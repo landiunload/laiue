@@ -1,14 +1,23 @@
 #include <windows.h>
 
-void _RTC_InitBase(void) {}
-void _RTC_Shutdown(void) {}
-int _RTC_CheckStackVars(void* frame, void* descriptors) { (void)frame; (void)descriptors; return 0; }
+typedef void (*StartFunction)(void);
 
-void __stdcall mainCRTStartup(void)
+// Точка входа без CRT (задаётся линкеру через /ENTRY:EntryPoint).
+// ExitProcess вызывается явно: без CRT возврат из точки входа
+// завершил бы только главный поток, а не процесс.
+void __stdcall EntryPoint(void)
 {
-    HMODULE dll = LoadLibraryW(L"laiue_core.dll");
-    if (dll == NULL) return;
+    HMODULE coreLibrary = LoadLibraryW(L"laiue_core.dll");
+    if (coreLibrary != NULL)
+    {
+        StartFunction start = (StartFunction)GetProcAddress(coreLibrary, "Start");
+        if (start != NULL)
+        {
+            start();
+        }
 
-    void (__stdcall *start)(void) = (void (__stdcall *)(void))GetProcAddress(dll, "Start");
-    if (start != NULL) start();
+        FreeLibrary(coreLibrary);
+    }
+
+    ExitProcess(0);
 }

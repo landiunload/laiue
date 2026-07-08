@@ -1,28 +1,18 @@
 #include "input/input.h"
 
 #include <windows.h>
+#include <hidusage.h>
 
-#pragma intrinsic(memset)
-
-void _RTC_InitBase(void) {}
-void _RTC_Shutdown(void) {}
-int _RTC_CheckStackVars(void* frame, void* descriptors) { (void)frame; (void)descriptors; return 0; }
-
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+struct Input
 {
-    (void)hinstDLL;
-    (void)fdwReason;
-    (void)lpvReserved;
-    return TRUE;
-}
+    bool keyDown[INPUT_KEY_COUNT];
+    bool keyPressedLatch[INPUT_KEY_COUNT];
+    bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
+    int32_t mouseDeltaX;
+    int32_t mouseDeltaY;
+};
 
-static Bool  g_keyDown[INPUT_KEY_COUNT];
-static Bool  g_keyPressedLatch[INPUT_KEY_COUNT];
-static Bool  g_mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
-static Int32 g_mouseDeltaX;
-static Int32 g_mouseDeltaY;
-
-static InputKey MapVirtualKeyToInputKey(UInt32 virtualKey)
+static InputKey MapVirtualKeyToInputKey(uint32_t virtualKey)
 {
     switch (virtualKey)
     {
@@ -40,35 +30,50 @@ static InputKey MapVirtualKeyToInputKey(UInt32 virtualKey)
     }
 }
 
-void InputInitialize(void* windowHandle)
+Input* InputCreate(void* windowNativeHandle)
 {
-    HWND nativeWindow = (HWND)windowHandle;
+    Input* input = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*input));
+    if (input == NULL)
+    {
+        return NULL;
+    }
 
-    g_mouseDeltaX = 0;
-    g_mouseDeltaY = 0;
+    RAWINPUTDEVICE devices[] = {
+        {
+            .usUsagePage = HID_USAGE_PAGE_GENERIC,
+            .usUsage     = HID_USAGE_GENERIC_KEYBOARD,
+            .hwndTarget  = (HWND)windowNativeHandle,
+        },
+        {
+            .usUsagePage = HID_USAGE_PAGE_GENERIC,
+            .usUsage     = HID_USAGE_GENERIC_MOUSE,
+            .hwndTarget  = (HWND)windowNativeHandle,
+        },
+    };
 
-    RAWINPUTDEVICE devices[2] = { 0 };
+    if (!RegisterRawInputDevices(devices, ARRAYSIZE(devices), sizeof(devices[0])))
+    {
+        HeapFree(GetProcessHeap(), 0, input);
+        return NULL;
+    }
 
-    devices[0].usUsagePage = 0x01;
-    devices[0].usUsage     = 0x06;
-    devices[0].dwFlags     = 0;
-    devices[0].hwndTarget  = nativeWindow;
-
-    devices[1].usUsagePage = 0x01;
-    devices[1].usUsage     = 0x02;
-    devices[1].dwFlags     = 0;
-    devices[1].hwndTarget  = nativeWindow;
-
-    RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE));
+    return input;
 }
 
-void InputHandleRawInput(void* rawInputHandle)
+void InputDestroy(Input* input)
 {
-    HRAWINPUT handle = (HRAWINPUT)rawInputHandle;
+    if (input != NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, input);
+    }
+}
 
+void InputHandleRawInput(Input* input, void* rawInputHandle)
+{
     RAWINPUT rawInput;
-    UINT size = sizeof(rawInput);
-    if (GetRawInputData(handle, RID_INPUT, &rawInput, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1)
+    UINT rawInputSize = sizeof(rawInput);
+    if (GetRawInputData((HRAWINPUT)rawInputHandle, RID_INPUT,
+                        &rawInput, &rawInputSize, sizeof(RAWINPUTHEADER)) == (UINT)-1)
     {
         return;
     }
@@ -76,64 +81,74 @@ void InputHandleRawInput(void* rawInputHandle)
     if (rawInput.header.dwType == RIM_TYPEKEYBOARD)
     {
         const RAWKEYBOARD* keyboard = &rawInput.data.keyboard;
+
         InputKey key = MapVirtualKeyToInputKey(keyboard->VKey);
         if (key == INPUT_KEY_COUNT)
         {
             return;
         }
 
-        Bool isKeyUp = (keyboard->Flags & RI_KEY_BREAK) != 0;
-        if (isKeyUp)
+        bool isKeyRelease = (keyboard->Flags & RI_KEY_BREAK) != 0;
+        if (isKeyRelease)
         {
-            g_keyDown[key] = BOOL_FALSE;
+            input->keyDown[key] = false;
         }
         else
         {
-            if (!g_keyDown[key])
+            // Защёлка взводится только на переходе «отпущена -> нажата»,
+            // авто-повтор клавиатуры её не дребезжит.
+            if (!input->keyDown[key])
             {
-                g_keyPressedLatch[key] = BOOL_TRUE;
+                input->keyPressedLatch[key] = true;
             }
 
-            g_keyDown[key] = BOOL_TRUE;
+            input->keyDown[key] = true;
         }
     }
     else if (rawInput.header.dwType == RIM_TYPEMOUSE)
     {
         const RAWMOUSE* mouse = &rawInput.data.mouse;
-        g_mouseDeltaX += mouse->lLastX;
-        g_mouseDeltaY += mouse->lLastY;
 
-        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   g_mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]   = BOOL_TRUE;
-        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)     g_mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]   = BOOL_FALSE;
-        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)  g_mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT]  = BOOL_TRUE;
-        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)    g_mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT]  = BOOL_FALSE;
+        input->mouseDeltaX += mouse->lLastX;
+        input->mouseDeltaY += mouse->lLastY;
+
+        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = true; }
+        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = false; }
+        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) { input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = true; }
+        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   { input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = false; }
     }
 }
 
-void InputEndFrame(void)
+void InputEndFrame(Input* input)
 {
-    memset(g_keyPressedLatch, 0, sizeof(g_keyPressedLatch));
-    g_mouseDeltaX = 0;
-    g_mouseDeltaY = 0;
+    // Массив крошечный — простой цикл, чтобы компилятор
+    // не подставил вызов memset (CRT не линкуется).
+    for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
+    {
+        input->keyPressedLatch[key] = false;
+    }
+
+    input->mouseDeltaX = 0;
+    input->mouseDeltaY = 0;
 }
 
-Bool InputIsKeyDown(InputKey key)
+bool InputIsKeyDown(const Input* input, InputKey key)
 {
-    return g_keyDown[key];
+    return (uint32_t)key < INPUT_KEY_COUNT && input->keyDown[key];
 }
 
-Bool InputWasKeyPressed(InputKey key)
+bool InputWasKeyPressed(const Input* input, InputKey key)
 {
-    return g_keyPressedLatch[key];
+    return (uint32_t)key < INPUT_KEY_COUNT && input->keyPressedLatch[key];
 }
 
-Bool InputIsMouseButtonDown(InputMouseButton button)
+bool InputIsMouseButtonDown(const Input* input, InputMouseButton button)
 {
-    return g_mouseButtonDown[button];
+    return (uint32_t)button < INPUT_MOUSE_BUTTON_COUNT && input->mouseButtonDown[button];
 }
 
-void InputGetMouseDelta(Int32* deltaX, Int32* deltaY)
+void InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY)
 {
-    *deltaX = g_mouseDeltaX;
-    *deltaY = g_mouseDeltaY;
+    *deltaX = input->mouseDeltaX;
+    *deltaY = input->mouseDeltaY;
 }

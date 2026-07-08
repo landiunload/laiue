@@ -1,8 +1,13 @@
-#ifndef INPUT_H
-#define INPUT_H
+#pragma once
 
-#include "core/types.h"
 #include "api.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+// Непрозрачный дескриптор состояния ввода: создаётся на конкретное окно,
+// глобальных переменных нет.
+typedef struct Input Input;
 
 typedef enum InputKey
 {
@@ -24,13 +29,17 @@ typedef enum InputMouseButton
     INPUT_MOUSE_BUTTON_COUNT
 } InputMouseButton;
 
-LAIUE_INPUT_API void InputInitialize(void* windowHandle);
-LAIUE_INPUT_API void InputHandleRawInput(void* rawInputData);
-LAIUE_INPUT_API void InputEndFrame(void);
+LAIUE_INPUT_API Input* InputCreate(void* windowNativeHandle);
+LAIUE_INPUT_API void   InputDestroy(Input* input);
 
-LAIUE_INPUT_API Bool InputIsKeyDown(InputKey key);
-LAIUE_INPUT_API Bool InputWasKeyPressed(InputKey key);
-LAIUE_INPUT_API Bool InputIsMouseButtonDown(InputMouseButton button);
-LAIUE_INPUT_API void InputGetMouseDelta(Int32* deltaX, Int32* deltaY);
+// Обрабатывает HRAWINPUT из WM_INPUT; подключается к окну как raw-input callback.
+LAIUE_INPUT_API void   InputHandleRawInput(Input* input, void* rawInputHandle);
 
-#endif
+// Сбрасывает накопленные за кадр данные (нажатия-защёлки и дельту мыши).
+// Вызывается в конце каждого кадра.
+LAIUE_INPUT_API void   InputEndFrame(Input* input);
+
+LAIUE_INPUT_API bool   InputIsKeyDown(const Input* input, InputKey key);
+LAIUE_INPUT_API bool   InputWasKeyPressed(const Input* input, InputKey key);
+LAIUE_INPUT_API bool   InputIsMouseButtonDown(const Input* input, InputMouseButton button);
+LAIUE_INPUT_API void   InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY);

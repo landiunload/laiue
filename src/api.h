@@ -1,5 +1,7 @@
-#ifndef LAIUE_API_H
-#define LAIUE_API_H
+#pragma once
+
+// Макросы экспорта/импорта: внутри своей DLL символы экспортируются,
+// для всех остальных модулей — импортируются.
 
 #if defined(LAIUE_BUILD_WINDOW)
 #define LAIUE_WINDOW_API __declspec(dllexport)
@@ -17,6 +19,4 @@
 #define LAIUE_CORE_API __declspec(dllexport)
 #else
 #define LAIUE_CORE_API __declspec(dllimport)
-#endif
-
 #endif

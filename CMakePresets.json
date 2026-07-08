@@ -1,52 +1,90 @@
 {
-    "version": 6,
+    "version": 8,
     "configurePresets": [
         {
-            "name": "default",
-            "displayName": "MSVC Debug",
-            "generator": "Ninja",
+            "name": "windows-base",
+            "hidden": true,
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "CMAKE_C_FLAGS": ""
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
             }
         },
         {
-            "name": "clang-debug",
-            "displayName": "Clang Debug",
-            "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build/${presetName}",
+            "name": "visual-studio",
+            "displayName": "Visual Studio (последняя установленная)",
+            "inherits": "windows-base"
+        },
+        {
+            "name": "ninja-base",
+            "hidden": true,
+            "inherits": "windows-base",
+            "generator": "Ninja"
+        },
+        {
+            "name": "ninja-msvc-debug",
+            "displayName": "Ninja + MSVC Debug",
+            "inherits": "ninja-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "clang-cl.exe",
-                "CMAKE_C_FLAGS": ""
+                "CMAKE_C_COMPILER": "cl.exe"
             }
         },
         {
-            "name": "release",
-            "displayName": "MSVC Release",
-            "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build/${presetName}",
+            "name": "ninja-msvc-release",
+            "displayName": "Ninja + MSVC Release",
+            "inherits": "ninja-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "CMAKE_C_FLAGS": ""
+                "CMAKE_C_COMPILER": "cl.exe"
+            }
+        },
+        {
+            "name": "ninja-clang-debug",
+            "displayName": "Ninja + Clang Debug",
+            "inherits": "ninja-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang-cl.exe"
+            }
+        },
+        {
+            "name": "ninja-clang-release",
+            "displayName": "Ninja + Clang Release",
+            "inherits": "ninja-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang-cl.exe"
             }
         }
     ],
     "buildPresets": [
         {
-            "name": "default",
-            "configurePreset": "default"
+            "name": "visual-studio-debug",
+            "configurePreset": "visual-studio",
+            "configuration": "Debug"
         },
         {
-            "name": "clang-debug",
-            "configurePreset": "clang-debug"
+            "name": "visual-studio-release",
+            "configurePreset": "visual-studio",
+            "configuration": "Release"
         },
         {
-            "name": "release",
-            "configurePreset": "release"
+            "name": "ninja-msvc-debug",
+            "configurePreset": "ninja-msvc-debug"
+        },
+        {
+            "name": "ninja-msvc-release",
+            "configurePreset": "ninja-msvc-release"
+        },
+        {
+            "name": "ninja-clang-debug",
+            "configurePreset": "ninja-clang-debug"
+        },
+        {
+            "name": "ninja-clang-release",
+            "configurePreset": "ninja-clang-release"
         }
     ]
 }

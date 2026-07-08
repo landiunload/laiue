@@ -2,51 +2,121 @@
 
 #include <windows.h>
 
-void _RTC_InitBase(void) {}
-void _RTC_Shutdown(void) {}
-int _RTC_CheckStackVars(void* frame, void* descriptors) { (void)frame; (void)descriptors; return 0; }
+#define WINDOW_CLASS_NAME L"LaiueWindowClass"
 
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+struct Window
 {
-    (void)hinstDLL;
-    (void)fdwReason;
-    (void)lpvReserved;
-    return TRUE;
+    HWND handle;
+    int32_t clientWidth;
+    int32_t clientHeight;
+    bool resizePending;
+    bool mouseLookEnabled;
+    bool cursorHidden;
+    bool focused;
+    RawInputCallback rawInputCallback;
+    void* rawInputUserData;
+};
+
+// Ограничивает курсор клиентской областью окна (в экранных координатах).
+static void ApplyCursorClip(const Window* window)
+{
+    RECT clientRect;
+    if (!GetClientRect(window->handle, &clientRect))
+    {
+        return;
+    }
+
+    POINT topLeft     = { clientRect.left,  clientRect.top };
+    POINT bottomRight = { clientRect.right, clientRect.bottom };
+    ClientToScreen(window->handle, &topLeft);
+    ClientToScreen(window->handle, &bottomRight);
+
+    RECT screenRect = { topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
+    ClipCursor(&screenRect);
 }
 
-static HWND  g_windowHandle = NULL;
-static Int32 g_clientWidth  = 0;
-static Int32 g_clientHeight = 0;
-static Bool  g_resizePending = BOOL_FALSE;
-static RawInputCallback g_rawInputCallback = NULL;
-static Bool  g_mouseLookEnabled = BOOL_FALSE;
-static Bool  g_cursorHidden     = BOOL_FALSE;
-static Bool  g_windowFocused    = BOOL_FALSE;
+// Приводит видимость и захват курсора в соответствие с режимом mouse look.
+// Вызывается каждую итерацию цикла — реагирует и на потерю фокуса.
+static void UpdateMouseLookState(Window* window)
+{
+    bool shouldHideCursor = window->mouseLookEnabled && window->focused;
+    if (shouldHideCursor == window->cursorHidden)
+    {
+        return;
+    }
 
-#define WINDOW_CLASS_NAME L"LaiueWindowClass"
+    window->cursorHidden = shouldHideCursor;
+
+    if (shouldHideCursor)
+    {
+        while (ShowCursor(FALSE) >= 0) {}
+        ApplyCursorClip(window);
+    }
+    else
+    {
+        while (ShowCursor(TRUE) < 0) {}
+        ClipCursor(NULL);
+    }
+}
 
 static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    Window* window = (Window*)GetWindowLongPtrW(handle, GWLP_USERDATA);
+
     switch (message)
     {
+        case WM_NCCREATE:
+        {
+            // CreateWindowExW передаёт сюда указатель на Window —
+            // привязываем его к HWND, дальше достаём через GWLP_USERDATA.
+            const CREATESTRUCTW* createStruct = (const CREATESTRUCTW*)lParam;
+            SetWindowLongPtrW(handle, GWLP_USERDATA, (LONG_PTR)createStruct->lpCreateParams);
+            return DefWindowProcW(handle, message, wParam, lParam);
+        }
+
         case WM_SIZE:
-            g_clientWidth   = (Int32)LOWORD(lParam);
-            g_clientHeight  = (Int32)HIWORD(lParam);
-            g_resizePending = BOOL_TRUE;
+            // Сворачивание даёт клиентскую область 0x0 — это не resize.
+            if (window != NULL && wParam != SIZE_MINIMIZED)
+            {
+                window->clientWidth   = (int32_t)LOWORD(lParam);
+                window->clientHeight  = (int32_t)HIWORD(lParam);
+                window->resizePending = true;
+
+                if (window->cursorHidden)
+                {
+                    ApplyCursorClip(window);
+                }
+            }
+            return 0;
+
+        case WM_MOVE:
+            // Область захвата курсора задана в экранных координатах —
+            // при перемещении окна её нужно пересчитать.
+            if (window != NULL && window->cursorHidden)
+            {
+                ApplyCursorClip(window);
+            }
             return 0;
 
         case WM_INPUT:
-            if (g_rawInputCallback != NULL)
+            if (window != NULL && window->rawInputCallback != NULL)
             {
-                g_rawInputCallback((void*)lParam);
+                window->rawInputCallback(window->rawInputUserData, (void*)lParam);
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_ACTIVATE:
-            g_windowFocused = (LOWORD(wParam) != WA_INACTIVE) ? BOOL_TRUE : BOOL_FALSE;
+            if (window != NULL)
+            {
+                window->focused = LOWORD(wParam) != WA_INACTIVE;
+            }
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_DESTROY:
+            if (window != NULL)
+            {
+                window->handle = NULL;
+            }
             PostQuitMessage(0);
             return 0;
 
@@ -55,168 +125,150 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
     }
 }
 
-void* WindowCreate(WindowConfiguration configuration)
+Window* WindowCreate(const WindowConfiguration* configuration)
 {
-    HINSTANCE instance = GetModuleHandleW(NULL);
-
-    WNDCLASSEXW windowClass = { 0 };
-    windowClass.cbSize        = sizeof(windowClass);
-    windowClass.style         = CS_HREDRAW | CS_VREDRAW;
-    windowClass.lpfnWndProc   = WindowProcedure;
-    windowClass.hInstance     = instance;
-    windowClass.hIcon         = LoadIconW(instance, (LPCWSTR)IDI_APPLICATION);
-    windowClass.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-    windowClass.lpszClassName = WINDOW_CLASS_NAME;
-
-    if (!RegisterClassExW(&windowClass))
+    if (configuration == NULL)
     {
         return NULL;
     }
 
-    RECT clientRect;
-    clientRect.left   = 0;
-    clientRect.top    = 0;
-    clientRect.right  = configuration.width;
-    clientRect.bottom = configuration.height;
+    HINSTANCE instance = GetModuleHandleW(NULL);
 
-    DWORD windowStyle   = WS_OVERLAPPEDWINDOW;
-    DWORD windowStyleEx = WS_EX_APPWINDOW;
+    WNDCLASSEXW windowClass = {
+        .cbSize        = sizeof(windowClass),
+        .style         = CS_HREDRAW | CS_VREDRAW,
+        .lpfnWndProc   = WindowProcedure,
+        .hInstance     = instance,
+        .hIcon         = LoadIconW(NULL, IDI_APPLICATION),
+        .hCursor       = LoadCursorW(NULL, IDC_ARROW),
+        .lpszClassName = WINDOW_CLASS_NAME,
+    };
 
-    AdjustWindowRectEx(&clientRect, windowStyle, FALSE, windowStyleEx);
+    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return NULL;
+    }
 
-    Int32 windowWidth  = clientRect.right - clientRect.left;
-    Int32 windowHeight = clientRect.bottom - clientRect.top;
+    Window* window = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*window));
+    if (window == NULL)
+    {
+        return NULL;
+    }
 
-    HWND handle = CreateWindowExW(
-        windowStyleEx,
+    window->clientWidth  = configuration->width;
+    window->clientHeight = configuration->height;
+
+    // Размер окна подбирается так, чтобы клиентская область
+    // совпала с запрошенными width x height.
+    RECT windowRect = { 0, 0, configuration->width, configuration->height };
+    const DWORD windowStyle         = WS_OVERLAPPEDWINDOW;
+    const DWORD windowStyleExtended = WS_EX_APPWINDOW;
+    AdjustWindowRectEx(&windowRect, windowStyle, FALSE, windowStyleExtended);
+
+    window->handle = CreateWindowExW(
+        windowStyleExtended,
         WINDOW_CLASS_NAME,
-        configuration.title,
+        configuration->title,
         windowStyle,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        windowWidth,
-        windowHeight,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
         NULL,
         NULL,
         instance,
-        NULL
+        window
     );
 
-    if (handle == NULL)
+    if (window->handle == NULL)
     {
+        HeapFree(GetProcessHeap(), 0, window);
         return NULL;
     }
 
-    g_windowHandle  = handle;
-    g_clientWidth   = configuration.width;
-    g_clientHeight  = configuration.height;
-    g_resizePending = BOOL_FALSE;
+    ShowWindow(window->handle, SW_SHOWDEFAULT);
+    UpdateWindow(window->handle);
 
-    ShowWindow(handle, SW_SHOWDEFAULT);
-    UpdateWindow(handle);
-
-    return (void*)handle;
-}
-
-void* WindowGetHandle(void* window)
-{
     return window;
 }
 
-void WindowSetRawInputCallback(void* window, RawInputCallback callback)
+void WindowDestroy(Window* window)
 {
-    (void)window;
-    g_rawInputCallback = callback;
-}
-
-void WindowGetClientSize(void* window, Int32* width, Int32* height)
-{
-    (void)window;
-    *width  = g_clientWidth;
-    *height = g_clientHeight;
-}
-
-Bool WindowConsumeResize(void* window)
-{
-    (void)window;
-
-    if (g_resizePending)
+    if (window == NULL)
     {
-        g_resizePending = BOOL_FALSE;
-        return BOOL_TRUE;
+        return;
     }
 
-    return BOOL_FALSE;
+    if (window->handle != NULL)
+    {
+        DestroyWindow(window->handle);
+    }
+
+    HeapFree(GetProcessHeap(), 0, window);
 }
 
-void WindowRunLoop(void* window, FrameCallback onFrame, void* userData)
+void* WindowGetNativeHandle(const Window* window)
 {
-    (void)window;
-    MSG message = { 0 };
+    return window->handle;
+}
 
-    while (message.message != WM_QUIT)
+void WindowSetRawInputCallback(Window* window, RawInputCallback callback, void* userData)
+{
+    window->rawInputCallback = callback;
+    window->rawInputUserData = userData;
+}
+
+void WindowGetClientSize(const Window* window, int32_t* width, int32_t* height)
+{
+    *width  = window->clientWidth;
+    *height = window->clientHeight;
+}
+
+bool WindowConsumeResize(Window* window)
+{
+    if (window->resizePending)
     {
+        window->resizePending = false;
+        return true;
+    }
+
+    return false;
+}
+
+void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
+{
+    for (;;)
+    {
+        MSG message;
         while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
         {
+            if (message.message == WM_QUIT)
+            {
+                return;
+            }
+
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+
+        UpdateMouseLookState(window);
 
         if (onFrame != NULL)
         {
             onFrame(userData);
         }
 
-        // ~60 FPS когда нет сообщений, ~0% CPU в простое
+        // ~60 кадров в секунду при простое, ~0% CPU без сообщений.
         MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT);
     }
 }
 
-void WindowSetMouseLook(void* window, Bool enabled)
+void WindowSetMouseLook(Window* window, bool enabled)
 {
-    (void)window;
-    g_mouseLookEnabled = enabled;
+    window->mouseLookEnabled = enabled;
 }
 
-void WindowUpdateMouseLook(void* window)
+void WindowRequestClose(Window* window)
 {
-    (void)window;
-
-    Bool shouldHide = g_mouseLookEnabled && g_windowFocused;
-
-    if (shouldHide == g_cursorHidden)
-    {
-        return;
-    }
-
-    if (shouldHide)
-    {
-        while (ShowCursor(FALSE) >= 0);
-        g_cursorHidden = BOOL_TRUE;
-
-        RECT clientRect;
-        GetClientRect(g_windowHandle, &clientRect);
-        POINT clientTopLeft = { clientRect.left, clientRect.top };
-        POINT clientBottomRight = { clientRect.right, clientRect.bottom };
-        ClientToScreen(g_windowHandle, &clientTopLeft);
-        ClientToScreen(g_windowHandle, &clientBottomRight);
-
-        clientRect.left   = clientTopLeft.x;
-        clientRect.top    = clientTopLeft.y;
-        clientRect.right  = clientBottomRight.x;
-        clientRect.bottom = clientBottomRight.y;
-        ClipCursor(&clientRect);
-    }
-    else
-    {
-        while (ShowCursor(TRUE) < 0);
-        g_cursorHidden = BOOL_FALSE;
-        ClipCursor(NULL);
-    }
-}
-
-void WindowRequestClose(void* window)
-{
-    (void)window;
-    PostMessageW(g_windowHandle, WM_CLOSE, 0, 0);
+    PostMessageW(window->handle, WM_CLOSE, 0, 0);
 }

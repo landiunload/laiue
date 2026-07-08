@@ -1,28 +1,30 @@
-#ifndef WINDOW_H
-#define WINDOW_H
+#pragma once
 
-#include "core/types.h"
 #include "api.h"
-#include <stddef.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+
+// Непрозрачный дескриптор окна: всё состояние живёт внутри реализации,
+// поэтому окон может быть сколько угодно и глобальных переменных нет.
+typedef struct Window Window;
 
 typedef struct WindowConfiguration
 {
-    wchar_t* title;
-    Int32 width;
-    Int32 height;
+    const wchar_t* title;
+    int32_t width;
+    int32_t height;
 } WindowConfiguration;
 
 typedef void (*FrameCallback)(void* userData);
-typedef void (*RawInputCallback)(void* rawInputData);
+typedef void (*RawInputCallback)(void* userData, void* rawInputHandle);
 
-LAIUE_WINDOW_API void* WindowCreate(WindowConfiguration configuration);
-LAIUE_WINDOW_API void* WindowGetHandle(void* window);
-LAIUE_WINDOW_API void  WindowSetRawInputCallback(void* window, RawInputCallback callback);
-LAIUE_WINDOW_API void  WindowGetClientSize(void* window, Int32* width, Int32* height);
-LAIUE_WINDOW_API Bool  WindowConsumeResize(void* window);
-LAIUE_WINDOW_API void  WindowRunLoop(void* window, FrameCallback onFrame, void* userData);
-LAIUE_WINDOW_API void  WindowSetMouseLook(void* window, Bool enabled);
-LAIUE_WINDOW_API void  WindowUpdateMouseLook(void* window);
-LAIUE_WINDOW_API void  WindowRequestClose(void* window);
-
-#endif
+LAIUE_WINDOW_API Window* WindowCreate(const WindowConfiguration* configuration);
+LAIUE_WINDOW_API void    WindowDestroy(Window* window);
+LAIUE_WINDOW_API void*   WindowGetNativeHandle(const Window* window);
+LAIUE_WINDOW_API void    WindowSetRawInputCallback(Window* window, RawInputCallback callback, void* userData);
+LAIUE_WINDOW_API void    WindowGetClientSize(const Window* window, int32_t* width, int32_t* height);
+LAIUE_WINDOW_API bool    WindowConsumeResize(Window* window);
+LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
+LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
+LAIUE_WINDOW_API void    WindowRequestClose(Window* window);
