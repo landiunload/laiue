@@ -39,6 +39,11 @@ LAIUE_INPUT_API void   InputHandleRawInput(Input* input, void* rawInputHandle);
 // Вызывается в конце каждого кадра.
 LAIUE_INPUT_API void   InputEndFrame(Input* input);
 
+// Полный сброс состояния (все клавиши «отпущены», дельты обнулены).
+// Вызывается при потере фокуса окном: события отпускания,
+// произошедшие вне фокуса, raw input не доставляет.
+LAIUE_INPUT_API void   InputResetState(Input* input);
+
 LAIUE_INPUT_API bool   InputIsKeyDown(const Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputWasKeyPressed(const Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputIsMouseButtonDown(const Input* input, InputMouseButton button);

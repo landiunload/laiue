@@ -33,6 +33,13 @@ static void OnFrame(void* userData)
         WindowSetMouseLook(application->window, !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
     }
 
+    // Вне фокуса события отпускания клавиш не доставляются —
+    // без сброса клавиши «залипали» бы нажатыми.
+    if (WindowConsumeFocusLoss(application->window))
+    {
+        InputResetState(application->input);
+    }
+
     if (WindowConsumeResize(application->window))
     {
         int32_t clientWidth;

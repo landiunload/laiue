@@ -10,6 +10,7 @@ struct Window
     int32_t clientWidth;
     int32_t clientHeight;
     bool resizePending;
+    bool focusLossPending;
     bool mouseLookEnabled;
     bool cursorHidden;
     bool focused;
@@ -108,16 +109,24 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
         case WM_ACTIVATE:
             if (window != NULL)
             {
-                window->focused = LOWORD(wParam) != WA_INACTIVE;
+                bool nowFocused = LOWORD(wParam) != WA_INACTIVE;
+                if (window->focused && !nowFocused)
+                {
+                    // Пока окно не в фокусе, raw input не приходит —
+                    // потребитель по этой защёлке сбрасывает состояние ввода.
+                    window->focusLossPending = true;
+                }
+                window->focused = nowFocused;
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_DESTROY:
+            // WM_QUIT не постится: цикл каждого окна следит только
+            // за своим окном, уничтожение одного не завершает остальные.
             if (window != NULL)
             {
                 window->handle = NULL;
             }
-            PostQuitMessage(0);
             return 0;
 
         default:
@@ -204,6 +213,12 @@ void WindowDestroy(Window* window)
         DestroyWindow(window->handle);
     }
 
+    // Пока живы другие окна класса, вызов не пройдёт (ERROR_CLASS_HAS_WINDOWS)
+    // и это нормально; последний уничтоживший — разрегистрирует.
+    // Иначе после FreeLibrary в процессе остался бы класс
+    // с lpfnWndProc, указывающим в выгруженную DLL.
+    UnregisterClassW(WINDOW_CLASS_NAME, GetModuleHandleW(NULL));
+
     HeapFree(GetProcessHeap(), 0, window);
 }
 
@@ -235,20 +250,32 @@ bool WindowConsumeResize(Window* window)
     return false;
 }
 
+bool WindowConsumeFocusLoss(Window* window)
+{
+    if (window->focusLossPending)
+    {
+        window->focusLossPending = false;
+        return true;
+    }
+
+    return false;
+}
+
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 {
-    for (;;)
+    while (window->handle != NULL)
     {
         MSG message;
         while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
         {
-            if (message.message == WM_QUIT)
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+
+            // WM_DESTROY этого окна мог прийти во время DispatchMessage.
+            if (window->handle == NULL)
             {
                 return;
             }
-
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
         }
 
         UpdateMouseLookState(window);

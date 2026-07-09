@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.30)
+cmake_minimum_required(VERSION 3.28)
 
 project(laiue
     VERSION 0.2.0
@@ -17,6 +17,16 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+# Флаги проекта рассчитаны на две конфигурации; RelWithDebInfo и
+# MinSizeRel из мультиконфигурационных генераторов исключаются,
+# а одноконфигурационным без явного выбора назначается Release.
+get_property(LAIUE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(LAIUE_IS_MULTI_CONFIG)
+    set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
+elseif(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+endif()
 
 # Отладочная информация встраивается в объектные файлы (/Z7):
 # нет коллизий vc*.pdb при параллельной сборке.
@@ -38,6 +48,10 @@ set(CMAKE_C_STANDARD_LIBRARIES "")
 add_library(laiue_common INTERFACE)
 
 target_include_directories(laiue_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Резервные memset/memcpy компилируются в каждый модуль:
+# без CRT они обязаны быть в каждом DLL и в EXE.
+target_sources(laiue_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/memory.c)
 
 target_compile_definitions(laiue_common INTERFACE
     NOMINMAX

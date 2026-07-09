@@ -7,7 +7,7 @@
 ## Сборка
 
 Требования: любая Visual Studio с C-тулчейном (CMake сам берёт самую новую
-установленную), CMake ≥ 3.30. Для ninja-пресетов — Ninja,
+установленную), CMake ≥ 3.28. Для ninja-пресетов — Ninja,
 для clang-пресетов — LLVM (clang-cl + lld-link).
 
 ```cmd

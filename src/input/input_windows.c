@@ -10,6 +10,11 @@ struct Input
     bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
     int32_t mouseDeltaX;
     int32_t mouseDeltaY;
+    // Для мыши в абсолютном режиме (удалённый рабочий стол, планшет)
+    // дельта считается как разница с предыдущей позицией.
+    int32_t lastAbsoluteX;
+    int32_t lastAbsoluteY;
+    bool hasLastAbsolutePosition;
 };
 
 static InputKey MapVirtualKeyToInputKey(uint32_t virtualKey)
@@ -109,8 +114,25 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
     {
         const RAWMOUSE* mouse = &rawInput.data.mouse;
 
-        input->mouseDeltaX += mouse->lLastX;
-        input->mouseDeltaY += mouse->lLastY;
+        if (mouse->usFlags & MOUSE_MOVE_ABSOLUTE)
+        {
+            // Абсолютные координаты (нормированные 0..65535) —
+            // дельта восстанавливается по предыдущей позиции.
+            if (input->hasLastAbsolutePosition)
+            {
+                input->mouseDeltaX += mouse->lLastX - input->lastAbsoluteX;
+                input->mouseDeltaY += mouse->lLastY - input->lastAbsoluteY;
+            }
+
+            input->lastAbsoluteX = mouse->lLastX;
+            input->lastAbsoluteY = mouse->lLastY;
+            input->hasLastAbsolutePosition = true;
+        }
+        else
+        {
+            input->mouseDeltaX += mouse->lLastX;
+            input->mouseDeltaY += mouse->lLastY;
+        }
 
         if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = true; }
         if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = false; }
@@ -121,8 +143,6 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
 
 void InputEndFrame(Input* input)
 {
-    // Массив крошечный — простой цикл, чтобы компилятор
-    // не подставил вызов memset (CRT не линкуется).
     for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
     {
         input->keyPressedLatch[key] = false;
@@ -130,6 +150,24 @@ void InputEndFrame(Input* input)
 
     input->mouseDeltaX = 0;
     input->mouseDeltaY = 0;
+}
+
+void InputResetState(Input* input)
+{
+    for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
+    {
+        input->keyDown[key] = false;
+        input->keyPressedLatch[key] = false;
+    }
+
+    for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
+    {
+        input->mouseButtonDown[button] = false;
+    }
+
+    input->mouseDeltaX = 0;
+    input->mouseDeltaY = 0;
+    input->hasLastAbsolutePosition = false;
 }
 
 bool InputIsKeyDown(const Input* input, InputKey key)
