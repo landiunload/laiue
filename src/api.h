@@ -20,3 +20,15 @@
 #else
 #define LAIUE_CORE_API __declspec(dllimport)
 #endif
+
+#if defined(LAIUE_BUILD_WORLD)
+#define LAIUE_WORLD_API __declspec(dllexport)
+#else
+#define LAIUE_WORLD_API __declspec(dllimport)
+#endif
+
+#if defined(LAIUE_BUILD_RENDER)
+#define LAIUE_RENDER_API __declspec(dllexport)
+#else
+#define LAIUE_RENDER_API __declspec(dllimport)
+#endif

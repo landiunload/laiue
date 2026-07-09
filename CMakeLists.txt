@@ -49,10 +49,6 @@ add_library(laiue_common INTERFACE)
 
 target_include_directories(laiue_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# Резервные memset/memcpy компилируются в каждый модуль:
-# без CRT они обязаны быть в каждом DLL и в EXE.
-target_sources(laiue_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/memory.c)
-
 target_compile_definitions(laiue_common INTERFACE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
@@ -75,6 +71,14 @@ target_compile_options(laiue_common INTERFACE
 
 # /EMITTOOLVERSIONINFO и /LTCG понимает только линкер MSVC;
 # lld-link при -flto=thin обрабатывает bitcode сам, без флагов линкеру.
+# Статическая библиотека runtime: memset/memcpy/_fltused.
+# Без /GL, чтобы MSVC не падал с C2268 на LTCG при определении этих функций.
+add_library(laiue_runtime STATIC src/runtime/memory.c)
+target_include_directories(laiue_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(laiue_runtime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(laiue_runtime PRIVATE $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL->)
+target_compile_options(laiue_runtime PUBLIC /W4 /utf-8 /GS- /fp:fast $<$<CONFIG:Debug>:/Od> $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>)
+
 target_link_options(laiue_common INTERFACE
     /NODEFAULTLIB /SUBSYSTEM:WINDOWS
     /DYNAMICBASE:NO /HIGHENTROPYVA:NO
@@ -90,7 +94,7 @@ target_link_options(laiue_common INTERFACE
 # CRT нет, инициализация не нужна — точка входа DllMain не требуется вовсе.
 function(laiue_add_module module_name)
     add_library(${module_name} SHARED ${ARGN})
-    target_link_libraries(${module_name} PRIVATE laiue_common)
+    target_link_libraries(${module_name} PRIVATE laiue_common laiue_runtime)
     target_link_options(${module_name} PRIVATE /NOENTRY)
 endfunction()
 
@@ -112,19 +116,67 @@ laiue_add_module(laiue_input
 target_compile_definitions(laiue_input PRIVATE LAIUE_BUILD_INPUT)
 target_link_libraries(laiue_input PRIVATE kernel32 user32)
 
+# ========== DLL: world ==========
+laiue_add_module(laiue_world
+    src/world/world.c
+    src/world/noise.c
+    src/world/world.h
+    src/api.h
+)
+target_compile_definitions(laiue_world PRIVATE LAIUE_BUILD_WORLD)
+target_link_libraries(laiue_world PRIVATE kernel32)
+
+# ========== Shader compilation ==========
+set(FXC "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.0.20348.0/x64/fxc.exe")
+if(NOT EXISTS "${FXC}")
+    message(WARNING "fxc.exe not found at ${FXC}, shaders will not be compiled")
+endif()
+
+set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/chunk.hlsl")
+set(GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/render/generated")
+
+add_custom_command(
+    OUTPUT "${GENERATED_DIR}/chunk_vs.h" "${GENERATED_DIR}/chunk_ps.h"
+    COMMAND "${FXC}" /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect
+        "/Fh${GENERATED_DIR}/chunk_vs.h" /Vn g_chunk_vs "${SHADER_SOURCE}"
+    COMMAND "${FXC}" /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect
+        "/Fh${GENERATED_DIR}/chunk_ps.h" /Vn g_chunk_ps "${SHADER_SOURCE}"
+    DEPENDS "${SHADER_SOURCE}"
+    COMMENT "Compiling shaders..."
+)
+
+# Pre-compiled shader headers — no need to compile them as C
+set(SHADER_HEADERS
+    "${GENERATED_DIR}/chunk_vs.h"
+    "${GENERATED_DIR}/chunk_ps.h"
+)
+
+# ========== DLL: render ==========
+laiue_add_module(laiue_render
+    src/render/renderer_d3d12.c
+    src/render/renderer_d3d12_builder.c
+    src/render/renderer.h
+    src/api.h
+    ${SHADER_HEADERS}
+)
+target_compile_definitions(laiue_render PRIVATE LAIUE_BUILD_RENDER)
+target_link_libraries(laiue_render PRIVATE kernel32 d3d12.lib dxgi.lib dxguid.lib laiue_world)
+
 # ========== DLL: core ==========
 laiue_add_module(laiue_core
     src/core/application.c
+    src/core/math.c
+    src/game/camera.c
     src/api.h
 )
 target_compile_definitions(laiue_core PRIVATE LAIUE_BUILD_CORE)
-target_link_libraries(laiue_core PRIVATE laiue_window laiue_input)
+target_link_libraries(laiue_core PRIVATE kernel32 laiue_window laiue_input laiue_world laiue_render)
 
 # ========== EXE: launcher ==========
 add_executable(laiue WIN32
     src/launcher/main.c
 )
-target_link_libraries(laiue PRIVATE laiue_common kernel32)
+target_link_libraries(laiue PRIVATE laiue_common laiue_runtime kernel32)
 # /STACK и /HEAP имеют смысл только у EXE — размеры берутся из его заголовка.
 target_link_options(laiue PRIVATE
     /ENTRY:EntryPoint
