@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(laiue
-    VERSION 0.2.0
-    DESCRIPTION "Belaiu base - window and input"
+    VERSION 0.3.0
+    DESCRIPTION "Belaiu base - window, input, world, render"
     LANGUAGES C
 )
 
@@ -33,52 +33,49 @@ endif()
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug>:Embedded>")
 
 # CMake по умолчанию добавляет /RTC1 в Debug — без CRT его заглушкам
-# неоткуда взяться, поэтому вырезаем флаг целиком.
+# неоткуда взяться; /Ob2 в Release конфликтует с нашим /Ob3 (D9025).
 string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
-
-# В Release CMake добавляет /Ob2 — вырезаем, чтобы наш /Ob3
-# не давал предупреждение D9025 о переопределении.
 string(REPLACE "/Ob2" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 
 # CRT не линкуется — стандартный список библиотек не нужен,
-# зависимости каждой цели заданы явно через target_link_libraries.
+# зависимости каждой цели заданы явно.
 set(CMAKE_C_STANDARD_LIBRARIES "")
 
-# === общие настройки всех модулей (единый источник истины) ===
-add_library(laiue_common INTERFACE)
+# ============================================================
+# Общие настройки (единый источник истины)
+# ============================================================
 
-target_include_directories(laiue_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-target_compile_definitions(laiue_common INTERFACE
+# Настройки компиляции без /GL — их использует и laiue_runtime,
+# которому /GL противопоказан (#pragma function не работает под LTCG).
+add_library(laiue_compile_settings INTERFACE)
+target_include_directories(laiue_compile_settings INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(laiue_compile_settings INTERFACE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
     UNICODE
     _UNICODE
 )
-
 # cl.exe и clang-cl.exe принимают одинаковые базовые флаги;
 # различия закрыты генераторными выражениями по C_COMPILER_ID.
-# /Gw кладёт глобальные данные в отдельные COMDAT-секции —
-# /OPT:REF выбрасывает неиспользуемые; на скорость не влияет.
-target_compile_options(laiue_common INTERFACE
+# /Gw кладёт глобальные данные в COMDAT-секции — /OPT:REF выбрасывает
+# неиспользуемые; на скорость не влияет.
+target_compile_options(laiue_compile_settings INTERFACE
     /W4 /utf-8 /GS- /fp:fast
     $<$<CONFIG:Debug>:/WX /Od>
     $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>
-    $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL /Ob3>
+    $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/Ob3>
     $<$<AND:$<C_COMPILER_ID:Clang>,$<NOT:$<CONFIG:Debug>>>:-flto=thin>
     $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
 )
 
+# Полные настройки модулей: компиляция + /GL + линковка.
 # /EMITTOOLVERSIONINFO и /LTCG понимает только линкер MSVC;
 # lld-link при -flto=thin обрабатывает bitcode сам, без флагов линкеру.
-# Статическая библиотека runtime: memset/memcpy/_fltused.
-# Без /GL, чтобы MSVC не падал с C2268 на LTCG при определении этих функций.
-add_library(laiue_runtime STATIC src/runtime/memory.c)
-target_include_directories(laiue_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(laiue_runtime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
-target_compile_options(laiue_runtime PRIVATE $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL->)
-target_compile_options(laiue_runtime PUBLIC /W4 /utf-8 /GS- /fp:fast $<$<CONFIG:Debug>:/Od> $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>)
-
+add_library(laiue_common INTERFACE)
+target_link_libraries(laiue_common INTERFACE laiue_compile_settings)
+target_compile_options(laiue_common INTERFACE
+    $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL>
+)
 target_link_options(laiue_common INTERFACE
     /NODEFAULTLIB /SUBSYSTEM:WINDOWS
     /DYNAMICBASE:NO /HIGHENTROPYVA:NO
@@ -90,89 +87,136 @@ target_link_options(laiue_common INTERFACE
     $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/LTCG>
 )
 
-# Объявляет DLL проекта: общие настройки + /NOENTRY.
-# CRT нет, инициализация не нужна — точка входа DllMain не требуется вовсе.
+# Резервные memset/memcpy и _fltused для сборки без CRT.
+# Именно OBJECT-библиотека: ссылки на эти символы возникают на этапе
+# кодогенерации LTO — уже после разрешения символов из архивов,
+# поэтому STATIC-библиотеку линкер бы не вытянул. Объектный файл
+# попадает в каждый модуль и EXE безусловно.
+# Флаги заданы отдельно и намеренно БЕЗ LTO (/GL, -flto): под MSVC
+# с /GL не работает #pragma function, а под thinLTO интернализация
+# выбрасывает _fltused до того, как бэкенд сгенерирует ссылки на него.
+add_library(laiue_runtime OBJECT src/runtime/memory.c)
+target_compile_options(laiue_runtime PRIVATE
+    /W4 /utf-8 /GS- /fp:fast
+    $<$<CONFIG:Debug>:/Od>
+    $<$<NOT:$<CONFIG:Debug>>:/O2 /Oi>
+)
+
+# ============================================================
+# Объявление модуля одной командой:
+#   laiue_add_module(<имя> SOURCES <файлы...> [LINK <библиотеки...>])
+# Создаёт DLL laiue_<имя> с макросом экспорта LAIUE_BUILD_<ИМЯ>,
+# общими настройками, runtime-библиотекой и /NOENTRY
+# (CRT нет, инициализация не нужна — DllMain не требуется вовсе).
+# ============================================================
 function(laiue_add_module module_name)
-    add_library(${module_name} SHARED ${ARGN})
-    target_link_libraries(${module_name} PRIVATE laiue_common laiue_runtime)
-    target_link_options(${module_name} PRIVATE /NOENTRY)
+    cmake_parse_arguments(MODULE "" "" "SOURCES;LINK" ${ARGN})
+
+    set(target_name laiue_${module_name})
+    string(TOUPPER ${module_name} module_name_upper)
+
+    add_library(${target_name} SHARED ${MODULE_SOURCES})
+    target_compile_definitions(${target_name} PRIVATE LAIUE_BUILD_${module_name_upper})
+    target_link_libraries(${target_name} PRIVATE laiue_common laiue_runtime kernel32 ${MODULE_LINK})
+    target_link_options(${target_name} PRIVATE /NOENTRY)
 endfunction()
 
-# ========== DLL: window ==========
-laiue_add_module(laiue_window
-    src/platform/window.c
-    src/platform/window.h
-    src/api.h
-)
-target_compile_definitions(laiue_window PRIVATE LAIUE_BUILD_WINDOW)
-target_link_libraries(laiue_window PRIVATE kernel32 user32)
-
-# ========== DLL: input ==========
-laiue_add_module(laiue_input
-    src/input/input_windows.c
-    src/input/input.h
-    src/api.h
-)
-target_compile_definitions(laiue_input PRIVATE LAIUE_BUILD_INPUT)
-target_link_libraries(laiue_input PRIVATE kernel32 user32)
-
-# ========== DLL: world ==========
-laiue_add_module(laiue_world
-    src/world/world.c
-    src/world/noise.c
-    src/world/world.h
-    src/api.h
-)
-target_compile_definitions(laiue_world PRIVATE LAIUE_BUILD_WORLD)
-target_link_libraries(laiue_world PRIVATE kernel32)
-
-# ========== Shader compilation ==========
-set(FXC "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.0.20348.0/x64/fxc.exe")
-if(NOT EXISTS "${FXC}")
-    message(WARNING "fxc.exe not found at ${FXC}, shaders will not be compiled")
+# ============================================================
+# Компиляция шейдеров: fxc ищется в PATH, затем берётся самая
+# новая версия из установленных Windows SDK. Заголовки генерируются
+# в дерево исходников и закоммичены — сборка работает и без fxc.
+# ============================================================
+find_program(LAIUE_SHADER_COMPILER fxc)
+if(NOT LAIUE_SHADER_COMPILER)
+    file(GLOB LAIUE_SHADER_COMPILER_CANDIDATES
+        "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/fxc.exe")
+    if(LAIUE_SHADER_COMPILER_CANDIDATES)
+        list(SORT LAIUE_SHADER_COMPILER_CANDIDATES COMPARE NATURAL)
+        list(GET LAIUE_SHADER_COMPILER_CANDIDATES -1 LAIUE_SHADER_COMPILER)
+    endif()
 endif()
 
-set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/chunk.hlsl")
-set(GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/render/generated")
+set(LAIUE_GENERATED_SHADER_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/render/generated")
 
-add_custom_command(
-    OUTPUT "${GENERATED_DIR}/chunk_vs.h" "${GENERATED_DIR}/chunk_ps.h"
-    COMMAND "${FXC}" /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect
-        "/Fh${GENERATED_DIR}/chunk_vs.h" /Vn g_chunk_vs "${SHADER_SOURCE}"
-    COMMAND "${FXC}" /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect
-        "/Fh${GENERATED_DIR}/chunk_ps.h" /Vn g_chunk_ps "${SHADER_SOURCE}"
-    DEPENDS "${SHADER_SOURCE}"
-    COMMENT "Compiling shaders..."
+# laiue_compile_shader(<имя>) — компилирует shaders/<имя>.hlsl
+# (вершинный VSMain и пиксельный PSMain) в заголовки
+# <имя>_vs.h / <имя>_ps.h с массивами g_<имя>_vs / g_<имя>_ps.
+function(laiue_compile_shader shader_name)
+    if(NOT LAIUE_SHADER_COMPILER)
+        message(STATUS "fxc.exe не найден — используются закоммиченные заголовки шейдера «${shader_name}»")
+        return()
+    endif()
+
+    set(shader_source "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader_name}.hlsl")
+    add_custom_command(
+        OUTPUT
+            "${LAIUE_GENERATED_SHADER_DIRECTORY}/${shader_name}_vs.h"
+            "${LAIUE_GENERATED_SHADER_DIRECTORY}/${shader_name}_ps.h"
+        COMMAND "${LAIUE_SHADER_COMPILER}" /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect
+            "/Fh${LAIUE_GENERATED_SHADER_DIRECTORY}/${shader_name}_vs.h" /Vn g_${shader_name}_vs "${shader_source}"
+        COMMAND "${LAIUE_SHADER_COMPILER}" /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect
+            "/Fh${LAIUE_GENERATED_SHADER_DIRECTORY}/${shader_name}_ps.h" /Vn g_${shader_name}_ps "${shader_source}"
+        DEPENDS "${shader_source}"
+        COMMENT "Компиляция шейдера ${shader_name}"
+    )
+endfunction()
+
+laiue_compile_shader(chunk)
+
+# ============================================================
+# Модули
+# ============================================================
+
+laiue_add_module(window
+    SOURCES
+        src/platform/window.c
+        src/platform/window.h
+        src/platform/time.c
+        src/platform/time.h
+        src/api.h
+    LINK user32
 )
 
-# Pre-compiled shader headers — no need to compile them as C
-set(SHADER_HEADERS
-    "${GENERATED_DIR}/chunk_vs.h"
-    "${GENERATED_DIR}/chunk_ps.h"
+laiue_add_module(input
+    SOURCES src/input/input_windows.c src/input/input.h src/api.h
+    LINK user32
 )
 
-# ========== DLL: render ==========
-laiue_add_module(laiue_render
-    src/render/renderer_d3d12.c
-    src/render/renderer_d3d12_builder.c
-    src/render/renderer.h
-    src/api.h
-    ${SHADER_HEADERS}
+laiue_add_module(world
+    SOURCES src/world/world.c src/world/noise.c src/world/world.h src/world/noise.h src/api.h
 )
-target_compile_definitions(laiue_render PRIVATE LAIUE_BUILD_RENDER)
-target_link_libraries(laiue_render PRIVATE kernel32 d3d12.lib dxgi.lib dxguid.lib laiue_world)
 
-# ========== DLL: core ==========
-laiue_add_module(laiue_core
-    src/core/application.c
-    src/core/math.c
-    src/game/camera.c
-    src/api.h
+laiue_add_module(mesher
+    SOURCES src/mesh/chunk_mesher.c src/mesh/chunk_mesher.h src/api.h
+    LINK laiue_world
 )
-target_compile_definitions(laiue_core PRIVATE LAIUE_BUILD_CORE)
-target_link_libraries(laiue_core PRIVATE kernel32 laiue_window laiue_input laiue_world laiue_render)
 
-# ========== EXE: launcher ==========
+laiue_add_module(render
+    SOURCES
+        src/render/renderer_d3d12.c
+        src/render/renderer.h
+        src/api.h
+        "${LAIUE_GENERATED_SHADER_DIRECTORY}/chunk_vs.h"
+        "${LAIUE_GENERATED_SHADER_DIRECTORY}/chunk_ps.h"
+    LINK d3d12 dxgi dxguid
+)
+
+laiue_add_module(core
+    SOURCES
+        src/core/application.c
+        src/core/chunk_streaming.c
+        src/core/chunk_streaming.h
+        src/core/math.c
+        src/core/math.h
+        src/game/camera.c
+        src/game/camera.h
+        src/api.h
+    LINK laiue_window laiue_input laiue_world laiue_mesher laiue_render
+)
+
+# ============================================================
+# EXE: лаунчер
+# ============================================================
 add_executable(laiue WIN32
     src/launcher/main.c
 )

@@ -295,6 +295,11 @@ void WindowSetMouseLook(Window* window, bool enabled)
     window->mouseLookEnabled = enabled;
 }
 
+bool WindowIsMouseLookEnabled(const Window* window)
+{
+    return window->mouseLookEnabled;
+}
+
 void WindowRequestClose(Window* window)
 {
     PostMessageW(window->handle, WM_CLOSE, 0, 0);
