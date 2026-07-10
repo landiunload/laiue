@@ -187,7 +187,11 @@ laiue_add_module(world
 )
 
 laiue_add_module(mesher
-    SOURCES src/mesh/chunk_mesher.c src/mesh/chunk_mesher.h src/api.h
+    SOURCES
+        src/mesh/chunk_mesher.c
+        src/mesh/chunk_mesher.h
+        src/render/chunk_geometry.h
+        src/api.h
     LINK laiue_world
 )
 
@@ -195,6 +199,7 @@ laiue_add_module(render
     SOURCES
         src/render/renderer_d3d12.c
         src/render/renderer.h
+        src/render/chunk_geometry.h
         src/api.h
         "${LAIUE_GENERATED_SHADER_DIRECTORY}/chunk_vs.h"
         "${LAIUE_GENERATED_SHADER_DIRECTORY}/chunk_ps.h"

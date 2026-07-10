@@ -2,6 +2,7 @@
 #include "world/noise.h"
 
 #include <windows.h>
+#include <string.h>
 
 typedef struct ChunkCoordinate
 {
@@ -30,6 +31,7 @@ typedef struct Chunk
 // Кеш сеток высот: столб чанков (chunkX, chunkZ) использует одну и ту же
 // сетку 66x66 — шум считается один раз на столб, а не на каждый чанк.
 #define HEIGHT_GRID_SIZE (CHUNK_SIZE + 2)
+#define HEIGHT_GRID_CELLS (HEIGHT_GRID_SIZE * HEIGHT_GRID_SIZE)
 #define HEIGHT_CACHE_SLOTS 16
 
 typedef struct HeightGridSlot
@@ -43,16 +45,20 @@ typedef struct HeightGridSlot
 } HeightGridSlot;
 
 // Хеш-таблица чанков с открытой адресацией (линейное пробирование).
-// Внимание: кеш высот делает WorldFillRegion небезопасным для
-// параллельных вызовов — читатель должен быть один (поток мешинга).
+// tableLock: читатели (GetBlock, FillRegion) — shared, писатель (SetBlock) —
+// exclusive. heightCacheLock защищает кеш высот; сетка при промахе
+// считается вне замка, чтобы читатели не сериализовали вычисление шума.
 struct World
 {
+    SRWLOCK tableLock;
     ChunkCoordinate* keys;
     Chunk** chunks;
     bool* occupied;
     uint32_t count;
     uint32_t capacity;
     int64_t seed;
+
+    SRWLOCK heightCacheLock;
     HeightGridSlot heightCache[HEIGHT_CACHE_SLOTS];
 };
 
@@ -76,36 +82,46 @@ static bool ChunkCoordinateEquals(ChunkCoordinate a, ChunkCoordinate b)
     return a.x == b.x && a.y == b.y && a.z == b.z;
 }
 
-static uint32_t HashChunkCoordinate(ChunkCoordinate coordinate)
-{
-    uint64_t hash = (uint64_t)coordinate.x * 73856093ULL
-                  ^ (uint64_t)coordinate.y * 19349663ULL
-                  ^ (uint64_t)coordinate.z * 83492791ULL;
-    return (uint32_t)(hash ^ (hash >> 33));
-}
-
 // Высота ландшафта в блочных координатах (x, z); блок твёрдый, если y < высоты.
 static float TerrainHeight(int64_t seed, int64_t blockX, int64_t blockZ)
 {
     float noiseX = (float)blockX * 0.025f;
     float noiseZ = (float)blockZ * 0.025f;
-    float noise = GenerateNoise(seed, noiseX, 0.0f, noiseZ);
+    float noise = GenerateTerrainNoise(seed, noiseX, noiseZ);
     return (noise - 0.5f) * 32.0f;
 }
 
-// Возвращает сетку высот столба чанков (66x66 колонн вокруг чанка),
-// при попадании в кеш — без единого вычисления шума.
-static const HeightGridSlot* WorldGetHeightGrid(World* world, int64_t chunkX, int64_t chunkZ)
+// Первый воздушный уровень колонны: ceil(height).
+static int32_t ColumnCeiling(float height)
 {
-    uint32_t slotIndex = (uint32_t)((uint64_t)chunkX * 73856093ULL
-                                  ^ (uint64_t)chunkZ * 83492791ULL) & (HEIGHT_CACHE_SLOTS - 1);
+    int32_t ceiling = (int32_t)height;
+    if ((float)ceiling < height)
+    {
+        ceiling++;
+    }
+    return ceiling;
+}
+
+// Заполняет сетку высот столба чанков; при попадании в кеш —
+// без единого вычисления шума (копия из слота).
+static void WorldObtainHeightGrid(World* world, int64_t chunkX, int64_t chunkZ,
+    float* outHeights, float* outMinimum, float* outMaximum)
+{
+    uint32_t slotIndex = WorldHashChunkCoordinate(chunkX, 0, chunkZ) & (HEIGHT_CACHE_SLOTS - 1);
     HeightGridSlot* slot = &world->heightCache[slotIndex];
 
+    AcquireSRWLockShared(&world->heightCacheLock);
     if (slot->valid && slot->chunkX == chunkX && slot->chunkZ == chunkZ)
     {
-        return slot;
+        memcpy(outHeights, slot->heights, HEIGHT_GRID_CELLS * sizeof(float));
+        *outMinimum = slot->minimumHeight;
+        *outMaximum = slot->maximumHeight;
+        ReleaseSRWLockShared(&world->heightCacheLock);
+        return;
     }
+    ReleaseSRWLockShared(&world->heightCacheLock);
 
+    // Промах: тяжёлое вычисление шума — вне замка.
     int64_t minBlockX = (chunkX << CHUNK_SIZE_LOG2) - 1;
     int64_t minBlockZ = (chunkZ << CHUNK_SIZE_LOG2) - 1;
 
@@ -118,19 +134,24 @@ static const HeightGridSlot* WorldGetHeightGrid(World* world, int64_t chunkX, in
         for (int32_t x = 0; x < HEIGHT_GRID_SIZE; ++x)
         {
             float height = TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
-            slot->heights[z * HEIGHT_GRID_SIZE + x] = height;
+            outHeights[z * HEIGHT_GRID_SIZE + x] = height;
             if (first || height < minimumHeight) minimumHeight = height;
             if (first || height > maximumHeight) maximumHeight = height;
             first = false;
         }
     }
 
-    slot->valid = true;
+    *outMinimum = minimumHeight;
+    *outMaximum = maximumHeight;
+
+    AcquireSRWLockExclusive(&world->heightCacheLock);
+    memcpy(slot->heights, outHeights, HEIGHT_GRID_CELLS * sizeof(float));
     slot->chunkX = chunkX;
     slot->chunkZ = chunkZ;
     slot->minimumHeight = minimumHeight;
     slot->maximumHeight = maximumHeight;
-    return slot;
+    slot->valid = true;
+    ReleaseSRWLockExclusive(&world->heightCacheLock);
 }
 
 static void ChunkDestroy(Chunk* chunk)
@@ -142,6 +163,7 @@ static void ChunkDestroy(Chunk* chunk)
     HeapFree(GetProcessHeap(), 0, chunk);
 }
 
+// Вызывается только под эксклюзивным tableLock.
 static bool WorldGrow(World* world)
 {
     uint32_t oldCapacity = world->capacity;
@@ -167,7 +189,7 @@ static bool WorldGrow(World* world)
         }
 
         uint32_t mask = newCapacity - 1;
-        uint32_t index = HashChunkCoordinate(world->keys[i]) & mask;
+        uint32_t index = WorldHashChunkCoordinate(world->keys[i].x, world->keys[i].y, world->keys[i].z) & mask;
         while (newOccupied[index])
         {
             index = (index + 1) & mask;
@@ -197,6 +219,9 @@ World* WorldCreate(int64_t seed)
         return NULL;
     }
 
+    InitializeSRWLock(&world->tableLock);
+    InitializeSRWLock(&world->heightCacheLock);
+
     world->capacity = WORLD_INITIAL_CAPACITY;
     world->keys = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, world->capacity * sizeof(ChunkCoordinate));
     world->chunks = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, world->capacity * sizeof(Chunk*));
@@ -205,8 +230,7 @@ World* WorldCreate(int64_t seed)
     bool heightCacheAllocated = true;
     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
     {
-        world->heightCache[slot].heights = HeapAlloc(GetProcessHeap(), 0,
-            (size_t)HEIGHT_GRID_SIZE * HEIGHT_GRID_SIZE * sizeof(float));
+        world->heightCache[slot].heights = HeapAlloc(GetProcessHeap(), 0, HEIGHT_GRID_CELLS * sizeof(float));
         if (world->heightCache[slot].heights == NULL)
         {
             heightCacheAllocated = false;
@@ -255,6 +279,7 @@ void WorldDestroy(World* world)
     HeapFree(GetProcessHeap(), 0, world);
 }
 
+// Вызывается под tableLock (любым: shared для чтения, exclusive для записи).
 static Chunk** WorldFindEntry(World* world, ChunkCoordinate key)
 {
     if (world->count == 0)
@@ -263,7 +288,7 @@ static Chunk** WorldFindEntry(World* world, ChunkCoordinate key)
     }
 
     uint32_t mask = world->capacity - 1;
-    uint32_t index = HashChunkCoordinate(key) & mask;
+    uint32_t index = WorldHashChunkCoordinate(key.x, key.y, key.z) & mask;
 
     for (uint32_t probe = 0; probe < world->capacity; ++probe)
     {
@@ -282,6 +307,7 @@ static Chunk** WorldFindEntry(World* world, ChunkCoordinate key)
 }
 
 // Чанк создаётся лениво — только когда появляется первая дельта.
+// Вызывается под эксклюзивным tableLock.
 static Chunk* WorldGetOrCreateChunk(World* world, ChunkCoordinate key)
 {
     Chunk** entry = WorldFindEntry(world, key);
@@ -299,7 +325,7 @@ static Chunk* WorldGetOrCreateChunk(World* world, ChunkCoordinate key)
     }
 
     uint32_t mask = world->capacity - 1;
-    uint32_t index = HashChunkCoordinate(key) & mask;
+    uint32_t index = WorldHashChunkCoordinate(key.x, key.y, key.z) & mask;
     while (world->occupied[index])
     {
         index = (index + 1) & mask;
@@ -332,6 +358,7 @@ static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* ou
     return false;
 }
 
+// Вызывается под эксклюзивным tableLock.
 static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 {
     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
@@ -371,6 +398,7 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
         .z = ChunkFromBlock(z),
     };
 
+    AcquireSRWLockShared(&world->tableLock);
     Chunk** entry = WorldFindEntry(world, coordinate);
     if (entry != NULL)
     {
@@ -382,9 +410,11 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
         BlockType block;
         if (ChunkGetDelta(*entry, localIndex, &block))
         {
+            ReleaseSRWLockShared(&world->tableLock);
             return block;
         }
     }
+    ReleaseSRWLockShared(&world->tableLock);
 
     return (float)y < TerrainHeight(world->seed, x, z) ? BLOCK_EARTH : BLOCK_AIR;
 }
@@ -406,6 +436,8 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
     // Установка блока в сгенерированное значение — удаление дельты,
     // а не создание новой: чанк не накапливает бесполезные записи.
     BlockType generated = (float)y < TerrainHeight(world->seed, x, z) ? BLOCK_EARTH : BLOCK_AIR;
+
+    AcquireSRWLockExclusive(&world->tableLock);
     if (block == generated)
     {
         Chunk** entry = WorldFindEntry(world, coordinate);
@@ -417,20 +449,20 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
                 if (chunk->deltas[i].localIndex == localIndex)
                 {
                     chunk->deltas[i] = chunk->deltas[--chunk->deltaCount];
-                    return;
+                    break;
                 }
             }
         }
-        return;
     }
-
-    Chunk* chunk = WorldGetOrCreateChunk(world, coordinate);
-    if (chunk == NULL)
+    else
     {
-        return;
+        Chunk* chunk = WorldGetOrCreateChunk(world, coordinate);
+        if (chunk != NULL)
+        {
+            ChunkSetDelta(chunk, localIndex, block);
+        }
     }
-
-    ChunkSetDelta(chunk, localIndex, block);
+    ReleaseSRWLockExclusive(&world->tableLock);
 }
 
 WorldRegionContents WorldFillRegion(World* world,
@@ -447,6 +479,7 @@ WorldRegionContents WorldFillRegion(World* world,
     int64_t maxChunkY = ChunkFromBlock(minBlockY + sizeY - 1);
     int64_t maxChunkZ = ChunkFromBlock(minBlockZ + sizeZ - 1);
 
+    AcquireSRWLockShared(&world->tableLock);
     for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ && !regionHasDeltas; ++chunkZ)
     {
         for (int64_t chunkY = minChunkY; chunkY <= maxChunkY && !regionHasDeltas; ++chunkY)
@@ -462,34 +495,27 @@ WorldRegionContents WorldFillRegion(World* world,
             }
         }
     }
+    ReleaseSRWLockShared(&world->tableLock);
 
     // 2. Высоты колонн. Запрос мешера (регион 66x66 вокруг чанка)
-    // попадает в кеш сеток высот; произвольные регионы считают шум сами.
-    const HeightGridSlot* cachedGrid = NULL;
-    if (sizeX == HEIGHT_GRID_SIZE && sizeZ == HEIGHT_GRID_SIZE &&
-        ((minBlockX + 1) & (CHUNK_SIZE - 1)) == 0 &&
-        ((minBlockZ + 1) & (CHUNK_SIZE - 1)) == 0)
-    {
-        cachedGrid = WorldGetHeightGrid(world, (minBlockX + 1) >> CHUNK_SIZE_LOG2, (minBlockZ + 1) >> CHUNK_SIZE_LOG2);
-    }
-
-    float* localHeights = NULL;
+    // идёт через кеш сеток высот; произвольные регионы считают шум сами.
+    float* heights = HeapAlloc(GetProcessHeap(), 0, (size_t)sizeX * sizeZ * sizeof(float));
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
-    const float* heights = NULL;
     bool boundsKnown = false;
 
-    if (cachedGrid != NULL)
+    if (heights != NULL)
     {
-        heights = cachedGrid->heights;
-        minimumHeight = cachedGrid->minimumHeight;
-        maximumHeight = cachedGrid->maximumHeight;
-        boundsKnown = true;
-    }
-    else
-    {
-        localHeights = HeapAlloc(GetProcessHeap(), 0, (size_t)sizeX * sizeZ * sizeof(float));
-        if (localHeights != NULL)
+        if (sizeX == HEIGHT_GRID_SIZE && sizeZ == HEIGHT_GRID_SIZE &&
+            ((minBlockX + 1) & (CHUNK_SIZE - 1)) == 0 &&
+            ((minBlockZ + 1) & (CHUNK_SIZE - 1)) == 0)
+        {
+            WorldObtainHeightGrid(world,
+                (minBlockX + 1) >> CHUNK_SIZE_LOG2, (minBlockZ + 1) >> CHUNK_SIZE_LOG2,
+                heights, &minimumHeight, &maximumHeight);
+            boundsKnown = true;
+        }
+        else
         {
             bool first = true;
             for (int32_t z = 0; z < sizeZ; ++z)
@@ -497,13 +523,12 @@ WorldRegionContents WorldFillRegion(World* world,
                 for (int32_t x = 0; x < sizeX; ++x)
                 {
                     float height = TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
-                    localHeights[z * sizeX + x] = height;
+                    heights[z * sizeX + x] = height;
                     if (first || height < minimumHeight) minimumHeight = height;
                     if (first || height > maximumHeight) maximumHeight = height;
                     first = false;
                 }
             }
-            heights = localHeights;
             boundsKnown = true;
         }
     }
@@ -513,17 +538,19 @@ WorldRegionContents WorldFillRegion(World* world,
     {
         if ((float)minBlockY >= maximumHeight)
         {
-            if (localHeights != NULL) HeapFree(GetProcessHeap(), 0, localHeights);
+            HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_AIR;
         }
         if ((float)(minBlockY + sizeY - 1) < minimumHeight)
         {
-            if (localHeights != NULL) HeapFree(GetProcessHeap(), 0, localHeights);
+            HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_SOLID;
         }
     }
 
-    // 4. Заполнение сгенерированным ландшафтом.
+    // 4. Заполнение сгенерированным ландшафтом: граница «земля/воздух»
+    // колонны — одно целое число, дальше два memset вместо
+    // поблочных float-сравнений.
     for (int32_t z = 0; z < sizeZ; ++z)
     {
         for (int32_t x = 0; x < sizeX; ++x)
@@ -532,22 +559,25 @@ WorldRegionContents WorldFillRegion(World* world,
                 ? heights[z * sizeX + x]
                 : TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
 
+            int64_t solidCount = (int64_t)ColumnCeiling(height) - minBlockY;
+            if (solidCount < 0) solidCount = 0;
+            if (solidCount > sizeY) solidCount = sizeY;
+
             BlockType* column = &outBlocks[((size_t)z * sizeX + x) * sizeY];
-            for (int32_t y = 0; y < sizeY; ++y)
-            {
-                column[y] = (float)(minBlockY + y) < height ? BLOCK_EARTH : BLOCK_AIR;
-            }
+            memset(column, BLOCK_EARTH, (size_t)solidCount);
+            memset(column + solidCount, BLOCK_AIR, (size_t)(sizeY - solidCount));
         }
     }
 
-    if (localHeights != NULL)
+    if (heights != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, localHeights);
+        HeapFree(GetProcessHeap(), 0, heights);
     }
 
     // 5. Наложение дельт пересекающих чанков.
     if (regionHasDeltas)
     {
+        AcquireSRWLockShared(&world->tableLock);
         for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
         {
             for (int64_t chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
@@ -589,6 +619,7 @@ WorldRegionContents WorldFillRegion(World* world,
                 }
             }
         }
+        ReleaseSRWLockShared(&world->tableLock);
     }
 
     return WORLD_REGION_MIXED;
@@ -596,6 +627,6 @@ WorldRegionContents WorldFillRegion(World* world,
 
 int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t z)
 {
-    float height = TerrainHeight(world->seed, x, z);
-    return height >= 0.0f ? (int32_t)(height + 1.0f) : (int32_t)height;
+    // Блок твёрдый при y < height, значит верхний твёрдый = ceil(height) - 1.
+    return ColumnCeiling(TerrainHeight(world->seed, x, z)) - 1;
 }

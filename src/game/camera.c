@@ -1,10 +1,9 @@
 #include "game/camera.h"
 #include "core/math.h"
 
-#define MOUSE_SENSITIVITY 0.0025f
 #define PITCH_LIMIT 1.570796f
 
-void CameraInit(Camera* camera, float x, float y, float z, float yaw, float pitch)
+void CameraInit(Camera* camera, double x, double y, double z, float yaw, float pitch)
 {
     camera->position[0] = x;
     camera->position[1] = y;
@@ -13,53 +12,63 @@ void CameraInit(Camera* camera, float x, float y, float z, float yaw, float pitc
     camera->pitch = ScalarClamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
 }
 
-void CameraUpdate(Camera* camera, float deltaSeconds,
-    bool keyW, bool keyA, bool keyS, bool keyD,
-    int32_t mouseDeltaX, int32_t mouseDeltaY,
-    float speed)
+void CameraGetForwardVector(const Camera* camera, float outForward[3])
 {
-    camera->yaw += (float)mouseDeltaX * MOUSE_SENSITIVITY;
-    camera->pitch -= (float)mouseDeltaY * MOUSE_SENSITIVITY;
-    camera->pitch = ScalarClamp(camera->pitch, -PITCH_LIMIT, PITCH_LIMIT);
-
     float sinPitch = ScalarSin(camera->pitch);
     float cosPitch = ScalarCos(camera->pitch);
     float sinYaw = ScalarSin(camera->yaw);
     float cosYaw = ScalarCos(camera->yaw);
 
-    float forwardX = sinYaw * cosPitch;
-    float forwardY = sinPitch;
-    float forwardZ = cosYaw * cosPitch;
+    outForward[0] = sinYaw * cosPitch;
+    outForward[1] = sinPitch;
+    outForward[2] = cosYaw * cosPitch;
+}
 
-    float rightX = cosYaw;
-    float rightZ = -sinYaw;
+void CameraUpdate(Camera* camera, float deltaSeconds,
+    bool keyForward, bool keyLeft, bool keyBackward, bool keyRight, bool keyUp,
+    int32_t mouseDeltaX, int32_t mouseDeltaY,
+    float speed, float mouseSensitivity)
+{
+    camera->yaw += (float)mouseDeltaX * mouseSensitivity;
+    camera->pitch -= (float)mouseDeltaY * mouseSensitivity;
+    camera->pitch = ScalarClamp(camera->pitch, -PITCH_LIMIT, PITCH_LIMIT);
+
+    float forward[3];
+    CameraGetForwardVector(camera, forward);
+
+    float rightX = ScalarCos(camera->yaw);
+    float rightZ = -ScalarSin(camera->yaw);
 
     float step = speed * deltaSeconds;
-    if (keyW)
+    if (keyForward)
     {
-        camera->position[0] += forwardX * step;
-        camera->position[1] += forwardY * step;
-        camera->position[2] += forwardZ * step;
+        camera->position[0] += (double)(forward[0] * step);
+        camera->position[1] += (double)(forward[1] * step);
+        camera->position[2] += (double)(forward[2] * step);
     }
-    if (keyS)
+    if (keyBackward)
     {
-        camera->position[0] -= forwardX * step;
-        camera->position[1] -= forwardY * step;
-        camera->position[2] -= forwardZ * step;
+        camera->position[0] -= (double)(forward[0] * step);
+        camera->position[1] -= (double)(forward[1] * step);
+        camera->position[2] -= (double)(forward[2] * step);
     }
-    if (keyD)
+    if (keyRight)
     {
-        camera->position[0] += rightX * step;
-        camera->position[2] += rightZ * step;
+        camera->position[0] += (double)(rightX * step);
+        camera->position[2] += (double)(rightZ * step);
     }
-    if (keyA)
+    if (keyLeft)
     {
-        camera->position[0] -= rightX * step;
-        camera->position[2] -= rightZ * step;
+        camera->position[0] -= (double)(rightX * step);
+        camera->position[2] -= (double)(rightZ * step);
+    }
+    if (keyUp)
+    {
+        camera->position[1] += (double)step;
     }
 }
 
-void CameraGetViewMatrix(const Camera* camera, float outMatrix[16])
+void CameraGetViewMatrix(const Camera* camera, const float relativeEyePosition[3], float outMatrix[16])
 {
     float sinPitch = ScalarSin(camera->pitch);
     float cosPitch = ScalarCos(camera->pitch);
@@ -78,9 +87,9 @@ void CameraGetViewMatrix(const Camera* camera, float outMatrix[16])
     float upY = forwardZ * rightX - forwardX * rightZ;
     float upZ = forwardX * rightY - forwardY * rightX;
 
-    float positionX = camera->position[0];
-    float positionY = camera->position[1];
-    float positionZ = camera->position[2];
+    float positionX = relativeEyePosition[0];
+    float positionY = relativeEyePosition[1];
+    float positionZ = relativeEyePosition[2];
 
     outMatrix[0] = rightX;  outMatrix[1] = upX;  outMatrix[2] = forwardX;  outMatrix[3] = 0.0f;
     outMatrix[4] = rightY;  outMatrix[5] = upY;  outMatrix[6] = forwardY;  outMatrix[7] = 0.0f;

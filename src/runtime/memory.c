@@ -5,12 +5,13 @@
 // поэтому каждый модуль обязан носить свои определения — иначе линковка
 // сломается при смене версии компилятора.
 //
-// На скорость это не влияет: на местах вызова компилятор по-прежнему
-// инлайнит интринсики (/Oi); эти функции — только страховка для случаев,
-// когда он решает позвать библиотечную версию.
+// Реализация — интринсики rep stosb / rep movsb: на современных CPU
+// (ERMSB) это аппаратная скорость, а рекурсия невозможна — компилятор
+// выпускает одну инструкцию, а не вызов memset/memcpy.
 
 #include <stddef.h>
 #include <string.h>
+#include <intrin.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 // Иначе cl считает функции интринсиками и не даёт их определить.
@@ -22,28 +23,14 @@
 // Достаточно самого факта существования символа.
 int _fltused = 0;
 
-// volatile не даёт оптимизатору распознать в цикле идиому
-// и свернуть тело обратно в вызов memset/memcpy (бесконечная рекурсия).
-
 void* memset(void* destination, int value, size_t count)
 {
-    volatile unsigned char* destinationBytes = destination;
-    while (count-- > 0)
-    {
-        *destinationBytes++ = (unsigned char)value;
-    }
-
+    __stosb((unsigned char*)destination, (unsigned char)value, count);
     return destination;
 }
 
 void* memcpy(void* destination, const void* source, size_t count)
 {
-    volatile unsigned char* destinationBytes = destination;
-    const unsigned char* sourceBytes = source;
-    while (count-- > 0)
-    {
-        *destinationBytes++ = *sourceBytes++;
-    }
-
+    __movsb((unsigned char*)destination, (const unsigned char*)source, count);
     return destination;
 }

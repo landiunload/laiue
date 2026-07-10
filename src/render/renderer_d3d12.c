@@ -13,27 +13,71 @@
 
 #define FRAME_COUNT 2
 
-// Корневые константы: 16 значений матрицы view-projection + 3 значения
-// смещения чанка (устанавливается на каждый draw).
-#define ROOT_CONSTANT_COUNT 20
-#define ROOT_CONSTANT_CHUNK_ORIGIN_OFFSET 16
+// Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl):
+// dword 0..15 — view-projection, 16..18 — смещение чанка относительно
+// камеры, 20..22 — низшие 32 бита мировых координат угла чанка.
+#define ROOT_CONSTANT_COUNT 23
+#define ROOT_CONSTANT_ORIGIN_OFFSET 16
+#define ROOT_CONSTANT_CHUNK_BASE_OFFSET 20
+#define ROOT_PARAMETER_CONSTANTS 0
+#define ROOT_PARAMETER_QUAD_BUFFER 1
 
-// Очередь отложенного освобождения: ресурс уничтожается, только когда
-// GPU прошёл кадры, которые могли его читать.
+// Пул геометрии: меши суб-аллоцируются из больших DEFAULT-буферов —
+// без 64-КиБ выравнивания на каждый меш и без чтения через PCIe.
+#define POOL_BLOCK_BYTES (4u * 1024u * 1024u)
+#define MAX_POOL_BLOCKS 64
+
+// Очереди отложенного освобождения: ресурс или диапазон пула
+// уничтожается, только когда GPU прошёл кадры, которые могли его читать.
 #define DEFERRED_RELEASE_CAPACITY 256
+#define MAX_PENDING_UPLOADS 64
 
-typedef struct DeferredRelease
+typedef struct FreeRange
+{
+    uint32_t offset;
+    uint32_t size;
+} FreeRange;
+
+typedef struct GeometryPoolBlock
+{
+    ID3D12Resource* buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    uint32_t totalBytes;
+    FreeRange* freeRanges;      // отсортированы по offset, соседние слиты
+    uint32_t freeRangeCount;
+    uint32_t freeRangeCapacity;
+    D3D12_RESOURCE_STATES currentState;
+    bool touchedByUploads;
+} GeometryPoolBlock;
+
+typedef struct PendingUpload
+{
+    ID3D12Resource* staging;
+    uint32_t blockIndex;
+    uint32_t destinationOffset;
+    uint32_t sizeBytes;
+} PendingUpload;
+
+typedef struct DeferredResourceRelease
 {
     ID3D12Resource* resource;
     UINT64 safeFenceValue;
-} DeferredRelease;
+} DeferredResourceRelease;
+
+typedef struct DeferredRangeRelease
+{
+    uint32_t blockIndex;
+    uint32_t offset;
+    uint32_t size;
+    UINT64 safeFenceValue;
+} DeferredRangeRelease;
 
 struct RendererMesh
 {
-    ID3D12Resource*          buffer;
-    D3D12_VERTEX_BUFFER_VIEW vertexView;
-    D3D12_INDEX_BUFFER_VIEW  indexView;
-    uint32_t                 indexCount;
+    uint32_t blockIndex;
+    uint32_t offsetBytes;
+    uint32_t sizeBytes;
+    uint32_t quadCount;
 };
 
 struct Renderer
@@ -56,7 +100,6 @@ struct Renderer
     UINT                       frameIndex;
     ID3D12RootSignature*       rootSignature;
     ID3D12PipelineState*       pipelineState;
-    float                      viewProjection[16];
     D3D12_VIEWPORT             viewport;
     D3D12_RECT                 scissorRect;
     int32_t                    windowWidth;
@@ -65,9 +108,19 @@ struct Renderer
     int32_t                    resizeHeight;
     bool                       resizeRequested;
 
-    DeferredRelease            deferredReleases[DEFERRED_RELEASE_CAPACITY];
-    uint32_t                   deferredReleaseHead;
-    uint32_t                   deferredReleaseCount;
+    GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
+    uint32_t                   poolBlockCount;
+
+    PendingUpload              pendingUploads[MAX_PENDING_UPLOADS];
+    uint32_t                   pendingUploadCount;
+
+    DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
+    uint32_t                   deferredResourceHead;
+    uint32_t                   deferredResourceCount;
+
+    DeferredRangeRelease       deferredRanges[DEFERRED_RELEASE_CAPACITY];
+    uint32_t                   deferredRangeHead;
+    uint32_t                   deferredRangeCount;
 };
 
 static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
@@ -110,39 +163,228 @@ static void MoveToNextFrame(Renderer* renderer)
     renderer->fenceValues[renderer->frameIndex] = currentValue + 1;
 }
 
-// Освобождает ресурсы, кадры которых GPU уже прошёл.
+// === Пул геометрии ===
+
+static bool PoolBlockCreate(Renderer* renderer, uint32_t minimumBytes, uint32_t* outBlockIndex)
+{
+    if (renderer->poolBlockCount == MAX_POOL_BLOCKS)
+    {
+        return false;
+    }
+
+    uint32_t totalBytes = minimumBytes > POOL_BLOCK_BYTES ? minimumBytes : POOL_BLOCK_BYTES;
+
+    GeometryPoolBlock* block = &renderer->poolBlocks[renderer->poolBlockCount];
+    memset(block, 0, sizeof(*block));
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = totalBytes;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE,
+        &description, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&block->buffer)))
+    {
+        return false;
+    }
+
+    block->freeRangeCapacity = 16;
+    block->freeRanges = HeapAlloc(GetProcessHeap(), 0, block->freeRangeCapacity * sizeof(FreeRange));
+    if (block->freeRanges == NULL)
+    {
+        ID3D12Resource_Release(block->buffer);
+        block->buffer = NULL;
+        return false;
+    }
+
+    block->address = ID3D12Resource_GetGPUVirtualAddress(block->buffer);
+    block->totalBytes = totalBytes;
+    block->freeRanges[0].offset = 0;
+    block->freeRanges[0].size = totalBytes;
+    block->freeRangeCount = 1;
+    block->currentState = D3D12_RESOURCE_STATE_COMMON;
+
+    *outBlockIndex = renderer->poolBlockCount++;
+    return true;
+}
+
+static bool PoolAllocate(Renderer* renderer, uint32_t sizeBytes, uint32_t* outBlockIndex, uint32_t* outOffset)
+{
+    for (uint32_t blockIndex = 0; blockIndex < renderer->poolBlockCount; ++blockIndex)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[blockIndex];
+        for (uint32_t i = 0; i < block->freeRangeCount; ++i)
+        {
+            FreeRange* range = &block->freeRanges[i];
+            if (range->size < sizeBytes)
+            {
+                continue;
+            }
+
+            *outBlockIndex = blockIndex;
+            *outOffset = range->offset;
+            range->offset += sizeBytes;
+            range->size -= sizeBytes;
+            if (range->size == 0)
+            {
+                block->freeRanges[i] = block->freeRanges[--block->freeRangeCount];
+                // Список должен оставаться отсортированным для коалесценции —
+                // простая пересортировка вставкой (список короткий).
+                for (uint32_t j = 1; j < block->freeRangeCount; ++j)
+                {
+                    FreeRange moved = block->freeRanges[j];
+                    uint32_t position = j;
+                    while (position > 0 && block->freeRanges[position - 1].offset > moved.offset)
+                    {
+                        block->freeRanges[position] = block->freeRanges[position - 1];
+                        position--;
+                    }
+                    block->freeRanges[position] = moved;
+                }
+            }
+            return true;
+        }
+    }
+
+    uint32_t newBlockIndex;
+    if (!PoolBlockCreate(renderer, sizeBytes, &newBlockIndex))
+    {
+        return false;
+    }
+
+    GeometryPoolBlock* block = &renderer->poolBlocks[newBlockIndex];
+    *outBlockIndex = newBlockIndex;
+    *outOffset = 0;
+    block->freeRanges[0].offset = sizeBytes;
+    block->freeRanges[0].size = block->totalBytes - sizeBytes;
+    block->freeRangeCount = block->freeRanges[0].size == 0 ? 0 : 1;
+    return true;
+}
+
+// Возвращает диапазон в список свободных с коалесценцией соседей.
+static void PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
+{
+    uint32_t position = 0;
+    while (position < block->freeRangeCount && block->freeRanges[position].offset < offset)
+    {
+        position++;
+    }
+
+    bool mergesWithPrevious = position > 0 &&
+        block->freeRanges[position - 1].offset + block->freeRanges[position - 1].size == offset;
+    bool mergesWithNext = position < block->freeRangeCount &&
+        offset + size == block->freeRanges[position].offset;
+
+    if (mergesWithPrevious && mergesWithNext)
+    {
+        block->freeRanges[position - 1].size += size + block->freeRanges[position].size;
+        for (uint32_t i = position; i + 1 < block->freeRangeCount; ++i)
+        {
+            block->freeRanges[i] = block->freeRanges[i + 1];
+        }
+        block->freeRangeCount--;
+        return;
+    }
+    if (mergesWithPrevious)
+    {
+        block->freeRanges[position - 1].size += size;
+        return;
+    }
+    if (mergesWithNext)
+    {
+        block->freeRanges[position].offset = offset;
+        block->freeRanges[position].size += size;
+        return;
+    }
+
+    if (block->freeRangeCount == block->freeRangeCapacity)
+    {
+        uint32_t newCapacity = block->freeRangeCapacity * 2;
+        FreeRange* newRanges = HeapReAlloc(GetProcessHeap(), 0, block->freeRanges, newCapacity * sizeof(FreeRange));
+        if (newRanges == NULL)
+        {
+            return; // диапазон потерян до конца жизни пула — только при OOM
+        }
+        block->freeRanges = newRanges;
+        block->freeRangeCapacity = newCapacity;
+    }
+
+    for (uint32_t i = block->freeRangeCount; i > position; --i)
+    {
+        block->freeRanges[i] = block->freeRanges[i - 1];
+    }
+    block->freeRanges[position].offset = offset;
+    block->freeRanges[position].size = size;
+    block->freeRangeCount++;
+}
+
+// Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
 static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
 {
     UINT64 completedValue = ID3D12Fence_GetCompletedValue(renderer->fence);
 
-    while (renderer->deferredReleaseCount > 0)
+    while (renderer->deferredResourceCount > 0)
     {
-        DeferredRelease* entry = &renderer->deferredReleases[renderer->deferredReleaseHead];
+        DeferredResourceRelease* entry = &renderer->deferredResources[renderer->deferredResourceHead];
         if (!releaseEverything && entry->safeFenceValue > completedValue)
         {
             break;
         }
-
         ID3D12Resource_Release(entry->resource);
-        renderer->deferredReleaseHead = (renderer->deferredReleaseHead + 1) % DEFERRED_RELEASE_CAPACITY;
-        renderer->deferredReleaseCount--;
+        renderer->deferredResourceHead = (renderer->deferredResourceHead + 1) % DEFERRED_RELEASE_CAPACITY;
+        renderer->deferredResourceCount--;
     }
+
+    while (renderer->deferredRangeCount > 0)
+    {
+        DeferredRangeRelease* entry = &renderer->deferredRanges[renderer->deferredRangeHead];
+        if (!releaseEverything && entry->safeFenceValue > completedValue)
+        {
+            break;
+        }
+        PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size);
+        renderer->deferredRangeHead = (renderer->deferredRangeHead + 1) % DEFERRED_RELEASE_CAPACITY;
+        renderer->deferredRangeCount--;
+    }
+}
+
+static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
+{
+    if (renderer->deferredResourceCount == DEFERRED_RELEASE_CAPACITY)
+    {
+        WaitForGpu(renderer);
+        DrainDeferredReleases(renderer, true);
+    }
+
+    uint32_t slot = (renderer->deferredResourceHead + renderer->deferredResourceCount) % DEFERRED_RELEASE_CAPACITY;
+    renderer->deferredResources[slot].resource = resource;
+    renderer->deferredResources[slot].safeFenceValue = renderer->lastSignaledFenceValue + 1;
+    renderer->deferredResourceCount++;
 }
 
 static bool CreateRootSignature(Renderer* renderer)
 {
-    D3D12_ROOT_PARAMETER parameter;
-    memset(&parameter, 0, sizeof(parameter));
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    parameter.Constants.ShaderRegister = 0;
-    parameter.Constants.Num32BitValues = ROOT_CONSTANT_COUNT;
+    D3D12_ROOT_PARAMETER parameters[2];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[ROOT_PARAMETER_CONSTANTS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[ROOT_PARAMETER_CONSTANTS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[ROOT_PARAMETER_CONSTANTS].Constants.ShaderRegister = 0;
+    parameters[ROOT_PARAMETER_CONSTANTS].Constants.Num32BitValues = ROOT_CONSTANT_COUNT;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
 
     D3D12_ROOT_SIGNATURE_DESC description;
     memset(&description, 0, sizeof(description));
-    description.NumParameters = 1;
-    description.pParameters = &parameter;
-    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    description.NumParameters = 2;
+    description.pParameters = parameters;
 
     ID3DBlob* signatureBlob = NULL;
     ID3DBlob* errorBlob = NULL;
@@ -163,13 +405,8 @@ static bool CreateRootSignature(Renderer* renderer)
 
 static bool CreatePipelineState(Renderer* renderer)
 {
-    D3D12_INPUT_ELEMENT_DESC elements[1];
-    memset(elements, 0, sizeof(elements));
-    elements[0].SemanticName = "DATA";
-    elements[0].Format = DXGI_FORMAT_R32_UINT;
-    elements[0].AlignedByteOffset = 0;
-    elements[0].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-
+    // Vertex pulling: вершинных буферов нет, input layout пуст,
+    // геометрия читается шейдером из ByteAddressBuffer по SV_VertexID.
     D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
     memset(&description, 0, sizeof(description));
     description.pRootSignature = renderer->rootSignature;
@@ -177,8 +414,6 @@ static bool CreatePipelineState(Renderer* renderer)
     description.VS.BytecodeLength = sizeof(g_chunk_vs);
     description.PS.pShaderBytecode = g_chunk_ps;
     description.PS.BytecodeLength = sizeof(g_chunk_ps);
-    description.InputLayout.pInputElementDescs = elements;
-    description.InputLayout.NumElements = 1;
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
     description.RasterizerState.FrontCounterClockwise = FALSE;
@@ -399,9 +634,6 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     renderer->scissorRect.right = width;
     renderer->scissorRect.bottom = height;
 
-    renderer->viewProjection[0] = renderer->viewProjection[5] = 1.0f;
-    renderer->viewProjection[10] = renderer->viewProjection[15] = 1.0f;
-
     WaitForGpu(renderer);
 
     return renderer;
@@ -427,6 +659,17 @@ void RendererDestroy(Renderer* renderer)
     if (renderer->fence != NULL)
     {
         DrainDeferredReleases(renderer, true);
+    }
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        ID3D12Resource_Release(renderer->pendingUploads[i].staging);
+    }
+
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        if (renderer->poolBlocks[i].buffer != NULL) ID3D12Resource_Release(renderer->poolBlocks[i].buffer);
+        if (renderer->poolBlocks[i].freeRanges != NULL) HeapFree(GetProcessHeap(), 0, renderer->poolBlocks[i].freeRanges);
     }
 
     if (renderer->fenceEvent != NULL)
@@ -455,77 +698,74 @@ void RendererDestroy(Renderer* renderer)
     HeapFree(GetProcessHeap(), 0, renderer);
 }
 
-void RendererSetViewProjection(Renderer* renderer, const float matrix[16])
+RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
 {
-    for (int32_t i = 0; i < 16; ++i)
-    {
-        renderer->viewProjection[i] = matrix[i];
-    }
-}
-
-RendererMesh* RendererCreateMesh(Renderer* renderer,
-    const ChunkVertex* vertices, uint32_t vertexCount,
-    const uint32_t* indices, uint32_t indexCount)
-{
-    if (vertexCount == 0 || indexCount == 0)
+    if (quadCount == 0 || renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
     {
         return NULL;
     }
 
-    RendererMesh* mesh = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*mesh));
-    if (mesh == NULL)
+    uint32_t sizeBytes = quadCount * (uint32_t)sizeof(ChunkQuad);
+
+    uint32_t blockIndex;
+    uint32_t offsetBytes;
+    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes))
     {
         return NULL;
     }
 
-    uint64_t vertexBytes = (uint64_t)vertexCount * sizeof(ChunkVertex);
-    uint64_t indexBytes = (uint64_t)indexCount * sizeof(uint32_t);
-
-    // Один буфер на меш: [вершины][индексы]. Upload-куча с записью
-    // один раз при создании — стриминга каждый кадр больше нет.
+    // Временный staging-буфер: живёт до исполнения копирования GPU,
+    // освобождается отложенно.
     D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
 
     D3D12_RESOURCE_DESC description;
     memset(&description, 0, sizeof(description));
     description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    description.Width = vertexBytes + indexBytes;
+    description.Width = sizeBytes;
     description.Height = 1;
     description.DepthOrArraySize = 1;
     description.MipLevels = 1;
     description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     description.SampleDesc.Count = 1;
 
+    ID3D12Resource* staging = NULL;
     if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE,
-        &description, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&mesh->buffer)))
+        &description, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&staging)))
     {
-        HeapFree(GetProcessHeap(), 0, mesh);
+        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
         return NULL;
     }
 
     D3D12_RANGE emptyRange = { 0, 0 };
     void* mapped = NULL;
-    if (FAILED(ID3D12Resource_Map(mesh->buffer, 0, &emptyRange, &mapped)))
+    if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
     {
-        ID3D12Resource_Release(mesh->buffer);
-        HeapFree(GetProcessHeap(), 0, mesh);
+        ID3D12Resource_Release(staging);
+        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+        return NULL;
+    }
+    memcpy(mapped, quads, sizeBytes);
+    ID3D12Resource_Unmap(staging, 0, NULL);
+
+    RendererMesh* mesh = HeapAlloc(GetProcessHeap(), 0, sizeof(*mesh));
+    if (mesh == NULL)
+    {
+        ID3D12Resource_Release(staging);
+        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
         return NULL;
     }
 
-    memcpy(mapped, vertices, vertexBytes);
-    memcpy((uint8_t*)mapped + vertexBytes, indices, indexBytes);
-    ID3D12Resource_Unmap(mesh->buffer, 0, NULL);
+    mesh->blockIndex = blockIndex;
+    mesh->offsetBytes = offsetBytes;
+    mesh->sizeBytes = sizeBytes;
+    mesh->quadCount = quadCount;
 
-    D3D12_GPU_VIRTUAL_ADDRESS bufferAddress = ID3D12Resource_GetGPUVirtualAddress(mesh->buffer);
+    PendingUpload* upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
+    upload->staging = staging;
+    upload->blockIndex = blockIndex;
+    upload->destinationOffset = offsetBytes;
+    upload->sizeBytes = sizeBytes;
 
-    mesh->vertexView.BufferLocation = bufferAddress;
-    mesh->vertexView.SizeInBytes = (UINT)vertexBytes;
-    mesh->vertexView.StrideInBytes = (UINT)sizeof(ChunkVertex);
-
-    mesh->indexView.BufferLocation = bufferAddress + vertexBytes;
-    mesh->indexView.SizeInBytes = (UINT)indexBytes;
-    mesh->indexView.Format = DXGI_FORMAT_R32_UINT;
-
-    mesh->indexCount = indexCount;
     return mesh;
 }
 
@@ -536,39 +776,92 @@ void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)
         return;
     }
 
-    // Очередь переполнена — дожидаемся GPU и освобождаем всё накопленное.
-    if (renderer->deferredReleaseCount == DEFERRED_RELEASE_CAPACITY)
+    if (renderer->deferredRangeCount == DEFERRED_RELEASE_CAPACITY)
     {
         WaitForGpu(renderer);
         DrainDeferredReleases(renderer, true);
     }
 
-    uint32_t slot = (renderer->deferredReleaseHead + renderer->deferredReleaseCount) % DEFERRED_RELEASE_CAPACITY;
-    renderer->deferredReleases[slot].resource = mesh->buffer;
-    renderer->deferredReleases[slot].safeFenceValue = renderer->lastSignaledFenceValue + 1;
-    renderer->deferredReleaseCount++;
+    uint32_t slot = (renderer->deferredRangeHead + renderer->deferredRangeCount) % DEFERRED_RELEASE_CAPACITY;
+    renderer->deferredRanges[slot].blockIndex = mesh->blockIndex;
+    renderer->deferredRanges[slot].offset = mesh->offsetBytes;
+    renderer->deferredRanges[slot].size = mesh->sizeBytes;
+    renderer->deferredRanges[slot].safeFenceValue = renderer->lastSignaledFenceValue + 1;
+    renderer->deferredRangeCount++;
 
     HeapFree(GetProcessHeap(), 0, mesh);
 }
 
-void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh, const float chunkOrigin[3])
+void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
+    const float chunkOriginRelative[3], const uint32_t chunkBaseLow[3])
 {
+    GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-        0, 3, chunkOrigin, ROOT_CONSTANT_CHUNK_ORIGIN_OFFSET);
-    ID3D12GraphicsCommandList_IASetVertexBuffers(renderer->commandList, 0, 1, &mesh->vertexView);
-    ID3D12GraphicsCommandList_IASetIndexBuffer(renderer->commandList, &mesh->indexView);
-    ID3D12GraphicsCommandList_DrawIndexedInstanced(renderer->commandList, mesh->indexCount, 1, 0, 0, 0);
+        ROOT_PARAMETER_CONSTANTS, 3, chunkOriginRelative, ROOT_CONSTANT_ORIGIN_OFFSET);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, 3, chunkBaseLow, ROOT_CONSTANT_CHUNK_BASE_OFFSET);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
+        ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
+    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
 }
 
-static void ApplyPendingResize(Renderer* renderer)
+// Записывает отложенные загрузки мешей в командный список кадра.
+static void RecordPendingUploads(Renderer* renderer)
 {
-    renderer->resizeRequested = false;
+    if (renderer->pendingUploadCount == 0)
+    {
+        return;
+    }
 
+    // Блоки с загрузками — в состояние приёмника копирования.
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[renderer->pendingUploads[i].blockIndex];
+        if (!block->touchedByUploads)
+        {
+            block->touchedByUploads = true;
+            D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(block->buffer,
+                block->currentState, D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+            block->currentState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        PendingUpload* upload = &renderer->pendingUploads[i];
+        GeometryPoolBlock* block = &renderer->poolBlocks[upload->blockIndex];
+        ID3D12GraphicsCommandList_CopyBufferRegion(renderer->commandList,
+            block->buffer, upload->destinationOffset, upload->staging, 0, upload->sizeBytes);
+        DeferResourceRelease(renderer, upload->staging);
+    }
+
+    // Обратно в состояние чтения вершинным шейдером.
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[i];
+        if (block->touchedByUploads)
+        {
+            block->touchedByUploads = false;
+            D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(block->buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+            block->currentState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        }
+    }
+
+    renderer->pendingUploadCount = 0;
+}
+
+static bool ApplyPendingResize(Renderer* renderer)
+{
     int32_t width = renderer->resizeWidth;
     int32_t height = renderer->resizeHeight;
     if (width <= 0 || height <= 0)
     {
-        return;
+        renderer->resizeRequested = false;
+        return true;
     }
 
     WaitForGpu(renderer);
@@ -582,20 +875,38 @@ static void ApplyPendingResize(Renderer* renderer)
         }
     }
 
-    IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
+        DXGI_FORMAT_R8G8B8A8_UNORM, 0)))
+    {
+        return false; // resizeRequested остаётся — повтор в следующем кадре
+    }
+
+    // ResizeBuffers сбрасывает индекс back-буфера: чтобы подписи фенса
+    // остались монотонными, все слоты выравниваются по текущему значению
+    // (иначе ~каждый второй ресайз зависал бы навсегда).
+    UINT64 currentFenceValue = renderer->fenceValues[renderer->frameIndex];
     renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        renderer->fenceValues[i] = currentFenceValue;
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
     for (UINT i = 0; i < FRAME_COUNT; ++i)
     {
-        IDXGISwapChain3_GetBuffer(renderer->swapChain, i, &IID_ID3D12Resource, (void**)&renderer->renderTargets[i]);
+        if (FAILED(IDXGISwapChain3_GetBuffer(renderer->swapChain, i, &IID_ID3D12Resource, (void**)&renderer->renderTargets[i])))
+        {
+            return false;
+        }
         ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i], NULL, renderTargetViewHandle);
         renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
     }
 
-    CreateDepthBuffer(renderer, width, height);
+    if (!CreateDepthBuffer(renderer, width, height))
+    {
+        return false;
+    }
 
     renderer->windowWidth = width;
     renderer->windowHeight = height;
@@ -603,21 +914,29 @@ static void ApplyPendingResize(Renderer* renderer)
     renderer->viewport.Height = (float)height;
     renderer->scissorRect.right = width;
     renderer->scissorRect.bottom = height;
+    renderer->resizeRequested = false;
+    return true;
 }
 
-void RendererBeginFrame(Renderer* renderer)
+bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16])
 {
-    // Отложенный resize: применяется, когда GPU дошёл до этого кадра
-    // (забор предыдущего кадра проверен в MoveToNextFrame).
-    if (renderer->resizeRequested)
+    // Отложенный resize: применяется, когда GPU дошёл до этого кадра.
+    // При неудаче кадр пропускается, попытка повторится в следующем.
+    if (renderer->resizeRequested && !ApplyPendingResize(renderer))
     {
-        ApplyPendingResize(renderer);
+        return false;
+    }
+    if (renderer->renderTargets[renderer->frameIndex] == NULL || renderer->depthBuffer == NULL)
+    {
+        return false;
     }
 
     DrainDeferredReleases(renderer, false);
 
     ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex]);
     ID3D12GraphicsCommandList_Reset(renderer->commandList, renderer->commandAllocators[renderer->frameIndex], renderer->pipelineState);
+
+    RecordPendingUploads(renderer);
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -641,9 +960,11 @@ void RendererBeginFrame(Renderer* renderer)
     ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
 
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList, renderer->rootSignature);
-    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList, renderer->pipelineState);
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList, 0, 16, renderer->viewProjection, 0);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, 16, viewProjection, 0);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    return true;
 }
 
 void RendererEndFrame(Renderer* renderer)

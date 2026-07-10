@@ -6,6 +6,12 @@
 
 #include <windows.h>
 
+#define MAX_WORKER_THREADS 4
+
+// Бюджет загрузок на GPU за один кадр: сглаживает волну готовых мешей
+// при пересечении границы чанка (иначе — разовый фриз кадра).
+#define MESH_UPLOADS_PER_FRAME 4
+
 typedef enum ChunkEntryState
 {
     CHUNK_ENTRY_EMPTY = 0,
@@ -19,7 +25,9 @@ typedef struct ChunkEntry
     int64_t y;
     int64_t z;
     RendererMesh* mesh;
+    uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
     ChunkEntryState state;
+    bool requestQueued;     // есть ли в очереди заявка текущей ревизии
 } ChunkEntry;
 
 typedef struct ChunkRequest
@@ -27,6 +35,7 @@ typedef struct ChunkRequest
     int64_t x;
     int64_t y;
     int64_t z;
+    uint32_t revision;
 } ChunkRequest;
 
 typedef struct ChunkMeshResult
@@ -34,11 +43,17 @@ typedef struct ChunkMeshResult
     int64_t x;
     int64_t y;
     int64_t z;
-    ChunkVertex* vertices;
-    uint32_t vertexCount;
-    uint32_t* indices;
-    uint32_t indexCount;
+    uint32_t revision;
+    ChunkQuad* quads;
+    uint32_t quadCount;
+    bool succeeded;
 } ChunkMeshResult;
+
+typedef struct DrawItem
+{
+    float distanceSquared;
+    uint32_t entryIndex;
+} DrawItem;
 
 struct ChunkStreaming
 {
@@ -55,8 +70,11 @@ struct ChunkStreaming
     ChunkEntry* entries;
     uint32_t capacity;
 
-    // Кольцевые очереди под общим замком; ёмкость гарантирует,
-    // что число заявок в полёте никогда не превысит очередь результатов.
+    DrawItem* drawItems;    // переиспользуемый буфер сортировки отрисовки
+
+    // Кольцевые очереди под общим замком. Гарантия отсутствия потерь:
+    // unfinishedWork (заявки + в работе + результаты) не превышает
+    // ёмкость, поэтому очередь результатов переполниться не может.
     ChunkRequest* requests;
     uint32_t requestHead;
     uint32_t requestCount;
@@ -64,25 +82,19 @@ struct ChunkStreaming
     uint32_t resultHead;
     uint32_t resultCount;
     uint32_t queueCapacity;
+    uint32_t unfinishedWork;
 
     SRWLOCK queueLock;
     CONDITION_VARIABLE workAvailable;
-    HANDLE workerThread;
+    HANDLE workerThreads[MAX_WORKER_THREADS];
+    uint32_t workerThreadCount;
     bool shutdownRequested;
 };
-
-static uint32_t HashChunkCoordinate(int64_t x, int64_t y, int64_t z)
-{
-    uint64_t hash = (uint64_t)x * 73856093ULL
-                  ^ (uint64_t)y * 19349663ULL
-                  ^ (uint64_t)z * 83492791ULL;
-    return (uint32_t)(hash ^ (hash >> 33));
-}
 
 static ChunkEntry* FindEntry(const ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
 {
     uint32_t mask = streaming->capacity - 1;
-    uint32_t index = HashChunkCoordinate(x, y, z) & mask;
+    uint32_t index = WorldHashChunkCoordinate(x, y, z) & mask;
 
     for (uint32_t probe = 0; probe < streaming->capacity; ++probe)
     {
@@ -104,7 +116,7 @@ static ChunkEntry* FindEntry(const ChunkStreaming* streaming, int64_t x, int64_t
 static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
 {
     uint32_t mask = streaming->capacity - 1;
-    uint32_t index = HashChunkCoordinate(x, y, z) & mask;
+    uint32_t index = WorldHashChunkCoordinate(x, y, z) & mask;
 
     while (streaming->entries[index].state != CHUNK_ENTRY_EMPTY)
     {
@@ -116,10 +128,12 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     entry->y = y;
     entry->z = z;
     entry->mesh = NULL;
+    entry->revision = 0;
+    entry->requestQueued = false;
     return entry;
 }
 
-static bool IsInsideRadius(const ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
+static bool IsInsideRadius(const ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, int64_t radius)
 {
     int64_t deltaX = x - streaming->centerX;
     int64_t deltaY = y - streaming->centerY;
@@ -127,13 +141,48 @@ static bool IsInsideRadius(const ChunkStreaming* streaming, int64_t x, int64_t y
     if (deltaX < 0) deltaX = -deltaX;
     if (deltaY < 0) deltaY = -deltaY;
     if (deltaZ < 0) deltaZ = -deltaZ;
-    int64_t radius = streaming->viewRadius;
     return deltaX <= radius && deltaY <= radius && deltaZ <= radius;
+}
+
+// Ставит заявку текущей ревизии записи; false — очередь занята,
+// повторная попытка произойдёт в ChunkStreamingPump.
+static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
+{
+    bool enqueued = false;
+
+    AcquireSRWLockExclusive(&streaming->queueLock);
+    if (streaming->unfinishedWork < streaming->queueCapacity)
+    {
+        uint32_t queueMask = streaming->queueCapacity - 1;
+        ChunkRequest* request = &streaming->requests[(streaming->requestHead + streaming->requestCount) & queueMask];
+        request->x = entry->x;
+        request->y = entry->y;
+        request->z = entry->z;
+        request->revision = entry->revision;
+        streaming->requestCount++;
+        streaming->unfinishedWork++;
+        enqueued = true;
+    }
+    ReleaseSRWLockExclusive(&streaming->queueLock);
+
+    if (enqueued)
+    {
+        WakeConditionVariable(&streaming->workAvailable);
+    }
+
+    entry->requestQueued = enqueued;
+    return enqueued;
 }
 
 static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
 {
     ChunkStreaming* streaming = parameter;
+
+    ChunkMesherScratch* scratch = ChunkMesherScratchCreate();
+    if (scratch == NULL)
+    {
+        return 1;
+    }
 
     for (;;)
     {
@@ -142,9 +191,10 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
         {
             SleepConditionVariableSRW(&streaming->workAvailable, &streaming->queueLock, INFINITE, 0);
         }
-        if (streaming->shutdownRequested && streaming->requestCount == 0)
+        if (streaming->shutdownRequested)
         {
             ReleaseSRWLockExclusive(&streaming->queueLock);
+            ChunkMesherScratchDestroy(scratch);
             return 0;
         }
 
@@ -155,22 +205,15 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
         ReleaseSRWLockExclusive(&streaming->queueLock);
 
         // Тяжёлая работа — без замка.
-        ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z };
-        BuildChunkMesh(streaming->world, request.x, request.y, request.z,
-            &result.vertices, &result.vertexCount, &result.indices, &result.indexCount);
+        ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
+        result.succeeded = BuildChunkMesh(streaming->world, scratch,
+            request.x, request.y, request.z, &result.quads, &result.quadCount);
 
+        // Очередь результатов переполниться не может: unfinishedWork
+        // ограничен её ёмкостью.
         AcquireSRWLockExclusive(&streaming->queueLock);
-        if (streaming->resultCount < streaming->queueCapacity)
-        {
-            streaming->results[(streaming->resultHead + streaming->resultCount) & queueMask] = result;
-            streaming->resultCount++;
-        }
-        else
-        {
-            // Не должно случаться: ёмкости очередей совпадают.
-            if (result.vertices != NULL) HeapFree(GetProcessHeap(), 0, result.vertices);
-            if (result.indices != NULL) HeapFree(GetProcessHeap(), 0, result.indices);
-        }
+        streaming->results[(streaming->resultHead + streaming->resultCount) & queueMask] = result;
+        streaming->resultCount++;
         ReleaseSRWLockExclusive(&streaming->queueLock);
     }
 }
@@ -187,8 +230,9 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     streaming->renderer = renderer;
     streaming->viewRadius = viewRadiusChunks;
 
-    // Ёмкости — степени двойки с двукратным запасом от объёма радиуса.
-    uint32_t diameter = (uint32_t)(viewRadiusChunks * 2 + 1);
+    // Ёмкости — степени двойки с двукратным запасом от объёма радиуса
+    // (гистерезис держит записи до радиуса + 1).
+    uint32_t diameter = (uint32_t)(viewRadiusChunks * 2 + 3);
     uint32_t volume = diameter * diameter * diameter;
     uint32_t capacity = 1;
     while (capacity < volume * 2)
@@ -199,20 +243,41 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     streaming->capacity = capacity;
     streaming->queueCapacity = capacity;
     streaming->entries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof(ChunkEntry));
+    streaming->drawItems = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(DrawItem));
     streaming->requests = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkRequest));
     streaming->results = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkMeshResult));
 
     InitializeSRWLock(&streaming->queueLock);
     InitializeConditionVariable(&streaming->workAvailable);
 
-    if (streaming->entries == NULL || streaming->requests == NULL || streaming->results == NULL)
+    if (streaming->entries == NULL || streaming->drawItems == NULL ||
+        streaming->requests == NULL || streaming->results == NULL)
     {
         ChunkStreamingDestroy(streaming);
         return NULL;
     }
 
-    streaming->workerThread = CreateThread(NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
-    if (streaming->workerThread == NULL)
+    // Пул потоков мешинга: масштабируется по ядрам процессора.
+    SYSTEM_INFO systemInformation;
+    GetSystemInfo(&systemInformation);
+    uint32_t workerCount = systemInformation.dwNumberOfProcessors > 2
+        ? systemInformation.dwNumberOfProcessors - 2
+        : 1;
+    if (workerCount > MAX_WORKER_THREADS)
+    {
+        workerCount = MAX_WORKER_THREADS;
+    }
+
+    for (uint32_t i = 0; i < workerCount; ++i)
+    {
+        HANDLE thread = CreateThread(NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
+        if (thread != NULL)
+        {
+            streaming->workerThreads[streaming->workerThreadCount++] = thread;
+        }
+    }
+
+    if (streaming->workerThreadCount == 0)
     {
         ChunkStreamingDestroy(streaming);
         return NULL;
@@ -228,17 +293,18 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         return;
     }
 
-    if (streaming->workerThread != NULL)
+    if (streaming->workerThreadCount > 0)
     {
         AcquireSRWLockExclusive(&streaming->queueLock);
         streaming->shutdownRequested = true;
-        // Невыполненные заявки не нужны — поток завершится быстрее.
-        streaming->requestCount = 0;
         WakeAllConditionVariable(&streaming->workAvailable);
         ReleaseSRWLockExclusive(&streaming->queueLock);
 
-        WaitForSingleObject(streaming->workerThread, INFINITE);
-        CloseHandle(streaming->workerThread);
+        WaitForMultipleObjects(streaming->workerThreadCount, streaming->workerThreads, TRUE, INFINITE);
+        for (uint32_t i = 0; i < streaming->workerThreadCount; ++i)
+        {
+            CloseHandle(streaming->workerThreads[i]);
+        }
     }
 
     // Остаточные результаты: освободить CPU-массивы.
@@ -248,8 +314,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         for (uint32_t i = 0; i < streaming->resultCount; ++i)
         {
             ChunkMeshResult* result = &streaming->results[(streaming->resultHead + i) & queueMask];
-            if (result->vertices != NULL) HeapFree(GetProcessHeap(), 0, result->vertices);
-            if (result->indices != NULL) HeapFree(GetProcessHeap(), 0, result->indices);
+            if (result->quads != NULL) HeapFree(GetProcessHeap(), 0, result->quads);
         }
     }
 
@@ -265,6 +330,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         HeapFree(GetProcessHeap(), 0, streaming->entries);
     }
 
+    if (streaming->drawItems != NULL) HeapFree(GetProcessHeap(), 0, streaming->drawItems);
     if (streaming->requests != NULL) HeapFree(GetProcessHeap(), 0, streaming->requests);
     if (streaming->results != NULL) HeapFree(GetProcessHeap(), 0, streaming->results);
     HeapFree(GetProcessHeap(), 0, streaming);
@@ -278,14 +344,8 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         return;
     }
 
-    streaming->hasCenter = true;
-    streaming->centerX = chunkX;
-    streaming->centerY = chunkY;
-    streaming->centerZ = chunkZ;
-
-    // Пересборка таблицы: живущие в радиусе переносятся,
-    // вышедшие из радиуса — освобождаются (отложенно, под fence).
-    ChunkEntry* previousEntries = streaming->entries;
+    // Свежая таблица выделяется ДО смены центра: при нехватке памяти
+    // состояние не трогается, попытка повторится в следующем кадре.
     ChunkEntry* freshEntries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         (size_t)streaming->capacity * sizeof(ChunkEntry));
     if (freshEntries == NULL)
@@ -293,7 +353,16 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         return;
     }
 
+    streaming->hasCenter = true;
+    streaming->centerX = chunkX;
+    streaming->centerY = chunkY;
+    streaming->centerZ = chunkZ;
+
+    // Пересборка таблицы с гистерезисом: живущие в радиусе + 1
+    // переносятся, дальние освобождаются (отложенно, под fence).
+    ChunkEntry* previousEntries = streaming->entries;
     streaming->entries = freshEntries;
+
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
         ChunkEntry* previous = &previousEntries[i];
@@ -302,11 +371,13 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
             continue;
         }
 
-        if (IsInsideRadius(streaming, previous->x, previous->y, previous->z))
+        if (IsInsideRadius(streaming, previous->x, previous->y, previous->z, (int64_t)streaming->viewRadius + 1))
         {
             ChunkEntry* moved = InsertEntry(streaming, previous->x, previous->y, previous->z);
             moved->state = previous->state;
             moved->mesh = previous->mesh;
+            moved->revision = previous->revision;
+            moved->requestQueued = previous->requestQueued;
         }
         else if (previous->mesh != NULL)
         {
@@ -316,10 +387,6 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     HeapFree(GetProcessHeap(), 0, previousEntries);
 
     // Заказ недостающих чанков оболочками — от ближних к дальним.
-    AcquireSRWLockExclusive(&streaming->queueLock);
-    uint32_t queueMask = streaming->queueCapacity - 1;
-    bool enqueuedAny = false;
-
     for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
     {
         for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
@@ -345,71 +412,143 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
                     {
                         continue;
                     }
-                    if (streaming->requestCount >= streaming->queueCapacity)
-                    {
-                        continue;
-                    }
 
                     ChunkEntry* entry = InsertEntry(streaming, x, y, z);
                     entry->state = CHUNK_ENTRY_PENDING;
-
-                    ChunkRequest* request = &streaming->requests[(streaming->requestHead + streaming->requestCount) & queueMask];
-                    request->x = x;
-                    request->y = y;
-                    request->z = z;
-                    streaming->requestCount++;
-                    enqueuedAny = true;
+                    TryEnqueueRequest(streaming, entry);
                 }
             }
         }
     }
+}
 
-    ReleaseSRWLockExclusive(&streaming->queueLock);
-    if (enqueuedAny)
+void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, int64_t blockY, int64_t blockZ)
+{
+    int64_t chunkX = blockX >> CHUNK_SIZE_LOG2;
+    int64_t chunkY = blockY >> CHUNK_SIZE_LOG2;
+    int64_t chunkZ = blockZ >> CHUNK_SIZE_LOG2;
+    int64_t localX = blockX & (CHUNK_SIZE - 1);
+    int64_t localY = blockY & (CHUNK_SIZE - 1);
+    int64_t localZ = blockZ & (CHUNK_SIZE - 1);
+
+    // Блок на границе чанка входит в расширенный регион соседа —
+    // соседние чанки перестраиваются тоже.
+    int64_t offsetsX[2] = { 0, localX == 0 ? -1 : (localX == CHUNK_SIZE - 1 ? 1 : 0) };
+    int64_t offsetsY[2] = { 0, localY == 0 ? -1 : (localY == CHUNK_SIZE - 1 ? 1 : 0) };
+    int64_t offsetsZ[2] = { 0, localZ == 0 ? -1 : (localZ == CHUNK_SIZE - 1 ? 1 : 0) };
+
+    for (int32_t indexZ = 0; indexZ < 2; ++indexZ)
     {
-        WakeAllConditionVariable(&streaming->workAvailable);
+        if (indexZ == 1 && offsetsZ[1] == 0) continue;
+        for (int32_t indexY = 0; indexY < 2; ++indexY)
+        {
+            if (indexY == 1 && offsetsY[1] == 0) continue;
+            for (int32_t indexX = 0; indexX < 2; ++indexX)
+            {
+                if (indexX == 1 && offsetsX[1] == 0) continue;
+
+                ChunkEntry* entry = FindEntry(streaming,
+                    chunkX + offsetsX[indexX], chunkY + offsetsY[indexY], chunkZ + offsetsZ[indexZ]);
+                if (entry == NULL)
+                {
+                    continue;
+                }
+
+                if (entry->mesh != NULL)
+                {
+                    RendererDestroyMesh(streaming->renderer, entry->mesh);
+                    entry->mesh = NULL;
+                }
+                entry->state = CHUNK_ENTRY_PENDING;
+                entry->revision++;
+                TryEnqueueRequest(streaming, entry);
+            }
+        }
     }
 }
 
 void ChunkStreamingPump(ChunkStreaming* streaming)
 {
     uint32_t queueMask = streaming->queueCapacity - 1;
+    uint32_t uploadBudget = MESH_UPLOADS_PER_FRAME;
 
     for (;;)
     {
+        // Заглянуть в очередь: результат с геометрией берём только
+        // при оставшемся бюджете загрузок, остальные — бесплатны.
         AcquireSRWLockExclusive(&streaming->queueLock);
         if (streaming->resultCount == 0)
         {
             ReleaseSRWLockExclusive(&streaming->queueLock);
-            return;
+            break;
         }
+
         ChunkMeshResult result = streaming->results[streaming->resultHead & queueMask];
+        if (result.quadCount > 0 && uploadBudget == 0)
+        {
+            ReleaseSRWLockExclusive(&streaming->queueLock);
+            break;
+        }
         streaming->resultHead++;
         streaming->resultCount--;
+        streaming->unfinishedWork--;
         ReleaseSRWLockExclusive(&streaming->queueLock);
 
         ChunkEntry* entry = FindEntry(streaming, result.x, result.y, result.z);
-        if (entry != NULL && entry->state == CHUNK_ENTRY_PENDING &&
-            IsInsideRadius(streaming, result.x, result.y, result.z))
+        if (entry != NULL && entry->state == CHUNK_ENTRY_PENDING && entry->revision == result.revision)
         {
-            if (result.vertexCount > 0)
+            if (!result.succeeded)
             {
-                entry->mesh = RendererCreateMesh(streaming->renderer,
-                    result.vertices, result.vertexCount, result.indices, result.indexCount);
+                // Сбой построения (нехватка памяти): повторная попытка
+                // через сканирование ниже.
+                entry->requestQueued = false;
             }
-            entry->state = CHUNK_ENTRY_READY;
+            else if (result.quadCount > 0)
+            {
+                RendererMesh* mesh = RendererCreateMesh(streaming->renderer, result.quads, result.quadCount);
+                if (mesh != NULL)
+                {
+                    entry->mesh = mesh;
+                    entry->state = CHUNK_ENTRY_READY;
+                    uploadBudget--;
+                }
+                else
+                {
+                    entry->requestQueued = false;
+                }
+            }
+            else
+            {
+                entry->state = CHUNK_ENTRY_READY;
+            }
         }
 
-        if (result.vertices != NULL) HeapFree(GetProcessHeap(), 0, result.vertices);
-        if (result.indices != NULL) HeapFree(GetProcessHeap(), 0, result.indices);
+        if (result.quads != NULL)
+        {
+            HeapFree(GetProcessHeap(), 0, result.quads);
+        }
+    }
+
+    // Повторные заявки: записи, оставшиеся без заявки (переполнение
+    // очереди, сбой построения или загрузки).
+    for (uint32_t i = 0; i < streaming->capacity; ++i)
+    {
+        ChunkEntry* entry = &streaming->entries[i];
+        if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
+        {
+            TryEnqueueRequest(streaming, entry);
+        }
     }
 }
 
-void ChunkStreamingDraw(const ChunkStreaming* streaming, const float viewProjection[16])
+void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16],
+    const int64_t cameraBlockPosition[3])
 {
     float planes[6][4];
     Matrix4ExtractFrustumPlanes(viewProjection, planes);
 
+    // Сбор видимых мешей с расстоянием до камеры.
+    uint32_t drawCount = 0;
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
         const ChunkEntry* entry = &streaming->entries[i];
@@ -419,9 +558,9 @@ void ChunkStreamingDraw(const ChunkStreaming* streaming, const float viewProject
         }
 
         float minimum[3] = {
-            (float)(entry->x * CHUNK_SIZE),
-            (float)(entry->y * CHUNK_SIZE),
-            (float)(entry->z * CHUNK_SIZE),
+            (float)(entry->x * CHUNK_SIZE - cameraBlockPosition[0]),
+            (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
+            (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
         };
         float maximum[3] = {
             minimum[0] + (float)CHUNK_SIZE,
@@ -429,9 +568,49 @@ void ChunkStreamingDraw(const ChunkStreaming* streaming, const float viewProject
             minimum[2] + (float)CHUNK_SIZE,
         };
 
-        if (FrustumIntersectsBox(planes, minimum, maximum))
+        if (!FrustumIntersectsBox(planes, minimum, maximum))
         {
-            RendererDrawMesh(streaming->renderer, entry->mesh, minimum);
+            continue;
         }
+
+        float centerX = minimum[0] + (float)(CHUNK_SIZE / 2);
+        float centerY = minimum[1] + (float)(CHUNK_SIZE / 2);
+        float centerZ = minimum[2] + (float)(CHUNK_SIZE / 2);
+
+        streaming->drawItems[drawCount].distanceSquared = centerX * centerX + centerY * centerY + centerZ * centerZ;
+        streaming->drawItems[drawCount].entryIndex = i;
+        drawCount++;
+    }
+
+    // Сортировка спереди-назад: ближние чанки заполняют глубину первыми,
+    // перекрытые пиксели дальних отсекаются early-Z.
+    for (uint32_t i = 1; i < drawCount; ++i)
+    {
+        DrawItem item = streaming->drawItems[i];
+        uint32_t position = i;
+        while (position > 0 && streaming->drawItems[position - 1].distanceSquared > item.distanceSquared)
+        {
+            streaming->drawItems[position] = streaming->drawItems[position - 1];
+            position--;
+        }
+        streaming->drawItems[position] = item;
+    }
+
+    for (uint32_t i = 0; i < drawCount; ++i)
+    {
+        const ChunkEntry* entry = &streaming->entries[streaming->drawItems[i].entryIndex];
+
+        float chunkOriginRelative[3] = {
+            (float)(entry->x * CHUNK_SIZE - cameraBlockPosition[0]),
+            (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
+            (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
+        };
+        uint32_t chunkBaseLow[3] = {
+            (uint32_t)(uint64_t)(entry->x * CHUNK_SIZE),
+            (uint32_t)(uint64_t)(entry->y * CHUNK_SIZE),
+            (uint32_t)(uint64_t)(entry->z * CHUNK_SIZE),
+        };
+
+        RendererDrawMesh(streaming->renderer, entry->mesh, chunkOriginRelative, chunkBaseLow);
     }
 }

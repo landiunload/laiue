@@ -26,37 +26,28 @@ static inline int32_t FloorToInt(float value)
     return (value >= 0.0f || (float)truncated == value) ? truncated : truncated - 1;
 }
 
-static float Noise3D(int64_t seed, float x, float y, float z)
+// 2D-срез прежнего 3D-шума (плоскость y = 0): вклад узлов y = 1 был
+// умножен на SmoothStep(0) = 0, поэтому результат идентичен старому.
+static float Noise2D(int64_t seed, float x, float z)
 {
     int32_t integerX = FloorToInt(x);
-    int32_t integerY = FloorToInt(y);
     int32_t integerZ = FloorToInt(z);
 
     float smoothX = SmoothStep(x - (float)integerX);
-    float smoothY = SmoothStep(y - (float)integerY);
     float smoothZ = SmoothStep(z - (float)integerZ);
 
-    float n000 = ToUnitFloat(HashCoordinates(integerX,     integerY,     integerZ,     seed));
-    float n100 = ToUnitFloat(HashCoordinates(integerX + 1, integerY,     integerZ,     seed));
-    float n010 = ToUnitFloat(HashCoordinates(integerX,     integerY + 1, integerZ,     seed));
-    float n110 = ToUnitFloat(HashCoordinates(integerX + 1, integerY + 1, integerZ,     seed));
-    float n001 = ToUnitFloat(HashCoordinates(integerX,     integerY,     integerZ + 1, seed));
-    float n101 = ToUnitFloat(HashCoordinates(integerX + 1, integerY,     integerZ + 1, seed));
-    float n011 = ToUnitFloat(HashCoordinates(integerX,     integerY + 1, integerZ + 1, seed));
-    float n111 = ToUnitFloat(HashCoordinates(integerX + 1, integerY + 1, integerZ + 1, seed));
+    float n00 = ToUnitFloat(HashCoordinates(integerX,     0, integerZ,     seed));
+    float n10 = ToUnitFloat(HashCoordinates(integerX + 1, 0, integerZ,     seed));
+    float n01 = ToUnitFloat(HashCoordinates(integerX,     0, integerZ + 1, seed));
+    float n11 = ToUnitFloat(HashCoordinates(integerX + 1, 0, integerZ + 1, seed));
 
-    float nx00 = n000 + (n100 - n000) * smoothX;
-    float nx10 = n010 + (n110 - n010) * smoothX;
-    float nx01 = n001 + (n101 - n001) * smoothX;
-    float nx11 = n011 + (n111 - n011) * smoothX;
+    float nx0 = n00 + (n10 - n00) * smoothX;
+    float nx1 = n01 + (n11 - n01) * smoothX;
 
-    float nxy0 = nx00 + (nx10 - nx00) * smoothY;
-    float nxy1 = nx01 + (nx11 - nx01) * smoothY;
-
-    return nxy0 + (nxy1 - nxy0) * smoothZ;
+    return nx0 + (nx1 - nx0) * smoothZ;
 }
 
-static float FractalBrownianMotion(int64_t seed, float x, float y, float z, int32_t octaves)
+static float FractalBrownianMotion(int64_t seed, float x, float z, int32_t octaves)
 {
     float value = 0.0f;
     float amplitude = 1.0f;
@@ -65,7 +56,7 @@ static float FractalBrownianMotion(int64_t seed, float x, float y, float z, int3
 
     for (int32_t octave = 0; octave < octaves; ++octave)
     {
-        value += amplitude * Noise3D(seed, x * frequency, y * frequency, z * frequency);
+        value += amplitude * Noise2D(seed, x * frequency, z * frequency);
         maximumValue += amplitude;
         amplitude *= 0.5f;
         frequency *= 2.0f;
@@ -74,7 +65,7 @@ static float FractalBrownianMotion(int64_t seed, float x, float y, float z, int3
     return value / maximumValue;
 }
 
-float GenerateNoise(int64_t seed, float x, float y, float z)
+float GenerateTerrainNoise(int64_t seed, float x, float z)
 {
-    return FractalBrownianMotion(seed, x, y, z, 4);
+    return FractalBrownianMotion(seed, x, z, 4);
 }

@@ -285,8 +285,13 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
             onFrame(userData);
         }
 
-        // ~60 кадров в секунду при простое, ~0% CPU без сообщений.
-        MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT);
+        // В фокусе темп кадров дозирует vsync внутри кадра (Present);
+        // дополнительный сон здесь пропускал бы каждый второй vblank.
+        // Вне фокуса — экономный режим: ~20 кадров в секунду.
+        if (!window->focused)
+        {
+            MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
+        }
     }
 }
 

@@ -1,44 +1,63 @@
 #pragma pack_matrix(row_major)
 
-// Вершина несёт только упакованную локальную позицию и номер грани;
-// цвет и затенение восстанавливаются в пиксельном шейдере — благодаря
-// этому greedy meshing может сливать грани разных блоков.
+// Vertex pulling: вершинных буферов нет — квады читаются из
+// ByteAddressBuffer по SV_VertexID (6 вершин на квад).
+// Раскладка квада (8 байт) описана в src/render/chunk_geometry.h —
+// держать в синхроне!
+//
+// Origin rebasing: камера всегда около нуля; chunkOriginRelative —
+// смещение чанка относительно блока камеры, chunkBaseLow — низшие
+// 32 бита мировых блочных координат угла чанка (для цвета).
 cbuffer FrameConstants : register(b0)
 {
-    float4x4 viewProjection;
-    float3 chunkOrigin;
+    float4x4 viewProjection;     // dword 0..15
+    float3 chunkOriginRelative;  // dword 16..18
+    uint3 chunkBaseLow;          // dword 20..22
 };
 
-struct VertexInput
-{
-    uint packedData : DATA;
-};
+ByteAddressBuffer quadBuffer : register(t0);
 
 struct PixelInput
 {
     float4 position : SV_POSITION;
-    float3 worldPosition : WORLDPOSITION;
+    float3 localPosition : LOCALPOSITION;
     nointerpolation uint face : FACEINDEX;
 };
 
-PixelInput VSMain(VertexInput input)
-{
-    uint packedData = input.packedData;
-    float3 localPosition = float3(
-        packedData & 127,
-        (packedData >> 7) & 127,
-        (packedData >> 14) & 127);
+// Два треугольника квада: вершины 0,1,2 и 0,2,3.
+static const uint CORNER_PATTERN[6] = { 0, 1, 2, 0, 2, 3 };
 
-    float3 worldPosition = chunkOrigin + localPosition;
+// Четыре угла каждой грани (обход по часовой стрелке снаружи —
+// под back-face culling). Порядок граней: +X, -X, +Y, -Y, +Z, -Z.
+static const uint3 FACE_CORNERS[6][4] =
+{
+    { uint3(1,1,0), uint3(1,1,1), uint3(1,0,1), uint3(1,0,0) },
+    { uint3(0,1,1), uint3(0,1,0), uint3(0,0,0), uint3(0,0,1) },
+    { uint3(0,1,1), uint3(1,1,1), uint3(1,1,0), uint3(0,1,0) },
+    { uint3(1,0,1), uint3(0,0,1), uint3(0,0,0), uint3(1,0,0) },
+    { uint3(1,1,1), uint3(0,1,1), uint3(0,0,1), uint3(1,0,1) },
+    { uint3(0,1,0), uint3(1,1,0), uint3(1,0,0), uint3(0,0,0) },
+};
+
+PixelInput VSMain(uint vertexId : SV_VertexID)
+{
+    uint quadIndex = vertexId / 6;
+    uint cornerIndex = CORNER_PATTERN[vertexId % 6];
+
+    uint2 quad = quadBuffer.Load2(quadIndex * 8);
+    uint3 start = uint3(quad.x & 127, (quad.x >> 7) & 127, (quad.x >> 14) & 127);
+    uint face = (quad.x >> 21) & 7;
+    uint3 extent = uint3(quad.y & 127, (quad.y >> 7) & 127, (quad.y >> 14) & 127);
+
+    float3 localPosition = (float3)(start + FACE_CORNERS[face][cornerIndex] * extent);
 
     PixelInput output;
-    output.position = mul(float4(worldPosition, 1.0), viewProjection);
-    output.worldPosition = worldPosition;
-    output.face = (packedData >> 21) & 7;
+    output.position = mul(float4(chunkOriginRelative + localPosition, 1.0), viewProjection);
+    output.localPosition = localPosition;
+    output.face = face;
     return output;
 }
 
-// Порядок граней: +X, -X, +Y, -Y, +Z, -Z (совпадает с мешером).
 static const float3 FACE_NORMALS[6] =
 {
     float3( 1, 0, 0), float3(-1, 0, 0),
@@ -53,12 +72,15 @@ float4 PSMain(PixelInput input) : SV_TARGET
 {
     // Блок, которому принадлежит грань: полшага внутрь от плоскости грани.
     float3 normal = FACE_NORMALS[input.face];
-    int3 blockCoordinate = (int3)floor(input.worldPosition - normal * 0.5);
+    int3 localBlock = (int3)floor(input.localPosition - normal * 0.5);
 
-    // Процедурный цвет земли — тот же хеш, что был на CPU.
-    uint hash = (uint)blockCoordinate.x * 374761393u
-              + (uint)blockCoordinate.y * 668265263u
-              + (uint)blockCoordinate.z * 1274126177u;
+    // Низшие 32 бита мировых координат блока: переполнение uint
+    // в точности повторяет низ int64 — цвет стабилен во всём мире.
+    uint3 blockLow = chunkBaseLow + (uint3)localBlock;
+
+    uint hash = blockLow.x * 374761393u
+              + blockLow.y * 668265263u
+              + blockLow.z * 1274126177u;
     hash = (hash ^ (hash >> 13)) * 1274126177u;
     uint variation = (hash >> 16) & 31u;
 

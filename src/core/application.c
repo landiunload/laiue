@@ -9,13 +9,39 @@
 #include "core/chunk_streaming.h"
 
 #include <stddef.h>
+#include <windows.h>
 
-#define CAMERA_SPEED 80.0f
-#define FIELD_OF_VIEW_RADIANS 1.047197f
-#define NEAR_PLANE 0.1f
-#define FAR_PLANE 1000.0f
-#define VIEW_RADIUS_CHUNKS 3
-#define WORLD_SEED 42
+// Вся конфигурация приложения — в одном месте.
+typedef struct ApplicationConfiguration
+{
+    const wchar_t* windowTitle;
+    int32_t windowWidth;
+    int32_t windowHeight;
+    float cameraSpeed;
+    float mouseSensitivity;
+    float fieldOfViewRadians;
+    float nearPlane;
+    float farPlane;
+    float editReachDistance;
+    int32_t viewRadiusChunks;
+    int64_t worldSeed;
+    double spawnHeight;
+} ApplicationConfiguration;
+
+static const ApplicationConfiguration g_configuration = {
+    .windowTitle = L"laiue",
+    .windowWidth = 1280,
+    .windowHeight = 720,
+    .cameraSpeed = 80.0f,
+    .mouseSensitivity = 0.0025f,
+    .fieldOfViewRadians = 1.047197f,
+    .nearPlane = 0.1f,
+    .farPlane = 1000.0f,
+    .editReachDistance = 8.0f,
+    .viewRadiusChunks = 5,
+    .worldSeed = 42,
+    .spawnHeight = 80.0,
+};
 
 typedef struct ApplicationState
 {
@@ -37,10 +63,107 @@ static void HandleRawInput(void* userData, void* rawInputHandle)
     InputHandleRawInput((Input*)userData, rawInputHandle);
 }
 
-static int64_t ChunkFromCameraPosition(float position)
+static int64_t FloorToInt64(double value)
 {
-    int64_t chunk = (int64_t)(position / (float)CHUNK_SIZE);
-    return position < 0.0f ? chunk - 1 : chunk;
+    int64_t truncated = (int64_t)value;
+    return (double)truncated > value ? truncated - 1 : truncated;
+}
+
+// Трассировка луча по вокселям (DDA, Amanatides & Woo).
+// outPreviousBlock — последний воздушный блок перед попаданием
+// (куда ставится новый блок).
+static bool VoxelRaycast(World* world, const double origin[3], const float direction[3],
+    float maximumDistance, int64_t outHitBlock[3], int64_t outPreviousBlock[3])
+{
+    int64_t block[3];
+    int64_t step[3];
+    double tMax[3];
+    double tDelta[3];
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        block[axis] = FloorToInt64(origin[axis]);
+        double axisDirection = (double)direction[axis];
+
+        if (axisDirection > 1e-6)
+        {
+            step[axis] = 1;
+            tDelta[axis] = 1.0 / axisDirection;
+            tMax[axis] = ((double)(block[axis] + 1) - origin[axis]) / axisDirection;
+        }
+        else if (axisDirection < -1e-6)
+        {
+            step[axis] = -1;
+            tDelta[axis] = -1.0 / axisDirection;
+            tMax[axis] = ((double)block[axis] - origin[axis]) / axisDirection;
+        }
+        else
+        {
+            step[axis] = 0;
+            tDelta[axis] = 1e30;
+            tMax[axis] = 1e30;
+        }
+    }
+
+    for (;;)
+    {
+        int32_t axis = 0;
+        if (tMax[1] < tMax[axis]) axis = 1;
+        if (tMax[2] < tMax[axis]) axis = 2;
+
+        if (tMax[axis] > (double)maximumDistance)
+        {
+            return false;
+        }
+
+        outPreviousBlock[0] = block[0];
+        outPreviousBlock[1] = block[1];
+        outPreviousBlock[2] = block[2];
+
+        block[axis] += step[axis];
+        tMax[axis] += tDelta[axis];
+
+        if (WorldGetBlock(world, block[0], block[1], block[2]) != BLOCK_AIR)
+        {
+            outHitBlock[0] = block[0];
+            outHitBlock[1] = block[1];
+            outHitBlock[2] = block[2];
+            return true;
+        }
+    }
+}
+
+// Редактирование мира: ЛКМ — сломать блок, ПКМ — поставить.
+static void HandleBlockEditing(ApplicationState* application)
+{
+    bool breakPressed = InputWasMouseButtonPressed(application->input, INPUT_MOUSE_BUTTON_LEFT);
+    bool placePressed = InputWasMouseButtonPressed(application->input, INPUT_MOUSE_BUTTON_RIGHT);
+    if (!breakPressed && !placePressed)
+    {
+        return;
+    }
+
+    float lookDirection[3];
+    CameraGetForwardVector(&application->camera, lookDirection);
+
+    int64_t hitBlock[3];
+    int64_t previousBlock[3];
+    if (!VoxelRaycast(application->world, application->camera.position, lookDirection,
+            g_configuration.editReachDistance, hitBlock, previousBlock))
+    {
+        return;
+    }
+
+    if (breakPressed)
+    {
+        WorldSetBlock(application->world, hitBlock[0], hitBlock[1], hitBlock[2], BLOCK_AIR);
+        ChunkStreamingInvalidateBlock(application->chunkStreaming, hitBlock[0], hitBlock[1], hitBlock[2]);
+    }
+    else
+    {
+        WorldSetBlock(application->world, previousBlock[0], previousBlock[1], previousBlock[2], BLOCK_EARTH);
+        ChunkStreamingInvalidateBlock(application->chunkStreaming, previousBlock[0], previousBlock[1], previousBlock[2]);
+    }
 }
 
 static void OnFrame(void* userData)
@@ -88,10 +211,11 @@ static void OnFrame(void* userData)
         deltaSeconds = 0.1f;
     }
 
-    // Камера вращается только при захваченной мыши.
+    // Камера вращается и редактирует мир только при захваченной мыши.
+    bool mouseLookEnabled = WindowIsMouseLookEnabled(application->window);
     int32_t mouseDeltaX = 0;
     int32_t mouseDeltaY = 0;
-    if (WindowIsMouseLookEnabled(application->window))
+    if (mouseLookEnabled)
     {
         InputGetMouseDelta(application->input, &mouseDeltaX, &mouseDeltaY);
     }
@@ -101,29 +225,48 @@ static void OnFrame(void* userData)
         InputIsKeyDown(application->input, INPUT_KEY_A),
         InputIsKeyDown(application->input, INPUT_KEY_S),
         InputIsKeyDown(application->input, INPUT_KEY_D),
-        mouseDeltaX, mouseDeltaY, CAMERA_SPEED);
+        InputIsKeyDown(application->input, INPUT_KEY_SPACE),
+        mouseDeltaX, mouseDeltaY,
+        g_configuration.cameraSpeed, g_configuration.mouseSensitivity);
+
+    if (mouseLookEnabled)
+    {
+        HandleBlockEditing(application);
+    }
+
+    // Origin rebasing: начало координат рендера — блок камеры,
+    // все позиции в кадре малы и точны при любых мировых координатах.
+    int64_t cameraBlockPosition[3];
+    float relativeEyePosition[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        cameraBlockPosition[axis] = FloorToInt64(application->camera.position[axis]);
+        relativeEyePosition[axis] = (float)(application->camera.position[axis] - (double)cameraBlockPosition[axis]);
+    }
 
     // Стриминг чанков: центр следует за камерой, меши строятся
-    // рабочим потоком, готовые забираются каждый кадр.
+    // пулом рабочих потоков, готовые забираются с бюджетом на кадр.
     ChunkStreamingSetCenter(application->chunkStreaming,
-        ChunkFromCameraPosition(application->camera.position[0]),
-        ChunkFromCameraPosition(application->camera.position[1]),
-        ChunkFromCameraPosition(application->camera.position[2]));
+        cameraBlockPosition[0] >> CHUNK_SIZE_LOG2,
+        cameraBlockPosition[1] >> CHUNK_SIZE_LOG2,
+        cameraBlockPosition[2] >> CHUNK_SIZE_LOG2);
     ChunkStreamingPump(application->chunkStreaming);
 
     float viewMatrix[16];
     float projectionMatrix[16];
     float viewProjectionMatrix[16];
-    CameraGetViewMatrix(&application->camera, viewMatrix);
+    CameraGetViewMatrix(&application->camera, relativeEyePosition, viewMatrix);
     CameraGetProjectionMatrix(
         (float)application->windowWidth / (float)application->windowHeight,
-        FIELD_OF_VIEW_RADIANS, NEAR_PLANE, FAR_PLANE, projectionMatrix);
+        g_configuration.fieldOfViewRadians, g_configuration.nearPlane, g_configuration.farPlane,
+        projectionMatrix);
     Matrix4Multiply(viewMatrix, projectionMatrix, viewProjectionMatrix);
-    RendererSetViewProjection(application->renderer, viewProjectionMatrix);
 
-    RendererBeginFrame(application->renderer);
-    ChunkStreamingDraw(application->chunkStreaming, viewProjectionMatrix);
-    RendererEndFrame(application->renderer);
+    if (RendererBeginFrame(application->renderer, viewProjectionMatrix))
+    {
+        ChunkStreamingDraw(application->chunkStreaming, viewProjectionMatrix, cameraBlockPosition);
+        RendererEndFrame(application->renderer);
+    }
 
     InputEndFrame(application->input);
 }
@@ -131,9 +274,9 @@ static void OnFrame(void* userData)
 LAIUE_CORE_API void Start(void)
 {
     WindowConfiguration windowConfiguration = {
-        .title  = L"laiue",
-        .width  = 1280,
-        .height = 720,
+        .title  = g_configuration.windowTitle,
+        .width  = g_configuration.windowWidth,
+        .height = g_configuration.windowHeight,
     };
 
     Window* window = WindowCreate(&windowConfiguration);
@@ -149,7 +292,7 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    World* world = WorldCreate(WORLD_SEED);
+    World* world = WorldCreate(g_configuration.worldSeed);
     if (world == NULL)
     {
         InputDestroy(input);
@@ -171,7 +314,7 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    ChunkStreaming* chunkStreaming = ChunkStreamingCreate(world, renderer, VIEW_RADIUS_CHUNKS);
+    ChunkStreaming* chunkStreaming = ChunkStreamingCreate(world, renderer, g_configuration.viewRadiusChunks);
     if (chunkStreaming == NULL)
     {
         RendererDestroy(renderer);
@@ -192,7 +335,7 @@ LAIUE_CORE_API void Start(void)
         .previousTimeSeconds = PlatformTimeSeconds(),
     };
 
-    CameraInit(&application.camera, 0.0f, 80.0f, 0.0f, 0.0f, 0.0f);
+    CameraInit(&application.camera, 0.0, g_configuration.spawnHeight, 0.0, 0.0f, 0.0f);
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, &application);

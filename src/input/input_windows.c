@@ -8,6 +8,7 @@ struct Input
     bool keyDown[INPUT_KEY_COUNT];
     bool keyPressedLatch[INPUT_KEY_COUNT];
     bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
+    bool mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_COUNT];
     int32_t mouseDeltaX;
     int32_t mouseDeltaY;
     // Для мыши в абсолютном режиме (удалённый рабочий стол, планшет)
@@ -134,10 +135,30 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
             input->mouseDeltaY += mouse->lLastY;
         }
 
-        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = true; }
-        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    { input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT]  = false; }
-        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) { input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = true; }
-        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   { input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = false; }
+        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
+        {
+            if (!input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT])
+            {
+                input->mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_LEFT] = true;
+            }
+            input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT] = true;
+        }
+        if (mouse->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
+        {
+            input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT] = false;
+        }
+        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
+        {
+            if (!input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT])
+            {
+                input->mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_RIGHT] = true;
+            }
+            input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = true;
+        }
+        if (mouse->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
+        {
+            input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = false;
+        }
     }
 }
 
@@ -146,6 +167,11 @@ void InputEndFrame(Input* input)
     for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
     {
         input->keyPressedLatch[key] = false;
+    }
+
+    for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
+    {
+        input->mouseButtonPressedLatch[button] = false;
     }
 
     input->mouseDeltaX = 0;
@@ -163,6 +189,7 @@ void InputResetState(Input* input)
     for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
     {
         input->mouseButtonDown[button] = false;
+        input->mouseButtonPressedLatch[button] = false;
     }
 
     input->mouseDeltaX = 0;
@@ -183,6 +210,11 @@ bool InputWasKeyPressed(const Input* input, InputKey key)
 bool InputIsMouseButtonDown(const Input* input, InputMouseButton button)
 {
     return (uint32_t)button < INPUT_MOUSE_BUTTON_COUNT && input->mouseButtonDown[button];
+}
+
+bool InputWasMouseButtonPressed(const Input* input, InputMouseButton button)
+{
+    return (uint32_t)button < INPUT_MOUSE_BUTTON_COUNT && input->mouseButtonPressedLatch[button];
 }
 
 void InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY)

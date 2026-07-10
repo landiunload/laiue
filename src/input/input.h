@@ -47,4 +47,5 @@ LAIUE_INPUT_API void   InputResetState(Input* input);
 LAIUE_INPUT_API bool   InputIsKeyDown(const Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputWasKeyPressed(const Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputIsMouseButtonDown(const Input* input, InputMouseButton button);
+LAIUE_INPUT_API bool   InputWasMouseButtonPressed(const Input* input, InputMouseButton button);
 LAIUE_INPUT_API void   InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY);

@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Потокобезопасность: все функции мира можно вызывать из любых потоков
+// одновременно — таблица чанков и кеш высот защищены SRW-замками
+// (читатели параллельно, писатель эксклюзивно).
 typedef struct World World;
 
 typedef uint8_t BlockType;
@@ -14,6 +17,16 @@ typedef uint8_t BlockType;
 
 #define CHUNK_SIZE      64
 #define CHUNK_SIZE_LOG2 6
+
+// Общий хеш координат чанка (используется и миром, и стримингом ядра —
+// inline, чтобы не плодить копии и не звать через границу DLL).
+static inline uint32_t WorldHashChunkCoordinate(int64_t x, int64_t y, int64_t z)
+{
+    uint64_t hash = (uint64_t)x * 73856093ULL
+                  ^ (uint64_t)y * 19349663ULL
+                  ^ (uint64_t)z * 83492791ULL;
+    return (uint32_t)(hash ^ (hash >> 33));
+}
 
 // Итог пакетной выборки региона: однородные регионы позволяют
 // потребителю (например, мешеру) пропустить обработку целиком.
