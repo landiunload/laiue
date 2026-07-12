@@ -57,6 +57,11 @@ struct World
     uint32_t count;
     uint32_t capacity;
     int64_t seed;
+    TerrainOrigin terrainOrigin;   // абсолютный origin мира (остатки для шума)
+    // Границы мира в ЛОКАЛЬНЫХ координатах (относительно origin): за ними
+    // рельефа нет — это край мира (пустота).
+    int64_t worldLocalMinX, worldLocalMaxX;
+    int64_t worldLocalMinZ, worldLocalMaxZ;
 
     SRWLOCK heightCacheLock;
     HeightGridSlot heightCache[HEIGHT_CACHE_SLOTS];
@@ -83,11 +88,19 @@ static bool ChunkCoordinateEquals(ChunkCoordinate a, ChunkCoordinate b)
 }
 
 // Высота ландшафта в блочных координатах (x, z); блок твёрдый, если y < высоты.
-static float TerrainHeight(int64_t seed, int64_t blockX, int64_t blockZ)
+static float TerrainHeight(const World* world, int64_t localX, int64_t localZ)
 {
-    float noiseX = (float)blockX * 0.025f;
-    float noiseZ = (float)blockZ * 0.025f;
-    float noise = GenerateTerrainNoise(seed, noiseX, noiseZ);
+    // За краем мира рельефа нет: возвращаем очень низкую «высоту», и
+    // существующая логика заполнения делает всю колонну воздухом.
+    if (localX < world->worldLocalMinX || localX >= world->worldLocalMaxX ||
+        localZ < world->worldLocalMinZ || localZ >= world->worldLocalMaxZ)
+    {
+        return -1.0e9f;
+    }
+
+    // Шум по АБСОЛЮТНОЙ координате (origin мира + локальная) через
+    // предвычисленные остатки origin — bignum в горячем пути нет.
+    float noise = GenerateTerrainNoise(world->seed, &world->terrainOrigin, localX, localZ);
     return (noise - 0.5f) * 32.0f;
 }
 
@@ -133,7 +146,7 @@ static void WorldObtainHeightGrid(World* world, int64_t chunkX, int64_t chunkZ,
     {
         for (int32_t x = 0; x < HEIGHT_GRID_SIZE; ++x)
         {
-            float height = TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
+            float height = TerrainHeight(world, minBlockX + x, minBlockZ + z);
             outHeights[z * HEIGHT_GRID_SIZE + x] = height;
             if (first || height < minimumHeight) minimumHeight = height;
             if (first || height > maximumHeight) maximumHeight = height;
@@ -211,7 +224,17 @@ static bool WorldGrow(World* world)
     return true;
 }
 
-World* WorldCreate(int64_t seed)
+// Пересчитывает границу мира [0, worldSize) по одной оси в локальные
+// координаты (относительно origin) с насыщением до диапазона int64.
+static void ComputeLocalBounds(BigCoord worldSize, BigCoord origin, int64_t* outMin, int64_t* outMax)
+{
+    uint64_t low;
+    BigCoord upper = BigCoordSub(worldSize, origin);   // worldSize >= origin
+    *outMax = BigCoordFitsInt64(upper, &low) ? (int64_t)low : INT64_MAX;
+    *outMin = BigCoordFitsInt64(origin, &low) ? -(int64_t)low : INT64_MIN;
+}
+
+World* WorldCreate(int64_t seed, BigCoord originX, BigCoord originZ, BigCoord worldSize)
 {
     World* world = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*world));
     if (world == NULL)
@@ -244,6 +267,9 @@ World* WorldCreate(int64_t seed)
     }
 
     world->seed = seed;
+    TerrainOriginInit(&world->terrainOrigin, originX, originZ);
+    ComputeLocalBounds(worldSize, originX, &world->worldLocalMinX, &world->worldLocalMaxX);
+    ComputeLocalBounds(worldSize, originZ, &world->worldLocalMinZ, &world->worldLocalMaxZ);
     return world;
 }
 
@@ -416,7 +442,7 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
     }
     ReleaseSRWLockShared(&world->tableLock);
 
-    return (float)y < TerrainHeight(world->seed, x, z) ? BLOCK_EARTH : BLOCK_AIR;
+    return (float)y < TerrainHeight(world, x, z) ? BLOCK_EARTH : BLOCK_AIR;
 }
 
 void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block)
@@ -435,7 +461,7 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
 
     // Установка блока в сгенерированное значение — удаление дельты,
     // а не создание новой: чанк не накапливает бесполезные записи.
-    BlockType generated = (float)y < TerrainHeight(world->seed, x, z) ? BLOCK_EARTH : BLOCK_AIR;
+    BlockType generated = (float)y < TerrainHeight(world, x, z) ? BLOCK_EARTH : BLOCK_AIR;
 
     AcquireSRWLockExclusive(&world->tableLock);
     if (block == generated)
@@ -522,7 +548,7 @@ WorldRegionContents WorldFillRegion(World* world,
             {
                 for (int32_t x = 0; x < sizeX; ++x)
                 {
-                    float height = TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
+                    float height = TerrainHeight(world, minBlockX + x, minBlockZ + z);
                     heights[z * sizeX + x] = height;
                     if (first || height < minimumHeight) minimumHeight = height;
                     if (first || height > maximumHeight) maximumHeight = height;
@@ -557,7 +583,7 @@ WorldRegionContents WorldFillRegion(World* world,
         {
             float height = heights != NULL
                 ? heights[z * sizeX + x]
-                : TerrainHeight(world->seed, minBlockX + x, minBlockZ + z);
+                : TerrainHeight(world, minBlockX + x, minBlockZ + z);
 
             int64_t solidCount = (int64_t)ColumnCeiling(height) - minBlockY;
             if (solidCount < 0) solidCount = 0;
@@ -628,5 +654,5 @@ WorldRegionContents WorldFillRegion(World* world,
 int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t z)
 {
     // Блок твёрдый при y < height, значит верхний твёрдый = ceil(height) - 1.
-    return ColumnCeiling(TerrainHeight(world->seed, x, z)) - 1;
+    return ColumnCeiling(TerrainHeight(world, x, z)) - 1;
 }

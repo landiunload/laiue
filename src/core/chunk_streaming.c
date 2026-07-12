@@ -19,6 +19,8 @@ typedef enum ChunkEntryState
     CHUNK_ENTRY_READY,
 } ChunkEntryState;
 
+// PENDING не гасит отрисовку: mesh (если есть) — последняя готовая
+// геометрия, она рисуется, пока рабочий поток строит замену.
 typedef struct ChunkEntry
 {
     int64_t x;
@@ -454,11 +456,11 @@ void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, in
                     continue;
                 }
 
-                if (entry->mesh != NULL)
-                {
-                    RendererDestroyMesh(streaming->renderer, entry->mesh);
-                    entry->mesh = NULL;
-                }
+                // Старый меш НЕ удаляем здесь: он остаётся последней готовой
+                // геометрией и продолжает рисоваться, пока рабочий поток строит
+                // замену. Свап и освобождение — в ChunkStreamingPump, когда новый
+                // меш загружен. Иначе чанк мигал бы дырой те кадр-два, что идёт
+                // перестройка.
                 entry->state = CHUNK_ENTRY_PENDING;
                 entry->revision++;
                 TryEnqueueRequest(streaming, entry);
@@ -508,6 +510,12 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                 RendererMesh* mesh = RendererCreateMesh(streaming->renderer, result.quads, result.quadCount);
                 if (mesh != NULL)
                 {
+                    // Свап готов: старый меш освобождаем только теперь (отложенно
+                    // под fence — кадр с ним ещё может быть в полёте на GPU).
+                    if (entry->mesh != NULL)
+                    {
+                        RendererDestroyMesh(streaming->renderer, entry->mesh);
+                    }
                     entry->mesh = mesh;
                     entry->state = CHUNK_ENTRY_READY;
                     uploadBudget--;
@@ -519,6 +527,12 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
             }
             else
             {
+                // Чанк стал пустым (все блоки убраны): снимаем старый меш.
+                if (entry->mesh != NULL)
+                {
+                    RendererDestroyMesh(streaming->renderer, entry->mesh);
+                    entry->mesh = NULL;
+                }
                 entry->state = CHUNK_ENTRY_READY;
             }
         }
@@ -552,7 +566,9 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
         const ChunkEntry* entry = &streaming->entries[i];
-        if (entry->state != CHUNK_ENTRY_READY || entry->mesh == NULL)
+        // Рисуем любой чанк с готовым мешем, включая PENDING в процессе
+        // перестройки: показываем последнюю валидную геометрию — без мигания.
+        if (entry->mesh == NULL)
         {
             continue;
         }

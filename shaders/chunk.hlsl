@@ -39,6 +39,11 @@ static const uint3 FACE_CORNERS[6][4] =
     { uint3(0,1,0), uint3(1,1,0), uint3(1,0,0), uint3(0,0,0) },
 };
 
+// Доля глубины, на которую квад раздувается в своей плоскости для смыкания
+// швов. Масштаб на глубину даёт постоянный размер на экране (~полпикселя
+// при 720p/60 град.); больше — толще силуэт, меньше — могут вернуться щели.
+static const float SEAM_INFLATE = 0.0015;
+
 PixelInput VSMain(uint vertexId : SV_VertexID)
 {
     uint quadIndex = vertexId / 6;
@@ -49,10 +54,23 @@ PixelInput VSMain(uint vertexId : SV_VertexID)
     uint face = (quad.x >> 21) & 7;
     uint3 extent = uint3(quad.y & 127, (quad.y >> 7) & 127, (quad.y >> 14) & 127);
 
-    float3 localPosition = (float3)(start + FACE_CORNERS[face][cornerIndex] * extent);
+    uint3 corner = FACE_CORNERS[face][cornerIndex];
+    float3 localPosition = (float3)(start + corner * extent);
+    float3 worldPosition = chunkOriginRelative + localPosition;
+
+    // Смыкание T-стыков greedy-меша без MSAA: раздуваем квад в его плоскости
+    // наружу на постоянную (в экране) долю пикселя. Масштаб ~ глубине (clip.w),
+    // поэтому на любом расстоянии раздутие одинаково. Соседние квады
+    // перекрываются по общим кромкам — субпиксельные щели, сквозь которые
+    // просвечивал фон, пропадают; силуэт растёт на доли пикселя, без «пикселей».
+    float viewDepth = mul(float4(worldPosition, 1.0), viewProjection).w;
+    float3 cornerSign = (float3)corner * 2.0 - 1.0;
+    uint normalAxis = face >> 1;
+    float3 inPlane = float3(normalAxis != 0, normalAxis != 1, normalAxis != 2);
+    worldPosition += cornerSign * inPlane * (SEAM_INFLATE * viewDepth);
 
     PixelInput output;
-    output.position = mul(float4(chunkOriginRelative + localPosition, 1.0), viewProjection);
+    output.position = mul(float4(worldPosition, 1.0), viewProjection);
     output.localPosition = localPosition;
     output.face = face;
     return output;

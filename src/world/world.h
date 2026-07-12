@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api.h"
+#include "world/bigcoord.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,7 +38,7 @@ typedef enum WorldRegionContents
     WORLD_REGION_MIXED
 } WorldRegionContents;
 
-LAIUE_WORLD_API World* WorldCreate(int64_t seed);
+LAIUE_WORLD_API World* WorldCreate(int64_t seed, BigCoord originX, BigCoord originZ, BigCoord worldSize);
 LAIUE_WORLD_API void   WorldDestroy(World* world);
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);

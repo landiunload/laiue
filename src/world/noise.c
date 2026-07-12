@@ -1,12 +1,14 @@
 #include "world/noise.h"
 
-static inline uint32_t HashCoordinates(int32_t x, int32_t y, int32_t z, int64_t seed)
+// Размеры клеток решётки по октавам (базовая 40 = прежняя частота 1/0.025).
+static const int64_t g_cellBlocks[4] = { 40, 20, 10, 5 };
+
+static inline uint32_t HashCoordinates(uint64_t x, uint64_t z, int64_t seed)
 {
-    uint64_t hash = (uint64_t)(uint32_t)x * 374761393u
-                  + (uint64_t)(uint32_t)y * 668265263u
-                  + (uint64_t)(uint32_t)z * 1274126177u
-                  + (uint64_t)seed * 1013904223u;
-    hash = (hash ^ (hash >> 13)) * 1274126177u;
+    uint64_t hash = x * 374761393ULL
+                  + z * 1274126177ULL
+                  + (uint64_t)seed * 1013904223ULL;
+    hash = (hash ^ (hash >> 13)) * 1274126177ULL;
     return (uint32_t)(hash ^ (hash >> 16));
 }
 
@@ -20,52 +22,70 @@ static inline float SmoothStep(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
-static inline int32_t FloorToInt(float value)
+// Целочисленное деление с округлением вниз (корректно для отрицательных).
+static inline int64_t FloorDiv(int64_t a, int64_t b)
 {
-    int32_t truncated = (int32_t)value;
-    return (value >= 0.0f || (float)truncated == value) ? truncated : truncated - 1;
+    int64_t quotient = a / b;
+    int64_t remainder = a % b;
+    return (remainder != 0 && (remainder < 0) != (b < 0)) ? quotient - 1 : quotient;
 }
 
-// 2D-срез прежнего 3D-шума (плоскость y = 0): вклад узлов y = 1 был
-// умножен на SmoothStep(0) = 0, поэтому результат идентичен старому.
-static float Noise2D(int64_t seed, float x, float z)
+void TerrainOriginInit(TerrainOrigin* out, BigCoord originX, BigCoord originZ)
 {
-    int32_t integerX = FloorToInt(x);
-    int32_t integerZ = FloorToInt(z);
+    for (int32_t octave = 0; octave < 4; ++octave)
+    {
+        BigCoord quotientX = originX;
+        out->moduloX[octave]  = BigCoordDivSmall(&quotientX, (uint64_t)g_cellBlocks[octave]);
+        out->cellLowX[octave] = quotientX.limb[0];
 
-    float smoothX = SmoothStep(x - (float)integerX);
-    float smoothZ = SmoothStep(z - (float)integerZ);
+        BigCoord quotientZ = originZ;
+        out->moduloZ[octave]  = BigCoordDivSmall(&quotientZ, (uint64_t)g_cellBlocks[octave]);
+        out->cellLowZ[octave] = quotientZ.limb[0];
+    }
+}
 
-    float n00 = ToUnitFloat(HashCoordinates(integerX,     0, integerZ,     seed));
-    float n10 = ToUnitFloat(HashCoordinates(integerX + 1, 0, integerZ,     seed));
-    float n01 = ToUnitFloat(HashCoordinates(integerX,     0, integerZ + 1, seed));
-    float n11 = ToUnitFloat(HashCoordinates(integerX + 1, 0, integerZ + 1, seed));
+// Один слой value-noise. Узел абсолютной решётки = originCell + локальное
+// смещение клетки, всё int64; для хэша берутся низшие 64 бита узла.
+static float NoiseLayer(int64_t seed, const TerrainOrigin* origin, int32_t octave,
+    int64_t localX, int64_t localZ)
+{
+    int64_t cell = g_cellBlocks[octave];
+
+    int64_t combinedX = (int64_t)origin->moduloX[octave] + localX;
+    int64_t cellOffsetX = FloorDiv(combinedX, cell);
+    float fractionX = (float)(combinedX - cellOffsetX * cell) / (float)cell;
+    uint64_t nodeX = origin->cellLowX[octave] + (uint64_t)cellOffsetX;
+
+    int64_t combinedZ = (int64_t)origin->moduloZ[octave] + localZ;
+    int64_t cellOffsetZ = FloorDiv(combinedZ, cell);
+    float fractionZ = (float)(combinedZ - cellOffsetZ * cell) / (float)cell;
+    uint64_t nodeZ = origin->cellLowZ[octave] + (uint64_t)cellOffsetZ;
+
+    float smoothX = SmoothStep(fractionX);
+    float smoothZ = SmoothStep(fractionZ);
+
+    float n00 = ToUnitFloat(HashCoordinates(nodeX,     nodeZ,     seed));
+    float n10 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeZ,     seed));
+    float n01 = ToUnitFloat(HashCoordinates(nodeX,     nodeZ + 1, seed));
+    float n11 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeZ + 1, seed));
 
     float nx0 = n00 + (n10 - n00) * smoothX;
     float nx1 = n01 + (n11 - n01) * smoothX;
-
     return nx0 + (nx1 - nx0) * smoothZ;
 }
 
-static float FractalBrownianMotion(int64_t seed, float x, float z, int32_t octaves)
+float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localZ)
 {
     float value = 0.0f;
     float amplitude = 1.0f;
-    float frequency = 1.0f;
     float maximumValue = 0.0f;
 
-    for (int32_t octave = 0; octave < octaves; ++octave)
+    for (int32_t octave = 0; octave < 4; ++octave)
     {
-        value += amplitude * Noise2D(seed, x * frequency, z * frequency);
+        value += amplitude * NoiseLayer(seed, origin, octave, localX, localZ);
         maximumValue += amplitude;
         amplitude *= 0.5f;
-        frequency *= 2.0f;
     }
 
     return value / maximumValue;
-}
-
-float GenerateTerrainNoise(int64_t seed, float x, float z)
-{
-    return FractalBrownianMotion(seed, x, z, 4);
 }

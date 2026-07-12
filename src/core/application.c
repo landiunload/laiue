@@ -26,6 +26,7 @@ typedef struct ApplicationConfiguration
     int32_t viewRadiusChunks;
     int64_t worldSeed;
     double spawnHeight;
+    uint32_t worldSizePowerOfTen;    // размер мира по X и Z = 10^этого
 } ApplicationConfiguration;
 
 static const ApplicationConfiguration g_configuration = {
@@ -41,6 +42,7 @@ static const ApplicationConfiguration g_configuration = {
     .viewRadiusChunks = 5,
     .worldSeed = 42,
     .spawnHeight = 80.0,
+    .worldSizePowerOfTen = 1488,    // мир [0, 10^1488) по X и Z
 };
 
 typedef struct ApplicationState
@@ -292,7 +294,16 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    World* world = WorldCreate(g_configuration.worldSeed);
+    // Мир [0, worldSize) по X и Z (worldSize = 10^worldSizePowerOfTen). Спавн — в
+    // дальнем углу (X=Z=worldSize): origin ставим в cornerMargin блоках от края,
+    // чтобы сразу видеть обрыв рельефа. Мир адресуется bignum-координатой, но
+    // рендер/физика/стриминг работают локально (int64) относительно origin.
+    BigCoord worldSize = BigCoordPowTen(g_configuration.worldSizePowerOfTen);
+    const uint64_t cornerMargin = 160;
+    BigCoord worldOriginX = worldSize; BigCoordSubSmall(&worldOriginX, cornerMargin);
+    BigCoord worldOriginZ = worldSize; BigCoordSubSmall(&worldOriginZ, cornerMargin);
+
+    World* world = WorldCreate(g_configuration.worldSeed, worldOriginX, worldOriginZ, worldSize);
     if (world == NULL)
     {
         InputDestroy(input);
@@ -335,7 +346,7 @@ LAIUE_CORE_API void Start(void)
         .previousTimeSeconds = PlatformTimeSeconds(),
     };
 
-    CameraInit(&application.camera, 0.0, g_configuration.spawnHeight, 0.0, 0.0f, 0.0f);
+    CameraInit(&application.camera, 0.0, g_configuration.spawnHeight, 0.0, 0.785398f, -0.4f); // взгляд на угол мира (+X,+Z)
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, &application);
