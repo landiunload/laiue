@@ -410,23 +410,48 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t
     return true;
 }
 
-bool WorldDoubleAbsoluteX(World* world, int64_t blockShiftX)
+bool WorldAbsoluteBlockCoordinateEqualsInt64(World* world,
+    int32_t axis, int64_t localBlock, int64_t expected)
 {
-    if (blockShiftX % CHUNK_SIZE != 0)
+    if (axis < 0 || axis >= 3)
+    {
+        return false;
+    }
+    return InfiniteCoordCompareAddInt64ToInt64(
+        &world->blockOrigin[axis], localBlock, expected) == 0;
+}
+
+bool WorldSquareAbsoluteX(
+    World* world, int64_t localBlockX, int64_t* outLocalBlockX)
+{
+    if (outLocalBlockX == NULL)
     {
         return false;
     }
 
+    InfiniteCoord squared;
     InfiniteCoord newBlockOrigin;
     InfiniteCoord newChunkOrigin;
+    InfiniteCoordInit(&squared);
     InfiniteCoordInit(&newBlockOrigin);
     InfiniteCoordInit(&newChunkOrigin);
 
-    if (!InfiniteCoordTryCopyDoubleAddInt64(
-            &newBlockOrigin, &world->blockOrigin[0], blockShiftX)
-        || !InfiniteCoordTryCopyDoubleAddInt64(
-            &newChunkOrigin, &world->chunkOrigin[0], blockShiftX / CHUNK_SIZE))
+    if (!InfiniteCoordTryCopySquareAddInt64(
+            &squared, &world->blockOrigin[0], localBlockX))
     {
+        return false;
+    }
+
+    uint64_t localBlock = squared.limbCount == 0
+        ? 0
+        : squared.limbs[0] & (CHUNK_SIZE - 1u);
+
+    if (!InfiniteCoordTryCopyAddInt64(
+            &newBlockOrigin, &squared, -(int64_t)localBlock)
+        || !InfiniteCoordTryCopyShiftRight(
+            &newChunkOrigin, &squared, CHUNK_SIZE_LOG2))
+    {
+        InfiniteCoordDestroy(&squared);
         InfiniteCoordDestroy(&newBlockOrigin);
         InfiniteCoordDestroy(&newChunkOrigin);
         return false;
@@ -434,9 +459,11 @@ bool WorldDoubleAbsoluteX(World* world, int64_t blockShiftX)
 
     InfiniteCoordSwap(&world->blockOrigin[0], &newBlockOrigin);
     InfiniteCoordSwap(&world->chunkOrigin[0], &newChunkOrigin);
+    InfiniteCoordDestroy(&squared);
     InfiniteCoordDestroy(&newBlockOrigin);
     InfiniteCoordDestroy(&newChunkOrigin);
 
+    *outLocalBlockX = (int64_t)localBlock;
     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
 
     AcquireSRWLockExclusive(&world->heightCacheLock);

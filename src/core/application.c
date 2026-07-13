@@ -129,20 +129,35 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     return application->chunkStreaming != NULL;
 }
 
-static bool DoubleAbsoluteX(ApplicationState* application)
+static bool SquareAbsoluteX(ApplicationState* application)
 {
-    double doubledLocalX = application->camera.position[0] * 2.0;
-    int64_t blockShiftX = CalculateChunkAlignedShift(doubledLocalX);
+    int64_t currentBlockX = FloorToInt64(application->camera.position[0]);
+
+    // Для целых координат только 0²=0 и 1²=1. В этих случаях мир и кеш
+    // вообще не трогаем — повторной загрузки чанков не будет.
+    if (WorldAbsoluteBlockCoordinateEqualsInt64(
+            application->world, 0, currentBlockX, 0)
+        || WorldAbsoluteBlockCoordinateEqualsInt64(
+            application->world, 0, currentBlockX, 1))
+    {
+        return true;
+    }
+
+    double fractionalX =
+        application->camera.position[0] - (double)currentBlockX;
 
     ChunkStreamingDestroy(application->chunkStreaming);
     application->chunkStreaming = NULL;
 
-    if (!WorldDoubleAbsoluteX(application->world, blockShiftX))
+    int64_t squaredLocalBlockX;
+    if (!WorldSquareAbsoluteX(
+            application->world, currentBlockX, &squaredLocalBlockX))
     {
         return false;
     }
 
-    application->camera.position[0] = doubledLocalX - (double)blockShiftX;
+    application->camera.position[0] =
+        (double)squaredLocalBlockX + fractionalX;
     application->coordinateOverlayDirty = true;
     application->chunkStreaming = ChunkStreamingCreate(
         application->world, application->renderer, g_configuration.viewRadiusChunks);
@@ -316,7 +331,7 @@ static void OnFrame(void* userData)
 
     if (InputWasKeyPressed(application->input, INPUT_KEY_T))
     {
-        if (!DoubleAbsoluteX(application))
+        if (!SquareAbsoluteX(application))
         {
             WindowRequestClose(application->window);
             return;

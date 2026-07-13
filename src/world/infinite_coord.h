@@ -17,8 +17,10 @@ void InfiniteCoordInit(InfiniteCoord* value);
 void InfiniteCoordDestroy(InfiniteCoord* value);
 
 bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
-bool InfiniteCoordTryCopyDoubleAddInt64(
+bool InfiniteCoordTryCopySquareAddInt64(
     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
+bool InfiniteCoordTryCopyShiftRight(
+    InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount);
 void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b);
 
 // floor(value / divisor): возвращаются младшие 64 бита частного и

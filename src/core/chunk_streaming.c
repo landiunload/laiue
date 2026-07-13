@@ -5,6 +5,7 @@
 #include "mesh/chunk_mesher.h"
 
 #include <windows.h>
+#include <string.h>
 
 #define MAX_WORKER_THREADS 4
 
@@ -71,6 +72,7 @@ struct ChunkStreaming
 
     // Кеш мешей: открытая адресация, таблица принадлежит главному потоку.
     ChunkEntry* entries;
+    ChunkEntry* spareEntries;
     uint32_t capacity;
 
     DrawItem* drawItems;    // переиспользуемый буфер сортировки отрисовки
@@ -93,6 +95,60 @@ struct ChunkStreaming
     uint32_t workerThreadCount;
     bool shutdownRequested;
 };
+
+static void SwapDrawItems(DrawItem* left, DrawItem* right)
+{
+    DrawItem temporary = *left;
+    *left = *right;
+    *right = temporary;
+}
+
+static void SiftDrawItemsDown(DrawItem* items, uint32_t root, uint32_t count)
+{
+    for (;;)
+    {
+        uint32_t leftChild = root * 2u + 1u;
+        if (leftChild >= count)
+        {
+            return;
+        }
+
+        uint32_t largest = leftChild;
+        uint32_t rightChild = leftChild + 1u;
+        if (rightChild < count
+            && items[rightChild].distanceSquared > items[leftChild].distanceSquared)
+        {
+            largest = rightChild;
+        }
+
+        if (items[root].distanceSquared >= items[largest].distanceSquared)
+        {
+            return;
+        }
+
+        SwapDrawItems(&items[root], &items[largest]);
+        root = largest;
+    }
+}
+
+static void SortDrawItemsFrontToBack(DrawItem* items, uint32_t count)
+{
+    if (count < 2)
+    {
+        return;
+    }
+
+    for (uint32_t start = count / 2u; start > 0; --start)
+    {
+        SiftDrawItemsDown(items, start - 1u, count);
+    }
+
+    for (uint32_t end = count; end > 1; --end)
+    {
+        SwapDrawItems(&items[0], &items[end - 1u]);
+        SiftDrawItemsDown(items, 0, end - 1u);
+    }
+}
 
 static ChunkEntry* FindEntry(const ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
 {
@@ -236,12 +292,13 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     streaming->renderer = renderer;
     streaming->viewRadius = viewRadiusChunks;
 
-    // Ёмкости — степени двойки с двукратным запасом от объёма радиуса
-    // (гистерезис держит записи до радиуса + 1).
+    // Гистерезис держит максимум куб радиуса + 1. Загрузка около 54%
+    // достаточна для быстрой открытой адресации без лишнего удвоения памяти.
     uint32_t diameter = (uint32_t)(viewRadiusChunks * 2 + 3);
     uint32_t volume = diameter * diameter * diameter;
+    uint32_t minimumCapacity = volume + volume / 2u;
     uint32_t capacity = 1;
-    while (capacity < volume * 2)
+    while (capacity < minimumCapacity)
     {
         capacity <<= 1;
     }
@@ -249,6 +306,8 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     streaming->capacity = capacity;
     streaming->queueCapacity = capacity;
     streaming->entries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof(ChunkEntry));
+    streaming->spareEntries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+        (size_t)capacity * sizeof(ChunkEntry));
     streaming->drawItems = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(DrawItem));
     streaming->requests = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkRequest));
     streaming->results = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkMeshResult));
@@ -256,8 +315,9 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     InitializeSRWLock(&streaming->queueLock);
     InitializeConditionVariable(&streaming->workAvailable);
 
-    if (streaming->entries == NULL || streaming->drawItems == NULL ||
-        streaming->requests == NULL || streaming->results == NULL)
+    if (streaming->entries == NULL || streaming->spareEntries == NULL
+        || streaming->drawItems == NULL
+        || streaming->requests == NULL || streaming->results == NULL)
     {
         ChunkStreamingDestroy(streaming);
         return NULL;
@@ -336,6 +396,10 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         HeapFree(GetProcessHeap(), 0, streaming->entries);
     }
 
+    if (streaming->spareEntries != NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, streaming->spareEntries);
+    }
     if (streaming->drawItems != NULL) HeapFree(GetProcessHeap(), 0, streaming->drawItems);
     if (streaming->requests != NULL) HeapFree(GetProcessHeap(), 0, streaming->requests);
     if (streaming->results != NULL) HeapFree(GetProcessHeap(), 0, streaming->results);
@@ -350,14 +414,10 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         return;
     }
 
-    // Свежая таблица выделяется ДО смены центра: при нехватке памяти
-    // состояние не трогается, попытка повторится в следующем кадре.
-    ChunkEntry* freshEntries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+    // Вторая таблица переиспользуется при каждом переходе чанка:
+    // никаких HeapAlloc/HeapFree в игровом цикле.
+    memset(streaming->spareEntries, 0,
         (size_t)streaming->capacity * sizeof(ChunkEntry));
-    if (freshEntries == NULL)
-    {
-        return;
-    }
 
     streaming->hasCenter = true;
     streaming->centerX = chunkX;
@@ -367,7 +427,8 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     // Пересборка таблицы с гистерезисом: живущие в радиусе + 1
     // переносятся, дальние освобождаются (отложенно, под fence).
     ChunkEntry* previousEntries = streaming->entries;
-    streaming->entries = freshEntries;
+    streaming->entries = streaming->spareEntries;
+    streaming->spareEntries = previousEntries;
 
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
@@ -382,15 +443,19 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
             ChunkEntry* moved = InsertEntry(streaming, previous->x, previous->y, previous->z);
             moved->state = previous->state;
             moved->mesh = previous->mesh;
+            moved->baseLow[0] = previous->baseLow[0];
+            moved->baseLow[1] = previous->baseLow[1];
+            moved->baseLow[2] = previous->baseLow[2];
             moved->revision = previous->revision;
             moved->requestQueued = previous->requestQueued;
+            previous->mesh = NULL;
         }
         else if (previous->mesh != NULL)
         {
             RendererDestroyMesh(streaming->renderer, previous->mesh);
+            previous->mesh = NULL;
         }
     }
-    HeapFree(GetProcessHeap(), 0, previousEntries);
 
     // Заказ недостающих чанков оболочками — от ближних к дальним.
     for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
@@ -604,17 +669,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
 
     // Сортировка спереди-назад: ближние чанки заполняют глубину первыми,
     // перекрытые пиксели дальних отсекаются early-Z.
-    for (uint32_t i = 1; i < drawCount; ++i)
-    {
-        DrawItem item = streaming->drawItems[i];
-        uint32_t position = i;
-        while (position > 0 && streaming->drawItems[position - 1].distanceSquared > item.distanceSquared)
-        {
-            streaming->drawItems[position] = streaming->drawItems[position - 1];
-            position--;
-        }
-        streaming->drawItems[position] = item;
-    }
+    SortDrawItemsFrontToBack(streaming->drawItems, drawCount);
 
     for (uint32_t i = 0; i < drawCount; ++i)
     {

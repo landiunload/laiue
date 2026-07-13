@@ -290,50 +290,130 @@ bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* sourc
     return true;
 }
 
-bool InfiniteCoordTryCopyDoubleAddInt64(
+static uint64_t Multiply64(uint64_t left, uint64_t right, uint64_t* outHigh)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return _umul128(left, right, outHigh);
+#else
+    unsigned __int128 product = (unsigned __int128)left * right;
+    *outHigh = (uint64_t)(product >> 64);
+    return (uint64_t)product;
+#endif
+}
+
+static uint64_t AddWithCarry64(
+    uint64_t left, uint64_t right, uint64_t carry, uint64_t* outValue)
+{
+    uint64_t sum = left + right;
+    uint64_t firstCarry = sum < left ? 1u : 0u;
+    uint64_t result = sum + carry;
+    uint64_t secondCarry = result < sum ? 1u : 0u;
+    *outValue = result;
+    return firstCarry | secondCarry;
+}
+
+bool InfiniteCoordTryCopySquareAddInt64(
     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
 {
-    InfiniteCoord temporary;
-    InfiniteCoordInit(&temporary);
-
-    if (source->limbCount != 0)
+    InfiniteCoord value;
+    if (!InfiniteCoordTryCopyAddInt64(&value, source, addend))
     {
-        if (source->limbCount == UINT32_MAX)
-        {
-            return false;
-        }
-
-        uint32_t capacity = source->limbCount + 1;
-        temporary.limbs = HeapAlloc(GetProcessHeap(), 0,
-            (size_t)capacity * sizeof(uint64_t));
-        if (temporary.limbs == NULL)
-        {
-            return false;
-        }
-
-        uint64_t carry = 0;
-        for (uint32_t index = 0; index < source->limbCount; ++index)
-        {
-            uint64_t limb = source->limbs[index];
-            temporary.limbs[index] = (limb << 1) | carry;
-            carry = limb >> 63;
-        }
-
-        temporary.limbCount = source->limbCount;
-        if (carry != 0)
-        {
-            temporary.limbs[temporary.limbCount++] = carry;
-        }
-        temporary.sign = source->sign;
-    }
-
-    if (!InfiniteCoordTryAddInt64InPlace(&temporary, addend))
-    {
-        InfiniteCoordDestroy(&temporary);
         return false;
     }
 
-    *out = temporary;
+    if (value.limbCount == 0)
+    {
+        *out = value;
+        return true;
+    }
+
+    if (value.limbCount > (UINT32_MAX - 1u) / 2u)
+    {
+        InfiniteCoordDestroy(&value);
+        return false;
+    }
+
+    uint32_t capacity = value.limbCount * 2u + 1u;
+    uint64_t* limbs = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+        (size_t)capacity * sizeof(uint64_t));
+    if (limbs == NULL)
+    {
+        InfiniteCoordDestroy(&value);
+        return false;
+    }
+
+    for (uint32_t leftIndex = 0; leftIndex < value.limbCount; ++leftIndex)
+    {
+        for (uint32_t rightIndex = 0; rightIndex < value.limbCount; ++rightIndex)
+        {
+            uint64_t productHigh;
+            uint64_t productLow = Multiply64(
+                value.limbs[leftIndex], value.limbs[rightIndex], &productHigh);
+
+            uint32_t resultIndex = leftIndex + rightIndex;
+            uint64_t carry = AddWithCarry64(
+                limbs[resultIndex], productLow, 0, &limbs[resultIndex]);
+            ++resultIndex;
+            carry = AddWithCarry64(
+                limbs[resultIndex], productHigh, carry, &limbs[resultIndex]);
+            ++resultIndex;
+
+            while (carry != 0)
+            {
+                carry = AddWithCarry64(
+                    limbs[resultIndex], 0, carry, &limbs[resultIndex]);
+                ++resultIndex;
+            }
+        }
+    }
+
+    InfiniteCoordDestroy(&value);
+
+    out->limbs = limbs;
+    out->limbCount = capacity;
+    out->sign = 1;
+    InfiniteCoordNormalize(out);
+    return true;
+}
+
+bool InfiniteCoordTryCopyShiftRight(
+    InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount)
+{
+    if (bitCount == 0)
+    {
+        return InfiniteCoordTryCopy(out, source);
+    }
+    if (bitCount >= 64)
+    {
+        return false;
+    }
+
+    InfiniteCoordInit(out);
+    if (source->limbCount == 0)
+    {
+        return true;
+    }
+
+    out->limbs = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)source->limbCount * sizeof(uint64_t));
+    if (out->limbs == NULL)
+    {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < source->limbCount; ++index)
+    {
+        uint64_t shifted = source->limbs[index] >> bitCount;
+        if (index + 1 < source->limbCount)
+        {
+            shifted |= source->limbs[index + 1] << (64u - bitCount);
+        }
+        out->limbs[index] = shifted;
+    }
+
+    out->limbCount = source->limbCount;
+    out->sign = source->sign;
+    InfiniteCoordNormalize(out);
     return true;
 }
 
