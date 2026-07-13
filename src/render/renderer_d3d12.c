@@ -416,7 +416,9 @@ static bool CreatePipelineState(Renderer* renderer)
     description.PS.BytecodeLength = sizeof(g_chunk_ps);
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-    description.RasterizerState.FrontCounterClockwise = FALSE;
+    // Перестановка Y/Z в вершинном шейдере меняет winding всех граней.
+    // Без этого внешние стороны отсекались как back faces.
+    description.RasterizerState.FrontCounterClockwise = TRUE;
     description.RasterizerState.DepthClipEnable = TRUE;
     description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     description.DepthStencilState.DepthEnable = TRUE;

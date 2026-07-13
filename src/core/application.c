@@ -292,11 +292,11 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    // Максимальный BigCoord — самый край мира по X и Y.
-    BigCoord worldOrigin;
-    for (int32_t i = 0; i < BIGCOORD_LIMBS; ++i) worldOrigin.limb[i] = UINT64_MAX;
+    // Static storage не расходует стек: BigCoord занимает 4160 байт.
+    static BigCoord worldOrigin;
+    BigCoordSetMaximum(&worldOrigin);
 
-    World* world = WorldCreate(g_configuration.worldSeed, worldOrigin, worldOrigin);
+    World* world = WorldCreate(g_configuration.worldSeed, &worldOrigin, &worldOrigin);
     if (world == NULL)
     {
         InputDestroy(input);
@@ -339,7 +339,8 @@ LAIUE_CORE_API void Start(void)
         .previousTimeSeconds = PlatformTimeSeconds(),
     };
 
-    CameraInit(&application.camera, 0.0, 0.0, g_configuration.spawnHeight, 0.0f, 0.0f);
+    // Камера стартует над рельефом и сразу смотрит немного вниз.
+    CameraInit(&application.camera, 0.0, 0.0, g_configuration.spawnHeight, 0.0f, -0.4f);
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, &application);

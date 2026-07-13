@@ -200,7 +200,7 @@ static bool WorldGrow(World* world)
     return true;
 }
 
-World* WorldCreate(int64_t seed, BigCoord originX, BigCoord originY)
+World* WorldCreate(int64_t seed, const BigCoord* originX, const BigCoord* originY)
 {
     World* world = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*world));
     if (world == NULL)

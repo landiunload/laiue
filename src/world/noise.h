@@ -11,7 +11,7 @@ typedef struct TerrainOrigin
     uint64_t cellLowY[4];
 } TerrainOrigin;
 
-void TerrainOriginInit(TerrainOrigin* out, BigCoord originX, BigCoord originY);
+void TerrainOriginInit(TerrainOrigin* out, const BigCoord* originX, const BigCoord* originY);
 
 // FBM 4 октавы по горизонтальным координатам (x, y).
 float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localY);
