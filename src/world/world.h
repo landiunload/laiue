@@ -1,14 +1,12 @@
 #pragma once
 
 #include "api.h"
-#include "world/bigcoord.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 
-// Потокобезопасность: все функции мира можно вызывать из любых потоков
-// одновременно — таблица чанков и кеш высот защищены SRW-замками
-// (читатели параллельно, писатель эксклюзивно).
+// Потокобезопасность: обычные запросы мира можно выполнять параллельно.
+// WorldRebase вызывается только после остановки рабочих потоков мешинга.
 typedef struct World World;
 
 typedef uint8_t BlockType;
@@ -19,8 +17,6 @@ typedef uint8_t BlockType;
 #define CHUNK_SIZE      64
 #define CHUNK_SIZE_LOG2 6
 
-// Общий хеш координат чанка (используется и миром, и стримингом ядра —
-// inline, чтобы не плодить копии и не звать через границу DLL).
 static inline uint32_t WorldHashChunkCoordinate(int64_t x, int64_t y, int64_t z)
 {
     uint64_t hash = (uint64_t)x * 73856093ULL
@@ -29,8 +25,6 @@ static inline uint32_t WorldHashChunkCoordinate(int64_t x, int64_t y, int64_t z)
     return (uint32_t)(hash ^ (hash >> 33));
 }
 
-// Итог пакетной выборки региона: однородные регионы позволяют
-// потребителю (например, мешеру) пропустить обработку целиком.
 typedef enum WorldRegionContents
 {
     WORLD_REGION_ALL_AIR,
@@ -38,22 +32,26 @@ typedef enum WorldRegionContents
     WORLD_REGION_MIXED
 } WorldRegionContents;
 
-LAIUE_WORLD_API World* WorldCreate(int64_t seed, const BigCoord* originX, const BigCoord* originY);
+LAIUE_WORLD_API World* WorldCreate(int64_t seed);
 LAIUE_WORLD_API void   WorldDestroy(World* world);
+
+// Переносит локальное начало координат на целое число блоков.
+// Сдвиги обязаны быть кратны CHUNK_SIZE. Абсолютные координаты произвольной
+// точности растут динамически, а локальные координаты остаются маленькими.
+LAIUE_WORLD_API bool WorldRebase(World* world,
+    int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
 LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);
 
-// Пакетная выборка блоков региона одним вызовом: высота колонны считается
-// один раз, дельты накладываются пачкой — на порядки быстрее, чем
-// поблочные вызовы WorldGetBlock через границу DLL.
-//
-// Раскладка outBlocks: индекс = ((y * sizeX) + x) * sizeZ + z
-// (y, x — горизонталь, z — высота, самый быстрый индекс).
 LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
     BlockType* outBlocks);
 
-// Высота верхнего твёрдого блока процедурного ландшафта (x, y — горизонталь).
-LAIUE_WORLD_API int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
+// Высота верхнего твёрдого блока в текущих локальных координатах.
+LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
+
+// Младшие 32 бита абсолютных координат — стабильный хеш текстуры при rebasing.
+LAIUE_WORLD_API void WorldGetAbsoluteBlockLow32(World* world,
+    int64_t x, int64_t y, int64_t z, uint32_t outLow[3]);

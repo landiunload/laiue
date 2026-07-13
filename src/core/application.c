@@ -25,6 +25,7 @@ typedef struct ApplicationConfiguration
     float editReachDistance;
     int32_t viewRadiusChunks;
     int64_t worldSeed;
+    int64_t rebaseThresholdBlocks;
     double spawnHeight;
 } ApplicationConfiguration;
 
@@ -40,6 +41,7 @@ static const ApplicationConfiguration g_configuration = {
     .editReachDistance = 8.0f,
     .viewRadiusChunks = 5,
     .worldSeed = 42,
+    .rebaseThresholdBlocks = 1048576,
     .spawnHeight = 100.0,
 };
 
@@ -67,6 +69,56 @@ static int64_t FloorToInt64(double value)
 {
     int64_t truncated = (int64_t)value;
     return (double)truncated > value ? truncated - 1 : truncated;
+}
+
+static int64_t CalculateRebaseShift(double position)
+{
+    double threshold = (double)g_configuration.rebaseThresholdBlocks;
+    if (position >= -threshold && position <= threshold)
+    {
+        return 0;
+    }
+
+    int64_t block = FloorToInt64(position);
+    int64_t chunk = block / CHUNK_SIZE;
+    if (block < 0 && block % CHUNK_SIZE != 0)
+    {
+        --chunk;
+    }
+    return chunk * CHUNK_SIZE;
+}
+
+// Камера всегда остаётся около локального нуля. Когда она удаляется слишком
+// далеко, локальный кеш чанков останавливается, абсолютный bigint-origin мира
+// сдвигается, а камера возвращается в точный диапазон double.
+static bool RebaseWorldIfNeeded(ApplicationState* application)
+{
+    int64_t shift[3] = {
+        CalculateRebaseShift(application->camera.position[0]),
+        CalculateRebaseShift(application->camera.position[1]),
+        CalculateRebaseShift(application->camera.position[2]),
+    };
+    if (shift[0] == 0 && shift[1] == 0 && shift[2] == 0)
+    {
+        return true;
+    }
+
+    ChunkStreamingDestroy(application->chunkStreaming);
+    application->chunkStreaming = NULL;
+
+    if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
+    {
+        return false;
+    }
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        application->camera.position[axis] -= (double)shift[axis];
+    }
+
+    application->chunkStreaming = ChunkStreamingCreate(
+        application->world, application->renderer, g_configuration.viewRadiusChunks);
+    return application->chunkStreaming != NULL;
 }
 
 // Трассировка луча по вокселям (DDA, Amanatides & Woo).
@@ -229,6 +281,12 @@ static void OnFrame(void* userData)
         mouseDeltaX, mouseDeltaY,
         g_configuration.cameraSpeed, g_configuration.mouseSensitivity);
 
+    if (!RebaseWorldIfNeeded(application))
+    {
+        WindowRequestClose(application->window);
+        return;
+    }
+
     if (mouseLookEnabled)
     {
         HandleBlockEditing(application);
@@ -292,13 +350,7 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    // Максимально далёкая абсолютная точка, поддерживаемая BigCoord:
-    // 2^(64 * 520) - 1, то есть примерно 10^10018. Камера остаётся около
-    // локального нуля, поэтому точность движения и выбора блоков не теряется.
-    static BigCoord worldOrigin;
-    BigCoordSetMaximum(&worldOrigin);
-
-    World* world = WorldCreate(g_configuration.worldSeed, &worldOrigin, &worldOrigin);
+    World* world = WorldCreate(g_configuration.worldSeed);
     if (world == NULL)
     {
         InputDestroy(input);

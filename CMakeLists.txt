@@ -183,7 +183,14 @@ laiue_add_module(input
 )
 
 laiue_add_module(world
-    SOURCES src/world/world.c src/world/noise.c src/world/world.h src/world/noise.h src/world/bigcoord.h src/api.h
+    SOURCES
+        src/world/world_infinite.c
+        src/world/terrain_noise.c
+        src/world/terrain_noise.h
+        src/world/infinite_coord.c
+        src/world/infinite_coord.h
+        src/world/world.h
+        src/api.h
 )
 
 laiue_add_module(mesher

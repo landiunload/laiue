@@ -26,6 +26,7 @@ typedef struct ChunkEntry
     int64_t x;
     int64_t y;
     int64_t z;
+    uint32_t baseLow[3];
     RendererMesh* mesh;
     uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
     ChunkEntryState state;
@@ -129,6 +130,9 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     entry->x = x;
     entry->y = y;
     entry->z = z;
+    WorldGetAbsoluteBlockLow32(streaming->world,
+        x * CHUNK_SIZE, y * CHUNK_SIZE, z * CHUNK_SIZE,
+        entry->baseLow);
     entry->mesh = NULL;
     entry->revision = 0;
     entry->requestQueued = false;
@@ -621,12 +625,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
             (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
             (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
         };
-        uint32_t chunkBaseLow[3] = {
-            (uint32_t)(uint64_t)(entry->x * CHUNK_SIZE),
-            (uint32_t)(uint64_t)(entry->y * CHUNK_SIZE),
-            (uint32_t)(uint64_t)(entry->z * CHUNK_SIZE),
-        };
-
-        RendererDrawMesh(streaming->renderer, entry->mesh, chunkOriginRelative, chunkBaseLow);
+        RendererDrawMesh(streaming->renderer, entry->mesh,
+            chunkOriginRelative, entry->baseLow);
     }
 }
