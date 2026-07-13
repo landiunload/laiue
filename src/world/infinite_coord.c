@@ -290,6 +290,53 @@ bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* sourc
     return true;
 }
 
+bool InfiniteCoordTryCopyDoubleAddInt64(
+    InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
+{
+    InfiniteCoord temporary;
+    InfiniteCoordInit(&temporary);
+
+    if (source->limbCount != 0)
+    {
+        if (source->limbCount == UINT32_MAX)
+        {
+            return false;
+        }
+
+        uint32_t capacity = source->limbCount + 1;
+        temporary.limbs = HeapAlloc(GetProcessHeap(), 0,
+            (size_t)capacity * sizeof(uint64_t));
+        if (temporary.limbs == NULL)
+        {
+            return false;
+        }
+
+        uint64_t carry = 0;
+        for (uint32_t index = 0; index < source->limbCount; ++index)
+        {
+            uint64_t limb = source->limbs[index];
+            temporary.limbs[index] = (limb << 1) | carry;
+            carry = limb >> 63;
+        }
+
+        temporary.limbCount = source->limbCount;
+        if (carry != 0)
+        {
+            temporary.limbs[temporary.limbCount++] = carry;
+        }
+        temporary.sign = source->sign;
+    }
+
+    if (!InfiniteCoordTryAddInt64InPlace(&temporary, addend))
+    {
+        InfiniteCoordDestroy(&temporary);
+        return false;
+    }
+
+    *out = temporary;
+    return true;
+}
+
 void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)
 {
     InfiniteCoord temporary = *a;
@@ -498,4 +545,131 @@ int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoor
         return positive > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)positive;
     }
     return -(int64_t)(negativeMagnitude - magnitude);
+}
+
+typedef struct ShortCoordinateWriter
+{
+    wchar_t* text;
+    uint32_t capacity;
+    uint32_t length;
+} ShortCoordinateWriter;
+
+static void ShortCoordinateWriteCharacter(ShortCoordinateWriter* writer, wchar_t character)
+{
+    if (writer->capacity == 0)
+    {
+        return;
+    }
+    if (writer->length + 1 < writer->capacity)
+    {
+        writer->text[writer->length++] = character;
+        writer->text[writer->length] = L'\0';
+    }
+}
+
+static void ShortCoordinateWriteUnsigned(ShortCoordinateWriter* writer, uint64_t value)
+{
+    wchar_t reversed[24];
+    uint32_t count = 0;
+    do
+    {
+        reversed[count++] = (wchar_t)(L'0' + value % 10u);
+        value /= 10u;
+    }
+    while (value != 0);
+
+    while (count > 0)
+    {
+        ShortCoordinateWriteCharacter(writer, reversed[--count]);
+    }
+}
+
+static uint32_t UnsignedDecimalDigits(uint64_t value)
+{
+    uint32_t digits = 1;
+    while (value >= 10u)
+    {
+        value /= 10u;
+        ++digits;
+    }
+    return digits;
+}
+
+static uint32_t HighestSetBitIndex(uint64_t value)
+{
+    uint32_t index = 0;
+    while (value > 1u)
+    {
+        value >>= 1;
+        ++index;
+    }
+    return index;
+}
+
+void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
+    wchar_t* outText, uint32_t capacity)
+{
+    if (capacity == 0)
+    {
+        return;
+    }
+    outText[0] = L'\0';
+
+    InfiniteCoord value;
+    if (!InfiniteCoordTryCopyAddInt64(&value, base, offset))
+    {
+        if (capacity > 1)
+        {
+            outText[0] = L'?';
+            outText[1] = L'\0';
+        }
+        return;
+    }
+
+    ShortCoordinateWriter writer = { outText, capacity, 0 };
+    if (value.sign < 0)
+    {
+        ShortCoordinateWriteCharacter(&writer, L'-');
+    }
+
+    if (value.limbCount == 0)
+    {
+        ShortCoordinateWriteCharacter(&writer, L'0');
+    }
+    else if (value.limbCount == 1)
+    {
+        uint64_t magnitude = value.limbs[0];
+        uint32_t digits = UnsignedDecimalDigits(magnitude);
+        if (digits <= 7)
+        {
+            ShortCoordinateWriteUnsigned(&writer, magnitude);
+        }
+        else
+        {
+            uint64_t divisor = 1;
+            for (uint32_t index = 3; index < digits; ++index)
+            {
+                divisor *= 10u;
+            }
+            uint64_t leading = magnitude / divisor;
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + leading / 100u));
+            ShortCoordinateWriteCharacter(&writer, L'.');
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + (leading / 10u) % 10u));
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + leading % 10u));
+            ShortCoordinateWriteCharacter(&writer, L'e');
+            ShortCoordinateWriteUnsigned(&writer, digits - 1u);
+        }
+    }
+    else
+    {
+        uint64_t top = value.limbs[value.limbCount - 1];
+        uint64_t highestBit = (uint64_t)(value.limbCount - 1) * 64u
+            + HighestSetBitIndex(top);
+        ShortCoordinateWriteCharacter(&writer, L'~');
+        ShortCoordinateWriteCharacter(&writer, L'2');
+        ShortCoordinateWriteCharacter(&writer, L'^');
+        ShortCoordinateWriteUnsigned(&writer, highestBit);
+    }
+
+    InfiniteCoordDestroy(&value);
 }

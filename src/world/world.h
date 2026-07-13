@@ -3,6 +3,7 @@
 #include "api.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Потокобезопасность: обычные запросы мира можно выполнять параллельно.
@@ -40,6 +41,13 @@ LAIUE_WORLD_API void   WorldDestroy(World* world);
 // точности растут динамически, а локальные координаты остаются маленькими.
 LAIUE_WORLD_API bool WorldRebase(World* world,
     int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
+
+// Удваивает абсолютную координату X текущей точки. blockShiftX выбирает
+// новое локальное начало и обязан быть кратен CHUNK_SIZE.
+LAIUE_WORLD_API bool WorldDoubleAbsoluteX(World* world, int64_t blockShiftX);
+
+LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
+    int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity);
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
 LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);

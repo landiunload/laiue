@@ -17,6 +17,7 @@ typedef enum InputKey
     INPUT_KEY_A,
     INPUT_KEY_S,
     INPUT_KEY_D,
+    INPUT_KEY_T,
     INPUT_KEY_F7,
     INPUT_KEY_SHIFT,
     INPUT_KEY_COUNT

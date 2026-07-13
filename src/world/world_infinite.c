@@ -410,6 +410,44 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t
     return true;
 }
 
+bool WorldDoubleAbsoluteX(World* world, int64_t blockShiftX)
+{
+    if (blockShiftX % CHUNK_SIZE != 0)
+    {
+        return false;
+    }
+
+    InfiniteCoord newBlockOrigin;
+    InfiniteCoord newChunkOrigin;
+    InfiniteCoordInit(&newBlockOrigin);
+    InfiniteCoordInit(&newChunkOrigin);
+
+    if (!InfiniteCoordTryCopyDoubleAddInt64(
+            &newBlockOrigin, &world->blockOrigin[0], blockShiftX)
+        || !InfiniteCoordTryCopyDoubleAddInt64(
+            &newChunkOrigin, &world->chunkOrigin[0], blockShiftX / CHUNK_SIZE))
+    {
+        InfiniteCoordDestroy(&newBlockOrigin);
+        InfiniteCoordDestroy(&newChunkOrigin);
+        return false;
+    }
+
+    InfiniteCoordSwap(&world->blockOrigin[0], &newBlockOrigin);
+    InfiniteCoordSwap(&world->chunkOrigin[0], &newChunkOrigin);
+    InfiniteCoordDestroy(&newBlockOrigin);
+    InfiniteCoordDestroy(&newChunkOrigin);
+
+    TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
+
+    AcquireSRWLockExclusive(&world->heightCacheLock);
+    for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
+    {
+        world->heightCache[slot].valid = false;
+    }
+    ReleaseSRWLockExclusive(&world->heightCacheLock);
+    return true;
+}
+
 static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
 {
     if (world->count == 0) return NULL;
@@ -718,4 +756,20 @@ void WorldGetAbsoluteBlockLow32(World* world,
     outLow[0] = InfiniteCoordLow32Offset(&world->blockOrigin[0], x);
     outLow[1] = InfiniteCoordLow32Offset(&world->blockOrigin[1], y);
     outLow[2] = InfiniteCoordLow32Offset(&world->blockOrigin[2], z);
+}
+
+void WorldFormatAbsoluteBlockCoordinate(World* world,
+    int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity)
+{
+    if (axis < 0 || axis >= 3)
+    {
+        if (capacity > 0)
+        {
+            outText[0] = L'\0';
+        }
+        return;
+    }
+
+    InfiniteCoordFormatShortOffsetW(
+        &world->blockOrigin[axis], localBlock, outText, capacity);
 }

@@ -56,6 +56,8 @@ typedef struct ApplicationState
     int32_t windowWidth;
     int32_t windowHeight;
     double previousTimeSeconds;
+    int64_t coordinateOverlayBlock[3];
+    bool coordinateOverlayDirty;
 } ApplicationState;
 
 // Адаптер сигнатуры: окно передаёт userData + HRAWINPUT,
@@ -71,6 +73,17 @@ static int64_t FloorToInt64(double value)
     return (double)truncated > value ? truncated - 1 : truncated;
 }
 
+static int64_t CalculateChunkAlignedShift(double position)
+{
+    int64_t block = FloorToInt64(position);
+    int64_t chunk = block / CHUNK_SIZE;
+    if (block < 0 && block % CHUNK_SIZE != 0)
+    {
+        --chunk;
+    }
+    return chunk * CHUNK_SIZE;
+}
+
 static int64_t CalculateRebaseShift(double position)
 {
     double threshold = (double)g_configuration.rebaseThresholdBlocks;
@@ -79,13 +92,7 @@ static int64_t CalculateRebaseShift(double position)
         return 0;
     }
 
-    int64_t block = FloorToInt64(position);
-    int64_t chunk = block / CHUNK_SIZE;
-    if (block < 0 && block % CHUNK_SIZE != 0)
-    {
-        --chunk;
-    }
-    return chunk * CHUNK_SIZE;
+    return CalculateChunkAlignedShift(position);
 }
 
 // Камера всегда остаётся около локального нуля. Когда она удаляется слишком
@@ -115,10 +122,76 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     {
         application->camera.position[axis] -= (double)shift[axis];
     }
+    application->coordinateOverlayDirty = true;
 
     application->chunkStreaming = ChunkStreamingCreate(
         application->world, application->renderer, g_configuration.viewRadiusChunks);
     return application->chunkStreaming != NULL;
+}
+
+static bool DoubleAbsoluteX(ApplicationState* application)
+{
+    double doubledLocalX = application->camera.position[0] * 2.0;
+    int64_t blockShiftX = CalculateChunkAlignedShift(doubledLocalX);
+
+    ChunkStreamingDestroy(application->chunkStreaming);
+    application->chunkStreaming = NULL;
+
+    if (!WorldDoubleAbsoluteX(application->world, blockShiftX))
+    {
+        return false;
+    }
+
+    application->camera.position[0] = doubledLocalX - (double)blockShiftX;
+    application->coordinateOverlayDirty = true;
+    application->chunkStreaming = ChunkStreamingCreate(
+        application->world, application->renderer, g_configuration.viewRadiusChunks);
+    return application->chunkStreaming != NULL;
+}
+
+static void AppendWideText(wchar_t* destination, uint32_t capacity,
+    uint32_t* length, const wchar_t* source)
+{
+    while (*source != L'\0' && *length + 1 < capacity)
+    {
+        destination[(*length)++] = *source++;
+    }
+    if (capacity > 0)
+    {
+        destination[*length] = L'\0';
+    }
+}
+
+static void UpdateCoordinateOverlay(ApplicationState* application,
+    const int64_t cameraBlockPosition[3])
+{
+    if (!application->coordinateOverlayDirty
+        && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
+        && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
+        && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
+    {
+        return;
+    }
+
+    wchar_t coordinate[3][32];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        WorldFormatAbsoluteBlockCoordinate(application->world, axis,
+            cameraBlockPosition[axis], coordinate[axis], 32);
+        application->coordinateOverlayBlock[axis] = cameraBlockPosition[axis];
+    }
+
+    wchar_t text[128] = L"";
+    uint32_t length = 0;
+    AppendWideText(text, 128, &length, L"X: ");
+    AppendWideText(text, 128, &length, coordinate[0]);
+    AppendWideText(text, 128, &length, L"\r\nY: ");
+    AppendWideText(text, 128, &length, coordinate[1]);
+    AppendWideText(text, 128, &length, L"\r\nZ: ");
+    AppendWideText(text, 128, &length, coordinate[2]);
+
+    WindowSetOverlayText(application->window, text);
+    application->coordinateOverlayDirty = false;
 }
 
 // Трассировка луча по вокселям (DDA, Amanatides & Woo).
@@ -241,6 +314,15 @@ static void OnFrame(void* userData)
         InputResetState(application->input);
     }
 
+    if (InputWasKeyPressed(application->input, INPUT_KEY_T))
+    {
+        if (!DoubleAbsoluteX(application))
+        {
+            WindowRequestClose(application->window);
+            return;
+        }
+    }
+
     if (WindowConsumeResize(application->window))
     {
         int32_t clientWidth;
@@ -301,6 +383,8 @@ static void OnFrame(void* userData)
         cameraBlockPosition[axis] = FloorToInt64(application->camera.position[axis]);
         relativeEyePosition[axis] = (float)(application->camera.position[axis] - (double)cameraBlockPosition[axis]);
     }
+
+    UpdateCoordinateOverlay(application, cameraBlockPosition);
 
     // Стриминг чанков: центр следует за камерой, меши строятся
     // пулом рабочих потоков, готовые забираются с бюджетом на кадр.
@@ -391,6 +475,7 @@ LAIUE_CORE_API void Start(void)
         .windowWidth = clientWidth,
         .windowHeight = clientHeight,
         .previousTimeSeconds = PlatformTimeSeconds(),
+        .coordinateOverlayDirty = true,
     };
 
     // Камера стартует над рельефом и сразу смотрит немного вниз.
@@ -399,7 +484,7 @@ LAIUE_CORE_API void Start(void)
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, &application);
 
-    ChunkStreamingDestroy(chunkStreaming);
+    ChunkStreamingDestroy(application.chunkStreaming);
     RendererDestroy(renderer);
     WorldDestroy(world);
     InputDestroy(input);

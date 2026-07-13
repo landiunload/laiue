@@ -7,6 +7,7 @@
 struct Window
 {
     HWND handle;
+    HWND coordinateOverlay;
     int32_t clientWidth;
     int32_t clientHeight;
     bool resizePending;
@@ -106,6 +107,16 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
+        case WM_CTLCOLORSTATIC:
+            if (window != NULL && (HWND)lParam == window->coordinateOverlay)
+            {
+                HDC deviceContext = (HDC)wParam;
+                SetTextColor(deviceContext, RGB(255, 255, 255));
+                SetBkColor(deviceContext, RGB(0, 0, 0));
+                return (LRESULT)GetStockObject(BLACK_BRUSH);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
         case WM_ACTIVATE:
             if (window != NULL)
             {
@@ -170,7 +181,7 @@ Window* WindowCreate(const WindowConfiguration* configuration)
     // Размер окна подбирается так, чтобы клиентская область
     // совпала с запрошенными width x height.
     RECT windowRect = { 0, 0, configuration->width, configuration->height };
-    const DWORD windowStyle         = WS_OVERLAPPEDWINDOW;
+    const DWORD windowStyle         = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     const DWORD windowStyleExtended = WS_EX_APPWINDOW;
     AdjustWindowRectEx(&windowRect, windowStyle, FALSE, windowStyleExtended);
 
@@ -193,6 +204,22 @@ Window* WindowCreate(const WindowConfiguration* configuration)
     {
         HeapFree(GetProcessHeap(), 0, window);
         return NULL;
+    }
+
+    window->coordinateOverlay = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+        8, 8, 300, 56,
+        window->handle,
+        NULL,
+        instance,
+        NULL);
+    if (window->coordinateOverlay != NULL)
+    {
+        SendMessageW(window->coordinateOverlay, WM_SETFONT,
+            (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     }
 
     ShowWindow(window->handle, SW_SHOWDEFAULT);
@@ -303,6 +330,14 @@ void WindowSetMouseLook(Window* window, bool enabled)
 bool WindowIsMouseLookEnabled(const Window* window)
 {
     return window->mouseLookEnabled;
+}
+
+void WindowSetOverlayText(Window* window, const wchar_t* text)
+{
+    if (window != NULL && window->coordinateOverlay != NULL && text != NULL)
+    {
+        SetWindowTextW(window->coordinateOverlay, text);
+    }
 }
 
 void WindowRequestClose(Window* window)

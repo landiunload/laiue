@@ -1,0 +1,1660 @@
+diff --git a/src/world/infinite_coord.h b/src/world/infinite_coord.h
+new file mode 100644
+index 0000000..e7bc99e
+--- /dev/null
++++ b/src/world/infinite_coord.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// Знаковое целое произвольной точности. Число лимбов растёт только при
++// фактическом удалении от начала мира, поэтому предел задаётся доступной памятью.
++typedef struct InfiniteCoord
++{
++    uint64_t* limbs;       // модуль, little-endian
++    uint32_t limbCount;
++    int32_t sign;          // -1, 0, +1
++} InfiniteCoord;
++
++void InfiniteCoordInit(InfiniteCoord* value);
++void InfiniteCoordDestroy(InfiniteCoord* value);
++
++bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
++void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b);
++
++// floor(value / divisor): возвращаются младшие 64 бита частного и
++// неотрицательный остаток [0, divisor).
++uint64_t InfiniteCoordDivFloorSmallLow(
++    const InfiniteCoord* value, uint64_t divisor, uint64_t* outRemainder);
++
++// Сравнивает value + addend с subtrahend без временного bigint.
++int32_t InfiniteCoordCompareAddInt64ToInt64(
++    const InfiniteCoord* value, int64_t addend, int64_t subtrahend);
++
++// Хеш и точное сравнение виртуального значения base + offset.
++uint64_t InfiniteCoordHashOffset(const InfiniteCoord* base, int64_t offset);
++bool InfiniteCoordEqualsOffset(const InfiniteCoord* value, const InfiniteCoord* base, int64_t offset);
++
++// Младшие биты two's-complement значения base + offset.
++uint32_t InfiniteCoordLow32Offset(const InfiniteCoord* base, int64_t offset);
++
++// scalar - value с насыщением до int64.
++int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value);
+diff --git a/src/world/infinite_coord.c b/src/world/infinite_coord.c
+new file mode 100644
+index 0000000..7fd0d66
+--- /dev/null
++++ b/src/world/infinite_coord.c
+@@ -0,0 +1,501 @@
++#include "world/infinite_coord.h"
++
++#include <windows.h>
++#if defined(_MSC_VER) && !defined(__clang__)
++#include <intrin.h>
++#endif
++
++static uint64_t Int64Magnitude(int64_t value)
++{
++    return value < 0 ? 0u - (uint64_t)value : (uint64_t)value;
++}
++
++static void InfiniteCoordNormalize(InfiniteCoord* value)
++{
++    while (value->limbCount > 0 && value->limbs[value->limbCount - 1] == 0)
++    {
++        value->limbCount--;
++    }
++
++    if (value->limbCount == 0)
++    {
++        if (value->limbs != NULL)
++        {
++            HeapFree(GetProcessHeap(), 0, value->limbs);
++            value->limbs = NULL;
++        }
++        value->sign = 0;
++    }
++}
++
++static int32_t InfiniteCoordCompareMagnitudeSmall(const InfiniteCoord* value, uint64_t magnitude)
++{
++    if (value->limbCount > 1)
++    {
++        return 1;
++    }
++    uint64_t current = value->limbCount == 0 ? 0 : value->limbs[0];
++    return current < magnitude ? -1 : (current > magnitude ? 1 : 0);
++}
++
++static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source)
++{
++    InfiniteCoordInit(out);
++    if (source->limbCount == 0)
++    {
++        return true;
++    }
++
++    uint64_t* limbs = HeapAlloc(GetProcessHeap(), 0,
++        (size_t)source->limbCount * sizeof(uint64_t));
++    if (limbs == NULL)
++    {
++        return false;
++    }
++
++    for (uint32_t i = 0; i < source->limbCount; ++i)
++    {
++        limbs[i] = source->limbs[i];
++    }
++
++    out->limbs = limbs;
++    out->limbCount = source->limbCount;
++    out->sign = source->sign;
++    return true;
++}
++
++static bool InfiniteCoordTryAddMagnitudeSmall(InfiniteCoord* value, uint64_t magnitude)
++{
++    if (magnitude == 0)
++    {
++        return true;
++    }
++
++    if (value->limbCount == 0)
++    {
++        value->limbs = HeapAlloc(GetProcessHeap(), 0, sizeof(uint64_t));
++        if (value->limbs == NULL)
++        {
++            return false;
++        }
++        value->limbs[0] = magnitude;
++        value->limbCount = 1;
++        return true;
++    }
++
++    uint64_t old = value->limbs[0];
++    value->limbs[0] = old + magnitude;
++    uint64_t carry = value->limbs[0] < old ? 1u : 0u;
++
++    for (uint32_t i = 1; i < value->limbCount && carry != 0; ++i)
++    {
++        old = value->limbs[i];
++        value->limbs[i] = old + 1u;
++        carry = value->limbs[i] == 0 ? 1u : 0u;
++    }
++
++    if (carry != 0)
++    {
++        uint32_t newCount = value->limbCount + 1;
++        uint64_t* expanded = HeapReAlloc(GetProcessHeap(), 0, value->limbs,
++            (size_t)newCount * sizeof(uint64_t));
++        if (expanded == NULL)
++        {
++            // Откатываем перенос: исходное значение было ...FFFF + magnitude.
++            uint64_t borrow = magnitude;
++            for (uint32_t i = 0; i < value->limbCount && borrow != 0; ++i)
++            {
++                uint64_t current = value->limbs[i];
++                value->limbs[i] = current - borrow;
++                borrow = current < borrow ? 1u : 0u;
++            }
++            return false;
++        }
++        value->limbs = expanded;
++        value->limbs[value->limbCount] = 1u;
++        value->limbCount = newCount;
++    }
++
++    return true;
++}
++
++static void InfiniteCoordSubtractMagnitudeSmall(InfiniteCoord* value, uint64_t magnitude)
++{
++    uint64_t borrow = magnitude;
++    for (uint32_t i = 0; i < value->limbCount && borrow != 0; ++i)
++    {
++        uint64_t current = value->limbs[i];
++        value->limbs[i] = current - borrow;
++        borrow = current < borrow ? 1u : 0u;
++    }
++    InfiniteCoordNormalize(value);
++}
++
++static bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
++{
++    if (addend == 0)
++    {
++        return true;
++    }
++
++    int32_t addSign = addend < 0 ? -1 : 1;
++    uint64_t magnitude = Int64Magnitude(addend);
++
++    if (value->sign == 0)
++    {
++        if (!InfiniteCoordTryAddMagnitudeSmall(value, magnitude))
++        {
++            return false;
++        }
++        value->sign = addSign;
++        return true;
++    }
++
++    if (value->sign == addSign)
++    {
++        return InfiniteCoordTryAddMagnitudeSmall(value, magnitude);
++    }
++
++    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(value, magnitude);
++    if (comparison == 0)
++    {
++        InfiniteCoordDestroy(value);
++        return true;
++    }
++    if (comparison > 0)
++    {
++        InfiniteCoordSubtractMagnitudeSmall(value, magnitude);
++        return true;
++    }
++
++    uint64_t current = value->limbCount == 0 ? 0 : value->limbs[0];
++    value->limbs[0] = magnitude - current;
++    value->limbCount = 1;
++    value->sign = addSign;
++    return true;
++}
++
++static void SignedDifference(int64_t left, int64_t right,
++    int32_t* outSign, uint64_t* outMagnitude)
++{
++    if ((left >= 0) == (right >= 0))
++    {
++        if (left == right)
++        {
++            *outSign = 0;
++            *outMagnitude = 0;
++        }
++        else if (left > right)
++        {
++            *outSign = 1;
++            *outMagnitude = (uint64_t)left - (uint64_t)right;
++        }
++        else
++        {
++            *outSign = -1;
++            *outMagnitude = (uint64_t)right - (uint64_t)left;
++        }
++        return;
++    }
++
++    if (left >= 0)
++    {
++        *outSign = 1;
++        *outMagnitude = (uint64_t)left + Int64Magnitude(right);
++    }
++    else
++    {
++        *outSign = -1;
++        *outMagnitude = Int64Magnitude(left) + (uint64_t)right;
++    }
++}
++
++static int32_t InfiniteCoordSignAfterSmall(
++    const InfiniteCoord* value, int32_t addSign, uint64_t addMagnitude)
++{
++    if (addSign == 0 || addMagnitude == 0)
++    {
++        return value->sign;
++    }
++    if (value->sign == 0 || value->sign == addSign)
++    {
++        return addSign;
++    }
++
++    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(value, addMagnitude);
++    if (comparison == 0)
++    {
++        return 0;
++    }
++    return comparison > 0 ? value->sign : addSign;
++}
++
++static void InfiniteCoordTwosComplementLow128(
++    const InfiniteCoord* value, uint64_t* outLow, uint64_t* outHigh)
++{
++    uint64_t lowMagnitude = value->limbCount > 0 ? value->limbs[0] : 0;
++    uint64_t highMagnitude = value->limbCount > 1 ? value->limbs[1] : 0;
++
++    if (value->sign >= 0)
++    {
++        *outLow = lowMagnitude;
++        *outHigh = highMagnitude;
++        return;
++    }
++
++    uint64_t low = ~lowMagnitude + 1u;
++    uint64_t carry = low == 0 ? 1u : 0u;
++    *outLow = low;
++    *outHigh = ~highMagnitude + carry;
++}
++
++static uint64_t Mix64(uint64_t value)
++{
++    value ^= value >> 30;
++    value *= 0xbf58476d1ce4e5b9ULL;
++    value ^= value >> 27;
++    value *= 0x94d049bb133111ebULL;
++    return value ^ (value >> 31);
++}
++
++void InfiniteCoordInit(InfiniteCoord* value)
++{
++    value->limbs = NULL;
++    value->limbCount = 0;
++    value->sign = 0;
++}
++
++void InfiniteCoordDestroy(InfiniteCoord* value)
++{
++    if (value->limbs != NULL)
++    {
++        HeapFree(GetProcessHeap(), 0, value->limbs);
++    }
++    InfiniteCoordInit(value);
++}
++
++bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
++{
++    InfiniteCoord temporary;
++    if (!InfiniteCoordTryCopy(&temporary, source))
++    {
++        return false;
++    }
++    if (!InfiniteCoordTryAddInt64InPlace(&temporary, addend))
++    {
++        InfiniteCoordDestroy(&temporary);
++        return false;
++    }
++    *out = temporary;
++    return true;
++}
++
++void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)
++{
++    InfiniteCoord temporary = *a;
++    *a = *b;
++    *b = temporary;
++}
++
++uint64_t InfiniteCoordDivFloorSmallLow(
++    const InfiniteCoord* value, uint64_t divisor, uint64_t* outRemainder)
++{
++    uint64_t remainder = 0;
++    uint64_t quotientLow = 0;
++
++    for (uint32_t index = value->limbCount; index > 0; --index)
++    {
++#if defined(_MSC_VER) && !defined(__clang__)
++        quotientLow = _udiv128(remainder, value->limbs[index - 1], divisor, &remainder);
++#else
++        unsigned __int128 numerator = ((unsigned __int128)remainder << 64)
++            | value->limbs[index - 1];
++        quotientLow = (uint64_t)(numerator / divisor);
++        remainder = (uint64_t)(numerator % divisor);
++#endif
++    }
++
++    if (value->sign >= 0)
++    {
++        *outRemainder = remainder;
++        return quotientLow;
++    }
++
++    if (remainder == 0)
++    {
++        *outRemainder = 0;
++        return 0u - quotientLow;
++    }
++
++    *outRemainder = divisor - remainder;
++    return 0u - quotientLow - 1u;
++}
++
++int32_t InfiniteCoordCompareAddInt64ToInt64(
++    const InfiniteCoord* value, int64_t addend, int64_t subtrahend)
++{
++    int32_t differenceSign;
++    uint64_t differenceMagnitude;
++    SignedDifference(addend, subtrahend, &differenceSign, &differenceMagnitude);
++    return InfiniteCoordSignAfterSmall(value, differenceSign, differenceMagnitude);
++}
++
++uint64_t InfiniteCoordHashOffset(const InfiniteCoord* base, int64_t offset)
++{
++    uint64_t low;
++    uint64_t high;
++    InfiniteCoordTwosComplementLow128(base, &low, &high);
++
++    uint64_t previous = low;
++    low += (uint64_t)offset;
++    uint64_t carry = low < previous ? 1u : 0u;
++    high += (offset < 0 ? UINT64_MAX : 0u) + carry;
++
++    return Mix64(low) ^ Mix64(high + 0x9e3779b97f4a7c15ULL);
++}
++
++bool InfiniteCoordEqualsOffset(const InfiniteCoord* value, const InfiniteCoord* base, int64_t offset)
++{
++    if (offset == 0)
++    {
++        if (value->sign != base->sign || value->limbCount != base->limbCount)
++        {
++            return false;
++        }
++        for (uint32_t i = 0; i < value->limbCount; ++i)
++        {
++            if (value->limbs[i] != base->limbs[i]) return false;
++        }
++        return true;
++    }
++
++    int32_t offsetSign = offset < 0 ? -1 : 1;
++    uint64_t magnitude = Int64Magnitude(offset);
++
++    if (base->sign == 0)
++    {
++        return value->sign == offsetSign && value->limbCount == 1
++            && value->limbs[0] == magnitude;
++    }
++
++    if (base->sign == offsetSign)
++    {
++        if (value->sign != base->sign)
++        {
++            return false;
++        }
++
++        uint64_t carry = magnitude;
++        uint32_t expectedCount = base->limbCount;
++        for (uint32_t i = 0; i < base->limbCount; ++i)
++        {
++            uint64_t limb = base->limbs[i] + carry;
++            carry = limb < base->limbs[i] ? 1u : 0u;
++            if (i >= value->limbCount || value->limbs[i] != limb)
++            {
++                return false;
++            }
++        }
++        if (carry != 0)
++        {
++            expectedCount++;
++            if (value->limbCount < expectedCount || value->limbs[expectedCount - 1] != 1u)
++            {
++                return false;
++            }
++        }
++        return value->limbCount == expectedCount;
++    }
++
++    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(base, magnitude);
++    if (comparison == 0)
++    {
++        return value->sign == 0;
++    }
++    if (comparison < 0)
++    {
++        uint64_t baseMagnitude = base->limbCount == 0 ? 0 : base->limbs[0];
++        return value->sign == offsetSign && value->limbCount == 1
++            && value->limbs[0] == magnitude - baseMagnitude;
++    }
++
++    if (value->sign != base->sign)
++    {
++        return false;
++    }
++
++    uint64_t borrow = magnitude;
++    uint32_t expectedCount = base->limbCount;
++    for (uint32_t i = 0; i < base->limbCount; ++i)
++    {
++        uint64_t limb = base->limbs[i] - borrow;
++        borrow = base->limbs[i] < borrow ? 1u : 0u;
++        if (i < value->limbCount)
++        {
++            if (value->limbs[i] != limb) return false;
++        }
++        else if (limb != 0)
++        {
++            return false;
++        }
++        if (i == base->limbCount - 1 && limb == 0)
++        {
++            expectedCount--;
++        }
++    }
++    return value->limbCount == expectedCount;
++}
++
++uint32_t InfiniteCoordLow32Offset(const InfiniteCoord* base, int64_t offset)
++{
++    uint64_t low;
++    uint64_t high;
++    InfiniteCoordTwosComplementLow128(base, &low, &high);
++    (void)high;
++    return (uint32_t)(low + (uint64_t)offset);
++}
++
++int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value)
++{
++    if (value->sign == 0)
++    {
++        return scalar;
++    }
++    if (value->limbCount > 1)
++    {
++        return value->sign > 0 ? INT64_MIN : INT64_MAX;
++    }
++
++    uint64_t magnitude = value->limbs[0];
++    if (value->sign > 0)
++    {
++        if (scalar < 0)
++        {
++            uint64_t room = (uint64_t)(scalar - INT64_MIN);
++            return magnitude > room ? INT64_MIN : scalar - (int64_t)magnitude;
++        }
++        if (magnitude > (uint64_t)scalar + (uint64_t)INT64_MAX + 1u)
++        {
++            return INT64_MIN;
++        }
++        uint64_t resultMagnitude = magnitude - (uint64_t)scalar;
++        if (magnitude > (uint64_t)scalar)
++        {
++            return resultMagnitude == (1ULL << 63) ? INT64_MIN : -(int64_t)resultMagnitude;
++        }
++        return scalar - (int64_t)magnitude;
++    }
++
++    if (scalar >= 0)
++    {
++        return magnitude > (uint64_t)INT64_MAX - (uint64_t)scalar
++            ? INT64_MAX : scalar + (int64_t)magnitude;
++    }
++    uint64_t negativeMagnitude = Int64Magnitude(scalar);
++    if (magnitude >= negativeMagnitude)
++    {
++        uint64_t positive = magnitude - negativeMagnitude;
++        return positive > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)positive;
++    }
++    return -(int64_t)(negativeMagnitude - magnitude);
++}
+diff --git a/src/world/terrain_noise.h b/src/world/terrain_noise.h
+new file mode 100644
+index 0000000..70d0bd3
+--- /dev/null
++++ b/src/world/terrain_noise.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <stdint.h>
++#include "world/infinite_coord.h"
++
++typedef struct TerrainOrigin
++{
++    uint64_t moduloX[4];
++    uint64_t cellLowX[4];
++    uint64_t moduloY[4];
++    uint64_t cellLowY[4];
++} TerrainOrigin;
++
++void TerrainOriginInit(TerrainOrigin* out, const InfiniteCoord* originX, const InfiniteCoord* originY);
++
++// FBM 4 октавы по горизонтальным координатам (x, y).
++float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localY);
+diff --git a/src/world/terrain_noise.c b/src/world/terrain_noise.c
+new file mode 100644
+index 0000000..0ceb698
+--- /dev/null
++++ b/src/world/terrain_noise.c
+@@ -0,0 +1,120 @@
++#include "world/terrain_noise.h"
++
++// Размеры клеток решётки по октавам (базовая 40 = прежняя частота 1/0.025).
++static const int64_t g_cellBlocks[4] = { 40, 20, 10, 5 };
++
++static inline uint32_t HashCoordinates(uint64_t x, uint64_t y, int64_t seed)
++{
++    uint64_t hash = x * 374761393ULL
++                  + y * 1274126177ULL
++                  + (uint64_t)seed * 1013904223ULL;
++    hash = (hash ^ (hash >> 13)) * 1274126177ULL;
++    return (uint32_t)(hash ^ (hash >> 16));
++}
++
++static inline float ToUnitFloat(uint32_t hash)
++{
++    return (float)(hash >> 9) / 8388607.0f;
++}
++
++static inline float SmoothStep(float t)
++{
++    return t * t * (3.0f - 2.0f * t);
++}
++
++static void InitializeTerrainAxis(
++    uint64_t modulo[4], uint64_t cellLow[4], const InfiniteCoord* origin)
++{
++    for (int32_t octave = 0; octave < 4; ++octave)
++    {
++        cellLow[octave] = InfiniteCoordDivFloorSmallLow(
++            origin, (uint64_t)g_cellBlocks[octave], &modulo[octave]);
++    }
++}
++
++void TerrainOriginInit(TerrainOrigin* out, const InfiniteCoord* originX, const InfiniteCoord* originY)
++{
++    InitializeTerrainAxis(out->moduloX, out->cellLowX, originX);
++
++    if (originY == originX)
++    {
++        for (int32_t octave = 0; octave < 4; ++octave)
++        {
++            out->moduloY[octave] = out->moduloX[octave];
++            out->cellLowY[octave] = out->cellLowX[octave];
++        }
++    }
++    else
++    {
++        InitializeTerrainAxis(out->moduloY, out->cellLowY, originY);
++    }
++}
++
++// Разлагает originModulo + local на клетку и долю внутри клетки без
++// сложения signed int64, которое переполнялось у краёв локального диапазона.
++static inline void ResolveCoordinate(
++    uint64_t originModulo, uint64_t originCellLow,
++    int64_t local, int64_t cell,
++    uint64_t* outNode, float* outFraction)
++{
++    int64_t quotient = local / cell;
++    int64_t remainder = local % cell;
++    if (remainder < 0)
++    {
++        remainder += cell;
++        --quotient;
++    }
++
++    uint64_t combinedRemainder = (uint64_t)remainder + originModulo;
++    quotient += (int64_t)(combinedRemainder / (uint64_t)cell);
++    combinedRemainder %= (uint64_t)cell;
++
++    *outNode = originCellLow + (uint64_t)quotient;
++    *outFraction = (float)combinedRemainder / (float)cell;
++}
++
++static float NoiseLayer(int64_t seed, const TerrainOrigin* origin, int32_t octave,
++    int64_t localX, int64_t localY)
++{
++    int64_t cell = g_cellBlocks[octave];
++
++    uint64_t nodeX;
++    uint64_t nodeY;
++    float fractionX;
++    float fractionY;
++
++    ResolveCoordinate(
++        origin->moduloX[octave], origin->cellLowX[octave],
++        localX, cell, &nodeX, &fractionX);
++    ResolveCoordinate(
++        origin->moduloY[octave], origin->cellLowY[octave],
++        localY, cell, &nodeY, &fractionY);
++
++    float smoothX = SmoothStep(fractionX);
++    float smoothY = SmoothStep(fractionY);
++
++    float n00 = ToUnitFloat(HashCoordinates(nodeX,     nodeY,     seed));
++    float n10 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeY,     seed));
++    float n01 = ToUnitFloat(HashCoordinates(nodeX,     nodeY + 1, seed));
++    float n11 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeY + 1, seed));
++
++    float nx0 = n00 + (n10 - n00) * smoothX;
++    float nx1 = n01 + (n11 - n01) * smoothX;
++    return nx0 + (nx1 - nx0) * smoothY;
++}
++
++float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localY)
++{
++    float value = 0.0f;
++    float amplitude = 1.0f;
++    float maximumValue = 0.0f;
++
++    for (int32_t octave = 0; octave < 4; ++octave)
++    {
++        value += amplitude * NoiseLayer(seed, origin, octave, localX, localY);
++        maximumValue += amplitude;
++        amplitude *= 0.5f;
++    }
++
++    return value / maximumValue;
++}
+diff --git a/src/world/world_infinite.c b/src/world/world_infinite.c
+new file mode 100644
+index 0000000..f25e973
+--- /dev/null
++++ b/src/world/world_infinite.c
+@@ -0,0 +1,721 @@
++#include "world/world.h"
++#include "world/infinite_coord.h"
++#include "world/terrain_noise.h"
++
++#include <windows.h>
++#include <string.h>
++
++typedef struct LocalChunkCoordinate
++{
++    int64_t x;
++    int64_t y;
++    int64_t z;
++} LocalChunkCoordinate;
++
++typedef struct GlobalChunkCoordinate
++{
++    InfiniteCoord axis[3];
++    uint64_t hash;
++} GlobalChunkCoordinate;
++
++typedef struct DeltaEntry
++{
++    uint32_t localIndex;
++    BlockType block;
++} DeltaEntry;
++
++typedef struct Chunk
++{
++    uint32_t deltaCount;
++    uint32_t deltaCapacity;
++    DeltaEntry* deltas;
++} Chunk;
++
++#define WORLD_INITIAL_CAPACITY 32
++#define HEIGHT_GRID_SIZE (CHUNK_SIZE + 2)
++#define HEIGHT_GRID_CELLS (HEIGHT_GRID_SIZE * HEIGHT_GRID_SIZE)
++#define HEIGHT_CACHE_SLOTS 16
++
++typedef struct HeightGridSlot
++{
++    bool valid;
++    int64_t chunkX;
++    int64_t chunkY;
++    float minimumHeight;
++    float maximumHeight;
++    float* heights;
++} HeightGridSlot;
++
++struct World
++{
++    SRWLOCK tableLock;
++    GlobalChunkCoordinate* keys;
++    Chunk** chunks;
++    bool* occupied;
++    uint32_t count;
++    uint32_t capacity;
++
++    int64_t seed;
++    InfiniteCoord blockOrigin[3];
++    InfiniteCoord chunkOrigin[3];
++    TerrainOrigin terrainOrigin;
++
++    SRWLOCK heightCacheLock;
++    HeightGridSlot heightCache[HEIGHT_CACHE_SLOTS];
++};
++
++static int64_t ChunkFromBlock(int64_t block)
++{
++    int64_t quotient = block / CHUNK_SIZE;
++    if (block % CHUNK_SIZE < 0)
++    {
++        --quotient;
++    }
++    return quotient;
++}
++
++static uint16_t LocalFromBlock(int64_t block, int64_t chunkCoordinate)
++{
++    return (uint16_t)(block - chunkCoordinate * CHUNK_SIZE);
++}
++
++static uint32_t PackLocalIndex(uint16_t x, uint16_t y, uint16_t z)
++{
++    return (uint32_t)x * CHUNK_SIZE * CHUNK_SIZE + (uint32_t)y * CHUNK_SIZE + (uint32_t)z;
++}
++
++static uint64_t RotateLeft64(uint64_t value, uint32_t amount)
++{
++    return (value << amount) | (value >> (64u - amount));
++}
++
++static uint64_t HashLocalChunkCoordinate(const World* world, LocalChunkCoordinate coordinate)
++{
++    uint64_t x = InfiniteCoordHashOffset(&world->chunkOrigin[0], coordinate.x);
++    uint64_t y = InfiniteCoordHashOffset(&world->chunkOrigin[1], coordinate.y);
++    uint64_t z = InfiniteCoordHashOffset(&world->chunkOrigin[2], coordinate.z);
++    return x ^ RotateLeft64(y, 21) ^ RotateLeft64(z, 42);
++}
++
++static bool GlobalChunkCoordinateMatchesLocal(const GlobalChunkCoordinate* global,
++    const World* world, LocalChunkCoordinate local)
++{
++    return InfiniteCoordEqualsOffset(&global->axis[0], &world->chunkOrigin[0], local.x)
++        && InfiniteCoordEqualsOffset(&global->axis[1], &world->chunkOrigin[1], local.y)
++        && InfiniteCoordEqualsOffset(&global->axis[2], &world->chunkOrigin[2], local.z);
++}
++
++static void GlobalChunkCoordinateDestroy(GlobalChunkCoordinate* coordinate)
++{
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordDestroy(&coordinate->axis[axis]);
++    }
++    coordinate->hash = 0;
++}
++
++static bool GlobalChunkCoordinateTryCreate(GlobalChunkCoordinate* out,
++    const World* world, LocalChunkCoordinate local)
++{
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordInit(&out->axis[axis]);
++    }
++    out->hash = HashLocalChunkCoordinate(world, local);
++
++    int64_t offset[3] = { local.x, local.y, local.z };
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        if (!InfiniteCoordTryCopyAddInt64(&out->axis[axis], &world->chunkOrigin[axis], offset[axis]))
++        {
++            GlobalChunkCoordinateDestroy(out);
++            return false;
++        }
++    }
++    return true;
++}
++
++static float TerrainHeight(const World* world, int64_t localX, int64_t localY)
++{
++    float noise = GenerateTerrainNoise(world->seed, &world->terrainOrigin, localX, localY);
++    return (noise - 0.5f) * 32.0f;
++}
++
++static int32_t ColumnCeiling(float height)
++{
++    int32_t ceiling = (int32_t)height;
++    if ((float)ceiling < height)
++    {
++        ceiling++;
++    }
++    return ceiling;
++}
++
++static bool IsAbsoluteZBelow(const World* world, int64_t localZ, int64_t boundary)
++{
++    return InfiniteCoordCompareAddInt64ToInt64(&world->blockOrigin[2], localZ, boundary) < 0;
++}
++
++static BlockType GeneratedBlock(const World* world, int64_t x, int64_t y, int64_t z)
++{
++    int32_t boundary = ColumnCeiling(TerrainHeight(world, x, y));
++    return IsAbsoluteZBelow(world, z, boundary) ? BLOCK_EARTH : BLOCK_AIR;
++}
++
++static int32_t SolidCountInColumn(const World* world,
++    int64_t minBlockZ, int32_t sizeZ, int32_t boundary)
++{
++    if (!IsAbsoluteZBelow(world, minBlockZ, boundary))
++    {
++        return 0;
++    }
++    if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, boundary))
++    {
++        return sizeZ;
++    }
++
++    int32_t low = 0;
++    int32_t high = sizeZ;
++    while (low < high)
++    {
++        int32_t middle = low + (high - low) / 2;
++        if (IsAbsoluteZBelow(world, minBlockZ + middle, boundary))
++        {
++            low = middle + 1;
++        }
++        else
++        {
++            high = middle;
++        }
++    }
++    return low;
++}
++
++static void WorldObtainHeightGrid(World* world, int64_t chunkX, int64_t chunkY,
++    float* outHeights, float* outMinimum, float* outMaximum)
++{
++    uint32_t slotIndex = WorldHashChunkCoordinate(chunkX, chunkY, 0) & (HEIGHT_CACHE_SLOTS - 1);
++    HeightGridSlot* slot = &world->heightCache[slotIndex];
++
++    AcquireSRWLockShared(&world->heightCacheLock);
++    if (slot->valid && slot->chunkX == chunkX && slot->chunkY == chunkY)
++    {
++        memcpy(outHeights, slot->heights, HEIGHT_GRID_CELLS * sizeof(float));
++        *outMinimum = slot->minimumHeight;
++        *outMaximum = slot->maximumHeight;
++        ReleaseSRWLockShared(&world->heightCacheLock);
++        return;
++    }
++    ReleaseSRWLockShared(&world->heightCacheLock);
++
++    int64_t minBlockX = chunkX * CHUNK_SIZE - 1;
++    int64_t minBlockY = chunkY * CHUNK_SIZE - 1;
++    float minimumHeight = 0.0f;
++    float maximumHeight = 0.0f;
++    bool first = true;
++
++    for (int32_t y = 0; y < HEIGHT_GRID_SIZE; ++y)
++    {
++        for (int32_t x = 0; x < HEIGHT_GRID_SIZE; ++x)
++        {
++            float height = TerrainHeight(world, minBlockX + x, minBlockY + y);
++            outHeights[y * HEIGHT_GRID_SIZE + x] = height;
++            if (first || height < minimumHeight) minimumHeight = height;
++            if (first || height > maximumHeight) maximumHeight = height;
++            first = false;
++        }
++    }
++
++    *outMinimum = minimumHeight;
++    *outMaximum = maximumHeight;
++
++    AcquireSRWLockExclusive(&world->heightCacheLock);
++    memcpy(slot->heights, outHeights, HEIGHT_GRID_CELLS * sizeof(float));
++    slot->chunkX = chunkX;
++    slot->chunkY = chunkY;
++    slot->minimumHeight = minimumHeight;
++    slot->maximumHeight = maximumHeight;
++    slot->valid = true;
++    ReleaseSRWLockExclusive(&world->heightCacheLock);
++}
++
++static void ChunkDestroy(Chunk* chunk)
++{
++    if (chunk->deltas != NULL)
++    {
++        HeapFree(GetProcessHeap(), 0, chunk->deltas);
++    }
++    HeapFree(GetProcessHeap(), 0, chunk);
++}
++
++static bool WorldGrow(World* world)
++{
++    uint32_t oldCapacity = world->capacity;
++    uint32_t newCapacity = oldCapacity * 2;
++
++    GlobalChunkCoordinate* newKeys = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)newCapacity * sizeof(GlobalChunkCoordinate));
++    Chunk** newChunks = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)newCapacity * sizeof(Chunk*));
++    bool* newOccupied = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)newCapacity * sizeof(bool));
++
++    if (newKeys == NULL || newChunks == NULL || newOccupied == NULL)
++    {
++        if (newKeys != NULL) HeapFree(GetProcessHeap(), 0, newKeys);
++        if (newChunks != NULL) HeapFree(GetProcessHeap(), 0, newChunks);
++        if (newOccupied != NULL) HeapFree(GetProcessHeap(), 0, newOccupied);
++        return false;
++    }
++
++    for (uint32_t i = 0; i < oldCapacity; ++i)
++    {
++        if (!world->occupied[i]) continue;
++
++        uint32_t mask = newCapacity - 1;
++        uint32_t index = (uint32_t)(world->keys[i].hash ^ (world->keys[i].hash >> 32)) & mask;
++        while (newOccupied[index]) index = (index + 1) & mask;
++
++        newKeys[index] = world->keys[i];
++        newChunks[index] = world->chunks[i];
++        newOccupied[index] = true;
++    }
++
++    HeapFree(GetProcessHeap(), 0, world->keys);
++    HeapFree(GetProcessHeap(), 0, world->chunks);
++    HeapFree(GetProcessHeap(), 0, world->occupied);
++
++    world->keys = newKeys;
++    world->chunks = newChunks;
++    world->occupied = newOccupied;
++    world->capacity = newCapacity;
++    return true;
++}
++
++World* WorldCreate(int64_t seed)
++{
++    World* world = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*world));
++    if (world == NULL) return NULL;
++
++    InitializeSRWLock(&world->tableLock);
++    InitializeSRWLock(&world->heightCacheLock);
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordInit(&world->blockOrigin[axis]);
++        InfiniteCoordInit(&world->chunkOrigin[axis]);
++    }
++
++    world->capacity = WORLD_INITIAL_CAPACITY;
++    world->keys = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)world->capacity * sizeof(GlobalChunkCoordinate));
++    world->chunks = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)world->capacity * sizeof(Chunk*));
++    world->occupied = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
++        (size_t)world->capacity * sizeof(bool));
++
++    bool heightCacheAllocated = true;
++    for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
++    {
++        world->heightCache[slot].heights = HeapAlloc(GetProcessHeap(), 0,
++            HEIGHT_GRID_CELLS * sizeof(float));
++        if (world->heightCache[slot].heights == NULL) heightCacheAllocated = false;
++    }
++
++    if (world->keys == NULL || world->chunks == NULL || world->occupied == NULL || !heightCacheAllocated)
++    {
++        WorldDestroy(world);
++        return NULL;
++    }
++
++    world->seed = seed;
++    TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
++    return world;
++}
++
++void WorldDestroy(World* world)
++{
++    if (world == NULL) return;
++
++    if (world->occupied != NULL)
++    {
++        for (uint32_t i = 0; i < world->capacity; ++i)
++        {
++            if (!world->occupied[i]) continue;
++            GlobalChunkCoordinateDestroy(&world->keys[i]);
++            if (world->chunks != NULL && world->chunks[i] != NULL)
++            {
++                ChunkDestroy(world->chunks[i]);
++            }
++        }
++    }
++
++    for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
++    {
++        if (world->heightCache[slot].heights != NULL)
++        {
++            HeapFree(GetProcessHeap(), 0, world->heightCache[slot].heights);
++        }
++    }
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordDestroy(&world->blockOrigin[axis]);
++        InfiniteCoordDestroy(&world->chunkOrigin[axis]);
++    }
++
++    if (world->keys != NULL) HeapFree(GetProcessHeap(), 0, world->keys);
++    if (world->chunks != NULL) HeapFree(GetProcessHeap(), 0, world->chunks);
++    if (world->occupied != NULL) HeapFree(GetProcessHeap(), 0, world->occupied);
++    HeapFree(GetProcessHeap(), 0, world);
++}
++
++bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ)
++{
++    int64_t blockShift[3] = { blockShiftX, blockShiftY, blockShiftZ };
++    InfiniteCoord newBlockOrigin[3];
++    InfiniteCoord newChunkOrigin[3];
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordInit(&newBlockOrigin[axis]);
++        InfiniteCoordInit(&newChunkOrigin[axis]);
++        if (blockShift[axis] % CHUNK_SIZE != 0
++            || !InfiniteCoordTryCopyAddInt64(&newBlockOrigin[axis], &world->blockOrigin[axis], blockShift[axis])
++            || !InfiniteCoordTryCopyAddInt64(&newChunkOrigin[axis], &world->chunkOrigin[axis], blockShift[axis] / CHUNK_SIZE))
++        {
++            for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
++            {
++                InfiniteCoordDestroy(&newBlockOrigin[cleanup]);
++                InfiniteCoordDestroy(&newChunkOrigin[cleanup]);
++            }
++            return false;
++        }
++    }
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordSwap(&world->blockOrigin[axis], &newBlockOrigin[axis]);
++        InfiniteCoordSwap(&world->chunkOrigin[axis], &newChunkOrigin[axis]);
++        InfiniteCoordDestroy(&newBlockOrigin[axis]);
++        InfiniteCoordDestroy(&newChunkOrigin[axis]);
++    }
++
++    TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
++
++    AcquireSRWLockExclusive(&world->heightCacheLock);
++    for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
++    {
++        world->heightCache[slot].valid = false;
++    }
++    ReleaseSRWLockExclusive(&world->heightCacheLock);
++    return true;
++}
++
++static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
++{
++    if (world->count == 0) return NULL;
++
++    uint64_t hash = HashLocalChunkCoordinate(world, key);
++    uint32_t mask = world->capacity - 1;
++    uint32_t index = (uint32_t)(hash ^ (hash >> 32)) & mask;
++
++    for (uint32_t probe = 0; probe < world->capacity; ++probe)
++    {
++        if (!world->occupied[index]) return NULL;
++        if (world->keys[index].hash == hash
++            && GlobalChunkCoordinateMatchesLocal(&world->keys[index], world, key))
++        {
++            return &world->chunks[index];
++        }
++        index = (index + 1) & mask;
++    }
++    return NULL;
++}
++
++static Chunk* WorldGetOrCreateChunk(World* world, LocalChunkCoordinate key)
++{
++    Chunk** entry = WorldFindEntry(world, key);
++    if (entry != NULL) return *entry;
++
++    if (world->count * 2 >= world->capacity && !WorldGrow(world))
++    {
++        return NULL;
++    }
++
++    GlobalChunkCoordinate globalKey;
++    if (!GlobalChunkCoordinateTryCreate(&globalKey, world, key))
++    {
++        return NULL;
++    }
++
++    Chunk* chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Chunk));
++    if (chunk == NULL)
++    {
++        GlobalChunkCoordinateDestroy(&globalKey);
++        return NULL;
++    }
++
++    uint32_t mask = world->capacity - 1;
++    uint32_t index = (uint32_t)(globalKey.hash ^ (globalKey.hash >> 32)) & mask;
++    while (world->occupied[index]) index = (index + 1) & mask;
++
++    world->keys[index] = globalKey;
++    world->chunks[index] = chunk;
++    world->occupied[index] = true;
++    world->count++;
++    return chunk;
++}
++
++static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* outBlock)
++{
++    for (uint32_t i = 0; i < chunk->deltaCount; ++i)
++    {
++        if (chunk->deltas[i].localIndex == localIndex)
++        {
++            *outBlock = chunk->deltas[i].block;
++            return true;
++        }
++    }
++    return false;
++}
++
++static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
++{
++    for (uint32_t i = 0; i < chunk->deltaCount; ++i)
++    {
++        if (chunk->deltas[i].localIndex == localIndex)
++        {
++            chunk->deltas[i].block = block;
++            return;
++        }
++    }
++
++    if (chunk->deltaCount >= chunk->deltaCapacity)
++    {
++        uint32_t newCapacity = chunk->deltaCapacity < 8 ? 8 : chunk->deltaCapacity * 2;
++        DeltaEntry* newDeltas = chunk->deltas == NULL
++            ? HeapAlloc(GetProcessHeap(), 0, (size_t)newCapacity * sizeof(DeltaEntry))
++            : HeapReAlloc(GetProcessHeap(), 0, chunk->deltas,
++                (size_t)newCapacity * sizeof(DeltaEntry));
++        if (newDeltas == NULL) return;
++        chunk->deltas = newDeltas;
++        chunk->deltaCapacity = newCapacity;
++    }
++
++    chunk->deltas[chunk->deltaCount].localIndex = localIndex;
++    chunk->deltas[chunk->deltaCount].block = block;
++    chunk->deltaCount++;
++}
++
++BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
++{
++    LocalChunkCoordinate coordinate = {
++        ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
++    };
++
++    AcquireSRWLockShared(&world->tableLock);
++    Chunk** entry = WorldFindEntry(world, coordinate);
++    if (entry != NULL)
++    {
++        uint32_t localIndex = PackLocalIndex(
++            LocalFromBlock(x, coordinate.x),
++            LocalFromBlock(y, coordinate.y),
++            LocalFromBlock(z, coordinate.z));
++        BlockType block;
++        if (ChunkGetDelta(*entry, localIndex, &block))
++        {
++            ReleaseSRWLockShared(&world->tableLock);
++            return block;
++        }
++    }
++    ReleaseSRWLockShared(&world->tableLock);
++    return GeneratedBlock(world, x, y, z);
++}
++
++void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block)
++{
++    LocalChunkCoordinate coordinate = {
++        ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
++    };
++    uint32_t localIndex = PackLocalIndex(
++        LocalFromBlock(x, coordinate.x),
++        LocalFromBlock(y, coordinate.y),
++        LocalFromBlock(z, coordinate.z));
++    BlockType generated = GeneratedBlock(world, x, y, z);
++
++    AcquireSRWLockExclusive(&world->tableLock);
++    if (block == generated)
++    {
++        Chunk** entry = WorldFindEntry(world, coordinate);
++        if (entry != NULL)
++        {
++            Chunk* chunk = *entry;
++            for (uint32_t i = 0; i < chunk->deltaCount; ++i)
++            {
++                if (chunk->deltas[i].localIndex == localIndex)
++                {
++                    chunk->deltas[i] = chunk->deltas[--chunk->deltaCount];
++                    break;
++                }
++            }
++        }
++    }
++    else
++    {
++        Chunk* chunk = WorldGetOrCreateChunk(world, coordinate);
++        if (chunk != NULL) ChunkSetDelta(chunk, localIndex, block);
++    }
++    ReleaseSRWLockExclusive(&world->tableLock);
++}
++
++WorldRegionContents WorldFillRegion(World* world,
++    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
++    int32_t sizeX, int32_t sizeY, int32_t sizeZ,
++    BlockType* outBlocks)
++{
++    bool regionHasDeltas = false;
++    int64_t minChunkX = ChunkFromBlock(minBlockX);
++    int64_t minChunkY = ChunkFromBlock(minBlockY);
++    int64_t minChunkZ = ChunkFromBlock(minBlockZ);
++    int64_t maxChunkX = ChunkFromBlock(minBlockX + sizeX - 1);
++    int64_t maxChunkY = ChunkFromBlock(minBlockY + sizeY - 1);
++    int64_t maxChunkZ = ChunkFromBlock(minBlockZ + sizeZ - 1);
++
++    AcquireSRWLockShared(&world->tableLock);
++    for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ && !regionHasDeltas; ++chunkZ)
++    {
++        for (int64_t chunkY = minChunkY; chunkY <= maxChunkY && !regionHasDeltas; ++chunkY)
++        {
++            for (int64_t chunkX = minChunkX; chunkX <= maxChunkX && !regionHasDeltas; ++chunkX)
++            {
++                LocalChunkCoordinate coordinate = { chunkX, chunkY, chunkZ };
++                Chunk** entry = WorldFindEntry(world, coordinate);
++                if (entry != NULL && (*entry)->deltaCount > 0) regionHasDeltas = true;
++            }
++        }
++    }
++    ReleaseSRWLockShared(&world->tableLock);
++
++    float* heights = HeapAlloc(GetProcessHeap(), 0, (size_t)sizeX * sizeY * sizeof(float));
++    float minimumHeight = 0.0f;
++    float maximumHeight = 0.0f;
++    bool boundsKnown = false;
++
++    if (heights != NULL)
++    {
++        if (sizeX == HEIGHT_GRID_SIZE && sizeY == HEIGHT_GRID_SIZE
++            && (minBlockX + 1) % CHUNK_SIZE == 0
++            && (minBlockY + 1) % CHUNK_SIZE == 0)
++        {
++            WorldObtainHeightGrid(world,
++                (minBlockX + 1) / CHUNK_SIZE, (minBlockY + 1) / CHUNK_SIZE,
++                heights, &minimumHeight, &maximumHeight);
++            boundsKnown = true;
++        }
++        else
++        {
++            bool first = true;
++            for (int32_t y = 0; y < sizeY; ++y)
++            {
++                for (int32_t x = 0; x < sizeX; ++x)
++                {
++                    float height = TerrainHeight(world, minBlockX + x, minBlockY + y);
++                    heights[y * sizeX + x] = height;
++                    if (first || height < minimumHeight) minimumHeight = height;
++                    if (first || height > maximumHeight) maximumHeight = height;
++                    first = false;
++                }
++            }
++            boundsKnown = true;
++        }
++    }
++
++    if (!regionHasDeltas && boundsKnown)
++    {
++        if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
++        {
++            HeapFree(GetProcessHeap(), 0, heights);
++            return WORLD_REGION_ALL_AIR;
++        }
++        if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
++        {
++            HeapFree(GetProcessHeap(), 0, heights);
++            return WORLD_REGION_ALL_SOLID;
++        }
++    }
++
++    for (int32_t y = 0; y < sizeY; ++y)
++    {
++        for (int32_t x = 0; x < sizeX; ++x)
++        {
++            float height = heights != NULL
++                ? heights[y * sizeX + x]
++                : TerrainHeight(world, minBlockX + x, minBlockY + y);
++            int32_t solidCount = SolidCountInColumn(
++                world, minBlockZ, sizeZ, ColumnCeiling(height));
++
++            BlockType* column = &outBlocks[(((size_t)y * sizeX) + (size_t)x) * sizeZ];
++            memset(column, BLOCK_EARTH, (size_t)solidCount);
++            memset(column + solidCount, BLOCK_AIR, (size_t)(sizeZ - solidCount));
++        }
++    }
++
++    if (heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
++
++    if (regionHasDeltas)
++    {
++        AcquireSRWLockShared(&world->tableLock);
++        for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
++        {
++            for (int64_t chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
++            {
++                for (int64_t chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX)
++                {
++                    LocalChunkCoordinate coordinate = { chunkX, chunkY, chunkZ };
++                    Chunk** entry = WorldFindEntry(world, coordinate);
++                    if (entry == NULL) continue;
++
++                    const Chunk* chunk = *entry;
++                    int64_t chunkBaseX = chunkX * CHUNK_SIZE;
++                    int64_t chunkBaseY = chunkY * CHUNK_SIZE;
++                    int64_t chunkBaseZ = chunkZ * CHUNK_SIZE;
++
++                    for (uint32_t i = 0; i < chunk->deltaCount; ++i)
++                    {
++                        uint32_t localIndex = chunk->deltas[i].localIndex;
++                        int64_t blockX = chunkBaseX + localIndex / (CHUNK_SIZE * CHUNK_SIZE);
++                        int64_t blockY = chunkBaseY + (localIndex / CHUNK_SIZE) % CHUNK_SIZE;
++                        int64_t blockZ = chunkBaseZ + localIndex % CHUNK_SIZE;
++                        int64_t relativeX = blockX - minBlockX;
++                        int64_t relativeY = blockY - minBlockY;
++                        int64_t relativeZ = blockZ - minBlockZ;
++                        if (relativeX < 0 || relativeX >= sizeX
++                            || relativeY < 0 || relativeY >= sizeY
++                            || relativeZ < 0 || relativeZ >= sizeZ)
++                        {
++                            continue;
++                        }
++                        outBlocks[((size_t)relativeY * sizeX + (size_t)relativeX) * sizeZ
++                            + (size_t)relativeZ] = chunk->deltas[i].block;
++                    }
++                }
++            }
++        }
++        ReleaseSRWLockShared(&world->tableLock);
++    }
++
++    return WORLD_REGION_MIXED;
++}
++
++int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y)
++{
++    int64_t globalTop = (int64_t)ColumnCeiling(TerrainHeight(world, x, y)) - 1;
++    return InfiniteCoordSubtractFromInt64Clamped(globalTop, &world->blockOrigin[2]);
++}
++
++void WorldGetAbsoluteBlockLow32(World* world,
++    int64_t x, int64_t y, int64_t z, uint32_t outLow[3])
++{
++    outLow[0] = InfiniteCoordLow32Offset(&world->blockOrigin[0], x);
++    outLow[1] = InfiniteCoordLow32Offset(&world->blockOrigin[1], y);
++    outLow[2] = InfiniteCoordLow32Offset(&world->blockOrigin[2], z);
++}
+diff --git a/src/world/world.h b/src/world/world.h
+index 0c2f779..24e4137 100644
+--- a/src/world/world.h
++++ b/src/world/world.h
+@@ -1,14 +1,12 @@
+ #pragma once
+ 
+ #include "api.h"
+-#include "world/bigcoord.h"
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-// Потокобезопасность: все функции мира можно вызывать из любых потоков
+-// одновременно — таблица чанков и кеш высот защищены SRW-замками
+-// (читатели параллельно, писатель эксклюзивно).
++// Потокобезопасность: обычные запросы мира можно выполнять параллельно.
++// WorldRebase вызывается только после остановки рабочих потоков мешинга.
+ typedef struct World World;
+ 
+ typedef uint8_t BlockType;
+@@ -19,8 +17,6 @@ typedef uint8_t BlockType;
+ #define CHUNK_SIZE      64
+ #define CHUNK_SIZE_LOG2 6
+ 
+-// Общий хеш координат чанка (используется и миром, и стримингом ядра —
+-// inline, чтобы не плодить копии и не звать через границу DLL).
+ static inline uint32_t WorldHashChunkCoordinate(int64_t x, int64_t y, int64_t z)
+ {
+     uint64_t hash = (uint64_t)x * 73856093ULL
+@@ -29,8 +25,6 @@ static inline uint32_t WorldHashChunkCoordinate(int64_t x, int64_t y, int64_t z)
+     return (uint32_t)(hash ^ (hash >> 33));
+ }
+ 
+-// Итог пакетной выборки региона: однородные регионы позволяют
+-// потребителю (например, мешеру) пропустить обработку целиком.
+ typedef enum WorldRegionContents
+ {
+     WORLD_REGION_ALL_AIR,
+@@ -38,22 +32,26 @@ typedef enum WorldRegionContents
+     WORLD_REGION_MIXED
+ } WorldRegionContents;
+ 
+-LAIUE_WORLD_API World* WorldCreate(int64_t seed, const BigCoord* originX, const BigCoord* originY);
++LAIUE_WORLD_API World* WorldCreate(int64_t seed);
+ LAIUE_WORLD_API void   WorldDestroy(World* world);
+ 
++// Переносит локальное начало координат на целое число блоков.
++// Сдвиги обязаны быть кратны CHUNK_SIZE. Абсолютные координаты произвольной
++// точности растут динамически, а локальные координаты остаются маленькими.
++LAIUE_WORLD_API bool WorldRebase(World* world,
++    int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
++
+ LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
+ LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+ 
+-// Пакетная выборка блоков региона одним вызовом: высота колонны считается
+-// один раз, дельты накладываются пачкой — на порядки быстрее, чем
+-// поблочные вызовы WorldGetBlock через границу DLL.
+-//
+-// Раскладка outBlocks: индекс = ((y * sizeX) + x) * sizeZ + z
+-// (y, x — горизонталь, z — высота, самый быстрый индекс).
+ LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
+     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
+     BlockType* outBlocks);
+ 
+-// Высота верхнего твёрдого блока процедурного ландшафта (x, y — горизонталь).
+-LAIUE_WORLD_API int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
++// Высота верхнего твёрдого блока в текущих локальных координатах.
++LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
++
++// Младшие 32 бита абсолютных координат — стабильный хеш текстуры при rebasing.
++LAIUE_WORLD_API void WorldGetAbsoluteBlockLow32(World* world,
++    int64_t x, int64_t y, int64_t z, uint32_t outLow[3]);
+diff --git a/src/core/application.c b/src/core/application.c
+--- a/src/core/application.c
++++ b/src/core/application.c
+@@ -27,6 +27,7 @@ typedef struct ApplicationConfiguration
+     float editReachDistance;
+     int32_t viewRadiusChunks;
+     int64_t worldSeed;
++    int64_t rebaseThresholdBlocks;
+     double spawnHeight;
+ } ApplicationConfiguration;
+ 
+@@ -42,5 +43,6 @@ static const ApplicationConfiguration g_configuration = {
+     .editReachDistance = 8.0f,
+     .viewRadiusChunks = 5,
+     .worldSeed = 42,
++    .rebaseThresholdBlocks = 1048576,
+     .spawnHeight = 100.0,
+ };
+@@ -71,6 +73,56 @@ static int64_t FloorToInt64(double value)
+     return (double)truncated > value ? truncated - 1 : truncated;
+ }
+ 
++static int64_t CalculateRebaseShift(double position)
++{
++    double threshold = (double)g_configuration.rebaseThresholdBlocks;
++    if (position >= -threshold && position <= threshold)
++    {
++        return 0;
++    }
++
++    int64_t block = FloorToInt64(position);
++    int64_t chunk = block / CHUNK_SIZE;
++    if (block < 0 && block % CHUNK_SIZE != 0)
++    {
++        --chunk;
++    }
++    return chunk * CHUNK_SIZE;
++}
++
++// Камера всегда остаётся около локального нуля. Когда она удаляется слишком
++// далеко, локальный кеш чанков останавливается, абсолютный bigint-origin мира
++// сдвигается, а камера возвращается в точный диапазон double.
++static bool RebaseWorldIfNeeded(ApplicationState* application)
++{
++    int64_t shift[3] = {
++        CalculateRebaseShift(application->camera.position[0]),
++        CalculateRebaseShift(application->camera.position[1]),
++        CalculateRebaseShift(application->camera.position[2]),
++    };
++    if (shift[0] == 0 && shift[1] == 0 && shift[2] == 0)
++    {
++        return true;
++    }
++
++    ChunkStreamingDestroy(application->chunkStreaming);
++    application->chunkStreaming = NULL;
++
++    if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
++    {
++        return false;
++    }
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        application->camera.position[axis] -= (double)shift[axis];
++    }
++
++    application->chunkStreaming = ChunkStreamingCreate(
++        application->world, application->renderer, g_configuration.viewRadiusChunks);
++    return application->chunkStreaming != NULL;
++}
++
+ // Трассировка луча по вокселям (DDA, Amanatides & Woo).
+ // outPreviousBlock — последний воздушный блок перед попаданием
+ // (куда ставится новый блок).
+@@ -231,6 +275,12 @@ static void OnFrame(void* userData)
+         mouseDeltaX, mouseDeltaY,
+         g_configuration.cameraSpeed, g_configuration.mouseSensitivity);
+ 
++    if (!RebaseWorldIfNeeded(application))
++    {
++        WindowRequestClose(application->window);
++        return;
++    }
++
+     if (mouseLookEnabled)
+     {
+         HandleBlockEditing(application);
+@@ -294,13 +344,7 @@ LAIUE_CORE_API void Start(void)
+         return;
+     }
+ 
+-    // Максимально далёкая абсолютная точка, поддерживаемая BigCoord:
+-    // 2^(64 * 520) - 1, то есть примерно 10^10018. Камера остаётся около
+-    // локального нуля, поэтому точность движения и выбора блоков не теряется.
+-    static BigCoord worldOrigin;
+-    BigCoordSetMaximum(&worldOrigin);
+-
+-    World* world = WorldCreate(g_configuration.worldSeed, &worldOrigin, &worldOrigin);
++    World* world = WorldCreate(g_configuration.worldSeed);
+     if (world == NULL)
+     {
+         InputDestroy(input);
+diff --git a/src/core/chunk_streaming.c b/src/core/chunk_streaming.c
+--- a/src/core/chunk_streaming.c
++++ b/src/core/chunk_streaming.c
+@@ -27,6 +27,7 @@ typedef struct ChunkEntry
+     int64_t x;
+     int64_t y;
+     int64_t z;
++    uint32_t baseLow[3];
+     RendererMesh* mesh;
+     uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
+     ChunkEntryState state;
+@@ -130,6 +131,9 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y,
+     entry->x = x;
+     entry->y = y;
+     entry->z = z;
++    WorldGetAbsoluteBlockLow32(streaming->world,
++        x * CHUNK_SIZE, y * CHUNK_SIZE, z * CHUNK_SIZE,
++        entry->baseLow);
+     entry->mesh = NULL;
+     entry->revision = 0;
+     entry->requestQueued = false;
+@@ -617,12 +621,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[1
+             (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
+             (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
+         };
+-        uint32_t chunkBaseLow[3] = {
+-            (uint32_t)(uint64_t)(entry->x * CHUNK_SIZE),
+-            (uint32_t)(uint64_t)(entry->y * CHUNK_SIZE),
+-            (uint32_t)(uint64_t)(entry->z * CHUNK_SIZE),
+-        };
+-
+-        RendererDrawMesh(streaming->renderer, entry->mesh, chunkOriginRelative, chunkBaseLow);
++        RendererDrawMesh(streaming->renderer, entry->mesh,
++            chunkOriginRelative, entry->baseLow);
+     }
+ }
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -184,7 +184,14 @@ laiue_add_module(input
+ )
+ 
+ laiue_add_module(world
+-    SOURCES src/world/world.c src/world/noise.c src/world/world.h src/world/noise.h src/world/bigcoord.h src/api.h
++    SOURCES
++        src/world/world_infinite.c
++        src/world/terrain_noise.c
++        src/world/terrain_noise.h
++        src/world/infinite_coord.c
++        src/world/infinite_coord.h
++        src/world/world.h
++        src/api.h
+ )
+ 
+ laiue_add_module(mesher

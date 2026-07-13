@@ -29,4 +29,5 @@ LAIUE_WINDOW_API bool    WindowConsumeFocusLoss(Window* window);
 LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
 LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
+LAIUE_WINDOW_API void    WindowSetOverlayText(Window* window, const wchar_t* text);
 LAIUE_WINDOW_API void    WindowRequestClose(Window* window);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Знаковое целое произвольной точности. Число лимбов растёт только при
@@ -16,6 +17,8 @@ void InfiniteCoordInit(InfiniteCoord* value);
 void InfiniteCoordDestroy(InfiniteCoord* value);
 
 bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
+bool InfiniteCoordTryCopyDoubleAddInt64(
+    InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
 void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b);
 
 // floor(value / divisor): возвращаются младшие 64 бита частного и
@@ -36,3 +39,8 @@ uint32_t InfiniteCoordLow32Offset(const InfiniteCoord* base, int64_t offset);
 
 // scalar - value с насыщением до int64.
 int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value);
+
+// Короткое представление base + offset для UI: точное для небольших чисел,
+// научная запись для uint64 и степень двойки для координат любой длины.
+void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
+    wchar_t* outText, uint32_t capacity);
