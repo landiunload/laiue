@@ -174,7 +174,7 @@ laiue_add_module(window
         src/platform/time.c
         src/platform/time.h
         src/api.h
-    LINK user32
+    LINK user32 gdi32
 )
 
 laiue_add_module(input
