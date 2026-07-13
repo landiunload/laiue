@@ -24,6 +24,9 @@ LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
 LAIUE_RENDER_API bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16]);
 LAIUE_RENDER_API void RendererEndFrame(Renderer* renderer);
 
+LAIUE_RENDER_API void RendererSetVerticalSync(Renderer* renderer, bool enabled);
+LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
+
 // Создание меша: квады ставятся в очередь загрузки на GPU (выполняется
 // в ближайшем RendererBeginFrame). Вызывать до начала кадра.
 // NULL при нехватке памяти или пустой геометрии — вызывающая сторона

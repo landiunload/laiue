@@ -312,8 +312,8 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
             onFrame(userData);
         }
 
-        // В фокусе темп кадров дозирует vsync внутри кадра (Present);
-        // дополнительный сон здесь пропускал бы каждый второй vblank.
+        // В фокусе ожидание кадра при необходимости происходит в Present:
+        // дополнительный сон мешал бы vsync и ограничивал режим без него.
         // Вне фокуса — экономный режим: ~20 кадров в секунду.
         if (!window->focused)
         {

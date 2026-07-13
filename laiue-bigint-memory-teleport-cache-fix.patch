@@ -1,0 +1,1039 @@
+diff --git a/src/world/infinite_coord.h b/src/world/infinite_coord.h
+--- a/src/world/infinite_coord.h
++++ b/src/world/infinite_coord.h
+@@ -21,7 +21,13 @@ bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
+ bool InfiniteCoordTryCopySquareAddInt64(
+     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
+ bool InfiniteCoordTryCopyShiftRight(
+     InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount);
++bool InfiniteCoordTrySubtractToInt64(
++    const InfiniteCoord* left, const InfiniteCoord* right, int64_t* outDifference);
++
++// Сравнивает left + leftOffset и right + rightOffset без временных bigint.
++bool InfiniteCoordEqualsOffsets(const InfiniteCoord* left, int64_t leftOffset,
++    const InfiniteCoord* right, int64_t rightOffset);
+ void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b);
+ 
+ // floor(value / divisor): возвращаются младшие 64 бита частного и
+diff --git a/src/world/infinite_coord.c b/src/world/infinite_coord.c
+--- a/src/world/infinite_coord.c
++++ b/src/world/infinite_coord.c
+@@ -40,6 +40,26 @@ static int32_t InfiniteCoordCompareMagnitudeSmall(const InfiniteCoord* value, uint64_t magnitude)
+     return current < magnitude ? -1 : (current > magnitude ? 1 : 0);
+ }
+ 
++static int32_t InfiniteCoordCompareMagnitude(
++    const InfiniteCoord* left, const InfiniteCoord* right)
++{
++    if (left->limbCount != right->limbCount)
++    {
++        return left->limbCount < right->limbCount ? -1 : 1;
++    }
++
++    for (uint32_t index = left->limbCount; index > 0; --index)
++    {
++        uint64_t leftLimb = left->limbs[index - 1];
++        uint64_t rightLimb = right->limbs[index - 1];
++        if (leftLimb != rightLimb)
++        {
++            return leftLimb < rightLimb ? -1 : 1;
++        }
++    }
++    return 0;
++}
++
+ static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source)
+ {
+     InfiniteCoordInit(out);
+@@ -212,6 +230,114 @@ static void SignedDifference(int64_t left, int64_t right,
+     }
+ }
+ 
++static void CopyMagnitudeInfo(
++    const InfiniteCoord* value, uint64_t* outLow, bool* outWide)
++{
++    *outLow = value->limbCount == 0 ? 0 : value->limbs[0];
++    *outWide = false;
++    for (uint32_t index = 1; index < value->limbCount; ++index)
++    {
++        if (value->limbs[index] != 0)
++        {
++            *outWide = true;
++            break;
++        }
++    }
++}
++
++static void AddMagnitudeInfo(
++    const InfiniteCoord* left, const InfiniteCoord* right,
++    uint64_t* outLow, bool* outWide)
++{
++    uint64_t carry = 0;
++    uint32_t count = left->limbCount > right->limbCount
++        ? left->limbCount : right->limbCount;
++    *outLow = 0;
++    *outWide = false;
++
++    for (uint32_t index = 0; index < count; ++index)
++    {
++        uint64_t a = index < left->limbCount ? left->limbs[index] : 0;
++        uint64_t b = index < right->limbCount ? right->limbs[index] : 0;
++        uint64_t sum = a + b;
++        uint64_t firstCarry = sum < a ? 1u : 0u;
++        uint64_t result = sum + carry;
++        uint64_t secondCarry = result < sum ? 1u : 0u;
++        carry = firstCarry | secondCarry;
++
++        if (index == 0) *outLow = result;
++        else if (result != 0) *outWide = true;
++    }
++    if (carry != 0) *outWide = true;
++}
++
++static void SubtractMagnitudeInfo(
++    const InfiniteCoord* larger, const InfiniteCoord* smaller,
++    uint64_t* outLow, bool* outWide)
++{
++    uint64_t borrow = 0;
++    *outLow = 0;
++    *outWide = false;
++
++    for (uint32_t index = 0; index < larger->limbCount; ++index)
++    {
++        uint64_t a = larger->limbs[index];
++        uint64_t b = index < smaller->limbCount ? smaller->limbs[index] : 0;
++        uint64_t difference = a - b;
++        uint64_t firstBorrow = a < b ? 1u : 0u;
++        uint64_t result = difference - borrow;
++        uint64_t secondBorrow = difference < borrow ? 1u : 0u;
++        borrow = firstBorrow | secondBorrow;
++
++        if (index == 0) *outLow = result;
++        else if (result != 0) *outWide = true;
++    }
++}
++
++static void InfiniteCoordDifferenceInfo(
++    const InfiniteCoord* left, const InfiniteCoord* right,
++    int32_t* outSign, uint64_t* outMagnitude, bool* outWide)
++{
++    if (left->sign == 0)
++    {
++        *outSign = -right->sign;
++        CopyMagnitudeInfo(right, outMagnitude, outWide);
++        return;
++    }
++    if (right->sign == 0)
++    {
++        *outSign = left->sign;
++        CopyMagnitudeInfo(left, outMagnitude, outWide);
++        return;
++    }
++    if (left->sign != right->sign)
++    {
++        *outSign = left->sign;
++        AddMagnitudeInfo(left, right, outMagnitude, outWide);
++        return;
++    }
++
++    int32_t comparison = InfiniteCoordCompareMagnitude(left, right);
++    if (comparison == 0)
++    {
++        *outSign = 0;
++        *outMagnitude = 0;
++        *outWide = false;
++        return;
++    }
++
++    if (comparison > 0)
++    {
++        *outSign = left->sign;
++        SubtractMagnitudeInfo(left, right, outMagnitude, outWide);
++    }
++    else
++    {
++        *outSign = -left->sign;
++        SubtractMagnitudeInfo(right, left, outMagnitude, outWide);
++    }
++}
++
+ static int32_t InfiniteCoordSignAfterSmall(
+     const InfiniteCoord* value, int32_t addSign, uint64_t addMagnitude)
+ {
+@@ -315,6 +426,27 @@ static uint64_t AddWithCarry64(
+     return firstCarry | secondCarry;
+ }
+ 
++static void AddWideProduct(uint64_t* limbs, uint32_t index,
++    uint64_t low, uint64_t high, uint64_t extra)
++{
++    uint64_t carry = AddWithCarry64(
++        limbs[index], low, 0, &limbs[index]);
++    ++index;
++    carry = AddWithCarry64(
++        limbs[index], high, carry, &limbs[index]);
++    ++index;
++    carry = AddWithCarry64(
++        limbs[index], extra, carry, &limbs[index]);
++    ++index;
++
++    while (carry != 0)
++    {
++        carry = AddWithCarry64(
++            limbs[index], 0, carry, &limbs[index]);
++        ++index;
++    }
++}
++
+ bool InfiniteCoordTryCopySquareAddInt64(
+     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
+ {
+@@ -345,28 +474,29 @@ bool InfiniteCoordTryCopySquareAddInt64(
+         return false;
+     }
+ 
+-    for (uint32_t leftIndex = 0; leftIndex < value.limbCount; ++leftIndex)
++    // Специализированное возведение в квадрат: диагональ считается один раз,
++    // попарные произведения — один раз и удваиваются. Почти вдвое меньше
++    // 64x64 умножений, чем у общего школьного умножения.
++    for (uint32_t leftIndex = 0;
++         leftIndex < value.limbCount; ++leftIndex)
+     {
+-        for (uint32_t rightIndex = 0; rightIndex < value.limbCount; ++rightIndex)
++        uint64_t diagonalHigh;
++        uint64_t diagonalLow = Multiply64(
++            value.limbs[leftIndex], value.limbs[leftIndex], &diagonalHigh);
++        AddWideProduct(limbs, leftIndex * 2u,
++            diagonalLow, diagonalHigh, 0);
++
++        for (uint32_t rightIndex = leftIndex + 1;
++             rightIndex < value.limbCount; ++rightIndex)
+         {
+             uint64_t productHigh;
+             uint64_t productLow = Multiply64(
+                 value.limbs[leftIndex], value.limbs[rightIndex], &productHigh);
+-
+-            uint32_t resultIndex = leftIndex + rightIndex;
+-            uint64_t carry = AddWithCarry64(
+-                limbs[resultIndex], productLow, 0, &limbs[resultIndex]);
+-            ++resultIndex;
+-            carry = AddWithCarry64(
+-                limbs[resultIndex], productHigh, carry, &limbs[resultIndex]);
+-            ++resultIndex;
+-
+-            while (carry != 0)
+-            {
+-                carry = AddWithCarry64(
+-                    limbs[resultIndex], 0, carry, &limbs[resultIndex]);
+-                ++resultIndex;
+-            }
++            uint64_t doubledLow = productLow << 1;
++            uint64_t doubledHigh = (productHigh << 1) | (productLow >> 63);
++            uint64_t extra = productHigh >> 63;
++            AddWideProduct(limbs, leftIndex + rightIndex,
++                doubledLow, doubledHigh, extra);
+         }
+     }
+ 
+@@ -420,6 +546,51 @@ bool InfiniteCoordTryCopyShiftRight(
+     return true;
+ }
+ 
++bool InfiniteCoordTrySubtractToInt64(
++    const InfiniteCoord* left, const InfiniteCoord* right, int64_t* outDifference)
++{
++    if (outDifference == NULL) return false;
++
++    int32_t sign;
++    uint64_t magnitude;
++    bool wide;
++    InfiniteCoordDifferenceInfo(left, right, &sign, &magnitude, &wide);
++    if (wide) return false;
++
++    if (sign > 0)
++    {
++        if (magnitude > (uint64_t)INT64_MAX) return false;
++        *outDifference = (int64_t)magnitude;
++    }
++    else if (sign < 0)
++    {
++        if (magnitude > (1ull << 63)) return false;
++        *outDifference = magnitude == (1ull << 63)
++            ? INT64_MIN : -(int64_t)magnitude;
++    }
++    else
++    {
++        *outDifference = 0;
++    }
++    return true;
++}
++
++bool InfiniteCoordEqualsOffsets(const InfiniteCoord* left, int64_t leftOffset,
++    const InfiniteCoord* right, int64_t rightOffset)
++{
++    int32_t baseSign;
++    uint64_t baseMagnitude;
++    bool baseWide;
++    InfiniteCoordDifferenceInfo(
++        left, right, &baseSign, &baseMagnitude, &baseWide);
++    if (baseWide) return false;
++
++    int32_t offsetSign;
++    uint64_t offsetMagnitude;
++    SignedDifference(rightOffset, leftOffset, &offsetSign, &offsetMagnitude);
++    return baseSign == offsetSign && baseMagnitude == offsetMagnitude;
++}
++
+ void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)
+ {
+     InfiniteCoord temporary = *a;
+diff --git a/src/world/world.h b/src/world/world.h
+--- a/src/world/world.h
++++ b/src/world/world.h
+@@ -44,12 +44,10 @@ LAIUE_WORLD_API bool WorldRebase(World* world,
+     int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
+ 
+-LAIUE_WORLD_API bool WorldAbsoluteBlockCoordinateEqualsInt64(World* world,
+-    int32_t axis, int64_t localBlock, int64_t expected);
+-
+-// Возводит целую абсолютную координату X в квадрат и возвращает её новое
+-// локальное положение внутри чанка.
++// Возводит абсолютную координату X в квадрат. Возвращает смещение нового
++// chunk-origin относительно старого, если оно помещается в int64.
+ LAIUE_WORLD_API bool WorldSquareAbsoluteX(
+-    World* world, int64_t localBlockX, int64_t* outLocalBlockX);
++    World* world, int64_t localBlockX, int64_t* outLocalBlockX,
++    bool* outChunkOriginDeltaFits, int64_t* outChunkOriginDeltaX);
+ 
+ LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
+     int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity);
+diff --git a/src/world/world_infinite.c b/src/world/world_infinite.c
+--- a/src/world/world_infinite.c
++++ b/src/world/world_infinite.c
+@@ -14,17 +14,23 @@ typedef struct LocalChunkCoordinate
+     int64_t z;
+ } LocalChunkCoordinate;
+ 
++typedef struct CoordinateFrame
++{
++    InfiniteCoord chunkOrigin[3];
++    uint32_t referenceCount;
++} CoordinateFrame;
++
+ typedef struct GlobalChunkCoordinate
+ {
+-    InfiniteCoord axis[3];
+     uint64_t hash;
++    CoordinateFrame* frame;
++    LocalChunkCoordinate local;
+ } GlobalChunkCoordinate;
+ 
+-typedef struct DeltaEntry
+-{
+-    uint32_t localIndex;
+-    BlockType block;
+-} DeltaEntry;
++// 18 бит индекса блока в чанке + 8 бит типа блока.
++typedef uint32_t DeltaEntry;
++#define DELTA_INDEX_BITS (CHUNK_SIZE_LOG2 * 3)
++#define DELTA_INDEX_MASK ((1u << DELTA_INDEX_BITS) - 1u)
+ 
+ typedef struct Chunk
+ {
+@@ -60,6 +72,7 @@ struct World
+     int64_t seed;
+     InfiniteCoord blockOrigin[3];
+     InfiniteCoord chunkOrigin[3];
++    CoordinateFrame* editFrame;
+     TerrainOrigin terrainOrigin;
+ 
+     SRWLOCK heightCacheLock;
+@@ -84,6 +97,22 @@ static uint32_t PackLocalIndex(uint16_t x, uint16_t y, uint16_t z)
+     return (uint32_t)x * CHUNK_SIZE * CHUNK_SIZE + (uint32_t)y * CHUNK_SIZE + (uint32_t)z;
+ }
+ 
++static DeltaEntry PackDelta(uint32_t localIndex, BlockType block)
++{
++    return (localIndex & DELTA_INDEX_MASK)
++        | ((uint32_t)block << DELTA_INDEX_BITS);
++}
++
++static uint32_t DeltaLocalIndex(DeltaEntry entry)
++{
++    return entry & DELTA_INDEX_MASK;
++}
++
++static BlockType DeltaBlock(DeltaEntry entry)
++{
++    return (BlockType)(entry >> DELTA_INDEX_BITS);
++}
++
+ static uint64_t HashRotateLeft64(uint64_t value, uint32_t amount)
+ {
+     return (value << amount) | (value >> (64u - amount));
+@@ -99,40 +127,81 @@ static uint64_t HashLocalChunkCoordinate(const World* world, LocalChunkCoordinate coordinate)
+     return x ^ HashRotateLeft64(y, 21) ^ HashRotateLeft64(z, 42);
+ }
+ 
++static void CoordinateFrameRelease(CoordinateFrame* frame)
++{
++    if (frame == NULL) return;
++    if (--frame->referenceCount != 0) return;
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordDestroy(&frame->chunkOrigin[axis]);
++    }
++    HeapFree(GetProcessHeap(), 0, frame);
++}
++
++static CoordinateFrame* WorldGetEditFrame(World* world)
++{
++    if (world->editFrame != NULL) return world->editFrame;
++
++    CoordinateFrame* frame = HeapAlloc(
++        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*frame));
++    if (frame == NULL) return NULL;
++
++    frame->referenceCount = 1; // ссылка кеша World
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        InfiniteCoordInit(&frame->chunkOrigin[axis]);
++        if (!InfiniteCoordTryCopyAddInt64(
++                &frame->chunkOrigin[axis], &world->chunkOrigin[axis], 0))
++        {
++            CoordinateFrameRelease(frame);
++            return NULL;
++        }
++    }
++    world->editFrame = frame;
++    return frame;
++}
++
+ static bool GlobalChunkCoordinateMatchesLocal(const GlobalChunkCoordinate* global,
+     const World* world, LocalChunkCoordinate local)
+ {
+-    return InfiniteCoordEqualsOffset(&global->axis[0], &world->chunkOrigin[0], local.x)
+-        && InfiniteCoordEqualsOffset(&global->axis[1], &world->chunkOrigin[1], local.y)
+-        && InfiniteCoordEqualsOffset(&global->axis[2], &world->chunkOrigin[2], local.z);
++    if (global->frame == world->editFrame)
++    {
++        return global->local.x == local.x
++            && global->local.y == local.y
++            && global->local.z == local.z;
++    }
++
++    return InfiniteCoordEqualsOffsets(
++            &global->frame->chunkOrigin[0], global->local.x,
++            &world->chunkOrigin[0], local.x)
++        && InfiniteCoordEqualsOffsets(
++            &global->frame->chunkOrigin[1], global->local.y,
++            &world->chunkOrigin[1], local.y)
++        && InfiniteCoordEqualsOffsets(
++            &global->frame->chunkOrigin[2], global->local.z,
++            &world->chunkOrigin[2], local.z);
+ }
+ 
+ static void GlobalChunkCoordinateDestroy(GlobalChunkCoordinate* coordinate)
+ {
+-    for (int32_t axis = 0; axis < 3; ++axis)
+-    {
+-        InfiniteCoordDestroy(&coordinate->axis[axis]);
+-    }
++    CoordinateFrameRelease(coordinate->frame);
++    coordinate->frame = NULL;
+     coordinate->hash = 0;
+ }
+ 
+ static bool GlobalChunkCoordinateTryCreate(GlobalChunkCoordinate* out,
+-    const World* world, LocalChunkCoordinate local)
++    World* world, LocalChunkCoordinate local)
+ {
+-    for (int32_t axis = 0; axis < 3; ++axis)
++    CoordinateFrame* frame = WorldGetEditFrame(world);
++    if (frame == NULL || frame->referenceCount == UINT32_MAX)
+     {
+-        InfiniteCoordInit(&out->axis[axis]);
++        return false;
+     }
+-    out->hash = HashLocalChunkCoordinate(world, local);
+ 
+-    int64_t offset[3] = { local.x, local.y, local.z };
+-    for (int32_t axis = 0; axis < 3; ++axis)
+-    {
+-        if (!InfiniteCoordTryCopyAddInt64(&out->axis[axis], &world->chunkOrigin[axis], offset[axis]))
+-        {
+-            GlobalChunkCoordinateDestroy(out);
+-            return false;
+-        }
+-    }
++    frame->referenceCount++;
++    out->hash = HashLocalChunkCoordinate(world, local);
++    out->frame = frame;
++    out->local = local;
+     return true;
+ }
+@@ -357,6 +443,11 @@ void WorldDestroy(World* world)
+         }
+     }
+ 
++    if (world->editFrame != NULL)
++    {
++        CoordinateFrameRelease(world->editFrame);
++        world->editFrame = NULL;
++    }
+     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
+     {
+         if (world->heightCache[slot].heights != NULL)
+@@ -401,6 +492,11 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ)
+         InfiniteCoordDestroy(&newChunkOrigin[axis]);
+     }
+ 
++    if (world->editFrame != NULL)
++    {
++        CoordinateFrameRelease(world->editFrame);
++        world->editFrame = NULL;
++    }
+     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
+ 
+     AcquireSRWLockExclusive(&world->heightCacheLock);
+@@ -414,21 +510,12 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ)
+     return true;
+ }
+ 
+-bool WorldAbsoluteBlockCoordinateEqualsInt64(World* world,
+-    int32_t axis, int64_t localBlock, int64_t expected)
+-{
+-    if (axis < 0 || axis >= 3)
+-    {
+-        return false;
+-    }
+-    return InfiniteCoordCompareAddInt64ToInt64(
+-        &world->blockOrigin[axis], localBlock, expected) == 0;
+-}
+-
+ bool WorldSquareAbsoluteX(
+-    World* world, int64_t localBlockX, int64_t* outLocalBlockX)
++    World* world, int64_t localBlockX, int64_t* outLocalBlockX,
++    bool* outChunkOriginDeltaFits, int64_t* outChunkOriginDeltaX)
+ {
+-    if (outLocalBlockX == NULL)
++    if (outLocalBlockX == NULL || outChunkOriginDeltaFits == NULL
++        || outChunkOriginDeltaX == NULL)
+     {
+         return false;
+     }
+@@ -480,6 +567,9 @@ bool WorldSquareAbsoluteX(
+         return false;
+     }
+ 
++    int64_t chunkOriginDeltaX;
++    bool chunkOriginDeltaFits = InfiniteCoordTrySubtractToInt64(
++        &newChunkOrigin, &world->chunkOrigin[0], &chunkOriginDeltaX);
+     InfiniteCoordSwap(&world->blockOrigin[0], &newBlockOrigin);
+     InfiniteCoordSwap(&world->chunkOrigin[0], &newChunkOrigin);
+     InfiniteCoordDestroy(&squared);
+@@ -487,6 +577,13 @@ bool WorldSquareAbsoluteX(
+     InfiniteCoordDestroy(&newChunkOrigin);
+ 
+     *outLocalBlockX = (int64_t)localBlock;
++    *outChunkOriginDeltaFits = chunkOriginDeltaFits;
++    *outChunkOriginDeltaX = chunkOriginDeltaFits ? chunkOriginDeltaX : 0;
++    if (world->editFrame != NULL)
++    {
++        CoordinateFrameRelease(world->editFrame);
++        world->editFrame = NULL;
++    }
+     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
+ 
+     AcquireSRWLockExclusive(&world->heightCacheLock);
+@@ -526,9 +623,9 @@ static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* outBlock)
+ {
+     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+     {
+-        if (chunk->deltas[i].localIndex == localIndex)
++        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
+         {
+-            *outBlock = chunk->deltas[i].block;
++            *outBlock = DeltaBlock(chunk->deltas[i]);
+             return true;
+         }
+     }
+@@ -542,9 +639,9 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
+ {
+     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+     {
+-        if (chunk->deltas[i].localIndex == localIndex)
++        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
+         {
+-            chunk->deltas[i].block = block;
++            chunk->deltas[i] = PackDelta(localIndex, block);
+             return;
+         }
+     }
+@@ -553,7 +650,7 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
+ 
+     if (chunk->deltaCount >= chunk->deltaCapacity)
+     {
+-        uint32_t newCapacity = chunk->deltaCapacity < 8 ? 8 : chunk->deltaCapacity * 2;
++        uint32_t newCapacity = chunk->deltaCapacity < 4 ? 4 : chunk->deltaCapacity * 2;
+         DeltaEntry* newDeltas = chunk->deltas == NULL
+             ? HeapAlloc(GetProcessHeap(), 0, (size_t)newCapacity * sizeof(DeltaEntry))
+             : HeapReAlloc(GetProcessHeap(), 0, chunk->deltas,
+@@ -564,7 +661,6 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
+         chunk->deltaCapacity = newCapacity;
+     }
+ 
+-    chunk->deltas[chunk->deltaCount].localIndex = localIndex;
+-    chunk->deltas[chunk->deltaCount].block = block;
++    chunk->deltas[chunk->deltaCount] = PackDelta(localIndex, block);
+     chunk->deltaCount++;
+ }
+@@ -614,7 +710,7 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block)
+             Chunk* chunk = *entry;
+             for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+             {
+-                if (chunk->deltas[i].localIndex == localIndex)
++                if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
+                 {
+                     chunk->deltas[i] = chunk->deltas[--chunk->deltaCount];
+                     break;
+@@ -636,7 +732,11 @@ WorldRegionContents WorldFillRegion(World* world,
+     }
+     ReleaseSRWLockShared(&world->tableLock);
+ 
+-    float* heights = HeapAlloc(GetProcessHeap(), 0, (size_t)sizeX * sizeY * sizeof(float));
++    size_t heightCount = (size_t)sizeX * (size_t)sizeY;
++    float stackHeights[HEIGHT_GRID_CELLS];
++    bool heightsOnHeap = heightCount > HEIGHT_GRID_CELLS;
++    float* heights = heightsOnHeap
++        ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float)) : stackHeights;
+     float minimumHeight = 0.0f;
+     float maximumHeight = 0.0f;
+     bool boundsKnown = false;
+@@ -672,12 +772,12 @@ WorldRegionContents WorldFillRegion(World* world,
+     {
+         if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
+         {
+-            HeapFree(GetProcessHeap(), 0, heights);
++            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+             return WORLD_REGION_ALL_AIR;
+         }
+         if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
+         {
+-            HeapFree(GetProcessHeap(), 0, heights);
++            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+             return WORLD_REGION_ALL_SOLID;
+         }
+     }
+@@ -699,7 +799,7 @@ WorldRegionContents WorldFillRegion(World* world,
+         }
+     }
+ 
+-    if (heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
++    if (heightsOnHeap && heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
+ 
+     if (regionHasDeltas)
+     {
+@@ -724,7 +824,7 @@ WorldRegionContents WorldFillRegion(World* world,
+ 
+                     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+                     {
+-                        uint32_t localIndex = chunk->deltas[i].localIndex;
++                        uint32_t localIndex = DeltaLocalIndex(chunk->deltas[i]);
+                         int64_t blockX = chunkBaseX + localIndex / (CHUNK_SIZE * CHUNK_SIZE);
+                         int64_t blockY = chunkBaseY + (localIndex / CHUNK_SIZE) % CHUNK_SIZE;
+                         int64_t blockZ = chunkBaseZ + localIndex % CHUNK_SIZE;
+@@ -738,7 +838,7 @@ WorldRegionContents WorldFillRegion(World* world,
+                             continue;
+                         }
+                         outBlocks[((size_t)relativeY * sizeX + (size_t)relativeX) * sizeZ
+-                            + (size_t)relativeZ] = chunk->deltas[i].block;
++                            + (size_t)relativeZ] = DeltaBlock(chunk->deltas[i]);
+                     }
+                 }
+             }
+diff --git a/src/core/chunk_streaming.h b/src/core/chunk_streaming.h
+--- a/src/core/chunk_streaming.h
++++ b/src/core/chunk_streaming.h
+@@ -2,5 +2,6 @@
+ #pragma once
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ // Асинхронная подгрузка чанков (внутренний компонент ядра):
+@@ -17,6 +18,14 @@ typedef struct Renderer Renderer;
+ 
+ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks);
+ void ChunkStreamingDestroy(ChunkStreaming* streaming);
++bool ChunkStreamingPause(ChunkStreaming* streaming);
++
++// Вызывается после смены origin мира. Сохраняет только уже готовые GPU-меши,
++// абсолютные чанки которых попадают в новую зону обзора.
++bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
++    bool originDeltaFits,
++    int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
++    int64_t newCenterX, int64_t newCenterY, int64_t newCenterZ);
+ 
+ // Смена центра обзора (в координатах чанков): заказывает недостающие
+ // меши от ближних к дальним и выбрасывает вышедшие из радиуса+1.
+diff --git a/src/core/chunk_streaming.c b/src/core/chunk_streaming.c
+--- a/src/core/chunk_streaming.c
++++ b/src/core/chunk_streaming.c
+@@ -94,5 +94,6 @@ struct ChunkStreaming
+     CONDITION_VARIABLE workAvailable;
+     HANDLE workerThreads[MAX_WORKER_THREADS];
+     uint32_t workerThreadCount;
++    uint32_t desiredWorkerThreadCount;
+     bool shutdownRequested;
+ };
+@@ -281,6 +282,175 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
+     }
+ }
+ 
++static bool StartWorkerThreads(ChunkStreaming* streaming)
++{
++    if (streaming->workerThreadCount != 0) return true;
++    streaming->shutdownRequested = false;
++
++    for (uint32_t index = 0;
++         index < streaming->desiredWorkerThreadCount; ++index)
++    {
++        HANDLE thread = CreateThread(
++            NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
++        if (thread != NULL)
++        {
++            streaming->workerThreads[streaming->workerThreadCount++] = thread;
++        }
++    }
++    return streaming->workerThreadCount != 0;
++}
++
++static bool StopWorkerThreads(ChunkStreaming* streaming)
++{
++    if (streaming->workerThreadCount == 0) return true;
++
++    AcquireSRWLockExclusive(&streaming->queueLock);
++    streaming->shutdownRequested = true;
++    WakeAllConditionVariable(&streaming->workAvailable);
++    ReleaseSRWLockExclusive(&streaming->queueLock);
++
++    bool succeeded = true;
++    for (uint32_t index = 0;
++         index < streaming->workerThreadCount; ++index)
++    {
++        if (WaitForSingleObject(
++                streaming->workerThreads[index], INFINITE) != WAIT_OBJECT_0)
++        {
++            succeeded = false;
++        }
++        CloseHandle(streaming->workerThreads[index]);
++        streaming->workerThreads[index] = NULL;
++    }
++    streaming->workerThreadCount = 0;
++    streaming->shutdownRequested = false;
++    return succeeded;
++}
++
++bool ChunkStreamingPause(ChunkStreaming* streaming)
++{
++    if (!StopWorkerThreads(streaming)) return false;
++
++    uint32_t queueMask = streaming->queueCapacity - 1;
++    for (uint32_t index = 0; index < streaming->resultCount; ++index)
++    {
++        ChunkMeshResult* result = &streaming->results[
++            (streaming->resultHead + index) & queueMask];
++        if (result->quads != NULL)
++        {
++            HeapFree(GetProcessHeap(), 0, result->quads);
++            result->quads = NULL;
++        }
++    }
++
++    streaming->requestHead = 0;
++    streaming->requestCount = 0;
++    streaming->resultHead = 0;
++    streaming->resultCount = 0;
++    streaming->unfinishedWork = 0;
++
++    for (uint32_t index = 0; index < streaming->capacity; ++index)
++    {
++        ChunkEntry* entry = &streaming->entries[index];
++        entry->requestQueued = false;
++        if (entry->state == CHUNK_ENTRY_PENDING && entry->mesh != NULL)
++        {
++            entry->state = CHUNK_ENTRY_READY;
++        }
++    }
++    return true;
++}
++
++static bool TrySubtractInt64(
++    int64_t value, int64_t difference, int64_t* outValue)
++{
++    if (difference > 0 && value < INT64_MIN + difference) return false;
++    if (difference < 0 && value > INT64_MAX + difference) return false;
++    *outValue = value - difference;
++    return true;
++}
++
++static void QueueMissingChunks(
++    ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
++{
++    for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
++    {
++        for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
++        {
++            for (int64_t deltaY = -shell; deltaY <= shell; ++deltaY)
++            {
++                for (int64_t deltaX = -shell; deltaX <= shell; ++deltaX)
++                {
++                    int64_t absoluteX = deltaX < 0 ? -deltaX : deltaX;
++                    int64_t absoluteY = deltaY < 0 ? -deltaY : deltaY;
++                    int64_t absoluteZ = deltaZ < 0 ? -deltaZ : deltaZ;
++                    int64_t chebyshev = absoluteX > absoluteY ? absoluteX : absoluteY;
++                    if (absoluteZ > chebyshev) chebyshev = absoluteZ;
++                    if (chebyshev != shell) continue;
++
++                    int64_t x = chunkX + deltaX;
++                    int64_t y = chunkY + deltaY;
++                    int64_t z = chunkZ + deltaZ;
++                    if (FindEntry(streaming, x, y, z) != NULL) continue;
++
++                    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
++                    entry->state = CHUNK_ENTRY_PENDING;
++                    TryEnqueueRequest(streaming, entry);
++                }
++            }
++        }
++    }
++}
++
++bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
++    bool originDeltaFits,
++    int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
++    int64_t newCenterX, int64_t newCenterY, int64_t newCenterZ)
++{
++    memset(streaming->spareEntries, 0,
++        (size_t)streaming->capacity * sizeof(ChunkEntry));
++
++    ChunkEntry* previousEntries = streaming->entries;
++    streaming->entries = streaming->spareEntries;
++    streaming->spareEntries = previousEntries;
++    streaming->hasCenter = true;
++    streaming->centerX = newCenterX;
++    streaming->centerY = newCenterY;
++    streaming->centerZ = newCenterZ;
++
++    for (uint32_t index = 0; index < streaming->capacity; ++index)
++    {
++        ChunkEntry* previous = &previousEntries[index];
++        if (previous->mesh == NULL) continue;
++
++        int64_t x;
++        int64_t y;
++        int64_t z;
++        bool keep = originDeltaFits
++            && TrySubtractInt64(previous->x, chunkOriginDeltaX, &x)
++            && TrySubtractInt64(previous->y, chunkOriginDeltaY, &y)
++            && TrySubtractInt64(previous->z, chunkOriginDeltaZ, &z)
++            && IsInsideRadius(streaming, x, y, z,
++                (int64_t)streaming->viewRadius + 1);
++
++        if (keep)
++        {
++            ChunkEntry* moved = InsertEntry(streaming, x, y, z);
++            moved->mesh = previous->mesh;
++            moved->state = CHUNK_ENTRY_READY;
++            previous->mesh = NULL;
++        }
++        else
++        {
++            RendererDestroyMesh(streaming->renderer, previous->mesh);
++            previous->mesh = NULL;
++        }
++    }
++
++    if (!StartWorkerThreads(streaming)) return false;
++    QueueMissingChunks(streaming, newCenterX, newCenterY, newCenterZ);
++    return true;
++}
++
+ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks)
+ {
+     ChunkStreaming* streaming = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*streaming));
+@@ -328,24 +479,16 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks)
+     // Пул потоков мешинга: масштабируется по ядрам процессора.
+     SYSTEM_INFO systemInformation;
+     GetSystemInfo(&systemInformation);
+-    uint32_t workerCount = systemInformation.dwNumberOfProcessors > 2
++    streaming->desiredWorkerThreadCount =
++        systemInformation.dwNumberOfProcessors > 2
+         ? systemInformation.dwNumberOfProcessors - 2
+         : 1;
+-    if (workerCount > MAX_WORKER_THREADS)
++    if (streaming->desiredWorkerThreadCount > MAX_WORKER_THREADS)
+     {
+-        workerCount = MAX_WORKER_THREADS;
++        streaming->desiredWorkerThreadCount = MAX_WORKER_THREADS;
+     }
+ 
+-    for (uint32_t i = 0; i < workerCount; ++i)
+-    {
+-        HANDLE thread = CreateThread(NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
+-        if (thread != NULL)
+-        {
+-            streaming->workerThreads[streaming->workerThreadCount++] = thread;
+-        }
+-    }
+-
+-    if (streaming->workerThreadCount == 0)
++    if (!StartWorkerThreads(streaming))
+     {
+         ChunkStreamingDestroy(streaming);
+         return NULL;
+@@ -365,19 +508,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
+         return;
+     }
+ 
+-    if (streaming->workerThreadCount > 0)
+-    {
+-        AcquireSRWLockExclusive(&streaming->queueLock);
+-        streaming->shutdownRequested = true;
+-        WakeAllConditionVariable(&streaming->workAvailable);
+-        ReleaseSRWLockExclusive(&streaming->queueLock);
+-
+-        WaitForMultipleObjects(streaming->workerThreadCount, streaming->workerThreads, TRUE, INFINITE);
+-        for (uint32_t i = 0; i < streaming->workerThreadCount; ++i)
+-        {
+-            CloseHandle(streaming->workerThreads[i]);
+-        }
+-    }
++    ChunkStreamingPause(streaming);
+ 
+     // Остаточные результаты: освободить CPU-массивы.
+     if (streaming->results != NULL)
+@@ -439,38 +570,5 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
+         }
+     }
+ 
+-    // Заказ недостающих чанков оболочками — от ближних к дальним.
+-    for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
+-    {
+-        for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
+-        {
+-            for (int64_t deltaY = -shell; deltaY <= shell; ++deltaY)
+-            {
+-                for (int64_t deltaX = -shell; deltaX <= shell; ++deltaX)
+-                {
+-                    int64_t absoluteX = deltaX < 0 ? -deltaX : deltaX;
+-                    int64_t absoluteY = deltaY < 0 ? -deltaY : deltaY;
+-                    int64_t absoluteZ = deltaZ < 0 ? -deltaZ : deltaZ;
+-                    int64_t chebyshev = absoluteX > absoluteY ? absoluteX : absoluteY;
+-                    if (absoluteZ > chebyshev) chebyshev = absoluteZ;
+-                    if (chebyshev != shell)
+-                    {
+-                        continue;
+-                    }
+-
+-                    int64_t x = chunkX + deltaX;
+-                    int64_t y = chunkY + deltaY;
+-                    int64_t z = chunkZ + deltaZ;
+-                    if (FindEntry(streaming, x, y, z) != NULL)
+-                    {
+-                        continue;
+-                    }
+-
+-                    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
+-                    entry->state = CHUNK_ENTRY_PENDING;
+-                    TryEnqueueRequest(streaming, entry);
+-                }
+-            }
+-        }
+-    }
++    QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
+ }
+diff --git a/src/core/application.c b/src/core/application.c
+--- a/src/core/application.c
++++ b/src/core/application.c
+@@ -112,9 +112,11 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
+         return true;
+     }
+ 
+-    ChunkStreamingDestroy(application->chunkStreaming);
+-    application->chunkStreaming = NULL;
++    if (!ChunkStreamingPause(application->chunkStreaming))
++    {
++        return false;
++    }
+ 
+     if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
+     {
+         return false;
+@@ -125,34 +137,32 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
+     }
+     application->coordinateOverlayDirty = true;
+ 
+-    application->chunkStreaming = ChunkStreamingCreate(
+-        application->world, application->renderer, g_configuration.viewRadiusChunks);
+-    return application->chunkStreaming != NULL;
++    int64_t centerX = FloorToInt64(application->camera.position[0]) >> CHUNK_SIZE_LOG2;
++    int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
++    int64_t centerZ = FloorToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
++    return ChunkStreamingResumeAfterOriginChange(
++        application->chunkStreaming, true,
++        shift[0] / CHUNK_SIZE, shift[1] / CHUNK_SIZE, shift[2] / CHUNK_SIZE,
++        centerX, centerY, centerZ);
+ }
+ 
+ static bool SquareAbsoluteX(ApplicationState* application)
+ {
+     int64_t currentBlockX = FloorToInt64(application->camera.position[0]);
+-
+-    // Для целых координат только 0²=0 и 1²=1. В этих случаях мир и кеш
+-    // вообще не трогаем — повторной загрузки чанков не будет.
+-    if (WorldAbsoluteBlockCoordinateEqualsInt64(
+-            application->world, 0, currentBlockX, 0)
+-        || WorldAbsoluteBlockCoordinateEqualsInt64(
+-            application->world, 0, currentBlockX, 1))
+-    {
+-        return true;
+-    }
+-
+     double fractionalX =
+         application->camera.position[0] - (double)currentBlockX;
+ 
+-    ChunkStreamingDestroy(application->chunkStreaming);
+-    application->chunkStreaming = NULL;
++    if (!ChunkStreamingPause(application->chunkStreaming))
++    {
++        return false;
++    }
+ 
+     int64_t squaredLocalBlockX;
++    bool chunkOriginDeltaFits;
++    int64_t chunkOriginDeltaX;
+     if (!WorldSquareAbsoluteX(
+-            application->world, currentBlockX, &squaredLocalBlockX))
++            application->world, currentBlockX, &squaredLocalBlockX,
++            &chunkOriginDeltaFits, &chunkOriginDeltaX))
+     {
+         return false;
+     }
+@@ -161,7 +178,11 @@ static bool SquareAbsoluteX(ApplicationState* application)
+     application->camera.position[0] =
+         (double)squaredLocalBlockX + fractionalX;
+     application->coordinateOverlayDirty = true;
+-    application->chunkStreaming = ChunkStreamingCreate(
+-        application->world, application->renderer, g_configuration.viewRadiusChunks);
+-    return application->chunkStreaming != NULL;
++
++    int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
++    int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
++    int64_t centerZ = FloorToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
++    return ChunkStreamingResumeAfterOriginChange(
++        application->chunkStreaming, chunkOriginDeltaFits,
++        chunkOriginDeltaX, 0, 0, centerX, centerY, centerZ);
+ }

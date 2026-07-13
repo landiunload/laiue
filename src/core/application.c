@@ -326,6 +326,13 @@ static void OnFrame(void* userData)
         WindowSetMouseLook(application->window, !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
     }
 
+    // V — переключить вертикальную синхронизацию.
+    if (InputWasKeyPressed(application->input, INPUT_KEY_V))
+    {
+        RendererSetVerticalSync(application->renderer,
+            !RendererIsVerticalSyncEnabled(application->renderer));
+    }
+
     // Вне фокуса события отпускания клавиш не доставляются —
     // без сброса клавиши «залипали» бы нажатыми.
     if (WindowConsumeFocusLoss(application->window))

@@ -735,10 +735,8 @@ WorldRegionContents WorldFillRegion(World* world,
     ReleaseSRWLockShared(&world->tableLock);
 
     size_t heightCount = (size_t)sizeX * (size_t)sizeY;
-    float stackHeights[HEIGHT_GRID_CELLS];
-    bool heightsOnHeap = heightCount > HEIGHT_GRID_CELLS;
-    float* heights = heightsOnHeap
-        ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float)) : stackHeights;
+    float* heights = HeapAlloc(
+        GetProcessHeap(), 0, heightCount * sizeof(float));
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
     bool boundsKnown = false;
@@ -776,12 +774,12 @@ WorldRegionContents WorldFillRegion(World* world,
     {
         if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
         {
-            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+            HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_AIR;
         }
         if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
         {
-            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+            HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_SOLID;
         }
     }
@@ -802,7 +800,7 @@ WorldRegionContents WorldFillRegion(World* world,
         }
     }
 
-    if (heightsOnHeap && heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
+    if (heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
 
     if (regionHasDeltas)
     {

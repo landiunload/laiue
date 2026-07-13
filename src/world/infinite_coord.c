@@ -619,6 +619,40 @@ void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)
     *b = temporary;
 }
 
+static uint64_t Divide128By64(uint64_t high, uint64_t low,
+    uint64_t divisor, uint64_t* outRemainder)
+{
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+    return _udiv128(high, low, divisor, outRemainder);
+#elif defined(__clang__) && defined(_M_X64)
+    // У clang-cl нет интринсика _udiv128, а деление unsigned __int128
+    // требует функций compiler-rt, которых нет в сборке с /NODEFAULTLIB.
+    // На каждом шаге high < divisor, поэтому частное помещается в uint64_t.
+    __asm__("divq %2"
+        : "+a"(low), "+d"(high)
+        : "r"(divisor)
+        : "cc");
+    *outRemainder = high;
+    return low;
+#else
+    // Переносимый резервный путь без деления расширенного целого.
+    uint64_t quotient = 0;
+    for (uint32_t bit = 64; bit > 0; --bit)
+    {
+        uint32_t shift = bit - 1;
+        uint64_t carry = high >> 63;
+        high = (high << 1) | ((low >> shift) & 1u);
+        if (carry != 0 || high >= divisor)
+        {
+            high -= divisor;
+            quotient |= 1ull << shift;
+        }
+    }
+    *outRemainder = high;
+    return quotient;
+#endif
+}
+
 uint64_t InfiniteCoordDivFloorSmallLow(
     const InfiniteCoord* value, uint64_t divisor, uint64_t* outRemainder)
 {
@@ -627,14 +661,8 @@ uint64_t InfiniteCoordDivFloorSmallLow(
 
     for (uint32_t index = value->limbCount; index > 0; --index)
     {
-#if defined(_MSC_VER) && !defined(__clang__)
-        quotientLow = _udiv128(remainder, value->limbs[index - 1], divisor, &remainder);
-#else
-        unsigned __int128 numerator = ((unsigned __int128)remainder << 64)
-            | value->limbs[index - 1];
-        quotientLow = (uint64_t)(numerator / divisor);
-        remainder = (uint64_t)(numerator % divisor);
-#endif
+        quotientLow = Divide128By64(
+            remainder, value->limbs[index - 1], divisor, &remainder);
     }
 
     if (value->sign >= 0)

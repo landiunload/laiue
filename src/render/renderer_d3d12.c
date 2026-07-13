@@ -107,6 +107,8 @@ struct Renderer
     int32_t                    resizeWidth;
     int32_t                    resizeHeight;
     bool                       resizeRequested;
+    bool                       verticalSyncEnabled;
+    bool                       tearingSupported;
 
     GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
     uint32_t                   poolBlockCount;
@@ -503,11 +505,26 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
 
     renderer->windowWidth = width;
     renderer->windowHeight = height;
+    renderer->verticalSyncEnabled = true;
 
     if (FAILED(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void**)&renderer->factory)))
     {
         HeapFree(GetProcessHeap(), 0, renderer);
         return NULL;
+    }
+
+    IDXGIFactory5* factory5 = NULL;
+    if (SUCCEEDED(IDXGIFactory4_QueryInterface(
+            renderer->factory, &IID_IDXGIFactory5, (void**)&factory5)))
+    {
+        BOOL allowTearing = FALSE;
+        if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(factory5,
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &allowTearing, (UINT)sizeof(allowTearing))))
+        {
+            renderer->tearingSupported = allowTearing != FALSE;
+        }
+        IDXGIFactory5_Release(factory5);
     }
 
     // Аппаратный адаптер, при неудаче — программный WARP.
@@ -546,6 +563,8 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDescription.SampleDesc.Count = 1;
+    swapChainDescription.Flags = renderer->tearingSupported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     IDXGISwapChain1* swapChain1 = NULL;
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
@@ -879,8 +898,10 @@ static bool ApplyPendingResize(Renderer* renderer)
         }
     }
 
+    UINT swapChainFlags = renderer->tearingSupported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, 0)))
+        DXGI_FORMAT_R8G8B8A8_UNORM, swapChainFlags)))
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
@@ -982,8 +1003,21 @@ void RendererEndFrame(Renderer* renderer)
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
-    IDXGISwapChain3_Present(renderer->swapChain, 1, 0);
+    UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
+    UINT presentFlags = !renderer->verticalSyncEnabled && renderer->tearingSupported
+        ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    IDXGISwapChain3_Present(renderer->swapChain, syncInterval, presentFlags);
     MoveToNextFrame(renderer);
+}
+
+void RendererSetVerticalSync(Renderer* renderer, bool enabled)
+{
+    renderer->verticalSyncEnabled = enabled;
+}
+
+bool RendererIsVerticalSyncEnabled(const Renderer* renderer)
+{
+    return renderer->verticalSyncEnabled;
 }
 
 void RendererResize(Renderer* renderer, int32_t width, int32_t height)
