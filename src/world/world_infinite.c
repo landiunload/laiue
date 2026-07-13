@@ -12,17 +12,23 @@ typedef struct LocalChunkCoordinate
     int64_t z;
 } LocalChunkCoordinate;
 
+typedef struct CoordinateFrame
+{
+    InfiniteCoord chunkOrigin[3];
+    uint32_t referenceCount;
+} CoordinateFrame;
+
 typedef struct GlobalChunkCoordinate
 {
-    InfiniteCoord axis[3];
     uint64_t hash;
+    CoordinateFrame* frame;
+    LocalChunkCoordinate local;
 } GlobalChunkCoordinate;
 
-typedef struct DeltaEntry
-{
-    uint32_t localIndex;
-    BlockType block;
-} DeltaEntry;
+// 18 бит индекса блока в чанке + 8 бит типа блока.
+typedef uint32_t DeltaEntry;
+#define DELTA_INDEX_BITS (CHUNK_SIZE_LOG2 * 3)
+#define DELTA_INDEX_MASK ((1u << DELTA_INDEX_BITS) - 1u)
 
 typedef struct Chunk
 {
@@ -58,6 +64,7 @@ struct World
     int64_t seed;
     InfiniteCoord blockOrigin[3];
     InfiniteCoord chunkOrigin[3];
+    CoordinateFrame* editFrame;
     TerrainOrigin terrainOrigin;
 
     SRWLOCK heightCacheLock;
@@ -84,6 +91,22 @@ static uint32_t PackLocalIndex(uint16_t x, uint16_t y, uint16_t z)
     return (uint32_t)x * CHUNK_SIZE * CHUNK_SIZE + (uint32_t)y * CHUNK_SIZE + (uint32_t)z;
 }
 
+static DeltaEntry PackDelta(uint32_t localIndex, BlockType block)
+{
+    return (localIndex & DELTA_INDEX_MASK)
+        | ((uint32_t)block << DELTA_INDEX_BITS);
+}
+
+static uint32_t DeltaLocalIndex(DeltaEntry entry)
+{
+    return entry & DELTA_INDEX_MASK;
+}
+
+static BlockType DeltaBlock(DeltaEntry entry)
+{
+    return (BlockType)(entry >> DELTA_INDEX_BITS);
+}
+
 static uint64_t HashRotateLeft64(uint64_t value, uint32_t amount)
 {
     return (value << amount) | (value >> (64u - amount));
@@ -97,41 +120,82 @@ static uint64_t HashLocalChunkCoordinate(const World* world, LocalChunkCoordinat
     return x ^ HashRotateLeft64(y, 21) ^ HashRotateLeft64(z, 42);
 }
 
+static void CoordinateFrameRelease(CoordinateFrame* frame)
+{
+    if (frame == NULL) return;
+    if (--frame->referenceCount != 0) return;
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        InfiniteCoordDestroy(&frame->chunkOrigin[axis]);
+    }
+    HeapFree(GetProcessHeap(), 0, frame);
+}
+
+static CoordinateFrame* WorldGetEditFrame(World* world)
+{
+    if (world->editFrame != NULL) return world->editFrame;
+
+    CoordinateFrame* frame = HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*frame));
+    if (frame == NULL) return NULL;
+
+    frame->referenceCount = 1; // ссылка кеша World
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        InfiniteCoordInit(&frame->chunkOrigin[axis]);
+        if (!InfiniteCoordTryCopyAddInt64(
+                &frame->chunkOrigin[axis], &world->chunkOrigin[axis], 0))
+        {
+            CoordinateFrameRelease(frame);
+            return NULL;
+        }
+    }
+    world->editFrame = frame;
+    return frame;
+}
+
 static bool GlobalChunkCoordinateMatchesLocal(const GlobalChunkCoordinate* global,
     const World* world, LocalChunkCoordinate local)
 {
-    return InfiniteCoordEqualsOffset(&global->axis[0], &world->chunkOrigin[0], local.x)
-        && InfiniteCoordEqualsOffset(&global->axis[1], &world->chunkOrigin[1], local.y)
-        && InfiniteCoordEqualsOffset(&global->axis[2], &world->chunkOrigin[2], local.z);
+    if (global->frame == world->editFrame)
+    {
+        return global->local.x == local.x
+            && global->local.y == local.y
+            && global->local.z == local.z;
+    }
+
+    return InfiniteCoordEqualsOffsets(
+            &global->frame->chunkOrigin[0], global->local.x,
+            &world->chunkOrigin[0], local.x)
+        && InfiniteCoordEqualsOffsets(
+            &global->frame->chunkOrigin[1], global->local.y,
+            &world->chunkOrigin[1], local.y)
+        && InfiniteCoordEqualsOffsets(
+            &global->frame->chunkOrigin[2], global->local.z,
+            &world->chunkOrigin[2], local.z);
 }
 
 static void GlobalChunkCoordinateDestroy(GlobalChunkCoordinate* coordinate)
 {
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        InfiniteCoordDestroy(&coordinate->axis[axis]);
-    }
+    CoordinateFrameRelease(coordinate->frame);
+    coordinate->frame = NULL;
     coordinate->hash = 0;
 }
 
 static bool GlobalChunkCoordinateTryCreate(GlobalChunkCoordinate* out,
-    const World* world, LocalChunkCoordinate local)
+    World* world, LocalChunkCoordinate local)
 {
-    for (int32_t axis = 0; axis < 3; ++axis)
+    CoordinateFrame* frame = WorldGetEditFrame(world);
+    if (frame == NULL || frame->referenceCount == UINT32_MAX)
     {
-        InfiniteCoordInit(&out->axis[axis]);
+        return false;
     }
-    out->hash = HashLocalChunkCoordinate(world, local);
 
-    int64_t offset[3] = { local.x, local.y, local.z };
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (!InfiniteCoordTryCopyAddInt64(&out->axis[axis], &world->chunkOrigin[axis], offset[axis]))
-        {
-            GlobalChunkCoordinateDestroy(out);
-            return false;
-        }
-    }
+    frame->referenceCount++;
+    out->hash = HashLocalChunkCoordinate(world, local);
+    out->frame = frame;
+    out->local = local;
     return true;
 }
 
@@ -349,6 +413,11 @@ void WorldDestroy(World* world)
         }
     }
 
+    if (world->editFrame != NULL)
+    {
+        CoordinateFrameRelease(world->editFrame);
+        world->editFrame = NULL;
+    }
     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
     {
         if (world->heightCache[slot].heights != NULL)
@@ -399,6 +468,11 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t
         InfiniteCoordDestroy(&newChunkOrigin[axis]);
     }
 
+    if (world->editFrame != NULL)
+    {
+        CoordinateFrameRelease(world->editFrame);
+        world->editFrame = NULL;
+    }
     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
 
     AcquireSRWLockExclusive(&world->heightCacheLock);
@@ -410,21 +484,12 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t
     return true;
 }
 
-bool WorldAbsoluteBlockCoordinateEqualsInt64(World* world,
-    int32_t axis, int64_t localBlock, int64_t expected)
-{
-    if (axis < 0 || axis >= 3)
-    {
-        return false;
-    }
-    return InfiniteCoordCompareAddInt64ToInt64(
-        &world->blockOrigin[axis], localBlock, expected) == 0;
-}
-
 bool WorldSquareAbsoluteX(
-    World* world, int64_t localBlockX, int64_t* outLocalBlockX)
+    World* world, int64_t localBlockX, int64_t* outLocalBlockX,
+    bool* outChunkOriginDeltaFits, int64_t* outChunkOriginDeltaX)
 {
-    if (outLocalBlockX == NULL)
+    if (outLocalBlockX == NULL || outChunkOriginDeltaFits == NULL
+        || outChunkOriginDeltaX == NULL)
     {
         return false;
     }
@@ -457,6 +522,9 @@ bool WorldSquareAbsoluteX(
         return false;
     }
 
+    int64_t chunkOriginDeltaX;
+    bool chunkOriginDeltaFits = InfiniteCoordTrySubtractToInt64(
+        &newChunkOrigin, &world->chunkOrigin[0], &chunkOriginDeltaX);
     InfiniteCoordSwap(&world->blockOrigin[0], &newBlockOrigin);
     InfiniteCoordSwap(&world->chunkOrigin[0], &newChunkOrigin);
     InfiniteCoordDestroy(&squared);
@@ -464,6 +532,13 @@ bool WorldSquareAbsoluteX(
     InfiniteCoordDestroy(&newChunkOrigin);
 
     *outLocalBlockX = (int64_t)localBlock;
+    *outChunkOriginDeltaFits = chunkOriginDeltaFits;
+    *outChunkOriginDeltaX = chunkOriginDeltaFits ? chunkOriginDeltaX : 0;
+    if (world->editFrame != NULL)
+    {
+        CoordinateFrameRelease(world->editFrame);
+        world->editFrame = NULL;
+    }
     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
 
     AcquireSRWLockExclusive(&world->heightCacheLock);
@@ -534,9 +609,9 @@ static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* ou
 {
     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
     {
-        if (chunk->deltas[i].localIndex == localIndex)
+        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
         {
-            *outBlock = chunk->deltas[i].block;
+            *outBlock = DeltaBlock(chunk->deltas[i]);
             return true;
         }
     }
@@ -547,16 +622,16 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 {
     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
     {
-        if (chunk->deltas[i].localIndex == localIndex)
+        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
         {
-            chunk->deltas[i].block = block;
+            chunk->deltas[i] = PackDelta(localIndex, block);
             return;
         }
     }
 
     if (chunk->deltaCount >= chunk->deltaCapacity)
     {
-        uint32_t newCapacity = chunk->deltaCapacity < 8 ? 8 : chunk->deltaCapacity * 2;
+        uint32_t newCapacity = chunk->deltaCapacity < 4 ? 4 : chunk->deltaCapacity * 2;
         DeltaEntry* newDeltas = chunk->deltas == NULL
             ? HeapAlloc(GetProcessHeap(), 0, (size_t)newCapacity * sizeof(DeltaEntry))
             : HeapReAlloc(GetProcessHeap(), 0, chunk->deltas,
@@ -566,8 +641,7 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
         chunk->deltaCapacity = newCapacity;
     }
 
-    chunk->deltas[chunk->deltaCount].localIndex = localIndex;
-    chunk->deltas[chunk->deltaCount].block = block;
+    chunk->deltas[chunk->deltaCount] = PackDelta(localIndex, block);
     chunk->deltaCount++;
 }
 
@@ -616,7 +690,7 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
             Chunk* chunk = *entry;
             for (uint32_t i = 0; i < chunk->deltaCount; ++i)
             {
-                if (chunk->deltas[i].localIndex == localIndex)
+                if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
                 {
                     chunk->deltas[i] = chunk->deltas[--chunk->deltaCount];
                     break;
@@ -660,7 +734,11 @@ WorldRegionContents WorldFillRegion(World* world,
     }
     ReleaseSRWLockShared(&world->tableLock);
 
-    float* heights = HeapAlloc(GetProcessHeap(), 0, (size_t)sizeX * sizeY * sizeof(float));
+    size_t heightCount = (size_t)sizeX * (size_t)sizeY;
+    float stackHeights[HEIGHT_GRID_CELLS];
+    bool heightsOnHeap = heightCount > HEIGHT_GRID_CELLS;
+    float* heights = heightsOnHeap
+        ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float)) : stackHeights;
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
     bool boundsKnown = false;
@@ -698,12 +776,12 @@ WorldRegionContents WorldFillRegion(World* world,
     {
         if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
         {
-            HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_AIR;
         }
         if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
         {
-            HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_SOLID;
         }
     }
@@ -724,7 +802,7 @@ WorldRegionContents WorldFillRegion(World* world,
         }
     }
 
-    if (heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
+    if (heightsOnHeap && heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
 
     if (regionHasDeltas)
     {
@@ -746,7 +824,7 @@ WorldRegionContents WorldFillRegion(World* world,
 
                     for (uint32_t i = 0; i < chunk->deltaCount; ++i)
                     {
-                        uint32_t localIndex = chunk->deltas[i].localIndex;
+                        uint32_t localIndex = DeltaLocalIndex(chunk->deltas[i]);
                         int64_t blockX = chunkBaseX + localIndex / (CHUNK_SIZE * CHUNK_SIZE);
                         int64_t blockY = chunkBaseY + (localIndex / CHUNK_SIZE) % CHUNK_SIZE;
                         int64_t blockZ = chunkBaseZ + localIndex % CHUNK_SIZE;
@@ -760,7 +838,7 @@ WorldRegionContents WorldFillRegion(World* world,
                             continue;
                         }
                         outBlocks[((size_t)relativeY * sizeX + (size_t)relativeX) * sizeZ
-                            + (size_t)relativeZ] = chunk->deltas[i].block;
+                            + (size_t)relativeZ] = DeltaBlock(chunk->deltas[i]);
                     }
                 }
             }

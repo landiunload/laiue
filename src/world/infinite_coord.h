@@ -21,6 +21,12 @@ bool InfiniteCoordTryCopySquareAddInt64(
     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
 bool InfiniteCoordTryCopyShiftRight(
     InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount);
+bool InfiniteCoordTrySubtractToInt64(
+    const InfiniteCoord* left, const InfiniteCoord* right, int64_t* outDifference);
+
+// Сравнивает left + leftOffset и right + rightOffset без временных bigint.
+bool InfiniteCoordEqualsOffsets(const InfiniteCoord* left, int64_t leftOffset,
+    const InfiniteCoord* right, int64_t rightOffset);
 void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b);
 
 // floor(value / divisor): возвращаются младшие 64 бита частного и

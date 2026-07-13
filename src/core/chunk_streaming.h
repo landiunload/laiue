@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // Асинхронная подгрузка чанков (внутренний компонент ядра):
@@ -15,6 +16,14 @@ typedef struct Renderer Renderer;
 
 ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks);
 void ChunkStreamingDestroy(ChunkStreaming* streaming);
+bool ChunkStreamingPause(ChunkStreaming* streaming);
+
+// Вызывается после смены origin мира. Сохраняет только уже готовые GPU-меши,
+// абсолютные чанки которых попадают в новую зону обзора.
+bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
+    bool originDeltaFits,
+    int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
+    int64_t newCenterX, int64_t newCenterY, int64_t newCenterZ);
 
 // Смена центра обзора (в координатах чанков): заказывает недостающие
 // меши от ближних к дальним и выбрасывает вышедшие из радиуса+1.

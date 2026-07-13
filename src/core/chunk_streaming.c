@@ -93,6 +93,7 @@ struct ChunkStreaming
     CONDITION_VARIABLE workAvailable;
     HANDLE workerThreads[MAX_WORKER_THREADS];
     uint32_t workerThreadCount;
+    uint32_t desiredWorkerThreadCount;
     bool shutdownRequested;
 };
 
@@ -280,6 +281,175 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
     }
 }
 
+static bool StartWorkerThreads(ChunkStreaming* streaming)
+{
+    if (streaming->workerThreadCount != 0) return true;
+    streaming->shutdownRequested = false;
+
+    for (uint32_t index = 0;
+         index < streaming->desiredWorkerThreadCount; ++index)
+    {
+        HANDLE thread = CreateThread(
+            NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
+        if (thread != NULL)
+        {
+            streaming->workerThreads[streaming->workerThreadCount++] = thread;
+        }
+    }
+    return streaming->workerThreadCount != 0;
+}
+
+static bool StopWorkerThreads(ChunkStreaming* streaming)
+{
+    if (streaming->workerThreadCount == 0) return true;
+
+    AcquireSRWLockExclusive(&streaming->queueLock);
+    streaming->shutdownRequested = true;
+    WakeAllConditionVariable(&streaming->workAvailable);
+    ReleaseSRWLockExclusive(&streaming->queueLock);
+
+    bool succeeded = true;
+    for (uint32_t index = 0;
+         index < streaming->workerThreadCount; ++index)
+    {
+        if (WaitForSingleObject(
+                streaming->workerThreads[index], INFINITE) != WAIT_OBJECT_0)
+        {
+            succeeded = false;
+        }
+        CloseHandle(streaming->workerThreads[index]);
+        streaming->workerThreads[index] = NULL;
+    }
+    streaming->workerThreadCount = 0;
+    streaming->shutdownRequested = false;
+    return succeeded;
+}
+
+bool ChunkStreamingPause(ChunkStreaming* streaming)
+{
+    if (!StopWorkerThreads(streaming)) return false;
+
+    uint32_t queueMask = streaming->queueCapacity - 1;
+    for (uint32_t index = 0; index < streaming->resultCount; ++index)
+    {
+        ChunkMeshResult* result = &streaming->results[
+            (streaming->resultHead + index) & queueMask];
+        if (result->quads != NULL)
+        {
+            HeapFree(GetProcessHeap(), 0, result->quads);
+            result->quads = NULL;
+        }
+    }
+
+    streaming->requestHead = 0;
+    streaming->requestCount = 0;
+    streaming->resultHead = 0;
+    streaming->resultCount = 0;
+    streaming->unfinishedWork = 0;
+
+    for (uint32_t index = 0; index < streaming->capacity; ++index)
+    {
+        ChunkEntry* entry = &streaming->entries[index];
+        entry->requestQueued = false;
+        if (entry->state == CHUNK_ENTRY_PENDING && entry->mesh != NULL)
+        {
+            entry->state = CHUNK_ENTRY_READY;
+        }
+    }
+    return true;
+}
+
+static bool TrySubtractInt64(
+    int64_t value, int64_t difference, int64_t* outValue)
+{
+    if (difference > 0 && value < INT64_MIN + difference) return false;
+    if (difference < 0 && value > INT64_MAX + difference) return false;
+    *outValue = value - difference;
+    return true;
+}
+
+static void QueueMissingChunks(
+    ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
+{
+    for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
+    {
+        for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
+        {
+            for (int64_t deltaY = -shell; deltaY <= shell; ++deltaY)
+            {
+                for (int64_t deltaX = -shell; deltaX <= shell; ++deltaX)
+                {
+                    int64_t absoluteX = deltaX < 0 ? -deltaX : deltaX;
+                    int64_t absoluteY = deltaY < 0 ? -deltaY : deltaY;
+                    int64_t absoluteZ = deltaZ < 0 ? -deltaZ : deltaZ;
+                    int64_t chebyshev = absoluteX > absoluteY ? absoluteX : absoluteY;
+                    if (absoluteZ > chebyshev) chebyshev = absoluteZ;
+                    if (chebyshev != shell) continue;
+
+                    int64_t x = chunkX + deltaX;
+                    int64_t y = chunkY + deltaY;
+                    int64_t z = chunkZ + deltaZ;
+                    if (FindEntry(streaming, x, y, z) != NULL) continue;
+
+                    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
+                    entry->state = CHUNK_ENTRY_PENDING;
+                    TryEnqueueRequest(streaming, entry);
+                }
+            }
+        }
+    }
+}
+
+bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
+    bool originDeltaFits,
+    int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
+    int64_t newCenterX, int64_t newCenterY, int64_t newCenterZ)
+{
+    memset(streaming->spareEntries, 0,
+        (size_t)streaming->capacity * sizeof(ChunkEntry));
+
+    ChunkEntry* previousEntries = streaming->entries;
+    streaming->entries = streaming->spareEntries;
+    streaming->spareEntries = previousEntries;
+    streaming->hasCenter = true;
+    streaming->centerX = newCenterX;
+    streaming->centerY = newCenterY;
+    streaming->centerZ = newCenterZ;
+
+    for (uint32_t index = 0; index < streaming->capacity; ++index)
+    {
+        ChunkEntry* previous = &previousEntries[index];
+        if (previous->mesh == NULL) continue;
+
+        int64_t x;
+        int64_t y;
+        int64_t z;
+        bool keep = originDeltaFits
+            && TrySubtractInt64(previous->x, chunkOriginDeltaX, &x)
+            && TrySubtractInt64(previous->y, chunkOriginDeltaY, &y)
+            && TrySubtractInt64(previous->z, chunkOriginDeltaZ, &z)
+            && IsInsideRadius(streaming, x, y, z,
+                (int64_t)streaming->viewRadius + 1);
+
+        if (keep)
+        {
+            ChunkEntry* moved = InsertEntry(streaming, x, y, z);
+            moved->mesh = previous->mesh;
+            moved->state = CHUNK_ENTRY_READY;
+            previous->mesh = NULL;
+        }
+        else
+        {
+            RendererDestroyMesh(streaming->renderer, previous->mesh);
+            previous->mesh = NULL;
+        }
+    }
+
+    if (!StartWorkerThreads(streaming)) return false;
+    QueueMissingChunks(streaming, newCenterX, newCenterY, newCenterZ);
+    return true;
+}
+
 ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks)
 {
     ChunkStreaming* streaming = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*streaming));
@@ -326,24 +496,16 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     // Пул потоков мешинга: масштабируется по ядрам процессора.
     SYSTEM_INFO systemInformation;
     GetSystemInfo(&systemInformation);
-    uint32_t workerCount = systemInformation.dwNumberOfProcessors > 2
+    streaming->desiredWorkerThreadCount =
+        systemInformation.dwNumberOfProcessors > 2
         ? systemInformation.dwNumberOfProcessors - 2
         : 1;
-    if (workerCount > MAX_WORKER_THREADS)
+    if (streaming->desiredWorkerThreadCount > MAX_WORKER_THREADS)
     {
-        workerCount = MAX_WORKER_THREADS;
+        streaming->desiredWorkerThreadCount = MAX_WORKER_THREADS;
     }
 
-    for (uint32_t i = 0; i < workerCount; ++i)
-    {
-        HANDLE thread = CreateThread(NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
-        if (thread != NULL)
-        {
-            streaming->workerThreads[streaming->workerThreadCount++] = thread;
-        }
-    }
-
-    if (streaming->workerThreadCount == 0)
+    if (!StartWorkerThreads(streaming))
     {
         ChunkStreamingDestroy(streaming);
         return NULL;
@@ -359,19 +521,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         return;
     }
 
-    if (streaming->workerThreadCount > 0)
-    {
-        AcquireSRWLockExclusive(&streaming->queueLock);
-        streaming->shutdownRequested = true;
-        WakeAllConditionVariable(&streaming->workAvailable);
-        ReleaseSRWLockExclusive(&streaming->queueLock);
-
-        WaitForMultipleObjects(streaming->workerThreadCount, streaming->workerThreads, TRUE, INFINITE);
-        for (uint32_t i = 0; i < streaming->workerThreadCount; ++i)
-        {
-            CloseHandle(streaming->workerThreads[i]);
-        }
-    }
+    ChunkStreamingPause(streaming);
 
     // Остаточные результаты: освободить CPU-массивы.
     if (streaming->results != NULL)
@@ -457,40 +607,7 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         }
     }
 
-    // Заказ недостающих чанков оболочками — от ближних к дальним.
-    for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
-    {
-        for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
-        {
-            for (int64_t deltaY = -shell; deltaY <= shell; ++deltaY)
-            {
-                for (int64_t deltaX = -shell; deltaX <= shell; ++deltaX)
-                {
-                    int64_t absoluteX = deltaX < 0 ? -deltaX : deltaX;
-                    int64_t absoluteY = deltaY < 0 ? -deltaY : deltaY;
-                    int64_t absoluteZ = deltaZ < 0 ? -deltaZ : deltaZ;
-                    int64_t chebyshev = absoluteX > absoluteY ? absoluteX : absoluteY;
-                    if (absoluteZ > chebyshev) chebyshev = absoluteZ;
-                    if (chebyshev != shell)
-                    {
-                        continue;
-                    }
-
-                    int64_t x = chunkX + deltaX;
-                    int64_t y = chunkY + deltaY;
-                    int64_t z = chunkZ + deltaZ;
-                    if (FindEntry(streaming, x, y, z) != NULL)
-                    {
-                        continue;
-                    }
-
-                    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
-                    entry->state = CHUNK_ENTRY_PENDING;
-                    TryEnqueueRequest(streaming, entry);
-                }
-            }
-        }
-    }
+    QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
 }
 
 void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, int64_t blockY, int64_t blockZ)

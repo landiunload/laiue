@@ -38,6 +38,26 @@ static int32_t InfiniteCoordCompareMagnitudeSmall(const InfiniteCoord* value, ui
     return current < magnitude ? -1 : (current > magnitude ? 1 : 0);
 }
 
+static int32_t InfiniteCoordCompareMagnitude(
+    const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (left->limbCount != right->limbCount)
+    {
+        return left->limbCount < right->limbCount ? -1 : 1;
+    }
+
+    for (uint32_t index = left->limbCount; index > 0; --index)
+    {
+        uint64_t leftLimb = left->limbs[index - 1];
+        uint64_t rightLimb = right->limbs[index - 1];
+        if (leftLimb != rightLimb)
+        {
+            return leftLimb < rightLimb ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
 static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source)
 {
     InfiniteCoordInit(out);
@@ -210,6 +230,114 @@ static void SignedDifference(int64_t left, int64_t right,
     }
 }
 
+static void CopyMagnitudeInfo(
+    const InfiniteCoord* value, uint64_t* outLow, bool* outWide)
+{
+    *outLow = value->limbCount == 0 ? 0 : value->limbs[0];
+    *outWide = false;
+    for (uint32_t index = 1; index < value->limbCount; ++index)
+    {
+        if (value->limbs[index] != 0)
+        {
+            *outWide = true;
+            break;
+        }
+    }
+}
+
+static void AddMagnitudeInfo(
+    const InfiniteCoord* left, const InfiniteCoord* right,
+    uint64_t* outLow, bool* outWide)
+{
+    uint64_t carry = 0;
+    uint32_t count = left->limbCount > right->limbCount
+        ? left->limbCount : right->limbCount;
+    *outLow = 0;
+    *outWide = false;
+
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        uint64_t a = index < left->limbCount ? left->limbs[index] : 0;
+        uint64_t b = index < right->limbCount ? right->limbs[index] : 0;
+        uint64_t sum = a + b;
+        uint64_t firstCarry = sum < a ? 1u : 0u;
+        uint64_t result = sum + carry;
+        uint64_t secondCarry = result < sum ? 1u : 0u;
+        carry = firstCarry | secondCarry;
+
+        if (index == 0) *outLow = result;
+        else if (result != 0) *outWide = true;
+    }
+    if (carry != 0) *outWide = true;
+}
+
+static void SubtractMagnitudeInfo(
+    const InfiniteCoord* larger, const InfiniteCoord* smaller,
+    uint64_t* outLow, bool* outWide)
+{
+    uint64_t borrow = 0;
+    *outLow = 0;
+    *outWide = false;
+
+    for (uint32_t index = 0; index < larger->limbCount; ++index)
+    {
+        uint64_t a = larger->limbs[index];
+        uint64_t b = index < smaller->limbCount ? smaller->limbs[index] : 0;
+        uint64_t difference = a - b;
+        uint64_t firstBorrow = a < b ? 1u : 0u;
+        uint64_t result = difference - borrow;
+        uint64_t secondBorrow = difference < borrow ? 1u : 0u;
+        borrow = firstBorrow | secondBorrow;
+
+        if (index == 0) *outLow = result;
+        else if (result != 0) *outWide = true;
+    }
+}
+
+static void InfiniteCoordDifferenceInfo(
+    const InfiniteCoord* left, const InfiniteCoord* right,
+    int32_t* outSign, uint64_t* outMagnitude, bool* outWide)
+{
+    if (left->sign == 0)
+    {
+        *outSign = -right->sign;
+        CopyMagnitudeInfo(right, outMagnitude, outWide);
+        return;
+    }
+    if (right->sign == 0)
+    {
+        *outSign = left->sign;
+        CopyMagnitudeInfo(left, outMagnitude, outWide);
+        return;
+    }
+    if (left->sign != right->sign)
+    {
+        *outSign = left->sign;
+        AddMagnitudeInfo(left, right, outMagnitude, outWide);
+        return;
+    }
+
+    int32_t comparison = InfiniteCoordCompareMagnitude(left, right);
+    if (comparison == 0)
+    {
+        *outSign = 0;
+        *outMagnitude = 0;
+        *outWide = false;
+        return;
+    }
+
+    if (comparison > 0)
+    {
+        *outSign = left->sign;
+        SubtractMagnitudeInfo(left, right, outMagnitude, outWide);
+    }
+    else
+    {
+        *outSign = -left->sign;
+        SubtractMagnitudeInfo(right, left, outMagnitude, outWide);
+    }
+}
+
 static int32_t InfiniteCoordSignAfterSmall(
     const InfiniteCoord* value, int32_t addSign, uint64_t addMagnitude)
 {
@@ -312,6 +440,27 @@ static uint64_t AddWithCarry64(
     return firstCarry | secondCarry;
 }
 
+static void AddWideProduct(uint64_t* limbs, uint32_t index,
+    uint64_t low, uint64_t high, uint64_t extra)
+{
+    uint64_t carry = AddWithCarry64(
+        limbs[index], low, 0, &limbs[index]);
+    ++index;
+    carry = AddWithCarry64(
+        limbs[index], high, carry, &limbs[index]);
+    ++index;
+    carry = AddWithCarry64(
+        limbs[index], extra, carry, &limbs[index]);
+    ++index;
+
+    while (carry != 0)
+    {
+        carry = AddWithCarry64(
+            limbs[index], 0, carry, &limbs[index]);
+        ++index;
+    }
+}
+
 bool InfiniteCoordTryCopySquareAddInt64(
     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
 {
@@ -342,28 +491,29 @@ bool InfiniteCoordTryCopySquareAddInt64(
         return false;
     }
 
-    for (uint32_t leftIndex = 0; leftIndex < value.limbCount; ++leftIndex)
+    // Специализированное возведение в квадрат: диагональ считается один раз,
+    // попарные произведения — один раз и удваиваются. Почти вдвое меньше
+    // 64x64 умножений, чем у общего школьного умножения.
+    for (uint32_t leftIndex = 0;
+         leftIndex < value.limbCount; ++leftIndex)
     {
-        for (uint32_t rightIndex = 0; rightIndex < value.limbCount; ++rightIndex)
+        uint64_t diagonalHigh;
+        uint64_t diagonalLow = Multiply64(
+            value.limbs[leftIndex], value.limbs[leftIndex], &diagonalHigh);
+        AddWideProduct(limbs, leftIndex * 2u,
+            diagonalLow, diagonalHigh, 0);
+
+        for (uint32_t rightIndex = leftIndex + 1;
+             rightIndex < value.limbCount; ++rightIndex)
         {
             uint64_t productHigh;
             uint64_t productLow = Multiply64(
                 value.limbs[leftIndex], value.limbs[rightIndex], &productHigh);
-
-            uint32_t resultIndex = leftIndex + rightIndex;
-            uint64_t carry = AddWithCarry64(
-                limbs[resultIndex], productLow, 0, &limbs[resultIndex]);
-            ++resultIndex;
-            carry = AddWithCarry64(
-                limbs[resultIndex], productHigh, carry, &limbs[resultIndex]);
-            ++resultIndex;
-
-            while (carry != 0)
-            {
-                carry = AddWithCarry64(
-                    limbs[resultIndex], 0, carry, &limbs[resultIndex]);
-                ++resultIndex;
-            }
+            uint64_t doubledLow = productLow << 1;
+            uint64_t doubledHigh = (productHigh << 1) | (productLow >> 63);
+            uint64_t extra = productHigh >> 63;
+            AddWideProduct(limbs, leftIndex + rightIndex,
+                doubledLow, doubledHigh, extra);
         }
     }
 
@@ -415,6 +565,51 @@ bool InfiniteCoordTryCopyShiftRight(
     out->sign = source->sign;
     InfiniteCoordNormalize(out);
     return true;
+}
+
+bool InfiniteCoordTrySubtractToInt64(
+    const InfiniteCoord* left, const InfiniteCoord* right, int64_t* outDifference)
+{
+    if (outDifference == NULL) return false;
+
+    int32_t sign;
+    uint64_t magnitude;
+    bool wide;
+    InfiniteCoordDifferenceInfo(left, right, &sign, &magnitude, &wide);
+    if (wide) return false;
+
+    if (sign > 0)
+    {
+        if (magnitude > (uint64_t)INT64_MAX) return false;
+        *outDifference = (int64_t)magnitude;
+    }
+    else if (sign < 0)
+    {
+        if (magnitude > (1ull << 63)) return false;
+        *outDifference = magnitude == (1ull << 63)
+            ? INT64_MIN : -(int64_t)magnitude;
+    }
+    else
+    {
+        *outDifference = 0;
+    }
+    return true;
+}
+
+bool InfiniteCoordEqualsOffsets(const InfiniteCoord* left, int64_t leftOffset,
+    const InfiniteCoord* right, int64_t rightOffset)
+{
+    int32_t baseSign;
+    uint64_t baseMagnitude;
+    bool baseWide;
+    InfiniteCoordDifferenceInfo(
+        left, right, &baseSign, &baseMagnitude, &baseWide);
+    if (baseWide) return false;
+
+    int32_t offsetSign;
+    uint64_t offsetMagnitude;
+    SignedDifference(rightOffset, leftOffset, &offsetSign, &offsetMagnitude);
+    return baseSign == offsetSign && baseMagnitude == offsetMagnitude;
 }
 
 void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)

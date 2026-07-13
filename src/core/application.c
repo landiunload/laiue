@@ -110,8 +110,10 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
         return true;
     }
 
-    ChunkStreamingDestroy(application->chunkStreaming);
-    application->chunkStreaming = NULL;
+    if (!ChunkStreamingPause(application->chunkStreaming))
+    {
+        return false;
+    }
 
     if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
     {
@@ -124,34 +126,32 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     }
     application->coordinateOverlayDirty = true;
 
-    application->chunkStreaming = ChunkStreamingCreate(
-        application->world, application->renderer, g_configuration.viewRadiusChunks);
-    return application->chunkStreaming != NULL;
+    int64_t centerX = FloorToInt64(application->camera.position[0]) >> CHUNK_SIZE_LOG2;
+    int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
+    int64_t centerZ = FloorToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
+    return ChunkStreamingResumeAfterOriginChange(
+        application->chunkStreaming, true,
+        shift[0] / CHUNK_SIZE, shift[1] / CHUNK_SIZE, shift[2] / CHUNK_SIZE,
+        centerX, centerY, centerZ);
 }
 
 static bool SquareAbsoluteX(ApplicationState* application)
 {
     int64_t currentBlockX = FloorToInt64(application->camera.position[0]);
-
-    // Для целых координат только 0²=0 и 1²=1. В этих случаях мир и кеш
-    // вообще не трогаем — повторной загрузки чанков не будет.
-    if (WorldAbsoluteBlockCoordinateEqualsInt64(
-            application->world, 0, currentBlockX, 0)
-        || WorldAbsoluteBlockCoordinateEqualsInt64(
-            application->world, 0, currentBlockX, 1))
-    {
-        return true;
-    }
-
     double fractionalX =
         application->camera.position[0] - (double)currentBlockX;
 
-    ChunkStreamingDestroy(application->chunkStreaming);
-    application->chunkStreaming = NULL;
+    if (!ChunkStreamingPause(application->chunkStreaming))
+    {
+        return false;
+    }
 
     int64_t squaredLocalBlockX;
+    bool chunkOriginDeltaFits;
+    int64_t chunkOriginDeltaX;
     if (!WorldSquareAbsoluteX(
-            application->world, currentBlockX, &squaredLocalBlockX))
+            application->world, currentBlockX, &squaredLocalBlockX,
+            &chunkOriginDeltaFits, &chunkOriginDeltaX))
     {
         return false;
     }
@@ -159,9 +159,13 @@ static bool SquareAbsoluteX(ApplicationState* application)
     application->camera.position[0] =
         (double)squaredLocalBlockX + fractionalX;
     application->coordinateOverlayDirty = true;
-    application->chunkStreaming = ChunkStreamingCreate(
-        application->world, application->renderer, g_configuration.viewRadiusChunks);
-    return application->chunkStreaming != NULL;
+
+    int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
+    int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
+    int64_t centerZ = FloorToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
+    return ChunkStreamingResumeAfterOriginChange(
+        application->chunkStreaming, chunkOriginDeltaFits,
+        chunkOriginDeltaX, 0, 0, centerX, centerY, centerZ);
 }
 
 static void AppendWideText(wchar_t* destination, uint32_t capacity,

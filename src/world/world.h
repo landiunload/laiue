@@ -42,13 +42,11 @@ LAIUE_WORLD_API void   WorldDestroy(World* world);
 LAIUE_WORLD_API bool WorldRebase(World* world,
     int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
 
-LAIUE_WORLD_API bool WorldAbsoluteBlockCoordinateEqualsInt64(World* world,
-    int32_t axis, int64_t localBlock, int64_t expected);
-
-// Возводит целую абсолютную координату X в квадрат и возвращает её новое
-// локальное положение внутри чанка.
+// Возводит абсолютную координату X в квадрат. Возвращает смещение нового
+// chunk-origin относительно старого, если оно помещается в int64.
 LAIUE_WORLD_API bool WorldSquareAbsoluteX(
-    World* world, int64_t localBlockX, int64_t* outLocalBlockX);
+    World* world, int64_t localBlockX, int64_t* outLocalBlockX,
+    bool* outChunkOriginDeltaFits, int64_t* outChunkOriginDeltaX);
 
 LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
     int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity);
