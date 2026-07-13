@@ -84,7 +84,7 @@ static uint32_t PackLocalIndex(uint16_t x, uint16_t y, uint16_t z)
     return (uint32_t)x * CHUNK_SIZE * CHUNK_SIZE + (uint32_t)y * CHUNK_SIZE + (uint32_t)z;
 }
 
-static uint64_t RotateLeft64(uint64_t value, uint32_t amount)
+static uint64_t HashRotateLeft64(uint64_t value, uint32_t amount)
 {
     return (value << amount) | (value >> (64u - amount));
 }
@@ -94,7 +94,7 @@ static uint64_t HashLocalChunkCoordinate(const World* world, LocalChunkCoordinat
     uint64_t x = InfiniteCoordHashOffset(&world->chunkOrigin[0], coordinate.x);
     uint64_t y = InfiniteCoordHashOffset(&world->chunkOrigin[1], coordinate.y);
     uint64_t z = InfiniteCoordHashOffset(&world->chunkOrigin[2], coordinate.z);
-    return x ^ RotateLeft64(y, 21) ^ RotateLeft64(z, 42);
+    return x ^ HashRotateLeft64(y, 21) ^ HashRotateLeft64(z, 42);
 }
 
 static bool GlobalChunkCoordinateMatchesLocal(const GlobalChunkCoordinate* global,
