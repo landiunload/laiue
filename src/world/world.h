@@ -38,7 +38,7 @@ typedef enum WorldRegionContents
     WORLD_REGION_MIXED
 } WorldRegionContents;
 
-LAIUE_WORLD_API World* WorldCreate(int64_t seed, BigCoord originX, BigCoord originZ, BigCoord worldSize);
+LAIUE_WORLD_API World* WorldCreate(int64_t seed, BigCoord originX, BigCoord originY);
 LAIUE_WORLD_API void   WorldDestroy(World* world);
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
@@ -48,13 +48,12 @@ LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int6
 // один раз, дельты накладываются пачкой — на порядки быстрее, чем
 // поблочные вызовы WorldGetBlock через границу DLL.
 //
-// Раскладка outBlocks: индекс = ((z * sizeX) + x) * sizeY + y.
-// Если регион однороден (весь воздух или весь камень), outBlocks
-// НЕ заполняется — потребитель обрабатывает такой регион без данных.
+// Раскладка outBlocks: индекс = ((y * sizeX) + x) * sizeZ + z
+// (y, x — горизонталь, z — высота, самый быстрый индекс).
 LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
     BlockType* outBlocks);
 
-// Y-координата верхнего твёрдого блока колонны процедурного ландшафта.
-LAIUE_WORLD_API int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t z);
+// Высота верхнего твёрдого блока процедурного ландшафта (x, y — горизонталь).
+LAIUE_WORLD_API int32_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);

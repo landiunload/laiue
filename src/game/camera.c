@@ -6,8 +6,8 @@
 void CameraInit(Camera* camera, double x, double y, double z, float yaw, float pitch)
 {
     camera->position[0] = x;
-    camera->position[1] = y;
-    camera->position[2] = z;
+    camera->position[1] = y;  // вторая горизонталь
+    camera->position[2] = z;  // высота
     camera->yaw = yaw;
     camera->pitch = ScalarClamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
 }
@@ -20,8 +20,8 @@ void CameraGetForwardVector(const Camera* camera, float outForward[3])
     float cosYaw = ScalarCos(camera->yaw);
 
     outForward[0] = sinYaw * cosPitch;
-    outForward[1] = sinPitch;
-    outForward[2] = cosYaw * cosPitch;
+    outForward[1] = cosYaw * cosPitch;   // вторая горизонталь (бывший Z)
+    outForward[2] = sinPitch;             // высота (бывший Y)
 }
 
 void CameraUpdate(Camera* camera, float deltaSeconds,
@@ -37,7 +37,7 @@ void CameraUpdate(Camera* camera, float deltaSeconds,
     CameraGetForwardVector(camera, forward);
 
     float rightX = ScalarCos(camera->yaw);
-    float rightZ = -ScalarSin(camera->yaw);
+    float rightY = -ScalarSin(camera->yaw);  // вторая горизонталь (бывший Z)
 
     float step = speed * deltaSeconds;
     if (keyForward)
@@ -55,16 +55,16 @@ void CameraUpdate(Camera* camera, float deltaSeconds,
     if (keyRight)
     {
         camera->position[0] += (double)(rightX * step);
-        camera->position[2] += (double)(rightZ * step);
+        camera->position[1] += (double)(rightY * step);
     }
     if (keyLeft)
     {
         camera->position[0] -= (double)(rightX * step);
-        camera->position[2] -= (double)(rightZ * step);
+        camera->position[1] -= (double)(rightY * step);
     }
     if (keyUp)
     {
-        camera->position[1] += (double)step;
+        camera->position[2] += (double)step;
     }
 }
 
@@ -76,27 +76,27 @@ void CameraGetViewMatrix(const Camera* camera, const float relativeEyePosition[3
     float cosYaw = ScalarCos(camera->yaw);
 
     float forwardX = sinYaw * cosPitch;
-    float forwardY = sinPitch;
-    float forwardZ = cosYaw * cosPitch;
+    float forwardY = cosYaw * cosPitch;   // вторая горизонталь
+    float forwardZ = sinPitch;             // высота
 
     float rightX = cosYaw;
-    float rightY = 0.0f;
-    float rightZ = -sinYaw;
+    float rightY = -sinYaw;
+    float rightZ = 0.0f;
 
-    float upX = forwardY * rightZ - forwardZ * rightY;
-    float upY = forwardZ * rightX - forwardX * rightZ;
-    float upZ = forwardX * rightY - forwardY * rightX;
+    float upX = rightY * forwardZ - rightZ * forwardY;
+    float upY = rightZ * forwardX - rightX * forwardZ;
+    float upZ = rightX * forwardY - rightY * forwardX;
 
-    float positionX = relativeEyePosition[0];
-    float positionY = relativeEyePosition[1];
-    float positionZ = relativeEyePosition[2];
+    float posX = relativeEyePosition[0];
+    float posY = relativeEyePosition[1];
+    float posZ = relativeEyePosition[2];
 
     outMatrix[0] = rightX;  outMatrix[1] = upX;  outMatrix[2] = forwardX;  outMatrix[3] = 0.0f;
     outMatrix[4] = rightY;  outMatrix[5] = upY;  outMatrix[6] = forwardY;  outMatrix[7] = 0.0f;
     outMatrix[8] = rightZ;  outMatrix[9] = upZ;  outMatrix[10] = forwardZ; outMatrix[11] = 0.0f;
-    outMatrix[12] = -(rightX * positionX + rightY * positionY + rightZ * positionZ);
-    outMatrix[13] = -(upX * positionX + upY * positionY + upZ * positionZ);
-    outMatrix[14] = -(forwardX * positionX + forwardY * positionY + forwardZ * positionZ);
+    outMatrix[12] = -(rightX * posX + rightY * posY + rightZ * posZ);
+    outMatrix[13] = -(upX * posX + upY * posY + upZ * posZ);
+    outMatrix[14] = -(forwardX * posX + forwardY * posY + forwardZ * posZ);
     outMatrix[15] = 1.0f;
 }
 

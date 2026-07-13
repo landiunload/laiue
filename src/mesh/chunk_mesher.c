@@ -5,21 +5,15 @@
 #include <intrin.h>
 #include <string.h>
 
-// Бинарный greedy meshing (по мотивам vercidium-patreon/meshing):
-// колонна чанка 64 блока = один uint64, отсечение невидимых граней —
-// две битовые операции на всю колонну, слияние соседних граней
-// в большие прямоугольники — битовые маски по плоскостям.
-// CHUNK_SIZE = 64 ложится на uint64 ровно.
-
 // Расширенный регион: чанк плюс слой соседних блоков с каждой стороны,
 // чтобы грани на границе чанка отсекались без обращений к соседям.
 #define EXTENDED_SIZE (CHUNK_SIZE + 2)
 
-#define BLOCK_INDEX(z, x, y) ((((size_t)(z) * EXTENDED_SIZE) + (size_t)(x)) * EXTENDED_SIZE + (size_t)(y))
+// Раскладка из WorldFillRegion: ((y * sizeX) + x) * sizeZ + z, z = высота.
+#define BLOCK_INDEX(y, x, z) ((((size_t)(y) * EXTENDED_SIZE) + (size_t)(x)) * EXTENDED_SIZE + (size_t)(z))
 
 #define COLUMN_WORDS ((size_t)CHUNK_SIZE * CHUNK_SIZE)
 
-// Порядок граней: +X, -X, +Y, -Y, +Z, -Z (совпадает с chunk_geometry.h и шейдером).
 enum
 {
     FACE_POSITIVE_X,
@@ -30,7 +24,6 @@ enum
     FACE_NEGATIVE_Z,
 };
 
-// Растущий буфер квадов (переиспользуется между чанками).
 typedef struct QuadBuffer
 {
     ChunkQuad* quads;
@@ -40,9 +33,9 @@ typedef struct QuadBuffer
 
 struct ChunkMesherScratch
 {
-    BlockType* blocks;          // расширенный регион 66^3
-    uint64_t* columns;          // битовые колонны трёх осей, 3 x 64x64
-    uint64_t* planesPositive;   // плоскости граней, 64x64
+    BlockType* blocks;
+    uint64_t* columns;
+    uint64_t* planesPositive;
     uint64_t* planesNegative;
     QuadBuffer quadBuffer;
 };
@@ -106,6 +99,7 @@ static bool QuadBufferAppend(QuadBuffer* buffer, ChunkQuad quad)
 }
 
 // Переводит прямоугольник плоскости (slice, биты, ряды) в оси чанка.
+// Z = высота, Y = вторая горизонталь.
 static bool EmitFaceRectangle(QuadBuffer* buffer, uint32_t face, uint32_t slice,
     uint32_t bitStart, uint32_t bitExtent, uint32_t rowStart, uint32_t rowExtent)
 {
@@ -113,26 +107,23 @@ static bool EmitFaceRectangle(QuadBuffer* buffer, uint32_t face, uint32_t slice,
     {
         case FACE_POSITIVE_X:
         case FACE_NEGATIVE_X:
-            // Нормаль X; биты плоскости — Y, ряды — Z.
+            // Нормаль X; биты = Z (высота), ряды = Y (вторая горизонталь).
             return QuadBufferAppend(buffer,
-                PackChunkQuad(slice, bitStart, rowStart, face, 1, bitExtent, rowExtent));
+                PackChunkQuad(slice, rowStart, bitStart, face, 1, rowExtent, bitExtent));
 
         case FACE_POSITIVE_Y:
         case FACE_NEGATIVE_Y:
-            // Нормаль Y; биты — X, ряды — Z.
+            // Нормаль Y; биты = X, ряды = Z (высота).
             return QuadBufferAppend(buffer,
-                PackChunkQuad(bitStart, slice, rowStart, face, bitExtent, 1, rowExtent));
+                PackChunkQuad(rowStart, slice, bitStart, face, rowExtent, 1, bitExtent));
 
         default:
-            // Нормаль Z; биты — Y, ряды — X.
+            // Нормаль Z (высота); биты = Y, ряды = X.
             return QuadBufferAppend(buffer,
-                PackChunkQuad(rowStart, bitStart, slice, face, rowExtent, bitExtent, 1));
+                PackChunkQuad(bitStart, rowStart, slice, face, bitExtent, rowExtent, 1));
     }
 }
 
-// Greedy-слияние по битовым плоскостям: в ряду находится серия
-// подряд идущих граней, затем серия расширяется на соседние ряды,
-// пока они содержат ту же маску.
 static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes)
 {
     for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
@@ -188,7 +179,6 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes
     return true;
 }
 
-// Рассеивает биты видимых граней колонны в плоскости соответствующих срезов.
 static inline void ScatterFaceBits(uint64_t faceMask, uint64_t* planes, uint32_t row, uint64_t planeBit)
 {
     while (faceMask != 0)
@@ -208,8 +198,8 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     *outQuadCount = 0;
 
     int64_t baseX = chunkX * CHUNK_SIZE;
-    int64_t baseY = chunkY * CHUNK_SIZE;
-    int64_t baseZ = chunkZ * CHUNK_SIZE;
+    int64_t baseY = chunkY * CHUNK_SIZE;  // Y = вторая горизонталь
+    int64_t baseZ = chunkZ * CHUNK_SIZE;  // Z = высота
 
     BlockType* blocks = scratch->blocks;
 
@@ -218,16 +208,17 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
         EXTENDED_SIZE, EXTENDED_SIZE, EXTENDED_SIZE,
         blocks);
 
-    // Однородный регион (весь воздух или весь камень) видимых граней
-    // не содержит — меш пуст.
     if (contents != WORLD_REGION_MIXED)
     {
         return true;
     }
 
-    uint64_t* columnsY = scratch->columns;                    // [z*64+x], биты вдоль Y
-    uint64_t* columnsX = scratch->columns + COLUMN_WORDS;     // [z*64+y], биты вдоль X
-    uint64_t* columnsZ = scratch->columns + COLUMN_WORDS * 2; // [x*64+y], биты вдоль Z
+    // columnsZ[y*64+x] — биты вдоль Z (высота)
+    // columnsY[x*64+z] — биты вдоль Y (вторая горизонталь)
+    // columnsX[y*64+z] — биты вдоль X
+    uint64_t* columnsZ = scratch->columns;                      // [y*64+x]
+    uint64_t* columnsY = scratch->columns + COLUMN_WORDS;       // [x*64+z]
+    uint64_t* columnsX = scratch->columns + COLUMN_WORDS * 2;   // [y*64+z]
     uint64_t* planesPositive = scratch->planesPositive;
     uint64_t* planesNegative = scratch->planesNegative;
     size_t planeBytes = COLUMN_WORDS * sizeof(uint64_t);
@@ -235,18 +226,18 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     memset(scratch->columns, 0, planeBytes * 3);
 
     // Один проход по блокам заполняет колонны всех трёх осей.
-    for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
+    for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
-            const BlockType* column = &blocks[BLOCK_INDEX(z + 1, x + 1, 1)];
-            for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
+            const BlockType* column = &blocks[BLOCK_INDEX(y + 1, x + 1, 1)];
+            for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
             {
-                if (column[y] != BLOCK_AIR)
+                if (column[z] != BLOCK_AIR)
                 {
-                    columnsY[z * CHUNK_SIZE + x] |= 1ull << y;
-                    columnsX[z * CHUNK_SIZE + y] |= 1ull << x;
-                    columnsZ[x * CHUNK_SIZE + y] |= 1ull << z;
+                    columnsZ[y * CHUNK_SIZE + x] |= 1ull << z;
+                    columnsY[x * CHUNK_SIZE + z] |= 1ull << y;
+                    columnsX[y * CHUNK_SIZE + z] |= 1ull << x;
                 }
             }
         }
@@ -256,76 +247,74 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     quadBuffer->count = 0;
     bool succeeded = true;
 
-    // === Грани ±Y ===
+    // === Грани ±Z (высота, нормаль = Z) ===
     memset(planesPositive, 0, planeBytes);
     memset(planesNegative, 0, planeBytes);
-    for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
+    for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
-            uint64_t column = columnsY[z * CHUNK_SIZE + x];
+            uint64_t column = columnsZ[y * CHUNK_SIZE + x];
             if (column == 0)
             {
                 continue;
             }
-            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(z + 1, x + 1, EXTENDED_SIZE - 1)] != BLOCK_AIR);
-            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(z + 1, x + 1, 0)] != BLOCK_AIR);
-            // Грань видна там, где блок твёрдый, а сосед по направлению — воздух.
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, z, 1ull << x);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, z, 1ull << x);
+            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(y + 1, x + 1, EXTENDED_SIZE - 1)] != BLOCK_AIR);
+            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(y + 1, x + 1, 0)] != BLOCK_AIR);
+            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, y, 1ull << x);
+            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << x);
         }
     }
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Y, planesPositive);
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Y, planesNegative);
+    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Z, planesPositive);
+    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Z, planesNegative);
 
     // === Грани ±X ===
     memset(planesPositive, 0, planeBytes);
     memset(planesNegative, 0, planeBytes);
-    for (uint32_t z = 0; z < CHUNK_SIZE && succeeded; ++z)
+    for (uint32_t y = 0; y < CHUNK_SIZE && succeeded; ++y)
     {
-        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
+        for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
-            uint64_t column = columnsX[z * CHUNK_SIZE + y];
+            uint64_t column = columnsX[y * CHUNK_SIZE + z];
             if (column == 0)
             {
                 continue;
             }
-            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(z + 1, EXTENDED_SIZE - 1, y + 1)] != BLOCK_AIR);
-            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(z + 1, 0, y + 1)] != BLOCK_AIR);
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, z, 1ull << y);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, z, 1ull << y);
+            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(y + 1, EXTENDED_SIZE - 1, z + 1)] != BLOCK_AIR);
+            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(y + 1, 0, z + 1)] != BLOCK_AIR);
+            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, y, 1ull << z);
+            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << z);
         }
     }
     succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_X, planesPositive);
     succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_X, planesNegative);
 
-    // === Грани ±Z ===
+    // === Грани ±Y (вторая горизонталь, нормаль = Y) ===
     memset(planesPositive, 0, planeBytes);
     memset(planesNegative, 0, planeBytes);
     for (uint32_t x = 0; x < CHUNK_SIZE && succeeded; ++x)
     {
-        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
+        for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
-            uint64_t column = columnsZ[x * CHUNK_SIZE + y];
+            uint64_t column = columnsY[x * CHUNK_SIZE + z];
             if (column == 0)
             {
                 continue;
             }
-            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(EXTENDED_SIZE - 1, x + 1, y + 1)] != BLOCK_AIR);
-            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(0, x + 1, y + 1)] != BLOCK_AIR);
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, x, 1ull << y);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, x, 1ull << y);
+            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(EXTENDED_SIZE - 1, x + 1, z + 1)] != BLOCK_AIR);
+            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(0, x + 1, z + 1)] != BLOCK_AIR);
+            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, x, 1ull << z);
+            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, x, 1ull << z);
         }
     }
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Z, planesPositive);
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Z, planesNegative);
+    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Y, planesPositive);
+    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Y, planesNegative);
 
     if (!succeeded)
     {
         return false;
     }
 
-    // Копия точного размера — она уходит другому потоку, scratch остаётся.
     if (quadBuffer->count > 0)
     {
         size_t bytes = (size_t)quadBuffer->count * sizeof(ChunkQuad);

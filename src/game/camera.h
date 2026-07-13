@@ -3,11 +3,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Позиция — double: рендер работает в координатах относительно камеры
-// (origin rebasing), поэтому мир не деградирует на больших расстояниях.
 typedef struct Camera
 {
-    double position[3];
+    double position[3];    // [0]=X, [1]=Y (вторая горизонталь), [2]=Z (высота)
     float yaw;
     float pitch;
 } Camera;

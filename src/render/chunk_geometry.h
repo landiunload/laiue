@@ -9,13 +9,12 @@
 // и индексных буферов: вершинный шейдер разворачивает квад
 // по SV_VertexID (vertex pulling), 6 вершин на квад.
 //
-// positionAndFace: биты 0..6 — startX, 7..13 — startY, 14..20 — startZ
-//                  (локальные координаты в чанке, 0..64),
+// positionAndFace: биты 0..6 — startX, 7..13 — startZ (высота),
+//                  14..20 — startY (вторая горизонталь),
 //                  биты 21..23 — номер грани.
-// extents:         биты 0..6 — extentX, 7..13 — extentY, 14..20 — extentZ
-//                  (размеры квада в блоках; по оси нормали всегда 1).
+// extents:         биты 0..6 — extentX, 7..13 — extentZ, 14..20 — extentY.
 //
-// Порядок граней: +X, -X, +Y, -Y, +Z, -Z.
+// Порядок граней: +X, -X, +Y, -Y, +Z, -Z (+Z = верх, -Z = низ).
 typedef struct ChunkQuad
 {
     uint32_t positionAndFace;
@@ -27,8 +26,8 @@ static inline ChunkQuad PackChunkQuad(
     uint32_t extentX, uint32_t extentY, uint32_t extentZ)
 {
     ChunkQuad quad = {
-        .positionAndFace = startX | (startY << 7) | (startZ << 14) | (face << 21),
-        .extents = extentX | (extentY << 7) | (extentZ << 14),
+        .positionAndFace = startX | (startZ << 7) | (startY << 14) | (face << 21),
+        .extents = extentX | (extentZ << 7) | (extentY << 14),
     };
     return quad;
 }

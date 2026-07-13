@@ -30,7 +30,7 @@ static inline int64_t FloorDiv(int64_t a, int64_t b)
     return (remainder != 0 && (remainder < 0) != (b < 0)) ? quotient - 1 : quotient;
 }
 
-void TerrainOriginInit(TerrainOrigin* out, BigCoord originX, BigCoord originZ)
+void TerrainOriginInit(TerrainOrigin* out, BigCoord originX, BigCoord originY)
 {
     for (int32_t octave = 0; octave < 4; ++octave)
     {
@@ -38,16 +38,14 @@ void TerrainOriginInit(TerrainOrigin* out, BigCoord originX, BigCoord originZ)
         out->moduloX[octave]  = BigCoordDivSmall(&quotientX, (uint64_t)g_cellBlocks[octave]);
         out->cellLowX[octave] = quotientX.limb[0];
 
-        BigCoord quotientZ = originZ;
-        out->moduloZ[octave]  = BigCoordDivSmall(&quotientZ, (uint64_t)g_cellBlocks[octave]);
-        out->cellLowZ[octave] = quotientZ.limb[0];
+        BigCoord quotientY = originY;
+        out->moduloY[octave]  = BigCoordDivSmall(&quotientY, (uint64_t)g_cellBlocks[octave]);
+        out->cellLowY[octave] = quotientY.limb[0];
     }
 }
 
-// Один слой value-noise. Узел абсолютной решётки = originCell + локальное
-// смещение клетки, всё int64; для хэша берутся низшие 64 бита узла.
 static float NoiseLayer(int64_t seed, const TerrainOrigin* origin, int32_t octave,
-    int64_t localX, int64_t localZ)
+    int64_t localX, int64_t localY)
 {
     int64_t cell = g_cellBlocks[octave];
 
@@ -56,25 +54,25 @@ static float NoiseLayer(int64_t seed, const TerrainOrigin* origin, int32_t octav
     float fractionX = (float)(combinedX - cellOffsetX * cell) / (float)cell;
     uint64_t nodeX = origin->cellLowX[octave] + (uint64_t)cellOffsetX;
 
-    int64_t combinedZ = (int64_t)origin->moduloZ[octave] + localZ;
-    int64_t cellOffsetZ = FloorDiv(combinedZ, cell);
-    float fractionZ = (float)(combinedZ - cellOffsetZ * cell) / (float)cell;
-    uint64_t nodeZ = origin->cellLowZ[octave] + (uint64_t)cellOffsetZ;
+    int64_t combinedY = (int64_t)origin->moduloY[octave] + localY;
+    int64_t cellOffsetY = FloorDiv(combinedY, cell);
+    float fractionY = (float)(combinedY - cellOffsetY * cell) / (float)cell;
+    uint64_t nodeY = origin->cellLowY[octave] + (uint64_t)cellOffsetY;
 
     float smoothX = SmoothStep(fractionX);
-    float smoothZ = SmoothStep(fractionZ);
+    float smoothY = SmoothStep(fractionY);
 
-    float n00 = ToUnitFloat(HashCoordinates(nodeX,     nodeZ,     seed));
-    float n10 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeZ,     seed));
-    float n01 = ToUnitFloat(HashCoordinates(nodeX,     nodeZ + 1, seed));
-    float n11 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeZ + 1, seed));
+    float n00 = ToUnitFloat(HashCoordinates(nodeX,     nodeY,     seed));
+    float n10 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeY,     seed));
+    float n01 = ToUnitFloat(HashCoordinates(nodeX,     nodeY + 1, seed));
+    float n11 = ToUnitFloat(HashCoordinates(nodeX + 1, nodeY + 1, seed));
 
     float nx0 = n00 + (n10 - n00) * smoothX;
     float nx1 = n01 + (n11 - n01) * smoothX;
-    return nx0 + (nx1 - nx0) * smoothZ;
+    return nx0 + (nx1 - nx0) * smoothY;
 }
 
-float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localZ)
+float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t localX, int64_t localY)
 {
     float value = 0.0f;
     float amplitude = 1.0f;
@@ -82,7 +80,7 @@ float GenerateTerrainNoise(int64_t seed, const TerrainOrigin* origin, int64_t lo
 
     for (int32_t octave = 0; octave < 4; ++octave)
     {
-        value += amplitude * NoiseLayer(seed, origin, octave, localX, localZ);
+        value += amplitude * NoiseLayer(seed, origin, octave, localX, localY);
         maximumValue += amplitude;
         amplitude *= 0.5f;
     }

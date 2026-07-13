@@ -26,13 +26,12 @@ typedef struct ApplicationConfiguration
     int32_t viewRadiusChunks;
     int64_t worldSeed;
     double spawnHeight;
-    uint32_t worldSizePowerOfTen;    // размер мира по X и Z = 10^этого
 } ApplicationConfiguration;
 
 static const ApplicationConfiguration g_configuration = {
     .windowTitle = L"laiue",
-    .windowWidth = 1280,
-    .windowHeight = 720,
+    .windowWidth = 640,
+    .windowHeight = 360,
     .cameraSpeed = 80.0f,
     .mouseSensitivity = 0.0025f,
     .fieldOfViewRadians = 1.047197f,
@@ -41,8 +40,7 @@ static const ApplicationConfiguration g_configuration = {
     .editReachDistance = 8.0f,
     .viewRadiusChunks = 5,
     .worldSeed = 42,
-    .spawnHeight = 80.0,
-    .worldSizePowerOfTen = 1488,    // мир [0, 10^1488) по X и Z
+    .spawnHeight = 100.0,
 };
 
 typedef struct ApplicationState
@@ -294,16 +292,11 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    // Мир [0, worldSize) по X и Z (worldSize = 10^worldSizePowerOfTen). Спавн — в
-    // дальнем углу (X=Z=worldSize): origin ставим в cornerMargin блоках от края,
-    // чтобы сразу видеть обрыв рельефа. Мир адресуется bignum-координатой, но
-    // рендер/физика/стриминг работают локально (int64) относительно origin.
-    BigCoord worldSize = BigCoordPowTen(g_configuration.worldSizePowerOfTen);
-    const uint64_t cornerMargin = 160;
-    BigCoord worldOriginX = worldSize; BigCoordSubSmall(&worldOriginX, cornerMargin);
-    BigCoord worldOriginZ = worldSize; BigCoordSubSmall(&worldOriginZ, cornerMargin);
+    // Максимальный BigCoord — самый край мира по X и Y.
+    BigCoord worldOrigin;
+    for (int32_t i = 0; i < BIGCOORD_LIMBS; ++i) worldOrigin.limb[i] = UINT64_MAX;
 
-    World* world = WorldCreate(g_configuration.worldSeed, worldOriginX, worldOriginZ, worldSize);
+    World* world = WorldCreate(g_configuration.worldSeed, worldOrigin, worldOrigin);
     if (world == NULL)
     {
         InputDestroy(input);
@@ -346,7 +339,7 @@ LAIUE_CORE_API void Start(void)
         .previousTimeSeconds = PlatformTimeSeconds(),
     };
 
-    CameraInit(&application.camera, 0.0, g_configuration.spawnHeight, 0.0, 0.785398f, -0.4f); // взгляд на угол мира (+X,+Z)
+    CameraInit(&application.camera, 0.0, 0.0, g_configuration.spawnHeight, 0.0f, 0.0f);
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, &application);
