@@ -416,9 +416,11 @@ static bool CreatePipelineState(Renderer* renderer)
     description.PS.BytecodeLength = sizeof(g_chunk_ps);
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-    // Перестановка Y/Z в вершинном шейдере меняет winding всех граней.
-    // Без этого внешние стороны отсекались как back faces.
-    description.RasterizerState.FrontCounterClockwise = TRUE;
+    // Перестановка Y/Z в геометрии инвертирует winding, но перевод Z-up мира
+    // в D3D view-space (Y-up, Z-forward) инвертирует его ещё раз. Эти две
+    // перестановки компенсируют друг друга, поэтому сохраняем исходное правило:
+    // внешние стороны квада имеют clockwise winding в render-target space.
+    description.RasterizerState.FrontCounterClockwise = FALSE;
     description.RasterizerState.DepthClipEnable = TRUE;
     description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     description.DepthStencilState.DepthEnable = TRUE;

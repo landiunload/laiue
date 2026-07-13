@@ -292,7 +292,9 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    // Static storage не расходует стек: BigCoord занимает 4160 байт.
+    // Максимально далёкая абсолютная точка, поддерживаемая BigCoord:
+    // 2^(64 * 520) - 1, то есть примерно 10^10018. Камера остаётся около
+    // локального нуля, поэтому точность движения и выбора блоков не теряется.
     static BigCoord worldOrigin;
     BigCoordSetMaximum(&worldOrigin);
 
