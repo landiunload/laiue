@@ -56,8 +56,11 @@ typedef struct ApplicationState
     int32_t windowWidth;
     int32_t windowHeight;
     double previousTimeSeconds;
+    double fpsSampleStartSeconds;
+    uint32_t fpsFrameCount;
+    uint32_t framesPerSecond;
     int64_t coordinateOverlayBlock[3];
-    bool coordinateOverlayDirty;
+    bool overlayDirty;
 } ApplicationState;
 
 // Адаптер сигнатуры: окно передаёт userData + HRAWINPUT,
@@ -124,7 +127,7 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     {
         application->camera.position[axis] -= (double)shift[axis];
     }
-    application->coordinateOverlayDirty = true;
+    application->overlayDirty = true;
 
     int64_t centerX = FloorToInt64(application->camera.position[0]) >> CHUNK_SIZE_LOG2;
     int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
@@ -158,7 +161,7 @@ static bool SquareAbsoluteX(ApplicationState* application)
 
     application->camera.position[0] =
         (double)squaredLocalBlockX + fractionalX;
-    application->coordinateOverlayDirty = true;
+    application->overlayDirty = true;
 
     int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
     int64_t centerY = FloorToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
@@ -181,10 +184,54 @@ static void AppendWideText(wchar_t* destination, uint32_t capacity,
     }
 }
 
-static void UpdateCoordinateOverlay(ApplicationState* application,
+static void AppendUnsignedDecimal(wchar_t* destination, uint32_t capacity,
+    uint32_t* length, uint32_t value)
+{
+    wchar_t reversedDigits[10];
+    uint32_t digitCount = 0;
+    do
+    {
+        reversedDigits[digitCount++] = (wchar_t)(L'0' + value % 10u);
+        value /= 10u;
+    }
+    while (value != 0);
+
+    while (digitCount > 0 && *length + 1 < capacity)
+    {
+        destination[(*length)++] = reversedDigits[--digitCount];
+    }
+    if (capacity > 0)
+    {
+        destination[*length] = L'\0';
+    }
+}
+
+static void RecordPresentedFrame(ApplicationState* application)
+{
+    double currentTimeSeconds = PlatformTimeSeconds();
+    application->fpsFrameCount++;
+
+    double elapsedSeconds = currentTimeSeconds - application->fpsSampleStartSeconds;
+    if (elapsedSeconds < 0.5)
+    {
+        return;
+    }
+
+    uint32_t framesPerSecond = (uint32_t)(
+        (double)application->fpsFrameCount / elapsedSeconds + 0.5);
+    if (application->framesPerSecond != framesPerSecond)
+    {
+        application->framesPerSecond = framesPerSecond;
+        application->overlayDirty = true;
+    }
+    application->fpsFrameCount = 0;
+    application->fpsSampleStartSeconds = currentTimeSeconds;
+}
+
+static void UpdateOverlay(ApplicationState* application,
     const int64_t cameraBlockPosition[3])
 {
-    if (!application->coordinateOverlayDirty
+    if (!application->overlayDirty
         && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
         && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
         && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
@@ -208,9 +255,11 @@ static void UpdateCoordinateOverlay(ApplicationState* application,
     AppendWideText(text, 128, &length, coordinate[1]);
     AppendWideText(text, 128, &length, L"\r\nZ: ");
     AppendWideText(text, 128, &length, coordinate[2]);
+    AppendWideText(text, 128, &length, L"\r\nFPS: ");
+    AppendUnsignedDecimal(text, 128, &length, application->framesPerSecond);
 
     WindowSetOverlayText(application->window, text);
-    application->coordinateOverlayDirty = false;
+    application->overlayDirty = false;
 }
 
 // Трассировка луча по вокселям (DDA, Amanatides & Woo).
@@ -410,7 +459,7 @@ static void OnFrame(void* userData)
         relativeEyePosition[axis] = (float)(application->camera.position[axis] - (double)cameraBlockPosition[axis]);
     }
 
-    UpdateCoordinateOverlay(application, cameraBlockPosition);
+    UpdateOverlay(application, cameraBlockPosition);
 
     // Стриминг чанков: центр следует за камерой, меши строятся
     // пулом рабочих потоков, готовые забираются с бюджетом на кадр.
@@ -433,7 +482,12 @@ static void OnFrame(void* userData)
     if (RendererBeginFrame(application->renderer, viewProjectionMatrix))
     {
         ChunkStreamingDraw(application->chunkStreaming, viewProjectionMatrix, cameraBlockPosition);
-        RendererEndFrame(application->renderer);
+        if (!RendererEndFrame(application->renderer))
+        {
+            WindowRequestClose(application->window);
+            return;
+        }
+        RecordPresentedFrame(application);
     }
 
     InputEndFrame(application->input);
@@ -492,6 +546,7 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
+    double startTimeSeconds = PlatformTimeSeconds();
     ApplicationState application = {
         .window = window,
         .input = input,
@@ -500,8 +555,9 @@ LAIUE_CORE_API void Start(void)
         .chunkStreaming = chunkStreaming,
         .windowWidth = clientWidth,
         .windowHeight = clientHeight,
-        .previousTimeSeconds = PlatformTimeSeconds(),
-        .coordinateOverlayDirty = true,
+        .previousTimeSeconds = startTimeSeconds,
+        .fpsSampleStartSeconds = startTimeSeconds,
+        .overlayDirty = true,
     };
 
     // Камера стартует над рельефом и сразу смотрит немного вниз.

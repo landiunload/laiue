@@ -22,7 +22,8 @@ LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
 // ставит матрицу view-projection. Возвращает false, если кадр рисовать
 // нельзя (например, resize не удался) — тогда Draw/EndFrame пропускаются.
 LAIUE_RENDER_API bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16]);
-LAIUE_RENDER_API void RendererEndFrame(Renderer* renderer);
+// Возвращает false, если DXGI не смог показать кадр.
+LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 
 LAIUE_RENDER_API void RendererSetVerticalSync(Renderer* renderer, bool enabled);
 LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);

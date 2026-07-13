@@ -109,6 +109,7 @@ struct Renderer
     bool                       resizeRequested;
     bool                       verticalSyncEnabled;
     bool                       tearingSupported;
+    bool                       tearingPresentEnabled;
 
     GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
     uint32_t                   poolBlockCount;
@@ -148,8 +149,9 @@ static void WaitForGpu(Renderer* renderer)
     renderer->fenceValues[renderer->frameIndex]++;
 }
 
-static void MoveToNextFrame(Renderer* renderer)
+static bool MoveToNextFrame(Renderer* renderer)
 {
+    bool waitedForFence = false;
     UINT64 currentValue = renderer->fenceValues[renderer->frameIndex];
     ID3D12CommandQueue_Signal(renderer->commandQueue, renderer->fence, currentValue);
     renderer->lastSignaledFenceValue = currentValue;
@@ -160,9 +162,11 @@ static void MoveToNextFrame(Renderer* renderer)
     {
         ID3D12Fence_SetEventOnCompletion(renderer->fence, renderer->fenceValues[renderer->frameIndex], renderer->fenceEvent);
         WaitForSingleObject(renderer->fenceEvent, INFINITE);
+        waitedForFence = true;
     }
 
     renderer->fenceValues[renderer->frameIndex] = currentValue + 1;
+    return waitedForFence;
 }
 
 // === Пул геометрии ===
@@ -523,6 +527,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
                 &allowTearing, (UINT)sizeof(allowTearing))))
         {
             renderer->tearingSupported = allowTearing != FALSE;
+            renderer->tearingPresentEnabled = renderer->tearingSupported;
         }
         IDXGIFactory5_Release(factory5);
     }
@@ -699,7 +704,6 @@ void RendererDestroy(Renderer* renderer)
     {
         CloseHandle(renderer->fenceEvent);
     }
-
     for (UINT i = 0; i < FRAME_COUNT; ++i)
     {
         if (renderer->renderTargets[i] != NULL) ID3D12Resource_Release(renderer->renderTargets[i]);
@@ -992,7 +996,7 @@ bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16])
     return true;
 }
 
-void RendererEndFrame(Renderer* renderer)
+bool RendererEndFrame(Renderer* renderer)
 {
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -1004,10 +1008,38 @@ void RendererEndFrame(Renderer* renderer)
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
-    UINT presentFlags = !renderer->verticalSyncEnabled && renderer->tearingSupported
-        ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    IDXGISwapChain3_Present(renderer->swapChain, syncInterval, presentFlags);
-    MoveToNextFrame(renderer);
+    UINT presentFlags = 0;
+    if (!renderer->verticalSyncEnabled && renderer->tearingPresentEnabled)
+    {
+        BOOL fullscreen = TRUE;
+        if (SUCCEEDED(IDXGISwapChain3_GetFullscreenState(
+                renderer->swapChain, &fullscreen, NULL)) && !fullscreen)
+        {
+            presentFlags = DXGI_PRESENT_ALLOW_TEARING;
+        }
+    }
+
+    HRESULT presentResult = IDXGISwapChain3_Present(
+        renderer->swapChain, syncInterval, presentFlags);
+    if (presentResult == DXGI_ERROR_INVALID_CALL
+        && presentFlags == DXGI_PRESENT_ALLOW_TEARING)
+    {
+        renderer->tearingPresentEnabled = false;
+        presentResult = IDXGISwapChain3_Present(renderer->swapChain, 0, 0);
+    }
+    if (FAILED(presentResult))
+    {
+        return false;
+    }
+
+    bool waitedForFence = MoveToNextFrame(renderer);
+    if (!renderer->verticalSyncEnabled && !waitedForFence)
+    {
+        // Без vsync Present не является точкой ожидания. Отдаём остаток
+        // кванта рабочим потокам, не вводя задержку или предел FPS.
+        SwitchToThread();
+    }
+    return true;
 }
 
 void RendererSetVerticalSync(Renderer* renderer, bool enabled)
