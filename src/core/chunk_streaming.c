@@ -105,6 +105,8 @@ struct ChunkStreaming
     HANDLE workerThreads[MAX_WORKER_THREADS];
     uint32_t workerThreadCount;
     uint32_t desiredWorkerThreadCount;
+    uint32_t pausedWorkerCount;
+    bool pauseRequested;
     bool shutdownRequested;
 };
 
@@ -301,11 +303,20 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
         return 1;
     }
 
+    bool reportedPaused = false;
+
     for (;;)
     {
         AcquireSRWLockExclusive(&streaming->queueLock);
-        while (!streaming->shutdownRequested && streaming->requestCount == 0)
+        while (!streaming->shutdownRequested
+            && (streaming->pauseRequested || streaming->requestCount == 0))
         {
+            if (streaming->pauseRequested && !reportedPaused)
+            {
+                reportedPaused = true;
+                streaming->pausedWorkerCount++;
+                WakeAllConditionVariable(&streaming->workAvailable);
+            }
             SleepConditionVariableSRW(&streaming->workAvailable, &streaming->queueLock, INFINITE, 0);
         }
         if (streaming->shutdownRequested)
@@ -314,6 +325,8 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
             ChunkMesherScratchDestroy(scratch);
             return 0;
         }
+
+        reportedPaused = false;
 
         uint32_t queueMask = streaming->queueCapacity - 1;
         ChunkRequest request = streaming->requests[streaming->requestHead & queueMask];
@@ -359,6 +372,8 @@ static bool StopWorkerThreads(ChunkStreaming* streaming)
 
     AcquireSRWLockExclusive(&streaming->queueLock);
     streaming->shutdownRequested = true;
+    streaming->pauseRequested = false;
+    streaming->pausedWorkerCount = 0;
     WakeAllConditionVariable(&streaming->workAvailable);
     ReleaseSRWLockExclusive(&streaming->queueLock);
 
@@ -379,10 +394,29 @@ static bool StopWorkerThreads(ChunkStreaming* streaming)
     return succeeded;
 }
 
+static void ResumeWorkerThreads(ChunkStreaming* streaming)
+{
+    AcquireSRWLockExclusive(&streaming->queueLock);
+    streaming->pausedWorkerCount = 0;
+    streaming->pauseRequested = false;
+    WakeAllConditionVariable(&streaming->workAvailable);
+    ReleaseSRWLockExclusive(&streaming->queueLock);
+}
+
 bool ChunkStreamingPause(ChunkStreaming* streaming)
 {
-    if (!StopWorkerThreads(streaming)) return false;
+    if (streaming->workerThreadCount == 0) return false;
 
+    AcquireSRWLockExclusive(&streaming->queueLock);
+    streaming->pauseRequested = true;
+    WakeAllConditionVariable(&streaming->workAvailable);
+    while (streaming->pausedWorkerCount < streaming->workerThreadCount)
+    {
+        SleepConditionVariableSRW(
+            &streaming->workAvailable, &streaming->queueLock, INFINITE, 0);
+    }
+
+    // Все рабочие потоки стоят на condition variable и больше не читают World.
     uint32_t queueMask = streaming->queueCapacity - 1;
     for (uint32_t index = 0; index < streaming->resultCount; ++index)
     {
@@ -401,6 +435,8 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
     streaming->resultCount = 0;
     streaming->unfinishedWork = 0;
     streaming->hasUnqueuedPending = false;
+
+    ReleaseSRWLockExclusive(&streaming->queueLock);
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
     {
@@ -509,8 +545,8 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
         }
     }
 
-    if (!StartWorkerThreads(streaming)) return false;
     QueueMissingChunks(streaming, newCenterX, newCenterY, newCenterZ);
+    ResumeWorkerThreads(streaming);
     return true;
 }
 
@@ -585,7 +621,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         return;
     }
 
-    ChunkStreamingPause(streaming);
+    StopWorkerThreads(streaming);
 
     // Остаточные результаты: освободить CPU-массивы.
     if (streaming->results != NULL)

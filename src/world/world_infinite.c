@@ -605,28 +605,45 @@ static Chunk* WorldGetOrCreateChunk(World* world, LocalChunkCoordinate key)
     return chunk;
 }
 
+static uint32_t ChunkDeltaLowerBound(const Chunk* chunk, uint32_t localIndex)
+{
+    uint32_t low = 0;
+    uint32_t high = chunk->deltaCount;
+    while (low < high)
+    {
+        uint32_t middle = low + (high - low) / 2u;
+        if (DeltaLocalIndex(chunk->deltas[middle]) < localIndex)
+        {
+            low = middle + 1u;
+        }
+        else
+        {
+            high = middle;
+        }
+    }
+    return low;
+}
+
 static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* outBlock)
 {
-    for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+    uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
+    if (position < chunk->deltaCount
+        && DeltaLocalIndex(chunk->deltas[position]) == localIndex)
     {
-        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
-        {
-            *outBlock = DeltaBlock(chunk->deltas[i]);
-            return true;
-        }
+        *outBlock = DeltaBlock(chunk->deltas[position]);
+        return true;
     }
     return false;
 }
 
 static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 {
-    for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+    uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
+    if (position < chunk->deltaCount
+        && DeltaLocalIndex(chunk->deltas[position]) == localIndex)
     {
-        if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
-        {
-            chunk->deltas[i] = PackDelta(localIndex, block);
-            return;
-        }
+        chunk->deltas[position] = PackDelta(localIndex, block);
+        return;
     }
 
     if (chunk->deltaCount >= chunk->deltaCapacity)
@@ -641,8 +658,68 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
         chunk->deltaCapacity = newCapacity;
     }
 
-    chunk->deltas[chunk->deltaCount] = PackDelta(localIndex, block);
+    for (uint32_t index = chunk->deltaCount; index > position; --index)
+    {
+        chunk->deltas[index] = chunk->deltas[index - 1u];
+    }
+    chunk->deltas[position] = PackDelta(localIndex, block);
     chunk->deltaCount++;
+}
+
+static void WorldInsertExistingEntry(
+    World* world, GlobalChunkCoordinate key, Chunk* chunk)
+{
+    uint32_t mask = world->capacity - 1u;
+    uint32_t index = (uint32_t)(key.hash ^ (key.hash >> 32)) & mask;
+    while (world->occupied[index])
+    {
+        index = (index + 1u) & mask;
+    }
+
+    world->keys[index] = key;
+    world->chunks[index] = chunk;
+    world->occupied[index] = true;
+    world->count++;
+}
+
+static void WorldRemoveEntry(World* world, LocalChunkCoordinate key)
+{
+    if (world->count == 0) return;
+
+    uint64_t hash = HashLocalChunkCoordinate(world, key);
+    uint32_t mask = world->capacity - 1u;
+    uint32_t index = (uint32_t)(hash ^ (hash >> 32)) & mask;
+
+    while (world->occupied[index])
+    {
+        if (world->keys[index].hash == hash
+            && GlobalChunkCoordinateMatchesLocal(&world->keys[index], world, key))
+        {
+            break;
+        }
+        index = (index + 1u) & mask;
+    }
+    if (!world->occupied[index]) return;
+
+    GlobalChunkCoordinateDestroy(&world->keys[index]);
+    ChunkDestroy(world->chunks[index]);
+    world->chunks[index] = NULL;
+    world->occupied[index] = false;
+    world->count--;
+
+    // Открытая адресация без tombstone: хвост кластера надо вставить заново,
+    // иначе поиск остановится на образовавшейся дыре.
+    uint32_t scan = (index + 1u) & mask;
+    while (world->occupied[scan])
+    {
+        GlobalChunkCoordinate movedKey = world->keys[scan];
+        Chunk* movedChunk = world->chunks[scan];
+        world->chunks[scan] = NULL;
+        world->occupied[scan] = false;
+        world->count--;
+        WorldInsertExistingEntry(world, movedKey, movedChunk);
+        scan = (scan + 1u) & mask;
+    }
 }
 
 BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
@@ -688,12 +765,19 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
         if (entry != NULL)
         {
             Chunk* chunk = *entry;
-            for (uint32_t i = 0; i < chunk->deltaCount; ++i)
+            uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
+            if (position < chunk->deltaCount
+                && DeltaLocalIndex(chunk->deltas[position]) == localIndex)
             {
-                if (DeltaLocalIndex(chunk->deltas[i]) == localIndex)
+                for (uint32_t index = position + 1u;
+                     index < chunk->deltaCount; ++index)
                 {
-                    chunk->deltas[i] = chunk->deltas[--chunk->deltaCount];
-                    break;
+                    chunk->deltas[index - 1u] = chunk->deltas[index];
+                }
+                chunk->deltaCount--;
+                if (chunk->deltaCount == 0)
+                {
+                    WorldRemoveEntry(world, coordinate);
                 }
             }
         }
@@ -735,8 +819,11 @@ WorldRegionContents WorldFillRegion(World* world,
     ReleaseSRWLockShared(&world->tableLock);
 
     size_t heightCount = (size_t)sizeX * (size_t)sizeY;
-    float* heights = HeapAlloc(
-        GetProcessHeap(), 0, heightCount * sizeof(float));
+    float stackHeights[HEIGHT_GRID_CELLS];
+    bool heightsOnHeap = heightCount > HEIGHT_GRID_CELLS;
+    float* heights = heightsOnHeap
+        ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float))
+        : stackHeights;
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
     bool boundsKnown = false;
@@ -774,12 +861,12 @@ WorldRegionContents WorldFillRegion(World* world,
     {
         if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
         {
-            HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_AIR;
         }
         if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
         {
-            HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
             return WORLD_REGION_ALL_SOLID;
         }
     }
@@ -800,7 +887,7 @@ WorldRegionContents WorldFillRegion(World* world,
         }
     }
 
-    if (heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
+    if (heightsOnHeap && heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
 
     if (regionHasDeltas)
     {
