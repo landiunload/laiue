@@ -18,6 +18,13 @@ typedef struct ApplicationConfiguration
     int32_t windowWidth;
     int32_t windowHeight;
     float cameraSpeed;
+    float walkingSpeed;
+    float gravity;
+    float jumpSpeed;
+    float maximumFallSpeed;
+    double playerRadius;
+    double playerHeight;
+    double playerEyeHeight;
     float mouseSensitivity;
     float fieldOfViewRadians;
     float nearPlane;
@@ -34,6 +41,13 @@ static const ApplicationConfiguration g_configuration = {
     .windowWidth = 640,
     .windowHeight = 360,
     .cameraSpeed = 80.0f,
+    .walkingSpeed = 7.0f,
+    .gravity = 26.0f,
+    .jumpSpeed = 9.0f,
+    .maximumFallSpeed = 55.0f,
+    .playerRadius = 0.30,
+    .playerHeight = 1.80,
+    .playerEyeHeight = 1.62,
     .mouseSensitivity = 0.0025f,
     .fieldOfViewRadians = 1.047197f,
     .nearPlane = 0.1f,
@@ -44,6 +58,12 @@ static const ApplicationConfiguration g_configuration = {
     .rebaseThresholdBlocks = 1048576,
     .spawnHeight = 100.0,
 };
+
+typedef enum GameMode
+{
+    GAME_MODE_FLY,
+    GAME_MODE_WALK,
+} GameMode;
 
 typedef struct ApplicationState
 {
@@ -61,6 +81,9 @@ typedef struct ApplicationState
     uint32_t framesPerSecond;
     int64_t coordinateOverlayBlock[3];
     bool overlayDirty;
+    GameMode gameMode;
+    float verticalVelocity;
+    bool grounded;
 } ApplicationState;
 
 // Адаптер сигнатуры: окно передаёт userData + HRAWINPUT,
@@ -74,6 +97,253 @@ static int64_t FloorToInt64(double value)
 {
     int64_t truncated = (int64_t)value;
     return (double)truncated > value ? truncated - 1 : truncated;
+}
+
+#define COLLISION_EPSILON 0.001
+
+static void GetPlayerBounds(const Camera* camera,
+    double minimum[3], double maximum[3])
+{
+    double feet = camera->position[2] - g_configuration.playerEyeHeight;
+
+    minimum[0] = camera->position[0] - g_configuration.playerRadius;
+    maximum[0] = camera->position[0] + g_configuration.playerRadius;
+    minimum[1] = camera->position[1] - g_configuration.playerRadius;
+    maximum[1] = camera->position[1] + g_configuration.playerRadius;
+    minimum[2] = feet;
+    maximum[2] = feet + g_configuration.playerHeight;
+}
+
+static bool PlayerCollidesAt(World* world, const Camera* camera)
+{
+    double minimum[3];
+    double maximum[3];
+    GetPlayerBounds(camera, minimum, maximum);
+
+    int64_t minimumBlock[3];
+    int64_t maximumBlock[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        minimumBlock[axis] = FloorToInt64(minimum[axis] + COLLISION_EPSILON);
+        maximumBlock[axis] = FloorToInt64(maximum[axis] - COLLISION_EPSILON);
+    }
+
+    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
+    {
+        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
+        {
+            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
+            {
+                if (WorldGetBlock(world, x, y, z) != BLOCK_AIR)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool BlockPlaneCollides(World* world, int32_t axis, int64_t plane,
+    const double minimum[3], const double maximum[3])
+{
+    int64_t minimumBlock[3];
+    int64_t maximumBlock[3];
+    for (int32_t currentAxis = 0; currentAxis < 3; ++currentAxis)
+    {
+        minimumBlock[currentAxis] =
+            FloorToInt64(minimum[currentAxis] + COLLISION_EPSILON);
+        maximumBlock[currentAxis] =
+            FloorToInt64(maximum[currentAxis] - COLLISION_EPSILON);
+    }
+    minimumBlock[axis] = plane;
+    maximumBlock[axis] = plane;
+
+    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
+    {
+        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
+        {
+            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
+            {
+                if (WorldGetBlock(world, x, y, z) != BLOCK_AIR)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Движение AABB отдельно по каждой оси. Возвращает true при столкновении.
+// Проверяются все пересечённые плоскости блоков, поэтому большой deltaTime
+// не позволяет пролететь сквозь тонкую стену или пол.
+static bool MoveWalkingPlayerAxis(
+    ApplicationState* application, int32_t axis, double distance)
+{
+    if (distance == 0.0)
+    {
+        return false;
+    }
+
+    double oldMinimum[3];
+    double oldMaximum[3];
+    GetPlayerBounds(&application->camera, oldMinimum, oldMaximum);
+
+    Camera target = application->camera;
+    target.position[axis] += distance;
+
+    double newMinimum[3];
+    double newMaximum[3];
+    GetPlayerBounds(&target, newMinimum, newMaximum);
+
+    double negativeExtent = axis == 2
+        ? g_configuration.playerEyeHeight
+        : g_configuration.playerRadius;
+    double positiveExtent = axis == 2
+        ? g_configuration.playerHeight - g_configuration.playerEyeHeight
+        : g_configuration.playerRadius;
+
+    if (distance > 0.0)
+    {
+        int64_t firstPlane =
+            FloorToInt64(oldMaximum[axis] - COLLISION_EPSILON) + 1;
+        int64_t lastPlane =
+            FloorToInt64(newMaximum[axis] - COLLISION_EPSILON);
+
+        for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
+        {
+            if (BlockPlaneCollides(
+                    application->world, axis, plane, newMinimum, newMaximum))
+            {
+                application->camera.position[axis] =
+                    (double)plane - positiveExtent - COLLISION_EPSILON;
+                return true;
+            }
+        }
+    }
+    else
+    {
+        int64_t firstPlane =
+            FloorToInt64(oldMinimum[axis] + COLLISION_EPSILON) - 1;
+        int64_t lastPlane =
+            FloorToInt64(newMinimum[axis] + COLLISION_EPSILON);
+
+        for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
+        {
+            if (BlockPlaneCollides(
+                    application->world, axis, plane, newMinimum, newMaximum))
+            {
+                application->camera.position[axis] =
+                    (double)plane + 1.0 + negativeExtent + COLLISION_EPSILON;
+                return true;
+            }
+        }
+    }
+
+    application->camera.position[axis] = target.position[axis];
+    return false;
+}
+
+static bool ResolveWalkingPlayerPenetration(ApplicationState* application)
+{
+    // После переключения режима или телепорта новая область может оказаться
+    // внутри рельефа. Поднимаем игрока до первого свободного положения.
+    for (uint32_t step = 0; step < CHUNK_SIZE * 4u; ++step)
+    {
+        if (!PlayerCollidesAt(application->world, &application->camera))
+        {
+            return true;
+        }
+        application->camera.position[2] += 1.0;
+    }
+    return !PlayerCollidesAt(application->world, &application->camera);
+}
+
+static bool PlayerOverlapsBlock(
+    const ApplicationState* application, const int64_t block[3])
+{
+    if (application->gameMode != GAME_MODE_WALK)
+    {
+        return false;
+    }
+
+    double minimum[3];
+    double maximum[3];
+    GetPlayerBounds(&application->camera, minimum, maximum);
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double blockMinimum = (double)block[axis];
+        double blockMaximum = blockMinimum + 1.0;
+        if (maximum[axis] <= blockMinimum + COLLISION_EPSILON
+            || minimum[axis] >= blockMaximum - COLLISION_EPSILON)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void UpdateWalkingPlayer(ApplicationState* application,
+    float deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY)
+{
+    // CameraUpdate используется только для yaw/pitch; перемещение выполняет
+    // контроллер игрока с коллизиями.
+    CameraUpdate(&application->camera, deltaSeconds,
+        false, false, false, false, false,
+        mouseDeltaX, mouseDeltaY, 0.0f, g_configuration.mouseSensitivity);
+
+    float forwardInput =
+        (InputIsKeyDown(application->input, INPUT_KEY_W) ? 1.0f : 0.0f)
+        - (InputIsKeyDown(application->input, INPUT_KEY_S) ? 1.0f : 0.0f);
+    float rightInput =
+        (InputIsKeyDown(application->input, INPUT_KEY_D) ? 1.0f : 0.0f)
+        - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f);
+
+    if (forwardInput != 0.0f && rightInput != 0.0f)
+    {
+        forwardInput *= 0.70710678f;
+        rightInput *= 0.70710678f;
+    }
+
+    float sinYaw = ScalarSin(application->camera.yaw);
+    float cosYaw = ScalarCos(application->camera.yaw);
+    float movement = g_configuration.walkingSpeed * deltaSeconds;
+
+    double movementX = (double)(
+        (sinYaw * forwardInput + cosYaw * rightInput) * movement);
+    double movementY = (double)(
+        (cosYaw * forwardInput - sinYaw * rightInput) * movement);
+
+    MoveWalkingPlayerAxis(application, 0, movementX);
+    MoveWalkingPlayerAxis(application, 1, movementY);
+
+    if (application->grounded
+        && InputWasKeyPressed(application->input, INPUT_KEY_SPACE))
+    {
+        application->verticalVelocity = g_configuration.jumpSpeed;
+        application->grounded = false;
+    }
+
+    application->verticalVelocity -= g_configuration.gravity * deltaSeconds;
+    if (application->verticalVelocity < -g_configuration.maximumFallSpeed)
+    {
+        application->verticalVelocity = -g_configuration.maximumFallSpeed;
+    }
+
+    float previousVelocity = application->verticalVelocity;
+    bool verticalCollision = MoveWalkingPlayerAxis(application, 2,
+        (double)(application->verticalVelocity * deltaSeconds));
+    if (verticalCollision)
+    {
+        application->grounded = previousVelocity < 0.0f;
+        application->verticalVelocity = 0.0f;
+    }
+    else
+    {
+        application->grounded = false;
+    }
 }
 
 static int64_t CalculateChunkAlignedShift(double position)
@@ -161,6 +431,16 @@ static bool SquareAbsoluteX(ApplicationState* application)
 
     application->camera.position[0] =
         (double)squaredLocalBlockX + fractionalX;
+    if (application->gameMode == GAME_MODE_WALK)
+    {
+        application->verticalVelocity = 0.0f;
+        application->grounded = false;
+        if (!ResolveWalkingPlayerPenetration(application))
+        {
+            // Не оставляем камеру запертой внутри блоков.
+            application->gameMode = GAME_MODE_FLY;
+        }
+    }
     application->overlayDirty = true;
 
     int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
@@ -247,16 +527,19 @@ static void UpdateOverlay(ApplicationState* application,
         application->coordinateOverlayBlock[axis] = cameraBlockPosition[axis];
     }
 
-    wchar_t text[128] = L"";
+    wchar_t text[160] = L"";
     uint32_t length = 0;
-    AppendWideText(text, 128, &length, L"X: ");
-    AppendWideText(text, 128, &length, coordinate[0]);
-    AppendWideText(text, 128, &length, L"\r\nY: ");
-    AppendWideText(text, 128, &length, coordinate[1]);
-    AppendWideText(text, 128, &length, L"\r\nZ: ");
-    AppendWideText(text, 128, &length, coordinate[2]);
-    AppendWideText(text, 128, &length, L"\r\nFPS: ");
-    AppendUnsignedDecimal(text, 128, &length, application->framesPerSecond);
+    AppendWideText(text, 160, &length, L"X: ");
+    AppendWideText(text, 160, &length, coordinate[0]);
+    AppendWideText(text, 160, &length, L"\r\nY: ");
+    AppendWideText(text, 160, &length, coordinate[1]);
+    AppendWideText(text, 160, &length, L"\r\nZ: ");
+    AppendWideText(text, 160, &length, coordinate[2]);
+    AppendWideText(text, 160, &length, L"\r\nFPS: ");
+    AppendUnsignedDecimal(text, 160, &length, application->framesPerSecond);
+    AppendWideText(text, 160, &length, L"\r\nMode: ");
+    AppendWideText(text, 160, &length,
+        application->gameMode == GAME_MODE_WALK ? L"WALK" : L"FLY");
 
     WindowSetOverlayText(application->window, text);
     application->overlayDirty = false;
@@ -354,6 +637,11 @@ static void HandleBlockEditing(ApplicationState* application)
     }
     else
     {
+        if (PlayerOverlapsBlock(application, previousBlock))
+        {
+            return;
+        }
+
         WorldSetBlock(application->world, previousBlock[0], previousBlock[1], previousBlock[2], BLOCK_EARTH);
         ChunkStreamingInvalidateBlock(application->chunkStreaming, previousBlock[0], previousBlock[1], previousBlock[2]);
     }
@@ -387,6 +675,27 @@ static void OnFrame(void* userData)
     if (WindowConsumeFocusLoss(application->window))
     {
         InputResetState(application->input);
+    }
+
+    if (InputWasKeyPressed(application->input, INPUT_KEY_G))
+    {
+        if (application->gameMode == GAME_MODE_FLY)
+        {
+            application->gameMode = GAME_MODE_WALK;
+            application->verticalVelocity = 0.0f;
+            application->grounded = false;
+            if (!ResolveWalkingPlayerPenetration(application))
+            {
+                application->gameMode = GAME_MODE_FLY;
+            }
+        }
+        else
+        {
+            application->gameMode = GAME_MODE_FLY;
+            application->verticalVelocity = 0.0f;
+            application->grounded = false;
+        }
+        application->overlayDirty = true;
     }
 
     if (InputWasKeyPressed(application->input, INPUT_KEY_T))
@@ -429,14 +738,22 @@ static void OnFrame(void* userData)
         InputGetMouseDelta(application->input, &mouseDeltaX, &mouseDeltaY);
     }
 
-    CameraUpdate(&application->camera, deltaSeconds,
-        InputIsKeyDown(application->input, INPUT_KEY_W),
-        InputIsKeyDown(application->input, INPUT_KEY_A),
-        InputIsKeyDown(application->input, INPUT_KEY_S),
-        InputIsKeyDown(application->input, INPUT_KEY_D),
-        InputIsKeyDown(application->input, INPUT_KEY_SPACE),
-        mouseDeltaX, mouseDeltaY,
-        g_configuration.cameraSpeed, g_configuration.mouseSensitivity);
+    if (application->gameMode == GAME_MODE_WALK)
+    {
+        UpdateWalkingPlayer(
+            application, deltaSeconds, mouseDeltaX, mouseDeltaY);
+    }
+    else
+    {
+        CameraUpdate(&application->camera, deltaSeconds,
+            InputIsKeyDown(application->input, INPUT_KEY_W),
+            InputIsKeyDown(application->input, INPUT_KEY_A),
+            InputIsKeyDown(application->input, INPUT_KEY_S),
+            InputIsKeyDown(application->input, INPUT_KEY_D),
+            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
+            mouseDeltaX, mouseDeltaY,
+            g_configuration.cameraSpeed, g_configuration.mouseSensitivity);
+    }
 
     if (!RebaseWorldIfNeeded(application))
     {
@@ -558,6 +875,7 @@ LAIUE_CORE_API void Start(void)
         .previousTimeSeconds = startTimeSeconds,
         .fpsSampleStartSeconds = startTimeSeconds,
         .overlayDirty = true,
+        .gameMode = GAME_MODE_FLY,
     };
 
     // Камера стартует над рельефом и сразу смотрит немного вниз.
