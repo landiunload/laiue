@@ -19,12 +19,15 @@ typedef struct ApplicationConfiguration
     int32_t windowHeight;
     float cameraSpeed;
     float walkingSpeed;
+    float crouchingSpeed;
     float gravity;
     float jumpSpeed;
     float maximumFallSpeed;
     double playerRadius;
     double playerHeight;
     double playerEyeHeight;
+    double crouchingHeight;
+    double crouchingEyeHeight;
     float mouseSensitivity;
     float fieldOfViewRadians;
     float nearPlane;
@@ -42,12 +45,15 @@ static const ApplicationConfiguration g_configuration = {
     .windowHeight = 360,
     .cameraSpeed = 80.0f,
     .walkingSpeed = 7.0f,
+    .crouchingSpeed = 3.5f,
     .gravity = 26.0f,
     .jumpSpeed = 9.0f,
     .maximumFallSpeed = 55.0f,
     .playerRadius = 0.30,
     .playerHeight = 1.80,
-    .playerEyeHeight = 1.62,
+    .playerEyeHeight = 1.75,
+    .crouchingHeight = 1.30,
+    .crouchingEyeHeight = 1.25,
     .mouseSensitivity = 0.0025f,
     .fieldOfViewRadians = 1.047197f,
     .nearPlane = 0.1f,
@@ -84,6 +90,7 @@ typedef struct ApplicationState
     GameMode gameMode;
     float verticalVelocity;
     bool grounded;
+    bool crouching;
 } ApplicationState;
 
 // Адаптер сигнатуры: окно передаёт userData + HRAWINPUT,
@@ -101,24 +108,39 @@ static int64_t FloorToInt64(double value)
 
 #define COLLISION_EPSILON 0.001
 
-static void GetPlayerBounds(const Camera* camera,
-    double minimum[3], double maximum[3])
+static double ActivePlayerHeight(const ApplicationState* application)
 {
-    double feet = camera->position[2] - g_configuration.playerEyeHeight;
+    return application->crouching
+        ? g_configuration.crouchingHeight
+        : g_configuration.playerHeight;
+}
+
+static double ActivePlayerEyeHeight(const ApplicationState* application)
+{
+    return application->crouching
+        ? g_configuration.crouchingEyeHeight
+        : g_configuration.playerEyeHeight;
+}
+
+static void GetPlayerBounds(const ApplicationState* application,
+    const Camera* camera, double minimum[3], double maximum[3])
+{
+    double feet = camera->position[2] - ActivePlayerEyeHeight(application);
 
     minimum[0] = camera->position[0] - g_configuration.playerRadius;
     maximum[0] = camera->position[0] + g_configuration.playerRadius;
     minimum[1] = camera->position[1] - g_configuration.playerRadius;
     maximum[1] = camera->position[1] + g_configuration.playerRadius;
     minimum[2] = feet;
-    maximum[2] = feet + g_configuration.playerHeight;
+    maximum[2] = feet + ActivePlayerHeight(application);
 }
 
-static bool PlayerCollidesAt(World* world, const Camera* camera)
+static bool PlayerCollidesAt(const ApplicationState* application,
+    const Camera* camera)
 {
     double minimum[3];
     double maximum[3];
-    GetPlayerBounds(camera, minimum, maximum);
+    GetPlayerBounds(application, camera, minimum, maximum);
 
     int64_t minimumBlock[3];
     int64_t maximumBlock[3];
@@ -134,7 +156,7 @@ static bool PlayerCollidesAt(World* world, const Camera* camera)
         {
             for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
             {
-                if (WorldGetBlock(world, x, y, z) != BLOCK_AIR)
+                if (WorldGetBlock(application->world, x, y, z) != BLOCK_AIR)
                 {
                     return true;
                 }
@@ -142,6 +164,33 @@ static bool PlayerCollidesAt(World* world, const Camera* camera)
         }
     }
     return false;
+}
+
+static bool TrySetPlayerCrouching(
+    ApplicationState* application, bool crouching)
+{
+    if (application->crouching == crouching)
+    {
+        return true;
+    }
+
+    bool previousCrouching = application->crouching;
+    double previousEyeHeight = ActivePlayerEyeHeight(application);
+    double feet = application->camera.position[2] - previousEyeHeight;
+
+    application->crouching = crouching;
+    application->camera.position[2] =
+        feet + ActivePlayerEyeHeight(application);
+
+    if (!crouching && PlayerCollidesAt(application, &application->camera))
+    {
+        application->crouching = previousCrouching;
+        application->camera.position[2] = feet + previousEyeHeight;
+        return false;
+    }
+
+    application->overlayDirty = true;
+    return true;
 }
 
 static bool BlockPlaneCollides(World* world, int32_t axis, int64_t plane,
@@ -188,20 +237,20 @@ static bool MoveWalkingPlayerAxis(
 
     double oldMinimum[3];
     double oldMaximum[3];
-    GetPlayerBounds(&application->camera, oldMinimum, oldMaximum);
+    GetPlayerBounds(application, &application->camera, oldMinimum, oldMaximum);
 
     Camera target = application->camera;
     target.position[axis] += distance;
 
     double newMinimum[3];
     double newMaximum[3];
-    GetPlayerBounds(&target, newMinimum, newMaximum);
+    GetPlayerBounds(application, &target, newMinimum, newMaximum);
 
     double negativeExtent = axis == 2
-        ? g_configuration.playerEyeHeight
+        ? ActivePlayerEyeHeight(application)
         : g_configuration.playerRadius;
     double positiveExtent = axis == 2
-        ? g_configuration.playerHeight - g_configuration.playerEyeHeight
+        ? ActivePlayerHeight(application) - ActivePlayerEyeHeight(application)
         : g_configuration.playerRadius;
 
     if (distance > 0.0)
@@ -251,13 +300,13 @@ static bool ResolveWalkingPlayerPenetration(ApplicationState* application)
     // внутри рельефа. Поднимаем игрока до первого свободного положения.
     for (uint32_t step = 0; step < CHUNK_SIZE * 4u; ++step)
     {
-        if (!PlayerCollidesAt(application->world, &application->camera))
+        if (!PlayerCollidesAt(application, &application->camera))
         {
             return true;
         }
         application->camera.position[2] += 1.0;
     }
-    return !PlayerCollidesAt(application->world, &application->camera);
+    return !PlayerCollidesAt(application, &application->camera);
 }
 
 static bool PlayerOverlapsBlock(
@@ -270,7 +319,7 @@ static bool PlayerOverlapsBlock(
 
     double minimum[3];
     double maximum[3];
-    GetPlayerBounds(&application->camera, minimum, maximum);
+    GetPlayerBounds(application, &application->camera, minimum, maximum);
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
@@ -288,6 +337,9 @@ static bool PlayerOverlapsBlock(
 static void UpdateWalkingPlayer(ApplicationState* application,
     float deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY)
 {
+    TrySetPlayerCrouching(application,
+        InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
+
     // CameraUpdate используется только для yaw/pitch; перемещение выполняет
     // контроллер игрока с коллизиями.
     CameraUpdate(&application->camera, deltaSeconds,
@@ -309,7 +361,10 @@ static void UpdateWalkingPlayer(ApplicationState* application,
 
     float sinYaw = ScalarSin(application->camera.yaw);
     float cosYaw = ScalarCos(application->camera.yaw);
-    float movement = g_configuration.walkingSpeed * deltaSeconds;
+    float movementSpeed = application->crouching
+        ? g_configuration.crouchingSpeed
+        : g_configuration.walkingSpeed;
+    float movement = movementSpeed * deltaSeconds;
 
     double movementX = (double)(
         (sinYaw * forwardInput + cosYaw * rightInput) * movement);
@@ -319,7 +374,7 @@ static void UpdateWalkingPlayer(ApplicationState* application,
     MoveWalkingPlayerAxis(application, 0, movementX);
     MoveWalkingPlayerAxis(application, 1, movementY);
 
-    if (application->grounded
+    if (application->grounded && !application->crouching
         && InputWasKeyPressed(application->input, INPUT_KEY_SPACE))
     {
         application->verticalVelocity = g_configuration.jumpSpeed;
@@ -539,7 +594,9 @@ static void UpdateOverlay(ApplicationState* application,
     AppendUnsignedDecimal(text, 160, &length, application->framesPerSecond);
     AppendWideText(text, 160, &length, L"\r\nMode: ");
     AppendWideText(text, 160, &length,
-        application->gameMode == GAME_MODE_WALK ? L"WALK" : L"FLY");
+        application->gameMode == GAME_MODE_FLY
+            ? L"FLY"
+            : (application->crouching ? L"CROUCH" : L"WALK"));
 
     WindowSetOverlayText(application->window, text);
     application->overlayDirty = false;
@@ -684,6 +741,7 @@ static void OnFrame(void* userData)
             application->gameMode = GAME_MODE_WALK;
             application->verticalVelocity = 0.0f;
             application->grounded = false;
+            application->crouching = false;
             if (!ResolveWalkingPlayerPenetration(application))
             {
                 application->gameMode = GAME_MODE_FLY;
@@ -694,6 +752,7 @@ static void OnFrame(void* userData)
             application->gameMode = GAME_MODE_FLY;
             application->verticalVelocity = 0.0f;
             application->grounded = false;
+            application->crouching = false;
         }
         application->overlayDirty = true;
     }
