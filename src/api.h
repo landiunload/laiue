@@ -38,3 +38,9 @@
 #else
 #define LAIUE_RENDER_API __declspec(dllimport)
 #endif
+
+#if defined(LAIUE_BUILD_PHYSICS)
+#define LAIUE_PHYSICS_API __declspec(dllexport)
+#else
+#define LAIUE_PHYSICS_API __declspec(dllimport)
+#endif

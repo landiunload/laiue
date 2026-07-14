@@ -4,26 +4,23 @@
 #include <stdint.h>
 
 #include "game/camera.h"
+#include "physics/voxel_body.h"
 
-typedef bool (*PlayerSolidBlockQuery)(
-    void* context, int64_t x, int64_t y, int64_t z);
-
-typedef struct PlayerCollisionSource
-{
-    void* context;
-    PlayerSolidBlockQuery isSolidBlock;
-} PlayerCollisionSource;
+typedef VoxelSolidBlockQuery PlayerSolidBlockQuery;
+typedef VoxelCollisionSource PlayerCollisionSource;
 
 typedef struct PlayerControllerConfig
 {
     float walkingSpeed;
     float crouchingSpeed;
     float gravity;
-    float jumpSpeed;
     float maximumFallSpeed;
     float jumpBufferSeconds;
     float coyoteTimeSeconds;
     float externalVelocityDamping;
+    float fixedStepSeconds;
+    uint32_t maximumSubsteps;
+    double jumpHeight;
     double radius;
     double standingHeight;
     double standingEyeHeight;
@@ -31,6 +28,7 @@ typedef struct PlayerControllerConfig
     double crouchingEyeHeight;
     double collisionEpsilon;
     double groundProbeDepth;
+    double ledgeSupportRadius;
 } PlayerControllerConfig;
 
 typedef struct PlayerControllerCommand
@@ -38,19 +36,23 @@ typedef struct PlayerControllerCommand
     float forward;
     float right;
     bool jumpPressed;
+    bool jumpHeld;
     bool crouchHeld;
 } PlayerControllerCommand;
 
 typedef struct PlayerController
 {
     PlayerControllerConfig config;
-    float verticalVelocity;
-    float externalVelocityX;
-    float externalVelocityY;
-    float jumpBufferRemaining;
-    float coyoteTimeRemaining;
+    double verticalVelocity;
+    double externalVelocityX;
+    double externalVelocityY;
+    double jumpBufferRemaining;
+    double coyoteTimeRemaining;
+    double simulationAccumulator;
+    double jumpLaunchSpeed;
     bool grounded;
     bool crouching;
+    bool jumpHeldPrevious;
 } PlayerController;
 
 void PlayerControllerInit(

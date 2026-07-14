@@ -289,6 +289,8 @@ static void UpdatePlayer(ApplicationState* application,
             - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f),
         .jumpPressed =
             InputWasKeyPressed(application->input, INPUT_KEY_SPACE),
+        .jumpHeld =
+            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
         .crouchHeld =
             InputIsKeyDown(application->input, INPUT_KEY_SHIFT),
     };

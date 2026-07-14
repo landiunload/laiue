@@ -1,0 +1,985 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b1a5923..be9d480 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,6 +20,7 @@ add_subdirectory(src/input)
+ add_subdirectory(src/world)
+ add_subdirectory(src/mesh)
+ add_subdirectory(src/render)
++add_subdirectory(src/physics)
+ add_subdirectory(src/core)
+ 
+ add_executable(laiue WIN32 src/launcher/main.c)
+diff --git a/src/api.h b/src/api.h
+index 61cb5ee..8d1b6d0 100644
+--- a/src/api.h
++++ b/src/api.h
+@@ -38,3 +38,9 @@
+ #else
+ #define LAIUE_RENDER_API __declspec(dllimport)
+ #endif
++
++#if defined(LAIUE_BUILD_PHYSICS)
++#define LAIUE_PHYSICS_API __declspec(dllexport)
++#else
++#define LAIUE_PHYSICS_API __declspec(dllimport)
++#endif
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 3ca8964..d8a5886 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -14,7 +14,7 @@ laiue_add_module(core
+         ../game/camera.h
+         ../game/game_events.h
+         ../game/game_mode.h
+-        ../game/player_controller.c
++        ../game/player_controller_impl.c
+         ../game/player_controller.h
+         ../game/voxel_interaction.c
+         ../game/voxel_interaction.h
+@@ -25,4 +25,5 @@ laiue_add_module(core
+         laiue_world
+         laiue_mesher
+         laiue_render
++        laiue_physics
+ )
+diff --git a/src/core/application.c b/src/core/application.c
+index 26cca44..b6440e7 100644
+--- a/src/core/application.c
++++ b/src/core/application.c
+@@ -16,6 +16,8 @@ static void UpdatePlayer(ApplicationState* application,
+             - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f),
+         .jumpPressed =
+             InputWasKeyPressed(application->input, INPUT_KEY_SPACE),
++        .jumpHeld =
++            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
+         .crouchHeld =
+             InputIsKeyDown(application->input, INPUT_KEY_SHIFT),
+     };
+diff --git a/src/core/application_config.c b/src/core/application_config.c
+index 94857ca..6120cbe 100644
+--- a/src/core/application_config.c
++++ b/src/core/application_config.c
+@@ -18,11 +18,13 @@ const ApplicationConfiguration g_applicationConfiguration = {
+         .walkingSpeed = 7.0f,
+         .crouchingSpeed = 3.5f,
+         .gravity = 26.0f,
+-        .jumpSpeed = 9.0f,
+         .maximumFallSpeed = 55.0f,
+         .jumpBufferSeconds = 0.14f,
+         .coyoteTimeSeconds = 0.10f,
+         .externalVelocityDamping = 8.0f,
++        .fixedStepSeconds = 1.0f / 240.0f,
++        .maximumSubsteps = 32u,
++        .jumpHeight = 1.275,
+         .radius = 0.30,
+         .standingHeight = 1.80,
+         .standingEyeHeight = 1.75,
+@@ -30,5 +32,6 @@ const ApplicationConfiguration g_applicationConfiguration = {
+         .crouchingEyeHeight = 1.25,
+         .collisionEpsilon = 0.001,
+         .groundProbeDepth = 0.03,
++        .ledgeSupportRadius = 0.05,
+     },
+ };
+diff --git a/src/game/player_controller.h b/src/game/player_controller.h
+index a1b8f00..3935f9a 100644
+--- a/src/game/player_controller.h
++++ b/src/game/player_controller.h
+@@ -4,26 +4,23 @@
+ #include <stdint.h>
+ 
+ #include "game/camera.h"
++#include "physics/voxel_body.h"
+ 
+-typedef bool (*PlayerSolidBlockQuery)(
+-    void* context, int64_t x, int64_t y, int64_t z);
+-
+-typedef struct PlayerCollisionSource
+-{
+-    void* context;
+-    PlayerSolidBlockQuery isSolidBlock;
+-} PlayerCollisionSource;
++typedef VoxelSolidBlockQuery PlayerSolidBlockQuery;
++typedef VoxelCollisionSource PlayerCollisionSource;
+ 
+ typedef struct PlayerControllerConfig
+ {
+     float walkingSpeed;
+     float crouchingSpeed;
+     float gravity;
+-    float jumpSpeed;
+     float maximumFallSpeed;
+     float jumpBufferSeconds;
+     float coyoteTimeSeconds;
+     float externalVelocityDamping;
++    float fixedStepSeconds;
++    uint32_t maximumSubsteps;
++    double jumpHeight;
+     double radius;
+     double standingHeight;
+     double standingEyeHeight;
+@@ -31,6 +28,7 @@ typedef struct PlayerControllerConfig
+     double crouchingEyeHeight;
+     double collisionEpsilon;
+     double groundProbeDepth;
++    double ledgeSupportRadius;
+ } PlayerControllerConfig;
+ 
+ typedef struct PlayerControllerCommand
+@@ -38,19 +36,23 @@ typedef struct PlayerControllerCommand
+     float forward;
+     float right;
+     bool jumpPressed;
++    bool jumpHeld;
+     bool crouchHeld;
+ } PlayerControllerCommand;
+ 
+ typedef struct PlayerController
+ {
+     PlayerControllerConfig config;
+-    float verticalVelocity;
+-    float externalVelocityX;
+-    float externalVelocityY;
+-    float jumpBufferRemaining;
+-    float coyoteTimeRemaining;
++    double verticalVelocity;
++    double externalVelocityX;
++    double externalVelocityY;
++    double jumpBufferRemaining;
++    double coyoteTimeRemaining;
++    double simulationAccumulator;
++    double jumpLaunchSpeed;
+     bool grounded;
+     bool crouching;
++    bool jumpHeldPrevious;
+ } PlayerController;
+ 
+ void PlayerControllerInit(
+diff --git a/src/game/player_controller_impl.c b/src/game/player_controller_impl.c
+new file mode 100644
+index 0000000..5ab8275
+--- /dev/null
++++ b/src/game/player_controller_impl.c
+@@ -0,0 +1,490 @@
++#include "game/player_controller.h"
++
++#include "core/math.h"
++
++#define PLAYER_PENETRATION_STEPS 256u
++#define LEDGE_SEARCH_ITERATIONS 24u
++
++static double PositiveSquareRoot(double value)
++{
++    if (value <= 0.0)
++    {
++        return 0.0;
++    }
++
++    double estimate = value >= 1.0 ? value : 1.0;
++    for (uint32_t iteration = 0; iteration < 16u; ++iteration)
++    {
++        estimate = 0.5 * (estimate + value / estimate);
++    }
++    return estimate;
++}
++
++static double ActiveHeight(const PlayerController* controller)
++{
++    return controller->crouching
++        ? controller->config.crouchingHeight
++        : controller->config.standingHeight;
++}
++
++static double ActiveEyeHeight(const PlayerController* controller)
++{
++    return controller->crouching
++        ? controller->config.crouchingEyeHeight
++        : controller->config.standingEyeHeight;
++}
++
++static VoxelBodyShape ActiveShape(const PlayerController* controller)
++{
++    VoxelBodyShape shape = {
++        .radius = controller->config.radius,
++        .height = ActiveHeight(controller),
++        .eyeHeight = ActiveEyeHeight(controller),
++        .collisionEpsilon = controller->config.collisionEpsilon,
++    };
++    return shape;
++}
++
++static bool HasGroundContact(const PlayerController* controller,
++    const PlayerCollisionSource* collision, const Camera* camera)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    return VoxelBodyHasGroundContact(collision, camera->position,
++        &shape, controller->config.groundProbeDepth);
++}
++
++static bool HasStableGround(const PlayerController* controller,
++    const PlayerCollisionSource* collision, const Camera* camera)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    return VoxelBodyHasStableGround(collision, camera->position,
++        &shape, controller->config.groundProbeDepth,
++        controller->config.ledgeSupportRadius);
++}
++
++static bool TrySetCrouching(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera, bool crouching)
++{
++    if (controller->crouching == crouching)
++    {
++        return false;
++    }
++
++    bool previousCrouching = controller->crouching;
++    double previousEyeHeight = ActiveEyeHeight(controller);
++    double feet = camera->position[2] - previousEyeHeight;
++
++    controller->crouching = crouching;
++    camera->position[2] = feet + ActiveEyeHeight(controller);
++
++    VoxelBodyShape shape = ActiveShape(controller);
++    if (!crouching
++        && VoxelBodyCollides(collision, camera->position, &shape))
++    {
++        controller->crouching = previousCrouching;
++        camera->position[2] = feet + previousEyeHeight;
++        return false;
++    }
++    return true;
++}
++
++static void MoveVoluntaryAxisWithLedgeGuard(
++    PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    int32_t axis, double distance)
++{
++    if (distance == 0.0)
++    {
++        return;
++    }
++
++    bool guardEdge = controller->crouching
++        && controller->grounded
++        && HasStableGround(controller, collision, camera);
++    double start = camera->position[axis];
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    VoxelBodyMoveAxis(
++        collision, camera->position, &shape, axis, distance);
++
++    if (!guardEdge || HasStableGround(controller, collision, camera))
++    {
++        return;
++    }
++
++    double allowed = start;
++    double denied = camera->position[axis];
++    for (uint32_t iteration = 0;
++         iteration < LEDGE_SEARCH_ITERATIONS; ++iteration)
++    {
++        double middle = (allowed + denied) * 0.5;
++        camera->position[axis] = middle;
++        if (HasStableGround(controller, collision, camera))
++        {
++            allowed = middle;
++        }
++        else
++        {
++            denied = middle;
++        }
++    }
++    camera->position[axis] = allowed;
++}
++
++static void LatchJumpInput(PlayerController* controller,
++    const PlayerControllerCommand* command)
++{
++    bool risingHeld = command->jumpHeld
++        && !controller->jumpHeldPrevious;
++    controller->jumpHeldPrevious = command->jumpHeld;
++
++    if (command->jumpPressed || risingHeld)
++    {
++        controller->jumpBufferRemaining =
++            controller->config.jumpBufferSeconds;
++    }
++}
++
++static void UpdateGroundStateAtStepStart(PlayerController* controller,
++    const PlayerCollisionSource* collision, const Camera* camera,
++    double stepSeconds)
++{
++    bool supported = HasGroundContact(controller, collision, camera);
++    if (supported && controller->verticalVelocity <= 0.0)
++    {
++        controller->grounded = true;
++        controller->verticalVelocity = 0.0;
++        controller->coyoteTimeRemaining =
++            controller->config.coyoteTimeSeconds;
++        return;
++    }
++
++    controller->grounded = false;
++    controller->coyoteTimeRemaining -= stepSeconds;
++    if (controller->coyoteTimeRemaining < 0.0)
++    {
++        controller->coyoteTimeRemaining = 0.0;
++    }
++}
++
++static bool TryStartJump(PlayerController* controller)
++{
++    if (controller->crouching
++        || controller->jumpBufferRemaining <= 0.0
++        || controller->coyoteTimeRemaining <= 0.0)
++    {
++        return false;
++    }
++
++    controller->verticalVelocity = controller->jumpLaunchSpeed;
++    controller->jumpBufferRemaining = 0.0;
++    controller->coyoteTimeRemaining = 0.0;
++    controller->grounded = false;
++    return true;
++}
++
++static void MoveHorizontal(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, float yaw,
++    double stepSeconds)
++{
++    float forward = command->forward;
++    float right = command->right;
++    if (forward != 0.0f && right != 0.0f)
++    {
++        forward *= 0.70710678f;
++        right *= 0.70710678f;
++    }
++
++    float sinYaw = ScalarSin(yaw);
++    float cosYaw = ScalarCos(yaw);
++    double speed = controller->crouching
++        ? controller->config.crouchingSpeed
++        : controller->config.walkingSpeed;
++    double movement = speed * stepSeconds;
++    double movementX =
++        (double)(sinYaw * forward + cosYaw * right) * movement;
++    double movementY =
++        (double)(cosYaw * forward - sinYaw * right) * movement;
++
++    MoveVoluntaryAxisWithLedgeGuard(
++        controller, collision, camera, 0, movementX);
++    MoveVoluntaryAxisWithLedgeGuard(
++        controller, collision, camera, 1, movementY);
++}
++
++static void MoveExternalVelocity(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    double stepSeconds)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    if (controller->externalVelocityX != 0.0
++        && VoxelBodyMoveAxis(collision, camera->position, &shape, 0,
++            controller->externalVelocityX * stepSeconds))
++    {
++        controller->externalVelocityX = 0.0;
++    }
++    if (controller->externalVelocityY != 0.0
++        && VoxelBodyMoveAxis(collision, camera->position, &shape, 1,
++            controller->externalVelocityY * stepSeconds))
++    {
++        controller->externalVelocityY = 0.0;
++    }
++
++    double damping = 1.0
++        - (double)controller->config.externalVelocityDamping * stepSeconds;
++    if (damping < 0.0)
++    {
++        damping = 0.0;
++    }
++    controller->externalVelocityX *= damping;
++    controller->externalVelocityY *= damping;
++}
++
++// Возвращает true, когда за этот шаг достигнута точная вершина прыжка.
++static bool IntegrateVertical(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    double stepSeconds)
++{
++    if (controller->grounded && controller->verticalVelocity == 0.0)
++    {
++        return false;
++    }
++
++    double gravity = controller->config.gravity;
++    double maximumFallSpeed = controller->config.maximumFallSpeed;
++    double oldVelocity = controller->verticalVelocity;
++    if (oldVelocity < -maximumFallSpeed)
++    {
++        oldVelocity = -maximumFallSpeed;
++    }
++    double newVelocity = oldVelocity - gravity * stepSeconds;
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    if (oldVelocity > 0.0 && newVelocity <= 0.0)
++    {
++        double timeToApex = oldVelocity / gravity;
++        double distanceToApex = oldVelocity * timeToApex
++            - 0.5 * gravity * timeToApex * timeToApex;
++
++        if (VoxelBodyMoveAxis(collision, camera->position, &shape, 2,
++                distanceToApex))
++        {
++            controller->verticalVelocity = 0.0;
++            return false;
++        }
++
++        // Кадр обязательно увидит вершину. Остаток одного fixed-step
++        // сознательно отбрасывается: это не больше 1/240 секунды.
++        controller->verticalVelocity = 0.0;
++        controller->grounded = false;
++        return true;
++    }
++
++    double distance;
++    if (newVelocity < -maximumFallSpeed)
++    {
++        double timeToTerminal =
++            (oldVelocity + maximumFallSpeed) / gravity;
++        if (timeToTerminal < 0.0)
++        {
++            timeToTerminal = 0.0;
++        }
++        if (timeToTerminal > stepSeconds)
++        {
++            timeToTerminal = stepSeconds;
++        }
++        distance = oldVelocity * timeToTerminal
++            - 0.5 * gravity * timeToTerminal * timeToTerminal
++            - maximumFallSpeed * (stepSeconds - timeToTerminal);
++        newVelocity = -maximumFallSpeed;
++    }
++    else
++    {
++        distance = oldVelocity * stepSeconds
++            - 0.5 * gravity * stepSeconds * stepSeconds;
++    }
++
++    if (VoxelBodyMoveAxis(collision, camera->position, &shape, 2, distance))
++    {
++        controller->grounded = distance < 0.0;
++        controller->verticalVelocity = 0.0;
++        return false;
++    }
++
++    controller->verticalVelocity = newVelocity;
++    return false;
++}
++
++static bool SimulateStep(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, float yaw,
++    double stepSeconds)
++{
++    UpdateGroundStateAtStepStart(
++        controller, collision, camera, stepSeconds);
++    bool jumped = TryStartJump(controller);
++
++    MoveHorizontal(controller, collision, camera,
++        command, yaw, stepSeconds);
++    MoveExternalVelocity(controller, collision, camera, stepSeconds);
++
++    bool reachedApex = IntegrateVertical(
++        controller, collision, camera, stepSeconds);
++
++    if (!jumped && controller->jumpBufferRemaining > 0.0)
++    {
++        controller->jumpBufferRemaining -= stepSeconds;
++        if (controller->jumpBufferRemaining < 0.0)
++        {
++            controller->jumpBufferRemaining = 0.0;
++        }
++    }
++
++    if (controller->verticalVelocity <= 0.0
++        && HasGroundContact(controller, collision, camera))
++    {
++        controller->grounded = true;
++        controller->verticalVelocity = 0.0;
++    }
++    else if (controller->verticalVelocity != 0.0)
++    {
++        controller->grounded = false;
++    }
++
++    return reachedApex;
++}
++
++void PlayerControllerInit(PlayerController* controller,
++    const PlayerControllerConfig* config)
++{
++    controller->config = *config;
++    controller->verticalVelocity = 0.0;
++    controller->externalVelocityX = 0.0;
++    controller->externalVelocityY = 0.0;
++    controller->jumpBufferRemaining = 0.0;
++    controller->coyoteTimeRemaining = 0.0;
++    controller->simulationAccumulator = 0.0;
++    controller->jumpLaunchSpeed = PositiveSquareRoot(
++        2.0 * (double)config->gravity * config->jumpHeight);
++    controller->grounded = false;
++    controller->crouching = false;
++    controller->jumpHeldPrevious = false;
++}
++
++void PlayerControllerReset(PlayerController* controller, Camera* camera)
++{
++    if (controller->crouching)
++    {
++        double feet = camera->position[2]
++            - controller->config.crouchingEyeHeight;
++        camera->position[2] =
++            feet + controller->config.standingEyeHeight;
++    }
++
++    controller->verticalVelocity = 0.0;
++    controller->externalVelocityX = 0.0;
++    controller->externalVelocityY = 0.0;
++    controller->jumpBufferRemaining = 0.0;
++    controller->coyoteTimeRemaining = 0.0;
++    controller->simulationAccumulator = 0.0;
++    controller->grounded = false;
++    controller->crouching = false;
++    controller->jumpHeldPrevious = false;
++}
++
++bool PlayerControllerUpdate(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command,
++    float yaw, float deltaSeconds)
++{
++    bool presentationChanged = TrySetCrouching(
++        controller, collision, camera, command->crouchHeld);
++    LatchJumpInput(controller, command);
++
++    double fixedStep = controller->config.fixedStepSeconds;
++    if (fixedStep <= 0.0)
++    {
++        fixedStep = 1.0 / 240.0;
++    }
++    uint32_t maximumSubsteps = controller->config.maximumSubsteps;
++    if (maximumSubsteps == 0u)
++    {
++        maximumSubsteps = 32u;
++    }
++
++    if (deltaSeconds > 0.0f)
++    {
++        controller->simulationAccumulator += deltaSeconds;
++    }
++    double maximumAccumulator = fixedStep * (double)maximumSubsteps;
++    if (controller->simulationAccumulator > maximumAccumulator)
++    {
++        controller->simulationAccumulator = maximumAccumulator;
++    }
++
++    uint32_t substep = 0;
++    while (controller->simulationAccumulator + 1e-12 >= fixedStep
++        && substep < maximumSubsteps)
++    {
++        controller->simulationAccumulator -= fixedStep;
++        bool reachedApex = SimulateStep(controller,
++            collision, camera, command, yaw, fixedStep);
++        ++substep;
++
++        // Не проглатываем точную вершину несколькими catch-up шагами
++        // в одном отрисованном кадре.
++        if (reachedApex)
++        {
++            break;
++        }
++    }
++
++    return presentationChanged;
++}
++
++bool PlayerControllerResolvePenetration(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    for (uint32_t step = 0; step < PLAYER_PENETRATION_STEPS; ++step)
++    {
++        if (!VoxelBodyCollides(collision, camera->position, &shape))
++        {
++            return true;
++        }
++        camera->position[2] += 1.0;
++    }
++    return !VoxelBodyCollides(collision, camera->position, &shape);
++}
++
++bool PlayerControllerOverlapsBlock(const PlayerController* controller,
++    const Camera* camera, const int64_t block[3])
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    return VoxelBodyOverlapsBlock(camera->position, &shape, block);
++}
++
++bool PlayerControllerIsGrounded(const PlayerController* controller)
++{
++    return controller->grounded;
++}
++
++bool PlayerControllerIsCrouching(const PlayerController* controller)
++{
++    return controller->crouching;
++}
++
++void PlayerControllerApplyImpulse(PlayerController* controller,
++    float x, float y, float z)
++{
++    controller->externalVelocityX += x;
++    controller->externalVelocityY += y;
++    controller->verticalVelocity += z;
++    if (z > 0.0f)
++    {
++        controller->grounded = false;
++        controller->coyoteTimeRemaining = 0.0;
++    }
++}
+diff --git a/src/physics/CMakeLists.txt b/src/physics/CMakeLists.txt
+new file mode 100644
+index 0000000..04dbeca
+--- /dev/null
++++ b/src/physics/CMakeLists.txt
+@@ -0,0 +1,6 @@
++laiue_add_module(physics
++    SOURCES
++        voxel_body.c
++        voxel_body.h
++        ../api.h
++)
+diff --git a/src/physics/voxel_body.c b/src/physics/voxel_body.c
+new file mode 100644
+index 0000000..3e57e51
+--- /dev/null
++++ b/src/physics/voxel_body.c
+@@ -0,0 +1,247 @@
++#include "physics/voxel_body.h"
++
++static int64_t FloorToInt64(double value)
++{
++    int64_t truncated = (int64_t)value;
++    return (double)truncated > value ? truncated - 1 : truncated;
++}
++
++void VoxelBodyCalculateBounds(const double position[3],
++    const VoxelBodyShape* shape, VoxelBodyBounds* outBounds)
++{
++    double feet = position[2] - shape->eyeHeight;
++
++    outBounds->minimum[0] = position[0] - shape->radius;
++    outBounds->maximum[0] = position[0] + shape->radius;
++    outBounds->minimum[1] = position[1] - shape->radius;
++    outBounds->maximum[1] = position[1] + shape->radius;
++    outBounds->minimum[2] = feet;
++    outBounds->maximum[2] = feet + shape->height;
++}
++
++static bool BoundsContainSolidBlock(
++    const VoxelCollisionSource* collision,
++    const VoxelBodyShape* shape, const VoxelBodyBounds* bounds)
++{
++    int64_t minimumBlock[3];
++    int64_t maximumBlock[3];
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        minimumBlock[axis] = FloorToInt64(
++            bounds->minimum[axis] + shape->collisionEpsilon);
++        maximumBlock[axis] = FloorToInt64(
++            bounds->maximum[axis] - shape->collisionEpsilon);
++    }
++
++    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
++    {
++        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
++        {
++            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
++            {
++                if (collision->isSolidBlock(collision->context, x, y, z))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++bool VoxelBodyCollides(const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape)
++{
++    VoxelBodyBounds bounds;
++    VoxelBodyCalculateBounds(position, shape, &bounds);
++    return BoundsContainSolidBlock(collision, shape, &bounds);
++}
++
++static bool BlockPlaneCollides(
++    const VoxelCollisionSource* collision,
++    const VoxelBodyShape* shape, int32_t axis, int64_t plane,
++    const VoxelBodyBounds* bounds)
++{
++    int64_t minimumBlock[3];
++    int64_t maximumBlock[3];
++
++    for (int32_t currentAxis = 0; currentAxis < 3; ++currentAxis)
++    {
++        minimumBlock[currentAxis] = FloorToInt64(
++            bounds->minimum[currentAxis] + shape->collisionEpsilon);
++        maximumBlock[currentAxis] = FloorToInt64(
++            bounds->maximum[currentAxis] - shape->collisionEpsilon);
++    }
++    minimumBlock[axis] = plane;
++    maximumBlock[axis] = plane;
++
++    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
++    {
++        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
++        {
++            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
++            {
++                if (collision->isSolidBlock(collision->context, x, y, z))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
++    double position[3], const VoxelBodyShape* shape,
++    int32_t axis, double distance)
++{
++    if (distance == 0.0)
++    {
++        return false;
++    }
++
++    VoxelBodyBounds oldBounds;
++    VoxelBodyCalculateBounds(position, shape, &oldBounds);
++
++    double targetPosition[3] = {
++        position[0], position[1], position[2]
++    };
++    targetPosition[axis] += distance;
++
++    VoxelBodyBounds newBounds;
++    VoxelBodyCalculateBounds(targetPosition, shape, &newBounds);
++
++    double negativeExtent = axis == 2
++        ? shape->eyeHeight
++        : shape->radius;
++    double positiveExtent = axis == 2
++        ? shape->height - shape->eyeHeight
++        : shape->radius;
++    double epsilon = shape->collisionEpsilon;
++
++    if (distance > 0.0)
++    {
++        int64_t firstPlane =
++            FloorToInt64(oldBounds.maximum[axis] - epsilon) + 1;
++        int64_t lastPlane =
++            FloorToInt64(newBounds.maximum[axis] - epsilon);
++
++        for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
++        {
++            if (BlockPlaneCollides(
++                    collision, shape, axis, plane, &newBounds))
++            {
++                position[axis] =
++                    (double)plane - positiveExtent - epsilon;
++                return true;
++            }
++        }
++    }
++    else
++    {
++        int64_t firstPlane =
++            FloorToInt64(oldBounds.minimum[axis] + epsilon) - 1;
++        int64_t lastPlane =
++            FloorToInt64(newBounds.minimum[axis] + epsilon);
++
++        for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
++        {
++            if (BlockPlaneCollides(
++                    collision, shape, axis, plane, &newBounds))
++            {
++                position[axis] =
++                    (double)plane + 1.0 + negativeExtent + epsilon;
++                return true;
++            }
++        }
++    }
++
++    position[axis] = targetPosition[axis];
++    return false;
++}
++
++bool VoxelBodyHasGroundContact(const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth)
++{
++    VoxelBodyBounds bounds;
++    VoxelBodyCalculateBounds(position, shape, &bounds);
++
++    int64_t minimumX = FloorToInt64(
++        bounds.minimum[0] + shape->collisionEpsilon);
++    int64_t maximumX = FloorToInt64(
++        bounds.maximum[0] - shape->collisionEpsilon);
++    int64_t minimumY = FloorToInt64(
++        bounds.minimum[1] + shape->collisionEpsilon);
++    int64_t maximumY = FloorToInt64(
++        bounds.maximum[1] - shape->collisionEpsilon);
++    int64_t supportZ = FloorToInt64(bounds.minimum[2] - probeDepth);
++
++    for (int64_t y = minimumY; y <= maximumY; ++y)
++    {
++        for (int64_t x = minimumX; x <= maximumX; ++x)
++        {
++            if (collision->isSolidBlock(collision->context, x, y, supportZ))
++            {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth, double supportRadius)
++{
++    if (supportRadius < 0.0)
++    {
++        supportRadius = 0.0;
++    }
++    if (supportRadius > shape->radius)
++    {
++        supportRadius = shape->radius;
++    }
++
++    double feet = position[2] - shape->eyeHeight;
++    int64_t supportZ = FloorToInt64(feet - probeDepth);
++    const double offsets[3] = {
++        -supportRadius, 0.0, supportRadius
++    };
++
++    for (uint32_t yIndex = 0; yIndex < 3u; ++yIndex)
++    {
++        for (uint32_t xIndex = 0; xIndex < 3u; ++xIndex)
++        {
++            int64_t x = FloorToInt64(position[0] + offsets[xIndex]);
++            int64_t y = FloorToInt64(position[1] + offsets[yIndex]);
++            if (collision->isSolidBlock(collision->context, x, y, supportZ))
++            {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++bool VoxelBodyOverlapsBlock(const double position[3],
++    const VoxelBodyShape* shape, const int64_t block[3])
++{
++    VoxelBodyBounds bounds;
++    VoxelBodyCalculateBounds(position, shape, &bounds);
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        double blockMinimum = (double)block[axis];
++        double blockMaximum = blockMinimum + 1.0;
++        if (bounds.maximum[axis]
++                <= blockMinimum + shape->collisionEpsilon
++            || bounds.minimum[axis]
++                >= blockMaximum - shape->collisionEpsilon)
++        {
++            return false;
++        }
++    }
++    return true;
++}
+diff --git a/src/physics/voxel_body.h b/src/physics/voxel_body.h
+new file mode 100644
+index 0000000..59da4da
+--- /dev/null
++++ b/src/physics/voxel_body.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "api.h"
++
++typedef bool (*VoxelSolidBlockQuery)(
++    void* context, int64_t x, int64_t y, int64_t z);
++
++typedef struct VoxelCollisionSource
++{
++    void* context;
++    VoxelSolidBlockQuery isSolidBlock;
++} VoxelCollisionSource;
++
++typedef struct VoxelBodyShape
++{
++    double radius;
++    double height;
++    double eyeHeight;
++    double collisionEpsilon;
++} VoxelBodyShape;
++
++typedef struct VoxelBodyBounds
++{
++    double minimum[3];
++    double maximum[3];
++} VoxelBodyBounds;
++
++LAIUE_PHYSICS_API void VoxelBodyCalculateBounds(
++    const double position[3], const VoxelBodyShape* shape,
++    VoxelBodyBounds* outBounds);
++
++LAIUE_PHYSICS_API bool VoxelBodyCollides(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape);
++
++// Двигает тело по одной оси и возвращает true при столкновении.
++LAIUE_PHYSICS_API bool VoxelBodyMoveAxis(
++    const VoxelCollisionSource* collision,
++    double position[3], const VoxelBodyShape* shape,
++    int32_t axis, double distance);
++
++// Любая опора под AABB: используется для обычного контакта с землёй.
++LAIUE_PHYSICS_API bool VoxelBodyHasGroundContact(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth);
++
++// Опора под внутренней областью стоп. Нужна для защиты края при приседании:
++// тело может свисать, но его центр не уходит в пустоту.
++LAIUE_PHYSICS_API bool VoxelBodyHasStableGround(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth, double supportRadius);
++
++LAIUE_PHYSICS_API bool VoxelBodyOverlapsBlock(
++    const double position[3], const VoxelBodyShape* shape,
++    const int64_t block[3]);
