@@ -1,0 +1,3315 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,3 +20,4 @@
+ add_subdirectory(src/render)
+ add_subdirectory(src/physics)
++add_subdirectory(src/celestial)
+ add_subdirectory(src/gameplay)
+@@ -40,8 +40,15 @@
+-# Texture packs — runtime assets next to the executable.
++# Runtime assets next to the executable. PNG source art stays outside this
++# target; gameplay loads only precompiled GPU/runtime data.
+ add_custom_target(laiue_texturepacks
+     COMMAND ${CMAKE_COMMAND} -E copy_directory
+         "${CMAKE_SOURCE_DIR}/assets/texturepacks"
+         "$<TARGET_FILE_DIR:laiue>/texturepacks"
+-    COMMENT "Copying texture packs"
++    # Remove the retired third-party pack from an existing output directory.
++    COMMAND ${CMAKE_COMMAND} -E rm -f
++        "$<TARGET_FILE_DIR:laiue>/texturepacks/patrix_32x.ltp"
++    COMMAND ${CMAKE_COMMAND} -E copy_directory
++        "${CMAKE_SOURCE_DIR}/assets/sky"
++        "$<TARGET_FILE_DIR:laiue>/sky"
++    COMMENT "Copying texture packs and sky assets"
+ )
+ add_dependencies(laiue laiue_core laiue_texturepacks)
+diff --git a/src/api.h b/src/api.h
+--- a/src/api.h
++++ b/src/api.h
+@@ -50,7 +50,13 @@
+ #if defined(LAIUE_BUILD_GAMEPLAY)
+ #define LAIUE_GAMEPLAY_API __declspec(dllexport)
+ #else
+ #define LAIUE_GAMEPLAY_API __declspec(dllimport)
+ #endif
+ 
++#if defined(LAIUE_BUILD_CELESTIAL)
++#define LAIUE_CELESTIAL_API __declspec(dllexport)
++#else
++#define LAIUE_CELESTIAL_API __declspec(dllimport)
++#endif
++
+ #if defined(LAIUE_BUILD_INTERACTION)
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -8,4 +8,6 @@
+         chunk_streaming.h
+         debug_overlay.c
+         debug_overlay.h
++        sky_renderer.c
++        sky_renderer.h
+         math.c
+@@ -21,5 +21,7 @@
+         ui.c
+         ui.h
++        ui_atlas_assets.c
++        ui_atlas_assets.h
+         ui_font.c
+         ui_font.h
+         ../game/camera.c
+@@ -33,3 +33,4 @@
+         laiue_render
+         laiue_physics
++        laiue_celestial
+         laiue_gameplay
+diff --git a/src/core/application_config.h b/src/core/application_config.h
+--- a/src/core/application_config.h
++++ b/src/core/application_config.h
+@@ -14,3 +14,4 @@
+     int32_t viewRadiusChunks;
+     int64_t worldSeed;
++    double worldSecondsPerRealSecond;
+     int64_t rebaseThresholdBlocks;
+diff --git a/src/core/application_config.c b/src/core/application_config.c
+--- a/src/core/application_config.c
++++ b/src/core/application_config.c
+@@ -14,3 +14,5 @@
+     .viewRadiusChunks = 5,
+     .worldSeed = 42,
++    // 24 game hours in 20 real minutes.
++    .worldSecondsPerRealSecond = 72.0,
+     .rebaseThresholdBlocks = 1048576,
+diff --git a/src/world/world.h b/src/world/world.h
+--- a/src/world/world.h
++++ b/src/world/world.h
+@@ -17,4 +17,5 @@
+     BLOCK_AIR = 0,
+     BLOCK_EARTH = 1,
+     BLOCK_GRASS = 2,
++    BLOCK_STONE = 3,
+ } BlockType;
+diff --git a/src/world/world_infinite.c b/src/world/world_infinite.c
+--- a/src/world/world_infinite.c
++++ b/src/world/world_infinite.c
+@@ -225,11 +225,15 @@
+ static BlockType GeneratedBlock(const World* world, int64_t x, int64_t y, int64_t z)
+ {
+     int32_t boundary = ColumnCeiling(TerrainHeight(world, x, y));
+     if (!IsAbsoluteZBelow(world, z, boundary))
+     {
+         return BLOCK_AIR;
+     }
++    if (IsAbsoluteZBelow(world, z, boundary - 4))
++    {
++        return BLOCK_STONE;
++    }
+     return IsAbsoluteZBelow(world, z, boundary - 1)
+         ? BLOCK_EARTH
+         : BLOCK_GRASS;
+ }
+@@ -890,3 +890,7 @@
+             BlockType* column = &outBlocks[(((size_t)y * sizeX) + (size_t)x) * sizeZ];
+-            memset(column, BLOCK_EARTH, (size_t)solidCount);
++            int32_t stoneCount = SolidCountInColumn(
++                world, minBlockZ, sizeZ, boundary - 4);
++            memset(column, BLOCK_STONE, (size_t)stoneCount);
++            memset(column + stoneCount, BLOCK_EARTH,
++                (size_t)(solidCount - stoneCount));
+             memset(column + solidCount, BLOCK_AIR, (size_t)(sizeZ - solidCount));
+diff --git a/src/render/texture_pack.h b/src/render/texture_pack.h
+--- a/src/render/texture_pack.h
++++ b/src/render/texture_pack.h
+@@ -10,5 +10,6 @@
+     TEXTURE_PACK_LAYER_DIRT = 0,
+     TEXTURE_PACK_LAYER_GRASS_TOP = 1,
+     TEXTURE_PACK_LAYER_GRASS_SIDE = 2,
+-    TEXTURE_PACK_LAYER_COUNT = 3,
++    TEXTURE_PACK_LAYER_STONE = 3,
++    TEXTURE_PACK_LAYER_COUNT = 4,
+ };
+diff --git a/src/render/texture_pack.c b/src/render/texture_pack.c
+--- a/src/render/texture_pack.c
++++ b/src/render/texture_pack.c
+@@ -16,6 +16,7 @@
+-// Layer-major fallback: dirt, grass top, grass side.
++// Layer-major fallback: dirt, grass top, grass side, stone.
+ static const uint8_t g_fallbackPixels[TEXTURE_PACK_LAYER_COUNT * 4] = {
+     118, 90, 66, 255,
+     117, 173, 85, 255,
+     102, 121, 63, 255,
++    126, 128, 132, 255,
+ };
+@@ -247,40 +247,59 @@
+     uint16_t height = ReadU16Le(header + 10);
+-    uint16_t layerCount = ReadU16Le(header + 12);
++    uint16_t sourceLayerCount = ReadU16Le(header + 12);
+     uint16_t mipCount = ReadU16Le(header + 14);
+     uint32_t format = ReadU32Le(header + 16);
+     uint32_t dataBytes = ReadU32Le(header + 20);
+ 
+-    uint32_t expectedBytes = 0;
++    uint32_t sourceBytes = 0;
+     bool valid = magic == LTP_MAGIC
+         && version == LTP_VERSION
+         && headerSize == LTP_HEADER_SIZE
+         && width > 0 && width <= TEXTURE_MAX_DIMENSION
+         && height > 0 && height <= TEXTURE_MAX_DIMENSION
+-        && layerCount == TEXTURE_PACK_LAYER_COUNT
++        // Legacy three-layer packs remain readable; stone falls back to dirt.
++        && (sourceLayerCount == 3u
++            || sourceLayerCount == TEXTURE_PACK_LAYER_COUNT)
+         && mipCount == FullMipCount(width, height)
+         && format == LTP_FORMAT_RGBA8
+-        && CalculatePayloadBytes(width, height, layerCount, mipCount, &expectedBytes)
+-        && dataBytes == expectedBytes
++        && CalculatePayloadBytes(width, height,
++            sourceLayerCount, mipCount, &sourceBytes)
++        && dataBytes == sourceBytes
+         && fileSize.QuadPart == (LONGLONG)LTP_HEADER_SIZE + dataBytes;
+     if (!valid)
+     {
+         CloseHandle(file);
+         return false;
+     }
+ 
+-    uint8_t* pixels = HeapAlloc(GetProcessHeap(), 0, dataBytes);
++    uint32_t outputBytes = 0;
++    if (!CalculatePayloadBytes(width, height,
++            TEXTURE_PACK_LAYER_COUNT, mipCount, &outputBytes))
++    {
++        CloseHandle(file);
++        return false;
++    }
++    uint8_t* pixels = HeapAlloc(GetProcessHeap(), 0, outputBytes);
+     if (pixels == NULL || !ReadFileExact(file, pixels, dataBytes))
+     {
+         if (pixels != NULL) HeapFree(GetProcessHeap(), 0, pixels);
+         CloseHandle(file);
+         return false;
+     }
+     CloseHandle(file);
+ 
++    if (sourceLayerCount == 3u)
++    {
++        uint32_t bytesPerLayer = dataBytes / 3u;
++        for (uint32_t byte = 0; byte < bytesPerLayer; ++byte)
++        {
++            pixels[3u * bytesPerLayer + byte] = pixels[byte];
++        }
++    }
++
+     outPack->width = width;
+     outPack->height = height;
+-    outPack->layerCount = layerCount;
++    outPack->layerCount = TEXTURE_PACK_LAYER_COUNT;
+     outPack->mipCount = mipCount;
+     outPack->pixels = pixels;
+-    outPack->pixelBytes = dataBytes;
++    outPack->pixelBytes = outputBytes;
+     return true;
+diff --git a/shaders/chunk.hlsl b/shaders/chunk.hlsl
+--- a/shaders/chunk.hlsl
++++ b/shaders/chunk.hlsl
+@@ -79,7 +79,7 @@
+-    // Слои texture array: 0 = земля, 1 = верх травы, 2 = бок травы.
+-    uint textureLayer = 0;
++    // Layers: 0=dirt, 1=grass top, 2=grass side, 3=stone.
++    uint textureLayer = blockType == 3 ? 3 : 0;
+     if (blockType == 2)
+     {
+         textureLayer = face == 4 ? 1 : (face == 5 ? 0 : 2);
+     }
+     output.surface = face | (textureLayer << 3);
+diff --git a/src/render/renderer.h b/src/render/renderer.h
+--- a/src/render/renderer.h
++++ b/src/render/renderer.h
+@@ -50,4 +50,5 @@
+ typedef struct RendererFrameSetup
+ {
+     bool panorama;
++    float clearColor[4];
+     uint32_t faceResolution;
+@@ -99,4 +99,10 @@
+ LAIUE_RENDER_API bool RendererUiSetFontAtlas(Renderer* renderer,
+     const uint8_t* alphaPixels, uint32_t width, uint32_t height);
+ 
++// Draws UI-format quads into the current scene target before terrain. This is
++// used for the sun and moons, so later chunk drawing naturally occludes them.
++LAIUE_RENDER_API void RendererDrawSceneUi(Renderer* renderer,
++    const RendererUiQuad* quads, uint32_t count,
++    uint32_t targetWidth, uint32_t targetHeight);
++
+ // Ставит квады в очередь текущего кадра.
+diff --git a/src/render/renderer_d3d12.c b/src/render/renderer_d3d12.c
+--- a/src/render/renderer_d3d12.c
++++ b/src/render/renderer_d3d12.c
+@@ -139,3 +139,4 @@
+     RendererFrameSetup         frame;            // setup текущего кадра
++    uint32_t                   currentPassIndex;
+ 
+     // Слой UI: vertex pulling из upload-кольца, атлас шрифта.
+@@ -145,3 +145,5 @@
+     uint8_t*                   uiQuadMapped[FRAME_COUNT];
+     uint32_t                   uiQuadCount;
++    uint32_t                   uiOverlayStart;
++    uint32_t                   uiOverlayCount;
+     ID3D12Resource*            fontTexture;
+@@ -1400,13 +1400,103 @@
+ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
+     const float chunkOriginRelative[3])
+ {
+     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+ 
+     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+         ROOT_PARAMETER_CONSTANTS, 3, chunkOriginRelative, ROOT_CONSTANT_ORIGIN_OFFSET);
+     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
+         ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
+     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
+ }
+ 
++static uint32_t StoreUiQuads(Renderer* renderer,
++    const RendererUiQuad* quads, uint32_t* inOutCount)
++{
++    uint32_t count = *inOutCount;
++    uint32_t space = UI_MAX_QUADS - renderer->uiQuadCount;
++    if (count > space) count = space;
++    uint32_t start = renderer->uiQuadCount;
++    if (count > 0u)
++    {
++        memcpy(renderer->uiQuadMapped[renderer->frameIndex]
++                + (size_t)start * UI_QUAD_BYTES,
++            quads, (size_t)count * UI_QUAD_BYTES);
++        renderer->uiQuadCount += count;
++    }
++    *inOutCount = count;
++    return start;
++}
++
++void RendererDrawSceneUi(Renderer* renderer,
++    const RendererUiQuad* quads, uint32_t count,
++    uint32_t targetWidth, uint32_t targetHeight)
++{
++    if (quads == NULL || count == 0u || !renderer->fontReady
++        || targetWidth == 0u || targetHeight == 0u)
++    {
++        return;
++    }
++    uint32_t start = StoreUiQuads(renderer, quads, &count);
++    if (count == 0u) return;
++
++    const RendererScenePass* pass =
++        &renderer->frame.passes[renderer->currentPassIndex];
++    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
++    D3D12_CPU_DESCRIPTOR_HANDLE depthStencilViewHandle;
++    if (renderer->frame.panorama)
++    {
++        uint32_t faceIndex = pass->faceIndex < 6u ? pass->faceIndex : 0u;
++        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
++            renderer->cubeRtvHeap, &renderTargetViewHandle);
++        renderTargetViewHandle.ptr +=
++            (SIZE_T)faceIndex * renderer->renderTargetViewSize;
++        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
++            renderer->cubeDsvHeap, &depthStencilViewHandle);
++    }
++    else
++    {
++        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
++            renderer->renderTargetViewHeap, &renderTargetViewHandle);
++        renderTargetViewHandle.ptr +=
++            (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
++        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
++            renderer->depthStencilViewHeap, &depthStencilViewHandle);
++    }
++
++    // The UI PSO has no depth format. Temporarily unbind the DSV and restore
++    // it before chunk drawing so D3D12 validation remains strict and clean.
++    ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
++        1, &renderTargetViewHandle, FALSE, NULL);
++    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
++        renderer->uiPipelineState);
++    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
++        renderer->uiRootSignature);
++    float screenSize[2] = { (float)targetWidth, (float)targetHeight };
++    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
++        0, 2, screenSize, 0);
++    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
++        1, ID3D12Resource_GetGPUVirtualAddress(
++            renderer->uiQuadBuffers[renderer->frameIndex])
++            + (UINT64)start * UI_QUAD_BYTES);
++    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
++        2, SrvGpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
++    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
++        count * 6u, 1, 0, 0);
++
++    // Restore the chunk target and pipeline expected by ChunkStreamingDraw.
++    ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
++        1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
++    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
++        renderer->pipelineState);
++    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
++        renderer->rootSignature);
++    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
++        ROOT_PARAMETER_BLOCK_TEXTURES,
++        SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
++    ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList,
++        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
++        ROOT_PARAMETER_CONSTANTS, 16, pass->viewProjection, 0);
++}
++
+ static void RecordBlockTextureUpload
+@@ -1598,6 +1598,8 @@
+     }
+ 
+     renderer->frame = *frame;
+     renderer->uiQuadCount = 0;
++    renderer->uiOverlayStart = 0;
++    renderer->uiOverlayCount = 0;
+ 
+     if (renderer->frame.panorama
+@@ -1640,3 +1640,4 @@
+     const RendererScenePass* pass = &renderer->frame.passes[passIndex];
++    renderer->currentPassIndex = passIndex;
+ 
+     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+@@ -1701,8 +1701,7 @@
+     ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+         1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
+ 
+-    const float clearColor[4] = { 0.4f, 0.6f, 0.9f, 1.0f };
+     ID3D12GraphicsCommandList_ClearRenderTargetView(renderer->commandList,
+-        renderTargetViewHandle, clearColor, 1, &scissor);
++        renderTargetViewHandle, renderer->frame.clearColor, 1, &scissor);
+     ID3D12GraphicsCommandList_ClearDepthStencilView(renderer->commandList,
+         depthStencilViewHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &scissor);
+@@ -1759,32 +1759,33 @@
+     }
+ 
+-    if (renderer->uiQuadCount > 0 && renderer->fontReady)
++    if (renderer->uiOverlayCount > 0 && renderer->fontReady)
+     {
+         // Слой UI: альфа-смешивание поверх кадра, без глубины.
+         ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+             1, &renderTargetViewHandle, FALSE, NULL);
+         ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
+         ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
+ 
+         ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+             renderer->uiPipelineState);
+         ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+             renderer->uiRootSignature);
+ 
+         float screenSize[2] = {
+             (float)renderer->windowWidth,
+             (float)renderer->windowHeight,
+         };
+         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+             0, 2, screenSize, 0);
+         ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
+             1, ID3D12Resource_GetGPUVirtualAddress(
+-                renderer->uiQuadBuffers[renderer->frameIndex]));
++                renderer->uiQuadBuffers[renderer->frameIndex])
++                + (UINT64)renderer->uiOverlayStart * UI_QUAD_BYTES);
+         ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+             2, SrvGpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
+ 
+         ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
+-            renderer->uiQuadCount * 6, 1, 0, 0);
++            renderer->uiOverlayCount * 6, 1, 0, 0);
+     }
+ 
+     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
+@@ -1960,22 +1960,14 @@
+ void RendererUiQueue(Renderer* renderer, const RendererUiQuad* quads, uint32_t count)
+ {
+-    if (quads == NULL || count == 0)
++    if (quads == NULL || count == 0u)
+     {
+         return;
+     }
+-
+-    uint32_t space = UI_MAX_QUADS - renderer->uiQuadCount;
+-    if (count > space)
++    uint32_t start = StoreUiQuads(renderer, quads, &count);
++    if (count == 0u) return;
++    if (renderer->uiOverlayCount == 0u)
+     {
+-        count = space;
++        renderer->uiOverlayStart = start;
+     }
+-    if (count == 0)
+-    {
+-        return;
+-    }
+-
+-    memcpy(renderer->uiQuadMapped[renderer->frameIndex]
+-            + (size_t)renderer->uiQuadCount * UI_QUAD_BYTES,
+-        quads, (size_t)count * UI_QUAD_BYTES);
+-    renderer->uiQuadCount += count;
++    renderer->uiOverlayCount += count;
+ }
+diff --git a/src/core/ui_font.h b/src/core/ui_font.h
+--- a/src/core/ui_font.h
++++ b/src/core/ui_font.h
+@@ -5,5 +5,12 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <wchar.h>
+ 
++#include "core/ui_atlas_assets.h"
++
++typedef struct UiAtlasRegion
++{
++    float u0, v0, u1, v1;
++} UiAtlasRegion;
++
+ // Растровый атлас
+@@ -29,4 +29,5 @@
+     float ascent;        // от верха строки до базовой линии
+     float lineHeight;
+     int32_t pixelSize;
++    UiAtlasRegion moonPhases[UI_MOON_BODY_COUNT][UI_MOON_PHASE_COUNT];
+ } UiFont;
+diff --git a/src/core/ui_font.c b/src/core/ui_font.c
+--- a/src/core/ui_font.c
++++ b/src/core/ui_font.c
+@@ -166,3 +166,5 @@
+-    uint32_t atlasHeight = shelfY + shelfHeight + GLYPH_PADDING;
++    uint32_t moonAtlasY = shelfY + shelfHeight + GLYPH_PADDING;
++    uint32_t atlasHeight = moonAtlasY
++        + UI_MOON_ATLAS_HEIGHT + GLYPH_PADDING;
+     uint8_t* atlas = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+         (size_t)atlasWidth * atlasHeight);
+@@ -224,18 +224,44 @@
++    UiAtlasAssetsWriteMoonPhases(
++        atlas, atlasWidth, atlasHeight, 0u, moonAtlasY);
++    float inverseAtlasWidth = 1.0f / (float)atlasWidth;
++    float inverseAtlasHeight = 1.0f / (float)atlasHeight;
++    UiAtlasRegion moonPhases[UI_MOON_BODY_COUNT][UI_MOON_PHASE_COUNT];
++    for (uint32_t body = 0; body < UI_MOON_BODY_COUNT; ++body)
++    {
++        for (uint32_t phase = 0; phase < UI_MOON_PHASE_COUNT; ++phase)
++        {
++            uint32_t x = phase * UI_MOON_SPRITE_SIZE;
++            uint32_t y = moonAtlasY + body * UI_MOON_SPRITE_SIZE;
++            UiAtlasRegion* region = &moonPhases[body][phase];
++            region->u0 = (float)x * inverseAtlasWidth;
++            region->v0 = (float)y * inverseAtlasHeight;
++            region->u1 = (float)(x + UI_MOON_SPRITE_SIZE) * inverseAtlasWidth;
++            region->v1 = (float)(y + UI_MOON_SPRITE_SIZE) * inverseAtlasHeight;
++        }
++    }
++
+     if (scratch != NULL)
+     {
+         HeapFree(GetProcessHeap(), 0, scratch);
+     }
+     SelectObject(deviceContext, previousFont);
+     DeleteDC(deviceContext);
+     DeleteObject(gdiFont);
+ 
+     UiFontRelease(font);
+     font->atlas = atlas;
+     font->atlasWidth = atlasWidth;
+     font->atlasHeight = atlasHeight;
+     font->glyphs = glyphs;
+     font->glyphCount = glyphCount;
+     font->ascent = (float)textMetrics.tmAscent;
+     font->lineHeight = (float)(textMetrics.tmHeight + textMetrics.tmExternalLeading);
+     font->pixelSize = pixelSize;
++    for (uint32_t body = 0; body < UI_MOON_BODY_COUNT; ++body)
++    {
++        for (uint32_t phase = 0; phase < UI_MOON_PHASE_COUNT; ++phase)
++        {
++            font->moonPhases[body][phase] = moonPhases[body][phase];
++        }
++    }
+     return true;
+diff --git a/src/core/pause_menu.h b/src/core/pause_menu.h
+--- a/src/core/pause_menu.h
++++ b/src/core/pause_menu.h
+@@ -3,2 +3,3 @@
++#include "celestial/world_clock.h"
+ #include "core/panorama.h"
+ #include "core/ui.h"
+@@ -15,3 +15,4 @@
+     PAUSE_MENU_CLOSED = 0,
+     PAUSE_MENU_MAIN,
++    PAUSE_MENU_TIME,
+     PAUSE_MENU_SETTINGS,
+@@ -45,3 +45,3 @@
+ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
+-    GameSettings* settings, Renderer* renderer,
++    GameSettings* settings, WorldClock* worldClock, Renderer* renderer,
+     int32_t width, int32_t height, bool escapePressed);
+diff --git a/src/core/pause_menu.c b/src/core/pause_menu.c
+--- a/src/core/pause_menu.c
++++ b/src/core/pause_menu.c
+@@ -1,3 +1,5 @@
+ #include "core/pause_menu.h"
+ 
++#include "celestial/world_calendar.h"
++
+ // Идентификаторы
+@@ -6,10 +6,20 @@
+ enum
+ {
+     WIDGET_RESUME = 1,
++    WIDGET_TIME,
+     WIDGET_SETTINGS,
+     WIDGET_QUIT,
+     WIDGET_BACK,
+     WIDGET_FOV_SLIDER,
+     WIDGET_VSYNC,
+-    WIDGET_PROJECTION_FIRST = 16,
++    WIDGET_TIME_RUNNING,
++    WIDGET_TIME_MINUS_HOUR,
++    WIDGET_TIME_PLUS_HOUR,
++    WIDGET_TIME_MINUS_DAY,
++    WIDGET_TIME_PLUS_DAY,
++    WIDGET_TIME_DAWN,
++    WIDGET_TIME_NOON,
++    WIDGET_TIME_SUNSET,
++    WIDGET_TIME_MIDNIGHT,
++    WIDGET_PROJECTION_FIRST = 32,
+ };
+@@ -63,47 +63,54 @@
+ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
+     int32_t width, int32_t height)
+ {
+     float s = ui->scale;
+     float panelWidth = 250.0f * s;
+     float buttonHeight = 36.0f * s;
+     float buttonGap = 10.0f * s;
+     float padding = 20.0f * s;
+     float titleHeight = ui->font.lineHeight;
+     float panelHeight = padding + titleHeight + 16.0f * s
+-        + buttonHeight * 3.0f + buttonGap * 2.0f + padding;
++        + buttonHeight * 4.0f + buttonGap * 3.0f + padding;
+ 
+     float panelX = ((float)width - panelWidth) * 0.5f;
+     float panelY = ((float)height - panelHeight) * 0.5f;
+     DrawPanel(ui, panelX, panelY, panelWidth, panelHeight);
+ 
+     float cursorY = panelY + padding;
+     UiTextCentered(ui, panelX + panelWidth * 0.5f, cursorY,
+         UiColor(232, 236, 244, 255), L"Пауза");
+     cursorY += titleHeight + 16.0f * s;
+ 
+     float buttonX = panelX + padding;
+     float buttonWidth = panelWidth - padding * 2.0f;
+ 
+     PauseMenuAction action = PAUSE_MENU_ACTION_NONE;
+     if (UiButton(ui, WIDGET_RESUME, buttonX, cursorY,
+             buttonWidth, buttonHeight, L"Продолжить"))
+     {
+         action = PAUSE_MENU_ACTION_RESUME;
+     }
+     cursorY += buttonHeight + buttonGap;
+ 
++    if (UiButton(ui, WIDGET_TIME, buttonX, cursorY,
++            buttonWidth, buttonHeight, L"Время мира"))
++    {
++        menu->screen = PAUSE_MENU_TIME;
++    }
++    cursorY += buttonHeight + buttonGap;
++
+     if (UiButton(ui, WIDGET_SETTINGS, buttonX, cursorY,
+             buttonWidth, buttonHeight, L"Настройки"))
+     {
+         menu->screen = PAUSE_MENU_SETTINGS;
+     }
+     cursorY += buttonHeight + buttonGap;
+ 
+     if (UiButton(ui, WIDGET_QUIT, buttonX, cursorY,
+             buttonWidth, buttonHeight, L"Выход"))
+     {
+         action = PAUSE_MENU_ACTION_QUIT;
+     }
+ 
+     return action;
+ }
+@@ -110 +110,66 @@
++static void UpdateTimeScreen(PauseMenu* menu, UiContext* ui,
++    WorldClock* clock, int32_t width, int32_t height)
++{
++    float s = ui->scale;
++    float panelWidth = 370.0f * s;
++    float padding = 20.0f * s;
++    float lineHeight = ui->font.lineHeight;
++    float rowHeight = 34.0f * s;
++    float gap = 8.0f * s;
++    float panelHeight = padding + lineHeight + 14.0f * s
++        + lineHeight + 14.0f * s + rowHeight
++        + (rowHeight + gap) * 4.0f + rowHeight + padding;
++    float panelX = ((float)width - panelWidth) * 0.5f;
++    float panelY = ((float)height - panelHeight) * 0.5f;
++    DrawPanel(ui, panelX, panelY, panelWidth, panelHeight);
++
++    float x = panelX + padding;
++    float contentWidth = panelWidth - padding * 2.0f;
++    float y = panelY + padding;
++    UiTextCentered(ui, panelX + panelWidth * 0.5f, y,
++        UiColor(232, 236, 244, 255), L"Время мира");
++    y += lineHeight + 14.0f * s;
++
++    wchar_t dateTime[64];
++    WorldCalendarFormatDateTime(clock, dateTime, 64u);
++    UiTextCentered(ui, panelX + panelWidth * 0.5f, y,
++        UiColor(108, 148, 255, 255), dateTime);
++    y += lineHeight + 14.0f * s;
++
++    UiText(ui, x, y + (rowHeight - lineHeight) * 0.5f,
++        UiColor(232, 236, 244, 255), L"Ход времени");
++    bool running = WorldClockIsRunning(clock);
++    if (UiToggle(ui, WIDGET_TIME_RUNNING,
++            x + contentWidth - UiScaled(ui, 40.0f),
++            y + (rowHeight - UiScaled(ui, 22.0f)) * 0.5f, &running))
++    {
++        WorldClockSetRunning(clock, running);
++    }
++    y += rowHeight + gap;
++
++    float half = (contentWidth - gap) * 0.5f;
++    if (UiButton(ui, WIDGET_TIME_MINUS_HOUR, x, y, half, rowHeight, L"-1 час"))
++        WorldClockAddGameSeconds(clock, -3600.0);
++    if (UiButton(ui, WIDGET_TIME_PLUS_HOUR, x + half + gap, y, half, rowHeight, L"+1 час"))
++        WorldClockAddGameSeconds(clock, 3600.0);
++    y += rowHeight + gap;
++    if (UiButton(ui, WIDGET_TIME_MINUS_DAY, x, y, half, rowHeight, L"-1 день"))
++        WorldClockAddGameSeconds(clock, -86400.0);
++    if (UiButton(ui, WIDGET_TIME_PLUS_DAY, x + half + gap, y, half, rowHeight, L"+1 день"))
++        WorldClockAddGameSeconds(clock, 86400.0);
++    y += rowHeight + gap;
++    if (UiButton(ui, WIDGET_TIME_DAWN, x, y, half, rowHeight, L"Рассвет 06:00"))
++        WorldClockSetTimeOfDay(clock, 6u, 0u, 0u);
++    if (UiButton(ui, WIDGET_TIME_NOON, x + half + gap, y, half, rowHeight, L"Полдень 12:00"))
++        WorldClockSetTimeOfDay(clock, 12u, 0u, 0u);
++    y += rowHeight + gap;
++    if (UiButton(ui, WIDGET_TIME_SUNSET, x, y, half, rowHeight, L"Закат 18:00"))
++        WorldClockSetTimeOfDay(clock, 18u, 0u, 0u);
++    if (UiButton(ui, WIDGET_TIME_MIDNIGHT, x + half + gap, y, half, rowHeight, L"Полночь 00:00"))
++        WorldClockSetTimeOfDay(clock, 0u, 0u, 0u);
++    y += rowHeight + gap;
++    if (UiButton(ui, WIDGET_BACK, x, y, contentWidth, rowHeight, L"Назад"))
++        menu->screen = PAUSE_MENU_MAIN;
++}
++
+ static const wchar_t* ProjectionCaption(const GameSettings* settings)
+@@ -223,3 +223,3 @@
+ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
+-    GameSettings* settings, Renderer* renderer,
++    GameSettings* settings, WorldClock* worldClock, Renderer* renderer,
+     int32_t width, int32_t height, bool escapePressed)
+@@ -234,3 +234,4 @@
+-        if (menu->screen == PAUSE_MENU_SETTINGS)
++        if (menu->screen == PAUSE_MENU_SETTINGS
++            || menu->screen == PAUSE_MENU_TIME)
+         {
+             menu->screen = PAUSE_MENU_MAIN;
+@@ -248,7 +248,13 @@
+     if (menu->screen == PAUSE_MENU_MAIN)
+     {
+         return UpdateMainScreen(menu, ui, width, height);
+     }
+-
+-    UpdateSettingsScreen(menu, ui, settings, renderer, width, height);
++    if (menu->screen == PAUSE_MENU_TIME)
++    {
++        UpdateTimeScreen(menu, ui, worldClock, width, height);
++    }
++    else
++    {
++        UpdateSettingsScreen(menu, ui, settings, renderer, width, height);
++    }
+     return PAUSE_MENU_ACTION_NONE;
+diff --git a/src/core/debug_overlay.h b/src/core/debug_overlay.h
+--- a/src/core/debug_overlay.h
++++ b/src/core/debug_overlay.h
+@@ -5,4 +5,6 @@
+ #include <stdint.h>
+ #include <wchar.h>
+ 
++#include "celestial/celestial_model.h"
++#include "celestial/world_clock.h"
+ #include "gameplay/game_mode.h"
+@@ -12,4 +12,5 @@
+ void DebugOverlayBuildText(World* world, const PlayerController* player,
+     GameMode gameMode, uint32_t framesPerSecond,
+-    const int64_t cameraBlockPosition[3],
++    const WorldClock* worldClock, const CelestialState* celestial,
++    int64_t worldSeed, const int64_t cameraBlockPosition[3],
+     wchar_t* destination, uint32_t capacity);
+diff --git a/src/core/debug_overlay.c b/src/core/debug_overlay.c
+--- a/src/core/debug_overlay.c
++++ b/src/core/debug_overlay.c
+@@ -1,3 +1,5 @@
+ #include "core/debug_overlay.h"
+ 
++#include "celestial/world_calendar.h"
++
+ static void AppendText
+@@ -38,9 +38,28 @@
+     }
++}
++
++static void AppendUnsigned64(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, uint64_t value)
++{
++    wchar_t reversedDigits[20];
++    uint32_t digitCount = 0;
++    do
++    {
++        reversedDigits[digitCount++] = (wchar_t)(L'0' + value % 10u);
++        value /= 10u;
++    }
++    while (value != 0u && digitCount < 20u);
++    while (digitCount > 0u && *length + 1u < capacity)
++    {
++        destination[(*length)++] = reversedDigits[--digitCount];
++    }
++    if (capacity > 0u) destination[*length] = L'\0';
+ }
+ 
+ void DebugOverlayBuildText(World* world, const PlayerController* player,
+     GameMode gameMode, uint32_t framesPerSecond,
+-    const int64_t cameraBlockPosition[3],
++    const WorldClock* worldClock, const CelestialState* celestial,
++    int64_t worldSeed, const int64_t cameraBlockPosition[3],
+     wchar_t* destination, uint32_t capacity)
+ {
+     wchar_t coordinate[3][32];
+@@ -50,3 +50,5 @@
+     }
++    wchar_t dateTime[64];
++    WorldCalendarFormatDateTime(worldClock, dateTime, 64u);
+ 
+     destination[0] = L'\0';
+@@ -72,5 +72,25 @@
+     else
+     {
+         AppendText(destination, capacity, &length, L"WALK");
+     }
++    AppendText(destination, capacity, &length, L"\r\nTime: ");
++    AppendText(destination, capacity, &length, dateTime);
++    AppendText(destination, capacity, &length, L"\r\nLima: ");
++    AppendText(destination, capacity, &length,
++        CelestialPhaseName(celestial->lima.phaseIndex));
++    AppendText(destination, capacity, &length, L"\r\nPox: ");
++    AppendText(destination, capacity, &length,
++        CelestialPhaseName(celestial->pox.phaseIndex));
++    AppendText(destination, capacity, &length, L"\r\nSeed: ");
++    if (worldSeed < 0)
++    {
++        AppendText(destination, capacity, &length, L"-");
++        AppendUnsigned64(destination, capacity, &length,
++            (uint64_t)(-(worldSeed + 1)) + 1u);
++    }
++    else
++    {
++        AppendUnsigned64(destination, capacity, &length,
++            (uint64_t)worldSeed);
++    }
+ }
+diff --git a/src/core/application.c b/src/core/application.c
+--- a/src/core/application.c
++++ b/src/core/application.c
+@@ -1,2 +1,4 @@
+ #include "api.h"
++#include "celestial/celestial_model.h"
++#include "celestial/world_clock.h"
+ #include "core/application_config.h"
+@@ -9,2 +9,3 @@
+ #include "core/player_command_mapper.h"
++#include "core/sky_renderer.h"
+ #include "core/ui.h"
+@@ -44,5 +44,9 @@
+     GameSettings settings;
+     PanoramaCache panoramaCache;
+     PauseMenu menu;
+     UiContext ui;
++    WorldClock worldClock;
++    CelestialState celestial;
++    int64_t overlayDayNumber;
++    uint32_t overlaySecondOfDay;
+     bool mouseLookBeforeMenu;
+@@ -207,24 +207,33 @@
+ static void UpdateOverlay(ApplicationState* application,
+     const int64_t cameraBlockPosition[3])
+ {
++    int64_t dayNumber = WorldClockGetDayNumber(&application->worldClock);
++    uint32_t secondOfDay =
++        WorldClockGetSecondOfDay(&application->worldClock);
+     if (!application->overlayDirty
+         && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
+         && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
+-        && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
++        && application->coordinateOverlayBlock[2] == cameraBlockPosition[2]
++        && application->overlayDayNumber == dayNumber
++        && application->overlaySecondOfDay == secondOfDay)
+     {
+         return;
+     }
+ 
+     for (int32_t axis = 0; axis < 3; ++axis)
+     {
+         application->coordinateOverlayBlock[axis] =
+             cameraBlockPosition[axis];
+     }
++    application->overlayDayNumber = dayNumber;
++    application->overlaySecondOfDay = secondOfDay;
+ 
+-    wchar_t text[160];
++    wchar_t text[512];
+     DebugOverlayBuildText(application->world, &application->player,
+         application->gameMode, application->framesPerSecond,
+-        cameraBlockPosition, text, 160);
++        &application->worldClock, &application->celestial,
++        g_applicationConfiguration.worldSeed,
++        cameraBlockPosition, text, 512);
+     WindowSetOverlayText(application->window, text);
+     application->overlayDirty = false;
+ }
+@@ -415,6 +415,10 @@
+     if (deltaSeconds > 0.1f)
+     {
+         deltaSeconds = 0.1f;
+     }
++    if (!menuOpen)
++    {
++        WorldClockAdvance(&application->worldClock, deltaSeconds);
++    }
+ 
+     bool mouseLookEnabled =
+@@ -455,63 +455,69 @@
+-    UpdateOverlay(application, cameraBlockPosition);
+-
+     ChunkStreamingSetCenter(application->chunkStreaming,
+         cameraBlockPosition[0] >> CHUNK_SIZE_LOG2,
+         cameraBlockPosition[1] >> CHUNK_SIZE_LOG2,
+         cameraBlockPosition[2] >> CHUNK_SIZE_LOG2);
+     ChunkStreamingPump(application->chunkStreaming);
+ 
+-    // Меню обновляется до начала кадра: замена атласа шрифта требует
+-    // паузы GPU, а настройки должны примениться уже к этому кадру.
+-    bool drawMenu = false;
++    // UI atlas is prepared every frame because the same R8 atlas contains
++    // both font glyphs and generated Lima/Pox phase sprites.
++    int32_t cursorX = 0;
++    int32_t cursorY = 0;
++    bool mouseDown = false;
++    bool mousePressed = false;
+     if (menuOpen)
+     {
+-        int32_t cursorX;
+-        int32_t cursorY;
+         WindowGetCursorClientPosition(application->window,
+             &cursorX, &cursorY);
+-        bool mouseDown = InputIsMouseButtonDown(
++        mouseDown = InputIsMouseButtonDown(
+             application->input, INPUT_MOUSE_BUTTON_LEFT);
+-        bool mousePressed = InputWasMouseButtonPressed(
++        mousePressed = InputWasMouseButtonPressed(
+             application->input, INPUT_MOUSE_BUTTON_LEFT);
++    }
++    bool uiReady = UiBegin(&application->ui,
++        application->windowWidth, application->windowHeight,
++        (float)cursorX, (float)cursorY,
++        mouseDown, mousePressed, deltaSeconds);
++    if (uiReady && application->ui.fontDirty
++        && RendererUiSetFontAtlas(application->renderer,
++            application->ui.font.atlas,
++            application->ui.font.atlasWidth,
++            application->ui.font.atlasHeight))
++    {
++        application->ui.fontDirty = false;
++    }
+ 
+-        if (UiBegin(&application->ui,
+-                application->windowWidth, application->windowHeight,
+-                (float)cursorX, (float)cursorY,
+-                mouseDown, mousePressed, deltaSeconds))
++    if (menuOpen && uiReady)
++    {
++        PauseMenuAction action = PauseMenuUpdate(&application->menu,
++            &application->ui, &application->settings,
++            &application->worldClock, application->renderer,
++            application->windowWidth, application->windowHeight,
++            escapePressed);
++        if (action == PAUSE_MENU_ACTION_QUIT)
+         {
+-            if (application->ui.fontDirty
+-                && RendererUiSetFontAtlas(application->renderer,
+-                    application->ui.font.atlas,
+-                    application->ui.font.atlasWidth,
+-                    application->ui.font.atlasHeight))
+-            {
+-                application->ui.fontDirty = false;
+-            }
+-
+-            PauseMenuAction action = PauseMenuUpdate(&application->menu,
+-                &application->ui, &application->settings,
+-                application->renderer,
+-                application->windowWidth, application->windowHeight,
+-                escapePressed);
+-            if (action == PAUSE_MENU_ACTION_QUIT)
+-            {
+-                WindowRequestClose(application->window);
+-                return;
+-            }
+-            if (action == PAUSE_MENU_ACTION_RESUME)
+-            {
+-                ResumeGame(application);
+-            }
+-            else
+-            {
+-                drawMenu = true;
+-            }
++            WindowRequestClose(application->window);
++            return;
+         }
+-        else
++        if (action == PAUSE_MENU_ACTION_RESUME)
+         {
+-            // Шрифт недоступен — меню нарисовать нечем, не запираем игрока.
+             ResumeGame(application);
++            menuOpen = false;
+         }
+     }
++    else if (menuOpen && !uiReady)
++    {
++        ResumeGame(application);
++        menuOpen = false;
++    }
++
++    CelestialEvaluate(&application->worldClock,
++        g_applicationConfiguration.worldSeed, &application->celestial);
++    if (uiReady)
++    {
++        SkyRendererQueueLightingOverlay(&application->ui,
++            &application->celestial,
++            application->windowWidth, application->windowHeight);
++    }
++    UpdateOverlay(application, cameraBlockPosition);
+ 
+     // Описание кадра: обычная перспектива или панорама по граням кубмапы.
+@@ -535,9 +535,14 @@
+     PanoramaBuildFrameSetup(&application->panoramaCache,
+         application->settings.projection,
+         (float)application->settings.fovDegrees,
+         application->windowWidth, application->windowHeight,
+         g_applicationConfiguration.nearPlane,
+         g_applicationConfiguration.farPlane,
+         viewMatrix, &frameSetup);
++    for (uint32_t channel = 0; channel < 4u; ++channel)
++    {
++        frameSetup.clearColor[channel] =
++            application->celestial.skyColor[channel];
++    }
+ 
+     if (RendererBeginFrame(application->renderer, &frameSetup))
+@@ -548,13 +548,31 @@
+         for (uint32_t pass = 0; pass < frameSetup.passCount; ++pass)
+         {
+             RendererBeginScenePass(application->renderer, pass);
++            if (uiReady)
++            {
++                RendererUiQuad skyQuads[SKY_RENDERER_MAX_PASS_QUADS];
++                uint32_t skyQuadCount = SkyRendererBuildPassQuads(
++                    &application->celestial, &frameSetup, pass,
++                    (float)application->settings.fovDegrees * 0.0174532925f,
++                    &application->ui.font, skyQuads);
++                const RendererScenePass* scenePass =
++                    &frameSetup.passes[pass];
++                uint32_t targetWidth = frameSetup.panorama
++                    ? scenePass->rectMaxX - scenePass->rectMinX
++                    : (uint32_t)application->windowWidth;
++                uint32_t targetHeight = frameSetup.panorama
++                    ? scenePass->rectMaxY - scenePass->rectMinY
++                    : (uint32_t)application->windowHeight;
++                RendererDrawSceneUi(application->renderer,
++                    skyQuads, skyQuadCount, targetWidth, targetHeight);
++            }
+             ChunkStreamingDraw(application->chunkStreaming,
+                 frameSetup.passes[pass].viewProjection,
+                 cameraBlockPosition);
+         }
+ 
+-        if (drawMenu)
++        if (uiReady && application->ui.quadCount > 0u)
+         {
+             RendererUiQueue(application->renderer,
+                 application->ui.quads, application->ui.quadCount);
+         }
+@@ -640,5 +640,10 @@
+     application->settings.fovDegrees =
+         g_applicationConfiguration.defaultFieldOfViewDegrees;
+     application->settings.projection = RENDER_PROJECTION_AUTO;
++    WorldClockInit(&application->worldClock,
++        g_applicationConfiguration.worldSeed,
++        g_applicationConfiguration.worldSecondsPerRealSecond);
++    CelestialEvaluate(&application->worldClock,
++        g_applicationConfiguration.worldSeed, &application->celestial);
+ 
+     PlayerControllerInit
+diff --git a/assets/texturepacks/active.txt b/assets/texturepacks/active.txt
+--- a/assets/texturepacks/active.txt
++++ b/assets/texturepacks/active.txt
+@@ -1 +1 @@
+-patrix_32x.ltp
++laiue_original_32x.ltp
+diff --git a/tools/build_texture_pack.ps1 b/tools/build_texture_pack.ps1
+--- a/tools/build_texture_pack.ps1
++++ b/tools/build_texture_pack.ps1
+@@ -29,8 +29,8 @@
+ $LtpMagic = [uint32]0x3150544C
+ $LtpVersion = [uint16]1
+ $LtpHeaderSize = [uint16]24
+ $LtpFormatRgba8 = [uint32]1
+-$LayerCount = 3
++$LayerCount = 4
+ $MaximumDimension = 4096
+ 
+ function Convert-BitmapToRgba {
+@@ -233,6 +233,7 @@
+-    # Stable LTP layer order: dirt, grass top, grass side.
++    # Stable LTP layer order: dirt, grass top, grass side, stone.
+     $layers = @(
+         Read-PngFile -Path (Join-Path $sourceDirectory 'dirt.png')
+         Read-PngFile -Path (Join-Path $sourceDirectory 'grass_top.png')
+         Read-PngFile -Path (Join-Path $sourceDirectory 'grass_side.png')
++        Read-PngFile -Path (Join-Path $sourceDirectory 'stone.png')
+     )
+@@ -251,6 +251,8 @@
+         $tint = Convert-HexColor -Color $GrassTint
+         $grassTop = New-TintedImage -Image $grassTopSource -Tint $tint -ForceOpaque
+         $grassSide = Merge-GrassSide -Base $grassSideBase -Overlay $grassSideOverlay -Tint $tint
+-        $layers = @($dirt, $grassTop, $grassSide)
++        # Legacy Patrix import has no dedicated stone. Dirt is duplicated
++        # only for this compatibility path; the built-in Laiue pack has stone.
++        $layers = @($dirt, $grassTop, $grassSide, $dirt)
+     }
+     finally {
+diff --git a/docs/texturepacks.md b/docs/texturepacks.md
+--- a/docs/texturepacks.md
++++ b/docs/texturepacks.md
+@@ -30,4 +30,5 @@
+   dirt.png
+   grass_top.png
+   grass_side.png
++  stone.png
+ ```
+@@ -37,9 +37,10 @@
+ ```powershell
+ pwsh -File tools/build_texture_pack.ps1 `
+   -Directory .\my_pack `
+   -Output .\assets\texturepacks\my_pack.ltp
+ ```
+ 
+-Порядок слоёв стабилен: `0=dirt`, `1=grass_top`, `2=grass_side`.
++Порядок слоёв стабилен: `0=dirt`, `1=grass_top`, `2=grass_side`, `3=stone`.
++Старые трёхслойные LTP1 всё ещё читаются: для stone используется dirt.
+ 
+ ## Импорт Patrix
+@@ -78,5 +78,5 @@
+ | 8 | `u16` | width |
+ | 10 | `u16` | height |
+-| 12 | `u16` | layer count `3` |
++| 12 | `u16` | layer count `4` (legacy `3` accepted) |
+ | 14 | `u16` | полное число mip-уровней |
+ | 16 | `u32` | format `1` (`RGBA8`) |
+diff --git a/assets/texturepacks/patrix_32x.ltp b/assets/texturepacks/patrix_32x.ltp
+deleted file mode 100644
+index f269a1b3d79d0daf086ecf2d712b24d011d430b0..0000000000000000000000000000000000000000
+Binary files a/assets/texturepacks/patrix_32x.ltp and /dev/null differ
+diff --git a/assets/sky/moons_32x8.r8 b/assets/sky/moons_32x8.r8
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e14e82f58400cc7ac6341f23ad81e285b645b57
+GIT binary patch
+literal 16384
+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
+TX{h%PuD@J<_44^Y;QxOBdVx(i
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/dirt.png b/assets/texture_sources/laiue_original_32x/dirt.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e06b488bc9c244ac875babd0903fb4e022abe5a
+GIT binary patch
+literal 2395
+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
+N002ovPDHLkV1f^Au;~B*
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/grass_side.png b/assets/texture_sources/laiue_original_32x/grass_side.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..055ffd2c0251e425c3a473e9fe9efb7960a91872
+GIT binary patch
+literal 2710
+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
+QOaK4?07*qoM6N<$g2@Cxga7~l
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/grass_top.png b/assets/texture_sources/laiue_original_32x/grass_top.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..829c85eca1695165193b90d26b518b88aae83f65
+GIT binary patch
+literal 2766
+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
+U;6>1Z82|tP07*qoM6N<$f~bFW&Hw-a
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/lima_phases.png b/assets/texture_sources/laiue_original_32x/lima_phases.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfa13b78db8eda208c7e5a2efab4e9a8e3dbfa6b
+GIT binary patch
+literal 13996
+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
+S1-}je0000<MNUMnLSTZ!o^NCT
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/pox_phases.png b/assets/texture_sources/laiue_original_32x/pox_phases.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8637cc0a498181bb42b0c01f494ad43b6928886d
+GIT binary patch
+literal 13742
+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
+Y0wWG6#o&}8TmS$707*qoM6N<$f)zbD6951J
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texture_sources/laiue_original_32x/stone.png b/assets/texture_sources/laiue_original_32x/stone.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7df38ffd5ba6ff757e98b2987b54562cf8e1636b
+GIT binary patch
+literal 2421
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/texturepacks/laiue_original_32x.ltp b/assets/texturepacks/laiue_original_32x.ltp
+new file mode 100644
+index 0000000000000000000000000000000000000000..50c285e97cc49553b32ec166a99ed0964dbacdbf
+GIT binary patch
+literal 21864
+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
+C^3pN@
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/celestial.md b/docs/celestial.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f875baa537631736456b9490b52e5599504d4621
+--- /dev/null
++++ b/docs/celestial.md
+@@ -0,0 +1,19 @@
++# Время мира и небо
++
++Мировые часы хранят 64-битный номер дня относительно 2000-01-01 и секунды
++внутри текущих суток. При стандартной скорости игровые сутки проходят за
++20 реальных минут. Диапазон составляет примерно 25 квадриллионов
++григорианских лет в обе стороны — для игры время практически бесконечно.
++
++Seed мира детерминированно задаёт стартовую дату и начальные смещения орбит:
++
++- **Лима** — холодная серебристая луна с циклом фаз 29,53 суток;
++- **Покс** — тёплая янтарно-фиолетовая луна с циклом фаз 11,63 суток.
++
++В меню паузы есть экран **«Время мира»**: остановка/запуск времени,
++прибавление и вычитание часов и дней, а также пресеты рассвета, полудня,
++заката и полуночи.
++
++Сгенерированные фазы собраны в `sky/moons_32x8.r8`: две строки по восемь фаз,
++каждый кадр 32x32. Текст и луны используют общий R8-атлас интерфейса, поэтому
++во время игры не требуется декодировать PNG.
+diff --git a/src/celestial/CMakeLists.txt b/src/celestial/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7db34ae17c91c5910d65c11917c569e0c891a6a
+--- /dev/null
++++ b/src/celestial/CMakeLists.txt
+@@ -0,0 +1,10 @@
++laiue_add_module(celestial
++    SOURCES
++        celestial_model.c
++        celestial_model.h
++        world_calendar.c
++        world_calendar.h
++        world_clock.c
++        world_clock.h
++        ../api.h
++)
+diff --git a/src/celestial/celestial_model.c b/src/celestial/celestial_model.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..20d977a27fbb3351d4defccfe65b7eac53fa5457
+--- /dev/null
++++ b/src/celestial/celestial_model.c
+@@ -0,0 +1,197 @@
++#include "celestial/celestial_model.h"
++
++#include <stdbool.h>
++
++#define CELESTIAL_PI 3.14159265358979323846
++#define CELESTIAL_TWO_PI (2.0 * CELESTIAL_PI)
++#define WORLD_SECONDS_PER_DAY_INT 86400LL
++#define LIMA_PERIOD_SECONDS 2551443LL
++#define POX_PERIOD_SECONDS 1004832LL
++
++static uint64_t MixSeed(uint64_t value)
++{
++    value ^= value >> 30;
++    value *= UINT64_C(0xbf58476d1ce4e5b9);
++    value ^= value >> 27;
++    value *= UINT64_C(0x94d049bb133111eb);
++    return value ^ (value >> 31);
++}
++
++static double WrapSignedPi(double value)
++{
++    while (value > CELESTIAL_PI) value -= CELESTIAL_TWO_PI;
++    while (value < -CELESTIAL_PI) value += CELESTIAL_TWO_PI;
++    return value;
++}
++
++static double SinApprox(double value)
++{
++    value = WrapSignedPi(value);
++    if (value > CELESTIAL_PI * 0.5)
++    {
++        value = CELESTIAL_PI - value;
++    }
++    else if (value < -CELESTIAL_PI * 0.5)
++    {
++        value = -CELESTIAL_PI - value;
++    }
++
++    double square = value * value;
++    return value * (1.0 + square * (-1.0 / 6.0
++        + square * (1.0 / 120.0
++        + square * (-1.0 / 5040.0
++        + square * (1.0 / 362880.0)))));
++}
++
++static double CosApprox(double value)
++{
++    return SinApprox(value + CELESTIAL_PI * 0.5);
++}
++
++static float Clamp01(float value)
++{
++    if (value < 0.0f) return 0.0f;
++    if (value > 1.0f) return 1.0f;
++    return value;
++}
++
++static float SmoothStep(float edge0, float edge1, float value)
++{
++    float t = Clamp01((value - edge0) / (edge1 - edge0));
++    return t * t * (3.0f - 2.0f * t);
++}
++
++static float Lerp(float left, float right, float amount)
++{
++    return left + (right - left) * amount;
++}
++
++static int64_t PositiveModulo(int64_t value, int64_t modulus)
++{
++    int64_t result = value % modulus;
++    return result < 0 ? result + modulus : result;
++}
++
++static double CycleFraction(const WorldClock* clock,
++    int64_t periodSeconds, uint64_t seedOffset)
++{
++    int64_t dayRemainder = PositiveModulo(
++        WorldClockGetDayNumber(clock), periodSeconds);
++    int64_t wholeSeconds = (int64_t)clock->secondsOfDay;
++    int64_t cycle = PositiveModulo(
++        dayRemainder * WORLD_SECONDS_PER_DAY_INT
++            + wholeSeconds
++            + (int64_t)(seedOffset % (uint64_t)periodSeconds),
++        periodSeconds);
++    double fraction = ((double)cycle
++        + (clock->secondsOfDay - (double)wholeSeconds))
++        / (double)periodSeconds;
++    return fraction >= 1.0 ? fraction - 1.0 : fraction;
++}
++
++static void SetOrbitDirection(float outDirection[3],
++    double longitude, double inclination)
++{
++    double sinLongitude = SinApprox(longitude);
++    double cosLongitude = CosApprox(longitude);
++    double sinInclination = SinApprox(inclination);
++    double cosInclination = CosApprox(inclination);
++
++    outDirection[0] = (float)cosLongitude;
++    outDirection[1] = (float)(-sinLongitude * sinInclination);
++    outDirection[2] = (float)(sinLongitude * cosInclination);
++}
++
++static uint32_t PhaseIndex(double fraction)
++{
++    uint32_t index = (uint32_t)(fraction * 8.0 + 0.5);
++    return index & 7u;
++}
++
++static float PhaseBrightness(double fraction)
++{
++    return (float)(0.12 + 0.88
++        * (0.5 - 0.5 * CosApprox(fraction * CELESTIAL_TWO_PI)));
++}
++
++static void SetBody(CelestialBodyState* body,
++    double longitude, double inclination, double phase,
++    float red, float green, float blue,
++    float angularRadius, bool isSun)
++{
++    SetOrbitDirection(body->direction, longitude, inclination);
++    body->color[0] = red;
++    body->color[1] = green;
++    body->color[2] = blue;
++    body->angularRadius = angularRadius;
++    body->phaseIndex = isSun ? 0u : PhaseIndex(phase);
++    body->brightness = isSun ? 1.0f : PhaseBrightness(phase);
++    body->visible = body->direction[2] > -0.08f ? 1u : 0u;
++}
++
++void CelestialEvaluate(const WorldClock* clock,
++    int64_t seed, CelestialState* outState)
++{
++    double dayFraction = WorldClockGetDayFraction(clock);
++    // 06:00 — восточный горизонт, 12:00 — зенит, 18:00 — запад.
++    double sunLongitude = (dayFraction - 0.25) * CELESTIAL_TWO_PI;
++
++    uint64_t mixed = MixSeed((uint64_t)seed);
++    double limaPhase = CycleFraction(clock, LIMA_PERIOD_SECONDS, mixed);
++    double poxPhase = CycleFraction(clock, POX_PERIOD_SECONDS,
++        MixSeed(mixed ^ UINT64_C(0x706f785f6d6f6f6e)));
++
++    SetBody(&outState->sun,
++        sunLongitude, 0.0, 0.0,
++        1.0f, 0.84f, 0.48f, 0.045f, true);
++    SetBody(&outState->lima,
++        sunLongitude + limaPhase * CELESTIAL_TWO_PI,
++        0.16, limaPhase,
++        0.86f, 0.92f, 1.0f, 0.038f, false);
++    SetBody(&outState->pox,
++        sunLongitude + poxPhase * CELESTIAL_TWO_PI,
++        -0.31, poxPhase,
++        1.0f, 0.62f, 0.38f, 0.030f, false);
++
++    float sunElevation = outState->sun.direction[2];
++    float daylight = SmoothStep(-0.16f, 0.16f, sunElevation);
++    float twilight = 1.0f - SmoothStep(0.02f, 0.34f,
++        sunElevation < 0.0f ? -sunElevation : sunElevation);
++
++    const float night[3] = { 0.008f, 0.014f, 0.040f };
++    const float day[3] = { 0.38f, 0.63f, 0.92f };
++    const float sunset[3] = { 0.78f, 0.27f, 0.12f };
++    for (uint32_t channel = 0; channel < 3u; ++channel)
++    {
++        float base = Lerp(night[channel], day[channel], daylight);
++        outState->skyColor[channel] = Clamp01(
++            base + sunset[channel] * twilight * (1.0f - daylight) * 0.42f);
++    }
++    outState->skyColor[3] = 1.0f;
++
++    float limaLight = outState->lima.brightness
++        * Clamp01(outState->lima.direction[2]) * 0.10f;
++    float poxLight = outState->pox.brightness
++        * Clamp01(outState->pox.direction[2]) * 0.07f;
++    float nightContribution = (limaLight + poxLight) * (1.0f - daylight);
++    float light = Clamp01(0.11f + daylight * 0.89f + nightContribution);
++    outState->sceneLight[0] = light * Lerp(0.62f, 1.0f, daylight);
++    outState->sceneLight[1] = light * Lerp(0.70f, 1.0f, daylight);
++    outState->sceneLight[2] = light * Lerp(0.95f, 1.0f, daylight);
++    outState->sceneLight[3] = 1.0f;
++}
++
++const wchar_t* CelestialPhaseName(uint32_t phaseIndex)
++{
++    static const wchar_t* const names[8] = {
++        L"новолуние",
++        L"растущий серп",
++        L"первая четверть",
++        L"растущая",
++        L"полнолуние",
++        L"убывающая",
++        L"последняя четверть",
++        L"убывающий серп",
++    };
++    return names[phaseIndex & 7u];
++}
+diff --git a/src/celestial/celestial_model.h b/src/celestial/celestial_model.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc2baf2bf994c0cbb18cd6d927903d51603e950c
+--- /dev/null
++++ b/src/celestial/celestial_model.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "api.h"
++#include "celestial/world_clock.h"
++
++#include <stdint.h>
++#include <wchar.h>
++
++typedef struct CelestialBodyState
++{
++    float direction[3];
++    float color[3];
++    float angularRadius;
++    float brightness;
++    uint32_t phaseIndex;
++    uint32_t visible;
++} CelestialBodyState;
++
++typedef struct CelestialState
++{
++    float skyColor[4];
++    float sceneLight[4];
++    CelestialBodyState sun;
++    CelestialBodyState lima;
++    CelestialBodyState pox;
++} CelestialState;
++
++LAIUE_CELESTIAL_API void CelestialEvaluate(
++    const WorldClock* clock, int64_t seed, CelestialState* outState);
++LAIUE_CELESTIAL_API const wchar_t* CelestialPhaseName(uint32_t phaseIndex);
+diff --git a/src/celestial/world_calendar.c b/src/celestial/world_calendar.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed902e3ef1f76c997ac579985b49c83b243ab0a4
+--- /dev/null
++++ b/src/celestial/world_calendar.c
+@@ -0,0 +1,119 @@
++#include "celestial/world_calendar.h"
++
++#include <limits.h>
++
++#define WORLD_EPOCH_2000_TO_1970_DAYS 10957LL
++
++static int64_t FloorDivide(int64_t value, int64_t divisor)
++{
++    int64_t quotient = value / divisor;
++    if (value % divisor < 0)
++    {
++        --quotient;
++    }
++    return quotient;
++}
++
++static int64_t SaturatingAdd(int64_t left, int64_t right)
++{
++    if (right > 0 && left > INT64_MAX - right) return INT64_MAX;
++    if (right < 0 && left < INT64_MIN - right) return INT64_MIN;
++    return left + right;
++}
++
++static void AppendCharacter(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, wchar_t character)
++{
++    if (*length + 1u >= capacity) return;
++    destination[(*length)++] = character;
++    destination[*length] = L'\0';
++}
++
++static void AppendUnsigned(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, uint64_t value, uint32_t minimumDigits)
++{
++    wchar_t reversed[24];
++    uint32_t count = 0;
++    do
++    {
++        reversed[count++] = (wchar_t)(L'0' + value % 10u);
++        value /= 10u;
++    }
++    while (value != 0u && count < 24u);
++    while (count < minimumDigits && count < 24u)
++    {
++        reversed[count++] = L'0';
++    }
++    while (count > 0u)
++    {
++        AppendCharacter(destination, capacity, length, reversed[--count]);
++    }
++}
++
++static void AppendSigned(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, int64_t value)
++{
++    uint64_t magnitude;
++    if (value < 0)
++    {
++        AppendCharacter(destination, capacity, length, L'-');
++        magnitude = (uint64_t)(-(value + 1)) + 1u;
++    }
++    else
++    {
++        magnitude = (uint64_t)value;
++    }
++    AppendUnsigned(destination, capacity, length, magnitude, 1u);
++}
++
++void WorldCalendarGetDateTime(
++    const WorldClock* clock, WorldDateTime* outDateTime)
++{
++    // Howard Hinnant's civil_from_days for the proleptic Gregorian calendar.
++    int64_t z = SaturatingAdd(WorldClockGetDayNumber(clock),
++        WORLD_EPOCH_2000_TO_1970_DAYS);
++    z = SaturatingAdd(z, 719468);
++    int64_t era = FloorDivide(z, 146097);
++    uint32_t dayOfEra = (uint32_t)(z - era * 146097);
++    uint32_t yearOfEra = (dayOfEra - dayOfEra / 1460u
++        + dayOfEra / 36524u - dayOfEra / 146096u) / 365u;
++    int64_t year = (int64_t)yearOfEra + era * 400;
++    uint32_t dayOfYear = dayOfEra
++        - (365u * yearOfEra + yearOfEra / 4u - yearOfEra / 100u);
++    uint32_t monthPrime = (5u * dayOfYear + 2u) / 153u;
++    uint32_t day = dayOfYear
++        - (153u * monthPrime + 2u) / 5u + 1u;
++    uint32_t month = monthPrime < 10u
++        ? monthPrime + 3u : monthPrime - 9u;
++    year += month <= 2u;
++
++    uint32_t seconds = WorldClockGetSecondOfDay(clock);
++    outDateTime->year = year;
++    outDateTime->month = (uint8_t)month;
++    outDateTime->day = (uint8_t)day;
++    outDateTime->hour = (uint8_t)(seconds / 3600u);
++    outDateTime->minute = (uint8_t)((seconds / 60u) % 60u);
++    outDateTime->second = (uint8_t)(seconds % 60u);
++}
++
++void WorldCalendarFormatDateTime(
++    const WorldClock* clock, wchar_t* destination, uint32_t capacity)
++{
++    if (capacity == 0u) return;
++    destination[0] = L'\0';
++
++    WorldDateTime dateTime;
++    WorldCalendarGetDateTime(clock, &dateTime);
++    uint32_t length = 0;
++    AppendSigned(destination, capacity, &length, dateTime.year);
++    AppendCharacter(destination, capacity, &length, L'-');
++    AppendUnsigned(destination, capacity, &length, dateTime.month, 2u);
++    AppendCharacter(destination, capacity, &length, L'-');
++    AppendUnsigned(destination, capacity, &length, dateTime.day, 2u);
++    AppendCharacter(destination, capacity, &length, L' ');
++    AppendUnsigned(destination, capacity, &length, dateTime.hour, 2u);
++    AppendCharacter(destination, capacity, &length, L':');
++    AppendUnsigned(destination, capacity, &length, dateTime.minute, 2u);
++    AppendCharacter(destination, capacity, &length, L':');
++    AppendUnsigned(destination, capacity, &length, dateTime.second, 2u);
++}
+diff --git a/src/celestial/world_calendar.h b/src/celestial/world_calendar.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc37b9fc67707c0b5f56d121cb599fe2ec7a2c96
+--- /dev/null
++++ b/src/celestial/world_calendar.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include "api.h"
++#include "celestial/world_clock.h"
++
++#include <stdint.h>
++#include <wchar.h>
++
++typedef struct WorldDateTime
++{
++    int64_t year;
++    uint8_t month;
++    uint8_t day;
++    uint8_t hour;
++    uint8_t minute;
++    uint8_t second;
++} WorldDateTime;
++
++LAIUE_CELESTIAL_API void WorldCalendarGetDateTime(
++    const WorldClock* clock, WorldDateTime* outDateTime);
++LAIUE_CELESTIAL_API void WorldCalendarFormatDateTime(
++    const WorldClock* clock, wchar_t* destination, uint32_t capacity);
+diff --git a/src/celestial/world_clock.c b/src/celestial/world_clock.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..416733db5a28869115fb6b866174fc7515012510
+--- /dev/null
++++ b/src/celestial/world_clock.c
+@@ -0,0 +1,121 @@
++#include "celestial/world_clock.h"
++
++#include <limits.h>
++
++#define WORLD_SECONDS_PER_DAY 86400.0
++
++static uint64_t MixSeed(uint64_t value)
++{
++    value ^= value >> 30;
++    value *= UINT64_C(0xbf58476d1ce4e5b9);
++    value ^= value >> 27;
++    value *= UINT64_C(0x94d049bb133111eb);
++    return value ^ (value >> 31);
++}
++
++static int64_t FloorToInt64(double value)
++{
++    int64_t truncated = (int64_t)value;
++    return (double)truncated > value ? truncated - 1 : truncated;
++}
++
++static int64_t SaturatingAdd(int64_t left, int64_t right)
++{
++    if (right > 0 && left > INT64_MAX - right)
++    {
++        return INT64_MAX;
++    }
++    if (right < 0 && left < INT64_MIN - right)
++    {
++        return INT64_MIN;
++    }
++    return left + right;
++}
++
++static void Normalize(WorldClock* clock)
++{
++    if (clock->secondsOfDay >= 0.0
++        && clock->secondsOfDay < WORLD_SECONDS_PER_DAY)
++    {
++        return;
++    }
++
++    int64_t dayDelta = FloorToInt64(
++        clock->secondsOfDay / WORLD_SECONDS_PER_DAY);
++    clock->secondsOfDay -= (double)dayDelta * WORLD_SECONDS_PER_DAY;
++    clock->dayNumber = SaturatingAdd(clock->dayNumber, dayDelta);
++
++    if (clock->secondsOfDay < 0.0)
++    {
++        clock->secondsOfDay += WORLD_SECONDS_PER_DAY;
++        clock->dayNumber = SaturatingAdd(clock->dayNumber, -1);
++    }
++    else if (clock->secondsOfDay >= WORLD_SECONDS_PER_DAY)
++    {
++        clock->secondsOfDay -= WORLD_SECONDS_PER_DAY;
++        clock->dayNumber = SaturatingAdd(clock->dayNumber, 1);
++    }
++}
++
++void WorldClockInit(WorldClock* clock,
++    int64_t seed, double gameSecondsPerRealSecond)
++{
++    uint64_t mixed = MixSeed((uint64_t)seed);
++    // The seed chooses a date inside one complete 400-year Gregorian cycle.
++    // A new world starts at 08:00 so the first session is not forced into night.
++    clock->dayNumber = (int64_t)(mixed % UINT64_C(146097));
++    clock->secondsOfDay = 8.0 * 3600.0;
++    clock->gameSecondsPerRealSecond = gameSecondsPerRealSecond > 0.0
++        ? gameSecondsPerRealSecond : 72.0;
++    clock->running = true;
++}
++
++void WorldClockAdvance(WorldClock* clock, double realSeconds)
++{
++    if (!clock->running || realSeconds <= 0.0)
++    {
++        return;
++    }
++    WorldClockAddGameSeconds(clock,
++        realSeconds * clock->gameSecondsPerRealSecond);
++}
++
++void WorldClockAddGameSeconds(WorldClock* clock, double gameSeconds)
++{
++    clock->secondsOfDay += gameSeconds;
++    Normalize(clock);
++}
++
++void WorldClockSetTimeOfDay(WorldClock* clock,
++    uint32_t hour, uint32_t minute, uint32_t second)
++{
++    if (hour > 23u) hour = 23u;
++    if (minute > 59u) minute = 59u;
++    if (second > 59u) second = 59u;
++    clock->secondsOfDay = (double)(hour * 3600u + minute * 60u + second);
++}
++
++void WorldClockSetRunning(WorldClock* clock, bool running)
++{
++    clock->running = running;
++}
++
++bool WorldClockIsRunning(const WorldClock* clock)
++{
++    return clock->running;
++}
++
++double WorldClockGetDayFraction(const WorldClock* clock)
++{
++    return clock->secondsOfDay / WORLD_SECONDS_PER_DAY;
++}
++
++int64_t WorldClockGetDayNumber(const WorldClock* clock)
++{
++    return clock->dayNumber;
++}
++
++uint32_t WorldClockGetSecondOfDay(const WorldClock* clock)
++{
++    return (uint32_t)clock->secondsOfDay;
++}
+diff --git a/src/celestial/world_clock.h b/src/celestial/world_clock.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1a9625f85725710cc50384d4879d6db10a4c132
+--- /dev/null
++++ b/src/celestial/world_clock.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include "api.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef struct WorldClock
++{
++    // Number of days since 2000-01-01. int64 gives roughly 25 quadrillion
++    // Gregorian years in both directions, which is effectively infinite for play.
++    int64_t dayNumber;
++    double secondsOfDay;
++    double gameSecondsPerRealSecond;
++    bool running;
++} WorldClock;
++
++LAIUE_CELESTIAL_API void WorldClockInit(WorldClock* clock,
++    int64_t seed, double gameSecondsPerRealSecond);
++LAIUE_CELESTIAL_API void WorldClockAdvance(
++    WorldClock* clock, double realSeconds);
++LAIUE_CELESTIAL_API void WorldClockAddGameSeconds(
++    WorldClock* clock, double gameSeconds);
++LAIUE_CELESTIAL_API void WorldClockSetTimeOfDay(WorldClock* clock,
++    uint32_t hour, uint32_t minute, uint32_t second);
++LAIUE_CELESTIAL_API void WorldClockSetRunning(
++    WorldClock* clock, bool running);
++LAIUE_CELESTIAL_API bool WorldClockIsRunning(const WorldClock* clock);
++LAIUE_CELESTIAL_API double WorldClockGetDayFraction(const WorldClock* clock);
++LAIUE_CELESTIAL_API int64_t WorldClockGetDayNumber(const WorldClock* clock);
++LAIUE_CELESTIAL_API uint32_t WorldClockGetSecondOfDay(const WorldClock* clock);
+diff --git a/src/core/sky_renderer.c b/src/core/sky_renderer.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4451e88aa586b3ea34189d465ab0e7d93561b216
+--- /dev/null
++++ b/src/core/sky_renderer.c
+@@ -0,0 +1,197 @@
++#include "core/sky_renderer.h"
++
++#include "core/math.h"
++
++#include <stddef.h>
++
++#define SKY_PI 3.14159265358979323846f
++
++static uint8_t ColorChannel(float value)
++{
++    value = ScalarClamp(value, 0.0f, 1.0f);
++    return (uint8_t)(value * 255.0f + 0.5f);
++}
++
++static uint32_t BodyColor(const CelestialBodyState* body)
++{
++    float intensity = 0.56f + body->brightness * 0.44f;
++    return UiColor(
++        ColorChannel(body->color[0] * intensity),
++        ColorChannel(body->color[1] * intensity),
++        ColorChannel(body->color[2] * intensity), 255u);
++}
++
++static bool ProjectDirection(const float matrix[16],
++    const float direction[3], float outNdc[2])
++{
++    float clipX = direction[0] * matrix[0]
++        + direction[1] * matrix[4] + direction[2] * matrix[8];
++    float clipY = direction[0] * matrix[1]
++        + direction[1] * matrix[5] + direction[2] * matrix[9];
++    float clipW = direction[0] * matrix[3]
++        + direction[1] * matrix[7] + direction[2] * matrix[11];
++    if (clipW <= 1e-5f)
++    {
++        return false;
++    }
++    outNdc[0] = clipX / clipW;
++    outNdc[1] = clipY / clipW;
++    return outNdc[0] >= -1.25f && outNdc[0] <= 1.25f
++        && outNdc[1] >= -1.25f && outNdc[1] <= 1.25f;
++}
++
++static float BodyDiameter(const CelestialBodyState* body,
++    const RendererFrameSetup* frame, float horizontalFovRadians,
++    float targetWidth)
++{
++    float radians = body->angularRadius * 2.0f;
++    float referenceFov = frame->panorama ? SKY_PI * 0.5f
++        : ScalarClamp(horizontalFovRadians, 0.0174533f, 2.96706f);
++    float diameter = radians / referenceFov * targetWidth;
++    return ScalarClamp(diameter, 12.0f, 112.0f);
++}
++
++static void SetRect(RendererUiQuad* quad,
++    float centerX, float centerY, float diameter)
++{
++    float radius = diameter * 0.5f;
++    quad->rect[0] = centerX - radius;
++    quad->rect[1] = centerY - radius;
++    quad->rect[2] = centerX + radius;
++    quad->rect[3] = centerY + radius;
++    quad->reserved = 0u;
++}
++
++static bool AddBody(const CelestialBodyState* body,
++    const RendererFrameSetup* frame, uint32_t passIndex,
++    float horizontalFovRadians, const UiAtlasRegion* sprite,
++    RendererUiQuad* outQuad)
++{
++    if (body->visible == 0u || body->brightness <= 0.01f)
++    {
++        return false;
++    }
++
++    const RendererScenePass* pass = &frame->passes[passIndex];
++    float ndc[2];
++    if (!ProjectDirection(pass->viewProjection, body->direction, ndc))
++    {
++        return false;
++    }
++
++    float targetWidth;
++    float targetHeight;
++    float left;
++    float top;
++    if (frame->panorama)
++    {
++        // Scene UI is drawn with the pass viewport still active, therefore
++        // coordinates are local to that off-center viewport, not to the full
++        // cube-face texture.
++        targetWidth = (float)(pass->rectMaxX - pass->rectMinX);
++        targetHeight = (float)(pass->rectMaxY - pass->rectMinY);
++        left = 0.0f;
++        top = 0.0f;
++    }
++    else
++    {
++        targetWidth = (float)pass->rectMaxX;
++        targetHeight = (float)pass->rectMaxY;
++        left = 0.0f;
++        top = 0.0f;
++    }
++
++    float centerX = left + (ndc[0] * 0.5f + 0.5f) * targetWidth;
++    float centerY = top + (0.5f - ndc[1] * 0.5f) * targetHeight;
++    float diameter = BodyDiameter(body, frame, horizontalFovRadians,
++        targetWidth);
++    SetRect(outQuad, centerX, centerY, diameter);
++    outQuad->colorRGBA = BodyColor(body);
++
++    if (sprite != NULL)
++    {
++        outQuad->uv[0] = sprite->u0;
++        outQuad->uv[1] = sprite->v0;
++        outQuad->uv[2] = sprite->u1;
++        outQuad->uv[3] = sprite->v1;
++        outQuad->cornerRadius = 0.0f;
++        outQuad->flags = RENDERER_UI_QUAD_TEXT;
++    }
++    else
++    {
++        outQuad->uv[0] = outQuad->uv[1]
++            = outQuad->uv[2] = outQuad->uv[3] = 0.0f;
++        outQuad->cornerRadius = diameter * 0.5f;
++        outQuad->flags = 0u;
++    }
++    return true;
++}
++
++uint32_t SkyRendererBuildPassQuads(const CelestialState* celestial,
++    const RendererFrameSetup* frame, uint32_t passIndex,
++    float horizontalFovRadians, const UiFont* atlas,
++    RendererUiQuad outQuads[SKY_RENDERER_MAX_PASS_QUADS])
++{
++    if (passIndex >= frame->passCount)
++    {
++        return 0u;
++    }
++
++    uint32_t count = 0u;
++    if (AddBody(&celestial->sun, frame, passIndex,
++            horizontalFovRadians, NULL, &outQuads[count]))
++    {
++        ++count;
++    }
++
++    const UiAtlasRegion* lima = &atlas->moonPhases[0]
++        [celestial->lima.phaseIndex & 7u];
++    if (AddBody(&celestial->lima, frame, passIndex,
++            horizontalFovRadians, lima, &outQuads[count]))
++    {
++        ++count;
++    }
++
++    const UiAtlasRegion* pox = &atlas->moonPhases[1]
++        [celestial->pox.phaseIndex & 7u];
++    if (AddBody(&celestial->pox, frame, passIndex,
++            horizontalFovRadians, pox, &outQuads[count]))
++    {
++        ++count;
++    }
++    return count;
++}
++
++void SkyRendererQueueLightingOverlay(UiContext* ui,
++    const CelestialState* celestial, int32_t width, int32_t height)
++{
++    float light = (celestial->sceneLight[0]
++        + celestial->sceneLight[1] + celestial->sceneLight[2]) / 3.0f;
++    float darkness = ScalarClamp(1.0f - light, 0.0f, 1.0f);
++    uint32_t alpha = (uint32_t)(darkness * 178.0f + 0.5f);
++    if (alpha == 0u)
++    {
++        return;
++    }
++    if (ui->quadCount >= UI_MAX_DRAW_QUADS)
++    {
++        return;
++    }
++    // Insert the lighting filter below existing menu quads. PauseMenuUpdate may
++    // already have appended its controls by the time celestial state is known.
++    for (uint32_t index = ui->quadCount; index > 0u; --index)
++    {
++        ui->quads[index] = ui->quads[index - 1u];
++    }
++    RendererUiQuad* quad = &ui->quads[0];
++    quad->rect[0] = 0.0f;
++    quad->rect[1] = 0.0f;
++    quad->rect[2] = (float)width;
++    quad->rect[3] = (float)height;
++    quad->uv[0] = quad->uv[1] = quad->uv[2] = quad->uv[3] = 0.0f;
++    quad->colorRGBA = UiColor(3u, 7u, 22u, alpha);
++    quad->cornerRadius = 0.0f;
++    quad->flags = 0u;
++    quad->reserved = 0u;
++    ui->quadCount++;
++}
+diff --git a/src/core/sky_renderer.h b/src/core/sky_renderer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..62706b91b9a14aa134ebbb1e77472343d136514f
+--- /dev/null
++++ b/src/core/sky_renderer.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include "celestial/celestial_model.h"
++#include "core/ui.h"
++#include "render/renderer.h"
++
++#include <stdint.h>
++
++#define SKY_RENDERER_MAX_PASS_QUADS 3u
++
++// Builds sun/Lima/Pox quads for one scene pass. They are drawn before terrain,
++// so normal chunk depth/coverage naturally hides celestial bodies behind land.
++uint32_t SkyRendererBuildPassQuads(const CelestialState* celestial,
++    const RendererFrameSetup* frame, uint32_t passIndex,
++    float horizontalFovRadians, const UiFont* atlas,
++    RendererUiQuad outQuads[SKY_RENDERER_MAX_PASS_QUADS]);
++
++// Final scene-light filter. It is queued before menu UI, so the world darkens
++// at night while the pause menu keeps its original colors.
++void SkyRendererQueueLightingOverlay(UiContext* ui,
++    const CelestialState* celestial, int32_t width, int32_t height);
+diff --git a/src/core/ui_atlas_assets.c b/src/core/ui_atlas_assets.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c49b0b553442748ab449d081cff6ab75f7318a39
+--- /dev/null
++++ b/src/core/ui_atlas_assets.c
+@@ -0,0 +1,141 @@
++#include "core/ui_atlas_assets.h"
++
++#include <windows.h>
++#include <stddef.h>
++
++#define MOON_BYTES (UI_MOON_ATLAS_WIDTH * UI_MOON_ATLAS_HEIGHT)
++#define PATH_CAPACITY 32768u
++
++static bool GetAssetPath(wchar_t* path, uint32_t capacity)
++{
++    DWORD length = GetModuleFileNameW(NULL, path, capacity);
++    if (length == 0u || length >= capacity)
++    {
++        return false;
++    }
++    while (length > 0u && path[length - 1u] != L'\\'
++        && path[length - 1u] != L'/')
++    {
++        --length;
++    }
++    static const wchar_t suffix[] = L"sky\\moons_32x8.r8";
++    uint32_t suffixLength = (uint32_t)(sizeof(suffix) / sizeof(suffix[0])) - 1u;
++    if (length + suffixLength + 1u > capacity)
++    {
++        return false;
++    }
++    for (uint32_t index = 0; index <= suffixLength; ++index)
++    {
++        path[length + index] = suffix[index];
++    }
++    return true;
++}
++
++static bool ReadGeneratedAtlas(uint8_t pixels[MOON_BYTES])
++{
++    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
++        (size_t)PATH_CAPACITY * sizeof(wchar_t));
++    if (path == NULL || !GetAssetPath(path, PATH_CAPACITY))
++    {
++        if (path != NULL) HeapFree(GetProcessHeap(), 0, path);
++        return false;
++    }
++
++    HANDLE file = CreateFileW(path, GENERIC_READ,
++        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    HeapFree(GetProcessHeap(), 0, path);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        return false;
++    }
++
++    LARGE_INTEGER size;
++    DWORD read = 0;
++    bool succeeded = GetFileSizeEx(file, &size)
++        && size.QuadPart == MOON_BYTES
++        && ReadFile(file, pixels, MOON_BYTES, &read, NULL)
++        && read == MOON_BYTES;
++    CloseHandle(file);
++    return succeeded;
++}
++
++static int32_t Absolute(int32_t value)
++{
++    return value < 0 ? -value : value;
++}
++
++static void BuildFallback(uint8_t pixels[MOON_BYTES])
++{
++    for (uint32_t body = 0; body < UI_MOON_BODY_COUNT; ++body)
++    {
++        for (uint32_t phase = 0; phase < UI_MOON_PHASE_COUNT; ++phase)
++        {
++            uint32_t frameOffset =
++                (body * UI_MOON_PHASE_COUNT + phase)
++                * UI_MOON_SPRITE_SIZE * UI_MOON_SPRITE_SIZE;
++            for (int32_t y = 0; y < (int32_t)UI_MOON_SPRITE_SIZE; ++y)
++            {
++                for (int32_t x = 0; x < (int32_t)UI_MOON_SPRITE_SIZE; ++x)
++                {
++                    int32_t dx = x * 2 - 31;
++                    int32_t dy = y * 2 - 31;
++                    uint8_t alpha = 0;
++                    if (dx * dx + dy * dy <= 29 * 29)
++                    {
++                        // Eight readable fallback phases. The shipped generated
++                        // atlas replaces this path during normal builds.
++                        int32_t terminator = (int32_t)phase * 8 - 28;
++                        bool lit = phase <= 4u
++                            ? dx >= -terminator
++                            : dx <= 36 - terminator;
++                        if (phase == 0u) lit = false;
++                        if (phase == 4u) lit = true;
++                        alpha = lit ? (uint8_t)(210 + body * 25u) : 18u;
++                        if (((Absolute(dx) + Absolute(dy) + (int32_t)body * 3) % 11) == 0)
++                        {
++                            alpha = (uint8_t)(alpha * 3u / 4u);
++                        }
++                    }
++                    pixels[frameOffset + (uint32_t)y * UI_MOON_SPRITE_SIZE
++                        + (uint32_t)x] = alpha;
++                }
++            }
++        }
++    }
++}
++
++bool UiAtlasAssetsWriteMoonPhases(uint8_t* atlas,
++    uint32_t atlasWidth, uint32_t atlasHeight,
++    uint32_t destinationX, uint32_t destinationY)
++{
++    if (atlas == NULL
++        || destinationX + UI_MOON_ATLAS_WIDTH > atlasWidth
++        || destinationY + UI_MOON_ATLAS_HEIGHT > atlasHeight)
++    {
++        return false;
++    }
++
++    uint8_t* pixels = HeapAlloc(GetProcessHeap(), 0, MOON_BYTES);
++    if (pixels == NULL)
++    {
++        return false;
++    }
++    if (!ReadGeneratedAtlas(pixels))
++    {
++        BuildFallback(pixels);
++    }
++
++    for (uint32_t row = 0; row < UI_MOON_ATLAS_HEIGHT; ++row)
++    {
++        uint8_t* destination = atlas
++            + (size_t)(destinationY + row) * atlasWidth + destinationX;
++        const uint8_t* source = pixels + (size_t)row * UI_MOON_ATLAS_WIDTH;
++        for (uint32_t column = 0; column < UI_MOON_ATLAS_WIDTH; ++column)
++        {
++            destination[column] = source[column];
++        }
++    }
++    HeapFree(GetProcessHeap(), 0, pixels);
++    return true;
++}
+diff --git a/src/core/ui_atlas_assets.h b/src/core/ui_atlas_assets.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb370e832a4604e45617a75f24306877182eb004
+--- /dev/null
++++ b/src/core/ui_atlas_assets.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define UI_MOON_ATLAS_WIDTH 256u
++#define UI_MOON_ATLAS_HEIGHT 64u
++#define UI_MOON_SPRITE_SIZE 32u
++#define UI_MOON_BODY_COUNT 2u
++#define UI_MOON_PHASE_COUNT 8u
++
++// Copies the generated Lima/Pox phase atlas into an existing R8 UI atlas.
++// Missing runtime data is non-fatal: a procedural phase fallback is written.
++bool UiAtlasAssetsWriteMoonPhases(uint8_t* atlas,
++    uint32_t atlasWidth, uint32_t atlasHeight,
++    uint32_t destinationX, uint32_t destinationY);
