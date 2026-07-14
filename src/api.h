@@ -44,3 +44,15 @@
 #else
 #define LAIUE_PHYSICS_API __declspec(dllimport)
 #endif
+
+#if defined(LAIUE_BUILD_GAMEPLAY)
+#define LAIUE_GAMEPLAY_API __declspec(dllexport)
+#else
+#define LAIUE_GAMEPLAY_API __declspec(dllimport)
+#endif
+
+#if defined(LAIUE_BUILD_INTERACTION)
+#define LAIUE_INTERACTION_API __declspec(dllexport)
+#else
+#define LAIUE_INTERACTION_API __declspec(dllimport)
+#endif

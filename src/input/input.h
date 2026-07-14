@@ -38,8 +38,8 @@ LAIUE_INPUT_API void   InputDestroy(Input* input);
 // Обрабатывает HRAWINPUT из WM_INPUT; подключается к окну как raw-input callback.
 LAIUE_INPUT_API void   InputHandleRawInput(Input* input, void* rawInputHandle);
 
-// Сбрасывает накопленные за кадр данные (нажатия-защёлки и дельту мыши).
-// Вызывается в конце каждого кадра.
+// Сбрасывает только покадровые данные мыши. Очередь нажатий клавиш
+// живёт до явного InputConsumeKeyPress, поэтому не теряется при большом FPS.
 LAIUE_INPUT_API void   InputEndFrame(Input* input);
 
 // Полный сброс состояния (все клавиши «отпущены», дельты обнулены).
@@ -49,6 +49,7 @@ LAIUE_INPUT_API void   InputResetState(Input* input);
 
 LAIUE_INPUT_API bool   InputIsKeyDown(const Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputWasKeyPressed(const Input* input, InputKey key);
+LAIUE_INPUT_API bool   InputConsumeKeyPress(Input* input, InputKey key);
 LAIUE_INPUT_API bool   InputIsMouseButtonDown(const Input* input, InputMouseButton button);
 LAIUE_INPUT_API bool   InputWasMouseButtonPressed(const Input* input, InputMouseButton button);
 LAIUE_INPUT_API void   InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY);

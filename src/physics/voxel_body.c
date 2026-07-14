@@ -1,5 +1,7 @@
 #include "physics/voxel_body.h"
 
+#include <stddef.h>
+
 static int64_t FloorToInt64(double value)
 {
     int64_t truncated = (int64_t)value;
@@ -244,4 +246,107 @@ bool VoxelBodyOverlapsBlock(const double position[3],
         }
     }
     return true;
+}
+
+static bool HasSupportBelowOffset(
+    const VoxelCollisionSource* collision,
+    const double position[3], const VoxelBodyShape* shape,
+    double probeDepth, double xOffset, double yOffset)
+{
+    if (probeDepth <= 0.0)
+    {
+        return false;
+    }
+
+    double shiftedPosition[3] = {
+        position[0] + xOffset,
+        position[1] + yOffset,
+        position[2],
+    };
+    VoxelBodyBounds bounds;
+    VoxelBodyCalculateBounds(shiftedPosition, shape, &bounds);
+
+    double epsilon = shape->collisionEpsilon;
+    int64_t minimumX = FloorToInt64(bounds.minimum[0] + epsilon);
+    int64_t maximumX = FloorToInt64(bounds.maximum[0] - epsilon);
+    int64_t minimumY = FloorToInt64(bounds.minimum[1] + epsilon);
+    int64_t maximumY = FloorToInt64(bounds.maximum[1] - epsilon);
+    int64_t minimumZ = FloorToInt64(bounds.minimum[2] - probeDepth + epsilon);
+    int64_t maximumZ = FloorToInt64(bounds.minimum[2] - epsilon);
+
+    for (int64_t z = minimumZ; z <= maximumZ; ++z)
+    {
+        for (int64_t y = minimumY; y <= maximumY; ++y)
+        {
+            for (int64_t x = minimumX; x <= maximumX; ++x)
+            {
+                if (collision->isSolidBlock(collision->context, x, y, z))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static double ReduceSneakDistance(double value, double step)
+{
+    if (value > 0.0)
+    {
+        return value <= step ? 0.0 : value - step;
+    }
+    if (value < 0.0)
+    {
+        return value >= -step ? 0.0 : value + step;
+    }
+    return 0.0;
+}
+
+void VoxelBodyClipSneakingMovement(
+    const VoxelCollisionSource* collision,
+    const double position[3], const VoxelBodyShape* shape,
+    double probeDepth, double* xDistance, double* yDistance)
+{
+    if (collision == NULL || collision->isSolidBlock == NULL
+        || position == NULL || shape == NULL
+        || xDistance == NULL || yDistance == NULL)
+    {
+        return;
+    }
+
+    // Уже падающее или вытолкнутое тело не приклеивается обратно к краю.
+    if (!HasSupportBelowOffset(
+            collision, position, shape, probeDepth, 0.0, 0.0))
+    {
+        return;
+    }
+
+    // Vanilla Minecraft уменьшает компоненты движения небольшими шагами,
+    // сначала отдельно, затем диагональ. Это сохраняет скольжение вдоль края.
+    const double reductionStep = 0.05;
+    double x = *xDistance;
+    double y = *yDistance;
+
+    while (x != 0.0 && !HasSupportBelowOffset(
+            collision, position, shape, probeDepth, x, 0.0))
+    {
+        x = ReduceSneakDistance(x, reductionStep);
+    }
+
+    while (y != 0.0 && !HasSupportBelowOffset(
+            collision, position, shape, probeDepth, 0.0, y))
+    {
+        y = ReduceSneakDistance(y, reductionStep);
+    }
+
+    while (x != 0.0 && y != 0.0 && !HasSupportBelowOffset(
+            collision, position, shape, probeDepth, x, y))
+    {
+        x = ReduceSneakDistance(x, reductionStep);
+        y = ReduceSneakDistance(y, reductionStep);
+    }
+
+    *xDistance = x;
+    *yDistance = y;
 }

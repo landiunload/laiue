@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#include "game/player_controller.h"
+#include "gameplay/player_controller.h"
 
 typedef struct ApplicationConfiguration
 {

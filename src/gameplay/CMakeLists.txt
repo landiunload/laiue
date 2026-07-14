@@ -1,0 +1,15 @@
+laiue_add_module(gameplay
+    SOURCES
+        player_controller.c
+        player_controller.h
+        player_stance.c
+        player_stance.h
+        player_jump.c
+        player_jump.h
+        game_mode.h
+        game_events.h
+        ../game/camera.h
+        ../api.h
+    LINK
+        laiue_physics
+)

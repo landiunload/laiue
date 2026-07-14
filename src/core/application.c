@@ -4,10 +4,11 @@
 #include "core/debug_overlay.h"
 #include "core/math.h"
 #include "core/numeric.h"
+#include "core/player_command_mapper.h"
 #include "game/camera.h"
-#include "game/game_mode.h"
-#include "game/player_controller.h"
-#include "game/voxel_interaction.h"
+#include "gameplay/game_mode.h"
+#include "gameplay/player_controller.h"
+#include "interaction/voxel_interaction.h"
 #include "input/input.h"
 #include "platform/time.h"
 #include "platform/window.h"
@@ -221,9 +222,22 @@ static void HandleBlockEditing(ApplicationState* application)
     bool placePressed = InputWasMouseButtonPressed(
         application->input, INPUT_MOUSE_BUTTON_RIGHT);
 
+    float direction[3];
+    CameraGetForwardVector(&application->camera, direction);
+
+    VoxelBodyShape bodyShape;
+    const VoxelBodyShape* blockingShape = NULL;
+    const double* blockingPosition = NULL;
+    if (application->gameMode == GAME_MODE_WALK)
+    {
+        PlayerControllerGetBodyShape(&application->player, &bodyShape);
+        blockingShape = &bodyShape;
+        blockingPosition = application->camera.position;
+    }
+
     if (!VoxelInteractionTryCreateEdit(application->world,
-            &application->camera, &application->player,
-            application->gameMode == GAME_MODE_WALK,
+            application->camera.position, direction,
+            blockingPosition, blockingShape,
             breakPressed, placePressed,
             g_applicationConfiguration.editReachDistance, &edit))
     {
@@ -263,6 +277,10 @@ static void UpdatePlayer(ApplicationState* application,
 {
     if (application->gameMode == GAME_MODE_FLY)
     {
+        while (InputConsumeKeyPress(
+                application->input, INPUT_KEY_SPACE))
+        {
+        }
         CameraUpdate(&application->camera, deltaSeconds,
             InputIsKeyDown(application->input, INPUT_KEY_W),
             InputIsKeyDown(application->input, INPUT_KEY_A),
@@ -280,26 +298,15 @@ static void UpdatePlayer(ApplicationState* application,
         mouseDeltaX, mouseDeltaY, 0.0f,
         g_applicationConfiguration.mouseSensitivity);
 
-    PlayerControllerCommand command = {
-        .forward =
-            (InputIsKeyDown(application->input, INPUT_KEY_W) ? 1.0f : 0.0f)
-            - (InputIsKeyDown(application->input, INPUT_KEY_S) ? 1.0f : 0.0f),
-        .right =
-            (InputIsKeyDown(application->input, INPUT_KEY_D) ? 1.0f : 0.0f)
-            - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f),
-        .jumpPressed =
-            InputWasKeyPressed(application->input, INPUT_KEY_SPACE),
-        .jumpHeld =
-            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
-        .crouchHeld =
-            InputIsKeyDown(application->input, INPUT_KEY_SHIFT),
-    };
+    PlayerControllerCommand command;
+    PlayerCommandMapperBuild(application->input,
+        &application->camera, &command);
 
     PlayerCollisionSource collision =
         CreatePlayerCollisionSource(application->world);
     if (PlayerControllerUpdate(&application->player,
             &collision, &application->camera, &command,
-            application->camera.yaw, deltaSeconds))
+            deltaSeconds))
     {
         application->overlayDirty = true;
     }
@@ -309,19 +316,19 @@ static void OnFrame(void* userData)
 {
     ApplicationState* application = userData;
 
-    if (InputWasKeyPressed(application->input, INPUT_KEY_ESCAPE))
+    if (InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE))
     {
         WindowRequestClose(application->window);
         return;
     }
 
-    if (InputWasKeyPressed(application->input, INPUT_KEY_F7))
+    if (InputConsumeKeyPress(application->input, INPUT_KEY_F7))
     {
         WindowSetMouseLook(application->window,
             !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
     }
 
-    if (InputWasKeyPressed(application->input, INPUT_KEY_V))
+    if (InputConsumeKeyPress(application->input, INPUT_KEY_V))
     {
         RendererSetVerticalSync(application->renderer,
             !RendererIsVerticalSyncEnabled(application->renderer));
@@ -332,12 +339,12 @@ static void OnFrame(void* userData)
         InputResetState(application->input);
     }
 
-    if (InputWasKeyPressed(application->input, INPUT_KEY_G))
+    if (InputConsumeKeyPress(application->input, INPUT_KEY_G))
     {
         ToggleGameMode(application);
     }
 
-    if (InputWasKeyPressed(application->input, INPUT_KEY_T)
+    if (InputConsumeKeyPress(application->input, INPUT_KEY_T)
         && !SquareAbsoluteX(application))
     {
         WindowRequestClose(application->window);

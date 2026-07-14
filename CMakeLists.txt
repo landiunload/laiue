@@ -21,6 +21,8 @@ add_subdirectory(src/world)
 add_subdirectory(src/mesh)
 add_subdirectory(src/render)
 add_subdirectory(src/physics)
+add_subdirectory(src/gameplay)
+add_subdirectory(src/interaction)
 add_subdirectory(src/core)
 
 add_executable(laiue WIN32 src/launcher/main.c)

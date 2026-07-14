@@ -58,3 +58,11 @@ LAIUE_PHYSICS_API bool VoxelBodyHasStableGround(
 LAIUE_PHYSICS_API bool VoxelBodyOverlapsBlock(
     const double position[3], const VoxelBodyShape* shape,
     const int64_t block[3]);
+
+// Minecraft-подобная sneak-защита: уменьшает только добровольное
+// горизонтальное перемещение так, чтобы AABB сохранял пересечение с опорой.
+// Внешние импульсы должны вызывать VoxelBodyMoveAxis напрямую.
+LAIUE_PHYSICS_API void VoxelBodyClipSneakingMovement(
+    const VoxelCollisionSource* collision,
+    const double position[3], const VoxelBodyShape* shape,
+    double probeDepth, double* xDistance, double* yDistance);

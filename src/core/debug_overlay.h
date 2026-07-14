@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#include "game/game_mode.h"
-#include "game/player_controller.h"
+#include "gameplay/game_mode.h"
+#include "gameplay/player_controller.h"
 #include "world/world.h"
 
 void DebugOverlayBuildText(World* world, const PlayerController* player,

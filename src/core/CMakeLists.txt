@@ -10,14 +10,10 @@ laiue_add_module(core
         math.c
         math.h
         numeric.h
+        player_command_mapper.c
+        player_command_mapper.h
         ../game/camera.c
         ../game/camera.h
-        ../game/game_events.h
-        ../game/game_mode.h
-        ../game/player_controller_impl.c
-        ../game/player_controller.h
-        ../game/voxel_interaction.c
-        ../game/voxel_interaction.h
         ../api.h
     LINK
         laiue_window
@@ -26,4 +22,6 @@ laiue_add_module(core
         laiue_mesher
         laiue_render
         laiue_physics
+        laiue_gameplay
+        laiue_interaction
 )

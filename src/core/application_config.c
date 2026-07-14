@@ -32,6 +32,6 @@ const ApplicationConfiguration g_applicationConfiguration = {
         .crouchingEyeHeight = 1.25,
         .collisionEpsilon = 0.001,
         .groundProbeDepth = 0.03,
-        .ledgeSupportRadius = 0.05,
+        .sneakProbeDepth = 0.60,
     },
 };

@@ -3,7 +3,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "api.h"
 #include "game/camera.h"
+#include "gameplay/player_jump.h"
+#include "gameplay/player_stance.h"
 #include "physics/voxel_body.h"
 
 typedef VoxelSolidBlockQuery PlayerSolidBlockQuery;
@@ -28,54 +31,54 @@ typedef struct PlayerControllerConfig
     double crouchingEyeHeight;
     double collisionEpsilon;
     double groundProbeDepth;
-    double ledgeSupportRadius;
+    double sneakProbeDepth;
 } PlayerControllerConfig;
 
 typedef struct PlayerControllerCommand
 {
-    float forward;
-    float right;
+    // Нормализованное желаемое движение в мировых горизонтальных осях.
+    double movementX;
+    double movementY;
     bool jumpPressed;
-    bool jumpHeld;
     bool crouchHeld;
 } PlayerControllerCommand;
 
 typedef struct PlayerController
 {
     PlayerControllerConfig config;
-    double verticalVelocity;
+    PlayerStance stance;
+    PlayerJump jump;
     double externalVelocityX;
     double externalVelocityY;
-    double jumpBufferRemaining;
-    double coyoteTimeRemaining;
     double simulationAccumulator;
-    double jumpLaunchSpeed;
     bool grounded;
-    bool crouching;
-    bool jumpHeldPrevious;
 } PlayerController;
 
-void PlayerControllerInit(
+LAIUE_GAMEPLAY_API void PlayerControllerInit(
     PlayerController* controller, const PlayerControllerConfig* config);
-void PlayerControllerReset(PlayerController* controller, Camera* camera);
+LAIUE_GAMEPLAY_API void PlayerControllerReset(
+    PlayerController* controller, Camera* camera);
 
-// Возвращает true, когда изменилось состояние, отображаемое в UI.
-bool PlayerControllerUpdate(PlayerController* controller,
+// Возвращает true, если изменилось состояние, показываемое в интерфейсе.
+LAIUE_GAMEPLAY_API bool PlayerControllerUpdate(
+    PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    const PlayerControllerCommand* command,
-    float yaw, float deltaSeconds);
+    const PlayerControllerCommand* command, float deltaSeconds);
 
-bool PlayerControllerResolvePenetration(
+LAIUE_GAMEPLAY_API bool PlayerControllerResolvePenetration(
     PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera);
-
-bool PlayerControllerOverlapsBlock(const PlayerController* controller,
+LAIUE_GAMEPLAY_API bool PlayerControllerOverlapsBlock(
+    const PlayerController* controller,
     const Camera* camera, const int64_t block[3]);
+LAIUE_GAMEPLAY_API void PlayerControllerGetBodyShape(
+    const PlayerController* controller, VoxelBodyShape* outShape);
 
-bool PlayerControllerIsGrounded(const PlayerController* controller);
-bool PlayerControllerIsCrouching(const PlayerController* controller);
+LAIUE_GAMEPLAY_API bool PlayerControllerIsGrounded(
+    const PlayerController* controller);
+LAIUE_GAMEPLAY_API bool PlayerControllerIsCrouching(
+    const PlayerController* controller);
 
-// Внешний толчок намеренно обходит защиту края при приседании.
-// Это граница для будущих мобов, взрывов и движущихся платформ.
-void PlayerControllerApplyImpulse(
+// Внешний толчок не проходит через sneak-защиту края.
+LAIUE_GAMEPLAY_API void PlayerControllerApplyImpulse(
     PlayerController* controller, float x, float y, float z);

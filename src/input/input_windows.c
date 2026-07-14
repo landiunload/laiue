@@ -6,7 +6,7 @@
 struct Input
 {
     bool keyDown[INPUT_KEY_COUNT];
-    bool keyPressedLatch[INPUT_KEY_COUNT];
+    uint8_t keyPressCount[INPUT_KEY_COUNT];
     bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
     bool mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_COUNT];
     int32_t mouseDeltaX;
@@ -108,7 +108,10 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
             // авто-повтор клавиатуры её не дребезжит.
             if (!input->keyDown[key])
             {
-                input->keyPressedLatch[key] = true;
+                if (input->keyPressCount[key] < UINT8_MAX)
+                {
+                    input->keyPressCount[key]++;
+                }
             }
 
             input->keyDown[key] = true;
@@ -167,11 +170,6 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
 
 void InputEndFrame(Input* input)
 {
-    for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
-    {
-        input->keyPressedLatch[key] = false;
-    }
-
     for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
     {
         input->mouseButtonPressedLatch[button] = false;
@@ -186,7 +184,7 @@ void InputResetState(Input* input)
     for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
     {
         input->keyDown[key] = false;
-        input->keyPressedLatch[key] = false;
+        input->keyPressCount[key] = 0;
     }
 
     for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
@@ -207,7 +205,20 @@ bool InputIsKeyDown(const Input* input, InputKey key)
 
 bool InputWasKeyPressed(const Input* input, InputKey key)
 {
-    return (uint32_t)key < INPUT_KEY_COUNT && input->keyPressedLatch[key];
+    return (uint32_t)key < INPUT_KEY_COUNT
+        && input->keyPressCount[key] != 0;
+}
+
+bool InputConsumeKeyPress(Input* input, InputKey key)
+{
+    if ((uint32_t)key >= INPUT_KEY_COUNT
+        || input->keyPressCount[key] == 0)
+    {
+        return false;
+    }
+
+    input->keyPressCount[key]--;
+    return true;
 }
 
 bool InputIsMouseButtonDown(const Input* input, InputMouseButton button)

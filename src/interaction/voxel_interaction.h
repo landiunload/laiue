@@ -3,8 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "game/camera.h"
-#include "game/player_controller.h"
+#include "api.h"
+#include "physics/voxel_body.h"
 #include "world/world.h"
 
 typedef enum VoxelEditType
@@ -21,7 +21,9 @@ typedef struct VoxelEdit
     BlockType replacement;
 } VoxelEdit;
 
-bool VoxelInteractionTryCreateEdit(World* world, const Camera* camera,
-    const PlayerController* player, bool playerCollisionsEnabled,
+LAIUE_INTERACTION_API bool VoxelInteractionTryCreateEdit(
+    World* world, const double origin[3], const float direction[3],
+    const double blockingBodyPosition[3],
+    const VoxelBodyShape* blockingBodyShape,
     bool breakPressed, bool placePressed, float maximumDistance,
     VoxelEdit* outEdit);
