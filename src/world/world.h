@@ -14,6 +14,7 @@ typedef uint8_t BlockType;
 
 #define BLOCK_AIR   0
 #define BLOCK_EARTH 1
+#define BLOCK_GRASS 2
 
 #define CHUNK_SIZE      64
 #define CHUNK_SIZE_LOG2 6
@@ -62,7 +63,3 @@ LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
 
 // Высота верхнего твёрдого блока в текущих локальных координатах.
 LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
-
-// Младшие 32 бита абсолютных координат — стабильный хеш текстуры при rebasing.
-LAIUE_WORLD_API void WorldGetAbsoluteBlockLow32(World* world,
-    int64_t x, int64_t y, int64_t z, uint32_t outLow[3]);

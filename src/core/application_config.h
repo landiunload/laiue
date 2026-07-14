@@ -12,7 +12,8 @@ typedef struct ApplicationConfiguration
     int32_t windowHeight;
     float cameraSpeed;
     float mouseSensitivity;
-    float fieldOfViewRadians;
+    // Горизонтальное поле зрения по умолчанию (ползунок в настройках 0..360).
+    int32_t defaultFieldOfViewDegrees;
     float nearPlane;
     float farPlane;
     float editReachDistance;

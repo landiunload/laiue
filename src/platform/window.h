@@ -29,5 +29,9 @@ LAIUE_WINDOW_API bool    WindowConsumeFocusLoss(Window* window);
 LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
 LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
+// Позиция курсора в клиентских координатах окна (для интерфейса);
+// вне окна значения могут выходить за его пределы.
+LAIUE_WINDOW_API void    WindowGetCursorClientPosition(const Window* window,
+    int32_t* x, int32_t* y);
 LAIUE_WINDOW_API void    WindowSetOverlayText(Window* window, const wchar_t* text);
 LAIUE_WINDOW_API void    WindowRequestClose(Window* window);

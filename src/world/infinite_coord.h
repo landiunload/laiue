@@ -42,9 +42,6 @@ int32_t InfiniteCoordCompareAddInt64ToInt64(
 uint64_t InfiniteCoordHashOffset(const InfiniteCoord* base, int64_t offset);
 bool InfiniteCoordEqualsOffset(const InfiniteCoord* value, const InfiniteCoord* base, int64_t offset);
 
-// Младшие биты two's-complement значения base + offset.
-uint32_t InfiniteCoordLow32Offset(const InfiniteCoord* base, int64_t offset);
-
 // scalar - value с насыщением до int64.
 int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value);
 

@@ -332,6 +332,21 @@ bool WindowIsMouseLookEnabled(const Window* window)
     return window->mouseLookEnabled;
 }
 
+void WindowGetCursorClientPosition(const Window* window, int32_t* x, int32_t* y)
+{
+    *x = -1;
+    *y = -1;
+
+    POINT point;
+    if (window->handle == NULL || !GetCursorPos(&point)
+        || !ScreenToClient(window->handle, &point))
+    {
+        return;
+    }
+    *x = (int32_t)point.x;
+    *y = (int32_t)point.y;
+}
+
 void WindowSetOverlayText(Window* window, const wchar_t* text)
 {
     if (window != NULL && window->coordinateOverlay != NULL && text != NULL)

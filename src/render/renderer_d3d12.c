@@ -7,20 +7,40 @@
 
 #include "render/generated/chunk_vs.h"
 #include "render/generated/chunk_ps.h"
+#include "render/generated/panorama_vs.h"
+#include "render/generated/panorama_ps.h"
+#include "render/generated/ui_vs.h"
+#include "render/generated/ui_ps.h"
+#include "render/texture_pack.h"
 
 #include <stddef.h>
 #include <string.h>
 
 #define FRAME_COUNT 2
 
+// Общая шейдерная куча SRV: фиксированные слоты.
+#define SRV_SLOT_BLOCK_TEXTURES 0
+#define SRV_SLOT_PANORAMA_CUBE  1
+#define SRV_SLOT_FONT_ATLAS     2
+#define SRV_SLOT_COUNT          3
+
+// Слой UI: до 2048 квадов на кадр (по 48 байт — держать в синхроне
+// с shaders/ui.hlsl), кольцо из FRAME_COUNT upload-буферов.
+#define UI_MAX_QUADS 2048
+#define UI_QUAD_BYTES 48
+
+// Резолв панорамы: раскладка корневых констант.
+#define RESOLVE_ROOT_CONSTANT_COUNT 3
+
 // Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl):
-// dword 0..15 — view-projection, 16..18 — смещение чанка относительно
-// камеры, 20..22 — низшие 32 бита мировых координат угла чанка.
-#define ROOT_CONSTANT_COUNT 23
+// dword 0..15 — view-projection, 16..18 — смещение чанка относительно камеры.
+#define ROOT_CONSTANT_COUNT 19
 #define ROOT_CONSTANT_ORIGIN_OFFSET 16
-#define ROOT_CONSTANT_CHUNK_BASE_OFFSET 20
 #define ROOT_PARAMETER_CONSTANTS 0
 #define ROOT_PARAMETER_QUAD_BUFFER 1
+#define ROOT_PARAMETER_BLOCK_TEXTURES 2
+
+#define MAX_TEXTURE_SUBRESOURCES 48
 
 // Пул геометрии: меши суб-аллоцируются из больших DEFAULT-буферов —
 // без 64-КиБ выравнивания на каждый меш и без чтения через PCIe.
@@ -100,6 +120,32 @@ struct Renderer
     UINT                       frameIndex;
     ID3D12RootSignature*       rootSignature;
     ID3D12PipelineState*       pipelineState;
+    ID3D12Resource*            blockTexture;
+    ID3D12Resource*            blockTextureUpload;
+    ID3D12DescriptorHeap*      srvHeap;
+    UINT                       srvDescriptorSize;
+    bool                       blockTextureUploadPending;
+
+    // Панорама: кубмапа сцены (грани в пространстве вида) + резолв.
+    ID3D12Resource*            cubeColor;
+    ID3D12Resource*            cubeDepth;
+    ID3D12DescriptorHeap*      cubeRtvHeap;      // 6 RTV по слоям
+    ID3D12DescriptorHeap*      cubeDsvHeap;
+    uint32_t                   cubeResolution;   // 0 — ресурсы не созданы
+    ID3D12RootSignature*       resolveRootSignature;
+    ID3D12PipelineState*       resolvePipelineState;
+    RendererFrameSetup         frame;            // setup текущего кадра
+
+    // Слой UI: vertex pulling из upload-кольца, атлас шрифта.
+    ID3D12RootSignature*       uiRootSignature;
+    ID3D12PipelineState*       uiPipelineState;
+    ID3D12Resource*            uiQuadBuffers[FRAME_COUNT];
+    uint8_t*                   uiQuadMapped[FRAME_COUNT];
+    uint32_t                   uiQuadCount;
+    ID3D12Resource*            fontTexture;
+    ID3D12Resource*            fontTextureUpload;
+    bool                       fontUploadPending;
+    bool                       fontReady;
     D3D12_VIEWPORT             viewport;
     D3D12_RECT                 scissorRect;
     int32_t                    windowWidth;
@@ -375,9 +421,25 @@ static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
     renderer->deferredResourceCount++;
 }
 
+static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->srvHeap, &handle);
+    handle.ptr += (SIZE_T)slot * renderer->srvDescriptorSize;
+    return handle;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(Renderer* renderer, uint32_t slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(renderer->srvHeap, &handle);
+    handle.ptr += (UINT64)slot * renderer->srvDescriptorSize;
+    return handle;
+}
+
 static bool CreateRootSignature(Renderer* renderer)
 {
-    D3D12_ROOT_PARAMETER parameters[2];
+    D3D12_ROOT_PARAMETER parameters[3];
     memset(parameters, 0, sizeof(parameters));
     parameters[ROOT_PARAMETER_CONSTANTS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[ROOT_PARAMETER_CONSTANTS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -387,10 +449,34 @@ static bool CreateRootSignature(Renderer* renderer)
     parameters[ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     parameters[ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
 
+    D3D12_DESCRIPTOR_RANGE textureRange;
+    memset(&textureRange, 0, sizeof(textureRange));
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 1;
+    textureRange.BaseShaderRegister = 1;
+    textureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].DescriptorTable.pDescriptorRanges = &textureRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC description;
     memset(&description, 0, sizeof(description));
-    description.NumParameters = 2;
+    description.NumParameters = 3;
     description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
 
     ID3DBlob* signatureBlob = NULL;
     ID3DBlob* errorBlob = NULL;
@@ -442,6 +528,434 @@ static bool CreatePipelineState(Renderer* renderer)
 
     return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
         &IID_ID3D12PipelineState, (void**)&renderer->pipelineState));
+}
+
+static bool CreateBlockTexture(Renderer* renderer)
+{
+    TexturePackData pack;
+    TexturePackLoadActive(&pack);
+    if (pack.pixels == NULL)
+    {
+        return false;
+    }
+
+    bool succeeded = false;
+    UINT subresourceCount = pack.layerCount * pack.mipCount;
+    if (subresourceCount == 0 || subresourceCount > MAX_TEXTURE_SUBRESOURCES)
+    {
+        TexturePackRelease(&pack);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = pack.width;
+    textureDescription.Height = pack.height;
+    textureDescription.DepthOrArraySize = (UINT16)pack.layerCount;
+    textureDescription.MipLevels = (UINT16)pack.mipCount;
+    textureDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDescription.SampleDesc.Count = 1;
+    textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &defaultHeap,
+        D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->blockTexture)))
+    {
+        TexturePackRelease(&pack);
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
+    UINT rowCounts[MAX_TEXTURE_SUBRESOURCES];
+    UINT64 rowSizes[MAX_TEXTURE_SUBRESOURCES];
+    UINT64 uploadBytes = 0;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+        0, subresourceCount, 0, layouts, rowCounts, rowSizes, &uploadBytes);
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1;
+    uploadDescription.DepthOrArraySize = 1;
+    uploadDescription.MipLevels = 1;
+    uploadDescription.SampleDesc.Count = 1;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &uploadHeap,
+        D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->blockTextureUpload)))
+    {
+        TexturePackRelease(&pack);
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    unsigned char* mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(renderer->blockTextureUpload, 0,
+        &emptyRange, (void**)&mapped)))
+    {
+        TexturePackRelease(&pack);
+        return false;
+    }
+
+    for (uint32_t layer = 0; layer < pack.layerCount; ++layer)
+    {
+        for (uint32_t mip = 0; mip < pack.mipCount; ++mip)
+        {
+            UINT index = layer * pack.mipCount + mip;
+            TexturePackSubresource subresource;
+            if (!TexturePackGetSubresource(&pack, layer, mip, &subresource))
+            {
+                ID3D12Resource_Unmap(renderer->blockTextureUpload, 0, NULL);
+                TexturePackRelease(&pack);
+                return false;
+            }
+            unsigned char* destination = mapped + layouts[index].Offset;
+            for (uint32_t row = 0; row < subresource.height; ++row)
+            {
+                memcpy(destination + (size_t)row * layouts[index].Footprint.RowPitch,
+                    subresource.pixels + (size_t)row * subresource.rowBytes,
+                    subresource.rowBytes);
+            }
+        }
+    }
+    ID3D12Resource_Unmap(renderer->blockTextureUpload, 0, NULL);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = textureDescription.Format;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2DArray.MipLevels = pack.mipCount;
+    viewDescription.Texture2DArray.ArraySize = pack.layerCount;
+
+    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->blockTexture,
+        &viewDescription, SrvCpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
+    renderer->blockTextureUploadPending = true;
+    succeeded = true;
+
+    TexturePackRelease(&pack);
+    return succeeded;
+}
+
+// === Панорама и UI: сигнатуры, конвейеры, ресурсы ===
+
+static bool CreateResolveRootSignature(Renderer* renderer)
+{
+    D3D12_ROOT_PARAMETER parameters[2];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = RESOLVE_ROOT_CONSTANT_COUNT;
+
+    D3D12_DESCRIPTOR_RANGE cubeRange;
+    memset(&cubeRange, 0, sizeof(cubeRange));
+    cubeRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    cubeRange.NumDescriptors = 1;
+    cubeRange.BaseShaderRegister = 0;
+    cubeRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &cubeRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+
+    ID3DBlob* signatureBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+
+    HRESULT result = ID3D12Device_CreateRootSignature(renderer->device, 0,
+        ID3D10Blob_GetBufferPointer(signatureBlob), ID3D10Blob_GetBufferSize(signatureBlob),
+        &IID_ID3D12RootSignature, (void**)&renderer->resolveRootSignature);
+
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreateResolvePipelineState(Renderer* renderer)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->resolveRootSignature;
+    description.VS.pShaderBytecode = g_panorama_vs;
+    description.VS.BytecodeLength = sizeof(g_panorama_vs);
+    description.PS.pShaderBytecode = g_panorama_ps;
+    description.PS.BytecodeLength = sizeof(g_panorama_ps);
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
+        &IID_ID3D12PipelineState, (void**)&renderer->resolvePipelineState));
+}
+
+static bool CreateUiRootSignature(Renderer* renderer)
+{
+    D3D12_ROOT_PARAMETER parameters[3];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 2;
+
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[1].Descriptor.ShaderRegister = 0;
+
+    D3D12_DESCRIPTOR_RANGE fontRange;
+    memset(&fontRange, 0, sizeof(fontRange));
+    fontRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    fontRange.NumDescriptors = 1;
+    fontRange.BaseShaderRegister = 1;
+    fontRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &fontRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 3;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+
+    ID3DBlob* signatureBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+
+    HRESULT result = ID3D12Device_CreateRootSignature(renderer->device, 0,
+        ID3D10Blob_GetBufferPointer(signatureBlob), ID3D10Blob_GetBufferSize(signatureBlob),
+        &IID_ID3D12RootSignature, (void**)&renderer->uiRootSignature);
+
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreateUiPipelineState(Renderer* renderer)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->uiRootSignature;
+    description.VS.pShaderBytecode = g_ui_vs;
+    description.VS.BytecodeLength = sizeof(g_ui_vs);
+    description.PS.pShaderBytecode = g_ui_ps;
+    description.PS.BytecodeLength = sizeof(g_ui_ps);
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+
+    D3D12_RENDER_TARGET_BLEND_DESC* blend = &description.BlendState.RenderTarget[0];
+    blend->BlendEnable = TRUE;
+    blend->SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    blend->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    blend->BlendOp = D3D12_BLEND_OP_ADD;
+    blend->SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    blend->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
+        &IID_ID3D12PipelineState, (void**)&renderer->uiPipelineState));
+}
+
+static bool CreateUiQuadBuffers(Renderer* renderer)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = (UINT64)UI_MAX_QUADS * UI_QUAD_BYTES;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+            D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_GENERIC_READ,
+            NULL, &IID_ID3D12Resource, (void**)&renderer->uiQuadBuffers[i])))
+        {
+            return false;
+        }
+
+        D3D12_RANGE emptyRange = { 0, 0 };
+        if (FAILED(ID3D12Resource_Map(renderer->uiQuadBuffers[i], 0, &emptyRange,
+            (void**)&renderer->uiQuadMapped[i])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Создаёт (или пересоздаёт под новое разрешение) кубмапу сцены и её
+// глубину. Пересоздание редкое — при смене разрешения грани от FOV,
+// поэтому честно дожидается GPU перед заменой дескрипторов.
+static bool EnsureCubeResources(Renderer* renderer, uint32_t resolution)
+{
+    if (renderer->cubeResolution == resolution && renderer->cubeColor != NULL)
+    {
+        return true;
+    }
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+
+    if (renderer->cubeColor != NULL)
+    {
+        ID3D12Resource_Release(renderer->cubeColor);
+        renderer->cubeColor = NULL;
+    }
+    if (renderer->cubeDepth != NULL)
+    {
+        ID3D12Resource_Release(renderer->cubeDepth);
+        renderer->cubeDepth = NULL;
+    }
+    renderer->cubeResolution = 0;
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+
+    D3D12_RESOURCE_DESC colorDescription;
+    memset(&colorDescription, 0, sizeof(colorDescription));
+    colorDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    colorDescription.Width = resolution;
+    colorDescription.Height = resolution;
+    colorDescription.DepthOrArraySize = 6;
+    colorDescription.MipLevels = 1;
+    colorDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colorDescription.SampleDesc.Count = 1;
+    colorDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    colorDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE colorClear = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .Color = { 0.4f, 0.6f, 0.9f, 1.0f },
+    };
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+        D3D12_HEAP_FLAG_NONE, &colorDescription, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        &colorClear, &IID_ID3D12Resource, (void**)&renderer->cubeColor)))
+    {
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC depthDescription;
+    memset(&depthDescription, 0, sizeof(depthDescription));
+    depthDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depthDescription.Width = resolution;
+    depthDescription.Height = resolution;
+    depthDescription.DepthOrArraySize = 1;
+    depthDescription.MipLevels = 1;
+    depthDescription.Format = DXGI_FORMAT_D32_FLOAT;
+    depthDescription.SampleDesc.Count = 1;
+    depthDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    depthDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE depthClear = {
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .DepthStencil = { .Depth = 1.0f, .Stencil = 0 },
+    };
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+        D3D12_HEAP_FLAG_NONE, &depthDescription, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &depthClear, &IID_ID3D12Resource, (void**)&renderer->cubeDepth)))
+    {
+        ID3D12Resource_Release(renderer->cubeColor);
+        renderer->cubeColor = NULL;
+        return false;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->cubeRtvHeap, &rtvHandle);
+    for (UINT face = 0; face < 6; ++face)
+    {
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDescription;
+        memset(&rtvDescription, 0, sizeof(rtvDescription));
+        rtvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rtvDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        rtvDescription.Texture2DArray.FirstArraySlice = face;
+        rtvDescription.Texture2DArray.ArraySize = 1;
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->cubeColor,
+            &rtvDescription, rtvHandle);
+        rtvHandle.ptr += renderer->renderTargetViewSize;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->cubeDsvHeap, &dsvHandle);
+    ID3D12Device_CreateDepthStencilView(renderer->device, renderer->cubeDepth, NULL, dsvHandle);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription;
+    memset(&srvDescription, 0, sizeof(srvDescription));
+    srvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescription.TextureCube.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->cubeColor,
+        &srvDescription, SrvCpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
+
+    renderer->cubeResolution = resolution;
+    return true;
 }
 
 static bool CreateDepthBuffer(Renderer* renderer, int32_t width, int32_t height)
@@ -647,8 +1161,46 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
         return NULL;
     }
 
+    // Общая шейдерная куча SRV: блоки, кубмапа панорамы, атлас шрифта.
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        .NumDescriptors = SRV_SLOT_COUNT,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &srvHeapDescription,
+        &IID_ID3D12DescriptorHeap, (void**)&renderer->srvHeap)))
+    {
+        RendererDestroy(renderer);
+        return NULL;
+    }
+    renderer->srvDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
+        renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC cubeRtvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = 6,
+    };
+    D3D12_DESCRIPTOR_HEAP_DESC cubeDsvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeRtvHeapDescription,
+            &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeRtvHeap))
+        || FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeDsvHeapDescription,
+            &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeDsvHeap)))
+    {
+        RendererDestroy(renderer);
+        return NULL;
+    }
+
     if (!CreateRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreatePipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateResolveRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateResolvePipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateUiRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateUiPipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateUiQuadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateBlockTexture(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateDepthBuffer(renderer, width, height)) { RendererDestroy(renderer); return NULL; }
 
     renderer->viewport.TopLeftX = 0.0f;
@@ -699,6 +1251,29 @@ void RendererDestroy(Renderer* renderer)
         if (renderer->poolBlocks[i].buffer != NULL) ID3D12Resource_Release(renderer->poolBlocks[i].buffer);
         if (renderer->poolBlocks[i].freeRanges != NULL) HeapFree(GetProcessHeap(), 0, renderer->poolBlocks[i].freeRanges);
     }
+
+    if (renderer->blockTextureUpload != NULL) ID3D12Resource_Release(renderer->blockTextureUpload);
+    if (renderer->blockTexture != NULL) ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->srvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->srvHeap);
+
+    if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
+    if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
+    if (renderer->cubeRtvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeRtvHeap);
+    if (renderer->cubeDsvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeDsvHeap);
+    if (renderer->resolvePipelineState != NULL) ID3D12PipelineState_Release(renderer->resolvePipelineState);
+    if (renderer->resolveRootSignature != NULL) ID3D12RootSignature_Release(renderer->resolveRootSignature);
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->uiQuadBuffers[i] != NULL)
+        {
+            ID3D12Resource_Release(renderer->uiQuadBuffers[i]);
+        }
+    }
+    if (renderer->fontTextureUpload != NULL) ID3D12Resource_Release(renderer->fontTextureUpload);
+    if (renderer->fontTexture != NULL) ID3D12Resource_Release(renderer->fontTexture);
+    if (renderer->uiPipelineState != NULL) ID3D12PipelineState_Release(renderer->uiPipelineState);
+    if (renderer->uiRootSignature != NULL) ID3D12RootSignature_Release(renderer->uiRootSignature);
 
     if (renderer->fenceEvent != NULL)
     {
@@ -820,17 +1395,56 @@ void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)
 }
 
 void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
-    const float chunkOriginRelative[3], const uint32_t chunkBaseLow[3])
+    const float chunkOriginRelative[3])
 {
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
 
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
         ROOT_PARAMETER_CONSTANTS, 3, chunkOriginRelative, ROOT_CONSTANT_ORIGIN_OFFSET);
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-        ROOT_PARAMETER_CONSTANTS, 3, chunkBaseLow, ROOT_CONSTANT_CHUNK_BASE_OFFSET);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
         ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
+}
+
+static void RecordBlockTextureUpload(Renderer* renderer)
+{
+    if (!renderer->blockTextureUploadPending)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(renderer->blockTexture, &description);
+    UINT subresourceCount = (UINT)description.DepthOrArraySize * description.MipLevels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, subresourceCount, 0, layouts, NULL, NULL, NULL);
+
+    for (UINT index = 0; index < subresourceCount; ++index)
+    {
+        D3D12_TEXTURE_COPY_LOCATION destination;
+        memset(&destination, 0, sizeof(destination));
+        destination.pResource = renderer->blockTexture;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = index;
+
+        D3D12_TEXTURE_COPY_LOCATION source;
+        memset(&source, 0, sizeof(source));
+        source.pResource = renderer->blockTextureUpload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = layouts[index];
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+            &destination, 0, 0, 0, &source, NULL);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->blockTexture,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    DeferResourceRelease(renderer, renderer->blockTextureUpload);
+    renderer->blockTextureUpload = NULL;
+    renderer->blockTextureUploadPending = false;
 }
 
 // Записывает отложенные загрузки мешей в командный список кадра.
@@ -947,8 +1561,52 @@ static bool ApplyPendingResize(Renderer* renderer)
     return true;
 }
 
-bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16])
+// Загрузка атласа шрифта: записана в командный список ближайшего кадра.
+static void RecordFontAtlasUpload(Renderer* renderer)
 {
+    if (!renderer->fontUploadPending)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(renderer->fontTexture, &description);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, 1, 0, &layout, NULL, NULL, NULL);
+
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = renderer->fontTexture;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_TEXTURE_COPY_LOCATION source;
+    memset(&source, 0, sizeof(source));
+    source.pResource = renderer->fontTextureUpload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = layout;
+
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+        &destination, 0, 0, 0, &source, NULL);
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->fontTexture,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    DeferResourceRelease(renderer, renderer->fontTextureUpload);
+    renderer->fontTextureUpload = NULL;
+    renderer->fontUploadPending = false;
+    renderer->fontReady = true;
+}
+
+bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
+{
+    if (frame == NULL || frame->passCount == 0
+        || frame->passCount > RENDERER_MAX_SCENE_PASSES)
+    {
+        return false;
+    }
+
     // Отложенный resize: применяется, когда GPU дошёл до этого кадра.
     // При неудаче кадр пропускается, попытка повторится в следующем.
     if (renderer->resizeRequested && !ApplyPendingResize(renderer))
@@ -960,44 +1618,173 @@ bool RendererBeginFrame(Renderer* renderer, const float viewProjection[16])
         return false;
     }
 
+    renderer->frame = *frame;
+    renderer->uiQuadCount = 0;
+
+    if (renderer->frame.panorama
+        && !EnsureCubeResources(renderer, renderer->frame.faceResolution))
+    {
+        return false;
+    }
+
     DrainDeferredReleases(renderer, false);
 
     ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex]);
     ID3D12GraphicsCommandList_Reset(renderer->commandList, renderer->commandAllocators[renderer->frameIndex], renderer->pipelineState);
 
+    RecordBlockTextureUpload(renderer);
+    RecordFontAtlasUpload(renderer);
     RecordPendingUploads(renderer);
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
-    renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
-
-    D3D12_CPU_DESCRIPTOR_HANDLE depthStencilViewHandle;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->depthStencilViewHeap, &depthStencilViewHandle);
-
-    ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList, 1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
-
-    const float clearColor[4] = { 0.4f, 0.6f, 0.9f, 1.0f };
-    ID3D12GraphicsCommandList_ClearRenderTargetView(renderer->commandList, renderTargetViewHandle, clearColor, 0, NULL);
-    ID3D12GraphicsCommandList_ClearDepthStencilView(renderer->commandList, depthStencilViewHandle,
-        D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, NULL);
-
-    ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
-    ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
-
+    // Общее состояние всех проходов сцены; цель, очистка и viewProjection
+    // назначаются в RendererBeginScenePass.
+    ID3D12DescriptorHeap* descriptorHeaps[1] = { renderer->srvHeap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 1, descriptorHeaps);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList, renderer->rootSignature);
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-        ROOT_PARAMETER_CONSTANTS, 16, viewProjection, 0);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+        ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     return true;
 }
 
+void RendererBeginScenePass(Renderer* renderer, uint32_t passIndex)
+{
+    if (passIndex >= renderer->frame.passCount)
+    {
+        return;
+    }
+    const RendererScenePass* pass = &renderer->frame.passes[passIndex];
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    D3D12_CPU_DESCRIPTOR_HANDLE depthStencilViewHandle;
+    D3D12_VIEWPORT viewport;
+    D3D12_RECT scissor;
+
+    if (renderer->frame.panorama)
+    {
+        // Грань кубмапы: рисуется и очищается только задействованный
+        // прямоугольник — остальные тексели резолв не читает.
+        uint32_t faceIndex = pass->faceIndex < 6 ? pass->faceIndex : 0;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->cubeRtvHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)faceIndex * renderer->renderTargetViewSize;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->cubeDsvHeap, &depthStencilViewHandle);
+
+        scissor.left = (LONG)pass->rectMinX;
+        scissor.top = (LONG)pass->rectMinY;
+        scissor.right = (LONG)pass->rectMaxX;
+        scissor.bottom = (LONG)pass->rectMaxY;
+        viewport.TopLeftX = (float)scissor.left;
+        viewport.TopLeftY = (float)scissor.top;
+        viewport.Width = (float)(scissor.right - scissor.left);
+        viewport.Height = (float)(scissor.bottom - scissor.top);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+    }
+    else
+    {
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->renderTargetViewHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->depthStencilViewHeap, &depthStencilViewHandle);
+        viewport = renderer->viewport;
+        scissor = renderer->scissorRect;
+    }
+
+    ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+        1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
+
+    const float clearColor[4] = { 0.4f, 0.6f, 0.9f, 1.0f };
+    ID3D12GraphicsCommandList_ClearRenderTargetView(renderer->commandList,
+        renderTargetViewHandle, clearColor, 1, &scissor);
+    ID3D12GraphicsCommandList_ClearDepthStencilView(renderer->commandList,
+        depthStencilViewHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &scissor);
+
+    ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &scissor);
+
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, 16, pass->viewProjection, 0);
+}
+
 bool RendererEndFrame(Renderer* renderer)
 {
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+        renderer->renderTargetViewHeap, &renderTargetViewHandle);
+    renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
+
+    if (renderer->frame.panorama)
+    {
+        // Резолв: кубмапа -> back-буфер выбранной проекцией.
+        D3D12_RESOURCE_BARRIER toShaderResource = MakeTransitionBarrier(renderer->cubeColor,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &toShaderResource);
+
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
+
+        ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+            renderer->resolvePipelineState);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+            renderer->resolveRootSignature);
+
+        float resolveConstants[2] = {
+            renderer->frame.fovHalfRadians,
+            renderer->frame.resolveVerticalScale,
+        };
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 2, resolveConstants, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(renderer->commandList,
+            0, (UINT)renderer->frame.resolveMapping, 2);
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+            1, SrvGpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
+
+        ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, 3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER toRenderTarget = MakeTransitionBarrier(renderer->cubeColor,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &toRenderTarget);
+    }
+
+    if (renderer->uiQuadCount > 0 && renderer->fontReady)
+    {
+        // Слой UI: альфа-смешивание поверх кадра, без глубины.
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
+
+        ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+            renderer->uiPipelineState);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+            renderer->uiRootSignature);
+
+        float screenSize[2] = {
+            (float)renderer->windowWidth,
+            (float)renderer->windowHeight,
+        };
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 2, screenSize, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
+            1, ID3D12Resource_GetGPUVirtualAddress(
+                renderer->uiQuadBuffers[renderer->frameIndex]));
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+            2, SrvGpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
+
+        ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
+            renderer->uiQuadCount * 6, 1, 0, 0);
+    }
+
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
@@ -1061,4 +1848,135 @@ void RendererResize(Renderer* renderer, int32_t width, int32_t height)
     renderer->resizeWidth = width;
     renderer->resizeHeight = height;
     renderer->resizeRequested = true;
+}
+
+// === Слой интерфейса ===
+
+_Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
+    "RendererUiQuad is part of the GPU format (shaders/ui.hlsl)");
+
+bool RendererUiSetFontAtlas(Renderer* renderer,
+    const uint8_t* alphaPixels, uint32_t width, uint32_t height)
+{
+    if (alphaPixels == NULL || width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    // Замена атласа — редкое событие (смена масштаба интерфейса):
+    // честно дожидаемся GPU перед заменой текстуры и дескриптора.
+    // Вызывать вне пары BeginFrame/EndFrame.
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+
+    if (renderer->fontTextureUpload != NULL)
+    {
+        ID3D12Resource_Release(renderer->fontTextureUpload);
+        renderer->fontTextureUpload = NULL;
+    }
+    if (renderer->fontTexture != NULL)
+    {
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+    }
+    renderer->fontUploadPending = false;
+    renderer->fontReady = false;
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = width;
+    textureDescription.Height = height;
+    textureDescription.DepthOrArraySize = 1;
+    textureDescription.MipLevels = 1;
+    textureDescription.Format = DXGI_FORMAT_R8_UNORM;
+    textureDescription.SampleDesc.Count = 1;
+    textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &defaultHeap,
+        D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->fontTexture)))
+    {
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    UINT64 uploadBytes = 0;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+        0, 1, 0, &layout, NULL, NULL, &uploadBytes);
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1;
+    uploadDescription.DepthOrArraySize = 1;
+    uploadDescription.MipLevels = 1;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    uploadDescription.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &uploadHeap,
+        D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->fontTextureUpload)))
+    {
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    unsigned char* mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(renderer->fontTextureUpload, 0,
+        &emptyRange, (void**)&mapped)))
+    {
+        ID3D12Resource_Release(renderer->fontTextureUpload);
+        renderer->fontTextureUpload = NULL;
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+        return false;
+    }
+
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
+            alphaPixels + (size_t)row * width, width);
+    }
+    ID3D12Resource_Unmap(renderer->fontTextureUpload, 0, NULL);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = DXGI_FORMAT_R8_UNORM;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2D.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->fontTexture,
+        &viewDescription, SrvCpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
+
+    renderer->fontUploadPending = true;
+    return true;
+}
+
+void RendererUiQueue(Renderer* renderer, const RendererUiQuad* quads, uint32_t count)
+{
+    if (quads == NULL || count == 0)
+    {
+        return;
+    }
+
+    uint32_t space = UI_MAX_QUADS - renderer->uiQuadCount;
+    if (count > space)
+    {
+        count = space;
+    }
+    if (count == 0)
+    {
+        return;
+    }
+
+    memcpy(renderer->uiQuadMapped[renderer->frameIndex]
+            + (size_t)renderer->uiQuadCount * UI_QUAD_BYTES,
+        quads, (size_t)count * UI_QUAD_BYTES);
+    renderer->uiQuadCount += count;
 }

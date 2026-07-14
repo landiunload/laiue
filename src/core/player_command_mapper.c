@@ -18,14 +18,26 @@ void PlayerCommandMapperBuild(Input* input, const Camera* camera,
         right *= 0.70710678f;
     }
 
-    float sinYaw = ScalarSin(camera->yaw);
-    float cosYaw = ScalarCos(camera->yaw);
-    outCommand->movementX =
-        (double)(sinYaw * forward + cosYaw * right);
-    outCommand->movementY =
-        (double)(cosYaw * forward - sinYaw * right);
+    if (forward == 0.0f && right == 0.0f)
+    {
+        outCommand->movementX = 0.0;
+        outCommand->movementY = 0.0;
+    }
+    else
+    {
+        float sinYaw = ScalarSin(camera->yaw);
+        float cosYaw = ScalarCos(camera->yaw);
+        outCommand->movementX =
+            (double)(sinYaw * forward + cosYaw * right);
+        outCommand->movementY =
+            (double)(cosYaw * forward - sinYaw * right);
+    }
     outCommand->jumpPressed =
         InputConsumeKeyPress(input, INPUT_KEY_SPACE);
+    outCommand->jumpHeld =
+        InputIsKeyDown(input, INPUT_KEY_SPACE);
+    outCommand->sprintHeld =
+        InputIsKeyDown(input, INPUT_KEY_CONTROL);
     outCommand->crouchHeld =
         InputIsKeyDown(input, INPUT_KEY_SHIFT);
 }

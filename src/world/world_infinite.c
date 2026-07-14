@@ -223,7 +223,13 @@ static bool IsAbsoluteZBelow(const World* world, int64_t localZ, int64_t boundar
 static BlockType GeneratedBlock(const World* world, int64_t x, int64_t y, int64_t z)
 {
     int32_t boundary = ColumnCeiling(TerrainHeight(world, x, y));
-    return IsAbsoluteZBelow(world, z, boundary) ? BLOCK_EARTH : BLOCK_AIR;
+    if (!IsAbsoluteZBelow(world, z, boundary))
+    {
+        return BLOCK_AIR;
+    }
+    return IsAbsoluteZBelow(world, z, boundary - 1)
+        ? BLOCK_EARTH
+        : BLOCK_GRASS;
 }
 
 static int32_t SolidCountInColumn(const World* world,
@@ -879,12 +885,22 @@ WorldRegionContents WorldFillRegion(World* world,
             float height = heights != NULL
                 ? heights[y * sizeX + x]
                 : TerrainHeight(world, minBlockX + x, minBlockY + y);
+            int32_t boundary = ColumnCeiling(height);
             int32_t solidCount = SolidCountInColumn(
-                world, minBlockZ, sizeZ, ColumnCeiling(height));
+                world, minBlockZ, sizeZ, boundary);
 
             BlockType* column = &outBlocks[(((size_t)y * sizeX) + (size_t)x) * sizeZ];
             memset(column, BLOCK_EARTH, (size_t)solidCount);
             memset(column + solidCount, BLOCK_AIR, (size_t)(sizeZ - solidCount));
+
+            // Верхний сгенерированный solid-блок может лежать на последней
+            // позиции региона, поэтому проверяем также блок сразу за регионом.
+            if (solidCount > 0
+                && !IsAbsoluteZBelow(
+                    world, minBlockZ + solidCount, boundary))
+            {
+                column[solidCount - 1] = BLOCK_GRASS;
+            }
         }
     }
 
@@ -939,14 +955,6 @@ int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y)
 {
     int64_t globalTop = (int64_t)ColumnCeiling(TerrainHeight(world, x, y)) - 1;
     return InfiniteCoordSubtractFromInt64Clamped(globalTop, &world->blockOrigin[2]);
-}
-
-void WorldGetAbsoluteBlockLow32(World* world,
-    int64_t x, int64_t y, int64_t z, uint32_t outLow[3])
-{
-    outLow[0] = InfiniteCoordLow32Offset(&world->blockOrigin[0], x);
-    outLow[1] = InfiniteCoordLow32Offset(&world->blockOrigin[1], y);
-    outLow[2] = InfiniteCoordLow32Offset(&world->blockOrigin[2], z);
 }
 
 void WorldFormatAbsoluteBlockCoordinate(World* world,

@@ -33,6 +33,13 @@ void CameraUpdate(Camera* camera, float deltaSeconds,
     camera->pitch -= (float)mouseDeltaY * mouseSensitivity;
     camera->pitch = ScalarClamp(camera->pitch, -PITCH_LIMIT, PITCH_LIMIT);
 
+    // Поворот выше должен применяться даже без перемещения. Векторы движения
+    // и тригонометрия после него idle-кадру не нужны.
+    if (!keyForward && !keyLeft && !keyBackward && !keyRight && !keyUp)
+    {
+        return;
+    }
+
     float forward[3];
     CameraGetForwardVector(camera, forward);
 

@@ -10,8 +10,16 @@ laiue_add_module(core
         math.c
         math.h
         numeric.h
+        panorama.c
+        panorama.h
+        pause_menu.c
+        pause_menu.h
         player_command_mapper.c
         player_command_mapper.h
+        ui.c
+        ui.h
+        ui_font.c
+        ui_font.h
         ../game/camera.c
         ../game/camera.h
         ../api.h
@@ -24,4 +32,5 @@ laiue_add_module(core
         laiue_physics
         laiue_gameplay
         laiue_interaction
+        gdi32
 )

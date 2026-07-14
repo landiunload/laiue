@@ -22,6 +22,7 @@ typedef enum InputKey
     INPUT_KEY_V,
     INPUT_KEY_F7,
     INPUT_KEY_SHIFT,
+    INPUT_KEY_CONTROL,
     INPUT_KEY_COUNT
 } InputKey;
 

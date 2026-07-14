@@ -2,6 +2,8 @@ laiue_add_module(gameplay
     SOURCES
         player_controller.c
         player_controller.h
+        player_locomotion.c
+        player_locomotion.h
         player_stance.c
         player_stance.h
         player_jump.c

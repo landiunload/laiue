@@ -796,15 +796,6 @@ bool InfiniteCoordEqualsOffset(const InfiniteCoord* value, const InfiniteCoord* 
     return value->limbCount == expectedCount;
 }
 
-uint32_t InfiniteCoordLow32Offset(const InfiniteCoord* base, int64_t offset)
-{
-    uint64_t low;
-    uint64_t high;
-    InfiniteCoordTwosComplementLow128(base, &low, &high);
-    (void)high;
-    return (uint32_t)(low + (uint64_t)offset);
-}
-
 int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value)
 {
     if (value->sign == 0)

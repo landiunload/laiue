@@ -102,10 +102,31 @@ static bool QuadBufferAppend(QuadBuffer* buffer, ChunkQuad quad)
     return true;
 }
 
+// Материал блока, которому принадлежит грань. Координаты соответствуют
+// раскладке плоскостей greedy-мешера, а +1 переводит их в halo-регион 66^3.
+static inline BlockType FaceBlockType(const BlockType* blocks,
+    uint32_t face, uint32_t slice, uint32_t row, uint32_t bit)
+{
+    switch (face)
+    {
+        case FACE_POSITIVE_X:
+        case FACE_NEGATIVE_X:
+            return blocks[BLOCK_INDEX(row + 1, slice + 1, bit + 1)];
+
+        case FACE_POSITIVE_Y:
+        case FACE_NEGATIVE_Y:
+            return blocks[BLOCK_INDEX(slice + 1, row + 1, bit + 1)];
+
+        default:
+            return blocks[BLOCK_INDEX(row + 1, bit + 1, slice + 1)];
+    }
+}
+
 // Переводит прямоугольник плоскости (slice, биты, ряды) в оси чанка.
 // Z = высота, Y = вторая горизонталь.
 static bool EmitFaceRectangle(QuadBuffer* buffer, uint32_t face, uint32_t slice,
-    uint32_t bitStart, uint32_t bitExtent, uint32_t rowStart, uint32_t rowExtent)
+    uint32_t bitStart, uint32_t bitExtent, uint32_t rowStart,
+    uint32_t rowExtent, BlockType blockType)
 {
     switch (face)
     {
@@ -113,22 +134,26 @@ static bool EmitFaceRectangle(QuadBuffer* buffer, uint32_t face, uint32_t slice,
         case FACE_NEGATIVE_X:
             // Нормаль X; биты = Z (высота), ряды = Y (вторая горизонталь).
             return QuadBufferAppend(buffer,
-                PackChunkQuad(slice, rowStart, bitStart, face, 1, rowExtent, bitExtent));
+                PackChunkQuad(slice, rowStart, bitStart, face, blockType,
+                    1, rowExtent, bitExtent));
 
         case FACE_POSITIVE_Y:
         case FACE_NEGATIVE_Y:
-            // Нормаль Y; биты = X, ряды = Z (высота).
+            // Нормаль Y; биты = Z (высота), ряды = X.
             return QuadBufferAppend(buffer,
-                PackChunkQuad(rowStart, slice, bitStart, face, rowExtent, 1, bitExtent));
+                PackChunkQuad(rowStart, slice, bitStart, face, blockType,
+                    rowExtent, 1, bitExtent));
 
         default:
-            // Нормаль Z (высота); биты = Y, ряды = X.
+            // Нормаль Z (высота); биты = X, ряды = Y.
             return QuadBufferAppend(buffer,
-                PackChunkQuad(bitStart, rowStart, slice, face, bitExtent, rowExtent, 1));
+                PackChunkQuad(bitStart, rowStart, slice, face, blockType,
+                    bitExtent, rowExtent, 1));
     }
 }
 
-static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes)
+static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
+    uint64_t* planes, const BlockType* blocks)
 {
     for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
     {
@@ -143,18 +168,19 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes
                 unsigned long runStart;
                 _BitScanForward64(&runStart, bits);
 
-                uint64_t shifted = bits >> runStart;
-                uint64_t inverted = ~shifted;
-                uint32_t runLength;
-                if (inverted == 0)
+                BlockType blockType = FaceBlockType(
+                    blocks, face, slice, row, (uint32_t)runStart);
+                uint32_t runLength = 1;
+                while ((uint32_t)runStart + runLength < CHUNK_SIZE)
                 {
-                    runLength = 64 - (uint32_t)runStart;
-                }
-                else
-                {
-                    unsigned long firstZero;
-                    _BitScanForward64(&firstZero, inverted);
-                    runLength = (uint32_t)firstZero;
+                    uint32_t bit = (uint32_t)runStart + runLength;
+                    if ((bits & (1ull << bit)) == 0
+                        || FaceBlockType(blocks, face, slice, row, bit)
+                            != blockType)
+                    {
+                        break;
+                    }
+                    ++runLength;
                 }
 
                 uint64_t runMask = runLength == 64
@@ -162,9 +188,29 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes
                     : (((1ull << runLength) - 1) << runStart);
 
                 uint32_t rowExtent = 1;
-                while (row + rowExtent < CHUNK_SIZE &&
-                       (rows[row + rowExtent] & runMask) == runMask)
+                while (row + rowExtent < CHUNK_SIZE)
                 {
+                    uint32_t nextRow = row + rowExtent;
+                    if ((rows[nextRow] & runMask) != runMask)
+                    {
+                        break;
+                    }
+
+                    bool sameMaterial = true;
+                    for (uint32_t offset = 0; offset < runLength; ++offset)
+                    {
+                        if (FaceBlockType(blocks, face, slice, nextRow,
+                                (uint32_t)runStart + offset) != blockType)
+                        {
+                            sameMaterial = false;
+                            break;
+                        }
+                    }
+                    if (!sameMaterial)
+                    {
+                        break;
+                    }
+
                     rows[row + rowExtent] &= ~runMask;
                     ++rowExtent;
                 }
@@ -172,7 +218,9 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face, uint64_t* planes
                 bits &= ~runMask;
                 rows[row] &= ~runMask;
 
-                if (!EmitFaceRectangle(buffer, face, slice, (uint32_t)runStart, runLength, row, rowExtent))
+                if (!EmitFaceRectangle(buffer, face, slice,
+                        (uint32_t)runStart, runLength, row, rowExtent,
+                        blockType))
                 {
                     return false;
                 }
@@ -270,8 +318,10 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << x);
         }
     }
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Z, planesPositive);
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Z, planesNegative);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_POSITIVE_Z, planesPositive, blocks);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_NEGATIVE_Z, planesNegative, blocks);
 
     // === Грани ±X ===
     memset(planesPositive, 0, planeBytes);
@@ -291,8 +341,10 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << z);
         }
     }
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_X, planesPositive);
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_X, planesNegative);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_POSITIVE_X, planesPositive, blocks);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_NEGATIVE_X, planesNegative, blocks);
 
     // === Грани ±Y (вторая горизонталь, нормаль = Y) ===
     memset(planesPositive, 0, planeBytes);
@@ -312,8 +364,10 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, x, 1ull << z);
         }
     }
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_POSITIVE_Y, planesPositive);
-    succeeded = succeeded && GreedyMeshPlanes(quadBuffer, FACE_NEGATIVE_Y, planesNegative);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_POSITIVE_Y, planesPositive, blocks);
+    succeeded = succeeded && GreedyMeshPlanes(
+        quadBuffer, FACE_NEGATIVE_Y, planesNegative, blocks);
 
     if (!succeeded)
     {

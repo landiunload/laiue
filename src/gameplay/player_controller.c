@@ -12,62 +12,100 @@ static VoxelBodyShape ActiveShape(const PlayerController* controller)
     return PlayerStanceGetShape(&controller->stance);
 }
 
-static bool HasGroundContact(const PlayerController* controller,
-    const PlayerCollisionSource* collision, const Camera* camera)
-{
-    VoxelBodyShape shape = ActiveShape(controller);
-    return VoxelBodyHasGroundContact(collision, camera->position,
-        &shape, controller->config.groundProbeDepth);
-}
-
 static void RefreshGroundState(PlayerController* controller,
     const PlayerCollisionSource* collision, const Camera* camera,
-    double stepSeconds)
+    double stepSeconds, VoxelGroundContact* outContact)
 {
-    bool supported = HasGroundContact(controller, collision, camera);
-    PlayerJumpObserveGround(&controller->jump, supported, stepSeconds);
-    controller->grounded = supported
+    VoxelBodyShape shape = ActiveShape(controller);
+    VoxelBodyQueryGroundContact(collision, camera->position,
+        &shape, controller->config.groundProbeDepth, outContact);
+    PlayerJumpObserveGround(
+        &controller->jump, outContact->supported, stepSeconds);
+    controller->grounded = outContact->supported
         && controller->jump.verticalVelocity <= 0.0;
 }
 
-static void TryLaunchQueuedJump(PlayerController* controller)
+static bool TryLaunchQueuedJump(PlayerController* controller,
+    const PlayerControllerCommand* command)
 {
-    if (PlayerJumpTryLaunch(&controller->jump))
+    if (!PlayerJumpTryLaunch(&controller->jump))
     {
-        controller->grounded = false;
+        return false;
     }
+
+    controller->grounded = false;
+    if (command->sprintHeld
+        && !PlayerStanceIsCrouching(&controller->stance))
+    {
+        PlayerLocomotionApplySprintJumpImpulse(&controller->locomotion,
+            command->movementX, command->movementY,
+            controller->config.sprintingSpeed);
+    }
+    return true;
 }
 
 static void MoveVoluntary(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    const PlayerControllerCommand* command, double stepSeconds)
+    const PlayerControllerCommand* command, bool supported,
+    double surfaceFriction, double stepSeconds)
 {
-    double speed = PlayerStanceIsCrouching(&controller->stance)
-        ? controller->config.crouchingSpeed
+    double standingSpeed = command->sprintHeld
+        ? controller->config.sprintingSpeed
         : controller->config.walkingSpeed;
-    double movementX = command->movementX * speed * stepSeconds;
-    double movementY = command->movementY * speed * stepSeconds;
+    double crouchAmount = PlayerStanceGetCrouchAmount(
+        &controller->stance);
+    double groundTargetSpeed = standingSpeed
+        + ((double)controller->config.crouchingSpeed - standingSpeed)
+            * crouchAmount;
+    double targetSpeed = controller->grounded
+        ? groundTargetSpeed
+        : controller->config.walkingSpeed;
+
+    double movementX;
+    double movementY;
+    PlayerLocomotionStep(&controller->locomotion,
+        command->movementX, command->movementY, targetSpeed,
+        controller->grounded, surfaceFriction, stepSeconds,
+        &movementX, &movementY);
     VoxelBodyShape shape = ActiveShape(controller);
 
     // Minecraft-подобный sneak: добровольное движение обрезается до
     // последнего положения, под которым ещё существует опора.
     if (PlayerStanceIsCrouching(&controller->stance)
-        && HasGroundContact(controller, collision, camera))
+        && supported)
     {
+        double unclippedMovementX = movementX;
+        double unclippedMovementY = movementY;
         VoxelBodyClipSneakingMovement(collision, camera->position,
             &shape, controller->config.sneakProbeDepth,
             &movementX, &movementY);
+        if (movementX != unclippedMovementX)
+        {
+            PlayerLocomotionStopAxis(&controller->locomotion, 0);
+        }
+        if (movementY != unclippedMovementY)
+        {
+            PlayerLocomotionStopAxis(&controller->locomotion, 1);
+        }
     }
 
-    VoxelBodyMoveAxis(
-        collision, camera->position, &shape, 0, movementX);
-    VoxelBodyMoveAxis(
-        collision, camera->position, &shape, 1, movementY);
+    if (VoxelBodyMoveAxis(
+            collision, camera->position, &shape, 0, movementX))
+    {
+        PlayerLocomotionStopAxis(&controller->locomotion, 0);
+    }
+    if (VoxelBodyMoveAxis(
+            collision, camera->position, &shape, 1, movementY))
+    {
+        PlayerLocomotionStopAxis(&controller->locomotion, 1);
+    }
 }
 
+// Внешние толчки движутся отдельно от управляемой скорости: sneak не должен
+// приклеивать вытолкнутого игрока к краю блока.
 static void MoveExternalVelocity(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    double stepSeconds)
+    double surfaceFriction, double stepSeconds)
 {
     VoxelBodyShape shape = ActiveShape(controller);
 
@@ -84,8 +122,12 @@ static void MoveExternalVelocity(PlayerController* controller,
         controller->externalVelocityY = 0.0;
     }
 
+    double dampingScale = controller->grounded ? surfaceFriction : 1.0;
+    if (dampingScale < 0.0) dampingScale = 0.0;
+    if (dampingScale > 1.0) dampingScale = 1.0;
     double damping = 1.0
-        - (double)controller->config.externalVelocityDamping * stepSeconds;
+        - (double)controller->config.externalVelocityDamping
+            * dampingScale * stepSeconds;
     if (damping < 0.0)
     {
         damping = 0.0;
@@ -94,15 +136,16 @@ static void MoveExternalVelocity(PlayerController* controller,
     controller->externalVelocityY *= damping;
 }
 
-// Возвращает true в точной вершине прыжка.
-static bool IntegrateVertical(PlayerController* controller,
+// При переходе через вершину оба участка движения
+// интегрируются внутри того же fixed-step.
+static void IntegrateVertical(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
     double stepSeconds)
 {
     if (controller->grounded
         && controller->jump.verticalVelocity == 0.0)
     {
-        return false;
+        return;
     }
 
     double gravity = controller->jump.config.gravity;
@@ -125,12 +168,28 @@ static bool IntegrateVertical(PlayerController* controller,
                 &shape, 2, distanceToApex))
         {
             PlayerJumpHitCeiling(&controller->jump);
-            return false;
+            return;
         }
 
-        controller->jump.verticalVelocity = 0.0;
+        double remainingSeconds = stepSeconds - timeToApex;
+        if (remainingSeconds < 0.0)
+        {
+            remainingSeconds = 0.0;
+        }
+        double distanceFromApex =
+            -0.5 * gravity * remainingSeconds * remainingSeconds;
+        if (VoxelBodyMoveAxis(collision, camera->position,
+                &shape, 2, distanceFromApex))
+        {
+            PlayerJumpLand(&controller->jump);
+            controller->grounded = true;
+            return;
+        }
+
+        controller->jump.verticalVelocity =
+            -gravity * remainingSeconds;
         controller->grounded = false;
-        return true;
+        return;
     }
 
     double distance;
@@ -165,42 +224,45 @@ static bool IntegrateVertical(PlayerController* controller,
             PlayerJumpHitCeiling(&controller->jump);
             controller->grounded = false;
         }
-        return false;
+        return;
     }
 
     controller->jump.verticalVelocity = newVelocity;
     controller->grounded = false;
-    return false;
 }
 
-static bool SimulateStep(PlayerController* controller,
+static void SimulateStep(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    const PlayerControllerCommand* command, double stepSeconds)
+    const PlayerControllerCommand* command, double stepSeconds,
+    bool* presentationChanged)
 {
-    RefreshGroundState(controller, collision, camera, stepSeconds);
-    bool launched = PlayerJumpTryLaunch(&controller->jump);
-    if (launched)
+    if (PlayerStanceStep(&controller->stance,
+            collision, camera->position, stepSeconds))
     {
-        controller->grounded = false;
+        *presentationChanged = true;
     }
 
-    MoveVoluntary(controller, collision, camera, command, stepSeconds);
-    MoveExternalVelocity(controller, collision, camera, stepSeconds);
-    bool reachedApex = IntegrateVertical(
-        controller, collision, camera, stepSeconds);
+    VoxelGroundContact groundContact;
+    RefreshGroundState(controller, collision, camera,
+        stepSeconds, &groundContact);
+
+    // Удержание прыжка ставит новый запрос только при наличии опоры.
+    // Поэтому следующий прыжок начинается после приземления, а не в воздухе.
+    if (command->jumpHeld && controller->grounded)
+    {
+        PlayerJumpQueue(&controller->jump);
+    }
+    MoveVoluntary(controller, collision, camera, command,
+        groundContact.supported, groundContact.friction, stepSeconds);
+    bool launched = TryLaunchQueuedJump(controller, command);
+    MoveExternalVelocity(controller, collision, camera,
+        groundContact.friction, stepSeconds);
+    IntegrateVertical(controller, collision, camera, stepSeconds);
 
     if (!launched)
     {
         PlayerJumpAgeBuffer(&controller->jump, stepSeconds);
     }
-
-    if (controller->jump.verticalVelocity <= 0.0
-        && HasGroundContact(controller, collision, camera))
-    {
-        PlayerJumpLand(&controller->jump);
-        controller->grounded = true;
-    }
-    return reachedApex;
 }
 
 void PlayerControllerInit(PlayerController* controller,
@@ -214,6 +276,10 @@ void PlayerControllerInit(PlayerController* controller,
         .crouchingHeight = config->crouchingHeight,
         .crouchingEyeHeight = config->crouchingEyeHeight,
         .collisionEpsilon = config->collisionEpsilon,
+        .crouchEyeDuration = config->crouchEyeDuration,
+        .crouchColliderDuration = config->crouchColliderDuration,
+        .standColliderDuration = config->standColliderDuration,
+        .standEyeDuration = config->standEyeDuration,
     };
     PlayerStanceInit(&controller->stance, &stanceConfig);
 
@@ -225,6 +291,14 @@ void PlayerControllerInit(PlayerController* controller,
         .coyoteTimeSeconds = config->coyoteTimeSeconds,
     };
     PlayerJumpInit(&controller->jump, &jumpConfig);
+
+    PlayerLocomotionConfig locomotionConfig = {
+        .groundAcceleration = config->groundAcceleration,
+        .groundDeceleration = config->groundDeceleration,
+        .airAcceleration = config->airAcceleration,
+        .sprintJumpSpeed = config->sprintJumpSpeed,
+    };
+    PlayerLocomotionInit(&controller->locomotion, &locomotionConfig);
     controller->externalVelocityX = 0.0;
     controller->externalVelocityY = 0.0;
     controller->simulationAccumulator = 0.0;
@@ -235,6 +309,7 @@ void PlayerControllerReset(PlayerController* controller, Camera* camera)
 {
     PlayerStanceReset(&controller->stance, camera->position);
     PlayerJumpReset(&controller->jump);
+    PlayerLocomotionReset(&controller->locomotion);
     controller->externalVelocityX = 0.0;
     controller->externalVelocityY = 0.0;
     controller->simulationAccumulator = 0.0;
@@ -245,19 +320,15 @@ bool PlayerControllerUpdate(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
     const PlayerControllerCommand* command, float deltaSeconds)
 {
-    bool presentationChanged = PlayerStanceTrySet(
-        &controller->stance, collision,
-        camera->position, command->crouchHeld);
+    bool presentationChanged = PlayerStanceSetCrouching(
+        &controller->stance, command->crouchHeld);
 
+    // Нажатие не теряется между render-кадрами, но сам запуск
+    // выполняется в fixed-step после текущего шага разгона.
     if (command->jumpPressed)
     {
         PlayerJumpQueue(&controller->jump);
     }
-
-    // Нажатие обрабатывается немедленно, а не ждёт accumulation fixed-step.
-    // Поэтому при сотнях тысяч render-кадров событие не может потеряться.
-    RefreshGroundState(controller, collision, camera, 0.0);
-    TryLaunchQueuedJump(controller);
 
     double fixedStep = controller->config.fixedStepSeconds;
     if (fixedStep <= 0.0)
@@ -285,13 +356,10 @@ bool PlayerControllerUpdate(PlayerController* controller,
         && substep < maximumSubsteps)
     {
         controller->simulationAccumulator -= fixedStep;
-        bool reachedApex = SimulateStep(controller,
-            collision, camera, command, fixedStep);
+        SimulateStep(controller,
+            collision, camera, command, fixedStep,
+            &presentationChanged);
         ++substep;
-        if (reachedApex)
-        {
-            break;
-        }
     }
 
     return presentationChanged;

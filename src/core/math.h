@@ -10,6 +10,14 @@ float ScalarCos(float radians);
 float ScalarTan(float radians);
 float ScalarClamp(float value, float minimum, float maximum);
 float ScalarWrap(float radians);
+float ScalarSqrt(float value);
+
+// Арктангенсы — минимаксный полином, точность ~1e-6 рад.
+// ScalarAtan2 повторяет соглашения atan2f: результат в (-pi, pi],
+// учитывает знаки обоих аргументов.
+float ScalarAtan(float value);
+float ScalarAtan2(float y, float x);
+float ScalarAcos(float value);
 
 // out = left * right (матрицы 4x4, row-major).
 void Matrix4Multiply(const float left[16], const float right[16], float out[16]);

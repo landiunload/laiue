@@ -5,14 +5,39 @@
 
 #include "api.h"
 
-typedef bool (*VoxelSolidBlockQuery)(
-    void* context, int64_t x, int64_t y, int64_t z);
+enum
+{
+    VOXEL_BLOCK_PHYSICS_SOLID = 1u << 0,
+};
+
+// Минимальное физическое представление блока. Physics не зависит от
+// BlockType и от реализации мира, поэтому новые миры могут предоставлять
+// те же свойства через собственный callback.
+typedef struct VoxelBlockPhysics
+{
+    uint32_t flags;
+    // Нормализованный конечный коэффициент в диапазоне [0, 1].
+    float friction;
+} VoxelBlockPhysics;
+
+// Callback обязан при каждом вызове полностью записать flags и friction.
+// Все функции collision API требуют ненулевые source, callback и выходные
+// указатели; context может быть NULL, если конкретному source он не нужен.
+typedef void (*VoxelBlockPhysicsQuery)(
+    void* context, int64_t x, int64_t y, int64_t z,
+    VoxelBlockPhysics* outBlock);
 
 typedef struct VoxelCollisionSource
 {
     void* context;
-    VoxelSolidBlockQuery isSolidBlock;
+    VoxelBlockPhysicsQuery queryBlockPhysics;
 } VoxelCollisionSource;
+
+typedef struct VoxelGroundContact
+{
+    float friction;
+    bool supported;
+} VoxelGroundContact;
 
 typedef struct VoxelBodyShape
 {
@@ -43,6 +68,13 @@ LAIUE_PHYSICS_API bool VoxelBodyMoveAxis(
     int32_t axis, double distance);
 
 // Любая опора под AABB: используется для обычного контакта с землёй.
+// Трение нескольких блоков усредняется по площади опоры под стопами.
+LAIUE_PHYSICS_API void VoxelBodyQueryGroundContact(
+    const VoxelCollisionSource* collision,
+    const double position[3], const VoxelBodyShape* shape,
+    double probeDepth, VoxelGroundContact* outContact);
+
+// Совместимый сокращённый запрос, если свойства поверхности не нужны.
 LAIUE_PHYSICS_API bool VoxelBodyHasGroundContact(
     const VoxelCollisionSource* collision,
     const double position[3], const VoxelBodyShape* shape,

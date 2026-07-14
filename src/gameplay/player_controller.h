@@ -6,16 +6,21 @@
 #include "api.h"
 #include "game/camera.h"
 #include "gameplay/player_jump.h"
+#include "gameplay/player_locomotion.h"
 #include "gameplay/player_stance.h"
 #include "physics/voxel_body.h"
 
-typedef VoxelSolidBlockQuery PlayerSolidBlockQuery;
 typedef VoxelCollisionSource PlayerCollisionSource;
 
 typedef struct PlayerControllerConfig
 {
     float walkingSpeed;
+    float sprintingSpeed;
     float crouchingSpeed;
+    float groundAcceleration;
+    float groundDeceleration;
+    float airAcceleration;
+    float sprintJumpSpeed;
     float gravity;
     float maximumFallSpeed;
     float jumpBufferSeconds;
@@ -32,6 +37,10 @@ typedef struct PlayerControllerConfig
     double collisionEpsilon;
     double groundProbeDepth;
     double sneakProbeDepth;
+    double crouchEyeDuration;
+    double crouchColliderDuration;
+    double standColliderDuration;
+    double standEyeDuration;
 } PlayerControllerConfig;
 
 typedef struct PlayerControllerCommand
@@ -40,6 +49,8 @@ typedef struct PlayerControllerCommand
     double movementX;
     double movementY;
     bool jumpPressed;
+    bool jumpHeld;
+    bool sprintHeld;
     bool crouchHeld;
 } PlayerControllerCommand;
 
@@ -48,6 +59,7 @@ typedef struct PlayerController
     PlayerControllerConfig config;
     PlayerStance stance;
     PlayerJump jump;
+    PlayerLocomotion locomotion;
     double externalVelocityX;
     double externalVelocityY;
     double simulationAccumulator;

@@ -19,7 +19,7 @@ typedef struct ChunkMesherScratch ChunkMesherScratch;
 LAIUE_MESHER_API ChunkMesherScratch* ChunkMesherScratchCreate(void);
 LAIUE_MESHER_API void ChunkMesherScratchDestroy(ChunkMesherScratch* scratch);
 
-// Строит меш чанка по данным мира (бинарный greedy meshing).
+// Строит меш чанка по данным мира (material-aware greedy meshing).
 // Массив квадов выделяется через HeapAlloc — вызывающая сторона
 // освобождает его HeapFree. Для пустого чанка возвращает true
 // с нулевым счётчиком и NULL-массивом.

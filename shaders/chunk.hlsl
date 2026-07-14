@@ -4,16 +4,17 @@ cbuffer FrameConstants : register(b0)
 {
     float4x4 viewProjection;
     float3 chunkOriginRelative;
-    uint3 chunkBaseLow;
 };
 
 ByteAddressBuffer quadBuffer : register(t0);
+Texture2DArray blockTextures : register(t1);
+SamplerState blockSampler : register(s0);
 
 struct PixelInput
 {
     float4 position : SV_POSITION;
-    float3 localPosition : LOCALPOSITION;
-    nointerpolation uint face : FACEINDEX;
+    float2 textureCoordinates : TEXCOORD0;
+    nointerpolation uint surface : SURFACE;
 };
 
 static const uint CORNER_PATTERN[6] = { 0, 1, 2, 0, 2, 3 };
@@ -42,6 +43,7 @@ PixelInput VSMain(uint vertexId : SV_VertexID)
     uint2 quad = quadBuffer.Load2(quadIndex * 8);
     uint3 start = uint3(quad.x & 127, (quad.x >> 14) & 127, (quad.x >> 7) & 127);
     uint face = (quad.x >> 21) & 7;
+    uint blockType = quad.x >> 24;
     uint3 extent = uint3(quad.y & 127, (quad.y >> 14) & 127, (quad.y >> 7) & 127);
 
     uint3 corner = FACE_CORNERS[face][cornerIndex];
@@ -59,38 +61,36 @@ PixelInput VSMain(uint vertexId : SV_VertexID)
 
     PixelInput output;
     output.position = mul(float4(worldPosition, 1.0), viewProjection);
-    output.localPosition = localPosition;
-    output.face = face;
+    if (face < 2)
+    {
+        output.textureCoordinates = float2(localPosition.y, -localPosition.z);
+    }
+    else if (face < 4)
+    {
+        output.textureCoordinates = float2(localPosition.x, -localPosition.z);
+    }
+    else
+    {
+        output.textureCoordinates = localPosition.xy;
+    }
+
+    // Слои texture array: 0 = земля, 1 = верх травы, 2 = бок травы.
+    uint textureLayer = 0;
+    if (blockType == 2)
+    {
+        textureLayer = face == 4 ? 1 : (face == 5 ? 0 : 2);
+    }
+    output.surface = face | (textureLayer << 3);
     return output;
 }
-
-// Нормали: +X, -X, +Y(2ndH), -Y, +Z(высота), -Z.
-static const float3 FACE_NORMALS[6] =
-{
-    float3( 1, 0, 0), float3(-1, 0, 0),
-    float3( 0, 1, 0), float3( 0,-1, 0),
-    float3( 0, 0, 1), float3( 0, 0,-1),
-};
 
 static const float FACE_SHADE[6] = { 0.80, 0.80, 0.90, 0.70, 1.00, 0.55 };
 
 float4 PSMain(PixelInput input) : SV_TARGET
 {
-    float3 normal = FACE_NORMALS[input.face];
-    int3 localBlock = (int3)floor(input.localPosition - normal * 0.5);
-
-    uint3 blockLow = chunkBaseLow + (uint3)localBlock;
-
-    uint hash = blockLow.x * 374761393u
-              + blockLow.y * 668265263u
-              + blockLow.z * 1274126177u;
-    hash = (hash ^ (hash >> 13)) * 1274126177u;
-    uint variation = (hash >> 16) & 31u;
-
-    float3 baseColor = float3(
-        101.0 + (variation & 7),
-        67.0 + ((variation >> 3) & 7),
-        33.0) / 255.0;
-
-    return float4(baseColor * FACE_SHADE[input.face], 1.0);
+    uint face = input.surface & 7;
+    uint textureLayer = input.surface >> 3;
+    float3 textureLocation = float3(input.textureCoordinates, textureLayer);
+    float3 baseColor = blockTextures.Sample(blockSampler, textureLocation).rgb;
+    return float4(baseColor * FACE_SHADE[face], 1.0);
 }

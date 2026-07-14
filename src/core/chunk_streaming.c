@@ -12,6 +12,7 @@
 // Бюджет загрузок на GPU за один кадр: сглаживает волну готовых мешей
 // при пересечении границы чанка (иначе — разовый фриз кадра).
 #define MESH_UPLOADS_PER_FRAME 4
+#define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
 typedef enum ChunkEntryState
 {
@@ -27,7 +28,6 @@ typedef struct ChunkEntry
     int64_t x;
     int64_t y;
     int64_t z;
-    uint32_t baseLow[3];
     RendererMesh* mesh;
     uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
     uint32_t drawSlotPlusOne; // 0 — меша нет, иначе позиция в плотном drawItems + 1
@@ -48,10 +48,9 @@ typedef struct ChunkMeshResult
     int64_t x;
     int64_t y;
     int64_t z;
-    uint32_t revision;
     ChunkQuad* quads;
+    uint32_t revision;
     uint32_t quadCount;
-    bool succeeded;
 } ChunkMeshResult;
 
 typedef struct DrawItem
@@ -238,9 +237,6 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     entry->x = x;
     entry->y = y;
     entry->z = z;
-    WorldGetAbsoluteBlockLow32(streaming->world,
-        x * CHUNK_SIZE, y * CHUNK_SIZE, z * CHUNK_SIZE,
-        entry->baseLow);
     entry->mesh = NULL;
     entry->revision = 0;
     entry->drawSlotPlusOne = 0;
@@ -336,8 +332,11 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
 
         // Тяжёлая работа — без замка.
         ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
-        result.succeeded = BuildChunkMesh(streaming->world, scratch,
-            request.x, request.y, request.z, &result.quads, &result.quadCount);
+        if (!BuildChunkMesh(streaming->world, scratch,
+            request.x, request.y, request.z, &result.quads, &result.quadCount))
+        {
+            result.quadCount = CHUNK_MESH_BUILD_FAILED;
+        }
 
         // Очередь результатов переполниться не может: unfinishedWork
         // ограничен её ёмкостью.
@@ -573,14 +572,27 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
         capacity <<= 1;
     }
 
+    // Очередям достаточно вместить весь активный куб радиуса viewRadius.
+    // Hash-таблица больше из-за гистерезиса, но переносить этот запас в две
+    // очереди нет смысла: переполнение всё равно корректно retry-ится.
+    uint32_t activeDiameter = (uint32_t)(viewRadiusChunks * 2 + 1);
+    uint32_t activeVolume = activeDiameter * activeDiameter * activeDiameter;
+    uint32_t queueCapacity = 1;
+    while (queueCapacity < activeVolume)
+    {
+        queueCapacity <<= 1;
+    }
+
     streaming->capacity = capacity;
-    streaming->queueCapacity = capacity;
+    streaming->queueCapacity = queueCapacity;
     streaming->entries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof(ChunkEntry));
     streaming->spareEntries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         (size_t)capacity * sizeof(ChunkEntry));
-    streaming->drawItems = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(DrawItem));
-    streaming->requests = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkRequest));
-    streaming->results = HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(ChunkMeshResult));
+    streaming->drawItems = HeapAlloc(GetProcessHeap(), 0, (size_t)volume * sizeof(DrawItem));
+    streaming->requests = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)queueCapacity * sizeof(ChunkRequest));
+    streaming->results = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)queueCapacity * sizeof(ChunkMeshResult));
 
     InitializeSRWLock(&streaming->queueLock);
     InitializeConditionVariable(&streaming->workAvailable);
@@ -695,9 +707,6 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
             ChunkEntry* moved = InsertEntry(streaming, previous->x, previous->y, previous->z);
             moved->state = previous->state;
             moved->mesh = previous->mesh;
-            moved->baseLow[0] = previous->baseLow[0];
-            moved->baseLow[1] = previous->baseLow[1];
-            moved->baseLow[2] = previous->baseLow[2];
             moved->revision = previous->revision;
             moved->requestQueued = previous->requestQueued;
             if (moved->mesh != NULL)
@@ -784,7 +793,8 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         }
 
         ChunkMeshResult result = streaming->results[streaming->resultHead & queueMask];
-        if (result.quadCount > 0 && uploadBudget == 0)
+        if (result.quadCount != CHUNK_MESH_BUILD_FAILED
+            && result.quadCount > 0 && uploadBudget == 0)
         {
             ReleaseSRWLockExclusive(&streaming->queueLock);
             break;
@@ -800,7 +810,7 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
             // Заявка этой ревизии завершена; повторное выставление ниже нужно
             // только если построение или GPU-загрузка не удались.
             entry->requestQueued = false;
-            if (!result.succeeded)
+            if (result.quadCount == CHUNK_MESH_BUILD_FAILED)
             {
                 // Сбой построения (нехватка памяти): повторная попытка
                 // через условное сканирование ниже.
@@ -871,6 +881,33 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
     }
 }
 
+static void ExpandFrustumPlanesForChunk(float planes[6][4])
+{
+    const float halfExtent = (float)(CHUNK_SIZE / 2);
+    for (uint32_t plane = 0; plane < 6; ++plane)
+    {
+        float absoluteX = planes[plane][0] < 0.0f ? -planes[plane][0] : planes[plane][0];
+        float absoluteY = planes[plane][1] < 0.0f ? -planes[plane][1] : planes[plane][1];
+        float absoluteZ = planes[plane][2] < 0.0f ? -planes[plane][2] : planes[plane][2];
+        planes[plane][3] += halfExtent * (absoluteX + absoluteY + absoluteZ);
+    }
+}
+
+static bool FrustumContainsChunkCenter(const float planes[6][4], const float center[3])
+{
+    for (uint32_t plane = 0; plane < 6; ++plane)
+    {
+        if (planes[plane][0] * center[0]
+            + planes[plane][1] * center[1]
+            + planes[plane][2] * center[2]
+            + planes[plane][3] < 0.0f)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16],
     const int64_t cameraBlockPosition[3])
 {
@@ -912,6 +949,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
 
     float planes[6][4];
     Matrix4ExtractFrustumPlanes(viewProjection, planes);
+    ExpandFrustumPlanesForChunk(planes);
 
     // Frustum зависит от поворота камеры, поэтому отсечение остаётся
     // покадровым. Плотный список исключает обход пустых слотов hash-таблицы.
@@ -924,17 +962,16 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
             (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
             (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
         };
-        float maximum[3] = {
-            chunkOriginRelative[0] + (float)CHUNK_SIZE,
-            chunkOriginRelative[1] + (float)CHUNK_SIZE,
-            chunkOriginRelative[2] + (float)CHUNK_SIZE,
+        float center[3] = {
+            chunkOriginRelative[0] + (float)(CHUNK_SIZE / 2),
+            chunkOriginRelative[1] + (float)(CHUNK_SIZE / 2),
+            chunkOriginRelative[2] + (float)(CHUNK_SIZE / 2),
         };
-        if (!FrustumIntersectsBox(planes, chunkOriginRelative, maximum))
+        if (!FrustumContainsChunkCenter(planes, center))
         {
             continue;
         }
 
-        RendererDrawMesh(streaming->renderer, entry->mesh,
-            chunkOriginRelative, entry->baseLow);
+        RendererDrawMesh(streaming->renderer, entry->mesh, chunkOriginRelative);
     }
 }

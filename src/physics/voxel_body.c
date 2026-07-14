@@ -8,6 +8,21 @@ static int64_t FloorToInt64(double value)
     return (double)truncated > value ? truncated - 1 : truncated;
 }
 
+static void QueryBlockPhysics(const VoxelCollisionSource* collision,
+    int64_t x, int64_t y, int64_t z, VoxelBlockPhysics* outBlock)
+{
+    collision->queryBlockPhysics(
+        collision->context, x, y, z, outBlock);
+}
+
+static bool IsSolidBlock(const VoxelCollisionSource* collision,
+    int64_t x, int64_t y, int64_t z)
+{
+    VoxelBlockPhysics block;
+    QueryBlockPhysics(collision, x, y, z, &block);
+    return (block.flags & VOXEL_BLOCK_PHYSICS_SOLID) != 0u;
+}
+
 void VoxelBodyCalculateBounds(const double position[3],
     const VoxelBodyShape* shape, VoxelBodyBounds* outBounds)
 {
@@ -42,7 +57,7 @@ static bool BoundsContainSolidBlock(
         {
             for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
             {
-                if (collision->isSolidBlock(collision->context, x, y, z))
+                if (IsSolidBlock(collision, x, y, z))
                 {
                     return true;
                 }
@@ -84,7 +99,7 @@ static bool BlockPlaneCollides(
         {
             for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
             {
-                if (collision->isSolidBlock(collision->context, x, y, z))
+                if (IsSolidBlock(collision, x, y, z))
                 {
                     return true;
                 }
@@ -163,6 +178,83 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
     return false;
 }
 
+void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
+    const double position[3], const VoxelBodyShape* shape,
+    double probeDepth, VoxelGroundContact* outContact)
+{
+    outContact->friction = 0.0f;
+    outContact->supported = false;
+
+    VoxelBodyBounds bounds;
+    VoxelBodyCalculateBounds(position, shape, &bounds);
+
+    double footprintMinimumX =
+        bounds.minimum[0] + shape->collisionEpsilon;
+    double footprintMaximumX =
+        bounds.maximum[0] - shape->collisionEpsilon;
+    double footprintMinimumY =
+        bounds.minimum[1] + shape->collisionEpsilon;
+    double footprintMaximumY =
+        bounds.maximum[1] - shape->collisionEpsilon;
+    int64_t minimumX = FloorToInt64(
+        footprintMinimumX);
+    int64_t maximumX = FloorToInt64(
+        footprintMaximumX);
+    int64_t minimumY = FloorToInt64(
+        footprintMinimumY);
+    int64_t maximumY = FloorToInt64(
+        footprintMaximumY);
+    int64_t supportZ = FloorToInt64(bounds.minimum[2] - probeDepth);
+
+    double weightedFriction = 0.0;
+    double supportedArea = 0.0;
+
+    for (int64_t y = minimumY; y <= maximumY; ++y)
+    {
+        for (int64_t x = minimumX; x <= maximumX; ++x)
+        {
+            VoxelBlockPhysics block;
+            QueryBlockPhysics(collision, x, y, supportZ, &block);
+            if ((block.flags & VOXEL_BLOCK_PHYSICS_SOLID) == 0u)
+            {
+                continue;
+            }
+
+            double blockMinimumX = (double)x;
+            double blockMaximumX = blockMinimumX + 1.0;
+            double blockMinimumY = (double)y;
+            double blockMaximumY = blockMinimumY + 1.0;
+            double overlapMinimumX = footprintMinimumX > blockMinimumX
+                ? footprintMinimumX : blockMinimumX;
+            double overlapMaximumX = footprintMaximumX < blockMaximumX
+                ? footprintMaximumX : blockMaximumX;
+            double overlapMinimumY = footprintMinimumY > blockMinimumY
+                ? footprintMinimumY : blockMinimumY;
+            double overlapMaximumY = footprintMaximumY < blockMaximumY
+                ? footprintMaximumY : blockMaximumY;
+            double width = overlapMaximumX - overlapMinimumX;
+            double height = overlapMaximumY - overlapMinimumY;
+            if (width <= 0.0 || height <= 0.0)
+            {
+                continue;
+            }
+
+            double friction = block.friction >= 0.0f
+                ? (double)block.friction : 0.0;
+            double area = width * height;
+            weightedFriction += friction * area;
+            supportedArea += area;
+        }
+    }
+
+    if (supportedArea > 0.0)
+    {
+        outContact->friction =
+            (float)(weightedFriction / supportedArea);
+        outContact->supported = true;
+    }
+}
+
 bool VoxelBodyHasGroundContact(const VoxelCollisionSource* collision,
     const double position[3], const VoxelBodyShape* shape,
     double probeDepth)
@@ -184,7 +276,7 @@ bool VoxelBodyHasGroundContact(const VoxelCollisionSource* collision,
     {
         for (int64_t x = minimumX; x <= maximumX; ++x)
         {
-            if (collision->isSolidBlock(collision->context, x, y, supportZ))
+            if (IsSolidBlock(collision, x, y, supportZ))
             {
                 return true;
             }
@@ -218,7 +310,7 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
         {
             int64_t x = FloorToInt64(position[0] + offsets[xIndex]);
             int64_t y = FloorToInt64(position[1] + offsets[yIndex]);
-            if (collision->isSolidBlock(collision->context, x, y, supportZ))
+            if (IsSolidBlock(collision, x, y, supportZ))
             {
                 return true;
             }
@@ -280,7 +372,7 @@ static bool HasSupportBelowOffset(
         {
             for (int64_t x = minimumX; x <= maximumX; ++x)
             {
-                if (collision->isSolidBlock(collision->context, x, y, z))
+                if (IsSolidBlock(collision, x, y, z))
                 {
                     return true;
                 }
@@ -308,7 +400,7 @@ void VoxelBodyClipSneakingMovement(
     const double position[3], const VoxelBodyShape* shape,
     double probeDepth, double* xDistance, double* yDistance)
 {
-    if (collision == NULL || collision->isSolidBlock == NULL
+    if (collision == NULL || collision->queryBlockPhysics == NULL
         || position == NULL || shape == NULL
         || xDistance == NULL || yDistance == NULL)
     {

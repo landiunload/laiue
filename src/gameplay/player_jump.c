@@ -1,6 +1,6 @@
 #include "gameplay/player_jump.h"
 
-#include <stdint.h>
+#include <emmintrin.h>
 
 static double PositiveSquareRoot(double value)
 {
@@ -8,13 +8,8 @@ static double PositiveSquareRoot(double value)
     {
         return 0.0;
     }
-
-    double estimate = value >= 1.0 ? value : 1.0;
-    for (uint32_t iteration = 0; iteration < 20u; ++iteration)
-    {
-        estimate = 0.5 * (estimate + value / estimate);
-    }
-    return estimate;
+    __m128d input = _mm_set_sd(value);
+    return _mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), input));
 }
 
 void PlayerJumpInit(PlayerJump* jump, const PlayerJumpConfig* config)

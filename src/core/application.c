@@ -4,7 +4,10 @@
 #include "core/debug_overlay.h"
 #include "core/math.h"
 #include "core/numeric.h"
+#include "core/panorama.h"
+#include "core/pause_menu.h"
 #include "core/player_command_mapper.h"
+#include "core/ui.h"
 #include "game/camera.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/player_controller.h"
@@ -13,6 +16,7 @@
 #include "platform/time.h"
 #include "platform/window.h"
 #include "render/renderer.h"
+#include "world/block_properties.h"
 #include "world/world.h"
 
 #include <stddef.h>
@@ -36,19 +40,30 @@ typedef struct ApplicationState
     uint32_t framesPerSecond;
     int64_t coordinateOverlayBlock[3];
     bool overlayDirty;
+
+    GameSettings settings;
+    PanoramaCache panoramaCache;
+    PauseMenu menu;
+    UiContext ui;
+    bool mouseLookBeforeMenu;
 } ApplicationState;
 
-static bool IsSolidWorldBlock(
-    void* context, int64_t x, int64_t y, int64_t z)
+static void QueryWorldBlockPhysics(
+    void* context, int64_t x, int64_t y, int64_t z,
+    VoxelBlockPhysics* outBlock)
 {
-    return WorldGetBlock((World*)context, x, y, z) != BLOCK_AIR;
+    BlockType type = WorldGetBlock((World*)context, x, y, z);
+    BlockProperties properties = BlockGetProperties(type);
+    outBlock->flags = properties.solid
+        ? VOXEL_BLOCK_PHYSICS_SOLID : 0u;
+    outBlock->friction = properties.friction;
 }
 
 static PlayerCollisionSource CreatePlayerCollisionSource(World* world)
 {
     PlayerCollisionSource source = {
         .context = world,
-        .isSolidBlock = IsSolidWorldBlock,
+        .queryBlockPhysics = QueryWorldBlockPhysics,
     };
     return source;
 }
@@ -221,6 +236,10 @@ static void HandleBlockEditing(ApplicationState* application)
         application->input, INPUT_MOUSE_BUTTON_LEFT);
     bool placePressed = InputWasMouseButtonPressed(
         application->input, INPUT_MOUSE_BUTTON_RIGHT);
+    if (!breakPressed && !placePressed)
+    {
+        return;
+    }
 
     float direction[3];
     CameraGetForwardVector(&application->camera, direction);
@@ -312,23 +331,41 @@ static void UpdatePlayer(ApplicationState* application,
     }
 }
 
+// Закрывает меню и возвращает игру: восстанавливает режим взгляда,
+// сбрасывает накопленный за паузу ввод.
+static void ResumeGame(ApplicationState* application)
+{
+    application->menu.screen = PAUSE_MENU_CLOSED;
+    WindowSetMouseLook(application->window, application->mouseLookBeforeMenu);
+    InputResetState(application->input);
+}
+
 static void OnFrame(void* userData)
 {
     ApplicationState* application = userData;
 
-    if (InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE))
+    bool escapePressed =
+        InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE);
+    bool menuOpen = application->menu.screen != PAUSE_MENU_CLOSED;
+
+    if (escapePressed && !menuOpen)
     {
-        WindowRequestClose(application->window);
-        return;
+        // Открытие меню: курсор освобождается, режим взгляда запоминается.
+        PauseMenuOpen(&application->menu);
+        application->mouseLookBeforeMenu =
+            WindowIsMouseLookEnabled(application->window);
+        WindowSetMouseLook(application->window, false);
+        menuOpen = true;
+        escapePressed = false;
     }
 
-    if (InputConsumeKeyPress(application->input, INPUT_KEY_F7))
+    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_F7))
     {
         WindowSetMouseLook(application->window,
             !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
     }
 
-    if (InputConsumeKeyPress(application->input, INPUT_KEY_V))
+    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_V))
     {
         RendererSetVerticalSync(application->renderer,
             !RendererIsVerticalSyncEnabled(application->renderer));
@@ -339,12 +376,12 @@ static void OnFrame(void* userData)
         InputResetState(application->input);
     }
 
-    if (InputConsumeKeyPress(application->input, INPUT_KEY_G))
+    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_G))
     {
         ToggleGameMode(application);
     }
 
-    if (InputConsumeKeyPress(application->input, INPUT_KEY_T)
+    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_T)
         && !SquareAbsoluteX(application))
     {
         WindowRequestClose(application->window);
@@ -385,8 +422,11 @@ static void OnFrame(void* userData)
             &mouseDeltaX, &mouseDeltaY);
     }
 
-    UpdatePlayer(application,
-        deltaSeconds, mouseDeltaX, mouseDeltaY);
+    if (!menuOpen)
+    {
+        UpdatePlayer(application,
+            deltaSeconds, mouseDeltaX, mouseDeltaY);
+    }
 
     if (!RebaseWorldIfNeeded(application))
     {
@@ -394,7 +434,7 @@ static void OnFrame(void* userData)
         return;
     }
 
-    if (mouseLookEnabled)
+    if (mouseLookEnabled && !menuOpen)
     {
         HandleBlockEditing(application);
     }
@@ -418,26 +458,90 @@ static void OnFrame(void* userData)
         cameraBlockPosition[2] >> CHUNK_SIZE_LOG2);
     ChunkStreamingPump(application->chunkStreaming);
 
+    // Меню обновляется до начала кадра: замена атласа шрифта требует
+    // паузы GPU, а настройки должны примениться уже к этому кадру.
+    bool drawMenu = false;
+    if (menuOpen)
+    {
+        int32_t cursorX;
+        int32_t cursorY;
+        WindowGetCursorClientPosition(application->window,
+            &cursorX, &cursorY);
+        bool mouseDown = InputIsMouseButtonDown(
+            application->input, INPUT_MOUSE_BUTTON_LEFT);
+        bool mousePressed = InputWasMouseButtonPressed(
+            application->input, INPUT_MOUSE_BUTTON_LEFT);
+
+        if (UiBegin(&application->ui,
+                application->windowWidth, application->windowHeight,
+                (float)cursorX, (float)cursorY,
+                mouseDown, mousePressed, deltaSeconds))
+        {
+            if (application->ui.fontDirty
+                && RendererUiSetFontAtlas(application->renderer,
+                    application->ui.font.atlas,
+                    application->ui.font.atlasWidth,
+                    application->ui.font.atlasHeight))
+            {
+                application->ui.fontDirty = false;
+            }
+
+            PauseMenuAction action = PauseMenuUpdate(&application->menu,
+                &application->ui, &application->settings,
+                application->renderer,
+                application->windowWidth, application->windowHeight,
+                escapePressed);
+            if (action == PAUSE_MENU_ACTION_QUIT)
+            {
+                WindowRequestClose(application->window);
+                return;
+            }
+            if (action == PAUSE_MENU_ACTION_RESUME)
+            {
+                ResumeGame(application);
+            }
+            else
+            {
+                drawMenu = true;
+            }
+        }
+        else
+        {
+            // Шрифт недоступен — меню нарисовать нечем, не запираем игрока.
+            ResumeGame(application);
+        }
+    }
+
+    // Описание кадра: обычная перспектива или панорама по граням кубмапы.
     float viewMatrix[16];
-    float projectionMatrix[16];
-    float viewProjectionMatrix[16];
     CameraGetViewMatrix(&application->camera,
         relativeEyePosition, viewMatrix);
-    CameraGetProjectionMatrix(
-        (float)application->windowWidth
-            / (float)application->windowHeight,
-        g_applicationConfiguration.fieldOfViewRadians,
+
+    RendererFrameSetup frameSetup;
+    PanoramaBuildFrameSetup(&application->panoramaCache,
+        application->settings.projection,
+        (float)application->settings.fovDegrees,
+        application->windowWidth, application->windowHeight,
         g_applicationConfiguration.nearPlane,
         g_applicationConfiguration.farPlane,
-        projectionMatrix);
-    Matrix4Multiply(viewMatrix,
-        projectionMatrix, viewProjectionMatrix);
+        viewMatrix, &frameSetup);
 
-    if (RendererBeginFrame(
-            application->renderer, viewProjectionMatrix))
+    if (RendererBeginFrame(application->renderer, &frameSetup))
     {
-        ChunkStreamingDraw(application->chunkStreaming,
-            viewProjectionMatrix, cameraBlockPosition);
+        for (uint32_t pass = 0; pass < frameSetup.passCount; ++pass)
+        {
+            RendererBeginScenePass(application->renderer, pass);
+            ChunkStreamingDraw(application->chunkStreaming,
+                frameSetup.passes[pass].viewProjection,
+                cameraBlockPosition);
+        }
+
+        if (drawMenu)
+        {
+            RendererUiQueue(application->renderer,
+                application->ui.quads, application->ui.quadCount);
+        }
+
         if (!RendererEndFrame(application->renderer))
         {
             WindowRequestClose(application->window);
@@ -503,33 +607,52 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
+    // Состояние приложения крупное (квады интерфейса, кеш панорамы) —
+    // живёт на куче: стек без CRT не имеет проб роста (__chkstk),
+    // поэтому кадры функций обязаны оставаться меньше страницы.
+    ApplicationState* application = HeapAlloc(GetProcessHeap(),
+        HEAP_ZERO_MEMORY, sizeof(*application));
+    if (application == NULL)
+    {
+        ChunkStreamingDestroy(chunkStreaming);
+        RendererDestroy(renderer);
+        WorldDestroy(world);
+        InputDestroy(input);
+        WindowDestroy(window);
+        return;
+    }
+
     double startTimeSeconds = PlatformTimeSeconds();
-    ApplicationState application = {
-        .window = window,
-        .input = input,
-        .world = world,
-        .renderer = renderer,
-        .chunkStreaming = chunkStreaming,
-        .gameMode = GAME_MODE_FLY,
-        .windowWidth = clientWidth,
-        .windowHeight = clientHeight,
-        .previousTimeSeconds = startTimeSeconds,
-        .fpsSampleStartSeconds = startTimeSeconds,
-        .overlayDirty = true,
-    };
-    PlayerControllerInit(&application.player,
+    application->window = window;
+    application->input = input;
+    application->world = world;
+    application->renderer = renderer;
+    application->chunkStreaming = chunkStreaming;
+    application->gameMode = GAME_MODE_FLY;
+    application->windowWidth = clientWidth;
+    application->windowHeight = clientHeight;
+    application->previousTimeSeconds = startTimeSeconds;
+    application->fpsSampleStartSeconds = startTimeSeconds;
+    application->overlayDirty = true;
+    application->settings.fovDegrees =
+        g_applicationConfiguration.defaultFieldOfViewDegrees;
+    application->settings.projection = RENDER_PROJECTION_AUTO;
+
+    PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);
 
-    CameraInit(&application.camera,
+    CameraInit(&application->camera,
         0.0, 0.0, g_applicationConfiguration.spawnHeight,
         0.0f, -0.4f);
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
-    WindowRunLoop(window, OnFrame, &application);
+    WindowRunLoop(window, OnFrame, application);
 
-    ChunkStreamingDestroy(application.chunkStreaming);
+    UiRelease(&application->ui);
+    ChunkStreamingDestroy(application->chunkStreaming);
     RendererDestroy(renderer);
     WorldDestroy(world);
     InputDestroy(input);
     WindowDestroy(window);
+    HeapFree(GetProcessHeap(), 0, application);
 }

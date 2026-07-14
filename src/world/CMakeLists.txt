@@ -1,6 +1,8 @@
 laiue_add_module(world
     SOURCES
         world_infinite.c
+        block_properties.c
+        block_properties.h
         terrain_noise.c
         terrain_noise.h
         infinite_coord.c
