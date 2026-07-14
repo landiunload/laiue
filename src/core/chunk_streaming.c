@@ -30,6 +30,7 @@ typedef struct ChunkEntry
     uint32_t baseLow[3];
     RendererMesh* mesh;
     uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
+    uint32_t drawSlotPlusOne; // 0 — меша нет, иначе позиция в плотном drawItems + 1
     ChunkEntryState state;
     bool requestQueued;     // есть ли в очереди заявка текущей ревизии
 } ChunkEntry;
@@ -75,7 +76,17 @@ struct ChunkStreaming
     ChunkEntry* spareEntries;
     uint32_t capacity;
 
-    DrawItem* drawItems;    // переиспользуемый буфер сортировки отрисовки
+    // Плотный список записей с мешами. Он же хранит кешированный порядок
+    // от ближних к дальним: полную hash-таблицу Draw не обходит.
+    DrawItem* drawItems;
+    uint32_t drawItemCount;
+    int64_t drawCameraBlockPosition[3];
+    bool hasDrawCameraPosition;
+    bool drawOrderDirty;
+
+    // true тогда и только тогда, когда возможна PENDING-запись без заявки.
+    // Полный retry-скан таблицы выполняется лишь в таком случае.
+    bool hasUnqueuedPending;
 
     // Кольцевые очереди под общим замком. Гарантия отсутствия потерь:
     // unfinishedWork (заявки + в работе + результаты) не превышает
@@ -96,6 +107,44 @@ struct ChunkStreaming
     uint32_t desiredWorkerThreadCount;
     bool shutdownRequested;
 };
+
+static void AddMeshToDrawList(ChunkStreaming* streaming, ChunkEntry* entry)
+{
+    if (entry->drawSlotPlusOne != 0)
+    {
+        return;
+    }
+
+    uint32_t slot = streaming->drawItemCount++;
+    streaming->drawItems[slot].entryIndex = (uint32_t)(entry - streaming->entries);
+    entry->drawSlotPlusOne = slot + 1u;
+    streaming->drawOrderDirty = true;
+}
+
+static void RemoveMeshFromDrawList(ChunkStreaming* streaming, ChunkEntry* entry)
+{
+    if (entry->drawSlotPlusOne == 0)
+    {
+        return;
+    }
+
+    uint32_t slot = entry->drawSlotPlusOne - 1u;
+    uint32_t lastSlot = --streaming->drawItemCount;
+    if (slot != lastSlot)
+    {
+        streaming->drawItems[slot] = streaming->drawItems[lastSlot];
+        ChunkEntry* moved = &streaming->entries[streaming->drawItems[slot].entryIndex];
+        moved->drawSlotPlusOne = slot + 1u;
+    }
+    entry->drawSlotPlusOne = 0;
+    streaming->drawOrderDirty = true;
+}
+
+static void ResetDrawList(ChunkStreaming* streaming)
+{
+    streaming->drawItemCount = 0;
+    streaming->drawOrderDirty = true;
+}
 
 static void SwapDrawItems(DrawItem* left, DrawItem* right)
 {
@@ -192,6 +241,7 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
         entry->baseLow);
     entry->mesh = NULL;
     entry->revision = 0;
+    entry->drawSlotPlusOne = 0;
     entry->requestQueued = false;
     return entry;
 }
@@ -234,6 +284,10 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
     }
 
     entry->requestQueued = enqueued;
+    if (!enqueued)
+    {
+        streaming->hasUnqueuedPending = true;
+    }
     return enqueued;
 }
 
@@ -346,6 +400,7 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
     streaming->resultHead = 0;
     streaming->resultCount = 0;
     streaming->unfinishedWork = 0;
+    streaming->hasUnqueuedPending = false;
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
     {
@@ -354,6 +409,10 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
         if (entry->state == CHUNK_ENTRY_PENDING && entry->mesh != NULL)
         {
             entry->state = CHUNK_ENTRY_READY;
+        }
+        else if (entry->state == CHUNK_ENTRY_PENDING)
+        {
+            streaming->hasUnqueuedPending = true;
         }
     }
     return true;
@@ -415,15 +474,17 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
     streaming->centerX = newCenterX;
     streaming->centerY = newCenterY;
     streaming->centerZ = newCenterZ;
+    streaming->hasUnqueuedPending = false;
+    ResetDrawList(streaming);
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
     {
         ChunkEntry* previous = &previousEntries[index];
         if (previous->mesh == NULL) continue;
 
-        int64_t x;
-        int64_t y;
-        int64_t z;
+        int64_t x = 0;
+        int64_t y = 0;
+        int64_t z = 0;
         bool keep = originDeltaFits
             && TrySubtractInt64(previous->x, chunkOriginDeltaX, &x)
             && TrySubtractInt64(previous->y, chunkOriginDeltaY, &y)
@@ -436,12 +497,15 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
             ChunkEntry* moved = InsertEntry(streaming, x, y, z);
             moved->mesh = previous->mesh;
             moved->state = CHUNK_ENTRY_READY;
+            AddMeshToDrawList(streaming, moved);
             previous->mesh = NULL;
+            previous->drawSlotPlusOne = 0;
         }
         else
         {
             RendererDestroyMesh(streaming->renderer, previous->mesh);
             previous->mesh = NULL;
+            previous->drawSlotPlusOne = 0;
         }
     }
 
@@ -579,6 +643,8 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     ChunkEntry* previousEntries = streaming->entries;
     streaming->entries = streaming->spareEntries;
     streaming->spareEntries = previousEntries;
+    streaming->hasUnqueuedPending = false;
+    ResetDrawList(streaming);
 
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
@@ -598,12 +664,22 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
             moved->baseLow[2] = previous->baseLow[2];
             moved->revision = previous->revision;
             moved->requestQueued = previous->requestQueued;
+            if (moved->mesh != NULL)
+            {
+                AddMeshToDrawList(streaming, moved);
+            }
+            if (moved->state == CHUNK_ENTRY_PENDING && !moved->requestQueued)
+            {
+                streaming->hasUnqueuedPending = true;
+            }
             previous->mesh = NULL;
+            previous->drawSlotPlusOne = 0;
         }
         else if (previous->mesh != NULL)
         {
             RendererDestroyMesh(streaming->renderer, previous->mesh);
             previous->mesh = NULL;
+            previous->drawSlotPlusOne = 0;
         }
     }
 
@@ -685,11 +761,14 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         ChunkEntry* entry = FindEntry(streaming, result.x, result.y, result.z);
         if (entry != NULL && entry->state == CHUNK_ENTRY_PENDING && entry->revision == result.revision)
         {
+            // Заявка этой ревизии завершена; повторное выставление ниже нужно
+            // только если построение или GPU-загрузка не удались.
+            entry->requestQueued = false;
             if (!result.succeeded)
             {
                 // Сбой построения (нехватка памяти): повторная попытка
-                // через сканирование ниже.
-                entry->requestQueued = false;
+                // через условное сканирование ниже.
+                streaming->hasUnqueuedPending = true;
             }
             else if (result.quadCount > 0)
             {
@@ -698,17 +777,22 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                 {
                     // Свап готов: старый меш освобождаем только теперь (отложенно
                     // под fence — кадр с ним ещё может быть в полёте на GPU).
-                    if (entry->mesh != NULL)
+                    bool hadMesh = entry->mesh != NULL;
+                    if (hadMesh)
                     {
                         RendererDestroyMesh(streaming->renderer, entry->mesh);
                     }
                     entry->mesh = mesh;
+                    if (!hadMesh)
+                    {
+                        AddMeshToDrawList(streaming, entry);
+                    }
                     entry->state = CHUNK_ENTRY_READY;
                     uploadBudget--;
                 }
                 else
                 {
-                    entry->requestQueued = false;
+                    streaming->hasUnqueuedPending = true;
                 }
             }
             else
@@ -716,6 +800,7 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                 // Чанк стал пустым (все блоки убраны): снимаем старый меш.
                 if (entry->mesh != NULL)
                 {
+                    RemoveMeshFromDrawList(streaming, entry);
                     RendererDestroyMesh(streaming->renderer, entry->mesh);
                     entry->mesh = NULL;
                 }
@@ -729,14 +814,23 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         }
     }
 
-    // Повторные заявки: записи, оставшиеся без заявки (переполнение
-    // очереди, сбой построения или загрузки).
-    for (uint32_t i = 0; i < streaming->capacity; ++i)
+    // Повторные заявки: полный проход нужен только после фактического
+    // переполнения очереди, сбоя построения или загрузки.
+    if (streaming->hasUnqueuedPending)
     {
-        ChunkEntry* entry = &streaming->entries[i];
-        if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
+        streaming->hasUnqueuedPending = false;
+        for (uint32_t i = 0; i < streaming->capacity; ++i)
         {
-            TryEnqueueRequest(streaming, entry);
+            ChunkEntry* entry = &streaming->entries[i];
+            if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
+            {
+                // После первого отказа unfinishedWork уже достиг ёмкости:
+                // остальные попытки в этом кадре гарантированно не пройдут.
+                if (!TryEnqueueRequest(streaming, entry))
+                {
+                    break;
+                }
+            }
         }
     }
 }
@@ -744,51 +838,48 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
 void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16],
     const int64_t cameraBlockPosition[3])
 {
+    bool cameraBlockChanged = !streaming->hasDrawCameraPosition
+        || streaming->drawCameraBlockPosition[0] != cameraBlockPosition[0]
+        || streaming->drawCameraBlockPosition[1] != cameraBlockPosition[1]
+        || streaming->drawCameraBlockPosition[2] != cameraBlockPosition[2];
+
+    // Расстояния и порядок не зависят от поворота камеры. Пересчитываем их
+    // только при переходе камеры в другой блок или изменении состава мешей.
+    if (streaming->drawOrderDirty || cameraBlockChanged)
+    {
+        for (uint32_t i = 0; i < streaming->drawItemCount; ++i)
+        {
+            DrawItem* item = &streaming->drawItems[i];
+            const ChunkEntry* entry = &streaming->entries[item->entryIndex];
+            float centerX = (float)(entry->x * CHUNK_SIZE - cameraBlockPosition[0])
+                + (float)(CHUNK_SIZE / 2);
+            float centerY = (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1])
+                + (float)(CHUNK_SIZE / 2);
+            float centerZ = (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2])
+                + (float)(CHUNK_SIZE / 2);
+            item->distanceSquared = centerX * centerX + centerY * centerY + centerZ * centerZ;
+        }
+
+        SortDrawItemsFrontToBack(streaming->drawItems, streaming->drawItemCount);
+        for (uint32_t i = 0; i < streaming->drawItemCount; ++i)
+        {
+            ChunkEntry* entry = &streaming->entries[streaming->drawItems[i].entryIndex];
+            entry->drawSlotPlusOne = i + 1u;
+        }
+
+        streaming->drawCameraBlockPosition[0] = cameraBlockPosition[0];
+        streaming->drawCameraBlockPosition[1] = cameraBlockPosition[1];
+        streaming->drawCameraBlockPosition[2] = cameraBlockPosition[2];
+        streaming->hasDrawCameraPosition = true;
+        streaming->drawOrderDirty = false;
+    }
+
     float planes[6][4];
     Matrix4ExtractFrustumPlanes(viewProjection, planes);
 
-    // Сбор видимых мешей с расстоянием до камеры.
-    uint32_t drawCount = 0;
-    for (uint32_t i = 0; i < streaming->capacity; ++i)
-    {
-        const ChunkEntry* entry = &streaming->entries[i];
-        // Рисуем любой чанк с готовым мешем, включая PENDING в процессе
-        // перестройки: показываем последнюю валидную геометрию — без мигания.
-        if (entry->mesh == NULL)
-        {
-            continue;
-        }
-
-        float minimum[3] = {
-            (float)(entry->x * CHUNK_SIZE - cameraBlockPosition[0]),
-            (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
-            (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
-        };
-        float maximum[3] = {
-            minimum[0] + (float)CHUNK_SIZE,
-            minimum[1] + (float)CHUNK_SIZE,
-            minimum[2] + (float)CHUNK_SIZE,
-        };
-
-        if (!FrustumIntersectsBox(planes, minimum, maximum))
-        {
-            continue;
-        }
-
-        float centerX = minimum[0] + (float)(CHUNK_SIZE / 2);
-        float centerY = minimum[1] + (float)(CHUNK_SIZE / 2);
-        float centerZ = minimum[2] + (float)(CHUNK_SIZE / 2);
-
-        streaming->drawItems[drawCount].distanceSquared = centerX * centerX + centerY * centerY + centerZ * centerZ;
-        streaming->drawItems[drawCount].entryIndex = i;
-        drawCount++;
-    }
-
-    // Сортировка спереди-назад: ближние чанки заполняют глубину первыми,
-    // перекрытые пиксели дальних отсекаются early-Z.
-    SortDrawItemsFrontToBack(streaming->drawItems, drawCount);
-
-    for (uint32_t i = 0; i < drawCount; ++i)
+    // Frustum зависит от поворота камеры, поэтому отсечение остаётся
+    // покадровым. Плотный список исключает обход пустых слотов hash-таблицы.
+    for (uint32_t i = 0; i < streaming->drawItemCount; ++i)
     {
         const ChunkEntry* entry = &streaming->entries[streaming->drawItems[i].entryIndex];
 
@@ -797,6 +888,16 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
             (float)(entry->y * CHUNK_SIZE - cameraBlockPosition[1]),
             (float)(entry->z * CHUNK_SIZE - cameraBlockPosition[2]),
         };
+        float maximum[3] = {
+            chunkOriginRelative[0] + (float)CHUNK_SIZE,
+            chunkOriginRelative[1] + (float)CHUNK_SIZE,
+            chunkOriginRelative[2] + (float)CHUNK_SIZE,
+        };
+        if (!FrustumIntersectsBox(planes, chunkOriginRelative, maximum))
+        {
+            continue;
+        }
+
         RendererDrawMesh(streaming->renderer, entry->mesh,
             chunkOriginRelative, entry->baseLow);
     }

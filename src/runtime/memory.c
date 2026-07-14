@@ -16,50 +16,28 @@
 #endif
 
 // Без CRT компилятор при использовании float ищет _fltused.
-// Достаточно самого факта существования символа.
-int _fltused = 0;
+// Внешнее определение остаётся в обычном объектном файле без LTO, поэтому
+// доступно и для ссылок, которые ThinLTO создаёт только во время кодогенерации.
+// Само значение не меняется и не должно занимать writable-секцию.
+const int _fltused = 0;
 
 #if defined(__clang__)
 
-// ВНИМАНИЕ: под clang memset нельзя реализовывать через __stosb. clang
-// понижает __stosb до @llvm.memset, а тот в CodeGen — до вызова memset,
-// т.е. самой этой функции: `memset` компилировался в `jmp memset`
-// (бесконечный цикл) или `call memset` (рекурсия -> переполнение стека).
-// Ни -fno-builtin, ни optnone это не снимают — понижение идёт в бэкенде.
-//
-// Решение: цикл через volatile-указатель. LoopIdiomRecognize не сворачивает
-// volatile-доступы обратно в memset, поэтому самовызов не возникает.
-// Пословный проход держит скорость близко к rep stosb (упор в полосу памяти).
+// __stosb под clang понижается до @llvm.memset, а затем может стать вызовом
+// этой же функции. Прямой GNU inline asm не проходит через LLVM memory
+// intrinsics: в объекте гарантированно остаётся инструкция rep stosb.
 void* memset(void* destination, int value, size_t count)
 {
-    volatile unsigned char* bytes = (volatile unsigned char*)destination;
-    unsigned char single = (unsigned char)value;
+    void* result = destination;
+    unsigned char* output = (unsigned char*)destination;
 
-    // Голова до 8-байтового выравнивания.
-    while (count != 0 && ((size_t)bytes & 7u) != 0)
-    {
-        *bytes++ = single;
-        --count;
-    }
+    __asm__ volatile(
+        "rep stosb"
+        : "+D"(output), "+c"(count)
+        : "a"((unsigned char)value)
+        : "memory");
 
-    // Тело пословно.
-    unsigned long long word = 0x0101010101010101ull * (unsigned long long)single;
-    volatile unsigned long long* words = (volatile unsigned long long*)bytes;
-    while (count >= 8)
-    {
-        *words++ = word;
-        count -= 8;
-    }
-
-    // Хвост.
-    bytes = (volatile unsigned char*)words;
-    while (count != 0)
-    {
-        *bytes++ = single;
-        --count;
-    }
-
-    return destination;
+    return result;
 }
 
 // __movsb под clang остаётся инструкцией rep movsb (проверено дизассемблером):
