@@ -1,0 +1,10 @@
+laiue_add_module(world
+    SOURCES
+        world_infinite.c
+        terrain_noise.c
+        terrain_noise.h
+        infinite_coord.c
+        infinite_coord.h
+        world.h
+        ../api.h
+)

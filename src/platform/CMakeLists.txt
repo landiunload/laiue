@@ -1,0 +1,11 @@
+laiue_add_module(window
+    SOURCES
+        window.c
+        window.h
+        time.c
+        time.h
+        ../api.h
+    LINK
+        user32
+        gdi32
+)

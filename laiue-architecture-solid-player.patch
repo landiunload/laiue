@@ -1,0 +1,1870 @@
+diff --git a/.editorconfig b/.editorconfig
+new file mode 100644
+index 0000000..fc6d69d
+--- /dev/null
++++ b/.editorconfig
+@@ -0,0 +1,15 @@
++root = true
++
++[*]
++charset = utf-8
++end_of_line = lf
++insert_final_newline = true
++trim_trailing_whitespace = true
++
++[*.{c,h,hlsl}]
++indent_style = space
++indent_size = 4
++
++[*.cmake]
++indent_style = space
++indent_size = 4
+diff --git a/CMakeLists.next.txt b/CMakeLists.next.txt
+new file mode 100644
+index 0000000..b1a5923
+--- /dev/null
++++ b/CMakeLists.next.txt
+@@ -0,0 +1,31 @@
++cmake_minimum_required(VERSION 3.28)
++
++project(laiue
++    VERSION 0.4.0
++    DESCRIPTION "Belaiu base - window, input, world, gameplay and render"
++    LANGUAGES C
++)
++
++set(CMAKE_C_STANDARD 17)
++set(CMAKE_C_STANDARD_REQUIRED ON)
++set(CMAKE_C_EXTENSIONS OFF)
++
++list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
++include(LaiueToolchain)
++include(LaiueModule)
++include(LaiueShader)
++
++add_subdirectory(src/platform)
++add_subdirectory(src/input)
++add_subdirectory(src/world)
++add_subdirectory(src/mesh)
++add_subdirectory(src/render)
++add_subdirectory(src/core)
++
++add_executable(laiue WIN32 src/launcher/main.c)
++target_link_libraries(laiue PRIVATE laiue_common laiue_runtime kernel32)
++target_link_options(laiue PRIVATE
++    /ENTRY:EntryPoint
++    /STACK:262144,4096
++    /HEAP:65536,4096
++)
+diff --git a/cmake/LaiueModule.cmake b/cmake/LaiueModule.cmake
+new file mode 100644
+index 0000000..830b492
+--- /dev/null
++++ b/cmake/LaiueModule.cmake
+@@ -0,0 +1,48 @@
++include_guard(GLOBAL)
++
++function(laiue_collect_sources out_variable)
++    set(result)
++    foreach(source IN LISTS ARGN)
++        if(IS_ABSOLUTE "${source}")
++            list(APPEND result "${source}")
++        else()
++            list(APPEND result "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
++        endif()
++    endforeach()
++    set(${out_variable} "${result}" PARENT_SCOPE)
++endfunction()
++
++function(laiue_add_module module_name)
++    cmake_parse_arguments(PARSE_ARGV 1 MODULE
++        ""
++        ""
++        "SOURCES;LINK;PUBLIC_LINK"
++    )
++
++    if(NOT MODULE_SOURCES)
++        message(FATAL_ERROR "laiue_add_module(${module_name}) требует SOURCES")
++    endif()
++
++    laiue_collect_sources(module_sources ${MODULE_SOURCES})
++    set(target_name "laiue_${module_name}")
++    string(TOUPPER "${module_name}" module_name_upper)
++
++    add_library(${target_name} SHARED)
++    target_sources(${target_name} PRIVATE ${module_sources})
++    source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_sources})
++
++    target_compile_definitions(${target_name}
++        PRIVATE "LAIUE_BUILD_${module_name_upper}"
++    )
++    target_link_libraries(${target_name}
++        PRIVATE
++            laiue_common
++            laiue_runtime
++            kernel32
++            ${MODULE_LINK}
++    )
++    if(MODULE_PUBLIC_LINK)
++        target_link_libraries(${target_name} PUBLIC ${MODULE_PUBLIC_LINK})
++    endif()
++    target_link_options(${target_name} PRIVATE /NOENTRY)
++endfunction()
+diff --git a/cmake/LaiueShader.cmake b/cmake/LaiueShader.cmake
+new file mode 100644
+index 0000000..c1d6281
+--- /dev/null
++++ b/cmake/LaiueShader.cmake
+@@ -0,0 +1,51 @@
++include_guard(GLOBAL)
++
++function(laiue_find_shader_compiler out_variable)
++    find_program(shader_compiler fxc)
++    if(NOT shader_compiler)
++        file(GLOB candidates
++            "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/fxc.exe")
++        if(candidates)
++            list(SORT candidates COMPARE NATURAL)
++            list(GET candidates -1 shader_compiler)
++        endif()
++    endif()
++    set(${out_variable} "${shader_compiler}" PARENT_SCOPE)
++endfunction()
++
++function(laiue_compile_shader shader_name)
++    set(options)
++    set(one_value_args SOURCE OUTPUT_DIRECTORY)
++    cmake_parse_arguments(PARSE_ARGV 1 SHADER
++        "${options}" "${one_value_args}" "")
++
++    if(NOT SHADER_SOURCE OR NOT SHADER_OUTPUT_DIRECTORY)
++        message(FATAL_ERROR
++            "laiue_compile_shader требует SOURCE и OUTPUT_DIRECTORY")
++    endif()
++
++    laiue_find_shader_compiler(shader_compiler)
++    if(NOT shader_compiler)
++        message(STATUS
++            "fxc.exe не найден — используются закоммиченные заголовки ${shader_name}")
++        return()
++    endif()
++
++    file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIRECTORY}")
++    add_custom_command(
++        OUTPUT
++            "${SHADER_OUTPUT_DIRECTORY}/${shader_name}_vs.h"
++            "${SHADER_OUTPUT_DIRECTORY}/${shader_name}_ps.h"
++        COMMAND "${shader_compiler}"
++            /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect
++            "/Fh${SHADER_OUTPUT_DIRECTORY}/${shader_name}_vs.h"
++            /Vn "g_${shader_name}_vs" "${SHADER_SOURCE}"
++        COMMAND "${shader_compiler}"
++            /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect
++            "/Fh${SHADER_OUTPUT_DIRECTORY}/${shader_name}_ps.h"
++            /Vn "g_${shader_name}_ps" "${SHADER_SOURCE}"
++        DEPENDS "${SHADER_SOURCE}"
++        VERBATIM
++        COMMENT "Компиляция шейдера ${shader_name}"
++    )
++endfunction()
+diff --git a/cmake/LaiueToolchain.cmake b/cmake/LaiueToolchain.cmake
+new file mode 100644
+index 0000000..34572ce
+--- /dev/null
++++ b/cmake/LaiueToolchain.cmake
+@@ -0,0 +1,77 @@
++include_guard(GLOBAL)
++
++option(LAIUE_WARNINGS_AS_ERRORS "Считать предупреждения ошибками" ON)
++option(LAIUE_ENABLE_LTO "Включить оптимизацию времени линковки в Release" ON)
++
++if(NOT WIN32)
++    message(FATAL_ERROR "laiue собирается только под Windows")
++endif()
++if(NOT MSVC)
++    message(FATAL_ERROR
++        "Поддерживаются cl.exe и clang-cl.exe с интерфейсом MSVC")
++endif()
++
++get_property(LAIUE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
++if(LAIUE_IS_MULTI_CONFIG)
++    set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
++elseif(NOT CMAKE_BUILD_TYPE)
++    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
++endif()
++
++set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug>:Embedded>")
++string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
++string(REPLACE "/Ob2" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
++set(CMAKE_C_STANDARD_LIBRARIES "")
++
++add_library(laiue_compile_settings INTERFACE)
++target_include_directories(laiue_compile_settings
++    INTERFACE "${PROJECT_SOURCE_DIR}/src")
++target_compile_definitions(laiue_compile_settings INTERFACE
++    NOMINMAX
++    WIN32_LEAN_AND_MEAN
++    UNICODE
++    _UNICODE
++)
++
++target_compile_options(laiue_compile_settings INTERFACE
++    /W4 /utf-8 /GS- /fp:fast
++    $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
++    $<$<CONFIG:Debug>:/Od>
++    $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>
++    $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/Ob3>
++    $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
++)
++
++add_library(laiue_common INTERFACE)
++target_link_libraries(laiue_common INTERFACE laiue_compile_settings)
++
++if(LAIUE_ENABLE_LTO)
++    target_compile_options(laiue_common INTERFACE
++        $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL>
++        $<$<AND:$<C_COMPILER_ID:Clang>,$<NOT:$<CONFIG:Debug>>>:-flto=thin>
++    )
++endif()
++
++target_link_options(laiue_common INTERFACE
++    /NODEFAULTLIB /SUBSYSTEM:WINDOWS
++    /DYNAMICBASE:NO /HIGHENTROPYVA:NO
++    /MANIFEST:NO
++    /MERGE:.rdata=.text /MERGE:.pdata=.text
++    $<$<C_COMPILER_ID:MSVC>:/EMITTOOLVERSIONINFO:NO>
++    $<$<CONFIG:Debug>:/DEBUG /INCREMENTAL:NO>
++    $<$<NOT:$<CONFIG:Debug>>:/OPT:REF /OPT:ICF>
++)
++
++if(LAIUE_ENABLE_LTO)
++    target_link_options(laiue_common INTERFACE
++        $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/LTCG>
++    )
++endif()
++
++add_library(laiue_runtime OBJECT "${PROJECT_SOURCE_DIR}/src/runtime/memory.c")
++target_compile_options(laiue_runtime PRIVATE
++    /W4 /utf-8 /GS- /fp:fast
++    $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
++    $<$<CONFIG:Debug>:/Od>
++    $<$<NOT:$<CONFIG:Debug>>:/O2 /Oi>
++)
+diff --git a/docs/architecture.md b/docs/architecture.md
+new file mode 100644
+index 0000000..99cac6b
+--- /dev/null
++++ b/docs/architecture.md
+@@ -0,0 +1,22 @@
++# Архитектура laiue
++
++## Границы модулей
++
++- `core/application.c` — композиция приложения и жизненный цикл.
++- `core/application_config.*` — единый источник настроек.
++- `game/player_controller.*` — состояние игрока, поза, движение, прыжок, гравитация и коллизии.
++- `game/voxel_interaction.*` — трассировка луча и формирование команды редактирования мира.
++- `core/debug_overlay.*` — только форматирование диагностического текста.
++- `core/chunk_streaming.*` — асинхронная загрузка и жизненный цикл мешей.
++- `world/*` — процедурный мир и сохранённые изменения блоков.
++- `render/*` — GPU и отрисовка без игровой логики.
++
++## SOLID в C
++
++- **SRP:** каждая подсистема имеет одну причину для изменения.
++- **OCP:** внешние толчки добавляются через `PlayerControllerApplyImpulse`, не меняя ввод и коллизии.
++- **LSP:** наследование не используется; контракты функций не требуют подмены типов.
++- **ISP:** команды игрока, воксельное редактирование и overlay имеют отдельные узкие интерфейсы.
++- **DIP:** контроллер получает `PlayerControllerCommand` и абстракцию `PlayerCollisionSource`; он не зависит от клавиатуры, окна или конкретной реализации мира.
++
++`game_events.h` оставлен как точка будущего расширения, но API событий не придуман заранее: он появится только при наличии нескольких реальных производителей и потребителей.
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+new file mode 100644
+index 0000000..3ca8964
+--- /dev/null
++++ b/src/core/CMakeLists.txt
+@@ -0,0 +1,28 @@
++laiue_add_module(core
++    SOURCES
++        application.c
++        application_config.c
++        application_config.h
++        chunk_streaming.c
++        chunk_streaming.h
++        debug_overlay.c
++        debug_overlay.h
++        math.c
++        math.h
++        numeric.h
++        ../game/camera.c
++        ../game/camera.h
++        ../game/game_events.h
++        ../game/game_mode.h
++        ../game/player_controller.c
++        ../game/player_controller.h
++        ../game/voxel_interaction.c
++        ../game/voxel_interaction.h
++        ../api.h
++    LINK
++        laiue_window
++        laiue_input
++        laiue_world
++        laiue_mesher
++        laiue_render
++)
+diff --git a/src/core/application.next.c b/src/core/application.next.c
+new file mode 100644
+index 0000000..88e4027
+--- /dev/null
++++ b/src/core/application.next.c
+@@ -0,0 +1,526 @@
++#include "api.h"
++#include "core/application_config.h"
++#include "core/chunk_streaming.h"
++#include "core/debug_overlay.h"
++#include "core/math.h"
++#include "core/numeric.h"
++#include "game/camera.h"
++#include "game/game_mode.h"
++#include "game/player_controller.h"
++#include "game/voxel_interaction.h"
++#include "input/input.h"
++#include "platform/time.h"
++#include "platform/window.h"
++#include "render/renderer.h"
++#include "world/world.h"
++
++#include <stddef.h>
++#include <windows.h>
++
++typedef struct ApplicationState
++{
++    Window* window;
++    Input* input;
++    World* world;
++    Renderer* renderer;
++    ChunkStreaming* chunkStreaming;
++    Camera camera;
++    PlayerController player;
++    GameMode gameMode;
++    int32_t windowWidth;
++    int32_t windowHeight;
++    double previousTimeSeconds;
++    double fpsSampleStartSeconds;
++    uint32_t fpsFrameCount;
++    uint32_t framesPerSecond;
++    int64_t coordinateOverlayBlock[3];
++    bool overlayDirty;
++} ApplicationState;
++
++static bool IsSolidWorldBlock(
++    void* context, int64_t x, int64_t y, int64_t z)
++{
++    return WorldGetBlock((World*)context, x, y, z) != BLOCK_AIR;
++}
++
++static PlayerCollisionSource CreatePlayerCollisionSource(World* world)
++{
++    PlayerCollisionSource source = {
++        .context = world,
++        .isSolidBlock = IsSolidWorldBlock,
++    };
++    return source;
++}
++
++static void HandleRawInput(void* userData, void* rawInputHandle)
++{
++    InputHandleRawInput((Input*)userData, rawInputHandle);
++}
++
++static int64_t CalculateChunkAlignedShift(double position)
++{
++    int64_t block = FloorDoubleToInt64(position);
++    int64_t chunk = block / CHUNK_SIZE;
++    if (block < 0 && block % CHUNK_SIZE != 0)
++    {
++        --chunk;
++    }
++    return chunk * CHUNK_SIZE;
++}
++
++static int64_t CalculateRebaseShift(double position)
++{
++    double threshold =
++        (double)g_applicationConfiguration.rebaseThresholdBlocks;
++    if (position >= -threshold && position <= threshold)
++    {
++        return 0;
++    }
++    return CalculateChunkAlignedShift(position);
++}
++
++static bool RebaseWorldIfNeeded(ApplicationState* application)
++{
++    int64_t shift[3] = {
++        CalculateRebaseShift(application->camera.position[0]),
++        CalculateRebaseShift(application->camera.position[1]),
++        CalculateRebaseShift(application->camera.position[2]),
++    };
++    if (shift[0] == 0 && shift[1] == 0 && shift[2] == 0)
++    {
++        return true;
++    }
++
++    if (!ChunkStreamingPause(application->chunkStreaming))
++    {
++        return false;
++    }
++    if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
++    {
++        return false;
++    }
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        application->camera.position[axis] -= (double)shift[axis];
++    }
++    application->overlayDirty = true;
++
++    int64_t centerX =
++        FloorDoubleToInt64(application->camera.position[0]) >> CHUNK_SIZE_LOG2;
++    int64_t centerY =
++        FloorDoubleToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
++    int64_t centerZ =
++        FloorDoubleToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
++    return ChunkStreamingResumeAfterOriginChange(
++        application->chunkStreaming, true,
++        shift[0] / CHUNK_SIZE, shift[1] / CHUNK_SIZE,
++        shift[2] / CHUNK_SIZE, centerX, centerY, centerZ);
++}
++
++static bool SquareAbsoluteX(ApplicationState* application)
++{
++    int64_t currentBlockX =
++        FloorDoubleToInt64(application->camera.position[0]);
++    double fractionalX =
++        application->camera.position[0] - (double)currentBlockX;
++
++    if (!ChunkStreamingPause(application->chunkStreaming))
++    {
++        return false;
++    }
++
++    int64_t squaredLocalBlockX;
++    bool chunkOriginDeltaFits;
++    int64_t chunkOriginDeltaX;
++    if (!WorldSquareAbsoluteX(application->world, currentBlockX,
++            &squaredLocalBlockX, &chunkOriginDeltaFits,
++            &chunkOriginDeltaX))
++    {
++        return false;
++    }
++
++    application->camera.position[0] =
++        (double)squaredLocalBlockX + fractionalX;
++    if (application->gameMode == GAME_MODE_WALK)
++    {
++        PlayerCollisionSource collision =
++            CreatePlayerCollisionSource(application->world);
++        PlayerControllerReset(&application->player, &application->camera);
++        if (!PlayerControllerResolvePenetration(&application->player,
++                &collision, &application->camera))
++        {
++            application->gameMode = GAME_MODE_FLY;
++        }
++    }
++    application->overlayDirty = true;
++
++    int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
++    int64_t centerY =
++        FloorDoubleToInt64(application->camera.position[1]) >> CHUNK_SIZE_LOG2;
++    int64_t centerZ =
++        FloorDoubleToInt64(application->camera.position[2]) >> CHUNK_SIZE_LOG2;
++    return ChunkStreamingResumeAfterOriginChange(
++        application->chunkStreaming, chunkOriginDeltaFits,
++        chunkOriginDeltaX, 0, 0, centerX, centerY, centerZ);
++}
++
++static void RecordPresentedFrame(ApplicationState* application)
++{
++    double currentTimeSeconds = PlatformTimeSeconds();
++    application->fpsFrameCount++;
++
++    double elapsedSeconds =
++        currentTimeSeconds - application->fpsSampleStartSeconds;
++    if (elapsedSeconds < 0.5)
++    {
++        return;
++    }
++
++    uint32_t framesPerSecond = (uint32_t)(
++        (double)application->fpsFrameCount / elapsedSeconds + 0.5);
++    if (application->framesPerSecond != framesPerSecond)
++    {
++        application->framesPerSecond = framesPerSecond;
++        application->overlayDirty = true;
++    }
++    application->fpsFrameCount = 0;
++    application->fpsSampleStartSeconds = currentTimeSeconds;
++}
++
++static void UpdateOverlay(ApplicationState* application,
++    const int64_t cameraBlockPosition[3])
++{
++    if (!application->overlayDirty
++        && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
++        && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
++        && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
++    {
++        return;
++    }
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        application->coordinateOverlayBlock[axis] =
++            cameraBlockPosition[axis];
++    }
++
++    wchar_t text[160];
++    DebugOverlayBuildText(application->world, &application->player,
++        application->gameMode, application->framesPerSecond,
++        cameraBlockPosition, text, 160);
++    WindowSetOverlayText(application->window, text);
++    application->overlayDirty = false;
++}
++
++static void HandleBlockEditing(ApplicationState* application)
++{
++    VoxelEdit edit;
++    bool breakPressed = InputWasMouseButtonPressed(
++        application->input, INPUT_MOUSE_BUTTON_LEFT);
++    bool placePressed = InputWasMouseButtonPressed(
++        application->input, INPUT_MOUSE_BUTTON_RIGHT);
++
++    if (!VoxelInteractionTryCreateEdit(application->world,
++            &application->camera, &application->player,
++            application->gameMode == GAME_MODE_WALK,
++            breakPressed, placePressed,
++            g_applicationConfiguration.editReachDistance, &edit))
++    {
++        return;
++    }
++
++    WorldSetBlock(application->world,
++        edit.block[0], edit.block[1], edit.block[2], edit.replacement);
++    ChunkStreamingInvalidateBlock(application->chunkStreaming,
++        edit.block[0], edit.block[1], edit.block[2]);
++}
++
++static void ToggleGameMode(ApplicationState* application)
++{
++    if (application->gameMode == GAME_MODE_FLY)
++    {
++        application->gameMode = GAME_MODE_WALK;
++        PlayerCollisionSource collision =
++            CreatePlayerCollisionSource(application->world);
++        PlayerControllerReset(&application->player, &application->camera);
++        if (!PlayerControllerResolvePenetration(&application->player,
++                &collision, &application->camera))
++        {
++            application->gameMode = GAME_MODE_FLY;
++        }
++    }
++    else
++    {
++        application->gameMode = GAME_MODE_FLY;
++        PlayerControllerReset(&application->player, &application->camera);
++    }
++    application->overlayDirty = true;
++}
++
++static void UpdatePlayer(ApplicationState* application,
++    float deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY)
++{
++    if (application->gameMode == GAME_MODE_FLY)
++    {
++        CameraUpdate(&application->camera, deltaSeconds,
++            InputIsKeyDown(application->input, INPUT_KEY_W),
++            InputIsKeyDown(application->input, INPUT_KEY_A),
++            InputIsKeyDown(application->input, INPUT_KEY_S),
++            InputIsKeyDown(application->input, INPUT_KEY_D),
++            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
++            mouseDeltaX, mouseDeltaY,
++            g_applicationConfiguration.cameraSpeed,
++            g_applicationConfiguration.mouseSensitivity);
++        return;
++    }
++
++    CameraUpdate(&application->camera, deltaSeconds,
++        false, false, false, false, false,
++        mouseDeltaX, mouseDeltaY, 0.0f,
++        g_applicationConfiguration.mouseSensitivity);
++
++    PlayerControllerCommand command = {
++        .forward =
++            (InputIsKeyDown(application->input, INPUT_KEY_W) ? 1.0f : 0.0f)
++            - (InputIsKeyDown(application->input, INPUT_KEY_S) ? 1.0f : 0.0f),
++        .right =
++            (InputIsKeyDown(application->input, INPUT_KEY_D) ? 1.0f : 0.0f)
++            - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f),
++        .jumpPressed =
++            InputWasKeyPressed(application->input, INPUT_KEY_SPACE),
++        .crouchHeld =
++            InputIsKeyDown(application->input, INPUT_KEY_SHIFT),
++    };
++
++    PlayerCollisionSource collision =
++        CreatePlayerCollisionSource(application->world);
++    if (PlayerControllerUpdate(&application->player,
++            &collision, &application->camera, &command,
++            application->camera.yaw, deltaSeconds))
++    {
++        application->overlayDirty = true;
++    }
++}
++
++static void OnFrame(void* userData)
++{
++    ApplicationState* application = userData;
++
++    if (InputWasKeyPressed(application->input, INPUT_KEY_ESCAPE))
++    {
++        WindowRequestClose(application->window);
++        return;
++    }
++
++    if (InputWasKeyPressed(application->input, INPUT_KEY_F7))
++    {
++        WindowSetMouseLook(application->window,
++            !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
++    }
++
++    if (InputWasKeyPressed(application->input, INPUT_KEY_V))
++    {
++        RendererSetVerticalSync(application->renderer,
++            !RendererIsVerticalSyncEnabled(application->renderer));
++    }
++
++    if (WindowConsumeFocusLoss(application->window))
++    {
++        InputResetState(application->input);
++    }
++
++    if (InputWasKeyPressed(application->input, INPUT_KEY_G))
++    {
++        ToggleGameMode(application);
++    }
++
++    if (InputWasKeyPressed(application->input, INPUT_KEY_T)
++        && !SquareAbsoluteX(application))
++    {
++        WindowRequestClose(application->window);
++        return;
++    }
++
++    if (WindowConsumeResize(application->window))
++    {
++        int32_t clientWidth;
++        int32_t clientHeight;
++        WindowGetClientSize(application->window,
++            &clientWidth, &clientHeight);
++        if (clientWidth > 0 && clientHeight > 0)
++        {
++            application->windowWidth = clientWidth;
++            application->windowHeight = clientHeight;
++            RendererResize(application->renderer,
++                clientWidth, clientHeight);
++        }
++    }
++
++    double currentTimeSeconds = PlatformTimeSeconds();
++    float deltaSeconds = (float)(
++        currentTimeSeconds - application->previousTimeSeconds);
++    application->previousTimeSeconds = currentTimeSeconds;
++    if (deltaSeconds > 0.1f)
++    {
++        deltaSeconds = 0.1f;
++    }
++
++    bool mouseLookEnabled =
++        WindowIsMouseLookEnabled(application->window);
++    int32_t mouseDeltaX = 0;
++    int32_t mouseDeltaY = 0;
++    if (mouseLookEnabled)
++    {
++        InputGetMouseDelta(application->input,
++            &mouseDeltaX, &mouseDeltaY);
++    }
++
++    UpdatePlayer(application,
++        deltaSeconds, mouseDeltaX, mouseDeltaY);
++
++    if (!RebaseWorldIfNeeded(application))
++    {
++        WindowRequestClose(application->window);
++        return;
++    }
++
++    if (mouseLookEnabled)
++    {
++        HandleBlockEditing(application);
++    }
++
++    int64_t cameraBlockPosition[3];
++    float relativeEyePosition[3];
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        cameraBlockPosition[axis] =
++            FloorDoubleToInt64(application->camera.position[axis]);
++        relativeEyePosition[axis] = (float)(
++            application->camera.position[axis]
++            - (double)cameraBlockPosition[axis]);
++    }
++
++    UpdateOverlay(application, cameraBlockPosition);
++
++    ChunkStreamingSetCenter(application->chunkStreaming,
++        cameraBlockPosition[0] >> CHUNK_SIZE_LOG2,
++        cameraBlockPosition[1] >> CHUNK_SIZE_LOG2,
++        cameraBlockPosition[2] >> CHUNK_SIZE_LOG2);
++    ChunkStreamingPump(application->chunkStreaming);
++
++    float viewMatrix[16];
++    float projectionMatrix[16];
++    float viewProjectionMatrix[16];
++    CameraGetViewMatrix(&application->camera,
++        relativeEyePosition, viewMatrix);
++    CameraGetProjectionMatrix(
++        (float)application->windowWidth
++            / (float)application->windowHeight,
++        g_applicationConfiguration.fieldOfViewRadians,
++        g_applicationConfiguration.nearPlane,
++        g_applicationConfiguration.farPlane,
++        projectionMatrix);
++    Matrix4Multiply(viewMatrix,
++        projectionMatrix, viewProjectionMatrix);
++
++    if (RendererBeginFrame(
++            application->renderer, viewProjectionMatrix))
++    {
++        ChunkStreamingDraw(application->chunkStreaming,
++            viewProjectionMatrix, cameraBlockPosition);
++        if (!RendererEndFrame(application->renderer))
++        {
++            WindowRequestClose(application->window);
++            return;
++        }
++        RecordPresentedFrame(application);
++    }
++
++    InputEndFrame(application->input);
++}
++
++LAIUE_CORE_API void Start(void)
++{
++    WindowConfiguration windowConfiguration = {
++        .title = g_applicationConfiguration.windowTitle,
++        .width = g_applicationConfiguration.windowWidth,
++        .height = g_applicationConfiguration.windowHeight,
++    };
++
++    Window* window = WindowCreate(&windowConfiguration);
++    if (window == NULL)
++    {
++        return;
++    }
++
++    Input* input = InputCreate(WindowGetNativeHandle(window));
++    if (input == NULL)
++    {
++        WindowDestroy(window);
++        return;
++    }
++
++    World* world = WorldCreate(g_applicationConfiguration.worldSeed);
++    if (world == NULL)
++    {
++        InputDestroy(input);
++        WindowDestroy(window);
++        return;
++    }
++
++    int32_t clientWidth;
++    int32_t clientHeight;
++    WindowGetClientSize(window, &clientWidth, &clientHeight);
++
++    Renderer* renderer = RendererCreate(
++        WindowGetNativeHandle(window), clientWidth, clientHeight);
++    if (renderer == NULL)
++    {
++        WorldDestroy(world);
++        InputDestroy(input);
++        WindowDestroy(window);
++        return;
++    }
++
++    ChunkStreaming* chunkStreaming = ChunkStreamingCreate(
++        world, renderer, g_applicationConfiguration.viewRadiusChunks);
++    if (chunkStreaming == NULL)
++    {
++        RendererDestroy(renderer);
++        WorldDestroy(world);
++        InputDestroy(input);
++        WindowDestroy(window);
++        return;
++    }
++
++    double startTimeSeconds = PlatformTimeSeconds();
++    ApplicationState application = {
++        .window = window,
++        .input = input,
++        .world = world,
++        .renderer = renderer,
++        .chunkStreaming = chunkStreaming,
++        .gameMode = GAME_MODE_FLY,
++        .windowWidth = clientWidth,
++        .windowHeight = clientHeight,
++        .previousTimeSeconds = startTimeSeconds,
++        .fpsSampleStartSeconds = startTimeSeconds,
++        .overlayDirty = true,
++    };
++    PlayerControllerInit(&application.player,
++        &g_applicationConfiguration.player);
++
++    CameraInit(&application.camera,
++        0.0, 0.0, g_applicationConfiguration.spawnHeight,
++        0.0f, -0.4f);
++
++    WindowSetRawInputCallback(window, HandleRawInput, input);
++    WindowRunLoop(window, OnFrame, &application);
++
++    ChunkStreamingDestroy(application.chunkStreaming);
++    RendererDestroy(renderer);
++    WorldDestroy(world);
++    InputDestroy(input);
++    WindowDestroy(window);
++}
+diff --git a/src/core/application_config.c b/src/core/application_config.c
+new file mode 100644
+index 0000000..94857ca
+--- /dev/null
++++ b/src/core/application_config.c
+@@ -0,0 +1,34 @@
++#include "core/application_config.h"
++
++const ApplicationConfiguration g_applicationConfiguration = {
++    .windowTitle = L"laiue",
++    .windowWidth = 640,
++    .windowHeight = 360,
++    .cameraSpeed = 80.0f,
++    .mouseSensitivity = 0.0025f,
++    .fieldOfViewRadians = 1.047197f,
++    .nearPlane = 0.1f,
++    .farPlane = 1000.0f,
++    .editReachDistance = 8.0f,
++    .viewRadiusChunks = 5,
++    .worldSeed = 42,
++    .rebaseThresholdBlocks = 1048576,
++    .spawnHeight = 100.0,
++    .player = {
++        .walkingSpeed = 7.0f,
++        .crouchingSpeed = 3.5f,
++        .gravity = 26.0f,
++        .jumpSpeed = 9.0f,
++        .maximumFallSpeed = 55.0f,
++        .jumpBufferSeconds = 0.14f,
++        .coyoteTimeSeconds = 0.10f,
++        .externalVelocityDamping = 8.0f,
++        .radius = 0.30,
++        .standingHeight = 1.80,
++        .standingEyeHeight = 1.75,
++        .crouchingHeight = 1.30,
++        .crouchingEyeHeight = 1.25,
++        .collisionEpsilon = 0.001,
++        .groundProbeDepth = 0.03,
++    },
++};
+diff --git a/src/core/application_config.h b/src/core/application_config.h
+new file mode 100644
+index 0000000..f1555cb
+--- /dev/null
++++ b/src/core/application_config.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <stdint.h>
++#include <wchar.h>
++
++#include "game/player_controller.h"
++
++typedef struct ApplicationConfiguration
++{
++    const wchar_t* windowTitle;
++    int32_t windowWidth;
++    int32_t windowHeight;
++    float cameraSpeed;
++    float mouseSensitivity;
++    float fieldOfViewRadians;
++    float nearPlane;
++    float farPlane;
++    float editReachDistance;
++    int32_t viewRadiusChunks;
++    int64_t worldSeed;
++    int64_t rebaseThresholdBlocks;
++    double spawnHeight;
++    PlayerControllerConfig player;
++} ApplicationConfiguration;
++
++extern const ApplicationConfiguration g_applicationConfiguration;
+diff --git a/src/core/debug_overlay.c b/src/core/debug_overlay.c
+new file mode 100644
+index 0000000..c027f26
+--- /dev/null
++++ b/src/core/debug_overlay.c
+@@ -0,0 +1,74 @@
++#include "core/debug_overlay.h"
++
++static void AppendText(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, const wchar_t* source)
++{
++    while (*source != L'\0' && *length + 1u < capacity)
++    {
++        destination[(*length)++] = *source++;
++    }
++    if (capacity > 0)
++    {
++        destination[*length] = L'\0';
++    }
++}
++
++static void AppendUnsignedDecimal(wchar_t* destination, uint32_t capacity,
++    uint32_t* length, uint32_t value)
++{
++    wchar_t reversedDigits[10];
++    uint32_t digitCount = 0;
++    do
++    {
++        reversedDigits[digitCount++] = (wchar_t)(L'0' + value % 10u);
++        value /= 10u;
++    }
++    while (value != 0);
++
++    while (digitCount > 0 && *length + 1u < capacity)
++    {
++        destination[(*length)++] = reversedDigits[--digitCount];
++    }
++    if (capacity > 0)
++    {
++        destination[*length] = L'\0';
++    }
++}
++
++void DebugOverlayBuildText(World* world, const PlayerController* player,
++    GameMode gameMode, uint32_t framesPerSecond,
++    const int64_t cameraBlockPosition[3],
++    wchar_t* destination, uint32_t capacity)
++{
++    wchar_t coordinate[3][32];
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        WorldFormatAbsoluteBlockCoordinate(world, axis,
++            cameraBlockPosition[axis], coordinate[axis], 32);
++    }
++
++    destination[0] = L'\0';
++    uint32_t length = 0;
++    AppendText(destination, capacity, &length, L"X: ");
++    AppendText(destination, capacity, &length, coordinate[0]);
++    AppendText(destination, capacity, &length, L"\r\nY: ");
++    AppendText(destination, capacity, &length, coordinate[1]);
++    AppendText(destination, capacity, &length, L"\r\nZ: ");
++    AppendText(destination, capacity, &length, coordinate[2]);
++    AppendText(destination, capacity, &length, L"\r\nFPS: ");
++    AppendUnsignedDecimal(destination, capacity, &length, framesPerSecond);
++    AppendText(destination, capacity, &length, L"\r\nMode: ");
++
++    if (gameMode == GAME_MODE_FLY)
++    {
++        AppendText(destination, capacity, &length, L"FLY");
++    }
++    else if (PlayerControllerIsCrouching(player))
++    {
++        AppendText(destination, capacity, &length, L"CROUCH");
++    }
++    else
++    {
++        AppendText(destination, capacity, &length, L"WALK");
++    }
++}
+diff --git a/src/core/debug_overlay.h b/src/core/debug_overlay.h
+new file mode 100644
+index 0000000..cb898bc
+--- /dev/null
++++ b/src/core/debug_overlay.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <stdint.h>
++#include <wchar.h>
++
++#include "game/game_mode.h"
++#include "game/player_controller.h"
++#include "world/world.h"
++
++void DebugOverlayBuildText(World* world, const PlayerController* player,
++    GameMode gameMode, uint32_t framesPerSecond,
++    const int64_t cameraBlockPosition[3],
++    wchar_t* destination, uint32_t capacity);
+diff --git a/src/core/numeric.h b/src/core/numeric.h
+new file mode 100644
+index 0000000..9b3b5b3
+--- /dev/null
++++ b/src/core/numeric.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++#include <stdint.h>
++
++static inline int64_t FloorDoubleToInt64(double value)
++{
++    int64_t truncated = (int64_t)value;
++    return (double)truncated > value ? truncated - 1 : truncated;
++}
+diff --git a/src/game/game_events.h b/src/game/game_events.h
+new file mode 100644
+index 0000000..68e02ab
+--- /dev/null
++++ b/src/game/game_events.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++// Точка расширения для событий игрового процесса.
++// API намеренно не вводится до появления второго независимого потребителя:
++// это не даёт будущей шине событий стать лишней зависимостью уже сейчас.
+diff --git a/src/game/game_mode.h b/src/game/game_mode.h
+new file mode 100644
+index 0000000..164fd33
+--- /dev/null
++++ b/src/game/game_mode.h
+@@ -0,0 +1,7 @@
++#pragma once
++
++typedef enum GameMode
++{
++    GAME_MODE_FLY,
++    GAME_MODE_WALK,
++} GameMode;
+diff --git a/src/game/player_controller.c b/src/game/player_controller.c
+new file mode 100644
+index 0000000..fc9ff29
+--- /dev/null
++++ b/src/game/player_controller.c
+@@ -0,0 +1,487 @@
++#include "game/player_controller.h"
++
++#include "core/math.h"
++#include "core/numeric.h"
++
++#define PLAYER_PENETRATION_STEPS 256u
++#define LEDGE_SEARCH_ITERATIONS 14u
++
++typedef struct PlayerBounds
++{
++    double minimum[3];
++    double maximum[3];
++} PlayerBounds;
++
++static double ActiveHeight(const PlayerController* controller)
++{
++    return controller->crouching
++        ? controller->config.crouchingHeight
++        : controller->config.standingHeight;
++}
++
++static double ActiveEyeHeight(const PlayerController* controller)
++{
++    return controller->crouching
++        ? controller->config.crouchingEyeHeight
++        : controller->config.standingEyeHeight;
++}
++
++static void CalculateBounds(const PlayerController* controller,
++    const Camera* camera, PlayerBounds* bounds)
++{
++    double feet = camera->position[2] - ActiveEyeHeight(controller);
++    double radius = controller->config.radius;
++
++    bounds->minimum[0] = camera->position[0] - radius;
++    bounds->maximum[0] = camera->position[0] + radius;
++    bounds->minimum[1] = camera->position[1] - radius;
++    bounds->maximum[1] = camera->position[1] + radius;
++    bounds->minimum[2] = feet;
++    bounds->maximum[2] = feet + ActiveHeight(controller);
++}
++
++static bool BoundsContainSolidBlock(
++    const PlayerCollisionSource* collision,
++    const PlayerController* controller, const PlayerBounds* bounds)
++{
++    double epsilon = controller->config.collisionEpsilon;
++    int64_t minimumBlock[3];
++    int64_t maximumBlock[3];
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        minimumBlock[axis] =
++            FloorDoubleToInt64(bounds->minimum[axis] + epsilon);
++        maximumBlock[axis] =
++            FloorDoubleToInt64(bounds->maximum[axis] - epsilon);
++    }
++
++    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
++    {
++        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
++        {
++            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
++            {
++                if (collision->isSolidBlock(collision->context, x, y, z))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++static bool PlayerCollidesAt(
++    const PlayerCollisionSource* collision,
++    const PlayerController* controller, const Camera* camera)
++{
++    PlayerBounds bounds;
++    CalculateBounds(controller, camera, &bounds);
++    return BoundsContainSolidBlock(collision, controller, &bounds);
++}
++
++static bool BlockPlaneCollides(
++    const PlayerCollisionSource* collision,
++    const PlayerController* controller, int32_t axis, int64_t plane,
++    const PlayerBounds* bounds)
++{
++    double epsilon = controller->config.collisionEpsilon;
++    int64_t minimumBlock[3];
++    int64_t maximumBlock[3];
++
++    for (int32_t currentAxis = 0; currentAxis < 3; ++currentAxis)
++    {
++        minimumBlock[currentAxis] =
++            FloorDoubleToInt64(bounds->minimum[currentAxis] + epsilon);
++        maximumBlock[currentAxis] =
++            FloorDoubleToInt64(bounds->maximum[currentAxis] - epsilon);
++    }
++    minimumBlock[axis] = plane;
++    maximumBlock[axis] = plane;
++
++    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
++    {
++        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
++        {
++            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
++            {
++                if (collision->isSolidBlock(collision->context, x, y, z))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++static bool HasGroundSupport(
++    const PlayerCollisionSource* collision,
++    const PlayerController* controller, const Camera* camera)
++{
++    PlayerBounds bounds;
++    CalculateBounds(controller, camera, &bounds);
++
++    double epsilon = controller->config.collisionEpsilon;
++    int64_t minimumX = FloorDoubleToInt64(bounds.minimum[0] + epsilon);
++    int64_t maximumX = FloorDoubleToInt64(bounds.maximum[0] - epsilon);
++    int64_t minimumY = FloorDoubleToInt64(bounds.minimum[1] + epsilon);
++    int64_t maximumY = FloorDoubleToInt64(bounds.maximum[1] - epsilon);
++    int64_t supportZ = FloorDoubleToInt64(
++        bounds.minimum[2] - controller->config.groundProbeDepth);
++
++    for (int64_t y = minimumY; y <= maximumY; ++y)
++    {
++        for (int64_t x = minimumX; x <= maximumX; ++x)
++        {
++            if (collision->isSolidBlock(collision->context, x, y, supportZ))
++            {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++static bool MoveAxis(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    int32_t axis, double distance)
++{
++    if (distance == 0.0)
++    {
++        return false;
++    }
++
++    PlayerBounds oldBounds;
++    CalculateBounds(controller, camera, &oldBounds);
++
++    Camera target = *camera;
++    target.position[axis] += distance;
++
++    PlayerBounds newBounds;
++    CalculateBounds(controller, &target, &newBounds);
++
++    double negativeExtent = axis == 2
++        ? ActiveEyeHeight(controller)
++        : controller->config.radius;
++    double positiveExtent = axis == 2
++        ? ActiveHeight(controller) - ActiveEyeHeight(controller)
++        : controller->config.radius;
++    double epsilon = controller->config.collisionEpsilon;
++
++    if (distance > 0.0)
++    {
++        int64_t firstPlane =
++            FloorDoubleToInt64(oldBounds.maximum[axis] - epsilon) + 1;
++        int64_t lastPlane =
++            FloorDoubleToInt64(newBounds.maximum[axis] - epsilon);
++
++        for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
++        {
++            if (BlockPlaneCollides(
++                    collision, controller, axis, plane, &newBounds))
++            {
++                camera->position[axis] =
++                    (double)plane - positiveExtent - epsilon;
++                return true;
++            }
++        }
++    }
++    else
++    {
++        int64_t firstPlane =
++            FloorDoubleToInt64(oldBounds.minimum[axis] + epsilon) - 1;
++        int64_t lastPlane =
++            FloorDoubleToInt64(newBounds.minimum[axis] + epsilon);
++
++        for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
++        {
++            if (BlockPlaneCollides(
++                    collision, controller, axis, plane, &newBounds))
++            {
++                camera->position[axis] =
++                    (double)plane + 1.0 + negativeExtent + epsilon;
++                return true;
++            }
++        }
++    }
++
++    camera->position[axis] = target.position[axis];
++    return false;
++}
++
++static void MoveVoluntaryAxisWithLedgeGuard(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    int32_t axis, double distance)
++{
++    double start = camera->position[axis];
++    MoveAxis(controller, collision, camera, axis, distance);
++
++    if (!controller->crouching || !controller->grounded
++        || HasGroundSupport(collision, controller, camera))
++    {
++        return;
++    }
++
++    double allowed = start;
++    double blocked = camera->position[axis];
++    for (uint32_t iteration = 0;
++         iteration < LEDGE_SEARCH_ITERATIONS; ++iteration)
++    {
++        double middle = (allowed + blocked) * 0.5;
++        camera->position[axis] = middle;
++        if (HasGroundSupport(collision, controller, camera))
++        {
++            allowed = middle;
++        }
++        else
++        {
++            blocked = middle;
++        }
++    }
++    camera->position[axis] = allowed;
++}
++
++static bool TrySetCrouching(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera, bool crouching)
++{
++    if (controller->crouching == crouching)
++    {
++        return false;
++    }
++
++    bool previousCrouching = controller->crouching;
++    double previousEyeHeight = ActiveEyeHeight(controller);
++    double feet = camera->position[2] - previousEyeHeight;
++
++    controller->crouching = crouching;
++    camera->position[2] = feet + ActiveEyeHeight(controller);
++
++    if (!crouching && PlayerCollidesAt(collision, controller, camera))
++    {
++        controller->crouching = previousCrouching;
++        camera->position[2] = feet + previousEyeHeight;
++        return false;
++    }
++    return true;
++}
++
++void PlayerControllerInit(
++    PlayerController* controller, const PlayerControllerConfig* config)
++{
++    controller->config = *config;
++    controller->verticalVelocity = 0.0f;
++    controller->externalVelocityX = 0.0f;
++    controller->externalVelocityY = 0.0f;
++    controller->jumpBufferRemaining = 0.0f;
++    controller->coyoteTimeRemaining = 0.0f;
++    controller->grounded = false;
++    controller->crouching = false;
++}
++
++void PlayerControllerReset(PlayerController* controller, Camera* camera)
++{
++    if (controller->crouching)
++    {
++        double feet = camera->position[2] - controller->config.crouchingEyeHeight;
++        camera->position[2] = feet + controller->config.standingEyeHeight;
++    }
++
++    controller->verticalVelocity = 0.0f;
++    controller->externalVelocityX = 0.0f;
++    controller->externalVelocityY = 0.0f;
++    controller->jumpBufferRemaining = 0.0f;
++    controller->coyoteTimeRemaining = 0.0f;
++    controller->grounded = false;
++    controller->crouching = false;
++}
++
++bool PlayerControllerUpdate(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command,
++    float yaw, float deltaSeconds)
++{
++    bool presentationChanged = TrySetCrouching(
++        controller, collision, camera, command->crouchHeld);
++
++    bool supportedAtStart = HasGroundSupport(collision, controller, camera);
++    if (supportedAtStart && controller->verticalVelocity <= 0.0f)
++    {
++        controller->grounded = true;
++        controller->verticalVelocity = 0.0f;
++        controller->coyoteTimeRemaining =
++            controller->config.coyoteTimeSeconds;
++    }
++    else
++    {
++        controller->grounded = false;
++        controller->coyoteTimeRemaining -= deltaSeconds;
++        if (controller->coyoteTimeRemaining < 0.0f)
++        {
++            controller->coyoteTimeRemaining = 0.0f;
++        }
++    }
++
++    if (command->jumpPressed)
++    {
++        controller->jumpBufferRemaining =
++            controller->config.jumpBufferSeconds;
++    }
++    else
++    {
++        controller->jumpBufferRemaining -= deltaSeconds;
++        if (controller->jumpBufferRemaining < 0.0f)
++        {
++            controller->jumpBufferRemaining = 0.0f;
++        }
++    }
++
++    if (!controller->crouching
++        && controller->jumpBufferRemaining > 0.0f
++        && controller->coyoteTimeRemaining > 0.0f)
++    {
++        controller->verticalVelocity = controller->config.jumpSpeed;
++        controller->jumpBufferRemaining = 0.0f;
++        controller->coyoteTimeRemaining = 0.0f;
++        controller->grounded = false;
++    }
++
++    float forward = command->forward;
++    float right = command->right;
++    if (forward != 0.0f && right != 0.0f)
++    {
++        forward *= 0.70710678f;
++        right *= 0.70710678f;
++    }
++
++    float sinYaw = ScalarSin(yaw);
++    float cosYaw = ScalarCos(yaw);
++    float speed = controller->crouching
++        ? controller->config.crouchingSpeed
++        : controller->config.walkingSpeed;
++    double movement = (double)(speed * deltaSeconds);
++    double movementX =
++        (double)(sinYaw * forward + cosYaw * right) * movement;
++    double movementY =
++        (double)(cosYaw * forward - sinYaw * right) * movement;
++
++    MoveVoluntaryAxisWithLedgeGuard(
++        controller, collision, camera, 0, movementX);
++    MoveVoluntaryAxisWithLedgeGuard(
++        controller, collision, camera, 1, movementY);
++
++    if (controller->externalVelocityX != 0.0f)
++    {
++        if (MoveAxis(controller, collision, camera, 0,
++                (double)(controller->externalVelocityX * deltaSeconds)))
++        {
++            controller->externalVelocityX = 0.0f;
++        }
++    }
++    if (controller->externalVelocityY != 0.0f)
++    {
++        if (MoveAxis(controller, collision, camera, 1,
++                (double)(controller->externalVelocityY * deltaSeconds)))
++        {
++            controller->externalVelocityY = 0.0f;
++        }
++    }
++
++    float damping = 1.0f
++        - controller->config.externalVelocityDamping * deltaSeconds;
++    if (damping < 0.0f) damping = 0.0f;
++    controller->externalVelocityX *= damping;
++    controller->externalVelocityY *= damping;
++
++    if (!controller->grounded || controller->verticalVelocity > 0.0f)
++    {
++        controller->verticalVelocity -=
++            controller->config.gravity * deltaSeconds;
++        if (controller->verticalVelocity
++            < -controller->config.maximumFallSpeed)
++        {
++            controller->verticalVelocity =
++                -controller->config.maximumFallSpeed;
++        }
++
++        float previousVelocity = controller->verticalVelocity;
++        if (MoveAxis(controller, collision, camera, 2,
++                (double)(controller->verticalVelocity * deltaSeconds)))
++        {
++            controller->grounded = previousVelocity < 0.0f;
++            controller->verticalVelocity = 0.0f;
++        }
++    }
++
++    if (controller->verticalVelocity <= 0.0f
++        && HasGroundSupport(collision, controller, camera))
++    {
++        controller->grounded = true;
++        controller->verticalVelocity = 0.0f;
++    }
++    else if (controller->verticalVelocity != 0.0f)
++    {
++        controller->grounded = false;
++    }
++
++    return presentationChanged;
++}
++
++bool PlayerControllerResolvePenetration(
++    PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera)
++{
++    for (uint32_t step = 0; step < PLAYER_PENETRATION_STEPS; ++step)
++    {
++        if (!PlayerCollidesAt(collision, controller, camera))
++        {
++            return true;
++        }
++        camera->position[2] += 1.0;
++    }
++    return !PlayerCollidesAt(collision, controller, camera);
++}
++
++bool PlayerControllerOverlapsBlock(const PlayerController* controller,
++    const Camera* camera, const int64_t block[3])
++{
++    PlayerBounds bounds;
++    CalculateBounds(controller, camera, &bounds);
++    double epsilon = controller->config.collisionEpsilon;
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        double blockMinimum = (double)block[axis];
++        double blockMaximum = blockMinimum + 1.0;
++        if (bounds.maximum[axis] <= blockMinimum + epsilon
++            || bounds.minimum[axis] >= blockMaximum - epsilon)
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool PlayerControllerIsGrounded(const PlayerController* controller)
++{
++    return controller->grounded;
++}
++
++bool PlayerControllerIsCrouching(const PlayerController* controller)
++{
++    return controller->crouching;
++}
++
++void PlayerControllerApplyImpulse(
++    PlayerController* controller, float x, float y, float z)
++{
++    controller->externalVelocityX += x;
++    controller->externalVelocityY += y;
++    controller->verticalVelocity += z;
++    if (z > 0.0f)
++    {
++        controller->grounded = false;
++        controller->coyoteTimeRemaining = 0.0f;
++    }
++}
+diff --git a/src/game/player_controller.h b/src/game/player_controller.h
+new file mode 100644
+index 0000000..a1b8f00
+--- /dev/null
++++ b/src/game/player_controller.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "game/camera.h"
++
++typedef bool (*PlayerSolidBlockQuery)(
++    void* context, int64_t x, int64_t y, int64_t z);
++
++typedef struct PlayerCollisionSource
++{
++    void* context;
++    PlayerSolidBlockQuery isSolidBlock;
++} PlayerCollisionSource;
++
++typedef struct PlayerControllerConfig
++{
++    float walkingSpeed;
++    float crouchingSpeed;
++    float gravity;
++    float jumpSpeed;
++    float maximumFallSpeed;
++    float jumpBufferSeconds;
++    float coyoteTimeSeconds;
++    float externalVelocityDamping;
++    double radius;
++    double standingHeight;
++    double standingEyeHeight;
++    double crouchingHeight;
++    double crouchingEyeHeight;
++    double collisionEpsilon;
++    double groundProbeDepth;
++} PlayerControllerConfig;
++
++typedef struct PlayerControllerCommand
++{
++    float forward;
++    float right;
++    bool jumpPressed;
++    bool crouchHeld;
++} PlayerControllerCommand;
++
++typedef struct PlayerController
++{
++    PlayerControllerConfig config;
++    float verticalVelocity;
++    float externalVelocityX;
++    float externalVelocityY;
++    float jumpBufferRemaining;
++    float coyoteTimeRemaining;
++    bool grounded;
++    bool crouching;
++} PlayerController;
++
++void PlayerControllerInit(
++    PlayerController* controller, const PlayerControllerConfig* config);
++void PlayerControllerReset(PlayerController* controller, Camera* camera);
++
++// Возвращает true, когда изменилось состояние, отображаемое в UI.
++bool PlayerControllerUpdate(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command,
++    float yaw, float deltaSeconds);
++
++bool PlayerControllerResolvePenetration(
++    PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera);
++
++bool PlayerControllerOverlapsBlock(const PlayerController* controller,
++    const Camera* camera, const int64_t block[3]);
++
++bool PlayerControllerIsGrounded(const PlayerController* controller);
++bool PlayerControllerIsCrouching(const PlayerController* controller);
++
++// Внешний толчок намеренно обходит защиту края при приседании.
++// Это граница для будущих мобов, взрывов и движущихся платформ.
++void PlayerControllerApplyImpulse(
++    PlayerController* controller, float x, float y, float z);
+diff --git a/src/game/voxel_interaction.c b/src/game/voxel_interaction.c
+new file mode 100644
+index 0000000..eeb2e9e
+--- /dev/null
++++ b/src/game/voxel_interaction.c
+@@ -0,0 +1,112 @@
++#include "game/voxel_interaction.h"
++
++#include "core/numeric.h"
++
++static bool VoxelRaycast(World* world, const double origin[3],
++    const float direction[3], float maximumDistance,
++    int64_t outHitBlock[3], int64_t outPreviousBlock[3])
++{
++    int64_t block[3];
++    int64_t step[3];
++    double tMaximum[3];
++    double tDelta[3];
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        block[axis] = FloorDoubleToInt64(origin[axis]);
++        double axisDirection = (double)direction[axis];
++
++        if (axisDirection > 1e-6)
++        {
++            step[axis] = 1;
++            tDelta[axis] = 1.0 / axisDirection;
++            tMaximum[axis] =
++                ((double)(block[axis] + 1) - origin[axis]) / axisDirection;
++        }
++        else if (axisDirection < -1e-6)
++        {
++            step[axis] = -1;
++            tDelta[axis] = -1.0 / axisDirection;
++            tMaximum[axis] =
++                ((double)block[axis] - origin[axis]) / axisDirection;
++        }
++        else
++        {
++            step[axis] = 0;
++            tDelta[axis] = 1e30;
++            tMaximum[axis] = 1e30;
++        }
++    }
++
++    for (;;)
++    {
++        int32_t axis = 0;
++        if (tMaximum[1] < tMaximum[axis]) axis = 1;
++        if (tMaximum[2] < tMaximum[axis]) axis = 2;
++        if (tMaximum[axis] > (double)maximumDistance)
++        {
++            return false;
++        }
++
++        outPreviousBlock[0] = block[0];
++        outPreviousBlock[1] = block[1];
++        outPreviousBlock[2] = block[2];
++
++        block[axis] += step[axis];
++        tMaximum[axis] += tDelta[axis];
++
++        if (WorldGetBlock(world, block[0], block[1], block[2]) != BLOCK_AIR)
++        {
++            outHitBlock[0] = block[0];
++            outHitBlock[1] = block[1];
++            outHitBlock[2] = block[2];
++            return true;
++        }
++    }
++}
++
++bool VoxelInteractionTryCreateEdit(World* world, const Camera* camera,
++    const PlayerController* player, bool playerCollisionsEnabled,
++    bool breakPressed, bool placePressed, float maximumDistance,
++    VoxelEdit* outEdit)
++{
++    outEdit->type = VOXEL_EDIT_NONE;
++    if (!breakPressed && !placePressed)
++    {
++        return false;
++    }
++
++    float direction[3];
++    CameraGetForwardVector(camera, direction);
++
++    int64_t hitBlock[3];
++    int64_t previousBlock[3];
++    if (!VoxelRaycast(world, camera->position, direction, maximumDistance,
++            hitBlock, previousBlock))
++    {
++        return false;
++    }
++
++    if (breakPressed)
++    {
++        outEdit->type = VOXEL_EDIT_BREAK;
++        outEdit->replacement = BLOCK_AIR;
++        outEdit->block[0] = hitBlock[0];
++        outEdit->block[1] = hitBlock[1];
++        outEdit->block[2] = hitBlock[2];
++        return true;
++    }
++
++    if (playerCollisionsEnabled
++        && PlayerControllerOverlapsBlock(player, camera, previousBlock))
++    {
++        return false;
++    }
++
++    outEdit->type = VOXEL_EDIT_PLACE;
++    outEdit->replacement = BLOCK_EARTH;
++    outEdit->block[0] = previousBlock[0];
++    outEdit->block[1] = previousBlock[1];
++    outEdit->block[2] = previousBlock[2];
++    return true;
++}
+diff --git a/src/game/voxel_interaction.h b/src/game/voxel_interaction.h
+new file mode 100644
+index 0000000..efbeec8
+--- /dev/null
++++ b/src/game/voxel_interaction.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "game/camera.h"
++#include "game/player_controller.h"
++#include "world/world.h"
++
++typedef enum VoxelEditType
++{
++    VOXEL_EDIT_NONE,
++    VOXEL_EDIT_BREAK,
++    VOXEL_EDIT_PLACE,
++} VoxelEditType;
++
++typedef struct VoxelEdit
++{
++    VoxelEditType type;
++    int64_t block[3];
++    BlockType replacement;
++} VoxelEdit;
++
++bool VoxelInteractionTryCreateEdit(World* world, const Camera* camera,
++    const PlayerController* player, bool playerCollisionsEnabled,
++    bool breakPressed, bool placePressed, float maximumDistance,
++    VoxelEdit* outEdit);
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+new file mode 100644
+index 0000000..6f0ed1b
+--- /dev/null
++++ b/src/input/CMakeLists.txt
+@@ -0,0 +1,7 @@
++laiue_add_module(input
++    SOURCES
++        input_windows.c
++        input.h
++        ../api.h
++    LINK user32
++)
+diff --git a/src/mesh/CMakeLists.txt b/src/mesh/CMakeLists.txt
+new file mode 100644
+index 0000000..65ed4f9
+--- /dev/null
++++ b/src/mesh/CMakeLists.txt
+@@ -0,0 +1,8 @@
++laiue_add_module(mesher
++    SOURCES
++        chunk_mesher.c
++        chunk_mesher.h
++        ../render/chunk_geometry.h
++        ../api.h
++    LINK laiue_world
++)
+diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
+new file mode 100644
+index 0000000..a64acae
+--- /dev/null
++++ b/src/platform/CMakeLists.txt
+@@ -0,0 +1,11 @@
++laiue_add_module(window
++    SOURCES
++        window.c
++        window.h
++        time.c
++        time.h
++        ../api.h
++    LINK
++        user32
++        gdi32
++)
+diff --git a/src/render/CMakeLists.txt b/src/render/CMakeLists.txt
+new file mode 100644
+index 0000000..63d8b4c
+--- /dev/null
++++ b/src/render/CMakeLists.txt
+@@ -0,0 +1,19 @@
++set(generated_directory "${PROJECT_SOURCE_DIR}/src/render/generated")
++laiue_compile_shader(chunk
++    SOURCE "${PROJECT_SOURCE_DIR}/shaders/chunk.hlsl"
++    OUTPUT_DIRECTORY "${generated_directory}"
++)
++
++laiue_add_module(render
++    SOURCES
++        renderer_d3d12.c
++        renderer.h
++        chunk_geometry.h
++        ../api.h
++        "${generated_directory}/chunk_vs.h"
++        "${generated_directory}/chunk_ps.h"
++    LINK
++        d3d12
++        dxgi
++        dxguid
++)
+diff --git a/src/world/CMakeLists.txt b/src/world/CMakeLists.txt
+new file mode 100644
+index 0000000..9cec8c1
+--- /dev/null
++++ b/src/world/CMakeLists.txt
+@@ -0,0 +1,10 @@
++laiue_add_module(world
++    SOURCES
++        world_infinite.c
++        terrain_noise.c
++        terrain_noise.h
++        infinite_coord.c
++        infinite_coord.h
++        world.h
++        ../api.h
++)

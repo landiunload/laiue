@@ -1,0 +1,28 @@
+laiue_add_module(core
+    SOURCES
+        application.c
+        application_config.c
+        application_config.h
+        chunk_streaming.c
+        chunk_streaming.h
+        debug_overlay.c
+        debug_overlay.h
+        math.c
+        math.h
+        numeric.h
+        ../game/camera.c
+        ../game/camera.h
+        ../game/game_events.h
+        ../game/game_mode.h
+        ../game/player_controller.c
+        ../game/player_controller.h
+        ../game/voxel_interaction.c
+        ../game/voxel_interaction.h
+        ../api.h
+    LINK
+        laiue_window
+        laiue_input
+        laiue_world
+        laiue_mesher
+        laiue_render
+)
