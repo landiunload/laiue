@@ -793,7 +793,8 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
 WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
-    BlockType* outBlocks)
+    BlockType* outBlocks,
+    float* heightScratch, size_t heightScratchCount)
 {
     bool regionHasDeltas = false;
     int64_t minChunkX = ChunkFromBlock(minBlockX);
@@ -819,11 +820,11 @@ WorldRegionContents WorldFillRegion(World* world,
     ReleaseSRWLockShared(&world->tableLock);
 
     size_t heightCount = (size_t)sizeX * (size_t)sizeY;
-    float stackHeights[HEIGHT_GRID_CELLS];
-    bool heightsOnHeap = heightCount > HEIGHT_GRID_CELLS;
+    bool heightsOnHeap = heightScratch == NULL
+        || heightScratchCount < heightCount;
     float* heights = heightsOnHeap
         ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float))
-        : stackHeights;
+        : heightScratch;
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
     bool boundsKnown = false;

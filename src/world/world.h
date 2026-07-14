@@ -57,7 +57,8 @@ LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int6
 LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
-    BlockType* outBlocks);
+    BlockType* outBlocks,
+    float* heightScratch, size_t heightScratchCount);
 
 // Высота верхнего твёрдого блока в текущих локальных координатах.
 LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);

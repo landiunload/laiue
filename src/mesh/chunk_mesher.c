@@ -34,6 +34,7 @@ typedef struct QuadBuffer
 struct ChunkMesherScratch
 {
     BlockType* blocks;
+    float* heights;
     uint64_t* columns;
     uint64_t* planesPositive;
     uint64_t* planesNegative;
@@ -49,11 +50,13 @@ ChunkMesherScratch* ChunkMesherScratchCreate(void)
     }
 
     scratch->blocks = HeapAlloc(GetProcessHeap(), 0, (size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE);
+    scratch->heights = HeapAlloc(GetProcessHeap(), 0, (size_t)EXTENDED_SIZE * EXTENDED_SIZE * sizeof(float));
     scratch->columns = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * 3 * sizeof(uint64_t));
     scratch->planesPositive = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * sizeof(uint64_t));
     scratch->planesNegative = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * sizeof(uint64_t));
 
-    if (scratch->blocks == NULL || scratch->columns == NULL ||
+    if (scratch->blocks == NULL || scratch->heights == NULL
+        || scratch->columns == NULL ||
         scratch->planesPositive == NULL || scratch->planesNegative == NULL)
     {
         ChunkMesherScratchDestroy(scratch);
@@ -71,6 +74,7 @@ void ChunkMesherScratchDestroy(ChunkMesherScratch* scratch)
     }
 
     if (scratch->blocks != NULL) HeapFree(GetProcessHeap(), 0, scratch->blocks);
+    if (scratch->heights != NULL) HeapFree(GetProcessHeap(), 0, scratch->heights);
     if (scratch->columns != NULL) HeapFree(GetProcessHeap(), 0, scratch->columns);
     if (scratch->planesPositive != NULL) HeapFree(GetProcessHeap(), 0, scratch->planesPositive);
     if (scratch->planesNegative != NULL) HeapFree(GetProcessHeap(), 0, scratch->planesNegative);
@@ -203,10 +207,11 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
 
     BlockType* blocks = scratch->blocks;
 
+    const size_t heightScratchCount = (size_t)EXTENDED_SIZE * EXTENDED_SIZE;
     WorldRegionContents contents = WorldFillRegion(world,
         baseX - 1, baseY - 1, baseZ - 1,
         EXTENDED_SIZE, EXTENDED_SIZE, EXTENDED_SIZE,
-        blocks);
+        blocks, scratch->heights, heightScratchCount);
 
     if (contents != WORLD_REGION_MIXED)
     {
