@@ -33,5 +33,4 @@ LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
 // вне окна значения могут выходить за его пределы.
 LAIUE_WINDOW_API void    WindowGetCursorClientPosition(const Window* window,
     int32_t* x, int32_t* y);
-LAIUE_WINDOW_API void    WindowSetOverlayText(Window* window, const wchar_t* text);
 LAIUE_WINDOW_API void    WindowRequestClose(Window* window);

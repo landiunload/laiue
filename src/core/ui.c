@@ -1,24 +1,24 @@
 #include "core/ui.h"
 #include "core/math.h"
 
-// Палитра интерфейса.
-#define UI_COLOR_TEXT        UiColor(232, 236, 244, 255)
-#define UI_COLOR_TEXT_DIM    UiColor(150, 158, 172, 255)
-#define UI_COLOR_BUTTON      UiColor(42, 48, 62, 255)
-#define UI_COLOR_BUTTON_HOT  UiColor(58, 68, 88, 255)
-#define UI_COLOR_BUTTON_HELD UiColor(34, 40, 52, 255)
-#define UI_COLOR_ACCENT      UiColor(108, 148, 255, 255)
-#define UI_COLOR_TRACK       UiColor(30, 34, 44, 255)
-#define UI_COLOR_KNOB        UiColor(232, 236, 244, 255)
-
 #define UI_HOVER_SPEED 12.0f
 
 bool UiBegin(UiContext* ui, int32_t width, int32_t height,
     float mouseX, float mouseY, bool mouseDown, bool mousePressed,
     float deltaSeconds)
 {
-    (void)width;
-    ui->scale = ScalarClamp((float)height / 440.0f, 0.75f, 4.0f);
+    if (ui == NULL || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    // Масштаб ограничен обеими сторонами окна: меню больше не вылезает
+    // за края в узких или почти квадратных окнах.
+    float widthScale = (float)width / 640.0f;
+    float heightScale = (float)height / 440.0f;
+    float responsiveScale = widthScale < heightScale
+        ? widthScale : heightScale;
+    ui->scale = ScalarClamp(responsiveScale, 0.65f, 4.0f);
 
     int32_t pixelSize = (int32_t)(15.0f * ui->scale + 0.5f);
     if (pixelSize != ui->bakedPixelSize)
@@ -49,8 +49,17 @@ bool UiBegin(UiContext* ui, int32_t width, int32_t height,
 
 void UiRelease(UiContext* ui)
 {
+    if (ui == NULL)
+    {
+        return;
+    }
+
     UiFontRelease(&ui->font);
     ui->bakedPixelSize = 0;
+    ui->fontDirty = false;
+    ui->activeId = 0;
+    ui->animationCount = 0;
+    ui->quadCount = 0;
 }
 
 static uint32_t LerpColor(uint32_t from, uint32_t to, float t)
@@ -95,6 +104,16 @@ void UiRect(UiContext* ui, float x, float y, float width, float height,
     quad->rect[3] = y + height;
     quad->cornerRadius = cornerRadius;
     quad->colorRGBA = color;
+}
+
+void UiPanel(UiContext* ui, float x, float y, float width, float height)
+{
+    float shadow = UiScaled(ui, 7.0f);
+    UiRect(ui, x - shadow, y - shadow + UiScaled(ui, 3.0f),
+        width + shadow * 2.0f, height + shadow * 2.0f,
+        UiScaled(ui, 20.0f), UiColor(0, 0, 0, 90));
+    UiRect(ui, x, y, width, height,
+        UiScaled(ui, 14.0f), UI_COLOR_PANEL);
 }
 
 void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
@@ -143,6 +162,15 @@ void UiTextCentered(UiContext* ui, float centerX, float lineTopY,
 float UiTextWidth(const UiContext* ui, const wchar_t* text)
 {
     return UiFontMeasure(&ui->font, text);
+}
+
+float UiLabelValueRow(UiContext* ui, float x, float width, float y,
+    const wchar_t* label, const wchar_t* value, float bottomGap)
+{
+    UiText(ui, x, y, UI_COLOR_TEXT_DIM, label);
+    float valueX = x + width - UiTextWidth(ui, value);
+    UiText(ui, valueX, y, UI_COLOR_ACCENT, value);
+    return y + ui->font.lineHeight + bottomGap;
 }
 
 float UiAnimate(UiContext* ui, uint32_t id, bool towardOne)

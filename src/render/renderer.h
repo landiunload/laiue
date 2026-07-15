@@ -89,6 +89,7 @@ LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
 // Квады в пиксельных координатах окна, рисуются поверх кадра в EndFrame
 // с альфа-смешиванием. Раскладка повторяет shaders/ui.hlsl (48 байт).
 
+#define RENDERER_UI_MAX_QUADS 2048u
 #define RENDERER_UI_QUAD_TEXT 1u  // альфа берётся из атласа шрифта
 
 typedef struct RendererUiQuad

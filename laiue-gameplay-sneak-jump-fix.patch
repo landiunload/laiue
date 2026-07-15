@@ -1,0 +1,1461 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index be9d480..38b9665 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,8 @@ add_subdirectory(src/world)
+ add_subdirectory(src/mesh)
+ add_subdirectory(src/render)
+ add_subdirectory(src/physics)
++add_subdirectory(src/gameplay)
++add_subdirectory(src/interaction)
+ add_subdirectory(src/core)
+ 
+ add_executable(laiue WIN32 src/launcher/main.c)
+diff --git a/src/api.h b/src/api.h
+index 8d1b6d0..7cb2d36 100644
+--- a/src/api.h
++++ b/src/api.h
+@@ -44,3 +44,15 @@
+ #else
+ #define LAIUE_PHYSICS_API __declspec(dllimport)
+ #endif
++
++#if defined(LAIUE_BUILD_GAMEPLAY)
++#define LAIUE_GAMEPLAY_API __declspec(dllexport)
++#else
++#define LAIUE_GAMEPLAY_API __declspec(dllimport)
++#endif
++
++#if defined(LAIUE_BUILD_INTERACTION)
++#define LAIUE_INTERACTION_API __declspec(dllexport)
++#else
++#define LAIUE_INTERACTION_API __declspec(dllimport)
++#endif
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index d8a5886..ca81ec1 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -10,14 +10,10 @@ laiue_add_module(core
+         math.c
+         math.h
+         numeric.h
++        player_command_mapper.c
++        player_command_mapper.h
+         ../game/camera.c
+         ../game/camera.h
+-        ../game/game_events.h
+-        ../game/game_mode.h
+-        ../game/player_controller_impl.c
+-        ../game/player_controller.h
+-        ../game/voxel_interaction.c
+-        ../game/voxel_interaction.h
+         ../api.h
+     LINK
+         laiue_window
+@@ -26,4 +22,6 @@ laiue_add_module(core
+         laiue_mesher
+         laiue_render
+         laiue_physics
++        laiue_gameplay
++        laiue_interaction
+ )
+diff --git a/src/core/application.c b/src/core/application.c
+index 9717412..da6ab54 100644
+--- a/src/core/application.c
++++ b/src/core/application.c
+@@ -4,10 +4,11 @@
+ #include "core/debug_overlay.h"
+ #include "core/math.h"
+ #include "core/numeric.h"
++#include "core/player_command_mapper.h"
+ #include "game/camera.h"
+-#include "game/game_mode.h"
+-#include "game/player_controller.h"
+-#include "game/voxel_interaction.h"
++#include "gameplay/game_mode.h"
++#include "gameplay/player_controller.h"
++#include "interaction/voxel_interaction.h"
+ #include "input/input.h"
+ #include "platform/time.h"
+ #include "platform/window.h"
+@@ -39,9 +40,22 @@ static void HandleBlockEditing(ApplicationState* application)
+     bool placePressed = InputWasMouseButtonPressed(
+         application->input, INPUT_MOUSE_BUTTON_RIGHT);
+ 
++    float direction[3];
++    CameraGetForwardVector(&application->camera, direction);
++
++    VoxelBodyShape bodyShape;
++    const VoxelBodyShape* blockingShape = NULL;
++    const double* blockingPosition = NULL;
++    if (application->gameMode == GAME_MODE_WALK)
++    {
++        PlayerControllerGetBodyShape(&application->player, &bodyShape);
++        blockingShape = &bodyShape;
++        blockingPosition = application->camera.position;
++    }
++
+     if (!VoxelInteractionTryCreateEdit(application->world,
+-            &application->camera, &application->player,
+-            application->gameMode == GAME_MODE_WALK,
++            application->camera.position, direction,
++            blockingPosition, blockingShape,
+             breakPressed, placePressed,
+             g_applicationConfiguration.editReachDistance, &edit))
+     {
+@@ -76,6 +90,10 @@ static void UpdatePlayer(ApplicationState* application,
+ {
+     if (application->gameMode == GAME_MODE_FLY)
+     {
++        while (InputConsumeKeyPress(
++                application->input, INPUT_KEY_SPACE))
++        {
++        }
+         CameraUpdate(&application->camera, deltaSeconds,
+             InputIsKeyDown(application->input, INPUT_KEY_W),
+             InputIsKeyDown(application->input, INPUT_KEY_A),
+@@ -93,26 +111,15 @@ static void UpdatePlayer(ApplicationState* application,
+         mouseDeltaX, mouseDeltaY, 0.0f,
+         g_applicationConfiguration.mouseSensitivity);
+ 
+-    PlayerControllerCommand command = {
+-        .forward =
+-            (InputIsKeyDown(application->input, INPUT_KEY_W) ? 1.0f : 0.0f)
+-            - (InputIsKeyDown(application->input, INPUT_KEY_S) ? 1.0f : 0.0f),
+-        .right =
+-            (InputIsKeyDown(application->input, INPUT_KEY_D) ? 1.0f : 0.0f)
+-            - (InputIsKeyDown(application->input, INPUT_KEY_A) ? 1.0f : 0.0f),
+-        .jumpPressed =
+-            InputWasKeyPressed(application->input, INPUT_KEY_SPACE),
+-        .jumpHeld =
+-            InputIsKeyDown(application->input, INPUT_KEY_SPACE),
+-        .crouchHeld =
+-            InputIsKeyDown(application->input, INPUT_KEY_SHIFT),
+-    };
++    PlayerControllerCommand command;
++    PlayerCommandMapperBuild(application->input,
++        &application->camera, &command);
+ 
+     PlayerCollisionSource collision =
+         CreatePlayerCollisionSource(application->world);
+     if (PlayerControllerUpdate(&application->player,
+             &collision, &application->camera, &command,
+-            application->camera.yaw, deltaSeconds))
++            deltaSeconds))
+     {
+         application->overlayDirty = true;
+     }
+@@ -139,19 +146,19 @@ static void OnFrame(void* userData)
+ {
+     ApplicationState* application = userData;
+ 
+-    if (InputWasKeyPressed(application->input, INPUT_KEY_ESCAPE))
++    if (InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE))
+     {
+         WindowRequestClose(application->window);
+         return;
+     }
+ 
+-    if (InputWasKeyPressed(application->input, INPUT_KEY_F7))
++    if (InputConsumeKeyPress(application->input, INPUT_KEY_F7))
+     {
+         WindowSetMouseLook(application->window,
+             !InputIsKeyDown(application->input, INPUT_KEY_SHIFT));
+     }
+ 
+-    if (InputWasKeyPressed(application->input, INPUT_KEY_V))
++    if (InputConsumeKeyPress(application->input, INPUT_KEY_V))
+     {
+         RendererSetVerticalSync(application->renderer,
+             !RendererIsVerticalSyncEnabled(application->renderer));
+@@ -162,12 +169,12 @@ static void OnFrame(void* userData)
+         InputResetState(application->input);
+     }
+ 
+-    if (InputWasKeyPressed(application->input, INPUT_KEY_G))
++    if (InputConsumeKeyPress(application->input, INPUT_KEY_G))
+     {
+         ToggleGameMode(application);
+     }
+ 
+-    if (InputWasKeyPressed(application->input, INPUT_KEY_T)
++    if (InputConsumeKeyPress(application->input, INPUT_KEY_T)
+         && !SquareAbsoluteX(application))
+     {
+         WindowRequestClose(application->window);
+diff --git a/src/core/application_config.c b/src/core/application_config.c
+index 6120cbe..e06ca9d 100644
+--- a/src/core/application_config.c
++++ b/src/core/application_config.c
+@@ -32,6 +32,6 @@ const ApplicationConfiguration g_applicationConfiguration = {
+         .crouchingEyeHeight = 1.25,
+         .collisionEpsilon = 0.001,
+         .groundProbeDepth = 0.03,
+-        .ledgeSupportRadius = 0.05,
++        .sneakProbeDepth = 0.60,
+     },
+ };
+diff --git a/src/core/application_config.h b/src/core/application_config.h
+index f1555cb..a246579 100644
+--- a/src/core/application_config.h
++++ b/src/core/application_config.h
+@@ -3,7 +3,7 @@
+ #include <stdint.h>
+ #include <wchar.h>
+ 
+-#include "game/player_controller.h"
++#include "gameplay/player_controller.h"
+ 
+ typedef struct ApplicationConfiguration
+ {
+diff --git a/src/core/debug_overlay.h b/src/core/debug_overlay.h
+index cb898bc..3fa602d 100644
+--- a/src/core/debug_overlay.h
++++ b/src/core/debug_overlay.h
+@@ -3,8 +3,8 @@
+ #include <stdint.h>
+ #include <wchar.h>
+ 
+-#include "game/game_mode.h"
+-#include "game/player_controller.h"
++#include "gameplay/game_mode.h"
++#include "gameplay/player_controller.h"
+ #include "world/world.h"
+ 
+ void DebugOverlayBuildText(World* world, const PlayerController* player,
+diff --git a/src/core/player_command_mapper.c b/src/core/player_command_mapper.c
+new file mode 100644
+index 0000000..0a1a986
+--- /dev/null
++++ b/src/core/player_command_mapper.c
+@@ -0,0 +1,31 @@
++#include "core/player_command_mapper.h"
++
++#include "core/math.h"
++
++void PlayerCommandMapperBuild(Input* input, const Camera* camera,
++    PlayerControllerCommand* outCommand)
++{
++    float forward =
++        (InputIsKeyDown(input, INPUT_KEY_W) ? 1.0f : 0.0f)
++        - (InputIsKeyDown(input, INPUT_KEY_S) ? 1.0f : 0.0f);
++    float right =
++        (InputIsKeyDown(input, INPUT_KEY_D) ? 1.0f : 0.0f)
++        - (InputIsKeyDown(input, INPUT_KEY_A) ? 1.0f : 0.0f);
++
++    if (forward != 0.0f && right != 0.0f)
++    {
++        forward *= 0.70710678f;
++        right *= 0.70710678f;
++    }
++
++    float sinYaw = ScalarSin(camera->yaw);
++    float cosYaw = ScalarCos(camera->yaw);
++    outCommand->movementX =
++        (double)(sinYaw * forward + cosYaw * right);
++    outCommand->movementY =
++        (double)(cosYaw * forward - sinYaw * right);
++    outCommand->jumpPressed =
++        InputConsumeKeyPress(input, INPUT_KEY_SPACE);
++    outCommand->crouchHeld =
++        InputIsKeyDown(input, INPUT_KEY_SHIFT);
++}
+diff --git a/src/core/player_command_mapper.h b/src/core/player_command_mapper.h
+new file mode 100644
+index 0000000..735a6cc
+--- /dev/null
++++ b/src/core/player_command_mapper.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "game/camera.h"
++#include "gameplay/player_controller.h"
++#include "input/input.h"
++
++void PlayerCommandMapperBuild(Input* input, const Camera* camera,
++    PlayerControllerCommand* outCommand);
+diff --git a/src/gameplay/CMakeLists.txt b/src/gameplay/CMakeLists.txt
+new file mode 100644
+index 0000000..d3d041c
+--- /dev/null
++++ b/src/gameplay/CMakeLists.txt
+@@ -0,0 +1,15 @@
++laiue_add_module(gameplay
++    SOURCES
++        player_controller.c
++        player_controller.h
++        player_stance.c
++        player_stance.h
++        player_jump.c
++        player_jump.h
++        game_mode.h
++        game_events.h
++        ../game/camera.h
++        ../api.h
++    LINK
++        laiue_physics
++)
+diff --git a/src/gameplay/game_events.h b/src/gameplay/game_events.h
+new file mode 100644
+index 0000000..349374b
+--- /dev/null
++++ b/src/gameplay/game_events.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <stdint.h>
++
++typedef enum GameEventType
++{
++    GAME_EVENT_NONE,
++    GAME_EVENT_PLAYER_JUMPED,
++    GAME_EVENT_PLAYER_LANDED,
++    GAME_EVENT_PLAYER_STANCE_CHANGED,
++} GameEventType;
++
++typedef struct GameEvent
++{
++    GameEventType type;
++    uint64_t sequence;
++} GameEvent;
+diff --git a/src/gameplay/game_mode.h b/src/gameplay/game_mode.h
+new file mode 100644
+index 0000000..164fd33
+--- /dev/null
++++ b/src/gameplay/game_mode.h
+@@ -0,0 +1,7 @@
++#pragma once
++
++typedef enum GameMode
++{
++    GAME_MODE_FLY,
++    GAME_MODE_WALK,
++} GameMode;
+diff --git a/src/gameplay/player_controller.c b/src/gameplay/player_controller.c
+new file mode 100644
+index 0000000..6201cdd
+--- /dev/null
++++ b/src/gameplay/player_controller.c
+@@ -0,0 +1,349 @@
++#include "gameplay/player_controller.h"
++
++#include "gameplay/player_jump.h"
++#include "gameplay/player_stance.h"
++
++
++#define PLAYER_PENETRATION_STEPS 256u
++
++
++static VoxelBodyShape ActiveShape(const PlayerController* controller)
++{
++    return PlayerStanceGetShape(&controller->stance);
++}
++
++static bool HasGroundContact(const PlayerController* controller,
++    const PlayerCollisionSource* collision, const Camera* camera)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    return VoxelBodyHasGroundContact(collision, camera->position,
++        &shape, controller->config.groundProbeDepth);
++}
++
++static void RefreshGroundState(PlayerController* controller,
++    const PlayerCollisionSource* collision, const Camera* camera,
++    double stepSeconds)
++{
++    bool supported = HasGroundContact(controller, collision, camera);
++    PlayerJumpObserveGround(&controller->jump, supported, stepSeconds);
++    controller->grounded = supported
++        && controller->jump.verticalVelocity <= 0.0;
++}
++
++static void TryLaunchQueuedJump(PlayerController* controller)
++{
++    if (PlayerJumpTryLaunch(&controller->jump))
++    {
++        controller->grounded = false;
++    }
++}
++
++static void MoveVoluntary(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, double stepSeconds)
++{
++    double speed = PlayerStanceIsCrouching(&controller->stance)
++        ? controller->config.crouchingSpeed
++        : controller->config.walkingSpeed;
++    double movementX = command->movementX * speed * stepSeconds;
++    double movementY = command->movementY * speed * stepSeconds;
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    // Minecraft-подобный sneak: добровольное движение обрезается до
++    // последнего положения, под которым ещё существует опора.
++    if (PlayerStanceIsCrouching(&controller->stance)
++        && HasGroundContact(controller, collision, camera))
++    {
++        VoxelBodyClipSneakingMovement(collision, camera->position,
++            &shape, controller->config.sneakProbeDepth,
++            &movementX, &movementY);
++    }
++
++    VoxelBodyMoveAxis(
++        collision, camera->position, &shape, 0, movementX);
++    VoxelBodyMoveAxis(
++        collision, camera->position, &shape, 1, movementY);
++}
++
++static void MoveExternalVelocity(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    double stepSeconds)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    if (controller->externalVelocityX != 0.0
++        && VoxelBodyMoveAxis(collision, camera->position, &shape, 0,
++            controller->externalVelocityX * stepSeconds))
++    {
++        controller->externalVelocityX = 0.0;
++    }
++    if (controller->externalVelocityY != 0.0
++        && VoxelBodyMoveAxis(collision, camera->position, &shape, 1,
++            controller->externalVelocityY * stepSeconds))
++    {
++        controller->externalVelocityY = 0.0;
++    }
++
++    double damping = 1.0
++        - (double)controller->config.externalVelocityDamping * stepSeconds;
++    if (damping < 0.0)
++    {
++        damping = 0.0;
++    }
++    controller->externalVelocityX *= damping;
++    controller->externalVelocityY *= damping;
++}
++
++// Возвращает true в точной вершине прыжка.
++static bool IntegrateVertical(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    double stepSeconds)
++{
++    if (controller->grounded
++        && controller->jump.verticalVelocity == 0.0)
++    {
++        return false;
++    }
++
++    double gravity = controller->jump.config.gravity;
++    double maximumFallSpeed = controller->jump.config.maximumFallSpeed;
++    double oldVelocity = controller->jump.verticalVelocity;
++    if (oldVelocity < -maximumFallSpeed)
++    {
++        oldVelocity = -maximumFallSpeed;
++    }
++
++    double newVelocity = oldVelocity - gravity * stepSeconds;
++    VoxelBodyShape shape = ActiveShape(controller);
++
++    if (oldVelocity > 0.0 && newVelocity <= 0.0)
++    {
++        double timeToApex = oldVelocity / gravity;
++        double distanceToApex = oldVelocity * timeToApex
++            - 0.5 * gravity * timeToApex * timeToApex;
++        if (VoxelBodyMoveAxis(collision, camera->position,
++                &shape, 2, distanceToApex))
++        {
++            PlayerJumpHitCeiling(&controller->jump);
++            return false;
++        }
++
++        controller->jump.verticalVelocity = 0.0;
++        controller->grounded = false;
++        return true;
++    }
++
++    double distance;
++    if (newVelocity < -maximumFallSpeed)
++    {
++        double timeToTerminal =
++            (oldVelocity + maximumFallSpeed) / gravity;
++        if (timeToTerminal < 0.0) timeToTerminal = 0.0;
++        if (timeToTerminal > stepSeconds) timeToTerminal = stepSeconds;
++
++        distance = oldVelocity * timeToTerminal
++            - 0.5 * gravity * timeToTerminal * timeToTerminal
++            - maximumFallSpeed * (stepSeconds - timeToTerminal);
++        newVelocity = -maximumFallSpeed;
++    }
++    else
++    {
++        distance = oldVelocity * stepSeconds
++            - 0.5 * gravity * stepSeconds * stepSeconds;
++    }
++
++    if (VoxelBodyMoveAxis(collision, camera->position,
++            &shape, 2, distance))
++    {
++        if (distance < 0.0)
++        {
++            PlayerJumpLand(&controller->jump);
++            controller->grounded = true;
++        }
++        else
++        {
++            PlayerJumpHitCeiling(&controller->jump);
++            controller->grounded = false;
++        }
++        return false;
++    }
++
++    controller->jump.verticalVelocity = newVelocity;
++    controller->grounded = false;
++    return false;
++}
++
++static bool SimulateStep(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, double stepSeconds)
++{
++    RefreshGroundState(controller, collision, camera, stepSeconds);
++    bool launched = PlayerJumpTryLaunch(&controller->jump);
++    if (launched)
++    {
++        controller->grounded = false;
++    }
++
++    MoveVoluntary(controller, collision, camera, command, stepSeconds);
++    MoveExternalVelocity(controller, collision, camera, stepSeconds);
++    bool reachedApex = IntegrateVertical(
++        controller, collision, camera, stepSeconds);
++
++    if (!launched)
++    {
++        PlayerJumpAgeBuffer(&controller->jump, stepSeconds);
++    }
++
++    if (controller->jump.verticalVelocity <= 0.0
++        && HasGroundContact(controller, collision, camera))
++    {
++        PlayerJumpLand(&controller->jump);
++        controller->grounded = true;
++    }
++    return reachedApex;
++}
++
++void PlayerControllerInit(PlayerController* controller,
++    const PlayerControllerConfig* config)
++{
++    controller->config = *config;
++    PlayerStanceConfig stanceConfig = {
++        .radius = config->radius,
++        .standingHeight = config->standingHeight,
++        .standingEyeHeight = config->standingEyeHeight,
++        .crouchingHeight = config->crouchingHeight,
++        .crouchingEyeHeight = config->crouchingEyeHeight,
++        .collisionEpsilon = config->collisionEpsilon,
++    };
++    PlayerStanceInit(&controller->stance, &stanceConfig);
++
++    PlayerJumpConfig jumpConfig = {
++        .gravity = config->gravity,
++        .maximumFallSpeed = config->maximumFallSpeed,
++        .jumpHeight = config->jumpHeight,
++        .jumpBufferSeconds = config->jumpBufferSeconds,
++        .coyoteTimeSeconds = config->coyoteTimeSeconds,
++    };
++    PlayerJumpInit(&controller->jump, &jumpConfig);
++    controller->externalVelocityX = 0.0;
++    controller->externalVelocityY = 0.0;
++    controller->simulationAccumulator = 0.0;
++    controller->grounded = false;
++}
++
++void PlayerControllerReset(PlayerController* controller, Camera* camera)
++{
++    PlayerStanceReset(&controller->stance, camera->position);
++    PlayerJumpReset(&controller->jump);
++    controller->externalVelocityX = 0.0;
++    controller->externalVelocityY = 0.0;
++    controller->simulationAccumulator = 0.0;
++    controller->grounded = false;
++}
++
++bool PlayerControllerUpdate(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, float deltaSeconds)
++{
++    bool presentationChanged = PlayerStanceTrySet(
++        &controller->stance, collision,
++        camera->position, command->crouchHeld);
++
++    if (command->jumpPressed)
++    {
++        PlayerJumpQueue(&controller->jump);
++    }
++
++    // Нажатие обрабатывается немедленно, а не ждёт accumulation fixed-step.
++    // Поэтому при сотнях тысяч render-кадров событие не может потеряться.
++    RefreshGroundState(controller, collision, camera, 0.0);
++    TryLaunchQueuedJump(controller);
++
++    double fixedStep = controller->config.fixedStepSeconds;
++    if (fixedStep <= 0.0)
++    {
++        fixedStep = 1.0 / 240.0;
++    }
++    uint32_t maximumSubsteps = controller->config.maximumSubsteps;
++    if (maximumSubsteps == 0u)
++    {
++        maximumSubsteps = 32u;
++    }
++
++    if (deltaSeconds > 0.0f)
++    {
++        controller->simulationAccumulator += deltaSeconds;
++    }
++    double maximumAccumulator = fixedStep * (double)maximumSubsteps;
++    if (controller->simulationAccumulator > maximumAccumulator)
++    {
++        controller->simulationAccumulator = maximumAccumulator;
++    }
++
++    uint32_t substep = 0;
++    while (controller->simulationAccumulator + 1e-12 >= fixedStep
++        && substep < maximumSubsteps)
++    {
++        controller->simulationAccumulator -= fixedStep;
++        bool reachedApex = SimulateStep(controller,
++            collision, camera, command, fixedStep);
++        ++substep;
++        if (reachedApex)
++        {
++            break;
++        }
++    }
++
++    return presentationChanged;
++}
++
++bool PlayerControllerResolvePenetration(PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera)
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    for (uint32_t step = 0; step < PLAYER_PENETRATION_STEPS; ++step)
++    {
++        if (!VoxelBodyCollides(collision, camera->position, &shape))
++        {
++            return true;
++        }
++        camera->position[2] += 1.0;
++    }
++    return !VoxelBodyCollides(collision, camera->position, &shape);
++}
++
++bool PlayerControllerOverlapsBlock(const PlayerController* controller,
++    const Camera* camera, const int64_t block[3])
++{
++    VoxelBodyShape shape = ActiveShape(controller);
++    return VoxelBodyOverlapsBlock(camera->position, &shape, block);
++}
++
++void PlayerControllerGetBodyShape(const PlayerController* controller,
++    VoxelBodyShape* outShape)
++{
++    *outShape = ActiveShape(controller);
++}
++
++bool PlayerControllerIsGrounded(const PlayerController* controller)
++{
++    return controller->grounded;
++}
++
++bool PlayerControllerIsCrouching(const PlayerController* controller)
++{
++    return PlayerStanceIsCrouching(&controller->stance);
++}
++
++void PlayerControllerApplyImpulse(PlayerController* controller,
++    float x, float y, float z)
++{
++    controller->externalVelocityX += x;
++    controller->externalVelocityY += y;
++    controller->jump.verticalVelocity += z;
++    if (z > 0.0f)
++    {
++        controller->grounded = false;
++        controller->jump.coyoteTimeRemaining = 0.0;
++    }
++}
+diff --git a/src/gameplay/player_controller.h b/src/gameplay/player_controller.h
+new file mode 100644
+index 0000000..415e43f
+--- /dev/null
++++ b/src/gameplay/player_controller.h
+@@ -0,0 +1,84 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "api.h"
++#include "game/camera.h"
++#include "gameplay/player_jump.h"
++#include "gameplay/player_stance.h"
++#include "physics/voxel_body.h"
++
++typedef VoxelSolidBlockQuery PlayerSolidBlockQuery;
++typedef VoxelCollisionSource PlayerCollisionSource;
++
++typedef struct PlayerControllerConfig
++{
++    float walkingSpeed;
++    float crouchingSpeed;
++    float gravity;
++    float maximumFallSpeed;
++    float jumpBufferSeconds;
++    float coyoteTimeSeconds;
++    float externalVelocityDamping;
++    float fixedStepSeconds;
++    uint32_t maximumSubsteps;
++    double jumpHeight;
++    double radius;
++    double standingHeight;
++    double standingEyeHeight;
++    double crouchingHeight;
++    double crouchingEyeHeight;
++    double collisionEpsilon;
++    double groundProbeDepth;
++    double sneakProbeDepth;
++} PlayerControllerConfig;
++
++typedef struct PlayerControllerCommand
++{
++    // Нормализованное желаемое движение в мировых горизонтальных осях.
++    double movementX;
++    double movementY;
++    bool jumpPressed;
++    bool crouchHeld;
++} PlayerControllerCommand;
++
++typedef struct PlayerController
++{
++    PlayerControllerConfig config;
++    PlayerStance stance;
++    PlayerJump jump;
++    double externalVelocityX;
++    double externalVelocityY;
++    double simulationAccumulator;
++    bool grounded;
++} PlayerController;
++
++LAIUE_GAMEPLAY_API void PlayerControllerInit(
++    PlayerController* controller, const PlayerControllerConfig* config);
++LAIUE_GAMEPLAY_API void PlayerControllerReset(
++    PlayerController* controller, Camera* camera);
++
++// Возвращает true, если изменилось состояние, показываемое в интерфейсе.
++LAIUE_GAMEPLAY_API bool PlayerControllerUpdate(
++    PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera,
++    const PlayerControllerCommand* command, float deltaSeconds);
++
++LAIUE_GAMEPLAY_API bool PlayerControllerResolvePenetration(
++    PlayerController* controller,
++    const PlayerCollisionSource* collision, Camera* camera);
++LAIUE_GAMEPLAY_API bool PlayerControllerOverlapsBlock(
++    const PlayerController* controller,
++    const Camera* camera, const int64_t block[3]);
++LAIUE_GAMEPLAY_API void PlayerControllerGetBodyShape(
++    const PlayerController* controller, VoxelBodyShape* outShape);
++
++LAIUE_GAMEPLAY_API bool PlayerControllerIsGrounded(
++    const PlayerController* controller);
++LAIUE_GAMEPLAY_API bool PlayerControllerIsCrouching(
++    const PlayerController* controller);
++
++// Внешний толчок не проходит через sneak-защиту края.
++LAIUE_GAMEPLAY_API void PlayerControllerApplyImpulse(
++    PlayerController* controller, float x, float y, float z);
+diff --git a/src/gameplay/player_jump.c b/src/gameplay/player_jump.c
+new file mode 100644
+index 0000000..1dc9cc7
+--- /dev/null
++++ b/src/gameplay/player_jump.c
+@@ -0,0 +1,92 @@
++#include "gameplay/player_jump.h"
++
++#include <stdint.h>
++
++static double PositiveSquareRoot(double value)
++{
++    if (value <= 0.0)
++    {
++        return 0.0;
++    }
++
++    double estimate = value >= 1.0 ? value : 1.0;
++    for (uint32_t iteration = 0; iteration < 20u; ++iteration)
++    {
++        estimate = 0.5 * (estimate + value / estimate);
++    }
++    return estimate;
++}
++
++void PlayerJumpInit(PlayerJump* jump, const PlayerJumpConfig* config)
++{
++    jump->config = *config;
++    jump->launchSpeed = PositiveSquareRoot(
++        2.0 * config->gravity * config->jumpHeight);
++    PlayerJumpReset(jump);
++}
++
++void PlayerJumpReset(PlayerJump* jump)
++{
++    jump->verticalVelocity = 0.0;
++    jump->jumpBufferRemaining = 0.0;
++    jump->coyoteTimeRemaining = 0.0;
++}
++
++void PlayerJumpQueue(PlayerJump* jump)
++{
++    jump->jumpBufferRemaining = jump->config.jumpBufferSeconds;
++}
++
++void PlayerJumpObserveGround(PlayerJump* jump,
++    bool supported, double stepSeconds)
++{
++    if (supported && jump->verticalVelocity <= 0.0)
++    {
++        jump->verticalVelocity = 0.0;
++        jump->coyoteTimeRemaining = jump->config.coyoteTimeSeconds;
++        return;
++    }
++
++    jump->coyoteTimeRemaining -= stepSeconds;
++    if (jump->coyoteTimeRemaining < 0.0)
++    {
++        jump->coyoteTimeRemaining = 0.0;
++    }
++}
++
++bool PlayerJumpTryLaunch(PlayerJump* jump)
++{
++    if (jump->jumpBufferRemaining <= 0.0
++        || jump->coyoteTimeRemaining <= 0.0)
++    {
++        return false;
++    }
++
++    jump->verticalVelocity = jump->launchSpeed;
++    jump->jumpBufferRemaining = 0.0;
++    jump->coyoteTimeRemaining = 0.0;
++    return true;
++}
++
++void PlayerJumpAgeBuffer(PlayerJump* jump, double stepSeconds)
++{
++    jump->jumpBufferRemaining -= stepSeconds;
++    if (jump->jumpBufferRemaining < 0.0)
++    {
++        jump->jumpBufferRemaining = 0.0;
++    }
++}
++
++void PlayerJumpLand(PlayerJump* jump)
++{
++    jump->verticalVelocity = 0.0;
++    jump->coyoteTimeRemaining = jump->config.coyoteTimeSeconds;
++}
++
++void PlayerJumpHitCeiling(PlayerJump* jump)
++{
++    if (jump->verticalVelocity > 0.0)
++    {
++        jump->verticalVelocity = 0.0;
++    }
++}
+diff --git a/src/gameplay/player_jump.h b/src/gameplay/player_jump.h
+new file mode 100644
+index 0000000..3b0075c
+--- /dev/null
++++ b/src/gameplay/player_jump.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <stdbool.h>
++
++typedef struct PlayerJumpConfig
++{
++    double gravity;
++    double maximumFallSpeed;
++    double jumpHeight;
++    double jumpBufferSeconds;
++    double coyoteTimeSeconds;
++} PlayerJumpConfig;
++
++typedef struct PlayerJump
++{
++    PlayerJumpConfig config;
++    double verticalVelocity;
++    double jumpBufferRemaining;
++    double coyoteTimeRemaining;
++    double launchSpeed;
++} PlayerJump;
++
++void PlayerJumpInit(PlayerJump* jump, const PlayerJumpConfig* config);
++void PlayerJumpReset(PlayerJump* jump);
++void PlayerJumpQueue(PlayerJump* jump);
++void PlayerJumpObserveGround(PlayerJump* jump,
++    bool supported, double stepSeconds);
++bool PlayerJumpTryLaunch(PlayerJump* jump);
++void PlayerJumpAgeBuffer(PlayerJump* jump, double stepSeconds);
++void PlayerJumpLand(PlayerJump* jump);
++void PlayerJumpHitCeiling(PlayerJump* jump);
+diff --git a/src/gameplay/player_stance.c b/src/gameplay/player_stance.c
+new file mode 100644
+index 0000000..dc37554
+--- /dev/null
++++ b/src/gameplay/player_stance.c
+@@ -0,0 +1,74 @@
++#include "gameplay/player_stance.h"
++
++static double ActiveHeight(const PlayerStance* stance)
++{
++    return stance->crouching
++        ? stance->config.crouchingHeight
++        : stance->config.standingHeight;
++}
++
++static double ActiveEyeHeight(const PlayerStance* stance)
++{
++    return stance->crouching
++        ? stance->config.crouchingEyeHeight
++        : stance->config.standingEyeHeight;
++}
++
++void PlayerStanceInit(PlayerStance* stance,
++    const PlayerStanceConfig* config)
++{
++    stance->config = *config;
++    stance->crouching = false;
++}
++
++void PlayerStanceReset(PlayerStance* stance, double position[3])
++{
++    if (stance->crouching)
++    {
++        double feet = position[2] - stance->config.crouchingEyeHeight;
++        position[2] = feet + stance->config.standingEyeHeight;
++    }
++    stance->crouching = false;
++}
++
++bool PlayerStanceTrySet(PlayerStance* stance,
++    const VoxelCollisionSource* collision,
++    double position[3], bool crouching)
++{
++    if (stance->crouching == crouching)
++    {
++        return false;
++    }
++
++    bool previous = stance->crouching;
++    double previousEyeHeight = ActiveEyeHeight(stance);
++    double feet = position[2] - previousEyeHeight;
++
++    stance->crouching = crouching;
++    position[2] = feet + ActiveEyeHeight(stance);
++
++    VoxelBodyShape shape = PlayerStanceGetShape(stance);
++    if (!crouching && VoxelBodyCollides(collision, position, &shape))
++    {
++        stance->crouching = previous;
++        position[2] = feet + previousEyeHeight;
++        return false;
++    }
++    return true;
++}
++
++VoxelBodyShape PlayerStanceGetShape(const PlayerStance* stance)
++{
++    VoxelBodyShape shape = {
++        .radius = stance->config.radius,
++        .height = ActiveHeight(stance),
++        .eyeHeight = ActiveEyeHeight(stance),
++        .collisionEpsilon = stance->config.collisionEpsilon,
++    };
++    return shape;
++}
++
++bool PlayerStanceIsCrouching(const PlayerStance* stance)
++{
++    return stance->crouching;
++}
+diff --git a/src/gameplay/player_stance.h b/src/gameplay/player_stance.h
+new file mode 100644
+index 0000000..2a2061a
+--- /dev/null
++++ b/src/gameplay/player_stance.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <stdbool.h>
++
++#include "physics/voxel_body.h"
++
++typedef struct PlayerStanceConfig
++{
++    double radius;
++    double standingHeight;
++    double standingEyeHeight;
++    double crouchingHeight;
++    double crouchingEyeHeight;
++    double collisionEpsilon;
++} PlayerStanceConfig;
++
++typedef struct PlayerStance
++{
++    PlayerStanceConfig config;
++    bool crouching;
++} PlayerStance;
++
++void PlayerStanceInit(PlayerStance* stance,
++    const PlayerStanceConfig* config);
++void PlayerStanceReset(PlayerStance* stance, double position[3]);
++
++// Меняет стойку, сохраняя положение ног. Встать под потолком нельзя.
++bool PlayerStanceTrySet(PlayerStance* stance,
++    const VoxelCollisionSource* collision,
++    double position[3], bool crouching);
++
++VoxelBodyShape PlayerStanceGetShape(const PlayerStance* stance);
++bool PlayerStanceIsCrouching(const PlayerStance* stance);
+diff --git a/src/input/input.h b/src/input/input.h
+index d63d262..59b1836 100644
+--- a/src/input/input.h
++++ b/src/input/input.h
+@@ -38,8 +38,8 @@ LAIUE_INPUT_API void   InputDestroy(Input* input);
+ // Обрабатывает HRAWINPUT из WM_INPUT; подключается к окну как raw-input callback.
+ LAIUE_INPUT_API void   InputHandleRawInput(Input* input, void* rawInputHandle);
+ 
+-// Сбрасывает накопленные за кадр данные (нажатия-защёлки и дельту мыши).
+-// Вызывается в конце каждого кадра.
++// Сбрасывает только покадровые данные мыши. Очередь нажатий клавиш
++// живёт до явного InputConsumeKeyPress, поэтому не теряется при большом FPS.
+ LAIUE_INPUT_API void   InputEndFrame(Input* input);
+ 
+ // Полный сброс состояния (все клавиши «отпущены», дельты обнулены).
+@@ -49,6 +49,7 @@ LAIUE_INPUT_API void   InputResetState(Input* input);
+ 
+ LAIUE_INPUT_API bool   InputIsKeyDown(const Input* input, InputKey key);
+ LAIUE_INPUT_API bool   InputWasKeyPressed(const Input* input, InputKey key);
++LAIUE_INPUT_API bool   InputConsumeKeyPress(Input* input, InputKey key);
+ LAIUE_INPUT_API bool   InputIsMouseButtonDown(const Input* input, InputMouseButton button);
+ LAIUE_INPUT_API bool   InputWasMouseButtonPressed(const Input* input, InputMouseButton button);
+ LAIUE_INPUT_API void   InputGetMouseDelta(const Input* input, int32_t* deltaX, int32_t* deltaY);
+diff --git a/src/input/input_windows.c b/src/input/input_windows.c
+index f8252b7..0b335e4 100644
+--- a/src/input/input_windows.c
++++ b/src/input/input_windows.c
+@@ -6,7 +6,7 @@
+ struct Input
+ {
+     bool keyDown[INPUT_KEY_COUNT];
+-    bool keyPressedLatch[INPUT_KEY_COUNT];
++    uint8_t keyPressCount[INPUT_KEY_COUNT];
+     bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
+     bool mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_COUNT];
+     int32_t mouseDeltaX;
+@@ -64,7 +64,10 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
+             // авто-повтор клавиатуры её не дребезжит.
+             if (!input->keyDown[key])
+             {
+-                input->keyPressedLatch[key] = true;
++                if (input->keyPressCount[key] < UINT8_MAX)
++                {
++                    input->keyPressCount[key]++;
++                }
+             }
+ 
+             input->keyDown[key] = true;
+@@ -74,11 +77,6 @@ void InputHandleRawInput(Input* input, void* rawInputHandle)
+ 
+ void InputEndFrame(Input* input)
+ {
+-    for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
+-    {
+-        input->keyPressedLatch[key] = false;
+-    }
+-
+     for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
+     {
+         input->mouseButtonPressedLatch[button] = false;
+@@ -93,7 +91,7 @@ void InputResetState(Input* input)
+     for (int32_t key = 0; key < INPUT_KEY_COUNT; ++key)
+     {
+         input->keyDown[key] = false;
+-        input->keyPressedLatch[key] = false;
++        input->keyPressCount[key] = 0;
+     }
+ 
+     for (int32_t button = 0; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
+@@ -114,7 +112,20 @@ bool InputIsKeyDown(const Input* input, InputKey key)
+ 
+ bool InputWasKeyPressed(const Input* input, InputKey key)
+ {
+-    return (uint32_t)key < INPUT_KEY_COUNT && input->keyPressedLatch[key];
++    return (uint32_t)key < INPUT_KEY_COUNT
++        && input->keyPressCount[key] != 0;
++}
++
++bool InputConsumeKeyPress(Input* input, InputKey key)
++{
++    if ((uint32_t)key >= INPUT_KEY_COUNT
++        || input->keyPressCount[key] == 0)
++    {
++        return false;
++    }
++
++    input->keyPressCount[key]--;
++    return true;
+ }
+ 
+ 
+diff --git a/src/interaction/CMakeLists.txt b/src/interaction/CMakeLists.txt
+new file mode 100644
+index 0000000..e9fae81
+--- /dev/null
++++ b/src/interaction/CMakeLists.txt
+@@ -0,0 +1,11 @@
++laiue_add_module(interaction
++    SOURCES
++        voxel_raycast.c
++        voxel_raycast.h
++        voxel_interaction.c
++        voxel_interaction.h
++        ../api.h
++    LINK
++        laiue_world
++        laiue_physics
++)
+diff --git a/src/interaction/voxel_interaction.c b/src/interaction/voxel_interaction.c
+new file mode 100644
+index 0000000..b53c324
+--- /dev/null
++++ b/src/interaction/voxel_interaction.c
+@@ -0,0 +1,49 @@
++#include "interaction/voxel_interaction.h"
++
++#include "interaction/voxel_raycast.h"
++
++#include <stddef.h>
++
++bool VoxelInteractionTryCreateEdit(
++    World* world, const double origin[3], const float direction[3],
++    const double blockingBodyPosition[3],
++    const VoxelBodyShape* blockingBodyShape,
++    bool breakPressed, bool placePressed, float maximumDistance,
++    VoxelEdit* outEdit)
++{
++    outEdit->type = VOXEL_EDIT_NONE;
++    if (!breakPressed && !placePressed)
++    {
++        return false;
++    }
++
++    VoxelRaycastHit hit;
++    if (!VoxelRaycast(world, origin, direction, maximumDistance, &hit))
++    {
++        return false;
++    }
++
++    if (breakPressed)
++    {
++        outEdit->type = VOXEL_EDIT_BREAK;
++        outEdit->replacement = BLOCK_AIR;
++        outEdit->block[0] = hit.block[0];
++        outEdit->block[1] = hit.block[1];
++        outEdit->block[2] = hit.block[2];
++        return true;
++    }
++
++    if (blockingBodyShape != NULL && blockingBodyPosition != NULL
++        && VoxelBodyOverlapsBlock(blockingBodyPosition,
++            blockingBodyShape, hit.previousBlock))
++    {
++        return false;
++    }
++
++    outEdit->type = VOXEL_EDIT_PLACE;
++    outEdit->replacement = BLOCK_EARTH;
++    outEdit->block[0] = hit.previousBlock[0];
++    outEdit->block[1] = hit.previousBlock[1];
++    outEdit->block[2] = hit.previousBlock[2];
++    return true;
++}
+diff --git a/src/interaction/voxel_interaction.h b/src/interaction/voxel_interaction.h
+new file mode 100644
+index 0000000..8596728
+--- /dev/null
++++ b/src/interaction/voxel_interaction.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "api.h"
++#include "physics/voxel_body.h"
++#include "world/world.h"
++
++typedef enum VoxelEditType
++{
++    VOXEL_EDIT_NONE,
++    VOXEL_EDIT_BREAK,
++    VOXEL_EDIT_PLACE,
++} VoxelEditType;
++
++typedef struct VoxelEdit
++{
++    VoxelEditType type;
++    int64_t block[3];
++    BlockType replacement;
++} VoxelEdit;
++
++LAIUE_INTERACTION_API bool VoxelInteractionTryCreateEdit(
++    World* world, const double origin[3], const float direction[3],
++    const double blockingBodyPosition[3],
++    const VoxelBodyShape* blockingBodyShape,
++    bool breakPressed, bool placePressed, float maximumDistance,
++    VoxelEdit* outEdit);
+diff --git a/src/interaction/voxel_raycast.c b/src/interaction/voxel_raycast.c
+new file mode 100644
+index 0000000..71b756a
+--- /dev/null
++++ b/src/interaction/voxel_raycast.c
+@@ -0,0 +1,68 @@
++#include "interaction/voxel_raycast.h"
++
++static int64_t FloorToInt64(double value)
++{
++    int64_t truncated = (int64_t)value;
++    return (double)truncated > value ? truncated - 1 : truncated;
++}
++
++bool VoxelRaycast(World* world, const double origin[3],
++    const float direction[3], float maximumDistance,
++    VoxelRaycastHit* outHit)
++{
++    int64_t block[3];
++    int64_t step[3];
++    double tMaximum[3];
++    double tDelta[3];
++
++    for (int32_t axis = 0; axis < 3; ++axis)
++    {
++        block[axis] = FloorToInt64(origin[axis]);
++        double axisDirection = (double)direction[axis];
++        if (axisDirection > 1e-6)
++        {
++            step[axis] = 1;
++            tDelta[axis] = 1.0 / axisDirection;
++            tMaximum[axis] =
++                ((double)(block[axis] + 1) - origin[axis]) / axisDirection;
++        }
++        else if (axisDirection < -1e-6)
++        {
++            step[axis] = -1;
++            tDelta[axis] = -1.0 / axisDirection;
++            tMaximum[axis] =
++                ((double)block[axis] - origin[axis]) / axisDirection;
++        }
++        else
++        {
++            step[axis] = 0;
++            tDelta[axis] = 1e30;
++            tMaximum[axis] = 1e30;
++        }
++    }
++
++    for (;;)
++    {
++        int32_t axis = 0;
++        if (tMaximum[1] < tMaximum[axis]) axis = 1;
++        if (tMaximum[2] < tMaximum[axis]) axis = 2;
++        if (tMaximum[axis] > (double)maximumDistance)
++        {
++            return false;
++        }
++
++        outHit->previousBlock[0] = block[0];
++        outHit->previousBlock[1] = block[1];
++        outHit->previousBlock[2] = block[2];
++        block[axis] += step[axis];
++        tMaximum[axis] += tDelta[axis];
++
++        if (WorldGetBlock(world, block[0], block[1], block[2]) != BLOCK_AIR)
++        {
++            outHit->block[0] = block[0];
++            outHit->block[1] = block[1];
++            outHit->block[2] = block[2];
++            return true;
++        }
++    }
++}
+diff --git a/src/interaction/voxel_raycast.h b/src/interaction/voxel_raycast.h
+new file mode 100644
+index 0000000..69b4685
+--- /dev/null
++++ b/src/interaction/voxel_raycast.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "world/world.h"
++
++typedef struct VoxelRaycastHit
++{
++    int64_t block[3];
++    int64_t previousBlock[3];
++} VoxelRaycastHit;
++
++bool VoxelRaycast(World* world, const double origin[3],
++    const float direction[3], float maximumDistance,
++    VoxelRaycastHit* outHit);
+diff --git a/src/physics/voxel_body.c b/src/physics/voxel_body.c
+index 3e57e51..f36815a 100644
+--- a/src/physics/voxel_body.c
++++ b/src/physics/voxel_body.c
+@@ -1,5 +1,7 @@
+ #include "physics/voxel_body.h"
+ 
++#include <stddef.h>
++
+ static int64_t FloorToInt64(double value)
+ {
+     int64_t truncated = (int64_t)value;
+@@ -245,3 +247,106 @@ bool VoxelBodyOverlapsBlock(const double position[3],
+     }
+     return true;
+ }
++
++static bool HasSupportBelowOffset(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth, double xOffset, double yOffset)
++{
++    if (probeDepth <= 0.0)
++    {
++        return false;
++    }
++
++    double shiftedPosition[3] = {
++        position[0] + xOffset,
++        position[1] + yOffset,
++        position[2],
++    };
++    VoxelBodyBounds bounds;
++    VoxelBodyCalculateBounds(shiftedPosition, shape, &bounds);
++
++    double epsilon = shape->collisionEpsilon;
++    int64_t minimumX = FloorToInt64(bounds.minimum[0] + epsilon);
++    int64_t maximumX = FloorToInt64(bounds.maximum[0] - epsilon);
++    int64_t minimumY = FloorToInt64(bounds.minimum[1] + epsilon);
++    int64_t maximumY = FloorToInt64(bounds.maximum[1] - epsilon);
++    int64_t minimumZ = FloorToInt64(bounds.minimum[2] - probeDepth + epsilon);
++    int64_t maximumZ = FloorToInt64(bounds.minimum[2] - epsilon);
++
++    for (int64_t z = minimumZ; z <= maximumZ; ++z)
++    {
++        for (int64_t y = minimumY; y <= maximumY; ++y)
++        {
++            for (int64_t x = minimumX; x <= maximumX; ++x)
++            {
++                if (collision->isSolidBlock(collision->context, x, y, z))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++static double ReduceSneakDistance(double value, double step)
++{
++    if (value > 0.0)
++    {
++        return value <= step ? 0.0 : value - step;
++    }
++    if (value < 0.0)
++    {
++        return value >= -step ? 0.0 : value + step;
++    }
++    return 0.0;
++}
++
++void VoxelBodyClipSneakingMovement(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth, double* xDistance, double* yDistance)
++{
++    if (collision == NULL || collision->isSolidBlock == NULL
++        || position == NULL || shape == NULL
++        || xDistance == NULL || yDistance == NULL)
++    {
++        return;
++    }
++
++    // Уже падающее или вытолкнутое тело не приклеивается обратно к краю.
++    if (!HasSupportBelowOffset(
++            collision, position, shape, probeDepth, 0.0, 0.0))
++    {
++        return;
++    }
++
++    // Vanilla Minecraft уменьшает компоненты движения небольшими шагами,
++    // сначала отдельно, затем диагональ. Это сохраняет скольжение вдоль края.
++    const double reductionStep = 0.05;
++    double x = *xDistance;
++    double y = *yDistance;
++
++    while (x != 0.0 && !HasSupportBelowOffset(
++            collision, position, shape, probeDepth, x, 0.0))
++    {
++        x = ReduceSneakDistance(x, reductionStep);
++    }
++
++    while (y != 0.0 && !HasSupportBelowOffset(
++            collision, position, shape, probeDepth, 0.0, y))
++    {
++        y = ReduceSneakDistance(y, reductionStep);
++    }
++
++    while (x != 0.0 && y != 0.0 && !HasSupportBelowOffset(
++            collision, position, shape, probeDepth, x, y))
++    {
++        x = ReduceSneakDistance(x, reductionStep);
++        y = ReduceSneakDistance(y, reductionStep);
++    }
++
++    *xDistance = x;
++    *yDistance = y;
++}
+diff --git a/src/physics/voxel_body.h b/src/physics/voxel_body.h
+index 59da4da..d17dad3 100644
+--- a/src/physics/voxel_body.h
++++ b/src/physics/voxel_body.h
+@@ -58,3 +58,11 @@ LAIUE_PHYSICS_API bool VoxelBodyHasStableGround(
+ LAIUE_PHYSICS_API bool VoxelBodyOverlapsBlock(
+     const double position[3], const VoxelBodyShape* shape,
+     const int64_t block[3]);
++
++// Minecraft-подобная sneak-защита: уменьшает только добровольное
++// горизонтальное перемещение так, чтобы AABB сохранял пересечение с опорой.
++// Внешние импульсы должны вызывать VoxelBodyMoveAxis напрямую.
++LAIUE_PHYSICS_API void VoxelBodyClipSneakingMovement(
++    const VoxelCollisionSource* collision,
++    const double position[3], const VoxelBodyShape* shape,
++    double probeDepth, double* xDistance, double* yDistance);

@@ -29,7 +29,7 @@ typedef enum PauseMenuAction
 typedef struct GameSettings
 {
     // Графика
-    int32_t fovDegrees;           // ползунок 0..360 (рендер поднимает до >= 1)
+    int32_t fovDegrees;           // ползунок 1..360
     RenderProjection projection;  // выбор рендера
 
     // Администрирование
