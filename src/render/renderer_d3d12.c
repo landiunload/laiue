@@ -26,9 +26,8 @@
 #define SRV_SLOT_FONT_ATLAS     3
 #define SRV_SLOT_COUNT          4
 
-// Слой UI: до 2048 квадов на кадр (по 48 байт — держать в синхроне
-// с shaders/ui.hlsl), кольцо из FRAME_COUNT upload-буферов.
-#define UI_MAX_QUADS 2048
+// Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
+// Число квадов является частью публичного контракта renderer.h.
 #define UI_QUAD_BYTES 48
 
 // Резолв панорамы: раскладка корневых констант.
@@ -879,7 +878,7 @@ static bool CreateUiQuadBuffers(Renderer* renderer)
     D3D12_RESOURCE_DESC description;
     memset(&description, 0, sizeof(description));
     description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    description.Width = (UINT64)UI_MAX_QUADS * UI_QUAD_BYTES;
+    description.Width = (UINT64)RENDERER_UI_MAX_QUADS * UI_QUAD_BYTES;
     description.Height = 1;
     description.DepthOrArraySize = 1;
     description.MipLevels = 1;
@@ -2306,7 +2305,7 @@ void RendererUiQueue(Renderer* renderer, const RendererUiQuad* quads, uint32_t c
         return;
     }
 
-    uint32_t space = UI_MAX_QUADS - renderer->uiQuadCount;
+    uint32_t space = RENDERER_UI_MAX_QUADS - renderer->uiQuadCount;
     if (count > space)
     {
         count = space;

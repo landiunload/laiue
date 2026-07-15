@@ -5,8 +5,8 @@ laiue_add_module(core
         application_config.h
         chunk_streaming.c
         chunk_streaming.h
-        debug_overlay.c
-        debug_overlay.h
+        game_hud.c
+        game_hud.h
         game_time.c
         game_time.h
         math.c
@@ -22,6 +22,8 @@ laiue_add_module(core
         ui.h
         ui_font.c
         ui_font.h
+        ui_format.c
+        ui_format.h
         ../game/camera.c
         ../game/camera.h
         ../api.h

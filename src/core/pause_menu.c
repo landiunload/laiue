@@ -1,8 +1,5 @@
 #include "core/pause_menu.h"
-#include "render/shader_pack.h"
-#include "render/texture_pack.h"
-
-#include <windows.h>
+#include "core/ui_format.h"
 
 // Идентификаторы виджетов (стабильны между кадрами — на них живут анимации).
 enum
@@ -52,85 +49,9 @@ static const wchar_t* const PROJECTION_LABELS[RENDER_PROJECTION_COUNT] = {
 
 #define MENU_TEXT_CAPACITY 48
 
-static void AppendChar(wchar_t* buffer, uint32_t capacity,
-    uint32_t* length, wchar_t character)
-{
-    if (*length + 1u < capacity)
-    {
-        buffer[(*length)++] = character;
-    }
-    buffer[*length] = L'\0';
-}
-
-static void AppendUnsigned(wchar_t* buffer, uint32_t capacity,
-    uint32_t* length, uint32_t value)
-{
-    wchar_t digits[12];
-    uint32_t digitCount = 0;
-    do
-    {
-        digits[digitCount++] = (wchar_t)(L'0' + value % 10u);
-        value /= 10u;
-    }
-    while (value != 0u && digitCount < 11u);
-    while (digitCount > 0u)
-    {
-        AppendChar(buffer, capacity, length, digits[--digitCount]);
-    }
-}
-
-static void AppendString(wchar_t* buffer, uint32_t capacity,
-    uint32_t* length, const wchar_t* text)
-{
-    while (*text != L'\0')
-    {
-        AppendChar(buffer, capacity, length, *text++);
-    }
-}
-
-static void FormatDegrees(wchar_t* buffer, uint32_t capacity, int32_t value)
-{
-    uint32_t length = 0;
-    buffer[0] = L'\0';
-    AppendUnsigned(buffer, capacity, &length, value < 0 ? 0u : (uint32_t)value);
-    AppendChar(buffer, capacity, &length, 0x00B0);
-}
-
-static void FormatClock(wchar_t* buffer, uint32_t capacity, uint32_t minutes)
-{
-    uint32_t length = 0;
-    buffer[0] = L'\0';
-    uint32_t hours = (minutes / 60u) % 24u;
-    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + hours / 10u));
-    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + hours % 10u));
-    AppendChar(buffer, capacity, &length, L':');
-    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + (minutes % 60u) / 10u));
-    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + minutes % 10u));
-}
-
-static void FormatValueSuffix(wchar_t* buffer, uint32_t capacity,
-    int32_t value, const wchar_t* suffix)
-{
-    uint32_t length = 0;
-    buffer[0] = L'\0';
-    AppendUnsigned(buffer, capacity, &length, value < 0 ? 0u : (uint32_t)value);
-    AppendString(buffer, capacity, &length, suffix);
-}
-
 void PauseMenuOpen(PauseMenu* menu)
 {
     menu->screen = PAUSE_MENU_MAIN;
-}
-
-static void DrawPanel(UiContext* ui, float x, float y,
-    float width, float height)
-{
-    float shadow = UiScaled(ui, 7.0f);
-    UiRect(ui, x - shadow, y - shadow + UiScaled(ui, 3.0f),
-        width + shadow * 2.0f, height + shadow * 2.0f,
-        UiScaled(ui, 20.0f), UiColor(0, 0, 0, 90));
-    UiRect(ui, x, y, width, height,
-        UiScaled(ui, 14.0f), UiColor(22, 26, 34, 244));
 }
 
 static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
@@ -147,7 +68,7 @@ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
 
     float panelX = ((float)width - panelWidth) * 0.5f;
     float panelY = ((float)height - panelHeight) * 0.5f;
-    DrawPanel(ui, panelX, panelY, panelWidth, panelHeight);
+    UiPanel(ui, panelX, panelY, panelWidth, panelHeight);
 
     float cursorY = panelY + padding;
     UiTextCentered(ui, panelX + panelWidth * 0.5f, cursorY,
@@ -201,16 +122,6 @@ static const wchar_t* ProjectionCaption(const GameSettings* settings)
     }
 }
 
-// Строка «подпись слева, значение справа»; возвращает следующий cursorY.
-static float LabelValueRow(UiContext* ui, float x, float width, float y,
-    const wchar_t* label, const wchar_t* value)
-{
-    UiText(ui, x, y, UiColor(232, 236, 244, 255), label);
-    UiText(ui, x + width - UiTextWidth(ui, value), y,
-        UiColor(108, 148, 255, 255), value);
-    return y + ui->font.lineHeight + UiScaled(ui, 6.0f);
-}
-
 static float GraphicsTabHeight(const UiContext* ui)
 {
     float s = ui->scale;
@@ -244,11 +155,12 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
     float s = ui->scale;
     wchar_t text[MENU_TEXT_CAPACITY];
 
-    FormatDegrees(text, MENU_TEXT_CAPACITY, settings->fovDegrees);
-    y = LabelValueRow(ui, x, width, y, L"Поле зрения", text);
+    UiFormatDegrees(text, MENU_TEXT_CAPACITY, settings->fovDegrees);
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Поле зрения", text, UiScaled(ui, 6.0f));
 
     int32_t fov = settings->fovDegrees;
-    if (UiSliderInt(ui, WIDGET_FOV_SLIDER, x, y, width, 0, 360, &fov))
+    if (UiSliderInt(ui, WIDGET_FOV_SLIDER, x, y, width, 1, 360, &fov))
     {
         settings->fovDegrees = fov;
     }
@@ -321,8 +233,9 @@ static float DrawAdminTab(UiContext* ui, GameSettings* settings,
     if (timeMinutes > 1439) timeMinutes = 1439;
     if (timeMinutes < 0) timeMinutes = 0;
 
-    FormatClock(text, MENU_TEXT_CAPACITY, (uint32_t)timeMinutes);
-    y = LabelValueRow(ui, x, width, y, L"Время суток", text);
+    UiFormatClock(text, MENU_TEXT_CAPACITY, (uint32_t)timeMinutes);
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Время суток", text, UiScaled(ui, 6.0f));
 
     if (UiSliderInt(ui, WIDGET_TIME_SLIDER, x, y, width, 0, 1439, &timeMinutes))
     {
@@ -338,12 +251,12 @@ static float DrawAdminTab(UiContext* ui, GameSettings* settings,
     y += ui->font.lineHeight + 6.0f * s;
 
     wchar_t normalLabel[MENU_TEXT_CAPACITY];
-    uint32_t length = 0;
-    normalLabel[0] = L'\0';
-    AppendString(normalLabel, MENU_TEXT_CAPACITY, &length, L"Обычная — сутки за ");
-    AppendUnsigned(normalLabel, MENU_TEXT_CAPACITY, &length,
+    UiTextBuilder builder;
+    UiTextBuilderInit(&builder, normalLabel, MENU_TEXT_CAPACITY);
+    UiTextBuilderAppend(&builder, L"Обычная — сутки за ");
+    UiTextBuilderAppendUnsigned(&builder,
         (uint32_t)(dayLengthMinutes + 0.5f));
-    AppendString(normalLabel, MENU_TEXT_CAPACITY, &length, L" мин");
+    UiTextBuilderAppend(&builder, L" мин");
 
     const wchar_t* speedLabels[TIME_SPEED_COUNT] = {
         L"Пауза",
@@ -371,16 +284,18 @@ static float DrawControlsTab(UiContext* ui, GameSettings* settings,
     float s = ui->scale;
     wchar_t text[MENU_TEXT_CAPACITY];
 
-    FormatValueSuffix(text, MENU_TEXT_CAPACITY,
-        settings->mouseSensitivityPercent, L"%");
-    y = LabelValueRow(ui, x, width, y, L"Чувствительность мыши", text);
+    UiFormatUnsignedSuffix(text, MENU_TEXT_CAPACITY,
+        (uint32_t)settings->mouseSensitivityPercent, L"%");
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Чувствительность мыши", text, UiScaled(ui, 6.0f));
     UiSliderInt(ui, WIDGET_SENSITIVITY_SLIDER, x, y, width,
         25, 300, &settings->mouseSensitivityPercent);
     y += 20.0f * s + 12.0f * s;
 
-    FormatValueSuffix(text, MENU_TEXT_CAPACITY,
-        settings->flySpeedBlocks, L" бл/с");
-    y = LabelValueRow(ui, x, width, y, L"Скорость полёта", text);
+    UiFormatUnsignedSuffix(text, MENU_TEXT_CAPACITY,
+        (uint32_t)settings->flySpeedBlocks, L" бл/с");
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Скорость полёта", text, UiScaled(ui, 6.0f));
     UiSliderInt(ui, WIDGET_FLY_SPEED_SLIDER, x, y, width,
         10, 200, &settings->flySpeedBlocks);
     return y + 20.0f * s + 12.0f * s + 2.0f * s;
@@ -590,7 +505,7 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 
     float panelX = ((float)width - panelWidth) * 0.5f;
     float panelY = ((float)height - panelHeight) * 0.5f;
-    DrawPanel(ui, panelX, panelY, panelWidth, panelHeight);
+    UiPanel(ui, panelX, panelY, panelWidth, panelHeight);
 
     float contentX = panelX + padding;
     float contentWidth = panelWidth - padding * 2.0f;

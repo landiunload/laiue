@@ -10,7 +10,7 @@
 // кадр заново собирают список квадов для RendererUiQueue. Состояние
 // между кадрами — только анимации наведения и захват мыши слайдером.
 
-#define UI_MAX_DRAW_QUADS 1024
+#define UI_MAX_DRAW_QUADS RENDERER_UI_MAX_QUADS
 #define UI_MAX_ANIMATIONS 48
 
 typedef struct UiAnimation
@@ -46,6 +46,17 @@ static inline uint32_t UiColor(uint32_t r, uint32_t g, uint32_t b, uint32_t a)
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
+// Единая палитра HUD, меню и виджетов.
+#define UI_COLOR_TEXT        UiColor(232, 236, 244, 255)
+#define UI_COLOR_TEXT_DIM    UiColor(150, 158, 172, 255)
+#define UI_COLOR_BUTTON      UiColor(42, 48, 62, 255)
+#define UI_COLOR_BUTTON_HOT  UiColor(58, 68, 88, 255)
+#define UI_COLOR_BUTTON_HELD UiColor(34, 40, 52, 255)
+#define UI_COLOR_ACCENT      UiColor(108, 148, 255, 255)
+#define UI_COLOR_TRACK       UiColor(30, 34, 44, 255)
+#define UI_COLOR_KNOB        UiColor(232, 236, 244, 255)
+#define UI_COLOR_PANEL       UiColor(22, 26, 34, 244)
+
 // Начало кадра интерфейса: масштаб, ввод, при необходимости перепекает
 // шрифт (после вызова проверить fontDirty и отдать атлас рендереру).
 // false — шрифт недоступен, интерфейс рисовать нельзя.
@@ -63,6 +74,12 @@ void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
 void UiTextCentered(UiContext* ui, float centerX, float lineTopY,
     uint32_t color, const wchar_t* text);
 float UiTextWidth(const UiContext* ui, const wchar_t* text);
+
+// Общие композиционные элементы. HUD и меню используют один стиль,
+// поэтому тени, панели и строки значений не дублируются по модулям.
+void UiPanel(UiContext* ui, float x, float y, float width, float height);
+float UiLabelValueRow(UiContext* ui, float x, float width, float y,
+    const wchar_t* label, const wchar_t* value, float bottomGap);
 
 // Анимация значения к цели (для наведения и переключателей).
 float UiAnimate(UiContext* ui, uint32_t id, bool towardOne);

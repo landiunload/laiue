@@ -1,7 +1,7 @@
 #include "api.h"
 #include "core/application_config.h"
 #include "core/chunk_streaming.h"
-#include "core/debug_overlay.h"
+#include "core/game_hud.h"
 #include "core/game_time.h"
 #include "core/math.h"
 #include "core/numeric.h"
@@ -39,15 +39,13 @@ typedef struct ApplicationState
     double fpsSampleStartSeconds;
     uint32_t fpsFrameCount;
     uint32_t framesPerSecond;
-    int64_t coordinateOverlayBlock[3];
-    bool overlayDirty;
 
     GameSettings settings;
     PanoramaCache panoramaCache;
     PauseMenu menu;
     UiContext ui;
+    GameHud hud;
     bool mouseLookBeforeMenu;
-    uint32_t overlayTimeMinutes;
 } ApplicationState;
 
 static void QueryWorldBlockPhysics(
@@ -122,7 +120,6 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     {
         application->camera.position[axis] -= (double)shift[axis];
     }
-    application->overlayDirty = true;
 
     int64_t centerX =
         FloorDoubleToInt64(application->camera.position[0]) >> CHUNK_SIZE_LOG2;
@@ -171,7 +168,6 @@ static bool SquareAbsoluteX(ApplicationState* application)
             application->gameMode = GAME_MODE_FLY;
         }
     }
-    application->overlayDirty = true;
 
     int64_t centerX = squaredLocalBlockX >> CHUNK_SIZE_LOG2;
     int64_t centerY =
@@ -195,45 +191,10 @@ static void RecordPresentedFrame(ApplicationState* application)
         return;
     }
 
-    uint32_t framesPerSecond = (uint32_t)(
+    application->framesPerSecond = (uint32_t)(
         (double)application->fpsFrameCount / elapsedSeconds + 0.5);
-    if (application->framesPerSecond != framesPerSecond)
-    {
-        application->framesPerSecond = framesPerSecond;
-        application->overlayDirty = true;
-    }
     application->fpsFrameCount = 0;
     application->fpsSampleStartSeconds = currentTimeSeconds;
-}
-
-static void UpdateOverlay(ApplicationState* application,
-    const int64_t cameraBlockPosition[3])
-{
-    uint32_t timeMinutes = (uint32_t)(
-        application->settings.timeOfDayHours * 60.0f) % 1440u;
-
-    if (!application->overlayDirty
-        && application->overlayTimeMinutes == timeMinutes
-        && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
-        && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
-        && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
-    {
-        return;
-    }
-
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        application->coordinateOverlayBlock[axis] =
-            cameraBlockPosition[axis];
-    }
-    application->overlayTimeMinutes = timeMinutes;
-
-    wchar_t text[160];
-    DebugOverlayBuildText(application->world, &application->player,
-        application->gameMode, application->framesPerSecond, timeMinutes,
-        cameraBlockPosition, text, 160);
-    WindowSetOverlayText(application->window, text);
-    application->overlayDirty = false;
 }
 
 static void HandleBlockEditing(ApplicationState* application)
@@ -295,7 +256,6 @@ static void ToggleGameMode(ApplicationState* application)
         application->gameMode = GAME_MODE_FLY;
         PlayerControllerReset(&application->player, &application->camera);
     }
-    application->overlayDirty = true;
 }
 
 static void UpdatePlayer(ApplicationState* application,
@@ -334,12 +294,9 @@ static void UpdatePlayer(ApplicationState* application,
 
     PlayerCollisionSource collision =
         CreatePlayerCollisionSource(application->world);
-    if (PlayerControllerUpdate(&application->player,
-            &collision, &application->camera, &command,
-            deltaSeconds))
-    {
-        application->overlayDirty = true;
-    }
+    PlayerControllerUpdate(&application->player,
+        &collision, &application->camera, &command,
+        deltaSeconds);
 }
 
 // Закрывает меню и возвращает игру: восстанавливает режим взгляда,
@@ -467,42 +424,45 @@ static void OnFrame(void* userData)
             - (double)cameraBlockPosition[axis]);
     }
 
-    UpdateOverlay(application, cameraBlockPosition);
-
     ChunkStreamingSetCenter(application->chunkStreaming,
         cameraBlockPosition[0] >> CHUNK_SIZE_LOG2,
         cameraBlockPosition[1] >> CHUNK_SIZE_LOG2,
         cameraBlockPosition[2] >> CHUNK_SIZE_LOG2);
     ChunkStreamingPump(application->chunkStreaming);
 
-    // Меню обновляется до начала кадра: замена атласа шрифта требует
-    // паузы GPU, а настройки должны примениться уже к этому кадру.
-    bool drawMenu = false;
+    // HUD и меню собираются одним UI-контекстом. При закрытом меню ввод
+    // виджетам не передаётся, но шрифт и HUD всё равно доступны с первого кадра.
+    int32_t cursorX = -1;
+    int32_t cursorY = -1;
+    bool mouseDown = false;
+    bool mousePressed = false;
     if (menuOpen)
     {
-        int32_t cursorX;
-        int32_t cursorY;
         WindowGetCursorClientPosition(application->window,
             &cursorX, &cursorY);
-        bool mouseDown = InputIsMouseButtonDown(
+        mouseDown = InputIsMouseButtonDown(
             application->input, INPUT_MOUSE_BUTTON_LEFT);
-        bool mousePressed = InputWasMouseButtonPressed(
+        mousePressed = InputWasMouseButtonPressed(
             application->input, INPUT_MOUSE_BUTTON_LEFT);
+    }
 
-        if (UiBegin(&application->ui,
-                application->windowWidth, application->windowHeight,
-                (float)cursorX, (float)cursorY,
-                mouseDown, mousePressed, deltaSeconds))
+    bool uiReady = UiBegin(&application->ui,
+        application->windowWidth, application->windowHeight,
+        (float)cursorX, (float)cursorY,
+        mouseDown, mousePressed, deltaSeconds);
+    if (uiReady)
+    {
+        if (application->ui.fontDirty
+            && RendererUiSetFontAtlas(application->renderer,
+                application->ui.font.atlas,
+                application->ui.font.atlasWidth,
+                application->ui.font.atlasHeight))
         {
-            if (application->ui.fontDirty
-                && RendererUiSetFontAtlas(application->renderer,
-                    application->ui.font.atlas,
-                    application->ui.font.atlasWidth,
-                    application->ui.font.atlasHeight))
-            {
-                application->ui.fontDirty = false;
-            }
+            application->ui.fontDirty = false;
+        }
 
+        if (menuOpen)
+        {
             PauseMenuAction action = PauseMenuUpdate(&application->menu,
                 &application->ui, &application->settings,
                 application->renderer,
@@ -517,17 +477,24 @@ static void OnFrame(void* userData)
             if (action == PAUSE_MENU_ACTION_RESUME)
             {
                 ResumeGame(application);
-            }
-            else
-            {
-                drawMenu = true;
+                application->ui.quadCount = 0;
             }
         }
         else
         {
-            // Шрифт недоступен — меню нарисовать нечем, не запираем игрока.
-            ResumeGame(application);
+            uint32_t timeMinutes = (uint32_t)(
+                application->settings.timeOfDayHours * 60.0f) % 1440u;
+            GameHudDraw(&application->hud, &application->ui,
+                application->world, &application->player,
+                application->gameMode, application->framesPerSecond,
+                timeMinutes, cameraBlockPosition,
+                application->windowWidth, application->windowHeight);
         }
+    }
+    else if (menuOpen)
+    {
+        // Шрифт недоступен — меню нарисовать нечем, не запираем игрока.
+        ResumeGame(application);
     }
 
     // Описание кадра: обычная перспектива или панорама по граням кубмапы.
@@ -565,7 +532,7 @@ static void OnFrame(void* userData)
                 cameraBlockPosition);
         }
 
-        if (drawMenu)
+        if (uiReady && application->ui.quadCount > 0)
         {
             RendererUiQueue(application->renderer,
                 application->ui.quads, application->ui.quadCount);
@@ -662,7 +629,6 @@ LAIUE_CORE_API void Start(void)
     application->windowHeight = clientHeight;
     application->previousTimeSeconds = startTimeSeconds;
     application->fpsSampleStartSeconds = startTimeSeconds;
-    application->overlayDirty = true;
     application->settings.fovDegrees =
         g_applicationConfiguration.defaultFieldOfViewDegrees;
     application->settings.projection = RENDER_PROJECTION_AUTO;
@@ -679,6 +645,7 @@ LAIUE_CORE_API void Start(void)
     application->settings.applyTexturePack = false;
     application->settings.applyShaderPack = false;
 
+    GameHudInit(&application->hud);
     PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);
 
