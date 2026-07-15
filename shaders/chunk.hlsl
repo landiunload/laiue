@@ -4,10 +4,14 @@ cbuffer FrameConstants : register(b0)
 {
     float4x4 viewProjection;
     float3 chunkOriginRelative;
+    float3 sunDirection;    // единичный, от источника света к миру
+    float3 sunColor;
+    float3 ambientColor;
 };
 
 ByteAddressBuffer quadBuffer : register(t0);
 Texture2DArray blockTextures : register(t1);
+Texture2DArray blockNormals : register(t2);   // RGB — нормаль, A — AO
 SamplerState blockSampler : register(s0);
 
 struct PixelInput
@@ -84,7 +88,30 @@ PixelInput VSMain(uint vertexId : SV_VertexID)
     return output;
 }
 
+// Небесная окклюзия граней: имитация того, что верх видит больше неба.
 static const float FACE_SHADE[6] = { 0.80, 0.80, 0.90, 0.70, 1.00, 0.55 };
+
+// Касательные пространства граней в координатах мира: T — вдоль +U
+// текстуры, B — «вверх» текстуры (в сторону уменьшения V), N — наружу.
+// Согласовано с выбором UV в VSMain.
+static const float3 FACE_TANGENT[6] =
+{
+    float3(0, 1, 0), float3(0, 1, 0),   // +X, -X: U вдоль Y
+    float3(1, 0, 0), float3(1, 0, 0),   // +Y, -Y: U вдоль X
+    float3(1, 0, 0), float3(1, 0, 0),   // +Z, -Z: U вдоль X
+};
+static const float3 FACE_BITANGENT[6] =
+{
+    float3(0, 0, 1), float3(0, 0, 1),   // V = -Z => вверх текстуры +Z
+    float3(0, 0, 1), float3(0, 0, 1),
+    float3(0, -1, 0), float3(0, -1, 0), // V = +Y => вверх текстуры -Y
+};
+static const float3 FACE_NORMAL[6] =
+{
+    float3(1, 0, 0), float3(-1, 0, 0),
+    float3(0, 1, 0), float3(0, -1, 0),
+    float3(0, 0, 1), float3(0, 0, -1),
+};
 
 float4 PSMain(PixelInput input) : SV_TARGET
 {
@@ -92,5 +119,20 @@ float4 PSMain(PixelInput input) : SV_TARGET
     uint textureLayer = input.surface >> 3;
     float3 textureLocation = float3(input.textureCoordinates, textureLayer);
     float3 baseColor = blockTextures.Sample(blockSampler, textureLocation).rgb;
-    return float4(baseColor * FACE_SHADE[face], 1.0);
+
+    float4 normalSample = blockNormals.Sample(blockSampler, textureLocation);
+    float3 tangentNormal = normalSample.rgb * 2.0 - 1.0;
+    float occlusion = normalSample.a;
+
+    float3 worldNormal = normalize(
+        FACE_TANGENT[face] * tangentNormal.x
+        + FACE_BITANGENT[face] * tangentNormal.y
+        + FACE_NORMAL[face] * tangentNormal.z);
+
+    // Ламберт от солнца/луны + ambient с небесной окклюзией грани.
+    // AO гасит ambient целиком, прямой свет — наполовину.
+    float diffuse = saturate(dot(worldNormal, -sunDirection));
+    float3 light = ambientColor * (FACE_SHADE[face] * occlusion)
+        + sunColor * (diffuse * (0.55 + 0.45 * occlusion));
+    return float4(baseColor * light, 1.0);
 }

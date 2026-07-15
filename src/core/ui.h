@@ -76,6 +76,12 @@ bool UiToggle(UiContext* ui, uint32_t id, float x, float y, bool* value);
 bool UiRadioRow(UiContext* ui, uint32_t id, float x, float y,
     float width, float height, const wchar_t* label, bool selected);
 
+// Сегментные вкладки: равные сегменты по всей ширине; true — активная
+// вкладка сменилась (индекс пишется в activeIndex).
+bool UiSegmented(UiContext* ui, uint32_t id, float x, float y,
+    float width, float height, const wchar_t* const* labels,
+    int32_t count, int32_t* activeIndex);
+
 // Размеры виджетов в масштабированных пикселях.
 static inline float UiScaled(const UiContext* ui, float value)
 {

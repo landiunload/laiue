@@ -18,11 +18,13 @@
 
 #define FRAME_COUNT 2
 
-// Общая шейдерная куча SRV: фиксированные слоты.
+// Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
+// блоков соседствуют — таблица чанкового прохода накрывает оба (t1, t2).
 #define SRV_SLOT_BLOCK_TEXTURES 0
-#define SRV_SLOT_PANORAMA_CUBE  1
-#define SRV_SLOT_FONT_ATLAS     2
-#define SRV_SLOT_COUNT          3
+#define SRV_SLOT_BLOCK_NORMALS  1
+#define SRV_SLOT_PANORAMA_CUBE  2
+#define SRV_SLOT_FONT_ATLAS     3
+#define SRV_SLOT_COUNT          4
 
 // Слой UI: до 2048 квадов на кадр (по 48 байт — держать в синхроне
 // с shaders/ui.hlsl), кольцо из FRAME_COUNT upload-буферов.
@@ -32,10 +34,14 @@
 // Резолв панорамы: раскладка корневых констант.
 #define RESOLVE_ROOT_CONSTANT_COUNT 3
 
-// Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl):
-// dword 0..15 — view-projection, 16..18 — смещение чанка относительно камеры.
-#define ROOT_CONSTANT_COUNT 19
+// Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl,
+// float3 выравниваются по границам 16 байт):
+// dword 0..15 — view-projection, 16..18 — смещение чанка,
+// 20..22 — направление от солнца, 24..26 — цвет солнца, 28..30 — ambient.
+#define ROOT_CONSTANT_COUNT 31
 #define ROOT_CONSTANT_ORIGIN_OFFSET 16
+#define ROOT_CONSTANT_LIGHTING_OFFSET 20
+#define ROOT_CONSTANT_LIGHTING_COUNT 11
 #define ROOT_PARAMETER_CONSTANTS 0
 #define ROOT_PARAMETER_QUAD_BUFFER 1
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
@@ -122,6 +128,8 @@ struct Renderer
     ID3D12PipelineState*       pipelineState;
     ID3D12Resource*            blockTexture;
     ID3D12Resource*            blockTextureUpload;
+    ID3D12Resource*            blockNormalTexture;
+    ID3D12Resource*            blockNormalUpload;
     ID3D12DescriptorHeap*      srvHeap;
     UINT                       srvDescriptorSize;
     bool                       blockTextureUploadPending;
@@ -449,10 +457,11 @@ static bool CreateRootSignature(Renderer* renderer)
     parameters[ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     parameters[ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
 
+    // t1 — albedo, t2 — нормали: соседние слоты одной таблицы.
     D3D12_DESCRIPTOR_RANGE textureRange;
     memset(&textureRange, 0, sizeof(textureRange));
     textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    textureRange.NumDescriptors = 1;
+    textureRange.NumDescriptors = 2;
     textureRange.BaseShaderRegister = 1;
     textureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     parameters[ROOT_PARAMETER_BLOCK_TEXTURES].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -523,56 +532,52 @@ static bool CreatePipelineState(Renderer* renderer)
     description.SampleMask = 0xFFFFFFFF;
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
     return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
         &IID_ID3D12PipelineState, (void**)&renderer->pipelineState));
 }
 
-static bool CreateBlockTexture(Renderer* renderer)
-{
-    TexturePackData pack;
-    TexturePackLoadActive(&pack);
-    if (pack.pixels == NULL)
-    {
-        return false;
-    }
+// Общий путь создания texture array блоков (albedo или нормали):
+// DEFAULT-текстура + upload-буфер с подресурсами, SRV в заданный слот.
+typedef bool (*PackSubresourceGetter)(const TexturePackData* pack,
+    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
 
-    bool succeeded = false;
-    UINT subresourceCount = pack.layerCount * pack.mipCount;
+static bool CreateBlockArrayTexture(Renderer* renderer,
+    const TexturePackData* pack, PackSubresourceGetter getSubresource,
+    uint32_t srvSlot, DXGI_FORMAT format,
+    ID3D12Resource** outTexture, ID3D12Resource** outUpload)
+{
+    UINT subresourceCount = (UINT)pack->layerCount * pack->mipCount;
     if (subresourceCount == 0 || subresourceCount > MAX_TEXTURE_SUBRESOURCES)
     {
-        TexturePackRelease(&pack);
         return false;
     }
 
     D3D12_RESOURCE_DESC textureDescription;
     memset(&textureDescription, 0, sizeof(textureDescription));
     textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    textureDescription.Width = pack.width;
-    textureDescription.Height = pack.height;
-    textureDescription.DepthOrArraySize = (UINT16)pack.layerCount;
-    textureDescription.MipLevels = (UINT16)pack.mipCount;
-    textureDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDescription.Width = pack->width;
+    textureDescription.Height = pack->height;
+    textureDescription.DepthOrArraySize = (UINT16)pack->layerCount;
+    textureDescription.MipLevels = (UINT16)pack->mipCount;
+    textureDescription.Format = format;
     textureDescription.SampleDesc.Count = 1;
     textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
     D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
     if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &defaultHeap,
         D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST,
-        NULL, &IID_ID3D12Resource, (void**)&renderer->blockTexture)))
+        NULL, &IID_ID3D12Resource, (void**)outTexture)))
     {
-        TexturePackRelease(&pack);
         return false;
     }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
-    UINT rowCounts[MAX_TEXTURE_SUBRESOURCES];
-    UINT64 rowSizes[MAX_TEXTURE_SUBRESOURCES];
     UINT64 uploadBytes = 0;
     ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
-        0, subresourceCount, 0, layouts, rowCounts, rowSizes, &uploadBytes);
+        0, subresourceCount, 0, layouts, NULL, NULL, &uploadBytes);
 
     D3D12_RESOURCE_DESC uploadDescription;
     memset(&uploadDescription, 0, sizeof(uploadDescription));
@@ -587,31 +592,27 @@ static bool CreateBlockTexture(Renderer* renderer)
     D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
     if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &uploadHeap,
         D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
-        NULL, &IID_ID3D12Resource, (void**)&renderer->blockTextureUpload)))
+        NULL, &IID_ID3D12Resource, (void**)outUpload)))
     {
-        TexturePackRelease(&pack);
         return false;
     }
 
     D3D12_RANGE emptyRange = { 0, 0 };
     unsigned char* mapped = NULL;
-    if (FAILED(ID3D12Resource_Map(renderer->blockTextureUpload, 0,
-        &emptyRange, (void**)&mapped)))
+    if (FAILED(ID3D12Resource_Map(*outUpload, 0, &emptyRange, (void**)&mapped)))
     {
-        TexturePackRelease(&pack);
         return false;
     }
 
-    for (uint32_t layer = 0; layer < pack.layerCount; ++layer)
+    for (uint32_t layer = 0; layer < pack->layerCount; ++layer)
     {
-        for (uint32_t mip = 0; mip < pack.mipCount; ++mip)
+        for (uint32_t mip = 0; mip < pack->mipCount; ++mip)
         {
-            UINT index = layer * pack.mipCount + mip;
+            UINT index = layer * pack->mipCount + mip;
             TexturePackSubresource subresource;
-            if (!TexturePackGetSubresource(&pack, layer, mip, &subresource))
+            if (!getSubresource(pack, layer, mip, &subresource))
             {
-                ID3D12Resource_Unmap(renderer->blockTextureUpload, 0, NULL);
-                TexturePackRelease(&pack);
+                ID3D12Resource_Unmap(*outUpload, 0, NULL);
                 return false;
             }
             unsigned char* destination = mapped + layouts[index].Offset;
@@ -623,21 +624,67 @@ static bool CreateBlockTexture(Renderer* renderer)
             }
         }
     }
-    ID3D12Resource_Unmap(renderer->blockTextureUpload, 0, NULL);
+    ID3D12Resource_Unmap(*outUpload, 0, NULL);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
     memset(&viewDescription, 0, sizeof(viewDescription));
     viewDescription.Format = textureDescription.Format;
     viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    viewDescription.Texture2DArray.MipLevels = pack.mipCount;
-    viewDescription.Texture2DArray.ArraySize = pack.layerCount;
+    viewDescription.Texture2DArray.MipLevels = pack->mipCount;
+    viewDescription.Texture2DArray.ArraySize = pack->layerCount;
 
-    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->blockTexture,
-        &viewDescription, SrvCpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
-    renderer->blockTextureUploadPending = true;
-    succeeded = true;
+    ID3D12Device_CreateShaderResourceView(renderer->device, *outTexture,
+        &viewDescription, SrvCpuHandle(renderer, srvSlot));
+    return true;
+}
 
+static bool CreateBlockTexture(Renderer* renderer)
+{
+    TexturePackData pack;
+    TexturePackLoadActive(&pack);
+    if (pack.pixels == NULL)
+    {
+        return false;
+    }
+
+    // Albedo хранится в sRGB (декод при выборке), нормали — линейные.
+    bool succeeded = CreateBlockArrayTexture(renderer, &pack,
+        TexturePackGetSubresource, SRV_SLOT_BLOCK_TEXTURES,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        &renderer->blockTexture, &renderer->blockTextureUpload);
+
+    if (succeeded && pack.normalPixels != NULL)
+    {
+        succeeded = CreateBlockArrayTexture(renderer, &pack,
+            TexturePackGetNormalSubresource, SRV_SLOT_BLOCK_NORMALS,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &renderer->blockNormalTexture, &renderer->blockNormalUpload);
+    }
+    else if (succeeded)
+    {
+        // Пак без нормалей (LTP1): плоская нормаль 1x1 на каждый слой,
+        // AO = 1 — освещение вырождается в чистый ламберт по граням.
+        static const uint8_t flatNormalPixels[TEXTURE_PACK_LAYER_COUNT * 4] = {
+            128, 128, 255, 255,
+            128, 128, 255, 255,
+            128, 128, 255, 255,
+        };
+        TexturePackData flat = {
+            .width = 1,
+            .height = 1,
+            .layerCount = TEXTURE_PACK_LAYER_COUNT,
+            .mipCount = 1,
+            .pixels = flatNormalPixels,
+            .pixelBytes = sizeof(flatNormalPixels),
+        };
+        succeeded = CreateBlockArrayTexture(renderer, &flat,
+            TexturePackGetSubresource, SRV_SLOT_BLOCK_NORMALS,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &renderer->blockNormalTexture, &renderer->blockNormalUpload);
+    }
+
+    renderer->blockTextureUploadPending = succeeded;
     TexturePackRelease(&pack);
     return succeeded;
 }
@@ -716,7 +763,7 @@ static bool CreateResolvePipelineState(Renderer* renderer)
     description.SampleMask = 0xFFFFFFFF;
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
     return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
@@ -809,7 +856,7 @@ static bool CreateUiPipelineState(Renderer* renderer)
     description.SampleMask = 0xFFFFFFFF;
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
     return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
@@ -883,13 +930,13 @@ static bool EnsureCubeResources(Renderer* renderer, uint32_t resolution)
     colorDescription.Height = resolution;
     colorDescription.DepthOrArraySize = 6;
     colorDescription.MipLevels = 1;
-    colorDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colorDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     colorDescription.SampleDesc.Count = 1;
     colorDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     colorDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     D3D12_CLEAR_VALUE colorClear = {
-        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         .Color = { 0.4f, 0.6f, 0.9f, 1.0f },
     };
 
@@ -932,7 +979,7 @@ static bool EnsureCubeResources(Renderer* renderer, uint32_t resolution)
     {
         D3D12_RENDER_TARGET_VIEW_DESC rtvDescription;
         memset(&rtvDescription, 0, sizeof(rtvDescription));
-        rtvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rtvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         rtvDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         rtvDescription.Texture2DArray.FirstArraySlice = face;
         rtvDescription.Texture2DArray.ArraySize = 1;
@@ -947,7 +994,7 @@ static bool EnsureCubeResources(Renderer* renderer, uint32_t resolution)
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription;
     memset(&srvDescription, 0, sizeof(srvDescription));
-    srvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     srvDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
     srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDescription.TextureCube.MipLevels = 1;
@@ -1116,6 +1163,13 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
 
     renderer->renderTargetViewSize = ID3D12Device_GetDescriptorHandleIncrementSize(renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
+    // Swapchain остаётся UNORM (требование flip-модели), но RTV — sRGB:
+    // шейдеры работают в линейном свете, кодирование выполняет вывод.
+    D3D12_RENDER_TARGET_VIEW_DESC backBufferViewDescription;
+    memset(&backBufferViewDescription, 0, sizeof(backBufferViewDescription));
+    backBufferViewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    backBufferViewDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
     for (UINT i = 0; i < FRAME_COUNT; ++i)
@@ -1125,7 +1179,8 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
             RendererDestroy(renderer);
             return NULL;
         }
-        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i], NULL, renderTargetViewHandle);
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i],
+            &backBufferViewDescription, renderTargetViewHandle);
         renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
     }
 
@@ -1254,6 +1309,8 @@ void RendererDestroy(Renderer* renderer)
 
     if (renderer->blockTextureUpload != NULL) ID3D12Resource_Release(renderer->blockTextureUpload);
     if (renderer->blockTexture != NULL) ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->blockNormalUpload != NULL) ID3D12Resource_Release(renderer->blockNormalUpload);
+    if (renderer->blockNormalTexture != NULL) ID3D12Resource_Release(renderer->blockNormalTexture);
     if (renderer->srvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->srvHeap);
 
     if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
@@ -1406,15 +1463,11 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
 }
 
-static void RecordBlockTextureUpload(Renderer* renderer)
+static void RecordTextureArrayUpload(Renderer* renderer,
+    ID3D12Resource* texture, ID3D12Resource** upload)
 {
-    if (!renderer->blockTextureUploadPending)
-    {
-        return;
-    }
-
     D3D12_RESOURCE_DESC description;
-    ID3D12Resource_GetDesc(renderer->blockTexture, &description);
+    ID3D12Resource_GetDesc(texture, &description);
     UINT subresourceCount = (UINT)description.DepthOrArraySize * description.MipLevels;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
     ID3D12Device_GetCopyableFootprints(renderer->device, &description,
@@ -1424,13 +1477,13 @@ static void RecordBlockTextureUpload(Renderer* renderer)
     {
         D3D12_TEXTURE_COPY_LOCATION destination;
         memset(&destination, 0, sizeof(destination));
-        destination.pResource = renderer->blockTexture;
+        destination.pResource = texture;
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = index;
 
         D3D12_TEXTURE_COPY_LOCATION source;
         memset(&source, 0, sizeof(source));
-        source.pResource = renderer->blockTextureUpload;
+        source.pResource = *upload;
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = layouts[index];
 
@@ -1438,12 +1491,25 @@ static void RecordBlockTextureUpload(Renderer* renderer)
             &destination, 0, 0, 0, &source, NULL);
     }
 
-    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->blockTexture,
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(texture,
         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
 
-    DeferResourceRelease(renderer, renderer->blockTextureUpload);
-    renderer->blockTextureUpload = NULL;
+    DeferResourceRelease(renderer, *upload);
+    *upload = NULL;
+}
+
+static void RecordBlockTextureUpload(Renderer* renderer)
+{
+    if (!renderer->blockTextureUploadPending)
+    {
+        return;
+    }
+
+    RecordTextureArrayUpload(renderer,
+        renderer->blockTexture, &renderer->blockTextureUpload);
+    RecordTextureArrayUpload(renderer,
+        renderer->blockNormalTexture, &renderer->blockNormalUpload);
     renderer->blockTextureUploadPending = false;
 }
 
@@ -1534,6 +1600,11 @@ static bool ApplyPendingResize(Renderer* renderer)
         renderer->fenceValues[i] = currentFenceValue;
     }
 
+    D3D12_RENDER_TARGET_VIEW_DESC backBufferViewDescription;
+    memset(&backBufferViewDescription, 0, sizeof(backBufferViewDescription));
+    backBufferViewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    backBufferViewDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
     for (UINT i = 0; i < FRAME_COUNT; ++i)
@@ -1542,7 +1613,8 @@ static bool ApplyPendingResize(Renderer* renderer)
         {
             return false;
         }
-        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i], NULL, renderTargetViewHandle);
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i],
+            &backBufferViewDescription, renderTargetViewHandle);
         renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
     }
 
@@ -1649,6 +1721,16 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
         ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+    // Свет кадра: float3 в cbuffer выровнены по 16 байт, между ними pad.
+    float lighting[ROOT_CONSTANT_LIGHTING_COUNT] = {
+        frame->sunDirection[0], frame->sunDirection[1], frame->sunDirection[2], 0.0f,
+        frame->sunColor[0], frame->sunColor[1], frame->sunColor[2], 0.0f,
+        frame->ambientColor[0], frame->ambientColor[1], frame->ambientColor[2],
+    };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_LIGHTING_COUNT, lighting,
+        ROOT_CONSTANT_LIGHTING_OFFSET);
+
     return true;
 }
 
@@ -1701,7 +1783,12 @@ void RendererBeginScenePass(Renderer* renderer, uint32_t passIndex)
     ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
         1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
 
-    const float clearColor[4] = { 0.4f, 0.6f, 0.9f, 1.0f };
+    const float clearColor[4] = {
+        renderer->frame.skyColor[0],
+        renderer->frame.skyColor[1],
+        renderer->frame.skyColor[2],
+        1.0f,
+    };
     ID3D12GraphicsCommandList_ClearRenderTargetView(renderer->commandList,
         renderTargetViewHandle, clearColor, 1, &scissor);
     ID3D12GraphicsCommandList_ClearDepthStencilView(renderer->commandList,

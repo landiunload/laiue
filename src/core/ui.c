@@ -281,6 +281,61 @@ bool UiToggle(UiContext* ui, uint32_t id, float x, float y, bool* value)
     return changed;
 }
 
+bool UiSegmented(UiContext* ui, uint32_t id, float x, float y,
+    float width, float height, const wchar_t* const* labels,
+    int32_t count, int32_t* activeIndex)
+{
+    if (count <= 0)
+    {
+        return false;
+    }
+
+    float radius = UiScaled(ui, 8.0f);
+    UiRect(ui, x, y, width, height, radius, UI_COLOR_TRACK);
+
+    float inset = UiScaled(ui, 3.0f);
+    float segmentWidth = (width - inset * 2.0f) / (float)count;
+    bool changed = false;
+
+    for (int32_t index = 0; index < count; ++index)
+    {
+        float segmentX = x + inset + segmentWidth * (float)index;
+        float segmentY = y + inset;
+        float segmentHeight = height - inset * 2.0f;
+
+        bool active = *activeIndex == index;
+        bool hovered = ui->activeId == 0
+            && MouseInside(ui, segmentX, segmentY, segmentWidth, segmentHeight);
+        if (hovered && ui->mousePressed && !active)
+        {
+            *activeIndex = index;
+            active = true;
+            changed = true;
+        }
+
+        float selection = UiAnimate(ui, id + (uint32_t)index, active);
+        float hover = UiAnimate(ui, (id + (uint32_t)index) ^ 0x10000000u,
+            hovered && !active);
+
+        if (selection > 0.01f || hover > 0.01f)
+        {
+            uint32_t background = LerpColor(
+                UiColor(58, 68, 88, 0), UiColor(58, 68, 88, 200), hover);
+            background = LerpColor(background,
+                UiColor(74, 96, 150, 255), selection);
+            UiRect(ui, segmentX, segmentY, segmentWidth, segmentHeight,
+                radius - inset > 0.0f ? radius - inset : 0.0f, background);
+        }
+
+        float textTop = segmentY + (segmentHeight - ui->font.lineHeight) * 0.5f;
+        UiTextCentered(ui, segmentX + segmentWidth * 0.5f, textTop,
+            LerpColor(UI_COLOR_TEXT_DIM, UI_COLOR_TEXT, selection),
+            labels[index]);
+    }
+
+    return changed;
+}
+
 bool UiRadioRow(UiContext* ui, uint32_t id, float x, float y,
     float width, float height, const wchar_t* label, bool selected)
 {

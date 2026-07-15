@@ -54,6 +54,13 @@ typedef struct RendererFrameSetup
     float resolveVerticalScale;            // вертикальный параметр проекции
     uint32_t passCount;
     RendererScenePass passes[RENDERER_MAX_SCENE_PASSES];
+
+    // Свет кадра (цикл дня и ночи задаёт ядро; рендерер лишь передаёт
+    // значения шейдеру и очищает цели цветом неба).
+    float sunDirection[3];   // единичный, от источника к миру
+    float sunColor[3];
+    float ambientColor[3];
+    float skyColor[3];
 } RendererFrameSetup;
 
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);

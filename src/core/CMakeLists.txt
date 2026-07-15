@@ -7,6 +7,8 @@ laiue_add_module(core
         chunk_streaming.h
         debug_overlay.c
         debug_overlay.h
+        game_time.c
+        game_time.h
         math.c
         math.h
         numeric.h

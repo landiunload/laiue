@@ -211,7 +211,7 @@ Window* WindowCreate(const WindowConfiguration* configuration)
         L"STATIC",
         L"",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-        8, 8, 300, 72,
+        8, 8, 300, 92,
         window->handle,
         NULL,
         instance,

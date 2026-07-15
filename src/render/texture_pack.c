@@ -4,8 +4,10 @@
 
 #define LTP_MAGIC       0x3150544Cu
 #define LTP_VERSION     1u
+#define LTP_VERSION_NORMALS 2u
 #define LTP_HEADER_SIZE 24u
 #define LTP_FORMAT_RGBA8 1u
+#define LTP_FORMAT_RGBA8_NORMALS 2u
 
 #define ACTIVE_NAME_MAX_BYTES 128u
 #define PATH_CAPACITY_CHARS   32768u
@@ -39,6 +41,7 @@ static void SetFallback(TexturePackData* pack)
     pack->mipCount = 1;
     pack->pixels = g_fallbackPixels;
     pack->pixelBytes = sizeof(g_fallbackPixels);
+    pack->normalPixels = NULL;
 }
 
 static uint32_t LiteralLength(const wchar_t* text)
@@ -252,17 +255,24 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
     uint32_t format = ReadU32Le(header + 16);
     uint32_t dataBytes = ReadU32Le(header + 20);
 
-    uint32_t expectedBytes = 0;
+    // Версия 1 — только albedo; версия 2 — albedo + идентичный по
+    // раскладке блок карт нормалей сразу за ним.
+    bool withNormals = version == LTP_VERSION_NORMALS
+        && format == LTP_FORMAT_RGBA8_NORMALS;
+    bool versionValid = withNormals
+        || (version == LTP_VERSION && format == LTP_FORMAT_RGBA8);
+
+    uint32_t albedoBytes = 0;
     bool valid = magic == LTP_MAGIC
-        && version == LTP_VERSION
+        && versionValid
         && headerSize == LTP_HEADER_SIZE
         && width > 0 && width <= TEXTURE_MAX_DIMENSION
         && height > 0 && height <= TEXTURE_MAX_DIMENSION
         && layerCount == TEXTURE_PACK_LAYER_COUNT
         && mipCount == FullMipCount(width, height)
-        && format == LTP_FORMAT_RGBA8
-        && CalculatePayloadBytes(width, height, layerCount, mipCount, &expectedBytes)
-        && dataBytes == expectedBytes
+        && CalculatePayloadBytes(width, height, layerCount, mipCount, &albedoBytes)
+        && albedoBytes <= UINT32_MAX / 2u
+        && dataBytes == (withNormals ? albedoBytes * 2u : albedoBytes)
         && fileSize.QuadPart == (LONGLONG)LTP_HEADER_SIZE + dataBytes;
     if (!valid)
     {
@@ -284,7 +294,8 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
     outPack->layerCount = layerCount;
     outPack->mipCount = mipCount;
     outPack->pixels = pixels;
-    outPack->pixelBytes = dataBytes;
+    outPack->pixelBytes = albedoBytes;
+    outPack->normalPixels = withNormals ? pixels + albedoBytes : NULL;
     return true;
 }
 
@@ -336,10 +347,11 @@ void TexturePackLoadActive(TexturePackData* outPack)
     HeapFree(GetProcessHeap(), 0, path);
 }
 
-bool TexturePackGetSubresource(const TexturePackData* pack,
-    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource)
+static bool GetSubresourceFrom(const TexturePackData* pack,
+    const uint8_t* base, uint32_t layer, uint32_t mip,
+    TexturePackSubresource* outSubresource)
 {
-    if (pack == NULL || outSubresource == NULL || pack->pixels == NULL
+    if (pack == NULL || outSubresource == NULL || base == NULL
         || layer >= pack->layerCount || mip >= pack->mipCount)
     {
         return false;
@@ -371,12 +383,26 @@ bool TexturePackGetSubresource(const TexturePackData* pack,
         return false;
     }
 
-    outSubresource->pixels = pack->pixels + (size_t)offset;
+    outSubresource->pixels = base + (size_t)offset;
     outSubresource->width = width;
     outSubresource->height = height;
     outSubresource->rowBytes = width * 4u;
     outSubresource->byteCount = (uint32_t)byteCount;
     return true;
+}
+
+bool TexturePackGetSubresource(const TexturePackData* pack,
+    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource)
+{
+    return GetSubresourceFrom(pack,
+        pack != NULL ? pack->pixels : NULL, layer, mip, outSubresource);
+}
+
+bool TexturePackGetNormalSubresource(const TexturePackData* pack,
+    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource)
+{
+    return GetSubresourceFrom(pack,
+        pack != NULL ? pack->normalPixels : NULL, layer, mip, outSubresource);
 }
 
 void TexturePackRelease(TexturePackData* pack)
@@ -395,4 +421,5 @@ void TexturePackRelease(TexturePackData* pack)
     pack->mipCount = 0;
     pack->pixels = NULL;
     pack->pixelBytes = 0;
+    pack->normalPixels = NULL;
 }

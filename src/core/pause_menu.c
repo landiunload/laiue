@@ -7,9 +7,28 @@ enum
     WIDGET_SETTINGS,
     WIDGET_QUIT,
     WIDGET_BACK,
-    WIDGET_FOV_SLIDER,
+    WIDGET_TABS = 8,             // + индекс вкладки
+    WIDGET_FOV_SLIDER = 16,
     WIDGET_VSYNC,
-    WIDGET_PROJECTION_FIRST = 16,
+    WIDGET_TIME_SLIDER,
+    WIDGET_SENSITIVITY_SLIDER,
+    WIDGET_FLY_SPEED_SLIDER,
+    WIDGET_PROJECTION_FIRST = 32,
+    WIDGET_TIME_SPEED_FIRST = 48,
+};
+
+enum
+{
+    SETTINGS_TAB_GRAPHICS = 0,
+    SETTINGS_TAB_ADMIN,
+    SETTINGS_TAB_CONTROLS,
+    SETTINGS_TAB_COUNT,
+};
+
+static const wchar_t* const TAB_LABELS[SETTINGS_TAB_COUNT] = {
+    L"Графика",
+    L"Админ",
+    L"Управление",
 };
 
 static const wchar_t* const PROJECTION_LABELS[RENDER_PROJECTION_COUNT] = {
@@ -19,27 +38,71 @@ static const wchar_t* const PROJECTION_LABELS[RENDER_PROJECTION_COUNT] = {
     L"Панорама (цилиндр)",
 };
 
+#define MENU_TEXT_CAPACITY 48
+
+static void AppendChar(wchar_t* buffer, uint32_t capacity,
+    uint32_t* length, wchar_t character)
+{
+    if (*length + 1u < capacity)
+    {
+        buffer[(*length)++] = character;
+    }
+    buffer[*length] = L'\0';
+}
+
+static void AppendUnsigned(wchar_t* buffer, uint32_t capacity,
+    uint32_t* length, uint32_t value)
+{
+    wchar_t digits[12];
+    uint32_t digitCount = 0;
+    do
+    {
+        digits[digitCount++] = (wchar_t)(L'0' + value % 10u);
+        value /= 10u;
+    }
+    while (value != 0u && digitCount < 11u);
+    while (digitCount > 0u)
+    {
+        AppendChar(buffer, capacity, length, digits[--digitCount]);
+    }
+}
+
+static void AppendString(wchar_t* buffer, uint32_t capacity,
+    uint32_t* length, const wchar_t* text)
+{
+    while (*text != L'\0')
+    {
+        AppendChar(buffer, capacity, length, *text++);
+    }
+}
+
 static void FormatDegrees(wchar_t* buffer, uint32_t capacity, int32_t value)
 {
-    wchar_t digits[8];
-    uint32_t digitCount = 0;
-    if (value <= 0)
-    {
-        digits[digitCount++] = L'0';
-    }
-    while (value > 0 && digitCount < 7)
-    {
-        digits[digitCount++] = (wchar_t)(L'0' + value % 10);
-        value /= 10;
-    }
+    uint32_t length = 0;
+    buffer[0] = L'\0';
+    AppendUnsigned(buffer, capacity, &length, value < 0 ? 0u : (uint32_t)value);
+    AppendChar(buffer, capacity, &length, 0x00B0);
+}
 
-    uint32_t out = 0;
-    while (digitCount > 0 && out + 2 < capacity)
-    {
-        buffer[out++] = digits[--digitCount];
-    }
-    buffer[out++] = 0x00B0; // знак градуса
-    buffer[out] = L'\0';
+static void FormatClock(wchar_t* buffer, uint32_t capacity, uint32_t minutes)
+{
+    uint32_t length = 0;
+    buffer[0] = L'\0';
+    uint32_t hours = (minutes / 60u) % 24u;
+    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + hours / 10u));
+    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + hours % 10u));
+    AppendChar(buffer, capacity, &length, L':');
+    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + (minutes % 60u) / 10u));
+    AppendChar(buffer, capacity, &length, (wchar_t)(L'0' + minutes % 10u));
+}
+
+static void FormatValueSuffix(wchar_t* buffer, uint32_t capacity,
+    int32_t value, const wchar_t* suffix)
+{
+    uint32_t length = 0;
+    buffer[0] = L'\0';
+    AppendUnsigned(buffer, capacity, &length, value < 0 ? 0u : (uint32_t)value);
+    AppendString(buffer, capacity, &length, suffix);
 }
 
 void PauseMenuOpen(PauseMenu* menu)
@@ -126,27 +189,186 @@ static const wchar_t* ProjectionCaption(const GameSettings* settings)
     }
 }
 
+// Строка «подпись слева, значение справа»; возвращает следующий cursorY.
+static float LabelValueRow(UiContext* ui, float x, float width, float y,
+    const wchar_t* label, const wchar_t* value)
+{
+    UiText(ui, x, y, UiColor(232, 236, 244, 255), label);
+    UiText(ui, x + width - UiTextWidth(ui, value), y,
+        UiColor(108, 148, 255, 255), value);
+    return y + ui->font.lineHeight + UiScaled(ui, 6.0f);
+}
+
+static float GraphicsTabHeight(const UiContext* ui)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    return (line + 6.0f * s) + (20.0f * s + 4.0f * s) + (line + 12.0f * s)
+        + (line + 6.0f * s)
+        + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 12.0f * s
+        + 30.0f * s + 14.0f * s;
+}
+
+static float AdminTabHeight(const UiContext* ui)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    return (line + 6.0f * s) + (20.0f * s + 4.0f * s) + (line + 12.0f * s)
+        + (line + 6.0f * s)
+        + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 14.0f * s;
+}
+
+static float ControlsTabHeight(const UiContext* ui)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    return ((line + 6.0f * s) + (20.0f * s + 12.0f * s)) * 2.0f + 2.0f * s;
+}
+
+static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
+    Renderer* renderer, float x, float width, float y)
+{
+    float s = ui->scale;
+    wchar_t text[MENU_TEXT_CAPACITY];
+
+    FormatDegrees(text, MENU_TEXT_CAPACITY, settings->fovDegrees);
+    y = LabelValueRow(ui, x, width, y, L"Поле зрения", text);
+
+    int32_t fov = settings->fovDegrees;
+    if (UiSliderInt(ui, WIDGET_FOV_SLIDER, x, y, width, 0, 360, &fov))
+    {
+        settings->fovDegrees = fov;
+    }
+    y += 20.0f * s + 4.0f * s;
+
+    UiText(ui, x, y, UiColor(150, 158, 172, 255), ProjectionCaption(settings));
+    y += ui->font.lineHeight + 12.0f * s;
+
+    UiText(ui, x, y, UiColor(150, 158, 172, 255), L"Рендер");
+    y += ui->font.lineHeight + 6.0f * s;
+
+    for (int32_t projection = 0; projection < RENDER_PROJECTION_COUNT;
+         ++projection)
+    {
+        if (UiRadioRow(ui, WIDGET_PROJECTION_FIRST + (uint32_t)projection,
+                x, y, width, 30.0f * s, PROJECTION_LABELS[projection],
+                settings->projection == (RenderProjection)projection))
+        {
+            settings->projection = (RenderProjection)projection;
+        }
+        y += 30.0f * s
+            + (projection + 1 < RENDER_PROJECTION_COUNT ? 4.0f * s : 12.0f * s);
+    }
+
+    float rowHeight = 30.0f * s;
+    float toggleTop = y + (rowHeight - UiScaled(ui, 22.0f)) * 0.5f;
+    UiText(ui, x, y + (rowHeight - ui->font.lineHeight) * 0.5f,
+        UiColor(232, 236, 244, 255), L"Верт. синхронизация");
+    bool verticalSync = RendererIsVerticalSyncEnabled(renderer);
+    if (UiToggle(ui, WIDGET_VSYNC, x + width - UiScaled(ui, 40.0f), toggleTop,
+            &verticalSync))
+    {
+        RendererSetVerticalSync(renderer, verticalSync);
+    }
+    return y + rowHeight + 14.0f * s;
+}
+
+static float DrawAdminTab(UiContext* ui, GameSettings* settings,
+    float dayLengthMinutes, float x, float width, float y)
+{
+    float s = ui->scale;
+    wchar_t text[MENU_TEXT_CAPACITY];
+
+    int32_t timeMinutes = (int32_t)(settings->timeOfDayHours * 60.0f + 0.5f);
+    if (timeMinutes > 1439) timeMinutes = 1439;
+    if (timeMinutes < 0) timeMinutes = 0;
+
+    FormatClock(text, MENU_TEXT_CAPACITY, (uint32_t)timeMinutes);
+    y = LabelValueRow(ui, x, width, y, L"Время суток", text);
+
+    if (UiSliderInt(ui, WIDGET_TIME_SLIDER, x, y, width, 0, 1439, &timeMinutes))
+    {
+        settings->timeOfDayHours = (float)timeMinutes / 60.0f;
+    }
+    y += 20.0f * s + 4.0f * s;
+
+    UiText(ui, x, y, UiColor(150, 158, 172, 255),
+        L"рассвет 06:00 · закат 18:00");
+    y += ui->font.lineHeight + 12.0f * s;
+
+    UiText(ui, x, y, UiColor(150, 158, 172, 255), L"Скорость времени");
+    y += ui->font.lineHeight + 6.0f * s;
+
+    wchar_t normalLabel[MENU_TEXT_CAPACITY];
+    uint32_t length = 0;
+    normalLabel[0] = L'\0';
+    AppendString(normalLabel, MENU_TEXT_CAPACITY, &length, L"Обычная — сутки за ");
+    AppendUnsigned(normalLabel, MENU_TEXT_CAPACITY, &length,
+        (uint32_t)(dayLengthMinutes + 0.5f));
+    AppendString(normalLabel, MENU_TEXT_CAPACITY, &length, L" мин");
+
+    const wchar_t* speedLabels[TIME_SPEED_COUNT] = {
+        L"Пауза",
+        normalLabel,
+        L"Быстрая — сутки за 2 мин",
+        L"Реальное время",
+    };
+
+    for (int32_t speed = 0; speed < TIME_SPEED_COUNT; ++speed)
+    {
+        if (UiRadioRow(ui, WIDGET_TIME_SPEED_FIRST + (uint32_t)speed,
+                x, y, width, 30.0f * s, speedLabels[speed],
+                settings->timeSpeed == (TimeSpeedPreset)speed))
+        {
+            settings->timeSpeed = (TimeSpeedPreset)speed;
+        }
+        y += 30.0f * s + (speed + 1 < TIME_SPEED_COUNT ? 4.0f * s : 14.0f * s);
+    }
+    return y;
+}
+
+static float DrawControlsTab(UiContext* ui, GameSettings* settings,
+    float x, float width, float y)
+{
+    float s = ui->scale;
+    wchar_t text[MENU_TEXT_CAPACITY];
+
+    FormatValueSuffix(text, MENU_TEXT_CAPACITY,
+        settings->mouseSensitivityPercent, L"%");
+    y = LabelValueRow(ui, x, width, y, L"Чувствительность мыши", text);
+    UiSliderInt(ui, WIDGET_SENSITIVITY_SLIDER, x, y, width,
+        25, 300, &settings->mouseSensitivityPercent);
+    y += 20.0f * s + 12.0f * s;
+
+    FormatValueSuffix(text, MENU_TEXT_CAPACITY,
+        settings->flySpeedBlocks, L" бл/с");
+    y = LabelValueRow(ui, x, width, y, L"Скорость полёта", text);
+    UiSliderInt(ui, WIDGET_FLY_SPEED_SLIDER, x, y, width,
+        10, 200, &settings->flySpeedBlocks);
+    return y + 20.0f * s + 12.0f * s + 2.0f * s;
+}
+
 static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
-    GameSettings* settings, Renderer* renderer,
+    GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
     int32_t width, int32_t height)
 {
     float s = ui->scale;
-    float panelWidth = 330.0f * s;
+    float panelWidth = 340.0f * s;
     float padding = 20.0f * s;
     float lineHeight = ui->font.lineHeight;
-    float rowHeight = 30.0f * s;
-    float rowGap = 4.0f * s;
+    float tabsHeight = 32.0f * s;
     float buttonHeight = 36.0f * s;
 
-    float panelHeight = padding
-        + lineHeight + 14.0f * s                    // заголовок
-        + lineHeight + 6.0f * s                     // подпись + значение
-        + 20.0f * s + 4.0f * s                      // ползунок
-        + lineHeight + 12.0f * s                    // строка режима
-        + lineHeight + 6.0f * s                     // подпись «Рендер»
-        + rowHeight * 4.0f + rowGap * 3.0f + 12.0f * s
-        + rowHeight + 14.0f * s                     // верт. синхронизация
-        + buttonHeight + padding;
+    float contentHeight;
+    switch (menu->settingsTab)
+    {
+        case SETTINGS_TAB_ADMIN:    contentHeight = AdminTabHeight(ui); break;
+        case SETTINGS_TAB_CONTROLS: contentHeight = ControlsTabHeight(ui); break;
+        default:                    contentHeight = GraphicsTabHeight(ui); break;
+    }
+
+    float panelHeight = padding + lineHeight + 12.0f * s
+        + tabsHeight + 12.0f * s + contentHeight + buttonHeight + padding;
 
     float panelX = ((float)width - panelWidth) * 0.5f;
     float panelY = ((float)height - panelHeight) * 0.5f;
@@ -158,58 +380,27 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 
     UiTextCentered(ui, panelX + panelWidth * 0.5f, cursorY,
         UiColor(232, 236, 244, 255), L"Настройки");
-    cursorY += lineHeight + 14.0f * s;
-
-    // Поле зрения: подпись, значение справа, ползунок 0..360.
-    UiText(ui, contentX, cursorY, UiColor(232, 236, 244, 255), L"Поле зрения");
-    wchar_t degrees[8];
-    FormatDegrees(degrees, 8, settings->fovDegrees);
-    UiText(ui, contentX + contentWidth - UiTextWidth(ui, degrees), cursorY,
-        UiColor(108, 148, 255, 255), degrees);
-    cursorY += lineHeight + 6.0f * s;
-
-    int32_t fov = settings->fovDegrees;
-    if (UiSliderInt(ui, WIDGET_FOV_SLIDER, contentX, cursorY,
-            contentWidth, 0, 360, &fov))
-    {
-        settings->fovDegrees = fov;
-    }
-    cursorY += 20.0f * s + 4.0f * s;
-
-    UiText(ui, contentX, cursorY, UiColor(150, 158, 172, 255),
-        ProjectionCaption(settings));
     cursorY += lineHeight + 12.0f * s;
 
-    // Выбор рендера из списка.
-    UiText(ui, contentX, cursorY, UiColor(150, 158, 172, 255), L"Рендер");
-    cursorY += lineHeight + 6.0f * s;
+    UiSegmented(ui, WIDGET_TABS, contentX, cursorY, contentWidth, tabsHeight,
+        TAB_LABELS, SETTINGS_TAB_COUNT, &menu->settingsTab);
+    cursorY += tabsHeight + 12.0f * s;
 
-    for (int32_t projection = 0; projection < RENDER_PROJECTION_COUNT;
-         ++projection)
+    switch (menu->settingsTab)
     {
-        if (UiRadioRow(ui, WIDGET_PROJECTION_FIRST + (uint32_t)projection,
-                contentX, cursorY, contentWidth, rowHeight,
-                PROJECTION_LABELS[projection],
-                settings->projection == (RenderProjection)projection))
-        {
-            settings->projection = (RenderProjection)projection;
-        }
-        cursorY += rowHeight + (projection + 1 < RENDER_PROJECTION_COUNT
-            ? rowGap : 12.0f * s);
+        case SETTINGS_TAB_ADMIN:
+            cursorY = DrawAdminTab(ui, settings, dayLengthMinutes,
+                contentX, contentWidth, cursorY);
+            break;
+        case SETTINGS_TAB_CONTROLS:
+            cursorY = DrawControlsTab(ui, settings,
+                contentX, contentWidth, cursorY);
+            break;
+        default:
+            cursorY = DrawGraphicsTab(ui, settings, renderer,
+                contentX, contentWidth, cursorY);
+            break;
     }
-
-    // Вертикальная синхронизация.
-    float toggleTop = cursorY + (rowHeight - UiScaled(ui, 22.0f)) * 0.5f;
-    UiText(ui, contentX, cursorY + (rowHeight - lineHeight) * 0.5f,
-        UiColor(232, 236, 244, 255), L"Верт. синхронизация");
-    bool verticalSync = RendererIsVerticalSyncEnabled(renderer);
-    if (UiToggle(ui, WIDGET_VSYNC,
-            contentX + contentWidth - UiScaled(ui, 40.0f), toggleTop,
-            &verticalSync))
-    {
-        RendererSetVerticalSync(renderer, verticalSync);
-    }
-    cursorY += rowHeight + 14.0f * s;
 
     if (UiButton(ui, WIDGET_BACK, contentX, cursorY,
             contentWidth, buttonHeight, L"Назад"))
@@ -219,7 +410,7 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 }
 
 PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
-    GameSettings* settings, Renderer* renderer,
+    GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
     int32_t width, int32_t height, bool escapePressed)
 {
     if (menu->screen == PAUSE_MENU_CLOSED)
@@ -248,6 +439,7 @@ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
         return UpdateMainScreen(menu, ui, width, height);
     }
 
-    UpdateSettingsScreen(menu, ui, settings, renderer, width, height);
+    UpdateSettingsScreen(menu, ui, settings, renderer, dayLengthMinutes,
+        width, height);
     return PAUSE_MENU_ACTION_NONE;
 }

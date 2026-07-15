@@ -21,6 +21,9 @@ typedef struct TexturePackData
     uint16_t mipCount;
     const uint8_t* pixels;
     uint32_t pixelBytes;
+    // LTP2: карты нормалей (RGB — нормаль, A — ambient occlusion),
+    // раскладка идентична albedo. NULL у паков версии 1.
+    const uint8_t* normalPixels;
 } TexturePackData;
 
 typedef struct TexturePackSubresource
@@ -42,6 +45,10 @@ void TexturePackLoadActive(TexturePackData* outPack);
 // Returns a tightly packed RGBA8 subresource from the layer-major, mip-major
 // payload. The returned memory is owned by TexturePackData.
 bool TexturePackGetSubresource(const TexturePackData* pack,
+    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
+
+// То же для карт нормалей; false, если пак их не содержит.
+bool TexturePackGetNormalSubresource(const TexturePackData* pack,
     uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
 
 void TexturePackRelease(TexturePackData* pack);

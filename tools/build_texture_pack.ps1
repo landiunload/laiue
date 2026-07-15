@@ -3,6 +3,11 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Directory')]
     [string]$Directory,
 
+    # LTP2: дополнительно упаковать карты нормалей <имя>_n.png
+    # (RGB — нормаль, A — ambient occlusion).
+    [Parameter(ParameterSetName = 'Directory')]
+    [switch]$IncludeNormals,
+
     [Parameter(Mandatory, ParameterSetName = 'PatrixZip')]
     [string]$PatrixZip,
 
@@ -26,8 +31,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $LtpMagic = [uint32]0x3150544C
 $LtpVersion = [uint16]1
+$LtpVersionNormals = [uint16]2
 $LtpHeaderSize = [uint16]24
 $LtpFormatRgba8 = [uint32]1
+$LtpFormatRgba8Normals = [uint32]2
 $LayerCount = 3
 $MaximumDimension = 4096
 
@@ -228,6 +235,38 @@ function New-MipChain {
     }
 }
 
+# Мип-уровень карты нормалей: после усреднения RGB перенормируется
+# (иначе дальние мипы «выцветают» к плоской нормали неравномерно).
+function Restore-NormalLength {
+    param([Parameter(Mandatory)]$Image)
+
+    for ($offset = 0; $offset -lt $Image.Pixels.Length; $offset += 4) {
+        $nx = $Image.Pixels[$offset + 0] / 127.5 - 1.0
+        $ny = $Image.Pixels[$offset + 1] / 127.5 - 1.0
+        $nz = $Image.Pixels[$offset + 2] / 127.5 - 1.0
+        $length = [math]::Sqrt($nx * $nx + $ny * $ny + $nz * $nz)
+        if ($length -lt 1e-5) { $nx = 0.0; $ny = 0.0; $nz = 1.0; $length = 1.0 }
+        $Image.Pixels[$offset + 0] = [byte][math]::Round(($nx / $length * 0.5 + 0.5) * 255)
+        $Image.Pixels[$offset + 1] = [byte][math]::Round(($ny / $length * 0.5 + 0.5) * 255)
+        $Image.Pixels[$offset + 2] = [byte][math]::Round(($nz / $length * 0.5 + 0.5) * 255)
+    }
+    $Image
+}
+
+function New-NormalMipChain {
+    param([Parameter(Mandatory)]$Base)
+
+    $current = $Base
+    while ($true) {
+        $current
+        if ($current.Width -eq 1 -and $current.Height -eq 1) {
+            break
+        }
+        $current = Restore-NormalLength -Image (New-NextMip -Source $current)
+    }
+}
+
+$normalLayers = $null
 if ($PSCmdlet.ParameterSetName -eq 'Directory') {
     $sourceDirectory = (Resolve-Path -LiteralPath $Directory).Path
     # Stable LTP layer order: dirt, grass top, grass side.
@@ -236,6 +275,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Directory') {
         Read-PngFile -Path (Join-Path $sourceDirectory 'grass_top.png')
         Read-PngFile -Path (Join-Path $sourceDirectory 'grass_side.png')
     )
+    if ($IncludeNormals) {
+        $normalLayers = @(
+            Read-PngFile -Path (Join-Path $sourceDirectory 'dirt_n.png')
+            Read-PngFile -Path (Join-Path $sourceDirectory 'grass_top_n.png')
+            Read-PngFile -Path (Join-Path $sourceDirectory 'grass_side_n.png')
+        )
+    }
 }
 else {
     $zipPath = (Resolve-Path -LiteralPath $PatrixZip).Path
@@ -257,10 +303,24 @@ else {
 }
 
 Assert-CompatibleLayers -Layers $layers
+if ($null -ne $normalLayers) {
+    Assert-CompatibleLayers -Layers $normalLayers
+    if ($normalLayers[0].Width -ne $layers[0].Width) {
+        throw 'Размер карт нормалей должен совпадать с albedo'
+    }
+}
 
 $chains = [object[]]::new($LayerCount)
 for ($layer = 0; $layer -lt $LayerCount; ++$layer) {
     $chains[$layer] = @(New-MipChain -Base $layers[$layer])
+}
+
+$normalChains = $null
+if ($null -ne $normalLayers) {
+    $normalChains = [object[]]::new($LayerCount)
+    for ($layer = 0; $layer -lt $LayerCount; ++$layer) {
+        $normalChains[$layer] = @(New-NormalMipChain -Base $normalLayers[$layer])
+    }
 }
 
 $mipCount = $chains[0].Count
@@ -273,8 +333,12 @@ foreach ($chain in $chains) {
         $dataBytes64 += $mip.Pixels.Length
     }
 }
+if ($null -ne $normalChains) {
+    # LTP2: payload нормалей идентичен по размеру и раскладке albedo.
+    $dataBytes64 *= 2
+}
 if ($dataBytes64 -gt [uint32]::MaxValue) {
-    throw 'Payload LTP1 превышает 4 GiB'
+    throw 'Payload LTP превышает 4 GiB'
 }
 
 $outputPath = [System.IO.Path]::GetFullPath($Output)
@@ -288,18 +352,38 @@ $stream = [System.IO.File]::Open(
     [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
 $writer = [System.IO.BinaryWriter]::new($stream)
 try {
-    $writer.Write($LtpMagic)
-    $writer.Write($LtpVersion)
-    $writer.Write($LtpHeaderSize)
-    $writer.Write([uint16]$layers[0].Width)
-    $writer.Write([uint16]$layers[0].Height)
-    $writer.Write([uint16]$LayerCount)
-    $writer.Write([uint16]$mipCount)
-    $writer.Write($LtpFormatRgba8)
-    $writer.Write([uint32]$dataBytes64)
+    if ($null -ne $normalChains) {
+        $writer.Write($LtpMagic)
+        $writer.Write($LtpVersionNormals)
+        $writer.Write($LtpHeaderSize)
+        $writer.Write([uint16]$layers[0].Width)
+        $writer.Write([uint16]$layers[0].Height)
+        $writer.Write([uint16]$LayerCount)
+        $writer.Write([uint16]$mipCount)
+        $writer.Write($LtpFormatRgba8Normals)
+        $writer.Write([uint32]$dataBytes64)
+    }
+    else {
+        $writer.Write($LtpMagic)
+        $writer.Write($LtpVersion)
+        $writer.Write($LtpHeaderSize)
+        $writer.Write([uint16]$layers[0].Width)
+        $writer.Write([uint16]$layers[0].Height)
+        $writer.Write([uint16]$LayerCount)
+        $writer.Write([uint16]$mipCount)
+        $writer.Write($LtpFormatRgba8)
+        $writer.Write([uint32]$dataBytes64)
+    }
     foreach ($chain in $chains) {
         foreach ($mip in $chain) {
             $writer.Write([byte[]]$mip.Pixels)
+        }
+    }
+    if ($null -ne $normalChains) {
+        foreach ($chain in $normalChains) {
+            foreach ($mip in $chain) {
+                $writer.Write([byte[]]$mip.Pixels)
+            }
         }
     }
 }
@@ -307,7 +391,8 @@ finally {
     $writer.Dispose()
 }
 
+$versionLabel = if ($null -ne $normalChains) { 'LTP2 (albedo+normal)' } else { 'LTP1' }
 $fileBytes = (Get-Item -LiteralPath $outputPath).Length
-Write-Output ("LTP1: {0}x{1}, layers={2}, mips={3}, payload={4} B, file={5} B -> {6}" -f
-    $layers[0].Width, $layers[0].Height, $LayerCount, $mipCount,
+Write-Output ("{0}: {1}x{2}, layers={3}, mips={4}, payload={5} B, file={6} B -> {7}" -f
+    $versionLabel, $layers[0].Width, $layers[0].Height, $LayerCount, $mipCount,
     $dataBytes64, $fileBytes, $outputPath)

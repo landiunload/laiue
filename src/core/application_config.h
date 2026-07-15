@@ -14,6 +14,10 @@ typedef struct ApplicationConfiguration
     float mouseSensitivity;
     // Горизонтальное поле зрения по умолчанию (ползунок в настройках 0..360).
     int32_t defaultFieldOfViewDegrees;
+    // Длительность игровых суток на скорости «Обычная», минуты.
+    float dayLengthMinutes;
+    // Время суток при старте, часы 0..24.
+    float startTimeOfDayHours;
     float nearPlane;
     float farPlane;
     float editReachDistance;

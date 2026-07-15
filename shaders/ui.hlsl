@@ -60,11 +60,13 @@ UiPixelInput VSMain(uint vertexId : SV_VertexID)
         1.0 - pixel.y * 2.0 / screenSize.y,
         0.0, 1.0);
     output.uv = lerp(uvRect.xy, uvRect.zw, cornerWeight);
-    output.color = float4(
+    // Цвета интерфейса заданы в sRGB; цель кадра кодирует линейный свет,
+    // поэтому декодируем здесь (приближение гаммой 2.2).
+    float3 srgb = float3(
         (packedColor & 255) / 255.0,
         ((packedColor >> 8) & 255) / 255.0,
-        ((packedColor >> 16) & 255) / 255.0,
-        (packedColor >> 24) / 255.0);
+        ((packedColor >> 16) & 255) / 255.0);
+    output.color = float4(pow(srgb, 2.2), (packedColor >> 24) / 255.0);
     output.local = (cornerWeight - 0.5) * (rect.zw - rect.xy);
     output.halfSize = (rect.zw - rect.xy) * 0.5;
     output.cornerRadius = cornerRadius;

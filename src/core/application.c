@@ -2,6 +2,7 @@
 #include "core/application_config.h"
 #include "core/chunk_streaming.h"
 #include "core/debug_overlay.h"
+#include "core/game_time.h"
 #include "core/math.h"
 #include "core/numeric.h"
 #include "core/panorama.h"
@@ -46,6 +47,7 @@ typedef struct ApplicationState
     PauseMenu menu;
     UiContext ui;
     bool mouseLookBeforeMenu;
+    uint32_t overlayTimeMinutes;
 } ApplicationState;
 
 static void QueryWorldBlockPhysics(
@@ -207,7 +209,11 @@ static void RecordPresentedFrame(ApplicationState* application)
 static void UpdateOverlay(ApplicationState* application,
     const int64_t cameraBlockPosition[3])
 {
+    uint32_t timeMinutes = (uint32_t)(
+        application->settings.timeOfDayHours * 60.0f) % 1440u;
+
     if (!application->overlayDirty
+        && application->overlayTimeMinutes == timeMinutes
         && application->coordinateOverlayBlock[0] == cameraBlockPosition[0]
         && application->coordinateOverlayBlock[1] == cameraBlockPosition[1]
         && application->coordinateOverlayBlock[2] == cameraBlockPosition[2])
@@ -220,10 +226,11 @@ static void UpdateOverlay(ApplicationState* application,
         application->coordinateOverlayBlock[axis] =
             cameraBlockPosition[axis];
     }
+    application->overlayTimeMinutes = timeMinutes;
 
     wchar_t text[160];
     DebugOverlayBuildText(application->world, &application->player,
-        application->gameMode, application->framesPerSecond,
+        application->gameMode, application->framesPerSecond, timeMinutes,
         cameraBlockPosition, text, 160);
     WindowSetOverlayText(application->window, text);
     application->overlayDirty = false;
@@ -294,6 +301,11 @@ static void ToggleGameMode(ApplicationState* application)
 static void UpdatePlayer(ApplicationState* application,
     float deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY)
 {
+    // Настройки раздела «Управление» применяются вживую.
+    float sensitivity = g_applicationConfiguration.mouseSensitivity
+        * (float)application->settings.mouseSensitivityPercent * 0.01f;
+    float flySpeed = (float)application->settings.flySpeedBlocks;
+
     if (application->gameMode == GAME_MODE_FLY)
     {
         while (InputConsumeKeyPress(
@@ -307,15 +319,14 @@ static void UpdatePlayer(ApplicationState* application,
             InputIsKeyDown(application->input, INPUT_KEY_D),
             InputIsKeyDown(application->input, INPUT_KEY_SPACE),
             mouseDeltaX, mouseDeltaY,
-            g_applicationConfiguration.cameraSpeed,
-            g_applicationConfiguration.mouseSensitivity);
+            flySpeed, sensitivity);
         return;
     }
 
     CameraUpdate(&application->camera, deltaSeconds,
         false, false, false, false, false,
         mouseDeltaX, mouseDeltaY, 0.0f,
-        g_applicationConfiguration.mouseSensitivity);
+        sensitivity);
 
     PlayerControllerCommand command;
     PlayerCommandMapperBuild(application->input,
@@ -426,6 +437,12 @@ static void OnFrame(void* userData)
     {
         UpdatePlayer(application,
             deltaSeconds, mouseDeltaX, mouseDeltaY);
+        // Игровое время идёт, пока не открыто меню (пауза).
+        application->settings.timeOfDayHours = GameTimeAdvance(
+            application->settings.timeOfDayHours,
+            application->settings.timeSpeed,
+            g_applicationConfiguration.dayLengthMinutes,
+            deltaSeconds);
     }
 
     if (!RebaseWorldIfNeeded(application))
@@ -489,6 +506,7 @@ static void OnFrame(void* userData)
             PauseMenuAction action = PauseMenuUpdate(&application->menu,
                 &application->ui, &application->settings,
                 application->renderer,
+                g_applicationConfiguration.dayLengthMinutes,
                 application->windowWidth, application->windowHeight,
                 escapePressed);
             if (action == PAUSE_MENU_ACTION_QUIT)
@@ -525,6 +543,17 @@ static void OnFrame(void* userData)
         g_applicationConfiguration.nearPlane,
         g_applicationConfiguration.farPlane,
         viewMatrix, &frameSetup);
+
+    // Свет и небо от времени суток.
+    DayLighting lighting;
+    GameTimeGetLighting(application->settings.timeOfDayHours, &lighting);
+    for (int32_t channel = 0; channel < 3; ++channel)
+    {
+        frameSetup.sunDirection[channel] = lighting.sunDirection[channel];
+        frameSetup.sunColor[channel] = lighting.sunColor[channel];
+        frameSetup.ambientColor[channel] = lighting.ambientColor[channel];
+        frameSetup.skyColor[channel] = lighting.skyColor[channel];
+    }
 
     if (RendererBeginFrame(application->renderer, &frameSetup))
     {
@@ -637,6 +666,12 @@ LAIUE_CORE_API void Start(void)
     application->settings.fovDegrees =
         g_applicationConfiguration.defaultFieldOfViewDegrees;
     application->settings.projection = RENDER_PROJECTION_AUTO;
+    application->settings.timeOfDayHours =
+        g_applicationConfiguration.startTimeOfDayHours;
+    application->settings.timeSpeed = TIME_SPEED_NORMAL;
+    application->settings.mouseSensitivityPercent = 100;
+    application->settings.flySpeedBlocks =
+        (int32_t)g_applicationConfiguration.cameraSpeed;
 
     PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);

@@ -35,8 +35,22 @@ static void AppendUnsignedDecimal(wchar_t* destination, uint32_t capacity,
     }
 }
 
+static void AppendTwoDigits(wchar_t* destination, uint32_t capacity,
+    uint32_t* length, uint32_t value)
+{
+    if (*length + 2u < capacity)
+    {
+        destination[(*length)++] = (wchar_t)(L'0' + (value / 10u) % 10u);
+        destination[(*length)++] = (wchar_t)(L'0' + value % 10u);
+    }
+    if (capacity > 0)
+    {
+        destination[*length] = L'\0';
+    }
+}
+
 void DebugOverlayBuildText(World* world, const PlayerController* player,
-    GameMode gameMode, uint32_t framesPerSecond,
+    GameMode gameMode, uint32_t framesPerSecond, uint32_t timeMinutes,
     const int64_t cameraBlockPosition[3],
     wchar_t* destination, uint32_t capacity)
 {
@@ -57,6 +71,10 @@ void DebugOverlayBuildText(World* world, const PlayerController* player,
     AppendText(destination, capacity, &length, coordinate[2]);
     AppendText(destination, capacity, &length, L"\r\nFPS: ");
     AppendUnsignedDecimal(destination, capacity, &length, framesPerSecond);
+    AppendText(destination, capacity, &length, L"\r\nTime: ");
+    AppendTwoDigits(destination, capacity, &length, timeMinutes / 60u);
+    AppendText(destination, capacity, &length, L":");
+    AppendTwoDigits(destination, capacity, &length, timeMinutes % 60u);
     AppendText(destination, capacity, &length, L"\r\nMode: ");
 
     if (gameMode == GAME_MODE_FLY)
