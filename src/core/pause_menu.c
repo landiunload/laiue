@@ -1,4 +1,8 @@
 #include "core/pause_menu.h"
+#include "render/shader_pack.h"
+#include "render/texture_pack.h"
+
+#include <windows.h>
 #include "core/ui_format.h"
 
 // Идентификаторы виджетов (стабильны между кадрами — на них живут анимации).
