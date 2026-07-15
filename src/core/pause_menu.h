@@ -39,12 +39,22 @@ typedef struct GameSettings
     // Управление
     int32_t mouseSensitivityPercent;  // 25..300, базовая чувствительность = 100
     int32_t flySpeedBlocks;           // скорость полёта, блоков/с
+
+    // Шейдер
+    bool wireframe;               // каркасный режим
+    int32_t gamma;                // гамма-коррекция 50..150 (100 = нейтрально)
+
+    // Выбранные (но ещё не применённые) пакеты
+    int32_t selectedTexturePack;  // индекс в списке текстурпаков, -1 если не выбран
+    int32_t selectedShaderPack;   // индекс в списке шейдерпаков, -1 если не выбран
+    bool applyTexturePack;        // true → применить выбранный текстурпак
+    bool applyShaderPack;         // true → применить выбранный шейдерпак
 } GameSettings;
 
 typedef struct PauseMenu
 {
     PauseMenuScreen screen;
-    int32_t settingsTab;   // 0 — графика, 1 — администрирование, 2 — управление
+    int32_t settingsTab;   // 0 — графика, 1 — паки, 2 — администрирование, 3 — управление
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);

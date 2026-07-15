@@ -128,3 +128,21 @@ LAIUE_RENDER_API void RendererDrawMesh(Renderer* renderer, const RendererMesh* m
     const float chunkOriginRelative[3]);
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
+
+// Перезагружает текстурный пак из active.txt (вызывать вне BeginFrame/EndFrame).
+LAIUE_RENDER_API bool RendererReloadTexturePack(Renderer* renderer);
+
+// Настройки отладки рендера.
+LAIUE_RENDER_API void RendererSetWireframe(Renderer* renderer, bool enabled);
+LAIUE_RENDER_API bool RendererIsWireframe(const Renderer* renderer);
+
+// Перезагрузка шейдеров из байткода. Каждый параметр — указатель на DXBC
+// и его длина. Если указатель NULL, используется встроенный шейдер.
+// Вызывать вне BeginFrame/EndFrame.
+LAIUE_RENDER_API bool RendererReloadShaders(Renderer* renderer,
+    const void* chunkVS, uint32_t chunkVSLength,
+    const void* chunkPS, uint32_t chunkPSLength,
+    const void* panoramaVS, uint32_t panoramaVSLength,
+    const void* panoramaPS, uint32_t panoramaPSLength,
+    const void* uiVS, uint32_t uiVSLength,
+    const void* uiPS, uint32_t uiPSLength);

@@ -672,6 +672,12 @@ LAIUE_CORE_API void Start(void)
     application->settings.mouseSensitivityPercent = 100;
     application->settings.flySpeedBlocks =
         (int32_t)g_applicationConfiguration.cameraSpeed;
+    application->settings.wireframe = false;
+    application->settings.gamma = 100;
+    application->settings.selectedTexturePack = -1;
+    application->settings.selectedShaderPack = -1;
+    application->settings.applyTexturePack = false;
+    application->settings.applyShaderPack = false;
 
     PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);

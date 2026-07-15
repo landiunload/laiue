@@ -1,4 +1,8 @@
 #include "core/pause_menu.h"
+#include "render/shader_pack.h"
+#include "render/texture_pack.h"
+
+#include <windows.h>
 
 // Идентификаторы виджетов (стабильны между кадрами — на них живут анимации).
 enum
@@ -15,11 +19,18 @@ enum
     WIDGET_FLY_SPEED_SLIDER,
     WIDGET_PROJECTION_FIRST = 32,
     WIDGET_TIME_SPEED_FIRST = 48,
+    WIDGET_WIREFRAME,
+    WIDGET_GAMMA_SLIDER,
+    WIDGET_SHADER_LIST_FIRST = 80,
+    WIDGET_SHADER_APPLY,
+    WIDGET_TEXTURE_LIST_FIRST = 96,
+    WIDGET_TEXTURE_APPLY,
 };
 
 enum
 {
     SETTINGS_TAB_GRAPHICS = 0,
+    SETTINGS_TAB_PACKS,
     SETTINGS_TAB_ADMIN,
     SETTINGS_TAB_CONTROLS,
     SETTINGS_TAB_COUNT,
@@ -27,6 +38,7 @@ enum
 
 static const wchar_t* const TAB_LABELS[SETTINGS_TAB_COUNT] = {
     L"Графика",
+    L"Паки",
     L"Админ",
     L"Управление",
 };
@@ -206,7 +218,8 @@ static float GraphicsTabHeight(const UiContext* ui)
     return (line + 6.0f * s) + (20.0f * s + 4.0f * s) + (line + 12.0f * s)
         + (line + 6.0f * s)
         + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 12.0f * s
-        + 30.0f * s + 14.0f * s;
+        + 30.0f * s + 14.0f * s
+        + (22.0f * s + 12.0f * s) + (line + 6.0f * s) + (20.0f * s + 12.0f * s);
 }
 
 static float AdminTabHeight(const UiContext* ui)
@@ -270,7 +283,32 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
     {
         RendererSetVerticalSync(renderer, verticalSync);
     }
-    return y + rowHeight + 14.0f * s;
+    y += rowHeight + 14.0f * s;
+
+    // === Настройки шейдера ===
+    UiText(ui, x, y, UiColor(150, 158, 172, 255), L"Шейдер");
+    y += ui->font.lineHeight + 6.0f * s;
+
+    float toggleRowHeight = 22.0f * s;
+    float toggleRowTop = y + (toggleRowHeight - UiScaled(ui, 22.0f)) * 0.5f;
+    UiText(ui, x, y + (toggleRowHeight - ui->font.lineHeight) * 0.5f,
+        UiColor(232, 236, 244, 255), L"Каркасный режим");
+    bool wireframe = settings->wireframe;
+    if (UiToggle(ui, WIDGET_WIREFRAME, x + width - UiScaled(ui, 40.0f), toggleRowTop,
+            &wireframe))
+    {
+        settings->wireframe = wireframe;
+        RendererSetWireframe(renderer, wireframe);
+    }
+    y += toggleRowHeight + 12.0f * s;
+
+    FormatValueSuffix(text, MENU_TEXT_CAPACITY, settings->gamma, L"%");
+    y = LabelValueRow(ui, x, width, y, L"Гамма", text);
+    UiSliderInt(ui, WIDGET_GAMMA_SLIDER, x, y, width,
+        50, 150, &settings->gamma);
+    y += 20.0f * s + 12.0f * s;
+
+    return y;
 }
 
 static float DrawAdminTab(UiContext* ui, GameSettings* settings,
@@ -348,20 +386,200 @@ static float DrawControlsTab(UiContext* ui, GameSettings* settings,
     return y + 20.0f * s + 12.0f * s + 2.0f * s;
 }
 
+// === Паки (шейдерпаки + текстурпаки) ===
+
+static float PacksTabHeight(const UiContext* ui)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    // Заголовок шейдерпаков + до 5 строк + кнопка Apply (если есть)
+    // + заголовок текстурпаков + до 5 строк + кнопка Apply (если есть)
+    float sectionHeader = line + 12.0f * s;
+    float packRows = 30.0f * s * 5.0f + 4.0f * s * 4.0f;
+    float applyButton = 36.0f * s + 10.0f * s;
+    float separator = 12.0f * s;
+    return (sectionHeader + packRows + applyButton + separator)
+        + (sectionHeader + packRows + applyButton);
+}
+
+static float DrawPacksTab(UiContext* ui, GameSettings* settings,
+    Renderer* renderer, float x, float width, float y)
+{
+    float s = ui->scale;
+    float lineHeight = ui->font.lineHeight;
+
+    // ─── Шейдерпаки ───
+    UiText(ui, x, y, UiColor(232, 236, 244, 255), L"Шейдерпаки");
+    UiText(ui, x + width - UiTextWidth(ui, L".lsp"), y,
+        UiColor(108, 148, 255, 255), L".lsp");
+    y += lineHeight + 12.0f * s;
+
+    ShaderPackList shaderList;
+    if (ShaderPackEnumerate(&shaderList))
+    {
+        for (uint32_t i = 0; i < shaderList.count && i < 5; ++i)
+        {
+            uint32_t widgetId = WIDGET_SHADER_LIST_FIRST + i;
+            bool isSelected = (int32_t)i == settings->selectedShaderPack;
+            bool isActive = shaderList.entries[i].active;
+
+            uint32_t textColor = isActive
+                ? UiColor(108, 148, 255, 255)
+                : (isSelected ? UiColor(232, 236, 244, 255)
+                              : UiColor(180, 188, 200, 255));
+
+            UiText(ui, x, y + (30.0f * s - lineHeight) * 0.5f, textColor,
+                shaderList.entries[i].name);
+
+            if (isActive)
+            {
+                UiText(ui, x + width - UiTextWidth(ui, L"✓"), y,
+                    UiColor(80, 200, 80, 255), L"✓");
+            }
+
+            if (UiRadioRow(ui, widgetId, x, y, width, 30.0f * s,
+                    L"", isSelected || isActive) && !isActive)
+            {
+                settings->selectedShaderPack = (int32_t)i;
+            }
+
+            y += 30.0f * s + 4.0f * s;
+        }
+        ShaderPackListRelease(&shaderList);
+    }
+
+    y += 4.0f * s;
+
+    if (settings->selectedShaderPack >= 0)
+    {
+        if (UiButton(ui, WIDGET_SHADER_APPLY, x, y,
+                width, 36.0f * s, L"Применить шейдерпак"))
+        {
+            int32_t index = settings->selectedShaderPack;
+            // Повторно перечисляем, чтобы получить имя
+            ShaderPackList sl;
+            if (ShaderPackEnumerate(&sl) && (uint32_t)index < sl.count)
+            {
+                if (ShaderPackActivate(sl.entries[index].name))
+                {
+                    void* shaders[6];
+                    uint32_t lengths[6];
+                    if (ShaderPackLoadActiveBytecode(
+                            &shaders[0], &lengths[0],
+                            &shaders[1], &lengths[1],
+                            &shaders[2], &lengths[2],
+                            &shaders[3], &lengths[3],
+                            &shaders[4], &lengths[4],
+                            &shaders[5], &lengths[5]))
+                    {
+                        RendererReloadShaders(renderer,
+                            shaders[0], lengths[0],
+                            shaders[1], lengths[1],
+                            shaders[2], lengths[2],
+                            shaders[3], lengths[3],
+                            shaders[4], lengths[4],
+                            shaders[5], lengths[5]);
+                        for (int32_t si = 0; si < 6; ++si)
+                        {
+                            if (shaders[si] != NULL)
+                                HeapFree(GetProcessHeap(), 0, shaders[si]);
+                        }
+                    }
+                    else
+                    {
+                        RendererReloadShaders(renderer,
+                            NULL,0, NULL,0, NULL,0, NULL,0, NULL,0, NULL,0);
+                    }
+                    settings->selectedShaderPack = -1;
+                }
+            }
+            ShaderPackListRelease(&sl);
+        }
+        y += 36.0f * s + 10.0f * s;
+    }
+
+    y += 8.0f * s;
+
+    // ─── Текстурпаки ───
+    UiText(ui, x, y, UiColor(232, 236, 244, 255), L"Текстурпаки");
+    UiText(ui, x + width - UiTextWidth(ui, L".ltp/.lrp"), y,
+        UiColor(108, 148, 255, 255), L".ltp/.lrp");
+    y += lineHeight + 12.0f * s;
+
+    TexturePackList texList;
+    if (TexturePackEnumerate(&texList))
+    {
+        for (uint32_t i = 0; i < texList.count && i < 5; ++i)
+        {
+            uint32_t widgetId = WIDGET_TEXTURE_LIST_FIRST + i;
+            bool isSelected = (int32_t)i == settings->selectedTexturePack;
+            bool isActive = texList.entries[i].active;
+
+            uint32_t textColor = isActive
+                ? UiColor(108, 148, 255, 255)
+                : (isSelected ? UiColor(232, 236, 244, 255)
+                              : UiColor(180, 188, 200, 255));
+
+            UiText(ui, x, y + (30.0f * s - lineHeight) * 0.5f, textColor,
+                texList.entries[i].name);
+
+            if (isActive)
+            {
+                UiText(ui, x + width - UiTextWidth(ui, L"✓"), y,
+                    UiColor(80, 200, 80, 255), L"✓");
+            }
+
+            if (UiRadioRow(ui, widgetId, x, y, width, 30.0f * s,
+                    L"", isSelected || isActive) && !isActive)
+            {
+                settings->selectedTexturePack = (int32_t)i;
+            }
+
+            y += 30.0f * s + 4.0f * s;
+        }
+        TexturePackListRelease(&texList);
+    }
+
+    y += 4.0f * s;
+
+    if (settings->selectedTexturePack >= 0)
+    {
+        if (UiButton(ui, WIDGET_TEXTURE_APPLY, x, y,
+                width, 36.0f * s, L"Применить текстурпак"))
+        {
+            int32_t index = settings->selectedTexturePack;
+            TexturePackList tl;
+            if (TexturePackEnumerate(&tl) && (uint32_t)index < tl.count)
+            {
+                if (TexturePackActivate(tl.entries[index].name))
+                {
+                    RendererReloadTexturePack(renderer);
+                    settings->selectedTexturePack = -1;
+                }
+            }
+            TexturePackListRelease(&tl);
+        }
+        y += 36.0f * s + 10.0f * s;
+    }
+
+    return y;
+}
+
 static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
     int32_t width, int32_t height)
 {
     float s = ui->scale;
-    float panelWidth = 340.0f * s;
+    float panelWidth = 400.0f * s;
     float padding = 20.0f * s;
     float lineHeight = ui->font.lineHeight;
-    float tabsHeight = 32.0f * s;
+    float tabsHeight = 36.0f * s;
     float buttonHeight = 36.0f * s;
 
     float contentHeight;
     switch (menu->settingsTab)
     {
+        case SETTINGS_TAB_PACKS:    contentHeight = PacksTabHeight(ui); break;
         case SETTINGS_TAB_ADMIN:    contentHeight = AdminTabHeight(ui); break;
         case SETTINGS_TAB_CONTROLS: contentHeight = ControlsTabHeight(ui); break;
         default:                    contentHeight = GraphicsTabHeight(ui); break;
@@ -388,6 +606,10 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 
     switch (menu->settingsTab)
     {
+        case SETTINGS_TAB_PACKS:
+            cursorY = DrawPacksTab(ui, settings, renderer,
+                contentX, contentWidth, cursorY);
+            break;
         case SETTINGS_TAB_ADMIN:
             cursorY = DrawAdminTab(ui, settings, dayLengthMinutes,
                 contentX, contentWidth, cursorY);

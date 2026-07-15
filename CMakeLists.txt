@@ -41,7 +41,12 @@ add_custom_target(laiue_texturepacks
         "$<TARGET_FILE_DIR:laiue>/texturepacks"
     COMMENT "Копирование текстурпаков"
 )
-add_dependencies(laiue laiue_core laiue_texturepacks)
+add_custom_target(laiue_shaders
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "$<TARGET_FILE_DIR:laiue>/shaders"
+    COMMENT "Создание директории шейдерпаков"
+)
+add_dependencies(laiue laiue_core laiue_texturepacks laiue_shaders)
 target_link_options(laiue PRIVATE
     /ENTRY:EntryPoint
     /STACK:262144,4096

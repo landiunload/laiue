@@ -16,6 +16,8 @@ laiue_add_module(render
     SOURCES
         renderer_d3d12.c
         renderer.h
+        shader_pack.c
+        shader_pack.h
         texture_pack.c
         texture_pack.h
         chunk_geometry.h

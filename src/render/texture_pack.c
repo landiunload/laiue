@@ -1,6 +1,7 @@
 #include "render/texture_pack.h"
 
 #include <windows.h>
+#include <string.h>
 
 #define LTP_MAGIC       0x3150544Cu
 #define LTP_VERSION     1u
@@ -120,14 +121,21 @@ static uint8_t AsciiLower(uint8_t character)
         : character;
 }
 
-static bool HasLtpExtension(const uint8_t* name, uint32_t length)
+static bool HasPackExtension(const uint8_t* name, uint32_t length)
 {
-    return length > 4u
-        && name[length - 4u] == '.'
-        && AsciiLower(name[length - 3u]) == 'l'
-        && AsciiLower(name[length - 2u]) == 't'
-        && AsciiLower(name[length - 1u]) == 'p';
+    if (length <= 4u) return false;
+    uint8_t ext4 = AsciiLower(name[length - 4u]);
+    uint8_t ext3 = AsciiLower(name[length - 3u]);
+    uint8_t ext2 = AsciiLower(name[length - 2u]);
+    uint8_t ext1 = AsciiLower(name[length - 1u]);
+    if (ext4 == '.' && ext3 == 'l' && ext2 == 't' && ext1 == 'p')
+        return true;
+    if (ext4 == '.' && ext3 == 'l' && ext2 == 'r' && ext1 == 'p')
+        return true;
+    return false;
 }
+
+#define HasLtpExtension HasPackExtension
 
 static bool ReadActiveName(
     const wchar_t* activePath, uint8_t outName[ACTIVE_NAME_MAX_BYTES],
@@ -422,4 +430,282 @@ void TexturePackRelease(TexturePackData* pack)
     pack->pixels = NULL;
     pack->pixelBytes = 0;
     pack->normalPixels = NULL;
+}
+
+static bool ReadActiveNameFromDir(const wchar_t* dirPath,
+    uint32_t dirLength, uint8_t outName[ACTIVE_NAME_MAX_BYTES],
+    uint32_t* outLength)
+{
+    if (dirLength + 11u >= PATH_CAPACITY_CHARS)
+    {
+        return false;
+    }
+    // dirPath уже указывает на достаточно большой буфер (PATH_CAPACITY_CHARS),
+    // но он const. Копируем в не-const буфер из кучи.
+    wchar_t* activePath = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
+    if (activePath == NULL)
+    {
+        return false;
+    }
+    for (uint32_t i = 0; i < dirLength; ++i)
+    {
+        activePath[i] = dirPath[i];
+    }
+    memcpy(activePath + dirLength, L"\\active.txt", 12 * sizeof(wchar_t));
+    bool result = ReadActiveName(activePath, outName, outLength);
+    HeapFree(GetProcessHeap(), 0, activePath);
+    return result;
+}
+
+static bool IsActivePack(const wchar_t* dirPath, uint32_t dirLength,
+    const wchar_t* fileName)
+{
+    uint8_t activeName[ACTIVE_NAME_MAX_BYTES];
+    uint32_t activeLength = 0;
+    if (!ReadActiveNameFromDir(dirPath, dirLength, activeName, &activeLength))
+    {
+        // Если active.txt нет/бит — сравнивать не с чем; считаем все равными.
+        return false;
+    }
+
+    uint32_t nameLength = 0;
+    while (fileName[nameLength] != L'\0') ++nameLength;
+
+    if (nameLength != activeLength)
+    {
+        return false;
+    }
+    // activeName хранится как ASCII; fileName — wchar_t.
+    for (uint32_t i = 0; i < nameLength; ++i)
+    {
+        if ((wchar_t)activeName[i] != fileName[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TexturePackEnumerate(TexturePackList* outList)
+{
+    if (outList == NULL)
+    {
+        return false;
+    }
+    outList->entries = NULL;
+    outList->count = 0;
+
+    wchar_t* pathBuf = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
+    if (pathBuf == NULL)
+    {
+        return false;
+    }
+
+    uint32_t directoryLength = 0;
+    if (!GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength)
+        || !BuildPath(pathBuf, PATH_CAPACITY_CHARS, directoryLength,
+            L"\\texturepacks\\"))
+    {
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return false;
+    }
+
+    uint32_t dirLen = directoryLength + LiteralLength(L"\\texturepacks\\");
+
+    // Создаём шаблон поиска: "<dir>*.*" — фильтруем расширение в цикле
+    pathBuf[dirLen] = L'*';
+    pathBuf[dirLen + 1] = L'\0';
+
+    WIN32_FIND_DATAW findData;
+    HANDLE findHandle = FindFirstFileW(pathBuf, &findData);
+    if (findHandle == INVALID_HANDLE_VALUE)
+    {
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return true; // нет файлов — не ошибка
+    }
+
+    // Считаем количество
+    uint32_t capacity = 0;
+    do
+    {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            continue;
+        }
+        // Проверяем расширение: .ltp или .lrp
+        uint32_t nameLen = 0;
+        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
+        if (nameLen > 4)
+        {
+            uint8_t ascii[8];
+            for (uint32_t ci = 0; ci < 4 && ci < nameLen; ++ci)
+                ascii[4 - 1 - ci] = (uint8_t)(
+                    findData.cFileName[nameLen - 1 - ci] >= L'A'
+                    && findData.cFileName[nameLen - 1 - ci] <= L'Z'
+                    ? findData.cFileName[nameLen - 1 - ci] - L'A' + 'a'
+                    : findData.cFileName[nameLen - 1 - ci]);
+            if ((ascii[0] == 't' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')
+                || (ascii[0] == 'r' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.'))
+            {
+                ++capacity;
+            }
+        }
+    }
+    while (FindNextFileW(findHandle, &findData));
+
+    if (capacity == 0)
+    {
+        FindClose(findHandle);
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return true;
+    }
+
+    outList->entries = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)capacity * sizeof(TexturePackEntry));
+    if (outList->entries == NULL)
+    {
+        FindClose(findHandle);
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return false;
+    }
+
+    // Повторный проход для заполнения
+    FindClose(findHandle);
+    findHandle = FindFirstFileW(pathBuf, &findData);
+    if (findHandle == INVALID_HANDLE_VALUE)
+    {
+        HeapFree(GetProcessHeap(), 0, outList->entries);
+        outList->entries = NULL;
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return false;
+    }
+
+    // Восстанавливаем базовый путь (без *.ltp)
+    pathBuf[dirLen] = L'\0';
+
+    uint32_t index = 0;
+    do
+    {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            continue;
+        }
+        uint32_t nameLen = 0;
+        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
+        // Проверяем расширение
+        if (nameLen <= 4) continue;
+        uint8_t ascii[4];
+        for (uint32_t ci = 0; ci < 4; ++ci)
+            ascii[3 - ci] = (uint8_t)(
+                findData.cFileName[nameLen - 1 - ci] >= L'A'
+                && findData.cFileName[nameLen - 1 - ci] <= L'Z'
+                ? findData.cFileName[nameLen - 1 - ci] - L'A' + 'a'
+                : findData.cFileName[nameLen - 1 - ci]);
+        if (!((ascii[0] == 't' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')
+            || (ascii[0] == 'r' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')))
+        {
+            continue;
+        }
+
+        if (index >= capacity)
+        {
+            break;
+        }
+        nameLen = nameLen < TEXTURE_PACK_NAME_MAX - 1
+            ? nameLen : TEXTURE_PACK_NAME_MAX - 1;
+        for (uint32_t ci = 0; ci < nameLen; ++ci)
+        {
+            outList->entries[index].name[ci] = findData.cFileName[ci];
+        }
+        outList->entries[index].name[nameLen] = L'\0';
+
+        outList->entries[index].active = IsActivePack(
+            pathBuf, directoryLength, outList->entries[index].name);
+        ++index;
+    }
+    while (FindNextFileW(findHandle, &findData));
+
+    FindClose(findHandle);
+    HeapFree(GetProcessHeap(), 0, pathBuf);
+    outList->count = index;
+    return true;
+}
+
+void TexturePackListRelease(TexturePackList* list)
+{
+    if (list == NULL)
+    {
+        return;
+    }
+    if (list->entries != NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, list->entries);
+    }
+    list->entries = NULL;
+    list->count = 0;
+}
+
+bool TexturePackActivate(const wchar_t* name)
+{
+    if (name == NULL || name[0] == L'\0')
+    {
+        return false;
+    }
+
+    // Проверяем, что имя безопасное (только ASCII буквы, цифры, '_', '-', '.')
+    uint32_t nameLen = 0;
+    while (name[nameLen] != L'\0')
+    {
+        wchar_t c = name[nameLen];
+        if (!((c >= L'a' && c <= L'z')
+            || (c >= L'A' && c <= L'Z')
+            || (c >= L'0' && c <= L'9')
+            || c == L'_' || c == L'-' || c == L'.'))
+        {
+            return false;
+        }
+        ++nameLen;
+    }
+    if (nameLen == 0 || nameLen > ACTIVE_NAME_MAX_BYTES
+        || !HasLtpExtension((const uint8_t*)name, nameLen))
+    {
+        return false;
+    }
+
+    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
+    if (path == NULL)
+    {
+        return false;
+    }
+
+    uint32_t directoryLength = 0;
+    if (!GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
+        || !BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
+            L"\\texturepacks\\active.txt"))
+    {
+        HeapFree(GetProcessHeap(), 0, path);
+        return false;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HeapFree(GetProcessHeap(), 0, path);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    DWORD written = 0;
+    uint8_t ascii[ACTIVE_NAME_MAX_BYTES + 2];
+    for (uint32_t i = 0; i < nameLen; ++i)
+    {
+        ascii[i] = (uint8_t)name[i];
+    }
+    ascii[nameLen] = '\n';
+    bool ok = WriteFile(file, ascii, nameLen + 1, &written, NULL);
+    CloseHandle(file);
+    return ok && written == nameLen + 1;
 }
