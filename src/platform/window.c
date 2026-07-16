@@ -14,6 +14,10 @@ struct Window
     bool mouseLookEnabled;
     bool cursorHidden;
     bool focused;
+    float wheelSteps;             // накопленные щелчки колеса до Consume
+    bool fullscreen;
+    WINDOWPLACEMENT windowedPlacement;   // положение окна до фуллскрина
+    LONG windowedStyle;                  // стиль окна до фуллскрина
     RawInputCallback rawInputCallback;
     void* rawInputUserData;
 };
@@ -87,6 +91,14 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
                 {
                     ApplyCursorClip(window);
                 }
+            }
+            return 0;
+
+        case WM_MOUSEWHEEL:
+            if (window != NULL)
+            {
+                window->wheelSteps +=
+                    (float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA;
             }
             return 0;
 
@@ -318,6 +330,64 @@ void WindowGetCursorClientPosition(const Window* window, int32_t* x, int32_t* y)
     }
     *x = (int32_t)point.x;
     *y = (int32_t)point.y;
+}
+
+float WindowConsumeMouseWheelSteps(Window* window)
+{
+    float steps = window->wheelSteps;
+    window->wheelSteps = 0.0f;
+    return steps;
+}
+
+void WindowSetFullscreen(Window* window, bool enabled)
+{
+    if (window == NULL || window->fullscreen == enabled)
+    {
+        return;
+    }
+
+    if (enabled)
+    {
+        window->windowedStyle = GetWindowLongW(window->handle, GWL_STYLE);
+        window->windowedPlacement.length = sizeof(window->windowedPlacement);
+        GetWindowPlacement(window->handle, &window->windowedPlacement);
+
+        MONITORINFO monitorInfo = { .cbSize = sizeof(monitorInfo) };
+        HMONITOR monitor = MonitorFromWindow(window->handle,
+            MONITOR_DEFAULTTONEAREST);
+        if (!GetMonitorInfoW(monitor, &monitorInfo))
+        {
+            return;
+        }
+
+        SetWindowLongW(window->handle, GWL_STYLE,
+            (LONG)(WS_POPUP | WS_VISIBLE));
+        SetWindowPos(window->handle, HWND_TOP,
+            monitorInfo.rcMonitor.left, monitorInfo.rcMonitor.top,
+            monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+            monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        window->fullscreen = true;
+    }
+    else
+    {
+        SetWindowLongW(window->handle, GWL_STYLE, window->windowedStyle);
+        SetWindowPlacement(window->handle, &window->windowedPlacement);
+        SetWindowPos(window->handle, NULL, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
+            | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        window->fullscreen = false;
+    }
+
+    if (window->cursorHidden)
+    {
+        ApplyCursorClip(window);
+    }
+}
+
+bool WindowIsFullscreen(const Window* window)
+{
+    return window->fullscreen;
 }
 
 void WindowRequestClose(Window* window)

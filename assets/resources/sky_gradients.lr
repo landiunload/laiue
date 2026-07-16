@@ -1,0 +1,16 @@
+LAIUE RESOURCE 1
+# Ресурс градиентов неба по времени суток (RGB, доли яркости зенита).
+name = Sky Gradients
+author = laiue
+[dawn]
+zenith  = 2E4C86
+horizon = D98A5A
+[noon]
+zenith  = 3A78C2
+horizon = A9D0FF
+[dusk]
+zenith  = 1E2C5A
+horizon = E8603C
+[night]
+zenith  = 0A0E1A
+horizon = 141A2E

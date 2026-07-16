@@ -7,6 +7,7 @@
 #include "core/numeric.h"
 #include "core/panorama.h"
 #include "core/pause_menu.h"
+#include "render/shader_pack.h"
 #include "core/player_command_mapper.h"
 #include "core/ui.h"
 #include "game/camera.h"
@@ -446,10 +447,12 @@ static void OnFrame(void* userData)
             application->input, INPUT_MOUSE_BUTTON_LEFT);
     }
 
+    float wheelSteps = WindowConsumeMouseWheelSteps(application->window);
     bool uiReady = UiBegin(&application->ui,
         application->windowWidth, application->windowHeight,
         (float)cursorX, (float)cursorY,
-        mouseDown, mousePressed, deltaSeconds);
+        mouseDown, mousePressed,
+        menuOpen ? wheelSteps : 0.0f, deltaSeconds);
     if (uiReady)
     {
         if (application->ui.fontDirty
@@ -465,7 +468,7 @@ static void OnFrame(void* userData)
         {
             PauseMenuAction action = PauseMenuUpdate(&application->menu,
                 &application->ui, &application->settings,
-                application->renderer,
+                application->renderer, application->window,
                 g_applicationConfiguration.dayLengthMinutes,
                 application->windowWidth, application->windowHeight,
                 escapePressed);
@@ -521,6 +524,7 @@ static void OnFrame(void* userData)
         frameSetup.ambientColor[channel] = lighting.ambientColor[channel];
         frameSetup.skyColor[channel] = lighting.skyColor[channel];
     }
+    frameSetup.gamma = (float)application->settings.gamma * 0.01f;
 
     if (RendererBeginFrame(application->renderer, &frameSetup))
     {
@@ -640,6 +644,30 @@ LAIUE_CORE_API void Start(void)
         (int32_t)g_applicationConfiguration.cameraSpeed;
     application->settings.wireframe = false;
     application->settings.gamma = 100;
+
+    // Активный шейдерпак применяется сразу при старте, а не только
+    // после ручного нажатия «Применить» в меню.
+    {
+        void* shaders[6];
+        uint32_t lengths[6];
+        if (ShaderPackLoadActiveBytecode(
+                &shaders[0], &lengths[0], &shaders[1], &lengths[1],
+                &shaders[2], &lengths[2], &shaders[3], &lengths[3],
+                &shaders[4], &lengths[4], &shaders[5], &lengths[5]))
+        {
+            RendererReloadShaders(renderer,
+                shaders[0], lengths[0], shaders[1], lengths[1],
+                shaders[2], lengths[2], shaders[3], lengths[3],
+                shaders[4], lengths[4], shaders[5], lengths[5]);
+            for (int32_t shaderIndex = 0; shaderIndex < 6; ++shaderIndex)
+            {
+                if (shaders[shaderIndex] != NULL)
+                {
+                    HeapFree(GetProcessHeap(), 0, shaders[shaderIndex]);
+                }
+            }
+        }
+    }
     application->settings.selectedTexturePack = -1;
     application->settings.selectedShaderPack = -1;
     application->settings.applyTexturePack = false;

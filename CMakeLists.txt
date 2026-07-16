@@ -48,6 +48,18 @@ add_custom_target(laiue_content_files
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${PROJECT_SOURCE_DIR}/assets/texturepacks"
         "$<TARGET_FILE_DIR:laiue>/textures"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${PROJECT_SOURCE_DIR}/assets/resources"
+        "$<TARGET_FILE_DIR:laiue>/resources"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${PROJECT_SOURCE_DIR}/assets/mods"
+        "$<TARGET_FILE_DIR:laiue>/mods"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${PROJECT_SOURCE_DIR}/assets/data"
+        "$<TARGET_FILE_DIR:laiue>/data"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${PROJECT_SOURCE_DIR}/assets/shaderpacks"
+        "$<TARGET_FILE_DIR:laiue>/shaders"
     COMMENT "Подготовка ресурсов, модов, шейдеров, данных и текстур"
 )
 add_dependencies(laiue laiue_core laiue_content_files)

@@ -1,0 +1,131 @@
+#pragma pack_matrix(row_major)
+
+// ─── Vibrant-шейдер чанков для laiue ───
+// Чистая, насыщенная картинка без тумана: усиленная насыщенность,
+// контрастный терминатор и мягкий контактный AO. Быстрее photon —
+// подходит для слабых машин и ярких скриншотов.
+
+cbuffer FrameConstants : register(b0)
+{
+    float4x4 viewProjection;
+    float3 chunkOriginRelative;
+    float3 sunDirection;
+    float3 sunColor;
+    float3 ambientColor;
+    float gammaInverse;
+};
+
+ByteAddressBuffer quadBuffer : register(t0);
+Texture2DArray blockTextures : register(t1);
+Texture2DArray blockNormals : register(t2);
+SamplerState blockSampler : register(s0);
+
+struct PixelInput
+{
+    float4 position : SV_POSITION;
+    float2 textureCoordinates : TEXCOORD0;
+    nointerpolation uint surface : SURFACE;
+};
+
+static const uint CORNER_PATTERN[6] = { 0, 1, 2, 0, 2, 3 };
+static const uint3 FACE_CORNERS[6][4] =
+{
+    { uint3(1,1,0), uint3(1,1,1), uint3(1,0,1), uint3(1,0,0) },
+    { uint3(0,1,1), uint3(0,1,0), uint3(0,0,0), uint3(0,0,1) },
+    { uint3(1,1,1), uint3(0,1,1), uint3(0,0,1), uint3(1,0,1) },
+    { uint3(0,1,0), uint3(1,1,0), uint3(1,0,0), uint3(0,0,0) },
+    { uint3(0,1,1), uint3(1,1,1), uint3(1,1,0), uint3(0,1,0) },
+    { uint3(1,0,1), uint3(0,0,1), uint3(0,0,0), uint3(1,0,0) },
+};
+static const float SEAM_INFLATE = 0.0015;
+
+PixelInput VSMain(uint vertexId : SV_VertexID)
+{
+    uint quadIndex = vertexId / 6;
+    uint cornerIndex = CORNER_PATTERN[vertexId % 6];
+
+    uint2 quad = quadBuffer.Load2(quadIndex * 8);
+    uint3 start = uint3(quad.x & 127, (quad.x >> 14) & 127, (quad.x >> 7) & 127);
+    uint face = (quad.x >> 21) & 7;
+    uint blockType = quad.x >> 24;
+    uint3 extent = uint3(quad.y & 127, (quad.y >> 14) & 127, (quad.y >> 7) & 127);
+
+    uint3 corner = FACE_CORNERS[face][cornerIndex];
+    uint3 remapped = uint3(corner.x, corner.z, corner.y);
+    float3 localPosition = (float3)(start + remapped * extent);
+    float3 worldPosition = chunkOriginRelative + localPosition;
+
+    float viewDepth = mul(float4(worldPosition, 1.0), viewProjection).w;
+    float3 cornerSign = (float3)remapped * 2.0 - 1.0;
+    uint originalAxis = face >> 1;
+    float3 inPlane = float3(originalAxis != 0, originalAxis != 1, originalAxis != 2);
+    worldPosition += cornerSign * inPlane * (SEAM_INFLATE * viewDepth);
+
+    PixelInput output;
+    output.position = mul(float4(worldPosition, 1.0), viewProjection);
+    if (face < 2)
+        output.textureCoordinates = float2(localPosition.y, -localPosition.z);
+    else if (face < 4)
+        output.textureCoordinates = float2(localPosition.x, -localPosition.z);
+    else
+        output.textureCoordinates = localPosition.xy;
+
+    uint textureLayer = 0;
+    if (blockType == 2)
+        textureLayer = face == 4 ? 1 : (face == 5 ? 0 : 2);
+    output.surface = face | (textureLayer << 3);
+    return output;
+}
+
+static const float FACE_SHADE[6] = { 0.82, 0.82, 0.92, 0.68, 1.00, 0.50 };
+static const float3 FACE_TANGENT[6] =
+{
+    float3(0, 1, 0), float3(0, 1, 0),
+    float3(1, 0, 0), float3(1, 0, 0),
+    float3(1, 0, 0), float3(1, 0, 0),
+};
+static const float3 FACE_BITANGENT[6] =
+{
+    float3(0, 0, 1), float3(0, 0, 1),
+    float3(0, 0, 1), float3(0, 0, 1),
+    float3(0, -1, 0), float3(0, -1, 0),
+};
+static const float3 FACE_NORMAL[6] =
+{
+    float3(1, 0, 0), float3(-1, 0, 0),
+    float3(0, 1, 0), float3(0, -1, 0),
+    float3(0, 0, 1), float3(0, 0, -1),
+};
+
+float4 PSMain(PixelInput input) : SV_TARGET
+{
+    uint face = input.surface & 7;
+    uint textureLayer = input.surface >> 3;
+    float3 texel = float3(input.textureCoordinates, textureLayer);
+    float3 baseColor = blockTextures.Sample(blockSampler, texel).rgb;
+
+    float4 normalSample = blockNormals.Sample(blockSampler, texel);
+    float3 tangentNormal = normalSample.rgb * 2.0 - 1.0;
+    float occlusion = normalSample.a;
+
+    float3 worldNormal = normalize(
+        FACE_TANGENT[face] * tangentNormal.x
+        + FACE_BITANGENT[face] * tangentNormal.y
+        + FACE_NORMAL[face] * tangentNormal.z);
+
+    // Контрастное прямое освещение — резкий, «солнечный» терминатор.
+    float diffuse = saturate(dot(worldNormal, -sunDirection));
+    diffuse = diffuse * diffuse * (3.0 - 2.0 * diffuse);   // smoothstep
+
+    float3 light = ambientColor * (FACE_SHADE[face] * occlusion)
+        + sunColor * (diffuse * (0.6 + 0.4 * occlusion));
+    float3 color = baseColor * light;
+
+    // Усиление насыщенности вокруг яркости (luma-preserving saturation).
+    float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+    color = lerp(float3(luma, luma, luma), color, 1.35);
+    color = saturate(color);
+
+    color = pow(color, gammaInverse);
+    return float4(color, 1.0);
+}

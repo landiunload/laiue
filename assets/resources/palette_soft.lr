@@ -1,0 +1,12 @@
+LAIUE RESOURCE 1
+# Универсальный ресурс: мягкая цветовая палитра интерфейса и подсветок.
+# Формат — построчный "ключ = значение"; секции в квадратных скобках.
+name = Palette Soft
+author = laiue
+[colors]
+accent     = 6C94FF
+text       = E8ECF4
+text_dim   = 969CAC
+panel      = 161A22
+success    = 50C850
+danger     = D8503C

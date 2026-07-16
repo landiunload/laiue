@@ -61,6 +61,7 @@ typedef struct RendererFrameSetup
     float sunColor[3];
     float ambientColor[3];
     float skyColor[3];
+    float gamma;             // 1.0 — нейтрально; выход шейдера = pow(цвет, 1/gamma)
 } RendererFrameSetup;
 
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);

@@ -30,7 +30,13 @@ typedef struct UiContext
     float mouseY;
     bool mouseDown;
     bool mousePressed;   // нажатие в этом кадре
+    float wheelSteps;    // щелчки колеса за кадр (положительные — от себя)
     float deltaSeconds;
+
+    // Прямоугольник отсечения: квады обрезаются геометрически (и по UV),
+    // поэтому прокручиваемый контент не вылезает за панель.
+    bool clipEnabled;
+    float clipRect[4];   // x0, y0, x1, y1
 
     uint32_t activeId;   // виджет, захвативший мышь (слайдер)
 
@@ -62,7 +68,12 @@ static inline uint32_t UiColor(uint32_t r, uint32_t g, uint32_t b, uint32_t a)
 // false — шрифт недоступен, интерфейс рисовать нельзя.
 bool UiBegin(UiContext* ui, int32_t width, int32_t height,
     float mouseX, float mouseY, bool mouseDown, bool mousePressed,
-    float deltaSeconds);
+    float wheelSteps, float deltaSeconds);
+
+// Отсечение виджетов прямоугольником (например, прокручиваемая панель).
+// Пока клип активен, виджеты вне прямоугольника не рисуются и не ловят мышь.
+void UiSetClip(UiContext* ui, float x, float y, float width, float height);
+void UiClearClip(UiContext* ui);
 
 void UiRelease(UiContext* ui);
 

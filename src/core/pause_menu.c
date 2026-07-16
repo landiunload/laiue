@@ -26,6 +26,9 @@ enum
     WIDGET_SHADER_APPLY,
     WIDGET_TEXTURE_LIST_FIRST = 96,
     WIDGET_TEXTURE_APPLY,
+    WIDGET_FULLSCREEN = 120,
+    WIDGET_SHADER_RESET,
+    WIDGET_TEXTURE_RESET,
 };
 
 enum
@@ -134,6 +137,7 @@ static float GraphicsTabHeight(const UiContext* ui)
         + (line + 6.0f * s)
         + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 12.0f * s
         + 30.0f * s + 14.0f * s
+        + 30.0f * s + 14.0f * s
         + (22.0f * s + 12.0f * s) + (line + 6.0f * s) + (20.0f * s + 12.0f * s);
 }
 
@@ -154,7 +158,7 @@ static float ControlsTabHeight(const UiContext* ui)
 }
 
 static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
-    Renderer* renderer, float x, float width, float y)
+    Renderer* renderer, Window* window, float x, float width, float y)
 {
     float s = ui->scale;
     wchar_t text[MENU_TEXT_CAPACITY];
@@ -198,6 +202,19 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
             &verticalSync))
     {
         RendererSetVerticalSync(renderer, verticalSync);
+    }
+    y += rowHeight + 14.0f * s;
+
+    // Полноэкранный режим без рамки: окно занимает весь текущий монитор,
+    // поэтому доступно любое разрешение дисплея.
+    float fullscreenTop = y + (rowHeight - UiScaled(ui, 22.0f)) * 0.5f;
+    UiText(ui, x, y + (rowHeight - ui->font.lineHeight) * 0.5f,
+        UI_COLOR_TEXT, L"Полный экран");
+    bool fullscreen = WindowIsFullscreen(window);
+    if (UiToggle(ui, WIDGET_FULLSCREEN, x + width - UiScaled(ui, 40.0f),
+            fullscreenTop, &fullscreen))
+    {
+        WindowSetFullscreen(window, fullscreen);
     }
     y += rowHeight + 14.0f * s;
 
@@ -316,11 +333,12 @@ static float PacksTabHeight(const UiContext* ui)
     // Заголовок шейдерпаков + до 5 строк + кнопка Apply (если есть)
     // + заголовок текстурпаков + до 5 строк + кнопка Apply (если есть)
     float sectionHeader = line + 12.0f * s;
-    float packRows = 30.0f * s * 5.0f + 4.0f * s * 4.0f;
+    float packRows = 30.0f * s * 6.0f + 4.0f * s * 5.0f;
     float applyButton = 36.0f * s + 10.0f * s;
+    float resetButton = 30.0f * s + 8.0f * s;
     float separator = 12.0f * s;
-    return (sectionHeader + packRows + applyButton + separator)
-        + (sectionHeader + packRows + applyButton);
+    return (sectionHeader + packRows + applyButton + resetButton + separator)
+        + (sectionHeader + packRows + applyButton + resetButton);
 }
 
 static float DrawPacksTab(UiContext* ui, GameSettings* settings,
@@ -338,7 +356,7 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
     ShaderPackList shaderList;
     if (ShaderPackEnumerate(&shaderList))
     {
-        for (uint32_t i = 0; i < shaderList.count && i < 5; ++i)
+        for (uint32_t i = 0; i < shaderList.count && i < 6; ++i)
         {
             uint32_t widgetId = WIDGET_SHADER_LIST_FIRST + i;
             bool isSelected = (int32_t)i == settings->selectedShaderPack;
@@ -419,6 +437,16 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
         y += 36.0f * s + 10.0f * s;
     }
 
+    if (UiButton(ui, WIDGET_SHADER_RESET, x, y,
+            width, 30.0f * s, L"Встроенные шейдеры"))
+    {
+        ShaderPackActivate(NULL);
+        RendererReloadShaders(renderer,
+            NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        settings->selectedShaderPack = -1;
+    }
+    y += 30.0f * s + 8.0f * s;
+
     y += 8.0f * s;
 
     // ─── Текстурпаки ───
@@ -430,7 +458,7 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
     TexturePackList texList;
     if (TexturePackEnumerate(&texList))
     {
-        for (uint32_t i = 0; i < texList.count && i < 5; ++i)
+        for (uint32_t i = 0; i < texList.count && i < 6; ++i)
         {
             uint32_t widgetId = WIDGET_TEXTURE_LIST_FIRST + i;
             bool isSelected = (int32_t)i == settings->selectedTexturePack;
@@ -483,12 +511,21 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
         y += 36.0f * s + 10.0f * s;
     }
 
+    if (UiButton(ui, WIDGET_TEXTURE_RESET, x, y,
+            width, 30.0f * s, L"Встроенные текстуры"))
+    {
+        TexturePackActivate(NULL);
+        RendererReloadTexturePack(renderer);
+        settings->selectedTexturePack = -1;
+    }
+    y += 30.0f * s + 8.0f * s;
+
     return y;
 }
 
 static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
-    GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
-    int32_t width, int32_t height)
+    GameSettings* settings, Renderer* renderer, Window* window,
+    float dayLengthMinutes, int32_t width, int32_t height)
 {
     float s = ui->scale;
     float panelWidth = 400.0f * s;
@@ -506,8 +543,12 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
         default:                    contentHeight = GraphicsTabHeight(ui); break;
     }
 
-    float panelHeight = padding + lineHeight + 12.0f * s
+    // Панель не выше окна: на маленьких разрешениях шапка и кнопка «Назад»
+    // остаются на месте, а середина прокручивается колесом мыши.
+    float desiredHeight = padding + lineHeight + 12.0f * s
         + tabsHeight + 12.0f * s + contentHeight + buttonHeight + padding;
+    float maxHeight = (float)height - 16.0f * s;
+    float panelHeight = desiredHeight < maxHeight ? desiredHeight : maxHeight;
 
     float panelX = ((float)width - panelWidth) * 0.5f;
     float panelY = ((float)height - panelHeight) * 0.5f;
@@ -518,34 +559,73 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     float cursorY = panelY + padding;
 
     UiTextCentered(ui, panelX + panelWidth * 0.5f, cursorY,
-        UiColor(232, 236, 244, 255), L"Настройки");
+        UI_COLOR_TEXT, L"Настройки");
     cursorY += lineHeight + 12.0f * s;
 
     UiSegmented(ui, WIDGET_TABS, contentX, cursorY, contentWidth, tabsHeight,
         TAB_LABELS, SETTINGS_TAB_COUNT, &menu->settingsTab);
     cursorY += tabsHeight + 12.0f * s;
 
+    // Видимая область контента между вкладками и кнопкой «Назад».
+    float viewportTop = cursorY;
+    float viewportBottom = panelY + panelHeight - padding
+        - buttonHeight - 10.0f * s;
+    float viewportHeight = viewportBottom - viewportTop;
+    if (viewportHeight < 40.0f * s)
+    {
+        viewportHeight = 40.0f * s;
+        viewportBottom = viewportTop + viewportHeight;
+    }
+
+    float maxScroll = contentHeight - viewportHeight;
+    if (maxScroll < 0.0f)
+    {
+        maxScroll = 0.0f;
+    }
+    menu->settingsScroll -= ui->wheelSteps * 48.0f * s;
+    if (menu->settingsScroll < 0.0f) menu->settingsScroll = 0.0f;
+    if (menu->settingsScroll > maxScroll) menu->settingsScroll = maxScroll;
+
+    UiSetClip(ui, contentX, viewportTop, contentWidth, viewportHeight);
+    float scrolledY = viewportTop - menu->settingsScroll;
     switch (menu->settingsTab)
     {
         case SETTINGS_TAB_PACKS:
-            cursorY = DrawPacksTab(ui, settings, renderer,
-                contentX, contentWidth, cursorY);
+            DrawPacksTab(ui, settings, renderer,
+                contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_ADMIN:
-            cursorY = DrawAdminTab(ui, settings, dayLengthMinutes,
-                contentX, contentWidth, cursorY);
+            DrawAdminTab(ui, settings, dayLengthMinutes,
+                contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_CONTROLS:
-            cursorY = DrawControlsTab(ui, settings,
-                contentX, contentWidth, cursorY);
+            DrawControlsTab(ui, settings,
+                contentX, contentWidth, scrolledY);
             break;
         default:
-            cursorY = DrawGraphicsTab(ui, settings, renderer,
-                contentX, contentWidth, cursorY);
+            DrawGraphicsTab(ui, settings, renderer, window,
+                contentX, contentWidth, scrolledY);
             break;
     }
+    UiClearClip(ui);
 
-    if (UiButton(ui, WIDGET_BACK, contentX, cursorY,
+    // Полоса прокрутки: подсказывает, что ниже есть ещё настройки.
+    if (maxScroll > 0.0f)
+    {
+        float trackX = panelX + panelWidth - 6.0f * s;
+        float thumbHeight = viewportHeight * (viewportHeight / contentHeight);
+        if (thumbHeight < 24.0f * s) thumbHeight = 24.0f * s;
+        float thumbTravel = viewportHeight - thumbHeight;
+        float thumbY = viewportTop
+            + thumbTravel * (maxScroll > 0.0f
+                ? menu->settingsScroll / maxScroll : 0.0f);
+        UiRect(ui, trackX, viewportTop, 3.0f * s, viewportHeight,
+            1.5f * s, UiColor(255, 255, 255, 24));
+        UiRect(ui, trackX, thumbY, 3.0f * s, thumbHeight,
+            1.5f * s, UiColor(255, 255, 255, 90));
+    }
+
+    if (UiButton(ui, WIDGET_BACK, contentX, viewportBottom + 10.0f * s,
             contentWidth, buttonHeight, L"Назад"))
     {
         menu->screen = PAUSE_MENU_MAIN;
@@ -553,8 +633,9 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 }
 
 PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
-    GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
-    int32_t width, int32_t height, bool escapePressed)
+    GameSettings* settings, Renderer* renderer, Window* window,
+    float dayLengthMinutes, int32_t width, int32_t height,
+    bool escapePressed)
 {
     if (menu->screen == PAUSE_MENU_CLOSED)
     {
@@ -582,7 +663,7 @@ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
         return UpdateMainScreen(menu, ui, width, height);
     }
 
-    UpdateSettingsScreen(menu, ui, settings, renderer, dayLengthMinutes,
-        width, height);
+    UpdateSettingsScreen(menu, ui, settings, renderer, window,
+        dayLengthMinutes, width, height);
     return PAUSE_MENU_ACTION_NONE;
 }

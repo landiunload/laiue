@@ -5,7 +5,7 @@
 
 bool UiBegin(UiContext* ui, int32_t width, int32_t height,
     float mouseX, float mouseY, bool mouseDown, bool mousePressed,
-    float deltaSeconds)
+    float wheelSteps, float deltaSeconds)
 {
     if (ui == NULL || width <= 0 || height <= 0)
     {
@@ -38,6 +38,8 @@ bool UiBegin(UiContext* ui, int32_t width, int32_t height,
     ui->mouseY = mouseY;
     ui->mouseDown = mouseDown;
     ui->mousePressed = mousePressed;
+    ui->wheelSteps = wheelSteps;
+    ui->clipEnabled = false;
     ui->deltaSeconds = deltaSeconds;
     ui->quadCount = 0;
     if (!mouseDown)
@@ -76,6 +78,63 @@ static uint32_t LerpColor(uint32_t from, uint32_t to, float t)
     return result;
 }
 
+void UiSetClip(UiContext* ui, float x, float y, float width, float height)
+{
+    ui->clipEnabled = true;
+    ui->clipRect[0] = x;
+    ui->clipRect[1] = y;
+    ui->clipRect[2] = x + width;
+    ui->clipRect[3] = y + height;
+}
+
+void UiClearClip(UiContext* ui)
+{
+    ui->clipEnabled = false;
+}
+
+// Подрезает готовый квад по прямоугольнику клипа; UV пересчитываются
+// пропорционально срезанным сторонам. false — квад целиком за пределами.
+static bool ClipQuad(const UiContext* ui, RendererUiQuad* quad)
+{
+    if (!ui->clipEnabled)
+    {
+        return true;
+    }
+
+    float x0 = quad->rect[0];
+    float y0 = quad->rect[1];
+    float x1 = quad->rect[2];
+    float y1 = quad->rect[3];
+    float clippedX0 = x0 > ui->clipRect[0] ? x0 : ui->clipRect[0];
+    float clippedY0 = y0 > ui->clipRect[1] ? y0 : ui->clipRect[1];
+    float clippedX1 = x1 < ui->clipRect[2] ? x1 : ui->clipRect[2];
+    float clippedY1 = y1 < ui->clipRect[3] ? y1 : ui->clipRect[3];
+    if (clippedX0 >= clippedX1 || clippedY0 >= clippedY1)
+    {
+        return false;
+    }
+
+    float width = x1 - x0;
+    float height = y1 - y0;
+    if (width > 0.0f && height > 0.0f)
+    {
+        float u0 = quad->uv[0];
+        float v0 = quad->uv[1];
+        float uSpan = quad->uv[2] - u0;
+        float vSpan = quad->uv[3] - v0;
+        quad->uv[0] = u0 + uSpan * ((clippedX0 - x0) / width);
+        quad->uv[1] = v0 + vSpan * ((clippedY0 - y0) / height);
+        quad->uv[2] = u0 + uSpan * ((clippedX1 - x0) / width);
+        quad->uv[3] = v0 + vSpan * ((clippedY1 - y0) / height);
+    }
+
+    quad->rect[0] = clippedX0;
+    quad->rect[1] = clippedY0;
+    quad->rect[2] = clippedX1;
+    quad->rect[3] = clippedY1;
+    return true;
+}
+
 static RendererUiQuad* PushQuad(UiContext* ui)
 {
     if (ui->quadCount == UI_MAX_DRAW_QUADS)
@@ -104,6 +163,10 @@ void UiRect(UiContext* ui, float x, float y, float width, float height,
     quad->rect[3] = y + height;
     quad->cornerRadius = cornerRadius;
     quad->colorRGBA = color;
+    if (!ClipQuad(ui, quad))
+    {
+        --ui->quadCount;
+    }
 }
 
 void UiPanel(UiContext* ui, float x, float y, float width, float height)
@@ -147,6 +210,10 @@ void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
             quad->uv[3] = glyph->v1;
             quad->colorRGBA = color;
             quad->flags = RENDERER_UI_QUAD_TEXT;
+            if (!ClipQuad(ui, quad))
+            {
+                --ui->quadCount;
+            }
         }
         penX += glyph->advance;
     }

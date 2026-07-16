@@ -1,5 +1,6 @@
 #include "render/shader_pack.h"
 #include "content/content_format.h"
+#include "content/content_catalog.h"
 
 #include <windows.h>
 #include <string.h>
@@ -236,114 +237,14 @@ void ShaderPackListRelease(ShaderPackList* list)
 
 bool ShaderPackActivate(const wchar_t* name)
 {
+    // Пустой выбор сбрасывает активный пак; иначе имя и существование
+    // каталога .lsp проверяет единый каталог содержимого.
     if (name == NULL || name[0] == L'\0')
     {
-        return false;
+        return LaiueContentSetActivePack(LAIUE_CONTENT_SHADER_PACK, NULL);
     }
-
-    wchar_t* pathBuf = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (pathBuf == NULL)
-    {
-        return false;
-    }
-
-    // "Default" — удаляем active.txt, чтобы использовались встроенные шейдеры
-    if (LiteralMatch(name, L"Default"))
-    {
-        uint32_t directoryLength = 0;
-        bool ok = GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength)
-            && BuildPath(pathBuf, PATH_CAPACITY_CHARS, directoryLength,
-                SHADER_PACK_DIR L"active.txt");
-        if (ok && !DeleteFileW(pathBuf) && GetLastError() != ERROR_FILE_NOT_FOUND)
-        {
-            ok = false;
-        }
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return ok;
-    }
-
-    if (!LaiueContentNameIsSafe(name)
-        || !LaiueContentNameMatches(LAIUE_CONTENT_SHADER_PACK, name))
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-
-    uint32_t nameLen = 0;
-    while (name[nameLen] != L'\0')
-    {
-        if (name[nameLen] > 0x7f)
-        {
-            HeapFree(GetProcessHeap(), 0, pathBuf);
-            return false;
-        }
-        ++nameLen;
-    }
-    if (nameLen >= SHADER_PACK_NAME_MAX)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-
-    // Строим путь к директории пака
-    uint32_t directoryLength = 0;
-    if (!GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength))
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-
-    uint32_t dirPrefixLen = directoryLength + LiteralLength(SHADER_PACK_DIR);
-    if (dirPrefixLen + nameLen + 1u > PATH_CAPACITY_CHARS)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-    for (uint32_t i = 0; i < dirPrefixLen; ++i)
-    {
-        pathBuf[i] = i < directoryLength
-            ? pathBuf[i]
-            : SHADER_PACK_DIR[i - directoryLength];
-    }
-    for (uint32_t i = 0; i < nameLen; ++i)
-    {
-        pathBuf[dirPrefixLen + i] = name[i];
-    }
-    pathBuf[dirPrefixLen + nameLen] = L'\0';
-
-    DWORD attributes = GetFileAttributesW(pathBuf);
-    if (attributes == INVALID_FILE_ATTRIBUTES
-        || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-
-    // Пишем имя в active.txt
-    pathBuf[dirPrefixLen] = L'\0';
-    memcpy(pathBuf + dirPrefixLen, L"active.txt", 12 * sizeof(wchar_t));
-
-    HANDLE file = CreateFileW(pathBuf, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-    DWORD written = 0;
-    uint8_t ascii[128];
-    for (uint32_t i = 0; i < nameLen; ++i)
-    {
-        ascii[i] = (uint8_t)name[i];
-    }
-    ascii[nameLen] = '\n';
-    bool ok = WriteFile(file, ascii, nameLen + 1, &written, NULL);
-    CloseHandle(file);
-    HeapFree(GetProcessHeap(), 0, pathBuf);
-    return ok && written == nameLen + 1;
+    return LaiueContentSetActivePack(LAIUE_CONTENT_SHADER_PACK, name);
 }
-
 static bool ReadActivePackName(wchar_t* dirPath, uint32_t dirPrefixLen,
     uint8_t* outName, uint32_t* outNameLen, uint32_t nameCapacity)
 {

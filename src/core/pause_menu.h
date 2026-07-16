@@ -3,6 +3,7 @@
 #include "core/game_time.h"
 #include "core/panorama.h"
 #include "core/ui.h"
+#include "platform/window.h"
 #include "render/renderer.h"
 
 #include <stdbool.h>
@@ -55,6 +56,7 @@ typedef struct PauseMenu
 {
     PauseMenuScreen screen;
     int32_t settingsTab;   // 0 — графика, 1 — паки, 2 — администрирование, 3 — управление
+    float settingsScroll;  // прокрутка контента настроек, px (0 — верх)
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);
@@ -64,5 +66,6 @@ void PauseMenuOpen(PauseMenu* menu);
 // экран, на главном — продолжает игру). dayLengthMinutes — длительность
 // суток для подписи пресета «Обычная».
 PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
-    GameSettings* settings, Renderer* renderer, float dayLengthMinutes,
-    int32_t width, int32_t height, bool escapePressed);
+    GameSettings* settings, Renderer* renderer, Window* window,
+    float dayLengthMinutes, int32_t width, int32_t height,
+    bool escapePressed);

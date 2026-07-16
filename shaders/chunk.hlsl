@@ -7,6 +7,7 @@ cbuffer FrameConstants : register(b0)
     float3 sunDirection;    // единичный, от источника света к миру
     float3 sunColor;
     float3 ambientColor;
+    float gammaInverse;     // 1/gamma; упакован в свободный w ambientColor
 };
 
 ByteAddressBuffer quadBuffer : register(t0);
@@ -134,5 +135,6 @@ float4 PSMain(PixelInput input) : SV_TARGET
     float diffuse = saturate(dot(worldNormal, -sunDirection));
     float3 light = ambientColor * (FACE_SHADE[face] * occlusion)
         + sunColor * (diffuse * (0.55 + 0.45 * occlusion));
-    return float4(baseColor * light, 1.0);
+    float3 shaded = pow(saturate(baseColor * light), gammaInverse);
+    return float4(shaded, 1.0);
 }

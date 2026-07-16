@@ -1,5 +1,6 @@
 #include "render/texture_pack.h"
 #include "content/content_format.h"
+#include "content/content_catalog.h"
 
 #include <windows.h>
 #include <string.h>
@@ -624,64 +625,14 @@ void TexturePackListRelease(TexturePackList* list)
 
 bool TexturePackActivate(const wchar_t* name)
 {
+    // NULL или пустая строка сбрасывают выбор — игра вернётся к встроенной
+    // текстуре при следующей перезагрузке пака.
     if (name == NULL || name[0] == L'\0')
     {
-        return false;
+        return LaiueContentSetActivePack(LAIUE_CONTENT_TEXTURE_PACK, NULL);
     }
 
-    // Проверяем, что имя безопасное (только ASCII буквы, цифры, '_', '-', '.')
-    uint32_t nameLen = 0;
-    while (name[nameLen] != L'\0')
-    {
-        wchar_t c = name[nameLen];
-        if (!((c >= L'a' && c <= L'z')
-            || (c >= L'A' && c <= L'Z')
-            || (c >= L'0' && c <= L'9')
-            || c == L'_' || c == L'-' || c == L'.'))
-        {
-            return false;
-        }
-        ++nameLen;
-    }
-    if (nameLen == 0 || nameLen > ACTIVE_NAME_MAX_BYTES
-        || !LaiueContentNameIsSafe(name)
-        || !LaiueContentNameMatches(LAIUE_CONTENT_TEXTURE_PACK, name))
-    {
-        return false;
-    }
-
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (path == NULL)
-    {
-        return false;
-    }
-
-    uint32_t directoryLength = 0;
-    if (!GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
-        || !BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\textures\\active.txt"))
-    {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    HeapFree(GetProcessHeap(), 0, path);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    DWORD written = 0;
-    uint8_t ascii[ACTIVE_NAME_MAX_BYTES + 2];
-    for (uint32_t i = 0; i < nameLen; ++i)
-    {
-        ascii[i] = (uint8_t)name[i];
-    }
-    ascii[nameLen] = '\n';
-    bool ok = WriteFile(file, ascii, nameLen + 1, &written, NULL);
-    CloseHandle(file);
-    return ok && written == nameLen + 1;
+    // Валидация имени и формата, запись active.txt и проверка существования
+    // пака целиком живут в едином каталоге содержимого.
+    return LaiueContentSetActivePack(LAIUE_CONTENT_TEXTURE_PACK, name);
 }

@@ -37,10 +37,10 @@
 // float3 выравниваются по границам 16 байт):
 // dword 0..15 — view-projection, 16..18 — смещение чанка,
 // 20..22 — направление от солнца, 24..26 — цвет солнца, 28..30 — ambient.
-#define ROOT_CONSTANT_COUNT 31
+#define ROOT_CONSTANT_COUNT 32
 #define ROOT_CONSTANT_ORIGIN_OFFSET 16
 #define ROOT_CONSTANT_LIGHTING_OFFSET 20
-#define ROOT_CONSTANT_LIGHTING_COUNT 11
+#define ROOT_CONSTANT_LIGHTING_COUNT 12
 #define ROOT_PARAMETER_CONSTANTS 0
 #define ROOT_PARAMETER_QUAD_BUFFER 1
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
@@ -1738,10 +1738,12 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // Свет кадра: float3 в cbuffer выровнены по 16 байт, между ними pad.
+    float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
     float lighting[ROOT_CONSTANT_LIGHTING_COUNT] = {
         frame->sunDirection[0], frame->sunDirection[1], frame->sunDirection[2], 0.0f,
         frame->sunColor[0], frame->sunColor[1], frame->sunColor[2], 0.0f,
         frame->ambientColor[0], frame->ambientColor[1], frame->ambientColor[2],
+        gammaInverse,
     };
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
         ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_LIGHTING_COUNT, lighting,

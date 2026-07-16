@@ -34,3 +34,11 @@ LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
 LAIUE_WINDOW_API void    WindowGetCursorClientPosition(const Window* window,
     int32_t* x, int32_t* y);
 LAIUE_WINDOW_API void    WindowRequestClose(Window* window);
+
+// Накопленные с прошлого вызова щелчки колеса мыши (положительные — от себя).
+LAIUE_WINDOW_API float   WindowConsumeMouseWheelSteps(Window* window);
+
+// Полноэкранный режим без рамки на текущем мониторе. Обычный оконный
+// режим восстанавливает прежние стиль и положение окна.
+LAIUE_WINDOW_API void    WindowSetFullscreen(Window* window, bool enabled);
+LAIUE_WINDOW_API bool    WindowIsFullscreen(const Window* window);
