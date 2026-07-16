@@ -24,6 +24,7 @@ add_subdirectory(src/platform)
 add_subdirectory(src/input)
 add_subdirectory(src/world)
 add_subdirectory(src/mesh)
+add_subdirectory(src/content)
 add_subdirectory(src/render)
 add_subdirectory(src/physics)
 add_subdirectory(src/gameplay)
@@ -35,18 +36,21 @@ target_link_libraries(laiue PRIVATE laiue_common laiue_runtime kernel32)
 # Core загружается через LoadLibraryW, поэтому обычной link-зависимости у
 # launcher нет. Явная build-зависимость собирает core и весь его граф DLL
 # даже при сборке только цели laiue.
-add_custom_target(laiue_texturepacks
+# Канонические каталоги пользовательского содержимого. Форматы и каталоги
+# описаны единым модулем laiue_content; CMake только готовит runtime-структуру.
+add_custom_target(laiue_content_files
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "$<TARGET_FILE_DIR:laiue>/resources"
+        "$<TARGET_FILE_DIR:laiue>/mods"
+        "$<TARGET_FILE_DIR:laiue>/shaders"
+        "$<TARGET_FILE_DIR:laiue>/data"
+        "$<TARGET_FILE_DIR:laiue>/textures"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${PROJECT_SOURCE_DIR}/assets/texturepacks"
-        "$<TARGET_FILE_DIR:laiue>/texturepacks"
-    COMMENT "Копирование текстурпаков"
+        "$<TARGET_FILE_DIR:laiue>/textures"
+    COMMENT "Подготовка ресурсов, модов, шейдеров, данных и текстур"
 )
-add_custom_target(laiue_shaders
-    COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "$<TARGET_FILE_DIR:laiue>/shaders"
-    COMMENT "Создание директории шейдерпаков"
-)
-add_dependencies(laiue laiue_core laiue_texturepacks laiue_shaders)
+add_dependencies(laiue laiue_core laiue_content_files)
 target_link_options(laiue PRIVATE
     /ENTRY:EntryPoint
     /STACK:262144,4096

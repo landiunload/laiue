@@ -55,7 +55,7 @@ typedef struct TexturePackSubresource
     uint32_t byteCount;
 } TexturePackSubresource;
 
-// Looks for <exe-directory>/texturepacks/active.txt. The file must contain a
+// Looks for <exe-directory>/textures/active.txt. The file must contain a
 // safe ASCII .ltp file name from the same directory. Missing or invalid input
 // is deliberately non-fatal: outPack receives a built-in 1x1 fallback.
 // Release an already loaded pack before loading another one into the same

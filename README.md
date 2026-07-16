@@ -74,11 +74,16 @@ laiue_add_module(имя SOURCES <файлы...> [LINK <библиотеки...>]
 Точные ускорения, трение и времена анимации описаны в
 [docs/player_physics.md](docs/player_physics.md).
 
-## Текстурпаки
+## Пользовательское содержимое
 
-Игра загружает компактные `.ltp`-паки из каталога `texturepacks` рядом с
-исполняемым файлом. Формат, выбор активного пака и импорт PNG/Patrix описаны
-в [docs/texturepacks.md](docs/texturepacks.md).
+Единая система различает ресурсы `.lr/.lrp`, моды `.lm/.lmp`, шейдеры
+`.ls/.lsp`, данные `.ld/.ldp` и текстуры `.lt/.ltp`. Форматы не подменяют
+друг друга; каталоги и правила описаны в
+[docs/content_formats.md](docs/content_formats.md).
+
+Текстурпаки `.ltp` загружаются из каталога `textures` рядом с исполняемым
+файлом. Формат LTP и сборка исходных PNG описаны в
+[docs/texturepacks.md](docs/texturepacks.md).
 
 ## Время, свет и текстуры
 

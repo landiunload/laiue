@@ -56,3 +56,9 @@
 #else
 #define LAIUE_INTERACTION_API __declspec(dllimport)
 #endif
+
+#if defined(LAIUE_BUILD_CONTENT)
+#define LAIUE_CONTENT_API __declspec(dllexport)
+#else
+#define LAIUE_CONTENT_API __declspec(dllimport)
+#endif

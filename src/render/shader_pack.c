@@ -1,4 +1,5 @@
 #include "render/shader_pack.h"
+#include "content/content_format.h"
 
 #include <windows.h>
 #include <string.h>
@@ -100,7 +101,9 @@ bool ShaderPackEnumerate(ShaderPackList* outList)
         do
         {
             if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-                && findData.cFileName[0] != L'.')
+                && findData.cFileName[0] != L'.'
+                && LaiueContentNameMatches(
+                    LAIUE_CONTENT_SHADER_PACK, findData.cFileName))
             {
                 ++subdirCount;
             }
@@ -172,7 +175,9 @@ bool ShaderPackEnumerate(ShaderPackList* outList)
         do
         {
             if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
-                || findData.cFileName[0] == L'.')
+                || findData.cFileName[0] == L'.'
+                || !LaiueContentNameMatches(
+                    LAIUE_CONTENT_SHADER_PACK, findData.cFileName))
             {
                 continue;
             }
@@ -249,28 +254,33 @@ bool ShaderPackActivate(const wchar_t* name)
         uint32_t directoryLength = 0;
         bool ok = GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength)
             && BuildPath(pathBuf, PATH_CAPACITY_CHARS, directoryLength,
-                SHADER_PACK_DIR L"active.txt")
-            && DeleteFileW(pathBuf);
+                SHADER_PACK_DIR L"active.txt");
+        if (ok && !DeleteFileW(pathBuf) && GetLastError() != ERROR_FILE_NOT_FOUND)
+        {
+            ok = false;
+        }
         HeapFree(GetProcessHeap(), 0, pathBuf);
         return ok;
     }
 
-    // Проверяем безопасность имени
+    if (!LaiueContentNameIsSafe(name)
+        || !LaiueContentNameMatches(LAIUE_CONTENT_SHADER_PACK, name))
+    {
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return false;
+    }
+
     uint32_t nameLen = 0;
     while (name[nameLen] != L'\0')
     {
-        wchar_t c = name[nameLen];
-        if (!((c >= L'a' && c <= L'z')
-            || (c >= L'A' && c <= L'Z')
-            || (c >= L'0' && c <= L'9')
-            || c == L'_' || c == L'-'))
+        if (name[nameLen] > 0x7f)
         {
             HeapFree(GetProcessHeap(), 0, pathBuf);
             return false;
         }
         ++nameLen;
     }
-    if (nameLen == 0 || nameLen > 64)
+    if (nameLen >= SHADER_PACK_NAME_MAX)
     {
         HeapFree(GetProcessHeap(), 0, pathBuf);
         return false;
@@ -473,9 +483,9 @@ bool ShaderPackLoadActiveBytecode(
     packDirLen++;
 
     static const wchar_t* const shaderFiles[6] = {
-        L"chunk_vs.cso", L"chunk_ps.cso",
-        L"panorama_vs.cso", L"panorama_ps.cso",
-        L"ui_vs.cso", L"ui_ps.cso",
+        L"chunk_vs.ls", L"chunk_ps.ls",
+        L"panorama_vs.ls", L"panorama_ps.ls",
+        L"ui_vs.ls", L"ui_ps.ls",
     };
     void** outPtrs[6] = {
         outChunkVS, outChunkPS,

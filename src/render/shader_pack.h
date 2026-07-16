@@ -23,6 +23,8 @@ LAIUE_RENDER_API bool ShaderPackEnumerate(ShaderPackList* outList);
 LAIUE_RENDER_API void ShaderPackListRelease(ShaderPackList* list);
 LAIUE_RENDER_API bool ShaderPackActivate(const wchar_t* name);
 
+// Кастомный шейдерпак — каталог <exe>/shaders/<name>.lsp.
+// Каждый байткод внутри него является отдельным файлом .ls.
 // Загружает байткод шейдеров из активного шейдерпака.
 // Если активного кастомного пака нет — возвращает false (использовать встроенные).
 // Вызывающий владеет возвращёнными буферами (освобождать через HeapFree).

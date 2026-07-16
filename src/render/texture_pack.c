@@ -1,4 +1,5 @@
 #include "render/texture_pack.h"
+#include "content/content_format.h"
 
 #include <windows.h>
 #include <string.h>
@@ -128,11 +129,7 @@ static bool HasPackExtension(const uint8_t* name, uint32_t length)
     uint8_t ext3 = AsciiLower(name[length - 3u]);
     uint8_t ext2 = AsciiLower(name[length - 2u]);
     uint8_t ext1 = AsciiLower(name[length - 1u]);
-    if (ext4 == '.' && ext3 == 'l' && ext2 == 't' && ext1 == 'p')
-        return true;
-    if (ext4 == '.' && ext3 == 'l' && ext2 == 'r' && ext1 == 'p')
-        return true;
-    return false;
+    return ext4 == '.' && ext3 == 'l' && ext2 == 't' && ext1 == 'p';
 }
 
 #define HasLtpExtension HasPackExtension
@@ -327,15 +324,15 @@ void TexturePackLoadActive(TexturePackData* outPack)
     uint32_t activeNameLength = 0;
     bool ready = GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
         && BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\texturepacks\\active.txt")
+            L"\\textures\\active.txt")
         && ReadActiveName(path, activeName, &activeNameLength)
         && BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\texturepacks\\");
+            L"\\textures\\");
 
     if (ready)
     {
         uint32_t prefixLength = directoryLength
-            + LiteralLength(L"\\texturepacks\\");
+            + LiteralLength(L"\\textures\\");
         if (prefixLength + activeNameLength + 1u <= PATH_CAPACITY_CHARS)
         {
             for (uint32_t i = 0; i < activeNameLength; ++i)
@@ -506,13 +503,13 @@ bool TexturePackEnumerate(TexturePackList* outList)
     uint32_t directoryLength = 0;
     if (!GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength)
         || !BuildPath(pathBuf, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\texturepacks\\"))
+            L"\\textures\\"))
     {
         HeapFree(GetProcessHeap(), 0, pathBuf);
         return false;
     }
 
-    uint32_t dirLen = directoryLength + LiteralLength(L"\\texturepacks\\");
+    uint32_t dirLen = directoryLength + LiteralLength(L"\\textures\\");
 
     // Создаём шаблон поиска: "<dir>*.*" — фильтруем расширение в цикле
     pathBuf[dirLen] = L'*';
@@ -534,23 +531,10 @@ bool TexturePackEnumerate(TexturePackList* outList)
         {
             continue;
         }
-        // Проверяем расширение: .ltp или .lrp
-        uint32_t nameLen = 0;
-        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
-        if (nameLen > 4)
+        if (LaiueContentNameMatches(
+                LAIUE_CONTENT_TEXTURE_PACK, findData.cFileName))
         {
-            uint8_t ascii[8];
-            for (uint32_t ci = 0; ci < 4 && ci < nameLen; ++ci)
-                ascii[4 - 1 - ci] = (uint8_t)(
-                    findData.cFileName[nameLen - 1 - ci] >= L'A'
-                    && findData.cFileName[nameLen - 1 - ci] <= L'Z'
-                    ? findData.cFileName[nameLen - 1 - ci] - L'A' + 'a'
-                    : findData.cFileName[nameLen - 1 - ci]);
-            if ((ascii[0] == 't' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')
-                || (ascii[0] == 'r' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.'))
-            {
-                ++capacity;
-            }
+            ++capacity;
         }
     }
     while (FindNextFileW(findHandle, &findData));
@@ -592,22 +576,13 @@ bool TexturePackEnumerate(TexturePackList* outList)
         {
             continue;
         }
-        uint32_t nameLen = 0;
-        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
-        // Проверяем расширение
-        if (nameLen <= 4) continue;
-        uint8_t ascii[4];
-        for (uint32_t ci = 0; ci < 4; ++ci)
-            ascii[3 - ci] = (uint8_t)(
-                findData.cFileName[nameLen - 1 - ci] >= L'A'
-                && findData.cFileName[nameLen - 1 - ci] <= L'Z'
-                ? findData.cFileName[nameLen - 1 - ci] - L'A' + 'a'
-                : findData.cFileName[nameLen - 1 - ci]);
-        if (!((ascii[0] == 't' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')
-            || (ascii[0] == 'r' && ascii[1] == 'p' && ascii[2] == 'l' && ascii[3] == '.')))
+        if (!LaiueContentNameMatches(
+                LAIUE_CONTENT_TEXTURE_PACK, findData.cFileName))
         {
             continue;
         }
+        uint32_t nameLen = 0;
+        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
 
         if (index >= capacity)
         {
@@ -669,7 +644,8 @@ bool TexturePackActivate(const wchar_t* name)
         ++nameLen;
     }
     if (nameLen == 0 || nameLen > ACTIVE_NAME_MAX_BYTES
-        || !HasLtpExtension((const uint8_t*)name, nameLen))
+        || !LaiueContentNameIsSafe(name)
+        || !LaiueContentNameMatches(LAIUE_CONTENT_TEXTURE_PACK, name))
     {
         return false;
     }
@@ -684,7 +660,7 @@ bool TexturePackActivate(const wchar_t* name)
     uint32_t directoryLength = 0;
     if (!GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
         || !BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\texturepacks\\active.txt"))
+            L"\\textures\\active.txt"))
     {
         HeapFree(GetProcessHeap(), 0, path);
         return false;

@@ -218,8 +218,10 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
     }
     y += toggleRowHeight + 12.0f * s;
 
-    FormatValueSuffix(text, MENU_TEXT_CAPACITY, settings->gamma, L"%");
-    y = LabelValueRow(ui, x, width, y, L"Гамма", text);
+    UiFormatUnsignedSuffix(text, MENU_TEXT_CAPACITY,
+        (uint32_t)settings->gamma, L"%");
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Гамма", text, UiScaled(ui, 6.0f));
     UiSliderInt(ui, WIDGET_GAMMA_SLIDER, x, y, width,
         50, 150, &settings->gamma);
     y += 20.0f * s + 12.0f * s;
@@ -421,8 +423,8 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
 
     // ─── Текстурпаки ───
     UiText(ui, x, y, UiColor(232, 236, 244, 255), L"Текстурпаки");
-    UiText(ui, x + width - UiTextWidth(ui, L".ltp/.lrp"), y,
-        UiColor(108, 148, 255, 255), L".ltp/.lrp");
+    UiText(ui, x + width - UiTextWidth(ui, L".ltp"), y,
+        UiColor(108, 148, 255, 255), L".ltp");
     y += lineHeight + 12.0f * s;
 
     TexturePackList texList;

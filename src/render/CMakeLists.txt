@@ -29,6 +29,7 @@ laiue_add_module(render
         "${generated_directory}/ui_vs.h"
         "${generated_directory}/ui_ps.h"
     LINK
+        laiue_content
         d3d12
         dxgi
         dxguid
