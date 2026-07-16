@@ -31,6 +31,11 @@ target_compile_definitions(laiue_compile_settings INTERFACE
     WIN32_LEAN_AND_MEAN
     UNICODE
     _UNICODE
+    # Версия игры доступна каждому модулю: подпись в меню и проверка
+    # совместимости модов (game = MAJOR.MINOR в манифесте).
+    "LAIUE_VERSION_TEXT=L\"${PROJECT_VERSION}\""
+    LAIUE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    LAIUE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
 )
 
 target_compile_options(laiue_compile_settings INTERFACE

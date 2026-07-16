@@ -94,3 +94,9 @@ LAIUE_GAMEPLAY_API bool PlayerControllerIsCrouching(
 // Внешний толчок не проходит через sneak-защиту края.
 LAIUE_GAMEPLAY_API void PlayerControllerApplyImpulse(
     PlayerController* controller, float x, float y, float z);
+
+// Правила воздушных прыжков (реестр параметров модов): применяется
+// вживую; в полёте лимит только ужимается, дар прыжка не происходит.
+LAIUE_GAMEPLAY_API void PlayerControllerSetAirJumps(
+    PlayerController* controller, int32_t extraAirJumps,
+    double airJumpImpulse, bool refillOnGround);

@@ -12,7 +12,7 @@ enum
     WIDGET_SETTINGS,
     WIDGET_QUIT,
     WIDGET_BACK,
-    WIDGET_TABS = 8,             // + индекс вкладки
+    WIDGET_TABS = 8,             // + индекс вкладки (два ряда)
     WIDGET_FOV_SLIDER = 16,
     WIDGET_VSYNC,
     WIDGET_TIME_SLIDER,
@@ -29,20 +29,28 @@ enum
     WIDGET_FULLSCREEN = 120,
     WIDGET_SHADER_RESET,
     WIDGET_TEXTURE_RESET,
+    WIDGET_MOD_TOGGLE_FIRST = 160,
 };
 
 enum
 {
     SETTINGS_TAB_GRAPHICS = 0,
-    SETTINGS_TAB_PACKS,
+    SETTINGS_TAB_TEXTURES,
+    SETTINGS_TAB_SHADERS,
+    SETTINGS_TAB_MODS,
     SETTINGS_TAB_ADMIN,
     SETTINGS_TAB_CONTROLS,
     SETTINGS_TAB_COUNT,
 };
 
-static const wchar_t* const TAB_LABELS[SETTINGS_TAB_COUNT] = {
+// Шесть вкладок в два ряда по три сегмента.
+static const wchar_t* const TAB_LABELS_TOP[3] = {
     L"Графика",
-    L"Паки",
+    L"Текстуры",
+    L"Шейдеры",
+};
+static const wchar_t* const TAB_LABELS_BOTTOM[3] = {
+    L"Моды",
     L"Админ",
     L"Управление",
 };
@@ -71,7 +79,8 @@ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
     float padding = 20.0f * s;
     float titleHeight = ui->font.lineHeight;
     float panelHeight = padding + titleHeight + 16.0f * s
-        + buttonHeight * 3.0f + buttonGap * 2.0f + padding;
+        + buttonHeight * 3.0f + buttonGap * 2.0f
+        + 12.0f * s + titleHeight + padding;
 
     float panelX = ((float)width - panelWidth) * 0.5f;
     float panelY = ((float)height - panelHeight) * 0.5f;
@@ -105,6 +114,10 @@ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
     {
         action = PAUSE_MENU_ACTION_QUIT;
     }
+    cursorY += buttonHeight + 12.0f * s;
+
+    UiTextCentered(ui, panelX + panelWidth * 0.5f, cursorY,
+        UiColor(150, 158, 172, 160), L"laiue " LAIUE_VERSION_TEXT);
 
     return action;
 }
@@ -137,8 +150,7 @@ static float GraphicsTabHeight(const UiContext* ui)
         + (line + 6.0f * s)
         + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 12.0f * s
         + 30.0f * s + 14.0f * s
-        + 30.0f * s + 14.0f * s
-        + (22.0f * s + 12.0f * s) + (line + 6.0f * s) + (20.0f * s + 12.0f * s);
+        + 30.0f * s + 14.0f * s;
 }
 
 static float AdminTabHeight(const UiContext* ui)
@@ -216,34 +228,7 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
     {
         WindowSetFullscreen(window, fullscreen);
     }
-    y += rowHeight + 14.0f * s;
-
-    // === Настройки шейдера ===
-    UiText(ui, x, y, UiColor(150, 158, 172, 255), L"Шейдер");
-    y += ui->font.lineHeight + 6.0f * s;
-
-    float toggleRowHeight = 22.0f * s;
-    float toggleRowTop = y + (toggleRowHeight - UiScaled(ui, 22.0f)) * 0.5f;
-    UiText(ui, x, y + (toggleRowHeight - ui->font.lineHeight) * 0.5f,
-        UiColor(232, 236, 244, 255), L"Каркасный режим");
-    bool wireframe = settings->wireframe;
-    if (UiToggle(ui, WIDGET_WIREFRAME, x + width - UiScaled(ui, 40.0f), toggleRowTop,
-            &wireframe))
-    {
-        settings->wireframe = wireframe;
-        RendererSetWireframe(renderer, wireframe);
-    }
-    y += toggleRowHeight + 12.0f * s;
-
-    UiFormatUnsignedSuffix(text, MENU_TEXT_CAPACITY,
-        (uint32_t)settings->gamma, L"%");
-    y = UiLabelValueRow(ui, x, width, y,
-        L"Гамма", text, UiScaled(ui, 6.0f));
-    UiSliderInt(ui, WIDGET_GAMMA_SLIDER, x, y, width,
-        50, 150, &settings->gamma);
-    y += 20.0f * s + 12.0f * s;
-
-    return y;
+    return y + rowHeight + 14.0f * s;
 }
 
 static float DrawAdminTab(UiContext* ui, GameSettings* settings,
@@ -324,28 +309,40 @@ static float DrawControlsTab(UiContext* ui, GameSettings* settings,
     return y + 20.0f * s + 12.0f * s + 2.0f * s;
 }
 
-// === Паки (шейдерпаки + текстурпаки) ===
+// === Вкладки «Текстуры» и «Шейдеры» (по паку на вкладку) ===
 
-static float PacksTabHeight(const UiContext* ui)
+static float PackSectionHeight(const UiContext* ui)
 {
     float s = ui->scale;
     float line = ui->font.lineHeight;
-    // Заголовок шейдерпаков + до 5 строк + кнопка Apply (если есть)
-    // + заголовок текстурпаков + до 5 строк + кнопка Apply (если есть)
     float sectionHeader = line + 12.0f * s;
     float packRows = 30.0f * s * 6.0f + 4.0f * s * 5.0f;
     float applyButton = 36.0f * s + 10.0f * s;
     float resetButton = 30.0f * s + 8.0f * s;
-    float separator = 12.0f * s;
-    return (sectionHeader + packRows + applyButton + resetButton + separator)
-        + (sectionHeader + packRows + applyButton + resetButton);
+    return sectionHeader + packRows + 4.0f * s + applyButton + resetButton;
 }
 
-static float DrawPacksTab(UiContext* ui, GameSettings* settings,
+static float TexturesTabHeight(const UiContext* ui)
+{
+    return PackSectionHeight(ui);
+}
+
+static float ShadersTabHeight(const UiContext* ui)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    return PackSectionHeight(ui)
+        + 8.0f * s
+        + (22.0f * s + 12.0f * s)                      // каркасный режим
+        + (line + 6.0f * s) + (20.0f * s + 12.0f * s); // гамма
+}
+
+static float DrawShadersTab(UiContext* ui, GameSettings* settings,
     Renderer* renderer, float x, float width, float y)
 {
     float s = ui->scale;
     float lineHeight = ui->font.lineHeight;
+    wchar_t text[MENU_TEXT_CAPACITY];
 
     // ─── Шейдерпаки ───
     UiText(ui, x, y, UiColor(232, 236, 244, 255), L"Шейдерпаки");
@@ -449,6 +446,35 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
 
     y += 8.0f * s;
 
+    // ─── Параметры шейдера ───
+    float toggleRowHeight = 22.0f * s;
+    float toggleRowTop = y + (toggleRowHeight - UiScaled(ui, 22.0f)) * 0.5f;
+    UiText(ui, x, y + (toggleRowHeight - lineHeight) * 0.5f,
+        UI_COLOR_TEXT, L"Каркасный режим");
+    bool wireframe = settings->wireframe;
+    if (UiToggle(ui, WIDGET_WIREFRAME, x + width - UiScaled(ui, 40.0f),
+            toggleRowTop, &wireframe))
+    {
+        settings->wireframe = wireframe;
+        RendererSetWireframe(renderer, wireframe);
+    }
+    y += toggleRowHeight + 12.0f * s;
+
+    UiFormatUnsignedSuffix(text, MENU_TEXT_CAPACITY,
+        (uint32_t)settings->gamma, L"%");
+    y = UiLabelValueRow(ui, x, width, y,
+        L"Гамма", text, UiScaled(ui, 6.0f));
+    UiSliderInt(ui, WIDGET_GAMMA_SLIDER, x, y, width,
+        50, 150, &settings->gamma);
+    return y + 20.0f * s + 12.0f * s;
+}
+
+static float DrawTexturesTab(UiContext* ui, GameSettings* settings,
+    Renderer* renderer, float x, float width, float y)
+{
+    float s = ui->scale;
+    float lineHeight = ui->font.lineHeight;
+
     // ─── Текстурпаки ───
     UiText(ui, x, y, UiColor(232, 236, 244, 255), L"Текстурпаки");
     UiText(ui, x + width - UiTextWidth(ui, L".ltp"), y,
@@ -523,21 +549,104 @@ static float DrawPacksTab(UiContext* ui, GameSettings* settings,
     return y;
 }
 
+// === Вкладка «Моды» ===
+
+static float ModsTabHeight(const UiContext* ui, const ModsState* mods)
+{
+    float s = ui->scale;
+    float line = ui->font.lineHeight;
+    float rows = mods->count > 0
+        ? (34.0f * s + 6.0f * s) * (float)mods->count
+        : line + 6.0f * s;
+    return (line + 12.0f * s) + rows + 8.0f * s + line * 2.0f + 6.0f * s;
+}
+
+static float DrawModsTab(UiContext* ui, ModsState* mods,
+    float x, float width, float y)
+{
+    float s = ui->scale;
+    float lineHeight = ui->font.lineHeight;
+
+    UiText(ui, x, y, UI_COLOR_TEXT, L"Моды");
+    UiText(ui, x + width - UiTextWidth(ui, L".lmp"), y,
+        UI_COLOR_ACCENT, L".lmp");
+    y += lineHeight + 12.0f * s;
+
+    if (mods->count == 0)
+    {
+        UiText(ui, x, y, UI_COLOR_TEXT_DIM, L"Каталог mods пуст");
+        y += lineHeight + 6.0f * s;
+    }
+
+    for (uint32_t i = 0; i < mods->count; ++i)
+    {
+        ModEntry* entry = &mods->entries[i];
+        float rowHeight = 34.0f * s;
+        float textTop = y + (rowHeight - lineHeight) * 0.5f;
+
+        uint32_t nameColor = entry->compatible
+            ? (entry->enabled ? UI_COLOR_TEXT : UiColor(196, 202, 214, 255))
+            : UiColor(120, 126, 138, 255);
+        UiText(ui, x, textTop, nameColor, entry->displayName);
+
+        if (entry->version[0] != L'\0')
+        {
+            UiText(ui, x + UiTextWidth(ui, entry->displayName) + 8.0f * s,
+                textTop, UiColor(150, 158, 172, 160), entry->version);
+        }
+
+        if (entry->compatible)
+        {
+            bool enabled = entry->enabled;
+            float toggleTop = y + (rowHeight - UiScaled(ui, 22.0f)) * 0.5f;
+            if (UiToggle(ui, WIDGET_MOD_TOGGLE_FIRST + i,
+                    x + width - UiScaled(ui, 40.0f), toggleTop, &enabled))
+            {
+                ModsSetEnabled(mods, i, enabled);
+            }
+        }
+        else
+        {
+            wchar_t needed[MENU_TEXT_CAPACITY];
+            UiTextBuilder builder;
+            UiTextBuilderInit(&builder, needed, MENU_TEXT_CAPACITY);
+            UiTextBuilderAppend(&builder, L"нужна laiue ");
+            UiTextBuilderAppend(&builder, entry->requiredGame);
+            UiText(ui, x + width - UiTextWidth(ui, needed), textTop,
+                UiColor(214, 130, 118, 255), needed);
+        }
+
+        y += rowHeight + 6.0f * s;
+    }
+
+    y += 8.0f * s;
+    UiText(ui, x, y, UI_COLOR_TEXT_DIM,
+        L"DLL загружаются в порядке включения;");
+    y += lineHeight;
+    UiText(ui, x, y, UI_COLOR_TEXT_DIM,
+        L"библиотеки включайте раньше их потребителей.");
+    return y + lineHeight + 6.0f * s;
+}
+
 static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     GameSettings* settings, Renderer* renderer, Window* window,
-    float dayLengthMinutes, int32_t width, int32_t height)
+    ModsState* mods, float dayLengthMinutes, int32_t width, int32_t height)
 {
     float s = ui->scale;
     float panelWidth = 400.0f * s;
     float padding = 20.0f * s;
     float lineHeight = ui->font.lineHeight;
-    float tabsHeight = 36.0f * s;
+    float tabsHeight = 36.0f * s * 2.0f + 6.0f * s;  // два ряда сегментов
+    float tabRowHeight = 36.0f * s;
+
     float buttonHeight = 36.0f * s;
 
     float contentHeight;
     switch (menu->settingsTab)
     {
-        case SETTINGS_TAB_PACKS:    contentHeight = PacksTabHeight(ui); break;
+        case SETTINGS_TAB_TEXTURES: contentHeight = TexturesTabHeight(ui); break;
+        case SETTINGS_TAB_SHADERS:  contentHeight = ShadersTabHeight(ui); break;
+        case SETTINGS_TAB_MODS:     contentHeight = ModsTabHeight(ui, mods); break;
         case SETTINGS_TAB_ADMIN:    contentHeight = AdminTabHeight(ui); break;
         case SETTINGS_TAB_CONTROLS: contentHeight = ControlsTabHeight(ui); break;
         default:                    contentHeight = GraphicsTabHeight(ui); break;
@@ -562,8 +671,22 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
         UI_COLOR_TEXT, L"Настройки");
     cursorY += lineHeight + 12.0f * s;
 
-    UiSegmented(ui, WIDGET_TABS, contentX, cursorY, contentWidth, tabsHeight,
-        TAB_LABELS, SETTINGS_TAB_COUNT, &menu->settingsTab);
+    // Два ряда вкладок: клик в ряду выбирает вкладку своего диапазона.
+    int32_t topTab = menu->settingsTab < 3 ? menu->settingsTab : -1;
+    int32_t bottomTab = menu->settingsTab >= 3 ? menu->settingsTab - 3 : -1;
+    if (UiSegmented(ui, WIDGET_TABS, contentX, cursorY,
+            contentWidth, tabRowHeight, TAB_LABELS_TOP, 3, &topTab))
+    {
+        menu->settingsTab = topTab;
+        menu->settingsScroll = 0.0f;
+    }
+    if (UiSegmented(ui, WIDGET_TABS + 4, contentX,
+            cursorY + tabRowHeight + 6.0f * s,
+            contentWidth, tabRowHeight, TAB_LABELS_BOTTOM, 3, &bottomTab))
+    {
+        menu->settingsTab = bottomTab + 3;
+        menu->settingsScroll = 0.0f;
+    }
     cursorY += tabsHeight + 12.0f * s;
 
     // Видимая область контента между вкладками и кнопкой «Назад».
@@ -590,9 +713,16 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     float scrolledY = viewportTop - menu->settingsScroll;
     switch (menu->settingsTab)
     {
-        case SETTINGS_TAB_PACKS:
-            DrawPacksTab(ui, settings, renderer,
+        case SETTINGS_TAB_TEXTURES:
+            DrawTexturesTab(ui, settings, renderer,
                 contentX, contentWidth, scrolledY);
+            break;
+        case SETTINGS_TAB_SHADERS:
+            DrawShadersTab(ui, settings, renderer,
+                contentX, contentWidth, scrolledY);
+            break;
+        case SETTINGS_TAB_MODS:
+            DrawModsTab(ui, mods, contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_ADMIN:
             DrawAdminTab(ui, settings, dayLengthMinutes,
@@ -634,7 +764,7 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
 
 PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
     GameSettings* settings, Renderer* renderer, Window* window,
-    float dayLengthMinutes, int32_t width, int32_t height,
+    ModsState* mods, float dayLengthMinutes, int32_t width, int32_t height,
     bool escapePressed)
 {
     if (menu->screen == PAUSE_MENU_CLOSED)
@@ -664,6 +794,6 @@ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
     }
 
     UpdateSettingsScreen(menu, ui, settings, renderer, window,
-        dayLengthMinutes, width, height);
+        mods, dayLengthMinutes, width, height);
     return PAUSE_MENU_ACTION_NONE;
 }

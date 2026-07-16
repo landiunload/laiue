@@ -25,6 +25,27 @@ void PlayerJumpReset(PlayerJump* jump)
     jump->verticalVelocity = 0.0;
     jump->jumpBufferRemaining = 0.0;
     jump->coyoteTimeRemaining = 0.0;
+    jump->airJumpsRemaining = jump->config.extraAirJumps;
+}
+
+void PlayerJumpSetAirJumps(PlayerJump* jump,
+    int32_t extraAirJumps, double airJumpImpulse, bool refillOnGround,
+    bool grounded)
+{
+    jump->config.extraAirJumps = extraAirJumps;
+    jump->config.airJumpImpulse = airJumpImpulse;
+    jump->config.airJumpRefillOnGround = refillOnGround;
+
+    // На земле новый лимит доступен сразу; в воздухе остаток лишь
+    // ужимается — включение мода не должно дарить прыжок в полёте.
+    if (grounded)
+    {
+        jump->airJumpsRemaining = extraAirJumps;
+    }
+    else if (jump->airJumpsRemaining > extraAirJumps)
+    {
+        jump->airJumpsRemaining = extraAirJumps;
+    }
 }
 
 void PlayerJumpQueue(PlayerJump* jump)
@@ -39,6 +60,10 @@ void PlayerJumpObserveGround(PlayerJump* jump,
     {
         jump->verticalVelocity = 0.0;
         jump->coyoteTimeRemaining = jump->config.coyoteTimeSeconds;
+        if (jump->config.airJumpRefillOnGround)
+        {
+            jump->airJumpsRemaining = jump->config.extraAirJumps;
+        }
         return;
     }
 
@@ -51,16 +76,29 @@ void PlayerJumpObserveGround(PlayerJump* jump,
 
 bool PlayerJumpTryLaunch(PlayerJump* jump)
 {
-    if (jump->jumpBufferRemaining <= 0.0
-        || jump->coyoteTimeRemaining <= 0.0)
+    if (jump->jumpBufferRemaining <= 0.0)
     {
         return false;
     }
 
-    jump->verticalVelocity = jump->launchSpeed;
-    jump->jumpBufferRemaining = 0.0;
-    jump->coyoteTimeRemaining = 0.0;
-    return true;
+    if (jump->coyoteTimeRemaining > 0.0)
+    {
+        jump->verticalVelocity = jump->launchSpeed;
+        jump->jumpBufferRemaining = 0.0;
+        jump->coyoteTimeRemaining = 0.0;
+        return true;
+    }
+
+    // Воздушный прыжок (моды): отдельное нажатие в полёте.
+    if (jump->airJumpsRemaining > 0)
+    {
+        jump->verticalVelocity = jump->config.airJumpImpulse;
+        jump->jumpBufferRemaining = 0.0;
+        jump->airJumpsRemaining--;
+        return true;
+    }
+
+    return false;
 }
 
 void PlayerJumpAgeBuffer(PlayerJump* jump, double stepSeconds)
@@ -76,6 +114,10 @@ void PlayerJumpLand(PlayerJump* jump)
 {
     jump->verticalVelocity = 0.0;
     jump->coyoteTimeRemaining = jump->config.coyoteTimeSeconds;
+    if (jump->config.airJumpRefillOnGround)
+    {
+        jump->airJumpsRemaining = jump->config.extraAirJumps;
+    }
 }
 
 void PlayerJumpHitCeiling(PlayerJump* jump)

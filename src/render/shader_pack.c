@@ -9,16 +9,6 @@
 #define PATH_CAPACITY_CHARS 32768u
 #define SHADER_FILE_MAX 0x40000u  // 256 КБ на шейдер
 
-static bool LiteralMatch(const wchar_t* text, const wchar_t* literal)
-{
-    while (*literal != L'\0')
-    {
-        if (*text != *literal) return false;
-        ++text; ++literal;
-    }
-    return true;
-}
-
 static uint32_t LiteralLength(const wchar_t* text)
 {
     uint32_t length = 0;

@@ -415,3 +415,11 @@ void PlayerControllerApplyImpulse(PlayerController* controller,
         controller->jump.coyoteTimeRemaining = 0.0;
     }
 }
+
+void PlayerControllerSetAirJumps(PlayerController* controller,
+    int32_t extraAirJumps, double airJumpImpulse, bool refillOnGround)
+{
+    PlayerJumpSetAirJumps(&controller->jump,
+        extraAirJumps, airJumpImpulse, refillOnGround,
+        controller->grounded);
+}

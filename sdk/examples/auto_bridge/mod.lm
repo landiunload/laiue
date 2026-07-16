@@ -1,0 +1,11 @@
+LAIUE MOD 1
+# Пример нативного DLL-мода: мост строится под ногами в полёте
+# с обрыва (режим ходьбы). Исходник — рядом, auto_bridge.c.
+name = Auto Bridge
+author = laiue
+version = 1.0.0
+game = 0.5
+
+[native]
+entry = auto_bridge.dll
+api = 1

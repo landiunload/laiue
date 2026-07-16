@@ -6,6 +6,7 @@
 #include "core/math.h"
 #include "core/numeric.h"
 #include "core/panorama.h"
+#include "core/mod_host.h"
 #include "core/pause_menu.h"
 #include "render/shader_pack.h"
 #include "core/player_command_mapper.h"
@@ -46,6 +47,9 @@ typedef struct ApplicationState
     PauseMenu menu;
     UiContext ui;
     GameHud hud;
+    ModsState mods;
+    ModHost modHost;
+    uint32_t appliedModsRevision;
     bool mouseLookBeforeMenu;
 } ApplicationState;
 
@@ -232,10 +236,17 @@ static void HandleBlockEditing(ApplicationState* application)
         return;
     }
 
+    BlockType previousBlock = WorldGetBlock(application->world,
+        edit.block[0], edit.block[1], edit.block[2]);
     WorldSetBlock(application->world,
         edit.block[0], edit.block[1], edit.block[2], edit.replacement);
     ChunkStreamingInvalidateBlock(application->chunkStreaming,
         edit.block[0], edit.block[1], edit.block[2]);
+
+    // Правка блока игроком — событие для DLL-модов.
+    ModHostDispatchBlockEdit(&application->modHost,
+        edit.block[0], edit.block[1], edit.block[2],
+        (uint8_t)previousBlock, (uint8_t)edit.replacement);
 }
 
 static void ToggleGameMode(ApplicationState* application)
@@ -312,6 +323,14 @@ static void ResumeGame(ApplicationState* application)
 static void OnFrame(void* userData)
 {
     ApplicationState* application = userData;
+
+    // Смена состава модов (тумблер на вкладке, правка enabled.txt):
+    // хост перезагружает цепочку DLL в порядке включения.
+    if (application->mods.revision != application->appliedModsRevision)
+    {
+        ModHostSync(&application->modHost, &application->mods);
+        application->appliedModsRevision = application->mods.revision;
+    }
 
     bool escapePressed =
         InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE);
@@ -401,6 +420,9 @@ static void OnFrame(void* userData)
             application->settings.timeSpeed,
             g_applicationConfiguration.dayLengthMinutes,
             deltaSeconds);
+
+        // Кадровые хуки DLL-модов — после игрока, до отрисовки.
+        ModHostDispatchFrame(&application->modHost, deltaSeconds);
     }
 
     if (!RebaseWorldIfNeeded(application))
@@ -469,6 +491,7 @@ static void OnFrame(void* userData)
             PauseMenuAction action = PauseMenuUpdate(&application->menu,
                 &application->ui, &application->settings,
                 application->renderer, application->window,
+                &application->mods,
                 g_applicationConfiguration.dayLengthMinutes,
                 application->windowWidth, application->windowHeight,
                 escapePressed);
@@ -677,6 +700,26 @@ LAIUE_CORE_API void Start(void)
     PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);
 
+    // Моды: каталог перечитывается на старте, включённые применяются
+    // первым кадром (сравнение ревизий в OnFrame). Хост DLL-модов
+    // получает адреса подсистем — они живут в application на куче.
+    ModsInit(&application->mods);
+    ModsRefresh(&application->mods);
+
+    ModHostBindings modBindings = {
+        .world = world,
+        .chunkStreaming = chunkStreaming,
+        .player = &application->player,
+        .camera = &application->camera,
+        .settings = &application->settings,
+        .gameMode = &application->gameMode,
+    };
+    if (!ModHostInit(&application->modHost, &modBindings))
+    {
+        // Без кучи под слоты DLL-моды просто не загрузятся.
+        application->modHost.slots = NULL;
+    }
+
     CameraInit(&application->camera,
         0.0, 0.0, g_applicationConfiguration.spawnHeight,
         0.0f, -0.4f);
@@ -684,6 +727,9 @@ LAIUE_CORE_API void Start(void)
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, application);
 
+    // DLL-моды выгружаются до разрушения подсистем, на которые они
+    // могли бы позвать API из Shutdown.
+    ModHostShutdown(&application->modHost);
     UiRelease(&application->ui);
     ChunkStreamingDestroy(application->chunkStreaming);
     RendererDestroy(renderer);

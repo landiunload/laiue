@@ -11,6 +11,10 @@ laiue_add_module(core
         game_time.h
         math.c
         math.h
+        mod_host.c
+        mod_host.h
+        mods.c
+        mods.h
         numeric.h
         panorama.c
         panorama.h
@@ -36,5 +40,6 @@ laiue_add_module(core
         laiue_physics
         laiue_gameplay
         laiue_interaction
+        laiue_content
         gdi32
 )

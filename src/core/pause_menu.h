@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/game_time.h"
+#include "core/mods.h"
 #include "core/panorama.h"
 #include "core/ui.h"
 #include "platform/window.h"
@@ -10,8 +11,8 @@
 #include <stdint.h>
 
 // Меню паузы (внутренний компонент ядра): открывается по Esc,
-// экраны «Пауза» и «Настройки» с разделами «Графика»,
-// «Администрирование» и «Управление». Настройки применяются сразу.
+// экраны «Пауза» и «Настройки» с разделами «Графика», «Текстуры»,
+// «Шейдеры», «Моды», «Админ» и «Управление». Всё применяется сразу.
 
 typedef enum PauseMenuScreen
 {
@@ -55,7 +56,9 @@ typedef struct GameSettings
 typedef struct PauseMenu
 {
     PauseMenuScreen screen;
-    int32_t settingsTab;   // 0 — графика, 1 — паки, 2 — администрирование, 3 — управление
+    // 0 — графика, 1 — текстуры, 2 — шейдеры, 3 — моды,
+    // 4 — администрирование, 5 — управление.
+    int32_t settingsTab;
     float settingsScroll;  // прокрутка контента настроек, px (0 — верх)
 } PauseMenu;
 
@@ -64,8 +67,9 @@ void PauseMenuOpen(PauseMenu* menu);
 // Обновляет состояние и собирает квады меню в ui.
 // escapePressed — Esc в этом кадре (в настройках возвращает на главный
 // экран, на главном — продолжает игру). dayLengthMinutes — длительность
-// суток для подписи пресета «Обычная».
+// суток для подписи пресета «Обычная». Переключения модов сразу пишутся
+// в mods/enabled.txt и меняют ревизию mods.
 PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
     GameSettings* settings, Renderer* renderer, Window* window,
-    float dayLengthMinutes, int32_t width, int32_t height,
+    ModsState* mods, float dayLengthMinutes, int32_t width, int32_t height,
     bool escapePressed);

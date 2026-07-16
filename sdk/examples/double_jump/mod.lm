@@ -1,0 +1,9 @@
+LAIUE MOD 1
+name = Double Jump
+author = laiue
+version = 2.0.0
+game = 0.5
+
+[native]
+entry = double_jump.dll
+api = 1

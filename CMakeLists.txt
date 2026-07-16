@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(laiue
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "Belaiu base - window, input, world, gameplay and render"
     LANGUAGES C
 )
@@ -68,3 +68,38 @@ target_link_options(laiue PRIVATE
     /STACK:262144,4096
     /HEAP:65536,4096
 )
+
+# SDK модов кладётся рядом с игрой: заголовок API и примеры с исходниками —
+# мод пишется и собирается без исходников движка (docs/modding.md).
+add_custom_target(laiue_sdk
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${PROJECT_SOURCE_DIR}/sdk"
+        "$<TARGET_FILE_DIR:laiue>/sdk"
+    COMMENT "Копирование SDK модов"
+)
+add_dependencies(laiue laiue_sdk)
+
+# Пример нативного DLL-мода собирается как настоящий мод: без линка
+# с движком, только заголовок SDK. laiue_runtime даёт _fltused
+# (в нашем дереве без CRT); внешняя сборка обходится обычным cl /LD.
+add_library(mod_auto_bridge SHARED
+    sdk/examples/auto_bridge/auto_bridge.c)
+target_include_directories(mod_auto_bridge PRIVATE
+    "${PROJECT_SOURCE_DIR}/sdk")
+target_link_libraries(mod_auto_bridge PRIVATE
+    laiue_common laiue_runtime kernel32)
+target_link_options(mod_auto_bridge PRIVATE /NOENTRY)
+set_target_properties(mod_auto_bridge PROPERTIES
+    OUTPUT_NAME auto_bridge
+    RUNTIME_OUTPUT_DIRECTORY
+        "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mods/auto_bridge.lmp")
+# Манифест копируется отдельной целью: связка «линк + копия» в одном
+# ninja-правиле рождает вложенный cmd, ломкий в урезанных окружениях.
+add_custom_target(mod_auto_bridge_manifest
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${PROJECT_SOURCE_DIR}/sdk/examples/auto_bridge/mod.lm"
+        "$<TARGET_FILE_DIR:mod_auto_bridge>/mod.lm"
+    COMMENT "Раскладка примера auto_bridge.lmp"
+)
+add_dependencies(mod_auto_bridge_manifest mod_auto_bridge)
+add_dependencies(laiue mod_auto_bridge mod_auto_bridge_manifest)

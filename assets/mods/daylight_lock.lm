@@ -1,9 +1,0 @@
-LAIUE MOD 1
-# Тестовый мод: фиксирует время суток на заданном значении и скорости.
-name = Daylight Lock
-author = laiue
-version = 1.0.0
-[time]
-lock_enabled = true
-locked_hour = 10.5
-speed_preset = paused
