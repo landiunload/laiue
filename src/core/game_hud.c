@@ -22,15 +22,15 @@ static void SetModeText(GameHud* hud)
     const wchar_t* text;
     if (hud->gameMode == GAME_MODE_FLY)
     {
-        text = L"Полёт";
+        text = L"Креатив";
     }
     else if (hud->crouching)
     {
-        text = L"Присед";
+        text = L"Выживание · присед";
     }
     else
     {
-        text = L"Ходьба";
+        text = L"Выживание";
     }
 
     UiTextBuilder builder;

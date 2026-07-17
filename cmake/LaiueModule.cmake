@@ -44,6 +44,5 @@ function(laiue_add_module module_name)
     if(MODULE_PUBLIC_LINK)
         target_link_libraries(${target_name} PUBLIC ${MODULE_PUBLIC_LINK})
     endif()
-    target_link_options(${target_name} PRIVATE
-        /ENTRY:LaiueDllEntryPoint /SUBSYSTEM:WINDOWS)
+    target_link_options(${target_name} PRIVATE /NOENTRY)
 endfunction()

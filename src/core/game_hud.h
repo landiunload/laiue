@@ -31,7 +31,7 @@ typedef struct GameHud
     wchar_t coordinateText[3][32];
     wchar_t framesPerSecondText[16];
     wchar_t timeText[8];
-    wchar_t modeText[16];
+    wchar_t modeText[24];
     wchar_t networkText[24];
     wchar_t meshQueueText[24];
     wchar_t buildTimeText[24];

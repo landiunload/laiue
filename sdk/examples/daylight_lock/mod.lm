@@ -1,7 +1,9 @@
 LAIUE MOD 1
 name = Daylight Lock
 author = laiue
+id = laiue.daylight_lock
 version = 2.0.0
+side = server
 game = 0.5
 
 [native]

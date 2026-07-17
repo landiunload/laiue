@@ -14,8 +14,6 @@ typedef enum LaiueContentType
     LAIUE_CONTENT_MOD_PACK,           // .lmp
     LAIUE_CONTENT_SHADER,             // .ls
     LAIUE_CONTENT_SHADER_PACK,        // .lsp
-    LAIUE_CONTENT_DATA,               // .ld
-    LAIUE_CONTENT_DATA_PACK,          // .ldp
     LAIUE_CONTENT_TEXTURE,            // .lt
     LAIUE_CONTENT_TEXTURE_PACK,       // .ltp
     LAIUE_CONTENT_TYPE_COUNT,

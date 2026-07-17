@@ -3,6 +3,8 @@ laiue_add_module(core
         application.c
         application_config.c
         application_config.h
+        block_effects.c
+        block_effects.h
         camera.c
         camera.h
         chunk_streaming.c
@@ -11,12 +13,10 @@ laiue_add_module(core
         game_hud.h
         game_time.c
         game_time.h
+        inventory_ui.c
+        inventory_ui.h
         math.c
         math.h
-        mod_host.c
-        mod_host.h
-        mods.c
-        mods.h
         numeric.h
         panorama.c
         panorama.h
@@ -24,6 +24,8 @@ laiue_add_module(core
         pause_menu.h
         save_game.c
         save_game.h
+        server_list.c
+        server_list.h
         player_command_mapper.c
         player_command_mapper.h
         ui.c
@@ -45,6 +47,7 @@ laiue_add_module(core
         laiue_interaction
         laiue_content
         laiue_network
+        laiue_mod
         gdi32
 )
 target_include_directories(laiue_core PRIVATE "${PROJECT_SOURCE_DIR}/sdk")

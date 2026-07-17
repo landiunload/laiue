@@ -1,14 +1,15 @@
 #include "core/save_game.h"
+#include "core/ui_format.h"
 
 #include <windows.h>
 #include <string.h>
 
 #define SAVE_DIRECTORY_SUFFIX L"\\saves"
-#define SAVE_SLOT_SUFFIX      L"\\saves\\default"
-#define SAVE_MODDATA_SUFFIX   L"\\saves\\default\\moddata"
 
 #define PLAYER_SAVE_MAGIC   0x3150574Cu  // байты 'L' 'W' 'P' '1'
 #define PLAYER_SAVE_VERSION 1u
+#define INVENTORY_SAVE_MAGIC   0x3156494Cu  // байты 'L' 'I' 'V' '1'
+#define INVENTORY_SAVE_VERSION 1u
 
 #define SAVE_TEXT_CAPACITY 4096u
 
@@ -20,6 +21,8 @@ typedef struct SaveScratch
     char text[SAVE_TEXT_CAPACITY];
     char extra[SAVE_TEXT_CAPACITY];
 } SaveScratch;
+
+static wchar_t g_saveSlotName[SAVE_GAME_SLOT_NAME_CAPACITY] = L"default";
 
 static SaveScratch* SaveScratchAcquire(void)
 {
@@ -87,24 +90,194 @@ static bool BuildSavePath(const wchar_t* suffix,
 static bool BuildSaveFilePath(const wchar_t* fileName,
     wchar_t* destination, uint32_t capacity)
 {
-    if (!BuildSavePath(SAVE_SLOT_SUFFIX, destination, capacity))
+    if (!BuildSavePath(SAVE_DIRECTORY_SUFFIX, destination, capacity))
     {
         return false;
     }
     uint32_t length = 0;
     while (destination[length] != L'\0') ++length;
+    uint32_t slotLength = 0;
+    while (g_saveSlotName[slotLength] != L'\0') ++slotLength;
     uint32_t nameLength = 0;
     while (fileName[nameLength] != L'\0') ++nameLength;
-    if (length + nameLength + 2u > capacity)
+    if (length + slotLength + nameLength + 3u > capacity)
     {
         return false;
     }
+    destination[length] = L'\\';
+    memcpy(destination + length + 1u, g_saveSlotName,
+        (size_t)slotLength * sizeof(wchar_t));
+    length += slotLength + 1u;
     destination[length] = L'\\';
     for (uint32_t i = 0; i <= nameLength; ++i)
     {
         destination[length + 1u + i] = fileName[i];
     }
     return true;
+}
+
+static bool BuildSlotDirectoryPath(bool modData,
+    wchar_t* destination, uint32_t capacity)
+{
+    if (!BuildSavePath(SAVE_DIRECTORY_SUFFIX, destination, capacity)) return false;
+    uint32_t length = 0;
+    while (destination[length] != L'\0') ++length;
+    uint32_t slotLength = 0;
+    while (g_saveSlotName[slotLength] != L'\0') ++slotLength;
+    uint32_t extra = modData ? 9u : 1u; // '\\' + "moddata" + NUL
+    if (length + 1u + slotLength + extra > capacity) return false;
+    destination[length++] = L'\\';
+    memcpy(destination + length, g_saveSlotName,
+        (size_t)slotLength * sizeof(wchar_t));
+    length += slotLength;
+    if (modData)
+    {
+        memcpy(destination + length, L"\\moddata", 9u * sizeof(wchar_t));
+    }
+    else
+    {
+        destination[length] = L'\0';
+    }
+    return true;
+}
+
+bool SaveGameSetSlot(const wchar_t* name)
+{
+    if (name == NULL || name[0] == L'\0') return false;
+    uint32_t length = 0;
+    for (; name[length] != L'\0'; ++length)
+    {
+        wchar_t c = name[length];
+        if (length + 1 >= SAVE_GAME_SLOT_NAME_CAPACITY || c < 0x20
+            || c == L'\\' || c == L'/' || c == L':' || c == L'*'
+            || c == L'?' || c == L'"' || c == L'<' || c == L'>'
+            || c == L'|') return false;
+    }
+    if ((length == 1 && name[0] == L'.')
+        || (length == 2 && name[0] == L'.' && name[1] == L'.')) return false;
+    memcpy(g_saveSlotName, name, (size_t)(length + 1u) * sizeof(wchar_t));
+    return true;
+}
+
+const wchar_t* SaveGameGetSlot(void)
+{
+    return g_saveSlotName;
+}
+
+bool SaveGameEnumerateSlots(SaveGameSlotList* outList)
+{
+    if (outList == NULL) return false;
+    memset(outList, 0, sizeof(*outList));
+    wchar_t path[SAVE_GAME_PATH_CAPACITY];
+    if (!BuildSavePath(SAVE_DIRECTORY_SUFFIX, path, SAVE_GAME_PATH_CAPACITY)) return false;
+    uint32_t length = 0;
+    while (path[length] != L'\0') ++length;
+    if (length + 3u > SAVE_GAME_PATH_CAPACITY) return false;
+    uint32_t savesLength = length;
+    path[length++] = L'\\';
+    path[length++] = L'*';
+    path[length] = L'\0';
+    WIN32_FIND_DATAW data;
+    HANDLE search = FindFirstFileW(path, &data);
+    if (search == INVALID_HANDLE_VALUE)
+    {
+        return GetLastError() == ERROR_FILE_NOT_FOUND
+            || GetLastError() == ERROR_PATH_NOT_FOUND;
+    }
+    do
+    {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+            || data.cFileName[0] == L'.') continue;
+        uint32_t directoryLength = 0;
+        while (data.cFileName[directoryLength] != L'\0') ++directoryLength;
+        static const wchar_t metaName[] = L"\\world.meta";
+        if (savesLength + 1U + directoryLength
+                + (uint32_t)(sizeof(metaName) / sizeof(metaName[0]))
+                > SAVE_GAME_PATH_CAPACITY) continue;
+        memcpy(path + savesLength + 1U, data.cFileName,
+            (size_t)directoryLength * sizeof(wchar_t));
+        memcpy(path + savesLength + 1U + directoryLength,
+            metaName, sizeof(metaName));
+        DWORD metaAttributes = GetFileAttributesW(path);
+        path[savesLength + 1U] = L'*';
+        path[savesLength + 2U] = L'\0';
+        if (metaAttributes == INVALID_FILE_ATTRIBUTES
+            || (metaAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (outList->count >= SAVE_GAME_MAX_SLOTS) break;
+        SaveGameSlot* slot = &outList->entries[outList->count++];
+        uint32_t i = 0;
+        while (data.cFileName[i] != L'\0'
+            && i + 1 < SAVE_GAME_SLOT_NAME_CAPACITY)
+        {
+            slot->name[i] = data.cFileName[i];
+            ++i;
+        }
+        slot->name[i] = L'\0';
+    }
+    while (FindNextFileW(search, &data));
+    FindClose(search);
+    for (uint32_t i = 1; i < outList->count; ++i)
+    {
+        SaveGameSlot value = outList->entries[i];
+        uint32_t insert = i;
+        while (insert != 0)
+        {
+            const wchar_t* left = outList->entries[insert - 1U].name;
+            const wchar_t* right = value.name;
+            uint32_t c = 0;
+            while (left[c] != L'\0' && right[c] != L'\0'
+                && left[c] == right[c]) ++c;
+            if (left[c] <= right[c]) break;
+            outList->entries[insert] = outList->entries[insert - 1U];
+            --insert;
+        }
+        outList->entries[insert] = value;
+    }
+    return true;
+}
+
+static bool SlotListContains(const SaveGameSlotList* list,
+    const wchar_t* name)
+{
+    for (uint32_t i = 0; i < list->count; ++i)
+    {
+        uint32_t c = 0;
+        while (list->entries[i].name[c] != L'\0'
+            && list->entries[i].name[c] == name[c]) ++c;
+        if (list->entries[i].name[c] == name[c]) return true;
+    }
+    return false;
+}
+
+bool SaveGameChooseNewSlot(wchar_t* destination, uint32_t capacity)
+{
+    if (destination == NULL || capacity < 8U) return false;
+    SaveGameSlotList* slots = HeapAlloc(GetProcessHeap(),
+        HEAP_ZERO_MEMORY, sizeof(*slots));
+    if (slots == NULL) return false;
+    bool succeeded = SaveGameEnumerateSlots(slots);
+    if (succeeded)
+    {
+        for (uint32_t number = 1; number <= 9999U; ++number)
+        {
+            wchar_t candidate[SAVE_GAME_SLOT_NAME_CAPACITY];
+            UiTextBuilder builder;
+            UiTextBuilderInit(&builder, candidate,
+                SAVE_GAME_SLOT_NAME_CAPACITY);
+            UiTextBuilderAppend(&builder, L"world_");
+            UiTextBuilderAppendUnsigned(&builder, number);
+            if (builder.length > 0 && builder.length + 1U <= capacity
+                && !SlotListContains(slots, candidate))
+            {
+                memcpy(destination, candidate,
+                    ((size_t)builder.length + 1U) * sizeof(wchar_t));
+                break;
+            }
+        }
+        succeeded = destination[0] != L'\0';
+    }
+    HeapFree(GetProcessHeap(), 0, slots);
+    return succeeded;
 }
 
 bool SaveGameEnsureDirectories(void)
@@ -116,12 +289,20 @@ bool SaveGameEnsureDirectories(void)
     }
 
     bool succeeded = true;
-    const wchar_t* suffixes[3] = {
-        SAVE_DIRECTORY_SUFFIX, SAVE_SLOT_SUFFIX, SAVE_MODDATA_SUFFIX,
-    };
-    for (int32_t i = 0; i < 3 && succeeded; ++i)
+    succeeded = BuildSavePath(SAVE_DIRECTORY_SUFFIX,
+            scratch->path, SAVE_GAME_PATH_CAPACITY)
+        && (CreateDirectoryW(scratch->path, NULL)
+            || GetLastError() == ERROR_ALREADY_EXISTS);
+    if (succeeded)
     {
-        succeeded = BuildSavePath(suffixes[i],
+        succeeded = BuildSlotDirectoryPath(false,
+                scratch->path, SAVE_GAME_PATH_CAPACITY)
+            && (CreateDirectoryW(scratch->path, NULL)
+                || GetLastError() == ERROR_ALREADY_EXISTS);
+    }
+    if (succeeded)
+    {
+        succeeded = BuildSlotDirectoryPath(true,
                 scratch->path, SAVE_GAME_PATH_CAPACITY)
             && (CreateDirectoryW(scratch->path, NULL)
                 || GetLastError() == ERROR_ALREADY_EXISTS);
@@ -133,7 +314,7 @@ bool SaveGameEnsureDirectories(void)
 
 bool SaveGameModDataDirectory(wchar_t* destination, uint32_t capacity)
 {
-    return BuildSavePath(SAVE_MODDATA_SUFFIX, destination, capacity);
+    return BuildSlotDirectoryPath(true, destination, capacity);
 }
 
 // === Файловые помощники ===
@@ -440,6 +621,71 @@ bool SaveGameLoadPlayer(Camera* camera, GameMode* outGameMode)
     return true;
 }
 
+// === inventory.dat ===
+
+typedef struct InventorySaveRecord
+{
+    uint32_t magic;
+    uint16_t version;
+    uint8_t selectedHotbarSlot;
+    uint8_t reserved;
+    InventorySlot slots[INVENTORY_SLOT_COUNT];
+} InventorySaveRecord;
+
+static bool WriteInventory(const Inventory* inventory)
+{
+    if (inventory == NULL) return false;
+    SaveScratch* scratch = SaveScratchAcquire();
+    if (scratch == NULL
+        || !BuildSaveFilePath(L"inventory.dat", scratch->path,
+            SAVE_GAME_PATH_CAPACITY))
+    {
+        SaveScratchRelease(scratch);
+        return false;
+    }
+    InventorySaveRecord record;
+    memset(&record, 0, sizeof(record));
+    record.magic = INVENTORY_SAVE_MAGIC;
+    record.version = INVENTORY_SAVE_VERSION;
+    record.selectedHotbarSlot = inventory->selectedHotbarSlot;
+    memcpy(record.slots, inventory->slots, sizeof(record.slots));
+    bool succeeded = WriteWholeFile(scratch->path, &record, sizeof(record));
+    SaveScratchRelease(scratch);
+    return succeeded;
+}
+
+bool SaveGameLoadInventory(Inventory* inventory)
+{
+    if (inventory == NULL) return false;
+    SaveScratch* scratch = SaveScratchAcquire();
+    if (scratch == NULL
+        || !BuildSaveFilePath(L"inventory.dat", scratch->path,
+            SAVE_GAME_PATH_CAPACITY))
+    {
+        SaveScratchRelease(scratch);
+        return false;
+    }
+    InventorySaveRecord record;
+    bool succeeded = ReadWholeFileInto(scratch->path,
+            &record, sizeof(record)) == sizeof(record)
+        && record.magic == INVENTORY_SAVE_MAGIC
+        && record.version == INVENTORY_SAVE_VERSION
+        && record.selectedHotbarSlot < INVENTORY_HOTBAR_SLOT_COUNT;
+    for (uint32_t i = 0; i < INVENTORY_SLOT_COUNT && succeeded; ++i)
+    {
+        succeeded = record.slots[i].count <= INVENTORY_STACK_LIMIT
+            && ((record.slots[i].count == 0
+                    && record.slots[i].item == INVENTORY_ITEM_NONE)
+                || (record.slots[i].count != 0
+                    && record.slots[i].item != INVENTORY_ITEM_NONE));
+    }
+    SaveScratchRelease(scratch);
+    if (!succeeded) return false;
+    inventory->selectedHotbarSlot = record.selectedHotbarSlot;
+    memcpy(inventory->slots, record.slots, sizeof(record.slots));
+    return true;
+}
+
 // === mods.lock ===
 
 static uint32_t BuildModsLockText(const ModsState* mods,
@@ -523,7 +769,7 @@ void SaveGameCheckModsLock(const ModsState* mods)
 
 bool SaveGameWriteAll(World* world, const Camera* camera,
     GameMode gameMode, float timeOfDayHours, int64_t seed,
-    const ModsState* mods)
+    const ModsState* mods, const Inventory* inventory)
 {
     if (!SaveGameEnsureDirectories())
     {
@@ -542,6 +788,7 @@ bool SaveGameWriteAll(World* world, const Camera* camera,
 
     succeeded = WriteMeta(seed, timeOfDayHours) && succeeded;
     succeeded = WritePlayer(camera, gameMode) && succeeded;
+    succeeded = WriteInventory(inventory) && succeeded;
     succeeded = WriteModsLock(mods) && succeeded;
     return succeeded;
 }

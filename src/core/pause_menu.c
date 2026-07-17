@@ -1,4 +1,6 @@
 #include "core/pause_menu.h"
+#include "core/save_game.h"
+#include "core/server_list.h"
 #include "render/shader_pack.h"
 #include "render/texture_pack.h"
 
@@ -11,6 +13,7 @@ enum
     WIDGET_RESUME = 1,
     WIDGET_SETTINGS,
     WIDGET_QUIT,
+    WIDGET_RETURN_TITLE,
     WIDGET_BACK,
     WIDGET_TABS = 8,             // + индекс вкладки (два ряда)
     WIDGET_FOV_SLIDER = 16,
@@ -31,6 +34,17 @@ enum
     WIDGET_TEXTURE_RESET,
     WIDGET_MOD_TOGGLE_FIRST = 160,
     WIDGET_SAVE_WORLD = 200,
+    WIDGET_TITLE_SINGLE = 220,
+    WIDGET_TITLE_MULTI,
+    WIDGET_TITLE_SETTINGS,
+    WIDGET_TITLE_QUIT,
+    WIDGET_WORLD_FIRST = 240,
+    WIDGET_WORLD_NEW = 276,
+    WIDGET_SERVER_FIRST = 280,
+    WIDGET_MENU_BACK = 300,
+    WIDGET_MODS_APPLY = 310,
+    WIDGET_CONTENT_DOWNLOAD,
+    WIDGET_CONNECT_CANCEL,
 };
 
 enum
@@ -70,6 +84,302 @@ void PauseMenuOpen(PauseMenu* menu)
     menu->screen = PAUSE_MENU_MAIN;
 }
 
+void PauseMenuOpenTitle(PauseMenu* menu)
+{
+    menu->screen = PAUSE_MENU_TITLE;
+    menu->settingsReturnScreen = PAUSE_MENU_TITLE;
+}
+
+void PauseMenuShowModCompatibility(PauseMenu* menu, uint32_t count,
+    bool installed, bool downloadsAllowed)
+{
+    menu->requiredServerModCount = count;
+    menu->requiredServerModsInstalled = installed;
+    menu->serverDownloadsAllowed = downloadsAllowed;
+    menu->contentDownloading = false;
+    menu->contentDownloadFailed = false;
+    menu->screen = PAUSE_MENU_MOD_COMPATIBILITY;
+}
+
+static void CopyMenuText(wchar_t* destination, uint32_t capacity,
+    const wchar_t* source)
+{
+    uint32_t i = 0;
+    while (source[i] != L'\0' && i + 1 < capacity)
+    {
+        destination[i] = source[i];
+        ++i;
+    }
+    destination[i] = L'\0';
+}
+
+static PauseMenuAction UpdateTitleScreen(PauseMenu* menu, UiContext* ui,
+    int32_t width, int32_t height)
+{
+    float s = ui->scale;
+    float panelWidth = 290.0f * s;
+    float panelHeight = 292.0f * s;
+    float x = ((float)width - panelWidth) * 0.5f;
+    float y = ((float)height - panelHeight) * 0.5f;
+    float padding = 22.0f * s;
+    float buttonHeight = 40.0f * s;
+    float buttonWidth = panelWidth - padding * 2.0f;
+    UiPanel(ui, x, y, panelWidth, panelHeight);
+    y += padding;
+    UiTextCentered(ui, x + panelWidth * 0.5f, y,
+        UI_COLOR_TEXT, L"laiue " LAIUE_VERSION_TEXT);
+    y += ui->font.lineHeight + 22.0f * s;
+    if (UiButton(ui, WIDGET_TITLE_SINGLE, x + padding, y,
+            buttonWidth, buttonHeight, L"Одиночная игра"))
+    {
+        menu->worldListLoaded = false;
+        menu->worldListOffset = 0;
+        menu->screen = PAUSE_MENU_SINGLEPLAYER;
+    }
+    y += buttonHeight + 10.0f * s;
+    if (UiButton(ui, WIDGET_TITLE_MULTI, x + padding, y,
+            buttonWidth, buttonHeight, L"Сетевая игра"))
+    {
+        menu->serverListLoaded = false;
+        menu->serverListOffset = 0;
+        menu->screen = PAUSE_MENU_MULTIPLAYER;
+    }
+    y += buttonHeight + 10.0f * s;
+    if (UiButton(ui, WIDGET_TITLE_SETTINGS, x + padding, y,
+            buttonWidth, buttonHeight, L"Настройки"))
+    {
+        menu->settingsReturnScreen = PAUSE_MENU_TITLE;
+        menu->screen = PAUSE_MENU_SETTINGS;
+    }
+    y += buttonHeight + 10.0f * s;
+    if (UiButton(ui, WIDGET_TITLE_QUIT, x + padding, y,
+            buttonWidth, buttonHeight, L"Выход"))
+    {
+        return PAUSE_MENU_ACTION_QUIT;
+    }
+    return PAUSE_MENU_ACTION_NONE;
+}
+
+static PauseMenuAction UpdateSingleplayerScreen(PauseMenu* menu,
+    UiContext* ui, int32_t width, int32_t height)
+{
+    float s = ui->scale;
+    float panelWidth = 420.0f * s;
+    float panelHeight = 410.0f * s;
+    float x = ((float)width - panelWidth) * 0.5f;
+    float y = ((float)height - panelHeight) * 0.5f;
+    float padding = 22.0f * s;
+    float contentX = x + padding;
+    float contentWidth = panelWidth - padding * 2.0f;
+    UiPanel(ui, x, y, panelWidth, panelHeight);
+    y += padding;
+    UiTextCentered(ui, x + panelWidth * 0.5f, y,
+        UI_COLOR_TEXT, L"Сохранённые миры");
+    y += ui->font.lineHeight + 18.0f * s;
+
+    if (!menu->worldListLoaded)
+    {
+        menu->worldListLoaded = SaveGameEnumerateSlots(&menu->worldSlots);
+    }
+    const SaveGameSlotList* slots = &menu->worldSlots;
+    PauseMenuAction action = PAUSE_MENU_ACTION_NONE;
+    if (menu->worldListLoaded && slots->count != 0)
+    {
+        if (ui->wheelSteps > 0.0f
+            && menu->worldListOffset + 6U < slots->count)
+        {
+            ++menu->worldListOffset;
+        }
+        else if (ui->wheelSteps < 0.0f && menu->worldListOffset != 0)
+        {
+            --menu->worldListOffset;
+        }
+        for (uint32_t i = 0; i < 6U
+            && menu->worldListOffset + i < slots->count; ++i)
+        {
+            uint32_t slotIndex = menu->worldListOffset + i;
+            if (UiButton(ui, WIDGET_WORLD_FIRST + i, contentX, y,
+                    contentWidth, 34.0f * s,
+                    slots->entries[slotIndex].name))
+            {
+                CopyMenuText(menu->selectedWorld,
+                    (uint32_t)(sizeof(menu->selectedWorld) / sizeof(wchar_t)),
+                    slots->entries[slotIndex].name);
+                action = PAUSE_MENU_ACTION_PLAY_WORLD;
+            }
+            y += 40.0f * s;
+        }
+    }
+    else
+    {
+        UiText(ui, contentX, y, UI_COLOR_TEXT_DIM,
+            L"Сохранённых миров пока нет");
+        y += ui->font.lineHeight + 14.0f * s;
+    }
+
+    float bottom = ((float)height + panelHeight) * 0.5f - padding;
+    if (action == PAUSE_MENU_ACTION_NONE
+        && UiButton(ui, WIDGET_WORLD_NEW, contentX,
+            bottom - 78.0f * s, contentWidth, 34.0f * s,
+            L"Новый мир"))
+    {
+        menu->selectedWorld[0] = L'\0';
+        if (SaveGameChooseNewSlot(menu->selectedWorld,
+                (uint32_t)(sizeof(menu->selectedWorld) / sizeof(wchar_t))))
+        {
+            action = PAUSE_MENU_ACTION_PLAY_WORLD;
+        }
+    }
+    if (action == PAUSE_MENU_ACTION_NONE
+        && UiButton(ui, WIDGET_MENU_BACK, contentX,
+            bottom - 34.0f * s, contentWidth, 34.0f * s, L"Назад"))
+    {
+        menu->screen = PAUSE_MENU_TITLE;
+    }
+    return action;
+}
+
+static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
+    UiContext* ui, int32_t width, int32_t height)
+{
+    float s = ui->scale;
+    float panelWidth = 420.0f * s;
+    float panelHeight = 360.0f * s;
+    float x = ((float)width - panelWidth) * 0.5f;
+    float y = ((float)height - panelHeight) * 0.5f;
+    float padding = 22.0f * s;
+    float contentX = x + padding;
+    float contentWidth = panelWidth - padding * 2.0f;
+    UiPanel(ui, x, y, panelWidth, panelHeight);
+    y += padding;
+    UiTextCentered(ui, x + panelWidth * 0.5f, y,
+        UI_COLOR_TEXT, L"Сетевая игра");
+    y += ui->font.lineHeight + 18.0f * s;
+    if (!menu->serverListLoaded)
+    {
+        menu->serverListLoaded = ServerListLoad(&menu->servers);
+    }
+    const ServerList* list = &menu->servers;
+    if (ui->wheelSteps > 0.0f
+        && menu->serverListOffset + 5U < list->count)
+    {
+        ++menu->serverListOffset;
+    }
+    else if (ui->wheelSteps < 0.0f && menu->serverListOffset != 0)
+    {
+        --menu->serverListOffset;
+    }
+    for (uint32_t i = 0; i < 5U
+        && menu->serverListOffset + i < list->count; ++i)
+    {
+        uint32_t serverIndex = menu->serverListOffset + i;
+        wchar_t label[160];
+        UiTextBuilder labelBuilder;
+        UiTextBuilderInit(&labelBuilder, label,
+            (uint32_t)(sizeof(label) / sizeof(label[0])));
+        UiTextBuilderAppend(&labelBuilder, list->entries[serverIndex].name);
+        UiTextBuilderAppend(&labelBuilder, L" — ");
+        UiTextBuilderAppend(&labelBuilder, list->entries[serverIndex].address);
+        UiTextBuilderAppendChar(&labelBuilder, L':');
+        UiTextBuilderAppendUnsigned(&labelBuilder, list->entries[serverIndex].port);
+        if (UiButton(ui, WIDGET_SERVER_FIRST + i, contentX, y,
+                contentWidth, 38.0f * s,
+                menu->networkConnecting
+                    && menu->selectedServerPort == list->entries[serverIndex].port
+                    ? L"Подключение…" : label)
+            && !menu->networkConnecting)
+        {
+            menu->networkConnecting = true;
+            menu->networkRejected = false;
+            menu->contentDownloadFailed = false;
+            menu->selectedServerPort = list->entries[serverIndex].port;
+            return PAUSE_MENU_ACTION_CONNECT_LOCAL;
+        }
+        y += 44.0f * s;
+    }
+    if (menu->networkRejected)
+    {
+        UiText(ui, contentX, y, UiColor(216, 96, 80, 255),
+            L"Сервер отклонил набор модов");
+    }
+    else if (menu->contentDownloadFailed)
+    {
+        UiText(ui, contentX, y, UiColor(216, 96, 80, 255),
+            L"Содержимое не прошло проверку или установку");
+    }
+    float bottom = ((float)height + panelHeight) * 0.5f - padding;
+    if (UiButton(ui, WIDGET_MENU_BACK, contentX,
+            bottom - 34.0f * s, contentWidth, 34.0f * s, L"Назад"))
+    {
+        menu->networkConnecting = false;
+        menu->screen = PAUSE_MENU_TITLE;
+        return PAUSE_MENU_ACTION_CANCEL_CONNECT;
+    }
+    return PAUSE_MENU_ACTION_NONE;
+}
+
+static PauseMenuAction UpdateModCompatibilityScreen(PauseMenu* menu,
+    UiContext* ui, int32_t width, int32_t height)
+{
+    float s = ui->scale;
+    float panelWidth = 440.0f * s;
+    float panelHeight = 240.0f * s;
+    float x = ((float)width - panelWidth) * 0.5f;
+    float y = ((float)height - panelHeight) * 0.5f;
+    float padding = 22.0f * s;
+    float contentX = x + padding;
+    float contentWidth = panelWidth - padding * 2.0f;
+    UiPanel(ui, x, y, panelWidth, panelHeight);
+    y += padding;
+    UiTextCentered(ui, x + panelWidth * 0.5f, y,
+        UI_COLOR_TEXT, L"Моды сервера");
+    y += ui->font.lineHeight + 16.0f * s;
+    UiText(ui, contentX, y, UI_COLOR_TEXT_DIM,
+        menu->requiredServerModsInstalled
+            ? L"Необходимые моды установлены, но состав отличается."
+            : L"Часть обязательных модов отсутствует.");
+    y += ui->font.lineHeight + 14.0f * s;
+    if (menu->requiredServerModsInstalled)
+    {
+        if (UiButton(ui, WIDGET_MODS_APPLY, contentX, y,
+                contentWidth, 38.0f * s, L"Включить нужные моды и войти"))
+        {
+            return PAUSE_MENU_ACTION_APPLY_SERVER_MODS;
+        }
+    }
+    else if (menu->serverDownloadsAllowed)
+    {
+        if (menu->contentDownloading)
+        {
+            UiText(ui, contentX, y, UI_COLOR_TEXT_DIM,
+                L"Загрузка и проверка содержимого…");
+        }
+        else if (UiButton(ui, WIDGET_CONTENT_DOWNLOAD, contentX, y,
+                contentWidth, 38.0f * s,
+                L"Загрузить содержимое и войти"))
+        {
+            menu->contentDownloading = true;
+            menu->contentDownloadFailed = false;
+            return PAUSE_MENU_ACTION_DOWNLOAD_SERVER_CONTENT;
+        }
+    }
+    else
+    {
+        UiText(ui, contentX, y, UiColor(216, 96, 80, 255),
+            L"Загрузка содержимого на сервере отключена.");
+    }
+    float bottom = ((float)height + panelHeight) * 0.5f - padding;
+    if (UiButton(ui, WIDGET_CONNECT_CANCEL, contentX,
+            bottom - 34.0f * s, contentWidth, 34.0f * s, L"Отмена"))
+    {
+        menu->networkConnecting = false;
+        menu->contentDownloading = false;
+        menu->screen = PAUSE_MENU_MULTIPLAYER;
+        return PAUSE_MENU_ACTION_CANCEL_CONNECT;
+    }
+    return PAUSE_MENU_ACTION_NONE;
+}
+
 static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
     int32_t width, int32_t height)
 {
@@ -80,7 +390,7 @@ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
     float padding = 20.0f * s;
     float titleHeight = ui->font.lineHeight;
     float panelHeight = padding + titleHeight + 16.0f * s
-        + buttonHeight * 3.0f + buttonGap * 2.0f
+        + buttonHeight * 4.0f + buttonGap * 3.0f
         + 12.0f * s + titleHeight + padding;
 
     float panelX = ((float)width - panelWidth) * 0.5f;
@@ -106,7 +416,15 @@ static PauseMenuAction UpdateMainScreen(PauseMenu* menu, UiContext* ui,
     if (UiButton(ui, WIDGET_SETTINGS, buttonX, cursorY,
             buttonWidth, buttonHeight, L"Настройки"))
     {
+        menu->settingsReturnScreen = PAUSE_MENU_MAIN;
         menu->screen = PAUSE_MENU_SETTINGS;
+    }
+    cursorY += buttonHeight + buttonGap;
+
+    if (UiButton(ui, WIDGET_RETURN_TITLE, buttonX, cursorY,
+            buttonWidth, buttonHeight, L"В главное меню"))
+    {
+        action = PAUSE_MENU_ACTION_RETURN_TITLE;
     }
     cursorY += buttonHeight + buttonGap;
 
@@ -676,6 +994,12 @@ static float DrawModsTab(UiContext* ui, ModsState* mods,
                 textTop, UiColor(150, 158, 172, 160), entry->version);
         }
 
+        const wchar_t* sideText = entry->side == MOD_SIDE_CLIENT
+            ? L"клиент" : (entry->side == MOD_SIDE_SERVER ? L"сервер" : L"клиент+сервер");
+        UiText(ui, x + width - UiScaled(ui, 130.0f)
+                - UiTextWidth(ui, sideText), textTop,
+            UI_COLOR_TEXT_DIM, sideText);
+
         if (entry->compatible)
         {
             bool enabled = entry->enabled;
@@ -689,7 +1013,8 @@ static float DrawModsTab(UiContext* ui, ModsState* mods,
             // Фактический статус от хоста: включённый мод, который
             // не загрузился, честно показывает причину.
             if (entry->enabled
-                && entry->runtimeStatus != MOD_RUNTIME_LOADED)
+                && entry->runtimeStatus != MOD_RUNTIME_LOADED
+                && entry->runtimeStatus != MOD_RUNTIME_SIDE_INACTIVE)
             {
                 wchar_t reason[MENU_TEXT_CAPACITY];
                 UiTextBuilder builder;
@@ -872,7 +1197,7 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     if (UiButton(ui, WIDGET_BACK, contentX, viewportBottom + 10.0f * s,
             contentWidth, buttonHeight, L"Назад"))
     {
-        menu->screen = PAUSE_MENU_MAIN;
+        menu->screen = menu->settingsReturnScreen;
     }
 }
 
@@ -890,7 +1215,22 @@ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
     {
         if (menu->screen == PAUSE_MENU_SETTINGS)
         {
-            menu->screen = PAUSE_MENU_MAIN;
+            menu->screen = menu->settingsReturnScreen;
+        }
+        else if (menu->screen == PAUSE_MENU_SINGLEPLAYER
+            || menu->screen == PAUSE_MENU_MULTIPLAYER)
+        {
+            menu->screen = PAUSE_MENU_TITLE;
+        }
+        else if (menu->screen == PAUSE_MENU_TITLE)
+        {
+            return PAUSE_MENU_ACTION_QUIT;
+        }
+        else if (menu->screen == PAUSE_MENU_MOD_COMPATIBILITY)
+        {
+            menu->networkConnecting = false;
+            menu->screen = PAUSE_MENU_MULTIPLAYER;
+            return PAUSE_MENU_ACTION_CANCEL_CONNECT;
         }
         else
         {
@@ -905,6 +1245,23 @@ PauseMenuAction PauseMenuUpdate(PauseMenu* menu, UiContext* ui,
     if (menu->screen == PAUSE_MENU_MAIN)
     {
         return UpdateMainScreen(menu, ui, width, height);
+    }
+
+    if (menu->screen == PAUSE_MENU_TITLE)
+    {
+        return UpdateTitleScreen(menu, ui, width, height);
+    }
+    if (menu->screen == PAUSE_MENU_SINGLEPLAYER)
+    {
+        return UpdateSingleplayerScreen(menu, ui, width, height);
+    }
+    if (menu->screen == PAUSE_MENU_MULTIPLAYER)
+    {
+        return UpdateMultiplayerScreen(menu, ui, width, height);
+    }
+    if (menu->screen == PAUSE_MENU_MOD_COMPATIBILITY)
+    {
+        return UpdateModCompatibilityScreen(menu, ui, width, height);
     }
 
     UpdateSettingsScreen(menu, ui, settings, renderer, window,

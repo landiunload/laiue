@@ -10,6 +10,8 @@ laiue_add_module(gameplay
         player_jump.h
         game_mode.h
         game_events.h
+        inventory.c
+        inventory.h
         ../game/camera.h
         ../api.h
     LINK

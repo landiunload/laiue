@@ -80,6 +80,8 @@ void UiRelease(UiContext* ui);
 // Примитивы (координаты в пикселях окна).
 void UiRect(UiContext* ui, float x, float y, float width, float height,
     float cornerRadius, uint32_t color);
+void UiImage(UiContext* ui, float x, float y, float width, float height,
+    float u0, float v0, float u1, float v1, uint32_t color);
 void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
     const wchar_t* text);
 void UiTextCentered(UiContext* ui, float centerX, float lineTopY,

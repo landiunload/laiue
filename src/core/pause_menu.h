@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/game_time.h"
-#include "core/mods.h"
+#include "mod/mods.h"
 #include "core/panorama.h"
+#include "core/server_list.h"
+#include "core/save_game.h"
 #include "core/ui.h"
 #include "platform/window.h"
 #include "render/renderer.h"
@@ -20,13 +22,23 @@ typedef enum PauseMenuScreen
     PAUSE_MENU_CLOSED = 0,
     PAUSE_MENU_MAIN,
     PAUSE_MENU_SETTINGS,
+    PAUSE_MENU_TITLE,
+    PAUSE_MENU_SINGLEPLAYER,
+    PAUSE_MENU_MULTIPLAYER,
+    PAUSE_MENU_MOD_COMPATIBILITY,
 } PauseMenuScreen;
 
 typedef enum PauseMenuAction
 {
     PAUSE_MENU_ACTION_NONE = 0,
     PAUSE_MENU_ACTION_RESUME,
+    PAUSE_MENU_ACTION_RETURN_TITLE,
     PAUSE_MENU_ACTION_QUIT,
+    PAUSE_MENU_ACTION_PLAY_WORLD,
+    PAUSE_MENU_ACTION_CONNECT_LOCAL,
+    PAUSE_MENU_ACTION_APPLY_SERVER_MODS,
+    PAUSE_MENU_ACTION_DOWNLOAD_SERVER_CONTENT,
+    PAUSE_MENU_ACTION_CANCEL_CONNECT,
 } PauseMenuAction;
 
 typedef struct GameSettings
@@ -60,13 +72,32 @@ typedef struct PauseMenu
     // 0 — графика, 1 — текстуры, 2 — шейдеры, 3 — моды,
     // 4 — администрирование, 5 — управление.
     int32_t settingsTab;
+    PauseMenuScreen settingsReturnScreen;
     float settingsScroll;  // прокрутка контента настроек, px (0 — верх)
     bool saveRequested;    // кнопка «Сохранить мир» (сбрасывает вызывающий)
     ShaderPackLoadStatus shaderPackStatus;
     RendererContentStatus texturePackStatus;
+    wchar_t selectedWorld[64];
+    SaveGameSlotList worldSlots;
+    bool worldListLoaded;
+    uint32_t worldListOffset;
+    ServerList servers;
+    bool serverListLoaded;
+    uint32_t serverListOffset;
+    uint16_t selectedServerPort;
+    uint32_t requiredServerModCount;
+    bool requiredServerModsInstalled;
+    bool serverDownloadsAllowed;
+    bool contentDownloading;
+    bool contentDownloadFailed;
+    bool networkConnecting;
+    bool networkRejected;
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);
+void PauseMenuOpenTitle(PauseMenu* menu);
+void PauseMenuShowModCompatibility(PauseMenu* menu, uint32_t count,
+    bool installed, bool downloadsAllowed);
 
 // Обновляет состояние и собирает квады меню в ui.
 // escapePressed — Esc в этом кадре (в настройках возвращает на главный

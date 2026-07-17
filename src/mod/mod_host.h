@@ -1,6 +1,7 @@
 #pragma once
 
-#include "core/mods.h"
+#include "api.h"
+#include "mod/mods.h"
 #include "game/camera.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/player_controller.h"
@@ -27,17 +28,20 @@
 #define MOD_HOST_FIXED_STEP_SECONDS (1.0f / 60.0f)
 #define MOD_HOST_MAX_FIXED_STEPS_PER_FRAME 5
 
-typedef struct ChunkStreaming ChunkStreaming;
-
 // Указатели на подсистемы, которыми пользуется таблица API.
 typedef struct ModHostBindings
 {
     World* world;
-    ChunkStreaming* chunkStreaming;
     PlayerController* player;
     Camera* camera;
     GameMode* gameMode;
     float* timeOfDayHours;   // игровое время суток, 0..24
+    ModSide runtimeSide;
+    void* invalidateContext;
+    void (*invalidateBlock)(void* context,
+        int64_t x, int64_t y, int64_t z);
+    void* viewContext;
+    void (*getViewDirection)(void* context, float outDirection[3]);
     // Каталог блобов модов в сохранении (moddata/), может быть пустым.
     const wchar_t* modDataDirectory;
 } ModHostBindings;
@@ -62,16 +66,17 @@ typedef struct ModHost
     float fixedTickAccumulator;
 } ModHost;
 
-bool ModHostInit(ModHost* host, const ModHostBindings* bindings);
-void ModHostShutdown(ModHost* host);
+LAIUE_MOD_API bool ModHostInit(
+    ModHost* host, const ModHostBindings* bindings);
+LAIUE_MOD_API void ModHostShutdown(ModHost* host);
 
 // Приводит загруженные DLL в соответствие включённым модам (вызывается
 // при смене ревизии ModsState и на старте) и отписывает в entries
 // фактический runtimeStatus и код отказа инициализации.
-void ModHostSync(ModHost* host, ModsState* mods);
+LAIUE_MOD_API void ModHostSync(ModHost* host, ModsState* mods);
 
 // Хуки: фиксированный тик + кадр (вне меню паузы) и правка блока игроком.
-void ModHostDispatchFrame(ModHost* host, float deltaSeconds);
-void ModHostDispatchBlockEdit(ModHost* host,
+LAIUE_MOD_API void ModHostDispatchFrame(ModHost* host, float deltaSeconds);
+LAIUE_MOD_API void ModHostDispatchBlockEdit(ModHost* host,
     int64_t x, int64_t y, int64_t z,
     uint8_t previousBlock, uint8_t newBlock);

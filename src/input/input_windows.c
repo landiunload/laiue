@@ -31,6 +31,16 @@ static InputKey MapVirtualKeyToInputKey(uint32_t virtualKey)
         case 'T':         return INPUT_KEY_T;
         case 'G':         return INPUT_KEY_G;
         case 'V':         return INPUT_KEY_V;
+        case 'E':         return INPUT_KEY_E;
+        case '1':         return INPUT_KEY_1;
+        case '2':         return INPUT_KEY_2;
+        case '3':         return INPUT_KEY_3;
+        case '4':         return INPUT_KEY_4;
+        case '5':         return INPUT_KEY_5;
+        case '6':         return INPUT_KEY_6;
+        case '7':         return INPUT_KEY_7;
+        case '8':         return INPUT_KEY_8;
+        case '9':         return INPUT_KEY_9;
         case VK_SHIFT:
         case VK_LSHIFT:
         case VK_RSHIFT:   return INPUT_KEY_SHIFT;

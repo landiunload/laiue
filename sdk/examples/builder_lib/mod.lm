@@ -2,7 +2,9 @@ LAIUE MOD 1
 # Библиотечный мод: публикует интерфейс laiue.builder для других модов.
 name = Builder Lib
 author = laiue
+id = laiue.builder_lib
 version = 1.0.0
+side = server
 game = 0.5
 
 [native]

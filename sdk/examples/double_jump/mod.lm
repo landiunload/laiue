@@ -1,7 +1,9 @@
 LAIUE MOD 1
 name = Double Jump
 author = laiue
+id = laiue.double_jump
 version = 2.0.0
+side = client
 game = 0.5
 
 [native]

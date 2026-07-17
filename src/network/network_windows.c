@@ -10,16 +10,18 @@
 #include <string.h>
 
 #define NETWORK_RECEIVE_CAPACITY 4096U
-#define NETWORK_SEND_CAPACITY 65536U
+#define NETWORK_SEND_CAPACITY 16384U
 #define NETWORK_CLIENT_EVENT_CAPACITY 128U
 #define NETWORK_SERVER_EVENT_CAPACITY 256U
-#define NETWORK_HANDSHAKE_TIMEOUT_MS 5000ULL
+#define NETWORK_HANDSHAKE_TIMEOUT_MS 60000ULL
+#define NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS 120000ULL
 #define NETWORK_IDLE_TIMEOUT_MS 15000ULL
 #define NETWORK_RATE_WINDOW_MS 1000ULL
 #define NETWORK_MAX_FRAMES_PER_SECOND 160U
 #define NETWORK_MAX_INPUTS_PER_SECOND 120U
 #define NETWORK_MAX_EDITS_PER_SECOND 16U
 #define NETWORK_KEEPALIVE_INTERVAL_MS 1000ULL
+#define NETWORK_CONTROL_PAYLOAD_CAPACITY 256U
 
 typedef struct SocketChannel
 {
@@ -45,8 +47,17 @@ typedef struct NetworkServerPeer
     uint32_t framesInWindow;
     uint32_t inputsInWindow;
     uint32_t editsInWindow;
+    NetworkModDescriptor mods[LAIUE_NETWORK_MAX_MODS];
+    uint64_t clientNonce;
+    uint32_t expectedModCount;
+    uint32_t receivedModCount;
+    uint64_t contentOffset;
     bool allocated;
     bool ready;
+    bool helloReceived;
+    bool modListReceived;
+    bool contentTransferActive;
+    bool rejected;
 } NetworkServerPeer;
 
 struct NetworkClient
@@ -58,6 +69,16 @@ struct NetworkClient
     uint32_t eventCount;
     NetworkConnectionState state;
     uint64_t clientNonce;
+    NetworkModDescriptor serverMods[LAIUE_NETWORK_MAX_MODS];
+    uint32_t expectedServerModCount;
+    uint32_t receivedServerModCount;
+    uint8_t *contentBytes;
+    uint64_t expectedContentSize;
+    uint64_t receivedContentSize;
+    uint8_t expectedContentHash[LAIUE_NETWORK_CONTENT_HASH_SIZE];
+    bool serverDownloadsAllowed;
+    bool modsSubmitted;
+    bool contentRequested;
     bool transportConnected;
     bool disconnectNotified;
     bool winsockAcquired;
@@ -74,32 +95,55 @@ struct NetworkServer
     uint32_t nextPeerId;
     uint16_t maximumPeers;
     int64_t worldSeed;
+    NetworkModDescriptor mods[LAIUE_NETWORK_MAX_MODS];
+    uint32_t modCount;
+    const uint8_t *contentBundle;
+    uint64_t contentBundleSize;
+    uint8_t contentBundleHash[LAIUE_NETWORK_CONTENT_HASH_SIZE];
+    bool allowContentDownloads;
     bool winsockAcquired;
 };
 
-static volatile LONG g_winsockReferences;
+_Static_assert((NETWORK_SEND_CAPACITY & (NETWORK_SEND_CAPACITY - 1U)) == 0,
+               "Send ring capacity must remain a power of two");
+_Static_assert(NETWORK_SEND_CAPACITY >= LAIUE_PROTOCOL_MAX_FRAME_SIZE,
+               "Send ring must fit the largest protocol frame");
+_Static_assert(sizeof(struct NetworkServer) <= 384U * 1024U,
+               "Network server memory budget exceeded");
+_Static_assert(sizeof(NetworkModDescriptor) == sizeof(LaiueProtocolMod),
+               "Public and wire mod descriptors diverged");
+
+static SRWLOCK g_winsockLock = SRWLOCK_INIT;
+static uint32_t g_winsockReferences;
 
 static bool WinsockAcquire(void)
 {
-    LONG references = InterlockedIncrement(&g_winsockReferences);
-    if (references == 1)
+    bool acquired = true;
+    AcquireSRWLockExclusive(&g_winsockLock);
+    if (g_winsockReferences == 0)
     {
         WSADATA data;
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
         {
-            InterlockedDecrement(&g_winsockReferences);
-            return false;
+            acquired = false;
         }
     }
-    return true;
+    if (acquired)
+    {
+        ++g_winsockReferences;
+    }
+    ReleaseSRWLockExclusive(&g_winsockLock);
+    return acquired;
 }
 
 static void WinsockRelease(void)
 {
-    if (InterlockedDecrement(&g_winsockReferences) == 0)
+    AcquireSRWLockExclusive(&g_winsockLock);
+    if (g_winsockReferences != 0 && --g_winsockReferences == 0)
     {
         WSACleanup();
     }
+    ReleaseSRWLockExclusive(&g_winsockLock);
 }
 
 static bool SocketSetNonblocking(SOCKET socketHandle)
@@ -149,15 +193,24 @@ static bool ChannelQueueBytes(SocketChannel *channel, const uint8_t *bytes, uint
 static bool ChannelQueuePayload(SocketChannel *channel, LaiueMessageType type,
                                 const uint8_t *payload, uint32_t payloadSize)
 {
-    uint8_t frame[LAIUE_PROTOCOL_MAX_FRAME_SIZE];
+    if (payloadSize > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE
+        || (payloadSize != 0 && payload == NULL)
+        || LAIUE_PROTOCOL_HEADER_SIZE + payloadSize
+            > NETWORK_SEND_CAPACITY - channel->sendCount)
+    {
+        return false;
+    }
+    uint8_t header[LAIUE_PROTOCOL_HEADER_SIZE];
     uint32_t nextSequence = channel->sendSequence + 1U;
     if (nextSequence == 0)
     {
         return false;
     }
-    uint32_t frameSize =
-        LaiueProtocolWriteFrame(frame, sizeof(frame), type, nextSequence, payload, payloadSize);
-    if (frameSize == 0 || !ChannelQueueBytes(channel, frame, frameSize))
+    if (LaiueProtocolWriteHeader(header, sizeof(header), type,
+            nextSequence, payloadSize) == 0
+        || !ChannelQueueBytes(channel, header, sizeof(header))
+        || (payloadSize != 0
+            && !ChannelQueueBytes(channel, payload, payloadSize)))
     {
         return false;
     }
@@ -299,10 +352,111 @@ static bool GenerateNonce(uint64_t *outNonce)
     return status >= 0 && *outNonce != 0;
 }
 
+static bool ComputeSha256(const uint8_t *bytes, uint64_t size,
+                          uint8_t output[LAIUE_NETWORK_CONTENT_HASH_SIZE])
+{
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    bool succeeded = BCryptOpenAlgorithmProvider(&algorithm,
+        BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0
+        && BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0) >= 0;
+    uint64_t offset = 0;
+    while (succeeded && offset < size)
+    {
+        ULONG part = size - offset > 0xffffffffULL
+            ? 0xffffffffU : (ULONG)(size - offset);
+        succeeded = BCryptHashData(hash, (PUCHAR)(bytes + offset), part, 0) >= 0;
+        offset += part;
+    }
+    if (succeeded)
+    {
+        succeeded = BCryptFinishHash(hash, output,
+            LAIUE_NETWORK_CONTENT_HASH_SIZE, 0) >= 0;
+    }
+    if (hash != NULL) BCryptDestroyHash(hash);
+    if (algorithm != NULL) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return succeeded;
+}
+
+static bool HashEquals(const uint8_t *left, const uint8_t *right,
+                       uint32_t size)
+{
+    uint8_t difference = 0;
+    for (uint32_t i = 0; i < size; ++i) difference |= left[i] ^ right[i];
+    return difference == 0;
+}
+
+static void CopyModFromProtocol(NetworkModDescriptor *destination,
+                                const LaiueProtocolMod *source)
+{
+    memset(destination, 0, sizeof(*destination));
+    memcpy(destination->id, source->id, sizeof(destination->id));
+    memcpy(destination->version, source->version, sizeof(destination->version));
+    memcpy(destination->contentHash, source->contentHash,
+        LAIUE_NETWORK_MOD_HASH_SIZE);
+}
+
+static void CopyModToProtocol(LaiueProtocolMod *destination,
+                              const NetworkModDescriptor *source)
+{
+    memset(destination, 0, sizeof(*destination));
+    memcpy(destination->id, source->id, sizeof(destination->id));
+    memcpy(destination->version, source->version, sizeof(destination->version));
+    memcpy(destination->contentHash, source->contentHash,
+        LAIUE_NETWORK_MOD_HASH_SIZE);
+}
+
+static bool ModDescriptorsEqual(const NetworkModDescriptor *left,
+                                const NetworkModDescriptor *right)
+{
+    if (!HashEquals(left->contentHash, right->contentHash,
+            LAIUE_NETWORK_MOD_HASH_SIZE)) return false;
+    uint32_t index = 0;
+    while (index < LAIUE_NETWORK_MOD_ID_CAPACITY
+        && left->id[index] != '\0' && left->id[index] == right->id[index]) ++index;
+    if (index == LAIUE_NETWORK_MOD_ID_CAPACITY
+        || left->id[index] != right->id[index]) return false;
+    index = 0;
+    while (index < LAIUE_NETWORK_MOD_VERSION_CAPACITY
+        && left->version[index] != '\0'
+        && left->version[index] == right->version[index]) ++index;
+    return index < LAIUE_NETWORK_MOD_VERSION_CAPACITY
+        && left->version[index] == right->version[index];
+}
+
+static bool ChannelQueueModList(SocketChannel *channel,
+                                LaiueMessageType listType,
+                                LaiueMessageType entryType,
+                                const NetworkModDescriptor *mods,
+                                uint32_t count, uint8_t flags)
+{
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeModList(payload, sizeof(payload), count, flags);
+    if (size == 0 || !ChannelQueuePayload(channel, listType, payload, size)) return false;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        LaiueProtocolMod wire;
+        CopyModToProtocol(&wire, &mods[i]);
+        size = LaiueProtocolEncodeMod(payload, sizeof(payload), &wire);
+        if (size == 0 || !ChannelQueuePayload(channel, entryType, payload, size)) return false;
+    }
+    return true;
+}
+
+static bool ClientPushServerModsEvent(NetworkClient *client)
+{
+    NetworkClientEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = NETWORK_CLIENT_EVENT_SERVER_MODS;
+    event.data.serverMods.count = client->receivedServerModCount;
+    event.data.serverMods.downloadsAllowed = client->serverDownloadsAllowed;
+    return ClientPushEvent(client, &event);
+}
+
 static bool ClientBeginHandshake(NetworkClient *client)
 {
     uint64_t nonce;
-    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     if (!GenerateNonce(&nonce))
     {
         return false;
@@ -324,18 +478,98 @@ static bool ClientHandleFrame(NetworkClient *client, const LaiueProtocolFrame *f
     memset(&event, 0, sizeof(event));
     if (client->state == NETWORK_CONNECTION_CONNECTING)
     {
-        uint64_t echoedNonce;
-        if (frame->type != LAIUE_MESSAGE_SERVER_WELCOME ||
-            !LaiueProtocolDecodeWelcome(frame->payload, frame->payloadSize,
-                                        &event.data.ready.peerId, &event.data.ready.worldSeed,
-                                        &echoedNonce) ||
-            echoedNonce != client->clientNonce)
+        uint8_t flags;
+        if (frame->type != LAIUE_MESSAGE_SERVER_MOD_LIST
+            || !LaiueProtocolDecodeModList(frame->payload, frame->payloadSize,
+                &client->expectedServerModCount, &flags))
         {
             return false;
         }
-        event.type = NETWORK_CLIENT_EVENT_READY;
-        client->state = NETWORK_CONNECTION_READY;
-        return ClientPushEvent(client, &event);
+        client->serverDownloadsAllowed = (flags & 1U) != 0;
+        client->state = NETWORK_CONNECTION_NEGOTIATING_MODS;
+        return client->expectedServerModCount != 0
+            || ClientPushServerModsEvent(client);
+    }
+
+    if (client->state == NETWORK_CONNECTION_NEGOTIATING_MODS)
+    {
+        if (frame->type == LAIUE_MESSAGE_SERVER_CONTENT_BEGIN
+            && client->contentRequested && client->contentBytes == NULL)
+        {
+            if (!LaiueProtocolDecodeContentBegin(frame->payload,
+                    frame->payloadSize, &client->expectedContentSize,
+                    client->expectedContentHash)
+                || client->expectedContentSize > LAIUE_NETWORK_MAX_CONTENT_BYTES)
+            {
+                return false;
+            }
+            client->contentBytes = HeapAlloc(GetProcessHeap(), 0,
+                (size_t)client->expectedContentSize);
+            return client->contentBytes != NULL;
+        }
+        if (frame->type == LAIUE_MESSAGE_SERVER_CONTENT_CHUNK
+            && client->contentBytes != NULL && frame->payloadSize != 0
+            && frame->payloadSize <= client->expectedContentSize
+                - client->receivedContentSize)
+        {
+            memcpy(client->contentBytes + client->receivedContentSize,
+                frame->payload, frame->payloadSize);
+            client->receivedContentSize += frame->payloadSize;
+            return true;
+        }
+        if (frame->type == LAIUE_MESSAGE_SERVER_CONTENT_END
+            && frame->payloadSize == 0 && client->contentBytes != NULL
+            && client->receivedContentSize == client->expectedContentSize)
+        {
+            uint8_t actualHash[LAIUE_NETWORK_CONTENT_HASH_SIZE];
+            if (!ComputeSha256(client->contentBytes,
+                    client->receivedContentSize, actualHash)
+                || !HashEquals(actualHash, client->expectedContentHash,
+                    LAIUE_NETWORK_CONTENT_HASH_SIZE)) return false;
+            event.type = NETWORK_CLIENT_EVENT_CONTENT_READY;
+            return ClientPushEvent(client, &event);
+        }
+        if (frame->type == LAIUE_MESSAGE_SERVER_MOD_ENTRY
+            && client->receivedServerModCount < client->expectedServerModCount)
+        {
+            LaiueProtocolMod wire;
+            if (!LaiueProtocolDecodeMod(frame->payload, frame->payloadSize, &wire))
+            {
+                return false;
+            }
+            CopyModFromProtocol(
+                &client->serverMods[client->receivedServerModCount++], &wire);
+            return client->receivedServerModCount != client->expectedServerModCount
+                || ClientPushServerModsEvent(client);
+        }
+        if (frame->type == LAIUE_MESSAGE_SERVER_REJECT)
+        {
+            uint8_t reason;
+            if (!LaiueProtocolDecodeReject(frame->payload, frame->payloadSize, &reason)
+                || reason > NETWORK_REJECT_SERVER_POLICY) return false;
+            event.type = NETWORK_CLIENT_EVENT_REJECTED;
+            event.data.rejectReason = (NetworkRejectReason)reason;
+            if (!ClientPushEvent(client, &event)) return false;
+            client->disconnectNotified = true;
+            if (client->channel.socket != INVALID_SOCKET)
+            {
+                closesocket(client->channel.socket);
+                client->channel.socket = INVALID_SOCKET;
+            }
+            client->state = NETWORK_CONNECTION_DISCONNECTED;
+            return true;
+        }
+        if (frame->type == LAIUE_MESSAGE_SERVER_WELCOME && client->modsSubmitted)
+        {
+            uint64_t echoedNonce;
+            if (!LaiueProtocolDecodeWelcome(frame->payload, frame->payloadSize,
+                    &event.data.ready.peerId, &event.data.ready.worldSeed,
+                    &echoedNonce) || echoedNonce != client->clientNonce) return false;
+            event.type = NETWORK_CLIENT_EVENT_READY;
+            client->state = NETWORK_CONNECTION_READY;
+            return ClientPushEvent(client, &event);
+        }
+        return false;
     }
 
     if (client->state != NETWORK_CONNECTION_READY)
@@ -373,6 +607,41 @@ static bool ClientHandleFrame(NetworkClient *client, const LaiueProtocolFrame *f
         event.data.blockDelta.block[1] = decoded.block[1];
         event.data.blockDelta.block[2] = decoded.block[2];
         event.data.blockDelta.replacement = decoded.replacement;
+        return ClientPushEvent(client, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_BLOCK_DROP_SPAWN)
+    {
+        LaiueProtocolBlockDrop decoded;
+        if (!LaiueProtocolDecodeBlockDrop(frame->payload,
+                frame->payloadSize, &decoded)) return false;
+        event.type = NETWORK_CLIENT_EVENT_BLOCK_DROP_SPAWN;
+        event.data.blockDrop.id = decoded.id;
+        event.data.blockDrop.block = decoded.block;
+        event.data.blockDrop.position[0] = decoded.position[0];
+        event.data.blockDrop.position[1] = decoded.position[1];
+        event.data.blockDrop.position[2] = decoded.position[2];
+        return ClientPushEvent(client, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_BLOCK_DROP_REMOVE)
+    {
+        event.type = NETWORK_CLIENT_EVENT_BLOCK_DROP_REMOVE;
+        if (!LaiueProtocolDecodeDropRemove(frame->payload,
+                frame->payloadSize, &event.data.removedDropId)) return false;
+        return ClientPushEvent(client, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_INVENTORY_STATE)
+    {
+        LaiueProtocolInventory decoded;
+        if (!LaiueProtocolDecodeInventory(frame->payload,
+                frame->payloadSize, &decoded)) return false;
+        event.type = NETWORK_CLIENT_EVENT_INVENTORY_STATE;
+        event.data.inventory.selectedHotbarSlot =
+            decoded.selectedHotbarSlot;
+        for (uint32_t i = 0; i < LAIUE_NETWORK_INVENTORY_SLOTS; ++i)
+        {
+            event.data.inventory.slots[i].item = decoded.slots[i].item;
+            event.data.inventory.slots[i].count = decoded.slots[i].count;
+        }
         return ClientPushEvent(client, &event);
     }
     if (frame->type == LAIUE_MESSAGE_PONG && frame->payloadSize == 0)
@@ -463,6 +732,87 @@ static bool ServerCheckRate(NetworkServerPeer *peer, LaiueMessageType type)
            peer->editsInWindow <= NETWORK_MAX_EDITS_PER_SECOND;
 }
 
+static bool ServerFinishModNegotiation(NetworkServer *server,
+                                       NetworkServerPeer *peer)
+{
+    bool matches = peer->receivedModCount == server->modCount;
+    for (uint32_t i = 0; i < server->modCount && matches; ++i)
+    {
+        matches = ModDescriptorsEqual(&peer->mods[i], &server->mods[i]);
+    }
+
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    if (!matches)
+    {
+        uint32_t size = LaiueProtocolEncodeReject(payload, sizeof(payload),
+            NETWORK_REJECT_MOD_MISMATCH);
+        if (size == 0 || !ChannelQueuePayload(&peer->channel,
+                LAIUE_MESSAGE_SERVER_REJECT, payload, size)) return false;
+        peer->rejected = true;
+        return true;
+    }
+
+    uint32_t size = LaiueProtocolEncodeWelcome(payload, sizeof(payload),
+        peer->peerId, server->worldSeed, peer->clientNonce);
+    if (size == 0 || !ChannelQueuePayload(&peer->channel,
+            LAIUE_MESSAGE_SERVER_WELCOME, payload, size)) return false;
+    peer->ready = true;
+    NetworkServerEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = NETWORK_SERVER_EVENT_CONNECTED;
+    event.peerId = peer->peerId;
+    return ServerPushEvent(server, &event);
+}
+
+static bool ServerBeginContentTransfer(NetworkServer *server,
+                                       NetworkServerPeer *peer)
+{
+    if (!server->allowContentDownloads || server->contentBundle == NULL
+        || server->contentBundleSize == 0 || peer->contentTransferActive)
+    {
+        return false;
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeContentBegin(payload, sizeof(payload),
+        server->contentBundleSize, server->contentBundleHash);
+    if (size == 0 || !ChannelQueuePayload(&peer->channel,
+            LAIUE_MESSAGE_SERVER_CONTENT_BEGIN, payload, size)) return false;
+    peer->contentOffset = 0;
+    peer->contentTransferActive = true;
+    return true;
+}
+
+static bool ServerPumpContentTransfer(NetworkServer *server,
+                                      NetworkServerPeer *peer)
+{
+    if (!peer->contentTransferActive) return true;
+    for (uint32_t chunkIndex = 0; chunkIndex < 8U; ++chunkIndex)
+    {
+        uint32_t available = NETWORK_SEND_CAPACITY - peer->channel.sendCount;
+        if (peer->contentOffset == server->contentBundleSize)
+        {
+            if (available < LAIUE_PROTOCOL_HEADER_SIZE) return true;
+            if (!ChannelQueuePayload(&peer->channel,
+                    LAIUE_MESSAGE_SERVER_CONTENT_END, NULL, 0)) return false;
+            peer->contentTransferActive = false;
+            return true;
+        }
+        if (available <= LAIUE_PROTOCOL_HEADER_SIZE) return true;
+        uint64_t remaining = server->contentBundleSize - peer->contentOffset;
+        uint32_t chunkSize = remaining > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE
+            ? LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE : (uint32_t)remaining;
+        uint32_t maximumForRing = available - LAIUE_PROTOCOL_HEADER_SIZE;
+        if (chunkSize > maximumForRing) chunkSize = maximumForRing;
+        if (chunkSize == 0) return true;
+        if (!ChannelQueuePayload(&peer->channel,
+                LAIUE_MESSAGE_SERVER_CONTENT_CHUNK,
+                server->contentBundle + peer->contentOffset,
+                chunkSize)) return false;
+        peer->contentOffset += chunkSize;
+    }
+    return true;
+}
+
 static bool ServerHandleFrame(NetworkServer *server, NetworkServerPeer *peer,
                               const LaiueProtocolFrame *frame)
 {
@@ -476,23 +826,41 @@ static bool ServerHandleFrame(NetworkServer *server, NetworkServerPeer *peer,
     event.peerId = peer->peerId;
     if (!peer->ready)
     {
-        uint64_t nonce;
-        if (frame->type != LAIUE_MESSAGE_CLIENT_HELLO ||
-            !LaiueProtocolDecodeHello(frame->payload, frame->payloadSize, &nonce))
+        if (!peer->helloReceived)
         {
-            return false;
+            if (frame->type != LAIUE_MESSAGE_CLIENT_HELLO
+                || !LaiueProtocolDecodeHello(frame->payload,
+                    frame->payloadSize, &peer->clientNonce)) return false;
+            peer->helloReceived = true;
+            return ChannelQueueModList(&peer->channel,
+                LAIUE_MESSAGE_SERVER_MOD_LIST,
+                LAIUE_MESSAGE_SERVER_MOD_ENTRY,
+                server->mods, server->modCount,
+                server->allowContentDownloads ? 1U : 0U);
         }
-        uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
-        uint32_t payloadSize = LaiueProtocolEncodeWelcome(payload, sizeof(payload), peer->peerId,
-                                                          server->worldSeed, nonce);
-        if (payloadSize == 0 || !ChannelQueuePayload(&peer->channel, LAIUE_MESSAGE_SERVER_WELCOME,
-                                                     payload, payloadSize))
+        if (!peer->modListReceived)
         {
-            return false;
+            if (frame->type == LAIUE_MESSAGE_CLIENT_CONTENT_REQUEST
+                && frame->payloadSize == 0)
+            {
+                return ServerBeginContentTransfer(server, peer);
+            }
+            uint8_t flags;
+            if (frame->type != LAIUE_MESSAGE_CLIENT_MOD_LIST
+                || !LaiueProtocolDecodeModList(frame->payload,
+                    frame->payloadSize, &peer->expectedModCount, &flags)
+                || flags != 0) return false;
+            peer->modListReceived = true;
+            return peer->expectedModCount != 0
+                || ServerFinishModNegotiation(server, peer);
         }
-        peer->ready = true;
-        event.type = NETWORK_SERVER_EVENT_CONNECTED;
-        return ServerPushEvent(server, &event);
+        if (frame->type != LAIUE_MESSAGE_CLIENT_MOD_ENTRY
+            || peer->receivedModCount >= peer->expectedModCount) return false;
+        LaiueProtocolMod wire;
+        if (!LaiueProtocolDecodeMod(frame->payload, frame->payloadSize, &wire)) return false;
+        CopyModFromProtocol(&peer->mods[peer->receivedModCount++], &wire);
+        return peer->receivedModCount != peer->expectedModCount
+            || ServerFinishModNegotiation(server, peer);
     }
 
     if (frame->type == LAIUE_MESSAGE_PLAYER_INPUT)
@@ -518,10 +886,19 @@ static bool ServerHandleFrame(NetworkServer *server, NetworkServerPeer *peer,
         event.type = NETWORK_SERVER_EVENT_EDIT_INTENT;
         if (!LaiueProtocolDecodeEditIntent(
                 frame->payload, frame->payloadSize, &event.data.editIntent.breakBlock,
-                &event.data.editIntent.placeBlock, event.data.editIntent.direction))
+                &event.data.editIntent.placeBlock,
+                &event.data.editIntent.placementBlock,
+                event.data.editIntent.direction))
         {
             return false;
         }
+        return ServerPushEvent(server, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_SELECT_HOTBAR_SLOT
+        && frame->payloadSize == 1U && frame->payload[0] < 9U)
+    {
+        event.type = NETWORK_SERVER_EVENT_SELECT_HOTBAR_SLOT;
+        event.data.selectedHotbarSlot = frame->payload[0];
         return ServerPushEvent(server, &event);
     }
     if (frame->type == LAIUE_MESSAGE_PING && frame->payloadSize == 0)
@@ -612,6 +989,10 @@ void NetworkClientDestroy(NetworkClient *client)
     {
         closesocket(client->channel.socket);
     }
+    if (client->contentBytes != NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, client->contentBytes);
+    }
     bool releaseWinsock = client->winsockAcquired;
     HeapFree(GetProcessHeap(), 0, client);
     if (releaseWinsock)
@@ -682,8 +1063,14 @@ void NetworkClientUpdate(NetworkClient *client)
     }
 
     uint64_t now = GetTickCount64();
-    if (client->state == NETWORK_CONNECTION_CONNECTING &&
-        now - client->channel.connectedAtMs > NETWORK_HANDSHAKE_TIMEOUT_MS)
+    if (client->state == NETWORK_CONNECTION_CONNECTING
+        && now - client->channel.connectedAtMs > NETWORK_HANDSHAKE_TIMEOUT_MS)
+    {
+        ClientDisconnect(client, NETWORK_DISCONNECT_TIMEOUT);
+    }
+    else if (client->state == NETWORK_CONNECTION_NEGOTIATING_MODS
+        && now - client->channel.lastReceiveAtMs
+            > NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS)
     {
         ClientDisconnect(client, NETWORK_DISCONNECT_TIMEOUT);
     }
@@ -717,6 +1104,75 @@ bool NetworkClientPollEvent(NetworkClient *client, NetworkClientEvent *outEvent)
     return true;
 }
 
+bool NetworkClientCopyServerMods(const NetworkClient *client,
+                                 NetworkModDescriptor *output,
+                                 uint32_t capacity, uint32_t *outCount)
+{
+    if (client == NULL || outCount == NULL) return false;
+    *outCount = client->receivedServerModCount;
+    if (capacity < client->receivedServerModCount
+        || (client->receivedServerModCount != 0 && output == NULL)) return false;
+    if (client->receivedServerModCount != 0)
+    {
+        memcpy(output, client->serverMods,
+            (size_t)client->receivedServerModCount * sizeof(output[0]));
+    }
+    return true;
+}
+
+bool NetworkClientSubmitMods(NetworkClient *client,
+                             const NetworkModDescriptor *mods,
+                             uint32_t count)
+{
+    if (client == NULL
+        || client->state != NETWORK_CONNECTION_NEGOTIATING_MODS
+        || client->receivedServerModCount != client->expectedServerModCount
+        || client->modsSubmitted || count > LAIUE_NETWORK_MAX_MODS
+        || (count != 0 && mods == NULL)) return false;
+    if (!ChannelQueueModList(&client->channel,
+            LAIUE_MESSAGE_CLIENT_MOD_LIST,
+            LAIUE_MESSAGE_CLIENT_MOD_ENTRY, mods, count, 0))
+    {
+        ClientDisconnect(client, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    client->modsSubmitted = true;
+    return true;
+}
+
+bool NetworkClientRequestContent(NetworkClient *client)
+{
+    if (client == NULL
+        || client->state != NETWORK_CONNECTION_NEGOTIATING_MODS
+        || !client->serverDownloadsAllowed || client->contentRequested
+        || client->modsSubmitted) return false;
+    if (!ChannelQueuePayload(&client->channel,
+            LAIUE_MESSAGE_CLIENT_CONTENT_REQUEST, NULL, 0))
+    {
+        ClientDisconnect(client, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    client->contentRequested = true;
+    return true;
+}
+
+bool NetworkClientTakeContent(NetworkClient *client,
+                              uint8_t **outBytes, uint64_t *outSize)
+{
+    if (client == NULL || outBytes == NULL || outSize == NULL
+        || client->contentBytes == NULL
+        || client->receivedContentSize != client->expectedContentSize)
+    {
+        return false;
+    }
+    *outBytes = client->contentBytes;
+    *outSize = client->receivedContentSize;
+    client->contentBytes = NULL;
+    client->expectedContentSize = 0;
+    client->receivedContentSize = 0;
+    return true;
+}
+
 bool NetworkClientSendInput(NetworkClient *client, const NetworkInputCommand *input)
 {
     if (client == NULL || input == NULL || client->state != NETWORK_CONNECTION_READY)
@@ -733,7 +1189,7 @@ bool NetworkClientSendInput(NetworkClient *client, const NetworkInputCommand *in
         .sprintHeld = input->sprintHeld,
         .crouchHeld = input->crouchHeld,
     };
-    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodeInput(payload, sizeof(payload), &protocolInput);
     if (size == 0)
     {
@@ -747,16 +1203,18 @@ bool NetworkClientSendInput(NetworkClient *client, const NetworkInputCommand *in
     return true;
 }
 
-bool NetworkClientSendEditIntent(NetworkClient *client, bool breakBlock, bool placeBlock,
+bool NetworkClientSendEditIntent(NetworkClient *client, bool breakBlock,
+                                 bool placeBlock, uint8_t placementBlock,
                                  const float direction[3])
 {
     if (client == NULL || client->state != NETWORK_CONNECTION_READY)
     {
         return false;
     }
-    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size =
-        LaiueProtocolEncodeEditIntent(payload, sizeof(payload), breakBlock, placeBlock, direction);
+        LaiueProtocolEncodeEditIntent(payload, sizeof(payload), breakBlock,
+            placeBlock, placementBlock, direction);
     if (size == 0)
     {
         return false;
@@ -769,10 +1227,30 @@ bool NetworkClientSendEditIntent(NetworkClient *client, bool breakBlock, bool pl
     return true;
 }
 
+bool NetworkClientSendSelectedHotbarSlot(NetworkClient* client, uint8_t slot)
+{
+    if (client == NULL || client->state != NETWORK_CONNECTION_READY
+        || slot >= 9U) return false;
+    if (!ChannelQueuePayload(&client->channel,
+            LAIUE_MESSAGE_SELECT_HOTBAR_SLOT, &slot, 1U))
+    {
+        ClientDisconnect(client, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    return true;
+}
+
 NetworkServer *NetworkServerCreateLoopback(const NetworkServerConfiguration *configuration)
 {
     if (configuration == NULL || configuration->port == 0 || configuration->maximumPeers == 0 ||
-        configuration->maximumPeers > LAIUE_NETWORK_MAX_PEERS || !WinsockAcquire())
+        configuration->maximumPeers > LAIUE_NETWORK_MAX_PEERS
+        || configuration->modCount > LAIUE_NETWORK_MAX_MODS
+        || (configuration->modCount != 0 && configuration->mods == NULL)
+        || (configuration->allowContentDownloads
+            && (configuration->contentBundle == NULL
+                || configuration->contentBundleSize == 0
+                || configuration->contentBundleSize > LAIUE_NETWORK_MAX_CONTENT_BYTES))
+        || !WinsockAcquire())
     {
         return NULL;
     }
@@ -790,6 +1268,17 @@ NetworkServer *NetworkServerCreateLoopback(const NetworkServerConfiguration *con
     }
     server->maximumPeers = configuration->maximumPeers;
     server->worldSeed = configuration->worldSeed;
+    server->modCount = configuration->modCount;
+    server->allowContentDownloads = configuration->allowContentDownloads;
+    server->contentBundle = configuration->contentBundle;
+    server->contentBundleSize = configuration->contentBundleSize;
+    memcpy(server->contentBundleHash, configuration->contentBundleSha256,
+        LAIUE_NETWORK_CONTENT_HASH_SIZE);
+    if (server->modCount != 0)
+    {
+        memcpy(server->mods, configuration->mods,
+            (size_t)server->modCount * sizeof(server->mods[0]));
+    }
     server->nextPeerId = 1;
 
     server->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -903,6 +1392,11 @@ void NetworkServerUpdate(NetworkServer *server)
             ServerDisconnectPeer(server, index, NETWORK_DISCONNECT_IO);
             continue;
         }
+        if (peer->rejected && peer->channel.sendCount == 0)
+        {
+            ServerDisconnectPeer(server, index, NETWORK_DISCONNECT_PROTOCOL);
+            continue;
+        }
         bool disconnected = false;
         for (uint32_t receivePass = 0; receivePass < 64U; ++receivePass)
         {
@@ -930,7 +1424,16 @@ void NetworkServerUpdate(NetworkServer *server)
         {
             continue;
         }
-        if ((!peer->ready && now - peer->channel.connectedAtMs > NETWORK_HANDSHAKE_TIMEOUT_MS) ||
+        if (!ServerPumpContentTransfer(server, peer))
+        {
+            ServerDisconnectPeer(server, index, NETWORK_DISCONNECT_OVERFLOW);
+            continue;
+        }
+        if ((!peer->helloReceived
+                && now - peer->channel.connectedAtMs > NETWORK_HANDSHAKE_TIMEOUT_MS)
+            || (!peer->ready && peer->helloReceived
+                && now - peer->channel.lastReceiveAtMs
+                    > NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS) ||
             (peer->ready && now - peer->channel.lastReceiveAtMs > NETWORK_IDLE_TIMEOUT_MS))
         {
             ServerDisconnectPeer(server, index, NETWORK_DISCONNECT_TIMEOUT);
@@ -968,7 +1471,7 @@ bool NetworkServerBroadcastPlayerState(NetworkServer *server, const NetworkPlaye
         .pitch = state->pitch,
         .grounded = state->grounded,
     };
-    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodePlayerState(payload, sizeof(payload), &encodedState);
     if (size == 0)
     {
@@ -999,7 +1502,7 @@ bool NetworkServerBroadcastBlockDelta(NetworkServer *server, const NetworkBlockD
         .block = {delta->block[0], delta->block[1], delta->block[2]},
         .replacement = delta->replacement,
     };
-    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodeBlockDelta(payload, sizeof(payload), &encodedDelta);
     if (size == 0)
     {
@@ -1017,4 +1520,83 @@ bool NetworkServerBroadcastBlockDelta(NetworkServer *server, const NetworkBlockD
         }
     }
     return result;
+}
+
+bool NetworkServerBroadcastBlockDrop(NetworkServer* server,
+    const NetworkBlockDrop* drop)
+{
+    if (server == NULL || drop == NULL) return false;
+    LaiueProtocolBlockDrop encoded = {
+        .id = drop->id,
+        .position = { drop->position[0], drop->position[1], drop->position[2] },
+        .block = drop->block,
+    };
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeBlockDrop(payload,
+        sizeof(payload), &encoded);
+    if (size == 0) return false;
+    bool result = true;
+    for (uint32_t i = 0; i < server->maximumPeers; ++i)
+    {
+        NetworkServerPeer* peer = &server->peers[i];
+        if (peer->allocated && peer->ready
+            && !ChannelQueuePayload(&peer->channel,
+                LAIUE_MESSAGE_BLOCK_DROP_SPAWN, payload, size))
+        {
+            ServerDisconnectPeer(server, i, NETWORK_DISCONNECT_OVERFLOW);
+            result = false;
+        }
+    }
+    return result;
+}
+
+bool NetworkServerBroadcastDropRemove(NetworkServer* server, uint32_t dropId)
+{
+    if (server == NULL) return false;
+    uint8_t payload[4];
+    uint32_t size = LaiueProtocolEncodeDropRemove(payload,
+        sizeof(payload), dropId);
+    if (size == 0) return false;
+    bool result = true;
+    for (uint32_t i = 0; i < server->maximumPeers; ++i)
+    {
+        NetworkServerPeer* peer = &server->peers[i];
+        if (peer->allocated && peer->ready
+            && !ChannelQueuePayload(&peer->channel,
+                LAIUE_MESSAGE_BLOCK_DROP_REMOVE, payload, size))
+        {
+            ServerDisconnectPeer(server, i, NETWORK_DISCONNECT_OVERFLOW);
+            result = false;
+        }
+    }
+    return result;
+}
+
+bool NetworkServerSendInventory(NetworkServer* server, uint32_t peerId,
+    const NetworkInventoryState* inventory)
+{
+    if (server == NULL || peerId == 0 || inventory == NULL) return false;
+    LaiueProtocolInventory encoded;
+    memset(&encoded, 0, sizeof(encoded));
+    encoded.selectedHotbarSlot = inventory->selectedHotbarSlot;
+    for (uint32_t i = 0; i < LAIUE_NETWORK_INVENTORY_SLOTS; ++i)
+    {
+        encoded.slots[i].item = inventory->slots[i].item;
+        encoded.slots[i].count = inventory->slots[i].count;
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeInventory(payload,
+        sizeof(payload), &encoded);
+    if (size == 0) return false;
+    for (uint32_t i = 0; i < server->maximumPeers; ++i)
+    {
+        NetworkServerPeer* peer = &server->peers[i];
+        if (!peer->allocated || !peer->ready || peer->peerId != peerId)
+            continue;
+        if (ChannelQueuePayload(&peer->channel,
+                LAIUE_MESSAGE_INVENTORY_STATE, payload, size)) return true;
+        ServerDisconnectPeer(server, i, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    return false;
 }

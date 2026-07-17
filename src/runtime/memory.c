@@ -8,25 +8,6 @@
 #include <stddef.h>
 #include <string.h>
 #include <intrin.h>
-#include <windows.h>
-
-void __cdecl __security_init_cookie(void);
-
-// Все DLL проекта собираются без CRT и используют эту точку входа. Инициализация
-// непредсказуемого /GS-cookie обязательна до первого защищённого вызова.
-BOOL WINAPI LaiueDllEntryPoint(
-    HINSTANCE instance, DWORD reason, LPVOID reserved)
-{
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH)
-    {
-        __security_init_cookie();
-        // У модулей нет TLS и thread attach hooks: не будим все DLL на
-        // каждом worker thread стриминга или сетевого backend.
-        DisableThreadLibraryCalls(instance);
-    }
-    return TRUE;
-}
 
 #if defined(_MSC_VER) && !defined(__clang__)
 // Иначе cl считает функции интринсиками и не даёт их определить.

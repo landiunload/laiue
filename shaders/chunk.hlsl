@@ -4,6 +4,7 @@ cbuffer FrameConstants : register(b0)
 {
     float4x4 viewProjection;
     float3 chunkOriginRelative;
+    float meshScale;
     float3 sunDirection;    // единичный, от источника света к миру
     float3 sunColor;
     float3 ambientColor;
@@ -11,6 +12,7 @@ cbuffer FrameConstants : register(b0)
 };
 
 ByteAddressBuffer quadBuffer : register(t0);
+ByteAddressBuffer meshInstances : register(t3);
 Texture2DArray blockTextures : register(t1);
 Texture2DArray blockNormals : register(t2);   // RGB — нормаль, A — AO
 SamplerState blockSampler : register(s0);
@@ -40,7 +42,7 @@ static const uint3 FACE_CORNERS[6][4] =
 
 static const float SEAM_INFLATE = 0.0015;
 
-PixelInput VSMain(uint vertexId : SV_VertexID)
+PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
 {
     uint quadIndex = vertexId / 6;
     uint cornerIndex = CORNER_PATTERN[vertexId % 6];
@@ -55,7 +57,15 @@ PixelInput VSMain(uint vertexId : SV_VertexID)
     // old_Y(height) маппится в новую Z, old_Z(2ndH) — в новую Y
     uint3 remapped = uint3(corner.x, corner.z, corner.y);
     float3 localPosition = (float3)(start + remapped * extent);
-    float3 worldPosition = chunkOriginRelative + localPosition;
+    float3 origin = chunkOriginRelative;
+    float scale = meshScale;
+    if (meshScale < 0.0f)
+    {
+        float4 instance = asfloat(meshInstances.Load4(instanceId * 16));
+        origin = instance.xyz;
+        scale = instance.w;
+    }
+    float3 worldPosition = origin + localPosition * scale;
 
     float viewDepth = mul(float4(worldPosition, 1.0), viewProjection).w;
     float3 cornerSign = (float3)remapped * 2.0 - 1.0;

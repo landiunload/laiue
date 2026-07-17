@@ -25,5 +25,6 @@ LAIUE_INTERACTION_API bool VoxelInteractionTryCreateEdit(
     World* world, const double origin[3], const float direction[3],
     const double blockingBodyPosition[3],
     const VoxelBodyShape* blockingBodyShape,
-    bool breakPressed, bool placePressed, float maximumDistance,
+    bool breakPressed, bool placePressed, BlockType placementBlock,
+    float maximumDistance,
     VoxelEdit* outEdit);

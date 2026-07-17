@@ -1,8 +1,5 @@
-#include "core/mod_host.h"
-#include "core/camera.h"
-#include "core/chunk_streaming.h"
-#include "core/mods.h"
-#include "core/save_game.h"
+#include "mod/mod_host.h"
+#include "mod/mods.h"
 #include "content/content_catalog.h"
 #include "world/block_properties.h"
 
@@ -13,6 +10,7 @@
 
 #define MOD_LOG_FILE_NAME L"mod_log.txt"
 #define MOD_LOG_MAX_CHARS 512
+#define MOD_HOST_PATH_CAPACITY 1024
 
 struct ModHostSlot
 {
@@ -134,7 +132,10 @@ static bool ApiSetBlock(void* hostPointer,
 
     ModHostBindings* bindings = &slot->owner->bindings;
     WorldSetBlock(bindings->world, x, y, z, (BlockType)block);
-    ChunkStreamingInvalidateBlock(bindings->chunkStreaming, x, y, z);
+    if (bindings->invalidateBlock != NULL)
+    {
+        bindings->invalidateBlock(bindings->invalidateContext, x, y, z);
+    }
     return true;
 }
 
@@ -142,6 +143,13 @@ static void ApiGetPlayerPosition(void* hostPointer, double outPosition[3])
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
     const Camera* camera = slot->owner->bindings.camera;
+    if (camera == NULL)
+    {
+        outPosition[0] = 0.0;
+        outPosition[1] = 0.0;
+        outPosition[2] = 0.0;
+        return;
+    }
     outPosition[0] = camera->position[0];
     outPosition[1] = camera->position[1];
     outPosition[2] = camera->position[2];
@@ -152,6 +160,7 @@ static void ApiSetPlayerPosition(void* hostPointer,
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
     ModHostBindings* bindings = &slot->owner->bindings;
+    if (bindings->camera == NULL || bindings->player == NULL) return;
     bindings->camera->position[0] = position[0];
     bindings->camera->position[1] = position[1];
     bindings->camera->position[2] = position[2];
@@ -162,37 +171,52 @@ static void ApiSetPlayerPosition(void* hostPointer,
 static void ApiGetViewDirection(void* hostPointer, float outDirection[3])
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    CameraGetForwardVector(slot->owner->bindings.camera, outDirection);
+    ModHostBindings* bindings = &slot->owner->bindings;
+    if (bindings->getViewDirection != NULL)
+    {
+        bindings->getViewDirection(bindings->viewContext, outDirection);
+    }
+    else
+    {
+        outDirection[0] = 0.0f;
+        outDirection[1] = 0.0f;
+        outDirection[2] = 0.0f;
+    }
 }
 
 static void ApiApplyImpulse(void* hostPointer, float x, float y, float z)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    PlayerControllerApplyImpulse(slot->owner->bindings.player, x, y, z);
+    PlayerController* player = slot->owner->bindings.player;
+    if (player != NULL) PlayerControllerApplyImpulse(player, x, y, z);
 }
 
 static bool ApiIsPlayerGrounded(void* hostPointer)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    return PlayerControllerIsGrounded(slot->owner->bindings.player);
+    PlayerController* player = slot->owner->bindings.player;
+    return player != NULL && PlayerControllerIsGrounded(player);
 }
 
 static uint32_t ApiGetGameMode(void* hostPointer)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    return *slot->owner->bindings.gameMode == GAME_MODE_WALK
+    GameMode* gameMode = slot->owner->bindings.gameMode;
+    return gameMode != NULL && *gameMode == GAME_MODE_WALK
         ? LAIUE_GAME_MODE_WALK : LAIUE_GAME_MODE_FLY;
 }
 
 static float ApiGetTimeHours(void* hostPointer)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    return *slot->owner->bindings.timeOfDayHours;
+    float* time = slot->owner->bindings.timeOfDayHours;
+    return time != NULL ? *time : 0.0f;
 }
 
 static void ApiSetTimeHours(void* hostPointer, float hours)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    if (slot->owner->bindings.timeOfDayHours == NULL) return;
     while (hours >= 24.0f) hours -= 24.0f;
     while (hours < 0.0f) hours += 24.0f;
     *slot->owner->bindings.timeOfDayHours = hours;
@@ -206,8 +230,12 @@ static void ApiSetAirJumps(void* hostPointer,
     if (extraJumps > 3) extraJumps = 3;
     if (impulse < 1.0f) impulse = 1.0f;
     if (impulse > 20.0f) impulse = 20.0f;
-    PlayerControllerSetAirJumps(slot->owner->bindings.player,
-        extraJumps, (double)impulse, refillOnGround);
+    PlayerController* player = slot->owner->bindings.player;
+    if (player != NULL)
+    {
+        PlayerControllerSetAirJumps(player,
+            extraJumps, (double)impulse, refillOnGround);
+    }
 }
 
 // === Межмодовые интерфейсы ===
@@ -311,7 +339,7 @@ static void ApiSetFixedTickCallback(void* hostPointer,
     slot->fixedTickUser = user;
 }
 
-// === Данные мода в сохранении: saves/default/moddata/<имя>.bin ===
+// === Данные мода: клиентский save slot или серверный moddata/<имя>.bin ===
 
 #define MOD_DATA_MAX_BYTES (16u * 1024u * 1024u)
 
@@ -353,14 +381,13 @@ static bool ApiWriteModData(void* hostPointer,
     const void* bytes, uint32_t size)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    if (bytes == NULL || size == 0 || size > MOD_DATA_MAX_BYTES
-        || !SaveGameEnsureDirectories())
+    if (bytes == NULL || size == 0 || size > MOD_DATA_MAX_BYTES)
     {
         return false;
     }
 
-    wchar_t path[SAVE_GAME_PATH_CAPACITY];
-    if (!BuildModDataPath(slot, path, SAVE_GAME_PATH_CAPACITY))
+    wchar_t path[MOD_HOST_PATH_CAPACITY];
+    if (!BuildModDataPath(slot, path, MOD_HOST_PATH_CAPACITY))
     {
         return false;
     }
@@ -387,8 +414,8 @@ static uint32_t ApiReadModData(void* hostPointer,
         return 0;
     }
 
-    wchar_t path[SAVE_GAME_PATH_CAPACITY];
-    if (!BuildModDataPath(slot, path, SAVE_GAME_PATH_CAPACITY))
+    wchar_t path[MOD_HOST_PATH_CAPACITY];
+    if (!BuildModDataPath(slot, path, MOD_HOST_PATH_CAPACITY))
     {
         return 0;
     }
@@ -631,9 +658,16 @@ void ModHostSync(ModHost* host, ModsState* mods)
         && desiredCount < MOD_HOST_MAX_MODS; ++i)
     {
         ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
-        if (entry->enabled && entry->compatible)
+        bool sideMatches = host->bindings.runtimeSide == MOD_SIDE_SERVER
+            ? entry->side != MOD_SIDE_CLIENT
+            : entry->side != MOD_SIDE_SERVER;
+        if (entry->enabled && entry->compatible && sideMatches)
         {
             desired[desiredCount++] = entry;
+        }
+        else if (entry->enabled && entry->compatible)
+        {
+            entry->runtimeStatus = MOD_RUNTIME_SIDE_INACTIVE;
         }
     }
 
@@ -668,7 +702,10 @@ void ModHostSync(ModHost* host, ModsState* mods)
     }
 
     // Дефолты движка, которые моды могли перекрутить.
-    PlayerControllerSetAirJumps(host->bindings.player, 0, 7.0, true);
+    if (host->bindings.player != NULL)
+    {
+        PlayerControllerSetAirJumps(host->bindings.player, 0, 7.0, true);
+    }
 
     for (uint32_t i = 0; i < desiredCount; ++i)
     {

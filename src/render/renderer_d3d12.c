@@ -12,6 +12,7 @@
 #include "render/generated/ui_vs.h"
 #include "render/generated/ui_ps.h"
 #include "render/texture_pack_internal.h"
+#include "render/ui_image_wic.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -24,7 +25,8 @@
 #define SRV_SLOT_BLOCK_NORMALS  1
 #define SRV_SLOT_PANORAMA_CUBE  2
 #define SRV_SLOT_FONT_ATLAS     3
-#define SRV_SLOT_COUNT          4
+#define SRV_SLOT_UI_BACKGROUND  4
+#define SRV_SLOT_COUNT          5
 
 // Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
 // Число квадов является частью публичного контракта renderer.h.
@@ -44,6 +46,7 @@
 #define ROOT_PARAMETER_CONSTANTS 0
 #define ROOT_PARAMETER_QUAD_BUFFER 1
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
+#define ROOT_PARAMETER_INSTANCES 3
 
 #define MAX_TEXTURE_SUBRESOURCES 48
 
@@ -57,6 +60,7 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+#define INSTANCE_BYTES_PER_FRAME (64u * 1024u)
 
 typedef struct FreeRange
 {
@@ -156,6 +160,10 @@ struct Renderer
     ID3D12Resource*            fontTextureUpload;
     bool                       fontUploadPending;
     bool                       fontReady;
+    ID3D12Resource*            backgroundTexture;
+    ID3D12Resource*            backgroundTextureUpload;
+    bool                       backgroundUploadPending;
+    bool                       backgroundReady;
     D3D12_VIEWPORT             viewport;
     D3D12_RECT                 scissorRect;
     int32_t                    windowWidth;
@@ -167,6 +175,7 @@ struct Renderer
     bool                       tearingSupported;
     bool                       tearingPresentEnabled;
     bool                       wireframeEnabled;
+    bool                       worldReady;
 
     // Загруженный байткод шейдеров (для шейдерпаков).
     void* loadedChunkVS;       uint32_t loadedChunkVSLength;
@@ -184,6 +193,9 @@ struct Renderer
     ID3D12Resource*            meshUploadBuffers[FRAME_COUNT];
     uint8_t*                   meshUploadMapped[FRAME_COUNT];
     uint32_t                   meshUploadOffsets[FRAME_COUNT];
+    ID3D12Resource*            instanceBuffers[FRAME_COUNT];
+    uint8_t*                   instanceMapped[FRAME_COUNT];
+    uint32_t                   instanceOffsets[FRAME_COUNT];
 
     DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredResourceHead;
@@ -197,6 +209,8 @@ struct Renderer
     RendererStats              lastStats;
     RendererContentStatus     texturePackLoadStatus;
 };
+
+static bool RecreateChunkPipelineState(Renderer* renderer);
 
 static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
     ID3D12Resource* resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter)
@@ -465,7 +479,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(Renderer* renderer, uint32_t slo
 
 static bool CreateRootSignature(Renderer* renderer)
 {
-    D3D12_ROOT_PARAMETER parameters[3];
+    D3D12_ROOT_PARAMETER parameters[4];
     memset(parameters, 0, sizeof(parameters));
     parameters[ROOT_PARAMETER_CONSTANTS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[ROOT_PARAMETER_CONSTANTS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -474,6 +488,11 @@ static bool CreateRootSignature(Renderer* renderer)
     parameters[ROOT_PARAMETER_QUAD_BUFFER].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     parameters[ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     parameters[ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
+    parameters[ROOT_PARAMETER_INSTANCES].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[ROOT_PARAMETER_INSTANCES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[ROOT_PARAMETER_INSTANCES].Descriptor.ShaderRegister = 3;
 
     // t1 — albedo, t2 — нормали: соседние слоты одной таблицы.
     D3D12_DESCRIPTOR_RANGE textureRange;
@@ -500,7 +519,7 @@ static bool CreateRootSignature(Renderer* renderer)
 
     D3D12_ROOT_SIGNATURE_DESC description;
     memset(&description, 0, sizeof(description));
-    description.NumParameters = 3;
+    description.NumParameters = 4;
     description.pParameters = parameters;
     description.NumStaticSamplers = 1;
     description.pStaticSamplers = &sampler;
@@ -817,7 +836,7 @@ static bool CreateUiRootSignature(Renderer* renderer)
     D3D12_DESCRIPTOR_RANGE fontRange;
     memset(&fontRange, 0, sizeof(fontRange));
     fontRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    fontRange.NumDescriptors = 1;
+    fontRange.NumDescriptors = 2;
     fontRange.BaseShaderRegister = 1;
     fontRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -955,6 +974,21 @@ static bool CreateMeshUploadBuffers(Renderer* renderer)
         {
             return false;
         }
+
+        description.Width = INSTANCE_BYTES_PER_FRAME;
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&renderer->instanceBuffers[i])))
+        {
+            return false;
+        }
+        if (FAILED(ID3D12Resource_Map(renderer->instanceBuffers[i], 0,
+            &emptyRange, (void**)&renderer->instanceMapped[i])))
+        {
+            return false;
+        }
+        description.Width = MESH_UPLOAD_BYTES_PER_FRAME;
     }
     return true;
 }
@@ -1294,33 +1328,9 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     renderer->srvDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
         renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    D3D12_DESCRIPTOR_HEAP_DESC cubeRtvHeapDescription = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-        .NumDescriptors = 6,
-    };
-    D3D12_DESCRIPTOR_HEAP_DESC cubeDsvHeapDescription = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-        .NumDescriptors = 1,
-    };
-    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeRtvHeapDescription,
-            &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeRtvHeap))
-        || FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeDsvHeapDescription,
-            &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeDsvHeap)))
-    {
-        RendererDestroy(renderer);
-        return NULL;
-    }
-
-    if (!CreateRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreatePipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateResolveRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateResolvePipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateUiRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateUiPipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateUiQuadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateMeshUploadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateBlockTexture(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateDepthBuffer(renderer, width, height)) { RendererDestroy(renderer); return NULL; }
 
     renderer->viewport.TopLeftX = 0.0f;
     renderer->viewport.TopLeftY = 0.0f;
@@ -1336,6 +1346,143 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     WaitForGpu(renderer);
 
     return renderer;
+}
+
+void RendererReleaseWorld(Renderer* renderer)
+{
+    if (renderer == NULL) return;
+    if (renderer->commandQueue != NULL && renderer->fence != NULL
+        && renderer->fenceEvent != NULL)
+    {
+        WaitForGpu(renderer);
+        DrainDeferredReleases(renderer, true);
+    }
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].ownsStaging
+            && renderer->pendingUploads[i].staging != NULL)
+            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
+    }
+    renderer->pendingUploadCount = 0;
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        if (renderer->poolBlocks[i].buffer != NULL)
+            ID3D12Resource_Release(renderer->poolBlocks[i].buffer);
+        if (renderer->poolBlocks[i].freeRanges != NULL)
+            HeapFree(GetProcessHeap(), 0,
+                renderer->poolBlocks[i].freeRanges);
+    }
+    memset(renderer->poolBlocks, 0, sizeof(renderer->poolBlocks));
+    renderer->poolBlockCount = 0;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->meshUploadBuffers[i] != NULL)
+        {
+            if (renderer->meshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
+        }
+        if (renderer->instanceBuffers[i] != NULL)
+        {
+            if (renderer->instanceMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->instanceBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->instanceBuffers[i]);
+        }
+        renderer->meshUploadBuffers[i] = NULL;
+        renderer->meshUploadMapped[i] = NULL;
+        renderer->meshUploadOffsets[i] = 0;
+        renderer->instanceBuffers[i] = NULL;
+        renderer->instanceMapped[i] = NULL;
+        renderer->instanceOffsets[i] = 0;
+    }
+
+    if (renderer->blockTextureUpload != NULL)
+        ID3D12Resource_Release(renderer->blockTextureUpload);
+    if (renderer->blockTexture != NULL)
+        ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->blockNormalUpload != NULL)
+        ID3D12Resource_Release(renderer->blockNormalUpload);
+    if (renderer->blockNormalTexture != NULL)
+        ID3D12Resource_Release(renderer->blockNormalTexture);
+    renderer->blockTextureUpload = NULL;
+    renderer->blockTexture = NULL;
+    renderer->blockNormalUpload = NULL;
+    renderer->blockNormalTexture = NULL;
+    renderer->blockTextureUploadPending = false;
+
+    if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
+    if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
+    if (renderer->cubeRtvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeRtvHeap);
+    if (renderer->cubeDsvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeDsvHeap);
+    renderer->cubeColor = NULL;
+    renderer->cubeDepth = NULL;
+    renderer->cubeRtvHeap = NULL;
+    renderer->cubeDsvHeap = NULL;
+    renderer->cubeResolution = 0;
+    if (renderer->resolvePipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->resolvePipelineState);
+    if (renderer->resolveRootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->resolveRootSignature);
+    renderer->resolvePipelineState = NULL;
+    renderer->resolveRootSignature = NULL;
+    if (renderer->pipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->pipelineState);
+    if (renderer->rootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->rootSignature);
+    renderer->pipelineState = NULL;
+    renderer->rootSignature = NULL;
+    if (renderer->depthBuffer != NULL)
+        ID3D12Resource_Release(renderer->depthBuffer);
+    if (renderer->depthStencilViewHeap != NULL)
+        ID3D12DescriptorHeap_Release(renderer->depthStencilViewHeap);
+    renderer->depthBuffer = NULL;
+    renderer->depthStencilViewHeap = NULL;
+    renderer->worldReady = false;
+}
+
+bool RendererPrepareWorld(Renderer* renderer)
+{
+    if (renderer == NULL) return false;
+    if (renderer->worldReady) return true;
+
+    D3D12_DESCRIPTOR_HEAP_DESC cubeRtvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = 6,
+    };
+    D3D12_DESCRIPTOR_HEAP_DESC cubeDsvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
+    };
+    bool succeeded = SUCCEEDED(ID3D12Device_CreateDescriptorHeap(
+        renderer->device, &cubeRtvHeapDescription,
+        &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeRtvHeap))
+        && SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device,
+            &cubeDsvHeapDescription, &IID_ID3D12DescriptorHeap,
+            (void**)&renderer->cubeDsvHeap))
+        && CreateRootSignature(renderer)
+        && CreatePipelineState(renderer)
+        && CreateResolveRootSignature(renderer)
+        && CreateResolvePipelineState(renderer)
+        && CreateMeshUploadBuffers(renderer)
+        && CreateBlockTexture(renderer)
+        && CreateDepthBuffer(renderer, renderer->windowWidth,
+            renderer->windowHeight);
+    if (succeeded && renderer->wireframeEnabled)
+        succeeded = RecreateChunkPipelineState(renderer);
+    if (!succeeded)
+    {
+        RendererReleaseWorld(renderer);
+        return false;
+    }
+    renderer->worldReady = true;
+    return true;
+}
+
+bool RendererIsWorldReady(const Renderer* renderer)
+{
+    return renderer != NULL && renderer->worldReady;
 }
 
 void RendererDestroy(Renderer* renderer)
@@ -1359,6 +1506,8 @@ void RendererDestroy(Renderer* renderer)
     {
         DrainDeferredReleases(renderer, true);
     }
+
+    RendererReleaseWorld(renderer);
 
     for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
     {
@@ -1397,9 +1546,19 @@ void RendererDestroy(Renderer* renderer)
                 ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
         }
+        if (renderer->instanceBuffers[i] != NULL)
+        {
+            if (renderer->instanceMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->instanceBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->instanceBuffers[i]);
+        }
     }
     if (renderer->fontTextureUpload != NULL) ID3D12Resource_Release(renderer->fontTextureUpload);
     if (renderer->fontTexture != NULL) ID3D12Resource_Release(renderer->fontTexture);
+    if (renderer->backgroundTextureUpload != NULL)
+        ID3D12Resource_Release(renderer->backgroundTextureUpload);
+    if (renderer->backgroundTexture != NULL)
+        ID3D12Resource_Release(renderer->backgroundTexture);
     if (renderer->uiPipelineState != NULL) ID3D12PipelineState_Release(renderer->uiPipelineState);
     if (renderer->uiRootSignature != NULL) ID3D12RootSignature_Release(renderer->uiRootSignature);
 
@@ -1438,7 +1597,8 @@ void RendererDestroy(Renderer* renderer)
 
 RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
 {
-    if (quadCount == 0
+    if (renderer == NULL || !renderer->worldReady || quads == NULL
+        || quadCount == 0
         || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad)
         || renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
     {
@@ -1551,13 +1711,56 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
 {
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
 
+    float transform[4] = {
+        chunkOriginRelative[0], chunkOriginRelative[1],
+        chunkOriginRelative[2], 1.0f,
+    };
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-        ROOT_PARAMETER_CONSTANTS, 3, chunkOriginRelative, ROOT_CONSTANT_ORIGIN_OFFSET);
+        ROOT_PARAMETER_CONSTANTS, 4, transform, ROOT_CONSTANT_ORIGIN_OFFSET);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
         ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += mesh->quadCount;
+}
+
+void RendererDrawMeshInstances(Renderer* renderer, const RendererMesh* mesh,
+    const RendererMeshInstance* instances, uint32_t instanceCount)
+{
+    if (renderer == NULL || mesh == NULL || instances == NULL
+        || instanceCount == 0
+        || instanceCount > INSTANCE_BYTES_PER_FRAME
+            / (uint32_t)sizeof(RendererMeshInstance))
+        return;
+
+    uint32_t bytes = instanceCount
+        * (uint32_t)sizeof(RendererMeshInstance);
+    uint32_t offset = (renderer->instanceOffsets[renderer->frameIndex] + 15U)
+        & ~15U;
+    if (offset > INSTANCE_BYTES_PER_FRAME
+        || bytes > INSTANCE_BYTES_PER_FRAME - offset)
+        return;
+    memcpy(renderer->instanceMapped[renderer->frameIndex] + offset,
+        instances, bytes);
+    renderer->instanceOffsets[renderer->frameIndex] = offset + bytes;
+
+    GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+    float transform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+        renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform,
+        ROOT_CONSTANT_ORIGIN_OFFSET);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
+        block->address + mesh->offsetBytes);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_INSTANCES,
+        ID3D12Resource_GetGPUVirtualAddress(
+            renderer->instanceBuffers[renderer->frameIndex]) + offset);
+    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
+        mesh->quadCount * 6, instanceCount, 0, 0);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads +=
+        (uint64_t)mesh->quadCount * instanceCount;
 }
 
 static void RecordTextureArrayUpload(Renderer* renderer,
@@ -1717,7 +1920,8 @@ static bool ApplyPendingResize(Renderer* renderer)
         renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
     }
 
-    if (!CreateDepthBuffer(renderer, width, height))
+    if (renderer->worldReady
+        && !CreateDepthBuffer(renderer, width, height))
     {
         return false;
     }
@@ -1770,10 +1974,44 @@ static void RecordFontAtlasUpload(Renderer* renderer)
     renderer->fontReady = true;
 }
 
+static void RecordBackgroundUpload(Renderer* renderer)
+{
+    if (!renderer->backgroundUploadPending) return;
+
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(renderer->backgroundTexture, &description);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, 1, 0, &layout, NULL, NULL, NULL);
+
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = renderer->backgroundTexture;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source;
+    memset(&source, 0, sizeof(source));
+    source.pResource = renderer->backgroundTextureUpload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = layout;
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+        &destination, 0, 0, 0, &source, NULL);
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(
+        renderer->backgroundTexture, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1,
+        &barrier);
+    DeferResourceRelease(renderer, renderer->backgroundTextureUpload);
+    renderer->backgroundTextureUpload = NULL;
+    renderer->backgroundUploadPending = false;
+    renderer->backgroundReady = true;
+}
+
 bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
 {
-    if (frame == NULL || frame->passCount == 0
-        || frame->passCount > RENDERER_MAX_SCENE_PASSES)
+    if (renderer == NULL || frame == NULL
+        || frame->passCount > RENDERER_MAX_SCENE_PASSES
+        || (frame->passCount != 0 && !renderer->worldReady))
     {
         return false;
     }
@@ -1784,7 +2022,8 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     {
         return false;
     }
-    if (renderer->renderTargets[renderer->frameIndex] == NULL || renderer->depthBuffer == NULL)
+    if (renderer->renderTargets[renderer->frameIndex] == NULL
+        || (frame->passCount != 0 && renderer->depthBuffer == NULL))
     {
         return false;
     }
@@ -1803,10 +2042,13 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     DrainDeferredReleases(renderer, false);
 
     ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex]);
-    ID3D12GraphicsCommandList_Reset(renderer->commandList, renderer->commandAllocators[renderer->frameIndex], renderer->pipelineState);
+    ID3D12GraphicsCommandList_Reset(renderer->commandList,
+        renderer->commandAllocators[renderer->frameIndex],
+        renderer->worldReady ? renderer->pipelineState : NULL);
 
-    RecordBlockTextureUpload(renderer);
+    if (renderer->worldReady) RecordBlockTextureUpload(renderer);
     RecordFontAtlasUpload(renderer);
+    RecordBackgroundUpload(renderer);
     RecordPendingUploads(renderer);
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
@@ -1817,10 +2059,34 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     // назначаются в RendererBeginScenePass.
     ID3D12DescriptorHeap* descriptorHeaps[1] = { renderer->srvHeap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 1, descriptorHeaps);
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList, renderer->rootSignature);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    if (frame->passCount == 0)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->renderTargetViewHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex
+            * renderer->renderTargetViewSize;
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList,
+            1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList,
+            1, &renderer->scissorRect);
+        const float clearColor[4] = {
+            frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
+        };
+        ID3D12GraphicsCommandList_ClearRenderTargetView(
+            renderer->commandList, renderTargetViewHandle, clearColor, 0,
+            NULL);
+        return true;
+    }
+
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+        renderer->rootSignature);
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
         ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
-    ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // Свет кадра: float3 в cbuffer выровнены по 16 байт, между ними pad.
     float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
@@ -1839,7 +2105,8 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
 
 void RendererBeginScenePass(Renderer* renderer, uint32_t passIndex)
 {
-    if (passIndex >= renderer->frame.passCount)
+    if (renderer == NULL || !renderer->worldReady
+        || passIndex >= renderer->frame.passCount)
     {
         return;
     }
@@ -2015,6 +2282,7 @@ bool RendererEndFrame(Renderer* renderer)
 
     bool waitedForFence = MoveToNextFrame(renderer);
     renderer->meshUploadOffsets[renderer->frameIndex] = 0;
+    renderer->instanceOffsets[renderer->frameIndex] = 0;
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
         // Без vsync Present не является точкой ожидания. Отдаём остаток
@@ -2213,6 +2481,12 @@ bool RendererReloadTexturePack(Renderer* renderer)
         return false;
     }
 
+    if (!renderer->worldReady)
+    {
+        renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
+        return true;
+    }
+
     WaitForGpu(renderer);
     DrainDeferredReleases(renderer, true);
 
@@ -2256,6 +2530,8 @@ void RendererSetWireframe(Renderer* renderer, bool enabled)
         return;
     }
     renderer->wireframeEnabled = enabled;
+
+    if (!renderer->worldReady) return;
 
     WaitForGpu(renderer);
     RecreateChunkPipelineState(renderer);
@@ -2304,8 +2580,10 @@ bool RendererReloadShaders(Renderer* renderer,
     renderer->loadedUIPSLength = uiPSLength;
 
     // Пересоздаём все PSO.
-    if (!RecreateChunkPipelineState(renderer)) return false;
-    if (!RecreateResolvePipelineState(renderer)) return false;
+    if (renderer->worldReady
+        && !RecreateChunkPipelineState(renderer)) return false;
+    if (renderer->worldReady
+        && !RecreateResolvePipelineState(renderer)) return false;
     if (!RecreateUiPipelineState(renderer)) return false;
 
     return true;
@@ -2363,6 +2641,7 @@ bool RendererUiSetFontAtlas(Renderer* renderer,
     }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    memset(&layout, 0, sizeof(layout));
     UINT64 uploadBytes = 0;
     ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
         0, 1, 0, &layout, NULL, NULL, &uploadBytes);
@@ -2416,6 +2695,127 @@ bool RendererUiSetFontAtlas(Renderer* renderer,
         &viewDescription, SrvCpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
 
     renderer->fontUploadPending = true;
+    return true;
+}
+
+bool RendererUiLoadBackground(Renderer* renderer, const wchar_t* path,
+    uint32_t* outWidth, uint32_t* outHeight)
+{
+    if (renderer == NULL || path == NULL) return false;
+
+    uint8_t* pixels = NULL;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!UiImageLoadRgba(path, &pixels, &width, &height)) return false;
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+    if (renderer->backgroundTextureUpload != NULL)
+    {
+        ID3D12Resource_Release(renderer->backgroundTextureUpload);
+        renderer->backgroundTextureUpload = NULL;
+    }
+    if (renderer->backgroundTexture != NULL)
+    {
+        ID3D12Resource_Release(renderer->backgroundTexture);
+        renderer->backgroundTexture = NULL;
+    }
+    renderer->backgroundUploadPending = false;
+    renderer->backgroundReady = false;
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = width;
+    textureDescription.Height = height;
+    textureDescription.DepthOrArraySize = 1;
+    textureDescription.MipLevels = 1;
+    textureDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDescription.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    bool succeeded = SUCCEEDED(ID3D12Device_CreateCommittedResource(
+        renderer->device, &defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+        &IID_ID3D12Resource, (void**)&renderer->backgroundTexture));
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    memset(&layout, 0, sizeof(layout));
+    UINT64 uploadBytes = 0;
+    if (succeeded)
+    {
+        ID3D12Device_GetCopyableFootprints(renderer->device,
+            &textureDescription, 0, 1, 0, &layout, NULL, NULL,
+            &uploadBytes);
+        D3D12_RESOURCE_DESC uploadDescription;
+        memset(&uploadDescription, 0, sizeof(uploadDescription));
+        uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDescription.Width = uploadBytes;
+        uploadDescription.Height = 1;
+        uploadDescription.DepthOrArraySize = 1;
+        uploadDescription.MipLevels = 1;
+        uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        uploadDescription.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES uploadHeap = {
+            .Type = D3D12_HEAP_TYPE_UPLOAD,
+        };
+        succeeded = SUCCEEDED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE,
+            &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource,
+            (void**)&renderer->backgroundTextureUpload));
+    }
+
+    if (succeeded)
+    {
+        D3D12_RANGE emptyRange = { 0, 0 };
+        uint8_t* mapped = NULL;
+        succeeded = SUCCEEDED(ID3D12Resource_Map(
+            renderer->backgroundTextureUpload, 0, &emptyRange,
+            (void**)&mapped));
+        if (succeeded)
+        {
+            uint32_t sourceStride = width * 4U;
+            for (uint32_t row = 0; row < height; ++row)
+            {
+                memcpy(mapped + layout.Offset
+                        + (size_t)row * layout.Footprint.RowPitch,
+                    pixels + (size_t)row * sourceStride, sourceStride);
+            }
+            ID3D12Resource_Unmap(renderer->backgroundTextureUpload, 0,
+                NULL);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, pixels);
+
+    if (!succeeded)
+    {
+        if (renderer->backgroundTextureUpload != NULL)
+        {
+            ID3D12Resource_Release(renderer->backgroundTextureUpload);
+            renderer->backgroundTextureUpload = NULL;
+        }
+        if (renderer->backgroundTexture != NULL)
+        {
+            ID3D12Resource_Release(renderer->backgroundTexture);
+            renderer->backgroundTexture = NULL;
+        }
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    viewDescription.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2D.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device,
+        renderer->backgroundTexture, &viewDescription,
+        SrvCpuHandle(renderer, SRV_SLOT_UI_BACKGROUND));
+    renderer->backgroundUploadPending = true;
+    if (outWidth != NULL) *outWidth = width;
+    if (outHeight != NULL) *outHeight = height;
     return true;
 }
 

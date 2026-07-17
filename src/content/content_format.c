@@ -17,14 +17,6 @@ static const LaiueContentFormat g_formats[LAIUE_CONTENT_TYPE_COUNT] = {
         L"Шейдерпак", L"shaders", L".lsp",
         LAIUE_CONTENT_STORAGE_DIRECTORY, true,
     },
-    [LAIUE_CONTENT_DATA] = {
-        L"Данные", L"data", L".ld",
-        LAIUE_CONTENT_STORAGE_FILE, false,
-    },
-    [LAIUE_CONTENT_DATA_PACK] = {
-        L"Датапак", L"data", L".ldp",
-        LAIUE_CONTENT_STORAGE_FILE | LAIUE_CONTENT_STORAGE_DIRECTORY, true,
-    },
     [LAIUE_CONTENT_TEXTURE] = {
         L"Текстура", L"textures", L".lt",
         LAIUE_CONTENT_STORAGE_FILE, false,
@@ -39,6 +31,23 @@ static wchar_t AsciiLower(wchar_t character)
 {
     return character >= L'A' && character <= L'Z'
         ? (wchar_t)(character + (L'a' - L'A')) : character;
+}
+
+static bool IsWindowsDeviceName(const wchar_t* name, uint32_t length)
+{
+    uint32_t baseLength = 0;
+    while (baseLength < length && name[baseLength] != L'.') ++baseLength;
+    wchar_t a = baseLength > 0 ? AsciiLower(name[0]) : 0;
+    wchar_t b = baseLength > 1 ? AsciiLower(name[1]) : 0;
+    wchar_t c = baseLength > 2 ? AsciiLower(name[2]) : 0;
+    if (baseLength == 3
+        && ((a == L'c' && b == L'o' && c == L'n')
+            || (a == L'p' && b == L'r' && c == L'n')
+            || (a == L'a' && b == L'u' && c == L'x')
+            || (a == L'n' && b == L'u' && c == L'l'))) return true;
+    return baseLength == 4 && name[3] >= L'1' && name[3] <= L'9'
+        && ((a == L'c' && b == L'o' && c == L'm')
+            || (a == L'l' && b == L'p' && c == L't'));
 }
 
 static uint32_t TextLength(const wchar_t* text)
@@ -117,5 +126,6 @@ bool LaiueContentNameIsSafe(const wchar_t* name)
     }
 
     return length > 0 && name[0] != L' ' && name[length - 1u] != L' '
-        && name[length - 1u] != L'.';
+        && name[length - 1u] != L'.'
+        && !IsWindowsDeviceName(name, length);
 }

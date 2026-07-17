@@ -10,7 +10,7 @@
 //  16..31  — прямоугольник UV u0, v0, u1, v1
 //  32..35  — цвет RGBA8 (R в младшем байте)
 //  36..39  — радиус скругления, px
-//  40..43  — флаги: бит 0 — брать альфу из атласа
+//  40..43  — флаги: бит 0 — альфа шрифта, бит 1 — UI-картинка
 //  44..47  — резерв
 
 cbuffer UiConstants : register(b0)
@@ -20,6 +20,7 @@ cbuffer UiConstants : register(b0)
 
 ByteAddressBuffer uiQuads : register(t0);
 Texture2D<float4> fontAtlas : register(t1);
+Texture2D<float4> backgroundImage : register(t2);
 SamplerState fontSampler : register(s0);
 
 struct UiPixelInput
@@ -76,6 +77,10 @@ UiPixelInput VSMain(uint vertexId : SV_VertexID)
 
 float4 PSMain(UiPixelInput input) : SV_TARGET
 {
+    if ((input.flags & 2u) != 0u)
+    {
+        return backgroundImage.Sample(fontSampler, input.uv) * input.color;
+    }
     float alpha = input.color.a;
     if ((input.flags & 1u) != 0u)
     {

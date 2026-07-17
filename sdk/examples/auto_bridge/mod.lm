@@ -3,7 +3,9 @@ LAIUE MOD 1
 # с обрыва (режим ходьбы). Исходник — рядом, auto_bridge.c.
 name = Auto Bridge
 author = laiue
+id = laiue.auto_bridge
 version = 1.0.0
+side = client
 game = 0.5
 
 [native]

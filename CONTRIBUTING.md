@@ -17,6 +17,29 @@ pwsh -NoProfile -File tools/check_architecture.ps1
 CI собирает Debug и Release с MSVC. Предупреждения компилятора считаются
 ошибками. Автоматические тесты пока сознательно не входят в workflow.
 
+### Перед каждой пересборкой
+
+Полностью закройте `laiue.exe` и `laiue_server.exe`, запущенные именно из
+пересобираемого `build/.../bin/<Configuration>`. Windows блокирует загруженные
+EXE/DLL, поэтому `lld-link: permission denied` или `LNK1104` означает не
+ошибку CMake, а работающий процесс, удерживающий файл.
+
+Корневая сборка проверяет это автоматически и печатает имя, PID и путь
+блокирующего процесса. Штатно завершайте клиент через меню, сервер — через
+`Ctrl+C`. Только для зависшего процесса:
+
+```powershell
+Get-Process laiue,laiue_server -ErrorAction SilentlyContinue |
+    Select-Object Id, ProcessName, Path
+Stop-Process -Id <PID>
+```
+
+Процессы из другого build-каталога не мешают сборке и проверкой не
+блокируются. Не используйте один build-каталог одновременно для MSVC и
+clang-cl. Ninja + MSVC запускайте из Developer PowerShell/Command Prompt;
+обычный терминал может не содержать путей к стандартным заголовкам. Если это
+неудобно, используйте preset `visual-studio`.
+
 ## Границы изменений
 
 - DLL-модульность сохраняется: новая зависимость добавляется только в

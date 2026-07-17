@@ -10,19 +10,22 @@ $sourceRootPath = [System.IO.Path]::GetFullPath($SourceRoot)
 $allowed = @{
     content     = @('content')
     core        = @('content', 'core', 'game', 'gameplay', 'input',
-                    'interaction', 'mesh', 'network', 'physics', 'platform', 'render', 'world')
+                    'interaction', 'mesh', 'mod', 'network', 'physics',
+                    'platform', 'render', 'world')
     game        = @('game')
     gameplay    = @('game', 'gameplay', 'physics')
     input       = @('input')
     interaction = @('interaction', 'physics', 'world')
     launcher    = @('launcher')
     mesh        = @('mesh', 'render', 'world')
+    mod         = @('content', 'game', 'gameplay', 'mod', 'world')
     network     = @('network')
     physics     = @('physics')
     platform    = @('platform')
     render      = @('content', 'render')
     runtime     = @('runtime')
-    server      = @('game', 'gameplay', 'interaction', 'network', 'physics', 'server', 'world')
+    server      = @('content', 'game', 'gameplay', 'interaction', 'mod',
+                    'network', 'physics', 'server', 'world')
     world       = @('world')
 }
 

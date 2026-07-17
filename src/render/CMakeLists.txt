@@ -16,6 +16,8 @@ laiue_add_module(render
     SOURCES
         renderer_d3d12.c
         renderer.h
+        ui_image_wic.c
+        ui_image_wic.h
         shader_pack.c
         shader_pack.h
         texture_pack.c
@@ -34,4 +36,6 @@ laiue_add_module(render
         d3d12
         dxgi
         dxguid
+        ole32
+        windowscodecs
 )

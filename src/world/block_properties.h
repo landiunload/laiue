@@ -9,6 +9,7 @@
 typedef struct BlockProperties
 {
     float friction;
+    float breakSeconds;
     bool solid;
 } BlockProperties;
 

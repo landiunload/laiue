@@ -6,6 +6,7 @@ BlockProperties BlockGetProperties(BlockType block)
     {
         return (BlockProperties) {
             .friction = 0.0f,
+            .breakSeconds = 0.0f,
             .solid = false,
         };
     }
@@ -15,6 +16,7 @@ BlockProperties BlockGetProperties(BlockType block)
     // (например, лёд) добавляются сюда, не меняя physics/gameplay.
     return (BlockProperties) {
         .friction = 1.0f,
+        .breakSeconds = block == BLOCK_GRASS ? 0.45f : 0.55f,
         .solid = true,
     };
 }

@@ -9,9 +9,10 @@
 - `core/application_config.*` — единый источник настроек.
 - `game/camera.h` — нейтральная структура состояния камеры; операции и
   матрицы находятся в `core/camera.*`, потому что являются сервисом ядра.
-- `core/save_game.*`, `core/mod_host.*`, `core/mods.*` — сохранения,
-  загрузка нативных модов и управление их состоянием.
-- `content/*` — обнаружение содержимого и разбор общих текстовых форматов.
+- `core/save_game.*` — слоты миров, метаданные, игрок и атомарные сохранения.
+- `mod/mod_host.*`, `mod/mods.*` — отдельная DLL загрузки нативных модов,
+  стороны client/server и канонический набор сетевой совместимости.
+- `content/*` — каталог форматов и bounded bundle со staging-установкой.
 - `network/*` — bounded wire protocol, схемы сетевых игровых сообщений,
   соединения, очереди и transport; не зависит от реализаций мира, физики,
   renderer или UI.
@@ -22,10 +23,15 @@
   торможение, air-control и sprint-jump impulse.
 - `gameplay/player_jump.*` — вертикальный прыжок, buffer/coyote time.
 - `gameplay/player_stance.*` — стойка и безопасная анимация приседания.
+- `gameplay/inventory.*` — 36 слотов, stacking/consume/select без heap и
+  без зависимости от мира или UI.
 - `interaction/voxel_interaction.*` — трассировка луча и формирование команды редактирования мира.
-- `core/game_hud.*`, `core/ui*`, `core/pause_menu.*` — HUD, UI-примитивы
-  и композиция меню; GPU-реализация UI остаётся в `render`.
+- `core/game_hud.*`, `core/ui*`, `core/pause_menu.*`, `core/server_list.*` —
+  HUD, UI-примитивы, главное/игровое меню и локальный список серверов;
+  GPU-реализация UI остаётся в `render`.
 - `core/chunk_streaming.*` — асинхронная загрузка и жизненный цикл мешей.
+- `core/block_effects.*`, `core/inventory_ui.*` — дропы, частицы, подбор и
+  UI поверх generic gameplay/render API.
 - `world/*` — процедурный мир, изменения и свойства типов блоков.
 - `physics/voxel_body.*` — геометрия AABB, столкновения и контакт с
   поверхностью без зависимости от конкретного мира.
@@ -35,7 +41,8 @@
 компонует подсистемы; `render` зависит только от `content`; `mesher` —
 от `world`; `interaction` — от `world` и `physics`; `gameplay` — от
 `physics`; `network` не зависит от игровых модулей; server компонует
-`network`, `world`, `physics`, `gameplay` и `interaction`. Нижние модули не
+`content`, `mod`, `network`, `world`, `physics`, `gameplay` и `interaction`.
+Нижние модули не
 должны включать заголовки `core`.
 
 DLL-границы являются частью архитектуры. Крупную реализацию можно делить
@@ -70,10 +77,17 @@ GPU-проходы — внутренними частями `render`.
 | `Renderer` и `RendererMesh` | `ApplicationState` / streaming | только главный | диапазоны мешей откладываются до GPU fence |
 | `ModsState`, `ModHost` | `ApplicationState` | только главный | хуки останавливаются до сохранения и выгрузки DLL |
 | списки content | вызывающая сторона | только главный | парный `*ListRelease` |
-| байткоды/данные паков | вызывающая сторона загрузчика | только главный | освобождение после копирования renderer'ом |
+| server content bundle | `DedicatedServer` / client installer | server/client main | после network / после staging-установки |
+| байткоды/текстуры паков | вызывающая сторона загрузчика | только главный | освобождение после копирования renderer'ом |
 | `NetworkClient` | client `ApplicationState` | главный | до разрушения client world |
 | `NetworkServer` | `DedicatedServer` | server main thread | до server world |
 | server `World`/players | `DedicatedServer` | server main thread, 60 Гц | после остановки listener |
+
+В титульном состоянии `World`, `ChunkStreaming` и `ModHost` равны `NULL`:
+`RendererCreate` поднимает только shell/UI, `RendererPrepareWorld` — игровые
+PSO, depth, block textures и upload rings, `RendererReleaseWorld` освобождает
+их после остановки streaming. Статичный фон меню поэтому не скрывает
+работающий мир и не оставляет фоновых meshing/physics задач.
 
 Рабочие потоки не вызывают renderer, UI или моды. Нативные моды получают
 хуки только главного потока. Изменение `World` выполняется главным потоком;
@@ -93,6 +107,9 @@ mesher держит только shared-read на время чтения.
   структуры LTP находятся в `texture_pack_internal.h`.
 - Сохранения записываются атомарно; старый файл заменяется только после
   полной записи и `FlushFileBuffers`.
+- Загруженное содержимое сначала целиком проверяется (границы, пути, SHA-256
+  сетевого потока), распаковывается в `*.download`, а предыдущая версия
+  сохраняется как `*.previous` до атомарного rename.
 - Между внутренними DLL одной сборки ABI может развиваться синхронно.
   Стабильность назад обязательна только для `sdk/laiue_mod_api.h` и форматов
   на диске.

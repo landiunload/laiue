@@ -36,6 +36,12 @@ typedef enum RendererContentStatus
 // без вершинных и индексных буферов.
 typedef struct RendererMesh RendererMesh;
 
+typedef struct RendererMeshInstance
+{
+    float originRelative[3];
+    float scale;
+} RendererMeshInstance;
+
 // === Кадр и широкий угол ===
 //
 // Кадр состоит из 1..6 проходов сцены. Классический режим — один проход
@@ -85,8 +91,13 @@ typedef struct RendererFrameSetup
     float gamma;             // 1.0 — нейтрально; выход шейдера = pow(цвет, 1/gamma)
 } RendererFrameSetup;
 
+// Создаёт только swapchain и UI-слой. Ресурсы мира загружаются отдельно,
+// когда пользователь действительно запускает сессию.
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);
 LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
+LAIUE_RENDER_API bool      RendererPrepareWorld(Renderer* renderer);
+LAIUE_RENDER_API void      RendererReleaseWorld(Renderer* renderer);
+LAIUE_RENDER_API bool      RendererIsWorldReady(const Renderer* renderer);
 
 // Начало кадра: применяет отложенный resize, записывает загрузки мешей
 // и атласа, готовит ресурсы панорамы. Возвращает false, если кадр рисовать
@@ -118,6 +129,7 @@ LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
 
 #define RENDERER_UI_MAX_QUADS 2048u
 #define RENDERER_UI_QUAD_TEXT 1u  // альфа берётся из атласа шрифта
+#define RENDERER_UI_QUAD_IMAGE 2u // цвет берётся из фоновой UI-текстуры
 
 typedef struct RendererUiQuad
 {
@@ -133,6 +145,11 @@ typedef struct RendererUiQuad
 // (дожидается GPU — вызывать редко, при смене масштаба интерфейса).
 LAIUE_RENDER_API bool RendererUiSetFontAtlas(Renderer* renderer,
     const uint8_t* alphaPixels, uint32_t width, uint32_t height);
+
+// Единственная статичная полноэкранная картинка оболочки. Декодируется
+// системным WIC один раз; мир и его текстурпак для этого не создаются.
+LAIUE_RENDER_API bool RendererUiLoadBackground(Renderer* renderer,
+    const wchar_t* path, uint32_t* outWidth, uint32_t* outHeight);
 
 // Ставит квады в очередь текущего кадра. Вызывать между BeginFrame
 // и EndFrame; порядок вызовов задаёт порядок отрисовки.
@@ -154,6 +171,9 @@ LAIUE_RENDER_API void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh
 // (origin rebasing — камера всегда около нуля).
 LAIUE_RENDER_API void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
     const float chunkOriginRelative[3]);
+LAIUE_RENDER_API void RendererDrawMeshInstances(Renderer* renderer,
+    const RendererMesh* mesh, const RendererMeshInstance* instances,
+    uint32_t instanceCount);
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
 

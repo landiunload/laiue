@@ -169,6 +169,25 @@ void UiRect(UiContext* ui, float x, float y, float width, float height,
     }
 }
 
+void UiImage(UiContext* ui, float x, float y, float width, float height,
+    float u0, float v0, float u1, float v1, uint32_t color)
+{
+    RendererUiQuad* quad = PushQuad(ui);
+    if (quad == NULL || width <= 0.0f || height <= 0.0f) return;
+    quad->rect[0] = x;
+    quad->rect[1] = y;
+    quad->rect[2] = x + width;
+    quad->rect[3] = y + height;
+    quad->uv[0] = u0;
+    quad->uv[1] = v0;
+    quad->uv[2] = u1;
+    quad->uv[3] = v1;
+    quad->colorRGBA = color;
+    quad->cornerRadius = 0.0f;
+    quad->flags = RENDERER_UI_QUAD_IMAGE;
+    quad->reserved = 0;
+}
+
 void UiPanel(UiContext* ui, float x, float y, float width, float height)
 {
     float shadow = UiScaled(ui, 7.0f);
