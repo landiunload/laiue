@@ -14,8 +14,21 @@
 // стоять раньше своих потребителей. Файл — источник истины: пересчёт
 // всегда идёт от него, правка вручную равносильна щелчкам в меню.
 
+// Единый лимит каталога и хоста: включённый мод не может «молча»
+// не попасть в цепочку загрузки.
 #define MODS_MAX_ENTRIES 32
 #define MODS_NAME_CAPACITY 64
+
+// Фактическое состояние мода после синхронизации хоста — показывается
+// на вкладке «Моды» вместе с причиной отказа.
+typedef enum ModRuntimeStatus
+{
+    MOD_RUNTIME_DISABLED = 0,
+    MOD_RUNTIME_INCOMPATIBLE,   // версия игры или API не подходит
+    MOD_RUNTIME_LOADED,
+    MOD_RUNTIME_LOAD_FAILED,    // DLL или экспорт LaiueModInit не найдены
+    MOD_RUNTIME_INIT_FAILED,    // LaiueModInit вернул ненулевой код
+} ModRuntimeStatus;
 
 typedef struct ModEntry
 {
@@ -27,6 +40,9 @@ typedef struct ModEntry
     uint32_t requiredApi;                     // [native] api =
     bool enabled;
     bool compatible;   // версия игры и версия API
+
+    ModRuntimeStatus runtimeStatus;  // заполняет хост при синхронизации
+    int32_t initResult;              // код отказа LaiueModInit
 } ModEntry;
 
 typedef struct ModsState

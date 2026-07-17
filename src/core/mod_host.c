@@ -1,6 +1,7 @@
 #include "core/mod_host.h"
 #include "core/chunk_streaming.h"
 #include "core/mods.h"
+#include "core/save_game.h"
 #include "content/content_catalog.h"
 #include "world/block_properties.h"
 
@@ -23,6 +24,8 @@ struct ModHostSlot
 
     LaiueFrameCallback frameCallback;
     void* frameUser;
+    LaiueFixedTickCallback fixedTickCallback;
+    void* fixedTickUser;
     LaiueBlockEditCallback blockEditCallback;
     void* blockEditUser;
 };
@@ -183,7 +186,7 @@ static uint32_t ApiGetGameMode(void* hostPointer)
 static float ApiGetTimeHours(void* hostPointer)
 {
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    return slot->owner->bindings.settings->timeOfDayHours;
+    return *slot->owner->bindings.timeOfDayHours;
 }
 
 static void ApiSetTimeHours(void* hostPointer, float hours)
@@ -191,7 +194,7 @@ static void ApiSetTimeHours(void* hostPointer, float hours)
     ModHostSlot* slot = SlotFromHostPointer(hostPointer);
     while (hours >= 24.0f) hours -= 24.0f;
     while (hours < 0.0f) hours += 24.0f;
-    slot->owner->bindings.settings->timeOfDayHours = hours;
+    *slot->owner->bindings.timeOfDayHours = hours;
 }
 
 static void ApiSetAirJumps(void* hostPointer,
@@ -299,6 +302,126 @@ static void ApiSetFrameCallback(void* hostPointer,
     slot->frameUser = user;
 }
 
+static void ApiSetFixedTickCallback(void* hostPointer,
+    LaiueFixedTickCallback callback, void* user)
+{
+    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    slot->fixedTickCallback = callback;
+    slot->fixedTickUser = user;
+}
+
+// === Данные мода в сохранении: saves/default/moddata/<имя>.bin ===
+
+#define MOD_DATA_MAX_BYTES (16u * 1024u * 1024u)
+
+static bool BuildModDataPath(ModHostSlot* slot,
+    wchar_t* path, uint32_t capacity)
+{
+    const wchar_t* directory = slot->owner->bindings.modDataDirectory;
+    if (directory == NULL || directory[0] == L'\0')
+    {
+        return false;
+    }
+
+    uint32_t length = 0;
+    while (directory[length] != L'\0' && length + 1 < capacity)
+    {
+        path[length] = directory[length];
+        ++length;
+    }
+    if (length + 2 >= capacity)
+    {
+        return false;
+    }
+    path[length++] = L'\\';
+    for (uint32_t i = 0; slot->packName[i] != L'\0'
+        && length + 5 < capacity; ++i)
+    {
+        path[length++] = slot->packName[i];
+    }
+    const wchar_t* extension = L".bin";
+    for (uint32_t i = 0; extension[i] != L'\0' && length + 1 < capacity; ++i)
+    {
+        path[length++] = extension[i];
+    }
+    path[length] = L'\0';
+    return true;
+}
+
+static bool ApiWriteModData(void* hostPointer,
+    const void* bytes, uint32_t size)
+{
+    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    if (bytes == NULL || size == 0 || size > MOD_DATA_MAX_BYTES
+        || !SaveGameEnsureDirectories())
+    {
+        return false;
+    }
+
+    wchar_t path[SAVE_GAME_PATH_CAPACITY];
+    if (!BuildModDataPath(slot, path, SAVE_GAME_PATH_CAPACITY))
+    {
+        return false;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    DWORD written = 0;
+    bool succeeded = WriteFile(file, bytes, size, &written, NULL)
+        && written == size;
+    CloseHandle(file);
+    return succeeded;
+}
+
+static uint32_t ApiReadModData(void* hostPointer,
+    void* buffer, uint32_t capacity)
+{
+    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    if (buffer == NULL || capacity == 0)
+    {
+        return 0;
+    }
+
+    wchar_t path[SAVE_GAME_PATH_CAPACITY];
+    if (!BuildModDataPath(slot, path, SAVE_GAME_PATH_CAPACITY))
+    {
+        return 0;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    LARGE_INTEGER size;
+    uint32_t result = 0;
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 0
+        && size.QuadPart <= (LONGLONG)capacity)
+    {
+        uint32_t length = (uint32_t)size.QuadPart;
+        uint32_t completed = 0;
+        while (completed < length)
+        {
+            DWORD read = 0;
+            if (!ReadFile(file, (uint8_t*)buffer + completed,
+                    length - completed, &read, NULL) || read == 0)
+            {
+                break;
+            }
+            completed += read;
+        }
+        result = completed == length ? length : 0;
+    }
+    CloseHandle(file);
+    return result;
+}
+
 static void ApiSetBlockEditCallback(void* hostPointer,
     LaiueBlockEditCallback callback, void* user)
 {
@@ -332,6 +455,9 @@ static void FillApi(ModHostSlot* slot)
     api->setAirJumps = ApiSetAirJumps;
     api->publishInterface = ApiPublishInterface;
     api->queryInterface = ApiQueryInterface;
+    api->setFixedTickCallback = ApiSetFixedTickCallback;
+    api->writeModData = ApiWriteModData;
+    api->readModData = ApiReadModData;
 }
 
 // === Жизненный цикл ===
@@ -340,6 +466,7 @@ bool ModHostInit(ModHost* host, const ModHostBindings* bindings)
 {
     host->bindings = *bindings;
     memset(host->interfaces, 0, sizeof(host->interfaces));
+    host->fixedTickAccumulator = 0.0f;
     host->slots = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         (size_t)MOD_HOST_MAX_MODS * sizeof(ModHostSlot));
     return host->slots != NULL;
@@ -389,8 +516,8 @@ static bool WideNamesEqual(const wchar_t* a, const wchar_t* b)
     return a[i] == b[i];
 }
 
-static bool LoadSlot(ModHost* host, const wchar_t* packName,
-    const wchar_t* entryDll)
+// Загружает мод и отписывает фактический статус прямо в entry.
+static void LoadSlot(ModHost* host, ModEntry* entry)
 {
     ModHostSlot* slot = NULL;
     for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
@@ -403,23 +530,27 @@ static bool LoadSlot(ModHost* host, const wchar_t* packName,
     }
     if (slot == NULL)
     {
-        return false;
+        entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
+        return;
     }
 
     wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
         (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
     if (path == NULL)
     {
-        return false;
+        entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
+        return;
     }
     bool pathOk = LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK,
-        packName, entryDll, path, LAIUE_CONTENT_PATH_CAPACITY);
+        entry->fileName, entry->entryDll, path,
+        LAIUE_CONTENT_PATH_CAPACITY);
 
     HMODULE module = pathOk ? LoadLibraryW(path) : NULL;
     HeapFree(GetProcessHeap(), 0, path);
     if (module == NULL)
     {
-        return false;
+        entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
+        return;
     }
 
     LaiueModInitFunction initialize = (LaiueModInitFunction)
@@ -427,7 +558,8 @@ static bool LoadSlot(ModHost* host, const wchar_t* packName,
     if (initialize == NULL)
     {
         FreeLibrary(module);
-        return false;
+        entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
+        return;
     }
 
     memset(slot, 0, sizeof(*slot));
@@ -437,9 +569,9 @@ static bool LoadSlot(ModHost* host, const wchar_t* packName,
     slot->shutdown = (LaiueModShutdownFunction)
         (void*)GetProcAddress(module, "LaiueModShutdown");
     uint32_t c = 0;
-    while (packName[c] != L'\0' && c + 1 < MOD_HOST_NAME_CAPACITY)
+    while (entry->fileName[c] != L'\0' && c + 1 < MOD_HOST_NAME_CAPACITY)
     {
-        slot->packName[c] = packName[c];
+        slot->packName[c] = entry->fileName[c];
         ++c;
     }
     slot->packName[c] = L'\0';
@@ -474,14 +606,16 @@ static bool LoadSlot(ModHost* host, const wchar_t* packName,
         ApiLog(slot, line);
 
         UnloadSlot(slot);
-        return false;
+        entry->runtimeStatus = MOD_RUNTIME_INIT_FAILED;
+        entry->initResult = initResult;
+        return;
     }
 
     ApiLog(slot, L"мод загружен");
-    return true;
+    entry->runtimeStatus = MOD_RUNTIME_LOADED;
 }
 
-void ModHostSync(ModHost* host, const ModsState* mods)
+void ModHostSync(ModHost* host, ModsState* mods)
 {
     if (host->slots == NULL)
     {
@@ -490,12 +624,12 @@ void ModHostSync(ModHost* host, const ModsState* mods)
 
     // Желаемая цепочка: включённые совместимые моды в порядке
     // enabled.txt (он же порядок публикации библиотек и хуков).
-    const ModEntry* desired[MOD_HOST_MAX_MODS];
+    ModEntry* desired[MOD_HOST_MAX_MODS];
     uint32_t desiredCount = 0;
     for (uint32_t i = 0; i < mods->enabledCount
         && desiredCount < MOD_HOST_MAX_MODS; ++i)
     {
-        const ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
+        ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
         if (entry->enabled && entry->compatible)
         {
             desired[desiredCount++] = entry;
@@ -537,7 +671,7 @@ void ModHostSync(ModHost* host, const ModsState* mods)
 
     for (uint32_t i = 0; i < desiredCount; ++i)
     {
-        LoadSlot(host, desired[i]->fileName, desired[i]->entryDll);
+        LoadSlot(host, desired[i]);
     }
 }
 
@@ -547,6 +681,31 @@ void ModHostDispatchFrame(ModHost* host, float deltaSeconds)
     {
         return;
     }
+
+    // Фиксированный тик: постоянный шаг независимо от FPS. Кап шагов
+    // защищает от лавины после долгого кадра; хвост не копится.
+    host->fixedTickAccumulator += deltaSeconds;
+    uint32_t steps = 0;
+    while (host->fixedTickAccumulator >= MOD_HOST_FIXED_STEP_SECONDS
+        && steps < MOD_HOST_MAX_FIXED_STEPS_PER_FRAME)
+    {
+        host->fixedTickAccumulator -= MOD_HOST_FIXED_STEP_SECONDS;
+        ++steps;
+        for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
+        {
+            ModHostSlot* slot = &host->slots[i];
+            if (slot->used && slot->fixedTickCallback != NULL)
+            {
+                slot->fixedTickCallback(slot->fixedTickUser,
+                    MOD_HOST_FIXED_STEP_SECONDS);
+            }
+        }
+    }
+    if (host->fixedTickAccumulator > MOD_HOST_FIXED_STEP_SECONDS)
+    {
+        host->fixedTickAccumulator = MOD_HOST_FIXED_STEP_SECONDS;
+    }
+
     for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
     {
         ModHostSlot* slot = &host->slots[i];

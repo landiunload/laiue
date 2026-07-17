@@ -115,23 +115,6 @@ static bool SliceParseInt(ByteSlice slice, int32_t* outValue)
     return true;
 }
 
-static bool SliceParseBool(ByteSlice slice, bool* outValue)
-{
-    if (SliceEqualsAscii(slice, "true") || SliceEqualsAscii(slice, "1")
-        || SliceEqualsAscii(slice, "yes") || SliceEqualsAscii(slice, "on"))
-    {
-        *outValue = true;
-        return true;
-    }
-    if (SliceEqualsAscii(slice, "false") || SliceEqualsAscii(slice, "0")
-        || SliceEqualsAscii(slice, "no") || SliceEqualsAscii(slice, "off"))
-    {
-        *outValue = false;
-        return true;
-    }
-    return false;
-}
-
 static void SliceToWide(ByteSlice slice, wchar_t* destination,
     uint32_t capacity)
 {
@@ -417,7 +400,11 @@ static void RecomputeEnabled(ModsState* mods)
     mods->enabledCount = 0;
     for (uint32_t i = 0; i < mods->count; ++i)
     {
-        mods->entries[i].enabled = false;
+        ModEntry* entry = &mods->entries[i];
+        entry->enabled = false;
+        entry->runtimeStatus = entry->compatible
+            ? MOD_RUNTIME_DISABLED : MOD_RUNTIME_INCOMPATIBLE;
+        entry->initResult = 0;
     }
 
     wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
@@ -459,6 +446,8 @@ static void RecomputeEnabled(ModsState* mods)
                 continue; // удалённый, несовместимый или повтор строки
             }
             entry->enabled = true;
+            // Оптимистично LOADED: факт уточнит ближайший ModHostSync.
+            entry->runtimeStatus = MOD_RUNTIME_LOADED;
             mods->enabledOrder[mods->enabledCount++] =
                 (uint32_t)(entry - mods->entries);
         }

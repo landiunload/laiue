@@ -63,3 +63,16 @@ LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
 
 // Высота верхнего твёрдого блока в текущих локальных координатах.
 LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
+
+// === Сохранение правок (Laiue World Format v1, docs/world_format.md) ===
+//
+// WorldSaveDeltas пишет seed, начало координат и все правки блоков
+// (абсолютные координаты произвольной точности) — читать таблицу можно
+// параллельно с рабочими потоками мешинга. WorldLoadDeltas вызывается
+// на свежесозданном мире до запуска стриминга: сверяет seed,
+// восстанавливает начало координат через WorldRebase (v1 требует его
+// представимости в int64) и повторяет правки. Правки чанков, чьи
+// абсолюты не представимы относительно восстановленного начала,
+// в v1 пропускаются.
+LAIUE_WORLD_API bool WorldSaveDeltas(World* world, const wchar_t* path);
+LAIUE_WORLD_API bool WorldLoadDeltas(World* world, const wchar_t* path);

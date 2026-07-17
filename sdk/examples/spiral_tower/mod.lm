@@ -1,0 +1,10 @@
+LAIUE MOD 1
+# Потребитель библиотеки laiue.builder: включать НИЖЕ builder_lib.lmp.
+name = Spiral Tower
+author = laiue
+version = 1.0.0
+game = 0.5
+
+[native]
+entry = spiral_tower.dll
+api = 1

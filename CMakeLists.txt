@@ -79,27 +79,36 @@ add_custom_target(laiue_sdk
 )
 add_dependencies(laiue laiue_sdk)
 
-# Пример нативного DLL-мода собирается как настоящий мод: без линка
+# Примеры нативных DLL-модов собираются как настоящие моды: без линка
 # с движком, только заголовок SDK. laiue_runtime даёт _fltused
 # (в нашем дереве без CRT); внешняя сборка обходится обычным cl /LD.
-add_library(mod_auto_bridge SHARED
-    sdk/examples/auto_bridge/auto_bridge.c)
-target_include_directories(mod_auto_bridge PRIVATE
-    "${PROJECT_SOURCE_DIR}/sdk")
-target_link_libraries(mod_auto_bridge PRIVATE
-    laiue_common laiue_runtime kernel32)
-target_link_options(mod_auto_bridge PRIVATE /NOENTRY)
-set_target_properties(mod_auto_bridge PROPERTIES
-    OUTPUT_NAME auto_bridge
-    RUNTIME_OUTPUT_DIRECTORY
-        "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mods/auto_bridge.lmp")
 # Манифест копируется отдельной целью: связка «линк + копия» в одном
 # ninja-правиле рождает вложенный cmd, ломкий в урезанных окружениях.
-add_custom_target(mod_auto_bridge_manifest
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${PROJECT_SOURCE_DIR}/sdk/examples/auto_bridge/mod.lm"
-        "$<TARGET_FILE_DIR:mod_auto_bridge>/mod.lm"
-    COMMENT "Раскладка примера auto_bridge.lmp"
-)
-add_dependencies(mod_auto_bridge_manifest mod_auto_bridge)
-add_dependencies(laiue mod_auto_bridge mod_auto_bridge_manifest)
+function(laiue_add_example_mod mod_name)
+    set(target_name "mod_${mod_name}")
+    add_library(${target_name} SHARED
+        "sdk/examples/${mod_name}/${mod_name}.c")
+    target_include_directories(${target_name} PRIVATE
+        "${PROJECT_SOURCE_DIR}/sdk")
+    target_link_libraries(${target_name} PRIVATE
+        laiue_common laiue_runtime kernel32)
+    target_link_options(${target_name} PRIVATE /NOENTRY)
+    set_target_properties(${target_name} PROPERTIES
+        OUTPUT_NAME ${mod_name}
+        RUNTIME_OUTPUT_DIRECTORY
+            "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/mods/${mod_name}.lmp")
+    add_custom_target(${target_name}_manifest
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${PROJECT_SOURCE_DIR}/sdk/examples/${mod_name}/mod.lm"
+            "$<TARGET_FILE_DIR:${target_name}>/mod.lm"
+        COMMENT "Раскладка примера ${mod_name}.lmp"
+    )
+    add_dependencies(${target_name}_manifest ${target_name})
+    add_dependencies(laiue ${target_name} ${target_name}_manifest)
+endfunction()
+
+laiue_add_example_mod(auto_bridge)
+laiue_add_example_mod(double_jump)
+laiue_add_example_mod(daylight_lock)
+laiue_add_example_mod(builder_lib)
+laiue_add_example_mod(spiral_tower)

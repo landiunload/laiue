@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/pause_menu.h"
+#include "core/mods.h"
 #include "game/camera.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/player_controller.h"
@@ -10,18 +10,24 @@
 #include <stdint.h>
 #include <wchar.h>
 
-// Хост нативных DLL-модов (уровень B): загружает mods/<имя>.lmp/<dll>,
-// отдаёт моду версионируемую таблицу функций (sdk/laiue_mod_api.h)
-// и диспетчеризует хуки строго на главном потоке. Выгрузка снимает
-// колбеки мода до FreeLibrary, поэтому забытый Shutdown не роняет игру.
+// Хост нативных DLL-модов: загружает mods/<имя>.lmp/<dll>, отдаёт моду
+// версионируемую таблицу функций (sdk/laiue_mod_api.h) и диспетчеризует
+// хуки строго на главном потоке. Кадровому хуку сопутствует фиксированный
+// тик (60 Гц, аккумулятор) — геймплейные моды не зависят от FPS.
+// Хост не знает об интерфейсе: он получает голые указатели подсистем,
+// а фактический статус каждого мода отписывает обратно в ModsState.
 
-#define MOD_HOST_MAX_MODS 8
+// Единый лимит с каталогом: включённый мод всегда попадает в цепочку.
+#define MOD_HOST_MAX_MODS MODS_MAX_ENTRIES
 #define MOD_HOST_NAME_CAPACITY 64
 #define MOD_HOST_MAX_INTERFACES 16
 #define MOD_HOST_INTERFACE_NAME_CAPACITY 64
 
+// Фиксированный тик модов: 60 Гц, не больше 5 шагов за кадр.
+#define MOD_HOST_FIXED_STEP_SECONDS (1.0f / 60.0f)
+#define MOD_HOST_MAX_FIXED_STEPS_PER_FRAME 5
+
 typedef struct ChunkStreaming ChunkStreaming;
-typedef struct ModsState ModsState;
 
 // Указатели на подсистемы, которыми пользуется таблица API.
 typedef struct ModHostBindings
@@ -30,8 +36,10 @@ typedef struct ModHostBindings
     ChunkStreaming* chunkStreaming;
     PlayerController* player;
     Camera* camera;
-    GameSettings* settings;
     GameMode* gameMode;
+    float* timeOfDayHours;   // игровое время суток, 0..24
+    // Каталог блобов модов в сохранении (moddata/), может быть пустым.
+    const wchar_t* modDataDirectory;
 } ModHostBindings;
 
 typedef struct ModHostSlot ModHostSlot;
@@ -51,16 +59,18 @@ typedef struct ModHost
     ModHostBindings bindings;
     ModHostSlot* slots;      // MOD_HOST_MAX_MODS, на куче
     ModHostInterface interfaces[MOD_HOST_MAX_INTERFACES];
+    float fixedTickAccumulator;
 } ModHost;
 
 bool ModHostInit(ModHost* host, const ModHostBindings* bindings);
 void ModHostShutdown(ModHost* host);
 
-// Приводит загруженные DLL в соответствие включённым нативным модам
-// (вызывается при смене ревизии ModsState и на старте).
-void ModHostSync(ModHost* host, const ModsState* mods);
+// Приводит загруженные DLL в соответствие включённым модам (вызывается
+// при смене ревизии ModsState и на старте) и отписывает в entries
+// фактический runtimeStatus и код отказа инициализации.
+void ModHostSync(ModHost* host, ModsState* mods);
 
-// Хуки: кадр (вне меню паузы) и правка блока игроком.
+// Хуки: фиксированный тик + кадр (вне меню паузы) и правка блока игроком.
 void ModHostDispatchFrame(ModHost* host, float deltaSeconds);
 void ModHostDispatchBlockEdit(ModHost* host,
     int64_t x, int64_t y, int64_t z,

@@ -30,6 +30,7 @@ enum
     WIDGET_SHADER_RESET,
     WIDGET_TEXTURE_RESET,
     WIDGET_MOD_TOGGLE_FIRST = 160,
+    WIDGET_SAVE_WORLD = 200,
 };
 
 enum
@@ -159,7 +160,8 @@ static float AdminTabHeight(const UiContext* ui)
     float line = ui->font.lineHeight;
     return (line + 6.0f * s) + (20.0f * s + 4.0f * s) + (line + 12.0f * s)
         + (line + 6.0f * s)
-        + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 14.0f * s;
+        + 30.0f * s * 4.0f + 4.0f * s * 3.0f + 14.0f * s
+        + 36.0f * s + 10.0f * s;
 }
 
 static float ControlsTabHeight(const UiContext* ui)
@@ -231,8 +233,9 @@ static float DrawGraphicsTab(UiContext* ui, GameSettings* settings,
     return y + rowHeight + 14.0f * s;
 }
 
-static float DrawAdminTab(UiContext* ui, GameSettings* settings,
-    float dayLengthMinutes, float x, float width, float y)
+static float DrawAdminTab(PauseMenu* menu, UiContext* ui,
+    GameSettings* settings, float dayLengthMinutes,
+    float x, float width, float y)
 {
     float s = ui->scale;
     wchar_t text[MENU_TEXT_CAPACITY];
@@ -283,7 +286,14 @@ static float DrawAdminTab(UiContext* ui, GameSettings* settings,
         }
         y += 30.0f * s + (speed + 1 < TIME_SPEED_COUNT ? 4.0f * s : 14.0f * s);
     }
-    return y;
+
+    // Мир также сохраняется автоматически при выходе из игры.
+    if (UiButton(ui, WIDGET_SAVE_WORLD, x, y, width, 36.0f * s,
+            L"Сохранить мир"))
+    {
+        menu->saveRequested = true;
+    }
+    return y + 36.0f * s + 10.0f * s;
 }
 
 static float DrawControlsTab(UiContext* ui, GameSettings* settings,
@@ -604,14 +614,47 @@ static float DrawModsTab(UiContext* ui, ModsState* mods,
             {
                 ModsSetEnabled(mods, i, enabled);
             }
+
+            // Фактический статус от хоста: включённый мод, который
+            // не загрузился, честно показывает причину.
+            if (entry->enabled
+                && entry->runtimeStatus != MOD_RUNTIME_LOADED)
+            {
+                wchar_t reason[MENU_TEXT_CAPACITY];
+                UiTextBuilder builder;
+                UiTextBuilderInit(&builder, reason, MENU_TEXT_CAPACITY);
+                if (entry->runtimeStatus == MOD_RUNTIME_INIT_FAILED)
+                {
+                    UiTextBuilderAppend(&builder, L"отказ Init, код ");
+                    UiTextBuilderAppendUnsigned(&builder,
+                        entry->initResult < 0
+                            ? (uint32_t)(-entry->initResult)
+                            : (uint32_t)entry->initResult);
+                }
+                else
+                {
+                    UiTextBuilderAppend(&builder, L"DLL не загрузилась");
+                }
+                UiText(ui,
+                    x + width - UiScaled(ui, 48.0f)
+                        - UiTextWidth(ui, reason),
+                    textTop, UiColor(214, 130, 118, 255), reason);
+            }
         }
         else
         {
             wchar_t needed[MENU_TEXT_CAPACITY];
             UiTextBuilder builder;
             UiTextBuilderInit(&builder, needed, MENU_TEXT_CAPACITY);
-            UiTextBuilderAppend(&builder, L"нужна laiue ");
-            UiTextBuilderAppend(&builder, entry->requiredGame);
+            if (entry->requiredGame[0] != L'\0')
+            {
+                UiTextBuilderAppend(&builder, L"нужна laiue ");
+                UiTextBuilderAppend(&builder, entry->requiredGame);
+            }
+            else
+            {
+                UiTextBuilderAppend(&builder, L"манифест неполон");
+            }
             UiText(ui, x + width - UiTextWidth(ui, needed), textTop,
                 UiColor(214, 130, 118, 255), needed);
         }
@@ -725,7 +768,7 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
             DrawModsTab(ui, mods, contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_ADMIN:
-            DrawAdminTab(ui, settings, dayLengthMinutes,
+            DrawAdminTab(menu, ui, settings, dayLengthMinutes,
                 contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_CONTROLS:

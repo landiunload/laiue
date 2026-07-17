@@ -60,6 +60,7 @@ typedef struct PauseMenu
     // 4 — администрирование, 5 — управление.
     int32_t settingsTab;
     float settingsScroll;  // прокрутка контента настроек, px (0 — верх)
+    bool saveRequested;    // кнопка «Сохранить мир» (сбрасывает вызывающий)
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);

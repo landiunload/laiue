@@ -972,3 +972,387 @@ void WorldFormatAbsoluteBlockCoordinate(World* world,
     InfiniteCoordFormatShortOffsetW(
         &world->blockOrigin[axis], localBlock, outText, capacity);
 }
+
+// === Сохранение правок (Laiue World Format v1, docs/world_format.md) ===
+
+#define WORLD_SAVE_MAGIC        0x3143574Cu  // байты 'L' 'W' 'C' '1'
+#define WORLD_SAVE_VERSION      1u
+#define WORLD_SAVE_MAX_LIMBS    1024u
+#define WORLD_SAVE_BUFFER_BYTES 65536u
+
+typedef struct SaveWriter
+{
+    HANDLE file;
+    uint8_t* buffer;
+    uint32_t used;
+    bool failed;
+} SaveWriter;
+
+static void SaveWriterFlush(SaveWriter* writer)
+{
+    if (writer->failed || writer->used == 0)
+    {
+        return;
+    }
+    DWORD written = 0;
+    if (!WriteFile(writer->file, writer->buffer, writer->used, &written, NULL)
+        || written != writer->used)
+    {
+        writer->failed = true;
+    }
+    writer->used = 0;
+}
+
+static void SaveWriterBytes(SaveWriter* writer,
+    const void* bytes, uint32_t count)
+{
+    if (writer->failed)
+    {
+        return;
+    }
+    const uint8_t* source = bytes;
+    while (count > 0)
+    {
+        uint32_t space = WORLD_SAVE_BUFFER_BYTES - writer->used;
+        uint32_t portion = count < space ? count : space;
+        memcpy(writer->buffer + writer->used, source, portion);
+        writer->used += portion;
+        source += portion;
+        count -= portion;
+        if (writer->used == WORLD_SAVE_BUFFER_BYTES)
+        {
+            SaveWriterFlush(writer);
+        }
+    }
+}
+
+static void SaveWriterU16(SaveWriter* writer, uint16_t value)
+{
+    SaveWriterBytes(writer, &value, sizeof(value));
+}
+
+static void SaveWriterU32(SaveWriter* writer, uint32_t value)
+{
+    SaveWriterBytes(writer, &value, sizeof(value));
+}
+
+static void SaveWriterI64(SaveWriter* writer, int64_t value)
+{
+    SaveWriterBytes(writer, &value, sizeof(value));
+}
+
+static void SaveWriterCoord(SaveWriter* writer, const InfiniteCoord* value)
+{
+    SaveWriterBytes(writer, &value->sign, sizeof(value->sign));
+    SaveWriterU32(writer, value->limbCount);
+    if (value->limbCount > 0)
+    {
+        SaveWriterBytes(writer, value->limbs,
+            value->limbCount * (uint32_t)sizeof(uint64_t));
+    }
+}
+
+// Абсолютная координата чанка: origin кадра + локальное смещение.
+static bool SaveWriterFrameCoord(SaveWriter* writer,
+    const InfiniteCoord* base, int64_t offset)
+{
+    InfiniteCoord absolute;
+    InfiniteCoordInit(&absolute);
+    if (!InfiniteCoordTryCopyAddInt64(&absolute, base, offset))
+    {
+        writer->failed = true;
+        return false;
+    }
+    SaveWriterCoord(writer, &absolute);
+    InfiniteCoordDestroy(&absolute);
+    return true;
+}
+
+bool WorldSaveDeltas(World* world, const wchar_t* path)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    SaveWriter writer = { .file = file };
+    writer.buffer = HeapAlloc(GetProcessHeap(), 0, WORLD_SAVE_BUFFER_BYTES);
+    if (writer.buffer == NULL)
+    {
+        CloseHandle(file);
+        return false;
+    }
+
+    SaveWriterU32(&writer, WORLD_SAVE_MAGIC);
+    SaveWriterU16(&writer, WORLD_SAVE_VERSION);
+    SaveWriterU16(&writer, 0);
+    SaveWriterI64(&writer, world->seed);
+
+    // Таблица правок читается под общим замком: рабочие потоки мешинга
+    // продолжают читать мир, а правки делает только главный поток.
+    AcquireSRWLockShared(&world->tableLock);
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        SaveWriterCoord(&writer, &world->blockOrigin[axis]);
+    }
+
+    uint32_t chunkCount = 0;
+    for (uint32_t slot = 0; slot < world->capacity; ++slot)
+    {
+        if (world->occupied[slot] && world->chunks[slot] != NULL
+            && world->chunks[slot]->deltaCount > 0)
+        {
+            ++chunkCount;
+        }
+    }
+    SaveWriterU32(&writer, chunkCount);
+
+    for (uint32_t slot = 0; slot < world->capacity; ++slot)
+    {
+        if (!world->occupied[slot] || world->chunks[slot] == NULL
+            || world->chunks[slot]->deltaCount == 0)
+        {
+            continue;
+        }
+
+        const GlobalChunkCoordinate* key = &world->keys[slot];
+        const Chunk* chunk = world->chunks[slot];
+        const int64_t local[3] = { key->local.x, key->local.y, key->local.z };
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            if (!SaveWriterFrameCoord(&writer,
+                    &key->frame->chunkOrigin[axis], local[axis]))
+            {
+                break;
+            }
+        }
+        SaveWriterU32(&writer, chunk->deltaCount);
+        SaveWriterBytes(&writer, chunk->deltas,
+            chunk->deltaCount * (uint32_t)sizeof(DeltaEntry));
+    }
+
+    ReleaseSRWLockShared(&world->tableLock);
+
+    SaveWriterFlush(&writer);
+    bool succeeded = !writer.failed;
+    HeapFree(GetProcessHeap(), 0, writer.buffer);
+    CloseHandle(file);
+    return succeeded;
+}
+
+typedef struct SaveReader
+{
+    const uint8_t* bytes;
+    uint32_t length;
+    uint32_t offset;
+    bool failed;
+} SaveReader;
+
+static void SaveReaderBytes(SaveReader* reader, void* destination,
+    uint32_t count)
+{
+    if (reader->failed || reader->offset + count > reader->length)
+    {
+        reader->failed = true;
+        return;
+    }
+    memcpy(destination, reader->bytes + reader->offset, count);
+    reader->offset += count;
+}
+
+static uint16_t SaveReaderU16(SaveReader* reader)
+{
+    uint16_t value = 0;
+    SaveReaderBytes(reader, &value, sizeof(value));
+    return value;
+}
+
+static uint32_t SaveReaderU32(SaveReader* reader)
+{
+    uint32_t value = 0;
+    SaveReaderBytes(reader, &value, sizeof(value));
+    return value;
+}
+
+static int64_t SaveReaderI64(SaveReader* reader)
+{
+    int64_t value = 0;
+    SaveReaderBytes(reader, &value, sizeof(value));
+    return value;
+}
+
+// Читает InfiniteCoord и сворачивает в int64. representable сбрасывается,
+// если модуль шире 63 бит — v1 такие координаты пропускает.
+static int64_t SaveReaderCoordInt64(SaveReader* reader, bool* representable)
+{
+    int32_t sign = 0;
+    SaveReaderBytes(reader, &sign, sizeof(sign));
+    uint32_t limbCount = SaveReaderU32(reader);
+    if (limbCount > WORLD_SAVE_MAX_LIMBS)
+    {
+        reader->failed = true;
+        return 0;
+    }
+
+    uint64_t low = 0;
+    bool fits = true;
+    for (uint32_t i = 0; i < limbCount; ++i)
+    {
+        uint64_t limb = 0;
+        SaveReaderBytes(reader, &limb, sizeof(limb));
+        if (i == 0)
+        {
+            low = limb;
+        }
+        else if (limb != 0)
+        {
+            fits = false;
+        }
+    }
+
+    if (sign == 0 || limbCount == 0)
+    {
+        return 0;
+    }
+    if (low > (uint64_t)INT64_MAX)
+    {
+        fits = false;
+    }
+    if (!fits)
+    {
+        *representable = false;
+        return 0;
+    }
+    return sign < 0 ? -(int64_t)low : (int64_t)low;
+}
+
+static bool SafeSubtractInt64(int64_t value, int64_t difference,
+    int64_t* outValue)
+{
+    if (difference > 0 && value < INT64_MIN + difference) return false;
+    if (difference < 0 && value > INT64_MAX + difference) return false;
+    *outValue = value - difference;
+    return true;
+}
+
+bool WorldLoadDeltas(World* world, const wchar_t* path)
+{
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0
+        || size.QuadPart > 64ll * 1024 * 1024)
+    {
+        CloseHandle(file);
+        return false;
+    }
+
+    uint32_t length = (uint32_t)size.QuadPart;
+    uint8_t* bytes = HeapAlloc(GetProcessHeap(), 0, length);
+    if (bytes == NULL)
+    {
+        CloseHandle(file);
+        return false;
+    }
+    uint32_t completed = 0;
+    while (completed < length)
+    {
+        DWORD read = 0;
+        if (!ReadFile(file, bytes + completed, length - completed, &read, NULL)
+            || read == 0)
+        {
+            HeapFree(GetProcessHeap(), 0, bytes);
+            CloseHandle(file);
+            return false;
+        }
+        completed += read;
+    }
+    CloseHandle(file);
+
+    SaveReader reader = { .bytes = bytes, .length = length };
+    bool succeeded = false;
+
+    if (SaveReaderU32(&reader) == WORLD_SAVE_MAGIC
+        && SaveReaderU16(&reader) == WORLD_SAVE_VERSION)
+    {
+        SaveReaderU16(&reader);  // reserved
+        int64_t savedSeed = SaveReaderI64(&reader);
+
+        bool originRepresentable = true;
+        int64_t blockShift[3];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            blockShift[axis] =
+                SaveReaderCoordInt64(&reader, &originRepresentable);
+        }
+
+        // Мир обязан быть свежесозданным с тем же зерном; v1 требует
+        // представимости начала координат в int64.
+        if (!reader.failed && savedSeed == world->seed
+            && originRepresentable
+            && (blockShift[0] == 0 && blockShift[1] == 0
+                && blockShift[2] == 0
+                ? true
+                : WorldRebase(world,
+                      blockShift[0], blockShift[1], blockShift[2])))
+        {
+            int64_t chunkShift[3] = {
+                blockShift[0] / CHUNK_SIZE,
+                blockShift[1] / CHUNK_SIZE,
+                blockShift[2] / CHUNK_SIZE,
+            };
+
+            uint32_t chunkCount = SaveReaderU32(&reader);
+            succeeded = !reader.failed;
+
+            for (uint32_t i = 0; i < chunkCount && !reader.failed; ++i)
+            {
+                bool representable = true;
+                int64_t absolute[3];
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    absolute[axis] =
+                        SaveReaderCoordInt64(&reader, &representable);
+                }
+
+                int64_t localChunk[3];
+                for (int32_t axis = 0; axis < 3 && representable; ++axis)
+                {
+                    representable = SafeSubtractInt64(absolute[axis],
+                        chunkShift[axis], &localChunk[axis]);
+                }
+
+                uint32_t deltaCount = SaveReaderU32(&reader);
+                for (uint32_t d = 0; d < deltaCount && !reader.failed; ++d)
+                {
+                    uint32_t entry = SaveReaderU32(&reader);
+                    if (!representable)
+                    {
+                        continue;  // недостижимо далёкий чанк — пропуск v1
+                    }
+                    uint32_t index = DeltaLocalIndex(entry);
+                    int64_t x = localChunk[0] * CHUNK_SIZE
+                        + (int64_t)(index / (CHUNK_SIZE * CHUNK_SIZE));
+                    int64_t y = localChunk[1] * CHUNK_SIZE
+                        + (int64_t)((index / CHUNK_SIZE) % CHUNK_SIZE);
+                    int64_t z = localChunk[2] * CHUNK_SIZE
+                        + (int64_t)(index % CHUNK_SIZE);
+                    WorldSetBlock(world, x, y, z, DeltaBlock(entry));
+                }
+            }
+
+            succeeded = succeeded && !reader.failed;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, bytes);
+    return succeeded;
+}

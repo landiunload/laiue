@@ -20,6 +20,8 @@ laiue_add_module(core
         panorama.h
         pause_menu.c
         pause_menu.h
+        save_game.c
+        save_game.h
         player_command_mapper.c
         player_command_mapper.h
         ui.c

@@ -47,6 +47,7 @@
 #define LAIUE_GAME_MODE_WALK 1u
 
 typedef void (*LaiueFrameCallback)(void* user, float deltaSeconds);
+typedef void (*LaiueFixedTickCallback)(void* user, float stepSeconds);
 typedef void (*LaiueBlockEditCallback)(void* user,
     int64_t x, int64_t y, int64_t z,
     uint8_t previousBlock, uint8_t newBlock);
@@ -121,6 +122,22 @@ typedef struct LaiueModApi
         const char* name, uint32_t version, void* interfacePointer);
     void* (*queryInterface)(void* host,
         const char* name, uint32_t minimumVersion);
+
+    /* Фиксированный тик: постоянный шаг 1/60 с независимо от FPS —
+       для геймплея, способностей и таймеров (кадровый хук оставьте
+       визуалу). За длинный кадр приходит несколько тиков подряд,
+       но не больше пяти; пока открыто меню паузы, тиков нет. */
+    void (*setFixedTickCallback)(void* host,
+        LaiueFixedTickCallback callback, void* user);
+
+    /* === Данные мода в сохранении мира ===
+       Блоб на мод в saves/<мир>/moddata/<имя>.bin. Читайте в
+       LaiueModInit, пишите при изменениях или в LaiueModShutdown
+       (он вызывается до записи сохранения при выходе).
+       readModData возвращает фактический размер (0 — данных нет
+       или буфер мал). */
+    bool (*writeModData)(void* host, const void* bytes, uint32_t size);
+    uint32_t (*readModData)(void* host, void* buffer, uint32_t capacity);
 } LaiueModApi;
 
 typedef int32_t (*LaiueModInitFunction)(const LaiueModApi* api);

@@ -8,6 +8,7 @@
 #include "core/panorama.h"
 #include "core/mod_host.h"
 #include "core/pause_menu.h"
+#include "core/save_game.h"
 #include "render/shader_pack.h"
 #include "core/player_command_mapper.h"
 #include "core/ui.h"
@@ -51,6 +52,8 @@ typedef struct ApplicationState
     ModHost modHost;
     uint32_t appliedModsRevision;
     bool mouseLookBeforeMenu;
+    int64_t worldSeed;
+    wchar_t modDataDirectory[SAVE_GAME_PATH_CAPACITY];
 } ApplicationState;
 
 static void QueryWorldBlockPhysics(
@@ -505,6 +508,15 @@ static void OnFrame(void* userData)
                 ResumeGame(application);
                 application->ui.quadCount = 0;
             }
+
+            if (application->menu.saveRequested)
+            {
+                application->menu.saveRequested = false;
+                SaveGameWriteAll(application->world,
+                    &application->camera, application->gameMode,
+                    application->settings.timeOfDayHours,
+                    application->worldSeed, &application->mods);
+            }
         }
         else
         {
@@ -597,12 +609,31 @@ LAIUE_CORE_API void Start(void)
         return;
     }
 
-    World* world = WorldCreate(g_applicationConfiguration.worldSeed);
+    // Сохранение: seed и время читаются до создания мира; правки
+    // блоков применяются сразу после — до запуска стриминга чанков.
+    int64_t worldSeed = g_applicationConfiguration.worldSeed;
+    int32_t savedTimeMinutes = -1;
+    {
+        int64_t savedSeed;
+        int32_t savedMinutes;
+        if (SaveGameReadMeta(&savedSeed, &savedMinutes))
+        {
+            worldSeed = savedSeed;
+            savedTimeMinutes = savedMinutes;
+        }
+    }
+
+    World* world = WorldCreate(worldSeed);
     if (world == NULL)
     {
         InputDestroy(input);
         WindowDestroy(window);
         return;
+    }
+
+    if (savedTimeMinutes >= 0)
+    {
+        SaveGameLoadWorld(world);
     }
 
     int32_t clientWidth;
@@ -700,19 +731,36 @@ LAIUE_CORE_API void Start(void)
     PlayerControllerInit(&application->player,
         &g_applicationConfiguration.player);
 
+    // Состояние из сохранения: seed запомнен для записи, время суток
+    // продолжается с сохранённой минуты.
+    application->worldSeed = worldSeed;
+    if (savedTimeMinutes >= 0)
+    {
+        application->settings.timeOfDayHours =
+            (float)savedTimeMinutes / 60.0f;
+    }
+
     // Моды: каталог перечитывается на старте, включённые применяются
     // первым кадром (сравнение ревизий в OnFrame). Хост DLL-модов
     // получает адреса подсистем — они живут в application на куче.
     ModsInit(&application->mods);
     ModsRefresh(&application->mods);
+    if (savedTimeMinutes >= 0)
+    {
+        SaveGameCheckModsLock(&application->mods);
+    }
+
+    SaveGameModDataDirectory(application->modDataDirectory,
+        SAVE_GAME_PATH_CAPACITY);
 
     ModHostBindings modBindings = {
         .world = world,
         .chunkStreaming = chunkStreaming,
         .player = &application->player,
         .camera = &application->camera,
-        .settings = &application->settings,
         .gameMode = &application->gameMode,
+        .timeOfDayHours = &application->settings.timeOfDayHours,
+        .modDataDirectory = application->modDataDirectory,
     };
     if (!ModHostInit(&application->modHost, &modBindings))
     {
@@ -723,13 +771,20 @@ LAIUE_CORE_API void Start(void)
     CameraInit(&application->camera,
         0.0, 0.0, g_applicationConfiguration.spawnHeight,
         0.0f, -0.4f);
+    if (savedTimeMinutes >= 0)
+    {
+        SaveGameLoadPlayer(&application->camera, &application->gameMode);
+    }
 
     WindowSetRawInputCallback(window, HandleRawInput, input);
     WindowRunLoop(window, OnFrame, application);
 
-    // DLL-моды выгружаются до разрушения подсистем, на которые они
-    // могли бы позвать API из Shutdown.
+    // DLL-моды выгружаются до разрушения подсистем (их Shutdown может
+    // писать данные через API), затем пишется само сохранение.
     ModHostShutdown(&application->modHost);
+    SaveGameWriteAll(world, &application->camera, application->gameMode,
+        application->settings.timeOfDayHours, application->worldSeed,
+        &application->mods);
     UiRelease(&application->ui);
     ChunkStreamingDestroy(application->chunkStreaming);
     RendererDestroy(renderer);
