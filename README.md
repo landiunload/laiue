@@ -3,6 +3,8 @@
 Воксельный каркас под Windows без CRT: крошечный лаунчер `laiue.exe`
 загружает `laiue_core.dll`, ядро создаёт окно, подключает raw input,
 генерирует мир чанками и рисует его через Direct3D 12.
+В комплект входит отдельный authoritative `laiue_server.exe`; текущий
+безопасный вертикальный срез мультиплеера работает только через loopback.
 
 ## Сборка
 
@@ -35,12 +37,21 @@ laiue.exe                 — лаунчер без CRT, только LoadLibrar
     ├── laiue_mesher.dll  — бинарный greedy meshing (мир -> геометрия)
     ├── laiue_render.dll  — Direct3D 12, GPU-резидентные меши
     ├── laiue_content.dll — каталог и форматы подключаемого содержимого
+    ├── laiue_network.dll — bounded protocol и client/server transport
     ├── laiue_physics.dll — AABB и столкновения с вокселями
     ├── laiue_gameplay.dll — движение, прыжок и стойка игрока
     └── laiue_interaction.dll — raycast и редактирование блоков
+
+laiue_server.exe          — headless composition root без renderer/UI/core
+├── laiue_network.dll     — соединения, framing, очереди и rate limits
+├── laiue_world.dll       — авторитетный мир
+├── laiue_gameplay.dll    — авторитетная физика игрока
+└── laiue_interaction.dll — проверенная сервером правка блоков
 ```
 
-Все модули собираются без CRT (`/NODEFAULTLIB`), DLL линкуются с `/NOENTRY`.
+Все модули собираются без CRT (`/NODEFAULTLIB`). DLL имеют минимальную точку
+входа только для инициализации `/GS` security cookie; дополнительно включены
+CFG, CET, ASLR и DEP/NX.
 Состояние — непрозрачные экземпляры (`Window*`, `Input*`, `World*`,
 `Renderer*`), глобальных переменных нет. Рендерер не знает о мире,
 мир не знает о геометрии; их связывает модуль mesher.
@@ -74,6 +85,19 @@ laiue_add_module(имя SOURCES <файлы...> [LINK <библиотеки...>]
 Правила разработки и локальные проверки находятся в
 [CONTRIBUTING.md](CONTRIBUTING.md).
 Корневая сборка автоматически отклоняет запрещённые межмодульные include.
+
+Локальный сервер запускается до клиента из каталога сборки:
+
+```powershell
+./laiue_server.exe
+./laiue.exe
+```
+
+Он слушает только `127.0.0.1:27180`; отсутствие сервера не мешает offline-
+режиму. Ограничения текущей реализации, threat model и обязательный план
+перехода на MsQuic/TLS 1.3 описаны в
+[docs/multiplayer.md](docs/multiplayer.md). Открывать текущий plaintext TCP
+в LAN или Internet нельзя.
 
 ## Управление
 

@@ -18,6 +18,7 @@
 #include "gameplay/player_controller.h"
 #include "interaction/voxel_interaction.h"
 #include "input/input.h"
+#include "network/network.h"
 #include "platform/time.h"
 #include "platform/window.h"
 #include "render/renderer.h"
@@ -25,6 +26,7 @@
 #include "world/world.h"
 
 #include <stddef.h>
+#include <string.h>
 #include <windows.h>
 
 typedef struct ApplicationState
@@ -44,6 +46,13 @@ typedef struct ApplicationState
     uint32_t fpsFrameCount;
     uint32_t framesPerSecond;
     bool showDiagnostics;
+    NetworkClient* networkClient;
+    uint32_t networkPeerId;
+    float networkInputAccumulator;
+    NetworkInputCommand networkPendingInput;
+    bool networkReady;
+    bool networkEverReady;
+    bool networkHasSnapshot;
 
     GameSettings settings;
     PanoramaCache panoramaCache;
@@ -222,6 +231,13 @@ static void HandleBlockEditing(ApplicationState* application)
     float direction[3];
     CameraGetForwardVector(&application->camera, direction);
 
+    if (application->networkReady)
+    {
+        NetworkClientSendEditIntent(application->networkClient,
+            breakPressed, placePressed, direction);
+        return;
+    }
+
     VoxelBodyShape bodyShape;
     const VoxelBodyShape* blockingShape = NULL;
     const double* blockingPosition = NULL;
@@ -283,6 +299,46 @@ static void UpdatePlayer(ApplicationState* application,
         * (float)application->settings.mouseSensitivityPercent * 0.01f;
     float flySpeed = (float)application->settings.flySpeedBlocks;
 
+    if (application->networkReady)
+    {
+        CameraUpdate(&application->camera, deltaSeconds,
+            false, false, false, false, false,
+            mouseDeltaX, mouseDeltaY, 0.0f, sensitivity);
+
+        PlayerControllerCommand command;
+        PlayerCommandMapperBuild(application->input,
+            &application->camera, &command);
+
+        // Предсказание существует только для плавности клиента. Сервер
+        // повторяет физику сам и регулярно исправляет расхождение.
+        PlayerCollisionSource collision =
+            CreatePlayerCollisionSource(application->world);
+        PlayerControllerUpdate(&application->player,
+            &collision, &application->camera, &command, deltaSeconds);
+
+        application->networkPendingInput.movementX =
+            (float)command.movementX;
+        application->networkPendingInput.movementY =
+            (float)command.movementY;
+        application->networkPendingInput.yaw = application->camera.yaw;
+        application->networkPendingInput.pitch = application->camera.pitch;
+        application->networkPendingInput.jumpPressed =
+            application->networkPendingInput.jumpPressed
+            || command.jumpPressed;
+        application->networkPendingInput.jumpHeld = command.jumpHeld;
+        application->networkPendingInput.sprintHeld = command.sprintHeld;
+        application->networkPendingInput.crouchHeld = command.crouchHeld;
+        application->networkInputAccumulator += deltaSeconds;
+        if (application->networkInputAccumulator >= (1.0f / 60.0f))
+        {
+            NetworkClientSendInput(application->networkClient,
+                &application->networkPendingInput);
+            application->networkPendingInput.jumpPressed = false;
+            application->networkInputAccumulator = 0.0f;
+        }
+        return;
+    }
+
     if (application->gameMode == GAME_MODE_FLY)
     {
         while (InputConsumeKeyPress(
@@ -316,6 +372,90 @@ static void UpdatePlayer(ApplicationState* application,
         deltaSeconds);
 }
 
+static void PumpNetwork(ApplicationState* application)
+{
+    if (application->networkClient == NULL)
+    {
+        return;
+    }
+    NetworkClientUpdate(application->networkClient);
+
+    bool destroyClient = false;
+    NetworkClientEvent event;
+    while (NetworkClientPollEvent(application->networkClient, &event))
+    {
+        if (event.type == NETWORK_CLIENT_EVENT_READY)
+        {
+            if (event.data.ready.worldSeed != application->worldSeed)
+            {
+                destroyClient = true;
+                continue;
+            }
+            application->networkPeerId = event.data.ready.peerId;
+            application->networkReady = true;
+            application->networkEverReady = true;
+            application->networkHasSnapshot = false;
+            application->gameMode = GAME_MODE_WALK;
+            memset(&application->networkPendingInput, 0,
+                sizeof(application->networkPendingInput));
+            PlayerControllerReset(
+                &application->player, &application->camera);
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_PLAYER_STATE
+            && application->networkReady
+            && event.data.playerState.peerId == application->networkPeerId)
+        {
+            double errorSquared = 0.0;
+            for (int32_t axis = 0; axis < 3; ++axis)
+            {
+                double error = event.data.playerState.position[axis]
+                    - application->camera.position[axis];
+                errorSquared += error * error;
+            }
+            bool hardCorrection = !application->networkHasSnapshot
+                || errorSquared > 16.0;
+            for (int32_t axis = 0; axis < 3; ++axis)
+            {
+                double authoritative =
+                    event.data.playerState.position[axis];
+                application->camera.position[axis] = hardCorrection
+                    ? authoritative
+                    : application->camera.position[axis]
+                        + (authoritative
+                            - application->camera.position[axis]) * 0.25;
+            }
+            if (hardCorrection)
+            {
+                PlayerControllerReset(
+                    &application->player, &application->camera);
+            }
+            application->networkHasSnapshot = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_BLOCK_DELTA
+            && application->networkReady)
+        {
+            const int64_t* block = event.data.blockDelta.block;
+            WorldSetBlock(application->world,
+                block[0], block[1], block[2],
+                event.data.blockDelta.replacement);
+            ChunkStreamingInvalidateBlock(application->chunkStreaming,
+                block[0], block[1], block[2]);
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_DISCONNECTED)
+        {
+            application->networkReady = false;
+            application->networkPeerId = 0;
+            application->networkHasSnapshot = false;
+        }
+    }
+    if (destroyClient)
+    {
+        NetworkClientDestroy(application->networkClient);
+        application->networkClient = NULL;
+        application->networkReady = false;
+    }
+}
+
 // Закрывает меню и возвращает игру: восстанавливает режим взгляда,
 // сбрасывает накопленный за паузу ввод.
 static void ResumeGame(ApplicationState* application)
@@ -328,6 +468,8 @@ static void ResumeGame(ApplicationState* application)
 static void OnFrame(void* userData)
 {
     ApplicationState* application = userData;
+
+    PumpNetwork(application);
 
     // Смена состава модов (тумблер на вкладке, правка enabled.txt):
     // хост перезагружает цепочку DLL в порядке включения.
@@ -374,12 +516,14 @@ static void OnFrame(void* userData)
         InputResetState(application->input);
     }
 
-    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_G))
+    if (!menuOpen && !application->networkReady
+        && InputConsumeKeyPress(application->input, INPUT_KEY_G))
     {
         ToggleGameMode(application);
     }
 
-    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_T)
+    if (!menuOpen && !application->networkReady
+        && InputConsumeKeyPress(application->input, INPUT_KEY_T)
         && !SquareAbsoluteX(application))
     {
         WindowRequestClose(application->window);
@@ -435,7 +579,7 @@ static void OnFrame(void* userData)
         ModHostDispatchFrame(&application->modHost, deltaSeconds);
     }
 
-    if (!RebaseWorldIfNeeded(application))
+    if (!application->networkReady && !RebaseWorldIfNeeded(application))
     {
         WindowRequestClose(application->window);
         return;
@@ -516,7 +660,8 @@ static void OnFrame(void* userData)
                 application->ui.quadCount = 0;
             }
 
-            if (application->menu.saveRequested)
+            if (application->menu.saveRequested
+                && !application->networkEverReady)
             {
                 application->menu.saveRequested = false;
                 SaveGameWriteAll(application->world,
@@ -539,6 +684,7 @@ static void OnFrame(void* userData)
                 application->gameMode, application->framesPerSecond,
                 timeMinutes, &streamingStats, &rendererStats,
                 application->showDiagnostics,
+                application->networkReady, application->networkPeerId,
                 cameraBlockPosition,
                 application->windowWidth, application->windowHeight);
         }
@@ -713,6 +859,9 @@ LAIUE_CORE_API void Start(void)
     application->settings.wireframe = false;
     application->settings.gamma = 100;
 
+    application->networkClient = NetworkClientCreateLoopback(
+        LAIUE_NETWORK_DEFAULT_PORT);
+
     application->menu.texturePackStatus =
         RendererGetTexturePackLoadStatus(renderer);
     if (application->menu.texturePackStatus == RENDERER_CONTENT_INVALID
@@ -759,8 +908,9 @@ LAIUE_CORE_API void Start(void)
     application->settings.applyShaderPack = false;
 
     GameHudInit(&application->hud);
-    PlayerControllerInit(&application->player,
-        &g_applicationConfiguration.player);
+    PlayerControllerConfig playerConfiguration;
+    PlayerControllerGetDefaultConfig(&playerConfiguration);
+    PlayerControllerInit(&application->player, &playerConfiguration);
 
     // Состояние из сохранения: seed запомнен для записи, время суток
     // продолжается с сохранённой минуты.
@@ -813,9 +963,13 @@ LAIUE_CORE_API void Start(void)
     // DLL-моды выгружаются до разрушения подсистем (их Shutdown может
     // писать данные через API), затем пишется само сохранение.
     ModHostShutdown(&application->modHost);
-    SaveGameWriteAll(world, &application->camera, application->gameMode,
-        application->settings.timeOfDayHours, application->worldSeed,
-        &application->mods);
+    if (!application->networkEverReady)
+    {
+        SaveGameWriteAll(world, &application->camera, application->gameMode,
+            application->settings.timeOfDayHours, application->worldSeed,
+            &application->mods);
+    }
+    NetworkClientDestroy(application->networkClient);
     UiRelease(&application->ui);
     ChunkStreamingDestroy(application->chunkStreaming);
     RendererDestroy(renderer);

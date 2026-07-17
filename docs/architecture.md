@@ -12,6 +12,11 @@
 - `core/save_game.*`, `core/mod_host.*`, `core/mods.*` — сохранения,
   загрузка нативных модов и управление их состоянием.
 - `content/*` — обнаружение содержимого и разбор общих текстовых форматов.
+- `network/*` — bounded wire protocol, схемы сетевых игровых сообщений,
+  соединения, очереди и transport; не зависит от реализаций мира, физики,
+  renderer или UI.
+- `server/main.c` — отдельный headless composition root: authoritative мир,
+  игроки, fixed tick и семантическая проверка команд.
 - `gameplay/player_controller.*` — orchestration fixed-step физики игрока.
 - `gameplay/player_locomotion.*` — горизонтальная скорость, ускорение,
   торможение, air-control и sprint-jump impulse.
@@ -29,7 +34,9 @@
 Направление зависимостей задаётся в `src/*/CMakeLists.txt`: `core`
 компонует подсистемы; `render` зависит только от `content`; `mesher` —
 от `world`; `interaction` — от `world` и `physics`; `gameplay` — от
-`physics`. Нижние модули не должны включать заголовки `core`.
+`physics`; `network` не зависит от игровых модулей; server компонует
+`network`, `world`, `physics`, `gameplay` и `interaction`. Нижние модули не
+должны включать заголовки `core`.
 
 DLL-границы являются частью архитектуры. Крупную реализацию можно делить
 на несколько `.c` внутри той же DLL, но объединять подсистемы или передавать
@@ -64,10 +71,18 @@ GPU-проходы — внутренними частями `render`.
 | `ModsState`, `ModHost` | `ApplicationState` | только главный | хуки останавливаются до сохранения и выгрузки DLL |
 | списки content | вызывающая сторона | только главный | парный `*ListRelease` |
 | байткоды/данные паков | вызывающая сторона загрузчика | только главный | освобождение после копирования renderer'ом |
+| `NetworkClient` | client `ApplicationState` | главный | до разрушения client world |
+| `NetworkServer` | `DedicatedServer` | server main thread | до server world |
+| server `World`/players | `DedicatedServer` | server main thread, 60 Гц | после остановки listener |
 
 Рабочие потоки не вызывают renderer, UI или моды. Нативные моды получают
 хуки только главного потока. Изменение `World` выполняется главным потоком;
 mesher держит только shared-read на время чтения.
+
+В сетевой сессии server — единственный владелец истинного игрового состояния.
+Клиентское движение является prediction и исправляется snapshot; client intent
+не является командой установить позицию или блок. Подробный threat model и
+этапы remote transport находятся в [multiplayer.md](multiplayer.md).
 
 ## Ошибки и fallback
 

@@ -39,7 +39,7 @@ target_compile_definitions(laiue_compile_settings INTERFACE
 )
 
 target_compile_options(laiue_compile_settings INTERFACE
-    /W4 /utf-8 /GS- /fp:fast
+    /W4 /utf-8 /GS /guard:cf /fp:fast
     $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
     $<$<CONFIG:Debug>:/Od>
     $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>
@@ -48,7 +48,14 @@ target_compile_options(laiue_compile_settings INTERFACE
 )
 
 add_library(laiue_common INTERFACE)
-target_link_libraries(laiue_common INTERFACE laiue_compile_settings)
+target_link_libraries(laiue_common INTERFACE
+    laiue_compile_settings
+    BufferOverflowU
+    # cl.exe с /GS ссылается на unwind-handler, которого нет в
+    # BufferOverflowU. /NODEFAULTLIB извлекает из libcmt только нужный
+    # gshandler.obj; CRT startup, heap, stdio и memory не подключаются.
+    $<$<C_COMPILER_ID:MSVC>:libcmt>
+)
 
 if(LAIUE_ENABLE_LTO)
     target_compile_options(laiue_common INTERFACE
@@ -58,8 +65,8 @@ if(LAIUE_ENABLE_LTO)
 endif()
 
 target_link_options(laiue_common INTERFACE
-    /NODEFAULTLIB /SUBSYSTEM:WINDOWS
-    /DYNAMICBASE /HIGHENTROPYVA
+    /NODEFAULTLIB
+    /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf /CETCOMPAT
     /MANIFEST:NO
     /MERGE:.rdata=.text /MERGE:.pdata=.text
     $<$<C_COMPILER_ID:MSVC>:/EMITTOOLVERSIONINFO:NO>
@@ -75,7 +82,7 @@ endif()
 
 add_library(laiue_runtime OBJECT "${PROJECT_SOURCE_DIR}/src/runtime/memory.c")
 target_compile_options(laiue_runtime PRIVATE
-    /W4 /utf-8 /GS- /fp:fast
+    /W4 /utf-8 /GS /guard:cf /fp:fast
     $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
     $<$<CONFIG:Debug>:/Od>
     $<$<NOT:$<CONFIG:Debug>>:/O2 /Oi>

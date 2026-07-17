@@ -39,6 +39,20 @@ static void SetModeText(GameHud* hud)
     UiTextBuilderAppend(&builder, text);
 }
 
+static void SetNetworkText(GameHud* hud)
+{
+    UiTextBuilder builder;
+    UiTextBuilderInit(&builder, hud->networkText,
+        (uint32_t)(sizeof(hud->networkText) / sizeof(hud->networkText[0])));
+    if (!hud->networkConnected)
+    {
+        UiTextBuilderAppend(&builder, L"Offline");
+        return;
+    }
+    UiTextBuilderAppend(&builder, L"Server #");
+    UiTextBuilderAppendUnsigned(&builder, hud->networkPeerId);
+}
+
 void GameHudInit(GameHud* hud)
 {
     hud->initialized = false;
@@ -46,6 +60,8 @@ void GameHudInit(GameHud* hud)
     hud->timeMinutes = 0;
     hud->gameMode = GAME_MODE_FLY;
     hud->crouching = false;
+    hud->networkConnected = false;
+    hud->networkPeerId = 0;
     hud->diagnosticsVisible = false;
     hud->measuredPixelSize = 0;
     hud->panelWidth = 0.0f;
@@ -58,6 +74,7 @@ void GameHudInit(GameHud* hud)
     hud->framesPerSecondText[0] = L'\0';
     hud->timeText[0] = L'\0';
     hud->modeText[0] = L'\0';
+    hud->networkText[0] = L'\0';
     hud->meshQueueText[0] = L'\0';
     hud->buildTimeText[0] = L'\0';
     hud->wastedBuildsText[0] = L'\0';
@@ -73,7 +90,7 @@ static void UpdateTextCache(GameHud* hud, World* world,
     uint32_t framesPerSecond, uint32_t timeMinutes,
     const ChunkStreamingStats* streamingStats,
     const RendererStats* rendererStats,
-    bool diagnosticsVisible,
+    bool diagnosticsVisible, bool networkConnected, uint32_t networkPeerId,
     const int64_t cameraBlockPosition[3])
 {
     bool measurementDirty = !hud->initialized;
@@ -125,6 +142,14 @@ static void UpdateTextCache(GameHud* hud, World* world,
         hud->gameMode = gameMode;
         hud->crouching = crouching;
         SetModeText(hud);
+        measurementDirty = true;
+    }
+    if (!hud->initialized || hud->networkConnected != networkConnected
+        || hud->networkPeerId != networkPeerId)
+    {
+        hud->networkConnected = networkConnected;
+        hud->networkPeerId = networkPeerId;
+        SetNetworkText(hud);
         measurementDirty = true;
     }
 
@@ -199,6 +224,7 @@ static void MeasurePanel(GameHud* hud, const UiContext* ui)
     float labelWidth = UiTextWidth(ui, L"Время");
     labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Режим"));
     labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"FPS"));
+    labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Сеть"));
     if (hud->diagnosticsVisible)
     {
         labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Очередь"));
@@ -215,6 +241,7 @@ static void MeasurePanel(GameHud* hud, const UiContext* ui)
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->framesPerSecondText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->timeText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->modeText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->networkText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->meshQueueText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->buildTimeText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->wastedBuildsText));
@@ -235,7 +262,7 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
     GameMode gameMode, uint32_t framesPerSecond, uint32_t timeMinutes,
     const ChunkStreamingStats* streamingStats,
     const RendererStats* rendererStats,
-    bool diagnosticsVisible,
+    bool diagnosticsVisible, bool networkConnected, uint32_t networkPeerId,
     const int64_t cameraBlockPosition[3],
     int32_t viewportWidth, int32_t viewportHeight)
 {
@@ -248,7 +275,7 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
 
     UpdateTextCache(hud, world, player, gameMode,
         framesPerSecond, timeMinutes, streamingStats, rendererStats,
-        diagnosticsVisible,
+        diagnosticsVisible, networkConnected, networkPeerId,
         cameraBlockPosition);
 
     if (hud->measuredPixelSize != ui->font.pixelSize)
@@ -264,7 +291,7 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
     float rowAdvance = ui->font.lineHeight + rowGap;
     float panelHeight = padding + ui->font.lineHeight + titleGap
         + dividerHeight + titleGap
-        + rowAdvance * (hud->diagnosticsVisible ? 12.0f : 6.0f)
+        + rowAdvance * (hud->diagnosticsVisible ? 13.0f : 7.0f)
         - rowGap + padding;
 
     float availableWidth = (float)viewportWidth - margin * 2.0f;
@@ -302,8 +329,10 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
         L"FPS", hud->framesPerSecondText, rowGap);
     cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
         L"Время", hud->timeText, rowGap);
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Режим", hud->modeText, rowGap);
     UiLabelValueRow(ui, contentX, contentWidth, cursorY,
-        L"Режим", hud->modeText,
+        L"Сеть", hud->networkText,
         hud->diagnosticsVisible ? rowGap : 0.0f);
     if (!hud->diagnosticsVisible) return;
     cursorY += rowAdvance;

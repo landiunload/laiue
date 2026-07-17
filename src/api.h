@@ -62,3 +62,9 @@
 #else
 #define LAIUE_CONTENT_API __declspec(dllimport)
 #endif
+
+#if defined(LAIUE_BUILD_NETWORK)
+#define LAIUE_NETWORK_API __declspec(dllexport)
+#else
+#define LAIUE_NETWORK_API __declspec(dllimport)
+#endif

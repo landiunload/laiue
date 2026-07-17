@@ -44,6 +44,7 @@ laiue_add_module(core
         laiue_gameplay
         laiue_interaction
         laiue_content
+        laiue_network
         gdi32
 )
 target_include_directories(laiue_core PRIVATE "${PROJECT_SOURCE_DIR}/sdk")

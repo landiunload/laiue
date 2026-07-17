@@ -2,13 +2,36 @@
 #include "core/math.h"
 
 #define PITCH_LIMIT 1.570796f
+#define YAW_LIMIT   3.1415927f
+#define YAW_PERIOD  6.2831853f
+
+static float NormalizeYaw(float yaw)
+{
+    // Верхняя граница защищает преобразование в int32 от повреждённого
+    // сохранения; обычный raw-input даже при int32 delta существенно меньше.
+    if (yaw != yaw || yaw > 100000000.0f || yaw < -100000000.0f)
+    {
+        return 0.0f;
+    }
+    int32_t periods = (int32_t)(yaw / YAW_PERIOD);
+    yaw -= (float)periods * YAW_PERIOD;
+    if (yaw > YAW_LIMIT)
+    {
+        yaw -= YAW_PERIOD;
+    }
+    else if (yaw < -YAW_LIMIT)
+    {
+        yaw += YAW_PERIOD;
+    }
+    return yaw;
+}
 
 void CameraInit(Camera* camera, double x, double y, double z, float yaw, float pitch)
 {
     camera->position[0] = x;
     camera->position[1] = y;  // вторая горизонталь
     camera->position[2] = z;  // высота
-    camera->yaw = yaw;
+    camera->yaw = NormalizeYaw(yaw);
     camera->pitch = ScalarClamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
 }
 
@@ -30,6 +53,7 @@ void CameraUpdate(Camera* camera, float deltaSeconds,
     float speed, float mouseSensitivity)
 {
     camera->yaw += (float)mouseDeltaX * mouseSensitivity;
+    camera->yaw = NormalizeYaw(camera->yaw);
     camera->pitch -= (float)mouseDeltaY * mouseSensitivity;
     camera->pitch = ScalarClamp(camera->pitch, -PITCH_LIMIT, PITCH_LIMIT);
 

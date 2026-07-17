@@ -3,8 +3,6 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#include "gameplay/player_controller.h"
-
 typedef struct ApplicationConfiguration
 {
     const wchar_t* windowTitle;
@@ -25,7 +23,6 @@ typedef struct ApplicationConfiguration
     int64_t worldSeed;
     int64_t rebaseThresholdBlocks;
     double spawnHeight;
-    PlayerControllerConfig player;
 } ApplicationConfiguration;
 
 extern const ApplicationConfiguration g_applicationConfiguration;

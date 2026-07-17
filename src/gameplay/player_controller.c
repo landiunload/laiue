@@ -3,6 +3,7 @@
 #include "gameplay/player_jump.h"
 #include "gameplay/player_stance.h"
 
+#include <string.h>
 
 #define PLAYER_PENETRATION_STEPS 256u
 
@@ -422,4 +423,41 @@ void PlayerControllerSetAirJumps(PlayerController* controller,
     PlayerJumpSetAirJumps(&controller->jump,
         extraAirJumps, airJumpImpulse, refillOnGround,
         controller->grounded);
+}
+void PlayerControllerGetDefaultConfig(PlayerControllerConfig* outConfig)
+{
+    if (outConfig == NULL)
+    {
+        return;
+    }
+    const PlayerControllerConfig defaults = {
+        .walkingSpeed = 4.0f,
+        .sprintingSpeed = 6.0f,
+        .crouchingSpeed = 3.5f,
+        .groundAcceleration = 20.0f,
+        .groundDeceleration = 30.0f,
+        .airAcceleration = 4.0f,
+        .sprintJumpSpeed = 8.0f,
+        .gravity = 26.0f,
+        .maximumFallSpeed = 55.0f,
+        .jumpBufferSeconds = 0.14f,
+        .coyoteTimeSeconds = 0.10f,
+        .externalVelocityDamping = 8.0f,
+        .fixedStepSeconds = 1.0f / 240.0f,
+        .maximumSubsteps = 32u,
+        .jumpHeight = 1.275,
+        .radius = 0.30,
+        .standingHeight = 1.80,
+        .standingEyeHeight = 1.75,
+        .crouchingHeight = 1.30,
+        .crouchingEyeHeight = 1.25,
+        .collisionEpsilon = 0.001,
+        .groundProbeDepth = 0.03,
+        .sneakProbeDepth = 0.60,
+        .crouchEyeDuration = 0.175,
+        .crouchColliderDuration = 0.200,
+        .standColliderDuration = 0.200,
+        .standEyeDuration = 0.250,
+    };
+    memcpy(outConfig, &defaults, sizeof(*outConfig));
 }

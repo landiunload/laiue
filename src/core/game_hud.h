@@ -21,6 +21,8 @@ typedef struct GameHud
     uint32_t timeMinutes;
     GameMode gameMode;
     bool crouching;
+    bool networkConnected;
+    uint32_t networkPeerId;
     bool diagnosticsVisible;
 
     int32_t measuredPixelSize;
@@ -30,6 +32,7 @@ typedef struct GameHud
     wchar_t framesPerSecondText[16];
     wchar_t timeText[8];
     wchar_t modeText[16];
+    wchar_t networkText[24];
     wchar_t meshQueueText[24];
     wchar_t buildTimeText[24];
     wchar_t wastedBuildsText[24];
@@ -47,6 +50,6 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
     GameMode gameMode, uint32_t framesPerSecond, uint32_t timeMinutes,
     const ChunkStreamingStats* streamingStats,
     const RendererStats* rendererStats,
-    bool diagnosticsVisible,
+    bool diagnosticsVisible, bool networkConnected, uint32_t networkPeerId,
     const int64_t cameraBlockPosition[3],
     int32_t viewportWidth, int32_t viewportHeight);

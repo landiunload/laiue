@@ -66,6 +66,11 @@ typedef struct PlayerController
     bool grounded;
 } PlayerController;
 
+// Единственный источник базовых правил движения для клиента и dedicated
+// server. Вызывающая сторона может изменить копию до PlayerControllerInit.
+LAIUE_GAMEPLAY_API void PlayerControllerGetDefaultConfig(
+    PlayerControllerConfig* outConfig);
+
 LAIUE_GAMEPLAY_API void PlayerControllerInit(
     PlayerController* controller, const PlayerControllerConfig* config);
 LAIUE_GAMEPLAY_API void PlayerControllerReset(

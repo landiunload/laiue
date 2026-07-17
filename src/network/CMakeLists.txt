@@ -1,0 +1,11 @@
+laiue_add_module(network
+    SOURCES
+        network_windows.c
+        network.h
+        protocol.c
+        protocol.h
+        ../api.h
+    LINK
+        ws2_32
+        bcrypt
+)

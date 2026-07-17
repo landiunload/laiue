@@ -37,11 +37,32 @@ add_subdirectory(src/input)
 add_subdirectory(src/world)
 add_subdirectory(src/mesh)
 add_subdirectory(src/content)
+add_subdirectory(src/network)
 add_subdirectory(src/render)
 add_subdirectory(src/physics)
 add_subdirectory(src/gameplay)
 add_subdirectory(src/interaction)
 add_subdirectory(src/core)
+
+# Dedicated server deliberately has no dependency on window, input, renderer,
+# mesher, content or client core. Gameplay and world stay authoritative here.
+add_executable(laiue_server src/server/main.c)
+target_link_libraries(laiue_server PRIVATE
+    laiue_common
+    laiue_runtime
+    laiue_network
+    laiue_world
+    laiue_physics
+    laiue_gameplay
+    laiue_interaction
+    kernel32
+)
+target_link_options(laiue_server PRIVATE
+    /ENTRY:ServerEntryPoint
+    /SUBSYSTEM:CONSOLE
+    /STACK:262144,4096
+    /HEAP:65536,4096
+)
 
 add_executable(laiue WIN32 src/launcher/main.c)
 target_link_libraries(laiue PRIVATE laiue_common laiue_runtime kernel32)
@@ -70,7 +91,7 @@ add_custom_target(laiue_content_files
         "$<TARGET_FILE_DIR:laiue>/shaders"
     COMMENT "Подготовка ресурсов, модов, шейдеров, данных и текстур"
 )
-add_dependencies(laiue laiue_core laiue_content_files)
+add_dependencies(laiue laiue_core laiue_content_files laiue_server)
 if(TARGET laiue_architecture_check)
     add_dependencies(laiue laiue_architecture_check)
 endif()
@@ -103,7 +124,8 @@ function(laiue_add_example_mod mod_name)
         "${PROJECT_SOURCE_DIR}/sdk")
     target_link_libraries(${target_name} PRIVATE
         laiue_common laiue_runtime kernel32)
-    target_link_options(${target_name} PRIVATE /NOENTRY)
+    target_link_options(${target_name} PRIVATE
+        /ENTRY:LaiueDllEntryPoint /SUBSYSTEM:WINDOWS)
     set_target_properties(${target_name} PROPERTIES
         OUTPUT_NAME ${mod_name}
         RUNTIME_OUTPUT_DIRECTORY

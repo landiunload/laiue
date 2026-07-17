@@ -3,6 +3,25 @@
 Актуально для версии 0.5.0. План основан на текущем дереве исходников и
 успешной Release-сборке `ninja-clang-release`.
 
+## P0 — довести мультиплеер до удалённого подключения
+
+1. [Выполнено локально] Добавлены отдельный headless `laiue_server.exe`, общая
+   `laiue_network.dll`, authoritative physics/block edits, client prediction и
+   reconciliation. Listener привязан только к loopback.
+2. [Выполнено] Wire-format не передаёт C-структуры: версия, exact sizes,
+   bounded frames/queues, sequence, state machine, validation и rate limits.
+3. [Выполнено] Весь проект переведён с `/GS-` на инициализированные `/GS`
+   cookies; включены CFG, CET, ASLR и DEP/NX.
+4. Подключить MsQuic backend с TLS 1.3, проверкой сертификата, без plaintext
+   fallback и без gameplay в 0-RTT.
+5. Реализовать initial world snapshot, chunk revisions/deltas, interest
+   management, server persistence и отображение удалённых игроков.
+6. Добавить identity/access tokens, конфигурацию dedicated server, метрики,
+   административный аудит и внешний DDoS perimeter.
+
+До выполнения пунктов 4–6 открывать listener в LAN/Internet запрещено.
+Контракт и threat model: [multiplayer.md](multiplayer.md).
+
 ## Отложено — автоматические тесты
 
 1. Подключить CTest и добавить небольшие тестовые EXE без CRT для чистых
@@ -34,6 +53,9 @@ ABI SDK или бинарных форматов версии 2.
    публичный API renderer — от внутренней раскладки LTP.
 7. [Выполнено] Перечисление текстур/шейдеров делегировано `content.dll`;
    дублирующие Win32-обходы удалены из render DLL.
+8. Перед добавлением MsQuic разделить `network_windows.c` на общий bounded
+   channel, client state machine и server state machine. Части остаются внутри
+   одной `network.dll`; публичный API и wire-format не меняются.
 
 Критерий готовности: крупные подсистемы имеют файлы до примерно 800 строк,
 а их внутренние части не становятся новыми DLL без реальной необходимости.
