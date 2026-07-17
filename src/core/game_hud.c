@@ -6,6 +6,17 @@ static float Maximum(float left, float right)
     return left > right ? left : right;
 }
 
+static void FormatPair(wchar_t* destination, uint32_t capacity,
+    uint64_t left, uint64_t right, const wchar_t* suffix)
+{
+    UiTextBuilder builder;
+    UiTextBuilderInit(&builder, destination, capacity);
+    UiTextBuilderAppendUnsigned(&builder, left);
+    UiTextBuilderAppendChar(&builder, L'/');
+    UiTextBuilderAppendUnsigned(&builder, right);
+    UiTextBuilderAppend(&builder, suffix);
+}
+
 static void SetModeText(GameHud* hud)
 {
     const wchar_t* text;
@@ -35,6 +46,7 @@ void GameHudInit(GameHud* hud)
     hud->timeMinutes = 0;
     hud->gameMode = GAME_MODE_FLY;
     hud->crouching = false;
+    hud->diagnosticsVisible = false;
     hud->measuredPixelSize = 0;
     hud->panelWidth = 0.0f;
 
@@ -46,14 +58,30 @@ void GameHudInit(GameHud* hud)
     hud->framesPerSecondText[0] = L'\0';
     hud->timeText[0] = L'\0';
     hud->modeText[0] = L'\0';
+    hud->meshQueueText[0] = L'\0';
+    hud->buildTimeText[0] = L'\0';
+    hud->wastedBuildsText[0] = L'\0';
+    hud->drawText[0] = L'\0';
+    hud->uploadText[0] = L'\0';
+    hud->geometryPoolText[0] = L'\0';
+    hud->streamingStats = (ChunkStreamingStats){ 0 };
+    hud->rendererStats = (RendererStats){ 0 };
 }
 
 static void UpdateTextCache(GameHud* hud, World* world,
     const PlayerController* player, GameMode gameMode,
     uint32_t framesPerSecond, uint32_t timeMinutes,
+    const ChunkStreamingStats* streamingStats,
+    const RendererStats* rendererStats,
+    bool diagnosticsVisible,
     const int64_t cameraBlockPosition[3])
 {
     bool measurementDirty = !hud->initialized;
+    if (!hud->initialized || hud->diagnosticsVisible != diagnosticsVisible)
+    {
+        hud->diagnosticsVisible = diagnosticsVisible;
+        measurementDirty = true;
+    }
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
@@ -100,6 +128,65 @@ static void UpdateTextCache(GameHud* hud, World* world,
         measurementDirty = true;
     }
 
+    uint64_t buildMicroseconds = (uint64_t)(
+        streamingStats->averageBuildMilliseconds * 1000.0 + 0.5);
+    uint64_t previousBuildMicroseconds = (uint64_t)(
+        hud->streamingStats.averageBuildMilliseconds * 1000.0 + 0.5);
+    if (!hud->initialized
+        || hud->streamingStats.pendingRequests != streamingStats->pendingRequests
+        || hud->streamingStats.pendingResults != streamingStats->pendingResults)
+    {
+        FormatPair(hud->meshQueueText,
+            (uint32_t)(sizeof(hud->meshQueueText) / sizeof(wchar_t)),
+            streamingStats->pendingRequests, streamingStats->pendingResults, L"");
+        measurementDirty = true;
+    }
+    if (!hud->initialized || previousBuildMicroseconds != buildMicroseconds)
+    {
+        UiFormatUnsignedSuffix(hud->buildTimeText,
+            (uint32_t)(sizeof(hud->buildTimeText) / sizeof(wchar_t)),
+            buildMicroseconds, L" us");
+        measurementDirty = true;
+    }
+    if (!hud->initialized
+        || hud->streamingStats.cancelledBuilds != streamingStats->cancelledBuilds
+        || hud->streamingStats.discardedBuilds != streamingStats->discardedBuilds)
+    {
+        FormatPair(hud->wastedBuildsText,
+            (uint32_t)(sizeof(hud->wastedBuildsText) / sizeof(wchar_t)),
+            streamingStats->cancelledBuilds, streamingStats->discardedBuilds, L"");
+        measurementDirty = true;
+    }
+    if (!hud->initialized
+        || hud->rendererStats.drawCalls != rendererStats->drawCalls
+        || hud->rendererStats.drawnQuads != rendererStats->drawnQuads)
+    {
+        FormatPair(hud->drawText,
+            (uint32_t)(sizeof(hud->drawText) / sizeof(wchar_t)),
+            rendererStats->drawCalls, rendererStats->drawnQuads, L"");
+        measurementDirty = true;
+    }
+    if (!hud->initialized
+        || hud->rendererStats.uploadedBytes != rendererStats->uploadedBytes)
+    {
+        UiFormatUnsignedSuffix(hud->uploadText,
+            (uint32_t)(sizeof(hud->uploadText) / sizeof(wchar_t)),
+            (rendererStats->uploadedBytes + 1023u) / 1024u, L" KiB");
+        measurementDirty = true;
+    }
+    if (!hud->initialized
+        || hud->rendererStats.geometryPoolUsedBytes != rendererStats->geometryPoolUsedBytes
+        || hud->rendererStats.geometryPoolCapacityBytes != rendererStats->geometryPoolCapacityBytes)
+    {
+        FormatPair(hud->geometryPoolText,
+            (uint32_t)(sizeof(hud->geometryPoolText) / sizeof(wchar_t)),
+            (rendererStats->geometryPoolUsedBytes + 1023u) / 1024u,
+            rendererStats->geometryPoolCapacityBytes / 1024u, L" KiB");
+        measurementDirty = true;
+    }
+    hud->streamingStats = *streamingStats;
+    hud->rendererStats = *rendererStats;
+
     if (measurementDirty)
     {
         hud->measuredPixelSize = 0;
@@ -112,6 +199,15 @@ static void MeasurePanel(GameHud* hud, const UiContext* ui)
     float labelWidth = UiTextWidth(ui, L"Время");
     labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Режим"));
     labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"FPS"));
+    if (hud->diagnosticsVisible)
+    {
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Очередь"));
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Meshing"));
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Отмена"));
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Draw"));
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"Upload"));
+        labelWidth = Maximum(labelWidth, UiTextWidth(ui, L"GPU mesh"));
+    }
 
     float valueWidth = UiTextWidth(ui, hud->coordinateText[0]);
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->coordinateText[1]));
@@ -119,6 +215,12 @@ static void MeasurePanel(GameHud* hud, const UiContext* ui)
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->framesPerSecondText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->timeText));
     valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->modeText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->meshQueueText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->buildTimeText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->wastedBuildsText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->drawText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->uploadText));
+    valueWidth = Maximum(valueWidth, UiTextWidth(ui, hud->geometryPoolText));
 
     float padding = UiScaled(ui, 12.0f);
     float gap = UiScaled(ui, 18.0f);
@@ -131,17 +233,23 @@ static void MeasurePanel(GameHud* hud, const UiContext* ui)
 void GameHudDraw(GameHud* hud, UiContext* ui,
     World* world, const PlayerController* player,
     GameMode gameMode, uint32_t framesPerSecond, uint32_t timeMinutes,
+    const ChunkStreamingStats* streamingStats,
+    const RendererStats* rendererStats,
+    bool diagnosticsVisible,
     const int64_t cameraBlockPosition[3],
     int32_t viewportWidth, int32_t viewportHeight)
 {
     if (hud == NULL || ui == NULL || world == NULL || player == NULL
+        || streamingStats == NULL || rendererStats == NULL
         || cameraBlockPosition == NULL)
     {
         return;
     }
 
     UpdateTextCache(hud, world, player, gameMode,
-        framesPerSecond, timeMinutes, cameraBlockPosition);
+        framesPerSecond, timeMinutes, streamingStats, rendererStats,
+        diagnosticsVisible,
+        cameraBlockPosition);
 
     if (hud->measuredPixelSize != ui->font.pixelSize)
     {
@@ -156,7 +264,8 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
     float rowAdvance = ui->font.lineHeight + rowGap;
     float panelHeight = padding + ui->font.lineHeight + titleGap
         + dividerHeight + titleGap
-        + rowAdvance * 6.0f - rowGap + padding;
+        + rowAdvance * (hud->diagnosticsVisible ? 12.0f : 6.0f)
+        - rowGap + padding;
 
     float availableWidth = (float)viewportWidth - margin * 2.0f;
     float availableHeight = (float)viewportHeight - margin * 2.0f;
@@ -194,5 +303,20 @@ void GameHudDraw(GameHud* hud, UiContext* ui,
     cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
         L"Время", hud->timeText, rowGap);
     UiLabelValueRow(ui, contentX, contentWidth, cursorY,
-        L"Режим", hud->modeText, 0.0f);
+        L"Режим", hud->modeText,
+        hud->diagnosticsVisible ? rowGap : 0.0f);
+    if (!hud->diagnosticsVisible) return;
+    cursorY += rowAdvance;
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Очередь", hud->meshQueueText, rowGap);
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Meshing", hud->buildTimeText, rowGap);
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Отмена", hud->wastedBuildsText, rowGap);
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Draw", hud->drawText, rowGap);
+    cursorY = UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"Upload", hud->uploadText, rowGap);
+    UiLabelValueRow(ui, contentX, contentWidth, cursorY,
+        L"GPU mesh", hud->geometryPoolText, 0.0f);
 }

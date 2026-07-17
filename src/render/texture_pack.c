@@ -1,5 +1,5 @@
 #include "render/texture_pack.h"
-#include "content/content_format.h"
+#include "render/texture_pack_internal.h"
 #include "content/content_catalog.h"
 
 #include <windows.h>
@@ -305,11 +305,11 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
     return true;
 }
 
-void TexturePackLoadActive(TexturePackData* outPack)
+TexturePackLoadStatus TexturePackLoadActive(TexturePackData* outPack)
 {
     if (outPack == NULL)
     {
-        return;
+        return TEXTURE_PACK_LOAD_IO_ERROR;
     }
     SetFallback(outPack);
 
@@ -317,18 +317,28 @@ void TexturePackLoadActive(TexturePackData* outPack)
         (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
     if (path == NULL)
     {
-        return;
+        return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
     uint32_t directoryLength = 0;
     uint8_t activeName[ACTIVE_NAME_MAX_BYTES];
     uint32_t activeNameLength = 0;
-    bool ready = GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
-        && BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\textures\\active.txt")
-        && ReadActiveName(path, activeName, &activeNameLength)
-        && BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\textures\\");
+    if (!GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
+        || !BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
+            L"\\textures\\active.txt"))
+    {
+        HeapFree(GetProcessHeap(), 0, path);
+        return TEXTURE_PACK_LOAD_IO_ERROR;
+    }
+    DWORD activeAttributes = GetFileAttributesW(path);
+    if (!ReadActiveName(path, activeName, &activeNameLength))
+    {
+        HeapFree(GetProcessHeap(), 0, path);
+        return activeAttributes == INVALID_FILE_ATTRIBUTES
+            ? TEXTURE_PACK_LOAD_NO_ACTIVE_PACK : TEXTURE_PACK_LOAD_INVALID;
+    }
+    bool ready = BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
+        L"\\textures\\");
 
     if (ready)
     {
@@ -346,11 +356,14 @@ void TexturePackLoadActive(TexturePackData* outPack)
             if (LoadLtp(path, &loaded))
             {
                 *outPack = loaded;
+                HeapFree(GetProcessHeap(), 0, path);
+                return TEXTURE_PACK_LOAD_OK;
             }
         }
     }
 
     HeapFree(GetProcessHeap(), 0, path);
+    return ready ? TEXTURE_PACK_LOAD_INVALID : TEXTURE_PACK_LOAD_IO_ERROR;
 }
 
 static bool GetSubresourceFrom(const TexturePackData* pack,
@@ -430,61 +443,6 @@ void TexturePackRelease(TexturePackData* pack)
     pack->normalPixels = NULL;
 }
 
-static bool ReadActiveNameFromDir(const wchar_t* dirPath,
-    uint32_t dirLength, uint8_t outName[ACTIVE_NAME_MAX_BYTES],
-    uint32_t* outLength)
-{
-    if (dirLength + 11u >= PATH_CAPACITY_CHARS)
-    {
-        return false;
-    }
-    // dirPath уже указывает на достаточно большой буфер (PATH_CAPACITY_CHARS),
-    // но он const. Копируем в не-const буфер из кучи.
-    wchar_t* activePath = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (activePath == NULL)
-    {
-        return false;
-    }
-    for (uint32_t i = 0; i < dirLength; ++i)
-    {
-        activePath[i] = dirPath[i];
-    }
-    memcpy(activePath + dirLength, L"\\active.txt", 12 * sizeof(wchar_t));
-    bool result = ReadActiveName(activePath, outName, outLength);
-    HeapFree(GetProcessHeap(), 0, activePath);
-    return result;
-}
-
-static bool IsActivePack(const wchar_t* dirPath, uint32_t dirLength,
-    const wchar_t* fileName)
-{
-    uint8_t activeName[ACTIVE_NAME_MAX_BYTES];
-    uint32_t activeLength = 0;
-    if (!ReadActiveNameFromDir(dirPath, dirLength, activeName, &activeLength))
-    {
-        // Если active.txt нет/бит — сравнивать не с чем; считаем все равными.
-        return false;
-    }
-
-    uint32_t nameLength = 0;
-    while (fileName[nameLength] != L'\0') ++nameLength;
-
-    if (nameLength != activeLength)
-    {
-        return false;
-    }
-    // activeName хранится как ASCII; fileName — wchar_t.
-    for (uint32_t i = 0; i < nameLength; ++i)
-    {
-        if ((wchar_t)activeName[i] != fileName[i])
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool TexturePackEnumerate(TexturePackList* outList)
 {
     if (outList == NULL)
@@ -494,118 +452,39 @@ bool TexturePackEnumerate(TexturePackList* outList)
     outList->entries = NULL;
     outList->count = 0;
 
-    wchar_t* pathBuf = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (pathBuf == NULL)
+    LaiueContentList contentList;
+    if (!LaiueContentEnumerate(
+            LAIUE_CONTENT_TEXTURE_PACK, &contentList))
     {
         return false;
     }
-
-    uint32_t directoryLength = 0;
-    if (!GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength)
-        || !BuildPath(pathBuf, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\textures\\"))
+    if (contentList.count == 0)
     {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-
-    uint32_t dirLen = directoryLength + LiteralLength(L"\\textures\\");
-
-    // Создаём шаблон поиска: "<dir>*.*" — фильтруем расширение в цикле
-    pathBuf[dirLen] = L'*';
-    pathBuf[dirLen + 1] = L'\0';
-
-    WIN32_FIND_DATAW findData;
-    HANDLE findHandle = FindFirstFileW(pathBuf, &findData);
-    if (findHandle == INVALID_HANDLE_VALUE)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return true; // нет файлов — не ошибка
-    }
-
-    // Считаем количество
-    uint32_t capacity = 0;
-    do
-    {
-        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-        {
-            continue;
-        }
-        if (LaiueContentNameMatches(
-                LAIUE_CONTENT_TEXTURE_PACK, findData.cFileName))
-        {
-            ++capacity;
-        }
-    }
-    while (FindNextFileW(findHandle, &findData));
-
-    if (capacity == 0)
-    {
-        FindClose(findHandle);
-        HeapFree(GetProcessHeap(), 0, pathBuf);
+        LaiueContentListRelease(&contentList);
         return true;
     }
-
     outList->entries = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)capacity * sizeof(TexturePackEntry));
+        (size_t)contentList.count * sizeof(TexturePackEntry));
     if (outList->entries == NULL)
     {
-        FindClose(findHandle);
-        HeapFree(GetProcessHeap(), 0, pathBuf);
+        LaiueContentListRelease(&contentList);
         return false;
     }
-
-    // Повторный проход для заполнения
-    FindClose(findHandle);
-    findHandle = FindFirstFileW(pathBuf, &findData);
-    if (findHandle == INVALID_HANDLE_VALUE)
+    for (uint32_t index = 0; index < contentList.count; ++index)
     {
-        HeapFree(GetProcessHeap(), 0, outList->entries);
-        outList->entries = NULL;
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
+        uint32_t length = 0;
+        while (contentList.entries[index].name[length] != L'\0'
+            && length + 1u < TEXTURE_PACK_NAME_MAX)
+        {
+            outList->entries[index].name[length] =
+                contentList.entries[index].name[length];
+            ++length;
+        }
+        outList->entries[index].name[length] = L'\0';
+        outList->entries[index].active = contentList.entries[index].active;
     }
-
-    // Восстанавливаем базовый путь (без *.ltp)
-    pathBuf[dirLen] = L'\0';
-
-    uint32_t index = 0;
-    do
-    {
-        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-        {
-            continue;
-        }
-        if (!LaiueContentNameMatches(
-                LAIUE_CONTENT_TEXTURE_PACK, findData.cFileName))
-        {
-            continue;
-        }
-        uint32_t nameLen = 0;
-        while (findData.cFileName[nameLen] != L'\0') ++nameLen;
-
-        if (index >= capacity)
-        {
-            break;
-        }
-        nameLen = nameLen < TEXTURE_PACK_NAME_MAX - 1
-            ? nameLen : TEXTURE_PACK_NAME_MAX - 1;
-        for (uint32_t ci = 0; ci < nameLen; ++ci)
-        {
-            outList->entries[index].name[ci] = findData.cFileName[ci];
-        }
-        outList->entries[index].name[nameLen] = L'\0';
-
-        outList->entries[index].active = IsActivePack(
-            pathBuf, directoryLength, outList->entries[index].name);
-        ++index;
-    }
-    while (FindNextFileW(findHandle, &findData));
-
-    FindClose(findHandle);
-    HeapFree(GetProcessHeap(), 0, pathBuf);
-    outList->count = index;
+    outList->count = contentList.count;
+    LaiueContentListRelease(&contentList);
     return true;
 }
 

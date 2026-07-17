@@ -10,6 +10,27 @@
 // мира: построение геометрии из вокселей — обязанность модуля mesher.
 typedef struct Renderer Renderer;
 
+typedef struct RendererStats
+{
+    uint64_t drawCalls;
+    uint64_t drawnQuads;
+    uint64_t uploadedBytes;
+    uint64_t geometryPoolUsedBytes;
+    uint64_t geometryPoolCapacityBytes;
+    uint32_t scenePasses;
+} RendererStats;
+
+typedef enum RendererContentStatus
+{
+    RENDERER_CONTENT_NOT_ATTEMPTED = 0,
+    RENDERER_CONTENT_OK,
+    RENDERER_CONTENT_NO_ACTIVE,
+    RENDERER_CONTENT_INVALID,
+    RENDERER_CONTENT_IO_ERROR,
+    RENDERER_CONTENT_GPU_ERROR,
+    RENDERER_CONTENT_ACTIVATION_ERROR,
+} RendererContentStatus;
+
 // GPU-резидентный меш: квады один раз копируются в общий DEFAULT-буфер
 // (суб-аллокация, без 64-КиБ ресурса на меш) и рисуются vertex pulling'ом
 // без вершинных и индексных буферов.
@@ -82,6 +103,11 @@ LAIUE_RENDER_API void RendererBeginScenePass(Renderer* renderer, uint32_t passIn
 // Возвращает false, если DXGI не смог показать кадр.
 LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 
+// Статистика последнего успешно показанного кадра. Не синхронизирует CPU
+// с GPU и потому подходит для HUD и внешнего профилировщика.
+LAIUE_RENDER_API void RendererGetStats(const Renderer* renderer,
+    RendererStats* outStats);
+
 LAIUE_RENDER_API void RendererSetVerticalSync(Renderer* renderer, bool enabled);
 LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
 
@@ -133,6 +159,8 @@ LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t 
 
 // Перезагружает текстурный пак из active.txt (вызывать вне BeginFrame/EndFrame).
 LAIUE_RENDER_API bool RendererReloadTexturePack(Renderer* renderer);
+LAIUE_RENDER_API RendererContentStatus RendererGetTexturePackLoadStatus(
+    const Renderer* renderer);
 
 // Настройки отладки рендера.
 LAIUE_RENDER_API void RendererSetWireframe(Renderer* renderer, bool enabled);

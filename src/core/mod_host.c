@@ -1,4 +1,5 @@
 #include "core/mod_host.h"
+#include "core/camera.h"
 #include "core/chunk_streaming.h"
 #include "core/mods.h"
 #include "core/save_game.h"

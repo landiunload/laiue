@@ -15,6 +15,18 @@ include(LaiueToolchain)
 include(LaiueModule)
 include(LaiueShader)
 
+find_program(LAIUE_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+if(LAIUE_POWERSHELL_EXECUTABLE)
+    add_custom_target(laiue_architecture_check
+        COMMAND "${LAIUE_POWERSHELL_EXECUTABLE}" -NoProfile -File
+            "${PROJECT_SOURCE_DIR}/tools/check_architecture.ps1"
+        COMMENT "Проверка направлений include-зависимостей"
+        VERBATIM
+    )
+else()
+    message(WARNING "PowerShell не найден: проверка архитектурных границ отключена")
+endif()
+
 # Launcher и все загружаемые им DLL должны лежать рядом. Генераторное
 # выражение одновременно разделяет Debug/Release и не даёт Visual Studio
 # добавить к пути ещё один каталог конфигурации.
@@ -59,6 +71,9 @@ add_custom_target(laiue_content_files
     COMMENT "Подготовка ресурсов, модов, шейдеров, данных и текстур"
 )
 add_dependencies(laiue laiue_core laiue_content_files)
+if(TARGET laiue_architecture_check)
+    add_dependencies(laiue laiue_architecture_check)
+endif()
 target_link_options(laiue PRIVATE
     /ENTRY:EntryPoint
     /STACK:262144,4096

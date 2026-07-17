@@ -20,6 +20,18 @@ typedef struct ShaderPackList
     uint32_t count;
 } ShaderPackList;
 
+typedef enum ShaderPackLoadStatus
+{
+    SHADER_PACK_LOAD_NOT_ATTEMPTED = 0,
+    SHADER_PACK_LOAD_OK,
+    SHADER_PACK_LOAD_NO_ACTIVE_PACK,
+    SHADER_PACK_LOAD_INVALID_MANIFEST,
+    SHADER_PACK_LOAD_EMPTY,
+    SHADER_PACK_LOAD_IO_ERROR,
+    SHADER_PACK_LOAD_ACTIVATION_ERROR,
+    SHADER_PACK_LOAD_PIPELINE_ERROR,
+} ShaderPackLoadStatus;
+
 LAIUE_RENDER_API bool ShaderPackEnumerate(ShaderPackList* outList);
 LAIUE_RENDER_API void ShaderPackListRelease(ShaderPackList* list);
 LAIUE_RENDER_API bool ShaderPackActivate(const wchar_t* name);
@@ -37,4 +49,5 @@ LAIUE_RENDER_API bool ShaderPackLoadActiveBytecode(
     void** outPanoramaVS, uint32_t* outPanoramaVSLength,
     void** outPanoramaPS, uint32_t* outPanoramaPSLength,
     void** outUIVS, uint32_t* outUIVSLength,
-    void** outUIPS, uint32_t* outUIPSLength);
+    void** outUIPS, uint32_t* outUIPSLength,
+    ShaderPackLoadStatus* outStatus);

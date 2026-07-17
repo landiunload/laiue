@@ -1,5 +1,6 @@
 #include "api.h"
 #include "core/application_config.h"
+#include "core/camera.h"
 #include "core/chunk_streaming.h"
 #include "core/game_hud.h"
 #include "core/game_time.h"
@@ -10,9 +11,9 @@
 #include "core/pause_menu.h"
 #include "core/save_game.h"
 #include "render/shader_pack.h"
+#include "render/texture_pack.h"
 #include "core/player_command_mapper.h"
 #include "core/ui.h"
-#include "game/camera.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/player_controller.h"
 #include "interaction/voxel_interaction.h"
@@ -42,6 +43,7 @@ typedef struct ApplicationState
     double fpsSampleStartSeconds;
     uint32_t fpsFrameCount;
     uint32_t framesPerSecond;
+    bool showDiagnostics;
 
     GameSettings settings;
     PanoramaCache panoramaCache;
@@ -339,6 +341,11 @@ static void OnFrame(void* userData)
         InputConsumeKeyPress(application->input, INPUT_KEY_ESCAPE);
     bool menuOpen = application->menu.screen != PAUSE_MENU_CLOSED;
 
+    if (!menuOpen && InputConsumeKeyPress(application->input, INPUT_KEY_F3))
+    {
+        application->showDiagnostics = !application->showDiagnostics;
+    }
+
     if (escapePressed && !menuOpen)
     {
         // Открытие меню: курсор освобождается, режим взгляда запоминается.
@@ -522,10 +529,17 @@ static void OnFrame(void* userData)
         {
             uint32_t timeMinutes = (uint32_t)(
                 application->settings.timeOfDayHours * 60.0f) % 1440u;
+            ChunkStreamingStats streamingStats;
+            RendererStats rendererStats;
+            ChunkStreamingGetStats(application->chunkStreaming,
+                &streamingStats);
+            RendererGetStats(application->renderer, &rendererStats);
             GameHudDraw(&application->hud, &application->ui,
                 application->world, &application->player,
                 application->gameMode, application->framesPerSecond,
-                timeMinutes, cameraBlockPosition,
+                timeMinutes, &streamingStats, &rendererStats,
+                application->showDiagnostics,
+                cameraBlockPosition,
                 application->windowWidth, application->windowHeight);
         }
     }
@@ -699,20 +713,32 @@ LAIUE_CORE_API void Start(void)
     application->settings.wireframe = false;
     application->settings.gamma = 100;
 
+    application->menu.texturePackStatus =
+        RendererGetTexturePackLoadStatus(renderer);
+    if (application->menu.texturePackStatus == RENDERER_CONTENT_INVALID
+        || application->menu.texturePackStatus == RENDERER_CONTENT_IO_ERROR)
+    {
+        TexturePackActivate(NULL);
+        RendererReloadTexturePack(renderer);
+    }
+
     // Активный шейдерпак применяется сразу при старте, а не только
     // после ручного нажатия «Применить» в меню.
     {
         void* shaders[6];
         uint32_t lengths[6];
+        ShaderPackLoadStatus shaderStatus;
         if (ShaderPackLoadActiveBytecode(
                 &shaders[0], &lengths[0], &shaders[1], &lengths[1],
                 &shaders[2], &lengths[2], &shaders[3], &lengths[3],
-                &shaders[4], &lengths[4], &shaders[5], &lengths[5]))
+                &shaders[4], &lengths[4], &shaders[5], &lengths[5],
+                &shaderStatus))
         {
-            RendererReloadShaders(renderer,
+            application->menu.shaderPackStatus = RendererReloadShaders(renderer,
                 shaders[0], lengths[0], shaders[1], lengths[1],
                 shaders[2], lengths[2], shaders[3], lengths[3],
-                shaders[4], lengths[4], shaders[5], lengths[5]);
+                shaders[4], lengths[4], shaders[5], lengths[5])
+                ? SHADER_PACK_LOAD_OK : SHADER_PACK_LOAD_PIPELINE_ERROR;
             for (int32_t shaderIndex = 0; shaderIndex < 6; ++shaderIndex)
             {
                 if (shaders[shaderIndex] != NULL)
@@ -720,6 +746,11 @@ LAIUE_CORE_API void Start(void)
                     HeapFree(GetProcessHeap(), 0, shaders[shaderIndex]);
                 }
             }
+        }
+        else if (shaderStatus != SHADER_PACK_LOAD_NO_ACTIVE_PACK)
+        {
+            application->menu.shaderPackStatus = shaderStatus;
+            ShaderPackActivate(NULL);
         }
     }
     application->settings.selectedTexturePack = -1;

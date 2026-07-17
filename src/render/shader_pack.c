@@ -1,5 +1,4 @@
 #include "render/shader_pack.h"
-#include "content/content_format.h"
 #include "content/content_catalog.h"
 
 #include <windows.h>
@@ -24,6 +23,26 @@ static bool BytesEqual(const uint8_t* left, const char* right, uint32_t count)
         if (left[i] != (uint8_t)right[i]) return false;
     }
     return true;
+}
+
+static bool HasExactLine(const uint8_t* data, uint32_t length,
+    const char* expected, uint32_t expectedLength, bool firstLineOnly)
+{
+    uint32_t start = 0;
+    while (start < length)
+    {
+        uint32_t end = start;
+        while (end < length && data[end] != '\n' && data[end] != '\r') ++end;
+        if (end - start == expectedLength
+            && BytesEqual(data + start, expected, expectedLength))
+        {
+            return true;
+        }
+        if (firstLineOnly) return false;
+        while (end < length && (data[end] == '\n' || data[end] == '\r')) ++end;
+        start = end;
+    }
+    return false;
 }
 
 static bool BuildPath(wchar_t* path, uint32_t capacity,
@@ -71,153 +90,40 @@ bool ShaderPackEnumerate(ShaderPackList* outList)
     outList->entries = NULL;
     outList->count = 0;
 
-    wchar_t* basePath = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (basePath == NULL)
+    LaiueContentList contentList;
+    if (!LaiueContentEnumerate(LAIUE_CONTENT_SHADER_PACK, &contentList))
     {
         return false;
     }
-
-    uint32_t directoryLength = 0;
-    if (!GetExecutableDirectory(basePath, PATH_CAPACITY_CHARS, &directoryLength)
-        || !BuildPath(basePath, PATH_CAPACITY_CHARS, directoryLength,
-            SHADER_PACK_DIR))
-    {
-        HeapFree(GetProcessHeap(), 0, basePath);
-        return false;
-    }
-
-    uint32_t dirPrefixLen = directoryLength + LiteralLength(SHADER_PACK_DIR);
-
-    // Строим шаблон поиска "<dir>*" для FindFirstFile
-    basePath[dirPrefixLen] = L'*';
-    basePath[dirPrefixLen + 1] = L'\0';
-
-    // Считаем поддиректории
-    uint32_t subdirCount = 1; // всегда есть "Default"
-    WIN32_FIND_DATAW findData;
-    HANDLE findHandle = FindFirstFileW(basePath, &findData);
-    if (findHandle != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-                && findData.cFileName[0] != L'.'
-                && LaiueContentNameMatches(
-                    LAIUE_CONTENT_SHADER_PACK, findData.cFileName))
-            {
-                ++subdirCount;
-            }
-        }
-        while (FindNextFileW(findHandle, &findData));
-        FindClose(findHandle);
-    }
-
     outList->entries = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)subdirCount * sizeof(ShaderPackEntry));
+        (size_t)(contentList.count + 1u) * sizeof(ShaderPackEntry));
     if (outList->entries == NULL)
     {
-        HeapFree(GetProcessHeap(), 0, basePath);
+        LaiueContentListRelease(&contentList);
         return false;
     }
-
-    // Заполняем: сначала "Default" (built-in)
-    uint32_t index = 0;
-    memcpy(outList->entries[index].name, L"Default", 8 * sizeof(wchar_t));
-    outList->entries[index].active = true;
-    ++index;
-
-    // Восстанавливаем путь (убираем * в конце)
-    basePath[dirPrefixLen] = L'\0';
-
-    // Читаем active.txt
-    uint8_t activeName[64];
-    uint32_t activeNameLen = 0;
-    memcpy(basePath + dirPrefixLen, L"active.txt", 12 * sizeof(wchar_t));
-
-    HANDLE activeFile = CreateFileW(basePath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (activeFile != INVALID_HANDLE_VALUE)
+    memcpy(outList->entries[0].name, L"Default", 8u * sizeof(wchar_t));
+    bool hasActive = false;
+    for (uint32_t sourceIndex = 0;
+        sourceIndex < contentList.count; ++sourceIndex)
     {
-        LARGE_INTEGER size;
-        if (GetFileSizeEx(activeFile, &size)
-            && size.QuadPart > 0
-            && (LONGLONG)size.QuadPart <= (LONGLONG)sizeof(activeName))
+        uint32_t destinationIndex = sourceIndex + 1u;
+        uint32_t length = 0;
+        while (contentList.entries[sourceIndex].name[length] != L'\0'
+            && length + 1u < SHADER_PACK_NAME_MAX)
         {
-            DWORD read = 0;
-            if (ReadFile(activeFile, activeName, (DWORD)size.QuadPart, &read, NULL))
-            {
-                uint32_t len = (uint32_t)size.QuadPart;
-                while (len > 0 && (activeName[len - 1] == ' '
-                    || activeName[len - 1] == '\n' || activeName[len - 1] == '\r'))
-                {
-                    --len;
-                }
-                activeName[len] = '\0';
-                activeNameLen = len;
-            }
+            outList->entries[destinationIndex].name[length] =
+                contentList.entries[sourceIndex].name[length];
+            ++length;
         }
-        CloseHandle(activeFile);
+        outList->entries[destinationIndex].name[length] = L'\0';
+        outList->entries[destinationIndex].active =
+            contentList.entries[sourceIndex].active;
+        hasActive = hasActive || contentList.entries[sourceIndex].active;
     }
-
-    if (activeNameLen > 0)
-    {
-        outList->entries[0].active = false;
-    }
-
-    // Заполняем поддиректории (восстанавливаем шаблон поиска)
-    basePath[dirPrefixLen] = L'*';
-    basePath[dirPrefixLen + 1] = L'\0';
-
-    findHandle = FindFirstFileW(basePath, &findData);
-    if (findHandle != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
-                || findData.cFileName[0] == L'.'
-                || !LaiueContentNameMatches(
-                    LAIUE_CONTENT_SHADER_PACK, findData.cFileName))
-            {
-                continue;
-            }
-            if (index >= subdirCount)
-            {
-                break;
-            }
-
-            uint32_t nameLen = 0;
-            while (findData.cFileName[nameLen] != L'\0'
-                && nameLen < SHADER_PACK_NAME_MAX - 1)
-            {
-                outList->entries[index].name[nameLen] = findData.cFileName[nameLen];
-                ++nameLen;
-            }
-            outList->entries[index].name[nameLen] = L'\0';
-            outList->entries[index].active = false;
-
-            if (activeNameLen > 0 && nameLen == activeNameLen)
-            {
-                bool match = true;
-                for (uint32_t i = 0; i < nameLen; ++i)
-                {
-                    if ((wchar_t)activeName[i] != outList->entries[index].name[i])
-                    {
-                        match = false;
-                        break;
-                    }
-                }
-                outList->entries[index].active = match;
-            }
-            ++index;
-        }
-        while (FindNextFileW(findHandle, &findData));
-        FindClose(findHandle);
-    }
-
-    HeapFree(GetProcessHeap(), 0, basePath);
-    outList->count = index;
+    outList->entries[0].active = !hasActive;
+    outList->count = contentList.count + 1u;
+    LaiueContentListRelease(&contentList);
     return true;
 }
 
@@ -334,17 +240,10 @@ static bool IsCompatibleManifest(const wchar_t* fullPath)
 
     static const char header[] = "LAIUE SHADER 1";
     static const char contract[] = "contract = 1";
-    bool hasHeader = length >= sizeof(header) - 1u
-        && BytesEqual(data, header, sizeof(header) - 1u);
-    bool hasContract = false;
-    for (uint32_t i = 0; i + sizeof(contract) - 1u <= length; ++i)
-    {
-        if (BytesEqual(data + i, contract, sizeof(contract) - 1u))
-        {
-            hasContract = true;
-            break;
-        }
-    }
+    bool hasHeader = HasExactLine(data, length,
+        header, sizeof(header) - 1u, true);
+    bool hasContract = HasExactLine(data, length,
+        contract, sizeof(contract) - 1u, false);
     HeapFree(GetProcessHeap(), 0, data);
     return hasHeader && hasContract;
 }
@@ -355,8 +254,10 @@ bool ShaderPackLoadActiveBytecode(
     void** outPanoramaVS, uint32_t* outPanoramaVSLength,
     void** outPanoramaPS, uint32_t* outPanoramaPSLength,
     void** outUIVS, uint32_t* outUIVSLength,
-    void** outUIPS, uint32_t* outUIPSLength)
+    void** outUIPS, uint32_t* outUIPSLength,
+    ShaderPackLoadStatus* outStatus)
 {
+    if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_IO_ERROR;
     // Инициализируем все выходные параметры в NULL/0
     *outChunkVS = NULL; *outChunkVSLength = 0;
     *outChunkPS = NULL; *outChunkPSLength = 0;
@@ -397,6 +298,7 @@ bool ShaderPackLoadActiveBytecode(
     uint32_t activeNameLen = 0;
     if (!ReadActivePackName(pathBuf, dirPrefixLen, activeName, &activeNameLen, sizeof(activeName)))
     {
+        if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_NO_ACTIVE_PACK;
         HeapFree(GetProcessHeap(), 0, pathBuf);
         return false; // нет активного пака — используем встроенные
     }
@@ -413,6 +315,7 @@ bool ShaderPackLoadActiveBytecode(
     if (!BuildPath(pathBuf, PATH_CAPACITY_CHARS, packDirLen, L"pack.lm")
         || !IsCompatibleManifest(pathBuf))
     {
+        if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_INVALID_MANIFEST;
         HeapFree(GetProcessHeap(), 0, pathBuf);
         return false;
     }
@@ -460,6 +363,7 @@ bool ShaderPackLoadActiveBytecode(
 
     if (!anyLoaded)
     {
+        if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_EMPTY;
         for (uint32_t i = 0; i < 6; ++i)
         {
             if (*outPtrs[i] != NULL)
@@ -474,5 +378,6 @@ bool ShaderPackLoadActiveBytecode(
     }
 
     HeapFree(GetProcessHeap(), 0, pathBuf);
+    if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_OK;
     return true;
 }

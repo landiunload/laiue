@@ -1,4 +1,4 @@
-#include "game/camera.h"
+#include "core/camera.h"
 #include "core/math.h"
 
 #define PITCH_LIMIT 1.570796f

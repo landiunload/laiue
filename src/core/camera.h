@@ -1,0 +1,22 @@
+#pragma once
+
+#include "game/camera.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+void CameraInit(Camera* camera, double x, double y, double z,
+    float yaw, float pitch);
+
+void CameraUpdate(Camera* camera, float deltaSeconds,
+    bool keyForward, bool keyLeft, bool keyBackward, bool keyRight, bool keyUp,
+    int32_t mouseDeltaX, int32_t mouseDeltaY,
+    float speed, float mouseSensitivity);
+
+void CameraGetForwardVector(const Camera* camera, float outForward[3]);
+
+// Матрица вида для позиции глаза относительно начала координат рендера.
+void CameraGetViewMatrix(const Camera* camera,
+    const float relativeEyePosition[3], float outMatrix[16]);
+void CameraGetProjectionMatrix(float aspectRatio, float fovRadians,
+    float nearPlane, float farPlane, float outMatrix[16]);

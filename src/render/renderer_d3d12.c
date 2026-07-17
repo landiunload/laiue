@@ -11,7 +11,7 @@
 #include "render/generated/panorama_ps.h"
 #include "render/generated/ui_vs.h"
 #include "render/generated/ui_ps.h"
-#include "render/texture_pack.h"
+#include "render/texture_pack_internal.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -56,6 +56,7 @@
 // уничтожается, только когда GPU прошёл кадры, которые могли его читать.
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
+#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 
 typedef struct FreeRange
 {
@@ -78,9 +79,11 @@ typedef struct GeometryPoolBlock
 typedef struct PendingUpload
 {
     ID3D12Resource* staging;
+    uint32_t sourceOffset;
     uint32_t blockIndex;
     uint32_t destinationOffset;
     uint32_t sizeBytes;
+    bool ownsStaging;
 } PendingUpload;
 
 typedef struct DeferredResourceRelease
@@ -178,6 +181,9 @@ struct Renderer
 
     PendingUpload              pendingUploads[MAX_PENDING_UPLOADS];
     uint32_t                   pendingUploadCount;
+    ID3D12Resource*            meshUploadBuffers[FRAME_COUNT];
+    uint8_t*                   meshUploadMapped[FRAME_COUNT];
+    uint32_t                   meshUploadOffsets[FRAME_COUNT];
 
     DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredResourceHead;
@@ -186,6 +192,10 @@ struct Renderer
     DeferredRangeRelease       deferredRanges[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredRangeHead;
     uint32_t                   deferredRangeCount;
+
+    RendererStats              currentStats;
+    RendererStats              lastStats;
+    RendererContentStatus     texturePackLoadStatus;
 };
 
 static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
@@ -650,7 +660,18 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
 static bool CreateBlockTexture(Renderer* renderer)
 {
     TexturePackData pack;
-    TexturePackLoadActive(&pack);
+    TexturePackLoadStatus loadStatus = TexturePackLoadActive(&pack);
+    switch (loadStatus)
+    {
+        case TEXTURE_PACK_LOAD_OK:
+            renderer->texturePackLoadStatus = RENDERER_CONTENT_OK; break;
+        case TEXTURE_PACK_LOAD_NO_ACTIVE_PACK:
+            renderer->texturePackLoadStatus = RENDERER_CONTENT_NO_ACTIVE; break;
+        case TEXTURE_PACK_LOAD_INVALID:
+            renderer->texturePackLoadStatus = RENDERER_CONTENT_INVALID; break;
+        default:
+            renderer->texturePackLoadStatus = RENDERER_CONTENT_IO_ERROR; break;
+    }
     if (pack.pixels == NULL)
     {
         return false;
@@ -693,6 +714,8 @@ static bool CreateBlockTexture(Renderer* renderer)
     }
 
     renderer->blockTextureUploadPending = succeeded;
+    if (!succeeded)
+        renderer->texturePackLoadStatus = RENDERER_CONTENT_GPU_ERROR;
     TexturePackRelease(&pack);
     return succeeded;
 }
@@ -897,6 +920,38 @@ static bool CreateUiQuadBuffers(Renderer* renderer)
         D3D12_RANGE emptyRange = { 0, 0 };
         if (FAILED(ID3D12Resource_Map(renderer->uiQuadBuffers[i], 0, &emptyRange,
             (void**)&renderer->uiQuadMapped[i])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool CreateMeshUploadBuffers(Renderer* renderer)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = MESH_UPLOAD_BYTES_PER_FRAME;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&renderer->meshUploadBuffers[i])))
+        {
+            return false;
+        }
+        D3D12_RANGE emptyRange = { 0, 0 };
+        if (FAILED(ID3D12Resource_Map(renderer->meshUploadBuffers[i], 0,
+            &emptyRange, (void**)&renderer->meshUploadMapped[i])))
         {
             return false;
         }
@@ -1263,6 +1318,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (!CreateUiRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateUiPipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateUiQuadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateMeshUploadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateBlockTexture(renderer)) { RendererDestroy(renderer); return NULL; }
     if (!CreateDepthBuffer(renderer, width, height)) { RendererDestroy(renderer); return NULL; }
 
@@ -1306,7 +1362,8 @@ void RendererDestroy(Renderer* renderer)
 
     for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
     {
-        ID3D12Resource_Release(renderer->pendingUploads[i].staging);
+        if (renderer->pendingUploads[i].ownsStaging)
+            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
     }
 
     for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
@@ -1333,6 +1390,12 @@ void RendererDestroy(Renderer* renderer)
         if (renderer->uiQuadBuffers[i] != NULL)
         {
             ID3D12Resource_Release(renderer->uiQuadBuffers[i]);
+        }
+        if (renderer->meshUploadBuffers[i] != NULL)
+        {
+            if (renderer->meshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
         }
     }
     if (renderer->fontTextureUpload != NULL) ID3D12Resource_Release(renderer->fontTextureUpload);
@@ -1375,7 +1438,9 @@ void RendererDestroy(Renderer* renderer)
 
 RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
 {
-    if (quadCount == 0 || renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
+    if (quadCount == 0
+        || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad)
+        || renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
     {
         return NULL;
     }
@@ -1389,43 +1454,55 @@ RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uin
         return NULL;
     }
 
-    // Временный staging-буфер: живёт до исполнения копирования GPU,
-    // освобождается отложенно.
-    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-
-    D3D12_RESOURCE_DESC description;
-    memset(&description, 0, sizeof(description));
-    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    description.Width = sizeBytes;
-    description.Height = 1;
-    description.DepthOrArraySize = 1;
-    description.MipLevels = 1;
-    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    description.SampleDesc.Count = 1;
-
     ID3D12Resource* staging = NULL;
-    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE,
-        &description, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&staging)))
+    uint32_t sourceOffset = (renderer->meshUploadOffsets[renderer->frameIndex] + 15u) & ~15u;
+    bool ownsStaging = sourceOffset > MESH_UPLOAD_BYTES_PER_FRAME
+        || sizeBytes > MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
+    if (!ownsStaging)
     {
-        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
-        return NULL;
+        staging = renderer->meshUploadBuffers[renderer->frameIndex];
+        memcpy(renderer->meshUploadMapped[renderer->frameIndex] + sourceOffset,
+            quads, sizeBytes);
+        renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset + sizeBytes;
     }
-
-    D3D12_RANGE emptyRange = { 0, 0 };
-    void* mapped = NULL;
-    if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
+    else
     {
-        ID3D12Resource_Release(staging);
-        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
-        return NULL;
+        D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC description;
+        memset(&description, 0, sizeof(description));
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = sizeBytes;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        description.SampleDesc.Count = 1;
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&staging)))
+        {
+            PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+            return NULL;
+        }
+        D3D12_RANGE emptyRange = { 0, 0 };
+        void* mapped = NULL;
+        if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
+        {
+            ID3D12Resource_Release(staging);
+            PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+            return NULL;
+        }
+        memcpy(mapped, quads, sizeBytes);
+        ID3D12Resource_Unmap(staging, 0, NULL);
+        sourceOffset = 0;
     }
-    memcpy(mapped, quads, sizeBytes);
-    ID3D12Resource_Unmap(staging, 0, NULL);
 
     RendererMesh* mesh = HeapAlloc(GetProcessHeap(), 0, sizeof(*mesh));
     if (mesh == NULL)
     {
-        ID3D12Resource_Release(staging);
+        if (ownsStaging) ID3D12Resource_Release(staging);
+        else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
         PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
         return NULL;
     }
@@ -1437,9 +1514,11 @@ RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uin
 
     PendingUpload* upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
     upload->staging = staging;
+    upload->sourceOffset = sourceOffset;
     upload->blockIndex = blockIndex;
     upload->destinationOffset = offsetBytes;
     upload->sizeBytes = sizeBytes;
+    upload->ownsStaging = ownsStaging;
 
     return mesh;
 }
@@ -1477,6 +1556,8 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
         ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += mesh->quadCount;
 }
 
 static void RecordTextureArrayUpload(Renderer* renderer,
@@ -1556,8 +1637,10 @@ static void RecordPendingUploads(Renderer* renderer)
         PendingUpload* upload = &renderer->pendingUploads[i];
         GeometryPoolBlock* block = &renderer->poolBlocks[upload->blockIndex];
         ID3D12GraphicsCommandList_CopyBufferRegion(renderer->commandList,
-            block->buffer, upload->destinationOffset, upload->staging, 0, upload->sizeBytes);
-        DeferResourceRelease(renderer, upload->staging);
+            block->buffer, upload->destinationOffset, upload->staging,
+            upload->sourceOffset, upload->sizeBytes);
+        if (upload->ownsStaging) DeferResourceRelease(renderer, upload->staging);
+        renderer->currentStats.uploadedBytes += upload->sizeBytes;
     }
 
     // Обратно в состояние чтения вершинным шейдером.
@@ -1708,6 +1791,8 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
 
     renderer->frame = *frame;
     renderer->uiQuadCount = 0;
+    memset(&renderer->currentStats, 0, sizeof(renderer->currentStats));
+    renderer->currentStats.scenePasses = frame->passCount;
 
     if (renderer->frame.panorama
         && !EnsureCubeResources(renderer, renderer->frame.faceResolution))
@@ -1855,6 +1940,7 @@ bool RendererEndFrame(Renderer* renderer)
             1, SrvGpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
 
         ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, 3, 1, 0, 0);
+        renderer->currentStats.drawCalls++;
 
         D3D12_RESOURCE_BARRIER toRenderTarget = MakeTransitionBarrier(renderer->cubeColor,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1888,6 +1974,7 @@ bool RendererEndFrame(Renderer* renderer)
 
         ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
             renderer->uiQuadCount * 6, 1, 0, 0);
+        renderer->currentStats.drawCalls++;
     }
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
@@ -1924,7 +2011,10 @@ bool RendererEndFrame(Renderer* renderer)
         return false;
     }
 
+    renderer->lastStats = renderer->currentStats;
+
     bool waitedForFence = MoveToNextFrame(renderer);
+    renderer->meshUploadOffsets[renderer->frameIndex] = 0;
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
         // Без vsync Present не является точкой ожидания. Отдаём остаток
@@ -1932,6 +2022,28 @@ bool RendererEndFrame(Renderer* renderer)
         SwitchToThread();
     }
     return true;
+}
+
+void RendererGetStats(const Renderer* renderer, RendererStats* outStats)
+{
+    if (renderer == NULL || outStats == NULL) return;
+
+    *outStats = renderer->lastStats;
+    uint64_t capacity = 0;
+    uint64_t freeBytes = 0;
+    for (uint32_t blockIndex = 0;
+        blockIndex < renderer->poolBlockCount; ++blockIndex)
+    {
+        const GeometryPoolBlock* block = &renderer->poolBlocks[blockIndex];
+        capacity += block->totalBytes;
+        for (uint32_t rangeIndex = 0;
+            rangeIndex < block->freeRangeCount; ++rangeIndex)
+        {
+            freeBytes += block->freeRanges[rangeIndex].size;
+        }
+    }
+    outStats->geometryPoolCapacityBytes = capacity;
+    outStats->geometryPoolUsedBytes = capacity - freeBytes;
 }
 
 void RendererSetVerticalSync(Renderer* renderer, bool enabled)
@@ -2128,6 +2240,13 @@ bool RendererReloadTexturePack(Renderer* renderer)
     renderer->blockTextureUploadPending = false;
 
     return CreateBlockTexture(renderer);
+}
+
+RendererContentStatus RendererGetTexturePackLoadStatus(
+    const Renderer* renderer)
+{
+    return renderer != NULL ? renderer->texturePackLoadStatus
+        : RENDERER_CONTENT_NOT_ATTEMPTED;
 }
 
 void RendererSetWireframe(Renderer* renderer, bool enabled)

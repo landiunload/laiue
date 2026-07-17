@@ -1,6 +1,6 @@
 #include "core/panorama.h"
+#include "core/camera.h"
 #include "core/math.h"
-#include "game/camera.h"
 
 #include <string.h>
 

@@ -6,6 +6,7 @@
 #include "core/ui.h"
 #include "platform/window.h"
 #include "render/renderer.h"
+#include "render/shader_pack.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,6 +62,8 @@ typedef struct PauseMenu
     int32_t settingsTab;
     float settingsScroll;  // прокрутка контента настроек, px (0 — верх)
     bool saveRequested;    // кнопка «Сохранить мир» (сбрасывает вызывающий)
+    ShaderPackLoadStatus shaderPackStatus;
+    RendererContentStatus texturePackStatus;
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);

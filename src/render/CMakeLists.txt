@@ -20,6 +20,7 @@ laiue_add_module(render
         shader_pack.h
         texture_pack.c
         texture_pack.h
+        texture_pack_internal.h
         chunk_geometry.h
         ../api.h
         "${generated_directory}/chunk_vs.h"

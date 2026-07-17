@@ -334,20 +334,34 @@ static float PackSectionHeight(const UiContext* ui)
 
 static float TexturesTabHeight(const UiContext* ui)
 {
-    return PackSectionHeight(ui);
+    return PackSectionHeight(ui) + ui->font.lineHeight + 6.0f * ui->scale;
 }
 
 static float ShadersTabHeight(const UiContext* ui)
 {
     float s = ui->scale;
     float line = ui->font.lineHeight;
-    return PackSectionHeight(ui)
+    return PackSectionHeight(ui) + line + 6.0f * s
         + 8.0f * s
         + (22.0f * s + 12.0f * s)                      // каркасный режим
         + (line + 6.0f * s) + (20.0f * s + 12.0f * s); // гамма
 }
 
-static float DrawShadersTab(UiContext* ui, GameSettings* settings,
+static const wchar_t* ShaderStatusText(ShaderPackLoadStatus status)
+{
+    switch (status)
+    {
+        case SHADER_PACK_LOAD_OK: return L"Шейдерпак применён";
+        case SHADER_PACK_LOAD_INVALID_MANIFEST: return L"Несовместимый pack.lm";
+        case SHADER_PACK_LOAD_EMPTY: return L"В паке нет шейдеров";
+        case SHADER_PACK_LOAD_ACTIVATION_ERROR: return L"Не удалось выбрать пак";
+        case SHADER_PACK_LOAD_PIPELINE_ERROR: return L"Ошибка создания GPU pipeline";
+        case SHADER_PACK_LOAD_IO_ERROR: return L"Ошибка чтения шейдерпака";
+        default: return L"";
+    }
+}
+
+static float DrawShadersTab(PauseMenu* menu, UiContext* ui, GameSettings* settings,
     Renderer* renderer, float x, float width, float y)
 {
     float s = ui->scale;
@@ -410,15 +424,16 @@ static float DrawShadersTab(UiContext* ui, GameSettings* settings,
                 {
                     void* shaders[6];
                     uint32_t lengths[6];
+                    ShaderPackLoadStatus loadStatus;
                     if (ShaderPackLoadActiveBytecode(
                             &shaders[0], &lengths[0],
                             &shaders[1], &lengths[1],
                             &shaders[2], &lengths[2],
                             &shaders[3], &lengths[3],
                             &shaders[4], &lengths[4],
-                            &shaders[5], &lengths[5]))
+                            &shaders[5], &lengths[5], &loadStatus))
                     {
-                        RendererReloadShaders(renderer,
+                        bool reloaded = RendererReloadShaders(renderer,
                             shaders[0], lengths[0],
                             shaders[1], lengths[1],
                             shaders[2], lengths[2],
@@ -430,13 +445,22 @@ static float DrawShadersTab(UiContext* ui, GameSettings* settings,
                             if (shaders[si] != NULL)
                                 HeapFree(GetProcessHeap(), 0, shaders[si]);
                         }
+                        menu->shaderPackStatus = reloaded
+                            ? SHADER_PACK_LOAD_OK
+                            : SHADER_PACK_LOAD_PIPELINE_ERROR;
                     }
                     else
                     {
+                        menu->shaderPackStatus = loadStatus;
+                        ShaderPackActivate(NULL);
                         RendererReloadShaders(renderer,
                             NULL,0, NULL,0, NULL,0, NULL,0, NULL,0, NULL,0);
                     }
                     settings->selectedShaderPack = -1;
+                }
+                else
+                {
+                    menu->shaderPackStatus = SHADER_PACK_LOAD_ACTIVATION_ERROR;
                 }
             }
             ShaderPackListRelease(&sl);
@@ -451,8 +475,18 @@ static float DrawShadersTab(UiContext* ui, GameSettings* settings,
         RendererReloadShaders(renderer,
             NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         settings->selectedShaderPack = -1;
+        menu->shaderPackStatus = SHADER_PACK_LOAD_NOT_ATTEMPTED;
     }
     y += 30.0f * s + 8.0f * s;
+
+    const wchar_t* statusText = ShaderStatusText(menu->shaderPackStatus);
+    if (statusText[0] != L'\0')
+    {
+        uint32_t color = menu->shaderPackStatus == SHADER_PACK_LOAD_OK
+            ? UiColor(80, 200, 80, 255) : UiColor(216, 96, 80, 255);
+        UiText(ui, x, y, color, statusText);
+    }
+    y += lineHeight + 6.0f * s;
 
     y += 8.0f * s;
 
@@ -479,7 +513,20 @@ static float DrawShadersTab(UiContext* ui, GameSettings* settings,
     return y + 20.0f * s + 12.0f * s;
 }
 
-static float DrawTexturesTab(UiContext* ui, GameSettings* settings,
+static const wchar_t* TextureStatusText(RendererContentStatus status)
+{
+    switch (status)
+    {
+        case RENDERER_CONTENT_OK: return L"Текстурпак применён";
+        case RENDERER_CONTENT_INVALID: return L"Повреждённый формат LTP";
+        case RENDERER_CONTENT_GPU_ERROR: return L"Ошибка загрузки текстуры на GPU";
+        case RENDERER_CONTENT_ACTIVATION_ERROR: return L"Не удалось выбрать пак";
+        case RENDERER_CONTENT_IO_ERROR: return L"Ошибка чтения текстурпака";
+        default: return L"";
+    }
+}
+
+static float DrawTexturesTab(PauseMenu* menu, UiContext* ui, GameSettings* settings,
     Renderer* renderer, float x, float width, float y)
 {
     float s = ui->scale;
@@ -538,8 +585,22 @@ static float DrawTexturesTab(UiContext* ui, GameSettings* settings,
             {
                 if (TexturePackActivate(tl.entries[index].name))
                 {
-                    RendererReloadTexturePack(renderer);
+                    bool reloaded = RendererReloadTexturePack(renderer);
+                    RendererContentStatus status =
+                        RendererGetTexturePackLoadStatus(renderer);
+                    if (!reloaded) status = RENDERER_CONTENT_GPU_ERROR;
+                    if (status != RENDERER_CONTENT_OK)
+                    {
+                        TexturePackActivate(NULL);
+                        RendererReloadTexturePack(renderer);
+                    }
+                    menu->texturePackStatus = status;
                     settings->selectedTexturePack = -1;
+                }
+                else
+                {
+                    menu->texturePackStatus =
+                        RENDERER_CONTENT_ACTIVATION_ERROR;
                 }
             }
             TexturePackListRelease(&tl);
@@ -553,8 +614,18 @@ static float DrawTexturesTab(UiContext* ui, GameSettings* settings,
         TexturePackActivate(NULL);
         RendererReloadTexturePack(renderer);
         settings->selectedTexturePack = -1;
+        menu->texturePackStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
     }
     y += 30.0f * s + 8.0f * s;
+
+    const wchar_t* statusText = TextureStatusText(menu->texturePackStatus);
+    if (statusText[0] != L'\0')
+    {
+        uint32_t color = menu->texturePackStatus == RENDERER_CONTENT_OK
+            ? UiColor(80, 200, 80, 255) : UiColor(216, 96, 80, 255);
+        UiText(ui, x, y, color, statusText);
+    }
+    y += lineHeight + 6.0f * s;
 
     return y;
 }
@@ -757,11 +828,11 @@ static void UpdateSettingsScreen(PauseMenu* menu, UiContext* ui,
     switch (menu->settingsTab)
     {
         case SETTINGS_TAB_TEXTURES:
-            DrawTexturesTab(ui, settings, renderer,
+            DrawTexturesTab(menu, ui, settings, renderer,
                 contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_SHADERS:
-            DrawShadersTab(ui, settings, renderer,
+            DrawShadersTab(menu, ui, settings, renderer,
                 contentX, contentWidth, scrolledY);
             break;
         case SETTINGS_TAB_MODS:

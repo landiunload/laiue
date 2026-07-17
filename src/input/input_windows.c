@@ -37,6 +37,7 @@ static InputKey MapVirtualKeyToInputKey(uint32_t virtualKey)
         case VK_CONTROL:
         case VK_LCONTROL:
         case VK_RCONTROL: return INPUT_KEY_CONTROL;
+        case VK_F3:       return INPUT_KEY_F3;
         case VK_F7:       return INPUT_KEY_F7;
         default:          return INPUT_KEY_COUNT;
     }

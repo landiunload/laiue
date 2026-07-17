@@ -3,6 +3,8 @@ laiue_add_module(core
         application.c
         application_config.c
         application_config.h
+        camera.c
+        camera.h
         chunk_streaming.c
         chunk_streaming.h
         game_hud.c
@@ -30,7 +32,6 @@ laiue_add_module(core
         ui_font.h
         ui_format.c
         ui_format.h
-        ../game/camera.c
         ../game/camera.h
         ../api.h
     LINK
