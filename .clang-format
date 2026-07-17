@@ -1,0 +1,10 @@
+BasedOnStyle: Microsoft
+Language: Cpp
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+BreakBeforeBraces: Allman
+SortIncludes: Never
+AllowShortIfStatementsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty

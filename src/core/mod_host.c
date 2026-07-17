@@ -5,7 +5,7 @@
 #include "content/content_catalog.h"
 #include "world/block_properties.h"
 
-#include "../../sdk/laiue_mod_api.h"
+#include "laiue_mod_api.h"
 
 #include <windows.h>
 #include <string.h>

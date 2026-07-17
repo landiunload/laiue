@@ -7,12 +7,10 @@
 #include <wchar.h>
 
 // Единый контракт пользовательского содержимого laiue.
-// Нечётные элементы — одиночные сущности, следующий элемент — их пак.
+// Чётные элементы — одиночные сущности, следующий элемент — их пак.
 typedef enum LaiueContentType
 {
-    LAIUE_CONTENT_RESOURCE = 0,       // .lr
-    LAIUE_CONTENT_RESOURCE_PACK,      // .lrp
-    LAIUE_CONTENT_MOD,                // .lm
+    LAIUE_CONTENT_MOD = 0,            // .lm
     LAIUE_CONTENT_MOD_PACK,           // .lmp
     LAIUE_CONTENT_SHADER,             // .ls
     LAIUE_CONTENT_SHADER_PACK,        // .lsp

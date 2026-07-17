@@ -11,7 +11,7 @@
 для clang-пресетов — LLVM (clang-cl + lld-link).
 
 ```cmd
-:: последняя установленная Visual Studio (сейчас — VS 2026)
+:: последняя установленная Visual Studio
 cmake --preset visual-studio
 cmake --build --preset visual-studio-release
 
@@ -33,7 +33,11 @@ laiue.exe                 — лаунчер без CRT, только LoadLibrar
     ├── laiue_input.dll   — raw input: клавиатура и мышь
     ├── laiue_world.dll   — воксельный мир: шум, чанки-дельты, кеш высот
     ├── laiue_mesher.dll  — бинарный greedy meshing (мир -> геометрия)
-    └── laiue_render.dll  — Direct3D 12, GPU-резидентные меши
+    ├── laiue_render.dll  — Direct3D 12, GPU-резидентные меши
+    ├── laiue_content.dll — каталог и форматы подключаемого содержимого
+    ├── laiue_physics.dll — AABB и столкновения с вокселями
+    ├── laiue_gameplay.dll — движение, прыжок и стойка игрока
+    └── laiue_interaction.dll — raycast и редактирование блоков
 ```
 
 Все модули собираются без CRT (`/NODEFAULTLIB`), DLL линкуются с `/NOENTRY`.
@@ -59,6 +63,12 @@ int64 (±9,2·10¹⁸ блоков).
 laiue_add_module(имя SOURCES <файлы...> [LINK <библиотеки...>])
 ```
 
+Подробные границы и направление зависимостей описаны в
+[docs/architecture.md](docs/architecture.md), а план технических
+улучшений — в [docs/improvement_plan.md](docs/improvement_plan.md).
+Правила разработки и локальные проверки находятся в
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Управление
 
 - `Esc` — меню паузы (продолжить, настройки, выход)
@@ -76,8 +86,8 @@ laiue_add_module(имя SOURCES <файлы...> [LINK <библиотеки...>]
 
 ## Пользовательское содержимое
 
-Единая система различает ресурсы `.lr/.lrp`, моды `.lm/.lmp`, шейдеры
-`.ls/.lsp`, данные `.ld/.ldp` и текстуры `.lt/.ltp`. Форматы не подменяют
+Единая система различает моды `.lm/.lmp`, шейдеры `.ls/.lsp`, данные
+`.ld/.ldp` и текстуры `.lt/.ltp`. Форматы не подменяют
 друг друга; каталоги и правила описаны в
 [docs/content_formats.md](docs/content_formats.md). Целевая архитектура
 подключаемого содержимого — какие категории остаются, как устроены моды

@@ -1070,10 +1070,19 @@ static bool SaveWriterFrameCoord(SaveWriter* writer,
 
 bool WorldSaveDeltas(World* world, const wchar_t* path)
 {
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+    uint32_t pathLength = 0;
+    while (path[pathLength] != L'\0') ++pathLength;
+    wchar_t* temporaryPath = HeapAlloc(GetProcessHeap(), 0,
+        (size_t)(pathLength + 5u) * sizeof(wchar_t));
+    if (temporaryPath == NULL) return false;
+    memcpy(temporaryPath, path, (size_t)pathLength * sizeof(wchar_t));
+    memcpy(temporaryPath + pathLength, L".tmp", 5u * sizeof(wchar_t));
+
+    HANDLE file = CreateFileW(temporaryPath, GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
+        HeapFree(GetProcessHeap(), 0, temporaryPath);
         return false;
     }
 
@@ -1082,6 +1091,8 @@ bool WorldSaveDeltas(World* world, const wchar_t* path)
     if (writer.buffer == NULL)
     {
         CloseHandle(file);
+        DeleteFileW(temporaryPath);
+        HeapFree(GetProcessHeap(), 0, temporaryPath);
         return false;
     }
 
@@ -1137,9 +1148,16 @@ bool WorldSaveDeltas(World* world, const wchar_t* path)
     ReleaseSRWLockShared(&world->tableLock);
 
     SaveWriterFlush(&writer);
-    bool succeeded = !writer.failed;
+    bool succeeded = !writer.failed && FlushFileBuffers(file);
     HeapFree(GetProcessHeap(), 0, writer.buffer);
     CloseHandle(file);
+    if (succeeded)
+    {
+        succeeded = MoveFileExW(temporaryPath, path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+    if (!succeeded) DeleteFileW(temporaryPath);
+    HeapFree(GetProcessHeap(), 0, temporaryPath);
     return succeeded;
 }
 

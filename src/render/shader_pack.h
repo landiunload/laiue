@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define SHADER_PACK_NAME_MAX 64
+#define LAIUE_SHADER_CONTRACT_VERSION 1u
 
 typedef struct ShaderPackEntry
 {
@@ -24,9 +25,11 @@ LAIUE_RENDER_API void ShaderPackListRelease(ShaderPackList* list);
 LAIUE_RENDER_API bool ShaderPackActivate(const wchar_t* name);
 
 // Кастомный шейдерпак — каталог <exe>/shaders/<name>.lsp.
-// Каждый байткод внутри него является отдельным файлом .ls.
+// pack.lm обязан объявить `LAIUE SHADER 1` и `contract = 1`.
+// Каждый предоставленный байткод внутри него является отдельным файлом .ls;
+// отсутствующие стадии берутся из встроенного набора.
 // Загружает байткод шейдеров из активного шейдерпака.
-// Если активного кастомного пака нет — возвращает false (использовать встроенные).
+// Если пак отсутствует или несовместим — возвращает false.
 // Вызывающий владеет возвращёнными буферами (освобождать через HeapFree).
 LAIUE_RENDER_API bool ShaderPackLoadActiveBytecode(
     void** outChunkVS, uint32_t* outChunkVSLength,

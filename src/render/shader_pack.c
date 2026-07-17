@@ -8,12 +8,22 @@
 #define SHADER_PACK_DIR L"\\shaders\\"
 #define PATH_CAPACITY_CHARS 32768u
 #define SHADER_FILE_MAX 0x40000u  // 256 КБ на шейдер
+#define SHADER_MANIFEST_MAX 4096u
 
 static uint32_t LiteralLength(const wchar_t* text)
 {
     uint32_t length = 0;
     while (text[length] != L'\0') ++length;
     return length;
+}
+
+static bool BytesEqual(const uint8_t* left, const char* right, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (left[i] != (uint8_t)right[i]) return false;
+    }
+    return true;
 }
 
 static bool BuildPath(wchar_t* path, uint32_t capacity,
@@ -312,6 +322,33 @@ static void* LoadCsoFile(const wchar_t* fullPath, uint32_t* outLength)
     return data;
 }
 
+static bool IsCompatibleManifest(const wchar_t* fullPath)
+{
+    uint32_t length = 0;
+    uint8_t* data = LoadCsoFile(fullPath, &length);
+    if (data == NULL || length > SHADER_MANIFEST_MAX)
+    {
+        if (data != NULL) HeapFree(GetProcessHeap(), 0, data);
+        return false;
+    }
+
+    static const char header[] = "LAIUE SHADER 1";
+    static const char contract[] = "contract = 1";
+    bool hasHeader = length >= sizeof(header) - 1u
+        && BytesEqual(data, header, sizeof(header) - 1u);
+    bool hasContract = false;
+    for (uint32_t i = 0; i + sizeof(contract) - 1u <= length; ++i)
+    {
+        if (BytesEqual(data + i, contract, sizeof(contract) - 1u))
+        {
+            hasContract = true;
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, data);
+    return hasHeader && hasContract;
+}
+
 bool ShaderPackLoadActiveBytecode(
     void** outChunkVS, uint32_t* outChunkVSLength,
     void** outChunkPS, uint32_t* outChunkPSLength,
@@ -373,6 +410,13 @@ bool ShaderPackLoadActiveBytecode(
     pathBuf[packDirLen] = L'\\';
     packDirLen++;
 
+    if (!BuildPath(pathBuf, PATH_CAPACITY_CHARS, packDirLen, L"pack.lm")
+        || !IsCompatibleManifest(pathBuf))
+    {
+        HeapFree(GetProcessHeap(), 0, pathBuf);
+        return false;
+    }
+
     static const wchar_t* const shaderFiles[6] = {
         L"chunk_vs.ls", L"chunk_ps.ls",
         L"panorama_vs.ls", L"panorama_ps.ls",
@@ -389,7 +433,7 @@ bool ShaderPackLoadActiveBytecode(
         outUIVSLength, outUIPSLength,
     };
 
-    bool allLoaded = true;
+    bool anyLoaded = false;
     for (uint32_t i = 0; i < 6; ++i)
     {
         // Строим полный путь, переиспользуя тот же буфер pathBuf
@@ -400,7 +444,7 @@ bool ShaderPackLoadActiveBytecode(
         uint32_t sfxLen = LiteralLength(shaderFiles[i]);
         if (packDirLen + sfxLen + 1u > PATH_CAPACITY_CHARS)
         {
-            allLoaded = false;
+            anyLoaded = false;
             break;
         }
         for (uint32_t j = 0; j < sfxLen; ++j)
@@ -411,13 +455,10 @@ bool ShaderPackLoadActiveBytecode(
 
         void* data = LoadCsoFile(pathBuf, outLengths[i]);
         *outPtrs[i] = data;
-        if (data == NULL)
-        {
-            allLoaded = false;
-        }
+        anyLoaded = anyLoaded || data != NULL;
     }
 
-    if (!allLoaded)
+    if (!anyLoaded)
     {
         for (uint32_t i = 0; i < 6; ++i)
         {

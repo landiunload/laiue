@@ -14,6 +14,19 @@ typedef struct ChunkStreaming ChunkStreaming;
 typedef struct World World;
 typedef struct Renderer Renderer;
 
+typedef struct ChunkStreamingStats
+{
+    uint64_t queuedRequests;
+    uint64_t completedBuilds;
+    uint64_t cancelledBuilds;
+    uint64_t discardedBuilds;
+    uint64_t uploadedMeshes;
+    uint32_t pendingRequests;
+    uint32_t pendingResults;
+    uint32_t peakUnfinishedWork;
+    double averageBuildMilliseconds;
+} ChunkStreamingStats;
+
 ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks);
 void ChunkStreamingDestroy(ChunkStreaming* streaming);
 bool ChunkStreamingPause(ChunkStreaming* streaming);
@@ -36,6 +49,11 @@ void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, in
 // Забирает готовые меши из рабочих потоков и загружает их на GPU
 // (не больше бюджета на кадр). Вызывается каждый кадр до начала кадра.
 void ChunkStreamingPump(ChunkStreaming* streaming);
+
+// Снимок накопительных счётчиков для HUD/профилировщика. Вызов дешёвый и
+// не останавливает рабочие потоки надолго.
+void ChunkStreamingGetStats(ChunkStreaming* streaming,
+    ChunkStreamingStats* outStats);
 
 // Рисует видимые меши спереди-назад (между Begin/EndFrame).
 // cameraBlockPosition — блок камеры: origin rebasing, все координаты

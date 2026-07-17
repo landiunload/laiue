@@ -40,7 +40,6 @@ target_link_libraries(laiue PRIVATE laiue_common laiue_runtime kernel32)
 # описаны единым модулем laiue_content; CMake только готовит runtime-структуру.
 add_custom_target(laiue_content_files
     COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "$<TARGET_FILE_DIR:laiue>/resources"
         "$<TARGET_FILE_DIR:laiue>/mods"
         "$<TARGET_FILE_DIR:laiue>/shaders"
         "$<TARGET_FILE_DIR:laiue>/data"
@@ -48,9 +47,6 @@ add_custom_target(laiue_content_files
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${PROJECT_SOURCE_DIR}/assets/texturepacks"
         "$<TARGET_FILE_DIR:laiue>/textures"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${PROJECT_SOURCE_DIR}/assets/resources"
-        "$<TARGET_FILE_DIR:laiue>/resources"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${PROJECT_SOURCE_DIR}/assets/mods"
         "$<TARGET_FILE_DIR:laiue>/mods"

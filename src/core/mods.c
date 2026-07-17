@@ -1,7 +1,7 @@
 #include "core/mods.h"
 #include "content/content_catalog.h"
 
-#include "../../sdk/laiue_mod_api.h"
+#include "laiue_mod_api.h"
 
 #include <windows.h>
 #include <string.h>

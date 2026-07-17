@@ -45,3 +45,4 @@ laiue_add_module(core
         laiue_content
         gdi32
 )
+target_include_directories(laiue_core PRIVATE "${PROJECT_SOURCE_DIR}/sdk")

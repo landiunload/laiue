@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        preset: [visual-studio-debug, visual-studio-release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake --preset visual-studio
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Verify generated sources
+        shell: pwsh
+        run: |
+          git diff --check
+          if (git status --porcelain) {
+            git status --short
+            throw 'Build changed tracked sources'
+          }

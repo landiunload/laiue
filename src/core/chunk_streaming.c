@@ -12,6 +12,7 @@
 // Бюджет загрузок на GPU за один кадр: сглаживает волну готовых мешей
 // при пересечении границы чанка (иначе — разовый фриз кадра).
 #define MESH_UPLOADS_PER_FRAME 4
+#define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
 typedef enum ChunkEntryState
@@ -41,6 +42,7 @@ typedef struct ChunkRequest
     int64_t y;
     int64_t z;
     uint32_t revision;
+    uint32_t centerEpoch;
 } ChunkRequest;
 
 typedef struct ChunkMeshResult
@@ -107,6 +109,16 @@ struct ChunkStreaming
     uint32_t pausedWorkerCount;
     bool pauseRequested;
     bool shutdownRequested;
+
+    LARGE_INTEGER performanceFrequency;
+    volatile LONG64 queuedRequests;
+    volatile LONG64 completedBuilds;
+    volatile LONG64 cancelledBuilds;
+    volatile LONG64 discardedBuilds;
+    volatile LONG64 uploadedMeshes;
+    volatile LONG64 totalBuildTicks;
+    uint32_t peakUnfinishedWork;
+    volatile LONG centerEpoch;
 };
 
 static void AddMeshToDrawList(ChunkStreaming* streaming, ChunkEntry* entry)
@@ -270,14 +282,20 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
         request->y = entry->y;
         request->z = entry->z;
         request->revision = entry->revision;
+        request->centerEpoch = streaming->centerEpoch;
         streaming->requestCount++;
         streaming->unfinishedWork++;
+        if (streaming->unfinishedWork > streaming->peakUnfinishedWork)
+        {
+            streaming->peakUnfinishedWork = streaming->unfinishedWork;
+        }
         enqueued = true;
     }
     ReleaseSRWLockExclusive(&streaming->queueLock);
 
     if (enqueued)
     {
+        InterlockedIncrement64(&streaming->queuedRequests);
         WakeConditionVariable(&streaming->workAvailable);
     }
 
@@ -331,12 +349,22 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
         ReleaseSRWLockExclusive(&streaming->queueLock);
 
         // Тяжёлая работа — без замка.
+        bool cancelled = request.centerEpoch != (uint32_t)InterlockedCompareExchange(
+            &streaming->centerEpoch, 0, 0);
+        LARGE_INTEGER buildStart;
+        LARGE_INTEGER buildEnd;
+        QueryPerformanceCounter(&buildStart);
         ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
-        if (!BuildChunkMesh(streaming->world, scratch,
+        if (cancelled || !BuildChunkMesh(streaming->world, scratch,
             request.x, request.y, request.z, &result.quads, &result.quadCount))
         {
             result.quadCount = CHUNK_MESH_BUILD_FAILED;
         }
+        QueryPerformanceCounter(&buildEnd);
+        InterlockedAdd64(&streaming->totalBuildTicks,
+            buildEnd.QuadPart - buildStart.QuadPart);
+        InterlockedIncrement64(&streaming->completedBuilds);
+        if (cancelled) InterlockedIncrement64(&streaming->cancelledBuilds);
 
         // Очередь результатов переполниться не может: unfinishedWork
         // ограничен её ёмкостью.
@@ -596,6 +624,7 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
 
     InitializeSRWLock(&streaming->queueLock);
     InitializeConditionVariable(&streaming->workAvailable);
+    QueryPerformanceFrequency(&streaming->performanceFrequency);
 
     if (streaming->entries == NULL || streaming->spareEntries == NULL
         || streaming->drawItems == NULL
@@ -685,6 +714,7 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     streaming->centerX = chunkX;
     streaming->centerY = chunkY;
     streaming->centerZ = chunkZ;
+    InterlockedIncrement(&streaming->centerEpoch);
 
     // Пересборка таблицы с гистерезисом: живущие в радиусе + 1
     // переносятся, дальние освобождаются (отложенно, под fence).
@@ -780,6 +810,8 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
 {
     uint32_t queueMask = streaming->queueCapacity - 1;
     uint32_t uploadBudget = MESH_UPLOADS_PER_FRAME;
+    LARGE_INTEGER pumpStart;
+    QueryPerformanceCounter(&pumpStart);
 
     for (;;)
     {
@@ -835,6 +867,7 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                     }
                     entry->state = CHUNK_ENTRY_READY;
                     uploadBudget--;
+                    InterlockedIncrement64(&streaming->uploadedMeshes);
                 }
                 else
                 {
@@ -853,10 +886,23 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                 entry->state = CHUNK_ENTRY_READY;
             }
         }
+        else
+        {
+            InterlockedIncrement64(&streaming->discardedBuilds);
+        }
 
         if (result.quads != NULL)
         {
             HeapFree(GetProcessHeap(), 0, result.quads);
+        }
+
+        if (uploadBudget < MESH_UPLOADS_PER_FRAME)
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double elapsedMilliseconds = (double)(now.QuadPart - pumpStart.QuadPart)
+                * 1000.0 / (double)streaming->performanceFrequency.QuadPart;
+            if (elapsedMilliseconds >= MESH_UPLOAD_BUDGET_MILLISECONDS) break;
         }
     }
 
@@ -879,6 +925,37 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
             }
         }
     }
+}
+
+void ChunkStreamingGetStats(ChunkStreaming* streaming,
+    ChunkStreamingStats* outStats)
+{
+    if (streaming == NULL || outStats == NULL) return;
+
+    outStats->queuedRequests = (uint64_t)InterlockedCompareExchange64(
+        &streaming->queuedRequests, 0, 0);
+    outStats->completedBuilds = (uint64_t)InterlockedCompareExchange64(
+        &streaming->completedBuilds, 0, 0);
+    outStats->cancelledBuilds = (uint64_t)InterlockedCompareExchange64(
+        &streaming->cancelledBuilds, 0, 0);
+    outStats->discardedBuilds = (uint64_t)InterlockedCompareExchange64(
+        &streaming->discardedBuilds, 0, 0);
+    outStats->uploadedMeshes = (uint64_t)InterlockedCompareExchange64(
+        &streaming->uploadedMeshes, 0, 0);
+    LONG64 totalTicks = InterlockedCompareExchange64(
+        &streaming->totalBuildTicks, 0, 0);
+
+    AcquireSRWLockShared(&streaming->queueLock);
+    outStats->pendingRequests = streaming->requestCount;
+    outStats->pendingResults = streaming->resultCount;
+    outStats->peakUnfinishedWork = streaming->peakUnfinishedWork;
+    ReleaseSRWLockShared(&streaming->queueLock);
+
+    outStats->averageBuildMilliseconds = outStats->completedBuilds > 0
+        ? (double)totalTicks * 1000.0
+            / ((double)streaming->performanceFrequency.QuadPart
+                * (double)outStats->completedBuilds)
+        : 0.0;
 }
 
 static void ExpandFrustumPlanesForChunk(float planes[6][4])

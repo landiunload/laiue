@@ -23,8 +23,8 @@ typedef struct LaiueContentList
     uint32_t count;
 } LaiueContentList;
 
-// Перечисляет только один точный формат. Например, запрос .ltp никогда не
-// вернёт .lrp, хотя оба являются паками.
+// Перечисляет только один точный формат: пакет одного типа никогда не
+// смешивается с пакетами другой категории.
 LAIUE_CONTENT_API bool LaiueContentEnumerate(
     LaiueContentType type, LaiueContentList* outList);
 LAIUE_CONTENT_API void LaiueContentListRelease(LaiueContentList* list);
