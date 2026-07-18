@@ -2087,6 +2087,13 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
         renderer->rootSignature);
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
         ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
+    // fxc вправе спекулятивно выполнить Load из t3 даже для обычного чанка,
+    // где meshScale положителен. Поэтому корневой SRV всегда указывает на
+    // валидный буфер; инстансные draw-вызовы ниже заменяют адрес на свой offset.
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_INSTANCES,
+        ID3D12Resource_GetGPUVirtualAddress(
+            renderer->instanceBuffers[renderer->frameIndex]));
 
     // Свет кадра: float3 в cbuffer выровнены по 16 байт, между ними pad.
     float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
@@ -2248,7 +2255,12 @@ bool RendererEndFrame(Renderer* renderer)
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
 
-    ID3D12GraphicsCommandList_Close(renderer->commandList);
+    HRESULT closeResult = ID3D12GraphicsCommandList_Close(
+        renderer->commandList);
+    if (FAILED(closeResult))
+    {
+        return false;
+    }
 
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);

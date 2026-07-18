@@ -57,6 +57,7 @@ PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     float3 localPosition = (float3)(start + remapped * extent);
     float3 origin = chunkOriginRelative;
     float scale = meshScale;
+    [branch]
     if (meshScale < 0.0f)
     {
         float4 instance = asfloat(meshInstances.Load4(instanceId * 16));
