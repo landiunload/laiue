@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(laiue
     VERSION 0.5.0
-    DESCRIPTION "Belaiu base - window, input, world, gameplay and render"
+    DESCRIPTION "Windows voxel engine with client/server runtime"
     LANGUAGES C
 )
 

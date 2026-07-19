@@ -1,6 +1,6 @@
-# Контракт шейдерпаков
+# Шейдерпаки
 
-Шейдерпак — каталог `shaders/<name>.lsp`. В корне обязателен `pack.lm`:
+Шейдерпак — каталог `shaders/<name>.lsp` с манифестом:
 
 ```text
 LAIUE SHADER 1
@@ -8,29 +8,59 @@ name = My Pack
 contract = 1
 ```
 
-`contract` описывает совместимость root signature, входов/выходов и
-constant buffers. Движок 0.5 поддерживает контракт 1; пакет с другой
-версией не применяется и безопасно откатывается на встроенные шейдеры.
-Причина отказа показывается на вкладке «Шейдеры». При старте несовместимый
-активный пакет также сбрасывается, поэтому `active.txt` не остаётся в
-ложном состоянии.
+Движок 0.5.0 поддерживает только contract 1. Пак содержит скомпилированный
+DXBC, а не HLSL-текст. Допустим любой непустой набор стадий:
 
-## Стадии
+| Файл | Entry/profile | Проход |
+|---|---|---|
+| `chunk_vs.ls`, `chunk_ps.ls` | `VSMain/PSMain`, `*_5_0` | чанки |
+| `panorama_vs.ls`, `panorama_ps.ls` | `VSMain/PSMain`, `*_5_0` | широкая проекция |
+| `ui_vs.ls`, `ui_ps.ls` | `VSMain/PSMain`, `*_5_0` | UI |
 
-Пак может содержать любое непустое подмножество файлов:
+Отсутствующая стадия берётся из встроенного набора. Максимальный размер файла
+— 256 КиБ. Несовместимый или повреждённый активный пак сбрасывается на
+встроенные шейдеры, причина показывается в UI. Выбор применяется при
+подготовке игровой сессии; главное меню не создаёт игровые GPU-ресурсы.
 
-| Файл | Назначение |
-|---|---|
-| `chunk_vs.ls` | vertex pulling геометрии чанков |
-| `chunk_ps.ls` | материалы, свет и туман чанков |
-| `panorama_vs.ls` | полноэкранный проход широкой проекции |
-| `panorama_ps.ls` | выборка кубмапы и проекция |
-| `ui_vs.ls` | квады UI и текст |
-| `ui_ps.ls` | SDF, цвет и атлас шрифта |
+## Contract 1
 
-Отсутствующая стадия берётся из встроенного набора того же контракта.
-Таким образом, пакет, меняющий только `chunk_ps.ls`, является корректным.
-Пустой пакет отклоняется.
+Эталонные реализации находятся в `shaders/*.hlsl`.
 
-Байткоды должны быть скомпилированы под те же профили и соглашения, что
-исходники в `shaders/`. Максимальный размер одной стадии — 256 КиБ.
+### Chunk
+
+- `b0`: row-major `viewProjection`, `chunkOriginRelative`, `meshScale`,
+  `sunDirection`, `sunColor`, `ambientColor`, `gammaInverse`;
+- `t0`: packed quad `ByteAddressBuffer`;
+- `t1`: albedo `Texture2DArray`, `t2`: normal/AO `Texture2DArray`;
+- `t3`: instance buffer, один `float4 { origin.xyz, scale }`;
+- `s0`: sampler.
+
+При `meshScale < 0` vertex shader обязан читать transform по `SV_InstanceID`;
+при положительном значении используется `chunkOriginRelative`. Renderer всегда
+привязывает корректный `t3`, но чтение следует оставлять под `[branch]`, как в
+эталонном `chunk.hlsl`.
+
+### Panorama
+
+`b0` содержит `fovHalfRadians`, `verticalScale`, `mapping`; `t0` —
+`TextureCube`, `s0` — sampler. `mapping`: 0 — equidistant fisheye, 1 —
+цилиндрическая проекция.
+
+### UI
+
+`b0` содержит `float2 screenSize`; `t0` — квады по 48 байт, `t1` — атлас
+шрифта, `t2` — статичный фон, `s0` — sampler. У квада flag 1 выбирает альфу
+шрифта, flag 2 — фоновую текстуру. Точная раскладка записана в
+`shaders/ui.hlsl` и `RendererUiQuad`.
+
+## Компиляция
+
+Используйте `fxc.exe` с `/O3 /Qstrip_debug /Qstrip_reflect`:
+
+```bat
+fxc /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect /Fo chunk_vs.ls chunk.hlsl
+fxc /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect /Fo chunk_ps.ls chunk.hlsl
+```
+
+Встроенные шейдеры CMake компилирует теми же параметрами; если `fxc` не
+найден, используются закоммиченные заголовки с байткодом.

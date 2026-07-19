@@ -131,9 +131,9 @@ typedef struct LaiueModApi
         LaiueFixedTickCallback callback, void* user);
 
     /* === Данные мода в сохранении мира ===
-       Блоб на мод в saves/<мир>/moddata/<имя>.bin. Читайте в
-       LaiueModInit, пишите при изменениях или в LaiueModShutdown
-       (он вызывается до записи сохранения при выходе).
+       Блоб на мод в saves/<мир>/moddata/<имя>.bin записывается этим API
+       напрямую и не входит в общую транзакцию SaveGame. Читайте в
+       LaiueModInit, пишите при изменениях или в LaiueModShutdown.
        readModData возвращает фактический размер (0 — данных нет
        или буфер мал). */
     bool (*writeModData)(void* host, const void* bytes, uint32_t size);
