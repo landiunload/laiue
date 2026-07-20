@@ -7,6 +7,7 @@
 | `launcher` | минимальный `laiue.exe`: `LoadLibrary` и `Start` |
 | `platform` | Win32-окно, message loop, mouse look, время |
 | `input` | Raw Input клавиатуры и мыши |
+| `audio` | потоковое локальное/HTTP(S)-аудио, transport, громкость и события |
 | `world` | генерация, чанки, дельты, свойства блоков и сохранение `chunks.dat` |
 | `mesher` | greedy meshing: `World` → упакованные квады |
 | `render` | D3D12, GPU-меши, шейдеры, текстуры, panorama и UI pass |
@@ -35,8 +36,9 @@
 value-структуры и указатели на них.
 
 Новая DLL нужна только если подсистема имеет самостоятельный жизненный
-цикл, узкий C API и реального второго потребителя. Иначе добавляется
-внутренний `.c/.h` существующего модуля.
+цикл, узкий C API и реального второго потребителя. `audio` удовлетворяет
+этому правилу: его используют клиент движка и отдельные приложения на
+laiue. Иначе добавляется внутренний `.c/.h` существующего модуля.
 
 ## Жизненный цикл клиента
 
@@ -57,6 +59,7 @@ value-структуры и указатели на них.
 | Объект | Владелец | Потоки |
 |---|---|---|
 | клиентские `World`, `ChunkStreaming`, `Renderer` | `ApplicationState` | main + read-only meshing workers |
+| `AudioPlayer` | вызывающий клиент или приложение | client main + callbacks Media Foundation |
 | `RendererMesh` | streaming/effects | создаётся и рисуется только main; освобождение после GPU fence |
 | `ModsState`, `ModHost` | `ApplicationState` | только main |
 | `NetworkClient` | `ApplicationState` | client main |

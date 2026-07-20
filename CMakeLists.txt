@@ -34,6 +34,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 
 add_subdirectory(src/platform)
 add_subdirectory(src/input)
+add_subdirectory(src/audio)
 add_subdirectory(src/world)
 add_subdirectory(src/mesh)
 add_subdirectory(src/content)
@@ -128,6 +129,7 @@ if(LAIUE_POWERSHELL_EXECUTABLE)
         laiue_server
         laiue_window
         laiue_input
+        laiue_audio
         laiue_world
         laiue_mesher
         laiue_content
@@ -190,3 +192,8 @@ laiue_add_example_mod(double_jump)
 laiue_add_example_mod(daylight_lock)
 laiue_add_example_mod(builder_lib)
 laiue_add_example_mod(spiral_tower)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

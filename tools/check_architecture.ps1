@@ -8,8 +8,9 @@ $sourceRootPath = [System.IO.Path]::GetFullPath($SourceRoot)
 # Разрешённые направления include-зависимостей. core — composition root;
 # остальные модули видят только себя и явно перечисленные нижние слои.
 $allowed = @{
+    audio       = @('audio')
     content     = @('content')
-    core        = @('content', 'core', 'game', 'gameplay', 'input',
+    core        = @('audio', 'content', 'core', 'game', 'gameplay', 'input',
                     'interaction', 'mesh', 'mod', 'network', 'physics',
                     'platform', 'render', 'world')
     game        = @('game')

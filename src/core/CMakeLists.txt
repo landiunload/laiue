@@ -39,6 +39,7 @@ laiue_add_module(core
     LINK
         laiue_window
         laiue_input
+        laiue_audio
         laiue_world
         laiue_mesher
         laiue_render

@@ -15,6 +15,12 @@
 #define LAIUE_INPUT_API __declspec(dllimport)
 #endif
 
+#if defined(LAIUE_BUILD_AUDIO)
+#define LAIUE_AUDIO_API __declspec(dllexport)
+#else
+#define LAIUE_AUDIO_API __declspec(dllimport)
+#endif
+
 #if defined(LAIUE_BUILD_CORE)
 #define LAIUE_CORE_API __declspec(dllexport)
 #else

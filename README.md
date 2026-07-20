@@ -1,7 +1,7 @@
 # laiue
 
 Воксельный движок 0.5.0 для Windows: C17 без CRT, Direct3D 12,
-DLL-модули, нативные моды и отдельный authoritative server.
+потоковое аудио, DLL-модули, нативные моды и отдельный authoritative server.
 
 Сейчас готовы одиночные миры, сохранения, креатив/выживание, инвентарь,
 дропы и локальный мультиплеер. Сетевой transport привязан к
@@ -69,7 +69,7 @@ cmake --build --preset ninja-clang-release --parallel
 
 ```text
 laiue.exe -> laiue_core.dll
-             ├─ window + input
+             ├─ window + input + audio
              ├─ world + mesher + render
              ├─ physics + gameplay + interaction
              └─ content + mod + network
@@ -104,6 +104,7 @@ renderer или mesher. Направления include-зависимостей 
 ## Документация
 
 - [архитектура](docs/architecture.md)
+- [аудио](docs/audio.md)
 - [актуальный план](docs/improvement_plan.md)
 - [мультиплеер и безопасность](docs/multiplayer.md)
 - [моддинг и SDK](docs/modding.md)
