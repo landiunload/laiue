@@ -7,16 +7,22 @@
 ```powershell
 cmake --preset ninja-clang-debug
 cmake --build --preset ninja-clang-debug --parallel
+ctest --preset ninja-clang-debug
 
 cmake --preset ninja-clang-release
 cmake --build --preset ninja-clang-release --parallel
+ctest --preset ninja-clang-release
 
 pwsh -NoProfile -File tools/check_architecture.ps1
 git diff --check
 ```
 
-CI собирает MSVC Debug и Release с warnings-as-errors и проверяет, что
-сборка не изменила tracked-файлы. Автоматические тесты пока не подключены.
+Тесты живут в `tests/` и регистрируются в CTest; test-preset назван так же,
+как build-preset. Тест аудио-API возвращает 125 и помечается пропущенным,
+если в системе нет Media Foundation (Windows N/Server без Media Pack).
+
+CI собирает MSVC Debug и Release с warnings-as-errors, прогоняет CTest и
+проверяет, что сборка не изменила tracked-файлы.
 
 ## Блокировка DLL при сборке
 
