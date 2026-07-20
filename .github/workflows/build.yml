@@ -16,6 +16,8 @@ jobs:
         run: cmake --preset visual-studio
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
       - name: Verify generated sources
         shell: pwsh
         run: |
