@@ -86,5 +86,39 @@
             "name": "ninja-clang-release",
             "configurePreset": "ninja-clang-release"
         }
+    ],
+    "testPresets": [
+        {
+            "name": "visual-studio-debug",
+            "configurePreset": "visual-studio",
+            "configuration": "Debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "visual-studio-release",
+            "configurePreset": "visual-studio",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "ninja-msvc-debug",
+            "configurePreset": "ninja-msvc-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "ninja-msvc-release",
+            "configurePreset": "ninja-msvc-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "ninja-clang-debug",
+            "configurePreset": "ninja-clang-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "ninja-clang-release",
+            "configurePreset": "ninja-clang-release",
+            "output": { "outputOnFailure": true }
+        }
     ]
 }

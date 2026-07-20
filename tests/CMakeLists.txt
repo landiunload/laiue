@@ -1,4 +1,4 @@
-add_executable(laiue_audio_api_test EXCLUDE_FROM_ALL audio_api_test.c)
+add_executable(laiue_audio_api_test audio_api_test.c)
 target_link_libraries(laiue_audio_api_test PRIVATE
     laiue_common
     laiue_runtime
