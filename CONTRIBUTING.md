@@ -20,6 +20,9 @@ git diff --check
 Тесты живут в `tests/` и регистрируются в CTest; test-preset назван так же,
 как build-preset. Тест аудио-API возвращает 125 и помечается пропущенным,
 если в системе нет Media Foundation (Windows N/Server без Media Pack).
+Тест протокола оборудования не требует и пропусков не имеет: он компилирует
+`src/network/protocol.c` в себя, поэтому кодек можно проверять, не экспортируя
+его из `laiue_network`.
 
 CI собирает MSVC Debug и Release с warnings-as-errors, прогоняет CTest и
 проверяет, что сборка не изменила tracked-файлы.
