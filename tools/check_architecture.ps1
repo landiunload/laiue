@@ -36,8 +36,8 @@ $files = Get-ChildItem -LiteralPath $sourceRootPath -Recurse -File |
     Where-Object { $_.FullName -notmatch '[\\/]generated[\\/]' }
 
 foreach ($file in $files) {
-    $relative = [System.IO.Path]::GetRelativePath(
-        $sourceRootPath, $file.FullName).Replace('\', '/')
+    $relative = $file.FullName.Substring(
+        ([string]$sourceRootPath).Length + 1).Replace('\', '/')
     if (-not $relative.Contains('/')) { continue }
     $owner = $relative.Split('/')[0]
     if (-not $allowed.ContainsKey($owner)) {
