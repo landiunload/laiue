@@ -29,3 +29,32 @@ jobs:
             git status --short
             throw 'Build changed tracked sources'
           }
+
+      # Готовый к запуску клиент+сервер: игрок скачивает zip и запускает
+      # laiue.exe без сборки. Пакуется только Release; архив кладётся вне
+      # рабочего дерева, чтобы не сработала проверка изменённых файлов выше.
+      - name: Package release artifact
+        if: matrix.preset == 'visual-studio-release'
+        shell: pwsh
+        run: |
+          $out = 'build/visual-studio/bin/Release'
+          foreach ($required in 'laiue.exe', 'laiue_server.exe') {
+            if (-not (Test-Path (Join-Path $out $required))) {
+              throw "В сборке нет $required"
+            }
+          }
+          # Тестовые исполняемые файлы — часть сборки, но не игры; в релиз не
+          # кладём. saves/ и прочее рантайм-содержимое на чистом раннере не
+          # создаётся, поэтому отдельно исключать не нужно.
+          $items = Get-ChildItem $out -Exclude '*_test.exe'
+          $zip = Join-Path $env:RUNNER_TEMP 'laiue-windows-x64.zip'
+          Compress-Archive -Path $items.FullName -DestinationPath $zip -Force
+          "Артефакт: $([math]::Round((Get-Item $zip).Length / 1MB, 2)) МБ" | Write-Host
+
+      - name: Upload release artifact
+        if: matrix.preset == 'visual-studio-release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: laiue-windows-x64
+          path: ${{ runner.temp }}/laiue-windows-x64.zip
+          if-no-files-found: error
