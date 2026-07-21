@@ -8,16 +8,19 @@ jobs:
   windows-msvc:
     runs-on: windows-latest
     strategy:
+      # Падение одной конфигурации не должно отменять вторую: иначе про
+      # Release ничего не известно, пока не починен Debug.
+      fail-fast: false
       matrix:
         preset: [visual-studio-debug, visual-studio-release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake --preset visual-studio
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }} --parallel
       - name: Test
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --no-tests=error
       - name: Verify generated sources
         shell: pwsh
         run: |
