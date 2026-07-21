@@ -37,7 +37,15 @@ typedef enum LaiueMessageType
     LAIUE_MESSAGE_BLOCK_DROP_SPAWN = 18,
     LAIUE_MESSAGE_BLOCK_DROP_REMOVE = 19,
     LAIUE_MESSAGE_INVENTORY_STATE = 20,
-    LAIUE_MESSAGE_SELECT_HOTBAR_SLOT = 21
+    LAIUE_MESSAGE_SELECT_HOTBAR_SLOT = 21,
+
+    // Первый недопустимый номер: граница проверки заголовка. Новый тип
+    // добавляется строго перед этой строкой и сразу попадает в разрешённый
+    // диапазон. Раньше граница была прибита к SERVER_CONTENT_END, поэтому
+    // добавленные после него drop/inventory/hotbar не проходили проверку:
+    // WriteHeader возвращал 0, ChannelQueuePayload — false, и вместо
+    // отправки сообщения соединение рвалось как OVERFLOW.
+    LAIUE_MESSAGE_COUNT
 } LaiueMessageType;
 
 typedef struct LaiueProtocolMod

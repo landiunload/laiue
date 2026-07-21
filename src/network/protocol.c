@@ -113,7 +113,7 @@ bool LaiueProtocolReadHeader(const uint8_t *bytes, uint32_t size, LaiueProtocolF
     uint16_t type = ReadU16(bytes + 6);
     uint32_t payloadSize = ReadU32(bytes + 8);
     uint32_t sequence = ReadU32(bytes + 12);
-    if (type < LAIUE_MESSAGE_CLIENT_HELLO || type > LAIUE_MESSAGE_SERVER_CONTENT_END ||
+    if (type < LAIUE_MESSAGE_CLIENT_HELLO || type >= LAIUE_MESSAGE_COUNT ||
         payloadSize > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE || sequence == 0)
     {
         return false;
@@ -131,7 +131,7 @@ uint32_t LaiueProtocolWriteHeader(uint8_t *output, uint32_t capacity,
                                   uint32_t payloadSize)
 {
     if (output == NULL || sequence == 0 || type < LAIUE_MESSAGE_CLIENT_HELLO ||
-        type > LAIUE_MESSAGE_SERVER_CONTENT_END || payloadSize > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE ||
+        type >= LAIUE_MESSAGE_COUNT || payloadSize > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE ||
         capacity < LAIUE_PROTOCOL_HEADER_SIZE)
     {
         return 0;
