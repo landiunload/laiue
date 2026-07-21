@@ -798,6 +798,80 @@ static void TestDropsAndInventory(void)
         "EncodeInventory принял неизвестный предмет");
 }
 
+// Неконечное значение float собирается из битов и проносится через
+// volatile: иначе компилятор с /fp:fast вправе доказать неконечность на
+// этапе компиляции и свернуть проверку, и тест мерил бы не то. Значение
+// обязано дойти до валидатора «живым», как приходит из сети.
+static float ProtocolTestBitsToFloat(uint32_t bits)
+{
+    volatile uint32_t source = bits;
+    union
+    {
+        uint32_t integer;
+        float floating;
+    } conversion;
+
+    conversion.integer = source;
+    return conversion.floating;
+}
+
+// Кодеки ввода и правки принимают float напрямую от клиента. NaN и
+// ±Infinity обязаны отвергаться до квантования: иначе они попадут в
+// позицию, угол или направление на авторитетном сервере. Проверка
+// намеренно гоняет реальные битовые представления, а не литералы.
+static void TestNonFiniteRejected(void)
+{
+    static const uint32_t nonFinitePatterns[3] = {
+        0x7f800000u, // +Infinity
+        0xff800000u, // -Infinity
+        0x7fc00000u, // тихий NaN
+    };
+
+    uint8_t payload[16];
+
+    // Каждое из четырёх полей ввода по очереди травится неконечным
+    // значением, остальные остаются валидными.
+    for (uint32_t pattern = 0; pattern < 3u; ++pattern)
+    {
+        float poison = ProtocolTestBitsToFloat(nonFinitePatterns[pattern]);
+        for (uint32_t field = 0; field < 4u; ++field)
+        {
+            LaiueProtocolInput input = {
+                .movementX = 0.0f,
+                .movementY = 0.0f,
+                .yaw = 0.0f,
+                .pitch = 0.0f,
+            };
+            switch (field)
+            {
+                case 0: input.movementX = poison; break;
+                case 1: input.movementY = poison; break;
+                case 2: input.yaw = poison; break;
+                default: input.pitch = poison; break;
+            }
+            ProtocolTestExpect(
+                LaiueProtocolEncodeInput(payload, sizeof(payload), &input) == 0,
+                "EncodeInput принял неконечное поле ввода");
+        }
+    }
+
+    // Направление правки — тот же контракт: неконечная компонента
+    // отвергается до нормировки и квантования.
+    for (uint32_t pattern = 0; pattern < 3u; ++pattern)
+    {
+        float poison = ProtocolTestBitsToFloat(nonFinitePatterns[pattern]);
+        for (uint32_t axis = 0; axis < 3u; ++axis)
+        {
+            float direction[3] = { 1.0f, 0.0f, 0.0f };
+            direction[axis] = poison;
+            ProtocolTestExpect(
+                LaiueProtocolEncodeEditIntent(payload, sizeof(payload),
+                    true, false, 0u, direction) == 0,
+                "EncodeEditIntent принял неконечное направление");
+        }
+    }
+}
+
 void ProtocolTestEntryPoint(void)
 {
     TestHeaderAcceptsEveryDeclaredType();
@@ -808,6 +882,7 @@ void ProtocolTestEntryPoint(void)
     TestContentBegin();
     TestInput();
     TestEditIntent();
+    TestNonFiniteRejected();
     TestPlayerStateAndBlockDelta();
     TestDropsAndInventory();
 

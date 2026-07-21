@@ -58,6 +58,14 @@ static void WriteU64(uint8_t *output, uint64_t value)
     WriteU32(output + 4, (uint32_t)(value >> 32));
 }
 
+// ВАЖНО: этот файл обязан собираться с /fp:precise (см. CMake рядом с
+// protocol.c). Проверки NaN здесь опираются на то, что NaN != NaN. Под
+// /fp:fast компилятор считает NaN невозможным и сворачивает самосравнение в
+// true; на clang-cl (там /fp:fast == -ffast-math -ffinite-math-only) это
+// доказанно пропускало NaN из сети в EncodeInput. Битовая проверка не
+// спасает: finite-math-only — это аксиома «неконечных нет», и оптимизатор
+// применяет её и к разбору битов. Единственная надёжная защита — точная
+// модель FP для этой единицы трансляции.
 static bool IsFiniteFloat(float value)
 {
     return value == value && value >= -3.402823466e+38f && value <= 3.402823466e+38f;
