@@ -13,3 +13,13 @@ indent_size = 4
 [*.cmake]
 indent_style = space
 indent_size = 4
+
+# Заголовки со скомпилированными шейдерами пишет fxc, и файл должен совпадать
+# с его выводом байт в байт. Общие правила выше (lf + обрезка хвостовых
+# пробелов) один раз уже переформатировали chunk_vs.h при открытии в редакторе:
+# байткод остался прежним, но git видел файл изменённым после каждой сборки,
+# и CI падал на «Build changed tracked sources». Генерируемое не трогаем.
+[src/render/generated/**]
+end_of_line = crlf
+trim_trailing_whitespace = false
+insert_final_newline = false
