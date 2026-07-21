@@ -1,4 +1,4 @@
-// Резервные реализации memset/memcpy для сборки без CRT (/NODEFAULTLIB).
+// Резервные реализации memset/memcpy/memcmp для сборки без CRT (/NODEFAULTLIB).
 //
 // Оптимизатор любой версии MSVC или clang имеет право синтезировать
 // вызовы этих функций (инициализаторы структур, копирование, циклы),
@@ -13,6 +13,7 @@
 // Иначе cl считает функции интринсиками и не даёт их определить.
 #pragma function(memset)
 #pragma function(memcpy)
+#pragma function(memcmp)
 #endif
 
 // Без CRT компилятор при использовании float ищет _fltused.
@@ -66,3 +67,29 @@ void* memcpy(void* destination, const void* source, size_t count)
 }
 
 #endif
+
+// IsEqualIID и сравнение структур раскрываются в memcmp. В Release компилятор
+// разворачивает его на месте, а с /Od выпускает настоящий вызов — без CRT
+// линковка падала на неразрешённом символе.
+//
+// Под clang распознавание идиом умеет свернуть такой цикл обратно в вызов
+// memcmp, то есть в рекурсию: optnone это исключает. Функция сравнивает
+// короткие структуры вроде GUID, скорость здесь роли не играет.
+#if defined(__clang__)
+__attribute__((optnone))
+#endif
+int memcmp(const void* first, const void* second, size_t count)
+{
+    const unsigned char* left = (const unsigned char*)first;
+    const unsigned char* right = (const unsigned char*)second;
+
+    for (size_t index = 0; index < count; ++index)
+    {
+        if (left[index] != right[index])
+        {
+            return (int)left[index] - (int)right[index];
+        }
+    }
+
+    return 0;
+}
