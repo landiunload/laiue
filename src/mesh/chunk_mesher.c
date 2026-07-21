@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <emmintrin.h>
 #include <string.h>
 
 // Расширенный регион: чанк плюс слой соседних блоков с каждой стороны,
@@ -231,6 +232,25 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
     return true;
 }
 
+// Маска непустых вокселей колонны из 64 блоков. SSE2 входит в базовый набор
+// команд x64, поэтому проверки CPU не нужны: четыре сравнения по 16 байт
+// вместо 64 отдельных. BlockType — байт, BLOCK_AIR — ноль, сравнение с нулём
+// и даёт искомые биты. Чтение неровное по выравниванию — так и задумано.
+static inline uint64_t ColumnSolidMask(const BlockType* column)
+{
+    const __m128i airVector = _mm_setzero_si128();
+    uint64_t solidMask = 0;
+
+    for (uint32_t offset = 0; offset < CHUNK_SIZE; offset += 16)
+    {
+        __m128i voxels = _mm_loadu_si128((const __m128i*)(column + offset));
+        uint32_t airBits = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(voxels, airVector));
+        solidMask |= (uint64_t)(~airBits & 0xFFFFu) << offset;
+    }
+
+    return solidMask;
+}
+
 static inline void ScatterFaceBits(uint64_t faceMask, uint64_t* planes, uint32_t row, uint64_t planeBit)
 {
     while (faceMask != 0)
@@ -278,20 +298,33 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
 
     memset(scratch->columns, 0, planeBytes * 3);
 
-    // Один проход по блокам заполняет колонны всех трёх осей.
+    // Один проход по блокам заполняет колонны всех трёх осей. Колонна вдоль Z
+    // читается целиком одной маской, поперечные оси получают биты обходом
+    // установленных разрядов — пустые колонны (а над поверхностью их
+    // большинство) пропускаются целиком.
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
+        const uint64_t rowBit = 1ull << y;
+
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
-            const BlockType* column = &blocks[BLOCK_INDEX(y + 1, x + 1, 1)];
-            for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
+            const uint64_t solidMask = ColumnSolidMask(&blocks[BLOCK_INDEX(y + 1, x + 1, 1)]);
+            if (solidMask == 0)
             {
-                if (column[z] != BLOCK_AIR)
-                {
-                    columnsZ[y * CHUNK_SIZE + x] |= 1ull << z;
-                    columnsY[x * CHUNK_SIZE + z] |= 1ull << y;
-                    columnsX[y * CHUNK_SIZE + z] |= 1ull << x;
-                }
+                continue;
+            }
+
+            columnsZ[y * CHUNK_SIZE + x] = solidMask;
+
+            const uint64_t columnBit = 1ull << x;
+            uint64_t remaining = solidMask;
+            while (remaining != 0)
+            {
+                unsigned long z;
+                _BitScanForward64(&z, remaining);
+                remaining &= remaining - 1;
+                columnsY[x * CHUNK_SIZE + (uint32_t)z] |= rowBit;
+                columnsX[y * CHUNK_SIZE + (uint32_t)z] |= columnBit;
             }
         }
     }
