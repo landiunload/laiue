@@ -97,6 +97,32 @@ if(TARGET laiue_runtime_not_running_check)
 endif()
 
 add_test(NAME laiue.physics.determinism COMMAND laiue_determinism_test)
+
+# content_format.c компилируется в тест напрямую по той же причине, что
+# protocol.c и infinite_coord.c: правила именования содержимого — внутренний
+# контракт laiue_content, и расширять ABI DLL ради проверок нельзя.
+# LAIUE_BUILD_CONTENT переводит экспортные макросы в dllexport, чтобы функции
+# определялись в тесте, а не импортировались из DLL.
+add_executable(laiue_content_format_test
+    content_format_test.c
+    ../src/content/content_format.c)
+target_compile_definitions(laiue_content_format_test PRIVATE
+    LAIUE_BUILD_CONTENT)
+target_link_libraries(laiue_content_format_test PRIVATE
+    laiue_common
+    laiue_runtime
+    kernel32
+)
+target_link_options(laiue_content_format_test PRIVATE
+    /ENTRY:ContentFormatTestEntryPoint
+    /SUBSYSTEM:CONSOLE
+)
+if(TARGET laiue_runtime_not_running_check)
+    add_dependencies(laiue_content_format_test laiue_runtime_not_running_check)
+endif()
+
+add_test(NAME laiue.content.format COMMAND laiue_content_format_test)
+
 # Пропуск вместо падения там, где проигрывать нечем: Windows N/Server без
 # Media Feature Pack и агенты CI без звуковой карты. Проверки контракта API
 # тест выполняет до пропуска, они не зависят от оборудования.
