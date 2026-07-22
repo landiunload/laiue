@@ -878,6 +878,16 @@ WorldRegionContents WorldFillRegion(World* world,
         }
     }
 
+    // И solidCount, и признак травы зависят только от boundary: minBlockZ,
+    // sizeZ и мир в пределах вызова неизменны. Рельеф гладкий, у соседних
+    // колонн граница обычно та же, поэтому хватает памяти на один прошлый
+    // результат. Без неё каждая колонна гоняла бинарный поиск по сравнениям
+    // произвольной точности — на регион 66x66 это ~39 тысяч сравнений.
+    int32_t cachedBoundary = 0;
+    int32_t cachedSolidCount = 0;
+    bool cachedGrass = false;
+    bool cacheValid = false;
+
     for (int32_t y = 0; y < sizeY; ++y)
     {
         for (int32_t x = 0; x < sizeX; ++x)
@@ -886,18 +896,27 @@ WorldRegionContents WorldFillRegion(World* world,
                 ? heights[y * sizeX + x]
                 : TerrainHeight(world, minBlockX + x, minBlockY + y);
             int32_t boundary = ColumnCeiling(height);
-            int32_t solidCount = SolidCountInColumn(
-                world, minBlockZ, sizeZ, boundary);
 
+            if (!cacheValid || boundary != cachedBoundary)
+            {
+                cachedSolidCount = SolidCountInColumn(
+                    world, minBlockZ, sizeZ, boundary);
+                // Верхний сгенерированный solid-блок может лежать на
+                // последней позиции региона, поэтому проверяем также блок
+                // сразу за регионом.
+                cachedGrass = cachedSolidCount > 0
+                    && !IsAbsoluteZBelow(
+                        world, minBlockZ + cachedSolidCount, boundary);
+                cachedBoundary = boundary;
+                cacheValid = true;
+            }
+
+            int32_t solidCount = cachedSolidCount;
             BlockType* column = &outBlocks[(((size_t)y * sizeX) + (size_t)x) * sizeZ];
             memset(column, BLOCK_EARTH, (size_t)solidCount);
             memset(column + solidCount, BLOCK_AIR, (size_t)(sizeZ - solidCount));
 
-            // Верхний сгенерированный solid-блок может лежать на последней
-            // позиции региона, поэтому проверяем также блок сразу за регионом.
-            if (solidCount > 0
-                && !IsAbsoluteZBelow(
-                    world, minBlockZ + solidCount, boundary))
+            if (cachedGrass)
             {
                 column[solidCount - 1] = BLOCK_GRASS;
             }
