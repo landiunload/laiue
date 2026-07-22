@@ -26,7 +26,7 @@ add_executable(laiue_protocol_test
 # src/network/CMakeLists.txt): иначе тест мерил бы не те правила, что
 # работают в игре. Тест TestNonFiniteRejected опирается ровно на это.
 set_source_files_properties(../src/network/protocol.c
-    PROPERTIES COMPILE_OPTIONS "/fp:precise")
+    PROPERTIES COMPILE_OPTIONS "${LAIUE_PRECISE_FP_OPTIONS}")
 target_link_libraries(laiue_protocol_test PRIVATE
     laiue_common
     laiue_runtime
@@ -75,11 +75,11 @@ set(laiue_determinism_sources
     ../src/gameplay/player_stance.c
     ../src/physics/voxel_body.c)
 add_executable(laiue_determinism_test ${laiue_determinism_sources})
-# /fp:precise убирает переассоциацию; -ffp-contract=off (clang-cl) запрещает
-# слияние в FMA. У MSVC /fp:precise контракции и так не делает.
+# Те же опции, что и в боевой сборке этих модулей (см.
+# cmake/LaiueToolchain.cmake): тест обязан мерить те правила, что работают
+# в игре, иначе он стережёт не то.
 set_source_files_properties(${laiue_determinism_sources}
-    PROPERTIES COMPILE_OPTIONS
-        "/fp:precise;$<$<C_COMPILER_ID:Clang>:-ffp-contract=off>")
+    PROPERTIES COMPILE_OPTIONS "${LAIUE_DETERMINISTIC_FP_OPTIONS}")
 target_compile_definitions(laiue_determinism_test PRIVATE
     LAIUE_BUILD_GAMEPLAY
     LAIUE_BUILD_PHYSICS)

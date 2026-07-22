@@ -16,7 +16,7 @@ laiue_add_module(network
 # тестом на битовых представлениях: под clang-cl EncodeInput принимал NaN
 # во все поля. Точная модель FP включается только для этого холодного файла;
 # флаги оптимизации (/O2, /GL и прочие) остаются на месте, скорость кадра не
-# затрагивается. Тот же флаг продублирован в tests/CMakeLists.txt, где
-# protocol.c собирается второй раз.
+# затрагивается. Набор флагов — в cmake/LaiueToolchain.cmake. Те же опции
+# применяются в tests/CMakeLists.txt, где protocol.c собирается второй раз.
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/protocol.c"
-    PROPERTIES COMPILE_OPTIONS "/fp:precise")
+    PROPERTIES COMPILE_OPTIONS "${LAIUE_PRECISE_FP_OPTIONS}")

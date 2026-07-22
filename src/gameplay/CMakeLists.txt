@@ -29,5 +29,4 @@ set_source_files_properties(
     player_locomotion.c
     player_stance.c
     player_jump.c
-    PROPERTIES COMPILE_OPTIONS
-        "/fp:precise;$<$<C_COMPILER_ID:Clang>:-ffp-contract=off>")
+    PROPERTIES COMPILE_OPTIONS "${LAIUE_DETERMINISTIC_FP_OPTIONS}")
