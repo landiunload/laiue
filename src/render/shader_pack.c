@@ -172,15 +172,15 @@ static bool ReadActivePackName(wchar_t* dirPath, uint32_t dirPrefixLen,
             DWORD read = 0;
             if (ReadFile(activeFile, outName, (DWORD)size.QuadPart, &read, NULL))
             {
-                uint32_t len = (uint32_t)size.QuadPart;
-                while (len > 0 && (outName[len - 1] == ' '
-                    || outName[len - 1] == '\n' || outName[len - 1] == '\r'))
+                uint32_t activeNameLength = (uint32_t)size.QuadPart;
+                while (activeNameLength > 0 && (outName[activeNameLength - 1] == ' '
+                    || outName[activeNameLength - 1] == '\n' || outName[activeNameLength - 1] == '\r'))
                 {
-                    --len;
+                    --activeNameLength;
                 }
-                outName[len] = '\0';
-                *outNameLen = len;
-                hasActive = len > 0;
+                outName[activeNameLength] = '\0';
+                *outNameLen = activeNameLength;
+                hasActive = activeNameLength > 0;
             }
         }
         CloseHandle(activeFile);
@@ -188,7 +188,7 @@ static bool ReadActivePackName(wchar_t* dirPath, uint32_t dirPrefixLen,
     return hasActive;
 }
 
-static void* LoadCsoFile(const wchar_t* fullPath, uint32_t* outLength)
+static void* LoadCompiledShaderFile(const wchar_t* fullPath, uint32_t* outLength)
 {
     HANDLE file = CreateFileW(fullPath, GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -231,7 +231,7 @@ static void* LoadCsoFile(const wchar_t* fullPath, uint32_t* outLength)
 static bool IsCompatibleManifest(const wchar_t* fullPath)
 {
     uint32_t length = 0;
-    uint8_t* data = LoadCsoFile(fullPath, &length);
+    uint8_t* data = LoadCompiledShaderFile(fullPath, &length);
     if (data == NULL || length > SHADER_MANIFEST_MAX)
     {
         if (data != NULL) HeapFree(GetProcessHeap(), 0, data);
@@ -356,7 +356,7 @@ bool ShaderPackLoadActiveBytecode(
         }
         pathBuf[packDirLen + sfxLen] = L'\0';
 
-        void* data = LoadCsoFile(pathBuf, outLengths[i]);
+        void* data = LoadCompiledShaderFile(pathBuf, outLengths[i]);
         *outPtrs[i] = data;
         anyLoaded = anyLoaded || data != NULL;
     }
