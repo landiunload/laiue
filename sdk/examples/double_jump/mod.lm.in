@@ -1,4 +1,4 @@
-LAIUE MOD 1
+LAIUE MOD 2
 name = Double Jump
 author = laiue
 id = laiue.double_jump
@@ -7,5 +7,5 @@ side = client
 game = 0.5
 
 [native]
-entry = double_jump.dll
+@LAIUE_MOD_NATIVE_ENTRIES@
 api = 1

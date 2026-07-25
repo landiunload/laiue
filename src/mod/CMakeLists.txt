@@ -6,7 +6,6 @@ laiue_add_module(mod
         mods.h
         ../api.h
     LINK
-        bcrypt
         laiue_content
         laiue_world
         laiue_gameplay

@@ -20,11 +20,11 @@ static bool BuildServersPath(wchar_t* output, uint32_t capacity)
     return true;
 }
 
-static bool SliceEquals(const char* bytes, uint32_t length, const char* text)
+static uint32_t NarrowLength(const char* text)
 {
-    uint32_t i = 0;
-    while (i < length && text[i] != '\0' && bytes[i] == text[i]) ++i;
-    return i == length && text[i] == '\0';
+    uint32_t length = 0;
+    while (text[length] != '\0') ++length;
+    return length;
 }
 
 static bool ParsePort(const char* bytes, uint32_t length, uint16_t* output)
@@ -61,17 +61,44 @@ static bool ParseLine(const char* line, uint32_t length,
     uint32_t second = first + 1U;
     while (second < length && line[second] != '|') ++second;
     if (second == first + 1U || second == length) return false;
-    uint32_t addressLength = second - first - 1U;
-    const char* address = line + first + 1U;
-    if (!SliceEquals(address, addressLength, "127.0.0.1")
-        && !SliceEquals(address, addressLength, "localhost")) return false;
-
+    uint32_t endpointLength = second - first - 1U;
+    const char* endpointText = line + first + 1U;
+    uint32_t thirdLength = length - second - 1U;
+    if (endpointLength >= LAIUE_NETWORK_HOST_CAPACITY
+        || thirdLength == 0 || thirdLength >= 80U) return false;
+    char endpointUtf8[LAIUE_NETWORK_HOST_CAPACITY];
+    memcpy(endpointUtf8, endpointText, endpointLength);
+    endpointUtf8[endpointLength] = '\0';
     memset(entry, 0, sizeof(*entry));
+    uint16_t legacyPort = 0;
+    bool legacy = ParsePort(
+        line + second + 1U, thirdLength, &legacyPort);
+    NetworkEndpointParseResult endpointResult = NetworkEndpointParse(
+        endpointUtf8,
+        legacy ? legacyPort : LAIUE_NETWORK_DEFAULT_PORT,
+        &entry->endpoint);
+    if (endpointResult != NETWORK_ENDPOINT_PARSE_OK) return false;
+    if (legacy)
+    {
+        entry->trustMode = NETWORK_TRUST_SYSTEM;
+        entry->endpoint.port = legacyPort;
+    }
+    else
+    {
+        char trust[80];
+        memcpy(trust, line + second + 1U, thirdLength);
+        trust[thirdLength] = '\0';
+        if (!NetworkTrustParse(trust, &entry->trustMode,
+                entry->certificateSha256))
+            return false;
+    }
+    entry->port = entry->endpoint.port;
     return CopyUtf8(line, first, entry->name, SERVER_LIST_TEXT_CAPACITY)
-        && CopyUtf8(address, addressLength, entry->address,
+        && CopyUtf8(entry->endpoint.host,
+            NarrowLength(entry->endpoint.host), entry->address,
             SERVER_LIST_TEXT_CAPACITY)
-        && ParsePort(line + second + 1U, length - second - 1U,
-            &entry->port);
+        && CopyUtf8(endpointText, endpointLength, entry->endpointText,
+            SERVER_LIST_TEXT_CAPACITY);
 }
 
 bool ServerListLoad(ServerList* list)
@@ -121,8 +148,12 @@ bool ServerListLoad(ServerList* list)
     {
         ServerListEntry* entry = &list->entries[0];
         memcpy(entry->name, L"Локальный сервер", sizeof(L"Локальный сервер"));
-        memcpy(entry->address, L"127.0.0.1", sizeof(L"127.0.0.1"));
-        entry->port = 27180U;
+        memcpy(entry->address, L"localhost", sizeof(L"localhost"));
+        memcpy(entry->endpointText, L"localhost", sizeof(L"localhost"));
+        NetworkEndpointParse("localhost", LAIUE_NETWORK_DEFAULT_PORT,
+            &entry->endpoint);
+        entry->port = entry->endpoint.port;
+        entry->trustMode = NETWORK_TRUST_SYSTEM;
         list->count = 1;
     }
     return true;

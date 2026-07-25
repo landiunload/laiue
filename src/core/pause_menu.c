@@ -279,21 +279,20 @@ static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
             (uint32_t)(sizeof(label) / sizeof(label[0])));
         UiTextBuilderAppend(&labelBuilder, list->entries[serverIndex].name);
         UiTextBuilderAppend(&labelBuilder, L" — ");
-        UiTextBuilderAppend(&labelBuilder, list->entries[serverIndex].address);
-        UiTextBuilderAppendChar(&labelBuilder, L':');
-        UiTextBuilderAppendUnsigned(&labelBuilder, list->entries[serverIndex].port);
+        UiTextBuilderAppend(&labelBuilder,
+            list->entries[serverIndex].endpointText);
         if (UiButton(ui, WIDGET_SERVER_FIRST + i, contentX, y,
                 contentWidth, 38.0f * s,
                 menu->networkConnecting
-                    && menu->selectedServerPort == list->entries[serverIndex].port
+                    && menu->selectedServerIndex == serverIndex
                     ? L"Подключение…" : label)
             && !menu->networkConnecting)
         {
             menu->networkConnecting = true;
             menu->networkRejected = false;
             menu->contentDownloadFailed = false;
-            menu->selectedServerPort = list->entries[serverIndex].port;
-            return PAUSE_MENU_ACTION_CONNECT_LOCAL;
+            menu->selectedServerIndex = serverIndex;
+            return PAUSE_MENU_ACTION_CONNECT_SERVER;
         }
         y += 44.0f * s;
     }

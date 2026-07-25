@@ -1,58 +1,61 @@
 #include "mod/mod_host.h"
 #include "mod/mods.h"
 #include "content/content_catalog.h"
+#include "platform/system.h"
 #include "world/block_properties.h"
 
 #include "laiue_mod_api.h"
 
-#include <windows.h>
 #include <string.h>
 
 #define MOD_LOG_FILE_NAME L"mod_log.txt"
 #define MOD_LOG_MAX_CHARS 512
+#define MOD_LOG_UTF8_CAPACITY (MOD_LOG_MAX_CHARS * 4)
 #define MOD_HOST_PATH_CAPACITY 1024
+
+_Static_assert(sizeof(LaiueModInitFunction) == sizeof(void *),
+               "dynamic-library symbols must fit native function pointers");
+_Static_assert(sizeof(LaiueModShutdownFunction) == sizeof(void *),
+               "dynamic-library symbols must fit native function pointers");
 
 struct ModHostSlot
 {
     bool used;
-    wchar_t packName[MOD_HOST_NAME_CAPACITY];  // имя каталога .lmp
-    HMODULE module;
+    wchar_t packName[MOD_HOST_NAME_CAPACITY]; // имя каталога .lmp
+    PlatformDynamicLibrary module;
     LaiueModShutdownFunction shutdown;
-    LaiueModApi api;                            // api.host -> этот слот
-    ModHost* owner;
+    LaiueModApi api; // api.host -> этот слот
+    ModHost *owner;
 
     LaiueFrameCallback frameCallback;
-    void* frameUser;
+    void *frameUser;
     LaiueFixedTickCallback fixedTickCallback;
-    void* fixedTickUser;
+    void *fixedTickUser;
     LaiueBlockEditCallback blockEditCallback;
-    void* blockEditUser;
+    void *blockEditUser;
 };
 
-static ModHostSlot* SlotFromHostPointer(void* hostPointer)
+static ModHostSlot *SlotFromHostPointer(void *hostPointer)
 {
-    return (ModHostSlot*)hostPointer;
+    return (ModHostSlot *)hostPointer;
 }
 
-// === Журнал: OutputDebugString + mods/mod_log.txt (UTF-8, append) ===
+// === Журнал: console/debug output + mods/mod_log.txt (UTF-8, append) ===
 
-static void AppendLogFile(const wchar_t* line)
+static void AppendLogFile(const wchar_t *line)
 {
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
     if (path == NULL)
-    {
         return;
-    }
-
-    if (LaiueContentBuildPath(LAIUE_CONTENT_MOD, NULL, NULL,
-            path, LAIUE_CONTENT_PATH_CAPACITY))
+    if (LaiueContentBuildPath(LAIUE_CONTENT_MOD, NULL, NULL, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
         uint32_t length = 0;
-        while (path[length] != L'\0') ++length;
-        const wchar_t* suffix = L"\\" MOD_LOG_FILE_NAME;
+        while (path[length] != L'\0')
+            ++length;
+        const wchar_t *suffix = L"/" MOD_LOG_FILE_NAME;
         uint32_t suffixLength = 0;
-        while (suffix[suffixLength] != L'\0') ++suffixLength;
+        while (suffix[suffixLength] != L'\0')
+            ++suffixLength;
         if (length + suffixLength + 1 <= LAIUE_CONTENT_PATH_CAPACITY)
         {
             for (uint32_t i = 0; i <= suffixLength; ++i)
@@ -60,77 +63,82 @@ static void AppendLogFile(const wchar_t* line)
                 path[length + i] = suffix[i];
             }
 
-            HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                FILE_SHARE_READ, NULL, OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL, NULL);
-            if (file != INVALID_HANDLE_VALUE)
+            char *utf8 = PlatformAllocate(MOD_LOG_UTF8_CAPACITY, false);
+            uint32_t written = 0;
+            if (utf8 != NULL &&
+                PlatformWideToUtf8(line, utf8, MOD_LOG_UTF8_CAPACITY - 2U, &written) &&
+                written + 1U < MOD_LOG_UTF8_CAPACITY)
             {
-                char utf8[MOD_LOG_MAX_CHARS * 3];
-                int written = WideCharToMultiByte(CP_UTF8, 0, line, -1,
-                    utf8, (int)sizeof(utf8) - 2, NULL, NULL);
-                if (written > 1)
-                {
-                    utf8[written - 1] = '\r';
-                    utf8[written] = '\n';
-                    DWORD ignored = 0;
-                    WriteFile(file, utf8, (DWORD)written + 1, &ignored, NULL);
-                }
-                CloseHandle(file);
+                utf8[written++] = '\n';
+                PlatformAppendFile(path, utf8, written);
             }
+            PlatformFree(utf8);
         }
     }
-    HeapFree(GetProcessHeap(), 0, path);
+    PlatformFree(path);
 }
 
-static void ApiLog(void* hostPointer, const wchar_t* message)
+static void ApiLog(void *hostPointer, const wchar_t *message)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (slot == NULL || message == NULL)
     {
         return;
     }
 
-    wchar_t line[MOD_LOG_MAX_CHARS];
+    wchar_t *line = PlatformAllocate(
+        (size_t)MOD_LOG_MAX_CHARS * sizeof(wchar_t), false);
+    char *console = PlatformAllocate(MOD_LOG_UTF8_CAPACITY, false);
+    if (line == NULL || console == NULL)
+    {
+        PlatformFree(console);
+        PlatformFree(line);
+        return;
+    }
     uint32_t length = 0;
     line[length++] = L'[';
-    for (uint32_t i = 0; slot->packName[i] != L'\0'
-        && length + 2 < MOD_LOG_MAX_CHARS; ++i)
+    for (uint32_t i = 0; slot->packName[i] != L'\0' && length + 2 < MOD_LOG_MAX_CHARS; ++i)
     {
         line[length++] = slot->packName[i];
     }
     line[length++] = L']';
     line[length++] = L' ';
-    for (uint32_t i = 0; message[i] != L'\0'
-        && length + 1 < MOD_LOG_MAX_CHARS; ++i)
+    for (uint32_t i = 0; message[i] != L'\0' && length + 1 < MOD_LOG_MAX_CHARS; ++i)
     {
         line[length++] = message[i];
     }
     line[length] = L'\0';
 
-    OutputDebugStringW(line);
-    OutputDebugStringW(L"\n");
+    uint32_t consoleLength = 0;
+    if (PlatformWideToUtf8(line, console, MOD_LOG_UTF8_CAPACITY - 2U, &consoleLength) &&
+        consoleLength + 1U < MOD_LOG_UTF8_CAPACITY)
+    {
+        console[consoleLength++] = '\n';
+        console[consoleLength] = '\0';
+        PlatformWriteConsoleUtf8(console);
+    }
     AppendLogFile(line);
+    PlatformFree(console);
+    PlatformFree(line);
 }
 
 // === Таблица API ===
 
-static uint8_t ApiGetBlock(void* hostPointer,
-    int64_t x, int64_t y, int64_t z)
+static uint8_t ApiGetBlock(void *hostPointer, int64_t x, int64_t y, int64_t z)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     return (uint8_t)WorldGetBlock(slot->owner->bindings.world, x, y, z);
 }
 
-static bool ApiSetBlock(void* hostPointer,
-    int64_t x, int64_t y, int64_t z, uint8_t block)
+static bool ApiSetBlock(void *hostPointer, int64_t x, int64_t y, int64_t z, uint8_t block)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (block > LAIUE_BLOCK_GRASS)
     {
-        return false;  // неизвестный этой версии игры тип
+        return false; // неизвестный этой версии игры тип
     }
 
-    ModHostBindings* bindings = &slot->owner->bindings;
+    ModHostBindings *bindings = &slot->owner->bindings;
     WorldSetBlock(bindings->world, x, y, z, (BlockType)block);
     if (bindings->invalidateBlock != NULL)
     {
@@ -139,10 +147,10 @@ static bool ApiSetBlock(void* hostPointer,
     return true;
 }
 
-static void ApiGetPlayerPosition(void* hostPointer, double outPosition[3])
+static void ApiGetPlayerPosition(void *hostPointer, double outPosition[3])
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    const Camera* camera = slot->owner->bindings.camera;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    const Camera *camera = slot->owner->bindings.camera;
     if (camera == NULL)
     {
         outPosition[0] = 0.0;
@@ -155,12 +163,12 @@ static void ApiGetPlayerPosition(void* hostPointer, double outPosition[3])
     outPosition[2] = camera->position[2];
 }
 
-static void ApiSetPlayerPosition(void* hostPointer,
-    const double position[3])
+static void ApiSetPlayerPosition(void *hostPointer, const double position[3])
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    ModHostBindings* bindings = &slot->owner->bindings;
-    if (bindings->camera == NULL || bindings->player == NULL) return;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    ModHostBindings *bindings = &slot->owner->bindings;
+    if (bindings->camera == NULL || bindings->player == NULL)
+        return;
     bindings->camera->position[0] = position[0];
     bindings->camera->position[1] = position[1];
     bindings->camera->position[2] = position[2];
@@ -168,10 +176,10 @@ static void ApiSetPlayerPosition(void* hostPointer,
     PlayerControllerReset(bindings->player, bindings->camera);
 }
 
-static void ApiGetViewDirection(void* hostPointer, float outDirection[3])
+static void ApiGetViewDirection(void *hostPointer, float outDirection[3])
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    ModHostBindings* bindings = &slot->owner->bindings;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    ModHostBindings *bindings = &slot->owner->bindings;
     if (bindings->getViewDirection != NULL)
     {
         bindings->getViewDirection(bindings->viewContext, outDirection);
@@ -184,86 +192,94 @@ static void ApiGetViewDirection(void* hostPointer, float outDirection[3])
     }
 }
 
-static void ApiApplyImpulse(void* hostPointer, float x, float y, float z)
+static void ApiApplyImpulse(void *hostPointer, float x, float y, float z)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    PlayerController* player = slot->owner->bindings.player;
-    if (player != NULL) PlayerControllerApplyImpulse(player, x, y, z);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    PlayerController *player = slot->owner->bindings.player;
+    if (player != NULL)
+        PlayerControllerApplyImpulse(player, x, y, z);
 }
 
-static bool ApiIsPlayerGrounded(void* hostPointer)
+static bool ApiIsPlayerGrounded(void *hostPointer)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    PlayerController* player = slot->owner->bindings.player;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    PlayerController *player = slot->owner->bindings.player;
     return player != NULL && PlayerControllerIsGrounded(player);
 }
 
-static uint32_t ApiGetGameMode(void* hostPointer)
+static uint32_t ApiGetGameMode(void *hostPointer)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    GameMode* gameMode = slot->owner->bindings.gameMode;
-    return gameMode != NULL && *gameMode == GAME_MODE_WALK
-        ? LAIUE_GAME_MODE_WALK : LAIUE_GAME_MODE_FLY;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    GameMode *gameMode = slot->owner->bindings.gameMode;
+    return gameMode != NULL && *gameMode == GAME_MODE_WALK ? LAIUE_GAME_MODE_WALK
+                                                           : LAIUE_GAME_MODE_FLY;
 }
 
-static float ApiGetTimeHours(void* hostPointer)
+static float ApiGetTimeHours(void *hostPointer)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    float* time = slot->owner->bindings.timeOfDayHours;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    float *time = slot->owner->bindings.timeOfDayHours;
     return time != NULL ? *time : 0.0f;
 }
 
-static void ApiSetTimeHours(void* hostPointer, float hours)
+static void ApiSetTimeHours(void *hostPointer, float hours)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    if (slot->owner->bindings.timeOfDayHours == NULL) return;
-    while (hours >= 24.0f) hours -= 24.0f;
-    while (hours < 0.0f) hours += 24.0f;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    if (slot->owner->bindings.timeOfDayHours == NULL)
+        return;
+    while (hours >= 24.0f)
+        hours -= 24.0f;
+    while (hours < 0.0f)
+        hours += 24.0f;
     *slot->owner->bindings.timeOfDayHours = hours;
 }
 
-static void ApiSetAirJumps(void* hostPointer,
-    int32_t extraJumps, float impulse, bool refillOnGround)
+static void ApiSetAirJumps(void *hostPointer, int32_t extraJumps, float impulse,
+                           bool refillOnGround)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
-    if (extraJumps < 0) extraJumps = 0;
-    if (extraJumps > 3) extraJumps = 3;
-    if (impulse < 1.0f) impulse = 1.0f;
-    if (impulse > 20.0f) impulse = 20.0f;
-    PlayerController* player = slot->owner->bindings.player;
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
+    if (extraJumps < 0)
+        extraJumps = 0;
+    if (extraJumps > 3)
+        extraJumps = 3;
+    if (impulse < 1.0f)
+        impulse = 1.0f;
+    if (impulse > 20.0f)
+        impulse = 20.0f;
+    PlayerController *player = slot->owner->bindings.player;
     if (player != NULL)
     {
-        PlayerControllerSetAirJumps(player,
-            extraJumps, (double)impulse, refillOnGround);
+        PlayerControllerSetAirJumps(player, extraJumps, (double)impulse, refillOnGround);
     }
 }
 
 // === Межмодовые интерфейсы ===
 
-static bool InterfaceNamesEqual(const char* a, const char* b)
+static bool InterfaceNamesEqual(const char *a, const char *b)
 {
     uint32_t i = 0;
-    while (a[i] != '\0' && a[i] == b[i]) ++i;
+    while (a[i] != '\0' && a[i] == b[i])
+        ++i;
     return a[i] == b[i];
 }
 
-static bool ApiPublishInterface(void* hostPointer,
-    const char* name, uint32_t version, void* interfacePointer)
+static bool ApiPublishInterface(void *hostPointer, const char *name, uint32_t version,
+                                void *interfacePointer)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (name == NULL || name[0] == '\0' || interfacePointer == NULL)
     {
         return false;
     }
 
-    ModHost* host = slot->owner;
-    ModHostInterface* free = NULL;
+    ModHost *host = slot->owner;
+    ModHostInterface *free = NULL;
     for (uint32_t i = 0; i < MOD_HOST_MAX_INTERFACES; ++i)
     {
-        ModHostInterface* entry = &host->interfaces[i];
+        ModHostInterface *entry = &host->interfaces[i];
         if (entry->used && InterfaceNamesEqual(entry->name, name))
         {
-            return false;  // имя занято другой библиотекой
+            return false; // имя занято другой библиотекой
         }
         if (!entry->used && free == NULL)
         {
@@ -276,8 +292,7 @@ static bool ApiPublishInterface(void* hostPointer,
     }
 
     uint32_t i = 0;
-    while (name[i] != '\0'
-        && i + 1 < MOD_HOST_INTERFACE_NAME_CAPACITY)
+    while (name[i] != '\0' && i + 1 < MOD_HOST_INTERFACE_NAME_CAPACITY)
     {
         free->name[i] = name[i];
         ++i;
@@ -290,20 +305,19 @@ static bool ApiPublishInterface(void* hostPointer,
     return true;
 }
 
-static void* ApiQueryInterface(void* hostPointer,
-    const char* name, uint32_t minimumVersion)
+static void *ApiQueryInterface(void *hostPointer, const char *name, uint32_t minimumVersion)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (name == NULL)
     {
         return NULL;
     }
-    ModHost* host = slot->owner;
+    ModHost *host = slot->owner;
     for (uint32_t i = 0; i < MOD_HOST_MAX_INTERFACES; ++i)
     {
-        ModHostInterface* entry = &host->interfaces[i];
-        if (entry->used && entry->version >= minimumVersion
-            && InterfaceNamesEqual(entry->name, name))
+        ModHostInterface *entry = &host->interfaces[i];
+        if (entry->used && entry->version >= minimumVersion &&
+            InterfaceNamesEqual(entry->name, name))
         {
             return entry->pointer;
         }
@@ -311,9 +325,9 @@ static void* ApiQueryInterface(void* hostPointer,
     return NULL;
 }
 
-static void RemoveSlotInterfaces(ModHostSlot* slot)
+static void RemoveSlotInterfaces(ModHostSlot *slot)
 {
-    ModHost* host = slot->owner;
+    ModHost *host = slot->owner;
     for (uint32_t i = 0; i < MOD_HOST_MAX_INTERFACES; ++i)
     {
         if (host->interfaces[i].used && host->interfaces[i].owner == slot)
@@ -323,18 +337,16 @@ static void RemoveSlotInterfaces(ModHostSlot* slot)
     }
 }
 
-static void ApiSetFrameCallback(void* hostPointer,
-    LaiueFrameCallback callback, void* user)
+static void ApiSetFrameCallback(void *hostPointer, LaiueFrameCallback callback, void *user)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     slot->frameCallback = callback;
     slot->frameUser = user;
 }
 
-static void ApiSetFixedTickCallback(void* hostPointer,
-    LaiueFixedTickCallback callback, void* user)
+static void ApiSetFixedTickCallback(void *hostPointer, LaiueFixedTickCallback callback, void *user)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     slot->fixedTickCallback = callback;
     slot->fixedTickUser = user;
 }
@@ -343,10 +355,9 @@ static void ApiSetFixedTickCallback(void* hostPointer,
 
 #define MOD_DATA_MAX_BYTES (16u * 1024u * 1024u)
 
-static bool BuildModDataPath(ModHostSlot* slot,
-    wchar_t* path, uint32_t capacity)
+static bool BuildModDataPath(ModHostSlot *slot, wchar_t *path, uint32_t capacity)
 {
-    const wchar_t* directory = slot->owner->bindings.modDataDirectory;
+    const wchar_t *directory = slot->owner->bindings.modDataDirectory;
     if (directory == NULL || directory[0] == L'\0')
     {
         return false;
@@ -362,13 +373,12 @@ static bool BuildModDataPath(ModHostSlot* slot,
     {
         return false;
     }
-    path[length++] = L'\\';
-    for (uint32_t i = 0; slot->packName[i] != L'\0'
-        && length + 5 < capacity; ++i)
+    path[length++] = L'/';
+    for (uint32_t i = 0; slot->packName[i] != L'\0' && length + 5 < capacity; ++i)
     {
         path[length++] = slot->packName[i];
     }
-    const wchar_t* extension = L".bin";
+    const wchar_t *extension = L".bin";
     for (uint32_t i = 0; extension[i] != L'\0' && length + 1 < capacity; ++i)
     {
         path[length++] = extension[i];
@@ -377,10 +387,9 @@ static bool BuildModDataPath(ModHostSlot* slot,
     return true;
 }
 
-static bool ApiWriteModData(void* hostPointer,
-    const void* bytes, uint32_t size)
+static bool ApiWriteModData(void *hostPointer, const void *bytes, uint32_t size)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (bytes == NULL || size == 0 || size > MOD_DATA_MAX_BYTES)
     {
         return false;
@@ -392,23 +401,12 @@ static bool ApiWriteModData(void* hostPointer,
         return false;
     }
 
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-    DWORD written = 0;
-    bool succeeded = WriteFile(file, bytes, size, &written, NULL)
-        && written == size;
-    CloseHandle(file);
-    return succeeded;
+    return PlatformWriteFileAtomic(path, bytes, size);
 }
 
-static uint32_t ApiReadModData(void* hostPointer,
-    void* buffer, uint32_t capacity)
+static uint32_t ApiReadModData(void *hostPointer, void *buffer, uint32_t capacity)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     if (buffer == NULL || capacity == 0)
     {
         return 0;
@@ -420,47 +418,28 @@ static uint32_t ApiReadModData(void* hostPointer,
         return 0;
     }
 
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return 0;
-    }
-
-    LARGE_INTEGER size;
+    uint8_t *bytes = NULL;
+    uint64_t size = 0;
     uint32_t result = 0;
-    if (GetFileSizeEx(file, &size) && size.QuadPart > 0
-        && size.QuadPart <= (LONGLONG)capacity)
+    if (PlatformReadEntireFile(path, capacity, &bytes, &size) && size > 0 && size <= capacity)
     {
-        uint32_t length = (uint32_t)size.QuadPart;
-        uint32_t completed = 0;
-        while (completed < length)
-        {
-            DWORD read = 0;
-            if (!ReadFile(file, (uint8_t*)buffer + completed,
-                    length - completed, &read, NULL) || read == 0)
-            {
-                break;
-            }
-            completed += read;
-        }
-        result = completed == length ? length : 0;
+        memcpy(buffer, bytes, (size_t)size);
+        result = (uint32_t)size;
     }
-    CloseHandle(file);
+    PlatformFree(bytes);
     return result;
 }
 
-static void ApiSetBlockEditCallback(void* hostPointer,
-    LaiueBlockEditCallback callback, void* user)
+static void ApiSetBlockEditCallback(void *hostPointer, LaiueBlockEditCallback callback, void *user)
 {
-    ModHostSlot* slot = SlotFromHostPointer(hostPointer);
+    ModHostSlot *slot = SlotFromHostPointer(hostPointer);
     slot->blockEditCallback = callback;
     slot->blockEditUser = user;
 }
 
-static void FillApi(ModHostSlot* slot)
+static void FillApi(ModHostSlot *slot)
 {
-    LaiueModApi* api = &slot->api;
+    LaiueModApi *api = &slot->api;
     memset(api, 0, sizeof(*api));
     api->structSize = sizeof(*api);
     api->apiVersion = LAIUE_MOD_API_VERSION;
@@ -490,25 +469,24 @@ static void FillApi(ModHostSlot* slot)
 
 // === Жизненный цикл ===
 
-bool ModHostInit(ModHost* host, const ModHostBindings* bindings)
+bool ModHostInit(ModHost *host, const ModHostBindings *bindings)
 {
     host->bindings = *bindings;
     memset(host->interfaces, 0, sizeof(host->interfaces));
     host->fixedTickAccumulator = 0.0f;
-    host->slots = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)MOD_HOST_MAX_MODS * sizeof(ModHostSlot));
+    host->slots = PlatformAllocate((size_t)MOD_HOST_MAX_MODS * sizeof(ModHostSlot), true);
     return host->slots != NULL;
 }
 
-static void UnloadSlot(ModHostSlot* slot)
+static void UnloadSlot(ModHostSlot *slot)
 {
     if (!slot->used)
     {
         return;
     }
 
-    // Колбеки и интерфейсы снимаются до FreeLibrary: указатели
-    // в выгруженную DLL не должны пережить её.
+    // Колбеки и интерфейсы снимаются до unload: указатели
+    // в выгруженную DLL/SO не должны пережить её.
     slot->frameCallback = NULL;
     slot->blockEditCallback = NULL;
     RemoveSlotInterfaces(slot);
@@ -518,12 +496,12 @@ static void UnloadSlot(ModHostSlot* slot)
     }
     if (slot->module != NULL)
     {
-        FreeLibrary(slot->module);
+        PlatformDynamicLibraryClose(slot->module);
     }
     memset(slot, 0, sizeof(*slot));
 }
 
-void ModHostShutdown(ModHost* host)
+void ModHostShutdown(ModHost *host)
 {
     if (host->slots == NULL)
     {
@@ -533,21 +511,22 @@ void ModHostShutdown(ModHost* host)
     {
         UnloadSlot(&host->slots[i]);
     }
-    HeapFree(GetProcessHeap(), 0, host->slots);
+    PlatformFree(host->slots);
     host->slots = NULL;
 }
 
-static bool WideNamesEqual(const wchar_t* a, const wchar_t* b)
+static bool WideNamesEqual(const wchar_t *a, const wchar_t *b)
 {
     uint32_t i = 0;
-    while (a[i] != L'\0' && a[i] == b[i]) ++i;
+    while (a[i] != L'\0' && a[i] == b[i])
+        ++i;
     return a[i] == b[i];
 }
 
 // Загружает мод и отписывает фактический статус прямо в entry.
-static void LoadSlot(ModHost* host, ModEntry* entry)
+static void LoadSlot(ModHost *host, ModEntry *entry)
 {
-    ModHostSlot* slot = NULL;
+    ModHostSlot *slot = NULL;
     for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
     {
         if (!host->slots[i].used)
@@ -562,30 +541,29 @@ static void LoadSlot(ModHost* host, ModEntry* entry)
         return;
     }
 
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
     if (path == NULL)
     {
         entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
         return;
     }
-    bool pathOk = LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK,
-        entry->fileName, entry->entryDll, path,
-        LAIUE_CONTENT_PATH_CAPACITY);
+    bool pathOk = LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK, entry->fileName, entry->entryDll,
+                                        path, LAIUE_CONTENT_PATH_CAPACITY);
 
-    HMODULE module = pathOk ? LoadLibraryW(path) : NULL;
-    HeapFree(GetProcessHeap(), 0, path);
+    PlatformDynamicLibrary module = pathOk ? PlatformDynamicLibraryOpen(path) : NULL;
+    PlatformFree(path);
     if (module == NULL)
     {
         entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
         return;
     }
 
-    LaiueModInitFunction initialize = (LaiueModInitFunction)
-        (void*)GetProcAddress(module, "LaiueModInit");
+    LaiueModInitFunction initialize = NULL;
+    void *initializeSymbol = PlatformDynamicLibrarySymbol(module, "LaiueModInit");
+    memcpy(&initialize, &initializeSymbol, sizeof(initialize));
     if (initialize == NULL)
     {
-        FreeLibrary(module);
+        PlatformDynamicLibraryClose(module);
         entry->runtimeStatus = MOD_RUNTIME_LOAD_FAILED;
         return;
     }
@@ -594,8 +572,8 @@ static void LoadSlot(ModHost* host, ModEntry* entry)
     slot->used = true;
     slot->owner = host;
     slot->module = module;
-    slot->shutdown = (LaiueModShutdownFunction)
-        (void*)GetProcAddress(module, "LaiueModShutdown");
+    void *shutdownSymbol = PlatformDynamicLibrarySymbol(module, "LaiueModShutdown");
+    memcpy(&slot->shutdown, &shutdownSymbol, sizeof(slot->shutdown));
     uint32_t c = 0;
     while (entry->fileName[c] != L'\0' && c + 1 < MOD_HOST_NAME_CAPACITY)
     {
@@ -611,9 +589,9 @@ static void LoadSlot(ModHost* host, ModEntry* entry)
         // Причина в журнал: типично «нет библиотеки-зависимости».
         wchar_t line[64] = L"отклонил инициализацию, код ";
         uint32_t length = 0;
-        while (line[length] != L'\0') ++length;
-        uint32_t value = initResult < 0
-            ? (uint32_t)(-initResult) : (uint32_t)initResult;
+        while (line[length] != L'\0')
+            ++length;
+        uint32_t value = initResult < 0 ? (uint32_t)(-initResult) : (uint32_t)initResult;
         if (initResult < 0 && length + 1 < 63)
         {
             line[length++] = L'-';
@@ -624,8 +602,7 @@ static void LoadSlot(ModHost* host, ModEntry* entry)
         {
             digits[digitCount++] = (wchar_t)(L'0' + value % 10u);
             value /= 10u;
-        }
-        while (value != 0u && digitCount < 11u);
+        } while (value != 0u && digitCount < 11u);
         while (digitCount > 0u && length + 1 < 63)
         {
             line[length++] = digits[--digitCount];
@@ -643,7 +620,7 @@ static void LoadSlot(ModHost* host, ModEntry* entry)
     entry->runtimeStatus = MOD_RUNTIME_LOADED;
 }
 
-void ModHostSync(ModHost* host, ModsState* mods)
+void ModHostSync(ModHost *host, ModsState *mods)
 {
     if (host->slots == NULL)
     {
@@ -652,15 +629,14 @@ void ModHostSync(ModHost* host, ModsState* mods)
 
     // Желаемая цепочка: включённые совместимые моды в порядке
     // enabled.txt (он же порядок публикации библиотек и хуков).
-    ModEntry* desired[MOD_HOST_MAX_MODS];
+    ModEntry *desired[MOD_HOST_MAX_MODS];
     uint32_t desiredCount = 0;
-    for (uint32_t i = 0; i < mods->enabledCount
-        && desiredCount < MOD_HOST_MAX_MODS; ++i)
+    for (uint32_t i = 0; i < mods->enabledCount && desiredCount < MOD_HOST_MAX_MODS; ++i)
     {
-        ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
+        ModEntry *entry = &mods->entries[mods->enabledOrder[i]];
         bool sideMatches = host->bindings.runtimeSide == MOD_SIDE_SERVER
-            ? entry->side != MOD_SIDE_CLIENT
-            : entry->side != MOD_SIDE_SERVER;
+                               ? entry->side != MOD_SIDE_CLIENT
+                               : entry->side != MOD_SIDE_SERVER;
         if (entry->enabled && entry->compatible && sideMatches)
         {
             desired[desiredCount++] = entry;
@@ -681,8 +657,8 @@ void ModHostSync(ModHost* host, ModsState* mods)
         {
             continue;
         }
-        matches = loaded < desiredCount && WideNamesEqual(
-            host->slots[i].packName, desired[loaded]->fileName);
+        matches = loaded < desiredCount &&
+                  WideNamesEqual(host->slots[i].packName, desired[loaded]->fileName);
         ++loaded;
     }
     if (matches && loaded == desiredCount)
@@ -713,7 +689,7 @@ void ModHostSync(ModHost* host, ModsState* mods)
     }
 }
 
-void ModHostDispatchFrame(ModHost* host, float deltaSeconds)
+void ModHostDispatchFrame(ModHost *host, float deltaSeconds)
 {
     if (host->slots == NULL)
     {
@@ -724,18 +700,17 @@ void ModHostDispatchFrame(ModHost* host, float deltaSeconds)
     // защищает от лавины после долгого кадра; хвост не копится.
     host->fixedTickAccumulator += deltaSeconds;
     uint32_t steps = 0;
-    while (host->fixedTickAccumulator >= MOD_HOST_FIXED_STEP_SECONDS
-        && steps < MOD_HOST_MAX_FIXED_STEPS_PER_FRAME)
+    while (host->fixedTickAccumulator >= MOD_HOST_FIXED_STEP_SECONDS &&
+           steps < MOD_HOST_MAX_FIXED_STEPS_PER_FRAME)
     {
         host->fixedTickAccumulator -= MOD_HOST_FIXED_STEP_SECONDS;
         ++steps;
         for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
         {
-            ModHostSlot* slot = &host->slots[i];
+            ModHostSlot *slot = &host->slots[i];
             if (slot->used && slot->fixedTickCallback != NULL)
             {
-                slot->fixedTickCallback(slot->fixedTickUser,
-                    MOD_HOST_FIXED_STEP_SECONDS);
+                slot->fixedTickCallback(slot->fixedTickUser, MOD_HOST_FIXED_STEP_SECONDS);
             }
         }
     }
@@ -746,7 +721,7 @@ void ModHostDispatchFrame(ModHost* host, float deltaSeconds)
 
     for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
     {
-        ModHostSlot* slot = &host->slots[i];
+        ModHostSlot *slot = &host->slots[i];
         if (slot->used && slot->frameCallback != NULL)
         {
             slot->frameCallback(slot->frameUser, deltaSeconds);
@@ -754,9 +729,8 @@ void ModHostDispatchFrame(ModHost* host, float deltaSeconds)
     }
 }
 
-void ModHostDispatchBlockEdit(ModHost* host,
-    int64_t x, int64_t y, int64_t z,
-    uint8_t previousBlock, uint8_t newBlock)
+void ModHostDispatchBlockEdit(ModHost *host, int64_t x, int64_t y, int64_t z, uint8_t previousBlock,
+                              uint8_t newBlock)
 {
     if (host->slots == NULL)
     {
@@ -764,11 +738,10 @@ void ModHostDispatchBlockEdit(ModHost* host,
     }
     for (uint32_t i = 0; i < MOD_HOST_MAX_MODS; ++i)
     {
-        ModHostSlot* slot = &host->slots[i];
+        ModHostSlot *slot = &host->slots[i];
         if (slot->used && slot->blockEditCallback != NULL)
         {
-            slot->blockEditCallback(slot->blockEditUser,
-                x, y, z, previousBlock, newBlock);
+            slot->blockEditCallback(slot->blockEditUser, x, y, z, previousBlock, newBlock);
         }
     }
 }

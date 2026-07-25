@@ -1,4 +1,4 @@
-LAIUE MOD 1
+LAIUE MOD 2
 # Библиотечный мод: публикует интерфейс laiue.builder для других модов.
 name = Builder Lib
 author = laiue
@@ -8,5 +8,5 @@ side = server
 game = 0.5
 
 [native]
-entry = builder_lib.dll
+@LAIUE_MOD_NATIVE_ENTRIES@
 api = 1

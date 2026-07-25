@@ -1,18 +1,16 @@
 /*
- * Auto Bridge — пример нативного DLL-мода laiue.
+ * Auto Bridge — пример нативного мода laiue.
  *
  * В режиме ходьбы, пока игрок не стоит на земле, мод подкладывает блок
  * земли под ноги: шагаешь с обрыва — мост строится сам.
  *
  * Мод не линкуется с игрой: достаточно sdk/laiue_mod_api.h.
- * Сборка из Developer Command Prompt x64 (см. build.bat):
- *
- *     cl /nologo /W4 /O2 /LD /I..\.. auto_bridge.c /Fe:auto_bridge.dll
+ * Ручная сборка: build.bat (Windows) или build.sh (Linux).
  */
 
 #include "laiue_mod_api.h"
 
-static const LaiueModApi* g_api;
+static const LaiueModApi *g_api;
 
 static int64_t FloorToInt64(double value)
 {
@@ -20,13 +18,13 @@ static int64_t FloorToInt64(double value)
     return (double)truncated > value ? truncated - 1 : truncated;
 }
 
-static void OnFrame(void* user, float deltaSeconds)
+static void OnFrame(void *user, float deltaSeconds)
 {
     (void)user;
     (void)deltaSeconds;
 
-    if (g_api->getGameMode(g_api->host) != LAIUE_GAME_MODE_WALK
-        || g_api->isPlayerGrounded(g_api->host))
+    if (g_api->getGameMode(g_api->host) != LAIUE_GAME_MODE_WALK ||
+        g_api->isPlayerGrounded(g_api->host))
     {
         return;
     }
@@ -46,7 +44,7 @@ static void OnFrame(void* user, float deltaSeconds)
     }
 }
 
-__declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
+LAIUE_MOD_EXPORT int32_t LAIUE_MOD_CALL LaiueModInit(const LaiueModApi *api)
 {
     /* Хост может быть новее: доступные поля ограничены structSize. */
     if (api->apiVersion < 1u)
@@ -60,7 +58,7 @@ __declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
     return 0;
 }
 
-__declspec(dllexport) void LaiueModShutdown(void)
+LAIUE_MOD_EXPORT void LAIUE_MOD_CALL LaiueModShutdown(void)
 {
     g_api = 0;
 }

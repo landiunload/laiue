@@ -33,6 +33,44 @@
 #include <string.h>
 #include <windows.h>
 
+#define NETWORK_PENDING_DELTA_CAPACITY LAIUE_NETWORK_MAX_QUEUED_EVENTS
+#define NETWORK_CHUNK_REVISION_CAPACITY LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS
+
+typedef struct NetworkRemotePlayer
+{
+    bool active;
+    bool hasState;
+    uint32_t peerId;
+    NetworkPlayerState displayed;
+    NetworkPlayerState target;
+} NetworkRemotePlayer;
+
+typedef struct NetworkChunkRevision
+{
+    int64_t chunk[3];
+    uint64_t revision;
+} NetworkChunkRevision;
+
+typedef struct NetworkSnapshotAssembly
+{
+    bool active;
+    bool chunkActive;
+    bool resyncResponse;
+    uint64_t snapshotId;
+    uint64_t worldRevision;
+    uint32_t expectedChunkCount;
+    uint32_t completedChunkCount;
+    int64_t chunk[3];
+    uint64_t chunkRevision;
+    uint16_t chunkPartCount;
+    uint16_t nextChunkPart;
+    WorldChunkDelta* edits;
+    uint32_t editCount;
+    uint32_t editCapacity;
+    NetworkBlockDelta pendingDeltas[NETWORK_PENDING_DELTA_CAPACITY];
+    uint32_t pendingDeltaCount;
+} NetworkSnapshotAssembly;
+
 typedef struct ApplicationState
 {
     Window* window;
@@ -57,7 +95,16 @@ typedef struct ApplicationState
     NetworkInputCommand networkPendingInput;
     bool networkReady;
     bool networkEverReady;
+    bool networkSession;
+    bool networkWorldInitialized;
+    bool networkGameplayActivated;
     bool networkHasSnapshot;
+    uint32_t networkPendingResyncCount;
+    NetworkSnapshotAssembly networkSnapshot;
+    NetworkChunkRevision networkChunkRevisions[
+        NETWORK_CHUNK_REVISION_CAPACITY];
+    uint32_t networkChunkRevisionCount;
+    NetworkRemotePlayer remotePlayers[LAIUE_NETWORK_MAX_PEERS];
     NetworkModDescriptor serverMods[LAIUE_NETWORK_MAX_MODS];
     ModCompatibilityEntry serverCompatibilityMods[MODS_MAX_ENTRIES];
     ModCompatibilityEntry localCompatibilityMods[MODS_MAX_ENTRIES];
@@ -211,7 +258,7 @@ static void ApplicationCloseSession(ApplicationState* application,
     bool saveWorld, bool disconnectNetwork)
 {
     if (application->sessionActive && saveWorld
-        && !application->networkEverReady)
+        && !application->networkSession)
     {
         SaveGameWriteAll(application->world, &application->camera,
             application->gameMode, application->settings.timeOfDayHours,
@@ -230,9 +277,20 @@ static void ApplicationCloseSession(ApplicationState* application,
     application->chunkStreaming = NULL;
     application->world = NULL;
     application->sessionActive = false;
+    application->networkSession = false;
     application->inventoryOpen = false;
     application->breaking.active = false;
     application->breaking.progress = 0.0f;
+    application->networkSnapshot.active = false;
+    application->networkSnapshot.chunkActive = false;
+    application->networkSnapshot.editCount = 0;
+    application->networkSnapshot.pendingDeltaCount = 0;
+    application->networkChunkRevisionCount = 0;
+    application->networkWorldInitialized = false;
+    application->networkGameplayActivated = false;
+    application->networkPendingResyncCount = 0;
+    memset(application->remotePlayers, 0,
+        sizeof(application->remotePlayers));
     RendererReleaseWorld(application->renderer);
     if (disconnectNetwork)
     {
@@ -240,6 +298,7 @@ static void ApplicationCloseSession(ApplicationState* application,
         application->networkClient = NULL;
         application->networkReady = false;
         application->networkEverReady = false;
+        application->networkSession = false;
     }
 }
 
@@ -291,6 +350,8 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
     application->worldSeed = seed;
     application->networkEverReady = false;
     application->networkReady = false;
+    application->networkSession = false;
+    application->networkWorldInitialized = false;
     application->gameMode = GAME_MODE_FLY;
     application->settings.timeOfDayHours = savedMinutes >= 0
         ? (float)savedMinutes / 60.0f
@@ -319,6 +380,7 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
     }
     application->blockEffectsReady = true;
     InitializeApplicationModHost(application);
+    application->networkSession = false;
     application->sessionActive = true;
     return true;
 }
@@ -365,6 +427,8 @@ static bool ApplicationSwitchToNetworkWorld(ApplicationState* application,
     }
     application->blockEffectsReady = true;
     InitializeApplicationModHost(application);
+    application->networkSession = true;
+    application->networkWorldInitialized = true;
     application->sessionActive = true;
     return true;
 }
@@ -815,6 +879,370 @@ static void UpdatePlayer(ApplicationState* application,
         deltaSeconds);
 }
 
+static bool NetworkChunkEquals(
+    const int64_t left[3], const int64_t right[3])
+{
+    return left[0] == right[0]
+        && left[1] == right[1]
+        && left[2] == right[2];
+}
+
+static NetworkChunkRevision* FindNetworkChunkRevision(
+    ApplicationState* application, const int64_t chunk[3])
+{
+    for (uint32_t i = 0;
+        i < application->networkChunkRevisionCount; ++i)
+    {
+        NetworkChunkRevision* entry =
+            &application->networkChunkRevisions[i];
+        if (NetworkChunkEquals(entry->chunk, chunk)) return entry;
+    }
+    return NULL;
+}
+
+static void SetNetworkChunkRevision(ApplicationState* application,
+    const int64_t chunk[3], uint64_t revision)
+{
+    NetworkChunkRevision* entry =
+        FindNetworkChunkRevision(application, chunk);
+    if (entry == NULL)
+    {
+        uint32_t index;
+        if (application->networkChunkRevisionCount
+            < NETWORK_CHUNK_REVISION_CAPACITY)
+        {
+            index = application->networkChunkRevisionCount++;
+        }
+        else
+        {
+            index = WorldHashChunkCoordinate(
+                chunk[0], chunk[1], chunk[2])
+                % NETWORK_CHUNK_REVISION_CAPACITY;
+        }
+        entry = &application->networkChunkRevisions[index];
+        memcpy(entry->chunk, chunk, sizeof(entry->chunk));
+    }
+    entry->revision = revision;
+}
+
+static void InvalidateNetworkChunk(
+    ApplicationState* application, const int64_t chunk[3])
+{
+    int64_t minimum[3];
+    int64_t maximum[3];
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (chunk[axis] < INT64_MIN / CHUNK_SIZE
+            || chunk[axis] > INT64_MAX / CHUNK_SIZE)
+            return;
+        minimum[axis] = chunk[axis] * CHUNK_SIZE;
+        if (minimum[axis] > INT64_MAX - (CHUNK_SIZE - 1))
+            return;
+        maximum[axis] = minimum[axis] + CHUNK_SIZE - 1;
+    }
+    for (uint32_t z = 0; z < 2U; ++z)
+    {
+        for (uint32_t y = 0; y < 2U; ++y)
+        {
+            for (uint32_t x = 0; x < 2U; ++x)
+            {
+                ChunkStreamingInvalidateBlock(application->chunkStreaming,
+                    x == 0 ? minimum[0] : maximum[0],
+                    y == 0 ? minimum[1] : maximum[1],
+                    z == 0 ? minimum[2] : maximum[2]);
+            }
+        }
+    }
+}
+
+static bool EnsureNetworkSnapshotEditCapacity(
+    NetworkSnapshotAssembly* snapshot, uint32_t required)
+{
+    const uint32_t maximum = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+    if (required > maximum) return false;
+    if (required <= snapshot->editCapacity) return true;
+    uint32_t capacity = snapshot->editCapacity == 0
+        ? LAIUE_NETWORK_MAX_CHUNK_EDITS : snapshot->editCapacity;
+    while (capacity < required)
+    {
+        uint32_t next = capacity * 2U;
+        capacity = next > maximum ? maximum : next;
+    }
+    WorldChunkDelta* resized = snapshot->edits == NULL
+        ? HeapAlloc(GetProcessHeap(), 0,
+            (size_t)capacity * sizeof(*resized))
+        : HeapReAlloc(GetProcessHeap(), 0, snapshot->edits,
+            (size_t)capacity * sizeof(*resized));
+    if (resized == NULL) return false;
+    snapshot->edits = resized;
+    snapshot->editCapacity = capacity;
+    return true;
+}
+
+static bool BeginNetworkSnapshot(ApplicationState* application,
+    const NetworkSnapshotInfo* info)
+{
+    if (info == NULL || info->snapshotId == 0
+        || info->chunkCount > LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS)
+        return false;
+    bool initial = !application->networkWorldInitialized;
+    if (initial
+        && !ApplicationSwitchToNetworkWorld(application, info->worldSeed))
+        return false;
+    if (!application->sessionActive || !application->networkSession
+        || application->worldSeed != info->worldSeed)
+        return false;
+
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    snapshot->active = true;
+    snapshot->chunkActive = false;
+    snapshot->resyncResponse =
+        !initial && application->networkPendingResyncCount > 0;
+    snapshot->snapshotId = info->snapshotId;
+    snapshot->worldRevision = info->worldRevision;
+    snapshot->expectedChunkCount = info->chunkCount;
+    snapshot->completedChunkCount = 0;
+    snapshot->editCount = 0;
+    snapshot->pendingDeltaCount = 0;
+    application->networkReady = false;
+    application->networkPeerId = info->peerId;
+    application->settings.timeOfDayHours =
+        (float)(info->worldTime % 86400000ULL) / 3600000.0f;
+    if (initial)
+    {
+        application->networkHasSnapshot = false;
+        application->networkChunkRevisionCount = 0;
+        memset(application->remotePlayers, 0,
+            sizeof(application->remotePlayers));
+        BlockEffectsClear(&application->blockEffects);
+    }
+    return true;
+}
+
+static bool ApplyNetworkSnapshotChunk(ApplicationState* application,
+    const NetworkChunkDelta* chunk)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->active || chunk == NULL
+        || chunk->partCount == 0
+        || chunk->partCount > LAIUE_NETWORK_MAX_CHUNK_PARTS
+        || chunk->partIndex >= chunk->partCount
+        || chunk->editCount > LAIUE_NETWORK_MAX_CHUNK_EDITS
+        || (chunk->partIndex + 1U < chunk->partCount
+            && chunk->editCount != LAIUE_NETWORK_MAX_CHUNK_EDITS)
+        || (chunk->partCount > 1U && chunk->editCount == 0))
+        return false;
+
+    if (chunk->partIndex == 0)
+    {
+        if (snapshot->chunkActive
+            || snapshot->completedChunkCount
+                >= snapshot->expectedChunkCount)
+            return false;
+        memcpy(snapshot->chunk, chunk->chunk, sizeof(snapshot->chunk));
+        snapshot->chunkRevision = chunk->revision;
+        snapshot->chunkPartCount = chunk->partCount;
+        snapshot->nextChunkPart = 0;
+        snapshot->editCount = 0;
+        snapshot->chunkActive = true;
+    }
+    if (!snapshot->chunkActive
+        || !NetworkChunkEquals(snapshot->chunk, chunk->chunk)
+        || snapshot->chunkRevision != chunk->revision
+        || snapshot->chunkPartCount != chunk->partCount
+        || snapshot->nextChunkPart != chunk->partIndex
+        || !EnsureNetworkSnapshotEditCapacity(snapshot,
+            snapshot->editCount + chunk->editCount))
+        return false;
+
+    for (uint32_t i = 0; i < chunk->editCount; ++i)
+    {
+        const NetworkChunkEdit* edit = &chunk->edits[i];
+        if (edit->localX >= CHUNK_SIZE
+            || edit->localY >= CHUNK_SIZE
+            || edit->localZ >= CHUNK_SIZE)
+            return false;
+        uint32_t localIndex =
+            (uint32_t)edit->localX * CHUNK_SIZE * CHUNK_SIZE
+            + (uint32_t)edit->localY * CHUNK_SIZE
+            + edit->localZ;
+        if (snapshot->editCount > 0
+            && localIndex
+                <= snapshot->edits[snapshot->editCount - 1U].localIndex)
+            return false;
+        snapshot->edits[snapshot->editCount].localIndex = localIndex;
+        snapshot->edits[snapshot->editCount].block = edit->replacement;
+        ++snapshot->editCount;
+    }
+    ++snapshot->nextChunkPart;
+    if (snapshot->nextChunkPart == snapshot->chunkPartCount)
+    {
+        if (!WorldReplaceChunkDeltas(application->world, snapshot->chunk,
+                snapshot->edits, snapshot->editCount,
+                snapshot->chunkRevision, snapshot->worldRevision))
+            return false;
+        SetNetworkChunkRevision(application, snapshot->chunk,
+            snapshot->chunkRevision);
+        InvalidateNetworkChunk(application, snapshot->chunk);
+        snapshot->chunkActive = false;
+        snapshot->editCount = 0;
+        ++snapshot->completedChunkCount;
+    }
+    return true;
+}
+
+static int64_t NetworkBlockChunk(int64_t block)
+{
+    int64_t chunk = block / CHUNK_SIZE;
+    if (block < 0 && block % CHUNK_SIZE != 0) --chunk;
+    return chunk;
+}
+
+static bool ApplyNetworkBlockDelta(ApplicationState* application,
+    const NetworkBlockDelta* delta)
+{
+    int64_t chunk[3] = {
+        NetworkBlockChunk(delta->block[0]),
+        NetworkBlockChunk(delta->block[1]),
+        NetworkBlockChunk(delta->block[2]),
+    };
+    NetworkChunkRevision* known =
+        FindNetworkChunkRevision(application, chunk);
+    uint64_t currentRevision = known == NULL ? 0 : known->revision;
+    if (delta->revision <= currentRevision) return true;
+    if (delta->revision != currentRevision + 1U)
+    {
+        if (!NetworkClientRequestChunkResync(
+                application->networkClient, chunk, currentRevision)
+            || application->networkPendingResyncCount == UINT32_MAX)
+            return false;
+        ++application->networkPendingResyncCount;
+        return true;
+    }
+    WorldSetBlock(application->world,
+        delta->block[0], delta->block[1], delta->block[2],
+        delta->replacement);
+    SetNetworkChunkRevision(application, chunk, delta->revision);
+    ChunkStreamingInvalidateBlock(application->chunkStreaming,
+        delta->block[0], delta->block[1], delta->block[2]);
+    return true;
+}
+
+static bool FinishNetworkSnapshot(ApplicationState* application,
+    const NetworkSnapshotInfo* info)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->active || info == NULL || snapshot->chunkActive
+        || info->snapshotId != snapshot->snapshotId
+        || info->worldRevision != snapshot->worldRevision
+        || snapshot->completedChunkCount != snapshot->expectedChunkCount)
+        return false;
+    snapshot->active = false;
+    for (uint32_t i = 0; i < snapshot->pendingDeltaCount; ++i)
+    {
+        if (!ApplyNetworkBlockDelta(
+                application, &snapshot->pendingDeltas[i]))
+            return false;
+    }
+    snapshot->pendingDeltaCount = 0;
+    if (snapshot->resyncResponse
+        && application->networkPendingResyncCount > 0)
+        --application->networkPendingResyncCount;
+    return true;
+}
+
+static NetworkRemotePlayer* FindRemotePlayer(
+    ApplicationState* application, uint32_t peerId, bool create)
+{
+    NetworkRemotePlayer* empty = NULL;
+    for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+    {
+        NetworkRemotePlayer* player = &application->remotePlayers[i];
+        if (player->active && player->peerId == peerId) return player;
+        if (!player->active && empty == NULL) empty = player;
+    }
+    if (!create || empty == NULL) return NULL;
+    memset(empty, 0, sizeof(*empty));
+    empty->active = true;
+    empty->peerId = peerId;
+    return empty;
+}
+
+static void RemoveRemotePlayer(
+    ApplicationState* application, uint32_t peerId)
+{
+    NetworkRemotePlayer* player =
+        FindRemotePlayer(application, peerId, false);
+    if (player != NULL) memset(player, 0, sizeof(*player));
+}
+
+static void StoreRemotePlayerState(ApplicationState* application,
+    const NetworkPlayerState* state)
+{
+    NetworkRemotePlayer* player =
+        FindRemotePlayer(application, state->peerId, true);
+    if (player == NULL) return;
+    if (!player->hasState)
+    {
+        player->displayed = *state;
+        player->hasState = true;
+    }
+    player->target = *state;
+}
+
+static float InterpolateRemoteAngle(float current, float target, float alpha)
+{
+    float difference = target - current;
+    while (difference > 3.14159265f) difference -= 6.28318531f;
+    while (difference < -3.14159265f) difference += 6.28318531f;
+    return current + difference * alpha;
+}
+
+static void UpdateRemotePlayers(
+    ApplicationState* application, float deltaSeconds)
+{
+    float alpha = deltaSeconds * 12.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+    {
+        NetworkRemotePlayer* player = &application->remotePlayers[i];
+        if (!player->active || !player->hasState) continue;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            player->displayed.position[axis] +=
+                (player->target.position[axis]
+                    - player->displayed.position[axis]) * alpha;
+        }
+        player->displayed.yaw = InterpolateRemoteAngle(
+            player->displayed.yaw, player->target.yaw, alpha);
+        player->displayed.pitch +=
+            (player->target.pitch - player->displayed.pitch) * alpha;
+        player->displayed.serverTick = player->target.serverTick;
+        player->displayed.grounded = player->target.grounded;
+    }
+}
+
+static void CompleteNetworkReady(ApplicationState* application)
+{
+    if (!application->networkEverReady
+        || !application->networkWorldInitialized
+        || application->networkSnapshot.active
+        || application->networkPendingResyncCount != 0)
+        return;
+    application->networkReady = true;
+    if (application->networkGameplayActivated) return;
+    application->networkGameplayActivated = true;
+    application->gameMode = GAME_MODE_WALK;
+    memset(&application->networkPendingInput, 0,
+        sizeof(application->networkPendingInput));
+    PlayerControllerReset(
+        &application->player, &application->camera);
+    application->menu.networkConnecting = false;
+    application->sessionActive = true;
+    application->mouseLookBeforeMenu = true;
+    ResumeGame(application);
+}
+
 static void PumpNetwork(ApplicationState* application)
 {
     if (application->networkClient == NULL)
@@ -874,27 +1302,40 @@ static void PumpNetwork(ApplicationState* application)
                 WindowSetMouseLook(application->window, false);
             }
         }
+        else if (event.type == NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN)
+        {
+            if (!BeginNetworkSnapshot(
+                    application, &event.data.snapshot))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_SNAPSHOT_CHUNK)
+        {
+            if (!ApplyNetworkSnapshotChunk(
+                    application, &event.data.chunkDelta))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_SNAPSHOT_END)
+        {
+            if (!FinishNetworkSnapshot(
+                    application, &event.data.snapshot))
+                destroyClient = true;
+        }
         else if (event.type == NETWORK_CLIENT_EVENT_READY)
         {
-            if (!ApplicationSwitchToNetworkWorld(application,
-                    event.data.ready.worldSeed))
+            if (!application->networkSession
+                || !application->networkWorldInitialized)
+            {
+                destroyClient = true;
+                continue;
+            }
+            if (application->worldSeed != event.data.ready.worldSeed)
             {
                 destroyClient = true;
                 continue;
             }
             application->networkPeerId = event.data.ready.peerId;
-            application->networkReady = true;
             application->networkEverReady = true;
-            application->networkHasSnapshot = false;
-            application->gameMode = GAME_MODE_WALK;
-            memset(&application->networkPendingInput, 0,
-                sizeof(application->networkPendingInput));
-            PlayerControllerReset(
-                &application->player, &application->camera);
-            application->menu.networkConnecting = false;
-            application->sessionActive = true;
-            application->mouseLookBeforeMenu = true;
-            ResumeGame(application);
+            CompleteNetworkReady(application);
         }
         else if (event.type == NETWORK_CLIENT_EVENT_CONTENT_READY)
         {
@@ -908,7 +1349,7 @@ static void PumpNetwork(ApplicationState* application)
             {
                 installed = LaiueContentBundleInstall(bytes, size);
             }
-            if (bytes != NULL) HeapFree(GetProcessHeap(), 0, bytes);
+            NetworkContentRelease(bytes);
             ModsRefresh(&application->mods);
             bool applied = installed
                 && ModsApplyServerCompatibilitySet(&application->mods,
@@ -931,60 +1372,92 @@ static void PumpNetwork(ApplicationState* application)
             }
         }
         else if (event.type == NETWORK_CLIENT_EVENT_PLAYER_STATE
-            && application->networkReady
-            && event.data.playerState.peerId == application->networkPeerId)
+            && application->networkSession
+            && application->sessionActive)
         {
-            double errorSquared = 0.0;
-            for (int32_t axis = 0; axis < 3; ++axis)
+            if (event.data.playerState.peerId
+                != application->networkPeerId)
             {
-                double error = event.data.playerState.position[axis]
-                    - application->camera.position[axis];
-                errorSquared += error * error;
+                StoreRemotePlayerState(
+                    application, &event.data.playerState);
             }
-            bool hardCorrection = !application->networkHasSnapshot
-                || errorSquared > 16.0;
-            for (int32_t axis = 0; axis < 3; ++axis)
+            else
             {
-                double authoritative =
-                    event.data.playerState.position[axis];
-                application->camera.position[axis] = hardCorrection
-                    ? authoritative
-                    : application->camera.position[axis]
-                        + (authoritative
-                            - application->camera.position[axis]) * 0.25;
+                double errorSquared = 0.0;
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    double error = event.data.playerState.position[axis]
+                        - application->camera.position[axis];
+                    errorSquared += error * error;
+                }
+                bool hardCorrection = !application->networkHasSnapshot
+                    || errorSquared > 16.0;
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    double authoritative =
+                        event.data.playerState.position[axis];
+                    application->camera.position[axis] = hardCorrection
+                        ? authoritative
+                        : application->camera.position[axis]
+                            + (authoritative
+                                - application->camera.position[axis])
+                                * 0.25;
+                }
+                application->camera.yaw =
+                    event.data.playerState.yaw;
+                application->camera.pitch =
+                    event.data.playerState.pitch;
+                if (hardCorrection)
+                {
+                    PlayerControllerReset(
+                        &application->player, &application->camera);
+                }
+                application->networkHasSnapshot = true;
             }
-            if (hardCorrection)
-            {
-                PlayerControllerReset(
-                    &application->player, &application->camera);
-            }
-            application->networkHasSnapshot = true;
         }
         else if (event.type == NETWORK_CLIENT_EVENT_BLOCK_DELTA
-            && application->networkReady)
+            && application->networkSession)
         {
-            const int64_t* block = event.data.blockDelta.block;
-            WorldSetBlock(application->world,
-                block[0], block[1], block[2],
-                event.data.blockDelta.replacement);
-            ChunkStreamingInvalidateBlock(application->chunkStreaming,
-                block[0], block[1], block[2]);
+            if (application->networkSnapshot.active)
+            {
+                NetworkSnapshotAssembly* snapshot =
+                    &application->networkSnapshot;
+                if (snapshot->pendingDeltaCount
+                    >= NETWORK_PENDING_DELTA_CAPACITY)
+                {
+                    destroyClient = true;
+                }
+                else
+                {
+                    snapshot->pendingDeltas[
+                        snapshot->pendingDeltaCount++] =
+                        event.data.blockDelta;
+                }
+            }
+            else if (!ApplyNetworkBlockDelta(
+                    application, &event.data.blockDelta))
+            {
+                destroyClient = true;
+            }
         }
         else if (event.type == NETWORK_CLIENT_EVENT_BLOCK_DROP_SPAWN
-            && application->networkReady)
+            && application->networkSession
+            && application->sessionActive)
         {
             BlockEffectsSpawnNetworkDrop(&application->blockEffects,
                 event.data.blockDrop.id, event.data.blockDrop.block,
                 event.data.blockDrop.position);
         }
         else if (event.type == NETWORK_CLIENT_EVENT_BLOCK_DROP_REMOVE
-            && application->networkReady)
+            && application->networkSession
+            && application->sessionActive)
         {
             BlockEffectsRemoveNetworkDrop(&application->blockEffects,
                 event.data.removedDropId);
         }
         else if (event.type == NETWORK_CLIENT_EVENT_INVENTORY_STATE
-            && application->networkReady)
+            && application->networkSession
+            && application->sessionActive)
         {
             application->inventory.selectedHotbarSlot =
                 event.data.inventory.selectedHotbarSlot;
@@ -996,18 +1469,37 @@ static void PumpNetwork(ApplicationState* application)
                     event.data.inventory.slots[i].count;
             }
         }
+        else if (event.type == NETWORK_CLIENT_EVENT_PLAYER_JOINED
+            && event.data.peerId != application->networkPeerId)
+        {
+            FindRemotePlayer(application, event.data.peerId, true);
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_PLAYER_LEFT)
+        {
+            RemoveRemotePlayer(application, event.data.peerId);
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_WORLD_TIME
+            && application->networkSession)
+        {
+            application->settings.timeOfDayHours =
+                (float)(event.data.worldTime % 86400000ULL)
+                    / 3600000.0f;
+        }
         else if (event.type == NETWORK_CLIENT_EVENT_REJECTED)
         {
             application->networkReady = false;
             application->menu.networkConnecting = false;
             application->menu.networkRejected = true;
             application->menu.screen = PAUSE_MENU_MULTIPLAYER;
+            destroyClient = true;
         }
         else if (event.type == NETWORK_CLIENT_EVENT_DISCONNECTED)
         {
             application->networkReady = false;
             application->networkPeerId = 0;
             application->networkHasSnapshot = false;
+            application->networkSnapshot.active = false;
+            application->networkSnapshot.chunkActive = false;
             if (!application->networkEverReady)
             {
                 application->menu.networkConnecting = false;
@@ -1018,10 +1510,14 @@ static void PumpNetwork(ApplicationState* application)
                 }
                 application->menu.screen = PAUSE_MENU_MULTIPLAYER;
             }
+            destroyClient = true;
         }
     }
     if (destroyClient)
     {
+        if (application->networkSession
+            && !application->networkGameplayActivated)
+            ApplicationCloseSession(application, false, false);
         NetworkClientDestroy(application->networkClient);
         application->networkClient = NULL;
         application->networkReady = false;
@@ -1164,14 +1660,14 @@ static void OnFrame(void* userData)
     }
 
     if (application->sessionActive && !menuOpen
-        && !application->inventoryOpen && !application->networkReady
+        && !application->inventoryOpen && !application->networkSession
         && InputConsumeKeyPress(application->input, INPUT_KEY_G))
     {
         ToggleGameMode(application);
     }
 
     if (application->sessionActive && !menuOpen
-        && !application->inventoryOpen && !application->networkReady
+        && !application->inventoryOpen && !application->networkSession
         && InputConsumeKeyPress(application->input, INPUT_KEY_T)
         && !SquareAbsoluteX(application))
     {
@@ -1202,6 +1698,7 @@ static void OnFrame(void* userData)
     {
         deltaSeconds = 0.1f;
     }
+    UpdateRemotePlayers(application, deltaSeconds);
 
     bool mouseLookEnabled =
         WindowIsMouseLookEnabled(application->window);
@@ -1214,7 +1711,8 @@ static void OnFrame(void* userData)
     }
 
     bool gameplayActive = application->sessionActive && !menuOpen
-        && !application->inventoryOpen;
+        && !application->inventoryOpen
+        && (!application->networkSession || application->networkReady);
     if (gameplayActive)
     {
         UpdatePlayer(application,
@@ -1230,7 +1728,7 @@ static void OnFrame(void* userData)
         ModHostDispatchFrame(&application->modHost, deltaSeconds);
     }
 
-    if (application->sessionActive && !application->networkReady
+    if (application->sessionActive && !application->networkSession
         && !RebaseWorldIfNeeded(application))
     {
         WindowRequestClose(application->window);
@@ -1265,7 +1763,7 @@ static void OnFrame(void* userData)
             BlockEffectsUpdate(&application->blockEffects,
                 application->world, &application->inventory,
                 application->camera.position, deltaSeconds,
-                !application->networkReady);
+                !application->networkSession);
         }
         else
         {
@@ -1358,13 +1856,36 @@ static void OnFrame(void* userData)
                     application->ui.quadCount = 0;
                 }
             }
-            if (action == PAUSE_MENU_ACTION_CONNECT_LOCAL)
+            if (action == PAUSE_MENU_ACTION_CONNECT_SERVER)
             {
                 NetworkClientDestroy(application->networkClient);
-                application->networkClient = NetworkClientCreateLoopback(
-                    application->menu.selectedServerPort != 0
-                        ? application->menu.selectedServerPort
-                        : LAIUE_NETWORK_DEFAULT_PORT);
+                application->networkClient = NULL;
+                application->networkReady = false;
+                application->networkEverReady = false;
+                application->networkWorldInitialized = false;
+                application->networkGameplayActivated = false;
+                application->networkPendingResyncCount = 0;
+                application->networkSnapshot.active = false;
+                application->networkSnapshot.chunkActive = false;
+                application->networkSnapshot.pendingDeltaCount = 0;
+                if (application->menu.selectedServerIndex
+                    < application->menu.servers.count)
+                {
+                    const ServerListEntry* selected =
+                        &application->menu.servers.entries[
+                            application->menu.selectedServerIndex];
+                    NetworkClientConfiguration configuration;
+                    NetworkClientConfigurationInitialize(&configuration);
+                    configuration.endpoint = selected->endpoint;
+                    configuration.addressFamily =
+                        NETWORK_ADDRESS_FAMILY_AUTO;
+                    configuration.trustMode = selected->trustMode;
+                    memcpy(configuration.certificateSha256,
+                        selected->certificateSha256,
+                        LAIUE_NETWORK_CERTIFICATE_PIN_SIZE);
+                    application->networkClient =
+                        NetworkClientCreate(&configuration);
+                }
                 if (application->networkClient == NULL)
                 {
                     application->menu.networkConnecting = false;
@@ -1397,6 +1918,9 @@ static void OnFrame(void* userData)
             }
             if (action == PAUSE_MENU_ACTION_CANCEL_CONNECT)
             {
+                if (application->networkSession
+                    && !application->networkGameplayActivated)
+                    ApplicationCloseSession(application, false, false);
                 NetworkClientDestroy(application->networkClient);
                 application->networkClient = NULL;
                 application->networkReady = false;
@@ -1435,7 +1959,7 @@ static void OnFrame(void* userData)
                 application->inventory.selectedHotbarSlot;
             InventoryUiDraw(&application->ui, &application->inventory,
                 application->gameMode, application->inventoryOpen,
-                !application->networkReady,
+                !application->networkSession,
                 application->breaking.progress,
                 application->windowWidth, application->windowHeight);
             if (application->networkReady
@@ -1622,5 +2146,8 @@ LAIUE_CORE_API void Start(void)
     RendererDestroy(renderer);
     InputDestroy(input);
     WindowDestroy(window);
+    if (application->networkSnapshot.edits != NULL)
+        HeapFree(GetProcessHeap(), 0,
+            application->networkSnapshot.edits);
     HeapFree(GetProcessHeap(), 0, application);
 }

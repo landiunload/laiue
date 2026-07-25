@@ -1,20 +1,23 @@
 # Моддинг
 
-Мод — доверенная нативная DLL в каталоге `mods/<name>.lmp`:
+Мод — доверенная нативная библиотека в каталоге `mods/<name>.lmp`.
+Полный переносимый pack может содержать бинарники нескольких платформ:
 
 ```text
 my_mod.lmp/
   mod.lm
-  my_mod.dll
+  my_mod.windows-x86_64.dll
+  my_mod.linux-x86_64-gnu.so
+  my_mod.linux-x86_64-musl.so
 ```
 
-Мод не линкуется с внутренними DLL игры. Единственная публичная граница —
-таблица функций из `sdk/laiue_mod_api.h`.
+Мод не линкуется с внутренними DLL/SO игры. Единственная публичная
+граница — таблица функций из `sdk/laiue_mod_api.h`.
 
 ## Манифест
 
 ```text
-LAIUE MOD 1
+LAIUE MOD 2
 id = example.my_mod
 name = My Mod
 version = 1.0.0
@@ -22,12 +25,21 @@ game = 0.5
 side = both
 
 [native]
-entry = my_mod.dll
+entry_windows_x86_64 = my_mod.windows-x86_64.dll
+entry_linux_x86_64_gnu = my_mod.linux-x86_64-gnu.so
+entry_linux_x86_64_musl = my_mod.linux-x86_64-musl.so
 api = 1
 ```
 
 `id` состоит из ASCII-букв в нижнем регистре, цифр, `.`, `_` и `-`.
 `game` — минимальная совместимая версия игры, `api` — версия SDK.
+Допустимо объявить только реально поставляемые платформы. Каждый
+объявленный файл обязан присутствовать, иначе pack несовместим. На текущей
+платформе должен быть её entry.
+
+`LAIUE MOD 1` продолжает читаться: его `entry` считается исключительно
+`entry_windows_x86_64`. Для нового или пересобранного мода используйте v2.
+Одновременно задавать `entry` и `entry_windows_x86_64` нельзя.
 
 | `side` | Где загружается | Проверка при подключении |
 |---|---|---|
@@ -50,20 +62,58 @@ static void OnTick(void* user, float stepSeconds)
     (void)stepSeconds;
 }
 
-__declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
+LAIUE_MOD_EXPORT int32_t LAIUE_MOD_CALL
+LaiueModInit(const LaiueModApi* api)
 {
     api->setFixedTickCallback(api->host, OnTick, 0);
     api->log(api->host, L"mod loaded");
     return 0;
 }
 
-__declspec(dllexport) void LaiueModShutdown(void) {}
+LAIUE_MOD_EXPORT void LAIUE_MOD_CALL LaiueModShutdown(void) {}
 ```
 
-Сборка из x64 Developer Command Prompt:
+Windows, из x64 Developer Command Prompt:
 
 ```bat
-cl /nologo /W4 /O2 /LD /Isdk my_mod.c /Fe:my_mod.dll
+cl /nologo /W4 /O2 /utf-8 /LD /Isdk my_mod.c ^
+  /Fe:my_mod.windows-x86_64.dll
+```
+
+Linux glibc:
+
+```sh
+cc -std=c17 -Wall -Wextra -Werror -O2 -fPIC -fvisibility=hidden \
+  -shared -Isdk my_mod.c -o my_mod.linux-x86_64-gnu.so
+```
+
+Linux musl собирается теми же флагами с musl toolchain и получает имя
+`my_mod.linux-x86_64-musl.so`. Не переименовывайте glibc-бинарник в musl:
+это разные ABI-артефакты.
+
+Для одно-платформенной локальной разработки manifest может объявлять только
+текущий бинарник. Такой pack намеренно не совпадёт по fingerprint с pack
+другой ОС. Release pack для совместной игры Windows/Linux должен содержать
+все объявленные артефакты.
+
+Экспорты всегда оформляются через `LAIUE_MOD_EXPORT` и
+`LAIUE_MOD_CALL`; прямой `__declspec(dllexport)` делает исходник
+Windows-only.
+
+Например, скрипты `auto_bridge` создают бинарник и готовый локальный
+`mod.lm` из `mod.lm.in`:
+
+```powershell
+cd sdk/examples/auto_bridge
+./build.bat
+```
+
+```sh
+cd sdk/examples/auto_bridge
+sh ./build.sh
+
+# Для musl:
+LAIUE_LINUX_LIBC=musl CC=musl-gcc sh ./build.sh
 ```
 
 `LaiueModInit` возвращает 0 при успехе. `LaiueModShutdown` опционален.
@@ -108,15 +158,28 @@ Gameplay размещайте в fixed tick, визуальные действи
 
 ## Совместимость с сервером
 
-До допуска сравниваются упорядоченные `id`, `version` и SHA-256 манифеста с
-DLL. Лишний или отсутствующий `server`/`both` мод означает несовпадение.
-Чисто клиентские моды сохраняются. Если нужные паки установлены, UI предлагает
-включить серверный профиль; загрузка с сервера требует отдельного подтверждения.
-Подробнее: [multiplayer.md](multiplayer.md).
+До допуска сравниваются упорядоченные `id`, `version` и content fingerprint.
+Для v2 начальное значение — SHA-256 точных байтов `mod.lm`, после чего к нему
+последовательно подмешиваются SHA-256 объявленных файлов в фиксированном
+порядке:
+
+1. `entry_windows_x86_64`;
+2. `entry_linux_x86_64_gnu`;
+3. `entry_linux_x86_64_musl`.
+
+Поэтому один полный pack имеет одинаковый fingerprint на Windows, glibc и
+musl, а изменение любого платформенного бинарника меняет совместимость для
+всего pack. Нормализация строк manifest не выполняется: line endings и
+комментарии тоже являются его байтами.
+
+Лишний или отсутствующий `server`/`both` мод означает несовпадение. Чисто
+клиентские моды сохраняются. Если нужные паки установлены, UI предлагает
+включить серверный профиль; загрузка с сервера требует отдельного
+подтверждения. Подробнее: [multiplayer.md](multiplayer.md).
 
 ## Доверие и сохранения
 
-Нативная DLL имеет права процесса и не изолирована песочницей. Устанавливайте
+Нативная DLL/SO имеет права процесса и не изолирована песочницей. Устанавливайте
 моды и загружайте их с серверов только из доверенных источников; SHA-256
 проверяет целостность передачи, а не безопасность кода.
 
@@ -125,4 +188,5 @@ DLL. Лишний или отсутствующий `server`/`both` мод оз�
 [world_format.md](world_format.md).
 
 Встроенные примеры: `double_jump`, `daylight_lock`, `auto_bridge`,
-`builder_lib` и `spiral_tower`; CMake собирает их в runtime-каталог `mods/`.
+`builder_lib` и `spiral_tower`; CMake генерирует manifest текущей платформы
+и собирает их в runtime-каталог `mods/`.

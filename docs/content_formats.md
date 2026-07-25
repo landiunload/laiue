@@ -17,13 +17,15 @@ Runtime-мод — каталог `mods/<name>.lmp`:
 ```text
 my_mod.lmp/
   mod.lm
-  my_mod.dll
+  my_mod.windows-x86_64.dll
+  my_mod.linux-x86_64-gnu.so
+  my_mod.linux-x86_64-musl.so
 ```
 
 Минимальный UTF-8-манифест:
 
 ```text
-LAIUE MOD 1
+LAIUE MOD 2
 id = author.my_mod
 name = My Mod
 version = 1.0.0
@@ -31,11 +33,14 @@ game = 0.5
 side = both
 
 [native]
-entry = my_mod.dll
+entry_windows_x86_64 = my_mod.windows-x86_64.dll
+entry_linux_x86_64_gnu = my_mod.linux-x86_64-gnu.so
+entry_linux_x86_64_musl = my_mod.linux-x86_64-musl.so
 api = 1
 ```
 
-Полный контракт — в [modding.md](modding.md).
+Можно объявить подмножество платформ, но каждый объявленный файл обязателен.
+Полный контракт и правила fingerprint — в [modding.md](modding.md).
 
 ## Шейдеры
 
@@ -67,6 +72,14 @@ ui_vs.ls          ui_ps.ls
 
 Моды используют не `active.txt`, а ordered-файлы `mods/enabled.txt` и
 `mods/server_enabled.txt`.
+
+## Сетевой bundle
+
+Writer создаёт `LCB2`: все относительные пути — canonical UTF-8 с `/`,
+entries отсортированы детерминированно. Сборка отклоняет symlink/reparse
+points, traversal, duplicate и case-collision, даже на case-sensitive Linux.
+Installer читает LCB1 для совместимости и LCB2, но новые bundles всегда v2.
+Размеры, число файлов и SHA-256 проверяются до переключения staging-каталога.
 
 ## Встроенные примеры
 

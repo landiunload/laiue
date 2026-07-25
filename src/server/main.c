@@ -7,11 +7,10 @@
 #include "mod/mod_host.h"
 #include "mod/mods.h"
 #include "network/network.h"
+#include "platform/system.h"
 #include "server/server_config.h"
 #include "world/block_properties.h"
 #include "world/world.h"
-
-#include <windows.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,6 +25,7 @@
 #define SERVER_BREAK_INTENT_TIMEOUT_MS 250ULL
 #define SERVER_EDIT_REACH 8.0f
 #define SERVER_DROP_CAPACITY 256U
+#define SERVER_INTEREST_RADIUS_CHUNKS 5LL
 
 typedef struct ServerBlockDrop
 {
@@ -51,6 +51,8 @@ typedef struct ServerPlayer
     int64_t breakingBlock[3];
     bool breaking;
     Inventory inventory;
+    int64_t snapshotCenter[3];
+    bool hasSnapshotCenter;
     bool active;
 } ServerPlayer;
 
@@ -66,12 +68,40 @@ typedef struct DedicatedServer
     NetworkModDescriptor networkMods[LAIUE_NETWORK_MAX_MODS];
     uint32_t networkModCount;
     LaiueContentBundle downloadableContent;
+    int64_t worldSeed;
     float timeOfDayHours;
     uint32_t tick;
     ServerBlockDrop drops[SERVER_DROP_CAPACITY];
     uint32_t nextDropSlot;
     uint32_t nextDropId;
+    uint64_t nextSnapshotId;
 } DedicatedServer;
+
+static NetworkAddressFamily ToNetworkAddressFamily(
+    ServerAddressFamily family)
+{
+    if (family == SERVER_ADDRESS_FAMILY_IPV4)
+        return NETWORK_ADDRESS_FAMILY_IPV4;
+    if (family == SERVER_ADDRESS_FAMILY_IPV6)
+        return NETWORK_ADDRESS_FAMILY_IPV6;
+    return NETWORK_ADDRESS_FAMILY_DUAL;
+}
+
+static bool ServerCredentialsAreUsable(
+    const ServerConfiguration* configuration)
+{
+#if defined(_WIN32)
+    return configuration->certificateThumbprint[0] != '\0';
+#else
+    uint32_t length = 0;
+    while (configuration->privateKeyFile[length] != '\0') ++length;
+    wchar_t privateKey[LAIUE_PLATFORM_PATH_CAPACITY];
+    return configuration->certificateFile[0] != '\0' && length != 0
+        && PlatformUtf8ToWide(configuration->privateKeyFile, length,
+            privateKey, LAIUE_PLATFORM_PATH_CAPACITY, NULL)
+        && PlatformValidatePrivateKeyFile(privateKey);
+#endif
+}
 
 static bool CopyBundleSourceName(LaiueContentBundleSource* source,
                                  LaiueContentType type, const wchar_t* name)
@@ -110,8 +140,8 @@ static bool AppendCatalogSources(LaiueContentBundleSource* sources,
 
 static bool BuildDownloadableContent(DedicatedServer* server)
 {
-    LaiueContentBundleSource* sources = HeapAlloc(GetProcessHeap(),
-        HEAP_ZERO_MEMORY, LAIUE_CONTENT_BUNDLE_MAX_SOURCES * sizeof(*sources));
+    LaiueContentBundleSource* sources = PlatformAllocate(
+        LAIUE_CONTENT_BUNDLE_MAX_SOURCES * sizeof(*sources), true);
     if (sources == NULL) return false;
     uint32_t count = 0;
     bool succeeded = true;
@@ -144,45 +174,21 @@ static bool BuildDownloadableContent(DedicatedServer* server)
         succeeded = LaiueContentBundleBuild(sources, count,
             &server->downloadableContent);
     }
-    HeapFree(GetProcessHeap(), 0, sources);
+    PlatformFree(sources);
     return succeeded;
-}
-
-static volatile LONG g_stopRequested;
-
-static BOOL WINAPI HandleConsoleControl(DWORD controlType)
-{
-    if (controlType == CTRL_C_EVENT || controlType == CTRL_BREAK_EVENT ||
-        controlType == CTRL_CLOSE_EVENT || controlType == CTRL_SHUTDOWN_EVENT)
-    {
-        InterlockedExchange(&g_stopRequested, 1);
-        return TRUE;
-    }
-    return FALSE;
 }
 
 static double ServerTimeSeconds(void)
 {
-    static LARGE_INTEGER frequency;
-    static volatile LONG initialized;
-    if (InterlockedCompareExchange(&initialized, 1, 0) == 0)
-    {
-        QueryPerformanceFrequency(&frequency);
-    }
-    LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart / (double)frequency.QuadPart;
+    return PlatformMonotonicSeconds();
 }
 
 static void WriteServerMessage(const wchar_t *message, uint32_t length)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-    DWORD written;
-    WriteConsoleW(output, message, length, &written, NULL);
+    (void)length;
+    char utf8[1024];
+    if (PlatformWideToUtf8(message, utf8, sizeof(utf8), NULL))
+        PlatformWriteConsoleUtf8(utf8);
 }
 
 static uint32_t AppendServerText(wchar_t* destination, uint32_t capacity,
@@ -252,7 +258,7 @@ static ServerPlayer *AddPlayer(DedicatedServer *server, uint32_t peerId)
         player->camera.position[2] = SERVER_SPAWN_HEIGHT;
         player->camera.yaw = 0.0f;
         player->camera.pitch = -0.4f;
-        player->lastInputAtMs = GetTickCount64();
+        player->lastInputAtMs = PlatformMonotonicMilliseconds();
 
         PlayerControllerConfig configuration;
         PlayerControllerGetDefaultConfig(&configuration);
@@ -277,7 +283,7 @@ static void RemovePlayer(DedicatedServer *server, uint32_t peerId)
     }
 }
 
-static void SendPlayerInventory(DedicatedServer* server,
+static bool SendPlayerInventory(DedicatedServer* server,
     const ServerPlayer* player)
 {
     NetworkInventoryState state;
@@ -288,7 +294,204 @@ static void SendPlayerInventory(DedicatedServer* server,
         state.slots[i].item = (uint8_t)player->inventory.slots[i].item;
         state.slots[i].count = player->inventory.slots[i].count;
     }
-    NetworkServerSendInventory(server->network, player->peerId, &state);
+    return NetworkServerSendInventory(
+        server->network, player->peerId, &state);
+}
+
+static int64_t ServerPositionChunk(double position)
+{
+    double scaled = position / (double)CHUNK_SIZE;
+    int64_t chunk = (int64_t)scaled;
+    if ((double)chunk > scaled) --chunk;
+    return chunk;
+}
+
+static int64_t ServerBlockChunk(int64_t block)
+{
+    int64_t chunk = block / CHUNK_SIZE;
+    if (block < 0 && block % CHUNK_SIZE != 0) --chunk;
+    return chunk;
+}
+
+static bool PlayerInterestedInChunk(
+    const ServerPlayer* player, const int64_t chunk[3])
+{
+    if (!player->active || !player->hasSnapshotCenter) return false;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        uint64_t distance = chunk[axis] >= player->snapshotCenter[axis]
+            ? (uint64_t)chunk[axis]
+                - (uint64_t)player->snapshotCenter[axis]
+            : (uint64_t)player->snapshotCenter[axis]
+                - (uint64_t)chunk[axis];
+        if (distance > SERVER_INTEREST_RADIUS_CHUNKS) return false;
+    }
+    return true;
+}
+
+static uint64_t ServerWorldTimeMilliseconds(float hours)
+{
+    while (hours < 0.0f) hours += 24.0f;
+    while (hours >= 24.0f) hours -= 24.0f;
+    return (uint64_t)(hours * 3600000.0f + 0.5f);
+}
+
+static bool SendWorldSnapshot(DedicatedServer* server,
+    ServerPlayer* player, const int64_t minimum[3], const int64_t maximum[3])
+{
+    WorldChunkSummary* summaries = PlatformAllocate(
+        LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS * sizeof(*summaries), false);
+    if (summaries == NULL) return false;
+    bool truncated = false;
+    uint64_t worldRevision = 0;
+    uint32_t summaryCount = WorldCopyEditedChunkSummaries(
+        server->world, minimum, maximum, summaries,
+        LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS, &truncated, &worldRevision);
+    uint32_t messageCount = 0;
+    for (uint32_t i = 0; i < summaryCount; ++i)
+    {
+        uint32_t parts = summaries[i].deltaCount == 0 ? 1U
+            : (summaries[i].deltaCount
+                + LAIUE_NETWORK_MAX_CHUNK_EDITS - 1U)
+                / LAIUE_NETWORK_MAX_CHUNK_EDITS;
+        if (parts > LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS - messageCount)
+        {
+            truncated = true;
+            break;
+        }
+        messageCount += parts;
+    }
+    if (truncated)
+    {
+        PlatformFree(summaries);
+        return false;
+    }
+
+    uint64_t snapshotId = ++server->nextSnapshotId;
+    if (snapshotId == 0) snapshotId = ++server->nextSnapshotId;
+    NetworkSnapshotInfo snapshot = {
+        .snapshotId = snapshotId,
+        .worldRevision = worldRevision,
+        .serverTick = server->tick,
+        .chunkCount = summaryCount,
+        .peerId = player->peerId,
+        .worldSeed = server->worldSeed,
+        .worldTime = ServerWorldTimeMilliseconds(server->timeOfDayHours),
+    };
+    bool succeeded = NetworkServerSendSnapshotBegin(
+        server->network, player->peerId, &snapshot);
+    for (uint32_t i = 0; i < summaryCount && succeeded; ++i)
+    {
+        uint32_t deltaCount = summaries[i].deltaCount;
+        WorldChunkDelta* deltas = deltaCount == 0 ? NULL
+            : PlatformAllocate(
+                (size_t)deltaCount * sizeof(*deltas), false);
+        uint32_t copied = 0;
+        uint64_t chunkRevision = 0;
+        succeeded = (deltaCount == 0 || deltas != NULL)
+            && WorldCopyChunkDeltas(server->world, summaries[i].chunk,
+                deltas, deltaCount, &copied, &chunkRevision)
+            && copied == deltaCount;
+        uint32_t partCount = deltaCount == 0 ? 1U
+            : (deltaCount + LAIUE_NETWORK_MAX_CHUNK_EDITS - 1U)
+                / LAIUE_NETWORK_MAX_CHUNK_EDITS;
+        for (uint32_t partIndex = 0;
+            partIndex < partCount && succeeded; ++partIndex)
+        {
+            uint32_t offset = partIndex * LAIUE_NETWORK_MAX_CHUNK_EDITS;
+            uint32_t count = deltaCount - offset;
+            if (count > LAIUE_NETWORK_MAX_CHUNK_EDITS)
+                count = LAIUE_NETWORK_MAX_CHUNK_EDITS;
+            NetworkChunkDelta chunk;
+            memset(&chunk, 0, sizeof(chunk));
+            memcpy(chunk.chunk, summaries[i].chunk, sizeof(chunk.chunk));
+            chunk.revision = chunkRevision;
+            chunk.partIndex = (uint16_t)partIndex;
+            chunk.partCount = (uint16_t)partCount;
+            chunk.editCount = (uint16_t)count;
+            for (uint32_t d = 0; d < count; ++d)
+            {
+                uint32_t localIndex = deltas[offset + d].localIndex;
+                chunk.edits[d].localX =
+                    (uint8_t)(localIndex / (CHUNK_SIZE * CHUNK_SIZE));
+                chunk.edits[d].localY =
+                    (uint8_t)((localIndex / CHUNK_SIZE) % CHUNK_SIZE);
+                chunk.edits[d].localZ =
+                    (uint8_t)(localIndex % CHUNK_SIZE);
+                chunk.edits[d].replacement = deltas[offset + d].block;
+            }
+            succeeded = NetworkServerSendSnapshotChunk(
+                server->network, player->peerId, &chunk);
+        }
+        PlatformFree(deltas);
+    }
+
+    // Initial state belongs to the snapshot barrier. READY is emitted by the
+    // transport only after SNAPSHOT_END has been received.
+    if (succeeded)
+        succeeded = NetworkServerSendWorldTime(server->network,
+            player->peerId, snapshot.worldTime);
+    if (succeeded)
+    {
+        succeeded = SendPlayerInventory(server, player);
+        for (uint32_t i = 0; i < SERVER_DROP_CAPACITY && succeeded; ++i)
+        {
+            const ServerBlockDrop* drop = &server->drops[i];
+            if (!drop->active) continue;
+            NetworkBlockDrop networkDrop = {
+                .id = drop->id,
+                .position = { drop->position[0], drop->position[1],
+                    drop->position[2] },
+                .block = drop->block,
+            };
+            succeeded = NetworkServerSendBlockDrop(
+                server->network, player->peerId, &networkDrop);
+        }
+    }
+    for (uint32_t i = 0;
+        i < LAIUE_NETWORK_MAX_PEERS && succeeded; ++i)
+    {
+        const ServerPlayer* existing = &server->players[i];
+        if (!existing->active) continue;
+        NetworkPlayerState state = {
+            .serverTick = server->tick,
+            .peerId = existing->peerId,
+            .position = { existing->camera.position[0],
+                existing->camera.position[1], existing->camera.position[2] },
+            .yaw = existing->camera.yaw,
+            .pitch = existing->camera.pitch,
+            .grounded = PlayerControllerIsGrounded(&existing->controller),
+        };
+        succeeded = NetworkServerSendPlayerJoined(
+                server->network, player->peerId, existing->peerId)
+            && NetworkServerSendPlayerState(
+                server->network, player->peerId, &state);
+    }
+    if (succeeded)
+        succeeded = NetworkServerSendSnapshotEnd(server->network,
+            player->peerId, snapshotId, worldRevision);
+    PlatformFree(summaries);
+    return succeeded;
+}
+
+static bool SendInitialWorldSnapshot(
+    DedicatedServer* server, ServerPlayer* player)
+{
+    int64_t center[3] = {
+        ServerPositionChunk(player->camera.position[0]),
+        ServerPositionChunk(player->camera.position[1]),
+        ServerPositionChunk(player->camera.position[2]),
+    };
+    int64_t minimum[3];
+    int64_t maximum[3];
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        minimum[axis] = center[axis] - SERVER_INTEREST_RADIUS_CHUNKS;
+        maximum[axis] = center[axis] + SERVER_INTEREST_RADIUS_CHUNKS;
+        player->snapshotCenter[axis] = center[axis];
+    }
+    player->hasSnapshotCenter = true;
+    return SendWorldSnapshot(server, player, minimum, maximum);
 }
 
 static void SpawnServerDrop(DedicatedServer* server, uint8_t block,
@@ -318,7 +521,7 @@ static void SpawnServerDrop(DedicatedServer* server, uint8_t block,
 static void HandleEditIntent(DedicatedServer *server, ServerPlayer *player,
                              const NetworkServerEvent *event)
 {
-    uint64_t now = GetTickCount64();
+    uint64_t now = PlatformMonotonicMilliseconds();
     VoxelBodyShape bodyShape;
     PlayerControllerGetBodyShape(&player->controller, &bodyShape);
     VoxelEdit edit;
@@ -378,12 +581,25 @@ static void HandleEditIntent(DedicatedServer *server, ServerPlayer *player,
     ModHostDispatchBlockEdit(&server->modHost,
         edit.block[0], edit.block[1], edit.block[2],
         previous, (uint8_t)edit.replacement);
+    int64_t changedChunk[3] = {
+        ServerBlockChunk(edit.block[0]),
+        ServerBlockChunk(edit.block[1]),
+        ServerBlockChunk(edit.block[2]),
+    };
     NetworkBlockDelta delta = {
         .serverTick = server->tick,
+        .revision = WorldGetChunkRevision(server->world, changedChunk),
         .block = {edit.block[0], edit.block[1], edit.block[2]},
         .replacement = edit.replacement,
     };
-    NetworkServerBroadcastBlockDelta(server->network, &delta);
+    for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+    {
+        if (PlayerInterestedInChunk(&server->players[i], changedChunk))
+        {
+            NetworkServerSendBlockDelta(server->network,
+                server->players[i].peerId, &delta);
+        }
+    }
     if (edit.type == VOXEL_EDIT_BREAK)
         SpawnServerDrop(server, previous, edit.block);
     else
@@ -398,11 +614,25 @@ static void HandleNetworkEvents(DedicatedServer *server)
         if (event.type == NETWORK_SERVER_EVENT_CONNECTED)
         {
             ServerPlayer* connected = AddPlayer(server, event.peerId);
-            if (connected != NULL) SendPlayerInventory(server, connected);
+            if (connected != NULL)
+            {
+                for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+                {
+                    const ServerPlayer* existing = &server->players[i];
+                    if (existing->active
+                        && existing->peerId != connected->peerId)
+                    {
+                        NetworkServerSendPlayerJoined(server->network,
+                            existing->peerId, connected->peerId);
+                    }
+                }
+                SendInitialWorldSnapshot(server, connected);
+            }
             continue;
         }
         if (event.type == NETWORK_SERVER_EVENT_DISCONNECTED)
         {
+            NetworkServerBroadcastPlayerLeft(server->network, event.peerId);
             RemovePlayer(server, event.peerId);
             continue;
         }
@@ -422,7 +652,7 @@ static void HandleNetworkEvents(DedicatedServer *server)
             player->command.crouchHeld = event.data.input.crouchHeld;
             player->camera.yaw = event.data.input.yaw;
             player->camera.pitch = event.data.input.pitch;
-            player->lastInputAtMs = GetTickCount64();
+            player->lastInputAtMs = PlatformMonotonicMilliseconds();
         }
         else if (event.type == NETWORK_SERVER_EVENT_EDIT_INTENT)
         {
@@ -434,12 +664,20 @@ static void HandleNetworkEvents(DedicatedServer *server)
                 event.data.selectedHotbarSlot);
             SendPlayerInventory(server, player);
         }
+        else if (event.type == NETWORK_SERVER_EVENT_CHUNK_RESYNC_REQUEST)
+        {
+            int64_t minimum[3];
+            int64_t maximum[3];
+            memcpy(minimum, event.data.chunkResync.chunk, sizeof(minimum));
+            memcpy(maximum, minimum, sizeof(maximum));
+            SendWorldSnapshot(server, player, minimum, maximum);
+        }
     }
 }
 
 static void SimulateTick(DedicatedServer *server)
 {
-    uint64_t now = GetTickCount64();
+    uint64_t now = PlatformMonotonicMilliseconds();
     server->tick++;
     ModHostDispatchFrame(&server->modHost, (float)SERVER_TICK_SECONDS);
     for (uint32_t index = 0; index < LAIUE_NETWORK_MAX_PEERS; ++index)
@@ -512,29 +750,65 @@ static void SimulateTick(DedicatedServer *server)
     }
 }
 
+static void RefreshPlayerInterest(DedicatedServer* server)
+{
+    for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+    {
+        ServerPlayer* player = &server->players[i];
+        if (!player->active || !player->hasSnapshotCenter) continue;
+        int64_t center[3] = {
+            ServerPositionChunk(player->camera.position[0]),
+            ServerPositionChunk(player->camera.position[1]),
+            ServerPositionChunk(player->camera.position[2]),
+        };
+        bool changed = false;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+            changed = changed
+                || center[axis] != player->snapshotCenter[axis];
+        if (!changed) continue;
+        int64_t minimum[3];
+        int64_t maximum[3];
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            minimum[axis] = center[axis] - SERVER_INTEREST_RADIUS_CHUNKS;
+            maximum[axis] = center[axis] + SERVER_INTEREST_RADIUS_CHUNKS;
+        }
+        if (SendWorldSnapshot(server, player, minimum, maximum))
+        {
+            memcpy(player->snapshotCenter, center,
+                sizeof(player->snapshotCenter));
+        }
+    }
+}
+
 static uint32_t RunServer(void)
 {
-    ServerConfiguration configuration;
-    ServerConfigurationLoad(&configuration);
+    ServerConfiguration* configuration =
+        PlatformAllocate(sizeof(*configuration), false);
+    if (configuration == NULL) return 1U;
+    ServerConfigurationLoad(configuration);
 
-    World *world = WorldCreate(configuration.worldSeed);
+    World *world = WorldCreate(configuration->worldSeed);
     if (world == NULL)
     {
+        PlatformFree(configuration);
         return 1U;
     }
-    CreateDirectoryW(L"saves", NULL);
-    CreateDirectoryW(L"saves\\default", NULL);
+    PlatformCreateDirectory(L"saves");
+    PlatformCreateDirectory(L"saves\\default");
     // Для локального split-runtime это тот же мир, который клиент уже
     // загрузил до handshake. После подключения клиент больше его не пишет.
     WorldLoadDeltas(world, g_serverWorldPath);
 
-    DedicatedServer *server = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*server));
+    DedicatedServer *server = PlatformAllocate(sizeof(*server), true);
     if (server == NULL)
     {
         WorldDestroy(world);
+        PlatformFree(configuration);
         return 2U;
     }
     server->world = world;
+    server->worldSeed = configuration->worldSeed;
     server->timeOfDayHours = 12.0f;
     server->collision.context = world;
     server->collision.queryBlockPhysics = QueryWorldBlockPhysics;
@@ -547,7 +821,7 @@ static uint32_t RunServer(void)
         .runtimeSide = MOD_SIDE_SERVER,
         .modDataDirectory = L"saves\\default\\moddata",
     };
-    CreateDirectoryW(L"saves\\default\\moddata", NULL);
+    PlatformCreateDirectory(L"saves\\default\\moddata");
     if (ModHostInit(&server->modHost, &modBindings))
     {
         ModHostSync(&server->modHost, &server->mods);
@@ -559,8 +833,9 @@ static uint32_t RunServer(void)
             &compatibilityCount))
     {
         ModHostShutdown(&server->modHost);
-        HeapFree(GetProcessHeap(), 0, server);
+        PlatformFree(server);
         WorldDestroy(world);
+        PlatformFree(configuration);
         return 3U;
     }
     server->networkModCount = compatibilityCount;
@@ -575,56 +850,111 @@ static uint32_t RunServer(void)
             server->compatibilityMods[i].contentHash,
             LAIUE_NETWORK_MOD_HASH_SIZE);
     }
-    bool downloadsReady = !configuration.allowContentDownloads
+    bool downloadsReady = !configuration->allowContentDownloads
         || BuildDownloadableContent(server);
     if (!downloadsReady)
     {
         ModHostShutdown(&server->modHost);
-        HeapFree(GetProcessHeap(), 0, server);
+        PlatformFree(server);
         WorldDestroy(world);
+        PlatformFree(configuration);
         return 4U;
     }
-    NetworkServerConfiguration networkConfiguration = {
-        .port = configuration.port,
-        .maximumPeers = configuration.maximumPeers,
-        .worldSeed = configuration.worldSeed,
-        .mods = server->networkMods,
-        .modCount = server->networkModCount,
-        .allowContentDownloads = configuration.allowContentDownloads,
-        .contentBundle = server->downloadableContent.bytes,
-        .contentBundleSize = server->downloadableContent.size,
-    };
+    NetworkServerConfiguration networkConfiguration;
+    NetworkServerConfigurationInitialize(&networkConfiguration);
+    networkConfiguration.port = configuration->port;
+    networkConfiguration.maximumPeers = configuration->maximumPeers;
+    networkConfiguration.worldSeed = configuration->worldSeed;
+    networkConfiguration.mods = server->networkMods;
+    networkConfiguration.modCount = server->networkModCount;
+    networkConfiguration.allowContentDownloads =
+        configuration->allowContentDownloads;
+    networkConfiguration.contentBundle = server->downloadableContent.bytes;
+    networkConfiguration.contentBundleSize =
+        server->downloadableContent.size;
+    networkConfiguration.addressFamily =
+        ToNetworkAddressFamily(configuration->addressFamily);
+    networkConfiguration.listenAddress = configuration->listenAddress;
+    networkConfiguration.certificateFile = configuration->certificateFile;
+    networkConfiguration.privateKeyFile = configuration->privateKeyFile;
+    networkConfiguration.certificateStoreThumbprint =
+        configuration->certificateThumbprint;
     memcpy(networkConfiguration.contentBundleSha256,
         server->downloadableContent.sha256,
         LAIUE_NETWORK_CONTENT_HASH_SIZE);
-    NetworkServer *network = NetworkServerCreateLoopback(&networkConfiguration);
+    NetworkServer *network = ServerCredentialsAreUsable(configuration)
+        ? NetworkServerCreate(&networkConfiguration) : NULL;
     if (network == NULL)
     {
         LaiueContentBundleRelease(&server->downloadableContent);
         ModHostShutdown(&server->modHost);
-        HeapFree(GetProcessHeap(), 0, server);
+        PlatformFree(server);
         WorldDestroy(world);
+        PlatformFree(configuration);
         return 5U;
     }
     server->network = network;
 
-    wchar_t readyMessage[192];
-    uint32_t readyLength = AppendServerText(readyMessage, 192U, 0,
-        L"laiue dedicated server: 127.0.0.1:");
-    readyLength = AppendServerUnsigned(readyMessage, 192U,
-        readyLength, configuration.port);
-    readyLength = AppendServerText(readyMessage, 192U, readyLength,
-        L" (loopback only)\r\ncontent downloads: ");
-    readyLength = AppendServerText(readyMessage, 192U, readyLength,
-        configuration.allowContentDownloads ? L"enabled" : L"disabled");
-    readyLength = AppendServerText(readyMessage, 192U, readyLength,
+    wchar_t bindAddress[SERVER_CONFIG_ADDRESS_CAPACITY + 3U];
+    uint32_t bindLength = 0;
+    bool wildcard = configuration->listenAddress[0] == '*'
+        && configuration->listenAddress[1] == '\0';
+    const char* shownAddress = wildcard
+        ? (configuration->addressFamily == SERVER_ADDRESS_FAMILY_IPV4
+            ? "0.0.0.0" : "::")
+        : configuration->listenAddress;
+    uint32_t shownLength = 0;
+    while (shownAddress[shownLength] != '\0') ++shownLength;
+    uint32_t convertedLength = 0;
+    if (!PlatformUtf8ToWide(shownAddress, shownLength,
+            bindAddress + bindLength,
+            (uint32_t)(sizeof(bindAddress) / sizeof(bindAddress[0]))
+                - bindLength,
+            &convertedLength))
+    {
+        bindAddress[0] = L'?';
+        bindAddress[1] = L'\0';
+        bindLength = 1U;
+    }
+    else
+    {
+        bindLength += convertedLength;
+        if (configuration->addressFamily != SERVER_ADDRESS_FAMILY_IPV4)
+        {
+            for (uint32_t i = bindLength; i > 0; --i)
+                bindAddress[i] = bindAddress[i - 1U];
+            bindAddress[0] = L'[';
+            ++bindLength;
+            bindAddress[bindLength++] = L']';
+            bindAddress[bindLength] = L'\0';
+        }
+    }
+
+    wchar_t readyMessage[384];
+    uint32_t readyLength = AppendServerText(readyMessage, 384U, 0,
+        L"laiue dedicated server: ");
+    readyLength = AppendServerText(
+        readyMessage, 384U, readyLength, bindAddress);
+    readyLength = AppendServerText(
+        readyMessage, 384U, readyLength, L":");
+    readyLength = AppendServerUnsigned(readyMessage, 384U,
+        readyLength, configuration->port);
+    readyLength = AppendServerText(readyMessage, 384U, readyLength,
+        configuration->addressFamily == SERVER_ADDRESS_FAMILY_DUAL
+            ? L" (UDP, IPv4 + IPv6)\r\ncontent downloads: "
+            : configuration->addressFamily == SERVER_ADDRESS_FAMILY_IPV4
+                ? L" (UDP, IPv4)\r\ncontent downloads: "
+                : L" (UDP, IPv6)\r\ncontent downloads: ");
+    readyLength = AppendServerText(readyMessage, 384U, readyLength,
+        configuration->allowContentDownloads ? L"enabled" : L"disabled");
+    readyLength = AppendServerText(readyMessage, 384U, readyLength,
         L"\r\nCtrl+C to stop.\r\n");
     WriteServerMessage(readyMessage, readyLength);
 
-    SetConsoleCtrlHandler(HandleConsoleControl, TRUE);
+    PlatformInstallTerminationHandler();
     double previousTime = ServerTimeSeconds();
     double accumulator = 0.0;
-    while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0)
+    while (!PlatformTerminationRequested())
     {
         double currentTime = ServerTimeSeconds();
         double elapsed = currentTime - previousTime;
@@ -653,20 +983,33 @@ static uint32_t RunServer(void)
         {
             accumulator = 0.0;
         }
-        Sleep(1);
+        if (steps != 0) RefreshPlayerInterest(server);
+        PlatformSleepMilliseconds(1U);
     }
 
-    SetConsoleCtrlHandler(HandleConsoleControl, FALSE);
+    PlatformRemoveTerminationHandler();
     NetworkServerDestroy(network);
     LaiueContentBundleRelease(&server->downloadableContent);
     ModHostShutdown(&server->modHost);
     WorldSaveDeltas(world, g_serverWorldPath);
     WorldDestroy(world);
-    HeapFree(GetProcessHeap(), 0, server);
+    PlatformFree(server);
+    PlatformFree(configuration);
     return 0U;
 }
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 void __stdcall ServerEntryPoint(void)
 {
     ExitProcess(RunServer());
 }
+#else
+int main(void)
+{
+    return (int)RunServer();
+}
+#endif

@@ -7,19 +7,21 @@
  * ниже неё. При изменении состава модов хост перезагружает цепочку,
  * поэтому висячих указателей на таблицу не бывает.
  *
- *     cl /nologo /W4 /O2 /utf-8 /LD /I..\.. builder_lib.c /Fe:builder_lib.dll
+ * Windows и Linux-команды сборки приведены в docs/modding.md.
  */
 
 #include "builder_lib.h"
 #include "laiue_mod_api.h"
 
-static const LaiueModApi* g_api;
+static const LaiueModApi *g_api;
 
 /* Синус без CRT: полином на [-pi, pi] — примеру этого достаточно. */
 static float LibSin(float radians)
 {
-    while (radians > 3.14159265f) radians -= 6.28318531f;
-    while (radians < -3.14159265f) radians += 6.28318531f;
+    while (radians > 3.14159265f)
+        radians -= 6.28318531f;
+    while (radians < -3.14159265f)
+        radians += 6.28318531f;
     float x2 = radians * radians;
     float series = -2.50521084e-08f;
     series = series * x2 + 2.75573192e-06f;
@@ -37,16 +39,30 @@ static float LibCos(float radians)
 
 static int64_t RoundToBlock(float value)
 {
-    return value >= 0.0f ? (int64_t)(value + 0.5f)
-                         : -(int64_t)(0.5f - value);
+    return value >= 0.0f ? (int64_t)(value + 0.5f) : -(int64_t)(0.5f - value);
 }
 
-static void FillBox(int64_t x0, int64_t y0, int64_t z0,
-    int64_t x1, int64_t y1, int64_t z1, uint8_t block)
+static void FillBox(int64_t x0, int64_t y0, int64_t z0, int64_t x1, int64_t y1, int64_t z1,
+                    uint8_t block)
 {
-    if (x1 < x0) { int64_t t = x0; x0 = x1; x1 = t; }
-    if (y1 < y0) { int64_t t = y0; y0 = y1; y1 = t; }
-    if (z1 < z0) { int64_t t = z0; z0 = z1; z1 = t; }
+    if (x1 < x0)
+    {
+        int64_t t = x0;
+        x0 = x1;
+        x1 = t;
+    }
+    if (y1 < y0)
+    {
+        int64_t t = y0;
+        y0 = y1;
+        y1 = t;
+    }
+    if (z1 < z0)
+    {
+        int64_t t = z0;
+        z0 = z1;
+        z1 = t;
+    }
 
     for (int64_t z = z0; z <= z1; ++z)
         for (int64_t y = y0; y <= y1; ++y)
@@ -54,8 +70,8 @@ static void FillBox(int64_t x0, int64_t y0, int64_t z0,
                 g_api->setBlock(g_api->host, x, y, z, block);
 }
 
-static void BuildHelix(int64_t centerX, int64_t centerY, int64_t baseZ,
-    int32_t radius, int32_t height, uint8_t block)
+static void BuildHelix(int64_t centerX, int64_t centerY, int64_t baseZ, int32_t radius,
+                       int32_t height, uint8_t block)
 {
     for (int32_t step = 0; step < height * 2; ++step)
     {
@@ -73,11 +89,10 @@ static BuilderLibV1 g_builder = {
     BuildHelix,
 };
 
-__declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
+LAIUE_MOD_EXPORT int32_t LAIUE_MOD_CALL LaiueModInit(const LaiueModApi *api)
 {
     g_api = api;
-    if (!api->publishInterface(api->host,
-            BUILDER_LIB_NAME, BUILDER_LIB_VERSION, &g_builder))
+    if (!api->publishInterface(api->host, BUILDER_LIB_NAME, BUILDER_LIB_VERSION, &g_builder))
     {
         api->log(api->host, L"не удалось опубликовать интерфейс");
         return 1;
@@ -86,7 +101,7 @@ __declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
     return 0;
 }
 
-__declspec(dllexport) void LaiueModShutdown(void)
+LAIUE_MOD_EXPORT void LAIUE_MOD_CALL LaiueModShutdown(void)
 {
     g_api = 0;
 }

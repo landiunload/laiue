@@ -34,6 +34,19 @@ typedef enum WorldRegionContents
     WORLD_REGION_MIXED
 } WorldRegionContents;
 
+typedef struct WorldChunkSummary
+{
+    int64_t chunk[3];
+    uint64_t revision;
+    uint32_t deltaCount;
+} WorldChunkSummary;
+
+typedef struct WorldChunkDelta
+{
+    uint32_t localIndex;
+    BlockType block;
+} WorldChunkDelta;
+
 LAIUE_WORLD_API World* WorldCreate(int64_t seed);
 LAIUE_WORLD_API void   WorldDestroy(World* world);
 
@@ -54,6 +67,23 @@ LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
 LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+
+// Snapshot API для удалённого клиента. Сначала сервер копирует summaries в
+// заданном окне, затем запрашивает deltas каждого чанка. Все буферы принадлежат
+// вызывающему, поэтому allocator модуля world не выходит наружу.
+LAIUE_WORLD_API uint64_t WorldGetRevision(World* world);
+LAIUE_WORLD_API uint64_t WorldGetChunkRevision(
+    World* world, const int64_t chunk[3]);
+LAIUE_WORLD_API uint32_t WorldCopyEditedChunkSummaries(
+    World* world, const int64_t minimumChunk[3], const int64_t maximumChunk[3],
+    WorldChunkSummary* output, uint32_t capacity, bool* outTruncated,
+    uint64_t* outWorldRevision);
+LAIUE_WORLD_API bool WorldCopyChunkDeltas(
+    World* world, const int64_t chunk[3], WorldChunkDelta* output,
+    uint32_t capacity, uint32_t* outCount, uint64_t* outChunkRevision);
+LAIUE_WORLD_API bool WorldReplaceChunkDeltas(
+    World* world, const int64_t chunk[3], const WorldChunkDelta* deltas,
+    uint32_t count, uint64_t chunkRevision, uint64_t worldRevision);
 
 LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,

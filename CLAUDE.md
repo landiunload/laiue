@@ -6,6 +6,8 @@
 
 ## О проекте
 
-laiue 0.5.0 — воксельный движок на C17 под Windows без CRT (D3D12).
-Модульная сборка использует CMake (`laiue_add_module`). Актуальные команды и
-ссылки находятся в [README.md](README.md).
+laiue 0.5.0 — воксельный движок на C17: Windows-клиент/сервер без CRT и
+Linux dedicated server с libc/POSIX. Модульная сборка использует CMake
+(`laiue_add_module`). Канонические правила работы находятся в
+[CONTRIBUTING.md](CONTRIBUTING.md), актуальные команды и ссылки —
+в [README.md](README.md).

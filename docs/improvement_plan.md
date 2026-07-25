@@ -3,19 +3,18 @@
 Актуально для laiue 0.5.0. Выполненные возможности описаны в тематических
 документах; здесь только незакрытые задачи.
 
-## P0 — мультиплеер за пределами localhost
+## P0 — эксплуатационное усиление multiplayer
 
-Сейчас сервер авторитетен, но transport принимает только `127.0.0.1`.
-Открывать порт в LAN/Internet можно после выполнения всего списка:
+Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
+реализованы. Следующий слой для долгоживущего публичного сервера:
 
-1. MsQuic с TLS 1.3, обязательной проверкой сертификата и без gameplay в
-   0-RTT.
-2. Identity/session layer с короткоживущими токенами и отзывом сессий.
-3. Initial snapshot, revisions/deltas чанков, interest management и
-   отображение удалённых игроков.
-4. Полные серверные сохранения игроков/инвентарей, метрики и
-   административный аудит. Graceful shutdown чанков уже есть.
-5. Fuzzing decoder, soak/load и проверки ошибочного сетевого потока.
+1. Identity/session layer с короткоживущими токенами и отзывом сессий.
+2. Полные серверные profiles игроков/инвентарей, метрики и
+   административный аудит.
+3. Fuzzing decoder, soak/load, DDoS/perimeter limits и проверки ошибочного
+   QUIC-потока.
+4. Rotation сертификатов/pins без простоя и документированная recovery
+   процедура.
 
 Текущие гарантии и ограничения: [multiplayer.md](multiplayer.md).
 
@@ -27,7 +26,8 @@
 - `world_infinite.c`: хранение, генерация и фасад `world.h`;
 - `chunk_streaming.c`: планировщик, очередь работ и GPU-меши;
 - `pause_menu.c`: состояние/команды и представление;
-- `network_windows.c`: bounded channel и client/server state machines.
+- MsQuic backend: transport callbacks, bounded channel и client/server state
+  machines держать раздельными внутренними файлами.
 
 Рефакторинг выполняется после профиля или перед существенным изменением
 подсистемы. Новая DLL оправдана только отдельным временем жизни, владельцем

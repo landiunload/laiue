@@ -6,10 +6,11 @@
 #include <stdint.h>
 #include <wchar.h>
 
-// Моды laiue — только нативные DLL (см. docs/modding.md): каталог
-// mods/<имя>.lmp с манифестом mod.lm и DLL точки входа. Манифест —
-// построчный UTF-8: заголовок `LAIUE MOD 1`, метаданные (name, version,
-// game) и секция [native] с entry (имя DLL) и api (версия API SDK).
+// Моды laiue — доверенные нативные библиотеки (см. docs/modding.md):
+// каталог mods/<имя>.lmp с манифестом mod.lm и DLL/SO точки входа.
+// Манифест — построчный UTF-8. Версия 2 задаёт отдельные entry для
+// Windows x86_64, Linux x86_64 glibc и Linux x86_64 musl. Legacy
+// `LAIUE MOD 1` с `entry` читается как Windows-only.
 //
 // Включённые моды и их порядок хранит mods/enabled.txt (по строке —
 // имя каталога). Порядок = порядок загрузки DLL: библиотеки должны
@@ -44,29 +45,37 @@ typedef enum ModRuntimeStatus
 {
     MOD_RUNTIME_DISABLED = 0,
     MOD_RUNTIME_SIDE_INACTIVE,
-    MOD_RUNTIME_INCOMPATIBLE,   // версия игры или API не подходит
+    MOD_RUNTIME_INCOMPATIBLE, // версия игры или API не подходит
     MOD_RUNTIME_LOADED,
-    MOD_RUNTIME_LOAD_FAILED,    // DLL или экспорт LaiueModInit не найдены
-    MOD_RUNTIME_INIT_FAILED,    // LaiueModInit вернул ненулевой код
+    MOD_RUNTIME_LOAD_FAILED, // DLL или экспорт LaiueModInit не найдены
+    MOD_RUNTIME_INIT_FAILED, // LaiueModInit вернул ненулевой код
 } ModRuntimeStatus;
 
 typedef struct ModEntry
 {
-    wchar_t fileName[MODS_NAME_CAPACITY];     // имя каталога .lmp
-    wchar_t displayName[MODS_NAME_CAPACITY];  // name = из манифеста
-    wchar_t version[16];                      // version = из манифеста
-    wchar_t requiredGame[16];                 // game = (пусто — любая)
-    wchar_t entryDll[MODS_NAME_CAPACITY];     // [native] entry =
-    char id[MODS_ID_CAPACITY];                // стабильный ASCII id
-    ModSide side;                             // client/server/both
-    uint8_t contentHash[MODS_CONTENT_HASH_SIZE]; // SHA-256(manifest + DLL hashes)
-    uint32_t requiredApi;                     // [native] api =
+    wchar_t fileName[MODS_NAME_CAPACITY];    // имя каталога .lmp
+    wchar_t displayName[MODS_NAME_CAPACITY]; // name = из манифеста
+    wchar_t version[16];                     // version = из манифеста
+    wchar_t requiredGame[16];                // game = (пусто — любая)
+    // Выбранный для текущей платформы native entry. Имя сохранено для
+    // совместимости внутренних потребителей; на Linux это путь к .so.
+    wchar_t entryDll[MODS_NAME_CAPACITY];
+    wchar_t entryWindowsX86_64[MODS_NAME_CAPACITY];
+    wchar_t entryLinuxX86_64Gnu[MODS_NAME_CAPACITY];
+    wchar_t entryLinuxX86_64Musl[MODS_NAME_CAPACITY];
+    char id[MODS_ID_CAPACITY]; // стабильный ASCII id
+    ModSide side;              // client/server/both
+    // v2: SHA-256-цепочка raw manifest + hashes всех объявленных
+    // артефактов в каноническом порядке Windows/GNU/musl.
+    uint8_t contentHash[MODS_CONTENT_HASH_SIZE];
+    uint32_t requiredApi; // [native] api =
+    uint32_t manifestVersion;
     bool enabled;
-    bool compatible;   // версия игры и версия API
+    bool compatible; // версия игры и версия API
     bool sideValid;
 
-    ModRuntimeStatus runtimeStatus;  // заполняет хост при синхронизации
-    int32_t initResult;              // код отказа LaiueModInit
+    ModRuntimeStatus runtimeStatus; // заполняет хост при синхронизации
+    int32_t initResult;             // код отказа LaiueModInit
 } ModEntry;
 
 typedef struct ModsState
@@ -84,22 +93,23 @@ typedef struct ModsState
     uint32_t revision;
 } ModsState;
 
-LAIUE_MOD_API void ModsInit(ModsState* mods, const wchar_t* enabledFileName);
+LAIUE_MOD_API void ModsInit(ModsState *mods, const wchar_t *enabledFileName);
 
 // Перечитывает каталог mods и enabled.txt.
-LAIUE_MOD_API void ModsRefresh(ModsState* mods);
+LAIUE_MOD_API void ModsRefresh(ModsState *mods);
 
 // Включает или выключает мод по индексу списка: переписывает
 // enabled.txt (включение добавляется в конец порядка) и пересчитывает.
 // Несовместимые моды включить нельзя.
-LAIUE_MOD_API bool ModsSetEnabled(
-    ModsState* mods, uint32_t index, bool enabled);
+LAIUE_MOD_API bool ModsSetEnabled(ModsState *mods, uint32_t index, bool enabled);
 
 // Client-only моды исключены; порядок сохраняет dependency/load order.
-LAIUE_MOD_API bool ModsBuildCompatibilitySet(const ModsState* mods,
-    ModCompatibilityEntry* output, uint32_t capacity, uint32_t* outCount);
+LAIUE_MOD_API bool ModsBuildCompatibilitySet(const ModsState *mods, ModCompatibilityEntry *output,
+                                             uint32_t capacity, uint32_t *outCount);
 
-LAIUE_MOD_API bool ModsApplyServerCompatibilitySet(ModsState* mods,
-    const ModCompatibilityEntry* required, uint32_t count);
-LAIUE_MOD_API bool ModsCanApplyServerCompatibilitySet(const ModsState* mods,
-    const ModCompatibilityEntry* required, uint32_t count);
+LAIUE_MOD_API bool ModsApplyServerCompatibilitySet(ModsState *mods,
+                                                   const ModCompatibilityEntry *required,
+                                                   uint32_t count);
+LAIUE_MOD_API bool ModsCanApplyServerCompatibilitySet(const ModsState *mods,
+                                                      const ModCompatibilityEntry *required,
+                                                      uint32_t count);

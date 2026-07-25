@@ -4,9 +4,11 @@
 #include <stdint.h>
 
 #define LAIUE_PROTOCOL_MAGIC 0x5549414cU /* "LAIU" little-endian */
-#define LAIUE_PROTOCOL_VERSION 4U
+#define LAIUE_PROTOCOL_VERSION 5U
+#define LAIUE_PROTOCOL_ALPN "laiue/5"
 #define LAIUE_PROTOCOL_HEADER_SIZE 16U
-#define LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE 1024U
+#define LAIUE_PROTOCOL_MAX_CONTROL_PAYLOAD_SIZE 1024U
+#define LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE LAIUE_PROTOCOL_MAX_CONTROL_PAYLOAD_SIZE
 #define LAIUE_PROTOCOL_MAX_FRAME_SIZE (LAIUE_PROTOCOL_HEADER_SIZE + LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE)
 
 #define LAIUE_PROTOCOL_MAX_MODS 32U
@@ -14,6 +16,16 @@
 #define LAIUE_PROTOCOL_MOD_VERSION_CAPACITY 16U
 #define LAIUE_PROTOCOL_MOD_HASH_SIZE 32U
 #define LAIUE_PROTOCOL_CONTENT_HASH_SIZE 32U
+#define LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS 4096U
+#define LAIUE_PROTOCOL_MAX_CHUNK_EDITS 128U
+#define LAIUE_PROTOCOL_CHUNK_SIZE 64U
+#define LAIUE_PROTOCOL_MAX_CHUNK_PARTS \
+    ((LAIUE_PROTOCOL_CHUNK_SIZE * LAIUE_PROTOCOL_CHUNK_SIZE * \
+      LAIUE_PROTOCOL_CHUNK_SIZE) / LAIUE_PROTOCOL_MAX_CHUNK_EDITS)
+#define LAIUE_PROTOCOL_MAX_CONTROL_STREAMS 1U
+#define LAIUE_PROTOCOL_MAX_SERVER_STREAMS 2U
+#define LAIUE_PROTOCOL_MAX_QUEUED_FRAMES 256U
+#define LAIUE_PROTOCOL_MAX_OUTSTANDING_SENDS 256U
 
 typedef enum LaiueMessageType
 {
@@ -38,6 +50,15 @@ typedef enum LaiueMessageType
     LAIUE_MESSAGE_BLOCK_DROP_REMOVE = 19,
     LAIUE_MESSAGE_INVENTORY_STATE = 20,
     LAIUE_MESSAGE_SELECT_HOTBAR_SLOT = 21,
+    LAIUE_MESSAGE_SNAPSHOT_BEGIN = 22,
+    LAIUE_MESSAGE_SNAPSHOT_CHUNK = 23,
+    LAIUE_MESSAGE_SNAPSHOT_END = 24,
+    LAIUE_MESSAGE_CHUNK_RESYNC_REQUEST = 25,
+    LAIUE_MESSAGE_PLAYER_JOINED = 26,
+    LAIUE_MESSAGE_PLAYER_LEFT = 27,
+    LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY = 28,
+    LAIUE_MESSAGE_WORLD_TIME = 29,
+    LAIUE_MESSAGE_SYNC_READY = 30,
 
     // Первый недопустимый номер: граница проверки заголовка. Новый тип
     // добавляется строго перед этой строкой и сразу попадает в разрешённый
@@ -88,6 +109,7 @@ typedef struct LaiueProtocolPlayerState
 typedef struct LaiueProtocolBlockDelta
 {
     uint32_t serverTick;
+    uint64_t revision;
     int64_t block[3];
     uint8_t replacement;
 } LaiueProtocolBlockDelta;
@@ -112,6 +134,43 @@ typedef struct LaiueProtocolInventory
     uint8_t selectedHotbarSlot;
     LaiueProtocolInventorySlot slots[LAIUE_PROTOCOL_INVENTORY_SLOTS];
 } LaiueProtocolInventory;
+
+typedef struct LaiueProtocolSnapshotBegin
+{
+    uint64_t snapshotId;
+    uint64_t worldRevision;
+    uint32_t serverTick;
+    uint32_t chunkCount;
+    uint32_t peerId;
+    int64_t worldSeed;
+    uint64_t worldTime;
+} LaiueProtocolSnapshotBegin;
+
+typedef struct LaiueProtocolChunkEdit
+{
+    uint8_t localX;
+    uint8_t localY;
+    uint8_t localZ;
+    uint8_t replacement;
+} LaiueProtocolChunkEdit;
+
+typedef struct LaiueProtocolChunkDelta
+{
+    int64_t chunk[3];
+    uint64_t revision;
+    // A logical 64^3 chunk may contain more edits than fit in one bounded
+    // control frame. Parts are zero-based, contiguous and never interleaved.
+    uint16_t partIndex;
+    uint16_t partCount;
+    uint16_t editCount;
+    LaiueProtocolChunkEdit edits[LAIUE_PROTOCOL_MAX_CHUNK_EDITS];
+} LaiueProtocolChunkDelta;
+
+typedef struct LaiueProtocolChunkResyncRequest
+{
+    int64_t chunk[3];
+    uint64_t expectedRevision;
+} LaiueProtocolChunkResyncRequest;
 
 bool LaiueProtocolReadHeader(const uint8_t *bytes, uint32_t size, LaiueProtocolFrame *outFrame);
 uint32_t LaiueProtocolWriteHeader(uint8_t *output, uint32_t capacity,
@@ -171,3 +230,35 @@ uint32_t LaiueProtocolEncodeInventory(uint8_t* output, uint32_t capacity,
                                      const LaiueProtocolInventory* inventory);
 bool LaiueProtocolDecodeInventory(const uint8_t* payload, uint32_t size,
                                   LaiueProtocolInventory* outInventory);
+uint32_t LaiueProtocolEncodeSnapshotBegin(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolSnapshotBegin *snapshot);
+bool LaiueProtocolDecodeSnapshotBegin(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolSnapshotBegin *outSnapshot);
+uint32_t LaiueProtocolEncodeSnapshotChunk(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkDelta *chunk);
+bool LaiueProtocolDecodeSnapshotChunk(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkDelta *outChunk);
+uint32_t LaiueProtocolEncodeSnapshotEnd(
+    uint8_t *output, uint32_t capacity,
+    uint64_t snapshotId, uint64_t worldRevision);
+bool LaiueProtocolDecodeSnapshotEnd(
+    const uint8_t *payload, uint32_t size,
+    uint64_t *outSnapshotId, uint64_t *outWorldRevision);
+uint32_t LaiueProtocolEncodeChunkResyncRequest(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkResyncRequest *request);
+bool LaiueProtocolDecodeChunkResyncRequest(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkResyncRequest *outRequest);
+uint32_t LaiueProtocolEncodePeerId(
+    uint8_t *output, uint32_t capacity, uint32_t peerId);
+bool LaiueProtocolDecodePeerId(
+    const uint8_t *payload, uint32_t size, uint32_t *outPeerId);
+uint32_t LaiueProtocolEncodeWorldTime(
+    uint8_t *output, uint32_t capacity, uint64_t worldTime);
+bool LaiueProtocolDecodeWorldTime(
+    const uint8_t *payload, uint32_t size, uint64_t *outWorldTime);

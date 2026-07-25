@@ -17,7 +17,7 @@
             "inherits": "windows-base"
         },
         {
-            "name": "ninja-base",
+            "name": "ninja-windows-base",
             "hidden": true,
             "inherits": "windows-base",
             "generator": "Ninja"
@@ -25,7 +25,7 @@
         {
             "name": "ninja-msvc-debug",
             "displayName": "Ninja + MSVC Debug",
-            "inherits": "ninja-base",
+            "inherits": "ninja-windows-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_C_COMPILER": "cl.exe"
@@ -34,16 +34,29 @@
         {
             "name": "ninja-msvc-release",
             "displayName": "Ninja + MSVC Release",
-            "inherits": "ninja-base",
+            "inherits": "ninja-windows-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "cl.exe"
+                "CMAKE_C_COMPILER": "cl.exe",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
+            }
+        },
+        {
+            "name": "ninja-msvc-server-release",
+            "displayName": "Ninja + MSVC server-only Release",
+            "inherits": "ninja-windows-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "cl.exe",
+                "LAIUE_BUILD_CLIENT": "OFF",
+                "LAIUE_BUILD_SERVER": "ON",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
             }
         },
         {
             "name": "ninja-clang-debug",
-            "displayName": "Ninja + Clang Debug",
-            "inherits": "ninja-base",
+            "displayName": "Ninja + clang-cl Debug",
+            "inherits": "ninja-windows-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_C_COMPILER": "clang-cl.exe"
@@ -51,11 +64,83 @@
         },
         {
             "name": "ninja-clang-release",
-            "displayName": "Ninja + Clang Release",
-            "inherits": "ninja-base",
+            "displayName": "Ninja + clang-cl Release",
+            "inherits": "ninja-windows-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "clang-cl.exe"
+                "CMAKE_C_COMPILER": "clang-cl.exe",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
+            }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            },
+            "cacheVariables": {
+                "LAIUE_BUILD_CLIENT": "OFF",
+                "LAIUE_BUILD_SERVER": "ON",
+                "LAIUE_BUILD_EXAMPLE_MODS": "ON"
+            }
+        },
+        {
+            "name": "linux-gcc-debug",
+            "displayName": "Debian 13 + GCC Debug",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "gcc",
+                "LAIUE_LINUX_LIBC": "gnu"
+            }
+        },
+        {
+            "name": "linux-gcc-release",
+            "displayName": "Debian 13 + GCC Release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "gcc",
+                "LAIUE_LINUX_LIBC": "gnu",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
+            }
+        },
+        {
+            "name": "linux-clang-release",
+            "displayName": "Debian 13 + Clang Release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang",
+                "LAIUE_LINUX_LIBC": "gnu",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
+            }
+        },
+        {
+            "name": "linux-gcc-asan",
+            "displayName": "Debian 13 + GCC ASan/UBSan",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "gcc",
+                "LAIUE_LINUX_LIBC": "gnu",
+                "LAIUE_ENABLE_LTO": "OFF",
+                "LAIUE_ENABLE_SANITIZERS": "ON"
+            }
+        },
+        {
+            "name": "linux-musl-release",
+            "displayName": "Alpine/musl + GCC Release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "gcc",
+                "LAIUE_LINUX_LIBC": "musl",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
             }
         }
     ],
@@ -79,12 +164,36 @@
             "configurePreset": "ninja-msvc-release"
         },
         {
+            "name": "ninja-msvc-server-release",
+            "configurePreset": "ninja-msvc-server-release"
+        },
+        {
             "name": "ninja-clang-debug",
             "configurePreset": "ninja-clang-debug"
         },
         {
             "name": "ninja-clang-release",
             "configurePreset": "ninja-clang-release"
+        },
+        {
+            "name": "linux-gcc-debug",
+            "configurePreset": "linux-gcc-debug"
+        },
+        {
+            "name": "linux-gcc-release",
+            "configurePreset": "linux-gcc-release"
+        },
+        {
+            "name": "linux-clang-release",
+            "configurePreset": "linux-clang-release"
+        },
+        {
+            "name": "linux-gcc-asan",
+            "configurePreset": "linux-gcc-asan"
+        },
+        {
+            "name": "linux-musl-release",
+            "configurePreset": "linux-musl-release"
         }
     ],
     "testPresets": [
@@ -111,6 +220,11 @@
             "output": { "outputOnFailure": true }
         },
         {
+            "name": "ninja-msvc-server-release",
+            "configurePreset": "ninja-msvc-server-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
             "name": "ninja-clang-debug",
             "configurePreset": "ninja-clang-debug",
             "output": { "outputOnFailure": true }
@@ -118,6 +232,31 @@
         {
             "name": "ninja-clang-release",
             "configurePreset": "ninja-clang-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "linux-gcc-debug",
+            "configurePreset": "linux-gcc-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "linux-gcc-release",
+            "configurePreset": "linux-gcc-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "linux-clang-release",
+            "configurePreset": "linux-clang-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "linux-gcc-asan",
+            "configurePreset": "linux-gcc-asan",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "linux-musl-release",
+            "configurePreset": "linux-musl-release",
             "output": { "outputOnFailure": true }
         }
     ]

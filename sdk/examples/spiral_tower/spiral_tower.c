@@ -7,21 +7,19 @@
  * выше этого мода — иначе Init честно откажется (код 1), и вкладка
  * модов покажет причину.
  *
- *     cl /nologo /W4 /O2 /utf-8 /LD /I..\.. /I..\builder_lib ^
- *        spiral_tower.c /Fe:spiral_tower.dll
+ * Windows и Linux-команды сборки приведены в docs/modding.md.
  */
 
 #include "../builder_lib/builder_lib.h"
 #include "laiue_mod_api.h"
 
-__declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
+LAIUE_MOD_EXPORT int32_t LAIUE_MOD_CALL LaiueModInit(const LaiueModApi *api)
 {
-    const BuilderLibV1* builder = api->queryInterface(api->host,
-        BUILDER_LIB_NAME, BUILDER_LIB_VERSION);
+    const BuilderLibV1 *builder =
+        api->queryInterface(api->host, BUILDER_LIB_NAME, BUILDER_LIB_VERSION);
     if (builder == NULL)
     {
-        api->log(api->host,
-            L"нужен Builder Lib: включите builder_lib.lmp выше по списку");
+        api->log(api->host, L"нужен Builder Lib: включите builder_lib.lmp выше по списку");
         return 1;
     }
 
@@ -32,6 +30,4 @@ __declspec(dllexport) int32_t LaiueModInit(const LaiueModApi* api)
     return 0;
 }
 
-__declspec(dllexport) void LaiueModShutdown(void)
-{
-}
+LAIUE_MOD_EXPORT void LAIUE_MOD_CALL LaiueModShutdown(void) {}

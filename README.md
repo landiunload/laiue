@@ -1,17 +1,20 @@
 # laiue
 
-Воксельный движок 0.5.0 для Windows: C17 без CRT, Direct3D 12,
-потоковое аудио, DLL-модули, нативные моды и отдельный authoritative server.
+Воксельный движок 0.5.0: Windows-клиент на C17 без CRT и Direct3D 12,
+а также authoritative dedicated server для Windows и Linux x86_64.
+Клиент и сервер используют общий headless-стек мира, физики, gameplay,
+content, network и модов.
 
 Сейчас готовы одиночные миры, сохранения, креатив/выживание, инвентарь,
-дропы и локальный мультиплеер. Сетевой transport привязан к
-`127.0.0.1`; открывать его в LAN или Internet пока нельзя.
+дропы и client/server multiplayer. Удалённый production transport —
+QUIC/UDP с TLS 1.3, обязательной проверкой server identity и поддержкой
+IPv4/IPv6. Если MsQuic или credentials недоступны, он завершается
+fail-closed без plaintext fallback.
 
 ## Сборка
 
-Требуются CMake 3.28+ и Visual Studio с MSVC. Для Ninja нужны Ninja и,
-в зависимости от preset, Developer Command Prompt MSVC или LLVM
-(`clang-cl` + `lld-link`).
+Требуется CMake 3.28+. Windows-клиент собирается MSVC или clang-cl; Linux
+server — GCC/Clang с OpenSSL 3 и MsQuic 2.5.9.
 
 ```powershell
 # Visual Studio, Release
@@ -23,10 +26,21 @@ cmake --preset ninja-clang-release
 cmake --build --preset ninja-clang-release --parallel
 ```
 
-Результат находится в `build/<preset>/bin/<Configuration>`. Перед
+Linux server:
+
+```sh
+cmake --preset linux-gcc-release
+cmake --build --preset linux-gcc-release \
+  --target laiue_server_bundle --parallel
+```
+
+Также доступны `linux-gcc-debug`, `linux-clang-release`,
+`linux-gcc-asan` и `linux-musl-release`. Результат находится в
+`build/<preset>/bin/<Configuration>`. Перед
 пересборкой закройте клиент и сервер из этого каталога: Windows блокирует
 загруженные EXE/DLL. Сборка проверяет блокировку заранее и выводит PID.
-Подробности — в [CONTRIBUTING.md](CONTRIBUTING.md).
+Зависимости, options, install и ABI-матрица описаны в
+[docs/portability.md](docs/portability.md).
 
 ## Запуск
 
@@ -39,8 +53,13 @@ cmake --build --preset ninja-clang-release --parallel
 ./laiue_server.exe
 ```
 
+Перед удалённым запуском настройте certificate/key и bind policy в
+`server.cfg`. По умолчанию порт — UDP 27180, режим `dual` слушает IPv4 и
+IPv6 одновременно. Инструкции для Linux/Windows, SAN, pin и нестандартного
+порта — в [docs/secure_server.md](docs/secure_server.md).
+
 Клиент открывает главное меню без мира и фоновых meshing-задач. Мир,
-игровые GPU-ресурсы и DLL-хост модов создаются только после выбора сессии
+игровые GPU-ресурсы и native host модов создаются только после выбора сессии
 и освобождаются при возврате в меню.
 
 ## Управление
@@ -70,12 +89,12 @@ cmake --build --preset ninja-clang-release --parallel
 ```text
 laiue.exe -> laiue_core.dll
              ├─ window + input + audio
-             ├─ world + mesher + render
-             ├─ physics + gameplay + interaction
-             └─ content + mod + network
+             ├─ mesher + render
+             └─ laiue::headless_stack
+                  └─ world + physics + gameplay + interaction
+                     + content + mod + network
 
-laiue_server.exe -> network + content + mod + world
-                    + physics + gameplay + interaction
+laiue_server(.exe) -> laiue::headless_stack
 ```
 
 `core` компонует клиент. Сервер не зависит от `core`, окна, input,
@@ -86,7 +105,7 @@ renderer или mesher. Направления include-зависимостей 
 
 Поддерживаются три категории:
 
-- моды: `mods/<name>.lmp` с `mod.lm` и DLL;
+- моды: `mods/<name>.lmp` с `mod.lm` v2 и платформенными DLL/SO;
 - шейдерпаки: `shaders/<name>.lsp` с DXBC-стадиями `.ls`;
 - текстурпаки: `textures/<name>.ltp`.
 
@@ -107,6 +126,8 @@ renderer или mesher. Направления include-зависимостей 
 - [аудио](docs/audio.md)
 - [актуальный план](docs/improvement_plan.md)
 - [мультиплеер и безопасность](docs/multiplayer.md)
+- [secure remote server](docs/secure_server.md)
+- [переносимость и Linux](docs/portability.md)
 - [моддинг и SDK](docs/modding.md)
 - [форматы содержимого](docs/content_formats.md)
 - [шейдерпаки](docs/shaderpacks.md)

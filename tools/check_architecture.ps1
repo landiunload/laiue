@@ -9,7 +9,7 @@ $sourceRootPath = [System.IO.Path]::GetFullPath($SourceRoot)
 # остальные модули видят только себя и явно перечисленные нижние слои.
 $allowed = @{
     audio       = @('audio')
-    content     = @('content')
+    content     = @('content', 'platform')
     core        = @('audio', 'content', 'core', 'game', 'gameplay', 'input',
                     'interaction', 'mesh', 'mod', 'network', 'physics',
                     'platform', 'render', 'world')
@@ -19,15 +19,15 @@ $allowed = @{
     interaction = @('interaction', 'physics', 'world')
     launcher    = @('launcher')
     mesh        = @('mesh', 'render', 'world')
-    mod         = @('content', 'game', 'gameplay', 'mod', 'world')
-    network     = @('network')
+    mod         = @('content', 'game', 'gameplay', 'mod', 'platform', 'world')
+    network     = @('network', 'platform')
     physics     = @('physics')
     platform    = @('platform')
     render      = @('content', 'render')
     runtime     = @('runtime')
     server      = @('content', 'game', 'gameplay', 'interaction', 'mod',
-                    'network', 'physics', 'server', 'world')
-    world       = @('world')
+                    'network', 'physics', 'platform', 'server', 'world')
+    world       = @('platform', 'world')
 }
 
 $violations = [System.Collections.Generic.List[string]]::new()

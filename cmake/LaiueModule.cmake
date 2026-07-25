@@ -12,37 +12,61 @@ function(laiue_collect_sources out_variable)
     set(${out_variable} "${result}" PARENT_SCOPE)
 endfunction()
 
+function(laiue_register_runtime_target target_name)
+    if(NOT TARGET "${target_name}")
+        message(FATAL_ERROR
+            "Нельзя зарегистрировать отсутствующую цель ${target_name}")
+    endif()
+    set_property(GLOBAL APPEND PROPERTY LAIUE_RUNTIME_TARGETS "${target_name}")
+endfunction()
+
 function(laiue_add_module module_name)
     cmake_parse_arguments(PARSE_ARGV 1 MODULE
         ""
         ""
-        "SOURCES;LINK;PUBLIC_LINK"
+        "SOURCES;WINDOWS_SOURCES;UNIX_SOURCES;LINK;PUBLIC_LINK;WINDOWS_LINK;UNIX_LINK"
     )
 
-    if(NOT MODULE_SOURCES)
+    set(selected_sources ${MODULE_SOURCES})
+    set(selected_links ${MODULE_LINK})
+    if(WIN32)
+        list(APPEND selected_sources ${MODULE_WINDOWS_SOURCES})
+        list(APPEND selected_links ${MODULE_WINDOWS_LINK})
+    else()
+        list(APPEND selected_sources ${MODULE_UNIX_SOURCES})
+        list(APPEND selected_links ${MODULE_UNIX_LINK})
+    endif()
+    if(NOT selected_sources)
         message(FATAL_ERROR "laiue_add_module(${module_name}) требует SOURCES")
     endif()
 
-    laiue_collect_sources(module_sources ${MODULE_SOURCES})
+    laiue_collect_sources(module_sources ${selected_sources})
     set(target_name "laiue_${module_name}")
     string(TOUPPER "${module_name}" module_name_upper)
 
     add_library(${target_name} SHARED)
     target_sources(${target_name} PRIVATE ${module_sources})
     source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_sources})
-
     target_compile_definitions(${target_name}
-        PRIVATE "LAIUE_BUILD_${module_name_upper}"
-    )
+        PRIVATE "LAIUE_BUILD_${module_name_upper}")
     target_link_libraries(${target_name}
         PRIVATE
             laiue_common
-            laiue_runtime
-            kernel32
-            ${MODULE_LINK}
-    )
+            laiue::platform_support
+            ${selected_links})
     if(MODULE_PUBLIC_LINK)
         target_link_libraries(${target_name} PUBLIC ${MODULE_PUBLIC_LINK})
     endif()
-    target_link_options(${target_name} PRIVATE /NOENTRY)
+
+    if(WIN32)
+        target_link_options(${target_name} PRIVATE /NOENTRY)
+    else()
+        set_target_properties(${target_name} PROPERTIES
+            C_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN YES
+            BUILD_RPATH "$ORIGIN"
+            INSTALL_RPATH "$ORIGIN")
+    endif()
+
+    laiue_register_runtime_target(${target_name})
 endfunction()

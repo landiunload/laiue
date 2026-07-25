@@ -35,7 +35,7 @@ typedef enum PauseMenuAction
     PAUSE_MENU_ACTION_RETURN_TITLE,
     PAUSE_MENU_ACTION_QUIT,
     PAUSE_MENU_ACTION_PLAY_WORLD,
-    PAUSE_MENU_ACTION_CONNECT_LOCAL,
+    PAUSE_MENU_ACTION_CONNECT_SERVER,
     PAUSE_MENU_ACTION_APPLY_SERVER_MODS,
     PAUSE_MENU_ACTION_DOWNLOAD_SERVER_CONTENT,
     PAUSE_MENU_ACTION_CANCEL_CONNECT,
@@ -84,7 +84,7 @@ typedef struct PauseMenu
     ServerList servers;
     bool serverListLoaded;
     uint32_t serverListOffset;
-    uint16_t selectedServerPort;
+    uint32_t selectedServerIndex;
     uint32_t requiredServerModCount;
     bool requiredServerModsInstalled;
     bool serverDownloadsAllowed;

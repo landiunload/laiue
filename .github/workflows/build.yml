@@ -8,15 +8,34 @@ jobs:
   windows-msvc:
     runs-on: windows-latest
     strategy:
-      # Падение одной конфигурации не должно отменять вторую: иначе про
-      # Release ничего не известно, пока не починен Debug.
       fail-fast: false
       matrix:
         preset: [visual-studio-debug, visual-studio-release]
     steps:
       - uses: actions/checkout@v5
+      - name: Install MsQuic 2.5.9
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'msquic.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'msquic'
+          Invoke-WebRequest `
+            -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Native.Quic.MsQuic.Schannel/2.5.9' `
+            -OutFile $archive
+          $expected = '9877A919E1AA73AA4800F1E8A06B6539021F376228910138EB04540CD956617B'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'MsQuic NuGet SHA-256 mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $root -Force
+          Invoke-WebRequest `
+            -Uri 'https://raw.githubusercontent.com/microsoft/msquic/87b53085d76bd7920d490a6f226c9999b6614d14/THIRD-PARTY-NOTICES' `
+            -OutFile (Join-Path $root 'THIRD-PARTY-NOTICES')
+          "LAIUE_MSQUIC_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Configure
-        run: cmake --preset visual-studio
+        shell: pwsh
+        run: >
+          cmake --preset visual-studio
+          "-DLAIUE_MSQUIC_ROOT=$env:LAIUE_MSQUIC_ROOT"
+          -DLAIUE_REQUIRE_MSQUIC=ON
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }} --parallel
       - name: Test
@@ -29,10 +48,6 @@ jobs:
             git status --short
             throw 'Build changed tracked sources'
           }
-
-      # Готовый к запуску клиент+сервер: игрок скачивает zip и запускает
-      # laiue.exe без сборки. Пакуется только Release; архив кладётся вне
-      # рабочего дерева, чтобы не сработала проверка изменённых файлов выше.
       - name: Package release artifact
         if: matrix.preset == 'visual-studio-release'
         shell: pwsh
@@ -43,18 +58,122 @@ jobs:
               throw "В сборке нет $required"
             }
           }
-          # Тестовые исполняемые файлы — часть сборки, но не игры; в релиз не
-          # кладём. saves/ и прочее рантайм-содержимое на чистом раннере не
-          # создаётся, поэтому отдельно исключать не нужно.
           $items = Get-ChildItem $out -Exclude '*_test.exe'
           $zip = Join-Path $env:RUNNER_TEMP 'laiue-windows-x64.zip'
           Compress-Archive -Path $items.FullName -DestinationPath $zip -Force
-          "Артефакт: $([math]::Round((Get-Item $zip).Length / 1MB, 2)) МБ" | Write-Host
-
       - name: Upload release artifact
         if: matrix.preset == 'visual-studio-release'
         uses: actions/upload-artifact@v4
         with:
           name: laiue-windows-x64
           path: ${{ runner.temp }}/laiue-windows-x64.zip
+          if-no-files-found: error
+
+  debian-server:
+    runs-on: ubuntu-latest
+    container: debian:13-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [linux-gcc-debug, linux-clang-release, linux-gcc-asan]
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates clang cmake curl g++ gcc git gnupg libssl-dev ninja-build
+          curl --fail --location --silent --show-error \
+            --output /tmp/packages-microsoft-prod.deb \
+            https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb
+          dpkg -i /tmp/packages-microsoft-prod.deb
+          apt-get update
+          apt-get install -y libmsquic=2.5.9
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+      - name: Install smoke test
+        run: cmake --install build/${{ matrix.preset }} --prefix build/install
+      - name: Verify generated sources
+        run: |
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Package glibc server
+        if: matrix.preset == 'linux-clang-release'
+        run: |
+          cpack --config build/${{ matrix.preset }}/CPackConfig.cmake \
+            --generator TGZ --package-directory /tmp/laiue-package
+          mv /tmp/laiue-package/*.tar.gz /tmp/laiue-linux-x86_64-gnu.tar.gz
+      - name: Upload glibc server
+        if: matrix.preset == 'linux-clang-release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: laiue-linux-x86_64-gnu
+          path: /tmp/laiue-linux-x86_64-gnu.tar.gz
+          if-no-files-found: error
+
+  alpine-server:
+    runs-on: ubuntu-latest
+    container: alpine:3.23
+    steps:
+      - name: Install build dependencies
+        run: >
+          apk add --no-cache
+          bash build-base cmake gcompat git linux-headers ninja
+          openssl-dev perl
+      - name: Build pinned MsQuic 2.5.9 for musl
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/microsoft/msquic.git /tmp/msquic
+          git -C /tmp/msquic fetch --depth 1 origin \
+            87b53085d76bd7920d490a6f226c9999b6614d14
+          git -C /tmp/msquic checkout --detach \
+            87b53085d76bd7920d490a6f226c9999b6614d14
+          git -C /tmp/msquic submodule update --init --recursive --depth 1
+          cmake -S /tmp/msquic -B /tmp/msquic-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DQUIC_BUILD_PERF=OFF \
+            -DQUIC_BUILD_SHARED=ON \
+            -DQUIC_BUILD_TEST=OFF \
+            -DQUIC_BUILD_TOOLS=OFF \
+            -DQUIC_EMBED_GIT_HASH=OFF \
+            -DQUIC_ENABLE_LOGGING=OFF \
+            -DQUIC_LINUX_XDP_ENABLED=OFF \
+            -DQUIC_TLS_LIB=quictls
+          cmake --build /tmp/msquic-build --target msquic --parallel
+          mkdir -p /tmp/msquic-install/include /tmp/msquic-install/lib
+          cp /tmp/msquic/src/inc/msquic*.h /tmp/msquic-install/include/
+          library="$(find /tmp/msquic-build -type f -name 'libmsquic.so*' | head -n 1)"
+          test -n "$library"
+          cp "$library" /tmp/msquic-install/lib/libmsquic.so.2.5.9
+          ln -s libmsquic.so.2.5.9 /tmp/msquic-install/lib/libmsquic.so.2
+          ln -s libmsquic.so.2 /tmp/msquic-install/lib/libmsquic.so
+          cp /tmp/msquic/LICENSE /tmp/msquic-install/LICENSE
+          cp /tmp/msquic/THIRD-PARTY-NOTICES \
+            /tmp/msquic-install/THIRD-PARTY-NOTICES
+          echo 'LAIUE_MSQUIC_ROOT=/tmp/msquic-install' >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset linux-musl-release
+      - name: Build
+        run: cmake --build --preset linux-musl-release --parallel
+      - name: Test
+        run: ctest --preset linux-musl-release
+      - name: Install smoke test
+        run: cmake --install build/linux-musl-release --prefix build/install
+      - name: Verify generated sources
+        run: |
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Package musl server
+        run: |
+          cpack --config build/linux-musl-release/CPackConfig.cmake \
+            --generator TGZ --package-directory /tmp/laiue-package
+          mv /tmp/laiue-package/*.tar.gz /tmp/laiue-linux-x86_64-musl.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laiue-linux-x86_64-musl
+          path: /tmp/laiue-linux-x86_64-musl.tar.gz
           if-no-files-found: error

@@ -1,6 +1,6 @@
 #include "world/infinite_coord.h"
+#include "platform/system.h"
 
-#include <windows.h>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #endif
@@ -21,7 +21,7 @@ static void InfiniteCoordNormalize(InfiniteCoord* value)
     {
         if (value->limbs != NULL)
         {
-            HeapFree(GetProcessHeap(), 0, value->limbs);
+            PlatformFree(value->limbs);
             value->limbs = NULL;
         }
         value->sign = 0;
@@ -66,8 +66,8 @@ static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source
         return true;
     }
 
-    uint64_t* limbs = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)source->limbCount * sizeof(uint64_t));
+    uint64_t* limbs = PlatformAllocate(
+        (size_t)source->limbCount * sizeof(uint64_t), false);
     if (limbs == NULL)
     {
         return false;
@@ -93,7 +93,7 @@ static bool InfiniteCoordTryAddMagnitudeSmall(InfiniteCoord* value, uint64_t mag
 
     if (value->limbCount == 0)
     {
-        value->limbs = HeapAlloc(GetProcessHeap(), 0, sizeof(uint64_t));
+        value->limbs = PlatformAllocate(sizeof(uint64_t), false);
         if (value->limbs == NULL)
         {
             return false;
@@ -117,8 +117,8 @@ static bool InfiniteCoordTryAddMagnitudeSmall(InfiniteCoord* value, uint64_t mag
     if (carry != 0)
     {
         uint32_t newCount = value->limbCount + 1;
-        uint64_t* expanded = HeapReAlloc(GetProcessHeap(), 0, value->limbs,
-            (size_t)newCount * sizeof(uint64_t));
+        uint64_t* expanded = PlatformReallocate(value->limbs,
+            (size_t)newCount * sizeof(uint64_t), false);
         if (expanded == NULL)
         {
             // Откатываем перенос: исходное значение было ...FFFF + magnitude.
@@ -397,7 +397,7 @@ void InfiniteCoordDestroy(InfiniteCoord* value)
 {
     if (value->limbs != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, value->limbs);
+        PlatformFree(value->limbs);
     }
     InfiniteCoordInit(value);
 }
@@ -483,8 +483,8 @@ bool InfiniteCoordTryCopySquareAddInt64(
     }
 
     uint32_t capacity = value.limbCount * 2u + 1u;
-    uint64_t* limbs = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)capacity * sizeof(uint64_t));
+    uint64_t* limbs = PlatformAllocate(
+        (size_t)capacity * sizeof(uint64_t), true);
     if (limbs == NULL)
     {
         InfiniteCoordDestroy(&value);
@@ -544,8 +544,8 @@ bool InfiniteCoordTryCopyShiftRight(
         return true;
     }
 
-    out->limbs = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)source->limbCount * sizeof(uint64_t));
+    out->limbs = PlatformAllocate(
+        (size_t)source->limbCount * sizeof(uint64_t), false);
     if (out->limbs == NULL)
     {
         return false;

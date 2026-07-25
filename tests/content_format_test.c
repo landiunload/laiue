@@ -1,6 +1,5 @@
-#include <windows.h>
-
 #include "content/content_format.h"
+#include "test_runtime.h"
 
 // Контракт пользовательского содержимого: какие имена паков и модов движок
 // вообще соглашается принять. LaiueContentNameIsSafe — единственный барьер
@@ -18,21 +17,9 @@
 
 static uint32_t contentFormatTestChecks;
 
-// Тест собирается без CRT: вывод — прямая запись в stdout.
 static void ContentFormatTestWrite(const char* text)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-    uint32_t length = 0;
-    while (text[length] != '\0')
-    {
-        ++length;
-    }
-    DWORD written = 0;
-    WriteFile(output, text, length, &written, NULL);
+    LaiueTestRuntimeWrite(text);
 }
 
 static void ContentFormatTestWriteNumber(uint32_t value)
@@ -61,7 +48,7 @@ static void ContentFormatTestExpect(bool condition, const char* name)
     ContentFormatTestWrite("Проверка не пройдена: ");
     ContentFormatTestWrite(name);
     ContentFormatTestWrite("\r\n");
-    ExitProcess(1);
+    LaiueTestRuntimeExit(1);
 }
 
 static bool WideEquals(const wchar_t* left, const wchar_t* right)
@@ -309,7 +296,7 @@ static void TestNameIsSafeRejectsDeviceNames(void)
         "com1.lm признан безопасным");
 }
 
-void ContentFormatTestEntryPoint(void)
+LAIUE_TEST_ENTRY(ContentFormatTestEntryPoint)
 {
     TestFormatTable();
     TestPackFlagFollowsTypeOrder();
@@ -322,5 +309,5 @@ void ContentFormatTestEntryPoint(void)
     ContentFormatTestWrite("Проверок пройдено: ");
     ContentFormatTestWriteNumber(contentFormatTestChecks);
     ContentFormatTestWrite("\r\n");
-    ExitProcess(0);
+    LAIUE_TEST_SUCCESS();
 }

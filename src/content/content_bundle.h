@@ -24,14 +24,15 @@ typedef struct LaiueContentBundle
     uint8_t sha256[LAIUE_CONTENT_BUNDLE_HASH_SIZE];
 } LaiueContentBundle;
 
-// Собирает переносимый пакет только из явно перечисленных корневых паков.
-// Reparse points игнорируются, объём и число файлов жёстко ограничены.
+// Собирает переносимый LCB2-пакет только из явно перечисленных корневых
+// паков. Пути — canonical UTF-8 с '/', обход каталогов сортируется,
+// symlink/reparse и ASCII case-collisions отклоняются.
 LAIUE_CONTENT_API bool LaiueContentBundleBuild(
     const LaiueContentBundleSource* sources, uint32_t sourceCount,
     LaiueContentBundle* output);
 LAIUE_CONTENT_API void LaiueContentBundleRelease(LaiueContentBundle* bundle);
 
-// Полностью валидирует пакет до записи. Распаковка идёт в *.download,
+// Полностью валидирует LCB1/LCB2 до записи. Распаковка идёт в *.download,
 // прежняя версия сохраняется как *.previous, затем выполняется rename.
 LAIUE_CONTENT_API bool LaiueContentBundleInstall(
     const uint8_t* bytes, uint64_t size);

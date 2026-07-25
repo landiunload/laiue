@@ -1,6 +1,5 @@
-#include <windows.h>
-
 #include "world/infinite_coord.h"
+#include "test_runtime.h"
 
 // InfiniteCoord — знаковое целое произвольной точности, на котором держится
 // бесконечный мир. Логика чистая и детерминированная, поэтому infinite_coord.c
@@ -12,21 +11,9 @@
 
 static uint32_t coordTestChecks;
 
-// Тест собирается без CRT: вывод — прямая запись в stdout.
 static void CoordTestWrite(const char* text)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-    uint32_t length = 0;
-    while (text[length] != '\0')
-    {
-        ++length;
-    }
-    DWORD written = 0;
-    WriteFile(output, text, length, &written, NULL);
+    LaiueTestRuntimeWrite(text);
 }
 
 static void CoordTestWriteNumber(uint32_t value)
@@ -55,7 +42,7 @@ static void CoordTestExpect(bool condition, const char* name)
     CoordTestWrite("Проверка не пройдена: ");
     CoordTestWrite(name);
     CoordTestWrite("\r\n");
-    ExitProcess(1);
+    LaiueTestRuntimeExit(1);
 }
 
 static bool WideEquals(const wchar_t* left, const wchar_t* right)
@@ -442,7 +429,7 @@ static void TestFormatShort(void)
     InfiniteCoordDestroy(&twoPow64);
 }
 
-void CoordTestEntryPoint(void)
+LAIUE_TEST_ENTRY(CoordTestEntryPoint)
 {
     TestInitAndInt64RoundTrip();
     TestCarryAcrossLimb();
@@ -459,5 +446,5 @@ void CoordTestEntryPoint(void)
     CoordTestWrite("Проверок пройдено: ");
     CoordTestWriteNumber(coordTestChecks);
     CoordTestWrite("\r\n");
-    ExitProcess(0);
+    LAIUE_TEST_SUCCESS();
 }

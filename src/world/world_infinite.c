@@ -1,8 +1,8 @@
 #include "world/world.h"
 #include "world/infinite_coord.h"
 #include "world/terrain_noise.h"
+#include "platform/system.h"
 
-#include <windows.h>
 #include <string.h>
 
 typedef struct LocalChunkCoordinate
@@ -35,6 +35,7 @@ typedef struct Chunk
     uint32_t deltaCount;
     uint32_t deltaCapacity;
     DeltaEntry* deltas;
+    uint64_t revision;
 } Chunk;
 
 #define WORLD_INITIAL_CAPACITY 32
@@ -54,12 +55,13 @@ typedef struct HeightGridSlot
 
 struct World
 {
-    SRWLOCK tableLock;
+    PlatformRwLock tableLock;
     GlobalChunkCoordinate* keys;
     Chunk** chunks;
     bool* occupied;
     uint32_t count;
     uint32_t capacity;
+    uint64_t revision;
 
     int64_t seed;
     InfiniteCoord blockOrigin[3];
@@ -67,7 +69,7 @@ struct World
     CoordinateFrame* editFrame;
     TerrainOrigin terrainOrigin;
 
-    SRWLOCK heightCacheLock;
+    PlatformRwLock heightCacheLock;
     HeightGridSlot heightCache[HEIGHT_CACHE_SLOTS];
 };
 
@@ -129,15 +131,14 @@ static void CoordinateFrameRelease(CoordinateFrame* frame)
     {
         InfiniteCoordDestroy(&frame->chunkOrigin[axis]);
     }
-    HeapFree(GetProcessHeap(), 0, frame);
+    PlatformFree(frame);
 }
 
 static CoordinateFrame* WorldGetEditFrame(World* world)
 {
     if (world->editFrame != NULL) return world->editFrame;
 
-    CoordinateFrame* frame = HeapAlloc(
-        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*frame));
+    CoordinateFrame* frame = PlatformAllocate(sizeof(*frame), true);
     if (frame == NULL) return NULL;
 
     frame->referenceCount = 1; // ссылка кеша World
@@ -267,16 +268,16 @@ static void WorldObtainHeightGrid(World* world, int64_t chunkX, int64_t chunkY,
     uint32_t slotIndex = WorldHashChunkCoordinate(chunkX, chunkY, 0) & (HEIGHT_CACHE_SLOTS - 1);
     HeightGridSlot* slot = &world->heightCache[slotIndex];
 
-    AcquireSRWLockShared(&world->heightCacheLock);
+    PlatformRwLockAcquireShared(&world->heightCacheLock);
     if (slot->valid && slot->chunkX == chunkX && slot->chunkY == chunkY)
     {
         memcpy(outHeights, slot->heights, HEIGHT_GRID_CELLS * sizeof(float));
         *outMinimum = slot->minimumHeight;
         *outMaximum = slot->maximumHeight;
-        ReleaseSRWLockShared(&world->heightCacheLock);
+        PlatformRwLockReleaseShared(&world->heightCacheLock);
         return;
     }
-    ReleaseSRWLockShared(&world->heightCacheLock);
+    PlatformRwLockReleaseShared(&world->heightCacheLock);
 
     int64_t minBlockX = chunkX * CHUNK_SIZE - 1;
     int64_t minBlockY = chunkY * CHUNK_SIZE - 1;
@@ -299,23 +300,23 @@ static void WorldObtainHeightGrid(World* world, int64_t chunkX, int64_t chunkY,
     *outMinimum = minimumHeight;
     *outMaximum = maximumHeight;
 
-    AcquireSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockAcquireExclusive(&world->heightCacheLock);
     memcpy(slot->heights, outHeights, HEIGHT_GRID_CELLS * sizeof(float));
     slot->chunkX = chunkX;
     slot->chunkY = chunkY;
     slot->minimumHeight = minimumHeight;
     slot->maximumHeight = maximumHeight;
     slot->valid = true;
-    ReleaseSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockReleaseExclusive(&world->heightCacheLock);
 }
 
 static void ChunkDestroy(Chunk* chunk)
 {
     if (chunk->deltas != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, chunk->deltas);
+        PlatformFree(chunk->deltas);
     }
-    HeapFree(GetProcessHeap(), 0, chunk);
+    PlatformFree(chunk);
 }
 
 static bool WorldGrow(World* world)
@@ -323,18 +324,18 @@ static bool WorldGrow(World* world)
     uint32_t oldCapacity = world->capacity;
     uint32_t newCapacity = oldCapacity * 2;
 
-    GlobalChunkCoordinate* newKeys = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)newCapacity * sizeof(GlobalChunkCoordinate));
-    Chunk** newChunks = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)newCapacity * sizeof(Chunk*));
-    bool* newOccupied = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)newCapacity * sizeof(bool));
+    GlobalChunkCoordinate* newKeys = PlatformAllocate(
+        (size_t)newCapacity * sizeof(GlobalChunkCoordinate), true);
+    Chunk** newChunks = PlatformAllocate(
+        (size_t)newCapacity * sizeof(Chunk*), true);
+    bool* newOccupied = PlatformAllocate(
+        (size_t)newCapacity * sizeof(bool), true);
 
     if (newKeys == NULL || newChunks == NULL || newOccupied == NULL)
     {
-        if (newKeys != NULL) HeapFree(GetProcessHeap(), 0, newKeys);
-        if (newChunks != NULL) HeapFree(GetProcessHeap(), 0, newChunks);
-        if (newOccupied != NULL) HeapFree(GetProcessHeap(), 0, newOccupied);
+        PlatformFree(newKeys);
+        PlatformFree(newChunks);
+        PlatformFree(newOccupied);
         return false;
     }
 
@@ -351,9 +352,9 @@ static bool WorldGrow(World* world)
         newOccupied[index] = true;
     }
 
-    HeapFree(GetProcessHeap(), 0, world->keys);
-    HeapFree(GetProcessHeap(), 0, world->chunks);
-    HeapFree(GetProcessHeap(), 0, world->occupied);
+    PlatformFree(world->keys);
+    PlatformFree(world->chunks);
+    PlatformFree(world->occupied);
 
     world->keys = newKeys;
     world->chunks = newChunks;
@@ -364,11 +365,20 @@ static bool WorldGrow(World* world)
 
 World* WorldCreate(int64_t seed)
 {
-    World* world = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*world));
+    World* world = PlatformAllocate(sizeof(*world), true);
     if (world == NULL) return NULL;
 
-    InitializeSRWLock(&world->tableLock);
-    InitializeSRWLock(&world->heightCacheLock);
+    if (!PlatformRwLockInitialize(&world->tableLock))
+    {
+        PlatformFree(world);
+        return NULL;
+    }
+    if (!PlatformRwLockInitialize(&world->heightCacheLock))
+    {
+        PlatformRwLockDestroy(&world->tableLock);
+        PlatformFree(world);
+        return NULL;
+    }
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         InfiniteCoordInit(&world->blockOrigin[axis]);
@@ -376,18 +386,18 @@ World* WorldCreate(int64_t seed)
     }
 
     world->capacity = WORLD_INITIAL_CAPACITY;
-    world->keys = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)world->capacity * sizeof(GlobalChunkCoordinate));
-    world->chunks = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)world->capacity * sizeof(Chunk*));
-    world->occupied = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)world->capacity * sizeof(bool));
+    world->keys = PlatformAllocate(
+        (size_t)world->capacity * sizeof(GlobalChunkCoordinate), true);
+    world->chunks = PlatformAllocate(
+        (size_t)world->capacity * sizeof(Chunk*), true);
+    world->occupied = PlatformAllocate(
+        (size_t)world->capacity * sizeof(bool), true);
 
     bool heightCacheAllocated = true;
     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
     {
-        world->heightCache[slot].heights = HeapAlloc(GetProcessHeap(), 0,
-            HEIGHT_GRID_CELLS * sizeof(float));
+        world->heightCache[slot].heights = PlatformAllocate(
+            HEIGHT_GRID_CELLS * sizeof(float), false);
         if (world->heightCache[slot].heights == NULL) heightCacheAllocated = false;
     }
 
@@ -428,7 +438,7 @@ void WorldDestroy(World* world)
     {
         if (world->heightCache[slot].heights != NULL)
         {
-            HeapFree(GetProcessHeap(), 0, world->heightCache[slot].heights);
+            PlatformFree(world->heightCache[slot].heights);
         }
     }
     for (int32_t axis = 0; axis < 3; ++axis)
@@ -437,10 +447,12 @@ void WorldDestroy(World* world)
         InfiniteCoordDestroy(&world->chunkOrigin[axis]);
     }
 
-    if (world->keys != NULL) HeapFree(GetProcessHeap(), 0, world->keys);
-    if (world->chunks != NULL) HeapFree(GetProcessHeap(), 0, world->chunks);
-    if (world->occupied != NULL) HeapFree(GetProcessHeap(), 0, world->occupied);
-    HeapFree(GetProcessHeap(), 0, world);
+    PlatformFree(world->keys);
+    PlatformFree(world->chunks);
+    PlatformFree(world->occupied);
+    PlatformRwLockDestroy(&world->heightCacheLock);
+    PlatformRwLockDestroy(&world->tableLock);
+    PlatformFree(world);
 }
 
 bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ)
@@ -481,12 +493,12 @@ bool WorldRebase(World* world, int64_t blockShiftX, int64_t blockShiftY, int64_t
     }
     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
 
-    AcquireSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockAcquireExclusive(&world->heightCacheLock);
     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
     {
         world->heightCache[slot].valid = false;
     }
-    ReleaseSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockReleaseExclusive(&world->heightCacheLock);
     return true;
 }
 
@@ -547,12 +559,12 @@ bool WorldSquareAbsoluteX(
     }
     TerrainOriginInit(&world->terrainOrigin, &world->blockOrigin[0], &world->blockOrigin[1]);
 
-    AcquireSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockAcquireExclusive(&world->heightCacheLock);
     for (uint32_t slot = 0; slot < HEIGHT_CACHE_SLOTS; ++slot)
     {
         world->heightCache[slot].valid = false;
     }
-    ReleaseSRWLockExclusive(&world->heightCacheLock);
+    PlatformRwLockReleaseExclusive(&world->heightCacheLock);
     return true;
 }
 
@@ -593,7 +605,7 @@ static Chunk* WorldGetOrCreateChunk(World* world, LocalChunkCoordinate key)
         return NULL;
     }
 
-    Chunk* chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Chunk));
+    Chunk* chunk = PlatformAllocate(sizeof(Chunk), true);
     if (chunk == NULL)
     {
         GlobalChunkCoordinateDestroy(&globalKey);
@@ -642,24 +654,25 @@ static bool ChunkGetDelta(const Chunk* chunk, uint32_t localIndex, BlockType* ou
     return false;
 }
 
-static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
+static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 {
     uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
     if (position < chunk->deltaCount
         && DeltaLocalIndex(chunk->deltas[position]) == localIndex)
     {
         chunk->deltas[position] = PackDelta(localIndex, block);
-        return;
+        return true;
     }
 
     if (chunk->deltaCount >= chunk->deltaCapacity)
     {
         uint32_t newCapacity = chunk->deltaCapacity < 4 ? 4 : chunk->deltaCapacity * 2;
         DeltaEntry* newDeltas = chunk->deltas == NULL
-            ? HeapAlloc(GetProcessHeap(), 0, (size_t)newCapacity * sizeof(DeltaEntry))
-            : HeapReAlloc(GetProcessHeap(), 0, chunk->deltas,
-                (size_t)newCapacity * sizeof(DeltaEntry));
-        if (newDeltas == NULL) return;
+            ? PlatformAllocate(
+                (size_t)newCapacity * sizeof(DeltaEntry), false)
+            : PlatformReallocate(chunk->deltas,
+                (size_t)newCapacity * sizeof(DeltaEntry), false);
+        if (newDeltas == NULL) return false;
         chunk->deltas = newDeltas;
         chunk->deltaCapacity = newCapacity;
     }
@@ -670,62 +683,7 @@ static void ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
     }
     chunk->deltas[position] = PackDelta(localIndex, block);
     chunk->deltaCount++;
-}
-
-static void WorldInsertExistingEntry(
-    World* world, GlobalChunkCoordinate key, Chunk* chunk)
-{
-    uint32_t mask = world->capacity - 1u;
-    uint32_t index = (uint32_t)(key.hash ^ (key.hash >> 32)) & mask;
-    while (world->occupied[index])
-    {
-        index = (index + 1u) & mask;
-    }
-
-    world->keys[index] = key;
-    world->chunks[index] = chunk;
-    world->occupied[index] = true;
-    world->count++;
-}
-
-static void WorldRemoveEntry(World* world, LocalChunkCoordinate key)
-{
-    if (world->count == 0) return;
-
-    uint64_t hash = HashLocalChunkCoordinate(world, key);
-    uint32_t mask = world->capacity - 1u;
-    uint32_t index = (uint32_t)(hash ^ (hash >> 32)) & mask;
-
-    while (world->occupied[index])
-    {
-        if (world->keys[index].hash == hash
-            && GlobalChunkCoordinateMatchesLocal(&world->keys[index], world, key))
-        {
-            break;
-        }
-        index = (index + 1u) & mask;
-    }
-    if (!world->occupied[index]) return;
-
-    GlobalChunkCoordinateDestroy(&world->keys[index]);
-    ChunkDestroy(world->chunks[index]);
-    world->chunks[index] = NULL;
-    world->occupied[index] = false;
-    world->count--;
-
-    // Открытая адресация без tombstone: хвост кластера надо вставить заново,
-    // иначе поиск остановится на образовавшейся дыре.
-    uint32_t scan = (index + 1u) & mask;
-    while (world->occupied[scan])
-    {
-        GlobalChunkCoordinate movedKey = world->keys[scan];
-        Chunk* movedChunk = world->chunks[scan];
-        world->chunks[scan] = NULL;
-        world->occupied[scan] = false;
-        world->count--;
-        WorldInsertExistingEntry(world, movedKey, movedChunk);
-        scan = (scan + 1u) & mask;
-    }
+    return true;
 }
 
 BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
@@ -734,7 +692,7 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
     };
 
-    AcquireSRWLockShared(&world->tableLock);
+    PlatformRwLockAcquireShared(&world->tableLock);
     Chunk** entry = WorldFindEntry(world, coordinate);
     if (entry != NULL)
     {
@@ -745,16 +703,17 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
         BlockType block;
         if (ChunkGetDelta(*entry, localIndex, &block))
         {
-            ReleaseSRWLockShared(&world->tableLock);
+            PlatformRwLockReleaseShared(&world->tableLock);
             return block;
         }
     }
-    ReleaseSRWLockShared(&world->tableLock);
+    PlatformRwLockReleaseShared(&world->tableLock);
     return GeneratedBlock(world, x, y, z);
 }
 
 void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block)
 {
+    if (world == NULL) return;
     LocalChunkCoordinate coordinate = {
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
     };
@@ -764,10 +723,21 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
         LocalFromBlock(z, coordinate.z));
     BlockType generated = GeneratedBlock(world, x, y, z);
 
-    AcquireSRWLockExclusive(&world->tableLock);
+    PlatformRwLockAcquireExclusive(&world->tableLock);
+    Chunk** existingEntry = WorldFindEntry(world, coordinate);
+    BlockType current = generated;
+    if (existingEntry != NULL)
+        ChunkGetDelta(*existingEntry, localIndex, &current);
+    if (current == block)
+    {
+        PlatformRwLockReleaseExclusive(&world->tableLock);
+        return;
+    }
+    bool changed = false;
+    Chunk* changedChunk = existingEntry == NULL ? NULL : *existingEntry;
     if (block == generated)
     {
-        Chunk** entry = WorldFindEntry(world, coordinate);
+        Chunk** entry = existingEntry;
         if (entry != NULL)
         {
             Chunk* chunk = *entry;
@@ -781,19 +751,211 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
                     chunk->deltas[index - 1u] = chunk->deltas[index];
                 }
                 chunk->deltaCount--;
-                if (chunk->deltaCount == 0)
-                {
-                    WorldRemoveEntry(world, coordinate);
-                }
+                changed = true;
+                changedChunk = chunk;
             }
         }
     }
     else
     {
         Chunk* chunk = WorldGetOrCreateChunk(world, coordinate);
-        if (chunk != NULL) ChunkSetDelta(chunk, localIndex, block);
+        if (chunk != NULL && ChunkSetDelta(chunk, localIndex, block))
+        {
+            changed = true;
+            changedChunk = chunk;
+        }
     }
-    ReleaseSRWLockExclusive(&world->tableLock);
+    if (changed)
+    {
+        if (changedChunk != NULL && changedChunk->revision != UINT64_MAX)
+            ++changedChunk->revision;
+        if (world->revision != UINT64_MAX) ++world->revision;
+    }
+    PlatformRwLockReleaseExclusive(&world->tableLock);
+}
+
+uint64_t WorldGetRevision(World* world)
+{
+    if (world == NULL) return 0;
+    PlatformRwLockAcquireShared(&world->tableLock);
+    uint64_t revision = world->revision;
+    PlatformRwLockReleaseShared(&world->tableLock);
+    return revision;
+}
+
+uint64_t WorldGetChunkRevision(World* world, const int64_t chunk[3])
+{
+    if (world == NULL || chunk == NULL) return 0;
+    LocalChunkCoordinate coordinate = { chunk[0], chunk[1], chunk[2] };
+    PlatformRwLockAcquireShared(&world->tableLock);
+    Chunk** entry = WorldFindEntry(world, coordinate);
+    uint64_t revision = entry == NULL ? 0 : (*entry)->revision;
+    PlatformRwLockReleaseShared(&world->tableLock);
+    return revision;
+}
+
+static bool GlobalChunkCoordinateToLocal(const GlobalChunkCoordinate* global,
+    const World* world, int64_t output[3])
+{
+    const int64_t offsets[3] = {
+        global->local.x, global->local.y, global->local.z,
+    };
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        InfiniteCoord absolute;
+        InfiniteCoordInit(&absolute);
+        bool succeeded = InfiniteCoordTryCopyAddInt64(&absolute,
+            &global->frame->chunkOrigin[axis], offsets[axis])
+            && InfiniteCoordTrySubtractToInt64(
+                &absolute, &world->chunkOrigin[axis], &output[axis]);
+        InfiniteCoordDestroy(&absolute);
+        if (!succeeded) return false;
+    }
+    return true;
+}
+
+static bool ChunkSummaryLess(
+    const WorldChunkSummary* left, const WorldChunkSummary* right)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->chunk[axis] != right->chunk[axis])
+            return left->chunk[axis] < right->chunk[axis];
+    }
+    return false;
+}
+
+uint32_t WorldCopyEditedChunkSummaries(
+    World* world, const int64_t minimumChunk[3], const int64_t maximumChunk[3],
+    WorldChunkSummary* output, uint32_t capacity, bool* outTruncated,
+    uint64_t* outWorldRevision)
+{
+    if (outTruncated != NULL) *outTruncated = false;
+    if (outWorldRevision != NULL) *outWorldRevision = 0;
+    if (world == NULL || minimumChunk == NULL || maximumChunk == NULL
+        || (capacity > 0 && output == NULL))
+        return 0;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+        if (minimumChunk[axis] > maximumChunk[axis]) return 0;
+
+    uint32_t count = 0;
+    bool truncated = false;
+    PlatformRwLockAcquireShared(&world->tableLock);
+    if (outWorldRevision != NULL) *outWorldRevision = world->revision;
+    for (uint32_t slot = 0; slot < world->capacity; ++slot)
+    {
+        if (!world->occupied[slot] || world->chunks[slot] == NULL
+            || world->chunks[slot]->deltaCount == 0)
+            continue;
+        int64_t local[3];
+        if (!GlobalChunkCoordinateToLocal(&world->keys[slot], world, local))
+            continue;
+        bool inside = true;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+            inside = inside && local[axis] >= minimumChunk[axis]
+                && local[axis] <= maximumChunk[axis];
+        if (!inside) continue;
+        if (count >= capacity)
+        {
+            truncated = true;
+            continue;
+        }
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+            output[count].chunk[axis] = local[axis];
+        output[count].revision = world->chunks[slot]->revision;
+        output[count].deltaCount = world->chunks[slot]->deltaCount;
+        ++count;
+    }
+    PlatformRwLockReleaseShared(&world->tableLock);
+
+    for (uint32_t i = 1; i < count; ++i)
+    {
+        WorldChunkSummary value = output[i];
+        uint32_t position = i;
+        while (position > 0
+            && ChunkSummaryLess(&value, &output[position - 1U]))
+        {
+            output[position] = output[position - 1U];
+            --position;
+        }
+        output[position] = value;
+    }
+    if (outTruncated != NULL) *outTruncated = truncated;
+    return count;
+}
+
+bool WorldCopyChunkDeltas(
+    World* world, const int64_t chunk[3], WorldChunkDelta* output,
+    uint32_t capacity, uint32_t* outCount, uint64_t* outChunkRevision)
+{
+    if (outCount != NULL) *outCount = 0;
+    if (outChunkRevision != NULL) *outChunkRevision = 0;
+    if (world == NULL || chunk == NULL || outCount == NULL
+        || (capacity > 0 && output == NULL))
+        return false;
+    LocalChunkCoordinate coordinate = { chunk[0], chunk[1], chunk[2] };
+    PlatformRwLockAcquireShared(&world->tableLock);
+    Chunk** entry = WorldFindEntry(world, coordinate);
+    uint32_t count = entry == NULL ? 0 : (*entry)->deltaCount;
+    if (count > capacity)
+    {
+        *outCount = count;
+        PlatformRwLockReleaseShared(&world->tableLock);
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        output[i].localIndex = DeltaLocalIndex((*entry)->deltas[i]);
+        output[i].block = DeltaBlock((*entry)->deltas[i]);
+    }
+    if (entry != NULL && outChunkRevision != NULL)
+        *outChunkRevision = (*entry)->revision;
+    *outCount = count;
+    PlatformRwLockReleaseShared(&world->tableLock);
+    return true;
+}
+
+bool WorldReplaceChunkDeltas(
+    World* world, const int64_t chunk[3], const WorldChunkDelta* deltas,
+    uint32_t count, uint64_t chunkRevision, uint64_t worldRevision)
+{
+    if (world == NULL || chunk == NULL || (count > 0 && deltas == NULL))
+        return false;
+    DeltaEntry* packed = count == 0 ? NULL
+        : PlatformAllocate((size_t)count * sizeof(DeltaEntry), false);
+    if (count > 0 && packed == NULL) return false;
+    uint32_t previousIndex = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (deltas[i].localIndex > DELTA_INDEX_MASK
+            || (i > 0 && deltas[i].localIndex <= previousIndex))
+        {
+            PlatformFree(packed);
+            return false;
+        }
+        previousIndex = deltas[i].localIndex;
+        packed[i] = PackDelta(deltas[i].localIndex, deltas[i].block);
+    }
+
+    LocalChunkCoordinate coordinate = { chunk[0], chunk[1], chunk[2] };
+    PlatformRwLockAcquireExclusive(&world->tableLock);
+    Chunk* target = WorldGetOrCreateChunk(world, coordinate);
+    if (target == NULL)
+    {
+        PlatformRwLockReleaseExclusive(&world->tableLock);
+        PlatformFree(packed);
+        return false;
+    }
+    PlatformFree(target->deltas);
+    target->deltas = packed;
+    target->deltaCount = count;
+    target->deltaCapacity = count;
+    target->revision = chunkRevision;
+    packed = NULL;
+    if (world->revision < worldRevision) world->revision = worldRevision;
+    PlatformRwLockReleaseExclusive(&world->tableLock);
+    PlatformFree(packed);
+    return true;
 }
 
 WorldRegionContents WorldFillRegion(World* world,
@@ -810,7 +972,7 @@ WorldRegionContents WorldFillRegion(World* world,
     int64_t maxChunkY = ChunkFromBlock(minBlockY + sizeY - 1);
     int64_t maxChunkZ = ChunkFromBlock(minBlockZ + sizeZ - 1);
 
-    AcquireSRWLockShared(&world->tableLock);
+    PlatformRwLockAcquireShared(&world->tableLock);
     for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ && !regionHasDeltas; ++chunkZ)
     {
         for (int64_t chunkY = minChunkY; chunkY <= maxChunkY && !regionHasDeltas; ++chunkY)
@@ -823,13 +985,13 @@ WorldRegionContents WorldFillRegion(World* world,
             }
         }
     }
-    ReleaseSRWLockShared(&world->tableLock);
+    PlatformRwLockReleaseShared(&world->tableLock);
 
     size_t heightCount = (size_t)sizeX * (size_t)sizeY;
     bool heightsOnHeap = heightScratch == NULL
         || heightScratchCount < heightCount;
     float* heights = heightsOnHeap
-        ? HeapAlloc(GetProcessHeap(), 0, heightCount * sizeof(float))
+        ? PlatformAllocate(heightCount * sizeof(float), false)
         : heightScratch;
     float minimumHeight = 0.0f;
     float maximumHeight = 0.0f;
@@ -868,12 +1030,12 @@ WorldRegionContents WorldFillRegion(World* world,
     {
         if (!IsAbsoluteZBelow(world, minBlockZ, ColumnCeiling(maximumHeight)))
         {
-            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) PlatformFree(heights);
             return WORLD_REGION_ALL_AIR;
         }
         if (IsAbsoluteZBelow(world, minBlockZ + sizeZ - 1, ColumnCeiling(minimumHeight)))
         {
-            if (heightsOnHeap) HeapFree(GetProcessHeap(), 0, heights);
+            if (heightsOnHeap) PlatformFree(heights);
             return WORLD_REGION_ALL_SOLID;
         }
     }
@@ -923,11 +1085,11 @@ WorldRegionContents WorldFillRegion(World* world,
         }
     }
 
-    if (heightsOnHeap && heights != NULL) HeapFree(GetProcessHeap(), 0, heights);
+    if (heightsOnHeap && heights != NULL) PlatformFree(heights);
 
     if (regionHasDeltas)
     {
-        AcquireSRWLockShared(&world->tableLock);
+        PlatformRwLockAcquireShared(&world->tableLock);
         for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
         {
             for (int64_t chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
@@ -964,7 +1126,7 @@ WorldRegionContents WorldFillRegion(World* world,
                 }
             }
         }
-        ReleaseSRWLockShared(&world->tableLock);
+        PlatformRwLockReleaseShared(&world->tableLock);
     }
 
     return WORLD_REGION_MIXED;
@@ -997,52 +1159,45 @@ void WorldFormatAbsoluteBlockCoordinate(World* world,
 #define WORLD_SAVE_MAGIC        0x3143574Cu  // байты 'L' 'W' 'C' '1'
 #define WORLD_SAVE_VERSION      1u
 #define WORLD_SAVE_MAX_LIMBS    1024u
-#define WORLD_SAVE_BUFFER_BYTES 65536u
+#define WORLD_SAVE_INITIAL_BYTES 65536u
+#define WORLD_SAVE_MAX_BYTES (64u * 1024u * 1024u)
 
 typedef struct SaveWriter
 {
-    HANDLE file;
-    uint8_t* buffer;
-    uint32_t used;
+    uint8_t* bytes;
+    uint32_t size;
+    uint32_t capacity;
     bool failed;
 } SaveWriter;
-
-static void SaveWriterFlush(SaveWriter* writer)
-{
-    if (writer->failed || writer->used == 0)
-    {
-        return;
-    }
-    DWORD written = 0;
-    if (!WriteFile(writer->file, writer->buffer, writer->used, &written, NULL)
-        || written != writer->used)
-    {
-        writer->failed = true;
-    }
-    writer->used = 0;
-}
 
 static void SaveWriterBytes(SaveWriter* writer,
     const void* bytes, uint32_t count)
 {
-    if (writer->failed)
+    if (writer->failed) return;
+    if (count > WORLD_SAVE_MAX_BYTES - writer->size)
     {
+        writer->failed = true;
         return;
     }
-    const uint8_t* source = bytes;
-    while (count > 0)
+    uint32_t required = writer->size + count;
+    if (required > writer->capacity)
     {
-        uint32_t space = WORLD_SAVE_BUFFER_BYTES - writer->used;
-        uint32_t portion = count < space ? count : space;
-        memcpy(writer->buffer + writer->used, source, portion);
-        writer->used += portion;
-        source += portion;
-        count -= portion;
-        if (writer->used == WORLD_SAVE_BUFFER_BYTES)
+        uint32_t capacity = writer->capacity;
+        while (capacity < required && capacity <= WORLD_SAVE_MAX_BYTES / 2U)
+            capacity *= 2U;
+        if (capacity < required) capacity = required;
+        uint8_t* expanded = PlatformReallocate(
+            writer->bytes, capacity, false);
+        if (expanded == NULL)
         {
-            SaveWriterFlush(writer);
+            writer->failed = true;
+            return;
         }
+        writer->bytes = expanded;
+        writer->capacity = capacity;
     }
+    memcpy(writer->bytes + writer->size, bytes, count);
+    writer->size += count;
 }
 
 static void SaveWriterU16(SaveWriter* writer, uint16_t value)
@@ -1089,31 +1244,12 @@ static bool SaveWriterFrameCoord(SaveWriter* writer,
 
 bool WorldSaveDeltas(World* world, const wchar_t* path)
 {
-    uint32_t pathLength = 0;
-    while (path[pathLength] != L'\0') ++pathLength;
-    wchar_t* temporaryPath = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)(pathLength + 5u) * sizeof(wchar_t));
-    if (temporaryPath == NULL) return false;
-    memcpy(temporaryPath, path, (size_t)pathLength * sizeof(wchar_t));
-    memcpy(temporaryPath + pathLength, L".tmp", 5u * sizeof(wchar_t));
-
-    HANDLE file = CreateFileW(temporaryPath, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        HeapFree(GetProcessHeap(), 0, temporaryPath);
-        return false;
-    }
-
-    SaveWriter writer = { .file = file };
-    writer.buffer = HeapAlloc(GetProcessHeap(), 0, WORLD_SAVE_BUFFER_BYTES);
-    if (writer.buffer == NULL)
-    {
-        CloseHandle(file);
-        DeleteFileW(temporaryPath);
-        HeapFree(GetProcessHeap(), 0, temporaryPath);
-        return false;
-    }
+    if (world == NULL || path == NULL) return false;
+    SaveWriter writer = {
+        .bytes = PlatformAllocate(WORLD_SAVE_INITIAL_BYTES, false),
+        .capacity = WORLD_SAVE_INITIAL_BYTES,
+    };
+    if (writer.bytes == NULL) return false;
 
     SaveWriterU32(&writer, WORLD_SAVE_MAGIC);
     SaveWriterU16(&writer, WORLD_SAVE_VERSION);
@@ -1122,7 +1258,7 @@ bool WorldSaveDeltas(World* world, const wchar_t* path)
 
     // Таблица правок читается под общим замком: рабочие потоки мешинга
     // продолжают читать мир, а правки делает только главный поток.
-    AcquireSRWLockShared(&world->tableLock);
+    PlatformRwLockAcquireShared(&world->tableLock);
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
@@ -1164,19 +1300,11 @@ bool WorldSaveDeltas(World* world, const wchar_t* path)
             chunk->deltaCount * (uint32_t)sizeof(DeltaEntry));
     }
 
-    ReleaseSRWLockShared(&world->tableLock);
+    PlatformRwLockReleaseShared(&world->tableLock);
 
-    SaveWriterFlush(&writer);
-    bool succeeded = !writer.failed && FlushFileBuffers(file);
-    HeapFree(GetProcessHeap(), 0, writer.buffer);
-    CloseHandle(file);
-    if (succeeded)
-    {
-        succeeded = MoveFileExW(temporaryPath, path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    }
-    if (!succeeded) DeleteFileW(temporaryPath);
-    HeapFree(GetProcessHeap(), 0, temporaryPath);
+    bool succeeded = !writer.failed
+        && PlatformWriteFileAtomic(path, writer.bytes, writer.size);
+    PlatformFree(writer.bytes);
     return succeeded;
 }
 
@@ -1277,42 +1405,17 @@ static bool SafeSubtractInt64(int64_t value, int64_t difference,
 
 bool WorldLoadDeltas(World* world, const wchar_t* path)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
+    uint8_t* bytes = NULL;
+    uint64_t size = 0;
+    if (world == NULL || path == NULL
+        || !PlatformReadEntireFile(
+            path, WORLD_SAVE_MAX_BYTES, &bytes, &size)
+        || size == 0 || size > UINT32_MAX)
     {
+        PlatformFree(bytes);
         return false;
     }
-
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0
-        || size.QuadPart > 64ll * 1024 * 1024)
-    {
-        CloseHandle(file);
-        return false;
-    }
-
-    uint32_t length = (uint32_t)size.QuadPart;
-    uint8_t* bytes = HeapAlloc(GetProcessHeap(), 0, length);
-    if (bytes == NULL)
-    {
-        CloseHandle(file);
-        return false;
-    }
-    uint32_t completed = 0;
-    while (completed < length)
-    {
-        DWORD read = 0;
-        if (!ReadFile(file, bytes + completed, length - completed, &read, NULL)
-            || read == 0)
-        {
-            HeapFree(GetProcessHeap(), 0, bytes);
-            CloseHandle(file);
-            return false;
-        }
-        completed += read;
-    }
-    CloseHandle(file);
+    uint32_t length = (uint32_t)size;
 
     SaveReader reader = { .bytes = bytes, .length = length };
     bool succeeded = false;
@@ -1390,6 +1493,6 @@ bool WorldLoadDeltas(World* world, const wchar_t* path)
         }
     }
 
-    HeapFree(GetProcessHeap(), 0, bytes);
+    PlatformFree(bytes);
     return succeeded;
 }

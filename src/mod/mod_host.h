@@ -11,7 +11,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-// Хост нативных DLL-модов: загружает mods/<имя>.lmp/<dll>, отдаёт моду
+// Хост нативных DLL/SO-модов: загружает platform entry из
+// mods/<имя>.lmp, отдаёт моду
 // версионируемую таблицу функций (sdk/laiue_mod_api.h) и диспетчеризует
 // хуки строго на главном потоке. Кадровому хуку сопутствует фиксированный
 // тик (60 Гц, аккумулятор) — геймплейные моды не зависят от FPS.
@@ -31,19 +32,18 @@
 // Указатели на подсистемы, которыми пользуется таблица API.
 typedef struct ModHostBindings
 {
-    World* world;
-    PlayerController* player;
-    Camera* camera;
-    GameMode* gameMode;
-    float* timeOfDayHours;   // игровое время суток, 0..24
+    World *world;
+    PlayerController *player;
+    Camera *camera;
+    GameMode *gameMode;
+    float *timeOfDayHours; // игровое время суток, 0..24
     ModSide runtimeSide;
-    void* invalidateContext;
-    void (*invalidateBlock)(void* context,
-        int64_t x, int64_t y, int64_t z);
-    void* viewContext;
-    void (*getViewDirection)(void* context, float outDirection[3]);
+    void *invalidateContext;
+    void (*invalidateBlock)(void *context, int64_t x, int64_t y, int64_t z);
+    void *viewContext;
+    void (*getViewDirection)(void *context, float outDirection[3]);
     // Каталог блобов модов в сохранении (moddata/), может быть пустым.
-    const wchar_t* modDataDirectory;
+    const wchar_t *modDataDirectory;
 } ModHostBindings;
 
 typedef struct ModHostSlot ModHostSlot;
@@ -54,29 +54,27 @@ typedef struct ModHostInterface
     bool used;
     char name[MOD_HOST_INTERFACE_NAME_CAPACITY];
     uint32_t version;
-    void* pointer;
-    ModHostSlot* owner;
+    void *pointer;
+    ModHostSlot *owner;
 } ModHostInterface;
 
 typedef struct ModHost
 {
     ModHostBindings bindings;
-    ModHostSlot* slots;      // MOD_HOST_MAX_MODS, на куче
+    ModHostSlot *slots; // MOD_HOST_MAX_MODS, на куче
     ModHostInterface interfaces[MOD_HOST_MAX_INTERFACES];
     float fixedTickAccumulator;
 } ModHost;
 
-LAIUE_MOD_API bool ModHostInit(
-    ModHost* host, const ModHostBindings* bindings);
-LAIUE_MOD_API void ModHostShutdown(ModHost* host);
+LAIUE_MOD_API bool ModHostInit(ModHost *host, const ModHostBindings *bindings);
+LAIUE_MOD_API void ModHostShutdown(ModHost *host);
 
-// Приводит загруженные DLL в соответствие включённым модам (вызывается
+// Приводит загруженные библиотеки в соответствие включённым модам (вызывается
 // при смене ревизии ModsState и на старте) и отписывает в entries
 // фактический runtimeStatus и код отказа инициализации.
-LAIUE_MOD_API void ModHostSync(ModHost* host, ModsState* mods);
+LAIUE_MOD_API void ModHostSync(ModHost *host, ModsState *mods);
 
 // Хуки: фиксированный тик + кадр (вне меню паузы) и правка блока игроком.
-LAIUE_MOD_API void ModHostDispatchFrame(ModHost* host, float deltaSeconds);
-LAIUE_MOD_API void ModHostDispatchBlockEdit(ModHost* host,
-    int64_t x, int64_t y, int64_t z,
-    uint8_t previousBlock, uint8_t newBlock);
+LAIUE_MOD_API void ModHostDispatchFrame(ModHost *host, float deltaSeconds);
+LAIUE_MOD_API void ModHostDispatchBlockEdit(ModHost *host, int64_t x, int64_t y, int64_t z,
+                                            uint8_t previousBlock, uint8_t newBlock);

@@ -40,15 +40,9 @@ laiue_add_module(core
         laiue_window
         laiue_input
         laiue_audio
-        laiue_world
         laiue_mesher
         laiue_render
-        laiue_physics
-        laiue_gameplay
-        laiue_interaction
-        laiue_content
-        laiue_network
-        laiue_mod
+        laiue::headless_stack
         gdi32
 )
 target_include_directories(laiue_core PRIVATE "${PROJECT_SOURCE_DIR}/sdk")

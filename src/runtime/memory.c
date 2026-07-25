@@ -14,6 +14,7 @@
 #pragma function(memset)
 #pragma function(memcpy)
 #pragma function(memcmp)
+#pragma function(memmove)
 #endif
 
 // Без CRT компилятор при использовании float ищет _fltused.
@@ -92,4 +93,26 @@ int memcmp(const void* first, const void* second, size_t count)
     }
 
     return 0;
+}
+
+// Оптимизатор может синтезировать memmove для перекрывающихся сдвигов
+// (например, при форматировании IPv6 endpoint). volatile не даёт свернуть
+// этот перенос обратно во внешний вызов memmove и получить рекурсию.
+#if defined(__clang__)
+__attribute__((optnone))
+#endif
+void* memmove(void* destination, const void* source, size_t count)
+{
+    volatile unsigned char* output = (volatile unsigned char*)destination;
+    const volatile unsigned char* input =
+        (const volatile unsigned char*)source;
+    if (output < input)
+    {
+        for (size_t i = 0; i < count; ++i) output[i] = input[i];
+    }
+    else if (output > input)
+    {
+        for (size_t i = count; i > 0; --i) output[i - 1U] = input[i - 1U];
+    }
+    return destination;
 }

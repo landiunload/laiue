@@ -1,2 +1,4 @@
-# name|address|port
-Локальный сервер|127.0.0.1|27180
+# name|endpoint|trust
+# IPv6 with a custom port must use brackets: [2001:db8::10]:30000
+# For a private/self-signed server replace `system` with sha256:<64 hex>.
+Локальный сервер|localhost|system

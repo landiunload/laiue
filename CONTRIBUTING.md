@@ -2,7 +2,10 @@
 
 ## Локальная проверка
 
-Проект собирается только под Windows: CMake 3.28+, MSVC или clang-cl.
+Канонические платформы: Windows x86_64 (клиент и сервер) и Linux x86_64
+(сервер). Нужны CMake 3.28+ и MSVC/clang-cl на Windows либо GCC/Clang на
+Linux. Подробная матрица и зависимости — в
+[docs/portability.md](docs/portability.md).
 
 ```powershell
 cmake --preset ninja-clang-debug
@@ -17,6 +20,18 @@ pwsh -NoProfile -File tools/check_architecture.ps1
 git diff --check
 ```
 
+Минимальная server-only проверка на Debian/Ubuntu:
+
+```sh
+cmake --preset linux-gcc-asan
+cmake --build --preset linux-gcc-asan --target laiue_server_bundle
+ctest --preset linux-gcc-asan
+```
+
+Release/CI обязаны задавать `LAIUE_REQUIRE_MSQUIC=ON`: отсутствие secure
+transport там является ошибкой configure, а не основанием включить
+plaintext fallback.
+
 Тесты живут в `tests/` и регистрируются в CTest; test-preset назван так же,
 как build-preset. Тест аудио-API возвращает 125 и помечается пропущенным,
 если в системе нет Media Foundation (Windows N/Server без Media Pack).
@@ -24,7 +39,8 @@ git diff --check
 `src/network/protocol.c` в себя, поэтому кодек можно проверять, не экспортируя
 его из `laiue_network`.
 
-CI собирает MSVC Debug и Release с warnings-as-errors, прогоняет CTest и
+CI собирает Windows MSVC Debug/Release, Debian GCC/Clang и Alpine/musl,
+включает warnings-as-errors, запускает доступные CTest/smoke checks и
 проверяет, что сборка не изменила tracked-файлы.
 
 ## Блокировка DLL при сборке
@@ -50,15 +66,43 @@ Developer PowerShell/Command Prompt; иначе используйте preset
 ## Архитектурные правила
 
 - Новая зависимость DLL объявляется в `src/<module>/CMakeLists.txt`.
+- Общий клиент-серверный код входит в `laiue::headless_stack`; нельзя
+  компилировать те же production `.c` отдельно в клиент и сервер.
+- Win32/POSIX API разрешены только в `src/platform` и специализированных
+  backend-файлах. Simulation/world/gameplay не выбирают ОС через `#ifdef`.
+- Общий simulation-код не выполняет файловый, сетевой или console I/O.
 - Нижние модули не включают `core`; разрешённый граф проверяет
   `tools/check_architecture.ps1`.
 - Крупную DLL делите на внутренние `.c/.h`, не создавая ABI без
   самостоятельного жизненного цикла и второго потребителя.
-- `network` принимает только bounded wire-format. Клиент не задаёт
+- Все CMake options, include paths, definitions и linker flags должны быть
+  target-scoped. Configure/build не пишут в source tree.
+- Каждый буфер и handle имеют одного владельца; публичный API явно указывает
+  release-функцию. Нельзя требовать от потребителя освобождать память через
+  allocator другой DLL/SO.
+- `network` принимает только versioned и bounded wire-format. Клиент не задаёт
   авторитетную позицию, инвентарь или результат правки блока.
-- Текущий TCP backend остаётся loopback-only. Remote backend обязан
-  использовать TLS 1.3 с проверкой server identity и без plaintext fallback.
+- MsQuic callbacks только копируют данные в bounded queues. Gameplay/world
+  вызываются на main thread, send-buffer живёт до `SEND_COMPLETE`, а overflow
+  закрывает только виновного peer.
+- Fixed tick не содержит allocation, I/O и покадрового logging.
 - Оптимизация горячего пути требует повторяемого замера до и после.
+
+## Безопасность
+
+- Remote transport — только QUIC/TLS 1.3 с проверкой DNS/IP identity или
+  точного pin. Plaintext fallback, TOFU и release-режим `skip certificate
+  validation` запрещены.
+- Private keys не попадают в репозиторий, build artifacts, crash dumps и
+  логи. Linux проверяет regular-file/no-symlink и права не шире `0600`.
+- Gameplay, mod negotiation и snapshots не отправляются в 0-RTT.
+- Любой размер, count, offset, sequence и enum из сети/файла проверяются до
+  allocation и индексирования. Доверенный локальный файл не считается
+  автоматически корректным.
+- Нативные моды не являются sandbox: hash подтверждает совместимость и
+  целостность, но не безопасность кода.
+- Исправление уязвимости сопровождается негативным regression test; секреты
+  и рабочие exploit payloads в fixtures не добавляются.
 
 ## Совместимость
 
@@ -68,11 +112,21 @@ Developer PowerShell/Command Prompt; иначе используйте preset
 - Дисковые и сетевые форматы — little-endian, versioned и bounded.
 - Новая несовместимая раскладка получает новую версию, а не тихо заменяет
   старую.
+- Новые поля wire/disk/SDK добавляются так, чтобы старый reader мог либо
+  безопасно пропустить их, либо явно отклонить новую версию.
+- Manifest v2 hash считается по одинаковым байтам и фиксированному порядку
+  артефактов на всех ОС; нельзя подменять его hash только текущего бинарника.
 
-## Генерируемые файлы
+## Изменения, тесты и генерируемые файлы
 
-- `src/render/generated/*.h` создаются из `shaders/*.hlsl`; после изменения
-  HLSL пересоберите проект и commit-ьте обновлённые заголовки.
+- Исправление ошибки получает минимальный regression test, который падает до
+  исправления. Изменение wire/disk/SDK layout получает golden/round-trip
+  проверку.
+- Перед отправкой запускайте наиболее узкую релевантную проверку, затем
+  platform build/CTest. Не маскируйте предупреждения глобальным отключением.
+- `src/render/generated/*.h` — checked-in fallback. Обычная сборка генерирует
+  shader headers только в binary tree; обновление fallback выполняется
+  отдельной явной командой и проверяется diff.
 - Бинарные шейдеры встроенных `.lsp` пересобираются тем же профилем
   `*_5_0`, `/O3`, `/Qstrip_debug`, `/Qstrip_reflect`.
 - `tools/generate_textures.ps1` создаёт исходные PNG, а
@@ -82,16 +136,29 @@ Developer PowerShell/Command Prompt; иначе используйте preset
 затронутых C/H-файлов используйте `.clang-format`; предупреждения считаются
 ошибками.
 
-## Документация и SDK
+## Документация, SDK и зависимости
 
 При изменении поведения обновляйте ближайший документ, а не добавляйте
 второе описание в README. Основные контракты:
 
 - [архитектура](docs/architecture.md)
+- [переносимость](docs/portability.md)
 - [мультиплеер](docs/multiplayer.md)
+- [secure server](docs/secure_server.md)
 - [форматы](docs/content_formats.md)
 - [шейдеры](docs/shaderpacks.md)
 - [моды](docs/modding.md)
 - [сохранения](docs/world_format.md)
 
 Перед публикацией SDK соберите пять примеров из `sdk/examples/`.
+
+Новая или обновлённая внешняя зависимость требует:
+
+- закреплённой поддерживаемой версии и воспроизводимого источника пакета;
+- проверки security advisories и release notes;
+- проверки лицензии, redistribution условий и обновления notices;
+- CI-сборки на каждой затронутой ABI/libc;
+- отсутствия сетевой загрузки во время обычного CMake configure.
+
+`CONTRIBUTING.md` — единственный канонический набор правил разработки.
+Editor/agent-specific файлы должны ссылаться сюда, а не копировать правила.

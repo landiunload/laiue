@@ -1,38 +1,53 @@
 #include "content/content_catalog.h"
+#include "platform/system.h"
 
-#include <windows.h>
 #include <stddef.h>
+#include <string.h>
 
 #define ACTIVE_FILE_NAME L"active.txt"
-#define ACTIVE_UTF8_CAPACITY 512u
+#define ACTIVE_UTF8_CAPACITY 512U
+
+static wchar_t* AllocatePathBuffer(void)
+{
+    return PlatformAllocate(
+        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
+}
 
 static uint32_t TextLength(const wchar_t* text)
 {
     uint32_t length = 0;
-    if (text == NULL)
-    {
-        return 0;
-    }
-    while (text[length] != L'\0')
-    {
-        ++length;
-    }
+    if (text != NULL)
+        while (text[length] != L'\0') ++length;
     return length;
+}
+
+static bool TextEquals(const wchar_t* left, const wchar_t* right)
+{
+    uint32_t i = 0;
+    while (left[i] != L'\0' && right[i] != L'\0')
+    {
+        if (left[i] != right[i]) return false;
+        ++i;
+    }
+    return left[i] == right[i];
+}
+
+static int32_t TextCompare(const wchar_t* left, const wchar_t* right)
+{
+    uint32_t i = 0;
+    while (left[i] != L'\0' && right[i] != L'\0'
+        && left[i] == right[i])
+        ++i;
+    return left[i] < right[i] ? -1 : left[i] > right[i] ? 1 : 0;
 }
 
 static bool AppendText(wchar_t* destination, uint32_t capacity,
     uint32_t* length, const wchar_t* source)
 {
-    if (destination == NULL || length == NULL || source == NULL)
-    {
-        return false;
-    }
+    if (destination == NULL || length == NULL || source == NULL) return false;
     while (*source != L'\0')
     {
-        if (*length + 1u >= capacity)
-        {
-            return false;
-        }
+        if (*length + 1U >= capacity) return false;
         destination[(*length)++] = *source++;
     }
     destination[*length] = L'\0';
@@ -42,10 +57,7 @@ static bool AppendText(wchar_t* destination, uint32_t capacity,
 static bool AppendCharacter(wchar_t* destination, uint32_t capacity,
     uint32_t* length, wchar_t character)
 {
-    if (*length + 1u >= capacity)
-    {
-        return false;
-    }
+    if (*length + 1U >= capacity) return false;
     destination[(*length)++] = character;
     destination[*length] = L'\0';
     return true;
@@ -54,21 +66,9 @@ static bool AppendCharacter(wchar_t* destination, uint32_t capacity,
 static bool GetExecutableDirectory(wchar_t* destination, uint32_t capacity,
     uint32_t* outLength)
 {
-    DWORD length = GetModuleFileNameW(NULL, destination, capacity);
-    if (length == 0 || length >= capacity)
-    {
-        return false;
-    }
-    for (uint32_t i = (uint32_t)length; i > 0; --i)
-    {
-        if (destination[i - 1u] == L'\\' || destination[i - 1u] == L'/')
-        {
-            destination[i - 1u] = L'\0';
-            *outLength = i - 1u;
-            return true;
-        }
-    }
-    return false;
+    if (!PlatformExecutableDirectory(destination, capacity)) return false;
+    *outLength = TextLength(destination);
+    return true;
 }
 
 static bool ChildNameIsSafe(const wchar_t* name)
@@ -85,34 +85,21 @@ bool LaiueContentBuildPath(LaiueContentType type,
         || (name != NULL && (!LaiueContentNameIsSafe(name)
             || !LaiueContentNameMatches(type, name)))
         || !ChildNameIsSafe(childName))
-    {
         return false;
-    }
 
     uint32_t length = 0;
     if (!GetExecutableDirectory(destination, capacity, &length)
-        || !AppendCharacter(destination, capacity, &length, L'\\')
+        || !AppendCharacter(destination, capacity, &length, L'/')
         || !AppendText(destination, capacity, &length, format->directoryName))
-    {
         return false;
-    }
-
-    if (name != NULL)
-    {
-        if (!AppendCharacter(destination, capacity, &length, L'\\')
-            || !AppendText(destination, capacity, &length, name))
-        {
-            return false;
-        }
-    }
-    if (childName != NULL)
-    {
-        if (!AppendCharacter(destination, capacity, &length, L'\\')
-            || !AppendText(destination, capacity, &length, childName))
-        {
-            return false;
-        }
-    }
+    if (name != NULL
+        && (!AppendCharacter(destination, capacity, &length, L'/')
+            || !AppendText(destination, capacity, &length, name)))
+        return false;
+    if (childName != NULL
+        && (!AppendCharacter(destination, capacity, &length, L'/')
+            || !AppendText(destination, capacity, &length, childName)))
+        return false;
     return true;
 }
 
@@ -120,128 +107,67 @@ static bool BuildDirectoryPath(LaiueContentType type, const wchar_t* suffix,
     wchar_t* destination, uint32_t capacity)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || destination == NULL || capacity == 0)
-    {
-        return false;
-    }
-
+    if (format == NULL || destination == NULL || capacity == 0) return false;
     uint32_t length = 0;
     if (!GetExecutableDirectory(destination, capacity, &length)
-        || !AppendCharacter(destination, capacity, &length, L'\\')
+        || !AppendCharacter(destination, capacity, &length, L'/')
         || !AppendText(destination, capacity, &length, format->directoryName))
-    {
         return false;
-    }
-    if (suffix != NULL)
-    {
-        if (!AppendCharacter(destination, capacity, &length, L'\\')
-            || !AppendText(destination, capacity, &length, suffix))
-        {
-            return false;
-        }
-    }
-    return true;
+    return suffix == NULL
+        || (AppendCharacter(destination, capacity, &length, L'/')
+            && AppendText(destination, capacity, &length, suffix));
 }
 
-static bool StorageMatches(const LaiueContentFormat* format, DWORD attributes)
+static bool StorageMatches(
+    const LaiueContentFormat* format, bool directory)
 {
-    bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     uint32_t storage = directory
         ? LAIUE_CONTENT_STORAGE_DIRECTORY : LAIUE_CONTENT_STORAGE_FILE;
     return (format->storageMask & storage) != 0;
-}
-
-static bool TextEquals(const wchar_t* left, const wchar_t* right)
-{
-    uint32_t i = 0;
-    while (left[i] != L'\0' && right[i] != L'\0')
-    {
-        if (left[i] != right[i])
-        {
-            return false;
-        }
-        ++i;
-    }
-    return left[i] == right[i];
 }
 
 bool LaiueContentGetActivePack(LaiueContentType type,
     wchar_t* destination, uint32_t capacity)
 {
     if (!LaiueContentTypeIsPack(type) || destination == NULL || capacity == 0)
-    {
         return false;
-    }
     destination[0] = L'\0';
 
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (path == NULL)
+    wchar_t* path = AllocatePathBuffer();
+    if (path == NULL) return false;
+    if (!BuildDirectoryPath(
+            type, ACTIVE_FILE_NAME, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
+        PlatformFree(path);
         return false;
     }
-    if (!BuildDirectoryPath(type, ACTIVE_FILE_NAME,
-            path, LAIUE_CONTENT_PATH_CAPACITY))
+    uint8_t* bytes = NULL;
+    uint64_t size = 0;
+    if (!PlatformReadEntireFile(
+            path, ACTIVE_UTF8_CAPACITY - 1U, &bytes, &size)
+        || size == 0)
     {
-        HeapFree(GetProcessHeap(), 0, path);
+        PlatformFree(path);
+        PlatformFree(bytes);
         return false;
     }
+    PlatformFree(path);
 
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    HeapFree(GetProcessHeap(), 0, path);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    uint8_t bytes[ACTIVE_UTF8_CAPACITY];
-    LARGE_INTEGER size;
-    DWORD read = 0;
-    bool valid = GetFileSizeEx(file, &size)
-        && size.QuadPart > 0
-        && size.QuadPart < (LONGLONG)sizeof(bytes)
-        && ReadFile(file, bytes, (DWORD)size.QuadPart, &read, NULL)
-        && read == (DWORD)size.QuadPart;
-    CloseHandle(file);
-    if (!valid)
-    {
-        return false;
-    }
-
-    uint32_t begin = 0;
-    uint32_t end = read;
-    if (end >= 3u && bytes[0] == 0xEFu && bytes[1] == 0xBBu
-        && bytes[2] == 0xBFu)
-    {
-        begin = 3u;
-    }
+    uint32_t begin = size >= 3U && bytes[0] == 0xefU
+        && bytes[1] == 0xbbU && bytes[2] == 0xbfU ? 3U : 0U;
+    uint32_t end = (uint32_t)size;
     while (begin < end && (bytes[begin] == ' ' || bytes[begin] == '\t'
         || bytes[begin] == '\r' || bytes[begin] == '\n'))
-    {
         ++begin;
-    }
-    while (end > begin && (bytes[end - 1u] == ' ' || bytes[end - 1u] == '\t'
-        || bytes[end - 1u] == '\r' || bytes[end - 1u] == '\n'))
-    {
+    while (end > begin && (bytes[end - 1U] == ' '
+        || bytes[end - 1U] == '\t' || bytes[end - 1U] == '\r'
+        || bytes[end - 1U] == '\n'))
         --end;
-    }
-    if (begin == end)
-    {
-        return false;
-    }
-
-    int converted = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-        (const char*)bytes + begin, (int)(end - begin),
-        destination, (int)(capacity - 1u));
-    if (converted <= 0 || (uint32_t)converted >= capacity)
-    {
-        destination[0] = L'\0';
-        return false;
-    }
-    destination[converted] = L'\0';
-    if (!LaiueContentNameIsSafe(destination)
+    bool converted = begin < end && PlatformUtf8ToWide(
+        (const char*)bytes + begin, end - begin,
+        destination, capacity, NULL);
+    PlatformFree(bytes);
+    if (!converted || !LaiueContentNameIsSafe(destination)
         || !LaiueContentNameMatches(type, destination))
     {
         destination[0] = L'\0';
@@ -253,95 +179,110 @@ bool LaiueContentGetActivePack(LaiueContentType type,
 bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || outList == NULL)
-    {
-        return false;
-    }
+    if (format == NULL || outList == NULL) return false;
     outList->entries = NULL;
     outList->count = 0;
 
-    wchar_t* searchPath = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (searchPath == NULL
-        || !BuildDirectoryPath(type, L"*", searchPath,
-            LAIUE_CONTENT_PATH_CAPACITY))
+    wchar_t* directoryPath = AllocatePathBuffer();
+    if (directoryPath == NULL) return false;
+    if (!BuildDirectoryPath(
+            type, NULL, directoryPath, LAIUE_CONTENT_PATH_CAPACITY))
     {
-        if (searchPath != NULL) HeapFree(GetProcessHeap(), 0, searchPath);
+        PlatformFree(directoryPath);
         return false;
     }
-
-    uint32_t count = 0;
-    WIN32_FIND_DATAW findData;
-    HANDLE find = FindFirstFileW(searchPath, &findData);
-    if (find != INVALID_HANDLE_VALUE)
+    PlatformDirectoryIterator* iterator =
+        PlatformAllocate(sizeof(*iterator), false);
+    PlatformDirectoryEntry* file =
+        PlatformAllocate(sizeof(*file), false);
+    if (iterator == NULL || file == NULL)
     {
-        do
-        {
-            if (findData.cFileName[0] != L'.'
-                && StorageMatches(format, findData.dwFileAttributes)
-                && LaiueContentNameIsSafe(findData.cFileName)
-                && LaiueContentNameMatches(type, findData.cFileName))
-            {
-                ++count;
-            }
-        }
-        while (FindNextFileW(find, &findData));
-        FindClose(find);
+        PlatformFree(file);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
+        return false;
     }
-
-    if (count == 0)
+    if (!PlatformDirectoryOpen(iterator, directoryPath))
     {
-        HeapFree(GetProcessHeap(), 0, searchPath);
+        PlatformFree(file);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
         return true;
     }
 
-    LaiueContentEntry* entries = HeapAlloc(GetProcessHeap(),
-        HEAP_ZERO_MEMORY, (size_t)count * sizeof(*entries));
+    uint32_t count = 0;
+    while (PlatformDirectoryNext(iterator, file))
+    {
+        if (!file->isSymbolicLink
+            && StorageMatches(format, file->isDirectory)
+            && LaiueContentNameIsSafe(file->name)
+            && LaiueContentNameMatches(type, file->name))
+            ++count;
+    }
+    PlatformDirectoryClose(iterator);
+    if (count == 0)
+    {
+        PlatformFree(file);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
+        return true;
+    }
+
+    LaiueContentEntry* entries = PlatformAllocate(
+        (size_t)count * sizeof(*entries), true);
     if (entries == NULL)
     {
-        HeapFree(GetProcessHeap(), 0, searchPath);
+        PlatformFree(file);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
         return false;
     }
-
     wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    bool hasActive = format->pack
-        && LaiueContentGetActivePack(type, activeName,
-            LAIUE_CONTENT_NAME_CAPACITY);
+    bool hasActive = format->pack && LaiueContentGetActivePack(
+        type, activeName, LAIUE_CONTENT_NAME_CAPACITY);
 
     uint32_t index = 0;
-    find = FindFirstFileW(searchPath, &findData);
-    if (find != INVALID_HANDLE_VALUE)
+    if (!PlatformDirectoryOpen(iterator, directoryPath))
     {
-        do
-        {
-            if (findData.cFileName[0] == L'.'
-                || !StorageMatches(format, findData.dwFileAttributes)
-                || !LaiueContentNameIsSafe(findData.cFileName)
-                || !LaiueContentNameMatches(type, findData.cFileName))
-            {
-                continue;
-            }
-
-            uint32_t length = TextLength(findData.cFileName);
-            if (length >= LAIUE_CONTENT_NAME_CAPACITY)
-            {
-                continue;
-            }
-            for (uint32_t i = 0; i <= length; ++i)
-            {
-                entries[index].name[i] = findData.cFileName[i];
-            }
-            entries[index].directory =
-                (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            entries[index].active = hasActive
-                && TextEquals(entries[index].name, activeName);
-            ++index;
-        }
-        while (index < count && FindNextFileW(find, &findData));
-        FindClose(find);
+        PlatformFree(file);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
+        PlatformFree(entries);
+        return false;
     }
+    while (index < count && PlatformDirectoryNext(iterator, file))
+    {
+        if (file->isSymbolicLink
+            || !StorageMatches(format, file->isDirectory)
+            || !LaiueContentNameIsSafe(file->name)
+            || !LaiueContentNameMatches(type, file->name))
+            continue;
+        uint32_t length = TextLength(file->name);
+        if (length >= LAIUE_CONTENT_NAME_CAPACITY) continue;
+        memcpy(entries[index].name, file->name,
+            (size_t)(length + 1U) * sizeof(wchar_t));
+        entries[index].directory = file->isDirectory;
+        entries[index].active = hasActive
+            && TextEquals(entries[index].name, activeName);
+        ++index;
+    }
+    PlatformDirectoryClose(iterator);
+    PlatformFree(file);
+    PlatformFree(iterator);
+    PlatformFree(directoryPath);
 
-    HeapFree(GetProcessHeap(), 0, searchPath);
+    for (uint32_t i = 1; i < index; ++i)
+    {
+        LaiueContentEntry value = entries[i];
+        uint32_t position = i;
+        while (position > 0
+            && TextCompare(value.name, entries[position - 1U].name) < 0)
+        {
+            entries[position] = entries[position - 1U];
+            --position;
+        }
+        entries[position] = value;
+    }
     outList->entries = entries;
     outList->count = index;
     return true;
@@ -349,95 +290,90 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
 
 void LaiueContentListRelease(LaiueContentList* list)
 {
-    if (list == NULL)
-    {
-        return;
-    }
-    if (list->entries != NULL)
-    {
-        HeapFree(GetProcessHeap(), 0, list->entries);
-    }
+    if (list == NULL) return;
+    PlatformFree(list->entries);
     list->entries = NULL;
     list->count = 0;
+}
+
+static bool ContentPathMatchesStorage(
+    LaiueContentType type, const wchar_t* name)
+{
+    const LaiueContentFormat* format = LaiueContentFormatGet(type);
+    if (format == NULL) return false;
+    wchar_t* directoryPath = AllocatePathBuffer();
+    if (directoryPath == NULL || !BuildDirectoryPath(
+            type, NULL, directoryPath, LAIUE_CONTENT_PATH_CAPACITY))
+    {
+        PlatformFree(directoryPath);
+        return false;
+    }
+    PlatformDirectoryIterator* iterator =
+        PlatformAllocate(sizeof(*iterator), false);
+    PlatformDirectoryEntry* entry =
+        PlatformAllocate(sizeof(*entry), false);
+    if (iterator == NULL || entry == NULL
+        || !PlatformDirectoryOpen(iterator, directoryPath))
+    {
+        PlatformFree(entry);
+        PlatformFree(iterator);
+        PlatformFree(directoryPath);
+        return false;
+    }
+    PlatformFree(directoryPath);
+    bool found = false;
+    while (PlatformDirectoryNext(iterator, entry))
+    {
+        if (!entry->isSymbolicLink && TextEquals(entry->name, name)
+            && StorageMatches(format, entry->isDirectory))
+        {
+            found = true;
+            break;
+        }
+    }
+    PlatformDirectoryClose(iterator);
+    PlatformFree(entry);
+    PlatformFree(iterator);
+    return found;
 }
 
 bool LaiueContentSetActivePack(LaiueContentType type, const wchar_t* name)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || !format->pack)
+    if (format == NULL || !format->pack) return false;
+    wchar_t* path = AllocatePathBuffer();
+    if (path == NULL) return false;
+    if (!BuildDirectoryPath(
+            type, ACTIVE_FILE_NAME, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
+        PlatformFree(path);
         return false;
     }
-
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (path == NULL)
-    {
-        return false;
-    }
-
-    if (!BuildDirectoryPath(type, ACTIVE_FILE_NAME,
-            path, LAIUE_CONTENT_PATH_CAPACITY))
-    {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
     if (name == NULL || name[0] == L'\0')
     {
-        bool removed = DeleteFileW(path) != FALSE;
-        DWORD error = GetLastError();
-        HeapFree(GetProcessHeap(), 0, path);
-        return removed || error == ERROR_FILE_NOT_FOUND;
+        bool removed = !PlatformPathExists(path) || PlatformDeleteFile(path);
+        PlatformFree(path);
+        return removed;
     }
-
     if (!LaiueContentNameIsSafe(name)
-        || !LaiueContentNameMatches(type, name))
+        || !LaiueContentNameMatches(type, name)
+        || !ContentPathMatchesStorage(type, name))
     {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-
-    wchar_t* contentPath = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (contentPath == NULL)
-    {
-        HeapFree(GetProcessHeap(), 0, path);
-        return false;
-    }
-    bool exists = LaiueContentBuildPath(type, name, NULL,
-        contentPath, LAIUE_CONTENT_PATH_CAPACITY);
-    DWORD attributes = exists ? GetFileAttributesW(contentPath)
-        : INVALID_FILE_ATTRIBUTES;
-    HeapFree(GetProcessHeap(), 0, contentPath);
-    if (attributes == INVALID_FILE_ATTRIBUTES
-        || !StorageMatches(format, attributes))
-    {
-        HeapFree(GetProcessHeap(), 0, path);
+        PlatformFree(path);
         return false;
     }
 
     char utf8[ACTIVE_UTF8_CAPACITY];
-    int byteCount = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        name, -1, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-    if (byteCount <= 1 || byteCount >= (int)sizeof(utf8))
+    uint32_t byteCount = 0;
+    if (!PlatformWideToUtf8(name, utf8,
+            sizeof(utf8) - 1U, &byteCount)
+        || byteCount + 1U > sizeof(utf8))
     {
-        HeapFree(GetProcessHeap(), 0, path);
+        PlatformFree(path);
         return false;
     }
-    utf8[byteCount - 1] = '\n';
-
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    HeapFree(GetProcessHeap(), 0, path);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    DWORD written = 0;
-    bool succeeded = WriteFile(file, utf8, (DWORD)byteCount, &written, NULL)
-        && written == (DWORD)byteCount;
-    CloseHandle(file);
-    return succeeded;
+    utf8[byteCount++] = '\n';
+    bool written = PlatformWriteFileAtomic(path, utf8, byteCount);
+    PlatformFree(path);
+    return written;
 }

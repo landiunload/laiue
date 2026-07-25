@@ -1,7 +1,8 @@
-#include <windows.h>
 #include <string.h>
 
+#include "network/network.h"
 #include "network/protocol.h"
+#include "test_runtime.h"
 
 // Кодек протокола — чистая логика без сокетов и Windows-состояния, поэтому
 // protocol.c компилируется прямо в тест. Экспортировать его из laiue_network
@@ -9,23 +10,9 @@
 
 static uint32_t protocolTestChecks;
 
-// Тест собирается без CRT, поэтому вывод — прямая запись в stdout.
 static void ProtocolTestWrite(const char* text)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-
-    uint32_t length = 0;
-    while (text[length] != '\0')
-    {
-        ++length;
-    }
-
-    DWORD written = 0;
-    WriteFile(output, text, length, &written, NULL);
+    LaiueTestRuntimeWrite(text);
 }
 
 static void ProtocolTestWriteNumber(uint32_t value)
@@ -57,7 +44,7 @@ static void ProtocolTestExpect(bool condition, const char* name)
     ProtocolTestWrite("Проверка не пройдена: ");
     ProtocolTestWrite(name);
     ProtocolTestWrite("\r\n");
-    ExitProcess(1);
+    LaiueTestRuntimeExit(1);
 }
 
 static void TestWriteU16(uint8_t* output, uint16_t value)
@@ -636,27 +623,29 @@ static void TestPlayerStateAndBlockDelta(void)
 
     LaiueProtocolBlockDelta delta = {
         .serverTick = 7u,
+        .revision = 81u,
         .block = { -100000LL, 5LL, 63LL },
         .replacement = 2u,
     };
     ProtocolTestExpect(
-        LaiueProtocolEncodeBlockDelta(payload, sizeof(payload), &delta) == 29u,
+        LaiueProtocolEncodeBlockDelta(payload, sizeof(payload), &delta) == 37u,
         "EncodeBlockDelta вернул неожиданный размер");
 
     LaiueProtocolBlockDelta decodedDelta;
     ProtocolTestExpect(
-        LaiueProtocolDecodeBlockDelta(payload, 29u, &decodedDelta)
+        LaiueProtocolDecodeBlockDelta(payload, 37u, &decodedDelta)
         && decodedDelta.serverTick == 7u
+        && decodedDelta.revision == 81u
         && decodedDelta.block[0] == -100000LL && decodedDelta.block[1] == 5LL
         && decodedDelta.block[2] == 63LL && decodedDelta.replacement == 2u,
         "DecodeBlockDelta не восстановил поля");
     ProtocolTestExpect(
-        !LaiueProtocolDecodeBlockDelta(payload, 28u, &decodedDelta)
-        && !LaiueProtocolDecodeBlockDelta(payload, 30u, &decodedDelta),
+        !LaiueProtocolDecodeBlockDelta(payload, 36u, &decodedDelta)
+        && !LaiueProtocolDecodeBlockDelta(payload, 38u, &decodedDelta),
         "DecodeBlockDelta принял неточный размер");
 
-    payload[28] = 3u;
-    ProtocolTestExpect(!LaiueProtocolDecodeBlockDelta(payload, 29u, &decodedDelta),
+    payload[36] = 3u;
+    ProtocolTestExpect(!LaiueProtocolDecodeBlockDelta(payload, 37u, &decodedDelta),
         "DecodeBlockDelta принял неизвестный блок");
 
     LaiueProtocolBlockDelta invalidDelta = delta;
@@ -665,6 +654,13 @@ static void TestPlayerStateAndBlockDelta(void)
         LaiueProtocolEncodeBlockDelta(payload, sizeof(payload),
             &invalidDelta) == 0,
         "EncodeBlockDelta принял неизвестный блок");
+
+    invalidDelta = delta;
+    invalidDelta.revision = 0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeBlockDelta(payload, sizeof(payload),
+            &invalidDelta) == 0,
+        "EncodeBlockDelta принял нулевую ревизию");
 }
 
 static void TestDropsAndInventory(void)
@@ -872,7 +868,340 @@ static void TestNonFiniteRejected(void)
     }
 }
 
-void ProtocolTestEntryPoint(void)
+static void TestEndpointParser(void)
+{
+    NetworkEndpoint endpoint;
+    ProtocolTestExpect(
+        NetworkEndpointParse("192.0.2.10",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV4
+        && endpoint.port == LAIUE_NETWORK_DEFAULT_PORT
+        && EqualAscii(endpoint.host, "192.0.2.10"),
+        "Endpoint parser не принял IPv4 со стандартным портом");
+    ProtocolTestExpect(
+        NetworkEndpointParse("192.0.2.10:30000",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV4
+        && endpoint.port == 30000u,
+        "Endpoint parser не принял IPv4 с портом");
+    ProtocolTestExpect(
+        NetworkEndpointParse("2001:db8::10",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV6
+        && endpoint.port == LAIUE_NETWORK_DEFAULT_PORT,
+        "Endpoint parser не принял bare IPv6");
+    ProtocolTestExpect(
+        NetworkEndpointParse("[2001:DB8::10]:30000",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV6
+        && endpoint.port == 30000u
+        && EqualAscii(endpoint.host, "2001:db8::10"),
+        "Endpoint parser не принял bracketed IPv6");
+    ProtocolTestExpect(
+        NetworkEndpointParse("Example.COM:443",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_DNS
+        && endpoint.port == 443u
+        && EqualAscii(endpoint.host, "example.com"),
+        "Endpoint parser не канонизировал DNS endpoint");
+    ProtocolTestExpect(
+        NetworkEndpointParse("::ffff:192.0.2.1",
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV6,
+        "Endpoint parser не принял IPv4-mapped IPv6");
+
+    static const char* invalid[] = {
+        "",
+        "http://example.com",
+        "user@example.com",
+        "192.0.2.1:0",
+        "192.0.2.1:65536",
+        "192.0.2.1:notaport",
+        "999.0.0.1",
+        "01.2.3.4",
+        "[2001:db8::1",
+        "[2001:db8::1]garbage",
+        "[192.0.2.1]:27180",
+        "2001:::1",
+        "2001:db8::1::2",
+        "-example.test",
+        "example..test",
+        "*.example.test",
+    };
+    for (uint32_t index = 0; index < sizeof(invalid) / sizeof(invalid[0]);
+         ++index)
+    {
+        ProtocolTestExpect(
+            NetworkEndpointParse(invalid[index],
+                LAIUE_NETWORK_DEFAULT_PORT, &endpoint) !=
+                NETWORK_ENDPOINT_PARSE_OK,
+            "Endpoint parser принял некорректный endpoint");
+    }
+
+    ProtocolTestExpect(
+        NetworkListenEndpointParse("*", NETWORK_ADDRESS_FAMILY_DUAL,
+            LAIUE_NETWORK_DEFAULT_PORT, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_WILDCARD
+        && EqualAscii(endpoint.host, "::"),
+        "Listener parser не создал dual-stack wildcard");
+    ProtocolTestExpect(
+        NetworkListenEndpointParse("0.0.0.0",
+            NETWORK_ADDRESS_FAMILY_IPV4, 30000u, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV4,
+        "Listener parser не принял IPv4 bind");
+    ProtocolTestExpect(
+        NetworkListenEndpointParse("::1",
+            NETWORK_ADDRESS_FAMILY_IPV6, 30000u, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && endpoint.kind == NETWORK_ENDPOINT_IPV6,
+        "Listener parser не принял IPv6 bind");
+    ProtocolTestExpect(
+        NetworkListenEndpointParse("127.0.0.1",
+            NETWORK_ADDRESS_FAMILY_DUAL, 30000u, &endpoint) ==
+            NETWORK_ENDPOINT_PARSE_FAMILY_MISMATCH,
+        "Listener parser принял конкретный IPv4 в dual режиме");
+}
+
+static void TestTrustParser(void)
+{
+    NetworkTrustMode mode;
+    uint8_t pin[LAIUE_NETWORK_CERTIFICATE_PIN_SIZE];
+    ProtocolTestExpect(NetworkTrustParse("system", &mode, pin)
+        && mode == NETWORK_TRUST_SYSTEM && pin[0] == 0 && pin[31] == 0,
+        "Trust parser не принял system");
+
+    const char* pinned =
+        "sha256:"
+        "000102030405060708090a0b0c0d0e0f"
+        "101112131415161718191a1b1c1d1e1f";
+    ProtocolTestExpect(NetworkTrustParse(pinned, &mode, pin)
+        && mode == NETWORK_TRUST_SHA256
+        && pin[0] == 0x00u && pin[1] == 0x01u
+        && pin[30] == 0x1eu && pin[31] == 0x1fu,
+        "Trust parser не принял SHA-256 pin");
+    ProtocolTestExpect(!NetworkTrustParse("sha256:1234", &mode, pin)
+        && !NetworkTrustParse("insecure", &mode, pin),
+        "Trust parser принял неполный pin или insecure режим");
+    ProtocolTestExpect(
+        !NetworkTrustParse(
+            "sha256:"
+            "00000000000000000000000000000000"
+            "00000000000000000000000000000000",
+            &mode, pin),
+        "Trust parser принял вырожденный нулевой pin");
+}
+
+static void TestNetworkConfigurations(void)
+{
+    NetworkClientConfiguration client;
+    NetworkClientConfigurationInitialize(&client);
+    ProtocolTestExpect(
+        client.structureSize == sizeof(client)
+        && client.addressFamily == NETWORK_ADDRESS_FAMILY_AUTO
+        && client.trustMode == NETWORK_TRUST_SYSTEM,
+        "ClientConfigurationInitialize не выставил безопасные defaults");
+    ProtocolTestExpect(
+        NetworkEndpointParse("example.test",
+            LAIUE_NETWORK_DEFAULT_PORT, &client.endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && NetworkClientConfigurationIsValid(&client),
+        "Client configuration отвергла system trust");
+
+    client.addressFamily = NETWORK_ADDRESS_FAMILY_IPV6;
+    ProtocolTestExpect(NetworkClientConfigurationIsValid(&client),
+        "Client configuration отвергла IPv6 preference для DNS");
+    ProtocolTestExpect(
+        NetworkEndpointParse("192.0.2.1",
+            LAIUE_NETWORK_DEFAULT_PORT, &client.endpoint) ==
+            NETWORK_ENDPOINT_PARSE_OK
+        && !NetworkClientConfigurationIsValid(&client),
+        "Client configuration приняла IPv4 endpoint в IPv6-only режиме");
+
+    client.addressFamily = NETWORK_ADDRESS_FAMILY_IPV4;
+    client.trustMode = NETWORK_TRUST_SHA256;
+    client.certificateSha256[0] = 1u;
+    ProtocolTestExpect(NetworkClientConfigurationIsValid(&client),
+        "Client configuration отвергла непустой certificate pin");
+    memset(client.certificateSha256, 0, sizeof(client.certificateSha256));
+    ProtocolTestExpect(!NetworkClientConfigurationIsValid(&client),
+        "Client configuration приняла пустой certificate pin");
+
+    NetworkServerConfiguration server;
+    NetworkServerConfigurationInitialize(&server);
+    ProtocolTestExpect(
+        server.structureSize == sizeof(server)
+        && server.port == LAIUE_NETWORK_DEFAULT_PORT
+        && server.addressFamily == NETWORK_ADDRESS_FAMILY_DUAL
+        && !NetworkServerConfigurationIsValid(&server),
+        "Server configuration должна требовать TLS credentials");
+#if defined(_WIN32)
+    server.certificateStoreThumbprint =
+        "00112233445566778899aabbccddeeff00112233";
+#else
+    server.certificateFile = "server.crt";
+    server.privateKeyFile = "server.key";
+#endif
+    ProtocolTestExpect(NetworkServerConfigurationIsValid(&server),
+        "Server configuration отвергла корректные TLS credentials");
+    server.addressFamily = NETWORK_ADDRESS_FAMILY_IPV4;
+    server.listenAddress = "::1";
+    ProtocolTestExpect(!NetworkServerConfigurationIsValid(&server),
+        "Server configuration приняла IPv6 bind в IPv4-only режиме");
+}
+
+static void TestSnapshotProtocol(void)
+{
+    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    LaiueProtocolSnapshotBegin begin = {
+        .snapshotId = 17u,
+        .worldRevision = 91u,
+        .serverTick = 42u,
+        .chunkCount = 2u,
+        .peerId = 7u,
+        .worldSeed = -12345,
+        .worldTime = 888u,
+    };
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotBegin(payload, sizeof(payload), &begin)
+            == 44u,
+        "EncodeSnapshotBegin вернул неожиданный размер");
+    LaiueProtocolSnapshotBegin decodedBegin;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeSnapshotBegin(payload, 44u, &decodedBegin)
+        && decodedBegin.snapshotId == 17u
+        && decodedBegin.worldRevision == 91u
+        && decodedBegin.serverTick == 42u
+        && decodedBegin.chunkCount == 2u
+        && decodedBegin.peerId == 7u
+        && decodedBegin.worldSeed == -12345
+        && decodedBegin.worldTime == 888u,
+        "DecodeSnapshotBegin не восстановил поля");
+
+    LaiueProtocolChunkDelta chunk;
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.chunk[0] = -9;
+    chunk.chunk[1] = 5;
+    chunk.chunk[2] = 1;
+    chunk.revision = 92u;
+    chunk.partIndex = 0u;
+    chunk.partCount = 1u;
+    chunk.editCount = 3u;
+    chunk.edits[0].localX = 0u;
+    chunk.edits[0].localY = 0u;
+    chunk.edits[0].localZ = 0u;
+    chunk.edits[0].replacement = 1u;
+    chunk.edits[1].localX = 0u;
+    chunk.edits[1].localY = 0u;
+    chunk.edits[1].localZ = 1u;
+    chunk.edits[1].replacement = 2u;
+    chunk.edits[2].localX = 63u;
+    chunk.edits[2].localY = 63u;
+    chunk.edits[2].localZ = 63u;
+    chunk.edits[2].replacement = 0u;
+    uint32_t chunkSize =
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk);
+    ProtocolTestExpect(chunkSize == 50u,
+        "EncodeSnapshotChunk вернул неожиданный размер");
+
+    LaiueProtocolChunkDelta decodedChunk;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeSnapshotChunk(payload, chunkSize, &decodedChunk)
+        && decodedChunk.chunk[0] == -9
+        && decodedChunk.chunk[1] == 5
+        && decodedChunk.chunk[2] == 1
+        && decodedChunk.revision == 92u
+        && decodedChunk.partIndex == 0u
+        && decodedChunk.partCount == 1u
+        && decodedChunk.editCount == 3u
+        && decodedChunk.edits[2].localX == 63u
+        && decodedChunk.edits[2].replacement == 0u,
+        "DecodeSnapshotChunk не восстановил поля");
+
+    chunk.edits[1] = chunk.edits[0];
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk)
+            == 0,
+        "EncodeSnapshotChunk принял дубликат/несортированные edits");
+    chunk.edits[1].localX = 64u;
+    chunk.edits[1].localY = 0u;
+    chunk.edits[1].localZ = 1u;
+    chunk.edits[1].replacement = 2u;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk)
+            == 0,
+        "EncodeSnapshotChunk принял локальную координату вне чанка");
+    chunk.edits[1].localX = 0u;
+    chunk.partIndex = 1u;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk)
+            == 0u,
+        "EncodeSnapshotChunk принял partIndex вне partCount");
+    chunk.partIndex = 0u;
+    chunk.partCount = 2u;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk)
+            == 0u,
+        "EncodeSnapshotChunk принял неполную не-последнюю часть");
+    chunk.partIndex = 0u;
+    chunk.partCount = 1u;
+    chunk.editCount = 0u;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotChunk(payload, sizeof(payload), &chunk)
+            == 38u
+        && LaiueProtocolDecodeSnapshotChunk(
+            payload, 38u, &decodedChunk)
+        && decodedChunk.partCount == 1u
+        && decodedChunk.editCount == 0u,
+        "Пустой single-part chunk delta не прошёл round-trip");
+
+    uint64_t snapshotId = 0;
+    uint64_t worldRevision = 0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotEnd(payload, sizeof(payload), 17u, 95u)
+            == 16u
+        && LaiueProtocolDecodeSnapshotEnd(payload, 16u,
+            &snapshotId, &worldRevision)
+        && snapshotId == 17u && worldRevision == 95u,
+        "SnapshotEnd не прошёл round-trip");
+
+    LaiueProtocolChunkResyncRequest request = {
+        .chunk = { -1, 2, 3 },
+        .expectedRevision = 94u,
+    };
+    LaiueProtocolChunkResyncRequest decodedRequest;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeChunkResyncRequest(payload, sizeof(payload),
+            &request) == 32u
+        && LaiueProtocolDecodeChunkResyncRequest(payload, 32u,
+            &decodedRequest)
+        && decodedRequest.chunk[0] == -1
+        && decodedRequest.expectedRevision == 94u,
+        "ChunkResyncRequest не прошёл round-trip");
+
+    uint32_t peerId = 0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodePeerId(payload, sizeof(payload), 7u) == 4u
+        && LaiueProtocolDecodePeerId(payload, 4u, &peerId)
+        && peerId == 7u,
+        "PeerId не прошёл round-trip");
+    uint64_t worldTime = 0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeWorldTime(payload, sizeof(payload),
+            123456789u) == 8u
+        && LaiueProtocolDecodeWorldTime(payload, 8u, &worldTime)
+        && worldTime == 123456789u,
+        "WorldTime не прошёл round-trip");
+}
+
+LAIUE_TEST_ENTRY(ProtocolTestEntryPoint)
 {
     TestHeaderAcceptsEveryDeclaredType();
     TestHeaderRoundTripAndRejections();
@@ -885,9 +1214,13 @@ void ProtocolTestEntryPoint(void)
     TestNonFiniteRejected();
     TestPlayerStateAndBlockDelta();
     TestDropsAndInventory();
+    TestEndpointParser();
+    TestTrustParser();
+    TestNetworkConfigurations();
+    TestSnapshotProtocol();
 
     ProtocolTestWrite("Проверок пройдено: ");
     ProtocolTestWriteNumber(protocolTestChecks);
     ProtocolTestWrite("\r\n");
-    ExitProcess(0);
+    LAIUE_TEST_SUCCESS();
 }

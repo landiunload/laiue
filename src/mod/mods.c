@@ -1,29 +1,31 @@
 #include "mod/mods.h"
 #include "content/content_catalog.h"
+#include "platform/system.h"
 
 #include "laiue_mod_api.h"
 
-#include <windows.h>
-#include <bcrypt.h>
 #include <string.h>
 
 #define MOD_PACK_MANIFEST_NAME L"mod.lm"
 
 #define MOD_FILE_MAX_BYTES (64u * 1024u)
-#define MOD_FORMAT_VERSION 1
+#define MOD_NATIVE_MAX_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MOD_FORMAT_VERSION 2
+#define MODS_NAME_UTF8_CAPACITY (MODS_NAME_CAPACITY * 4U)
 
 // === Байтовые утилиты парсера (файлы модов — построчный UTF-8) ===
 
 typedef struct ByteSlice
 {
-    const uint8_t* data;
+    const uint8_t *data;
     uint32_t length;
 } ByteSlice;
 
-static bool SliceEqualsAscii(ByteSlice slice, const char* text)
+static bool SliceEqualsAscii(ByteSlice slice, const char *text)
 {
     uint32_t length = 0;
-    while (text[length] != '\0') ++length;
+    while (text[length] != '\0')
+        ++length;
     if (slice.length != length)
     {
         return false;
@@ -31,7 +33,8 @@ static bool SliceEqualsAscii(ByteSlice slice, const char* text)
     for (uint32_t i = 0; i < length; ++i)
     {
         uint8_t a = slice.data[i];
-        if (a >= 'A' && a <= 'Z') a = (uint8_t)(a + ('a' - 'A'));
+        if (a >= 'A' && a <= 'Z')
+            a = (uint8_t)(a + ('a' - 'A'));
         uint8_t b = (uint8_t)text[i];
         if (a != b)
         {
@@ -43,98 +46,61 @@ static bool SliceEqualsAscii(ByteSlice slice, const char* text)
 
 static ByteSlice SliceTrim(ByteSlice slice)
 {
-    while (slice.length > 0 && (slice.data[0] == ' ' || slice.data[0] == '\t'
-        || slice.data[0] == '\r'))
+    while (slice.length > 0 &&
+           (slice.data[0] == ' ' || slice.data[0] == '\t' || slice.data[0] == '\r'))
     {
         ++slice.data;
         --slice.length;
     }
-    while (slice.length > 0 && (slice.data[slice.length - 1] == ' '
-        || slice.data[slice.length - 1] == '\t'
-        || slice.data[slice.length - 1] == '\r'))
+    while (slice.length > 0 &&
+           (slice.data[slice.length - 1] == ' ' || slice.data[slice.length - 1] == '\t' ||
+            slice.data[slice.length - 1] == '\r'))
     {
         --slice.length;
     }
     return slice;
 }
 
-static bool SliceParseFloat(ByteSlice slice, float* outValue)
+static bool SliceParseUint32(ByteSlice slice, uint32_t *outValue)
 {
-    if (slice.length == 0)
+    if (slice.length == 0 || outValue == NULL)
     {
         return false;
     }
 
-    uint32_t index = 0;
-    float sign = 1.0f;
-    if (slice.data[0] == '-' || slice.data[0] == '+')
+    uint32_t value = 0;
+    for (uint32_t index = 0; index < slice.length; ++index)
     {
-        sign = slice.data[0] == '-' ? -1.0f : 1.0f;
-        index = 1;
-    }
-
-    bool anyDigit = false;
-    float value = 0.0f;
-    while (index < slice.length
-        && slice.data[index] >= '0' && slice.data[index] <= '9')
-    {
-        value = value * 10.0f + (float)(slice.data[index] - '0');
-        anyDigit = true;
-        ++index;
-    }
-    if (index < slice.length && slice.data[index] == '.')
-    {
-        ++index;
-        float scale = 0.1f;
-        while (index < slice.length
-            && slice.data[index] >= '0' && slice.data[index] <= '9')
+        uint8_t digit = slice.data[index];
+        if (digit < '0' || digit > '9')
         {
-            value += (float)(slice.data[index] - '0') * scale;
-            scale *= 0.1f;
-            anyDigit = true;
-            ++index;
+            return false;
         }
+        digit = (uint8_t)(digit - '0');
+        if (value > (UINT32_MAX - digit) / 10u)
+        {
+            return false;
+        }
+        value = value * 10u + digit;
     }
-
-    if (!anyDigit || index != slice.length)
-    {
-        return false;
-    }
-    *outValue = sign * value;
+    *outValue = value;
     return true;
 }
 
-static bool SliceParseInt(ByteSlice slice, int32_t* outValue)
-{
-    float value;
-    if (!SliceParseFloat(slice, &value))
-    {
-        return false;
-    }
-    *outValue = (int32_t)(value + (value >= 0.0f ? 0.5f : -0.5f));
-    return true;
-}
-
-static void SliceToWide(ByteSlice slice, wchar_t* destination,
-    uint32_t capacity)
+static void SliceToWide(ByteSlice slice, wchar_t *destination, uint32_t capacity)
 {
     destination[0] = L'\0';
     if (slice.length == 0 || capacity < 2)
     {
         return;
     }
-    int written = MultiByteToWideChar(CP_UTF8, 0,
-        (const char*)slice.data, (int)slice.length,
-        destination, (int)capacity - 1);
-    if (written < 0)
-    {
-        written = 0;
-    }
-    destination[written] = L'\0';
+    uint32_t written = 0;
+    if (!PlatformUtf8ToWide((const char *)slice.data, slice.length, destination, capacity,
+                            &written))
+        destination[0] = L'\0';
 }
 
-static bool SliceToIdentifier(ByteSlice slice, char* destination,
-    uint32_t capacity)
+static bool SliceToIdentifier(ByteSlice slice, char *destination, uint32_t capacity)
 {
     if (slice.length == 0 || slice.length >= capacity)
     {
@@ -143,9 +109,9 @@ static bool SliceToIdentifier(ByteSlice slice, char* destination,
     for (uint32_t i = 0; i < slice.length; ++i)
     {
         uint8_t c = slice.data[i];
-        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + ('a' - 'A'));
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-            || c == '.' || c == '_' || c == '-'))
+        if (c >= 'A' && c <= 'Z')
+            c = (uint8_t)(c + ('a' - 'A'));
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
         {
             destination[0] = '\0';
             return false;
@@ -156,113 +122,41 @@ static bool SliceToIdentifier(ByteSlice slice, char* destination,
     return true;
 }
 
-static bool HashBuffer(const uint8_t* bytes, uint32_t length,
-    uint8_t output[MODS_CONTENT_HASH_SIZE])
+static bool HashBuffer(const uint8_t *bytes, uint32_t length,
+                       uint8_t output[MODS_CONTENT_HASH_SIZE])
 {
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    bool succeeded = BCryptOpenAlgorithmProvider(&algorithm,
-        BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0
-        && BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0) >= 0
-        && BCryptHashData(hash, (PUCHAR)bytes, length, 0) >= 0
-        && BCryptFinishHash(hash, output, MODS_CONTENT_HASH_SIZE, 0) >= 0;
-    if (hash != NULL) BCryptDestroyHash(hash);
-    if (algorithm != NULL) BCryptCloseAlgorithmProvider(algorithm, 0);
-    return succeeded;
+    return PlatformSha256(bytes, length, output);
 }
 
 // === Файловый ввод-вывод ===
 
-static uint8_t* ReadWholeFile(const wchar_t* path, uint32_t* outLength)
+static uint8_t *ReadWholeFile(const wchar_t *path, uint32_t *outLength)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
+    uint8_t *bytes = NULL;
+    uint64_t length = 0;
+    if (outLength == NULL || !PlatformReadEntireFile(path, MOD_FILE_MAX_BYTES, &bytes, &length) ||
+        length == 0 || length > UINT32_MAX)
     {
+        PlatformFree(bytes);
         return NULL;
     }
-
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0
-        || size.QuadPart > MOD_FILE_MAX_BYTES)
-    {
-        CloseHandle(file);
-        return NULL;
-    }
-
-    uint32_t length = (uint32_t)size.QuadPart;
-    uint8_t* bytes = HeapAlloc(GetProcessHeap(), 0, length);
-    if (bytes == NULL)
-    {
-        CloseHandle(file);
-        return NULL;
-    }
-
-    uint32_t completed = 0;
-    while (completed < length)
-    {
-        DWORD read = 0;
-        if (!ReadFile(file, bytes + completed, length - completed, &read, NULL)
-            || read == 0)
-        {
-            HeapFree(GetProcessHeap(), 0, bytes);
-            CloseHandle(file);
-            return NULL;
-        }
-        completed += read;
-    }
-    CloseHandle(file);
-
-    *outLength = length;
+    *outLength = (uint32_t)length;
     return bytes;
 }
 
-static bool HashFile(const wchar_t* path,
-    uint8_t output[MODS_CONTENT_HASH_SIZE])
+static bool HashFile(const wchar_t *path, uint8_t output[MODS_CONTENT_HASH_SIZE])
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    bool succeeded = BCryptOpenAlgorithmProvider(&algorithm,
-        BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0
-        && BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0) >= 0;
-    uint8_t buffer[1024];
-    while (succeeded)
-    {
-        DWORD read = 0;
-        if (!ReadFile(file, buffer, sizeof(buffer), &read, NULL))
-        {
-            succeeded = false;
-            break;
-        }
-        if (read == 0) break;
-        if (BCryptHashData(hash, buffer, read, 0) < 0)
-        {
-            succeeded = false;
-            break;
-        }
-    }
-    CloseHandle(file);
-    if (succeeded)
-    {
-        succeeded = BCryptFinishHash(hash, output,
-            MODS_CONTENT_HASH_SIZE, 0) >= 0;
-    }
-    if (hash != NULL) BCryptDestroyHash(hash);
-    if (algorithm != NULL) BCryptCloseAlgorithmProvider(algorithm, 0);
+    uint8_t *bytes = NULL;
+    uint64_t size = 0;
+    bool succeeded = PlatformReadEntireFile(path, MOD_NATIVE_MAX_BYTES, &bytes, &size) &&
+                     size != 0 && PlatformSha256(bytes, size, output);
+    PlatformFree(bytes);
     return succeeded;
 }
 
 static bool CombineHashes(const uint8_t left[MODS_CONTENT_HASH_SIZE],
-    const uint8_t right[MODS_CONTENT_HASH_SIZE],
-    uint8_t output[MODS_CONTENT_HASH_SIZE])
+                          const uint8_t right[MODS_CONTENT_HASH_SIZE],
+                          uint8_t output[MODS_CONTENT_HASH_SIZE])
 {
     uint8_t pair[MODS_CONTENT_HASH_SIZE * 2U];
     memcpy(pair, left, MODS_CONTENT_HASH_SIZE);
@@ -270,33 +164,28 @@ static bool CombineHashes(const uint8_t left[MODS_CONTENT_HASH_SIZE],
     return HashBuffer(pair, sizeof(pair), output);
 }
 
-static bool HashesEqual(const uint8_t* left, const uint8_t* right)
+static bool HashesEqual(const uint8_t *left, const uint8_t *right)
 {
-    uint8_t difference = 0;
-    for (uint32_t i = 0; i < MODS_CONTENT_HASH_SIZE; ++i)
-    {
-        difference |= left[i] ^ right[i];
-    }
-    return difference == 0;
+    return PlatformConstantTimeEqual(left, right, MODS_CONTENT_HASH_SIZE);
 }
 
-static bool BuildEnabledPath(const ModsState* mods,
-    wchar_t* destination, uint32_t capacity)
+static bool BuildEnabledPath(const ModsState *mods, wchar_t *destination, uint32_t capacity)
 {
-    if (!LaiueContentBuildPath(LAIUE_CONTENT_MOD, NULL, NULL,
-            destination, capacity))
+    if (!LaiueContentBuildPath(LAIUE_CONTENT_MOD, NULL, NULL, destination, capacity))
     {
         return false;
     }
     uint32_t length = 0;
-    while (destination[length] != L'\0') ++length;
+    while (destination[length] != L'\0')
+        ++length;
     uint32_t nameLength = 0;
-    while (mods->enabledFileName[nameLength] != L'\0') ++nameLength;
+    while (mods->enabledFileName[nameLength] != L'\0')
+        ++nameLength;
     if (length + nameLength + 2 > capacity)
     {
         return false;
     }
-    destination[length++] = L'\\';
+    destination[length++] = L'/';
     for (uint32_t i = 0; i <= nameLength; ++i)
     {
         destination[length + i] = mods->enabledFileName[i];
@@ -304,53 +193,27 @@ static bool BuildEnabledPath(const ModsState* mods,
     return true;
 }
 
-static bool WriteFileAtomically(const wchar_t* path,
-    const uint8_t* bytes, uint32_t length)
+static bool WriteFileAtomically(const wchar_t *path, const uint8_t *bytes, uint32_t length)
 {
-    uint32_t pathLength = 0;
-    while (path[pathLength] != L'\0') ++pathLength;
-    wchar_t* temporary = HeapAlloc(GetProcessHeap(), 0,
-        ((size_t)pathLength + 5U) * sizeof(wchar_t));
-    if (temporary == NULL) return false;
-    memcpy(temporary, path, (size_t)pathLength * sizeof(wchar_t));
-    memcpy(temporary + pathLength, L".tmp", 5U * sizeof(wchar_t));
-    HANDLE file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    bool succeeded = file != INVALID_HANDLE_VALUE;
-    if (succeeded)
-    {
-        DWORD written = 0;
-        succeeded = WriteFile(file, bytes, length, &written, NULL)
-            && written == length && FlushFileBuffers(file);
-        CloseHandle(file);
-    }
-    if (succeeded)
-    {
-        succeeded = MoveFileExW(temporary, path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-    }
-    if (!succeeded) DeleteFileW(temporary);
-    HeapFree(GetProcessHeap(), 0, temporary);
-    return succeeded;
+    return PlatformWriteFileAtomic(path, bytes, length);
 }
 
 // === Разбор файла мода ===
 
 // Колбек получает секцию (пустая до первого заголовка), ключ и значение.
-typedef void (*ModPairCallback)(void* context,
-    ByteSlice section, ByteSlice key, ByteSlice value);
+typedef void (*ModPairCallback)(void *context, ByteSlice section, ByteSlice key, ByteSlice value);
 
 // Разбирает файл: первая значимая строка обязана быть заголовком
 // `LAIUE MOD <версия>` с версией не новее поддерживаемой.
-static bool ParseModFile(const uint8_t* bytes, uint32_t length,
-    ModPairCallback callback, void* context)
+static bool ParseModFile(const uint8_t *bytes, uint32_t length, ModPairCallback callback,
+                         void *context, uint32_t *outFormatVersion)
 {
-    ByteSlice section = { NULL, 0 };
+    ByteSlice section = {NULL, 0};
     bool headerSeen = false;
+    uint32_t formatVersion = 0;
 
     uint32_t offset = 0;
-    if (length >= 3 && bytes[0] == 0xEFu && bytes[1] == 0xBBu
-        && bytes[2] == 0xBFu)
+    if (length >= 3 && bytes[0] == 0xEFu && bytes[1] == 0xBBu && bytes[2] == 0xBFu)
     {
         offset = 3; // BOM
     }
@@ -358,10 +221,10 @@ static bool ParseModFile(const uint8_t* bytes, uint32_t length,
     while (offset < length)
     {
         uint32_t lineEnd = offset;
-        while (lineEnd < length && bytes[lineEnd] != '\n') ++lineEnd;
+        while (lineEnd < length && bytes[lineEnd] != '\n')
+            ++lineEnd;
 
-        ByteSlice line = SliceTrim(
-            (ByteSlice){ bytes + offset, lineEnd - offset });
+        ByteSlice line = SliceTrim((ByteSlice){bytes + offset, lineEnd - offset});
         offset = lineEnd + 1;
 
         if (line.length == 0 || line.data[0] == '#')
@@ -372,15 +235,13 @@ static bool ParseModFile(const uint8_t* bytes, uint32_t length,
         if (!headerSeen)
         {
             // "LAIUE MOD <n>"
-            if (line.length < 11
-                || !SliceEqualsAscii((ByteSlice){ line.data, 9 }, "laiue mod"))
+            if (line.length < 11 || !SliceEqualsAscii((ByteSlice){line.data, 9}, "laiue mod"))
             {
                 return false;
             }
-            int32_t version;
-            if (!SliceParseInt(SliceTrim(
-                    (ByteSlice){ line.data + 9, line.length - 9 }), &version)
-                || version < 1 || version > MOD_FORMAT_VERSION)
+            if (!SliceParseUint32(SliceTrim((ByteSlice){line.data + 9, line.length - 9}),
+                                  &formatVersion) ||
+                formatVersion < 1 || formatVersion > MOD_FORMAT_VERSION)
             {
                 return false;
             }
@@ -392,37 +253,66 @@ static bool ParseModFile(const uint8_t* bytes, uint32_t length,
         {
             if (line.data[line.length - 1] == ']' && line.length >= 3)
             {
-                section = SliceTrim(
-                    (ByteSlice){ line.data + 1, line.length - 2 });
+                section = SliceTrim((ByteSlice){line.data + 1, line.length - 2});
             }
             continue;
         }
 
         uint32_t equals = 0;
-        while (equals < line.length && line.data[equals] != '=') ++equals;
+        while (equals < line.length && line.data[equals] != '=')
+            ++equals;
         if (equals == 0 || equals == line.length)
         {
             continue;
         }
 
-        ByteSlice key = SliceTrim((ByteSlice){ line.data, equals });
-        ByteSlice value = SliceTrim((ByteSlice){
-            line.data + equals + 1, line.length - equals - 1 });
+        ByteSlice key = SliceTrim((ByteSlice){line.data, equals});
+        ByteSlice value = SliceTrim((ByteSlice){line.data + equals + 1, line.length - equals - 1});
         if (key.length > 0)
         {
             callback(context, section, key, value);
         }
     }
 
+    if (headerSeen && outFormatVersion != NULL)
+    {
+        *outFormatVersion = formatVersion;
+    }
     return headerSeen;
 }
 
 // === Потребитель 1: манифест (имя, версия, требуемая игра) ===
 
-static void ManifestCallback(void* context,
-    ByteSlice section, ByteSlice key, ByteSlice value)
+typedef struct ManifestParseState
 {
-    ModEntry* entry = context;
+    ModEntry *entry;
+    bool valid;
+    bool legacyEntrySeen;
+    bool windowsEntrySeen;
+    bool linuxGnuEntrySeen;
+    bool linuxMuslEntrySeen;
+} ManifestParseState;
+
+static void ParseNativeEntry(ManifestParseState *state, ByteSlice value, bool *seen,
+                             wchar_t *destination)
+{
+    if (*seen)
+    {
+        state->valid = false;
+        return;
+    }
+    *seen = true;
+    SliceToWide(value, destination, MODS_NAME_CAPACITY);
+    if (destination[0] == L'\0')
+    {
+        state->valid = false;
+    }
+}
+
+static void ManifestCallback(void *context, ByteSlice section, ByteSlice key, ByteSlice value)
+{
+    ManifestParseState *state = context;
+    ModEntry *entry = state->entry;
     if (section.length == 0)
     {
         if (SliceEqualsAscii(key, "name"))
@@ -443,27 +333,43 @@ static void ManifestCallback(void* context,
         }
         else if (SliceEqualsAscii(key, "side"))
         {
-            if (SliceEqualsAscii(value, "client")) entry->side = MOD_SIDE_CLIENT;
-            else if (SliceEqualsAscii(value, "server")) entry->side = MOD_SIDE_SERVER;
-            else if (SliceEqualsAscii(value, "both")) entry->side = MOD_SIDE_BOTH;
-            else entry->sideValid = false;
+            if (SliceEqualsAscii(value, "client"))
+                entry->side = MOD_SIDE_CLIENT;
+            else if (SliceEqualsAscii(value, "server"))
+                entry->side = MOD_SIDE_SERVER;
+            else if (SliceEqualsAscii(value, "both"))
+                entry->side = MOD_SIDE_BOTH;
+            else
+                entry->sideValid = false;
         }
         return;
     }
 
-    // DLL-мод: имя точки входа и требуемая версия API SDK.
+    // Нативный мод: платформенные точки входа и версия API SDK.
     if (SliceEqualsAscii(section, "native"))
     {
         if (SliceEqualsAscii(key, "entry"))
         {
-            SliceToWide(value, entry->entryDll, MODS_NAME_CAPACITY);
+            ParseNativeEntry(state, value, &state->legacyEntrySeen, entry->entryWindowsX86_64);
+        }
+        else if (SliceEqualsAscii(key, "entry_windows_x86_64"))
+        {
+            ParseNativeEntry(state, value, &state->windowsEntrySeen, entry->entryWindowsX86_64);
+        }
+        else if (SliceEqualsAscii(key, "entry_linux_x86_64_gnu"))
+        {
+            ParseNativeEntry(state, value, &state->linuxGnuEntrySeen, entry->entryLinuxX86_64Gnu);
+        }
+        else if (SliceEqualsAscii(key, "entry_linux_x86_64_musl"))
+        {
+            ParseNativeEntry(state, value, &state->linuxMuslEntrySeen, entry->entryLinuxX86_64Musl);
         }
         else if (SliceEqualsAscii(key, "api"))
         {
-            int32_t api;
-            if (SliceParseInt(value, &api) && api > 0)
+            uint32_t api;
+            if (SliceParseUint32(value, &api) && api > 0)
             {
-                entry->requiredApi = (uint32_t)api;
+                entry->requiredApi = api;
             }
         }
     }
@@ -471,7 +377,7 @@ static void ManifestCallback(void* context,
 
 // game = MAJOR.MINOR: совместим, если мажор совпадает, а минор не новее
 // текущего (0.x трактуется строго, как и положено до 1.0).
-static bool GameVersionCompatible(const wchar_t* required)
+static bool GameVersionCompatible(const wchar_t *required)
 {
     if (required[0] == L'\0')
     {
@@ -507,11 +413,11 @@ static bool GameVersionCompatible(const wchar_t* required)
 
 // === Состояние ===
 
-void ModsInit(ModsState* mods, const wchar_t* enabledFileName)
+void ModsInit(ModsState *mods, const wchar_t *enabledFileName)
 {
     memset(mods, 0, sizeof(*mods));
-    const wchar_t* source = enabledFileName != NULL && enabledFileName[0] != L'\0'
-        ? enabledFileName : L"enabled.txt";
+    const wchar_t *source =
+        enabledFileName != NULL && enabledFileName[0] != L'\0' ? enabledFileName : L"enabled.txt";
     uint32_t i = 0;
     while (source[i] != L'\0' && i + 1 < MODS_NAME_CAPACITY)
     {
@@ -521,14 +427,15 @@ void ModsInit(ModsState* mods, const wchar_t* enabledFileName)
     mods->enabledFileName[i] = L'\0';
 }
 
-static ModEntry* FindEntry(ModsState* mods, const wchar_t* fileName)
+static ModEntry *FindEntry(ModsState *mods, const wchar_t *fileName)
 {
     for (uint32_t i = 0; i < mods->count; ++i)
     {
-        const wchar_t* a = mods->entries[i].fileName;
-        const wchar_t* b = fileName;
+        const wchar_t *a = mods->entries[i].fileName;
+        const wchar_t *b = fileName;
         uint32_t index = 0;
-        while (a[index] != L'\0' && a[index] == b[index]) ++index;
+        while (a[index] != L'\0' && a[index] == b[index])
+            ++index;
         if (a[index] == b[index])
         {
             return &mods->entries[i];
@@ -538,35 +445,112 @@ static ModEntry* FindEntry(ModsState* mods, const wchar_t* fileName)
 }
 
 // Путь к манифесту mod.lm внутри каталога пака.
-static bool BuildManifestPath(const ModEntry* entry,
-    wchar_t* path, uint32_t capacity)
+static bool BuildManifestPath(const ModEntry *entry, wchar_t *path, uint32_t capacity)
 {
-    return LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK, entry->fileName,
-        MOD_PACK_MANIFEST_NAME, path, capacity);
+    return LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK, entry->fileName, MOD_PACK_MANIFEST_NAME,
+                                 path, capacity);
+}
+
+static bool ManifestNativeEntriesValid(const ManifestParseState *state, uint32_t formatVersion)
+{
+    if (!state->valid || (state->legacyEntrySeen && state->windowsEntrySeen))
+    {
+        return false;
+    }
+
+    if (formatVersion == 1u)
+    {
+        return state->legacyEntrySeen && !state->windowsEntrySeen && !state->linuxGnuEntrySeen &&
+               !state->linuxMuslEntrySeen;
+    }
+
+    return formatVersion == 2u && (state->legacyEntrySeen || state->windowsEntrySeen ||
+                                   state->linuxGnuEntrySeen || state->linuxMuslEntrySeen);
+}
+
+static void CopyNativeEntry(wchar_t destination[MODS_NAME_CAPACITY],
+                            const wchar_t source[MODS_NAME_CAPACITY])
+{
+    uint32_t index = 0;
+    while (source[index] != L'\0' && index + 1 < MODS_NAME_CAPACITY)
+    {
+        destination[index] = source[index];
+        ++index;
+    }
+    destination[index] = L'\0';
+}
+
+static bool SelectCurrentPlatformEntry(ModEntry *entry)
+{
+    const wchar_t *selected = NULL;
+#if defined(_WIN32)
+    selected = entry->entryWindowsX86_64;
+#elif defined(__linux__) && defined(LAIUE_LINUX_LIBC_MUSL)
+    selected = entry->entryLinuxX86_64Musl;
+#elif defined(__linux__)
+    selected = entry->entryLinuxX86_64Gnu;
+#endif
+    if (selected == NULL || selected[0] == L'\0')
+    {
+        entry->entryDll[0] = L'\0';
+        return false;
+    }
+    CopyNativeEntry(entry->entryDll, selected);
+    return true;
+}
+
+static bool HashDeclaredArtifact(const ModEntry *entry, const wchar_t *artifactName, wchar_t *path,
+                                 uint8_t aggregate[MODS_CONTENT_HASH_SIZE])
+{
+    if (artifactName[0] == L'\0')
+    {
+        return true;
+    }
+
+    uint8_t artifactHash[MODS_CONTENT_HASH_SIZE];
+    uint8_t combined[MODS_CONTENT_HASH_SIZE];
+    if (!LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK, entry->fileName, artifactName, path,
+                               LAIUE_CONTENT_PATH_CAPACITY) ||
+        !HashFile(path, artifactHash) || !CombineHashes(aggregate, artifactHash, combined))
+    {
+        return false;
+    }
+    memcpy(aggregate, combined, MODS_CONTENT_HASH_SIZE);
+    return true;
+}
+
+static bool HashDeclaredArtifacts(const ModEntry *entry, wchar_t *path,
+                                  const uint8_t manifestHash[MODS_CONTENT_HASH_SIZE],
+                                  uint8_t output[MODS_CONTENT_HASH_SIZE])
+{
+    memcpy(output, manifestHash, MODS_CONTENT_HASH_SIZE);
+    // Порядок является частью wire-совместимости и не зависит от
+    // платформы, на которой каталог сканируется.
+    return HashDeclaredArtifact(entry, entry->entryWindowsX86_64, path, output) &&
+           HashDeclaredArtifact(entry, entry->entryLinuxX86_64Gnu, path, output) &&
+           HashDeclaredArtifact(entry, entry->entryLinuxX86_64Musl, path, output);
 }
 
 // Пересчёт включённых от файла enabled.txt (источник истины порядка).
-static void RecomputeEnabled(ModsState* mods)
+static void RecomputeEnabled(ModsState *mods)
 {
     mods->enabledCount = 0;
     for (uint32_t i = 0; i < mods->count; ++i)
     {
-        ModEntry* entry = &mods->entries[i];
+        ModEntry *entry = &mods->entries[i];
         entry->enabled = false;
-        entry->runtimeStatus = entry->compatible
-            ? MOD_RUNTIME_DISABLED : MOD_RUNTIME_INCOMPATIBLE;
+        entry->runtimeStatus = entry->compatible ? MOD_RUNTIME_DISABLED : MOD_RUNTIME_INCOMPATIBLE;
         entry->initResult = 0;
     }
 
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
     if (path == NULL)
     {
         mods->revision++;
         return;
     }
 
-    uint8_t* bytes = NULL;
+    uint8_t *bytes = NULL;
     uint32_t length = 0;
     if (BuildEnabledPath(mods, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
@@ -579,9 +563,9 @@ static void RecomputeEnabled(ModsState* mods)
         while (offset < length)
         {
             uint32_t lineEnd = offset;
-            while (lineEnd < length && bytes[lineEnd] != '\n') ++lineEnd;
-            ByteSlice line = SliceTrim(
-                (ByteSlice){ bytes + offset, lineEnd - offset });
+            while (lineEnd < length && bytes[lineEnd] != '\n')
+                ++lineEnd;
+            ByteSlice line = SliceTrim((ByteSlice){bytes + offset, lineEnd - offset});
             offset = lineEnd + 1;
             if (line.length == 0 || line.data[0] == '#')
             {
@@ -591,7 +575,7 @@ static void RecomputeEnabled(ModsState* mods)
             wchar_t fileName[MODS_NAME_CAPACITY];
             SliceToWide(line, fileName, MODS_NAME_CAPACITY);
 
-            ModEntry* entry = FindEntry(mods, fileName);
+            ModEntry *entry = FindEntry(mods, fileName);
             if (entry == NULL || !entry->compatible || entry->enabled)
             {
                 continue; // удалённый, несовместимый или повтор строки
@@ -599,18 +583,17 @@ static void RecomputeEnabled(ModsState* mods)
             entry->enabled = true;
             // Оптимистично LOADED: факт уточнит ближайший ModHostSync.
             entry->runtimeStatus = MOD_RUNTIME_LOADED;
-            mods->enabledOrder[mods->enabledCount++] =
-                (uint32_t)(entry - mods->entries);
+            mods->enabledOrder[mods->enabledCount++] = (uint32_t)(entry - mods->entries);
         }
-        HeapFree(GetProcessHeap(), 0, bytes);
+        PlatformFree(bytes);
     }
 
-    HeapFree(GetProcessHeap(), 0, path);
+    PlatformFree(path);
     mods->revision++;
 }
 
 // Собирает список DLL-модов: каталоги .lmp с манифестом mod.lm.
-static void CollectEntries(ModsState* mods)
+static void CollectEntries(ModsState *mods)
 {
     LaiueContentList list;
     if (!LaiueContentEnumerate(LAIUE_CONTENT_MOD_PACK, &list))
@@ -618,45 +601,45 @@ static void CollectEntries(ModsState* mods)
         return;
     }
 
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
 
-    for (uint32_t i = 0; i < list.count
-        && mods->count < MODS_MAX_ENTRIES; ++i)
+    for (uint32_t i = 0; i < list.count && mods->count < MODS_MAX_ENTRIES; ++i)
     {
-        ModEntry* entry = &mods->entries[mods->count];
+        ModEntry *entry = &mods->entries[mods->count];
         memset(entry, 0, sizeof(*entry));
         entry->side = MOD_SIDE_BOTH;
         entry->sideValid = true;
 
         // Имя каталога (уже проверено каталогом на безопасность).
         uint32_t index = 0;
-        while (list.entries[i].name[index] != L'\0'
-            && index + 1 < MODS_NAME_CAPACITY)
+        while (list.entries[i].name[index] != L'\0' && index + 1 < MODS_NAME_CAPACITY)
         {
             entry->fileName[index] = list.entries[i].name[index];
             ++index;
         }
         entry->fileName[index] = L'\0';
 
-        // Манифест: имя, версия, требуемая игра, [native] entry/api.
+        // Манифест: метаданные и платформенные [native] entries.
         bool parsed = false;
         bool manifestHashed = false;
+        ManifestParseState manifestState;
+        memset(&manifestState, 0, sizeof(manifestState));
+        manifestState.entry = entry;
+        manifestState.valid = true;
         uint8_t manifestHash[MODS_CONTENT_HASH_SIZE];
-        if (path != NULL
-            && BuildManifestPath(entry, path, LAIUE_CONTENT_PATH_CAPACITY))
+        if (path != NULL && BuildManifestPath(entry, path, LAIUE_CONTENT_PATH_CAPACITY))
         {
             uint32_t length = 0;
-            uint8_t* bytes = ReadWholeFile(path, &length);
+            uint8_t *bytes = ReadWholeFile(path, &length);
             if (bytes != NULL)
             {
-                parsed = ParseModFile(bytes, length,
-                    ManifestCallback, entry);
+                parsed = ParseModFile(bytes, length, ManifestCallback, &manifestState,
+                                      &entry->manifestVersion);
                 manifestHashed = HashBuffer(bytes, length, manifestHash);
-                HeapFree(GetProcessHeap(), 0, bytes);
+                PlatformFree(bytes);
             }
         }
-        if (!parsed)
+        if (!parsed || !ManifestNativeEntriesValid(&manifestState, entry->manifestVersion))
         {
             continue; // не мод формата LAIUE MOD — пропускаем
         }
@@ -664,48 +647,37 @@ static void CollectEntries(ModsState* mods)
         if (entry->displayName[0] == L'\0')
         {
             // Без name = показываем имя файла.
-            for (index = 0; entry->fileName[index] != L'\0'
-                && index + 1 < MODS_NAME_CAPACITY; ++index)
+            for (index = 0; entry->fileName[index] != L'\0' && index + 1 < MODS_NAME_CAPACITY;
+                 ++index)
             {
                 entry->displayName[index] = entry->fileName[index];
             }
             entry->displayName[index] = L'\0';
         }
 
-        // Hash включает исполняемый файл: одинаковые id/version, но разные
-        // DLL не считаются одним сетевым модом.
-        bool dllHashed = false;
-        uint8_t dllHash[MODS_CONTENT_HASH_SIZE];
-        if (path != NULL && entry->entryDll[0] != L'\0'
-            && LaiueContentBuildPath(LAIUE_CONTENT_MOD_PACK,
-                entry->fileName, entry->entryDll, path,
-                LAIUE_CONTENT_PATH_CAPACITY))
-        {
-            dllHashed = HashFile(path, dllHash)
-                && manifestHashed
-                && CombineHashes(manifestHash, dllHash, entry->contentHash);
-        }
+        bool platformEntrySelected = SelectCurrentPlatformEntry(entry);
+        // Строгий v2 pack обязан содержать каждый объявленный artifact.
+        // Это даёт один fingerprint полного pack на Windows/glibc/musl.
+        bool artifactsHashed = path != NULL && manifestHashed &&
+                               HashDeclaredArtifacts(entry, path, manifestHash, entry->contentHash);
 
-        // Совместимость: версия игры, стабильный id, DLL и API SDK.
-        entry->compatible = GameVersionCompatible(entry->requiredGame)
-            && entry->sideValid
-            && entry->id[0] != '\0'
-            && entry->version[0] != L'\0'
-            && entry->entryDll[0] != L'\0'
-            && dllHashed
-            && entry->requiredApi >= 1u
-            && entry->requiredApi <= LAIUE_MOD_API_VERSION;
+        // Совместимость: версия игры, стабильный id, native artifact
+        // текущей платформы, полный hash и версия API SDK.
+        entry->compatible = GameVersionCompatible(entry->requiredGame) && entry->sideValid &&
+                            entry->id[0] != '\0' && entry->version[0] != L'\0' &&
+                            platformEntrySelected && artifactsHashed && entry->requiredApi >= 1u &&
+                            entry->requiredApi <= LAIUE_MOD_API_VERSION;
         mods->count++;
     }
 
     if (path != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, path);
+        PlatformFree(path);
     }
     LaiueContentListRelease(&list);
 }
 
-void ModsRefresh(ModsState* mods)
+void ModsRefresh(ModsState *mods)
 {
     mods->count = 0;
     CollectEntries(mods);
@@ -714,8 +686,9 @@ void ModsRefresh(ModsState* mods)
         for (uint32_t j = i + 1; j < mods->count; ++j)
         {
             uint32_t c = 0;
-            while (mods->entries[i].id[c] != '\0'
-                && mods->entries[i].id[c] == mods->entries[j].id[c]) ++c;
+            while (mods->entries[i].id[c] != '\0' &&
+                   mods->entries[i].id[c] == mods->entries[j].id[c])
+                ++c;
             if (mods->entries[i].id[c] == mods->entries[j].id[c])
             {
                 mods->entries[i].compatible = false;
@@ -726,36 +699,34 @@ void ModsRefresh(ModsState* mods)
     RecomputeEnabled(mods);
 }
 
-static bool WriteEnabledFile(const ModsState* mods,
-    const wchar_t* toggleName, bool enable)
+static bool WriteEnabledFile(const ModsState *mods, const wchar_t *toggleName, bool enable)
 {
     // Новый порядок: старые включённые (кроме выключаемого) в прежнем
     // порядке — их даёт текущее состояние entries + порядок enabled.txt,
     // который уже отражён флагами. Для простоты и стабильности порядок
     // берём как: все ныне включённые в порядке каталога... нет — порядок
     // важен. Поэтому: читаем enabled.txt, фильтруем, дописываем.
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (path == NULL
-        || !BuildEnabledPath(mods, path, LAIUE_CONTENT_PATH_CAPACITY))
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
+    if (path == NULL || !BuildEnabledPath(mods, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
-        if (path != NULL) HeapFree(GetProcessHeap(), 0, path);
+        if (path != NULL)
+            PlatformFree(path);
         return false;
     }
 
     // Собираем новый файл в UTF-8 буфере.
-    uint32_t capacity = MODS_MAX_ENTRIES * (MODS_NAME_CAPACITY * 3 + 2) + 64;
-    uint8_t* output = HeapAlloc(GetProcessHeap(), 0, capacity);
+    uint32_t capacity = MODS_MAX_ENTRIES * (MODS_NAME_UTF8_CAPACITY + 1U) + 64U;
+    uint8_t *output = PlatformAllocate(capacity, false);
     if (output == NULL)
     {
-        HeapFree(GetProcessHeap(), 0, path);
+        PlatformFree(path);
         return false;
     }
     uint32_t outputLength = 0;
     bool outputValid = true;
 
     uint32_t existingLength = 0;
-    uint8_t* existing = ReadWholeFile(path, &existingLength);
+    uint8_t *existing = ReadWholeFile(path, &existingLength);
     if (existing != NULL)
     {
         uint32_t offset = 0;
@@ -766,8 +737,7 @@ static bool WriteEnabledFile(const ModsState* mods,
             {
                 ++lineEnd;
             }
-            ByteSlice line = SliceTrim(
-                (ByteSlice){ existing + offset, lineEnd - offset });
+            ByteSlice line = SliceTrim((ByteSlice){existing + offset, lineEnd - offset});
             offset = lineEnd + 1;
             if (line.length == 0)
             {
@@ -800,19 +770,19 @@ static bool WriteEnabledFile(const ModsState* mods,
                 break;
             }
         }
-        HeapFree(GetProcessHeap(), 0, existing);
+        PlatformFree(existing);
     }
 
     if (enable)
     {
         // Включение — в конец порядка (последний побеждает в конфликтах).
-        char utf8[MODS_NAME_CAPACITY * 3];
-        int written = WideCharToMultiByte(CP_UTF8, 0, toggleName, -1,
-            utf8, (int)sizeof(utf8), NULL, NULL);
-        if (written > 1 && outputLength + (uint32_t)written <= capacity)
+        char utf8[MODS_NAME_UTF8_CAPACITY];
+        uint32_t written = 0;
+        if (PlatformWideToUtf8(toggleName, utf8, sizeof(utf8), &written) && written > 0 &&
+            outputLength + written + 1U <= capacity)
         {
-            memcpy(output + outputLength, utf8, (size_t)written - 1);
-            outputLength += (uint32_t)written - 1;
+            memcpy(output + outputLength, utf8, written);
+            outputLength += written;
             output[outputLength++] = '\n';
         }
         else
@@ -821,21 +791,20 @@ static bool WriteEnabledFile(const ModsState* mods,
         }
     }
 
-    bool succeeded = outputValid
-        && WriteFileAtomically(path, output, outputLength);
+    bool succeeded = outputValid && WriteFileAtomically(path, output, outputLength);
 
-    HeapFree(GetProcessHeap(), 0, output);
-    HeapFree(GetProcessHeap(), 0, path);
+    PlatformFree(output);
+    PlatformFree(path);
     return succeeded;
 }
 
-bool ModsSetEnabled(ModsState* mods, uint32_t index, bool enabled)
+bool ModsSetEnabled(ModsState *mods, uint32_t index, bool enabled)
 {
     if (index >= mods->count)
     {
         return false;
     }
-    ModEntry* entry = &mods->entries[index];
+    ModEntry *entry = &mods->entries[index];
     if (!entry->compatible && enabled)
     {
         return false;
@@ -854,15 +823,14 @@ bool ModsSetEnabled(ModsState* mods, uint32_t index, bool enabled)
     return true;
 }
 
-static bool CopyVersionToUtf8(const wchar_t* source, char* destination)
+static bool CopyVersionToUtf8(const wchar_t *source, char *destination)
 {
-    int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        source, -1, destination, MODS_VERSION_CAPACITY, NULL, NULL);
-    return written > 1;
+    uint32_t written = 0;
+    return PlatformWideToUtf8(source, destination, MODS_VERSION_CAPACITY, &written) && written > 0;
 }
 
-bool ModsBuildCompatibilitySet(const ModsState* mods,
-    ModCompatibilityEntry* output, uint32_t capacity, uint32_t* outCount)
+bool ModsBuildCompatibilitySet(const ModsState *mods, ModCompatibilityEntry *output,
+                               uint32_t capacity, uint32_t *outCount)
 {
     if (mods == NULL || outCount == NULL)
     {
@@ -871,9 +839,8 @@ bool ModsBuildCompatibilitySet(const ModsState* mods,
     uint32_t count = 0;
     for (uint32_t i = 0; i < mods->enabledCount; ++i)
     {
-        const ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
-        if (entry->enabled && entry->compatible
-            && entry->side != MOD_SIDE_CLIENT)
+        const ModEntry *entry = &mods->entries[mods->enabledOrder[i]];
+        if (entry->enabled && entry->compatible && entry->side != MOD_SIDE_CLIENT)
         {
             ++count;
         }
@@ -887,13 +854,12 @@ bool ModsBuildCompatibilitySet(const ModsState* mods,
     uint32_t write = 0;
     for (uint32_t i = 0; i < mods->enabledCount; ++i)
     {
-        const ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
-        if (!entry->enabled || !entry->compatible
-            || entry->side == MOD_SIDE_CLIENT)
+        const ModEntry *entry = &mods->entries[mods->enabledOrder[i]];
+        if (!entry->enabled || !entry->compatible || entry->side == MOD_SIDE_CLIENT)
         {
             continue;
         }
-        ModCompatibilityEntry* item = &output[write++];
+        ModCompatibilityEntry *item = &output[write++];
         memset(item, 0, sizeof(*item));
         uint32_t c = 0;
         while (entry->id[c] != '\0' && c + 1 < MODS_ID_CAPACITY)
@@ -905,39 +871,38 @@ bool ModsBuildCompatibilitySet(const ModsState* mods,
         {
             return false;
         }
-        memcpy(item->contentHash, entry->contentHash,
-            MODS_CONTENT_HASH_SIZE);
+        memcpy(item->contentHash, entry->contentHash, MODS_CONTENT_HASH_SIZE);
     }
 
     return true;
 }
 
-static bool CompatibilityMatchesEntry(const ModCompatibilityEntry* required,
-    const ModEntry* entry)
+static bool CompatibilityMatchesEntry(const ModCompatibilityEntry *required, const ModEntry *entry)
 {
     uint32_t i = 0;
-    while (required->id[i] != '\0' && required->id[i] == entry->id[i]) ++i;
-    if (required->id[i] != entry->id[i]
-        || !HashesEqual(required->contentHash, entry->contentHash))
+    while (required->id[i] != '\0' && required->id[i] == entry->id[i])
+        ++i;
+    if (required->id[i] != entry->id[i] || !HashesEqual(required->contentHash, entry->contentHash))
     {
         return false;
     }
     char version[MODS_VERSION_CAPACITY];
-    if (!CopyVersionToUtf8(entry->version, version)) return false;
+    if (!CopyVersionToUtf8(entry->version, version))
+        return false;
     i = 0;
-    while (required->version[i] != '\0'
-        && required->version[i] == version[i]) ++i;
+    while (required->version[i] != '\0' && required->version[i] == version[i])
+        ++i;
     return required->version[i] == version[i];
 }
 
-static const ModEntry* FindCompatibilityEntry(const ModsState* mods,
-    const ModCompatibilityEntry* required)
+static const ModEntry *FindCompatibilityEntry(const ModsState *mods,
+                                              const ModCompatibilityEntry *required)
 {
     for (uint32_t i = 0; i < mods->count; ++i)
     {
-        const ModEntry* entry = &mods->entries[i];
-        if (entry->compatible && entry->side != MOD_SIDE_CLIENT
-            && CompatibilityMatchesEntry(required, entry))
+        const ModEntry *entry = &mods->entries[i];
+        if (entry->compatible && entry->side != MOD_SIDE_CLIENT &&
+            CompatibilityMatchesEntry(required, entry))
         {
             return entry;
         }
@@ -945,11 +910,11 @@ static const ModEntry* FindCompatibilityEntry(const ModsState* mods,
     return NULL;
 }
 
-bool ModsCanApplyServerCompatibilitySet(const ModsState* mods,
-    const ModCompatibilityEntry* required, uint32_t count)
+bool ModsCanApplyServerCompatibilitySet(const ModsState *mods,
+                                        const ModCompatibilityEntry *required, uint32_t count)
 {
-    if (mods == NULL || count > MODS_MAX_ENTRIES
-        || (count != 0 && required == NULL)) return false;
+    if (mods == NULL || count > MODS_MAX_ENTRIES || (count != 0 && required == NULL))
+        return false;
     for (uint32_t i = 0; i < count; ++i)
     {
         if (FindCompatibilityEntry(mods, &required[i]) == NULL)
@@ -960,45 +925,47 @@ bool ModsCanApplyServerCompatibilitySet(const ModsState* mods,
     return true;
 }
 
-static bool AppendEnabledName(uint8_t* output, uint32_t capacity,
-    uint32_t* length, const wchar_t* name)
+static bool AppendEnabledName(uint8_t *output, uint32_t capacity, uint32_t *length,
+                              const wchar_t *name)
 {
-    char utf8[MODS_NAME_CAPACITY * 3];
-    int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        name, -1, utf8, (int)sizeof(utf8), NULL, NULL);
-    if (written <= 1 || *length + (uint32_t)written > capacity)
+    char utf8[MODS_NAME_UTF8_CAPACITY];
+    uint32_t written = 0;
+    if (!PlatformWideToUtf8(name, utf8, sizeof(utf8), &written) || written == 0 ||
+        *length + written + 1U > capacity)
     {
         return false;
     }
-    memcpy(output + *length, utf8, (uint32_t)written - 1u);
-    *length += (uint32_t)written - 1u;
+    memcpy(output + *length, utf8, written);
+    *length += written;
     output[(*length)++] = '\n';
     return true;
 }
 
-bool ModsApplyServerCompatibilitySet(ModsState* mods,
-    const ModCompatibilityEntry* required, uint32_t count)
+bool ModsApplyServerCompatibilitySet(ModsState *mods, const ModCompatibilityEntry *required,
+                                     uint32_t count)
 {
     if (!ModsCanApplyServerCompatibilitySet(mods, required, count))
     {
         return false;
     }
-    const ModEntry* resolved[MODS_MAX_ENTRIES];
+    const ModEntry *resolved[MODS_MAX_ENTRIES];
     for (uint32_t i = 0; i < count; ++i)
     {
         resolved[i] = FindCompatibilityEntry(mods, &required[i]);
-        if (resolved[i] == NULL) return false;
+        if (resolved[i] == NULL)
+            return false;
     }
 
-    uint32_t capacity = MODS_MAX_ENTRIES * (MODS_NAME_CAPACITY * 3 + 1u);
-    uint8_t* output = HeapAlloc(GetProcessHeap(), 0, capacity);
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t));
-    if (output == NULL || path == NULL
-        || !BuildEnabledPath(mods, path, LAIUE_CONTENT_PATH_CAPACITY))
+    uint32_t capacity = MODS_MAX_ENTRIES * (MODS_NAME_UTF8_CAPACITY + 1U);
+    uint8_t *output = PlatformAllocate(capacity, false);
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
+    if (output == NULL || path == NULL ||
+        !BuildEnabledPath(mods, path, LAIUE_CONTENT_PATH_CAPACITY))
     {
-        if (output != NULL) HeapFree(GetProcessHeap(), 0, output);
-        if (path != NULL) HeapFree(GetProcessHeap(), 0, path);
+        if (output != NULL)
+            PlatformFree(output);
+        if (path != NULL)
+            PlatformFree(path);
         return false;
     }
 
@@ -1007,22 +974,22 @@ bool ModsApplyServerCompatibilitySet(ModsState* mods,
     // Client-only состав остаётся пользовательским и не зависит от сервера.
     for (uint32_t i = 0; i < mods->enabledCount && succeeded; ++i)
     {
-        ModEntry* entry = &mods->entries[mods->enabledOrder[i]];
+        ModEntry *entry = &mods->entries[mods->enabledOrder[i]];
         if (entry->enabled && entry->side == MOD_SIDE_CLIENT)
         {
-            succeeded = AppendEnabledName(output, capacity,
-                &length, entry->fileName);
+            succeeded = AppendEnabledName(output, capacity, &length, entry->fileName);
         }
     }
     for (uint32_t i = 0; i < count && succeeded; ++i)
     {
-        succeeded = AppendEnabledName(output, capacity,
-            &length, resolved[i]->fileName);
+        succeeded = AppendEnabledName(output, capacity, &length, resolved[i]->fileName);
     }
 
-    if (succeeded) succeeded = WriteFileAtomically(path, output, length);
-    HeapFree(GetProcessHeap(), 0, path);
-    HeapFree(GetProcessHeap(), 0, output);
-    if (succeeded) RecomputeEnabled(mods);
+    if (succeeded)
+        succeeded = WriteFileAtomically(path, output, length);
+    PlatformFree(path);
+    PlatformFree(output);
+    if (succeeded)
+        RecomputeEnabled(mods);
     return succeeded;
 }

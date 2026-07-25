@@ -8,13 +8,20 @@
 #define INPUT_PAYLOAD_SIZE 9U
 #define EDIT_PAYLOAD_SIZE 8U
 #define PLAYER_STATE_PAYLOAD_SIZE 37U
-#define BLOCK_DELTA_PAYLOAD_SIZE 29U
+#define BLOCK_DELTA_PAYLOAD_SIZE 37U
 #define MOD_LIST_PAYLOAD_SIZE 3U
 #define REJECT_PAYLOAD_SIZE 1U
 #define CONTENT_BEGIN_PAYLOAD_SIZE 40U
 #define BLOCK_DROP_PAYLOAD_SIZE 29U
 #define DROP_REMOVE_PAYLOAD_SIZE 4U
 #define INVENTORY_PAYLOAD_SIZE (1U + LAIUE_PROTOCOL_INVENTORY_SLOTS * 3U)
+#define SNAPSHOT_BEGIN_PAYLOAD_SIZE 44U
+#define SNAPSHOT_CHUNK_HEADER_SIZE 38U
+#define SNAPSHOT_CHUNK_EDIT_SIZE 4U
+#define SNAPSHOT_END_PAYLOAD_SIZE 16U
+#define CHUNK_RESYNC_PAYLOAD_SIZE 32U
+#define PEER_ID_PAYLOAD_SIZE 4U
+#define WORLD_TIME_PAYLOAD_SIZE 8U
 
 #define ANGLE_PI 3.14159265358979323846f
 #define PITCH_LIMIT 1.57079632679489661923f
@@ -501,31 +508,34 @@ uint32_t LaiueProtocolEncodeBlockDelta(uint8_t *output, uint32_t capacity,
                                        const LaiueProtocolBlockDelta *delta)
 {
     if (output == NULL || delta == NULL || capacity < BLOCK_DELTA_PAYLOAD_SIZE ||
-        delta->replacement > 2U)
+        delta->revision == 0 || delta->replacement > 2U)
     {
         return 0;
     }
     WriteU32(output, delta->serverTick);
-    WriteU64(output + 4, (uint64_t)delta->block[0]);
-    WriteU64(output + 12, (uint64_t)delta->block[1]);
-    WriteU64(output + 20, (uint64_t)delta->block[2]);
-    output[28] = delta->replacement;
+    WriteU64(output + 4, delta->revision);
+    WriteU64(output + 12, (uint64_t)delta->block[0]);
+    WriteU64(output + 20, (uint64_t)delta->block[1]);
+    WriteU64(output + 28, (uint64_t)delta->block[2]);
+    output[36] = delta->replacement;
     return BLOCK_DELTA_PAYLOAD_SIZE;
 }
 
 bool LaiueProtocolDecodeBlockDelta(const uint8_t *payload, uint32_t size,
                                    LaiueProtocolBlockDelta *outDelta)
 {
-    if (payload == NULL || outDelta == NULL || size != BLOCK_DELTA_PAYLOAD_SIZE || payload[28] > 2U)
+    if (payload == NULL || outDelta == NULL ||
+        size != BLOCK_DELTA_PAYLOAD_SIZE || payload[36] > 2U)
     {
         return false;
     }
     outDelta->serverTick = ReadU32(payload);
-    outDelta->block[0] = (int64_t)ReadU64(payload + 4);
-    outDelta->block[1] = (int64_t)ReadU64(payload + 12);
-    outDelta->block[2] = (int64_t)ReadU64(payload + 20);
-    outDelta->replacement = payload[28];
-    return true;
+    outDelta->revision = ReadU64(payload + 4);
+    outDelta->block[0] = (int64_t)ReadU64(payload + 12);
+    outDelta->block[1] = (int64_t)ReadU64(payload + 20);
+    outDelta->block[2] = (int64_t)ReadU64(payload + 28);
+    outDelta->replacement = payload[36];
+    return outDelta->revision != 0;
 }
 
 uint32_t LaiueProtocolEncodeBlockDrop(uint8_t* output, uint32_t capacity,
@@ -613,5 +623,277 @@ bool LaiueProtocolDecodeInventory(const uint8_t* payload, uint32_t size,
         outInventory->slots[i].item = item;
         outInventory->slots[i].count = count;
     }
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeSnapshotBegin(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolSnapshotBegin *snapshot)
+{
+    if (output == NULL || snapshot == NULL ||
+        capacity < SNAPSHOT_BEGIN_PAYLOAD_SIZE ||
+        snapshot->snapshotId == 0 ||
+        snapshot->peerId == 0 ||
+        snapshot->chunkCount > LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS)
+    {
+        return 0;
+    }
+    WriteU64(output, snapshot->snapshotId);
+    WriteU64(output + 8, snapshot->worldRevision);
+    WriteU32(output + 16, snapshot->serverTick);
+    WriteU32(output + 20, snapshot->chunkCount);
+    WriteU32(output + 24, snapshot->peerId);
+    WriteU64(output + 28, (uint64_t)snapshot->worldSeed);
+    WriteU64(output + 36, snapshot->worldTime);
+    return SNAPSHOT_BEGIN_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeSnapshotBegin(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolSnapshotBegin *outSnapshot)
+{
+    if (payload == NULL || outSnapshot == NULL ||
+        size != SNAPSHOT_BEGIN_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    outSnapshot->snapshotId = ReadU64(payload);
+    outSnapshot->worldRevision = ReadU64(payload + 8);
+    outSnapshot->serverTick = ReadU32(payload + 16);
+    outSnapshot->chunkCount = ReadU32(payload + 20);
+    outSnapshot->peerId = ReadU32(payload + 24);
+    outSnapshot->worldSeed = (int64_t)ReadU64(payload + 28);
+    outSnapshot->worldTime = ReadU64(payload + 36);
+    return outSnapshot->snapshotId != 0 && outSnapshot->peerId != 0 &&
+           outSnapshot->chunkCount <= LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS;
+}
+
+static uint32_t ChunkEditIndex(const LaiueProtocolChunkEdit *edit)
+{
+    return (uint32_t)edit->localX *
+               LAIUE_PROTOCOL_CHUNK_SIZE * LAIUE_PROTOCOL_CHUNK_SIZE +
+           (uint32_t)edit->localY * LAIUE_PROTOCOL_CHUNK_SIZE +
+           (uint32_t)edit->localZ;
+}
+
+static bool ChunkEditsAreCanonical(
+    const LaiueProtocolChunkEdit *edits, uint32_t count)
+{
+    uint32_t previous = 0;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const LaiueProtocolChunkEdit *edit = &edits[index];
+        if (edit->localX >= LAIUE_PROTOCOL_CHUNK_SIZE ||
+            edit->localY >= LAIUE_PROTOCOL_CHUNK_SIZE ||
+            edit->localZ >= LAIUE_PROTOCOL_CHUNK_SIZE ||
+            edit->replacement > 2U)
+        {
+            return false;
+        }
+        uint32_t current = ChunkEditIndex(edit);
+        if (index != 0 && current <= previous)
+        {
+            return false;
+        }
+        previous = current;
+    }
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeSnapshotChunk(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkDelta *chunk)
+{
+    if (output == NULL || chunk == NULL ||
+        chunk->revision == 0 ||
+        chunk->partCount == 0 ||
+        chunk->partCount > LAIUE_PROTOCOL_MAX_CHUNK_PARTS ||
+        chunk->partIndex >= chunk->partCount ||
+        (chunk->editCount == 0 &&
+         (chunk->partIndex != 0 || chunk->partCount != 1)) ||
+        (chunk->partIndex + 1U < chunk->partCount &&
+         chunk->editCount != LAIUE_PROTOCOL_MAX_CHUNK_EDITS) ||
+        chunk->editCount > LAIUE_PROTOCOL_MAX_CHUNK_EDITS ||
+        !ChunkEditsAreCanonical(chunk->edits, chunk->editCount))
+    {
+        return 0;
+    }
+    uint32_t size = SNAPSHOT_CHUNK_HEADER_SIZE +
+                    (uint32_t)chunk->editCount * SNAPSHOT_CHUNK_EDIT_SIZE;
+    if (capacity < size || size > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE)
+    {
+        return 0;
+    }
+    WriteU64(output, (uint64_t)chunk->chunk[0]);
+    WriteU64(output + 8, (uint64_t)chunk->chunk[1]);
+    WriteU64(output + 16, (uint64_t)chunk->chunk[2]);
+    WriteU64(output + 24, chunk->revision);
+    WriteU16(output + 32, chunk->partIndex);
+    WriteU16(output + 34, chunk->partCount);
+    WriteU16(output + 36, chunk->editCount);
+    for (uint32_t index = 0; index < chunk->editCount; ++index)
+    {
+        uint8_t *encoded =
+            output + SNAPSHOT_CHUNK_HEADER_SIZE +
+            index * SNAPSHOT_CHUNK_EDIT_SIZE;
+        encoded[0] = chunk->edits[index].localX;
+        encoded[1] = chunk->edits[index].localY;
+        encoded[2] = chunk->edits[index].localZ;
+        encoded[3] = chunk->edits[index].replacement;
+    }
+    return size;
+}
+
+bool LaiueProtocolDecodeSnapshotChunk(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkDelta *outChunk)
+{
+    if (payload == NULL || outChunk == NULL ||
+        size < SNAPSHOT_CHUNK_HEADER_SIZE)
+    {
+        return false;
+    }
+    uint32_t partIndex = ReadU16(payload + 32);
+    uint32_t partCount = ReadU16(payload + 34);
+    uint32_t editCount = ReadU16(payload + 36);
+    uint32_t expectedSize = SNAPSHOT_CHUNK_HEADER_SIZE +
+                            editCount * SNAPSHOT_CHUNK_EDIT_SIZE;
+    if (partCount == 0 ||
+        partCount > LAIUE_PROTOCOL_MAX_CHUNK_PARTS ||
+        partIndex >= partCount ||
+        (editCount == 0 &&
+         (partIndex != 0 || partCount != 1)) ||
+        (partIndex + 1U < partCount &&
+         editCount != LAIUE_PROTOCOL_MAX_CHUNK_EDITS) ||
+        editCount > LAIUE_PROTOCOL_MAX_CHUNK_EDITS ||
+        size != expectedSize)
+    {
+        return false;
+    }
+    outChunk->chunk[0] = (int64_t)ReadU64(payload);
+    outChunk->chunk[1] = (int64_t)ReadU64(payload + 8);
+    outChunk->chunk[2] = (int64_t)ReadU64(payload + 16);
+    outChunk->revision = ReadU64(payload + 24);
+    outChunk->partIndex = (uint16_t)partIndex;
+    outChunk->partCount = (uint16_t)partCount;
+    outChunk->editCount = (uint16_t)editCount;
+    for (uint32_t index = 0; index < editCount; ++index)
+    {
+        const uint8_t *encoded =
+            payload + SNAPSHOT_CHUNK_HEADER_SIZE +
+            index * SNAPSHOT_CHUNK_EDIT_SIZE;
+        outChunk->edits[index].localX = encoded[0];
+        outChunk->edits[index].localY = encoded[1];
+        outChunk->edits[index].localZ = encoded[2];
+        outChunk->edits[index].replacement = encoded[3];
+    }
+    return outChunk->revision != 0 &&
+           ChunkEditsAreCanonical(outChunk->edits, editCount);
+}
+
+uint32_t LaiueProtocolEncodeSnapshotEnd(
+    uint8_t *output, uint32_t capacity,
+    uint64_t snapshotId, uint64_t worldRevision)
+{
+    if (output == NULL || capacity < SNAPSHOT_END_PAYLOAD_SIZE ||
+        snapshotId == 0)
+    {
+        return 0;
+    }
+    WriteU64(output, snapshotId);
+    WriteU64(output + 8, worldRevision);
+    return SNAPSHOT_END_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeSnapshotEnd(
+    const uint8_t *payload, uint32_t size,
+    uint64_t *outSnapshotId, uint64_t *outWorldRevision)
+{
+    if (payload == NULL || outSnapshotId == NULL ||
+        outWorldRevision == NULL ||
+        size != SNAPSHOT_END_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    *outSnapshotId = ReadU64(payload);
+    *outWorldRevision = ReadU64(payload + 8);
+    return *outSnapshotId != 0;
+}
+
+uint32_t LaiueProtocolEncodeChunkResyncRequest(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkResyncRequest *request)
+{
+    if (output == NULL || request == NULL ||
+        capacity < CHUNK_RESYNC_PAYLOAD_SIZE)
+    {
+        return 0;
+    }
+    WriteU64(output, (uint64_t)request->chunk[0]);
+    WriteU64(output + 8, (uint64_t)request->chunk[1]);
+    WriteU64(output + 16, (uint64_t)request->chunk[2]);
+    WriteU64(output + 24, request->expectedRevision);
+    return CHUNK_RESYNC_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeChunkResyncRequest(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkResyncRequest *outRequest)
+{
+    if (payload == NULL || outRequest == NULL ||
+        size != CHUNK_RESYNC_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    outRequest->chunk[0] = (int64_t)ReadU64(payload);
+    outRequest->chunk[1] = (int64_t)ReadU64(payload + 8);
+    outRequest->chunk[2] = (int64_t)ReadU64(payload + 16);
+    outRequest->expectedRevision = ReadU64(payload + 24);
+    return true;
+}
+
+uint32_t LaiueProtocolEncodePeerId(
+    uint8_t *output, uint32_t capacity, uint32_t peerId)
+{
+    if (output == NULL || capacity < PEER_ID_PAYLOAD_SIZE || peerId == 0)
+    {
+        return 0;
+    }
+    WriteU32(output, peerId);
+    return PEER_ID_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodePeerId(
+    const uint8_t *payload, uint32_t size, uint32_t *outPeerId)
+{
+    if (payload == NULL || outPeerId == NULL ||
+        size != PEER_ID_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    *outPeerId = ReadU32(payload);
+    return *outPeerId != 0;
+}
+
+uint32_t LaiueProtocolEncodeWorldTime(
+    uint8_t *output, uint32_t capacity, uint64_t worldTime)
+{
+    if (output == NULL || capacity < WORLD_TIME_PAYLOAD_SIZE)
+    {
+        return 0;
+    }
+    WriteU64(output, worldTime);
+    return WORLD_TIME_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeWorldTime(
+    const uint8_t *payload, uint32_t size, uint64_t *outWorldTime)
+{
+    if (payload == NULL || outWorldTime == NULL ||
+        size != WORLD_TIME_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    *outWorldTime = ReadU64(payload);
     return true;
 }

@@ -100,6 +100,7 @@ struct NetworkServer
     const uint8_t *contentBundle;
     uint64_t contentBundleSize;
     uint8_t contentBundleHash[LAIUE_NETWORK_CONTENT_HASH_SIZE];
+    uint64_t nextBlockRevision;
     bool allowContentDownloads;
     bool winsockAcquired;
 };
@@ -603,6 +604,7 @@ static bool ClientHandleFrame(NetworkClient *client, const LaiueProtocolFrame *f
         }
         event.type = NETWORK_CLIENT_EVENT_BLOCK_DELTA;
         event.data.blockDelta.serverTick = decoded.serverTick;
+        event.data.blockDelta.revision = decoded.revision;
         event.data.blockDelta.block[0] = decoded.block[0];
         event.data.blockDelta.block[1] = decoded.block[1];
         event.data.blockDelta.block[2] = decoded.block[2];
@@ -991,7 +993,7 @@ void NetworkClientDestroy(NetworkClient *client)
     }
     if (client->contentBytes != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, client->contentBytes);
+        NetworkContentRelease(client->contentBytes);
     }
     bool releaseWinsock = client->winsockAcquired;
     HeapFree(GetProcessHeap(), 0, client);
@@ -1280,6 +1282,7 @@ NetworkServer *NetworkServerCreateLoopback(const NetworkServerConfiguration *con
             (size_t)server->modCount * sizeof(server->mods[0]));
     }
     server->nextPeerId = 1;
+    server->nextBlockRevision = 1;
 
     server->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server->listener == INVALID_SOCKET || !SocketSetNonblocking(server->listener))
@@ -1499,9 +1502,20 @@ bool NetworkServerBroadcastBlockDelta(NetworkServer *server, const NetworkBlockD
     }
     LaiueProtocolBlockDelta encodedDelta = {
         .serverTick = delta->serverTick,
+        .revision = delta->revision != 0
+            ? delta->revision
+            : server->nextBlockRevision,
         .block = {delta->block[0], delta->block[1], delta->block[2]},
         .replacement = delta->replacement,
     };
+    if (delta->revision == 0)
+    {
+        ++server->nextBlockRevision;
+        if (server->nextBlockRevision == 0)
+        {
+            server->nextBlockRevision = 1;
+        }
+    }
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodeBlockDelta(payload, sizeof(payload), &encodedDelta);
     if (size == 0)

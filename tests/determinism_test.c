@@ -1,6 +1,5 @@
-#include <windows.h>
-
 #include "gameplay/player_controller.h"
+#include "test_runtime.h"
 
 // Харнесс-доказательство детерминизма физики. Прогоняет фиксированную ленту
 // вводов через настоящий PlayerControllerUpdate и сворачивает состояние
@@ -14,22 +13,9 @@
 // глобальный /fp:fast переассоциирует выражения и сливает a*b+c в FMA, из-за
 // чего результат зависит от CPU и компилятора.
 
-// --- Вывод без CRT --------------------------------------------------------
-
 static void TestWrite(const char* text)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-    uint32_t length = 0;
-    while (text[length] != '\0')
-    {
-        ++length;
-    }
-    DWORD written = 0;
-    WriteFile(output, text, length, &written, NULL);
+    LaiueTestRuntimeWrite(text);
 }
 
 static void TestWriteHex64(uint64_t value)
@@ -183,7 +169,7 @@ static void FoldState(const PlayerController* controller, const Camera* camera)
     HashBytes(&grounded, sizeof(grounded));
 }
 
-void DeterminismTestEntryPoint(void)
+LAIUE_TEST_ENTRY(DeterminismTestEntryPoint)
 {
     PlayerControllerConfig config;
     FrozenConfig(&config);
@@ -229,7 +215,7 @@ void DeterminismTestEntryPoint(void)
         TestWrite("ДЕТЕРМИНИЗМ НАРУШЕН: ожидался ");
         TestWriteHex64(DETERMINISM_EXPECTED_HASH);
         TestWrite("\r\n");
-        ExitProcess(1);
+        LaiueTestRuntimeExit(1);
     }
-    ExitProcess(0);
+    LAIUE_TEST_SUCCESS();
 }

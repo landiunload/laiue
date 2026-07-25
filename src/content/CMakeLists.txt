@@ -7,6 +7,6 @@ laiue_add_module(content
         content_format.c
         content_format.h
         ../api.h
-    LINK
+    WINDOWS_LINK
         bcrypt
 )

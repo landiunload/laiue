@@ -5,7 +5,8 @@
 | Модуль | Ответственность |
 |---|---|
 | `launcher` | минимальный `laiue.exe`: `LoadLibrary` и `Start` |
-| `platform` | Win32-окно, message loop, mouse look, время |
+| `platform_support` | Win32/POSIX: память, locks, файлы, время, crypto, signals, dynamic loading |
+| `window` | Win32-окно, message loop и mouse look |
 | `input` | Raw Input клавиатуры и мыши |
 | `audio` | потоковое локальное/HTTP(S)-аудио, transport, громкость и события |
 | `world` | генерация, чанки, дельты, свойства блоков и сохранение `chunks.dat` |
@@ -15,8 +16,8 @@
 | `gameplay` | контроллер игрока, движение, прыжок, стойка и инвентарь |
 | `interaction` | raycast и проверяемая команда правки блока |
 | `content` | каталог форматов и безопасный сетевой bundle |
-| `mod` | профили модов, DLL-host, стороны и межмодовые интерфейсы |
-| `network` | protocol v4, bounded queues и loopback TCP transport |
+| `mod` | профили модов, DLL/SO-host, стороны и межмодовые интерфейсы |
+| `network` | protocol v5, bounded queues и QUIC/TLS transport |
 | `core` | клиентский composition root, UI, streaming, сохранения и эффекты |
 | `server` | headless authoritative composition root |
 
@@ -25,9 +26,11 @@
 
 ## Направление зависимостей
 
-`core` компонует клиентские подсистемы. Сервер компонует `network`,
-`content`, `mod`, `world`, `physics`, `gameplay` и `interaction`, но не
-зависит от `core`, `window`, `input`, `render` или `mesher`.
+`laiue::headless_stack` ровно один раз компонует `network`, `content`, `mod`,
+`world`, `physics`, `gameplay` и `interaction`. И `core`, и сервер линкуют
+эту общую цель; production sources не перекомпилируются отдельной копией.
+Сервер не зависит от `core`, `window`, `input`, `audio`, `render` или
+`mesher`.
 
 Нижние модули не включают заголовки `core`. Допустимый граф задан в
 `src/*/CMakeLists.txt` и проверяется `tools/check_architecture.ps1` при
@@ -62,12 +65,14 @@ laiue. Иначе добавляется внутренний `.c/.h` сущес
 | `AudioPlayer` | вызывающий клиент или приложение | client main + callbacks Media Foundation |
 | `RendererMesh` | streaming/effects | создаётся и рисуется только main; освобождение после GPU fence |
 | `ModsState`, `ModHost` | `ApplicationState` | только main |
-| `NetworkClient` | `ApplicationState` | client main |
+| `NetworkClient` | `ApplicationState` | main + MsQuic callbacks, которые только ставят bounded events |
 | server world, players, inventory, drops | `DedicatedServer` | server main, fixed tick 60 Гц |
 
 Workers читают `World` и строят CPU-меши, но не вызывают renderer, UI или
 моды. Мутации мира выполняются main thread. Нативные моды получают API и
-callbacks только на main thread.
+callbacks только на main thread. MsQuic callback thread не вызывает protocol,
+world или gameplay: он копирует данные в ограниченную очередь, которую
+разбирает main thread.
 
 ## Горячие пути
 

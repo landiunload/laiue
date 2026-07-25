@@ -1,4 +1,4 @@
-LAIUE MOD 1
+LAIUE MOD 2
 # Потребитель библиотеки laiue.builder: включать НИЖЕ builder_lib.lmp.
 name = Spiral Tower
 author = laiue
@@ -8,5 +8,5 @@ side = server
 game = 0.5
 
 [native]
-entry = spiral_tower.dll
+@LAIUE_MOD_NATIVE_ENTRIES@
 api = 1
