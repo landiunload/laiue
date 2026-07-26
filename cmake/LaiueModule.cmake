@@ -12,18 +12,27 @@ function(laiue_collect_sources out_variable)
     set(${out_variable} "${result}" PARENT_SCOPE)
 endfunction()
 
-function(laiue_register_runtime_target target_name)
+function(laiue_register_runtime_target target_name runtime_role)
     if(NOT TARGET "${target_name}")
         message(FATAL_ERROR
             "Нельзя зарегистрировать отсутствующую цель ${target_name}")
     endif()
+    string(TOUPPER "${runtime_role}" normalized_role)
+    if(NOT normalized_role MATCHES
+       "^(HEADLESS|CLIENT|SERVER|MODSDK)$")
+        message(FATAL_ERROR
+            "Цель ${target_name} имеет неизвестную runtime role: "
+            "${runtime_role}")
+    endif()
     set_property(GLOBAL APPEND PROPERTY LAIUE_RUNTIME_TARGETS "${target_name}")
+    set_property(GLOBAL APPEND PROPERTY
+        "LAIUE_RUNTIME_${normalized_role}_TARGETS" "${target_name}")
 endfunction()
 
 function(laiue_add_module module_name)
     cmake_parse_arguments(PARSE_ARGV 1 MODULE
         ""
-        ""
+        "RUNTIME_ROLE"
         "SOURCES;WINDOWS_SOURCES;UNIX_SOURCES;LINK;PUBLIC_LINK;WINDOWS_LINK;UNIX_LINK"
     )
 
@@ -38,6 +47,10 @@ function(laiue_add_module module_name)
     endif()
     if(NOT selected_sources)
         message(FATAL_ERROR "laiue_add_module(${module_name}) требует SOURCES")
+    endif()
+    if(NOT MODULE_RUNTIME_ROLE)
+        message(FATAL_ERROR
+            "laiue_add_module(${module_name}) требует RUNTIME_ROLE")
     endif()
 
     laiue_collect_sources(module_sources ${selected_sources})
@@ -68,5 +81,6 @@ function(laiue_add_module module_name)
             INSTALL_RPATH "$ORIGIN")
     endif()
 
-    laiue_register_runtime_target(${target_name})
+    laiue_register_runtime_target(
+        ${target_name} "${MODULE_RUNTIME_ROLE}")
 endfunction()

@@ -246,7 +246,7 @@ bool PlatformReadEntireFile(const wchar_t* path, uint64_t maximumBytes,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (file == INVALID_HANDLE_VALUE) return false;
     BY_HANDLE_FILE_INFORMATION information;
-    LARGE_INTEGER size;
+    LARGE_INTEGER size = {0};
     bool valid = GetFileInformationByHandle(file, &information)
         && !(information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
         && GetFileSizeEx(file, &size) && size.QuadPart >= 0

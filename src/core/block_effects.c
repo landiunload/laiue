@@ -113,6 +113,16 @@ void BlockEffectsSpawnNetworkDrop(BlockEffects* effects, uint32_t id,
 {
     if (effects == NULL || position == NULL || id == 0
         || block == BLOCK_AIR || block > BLOCK_GRASS) return;
+    for (uint32_t i = 0; i < BLOCK_EFFECT_DROP_CAPACITY; ++i)
+    {
+        BlockDrop* existing = &effects->drops[i];
+        if (!existing->active || existing->networkId != id) continue;
+        existing->block = block;
+        existing->position[0] = position[0];
+        existing->position[1] = position[1];
+        existing->position[2] = position[2];
+        return;
+    }
     BlockDrop* drop = &effects->drops[
         effects->nextDrop++ % BLOCK_EFFECT_DROP_CAPACITY];
     memset(drop, 0, sizeof(*drop));

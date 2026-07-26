@@ -423,9 +423,25 @@ static uint64_t Multiply64(uint64_t left, uint64_t right, uint64_t* outHigh)
 #if defined(_MSC_VER) && !defined(__clang__)
     return _umul128(left, right, outHigh);
 #else
-    unsigned __int128 product = (unsigned __int128)left * right;
-    *outHigh = (uint64_t)(product >> 64);
-    return (uint64_t)product;
+    // Four 32x32 products avoid the non-standard __int128 extension and
+    // keep the exact same result on MSVC, GCC, Clang, glibc and musl.
+    uint64_t leftLow = (uint32_t)left;
+    uint64_t leftHigh = left >> 32U;
+    uint64_t rightLow = (uint32_t)right;
+    uint64_t rightHigh = right >> 32U;
+    uint64_t lowProduct = leftLow * rightLow;
+    uint64_t crossLeft = leftHigh * rightLow;
+    uint64_t crossRight = leftLow * rightHigh;
+    uint64_t middle =
+        (lowProduct >> 32U) +
+        (uint32_t)crossLeft +
+        (uint32_t)crossRight;
+    *outHigh =
+        leftHigh * rightHigh +
+        (crossLeft >> 32U) +
+        (crossRight >> 32U) +
+        (middle >> 32U);
+    return (middle << 32U) | (uint32_t)lowProduct;
 #endif
 }
 

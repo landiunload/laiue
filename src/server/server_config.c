@@ -150,6 +150,10 @@ static void ApplyEnvironment(ServerConfiguration* configuration)
     ApplyEnvironmentPair(
         configuration, "LAIUE_SERVER_PORT", "port");
     ApplyEnvironmentPair(configuration,
+        "LAIUE_SERVER_MAXIMUM_PEERS", "maximum_peers");
+    ApplyEnvironmentPair(configuration,
+        "LAIUE_SERVER_WORLD_SEED", "world_seed");
+    ApplyEnvironmentPair(configuration,
         "LAIUE_SERVER_ALLOW_CONTENT_DOWNLOADS", "allow_content_downloads");
     ApplyEnvironmentPair(configuration,
         "LAIUE_SERVER_ADDRESS_FAMILY", "address_family");

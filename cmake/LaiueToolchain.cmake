@@ -10,10 +10,18 @@ if(WIN32)
         message(FATAL_ERROR
             "Windows-сборка поддерживает cl.exe и clang-cl.exe")
     endif()
-    # CMake добавляет старый набор Win32 libraries к каждой C-цели
-    # неявно. Убираем его, чтобы зависимости объявлялись у конкретных
-    # targets (platform/window/audio/render), а headless server не тянул UI.
-    set(CMAKE_C_STANDARD_LIBRARIES "")
+
+    # Before CMake 4.0, /RTC1 lives in the global Debug flag cache and the
+    # MSVC_RUNTIME_CHECKS target abstraction is ignored (CMP0184 OLD).
+    # Remove only CMake's no-CRT-incompatible default. Individual future
+    # CRT-backed targets may still opt in with target_compile_options().
+    if(CMAKE_VERSION VERSION_LESS 4.0)
+        string(REGEX REPLACE
+            "(^|[ \t])[-/]RTC(su|[1suc])([ \t]|$)"
+            " " _laiue_c_flags_debug "${CMAKE_C_FLAGS_DEBUG}")
+        set(CMAKE_C_FLAGS_DEBUG "${_laiue_c_flags_debug}" CACHE STRING
+            "C flags used by the compiler during DEBUG builds" FORCE)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         message(FATAL_ERROR
@@ -27,10 +35,9 @@ endif()
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "laiue поддерживает только 64-битные сборки")
 endif()
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
-   AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     message(FATAL_ERROR
-        "Linux-сервер пока поддерживает только x86_64; текущая архитектура: "
+        "Текущий SSE2-контракт поддерживает только x86_64; архитектура: "
         "${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
@@ -63,7 +70,7 @@ if(WIN32)
     target_compile_options(laiue_build_options INTERFACE
         /W4 /utf-8 /GS- /fp:fast
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
-        $<$<CONFIG:Debug>:/Od /RTC- /Z7>
+        $<$<CONFIG:Debug>:/Od /Z7>
         $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>
         $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/Ob3>
         $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
@@ -79,10 +86,27 @@ else()
     set(LAIUE_LINUX_LIBC "gnu" CACHE STRING
         "Linux libc ABI для server/mod artifacts: gnu или musl")
     set_property(CACHE LAIUE_LINUX_LIBC PROPERTY STRINGS gnu musl)
+    include(CheckCSourceCompiles)
+    check_c_source_compiles(
+        "#include <features.h>
+         #ifndef __GLIBC__
+         #error not glibc
+         #endif
+         int main(void) { return 0; }"
+        LAIUE_COMPILER_USES_GLIBC)
     if(LAIUE_LINUX_LIBC STREQUAL "gnu")
+        if(NOT LAIUE_COMPILER_USES_GLIBC)
+            message(FATAL_ERROR
+                "LAIUE_LINUX_LIBC=gnu требует glibc toolchain")
+        endif()
         target_compile_definitions(laiue_build_options INTERFACE
             LAIUE_LINUX_LIBC_GNU=1)
     elseif(LAIUE_LINUX_LIBC STREQUAL "musl")
+        if(LAIUE_COMPILER_USES_GLIBC)
+            message(FATAL_ERROR
+                "LAIUE_LINUX_LIBC=musl нельзя собирать glibc compiler; "
+                "используйте native Alpine или musl toolchain")
+        endif()
         target_compile_definitions(laiue_build_options INTERFACE
             LAIUE_LINUX_LIBC_MUSL=1)
     else()
@@ -128,7 +152,7 @@ if(WIN32)
     target_compile_options(laiue_runtime PRIVATE
         /W4 /utf-8 /GS- /fp:fast
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
-        $<$<CONFIG:Debug>:/Od /RTC- /Z7>
+        $<$<CONFIG:Debug>:/Od /Z7>
         $<$<NOT:$<CONFIG:Debug>>:/O2 /Oi>)
     target_sources(laiue_windows_no_crt INTERFACE
         "$<TARGET_OBJECTS:laiue_runtime>")

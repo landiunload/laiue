@@ -292,6 +292,52 @@ static void TestVersionOneRejectsVersionTwoKeys(void)
     ModManifestTestExpect(!ManifestNativeEntriesValid(&state, version), "v1 принял ключ из v2");
 }
 
+static void TestAggregateHashGolden(void)
+{
+    static const uint8_t manifest[] =
+        "LAIUE MOD 2\n"
+        "[native]\n"
+        "entry_windows_x86_64 = mod.dll\n"
+        "entry_linux_x86_64_gnu = mod.gnu.so\n"
+        "entry_linux_x86_64_musl = mod.musl.so\n"
+        "api = 1\n";
+    static const uint8_t windowsArtifact[] = {0U, 1U, 2U, 3U};
+    static const uint8_t gnuArtifact[] = {'g', 'n', 'u'};
+    static const uint8_t muslArtifact[] = {'m', 'u', 's', 'l'};
+    static const uint8_t expected[MODS_CONTENT_HASH_SIZE] = {
+        0xe5U, 0xfcU, 0x55U, 0xf0U, 0xf6U, 0x4dU, 0x23U, 0xd5U,
+        0xceU, 0x7fU, 0x1dU, 0xc7U, 0xabU, 0xa2U, 0x71U, 0x38U,
+        0x20U, 0xe9U, 0x66U, 0xc6U, 0xd8U, 0x39U, 0xb3U, 0xdbU,
+        0x3aU, 0x93U, 0x13U, 0xabU, 0x99U, 0xddU, 0x4aU, 0xecU,
+    };
+    const uint8_t* artifacts[] = {
+        windowsArtifact, gnuArtifact, muslArtifact};
+    const uint32_t artifactSizes[] = {
+        sizeof(windowsArtifact),
+        sizeof(gnuArtifact),
+        sizeof(muslArtifact)};
+    uint8_t aggregate[MODS_CONTENT_HASH_SIZE];
+    ModManifestTestExpect(
+        HashBuffer(manifest, sizeof(manifest) - 1U, aggregate),
+        "не удалось hash manifest golden");
+    for (uint32_t index = 0; index < 3U; ++index)
+    {
+        uint8_t artifactHash[MODS_CONTENT_HASH_SIZE];
+        uint8_t combined[MODS_CONTENT_HASH_SIZE];
+        ModManifestTestExpect(
+            HashBuffer(
+                artifacts[index], artifactSizes[index],
+                artifactHash) &&
+                CombineHashes(
+                    aggregate, artifactHash, combined),
+            "не удалось собрать aggregate golden");
+        memcpy(aggregate, combined, sizeof(aggregate));
+    }
+    ModManifestTestExpect(
+        memcmp(aggregate, expected, sizeof(expected)) == 0,
+        "platform artifact hash отличается от golden");
+}
+
 static void RunModManifestTests(void)
 {
     ModManifestTestWrite("legacy manifest\r\n");
@@ -304,6 +350,8 @@ static void RunModManifestTests(void)
     TestInvalidVersionsRejected();
     ModManifestTestWrite("version-key boundary\r\n");
     TestVersionOneRejectsVersionTwoKeys();
+    ModManifestTestWrite("aggregate hash golden\r\n");
+    TestAggregateHashGolden();
     ModManifestTestWrite("artifact hash\r\n");
     TestAllDeclaredArtifactsAffectHash();
 

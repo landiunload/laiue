@@ -1,4 +1,5 @@
 laiue_add_module(core
+    RUNTIME_ROLE CLIENT
     SOURCES
         application.c
         application_config.c

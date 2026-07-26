@@ -51,6 +51,8 @@ port = 30000
 Все удалённые параметры можно переопределить окружением:
 
 - `LAIUE_SERVER_PORT`;
+- `LAIUE_SERVER_MAXIMUM_PEERS`;
+- `LAIUE_SERVER_WORLD_SEED`;
 - `LAIUE_SERVER_ALLOW_CONTENT_DOWNLOADS`;
 - `LAIUE_SERVER_ADDRESS_FAMILY`;
 - `LAIUE_SERVER_LISTEN_ADDRESS`;
@@ -125,6 +127,13 @@ Trust policy:
 - `sha256:<64 hex>` дополнительно требует точного SHA-256 fingerprint leaf
   DER certificate; self-signed chain допускается только при правильном pin,
   непросроченном сертификате и совпавшем SAN.
+
+На Windows и Linux pin служит заранее переданным якорем для self-signed
+сертификата: недоверенный корень допускается только после точного сравнения
+SHA-256 leaf DER, срока действия и SAN. Это не режим отключённой проверки:
+MsQuic передаёт решение приложению через deferred certificate validation,
+а `NO_CERTIFICATE_VALIDATION` не используется. Для `system` системная
+цепочка по-прежнему обязательна.
 
 TOFU, автоматического принятия первого сертификата и режима
 `skip verification` нет. Mismatch завершает handshake до отправки mod list,

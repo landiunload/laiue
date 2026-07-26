@@ -94,7 +94,10 @@ Linux musl собирается теми же флагами с musl toolchain �
 Для одно-платформенной локальной разработки manifest может объявлять только
 текущий бинарник. Такой pack намеренно не совпадёт по fingerprint с pack
 другой ОС. Release pack для совместной игры Windows/Linux должен содержать
-все объявленные артефакты.
+все объявленные артефакты. CI сохраняет отдельные platform stages, затем
+`cmake/AssembleModSdk.cmake` создаёт `laiue-mod-sdk-x86_64` с одним
+manifest и тремя бинарниками каждого example-мода; именно этот pack имеет
+одинаковый compatibility hash у Windows, glibc и musl readers.
 
 Экспорты всегда оформляются через `LAIUE_MOD_EXPORT` и
 `LAIUE_MOD_CALL`; прямой `__declspec(dllexport)` делает исходник

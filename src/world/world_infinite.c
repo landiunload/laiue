@@ -3,6 +3,7 @@
 #include "world/terrain_noise.h"
 #include "platform/system.h"
 
+#include <limits.h>
 #include <string.h>
 
 typedef struct LocalChunkCoordinate
@@ -845,7 +846,8 @@ uint32_t WorldCopyEditedChunkSummaries(
     for (uint32_t slot = 0; slot < world->capacity; ++slot)
     {
         if (!world->occupied[slot] || world->chunks[slot] == NULL
-            || world->chunks[slot]->deltaCount == 0)
+            || (world->chunks[slot]->deltaCount == 0
+                && world->chunks[slot]->revision == 0))
             continue;
         int64_t local[3];
         if (!GlobalChunkCoordinateToLocal(&world->keys[slot], world, local))
@@ -964,6 +966,14 @@ WorldRegionContents WorldFillRegion(World* world,
     BlockType* outBlocks,
     float* heightScratch, size_t heightScratchCount)
 {
+    if (world == NULL || outBlocks == NULL ||
+        sizeX <= 0 || sizeY <= 0 || sizeZ <= 0 ||
+        minBlockX > INT64_MAX - ((int64_t)sizeX - 1) ||
+        minBlockY > INT64_MAX - ((int64_t)sizeY - 1) ||
+        minBlockZ > INT64_MAX - ((int64_t)sizeZ - 1))
+    {
+        return WORLD_REGION_ALL_AIR;
+    }
     bool regionHasDeltas = false;
     int64_t minChunkX = ChunkFromBlock(minBlockX);
     int64_t minChunkY = ChunkFromBlock(minBlockY);
@@ -1073,10 +1083,17 @@ WorldRegionContents WorldFillRegion(World* world,
                 cacheValid = true;
             }
 
-            int32_t solidCount = cachedSolidCount;
+            uint32_t solidCount = cachedSolidCount > 0
+                ? (uint32_t)cachedSolidCount : 0U;
+            uint32_t columnDepth = (uint32_t)sizeZ;
+            if (solidCount > columnDepth)
+            {
+                solidCount = columnDepth;
+            }
             BlockType* column = &outBlocks[(((size_t)y * sizeX) + (size_t)x) * sizeZ];
             memset(column, BLOCK_EARTH, (size_t)solidCount);
-            memset(column + solidCount, BLOCK_AIR, (size_t)(sizeZ - solidCount));
+            memset(column + solidCount, BLOCK_AIR,
+                (size_t)(columnDepth - solidCount));
 
             if (cachedGrass)
             {

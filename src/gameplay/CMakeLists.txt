@@ -1,4 +1,5 @@
 laiue_add_module(gameplay
+    RUNTIME_ROLE HEADLESS
     SOURCES
         player_controller.c
         player_controller.h

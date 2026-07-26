@@ -218,6 +218,7 @@ typedef enum NetworkClientEventType
     NETWORK_CLIENT_EVENT_PLAYER_JOINED,
     NETWORK_CLIENT_EVENT_PLAYER_LEFT,
     NETWORK_CLIENT_EVENT_WORLD_TIME,
+    NETWORK_CLIENT_EVENT_CHUNK_RESYNC_CANCELLED,
     NETWORK_CLIENT_EVENT_DISCONNECTED
 } NetworkClientEventType;
 
@@ -240,6 +241,11 @@ typedef struct NetworkClientEvent
         NetworkChunkDelta chunkDelta;
         uint32_t peerId;
         uint64_t worldTime;
+        struct
+        {
+            int64_t chunk[3];
+            uint64_t expectedRevision;
+        } chunkResyncCancelled;
         struct
         {
             uint32_t count;
@@ -381,6 +387,10 @@ LAIUE_NETWORK_API bool NetworkClientSendSelectedHotbarSlot(NetworkClient* client
 LAIUE_NETWORK_API bool NetworkClientRequestChunkResync(
     NetworkClient *client, const int64_t chunk[3],
     uint64_t expectedRevision);
+// Confirms that the main thread has applied the complete world/state barrier.
+// Input/edit calls remain server-gated until this ordered acknowledgement.
+LAIUE_NETWORK_API bool NetworkClientAcknowledgeReady(
+    NetworkClient *client);
 
 LAIUE_NETWORK_API NetworkServer *NetworkServerCreateLoopback(
     const NetworkServerConfiguration *configuration);
@@ -406,6 +416,9 @@ LAIUE_NETWORK_API bool NetworkServerSendSnapshotChunk(
 LAIUE_NETWORK_API bool NetworkServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision);
+LAIUE_NETWORK_API bool NetworkServerSendChunkResyncCancelled(
+    NetworkServer *server, uint32_t peerId,
+    const int64_t chunk[3], uint64_t expectedRevision);
 LAIUE_NETWORK_API bool NetworkServerSendPlayerJoined(
     NetworkServer *server, uint32_t peerId, uint32_t joinedPeerId);
 LAIUE_NETWORK_API bool NetworkServerBroadcastPlayerJoined(

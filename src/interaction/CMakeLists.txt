@@ -1,4 +1,5 @@
 laiue_add_module(interaction
+    RUNTIME_ROLE HEADLESS
     SOURCES
         voxel_raycast.c
         voxel_raycast.h

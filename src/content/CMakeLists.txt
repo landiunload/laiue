@@ -1,4 +1,5 @@
 laiue_add_module(content
+    RUNTIME_ROLE HEADLESS
     SOURCES
         content_catalog.c
         content_catalog.h

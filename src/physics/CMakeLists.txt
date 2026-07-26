@@ -1,4 +1,5 @@
 laiue_add_module(physics
+    RUNTIME_ROLE HEADLESS
     SOURCES
         voxel_body.c
         voxel_body.h

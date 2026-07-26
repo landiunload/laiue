@@ -39,16 +39,30 @@ Linux client, renderer, window, input и audio в текущую итераци�
 | `LAIUE_ENABLE_MSQUIC` | ON | искать secure transport |
 | `LAIUE_REQUIRE_MSQUIC` | OFF | fail configure без MsQuic |
 | `LAIUE_MSQUIC_ROOT` | пусто | prefix с `include/`, `lib/`, runtime |
+| `LAIUE_MSQUIC_VERSION` | auto | подтверждённая версия при отсутствии metadata |
 
 CMake не скачивает MsQuic. Release/CI используют MsQuic 2.5.9 из системного
 пакета или проверенного `LAIUE_MSQUIC_ROOT` и включают
-`LAIUE_REQUIRE_MSQUIC=ON`.
+`LAIUE_REQUIRE_MSQUIC=ON`. Другая обнаруженная версия отклоняется. Если
+package metadata недоступна, `LAIUE_MSQUIC_VERSION=2.5.9` задаётся только
+после внешней проверки package hash/commit.
 
 ## Debian 13
 
-Нужны CMake 3.28+, Ninja, GCC или Clang, pthread/dl, OpenSSL 3 development
-files и MsQuic 2.5.9 development/runtime package. `libmsquic` устанавливается
-из официального Microsoft repository для Debian либо передаётся через
+Нужны CMake 3.28+, Ninja, GCC или Clang, pthread/dl и OpenSSL 3 development
+files. Официальный Debian-пакет `libmsquic=2.5.9` является runtime-only:
+в нём нет headers, pkg-config metadata и unversioned linker symlink.
+Поэтому release build передаёт `LAIUE_MSQUIC_ROOT`, собранный из:
+
+- `libmsquic.so.2.5.9` официального Microsoft-пакета;
+- symlink chain `libmsquic.so -> libmsquic.so.2 -> libmsquic.so.2.5.9`;
+- headers, `LICENSE` и `THIRD-PARTY-NOTICES` из закреплённого upstream commit,
+  соответствующего 2.5.9;
+- файла `VERSION` со значением `2.5.9`.
+
+Обычный CMake configure ничего из сети не загружает. Воспроизводимая
+bootstrap-последовательность находится в Debian job
+`.github/workflows/build.yml`; prefix затем передаётся через
 `LAIUE_MSQUIC_ROOT`.
 
 ```sh
@@ -84,6 +98,11 @@ cmake --build --preset linux-musl-release --target laiue_server_bundle
 
 glibc и musl server/mod binaries не взаимозаменяемы. Release names и manifest
 keys всегда содержат ABI: `linux-x86_64-gnu` или `linux-x86_64-musl`.
+Чистому Alpine 3.23 runtime нужны пакеты `libcrypto3`, `libssl3` и
+`libgcc`; `openssl` требуется оператору для выпуска/диагностики
+сертификата, но не самому серверному процессу. CI запускает musl bundle
+в отдельном чистом Alpine container, без установленной system
+`libmsquic`.
 
 ## Артефакты
 
@@ -91,16 +110,28 @@ keys всегда содержат ABI: `linux-x86_64-gnu` или `linux-x86_64-
 - `laiue_server_bundle` — сервер и общий headless runtime;
 - `laiue_distribution` — все включённые компоненты и SDK examples.
 
-Установка и пакет:
+Bundle-цели очищают и заполняют независимые staging-каталоги
+`build/<preset>/bundles/{client,server,mod-sdk}/<config>`. Install-компоненты
+`Client`, `Server` и `ModSDK` можно устанавливать отдельно:
 
 ```sh
-cmake --install build/linux-gcc-release --prefix staging/laiue
+cmake --install build/linux-gcc-release --prefix staging/server \
+  --component Server
 cpack --config build/linux-gcc-release/CPackConfig.cmake
 ```
 
 Windows package — ZIP, Linux package — TGZ. Shared libraries лежат рядом с
 исполняемым файлом; ELF RUNPATH равен `$ORIGIN`. Не полагайтесь на
-`LD_LIBRARY_PATH` в release package.
+`LD_LIBRARY_PATH` в release package. `tools/smoke_linux_server.sh` проверяет
+RUNPATH/runtime dependencies и запускает IPv4, IPv6 и dual listeners с
+временным сертификатом (IPv6 пропускается только когда его отключил runner).
+
+glibc bundle содержит выбранную `libmsquic.so` symlink chain, но не копирует
+системные библиотеки Debian. На чистом Debian 13 до запуска установите
+runtime packages `libssl3t64`, `libnuma1`, `libxdp1` и
+`libnl-route-3-200`; apt подтянет их транзитивные зависимости. CI повторяет
+package smoke в чистом `debian:13-slim` без установленного `libmsquic`
+package, чтобы доказать использование runtime из bundle.
 
 ## Переносимый код
 

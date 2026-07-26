@@ -1,4 +1,5 @@
 laiue_add_module(world
+    RUNTIME_ROLE HEADLESS
     SOURCES
         world_infinite.c
         block_properties.c

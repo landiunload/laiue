@@ -1,4 +1,5 @@
 laiue_add_module(audio
+    RUNTIME_ROLE CLIENT
     SOURCES
         audio_windows.c
         audio.h

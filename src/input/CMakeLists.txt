@@ -1,4 +1,5 @@
 laiue_add_module(input
+    RUNTIME_ROLE CLIENT
     SOURCES
         input_windows.c
         input.h

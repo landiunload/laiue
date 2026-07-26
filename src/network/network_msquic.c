@@ -1,3 +1,4 @@
+#include "network/certificate_validation.h"
 #include "network/network.h"
 #include "network/protocol.h"
 #include "platform/system.h"
@@ -11,12 +12,20 @@
 #include <stddef.h>
 #include <string.h>
 
-#if !defined(_WIN32)
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 #define NETWORK_RECEIVE_CAPACITY 16384U
+#define NETWORK_CONTROL_RECEIVE_CAPACITY \
+    (LAIUE_PROTOCOL_MAX_QUEUED_FRAMES * \
+     LAIUE_PROTOCOL_MAX_FRAME_SIZE)
+#define NETWORK_AUX_RECEIVE_CAPACITY \
+    ((LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U) * \
+     LAIUE_PROTOCOL_MAX_FRAME_SIZE)
 #define NETWORK_CLIENT_EVENT_CAPACITY 128U
 #define NETWORK_SERVER_EVENT_CAPACITY LAIUE_NETWORK_MAX_QUEUED_EVENTS
 #define NETWORK_HANDSHAKE_TIMEOUT_MS 60000ULL
@@ -26,8 +35,10 @@
 #define NETWORK_MAX_FRAMES_PER_SECOND 160U
 #define NETWORK_MAX_INPUTS_PER_SECOND 120U
 #define NETWORK_MAX_EDITS_PER_SECOND 16U
-#define NETWORK_MAX_RESYNCS_PER_SECOND 8U
+#define NETWORK_MAX_RESYNCS_PER_SECOND 1U
 #define NETWORK_CONTROL_PAYLOAD_CAPACITY LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE
+#define NETWORK_AUX_MAX_OUTSTANDING_SENDS \
+    (LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U)
 #define NETWORK_APP_ERROR_PROTOCOL 0x100U
 #define NETWORK_APP_ERROR_OVERFLOW 0x101U
 #define NETWORK_APP_ERROR_SHUTDOWN 0x102U
@@ -38,7 +49,7 @@ typedef struct QuicSend
 {
     QuicChannel *channel;
     QUIC_BUFFER buffer;
-    uint8_t bytes[];
+    uint8_t bytes[1];
 } QuicSend;
 
 struct QuicChannel
@@ -46,7 +57,9 @@ struct QuicChannel
     const QUIC_API_TABLE *api;
     PlatformRwLock *lock;
     HQUIC stream;
-    uint8_t receive[NETWORK_RECEIVE_CAPACITY];
+    uint8_t inlineReceive[NETWORK_RECEIVE_CAPACITY];
+    uint8_t *receive;
+    uint32_t receiveCapacity;
     uint32_t receiveSize;
     uint32_t receiveSequence;
     uint32_t sendSequence;
@@ -57,6 +70,8 @@ struct QuicChannel
     NetworkDisconnectReason callbackError;
     bool streamStarted;
     bool peerSendClosed;
+    bool auxiliary;
+    bool shutdownComplete;
 };
 
 typedef struct NetworkServerPeer NetworkServerPeer;
@@ -76,11 +91,16 @@ struct NetworkClient
     NetworkConnectionState state;
     NetworkDisconnectReason callbackReason;
     NetworkClientConfiguration connectionConfiguration;
+    uint8_t controlReceive[NETWORK_CONTROL_RECEIVE_CAPACITY];
+    uint8_t serverReceive[
+        LAIUE_PROTOCOL_MAX_SERVER_STREAMS]
+        [NETWORK_AUX_RECEIVE_CAPACITY];
     QuicChannel serverChannels[LAIUE_PROTOCOL_MAX_SERVER_STREAMS];
-    uint32_t serverChannelCount;
     uint64_t clientNonce;
     uint64_t snapshotId;
     uint64_t snapshotWorldRevision;
+    int64_t resyncRequestChunk[3];
+    uint64_t resyncExpectedRevision;
     uint32_t snapshotServerTick;
     uint32_t expectedSnapshotChunks;
     uint32_t receivedSnapshotChunks;
@@ -105,12 +125,18 @@ struct NetworkClient
     bool transportConnected;
     bool transportConnectedHandled;
     bool certificateVerified;
+    bool connectionStarted;
+    bool stopping;
     bool shutdownComplete;
     bool shutdownRequested;
     bool disconnectNotified;
     bool snapshotStarted;
     bool snapshotEnded;
+    bool syncBeginReceived;
     bool syncReadyReceived;
+    bool syncAppliedSent;
+    bool resyncRequestOutstanding;
+    bool resyncResponseMatched;
 };
 
 struct NetworkServer
@@ -160,6 +186,9 @@ struct NetworkServerPeer
     uint32_t receivedModCount;
     uint64_t contentOffset;
     uint64_t snapshotId;
+    uint64_t snapshotWorldRevision;
+    int64_t resyncRequestChunk[3];
+    uint64_t resyncExpectedRevision;
     uint32_t expectedSnapshotChunks;
     uint32_t sentSnapshotChunks;
     int64_t snapshotPartChunk[3];
@@ -170,6 +199,7 @@ struct NetworkServerPeer
     NetworkDisconnectReason callbackReason;
     NetworkDisconnectReason closeReason;
     bool allocated;
+    bool listenerReady;
     bool secureConnected;
     bool shutdownComplete;
     bool closing;
@@ -177,7 +207,11 @@ struct NetworkServerPeer
     bool modListReceived;
     bool negotiated;
     bool ready;
+    bool everReady;
     bool snapshotStarted;
+    bool awaitingSyncApplied;
+    bool resyncRequestOutstanding;
+    bool resyncResponseMatched;
     bool contentTransferActive;
     bool rejected;
     bool connectedNotified;
@@ -266,6 +300,8 @@ static void ChannelInitialize(
     memset(channel, 0, sizeof(*channel));
     channel->api = api;
     channel->lock = lock;
+    channel->receive = channel->inlineReceive;
+    channel->receiveCapacity = NETWORK_RECEIVE_CAPACITY;
     channel->connectedAtMs = PlatformMonotonicMilliseconds();
     channel->lastReceiveAtMs = channel->connectedAtMs;
     channel->lastSendAtMs = channel->connectedAtMs;
@@ -288,6 +324,8 @@ static QUIC_STATUS QUIC_API ChannelStreamCallback(
         {
             --channel->outstandingSends;
         }
+        channel->lastSendAtMs =
+            PlatformMonotonicMilliseconds();
         PlatformRwLockReleaseExclusive(channel->lock);
         PlatformFree(send);
         return QUIC_STATUS_SUCCESS;
@@ -322,7 +360,8 @@ static QUIC_STATUS QUIC_API ChannelStreamCallback(
                 }
             }
             if (!valid ||
-                total > NETWORK_RECEIVE_CAPACITY - channel->receiveSize)
+                total >
+                    channel->receiveCapacity - channel->receiveSize)
             {
                 channel->callbackError =
                     valid ? NETWORK_DISCONNECT_OVERFLOW
@@ -362,7 +401,9 @@ static QUIC_STATUS QUIC_API ChannelStreamCallback(
             break;
 
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-            if (!event->SHUTDOWN_COMPLETE.AppCloseInProgress &&
+            channel->shutdownComplete = true;
+            if (!channel->auxiliary &&
+                !event->SHUTDOWN_COMPLETE.AppCloseInProgress &&
                 channel->callbackError == NETWORK_DISCONNECT_NONE)
             {
                 channel->callbackError = NETWORK_DISCONNECT_REMOTE;
@@ -377,6 +418,30 @@ static QUIC_STATUS QUIC_API ChannelStreamCallback(
     return QUIC_STATUS_SUCCESS;
 }
 
+#if !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+static void SetQuicStreamCallback(
+    const QUIC_API_TABLE *api, HQUIC stream,
+    QUIC_STREAM_CALLBACK_HANDLER callback, void *context)
+{
+    // MsQuic's generic setter intentionally represents callback functions
+    // as void*. Keep the implementation-defined conversion at this single
+    // audited ABI boundary.
+    api->SetCallbackHandler(stream, (void *)callback, context);
+}
+
+static void SetQuicConnectionCallback(
+    const QUIC_API_TABLE *api, HQUIC connection,
+    QUIC_CONNECTION_CALLBACK_HANDLER callback, void *context)
+{
+    api->SetCallbackHandler(connection, (void *)callback, context);
+}
+#if !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+#pragma GCC diagnostic pop
+#endif
+
 static bool ChannelSendPayload(
     QuicChannel *channel, LaiueMessageType type,
     const uint8_t *payload, uint32_t payloadSize)
@@ -388,7 +453,7 @@ static bool ChannelSendPayload(
 
     uint32_t frameSize = LAIUE_PROTOCOL_HEADER_SIZE + payloadSize;
     QuicSend *send = PlatformAllocate(
-        sizeof(*send) + frameSize, true);
+        offsetof(QuicSend, bytes) + frameSize, true);
     if (send == NULL)
     {
         return false;
@@ -396,10 +461,12 @@ static bool ChannelSendPayload(
 
     HQUIC stream;
     PlatformRwLockAcquireExclusive(channel->lock);
+    uint32_t sendLimit = channel->auxiliary
+        ? NETWORK_AUX_MAX_OUTSTANDING_SENDS
+        : LAIUE_NETWORK_MAX_OUTSTANDING_SENDS;
     if (channel->stream == NULL ||
         channel->callbackError != NETWORK_DISCONNECT_NONE ||
-        channel->outstandingSends >=
-            LAIUE_NETWORK_MAX_OUTSTANDING_SENDS)
+        channel->outstandingSends >= sendLimit)
     {
         PlatformRwLockReleaseExclusive(channel->lock);
         PlatformFree(send);
@@ -548,6 +615,100 @@ static uint32_t ChannelOutstandingSends(QuicChannel *channel)
     uint32_t count = channel->outstandingSends;
     PlatformRwLockReleaseShared(channel->lock);
     return count;
+}
+
+static uint64_t ChannelLastReceiveAt(QuicChannel *channel)
+{
+    PlatformRwLockAcquireShared(channel->lock);
+    uint64_t value = channel->lastReceiveAtMs;
+    PlatformRwLockReleaseShared(channel->lock);
+    return value;
+}
+
+static uint64_t ChannelLastSendAt(QuicChannel *channel)
+{
+    PlatformRwLockAcquireShared(channel->lock);
+    uint64_t value = channel->lastSendAtMs;
+    PlatformRwLockReleaseShared(channel->lock);
+    return value;
+}
+
+static uint64_t ChannelLastActivityAt(QuicChannel *channel)
+{
+    PlatformRwLockAcquireShared(channel->lock);
+    uint64_t value =
+        channel->lastReceiveAtMs > channel->lastSendAtMs
+            ? channel->lastReceiveAtMs
+            : channel->lastSendAtMs;
+    PlatformRwLockReleaseShared(channel->lock);
+    return value;
+}
+
+static bool ChannelIsActive(QuicChannel *channel)
+{
+    PlatformRwLockAcquireShared(channel->lock);
+    bool active = channel->stream != NULL;
+    PlatformRwLockReleaseShared(channel->lock);
+    return active;
+}
+
+static bool ChannelShutdownGracefully(QuicChannel *channel)
+{
+    HQUIC stream = NULL;
+    PlatformRwLockAcquireShared(channel->lock);
+    stream = channel->stream;
+    PlatformRwLockReleaseShared(channel->lock);
+    return stream != NULL &&
+           !QUIC_FAILED(channel->api->StreamShutdown(
+               stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0));
+}
+
+static bool ChannelTryRetireAuxiliary(
+    QuicChannel *channel, bool *outRetired)
+{
+    HQUIC stream = NULL;
+    bool valid = true;
+    *outRetired = false;
+
+    PlatformRwLockAcquireExclusive(channel->lock);
+    if (channel->stream != NULL && channel->shutdownComplete)
+    {
+        if (channel->receiveSize != 0 ||
+            channel->outstandingSends != 0)
+        {
+            // The callback may observe FIN before the main thread has
+            // drained all complete frames copied into the bounded buffer.
+        }
+        else if (!channel->auxiliary ||
+                (channel->receiveSequence == 0 &&
+                 channel->sendSequence == 0))
+        {
+            valid = false;
+        }
+        else
+        {
+            stream = channel->stream;
+            channel->stream = NULL;
+            *outRetired = true;
+        }
+    }
+    PlatformRwLockReleaseExclusive(channel->lock);
+
+    if (stream != NULL)
+    {
+        channel->api->StreamClose(stream);
+    }
+    return valid;
+}
+
+static bool ChannelReceiveEndedWithBytes(QuicChannel *channel)
+{
+    PlatformRwLockAcquireShared(channel->lock);
+    bool truncated =
+        (channel->peerSendClosed || channel->shutdownComplete) &&
+        channel->receiveSize != 0;
+    PlatformRwLockReleaseShared(channel->lock);
+    return truncated;
 }
 
 static void CopyModFromProtocol(
@@ -760,51 +921,6 @@ static bool ParseThumbprint(
 }
 #endif
 
-#if !defined(_WIN32)
-static bool ValidatePinnedCertificateOpenSsl(
-    const NetworkClient *client, const QUIC_BUFFER *certificate)
-{
-    const unsigned char *cursor = certificate->Buffer;
-    const unsigned char *end = cursor + certificate->Length;
-    X509 *x509 = d2i_X509(NULL, &cursor, (long)certificate->Length);
-    if (x509 == NULL || cursor != end)
-    {
-        X509_free(x509);
-        return false;
-    }
-    bool valid = X509_cmp_current_time(X509_get0_notBefore(x509)) <= 0 &&
-                 X509_cmp_current_time(X509_get0_notAfter(x509)) >= 0;
-    if (valid &&
-        client->connectionConfiguration.endpoint.kind ==
-            NETWORK_ENDPOINT_IPV4)
-    {
-        valid = X509_check_ip_asc(
-                    x509,
-                    client->connectionConfiguration.endpoint.host,
-                    0U) == 1;
-    }
-    else if (valid &&
-             client->connectionConfiguration.endpoint.kind ==
-                 NETWORK_ENDPOINT_IPV6)
-    {
-        valid = X509_check_ip_asc(
-                    x509,
-                    client->connectionConfiguration.endpoint.host,
-                    0U) == 1;
-    }
-    else if (valid)
-    {
-        valid = X509_check_host(
-                    x509,
-                    client->connectionConfiguration.endpoint.host,
-                    0U, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,
-                    NULL) == 1;
-    }
-    X509_free(x509);
-    return valid;
-}
-#endif
-
 static bool ValidatePinnedCertificate(
     NetworkClient *client,
     const QUIC_CONNECTION_EVENT *event)
@@ -830,14 +946,19 @@ static bool ValidatePinnedCertificate(
 #if defined(_WIN32)
     QUIC_STATUS deferred =
         event->PEER_CERTIFICATE_RECEIVED.DeferredStatus;
-    // A pin may replace only the chain anchor. Expiration, revocation and
-    // DNS/IP SAN failures remain fatal and are reported as different
-    // Schannel statuses.
-    return !QUIC_FAILED(deferred) ||
-           deferred == QUIC_STATUS_CERT_UNTRUSTED_ROOT ||
-           deferred == (QUIC_STATUS)CERT_E_CHAINING;
+    // A pin may replace only the chain anchor. The DER leaf is parsed
+    // independently so an untrusted-root status cannot mask expiration or
+    // a DNS/IP SAN mismatch.
+    return NetworkCertificateValidateLeafIdentity(
+               &client->connectionConfiguration.endpoint,
+               certificate->Buffer, certificate->Length) &&
+           (!QUIC_FAILED(deferred) ||
+            deferred == QUIC_STATUS_CERT_UNTRUSTED_ROOT ||
+            deferred == (QUIC_STATUS)CERT_E_CHAINING);
 #else
-    return ValidatePinnedCertificateOpenSsl(client, certificate);
+    return NetworkCertificateValidateLeafIdentity(
+        &client->connectionConfiguration.endpoint,
+        certificate->Buffer, certificate->Length);
 #endif
 }
 
@@ -853,9 +974,22 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
     switch (event->Type)
     {
         case QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED:
-            if (client->connectionConfiguration.trustMode !=
-                    NETWORK_TRUST_SHA256 ||
-                !ValidatePinnedCertificate(client, event))
+        {
+            const QUIC_BUFFER *certificate =
+                (const QUIC_BUFFER *)
+                    event->PEER_CERTIFICATE_RECEIVED.Certificate;
+            bool valid =
+                certificate != NULL &&
+                certificate->Buffer != NULL &&
+                certificate->Length != 0 &&
+                (client->connectionConfiguration.trustMode ==
+                         NETWORK_TRUST_SHA256
+                     ? ValidatePinnedCertificate(client, event)
+                     : NetworkCertificateValidateLeafIdentity(
+                           &client->connectionConfiguration.endpoint,
+                           certificate->Buffer,
+                           certificate->Length));
+            if (!valid)
             {
                 PlatformRwLockAcquireExclusive(&client->lock);
                 client->callbackReason =
@@ -867,6 +1001,7 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             client->certificateVerified = true;
             PlatformRwLockReleaseExclusive(&client->lock);
             return QUIC_STATUS_SUCCESS;
+        }
 
         case QUIC_CONNECTION_EVENT_CONNECTED:
             PlatformRwLockAcquireExclusive(&client->lock);
@@ -881,11 +1016,6 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             else
             {
                 client->transportConnected = true;
-                if (client->connectionConfiguration.trustMode ==
-                    NETWORK_TRUST_SYSTEM)
-                {
-                    client->certificateVerified = true;
-                }
             }
             PlatformRwLockReleaseExclusive(&client->lock);
             break;
@@ -894,22 +1024,35 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
         {
             QuicChannel *accepted = NULL;
             PlatformRwLockAcquireExclusive(&client->lock);
-            if ((event->PEER_STREAM_STARTED.Flags &
+            if (!client->stopping &&
+                (event->PEER_STREAM_STARTED.Flags &
                     QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL) != 0 &&
                 (event->PEER_STREAM_STARTED.Flags &
-                    QUIC_STREAM_OPEN_FLAG_0_RTT) == 0 &&
-                client->serverChannelCount <
-                    LAIUE_PROTOCOL_MAX_SERVER_STREAMS)
+                    QUIC_STREAM_OPEN_FLAG_0_RTT) == 0)
             {
-                accepted = &client->serverChannels[
-                    client->serverChannelCount++];
-                ChannelInitialize(
-                    accepted, client->api, &client->lock);
-                accepted->stream =
-                    event->PEER_STREAM_STARTED.Stream;
-                accepted->streamStarted = true;
+                for (uint32_t index = 0;
+                     index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS;
+                     ++index)
+                {
+                    if (client->serverChannels[index].stream != NULL)
+                    {
+                        continue;
+                    }
+                    accepted = &client->serverChannels[index];
+                    ChannelInitialize(
+                        accepted, client->api, &client->lock);
+                    accepted->receive =
+                        client->serverReceive[index];
+                    accepted->receiveCapacity =
+                        NETWORK_AUX_RECEIVE_CAPACITY;
+                    accepted->auxiliary = true;
+                    accepted->stream =
+                        event->PEER_STREAM_STARTED.Stream;
+                    accepted->streamStarted = true;
+                    break;
+                }
             }
-            else
+            if (accepted == NULL && !client->stopping)
             {
                 client->callbackReason =
                     NETWORK_DISCONNECT_PROTOCOL;
@@ -917,9 +1060,10 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             PlatformRwLockReleaseExclusive(&client->lock);
             if (accepted != NULL)
             {
-                client->api->SetCallbackHandler(
+                SetQuicStreamCallback(
+                    client->api,
                     event->PEER_STREAM_STARTED.Stream,
-                    (void *)ChannelStreamCallback, accepted);
+                    ChannelStreamCallback, accepted);
             }
             else
             {
@@ -998,10 +1142,22 @@ static void ClientDisconnect(
         memset(&event, 0, sizeof(event));
         event.type = NETWORK_CLIENT_EVENT_DISCONNECTED;
         event.data.disconnectReason = reason;
-        (void)ClientPushEvent(client, &event);
+        if (!ClientPushEvent(client, &event))
+        {
+            // A terminal event must never be lost behind non-terminal
+            // state. Evict the oldest queued item as a last-resort bounded
+            // shutdown path.
+            client->eventRead =
+                (client->eventRead + 1U) %
+                NETWORK_CLIENT_EVENT_CAPACITY;
+            --client->eventCount;
+            (void)ClientPushEvent(client, &event);
+        }
         client->disconnectNotified = true;
     }
-    if (!client->shutdownRequested && client->connection != NULL)
+    if (!client->shutdownRequested &&
+        client->connectionStarted &&
+        client->connection != NULL)
     {
         client->shutdownRequested = true;
         client->api->ConnectionShutdown(
@@ -1026,17 +1182,23 @@ static bool ClientPushServerModsEvent(NetworkClient *client)
 
 static bool ClientBeginProtocol(NetworkClient *client)
 {
-    if (!client->certificateVerified ||
-        client->channel.stream != NULL)
+    if (ChannelIsActive(&client->channel))
     {
         return false;
     }
+    HQUIC stream = NULL;
     if (QUIC_FAILED(client->api->StreamOpen(
             client->connection, QUIC_STREAM_OPEN_FLAG_NONE,
             ChannelStreamCallback, &client->channel,
-            &client->channel.stream)) ||
-        QUIC_FAILED(client->api->StreamStart(
-            client->channel.stream,
+            &stream)))
+    {
+        return false;
+    }
+    PlatformRwLockAcquireExclusive(&client->lock);
+    client->channel.stream = stream;
+    PlatformRwLockReleaseExclusive(&client->lock);
+    if (QUIC_FAILED(client->api->StreamStart(
+            stream,
             QUIC_STREAM_START_FLAG_IMMEDIATE |
                 QUIC_STREAM_START_FLAG_SHUTDOWN_ON_FAIL)))
     {
@@ -1075,6 +1237,14 @@ static uint32_t ChunkEditOrdinal(
            (uint32_t)edit->localY *
                LAIUE_PROTOCOL_CHUNK_SIZE +
            edit->localZ;
+}
+
+static bool ChunkCoordinatesEqual(
+    const int64_t left[3], const int64_t right[3])
+{
+    return left[0] == right[0] &&
+           left[1] == right[1] &&
+           left[2] == right[2];
 }
 
 static bool ClientHandleSnapshotChunk(
@@ -1125,6 +1295,18 @@ static bool ClientHandleSnapshotChunk(
         (uint16_t)(decoded.partIndex + 1U);
     if (client->snapshotNextPart == decoded.partCount)
     {
+        if (client->resyncRequestOutstanding &&
+            ChunkCoordinatesEqual(
+                client->resyncRequestChunk, decoded.chunk))
+        {
+            if (client->resyncResponseMatched ||
+                decoded.revision <
+                    client->resyncExpectedRevision)
+            {
+                return false;
+            }
+            client->resyncResponseMatched = true;
+        }
         ++client->receivedSnapshotChunks;
         client->snapshotNextPart = 0;
         client->snapshotPartCount = 0;
@@ -1157,7 +1339,8 @@ static bool ClientHandleSnapshotChunk(
 static bool ClientCompleteSyncIfReady(NetworkClient *client)
 {
     if (client->state != NETWORK_CONNECTION_SYNCING_WORLD ||
-        !client->snapshotEnded || !client->syncReadyReceived)
+        !client->syncBeginReceived || !client->snapshotEnded ||
+        !client->syncReadyReceived)
     {
         return true;
     }
@@ -1167,6 +1350,10 @@ static bool ClientCompleteSyncIfReady(NetworkClient *client)
     event.data.ready.peerId = client->pendingPeerId;
     event.data.ready.worldSeed = client->pendingWorldSeed;
     client->state = NETWORK_CONNECTION_READY;
+    // Every barrier owns a new acknowledgement. Clear the receive-side
+    // marker here so a later control-first SYNC_BEGIN is accepted.
+    client->syncBeginReceived = false;
+    client->syncAppliedSent = false;
     return ClientPushEvent(client, &event);
 }
 
@@ -1296,6 +1483,27 @@ static bool ClientHandleFrame(
         return false;
     }
 
+    if (frame->type == LAIUE_MESSAGE_SYNC_BEGIN)
+    {
+        if (frame->payloadSize != 0 ||
+            (client->state != NETWORK_CONNECTION_SYNCING_WORLD &&
+             client->state != NETWORK_CONNECTION_READY) ||
+            client->syncBeginReceived)
+        {
+            return false;
+        }
+        if (client->state == NETWORK_CONNECTION_READY)
+        {
+            client->state = NETWORK_CONNECTION_SYNCING_WORLD;
+            client->snapshotStarted = false;
+            client->snapshotEnded = false;
+            client->syncReadyReceived = false;
+            client->syncAppliedSent = false;
+        }
+        client->syncBeginReceived = true;
+        return ClientCompleteSyncIfReady(client);
+    }
+
     if (client->state == NETWORK_CONNECTION_SYNCING_WORLD)
     {
         if (frame->type == LAIUE_MESSAGE_SNAPSHOT_BEGIN &&
@@ -1314,6 +1522,7 @@ static bool ClientHandleFrame(
             client->snapshotServerTick = snapshot.serverTick;
             client->expectedSnapshotChunks = snapshot.chunkCount;
             client->receivedSnapshotChunks = 0;
+            client->resyncResponseMatched = false;
             client->snapshotStarted = true;
             event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN;
             event.data.snapshot.snapshotId = snapshot.snapshotId;
@@ -1349,16 +1558,24 @@ static bool ClientHandleFrame(
             event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_END;
             event.data.snapshot.snapshotId = snapshotId;
             event.data.snapshot.worldRevision = worldRevision;
+            client->snapshotWorldRevision = worldRevision;
             if (!ClientPushEvent(client, &event))
             {
                 return false;
+            }
+            if (client->resyncRequestOutstanding &&
+                client->resyncResponseMatched)
+            {
+                client->resyncRequestOutstanding = false;
+                client->resyncResponseMatched = false;
             }
             client->snapshotStarted = false;
             client->snapshotEnded = true;
             return ClientCompleteSyncIfReady(client);
         }
         if (frame->type == LAIUE_MESSAGE_SYNC_READY &&
-            frame->payloadSize == 0)
+            frame->payloadSize == 0 &&
+            client->syncBeginReceived)
         {
             client->syncReadyReceived = true;
             return ClientCompleteSyncIfReady(client);
@@ -1369,6 +1586,34 @@ static bool ClientHandleFrame(
         client->state != NETWORK_CONNECTION_READY)
     {
         return false;
+    }
+
+    if (frame->type ==
+        LAIUE_MESSAGE_CHUNK_RESYNC_CANCELLED)
+    {
+        LaiueProtocolChunkResyncRequest cancelled;
+        if (!LaiueProtocolDecodeChunkResyncCancelled(
+                frame->payload, frame->payloadSize,
+                &cancelled) ||
+            !client->resyncRequestOutstanding ||
+            !ChunkCoordinatesEqual(
+                client->resyncRequestChunk,
+                cancelled.chunk) ||
+            client->resyncExpectedRevision !=
+                cancelled.expectedRevision)
+        {
+            return false;
+        }
+        client->resyncRequestOutstanding = false;
+        client->resyncResponseMatched = false;
+        event.type =
+            NETWORK_CLIENT_EVENT_CHUNK_RESYNC_CANCELLED;
+        memcpy(event.data.chunkResyncCancelled.chunk,
+            cancelled.chunk,
+            sizeof(event.data.chunkResyncCancelled.chunk));
+        event.data.chunkResyncCancelled.expectedRevision =
+            cancelled.expectedRevision;
+        return ClientPushEvent(client, &event);
     }
 
     if (frame->type == LAIUE_MESSAGE_PLAYER_STATE ||
@@ -1501,6 +1746,23 @@ static bool ClientParseFrames(NetworkClient *client)
     for (uint32_t count = 0;
          count < LAIUE_PROTOCOL_MAX_QUEUED_FRAMES; ++count)
     {
+        if (client->state ==
+                NETWORK_CONNECTION_SYNCING_WORLD &&
+            client->syncBeginReceived &&
+            !client->snapshotEnded)
+        {
+            // Initial state and live gameplay follow SYNC_BEGIN on the
+            // ordered control stream, while the snapshot uses an independent
+            // stream. Hold all later control frames until SNAPSHOT_END so
+            // the application always observes world creation first, then
+            // inventory/drops/roster/deltas, and READY last.
+            return true;
+        }
+        if (client->eventCount >=
+            NETWORK_CLIENT_EVENT_CAPACITY - 1U)
+        {
+            return true;
+        }
         LaiueProtocolFrame frame;
         bool complete = false;
         if (!ChannelPopFrame(
@@ -1522,7 +1784,7 @@ static bool ClientParseFrames(NetworkClient *client)
             return false;
         }
     }
-    return false;
+    return true;
 }
 
 static bool IsContentStreamMessage(LaiueMessageType type)
@@ -1546,6 +1808,11 @@ static bool ClientParseServerStream(
     for (uint32_t count = 0;
          count < LAIUE_PROTOCOL_MAX_QUEUED_FRAMES; ++count)
     {
+        if (client->eventCount >=
+            NETWORK_CLIENT_EVENT_CAPACITY - 1U)
+        {
+            return true;
+        }
         LaiueMessageType type = LAIUE_MESSAGE_COUNT;
         bool complete = false;
         if (!ChannelPeekFrameType(channel, &type, &complete))
@@ -1554,14 +1821,17 @@ static bool ClientParseServerStream(
         }
         if (!complete)
         {
-            return true;
+            return !ChannelReceiveEndedWithBytes(channel);
         }
         if (type == LAIUE_MESSAGE_SNAPSHOT_BEGIN &&
             client->state == NETWORK_CONNECTION_READY)
         {
             client->state = NETWORK_CONNECTION_SYNCING_WORLD;
+            client->snapshotStarted = false;
             client->snapshotEnded = false;
+            client->syncBeginReceived = false;
             client->syncReadyReceived = false;
+            client->syncAppliedSent = false;
         }
         if (IsSnapshotStreamMessage(type) &&
             client->state == NETWORK_CONNECTION_NEGOTIATING)
@@ -1588,7 +1858,7 @@ static bool ClientParseServerStream(
             return false;
         }
     }
-    return false;
+    return true;
 }
 
 static QUIC_STATUS QUIC_API ServerConnectionCallback(
@@ -1643,10 +1913,10 @@ static QUIC_STATUS QUIC_API ServerConnectionCallback(
             PlatformRwLockReleaseExclusive(&server->lock);
             if (accept)
             {
-                server->api->SetCallbackHandler(
+                SetQuicStreamCallback(
+                    server->api,
                     event->PEER_STREAM_STARTED.Stream,
-                    (void *)ChannelStreamCallback,
-                    &peer->channel);
+                    ChannelStreamCallback, &peer->channel);
             }
             else
             {
@@ -1734,6 +2004,14 @@ static QUIC_STATUS QUIC_API ServerListenerCallback(
                 }
                 ChannelInitialize(
                     &peer->channel, server->api, &server->lock);
+                ChannelInitialize(
+                    &peer->snapshotChannel,
+                    server->api, &server->lock);
+                peer->snapshotChannel.auxiliary = true;
+                ChannelInitialize(
+                    &peer->contentChannel,
+                    server->api, &server->lock);
+                peer->contentChannel.auxiliary = true;
                 break;
             }
         }
@@ -1744,17 +2022,21 @@ static QUIC_STATUS QUIC_API ServerListenerCallback(
         return QUIC_STATUS_CONNECTION_REFUSED;
     }
 
-    server->api->SetCallbackHandler(
-        peer->connection,
-        (void *)ServerConnectionCallback, peer);
+    SetQuicConnectionCallback(
+        server->api, peer->connection,
+        ServerConnectionCallback, peer);
     QUIC_STATUS status = server->api->ConnectionSetConfiguration(
         peer->connection, server->configuration);
+    PlatformRwLockAcquireExclusive(&server->lock);
     if (QUIC_FAILED(status))
     {
-        PlatformRwLockAcquireExclusive(&server->lock);
         memset(peer, 0, sizeof(*peer));
-        PlatformRwLockReleaseExclusive(&server->lock);
     }
+    else
+    {
+        peer->listenerReady = true;
+    }
+    PlatformRwLockReleaseExclusive(&server->lock);
     (void)listener;
     return status;
 }
@@ -1773,6 +2055,35 @@ static bool ServerPushEvent(
     return true;
 }
 
+typedef struct ServerPeerCallbackState
+{
+    NetworkDisconnectReason reason;
+    bool allocated;
+    bool secureConnected;
+    bool shutdownComplete;
+    bool peerSendClosed;
+} ServerPeerCallbackState;
+
+static ServerPeerCallbackState ServerTakePeerCallbackState(
+    NetworkServer *server, NetworkServerPeer *peer)
+{
+    ServerPeerCallbackState state;
+    memset(&state, 0, sizeof(state));
+    PlatformRwLockAcquireExclusive(&server->lock);
+    state.allocated =
+        peer->allocated && peer->listenerReady;
+    if (state.allocated)
+    {
+        state.reason = peer->callbackReason;
+        peer->callbackReason = NETWORK_DISCONNECT_NONE;
+        state.secureConnected = peer->secureConnected;
+        state.shutdownComplete = peer->shutdownComplete;
+        state.peerSendClosed = peer->channel.peerSendClosed;
+    }
+    PlatformRwLockReleaseExclusive(&server->lock);
+    return state;
+}
+
 static NetworkServerPeer *ServerFindPeer(
     NetworkServer *server, uint32_t peerId)
 {
@@ -1780,31 +2091,47 @@ static NetworkServerPeer *ServerFindPeer(
     {
         return NULL;
     }
+    NetworkServerPeer *found = NULL;
+    PlatformRwLockAcquireShared(&server->lock);
     for (uint32_t index = 0;
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (peer->allocated && peer->peerId == peerId)
+        if (peer->allocated && peer->listenerReady &&
+            peer->peerId == peerId)
         {
-            return peer;
+            found = peer;
+            break;
         }
     }
-    return NULL;
+    PlatformRwLockReleaseShared(&server->lock);
+    return found;
 }
 
 static void ServerDisconnectPeer(
-    NetworkServerPeer *peer, NetworkDisconnectReason reason)
+    NetworkServer *server, NetworkServerPeer *peer,
+    NetworkDisconnectReason reason)
 {
-    if (peer == NULL || !peer->allocated || peer->closing)
+    if (server == NULL || peer == NULL)
     {
+        return;
+    }
+    HQUIC connection = NULL;
+    PlatformRwLockAcquireExclusive(&server->lock);
+    if (!peer->allocated || !peer->listenerReady ||
+        peer->closing)
+    {
+        PlatformRwLockReleaseExclusive(&server->lock);
         return;
     }
     peer->closing = true;
     peer->closeReason = reason;
-    if (peer->connection != NULL)
+    connection = peer->connection;
+    PlatformRwLockReleaseExclusive(&server->lock);
+    if (connection != NULL)
     {
-        peer->server->api->ConnectionShutdown(
-            peer->connection,
+        server->api->ConnectionShutdown(
+            connection,
             QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,
             reason == NETWORK_DISCONNECT_OVERFLOW
                 ? NETWORK_APP_ERROR_OVERFLOW
@@ -1812,32 +2139,73 @@ static void ServerDisconnectPeer(
     }
 }
 
-static void ServerFinalizePeer(NetworkServerPeer *peer)
+static void ServerFinalizePeer(
+    NetworkServer *server, NetworkServerPeer *peer)
 {
-    NetworkServer *server = peer->server;
-    uint32_t peerId = peer->peerId;
+    uint32_t peerId = 0;
     NetworkDisconnectReason reason =
+        NETWORK_DISCONNECT_REMOTE;
+    bool notify = false;
+    HQUIC controlStream = NULL;
+    HQUIC snapshotStream = NULL;
+    HQUIC contentStream = NULL;
+    HQUIC connection = NULL;
+
+    PlatformRwLockAcquireExclusive(&server->lock);
+    if (!peer->allocated || !peer->listenerReady ||
+        !peer->closing || !peer->shutdownComplete ||
+        (peer->channel.stream != NULL &&
+         !peer->channel.shutdownComplete) ||
+        (peer->snapshotChannel.stream != NULL &&
+         !peer->snapshotChannel.shutdownComplete) ||
+        (peer->contentChannel.stream != NULL &&
+         !peer->contentChannel.shutdownComplete))
+    {
+        PlatformRwLockReleaseExclusive(&server->lock);
+        return;
+    }
+    peerId = peer->peerId;
+    reason =
         peer->closeReason != NETWORK_DISCONNECT_NONE
             ? peer->closeReason
             : NETWORK_DISCONNECT_REMOTE;
-    bool notify = peer->connectedNotified;
-    if (peer->channel.stream != NULL)
+    notify = peer->connectedNotified;
+    if (notify &&
+        server->eventCount >= NETWORK_SERVER_EVENT_CAPACITY)
     {
-        server->api->StreamClose(peer->channel.stream);
+        // Keep the closed slot until the main thread drains room for the
+        // mandatory terminal event. The next update retries finalization.
+        PlatformRwLockReleaseExclusive(&server->lock);
+        return;
     }
-    if (peer->snapshotChannel.stream != NULL)
+    controlStream = peer->channel.stream;
+    snapshotStream = peer->snapshotChannel.stream;
+    contentStream = peer->contentChannel.stream;
+    connection = peer->connection;
+    PlatformRwLockReleaseExclusive(&server->lock);
+
+    if (controlStream != NULL)
     {
-        server->api->StreamClose(peer->snapshotChannel.stream);
+        server->api->StreamClose(controlStream);
     }
-    if (peer->contentChannel.stream != NULL)
+    if (snapshotStream != NULL)
     {
-        server->api->StreamClose(peer->contentChannel.stream);
+        server->api->StreamClose(snapshotStream);
     }
-    if (peer->connection != NULL)
+    if (contentStream != NULL)
     {
-        server->api->ConnectionClose(peer->connection);
+        server->api->StreamClose(contentStream);
     }
+    if (connection != NULL)
+    {
+        server->api->ConnectionClose(connection);
+    }
+
+    // ConnectionClose/StreamClose synchronously retire their callback
+    // handles. Only now may the slot be exposed for listener reuse.
+    PlatformRwLockAcquireExclusive(&server->lock);
     memset(peer, 0, sizeof(*peer));
+    PlatformRwLockReleaseExclusive(&server->lock);
     if (notify)
     {
         NetworkServerEvent event;
@@ -1939,28 +2307,33 @@ static bool ServerOpenSendStream(
     {
         return false;
     }
-    if (channel->stream != NULL)
+    if (ChannelIsActive(channel))
     {
-        return channel->callbackError ==
-               NETWORK_DISCONNECT_NONE;
+        return false;
     }
     ChannelInitialize(
         channel, peer->server->api, &peer->server->lock);
+    channel->auxiliary = true;
+    HQUIC stream = NULL;
     if (QUIC_FAILED(peer->server->api->StreamOpen(
             peer->connection,
             QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
-            ChannelStreamCallback, channel, &channel->stream)))
+            ChannelStreamCallback, channel, &stream)))
     {
-        channel->stream = NULL;
         return false;
     }
+    PlatformRwLockAcquireExclusive(&peer->server->lock);
+    channel->stream = stream;
+    PlatformRwLockReleaseExclusive(&peer->server->lock);
     if (QUIC_FAILED(peer->server->api->StreamStart(
-            channel->stream,
+            stream,
             QUIC_STREAM_START_FLAG_IMMEDIATE |
                 QUIC_STREAM_START_FLAG_SHUTDOWN_ON_FAIL)))
     {
-        peer->server->api->StreamClose(channel->stream);
+        peer->server->api->StreamClose(stream);
+        PlatformRwLockAcquireExclusive(&peer->server->lock);
         channel->stream = NULL;
+        PlatformRwLockReleaseExclusive(&peer->server->lock);
         return false;
     }
     return true;
@@ -2021,10 +2394,8 @@ static bool ServerPumpContentTransfer(
                 return false;
             }
             peer->contentTransferActive = false;
-            peer->server->api->StreamShutdown(
-                peer->contentChannel.stream,
-                QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
-            return true;
+            return ChannelShutdownGracefully(
+                &peer->contentChannel);
         }
         uint64_t remaining =
             server->contentBundleSize - peer->contentOffset;
@@ -2042,6 +2413,41 @@ static bool ServerPumpContentTransfer(
         }
         peer->contentOffset += chunkSize;
     }
+    return true;
+}
+
+static bool ServerAcceptChunkResyncRequest(
+    NetworkServer *server, NetworkServerPeer *peer,
+    const LaiueProtocolFrame *frame)
+{
+    LaiueProtocolChunkResyncRequest request;
+    if (peer->resyncRequestOutstanding ||
+        !LaiueProtocolDecodeChunkResyncRequest(
+            frame->payload, frame->payloadSize, &request))
+    {
+        return false;
+    }
+
+    NetworkServerEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type =
+        NETWORK_SERVER_EVENT_CHUNK_RESYNC_REQUEST;
+    event.peerId = peer->peerId;
+    memcpy(event.data.chunkResync.chunk, request.chunk,
+        sizeof(event.data.chunkResync.chunk));
+    event.data.chunkResync.expectedRevision =
+        request.expectedRevision;
+    if (!ServerPushEvent(server, &event))
+    {
+        return false;
+    }
+
+    memcpy(peer->resyncRequestChunk, request.chunk,
+        sizeof(peer->resyncRequestChunk));
+    peer->resyncExpectedRevision =
+        request.expectedRevision;
+    peer->resyncRequestOutstanding = true;
+    peer->resyncResponseMatched = false;
     return true;
 }
 
@@ -2117,12 +2523,67 @@ static bool ServerHandleFrame(
 
     if (!peer->ready)
     {
-        return frame->type == LAIUE_MESSAGE_PING &&
-                       frame->payloadSize == 0
-                   ? ChannelSendPayload(
-                         &peer->channel, LAIUE_MESSAGE_PONG,
-                         NULL, 0)
-                   : false;
+        if (frame->type == LAIUE_MESSAGE_SYNC_APPLIED &&
+            peer->awaitingSyncApplied &&
+            !peer->snapshotStarted)
+        {
+            uint64_t snapshotId = 0;
+            uint64_t worldRevision = 0;
+            if (!LaiueProtocolDecodeSyncApplied(
+                    frame->payload, frame->payloadSize,
+                    &snapshotId, &worldRevision) ||
+                snapshotId != peer->snapshotId ||
+                worldRevision != peer->snapshotWorldRevision)
+            {
+                return false;
+            }
+            peer->awaitingSyncApplied = false;
+            peer->ready = true;
+            peer->everReady = true;
+            return true;
+        }
+        if (frame->type == LAIUE_MESSAGE_PING &&
+            frame->payloadSize == 0)
+        {
+            return ChannelSendPayload(
+                &peer->channel, LAIUE_MESSAGE_PONG, NULL, 0);
+        }
+        if (!peer->everReady)
+        {
+            return false;
+        }
+
+        // SYNC_BEGIN is ordered on the control stream, but gameplay frames
+        // already sent by a previously-ready client can still be in flight.
+        // Validate and discard only those well-formed stale commands.
+        if (frame->type == LAIUE_MESSAGE_PLAYER_INPUT)
+        {
+            LaiueProtocolInput ignored;
+            return LaiueProtocolDecodeInput(
+                frame->payload, frame->payloadSize, &ignored);
+        }
+        if (frame->type == LAIUE_MESSAGE_EDIT_INTENT)
+        {
+            bool breakBlock = false;
+            bool placeBlock = false;
+            uint8_t placementBlock = 0;
+            float direction[3];
+            return LaiueProtocolDecodeEditIntent(
+                frame->payload, frame->payloadSize,
+                &breakBlock, &placeBlock, &placementBlock,
+                direction);
+        }
+        if (frame->type == LAIUE_MESSAGE_SELECT_HOTBAR_SLOT)
+        {
+            return frame->payloadSize == 1U &&
+                   frame->payload[0] < 9U;
+        }
+        if (frame->type == LAIUE_MESSAGE_CHUNK_RESYNC_REQUEST)
+        {
+            return ServerAcceptChunkResyncRequest(
+                server, peer, frame);
+        }
+        return false;
     }
     if (frame->type == LAIUE_MESSAGE_PLAYER_INPUT)
     {
@@ -2166,21 +2627,8 @@ static bool ServerHandleFrame(
     }
     if (frame->type == LAIUE_MESSAGE_CHUNK_RESYNC_REQUEST)
     {
-        LaiueProtocolChunkResyncRequest request;
-        if (!LaiueProtocolDecodeChunkResyncRequest(
-                frame->payload, frame->payloadSize, &request))
-        {
-            return false;
-        }
-        event.type = NETWORK_SERVER_EVENT_CHUNK_RESYNC_REQUEST;
-        for (uint32_t axis = 0; axis < 3U; ++axis)
-        {
-            event.data.chunkResync.chunk[axis] =
-                request.chunk[axis];
-        }
-        event.data.chunkResync.expectedRevision =
-            request.expectedRevision;
-        return ServerPushEvent(server, &event);
+        return ServerAcceptChunkResyncRequest(
+            server, peer, frame);
     }
     return frame->type == LAIUE_MESSAGE_PING &&
                    frame->payloadSize == 0
@@ -2197,6 +2645,11 @@ static bool ServerParseFrames(
     for (uint32_t count = 0;
          count < LAIUE_PROTOCOL_MAX_QUEUED_FRAMES; ++count)
     {
+        if (server->eventCount >=
+            NETWORK_SERVER_EVENT_CAPACITY - 1U)
+        {
+            return true;
+        }
         LaiueProtocolFrame frame;
         bool complete = false;
         if (!ChannelPopFrame(
@@ -2213,7 +2666,7 @@ static bool ServerParseFrames(
             return false;
         }
     }
-    return false;
+    return true;
 }
 
 NetworkSecureTransportStatus NetworkGetSecureTransportStatus(void)
@@ -2234,23 +2687,23 @@ static bool LoadClientCredentials(NetworkClient *client)
     QUIC_CREDENTIAL_CONFIG credentials;
     memset(&credentials, 0, sizeof(credentials));
     credentials.Type = QUIC_CREDENTIAL_TYPE_NONE;
-    credentials.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+    credentials.Flags =
+        QUIC_CREDENTIAL_FLAG_CLIENT |
+        QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED |
+        QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES;
+#if !defined(_WIN32)
+    credentials.Flags |=
+        QUIC_CREDENTIAL_FLAG_USE_TLS_BUILTIN_CERTIFICATE_VALIDATION;
+#endif
     if (client->connectionConfiguration.trustMode ==
         NETWORK_TRUST_SHA256)
     {
         credentials.Flags |=
-            QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED |
-            QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES;
-#if defined(_WIN32)
-        credentials.Flags |=
             QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION;
-#else
-        // Built-in OpenSSL validation supplies chain status to the deferred
-        // certificate indication. The application then additionally checks
-        // the exact leaf pin, validity period and SAN.
-        credentials.Flags |=
-            QUIC_CREDENTIAL_FLAG_USE_TLS_BUILTIN_CERTIFICATE_VALIDATION;
-#endif
+        // Keep the TLS backend's chain result available, but defer the final
+        // decision to the exact DER pin plus our strict validity/SAN check.
+        // This lets a pre-shared pin act as the trust anchor for a self-signed
+        // certificate without the dangerous NO_CERTIFICATE_VALIDATION mode.
     }
     return !QUIC_FAILED(client->api->ConfigurationLoadCredential(
         client->configuration, &credentials));
@@ -2282,6 +2735,21 @@ NetworkClient *NetworkClientCreate(
     }
     ChannelInitialize(
         &client->channel, client->api, &client->lock);
+    client->channel.receive = client->controlReceive;
+    client->channel.receiveCapacity =
+        NETWORK_CONTROL_RECEIVE_CAPACITY;
+    for (uint32_t index = 0;
+         index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
+    {
+        ChannelInitialize(
+            &client->serverChannels[index],
+            client->api, &client->lock);
+        client->serverChannels[index].receive =
+            client->serverReceive[index];
+        client->serverChannels[index].receiveCapacity =
+            NETWORK_AUX_RECEIVE_CAPACITY;
+        client->serverChannels[index].auxiliary = true;
+    }
     if (!OpenConfiguration(
             client->api, client->registration, false,
             configuration->handshakeTimeoutMs,
@@ -2302,9 +2770,11 @@ NetworkClient *NetworkClientCreate(
         configuration->endpoint.port);
     if (QUIC_FAILED(status))
     {
-        NetworkClientDestroy(client);
-        return NULL;
+        ClientDisconnect(
+            client, TransportStatusReason(status, false));
+        return client;
     }
+    client->connectionStarted = true;
     client->state = NETWORK_CONNECTION_VERIFYING_SERVER;
     return client;
 }
@@ -2329,31 +2799,26 @@ void NetworkClientDestroy(NetworkClient *client)
     {
         return;
     }
-    if (client->connection != NULL)
+    HQUIC connection = NULL;
+    bool connectionStarted = false;
+    PlatformRwLockAcquireExclusive(&client->lock);
+    client->stopping = true;
+    connection = client->connection;
+    connectionStarted = client->connectionStarted;
+    PlatformRwLockReleaseExclusive(&client->lock);
+    if (connection != NULL)
     {
-        client->api->ConnectionShutdown(
-            client->connection,
-            QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT,
-            NETWORK_APP_ERROR_SHUTDOWN);
-    }
-    if (client->channel.stream != NULL)
-    {
-        client->api->StreamClose(client->channel.stream);
-        client->channel.stream = NULL;
-    }
-    for (uint32_t index = 0;
-         index < client->serverChannelCount; ++index)
-    {
-        if (client->serverChannels[index].stream != NULL)
+        if (connectionStarted)
         {
-            client->api->StreamClose(
-                client->serverChannels[index].stream);
-            client->serverChannels[index].stream = NULL;
+            client->api->ConnectionShutdown(
+                connection,
+                QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT,
+                NETWORK_APP_ERROR_SHUTDOWN);
         }
-    }
-    if (client->connection != NULL)
-    {
-        client->api->ConnectionClose(client->connection);
+        // ConnectionClose is synchronous by default and owns forced
+        // teardown of every associated stream. Closing started child
+        // streams before SHUTDOWN_COMPLETE is undefined in MsQuic.
+        client->api->ConnectionClose(connection);
         client->connection = NULL;
     }
     if (client->configuration != NULL)
@@ -2396,16 +2861,15 @@ void NetworkClientUpdate(NetworkClient *client)
     {
         reason = channelReason;
     }
-    uint32_t serverChannelCount;
-    PlatformRwLockAcquireShared(&client->lock);
-    serverChannelCount = client->serverChannelCount;
-    PlatformRwLockReleaseShared(&client->lock);
     for (uint32_t index = 0;
-         index < serverChannelCount &&
+         index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS &&
          reason == NETWORK_DISCONNECT_NONE; ++index)
     {
-        reason = ChannelTakeError(
-            &client->serverChannels[index]);
+        if (ChannelIsActive(&client->serverChannels[index]))
+        {
+            reason = ChannelTakeError(
+                &client->serverChannels[index]);
+        }
     }
     if (reason != NETWORK_DISCONNECT_NONE)
     {
@@ -2430,10 +2894,22 @@ void NetworkClientUpdate(NetworkClient *client)
         return;
     }
     for (uint32_t index = 0;
-         index < serverChannelCount; ++index)
+         index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
     {
+        if (!ChannelIsActive(&client->serverChannels[index]))
+        {
+            continue;
+        }
         if (!ClientParseServerStream(
                 client, &client->serverChannels[index]))
+        {
+            ClientDisconnect(
+                client, NETWORK_DISCONNECT_PROTOCOL);
+            return;
+        }
+        bool retired = false;
+        if (!ChannelTryRetireAuxiliary(
+                &client->serverChannels[index], &retired))
         {
             ClientDisconnect(
                 client, NETWORK_DISCONNECT_PROTOCOL);
@@ -2450,10 +2926,42 @@ void NetworkClientUpdate(NetworkClient *client)
         client->connectionConfiguration.idleTimeoutMs != 0
             ? client->connectionConfiguration.idleTimeoutMs
             : (uint32_t)NETWORK_IDLE_TIMEOUT_MS;
+    if (client->state == NETWORK_CONNECTION_READY)
+    {
+        uint32_t keepAliveInterval = idleTimeout / 3U;
+        if (keepAliveInterval < 1000U)
+        {
+            keepAliveInterval = 1000U;
+        }
+        if (now - ChannelLastSendAt(&client->channel) >=
+                keepAliveInterval &&
+            !ChannelSendPayload(
+                &client->channel, LAIUE_MESSAGE_PING, NULL, 0))
+        {
+            ClientDisconnect(client, NETWORK_DISCONNECT_IO);
+            return;
+        }
+    }
+    uint64_t lastActivity =
+        ChannelLastActivityAt(&client->channel);
+    for (uint32_t index = 0;
+         index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
+    {
+        if (!ChannelIsActive(&client->serverChannels[index]))
+        {
+            continue;
+        }
+        uint64_t channelActivity =
+            ChannelLastActivityAt(&client->serverChannels[index]);
+        if (channelActivity > lastActivity)
+        {
+            lastActivity = channelActivity;
+        }
+    }
     uint64_t deadline =
         client->state == NETWORK_CONNECTION_VERIFYING_SERVER
             ? client->channel.connectedAtMs + handshakeTimeout
-            : client->channel.lastReceiveAtMs +
+            : lastActivity +
                   (client->state == NETWORK_CONNECTION_NEGOTIATING ||
                            client->state ==
                                NETWORK_CONNECTION_SYNCING_WORLD
@@ -2631,7 +3139,8 @@ bool NetworkClientRequestChunkResync(
     uint64_t expectedRevision)
 {
     if (client == NULL || chunk == NULL ||
-        client->state != NETWORK_CONNECTION_READY)
+        client->state != NETWORK_CONNECTION_READY ||
+        client->resyncRequestOutstanding)
     {
         return false;
     }
@@ -2642,11 +3151,46 @@ bool NetworkClientRequestChunkResync(
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodeChunkResyncRequest(
         payload, sizeof(payload), &request);
-    return size != 0 &&
-           ChannelSendPayload(
-               &client->channel,
-               LAIUE_MESSAGE_CHUNK_RESYNC_REQUEST,
-               payload, size);
+    if (size == 0 ||
+        !ChannelSendPayload(
+            &client->channel,
+            LAIUE_MESSAGE_CHUNK_RESYNC_REQUEST,
+            payload, size))
+    {
+        return false;
+    }
+    memcpy(client->resyncRequestChunk, chunk,
+        sizeof(client->resyncRequestChunk));
+    client->resyncExpectedRevision = expectedRevision;
+    client->resyncRequestOutstanding = true;
+    client->resyncResponseMatched = false;
+    return true;
+}
+
+bool NetworkClientAcknowledgeReady(NetworkClient *client)
+{
+    if (client == NULL ||
+        client->state != NETWORK_CONNECTION_READY)
+    {
+        return false;
+    }
+    if (client->syncAppliedSent)
+    {
+        return true;
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeSyncApplied(
+        payload, sizeof(payload), client->snapshotId,
+        client->snapshotWorldRevision);
+    if (size == 0 ||
+        !ChannelSendPayload(
+            &client->channel,
+            LAIUE_MESSAGE_SYNC_APPLIED, payload, size))
+    {
+        return false;
+    }
+    client->syncAppliedSent = true;
+    return true;
 }
 
 #if !defined(_WIN32)
@@ -2836,7 +3380,9 @@ void NetworkServerDestroy(NetworkServer *server)
     {
         return;
     }
+    PlatformRwLockAcquireExclusive(&server->lock);
     server->stopping = true;
+    PlatformRwLockReleaseExclusive(&server->lock);
     if (server->listener != NULL)
     {
         server->api->ListenerStop(server->listener);
@@ -2856,27 +3402,24 @@ void NetworkServerDestroy(NetworkServer *server)
              index < server->maximumPeers; ++index)
         {
             NetworkServerPeer *peer = &server->peers[index];
-            if (!peer->allocated)
+            HQUIC connection = NULL;
+            PlatformRwLockAcquireExclusive(&server->lock);
+            bool allocated = peer->allocated;
+            if (allocated)
+            {
+                connection = peer->connection;
+            }
+            PlatformRwLockReleaseExclusive(&server->lock);
+            if (!allocated)
             {
                 continue;
             }
-            if (peer->channel.stream != NULL)
+            if (connection != NULL)
             {
-                server->api->StreamClose(peer->channel.stream);
-            }
-            if (peer->snapshotChannel.stream != NULL)
-            {
-                server->api->StreamClose(
-                    peer->snapshotChannel.stream);
-            }
-            if (peer->contentChannel.stream != NULL)
-            {
-                server->api->StreamClose(
-                    peer->contentChannel.stream);
-            }
-            if (peer->connection != NULL)
-            {
-                server->api->ConnectionClose(peer->connection);
+                // RegistrationShutdown has initiated a silent teardown.
+                // ConnectionClose synchronously owns any child streams that
+                // have not yet reported SHUTDOWN_COMPLETE.
+                server->api->ConnectionClose(connection);
             }
         }
     }
@@ -2908,13 +3451,14 @@ void NetworkServerUpdate(NetworkServer *server)
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (!peer->allocated)
+        ServerPeerCallbackState callbackState =
+            ServerTakePeerCallbackState(server, peer);
+        if (!callbackState.allocated)
         {
             continue;
         }
 
-        NetworkDisconnectReason reason = peer->callbackReason;
-        peer->callbackReason = NETWORK_DISCONNECT_NONE;
+        NetworkDisconnectReason reason = callbackState.reason;
         NetworkDisconnectReason channelReason =
             ChannelTakeError(&peer->channel);
         if (reason == NETWORK_DISCONNECT_NONE)
@@ -2922,64 +3466,100 @@ void NetworkServerUpdate(NetworkServer *server)
             reason = channelReason;
         }
         if (reason == NETWORK_DISCONNECT_NONE &&
-            peer->snapshotChannel.stream != NULL)
+            ChannelIsActive(&peer->snapshotChannel))
         {
             reason = ChannelTakeError(
                 &peer->snapshotChannel);
         }
         if (reason == NETWORK_DISCONNECT_NONE &&
-            peer->contentChannel.stream != NULL)
+            ChannelIsActive(&peer->contentChannel))
         {
             reason = ChannelTakeError(&peer->contentChannel);
         }
-        if (peer->channel.peerSendClosed &&
+        bool retired = false;
+        if (reason == NETWORK_DISCONNECT_NONE &&
+            !ChannelTryRetireAuxiliary(
+                &peer->snapshotChannel, &retired))
+        {
+            reason = NETWORK_DISCONNECT_PROTOCOL;
+        }
+        if (reason == NETWORK_DISCONNECT_NONE &&
+            !ChannelTryRetireAuxiliary(
+                &peer->contentChannel, &retired))
+        {
+            reason = NETWORK_DISCONNECT_PROTOCOL;
+        }
+        if (callbackState.peerSendClosed &&
             reason == NETWORK_DISCONNECT_NONE)
         {
             reason = NETWORK_DISCONNECT_REMOTE;
         }
         if (reason != NETWORK_DISCONNECT_NONE)
         {
-            ServerDisconnectPeer(peer, reason);
+            ServerDisconnectPeer(server, peer, reason);
         }
         if (!peer->closing &&
             (!ServerParseFrames(server, peer) ||
              !ServerPumpContentTransfer(server, peer)))
         {
             ServerDisconnectPeer(
-                peer, NETWORK_DISCONNECT_PROTOCOL);
+                server, peer, NETWORK_DISCONNECT_PROTOCOL);
         }
         if (!peer->closing)
         {
             uint64_t deadline;
-            if (!peer->secureConnected)
+            if (!callbackState.secureConnected)
             {
                 deadline = peer->channel.connectedAtMs +
                            server->handshakeTimeoutMs;
             }
             else
             {
-                uint64_t idleLimit =
-                    peer->negotiated
-                        ? server->idleTimeoutMs
-                        : NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS;
-                deadline =
-                    peer->channel.lastReceiveAtMs + idleLimit;
+                if (peer->ready)
+                {
+                    deadline =
+                        ChannelLastReceiveAt(&peer->channel) +
+                        server->idleTimeoutMs;
+                }
+                else
+                {
+                    uint64_t lastActivity =
+                        ChannelLastActivityAt(&peer->channel);
+                    if (ChannelIsActive(&peer->snapshotChannel))
+                    {
+                        uint64_t snapshotActivity =
+                            ChannelLastActivityAt(
+                                &peer->snapshotChannel);
+                        if (snapshotActivity > lastActivity)
+                            lastActivity = snapshotActivity;
+                    }
+                    if (ChannelIsActive(&peer->contentChannel))
+                    {
+                        uint64_t contentActivity =
+                            ChannelLastActivityAt(
+                                &peer->contentChannel);
+                        if (contentActivity > lastActivity)
+                            lastActivity = contentActivity;
+                    }
+                    deadline = lastActivity +
+                        NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS;
+                }
             }
             if (now > deadline)
             {
                 ServerDisconnectPeer(
-                    peer, NETWORK_DISCONNECT_TIMEOUT);
+                    server, peer, NETWORK_DISCONNECT_TIMEOUT);
             }
             else if (peer->rejected &&
                      ChannelOutstandingSends(&peer->channel) == 0)
             {
                 ServerDisconnectPeer(
-                    peer, NETWORK_DISCONNECT_REMOTE);
+                    server, peer, NETWORK_DISCONNECT_REMOTE);
             }
         }
-        if (peer->closing && peer->shutdownComplete)
+        if (peer->closing && callbackState.shutdownComplete)
         {
-            ServerFinalizePeer(peer);
+            ServerFinalizePeer(server, peer);
         }
     }
 }
@@ -2999,24 +3579,36 @@ bool NetworkServerPollEvent(
     return true;
 }
 
-static bool ServerPeerCanSync(const NetworkServerPeer *peer)
+static bool ServerPeerCanSync(
+    NetworkServer *server, const NetworkServerPeer *peer)
 {
-    return peer != NULL && peer->allocated && peer->negotiated &&
-           !peer->closing && peer->channel.stream != NULL;
+    if (server == NULL || peer == NULL)
+    {
+        return false;
+    }
+    PlatformRwLockAcquireShared(&server->lock);
+    bool canSync =
+        peer->allocated && peer->listenerReady &&
+        peer->negotiated && !peer->closing &&
+        peer->channel.stream != NULL;
+    PlatformRwLockReleaseShared(&server->lock);
+    return canSync;
 }
 
 static bool ServerSendToPeer(
-    NetworkServerPeer *peer, LaiueMessageType type,
+    NetworkServer *server, NetworkServerPeer *peer,
+    LaiueMessageType type,
     const uint8_t *payload, uint32_t size, bool requireReady)
 {
-    if (!ServerPeerCanSync(peer) ||
+    if (!ServerPeerCanSync(server, peer) ||
         (requireReady && !peer->ready))
     {
         return false;
     }
     if (!ChannelSendPayload(&peer->channel, type, payload, size))
     {
-        ServerDisconnectPeer(peer, NETWORK_DISCONNECT_OVERFLOW);
+        ServerDisconnectPeer(
+            server, peer, NETWORK_DISCONNECT_OVERFLOW);
         return false;
     }
     return true;
@@ -3054,12 +3646,12 @@ bool NetworkServerSendPlayerState(
     uint32_t size = 0;
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
     if (!EncodePlayerState(payload, state, &size) ||
-        !ServerPeerCanSync(peer))
+        !ServerPeerCanSync(server, peer))
     {
         return false;
     }
     return ServerSendToPeer(
-        peer,
+        server, peer,
         peer->ready ? LAIUE_MESSAGE_PLAYER_STATE
                     : LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY,
         payload, size, false);
@@ -3083,14 +3675,11 @@ bool NetworkServerBroadcastPlayerState(
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (ServerPeerCanSync(peer))
+        if (ServerPeerCanSync(server, peer) && peer->ready)
         {
             succeeded =
                 ServerSendToPeer(
-                    peer,
-                    peer->ready
-                        ? LAIUE_MESSAGE_PLAYER_STATE
-                        : LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY,
+                    server, peer, LAIUE_MESSAGE_PLAYER_STATE,
                     payload, size, false) &&
                 succeeded;
         }
@@ -3140,7 +3729,7 @@ bool NetworkServerSendBlockDelta(
     uint32_t size = 0;
     return EncodeBlockDelta(server, delta, payload, &size) &&
            ServerSendToPeer(
-               ServerFindPeer(server, peerId),
+               server, ServerFindPeer(server, peerId),
                LAIUE_MESSAGE_BLOCK_DELTA,
                payload, size, false);
 }
@@ -3159,11 +3748,11 @@ bool NetworkServerBroadcastBlockDelta(
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (ServerPeerCanSync(peer))
+        if (ServerPeerCanSync(server, peer))
         {
             succeeded =
                 ServerSendToPeer(
-                    peer, LAIUE_MESSAGE_BLOCK_DELTA,
+                    server, peer, LAIUE_MESSAGE_BLOCK_DELTA,
                     payload, size, false) &&
                 succeeded;
         }
@@ -3176,7 +3765,8 @@ bool NetworkServerSendSnapshotBegin(
     const NetworkSnapshotInfo *snapshot)
 {
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
-    if (!ServerPeerCanSync(peer) || peer->snapshotStarted ||
+    if (!ServerPeerCanSync(server, peer) ||
+        peer->snapshotStarted ||
         snapshot == NULL ||
         snapshot->peerId != peerId ||
         snapshot->worldSeed != server->worldSeed)
@@ -3201,11 +3791,20 @@ bool NetworkServerSendSnapshotBegin(
         return false;
     }
     if (!ChannelSendPayload(
+            &peer->channel, LAIUE_MESSAGE_SYNC_BEGIN, NULL, 0))
+    {
+        ServerDisconnectPeer(
+            server, peer, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    peer->ready = false;
+    peer->awaitingSyncApplied = false;
+    if (!ChannelSendPayload(
             &peer->snapshotChannel,
             LAIUE_MESSAGE_SNAPSHOT_BEGIN, payload, size))
     {
         ServerDisconnectPeer(
-            peer, NETWORK_DISCONNECT_OVERFLOW);
+            server, peer, NETWORK_DISCONNECT_OVERFLOW);
         return false;
     }
     peer->snapshotId = snapshot->snapshotId;
@@ -3214,7 +3813,6 @@ bool NetworkServerSendSnapshotBegin(
     peer->snapshotNextPart = 0;
     peer->snapshotPartCount = 0;
     peer->snapshotStarted = true;
-    peer->ready = false;
     return true;
 }
 
@@ -3223,7 +3821,8 @@ bool NetworkServerSendSnapshotChunk(
     const NetworkChunkDelta *chunk)
 {
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
-    if (!ServerPeerCanSync(peer) || !peer->snapshotStarted ||
+    if (!ServerPeerCanSync(server, peer) ||
+        !peer->snapshotStarted ||
         peer->ready || chunk == NULL ||
         peer->sentSnapshotChunks >=
             peer->expectedSnapshotChunks)
@@ -3250,6 +3849,15 @@ bool NetworkServerSendSnapshotChunk(
         wire.edits[index].localZ = chunk->edits[index].localZ;
         wire.edits[index].replacement =
             chunk->edits[index].replacement;
+    }
+    bool resyncChunk =
+        peer->resyncRequestOutstanding &&
+        ChunkCoordinatesEqual(
+            peer->resyncRequestChunk, wire.chunk);
+    if (resyncChunk &&
+        wire.revision < peer->resyncExpectedRevision)
+    {
+        return false;
     }
 
     if (wire.partIndex == 0)
@@ -3283,7 +3891,7 @@ bool NetworkServerSendSnapshotChunk(
         if (size != 0)
         {
             ServerDisconnectPeer(
-                peer, NETWORK_DISCONNECT_OVERFLOW);
+                server, peer, NETWORK_DISCONNECT_OVERFLOW);
         }
         return false;
     }
@@ -3304,6 +3912,14 @@ bool NetworkServerSendSnapshotChunk(
         (uint16_t)(wire.partIndex + 1U);
     if (peer->snapshotNextPart == wire.partCount)
     {
+        if (resyncChunk)
+        {
+            if (peer->resyncResponseMatched)
+            {
+                return false;
+            }
+            peer->resyncResponseMatched = true;
+        }
         ++peer->sentSnapshotChunks;
         peer->snapshotNextPart = 0;
         peer->snapshotPartCount = 0;
@@ -3317,9 +3933,12 @@ bool NetworkServerSendSnapshotEnd(
     uint64_t snapshotId, uint64_t worldRevision)
 {
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
-    if (!ServerPeerCanSync(peer) || !peer->snapshotStarted ||
+    if (!ServerPeerCanSync(server, peer) ||
+        !peer->snapshotStarted ||
         peer->ready || peer->snapshotId != snapshotId ||
         peer->snapshotNextPart != 0 ||
+        (peer->resyncRequestOutstanding &&
+         !peer->resyncResponseMatched) ||
         peer->sentSnapshotChunks !=
             peer->expectedSnapshotChunks)
     {
@@ -3336,7 +3955,7 @@ bool NetworkServerSendSnapshotEnd(
         if (size != 0)
         {
             ServerDisconnectPeer(
-                peer, NETWORK_DISCONNECT_OVERFLOW);
+                server, peer, NETWORK_DISCONNECT_OVERFLOW);
         }
         return false;
     }
@@ -3344,11 +3963,57 @@ bool NetworkServerSendSnapshotEnd(
             &peer->channel, LAIUE_MESSAGE_SYNC_READY, NULL, 0))
     {
         ServerDisconnectPeer(
-            peer, NETWORK_DISCONNECT_OVERFLOW);
+            server, peer, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    if (!ChannelShutdownGracefully(&peer->snapshotChannel))
+    {
+        ServerDisconnectPeer(
+            server, peer, NETWORK_DISCONNECT_IO);
         return false;
     }
     peer->snapshotStarted = false;
-    peer->ready = true;
+    peer->snapshotWorldRevision = worldRevision;
+    peer->awaitingSyncApplied = true;
+    if (peer->resyncRequestOutstanding)
+    {
+        peer->resyncRequestOutstanding = false;
+        peer->resyncResponseMatched = false;
+    }
+    return true;
+}
+
+bool NetworkServerSendChunkResyncCancelled(
+    NetworkServer *server, uint32_t peerId,
+    const int64_t chunk[3], uint64_t expectedRevision)
+{
+    NetworkServerPeer *peer = ServerFindPeer(server, peerId);
+    if (!ServerPeerCanSync(server, peer) || chunk == NULL ||
+        !peer->resyncRequestOutstanding ||
+        !ChunkCoordinatesEqual(
+            peer->resyncRequestChunk, chunk) ||
+        peer->resyncExpectedRevision != expectedRevision)
+    {
+        return false;
+    }
+    LaiueProtocolChunkResyncRequest cancelled = {
+        { chunk[0], chunk[1], chunk[2] },
+        expectedRevision,
+    };
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size =
+        LaiueProtocolEncodeChunkResyncCancelled(
+            payload, sizeof(payload), &cancelled);
+    if (size == 0 ||
+        !ServerSendToPeer(
+            server, peer,
+            LAIUE_MESSAGE_CHUNK_RESYNC_CANCELLED,
+            payload, size, false))
+    {
+        return false;
+    }
+    peer->resyncRequestOutstanding = false;
+    peer->resyncResponseMatched = false;
     return true;
 }
 
@@ -3361,7 +4026,8 @@ static bool ServerSendPeerId(
     uint32_t size = LaiueProtocolEncodePeerId(
         payload, sizeof(payload), value);
     return size != 0 &&
-           ServerSendToPeer(peer, type, payload, size, false);
+           ServerSendToPeer(
+               server, peer, type, payload, size, false);
 }
 
 static bool ServerBroadcastPeerId(
@@ -3384,11 +4050,11 @@ static bool ServerBroadcastPeerId(
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (ServerPeerCanSync(peer))
+        if (ServerPeerCanSync(server, peer))
         {
             succeeded =
                 ServerSendToPeer(
-                    peer, type, payload, size, false) &&
+                    server, peer, type, payload, size, false) &&
                 succeeded;
         }
     }
@@ -3436,7 +4102,7 @@ bool NetworkServerSendWorldTime(
         payload, sizeof(payload), worldTime);
     return size != 0 &&
            ServerSendToPeer(
-               peer, LAIUE_MESSAGE_WORLD_TIME,
+               server, peer, LAIUE_MESSAGE_WORLD_TIME,
                payload, size, false);
 }
 
@@ -3469,7 +4135,7 @@ bool NetworkServerSendBlockDrop(
     uint32_t size = 0;
     return EncodeBlockDrop(payload, drop, &size) &&
            ServerSendToPeer(
-               ServerFindPeer(server, peerId),
+               server, ServerFindPeer(server, peerId),
                LAIUE_MESSAGE_BLOCK_DROP_SPAWN,
                payload, size, false);
 }
@@ -3492,11 +4158,12 @@ bool NetworkServerBroadcastBlockDrop(
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (ServerPeerCanSync(peer))
+        if (ServerPeerCanSync(server, peer))
         {
             succeeded =
                 ServerSendToPeer(
-                    peer, LAIUE_MESSAGE_BLOCK_DROP_SPAWN,
+                    server, peer,
+                    LAIUE_MESSAGE_BLOCK_DROP_SPAWN,
                     payload, size, false) &&
                 succeeded;
         }
@@ -3523,11 +4190,12 @@ bool NetworkServerBroadcastDropRemove(
          index < server->maximumPeers; ++index)
     {
         NetworkServerPeer *peer = &server->peers[index];
-        if (ServerPeerCanSync(peer))
+        if (ServerPeerCanSync(server, peer))
         {
             succeeded =
                 ServerSendToPeer(
-                    peer, LAIUE_MESSAGE_BLOCK_DROP_REMOVE,
+                    server, peer,
+                    LAIUE_MESSAGE_BLOCK_DROP_REMOVE,
                     payload, size, false) &&
                 succeeded;
         }
@@ -3557,7 +4225,7 @@ bool NetworkServerSendInventory(
         payload, sizeof(payload), &wire);
     return size != 0 &&
            ServerSendToPeer(
-               ServerFindPeer(server, peerId),
+               server, ServerFindPeer(server, peerId),
                LAIUE_MESSAGE_INVENTORY_STATE,
                payload, size, false);
 }

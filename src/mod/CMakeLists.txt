@@ -1,4 +1,5 @@
 laiue_add_module(mod
+    RUNTIME_ROLE HEADLESS
     SOURCES
         mod_host.c
         mod_host.h

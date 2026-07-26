@@ -3,8 +3,22 @@ include_guard(GLOBAL)
 option(LAIUE_ENABLE_MSQUIC "Собирать secure remote transport через MsQuic" ON)
 option(LAIUE_REQUIRE_MSQUIC
     "Завершать configure ошибкой, если MsQuic не найден" OFF)
-set(LAIUE_MSQUIC_ROOT "" CACHE PATH
+set(LAIUE_MSQUIC_REQUIRED_VERSION "2.5.9")
+set(_laiue_msquic_root_default "")
+if(DEFINED ENV{LAIUE_MSQUIC_ROOT}
+   AND NOT "$ENV{LAIUE_MSQUIC_ROOT}" STREQUAL "")
+    set(_laiue_msquic_root_default "$ENV{LAIUE_MSQUIC_ROOT}")
+endif()
+set(LAIUE_MSQUIC_ROOT "${_laiue_msquic_root_default}" CACHE PATH
     "Префикс установленного MsQuic (include/, lib/ и bin/)")
+if(NOT LAIUE_MSQUIC_ROOT
+   AND DEFINED ENV{LAIUE_MSQUIC_ROOT}
+   AND NOT "$ENV{LAIUE_MSQUIC_ROOT}" STREQUAL "")
+    set(LAIUE_MSQUIC_ROOT "$ENV{LAIUE_MSQUIC_ROOT}" CACHE PATH
+        "Префикс установленного MsQuic (include/, lib/ и bin/)" FORCE)
+endif()
+set(LAIUE_MSQUIC_VERSION "" CACHE STRING
+    "Проверенная версия MsQuic, если package metadata недоступна")
 
 if(NOT LAIUE_ENABLE_MSQUIC)
     if(LAIUE_REQUIRE_MSQUIC)
@@ -103,6 +117,104 @@ if(LAIUE_MSQUIC_INCLUDE_DIR AND LAIUE_MSQUIC_LIBRARY)
 endif()
 
 if(_laiue_msquic_complete)
+    if(UNIX AND LAIUE_REQUIRE_MSQUIC
+       AND NOT IS_SYMLINK "${LAIUE_MSQUIC_LIBRARY}")
+        message(FATAL_ERROR
+            "Release prefix должен предоставлять libmsquic.so как начало "
+            "проверенной SONAME symlink chain; выбран обычный файл: "
+            "${LAIUE_MSQUIC_LIBRARY}")
+    endif()
+    set(_laiue_msquic_detected_version "")
+    if(LAIUE_MSQUIC_ROOT)
+        if(EXISTS "${LAIUE_MSQUIC_ROOT}/VERSION")
+            file(READ "${LAIUE_MSQUIC_ROOT}/VERSION"
+                _laiue_msquic_version_text LIMIT 256)
+            string(REGEX MATCH
+                "([0-9]+\\.[0-9]+\\.[0-9]+)"
+                _laiue_msquic_version_match
+                "${_laiue_msquic_version_text}")
+            set(_laiue_msquic_detected_version "${CMAKE_MATCH_1}")
+        endif()
+        if(NOT _laiue_msquic_detected_version)
+            file(GLOB _laiue_msquic_nuspecs
+                LIST_DIRECTORIES FALSE
+                "${LAIUE_MSQUIC_ROOT}/*.nuspec")
+            list(SORT _laiue_msquic_nuspecs)
+            foreach(_laiue_msquic_nuspec IN LISTS
+                    _laiue_msquic_nuspecs)
+                file(READ "${_laiue_msquic_nuspec}"
+                    _laiue_msquic_nuspec_text LIMIT 16384)
+                string(REGEX MATCH
+                    "<version>[ \t\r\n]*([0-9]+\\.[0-9]+\\.[0-9]+)"
+                    _laiue_msquic_nuspec_match
+                    "${_laiue_msquic_nuspec_text}")
+                if(_laiue_msquic_nuspec_match)
+                    set(_laiue_msquic_detected_version
+                        "${CMAKE_MATCH_1}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+    endif()
+    if(NOT _laiue_msquic_detected_version AND UNIX
+       AND NOT LAIUE_MSQUIC_ROOT)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(_LAIUE_MSQUIC_PC QUIET libmsquic)
+            if(NOT _LAIUE_MSQUIC_PC_FOUND)
+                pkg_check_modules(_LAIUE_MSQUIC_PC QUIET msquic)
+            endif()
+            if(_LAIUE_MSQUIC_PC_FOUND)
+                set(_laiue_msquic_detected_version
+                    "${_LAIUE_MSQUIC_PC_VERSION}")
+            endif()
+        endif()
+    endif()
+    if(NOT _laiue_msquic_detected_version AND
+       LAIUE_MSQUIC_LIBRARY MATCHES
+           "\\.so\\.([0-9]+\\.[0-9]+\\.[0-9]+)")
+        set(_laiue_msquic_detected_version "${CMAKE_MATCH_1}")
+    endif()
+    if(LAIUE_MSQUIC_VERSION)
+        if(_laiue_msquic_detected_version AND
+           NOT _laiue_msquic_detected_version VERSION_EQUAL
+               LAIUE_MSQUIC_VERSION)
+            message(FATAL_ERROR
+                "Указанная версия MsQuic ${LAIUE_MSQUIC_VERSION} "
+                "противоречит metadata выбранного runtime "
+                "${_laiue_msquic_detected_version}")
+        elseif(NOT _laiue_msquic_detected_version)
+            set(_laiue_msquic_detected_version
+                "${LAIUE_MSQUIC_VERSION}")
+        endif()
+    endif()
+    if(NOT _laiue_msquic_detected_version)
+        if(LAIUE_REQUIRE_MSQUIC)
+            message(FATAL_ERROR
+                "Версию MsQuic нельзя проверить. Используйте prefix с "
+                "VERSION/package metadata либо задайте "
+                "-DLAIUE_MSQUIC_VERSION=${LAIUE_MSQUIC_REQUIRED_VERSION} "
+                "после проверки пакета/hash.")
+        endif()
+        message(WARNING
+            "Версия найденного MsQuic не подтверждена; release-сборки "
+            "обязаны использовать ${LAIUE_MSQUIC_REQUIRED_VERSION}.")
+    elseif(NOT _laiue_msquic_detected_version VERSION_EQUAL
+               LAIUE_MSQUIC_REQUIRED_VERSION)
+        message(FATAL_ERROR
+            "Требуется MsQuic ${LAIUE_MSQUIC_REQUIRED_VERSION}, найден "
+            "${_laiue_msquic_detected_version}")
+    endif()
+    if(LAIUE_REQUIRE_MSQUIC AND
+       (NOT LAIUE_MSQUIC_LICENSE OR NOT LAIUE_MSQUIC_NOTICE))
+        message(FATAL_ERROR
+            "Release bundle требует LICENSE и THIRD-PARTY-NOTICES "
+            "из того же проверенного MsQuic prefix")
+    endif()
+    set(LAIUE_MSQUIC_DETECTED_VERSION
+        "${_laiue_msquic_detected_version}" CACHE INTERNAL
+        "Фактически проверенная версия MsQuic" FORCE)
+
     add_library(laiue_msquic SHARED IMPORTED GLOBAL)
     add_library(laiue::msquic ALIAS laiue_msquic)
     set_target_properties(laiue_msquic PROPERTIES
@@ -118,7 +230,8 @@ if(_laiue_msquic_complete)
     endif()
     message(STATUS
         "MsQuic: ${LAIUE_MSQUIC_LIBRARY} "
-        "(headers: ${LAIUE_MSQUIC_INCLUDE_DIR})")
+        "(headers: ${LAIUE_MSQUIC_INCLUDE_DIR}, "
+        "version: ${_laiue_msquic_detected_version})")
 elseif(LAIUE_REQUIRE_MSQUIC)
     message(FATAL_ERROR
         "MsQuic не найден. Установите libmsquic 2.5.9 или задайте "

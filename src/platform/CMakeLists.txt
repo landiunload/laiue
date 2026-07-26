@@ -29,6 +29,7 @@ endif()
 # Window/input/render stack is intentionally absent from Linux server builds.
 if(LAIUE_BUILD_CLIENT)
     laiue_add_module(window
+        RUNTIME_ROLE CLIENT
         SOURCES
             window.c
             window.h

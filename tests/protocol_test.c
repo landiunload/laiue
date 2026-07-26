@@ -1171,6 +1171,15 @@ static void TestSnapshotProtocol(void)
             &snapshotId, &worldRevision)
         && snapshotId == 17u && worldRevision == 95u,
         "SnapshotEnd не прошёл round-trip");
+    snapshotId = 0;
+    worldRevision = 0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSyncApplied(
+            payload, sizeof(payload), 17u, 95u) == 16u
+        && LaiueProtocolDecodeSyncApplied(
+            payload, 16u, &snapshotId, &worldRevision)
+        && snapshotId == 17u && worldRevision == 95u,
+        "SyncApplied не привязан к snapshot generation");
 
     LaiueProtocolChunkResyncRequest request = {
         .chunk = { -1, 2, 3 },
@@ -1185,6 +1194,23 @@ static void TestSnapshotProtocol(void)
         && decodedRequest.chunk[0] == -1
         && decodedRequest.expectedRevision == 94u,
         "ChunkResyncRequest не прошёл round-trip");
+    memset(&decodedRequest, 0, sizeof(decodedRequest));
+    ProtocolTestExpect(
+        LaiueProtocolEncodeChunkResyncCancelled(
+            payload, sizeof(payload), &request) == 32u
+        && LaiueProtocolDecodeChunkResyncCancelled(
+            payload, 32u, &decodedRequest)
+        && decodedRequest.chunk[0] == -1
+        && decodedRequest.chunk[1] == 2
+        && decodedRequest.chunk[2] == 3
+        && decodedRequest.expectedRevision == 94u,
+        "ChunkResyncCancelled не сохранил correlation");
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeChunkResyncCancelled(
+            payload, 31u, &decodedRequest)
+        && !LaiueProtocolDecodeChunkResyncCancelled(
+            payload, 33u, &decodedRequest),
+        "ChunkResyncCancelled принял неточный размер");
 
     uint32_t peerId = 0;
     ProtocolTestExpect(

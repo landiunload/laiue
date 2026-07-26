@@ -59,6 +59,9 @@ typedef enum LaiueMessageType
     LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY = 28,
     LAIUE_MESSAGE_WORLD_TIME = 29,
     LAIUE_MESSAGE_SYNC_READY = 30,
+    LAIUE_MESSAGE_SYNC_BEGIN = 31,
+    LAIUE_MESSAGE_SYNC_APPLIED = 32,
+    LAIUE_MESSAGE_CHUNK_RESYNC_CANCELLED = 33,
 
     // Первый недопустимый номер: граница проверки заголовка. Новый тип
     // добавляется строго перед этой строкой и сразу попадает в разрешённый
@@ -248,10 +251,22 @@ uint32_t LaiueProtocolEncodeSnapshotEnd(
 bool LaiueProtocolDecodeSnapshotEnd(
     const uint8_t *payload, uint32_t size,
     uint64_t *outSnapshotId, uint64_t *outWorldRevision);
+uint32_t LaiueProtocolEncodeSyncApplied(
+    uint8_t *output, uint32_t capacity,
+    uint64_t snapshotId, uint64_t worldRevision);
+bool LaiueProtocolDecodeSyncApplied(
+    const uint8_t *payload, uint32_t size,
+    uint64_t *outSnapshotId, uint64_t *outWorldRevision);
 uint32_t LaiueProtocolEncodeChunkResyncRequest(
     uint8_t *output, uint32_t capacity,
     const LaiueProtocolChunkResyncRequest *request);
 bool LaiueProtocolDecodeChunkResyncRequest(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkResyncRequest *outRequest);
+uint32_t LaiueProtocolEncodeChunkResyncCancelled(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkResyncRequest *request);
+bool LaiueProtocolDecodeChunkResyncCancelled(
     const uint8_t *payload, uint32_t size,
     LaiueProtocolChunkResyncRequest *outRequest);
 uint32_t LaiueProtocolEncodePeerId(

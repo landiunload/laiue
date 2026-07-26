@@ -1,5 +1,39 @@
 include_guard(GLOBAL)
 
+function(laiue_assert_target_excludes root_target)
+    set(forbidden_targets ${ARGN})
+    set(queue "${root_target}")
+    set(visited)
+    while(queue)
+        list(POP_FRONT queue current)
+        get_target_property(aliased_target "${current}" ALIASED_TARGET)
+        if(aliased_target)
+            set(current "${aliased_target}")
+        endif()
+        if(current IN_LIST visited)
+            continue()
+        endif()
+        list(APPEND visited "${current}")
+
+        foreach(forbidden_target IN LISTS forbidden_targets)
+            if(current STREQUAL forbidden_target)
+                message(FATAL_ERROR
+                    "${root_target} транзитивно зависит от client-only "
+                    "цели ${forbidden_target}")
+            endif()
+        endforeach()
+
+        get_target_property(direct_links "${current}" LINK_LIBRARIES)
+        get_target_property(interface_links
+            "${current}" INTERFACE_LINK_LIBRARIES)
+        foreach(dependency IN LISTS direct_links interface_links)
+            if(TARGET "${dependency}")
+                list(APPEND queue "${dependency}")
+            endif()
+        endforeach()
+    endwhile()
+endfunction()
+
 function(laiue_assert_build_architecture)
     get_target_property(headless_links
         laiue_headless_stack INTERFACE_LINK_LIBRARIES)
@@ -28,16 +62,9 @@ function(laiue_assert_build_architecture)
                 "Dedicated server не использует laiue::headless_stack")
         endif()
 
-        foreach(forbidden_target IN ITEMS
-                laiue_window laiue_input laiue_audio laiue_mesher
-                laiue_render laiue_core)
-            list(FIND server_links "${forbidden_target}" forbidden_index)
-            if(NOT forbidden_index EQUAL -1)
-                message(FATAL_ERROR
-                    "Dedicated server напрямую зависит от client-only цели "
-                    "${forbidden_target}")
-            endif()
-        endforeach()
+        laiue_assert_target_excludes(laiue_server
+            laiue_window laiue_input laiue_audio laiue_mesher
+            laiue_render laiue_core)
     endif()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

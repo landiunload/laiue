@@ -820,6 +820,22 @@ bool LaiueProtocolDecodeSnapshotEnd(
     return *outSnapshotId != 0;
 }
 
+uint32_t LaiueProtocolEncodeSyncApplied(
+    uint8_t *output, uint32_t capacity,
+    uint64_t snapshotId, uint64_t worldRevision)
+{
+    return LaiueProtocolEncodeSnapshotEnd(
+        output, capacity, snapshotId, worldRevision);
+}
+
+bool LaiueProtocolDecodeSyncApplied(
+    const uint8_t *payload, uint32_t size,
+    uint64_t *outSnapshotId, uint64_t *outWorldRevision)
+{
+    return LaiueProtocolDecodeSnapshotEnd(
+        payload, size, outSnapshotId, outWorldRevision);
+}
+
 uint32_t LaiueProtocolEncodeChunkResyncRequest(
     uint8_t *output, uint32_t capacity,
     const LaiueProtocolChunkResyncRequest *request)
@@ -850,6 +866,22 @@ bool LaiueProtocolDecodeChunkResyncRequest(
     outRequest->chunk[2] = (int64_t)ReadU64(payload + 16);
     outRequest->expectedRevision = ReadU64(payload + 24);
     return true;
+}
+
+uint32_t LaiueProtocolEncodeChunkResyncCancelled(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolChunkResyncRequest *request)
+{
+    return LaiueProtocolEncodeChunkResyncRequest(
+        output, capacity, request);
+}
+
+bool LaiueProtocolDecodeChunkResyncCancelled(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolChunkResyncRequest *outRequest)
+{
+    return LaiueProtocolDecodeChunkResyncRequest(
+        payload, size, outRequest);
 }
 
 uint32_t LaiueProtocolEncodePeerId(

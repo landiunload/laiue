@@ -28,6 +28,13 @@ LAIUE_TEST_ENTRY(WorldSnapshotTestEntryPoint)
     World* client = WorldCreate(0x102030405060708LL);
     SnapshotExpect(server != NULL && client != NULL,
         "миры не созданы");
+    BlockType invalidRegionGuard = 0x7fU;
+    SnapshotExpect(
+        WorldFillRegion(server, 0, 0, 0, 1, 1, 0,
+            &invalidRegionGuard, NULL, 0) ==
+                WORLD_REGION_ALL_AIR &&
+        invalidRegionGuard == 0x7fU,
+        "некорректный размер региона изменил буфер");
 
     const int64_t blockA[3] = { 3, 5, 96 };
     const int64_t blockB[3] = { 4, 5, 96 };
@@ -95,6 +102,14 @@ LAIUE_TEST_ENTRY(WorldSnapshotTestEntryPoint)
             deltas, 4, &deltaCount, &chunkRevision)
         && deltaCount == 0 && chunkRevision == 4,
         "пустой tombstone чанка потерял revision");
+    summaryCount = WorldCopyEditedChunkSummaries(
+        server, minimum, maximum, summaries, 4,
+        &truncated, &snapshotRevision);
+    SnapshotExpect(summaryCount == 2 && !truncated
+        && ChunkEquals(summaries[0].chunk, chunkA)
+        && summaries[0].deltaCount == 0
+        && summaries[0].revision == 4,
+        "пустой tombstone отсутствует в enumeration snapshot");
     SnapshotExpect(WorldReplaceChunkDeltas(client, chunkA,
             NULL, 0, chunkRevision, WorldGetRevision(server)),
         "пустой resync чанка не применён");

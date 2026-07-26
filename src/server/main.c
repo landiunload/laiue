@@ -19,13 +19,16 @@
 #define SERVER_SPAWN_HEIGHT 100.0
 #define SERVER_TICK_SECONDS (1.0 / 60.0)
 #define SERVER_SNAPSHOT_TICKS 3U
+#define SERVER_TIME_SYNC_TICKS 60U
+#define SERVER_DAY_LENGTH_SECONDS 3600.0
 #define SERVER_MAX_CATCH_UP_TICKS 8U
 #define SERVER_INPUT_TIMEOUT_MS 250ULL
 #define SERVER_EDIT_COOLDOWN_MS 125ULL
 #define SERVER_BREAK_INTENT_TIMEOUT_MS 250ULL
 #define SERVER_EDIT_REACH 8.0f
-#define SERVER_DROP_CAPACITY 256U
+#define SERVER_DROP_CAPACITY 128U
 #define SERVER_INTEREST_RADIUS_CHUNKS 5LL
+#define SERVER_RESYNC_QUEUE_CAPACITY 1U
 
 typedef struct ServerBlockDrop
 {
@@ -35,6 +38,12 @@ typedef struct ServerBlockDrop
     uint8_t block;
     bool active;
 } ServerBlockDrop;
+
+typedef struct ServerResyncRequest
+{
+    int64_t chunk[3];
+    uint64_t expectedRevision;
+} ServerResyncRequest;
 
 static const wchar_t g_serverWorldPath[] = L"saves\\default\\chunks.dat";
 
@@ -52,7 +61,11 @@ typedef struct ServerPlayer
     bool breaking;
     Inventory inventory;
     int64_t snapshotCenter[3];
+    ServerResyncRequest resyncQueue[
+        SERVER_RESYNC_QUEUE_CAPACITY];
+    uint32_t resyncQueueCount;
     bool hasSnapshotCenter;
+    bool fullSnapshotPending;
     bool active;
 } ServerPlayer;
 
@@ -348,8 +361,11 @@ static bool SendWorldSnapshot(DedicatedServer* server,
         server->world, minimum, maximum, summaries,
         LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS, &truncated, &worldRevision);
     uint32_t messageCount = 0;
+    uint32_t maximumDeltaCount = 0;
     for (uint32_t i = 0; i < summaryCount; ++i)
     {
+        if (summaries[i].deltaCount > maximumDeltaCount)
+            maximumDeltaCount = summaries[i].deltaCount;
         uint32_t parts = summaries[i].deltaCount == 0 ? 1U
             : (summaries[i].deltaCount
                 + LAIUE_NETWORK_MAX_CHUNK_EDITS - 1U)
@@ -362,6 +378,14 @@ static bool SendWorldSnapshot(DedicatedServer* server,
         messageCount += parts;
     }
     if (truncated)
+    {
+        PlatformFree(summaries);
+        return false;
+    }
+    WorldChunkDelta* deltas = maximumDeltaCount == 0 ? NULL
+        : PlatformAllocate(
+            (size_t)maximumDeltaCount * sizeof(*deltas), false);
+    if (maximumDeltaCount != 0 && deltas == NULL)
     {
         PlatformFree(summaries);
         return false;
@@ -383,13 +407,10 @@ static bool SendWorldSnapshot(DedicatedServer* server,
     for (uint32_t i = 0; i < summaryCount && succeeded; ++i)
     {
         uint32_t deltaCount = summaries[i].deltaCount;
-        WorldChunkDelta* deltas = deltaCount == 0 ? NULL
-            : PlatformAllocate(
-                (size_t)deltaCount * sizeof(*deltas), false);
         uint32_t copied = 0;
         uint64_t chunkRevision = 0;
-        succeeded = (deltaCount == 0 || deltas != NULL)
-            && WorldCopyChunkDeltas(server->world, summaries[i].chunk,
+        succeeded = WorldCopyChunkDeltas(
+                server->world, summaries[i].chunk,
                 deltas, deltaCount, &copied, &chunkRevision)
             && copied == deltaCount;
         uint32_t partCount = deltaCount == 0 ? 1U
@@ -423,7 +444,6 @@ static bool SendWorldSnapshot(DedicatedServer* server,
             succeeded = NetworkServerSendSnapshotChunk(
                 server->network, player->peerId, &chunk);
         }
-        PlatformFree(deltas);
     }
 
     // Initial state belongs to the snapshot barrier. READY is emitted by the
@@ -470,6 +490,7 @@ static bool SendWorldSnapshot(DedicatedServer* server,
     if (succeeded)
         succeeded = NetworkServerSendSnapshotEnd(server->network,
             player->peerId, snapshotId, worldRevision);
+    PlatformFree(deltas);
     PlatformFree(summaries);
     return succeeded;
 }
@@ -488,10 +509,97 @@ static bool SendInitialWorldSnapshot(
     {
         minimum[axis] = center[axis] - SERVER_INTEREST_RADIUS_CHUNKS;
         maximum[axis] = center[axis] + SERVER_INTEREST_RADIUS_CHUNKS;
-        player->snapshotCenter[axis] = center[axis];
+        for (uint32_t request = 0;
+            request < player->resyncQueueCount; ++request)
+        {
+            int64_t requested =
+                player->resyncQueue[request].chunk[axis];
+            if (requested < minimum[axis]) minimum[axis] = requested;
+            if (requested > maximum[axis]) maximum[axis] = requested;
+        }
     }
+    if (!SendWorldSnapshot(server, player, minimum, maximum))
+        return false;
+    memcpy(player->snapshotCenter, center,
+        sizeof(player->snapshotCenter));
     player->hasSnapshotCenter = true;
-    return SendWorldSnapshot(server, player, minimum, maximum);
+    player->resyncQueueCount = 0;
+    player->fullSnapshotPending = false;
+    return true;
+}
+
+static bool ServerChunkEquals(
+    const int64_t left[3], const int64_t right[3])
+{
+    return left[0] == right[0] &&
+           left[1] == right[1] &&
+           left[2] == right[2];
+}
+
+static void QueueChunkResync(
+    ServerPlayer* player, const NetworkServerEvent* event)
+{
+    for (uint32_t index = 0;
+        index < player->resyncQueueCount; ++index)
+    {
+        ServerResyncRequest* queued =
+            &player->resyncQueue[index];
+        if (!ServerChunkEquals(
+                queued->chunk,
+                event->data.chunkResync.chunk))
+            continue;
+        if (event->data.chunkResync.expectedRevision
+            < queued->expectedRevision)
+        {
+            queued->expectedRevision =
+                event->data.chunkResync.expectedRevision;
+        }
+        return;
+    }
+    if (player->resyncQueueCount >=
+        SERVER_RESYNC_QUEUE_CAPACITY)
+    {
+        player->fullSnapshotPending = true;
+        return;
+    }
+    ServerResyncRequest* queued =
+        &player->resyncQueue[player->resyncQueueCount++];
+    memcpy(queued->chunk, event->data.chunkResync.chunk,
+        sizeof(queued->chunk));
+    queued->expectedRevision =
+        event->data.chunkResync.expectedRevision;
+}
+
+static void ProcessPendingResyncs(DedicatedServer* server)
+{
+    for (uint32_t playerIndex = 0;
+        playerIndex < LAIUE_NETWORK_MAX_PEERS; ++playerIndex)
+    {
+        ServerPlayer* player = &server->players[playerIndex];
+        if (!player->active) continue;
+        if (player->fullSnapshotPending)
+        {
+            SendInitialWorldSnapshot(server, player);
+            continue;
+        }
+        if (player->resyncQueueCount == 0) continue;
+
+        int64_t minimum[3];
+        int64_t maximum[3];
+        memcpy(minimum, player->resyncQueue[0].chunk,
+            sizeof(minimum));
+        memcpy(maximum, minimum, sizeof(maximum));
+        if (!SendWorldSnapshot(
+                server, player, minimum, maximum))
+            continue;
+        for (uint32_t index = 1;
+            index < player->resyncQueueCount; ++index)
+        {
+            player->resyncQueue[index - 1U] =
+                player->resyncQueue[index];
+        }
+        --player->resyncQueueCount;
+    }
 }
 
 static void SpawnServerDrop(DedicatedServer* server, uint8_t block,
@@ -626,7 +734,8 @@ static void HandleNetworkEvents(DedicatedServer *server)
                             existing->peerId, connected->peerId);
                     }
                 }
-                SendInitialWorldSnapshot(server, connected);
+                if (!SendInitialWorldSnapshot(server, connected))
+                    connected->fullSnapshotPending = true;
             }
             continue;
         }
@@ -666,11 +775,24 @@ static void HandleNetworkEvents(DedicatedServer *server)
         }
         else if (event.type == NETWORK_SERVER_EVENT_CHUNK_RESYNC_REQUEST)
         {
-            int64_t minimum[3];
-            int64_t maximum[3];
-            memcpy(minimum, event.data.chunkResync.chunk, sizeof(minimum));
-            memcpy(maximum, minimum, sizeof(maximum));
-            SendWorldSnapshot(server, player, minimum, maximum);
+            uint64_t authoritativeRevision =
+                WorldGetChunkRevision(
+                    server->world,
+                    event.data.chunkResync.chunk);
+            if (!PlayerInterestedInChunk(
+                    player, event.data.chunkResync.chunk) ||
+                authoritativeRevision <=
+                    event.data.chunkResync.expectedRevision)
+            {
+                NetworkServerSendChunkResyncCancelled(
+                    server->network, player->peerId,
+                    event.data.chunkResync.chunk,
+                    event.data.chunkResync.expectedRevision);
+            }
+            else
+            {
+                QueueChunkResync(player, &event);
+            }
         }
     }
 }
@@ -679,6 +801,11 @@ static void SimulateTick(DedicatedServer *server)
 {
     uint64_t now = PlatformMonotonicMilliseconds();
     server->tick++;
+    server->timeOfDayHours +=
+        (float)(SERVER_TICK_SECONDS *
+                (24.0 / SERVER_DAY_LENGTH_SECONDS));
+    if (server->timeOfDayHours >= 24.0f)
+        server->timeOfDayHours -= 24.0f;
     ModHostDispatchFrame(&server->modHost, (float)SERVER_TICK_SECONDS);
     for (uint32_t index = 0; index < LAIUE_NETWORK_MAX_PEERS; ++index)
     {
@@ -723,6 +850,20 @@ static void SimulateTick(DedicatedServer *server)
             NetworkServerBroadcastDropRemove(server->network, drop->id);
             SendPlayerInventory(server, player);
             break;
+        }
+    }
+
+    if (server->tick % SERVER_TIME_SYNC_TICKS == 0)
+    {
+        uint64_t worldTime =
+            ServerWorldTimeMilliseconds(server->timeOfDayHours);
+        for (uint32_t index = 0;
+            index < LAIUE_NETWORK_MAX_PEERS; ++index)
+        {
+            const ServerPlayer* player = &server->players[index];
+            if (player->active)
+                NetworkServerSendWorldTime(
+                    server->network, player->peerId, worldTime);
         }
     }
 
@@ -971,6 +1112,7 @@ static uint32_t RunServer(void)
 
         NetworkServerUpdate(network);
         HandleNetworkEvents(server);
+        ProcessPendingResyncs(server);
 
         uint32_t steps = 0;
         while (accumulator >= SERVER_TICK_SECONDS && steps < SERVER_MAX_CATCH_UP_TICKS)

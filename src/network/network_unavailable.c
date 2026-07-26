@@ -118,6 +118,12 @@ bool NetworkClientRequestChunkResync(
     return false;
 }
 
+bool NetworkClientAcknowledgeReady(NetworkClient *client)
+{
+    (void)client;
+    return false;
+}
+
 NetworkServer *NetworkServerCreateLoopback(
     const NetworkServerConfiguration *configuration)
 {
@@ -207,6 +213,17 @@ bool NetworkServerSendSnapshotEnd(
     (void)peerId;
     (void)snapshotId;
     (void)worldRevision;
+    return false;
+}
+
+bool NetworkServerSendChunkResyncCancelled(
+    NetworkServer *server, uint32_t peerId,
+    const int64_t chunk[3], uint64_t expectedRevision)
+{
+    (void)server;
+    (void)peerId;
+    (void)chunk;
+    (void)expectedRevision;
     return false;
 }
 

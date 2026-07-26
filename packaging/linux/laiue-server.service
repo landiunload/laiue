@@ -1,0 +1,40 @@
+[Unit]
+Description=laiue secure dedicated server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=laiue
+Group=laiue
+WorkingDirectory=/var/lib/laiue-server
+EnvironmentFile=/etc/laiue-server/server.env
+ExecStart=/opt/laiue-server/current/laiue_server
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/laiue-server /opt/laiue-server
+ReadWritePaths=/var/lib/laiue-server
+
+[Install]
+WantedBy=multi-user.target

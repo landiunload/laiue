@@ -20,6 +20,7 @@ laiue_compile_shader(ui
     OUTPUT_VARIABLE ui_shader_headers)
 
 laiue_add_module(render
+    RUNTIME_ROLE CLIENT
     SOURCES
         renderer_d3d12.c
         renderer.h

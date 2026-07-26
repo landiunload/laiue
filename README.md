@@ -35,8 +35,9 @@ cmake --build --preset linux-gcc-release \
 ```
 
 Также доступны `linux-gcc-debug`, `linux-clang-release`,
-`linux-gcc-asan` и `linux-musl-release`. Результат находится в
-`build/<preset>/bin/<Configuration>`. Перед
+`linux-gcc-asan` и `linux-musl-release`. Готовый server stage находится в
+`build/<preset>/bundles/server/<Configuration>`, а отдельные build outputs —
+в `build/<preset>/bin/<Configuration>`. Перед
 пересборкой закройте клиент и сервер из этого каталога: Windows блокирует
 загруженные EXE/DLL. Сборка проверяет блокировку заранее и выводит PID.
 Зависимости, options, install и ABI-матрица описаны в

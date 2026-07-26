@@ -23,6 +23,7 @@
 #include "interaction/voxel_interaction.h"
 #include "input/input.h"
 #include "network/network.h"
+#include "platform/system.h"
 #include "platform/time.h"
 #include "platform/window.h"
 #include "render/renderer.h"
@@ -35,6 +36,8 @@
 
 #define NETWORK_PENDING_DELTA_CAPACITY LAIUE_NETWORK_MAX_QUEUED_EVENTS
 #define NETWORK_CHUNK_REVISION_CAPACITY LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS
+#define NETWORK_DAY_LENGTH_MINUTES 60.0f
+#define NETWORK_RESYNC_REQUEST_INTERVAL_MS 1000ULL
 
 typedef struct NetworkRemotePlayer
 {
@@ -49,13 +52,14 @@ typedef struct NetworkChunkRevision
 {
     int64_t chunk[3];
     uint64_t revision;
+    bool resyncPending;
+    bool resyncRequested;
 } NetworkChunkRevision;
 
 typedef struct NetworkSnapshotAssembly
 {
     bool active;
     bool chunkActive;
-    bool resyncResponse;
     uint64_t snapshotId;
     uint64_t worldRevision;
     uint32_t expectedChunkCount;
@@ -100,6 +104,7 @@ typedef struct ApplicationState
     bool networkGameplayActivated;
     bool networkHasSnapshot;
     uint32_t networkPendingResyncCount;
+    uint64_t networkNextResyncRequestAtMs;
     NetworkSnapshotAssembly networkSnapshot;
     NetworkChunkRevision networkChunkRevisions[
         NETWORK_CHUNK_REVISION_CAPACITY];
@@ -289,6 +294,7 @@ static void ApplicationCloseSession(ApplicationState* application,
     application->networkWorldInitialized = false;
     application->networkGameplayActivated = false;
     application->networkPendingResyncCount = 0;
+    application->networkNextResyncRequestAtMs = 0;
     memset(application->remotePlayers, 0,
         sizeof(application->remotePlayers));
     RendererReleaseWorld(application->renderer);
@@ -900,7 +906,7 @@ static NetworkChunkRevision* FindNetworkChunkRevision(
     return NULL;
 }
 
-static void SetNetworkChunkRevision(ApplicationState* application,
+static bool SetNetworkChunkRevision(ApplicationState* application,
     const int64_t chunk[3], uint64_t revision)
 {
     NetworkChunkRevision* entry =
@@ -915,14 +921,66 @@ static void SetNetworkChunkRevision(ApplicationState* application,
         }
         else
         {
-            index = WorldHashChunkCoordinate(
-                chunk[0], chunk[1], chunk[2])
-                % NETWORK_CHUNK_REVISION_CAPACITY;
+            uint32_t start = WorldHashChunkCoordinate(
+                chunk[0], chunk[1], chunk[2]) %
+                NETWORK_CHUNK_REVISION_CAPACITY;
+            index = start;
+            while (application->networkChunkRevisions[index].
+                       resyncPending)
+            {
+                index =
+                    (index + 1U) %
+                    NETWORK_CHUNK_REVISION_CAPACITY;
+                if (index == start)
+                {
+                    return false;
+                }
+            }
         }
         entry = &application->networkChunkRevisions[index];
         memcpy(entry->chunk, chunk, sizeof(entry->chunk));
+        entry->resyncPending = false;
+        entry->resyncRequested = false;
     }
     entry->revision = revision;
+    return true;
+}
+
+static bool RequestNextNetworkChunkResync(
+    ApplicationState* application)
+{
+    for (uint32_t i = 0;
+        i < application->networkChunkRevisionCount; ++i)
+    {
+        const NetworkChunkRevision* entry =
+            &application->networkChunkRevisions[i];
+        if (entry->resyncPending && entry->resyncRequested)
+            return true;
+    }
+    if (NetworkClientGetState(application->networkClient) !=
+            NETWORK_CONNECTION_READY ||
+        PlatformMonotonicMilliseconds() <
+            application->networkNextResyncRequestAtMs)
+    {
+        return true;
+    }
+    for (uint32_t i = 0;
+        i < application->networkChunkRevisionCount; ++i)
+    {
+        NetworkChunkRevision* entry =
+            &application->networkChunkRevisions[i];
+        if (!entry->resyncPending) continue;
+        if (!NetworkClientRequestChunkResync(
+                application->networkClient, entry->chunk,
+                entry->revision))
+            return false;
+        entry->resyncRequested = true;
+        application->networkNextResyncRequestAtMs =
+            PlatformMonotonicMilliseconds() +
+            NETWORK_RESYNC_REQUEST_INTERVAL_MS;
+        return true;
+    }
+    return true;
 }
 
 static void InvalidateNetworkChunk(
@@ -996,8 +1054,6 @@ static bool BeginNetworkSnapshot(ApplicationState* application,
     NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
     snapshot->active = true;
     snapshot->chunkActive = false;
-    snapshot->resyncResponse =
-        !initial && application->networkPendingResyncCount > 0;
     snapshot->snapshotId = info->snapshotId;
     snapshot->worldRevision = info->worldRevision;
     snapshot->expectedChunkCount = info->chunkCount;
@@ -1081,8 +1137,24 @@ static bool ApplyNetworkSnapshotChunk(ApplicationState* application,
                 snapshot->edits, snapshot->editCount,
                 snapshot->chunkRevision, snapshot->worldRevision))
             return false;
-        SetNetworkChunkRevision(application, snapshot->chunk,
-            snapshot->chunkRevision);
+        NetworkChunkRevision* previous =
+            FindNetworkChunkRevision(
+                application, snapshot->chunk);
+        bool resolvedResync =
+            previous != NULL && previous->resyncPending;
+        if (!SetNetworkChunkRevision(
+                application, snapshot->chunk,
+                snapshot->chunkRevision))
+            return false;
+        NetworkChunkRevision* applied =
+            FindNetworkChunkRevision(
+                application, snapshot->chunk);
+        if (applied == NULL) return false;
+        applied->resyncPending = false;
+        applied->resyncRequested = false;
+        if (resolvedResync
+            && application->networkPendingResyncCount > 0)
+            --application->networkPendingResyncCount;
         InvalidateNetworkChunk(application, snapshot->chunk);
         snapshot->chunkActive = false;
         snapshot->editCount = 0;
@@ -1108,24 +1180,58 @@ static bool ApplyNetworkBlockDelta(ApplicationState* application,
     };
     NetworkChunkRevision* known =
         FindNetworkChunkRevision(application, chunk);
-    uint64_t currentRevision = known == NULL ? 0 : known->revision;
+    if (known == NULL)
+    {
+        if (!SetNetworkChunkRevision(application, chunk, 0))
+            return false;
+        known = FindNetworkChunkRevision(application, chunk);
+        if (known == NULL) return false;
+    }
+    uint64_t currentRevision = known->revision;
     if (delta->revision <= currentRevision) return true;
     if (delta->revision != currentRevision + 1U)
     {
-        if (!NetworkClientRequestChunkResync(
-                application->networkClient, chunk, currentRevision)
-            || application->networkPendingResyncCount == UINT32_MAX)
-            return false;
-        ++application->networkPendingResyncCount;
+        if (!known->resyncPending)
+        {
+            if (application->networkPendingResyncCount ==
+                UINT32_MAX)
+                return false;
+            known->resyncPending = true;
+            known->resyncRequested = false;
+            ++application->networkPendingResyncCount;
+            if (!RequestNextNetworkChunkResync(application))
+                return false;
+        }
         return true;
     }
     WorldSetBlock(application->world,
         delta->block[0], delta->block[1], delta->block[2],
         delta->replacement);
-    SetNetworkChunkRevision(application, chunk, delta->revision);
+    if (!SetNetworkChunkRevision(
+            application, chunk, delta->revision))
+        return false;
     ChunkStreamingInvalidateBlock(application->chunkStreaming,
         delta->block[0], delta->block[1], delta->block[2]);
     return true;
+}
+
+static bool CancelNetworkChunkResync(
+    ApplicationState* application,
+    const int64_t chunk[3], uint64_t expectedRevision)
+{
+    NetworkChunkRevision* entry =
+        FindNetworkChunkRevision(application, chunk);
+    if (entry == NULL || !entry->resyncPending ||
+        !entry->resyncRequested ||
+        entry->revision != expectedRevision ||
+        application->networkPendingResyncCount == 0)
+    {
+        return false;
+    }
+    entry->resyncPending = false;
+    entry->resyncRequested = false;
+    --application->networkPendingResyncCount;
+    return RequestNextNetworkChunkResync(application);
 }
 
 static bool FinishNetworkSnapshot(ApplicationState* application,
@@ -1145,9 +1251,6 @@ static bool FinishNetworkSnapshot(ApplicationState* application,
             return false;
     }
     snapshot->pendingDeltaCount = 0;
-    if (snapshot->resyncResponse
-        && application->networkPendingResyncCount > 0)
-        --application->networkPendingResyncCount;
     return true;
 }
 
@@ -1222,15 +1325,21 @@ static void UpdateRemotePlayers(
     }
 }
 
-static void CompleteNetworkReady(ApplicationState* application)
+static bool CompleteNetworkReady(ApplicationState* application)
 {
     if (!application->networkEverReady
         || !application->networkWorldInitialized
-        || application->networkSnapshot.active
-        || application->networkPendingResyncCount != 0)
-        return;
+        || application->networkSnapshot.active)
+        return true;
+    if (!NetworkClientAcknowledgeReady(
+            application->networkClient))
+        return false;
+    if (!RequestNextNetworkChunkResync(application))
+        return false;
+    if (application->networkPendingResyncCount != 0)
+        return true;
     application->networkReady = true;
-    if (application->networkGameplayActivated) return;
+    if (application->networkGameplayActivated) return true;
     application->networkGameplayActivated = true;
     application->gameMode = GAME_MODE_WALK;
     memset(&application->networkPendingInput, 0,
@@ -1241,6 +1350,7 @@ static void CompleteNetworkReady(ApplicationState* application)
     application->sessionActive = true;
     application->mouseLookBeforeMenu = true;
     ResumeGame(application);
+    return true;
 }
 
 static void PumpNetwork(ApplicationState* application)
@@ -1250,6 +1360,12 @@ static void PumpNetwork(ApplicationState* application)
         return;
     }
     NetworkClientUpdate(application->networkClient);
+    if (application->networkSession &&
+        NetworkClientGetState(application->networkClient) ==
+            NETWORK_CONNECTION_SYNCING_WORLD)
+    {
+        application->networkReady = false;
+    }
 
     bool destroyClient = false;
     NetworkClientEvent event;
@@ -1335,7 +1451,8 @@ static void PumpNetwork(ApplicationState* application)
             }
             application->networkPeerId = event.data.ready.peerId;
             application->networkEverReady = true;
-            CompleteNetworkReady(application);
+            if (!CompleteNetworkReady(application))
+                destroyClient = true;
         }
         else if (event.type == NETWORK_CLIENT_EVENT_CONTENT_READY)
         {
@@ -1485,6 +1602,20 @@ static void PumpNetwork(ApplicationState* application)
                 (float)(event.data.worldTime % 86400000ULL)
                     / 3600000.0f;
         }
+        else if (event.type ==
+                NETWORK_CLIENT_EVENT_CHUNK_RESYNC_CANCELLED
+            && application->networkSession)
+        {
+            if (!CancelNetworkChunkResync(
+                    application,
+                    event.data.chunkResyncCancelled.chunk,
+                    event.data.chunkResyncCancelled.
+                        expectedRevision) ||
+                !CompleteNetworkReady(application))
+            {
+                destroyClient = true;
+            }
+        }
         else if (event.type == NETWORK_CLIENT_EVENT_REJECTED)
         {
             application->networkReady = false;
@@ -1512,6 +1643,11 @@ static void PumpNetwork(ApplicationState* application)
             }
             destroyClient = true;
         }
+    }
+    if (!destroyClient && application->networkSession &&
+        !RequestNextNetworkChunkResync(application))
+    {
+        destroyClient = true;
     }
     if (destroyClient)
     {
@@ -1717,13 +1853,28 @@ static void OnFrame(void* userData)
     {
         UpdatePlayer(application,
             deltaSeconds, mouseDeltaX, mouseDeltaY);
-        // Игровое время идёт, пока не открыто меню (пауза).
+    }
+    if (application->networkSession && application->sessionActive)
+    {
+        // Remote time never pauses with a local menu. The server sends a
+        // fresh authoritative anchor once per second; matching extrapolation
+        // keeps lighting smooth between anchors.
+        application->settings.timeOfDayHours = GameTimeAdvance(
+            application->settings.timeOfDayHours,
+            TIME_SPEED_NORMAL, NETWORK_DAY_LENGTH_MINUTES,
+            deltaSeconds);
+    }
+    else if (gameplayActive)
+    {
+        // Локальное игровое время идёт, пока не открыто меню (пауза).
         application->settings.timeOfDayHours = GameTimeAdvance(
             application->settings.timeOfDayHours,
             application->settings.timeSpeed,
             g_applicationConfiguration.dayLengthMinutes,
             deltaSeconds);
-
+    }
+    if (gameplayActive)
+    {
         // Кадровые хуки DLL-модов — после игрока, до отрисовки.
         ModHostDispatchFrame(&application->modHost, deltaSeconds);
     }
@@ -1865,6 +2016,7 @@ static void OnFrame(void* userData)
                 application->networkWorldInitialized = false;
                 application->networkGameplayActivated = false;
                 application->networkPendingResyncCount = 0;
+                application->networkNextResyncRequestAtMs = 0;
                 application->networkSnapshot.active = false;
                 application->networkSnapshot.chunkActive = false;
                 application->networkSnapshot.pendingDeltaCount = 0;
@@ -1928,7 +2080,7 @@ static void OnFrame(void* userData)
 
             if (application->menu.saveRequested
                 && application->sessionActive
-                && !application->networkEverReady)
+                && !application->networkSession)
             {
                 application->menu.saveRequested = false;
                 SaveGameWriteAll(application->world,

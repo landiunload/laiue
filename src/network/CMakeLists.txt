@@ -10,10 +10,14 @@ set(laiue_network_links)
 set(laiue_network_windows_links)
 
 if(TARGET laiue::msquic)
-    list(APPEND laiue_network_sources network_msquic.c)
+    list(APPEND laiue_network_sources
+        certificate_validation.c
+        certificate_validation.h
+        network_msquic.c)
     list(APPEND laiue_network_links laiue::msquic)
     if(WIN32)
-        list(APPEND laiue_network_windows_links ws2_32 bcrypt ntdll)
+        list(APPEND laiue_network_windows_links
+            ws2_32 bcrypt crypt32 ntdll)
     else()
         # Linux certificate pinning validates DER/SAN through OpenSSL X509.
         list(APPEND laiue_network_links OpenSSL::Crypto)
@@ -25,6 +29,7 @@ else()
 endif()
 
 laiue_add_module(network
+    RUNTIME_ROLE HEADLESS
     SOURCES ${laiue_network_sources}
     LINK ${laiue_network_links}
     WINDOWS_LINK ${laiue_network_windows_links})
@@ -38,19 +43,12 @@ if(TARGET laiue::msquic)
                 "$<TARGET_FILE_DIR:laiue_network>/msquic.dll"
             COMMENT "Копирование MsQuic runtime")
     elseif(UNIX AND LAIUE_MSQUIC_LIBRARY)
-        get_filename_component(laiue_msquic_runtime_directory
-            "${LAIUE_MSQUIC_LIBRARY}" DIRECTORY)
-        file(GLOB laiue_msquic_runtime_files
-            LIST_DIRECTORIES FALSE
-            "${laiue_msquic_runtime_directory}/libmsquic.so*")
-        foreach(runtime_file IN LISTS laiue_msquic_runtime_files)
-            get_filename_component(runtime_name "${runtime_file}" NAME)
-            add_custom_command(TARGET laiue_network POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                    "${runtime_file}"
-                    "$<TARGET_FILE_DIR:laiue_network>/${runtime_name}"
-                COMMENT "Копирование ${runtime_name}")
-        endforeach()
+        add_custom_command(TARGET laiue_network POST_BUILD
+            COMMAND "${CMAKE_COMMAND}"
+                "-DSOURCE=${LAIUE_MSQUIC_LIBRARY}"
+                "-DDESTINATION=$<TARGET_FILE_DIR:laiue_network>"
+                -P "${PROJECT_SOURCE_DIR}/cmake/CopySharedLibrary.cmake"
+            COMMENT "Копирование выбранного MsQuic runtime и SONAME")
     endif()
 endif()
 
