@@ -547,6 +547,13 @@ bool NetworkTrustParse(
     }
 
     static const char prefix[] = "sha256:";
+    const uint32_t expectedLength =
+        (uint32_t)(sizeof(prefix) - 1U) +
+        LAIUE_NETWORK_CERTIFICATE_PIN_SIZE * 2U;
+    if (BoundedLength(text, expectedLength + 1U) != expectedLength)
+    {
+        return false;
+    }
     for (uint32_t index = 0; index < sizeof(prefix) - 1U; ++index)
     {
         if (AsciiLower(text[index]) != prefix[index])

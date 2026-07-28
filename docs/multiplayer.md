@@ -22,16 +22,17 @@ roster.
 ## Запуск
 
 ```powershell
-cmake --preset ninja-clang-release
-cmake --build --preset ninja-clang-release --parallel
-cd build/ninja-clang-release/bin/Release
+$env:LAIUE_MSQUIC_ROOT = 'C:\deps\msquic-2.5.9'
+cmake --preset windows-msvc
+cmake --build --preset windows-msvc-release --parallel
+cd build/windows-msvc/bin/Release
 ./laiue_server.exe
 ./laiue.exe
 ```
 
-Linux server собирается через `linux-gcc-release` или
-`linux-clang-release`. Клиент подключается через «Сетевая игра»; список
-находится в `servers.txt`:
+Linux server конфигурируется через `linux-gcc` или `linux-clang`, затем
+собирается одноимённым build-preset с суффиксом `-debug`/`-release`.
+Клиент подключается через «Сетевая игра»; список находится в `servers.txt`:
 
 ```text
 Локальный IPv4|127.0.0.1|sha256:<64 hex>
@@ -42,6 +43,9 @@ Linux server собирается через `linux-gcc-release` или
 Синтаксис — `name|endpoint|trust`; старый `name|address|port` читается для
 миграции. Отсутствующий порт означает 27180. У bare IPv6 допустим только
 default port, IPv6 с явным портом записывается как `[address]:port`.
+Переключатель `Авто | IPv4 | IPv6` в меню ограничивает разрешение DNS-имён.
+IPv4- и IPv6-literal всегда однозначно выбирают своё семейство независимо от
+переключателя.
 
 Настройки сервера — в `server.cfg`:
 

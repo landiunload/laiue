@@ -14,33 +14,43 @@ fail-closed без plaintext fallback.
 ## Сборка
 
 Требуется CMake 3.28+. Windows-клиент собирается MSVC или clang-cl; Linux
-server — GCC/Clang с OpenSSL 3 и MsQuic 2.5.9.
+server — GCC/Clang с Ninja, OpenSSL 3 и MsQuic 2.5.9. Все канонические
+configure-presets требуют проверенный MsQuic prefix через
+`LAIUE_MSQUIC_ROOT` либо `-DLAIUE_MSQUIC_ROOT=...`.
 
 ```powershell
-# Visual Studio, Release
-cmake --preset visual-studio
-cmake --build --preset visual-studio-release --parallel
+# Visual Studio/MSVC: configure один раз, Debug и Release — в одном дереве
+$env:LAIUE_MSQUIC_ROOT = 'C:\deps\msquic-2.5.9'
+cmake --preset windows-msvc
+cmake --build --preset windows-msvc-debug --parallel
+cmake --build --preset windows-msvc-release --parallel
 
-# Ninja + clang-cl, Release
-cmake --preset ninja-clang-release
-cmake --build --preset ninja-clang-release --parallel
+# clang-cl: запустите из x64 VS Developer shell с Ninja в PATH
+cmake --preset windows-clang
+cmake --build --preset windows-clang-release --parallel
 ```
 
 Linux server:
 
 ```sh
-cmake --preset linux-gcc-release
+export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
+cmake --preset linux-gcc
 cmake --build --preset linux-gcc-release \
   --target laiue_server_bundle --parallel
+ctest --preset linux-gcc-release
 ```
 
-Также доступны `linux-gcc-debug`, `linux-clang-release`,
-`linux-gcc-asan` и `linux-musl-release`. Готовый server stage находится в
-`build/<preset>/bundles/server/<Configuration>`, а отдельные build outputs —
-в `build/<preset>/bin/<Configuration>`. Перед
-пересборкой закройте клиент и сервер из этого каталога: Windows блокирует
-загруженные EXE/DLL. Сборка проверяет блокировку заранее и выводит PID.
-Зависимости, options, install и ABI-матрица описаны в
+Configure-presets: `windows-msvc`, `windows-clang`,
+`windows-msvc-server`, `linux-gcc`, `linux-clang`, `linux-musl` и
+`linux-gcc-asan`. Обычные build/test-presets добавляют `-debug` или
+`-release`; sanitizer имеет только `linux-gcc-asan-debug`.
+
+Готовый server stage находится в
+`build/<configure>/bundles/server/<Configuration>`, а отдельные outputs —
+в `build/<configure>/bin/<Configuration>`. Перед пересборкой закройте клиент
+и сервер из этого каталога: Windows блокирует загруженные EXE/DLL. Сборка
+проверяет блокировку заранее и выводит PID. Зависимости, install/package и
+ABI-матрица описаны в
 [docs/portability.md](docs/portability.md).
 
 ## Запуск

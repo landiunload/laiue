@@ -1621,6 +1621,8 @@ static void PumpNetwork(ApplicationState* application)
             application->networkReady = false;
             application->menu.networkConnecting = false;
             application->menu.networkRejected = true;
+            application->menu.networkDisconnectReason =
+                NETWORK_DISCONNECT_NONE;
             application->menu.screen = PAUSE_MENU_MULTIPLAYER;
             destroyClient = true;
         }
@@ -1634,6 +1636,8 @@ static void PumpNetwork(ApplicationState* application)
             if (!application->networkEverReady)
             {
                 application->menu.networkConnecting = false;
+                application->menu.networkDisconnectReason =
+                    event.data.disconnectReason;
                 if (application->menu.contentDownloading)
                 {
                     application->menu.contentDownloading = false;
@@ -2020,6 +2024,8 @@ static void OnFrame(void* userData)
                 application->networkSnapshot.active = false;
                 application->networkSnapshot.chunkActive = false;
                 application->networkSnapshot.pendingDeltaCount = 0;
+                application->menu.networkDisconnectReason =
+                    NETWORK_DISCONNECT_NONE;
                 if (application->menu.selectedServerIndex
                     < application->menu.servers.count)
                 {
@@ -2029,8 +2035,15 @@ static void OnFrame(void* userData)
                     NetworkClientConfiguration configuration;
                     NetworkClientConfigurationInitialize(&configuration);
                     configuration.endpoint = selected->endpoint;
+                    // A literal selects its family unambiguously. The menu
+                    // preference only constrains DNS resolution.
                     configuration.addressFamily =
-                        NETWORK_ADDRESS_FAMILY_AUTO;
+                        selected->endpoint.kind == NETWORK_ENDPOINT_IPV4
+                            ? NETWORK_ADDRESS_FAMILY_IPV4
+                            : (selected->endpoint.kind ==
+                                    NETWORK_ENDPOINT_IPV6
+                                ? NETWORK_ADDRESS_FAMILY_IPV6
+                                : application->menu.clientAddressFamily);
                     configuration.trustMode = selected->trustMode;
                     memcpy(configuration.certificateSha256,
                         selected->certificateSha256,
@@ -2041,7 +2054,8 @@ static void OnFrame(void* userData)
                 if (application->networkClient == NULL)
                 {
                     application->menu.networkConnecting = false;
-                    application->menu.networkRejected = true;
+                    application->menu.networkDisconnectReason =
+                        NETWORK_DISCONNECT_CONFIGURATION;
                 }
             }
             if (action == PAUSE_MENU_ACTION_APPLY_SERVER_MODS)

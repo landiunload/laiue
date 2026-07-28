@@ -5,14 +5,38 @@ on:
   pull_request:
 
 jobs:
-  windows-msvc:
+  windows-build:
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        preset: [visual-studio-debug, visual-studio-release]
+        configure_preset:
+          [windows-msvc, windows-clang, windows-msvc-server]
     steps:
       - uses: actions/checkout@v5
+      - name: Activate x64 MSVC environment
+        if: matrix.configure_preset == 'windows-clang'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = & $vswhere -products * -version '[17.0,18.0)' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (!$vsRoot) {
+            throw 'Visual Studio 2022 C++ tools were not found'
+          }
+          $env:PATH = "$(Split-Path $vswhere);$env:PATH"
+          $devShell = Join-Path $vsRoot `
+            'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $vsRoot `
+            -SkipAutomaticLocation `
+            -DevCmdArguments '-arch=x64 -host_arch=x64'
+          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'PATH') {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            "$name=$value" | Out-File $env:GITHUB_ENV -Append
+          }
       - name: Install MsQuic 2.5.9
         shell: pwsh
         run: |
@@ -38,16 +62,36 @@ jobs:
       - name: Configure
         shell: pwsh
         run: >
-          cmake --preset visual-studio
+          cmake --preset ${{ matrix.configure_preset }}
           "-DLAIUE_MSQUIC_ROOT=$env:LAIUE_MSQUIC_ROOT"
           -DLAIUE_REQUIRE_MSQUIC=ON
-      - name: Build
-        run: cmake --build --preset ${{ matrix.preset }} --parallel
-      - name: Test
-        run: ctest --preset ${{ matrix.preset }} --no-tests=error
-      - name: Verify checked-in shader fallbacks
+      - name: Build Debug
         run: >
-          cmake --build --preset ${{ matrix.preset }}
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-debug --parallel
+      - name: Test Debug
+        run: >
+          ctest --preset ${{ matrix.configure_preset }}-debug
+          --no-tests=error
+      - name: Verify checked-in shader fallbacks (Debug)
+        if: matrix.configure_preset != 'windows-msvc-server'
+        run: >
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-debug
+          --target laiue_verify_shaders
+      - name: Build Release
+        run: >
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-release --parallel
+      - name: Test Release
+        run: >
+          ctest --preset ${{ matrix.configure_preset }}-release
+          --no-tests=error
+      - name: Verify checked-in shader fallbacks (Release)
+        if: matrix.configure_preset != 'windows-msvc-server'
+        run: >
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-release
           --target laiue_verify_shaders
       - name: Verify generated sources
         shell: pwsh
@@ -58,47 +102,47 @@ jobs:
             throw 'Build changed tracked sources'
           }
       - name: Stage release components
-        if: matrix.preset == 'visual-studio-release'
+        if: matrix.configure_preset == 'windows-msvc'
         shell: pwsh
         run: |
-          cmake --build --preset visual-studio-release --parallel `
+          cmake --build --preset windows-msvc-release --parallel `
             --target laiue_client_bundle laiue_server_bundle laiue_modsdk_bundle
-          $client = 'build/visual-studio/bundles/client/Release'
-          $server = 'build/visual-studio/bundles/server/Release'
+          $client = 'build/windows-msvc/bundles/client/Release'
+          $server = 'build/windows-msvc/bundles/server/Release'
           Compress-Archive -Path "$client/*" `
             -DestinationPath "$env:RUNNER_TEMP/laiue-windows-client-x64.zip" -Force
           Compress-Archive -Path "$server/*" `
             -DestinationPath "$env:RUNNER_TEMP/laiue-windows-server-x64.zip" -Force
       - name: Upload Windows client
-        if: matrix.preset == 'visual-studio-release'
+        if: matrix.configure_preset == 'windows-msvc'
         uses: actions/upload-artifact@v4
         with:
           name: laiue-windows-client-x64
           path: ${{ runner.temp }}/laiue-windows-client-x64.zip
           if-no-files-found: error
       - name: Upload Windows server
-        if: matrix.preset == 'visual-studio-release'
+        if: matrix.configure_preset == 'windows-msvc'
         uses: actions/upload-artifact@v4
         with:
           name: laiue-windows-server-x64
           path: ${{ runner.temp }}/laiue-windows-server-x64.zip
           if-no-files-found: error
       - name: Upload Windows mod stage
-        if: matrix.preset == 'visual-studio-release'
+        if: matrix.configure_preset == 'windows-msvc'
         uses: actions/upload-artifact@v4
         with:
           name: mod-stage-windows
-          path: build/visual-studio/bundles/mod-sdk/Release/mods
+          path: build/windows-msvc/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload Windows ModSDK verifier
-        if: matrix.preset == 'visual-studio-release'
+        if: matrix.configure_preset == 'windows-msvc'
         uses: actions/upload-artifact@v4
         with:
           name: mod-verifier-windows
           path: |
-            build/visual-studio/bin/Release/laiue_mod_binary_load_test.exe
-            build/visual-studio/bin/Release/laiue_mod_package_hash_test.exe
-            build/visual-studio/bin/Release/laiue_content.dll
+            build/windows-msvc/bin/Release/laiue_mod_binary_load_test.exe
+            build/windows-msvc/bin/Release/laiue_mod_package_hash_test.exe
+            build/windows-msvc/bin/Release/laiue_content.dll
           if-no-files-found: error
 
   debian-server:
@@ -107,9 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset:
-          [linux-gcc-debug, linux-gcc-release, linux-clang-release,
-           linux-gcc-asan]
+        configure_preset: [linux-gcc, linux-clang, linux-gcc-asan]
     steps:
       - name: Install build dependencies
         run: |
@@ -145,50 +187,72 @@ jobs:
           echo "LAIUE_MSQUIC_ROOT=$root" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
-      - name: Build
-        run: cmake --build --preset ${{ matrix.preset }} --parallel
-      - name: Test
-        run: ctest --preset ${{ matrix.preset }}
-      - name: Install smoke test
+        run: cmake --preset ${{ matrix.configure_preset }}
+      - name: Build Debug
+        run: >
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-debug --parallel
+      - name: Test Debug
+        run: ctest --preset ${{ matrix.configure_preset }}-debug
+      - name: Install smoke test (Debug)
         run: |
-          cmake --install build/${{ matrix.preset }} \
-            --prefix build/install --component Server
-          sh tools/smoke_linux_server.sh build/install
+          cmake --install build/${{ matrix.configure_preset }} \
+            --config Debug \
+            --prefix build/install/${{ matrix.configure_preset }}/Debug \
+            --component Server
+          sh tools/smoke_linux_server.sh \
+            build/install/${{ matrix.configure_preset }}/Debug
+      - name: Build Release
+        if: matrix.configure_preset != 'linux-gcc-asan'
+        run: >
+          cmake --build
+          --preset ${{ matrix.configure_preset }}-release --parallel
+      - name: Test Release
+        if: matrix.configure_preset != 'linux-gcc-asan'
+        run: ctest --preset ${{ matrix.configure_preset }}-release
+      - name: Install smoke test (Release)
+        if: matrix.configure_preset != 'linux-gcc-asan'
+        run: |
+          cmake --install build/${{ matrix.configure_preset }} \
+            --config Release \
+            --prefix build/install/${{ matrix.configure_preset }}/Release \
+            --component Server
+          sh tools/smoke_linux_server.sh \
+            build/install/${{ matrix.configure_preset }}/Release
       - name: Verify generated sources
         run: |
           git diff --check
           test -z "$(git status --porcelain)"
       - name: Package glibc server
-        if: matrix.preset == 'linux-clang-release'
+        if: matrix.configure_preset == 'linux-clang'
         run: |
-          cmake --build --preset ${{ matrix.preset }} --parallel \
+          cmake --build --preset linux-clang-release --parallel \
             --target laiue_server_bundle laiue_modsdk_bundle
-          tar -C build/${{ matrix.preset }}/bundles/server/Release \
+          tar -C build/linux-clang/bundles/server/Release \
             -czf /tmp/laiue-linux-x86_64-gnu.tar.gz .
       - name: Upload glibc server
-        if: matrix.preset == 'linux-clang-release'
+        if: matrix.configure_preset == 'linux-clang'
         uses: actions/upload-artifact@v4
         with:
           name: laiue-linux-x86_64-gnu
           path: /tmp/laiue-linux-x86_64-gnu.tar.gz
           if-no-files-found: error
       - name: Upload glibc mod stage
-        if: matrix.preset == 'linux-clang-release'
+        if: matrix.configure_preset == 'linux-clang'
         uses: actions/upload-artifact@v4
         with:
           name: mod-stage-gnu
-          path: build/linux-clang-release/bundles/mod-sdk/Release/mods
+          path: build/linux-clang/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload glibc ModSDK verifier
-        if: matrix.preset == 'linux-clang-release'
+        if: matrix.configure_preset == 'linux-clang'
         uses: actions/upload-artifact@v4
         with:
           name: mod-verifier-gnu
           path: |
-            build/linux-clang-release/bin/Release/laiue_mod_binary_load_test
-            build/linux-clang-release/bin/Release/laiue_mod_package_hash_test
-            build/linux-clang-release/bin/Release/liblaiue_content.so
+            build/linux-clang/bin/Release/laiue_mod_binary_load_test
+            build/linux-clang/bin/Release/laiue_mod_package_hash_test
+            build/linux-clang/bin/Release/liblaiue_content.so
           if-no-files-found: error
 
   alpine-server:
@@ -237,17 +301,30 @@ jobs:
       - uses: actions/checkout@v5
       - name: Configure
         run: >
-          cmake --preset linux-musl-release
+          cmake --preset linux-musl
           -DLAIUE_MSQUIC_ROOT="$LAIUE_MSQUIC_ROOT"
-      - name: Build
-        run: cmake --build --preset linux-musl-release --parallel
-      - name: Test
-        run: ctest --preset linux-musl-release
-      - name: Install smoke test
+      - name: Build Debug
+        run: cmake --build --preset linux-musl-debug --parallel
+      - name: Test Debug
+        run: ctest --preset linux-musl-debug
+      - name: Install smoke test (Debug)
         run: |
-          cmake --install build/linux-musl-release \
-            --prefix build/install --component Server
-          sh tools/smoke_linux_server.sh build/install
+          cmake --install build/linux-musl \
+            --config Debug \
+            --prefix build/install/linux-musl/Debug \
+            --component Server
+          sh tools/smoke_linux_server.sh build/install/linux-musl/Debug
+      - name: Build Release
+        run: cmake --build --preset linux-musl-release --parallel
+      - name: Test Release
+        run: ctest --preset linux-musl-release
+      - name: Install smoke test (Release)
+        run: |
+          cmake --install build/linux-musl \
+            --config Release \
+            --prefix build/install/linux-musl/Release \
+            --component Server
+          sh tools/smoke_linux_server.sh build/install/linux-musl/Release
       - name: Verify generated sources
         run: |
           git diff --check
@@ -256,7 +333,7 @@ jobs:
         run: |
           cmake --build --preset linux-musl-release --parallel \
             --target laiue_server_bundle laiue_modsdk_bundle
-          tar -C build/linux-musl-release/bundles/server/Release \
+          tar -C build/linux-musl/bundles/server/Release \
             -czf /tmp/laiue-linux-x86_64-musl.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
@@ -267,16 +344,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mod-stage-musl
-          path: build/linux-musl-release/bundles/mod-sdk/Release/mods
+          path: build/linux-musl/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload musl ModSDK verifier
         uses: actions/upload-artifact@v4
         with:
           name: mod-verifier-musl
           path: |
-            build/linux-musl-release/bin/Release/laiue_mod_binary_load_test
-            build/linux-musl-release/bin/Release/laiue_mod_package_hash_test
-            build/linux-musl-release/bin/Release/liblaiue_content.so
+            build/linux-musl/bin/Release/laiue_mod_binary_load_test
+            build/linux-musl/bin/Release/laiue_mod_package_hash_test
+            build/linux-musl/bin/Release/liblaiue_content.so
           if-no-files-found: error
 
   debian-package-smoke:
@@ -335,7 +412,7 @@ jobs:
 
   mod-sdk:
     runs-on: ubuntu-latest
-    needs: [windows-msvc, debian-server, alpine-server]
+    needs: [windows-build, debian-server, alpine-server]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4

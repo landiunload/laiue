@@ -47,6 +47,29 @@ CMake не скачивает MsQuic. Release/CI используют MsQuic 2.5
 package metadata недоступна, `LAIUE_MSQUIC_VERSION=2.5.9` задаётся только
 после внешней проверки package hash/commit.
 
+## Presets
+
+Каждый toolchain конфигурируется один раз в `build/<configure>`:
+
+| Configure preset | Generator | Build/test presets |
+|---|---|---|
+| `windows-msvc` | Visual Studio | `windows-msvc-debug`, `windows-msvc-release` |
+| `windows-clang` | Ninja Multi-Config | `windows-clang-debug`, `windows-clang-release` |
+| `windows-msvc-server` | Visual Studio, server-only | `windows-msvc-server-debug`, `windows-msvc-server-release` |
+| `linux-gcc` | Ninja Multi-Config | `linux-gcc-debug`, `linux-gcc-release` |
+| `linux-clang` | Ninja Multi-Config | `linux-clang-debug`, `linux-clang-release` |
+| `linux-musl` | Ninja Multi-Config | `linux-musl-debug`, `linux-musl-release` |
+| `linux-gcc-asan` | Ninja Multi-Config | `linux-gcc-asan-debug` |
+
+Все эти configure-presets требуют MsQuic 2.5.9. Перед configure задайте
+`LAIUE_MSQUIC_ROOT` в окружении либо передайте
+`-DLAIUE_MSQUIC_ROOT=<prefix>`.
+
+`windows-msvc` сам находит установленный Visual Studio и не требует
+Developer shell. Для `windows-clang` нужны `clang-cl` и Ninja в `PATH`;
+запускайте его из x64 VS Developer PowerShell/Command Prompt, чтобы были
+доступны Windows SDK и x64 libraries.
+
 ## Debian 13
 
 Нужны CMake 3.28+, Ninja, GCC или Clang, pthread/dl и OpenSSL 3 development
@@ -66,7 +89,8 @@ bootstrap-последовательность находится в Debian job
 `LAIUE_MSQUIC_ROOT`.
 
 ```sh
-cmake --preset linux-gcc-release
+export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
+cmake --preset linux-gcc
 cmake --build --preset linux-gcc-release --target laiue_server_bundle
 ctest --preset linux-gcc-release
 ```
@@ -75,14 +99,12 @@ ctest --preset linux-gcc-release
 
 ```sh
 cmake --preset linux-gcc-asan
-cmake --build --preset linux-gcc-asan
-ctest --preset linux-gcc-asan
+cmake --build --preset linux-gcc-asan-debug
+ctest --preset linux-gcc-asan-debug
 ```
 
-Готовы presets `linux-gcc-debug`, `linux-gcc-release`,
-`linux-clang-release` и `linux-gcc-asan`. Для release с обязательным secure
-transport добавьте `-DLAIUE_REQUIRE_MSQUIC=ON` либо задайте эту cache option
-в CI.
+GCC и Clang используют отдельные configure trees, но Debug и Release внутри
+каждого дерева выбираются без повторного configure.
 
 ## Alpine/musl
 
@@ -90,10 +112,10 @@ transport добавьте `-DLAIUE_REQUIRE_MSQUIC=ON` либо задайте �
 musl-сборку MsQuic/OpenSSL:
 
 ```sh
-cmake --preset linux-musl-release \
-  -DLAIUE_MSQUIC_ROOT=/opt/msquic-musl \
-  -DLAIUE_REQUIRE_MSQUIC=ON
+cmake --preset linux-musl \
+  -DLAIUE_MSQUIC_ROOT=/opt/msquic-musl
 cmake --build --preset linux-musl-release --target laiue_server_bundle
+ctest --preset linux-musl-release
 ```
 
 glibc и musl server/mod binaries не взаимозаменяемы. Release names и manifest
@@ -111,15 +133,18 @@ keys всегда содержат ABI: `linux-x86_64-gnu` или `linux-x86_64-
 - `laiue_distribution` — все включённые компоненты и SDK examples.
 
 Bundle-цели очищают и заполняют независимые staging-каталоги
-`build/<preset>/bundles/{client,server,mod-sdk}/<config>`. Install-компоненты
-`Client`, `Server` и `ModSDK` можно устанавливать отдельно:
+`build/<configure>/bundles/{client,server,mod-sdk}/<config>`.
+Install-компоненты `Client`, `Server` и `ModSDK` можно устанавливать
+отдельно. Для multi-config дерева `--config` обязателен; CPack получает ту
+же конфигурацию через `-C`:
 
 ```sh
-cmake --install build/linux-gcc-release --prefix staging/server \
-  --component Server
-cpack --config build/linux-gcc-release/CPackConfig.cmake
+cmake --install build/linux-gcc --config Release \
+  --prefix staging/server --component Server
+cpack --config build/linux-gcc/CPackConfig.cmake -C Release
 ```
 
+CPack складывает архивы в `build/<configure>/packages`, не в source tree.
 Windows package — ZIP, Linux package — TGZ. Shared libraries лежат рядом с
 исполняемым файлом; ELF RUNPATH равен `$ORIGIN`. Не полагайтесь на
 `LD_LIBRARY_PATH` в release package. `tools/smoke_linux_server.sh` проверяет

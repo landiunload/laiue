@@ -987,9 +987,11 @@ static void TestTrustParser(void)
         && pin[0] == 0x00u && pin[1] == 0x01u
         && pin[30] == 0x1eu && pin[31] == 0x1fu,
         "Trust parser не принял SHA-256 pin");
-    ProtocolTestExpect(!NetworkTrustParse("sha256:1234", &mode, pin)
+    ProtocolTestExpect(!NetworkTrustParse("", &mode, pin)
+        && !NetworkTrustParse("sha", &mode, pin)
+        && !NetworkTrustParse("sha256:1234", &mode, pin)
         && !NetworkTrustParse("insecure", &mode, pin),
-        "Trust parser принял неполный pin или insecure режим");
+        "Trust parser принял короткий, неполный или insecure trust");
     ProtocolTestExpect(
         !NetworkTrustParse(
             "sha256:"

@@ -85,6 +85,9 @@ typedef struct PauseMenu
     bool serverListLoaded;
     uint32_t serverListOffset;
     uint32_t selectedServerIndex;
+    // AUTO/IPV4/IPV6 preference for DNS names. An IP literal always selects
+    // its own family, regardless of this preference.
+    NetworkAddressFamily clientAddressFamily;
     uint32_t requiredServerModCount;
     bool requiredServerModsInstalled;
     bool serverDownloadsAllowed;
@@ -92,6 +95,7 @@ typedef struct PauseMenu
     bool contentDownloadFailed;
     bool networkConnecting;
     bool networkRejected;
+    NetworkDisconnectReason networkDisconnectReason;
 } PauseMenu;
 
 void PauseMenuOpen(PauseMenu* menu);

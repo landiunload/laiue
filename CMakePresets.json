@@ -9,73 +9,44 @@
                 "type": "equals",
                 "lhs": "${hostSystemName}",
                 "rhs": "Windows"
+            },
+            "cacheVariables": {
+                "LAIUE_REQUIRE_MSQUIC": "ON"
             }
         },
         {
-            "name": "visual-studio",
-            "displayName": "Visual Studio (последняя установленная)",
-            "inherits": "windows-base"
-        },
-        {
-            "name": "ninja-windows-base",
-            "hidden": true,
+            "name": "windows-msvc",
+            "displayName": "Windows + Visual Studio/MSVC",
+            "description": "Windows client and server, Debug and Release in one build tree",
             "inherits": "windows-base",
-            "generator": "Ninja"
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64"
         },
         {
-            "name": "ninja-msvc-debug",
-            "displayName": "Ninja + MSVC Debug",
-            "inherits": "ninja-windows-base",
+            "name": "windows-clang",
+            "displayName": "Windows + clang-cl",
+            "description": "Windows client and server, Debug and Release in one build tree",
+            "inherits": "windows-base",
+            "generator": "Ninja Multi-Config",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "cl.exe"
-            }
-        },
-        {
-            "name": "ninja-msvc-release",
-            "displayName": "Ninja + MSVC Release",
-            "inherits": "ninja-windows-base",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
-            }
-        },
-        {
-            "name": "ninja-msvc-server-release",
-            "displayName": "Ninja + MSVC server-only Release",
-            "inherits": "ninja-windows-base",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "LAIUE_BUILD_CLIENT": "OFF",
-                "LAIUE_BUILD_SERVER": "ON",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
-            }
-        },
-        {
-            "name": "ninja-clang-debug",
-            "displayName": "Ninja + clang-cl Debug",
-            "inherits": "ninja-windows-base",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "clang-cl.exe"
-            }
-        },
-        {
-            "name": "ninja-clang-release",
-            "displayName": "Ninja + clang-cl Release",
-            "inherits": "ninja-windows-base",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_C_COMPILER": "clang-cl.exe",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
+                "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "windows-msvc-server",
+            "displayName": "Windows + Visual Studio/MSVC (server only)",
+            "description": "Dedicated server without client-only modules",
+            "inherits": "windows-msvc",
+            "cacheVariables": {
+                "LAIUE_BUILD_CLIENT": "OFF",
+                "LAIUE_BUILD_SERVER": "ON"
             }
         },
         {
             "name": "linux-base",
             "hidden": true,
-            "generator": "Ninja",
+            "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/build/${presetName}",
             "condition": {
                 "type": "equals",
@@ -83,181 +54,279 @@
                 "rhs": "Linux"
             },
             "cacheVariables": {
+                "CMAKE_DEFAULT_BUILD_TYPE": "Release",
                 "LAIUE_BUILD_CLIENT": "OFF",
                 "LAIUE_BUILD_SERVER": "ON",
-                "LAIUE_BUILD_EXAMPLE_MODS": "ON"
+                "LAIUE_BUILD_EXAMPLE_MODS": "ON",
+                "LAIUE_REQUIRE_MSQUIC": "ON"
             }
         },
         {
-            "name": "linux-gcc-debug",
-            "displayName": "Debian 13 + GCC Debug",
+            "name": "linux-gcc",
+            "displayName": "Debian 13/glibc + GCC",
+            "description": "Linux server, Debug and Release in one build tree",
             "inherits": "linux-base",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_C_COMPILER": "gcc",
                 "LAIUE_LINUX_LIBC": "gnu"
             }
         },
         {
-            "name": "linux-gcc-release",
-            "displayName": "Debian 13 + GCC Release",
+            "name": "linux-clang",
+            "displayName": "Debian 13/glibc + Clang",
+            "description": "Linux server, Debug and Release in one build tree",
             "inherits": "linux-base",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "gcc",
-                "LAIUE_LINUX_LIBC": "gnu",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
-            }
-        },
-        {
-            "name": "linux-clang-release",
-            "displayName": "Debian 13 + Clang Release",
-            "inherits": "linux-base",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_C_COMPILER": "clang",
-                "LAIUE_LINUX_LIBC": "gnu",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
+                "LAIUE_LINUX_LIBC": "gnu"
             }
         },
         {
             "name": "linux-gcc-asan",
-            "displayName": "Debian 13 + GCC ASan/UBSan",
-            "inherits": "linux-base",
+            "displayName": "Debian 13/glibc + GCC + ASan/UBSan",
+            "description": "Sanitized Debug server build",
+            "inherits": "linux-gcc",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "gcc",
-                "LAIUE_LINUX_LIBC": "gnu",
+                "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
                 "LAIUE_ENABLE_LTO": "OFF",
                 "LAIUE_ENABLE_SANITIZERS": "ON"
             }
         },
         {
-            "name": "linux-musl-release",
-            "displayName": "Alpine/musl + GCC Release",
+            "name": "linux-musl",
+            "displayName": "Alpine/musl + GCC",
+            "description": "Linux server, Debug and Release in one build tree",
             "inherits": "linux-base",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_C_COMPILER": "gcc",
-                "LAIUE_LINUX_LIBC": "musl",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
+                "LAIUE_LINUX_LIBC": "musl"
             }
         }
     ],
     "buildPresets": [
         {
-            "name": "visual-studio-debug",
-            "configurePreset": "visual-studio",
-            "configuration": "Debug"
+            "name": "windows-build-debug",
+            "hidden": true,
+            "configuration": "Debug",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         },
         {
-            "name": "visual-studio-release",
-            "configurePreset": "visual-studio",
-            "configuration": "Release"
+            "name": "windows-build-release",
+            "hidden": true,
+            "configuration": "Release",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         },
         {
-            "name": "ninja-msvc-debug",
-            "configurePreset": "ninja-msvc-debug"
+            "name": "linux-build-debug",
+            "hidden": true,
+            "configuration": "Debug",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
         },
         {
-            "name": "ninja-msvc-release",
-            "configurePreset": "ninja-msvc-release"
+            "name": "linux-build-release",
+            "hidden": true,
+            "configuration": "Release",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
         },
         {
-            "name": "ninja-msvc-server-release",
-            "configurePreset": "ninja-msvc-server-release"
+            "name": "windows-msvc-debug",
+            "inherits": "windows-build-debug",
+            "configurePreset": "windows-msvc"
         },
         {
-            "name": "ninja-clang-debug",
-            "configurePreset": "ninja-clang-debug"
+            "name": "windows-msvc-release",
+            "inherits": "windows-build-release",
+            "configurePreset": "windows-msvc"
         },
         {
-            "name": "ninja-clang-release",
-            "configurePreset": "ninja-clang-release"
+            "name": "windows-clang-debug",
+            "inherits": "windows-build-debug",
+            "configurePreset": "windows-clang"
+        },
+        {
+            "name": "windows-clang-release",
+            "inherits": "windows-build-release",
+            "configurePreset": "windows-clang"
+        },
+        {
+            "name": "windows-msvc-server-debug",
+            "inherits": "windows-build-debug",
+            "configurePreset": "windows-msvc-server"
+        },
+        {
+            "name": "windows-msvc-server-release",
+            "inherits": "windows-build-release",
+            "configurePreset": "windows-msvc-server"
         },
         {
             "name": "linux-gcc-debug",
-            "configurePreset": "linux-gcc-debug"
+            "inherits": "linux-build-debug",
+            "configurePreset": "linux-gcc"
         },
         {
             "name": "linux-gcc-release",
-            "configurePreset": "linux-gcc-release"
+            "inherits": "linux-build-release",
+            "configurePreset": "linux-gcc"
+        },
+        {
+            "name": "linux-clang-debug",
+            "inherits": "linux-build-debug",
+            "configurePreset": "linux-clang"
         },
         {
             "name": "linux-clang-release",
-            "configurePreset": "linux-clang-release"
+            "inherits": "linux-build-release",
+            "configurePreset": "linux-clang"
         },
         {
-            "name": "linux-gcc-asan",
+            "name": "linux-gcc-asan-debug",
+            "inherits": "linux-build-debug",
             "configurePreset": "linux-gcc-asan"
         },
         {
+            "name": "linux-musl-debug",
+            "inherits": "linux-build-debug",
+            "configurePreset": "linux-musl"
+        },
+        {
             "name": "linux-musl-release",
-            "configurePreset": "linux-musl-release"
+            "inherits": "linux-build-release",
+            "configurePreset": "linux-musl"
         }
     ],
     "testPresets": [
         {
-            "name": "visual-studio-debug",
-            "configurePreset": "visual-studio",
+            "name": "windows-test-debug",
+            "hidden": true,
             "configuration": "Debug",
-            "output": { "outputOnFailure": true }
+            "output": {
+                "outputOnFailure": true
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         },
         {
-            "name": "visual-studio-release",
-            "configurePreset": "visual-studio",
+            "name": "windows-test-release",
+            "hidden": true,
             "configuration": "Release",
-            "output": { "outputOnFailure": true }
+            "output": {
+                "outputOnFailure": true
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         },
         {
-            "name": "ninja-msvc-debug",
-            "configurePreset": "ninja-msvc-debug",
-            "output": { "outputOnFailure": true }
+            "name": "linux-test-debug",
+            "hidden": true,
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
         },
         {
-            "name": "ninja-msvc-release",
-            "configurePreset": "ninja-msvc-release",
-            "output": { "outputOnFailure": true }
+            "name": "linux-test-release",
+            "hidden": true,
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
         },
         {
-            "name": "ninja-msvc-server-release",
-            "configurePreset": "ninja-msvc-server-release",
-            "output": { "outputOnFailure": true }
+            "name": "windows-msvc-debug",
+            "inherits": "windows-test-debug",
+            "configurePreset": "windows-msvc"
         },
         {
-            "name": "ninja-clang-debug",
-            "configurePreset": "ninja-clang-debug",
-            "output": { "outputOnFailure": true }
+            "name": "windows-msvc-release",
+            "inherits": "windows-test-release",
+            "configurePreset": "windows-msvc"
         },
         {
-            "name": "ninja-clang-release",
-            "configurePreset": "ninja-clang-release",
-            "output": { "outputOnFailure": true }
+            "name": "windows-clang-debug",
+            "inherits": "windows-test-debug",
+            "configurePreset": "windows-clang"
+        },
+        {
+            "name": "windows-clang-release",
+            "inherits": "windows-test-release",
+            "configurePreset": "windows-clang"
+        },
+        {
+            "name": "windows-msvc-server-debug",
+            "inherits": "windows-test-debug",
+            "configurePreset": "windows-msvc-server"
+        },
+        {
+            "name": "windows-msvc-server-release",
+            "inherits": "windows-test-release",
+            "configurePreset": "windows-msvc-server"
         },
         {
             "name": "linux-gcc-debug",
-            "configurePreset": "linux-gcc-debug",
-            "output": { "outputOnFailure": true }
+            "inherits": "linux-test-debug",
+            "configurePreset": "linux-gcc"
         },
         {
             "name": "linux-gcc-release",
-            "configurePreset": "linux-gcc-release",
-            "output": { "outputOnFailure": true }
+            "inherits": "linux-test-release",
+            "configurePreset": "linux-gcc"
+        },
+        {
+            "name": "linux-clang-debug",
+            "inherits": "linux-test-debug",
+            "configurePreset": "linux-clang"
         },
         {
             "name": "linux-clang-release",
-            "configurePreset": "linux-clang-release",
-            "output": { "outputOnFailure": true }
+            "inherits": "linux-test-release",
+            "configurePreset": "linux-clang"
         },
         {
-            "name": "linux-gcc-asan",
-            "configurePreset": "linux-gcc-asan",
-            "output": { "outputOnFailure": true }
+            "name": "linux-gcc-asan-debug",
+            "inherits": "linux-test-debug",
+            "configurePreset": "linux-gcc-asan"
+        },
+        {
+            "name": "linux-musl-debug",
+            "inherits": "linux-test-debug",
+            "configurePreset": "linux-musl"
         },
         {
             "name": "linux-musl-release",
-            "configurePreset": "linux-musl-release",
-            "output": { "outputOnFailure": true }
+            "inherits": "linux-test-release",
+            "configurePreset": "linux-musl"
         }
     ]
 }

@@ -44,8 +44,16 @@ endif()
 get_property(LAIUE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(LAIUE_IS_MULTI_CONFIG)
     set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
-elseif(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+else()
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+    endif()
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release)
+    if(NOT CMAKE_BUILD_TYPE MATCHES "^(Debug|Release)$")
+        message(FATAL_ERROR
+            "CMAKE_BUILD_TYPE должен быть Debug или Release, получено: "
+            "${CMAKE_BUILD_TYPE}")
+    endif()
 endif()
 
 # Общие правила компиляции. Все свойства намеренно target-scoped: выбор
@@ -71,8 +79,7 @@ if(WIN32)
         /W4 /utf-8 /GS- /fp:fast
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
-        $<$<NOT:$<CONFIG:Debug>>:/O2 /Ot /Oi /Gw>
-        $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/Ob3>
+        $<$<CONFIG:Release>:/O2 /Ot /Oi /Gw>
         $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
     )
 else()
@@ -80,7 +87,7 @@ else()
         -Wall -Wextra -Wpedantic
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:-Werror>
         $<$<CONFIG:Debug>:-O0;-g3>
-        $<$<NOT:$<CONFIG:Debug>>:-O2>
+        $<$<CONFIG:Release>:-O2>
     )
 
     set(LAIUE_LINUX_LIBC "gnu" CACHE STRING
@@ -153,7 +160,7 @@ if(WIN32)
         /W4 /utf-8 /GS- /fp:fast
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
-        $<$<NOT:$<CONFIG:Debug>>:/O2 /Oi>)
+        $<$<CONFIG:Release>:/O2 /Oi>)
     target_sources(laiue_windows_no_crt INTERFACE
         "$<TARGET_OBJECTS:laiue_runtime>")
     target_link_options(laiue_windows_no_crt INTERFACE
@@ -163,7 +170,7 @@ if(WIN32)
         /MERGE:.rdata=.text /MERGE:.pdata=.text
         $<$<C_COMPILER_ID:MSVC>:/EMITTOOLVERSIONINFO:NO>
         $<$<CONFIG:Debug>:/DEBUG /INCREMENTAL:NO>
-        $<$<NOT:$<CONFIG:Debug>>:/OPT:REF /OPT:ICF>
+        $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
     )
 else()
     # Совместимое имя избавляет старые локальные CMake-потребители от
@@ -174,15 +181,15 @@ endif()
 if(LAIUE_ENABLE_LTO)
     if(WIN32)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/GL>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<NOT:$<CONFIG:Debug>>>:-flto=thin>)
+            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/GL>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=thin>)
         target_link_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/LTCG>)
+            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>)
     else()
         target_compile_options(laiue_build_options INTERFACE
-            $<$<NOT:$<CONFIG:Debug>>:-flto>)
+            $<$<CONFIG:Release>:-flto>)
         target_link_options(laiue_build_options INTERFACE
-            $<$<NOT:$<CONFIG:Debug>>:-flto>)
+            $<$<CONFIG:Release>:-flto>)
     endif()
 endif()
 

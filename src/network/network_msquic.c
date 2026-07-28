@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include "network/certificate_validation.h"
 #include "network/network.h"
 #include "network/protocol.h"
@@ -16,7 +20,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <netdb.h>
+#include <sys/socket.h>
 #endif
 
 #define NETWORK_RECEIVE_CAPACITY 16384U
@@ -31,6 +39,7 @@
 #define NETWORK_HANDSHAKE_TIMEOUT_MS 60000ULL
 #define NETWORK_NEGOTIATION_IDLE_TIMEOUT_MS 120000ULL
 #define NETWORK_IDLE_TIMEOUT_MS 15000ULL
+#define NETWORK_SHUTDOWN_DRAIN_TIMEOUT_MS 5000ULL
 #define NETWORK_RATE_WINDOW_MS 1000ULL
 #define NETWORK_MAX_FRAMES_PER_SECOND 160U
 #define NETWORK_MAX_INPUTS_PER_SECOND 120U
@@ -251,7 +260,7 @@ static bool AlpnMatches(uint8_t length, const uint8_t *bytes)
 }
 
 static NetworkDisconnectReason TransportStatusReason(
-    QUIC_STATUS status, bool handshakeComplete)
+    QUIC_STATUS status, bool handshakeComplete, bool dnsEndpoint)
 {
     if (status == QUIC_STATUS_CONNECTION_TIMEOUT)
     {
@@ -268,14 +277,10 @@ static NetworkDisconnectReason TransportStatusReason(
         status == QUIC_STATUS_REVOKED_CERTIFICATE ||
         status == QUIC_STATUS_EXPIRED_CERTIFICATE ||
         status == QUIC_STATUS_UNKNOWN_CERTIFICATE ||
-        status == QUIC_STATUS_REQUIRED_CERTIFICATE;
-#if defined(_WIN32)
-    certificateStatus =
-        certificateStatus ||
+        status == QUIC_STATUS_REQUIRED_CERTIFICATE ||
         status == QUIC_STATUS_CERT_EXPIRED ||
         status == QUIC_STATUS_CERT_UNTRUSTED_ROOT ||
         status == QUIC_STATUS_CERT_NO_CERT;
-#endif
     if (certificateStatus)
     {
         return NETWORK_DISCONNECT_CERTIFICATE;
@@ -286,7 +291,9 @@ static NetworkDisconnectReason TransportStatusReason(
     {
         return NETWORK_DISCONNECT_TLS;
     }
-    if (!handshakeComplete && status == QUIC_STATUS_UNREACHABLE)
+    if (!handshakeComplete && dnsEndpoint &&
+        (status == QUIC_STATUS_UNREACHABLE ||
+         status == QUIC_STATUS_NOT_FOUND))
     {
         return NETWORK_DISCONNECT_DNS;
     }
@@ -810,6 +817,92 @@ static QUIC_ADDRESS_FAMILY QuicFamily(
     return QUIC_ADDRESS_FAMILY_UNSPEC;
 }
 
+static bool ResolveDnsEndpoint(
+    const NetworkClientConfiguration *configuration,
+    QUIC_ADDR *outAddress)
+{
+    if (configuration == NULL || outAddress == NULL ||
+        configuration->endpoint.kind != NETWORK_ENDPOINT_DNS)
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    ADDRINFOA hints;
+    ADDRINFOA *addresses = NULL;
+#else
+    struct addrinfo hints;
+    struct addrinfo *addresses = NULL;
+#endif
+    memset(&hints, 0, sizeof(hints));
+    if (configuration->addressFamily ==
+        NETWORK_ADDRESS_FAMILY_IPV4)
+    {
+        hints.ai_family = AF_INET;
+    }
+    else if (configuration->addressFamily ==
+             NETWORK_ADDRESS_FAMILY_IPV6)
+    {
+        hints.ai_family = AF_INET6;
+    }
+    else
+    {
+        hints.ai_family = AF_UNSPEC;
+    }
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+#if defined(_WIN32)
+    int result = GetAddrInfoA(
+        configuration->endpoint.host, NULL, &hints, &addresses);
+#else
+    int result = getaddrinfo(
+        configuration->endpoint.host, NULL, &hints, &addresses);
+#endif
+    if (result != 0 || addresses == NULL)
+    {
+        return false;
+    }
+
+    bool found = false;
+#if defined(_WIN32)
+    for (const ADDRINFOA *candidate = addresses;
+#else
+    for (const struct addrinfo *candidate = addresses;
+#endif
+         candidate != NULL; candidate = candidate->ai_next)
+    {
+        if (candidate->ai_family == AF_INET &&
+            candidate->ai_addr != NULL &&
+            candidate->ai_addrlen >= sizeof(outAddress->Ipv4))
+        {
+            memset(outAddress, 0, sizeof(*outAddress));
+            memcpy(
+                &outAddress->Ipv4, candidate->ai_addr,
+                sizeof(outAddress->Ipv4));
+            found = true;
+            break;
+        }
+        if (candidate->ai_family == AF_INET6 &&
+            candidate->ai_addr != NULL &&
+            candidate->ai_addrlen >= sizeof(outAddress->Ipv6))
+        {
+            memset(outAddress, 0, sizeof(*outAddress));
+            memcpy(
+                &outAddress->Ipv6, candidate->ai_addr,
+                sizeof(outAddress->Ipv6));
+            found = true;
+            break;
+        }
+    }
+#if defined(_WIN32)
+    FreeAddrInfoA(addresses);
+#else
+    freeaddrinfo(addresses);
+#endif
+    return found;
+}
+
 static void FillSettings(
     QUIC_SETTINGS *settings, bool server,
     uint32_t handshakeTimeoutMs, uint32_t idleTimeoutMs)
@@ -943,23 +1036,23 @@ static bool ValidatePinnedCertificate(
     {
         return false;
     }
-#if defined(_WIN32)
     QUIC_STATUS deferred =
         event->PEER_CERTIFICATE_RECEIVED.DeferredStatus;
     // A pin may replace only the chain anchor. The DER leaf is parsed
     // independently so an untrusted-root status cannot mask expiration or
     // a DNS/IP SAN mismatch.
-    return NetworkCertificateValidateLeafIdentity(
-               &client->connectionConfiguration.endpoint,
-               certificate->Buffer, certificate->Length) &&
-           (!QUIC_FAILED(deferred) ||
-            deferred == QUIC_STATUS_CERT_UNTRUSTED_ROOT ||
-            deferred == (QUIC_STATUS)CERT_E_CHAINING);
-#else
-    return NetworkCertificateValidateLeafIdentity(
-        &client->connectionConfiguration.endpoint,
-        certificate->Buffer, certificate->Length);
+    bool acceptableChain =
+        !QUIC_FAILED(deferred) ||
+        deferred == QUIC_STATUS_CERT_UNTRUSTED_ROOT;
+#if defined(_WIN32)
+    acceptableChain =
+        acceptableChain ||
+        deferred == (QUIC_STATUS)CERT_E_CHAINING;
 #endif
+    return acceptableChain &&
+           NetworkCertificateValidateLeafIdentity(
+               &client->connectionConfiguration.endpoint,
+               certificate->Buffer, certificate->Length);
 }
 
 static QUIC_STATUS QUIC_API ClientConnectionCallback(
@@ -978,6 +1071,8 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             const QUIC_BUFFER *certificate =
                 (const QUIC_BUFFER *)
                     event->PEER_CERTIFICATE_RECEIVED.Certificate;
+            QUIC_STATUS deferred =
+                event->PEER_CERTIFICATE_RECEIVED.DeferredStatus;
             bool valid =
                 certificate != NULL &&
                 certificate->Buffer != NULL &&
@@ -985,10 +1080,11 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
                 (client->connectionConfiguration.trustMode ==
                          NETWORK_TRUST_SHA256
                      ? ValidatePinnedCertificate(client, event)
-                     : NetworkCertificateValidateLeafIdentity(
-                           &client->connectionConfiguration.endpoint,
-                           certificate->Buffer,
-                           certificate->Length));
+                     : !QUIC_FAILED(deferred) &&
+                           NetworkCertificateValidateLeafIdentity(
+                               &client->connectionConfiguration.endpoint,
+                               certificate->Buffer,
+                               certificate->Length));
             if (!valid)
             {
                 PlatformRwLockAcquireExclusive(&client->lock);
@@ -1023,8 +1119,10 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
         {
             QuicChannel *accepted = NULL;
+            bool stopping = false;
             PlatformRwLockAcquireExclusive(&client->lock);
-            if (!client->stopping &&
+            stopping = client->stopping;
+            if (!stopping &&
                 (event->PEER_STREAM_STARTED.Flags &
                     QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL) != 0 &&
                 (event->PEER_STREAM_STARTED.Flags &
@@ -1052,7 +1150,7 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
                     break;
                 }
             }
-            if (accepted == NULL && !client->stopping)
+            if (accepted == NULL && !stopping)
             {
                 client->callbackReason =
                     NETWORK_DISCONNECT_PROTOCOL;
@@ -1067,10 +1165,11 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             }
             else
             {
-                client->api->StreamShutdown(
-                    event->PEER_STREAM_STARTED.Stream,
-                    QUIC_STREAM_SHUTDOWN_FLAG_ABORT,
-                    NETWORK_APP_ERROR_PROTOCOL);
+                // A non-success return rejects a peer-created stream without
+                // publishing a handle that teardown would have to race.
+                return stopping
+                           ? QUIC_STATUS_ABORTED
+                           : QUIC_STATUS_NOT_SUPPORTED;
             }
             break;
         }
@@ -1081,7 +1180,9 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
             {
                 client->callbackReason = TransportStatusReason(
                     event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status,
-                    client->transportConnected);
+                    client->transportConnected,
+                    client->connectionConfiguration.endpoint.kind ==
+                        NETWORK_ENDPOINT_DNS);
             }
             PlatformRwLockReleaseExclusive(&client->lock);
             break;
@@ -1920,10 +2021,9 @@ static QUIC_STATUS QUIC_API ServerConnectionCallback(
             }
             else
             {
-                server->api->StreamShutdown(
-                    event->PEER_STREAM_STARTED.Stream,
-                    QUIC_STREAM_SHUTDOWN_FLAG_ABORT,
-                    NETWORK_APP_ERROR_PROTOCOL);
+                // Returning failure lets MsQuic reject the unowned peer
+                // stream; no callback context or handle is published.
+                return QUIC_STATUS_NOT_SUPPORTED;
             }
             break;
         }
@@ -1934,7 +2034,7 @@ static QUIC_STATUS QUIC_API ServerConnectionCallback(
             {
                 peer->callbackReason = TransportStatusReason(
                     event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status,
-                    peer->secureConnected);
+                    peer->secureConnected, false);
             }
             PlatformRwLockReleaseExclusive(&server->lock);
             break;
@@ -2690,21 +2790,16 @@ static bool LoadClientCredentials(NetworkClient *client)
     credentials.Flags =
         QUIC_CREDENTIAL_FLAG_CLIENT |
         QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED |
-        QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES;
+        QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES |
+        QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION;
 #if !defined(_WIN32)
     credentials.Flags |=
         QUIC_CREDENTIAL_FLAG_USE_TLS_BUILTIN_CERTIFICATE_VALIDATION;
 #endif
-    if (client->connectionConfiguration.trustMode ==
-        NETWORK_TRUST_SHA256)
-    {
-        credentials.Flags |=
-            QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION;
-        // Keep the TLS backend's chain result available, but defer the final
-        // decision to the exact DER pin plus our strict validity/SAN check.
-        // This lets a pre-shared pin act as the trust anchor for a self-signed
-        // certificate without the dangerous NO_CERTIFICATE_VALIDATION mode.
-    }
+    // Keep the TLS backend's chain result available to the callback. System
+    // trust requires a successful chain; pin trust may replace only an
+    // untrusted root and still requires exact DER, validity and SAN checks.
+    // NO_CERTIFICATE_VALIDATION remains deliberately unused.
     return !QUIC_FAILED(client->api->ConfigurationLoadCredential(
         client->configuration, &credentials));
 }
@@ -2763,6 +2858,24 @@ NetworkClient *NetworkClientCreate(
         NetworkClientDestroy(client);
         return NULL;
     }
+    if (configuration->endpoint.kind == NETWORK_ENDPOINT_DNS)
+    {
+        QUIC_ADDR remoteAddress;
+        if (!ResolveDnsEndpoint(configuration, &remoteAddress))
+        {
+            ClientDisconnect(client, NETWORK_DISCONNECT_DNS);
+            return client;
+        }
+        if (QUIC_FAILED(client->api->SetParam(
+                client->connection,
+                QUIC_PARAM_CONN_REMOTE_ADDRESS,
+                (uint32_t)sizeof(remoteAddress),
+                &remoteAddress)))
+        {
+            ClientDisconnect(client, NETWORK_DISCONNECT_IO);
+            return client;
+        }
+    }
     QUIC_STATUS status = client->api->ConnectionStart(
         client->connection, client->configuration,
         QuicFamily(configuration->addressFamily),
@@ -2771,7 +2884,11 @@ NetworkClient *NetworkClientCreate(
     if (QUIC_FAILED(status))
     {
         ClientDisconnect(
-            client, TransportStatusReason(status, false));
+            client,
+            TransportStatusReason(
+                status, false,
+                configuration->endpoint.kind ==
+                    NETWORK_ENDPOINT_DNS));
         return client;
     }
     client->connectionStarted = true;
@@ -2793,6 +2910,38 @@ NetworkClient *NetworkClientCreateLoopback(uint16_t port)
     return NetworkClientCreate(&configuration);
 }
 
+static bool ClientTakeShutdownStreams(
+    NetworkClient *client, HQUIC *outControlStream,
+    HQUIC outServerStreams[LAIUE_PROTOCOL_MAX_SERVER_STREAMS])
+{
+    bool ready = false;
+    PlatformRwLockAcquireExclusive(&client->lock);
+    ready = client->shutdownComplete &&
+            (client->channel.stream == NULL ||
+             client->channel.shutdownComplete);
+    for (uint32_t index = 0;
+         index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS && ready; ++index)
+    {
+        ready =
+            client->serverChannels[index].stream == NULL ||
+            client->serverChannels[index].shutdownComplete;
+    }
+    if (ready)
+    {
+        *outControlStream = client->channel.stream;
+        client->channel.stream = NULL;
+        for (uint32_t index = 0;
+             index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
+        {
+            outServerStreams[index] =
+                client->serverChannels[index].stream;
+            client->serverChannels[index].stream = NULL;
+        }
+    }
+    PlatformRwLockReleaseExclusive(&client->lock);
+    return ready;
+}
+
 void NetworkClientDestroy(NetworkClient *client)
 {
     if (client == NULL)
@@ -2808,16 +2957,46 @@ void NetworkClientDestroy(NetworkClient *client)
     PlatformRwLockReleaseExclusive(&client->lock);
     if (connection != NULL)
     {
+        HQUIC controlStream = NULL;
+        HQUIC serverStreams[LAIUE_PROTOCOL_MAX_SERVER_STREAMS] = {0};
+        bool shutdownDrained = !connectionStarted;
         if (connectionStarted)
         {
             client->api->ConnectionShutdown(
                 connection,
                 QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT,
                 NETWORK_APP_ERROR_SHUTDOWN);
+            uint64_t deadline = PlatformMonotonicMilliseconds() +
+                                NETWORK_SHUTDOWN_DRAIN_TIMEOUT_MS;
+            do
+            {
+                shutdownDrained = ClientTakeShutdownStreams(
+                    client, &controlStream, serverStreams);
+                if (shutdownDrained ||
+                    PlatformMonotonicMilliseconds() >= deadline)
+                {
+                    break;
+                }
+                PlatformSleepMilliseconds(1U);
+            } while (true);
         }
-        // ConnectionClose is synchronous by default and owns forced
-        // teardown of every associated stream. Closing started child
-        // streams before SHUTDOWN_COMPLETE is undefined in MsQuic.
+        if (shutdownDrained)
+        {
+            if (controlStream != NULL)
+            {
+                client->api->StreamClose(controlStream);
+            }
+            for (uint32_t index = 0;
+                 index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
+            {
+                if (serverStreams[index] != NULL)
+                {
+                    client->api->StreamClose(serverStreams[index]);
+                }
+            }
+        }
+        // ConnectionClose is synchronous. Normally all child handles were
+        // closed above only after their SHUTDOWN_COMPLETE callbacks.
         client->api->ConnectionClose(connection);
         client->connection = NULL;
     }
@@ -3374,6 +3553,66 @@ NetworkServer *NetworkServerCreateLoopback(
     return NetworkServerCreate(&loopback);
 }
 
+typedef struct ServerShutdownHandles
+{
+    HQUIC connection;
+    HQUIC controlStream;
+    HQUIC snapshotStream;
+    HQUIC contentStream;
+} ServerShutdownHandles;
+
+static bool ServerShutdownIsDrained(NetworkServer *server)
+{
+    bool drained = true;
+    PlatformRwLockAcquireShared(&server->lock);
+    for (uint32_t index = 0;
+         index < server->maximumPeers && drained; ++index)
+    {
+        const NetworkServerPeer *peer = &server->peers[index];
+        if (!peer->allocated)
+        {
+            continue;
+        }
+        drained =
+            peer->listenerReady && peer->shutdownComplete &&
+            (peer->channel.stream == NULL ||
+             peer->channel.shutdownComplete) &&
+            (peer->snapshotChannel.stream == NULL ||
+             peer->snapshotChannel.shutdownComplete) &&
+            (peer->contentChannel.stream == NULL ||
+             peer->contentChannel.shutdownComplete);
+    }
+    PlatformRwLockReleaseShared(&server->lock);
+    return drained;
+}
+
+static void ServerTakeShutdownHandles(
+    NetworkServer *server,
+    ServerShutdownHandles handles[LAIUE_NETWORK_MAX_PEERS])
+{
+    PlatformRwLockAcquireExclusive(&server->lock);
+    for (uint32_t index = 0;
+         index < server->maximumPeers; ++index)
+    {
+        NetworkServerPeer *peer = &server->peers[index];
+        if (!peer->allocated)
+        {
+            continue;
+        }
+        handles[index].connection = peer->connection;
+        handles[index].controlStream = peer->channel.stream;
+        handles[index].snapshotStream =
+            peer->snapshotChannel.stream;
+        handles[index].contentStream =
+            peer->contentChannel.stream;
+        peer->connection = NULL;
+        peer->channel.stream = NULL;
+        peer->snapshotChannel.stream = NULL;
+        peer->contentChannel.stream = NULL;
+    }
+    PlatformRwLockReleaseExclusive(&server->lock);
+}
+
 void NetworkServerDestroy(NetworkServer *server)
 {
     if (server == NULL)
@@ -3398,29 +3637,51 @@ void NetworkServerDestroy(NetworkServer *server)
     }
     if (server->peers != NULL && server->api != NULL)
     {
+        uint64_t deadline = PlatformMonotonicMilliseconds() +
+                            NETWORK_SHUTDOWN_DRAIN_TIMEOUT_MS;
+        while (!ServerShutdownIsDrained(server) &&
+               PlatformMonotonicMilliseconds() < deadline)
+        {
+            PlatformSleepMilliseconds(1U);
+        }
+        ServerShutdownHandles
+            handles[LAIUE_NETWORK_MAX_PEERS] = {0};
+        bool shutdownDrained = ServerShutdownIsDrained(server);
+        if (shutdownDrained)
+        {
+            ServerTakeShutdownHandles(server, handles);
+        }
         for (uint32_t index = 0;
              index < server->maximumPeers; ++index)
         {
-            NetworkServerPeer *peer = &server->peers[index];
-            HQUIC connection = NULL;
-            PlatformRwLockAcquireExclusive(&server->lock);
-            bool allocated = peer->allocated;
-            if (allocated)
+            if (handles[index].controlStream != NULL)
             {
-                connection = peer->connection;
+                server->api->StreamClose(
+                    handles[index].controlStream);
             }
-            PlatformRwLockReleaseExclusive(&server->lock);
-            if (!allocated)
+            if (handles[index].snapshotStream != NULL)
             {
-                continue;
+                server->api->StreamClose(
+                    handles[index].snapshotStream);
             }
-            if (connection != NULL)
+            if (handles[index].contentStream != NULL)
             {
-                // RegistrationShutdown has initiated a silent teardown.
-                // ConnectionClose synchronously owns any child streams that
-                // have not yet reported SHUTDOWN_COMPLETE.
-                server->api->ConnectionClose(connection);
+                server->api->StreamClose(
+                    handles[index].contentStream);
             }
+            if (handles[index].connection != NULL)
+            {
+                server->api->ConnectionClose(
+                    handles[index].connection);
+            }
+        }
+        if (!shutdownDrained)
+        {
+            // This is a fail-safe for a broken transport callback contract.
+            // RegistrationClose below remains the last-resort owner; never
+            // invoke StreamClose before SHUTDOWN_COMPLETE.
+            PlatformWriteConsoleUtf8(
+                "MsQuic shutdown callbacks did not drain in time\n");
         }
     }
     if (server->configuration != NULL)

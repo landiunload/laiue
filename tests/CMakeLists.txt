@@ -87,7 +87,7 @@ if(UNIX AND TARGET laiue_msquic)
             COMMAND "${CMAKE_COMMAND}"
                 "-DOPENSSL_EXECUTABLE=${laiue_test_openssl_executable}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:laiue_quic_integration_test>"
-                "-DRUNTIME_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/quic-integration-runtime"
+                "-DRUNTIME_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/quic-integration-runtime/$<CONFIG>"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/run_quic_integration_test.cmake")
         set_tests_properties(laiue.network.quic.integration PROPERTIES
             RESOURCE_LOCK laiue_quic_listener

@@ -42,6 +42,7 @@ enum
     WIDGET_WORLD_NEW = 276,
     WIDGET_SERVER_FIRST = 280,
     WIDGET_MENU_BACK = 300,
+    WIDGET_SERVER_ADDRESS_FAMILY = 304,
     WIDGET_MODS_APPLY = 310,
     WIDGET_CONTENT_DOWNLOAD,
     WIDGET_CONNECT_CANCEL,
@@ -77,7 +78,42 @@ static const wchar_t* const PROJECTION_LABELS[RENDER_PROJECTION_COUNT] = {
     L"Панорама (цилиндр)",
 };
 
+static const wchar_t* const CLIENT_ADDRESS_FAMILY_LABELS[3] = {
+    L"Авто",
+    L"IPv4",
+    L"IPv6",
+};
+
 #define MENU_TEXT_CAPACITY 48
+
+static const wchar_t* NetworkFailureCaption(NetworkDisconnectReason reason)
+{
+    switch (reason)
+    {
+        case NETWORK_DISCONNECT_DNS:
+            return L"DNS-имя не разрешено";
+        case NETWORK_DISCONNECT_TLS:
+            return L"Не удалось установить TLS 1.3";
+        case NETWORK_DISCONNECT_CERTIFICATE:
+            return L"Сертификат сервера не прошёл проверку";
+        case NETWORK_DISCONNECT_VERSION:
+            return L"Версия протокола сервера не совпадает";
+        case NETWORK_DISCONNECT_TIMEOUT:
+            return L"Нет ответа: проверьте UDP, IP и порт";
+        case NETWORK_DISCONNECT_CONFIGURATION:
+            return L"Некорректный адрес или настройка клиента";
+        case NETWORK_DISCONNECT_PROTOCOL:
+            return L"Сервер нарушил сетевой протокол";
+        case NETWORK_DISCONNECT_OVERFLOW:
+            return L"Превышены безопасные сетевые лимиты";
+        case NETWORK_DISCONNECT_REMOTE:
+            return L"Сервер закрыл соединение";
+        case NETWORK_DISCONNECT_IO:
+            return L"Ошибка сетевого транспорта";
+        default:
+            return L"Не удалось подключиться к серверу";
+    }
+}
 
 void PauseMenuOpen(PauseMenu* menu)
 {
@@ -142,6 +178,7 @@ static PauseMenuAction UpdateTitleScreen(PauseMenu* menu, UiContext* ui,
     {
         menu->serverListLoaded = false;
         menu->serverListOffset = 0;
+        menu->networkDisconnectReason = NETWORK_DISCONNECT_NONE;
         menu->screen = PAUSE_MENU_MULTIPLAYER;
     }
     y += buttonHeight + 10.0f * s;
@@ -259,9 +296,33 @@ static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
     {
         menu->serverListLoaded = ServerListLoad(&menu->servers);
     }
+    int32_t familyIndex = 0;
+    if (menu->clientAddressFamily == NETWORK_ADDRESS_FAMILY_IPV4)
+    {
+        familyIndex = 1;
+    }
+    else if (menu->clientAddressFamily == NETWORK_ADDRESS_FAMILY_IPV6)
+    {
+        familyIndex = 2;
+    }
+    UiText(ui, contentX, y, UI_COLOR_TEXT_DIM,
+        L"Семейство для DNS-имён");
+    y += ui->font.lineHeight + 4.0f * s;
+    if (UiSegmented(ui, WIDGET_SERVER_ADDRESS_FAMILY,
+            contentX, y, contentWidth, 30.0f * s,
+            CLIENT_ADDRESS_FAMILY_LABELS, 3, &familyIndex))
+    {
+        menu->clientAddressFamily = familyIndex == 1
+            ? NETWORK_ADDRESS_FAMILY_IPV4
+            : (familyIndex == 2
+                ? NETWORK_ADDRESS_FAMILY_IPV6
+                : NETWORK_ADDRESS_FAMILY_AUTO);
+    }
+    y += 38.0f * s;
+
     const ServerList* list = &menu->servers;
     if (ui->wheelSteps > 0.0f
-        && menu->serverListOffset + 5U < list->count)
+        && menu->serverListOffset + 3U < list->count)
     {
         ++menu->serverListOffset;
     }
@@ -269,7 +330,7 @@ static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
     {
         --menu->serverListOffset;
     }
-    for (uint32_t i = 0; i < 5U
+    for (uint32_t i = 0; i < 3U
         && menu->serverListOffset + i < list->count; ++i)
     {
         uint32_t serverIndex = menu->serverListOffset + i;
@@ -290,6 +351,7 @@ static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
         {
             menu->networkConnecting = true;
             menu->networkRejected = false;
+            menu->networkDisconnectReason = NETWORK_DISCONNECT_NONE;
             menu->contentDownloadFailed = false;
             menu->selectedServerIndex = serverIndex;
             return PAUSE_MENU_ACTION_CONNECT_SERVER;
@@ -306,7 +368,18 @@ static PauseMenuAction UpdateMultiplayerScreen(PauseMenu* menu,
         UiText(ui, contentX, y, UiColor(216, 96, 80, 255),
             L"Содержимое не прошло проверку или установку");
     }
+    else if (menu->networkDisconnectReason != NETWORK_DISCONNECT_NONE)
+    {
+        UiText(ui, contentX, y, UiColor(216, 96, 80, 255),
+            NetworkFailureCaption(menu->networkDisconnectReason));
+    }
     float bottom = ((float)height + panelHeight) * 0.5f - padding;
+    if (!menu->networkRejected && !menu->contentDownloadFailed
+        && menu->networkDisconnectReason == NETWORK_DISCONNECT_NONE)
+    {
+        UiText(ui, contentX, bottom - 62.0f * s, UI_COLOR_TEXT_DIM,
+            L"IP/порт: servers.txt; без порта — UDP 27180");
+    }
     if (UiButton(ui, WIDGET_MENU_BACK, contentX,
             bottom - 34.0f * s, contentWidth, 34.0f * s, L"Назад"))
     {

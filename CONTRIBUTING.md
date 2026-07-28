@@ -8,13 +8,13 @@ Linux. Подробная матрица и зависимости — в
 [docs/portability.md](docs/portability.md).
 
 ```powershell
-cmake --preset ninja-clang-debug
-cmake --build --preset ninja-clang-debug --parallel
-ctest --preset ninja-clang-debug
+$env:LAIUE_MSQUIC_ROOT = 'C:\deps\msquic-2.5.9'
+cmake --preset windows-clang
+cmake --build --preset windows-clang-debug --parallel
+ctest --preset windows-clang-debug
 
-cmake --preset ninja-clang-release
-cmake --build --preset ninja-clang-release --parallel
-ctest --preset ninja-clang-release
+cmake --build --preset windows-clang-release --parallel
+ctest --preset windows-clang-release
 
 pwsh -NoProfile -File tools/check_architecture.ps1
 git diff --check
@@ -23,14 +23,20 @@ git diff --check
 Минимальная server-only проверка на Debian/Ubuntu:
 
 ```sh
+export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
 cmake --preset linux-gcc-asan
-cmake --build --preset linux-gcc-asan --target laiue_server_bundle
-ctest --preset linux-gcc-asan
+cmake --build --preset linux-gcc-asan-debug \
+  --target laiue_server_bundle
+ctest --preset linux-gcc-asan-debug
 ```
 
-Release/CI обязаны задавать `LAIUE_REQUIRE_MSQUIC=ON`: отсутствие secure
-transport там является ошибкой configure, а не основанием включить
-plaintext fallback.
+Configure выполняется один раз на toolchain; Debug и Release выбираются
+одноимённым build/test-preset с суффиксом `-debug` или `-release`.
+Sanitizer-проверка существует только как `linux-gcc-asan-debug`.
+Все канонические configure-presets задают `LAIUE_REQUIRE_MSQUIC=ON`:
+отсутствие secure transport является ошибкой configure, а не основанием
+включить plaintext fallback. Prefix передаётся через `LAIUE_MSQUIC_ROOT`
+или `-DLAIUE_MSQUIC_ROOT=...`.
 
 Тесты живут в `tests/` и регистрируются в CTest; test-preset назван так же,
 как build-preset. Тест аудио-API возвращает 125 и помечается пропущенным,
@@ -59,9 +65,9 @@ Get-Process laiue,laiue_server -ErrorAction SilentlyContinue |
 Stop-Process -Id <PID>
 ```
 
-Разные build-каталоги друг другу не мешают. Ninja + MSVC запускайте из
-Developer PowerShell/Command Prompt; иначе используйте preset
-`visual-studio`.
+Разные build-каталоги друг другу не мешают. Visual Studio preset
+`windows-msvc` самодостаточен. Preset `windows-clang` требует `clang-cl` и
+Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Command Prompt.
 
 ## Архитектурные правила
 

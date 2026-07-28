@@ -745,11 +745,20 @@ static bool RunCertificateFailureScenario(
                     NETWORK_DISCONNECT_CERTIFICATE;
                 if (!certificateDisconnect)
                 {
+                    fprintf(
+                        stderr,
+                        "Expected certificate disconnect, got reason %u\n",
+                        (unsigned int)
+                            clientEvent.data.disconnectReason);
                     protocolOrGameDataObserved = true;
                 }
             }
             else
             {
+                fprintf(
+                    stderr,
+                    "Unexpected event before certificate rejection: %u\n",
+                    (unsigned int)clientEvent.type);
                 protocolOrGameDataObserved = true;
             }
         }
@@ -804,11 +813,19 @@ static bool RunDnsFailureScenario(void)
                     NETWORK_DISCONNECT_DNS;
                 if (!dnsDisconnect)
                 {
+                    fprintf(
+                        stderr,
+                        "Expected DNS disconnect, got reason %u\n",
+                        (unsigned int)event.data.disconnectReason);
                     protocolOrGenericFailureObserved = true;
                 }
             }
             else
             {
+                fprintf(
+                    stderr,
+                    "Unexpected event before DNS failure: %u\n",
+                    (unsigned int)event.type);
                 protocolOrGenericFailureObserved = true;
             }
         }
@@ -903,6 +920,16 @@ int main(int argumentCount, char **arguments)
                                NETWORK_TRUST_SYSTEM, NULL, 0),
                            "IPv4 system-trust connection did not reach "
                            "READY/input");
+        if (succeeded)
+        {
+            succeeded = Expect(
+                RunReadyScenario(
+                    certificatePath, privateKeyPath, "localhost",
+                    NETWORK_ADDRESS_FAMILY_AUTO,
+                    NETWORK_TRUST_SYSTEM, NULL, 0),
+                "DNS system-trust connection did not preserve SNI/SAN "
+                "while using the resolved QUIC address");
+        }
     }
     else if (strcmp(mode, "wrong-pin") == 0)
     {

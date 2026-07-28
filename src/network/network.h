@@ -349,6 +349,8 @@ LAIUE_NETWORK_API NetworkSecureTransportStatus NetworkGetSecureTransportStatus(v
 
 // Production entry points are authenticated QUIC/TLS 1.3 only. They fail
 // closed when MsQuic is not compiled in or credentials cannot be validated.
+// A client-side resolution/start failure can return a valid client already in
+// DISCONNECTED state so callers can poll its precise terminal reason.
 LAIUE_NETWORK_API NetworkClient *NetworkClientCreate(
     const NetworkClientConfiguration *configuration);
 LAIUE_NETWORK_API NetworkServer *NetworkServerCreate(
