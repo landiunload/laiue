@@ -91,7 +91,7 @@ Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
 - `renderer_d3d12.c`: device/swap chain, ресурсы, chunk, panorama и UI pass;
 - `world_infinite.c`: хранение, генерация и фасад `world.h`;
 - `chunk_streaming.c`: планировщик, очередь работ и GPU-меши;
-- `server/main.c` (1352 строки): конфигурация и запуск, обработка сетевых
+- `server/main.c`: конфигурация и запуск, обработка сетевых
   событий, симуляция тика и интерес игроков;
 - `pause_menu.c`: состояние/команды и представление;
 - Сетевой стек: вынести общий framing/send ownership в
