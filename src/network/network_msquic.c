@@ -4,6 +4,8 @@
 
 #include "network/certificate_validation.h"
 #include "network/network.h"
+#include "network/network_backend.h"
+#include "network/network_datagram.h"
 #include "network/protocol.h"
 #include "platform/system.h"
 
@@ -85,6 +87,14 @@ struct QuicChannel
 
 typedef struct NetworkServerPeer NetworkServerPeer;
 
+typedef struct QuicDatagramSendSlot
+{
+    NetworkServerPeer *peer;
+    QUIC_BUFFER buffer;
+    uint8_t bytes[LAIUE_NETWORK_PLAYER_STATE_DATAGRAM_SIZE];
+    bool inUse;
+} QuicDatagramSendSlot;
+
 struct NetworkClient
 {
     const QUIC_API_TABLE *api;
@@ -94,6 +104,8 @@ struct NetworkClient
     PlatformRwLock lock;
     QuicChannel channel;
     NetworkClientEvent events[NETWORK_CLIENT_EVENT_CAPACITY];
+    LaiueNetworkDatagramQueue datagrams;
+    LaiueNetworkPlayerStateFreshness playerStateFreshness;
     uint32_t eventRead;
     uint32_t eventWrite;
     uint32_t eventCount;
@@ -106,6 +118,7 @@ struct NetworkClient
         [NETWORK_AUX_RECEIVE_CAPACITY];
     QuicChannel serverChannels[LAIUE_PROTOCOL_MAX_SERVER_STREAMS];
     uint64_t clientNonce;
+    uint64_t datagramLastReceiveAtMs;
     uint64_t snapshotId;
     uint64_t snapshotWorldRevision;
     int64_t resyncRequestChunk[3];
@@ -191,6 +204,9 @@ struct NetworkServerPeer
     uint32_t inputsInWindow;
     uint32_t editsInWindow;
     uint32_t resyncsInWindow;
+    LaiueNetworkDatagramQueue datagrams;
+    QuicDatagramSendSlot datagramSends[
+        LAIUE_NETWORK_MAX_OUTSTANDING_DATAGRAM_SENDS];
     NetworkModDescriptor mods[LAIUE_NETWORK_MAX_MODS];
     uint64_t clientNonce;
     uint32_t expectedModCount;
@@ -202,11 +218,14 @@ struct NetworkServerPeer
     uint64_t resyncExpectedRevision;
     uint32_t expectedSnapshotChunks;
     uint32_t sentSnapshotChunks;
+    uint32_t datagramSequence;
+    uint32_t outstandingDatagramSends;
     int64_t snapshotPartChunk[3];
     uint64_t snapshotPartRevision;
     uint32_t snapshotLastEditIndex;
     uint16_t snapshotNextPart;
     uint16_t snapshotPartCount;
+    uint16_t maximumDatagramSendLength;
     NetworkDisconnectReason callbackReason;
     NetworkDisconnectReason closeReason;
     bool allocated;
@@ -227,6 +246,7 @@ struct NetworkServerPeer
     bool contentTransferActive;
     bool rejected;
     bool connectedNotified;
+    bool datagramSendEnabled;
 };
 
 _Static_assert(LAIUE_NETWORK_MAX_CHUNK_EDITS ==
@@ -301,6 +321,18 @@ static NetworkDisconnectReason TransportStatusReason(
         return NETWORK_DISCONNECT_DNS;
     }
     return NETWORK_DISCONNECT_IO;
+}
+
+static NetworkDisconnectReason DatagramPushDisconnectReason(
+    LaiueNetworkDatagramPushResult result)
+{
+    if (result == LAIUE_NETWORK_DATAGRAM_ACCEPTED)
+    {
+        return NETWORK_DISCONNECT_NONE;
+    }
+    return result == LAIUE_NETWORK_DATAGRAM_OVERFLOW
+               ? NETWORK_DISCONNECT_OVERFLOW
+               : NETWORK_DISCONNECT_PROTOCOL;
 }
 
 static void ChannelInitialize(
@@ -928,7 +960,7 @@ static void FillSettings(
     settings->PeerUnidiStreamCount =
         server ? 0U : LAIUE_PROTOCOL_MAX_SERVER_STREAMS;
     settings->IsSet.PeerUnidiStreamCount = true;
-    settings->DatagramReceiveEnabled = false;
+    settings->DatagramReceiveEnabled = true;
     settings->IsSet.DatagramReceiveEnabled = true;
     if (server)
     {
@@ -1117,6 +1149,43 @@ static QUIC_STATUS QUIC_API ClientConnectionCallback(
                 client->transportConnected = true;
             }
             PlatformRwLockReleaseExclusive(&client->lock);
+            break;
+
+        case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
+        {
+            LaiueNetworkDatagramPushResult pushed =
+                LAIUE_NETWORK_DATAGRAM_INVALID;
+            const QUIC_BUFFER *buffer =
+                event->DATAGRAM_RECEIVED.Buffer;
+            PlatformRwLockAcquireExclusive(&client->lock);
+            if ((event->DATAGRAM_RECEIVED.Flags &
+                    QUIC_RECEIVE_FLAG_0_RTT) == 0 &&
+                buffer != NULL)
+            {
+                pushed = LaiueNetworkDatagramQueuePush(
+                    &client->datagrams, buffer->Buffer,
+                    buffer->Length);
+            }
+            NetworkDisconnectReason reason =
+                DatagramPushDisconnectReason(pushed);
+            if (reason == NETWORK_DISCONNECT_NONE)
+            {
+                client->datagramLastReceiveAtMs =
+                    PlatformMonotonicMilliseconds();
+            }
+            else if (client->callbackReason ==
+                     NETWORK_DISCONNECT_NONE)
+            {
+                client->callbackReason = reason;
+            }
+            PlatformRwLockReleaseExclusive(&client->lock);
+            break;
+        }
+
+        case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED:
+        case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED:
+            // Client-to-server transient datagrams are intentionally not
+            // enabled in this iteration.
             break;
 
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
@@ -1747,6 +1816,22 @@ static bool ClientHandleFrame(
         {
             return false;
         }
+        if (frame->type == LAIUE_MESSAGE_PLAYER_STATE &&
+            !LaiueNetworkPlayerStateFreshnessAccept(
+                &client->playerStateFreshness,
+                decoded.peerId, decoded.serverTick))
+        {
+            // Unreliable state may be duplicated or reordered. It is
+            // transient and must not turn normal packet behavior into a
+            // protocol disconnect. Reliable fallback shares this guard.
+            return true;
+        }
+        if (frame->type == LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY)
+        {
+            LaiueNetworkPlayerStateFreshnessActivate(
+                &client->playerStateFreshness,
+                decoded.peerId);
+        }
         event.type = NETWORK_CLIENT_EVENT_PLAYER_STATE;
         event.data.playerState.serverTick = decoded.serverTick;
         event.data.playerState.peerId = decoded.peerId;
@@ -1865,6 +1950,18 @@ static bool ClientHandleFrame(
                 &event.data.peerId))
         {
             return false;
+        }
+        if (frame->type == LAIUE_MESSAGE_PLAYER_JOINED)
+        {
+            LaiueNetworkPlayerStateFreshnessActivate(
+                &client->playerStateFreshness,
+                event.data.peerId);
+        }
+        else
+        {
+            LaiueNetworkPlayerStateFreshnessRetire(
+                &client->playerStateFreshness,
+                event.data.peerId);
         }
         return ClientPushEvent(client, &event);
     }
@@ -1998,6 +2095,40 @@ static bool ClientParseServerStream(
     return true;
 }
 
+static bool ClientParseDatagrams(NetworkClient *client)
+{
+    uint8_t bytes[LAIUE_NETWORK_PLAYER_STATE_DATAGRAM_SIZE];
+    for (uint32_t count = 0;
+         count < LAIUE_NETWORK_DATAGRAM_QUEUE_CAPACITY; ++count)
+    {
+        if (client->eventCount >=
+            NETWORK_CLIENT_EVENT_CAPACITY - 1U)
+        {
+            return true;
+        }
+
+        uint32_t size = 0;
+        PlatformRwLockAcquireExclusive(&client->lock);
+        bool received = LaiueNetworkDatagramQueuePop(
+            &client->datagrams, bytes, &size);
+        PlatformRwLockReleaseExclusive(&client->lock);
+        if (!received)
+        {
+            return true;
+        }
+
+        LaiueProtocolFrame frame;
+        if (client->state != NETWORK_CONNECTION_READY ||
+            !LaiueNetworkDatagramReadPlayerStateFrame(
+                bytes, size, &frame) ||
+            !ClientHandleFrame(client, &frame))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static QUIC_STATUS QUIC_API ServerConnectionCallback(
     HQUIC connection, void *context, QUIC_CONNECTION_EVENT *event)
 {
@@ -2026,6 +2157,67 @@ static QUIC_STATUS QUIC_API ServerConnectionCallback(
             }
             PlatformRwLockReleaseExclusive(&server->lock);
             break;
+
+        case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED:
+            PlatformRwLockAcquireExclusive(&server->lock);
+            if (peer->allocated)
+            {
+                peer->datagramSendEnabled =
+                    event->DATAGRAM_STATE_CHANGED.SendEnabled != FALSE;
+                peer->maximumDatagramSendLength =
+                    event->DATAGRAM_STATE_CHANGED.MaxSendLength;
+            }
+            PlatformRwLockReleaseExclusive(&server->lock);
+            break;
+
+        case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
+        {
+            LaiueNetworkDatagramPushResult pushed =
+                LAIUE_NETWORK_DATAGRAM_INVALID;
+            const QUIC_BUFFER *buffer =
+                event->DATAGRAM_RECEIVED.Buffer;
+            PlatformRwLockAcquireExclusive(&server->lock);
+            if (peer->allocated &&
+                (event->DATAGRAM_RECEIVED.Flags &
+                    QUIC_RECEIVE_FLAG_0_RTT) == 0 &&
+                buffer != NULL)
+            {
+                pushed = LaiueNetworkDatagramQueuePush(
+                    &peer->datagrams, buffer->Buffer,
+                    buffer->Length);
+            }
+            NetworkDisconnectReason reason =
+                DatagramPushDisconnectReason(pushed);
+            if (reason != NETWORK_DISCONNECT_NONE &&
+                peer->callbackReason == NETWORK_DISCONNECT_NONE)
+            {
+                peer->callbackReason = reason;
+            }
+            PlatformRwLockReleaseExclusive(&server->lock);
+            break;
+        }
+
+        case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED:
+        {
+            QuicDatagramSendSlot *send =
+                event->DATAGRAM_SEND_STATE_CHANGED.ClientContext;
+            if (send != NULL &&
+                QUIC_DATAGRAM_SEND_STATE_IS_FINAL(
+                    event->DATAGRAM_SEND_STATE_CHANGED.State))
+            {
+                PlatformRwLockAcquireExclusive(&server->lock);
+                if (send->peer == peer && send->inUse)
+                {
+                    if (peer->outstandingDatagramSends != 0)
+                    {
+                        --peer->outstandingDatagramSends;
+                    }
+                    send->inUse = false;
+                }
+                PlatformRwLockReleaseExclusive(&server->lock);
+            }
+            break;
+        }
 
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
         {
@@ -2293,6 +2485,7 @@ static void ServerFinalizePeer(
     PlatformRwLockAcquireExclusive(&server->lock);
     if (!peer->allocated || !peer->listenerReady ||
         !peer->closing || !peer->shutdownComplete ||
+        peer->outstandingDatagramSends != 0 ||
         (peer->channel.stream != NULL &&
          !peer->channel.shutdownComplete) ||
         (peer->snapshotChannel.stream != NULL &&
@@ -2809,7 +3002,20 @@ static bool ServerParseFrames(
     return true;
 }
 
-NetworkSecureTransportStatus NetworkGetSecureTransportStatus(void)
+static bool ServerHasUnexpectedDatagram(
+    NetworkServer *server, NetworkServerPeer *peer)
+{
+    uint8_t bytes[LAIUE_NETWORK_PLAYER_STATE_DATAGRAM_SIZE];
+    uint32_t size = 0;
+    PlatformRwLockAcquireExclusive(&server->lock);
+    bool received = LaiueNetworkDatagramQueuePop(
+        &peer->datagrams, bytes, &size);
+    PlatformRwLockReleaseExclusive(&server->lock);
+    (void)size;
+    return received;
+}
+
+NetworkSecureTransportStatus LaiueNetworkBackendGetStatus(void)
 {
     const QUIC_API_TABLE *api = NULL;
     HQUIC registration = NULL;
@@ -2844,7 +3050,7 @@ static bool LoadClientCredentials(NetworkClient *client)
         client->configuration, &credentials));
 }
 
-NetworkClient *NetworkClientCreate(
+NetworkClient *LaiueNetworkBackendClientCreate(
     const NetworkClientConfiguration *configuration)
 {
     if (!NetworkClientConfigurationIsValid(configuration))
@@ -2865,7 +3071,7 @@ NetworkClient *NetworkClientCreate(
     if (!OpenApiAndRegistration(
             &client->api, &client->registration))
     {
-        NetworkClientDestroy(client);
+        LaiueNetworkBackendClientDestroy(client);
         return NULL;
     }
     ChannelInitialize(
@@ -2895,7 +3101,7 @@ NetworkClient *NetworkClientCreate(
             client->registration, ClientConnectionCallback,
             client, &client->connection)))
     {
-        NetworkClientDestroy(client);
+        LaiueNetworkBackendClientDestroy(client);
         return NULL;
     }
     if (configuration->endpoint.kind == NETWORK_ENDPOINT_DNS)
@@ -2936,7 +3142,7 @@ NetworkClient *NetworkClientCreate(
     return client;
 }
 
-NetworkClient *NetworkClientCreateLoopback(uint16_t port)
+NetworkClient *LaiueNetworkBackendClientCreateLoopback(uint16_t port)
 {
     NetworkClientConfiguration configuration;
     NetworkClientConfigurationInitialize(&configuration);
@@ -2947,7 +3153,7 @@ NetworkClient *NetworkClientCreateLoopback(uint16_t port)
     {
         return NULL;
     }
-    return NetworkClientCreate(&configuration);
+    return LaiueNetworkBackendClientCreate(&configuration);
 }
 
 static bool ClientTakeShutdownStreams(
@@ -2982,7 +3188,7 @@ static bool ClientTakeShutdownStreams(
     return ready;
 }
 
-void NetworkClientDestroy(NetworkClient *client)
+void LaiueNetworkBackendClientDestroy(NetworkClient *client)
 {
     if (client == NULL)
     {
@@ -3057,7 +3263,7 @@ void NetworkClientDestroy(NetworkClient *client)
     PlatformFree(client);
 }
 
-void NetworkClientUpdate(NetworkClient *client)
+void LaiueNetworkBackendClientUpdate(NetworkClient *client)
 {
     if (client == NULL ||
         client->state == NETWORK_CONNECTION_DISCONNECTED)
@@ -3068,11 +3274,14 @@ void NetworkClientUpdate(NetworkClient *client)
     NetworkDisconnectReason reason;
     bool connected;
     bool verified;
+    uint64_t datagramLastReceiveAtMs;
     PlatformRwLockAcquireExclusive(&client->lock);
     reason = client->callbackReason;
     client->callbackReason = NETWORK_DISCONNECT_NONE;
     connected = client->transportConnected;
     verified = client->certificateVerified;
+    datagramLastReceiveAtMs =
+        client->datagramLastReceiveAtMs;
     PlatformRwLockReleaseExclusive(&client->lock);
     NetworkDisconnectReason channelReason =
         ChannelTakeError(&client->channel);
@@ -3135,6 +3344,12 @@ void NetworkClientUpdate(NetworkClient *client)
             return;
         }
     }
+    if (!ClientParseDatagrams(client))
+    {
+        ClientDisconnect(
+            client, NETWORK_DISCONNECT_PROTOCOL);
+        return;
+    }
 
     uint64_t now = PlatformMonotonicMilliseconds();
     uint32_t handshakeTimeout =
@@ -3163,6 +3378,10 @@ void NetworkClientUpdate(NetworkClient *client)
     }
     uint64_t lastActivity =
         ChannelLastActivityAt(&client->channel);
+    if (datagramLastReceiveAtMs > lastActivity)
+    {
+        lastActivity = datagramLastReceiveAtMs;
+    }
     for (uint32_t index = 0;
          index < LAIUE_PROTOCOL_MAX_SERVER_STREAMS; ++index)
     {
@@ -3192,7 +3411,7 @@ void NetworkClientUpdate(NetworkClient *client)
     }
 }
 
-NetworkConnectionState NetworkClientGetState(
+NetworkConnectionState LaiueNetworkBackendClientGetState(
     const NetworkClient *client)
 {
     return client != NULL
@@ -3200,7 +3419,7 @@ NetworkConnectionState NetworkClientGetState(
                : NETWORK_CONNECTION_DISCONNECTED;
 }
 
-bool NetworkClientPollEvent(
+bool LaiueNetworkBackendClientPollEvent(
     NetworkClient *client, NetworkClientEvent *outEvent)
 {
     if (client == NULL || outEvent == NULL ||
@@ -3215,7 +3434,7 @@ bool NetworkClientPollEvent(
     return true;
 }
 
-bool NetworkClientCopyServerMods(
+bool LaiueNetworkBackendClientCopyServerMods(
     const NetworkClient *client, NetworkModDescriptor *output,
     uint32_t capacity, uint32_t *outCount)
 {
@@ -3236,7 +3455,7 @@ bool NetworkClientCopyServerMods(
     return true;
 }
 
-bool NetworkClientSubmitMods(
+bool LaiueNetworkBackendClientSubmitMods(
     NetworkClient *client, const NetworkModDescriptor *mods,
     uint32_t count)
 {
@@ -3260,7 +3479,7 @@ bool NetworkClientSubmitMods(
     return true;
 }
 
-bool NetworkClientRequestContent(NetworkClient *client)
+bool LaiueNetworkBackendClientRequestContent(NetworkClient *client)
 {
     if (client == NULL ||
         client->state != NETWORK_CONNECTION_NEGOTIATING ||
@@ -3279,7 +3498,7 @@ bool NetworkClientRequestContent(NetworkClient *client)
     return true;
 }
 
-bool NetworkClientTakeContent(
+bool LaiueNetworkBackendClientTakeContent(
     NetworkClient *client, uint8_t **outBytes, uint64_t *outSize)
 {
     if (client == NULL || outBytes == NULL || outSize == NULL ||
@@ -3296,7 +3515,7 @@ bool NetworkClientTakeContent(
     return true;
 }
 
-bool NetworkClientSendInput(
+bool LaiueNetworkBackendClientSendInput(
     NetworkClient *client, const NetworkInputCommand *input)
 {
     if (client == NULL || input == NULL ||
@@ -3337,7 +3556,7 @@ bool NetworkClientSendInput(
     return true;
 }
 
-bool NetworkClientSendEditIntent(
+bool LaiueNetworkBackendClientSendEditIntent(
     NetworkClient *client, bool breakBlock, bool placeBlock,
     uint8_t placementBlock, const float direction[3])
 {
@@ -3356,7 +3575,7 @@ bool NetworkClientSendEditIntent(
                payload, size);
 }
 
-bool NetworkClientSendSelectedHotbarSlot(
+bool LaiueNetworkBackendClientSendSelectedHotbarSlot(
     NetworkClient *client, uint8_t slot)
 {
     return client != NULL && slot < 9U &&
@@ -3367,7 +3586,7 @@ bool NetworkClientSendSelectedHotbarSlot(
                &slot, 1U);
 }
 
-bool NetworkClientRequestChunkResync(
+bool LaiueNetworkBackendClientRequestChunkResync(
     NetworkClient *client, const int64_t chunk[3],
     uint64_t expectedRevision)
 {
@@ -3400,7 +3619,7 @@ bool NetworkClientRequestChunkResync(
     return true;
 }
 
-bool NetworkClientAcknowledgeReady(NetworkClient *client)
+bool LaiueNetworkBackendClientAcknowledgeReady(NetworkClient *client)
 {
     if (client == NULL ||
         client->state != NETWORK_CONNECTION_READY)
@@ -3504,7 +3723,7 @@ static bool BuildListenAddress(
                endpoint.host, endpoint.port, outAddress) != FALSE;
 }
 
-NetworkServer *NetworkServerCreate(
+NetworkServer *LaiueNetworkBackendServerCreate(
     const NetworkServerConfiguration *configuration)
 {
     if (!NetworkServerConfigurationIsValid(configuration))
@@ -3553,7 +3772,7 @@ NetworkServer *NetworkServerCreate(
                 actual, configuration->contentBundleSha256,
                 sizeof(actual)))
         {
-            NetworkServerDestroy(server);
+            LaiueNetworkBackendServerDestroy(server);
             return NULL;
         }
         memcpy(
@@ -3574,7 +3793,7 @@ NetworkServer *NetworkServerCreate(
             server->registration, ServerListenerCallback,
             server, &server->listener)))
     {
-        NetworkServerDestroy(server);
+        LaiueNetworkBackendServerDestroy(server);
         return NULL;
     }
 
@@ -3588,13 +3807,13 @@ NetworkServer *NetworkServerCreate(
         QUIC_FAILED(server->api->ListenerStart(
             server->listener, &alpn, 1U, &address)))
     {
-        NetworkServerDestroy(server);
+        LaiueNetworkBackendServerDestroy(server);
         return NULL;
     }
     return server;
 }
 
-NetworkServer *NetworkServerCreateLoopback(
+NetworkServer *LaiueNetworkBackendServerCreateLoopback(
     const NetworkServerConfiguration *configuration)
 {
     if (configuration == NULL)
@@ -3604,7 +3823,7 @@ NetworkServer *NetworkServerCreateLoopback(
     NetworkServerConfiguration loopback = *configuration;
     loopback.addressFamily = NETWORK_ADDRESS_FAMILY_DUAL;
     loopback.listenAddress = "*";
-    return NetworkServerCreate(&loopback);
+    return LaiueNetworkBackendServerCreate(&loopback);
 }
 
 typedef struct ServerShutdownHandles
@@ -3629,6 +3848,7 @@ static bool ServerShutdownIsDrained(NetworkServer *server)
         }
         drained =
             peer->listenerReady && peer->shutdownComplete &&
+            peer->outstandingDatagramSends == 0 &&
             (peer->channel.stream == NULL ||
              peer->channel.shutdownComplete) &&
             (peer->snapshotChannel.stream == NULL ||
@@ -3667,7 +3887,7 @@ static void ServerTakeShutdownHandles(
     PlatformRwLockReleaseExclusive(&server->lock);
 }
 
-void NetworkServerDestroy(NetworkServer *server)
+void LaiueNetworkBackendServerDestroy(NetworkServer *server)
 {
     if (server == NULL)
     {
@@ -3755,7 +3975,7 @@ void NetworkServerDestroy(NetworkServer *server)
     PlatformFree(server);
 }
 
-void NetworkServerUpdate(NetworkServer *server)
+void LaiueNetworkBackendServerUpdate(NetworkServer *server)
 {
     if (server == NULL || server->stopping)
     {
@@ -3790,6 +4010,14 @@ void NetworkServerUpdate(NetworkServer *server)
             ChannelIsActive(&peer->contentChannel))
         {
             reason = ChannelTakeError(&peer->contentChannel);
+        }
+        if (reason == NETWORK_DISCONNECT_NONE &&
+            ServerHasUnexpectedDatagram(server, peer))
+        {
+            // Protocol v5 currently defines transient datagrams only in the
+            // authoritative server-to-client direction. The callback merely
+            // copied the bounded bytes; policy is enforced here.
+            reason = NETWORK_DISCONNECT_PROTOCOL;
         }
         bool retired = false;
         if (reason == NETWORK_DISCONNECT_NONE &&
@@ -3879,7 +4107,7 @@ void NetworkServerUpdate(NetworkServer *server)
     }
 }
 
-bool NetworkServerPollEvent(
+bool LaiueNetworkBackendServerPollEvent(
     NetworkServer *server, NetworkServerEvent *outEvent)
 {
     if (server == NULL || outEvent == NULL ||
@@ -3894,7 +4122,7 @@ bool NetworkServerPollEvent(
     return true;
 }
 
-bool NetworkServerDisconnect(
+bool LaiueNetworkBackendServerDisconnect(
     NetworkServer *server, uint32_t peerId,
     NetworkDisconnectReason reason)
 {
@@ -3956,6 +4184,105 @@ static bool ServerSendToPeer(
     return true;
 }
 
+static bool ServerTrySendPlayerStateDatagram(
+    NetworkServer *server, NetworkServerPeer *peer,
+    const uint8_t *payload, uint32_t payloadSize,
+    bool *outSent)
+{
+    if (server == NULL || peer == NULL || payload == NULL ||
+        outSent == NULL ||
+        payloadSize != LAIUE_PROTOCOL_PLAYER_STATE_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+    *outSent = false;
+    const uint32_t frameSize =
+        LAIUE_PROTOCOL_HEADER_SIZE + payloadSize;
+    HQUIC connection = NULL;
+    uint32_t sequence = 0;
+    QuicDatagramSendSlot *send = NULL;
+    PlatformRwLockAcquireExclusive(&server->lock);
+    bool canSend =
+        peer->allocated && peer->listenerReady &&
+        peer->secureConnected && peer->ready &&
+        !peer->closing && peer->connection != NULL &&
+        LaiueNetworkDatagramCanSendPlayerState(
+            peer->datagramSendEnabled,
+            peer->maximumDatagramSendLength,
+            peer->outstandingDatagramSends, frameSize);
+    if (canSend)
+    {
+        for (uint32_t index = 0;
+             index <
+                 LAIUE_NETWORK_MAX_OUTSTANDING_DATAGRAM_SENDS;
+             ++index)
+        {
+            if (!peer->datagramSends[index].inUse)
+            {
+                send = &peer->datagramSends[index];
+                break;
+            }
+        }
+        canSend = send != NULL;
+    }
+    if (canSend)
+    {
+        sequence = ++peer->datagramSequence;
+        if (sequence == 0)
+        {
+            sequence = ++peer->datagramSequence;
+        }
+        connection = peer->connection;
+        send->peer = peer;
+        send->inUse = true;
+        ++peer->outstandingDatagramSends;
+    }
+    PlatformRwLockReleaseExclusive(&server->lock);
+    if (!canSend)
+    {
+        return true;
+    }
+
+    if (LaiueProtocolWriteFrame(
+            send->bytes, sizeof(send->bytes),
+            LAIUE_MESSAGE_PLAYER_STATE, sequence,
+            payload, payloadSize) != frameSize)
+    {
+        PlatformRwLockAcquireExclusive(&server->lock);
+        if (send->inUse)
+        {
+            --peer->outstandingDatagramSends;
+            send->inUse = false;
+        }
+        PlatformRwLockReleaseExclusive(&server->lock);
+        return false;
+    }
+    send->buffer.Buffer = send->bytes;
+    send->buffer.Length = frameSize;
+
+    QUIC_STATUS status = server->api->DatagramSend(
+        connection, &send->buffer, 1U,
+        QUIC_SEND_FLAG_CANCEL_ON_BLOCKED, send);
+    if (QUIC_FAILED(status))
+    {
+        PlatformRwLockAcquireExclusive(&server->lock);
+        if (send->inUse)
+        {
+            if (peer->outstandingDatagramSends != 0)
+            {
+                --peer->outstandingDatagramSends;
+            }
+            send->inUse = false;
+        }
+        PlatformRwLockReleaseExclusive(&server->lock);
+        // Capability can change asynchronously. Preserve delivery by
+        // retrying this state through the reliable control stream.
+        return true;
+    }
+    *outSent = true;
+    return true;
+}
+
 static bool EncodePlayerState(
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY],
     const NetworkPlayerState *state, uint32_t *outSize)
@@ -3994,7 +4321,7 @@ static bool EncodePlayerState(
     return *outSize != 0;
 }
 
-bool NetworkServerSendPlayerState(
+bool LaiueNetworkBackendServerSendPlayerState(
     NetworkServer *server, uint32_t peerId,
     const NetworkPlayerState *state)
 {
@@ -4006,14 +4333,23 @@ bool NetworkServerSendPlayerState(
     {
         return false;
     }
-    return ServerSendToPeer(
-        server, peer,
-        peer->ready ? LAIUE_MESSAGE_PLAYER_STATE
-                    : LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY,
-        payload, size, false);
+    if (!peer->ready)
+    {
+        return ServerSendToPeer(
+            server, peer,
+            LAIUE_MESSAGE_PLAYER_ROSTER_ENTRY,
+            payload, size, false);
+    }
+    bool datagramSent = false;
+    return ServerTrySendPlayerStateDatagram(
+               server, peer, payload, size, &datagramSent) &&
+           (datagramSent ||
+            ServerSendToPeer(
+                server, peer, LAIUE_MESSAGE_PLAYER_STATE,
+                payload, size, false));
 }
 
-bool NetworkServerBroadcastPlayerState(
+bool LaiueNetworkBackendServerBroadcastPlayerState(
     NetworkServer *server, const NetworkPlayerState *state)
 {
     if (server == NULL)
@@ -4033,11 +4369,17 @@ bool NetworkServerBroadcastPlayerState(
         NetworkServerPeer *peer = &server->peers[index];
         if (ServerPeerCanSync(server, peer) && peer->ready)
         {
-            succeeded =
-                ServerSendToPeer(
-                    server, peer, LAIUE_MESSAGE_PLAYER_STATE,
-                    payload, size, false) &&
-                succeeded;
+            bool datagramSent = false;
+            bool peerSucceeded =
+                ServerTrySendPlayerStateDatagram(
+                    server, peer, payload, size,
+                    &datagramSent) &&
+                (datagramSent ||
+                 ServerSendToPeer(
+                     server, peer,
+                     LAIUE_MESSAGE_PLAYER_STATE,
+                     payload, size, false));
+            succeeded = peerSucceeded && succeeded;
         }
     }
     return succeeded;
@@ -4077,7 +4419,7 @@ static bool EncodeBlockDelta(
     return *outSize != 0;
 }
 
-bool NetworkServerSendBlockDelta(
+bool LaiueNetworkBackendServerSendBlockDelta(
     NetworkServer *server, uint32_t peerId,
     const NetworkBlockDelta *delta)
 {
@@ -4090,7 +4432,7 @@ bool NetworkServerSendBlockDelta(
                payload, size, false);
 }
 
-bool NetworkServerBroadcastBlockDelta(
+bool LaiueNetworkBackendServerBroadcastBlockDelta(
     NetworkServer *server, const NetworkBlockDelta *delta)
 {
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
@@ -4116,7 +4458,7 @@ bool NetworkServerBroadcastBlockDelta(
     return succeeded;
 }
 
-bool NetworkServerCanBeginSnapshot(
+bool LaiueNetworkBackendServerCanBeginSnapshot(
     NetworkServer *server, uint32_t peerId,
     bool requiresReadyBarrier)
 {
@@ -4125,7 +4467,7 @@ bool NetworkServerCanBeginSnapshot(
         requiresReadyBarrier);
 }
 
-bool NetworkServerSendSnapshotBegin(
+bool LaiueNetworkBackendServerSendSnapshotBegin(
     NetworkServer *server, uint32_t peerId,
     const NetworkSnapshotInfo *snapshot)
 {
@@ -4189,7 +4531,7 @@ bool NetworkServerSendSnapshotBegin(
     return true;
 }
 
-bool NetworkServerSendSnapshotChunk(
+bool LaiueNetworkBackendServerSendSnapshotChunk(
     NetworkServer *server, uint32_t peerId,
     const NetworkChunkDelta *chunk)
 {
@@ -4304,7 +4646,7 @@ bool NetworkServerSendSnapshotChunk(
     return true;
 }
 
-bool NetworkServerSendSnapshotEnd(
+bool LaiueNetworkBackendServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision)
 {
@@ -4366,7 +4708,7 @@ bool NetworkServerSendSnapshotEnd(
     return true;
 }
 
-bool NetworkServerSendChunkResyncCancelled(
+bool LaiueNetworkBackendServerSendChunkResyncCancelled(
     NetworkServer *server, uint32_t peerId,
     const int64_t chunk[3], uint64_t expectedRevision)
 {
@@ -4444,7 +4786,7 @@ static bool ServerBroadcastPeerId(
     return succeeded;
 }
 
-bool NetworkServerSendPlayerJoined(
+bool LaiueNetworkBackendServerSendPlayerJoined(
     NetworkServer *server, uint32_t peerId,
     uint32_t joinedPeerId)
 {
@@ -4453,14 +4795,14 @@ bool NetworkServerSendPlayerJoined(
         LAIUE_MESSAGE_PLAYER_JOINED);
 }
 
-bool NetworkServerBroadcastPlayerJoined(
+bool LaiueNetworkBackendServerBroadcastPlayerJoined(
     NetworkServer *server, uint32_t joinedPeerId)
 {
     return ServerBroadcastPeerId(
         server, joinedPeerId, LAIUE_MESSAGE_PLAYER_JOINED);
 }
 
-bool NetworkServerSendPlayerLeft(
+bool LaiueNetworkBackendServerSendPlayerLeft(
     NetworkServer *server, uint32_t peerId,
     uint32_t leftPeerId)
 {
@@ -4469,14 +4811,14 @@ bool NetworkServerSendPlayerLeft(
         LAIUE_MESSAGE_PLAYER_LEFT);
 }
 
-bool NetworkServerBroadcastPlayerLeft(
+bool LaiueNetworkBackendServerBroadcastPlayerLeft(
     NetworkServer *server, uint32_t leftPeerId)
 {
     return ServerBroadcastPeerId(
         server, leftPeerId, LAIUE_MESSAGE_PLAYER_LEFT);
 }
 
-bool NetworkServerSendWorldTime(
+bool LaiueNetworkBackendServerSendWorldTime(
     NetworkServer *server, uint32_t peerId, uint64_t worldTime)
 {
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
@@ -4510,7 +4852,7 @@ static bool EncodeBlockDrop(
     return *outSize != 0;
 }
 
-bool NetworkServerSendBlockDrop(
+bool LaiueNetworkBackendServerSendBlockDrop(
     NetworkServer *server, uint32_t peerId,
     const NetworkBlockDrop *drop)
 {
@@ -4523,7 +4865,7 @@ bool NetworkServerSendBlockDrop(
                payload, size, false);
 }
 
-bool NetworkServerBroadcastBlockDrop(
+bool LaiueNetworkBackendServerBroadcastBlockDrop(
     NetworkServer *server, const NetworkBlockDrop *drop)
 {
     if (server == NULL)
@@ -4554,7 +4896,7 @@ bool NetworkServerBroadcastBlockDrop(
     return succeeded;
 }
 
-bool NetworkServerBroadcastDropRemove(
+bool LaiueNetworkBackendServerBroadcastDropRemove(
     NetworkServer *server, uint32_t dropId)
 {
     if (server == NULL)
@@ -4586,7 +4928,7 @@ bool NetworkServerBroadcastDropRemove(
     return succeeded;
 }
 
-bool NetworkServerSendInventory(
+bool LaiueNetworkBackendServerSendInventory(
     NetworkServer *server, uint32_t peerId,
     const NetworkInventoryState *inventory)
 {

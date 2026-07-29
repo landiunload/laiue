@@ -41,11 +41,18 @@ Linux client, renderer, window, input и audio в текущую итераци�
 | `LAIUE_MSQUIC_ROOT` | пусто | prefix с `include/`, `lib/`, runtime |
 | `LAIUE_MSQUIC_VERSION` | auto | подтверждённая версия при отсутствии metadata |
 
-CMake не скачивает MsQuic. Release/CI используют MsQuic 2.5.9 из системного
-пакета или проверенного `LAIUE_MSQUIC_ROOT` и включают
-`LAIUE_REQUIRE_MSQUIC=ON`. Другая обнаруженная версия отклоняется. Если
-package metadata недоступна, `LAIUE_MSQUIC_VERSION=2.5.9` задаётся только
-после внешней проверки package hash/commit.
+CMake не скачивает MsQuic. Release/CI используют проверенный
+`LAIUE_MSQUIC_ROOT` и включают `LAIUE_REQUIRE_MSQUIC=ON`. Другая
+обнаруженная версия отклоняется. Если package metadata недоступна,
+`LAIUE_MSQUIC_VERSION=2.5.9` задаётся только после внешней проверки package
+hash/commit.
+
+Linux release собирает закреплённый lean-профиль MsQuic: без XDP, logging,
+tools, tests и perf, с системной `libcrypto.so.3`. Prefix содержит точные
+upstream commits, SHA-256 runtime, licenses и параметры сборки в
+`BUILD-METADATA`; CMake и package smoke перепроверяют metadata и ELF.
+Обычный system prefix остаётся допустим для разработки, но не получает
+статус проверенного lean-артефакта.
 
 ## Presets
 
@@ -72,21 +79,29 @@ Developer shell. Для `windows-clang` нужны `clang-cl` и Ninja в `PATH`
 
 ## Debian 13
 
-Нужны CMake 3.28+, Ninja, GCC или Clang, pthread/dl и OpenSSL 3 development
-files. Официальный Debian-пакет `libmsquic=2.5.9` является runtime-only:
-в нём нет headers, pkg-config metadata и unversioned linker symlink.
-Поэтому release build передаёт `LAIUE_MSQUIC_ROOT`, собранный из:
+Нужны CMake 3.28+, Ninja, GCC или Clang, Git, binutils, Perl и OpenSSL 3
+development files. Официальный Microsoft runtime содержит ненужные серверу
+XDP/BPF/NUMA зависимости, поэтому release/CI собирают меньший профиль из
+закреплённых исходников. Получение исходников выполняется явно, вне CMake:
 
-- `libmsquic.so.2.5.9` официального Microsoft-пакета;
-- symlink chain `libmsquic.so -> libmsquic.so.2 -> libmsquic.so.2.5.9`;
-- headers, `LICENSE` и `THIRD-PARTY-NOTICES` из закреплённого upstream commit,
-  соответствующего 2.5.9;
-- файла `VERSION` со значением `2.5.9`.
+```sh
+git clone --filter=blob:none --no-checkout \
+  https://github.com/microsoft/msquic.git /tmp/msquic
+git -C /tmp/msquic fetch --depth 1 origin \
+  87b53085d76bd7920d490a6f226c9999b6614d14
+git -C /tmp/msquic checkout --detach \
+  87b53085d76bd7920d490a6f226c9999b6614d14
+git -C /tmp/msquic submodule update --init --depth 1 \
+  submodules/quictls
+LAIUE_MSQUIC_LIBC=gnu sh tools/build_lean_msquic.sh \
+  /tmp/msquic /tmp/msquic-build /tmp/msquic-install
+```
 
-Обычный CMake configure ничего из сети не загружает. Воспроизводимая
-bootstrap-последовательность находится в Debian job
-`.github/workflows/build.yml`; prefix затем передаётся через
-`LAIUE_MSQUIC_ROOT`.
+Build directory и prefix должны быть пустыми и находиться вне source tree.
+Скрипт запрещает сетевые загрузки во время configure, проверяет оба commit,
+чистоту checkout, ABI, SONAME, hardening, exports, размер и runtime
+dependencies. Результат передаётся проекту через
+`LAIUE_MSQUIC_ROOT=/tmp/msquic-install`.
 
 ```sh
 export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
@@ -108,8 +123,10 @@ GCC и Clang используют отдельные configure trees, но Debug
 
 ## Alpine/musl
 
-Используйте native Alpine builder либо musl toolchain, а также совместимую
-musl-сборку MsQuic/OpenSSL:
+Используйте native Alpine builder либо musl toolchain. Для release archive
+установите GNU `tar` и `gzip` (BusyBox gzip не поддерживает `-n`). Тот же
+`tools/build_lean_msquic.sh` запускается внутри Alpine с
+`LAIUE_MSQUIC_LIBC=musl`; один prefix нельзя переносить между glibc и musl:
 
 ```sh
 cmake --preset linux-musl \
@@ -156,12 +173,17 @@ RUNPATH/runtime dependencies и запускает IPv4, IPv6 и dual listeners 
 файлы — `0644`. Поэтому archive безопасен даже при build tree на drvfs или
 другой файловой системе без Unix permission metadata.
 
-glibc bundle содержит выбранную `libmsquic.so` symlink chain, но не копирует
-системные библиотеки Debian. На чистом Debian 13 до запуска установите
-runtime packages `libssl3t64`, `libnuma1`, `libxdp1` и
-`libnl-route-3-200`; apt подтянет их транзитивные зависимости. CI повторяет
-package smoke в чистом `debian:13-slim` без установленного `libmsquic`
-package, чтобы доказать использование runtime из bundle.
+glibc bundle содержит проверенную `libmsquic.so` symlink chain, но не
+копирует системную OpenSSL. На чистом Debian 13 нужен runtime package
+`libssl3t64`; XDP, BPF, NUMA и netlink packages lean-профилю не нужны. CI
+повторяет package smoke в чистом `debian:13-slim` без system `libmsquic`,
+чтобы доказать использование runtime из bundle и отсутствие скрытых
+зависимостей.
+
+`tools/check_lean_msquic.sh` можно запускать отдельно для аудита
+`libmsquic.so.2.5.9`; `tools/package_linux_server.sh` повторяет этот аудит
+перед созданием архива. Release archive создаётся GNU tar с
+детерминированными order/mode/mtime и соседним SHA-256.
 
 ## Переносимый код
 

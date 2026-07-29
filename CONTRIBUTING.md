@@ -20,7 +20,9 @@ pwsh -NoProfile -File tools/check_architecture.ps1
 git diff --check
 ```
 
-Минимальная server-only проверка на Debian/Ubuntu:
+Минимальная server-only проверка на Debian/Ubuntu после создания
+проверенного lean-prefix по
+[инструкции](docs/portability.md#debian-13):
 
 ```sh
 export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
@@ -47,7 +49,8 @@ Sanitizer-проверка существует только как `linux-gcc-a
 
 CI собирает Windows MSVC Debug/Release, Debian GCC/Clang и Alpine/musl,
 включает warnings-as-errors, запускает доступные CTest/smoke checks и
-проверяет, что сборка не изменила tracked-файлы.
+проверяет, что сборка не изменила tracked-файлы. Проверка source tree всегда
+получает явный repository root и не зависит от текущего каталога runner.
 
 ## Блокировка DLL при сборке
 
@@ -91,6 +94,15 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
 - MsQuic callbacks только копируют данные в bounded queues. Gameplay/world
   вызываются на main thread, send-buffer живёт до `SEND_COMPLETE`, а overflow
   закрывает только виновного peer.
+- Reliable control/input/snapshot и transient state — разные контракты.
+  QUIC DATAGRAM разрешён только для сообщений, которые можно безопасно
+  потерять, продублировать и переупорядочить. Временное состояние игрока
+  сравнивается wrap-safe по `serverTick` и имеет bounded reliable fallback;
+  edge-input нельзя переносить в DATAGRAM без отдельного repeat/ack протокола.
+- Публичный `Network*` ABI не зависит от конкретной QUIC-библиотеки.
+  Transport backend не декодирует protocol и не вызывает gameplay; новый
+  backend сначала подключается к общему bounded channel/session engine, а не
+  копирует client/server state machines.
 - Fixed tick не содержит allocation, I/O и покадрового logging.
 - Network physics исполняется только как 60 Гц canonical input и четыре
   целых substep; render `deltaSeconds` не попадает в authoritative simulation
@@ -148,6 +160,12 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
   prediction/reconciliation regression test.
 - Перед отправкой запускайте наиболее узкую релевантную проверку, затем
   platform build/CTest. Не маскируйте предупреждения глобальным отключением.
+- Workflow Actions закрепляются полным commit SHA, runner image — явным
+  поддерживаемым label. Обновления делает Dependabot и проверяет обычная
+  матрица; floating `@main`, `@vN` и `*-latest` в release workflow запрещены.
+- Загружаемый в CI dependency проверяется до распаковки: version/commit,
+  SHA-256 и обязательные license/notices. Ошибка должна печатать ожидаемое и
+  фактическое значение, чтобы drift отличался от сетевого сбоя.
 - `src/render/generated/*.h` — checked-in fallback. Обычная сборка генерирует
   shader headers только в binary tree; обновление fallback выполняется
   отдельной явной командой и проверяется diff.
@@ -184,6 +202,17 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
 - проверки лицензии, redistribution условий и обновления notices;
 - CI-сборки на каждой затронутой ABI/libc;
 - отсутствия сетевой загрузки во время обычного CMake configure.
+
+Linux release MsQuic собирается только через
+`tools/build_lean_msquic.sh`: exact source/quictls commits, системная
+OpenSSL 3, XDP/logging/tools/tests/perf выключены. Его
+`BUILD-METADATA` и ELF проверяются повторно при configure, install smoke и
+упаковке; менять профиль без проверки runtime dependencies, размера,
+hardening, license/notices и обеих libc нельзя.
+
+Linux release archive создаётся только GNU tar/gzip с отключёнными
+name/mtime в gzip header. CI дважды упаковывает один bundle и сравнивает
+SHA-256; изменение упаковщика обязано сохранить эту проверку.
 
 `CONTRIBUTING.md` — единственный канонический набор правил разработки.
 Editor/agent-specific файлы должны ссылаться сюда, а не копировать правила.

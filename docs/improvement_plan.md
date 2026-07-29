@@ -8,32 +8,26 @@
 
 | Проверка | Результат |
 |---|---|
-| `windows-msvc` Debug + Release | сборка OK, CTest 19/19 |
-| `windows-clang` Debug + Release | сборка OK, CTest 19/19 |
-| `windows-msvc-server` Debug + Release | сборка OK, CTest 17/17 |
-| `linux-gcc-release` на хосте без runtime-пакетов | линковка падает |
-| Debian GCC/Clang Debug + Release с runtime-пакетами | сборка OK, CTest 18/18 |
-| Debian GCC ASan/UBSan Debug | сборка OK, CTest 18/18 |
-| Alpine/musl GCC Debug + Release | сборка OK, CTest 18/18 |
+| `windows-msvc` Debug + Release | сборка OK, CTest 21/21 |
+| `windows-clang` Debug + Release | сборка OK, CTest 21/21 |
+| `windows-msvc-server` Debug + Release | сборка OK, CTest 19/19 |
+| Lean MsQuic glibc/musl | pinned source, ≤4 MiB, без XDP/BPF/NUMA dependencies |
+| Debian GCC/Clang Debug + Release | сборка OK, CTest 20/20 |
+| Debian GCC ASan/UBSan Debug | сборка OK, CTest 20/20 |
+| Alpine/musl GCC Debug + Release | сборка OK, CTest 20/20 |
 | glibc/musl release archive smoke | права, `$ORIGIN`, IPv4/IPv6/dual/custom port OK |
 | Клиент `laiue.exe` | стартует, закрывается штатно |
 | `laiue_server` без credentials | выход с кодом 5 и строкой `startup failed: configuration has no usable certificate or private key` |
 | Сервер moskva, IPv4 и IPv6 | QUIC + pin + полный initial sync подтверждены probe |
 
-Линковка падает на `libmsquic.so.2`: `xdp_program__open_file`,
-`rtnl_route_*`, `numa_*`. Это отсутствие документированных runtime-пакетов
-на хосте, а не ошибка кода — с ними собираются и `laiue_server`, и
-`laiue_quic_integration_test`.
+Release/CI больше не используют общий upstream runtime с XDP/BPF/NUMA.
+`tools/build_lean_msquic.sh` строит закреплённый профиль с системной OpenSSL
+3, а configure/package smoke перепроверяют его metadata, SHA-256, ELF
+hardening и допустимый список `NEEDED`.
 
 ## P0 — зелёные сборки и запуск
 
-1. **Linux prerequisites видны до линковки.** `docs/portability.md`
-   перечисляет `libssl3t64`, `libnuma1`, `libxdp1`, `libnl-route-3-200`, но
-   быстрый старт в `CONTRIBUTING.md` их не упоминает, и первая ошибка
-   приходит от `ld` через несколько минут сборки. Нужна проверка на
-   configure, которая сообщает точную строку `apt-get install`, и та же
-   строка в quickstart. Configure по-прежнему ничего не скачивает.
-2. **Сквозной тест на Windows.** `laiue.network.quic.integration`
+1. **Сквозной тест на Windows.** `laiue.network.quic.integration`
    регистрируется под `if(UNIX AND TARGET laiue_msquic)`, поэтому Windows
    идёт без единой проверки client/server поверх loopback — а это
    основная платформа клиента. Сделать сценарий переносимым (PEM или
@@ -100,12 +94,41 @@ Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
 - `server/main.c` (1352 строки): конфигурация и запуск, обработка сетевых
   событий, симуляция тика и интерес игроков;
 - `pause_menu.c`: состояние/команды и представление;
-- MsQuic backend: transport callbacks, bounded channel и client/server state
-  machines держать раздельными внутренними файлами.
+- Сетевой стек: вынести общий framing/send ownership в
+  `network_channel.*`, client/server negotiation/snapshot/READY — в session
+  files, а MsQuic callbacks/DNS/bind/handles оставить в
+  `network_transport_msquic.c`.
 
 Рефакторинг выполняется после профиля или перед существенным изменением
 подсистемы. Новая DLL оправдана только отдельным временем жизни, владельцем
 состояния или стабильной границей API.
+
+## P1 — экспериментальный OpenSSL QUIC backend
+
+Linux server на OpenSSL 3.5 QUIC реален и должен быть совместим с Windows
+MsQuic client через QUIC v1 и ALPN `laiue/5`, но прямой второй вариант
+текущего высокоуровневого backend продублирует session state machines.
+Последовательность:
+
+1. Завершить общий channel/session/transport split и fake-transport tests
+   для fragmentation/coalescing, delayed completion, overflow, extra
+   streams и shutdown generation race.
+2. Добавить compile-time `LAIUE_QUIC_BACKEND=msquic|openssl`; OpenSSL
+   разрешать только для Linux server-only и версии 3.5+.
+3. Проверить listener, полный 1-RTT, точный ALPN, один bidi control stream,
+   server uni snapshot/content streams, отсутствие tickets/resumption и
+   внешний handshake timeout.
+4. Прогнать Windows-client ↔ Debian-server для IPv4/IPv6, default/custom
+   port, system/pin, wrong pin, expired/SAN mismatch, wrong ALPN и plaintext.
+5. Сравнить MsQuic/OpenSSL под 0/1/5% loss: handshake p95, CPU, RSS,
+   player-state age/jitter и snapshot throughput.
+
+OpenSSL 3.5 не предоставляет RFC 9221 application DATAGRAM, поэтому
+`PLAYER_STATE` использует reliable fallback. Backend остаётся experimental,
+пока этот путь при loss не укладывается в interpolation budget. Выигрыш в
+размере существует только при политике системных `libssl.so.3` и
+`libcrypto.so.3`; bundling обеих библиотек может оказаться тяжелее lean
+MsQuic.
 
 ## P1 — производительность и размер
 
@@ -147,9 +170,10 @@ Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
 не проходили `WriteHeader`; вместо отправки вызывающий код рвал соединение как
 OVERFLOW. Сборка при этом была чистой, а обработчики приёма — недостижимы.
 
-Сейчас регистрируется 19 тестов на Windows и 18 на Linux: направления
+Сейчас регистрируется 21 тест на Windows и 20 на Linux: направления
 include-зависимостей, контракт аудио-API, кодек протокола и проверка
-сертификата, отображение команд игрока, конфигурация сервера, очередь
+сертификата, DATAGRAM queue/freshness/fallback, отображение команд игрока,
+конфигурация сервера, source-tree guard, очередь
 вводов и планировщик снапшотов, арифметика `InfiniteCoord`, снапшот мира,
 побитовый детерминизм физики, репликация игрока, форматы контента и
 правила имён паков и модов. Разница между платформами — сквозной
@@ -157,7 +181,6 @@ QUIC-сценарий, он существует только под UNIX.
 Незакрытое:
 
 - сквозной client/server сценарий на Windows (см. P0);
-- негативный прогон сервера без credentials (см. P0);
 - fuzzing декодера и ошибочный сетевой поток;
 - проверки формата сохранений при изменении раскладки;
 - покрытие мешера и сохранений.
@@ -168,9 +191,9 @@ QUIC-сценарий, он существует только под UNIX.
 ## Порядок работ
 
 Пункты P0 упорядочены так, чтобы каждый следующий опирался на уже
-проверяемый результат: сначала configure-диагностика чистого Linux-хоста,
-затем диагностируемый fail-closed запуск, переносимый Windows QUIC test и
-только после этого versioned operator tool для повторяемого деплоя.
+проверяемый результат: сначала переносимый Windows QUIC test, затем
+наблюдаемость/ротация и только после этого versioned operator tool для
+повторяемого деплоя.
 
 ## Почему сейчас не ECS
 

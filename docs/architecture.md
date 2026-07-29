@@ -32,6 +32,14 @@
 Сервер не зависит от `core`, `window`, `input`, `audio`, `render` или
 `mesher`.
 
+Публичный `Network*` ABI реализует `network_secure.c`; выбранный при
+configure transport доступен только через внутренний `network_backend.h`.
+Отсутствующий secure backend реализует тот же контракт fail-closed, поэтому
+ни клиент, ни сервер не обходят TLS через платформенный или loopback
+plaintext path. Следующий уровень разделения — общий channel/session engine
+и низкоуровневый transport contract; альтернативный QUIC backend не должен
+дублировать negotiation/snapshot/READY state machines.
+
 Нижние модули не включают заголовки `core`. Допустимый граф задан в
 `src/*/CMakeLists.txt` и проверяется `tools/check_architecture.ps1` при
 сборке. Владеющие состоянием объекты (`World`, `Renderer`, network handles)

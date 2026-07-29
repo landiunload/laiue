@@ -1,7 +1,11 @@
 set(laiue_network_sources
     endpoint.c
+    network_datagram.c
+    network_datagram.h
+    network_backend.h
     network_content.c
     network.h
+    network_secure.c
     protocol.c
     protocol.h
     ../api.h)
@@ -24,7 +28,6 @@ if(TARGET laiue::msquic)
     endif()
 else()
     list(APPEND laiue_network_sources
-        network_secure.c
         network_unavailable.c)
 endif()
 

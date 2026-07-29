@@ -2,35 +2,106 @@
 set -eu
 
 install_dir=${1:?usage: smoke_linux_server.sh INSTALL_DIRECTORY}
+install_dir=$(CDPATH= cd "${install_dir}" && pwd -P)
 server="${install_dir}/laiue_server"
+script_directory=$(CDPATH= cd "$(dirname "$0")" && pwd)
+msquic_version=2.5.9
 if [ ! -x "${server}" ]; then
     echo "missing installed server: ${server}" >&2
     exit 1
 fi
+for program in ldd openssl readelf readlink timeout; do
+    if ! command -v "${program}" >/dev/null 2>&1; then
+        echo "server smoke requires ${program}" >&2
+        exit 1
+    fi
+done
 
 if ! readelf -d "${server}" | grep -Fq '$ORIGIN'; then
     echo "laiue_server has no \$ORIGIN RUNPATH" >&2
     exit 1
 fi
-if ldd "${server}" | grep -q 'not found'; then
-    ldd "${server}" >&2
+set +e
+ldd_output=$(LD_LIBRARY_PATH= LD_PRELOAD= ldd "${server}")
+ldd_status=$?
+set -e
+if [ "${ldd_status}" -ne 0 ]; then
+    printf '%s\n' "${ldd_output}" >&2
+    echo "ldd failed for installed server (exit ${ldd_status})" >&2
     exit 1
 fi
-if ! find "${install_dir}" -maxdepth 1 -name 'libmsquic.so*' |
-    grep -q .
+if printf '%s\n' "${ldd_output}" | grep -q 'not found'; then
+    printf '%s\n' "${ldd_output}" >&2
+    exit 1
+fi
+if ! printf '%s\n' "${ldd_output}" |
+    grep -F "${install_dir}/libmsquic.so.2" >/dev/null
 then
-    echo "installed bundle has no libmsquic.so runtime" >&2
+    printf '%s\n' "${ldd_output}" >&2
+    echo "server did not resolve bundled libmsquic.so.2" >&2
+    exit 1
+fi
+msquic_runtime=$(find "${install_dir}" -maxdepth 1 -type f \
+    -name "libmsquic.so.${msquic_version}" -print | LC_ALL=C sort)
+if [ -z "${msquic_runtime}" ] ||
+   [ "$(printf '%s\n' "${msquic_runtime}" | wc -l)" -ne 1 ]
+then
+    echo "installed bundle must have one libmsquic.so.${msquic_version}" >&2
+    printf '%s\n' "${msquic_runtime}" >&2
+    exit 1
+fi
+if [ ! -L "${install_dir}/libmsquic.so" ] ||
+   [ "$(readlink "${install_dir}/libmsquic.so")" != libmsquic.so.2 ] ||
+   [ ! -L "${install_dir}/libmsquic.so.2" ] ||
+   [ "$(readlink "${install_dir}/libmsquic.so.2")" != \
+        "libmsquic.so.${msquic_version}" ]
+then
+    echo "installed bundle has an invalid libmsquic symlink chain" >&2
+    exit 1
+fi
+unexpected_symlinks=$(find "${install_dir}" -type l \
+    ! -path "${install_dir}/libmsquic.so" \
+    ! -path "${install_dir}/libmsquic.so.2" -print)
+if [ -n "${unexpected_symlinks}" ]; then
+    echo "installed bundle contains unexpected symlinks:" >&2
+    printf '%s\n' "${unexpected_symlinks}" >&2
     exit 1
 fi
 for notice in LICENSE \
     licenses/msquic/LICENSE \
     licenses/msquic/THIRD-PARTY-NOTICES
 do
-    if [ ! -s "${install_dir}/${notice}" ]; then
-        echo "installed bundle has no required notice: ${notice}" >&2
+    notice_path="${install_dir}/${notice}"
+    if [ ! -s "${notice_path}" ] || [ ! -f "${notice_path}" ] ||
+       [ -L "${notice_path}" ]
+    then
+        echo "installed bundle has no regular notice: ${notice}" >&2
         exit 1
     fi
 done
+metadata="${install_dir}/licenses/msquic/BUILD-METADATA"
+version_file="${install_dir}/licenses/msquic/VERSION"
+if [ -e "${metadata}" ]; then
+    for lean_notice in "${version_file}" \
+        "${install_dir}/licenses/msquic/QUIC-TLS-LICENSE"
+    do
+        if [ ! -s "${lean_notice}" ] || [ -L "${lean_notice}" ]; then
+            echo "lean MsQuic install is missing: ${lean_notice}" >&2
+            exit 1
+        fi
+    done
+    sh "${script_directory}/check_lean_msquic.sh" \
+        "${msquic_runtime}" "${metadata}"
+fi
+if [ -e "${version_file}" ]; then
+    if [ ! -f "${version_file}" ] || [ -L "${version_file}" ] ||
+       [ "$(tr -d '\r' <"${version_file}")" != "${msquic_version}" ]
+    then
+        echo "installed MsQuic VERSION is not a regular " \
+            "${msquic_version} file" >&2
+        exit 1
+    fi
+fi
 
 smoke_root=$(mktemp -d)
 trap 'rm -rf "${smoke_root}"' EXIT HUP INT TERM
@@ -60,6 +131,8 @@ run_listener()
         LAIUE_SERVER_PORT="${port}" \
         LAIUE_SERVER_CERTIFICATE_FILE="certs/server-cert.pem" \
         LAIUE_SERVER_PRIVATE_KEY_FILE="certs/server-key.pem" \
+        LD_LIBRARY_PATH= \
+        LD_PRELOAD= \
         timeout 3 ./laiue_server
     ) >"${log}" 2>&1
     status=$?
@@ -91,6 +164,8 @@ assert_startup_failure_is_explained()
         cd "${runtime}"
         LAIUE_SERVER_CERTIFICATE_FILE="certs/missing-cert.pem" \
         LAIUE_SERVER_PRIVATE_KEY_FILE="certs/missing-key.pem" \
+        LD_LIBRARY_PATH= \
+        LD_PRELOAD= \
         timeout 10 ./laiue_server
     ) >"${log}" 2>&1
     status=$?

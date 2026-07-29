@@ -1,4 +1,5 @@
 #include "network/network.h"
+#include "network/network_backend.h"
 
 #include <stddef.h>
 
@@ -6,29 +7,42 @@
 // point fails closed on every platform. The legacy plaintext implementation
 // is intentionally not selected by CMake.
 
-NetworkClient *NetworkClientCreateLoopback(uint16_t port)
+NetworkSecureTransportStatus LaiueNetworkBackendGetStatus(void)
+{
+    return NETWORK_SECURE_TRANSPORT_UNAVAILABLE;
+}
+
+NetworkClient *LaiueNetworkBackendClientCreate(
+    const NetworkClientConfiguration *configuration)
+{
+    (void)configuration;
+    return NULL;
+}
+
+NetworkClient *LaiueNetworkBackendClientCreateLoopback(uint16_t port)
 {
     (void)port;
     return NULL;
 }
 
-void NetworkClientDestroy(NetworkClient *client)
+void LaiueNetworkBackendClientDestroy(NetworkClient *client)
 {
     (void)client;
 }
 
-void NetworkClientUpdate(NetworkClient *client)
+void LaiueNetworkBackendClientUpdate(NetworkClient *client)
 {
     (void)client;
 }
 
-NetworkConnectionState NetworkClientGetState(const NetworkClient *client)
+NetworkConnectionState LaiueNetworkBackendClientGetState(
+    const NetworkClient *client)
 {
     (void)client;
     return NETWORK_CONNECTION_DISCONNECTED;
 }
 
-bool NetworkClientPollEvent(
+bool LaiueNetworkBackendClientPollEvent(
     NetworkClient *client, NetworkClientEvent *outEvent)
 {
     (void)client;
@@ -36,7 +50,7 @@ bool NetworkClientPollEvent(
     return false;
 }
 
-bool NetworkClientCopyServerMods(
+bool LaiueNetworkBackendClientCopyServerMods(
     const NetworkClient *client, NetworkModDescriptor *output,
     uint32_t capacity, uint32_t *outCount)
 {
@@ -50,7 +64,7 @@ bool NetworkClientCopyServerMods(
     return false;
 }
 
-bool NetworkClientSubmitMods(
+bool LaiueNetworkBackendClientSubmitMods(
     NetworkClient *client, const NetworkModDescriptor *mods, uint32_t count)
 {
     (void)client;
@@ -59,13 +73,13 @@ bool NetworkClientSubmitMods(
     return false;
 }
 
-bool NetworkClientRequestContent(NetworkClient *client)
+bool LaiueNetworkBackendClientRequestContent(NetworkClient *client)
 {
     (void)client;
     return false;
 }
 
-bool NetworkClientTakeContent(
+bool LaiueNetworkBackendClientTakeContent(
     NetworkClient *client, uint8_t **outBytes, uint64_t *outSize)
 {
     (void)client;
@@ -80,7 +94,7 @@ bool NetworkClientTakeContent(
     return false;
 }
 
-bool NetworkClientSendInput(
+bool LaiueNetworkBackendClientSendInput(
     NetworkClient *client, const NetworkInputCommand *input)
 {
     (void)client;
@@ -88,7 +102,7 @@ bool NetworkClientSendInput(
     return false;
 }
 
-bool NetworkClientSendEditIntent(
+bool LaiueNetworkBackendClientSendEditIntent(
     NetworkClient *client, bool breakBlock, bool placeBlock,
     uint8_t placementBlock, const float direction[3])
 {
@@ -100,7 +114,7 @@ bool NetworkClientSendEditIntent(
     return false;
 }
 
-bool NetworkClientSendSelectedHotbarSlot(
+bool LaiueNetworkBackendClientSendSelectedHotbarSlot(
     NetworkClient *client, uint8_t slot)
 {
     (void)client;
@@ -108,7 +122,7 @@ bool NetworkClientSendSelectedHotbarSlot(
     return false;
 }
 
-bool NetworkClientRequestChunkResync(
+bool LaiueNetworkBackendClientRequestChunkResync(
     NetworkClient *client, const int64_t chunk[3],
     uint64_t expectedRevision)
 {
@@ -118,30 +132,37 @@ bool NetworkClientRequestChunkResync(
     return false;
 }
 
-bool NetworkClientAcknowledgeReady(NetworkClient *client)
+bool LaiueNetworkBackendClientAcknowledgeReady(NetworkClient *client)
 {
     (void)client;
     return false;
 }
 
-NetworkServer *NetworkServerCreateLoopback(
+NetworkServer *LaiueNetworkBackendServerCreate(
     const NetworkServerConfiguration *configuration)
 {
     (void)configuration;
     return NULL;
 }
 
-void NetworkServerDestroy(NetworkServer *server)
+NetworkServer *LaiueNetworkBackendServerCreateLoopback(
+    const NetworkServerConfiguration *configuration)
+{
+    (void)configuration;
+    return NULL;
+}
+
+void LaiueNetworkBackendServerDestroy(NetworkServer *server)
 {
     (void)server;
 }
 
-void NetworkServerUpdate(NetworkServer *server)
+void LaiueNetworkBackendServerUpdate(NetworkServer *server)
 {
     (void)server;
 }
 
-bool NetworkServerPollEvent(
+bool LaiueNetworkBackendServerPollEvent(
     NetworkServer *server, NetworkServerEvent *outEvent)
 {
     (void)server;
@@ -149,7 +170,7 @@ bool NetworkServerPollEvent(
     return false;
 }
 
-bool NetworkServerDisconnect(
+bool LaiueNetworkBackendServerDisconnect(
     NetworkServer *server, uint32_t peerId,
     NetworkDisconnectReason reason)
 {
@@ -159,7 +180,7 @@ bool NetworkServerDisconnect(
     return false;
 }
 
-bool NetworkServerBroadcastPlayerState(
+bool LaiueNetworkBackendServerBroadcastPlayerState(
     NetworkServer *server, const NetworkPlayerState *state)
 {
     (void)server;
@@ -167,7 +188,7 @@ bool NetworkServerBroadcastPlayerState(
     return false;
 }
 
-bool NetworkServerSendPlayerState(
+bool LaiueNetworkBackendServerSendPlayerState(
     NetworkServer *server, uint32_t peerId,
     const NetworkPlayerState *state)
 {
@@ -177,7 +198,7 @@ bool NetworkServerSendPlayerState(
     return false;
 }
 
-bool NetworkServerSendBlockDelta(
+bool LaiueNetworkBackendServerSendBlockDelta(
     NetworkServer *server, uint32_t peerId,
     const NetworkBlockDelta *delta)
 {
@@ -187,7 +208,7 @@ bool NetworkServerSendBlockDelta(
     return false;
 }
 
-bool NetworkServerBroadcastBlockDelta(
+bool LaiueNetworkBackendServerBroadcastBlockDelta(
     NetworkServer *server, const NetworkBlockDelta *delta)
 {
     (void)server;
@@ -195,7 +216,7 @@ bool NetworkServerBroadcastBlockDelta(
     return false;
 }
 
-bool NetworkServerCanBeginSnapshot(
+bool LaiueNetworkBackendServerCanBeginSnapshot(
     NetworkServer *server, uint32_t peerId,
     bool requiresReadyBarrier)
 {
@@ -205,7 +226,7 @@ bool NetworkServerCanBeginSnapshot(
     return false;
 }
 
-bool NetworkServerSendSnapshotBegin(
+bool LaiueNetworkBackendServerSendSnapshotBegin(
     NetworkServer *server, uint32_t peerId,
     const NetworkSnapshotInfo *snapshot)
 {
@@ -215,7 +236,7 @@ bool NetworkServerSendSnapshotBegin(
     return false;
 }
 
-bool NetworkServerSendSnapshotChunk(
+bool LaiueNetworkBackendServerSendSnapshotChunk(
     NetworkServer *server, uint32_t peerId,
     const NetworkChunkDelta *chunk)
 {
@@ -225,7 +246,7 @@ bool NetworkServerSendSnapshotChunk(
     return false;
 }
 
-bool NetworkServerSendSnapshotEnd(
+bool LaiueNetworkBackendServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision)
 {
@@ -236,7 +257,7 @@ bool NetworkServerSendSnapshotEnd(
     return false;
 }
 
-bool NetworkServerSendChunkResyncCancelled(
+bool LaiueNetworkBackendServerSendChunkResyncCancelled(
     NetworkServer *server, uint32_t peerId,
     const int64_t chunk[3], uint64_t expectedRevision)
 {
@@ -247,7 +268,7 @@ bool NetworkServerSendChunkResyncCancelled(
     return false;
 }
 
-bool NetworkServerSendPlayerJoined(
+bool LaiueNetworkBackendServerSendPlayerJoined(
     NetworkServer *server, uint32_t peerId,
     uint32_t joinedPeerId)
 {
@@ -257,7 +278,7 @@ bool NetworkServerSendPlayerJoined(
     return false;
 }
 
-bool NetworkServerBroadcastPlayerJoined(
+bool LaiueNetworkBackendServerBroadcastPlayerJoined(
     NetworkServer *server, uint32_t joinedPeerId)
 {
     (void)server;
@@ -265,7 +286,7 @@ bool NetworkServerBroadcastPlayerJoined(
     return false;
 }
 
-bool NetworkServerSendPlayerLeft(
+bool LaiueNetworkBackendServerSendPlayerLeft(
     NetworkServer *server, uint32_t peerId,
     uint32_t leftPeerId)
 {
@@ -275,7 +296,7 @@ bool NetworkServerSendPlayerLeft(
     return false;
 }
 
-bool NetworkServerBroadcastPlayerLeft(
+bool LaiueNetworkBackendServerBroadcastPlayerLeft(
     NetworkServer *server, uint32_t leftPeerId)
 {
     (void)server;
@@ -283,7 +304,7 @@ bool NetworkServerBroadcastPlayerLeft(
     return false;
 }
 
-bool NetworkServerSendWorldTime(
+bool LaiueNetworkBackendServerSendWorldTime(
     NetworkServer *server, uint32_t peerId,
     uint64_t worldTime)
 {
@@ -293,7 +314,7 @@ bool NetworkServerSendWorldTime(
     return false;
 }
 
-bool NetworkServerBroadcastBlockDrop(
+bool LaiueNetworkBackendServerBroadcastBlockDrop(
     NetworkServer *server, const NetworkBlockDrop *drop)
 {
     (void)server;
@@ -301,7 +322,7 @@ bool NetworkServerBroadcastBlockDrop(
     return false;
 }
 
-bool NetworkServerSendBlockDrop(
+bool LaiueNetworkBackendServerSendBlockDrop(
     NetworkServer *server, uint32_t peerId,
     const NetworkBlockDrop *drop)
 {
@@ -311,7 +332,7 @@ bool NetworkServerSendBlockDrop(
     return false;
 }
 
-bool NetworkServerBroadcastDropRemove(
+bool LaiueNetworkBackendServerBroadcastDropRemove(
     NetworkServer *server, uint32_t dropId)
 {
     (void)server;
@@ -319,7 +340,7 @@ bool NetworkServerBroadcastDropRemove(
     return false;
 }
 
-bool NetworkServerSendInventory(
+bool LaiueNetworkBackendServerSendInventory(
     NetworkServer *server, uint32_t peerId,
     const NetworkInventoryState *inventory)
 {

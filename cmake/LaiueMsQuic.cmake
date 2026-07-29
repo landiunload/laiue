@@ -4,6 +4,11 @@ option(LAIUE_ENABLE_MSQUIC "Собирать secure remote transport через 
 option(LAIUE_REQUIRE_MSQUIC
     "Завершать configure ошибкой, если MsQuic не найден" OFF)
 set(LAIUE_MSQUIC_REQUIRED_VERSION "2.5.9")
+set(LAIUE_MSQUIC_REQUIRED_COMMIT
+    "87b53085d76bd7920d490a6f226c9999b6614d14")
+set(LAIUE_MSQUIC_REQUIRED_QUICTLS_COMMIT
+    "ff36838bb69801cad56823159a036977bcbe5c75")
+set(LAIUE_MSQUIC_IS_LEAN_PREFIX FALSE)
 set(_laiue_msquic_root_default "")
 if(DEFINED ENV{LAIUE_MSQUIC_ROOT}
    AND NOT "$ENV{LAIUE_MSQUIC_ROOT}" STREQUAL "")
@@ -31,6 +36,20 @@ endif()
 set(_laiue_msquic_include_hints)
 set(_laiue_msquic_library_hints)
 set(_laiue_msquic_runtime_hints)
+# Detection results belong to the current prefix as a unit. Re-run every
+# lookup when LAIUE_MSQUIC_ROOT changes so a cached path cannot mix two
+# installations or survive an explicit switch back to system packages.
+foreach(cache_entry IN ITEMS
+        LAIUE_MSQUIC_INCLUDE_DIR
+        LAIUE_MSQUIC_LIBRARY
+        LAIUE_MSQUIC_RUNTIME
+        LAIUE_MSQUIC_LICENSE
+        LAIUE_MSQUIC_NOTICE
+        LAIUE_MSQUIC_TLS_LICENSE
+        LAIUE_MSQUIC_VERSION_FILE
+        LAIUE_MSQUIC_BUILD_METADATA)
+    unset(${cache_entry} CACHE)
+endforeach()
 if(LAIUE_MSQUIC_ROOT)
     list(APPEND _laiue_msquic_include_hints
         "${LAIUE_MSQUIC_ROOT}/include"
@@ -48,14 +67,6 @@ if(LAIUE_MSQUIC_ROOT)
 
     # Явный prefix является единицей доверия: нельзя незаметно смешать
     # header/import library из него с DLL или notices из PATH другой версии.
-    foreach(cache_entry IN ITEMS
-            LAIUE_MSQUIC_INCLUDE_DIR
-            LAIUE_MSQUIC_LIBRARY
-            LAIUE_MSQUIC_RUNTIME
-            LAIUE_MSQUIC_LICENSE
-            LAIUE_MSQUIC_NOTICE)
-        unset(${cache_entry} CACHE)
-    endforeach()
     find_path(LAIUE_MSQUIC_INCLUDE_DIR
         NAMES msquic.h
         PATHS ${_laiue_msquic_include_hints}
@@ -76,6 +87,18 @@ if(LAIUE_MSQUIC_ROOT)
             "${LAIUE_MSQUIC_ROOT}"
             "${LAIUE_MSQUIC_ROOT}/share/doc/libmsquic"
         NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_TLS_LICENSE
+        NAMES QUIC-TLS-LICENSE
+        PATHS "${LAIUE_MSQUIC_ROOT}"
+        NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_VERSION_FILE
+        NAMES VERSION
+        PATHS "${LAIUE_MSQUIC_ROOT}"
+        NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_BUILD_METADATA
+        NAMES BUILD-METADATA
+        PATHS "${LAIUE_MSQUIC_ROOT}"
+        NO_DEFAULT_PATH)
     if(WIN32)
         find_file(LAIUE_MSQUIC_RUNTIME
             NAMES msquic.dll
@@ -95,6 +118,18 @@ else()
         PATHS
             "/usr/share/doc/libmsquic"
         NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_TLS_LICENSE
+        NAMES QUIC-TLS-LICENSE
+        PATHS "/usr/share/doc/libmsquic"
+        NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_VERSION_FILE
+        NAMES VERSION
+        PATHS "/usr/share/doc/libmsquic"
+        NO_DEFAULT_PATH)
+    find_file(LAIUE_MSQUIC_BUILD_METADATA
+        NAMES BUILD-METADATA
+        PATHS "/usr/share/doc/libmsquic"
+        NO_DEFAULT_PATH)
     if(WIN32)
         # Для system install разрешён обычный поиск, но все release jobs
         # используют строгий проверенный LAIUE_MSQUIC_ROOT.
@@ -107,7 +142,61 @@ mark_as_advanced(
     LAIUE_MSQUIC_LIBRARY
     LAIUE_MSQUIC_RUNTIME
     LAIUE_MSQUIC_LICENSE
-    LAIUE_MSQUIC_NOTICE)
+    LAIUE_MSQUIC_NOTICE
+    LAIUE_MSQUIC_TLS_LICENSE
+    LAIUE_MSQUIC_VERSION_FILE
+    LAIUE_MSQUIC_BUILD_METADATA)
+
+function(_laiue_msquic_metadata_value metadata_file metadata_key
+         output_variable)
+    file(STRINGS "${metadata_file}" _laiue_metadata_matches
+        REGEX "^${metadata_key}=")
+    list(LENGTH _laiue_metadata_matches _laiue_metadata_count)
+    if(NOT _laiue_metadata_count EQUAL 1)
+        message(FATAL_ERROR
+            "MsQuic BUILD-METADATA требует ровно одно поле "
+            "${metadata_key}=...")
+    endif()
+    list(GET _laiue_metadata_matches 0 _laiue_metadata_line)
+    string(REGEX REPLACE "^[^=]*=" "" _laiue_metadata_value
+        "${_laiue_metadata_line}")
+    if(_laiue_metadata_value STREQUAL "")
+        message(FATAL_ERROR
+            "Пустое поле ${metadata_key} в MsQuic BUILD-METADATA")
+    endif()
+    set(${output_variable} "${_laiue_metadata_value}" PARENT_SCOPE)
+endfunction()
+
+function(_laiue_msquic_require_metadata metadata_file metadata_key
+         expected_value)
+    _laiue_msquic_metadata_value(
+        "${metadata_file}" "${metadata_key}" _laiue_metadata_actual)
+    if(NOT _laiue_metadata_actual STREQUAL "${expected_value}")
+        message(FATAL_ERROR
+            "MsQuic BUILD-METADATA: ${metadata_key}="
+            "${_laiue_metadata_actual}, требуется ${expected_value}")
+    endif()
+endfunction()
+
+function(_laiue_msquic_require_metadata_sha256 metadata_file
+         metadata_key provenance_file)
+    _laiue_msquic_metadata_value(
+        "${metadata_file}" "${metadata_key}" _laiue_expected_sha256)
+    string(LENGTH "${_laiue_expected_sha256}" _laiue_sha256_length)
+    if(NOT _laiue_sha256_length EQUAL 64 OR
+       NOT _laiue_expected_sha256 MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "Некорректное поле ${metadata_key} в MsQuic "
+            "BUILD-METADATA")
+    endif()
+    file(SHA256 "${provenance_file}" _laiue_actual_sha256)
+    if(NOT "${_laiue_actual_sha256}" STREQUAL
+           "${_laiue_expected_sha256}")
+        message(FATAL_ERROR
+            "${provenance_file} не совпадает с MsQuic "
+            "BUILD-METADATA")
+    endif()
+endfunction()
 
 set(_laiue_msquic_complete FALSE)
 if(LAIUE_MSQUIC_INCLUDE_DIR AND LAIUE_MSQUIC_LIBRARY)
@@ -126,8 +215,8 @@ if(_laiue_msquic_complete)
     endif()
     set(_laiue_msquic_detected_version "")
     if(LAIUE_MSQUIC_ROOT)
-        if(EXISTS "${LAIUE_MSQUIC_ROOT}/VERSION")
-            file(READ "${LAIUE_MSQUIC_ROOT}/VERSION"
+        if(LAIUE_MSQUIC_VERSION_FILE)
+            file(READ "${LAIUE_MSQUIC_VERSION_FILE}"
                 _laiue_msquic_version_text LIMIT 256)
             string(REGEX MATCH
                 "([0-9]+\\.[0-9]+\\.[0-9]+)"
@@ -210,6 +299,100 @@ if(_laiue_msquic_complete)
         message(FATAL_ERROR
             "Release bundle требует LICENSE и THIRD-PARTY-NOTICES "
             "из того же проверенного MsQuic prefix")
+    endif()
+    if(UNIX AND LAIUE_MSQUIC_BUILD_METADATA)
+        file(SIZE "${LAIUE_MSQUIC_BUILD_METADATA}"
+            _laiue_msquic_metadata_size)
+        if(_laiue_msquic_metadata_size GREATER 32768)
+            message(FATAL_ERROR
+                "MsQuic BUILD-METADATA превышает 32 KiB")
+        endif()
+        file(STRINGS "${LAIUE_MSQUIC_BUILD_METADATA}"
+            _laiue_msquic_lean_markers
+            REGEX "^(format=laiue-msquic-build-metadata-v1|profile=laiue-lean)$")
+        if(_laiue_msquic_lean_markers)
+            if(NOT LAIUE_MSQUIC_VERSION_FILE OR
+               NOT LAIUE_MSQUIC_TLS_LICENSE OR
+               NOT LAIUE_MSQUIC_LICENSE OR
+               NOT LAIUE_MSQUIC_NOTICE)
+                message(FATAL_ERROR
+                    "Lean MsQuic prefix требует VERSION, LICENSE, "
+                    "THIRD-PARTY-NOTICES и QUIC-TLS-LICENSE")
+            endif()
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" format
+                laiue-msquic-build-metadata-v1)
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" profile laiue-lean)
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" version
+                "${LAIUE_MSQUIC_REQUIRED_VERSION}")
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" source_commit
+                "${LAIUE_MSQUIC_REQUIRED_COMMIT}")
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" quictls_commit
+                "${LAIUE_MSQUIC_REQUIRED_QUICTLS_COMMIT}")
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" architecture x86_64)
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" libc
+                "${LAIUE_LINUX_LIBC}")
+            foreach(_laiue_msquic_disabled_feature IN ITEMS
+                    xdp logging tools tests perf embedded_git_hash)
+                _laiue_msquic_require_metadata(
+                    "${LAIUE_MSQUIC_BUILD_METADATA}"
+                    "${_laiue_msquic_disabled_feature}" OFF)
+            endforeach()
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" tls quictls)
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}"
+                system_libcrypto ON)
+            _laiue_msquic_require_metadata(
+                "${LAIUE_MSQUIC_BUILD_METADATA}"
+                strip strip-unneeded)
+            _laiue_msquic_metadata_value(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" runtime_sha256
+                _laiue_msquic_expected_sha256)
+            string(LENGTH "${_laiue_msquic_expected_sha256}"
+                _laiue_msquic_sha256_length)
+            if(NOT _laiue_msquic_sha256_length EQUAL 64 OR
+               NOT _laiue_msquic_expected_sha256 MATCHES
+                   "^[0-9a-f]+$")
+                message(FATAL_ERROR
+                    "Некорректный runtime_sha256 в MsQuic "
+                    "BUILD-METADATA")
+            endif()
+            file(SHA256 "${LAIUE_MSQUIC_LIBRARY}"
+                _laiue_msquic_actual_sha256)
+            if(NOT "${_laiue_msquic_actual_sha256}" STREQUAL
+                   "${_laiue_msquic_expected_sha256}")
+                message(FATAL_ERROR
+                    "Выбранный libmsquic не совпадает с "
+                    "BUILD-METADATA SHA-256")
+            endif()
+            _laiue_msquic_require_metadata_sha256(
+                "${LAIUE_MSQUIC_BUILD_METADATA}" license_sha256
+                "${LAIUE_MSQUIC_LICENSE}")
+            _laiue_msquic_require_metadata_sha256(
+                "${LAIUE_MSQUIC_BUILD_METADATA}"
+                third_party_notices_sha256
+                "${LAIUE_MSQUIC_NOTICE}")
+            _laiue_msquic_require_metadata_sha256(
+                "${LAIUE_MSQUIC_BUILD_METADATA}"
+                quictls_license_sha256
+                "${LAIUE_MSQUIC_TLS_LICENSE}")
+            set(LAIUE_MSQUIC_IS_LEAN_PREFIX TRUE)
+            message(STATUS
+                "MsQuic prefix: проверенный laiue-lean "
+                "(${LAIUE_LINUX_LIBC})")
+        else()
+            message(STATUS
+                "MsQuic BUILD-METADATA имеет сторонний формат и не "
+                "включается в laiue bundle")
+            set(LAIUE_MSQUIC_BUILD_METADATA "")
+        endif()
     endif()
     set(LAIUE_MSQUIC_DETECTED_VERSION
         "${_laiue_msquic_detected_version}" CACHE INTERNAL

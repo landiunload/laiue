@@ -4,35 +4,60 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   windows-build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         configure_preset:
           [windows-msvc, windows-clang, windows-msvc-server]
     steps:
-      - uses: actions/checkout@v5
-      - name: Activate x64 MSVC environment
-        if: matrix.configure_preset == 'windows-clang'
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - name: Activate latest x64 C++ environment
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
             'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsRoot = & $vswhere -products * -version '[17.0,18.0)' `
+          if (!(Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe was not found at $vswhere"
+          }
+          $vsRoot = & $vswhere -latest -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
           if (!$vsRoot) {
-            throw 'Visual Studio 2022 C++ tools were not found'
+            Write-Host 'Installed Visual Studio instances:'
+            & $vswhere -products *
+            throw 'No Visual Studio installation with x64 C++ tools was found'
           }
+          $vsRoot = @($vsRoot)[0].Trim()
           $env:PATH = "$(Split-Path $vswhere);$env:PATH"
           $devShell = Join-Path $vsRoot `
             'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (!(Test-Path -LiteralPath $devShell -PathType Leaf)) {
+            throw "Visual Studio developer shell was not found at $devShell"
+          }
           Import-Module $devShell
           Enter-VsDevShell -VsInstallPath $vsRoot `
             -SkipAutomaticLocation `
             -DevCmdArguments '-arch=x64 -host_arch=x64'
+          $preset = '${{ matrix.configure_preset }}'
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          $clangCl = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+          if (!$cl) {
+            throw 'The activated environment does not provide cl.exe'
+          }
+          if ($preset -eq 'windows-clang' -and !$clangCl) {
+            throw 'The activated environment does not provide clang-cl.exe'
+          }
+          Write-Host "Visual Studio: $vsRoot"
+          Write-Host "MSVC compiler: $($cl.Source)"
+          if ($clangCl) {
+            Write-Host "Clang compiler: $($clangCl.Source)"
+          }
           foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'PATH') {
             $value = [Environment]::GetEnvironmentVariable($name)
             "$name=$value" | Out-File $env:GITHUB_ENV -Append
@@ -44,19 +69,55 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'msquic'
           Invoke-WebRequest `
             -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Native.Quic.MsQuic.Schannel/2.5.9' `
-            -OutFile $archive
+            -OutFile $archive `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 2
           $expected = '9877A919E1AA73AA4800F1E8A06B6539021F376228910138EB04540CD956617B'
-          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
-            throw 'MsQuic NuGet SHA-256 mismatch'
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($actual -ne $expected) {
+            throw "MsQuic NuGet SHA-256 mismatch: expected $expected, got $actual"
           }
           Expand-Archive -Path $archive -DestinationPath $root -Force
+          $manifest = Join-Path $root `
+            'Microsoft.Native.Quic.MsQuic.Schannel.nuspec'
+          $license = Join-Path $root 'LICENSE'
+          foreach ($metadata in @($manifest, $license)) {
+            if (!(Test-Path -LiteralPath $metadata -PathType Leaf) -or
+                (Get-Item -LiteralPath $metadata).Length -eq 0) {
+              throw "MsQuic package metadata is missing or empty: $metadata"
+            }
+          }
+          [xml]$manifestXml = Get-Content -LiteralPath $manifest -Raw
+          $expectedPackageCommit = `
+            'a78f32adba4227d92b8bb2c4cd8d055183131c7d'
+          $packageCommit = $manifestXml.package.metadata.repository.commit
+          if ($packageCommit -ne $expectedPackageCommit) {
+            throw "MsQuic package commit mismatch: expected $expectedPackageCommit, got $packageCommit"
+          }
+          $licenseHash = `
+            '903DF5512F7D02609FED0C780A9B704F5A3EEB6E4D84EBE42A29845C81899A3C'
+          $actualLicenseHash = `
+            (Get-FileHash $license -Algorithm SHA256).Hash
+          if ($actualLicenseHash -ne $licenseHash) {
+            throw "MsQuic LICENSE SHA-256 mismatch: expected $licenseHash, got $actualLicenseHash"
+          }
           $notice = Join-Path $root 'THIRD-PARTY-NOTICES'
+          # The NuGet archive omits notices; use the public v2.5.9 source pin.
+          $sourceCommit = '87b53085d76bd7920d490a6f226c9999b6614d14'
           Invoke-WebRequest `
-            -Uri 'https://raw.githubusercontent.com/microsoft/msquic/87b53085d76bd7920d490a6f226c9999b6614d14/THIRD-PARTY-NOTICES' `
-            -OutFile $notice
-          $noticeHash = 'C823706397513B6EAB16AF7BD5CA30F8E98272712C71688AC246D7AEC00FA5BB'
-          if ((Get-FileHash $notice -Algorithm SHA256).Hash -ne $noticeHash) {
-            throw 'MsQuic third-party notices SHA-256 mismatch'
+            -Uri "https://raw.githubusercontent.com/microsoft/msquic/$sourceCommit/THIRD-PARTY-NOTICES" `
+            -OutFile $notice `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 2
+          if (!(Test-Path -LiteralPath $notice -PathType Leaf) -or
+              (Get-Item -LiteralPath $notice).Length -eq 0) {
+            throw "MsQuic notices are missing or empty: $notice"
+          }
+          $noticeHash = 'FD4D104F2A12ADF1B69B7F4DEAD5E27927FBB098D21731B5B0DC5AC40BD60AF2'
+          $actualNoticeHash = `
+            (Get-FileHash $notice -Algorithm SHA256).Hash
+          if ($actualNoticeHash -ne $noticeHash) {
+            throw "MsQuic notices SHA-256 mismatch: expected $noticeHash, got $actualNoticeHash"
           }
           "LAIUE_MSQUIC_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Configure
@@ -72,6 +133,7 @@ jobs:
       - name: Test Debug
         run: >
           ctest --preset ${{ matrix.configure_preset }}-debug
+          --output-on-failure
           --no-tests=error
       - name: Verify checked-in shader fallbacks (Debug)
         if: matrix.configure_preset != 'windows-msvc-server'
@@ -86,6 +148,7 @@ jobs:
       - name: Test Release
         run: >
           ctest --preset ${{ matrix.configure_preset }}-release
+          --output-on-failure
           --no-tests=error
       - name: Verify checked-in shader fallbacks (Release)
         if: matrix.configure_preset != 'windows-msvc-server'
@@ -93,14 +156,6 @@ jobs:
           cmake --build
           --preset ${{ matrix.configure_preset }}-release
           --target laiue_verify_shaders
-      - name: Verify generated sources
-        shell: pwsh
-        run: |
-          git diff --check
-          if (git status --porcelain) {
-            git status --short
-            throw 'Build changed tracked sources'
-          }
       - name: Stage release components
         if: matrix.configure_preset == 'windows-msvc'
         shell: pwsh
@@ -113,30 +168,35 @@ jobs:
             -DestinationPath "$env:RUNNER_TEMP/laiue-windows-client-x64.zip" -Force
           Compress-Archive -Path "$server/*" `
             -DestinationPath "$env:RUNNER_TEMP/laiue-windows-server-x64.zip" -Force
+      - name: Verify source tree remains unchanged
+        shell: pwsh
+        run: |
+          cmake "-DSOURCE_ROOT=$env:GITHUB_WORKSPACE" `
+            -P tools/verify_source_tree.cmake
       - name: Upload Windows client
         if: matrix.configure_preset == 'windows-msvc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: laiue-windows-client-x64
           path: ${{ runner.temp }}/laiue-windows-client-x64.zip
           if-no-files-found: error
       - name: Upload Windows server
         if: matrix.configure_preset == 'windows-msvc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: laiue-windows-server-x64
           path: ${{ runner.temp }}/laiue-windows-server-x64.zip
           if-no-files-found: error
       - name: Upload Windows mod stage
         if: matrix.configure_preset == 'windows-msvc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-stage-windows
           path: build/windows-msvc/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload Windows ModSDK verifier
         if: matrix.configure_preset == 'windows-msvc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-verifier-windows
           path: |
@@ -146,7 +206,7 @@ jobs:
           if-no-files-found: error
 
   debian-server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: debian:13-slim
     strategy:
       fail-fast: false
@@ -157,35 +217,22 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            ca-certificates clang cmake curl g++ gcc git gnupg \
-            libssl-dev ninja-build openssl
-          curl --fail --location --silent --show-error \
-            --output /tmp/packages-microsoft-prod.deb \
-            https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb
-          dpkg -i /tmp/packages-microsoft-prod.deb
-          apt-get update
-          apt-get install -y libmsquic=2.5.9
-          test "$(dpkg-query -W -f='${Version}' libmsquic)" = 2.5.9
+            ca-certificates clang cmake g++ gcc git gzip libssl-dev \
+            make ninja-build openssl perl
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - name: Build lean pinned MsQuic 2.5.9
+        run: |
           git clone --filter=blob:none --no-checkout \
-            https://github.com/microsoft/msquic.git /tmp/msquic-source
-          git -C /tmp/msquic-source fetch --depth 1 origin \
+            https://github.com/microsoft/msquic.git /tmp/msquic
+          git -C /tmp/msquic fetch --depth 1 origin \
             87b53085d76bd7920d490a6f226c9999b6614d14
-          git -C /tmp/msquic-source checkout --detach \
+          git -C /tmp/msquic checkout --detach \
             87b53085d76bd7920d490a6f226c9999b6614d14
-          root=/tmp/msquic-install
-          mkdir -p "$root/include" "$root/lib"
-          cp /tmp/msquic-source/src/inc/msquic*.h \
-            /tmp/msquic-source/src/inc/quic_sal_stub.h \
-            "$root/include/"
-          cp /usr/lib/x86_64-linux-gnu/libmsquic.so.2.5.9 "$root/lib/"
-          ln -s libmsquic.so.2.5.9 "$root/lib/libmsquic.so.2"
-          ln -s libmsquic.so.2 "$root/lib/libmsquic.so"
-          cp /tmp/msquic-source/LICENSE "$root/LICENSE"
-          cp /tmp/msquic-source/THIRD-PARTY-NOTICES \
-            "$root/THIRD-PARTY-NOTICES"
-          echo 2.5.9 > "$root/VERSION"
-          echo "LAIUE_MSQUIC_ROOT=$root" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v5
+          git -C /tmp/msquic submodule update --init --depth 1 \
+            submodules/quictls
+          LAIUE_MSQUIC_LIBC=gnu sh tools/build_lean_msquic.sh \
+            /tmp/msquic /tmp/msquic-build /tmp/msquic-install
+          echo "LAIUE_MSQUIC_ROOT=/tmp/msquic-install" >> "$GITHUB_ENV"
       - name: Configure
         run: cmake --preset ${{ matrix.configure_preset }}
       - name: Build Debug
@@ -193,7 +240,9 @@ jobs:
           cmake --build
           --preset ${{ matrix.configure_preset }}-debug --parallel
       - name: Test Debug
-        run: ctest --preset ${{ matrix.configure_preset }}-debug
+        run: >
+          ctest --preset ${{ matrix.configure_preset }}-debug
+          --output-on-failure --no-tests=error
       - name: Install smoke test (Debug)
         run: |
           cmake --install build/${{ matrix.configure_preset }} \
@@ -209,7 +258,9 @@ jobs:
           --preset ${{ matrix.configure_preset }}-release --parallel
       - name: Test Release
         if: matrix.configure_preset != 'linux-gcc-asan'
-        run: ctest --preset ${{ matrix.configure_preset }}-release
+        run: >
+          ctest --preset ${{ matrix.configure_preset }}-release
+          --output-on-failure --no-tests=error
       - name: Install smoke test (Release)
         if: matrix.configure_preset != 'linux-gcc-asan'
         run: |
@@ -219,18 +270,25 @@ jobs:
             --component Server
           sh tools/smoke_linux_server.sh \
             build/install/${{ matrix.configure_preset }}/Release
-      - name: Verify generated sources
-        run: |
-          git diff --check
-          test -z "$(git status --porcelain)"
       - name: Package glibc server
         if: matrix.configure_preset == 'linux-clang'
         run: |
           cmake --build --preset linux-clang-release --parallel \
             --target laiue_server_archive laiue_modsdk_bundle
+          cp \
+            build/linux-clang/packages/Release/laiue-linux-x86_64-gnu.tar.gz.sha256 \
+            /tmp/laiue-linux-x86_64-gnu.first.sha256
+          cmake --build --preset linux-clang-release --parallel \
+            --target laiue_server_archive
+          cmp /tmp/laiue-linux-x86_64-gnu.first.sha256 \
+            build/linux-clang/packages/Release/laiue-linux-x86_64-gnu.tar.gz.sha256
+      - name: Verify source tree remains unchanged
+        run: |
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
       - name: Upload glibc server
         if: matrix.configure_preset == 'linux-clang'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: laiue-linux-x86_64-gnu
           path: |
@@ -239,14 +297,14 @@ jobs:
           if-no-files-found: error
       - name: Upload glibc mod stage
         if: matrix.configure_preset == 'linux-clang'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-stage-gnu
           path: build/linux-clang/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload glibc ModSDK verifier
         if: matrix.configure_preset == 'linux-clang'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-verifier-gnu
           path: |
@@ -256,14 +314,15 @@ jobs:
           if-no-files-found: error
 
   alpine-server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: alpine:3.23
     steps:
       - name: Install build dependencies
         run: >
           apk add --no-cache
-          bash build-base cmake gcompat git linux-headers ninja
-          openssl openssl-dev perl
+          bash build-base cmake gcompat git gzip linux-headers ninja
+          openssl openssl-dev perl tar
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
       - name: Build pinned MsQuic 2.5.9 for musl
         run: |
           git clone --filter=blob:none --no-checkout \
@@ -272,33 +331,11 @@ jobs:
             87b53085d76bd7920d490a6f226c9999b6614d14
           git -C /tmp/msquic checkout --detach \
             87b53085d76bd7920d490a6f226c9999b6614d14
-          git -C /tmp/msquic submodule update --init --recursive --depth 1
-          cmake -S /tmp/msquic -B /tmp/msquic-build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DQUIC_BUILD_PERF=OFF \
-            -DQUIC_BUILD_SHARED=ON \
-            -DQUIC_BUILD_TEST=OFF \
-            -DQUIC_BUILD_TOOLS=OFF \
-            -DQUIC_EMBED_GIT_HASH=OFF \
-            -DQUIC_ENABLE_LOGGING=OFF \
-            -DQUIC_LINUX_XDP_ENABLED=OFF \
-            -DQUIC_TLS_LIB=quictls
-          cmake --build /tmp/msquic-build --target msquic --parallel
-          mkdir -p /tmp/msquic-install/include /tmp/msquic-install/lib
-          cp /tmp/msquic/src/inc/msquic*.h \
-            /tmp/msquic/src/inc/quic_sal_stub.h \
-            /tmp/msquic-install/include/
-          library="$(find /tmp/msquic-build -type f -name 'libmsquic.so*' | head -n 1)"
-          test -n "$library"
-          cp "$library" /tmp/msquic-install/lib/libmsquic.so.2.5.9
-          ln -s libmsquic.so.2.5.9 /tmp/msquic-install/lib/libmsquic.so.2
-          ln -s libmsquic.so.2 /tmp/msquic-install/lib/libmsquic.so
-          cp /tmp/msquic/LICENSE /tmp/msquic-install/LICENSE
-          cp /tmp/msquic/THIRD-PARTY-NOTICES \
-            /tmp/msquic-install/THIRD-PARTY-NOTICES
-          echo '2.5.9' > /tmp/msquic-install/VERSION
+          git -C /tmp/msquic submodule update --init --depth 1 \
+            submodules/quictls
+          LAIUE_MSQUIC_LIBC=musl sh tools/build_lean_msquic.sh \
+            /tmp/msquic /tmp/msquic-build /tmp/msquic-install
           echo 'LAIUE_MSQUIC_ROOT=/tmp/msquic-install' >> "$GITHUB_ENV"
-      - uses: actions/checkout@v5
       - name: Configure
         run: >
           cmake --preset linux-musl
@@ -306,7 +343,9 @@ jobs:
       - name: Build Debug
         run: cmake --build --preset linux-musl-debug --parallel
       - name: Test Debug
-        run: ctest --preset linux-musl-debug
+        run: >
+          ctest --preset linux-musl-debug
+          --output-on-failure --no-tests=error
       - name: Install smoke test (Debug)
         run: |
           cmake --install build/linux-musl \
@@ -317,7 +356,9 @@ jobs:
       - name: Build Release
         run: cmake --build --preset linux-musl-release --parallel
       - name: Test Release
-        run: ctest --preset linux-musl-release
+        run: >
+          ctest --preset linux-musl-release
+          --output-on-failure --no-tests=error
       - name: Install smoke test (Release)
         run: |
           cmake --install build/linux-musl \
@@ -325,15 +366,22 @@ jobs:
             --prefix build/install/linux-musl/Release \
             --component Server
           sh tools/smoke_linux_server.sh build/install/linux-musl/Release
-      - name: Verify generated sources
-        run: |
-          git diff --check
-          test -z "$(git status --porcelain)"
       - name: Package musl server
         run: |
           cmake --build --preset linux-musl-release --parallel \
             --target laiue_server_archive laiue_modsdk_bundle
-      - uses: actions/upload-artifact@v4
+          cp \
+            build/linux-musl/packages/Release/laiue-linux-x86_64-musl.tar.gz.sha256 \
+            /tmp/laiue-linux-x86_64-musl.first.sha256
+          cmake --build --preset linux-musl-release --parallel \
+            --target laiue_server_archive
+          cmp /tmp/laiue-linux-x86_64-musl.first.sha256 \
+            build/linux-musl/packages/Release/laiue-linux-x86_64-musl.tar.gz.sha256
+      - name: Verify source tree remains unchanged
+        run: |
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: laiue-linux-x86_64-musl
           path: |
@@ -341,13 +389,13 @@ jobs:
             build/linux-musl/packages/Release/laiue-linux-x86_64-musl.tar.gz.sha256
           if-no-files-found: error
       - name: Upload musl mod stage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-stage-musl
           path: build/linux-musl/bundles/mod-sdk/Release/mods
           if-no-files-found: error
       - name: Upload musl ModSDK verifier
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-verifier-musl
           path: |
@@ -357,11 +405,11 @@ jobs:
           if-no-files-found: error
 
   debian-package-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: debian-server
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-linux-x86_64-gnu
           path: build/package
@@ -384,18 +432,17 @@ jobs:
             debian:13-slim sh -lc '
               apt-get update
               apt-get install -y --no-install-recommends \
-                binutils libssl3t64 libnuma1 libxdp1 \
-                libnl-route-3-200 openssl
+                binutils libssl3t64 openssl
               test ! -e /usr/lib/x86_64-linux-gnu/libmsquic.so.2.5.9
               sh /src/tools/smoke_linux_server.sh /opt/laiue
             '
 
   alpine-package-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: alpine-server
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-linux-x86_64-musl
           path: build/package
@@ -423,19 +470,19 @@ jobs:
             '
 
   mod-sdk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [windows-build, debian-server, alpine-server]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-stage-windows
           path: build/mod-stages/windows
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-stage-gnu
           path: build/mod-stages/gnu
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-stage-musl
           path: build/mod-stages/musl
@@ -453,21 +500,21 @@ jobs:
           test "$(find build/mod-sdk/mods -mindepth 1 -maxdepth 1 \
             -type d -name '*.lmp' | wc -l)" -gt 0
           tar -C build/mod-sdk -czf /tmp/laiue-mod-sdk-x86_64.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: laiue-mod-sdk-x86_64
           path: /tmp/laiue-mod-sdk-x86_64.tar.gz
           if-no-files-found: error
 
   mod-sdk-verify-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: mod-sdk
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-mod-sdk-x86_64
           path: ${{ runner.temp }}/mod-sdk-package
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-verifier-windows
           path: ${{ runner.temp }}/mod-sdk
@@ -492,14 +539,14 @@ jobs:
               (Get-Item $env:LAIUE_MOD_HASH_OUTPUT).Length -eq 0) {
             throw 'Windows ModSDK package hash is empty'
           }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-hash-windows
           path: ${{ runner.temp }}/mod-hashes/windows.txt
           if-no-files-found: error
 
   mod-sdk-verify-gnu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: debian:13-slim
     needs: mod-sdk
     steps:
@@ -507,11 +554,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends libssl3t64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-mod-sdk-x86_64
           path: /tmp/mod-sdk-package
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-verifier-gnu
           path: /tmp/mod-sdk
@@ -528,24 +575,24 @@ jobs:
           /tmp/mod-sdk/laiue_mod_binary_load_test
           /tmp/mod-sdk/laiue_mod_package_hash_test
           test -s "$LAIUE_MOD_HASH_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-hash-gnu
           path: /tmp/mod-hashes/gnu.txt
           if-no-files-found: error
 
   mod-sdk-verify-musl:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: alpine:3.23
     needs: mod-sdk
     steps:
       - name: Install verifier runtime dependencies
         run: apk add --no-cache libcrypto3 libgcc
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-mod-sdk-x86_64
           path: /tmp/mod-sdk-package
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-verifier-musl
           path: /tmp/mod-sdk
@@ -562,27 +609,27 @@ jobs:
           /tmp/mod-sdk/laiue_mod_binary_load_test
           /tmp/mod-sdk/laiue_mod_package_hash_test
           test -s "$LAIUE_MOD_HASH_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mod-hash-musl
           path: /tmp/mod-hashes/musl.txt
           if-no-files-found: error
 
   mod-sdk-hash-consistency:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       [mod-sdk-verify-windows, mod-sdk-verify-gnu,
        mod-sdk-verify-musl]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-hash-windows
           path: build/mod-hashes/windows
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-hash-gnu
           path: build/mod-hashes/gnu
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-hash-musl
           path: build/mod-hashes/musl

@@ -70,6 +70,19 @@ laiue_configure_portable_test(
 
 add_test(NAME laiue.network.protocol COMMAND laiue_protocol_test)
 
+add_executable(laiue_network_datagram_test
+    network_datagram_test.c
+    ../src/network/network_datagram.c
+    ../src/network/protocol.c)
+target_compile_definitions(laiue_network_datagram_test PRIVATE
+    LAIUE_BUILD_NETWORK)
+laiue_configure_portable_test(
+    laiue_network_datagram_test
+    NetworkDatagramTestEntryPoint)
+
+add_test(NAME laiue.network.datagram
+    COMMAND laiue_network_datagram_test)
+
 add_executable(laiue_certificate_validation_test
     certificate_validation_test.c
     ../src/network/certificate_validation.c

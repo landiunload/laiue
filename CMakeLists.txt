@@ -386,6 +386,22 @@ if(TARGET laiue_msquic)
                 DESTINATION "licenses/msquic"
                 COMPONENT "${component_name}")
         endif()
+        if(LAIUE_MSQUIC_TLS_LICENSE)
+            install(FILES "${LAIUE_MSQUIC_TLS_LICENSE}"
+                DESTINATION "licenses/msquic"
+                COMPONENT "${component_name}")
+        endif()
+        if(LAIUE_MSQUIC_VERSION_FILE)
+            install(FILES "${LAIUE_MSQUIC_VERSION_FILE}"
+                DESTINATION "licenses/msquic"
+                COMPONENT "${component_name}")
+        endif()
+        if(LAIUE_MSQUIC_IS_LEAN_PREFIX AND
+           LAIUE_MSQUIC_BUILD_METADATA)
+            install(FILES "${LAIUE_MSQUIC_BUILD_METADATA}"
+                DESTINATION "licenses/msquic"
+                COMPONENT "${component_name}")
+        endif()
     endfunction()
     if(LAIUE_BUILD_SERVER)
         laiue_install_msquic(Server)
@@ -400,6 +416,11 @@ endif()
 # directory and makes stale files visible during package smoke tests.
 function(laiue_add_component_bundle target_name directory_name
          component_name)
+    set(_laiue_bundle_strip_argument)
+    if(UNIX)
+        set(_laiue_bundle_strip_argument
+            "$<$<CONFIG:Release>:--strip>")
+    endif()
     add_custom_target(${target_name}
         COMMAND "${CMAKE_COMMAND}" -E rm -rf
             "${CMAKE_BINARY_DIR}/bundles/${directory_name}/$<CONFIG>"
@@ -410,6 +431,8 @@ function(laiue_add_component_bundle target_name directory_name
             --prefix
                 "${CMAKE_BINARY_DIR}/bundles/${directory_name}/$<CONFIG>"
             --component "${component_name}"
+            ${_laiue_bundle_strip_argument}
+        COMMAND_EXPAND_LISTS
         VERBATIM)
     if(TARGET laiue_architecture_check)
         add_dependencies(${target_name} laiue_architecture_check)
@@ -435,6 +458,8 @@ if(LAIUE_BUILD_SERVER)
             COMMAND sh "${PROJECT_SOURCE_DIR}/tools/package_linux_server.sh"
                 "${CMAKE_BINARY_DIR}/bundles/server/$<CONFIG>"
                 "${_laiue_server_archive}"
+                "${CMAKE_STRIP}"
+                "$<CONFIG>"
             VERBATIM)
         add_dependencies(laiue_server_archive laiue_server_bundle)
     endif()
@@ -474,5 +499,14 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}"
             "-DSOURCE_ROOT=${PROJECT_SOURCE_DIR}/src"
             -P "${PROJECT_SOURCE_DIR}/tools/check_architecture.cmake")
+    find_package(Git QUIET)
+    if(Git_FOUND)
+        add_test(NAME laiue.build.source_tree_guard
+            COMMAND "${CMAKE_COMMAND}"
+                "-DVERIFY_SCRIPT=${PROJECT_SOURCE_DIR}/tools/verify_source_tree.cmake"
+                "-DTEST_ROOT=${CMAKE_BINARY_DIR}/tests/source-tree-guard"
+                "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+                -P "${PROJECT_SOURCE_DIR}/tests/verify_source_tree_test.cmake")
+    endif()
     add_subdirectory(tests)
 endif()

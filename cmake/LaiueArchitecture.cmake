@@ -79,6 +79,41 @@ function(laiue_assert_build_architecture)
         endforeach()
     endif()
 
+    if(TARGET laiue_network)
+        get_target_property(network_sources laiue_network SOURCES)
+        set(network_source_names)
+        foreach(network_source IN LISTS network_sources)
+            get_filename_component(network_source_name
+                "${network_source}" NAME)
+            list(APPEND network_source_names "${network_source_name}")
+        endforeach()
+        foreach(required_network_source IN ITEMS
+                network_secure.c network_datagram.c)
+            if(NOT required_network_source IN_LIST network_source_names)
+                message(FATAL_ERROR
+                    "Network target не содержит общий source "
+                    "${required_network_source}")
+            endif()
+        endforeach()
+        if(network_windows.c IN_LIST network_source_names)
+            message(FATAL_ERROR
+                "Legacy plaintext TCP backend попал в production target")
+        endif()
+        if(TARGET laiue_msquic)
+            if(NOT network_msquic.c IN_LIST network_source_names OR
+               network_unavailable.c IN_LIST network_source_names)
+                message(FATAL_ERROR
+                    "Secure network target должен выбирать только "
+                    "MsQuic backend")
+            endif()
+        elseif(NOT network_unavailable.c IN_LIST network_source_names OR
+               network_msquic.c IN_LIST network_source_names)
+            message(FATAL_ERROR
+                "Сборка без secure transport должна выбирать только "
+                "fail-closed backend")
+        endif()
+    endif()
+
     message(STATUS
         "CMake architecture: shared headless stack and platform split OK")
 endfunction()

@@ -105,6 +105,19 @@ restore/replay, а состояния удалённых игроков инте
 active drops передаются до `READY` и далее меняются только
 server-authoritative событиями.
 
+После `READY` текущие player states передаются server-to-client через QUIC
+DATAGRAM: потерянное устаревшее состояние не блокирует более новый tick.
+Callback MsQuic только копирует полный bounded frame в очередь, а wire
+validation и публикация gameplay-события выполняются в `NetworkClientUpdate`
+на main thread. Duplicate и out-of-order state отбрасываются wrap-safe по
+`serverTick` отдельно для каждого игрока; уход игрока оставляет tombstone,
+поэтому запоздавший DATAGRAM не воссоздаёт его. Send slots заранее
+ограничены и не выделяют память на каждом snapshot tick. Если peer не
+согласовал DATAGRAM, его допустимый размер меньше player-state frame либо
+bounded send queue заполнена, этот state автоматически уходит по reliable
+control stream. Roster, join/leave, snapshots, inventory, block events и
+input остаются reliable.
+
 ## Загрузка содержимого
 
 Если `allow_content_downloads = true`, сервер может предложить `.lmp`, `.lsp`
@@ -151,9 +164,10 @@ DEP/NX сохранены. Linux CI дополнительно использу�
   отсутствуют.
 - Состояние игрока и inventory между независимыми подключениями пока не
   сохраняется как постоянный profile.
-- QUIC datagrams и 0-RTT отключены; control/gameplay используют один
-  bidirectional stream, snapshots/content — server-initiated streams.
-- Reliable player-state stream может испытывать head-of-line delay; remote
-  interpolation ограничивает видимый jitter, но не заменяет разрыв связи.
+- 0-RTT отключён. Client input пока остаётся на reliable bidirectional
+  stream: перенос edge-команд в DATAGRAM требует отдельного
+  acknowledgement/repeat контракта.
+- QUIC DATAGRAM используется только для transient player state; при
+  недоступности расширения действует совместимый reliable fallback.
 - Для публичного сервера всё равно нужны обновления ОС/MsQuic, rate limiting
   на периметре, мониторинг и резервные копии.

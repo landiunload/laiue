@@ -136,6 +136,13 @@ mouse look не откатывается сетевым yaw/pitch собстве
 `serverTick` snapshot. Старые и повторные ticks игнорируются, сравнение
 учитывает wrap `uint32_t`.
 
+После `READY` сервер предпочитает QUIC DATAGRAM для `PLAYER_STATE`, поэтому
+потерянный старый snapshot не блокирует более новый. Полный bounded frame
+копируется callback-ом и разбирается только на main thread. Если расширение
+не согласовано, MTU недостаточен либо заняты все заранее выделенные send
+slots, конкретный state уходит по reliable control stream. Оба пути
+используют одну freshness policy; roster и join/left всегда reliable.
+
 Presentation семплируется на шесть тиков позади newest state. Позиция и
 pitch интерполируются линейно, yaw идёт по кратчайшей дуге. При временном
 отсутствии snapshot последняя скорость продолжается максимум два тика,
@@ -230,9 +237,11 @@ production `PlayerFixedTickClock`, который использует клие�
 
 ## Ограничения
 
-- QUIC datagrams не используются: player state идёт по reliable stream и
-  может задержаться за потерянным packet; interpolation скрывает только
-  bounded jitter, а не длительный разрыв связи.
+- QUIC DATAGRAM используется только server-to-client для transient
+  `PLAYER_STATE`. Input остаётся reliable: `jumpPressed` и другие edge-команды
+  нельзя безопасно потерять без отдельного repeat/ack контракта. Peer без
+  DATAGRAM использует reliable fallback и при packet loss может получить
+  state позже из-за head-of-line.
 - Сервер не делает rollback/lag compensation для interaction.
 - Полный physics state пока рассылается тем же player-state сообщением, что
   и remote presentation state.

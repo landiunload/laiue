@@ -8,7 +8,6 @@
 #define WELCOME_PAYLOAD_SIZE 20U
 #define INPUT_PAYLOAD_SIZE 13U
 #define EDIT_PAYLOAD_SIZE 8U
-#define PLAYER_STATE_PAYLOAD_SIZE 117U
 #define BLOCK_DELTA_PAYLOAD_SIZE 37U
 #define MOD_LIST_PAYLOAD_SIZE 3U
 #define REJECT_PAYLOAD_SIZE 1U
@@ -569,7 +568,8 @@ bool LaiueProtocolDecodeEditIntent(const uint8_t *payload, uint32_t size, bool *
 uint32_t LaiueProtocolEncodePlayerState(uint8_t *output, uint32_t capacity,
                                         const LaiueProtocolPlayerState *state)
 {
-    if (output == NULL || state == NULL || capacity < PLAYER_STATE_PAYLOAD_SIZE ||
+    if (output == NULL || state == NULL ||
+        capacity < LAIUE_PROTOCOL_PLAYER_STATE_PAYLOAD_SIZE ||
         state->peerId == 0 || !IsFinitePosition(state->position[0]) ||
         !IsFinitePosition(state->position[1]) || !IsFinitePosition(state->position[2]) ||
         !IsFiniteFloat(state->yaw) || !IsFiniteFloat(state->pitch) || state->yaw < -ANGLE_PI ||
@@ -636,13 +636,14 @@ uint32_t LaiueProtocolEncodePlayerState(uint8_t *output, uint32_t capacity,
     output[PLAYER_STATE_FLAGS_OFFSET] =
         (uint8_t)((state->crouchingRequested ? 1U : 0U) |
                   (state->grounded ? 2U : 0U));
-    return PLAYER_STATE_PAYLOAD_SIZE;
+    return LAIUE_PROTOCOL_PLAYER_STATE_PAYLOAD_SIZE;
 }
 
 bool LaiueProtocolDecodePlayerState(const uint8_t *payload, uint32_t size,
                                     LaiueProtocolPlayerState *outState)
 {
-    if (payload == NULL || outState == NULL || size != PLAYER_STATE_PAYLOAD_SIZE ||
+    if (payload == NULL || outState == NULL ||
+        size != LAIUE_PROTOCOL_PLAYER_STATE_PAYLOAD_SIZE ||
         (payload[PLAYER_STATE_FLAGS_OFFSET] & 0xfcU) != 0)
     {
         return false;
