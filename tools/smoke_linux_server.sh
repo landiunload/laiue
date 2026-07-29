@@ -80,6 +80,38 @@ run_listener()
     fi
 }
 
+# Отказ старта обязан объяснить себя: под systemd молчаливый выход виден
+# только как Restart=on-failure в цикле. Регрессия к пустому выводу должна
+# ронять smoke, а не обнаруживаться оператором в проде.
+assert_startup_failure_is_explained()
+{
+    log="${smoke_root}/no-credentials.log"
+    set +e
+    (
+        cd "${runtime}"
+        LAIUE_SERVER_CERTIFICATE_FILE="certs/missing-cert.pem" \
+        LAIUE_SERVER_PRIVATE_KEY_FILE="certs/missing-key.pem" \
+        timeout 10 ./laiue_server
+    ) >"${log}" 2>&1
+    status=$?
+    set -e
+    if [ "${status}" -ne 5 ]; then
+        cat "${log}" >&2
+        echo "expected exit 5 without credentials, got ${status}" >&2
+        exit 1
+    fi
+    if ! grep -Fq 'startup failed:' "${log}"; then
+        echo "server exited ${status} without explaining why" >&2
+        exit 1
+    fi
+    if ! grep -Fq '(exit 5)' "${log}"; then
+        cat "${log}" >&2
+        echo "startup failure line does not name its exit code" >&2
+        exit 1
+    fi
+}
+
+assert_startup_failure_is_explained
 run_listener ipv4 127.0.0.1 27180 '(UDP, IPv4)'
 if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] &&
    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 0 ]

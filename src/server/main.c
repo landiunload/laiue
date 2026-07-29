@@ -245,6 +245,21 @@ static uint32_t AppendServerUnsigned(wchar_t* destination, uint32_t capacity,
     return length;
 }
 
+// Отказ старта обязан объяснить себя оператору. Под systemd молчаливый
+// выход виден только как Restart=on-failure в цикле: журнал пуст, а
+// причина (нет сертификата, нет памяти, битый набор модов) неотличима.
+static void WriteServerStartupFailure(const wchar_t* reason, uint32_t exitCode)
+{
+    wchar_t message[256];
+    uint32_t length = AppendServerText(message, 256U, 0,
+        L"laiue dedicated server: startup failed: ");
+    length = AppendServerText(message, 256U, length, reason);
+    length = AppendServerText(message, 256U, length, L" (exit ");
+    length = AppendServerUnsigned(message, 256U, length, exitCode);
+    length = AppendServerText(message, 256U, length, L")\r\n");
+    WriteServerMessage(message, length);
+}
+
 static void QueryWorldBlockPhysics(void *context, int64_t x, int64_t y, int64_t z,
                                    VoxelBlockPhysics *outBlock)
 {
@@ -1111,16 +1126,25 @@ static void RefreshPlayerInterest(DedicatedServer* server)
 
 static uint32_t RunServer(void)
 {
+    uint32_t exitCode = 0U;
+    World* world = NULL;
+    DedicatedServer* server = NULL;
+
     ServerConfiguration* configuration =
         PlatformAllocate(sizeof(*configuration), false);
-    if (configuration == NULL) return 1U;
+    if (configuration == NULL)
+    {
+        WriteServerStartupFailure(L"out of memory reading server.cfg", 1U);
+        return 1U;
+    }
     ServerConfigurationLoad(configuration);
 
-    World *world = WorldCreate(configuration->worldSeed);
+    world = WorldCreate(configuration->worldSeed);
     if (world == NULL)
     {
-        PlatformFree(configuration);
-        return 1U;
+        exitCode = 1U;
+        WriteServerStartupFailure(L"out of memory creating the world", 1U);
+        goto teardown;
     }
     PlatformCreateDirectory(L"saves");
     PlatformCreateDirectory(L"saves\\default");
@@ -1128,12 +1152,12 @@ static uint32_t RunServer(void)
     // загрузил до handshake. После подключения клиент больше его не пишет.
     WorldLoadDeltas(world, g_serverWorldPath);
 
-    DedicatedServer *server = PlatformAllocate(sizeof(*server), true);
+    server = PlatformAllocate(sizeof(*server), true);
     if (server == NULL)
     {
-        WorldDestroy(world);
-        PlatformFree(configuration);
-        return 2U;
+        exitCode = 2U;
+        WriteServerStartupFailure(L"out of memory creating the server", 2U);
+        goto teardown;
     }
     server->world = world;
     server->worldSeed = configuration->worldSeed;
@@ -1166,11 +1190,10 @@ static uint32_t RunServer(void)
             server->compatibilityMods, MODS_MAX_ENTRIES,
             &compatibilityCount))
     {
-        ModHostShutdown(&server->modHost);
-        PlatformFree(server);
-        WorldDestroy(world);
-        PlatformFree(configuration);
-        return 3U;
+        exitCode = 3U;
+        WriteServerStartupFailure(
+            L"server_enabled.txt yields no valid mod compatibility set", 3U);
+        goto teardown;
     }
     server->networkModCount = compatibilityCount;
     for (uint32_t i = 0; i < compatibilityCount; ++i)
@@ -1188,11 +1211,10 @@ static uint32_t RunServer(void)
         || BuildDownloadableContent(server);
     if (!downloadsReady)
     {
-        ModHostShutdown(&server->modHost);
-        PlatformFree(server);
-        WorldDestroy(world);
-        PlatformFree(configuration);
-        return 4U;
+        exitCode = 4U;
+        WriteServerStartupFailure(
+            L"cannot build the downloadable content bundle", 4U);
+        goto teardown;
     }
     NetworkServerConfiguration networkConfiguration;
     NetworkServerConfigurationInitialize(&networkConfiguration);
@@ -1216,16 +1238,20 @@ static uint32_t RunServer(void)
     memcpy(networkConfiguration.contentBundleSha256,
         server->downloadableContent.sha256,
         LAIUE_NETWORK_CONTENT_HASH_SIZE);
-    NetworkServer *network = ServerCredentialsAreUsable(configuration)
+    // Оба отказа fail-closed и делят код 5, но причины у оператора разные:
+    // «поправь server.cfg» против «QUIC-стек не поднялся».
+    bool credentialsUsable = ServerCredentialsAreUsable(configuration);
+    NetworkServer *network = credentialsUsable
         ? NetworkServerCreate(&networkConfiguration) : NULL;
     if (network == NULL)
     {
-        LaiueContentBundleRelease(&server->downloadableContent);
-        ModHostShutdown(&server->modHost);
-        PlatformFree(server);
-        WorldDestroy(world);
-        PlatformFree(configuration);
-        return 5U;
+        exitCode = 5U;
+        WriteServerStartupFailure(credentialsUsable
+            ? L"secure transport unavailable, see docs/secure_server.md"
+            : L"configuration has no usable certificate or private key,"
+              L" see docs/secure_server.md",
+            5U);
+        goto teardown;
     }
     server->network = network;
 
@@ -1333,6 +1359,19 @@ static uint32_t RunServer(void)
     PlatformFree(server);
     PlatformFree(configuration);
     return 0U;
+
+    // Общая лестница отказов старта. Порядок обязателен: моды выгружаются
+    // до уничтожения мира, потому что их shutdown ещё держит его bindings.
+teardown:
+    if (server != NULL)
+    {
+        LaiueContentBundleRelease(&server->downloadableContent);
+        ModHostShutdown(&server->modHost);
+    }
+    PlatformFree(server);
+    WorldDestroy(world);
+    PlatformFree(configuration);
+    return exitCode;
 }
 
 #if defined(_WIN32)

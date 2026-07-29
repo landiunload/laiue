@@ -17,7 +17,7 @@
 | Alpine/musl GCC Debug + Release | сборка OK, CTest 18/18 |
 | glibc/musl release archive smoke | права, `$ORIGIN`, IPv4/IPv6/dual/custom port OK |
 | Клиент `laiue.exe` | стартует, закрывается штатно |
-| `laiue_server` без credentials | выход с кодом 5 **без единого сообщения** |
+| `laiue_server` без credentials | выход с кодом 5 и строкой `startup failed: configuration has no usable certificate or private key` |
 | Сервер moskva, IPv4 и IPv6 | QUIC + pin + полный initial sync подтверждены probe |
 
 Линковка падает на `libmsquic.so.2`: `xdp_program__open_file`,
@@ -33,14 +33,7 @@
    приходит от `ld` через несколько минут сборки. Нужна проверка на
    configure, которая сообщает точную строку `apt-get install`, и та же
    строка в quickstart. Configure по-прежнему ничего не скачивает.
-2. **Диагностика fail-closed сервера.** `RunServer` имеет пять путей
-   выхода (коды 1..5) и печатает только успешный баннер. Оператор видит
-   пустой `journalctl` и `Restart=on-failure` в цикле. Нужны сообщения
-   `configuration` / `secure transport unavailable` из
-   [secure_server.md](secure_server.md), документированные коды выхода и
-   негативный случай в `tools/smoke_linux_server.sh` (нет сертификата →
-   ожидаемый код и текст). Правило: исправление получает regression test.
-3. **Сквозной тест на Windows.** `laiue.network.quic.integration`
+2. **Сквозной тест на Windows.** `laiue.network.quic.integration`
    регистрируется под `if(UNIX AND TARGET laiue_msquic)`, поэтому Windows
    идёт без единой проверки client/server поверх loopback — а это
    основная платформа клиента. Сделать сценарий переносимым (PEM или
