@@ -2107,6 +2107,142 @@ static void UpdateHotbarSelection(ApplicationState* application,
     }
 }
 
+// Применяет действие, выбранное в меню паузы. Возвращает false, когда кадр
+// нужно прервать: окно закрывается и рисовать уже нечего. Switch вместо
+// цепочки сравнений — чтобы компилятор сообщил о новом действии меню,
+// которое здесь забыли обработать.
+static bool ApplyPauseMenuAction(ApplicationState* application,
+    PauseMenuAction action)
+{
+    switch (action)
+    {
+    case PAUSE_MENU_ACTION_NONE:
+        break;
+    case PAUSE_MENU_ACTION_QUIT:
+        WindowRequestClose(application->window);
+        return false;
+    case PAUSE_MENU_ACTION_RESUME:
+        ResumeGame(application);
+        application->ui.quadCount = 0;
+        break;
+    case PAUSE_MENU_ACTION_RETURN_TITLE:
+        ApplicationCloseSession(application, true, true);
+        PauseMenuOpenTitle(&application->menu);
+        WindowSetMouseLook(application->window, false);
+        application->ui.quadCount = 0;
+        DrawTitleBackground(application);
+        PauseMenuUpdate(&application->menu, &application->ui,
+            &application->settings, application->renderer,
+            application->window, &application->mods,
+            g_applicationConfiguration.dayLengthMinutes,
+            application->windowWidth, application->windowHeight,
+            false);
+        break;
+    case PAUSE_MENU_ACTION_PLAY_WORLD:
+        NetworkClientDestroy(application->networkClient);
+        application->networkClient = NULL;
+        if (ApplicationSwitchWorld(application,
+                application->menu.selectedWorld))
+        {
+            application->mouseLookBeforeMenu = true;
+            ResumeGame(application);
+            application->ui.quadCount = 0;
+        }
+        break;
+    case PAUSE_MENU_ACTION_CONNECT_SERVER:
+    {
+        NetworkClientDestroy(application->networkClient);
+        application->networkClient = NULL;
+        application->networkReady = false;
+        application->networkEverReady = false;
+        application->networkWorldInitialized = false;
+        application->networkGameplayActivated = false;
+        application->networkPendingResyncCount = 0;
+        application->networkNextResyncRequestAtMs = 0;
+        application->networkSnapshot.active = false;
+        application->networkSnapshot.chunkActive = false;
+        application->networkSnapshot.pendingDeltaCount = 0;
+        application->menu.networkDisconnectReason =
+            NETWORK_DISCONNECT_NONE;
+        if (application->menu.selectedServerIndex
+            < application->menu.servers.count)
+        {
+            const ServerListEntry* selected =
+                &application->menu.servers.entries[
+                    application->menu.selectedServerIndex];
+            NetworkClientConfiguration configuration;
+            NetworkClientConfigurationInitialize(&configuration);
+            configuration.endpoint = selected->endpoint;
+            // A literal selects its family unambiguously. The menu
+            // preference only constrains DNS resolution.
+            configuration.addressFamily =
+                selected->endpoint.kind == NETWORK_ENDPOINT_IPV4
+                    ? NETWORK_ADDRESS_FAMILY_IPV4
+                    : (selected->endpoint.kind ==
+                            NETWORK_ENDPOINT_IPV6
+                        ? NETWORK_ADDRESS_FAMILY_IPV6
+                        : application->menu.clientAddressFamily);
+            configuration.trustMode = selected->trustMode;
+            memcpy(configuration.certificateSha256,
+                selected->certificateSha256,
+                LAIUE_NETWORK_CERTIFICATE_PIN_SIZE);
+            application->networkClient =
+                NetworkClientCreate(&configuration);
+        }
+        if (application->networkClient == NULL)
+        {
+            application->menu.networkConnecting = false;
+            application->menu.networkDisconnectReason =
+                NETWORK_DISCONNECT_CONFIGURATION;
+        }
+        break;
+    }
+    case PAUSE_MENU_ACTION_APPLY_SERVER_MODS:
+        if (ModsApplyServerCompatibilitySet(&application->mods,
+                application->serverCompatibilityMods,
+                application->serverModCount)
+            && SubmitCurrentNetworkMods(application))
+        {
+            application->menu.screen = PAUSE_MENU_MULTIPLAYER;
+        }
+        else
+        {
+            application->menu.networkConnecting = false;
+            application->menu.networkRejected = true;
+            application->menu.screen = PAUSE_MENU_MULTIPLAYER;
+        }
+        break;
+    case PAUSE_MENU_ACTION_DOWNLOAD_SERVER_CONTENT:
+        if (!NetworkClientRequestContent(application->networkClient))
+        {
+            application->menu.contentDownloading = false;
+            application->menu.contentDownloadFailed = true;
+        }
+        break;
+    case PAUSE_MENU_ACTION_CANCEL_CONNECT:
+        if (application->networkSession
+            && !application->networkGameplayActivated)
+            ApplicationCloseSession(application, false, false);
+        NetworkClientDestroy(application->networkClient);
+        application->networkClient = NULL;
+        application->networkReady = false;
+        break;
+    }
+
+    if (application->menu.saveRequested
+        && application->sessionActive
+        && !application->networkSession)
+    {
+        application->menu.saveRequested = false;
+        SaveGameWriteAll(application->world,
+            &application->camera, application->gameMode,
+            application->settings.timeOfDayHours,
+            application->worldSeed, &application->mods,
+            &application->inventory);
+    }
+    return true;
+}
+
 static void OnFrame(void* userData)
 {
     ApplicationState* application = userData;
@@ -2233,18 +2369,16 @@ static void OnFrame(void* userData)
     bool gameplayActive = application->sessionActive && !menuOpen
         && !application->inventoryOpen
         && (!application->networkSession || application->networkReady);
-    if (application->networkSession &&
-        application->sessionActive &&
-        application->networkReady)
+    // Сетевая симуляция тикает и при открытом меню: сервер продолжает
+    // считать игрока, и пропуск тиков разошёлся бы с его состоянием.
+    // gameplayActive при этом гасит ввод, а не сам тик.
+    bool networkTickRunning = application->networkSession
+        && application->sessionActive && application->networkReady;
+    if (networkTickRunning || gameplayActive)
     {
         UpdatePlayer(application,
             simulationDeltaSeconds, mouseDeltaX, mouseDeltaY,
             gameplayActive);
-    }
-    else if (gameplayActive)
-    {
-        UpdatePlayer(application,
-            simulationDeltaSeconds, mouseDeltaX, mouseDeltaY, true);
     }
     if (application->networkSession && application->sessionActive)
     {
@@ -2363,133 +2497,9 @@ static void OnFrame(void* userData)
                 g_applicationConfiguration.dayLengthMinutes,
                 application->windowWidth, application->windowHeight,
                 escapePressed);
-            if (action == PAUSE_MENU_ACTION_QUIT)
+            if (!ApplyPauseMenuAction(application, action))
             {
-                WindowRequestClose(application->window);
                 return;
-            }
-            if (action == PAUSE_MENU_ACTION_RESUME)
-            {
-                ResumeGame(application);
-                application->ui.quadCount = 0;
-            }
-            if (action == PAUSE_MENU_ACTION_RETURN_TITLE)
-            {
-                ApplicationCloseSession(application, true, true);
-                PauseMenuOpenTitle(&application->menu);
-                WindowSetMouseLook(application->window, false);
-                application->ui.quadCount = 0;
-                DrawTitleBackground(application);
-                PauseMenuUpdate(&application->menu, &application->ui,
-                    &application->settings, application->renderer,
-                    application->window, &application->mods,
-                    g_applicationConfiguration.dayLengthMinutes,
-                    application->windowWidth, application->windowHeight,
-                    false);
-            }
-            if (action == PAUSE_MENU_ACTION_PLAY_WORLD)
-            {
-                NetworkClientDestroy(application->networkClient);
-                application->networkClient = NULL;
-                if (ApplicationSwitchWorld(application,
-                        application->menu.selectedWorld))
-                {
-                    application->mouseLookBeforeMenu = true;
-                    ResumeGame(application);
-                    application->ui.quadCount = 0;
-                }
-            }
-            if (action == PAUSE_MENU_ACTION_CONNECT_SERVER)
-            {
-                NetworkClientDestroy(application->networkClient);
-                application->networkClient = NULL;
-                application->networkReady = false;
-                application->networkEverReady = false;
-                application->networkWorldInitialized = false;
-                application->networkGameplayActivated = false;
-                application->networkPendingResyncCount = 0;
-                application->networkNextResyncRequestAtMs = 0;
-                application->networkSnapshot.active = false;
-                application->networkSnapshot.chunkActive = false;
-                application->networkSnapshot.pendingDeltaCount = 0;
-                application->menu.networkDisconnectReason =
-                    NETWORK_DISCONNECT_NONE;
-                if (application->menu.selectedServerIndex
-                    < application->menu.servers.count)
-                {
-                    const ServerListEntry* selected =
-                        &application->menu.servers.entries[
-                            application->menu.selectedServerIndex];
-                    NetworkClientConfiguration configuration;
-                    NetworkClientConfigurationInitialize(&configuration);
-                    configuration.endpoint = selected->endpoint;
-                    // A literal selects its family unambiguously. The menu
-                    // preference only constrains DNS resolution.
-                    configuration.addressFamily =
-                        selected->endpoint.kind == NETWORK_ENDPOINT_IPV4
-                            ? NETWORK_ADDRESS_FAMILY_IPV4
-                            : (selected->endpoint.kind ==
-                                    NETWORK_ENDPOINT_IPV6
-                                ? NETWORK_ADDRESS_FAMILY_IPV6
-                                : application->menu.clientAddressFamily);
-                    configuration.trustMode = selected->trustMode;
-                    memcpy(configuration.certificateSha256,
-                        selected->certificateSha256,
-                        LAIUE_NETWORK_CERTIFICATE_PIN_SIZE);
-                    application->networkClient =
-                        NetworkClientCreate(&configuration);
-                }
-                if (application->networkClient == NULL)
-                {
-                    application->menu.networkConnecting = false;
-                    application->menu.networkDisconnectReason =
-                        NETWORK_DISCONNECT_CONFIGURATION;
-                }
-            }
-            if (action == PAUSE_MENU_ACTION_APPLY_SERVER_MODS)
-            {
-                if (ModsApplyServerCompatibilitySet(&application->mods,
-                        application->serverCompatibilityMods,
-                        application->serverModCount)
-                    && SubmitCurrentNetworkMods(application))
-                {
-                    application->menu.screen = PAUSE_MENU_MULTIPLAYER;
-                }
-                else
-                {
-                    application->menu.networkConnecting = false;
-                    application->menu.networkRejected = true;
-                    application->menu.screen = PAUSE_MENU_MULTIPLAYER;
-                }
-            }
-            if (action == PAUSE_MENU_ACTION_DOWNLOAD_SERVER_CONTENT)
-            {
-                if (!NetworkClientRequestContent(application->networkClient))
-                {
-                    application->menu.contentDownloading = false;
-                    application->menu.contentDownloadFailed = true;
-                }
-            }
-            if (action == PAUSE_MENU_ACTION_CANCEL_CONNECT)
-            {
-                if (application->networkSession
-                    && !application->networkGameplayActivated)
-                    ApplicationCloseSession(application, false, false);
-                NetworkClientDestroy(application->networkClient);
-                application->networkClient = NULL;
-                application->networkReady = false;
-            }
-
-            if (application->menu.saveRequested
-                && application->sessionActive
-                && !application->networkSession)
-            {
-                application->menu.saveRequested = false;
-                SaveGameWriteAll(application->world,
-                    &application->camera, application->gameMode,
-                    application->settings.timeOfDayHours,
-                    application->worldSeed, &application->mods,
-                    &application->inventory);
             }
         }
         else if (application->sessionActive)
