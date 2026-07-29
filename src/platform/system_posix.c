@@ -421,6 +421,40 @@ bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
     return succeeded;
 }
 
+// rename() атомарен по видимости, но сама запись в каталог остаётся в кэше.
+// Без fsync каталога потеря питания уносит файл, об успешной записи которого
+// вызывающий код уже отчитался, — вместе с прежней версией, которую rename заменил.
+// Windows-ветка получает ту же гарантию через MOVEFILE_WRITE_THROUGH.
+static bool SyncDirectoryOfFile(const char* filePath)
+{
+    char directoryPath[LAIUE_PLATFORM_PATH_CAPACITY * 4U];
+    const char* lastSeparator = strrchr(filePath, '/');
+    if (lastSeparator == NULL)
+    {
+        directoryPath[0] = '.';
+        directoryPath[1] = '\0';
+    }
+    else
+    {
+        // Файл лежит прямо в корне: каталог — сам «/», а не пустая строка.
+        size_t directoryLength = (size_t)(lastSeparator - filePath);
+        if (directoryLength == 0) directoryLength = 1U;
+        if (directoryLength >= sizeof(directoryPath)) return false;
+        memcpy(directoryPath, filePath, directoryLength);
+        directoryPath[directoryLength] = '\0';
+    }
+
+    int directory = open(directoryPath, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (directory < 0) return false;
+    bool synced = fsync(directory) == 0;
+    // EINVAL от fsync каталога означает, что файловая система такого не умеет.
+    // Сделать больше нечего, и объявлять из-за этого состоявшуюся замену
+    // неудачей — врать вызывающему в обратную сторону.
+    if (!synced && errno == EINVAL) synced = true;
+    close(directory);
+    return synced;
+}
+
 bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,
                              uint64_t size)
 {
@@ -435,9 +469,12 @@ bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,
     fchmod(file, 0644);
     bool succeeded = WriteAll(file, bytes, size) && fsync(file) == 0;
     close(file);
-    if (succeeded) succeeded = rename(temporary, nativePath) == 0;
-    if (!succeeded) unlink(temporary);
-    return succeeded;
+    if (!succeeded || rename(temporary, nativePath) != 0)
+    {
+        unlink(temporary);
+        return false;
+    }
+    return SyncDirectoryOfFile(nativePath);
 }
 
 bool PlatformAppendFile(const wchar_t* path, const void* bytes, uint64_t size)
