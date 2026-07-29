@@ -16,10 +16,12 @@
 #include "render/shader_pack.h"
 #include "render/texture_pack.h"
 #include "core/player_command_mapper.h"
+#include "core/remote_player_renderer.h"
 #include "core/ui.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/inventory.h"
 #include "gameplay/player_controller.h"
+#include "gameplay/player_replication.h"
 #include "interaction/voxel_interaction.h"
 #include "input/input.h"
 #include "network/network.h"
@@ -38,6 +40,17 @@
 #define NETWORK_CHUNK_REVISION_CAPACITY LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS
 #define NETWORK_DAY_LENGTH_MINUTES 60.0f
 #define NETWORK_RESYNC_REQUEST_INTERVAL_MS 1000ULL
+#define NETWORK_SIMULATION_TICK_RATE 60U
+#define NETWORK_SIMULATION_TICK_SECONDS \
+    (1.0 / (double)NETWORK_SIMULATION_TICK_RATE)
+#define NETWORK_PHYSICS_SUBSTEPS 4U
+#define NETWORK_MAX_CATCH_UP_TICKS 8U
+#define NETWORK_VISUAL_SNAP_DISTANCE 2.0
+#define NETWORK_VISUAL_CORRECTION_RATE 10.0
+
+_Static_assert(LAIUE_NETWORK_MAX_PEERS
+        <= REMOTE_PLAYER_RENDER_CAPACITY,
+    "remote player renderer must cover every network peer");
 
 typedef struct NetworkRemotePlayer
 {
@@ -45,7 +58,8 @@ typedef struct NetworkRemotePlayer
     bool hasState;
     uint32_t peerId;
     NetworkPlayerState displayed;
-    NetworkPlayerState target;
+    PlayerInterpolationBuffer interpolation;
+    double ticksSinceNewest;
 } NetworkRemotePlayer;
 
 typedef struct NetworkChunkRevision
@@ -60,6 +74,7 @@ typedef struct NetworkSnapshotAssembly
 {
     bool active;
     bool chunkActive;
+    bool requiresReadyBarrier;
     uint64_t snapshotId;
     uint64_t worldRevision;
     uint32_t expectedChunkCount;
@@ -83,6 +98,10 @@ typedef struct ApplicationState
     Renderer* renderer;
     ChunkStreaming* chunkStreaming;
     Camera camera;
+    // Remote sessions keep collision/prediction state separate from the
+    // presentation camera. Reconciliation changes this camera immediately;
+    // the renderer observes only the bounded visual correction below.
+    Camera networkPhysicsCamera;
     PlayerController player;
     GameMode gameMode;
     int32_t windowWidth;
@@ -94,9 +113,14 @@ typedef struct ApplicationState
     bool showDiagnostics;
     NetworkClient* networkClient;
     uint32_t networkPeerId;
-    float networkInputAccumulator;
+    PlayerFixedTickClock networkSimulationClock;
+    double networkPreviousPhysicsPosition[3];
+    double networkVisualCorrection[3];
+    uint32_t networkNextInputSequence;
+    PlayerPredictionHistory networkPrediction;
+    bool networkPhysicsInitialized;
+    bool networkPendingJumpPressed;
     float networkBreakSendAccumulator;
-    NetworkInputCommand networkPendingInput;
     bool networkReady;
     bool networkEverReady;
     bool networkSession;
@@ -110,6 +134,9 @@ typedef struct ApplicationState
         NETWORK_CHUNK_REVISION_CAPACITY];
     uint32_t networkChunkRevisionCount;
     NetworkRemotePlayer remotePlayers[LAIUE_NETWORK_MAX_PEERS];
+    RemotePlayerRenderer remotePlayerRenderer;
+    RemotePlayerRenderPose
+        remotePlayerRenderPoses[REMOTE_PLAYER_RENDER_CAPACITY];
     NetworkModDescriptor serverMods[LAIUE_NETWORK_MAX_MODS];
     ModCompatibilityEntry serverCompatibilityMods[MODS_MAX_ENTRIES];
     ModCompatibilityEntry localCompatibilityMods[MODS_MAX_ENTRIES];
@@ -164,6 +191,22 @@ static PlayerCollisionSource CreatePlayerCollisionSource(World* world)
     return source;
 }
 
+static void ResetNetworkPhysics(ApplicationState* application)
+{
+    application->networkPhysicsCamera = application->camera;
+    PlayerFixedTickClockInit(&application->networkSimulationClock);
+    application->networkNextInputSequence = 0U;
+    application->networkPendingJumpPressed = false;
+    PlayerPredictionHistoryInit(&application->networkPrediction);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        application->networkPreviousPhysicsPosition[axis] =
+            application->networkPhysicsCamera.position[axis];
+        application->networkVisualCorrection[axis] = 0.0;
+    }
+    application->networkPhysicsInitialized = true;
+}
+
 static void InvalidateModBlock(void* context,
     int64_t x, int64_t y, int64_t z)
 {
@@ -182,11 +225,19 @@ static void InitializeApplicationModHost(ApplicationState* application)
         SAVE_GAME_PATH_CAPACITY);
     ModHostBindings bindings = {
         .world = application->world,
-        .player = &application->player,
+        // A remote client may observe and render mod state, but it must not
+        // mutate authoritative physics locally. Per-player impulses and
+        // movement modifiers are applied by the server and arrive through
+        // reconciliation.
+        .player = application->networkSession
+            ? NULL : &application->player,
         .camera = &application->camera,
         .gameMode = &application->gameMode,
         .timeOfDayHours = &application->settings.timeOfDayHours,
         .runtimeSide = MOD_SIDE_CLIENT,
+        .blockMutationPolicy = application->networkSession
+            ? MOD_HOST_BLOCK_MUTATION_DENY
+            : MOD_HOST_BLOCK_MUTATION_LOCAL,
         .invalidateContext = application->chunkStreaming,
         .invalidateBlock = InvalidateModBlock,
         .viewContext = &application->camera,
@@ -277,6 +328,8 @@ static void ApplicationCloseSession(ApplicationState* application,
             application->renderer);
         application->blockEffectsReady = false;
     }
+    RemotePlayerRendererShutdown(&application->remotePlayerRenderer,
+        application->renderer);
     ChunkStreamingDestroy(application->chunkStreaming);
     WorldDestroy(application->world);
     application->chunkStreaming = NULL;
@@ -295,6 +348,10 @@ static void ApplicationCloseSession(ApplicationState* application,
     application->networkGameplayActivated = false;
     application->networkPendingResyncCount = 0;
     application->networkNextResyncRequestAtMs = 0;
+    application->networkPhysicsInitialized = false;
+    PlayerFixedTickClockInit(&application->networkSimulationClock);
+    application->networkPendingJumpPressed = false;
+    PlayerPredictionHistoryInit(&application->networkPrediction);
     memset(application->remotePlayers, 0,
         sizeof(application->remotePlayers));
     RendererReleaseWorld(application->renderer);
@@ -358,6 +415,7 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
     application->networkReady = false;
     application->networkSession = false;
     application->networkWorldInitialized = false;
+    application->networkPhysicsInitialized = false;
     application->gameMode = GAME_MODE_FLY;
     application->settings.timeOfDayHours = savedMinutes >= 0
         ? (float)savedMinutes / 60.0f
@@ -418,6 +476,7 @@ static bool ApplicationSwitchToNetworkWorld(ApplicationState* application,
     CameraInit(&application->camera, 0.0, 0.0,
         g_applicationConfiguration.spawnHeight, 0.0f, -0.4f);
     PlayerControllerReset(&application->player, &application->camera);
+    ResetNetworkPhysics(application);
     application->gameMode = GAME_MODE_SURVIVAL;
     InitializeSessionInventory(application);
     InventoryClear(&application->inventory);
@@ -432,8 +491,8 @@ static bool ApplicationSwitchToNetworkWorld(ApplicationState* application,
         return false;
     }
     application->blockEffectsReady = true;
-    InitializeApplicationModHost(application);
     application->networkSession = true;
+    InitializeApplicationModHost(application);
     application->networkWorldInitialized = true;
     application->sessionActive = true;
     return true;
@@ -804,9 +863,115 @@ static void ToggleGameMode(ApplicationState* application)
     }
 }
 
-static void UpdatePlayer(ApplicationState* application,
-    float deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY)
+static uint32_t NextNetworkInputSequence(uint32_t current)
 {
+    ++current;
+    return current == 0U ? 1U : current;
+}
+
+static void BuildCanonicalPlayerCommand(
+    const NetworkInputCommand* input,
+    PlayerControllerCommand* outCommand)
+{
+    outCommand->movementX = input->movementX;
+    outCommand->movementY = input->movementY;
+    outCommand->jumpPressed = input->jumpPressed;
+    outCommand->jumpHeld = input->jumpHeld;
+    outCommand->sprintHeld = input->sprintHeld;
+    outCommand->crouchHeld = input->crouchHeld;
+}
+
+static bool SimulateNetworkInputTick(
+    ApplicationState* application,
+    const PlayerCollisionSource* collision,
+    const PlayerControllerCommand* sampledCommand)
+{
+    NetworkInputCommand input;
+    memset(&input, 0, sizeof(input));
+    input.sequence = NextNetworkInputSequence(
+        application->networkNextInputSequence);
+    input.movementX = (float)sampledCommand->movementX;
+    input.movementY = (float)sampledCommand->movementY;
+    input.yaw = application->camera.yaw;
+    input.pitch = application->camera.pitch;
+    input.jumpPressed = sampledCommand->jumpPressed;
+    input.jumpHeld = sampledCommand->jumpHeld;
+    input.sprintHeld = sampledCommand->sprintHeld;
+    input.crouchHeld = sampledCommand->crouchHeld;
+
+    NetworkInputCommand canonical;
+    if (!NetworkInputCanonicalize(&input, &canonical) ||
+        !NetworkClientSendInput(
+            application->networkClient, &canonical))
+    {
+        return false;
+    }
+
+    PlayerControllerCommand command;
+    BuildCanonicalPlayerCommand(&canonical, &command);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        application->networkPreviousPhysicsPosition[axis] =
+            application->networkPhysicsCamera.position[axis];
+    }
+    application->networkPhysicsCamera.yaw = canonical.yaw;
+    application->networkPhysicsCamera.pitch = canonical.pitch;
+    PlayerControllerSimulateFixedSteps(&application->player,
+        collision, &application->networkPhysicsCamera,
+        &command, NETWORK_PHYSICS_SUBSTEPS);
+
+    PlayerControllerState predicted;
+    PlayerControllerCaptureState(&application->player,
+        &application->networkPhysicsCamera, &predicted);
+    if (!PlayerPredictionHistoryRecord(
+            &application->networkPrediction,
+            canonical.sequence, &command, &predicted))
+    {
+        // A local history invariant failure must not leave half-valid replay
+        // data. The next authoritative state performs a bounded hard restore.
+        PlayerPredictionHistoryInit(
+            &application->networkPrediction);
+    }
+    application->networkNextInputSequence = canonical.sequence;
+    return true;
+}
+
+static void UpdateNetworkPresentationCamera(
+    ApplicationState* application, float deltaSeconds)
+{
+    if (!application->networkPhysicsInitialized)
+        return;
+
+    double alpha = PlayerFixedTickClockAlpha(
+        &application->networkSimulationClock,
+        NETWORK_SIMULATION_TICK_SECONDS);
+
+    double decay = 1.0 /
+        (1.0 + NETWORK_VISUAL_CORRECTION_RATE *
+            (double)deltaSeconds);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        application->networkVisualCorrection[axis] *= decay;
+        if (application->networkVisualCorrection[axis] > -1e-9 &&
+            application->networkVisualCorrection[axis] < 1e-9)
+        {
+            application->networkVisualCorrection[axis] = 0.0;
+        }
+        double previous =
+            application->networkPreviousPhysicsPosition[axis];
+        double current =
+            application->networkPhysicsCamera.position[axis];
+        application->camera.position[axis] =
+            previous + (current - previous) * alpha +
+            application->networkVisualCorrection[axis];
+    }
+}
+
+static void UpdatePlayer(ApplicationState* application,
+    double deltaSeconds, int32_t mouseDeltaX, int32_t mouseDeltaY,
+    bool acceptsInput)
+{
+    float presentationDeltaSeconds = (float)deltaSeconds;
     // Настройки раздела «Управление» применяются вживую.
     float sensitivity = g_applicationConfiguration.mouseSensitivity
         * (float)application->settings.mouseSensitivityPercent * 0.01f;
@@ -814,41 +979,56 @@ static void UpdatePlayer(ApplicationState* application,
 
     if (application->networkReady)
     {
-        CameraUpdate(&application->camera, deltaSeconds,
-            false, false, false, false, false,
-            mouseDeltaX, mouseDeltaY, 0.0f, sensitivity);
-
         PlayerControllerCommand command;
-        PlayerCommandMapperBuild(application->input,
-            &application->camera, &command);
+        memset(&command, 0, sizeof(command));
+        if (acceptsInput)
+        {
+            CameraUpdate(&application->camera, presentationDeltaSeconds,
+                false, false, false, false, false,
+                mouseDeltaX, mouseDeltaY, 0.0f, sensitivity);
+            PlayerCommandMapperBuild(application->input,
+                &application->camera, &command);
+            application->networkPendingJumpPressed =
+                application->networkPendingJumpPressed ||
+                command.jumpPressed;
+        }
+        else
+        {
+            // Multiplayer simulation never pauses for a local menu. A
+            // canonical neutral command stops held movement immediately
+            // while gravity and server time continue at 60 Hz.
+            application->networkPendingJumpPressed = false;
+        }
+        command.jumpPressed =
+            application->networkPendingJumpPressed;
 
-        // Предсказание существует только для плавности клиента. Сервер
-        // повторяет физику сам и регулярно исправляет расхождение.
+        if (!application->networkPhysicsInitialized)
+            ResetNetworkPhysics(application);
         PlayerCollisionSource collision =
             CreatePlayerCollisionSource(application->world);
-        PlayerControllerUpdate(&application->player,
-            &collision, &application->camera, &command, deltaSeconds);
+        PlayerFixedTickClockAccumulate(
+            &application->networkSimulationClock, deltaSeconds,
+            NETWORK_SIMULATION_TICK_SECONDS,
+            NETWORK_MAX_CATCH_UP_TICKS);
 
-        application->networkPendingInput.movementX =
-            (float)command.movementX;
-        application->networkPendingInput.movementY =
-            (float)command.movementY;
-        application->networkPendingInput.yaw = application->camera.yaw;
-        application->networkPendingInput.pitch = application->camera.pitch;
-        application->networkPendingInput.jumpPressed =
-            application->networkPendingInput.jumpPressed
-            || command.jumpPressed;
-        application->networkPendingInput.jumpHeld = command.jumpHeld;
-        application->networkPendingInput.sprintHeld = command.sprintHeld;
-        application->networkPendingInput.crouchHeld = command.crouchHeld;
-        application->networkInputAccumulator += deltaSeconds;
-        if (application->networkInputAccumulator >= (1.0f / 60.0f))
+        uint32_t ticks = 0U;
+        while (PlayerFixedTickClockHasTick(
+                &application->networkSimulationClock,
+                NETWORK_SIMULATION_TICK_SECONDS) &&
+            ticks < NETWORK_MAX_CATCH_UP_TICKS)
         {
-            NetworkClientSendInput(application->networkClient,
-                &application->networkPendingInput);
-            application->networkPendingInput.jumpPressed = false;
-            application->networkInputAccumulator = 0.0f;
+            if (!SimulateNetworkInputTick(
+                    application, &collision, &command))
+                break;
+            PlayerFixedTickClockConsumeTick(
+                &application->networkSimulationClock,
+                NETWORK_SIMULATION_TICK_SECONDS);
+            application->networkPendingJumpPressed = false;
+            command.jumpPressed = false;
+            ++ticks;
         }
+        UpdateNetworkPresentationCamera(
+            application, presentationDeltaSeconds);
         return;
     }
 
@@ -858,7 +1038,7 @@ static void UpdatePlayer(ApplicationState* application,
                 application->input, INPUT_KEY_SPACE))
         {
         }
-        CameraUpdate(&application->camera, deltaSeconds,
+        CameraUpdate(&application->camera, presentationDeltaSeconds,
             InputIsKeyDown(application->input, INPUT_KEY_W),
             InputIsKeyDown(application->input, INPUT_KEY_A),
             InputIsKeyDown(application->input, INPUT_KEY_S),
@@ -869,7 +1049,7 @@ static void UpdatePlayer(ApplicationState* application,
         return;
     }
 
-    CameraUpdate(&application->camera, deltaSeconds,
+    CameraUpdate(&application->camera, presentationDeltaSeconds,
         false, false, false, false, false,
         mouseDeltaX, mouseDeltaY, 0.0f,
         sensitivity);
@@ -911,6 +1091,10 @@ static bool SetNetworkChunkRevision(ApplicationState* application,
 {
     NetworkChunkRevision* entry =
         FindNetworkChunkRevision(application, chunk);
+    // Control и snapshot streams упорядочены только внутри каждого stream.
+    // Никогда не уменьшаем известную revision при межпоточной перестановке.
+    if (entry != NULL && entry->revision > revision)
+        return true;
     if (entry == NULL)
     {
         uint32_t index;
@@ -1044,6 +1228,8 @@ static bool BeginNetworkSnapshot(ApplicationState* application,
         || info->chunkCount > LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS)
         return false;
     bool initial = !application->networkWorldInitialized;
+    if (initial && !info->requiresReadyBarrier)
+        return false;
     if (initial
         && !ApplicationSwitchToNetworkWorld(application, info->worldSeed))
         return false;
@@ -1054,13 +1240,16 @@ static bool BeginNetworkSnapshot(ApplicationState* application,
     NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
     snapshot->active = true;
     snapshot->chunkActive = false;
+    snapshot->requiresReadyBarrier =
+        info->requiresReadyBarrier;
     snapshot->snapshotId = info->snapshotId;
     snapshot->worldRevision = info->worldRevision;
     snapshot->expectedChunkCount = info->chunkCount;
     snapshot->completedChunkCount = 0;
     snapshot->editCount = 0;
     snapshot->pendingDeltaCount = 0;
-    application->networkReady = false;
+    if (info->requiresReadyBarrier)
+        application->networkReady = false;
     application->networkPeerId = info->peerId;
     application->settings.timeOfDayHours =
         (float)(info->worldTime % 86400000ULL) / 3600000.0f;
@@ -1133,29 +1322,46 @@ static bool ApplyNetworkSnapshotChunk(ApplicationState* application,
     ++snapshot->nextChunkPart;
     if (snapshot->nextChunkPart == snapshot->chunkPartCount)
     {
-        if (!WorldReplaceChunkDeltas(application->world, snapshot->chunk,
-                snapshot->edits, snapshot->editCount,
-                snapshot->chunkRevision, snapshot->worldRevision))
-            return false;
         NetworkChunkRevision* previous =
             FindNetworkChunkRevision(
                 application, snapshot->chunk);
-        bool resolvedResync =
-            previous != NULL && previous->resyncPending;
-        if (!SetNetworkChunkRevision(
-                application, snapshot->chunk,
-                snapshot->chunkRevision))
-            return false;
-        NetworkChunkRevision* applied =
-            FindNetworkChunkRevision(
-                application, snapshot->chunk);
-        if (applied == NULL) return false;
-        applied->resyncPending = false;
-        applied->resyncRequested = false;
-        if (resolvedResync
-            && application->networkPendingResyncCount > 0)
-            --application->networkPendingResyncCount;
-        InvalidateNetworkChunk(application, snapshot->chunk);
+        bool staleSnapshot = previous != NULL
+            && previous->revision > snapshot->chunkRevision;
+        if (!staleSnapshot)
+        {
+            if (!WorldReplaceChunkDeltas(application->world,
+                    snapshot->chunk, snapshot->edits,
+                    snapshot->editCount, snapshot->chunkRevision,
+                    snapshot->worldRevision))
+                return false;
+
+            // World тоже защищает revision под своей блокировкой. Это
+            // покрывает будущие источники изменений, не отражённые в
+            // networkChunkRevisions.
+            uint64_t appliedRevision = WorldGetChunkRevision(
+                application->world, snapshot->chunk);
+            staleSnapshot =
+                appliedRevision > snapshot->chunkRevision;
+        }
+        if (!staleSnapshot)
+        {
+            bool resolvedResync =
+                previous != NULL && previous->resyncPending;
+            if (!SetNetworkChunkRevision(
+                    application, snapshot->chunk,
+                    snapshot->chunkRevision))
+                return false;
+            NetworkChunkRevision* applied =
+                FindNetworkChunkRevision(
+                    application, snapshot->chunk);
+            if (applied == NULL) return false;
+            applied->resyncPending = false;
+            applied->resyncRequested = false;
+            if (resolvedResync
+                && application->networkPendingResyncCount > 0)
+                --application->networkPendingResyncCount;
+            InvalidateNetworkChunk(application, snapshot->chunk);
+        }
         snapshot->chunkActive = false;
         snapshot->editCount = 0;
         ++snapshot->completedChunkCount;
@@ -1268,6 +1474,7 @@ static NetworkRemotePlayer* FindRemotePlayer(
     memset(empty, 0, sizeof(*empty));
     empty->active = true;
     empty->peerId = peerId;
+    PlayerInterpolationBufferInit(&empty->interpolation);
     return empty;
 }
 
@@ -1285,44 +1492,235 @@ static void StoreRemotePlayerState(ApplicationState* application,
     NetworkRemotePlayer* player =
         FindRemotePlayer(application, state->peerId, true);
     if (player == NULL) return;
-    if (!player->hasState)
-    {
-        player->displayed = *state;
-        player->hasState = true;
-    }
-    player->target = *state;
-}
-
-static float InterpolateRemoteAngle(float current, float target, float alpha)
-{
-    float difference = target - current;
-    while (difference > 3.14159265f) difference -= 6.28318531f;
-    while (difference < -3.14159265f) difference += 6.28318531f;
-    return current + difference * alpha;
+    PlayerInterpolationSnapshot snapshot = {
+        .serverTick = state->serverTick,
+        .position = {
+            state->position[0],
+            state->position[1],
+            state->position[2],
+        },
+        .yaw = state->yaw,
+        .pitch = state->pitch,
+        .grounded = state->grounded,
+    };
+    if (!PlayerInterpolationBufferPush(
+            &player->interpolation, &snapshot))
+        return;
+    // Keep the complete latest state (including crouch progress) for
+    // presentation metadata. Position and angles are overwritten below by
+    // the delayed interpolation sample.
+    player->displayed = *state;
+    player->hasState = true;
+    player->ticksSinceNewest = 0.0;
 }
 
 static void UpdateRemotePlayers(
     ApplicationState* application, float deltaSeconds)
 {
-    float alpha = deltaSeconds * 12.0f;
-    if (alpha > 1.0f) alpha = 1.0f;
     for (uint32_t i = 0; i < LAIUE_NETWORK_MAX_PEERS; ++i)
     {
         NetworkRemotePlayer* player = &application->remotePlayers[i];
         if (!player->active || !player->hasState) continue;
+        player->ticksSinceNewest +=
+            (double)deltaSeconds *
+            (double)NETWORK_SIMULATION_TICK_RATE;
+        PlayerInterpolatedPose pose;
+        if (!PlayerInterpolationBufferSample(
+                &player->interpolation,
+                player->ticksSinceNewest, &pose))
+            continue;
         for (uint32_t axis = 0; axis < 3U; ++axis)
         {
-            player->displayed.position[axis] +=
-                (player->target.position[axis]
-                    - player->displayed.position[axis]) * alpha;
+            player->displayed.position[axis] =
+                pose.position[axis];
         }
-        player->displayed.yaw = InterpolateRemoteAngle(
-            player->displayed.yaw, player->target.yaw, alpha);
-        player->displayed.pitch +=
-            (player->target.pitch - player->displayed.pitch) * alpha;
-        player->displayed.serverTick = player->target.serverTick;
-        player->displayed.grounded = player->target.grounded;
+        player->displayed.yaw = pose.yaw;
+        player->displayed.pitch = pose.pitch;
+        player->displayed.grounded = pose.grounded;
     }
+}
+
+static double SmoothRemoteStanceProgress(double value)
+{
+    if (value < 0.0)
+    {
+        value = 0.0;
+    }
+    else if (value > 1.0)
+    {
+        value = 1.0;
+    }
+    return value * value * value
+        * (value * (value * 6.0 - 15.0) + 10.0);
+}
+
+static double InterpolateRemoteStance(
+    double standing, double crouching, double progress)
+{
+    return standing + (crouching - standing)
+        * SmoothRemoteStanceProgress(progress);
+}
+
+static double RemotePlayerEyeHeight(
+    const ApplicationState* application,
+    const NetworkPlayerState* state)
+{
+    const PlayerStanceConfig* config =
+        &application->player.stance.config;
+    double height = InterpolateRemoteStance(
+        config->standingHeight, config->crouchingHeight,
+        state->colliderCrouchProgress);
+    double eyeHeight = InterpolateRemoteStance(
+        config->standingEyeHeight, config->crouchingEyeHeight,
+        state->eyeCrouchProgress);
+    double standingClearance =
+        config->standingHeight - config->standingEyeHeight;
+    double crouchingClearance =
+        config->crouchingHeight - config->crouchingEyeHeight;
+    double minimumClearance =
+        standingClearance < crouchingClearance
+        ? standingClearance : crouchingClearance;
+    if (minimumClearance < 0.0)
+    {
+        minimumClearance = 0.0;
+    }
+    double maximumEyeHeight = height - minimumClearance;
+    return eyeHeight < maximumEyeHeight
+        ? eyeHeight : maximumEyeHeight;
+}
+
+static void DrawRemotePlayers(ApplicationState* application,
+    const int64_t cameraBlockPosition[3])
+{
+    uint32_t poseCount = 0u;
+    for (uint32_t i = 0u; i < LAIUE_NETWORK_MAX_PEERS; ++i)
+    {
+        const NetworkRemotePlayer* player =
+            &application->remotePlayers[i];
+        if (!player->active || !player->hasState)
+        {
+            continue;
+        }
+        RemotePlayerRenderPose* pose =
+            &application->remotePlayerRenderPoses[poseCount++];
+        pose->feetPosition[0] = player->displayed.position[0];
+        pose->feetPosition[1] = player->displayed.position[1];
+        pose->feetPosition[2] = player->displayed.position[2]
+            - RemotePlayerEyeHeight(
+                application, &player->displayed);
+    }
+    RemotePlayerRendererDraw(&application->remotePlayerRenderer,
+        application->renderer, application->remotePlayerRenderPoses,
+        poseCount, cameraBlockPosition);
+}
+
+static void BuildPlayerControllerState(
+    const NetworkPlayerState* network,
+    PlayerControllerState* outState)
+{
+    memset(outState, 0, sizeof(*outState));
+    memcpy(outState->position, network->position,
+        sizeof(outState->position));
+    outState->locomotionVelocityX =
+        network->locomotionVelocityX;
+    outState->locomotionVelocityY =
+        network->locomotionVelocityY;
+    outState->verticalVelocity =
+        network->verticalVelocity;
+    outState->externalVelocityX =
+        network->externalVelocityX;
+    outState->externalVelocityY =
+        network->externalVelocityY;
+    outState->jumpBufferRemaining =
+        network->jumpBufferRemaining;
+    outState->coyoteTimeRemaining =
+        network->coyoteTimeRemaining;
+    outState->colliderCrouchProgress =
+        network->colliderCrouchProgress;
+    outState->eyeCrouchProgress =
+        network->eyeCrouchProgress;
+    outState->airJumpsRemaining =
+        network->airJumpsRemaining;
+    outState->crouchingRequested =
+        network->crouchingRequested;
+    outState->grounded = network->grounded;
+}
+
+static bool ReconcileLocalPlayer(
+    ApplicationState* application,
+    const NetworkPlayerState* network)
+{
+    if (!application->networkPhysicsInitialized)
+        ResetNetworkPhysics(application);
+
+    PlayerControllerState authoritative;
+    BuildPlayerControllerState(network, &authoritative);
+    PlayerCollisionSource collision =
+        CreatePlayerCollisionSource(application->world);
+    uint32_t replayed = 0U;
+    PlayerPredictionReconcileResult result =
+        PlayerPredictionHistoryReconcile(
+            &application->networkPrediction,
+            network->serverTick,
+            network->lastProcessedInputSequence,
+            &authoritative, &application->player,
+            &collision, &application->networkPhysicsCamera,
+            NETWORK_PHYSICS_SUBSTEPS, &replayed);
+    (void)replayed;
+
+    if (result == PLAYER_PREDICTION_RECONCILE_STALE)
+        return true;
+    if (result ==
+        PLAYER_PREDICTION_RECONCILE_HISTORY_MISS)
+    {
+        // The server acknowledgement fell outside the bounded 256-command
+        // window. Exact replay is no longer possible, so restore atomically
+        // and begin a fresh bounded history.
+        if (!PlayerControllerRestoreState(
+                &application->player,
+                &application->networkPhysicsCamera,
+                &authoritative))
+            return false;
+        PlayerPredictionHistoryInit(
+            &application->networkPrediction);
+    }
+    else if (result !=
+        PLAYER_PREDICTION_RECONCILE_APPLIED)
+    {
+        return false;
+    }
+
+    double correctionSquared = 0.0;
+    double correction[3];
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        correction[axis] = application->camera.position[axis] -
+            application->networkPhysicsCamera.position[axis];
+        correctionSquared +=
+            correction[axis] * correction[axis];
+    }
+    if (correctionSquared >
+        NETWORK_VISUAL_SNAP_DISTANCE *
+            NETWORK_VISUAL_SNAP_DISTANCE)
+    {
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            application->networkVisualCorrection[axis] = 0.0;
+            application->camera.position[axis] =
+                application->networkPhysicsCamera.position[axis];
+        }
+    }
+    else
+    {
+        memcpy(application->networkVisualCorrection,
+            correction,
+            sizeof(application->networkVisualCorrection));
+    }
+    memcpy(application->networkPreviousPhysicsPosition,
+        application->networkPhysicsCamera.position,
+        sizeof(application->networkPreviousPhysicsPosition));
+    application->networkHasSnapshot = true;
+    return true;
 }
 
 static bool CompleteNetworkReady(ApplicationState* application)
@@ -1342,10 +1740,9 @@ static bool CompleteNetworkReady(ApplicationState* application)
     if (application->networkGameplayActivated) return true;
     application->networkGameplayActivated = true;
     application->gameMode = GAME_MODE_WALK;
-    memset(&application->networkPendingInput, 0,
-        sizeof(application->networkPendingInput));
-    PlayerControllerReset(
-        &application->player, &application->camera);
+    application->networkPendingJumpPressed = false;
+    if (!application->networkPhysicsInitialized)
+        ResetNetworkPhysics(application);
     application->menu.networkConnecting = false;
     application->sessionActive = true;
     application->mouseLookBeforeMenu = true;
@@ -1433,8 +1830,11 @@ static void PumpNetwork(ApplicationState* application)
         else if (event.type == NETWORK_CLIENT_EVENT_SNAPSHOT_END)
         {
             if (!FinishNetworkSnapshot(
-                    application, &event.data.snapshot))
+                    application, &event.data.snapshot) ||
+                !CompleteNetworkReady(application))
+            {
                 destroyClient = true;
+            }
         }
         else if (event.type == NETWORK_CLIENT_EVENT_READY)
         {
@@ -1500,36 +1900,13 @@ static void PumpNetwork(ApplicationState* application)
             }
             else
             {
-                double errorSquared = 0.0;
-                for (int32_t axis = 0; axis < 3; ++axis)
-                {
-                    double error = event.data.playerState.position[axis]
-                        - application->camera.position[axis];
-                    errorSquared += error * error;
-                }
-                bool hardCorrection = !application->networkHasSnapshot
-                    || errorSquared > 16.0;
-                for (int32_t axis = 0; axis < 3; ++axis)
-                {
-                    double authoritative =
-                        event.data.playerState.position[axis];
-                    application->camera.position[axis] = hardCorrection
-                        ? authoritative
-                        : application->camera.position[axis]
-                            + (authoritative
-                                - application->camera.position[axis])
-                                * 0.25;
-                }
-                application->camera.yaw =
-                    event.data.playerState.yaw;
-                application->camera.pitch =
-                    event.data.playerState.pitch;
-                if (hardCorrection)
-                {
-                    PlayerControllerReset(
-                        &application->player, &application->camera);
-                }
-                application->networkHasSnapshot = true;
+                // The local view angles remain client-owned. Position and
+                // controller dynamics are restored at the acknowledged input
+                // and every newer canonical command is replayed.
+                if (!ReconcileLocalPlayer(
+                        application,
+                        &event.data.playerState))
+                    destroyClient = true;
             }
         }
         else if (event.type == NETWORK_CLIENT_EVENT_BLOCK_DELTA
@@ -1831,13 +2208,16 @@ static void OnFrame(void* userData)
     }
 
     double currentTimeSeconds = PlatformTimeSeconds();
-    float deltaSeconds = (float)(
-        currentTimeSeconds - application->previousTimeSeconds);
+    double simulationDeltaSeconds =
+        currentTimeSeconds - application->previousTimeSeconds;
     application->previousTimeSeconds = currentTimeSeconds;
-    if (deltaSeconds > 0.1f)
+    if (simulationDeltaSeconds > 0.1)
     {
-        deltaSeconds = 0.1f;
+        simulationDeltaSeconds = 0.1;
     }
+    if (simulationDeltaSeconds < 0.0)
+        simulationDeltaSeconds = 0.0;
+    float deltaSeconds = (float)simulationDeltaSeconds;
     UpdateRemotePlayers(application, deltaSeconds);
 
     bool mouseLookEnabled =
@@ -1853,10 +2233,18 @@ static void OnFrame(void* userData)
     bool gameplayActive = application->sessionActive && !menuOpen
         && !application->inventoryOpen
         && (!application->networkSession || application->networkReady);
-    if (gameplayActive)
+    if (application->networkSession &&
+        application->sessionActive &&
+        application->networkReady)
     {
         UpdatePlayer(application,
-            deltaSeconds, mouseDeltaX, mouseDeltaY);
+            simulationDeltaSeconds, mouseDeltaX, mouseDeltaY,
+            gameplayActive);
+    }
+    else if (gameplayActive)
+    {
+        UpdatePlayer(application,
+            simulationDeltaSeconds, mouseDeltaX, mouseDeltaY, true);
     }
     if (application->networkSession && application->sessionActive)
     {
@@ -2173,6 +2561,14 @@ static void OnFrame(void* userData)
         frameSetup.gamma = (float)application->settings.gamma * 0.01f;
     }
 
+    if (application->networkSession)
+    {
+        // Queue a retryable shared avatar mesh upload before the frame.
+        RemotePlayerRendererEnsure(
+            &application->remotePlayerRenderer,
+            application->renderer);
+    }
+
     if (RendererBeginFrame(application->renderer, &frameSetup))
     {
         for (uint32_t pass = 0; pass < frameSetup.passCount; ++pass)
@@ -2181,6 +2577,10 @@ static void OnFrame(void* userData)
             ChunkStreamingDraw(application->chunkStreaming,
                 frameSetup.passes[pass].viewProjection,
                 cameraBlockPosition);
+            if (application->networkSession)
+            {
+                DrawRemotePlayers(application, cameraBlockPosition);
+            }
             if (application->gameMode == GAME_MODE_SURVIVAL)
             {
                 BlockEffectsDraw(&application->blockEffects,

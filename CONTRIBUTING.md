@@ -92,6 +92,21 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
   вызываются на main thread, send-buffer живёт до `SEND_COMPLETE`, а overflow
   закрывает только виновного peer.
 - Fixed tick не содержит allocation, I/O и покадрового logging.
+- Network physics исполняется только как 60 Гц canonical input и четыре
+  целых substep; render `deltaSeconds` не попадает в authoritative simulation
+  или replay.
+- Монотонное время и fixed-step accumulator остаются `double`; сужение до
+  `float` допустимо только после simulation boundary. Изменение scheduler
+  проверяется как минимум при 30/60/144 FPS.
+- Reconciliation сначала атомарно восстанавливает полный server state, затем
+  повторяет неподтверждённые команды. Visual correction не меняет collision
+  position, а freshness и remote interpolation опираются на wrap-safe
+  `serverTick`; новый tick нельзя отбрасывать только из-за неизменившегося
+  input acknowledgement.
+- Physics-changing моды сетевой сессии исполняются server-authoritative;
+  remote client не получает mutable `PlayerController` и не может применять
+  `setBlock` прямо к локальной копии мира. Серверная мутация блока обязана
+  увеличить authoritative revision и реплицироваться заинтересованным peers.
 - Оптимизация горячего пути требует повторяемого замера до и после.
 
 ## Безопасность
@@ -128,6 +143,9 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
 - Исправление ошибки получает минимальный regression test, который падает до
   исправления. Изменение wire/disk/SDK layout получает golden/round-trip
   проверку.
+- Изменение physics formula, input quantization/sequence, authoritative state
+  или tick/interpolation policy получает determinism и
+  prediction/reconciliation regression test.
 - Перед отправкой запускайте наиболее узкую релевантную проверку, затем
   platform build/CTest. Не маскируйте предупреждения глобальным отключением.
 - `src/render/generated/*.h` — checked-in fallback. Обычная сборка генерирует
@@ -150,6 +168,7 @@ Ninja в `PATH` и запускается из x64 VS Developer PowerShell/Comma
 - [архитектура](docs/architecture.md)
 - [переносимость](docs/portability.md)
 - [мультиплеер](docs/multiplayer.md)
+- [физика и сетевая репликация](docs/physics.md)
 - [secure server](docs/secure_server.md)
 - [форматы](docs/content_formats.md)
 - [шейдеры](docs/shaderpacks.md)

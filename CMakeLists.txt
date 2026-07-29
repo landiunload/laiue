@@ -95,6 +95,12 @@ endif()
 if(LAIUE_BUILD_SERVER)
     add_executable(laiue_server
         src/server/main.c
+        src/server/player_input_queue.c
+        src/server/player_input_queue.h
+        src/server/server_tick_clock.c
+        src/server/server_tick_clock.h
+        src/server/snapshot_scheduler.c
+        src/server/snapshot_scheduler.h
         src/server/server_config.c
         src/server/server_config.h)
     target_link_libraries(laiue_server PRIVATE
@@ -421,6 +427,17 @@ if(LAIUE_BUILD_SERVER)
         laiue_server_bundle server Server)
     add_dependencies(laiue_server_bundle
         laiue_server laiue_server_content_files)
+    if(UNIX)
+        string(CONCAT _laiue_server_archive
+            "${CMAKE_BINARY_DIR}/packages/$<CONFIG>/"
+            "laiue-linux-x86_64-${LAIUE_LINUX_LIBC}.tar.gz")
+        add_custom_target(laiue_server_archive
+            COMMAND sh "${PROJECT_SOURCE_DIR}/tools/package_linux_server.sh"
+                "${CMAKE_BINARY_DIR}/bundles/server/$<CONFIG>"
+                "${_laiue_server_archive}"
+            VERBATIM)
+        add_dependencies(laiue_server_archive laiue_server_bundle)
+    endif()
 endif()
 laiue_add_component_bundle(
     laiue_modsdk_bundle mod-sdk ModSDK)
@@ -436,6 +453,9 @@ if(TARGET laiue_client_bundle)
 endif()
 if(TARGET laiue_server_bundle)
     add_dependencies(laiue_distribution laiue_server_bundle)
+endif()
+if(TARGET laiue_server_archive)
+    add_dependencies(laiue_distribution laiue_server_archive)
 endif()
 
 set(CPACK_PACKAGE_NAME "laiue")

@@ -6,6 +6,12 @@
 #include <string.h>
 
 #define PLAYER_PENETRATION_STEPS 256u
+#define PLAYER_STATE_POSITION_LIMIT 1099511627776.0
+#define PLAYER_STATE_VELOCITY_LIMIT 1048576.0
+#define PLAYER_STATE_TIMER_LIMIT 3600.0
+#define PLAYER_STATE_AIR_JUMP_LIMIT 4096
+#define PLAYER_STATE_TIMER_EPSILON 1e-9
+#define PLAYER_CANONICAL_VELOCITY_EPSILON 1e-12
 
 
 static VoxelBodyShape ActiveShape(const PlayerController* controller)
@@ -13,17 +19,60 @@ static VoxelBodyShape ActiveShape(const PlayerController* controller)
     return PlayerStanceGetShape(&controller->stance);
 }
 
+static double CanonicalVelocity(double value)
+{
+    return value > -PLAYER_CANONICAL_VELOCITY_EPSILON
+            && value < PLAYER_CANONICAL_VELOCITY_EPSILON
+        ? 0.0 : value;
+}
+
+static bool IsFiniteBounded(double value, double limit)
+{
+    return value == value && value >= -limit && value <= limit;
+}
+
+static bool SnapDownToGround(const PlayerController* controller,
+    const PlayerCollisionSource* collision, Camera* camera,
+    const VoxelBodyShape* shape)
+{
+    double probeDepth = controller->config.groundProbeDepth;
+    if (probeDepth <= 0.0)
+    {
+        return false;
+    }
+
+    double originalZ = camera->position[2];
+    if (VoxelBodyMoveAxis(collision, camera->position,
+            shape, 2, -probeDepth))
+    {
+        return true;
+    }
+
+    // Query и sweep используют один collision view, поэтому штатно этот
+    // путь недостижим. Сохраняем atomic semantics даже для ошибочного
+    // callback, изменившего мир между запросами.
+    camera->position[2] = originalZ;
+    return false;
+}
+
 static void RefreshGroundState(PlayerController* controller,
-    const PlayerCollisionSource* collision, const Camera* camera,
+    const PlayerCollisionSource* collision, Camera* camera,
     double stepSeconds, VoxelGroundContact* outContact)
 {
     VoxelBodyShape shape = ActiveShape(controller);
     VoxelBodyQueryGroundContact(collision, camera->position,
         &shape, controller->config.groundProbeDepth, outContact);
+
+    // Probe только обнаруживает поверхность. Падающее тело становится
+    // grounded лишь после детерминированного sweep к реальному контакту:
+    // иначе оно могло навсегда зависнуть в пределах groundProbeDepth.
+    bool supported = outContact->supported
+        && controller->jump.verticalVelocity <= 0.0
+        && SnapDownToGround(controller, collision, camera, &shape);
+    outContact->supported = supported;
     PlayerJumpObserveGround(
-        &controller->jump, outContact->supported, stepSeconds);
-    controller->grounded = outContact->supported
-        && controller->jump.verticalVelocity <= 0.0;
+        &controller->jump, supported, stepSeconds);
+    controller->grounded = supported;
 }
 
 static bool TryLaunchQueuedJump(PlayerController* controller,
@@ -146,7 +195,19 @@ static void IntegrateVertical(PlayerController* controller,
     if (controller->grounded
         && controller->jump.verticalVelocity == 0.0)
     {
-        return;
+        // Horizontal movement или внешний импульс могли увести тело с края
+        // уже после начального ground probe. Повторная проверка одновременно
+        // даёт bounded ground snap и запускает падение в том же substep.
+        VoxelBodyShape shape = ActiveShape(controller);
+        VoxelGroundContact contact;
+        VoxelBodyQueryGroundContact(collision, camera->position,
+            &shape, controller->config.groundProbeDepth, &contact);
+        if (contact.supported
+            && SnapDownToGround(controller, collision, camera, &shape))
+        {
+            return;
+        }
+        controller->grounded = false;
     }
 
     double gravity = controller->jump.config.gravity;
@@ -264,6 +325,17 @@ static void SimulateStep(PlayerController* controller,
     {
         PlayerJumpAgeBuffer(&controller->jump, stepSeconds);
     }
+
+    controller->locomotion.velocityX =
+        CanonicalVelocity(controller->locomotion.velocityX);
+    controller->locomotion.velocityY =
+        CanonicalVelocity(controller->locomotion.velocityY);
+    controller->externalVelocityX =
+        CanonicalVelocity(controller->externalVelocityX);
+    controller->externalVelocityY =
+        CanonicalVelocity(controller->externalVelocityY);
+    controller->jump.verticalVelocity =
+        CanonicalVelocity(controller->jump.verticalVelocity);
 }
 
 void PlayerControllerInit(PlayerController* controller,
@@ -319,18 +391,8 @@ void PlayerControllerReset(PlayerController* controller, Camera* camera)
 
 bool PlayerControllerUpdate(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    const PlayerControllerCommand* command, float deltaSeconds)
+    const PlayerControllerCommand* command, double deltaSeconds)
 {
-    bool presentationChanged = PlayerStanceSetCrouching(
-        &controller->stance, command->crouchHeld);
-
-    // Нажатие не теряется между render-кадрами, но сам запуск
-    // выполняется в fixed-step после текущего шага разгона.
-    if (command->jumpPressed)
-    {
-        PlayerJumpQueue(&controller->jump);
-    }
-
     double fixedStep = controller->config.fixedStepSeconds;
     if (fixedStep <= 0.0)
     {
@@ -352,18 +414,168 @@ bool PlayerControllerUpdate(PlayerController* controller,
         controller->simulationAccumulator = maximumAccumulator;
     }
 
-    uint32_t substep = 0;
+    uint32_t steps = 0;
     while (controller->simulationAccumulator + 1e-12 >= fixedStep
-        && substep < maximumSubsteps)
+        && steps < maximumSubsteps)
     {
         controller->simulationAccumulator -= fixedStep;
+        ++steps;
+    }
+
+    return PlayerControllerSimulateFixedSteps(controller,
+        collision, camera, command, steps);
+}
+
+bool PlayerControllerSimulateFixedSteps(PlayerController* controller,
+    const PlayerCollisionSource* collision, Camera* camera,
+    const PlayerControllerCommand* command, uint32_t steps)
+{
+    bool presentationChanged = PlayerStanceSetCrouching(
+        &controller->stance, command->crouchHeld);
+
+    // Edge принимается ровно один раз на command, даже если command
+    // исполняется четырьмя physics substeps серверного тика.
+    if (command->jumpPressed)
+    {
+        PlayerJumpQueue(&controller->jump);
+    }
+
+    double fixedStep = controller->config.fixedStepSeconds;
+    if (fixedStep <= 0.0)
+    {
+        fixedStep = 1.0 / 240.0;
+    }
+    for (uint32_t step = 0; step < steps; ++step)
+    {
         SimulateStep(controller,
             collision, camera, command, fixedStep,
             &presentationChanged);
-        ++substep;
+    }
+    return presentationChanged;
+}
+
+void PlayerControllerCaptureState(const PlayerController* controller,
+    const Camera* camera, PlayerControllerState* outState)
+{
+    outState->position[0] = camera->position[0];
+    outState->position[1] = camera->position[1];
+    outState->position[2] = camera->position[2];
+    outState->locomotionVelocityX = controller->locomotion.velocityX;
+    outState->locomotionVelocityY = controller->locomotion.velocityY;
+    outState->verticalVelocity = controller->jump.verticalVelocity;
+    outState->externalVelocityX = controller->externalVelocityX;
+    outState->externalVelocityY = controller->externalVelocityY;
+    outState->jumpBufferRemaining = controller->jump.jumpBufferRemaining;
+    outState->coyoteTimeRemaining = controller->jump.coyoteTimeRemaining;
+    outState->colliderCrouchProgress =
+        controller->stance.colliderCrouchProgress;
+    outState->eyeCrouchProgress = controller->stance.eyeCrouchProgress;
+    outState->airJumpsRemaining = controller->jump.airJumpsRemaining;
+    outState->crouchingRequested = controller->stance.crouchingRequested;
+    outState->grounded = controller->grounded;
+}
+
+bool PlayerControllerRestoreState(PlayerController* controller,
+    Camera* camera, const PlayerControllerState* state)
+{
+    for (uint32_t axis = 0; axis < 3u; ++axis)
+    {
+        if (!IsFiniteBounded(
+                state->position[axis], PLAYER_STATE_POSITION_LIMIT))
+        {
+            return false;
+        }
     }
 
-    return presentationChanged;
+    const double velocities[] = {
+        state->locomotionVelocityX,
+        state->locomotionVelocityY,
+        state->verticalVelocity,
+        state->externalVelocityX,
+        state->externalVelocityY,
+    };
+    for (uint32_t index = 0;
+        index < sizeof(velocities) / sizeof(velocities[0]); ++index)
+    {
+        if (!IsFiniteBounded(
+                velocities[index], PLAYER_STATE_VELOCITY_LIMIT))
+        {
+            return false;
+        }
+    }
+
+    double maximumJumpBuffer = controller->jump.config.jumpBufferSeconds;
+    double maximumCoyoteTime = controller->jump.config.coyoteTimeSeconds;
+    if (!IsFiniteBounded(maximumJumpBuffer, PLAYER_STATE_TIMER_LIMIT)
+        || !IsFiniteBounded(maximumCoyoteTime, PLAYER_STATE_TIMER_LIMIT))
+    {
+        return false;
+    }
+    if (maximumJumpBuffer < 0.0) maximumJumpBuffer = 0.0;
+    if (maximumCoyoteTime < 0.0) maximumCoyoteTime = 0.0;
+    if (!IsFiniteBounded(
+            state->jumpBufferRemaining, PLAYER_STATE_TIMER_LIMIT)
+        || state->jumpBufferRemaining
+            > maximumJumpBuffer + PLAYER_STATE_TIMER_EPSILON
+        || state->jumpBufferRemaining < 0.0
+        || !IsFiniteBounded(
+            state->coyoteTimeRemaining, PLAYER_STATE_TIMER_LIMIT)
+        || state->coyoteTimeRemaining
+            > maximumCoyoteTime + PLAYER_STATE_TIMER_EPSILON
+        || state->coyoteTimeRemaining < 0.0
+        || !IsFiniteBounded(state->colliderCrouchProgress, 1.0)
+        || state->colliderCrouchProgress < 0.0
+        || !IsFiniteBounded(state->eyeCrouchProgress, 1.0)
+        || state->eyeCrouchProgress < 0.0)
+    {
+        return false;
+    }
+
+    int32_t maximumAirJumps = controller->jump.config.extraAirJumps;
+    if (maximumAirJumps < 0) maximumAirJumps = 0;
+    if (maximumAirJumps > PLAYER_STATE_AIR_JUMP_LIMIT)
+    {
+        maximumAirJumps = PLAYER_STATE_AIR_JUMP_LIMIT;
+    }
+    if (state->airJumpsRemaining < 0
+        || state->airJumpsRemaining > maximumAirJumps
+        || (state->grounded
+            && state->verticalVelocity
+                > PLAYER_CANONICAL_VELOCITY_EPSILON))
+    {
+        return false;
+    }
+
+    camera->position[0] = state->position[0];
+    camera->position[1] = state->position[1];
+    camera->position[2] = state->position[2];
+    controller->locomotion.velocityX =
+        CanonicalVelocity(state->locomotionVelocityX);
+    controller->locomotion.velocityY =
+        CanonicalVelocity(state->locomotionVelocityY);
+    controller->jump.verticalVelocity =
+        CanonicalVelocity(state->verticalVelocity);
+    controller->externalVelocityX =
+        CanonicalVelocity(state->externalVelocityX);
+    controller->externalVelocityY =
+        CanonicalVelocity(state->externalVelocityY);
+    controller->jump.jumpBufferRemaining =
+        state->jumpBufferRemaining == 0.0
+        ? 0.0 : state->jumpBufferRemaining;
+    controller->jump.coyoteTimeRemaining =
+        state->coyoteTimeRemaining == 0.0
+        ? 0.0 : state->coyoteTimeRemaining;
+    controller->stance.colliderCrouchProgress =
+        state->colliderCrouchProgress == 0.0
+        ? 0.0 : state->colliderCrouchProgress;
+    controller->stance.eyeCrouchProgress =
+        state->eyeCrouchProgress == 0.0
+        ? 0.0 : state->eyeCrouchProgress;
+    controller->jump.airJumpsRemaining = state->airJumpsRemaining;
+    controller->stance.crouchingRequested = state->crouchingRequested;
+    controller->grounded = state->grounded;
+    controller->simulationAccumulator = 0.0;
+    return true;
 }
 
 bool PlayerControllerResolvePenetration(PlayerController* controller,
@@ -443,7 +655,7 @@ void PlayerControllerGetDefaultConfig(PlayerControllerConfig* outConfig)
         .jumpBufferSeconds = 0.14f,
         .coyoteTimeSeconds = 0.10f,
         .externalVelocityDamping = 8.0f,
-        .fixedStepSeconds = 1.0f / 240.0f,
+        .fixedStepSeconds = 1.0 / 240.0,
         .maximumSubsteps = 32u,
         .jumpHeight = 1.275,
         .radius = 0.30,

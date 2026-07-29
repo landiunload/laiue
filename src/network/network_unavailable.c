@@ -149,6 +149,16 @@ bool NetworkServerPollEvent(
     return false;
 }
 
+bool NetworkServerDisconnect(
+    NetworkServer *server, uint32_t peerId,
+    NetworkDisconnectReason reason)
+{
+    (void)server;
+    (void)peerId;
+    (void)reason;
+    return false;
+}
+
 bool NetworkServerBroadcastPlayerState(
     NetworkServer *server, const NetworkPlayerState *state)
 {
@@ -182,6 +192,16 @@ bool NetworkServerBroadcastBlockDelta(
 {
     (void)server;
     (void)delta;
+    return false;
+}
+
+bool NetworkServerCanBeginSnapshot(
+    NetworkServer *server, uint32_t peerId,
+    bool requiresReadyBarrier)
+{
+    (void)server;
+    (void)peerId;
+    (void)requiresReadyBarrier;
     return false;
 }
 

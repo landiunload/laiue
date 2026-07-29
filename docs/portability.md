@@ -91,7 +91,7 @@ bootstrap-последовательность находится в Debian job
 ```sh
 export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
 cmake --preset linux-gcc
-cmake --build --preset linux-gcc-release --target laiue_server_bundle
+cmake --build --preset linux-gcc-release --target laiue_server_archive
 ctest --preset linux-gcc-release
 ```
 
@@ -114,7 +114,7 @@ musl-сборку MsQuic/OpenSSL:
 ```sh
 cmake --preset linux-musl \
   -DLAIUE_MSQUIC_ROOT=/opt/msquic-musl
-cmake --build --preset linux-musl-release --target laiue_server_bundle
+cmake --build --preset linux-musl-release --target laiue_server_archive
 ctest --preset linux-musl-release
 ```
 
@@ -130,6 +130,7 @@ keys всегда содержат ABI: `linux-x86_64-gnu` или `linux-x86_64-
 
 - `laiue_client_bundle` — Windows client и runtime assets;
 - `laiue_server_bundle` — сервер и общий headless runtime;
+- `laiue_server_archive` — Linux tar.gz и соседний файл SHA-256;
 - `laiue_distribution` — все включённые компоненты и SDK examples.
 
 Bundle-цели очищают и заполняют независимые staging-каталоги
@@ -150,6 +151,10 @@ Windows package — ZIP, Linux package — TGZ. Shared libraries лежат ря
 `LD_LIBRARY_PATH` в release package. `tools/smoke_linux_server.sh` проверяет
 RUNPATH/runtime dependencies и запускает IPv4, IPv6 и dual listeners с
 временным сертификатом (IPv6 пропускается только когда его отключил runner).
+`laiue_server_archive` дополнительно нормализует modes через Linux-native
+временный каталог: каталоги и исполняемые файлы получают `0755`, обычные
+файлы — `0644`. Поэтому archive безопасен даже при build tree на drvfs или
+другой файловой системе без Unix permission metadata.
 
 glibc bundle содержит выбранную `libmsquic.so` symlink chain, но не копирует
 системные библиотеки Debian. На чистом Debian 13 до запуска установите

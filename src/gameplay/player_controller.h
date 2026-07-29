@@ -26,7 +26,10 @@ typedef struct PlayerControllerConfig
     float jumpBufferSeconds;
     float coyoteTimeSeconds;
     float externalVelocityDamping;
-    float fixedStepSeconds;
+    // Time is accumulated in double precision. Keeping the canonical
+    // 1/240 value as float makes common render partitions (notably 30 and
+    // 144 FPS) occasionally produce one substep too few.
+    double fixedStepSeconds;
     uint32_t maximumSubsteps;
     double jumpHeight;
     double radius;
@@ -66,6 +69,27 @@ typedef struct PlayerController
     bool grounded;
 } PlayerController;
 
+// Полный изменяемый результат fixed-step симуляции. Конфигурация в snapshot
+// не входит: обе стороны соединения обязаны заранее согласовать один physics
+// contract. Положение хранится вместе с внутренними скоростями и таймерами,
+// поэтому состояние можно безопасно восстановить перед replay ввода.
+typedef struct PlayerControllerState
+{
+    double position[3];
+    double locomotionVelocityX;
+    double locomotionVelocityY;
+    double verticalVelocity;
+    double externalVelocityX;
+    double externalVelocityY;
+    double jumpBufferRemaining;
+    double coyoteTimeRemaining;
+    double colliderCrouchProgress;
+    double eyeCrouchProgress;
+    int32_t airJumpsRemaining;
+    bool crouchingRequested;
+    bool grounded;
+} PlayerControllerState;
+
 // Единственный источник базовых правил движения для клиента и dedicated
 // server. Вызывающая сторона может изменить копию до PlayerControllerInit.
 LAIUE_GAMEPLAY_API void PlayerControllerGetDefaultConfig(
@@ -80,7 +104,27 @@ LAIUE_GAMEPLAY_API void PlayerControllerReset(
 LAIUE_GAMEPLAY_API bool PlayerControllerUpdate(
     PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
-    const PlayerControllerCommand* command, float deltaSeconds);
+    const PlayerControllerCommand* command, double deltaSeconds);
+
+// Исполняет ровно steps одинаковых fixed substeps. Эта функция не читает и
+// не изменяет frame accumulator: сервер и prediction replay используют её с
+// целым числом шагов. Edge-событие jumpPressed и запрос стойки принимаются
+// один раз на команду, а held-флаги действуют на каждом substep.
+LAIUE_GAMEPLAY_API bool PlayerControllerSimulateFixedSteps(
+    PlayerController* controller,
+    const PlayerCollisionSource* collision, Camera* camera,
+    const PlayerControllerCommand* command, uint32_t steps);
+
+LAIUE_GAMEPLAY_API void PlayerControllerCaptureState(
+    const PlayerController* controller, const Camera* camera,
+    PlayerControllerState* outState);
+
+// Проверяет snapshot целиком до изменения controller/camera. Неконечные и
+// выходящие за безопасные границы значения отклоняются; accumulator после
+// успешного authoritative restore всегда равен нулю.
+LAIUE_GAMEPLAY_API bool PlayerControllerRestoreState(
+    PlayerController* controller, Camera* camera,
+    const PlayerControllerState* state);
 
 LAIUE_GAMEPLAY_API bool PlayerControllerResolvePenetration(
     PlayerController* controller,

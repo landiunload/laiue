@@ -119,6 +119,39 @@ LAIUE_TEST_ENTRY(WorldSnapshotTestEntryPoint)
             blockB[0], blockB[1], blockB[2]) == generatedB,
         "пустой resync не восстановил базовый terrain");
 
+    // QUIC control и snapshot streams могут доставляться независимо:
+    // delta R+1 имеет право прийти раньше snapshot chunk R. Старый chunk
+    // должен считаться обработанным, не откатывая ни данные, ни revision.
+    const uint64_t snapshotChunkRevision =
+        WorldGetChunkRevision(client, chunkA);
+    WorldSetBlock(client,
+        blockA[0], blockA[1], blockA[2], changedA);
+    SnapshotExpect(WorldGetChunkRevision(client, chunkA)
+            == snapshotChunkRevision + 1U
+        && WorldGetBlock(client,
+            blockA[0], blockA[1], blockA[2]) == changedA,
+        "live delta R+1 не подготовлена");
+    const WorldChunkDelta staleSnapshotDeltas[1] = {
+        {
+            .localIndex =
+                (uint32_t)blockB[0] * CHUNK_SIZE * CHUNK_SIZE
+                + (uint32_t)blockB[1] * CHUNK_SIZE
+                + (uint32_t)(blockB[2] % CHUNK_SIZE),
+            .block = changedB,
+        },
+    };
+    SnapshotExpect(WorldReplaceChunkDeltas(client, chunkA,
+            staleSnapshotDeltas, 1, snapshotChunkRevision,
+            WorldGetRevision(client)),
+        "старый snapshot chunk должен безопасно подтверждаться");
+    SnapshotExpect(WorldGetChunkRevision(client, chunkA)
+            == snapshotChunkRevision + 1U
+        && WorldGetBlock(client,
+            blockA[0], blockA[1], blockA[2]) == changedA
+        && WorldGetBlock(client,
+            blockB[0], blockB[1], blockB[2]) == generatedB,
+        "snapshot R откатил уже применённую delta R+1");
+
     WorldDestroy(client);
     WorldDestroy(server);
     LaiueTestRuntimeWrite("World snapshot/revision: OK\r\n");

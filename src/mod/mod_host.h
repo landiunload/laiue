@@ -29,6 +29,19 @@
 #define MOD_HOST_FIXED_STEP_SECONDS (1.0f / 60.0f)
 #define MOD_HOST_MAX_FIXED_STEPS_PER_FRAME 5
 
+// Политика записи мира через LaiueModApi::setBlock. Значение по умолчанию
+// (DENY) намеренно fail-closed: remote-клиент не может превратить локальную
+// копию мира в источник неавторитетных изменений.
+typedef enum ModHostBlockMutationPolicy
+{
+    MOD_HOST_BLOCK_MUTATION_DENY = 0,
+    MOD_HOST_BLOCK_MUTATION_LOCAL,
+    MOD_HOST_BLOCK_MUTATION_CALLBACK,
+} ModHostBlockMutationPolicy;
+
+typedef bool (*ModHostBlockMutationCallback)(
+    void *context, int64_t x, int64_t y, int64_t z, uint8_t block);
+
 // Указатели на подсистемы, которыми пользуется таблица API.
 typedef struct ModHostBindings
 {
@@ -38,6 +51,11 @@ typedef struct ModHostBindings
     GameMode *gameMode;
     float *timeOfDayHours; // игровое время суток, 0..24
     ModSide runtimeSide;
+    ModHostBlockMutationPolicy blockMutationPolicy;
+    void *blockMutationContext;
+    // CALLBACK полностью отвечает за авторитетную запись и репликацию.
+    // Хост вызывает invalidateBlock только после успешного callback.
+    ModHostBlockMutationCallback mutateBlock;
     void *invalidateContext;
     void (*invalidateBlock)(void *context, int64_t x, int64_t y, int64_t z);
     void *viewContext;

@@ -13,6 +13,9 @@
 - сервер владеет блоками, revisions чанков, инвентарём, дропами и подбором
   предметов.
 
+Канонический контракт fixed tick, input sequence, prediction/replay и
+интерполяции описан в [physics.md](physics.md).
+
 Соединение проходит состояния `CONNECTING`, `VERIFYING_SERVER`,
 `NEGOTIATING`, `SYNCING_WORLD`, `READY`. Gameplay input принимается только в
 `READY`: сначала завершается TLS 1-RTT, затем сравниваются моды и передаются
@@ -91,9 +94,16 @@ manifest v2 и все объявленные Windows/glibc/musl binaries.
 вызывает bounded chunk resync. Клиент удалённой сессии не читает и не
 перезаписывает локальный world save.
 
-Roster синхронизируется событиями player joined/left, а player states
-интерполируются между серверными обновлениями. Inventory и active drops
-передаются до `READY` и далее меняются только server-authoritative событиями.
+Только initial snapshot использует READY barrier. Live interest-window и
+chunk-resync snapshots применяются без выхода из `READY`, поэтому input и
+60 Гц prediction не останавливаются при переходе между чанками.
+
+Roster синхронизируется событиями player joined/left. Собственное полное
+player state подтверждает последний обработанный input sequence и запускает
+restore/replay, а состояния удалённых игроков интерполируются по
+`serverTick` и реально используются общим инстанс-рендерером. Inventory и
+active drops передаются до `READY` и далее меняются только
+server-authoritative событиями.
 
 ## Загрузка содержимого
 
@@ -112,17 +122,20 @@ SHA-256 подтверждает целостность полученного �
 
 | Состояние | Владелец и проверка |
 |---|---|
-| позиция и скорость | сервер; клиент их не присылает |
-| движение | серверная fixed-step физика; клиент присылает кнопки и взгляд |
+| позиция и скорость | сервер; полный state подтверждает обработанный input |
+| движение | 60 Гц, 4 substep; клиент присылает канонический intent с sequence |
 | ломание/установка | серверный raycast, дистанция, таймер, выбранный слот |
 | инвентарь и дропы | сервер; bounded снимок 36 слотов |
-| моды | точный ordered fingerprint до допуска |
+| моды | точный fingerprint; world mutation только через server callback |
 | wire-поток | magic, version, exact size, sequence, state и rate limits |
 
 Обычный payload ограничен 1024 байтами, chunk snapshot — 128 правками, весь
 snapshot — 4096 чанками. Ограничены streams, callback/event queues,
 outstanding sends и число peer. Неверный размер, NaN/Infinity, повтор
 sequence, сообщение не в той фазе или overflow закрывают виновное соединение.
+Server input FIFO и client prediction history ограничены 256 командами;
+точные значения interpolation/catch-up budgets приведены в
+[physics.md](physics.md).
 
 ## Безопасность сборки
 
@@ -140,5 +153,7 @@ DEP/NX сохранены. Linux CI дополнительно использу�
   сохраняется как постоянный profile.
 - QUIC datagrams и 0-RTT отключены; control/gameplay используют один
   bidirectional stream, snapshots/content — server-initiated streams.
+- Reliable player-state stream может испытывать head-of-line delay; remote
+  interpolation ограничивает видимый jitter, но не заменяет разрыв связи.
 - Для публичного сервера всё равно нужны обновления ОС/MsQuic, rate limiting
   на периметре, мониторинг и резервные копии.

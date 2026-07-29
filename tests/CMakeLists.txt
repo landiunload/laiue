@@ -36,6 +36,22 @@ if(WIN32 AND TARGET laiue_audio)
     set_tests_properties(laiue.audio.api PROPERTIES SKIP_RETURN_CODE 125)
 endif()
 
+if(TARGET laiue_input AND TARGET laiue_network)
+    add_executable(laiue_player_command_mapper_test
+        player_command_mapper_test.c
+        ../src/core/player_command_mapper.c
+        ../src/core/math.c)
+    target_link_libraries(laiue_player_command_mapper_test PRIVATE
+        laiue_input
+        laiue_network)
+    laiue_configure_portable_test(
+        laiue_player_command_mapper_test
+        PlayerCommandMapperTestEntryPoint)
+
+    add_test(NAME laiue.player.command_mapper
+        COMMAND laiue_player_command_mapper_test)
+endif()
+
 # protocol.c компилируется в тест напрямую: кодек не экспортируется из
 # laiue_network, и расширять ABI DLL ради проверок нельзя.
 add_executable(laiue_protocol_test
@@ -116,6 +132,36 @@ set_tests_properties(laiue.server.config.invalid_dual PROPERTIES
     ENVIRONMENT
         "LAIUE_TEST_CASE=invalid-dual;LAIUE_SERVER_ADDRESS_FAMILY=dual;LAIUE_SERVER_LISTEN_ADDRESS=127.0.0.1")
 
+add_executable(laiue_server_input_queue_test
+    server_input_queue_test.c
+    ../src/server/player_input_queue.c)
+laiue_configure_portable_test(
+    laiue_server_input_queue_test
+    ServerInputQueueTestEntryPoint)
+
+add_test(NAME laiue.server.input_queue
+    COMMAND laiue_server_input_queue_test)
+
+add_executable(laiue_server_tick_clock_test
+    server_tick_clock_test.c
+    ../src/server/server_tick_clock.c)
+laiue_configure_portable_test(
+    laiue_server_tick_clock_test
+    ServerTickClockTestEntryPoint)
+
+add_test(NAME laiue.server.tick_clock
+    COMMAND laiue_server_tick_clock_test)
+
+add_executable(laiue_server_snapshot_scheduler_test
+    server_snapshot_scheduler_test.c
+    ../src/server/snapshot_scheduler.c)
+laiue_configure_portable_test(
+    laiue_server_snapshot_scheduler_test
+    ServerSnapshotSchedulerTestEntryPoint)
+
+add_test(NAME laiue.server.snapshot_scheduler
+    COMMAND laiue_server_snapshot_scheduler_test)
+
 # infinite_coord.c компилируется в тест напрямую по той же причине, что и
 # protocol.c: арифметика координат — внутренняя логика laiue_world и наружу
 # не экспортируется.
@@ -133,6 +179,18 @@ laiue_configure_portable_test(
     laiue_world_snapshot_test WorldSnapshotTestEntryPoint)
 
 add_test(NAME laiue.world.snapshot COMMAND laiue_world_snapshot_test)
+
+add_executable(laiue_mod_block_policy_test
+    mod_block_policy_test.c
+    ../src/mod/mod_block_policy.c)
+target_link_libraries(laiue_mod_block_policy_test PRIVATE
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_mod_block_policy_test
+    ModBlockPolicyTestEntryPoint)
+
+add_test(NAME laiue.mod.block_policy
+    COMMAND laiue_mod_block_policy_test)
 
 # Харнесс-доказательство детерминизма физики. Сим-модули компилируются прямо
 # в тест и закреплены за /fp:precise (без FMA-контракции): глобальный /fp:fast
@@ -158,6 +216,18 @@ laiue_configure_portable_test(
     laiue_determinism_test DeterminismTestEntryPoint)
 
 add_test(NAME laiue.physics.determinism COMMAND laiue_determinism_test)
+
+add_executable(laiue_player_replication_test
+    player_replication_test.c)
+target_link_libraries(laiue_player_replication_test PRIVATE
+    laiue_gameplay
+    laiue_physics)
+laiue_configure_portable_test(
+    laiue_player_replication_test
+    PlayerReplicationTestEntryPoint)
+
+add_test(NAME laiue.physics.replication
+    COMMAND laiue_player_replication_test)
 
 # content_format.c компилируется в тест напрямую по той же причине, что
 # protocol.c и infinite_coord.c: правила именования содержимого — внутренний

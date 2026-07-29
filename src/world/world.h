@@ -81,6 +81,8 @@ LAIUE_WORLD_API uint32_t WorldCopyEditedChunkSummaries(
 LAIUE_WORLD_API bool WorldCopyChunkDeltas(
     World* world, const int64_t chunk[3], WorldChunkDelta* output,
     uint32_t capacity, uint32_t* outCount, uint64_t* outChunkRevision);
+// Revision монотонна: snapshot старше уже применённого состояния считается
+// успешно обработанным no-op и не заменяет содержимое чанка.
 LAIUE_WORLD_API bool WorldReplaceChunkDeltas(
     World* world, const int64_t chunk[3], const WorldChunkDelta* deltas,
     uint32_t count, uint64_t chunkRevision, uint64_t worldRevision);

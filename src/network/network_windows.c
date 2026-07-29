@@ -587,11 +587,35 @@ static bool ClientHandleFrame(NetworkClient *client, const LaiueProtocolFrame *f
         event.type = NETWORK_CLIENT_EVENT_PLAYER_STATE;
         event.data.playerState.serverTick = decoded.serverTick;
         event.data.playerState.peerId = decoded.peerId;
+        event.data.playerState.lastProcessedInputSequence =
+            decoded.lastProcessedInputSequence;
         event.data.playerState.position[0] = decoded.position[0];
         event.data.playerState.position[1] = decoded.position[1];
         event.data.playerState.position[2] = decoded.position[2];
         event.data.playerState.yaw = decoded.yaw;
         event.data.playerState.pitch = decoded.pitch;
+        event.data.playerState.locomotionVelocityX =
+            decoded.locomotionVelocityX;
+        event.data.playerState.locomotionVelocityY =
+            decoded.locomotionVelocityY;
+        event.data.playerState.verticalVelocity =
+            decoded.verticalVelocity;
+        event.data.playerState.externalVelocityX =
+            decoded.externalVelocityX;
+        event.data.playerState.externalVelocityY =
+            decoded.externalVelocityY;
+        event.data.playerState.jumpBufferRemaining =
+            decoded.jumpBufferRemaining;
+        event.data.playerState.coyoteTimeRemaining =
+            decoded.coyoteTimeRemaining;
+        event.data.playerState.colliderCrouchProgress =
+            decoded.colliderCrouchProgress;
+        event.data.playerState.eyeCrouchProgress =
+            decoded.eyeCrouchProgress;
+        event.data.playerState.airJumpsRemaining =
+            decoded.airJumpsRemaining;
+        event.data.playerState.crouchingRequested =
+            decoded.crouchingRequested;
         event.data.playerState.grounded = decoded.grounded;
         return ClientPushEvent(client, &event);
     }
@@ -873,6 +897,7 @@ static bool ServerHandleFrame(NetworkServer *server, NetworkServerPeer *peer,
             return false;
         }
         event.type = NETWORK_SERVER_EVENT_INPUT;
+        event.data.input.sequence = decoded.sequence;
         event.data.input.movementX = decoded.movementX;
         event.data.input.movementY = decoded.movementY;
         event.data.input.yaw = decoded.yaw;
@@ -1182,6 +1207,7 @@ bool NetworkClientSendInput(NetworkClient *client, const NetworkInputCommand *in
         return false;
     }
     LaiueProtocolInput protocolInput = {
+        .sequence = input->sequence,
         .movementX = input->movementX,
         .movementY = input->movementY,
         .yaw = input->yaw,
@@ -1460,6 +1486,28 @@ bool NetworkServerPollEvent(NetworkServer *server, NetworkServerEvent *outEvent)
     return true;
 }
 
+bool NetworkServerDisconnect(
+    NetworkServer *server, uint32_t peerId,
+    NetworkDisconnectReason reason)
+{
+    if (server == NULL || peerId == 0 ||
+        reason <= NETWORK_DISCONNECT_NONE ||
+        reason > NETWORK_DISCONNECT_CONFIGURATION)
+    {
+        return false;
+    }
+    for (uint32_t index = 0; index < server->maximumPeers; ++index)
+    {
+        NetworkServerPeer *peer = &server->peers[index];
+        if (peer->allocated && peer->peerId == peerId)
+        {
+            ServerDisconnectPeer(server, index, reason);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool NetworkServerBroadcastPlayerState(NetworkServer *server, const NetworkPlayerState *state)
 {
     if (server == NULL || state == NULL)
@@ -1469,9 +1517,23 @@ bool NetworkServerBroadcastPlayerState(NetworkServer *server, const NetworkPlaye
     LaiueProtocolPlayerState encodedState = {
         .serverTick = state->serverTick,
         .peerId = state->peerId,
+        .lastProcessedInputSequence =
+            state->lastProcessedInputSequence,
         .position = {state->position[0], state->position[1], state->position[2]},
         .yaw = state->yaw,
         .pitch = state->pitch,
+        .locomotionVelocityX = state->locomotionVelocityX,
+        .locomotionVelocityY = state->locomotionVelocityY,
+        .verticalVelocity = state->verticalVelocity,
+        .externalVelocityX = state->externalVelocityX,
+        .externalVelocityY = state->externalVelocityY,
+        .jumpBufferRemaining = state->jumpBufferRemaining,
+        .coyoteTimeRemaining = state->coyoteTimeRemaining,
+        .colliderCrouchProgress =
+            state->colliderCrouchProgress,
+        .eyeCrouchProgress = state->eyeCrouchProgress,
+        .airJumpsRemaining = state->airJumpsRemaining,
+        .crouchingRequested = state->crouchingRequested,
         .grounded = state->grounded,
     };
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];

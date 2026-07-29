@@ -112,7 +112,7 @@ static void ScriptCommand(uint32_t tick, PlayerControllerCommand* command)
 // трансценденту в шаге симуляции, переставленное выражение или возврат
 // /fp:fast с реально включённым FMA. Осознанная правка формул/сценария —
 // пересними значение здесь.
-#define DETERMINISM_EXPECTED_HASH 0x8ea8005f3c9f0821ULL
+#define DETERMINISM_EXPECTED_HASH 0x6426d01ca5957726ULL
 
 // Конфиг заморожен в тесте, а не берётся из PlayerControllerGetDefaultConfig:
 // тюнинг геймплейных дефолтов не должен ронять проверку детерминизма. Это
@@ -132,7 +132,7 @@ static void FrozenConfig(PlayerControllerConfig* config)
         .jumpBufferSeconds = 0.14f,
         .coyoteTimeSeconds = 0.10f,
         .externalVelocityDamping = 8.0f,
-        .fixedStepSeconds = 1.0f / 240.0f,
+        .fixedStepSeconds = 1.0 / 240.0,
         .maximumSubsteps = 32u,
         .jumpHeight = 1.275,
         .radius = 0.30,
@@ -165,6 +165,12 @@ static void FoldState(const PlayerController* controller, const Camera* camera)
     HashDouble(controller->externalVelocityY);
     HashDouble(controller->stance.colliderCrouchProgress);
     HashDouble(controller->stance.eyeCrouchProgress);
+    int32_t airJumpsRemaining =
+        controller->jump.airJumpsRemaining;
+    HashBytes(&airJumpsRemaining, sizeof(airJumpsRemaining));
+    uint8_t crouchingRequested =
+        controller->stance.crouchingRequested ? 1u : 0u;
+    HashBytes(&crouchingRequested, sizeof(crouchingRequested));
     uint8_t grounded = controller->grounded ? 1u : 0u;
     HashBytes(&grounded, sizeof(grounded));
 }
@@ -183,7 +189,7 @@ LAIUE_TEST_ENTRY(DeterminismTestEntryPoint)
     // Ровно один фиксированный шаг на тик: подаём deltaSeconds == fixedStep,
     // и аккумулятор исполняет один SimulateStep. Число шагов не зависит от
     // настенных часов — это условие детерминизма поверх сети.
-    float step = config.fixedStepSeconds;
+    double step = config.fixedStepSeconds;
 
     for (uint32_t tick = 0; tick < DETERMINISM_TICKS; ++tick)
     {

@@ -141,9 +141,11 @@ struct NetworkClient
     bool disconnectNotified;
     bool snapshotStarted;
     bool snapshotEnded;
+    bool snapshotRequiresReadyBarrier;
     bool syncBeginReceived;
     bool syncReadyReceived;
     bool syncAppliedSent;
+    bool everReady;
     bool resyncRequestOutstanding;
     bool resyncResponseMatched;
 };
@@ -218,6 +220,7 @@ struct NetworkServerPeer
     bool ready;
     bool everReady;
     bool snapshotStarted;
+    bool snapshotRequiresReadyBarrier;
     bool awaitingSyncApplied;
     bool resyncRequestOutstanding;
     bool resyncResponseMatched;
@@ -1451,10 +1454,12 @@ static bool ClientCompleteSyncIfReady(NetworkClient *client)
     event.data.ready.peerId = client->pendingPeerId;
     event.data.ready.worldSeed = client->pendingWorldSeed;
     client->state = NETWORK_CONNECTION_READY;
+    client->everReady = true;
     // Every barrier owns a new acknowledgement. Clear the receive-side
     // marker here so a later control-first SYNC_BEGIN is accepted.
     client->syncBeginReceived = false;
     client->syncAppliedSent = false;
+    client->snapshotRequiresReadyBarrier = false;
     return ClientPushEvent(client, &event);
 }
 
@@ -1587,100 +1592,116 @@ static bool ClientHandleFrame(
     if (frame->type == LAIUE_MESSAGE_SYNC_BEGIN)
     {
         if (frame->payloadSize != 0 ||
-            (client->state != NETWORK_CONNECTION_SYNCING_WORLD &&
-             client->state != NETWORK_CONNECTION_READY) ||
-            client->syncBeginReceived)
+            client->state != NETWORK_CONNECTION_SYNCING_WORLD ||
+            client->everReady || client->syncBeginReceived)
         {
             return false;
-        }
-        if (client->state == NETWORK_CONNECTION_READY)
-        {
-            client->state = NETWORK_CONNECTION_SYNCING_WORLD;
-            client->snapshotStarted = false;
-            client->snapshotEnded = false;
-            client->syncReadyReceived = false;
-            client->syncAppliedSent = false;
         }
         client->syncBeginReceived = true;
         return ClientCompleteSyncIfReady(client);
     }
 
-    if (client->state == NETWORK_CONNECTION_SYNCING_WORLD)
+    if (frame->type == LAIUE_MESSAGE_SNAPSHOT_BEGIN &&
+        !client->snapshotStarted)
     {
-        if (frame->type == LAIUE_MESSAGE_SNAPSHOT_BEGIN &&
-            !client->snapshotStarted)
+        LaiueProtocolSnapshotBegin snapshot;
+        if (!LaiueProtocolDecodeSnapshotBegin(
+                frame->payload, frame->payloadSize, &snapshot) ||
+            snapshot.peerId != client->pendingPeerId ||
+            snapshot.worldSeed != client->pendingWorldSeed)
         {
-            LaiueProtocolSnapshotBegin snapshot;
-            if (!LaiueProtocolDecodeSnapshotBegin(
-                    frame->payload, frame->payloadSize, &snapshot) ||
-                snapshot.peerId != client->pendingPeerId ||
-                snapshot.worldSeed != client->pendingWorldSeed)
-            {
-                return false;
-            }
-            client->snapshotId = snapshot.snapshotId;
-            client->snapshotWorldRevision = snapshot.worldRevision;
-            client->snapshotServerTick = snapshot.serverTick;
-            client->expectedSnapshotChunks = snapshot.chunkCount;
-            client->receivedSnapshotChunks = 0;
+            return false;
+        }
+        bool validInitialBarrier =
+            snapshot.requiresReadyBarrier &&
+            !client->everReady &&
+            client->state == NETWORK_CONNECTION_SYNCING_WORLD;
+        bool validLiveSnapshot =
+            !snapshot.requiresReadyBarrier &&
+            client->everReady &&
+            client->state == NETWORK_CONNECTION_READY &&
+            !client->syncBeginReceived;
+        if (!validInitialBarrier && !validLiveSnapshot)
+        {
+            return false;
+        }
+        client->snapshotId = snapshot.snapshotId;
+        client->snapshotWorldRevision = snapshot.worldRevision;
+        client->snapshotServerTick = snapshot.serverTick;
+        client->expectedSnapshotChunks = snapshot.chunkCount;
+        client->receivedSnapshotChunks = 0;
+        client->resyncResponseMatched = false;
+        client->snapshotStarted = true;
+        client->snapshotEnded = false;
+        client->snapshotRequiresReadyBarrier =
+            snapshot.requiresReadyBarrier;
+        event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN;
+        event.data.snapshot.snapshotId = snapshot.snapshotId;
+        event.data.snapshot.worldRevision = snapshot.worldRevision;
+        event.data.snapshot.serverTick = snapshot.serverTick;
+        event.data.snapshot.chunkCount = snapshot.chunkCount;
+        event.data.snapshot.peerId = snapshot.peerId;
+        event.data.snapshot.worldSeed = snapshot.worldSeed;
+        event.data.snapshot.worldTime = snapshot.worldTime;
+        event.data.snapshot.requiresReadyBarrier =
+            snapshot.requiresReadyBarrier;
+        return ClientPushEvent(client, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_SNAPSHOT_CHUNK)
+    {
+        return ClientHandleSnapshotChunk(client, frame, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_SNAPSHOT_END &&
+        client->snapshotStarted)
+    {
+        uint64_t snapshotId = 0;
+        uint64_t worldRevision = 0;
+        if (!LaiueProtocolDecodeSnapshotEnd(
+                frame->payload, frame->payloadSize,
+                &snapshotId, &worldRevision) ||
+            snapshotId != client->snapshotId ||
+            worldRevision < client->snapshotWorldRevision ||
+            client->snapshotNextPart != 0 ||
+            client->receivedSnapshotChunks !=
+                client->expectedSnapshotChunks)
+        {
+            return false;
+        }
+        event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_END;
+        event.data.snapshot.snapshotId = snapshotId;
+        event.data.snapshot.worldRevision = worldRevision;
+        event.data.snapshot.requiresReadyBarrier =
+            client->snapshotRequiresReadyBarrier;
+        client->snapshotWorldRevision = worldRevision;
+        if (!ClientPushEvent(client, &event))
+        {
+            return false;
+        }
+        if (client->resyncRequestOutstanding &&
+            client->resyncResponseMatched)
+        {
+            client->resyncRequestOutstanding = false;
             client->resyncResponseMatched = false;
-            client->snapshotStarted = true;
-            event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN;
-            event.data.snapshot.snapshotId = snapshot.snapshotId;
-            event.data.snapshot.worldRevision =
-                snapshot.worldRevision;
-            event.data.snapshot.serverTick = snapshot.serverTick;
-            event.data.snapshot.chunkCount = snapshot.chunkCount;
-            event.data.snapshot.peerId = snapshot.peerId;
-            event.data.snapshot.worldSeed = snapshot.worldSeed;
-            event.data.snapshot.worldTime = snapshot.worldTime;
-            return ClientPushEvent(client, &event);
         }
-        if (frame->type == LAIUE_MESSAGE_SNAPSHOT_CHUNK)
+        bool requiresReadyBarrier =
+            client->snapshotRequiresReadyBarrier;
+        client->snapshotStarted = false;
+        if (requiresReadyBarrier)
         {
-            return ClientHandleSnapshotChunk(client, frame, &event);
-        }
-        if (frame->type == LAIUE_MESSAGE_SNAPSHOT_END &&
-            client->snapshotStarted)
-        {
-            uint64_t snapshotId = 0;
-            uint64_t worldRevision = 0;
-            if (!LaiueProtocolDecodeSnapshotEnd(
-                    frame->payload, frame->payloadSize,
-                    &snapshotId, &worldRevision) ||
-                snapshotId != client->snapshotId ||
-                worldRevision < client->snapshotWorldRevision ||
-                client->snapshotNextPart != 0 ||
-                client->receivedSnapshotChunks !=
-                    client->expectedSnapshotChunks)
-            {
-                return false;
-            }
-            event.type = NETWORK_CLIENT_EVENT_SNAPSHOT_END;
-            event.data.snapshot.snapshotId = snapshotId;
-            event.data.snapshot.worldRevision = worldRevision;
-            client->snapshotWorldRevision = worldRevision;
-            if (!ClientPushEvent(client, &event))
-            {
-                return false;
-            }
-            if (client->resyncRequestOutstanding &&
-                client->resyncResponseMatched)
-            {
-                client->resyncRequestOutstanding = false;
-                client->resyncResponseMatched = false;
-            }
-            client->snapshotStarted = false;
             client->snapshotEnded = true;
             return ClientCompleteSyncIfReady(client);
         }
-        if (frame->type == LAIUE_MESSAGE_SYNC_READY &&
-            frame->payloadSize == 0 &&
-            client->syncBeginReceived)
-        {
-            client->syncReadyReceived = true;
-            return ClientCompleteSyncIfReady(client);
-        }
+        client->snapshotRequiresReadyBarrier = false;
+        return client->state == NETWORK_CONNECTION_READY;
+    }
+    if (frame->type == LAIUE_MESSAGE_SYNC_READY &&
+        frame->payloadSize == 0 &&
+        client->state == NETWORK_CONNECTION_SYNCING_WORLD &&
+        client->syncBeginReceived &&
+        client->snapshotRequiresReadyBarrier)
+    {
+        client->syncReadyReceived = true;
+        return ClientCompleteSyncIfReady(client);
     }
 
     if (client->state != NETWORK_CONNECTION_SYNCING_WORLD &&
@@ -1729,6 +1750,8 @@ static bool ClientHandleFrame(
         event.type = NETWORK_CLIENT_EVENT_PLAYER_STATE;
         event.data.playerState.serverTick = decoded.serverTick;
         event.data.playerState.peerId = decoded.peerId;
+        event.data.playerState.lastProcessedInputSequence =
+            decoded.lastProcessedInputSequence;
         for (uint32_t axis = 0; axis < 3U; ++axis)
         {
             event.data.playerState.position[axis] =
@@ -1736,6 +1759,28 @@ static bool ClientHandleFrame(
         }
         event.data.playerState.yaw = decoded.yaw;
         event.data.playerState.pitch = decoded.pitch;
+        event.data.playerState.locomotionVelocityX =
+            decoded.locomotionVelocityX;
+        event.data.playerState.locomotionVelocityY =
+            decoded.locomotionVelocityY;
+        event.data.playerState.verticalVelocity =
+            decoded.verticalVelocity;
+        event.data.playerState.externalVelocityX =
+            decoded.externalVelocityX;
+        event.data.playerState.externalVelocityY =
+            decoded.externalVelocityY;
+        event.data.playerState.jumpBufferRemaining =
+            decoded.jumpBufferRemaining;
+        event.data.playerState.coyoteTimeRemaining =
+            decoded.coyoteTimeRemaining;
+        event.data.playerState.colliderCrouchProgress =
+            decoded.colliderCrouchProgress;
+        event.data.playerState.eyeCrouchProgress =
+            decoded.eyeCrouchProgress;
+        event.data.playerState.airJumpsRemaining =
+            decoded.airJumpsRemaining;
+        event.data.playerState.crouchingRequested =
+            decoded.crouchingRequested;
         event.data.playerState.grounded = decoded.grounded;
         return ClientPushEvent(client, &event);
     }
@@ -1924,16 +1969,6 @@ static bool ClientParseServerStream(
         {
             return !ChannelReceiveEndedWithBytes(channel);
         }
-        if (type == LAIUE_MESSAGE_SNAPSHOT_BEGIN &&
-            client->state == NETWORK_CONNECTION_READY)
-        {
-            client->state = NETWORK_CONNECTION_SYNCING_WORLD;
-            client->snapshotStarted = false;
-            client->snapshotEnded = false;
-            client->syncBeginReceived = false;
-            client->syncReadyReceived = false;
-            client->syncAppliedSent = false;
-        }
         if (IsSnapshotStreamMessage(type) &&
             client->state == NETWORK_CONNECTION_NEGOTIATING)
         {
@@ -1947,7 +1982,8 @@ static bool ClientParseServerStream(
             (IsContentStreamMessage(type) &&
              client->state != NETWORK_CONNECTION_NEGOTIATING) ||
             (IsSnapshotStreamMessage(type) &&
-             client->state != NETWORK_CONNECTION_SYNCING_WORLD))
+             client->state != NETWORK_CONNECTION_SYNCING_WORLD &&
+             client->state != NETWORK_CONNECTION_READY))
         {
             return false;
         }
@@ -2208,13 +2244,15 @@ static NetworkServerPeer *ServerFindPeer(
     return found;
 }
 
-static void ServerDisconnectPeer(
+static bool ServerDisconnectPeer(
     NetworkServer *server, NetworkServerPeer *peer,
     NetworkDisconnectReason reason)
 {
-    if (server == NULL || peer == NULL)
+    if (server == NULL || peer == NULL ||
+        reason <= NETWORK_DISCONNECT_NONE ||
+        reason > NETWORK_DISCONNECT_CONFIGURATION)
     {
-        return;
+        return false;
     }
     HQUIC connection = NULL;
     PlatformRwLockAcquireExclusive(&server->lock);
@@ -2222,7 +2260,7 @@ static void ServerDisconnectPeer(
         peer->closing)
     {
         PlatformRwLockReleaseExclusive(&server->lock);
-        return;
+        return false;
     }
     peer->closing = true;
     peer->closeReason = reason;
@@ -2237,6 +2275,7 @@ static void ServerDisconnectPeer(
                 ? NETWORK_APP_ERROR_OVERFLOW
                 : NETWORK_APP_ERROR_PROTOCOL);
     }
+    return true;
 }
 
 static void ServerFinalizePeer(
@@ -2694,6 +2733,7 @@ static bool ServerHandleFrame(
             return false;
         }
         event.type = NETWORK_SERVER_EVENT_INPUT;
+        event.data.input.sequence = decoded.sequence;
         event.data.input.movementX = decoded.movementX;
         event.data.input.movementY = decoded.movementY;
         event.data.input.yaw = decoded.yaw;
@@ -3265,22 +3305,36 @@ bool NetworkClientSendInput(
         return false;
     }
     LaiueProtocolInput wire = {
-        input->movementX,
-        input->movementY,
-        input->yaw,
-        input->pitch,
-        input->jumpPressed,
-        input->jumpHeld,
-        input->sprintHeld,
-        input->crouchHeld,
+        .sequence = input->sequence,
+        .movementX = input->movementX,
+        .movementY = input->movementY,
+        .yaw = input->yaw,
+        .pitch = input->pitch,
+        .jumpPressed = input->jumpPressed,
+        .jumpHeld = input->jumpHeld,
+        .sprintHeld = input->sprintHeld,
+        .crouchHeld = input->crouchHeld,
     };
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size =
         LaiueProtocolEncodeInput(payload, sizeof(payload), &wire);
-    return size != 0 &&
-           ChannelSendPayload(
-               &client->channel, LAIUE_MESSAGE_PLAYER_INPUT,
-               payload, size);
+    if (size == 0)
+    {
+        return false;
+    }
+    if (!ChannelSendPayload(
+            &client->channel, LAIUE_MESSAGE_PLAYER_INPUT,
+            payload, size))
+    {
+        // Input is the only client send performed continuously at 60 Hz.
+        // Once its bounded QUIC queue is exhausted, keeping the connection
+        // nominally READY would freeze prediction and repeatedly retry the
+        // same tick. Fail the offending connection just like the loopback
+        // backend, while other peers and the server keep running.
+        ClientDisconnect(client, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    return true;
 }
 
 bool NetworkClientSendEditIntent(
@@ -3840,6 +3894,14 @@ bool NetworkServerPollEvent(
     return true;
 }
 
+bool NetworkServerDisconnect(
+    NetworkServer *server, uint32_t peerId,
+    NetworkDisconnectReason reason)
+{
+    return ServerDisconnectPeer(
+        server, ServerFindPeer(server, peerId), reason);
+}
+
 static bool ServerPeerCanSync(
     NetworkServer *server, const NetworkServerPeer *peer)
 {
@@ -3854,6 +3916,25 @@ static bool ServerPeerCanSync(
         peer->channel.stream != NULL;
     PlatformRwLockReleaseShared(&server->lock);
     return canSync;
+}
+
+static bool ServerPeerCanBeginSnapshot(
+    NetworkServer *server, NetworkServerPeer *peer,
+    bool requiresReadyBarrier)
+{
+    if (!ServerPeerCanSync(server, peer) ||
+        peer->snapshotStarted ||
+        ChannelIsActive(&peer->snapshotChannel))
+    {
+        return false;
+    }
+    if (requiresReadyBarrier)
+    {
+        return !peer->everReady && !peer->ready &&
+            !peer->awaitingSyncApplied;
+    }
+    return peer->everReady && peer->ready &&
+        !peer->awaitingSyncApplied;
 }
 
 static bool ServerSendToPeer(
@@ -3887,12 +3968,26 @@ static bool EncodePlayerState(
     memset(&wire, 0, sizeof(wire));
     wire.serverTick = state->serverTick;
     wire.peerId = state->peerId;
+    wire.lastProcessedInputSequence =
+        state->lastProcessedInputSequence;
     for (uint32_t axis = 0; axis < 3U; ++axis)
     {
         wire.position[axis] = state->position[axis];
     }
     wire.yaw = state->yaw;
     wire.pitch = state->pitch;
+    wire.locomotionVelocityX = state->locomotionVelocityX;
+    wire.locomotionVelocityY = state->locomotionVelocityY;
+    wire.verticalVelocity = state->verticalVelocity;
+    wire.externalVelocityX = state->externalVelocityX;
+    wire.externalVelocityY = state->externalVelocityY;
+    wire.jumpBufferRemaining = state->jumpBufferRemaining;
+    wire.coyoteTimeRemaining = state->coyoteTimeRemaining;
+    wire.colliderCrouchProgress =
+        state->colliderCrouchProgress;
+    wire.eyeCrouchProgress = state->eyeCrouchProgress;
+    wire.airJumpsRemaining = state->airJumpsRemaining;
+    wire.crouchingRequested = state->crouchingRequested;
     wire.grounded = state->grounded;
     *outSize = LaiueProtocolEncodePlayerState(
         payload, NETWORK_CONTROL_PAYLOAD_CAPACITY, &wire);
@@ -4021,27 +4116,38 @@ bool NetworkServerBroadcastBlockDelta(
     return succeeded;
 }
 
+bool NetworkServerCanBeginSnapshot(
+    NetworkServer *server, uint32_t peerId,
+    bool requiresReadyBarrier)
+{
+    return ServerPeerCanBeginSnapshot(
+        server, ServerFindPeer(server, peerId),
+        requiresReadyBarrier);
+}
+
 bool NetworkServerSendSnapshotBegin(
     NetworkServer *server, uint32_t peerId,
     const NetworkSnapshotInfo *snapshot)
 {
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
-    if (!ServerPeerCanSync(server, peer) ||
-        peer->snapshotStarted ||
-        snapshot == NULL ||
+    if (snapshot == NULL ||
+        !ServerPeerCanBeginSnapshot(
+            server, peer, snapshot->requiresReadyBarrier) ||
         snapshot->peerId != peerId ||
         snapshot->worldSeed != server->worldSeed)
     {
         return false;
     }
     LaiueProtocolSnapshotBegin wire = {
-        snapshot->snapshotId,
-        snapshot->worldRevision,
-        snapshot->serverTick,
-        snapshot->chunkCount,
-        snapshot->peerId,
-        snapshot->worldSeed,
-        snapshot->worldTime,
+        .snapshotId = snapshot->snapshotId,
+        .worldRevision = snapshot->worldRevision,
+        .serverTick = snapshot->serverTick,
+        .chunkCount = snapshot->chunkCount,
+        .peerId = snapshot->peerId,
+        .worldSeed = snapshot->worldSeed,
+        .worldTime = snapshot->worldTime,
+        .requiresReadyBarrier =
+            snapshot->requiresReadyBarrier,
     };
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size = LaiueProtocolEncodeSnapshotBegin(
@@ -4051,15 +4157,19 @@ bool NetworkServerSendSnapshotBegin(
     {
         return false;
     }
-    if (!ChannelSendPayload(
+    if (snapshot->requiresReadyBarrier &&
+        !ChannelSendPayload(
             &peer->channel, LAIUE_MESSAGE_SYNC_BEGIN, NULL, 0))
     {
         ServerDisconnectPeer(
             server, peer, NETWORK_DISCONNECT_OVERFLOW);
         return false;
     }
-    peer->ready = false;
-    peer->awaitingSyncApplied = false;
+    if (snapshot->requiresReadyBarrier)
+    {
+        peer->ready = false;
+        peer->awaitingSyncApplied = false;
+    }
     if (!ChannelSendPayload(
             &peer->snapshotChannel,
             LAIUE_MESSAGE_SNAPSHOT_BEGIN, payload, size))
@@ -4074,6 +4184,8 @@ bool NetworkServerSendSnapshotBegin(
     peer->snapshotNextPart = 0;
     peer->snapshotPartCount = 0;
     peer->snapshotStarted = true;
+    peer->snapshotRequiresReadyBarrier =
+        snapshot->requiresReadyBarrier;
     return true;
 }
 
@@ -4084,7 +4196,10 @@ bool NetworkServerSendSnapshotChunk(
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
     if (!ServerPeerCanSync(server, peer) ||
         !peer->snapshotStarted ||
-        peer->ready || chunk == NULL ||
+        (peer->snapshotRequiresReadyBarrier
+             ? peer->ready
+             : !peer->ready) ||
+        chunk == NULL ||
         peer->sentSnapshotChunks >=
             peer->expectedSnapshotChunks)
     {
@@ -4196,7 +4311,10 @@ bool NetworkServerSendSnapshotEnd(
     NetworkServerPeer *peer = ServerFindPeer(server, peerId);
     if (!ServerPeerCanSync(server, peer) ||
         !peer->snapshotStarted ||
-        peer->ready || peer->snapshotId != snapshotId ||
+        (peer->snapshotRequiresReadyBarrier
+             ? peer->ready
+             : !peer->ready) ||
+        peer->snapshotId != snapshotId ||
         peer->snapshotNextPart != 0 ||
         (peer->resyncRequestOutstanding &&
          !peer->resyncResponseMatched) ||
@@ -4220,7 +4338,8 @@ bool NetworkServerSendSnapshotEnd(
         }
         return false;
     }
-    if (!ChannelSendPayload(
+    if (peer->snapshotRequiresReadyBarrier &&
+        !ChannelSendPayload(
             &peer->channel, LAIUE_MESSAGE_SYNC_READY, NULL, 0))
     {
         ServerDisconnectPeer(
@@ -4233,9 +4352,12 @@ bool NetworkServerSendSnapshotEnd(
             server, peer, NETWORK_DISCONNECT_IO);
         return false;
     }
+    bool requiresReadyBarrier =
+        peer->snapshotRequiresReadyBarrier;
     peer->snapshotStarted = false;
+    peer->snapshotRequiresReadyBarrier = false;
     peer->snapshotWorldRevision = worldRevision;
-    peer->awaitingSyncApplied = true;
+    peer->awaitingSyncApplied = requiresReadyBarrier;
     if (peer->resyncRequestOutstanding)
     {
         peer->resyncRequestOutstanding = false;

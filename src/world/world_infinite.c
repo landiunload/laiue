@@ -948,6 +948,18 @@ bool WorldReplaceChunkDeltas(
         PlatformFree(packed);
         return false;
     }
+    // Snapshot и control traffic идут по независимым QUIC streams. Поэтому
+    // более новая live-delta может быть применена до старого snapshot chunk.
+    // Revision чанка монотонна: старый снимок подтверждаем, но не позволяем
+    // ему откатить уже видимое состояние.
+    if (target->revision > chunkRevision)
+    {
+        if (world->revision < worldRevision)
+            world->revision = worldRevision;
+        PlatformRwLockReleaseExclusive(&world->tableLock);
+        PlatformFree(packed);
+        return true;
+    }
     PlatformFree(target->deltas);
     target->deltas = packed;
     target->deltaCount = count;

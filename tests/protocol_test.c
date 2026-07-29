@@ -430,6 +430,7 @@ static void TestInput(void)
 {
     uint8_t payload[16];
     LaiueProtocolInput input = {
+        .sequence = 73u,
         .movementX = 0.5f,
         .movementY = -0.5f,
         .yaw = 1.0f,
@@ -441,11 +442,11 @@ static void TestInput(void)
     };
 
     ProtocolTestExpect(
-        LaiueProtocolEncodeInput(payload, sizeof(payload), &input) == 9u,
+        LaiueProtocolEncodeInput(payload, sizeof(payload), &input) == 13u,
         "EncodeInput вернул неожиданный размер");
 
     LaiueProtocolInput decoded;
-    ProtocolTestExpect(LaiueProtocolDecodeInput(payload, 9u, &decoded),
+    ProtocolTestExpect(LaiueProtocolDecodeInput(payload, 13u, &decoded),
         "DecodeInput отверг собственную запись");
     // Допуск — шаг квантования: движение 1/32767, углы — предел/32767.
     ProtocolTestExpect(NearlyEqual(decoded.movementX, 0.5f, 1.0e-4f)
@@ -453,20 +454,26 @@ static void TestInput(void)
         && NearlyEqual(decoded.yaw, 1.0f, 2.0e-4f)
         && NearlyEqual(decoded.pitch, 0.5f, 2.0e-4f),
         "DecodeInput потерял точность сверх шага квантования");
-    ProtocolTestExpect(decoded.jumpPressed && !decoded.jumpHeld
+    ProtocolTestExpect(decoded.sequence == 73u
+        && decoded.jumpPressed && !decoded.jumpHeld
         && decoded.sprintHeld && !decoded.crouchHeld,
-        "DecodeInput перепутал флаги");
+        "DecodeInput потерял sequence или перепутал флаги");
 
-    ProtocolTestExpect(!LaiueProtocolDecodeInput(payload, 8u, &decoded)
-        && !LaiueProtocolDecodeInput(payload, 10u, &decoded),
+    ProtocolTestExpect(!LaiueProtocolDecodeInput(payload, 12u, &decoded)
+        && !LaiueProtocolDecodeInput(payload, 14u, &decoded),
         "DecodeInput принял неточный размер");
 
     // Старший полубайт зарезервирован и обязан быть нулевым.
-    uint8_t reserved[9];
+    uint8_t reserved[13];
     memcpy(reserved, payload, sizeof(reserved));
-    reserved[8] |= 0x10u;
-    ProtocolTestExpect(!LaiueProtocolDecodeInput(reserved, 9u, &decoded),
+    reserved[12] |= 0x10u;
+    ProtocolTestExpect(!LaiueProtocolDecodeInput(reserved, 13u, &decoded),
         "DecodeInput принял установленные резервные биты");
+
+    memcpy(reserved, payload, sizeof(reserved));
+    TestWriteU32(reserved, 0u);
+    ProtocolTestExpect(!LaiueProtocolDecodeInput(reserved, 13u, &decoded),
+        "DecodeInput принял зарезервированный нулевой sequence");
 
     LaiueProtocolInput outOfRange = input;
     outOfRange.movementX = 1.5f;
@@ -481,12 +488,47 @@ static void TestInput(void)
         "EncodeInput принял рыскание вне диапазона");
 
     // Вектор длиннее единицы — попытка ускориться по диагонали.
-    uint8_t forged[9];
+    uint8_t forged[13];
     memset(forged, 0, sizeof(forged));
-    TestWriteU16(forged, 32767u);
-    TestWriteU16(forged + 2, 32767u);
-    ProtocolTestExpect(!LaiueProtocolDecodeInput(forged, 9u, &decoded),
+    TestWriteU32(forged, 1u);
+    TestWriteU16(forged + 4, 32767u);
+    TestWriteU16(forged + 6, 32767u);
+    ProtocolTestExpect(!LaiueProtocolDecodeInput(forged, 13u, &decoded),
         "DecodeInput принял вектор движения длиннее единицы");
+    // 23265/32767 ~= 0.7100: squared length is about 1.0082. The old
+    // 1.01 tolerance accepted this crafted diagonal and granted ~0.4% speed.
+    TestWriteU16(forged + 4, 23265u);
+    TestWriteU16(forged + 6, 23265u);
+    ProtocolTestExpect(!LaiueProtocolDecodeInput(forged, 13u, &decoded),
+        "DecodeInput принял crafted diagonal сверх quantization tolerance");
+
+    NetworkInputCommand command = {
+        .sequence = 73u,
+        .movementX = 0.5f,
+        .movementY = -0.5f,
+        .yaw = 1.0f,
+        .pitch = 0.5f,
+        .jumpPressed = true,
+        .sprintHeld = true,
+    };
+    NetworkInputCommand canonical;
+    ProtocolTestExpect(
+        NetworkInputCanonicalize(&command, &canonical)
+        && canonical.sequence == 73u
+        && NearlyEqual(canonical.movementX, 0.5f, 1.0e-4f)
+        && NearlyEqual(canonical.movementY, -0.5f, 1.0e-4f)
+        && NearlyEqual(canonical.yaw, 1.0f, 2.0e-4f)
+        && NearlyEqual(canonical.pitch, 0.5f, 2.0e-4f)
+        && canonical.jumpPressed && canonical.sprintHeld,
+        "NetworkInputCanonicalize не повторил wire-квантование");
+    ProtocolTestExpect(
+        NetworkInputCanonicalize(&canonical, &canonical)
+        && canonical.sequence == 73u,
+        "NetworkInputCanonicalize не поддержал in-place canonical input");
+    command.sequence = 0u;
+    ProtocolTestExpect(
+        !NetworkInputCanonicalize(&command, &canonical),
+        "NetworkInputCanonicalize принял нулевой sequence");
 }
 
 static void TestEditIntent(void)
@@ -571,41 +613,65 @@ static void TestEditIntent(void)
 
 static void TestPlayerStateAndBlockDelta(void)
 {
-    uint8_t payload[64];
+    uint8_t payload[160];
     LaiueProtocolPlayerState state = {
         .serverTick = 42u,
         .peerId = 3u,
+        .lastProcessedInputSequence = 91u,
         .position = { 1.5, -2.25, 64.0 },
         .yaw = 0.25f,
         .pitch = -0.5f,
+        .locomotionVelocityX = 3.25,
+        .locomotionVelocityY = -1.5,
+        .verticalVelocity = 7.75,
+        .externalVelocityX = 0.125,
+        .externalVelocityY = -0.25,
+        .jumpBufferRemaining = 0.14,
+        .coyoteTimeRemaining = 0.08,
+        .colliderCrouchProgress = 0.4,
+        .eyeCrouchProgress = 0.6,
+        .airJumpsRemaining = 2,
+        .crouchingRequested = true,
         .grounded = true,
     };
 
     ProtocolTestExpect(
-        LaiueProtocolEncodePlayerState(payload, sizeof(payload), &state) == 37u,
+        LaiueProtocolEncodePlayerState(payload, sizeof(payload), &state) == 117u,
         "EncodePlayerState вернул неожиданный размер");
 
     LaiueProtocolPlayerState decodedState;
     ProtocolTestExpect(
-        LaiueProtocolDecodePlayerState(payload, 37u, &decodedState),
+        LaiueProtocolDecodePlayerState(payload, 117u, &decodedState),
         "DecodePlayerState отверг собственную запись");
     ProtocolTestExpect(decodedState.serverTick == 42u
-        && decodedState.peerId == 3u && decodedState.grounded
+        && decodedState.peerId == 3u
+        && decodedState.lastProcessedInputSequence == 91u
+        && decodedState.grounded && decodedState.crouchingRequested
         && ExactlyEqualDouble(decodedState.position[0], 1.5)
         && ExactlyEqualDouble(decodedState.position[1], -2.25)
         && ExactlyEqualDouble(decodedState.position[2], 64.0)
+        && ExactlyEqualDouble(decodedState.locomotionVelocityX, 3.25)
+        && ExactlyEqualDouble(decodedState.locomotionVelocityY, -1.5)
+        && ExactlyEqualDouble(decodedState.verticalVelocity, 7.75)
+        && ExactlyEqualDouble(decodedState.externalVelocityX, 0.125)
+        && ExactlyEqualDouble(decodedState.externalVelocityY, -0.25)
+        && ExactlyEqualDouble(decodedState.jumpBufferRemaining, 0.14)
+        && ExactlyEqualDouble(decodedState.coyoteTimeRemaining, 0.08)
+        && ExactlyEqualDouble(decodedState.colliderCrouchProgress, 0.4)
+        && ExactlyEqualDouble(decodedState.eyeCrouchProgress, 0.6)
+        && decodedState.airJumpsRemaining == 2
         && NearlyEqual(decodedState.yaw, 0.25f, 2.0e-4f)
         && NearlyEqual(decodedState.pitch, -0.5f, 2.0e-4f),
         "DecodePlayerState не восстановил поля");
     ProtocolTestExpect(
-        !LaiueProtocolDecodePlayerState(payload, 36u, &decodedState)
-        && !LaiueProtocolDecodePlayerState(payload, 38u, &decodedState),
+        !LaiueProtocolDecodePlayerState(payload, 116u, &decodedState)
+        && !LaiueProtocolDecodePlayerState(payload, 118u, &decodedState),
         "DecodePlayerState принял неточный размер");
 
-    payload[36] = 2u;
+    payload[116] = 4u;
     ProtocolTestExpect(
-        !LaiueProtocolDecodePlayerState(payload, 37u, &decodedState),
-        "DecodePlayerState принял небулево значение grounded");
+        !LaiueProtocolDecodePlayerState(payload, 117u, &decodedState),
+        "DecodePlayerState принял зарезервированный флаг");
 
     LaiueProtocolPlayerState invalidState = state;
     invalidState.peerId = 0u;
@@ -620,6 +686,36 @@ static void TestPlayerStateAndBlockDelta(void)
         LaiueProtocolEncodePlayerState(payload, sizeof(payload),
             &invalidState) == 0,
         "EncodePlayerState принял тангаж вне диапазона");
+
+    invalidState = state;
+    invalidState.colliderCrouchProgress = 1.01;
+    ProtocolTestExpect(
+        LaiueProtocolEncodePlayerState(payload, sizeof(payload),
+            &invalidState) == 0,
+        "EncodePlayerState принял crouch progress вне диапазона");
+
+    invalidState = state;
+    invalidState.airJumpsRemaining = -1;
+    ProtocolTestExpect(
+        LaiueProtocolEncodePlayerState(payload, sizeof(payload),
+            &invalidState) == 0,
+        "EncodePlayerState принял отрицательный остаток air jumps");
+
+    invalidState = state;
+    invalidState.jumpBufferRemaining = -0.001;
+    ProtocolTestExpect(
+        LaiueProtocolEncodePlayerState(payload, sizeof(payload),
+            &invalidState) == 0,
+        "EncodePlayerState принял отрицательный jump buffer");
+
+    ProtocolTestExpect(
+        LaiueProtocolEncodePlayerState(payload, sizeof(payload), &state)
+            == 117u,
+        "EncodePlayerState не восстановился после invalid cases");
+    TestWriteU64(payload + 40u, UINT64_C(0x7ff8000000000000));
+    ProtocolTestExpect(
+        !LaiueProtocolDecodePlayerState(payload, 117u, &decodedState),
+        "DecodePlayerState принял NaN locomotion velocity");
 
     LaiueProtocolBlockDelta delta = {
         .serverTick = 7u,
@@ -833,6 +929,7 @@ static void TestNonFiniteRejected(void)
         for (uint32_t field = 0; field < 4u; ++field)
         {
             LaiueProtocolInput input = {
+                .sequence = 1u,
                 .movementX = 0.0f,
                 .movementY = 0.0f,
                 .yaw = 0.0f,
@@ -1070,22 +1167,36 @@ static void TestSnapshotProtocol(void)
         .peerId = 7u,
         .worldSeed = -12345,
         .worldTime = 888u,
+        .requiresReadyBarrier = true,
     };
     ProtocolTestExpect(
         LaiueProtocolEncodeSnapshotBegin(payload, sizeof(payload), &begin)
-            == 44u,
+            == 45u,
         "EncodeSnapshotBegin вернул неожиданный размер");
     LaiueProtocolSnapshotBegin decodedBegin;
     ProtocolTestExpect(
-        LaiueProtocolDecodeSnapshotBegin(payload, 44u, &decodedBegin)
+        LaiueProtocolDecodeSnapshotBegin(payload, 45u, &decodedBegin)
         && decodedBegin.snapshotId == 17u
         && decodedBegin.worldRevision == 91u
         && decodedBegin.serverTick == 42u
         && decodedBegin.chunkCount == 2u
         && decodedBegin.peerId == 7u
         && decodedBegin.worldSeed == -12345
-        && decodedBegin.worldTime == 888u,
+        && decodedBegin.worldTime == 888u
+        && decodedBegin.requiresReadyBarrier,
         "DecodeSnapshotBegin не восстановил поля");
+
+    begin.requiresReadyBarrier = false;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeSnapshotBegin(payload, sizeof(payload), &begin)
+            == 45u
+        && LaiueProtocolDecodeSnapshotBegin(payload, 45u, &decodedBegin)
+        && !decodedBegin.requiresReadyBarrier,
+        "SnapshotBegin не сохранил live/barrier=false");
+    payload[44] = 2u;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeSnapshotBegin(payload, 45u, &decodedBegin),
+        "DecodeSnapshotBegin принял зарезервированные flags");
 
     LaiueProtocolChunkDelta chunk;
     memset(&chunk, 0, sizeof(chunk));

@@ -1,13 +1,14 @@
 #include "network/protocol.h"
+#include "network/network.h"
 
 #include <stddef.h>
 #include <string.h>
 
 #define HELLO_PAYLOAD_SIZE 12U
 #define WELCOME_PAYLOAD_SIZE 20U
-#define INPUT_PAYLOAD_SIZE 9U
+#define INPUT_PAYLOAD_SIZE 13U
 #define EDIT_PAYLOAD_SIZE 8U
-#define PLAYER_STATE_PAYLOAD_SIZE 37U
+#define PLAYER_STATE_PAYLOAD_SIZE 117U
 #define BLOCK_DELTA_PAYLOAD_SIZE 37U
 #define MOD_LIST_PAYLOAD_SIZE 3U
 #define REJECT_PAYLOAD_SIZE 1U
@@ -15,7 +16,7 @@
 #define BLOCK_DROP_PAYLOAD_SIZE 29U
 #define DROP_REMOVE_PAYLOAD_SIZE 4U
 #define INVENTORY_PAYLOAD_SIZE (1U + LAIUE_PROTOCOL_INVENTORY_SLOTS * 3U)
-#define SNAPSHOT_BEGIN_PAYLOAD_SIZE 44U
+#define SNAPSHOT_BEGIN_PAYLOAD_SIZE 45U
 #define SNAPSHOT_CHUNK_HEADER_SIZE 38U
 #define SNAPSHOT_CHUNK_EDIT_SIZE 4U
 #define SNAPSHOT_END_PAYLOAD_SIZE 16U
@@ -25,7 +26,40 @@
 
 #define ANGLE_PI 3.14159265358979323846f
 #define PITCH_LIMIT 1.57079632679489661923f
+#define MOVEMENT_LENGTH_SQUARED_LIMIT 1.0001f
 #define POSITION_LIMIT 1099511627776.0
+#define DYNAMIC_VELOCITY_LIMIT 1048576.0
+#define DYNAMIC_TIMER_LIMIT 3600.0
+#define AIR_JUMPS_LIMIT 1024
+
+#define INPUT_SEQUENCE_OFFSET 0U
+#define INPUT_MOVEMENT_X_OFFSET 4U
+#define INPUT_MOVEMENT_Y_OFFSET 6U
+#define INPUT_YAW_OFFSET 8U
+#define INPUT_PITCH_OFFSET 10U
+#define INPUT_FLAGS_OFFSET 12U
+
+#define PLAYER_STATE_SERVER_TICK_OFFSET 0U
+#define PLAYER_STATE_PEER_ID_OFFSET 4U
+#define PLAYER_STATE_INPUT_SEQUENCE_OFFSET 8U
+#define PLAYER_STATE_POSITION_X_OFFSET 12U
+#define PLAYER_STATE_POSITION_Y_OFFSET 20U
+#define PLAYER_STATE_POSITION_Z_OFFSET 28U
+#define PLAYER_STATE_YAW_OFFSET 36U
+#define PLAYER_STATE_PITCH_OFFSET 38U
+#define PLAYER_STATE_LOCOMOTION_X_OFFSET 40U
+#define PLAYER_STATE_LOCOMOTION_Y_OFFSET 48U
+#define PLAYER_STATE_VERTICAL_VELOCITY_OFFSET 56U
+#define PLAYER_STATE_EXTERNAL_X_OFFSET 64U
+#define PLAYER_STATE_EXTERNAL_Y_OFFSET 72U
+#define PLAYER_STATE_JUMP_BUFFER_OFFSET 80U
+#define PLAYER_STATE_COYOTE_TIME_OFFSET 88U
+#define PLAYER_STATE_COLLIDER_CROUCH_OFFSET 96U
+#define PLAYER_STATE_EYE_CROUCH_OFFSET 104U
+#define PLAYER_STATE_AIR_JUMPS_OFFSET 112U
+#define PLAYER_STATE_FLAGS_OFFSET 116U
+
+#define SNAPSHOT_BEGIN_FLAGS_OFFSET 44U
 
 static uint16_t ReadU16(const uint8_t *input)
 {
@@ -81,6 +115,11 @@ static bool IsFiniteFloat(float value)
 static bool IsFinitePosition(double value)
 {
     return value == value && value >= -POSITION_LIMIT && value <= POSITION_LIMIT;
+}
+
+static bool IsFiniteBoundedDouble(double value, double minimum, double maximum)
+{
+    return value == value && value >= minimum && value <= maximum;
 }
 
 static int16_t QuantizeSignedUnit(float value)
@@ -372,6 +411,7 @@ uint32_t LaiueProtocolEncodeInput(uint8_t *output, uint32_t capacity,
                                   const LaiueProtocolInput *input)
 {
     if (output == NULL || input == NULL || capacity < INPUT_PAYLOAD_SIZE ||
+        input->sequence == 0 ||
         !IsFiniteFloat(input->movementX) || !IsFiniteFloat(input->movementY) ||
         !IsFiniteFloat(input->yaw) || !IsFiniteFloat(input->pitch) || input->movementX < -1.0f ||
         input->movementX > 1.0f || input->movementY < -1.0f || input->movementY > 1.0f ||
@@ -381,35 +421,100 @@ uint32_t LaiueProtocolEncodeInput(uint8_t *output, uint32_t capacity,
         return 0;
     }
 
-    WriteU16(output, (uint16_t)QuantizeSignedUnit(input->movementX));
-    WriteU16(output + 2, (uint16_t)QuantizeSignedUnit(input->movementY));
-    WriteU16(output + 4, (uint16_t)QuantizeAngle(input->yaw, ANGLE_PI));
-    WriteU16(output + 6, (uint16_t)QuantizeAngle(input->pitch, PITCH_LIMIT));
-    output[8] = (uint8_t)((input->jumpPressed ? 1U : 0U) | (input->jumpHeld ? 2U : 0U) |
-                          (input->sprintHeld ? 4U : 0U) | (input->crouchHeld ? 8U : 0U));
+    float lengthSquared =
+        input->movementX * input->movementX +
+        input->movementY * input->movementY;
+    if (lengthSquared > MOVEMENT_LENGTH_SQUARED_LIMIT)
+    {
+        return 0;
+    }
+
+    WriteU32(output + INPUT_SEQUENCE_OFFSET, input->sequence);
+    WriteU16(output + INPUT_MOVEMENT_X_OFFSET,
+             (uint16_t)QuantizeSignedUnit(input->movementX));
+    WriteU16(output + INPUT_MOVEMENT_Y_OFFSET,
+             (uint16_t)QuantizeSignedUnit(input->movementY));
+    WriteU16(output + INPUT_YAW_OFFSET,
+             (uint16_t)QuantizeAngle(input->yaw, ANGLE_PI));
+    WriteU16(output + INPUT_PITCH_OFFSET,
+             (uint16_t)QuantizeAngle(input->pitch, PITCH_LIMIT));
+    output[INPUT_FLAGS_OFFSET] =
+        (uint8_t)((input->jumpPressed ? 1U : 0U) |
+                  (input->jumpHeld ? 2U : 0U) |
+                  (input->sprintHeld ? 4U : 0U) |
+                  (input->crouchHeld ? 8U : 0U));
     return INPUT_PAYLOAD_SIZE;
 }
 
 bool LaiueProtocolDecodeInput(const uint8_t *payload, uint32_t size, LaiueProtocolInput *outInput)
 {
     if (payload == NULL || outInput == NULL || size != INPUT_PAYLOAD_SIZE ||
-        (payload[8] & 0xf0U) != 0)
+        ReadU32(payload + INPUT_SEQUENCE_OFFSET) == 0 ||
+        (payload[INPUT_FLAGS_OFFSET] & 0xf0U) != 0)
     {
         return false;
     }
 
-    outInput->movementX = (float)(int16_t)ReadU16(payload) / 32767.0f;
-    outInput->movementY = (float)(int16_t)ReadU16(payload + 2) / 32767.0f;
-    outInput->yaw = (float)(int16_t)ReadU16(payload + 4) * (ANGLE_PI / 32767.0f);
-    outInput->pitch = (float)(int16_t)ReadU16(payload + 6) * (PITCH_LIMIT / 32767.0f);
-    outInput->jumpPressed = (payload[8] & 1U) != 0;
-    outInput->jumpHeld = (payload[8] & 2U) != 0;
-    outInput->sprintHeld = (payload[8] & 4U) != 0;
-    outInput->crouchHeld = (payload[8] & 8U) != 0;
+    outInput->sequence = ReadU32(payload + INPUT_SEQUENCE_OFFSET);
+    outInput->movementX =
+        (float)(int16_t)ReadU16(payload + INPUT_MOVEMENT_X_OFFSET) /
+        32767.0f;
+    outInput->movementY =
+        (float)(int16_t)ReadU16(payload + INPUT_MOVEMENT_Y_OFFSET) /
+        32767.0f;
+    outInput->yaw =
+        (float)(int16_t)ReadU16(payload + INPUT_YAW_OFFSET) *
+        (ANGLE_PI / 32767.0f);
+    outInput->pitch =
+        (float)(int16_t)ReadU16(payload + INPUT_PITCH_OFFSET) *
+        (PITCH_LIMIT / 32767.0f);
+    outInput->jumpPressed = (payload[INPUT_FLAGS_OFFSET] & 1U) != 0;
+    outInput->jumpHeld = (payload[INPUT_FLAGS_OFFSET] & 2U) != 0;
+    outInput->sprintHeld = (payload[INPUT_FLAGS_OFFSET] & 4U) != 0;
+    outInput->crouchHeld = (payload[INPUT_FLAGS_OFFSET] & 8U) != 0;
 
     float lengthSquared =
         outInput->movementX * outInput->movementX + outInput->movementY * outInput->movementY;
-    return lengthSquared <= 1.01f;
+    return lengthSquared <= MOVEMENT_LENGTH_SQUARED_LIMIT;
+}
+
+bool NetworkInputCanonicalize(
+    const NetworkInputCommand *input, NetworkInputCommand *outInput)
+{
+    if (input == NULL || outInput == NULL)
+    {
+        return false;
+    }
+    LaiueProtocolInput wire = {
+        .sequence = input->sequence,
+        .movementX = input->movementX,
+        .movementY = input->movementY,
+        .yaw = input->yaw,
+        .pitch = input->pitch,
+        .jumpPressed = input->jumpPressed,
+        .jumpHeld = input->jumpHeld,
+        .sprintHeld = input->sprintHeld,
+        .crouchHeld = input->crouchHeld,
+    };
+    uint8_t payload[INPUT_PAYLOAD_SIZE];
+    uint32_t size =
+        LaiueProtocolEncodeInput(payload, sizeof(payload), &wire);
+    LaiueProtocolInput canonical;
+    if (size != INPUT_PAYLOAD_SIZE ||
+        !LaiueProtocolDecodeInput(payload, size, &canonical))
+    {
+        return false;
+    }
+    outInput->sequence = canonical.sequence;
+    outInput->movementX = canonical.movementX;
+    outInput->movementY = canonical.movementY;
+    outInput->yaw = canonical.yaw;
+    outInput->pitch = canonical.pitch;
+    outInput->jumpPressed = canonical.jumpPressed;
+    outInput->jumpHeld = canonical.jumpHeld;
+    outInput->sprintHeld = canonical.sprintHeld;
+    outInput->crouchHeld = canonical.crouchHeld;
+    return true;
 }
 
 uint32_t LaiueProtocolEncodeEditIntent(uint8_t *output, uint32_t capacity, bool breakBlock,
@@ -468,19 +573,69 @@ uint32_t LaiueProtocolEncodePlayerState(uint8_t *output, uint32_t capacity,
         state->peerId == 0 || !IsFinitePosition(state->position[0]) ||
         !IsFinitePosition(state->position[1]) || !IsFinitePosition(state->position[2]) ||
         !IsFiniteFloat(state->yaw) || !IsFiniteFloat(state->pitch) || state->yaw < -ANGLE_PI ||
-        state->yaw > ANGLE_PI || state->pitch < -PITCH_LIMIT || state->pitch > PITCH_LIMIT)
+        state->yaw > ANGLE_PI || state->pitch < -PITCH_LIMIT ||
+        state->pitch > PITCH_LIMIT ||
+        !IsFiniteBoundedDouble(state->locomotionVelocityX,
+                               -DYNAMIC_VELOCITY_LIMIT,
+                               DYNAMIC_VELOCITY_LIMIT) ||
+        !IsFiniteBoundedDouble(state->locomotionVelocityY,
+                               -DYNAMIC_VELOCITY_LIMIT,
+                               DYNAMIC_VELOCITY_LIMIT) ||
+        !IsFiniteBoundedDouble(state->verticalVelocity,
+                               -DYNAMIC_VELOCITY_LIMIT,
+                               DYNAMIC_VELOCITY_LIMIT) ||
+        !IsFiniteBoundedDouble(state->externalVelocityX,
+                               -DYNAMIC_VELOCITY_LIMIT,
+                               DYNAMIC_VELOCITY_LIMIT) ||
+        !IsFiniteBoundedDouble(state->externalVelocityY,
+                               -DYNAMIC_VELOCITY_LIMIT,
+                               DYNAMIC_VELOCITY_LIMIT) ||
+        !IsFiniteBoundedDouble(state->jumpBufferRemaining, 0.0,
+                               DYNAMIC_TIMER_LIMIT) ||
+        !IsFiniteBoundedDouble(state->coyoteTimeRemaining, 0.0,
+                               DYNAMIC_TIMER_LIMIT) ||
+        !IsFiniteBoundedDouble(state->colliderCrouchProgress, 0.0, 1.0) ||
+        !IsFiniteBoundedDouble(state->eyeCrouchProgress, 0.0, 1.0) ||
+        state->airJumpsRemaining < 0 ||
+        state->airJumpsRemaining > AIR_JUMPS_LIMIT)
     {
         return 0;
     }
 
-    WriteU32(output, state->serverTick);
-    WriteU32(output + 4, state->peerId);
-    WriteDouble(output + 8, state->position[0]);
-    WriteDouble(output + 16, state->position[1]);
-    WriteDouble(output + 24, state->position[2]);
-    WriteU16(output + 32, (uint16_t)QuantizeAngle(state->yaw, ANGLE_PI));
-    WriteU16(output + 34, (uint16_t)QuantizeAngle(state->pitch, PITCH_LIMIT));
-    output[36] = state->grounded ? 1U : 0U;
+    WriteU32(output + PLAYER_STATE_SERVER_TICK_OFFSET, state->serverTick);
+    WriteU32(output + PLAYER_STATE_PEER_ID_OFFSET, state->peerId);
+    WriteU32(output + PLAYER_STATE_INPUT_SEQUENCE_OFFSET,
+             state->lastProcessedInputSequence);
+    WriteDouble(output + PLAYER_STATE_POSITION_X_OFFSET, state->position[0]);
+    WriteDouble(output + PLAYER_STATE_POSITION_Y_OFFSET, state->position[1]);
+    WriteDouble(output + PLAYER_STATE_POSITION_Z_OFFSET, state->position[2]);
+    WriteU16(output + PLAYER_STATE_YAW_OFFSET,
+             (uint16_t)QuantizeAngle(state->yaw, ANGLE_PI));
+    WriteU16(output + PLAYER_STATE_PITCH_OFFSET,
+             (uint16_t)QuantizeAngle(state->pitch, PITCH_LIMIT));
+    WriteDouble(output + PLAYER_STATE_LOCOMOTION_X_OFFSET,
+                state->locomotionVelocityX);
+    WriteDouble(output + PLAYER_STATE_LOCOMOTION_Y_OFFSET,
+                state->locomotionVelocityY);
+    WriteDouble(output + PLAYER_STATE_VERTICAL_VELOCITY_OFFSET,
+                state->verticalVelocity);
+    WriteDouble(output + PLAYER_STATE_EXTERNAL_X_OFFSET,
+                state->externalVelocityX);
+    WriteDouble(output + PLAYER_STATE_EXTERNAL_Y_OFFSET,
+                state->externalVelocityY);
+    WriteDouble(output + PLAYER_STATE_JUMP_BUFFER_OFFSET,
+                state->jumpBufferRemaining);
+    WriteDouble(output + PLAYER_STATE_COYOTE_TIME_OFFSET,
+                state->coyoteTimeRemaining);
+    WriteDouble(output + PLAYER_STATE_COLLIDER_CROUCH_OFFSET,
+                state->colliderCrouchProgress);
+    WriteDouble(output + PLAYER_STATE_EYE_CROUCH_OFFSET,
+                state->eyeCrouchProgress);
+    WriteU32(output + PLAYER_STATE_AIR_JUMPS_OFFSET,
+             (uint32_t)state->airJumpsRemaining);
+    output[PLAYER_STATE_FLAGS_OFFSET] =
+        (uint8_t)((state->crouchingRequested ? 1U : 0U) |
+                  (state->grounded ? 2U : 0U));
     return PLAYER_STATE_PAYLOAD_SIZE;
 }
 
@@ -488,20 +643,78 @@ bool LaiueProtocolDecodePlayerState(const uint8_t *payload, uint32_t size,
                                     LaiueProtocolPlayerState *outState)
 {
     if (payload == NULL || outState == NULL || size != PLAYER_STATE_PAYLOAD_SIZE ||
-        payload[36] > 1U)
+        (payload[PLAYER_STATE_FLAGS_OFFSET] & 0xfcU) != 0)
     {
         return false;
     }
-    outState->serverTick = ReadU32(payload);
-    outState->peerId = ReadU32(payload + 4);
-    outState->position[0] = ReadDouble(payload + 8);
-    outState->position[1] = ReadDouble(payload + 16);
-    outState->position[2] = ReadDouble(payload + 24);
-    outState->yaw = (float)(int16_t)ReadU16(payload + 32) * (ANGLE_PI / 32767.0f);
-    outState->pitch = (float)(int16_t)ReadU16(payload + 34) * (PITCH_LIMIT / 32767.0f);
-    outState->grounded = payload[36] != 0;
+    outState->serverTick =
+        ReadU32(payload + PLAYER_STATE_SERVER_TICK_OFFSET);
+    outState->peerId = ReadU32(payload + PLAYER_STATE_PEER_ID_OFFSET);
+    outState->lastProcessedInputSequence =
+        ReadU32(payload + PLAYER_STATE_INPUT_SEQUENCE_OFFSET);
+    outState->position[0] =
+        ReadDouble(payload + PLAYER_STATE_POSITION_X_OFFSET);
+    outState->position[1] =
+        ReadDouble(payload + PLAYER_STATE_POSITION_Y_OFFSET);
+    outState->position[2] =
+        ReadDouble(payload + PLAYER_STATE_POSITION_Z_OFFSET);
+    outState->yaw =
+        (float)(int16_t)ReadU16(payload + PLAYER_STATE_YAW_OFFSET) *
+        (ANGLE_PI / 32767.0f);
+    outState->pitch =
+        (float)(int16_t)ReadU16(payload + PLAYER_STATE_PITCH_OFFSET) *
+        (PITCH_LIMIT / 32767.0f);
+    outState->locomotionVelocityX =
+        ReadDouble(payload + PLAYER_STATE_LOCOMOTION_X_OFFSET);
+    outState->locomotionVelocityY =
+        ReadDouble(payload + PLAYER_STATE_LOCOMOTION_Y_OFFSET);
+    outState->verticalVelocity =
+        ReadDouble(payload + PLAYER_STATE_VERTICAL_VELOCITY_OFFSET);
+    outState->externalVelocityX =
+        ReadDouble(payload + PLAYER_STATE_EXTERNAL_X_OFFSET);
+    outState->externalVelocityY =
+        ReadDouble(payload + PLAYER_STATE_EXTERNAL_Y_OFFSET);
+    outState->jumpBufferRemaining =
+        ReadDouble(payload + PLAYER_STATE_JUMP_BUFFER_OFFSET);
+    outState->coyoteTimeRemaining =
+        ReadDouble(payload + PLAYER_STATE_COYOTE_TIME_OFFSET);
+    outState->colliderCrouchProgress =
+        ReadDouble(payload + PLAYER_STATE_COLLIDER_CROUCH_OFFSET);
+    outState->eyeCrouchProgress =
+        ReadDouble(payload + PLAYER_STATE_EYE_CROUCH_OFFSET);
+    outState->airJumpsRemaining =
+        (int32_t)ReadU32(payload + PLAYER_STATE_AIR_JUMPS_OFFSET);
+    outState->crouchingRequested =
+        (payload[PLAYER_STATE_FLAGS_OFFSET] & 1U) != 0;
+    outState->grounded =
+        (payload[PLAYER_STATE_FLAGS_OFFSET] & 2U) != 0;
     return outState->peerId != 0 && IsFinitePosition(outState->position[0]) &&
-           IsFinitePosition(outState->position[1]) && IsFinitePosition(outState->position[2]);
+           IsFinitePosition(outState->position[1]) &&
+           IsFinitePosition(outState->position[2]) &&
+           IsFiniteBoundedDouble(outState->locomotionVelocityX,
+                                 -DYNAMIC_VELOCITY_LIMIT,
+                                 DYNAMIC_VELOCITY_LIMIT) &&
+           IsFiniteBoundedDouble(outState->locomotionVelocityY,
+                                 -DYNAMIC_VELOCITY_LIMIT,
+                                 DYNAMIC_VELOCITY_LIMIT) &&
+           IsFiniteBoundedDouble(outState->verticalVelocity,
+                                 -DYNAMIC_VELOCITY_LIMIT,
+                                 DYNAMIC_VELOCITY_LIMIT) &&
+           IsFiniteBoundedDouble(outState->externalVelocityX,
+                                 -DYNAMIC_VELOCITY_LIMIT,
+                                 DYNAMIC_VELOCITY_LIMIT) &&
+           IsFiniteBoundedDouble(outState->externalVelocityY,
+                                 -DYNAMIC_VELOCITY_LIMIT,
+                                 DYNAMIC_VELOCITY_LIMIT) &&
+           IsFiniteBoundedDouble(outState->jumpBufferRemaining, 0.0,
+                                 DYNAMIC_TIMER_LIMIT) &&
+           IsFiniteBoundedDouble(outState->coyoteTimeRemaining, 0.0,
+                                 DYNAMIC_TIMER_LIMIT) &&
+           IsFiniteBoundedDouble(outState->colliderCrouchProgress, 0.0,
+                                 1.0) &&
+           IsFiniteBoundedDouble(outState->eyeCrouchProgress, 0.0, 1.0) &&
+           outState->airJumpsRemaining >= 0 &&
+           outState->airJumpsRemaining <= AIR_JUMPS_LIMIT;
 }
 
 uint32_t LaiueProtocolEncodeBlockDelta(uint8_t *output, uint32_t capacity,
@@ -645,6 +858,8 @@ uint32_t LaiueProtocolEncodeSnapshotBegin(
     WriteU32(output + 24, snapshot->peerId);
     WriteU64(output + 28, (uint64_t)snapshot->worldSeed);
     WriteU64(output + 36, snapshot->worldTime);
+    output[SNAPSHOT_BEGIN_FLAGS_OFFSET] =
+        snapshot->requiresReadyBarrier ? 1U : 0U;
     return SNAPSHOT_BEGIN_PAYLOAD_SIZE;
 }
 
@@ -653,7 +868,8 @@ bool LaiueProtocolDecodeSnapshotBegin(
     LaiueProtocolSnapshotBegin *outSnapshot)
 {
     if (payload == NULL || outSnapshot == NULL ||
-        size != SNAPSHOT_BEGIN_PAYLOAD_SIZE)
+        size != SNAPSHOT_BEGIN_PAYLOAD_SIZE ||
+        (payload[SNAPSHOT_BEGIN_FLAGS_OFFSET] & 0xfeU) != 0)
     {
         return false;
     }
@@ -664,6 +880,8 @@ bool LaiueProtocolDecodeSnapshotBegin(
     outSnapshot->peerId = ReadU32(payload + 24);
     outSnapshot->worldSeed = (int64_t)ReadU64(payload + 28);
     outSnapshot->worldTime = ReadU64(payload + 36);
+    outSnapshot->requiresReadyBarrier =
+        (payload[SNAPSHOT_BEGIN_FLAGS_OFFSET] & 1U) != 0;
     return outSnapshot->snapshotId != 0 && outSnapshot->peerId != 0 &&
            outSnapshot->chunkCount <= LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS;
 }

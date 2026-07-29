@@ -8,7 +8,10 @@
 #include "mod/mods.h"
 #include "network/network.h"
 #include "platform/system.h"
+#include "server/player_input_queue.h"
 #include "server/server_config.h"
+#include "server/server_tick_clock.h"
+#include "server/snapshot_scheduler.h"
 #include "world/block_properties.h"
 #include "world/world.h"
 
@@ -17,12 +20,15 @@
 #include <string.h>
 
 #define SERVER_SPAWN_HEIGHT 100.0
-#define SERVER_TICK_SECONDS (1.0 / 60.0)
+#define SERVER_TICK_RATE 60U
+#define SERVER_TICK_SECONDS (1.0 / (double)SERVER_TICK_RATE)
+#define SERVER_PHYSICS_SUBSTEPS 4U
 #define SERVER_SNAPSHOT_TICKS 3U
 #define SERVER_TIME_SYNC_TICKS 60U
 #define SERVER_DAY_LENGTH_SECONDS 3600.0
 #define SERVER_MAX_CATCH_UP_TICKS 8U
-#define SERVER_INPUT_TIMEOUT_MS 250ULL
+#define SERVER_MAX_BACKLOG_SECONDS \
+    ((double)SERVER_PLAYER_INPUT_QUEUE_CAPACITY / (double)SERVER_TICK_RATE)
 #define SERVER_EDIT_COOLDOWN_MS 125ULL
 #define SERVER_BREAK_INTENT_TIMEOUT_MS 250ULL
 #define SERVER_EDIT_REACH 8.0f
@@ -53,7 +59,9 @@ typedef struct ServerPlayer
     Camera camera;
     PlayerController controller;
     PlayerControllerCommand command;
-    uint64_t lastInputAtMs;
+    ServerPlayerInputQueue inputQueue;
+    uint32_t lastProcessedInputSequence;
+    uint32_t lastInputServerTick;
     uint64_t nextEditAtMs;
     uint64_t breakStartedAtMs;
     uint64_t lastBreakIntentAtMs;
@@ -64,6 +72,7 @@ typedef struct ServerPlayer
     ServerResyncRequest resyncQueue[
         SERVER_RESYNC_QUEUE_CAPACITY];
     uint32_t resyncQueueCount;
+    ServerSnapshotScheduler snapshotScheduler;
     bool hasSnapshotCenter;
     bool fullSnapshotPending;
     bool active;
@@ -88,6 +97,8 @@ typedef struct DedicatedServer
     uint32_t nextDropSlot;
     uint32_t nextDropId;
     uint64_t nextSnapshotId;
+    ServerSnapshotWorkBudget snapshotWorkBudget;
+    uint32_t nextSnapshotPlayerIndex;
 } DedicatedServer;
 
 static NetworkAddressFamily ToNetworkAddressFamily(
@@ -271,7 +282,10 @@ static ServerPlayer *AddPlayer(DedicatedServer *server, uint32_t peerId)
         player->camera.position[2] = SERVER_SPAWN_HEIGHT;
         player->camera.yaw = 0.0f;
         player->camera.pitch = -0.4f;
-        player->lastInputAtMs = PlatformMonotonicMilliseconds();
+        ServerPlayerInputQueueInitialize(&player->inputQueue);
+        ServerSnapshotSchedulerInitialize(
+            &player->snapshotScheduler, server->tick);
+        player->lastInputServerTick = server->tick;
 
         PlayerControllerConfig configuration;
         PlayerControllerGetDefaultConfig(&configuration);
@@ -311,6 +325,44 @@ static bool SendPlayerInventory(DedicatedServer* server,
         server->network, player->peerId, &state);
 }
 
+static void BuildNetworkPlayerState(
+    const DedicatedServer* server, const ServerPlayer* player,
+    NetworkPlayerState* outState)
+{
+    PlayerControllerState physics;
+    PlayerControllerCaptureState(
+        &player->controller, &player->camera, &physics);
+
+    memset(outState, 0, sizeof(*outState));
+    outState->serverTick = server->tick;
+    outState->peerId = player->peerId;
+    outState->lastProcessedInputSequence =
+        player->lastProcessedInputSequence;
+    memcpy(outState->position, physics.position,
+        sizeof(outState->position));
+    outState->yaw = player->camera.yaw;
+    outState->pitch = player->camera.pitch;
+    outState->locomotionVelocityX =
+        physics.locomotionVelocityX;
+    outState->locomotionVelocityY =
+        physics.locomotionVelocityY;
+    outState->verticalVelocity = physics.verticalVelocity;
+    outState->externalVelocityX = physics.externalVelocityX;
+    outState->externalVelocityY = physics.externalVelocityY;
+    outState->jumpBufferRemaining =
+        physics.jumpBufferRemaining;
+    outState->coyoteTimeRemaining =
+        physics.coyoteTimeRemaining;
+    outState->colliderCrouchProgress =
+        physics.colliderCrouchProgress;
+    outState->eyeCrouchProgress =
+        physics.eyeCrouchProgress;
+    outState->airJumpsRemaining = physics.airJumpsRemaining;
+    outState->crouchingRequested =
+        physics.crouchingRequested;
+    outState->grounded = physics.grounded;
+}
+
 static int64_t ServerPositionChunk(double position)
 {
     double scaled = position / (double)CHUNK_SIZE;
@@ -338,6 +390,67 @@ static bool PlayerInterestedInChunk(
             : (uint64_t)player->snapshotCenter[axis]
                 - (uint64_t)chunk[axis];
         if (distance > SERVER_INTEREST_RADIUS_CHUNKS) return false;
+    }
+    return true;
+}
+
+static bool MutateServerModBlock(
+    void* context, int64_t x, int64_t y, int64_t z,
+    uint8_t block)
+{
+    DedicatedServer* server = context;
+    if (server == NULL || server->world == NULL ||
+        block > BLOCK_GRASS)
+    {
+        return false;
+    }
+
+    BlockType requested = (BlockType)block;
+    BlockType previous = WorldGetBlock(
+        server->world, x, y, z);
+    if (previous == requested)
+    {
+        return true;
+    }
+
+    WorldSetBlock(server->world, x, y, z, requested);
+    if (WorldGetBlock(server->world, x, y, z) != requested)
+    {
+        return false;
+    }
+
+    // Во время ModHostSync transport ещё может не существовать. Такая
+    // startup-правка остаётся в authoritative world и попадёт в первый
+    // snapshot. После старта сети каждая правка получает текущую revision и
+    // рассылается только peers, чей interest window содержит этот chunk.
+    if (server->network == NULL)
+    {
+        return true;
+    }
+
+    int64_t changedChunk[3] = {
+        ServerBlockChunk(x),
+        ServerBlockChunk(y),
+        ServerBlockChunk(z),
+    };
+    NetworkBlockDelta delta = {
+        .serverTick = server->tick,
+        .revision = WorldGetChunkRevision(
+            server->world, changedChunk),
+        .block = {x, y, z},
+        .replacement = requested,
+    };
+    for (uint32_t index = 0;
+         index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer* player = &server->players[index];
+        if (PlayerInterestedInChunk(player, changedChunk))
+        {
+            // Ошибка отправки изолирует/закрывает конкретного peer внутри
+            // transport; уже принятую authoritative mutation не откатываем.
+            (void)NetworkServerSendBlockDelta(
+                server->network, player->peerId, &delta);
+        }
     }
     return true;
 }
@@ -401,6 +514,7 @@ static bool SendWorldSnapshot(DedicatedServer* server,
         .peerId = player->peerId,
         .worldSeed = server->worldSeed,
         .worldTime = ServerWorldTimeMilliseconds(server->timeOfDayHours),
+        .requiresReadyBarrier = !player->hasSnapshotCenter,
     };
     bool succeeded = NetworkServerSendSnapshotBegin(
         server->network, player->peerId, &snapshot);
@@ -473,15 +587,8 @@ static bool SendWorldSnapshot(DedicatedServer* server,
     {
         const ServerPlayer* existing = &server->players[i];
         if (!existing->active) continue;
-        NetworkPlayerState state = {
-            .serverTick = server->tick,
-            .peerId = existing->peerId,
-            .position = { existing->camera.position[0],
-                existing->camera.position[1], existing->camera.position[2] },
-            .yaw = existing->camera.yaw,
-            .pitch = existing->camera.pitch,
-            .grounded = PlayerControllerIsGrounded(&existing->controller),
-        };
+        NetworkPlayerState state;
+        BuildNetworkPlayerState(server, existing, &state);
         succeeded = NetworkServerSendPlayerJoined(
                 server->network, player->peerId, existing->peerId)
             && NetworkServerSendPlayerState(
@@ -554,12 +661,16 @@ static void QueueChunkResync(
             queued->expectedRevision =
                 event->data.chunkResync.expectedRevision;
         }
+        ServerSnapshotSchedulerRequest(
+            &player->snapshotScheduler);
         return;
     }
     if (player->resyncQueueCount >=
         SERVER_RESYNC_QUEUE_CAPACITY)
     {
         player->fullSnapshotPending = true;
+        ServerSnapshotSchedulerRequest(
+            &player->snapshotScheduler);
         return;
     }
     ServerResyncRequest* queued =
@@ -568,30 +679,74 @@ static void QueueChunkResync(
         sizeof(queued->chunk));
     queued->expectedRevision =
         event->data.chunkResync.expectedRevision;
+    ServerSnapshotSchedulerRequest(
+        &player->snapshotScheduler);
 }
 
 static void ProcessPendingResyncs(DedicatedServer* server)
 {
-    for (uint32_t playerIndex = 0;
-        playerIndex < LAIUE_NETWORK_MAX_PEERS; ++playerIndex)
+    if (!ServerSnapshotWorkBudgetAvailable(
+            &server->snapshotWorkBudget, server->tick))
     {
+        return;
+    }
+
+    for (uint32_t offset = 0;
+        offset < LAIUE_NETWORK_MAX_PEERS; ++offset)
+    {
+        uint32_t playerIndex =
+            (server->nextSnapshotPlayerIndex + offset) %
+            LAIUE_NETWORK_MAX_PEERS;
         ServerPlayer* player = &server->players[playerIndex];
         if (!player->active) continue;
-        if (player->fullSnapshotPending)
+        if (!player->fullSnapshotPending &&
+            player->resyncQueueCount == 0)
         {
-            SendInitialWorldSnapshot(server, player);
             continue;
         }
-        if (player->resyncQueueCount == 0) continue;
+
+        bool requiresReadyBarrier =
+            !player->hasSnapshotCenter;
+        bool transportCanBegin =
+            NetworkServerCanBeginSnapshot(
+                server->network, player->peerId,
+                requiresReadyBarrier);
+        if (!ServerSnapshotSchedulerTryBegin(
+                &player->snapshotScheduler, server->tick,
+                transportCanBegin))
+        {
+            continue;
+        }
+
+        ServerSnapshotWorkBudgetConsume(
+            &server->snapshotWorkBudget);
+        server->nextSnapshotPlayerIndex =
+            (playerIndex + 1U) % LAIUE_NETWORK_MAX_PEERS;
+        bool succeeded = false;
+        if (player->fullSnapshotPending)
+        {
+            succeeded =
+                SendInitialWorldSnapshot(server, player);
+            ServerSnapshotSchedulerFinish(
+                &player->snapshotScheduler, server->tick,
+                succeeded);
+            return;
+        }
 
         int64_t minimum[3];
         int64_t maximum[3];
         memcpy(minimum, player->resyncQueue[0].chunk,
             sizeof(minimum));
         memcpy(maximum, minimum, sizeof(maximum));
-        if (!SendWorldSnapshot(
-                server, player, minimum, maximum))
-            continue;
+        succeeded = SendWorldSnapshot(
+            server, player, minimum, maximum);
+        if (!succeeded)
+        {
+            ServerSnapshotSchedulerFinish(
+                &player->snapshotScheduler, server->tick,
+                false);
+            return;
+        }
         for (uint32_t index = 1;
             index < player->resyncQueueCount; ++index)
         {
@@ -599,6 +754,14 @@ static void ProcessPendingResyncs(DedicatedServer* server)
                 player->resyncQueue[index];
         }
         --player->resyncQueueCount;
+        ServerSnapshotSchedulerFinish(
+            &player->snapshotScheduler, server->tick, true);
+        if (player->resyncQueueCount != 0)
+        {
+            ServerSnapshotSchedulerRequest(
+                &player->snapshotScheduler);
+        }
+        return;
     }
 }
 
@@ -734,8 +897,11 @@ static void HandleNetworkEvents(DedicatedServer *server)
                             existing->peerId, connected->peerId);
                     }
                 }
-                if (!SendInitialWorldSnapshot(server, connected))
-                    connected->fullSnapshotPending = true;
+                // Snapshot construction is scheduled after the fixed ticks;
+                // accepting a peer must not stall every existing player.
+                connected->fullSnapshotPending = true;
+                ServerSnapshotSchedulerRequest(
+                    &connected->snapshotScheduler);
             }
             continue;
         }
@@ -753,15 +919,23 @@ static void HandleNetworkEvents(DedicatedServer *server)
         }
         if (event.type == NETWORK_SERVER_EVENT_INPUT)
         {
-            player->command.movementX = event.data.input.movementX;
-            player->command.movementY = event.data.input.movementY;
-            player->command.jumpPressed = event.data.input.jumpPressed;
-            player->command.jumpHeld = event.data.input.jumpHeld;
-            player->command.sprintHeld = event.data.input.sprintHeld;
-            player->command.crouchHeld = event.data.input.crouchHeld;
-            player->camera.yaw = event.data.input.yaw;
-            player->camera.pitch = event.data.input.pitch;
-            player->lastInputAtMs = PlatformMonotonicMilliseconds();
+            ServerPlayerInputPushResult pushed =
+                ServerPlayerInputQueuePush(
+                    &player->inputQueue, &event.data.input);
+            if (pushed == SERVER_PLAYER_INPUT_OVERFLOW)
+            {
+                NetworkServerDisconnect(server->network, player->peerId,
+                    NETWORK_DISCONNECT_OVERFLOW);
+            }
+            else if (pushed == SERVER_PLAYER_INPUT_GAP)
+            {
+                NetworkServerDisconnect(server->network, player->peerId,
+                    NETWORK_DISCONNECT_PROTOCOL);
+            }
+            else if (pushed == SERVER_PLAYER_INPUT_ACCEPTED)
+            {
+                player->lastInputServerTick = server->tick;
+            }
         }
         else if (event.type == NETWORK_SERVER_EVENT_EDIT_INTENT)
         {
@@ -814,12 +988,34 @@ static void SimulateTick(DedicatedServer *server)
         {
             continue;
         }
-        if (now - player->lastInputAtMs > SERVER_INPUT_TIMEOUT_MS)
+        NetworkInputCommand input;
+        bool consumedInput =
+            ServerPlayerInputQueuePop(&player->inputQueue, &input);
+        if (consumedInput)
+        {
+            player->command.movementX = input.movementX;
+            player->command.movementY = input.movementY;
+            player->command.jumpPressed = input.jumpPressed;
+            player->command.jumpHeld = input.jumpHeld;
+            player->command.sprintHeld = input.sprintHeld;
+            player->command.crouchHeld = input.crouchHeld;
+            player->camera.yaw = input.yaw;
+            player->camera.pitch = input.pitch;
+            player->lastProcessedInputSequence = input.sequence;
+        }
+        else
+        {
+            // Held state may span ticks, but a press edge is consumed once.
+            player->command.jumpPressed = false;
+        }
+        if (!consumedInput && ServerPlayerInputTimedOut(
+                server->tick, player->lastInputServerTick))
         {
             memset(&player->command, 0, sizeof(player->command));
         }
-        PlayerControllerUpdate(&player->controller, &server->collision, &player->camera,
-                               &player->command, (float)SERVER_TICK_SECONDS);
+        PlayerControllerSimulateFixedSteps(&player->controller,
+            &server->collision, &player->camera,
+            &player->command, SERVER_PHYSICS_SUBSTEPS);
         player->command.jumpPressed = false;
         if (player->breaking
             && now - player->lastBreakIntentAtMs
@@ -878,15 +1074,8 @@ static void SimulateTick(DedicatedServer *server)
         {
             continue;
         }
-        NetworkPlayerState state = {
-            .serverTick = server->tick,
-            .peerId = player->peerId,
-            .position = {player->camera.position[0], player->camera.position[1],
-                         player->camera.position[2]},
-            .yaw = player->camera.yaw,
-            .pitch = player->camera.pitch,
-            .grounded = PlayerControllerIsGrounded(&player->controller),
-        };
+        NetworkPlayerState state;
+        BuildNetworkPlayerState(server, player, &state);
         NetworkServerBroadcastPlayerState(server->network, &state);
     }
 }
@@ -907,18 +1096,16 @@ static void RefreshPlayerInterest(DedicatedServer* server)
             changed = changed
                 || center[axis] != player->snapshotCenter[axis];
         if (!changed) continue;
-        int64_t minimum[3];
-        int64_t maximum[3];
-        for (uint32_t axis = 0; axis < 3U; ++axis)
-        {
-            minimum[axis] = center[axis] - SERVER_INTEREST_RADIUS_CHUNKS;
-            maximum[axis] = center[axis] + SERVER_INTEREST_RADIUS_CHUNKS;
-        }
-        if (SendWorldSnapshot(server, player, minimum, maximum))
-        {
-            memcpy(player->snapshotCenter, center,
-                sizeof(player->snapshotCenter));
-        }
+        // The next snapshot is a live interest update (hasSnapshotCenter is
+        // already true), so the transport keeps READY and input flowing.
+        // Defer the work and let the fixed-tick scheduler coalesce movement
+        // while the previous QUIC auxiliary stream is still draining.
+        player->fullSnapshotPending = true;
+        ServerSnapshotSchedulerRequest(
+            &player->snapshotScheduler);
+        // Registration is cheap and must visit every peer. The global
+        // snapshot work budget below limits expensive preparation/sending;
+        // returning here would let a slow low-index peer starve all others.
     }
 }
 
@@ -951,6 +1138,8 @@ static uint32_t RunServer(void)
     server->world = world;
     server->worldSeed = configuration->worldSeed;
     server->timeOfDayHours = 12.0f;
+    ServerSnapshotWorkBudgetInitialize(
+        &server->snapshotWorkBudget, server->tick);
     server->collision.context = world;
     server->collision.queryBlockPhysics = QueryWorldBlockPhysics;
 
@@ -960,6 +1149,10 @@ static uint32_t RunServer(void)
         .world = world,
         .timeOfDayHours = &server->timeOfDayHours,
         .runtimeSide = MOD_SIDE_SERVER,
+        .blockMutationPolicy =
+            MOD_HOST_BLOCK_MUTATION_CALLBACK,
+        .blockMutationContext = server,
+        .mutateBlock = MutateServerModBlock,
         .modDataDirectory = L"saves\\default\\moddata",
     };
     PlatformCreateDirectory(L"saves\\default\\moddata");
@@ -1094,7 +1287,8 @@ static uint32_t RunServer(void)
 
     PlatformInstallTerminationHandler();
     double previousTime = ServerTimeSeconds();
-    double accumulator = 0.0;
+    ServerTickClock tickClock;
+    ServerTickClockInitialize(&tickClock);
     while (!PlatformTerminationRequested())
     {
         double currentTime = ServerTimeSeconds();
@@ -1104,29 +1298,30 @@ static uint32_t RunServer(void)
         {
             elapsed = 0.0;
         }
-        else if (elapsed > 0.25)
-        {
-            elapsed = 0.25;
-        }
-        accumulator += elapsed;
+        ServerTickClockAccumulate(
+            &tickClock, elapsed, SERVER_MAX_BACKLOG_SECONDS);
 
         NetworkServerUpdate(network);
         HandleNetworkEvents(server);
-        ProcessPendingResyncs(server);
 
         uint32_t steps = 0;
-        while (accumulator >= SERVER_TICK_SECONDS && steps < SERVER_MAX_CATCH_UP_TICKS)
+        while (ServerTickClockHasTick(
+                &tickClock, SERVER_TICK_SECONDS)
+            && steps < SERVER_MAX_CATCH_UP_TICKS)
         {
             SimulateTick(server);
-            accumulator -= SERVER_TICK_SECONDS;
+            ServerTickClockConsumeTick(
+                &tickClock, SERVER_TICK_SECONDS);
             steps++;
         }
-        if (steps == SERVER_MAX_CATCH_UP_TICKS)
-        {
-            accumulator = 0.0;
-        }
         if (steps != 0) RefreshPlayerInterest(server);
-        PlatformSleepMilliseconds(1U);
+        bool caughtUp = !ServerTickClockHasTick(
+            &tickClock, SERVER_TICK_SECONDS);
+        if (caughtUp)
+        {
+            ProcessPendingResyncs(server);
+            PlatformSleepMilliseconds(1U);
+        }
     }
 
     PlatformRemoveTerminationHandler();

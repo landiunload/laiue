@@ -1,4 +1,5 @@
 #include "mod/mod_host.h"
+#include "mod/mod_block_policy.h"
 #include "mod/mods.h"
 #include "content/content_catalog.h"
 #include "platform/system.h"
@@ -139,12 +140,8 @@ static bool ApiSetBlock(void *hostPointer, int64_t x, int64_t y, int64_t z, uint
     }
 
     ModHostBindings *bindings = &slot->owner->bindings;
-    WorldSetBlock(bindings->world, x, y, z, (BlockType)block);
-    if (bindings->invalidateBlock != NULL)
-    {
-        bindings->invalidateBlock(bindings->invalidateContext, x, y, z);
-    }
-    return true;
+    return ModHostApplyBlockMutation(
+        bindings, x, y, z, block);
 }
 
 static void ApiGetPlayerPosition(void *hostPointer, double outPosition[3])
@@ -471,6 +468,15 @@ static void FillApi(ModHostSlot *slot)
 
 bool ModHostInit(ModHost *host, const ModHostBindings *bindings)
 {
+    if (host == NULL || bindings == NULL || bindings->world == NULL ||
+        (uint32_t)bindings->blockMutationPolicy >
+            (uint32_t)MOD_HOST_BLOCK_MUTATION_CALLBACK ||
+        (bindings->blockMutationPolicy ==
+             MOD_HOST_BLOCK_MUTATION_CALLBACK &&
+         bindings->mutateBlock == NULL))
+    {
+        return false;
+    }
     host->bindings = *bindings;
     memset(host->interfaces, 0, sizeof(host->interfaces));
     host->fixedTickAccumulator = 0.0f;

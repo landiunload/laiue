@@ -144,7 +144,8 @@ renderer или mesher. Направления include-зависимостей 
 - [шейдерпаки](docs/shaderpacks.md)
 - [текстурпаки](docs/texturepacks.md)
 - [сохранения](docs/world_format.md)
-- [физика игрока](docs/player_physics.md)
+- [параметры физики игрока](docs/player_physics.md)
+- [сетевая физика и репликация](docs/physics.md)
 
 ## Лицензия
 

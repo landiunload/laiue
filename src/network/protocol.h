@@ -89,6 +89,7 @@ typedef struct LaiueProtocolFrame
 
 typedef struct LaiueProtocolInput
 {
+    uint32_t sequence;
     float movementX;
     float movementY;
     float yaw;
@@ -103,9 +104,21 @@ typedef struct LaiueProtocolPlayerState
 {
     uint32_t serverTick;
     uint32_t peerId;
+    uint32_t lastProcessedInputSequence;
     double position[3];
     float yaw;
     float pitch;
+    double locomotionVelocityX;
+    double locomotionVelocityY;
+    double verticalVelocity;
+    double externalVelocityX;
+    double externalVelocityY;
+    double jumpBufferRemaining;
+    double coyoteTimeRemaining;
+    double colliderCrouchProgress;
+    double eyeCrouchProgress;
+    int32_t airJumpsRemaining;
+    bool crouchingRequested;
     bool grounded;
 } LaiueProtocolPlayerState;
 
@@ -147,6 +160,7 @@ typedef struct LaiueProtocolSnapshotBegin
     uint32_t peerId;
     int64_t worldSeed;
     uint64_t worldTime;
+    bool requiresReadyBarrier;
 } LaiueProtocolSnapshotBegin;
 
 typedef struct LaiueProtocolChunkEdit

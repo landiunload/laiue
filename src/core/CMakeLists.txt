@@ -29,6 +29,8 @@ laiue_add_module(core
         server_list.h
         player_command_mapper.c
         player_command_mapper.h
+        remote_player_renderer.c
+        remote_player_renderer.h
         ui.c
         ui.h
         ui_font.c

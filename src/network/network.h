@@ -124,6 +124,11 @@ typedef struct NetworkModDescriptor
 
 typedef struct NetworkInputCommand
 {
+    // Monotonically increasing per-client simulation command identifier.
+    // Zero is reserved and rejected. Call NetworkInputCanonicalize before
+    // prediction so the locally simulated values exactly match the values
+    // reconstructed by the authoritative server from the wire.
+    uint32_t sequence;
     float movementX;
     float movementY;
     float yaw;
@@ -138,9 +143,23 @@ typedef struct NetworkPlayerState
 {
     uint32_t serverTick;
     uint32_t peerId;
+    // Last input sequence incorporated into this authoritative state. Zero
+    // means that the server has not processed a command from this peer yet.
+    uint32_t lastProcessedInputSequence;
     double position[3];
     float yaw;
     float pitch;
+    double locomotionVelocityX;
+    double locomotionVelocityY;
+    double verticalVelocity;
+    double externalVelocityX;
+    double externalVelocityY;
+    double jumpBufferRemaining;
+    double coyoteTimeRemaining;
+    double colliderCrouchProgress;
+    double eyeCrouchProgress;
+    int32_t airJumpsRemaining;
+    bool crouchingRequested;
     bool grounded;
 } NetworkPlayerState;
 
@@ -179,6 +198,10 @@ typedef struct NetworkSnapshotInfo
     uint32_t peerId;
     int64_t worldSeed;
     uint64_t worldTime;
+    // Initial synchronization must set this to true. A live interest-window
+    // snapshot for an already-ready peer must set it to false, in which case
+    // gameplay remains enabled and no READY acknowledgement is exchanged.
+    bool requiresReadyBarrier;
 } NetworkSnapshotInfo;
 
 typedef struct NetworkBlockDrop
@@ -347,6 +370,14 @@ LAIUE_NETWORK_API bool NetworkServerConfigurationIsValid(
     const NetworkServerConfiguration *configuration);
 LAIUE_NETWORK_API NetworkSecureTransportStatus NetworkGetSecureTransportStatus(void);
 
+// Validates and applies the exact protocol quantization used by
+// NetworkClientSendInput. The output is safe to use for local prediction and
+// then send unchanged; input and output may point to the same object.
+// Returns false for sequence zero, non-finite/out-of-range fields, or movement
+// vectors longer than one.
+LAIUE_NETWORK_API bool NetworkInputCanonicalize(
+    const NetworkInputCommand *input, NetworkInputCommand *outInput);
+
 // Production entry points are authenticated QUIC/TLS 1.3 only. They fail
 // closed when MsQuic is not compiled in or credentials cannot be validated.
 // A client-side resolution/start failure can return a valid client already in
@@ -399,6 +430,10 @@ LAIUE_NETWORK_API NetworkServer *NetworkServerCreateLoopback(
 LAIUE_NETWORK_API void NetworkServerDestroy(NetworkServer *server);
 LAIUE_NETWORK_API void NetworkServerUpdate(NetworkServer *server);
 LAIUE_NETWORK_API bool NetworkServerPollEvent(NetworkServer *server, NetworkServerEvent *outEvent);
+// Disconnects exactly one known peer. Intended for bounded-queue overflow and
+// invalid/non-monotonic command abuse detected by the authoritative server.
+LAIUE_NETWORK_API bool NetworkServerDisconnect(
+    NetworkServer *server, uint32_t peerId, NetworkDisconnectReason reason);
 LAIUE_NETWORK_API bool NetworkServerBroadcastPlayerState(NetworkServer *server,
                                                          const NetworkPlayerState *state);
 LAIUE_NETWORK_API bool NetworkServerSendPlayerState(
@@ -409,6 +444,12 @@ LAIUE_NETWORK_API bool NetworkServerSendBlockDelta(
     const NetworkBlockDelta *delta);
 LAIUE_NETWORK_API bool NetworkServerBroadcastBlockDelta(NetworkServer *server,
                                                         const NetworkBlockDelta *delta);
+// Cheap readiness probe for expensive snapshot preparation. False means the
+// previous auxiliary stream is still active or the peer is not in a state
+// compatible with the requested initial/live snapshot.
+LAIUE_NETWORK_API bool NetworkServerCanBeginSnapshot(
+    NetworkServer *server, uint32_t peerId,
+    bool requiresReadyBarrier);
 LAIUE_NETWORK_API bool NetworkServerSendSnapshotBegin(
     NetworkServer *server, uint32_t peerId,
     const NetworkSnapshotInfo *snapshot);

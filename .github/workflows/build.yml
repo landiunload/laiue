@@ -227,15 +227,15 @@ jobs:
         if: matrix.configure_preset == 'linux-clang'
         run: |
           cmake --build --preset linux-clang-release --parallel \
-            --target laiue_server_bundle laiue_modsdk_bundle
-          tar -C build/linux-clang/bundles/server/Release \
-            -czf /tmp/laiue-linux-x86_64-gnu.tar.gz .
+            --target laiue_server_archive laiue_modsdk_bundle
       - name: Upload glibc server
         if: matrix.configure_preset == 'linux-clang'
         uses: actions/upload-artifact@v4
         with:
           name: laiue-linux-x86_64-gnu
-          path: /tmp/laiue-linux-x86_64-gnu.tar.gz
+          path: |
+            build/linux-clang/packages/Release/laiue-linux-x86_64-gnu.tar.gz
+            build/linux-clang/packages/Release/laiue-linux-x86_64-gnu.tar.gz.sha256
           if-no-files-found: error
       - name: Upload glibc mod stage
         if: matrix.configure_preset == 'linux-clang'
@@ -332,13 +332,13 @@ jobs:
       - name: Package musl server
         run: |
           cmake --build --preset linux-musl-release --parallel \
-            --target laiue_server_bundle laiue_modsdk_bundle
-          tar -C build/linux-musl/bundles/server/Release \
-            -czf /tmp/laiue-linux-x86_64-musl.tar.gz .
+            --target laiue_server_archive laiue_modsdk_bundle
       - uses: actions/upload-artifact@v4
         with:
           name: laiue-linux-x86_64-musl
-          path: /tmp/laiue-linux-x86_64-musl.tar.gz
+          path: |
+            build/linux-musl/packages/Release/laiue-linux-x86_64-musl.tar.gz
+            build/linux-musl/packages/Release/laiue-linux-x86_64-musl.tar.gz.sha256
           if-no-files-found: error
       - name: Upload musl mod stage
         uses: actions/upload-artifact@v4
@@ -367,9 +367,15 @@ jobs:
           path: build/package
       - name: Extract release bundle
         run: |
+          (cd build/package && \
+            sha256sum -c laiue-linux-x86_64-gnu.tar.gz.sha256)
           mkdir -p build/runtime
           tar -xzf build/package/laiue-linux-x86_64-gnu.tar.gz \
             -C build/runtime
+          test "$(stat -c %a build/runtime/laiue_server)" = 755
+          test "$(stat -c %a \
+            build/runtime/deploy/laiue-server.service)" = 644
+          test -z "$(find build/runtime -type f -perm /022 -print -quit)"
       - name: Smoke in clean Debian 13 runtime
         run: |
           docker run --rm \
@@ -395,9 +401,15 @@ jobs:
           path: build/package
       - name: Extract release bundle
         run: |
+          (cd build/package && \
+            sha256sum -c laiue-linux-x86_64-musl.tar.gz.sha256)
           mkdir -p build/runtime
           tar -xzf build/package/laiue-linux-x86_64-musl.tar.gz \
             -C build/runtime
+          test "$(stat -c %a build/runtime/laiue_server)" = 755
+          test "$(stat -c %a \
+            build/runtime/deploy/laiue-server.service)" = 644
+          test -z "$(find build/runtime -type f -perm /022 -print -quit)"
       - name: Smoke in clean Alpine runtime
         run: |
           docker run --rm \

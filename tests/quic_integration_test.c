@@ -36,6 +36,12 @@ typedef struct ReadyScenarioState
     bool acknowledgementSent;
     bool inputSent;
     bool inputReceived;
+    bool liveSnapshotSent;
+    bool liveSnapshotBeginReceived;
+    bool liveSnapshotChunkReceived;
+    bool liveSnapshotEndReceived;
+    bool liveInputSent;
+    bool liveInputReceived;
     uint32_t peerId;
 } ReadyScenarioState;
 
@@ -379,6 +385,7 @@ static bool SendInitialSnapshot(
         .peerId = peerId,
         .worldSeed = INT64_C(0x102030405060708),
         .worldTime = UINT64_C(4567),
+        .requiresReadyBarrier = true,
     };
     const NetworkChunkDelta chunk = {
         .chunk = {0, 0, 0},
@@ -396,9 +403,21 @@ static bool SendInitialSnapshot(
     const NetworkPlayerState playerState = {
         .serverTick = 1234U,
         .peerId = peerId,
+        .lastProcessedInputSequence = 0U,
         .position = {1.0, 2.0, 3.0},
         .yaw = 0.5f,
         .pitch = -0.25f,
+        .locomotionVelocityX = 2.5,
+        .locomotionVelocityY = -1.25,
+        .verticalVelocity = 4.0,
+        .externalVelocityX = 0.5,
+        .externalVelocityY = -0.75,
+        .jumpBufferRemaining = 0.1,
+        .coyoteTimeRemaining = 0.05,
+        .colliderCrouchProgress = 0.25,
+        .eyeCrouchProgress = 0.5,
+        .airJumpsRemaining = 1,
+        .crouchingRequested = true,
         .grounded = true,
     };
     const NetworkBlockDrop drop = {
@@ -415,6 +434,34 @@ static bool SendInitialSnapshot(
            NetworkServerSendPlayerState(
                server, peerId, &playerState) &&
            NetworkServerSendBlockDrop(server, peerId, &drop) &&
+           NetworkServerSendSnapshotEnd(
+               server, peerId, snapshot.snapshotId,
+               snapshot.worldRevision);
+}
+
+static bool SendLiveSnapshot(
+    NetworkServer *server, uint32_t peerId)
+{
+    const NetworkSnapshotInfo snapshot = {
+        .snapshotId = UINT64_C(0x8877665544332211),
+        .worldRevision = UINT64_C(18),
+        .serverTick = 1235U,
+        .chunkCount = 1U,
+        .peerId = peerId,
+        .worldSeed = INT64_C(0x102030405060708),
+        .worldTime = UINT64_C(4568),
+        .requiresReadyBarrier = false,
+    };
+    const NetworkChunkDelta chunk = {
+        .chunk = {1, 0, 0},
+        .revision = UINT64_C(18),
+        .partIndex = 0U,
+        .partCount = 1U,
+        .editCount = 1U,
+        .edits = {{4U, 5U, 6U, 2U}},
+    };
+    return NetworkServerSendSnapshotBegin(server, peerId, &snapshot) &&
+           NetworkServerSendSnapshotChunk(server, peerId, &chunk) &&
            NetworkServerSendSnapshotEnd(
                server, peerId, snapshot.snapshotId,
                snapshot.worldRevision);
@@ -438,23 +485,50 @@ static bool HandleReadyServerEvents(
         }
         else if (event.type == NETWORK_SERVER_EVENT_INPUT)
         {
-            if (!state->acknowledgementSent ||
-                event.peerId != state->peerId ||
-                !ApproximatelyEqual(event.data.input.movementX, 0.25f) ||
-                !ApproximatelyEqual(event.data.input.movementY, -0.5f) ||
-                !ApproximatelyEqual(event.data.input.yaw, 0.75f) ||
-                !ApproximatelyEqual(event.data.input.pitch, -0.25f) ||
-                !event.data.input.jumpPressed ||
-                event.data.input.jumpHeld ||
-                !event.data.input.sprintHeld ||
-                event.data.input.crouchHeld)
+            if (event.peerId != state->peerId)
             {
                 return false;
             }
-            state->inputReceived = true;
+            if (event.data.input.sequence == 41U)
+            {
+                if (!state->acknowledgementSent ||
+                    state->inputReceived ||
+                    !ApproximatelyEqual(
+                        event.data.input.movementX, 0.25f) ||
+                    !ApproximatelyEqual(
+                        event.data.input.movementY, -0.5f) ||
+                    !ApproximatelyEqual(
+                        event.data.input.yaw, 0.75f) ||
+                    !ApproximatelyEqual(
+                        event.data.input.pitch, -0.25f) ||
+                    !event.data.input.jumpPressed ||
+                    event.data.input.jumpHeld ||
+                    !event.data.input.sprintHeld ||
+                    event.data.input.crouchHeld ||
+                    !SendLiveSnapshot(server, event.peerId))
+                {
+                    return false;
+                }
+                state->inputReceived = true;
+                state->liveSnapshotSent = true;
+            }
+            else if (event.data.input.sequence == 42U)
+            {
+                if (!state->liveSnapshotSent ||
+                    !state->liveInputSent ||
+                    state->liveInputReceived)
+                {
+                    return false;
+                }
+                state->liveInputReceived = true;
+            }
+            else
+            {
+                return false;
+            }
         }
         else if (event.type == NETWORK_SERVER_EVENT_DISCONNECTED &&
-                 !state->inputReceived)
+                 !state->liveInputReceived)
         {
             return false;
         }
@@ -484,45 +558,114 @@ static bool HandleReadyClientEvents(
                 state->modsSubmitted = true;
                 break;
             case NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN:
-                if (!state->serverConnected ||
-                    state->snapshotBeginReceived ||
-                    event.data.snapshot.snapshotId !=
-                        UINT64_C(0x1122334455667788) ||
-                    event.data.snapshot.chunkCount != 1U)
+                if (event.data.snapshot.snapshotId ==
+                    UINT64_C(0x1122334455667788))
+                {
+                    if (!state->serverConnected ||
+                        state->snapshotBeginReceived ||
+                        event.data.snapshot.chunkCount != 1U ||
+                        !event.data.snapshot.requiresReadyBarrier)
+                    {
+                        return false;
+                    }
+                    state->snapshotBeginReceived = true;
+                }
+                else if (event.data.snapshot.snapshotId ==
+                         UINT64_C(0x8877665544332211))
+                {
+                    const NetworkInputCommand input = {
+                        .sequence = 42U,
+                        .movementX = -0.25f,
+                    };
+                    if (!state->readyReceived ||
+                        !state->liveSnapshotSent ||
+                        state->liveSnapshotBeginReceived ||
+                        event.data.snapshot.chunkCount != 1U ||
+                        event.data.snapshot.requiresReadyBarrier ||
+                        NetworkClientGetState(client) !=
+                            NETWORK_CONNECTION_READY ||
+                        !NetworkClientSendInput(client, &input))
+                    {
+                        return false;
+                    }
+                    state->liveSnapshotBeginReceived = true;
+                    state->liveInputSent = true;
+                }
+                else
                 {
                     return false;
                 }
-                state->snapshotBeginReceived = true;
                 break;
             case NETWORK_CLIENT_EVENT_SNAPSHOT_CHUNK:
-                if (!state->snapshotBeginReceived ||
-                    state->snapshotChunkReceived ||
-                    event.data.chunkDelta.chunk[0] != 0 ||
-                    event.data.chunkDelta.chunk[1] != 0 ||
-                    event.data.chunkDelta.chunk[2] != 0 ||
-                    event.data.chunkDelta.revision != UINT64_C(17) ||
-                    event.data.chunkDelta.partIndex != 0U ||
-                    event.data.chunkDelta.partCount != 1U ||
-                    event.data.chunkDelta.editCount != 1U ||
-                    event.data.chunkDelta.edits[0].localX != 1U ||
-                    event.data.chunkDelta.edits[0].localY != 2U ||
-                    event.data.chunkDelta.edits[0].localZ != 3U ||
-                    event.data.chunkDelta.edits[0].replacement != 1U)
+                if (!state->snapshotChunkReceived)
                 {
-                    return false;
+                    if (!state->snapshotBeginReceived ||
+                        event.data.chunkDelta.chunk[0] != 0 ||
+                        event.data.chunkDelta.chunk[1] != 0 ||
+                        event.data.chunkDelta.chunk[2] != 0 ||
+                        event.data.chunkDelta.revision != UINT64_C(17) ||
+                        event.data.chunkDelta.partIndex != 0U ||
+                        event.data.chunkDelta.partCount != 1U ||
+                        event.data.chunkDelta.editCount != 1U ||
+                        event.data.chunkDelta.edits[0].localX != 1U ||
+                        event.data.chunkDelta.edits[0].localY != 2U ||
+                        event.data.chunkDelta.edits[0].localZ != 3U ||
+                        event.data.chunkDelta.edits[0].replacement != 1U)
+                    {
+                        return false;
+                    }
+                    state->snapshotChunkReceived = true;
                 }
-                state->snapshotChunkReceived = true;
+                else
+                {
+                    if (!state->liveSnapshotBeginReceived ||
+                        state->liveSnapshotChunkReceived ||
+                        NetworkClientGetState(client) !=
+                            NETWORK_CONNECTION_READY ||
+                        event.data.chunkDelta.chunk[0] != 1 ||
+                        event.data.chunkDelta.revision != UINT64_C(18) ||
+                        event.data.chunkDelta.editCount != 1U ||
+                        event.data.chunkDelta.edits[0].localX != 4U ||
+                        event.data.chunkDelta.edits[0].localY != 5U ||
+                        event.data.chunkDelta.edits[0].localZ != 6U ||
+                        event.data.chunkDelta.edits[0].replacement != 2U)
+                    {
+                        return false;
+                    }
+                    state->liveSnapshotChunkReceived = true;
+                }
                 break;
             case NETWORK_CLIENT_EVENT_SNAPSHOT_END:
-                if (!state->snapshotChunkReceived ||
-                    state->snapshotEndReceived ||
-                    event.data.snapshot.snapshotId !=
-                        UINT64_C(0x1122334455667788) ||
-                    event.data.snapshot.worldRevision != UINT64_C(17))
+                if (event.data.snapshot.snapshotId ==
+                    UINT64_C(0x1122334455667788))
+                {
+                    if (!state->snapshotChunkReceived ||
+                        state->snapshotEndReceived ||
+                        event.data.snapshot.worldRevision != UINT64_C(17) ||
+                        !event.data.snapshot.requiresReadyBarrier)
+                    {
+                        return false;
+                    }
+                    state->snapshotEndReceived = true;
+                }
+                else if (event.data.snapshot.snapshotId ==
+                         UINT64_C(0x8877665544332211))
+                {
+                    if (!state->liveSnapshotChunkReceived ||
+                        state->liveSnapshotEndReceived ||
+                        event.data.snapshot.worldRevision != UINT64_C(18) ||
+                        event.data.snapshot.requiresReadyBarrier ||
+                        NetworkClientGetState(client) !=
+                            NETWORK_CONNECTION_READY)
+                    {
+                        return false;
+                    }
+                    state->liveSnapshotEndReceived = true;
+                }
+                else
                 {
                     return false;
                 }
-                state->snapshotEndReceived = true;
                 break;
             case NETWORK_CLIENT_EVENT_INVENTORY_STATE:
                 if (!state->snapshotEndReceived ||
@@ -554,6 +697,18 @@ static bool HandleReadyClientEvents(
                 if (!state->snapshotEndReceived ||
                     event.data.playerState.peerId != state->peerId ||
                     event.data.playerState.serverTick != 1234U ||
+                    event.data.playerState.lastProcessedInputSequence != 0U ||
+                    event.data.playerState.locomotionVelocityX != 2.5 ||
+                    event.data.playerState.locomotionVelocityY != -1.25 ||
+                    event.data.playerState.verticalVelocity != 4.0 ||
+                    event.data.playerState.externalVelocityX != 0.5 ||
+                    event.data.playerState.externalVelocityY != -0.75 ||
+                    event.data.playerState.jumpBufferRemaining != 0.1 ||
+                    event.data.playerState.coyoteTimeRemaining != 0.05 ||
+                    event.data.playerState.colliderCrouchProgress != 0.25 ||
+                    event.data.playerState.eyeCrouchProgress != 0.5 ||
+                    event.data.playerState.airJumpsRemaining != 1 ||
+                    !event.data.playerState.crouchingRequested ||
                     !event.data.playerState.grounded)
                 {
                     return false;
@@ -586,6 +741,7 @@ static bool HandleReadyClientEvents(
                 state->readyReceived = true;
                 state->acknowledgementSent = true;
                 const NetworkInputCommand input = {
+                    .sequence = 41U,
                     .movementX = 0.25f,
                     .movementY = -0.5f,
                     .yaw = 0.75f,
@@ -638,6 +794,7 @@ static bool RunReadyScenario(
         return false;
     }
     const NetworkInputCommand prematureInput = {
+        .sequence = 1U,
         .movementX = 1.0f,
     };
     if (NetworkClientSendInput(client, &prematureInput))
@@ -652,7 +809,8 @@ static bool RunReadyScenario(
     memset(&state, 0, sizeof(state));
     uint64_t deadline = MonotonicMilliseconds() + TEST_CASE_TIMEOUT_MS;
     bool succeeded = true;
-    while (!state.inputReceived &&
+    while ((!state.liveInputReceived ||
+            !state.liveSnapshotEndReceived) &&
            MonotonicMilliseconds() <= deadline)
     {
         NetworkServerUpdate(server);
@@ -673,7 +831,11 @@ static bool RunReadyScenario(
         state.playerJoinedReceived && state.playerStateReceived &&
         state.blockDropReceived && state.readyReceived &&
         state.acknowledgementSent && state.inputSent &&
-        state.inputReceived;
+        state.inputReceived && state.liveSnapshotSent &&
+        state.liveSnapshotBeginReceived &&
+        state.liveSnapshotChunkReceived &&
+        state.liveSnapshotEndReceived &&
+        state.liveInputSent && state.liveInputReceived;
 
     NetworkClientDestroy(client);
     NetworkServerDestroy(server);
