@@ -16,7 +16,7 @@ jobs:
         configure_preset:
           [windows-msvc, windows-clang, windows-msvc-server]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - name: Activate latest x64 C++ environment
         shell: pwsh
         run: |
@@ -219,7 +219,7 @@ jobs:
           apt-get install -y \
             ca-certificates clang cmake g++ gcc git gzip libssl-dev \
             make ninja-build openssl perl
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - name: Build lean pinned MsQuic 2.5.9
         run: |
           git clone --filter=blob:none --no-checkout \
@@ -322,7 +322,7 @@ jobs:
           apk add --no-cache
           bash build-base cmake gcompat git gzip linux-headers ninja
           openssl openssl-dev perl tar
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - name: Build pinned MsQuic 2.5.9 for musl
         run: |
           git clone --filter=blob:none --no-checkout \
@@ -408,7 +408,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: debian-server
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-linux-x86_64-gnu
@@ -441,7 +441,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: alpine-server
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: laiue-linux-x86_64-musl
@@ -473,7 +473,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [windows-build, debian-server, alpine-server]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # releases-v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # releases-v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: mod-stage-windows
