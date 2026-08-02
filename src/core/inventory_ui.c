@@ -8,6 +8,7 @@ static const wchar_t* ItemShortName(InventoryItemId item)
 {
     if (item == 1) return L"Земля";
     if (item == 2) return L"Трава";
+    if (item == INVENTORY_ITEM_PHYSICS_LEVER) return L"Физ. рычаг";
     return L"";
 }
 

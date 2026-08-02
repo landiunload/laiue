@@ -16,7 +16,7 @@
 #define LAIUE_NETWORK_INVENTORY_SLOTS 36U
 #define LAIUE_NETWORK_HOST_CAPACITY 256U
 #define LAIUE_NETWORK_CERTIFICATE_PIN_SIZE 32U
-#define LAIUE_NETWORK_ALPN "laiue/5"
+#define LAIUE_NETWORK_ALPN "laiue/6"
 #define LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS 4096U
 #define LAIUE_NETWORK_MAX_CHUNK_EDITS 128U
 #define LAIUE_NETWORK_MAX_CHUNK_PARTS 2048U
@@ -24,6 +24,9 @@
 #define LAIUE_NETWORK_MAX_SERVER_STREAMS 2U
 #define LAIUE_NETWORK_MAX_QUEUED_EVENTS 256U
 #define LAIUE_NETWORK_MAX_OUTSTANDING_SENDS 256U
+#define LAIUE_NETWORK_MAX_CONSTRUCT_BODIES 16U
+#define LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BODY 256U
+#define LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH 80U
 
 typedef struct NetworkClient NetworkClient;
 typedef struct NetworkServer NetworkServer;
@@ -137,6 +140,7 @@ typedef struct NetworkInputCommand
     bool jumpHeld;
     bool sprintHeld;
     bool crouchHeld;
+    bool useHeld;
 } NetworkInputCommand;
 
 typedef struct NetworkPlayerState
@@ -204,6 +208,49 @@ typedef struct NetworkSnapshotInfo
     bool requiresReadyBarrier;
 } NetworkSnapshotInfo;
 
+typedef struct NetworkConstructReset
+{
+    uint16_t bodyCount;
+} NetworkConstructReset;
+
+typedef struct NetworkConstructBlock
+{
+    int16_t local[3];
+    int8_t mountNormal[3];
+    uint8_t material;
+    uint8_t kind;
+} NetworkConstructBlock;
+
+typedef struct NetworkConstructBody
+{
+    uint64_t id;
+    uint64_t revision;
+    double origin[3];
+    double velocity[3];
+    uint16_t blockCount;
+} NetworkConstructBody;
+
+typedef struct NetworkConstructBlockBatch
+{
+    uint64_t id;
+    uint64_t revision;
+    uint16_t firstBlock;
+    uint16_t blockCount;
+    NetworkConstructBlock
+        blocks[LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH];
+} NetworkConstructBlockBatch;
+
+typedef struct NetworkConstructState
+{
+    uint32_t serverTick;
+    uint64_t id;
+    uint64_t revision;
+    double origin[3];
+    double velocity[3];
+    // Zero means that no peer currently holds the lever.
+    uint64_t heldBy;
+} NetworkConstructState;
+
 typedef struct NetworkBlockDrop
 {
     uint32_t id;
@@ -237,6 +284,10 @@ typedef enum NetworkClientEventType
     NETWORK_CLIENT_EVENT_INVENTORY_STATE,
     NETWORK_CLIENT_EVENT_SNAPSHOT_BEGIN,
     NETWORK_CLIENT_EVENT_SNAPSHOT_CHUNK,
+    NETWORK_CLIENT_EVENT_CONSTRUCT_RESET,
+    NETWORK_CLIENT_EVENT_CONSTRUCT_BODY,
+    NETWORK_CLIENT_EVENT_CONSTRUCT_BLOCKS,
+    NETWORK_CLIENT_EVENT_CONSTRUCT_STATE,
     NETWORK_CLIENT_EVENT_SNAPSHOT_END,
     NETWORK_CLIENT_EVENT_PLAYER_JOINED,
     NETWORK_CLIENT_EVENT_PLAYER_LEFT,
@@ -262,6 +313,10 @@ typedef struct NetworkClientEvent
         NetworkInventoryState inventory;
         NetworkSnapshotInfo snapshot;
         NetworkChunkDelta chunkDelta;
+        NetworkConstructReset constructReset;
+        NetworkConstructBody constructBody;
+        NetworkConstructBlockBatch constructBlocks;
+        NetworkConstructState constructState;
         uint32_t peerId;
         uint64_t worldTime;
         struct
@@ -456,6 +511,23 @@ LAIUE_NETWORK_API bool NetworkServerSendSnapshotBegin(
 LAIUE_NETWORK_API bool NetworkServerSendSnapshotChunk(
     NetworkServer *server, uint32_t peerId,
     const NetworkChunkDelta *chunk);
+// Complete construct topology is sent on the active snapshot stream. RESET,
+// BODY and BLOCKS are ordered and bounded; the initial snapshot must include
+// exactly one complete topology set before SNAPSHOT_END.
+LAIUE_NETWORK_API bool NetworkServerSendConstructReset(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructReset *reset);
+LAIUE_NETWORK_API bool NetworkServerSendConstructBody(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBody *body);
+LAIUE_NETWORK_API bool NetworkServerSendConstructBlocks(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBlockBatch *blocks);
+// Dynamic state is ordered on the reliable control stream. It may be sent to
+// a ready peer or while that peer's snapshot barrier is active.
+LAIUE_NETWORK_API bool NetworkServerSendConstructState(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructState *state);
 LAIUE_NETWORK_API bool NetworkServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision);

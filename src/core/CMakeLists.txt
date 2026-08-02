@@ -23,6 +23,8 @@ laiue_add_module(core
         panorama.h
         pause_menu.c
         pause_menu.h
+        physical_construct_renderer.c
+        physical_construct_renderer.h
         save_game.c
         save_game.h
         server_list.c

@@ -33,8 +33,16 @@
 #define NETWORK_CONTROL_RECEIVE_CAPACITY \
     (LAIUE_PROTOCOL_MAX_QUEUED_FRAMES * \
      LAIUE_PROTOCOL_MAX_FRAME_SIZE)
+#define NETWORK_CONSTRUCT_BATCHES_PER_BODY \
+    ((LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY + \
+      LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH - 1U) / \
+     LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH)
+#define NETWORK_MAX_CONSTRUCT_SNAPSHOT_FRAMES \
+    (1U + LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES * \
+              (1U + NETWORK_CONSTRUCT_BATCHES_PER_BODY))
 #define NETWORK_AUX_RECEIVE_CAPACITY \
-    ((LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U) * \
+    ((LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U + \
+      NETWORK_MAX_CONSTRUCT_SNAPSHOT_FRAMES) * \
      LAIUE_PROTOCOL_MAX_FRAME_SIZE)
 #define NETWORK_CLIENT_EVENT_CAPACITY 128U
 #define NETWORK_SERVER_EVENT_CAPACITY LAIUE_NETWORK_MAX_QUEUED_EVENTS
@@ -49,7 +57,8 @@
 #define NETWORK_MAX_RESYNCS_PER_SECOND 1U
 #define NETWORK_CONTROL_PAYLOAD_CAPACITY LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE
 #define NETWORK_AUX_MAX_OUTSTANDING_SENDS \
-    (LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U)
+    (LAIUE_PROTOCOL_MAX_SNAPSHOT_CHUNKS + 2U + \
+     NETWORK_MAX_CONSTRUCT_SNAPSHOT_FRAMES)
 #define NETWORK_APP_ERROR_PROTOCOL 0x100U
 #define NETWORK_APP_ERROR_OVERFLOW 0x101U
 #define NETWORK_APP_ERROR_SHUTDOWN 0x102U
@@ -131,6 +140,13 @@ struct NetworkClient
     uint32_t snapshotLastEditIndex;
     uint16_t snapshotNextPart;
     uint16_t snapshotPartCount;
+    uint16_t expectedConstructBodies;
+    uint16_t receivedConstructBodies;
+    uint16_t expectedConstructBlocks;
+    uint16_t nextConstructBlock;
+    uint64_t constructBodyId;
+    uint64_t constructBodyRevision;
+    NetworkConstructBlock lastConstructBlock;
     uint32_t pendingPeerId;
     int64_t pendingWorldSeed;
     NetworkModDescriptor serverMods[LAIUE_NETWORK_MAX_MODS];
@@ -161,6 +177,9 @@ struct NetworkClient
     bool everReady;
     bool resyncRequestOutstanding;
     bool resyncResponseMatched;
+    bool constructResetReceived;
+    bool constructBodyActive;
+    bool lastConstructBlockValid;
 };
 
 struct NetworkServer
@@ -225,6 +244,13 @@ struct NetworkServerPeer
     uint32_t snapshotLastEditIndex;
     uint16_t snapshotNextPart;
     uint16_t snapshotPartCount;
+    uint16_t expectedConstructBodies;
+    uint16_t sentConstructBodies;
+    uint16_t expectedConstructBlocks;
+    uint16_t nextConstructBlock;
+    uint64_t constructBodyId;
+    uint64_t constructBodyRevision;
+    NetworkConstructBlock lastConstructBlock;
     uint16_t maximumDatagramSendLength;
     NetworkDisconnectReason callbackReason;
     NetworkDisconnectReason closeReason;
@@ -247,6 +273,9 @@ struct NetworkServerPeer
     bool rejected;
     bool connectedNotified;
     bool datagramSendEnabled;
+    bool constructResetSent;
+    bool constructBodyActive;
+    bool lastConstructBlockValid;
 };
 
 _Static_assert(LAIUE_NETWORK_MAX_CHUNK_EDITS ==
@@ -258,6 +287,15 @@ _Static_assert(LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS ==
 _Static_assert(LAIUE_NETWORK_MAX_CHUNK_PARTS ==
                    LAIUE_PROTOCOL_MAX_CHUNK_PARTS,
                "Public and wire chunk part limits diverged");
+_Static_assert(LAIUE_NETWORK_MAX_CONSTRUCT_BODIES ==
+                   LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES,
+               "Public and wire construct body limits diverged");
+_Static_assert(LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BODY ==
+                   LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY,
+               "Public and wire construct block limits diverged");
+_Static_assert(LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH ==
+                   LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH,
+               "Public and wire construct batch limits diverged");
 _Static_assert(sizeof(NetworkModDescriptor) == sizeof(LaiueProtocolMod),
                "Public and wire mod descriptors diverged");
 
@@ -1420,6 +1458,186 @@ static bool ChunkCoordinatesEqual(
            left[2] == right[2];
 }
 
+static bool ConstructBlockLess(
+    const NetworkConstructBlock *left,
+    const NetworkConstructBlock *right)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->local[axis] != right->local[axis])
+        {
+            return left->local[axis] < right->local[axis];
+        }
+    }
+    if (left->kind != right->kind)
+    {
+        return left->kind < right->kind;
+    }
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->mountNormal[axis] != right->mountNormal[axis])
+        {
+            return left->mountNormal[axis] <
+                   right->mountNormal[axis];
+        }
+    }
+    return left->material < right->material;
+}
+
+static void CopyConstructBlockFromProtocol(
+    NetworkConstructBlock *output,
+    const LaiueProtocolConstructBlock *input)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        output->local[axis] = input->local[axis];
+        output->mountNormal[axis] = input->mountNormal[axis];
+    }
+    output->material = input->material;
+    output->kind = input->kind;
+}
+
+static void CopyConstructBlockToProtocol(
+    LaiueProtocolConstructBlock *output,
+    const NetworkConstructBlock *input)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        output->local[axis] = input->local[axis];
+        output->mountNormal[axis] = input->mountNormal[axis];
+    }
+    output->material = input->material;
+    output->kind = input->kind;
+}
+
+static bool ClientHandleConstructReset(
+    NetworkClient *client, const LaiueProtocolFrame *frame,
+    NetworkClientEvent *event)
+{
+    LaiueProtocolConstructReset decoded;
+    if (!client->snapshotStarted ||
+        client->constructResetReceived ||
+        !LaiueProtocolDecodeConstructReset(
+            frame->payload, frame->payloadSize, &decoded))
+    {
+        return false;
+    }
+
+    client->expectedConstructBodies = decoded.bodyCount;
+    client->receivedConstructBodies = 0;
+    client->expectedConstructBlocks = 0;
+    client->nextConstructBlock = 0;
+    client->constructBodyId = 0;
+    client->constructBodyRevision = 0;
+    client->constructResetReceived = true;
+    client->constructBodyActive = false;
+    client->lastConstructBlockValid = false;
+
+    memset(event, 0, sizeof(*event));
+    event->type = NETWORK_CLIENT_EVENT_CONSTRUCT_RESET;
+    event->data.constructReset.bodyCount = decoded.bodyCount;
+    return ClientPushEvent(client, event);
+}
+
+static bool ClientHandleConstructBody(
+    NetworkClient *client, const LaiueProtocolFrame *frame,
+    NetworkClientEvent *event)
+{
+    LaiueProtocolConstructBody decoded;
+    if (!client->snapshotStarted ||
+        !client->constructResetReceived ||
+        client->constructBodyActive ||
+        client->receivedConstructBodies >=
+            client->expectedConstructBodies ||
+        !LaiueProtocolDecodeConstructBegin(
+            frame->payload, frame->payloadSize, &decoded))
+    {
+        return false;
+    }
+
+    client->constructBodyId = decoded.id;
+    client->constructBodyRevision = decoded.revision;
+    client->expectedConstructBlocks = decoded.blockCount;
+    client->nextConstructBlock = 0;
+    client->constructBodyActive = true;
+    client->lastConstructBlockValid = false;
+
+    memset(event, 0, sizeof(*event));
+    event->type = NETWORK_CLIENT_EVENT_CONSTRUCT_BODY;
+    event->data.constructBody.id = decoded.id;
+    event->data.constructBody.revision = decoded.revision;
+    event->data.constructBody.blockCount = decoded.blockCount;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        event->data.constructBody.origin[axis] = decoded.origin[axis];
+        event->data.constructBody.velocity[axis] = decoded.velocity[axis];
+    }
+    return ClientPushEvent(client, event);
+}
+
+static bool ClientHandleConstructBlocks(
+    NetworkClient *client, const LaiueProtocolFrame *frame,
+    NetworkClientEvent *event)
+{
+    LaiueProtocolConstructBlockBatch decoded;
+    if (!client->snapshotStarted ||
+        !client->constructResetReceived ||
+        !client->constructBodyActive ||
+        !LaiueProtocolDecodeConstructBlocks(
+            frame->payload, frame->payloadSize, &decoded) ||
+        decoded.id != client->constructBodyId ||
+        decoded.revision != client->constructBodyRevision ||
+        decoded.firstBlock != client->nextConstructBlock ||
+        (uint32_t)decoded.firstBlock + decoded.blockCount >
+            client->expectedConstructBlocks)
+    {
+        return false;
+    }
+
+    memset(event, 0, sizeof(*event));
+    event->type = NETWORK_CLIENT_EVENT_CONSTRUCT_BLOCKS;
+    event->data.constructBlocks.id = decoded.id;
+    event->data.constructBlocks.revision = decoded.revision;
+    event->data.constructBlocks.firstBlock = decoded.firstBlock;
+    event->data.constructBlocks.blockCount = decoded.blockCount;
+    for (uint32_t index = 0; index < decoded.blockCount; ++index)
+    {
+        CopyConstructBlockFromProtocol(
+            &event->data.constructBlocks.blocks[index],
+            &decoded.blocks[index]);
+    }
+    if (client->lastConstructBlockValid &&
+        !ConstructBlockLess(
+            &client->lastConstructBlock,
+            &event->data.constructBlocks.blocks[0]))
+    {
+        return false;
+    }
+
+    client->lastConstructBlock =
+        event->data.constructBlocks.blocks[decoded.blockCount - 1U];
+    client->lastConstructBlockValid = true;
+    client->nextConstructBlock =
+        (uint16_t)(decoded.firstBlock + decoded.blockCount);
+    if (client->nextConstructBlock ==
+        client->expectedConstructBlocks)
+    {
+        ++client->receivedConstructBodies;
+        client->constructBodyActive = false;
+        client->lastConstructBlockValid = false;
+    }
+    return ClientPushEvent(client, event);
+}
+
+static bool ClientConstructTopologyComplete(
+    const NetworkClient *client)
+{
+    return client->constructResetReceived &&
+           !client->constructBodyActive &&
+           client->receivedConstructBodies ==
+               client->expectedConstructBodies;
+}
+
 static bool ClientHandleSnapshotChunk(
     NetworkClient *client, const LaiueProtocolFrame *frame,
     NetworkClientEvent *event)
@@ -1700,6 +1918,15 @@ static bool ClientHandleFrame(
         client->expectedSnapshotChunks = snapshot.chunkCount;
         client->receivedSnapshotChunks = 0;
         client->resyncResponseMatched = false;
+        client->expectedConstructBodies = 0;
+        client->receivedConstructBodies = 0;
+        client->expectedConstructBlocks = 0;
+        client->nextConstructBlock = 0;
+        client->constructBodyId = 0;
+        client->constructBodyRevision = 0;
+        client->constructResetReceived = false;
+        client->constructBodyActive = false;
+        client->lastConstructBlockValid = false;
         client->snapshotStarted = true;
         client->snapshotEnded = false;
         client->snapshotRequiresReadyBarrier =
@@ -1720,6 +1947,18 @@ static bool ClientHandleFrame(
     {
         return ClientHandleSnapshotChunk(client, frame, &event);
     }
+    if (frame->type == LAIUE_MESSAGE_CONSTRUCT_RESET)
+    {
+        return ClientHandleConstructReset(client, frame, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_CONSTRUCT_BEGIN)
+    {
+        return ClientHandleConstructBody(client, frame, &event);
+    }
+    if (frame->type == LAIUE_MESSAGE_CONSTRUCT_BLOCKS)
+    {
+        return ClientHandleConstructBlocks(client, frame, &event);
+    }
     if (frame->type == LAIUE_MESSAGE_SNAPSHOT_END &&
         client->snapshotStarted)
     {
@@ -1732,7 +1971,11 @@ static bool ClientHandleFrame(
             worldRevision < client->snapshotWorldRevision ||
             client->snapshotNextPart != 0 ||
             client->receivedSnapshotChunks !=
-                client->expectedSnapshotChunks)
+                client->expectedSnapshotChunks ||
+            (client->snapshotRequiresReadyBarrier &&
+             !ClientConstructTopologyComplete(client)) ||
+            (client->constructResetReceived &&
+             !ClientConstructTopologyComplete(client)))
         {
             return false;
         }
@@ -1938,6 +2181,28 @@ static bool ClientHandleFrame(
         }
         return ClientPushEvent(client, &event);
     }
+    if (frame->type == LAIUE_MESSAGE_CONSTRUCT_STATE)
+    {
+        LaiueProtocolConstructState decoded;
+        if (!LaiueProtocolDecodeConstructState(
+                frame->payload, frame->payloadSize, &decoded))
+        {
+            return false;
+        }
+        event.type = NETWORK_CLIENT_EVENT_CONSTRUCT_STATE;
+        event.data.constructState.serverTick = decoded.serverTick;
+        event.data.constructState.id = decoded.id;
+        event.data.constructState.revision = decoded.revision;
+        event.data.constructState.heldBy = decoded.heldBy;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            event.data.constructState.origin[axis] =
+                decoded.origin[axis];
+            event.data.constructState.velocity[axis] =
+                decoded.velocity[axis];
+        }
+        return ClientPushEvent(client, &event);
+    }
     if (frame->type == LAIUE_MESSAGE_PLAYER_JOINED ||
         frame->type == LAIUE_MESSAGE_PLAYER_LEFT)
     {
@@ -2041,6 +2306,9 @@ static bool IsSnapshotStreamMessage(LaiueMessageType type)
 {
     return type == LAIUE_MESSAGE_SNAPSHOT_BEGIN ||
            type == LAIUE_MESSAGE_SNAPSHOT_CHUNK ||
+           type == LAIUE_MESSAGE_CONSTRUCT_RESET ||
+           type == LAIUE_MESSAGE_CONSTRUCT_BEGIN ||
+           type == LAIUE_MESSAGE_CONSTRUCT_BLOCKS ||
            type == LAIUE_MESSAGE_SNAPSHOT_END;
 }
 
@@ -2935,6 +3203,7 @@ static bool ServerHandleFrame(
         event.data.input.jumpHeld = decoded.jumpHeld;
         event.data.input.sprintHeld = decoded.sprintHeld;
         event.data.input.crouchHeld = decoded.crouchHeld;
+        event.data.input.useHeld = decoded.useHeld;
         return ServerPushEvent(server, &event);
     }
     if (frame->type == LAIUE_MESSAGE_EDIT_INTENT)
@@ -3533,6 +3802,7 @@ bool LaiueNetworkBackendClientSendInput(
         .jumpHeld = input->jumpHeld,
         .sprintHeld = input->sprintHeld,
         .crouchHeld = input->crouchHeld,
+        .useHeld = input->useHeld,
     };
     uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
     uint32_t size =
@@ -4525,6 +4795,15 @@ bool LaiueNetworkBackendServerSendSnapshotBegin(
     peer->sentSnapshotChunks = 0;
     peer->snapshotNextPart = 0;
     peer->snapshotPartCount = 0;
+    peer->expectedConstructBodies = 0;
+    peer->sentConstructBodies = 0;
+    peer->expectedConstructBlocks = 0;
+    peer->nextConstructBlock = 0;
+    peer->constructBodyId = 0;
+    peer->constructBodyRevision = 0;
+    peer->constructResetSent = false;
+    peer->constructBodyActive = false;
+    peer->lastConstructBlockValid = false;
     peer->snapshotStarted = true;
     peer->snapshotRequiresReadyBarrier =
         snapshot->requiresReadyBarrier;
@@ -4646,6 +4925,203 @@ bool LaiueNetworkBackendServerSendSnapshotChunk(
     return true;
 }
 
+static bool ServerPeerAcceptsSnapshotData(
+    NetworkServer *server, const NetworkServerPeer *peer)
+{
+    return ServerPeerCanSync(server, peer) &&
+           peer->snapshotStarted &&
+           (peer->snapshotRequiresReadyBarrier
+                ? !peer->ready
+                : peer->ready);
+}
+
+static bool ServerSendSnapshotPayload(
+    NetworkServer *server, NetworkServerPeer *peer,
+    LaiueMessageType type, const uint8_t *payload,
+    uint32_t size)
+{
+    if (size == 0)
+    {
+        return false;
+    }
+    if (!ChannelSendPayload(
+            &peer->snapshotChannel, type, payload, size))
+    {
+        ServerDisconnectPeer(
+            server, peer, NETWORK_DISCONNECT_OVERFLOW);
+        return false;
+    }
+    return true;
+}
+
+bool LaiueNetworkBackendServerSendConstructReset(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructReset *reset)
+{
+    NetworkServerPeer *peer = ServerFindPeer(server, peerId);
+    if (!ServerPeerAcceptsSnapshotData(server, peer) ||
+        reset == NULL || peer->constructResetSent ||
+        peer->constructBodyActive)
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructReset wire = {
+        .bodyCount = reset->bodyCount,
+    };
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeConstructReset(
+        payload, sizeof(payload), &wire);
+    if (!ServerSendSnapshotPayload(
+            server, peer, LAIUE_MESSAGE_CONSTRUCT_RESET,
+            payload, size))
+    {
+        return false;
+    }
+
+    peer->expectedConstructBodies = wire.bodyCount;
+    peer->sentConstructBodies = 0;
+    peer->expectedConstructBlocks = 0;
+    peer->nextConstructBlock = 0;
+    peer->constructBodyId = 0;
+    peer->constructBodyRevision = 0;
+    peer->constructResetSent = true;
+    peer->constructBodyActive = false;
+    peer->lastConstructBlockValid = false;
+    return true;
+}
+
+bool LaiueNetworkBackendServerSendConstructBody(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBody *body)
+{
+    NetworkServerPeer *peer = ServerFindPeer(server, peerId);
+    if (!ServerPeerAcceptsSnapshotData(server, peer) ||
+        body == NULL || !peer->constructResetSent ||
+        peer->constructBodyActive ||
+        peer->sentConstructBodies >=
+            peer->expectedConstructBodies)
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructBody wire;
+    memset(&wire, 0, sizeof(wire));
+    wire.id = body->id;
+    wire.revision = body->revision;
+    wire.blockCount = body->blockCount;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        wire.origin[axis] = body->origin[axis];
+        wire.velocity[axis] = body->velocity[axis];
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeConstructBegin(
+        payload, sizeof(payload), &wire);
+    if (!ServerSendSnapshotPayload(
+            server, peer, LAIUE_MESSAGE_CONSTRUCT_BEGIN,
+            payload, size))
+    {
+        return false;
+    }
+
+    peer->constructBodyId = wire.id;
+    peer->constructBodyRevision = wire.revision;
+    peer->expectedConstructBlocks = wire.blockCount;
+    peer->nextConstructBlock = 0;
+    peer->constructBodyActive = true;
+    peer->lastConstructBlockValid = false;
+    return true;
+}
+
+bool LaiueNetworkBackendServerSendConstructBlocks(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBlockBatch *blocks)
+{
+    NetworkServerPeer *peer = ServerFindPeer(server, peerId);
+    if (!ServerPeerAcceptsSnapshotData(server, peer) ||
+        blocks == NULL || !peer->constructResetSent ||
+        !peer->constructBodyActive || blocks->blockCount == 0U ||
+        blocks->blockCount >
+            LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH ||
+        blocks->id != peer->constructBodyId ||
+        blocks->revision != peer->constructBodyRevision ||
+        blocks->firstBlock != peer->nextConstructBlock ||
+        (uint32_t)blocks->firstBlock + blocks->blockCount >
+            peer->expectedConstructBlocks ||
+        (peer->lastConstructBlockValid &&
+         !ConstructBlockLess(
+             &peer->lastConstructBlock, &blocks->blocks[0])))
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructBlockBatch wire;
+    memset(&wire, 0, sizeof(wire));
+    wire.id = blocks->id;
+    wire.revision = blocks->revision;
+    wire.firstBlock = blocks->firstBlock;
+    wire.blockCount = blocks->blockCount;
+    for (uint32_t index = 0; index < blocks->blockCount; ++index)
+    {
+        CopyConstructBlockToProtocol(
+            &wire.blocks[index], &blocks->blocks[index]);
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeConstructBlocks(
+        payload, sizeof(payload), &wire);
+    if (!ServerSendSnapshotPayload(
+            server, peer, LAIUE_MESSAGE_CONSTRUCT_BLOCKS,
+            payload, size))
+    {
+        return false;
+    }
+
+    peer->lastConstructBlock =
+        blocks->blocks[blocks->blockCount - 1U];
+    peer->lastConstructBlockValid = true;
+    peer->nextConstructBlock =
+        (uint16_t)(blocks->firstBlock + blocks->blockCount);
+    if (peer->nextConstructBlock ==
+        peer->expectedConstructBlocks)
+    {
+        ++peer->sentConstructBodies;
+        peer->constructBodyActive = false;
+        peer->lastConstructBlockValid = false;
+    }
+    return true;
+}
+
+bool LaiueNetworkBackendServerSendConstructState(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructState *state)
+{
+    NetworkServerPeer *peer = ServerFindPeer(server, peerId);
+    if (!ServerPeerCanSync(server, peer) || state == NULL ||
+        (!peer->ready && !peer->snapshotStarted))
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructState wire;
+    memset(&wire, 0, sizeof(wire));
+    wire.serverTick = state->serverTick;
+    wire.id = state->id;
+    wire.revision = state->revision;
+    wire.heldBy = state->heldBy;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        wire.origin[axis] = state->origin[axis];
+        wire.velocity[axis] = state->velocity[axis];
+    }
+    uint8_t payload[NETWORK_CONTROL_PAYLOAD_CAPACITY];
+    uint32_t size = LaiueProtocolEncodeConstructState(
+        payload, sizeof(payload), &wire);
+    return size != 0 && ServerSendToPeer(
+        server, peer, LAIUE_MESSAGE_CONSTRUCT_STATE,
+        payload, size, false);
+}
+
 bool LaiueNetworkBackendServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision)
@@ -4661,7 +5137,13 @@ bool LaiueNetworkBackendServerSendSnapshotEnd(
         (peer->resyncRequestOutstanding &&
          !peer->resyncResponseMatched) ||
         peer->sentSnapshotChunks !=
-            peer->expectedSnapshotChunks)
+            peer->expectedSnapshotChunks ||
+        (peer->snapshotRequiresReadyBarrier &&
+         !peer->constructResetSent) ||
+        (peer->constructResetSent &&
+         (peer->constructBodyActive ||
+          peer->sentConstructBodies !=
+              peer->expectedConstructBodies)))
     {
         return false;
     }

@@ -71,7 +71,7 @@ IPv4 и IPv6 доходят до `READY`. Release установлен атом�
 
 ## P0 — эксплуатационное усиление multiplayer
 
-Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
+Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v6 snapshot
 реализованы. Следующий слой для долгоживущего публичного сервера:
 
 1. Identity/session layer с короткоживущими токенами и отзывом сессий.
@@ -106,7 +106,7 @@ Secure QUIC/TLS boundary, IPv4/IPv6 endpoint parsing и protocol v5 snapshot
 ## P1 — экспериментальный OpenSSL QUIC backend
 
 Linux server на OpenSSL 3.5 QUIC реален и должен быть совместим с Windows
-MsQuic client через QUIC v1 и ALPN `laiue/5`, но прямой второй вариант
+MsQuic client через QUIC v1 и ALPN `laiue/6`, но прямой второй вариант
 текущего высокоуровневого backend продублирует session state machines.
 Последовательность:
 

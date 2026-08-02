@@ -246,6 +246,46 @@ bool LaiueNetworkBackendServerSendSnapshotChunk(
     return false;
 }
 
+bool LaiueNetworkBackendServerSendConstructReset(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructReset *reset)
+{
+    (void)server;
+    (void)peerId;
+    (void)reset;
+    return false;
+}
+
+bool LaiueNetworkBackendServerSendConstructBody(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBody *body)
+{
+    (void)server;
+    (void)peerId;
+    (void)body;
+    return false;
+}
+
+bool LaiueNetworkBackendServerSendConstructBlocks(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBlockBatch *blocks)
+{
+    (void)server;
+    (void)peerId;
+    (void)blocks;
+    return false;
+}
+
+bool LaiueNetworkBackendServerSendConstructState(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructState *state)
+{
+    (void)server;
+    (void)peerId;
+    (void)state;
+    return false;
+}
+
 bool LaiueNetworkBackendServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision)

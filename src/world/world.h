@@ -47,6 +47,29 @@ typedef struct WorldChunkDelta
     BlockType block;
 } WorldChunkDelta;
 
+#define WORLD_MAX_ATOMIC_BLOCK_MUTATIONS 4096U
+#define WORLD_MAX_BOUNDED_BLOCK_QUERY_CELLS 64U
+#define WORLD_MAX_BOUNDED_BLOCK_RANGES 512U
+
+typedef struct WorldBlockMutation
+{
+    int64_t block[3];
+    BlockType expected;
+    BlockType replacement;
+} WorldBlockMutation;
+
+typedef struct WorldBlockState
+{
+    BlockType block;
+    bool edited;
+} WorldBlockState;
+
+typedef struct WorldBlockRange
+{
+    int64_t minimum[3];
+    int64_t maximum[3];
+} WorldBlockRange;
+
 LAIUE_WORLD_API World* WorldCreate(int64_t seed);
 LAIUE_WORLD_API void   WorldDestroy(World* world);
 
@@ -66,7 +89,36 @@ LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
     int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity);
 
 LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
+// Copies material and edit provenance under one shared lock. This is the
+// per-cell primitive for bounded transactional gameplay operations.
+LAIUE_WORLD_API bool WorldGetBlockState(
+    World* world, int64_t x, int64_t y, int64_t z,
+    WorldBlockState* outState);
+// Inclusive, allocation-free solid occupancy query. Oversized ranges are
+// rejected instead of turning a fixed-tick collision check into an unbounded
+// world scan.
+LAIUE_WORLD_API bool WorldAnySolidBlockInRange(
+    World* world, const int64_t minimum[3], const int64_t maximum[3]);
+// Evaluates all inclusive ranges under one shared table lock. Each range and
+// the range count are bounded; false means invalid input and callers which use
+// this for collision should fail closed. outSolid is always initialized.
+LAIUE_WORLD_API bool WorldAnySolidBlockInRanges(
+    World* world, const WorldBlockRange* ranges, uint32_t count,
+    bool* outSolid);
+// Возвращает true, если ячейка хранится как явная правка относительно
+// процедурного terrain. Это provenance для bounded gameplay-операций; сам
+// тип блока не кодирует, был ли он поставлен игроком.
+LAIUE_WORLD_API bool WorldIsBlockEdited(
+    World* world, int64_t x, int64_t y, int64_t z);
+// Транзакционные системы используют bool-вариант, чтобы не продолжать после
+// OOM. Совместимый WorldSetBlock оставлен для старых вызовов.
+LAIUE_WORLD_API bool WorldTrySetBlock(
+    World* world, int64_t x, int64_t y, int64_t z, BlockType block);
 LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+// Проверяет все expected и готовит новые delta-массивы до публикации хоть
+// одной правки. При false содержимое блоков и revisions не меняются.
+LAIUE_WORLD_API bool WorldApplyBlockBatch(
+    World* world, const WorldBlockMutation* mutations, uint32_t count);
 
 // Snapshot API для удалённого клиента. Сначала сервер копирует summaries в
 // заданном окне, затем запрашивает deltas каждого чанка. Все буферы принадлежат

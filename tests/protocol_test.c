@@ -439,6 +439,7 @@ static void TestInput(void)
         .jumpHeld = false,
         .sprintHeld = true,
         .crouchHeld = false,
+        .useHeld = true,
     };
 
     ProtocolTestExpect(
@@ -456,17 +457,17 @@ static void TestInput(void)
         "DecodeInput потерял точность сверх шага квантования");
     ProtocolTestExpect(decoded.sequence == 73u
         && decoded.jumpPressed && !decoded.jumpHeld
-        && decoded.sprintHeld && !decoded.crouchHeld,
+        && decoded.sprintHeld && !decoded.crouchHeld && decoded.useHeld,
         "DecodeInput потерял sequence или перепутал флаги");
 
     ProtocolTestExpect(!LaiueProtocolDecodeInput(payload, 12u, &decoded)
         && !LaiueProtocolDecodeInput(payload, 14u, &decoded),
         "DecodeInput принял неточный размер");
 
-    // Старший полубайт зарезервирован и обязан быть нулевым.
+    // Старшие три бита зарезервированы и обязаны быть нулевыми.
     uint8_t reserved[13];
     memcpy(reserved, payload, sizeof(reserved));
-    reserved[12] |= 0x10u;
+    reserved[12] |= 0x20u;
     ProtocolTestExpect(!LaiueProtocolDecodeInput(reserved, 13u, &decoded),
         "DecodeInput принял установленные резервные биты");
 
@@ -510,6 +511,7 @@ static void TestInput(void)
         .pitch = 0.5f,
         .jumpPressed = true,
         .sprintHeld = true,
+        .useHeld = true,
     };
     NetworkInputCommand canonical;
     ProtocolTestExpect(
@@ -519,7 +521,8 @@ static void TestInput(void)
         && NearlyEqual(canonical.movementY, -0.5f, 1.0e-4f)
         && NearlyEqual(canonical.yaw, 1.0f, 2.0e-4f)
         && NearlyEqual(canonical.pitch, 0.5f, 2.0e-4f)
-        && canonical.jumpPressed && canonical.sprintHeld,
+        && canonical.jumpPressed && canonical.sprintHeld
+        && canonical.useHeld,
         "NetworkInputCanonicalize не повторил wire-квантование");
     ProtocolTestExpect(
         NetworkInputCanonicalize(&canonical, &canonical)
@@ -554,12 +557,13 @@ static void TestEditIntent(void)
 
     ProtocolTestExpect(
         LaiueProtocolEncodeEditIntent(payload, sizeof(payload), false, true,
-            2u, east) == 8u,
+            LAIUE_PROTOCOL_MAX_INVENTORY_ITEM, east) == 8u,
         "EncodeEditIntent вернул неожиданный размер для установки");
     ProtocolTestExpect(
         LaiueProtocolDecodeEditIntent(payload, 8u, &breakBlock, &placeBlock,
             &placementBlock, direction)
-        && !breakBlock && placeBlock && placementBlock == 2u
+        && !breakBlock && placeBlock
+        && placementBlock == LAIUE_PROTOCOL_MAX_INVENTORY_ITEM
         && NearlyEqual(direction[0], 1.0f, 1.0e-4f),
         "DecodeEditIntent не восстановил установку");
 
@@ -573,7 +577,7 @@ static void TestEditIntent(void)
         "EncodeEditIntent принял намерение без действия");
     ProtocolTestExpect(
         LaiueProtocolEncodeEditIntent(payload, sizeof(payload), false, true,
-            3u, down) == 0,
+            LAIUE_PROTOCOL_MAX_INVENTORY_ITEM + 1U, down) == 0,
         "EncodeEditIntent принял неизвестный блок для установки");
     ProtocolTestExpect(
         LaiueProtocolEncodeEditIntent(payload, sizeof(payload), false, true,
@@ -609,6 +613,13 @@ static void TestEditIntent(void)
         !LaiueProtocolDecodeEditIntent(forged, 8u, &breakBlock, &placeBlock,
             &placementBlock, direction),
         "DecodeEditIntent принял неизвестное действие");
+
+    forged[0] = 2u;
+    forged[7] = LAIUE_PROTOCOL_MAX_INVENTORY_ITEM + 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeEditIntent(forged, 8u, &breakBlock, &placeBlock,
+            &placementBlock, direction),
+        "DecodeEditIntent принял неизвестный предмет");
 }
 
 static void TestPlayerStateAndBlockDelta(void)
@@ -819,6 +830,8 @@ static void TestDropsAndInventory(void)
     inventory.selectedHotbarSlot = 8u;
     inventory.slots[0].item = 1u;
     inventory.slots[0].count = 64u;
+    inventory.slots[2].item = LAIUE_PROTOCOL_MAX_INVENTORY_ITEM;
+    inventory.slots[2].count = 8u;
     inventory.slots[LAIUE_PROTOCOL_INVENTORY_SLOTS - 1u].item = 2u;
     inventory.slots[LAIUE_PROTOCOL_INVENTORY_SLOTS - 1u].count = 1u;
 
@@ -834,6 +847,9 @@ static void TestDropsAndInventory(void)
         && decodedInventory.selectedHotbarSlot == 8u
         && decodedInventory.slots[0].item == 1u
         && decodedInventory.slots[0].count == 64u
+        && decodedInventory.slots[2].item ==
+            LAIUE_PROTOCOL_MAX_INVENTORY_ITEM
+        && decodedInventory.slots[2].count == 8u
         && decodedInventory.slots[LAIUE_PROTOCOL_INVENTORY_SLOTS - 1u].item == 2u
         && decodedInventory.slots[LAIUE_PROTOCOL_INVENTORY_SLOTS - 1u].count == 1u,
         "DecodeInventory не восстановил слоты");
@@ -882,12 +898,24 @@ static void TestDropsAndInventory(void)
         "EncodeInventory принял стопку сверх предела");
 
     invalidInventory = inventory;
-    invalidInventory.slots[1].item = 3u;
+    invalidInventory.slots[1].item =
+        LAIUE_PROTOCOL_MAX_INVENTORY_ITEM + 1U;
     invalidInventory.slots[1].count = 1u;
     ProtocolTestExpect(
         LaiueProtocolEncodeInventory(payload, sizeof(payload),
             &invalidInventory) == 0,
         "EncodeInventory принял неизвестный предмет");
+
+    ProtocolTestExpect(
+        LaiueProtocolEncodeInventory(payload, sizeof(payload), &inventory)
+            == inventorySize,
+        "EncodeInventory не восстановился после invalid cases");
+    payload[1U + 2U * 3U] =
+        LAIUE_PROTOCOL_MAX_INVENTORY_ITEM + 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeInventory(
+            payload, inventorySize, &decodedInventory),
+        "DecodeInventory принял неизвестный предмет");
 }
 
 // Неконечное значение float собирается из битов и проносится через
@@ -901,6 +929,19 @@ static float ProtocolTestBitsToFloat(uint32_t bits)
     {
         uint32_t integer;
         float floating;
+    } conversion;
+
+    conversion.integer = source;
+    return conversion.floating;
+}
+
+static double ProtocolTestBitsToDouble(uint64_t bits)
+{
+    volatile uint64_t source = bits;
+    union
+    {
+        uint64_t integer;
+        double floating;
     } conversion;
 
     conversion.integer = source;
@@ -1340,6 +1381,646 @@ static void TestSnapshotProtocol(void)
         "WorldTime не прошёл round-trip");
 }
 
+static bool ConstructVectorsEqual(
+    const double left[3], const double right[3])
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (!ExactlyEqualDouble(left[axis], right[axis]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void TestConstructResetProtocol(void)
+{
+    uint8_t payload[8];
+    LaiueProtocolConstructReset reset = {
+        .bodyCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES,
+    };
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructReset(payload, sizeof(payload), &reset)
+                == 4U &&
+            payload[0] == 16U && payload[1] == 0U &&
+            payload[2] == 0U && payload[3] == 0U,
+        "ConstructReset не записан в canonical little-endian виде");
+
+    LaiueProtocolConstructReset decoded;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeConstructReset(payload, 4U, &decoded) &&
+            decoded.bodyCount == LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES,
+        "ConstructReset не прошёл round-trip");
+    reset.bodyCount = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructReset(payload, sizeof(payload), &reset)
+                == 4U &&
+            LaiueProtocolDecodeConstructReset(payload, 4U, &decoded) &&
+            decoded.bodyCount == 0U,
+        "ConstructReset не принял пустой authoritative set");
+    reset.bodyCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES + 1U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructReset(payload, sizeof(payload), &reset)
+            == 0U,
+        "ConstructReset принял bodyCount сверх предела");
+
+    reset.bodyCount = 1U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructReset(payload, 3U, &reset) == 0U &&
+            LaiueProtocolEncodeConstructReset(NULL, sizeof(payload), &reset)
+                == 0U &&
+            LaiueProtocolEncodeConstructReset(payload, sizeof(payload), NULL)
+                == 0U,
+        "ConstructReset не проверил указатели/ёмкость");
+    LaiueProtocolEncodeConstructReset(payload, sizeof(payload), &reset);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructReset(payload, 3U, &decoded) &&
+            !LaiueProtocolDecodeConstructReset(payload, 5U, &decoded) &&
+            !LaiueProtocolDecodeConstructReset(NULL, 4U, &decoded) &&
+            !LaiueProtocolDecodeConstructReset(payload, 4U, NULL),
+        "ConstructReset decoder принял неточный размер/NULL");
+    payload[2] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructReset(payload, 4U, &decoded),
+        "ConstructReset принял ненулевой reserved");
+    payload[2] = 0U;
+    payload[0] = (uint8_t)(LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES + 1U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructReset(payload, 4U, &decoded),
+        "ConstructReset decoder принял bodyCount сверх предела");
+}
+
+static LaiueProtocolConstructBody MakeConstructBody(void)
+{
+    LaiueProtocolConstructBody body;
+    memset(&body, 0, sizeof(body));
+    body.id = UINT64_C(0x1122334455667788);
+    body.revision = UINT64_C(0x0102030405060708);
+    body.origin[0] = -12.5;
+    body.origin[1] = 2.25;
+    body.origin[2] = 99.0;
+    body.velocity[0] = 0.5;
+    body.velocity[1] = -1.25;
+    body.velocity[2] = 0.0;
+    body.blockCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY;
+    return body;
+}
+
+static void TestConstructBeginProtocol(void)
+{
+    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    LaiueProtocolConstructBody body = MakeConstructBody();
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+                == 68U &&
+            payload[0] == 0x88U && payload[7] == 0x11U &&
+            payload[8] == 0x08U && payload[15] == 0x01U &&
+            payload[64] == 0x00U && payload[65] == 0x01U &&
+            payload[66] == 0U && payload[67] == 0U,
+        "ConstructBegin имеет неверную exact little-endian раскладку");
+
+    LaiueProtocolConstructBody decoded;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded) &&
+            decoded.id == body.id && decoded.revision == body.revision &&
+            decoded.blockCount == body.blockCount &&
+            ConstructVectorsEqual(decoded.origin, body.origin) &&
+            ConstructVectorsEqual(decoded.velocity, body.velocity),
+        "ConstructBegin не прошёл round-trip");
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, 67U, &body) == 0U &&
+            LaiueProtocolEncodeConstructBegin(NULL, sizeof(payload), &body)
+                == 0U &&
+            LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), NULL)
+                == 0U &&
+            !LaiueProtocolDecodeConstructBegin(payload, 67U, &decoded) &&
+            !LaiueProtocolDecodeConstructBegin(payload, 69U, &decoded) &&
+            !LaiueProtocolDecodeConstructBegin(NULL, 68U, &decoded) &&
+            !LaiueProtocolDecodeConstructBegin(payload, 68U, NULL),
+        "ConstructBegin не проверил указатели/точный размер");
+
+    body = MakeConstructBody();
+    body.id = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял нулевой id");
+    body = MakeConstructBody();
+    body.revision = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял нулевую revision");
+    body = MakeConstructBody();
+    body.blockCount = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял пустое тело");
+    body.blockCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY + 1U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял блоки сверх предела");
+
+    body = MakeConstructBody();
+    LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body);
+    payload[66] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded),
+        "ConstructBegin принял ненулевой reserved");
+    payload[66] = 0U;
+    TestWriteU64(payload, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded),
+        "ConstructBegin decoder принял нулевой id");
+    TestWriteU64(payload, body.id);
+    TestWriteU64(payload + 8U, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded),
+        "ConstructBegin decoder принял нулевую revision");
+    TestWriteU64(payload + 8U, body.revision);
+    TestWriteU16(payload + 64U,
+        LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY + 1U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded),
+        "ConstructBegin decoder принял blockCount сверх предела");
+
+    static const uint64_t nonFinite[3] = {
+        UINT64_C(0x7ff0000000000000),
+        UINT64_C(0xfff0000000000000),
+        UINT64_C(0x7ff8000000000000),
+    };
+    for (uint32_t pattern = 0; pattern < 3U; ++pattern)
+    {
+        for (uint32_t field = 0; field < 6U; ++field)
+        {
+            body = MakeConstructBody();
+            double poison = ProtocolTestBitsToDouble(nonFinite[pattern]);
+            if (field < 3U)
+                body.origin[field] = poison;
+            else
+                body.velocity[field - 3U] = poison;
+            ProtocolTestExpect(
+                LaiueProtocolEncodeConstructBegin(
+                    payload, sizeof(payload), &body) == 0U,
+                "ConstructBegin encoder принял non-finite vector field");
+
+            body = MakeConstructBody();
+            LaiueProtocolEncodeConstructBegin(
+                payload, sizeof(payload), &body);
+            uint32_t offset = field < 3U
+                ? 16U + field * 8U
+                : 40U + (field - 3U) * 8U;
+            TestWriteU64(payload + offset, nonFinite[pattern]);
+            ProtocolTestExpect(
+                !LaiueProtocolDecodeConstructBegin(payload, 68U, &decoded),
+                "ConstructBegin decoder принял non-finite vector field");
+        }
+    }
+
+    body = MakeConstructBody();
+    body.origin[0] = 1099511627777.0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял origin за world bound");
+    body = MakeConstructBody();
+    body.velocity[0] = 1048577.0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBegin(payload, sizeof(payload), &body)
+            == 0U,
+        "ConstructBegin принял velocity за dynamic bound");
+}
+
+static void MakeConstructBlockBatch(
+    LaiueProtocolConstructBlockBatch* batch)
+{
+    memset(batch, 0, sizeof(*batch));
+    batch->id = UINT64_C(0x1122334455667788);
+    batch->revision = UINT64_C(0x1020304050607080);
+    batch->firstBlock = 253U;
+    batch->blockCount = 3U;
+    batch->blocks[0].local[0] = INT16_MIN;
+    batch->blocks[0].local[1] = -2;
+    batch->blocks[0].local[2] = 5;
+    batch->blocks[0].material = 1U;
+    batch->blocks[0].kind = 0U;
+    batch->blocks[1].local[0] = INT16_MIN;
+    batch->blocks[1].local[1] = -2;
+    batch->blocks[1].local[2] = 6;
+    batch->blocks[1].material = 2U;
+    batch->blocks[1].kind = 0U;
+    batch->blocks[2].local[0] = 0;
+    batch->blocks[2].local[1] = 0;
+    batch->blocks[2].local[2] = 0;
+    batch->blocks[2].mountNormal[2] = 1;
+    batch->blocks[2].material = 0U;
+    batch->blocks[2].kind = 1U;
+}
+
+static void TestConstructBlocksProtocol(void)
+{
+    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    LaiueProtocolConstructBlockBatch batch;
+    MakeConstructBlockBatch(&batch);
+    uint32_t size = LaiueProtocolEncodeConstructBlocks(
+        payload, sizeof(payload), &batch);
+    ProtocolTestExpect(
+        size == 53U && payload[0] == 0x88U && payload[7] == 0x11U &&
+            payload[8] == 0x80U && payload[15] == 0x10U &&
+            payload[16] == 0xfdU && payload[17] == 0x00U &&
+            payload[18] == 3U && payload[19] == 0U &&
+            payload[20] == 0x00U && payload[21] == 0x80U &&
+            payload[29] == 1U && payload[30] == 0U &&
+            payload[50] == 1U && payload[51] == 0U && payload[52] == 1U,
+        "ConstructBlocks имеет неверную exact little-endian раскладку");
+
+    LaiueProtocolConstructBlockBatch decoded;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeConstructBlocks(payload, size, &decoded) &&
+            decoded.id == batch.id && decoded.revision == batch.revision &&
+            decoded.firstBlock == 253U && decoded.blockCount == 3U &&
+            decoded.blocks[0].local[0] == INT16_MIN &&
+            decoded.blocks[1].local[2] == 6 &&
+            decoded.blocks[1].material == 2U &&
+            decoded.blocks[2].kind == 1U &&
+            decoded.blocks[2].mountNormal[2] == 1,
+        "ConstructBlocks не прошёл round-trip");
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, size - 1U, &batch)
+                == 0U &&
+            LaiueProtocolEncodeConstructBlocks(NULL, sizeof(payload), &batch)
+                == 0U &&
+            LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), NULL)
+                == 0U &&
+            !LaiueProtocolDecodeConstructBlocks(payload, size - 1U, &decoded) &&
+            !LaiueProtocolDecodeConstructBlocks(payload, size + 1U, &decoded) &&
+            !LaiueProtocolDecodeConstructBlocks(NULL, size, &decoded) &&
+            !LaiueProtocolDecodeConstructBlocks(payload, size, NULL),
+        "ConstructBlocks не проверил указатели/точный размер");
+
+    MakeConstructBlockBatch(&batch);
+    batch.id = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял нулевой id");
+    MakeConstructBlockBatch(&batch);
+    batch.revision = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял нулевую revision");
+    MakeConstructBlockBatch(&batch);
+    batch.blockCount = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял пустой batch");
+    batch.blockCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH + 1U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял batch сверх предела");
+    MakeConstructBlockBatch(&batch);
+    batch.firstBlock = 254U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял диапазон за пределами body");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[1] = batch.blocks[0];
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял duplicate coordinates");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[1].local[2] = 4;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял non-canonical coordinate order");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[1].material = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял voxel с нулевым material");
+    batch.blocks[1].material = 3U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял неизвестный voxel material");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[1].mountNormal[0] = 1;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял mountNormal у voxel");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[2].material = 1U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял material у lever");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[2].local[0] = 1;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял lever вне local origin");
+    MakeConstructBlockBatch(&batch);
+    memset(batch.blocks[2].mountNormal, 0,
+        sizeof(batch.blocks[2].mountNormal));
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял нулевой lever mountNormal");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[2].mountNormal[0] = 1;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял diagonal lever mountNormal");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[2].mountNormal[2] = 2;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял lever mountNormal вне unit axis");
+    MakeConstructBlockBatch(&batch);
+    batch.blocks[2].kind = 2U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch)
+            == 0U,
+        "ConstructBlocks принял неизвестный block kind");
+
+    MakeConstructBlockBatch(&batch);
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[19] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks принял ненулевой reserved");
+    payload[19] = 0U;
+    TestWriteU64(payload, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял нулевой id");
+    TestWriteU64(payload, batch.id);
+    TestWriteU64(payload + 8U, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял нулевую revision");
+    TestWriteU64(payload + 8U, batch.revision);
+    payload[18] = 0U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, 20U, &decoded),
+        "ConstructBlocks decoder принял нулевой count");
+    payload[18] = 3U;
+    TestWriteU16(payload + 16U, 254U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял диапазон за пределами body");
+
+    MakeConstructBlockBatch(&batch);
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[29] = 0U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял voxel с нулевым material");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[29] = 3U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял неизвестный voxel material");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[26] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял mountNormal у voxel");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[51] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял material у lever");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[42] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял lever вне local origin");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[50] = 0U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял нулевой lever mountNormal");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[48] = 1U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял diagonal lever mountNormal");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[50] = 2U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял lever mountNormal вне unit axis");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    payload[52] = 2U;
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял неизвестный block kind");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    memcpy(payload + 31U, payload + 20U, 11U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял duplicate canonical record");
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    TestWriteU16(payload + 35U, 4U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder принял non-canonical record order");
+
+    memset(payload, 0, sizeof(payload));
+    TestWriteU64(payload, batch.id);
+    TestWriteU64(payload + 8U, batch.revision);
+    payload[18] =
+        (uint8_t)(LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH + 1U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructBlocks(payload,
+            20U + (LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH + 1U) * 11U,
+            &decoded),
+        "ConstructBlocks decoder принял batch сверх предела");
+
+    MakeConstructBlockBatch(&batch);
+    batch.firstBlock = 0U;
+    batch.blockCount = LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH;
+    memset(batch.blocks, 0, sizeof(batch.blocks));
+    for (uint32_t index = 0; index < batch.blockCount; ++index)
+    {
+        batch.blocks[index].local[0] = (int16_t)index;
+        batch.blocks[index].local[1] = 0;
+        batch.blocks[index].local[2] = 0;
+        batch.blocks[index].material = (uint8_t)(1U + index % 2U);
+        batch.blocks[index].kind = 0U;
+    }
+    size = LaiueProtocolEncodeConstructBlocks(payload, sizeof(payload), &batch);
+    ProtocolTestExpect(
+        size == 900U,
+        "ConstructBlocks encoder не принял максимальный bounded batch");
+    ProtocolTestExpect(
+        LaiueProtocolDecodeConstructBlocks(payload, size, &decoded),
+        "ConstructBlocks decoder не принял максимальный bounded batch");
+    ProtocolTestExpect(
+        decoded.blockCount == LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH &&
+            decoded.blocks[79].local[0] == 79,
+        "ConstructBlocks повредил максимальный bounded batch");
+}
+
+static LaiueProtocolConstructState MakeConstructState(void)
+{
+    LaiueProtocolConstructState state;
+    memset(&state, 0, sizeof(state));
+    state.serverTick = UINT32_MAX;
+    state.id = UINT64_C(0xa1b2c3d4e5f60718);
+    state.revision = UINT64_C(0x8877665544332211);
+    state.origin[0] = -1.5;
+    state.origin[1] = 2.0;
+    state.origin[2] = 3.25;
+    state.velocity[0] = -4.0;
+    state.velocity[1] = 5.5;
+    state.velocity[2] = 0.125;
+    state.heldBy = UINT64_C(0x0102030405060708);
+    return state;
+}
+
+static void TestConstructStateProtocol(void)
+{
+    uint8_t payload[LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE];
+    LaiueProtocolConstructState state = MakeConstructState();
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+                == 80U &&
+            payload[0] == 0xffU && payload[3] == 0xffU &&
+            payload[4] == 0U && payload[7] == 0U &&
+            payload[8] == 0x18U && payload[15] == 0xa1U &&
+            payload[16] == 0x11U && payload[23] == 0x88U &&
+            payload[72] == 0x08U && payload[79] == 0x01U,
+        "ConstructState имеет неверную exact little-endian раскладку");
+
+    LaiueProtocolConstructState decoded;
+    ProtocolTestExpect(
+        LaiueProtocolDecodeConstructState(payload, 80U, &decoded) &&
+            decoded.serverTick == state.serverTick && decoded.id == state.id &&
+            decoded.revision == state.revision &&
+            decoded.heldBy == state.heldBy &&
+            ConstructVectorsEqual(decoded.origin, state.origin) &&
+            ConstructVectorsEqual(decoded.velocity, state.velocity),
+        "ConstructState не прошёл round-trip");
+    state.serverTick = 0U;
+    state.heldBy = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+                == 80U &&
+            LaiueProtocolDecodeConstructState(payload, 80U, &decoded) &&
+            decoded.serverTick == 0U && decoded.heldBy == 0U,
+        "ConstructState не принял tick wrap/unheld state");
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, 79U, &state) == 0U &&
+            LaiueProtocolEncodeConstructState(NULL, sizeof(payload), &state)
+                == 0U &&
+            LaiueProtocolEncodeConstructState(payload, sizeof(payload), NULL)
+                == 0U &&
+            !LaiueProtocolDecodeConstructState(payload, 79U, &decoded) &&
+            !LaiueProtocolDecodeConstructState(payload, 81U, &decoded) &&
+            !LaiueProtocolDecodeConstructState(NULL, 80U, &decoded) &&
+            !LaiueProtocolDecodeConstructState(payload, 80U, NULL),
+        "ConstructState не проверил указатели/точный размер");
+
+    state = MakeConstructState();
+    state.id = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+            == 0U,
+        "ConstructState принял нулевой id");
+    state = MakeConstructState();
+    state.revision = 0U;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+            == 0U,
+        "ConstructState принял нулевую revision");
+
+    static const uint64_t nonFinite[3] = {
+        UINT64_C(0x7ff0000000000000),
+        UINT64_C(0xfff0000000000000),
+        UINT64_C(0x7ff8000000000000),
+    };
+    for (uint32_t pattern = 0; pattern < 3U; ++pattern)
+    {
+        for (uint32_t field = 0; field < 6U; ++field)
+        {
+            state = MakeConstructState();
+            double poison = ProtocolTestBitsToDouble(nonFinite[pattern]);
+            if (field < 3U)
+                state.origin[field] = poison;
+            else
+                state.velocity[field - 3U] = poison;
+            ProtocolTestExpect(
+                LaiueProtocolEncodeConstructState(
+                    payload, sizeof(payload), &state) == 0U,
+                "ConstructState encoder принял non-finite vector field");
+
+            state = MakeConstructState();
+            LaiueProtocolEncodeConstructState(
+                payload, sizeof(payload), &state);
+            uint32_t offset = field < 3U
+                ? 24U + field * 8U
+                : 48U + (field - 3U) * 8U;
+            TestWriteU64(payload + offset, nonFinite[pattern]);
+            ProtocolTestExpect(
+                !LaiueProtocolDecodeConstructState(payload, 80U, &decoded),
+                "ConstructState decoder принял non-finite vector field");
+        }
+    }
+
+    state = MakeConstructState();
+    LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state);
+    TestWriteU32(payload + 4U, 1U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructState(payload, 80U, &decoded),
+        "ConstructState decoder принял ненулевой reserved");
+    TestWriteU32(payload + 4U, 0U);
+    TestWriteU64(payload + 8U, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructState(payload, 80U, &decoded),
+        "ConstructState decoder принял нулевой id");
+    TestWriteU64(payload + 8U, state.id);
+    TestWriteU64(payload + 16U, 0U);
+    ProtocolTestExpect(
+        !LaiueProtocolDecodeConstructState(payload, 80U, &decoded),
+        "ConstructState decoder принял нулевую revision");
+    state = MakeConstructState();
+    state.origin[0] = -1099511627777.0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+            == 0U,
+        "ConstructState принял origin за world bound");
+    state = MakeConstructState();
+    state.velocity[0] = -1048577.0;
+    ProtocolTestExpect(
+        LaiueProtocolEncodeConstructState(payload, sizeof(payload), &state)
+            == 0U,
+        "ConstructState принял velocity за dynamic bound");
+}
+
+static void TestConstructProtocol(void)
+{
+    TestConstructResetProtocol();
+    TestConstructBeginProtocol();
+    TestConstructBlocksProtocol();
+    TestConstructStateProtocol();
+}
+
 LAIUE_TEST_ENTRY(ProtocolTestEntryPoint)
 {
     TestHeaderAcceptsEveryDeclaredType();
@@ -1357,6 +2038,7 @@ LAIUE_TEST_ENTRY(ProtocolTestEntryPoint)
     TestTrustParser();
     TestNetworkConfigurations();
     TestSnapshotProtocol();
+    TestConstructProtocol();
 
     ProtocolTestWrite("Проверок пройдено: ");
     ProtocolTestWriteNumber(protocolTestChecks);

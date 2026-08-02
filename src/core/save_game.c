@@ -1,5 +1,7 @@
 #include "core/save_game.h"
 #include "core/ui_format.h"
+#include "construct/physical_construct_persistence.h"
+#include "platform/system.h"
 
 #include <windows.h>
 #include <string.h>
@@ -18,6 +20,8 @@
 typedef struct SaveScratch
 {
     wchar_t path[SAVE_GAME_PATH_CAPACITY];
+    wchar_t secondaryPath[SAVE_GAME_PATH_CAPACITY];
+    wchar_t commitPath[SAVE_GAME_PATH_CAPACITY];
     char text[SAVE_TEXT_CAPACITY];
     char extra[SAVE_TEXT_CAPACITY];
 } SaveScratch;
@@ -677,7 +681,7 @@ bool SaveGameLoadInventory(Inventory* inventory)
             && ((record.slots[i].count == 0
                     && record.slots[i].item == INVENTORY_ITEM_NONE)
                 || (record.slots[i].count != 0
-                    && record.slots[i].item != INVENTORY_ITEM_NONE));
+                    && InventoryItemIsValid(record.slots[i].item)));
     }
     SaveScratchRelease(scratch);
     if (!succeeded) return false;
@@ -769,7 +773,8 @@ void SaveGameCheckModsLock(const ModsState* mods)
 
 bool SaveGameWriteAll(World* world, const Camera* camera,
     GameMode gameMode, float timeOfDayHours, int64_t seed,
-    const ModsState* mods, const Inventory* inventory)
+    const ModsState* mods, const Inventory* inventory,
+    const PhysicalConstructSystem* constructs)
 {
     if (!SaveGameEnsureDirectories())
     {
@@ -783,7 +788,13 @@ bool SaveGameWriteAll(World* world, const Camera* camera,
     }
     bool succeeded = BuildSaveFilePath(L"chunks.dat",
             scratch->path, SAVE_GAME_PATH_CAPACITY)
-        && WorldSaveDeltas(world, scratch->path);
+        && BuildSaveFilePath(L"constructs.dat",
+            scratch->secondaryPath, SAVE_GAME_PATH_CAPACITY)
+        && BuildSaveFilePath(L"state.commit",
+            scratch->commitPath, SAVE_GAME_PATH_CAPACITY)
+        && PhysicalConstructPersistenceSave(world, constructs,
+            scratch->path, scratch->secondaryPath,
+            scratch->commitPath);
     SaveScratchRelease(scratch);
 
     succeeded = WriteMeta(seed, timeOfDayHours) && succeeded;
@@ -793,7 +804,8 @@ bool SaveGameWriteAll(World* world, const Camera* camera,
     return succeeded;
 }
 
-bool SaveGameLoadWorld(World* world)
+bool SaveGameLoadWorldState(World* world,
+    PhysicalConstructSystem* constructs)
 {
     SaveScratch* scratch = SaveScratchAcquire();
     if (scratch == NULL)
@@ -802,7 +814,13 @@ bool SaveGameLoadWorld(World* world)
     }
     bool succeeded = BuildSaveFilePath(L"chunks.dat",
             scratch->path, SAVE_GAME_PATH_CAPACITY)
-        && WorldLoadDeltas(world, scratch->path);
+        && BuildSaveFilePath(L"constructs.dat",
+            scratch->secondaryPath, SAVE_GAME_PATH_CAPACITY)
+        && BuildSaveFilePath(L"state.commit",
+            scratch->commitPath, SAVE_GAME_PATH_CAPACITY)
+        && PhysicalConstructPersistenceLoad(world, constructs,
+            scratch->path, scratch->secondaryPath,
+            scratch->commitPath);
     SaveScratchRelease(scratch);
     return succeeded;
 }

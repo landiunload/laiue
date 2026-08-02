@@ -12,6 +12,7 @@
 #define PLAYER_STATE_AIR_JUMP_LIMIT 4096
 #define PLAYER_STATE_TIMER_EPSILON 1e-9
 #define PLAYER_CANONICAL_VELOCITY_EPSILON 1e-12
+#define PLAYER_PLATFORM_MAX_DISPLACEMENT_PER_SUBSTEP 0.5
 
 
 static VoxelBodyShape ActiveShape(const PlayerController* controller)
@@ -55,6 +56,9 @@ static bool SnapDownToGround(const PlayerController* controller,
     return false;
 }
 
+static double BoundedPlatformDisplacement(double velocity,
+    double stepSeconds);
+
 static void RefreshGroundState(PlayerController* controller,
     const PlayerCollisionSource* collision, Camera* camera,
     double stepSeconds, VoxelGroundContact* outContact)
@@ -76,7 +80,8 @@ static void RefreshGroundState(PlayerController* controller,
 }
 
 static bool TryLaunchQueuedJump(PlayerController* controller,
-    const PlayerControllerCommand* command)
+    const PlayerControllerCommand* command,
+    const VoxelGroundContact* groundContact, double stepSeconds)
 {
     if (!PlayerJumpTryLaunch(&controller->jump))
     {
@@ -84,6 +89,21 @@ static bool TryLaunchQueuedJump(PlayerController* controller,
     }
 
     controller->grounded = false;
+    if (groundContact->supported
+        && groundContact->surfaceStableId != 0u)
+    {
+        // Once the feet leave a moving surface its horizontal world velocity
+        // becomes ordinary external momentum instead of disappearing.
+        double inheritedX = BoundedPlatformDisplacement(
+            groundContact->surfaceVelocity[0], stepSeconds);
+        double inheritedY = BoundedPlatformDisplacement(
+            groundContact->surfaceVelocity[1], stepSeconds);
+        if (stepSeconds > 0.0)
+        {
+            controller->externalVelocityX += inheritedX / stepSeconds;
+            controller->externalVelocityY += inheritedY / stepSeconds;
+        }
+    }
     if (command->sprintHeld
         && !PlayerStanceIsCrouching(&controller->stance))
     {
@@ -92,6 +112,53 @@ static bool TryLaunchQueuedJump(PlayerController* controller,
             controller->config.sprintingSpeed);
     }
     return true;
+}
+
+static double BoundedPlatformDisplacement(double velocity,
+    double stepSeconds)
+{
+    if (!IsFiniteBounded(velocity, PLAYER_STATE_VELOCITY_LIMIT)
+        || !IsFiniteBounded(stepSeconds, PLAYER_STATE_TIMER_LIMIT)
+        || stepSeconds <= 0.0)
+    {
+        return 0.0;
+    }
+    double distance = velocity * stepSeconds;
+    if (distance > PLAYER_PLATFORM_MAX_DISPLACEMENT_PER_SUBSTEP)
+    {
+        return PLAYER_PLATFORM_MAX_DISPLACEMENT_PER_SUBSTEP;
+    }
+    if (distance < -PLAYER_PLATFORM_MAX_DISPLACEMENT_PER_SUBSTEP)
+    {
+        return -PLAYER_PLATFORM_MAX_DISPLACEMENT_PER_SUBSTEP;
+    }
+    return distance;
+}
+
+static void MoveWithGroundSurface(PlayerController* controller,
+    const PlayerCollisionSource* collision, Camera* camera,
+    const VoxelGroundContact* groundContact, double stepSeconds)
+{
+    if (!groundContact->supported
+        || groundContact->surfaceStableId == 0u)
+    {
+        return;
+    }
+
+    VoxelBodyShape shape = ActiveShape(controller);
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double distance = BoundedPlatformDisplacement(
+            groundContact->surfaceVelocity[axis], stepSeconds);
+        if (distance != 0.0)
+        {
+            // The regular exact sweep also clips against walls, ceilings and
+            // other moving bodies. A very fast platform can therefore never
+            // teleport a passenger through geometry.
+            VoxelBodyMoveAxis(collision, camera->position,
+                &shape, axis, distance);
+        }
+    }
 }
 
 static void MoveVoluntary(PlayerController* controller,
@@ -316,7 +383,13 @@ static void SimulateStep(PlayerController* controller,
     }
     MoveVoluntary(controller, collision, camera, command,
         groundContact.supported, groundContact.friction, stepSeconds);
-    bool launched = TryLaunchQueuedJump(controller, command);
+    bool launched = TryLaunchQueuedJump(
+        controller, command, &groundContact, stepSeconds);
+    if (!launched)
+    {
+        MoveWithGroundSurface(controller, collision, camera,
+            &groundContact, stepSeconds);
+    }
     MoveExternalVelocity(controller, collision, camera,
         groundContact.friction, stepSeconds);
     IntegrateVertical(controller, collision, camera, stepSeconds);

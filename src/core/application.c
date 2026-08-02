@@ -2,6 +2,7 @@
 #include "core/application_config.h"
 #include "core/block_effects.h"
 #include "content/content_bundle.h"
+#include "construct/physical_construct.h"
 #include "core/camera.h"
 #include "core/chunk_streaming.h"
 #include "core/game_hud.h"
@@ -16,6 +17,7 @@
 #include "render/shader_pack.h"
 #include "render/texture_pack.h"
 #include "core/player_command_mapper.h"
+#include "core/physical_construct_renderer.h"
 #include "core/remote_player_renderer.h"
 #include "core/ui.h"
 #include "gameplay/game_mode.h"
@@ -25,6 +27,7 @@
 #include "interaction/voxel_interaction.h"
 #include "input/input.h"
 #include "network/network.h"
+#include "network/protocol.h"
 #include "platform/system.h"
 #include "platform/time.h"
 #include "platform/window.h"
@@ -47,10 +50,17 @@
 #define NETWORK_MAX_CATCH_UP_TICKS 8U
 #define NETWORK_VISUAL_SNAP_DISTANCE 2.0
 #define NETWORK_VISUAL_CORRECTION_RATE 10.0
+#define NETWORK_CONSTRUCT_STATE_CACHE_CAPACITY \
+    (LAIUE_NETWORK_MAX_CONSTRUCT_BODIES * 2U)
 
 _Static_assert(LAIUE_NETWORK_MAX_PEERS
         <= REMOTE_PLAYER_RENDER_CAPACITY,
     "remote player renderer must cover every network peer");
+_Static_assert(LAIUE_PROTOCOL_MAX_INVENTORY_ITEM ==
+        INVENTORY_ITEM_PHYSICS_LEVER,
+    "protocol v6 and gameplay inventory item ranges must match");
+_Static_assert(LAIUE_PROTOCOL_INVENTORY_SLOTS == INVENTORY_SLOT_COUNT,
+    "protocol and gameplay inventory slot counts must match");
 
 typedef struct NetworkRemotePlayer
 {
@@ -70,6 +80,18 @@ typedef struct NetworkChunkRevision
     bool resyncRequested;
 } NetworkChunkRevision;
 
+typedef struct NetworkConstructStateCacheEntry
+{
+    bool active;
+    bool hasState;
+    bool hasBaselineTick;
+    bool baselineIncludesState;
+    uint64_t id;
+    uint64_t revision;
+    uint32_t baselineTick;
+    NetworkConstructState state;
+} NetworkConstructStateCacheEntry;
+
 typedef struct NetworkSnapshotAssembly
 {
     bool active;
@@ -77,6 +99,7 @@ typedef struct NetworkSnapshotAssembly
     bool requiresReadyBarrier;
     uint64_t snapshotId;
     uint64_t worldRevision;
+    uint32_t serverTick;
     uint32_t expectedChunkCount;
     uint32_t completedChunkCount;
     int64_t chunk[3];
@@ -88,6 +111,16 @@ typedef struct NetworkSnapshotAssembly
     uint32_t editCapacity;
     NetworkBlockDelta pendingDeltas[NETWORK_PENDING_DELTA_CAPACITY];
     uint32_t pendingDeltaCount;
+    bool constructResetReceived;
+    bool constructBodyActive;
+    uint16_t expectedConstructBodies;
+    uint16_t completedConstructBodies;
+    uint16_t nextConstructBlock;
+    uint64_t lastConstructBodyId;
+    NetworkConstructBody constructBody;
+    PhysicalConstructBlock
+        constructBlocks[PHYSICAL_CONSTRUCT_MAX_BLOCKS];
+    PhysicalConstructSystem* stagingConstructs;
 } NetworkSnapshotAssembly;
 
 typedef struct ApplicationState
@@ -95,6 +128,14 @@ typedef struct ApplicationState
     Window* window;
     Input* input;
     World* world;
+    PhysicalConstructSystem* constructs;
+    PhysicalConstructRenderer constructRenderer;
+    bool constructRendererReady;
+    double constructTickAccumulator;
+    bool localPendingJumpPressed;
+    uint64_t grabbedConstructBodyId;
+    double grabbedConstructDistance;
+    bool constructGrabInputHeld;
     Renderer* renderer;
     ChunkStreaming* chunkStreaming;
     Camera camera;
@@ -130,6 +171,10 @@ typedef struct ApplicationState
     uint32_t networkPendingResyncCount;
     uint64_t networkNextResyncRequestAtMs;
     NetworkSnapshotAssembly networkSnapshot;
+    NetworkConstructStateCacheEntry constructStateCache[
+        NETWORK_CONSTRUCT_STATE_CACHE_CAPACITY];
+    PhysicalConstructCollider constructColliderScratch[
+        VOXEL_DYNAMIC_COLLIDER_CAPACITY];
     NetworkChunkRevision networkChunkRevisions[
         NETWORK_CHUNK_REVISION_CAPACITY];
     uint32_t networkChunkRevisionCount;
@@ -150,6 +195,9 @@ typedef struct ApplicationState
     struct
     {
         int64_t block[3];
+        uint64_t bodyId;
+        int32_t localBlock[3];
+        VoxelEditSpace space;
         float progress;
         bool active;
     } breaking;
@@ -171,22 +219,84 @@ typedef struct ApplicationState
 
 static void ResumeGame(ApplicationState* application);
 
+static void ReleaseConstructGrab(ApplicationState* application)
+{
+    application->constructGrabInputHeld = false;
+    if (application->grabbedConstructBodyId != 0U &&
+        !application->networkSession && application->constructs != NULL)
+    {
+        (void)PhysicalConstructEndGrab(application->constructs,
+            application->grabbedConstructBodyId, UINT64_MAX);
+    }
+    application->grabbedConstructBodyId = 0U;
+}
+
 static void QueryWorldBlockPhysics(
     void* context, int64_t x, int64_t y, int64_t z,
     VoxelBlockPhysics* outBlock)
 {
-    BlockType type = WorldGetBlock((World*)context, x, y, z);
+    ApplicationState* application = context;
+    BlockType type = WorldGetBlock(application->world, x, y, z);
     BlockProperties properties = BlockGetProperties(type);
     outBlock->flags = properties.solid
         ? VOXEL_BLOCK_PHYSICS_SOLID : 0u;
     outBlock->friction = properties.friction;
 }
 
-static PlayerCollisionSource CreatePlayerCollisionSource(World* world)
+static bool QueryConstructColliders(void* context,
+    const VoxelBodyBounds* queryBounds,
+    VoxelDynamicCollider* outColliders, uint32_t colliderCapacity,
+    uint32_t* outColliderCount)
+{
+    ApplicationState* application = context;
+    *outColliderCount = 0U;
+    if (application->constructs == NULL)
+        return true;
+    if (queryBounds == NULL || outColliders == NULL ||
+        colliderCapacity > VOXEL_DYNAMIC_COLLIDER_CAPACITY)
+        return false;
+
+    PhysicalConstructAabb query;
+    memcpy(query.minimum, queryBounds->minimum,
+        sizeof(query.minimum));
+    memcpy(query.maximum, queryBounds->maximum,
+        sizeof(query.maximum));
+    bool truncated = false;
+    uint32_t count = PhysicalConstructCopyCollidersInAabb(
+        application->constructs, &query,
+        application->constructColliderScratch,
+        colliderCapacity, &truncated);
+    if (truncated)
+        return false;
+
+    for (uint32_t index = 0U; index < count; ++index)
+    {
+        const PhysicalConstructCollider* source =
+            &application->constructColliderScratch[index];
+        VoxelDynamicCollider* destination = &outColliders[index];
+        memcpy(destination->bounds.minimum, source->bounds.minimum,
+            sizeof(destination->bounds.minimum));
+        memcpy(destination->bounds.maximum, source->bounds.maximum,
+            sizeof(destination->bounds.maximum));
+        memcpy(destination->velocity, source->velocity,
+            sizeof(destination->velocity));
+        destination->friction = 1.0f;
+        // CopyCollidersInAabb is deterministic. A per-query ordinal is a
+        // bounded, non-zero ID and is unique even when one body contributes
+        // several voxel/model-part colliders.
+        destination->stableId = (uint64_t)index + 1U;
+    }
+    *outColliderCount = count;
+    return true;
+}
+
+static PlayerCollisionSource CreatePlayerCollisionSource(
+    ApplicationState* application)
 {
     PlayerCollisionSource source = {
-        .context = world,
+        .context = application,
         .queryBlockPhysics = QueryWorldBlockPhysics,
+        .queryDynamicColliders = QueryConstructColliders,
     };
     return source;
 }
@@ -205,6 +315,30 @@ static void ResetNetworkPhysics(ApplicationState* application)
         application->networkVisualCorrection[axis] = 0.0;
     }
     application->networkPhysicsInitialized = true;
+}
+
+static void AbandonNetworkSnapshot(ApplicationState* application)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    PhysicalConstructSystemDestroy(snapshot->stagingConstructs);
+    snapshot->stagingConstructs = NULL;
+    snapshot->active = false;
+    snapshot->chunkActive = false;
+    snapshot->constructResetReceived = false;
+    snapshot->constructBodyActive = false;
+    snapshot->editCount = 0U;
+    snapshot->pendingDeltaCount = 0U;
+    snapshot->expectedConstructBodies = 0U;
+    snapshot->completedConstructBodies = 0U;
+    snapshot->nextConstructBlock = 0U;
+    snapshot->lastConstructBodyId = 0U;
+}
+
+static void ResetNetworkConstructReplication(
+    ApplicationState* application)
+{
+    memset(application->constructStateCache, 0,
+        sizeof(application->constructStateCache));
 }
 
 static void InvalidateModBlock(void* context,
@@ -308,19 +442,26 @@ static void InitializeSessionInventory(ApplicationState* application)
     application->inventory.slots[0].count = INVENTORY_STACK_LIMIT;
     application->inventory.slots[1].item = BLOCK_GRASS;
     application->inventory.slots[1].count = INVENTORY_STACK_LIMIT;
+    application->inventory.slots[2].item =
+        INVENTORY_ITEM_PHYSICS_LEVER;
+    application->inventory.slots[2].count = INVENTORY_STACK_LIMIT;
 }
 
 static void ApplicationCloseSession(ApplicationState* application,
     bool saveWorld, bool disconnectNetwork)
 {
+    ReleaseConstructGrab(application);
     if (application->sessionActive && saveWorld
         && !application->networkSession)
     {
         SaveGameWriteAll(application->world, &application->camera,
             application->gameMode, application->settings.timeOfDayHours,
             application->worldSeed, &application->mods,
-            &application->inventory);
+            &application->inventory, application->constructs);
     }
+    // The staging replica references the current World and must be destroyed
+    // before that World. It is never visible to collision or rendering.
+    AbandonNetworkSnapshot(application);
     ModHostShutdown(&application->modHost);
     if (application->blockEffectsReady)
     {
@@ -330,19 +471,28 @@ static void ApplicationCloseSession(ApplicationState* application,
     }
     RemotePlayerRendererShutdown(&application->remotePlayerRenderer,
         application->renderer);
+    if (application->constructRendererReady)
+    {
+        PhysicalConstructRendererShutdown(
+            &application->constructRenderer, application->renderer);
+        application->constructRendererReady = false;
+    }
     ChunkStreamingDestroy(application->chunkStreaming);
+    PhysicalConstructSystemDestroy(application->constructs);
     WorldDestroy(application->world);
     application->chunkStreaming = NULL;
     application->world = NULL;
+    application->constructs = NULL;
+    application->grabbedConstructBodyId = 0U;
+    application->constructGrabInputHeld = false;
+    application->constructTickAccumulator = 0.0;
+    application->localPendingJumpPressed = false;
     application->sessionActive = false;
     application->networkSession = false;
     application->inventoryOpen = false;
     application->breaking.active = false;
     application->breaking.progress = 0.0f;
-    application->networkSnapshot.active = false;
-    application->networkSnapshot.chunkActive = false;
-    application->networkSnapshot.editCount = 0;
-    application->networkSnapshot.pendingDeltaCount = 0;
+    ResetNetworkConstructReplication(application);
     application->networkChunkRevisionCount = 0;
     application->networkWorldInitialized = false;
     application->networkGameplayActivated = false;
@@ -396,12 +546,31 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
         SaveGameSetSlot(previousSlot);
         return false;
     }
-    if (savedMinutes >= 0) SaveGameLoadWorld(replacementWorld);
+    PhysicalConstructSystem* replacementConstructs =
+        PhysicalConstructSystemCreate(replacementWorld, NULL);
+    if (replacementConstructs == NULL)
+    {
+        WorldDestroy(replacementWorld);
+        RendererReleaseWorld(application->renderer);
+        SaveGameSetSlot(previousSlot);
+        return false;
+    }
+    if (savedMinutes >= 0 &&
+        !SaveGameLoadWorldState(
+            replacementWorld, replacementConstructs))
+    {
+        PhysicalConstructSystemDestroy(replacementConstructs);
+        WorldDestroy(replacementWorld);
+        RendererReleaseWorld(application->renderer);
+        SaveGameSetSlot(previousSlot);
+        return false;
+    }
     ChunkStreaming* replacementStreaming = ChunkStreamingCreate(
         replacementWorld, application->renderer,
         g_applicationConfiguration.viewRadiusChunks);
     if (replacementStreaming == NULL)
     {
+        PhysicalConstructSystemDestroy(replacementConstructs);
         WorldDestroy(replacementWorld);
         RendererReleaseWorld(application->renderer);
         SaveGameSetSlot(previousSlot);
@@ -409,6 +578,7 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
     }
 
     application->world = replacementWorld;
+    application->constructs = replacementConstructs;
     application->chunkStreaming = replacementStreaming;
     application->worldSeed = seed;
     application->networkEverReady = false;
@@ -435,14 +605,18 @@ static bool ApplicationSwitchWorld(ApplicationState* application,
             application->renderer))
     {
         ChunkStreamingDestroy(application->chunkStreaming);
+        PhysicalConstructSystemDestroy(application->constructs);
         WorldDestroy(application->world);
         application->chunkStreaming = NULL;
         application->world = NULL;
+        application->constructs = NULL;
         RendererReleaseWorld(application->renderer);
         SaveGameSetSlot(previousSlot);
         return false;
     }
     application->blockEffectsReady = true;
+    PhysicalConstructRendererInit(&application->constructRenderer);
+    application->constructRendererReady = true;
     InitializeApplicationModHost(application);
     application->networkSession = false;
     application->sessionActive = true;
@@ -461,16 +635,26 @@ static bool ApplicationSwitchToNetworkWorld(ApplicationState* application,
         RendererReleaseWorld(application->renderer);
         return false;
     }
-    ChunkStreaming* replacementStreaming = ChunkStreamingCreate(
-        replacementWorld, application->renderer,
-        g_applicationConfiguration.viewRadiusChunks);
-    if (replacementStreaming == NULL)
+    PhysicalConstructSystem* replacementConstructs =
+        PhysicalConstructSystemCreate(replacementWorld, NULL);
+    if (replacementConstructs == NULL)
     {
         WorldDestroy(replacementWorld);
         RendererReleaseWorld(application->renderer);
         return false;
     }
+    ChunkStreaming* replacementStreaming = ChunkStreamingCreate(
+        replacementWorld, application->renderer,
+        g_applicationConfiguration.viewRadiusChunks);
+    if (replacementStreaming == NULL)
+    {
+        PhysicalConstructSystemDestroy(replacementConstructs);
+        WorldDestroy(replacementWorld);
+        RendererReleaseWorld(application->renderer);
+        return false;
+    }
     application->world = replacementWorld;
+    application->constructs = replacementConstructs;
     application->chunkStreaming = replacementStreaming;
     application->worldSeed = seed;
     CameraInit(&application->camera, 0.0, 0.0,
@@ -484,13 +668,17 @@ static bool ApplicationSwitchToNetworkWorld(ApplicationState* application,
             application->renderer))
     {
         ChunkStreamingDestroy(application->chunkStreaming);
+        PhysicalConstructSystemDestroy(application->constructs);
         WorldDestroy(application->world);
         application->chunkStreaming = NULL;
         application->world = NULL;
+        application->constructs = NULL;
         RendererReleaseWorld(application->renderer);
         return false;
     }
     application->blockEffectsReady = true;
+    PhysicalConstructRendererInit(&application->constructRenderer);
+    application->constructRendererReady = true;
     application->networkSession = true;
     InitializeApplicationModHost(application);
     application->networkWorldInitialized = true;
@@ -591,13 +779,27 @@ static bool RebaseWorldIfNeeded(ApplicationState* application)
     {
         return true;
     }
+    if (shift[0] == INT64_MIN || shift[1] == INT64_MIN ||
+        shift[2] == INT64_MIN)
+    {
+        return false;
+    }
 
     if (!ChunkStreamingPause(application->chunkStreaming))
     {
         return false;
     }
+    if (!PhysicalConstructRebase(application->constructs, shift))
+    {
+        return false;
+    }
     if (!WorldRebase(application->world, shift[0], shift[1], shift[2]))
     {
+        int64_t rollback[3] = {
+            -shift[0], -shift[1], -shift[2]
+        };
+        (void)PhysicalConstructRebase(
+            application->constructs, rollback);
         return false;
     }
 
@@ -648,7 +850,7 @@ static bool SquareAbsoluteX(ApplicationState* application)
     if (application->gameMode == GAME_MODE_WALK)
     {
         PlayerCollisionSource collision =
-            CreatePlayerCollisionSource(application->world);
+            CreatePlayerCollisionSource(application);
         PlayerControllerReset(&application->player, &application->camera);
         if (!PlayerControllerResolvePenetration(&application->player,
                 &collision, &application->camera))
@@ -685,32 +887,165 @@ static void RecordPresentedFrame(ApplicationState* application)
     application->fpsSampleStartSeconds = currentTimeSeconds;
 }
 
-static BlockType SelectedPlacementBlock(const ApplicationState* application)
+static InventoryItemId SelectedPlacementItem(
+    const ApplicationState* application)
 {
     const InventorySlot* selected =
         InventorySelectedSlot(&application->inventory);
-    if (selected == NULL || selected->item < BLOCK_EARTH
-        || selected->item > BLOCK_GRASS || selected->count == 0)
+    if (selected == NULL || !InventoryItemIsValid(selected->item) ||
+        selected->count == 0)
     {
-        return BLOCK_AIR;
+        return INVENTORY_ITEM_NONE;
     }
-    return (BlockType)selected->item;
+    return selected->item;
 }
 
-static bool SameBlockPosition(const int64_t left[3],
-    const int64_t right[3])
+static uint32_t BuildLocalPlacementBlockers(
+    ApplicationState* application,
+    PhysicalConstructAabb output[1])
 {
-    return left[0] == right[0] && left[1] == right[1]
-        && left[2] == right[2];
+    if (application->gameMode != GAME_MODE_WALK)
+        return 0U;
+    VoxelBodyShape shape;
+    VoxelBodyBounds bounds;
+    PlayerControllerGetBodyShape(&application->player, &shape);
+    VoxelBodyCalculateBounds(
+        application->camera.position, &shape, &bounds);
+    memcpy(output[0].minimum, bounds.minimum,
+        sizeof(output[0].minimum));
+    memcpy(output[0].maximum, bounds.maximum,
+        sizeof(output[0].maximum));
+    return 1U;
 }
 
-static void ApplyLocalEdit(ApplicationState* application,
-    const VoxelEdit* edit, bool survivalBreak)
+static bool SameEditTarget(
+    const ApplicationState* application, const VoxelEdit* edit)
 {
+    if (!application->breaking.active ||
+        application->breaking.space != edit->space)
+        return false;
+    if (edit->space == VOXEL_EDIT_SPACE_CONSTRUCT)
+    {
+        return application->breaking.bodyId == edit->bodyId &&
+            application->breaking.localBlock[0] == edit->localBlock[0] &&
+            application->breaking.localBlock[1] == edit->localBlock[1] &&
+            application->breaking.localBlock[2] == edit->localBlock[2];
+    }
+    return application->breaking.block[0] == edit->block[0] &&
+        application->breaking.block[1] == edit->block[1] &&
+        application->breaking.block[2] == edit->block[2];
+}
+
+static bool FindConstructBodyState(
+    const PhysicalConstructSystem* constructs, uint64_t bodyId,
+    PhysicalConstructBodyState* outState)
+{
+    PhysicalConstructBodyState states[PHYSICAL_CONSTRUCT_MAX_BODIES];
+    bool truncated = false;
+    uint32_t count = PhysicalConstructCopyBodyStates(
+        constructs, states, PHYSICAL_CONSTRUCT_MAX_BODIES, &truncated);
+    if (truncated) return false;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (states[index].id == bodyId)
+        {
+            *outState = states[index];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void InvalidateCapturedConstruct(
+    ApplicationState* application, uint64_t bodyId)
+{
+    PhysicalConstructBodyState state;
+    PhysicalConstructBlock* blocks = PlatformAllocate(
+        PHYSICAL_CONSTRUCT_MAX_BLOCKS * sizeof(*blocks), false);
+    if (blocks == NULL) return;
+    uint32_t count = 0;
+    if (!FindConstructBodyState(
+            application->constructs, bodyId, &state) ||
+        !PhysicalConstructCopyBlocks(application->constructs, bodyId,
+            blocks, PHYSICAL_CONSTRUCT_MAX_BLOCKS, &count))
+    {
+        PlatformFree(blocks);
+        return;
+    }
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (blocks[index].kind != PHYSICAL_CONSTRUCT_BLOCK_VOXEL)
+            continue;
+        int64_t block[3] = {
+            (int64_t)state.origin[0] + blocks[index].local[0],
+            (int64_t)state.origin[1] + blocks[index].local[1],
+            (int64_t)state.origin[2] + blocks[index].local[2],
+        };
+        ChunkStreamingInvalidateBlock(application->chunkStreaming,
+            block[0], block[1], block[2]);
+    }
+    PlatformFree(blocks);
+}
+
+static bool ApplyLocalEdit(ApplicationState* application,
+    const VoxelEdit* edit, bool survivalBreak,
+    const PhysicalConstructAabb* blockers, uint32_t blockerCount)
+{
+    if (edit->type == VOXEL_EDIT_ACTIVATE_LEVER)
+    {
+        uint64_t bodyId = 0;
+        PhysicalConstructResult result = PhysicalConstructActivateLever(
+            application->constructs, edit->block, edit->mountNormal,
+            blockers, blockerCount, &bodyId);
+        if (result != PHYSICAL_CONSTRUCT_OK) return false;
+        InvalidateCapturedConstruct(application, bodyId);
+        return true;
+    }
+    if (edit->space == VOXEL_EDIT_SPACE_CONSTRUCT)
+    {
+        if (edit->type == VOXEL_EDIT_PLACE)
+        {
+            return PhysicalConstructPlaceBlock(application->constructs,
+                edit->bodyId, edit->localBlock, edit->replacement,
+                blockers, blockerCount) == PHYSICAL_CONSTRUCT_OK;
+        }
+        PhysicalConstructBodyState before;
+        if (!FindConstructBodyState(
+                application->constructs, edit->bodyId, &before))
+            return false;
+        PhysicalConstructBlock removed;
+        uint64_t bodyIds[PHYSICAL_CONSTRUCT_MAX_BODIES];
+        uint32_t bodyIdCount = 0;
+        PhysicalConstructResult result = PhysicalConstructBreakBlock(
+            application->constructs, edit->bodyId, edit->localBlock,
+            &removed, bodyIds, PHYSICAL_CONSTRUCT_MAX_BODIES,
+            &bodyIdCount);
+        if (result != PHYSICAL_CONSTRUCT_OK) return false;
+        if (survivalBreak &&
+            removed.kind == PHYSICAL_CONSTRUCT_BLOCK_LEVER)
+        {
+            (void)InventoryAdd(&application->inventory,
+                INVENTORY_ITEM_PHYSICS_LEVER, 1U);
+        }
+        if (survivalBreak && removed.material != BLOCK_AIR)
+        {
+            int64_t effectBlock[3] = {
+                (int64_t)(before.origin[0] + removed.local[0]),
+                (int64_t)(before.origin[1] + removed.local[1]),
+                (int64_t)(before.origin[2] + removed.local[2]),
+            };
+            BlockEffectsSpawnDestroyed(&application->blockEffects,
+                removed.material, effectBlock);
+        }
+        return true;
+    }
+
     BlockType previousBlock = WorldGetBlock(application->world,
         edit->block[0], edit->block[1], edit->block[2]);
-    WorldSetBlock(application->world,
-        edit->block[0], edit->block[1], edit->block[2], edit->replacement);
+    if (!WorldTrySetBlock(application->world,
+            edit->block[0], edit->block[1], edit->block[2],
+            edit->replacement))
+        return false;
     ChunkStreamingInvalidateBlock(application->chunkStreaming,
         edit->block[0], edit->block[1], edit->block[2]);
     if (survivalBreak && previousBlock != BLOCK_AIR)
@@ -721,6 +1056,7 @@ static void ApplyLocalEdit(ApplicationState* application,
     ModHostDispatchBlockEdit(&application->modHost,
         edit->block[0], edit->block[1], edit->block[2],
         (uint8_t)previousBlock, (uint8_t)edit->replacement);
+    return true;
 }
 
 static void HandleBlockEditing(ApplicationState* application,
@@ -732,8 +1068,83 @@ static void HandleBlockEditing(ApplicationState* application,
             INPUT_MOUSE_BUTTON_LEFT)
         : InputWasMouseButtonPressed(application->input,
             INPUT_MOUSE_BUTTON_LEFT);
+    bool rightDown = InputIsMouseButtonDown(
+        application->input, INPUT_MOUSE_BUTTON_RIGHT);
     bool placePressed = InputWasMouseButtonPressed(
         application->input, INPUT_MOUSE_BUTTON_RIGHT);
+    float direction[3];
+    CameraGetForwardVector(&application->camera, direction);
+
+    PhysicalConstructAabb blockers[1];
+    uint32_t blockerCount = BuildLocalPlacementBlockers(
+        application, blockers);
+
+    if (application->grabbedConstructBodyId != 0U)
+    {
+        application->constructGrabInputHeld = rightDown;
+        if (!rightDown)
+        {
+            if (!application->networkSession)
+            {
+                (void)PhysicalConstructEndGrab(application->constructs,
+                    application->grabbedConstructBodyId, UINT64_MAX);
+            }
+            application->grabbedConstructBodyId = 0U;
+        }
+        else
+        {
+            double target[3];
+            for (uint32_t axis = 0; axis < 3U; ++axis)
+            {
+                target[axis] = application->camera.position[axis] +
+                    (double)direction[axis] *
+                        application->grabbedConstructDistance;
+            }
+            if (!application->networkSession &&
+                !PhysicalConstructUpdateGrab(application->constructs,
+                    application->grabbedConstructBodyId,
+                    UINT64_MAX, target))
+            {
+                application->grabbedConstructBodyId = 0U;
+                application->constructGrabInputHeld = false;
+            }
+            placePressed = false;
+        }
+    }
+    else
+    {
+        application->constructGrabInputHeld = false;
+        if (placePressed)
+        {
+            VoxelSceneHit hit;
+            if (VoxelInteractionRaycastScene(application->world,
+                    application->constructs,
+                    application->camera.position, direction,
+                    g_applicationConfiguration.editReachDistance,
+                    &hit) &&
+                hit.kind == VOXEL_SCENE_HIT_LEVER_HANDLE)
+            {
+                double target[3];
+                for (uint32_t axis = 0; axis < 3U; ++axis)
+                {
+                    target[axis] = application->camera.position[axis] +
+                        (double)direction[axis] * hit.distance;
+                }
+                bool accepted = application->networkSession ||
+                    PhysicalConstructBeginGrab(application->constructs,
+                        hit.bodyId, UINT64_MAX, target) ==
+                            PHYSICAL_CONSTRUCT_OK;
+                if (accepted)
+                {
+                    application->grabbedConstructBodyId = hit.bodyId;
+                    application->grabbedConstructDistance = hit.distance;
+                    application->constructGrabInputHeld = true;
+                    placePressed = false;
+                }
+            }
+        }
+    }
+
     if (!breakRequested && !placePressed)
     {
         application->breaking.active = false;
@@ -742,25 +1153,14 @@ static void HandleBlockEditing(ApplicationState* application,
         return;
     }
 
-    float direction[3];
-    CameraGetForwardVector(&application->camera, direction);
-
-    VoxelBodyShape bodyShape;
-    const VoxelBodyShape* blockingShape = NULL;
-    const double* blockingPosition = NULL;
-    if (application->gameMode == GAME_MODE_WALK)
-    {
-        PlayerControllerGetBodyShape(&application->player, &bodyShape);
-        blockingShape = &bodyShape;
-        blockingPosition = application->camera.position;
-    }
-
     if (breakRequested)
     {
         VoxelEdit edit;
         if (!VoxelInteractionTryCreateEdit(application->world,
+                application->constructs,
                 application->camera.position, direction,
-                blockingPosition, blockingShape, true, false, BLOCK_AIR,
+                blockers, blockerCount, true, false,
+                INVENTORY_ITEM_NONE,
                 g_applicationConfiguration.editReachDistance, &edit))
         {
             application->breaking.active = false;
@@ -773,24 +1173,26 @@ static void HandleBlockEditing(ApplicationState* application,
                 NetworkClientSendEditIntent(application->networkClient,
                     true, false, BLOCK_AIR, direction);
             else
-                ApplyLocalEdit(application, &edit, false);
+                (void)ApplyLocalEdit(application, &edit, false,
+                    blockers, blockerCount);
         }
         else
         {
-            if (!application->breaking.active
-                || !SameBlockPosition(application->breaking.block,
-                    edit.block))
+            if (!SameEditTarget(application, &edit))
             {
                 application->breaking.active = true;
-                application->breaking.block[0] = edit.block[0];
-                application->breaking.block[1] = edit.block[1];
-                application->breaking.block[2] = edit.block[2];
+                application->breaking.space = edit.space;
+                application->breaking.bodyId = edit.bodyId;
+                memcpy(application->breaking.block, edit.block,
+                    sizeof(application->breaking.block));
+                memcpy(application->breaking.localBlock,
+                    edit.localBlock,
+                    sizeof(application->breaking.localBlock));
                 application->breaking.progress = 0.0f;
                 application->networkBreakSendAccumulator = 0.1f;
             }
-            BlockProperties properties = BlockGetProperties(
-                WorldGetBlock(application->world,
-                    edit.block[0], edit.block[1], edit.block[2]));
+            BlockProperties properties =
+                BlockGetProperties(edit.original);
             float breakSeconds = properties.breakSeconds > 0.05f
                 ? properties.breakSeconds : 0.55f;
             application->breaking.progress += deltaSeconds / breakSeconds;
@@ -808,7 +1210,8 @@ static void HandleBlockEditing(ApplicationState* application,
             }
             else if (application->breaking.progress >= 1.0f)
             {
-                ApplyLocalEdit(application, &edit, true);
+                (void)ApplyLocalEdit(application, &edit, true,
+                    blockers, blockerCount);
                 application->breaking.active = false;
                 application->breaking.progress = 0.0f;
             }
@@ -822,33 +1225,41 @@ static void HandleBlockEditing(ApplicationState* application,
     }
 
     if (!placePressed) return;
-    BlockType placementBlock = SelectedPlacementBlock(application);
-    if (placementBlock == BLOCK_AIR) return;
+    InventoryItemId placementItem =
+        SelectedPlacementItem(application);
+    if (placementItem == INVENTORY_ITEM_NONE) return;
     VoxelEdit placement;
     if (!VoxelInteractionTryCreateEdit(application->world,
+            application->constructs,
             application->camera.position, direction,
-            blockingPosition, blockingShape, false, true, placementBlock,
+            blockers, blockerCount, false, true, placementItem,
             g_applicationConfiguration.editReachDistance, &placement))
         return;
     if (application->networkReady)
     {
         NetworkClientSendEditIntent(application->networkClient,
-            false, true, placementBlock, direction);
+            false, true, (uint8_t)placementItem, direction);
         return;
     }
-    if (survival && !InventoryConsumeSelected(
-            &application->inventory, 1U, NULL))
+    if (!ApplyLocalEdit(application, &placement, false,
+            blockers, blockerCount))
         return;
-    ApplyLocalEdit(application, &placement, false);
+    if (survival)
+    {
+        (void)InventoryConsumeSelected(
+            &application->inventory, 1U, NULL);
+    }
 }
 
 static void ToggleGameMode(ApplicationState* application)
 {
+    application->localPendingJumpPressed = false;
+    application->constructTickAccumulator = 0.0;
     if (application->gameMode == GAME_MODE_FLY)
     {
         application->gameMode = GAME_MODE_WALK;
         PlayerCollisionSource collision =
-            CreatePlayerCollisionSource(application->world);
+            CreatePlayerCollisionSource(application);
         PlayerControllerReset(&application->player, &application->camera);
         if (!PlayerControllerResolvePenetration(&application->player,
                 &collision, &application->camera))
@@ -898,6 +1309,7 @@ static bool SimulateNetworkInputTick(
     input.jumpHeld = sampledCommand->jumpHeld;
     input.sprintHeld = sampledCommand->sprintHeld;
     input.crouchHeld = sampledCommand->crouchHeld;
+    input.useHeld = application->constructGrabInputHeld;
 
     NetworkInputCommand canonical;
     if (!NetworkInputCanonicalize(&input, &canonical) ||
@@ -934,6 +1346,79 @@ static bool SimulateNetworkInputTick(
     }
     application->networkNextInputSequence = canonical.sequence;
     return true;
+}
+
+static void BuildLocalSimulationBlocker(
+    ApplicationState* application,
+    PhysicalConstructDynamicBlocker* outBlocker)
+{
+    VoxelBodyShape shape;
+    VoxelBodyBounds bounds;
+    PlayerControllerGetBodyShape(&application->player, &shape);
+    VoxelBodyCalculateBounds(
+        application->camera.position, &shape, &bounds);
+    memcpy(outBlocker->bounds.minimum, bounds.minimum,
+        sizeof(outBlocker->bounds.minimum));
+    memcpy(outBlocker->bounds.maximum, bounds.maximum,
+        sizeof(outBlocker->bounds.maximum));
+    outBlocker->ignoredBodyId = 0U;
+}
+
+static void UpdateLocalPhysicsSimulation(
+    ApplicationState* application, double deltaSeconds,
+    const PlayerControllerCommand* playerCommand)
+{
+    if (application->networkSession || application->constructs == NULL)
+        return;
+    if (deltaSeconds < 0.0) deltaSeconds = 0.0;
+    if (deltaSeconds > 0.1) deltaSeconds = 0.1;
+    application->constructTickAccumulator += deltaSeconds;
+    uint32_t ticks = 0U;
+    while (application->constructTickAccumulator >=
+               NETWORK_SIMULATION_TICK_SECONDS &&
+           ticks < NETWORK_MAX_CATCH_UP_TICKS)
+    {
+        for (uint32_t substep = 0U;
+            substep < NETWORK_PHYSICS_SUBSTEPS; ++substep)
+        {
+            PhysicalConstructDynamicBlocker blocker;
+            uint32_t blockerCount = 0U;
+            if (playerCommand != NULL)
+            {
+                BuildLocalSimulationBlocker(application, &blocker);
+                blockerCount = 1U;
+            }
+            (void)PhysicalConstructStepWithBlockers(
+                application->constructs,
+                blockerCount != 0U ? &blocker : NULL,
+                blockerCount);
+
+            if (playerCommand != NULL)
+            {
+                PlayerControllerCommand substepCommand =
+                    *playerCommand;
+                substepCommand.jumpPressed =
+                    substep == 0U &&
+                    application->localPendingJumpPressed;
+                PlayerCollisionSource collision =
+                    CreatePlayerCollisionSource(application);
+                (void)PlayerControllerSimulateFixedSteps(
+                    &application->player, &collision,
+                    &application->camera, &substepCommand, 1U);
+            }
+        }
+        application->localPendingJumpPressed = false;
+        application->constructTickAccumulator -=
+            NETWORK_SIMULATION_TICK_SECONDS;
+        ++ticks;
+    }
+    if (ticks == NETWORK_MAX_CATCH_UP_TICKS &&
+        application->constructTickAccumulator >
+            NETWORK_SIMULATION_TICK_SECONDS)
+    {
+        application->constructTickAccumulator =
+            NETWORK_SIMULATION_TICK_SECONDS;
+    }
 }
 
 static void UpdateNetworkPresentationCamera(
@@ -1005,7 +1490,7 @@ static void UpdatePlayer(ApplicationState* application,
         if (!application->networkPhysicsInitialized)
             ResetNetworkPhysics(application);
         PlayerCollisionSource collision =
-            CreatePlayerCollisionSource(application->world);
+            CreatePlayerCollisionSource(application);
         PlayerFixedTickClockAccumulate(
             &application->networkSimulationClock, deltaSeconds,
             NETWORK_SIMULATION_TICK_SECONDS,
@@ -1046,6 +1531,8 @@ static void UpdatePlayer(ApplicationState* application,
             InputIsKeyDown(application->input, INPUT_KEY_SPACE),
             mouseDeltaX, mouseDeltaY,
             flySpeed, sensitivity);
+        UpdateLocalPhysicsSimulation(
+            application, deltaSeconds, NULL);
         return;
     }
 
@@ -1057,12 +1544,11 @@ static void UpdatePlayer(ApplicationState* application,
     PlayerControllerCommand command;
     PlayerCommandMapperBuild(application->input,
         &application->camera, &command);
-
-    PlayerCollisionSource collision =
-        CreatePlayerCollisionSource(application->world);
-    PlayerControllerUpdate(&application->player,
-        &collision, &application->camera, &command,
-        deltaSeconds);
+    application->localPendingJumpPressed =
+        application->localPendingJumpPressed || command.jumpPressed;
+    command.jumpPressed = application->localPendingJumpPressed;
+    UpdateLocalPhysicsSimulation(
+        application, deltaSeconds, &command);
 }
 
 static bool NetworkChunkEquals(
@@ -1225,7 +1711,8 @@ static bool BeginNetworkSnapshot(ApplicationState* application,
     const NetworkSnapshotInfo* info)
 {
     if (info == NULL || info->snapshotId == 0
-        || info->chunkCount > LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS)
+        || info->chunkCount > LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS
+        || application->networkSnapshot.active)
         return false;
     bool initial = !application->networkWorldInitialized;
     if (initial && !info->requiresReadyBarrier)
@@ -1238,16 +1725,25 @@ static bool BeginNetworkSnapshot(ApplicationState* application,
         return false;
 
     NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (snapshot->stagingConstructs != NULL)
+        return false;
     snapshot->active = true;
     snapshot->chunkActive = false;
     snapshot->requiresReadyBarrier =
         info->requiresReadyBarrier;
     snapshot->snapshotId = info->snapshotId;
     snapshot->worldRevision = info->worldRevision;
+    snapshot->serverTick = info->serverTick;
     snapshot->expectedChunkCount = info->chunkCount;
     snapshot->completedChunkCount = 0;
     snapshot->editCount = 0;
     snapshot->pendingDeltaCount = 0;
+    snapshot->constructResetReceived = false;
+    snapshot->constructBodyActive = false;
+    snapshot->expectedConstructBodies = 0U;
+    snapshot->completedConstructBodies = 0U;
+    snapshot->nextConstructBlock = 0U;
+    snapshot->lastConstructBodyId = 0U;
     if (info->requiresReadyBarrier)
         application->networkReady = false;
     application->networkPeerId = info->peerId;
@@ -1369,6 +1865,262 @@ static bool ApplyNetworkSnapshotChunk(ApplicationState* application,
     return true;
 }
 
+static bool FinishNetworkConstructBody(ApplicationState* application)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->constructBodyActive ||
+        snapshot->nextConstructBlock !=
+            snapshot->constructBody.blockCount)
+    {
+        return false;
+    }
+    PhysicalConstructBodyState state;
+    memset(&state, 0, sizeof(state));
+    state.id = snapshot->constructBody.id;
+    state.topologyRevision = snapshot->constructBody.revision;
+    memcpy(state.origin, snapshot->constructBody.origin,
+        sizeof(state.origin));
+    memcpy(state.velocity, snapshot->constructBody.velocity,
+        sizeof(state.velocity));
+    state.blockCount = snapshot->constructBody.blockCount;
+    if (snapshot->stagingConstructs == NULL ||
+        PhysicalConstructImportBody(snapshot->stagingConstructs, &state,
+            snapshot->constructBlocks, state.blockCount) !=
+        PHYSICAL_CONSTRUCT_OK)
+    {
+        return false;
+    }
+    snapshot->constructBodyActive = false;
+    snapshot->nextConstructBlock = 0U;
+    snapshot->lastConstructBodyId = state.id;
+    ++snapshot->completedConstructBodies;
+    return true;
+}
+
+static bool ApplyNetworkConstructReset(ApplicationState* application,
+    const NetworkConstructReset* reset)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->active || snapshot->constructResetReceived ||
+        reset == NULL ||
+        reset->bodyCount > LAIUE_NETWORK_MAX_CONSTRUCT_BODIES)
+    {
+        return false;
+    }
+    snapshot->stagingConstructs =
+        PhysicalConstructSystemCreate(application->world, NULL);
+    if (snapshot->stagingConstructs == NULL)
+        return false;
+    snapshot->constructResetReceived = true;
+    snapshot->constructBodyActive = false;
+    snapshot->expectedConstructBodies = reset->bodyCount;
+    snapshot->completedConstructBodies = 0U;
+    snapshot->nextConstructBlock = 0U;
+    return true;
+}
+
+static bool ApplyNetworkConstructBody(ApplicationState* application,
+    const NetworkConstructBody* body)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->active || !snapshot->constructResetReceived ||
+        snapshot->constructBodyActive || body == NULL || body->id == 0U ||
+        body->revision == 0U || body->blockCount == 0U ||
+        body->blockCount > PHYSICAL_CONSTRUCT_MAX_BLOCKS ||
+        (snapshot->completedConstructBodies != 0U &&
+            body->id <= snapshot->lastConstructBodyId) ||
+        snapshot->completedConstructBodies >=
+            snapshot->expectedConstructBodies)
+    {
+        return false;
+    }
+    snapshot->constructBody = *body;
+    snapshot->constructBodyActive = true;
+    snapshot->nextConstructBlock = 0U;
+    return true;
+}
+
+static bool ApplyNetworkConstructBlocks(ApplicationState* application,
+    const NetworkConstructBlockBatch* batch)
+{
+    NetworkSnapshotAssembly* snapshot = &application->networkSnapshot;
+    if (!snapshot->active || !snapshot->constructBodyActive ||
+        batch == NULL || batch->id != snapshot->constructBody.id ||
+        batch->revision != snapshot->constructBody.revision ||
+        batch->blockCount == 0U ||
+        batch->blockCount > LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH ||
+        batch->firstBlock != snapshot->nextConstructBlock ||
+        (uint32_t)batch->firstBlock + batch->blockCount >
+            snapshot->constructBody.blockCount)
+    {
+        return false;
+    }
+    for (uint32_t index = 0; index < batch->blockCount; ++index)
+    {
+        const NetworkConstructBlock* source = &batch->blocks[index];
+        PhysicalConstructBlock* destination =
+            &snapshot->constructBlocks[batch->firstBlock + index];
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            destination->local[axis] = source->local[axis];
+            destination->mountNormal[axis] = source->mountNormal[axis];
+        }
+        destination->material = source->material;
+        destination->kind = source->kind;
+    }
+    snapshot->nextConstructBlock =
+        (uint16_t)(snapshot->nextConstructBlock + batch->blockCount);
+    if (snapshot->nextConstructBlock ==
+        snapshot->constructBody.blockCount)
+    {
+        return FinishNetworkConstructBody(application);
+    }
+    return true;
+}
+
+static bool NetworkTickAfter(uint32_t candidate, uint32_t reference)
+{
+    return (int32_t)(candidate - reference) > 0;
+}
+
+static bool ConstructSystemHasRevision(
+    const PhysicalConstructSystem* constructs,
+    uint64_t id, uint64_t revision)
+{
+    if (constructs == NULL) return false;
+    PhysicalConstructBodyState state;
+    return FindConstructBodyState(constructs, id, &state) &&
+        state.topologyRevision == revision;
+}
+
+static NetworkConstructStateCacheEntry* FindConstructStateCacheEntry(
+    ApplicationState* application, uint64_t id, uint64_t revision,
+    bool create)
+{
+    NetworkConstructStateCacheEntry* empty = NULL;
+    for (uint32_t index = 0U;
+        index < NETWORK_CONSTRUCT_STATE_CACHE_CAPACITY; ++index)
+    {
+        NetworkConstructStateCacheEntry* entry =
+            &application->constructStateCache[index];
+        if (entry->active && entry->id == id &&
+            entry->revision == revision)
+        {
+            return entry;
+        }
+        if (!entry->active && empty == NULL)
+            empty = entry;
+    }
+    if (!create) return NULL;
+
+    NetworkConstructStateCacheEntry* entry = empty;
+    if (entry == NULL)
+    {
+        for (uint32_t index = 0U;
+            index < NETWORK_CONSTRUCT_STATE_CACHE_CAPACITY; ++index)
+        {
+            NetworkConstructStateCacheEntry* candidate =
+                &application->constructStateCache[index];
+            if (!ConstructSystemHasRevision(application->constructs,
+                    candidate->id, candidate->revision) &&
+                !ConstructSystemHasRevision(
+                    application->networkSnapshot.stagingConstructs,
+                    candidate->id, candidate->revision))
+            {
+                entry = candidate;
+                break;
+            }
+        }
+    }
+    // Unknown/future state pressure is never a reason to disconnect a
+    // healthy client. The bounded cache simply drops the newest unknown key.
+    if (entry == NULL) return NULL;
+    memset(entry, 0, sizeof(*entry));
+    entry->active = true;
+    entry->id = id;
+    entry->revision = revision;
+    return entry;
+}
+
+static bool ApplyConstructMotionState(
+    PhysicalConstructSystem* constructs,
+    const NetworkConstructState* networkState)
+{
+    PhysicalConstructBodyState state;
+    if (!FindConstructBodyState(constructs, networkState->id, &state) ||
+        state.topologyRevision != networkState->revision)
+    {
+        return false;
+    }
+    memcpy(state.origin, networkState->origin, sizeof(state.origin));
+    memcpy(state.velocity, networkState->velocity, sizeof(state.velocity));
+    state.grabOwner = networkState->heldBy;
+    state.grabbed = networkState->heldBy != 0U;
+    return PhysicalConstructApplyBodyMotion(constructs, &state);
+}
+
+static void PushConstructPresentationSample(
+    ApplicationState* application,
+    const NetworkConstructState* state)
+{
+    PhysicalConstructRendererPushMotionSample(
+        &application->constructRenderer, state->id, state->revision,
+        state->serverTick, state->origin, state->velocity);
+}
+
+static bool ApplyNetworkConstructState(ApplicationState* application,
+    const NetworkConstructState* networkState)
+{
+    if (!application->networkSession || networkState == NULL ||
+        networkState->id == 0U || networkState->revision == 0U)
+    {
+        return false;
+    }
+    NetworkConstructStateCacheEntry* entry =
+        FindConstructStateCacheEntry(application, networkState->id,
+            networkState->revision, true);
+    if (entry == NULL)
+        return true;
+    if (entry->hasState && !NetworkTickAfter(
+            networkState->serverTick, entry->state.serverTick))
+    {
+        return true;
+    }
+    entry->state = *networkState;
+    entry->hasState = true;
+
+    PhysicalConstructBodyState activeState;
+    if (!FindConstructBodyState(application->constructs,
+            networkState->id, &activeState))
+    {
+        return true;
+    }
+    if (activeState.topologyRevision != networkState->revision)
+    {
+        // A newer-revision state may legally win the QUIC stream race with
+        // its topology snapshot. Older revisions are harmlessly stale.
+        return true;
+    }
+    if (entry->hasBaselineTick &&
+        !NetworkTickAfter(networkState->serverTick,
+            entry->baselineTick) &&
+        (networkState->serverTick != entry->baselineTick ||
+            entry->baselineIncludesState))
+    {
+        return true;
+    }
+    if (!ApplyConstructMotionState(
+            application->constructs, networkState))
+    {
+        return false;
+    }
+    entry->baselineTick = networkState->serverTick;
+    entry->hasBaselineTick = true;
+    entry->baselineIncludesState = true;
+    PushConstructPresentationSample(application, networkState);
+    return true;
+}
+
 static int64_t NetworkBlockChunk(int64_t block)
 {
     int64_t chunk = block / CHUNK_SIZE;
@@ -1440,6 +2192,65 @@ static bool CancelNetworkChunkResync(
     return RequestNextNetworkChunkResync(application);
 }
 
+static bool CommitNetworkConstructSnapshot(
+    ApplicationState* application, NetworkSnapshotAssembly* snapshot)
+{
+    if (!snapshot->constructResetReceived) return true;
+    if (snapshot->stagingConstructs == NULL) return false;
+
+    PhysicalConstructBodyState states[PHYSICAL_CONSTRUCT_MAX_BODIES];
+    bool truncated = false;
+    uint32_t bodyCount = PhysicalConstructCopyBodyStates(
+        snapshot->stagingConstructs, states,
+        PHYSICAL_CONSTRUCT_MAX_BODIES, &truncated);
+    if (truncated || bodyCount != snapshot->expectedConstructBodies)
+        return false;
+
+    for (uint32_t index = 0U; index < bodyCount; ++index)
+    {
+        PhysicalConstructBodyState* body = &states[index];
+        NetworkConstructStateCacheEntry* entry =
+            FindConstructStateCacheEntry(application, body->id,
+                body->topologyRevision, true);
+        if (entry == NULL) return false;
+
+        NetworkConstructState baseline = {
+            .serverTick = snapshot->serverTick,
+            .id = body->id,
+            .revision = body->topologyRevision,
+            .origin = {body->origin[0], body->origin[1], body->origin[2]},
+            .velocity = {body->velocity[0], body->velocity[1],
+                body->velocity[2]},
+            .heldBy = 0U,
+        };
+        entry->baselineTick = snapshot->serverTick;
+        entry->hasBaselineTick = true;
+        entry->baselineIncludesState = false;
+        PushConstructPresentationSample(application, &baseline);
+
+        if (entry->hasState &&
+            (entry->state.serverTick == snapshot->serverTick ||
+                NetworkTickAfter(entry->state.serverTick,
+                    snapshot->serverTick)))
+        {
+            if (!ApplyConstructMotionState(
+                    snapshot->stagingConstructs, &entry->state))
+            {
+                return false;
+            }
+            entry->baselineTick = entry->state.serverTick;
+            entry->baselineIncludesState = true;
+            PushConstructPresentationSample(application, &entry->state);
+        }
+    }
+
+    PhysicalConstructSystem* previous = application->constructs;
+    application->constructs = snapshot->stagingConstructs;
+    snapshot->stagingConstructs = NULL;
+    PhysicalConstructSystemDestroy(previous);
+    return true;
+}
+
 static bool FinishNetworkSnapshot(ApplicationState* application,
     const NetworkSnapshotInfo* info)
 {
@@ -1447,7 +2258,15 @@ static bool FinishNetworkSnapshot(ApplicationState* application,
     if (!snapshot->active || info == NULL || snapshot->chunkActive
         || info->snapshotId != snapshot->snapshotId
         || info->worldRevision != snapshot->worldRevision
-        || snapshot->completedChunkCount != snapshot->expectedChunkCount)
+        || snapshot->completedChunkCount != snapshot->expectedChunkCount
+        || snapshot->constructBodyActive
+        || (snapshot->constructResetReceived &&
+            snapshot->completedConstructBodies !=
+                snapshot->expectedConstructBodies)
+        || (snapshot->requiresReadyBarrier &&
+            !snapshot->constructResetReceived))
+        return false;
+    if (!CommitNetworkConstructSnapshot(application, snapshot))
         return false;
     snapshot->active = false;
     for (uint32_t i = 0; i < snapshot->pendingDeltaCount; ++i)
@@ -1656,7 +2475,7 @@ static bool ReconcileLocalPlayer(
     PlayerControllerState authoritative;
     BuildPlayerControllerState(network, &authoritative);
     PlayerCollisionSource collision =
-        CreatePlayerCollisionSource(application->world);
+        CreatePlayerCollisionSource(application);
     uint32_t replayed = 0U;
     PlayerPredictionReconcileResult result =
         PlayerPredictionHistoryReconcile(
@@ -1825,6 +2644,30 @@ static void PumpNetwork(ApplicationState* application)
         {
             if (!ApplyNetworkSnapshotChunk(
                     application, &event.data.chunkDelta))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_CONSTRUCT_RESET)
+        {
+            if (!ApplyNetworkConstructReset(
+                    application, &event.data.constructReset))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_CONSTRUCT_BODY)
+        {
+            if (!ApplyNetworkConstructBody(
+                    application, &event.data.constructBody))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_CONSTRUCT_BLOCKS)
+        {
+            if (!ApplyNetworkConstructBlocks(
+                    application, &event.data.constructBlocks))
+                destroyClient = true;
+        }
+        else if (event.type == NETWORK_CLIENT_EVENT_CONSTRUCT_STATE)
+        {
+            if (!ApplyNetworkConstructState(
+                    application, &event.data.constructState))
                 destroyClient = true;
         }
         else if (event.type == NETWORK_CLIENT_EVENT_SNAPSHOT_END)
@@ -2008,8 +2851,6 @@ static void PumpNetwork(ApplicationState* application)
             application->networkReady = false;
             application->networkPeerId = 0;
             application->networkHasSnapshot = false;
-            application->networkSnapshot.active = false;
-            application->networkSnapshot.chunkActive = false;
             if (!application->networkEverReady)
             {
                 application->menu.networkConnecting = false;
@@ -2032,6 +2873,7 @@ static void PumpNetwork(ApplicationState* application)
     }
     if (destroyClient)
     {
+        AbandonNetworkSnapshot(application);
         if (application->networkSession
             && !application->networkGameplayActivated)
             ApplicationCloseSession(application, false, false);
@@ -2159,9 +3001,8 @@ static bool ApplyPauseMenuAction(ApplicationState* application,
         application->networkGameplayActivated = false;
         application->networkPendingResyncCount = 0;
         application->networkNextResyncRequestAtMs = 0;
-        application->networkSnapshot.active = false;
-        application->networkSnapshot.chunkActive = false;
-        application->networkSnapshot.pendingDeltaCount = 0;
+        AbandonNetworkSnapshot(application);
+        ResetNetworkConstructReplication(application);
         application->menu.networkDisconnectReason =
             NETWORK_DISCONNECT_NONE;
         if (application->menu.selectedServerIndex
@@ -2238,7 +3079,7 @@ static bool ApplyPauseMenuAction(ApplicationState* application,
             &application->camera, application->gameMode,
             application->settings.timeOfDayHours,
             application->worldSeed, &application->mods,
-            &application->inventory);
+            &application->inventory, application->constructs);
     }
     return true;
 }
@@ -2282,6 +3123,7 @@ static void OnFrame(void* userData)
         application->mouseLookBeforeMenu =
             WindowIsMouseLookEnabled(application->window);
         WindowSetMouseLook(application->window, false);
+        ReleaseConstructGrab(application);
         menuOpen = true;
         escapePressed = false;
     }
@@ -2300,12 +3142,14 @@ static void OnFrame(void* userData)
 
     if (WindowConsumeFocusLoss(application->window))
     {
+        ReleaseConstructGrab(application);
         InputResetState(application->input);
     }
 
     if (application->sessionActive && !menuOpen
         && InputConsumeKeyPress(application->input, INPUT_KEY_E))
     {
+        ReleaseConstructGrab(application);
         application->inventoryOpen = !application->inventoryOpen;
         WindowSetMouseLook(application->window,
             !application->inventoryOpen);
@@ -2416,7 +3260,6 @@ static void OnFrame(void* userData)
     {
         HandleBlockEditing(application, deltaSeconds);
     }
-
     int64_t cameraBlockPosition[3] = { 0, 0, 0 };
     float relativeEyePosition[3] = { 0.0f, 0.0f, 0.0f };
     for (int32_t axis = 0; axis < 3; ++axis)
@@ -2578,6 +3421,15 @@ static void OnFrame(void* userData)
             &application->remotePlayerRenderer,
             application->renderer);
     }
+    if (application->sessionActive &&
+        application->constructRendererReady)
+    {
+        (void)PhysicalConstructRendererEnsure(
+            &application->constructRenderer, application->renderer);
+        PhysicalConstructRendererPrepareFrame(
+            &application->constructRenderer, application->constructs,
+            deltaSeconds, application->networkSession);
+    }
 
     if (RendererBeginFrame(application->renderer, &frameSetup))
     {
@@ -2587,6 +3439,9 @@ static void OnFrame(void* userData)
             ChunkStreamingDraw(application->chunkStreaming,
                 frameSetup.passes[pass].viewProjection,
                 cameraBlockPosition);
+            PhysicalConstructRendererDraw(
+                &application->constructRenderer,
+                application->renderer, cameraBlockPosition);
             if (application->networkSession)
             {
                 DrawRemotePlayers(application, cameraBlockPosition);

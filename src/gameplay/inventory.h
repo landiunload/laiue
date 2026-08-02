@@ -12,6 +12,7 @@
 typedef uint16_t InventoryItemId;
 
 #define INVENTORY_ITEM_NONE ((InventoryItemId)0)
+#define INVENTORY_ITEM_PHYSICS_LEVER ((InventoryItemId)3)
 
 typedef struct InventorySlot
 {
@@ -27,6 +28,10 @@ typedef struct Inventory
     uint8_t selectedHotbarSlot;
 } Inventory;
 
+// Ноль обозначает пустой слот. Остальные встроенные идентификаторы образуют
+// непрерывный versioned диапазон, чтобы disk/wire codecs могли проверять их
+// одной общей функцией без знания конкретного вида предмета.
+LAIUE_GAMEPLAY_API bool InventoryItemIsValid(InventoryItemId item);
 LAIUE_GAMEPLAY_API void InventoryClear(Inventory* inventory);
 LAIUE_GAMEPLAY_API uint32_t InventoryAdd(Inventory* inventory,
     InventoryItemId item, uint32_t count);

@@ -26,6 +26,10 @@ typedef struct ReadyScenarioState
     bool serverConnected;
     bool snapshotBeginReceived;
     bool snapshotChunkReceived;
+    bool constructResetReceived;
+    bool constructBodyReceived;
+    bool constructBlocksReceived;
+    bool constructStateReceived;
     bool snapshotEndReceived;
     bool inventoryReceived;
     bool worldTimeReceived;
@@ -36,9 +40,15 @@ typedef struct ReadyScenarioState
     bool acknowledgementSent;
     bool inputSent;
     bool inputReceived;
+    bool leverEditSent;
+    bool leverEditReceived;
     bool liveSnapshotSent;
     bool liveSnapshotBeginReceived;
     bool liveSnapshotChunkReceived;
+    bool liveConstructResetReceived;
+    bool liveConstructBodyReceived;
+    bool liveConstructBlocksReceived;
+    bool futureConstructStateReceived;
     bool liveSnapshotEndReceived;
     bool liveInputSent;
     bool liveInputReceived;
@@ -398,8 +408,8 @@ static bool SendInitialSnapshot(
     NetworkInventoryState inventory;
     memset(&inventory, 0, sizeof(inventory));
     inventory.selectedHotbarSlot = 2U;
-    inventory.slots[2].item = 1U;
-    inventory.slots[2].count = 3U;
+    inventory.slots[2].item = 3U;
+    inventory.slots[2].count = 8U;
     const NetworkPlayerState playerState = {
         .serverTick = 1234U,
         .peerId = peerId,
@@ -425,8 +435,46 @@ static bool SendInitialSnapshot(
         .position = {4.0, 5.0, 6.0},
         .block = 1U,
     };
+    const NetworkConstructReset constructReset = {
+        .bodyCount = 1U,
+    };
+    const NetworkConstructBody constructBody = {
+        .id = UINT64_C(77),
+        .revision = UINT64_C(7),
+        .origin = {8.0, 9.0, 10.0},
+        .velocity = {0.5, 0.0, -0.25},
+        .blockCount = 2U,
+    };
+    NetworkConstructBlockBatch constructBlocks;
+    memset(&constructBlocks, 0, sizeof(constructBlocks));
+    constructBlocks.id = constructBody.id;
+    constructBlocks.revision = constructBody.revision;
+    constructBlocks.blockCount = constructBody.blockCount;
+    constructBlocks.blocks[0].local[0] = -1;
+    constructBlocks.blocks[0].material = 1U;
+    constructBlocks.blocks[1].mountNormal[1] = 1;
+    constructBlocks.blocks[1].kind = 1U;
+    const NetworkConstructState constructState = {
+        .serverTick = snapshot.serverTick,
+        .id = constructBody.id,
+        .revision = constructBody.revision,
+        .origin = {8.25, 9.0, 10.0},
+        .velocity = {0.5, 0.0, -0.25},
+        .heldBy = peerId,
+    };
     return NetworkServerSendSnapshotBegin(server, peerId, &snapshot) &&
            NetworkServerSendSnapshotChunk(server, peerId, &chunk) &&
+           !NetworkServerSendConstructBody(
+               server, peerId, &constructBody) &&
+           NetworkServerSendConstructReset(
+               server, peerId, &constructReset) &&
+           NetworkServerSendConstructBody(
+               server, peerId, &constructBody) &&
+           !NetworkServerSendSnapshotEnd(
+               server, peerId, snapshot.snapshotId,
+               snapshot.worldRevision) &&
+           NetworkServerSendConstructBlocks(
+               server, peerId, &constructBlocks) &&
            NetworkServerSendWorldTime(
                server, peerId, snapshot.worldTime) &&
            NetworkServerSendInventory(server, peerId, &inventory) &&
@@ -434,6 +482,8 @@ static bool SendInitialSnapshot(
            NetworkServerSendPlayerState(
                server, peerId, &playerState) &&
            NetworkServerSendBlockDrop(server, peerId, &drop) &&
+           NetworkServerSendConstructState(
+               server, peerId, &constructState) &&
            NetworkServerSendSnapshotEnd(
                server, peerId, snapshot.snapshotId,
                snapshot.worldRevision);
@@ -460,8 +510,45 @@ static bool SendLiveSnapshot(
         .editCount = 1U,
         .edits = {{4U, 5U, 6U, 2U}},
     };
-    return NetworkServerSendSnapshotBegin(server, peerId, &snapshot) &&
+    const NetworkConstructReset constructReset = {
+        .bodyCount = 1U,
+    };
+    const NetworkConstructBody constructBody = {
+        .id = UINT64_C(77),
+        .revision = UINT64_C(8),
+        .origin = {8.5, 9.0, 10.0},
+        .velocity = {0.5, 0.0, -0.25},
+        .blockCount = 2U,
+    };
+    NetworkConstructBlockBatch constructBlocks;
+    memset(&constructBlocks, 0, sizeof(constructBlocks));
+    constructBlocks.id = constructBody.id;
+    constructBlocks.revision = constructBody.revision;
+    constructBlocks.blockCount = constructBody.blockCount;
+    constructBlocks.blocks[0].local[0] = -1;
+    constructBlocks.blocks[0].material = 1U;
+    constructBlocks.blocks[1].mountNormal[1] = 1;
+    constructBlocks.blocks[1].kind = 1U;
+    const NetworkConstructState futureState = {
+        .serverTick = 1236U,
+        .id = constructBody.id,
+        .revision = constructBody.revision,
+        .origin = {9.0, 9.0, 10.0},
+        .velocity = {0.5, 0.0, -0.25},
+        .heldBy = peerId,
+    };
+    // Control and auxiliary snapshot streams have no cross-stream ordering.
+    // Queue the new-revision pose first to exercise that legal race.
+    return NetworkServerSendConstructState(
+               server, peerId, &futureState) &&
+           NetworkServerSendSnapshotBegin(server, peerId, &snapshot) &&
            NetworkServerSendSnapshotChunk(server, peerId, &chunk) &&
+           NetworkServerSendConstructReset(
+               server, peerId, &constructReset) &&
+           NetworkServerSendConstructBody(
+               server, peerId, &constructBody) &&
+           NetworkServerSendConstructBlocks(
+               server, peerId, &constructBlocks) &&
            NetworkServerSendSnapshotEnd(
                server, peerId, snapshot.snapshotId,
                snapshot.worldRevision);
@@ -505,6 +592,7 @@ static bool HandleReadyServerEvents(
                     event.data.input.jumpHeld ||
                     !event.data.input.sprintHeld ||
                     event.data.input.crouchHeld ||
+                    !event.data.input.useHeld ||
                     !SendLiveSnapshot(server, event.peerId))
                 {
                     return false;
@@ -526,6 +614,18 @@ static bool HandleReadyServerEvents(
             {
                 return false;
             }
+        }
+        else if (event.type == NETWORK_SERVER_EVENT_EDIT_INTENT)
+        {
+            if (event.peerId != state->peerId ||
+                !state->leverEditSent || state->leverEditReceived ||
+                event.data.editIntent.breakBlock ||
+                !event.data.editIntent.placeBlock ||
+                event.data.editIntent.placementBlock != 3U)
+            {
+                return false;
+            }
+            state->leverEditReceived = true;
         }
         else if (event.type == NETWORK_SERVER_EVENT_DISCONNECTED &&
                  !state->liveInputReceived)
@@ -635,11 +735,95 @@ static bool HandleReadyClientEvents(
                     state->liveSnapshotChunkReceived = true;
                 }
                 break;
+            case NETWORK_CLIENT_EVENT_CONSTRUCT_RESET:
+                if (event.data.constructReset.bodyCount != 1U)
+                {
+                    return false;
+                }
+                if (!state->snapshotEndReceived)
+                {
+                    if (!state->snapshotBeginReceived ||
+                        state->constructResetReceived)
+                    {
+                        return false;
+                    }
+                    state->constructResetReceived = true;
+                }
+                else
+                {
+                    if (!state->liveSnapshotBeginReceived ||
+                        state->liveConstructResetReceived)
+                    {
+                        return false;
+                    }
+                    state->liveConstructResetReceived = true;
+                }
+                break;
+            case NETWORK_CLIENT_EVENT_CONSTRUCT_BODY:
+                if (event.data.constructBody.id != UINT64_C(77) ||
+                    event.data.constructBody.blockCount != 2U)
+                {
+                    return false;
+                }
+                if (!state->snapshotEndReceived)
+                {
+                    if (!state->constructResetReceived ||
+                        state->constructBodyReceived ||
+                        event.data.constructBody.revision != UINT64_C(7))
+                    {
+                        return false;
+                    }
+                    state->constructBodyReceived = true;
+                }
+                else
+                {
+                    if (!state->liveConstructResetReceived ||
+                        state->liveConstructBodyReceived ||
+                        event.data.constructBody.revision != UINT64_C(8))
+                    {
+                        return false;
+                    }
+                    state->liveConstructBodyReceived = true;
+                }
+                break;
+            case NETWORK_CLIENT_EVENT_CONSTRUCT_BLOCKS:
+                if (event.data.constructBlocks.id != UINT64_C(77) ||
+                    event.data.constructBlocks.firstBlock != 0U ||
+                    event.data.constructBlocks.blockCount != 2U ||
+                    event.data.constructBlocks.blocks[0].local[0] != -1 ||
+                    event.data.constructBlocks.blocks[0].material != 1U ||
+                    event.data.constructBlocks.blocks[1].kind != 1U ||
+                    event.data.constructBlocks.blocks[1].mountNormal[1] != 1)
+                {
+                    return false;
+                }
+                if (!state->snapshotEndReceived)
+                {
+                    if (!state->constructBodyReceived ||
+                        state->constructBlocksReceived ||
+                        event.data.constructBlocks.revision != UINT64_C(7))
+                    {
+                        return false;
+                    }
+                    state->constructBlocksReceived = true;
+                }
+                else
+                {
+                    if (!state->liveConstructBodyReceived ||
+                        state->liveConstructBlocksReceived ||
+                        event.data.constructBlocks.revision != UINT64_C(8))
+                    {
+                        return false;
+                    }
+                    state->liveConstructBlocksReceived = true;
+                }
+                break;
             case NETWORK_CLIENT_EVENT_SNAPSHOT_END:
                 if (event.data.snapshot.snapshotId ==
                     UINT64_C(0x1122334455667788))
                 {
                     if (!state->snapshotChunkReceived ||
+                        !state->constructBlocksReceived ||
                         state->snapshotEndReceived ||
                         event.data.snapshot.worldRevision != UINT64_C(17) ||
                         !event.data.snapshot.requiresReadyBarrier)
@@ -652,6 +836,7 @@ static bool HandleReadyClientEvents(
                          UINT64_C(0x8877665544332211))
                 {
                     if (!state->liveSnapshotChunkReceived ||
+                        !state->liveConstructBlocksReceived ||
                         state->liveSnapshotEndReceived ||
                         event.data.snapshot.worldRevision != UINT64_C(18) ||
                         event.data.snapshot.requiresReadyBarrier ||
@@ -670,8 +855,8 @@ static bool HandleReadyClientEvents(
             case NETWORK_CLIENT_EVENT_INVENTORY_STATE:
                 if (!state->snapshotEndReceived ||
                     event.data.inventory.selectedHotbarSlot != 2U ||
-                    event.data.inventory.slots[2].item != 1U ||
-                    event.data.inventory.slots[2].count != 3U)
+                    event.data.inventory.slots[2].item != 3U ||
+                    event.data.inventory.slots[2].count != 8U)
                 {
                     return false;
                 }
@@ -724,6 +909,38 @@ static bool HandleReadyClientEvents(
                 }
                 state->blockDropReceived = true;
                 break;
+            case NETWORK_CLIENT_EVENT_CONSTRUCT_STATE:
+                if (event.data.constructState.revision == UINT64_C(7))
+                {
+                    if (!state->snapshotEndReceived ||
+                        state->constructStateReceived ||
+                        event.data.constructState.serverTick != 1234U ||
+                        event.data.constructState.id != UINT64_C(77) ||
+                        event.data.constructState.origin[0] != 8.25 ||
+                        event.data.constructState.heldBy != state->peerId)
+                    {
+                        return false;
+                    }
+                    state->constructStateReceived = true;
+                }
+                else if (event.data.constructState.revision == UINT64_C(8))
+                {
+                    if (!state->readyReceived || !state->liveSnapshotSent ||
+                        state->futureConstructStateReceived ||
+                        event.data.constructState.serverTick != 1236U ||
+                        event.data.constructState.id != UINT64_C(77) ||
+                        event.data.constructState.origin[0] != 9.0 ||
+                        event.data.constructState.heldBy != state->peerId)
+                    {
+                        return false;
+                    }
+                    state->futureConstructStateReceived = true;
+                }
+                else
+                {
+                    return false;
+                }
+                break;
             case NETWORK_CLIENT_EVENT_READY:
             {
                 if (!state->snapshotEndReceived ||
@@ -732,6 +949,7 @@ static bool HandleReadyClientEvents(
                     !state->playerJoinedReceived ||
                     !state->playerStateReceived ||
                     !state->blockDropReceived ||
+                    !state->constructStateReceived ||
                     state->readyReceived ||
                     event.data.ready.peerId != state->peerId ||
                     !NetworkClientAcknowledgeReady(client))
@@ -750,12 +968,20 @@ static bool HandleReadyClientEvents(
                     .jumpHeld = false,
                     .sprintHeld = true,
                     .crouchHeld = false,
+                    .useHeld = true,
                 };
                 if (!NetworkClientSendInput(client, &input))
                 {
                     return false;
                 }
                 state->inputSent = true;
+                const float leverDirection[3] = {0.0f, 0.0f, -1.0f};
+                if (!NetworkClientSendEditIntent(
+                        client, false, true, 3U, leverDirection))
+                {
+                    return false;
+                }
+                state->leverEditSent = true;
                 break;
             }
             case NETWORK_CLIENT_EVENT_DISCONNECTED:
@@ -809,7 +1035,8 @@ static bool RunReadyScenario(
     memset(&state, 0, sizeof(state));
     uint64_t deadline = MonotonicMilliseconds() + TEST_CASE_TIMEOUT_MS;
     bool succeeded = true;
-    while ((!state.liveInputReceived ||
+    while ((!state.liveInputReceived || !state.leverEditReceived ||
+            !state.futureConstructStateReceived ||
             !state.liveSnapshotEndReceived) &&
            MonotonicMilliseconds() <= deadline)
     {
@@ -826,14 +1053,21 @@ static bool RunReadyScenario(
     succeeded =
         succeeded && state.serverVerified && state.modsSubmitted &&
         state.serverConnected && state.snapshotBeginReceived &&
-        state.snapshotChunkReceived && state.snapshotEndReceived &&
+        state.snapshotChunkReceived && state.constructResetReceived &&
+        state.constructBodyReceived && state.constructBlocksReceived &&
+        state.constructStateReceived && state.snapshotEndReceived &&
         state.inventoryReceived && state.worldTimeReceived &&
         state.playerJoinedReceived && state.playerStateReceived &&
         state.blockDropReceived && state.readyReceived &&
         state.acknowledgementSent && state.inputSent &&
-        state.inputReceived && state.liveSnapshotSent &&
+        state.inputReceived && state.leverEditSent &&
+        state.leverEditReceived && state.liveSnapshotSent &&
         state.liveSnapshotBeginReceived &&
         state.liveSnapshotChunkReceived &&
+        state.liveConstructResetReceived &&
+        state.liveConstructBodyReceived &&
+        state.liveConstructBlocksReceived &&
+        state.futureConstructStateReceived &&
         state.liveSnapshotEndReceived &&
         state.liveInputSent && state.liveInputReceived;
 

@@ -6,12 +6,13 @@ endif()
 set(allowed_audio audio)
 set(allowed_content content platform)
 set(allowed_core
-    audio content core game gameplay input interaction mesh mod network
+    audio construct content core game gameplay input interaction mesh mod network
     physics platform render world)
+set(allowed_construct construct physics platform world)
 set(allowed_game game)
 set(allowed_gameplay game gameplay physics)
 set(allowed_input input)
-set(allowed_interaction interaction physics world)
+set(allowed_interaction construct interaction physics world)
 set(allowed_launcher launcher)
 set(allowed_mesh mesh render world)
 set(allowed_mod content game gameplay mod platform world)
@@ -21,7 +22,8 @@ set(allowed_platform platform)
 set(allowed_render content render)
 set(allowed_runtime runtime)
 set(allowed_server
-    content game gameplay interaction mod network physics platform server world)
+    construct content game gameplay interaction mod network physics platform
+    server world)
 set(allowed_world platform world)
 
 file(GLOB_RECURSE source_files

@@ -1,5 +1,6 @@
 #include "core/camera.h"
 #include "core/math.h"
+#include "gameplay/view_direction.h"
 
 #define PITCH_LIMIT 1.570796f
 #define YAW_LIMIT   3.1415927f
@@ -37,14 +38,7 @@ void CameraInit(Camera* camera, double x, double y, double z, float yaw, float p
 
 void CameraGetForwardVector(const Camera* camera, float outForward[3])
 {
-    float sinPitch = ScalarSin(camera->pitch);
-    float cosPitch = ScalarCos(camera->pitch);
-    float sinYaw = ScalarSin(camera->yaw);
-    float cosYaw = ScalarCos(camera->yaw);
-
-    outForward[0] = sinYaw * cosPitch;
-    outForward[1] = cosYaw * cosPitch;   // вторая горизонталь (бывший Z)
-    outForward[2] = sinPitch;             // высота (бывший Y)
+    GameplayViewForward(camera->yaw, camera->pitch, outForward);
 }
 
 void CameraUpdate(Camera* camera, float deltaSeconds,

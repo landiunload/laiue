@@ -60,7 +60,11 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
-#define INSTANCE_BYTES_PER_FRAME (64u * 1024u)
+// One frame can contain up to six panorama scene passes.  Physical
+// constructs alone may contribute 4096 instances per pass, with players and
+// block effects appended afterwards.  Keep the upload arena large enough for
+// that documented worst case so later passes cannot silently lose draws.
+#define INSTANCE_BYTES_PER_FRAME (512u * 1024u)
 
 typedef struct FreeRange
 {

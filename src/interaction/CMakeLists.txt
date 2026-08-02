@@ -7,6 +7,7 @@ laiue_add_module(interaction
         voxel_interaction.h
         ../api.h
     LINK
+        laiue_construct
         laiue_world
         laiue_physics
 )

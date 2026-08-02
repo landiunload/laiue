@@ -77,6 +77,7 @@ static void InitPlayer(PlayerController *controller, Camera *camera,
     camera->pitch = 0.0f;
     collision->context = NULL;
     collision->queryBlockPhysics = QueryFlatWorld;
+    collision->queryDynamicColliders = NULL;
 
     PlayerControllerCommand idle = {0};
     PlayerControllerSimulateFixedSteps(controller, collision, camera, &idle, 1u);
@@ -716,6 +717,7 @@ static void TestGroundProbeSnap(void)
     PlayerControllerInit(&controller, &config);
     collision.context = NULL;
     collision.queryBlockPhysics = QueryFlatWorld;
+    collision.queryDynamicColliders = NULL;
     camera.position[0] = 0.5;
     camera.position[1] = 0.5;
     camera.position[2] = 1.02 + config.standingEyeHeight;

@@ -4,13 +4,20 @@
 #include <stdint.h>
 
 #define LAIUE_PROTOCOL_MAGIC 0x5549414cU /* "LAIU" little-endian */
-#define LAIUE_PROTOCOL_VERSION 5U
-#define LAIUE_PROTOCOL_ALPN "laiue/5"
+#define LAIUE_PROTOCOL_VERSION 6U
+#define LAIUE_PROTOCOL_ALPN "laiue/6"
 #define LAIUE_PROTOCOL_HEADER_SIZE 16U
 #define LAIUE_PROTOCOL_MAX_CONTROL_PAYLOAD_SIZE 1024U
 #define LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE LAIUE_PROTOCOL_MAX_CONTROL_PAYLOAD_SIZE
 #define LAIUE_PROTOCOL_MAX_FRAME_SIZE (LAIUE_PROTOCOL_HEADER_SIZE + LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE)
 #define LAIUE_PROTOCOL_PLAYER_STATE_PAYLOAD_SIZE 117U
+
+// Protocol v6 inventory/edit item schema. This is intentionally distinct
+// from the world BlockType range: item 3 is the physical lever tool, while
+// block deltas and drops continue to accept only world materials 0..2.
+#define LAIUE_PROTOCOL_V6_MAX_INVENTORY_ITEM 3U
+#define LAIUE_PROTOCOL_MAX_INVENTORY_ITEM \
+    LAIUE_PROTOCOL_V6_MAX_INVENTORY_ITEM
 
 #define LAIUE_PROTOCOL_MAX_MODS 32U
 #define LAIUE_PROTOCOL_MOD_ID_CAPACITY 32U
@@ -27,6 +34,9 @@
 #define LAIUE_PROTOCOL_MAX_SERVER_STREAMS 2U
 #define LAIUE_PROTOCOL_MAX_QUEUED_FRAMES 256U
 #define LAIUE_PROTOCOL_MAX_OUTSTANDING_SENDS 256U
+#define LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES 16U
+#define LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY 256U
+#define LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH 80U
 
 typedef enum LaiueMessageType
 {
@@ -63,6 +73,10 @@ typedef enum LaiueMessageType
     LAIUE_MESSAGE_SYNC_BEGIN = 31,
     LAIUE_MESSAGE_SYNC_APPLIED = 32,
     LAIUE_MESSAGE_CHUNK_RESYNC_CANCELLED = 33,
+    LAIUE_MESSAGE_CONSTRUCT_RESET = 34,
+    LAIUE_MESSAGE_CONSTRUCT_BEGIN = 35,
+    LAIUE_MESSAGE_CONSTRUCT_BLOCKS = 36,
+    LAIUE_MESSAGE_CONSTRUCT_STATE = 37,
 
     // Первый недопустимый номер: граница проверки заголовка. Новый тип
     // добавляется строго перед этой строкой и сразу попадает в разрешённый
@@ -99,6 +113,7 @@ typedef struct LaiueProtocolInput
     bool jumpHeld;
     bool sprintHeld;
     bool crouchHeld;
+    bool useHeld;
 } LaiueProtocolInput;
 
 typedef struct LaiueProtocolPlayerState
@@ -189,6 +204,48 @@ typedef struct LaiueProtocolChunkResyncRequest
     int64_t chunk[3];
     uint64_t expectedRevision;
 } LaiueProtocolChunkResyncRequest;
+
+typedef struct LaiueProtocolConstructReset
+{
+    uint16_t bodyCount;
+} LaiueProtocolConstructReset;
+
+typedef struct LaiueProtocolConstructBlock
+{
+    int16_t local[3];
+    int8_t mountNormal[3];
+    uint8_t material;
+    uint8_t kind;
+} LaiueProtocolConstructBlock;
+
+typedef struct LaiueProtocolConstructBody
+{
+    uint64_t id;
+    uint64_t revision;
+    double origin[3];
+    double velocity[3];
+    uint16_t blockCount;
+} LaiueProtocolConstructBody;
+
+typedef struct LaiueProtocolConstructBlockBatch
+{
+    uint64_t id;
+    uint64_t revision;
+    uint16_t firstBlock;
+    uint16_t blockCount;
+    LaiueProtocolConstructBlock
+        blocks[LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH];
+} LaiueProtocolConstructBlockBatch;
+
+typedef struct LaiueProtocolConstructState
+{
+    uint32_t serverTick;
+    uint64_t id;
+    uint64_t revision;
+    double origin[3];
+    double velocity[3];
+    uint64_t heldBy;
+} LaiueProtocolConstructState;
 
 bool LaiueProtocolReadHeader(const uint8_t *bytes, uint32_t size, LaiueProtocolFrame *outFrame);
 uint32_t LaiueProtocolWriteHeader(uint8_t *output, uint32_t capacity,
@@ -292,3 +349,27 @@ uint32_t LaiueProtocolEncodeWorldTime(
     uint8_t *output, uint32_t capacity, uint64_t worldTime);
 bool LaiueProtocolDecodeWorldTime(
     const uint8_t *payload, uint32_t size, uint64_t *outWorldTime);
+uint32_t LaiueProtocolEncodeConstructReset(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructReset *reset);
+bool LaiueProtocolDecodeConstructReset(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructReset *outReset);
+uint32_t LaiueProtocolEncodeConstructBegin(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructBody *body);
+bool LaiueProtocolDecodeConstructBegin(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructBody *outBody);
+uint32_t LaiueProtocolEncodeConstructBlocks(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructBlockBatch *batch);
+bool LaiueProtocolDecodeConstructBlocks(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructBlockBatch *outBatch);
+uint32_t LaiueProtocolEncodeConstructState(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructState *state);
+bool LaiueProtocolDecodeConstructState(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructState *outState);

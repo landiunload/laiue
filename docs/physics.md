@@ -1,4 +1,4 @@
-# Физика и сетевая репликация игрока
+# Физика игрока, конструкций и сетевая репликация
 
 Это каноническое описание общего physics contract клиента и dedicated
 server. Параметры ходьбы, прыжка, коллизий и стойки отдельно сведены в
@@ -13,6 +13,7 @@ authoritative state, prediction или interpolation обновляется эт
 | physics substep | 1/240 с |
 | substeps на одну сетевую команду | 4 |
 | authoritative player state | каждые 3 тика, 20 Гц |
+| authoritative construct state | каждый тик, 60 Гц |
 | catch-up клиента | не более 8 тиков за render frame |
 | catch-up сервера | не более 8 тиков за outer iteration |
 | safety backlog сервера | 256 тиков, горизонт input FIFO |
@@ -22,11 +23,14 @@ authoritative state, prediction или interpolation обновляется эт
 | interpolation delay | 6 server ticks, 100 мс |
 | максимальная extrapolation | 2 server ticks, около 33 мс |
 
-Клиент и сервер вызывают один `PlayerControllerSimulateFixedSteps` с четырьмя
-substep. Функция исполняет целое число шагов и не читает frame accumulator,
-поэтому replay не зависит от render FPS. Обычный `PlayerControllerUpdate`
-остаётся frame-адаптером для одиночной игры; сетевой путь не подаёт в
-authoritative simulation произвольный `deltaSeconds`.
+Клиент и сервер исполняют четыре вызова
+`PlayerControllerSimulateFixedSteps(..., 1)` на сетевой тик. Перед каждым
+из них выполняется ровно один шаг физической конструкции: конструкция видит
+актуальные AABB игроков, затем игрок видит новую дробную pose конструкции.
+Одиночная игра использует тот же общий 60/240 Гц accumulator; сетевой replay
+не читает frame accumulator и поэтому не зависит от render FPS. Функция
+`PlayerControllerUpdate` остаётся совместимым frame-адаптером для отдельных
+потребителей API.
 Монотонный frame time хранится в `double` вплоть до simulation accumulator;
 `fixedStepSeconds` также имеет тип `double`. Перевод времени в `float`
 разрешён только для presentation-подсистем. Regression проверяет одинаковый
@@ -187,6 +191,64 @@ bounded resync и возвращает `READY` только когда вся ц
 bounded размеры ограничивают память, но максимальная job до 4096 чанков пока
 не имеет отдельного лимита chunks/bytes на tick.
 
+## Физические блочные конструкции
+
+Предмет `physics lever` ставится правой кнопкой на грань обычного блока.
+Ячейка рычага становится локальным началом `(0, 0, 0)`, монтажный блок
+получает координату `-mountNormal`, а остальные захваченные блоки хранятся
+относительно этого начала. Локальный чанк конструкции вычисляется обычным
+floor-делением локальной координаты на `CHUNK_SIZE`; отрицательные
+координаты поэтому не меняют чанк около нуля ошибочно.
+
+Активация всегда забирает монтажный блок и затем только явно изменённые
+игроком блоки, соединённые с ним общими гранями. Процедурный ландшафт не
+обходится flood-fill целиком. Изъятие всех захваченных блоков из `World`
+происходит одной атомарной batch-операцией: mesher и snapshot reader не
+видят наполовину перенесённую конструкцию. Один runtime ограничен 16 телами
+по 256 записей в каждом, включая рычаг; превышение лимита отклоняет действие
+до изменения мира.
+
+Текущая модель является translation-only: каждый voxel сохраняет
+ориентацию мировой сетки, а тело имеет дробные `origin` и `velocity` без
+вращения. Рычаг состоит из трёх cuboid-частей; только отдельная AABB ручки
+начинает захват. Пока правая кнопка удерживается, bounded spring тянет точку
+ручки к лучу камеры на первоначальной дистанции. Гравитация, spring-damping
+захвата и collision исполняются теми же четырьмя substep по 1/240 с на
+клиенте и сервере.
+
+Коллизии используют точные дробные AABB блоков и частей рычага. Broadphase
+сначала отбрасывает тела по общим bounds, после чего локальная occupancy
+структура проверяет только кандидатов; fixed tick не делает allocation.
+Движение учитывает статический мир, другие конструкции и динамические AABB
+игроков. При установке блока на конструкцию заранее проверяются мир, другие
+тела и collider игрока, поэтому новый блок не может возникнуть внутри них.
+Контроллер игрока получает эти же части через bounded broadphase (не более
+32 ближайших AABB на одну операцию), использует их дробные границы без
+округления до voxel-cell и переносится горизонтальной скоростью опоры.
+Прыжок наследует горизонтальную скорость платформы; неполный broadphase
+обрабатывается fail-closed.
+
+Связность voxel-частей определяется общей гранью. Рычаг соединён только со
+своим монтажным блоком и не является фиктивным шестисторонним мостом. После
+разрушения блоков все компоненты вычисляются детерминированно: компонент с
+исходным якорем сохраняет ID, остальные получают отдельные ID, собственный
+origin и velocity. Topology revision меняется до рассылки snapshot.
+
+Dedicated server единолично исполняет grab, split и движение. Initial
+snapshot и отдельный topology epoch собираются клиентом во втором bounded
+`PhysicalConstructSystem`; активная collision-копия заменяется только на
+`SNAPSHOT_END`. Обычный interest/chunk resync topology не пересылает.
+`ConstructState` сравнивается wrap-safe по `serverTick`; state, пришедший
+раньше соответствующей topology revision из другого QUIC stream, временно
+хранится в bounded staging, а устаревший state игнорируется. Renderer
+интерполирует presentation history отдельно от authoritative collision и
+ограничивает extrapolation.
+
+Одиночная игра и dedicated server сохраняют topology в `constructs.dat`.
+Формат явно little-endian, ограничен теми же capacity, содержит SHA-256 и не
+сохраняет transient grab owner. Platform boundary выполняет atomic replace;
+wire и disk никогда не сериализуют raw `wchar_t`.
+
 ## Моды и authority
 
 Physics-changing мод не может считать remote client источником истины.
@@ -225,7 +287,10 @@ server-side выбора игрока, versioned SDK/wire contract и regression
 
 Основные проверки находятся в `determinism_test`,
 `player_replication_test`, `server_input_queue_test`, `protocol_test` и
-`quic_integration_test`. Server clock, snapshot scheduler, revision reorder и
+`quic_integration_test`. Сквозной `construct_player_integration_test`
+проверяет чередование шагов платформы и игрока, перенос на дробной AABB и
+отсутствие phantom-коллизии в пустой части ячейки рычага. Server clock,
+snapshot scheduler, revision reorder и
 mod block authority имеют отдельные regression tests. Replication regression
 дополнительно прогоняет
 задержку и jitter, повторные authoritative corrections, прыжки, crouch и

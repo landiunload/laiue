@@ -1,4 +1,5 @@
 #include "world/world.h"
+#include "world/block_properties.h"
 #include "world/infinite_coord.h"
 #include "world/terrain_noise.h"
 #include "platform/system.h"
@@ -108,6 +109,11 @@ static uint32_t DeltaLocalIndex(DeltaEntry entry)
 static BlockType DeltaBlock(DeltaEntry entry)
 {
     return (BlockType)(entry >> DELTA_INDEX_BITS);
+}
+
+static bool MutableBlockTypeValid(BlockType block)
+{
+    return block <= BLOCK_GRASS;
 }
 
 static uint64_t HashRotateLeft64(uint64_t value, uint32_t amount)
@@ -689,32 +695,144 @@ static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 
 BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
 {
+    WorldBlockState state;
+    return WorldGetBlockState(world, x, y, z, &state)
+        ? state.block : BLOCK_AIR;
+}
+
+bool WorldGetBlockState(World* world, int64_t x, int64_t y, int64_t z,
+    WorldBlockState* outState)
+{
+    if (world == NULL || outState == NULL) return false;
     LocalChunkCoordinate coordinate = {
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
     };
+    uint32_t localIndex = PackLocalIndex(
+        LocalFromBlock(x, coordinate.x),
+        LocalFromBlock(y, coordinate.y),
+        LocalFromBlock(z, coordinate.z));
+    BlockType block = GeneratedBlock(world, x, y, z);
+    bool edited = false;
 
     PlatformRwLockAcquireShared(&world->tableLock);
     Chunk** entry = WorldFindEntry(world, coordinate);
     if (entry != NULL)
     {
-        uint32_t localIndex = PackLocalIndex(
-            LocalFromBlock(x, coordinate.x),
-            LocalFromBlock(y, coordinate.y),
-            LocalFromBlock(z, coordinate.z));
-        BlockType block;
         if (ChunkGetDelta(*entry, localIndex, &block))
         {
-            PlatformRwLockReleaseShared(&world->tableLock);
-            return block;
+            edited = true;
         }
     }
     PlatformRwLockReleaseShared(&world->tableLock);
-    return GeneratedBlock(world, x, y, z);
+    outState->block = block;
+    outState->edited = edited;
+    return true;
 }
 
-void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block)
+static bool WorldBlockRangeValid(const WorldBlockRange* range)
 {
-    if (world == NULL) return;
+    uint64_t cellCount = 1U;
+    for (uint32_t axis = 0U; axis < 3U; ++axis)
+    {
+        if (range->minimum[axis] > range->maximum[axis]) return false;
+        uint64_t span = (uint64_t)range->maximum[axis]
+            - (uint64_t)range->minimum[axis] + 1U;
+        if (span == 0U || span > WORLD_MAX_BOUNDED_BLOCK_QUERY_CELLS
+            || cellCount > WORLD_MAX_BOUNDED_BLOCK_QUERY_CELLS / span)
+        {
+            return false;
+        }
+        cellCount *= span;
+    }
+    return true;
+}
+
+bool WorldAnySolidBlockInRanges(World* world, const WorldBlockRange* ranges,
+    uint32_t count, bool* outSolid)
+{
+    if (outSolid != NULL) *outSolid = false;
+    if (world == NULL || outSolid == NULL ||
+        count > WORLD_MAX_BOUNDED_BLOCK_RANGES ||
+        (count != 0U && ranges == NULL))
+    {
+        return false;
+    }
+    for (uint32_t rangeIndex = 0U; rangeIndex < count; ++rangeIndex)
+    {
+        if (!WorldBlockRangeValid(&ranges[rangeIndex])) return false;
+    }
+    if (count == 0U) return true;
+
+    bool solid = false;
+    PlatformRwLockAcquireShared(&world->tableLock);
+    for (uint32_t rangeIndex = 0U;
+         rangeIndex < count && !solid; ++rangeIndex)
+    {
+        const WorldBlockRange* range = &ranges[rangeIndex];
+        int64_t block[3] = {
+            range->minimum[0], range->minimum[1], range->minimum[2]
+        };
+        for (;;)
+        {
+            LocalChunkCoordinate coordinate = {
+                ChunkFromBlock(block[0]), ChunkFromBlock(block[1]),
+                ChunkFromBlock(block[2])
+            };
+            uint32_t localIndex = PackLocalIndex(
+                LocalFromBlock(block[0], coordinate.x),
+                LocalFromBlock(block[1], coordinate.y),
+                LocalFromBlock(block[2], coordinate.z));
+            BlockType material = GeneratedBlock(
+                world, block[0], block[1], block[2]);
+            Chunk** entry = WorldFindEntry(world, coordinate);
+            if (entry != NULL)
+                (void)ChunkGetDelta(*entry, localIndex, &material);
+            if (BlockGetProperties(material).solid)
+            {
+                solid = true;
+                break;
+            }
+
+            uint32_t axis = 0U;
+            for (; axis < 3U; ++axis)
+            {
+                if (block[axis] != range->maximum[axis])
+                {
+                    ++block[axis];
+                    break;
+                }
+                block[axis] = range->minimum[axis];
+            }
+            if (axis == 3U) break;
+        }
+    }
+    PlatformRwLockReleaseShared(&world->tableLock);
+    *outSolid = solid;
+    return true;
+}
+
+bool WorldAnySolidBlockInRange(World* world, const int64_t minimum[3],
+    const int64_t maximum[3])
+{
+    if (minimum == NULL || maximum == NULL) return false;
+    WorldBlockRange range = {
+        .minimum = { minimum[0], minimum[1], minimum[2] },
+        .maximum = { maximum[0], maximum[1], maximum[2] },
+    };
+    bool solid = false;
+    return WorldAnySolidBlockInRanges(world, &range, 1U, &solid) && solid;
+}
+
+bool WorldIsBlockEdited(World* world, int64_t x, int64_t y, int64_t z)
+{
+    WorldBlockState state;
+    return WorldGetBlockState(world, x, y, z, &state) && state.edited;
+}
+
+bool WorldTrySetBlock(World* world, int64_t x, int64_t y, int64_t z,
+    BlockType block)
+{
+    if (world == NULL || !MutableBlockTypeValid(block)) return false;
     LocalChunkCoordinate coordinate = {
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
     };
@@ -732,7 +850,7 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
     if (current == block)
     {
         PlatformRwLockReleaseExclusive(&world->tableLock);
-        return;
+        return true;
     }
     bool changed = false;
     Chunk* changedChunk = existingEntry == NULL ? NULL : *existingEntry;
@@ -773,6 +891,284 @@ void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType bloc
         if (world->revision != UINT64_MAX) ++world->revision;
     }
     PlatformRwLockReleaseExclusive(&world->tableLock);
+    return changed;
+}
+
+void WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z,
+    BlockType block)
+{
+    (void)WorldTrySetBlock(world, x, y, z, block);
+}
+
+typedef struct WorldBatchChunk
+{
+    LocalChunkCoordinate coordinate;
+    Chunk* existing;
+    DeltaEntry* stagedDeltas;
+    uint32_t stagedCount;
+    uint32_t stagedCapacity;
+    uint32_t changedCount;
+    GlobalChunkCoordinate newKey;
+    Chunk* newChunk;
+    bool newKeyReady;
+} WorldBatchChunk;
+
+static bool LocalChunkCoordinateEqual(
+    LocalChunkCoordinate left, LocalChunkCoordinate right)
+{
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+static void WorldBatchCleanup(WorldBatchChunk* chunks, uint32_t count)
+{
+    if (chunks == NULL) return;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        WorldBatchChunk* chunk = &chunks[index];
+        if (chunk->newChunk != NULL)
+        {
+            PlatformFree(chunk->newChunk);
+        }
+        if (chunk->newKeyReady)
+        {
+            GlobalChunkCoordinateDestroy(&chunk->newKey);
+        }
+        PlatformFree(chunk->stagedDeltas);
+    }
+    PlatformFree(chunks);
+}
+
+static bool WorldBatchApplyToChunk(
+    World* world, WorldBatchChunk* batch,
+    const WorldBlockMutation* mutation)
+{
+    uint16_t localX = LocalFromBlock(
+        mutation->block[0], batch->coordinate.x);
+    uint16_t localY = LocalFromBlock(
+        mutation->block[1], batch->coordinate.y);
+    uint16_t localZ = LocalFromBlock(
+        mutation->block[2], batch->coordinate.z);
+    uint32_t localIndex = PackLocalIndex(localX, localY, localZ);
+    BlockType generated = GeneratedBlock(world,
+        mutation->block[0], mutation->block[1], mutation->block[2]);
+    Chunk staged = {
+        .deltaCount = batch->stagedCount,
+        .deltaCapacity = batch->stagedCapacity,
+        .deltas = batch->stagedDeltas,
+        .revision = 0,
+    };
+    uint32_t position = ChunkDeltaLowerBound(&staged, localIndex);
+    bool hasDelta = position < staged.deltaCount &&
+        DeltaLocalIndex(staged.deltas[position]) == localIndex;
+
+    if (mutation->replacement == generated)
+    {
+        if (hasDelta)
+        {
+            for (uint32_t index = position + 1U;
+                 index < staged.deltaCount; ++index)
+            {
+                staged.deltas[index - 1U] = staged.deltas[index];
+            }
+            --staged.deltaCount;
+        }
+    }
+    else if (hasDelta)
+    {
+        staged.deltas[position] = PackDelta(
+            localIndex, mutation->replacement);
+    }
+    else if (!ChunkSetDelta(
+                 &staged, localIndex, mutation->replacement))
+    {
+        return false;
+    }
+    batch->stagedDeltas = staged.deltas;
+    batch->stagedCount = staged.deltaCount;
+    batch->stagedCapacity = staged.deltaCapacity;
+    ++batch->changedCount;
+    return true;
+}
+
+static uint64_t SaturatingAddRevision(uint64_t value, uint32_t amount)
+{
+    uint64_t remaining = UINT64_MAX - value;
+    return remaining < (uint64_t)amount
+        ? UINT64_MAX : value + (uint64_t)amount;
+}
+
+bool WorldApplyBlockBatch(World* world,
+    const WorldBlockMutation* mutations, uint32_t count)
+{
+    if (world == NULL || (count != 0U && mutations == NULL) ||
+        count > WORLD_MAX_ATOMIC_BLOCK_MUTATIONS)
+    {
+        return false;
+    }
+    if (count == 0U) return true;
+
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (!MutableBlockTypeValid(mutations[index].expected) ||
+            !MutableBlockTypeValid(mutations[index].replacement))
+        {
+            return false;
+        }
+        for (uint32_t previous = 0; previous < index; ++previous)
+        {
+            if (mutations[index].block[0] == mutations[previous].block[0] &&
+                mutations[index].block[1] == mutations[previous].block[1] &&
+                mutations[index].block[2] == mutations[previous].block[2])
+            {
+                return false;
+            }
+        }
+    }
+
+    WorldBatchChunk* chunks = PlatformAllocate(
+        (size_t)count * sizeof(*chunks), true);
+    if (chunks == NULL) return false;
+    uint32_t chunkCount = 0;
+    uint32_t totalChanged = 0;
+    bool succeeded = true;
+
+    PlatformRwLockAcquireExclusive(&world->tableLock);
+    for (uint32_t index = 0; index < count && succeeded; ++index)
+    {
+        const WorldBlockMutation* mutation = &mutations[index];
+        LocalChunkCoordinate coordinate = {
+            ChunkFromBlock(mutation->block[0]),
+            ChunkFromBlock(mutation->block[1]),
+            ChunkFromBlock(mutation->block[2]),
+        };
+        WorldBatchChunk* batch = NULL;
+        for (uint32_t chunkIndex = 0;
+             chunkIndex < chunkCount; ++chunkIndex)
+        {
+            if (LocalChunkCoordinateEqual(
+                    chunks[chunkIndex].coordinate, coordinate))
+            {
+                batch = &chunks[chunkIndex];
+                break;
+            }
+        }
+        if (batch == NULL)
+        {
+            batch = &chunks[chunkCount++];
+            batch->coordinate = coordinate;
+            Chunk** entry = WorldFindEntry(world, coordinate);
+            batch->existing = entry == NULL ? NULL : *entry;
+            uint32_t existingCount = batch->existing == NULL
+                ? 0U : batch->existing->deltaCount;
+            batch->stagedCapacity = existingCount + count;
+            if (batch->stagedCapacity != 0U)
+            {
+                batch->stagedDeltas = PlatformAllocate(
+                    (size_t)batch->stagedCapacity * sizeof(DeltaEntry),
+                    false);
+                if (batch->stagedDeltas == NULL)
+                {
+                    succeeded = false;
+                    break;
+                }
+            }
+            batch->stagedCount = existingCount;
+            if (existingCount != 0U)
+            {
+                memcpy(batch->stagedDeltas, batch->existing->deltas,
+                    (size_t)existingCount * sizeof(DeltaEntry));
+            }
+        }
+
+        uint32_t localIndex = PackLocalIndex(
+            LocalFromBlock(mutation->block[0], coordinate.x),
+            LocalFromBlock(mutation->block[1], coordinate.y),
+            LocalFromBlock(mutation->block[2], coordinate.z));
+        Chunk stagedView = {
+            .deltaCount = batch->stagedCount,
+            .deltaCapacity = batch->stagedCapacity,
+            .deltas = batch->stagedDeltas,
+        };
+        BlockType current = GeneratedBlock(world,
+            mutation->block[0], mutation->block[1], mutation->block[2]);
+        (void)ChunkGetDelta(&stagedView, localIndex, &current);
+        if (current != mutation->expected)
+        {
+            succeeded = false;
+            break;
+        }
+        if (current == mutation->replacement) continue;
+        succeeded = WorldBatchApplyToChunk(world, batch, mutation);
+        if (succeeded) ++totalChanged;
+    }
+
+    uint32_t newChunkCount = 0;
+    for (uint32_t index = 0; index < chunkCount; ++index)
+    {
+        if (chunks[index].existing == NULL &&
+            chunks[index].stagedCount != 0U)
+        {
+            ++newChunkCount;
+        }
+    }
+    while (succeeded &&
+        (world->count + newChunkCount) * 2U >= world->capacity)
+    {
+        succeeded = WorldGrow(world);
+    }
+
+    for (uint32_t index = 0; index < chunkCount && succeeded; ++index)
+    {
+        WorldBatchChunk* batch = &chunks[index];
+        if (batch->existing != NULL || batch->stagedCount == 0U)
+            continue;
+        batch->newChunk = PlatformAllocate(sizeof(Chunk), true);
+        succeeded = batch->newChunk != NULL &&
+            GlobalChunkCoordinateTryCreate(
+                &batch->newKey, world, batch->coordinate);
+        batch->newKeyReady = succeeded;
+    }
+
+    if (succeeded)
+    {
+        for (uint32_t index = 0; index < chunkCount; ++index)
+        {
+            WorldBatchChunk* batch = &chunks[index];
+            if (batch->changedCount == 0U) continue;
+            if (batch->existing != NULL)
+            {
+                PlatformFree(batch->existing->deltas);
+                batch->existing->deltas = batch->stagedDeltas;
+                batch->existing->deltaCount = batch->stagedCount;
+                batch->existing->deltaCapacity = batch->stagedCapacity;
+                batch->existing->revision = SaturatingAddRevision(
+                    batch->existing->revision, batch->changedCount);
+                batch->stagedDeltas = NULL;
+                continue;
+            }
+            if (batch->stagedCount == 0U) continue;
+            batch->newChunk->deltas = batch->stagedDeltas;
+            batch->newChunk->deltaCount = batch->stagedCount;
+            batch->newChunk->deltaCapacity = batch->stagedCapacity;
+            batch->newChunk->revision = batch->changedCount;
+            uint32_t mask = world->capacity - 1U;
+            uint32_t slot = (uint32_t)(batch->newKey.hash ^
+                (batch->newKey.hash >> 32U)) & mask;
+            while (world->occupied[slot]) slot = (slot + 1U) & mask;
+            world->keys[slot] = batch->newKey;
+            world->chunks[slot] = batch->newChunk;
+            world->occupied[slot] = true;
+            ++world->count;
+            batch->stagedDeltas = NULL;
+            batch->newChunk = NULL;
+            batch->newKeyReady = false;
+        }
+        world->revision = SaturatingAddRevision(
+            world->revision, totalChanged);
+    }
+    PlatformRwLockReleaseExclusive(&world->tableLock);
+    WorldBatchCleanup(chunks, chunkCount);
+    return succeeded;
 }
 
 uint64_t WorldGetRevision(World* world)

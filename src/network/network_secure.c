@@ -200,6 +200,38 @@ bool NetworkServerSendSnapshotChunk(
         server, peerId, chunk);
 }
 
+bool NetworkServerSendConstructReset(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructReset *reset)
+{
+    return LaiueNetworkBackendServerSendConstructReset(
+        server, peerId, reset);
+}
+
+bool NetworkServerSendConstructBody(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBody *body)
+{
+    return LaiueNetworkBackendServerSendConstructBody(
+        server, peerId, body);
+}
+
+bool NetworkServerSendConstructBlocks(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructBlockBatch *blocks)
+{
+    return LaiueNetworkBackendServerSendConstructBlocks(
+        server, peerId, blocks);
+}
+
+bool NetworkServerSendConstructState(
+    NetworkServer *server, uint32_t peerId,
+    const NetworkConstructState *state)
+{
+    return LaiueNetworkBackendServerSendConstructState(
+        server, peerId, state);
+}
+
 bool NetworkServerSendSnapshotEnd(
     NetworkServer *server, uint32_t peerId,
     uint64_t snapshotId, uint64_t worldRevision)

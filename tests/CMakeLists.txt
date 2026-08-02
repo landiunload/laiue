@@ -52,6 +52,13 @@ if(TARGET laiue_input AND TARGET laiue_network)
         COMMAND laiue_player_command_mapper_test)
 endif()
 
+add_executable(laiue_inventory_test inventory_test.c)
+target_link_libraries(laiue_inventory_test PRIVATE laiue_gameplay)
+laiue_configure_portable_test(
+    laiue_inventory_test InventoryTestEntryPoint)
+
+add_test(NAME laiue.gameplay.inventory COMMAND laiue_inventory_test)
+
 # protocol.c компилируется в тест напрямую: кодек не экспортируется из
 # laiue_network, и расширять ABI DLL ради проверок нельзя.
 add_executable(laiue_protocol_test
@@ -192,6 +199,69 @@ laiue_configure_portable_test(
     laiue_world_snapshot_test WorldSnapshotTestEntryPoint)
 
 add_test(NAME laiue.world.snapshot COMMAND laiue_world_snapshot_test)
+
+add_executable(laiue_physical_construct_store_test
+    physical_construct_store_test.c)
+target_link_libraries(laiue_physical_construct_store_test PRIVATE
+    laiue_construct
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_physical_construct_store_test
+    PhysicalConstructStoreTestEntryPoint)
+
+add_test(NAME laiue.construct.store
+    COMMAND laiue_physical_construct_store_test)
+
+add_executable(laiue_physical_construct_persistence_test
+    physical_construct_persistence_test.c)
+target_link_libraries(laiue_physical_construct_persistence_test PRIVATE
+    laiue_construct
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_physical_construct_persistence_test
+    PhysicalConstructPersistenceTestEntryPoint)
+
+add_test(NAME laiue.construct.persistence
+    COMMAND laiue_physical_construct_persistence_test)
+
+add_executable(laiue_physical_construct_test
+    physical_construct_test.c)
+target_link_libraries(laiue_physical_construct_test PRIVATE
+    laiue_construct
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_physical_construct_test
+    PhysicalConstructTestEntryPoint)
+
+add_test(NAME laiue.construct.physics
+    COMMAND laiue_physical_construct_test)
+
+add_executable(laiue_voxel_interaction_test
+    voxel_interaction_test.c)
+target_link_libraries(laiue_voxel_interaction_test PRIVATE
+    laiue_interaction
+    laiue_construct
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_voxel_interaction_test
+    VoxelInteractionTestEntryPoint)
+
+add_test(NAME laiue.construct.interaction
+    COMMAND laiue_voxel_interaction_test)
+
+add_executable(laiue_construct_player_integration_test
+    construct_player_integration_test.c)
+target_link_libraries(laiue_construct_player_integration_test PRIVATE
+    laiue_construct
+    laiue_gameplay
+    laiue_physics
+    laiue_world)
+laiue_configure_portable_test(
+    laiue_construct_player_integration_test
+    ConstructPlayerIntegrationTestEntryPoint)
+
+add_test(NAME laiue.construct.player_integration
+    COMMAND laiue_construct_player_integration_test)
 
 add_executable(laiue_mod_block_policy_test
     mod_block_policy_test.c

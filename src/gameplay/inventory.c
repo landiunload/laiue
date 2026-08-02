@@ -3,6 +3,12 @@
 #include <stddef.h>
 #include <string.h>
 
+bool InventoryItemIsValid(InventoryItemId item)
+{
+    return item > INVENTORY_ITEM_NONE
+        && item <= INVENTORY_ITEM_PHYSICS_LEVER;
+}
+
 void InventoryClear(Inventory* inventory)
 {
     if (inventory == NULL) return;
@@ -12,7 +18,7 @@ void InventoryClear(Inventory* inventory)
 uint32_t InventoryAdd(Inventory* inventory, InventoryItemId item,
     uint32_t count)
 {
-    if (inventory == NULL || item == INVENTORY_ITEM_NONE || count == 0)
+    if (inventory == NULL || !InventoryItemIsValid(item) || count == 0)
         return count;
 
     for (uint32_t i = 0; i < INVENTORY_SLOT_COUNT && count != 0; ++i)
@@ -41,7 +47,7 @@ uint32_t InventoryAdd(Inventory* inventory, InventoryItemId item,
 bool InventoryConsume(Inventory* inventory, InventoryItemId item,
     uint32_t count)
 {
-    if (inventory == NULL || item == INVENTORY_ITEM_NONE || count == 0)
+    if (inventory == NULL || !InventoryItemIsValid(item) || count == 0)
         return false;
     uint32_t available = 0;
     for (uint32_t i = 0; i < INVENTORY_SLOT_COUNT; ++i)
@@ -71,7 +77,7 @@ bool InventoryConsumeSelected(Inventory* inventory, uint32_t count,
         return false;
     InventorySlot* slot =
         &inventory->slots[inventory->selectedHotbarSlot];
-    if (slot->item == INVENTORY_ITEM_NONE || slot->count < count)
+    if (!InventoryItemIsValid(slot->item) || slot->count < count)
         return false;
     if (outItem != NULL) *outItem = slot->item;
     slot->count = (uint16_t)(slot->count - count);

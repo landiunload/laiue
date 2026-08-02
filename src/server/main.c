@@ -1,12 +1,16 @@
 #include "game/camera.h"
 #include "content/content_bundle.h"
 #include "content/content_catalog.h"
+#include "construct/physical_construct.h"
+#include "construct/physical_construct_persistence.h"
 #include "gameplay/player_controller.h"
 #include "gameplay/inventory.h"
+#include "gameplay/view_direction.h"
 #include "interaction/voxel_interaction.h"
 #include "mod/mod_host.h"
 #include "mod/mods.h"
 #include "network/network.h"
+#include "network/protocol.h"
 #include "platform/system.h"
 #include "server/player_input_queue.h"
 #include "server/server_config.h"
@@ -36,6 +40,12 @@
 #define SERVER_INTEREST_RADIUS_CHUNKS 5LL
 #define SERVER_RESYNC_QUEUE_CAPACITY 1U
 
+_Static_assert(LAIUE_PROTOCOL_MAX_INVENTORY_ITEM ==
+        INVENTORY_ITEM_PHYSICS_LEVER,
+    "protocol v6 and gameplay inventory item ranges must match");
+_Static_assert(LAIUE_PROTOCOL_INVENTORY_SLOTS == INVENTORY_SLOT_COUNT,
+    "protocol and gameplay inventory slot counts must match");
+
 typedef struct ServerBlockDrop
 {
     uint32_t id;
@@ -52,6 +62,10 @@ typedef struct ServerResyncRequest
 } ServerResyncRequest;
 
 static const wchar_t g_serverWorldPath[] = L"saves\\default\\chunks.dat";
+static const wchar_t g_serverConstructPath[] =
+    L"saves/default/constructs.dat";
+static const wchar_t g_serverCommitPath[] =
+    L"saves/default/state.commit";
 
 typedef struct ServerPlayer
 {
@@ -67,6 +81,12 @@ typedef struct ServerPlayer
     uint64_t lastBreakIntentAtMs;
     int64_t breakingBlock[3];
     bool breaking;
+    VoxelEditSpace breakingSpace;
+    uint64_t breakingBodyId;
+    int32_t breakingLocalBlock[3];
+    uint64_t grabbedConstructBodyId;
+    double grabbedConstructDistance;
+    bool constructGrabHeld;
     Inventory inventory;
     int64_t snapshotCenter[3];
     ServerResyncRequest resyncQueue[
@@ -75,6 +95,7 @@ typedef struct ServerPlayer
     ServerSnapshotScheduler snapshotScheduler;
     bool hasSnapshotCenter;
     bool fullSnapshotPending;
+    bool topologySnapshotPending;
     bool active;
 } ServerPlayer;
 
@@ -82,7 +103,10 @@ typedef struct DedicatedServer
 {
     NetworkServer *network;
     World *world;
+    PhysicalConstructSystem *constructs;
     PlayerCollisionSource collision;
+    PhysicalConstructCollider constructColliderScratch[
+        VOXEL_DYNAMIC_COLLIDER_CAPACITY];
     ServerPlayer players[LAIUE_NETWORK_MAX_PEERS];
     ModsState mods;
     ModHost modHost;
@@ -263,9 +287,56 @@ static void WriteServerStartupFailure(const wchar_t* reason, uint32_t exitCode)
 static void QueryWorldBlockPhysics(void *context, int64_t x, int64_t y, int64_t z,
                                    VoxelBlockPhysics *outBlock)
 {
-    BlockProperties properties = BlockGetProperties(WorldGetBlock((World *)context, x, y, z));
-    outBlock->flags = properties.solid ? VOXEL_BLOCK_PHYSICS_SOLID : 0U;
+    DedicatedServer* server = context;
+    BlockProperties properties = BlockGetProperties(
+        WorldGetBlock(server->world, x, y, z));
+    outBlock->flags = properties.solid
+        ? VOXEL_BLOCK_PHYSICS_SOLID : 0U;
     outBlock->friction = properties.friction;
+}
+
+static bool QueryConstructColliders(void* context,
+    const VoxelBodyBounds* queryBounds,
+    VoxelDynamicCollider* outColliders, uint32_t colliderCapacity,
+    uint32_t* outColliderCount)
+{
+    DedicatedServer* server = context;
+    *outColliderCount = 0U;
+    if (server->constructs == NULL)
+        return true;
+    if (queryBounds == NULL || outColliders == NULL ||
+        colliderCapacity > VOXEL_DYNAMIC_COLLIDER_CAPACITY)
+        return false;
+
+    PhysicalConstructAabb query;
+    memcpy(query.minimum, queryBounds->minimum,
+        sizeof(query.minimum));
+    memcpy(query.maximum, queryBounds->maximum,
+        sizeof(query.maximum));
+    bool truncated = false;
+    uint32_t count = PhysicalConstructCopyCollidersInAabb(
+        server->constructs, &query,
+        server->constructColliderScratch,
+        colliderCapacity, &truncated);
+    if (truncated)
+        return false;
+
+    for (uint32_t index = 0U; index < count; ++index)
+    {
+        const PhysicalConstructCollider* source =
+            &server->constructColliderScratch[index];
+        VoxelDynamicCollider* destination = &outColliders[index];
+        memcpy(destination->bounds.minimum, source->bounds.minimum,
+            sizeof(destination->bounds.minimum));
+        memcpy(destination->bounds.maximum, source->bounds.maximum,
+            sizeof(destination->bounds.maximum));
+        memcpy(destination->velocity, source->velocity,
+            sizeof(destination->velocity));
+        destination->friction = 1.0f;
+        destination->stableId = (uint64_t)index + 1U;
+    }
+    *outColliderCount = count;
+    return true;
 }
 
 static ServerPlayer *FindPlayer(DedicatedServer *server, uint32_t peerId)
@@ -311,6 +382,8 @@ static ServerPlayer *AddPlayer(DedicatedServer *server, uint32_t peerId)
         InventoryClear(&player->inventory);
         InventoryAdd(&player->inventory, BLOCK_EARTH, 16U);
         InventoryAdd(&player->inventory, BLOCK_GRASS, 16U);
+        InventoryAdd(&player->inventory,
+            INVENTORY_ITEM_PHYSICS_LEVER, 8U);
         return player;
     }
     return NULL;
@@ -321,6 +394,8 @@ static void RemovePlayer(DedicatedServer *server, uint32_t peerId)
     ServerPlayer *player = FindPlayer(server, peerId);
     if (player != NULL)
     {
+        PhysicalConstructReleaseOwner(
+            server->constructs, peerId);
         memset(player, 0, sizeof(*player));
     }
 }
@@ -428,8 +503,16 @@ static bool MutateServerModBlock(
         return true;
     }
 
-    WorldSetBlock(server->world, x, y, z, requested);
-    if (WorldGetBlock(server->world, x, y, z) != requested)
+    // A mod uses the same authoritative collision rule as a player edit:
+    // static world data must never be written through a moving construct.
+    if (requested != BLOCK_AIR && server->constructs != NULL &&
+        PhysicalConstructWorldCellOccupied(
+            server->constructs, x, y, z))
+    {
+        return false;
+    }
+
+    if (!WorldTrySetBlock(server->world, x, y, z, requested))
     {
         return false;
     }
@@ -477,8 +560,156 @@ static uint64_t ServerWorldTimeMilliseconds(float hours)
     return (uint64_t)(hours * 3600000.0f + 0.5f);
 }
 
+typedef struct ServerConstructSnapshotScratch
+{
+    PhysicalConstructBodyState states[PHYSICAL_CONSTRUCT_MAX_BODIES];
+    PhysicalConstructBlock blocks[PHYSICAL_CONSTRUCT_MAX_BLOCKS];
+} ServerConstructSnapshotScratch;
+
+static bool ServerConstructLocalFitsWire(const int32_t local[3])
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (local[axis] < INT16_MIN || local[axis] > INT16_MAX)
+            return false;
+    }
+    return true;
+}
+
+static bool ServerConstructBlockLess(
+    const PhysicalConstructBlock* left,
+    const PhysicalConstructBlock* right)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->local[axis] != right->local[axis])
+            return left->local[axis] < right->local[axis];
+    }
+    if (left->kind != right->kind)
+        return left->kind < right->kind;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->mountNormal[axis] != right->mountNormal[axis])
+            return left->mountNormal[axis] < right->mountNormal[axis];
+    }
+    return left->material < right->material;
+}
+
+static void ServerSortConstructBlocks(
+    PhysicalConstructBlock* blocks, uint32_t count)
+{
+    for (uint32_t index = 1U; index < count; ++index)
+    {
+        PhysicalConstructBlock value = blocks[index];
+        uint32_t insert = index;
+        while (insert != 0U &&
+            ServerConstructBlockLess(&value, &blocks[insert - 1U]))
+        {
+            blocks[insert] = blocks[insert - 1U];
+            --insert;
+        }
+        blocks[insert] = value;
+    }
+}
+
+static bool SendConstructTopologySnapshot(
+    DedicatedServer* server, ServerPlayer* player)
+{
+    ServerConstructSnapshotScratch* scratch = PlatformAllocate(
+        sizeof(*scratch), false);
+    if (scratch == NULL) return false;
+
+    bool truncated = false;
+    uint32_t bodyCount = PhysicalConstructCopyBodyStates(
+        server->constructs, scratch->states,
+        PHYSICAL_CONSTRUCT_MAX_BODIES, &truncated);
+    NetworkConstructReset reset = {
+        .bodyCount = (uint16_t)bodyCount,
+    };
+    bool succeeded = !truncated &&
+        bodyCount <= LAIUE_NETWORK_MAX_CONSTRUCT_BODIES &&
+        NetworkServerSendConstructReset(
+            server->network, player->peerId, &reset);
+
+    for (uint32_t bodyIndex = 0;
+        bodyIndex < bodyCount && succeeded; ++bodyIndex)
+    {
+        const PhysicalConstructBodyState* state =
+            &scratch->states[bodyIndex];
+        if (state->blockCount == 0U ||
+            state->blockCount > PHYSICAL_CONSTRUCT_MAX_BLOCKS ||
+            state->blockCount > UINT16_MAX)
+        {
+            succeeded = false;
+            break;
+        }
+        uint32_t copied = 0U;
+        succeeded = PhysicalConstructCopyBlocks(server->constructs,
+            state->id, scratch->blocks,
+            PHYSICAL_CONSTRUCT_MAX_BLOCKS, &copied) &&
+            copied == state->blockCount;
+        if (succeeded)
+            ServerSortConstructBlocks(scratch->blocks, copied);
+        for (uint32_t block = 0; block < copied && succeeded; ++block)
+        {
+            succeeded = ServerConstructLocalFitsWire(
+                scratch->blocks[block].local);
+        }
+        if (!succeeded) break;
+
+        NetworkConstructBody body = {
+            .id = state->id,
+            .revision = state->topologyRevision,
+            .origin = { state->origin[0], state->origin[1],
+                state->origin[2] },
+            .velocity = { state->velocity[0], state->velocity[1],
+                state->velocity[2] },
+            .blockCount = (uint16_t)copied,
+        };
+        succeeded = NetworkServerSendConstructBody(
+            server->network, player->peerId, &body);
+
+        for (uint32_t first = 0U;
+            first < copied && succeeded;
+            first += LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH)
+        {
+            uint32_t count = copied - first;
+            if (count > LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH)
+                count = LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH;
+            NetworkConstructBlockBatch batch;
+            memset(&batch, 0, sizeof(batch));
+            batch.id = state->id;
+            batch.revision = state->topologyRevision;
+            batch.firstBlock = (uint16_t)first;
+            batch.blockCount = (uint16_t)count;
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                const PhysicalConstructBlock* source =
+                    &scratch->blocks[first + index];
+                NetworkConstructBlock* destination =
+                    &batch.blocks[index];
+                for (uint32_t axis = 0; axis < 3U; ++axis)
+                {
+                    destination->local[axis] =
+                        (int16_t)source->local[axis];
+                    destination->mountNormal[axis] =
+                        source->mountNormal[axis];
+                }
+                destination->material = source->material;
+                destination->kind = source->kind;
+            }
+            succeeded = NetworkServerSendConstructBlocks(
+                server->network, player->peerId, &batch);
+        }
+    }
+
+    PlatformFree(scratch);
+    return succeeded;
+}
+
 static bool SendWorldSnapshot(DedicatedServer* server,
-    ServerPlayer* player, const int64_t minimum[3], const int64_t maximum[3])
+    ServerPlayer* player, const int64_t minimum[3],
+    const int64_t maximum[3], bool includeConstructTopology)
 {
     WorldChunkSummary* summaries = PlatformAllocate(
         LAIUE_NETWORK_MAX_SNAPSHOT_CHUNKS * sizeof(*summaries), false);
@@ -577,6 +808,8 @@ static bool SendWorldSnapshot(DedicatedServer* server,
 
     // Initial state belongs to the snapshot barrier. READY is emitted by the
     // transport only after SNAPSHOT_END has been received.
+    if (succeeded && includeConstructTopology)
+        succeeded = SendConstructTopologySnapshot(server, player);
     if (succeeded)
         succeeded = NetworkServerSendWorldTime(server->network,
             player->peerId, snapshot.worldTime);
@@ -640,14 +873,42 @@ static bool SendInitialWorldSnapshot(
             if (requested > maximum[axis]) maximum[axis] = requested;
         }
     }
-    if (!SendWorldSnapshot(server, player, minimum, maximum))
+    bool includeConstructTopology = !player->hasSnapshotCenter ||
+        player->topologySnapshotPending;
+    if (!SendWorldSnapshot(server, player, minimum, maximum,
+            includeConstructTopology))
         return false;
     memcpy(player->snapshotCenter, center,
         sizeof(player->snapshotCenter));
     player->hasSnapshotCenter = true;
     player->resyncQueueCount = 0;
     player->fullSnapshotPending = false;
+    if (includeConstructTopology)
+        player->topologySnapshotPending = false;
     return true;
+}
+
+static bool SendTopologyOnlySnapshot(
+    DedicatedServer* server, ServerPlayer* player)
+{
+    uint64_t snapshotId = ++server->nextSnapshotId;
+    if (snapshotId == 0U) snapshotId = ++server->nextSnapshotId;
+    uint64_t worldRevision = WorldGetRevision(server->world);
+    NetworkSnapshotInfo snapshot = {
+        .snapshotId = snapshotId,
+        .worldRevision = worldRevision,
+        .serverTick = server->tick,
+        .chunkCount = 0U,
+        .peerId = player->peerId,
+        .worldSeed = server->worldSeed,
+        .worldTime = ServerWorldTimeMilliseconds(server->timeOfDayHours),
+        .requiresReadyBarrier = false,
+    };
+    return NetworkServerSendSnapshotBegin(
+               server->network, player->peerId, &snapshot) &&
+           SendConstructTopologySnapshot(server, player) &&
+           NetworkServerSendSnapshotEnd(server->network,
+               player->peerId, snapshotId, worldRevision);
 }
 
 static bool ServerChunkEquals(
@@ -715,6 +976,7 @@ static void ProcessPendingResyncs(DedicatedServer* server)
         ServerPlayer* player = &server->players[playerIndex];
         if (!player->active) continue;
         if (!player->fullSnapshotPending &&
+            !player->topologySnapshotPending &&
             player->resyncQueueCount == 0)
         {
             continue;
@@ -748,13 +1010,23 @@ static void ProcessPendingResyncs(DedicatedServer* server)
             return;
         }
 
+        if (player->topologySnapshotPending)
+        {
+            succeeded = SendTopologyOnlySnapshot(server, player);
+            if (succeeded)
+                player->topologySnapshotPending = false;
+            ServerSnapshotSchedulerFinish(
+                &player->snapshotScheduler, server->tick, succeeded);
+            return;
+        }
+
         int64_t minimum[3];
         int64_t maximum[3];
         memcpy(minimum, player->resyncQueue[0].chunk,
             sizeof(minimum));
         memcpy(maximum, minimum, sizeof(maximum));
         succeeded = SendWorldSnapshot(
-            server, player, minimum, maximum);
+            server, player, minimum, maximum, false);
         if (!succeeded)
         {
             ServerSnapshotSchedulerFinish(
@@ -804,40 +1076,157 @@ static void SpawnServerDrop(DedicatedServer* server, uint8_t block,
     NetworkServerBroadcastBlockDrop(server->network, &networkDrop);
 }
 
+static uint32_t BuildServerPlayerBlockers(
+    DedicatedServer* server,
+    PhysicalConstructAabb output[LAIUE_NETWORK_MAX_PEERS])
+{
+    uint32_t count = 0U;
+    for (uint32_t index = 0; index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer* player = &server->players[index];
+        if (!player->active) continue;
+        VoxelBodyShape shape;
+        VoxelBodyBounds bounds;
+        PlayerControllerGetBodyShape(&player->controller, &shape);
+        VoxelBodyCalculateBounds(player->camera.position, &shape, &bounds);
+        memcpy(output[count].minimum, bounds.minimum,
+            sizeof(output[count].minimum));
+        memcpy(output[count].maximum, bounds.maximum,
+            sizeof(output[count].maximum));
+        ++count;
+    }
+    return count;
+}
+
+static uint32_t BuildServerSimulationBlockers(
+    DedicatedServer* server,
+    PhysicalConstructDynamicBlocker
+        output[LAIUE_NETWORK_MAX_PEERS])
+{
+    uint32_t count = 0U;
+    for (uint32_t index = 0U;
+        index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer* player = &server->players[index];
+        if (!player->active)
+            continue;
+        VoxelBodyShape shape;
+        VoxelBodyBounds bounds;
+        PlayerControllerGetBodyShape(&player->controller, &shape);
+        VoxelBodyCalculateBounds(
+            player->camera.position, &shape, &bounds);
+        memcpy(output[count].bounds.minimum, bounds.minimum,
+            sizeof(output[count].bounds.minimum));
+        memcpy(output[count].bounds.maximum, bounds.maximum,
+            sizeof(output[count].bounds.maximum));
+        output[count].ignoredBodyId = 0U;
+        ++count;
+    }
+    return count;
+}
+
+static bool ServerFindConstructState(
+    DedicatedServer* server, uint64_t bodyId,
+    PhysicalConstructBodyState* outState)
+{
+    PhysicalConstructBodyState states[PHYSICAL_CONSTRUCT_MAX_BODIES];
+    bool truncated = false;
+    uint32_t count = PhysicalConstructCopyBodyStates(
+        server->constructs, states, PHYSICAL_CONSTRUCT_MAX_BODIES,
+        &truncated);
+    if (truncated) return false;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (states[index].id == bodyId)
+        {
+            *outState = states[index];
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SameServerBreakTarget(
+    const ServerPlayer* player, const VoxelEdit* edit)
+{
+    if (!player->breaking || player->breakingSpace != edit->space)
+        return false;
+    if (edit->space == VOXEL_EDIT_SPACE_CONSTRUCT)
+    {
+        return player->breakingBodyId == edit->bodyId &&
+            player->breakingLocalBlock[0] == edit->localBlock[0] &&
+            player->breakingLocalBlock[1] == edit->localBlock[1] &&
+            player->breakingLocalBlock[2] == edit->localBlock[2];
+    }
+    return player->breakingBlock[0] == edit->block[0] &&
+        player->breakingBlock[1] == edit->block[1] &&
+        player->breakingBlock[2] == edit->block[2];
+}
+
+static void RequestConstructTopologySnapshots(DedicatedServer* server)
+{
+    for (uint32_t index = 0; index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer* player = &server->players[index];
+        if (!player->active) continue;
+        player->topologySnapshotPending = true;
+        ServerSnapshotSchedulerRequest(&player->snapshotScheduler);
+    }
+}
+
+static void RequestConstructActivationSnapshots(DedicatedServer* server)
+{
+    // Activation changes two authoritative domains atomically: captured
+    // voxels disappear from World and reappear as construct topology. A
+    // topology-only snapshot would leave remote clients with duplicate
+    // static blocks, so schedule one live interest snapshot containing both.
+    for (uint32_t index = 0U;
+        index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer* player = &server->players[index];
+        if (!player->active)
+            continue;
+        player->fullSnapshotPending = true;
+        player->topologySnapshotPending = true;
+        ServerSnapshotSchedulerRequest(&player->snapshotScheduler);
+    }
+}
+
 static void HandleEditIntent(DedicatedServer *server, ServerPlayer *player,
                              const NetworkServerEvent *event)
 {
     uint64_t now = PlatformMonotonicMilliseconds();
-    VoxelBodyShape bodyShape;
-    PlayerControllerGetBodyShape(&player->controller, &bodyShape);
+    PhysicalConstructAabb blockers[LAIUE_NETWORK_MAX_PEERS];
+    uint32_t blockerCount = BuildServerPlayerBlockers(server, blockers);
     VoxelEdit edit;
-    if (!VoxelInteractionTryCreateEdit(server->world, player->camera.position,
-                                       event->data.editIntent.direction, player->camera.position,
-                                       &bodyShape, event->data.editIntent.breakBlock,
-                                       event->data.editIntent.placeBlock,
-                                       event->data.editIntent.placementBlock,
-                                       SERVER_EDIT_REACH, &edit))
+    if (!VoxelInteractionTryCreateEdit(server->world, server->constructs,
+            player->camera.position, event->data.editIntent.direction,
+            blockers, blockerCount,
+            event->data.editIntent.breakBlock,
+            event->data.editIntent.placeBlock,
+            event->data.editIntent.placementBlock,
+            SERVER_EDIT_REACH, &edit))
     {
         player->breaking = false;
         return;
     }
 
-    uint8_t previous = (uint8_t)WorldGetBlock(server->world,
-        edit.block[0], edit.block[1], edit.block[2]);
+    uint8_t previous = edit.original;
     if (edit.type == VOXEL_EDIT_BREAK)
     {
-        bool sameTarget = player->breaking
-            && player->breakingBlock[0] == edit.block[0]
-            && player->breakingBlock[1] == edit.block[1]
-            && player->breakingBlock[2] == edit.block[2]
-            && now - player->lastBreakIntentAtMs
-                <= SERVER_BREAK_INTENT_TIMEOUT_MS;
+        bool sameTarget = SameServerBreakTarget(player, &edit) &&
+            now - player->lastBreakIntentAtMs <=
+                SERVER_BREAK_INTENT_TIMEOUT_MS;
         if (!sameTarget)
         {
             player->breaking = true;
+            player->breakingSpace = edit.space;
             player->breakingBlock[0] = edit.block[0];
             player->breakingBlock[1] = edit.block[1];
             player->breakingBlock[2] = edit.block[2];
+            player->breakingBodyId = edit.bodyId;
+            memcpy(player->breakingLocalBlock, edit.localBlock,
+                sizeof(player->breakingLocalBlock));
             player->breakStartedAtMs = now;
             player->lastBreakIntentAtMs = now;
             return;
@@ -859,11 +1248,73 @@ static void HandleEditIntent(DedicatedServer *server, ServerPlayer *player,
             || selected->item != event->data.editIntent.placementBlock)
             return;
         player->nextEditAtMs = now + SERVER_EDIT_COOLDOWN_MS;
-        if (!InventoryConsumeSelected(&player->inventory, 1U, NULL))
-            return;
     }
 
-    WorldSetBlock(server->world, edit.block[0], edit.block[1], edit.block[2], edit.replacement);
+    if (edit.type == VOXEL_EDIT_ACTIVATE_LEVER)
+    {
+        uint64_t bodyId = 0;
+        PhysicalConstructResult result = PhysicalConstructActivateLever(
+            server->constructs, edit.block, edit.mountNormal,
+            blockers, blockerCount, &bodyId);
+        if (result != PHYSICAL_CONSTRUCT_OK) return;
+        (void)InventoryConsumeSelected(&player->inventory, 1U, NULL);
+        SendPlayerInventory(server, player);
+        RequestConstructActivationSnapshots(server);
+        return;
+    }
+
+    if (edit.space == VOXEL_EDIT_SPACE_CONSTRUCT)
+    {
+        if (edit.type == VOXEL_EDIT_PLACE)
+        {
+            PhysicalConstructResult result = PhysicalConstructPlaceBlock(
+                server->constructs, edit.bodyId, edit.localBlock,
+                edit.replacement, blockers, blockerCount);
+            if (result != PHYSICAL_CONSTRUCT_OK) return;
+            (void)InventoryConsumeSelected(&player->inventory, 1U, NULL);
+            SendPlayerInventory(server, player);
+        }
+        else
+        {
+            PhysicalConstructBodyState before;
+            if (!ServerFindConstructState(server, edit.bodyId, &before))
+                return;
+            PhysicalConstructBlock removed;
+            uint64_t bodyIds[PHYSICAL_CONSTRUCT_MAX_BODIES];
+            uint32_t bodyIdCount = 0;
+            PhysicalConstructResult result = PhysicalConstructBreakBlock(
+                server->constructs, edit.bodyId, edit.localBlock,
+                &removed, bodyIds, PHYSICAL_CONSTRUCT_MAX_BODIES,
+                &bodyIdCount);
+            if (result != PHYSICAL_CONSTRUCT_OK) return;
+            if (removed.kind == PHYSICAL_CONSTRUCT_BLOCK_LEVER)
+            {
+                (void)InventoryAdd(&player->inventory,
+                    INVENTORY_ITEM_PHYSICS_LEVER, 1U);
+                SendPlayerInventory(server, player);
+            }
+            else
+            {
+                int64_t dropBlock[3] = {
+                    (int64_t)(before.origin[0] + removed.local[0]),
+                    (int64_t)(before.origin[1] + removed.local[1]),
+                    (int64_t)(before.origin[2] + removed.local[2]),
+                };
+                SpawnServerDrop(server, removed.material, dropBlock);
+            }
+        }
+        RequestConstructTopologySnapshots(server);
+        return;
+    }
+
+    if (!WorldTrySetBlock(server->world,
+            edit.block[0], edit.block[1], edit.block[2],
+            edit.replacement))
+        return;
+    if (edit.type == VOXEL_EDIT_PLACE)
+    {
+        (void)InventoryConsumeSelected(&player->inventory, 1U, NULL);
+    }
     ModHostDispatchBlockEdit(&server->modHost,
         edit.block[0], edit.block[1], edit.block[2],
         previous, (uint8_t)edit.replacement);
@@ -986,6 +1437,112 @@ static void HandleNetworkEvents(DedicatedServer *server)
     }
 }
 
+static void ReleaseServerConstructGrab(
+    DedicatedServer* server, ServerPlayer* player)
+{
+    if (player->grabbedConstructBodyId != 0U)
+    {
+        (void)PhysicalConstructEndGrab(server->constructs,
+            player->grabbedConstructBodyId, player->peerId);
+    }
+    player->grabbedConstructBodyId = 0U;
+    player->grabbedConstructDistance = 0.0;
+    player->constructGrabHeld = false;
+}
+
+static void UpdateServerConstructGrab(
+    DedicatedServer* server, ServerPlayer* player)
+{
+    if (!player->constructGrabHeld)
+    {
+        ReleaseServerConstructGrab(server, player);
+        return;
+    }
+
+    float direction[3];
+    GameplayViewForward(
+        player->camera.yaw, player->camera.pitch, direction);
+    if (player->grabbedConstructBodyId == 0U)
+    {
+        VoxelSceneHit hit;
+        if (!VoxelInteractionRaycastScene(server->world,
+                server->constructs, player->camera.position,
+                direction, SERVER_EDIT_REACH, &hit) ||
+            hit.kind != VOXEL_SCENE_HIT_LEVER_HANDLE)
+        {
+            return;
+        }
+        player->grabbedConstructDistance = hit.distance;
+        double target[3];
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            target[axis] = player->camera.position[axis]
+                + (double)direction[axis] * hit.distance;
+        }
+        if (PhysicalConstructBeginGrab(server->constructs,
+                hit.bodyId, player->peerId, target) !=
+            PHYSICAL_CONSTRUCT_OK)
+        {
+            player->grabbedConstructDistance = 0.0;
+            return;
+        }
+        player->grabbedConstructBodyId = hit.bodyId;
+        return;
+    }
+
+    double target[3];
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        target[axis] = player->camera.position[axis]
+            + (double)direction[axis]
+                * player->grabbedConstructDistance;
+    }
+    if (!PhysicalConstructUpdateGrab(server->constructs,
+            player->grabbedConstructBodyId, player->peerId, target))
+    {
+        player->grabbedConstructBodyId = 0U;
+        player->grabbedConstructDistance = 0.0;
+        player->constructGrabHeld = false;
+    }
+}
+
+static void SendConstructMotionStates(DedicatedServer* server)
+{
+    PhysicalConstructBodyState states[PHYSICAL_CONSTRUCT_MAX_BODIES];
+    bool truncated = false;
+    uint32_t bodyCount = PhysicalConstructCopyBodyStates(
+        server->constructs, states, PHYSICAL_CONSTRUCT_MAX_BODIES,
+        &truncated);
+    if (truncated) return;
+
+    for (uint32_t body = 0; body < bodyCount; ++body)
+    {
+        NetworkConstructState state = {
+            .serverTick = server->tick,
+            .id = states[body].id,
+            .revision = states[body].topologyRevision,
+            .origin = { states[body].origin[0], states[body].origin[1],
+                states[body].origin[2] },
+            .velocity = { states[body].velocity[0],
+                states[body].velocity[1], states[body].velocity[2] },
+            .heldBy = states[body].grabbed
+                ? states[body].grabOwner : 0U,
+        };
+        for (uint32_t peer = 0;
+            peer < LAIUE_NETWORK_MAX_PEERS; ++peer)
+        {
+            const ServerPlayer* player = &server->players[peer];
+            if (!player->active || !player->hasSnapshotCenter ||
+                player->fullSnapshotPending)
+            {
+                continue;
+            }
+            (void)NetworkServerSendConstructState(
+                server->network, player->peerId, &state);
+        }
+    }
+}
+
 static void SimulateTick(DedicatedServer *server)
 {
     uint64_t now = PlatformMonotonicMilliseconds();
@@ -1014,6 +1571,7 @@ static void SimulateTick(DedicatedServer *server)
             player->command.jumpHeld = input.jumpHeld;
             player->command.sprintHeld = input.sprintHeld;
             player->command.crouchHeld = input.crouchHeld;
+            player->constructGrabHeld = input.useHeld;
             player->camera.yaw = input.yaw;
             player->camera.pitch = input.pitch;
             player->lastProcessedInputSequence = input.sequence;
@@ -1027,14 +1585,49 @@ static void SimulateTick(DedicatedServer *server)
                 server->tick, player->lastInputServerTick))
         {
             memset(&player->command, 0, sizeof(player->command));
+            ReleaseServerConstructGrab(server, player);
         }
-        PlayerControllerSimulateFixedSteps(&player->controller,
-            &server->collision, &player->camera,
-            &player->command, SERVER_PHYSICS_SUBSTEPS);
+        UpdateServerConstructGrab(server, player);
+    }
+
+    // Both solvers use the same 240 Hz phase ordering. Each construct step
+    // sees current player AABBs; then every player sees the exact new
+    // fractional construct pose. This avoids a four-substep platform lead.
+    for (uint32_t substep = 0U;
+        substep < SERVER_PHYSICS_SUBSTEPS; ++substep)
+    {
+        PhysicalConstructDynamicBlocker
+            blockers[LAIUE_NETWORK_MAX_PEERS];
+        uint32_t blockerCount = BuildServerSimulationBlockers(
+            server, blockers);
+        (void)PhysicalConstructStepWithBlockers(
+            server->constructs, blockers, blockerCount);
+
+        for (uint32_t index = 0U;
+            index < LAIUE_NETWORK_MAX_PEERS; ++index)
+        {
+            ServerPlayer *player = &server->players[index];
+            if (!player->active)
+                continue;
+            PlayerControllerCommand command = player->command;
+            command.jumpPressed = substep == 0U &&
+                player->command.jumpPressed;
+            (void)PlayerControllerSimulateFixedSteps(
+                &player->controller, &server->collision,
+                &player->camera, &command, 1U);
+        }
+    }
+
+    for (uint32_t index = 0U;
+        index < LAIUE_NETWORK_MAX_PEERS; ++index)
+    {
+        ServerPlayer *player = &server->players[index];
+        if (!player->active)
+            continue;
         player->command.jumpPressed = false;
-        if (player->breaking
-            && now - player->lastBreakIntentAtMs
-                > SERVER_BREAK_INTENT_TIMEOUT_MS)
+        if (player->breaking &&
+            now - player->lastBreakIntentAtMs >
+                SERVER_BREAK_INTENT_TIMEOUT_MS)
             player->breaking = false;
     }
 
@@ -1063,6 +1656,11 @@ static void SimulateTick(DedicatedServer *server)
             break;
         }
     }
+
+    // Construct motion is a 60 Hz authoritative stream. Clients render from
+    // a short tick-indexed interpolation buffer, while topology remains on
+    // the bounded snapshot stream.
+    SendConstructMotionStates(server);
 
     if (server->tick % SERVER_TIME_SYNC_TICKS == 0)
     {
@@ -1148,10 +1746,6 @@ static uint32_t RunServer(void)
     }
     PlatformCreateDirectory(L"saves");
     PlatformCreateDirectory(L"saves\\default");
-    // Для локального split-runtime это тот же мир, который клиент уже
-    // загрузил до handshake. После подключения клиент больше его не пишет.
-    WorldLoadDeltas(world, g_serverWorldPath);
-
     server = PlatformAllocate(sizeof(*server), true);
     if (server == NULL)
     {
@@ -1160,12 +1754,33 @@ static uint32_t RunServer(void)
         goto teardown;
     }
     server->world = world;
+    server->constructs = PhysicalConstructSystemCreate(world, NULL);
+    if (server->constructs == NULL)
+    {
+        exitCode = 2U;
+        WriteServerStartupFailure(
+            L"out of memory creating physical constructs", 2U);
+        goto teardown;
+    }
+    // World edits and physical constructs are one authoritative persistence
+    // domain. The two-slot commit protocol never exposes half of an
+    // activation after a crash and retains the previous complete generation.
+    if (!PhysicalConstructPersistenceLoad(world, server->constructs,
+            g_serverWorldPath, g_serverConstructPath,
+            g_serverCommitPath))
+    {
+        exitCode = 2U;
+        WriteServerStartupFailure(
+            L"saves/default world state is invalid", 2U);
+        goto teardown;
+    }
     server->worldSeed = configuration->worldSeed;
     server->timeOfDayHours = 12.0f;
     ServerSnapshotWorkBudgetInitialize(
         &server->snapshotWorkBudget, server->tick);
-    server->collision.context = world;
+    server->collision.context = server;
     server->collision.queryBlockPhysics = QueryWorldBlockPhysics;
+    server->collision.queryDynamicColliders = QueryConstructColliders;
 
     ModsInit(&server->mods, L"server_enabled.txt");
     ModsRefresh(&server->mods);
@@ -1354,7 +1969,15 @@ static uint32_t RunServer(void)
     NetworkServerDestroy(network);
     LaiueContentBundleRelease(&server->downloadableContent);
     ModHostShutdown(&server->modHost);
-    WorldSaveDeltas(world, g_serverWorldPath);
+    bool stateSaved = PhysicalConstructPersistenceSave(
+        world, server->constructs, g_serverWorldPath,
+        g_serverConstructPath, g_serverCommitPath);
+    if (!stateSaved)
+    {
+        WriteServerMessage(
+            L"laiue dedicated server: save failed\r\n", 38U);
+    }
+    PhysicalConstructSystemDestroy(server->constructs);
     WorldDestroy(world);
     PlatformFree(server);
     PlatformFree(configuration);
@@ -1367,6 +1990,7 @@ teardown:
     {
         LaiueContentBundleRelease(&server->downloadableContent);
         ModHostShutdown(&server->modHost);
+        PhysicalConstructSystemDestroy(server->constructs);
     }
     PlatformFree(server);
     WorldDestroy(world);

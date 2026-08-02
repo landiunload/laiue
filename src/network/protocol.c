@@ -22,6 +22,11 @@
 #define CHUNK_RESYNC_PAYLOAD_SIZE 32U
 #define PEER_ID_PAYLOAD_SIZE 4U
 #define WORLD_TIME_PAYLOAD_SIZE 8U
+#define CONSTRUCT_RESET_PAYLOAD_SIZE 4U
+#define CONSTRUCT_BEGIN_PAYLOAD_SIZE 68U
+#define CONSTRUCT_BLOCKS_HEADER_SIZE 20U
+#define CONSTRUCT_BLOCK_RECORD_SIZE 11U
+#define CONSTRUCT_STATE_PAYLOAD_SIZE 80U
 
 #define ANGLE_PI 3.14159265358979323846f
 #define PITCH_LIMIT 1.57079632679489661923f
@@ -59,6 +64,45 @@
 #define PLAYER_STATE_FLAGS_OFFSET 116U
 
 #define SNAPSHOT_BEGIN_FLAGS_OFFSET 44U
+
+#define CONSTRUCT_BEGIN_ID_OFFSET 0U
+#define CONSTRUCT_BEGIN_REVISION_OFFSET 8U
+#define CONSTRUCT_BEGIN_ORIGIN_OFFSET 16U
+#define CONSTRUCT_BEGIN_VELOCITY_OFFSET 40U
+#define CONSTRUCT_BEGIN_BLOCK_COUNT_OFFSET 64U
+#define CONSTRUCT_BEGIN_RESERVED_OFFSET 66U
+
+#define CONSTRUCT_BLOCKS_ID_OFFSET 0U
+#define CONSTRUCT_BLOCKS_REVISION_OFFSET 8U
+#define CONSTRUCT_BLOCKS_FIRST_OFFSET 16U
+#define CONSTRUCT_BLOCKS_COUNT_OFFSET 18U
+#define CONSTRUCT_BLOCKS_RESERVED_OFFSET 19U
+
+#define CONSTRUCT_STATE_TICK_OFFSET 0U
+#define CONSTRUCT_STATE_RESERVED_OFFSET 4U
+#define CONSTRUCT_STATE_ID_OFFSET 8U
+#define CONSTRUCT_STATE_REVISION_OFFSET 16U
+#define CONSTRUCT_STATE_ORIGIN_OFFSET 24U
+#define CONSTRUCT_STATE_VELOCITY_OFFSET 48U
+#define CONSTRUCT_STATE_HELD_BY_OFFSET 72U
+
+#define CONSTRUCT_BLOCK_KIND_VOXEL 0U
+#define CONSTRUCT_BLOCK_KIND_LEVER 1U
+
+_Static_assert(LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES ==
+                   LAIUE_NETWORK_MAX_CONSTRUCT_BODIES,
+               "construct body limits must match public network ABI");
+_Static_assert(LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY ==
+                   LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BODY,
+               "construct block limits must match public network ABI");
+_Static_assert(LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH ==
+                   LAIUE_NETWORK_MAX_CONSTRUCT_BLOCKS_PER_BATCH,
+               "construct batch limits must match public network ABI");
+_Static_assert(CONSTRUCT_BLOCKS_HEADER_SIZE +
+                       LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH *
+                           CONSTRUCT_BLOCK_RECORD_SIZE <=
+                   LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE,
+               "construct block batch must fit one bounded control frame");
 
 static uint16_t ReadU16(const uint8_t *input)
 {
@@ -441,7 +485,8 @@ uint32_t LaiueProtocolEncodeInput(uint8_t *output, uint32_t capacity,
         (uint8_t)((input->jumpPressed ? 1U : 0U) |
                   (input->jumpHeld ? 2U : 0U) |
                   (input->sprintHeld ? 4U : 0U) |
-                  (input->crouchHeld ? 8U : 0U));
+                  (input->crouchHeld ? 8U : 0U) |
+                  (input->useHeld ? 16U : 0U));
     return INPUT_PAYLOAD_SIZE;
 }
 
@@ -449,7 +494,7 @@ bool LaiueProtocolDecodeInput(const uint8_t *payload, uint32_t size, LaiueProtoc
 {
     if (payload == NULL || outInput == NULL || size != INPUT_PAYLOAD_SIZE ||
         ReadU32(payload + INPUT_SEQUENCE_OFFSET) == 0 ||
-        (payload[INPUT_FLAGS_OFFSET] & 0xf0U) != 0)
+        (payload[INPUT_FLAGS_OFFSET] & 0xe0U) != 0)
     {
         return false;
     }
@@ -471,6 +516,7 @@ bool LaiueProtocolDecodeInput(const uint8_t *payload, uint32_t size, LaiueProtoc
     outInput->jumpHeld = (payload[INPUT_FLAGS_OFFSET] & 2U) != 0;
     outInput->sprintHeld = (payload[INPUT_FLAGS_OFFSET] & 4U) != 0;
     outInput->crouchHeld = (payload[INPUT_FLAGS_OFFSET] & 8U) != 0;
+    outInput->useHeld = (payload[INPUT_FLAGS_OFFSET] & 16U) != 0;
 
     float lengthSquared =
         outInput->movementX * outInput->movementX + outInput->movementY * outInput->movementY;
@@ -494,6 +540,7 @@ bool NetworkInputCanonicalize(
         .jumpHeld = input->jumpHeld,
         .sprintHeld = input->sprintHeld,
         .crouchHeld = input->crouchHeld,
+        .useHeld = input->useHeld,
     };
     uint8_t payload[INPUT_PAYLOAD_SIZE];
     uint32_t size =
@@ -513,6 +560,7 @@ bool NetworkInputCanonicalize(
     outInput->jumpHeld = canonical.jumpHeld;
     outInput->sprintHeld = canonical.sprintHeld;
     outInput->crouchHeld = canonical.crouchHeld;
+    outInput->useHeld = canonical.useHeld;
     return true;
 }
 
@@ -521,7 +569,8 @@ uint32_t LaiueProtocolEncodeEditIntent(uint8_t *output, uint32_t capacity, bool 
                                        const float direction[3])
 {
     if (output == NULL || capacity < EDIT_PAYLOAD_SIZE || breakBlock == placeBlock ||
-        (placeBlock && (placementBlock == 0U || placementBlock > 2U)) ||
+        (placeBlock && (placementBlock == 0U ||
+            placementBlock > LAIUE_PROTOCOL_MAX_INVENTORY_ITEM)) ||
         direction == NULL || !IsFiniteFloat(direction[0]) || !IsFiniteFloat(direction[1]) ||
         !IsFiniteFloat(direction[2]) || direction[0] < -1.0f || direction[0] > 1.0f ||
         direction[1] < -1.0f || direction[1] > 1.0f || direction[2] < -1.0f || direction[2] > 1.0f)
@@ -550,7 +599,8 @@ bool LaiueProtocolDecodeEditIntent(const uint8_t *payload, uint32_t size, bool *
         || outPlacementBlock == NULL || outDirection == NULL
         || size != EDIT_PAYLOAD_SIZE || (payload[0] != 1U && payload[0] != 2U)
         || (payload[0] == 1U && payload[7] != 0U)
-        || (payload[0] == 2U && (payload[7] == 0U || payload[7] > 2U)))
+        || (payload[0] == 2U && (payload[7] == 0U ||
+            payload[7] > LAIUE_PROTOCOL_MAX_INVENTORY_ITEM)))
     {
         return false;
     }
@@ -814,7 +864,8 @@ uint32_t LaiueProtocolEncodeInventory(uint8_t* output, uint32_t capacity,
         const LaiueProtocolInventorySlot* slot = &inventory->slots[i];
         if (slot->count > 64U
             || (slot->count == 0 && slot->item != 0)
-            || (slot->count != 0 && (slot->item == 0 || slot->item > 2)))
+            || (slot->count != 0 && (slot->item == 0 ||
+                slot->item > LAIUE_PROTOCOL_MAX_INVENTORY_ITEM)))
             return 0;
         output[1U + i * 3U] = slot->item;
         WriteU16(output + 2U + i * 3U, slot->count);
@@ -833,7 +884,8 @@ bool LaiueProtocolDecodeInventory(const uint8_t* payload, uint32_t size,
         uint8_t item = payload[1U + i * 3U];
         uint16_t count = ReadU16(payload + 2U + i * 3U);
         if (count > 64U || (count == 0 && item != 0)
-            || (count != 0 && (item == 0 || item > 2))) return false;
+            || (count != 0 && (item == 0 ||
+                item > LAIUE_PROTOCOL_MAX_INVENTORY_ITEM))) return false;
         outInventory->slots[i].item = item;
         outInventory->slots[i].count = count;
     }
@@ -1146,5 +1198,351 @@ bool LaiueProtocolDecodeWorldTime(
         return false;
     }
     *outWorldTime = ReadU64(payload);
+    return true;
+}
+
+static bool ConstructVectorsAreValid(
+    const double origin[3], const double velocity[3])
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (!IsFinitePosition(origin[axis]) ||
+            !IsFiniteBoundedDouble(velocity[axis],
+                -DYNAMIC_VELOCITY_LIMIT, DYNAMIC_VELOCITY_LIMIT))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ConstructMountIsZero(const int8_t mountNormal[3])
+{
+    return mountNormal[0] == 0 && mountNormal[1] == 0 &&
+           mountNormal[2] == 0;
+}
+
+static bool ConstructMountIsUnitAxis(const int8_t mountNormal[3])
+{
+    uint32_t nonzero = 0U;
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (mountNormal[axis] < -1 || mountNormal[axis] > 1)
+        {
+            return false;
+        }
+        if (mountNormal[axis] != 0)
+        {
+            ++nonzero;
+        }
+    }
+    return nonzero == 1U;
+}
+
+static bool ConstructBlockIsValid(
+    const LaiueProtocolConstructBlock *block)
+{
+    if (block->kind == CONSTRUCT_BLOCK_KIND_VOXEL)
+    {
+        return block->material >= 1U && block->material <= 2U &&
+               ConstructMountIsZero(block->mountNormal);
+    }
+    if (block->kind == CONSTRUCT_BLOCK_KIND_LEVER)
+    {
+        return block->material == 0U && block->local[0] == 0 &&
+               block->local[1] == 0 && block->local[2] == 0 &&
+               ConstructMountIsUnitAxis(block->mountNormal);
+    }
+    return false;
+}
+
+static bool ConstructBlockLess(
+    const LaiueProtocolConstructBlock *left,
+    const LaiueProtocolConstructBlock *right)
+{
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->local[axis] != right->local[axis])
+        {
+            return left->local[axis] < right->local[axis];
+        }
+    }
+    if (left->kind != right->kind)
+    {
+        return left->kind < right->kind;
+    }
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (left->mountNormal[axis] != right->mountNormal[axis])
+        {
+            return left->mountNormal[axis] < right->mountNormal[axis];
+        }
+    }
+    return left->material < right->material;
+}
+
+static bool ConstructBlocksAreCanonical(
+    const LaiueProtocolConstructBlock *blocks, uint32_t count)
+{
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (!ConstructBlockIsValid(&blocks[index]) || (index != 0U &&
+             !ConstructBlockLess(&blocks[index - 1U], &blocks[index])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeConstructReset(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructReset *reset)
+{
+    if (output == NULL || reset == NULL ||
+        capacity < CONSTRUCT_RESET_PAYLOAD_SIZE ||
+        reset->bodyCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES)
+    {
+        return 0;
+    }
+    WriteU16(output, reset->bodyCount);
+    WriteU16(output + 2U, 0U);
+    return CONSTRUCT_RESET_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeConstructReset(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructReset *outReset)
+{
+    if (payload == NULL || outReset == NULL ||
+        size != CONSTRUCT_RESET_PAYLOAD_SIZE ||
+        ReadU16(payload + 2U) != 0U)
+    {
+        return false;
+    }
+    uint16_t bodyCount = ReadU16(payload);
+    if (bodyCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BODIES)
+    {
+        return false;
+    }
+    outReset->bodyCount = bodyCount;
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeConstructBegin(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructBody *body)
+{
+    if (output == NULL || body == NULL ||
+        capacity < CONSTRUCT_BEGIN_PAYLOAD_SIZE || body->id == 0U ||
+        body->revision == 0U || body->blockCount == 0U ||
+        body->blockCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY ||
+        !ConstructVectorsAreValid(body->origin, body->velocity))
+    {
+        return 0;
+    }
+
+    WriteU64(output + CONSTRUCT_BEGIN_ID_OFFSET, body->id);
+    WriteU64(output + CONSTRUCT_BEGIN_REVISION_OFFSET, body->revision);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        WriteDouble(output + CONSTRUCT_BEGIN_ORIGIN_OFFSET + axis * 8U,
+            body->origin[axis]);
+        WriteDouble(output + CONSTRUCT_BEGIN_VELOCITY_OFFSET + axis * 8U,
+            body->velocity[axis]);
+    }
+    WriteU16(output + CONSTRUCT_BEGIN_BLOCK_COUNT_OFFSET, body->blockCount);
+    WriteU16(output + CONSTRUCT_BEGIN_RESERVED_OFFSET, 0U);
+    return CONSTRUCT_BEGIN_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeConstructBegin(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructBody *outBody)
+{
+    if (payload == NULL || outBody == NULL ||
+        size != CONSTRUCT_BEGIN_PAYLOAD_SIZE ||
+        ReadU16(payload + CONSTRUCT_BEGIN_RESERVED_OFFSET) != 0U)
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructBody decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    decoded.id = ReadU64(payload + CONSTRUCT_BEGIN_ID_OFFSET);
+    decoded.revision = ReadU64(payload + CONSTRUCT_BEGIN_REVISION_OFFSET);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        decoded.origin[axis] = ReadDouble(
+            payload + CONSTRUCT_BEGIN_ORIGIN_OFFSET + axis * 8U);
+        decoded.velocity[axis] = ReadDouble(
+            payload + CONSTRUCT_BEGIN_VELOCITY_OFFSET + axis * 8U);
+    }
+    decoded.blockCount = ReadU16(payload + CONSTRUCT_BEGIN_BLOCK_COUNT_OFFSET);
+    if (decoded.id == 0U || decoded.revision == 0U ||
+        decoded.blockCount == 0U ||
+        decoded.blockCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY ||
+        !ConstructVectorsAreValid(decoded.origin, decoded.velocity))
+    {
+        return false;
+    }
+    *outBody = decoded;
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeConstructBlocks(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructBlockBatch *batch)
+{
+    if (output == NULL || batch == NULL || batch->id == 0U ||
+        batch->revision == 0U || batch->blockCount == 0U ||
+        batch->blockCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH ||
+        (uint32_t)batch->firstBlock + batch->blockCount >
+            LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY ||
+        !ConstructBlocksAreCanonical(batch->blocks, batch->blockCount))
+    {
+        return 0;
+    }
+    uint32_t size = CONSTRUCT_BLOCKS_HEADER_SIZE +
+                    (uint32_t)batch->blockCount * CONSTRUCT_BLOCK_RECORD_SIZE;
+    if (capacity < size || size > LAIUE_PROTOCOL_MAX_PAYLOAD_SIZE)
+    {
+        return 0;
+    }
+
+    WriteU64(output + CONSTRUCT_BLOCKS_ID_OFFSET, batch->id);
+    WriteU64(output + CONSTRUCT_BLOCKS_REVISION_OFFSET, batch->revision);
+    WriteU16(output + CONSTRUCT_BLOCKS_FIRST_OFFSET, batch->firstBlock);
+    output[CONSTRUCT_BLOCKS_COUNT_OFFSET] = (uint8_t)batch->blockCount;
+    output[CONSTRUCT_BLOCKS_RESERVED_OFFSET] = 0U;
+    for (uint32_t index = 0; index < batch->blockCount; ++index)
+    {
+        uint8_t *record = output + CONSTRUCT_BLOCKS_HEADER_SIZE +
+                          index * CONSTRUCT_BLOCK_RECORD_SIZE;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            WriteU16(record + axis * 2U,
+                (uint16_t)batch->blocks[index].local[axis]);
+        }
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            record[6U + axis] =
+                (uint8_t)batch->blocks[index].mountNormal[axis];
+        }
+        record[9] = batch->blocks[index].material;
+        record[10] = batch->blocks[index].kind;
+    }
+    return size;
+}
+
+bool LaiueProtocolDecodeConstructBlocks(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructBlockBatch *outBatch)
+{
+    if (payload == NULL || outBatch == NULL ||
+        size < CONSTRUCT_BLOCKS_HEADER_SIZE ||
+        payload[CONSTRUCT_BLOCKS_RESERVED_OFFSET] != 0U)
+    {
+        return false;
+    }
+    uint32_t blockCount = payload[CONSTRUCT_BLOCKS_COUNT_OFFSET];
+    uint32_t expectedSize = CONSTRUCT_BLOCKS_HEADER_SIZE +
+                            blockCount * CONSTRUCT_BLOCK_RECORD_SIZE;
+    uint32_t firstBlock = ReadU16(payload + CONSTRUCT_BLOCKS_FIRST_OFFSET);
+    if (blockCount == 0U ||
+        blockCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BATCH ||
+        firstBlock + blockCount > LAIUE_PROTOCOL_MAX_CONSTRUCT_BLOCKS_PER_BODY ||
+        size != expectedSize)
+    {
+        return false;
+    }
+
+    LaiueProtocolConstructBlockBatch decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    decoded.id = ReadU64(payload + CONSTRUCT_BLOCKS_ID_OFFSET);
+    decoded.revision = ReadU64(payload + CONSTRUCT_BLOCKS_REVISION_OFFSET);
+    decoded.firstBlock = (uint16_t)firstBlock;
+    decoded.blockCount = (uint16_t)blockCount;
+    for (uint32_t index = 0; index < blockCount; ++index)
+    {
+        const uint8_t *record = payload + CONSTRUCT_BLOCKS_HEADER_SIZE +
+                                index * CONSTRUCT_BLOCK_RECORD_SIZE;
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            decoded.blocks[index].local[axis] =
+                (int16_t)ReadU16(record + axis * 2U);
+        }
+        for (uint32_t axis = 0; axis < 3U; ++axis)
+        {
+            decoded.blocks[index].mountNormal[axis] =
+                (int8_t)record[6U + axis];
+        }
+        decoded.blocks[index].material = record[9];
+        decoded.blocks[index].kind = record[10];
+    }
+    if (decoded.id == 0U || decoded.revision == 0U ||
+        !ConstructBlocksAreCanonical(decoded.blocks, blockCount))
+    {
+        return false;
+    }
+    *outBatch = decoded;
+    return true;
+}
+
+uint32_t LaiueProtocolEncodeConstructState(
+    uint8_t *output, uint32_t capacity,
+    const LaiueProtocolConstructState *state)
+{
+    if (output == NULL || state == NULL ||
+        capacity < CONSTRUCT_STATE_PAYLOAD_SIZE || state->id == 0U ||
+        state->revision == 0U ||
+        !ConstructVectorsAreValid(state->origin, state->velocity))
+    {
+        return 0;
+    }
+    WriteU32(output + CONSTRUCT_STATE_TICK_OFFSET, state->serverTick);
+    WriteU32(output + CONSTRUCT_STATE_RESERVED_OFFSET, 0U);
+    WriteU64(output + CONSTRUCT_STATE_ID_OFFSET, state->id);
+    WriteU64(output + CONSTRUCT_STATE_REVISION_OFFSET, state->revision);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        WriteDouble(output + CONSTRUCT_STATE_ORIGIN_OFFSET + axis * 8U,
+            state->origin[axis]);
+        WriteDouble(output + CONSTRUCT_STATE_VELOCITY_OFFSET + axis * 8U,
+            state->velocity[axis]);
+    }
+    WriteU64(output + CONSTRUCT_STATE_HELD_BY_OFFSET, state->heldBy);
+    return CONSTRUCT_STATE_PAYLOAD_SIZE;
+}
+
+bool LaiueProtocolDecodeConstructState(
+    const uint8_t *payload, uint32_t size,
+    LaiueProtocolConstructState *outState)
+{
+    if (payload == NULL || outState == NULL ||
+        size != CONSTRUCT_STATE_PAYLOAD_SIZE ||
+        ReadU32(payload + CONSTRUCT_STATE_RESERVED_OFFSET) != 0U)
+    {
+        return false;
+    }
+    LaiueProtocolConstructState decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    decoded.serverTick = ReadU32(payload + CONSTRUCT_STATE_TICK_OFFSET);
+    decoded.id = ReadU64(payload + CONSTRUCT_STATE_ID_OFFSET);
+    decoded.revision = ReadU64(payload + CONSTRUCT_STATE_REVISION_OFFSET);
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        decoded.origin[axis] = ReadDouble(
+            payload + CONSTRUCT_STATE_ORIGIN_OFFSET + axis * 8U);
+        decoded.velocity[axis] = ReadDouble(
+            payload + CONSTRUCT_STATE_VELOCITY_OFFSET + axis * 8U);
+    }
+    decoded.heldBy = ReadU64(payload + CONSTRUCT_STATE_HELD_BY_OFFSET);
+    if (decoded.id == 0U || decoded.revision == 0U ||
+        !ConstructVectorsAreValid(decoded.origin, decoded.velocity))
+    {
+        return false;
+    }
+    *outState = decoded;
     return true;
 }

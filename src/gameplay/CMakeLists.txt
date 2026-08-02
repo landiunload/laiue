@@ -15,6 +15,8 @@ laiue_add_module(gameplay
         game_events.h
         inventory.c
         inventory.h
+        view_direction.c
+        view_direction.h
         ../game/camera.h
         ../api.h
     LINK
@@ -33,4 +35,5 @@ set_source_files_properties(
     player_locomotion.c
     player_stance.c
     player_jump.c
+    view_direction.c
     PROPERTIES COMPILE_OPTIONS "${LAIUE_DETERMINISTIC_FP_OPTIONS}")

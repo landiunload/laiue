@@ -4,10 +4,10 @@
 
 - `laiue_server.exe`/`laiue_server` — отдельный headless server для
   Windows и Linux;
-- production transport — MsQuic/UDP с TLS 1.3 и ALPN `laiue/5`;
+- production transport — MsQuic/UDP с TLS 1.3 и ALPN `laiue/6`;
 - IPv4 и IPv6 можно слушать вместе либо выбрать одно семейство;
-- сервер считает физику с частотой 60 Гц и отправляет состояние с частотой
-  20 Гц;
+- сервер считает физику с частотой 60 Гц, отправляет состояние игрока с
+  частотой 20 Гц, а движущихся конструкций — 60 Гц;
 - клиент отправляет намерения, предсказывает своё движение и выполняет
   reconciliation;
 - сервер владеет блоками, revisions чанков, инвентарём, дропами и подбором
@@ -20,7 +20,7 @@
 `NEGOTIATING`, `SYNCING_WORLD`, `READY`. Gameplay input принимается только в
 `READY`: сначала завершается TLS 1-RTT, затем сравниваются моды и передаются
 seed, snapshot изменённых чанков, world time, inventory, drops и player
-roster.
+roster, а также полная topology физических конструкций.
 
 ## Запуск
 
@@ -98,6 +98,18 @@ manifest v2 и все объявленные Windows/glibc/musl binaries.
 chunk-resync snapshots применяются без выхода из `READY`, поэтому input и
 60 Гц prediction не останавливаются при переходе между чанками.
 
+Обычный interest/chunk resync не очищает и не пересылает глобальную topology
+конструкций. Установка, разрушение или split создают отдельный topology-only
+snapshot. Активация рычага одновременно удаляет захваченные voxels из
+`World`, поэтому для неё live snapshot содержит и финальные chunk deltas, и
+topology: удалённый клиент не оставляет статическую копию блоков под новым
+телом. Клиент собирает topology во втором bounded physical
+system и заменяет активную collision-копию только на `SNAPSHOT_END`, поэтому
+live gameplay не видит пустое или частично собранное тело. Motion state из
+control stream сопоставляется по body ID, topology revision и wrap-safe
+`serverTick`; допустимая межпоточная перестановка буферизуется, устаревшая
+pose игнорируется.
+
 Roster синхронизируется событиями player joined/left. Собственное полное
 player state подтверждает последний обработанный input sequence и запускает
 restore/replay, а состояния удалённых игроков интерполируются по
@@ -139,6 +151,7 @@ SHA-256 подтверждает целостность полученного �
 | движение | 60 Гц, 4 substep; клиент присылает канонический intent с sequence |
 | ломание/установка | серверный raycast, дистанция, таймер, выбранный слот |
 | инвентарь и дропы | сервер; bounded снимок 36 слотов |
+| физические конструкции | сервер; topology snapshot и 60 Гц motion state |
 | моды | точный fingerprint; world mutation только через server callback |
 | wire-поток | magic, version, exact size, sequence, state и rate limits |
 

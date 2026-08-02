@@ -4,6 +4,7 @@
 #include "game/camera.h"
 #include "gameplay/game_mode.h"
 #include "gameplay/inventory.h"
+#include "construct/physical_construct.h"
 #include "world/world.h"
 
 #include <stdbool.h>
@@ -14,7 +15,8 @@
 // Текущий слот находится в saves/<имя> рядом с исполняемым файлом.
 //
 //   world.meta  — текст: версия формата, seed, время суток, версия игры
-//   chunks.dat  — правки мира (пишет и читает модуль world)
+//   chunks.dat.{0,1} / constructs.dat.{0,1} — два поколения общей пары
+//   state.commit.{0,1} — атомарные commit records с generation и SHA-256
 //   player.dat  — позиция, взгляд и режим игрока
 //   inventory.dat — 36 фиксированных слотов и выбранная ячейка хотбара
 //   mods.lock   — включённые моды и их версии на момент сохранения
@@ -48,10 +50,14 @@ bool SaveGameReadMeta(int64_t* outSeed, int32_t* outTimeMinutes);
 
 bool SaveGameWriteAll(World* world, const Camera* camera,
     GameMode gameMode, float timeOfDayHours, int64_t seed,
-    const ModsState* mods, const Inventory* inventory);
+    const ModsState* mods, const Inventory* inventory,
+    const PhysicalConstructSystem* constructs);
 
-// Вызывать на свежесозданном мире до запуска стриминга чанков.
-bool SaveGameLoadWorld(World* world);
+// Вызывать на свежесозданной паре до запуска стриминга чанков. При повреждении
+// последнего поколения загружается предыдущая целая пара. Legacy saves may
+// omit either unsuffixed file; an existing malformed file remains an error.
+bool SaveGameLoadWorldState(
+    World* world, PhysicalConstructSystem* constructs);
 bool SaveGameLoadPlayer(Camera* camera, GameMode* outGameMode);
 bool SaveGameLoadInventory(Inventory* inventory);
 

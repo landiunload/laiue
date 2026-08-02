@@ -20,38 +20,71 @@ typedef struct VoxelBlockPhysics
     float friction;
 } VoxelBlockPhysics;
 
-// Callback обязан при каждом вызове полностью записать flags и friction.
-// Все функции collision API требуют ненулевые source, callback и выходные
-// указатели; context может быть NULL, если конкретному source он не нужен.
+typedef struct VoxelBodyBounds
+{
+    double minimum[3];
+    double maximum[3];
+} VoxelBodyBounds;
+
+enum
+{
+    VOXEL_DYNAMIC_COLLIDER_CAPACITY = 32u,
+};
+
+// Точный внешний коллайдер, не привязанный к целочисленной сетке мира.
+// stableId обязан быть ненулевым и уникальным внутри одной полной выборки;
+// эквивалентные полные выборки обязаны сохранять те же ID.
+typedef struct VoxelDynamicCollider
+{
+    VoxelBodyBounds bounds;
+    double velocity[3];
+    float friction;
+    uint64_t stableId;
+} VoxelDynamicCollider;
+
+// Callback обязан при каждом вызове полностью записать flags и friction и
+// быть read-only для одного simulation snapshot: collision API может вызвать
+// его несколько раз. Все функции требуют ненулевые source, callback и
+// выходные указатели; context может быть NULL, если source он не нужен.
 typedef void (*VoxelBlockPhysicsQuery)(
     void* context, int64_t x, int64_t y, int64_t z,
     VoxelBlockPhysics* outBlock);
+
+// Не больше одного bounded broadphase-запроса на одну collision-операцию.
+// Controller может выполнить несколько таких операций за fixed step, поэтому
+// callback обязан быть read-only для одного simulation snapshot. Он записывает
+// не больше colliderCapacity элементов и их точное число. true означает, что
+// выборка полна; false означает truncation/error и обрабатывается fail-closed.
+typedef bool (*VoxelDynamicColliderQuery)(
+    void* context, const VoxelBodyBounds* queryBounds,
+    VoxelDynamicCollider* outColliders, uint32_t colliderCapacity,
+    uint32_t* outColliderCount);
 
 typedef struct VoxelCollisionSource
 {
     void* context;
     VoxelBlockPhysicsQuery queryBlockPhysics;
+    VoxelDynamicColliderQuery queryDynamicColliders;
 } VoxelCollisionSource;
 
 typedef struct VoxelGroundContact
 {
     float friction;
     bool supported;
+    // Нулевая скорость и stableId == 0 обозначают статическую опору.
+    double surfaceVelocity[3];
+    uint64_t surfaceStableId;
 } VoxelGroundContact;
 
 typedef struct VoxelBodyShape
 {
+    // Все значения конечны; radius > collisionEpsilon,
+    // height > 2 * collisionEpsilon, eyeHeight лежит в [0, height].
     double radius;
     double height;
     double eyeHeight;
     double collisionEpsilon;
 } VoxelBodyShape;
-
-typedef struct VoxelBodyBounds
-{
-    double minimum[3];
-    double maximum[3];
-} VoxelBodyBounds;
 
 LAIUE_PHYSICS_API void VoxelBodyCalculateBounds(
     const double position[3], const VoxelBodyShape* shape,
@@ -61,7 +94,9 @@ LAIUE_PHYSICS_API bool VoxelBodyCollides(
     const VoxelCollisionSource* collision,
     const double position[3], const VoxelBodyShape* shape);
 
-// Двигает тело по одной оси и возвращает true при столкновении.
+// Двигает тело по одной оси и возвращает true при столкновении. Неконечные,
+// выходящие за simulation range значения и неверная ось fail-closed без
+// изменения position и без вызова broadphase callback.
 LAIUE_PHYSICS_API bool VoxelBodyMoveAxis(
     const VoxelCollisionSource* collision,
     double position[3], const VoxelBodyShape* shape,

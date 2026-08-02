@@ -10,6 +10,7 @@
 | `input` | Raw Input клавиатуры и мыши |
 | `audio` | потоковое локальное/HTTP(S)-аудио, transport, громкость и события |
 | `world` | генерация, чанки, дельты, свойства блоков и сохранение `chunks.dat` |
+| `construct` | физические блочные тела, topology/split, точные colliders и `constructs.dat` |
 | `mesher` | greedy meshing: `World` → упакованные квады |
 | `render` | D3D12, GPU-меши, шейдеры, текстуры, panorama и UI pass |
 | `physics` | AABB и столкновения без зависимости от `World` |
@@ -17,7 +18,7 @@
 | `interaction` | raycast и проверяемая команда правки блока |
 | `content` | каталог форматов и безопасный сетевой bundle |
 | `mod` | профили модов, DLL/SO-host, стороны и межмодовые интерфейсы |
-| `network` | protocol v5, bounded queues и QUIC/TLS transport |
+| `network` | protocol v6, bounded queues и QUIC/TLS transport |
 | `core` | клиентский composition root, UI, streaming, сохранения и эффекты |
 | `server` | headless authoritative composition root |
 
@@ -27,7 +28,7 @@
 ## Направление зависимостей
 
 `laiue::headless_stack` ровно один раз компонует `network`, `content`, `mod`,
-`world`, `physics`, `gameplay` и `interaction`. И `core`, и сервер линкуют
+`world`, `construct`, `physics`, `gameplay` и `interaction`. И `core`, и сервер линкуют
 эту общую цель; production sources не перекомпилируются отдельной копией.
 Сервер не зависит от `core`, `window`, `input`, `audio`, `render` или
 `mesher`.
@@ -75,6 +76,7 @@ laiue. Иначе добавляется внутренний `.c/.h` сущес
 | `ModsState`, `ModHost` | `ApplicationState` | только main |
 | `NetworkClient` | `ApplicationState` | main + MsQuic callbacks, которые только ставят bounded events |
 | server world, players, inventory, drops | `DedicatedServer` | server main, fixed tick 60 Гц |
+| `PhysicalConstructSystem` | client/server composition root | main thread, 60 Гц tick × 4 physics substep |
 
 Workers читают `World` и строят CPU-меши, но не вызывают renderer, UI или
 моды. Мутации мира выполняются main thread. Нативные моды получают API и

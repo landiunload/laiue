@@ -4,6 +4,7 @@
 #include <string.h>
 
 static uint32_t worldSnapshotChecks;
+static WorldBlockRange g_boundedRanges[WORLD_MAX_BOUNDED_BLOCK_RANGES];
 
 static void SnapshotExpect(bool condition, const char* name)
 {
@@ -151,6 +152,132 @@ LAIUE_TEST_ENTRY(WorldSnapshotTestEntryPoint)
         && WorldGetBlock(client,
             blockB[0], blockB[1], blockB[2]) == generatedB,
         "snapshot R откатил уже применённую delta R+1");
+
+    const int64_t batchA[3] = { 11, 13, 160 };
+    const int64_t batchB[3] = { CHUNK_SIZE + 11, 13, 160 };
+    BlockType batchGeneratedA = WorldGetBlock(server,
+        batchA[0], batchA[1], batchA[2]);
+    BlockType batchGeneratedB = WorldGetBlock(server,
+        batchB[0], batchB[1], batchB[2]);
+    WorldBlockMutation batch[2] = {
+        {
+            .block = { batchA[0], batchA[1], batchA[2] },
+            .expected = batchGeneratedA,
+            .replacement = BLOCK_EARTH,
+        },
+        {
+            .block = { batchB[0], batchB[1], batchB[2] },
+            .expected = batchGeneratedB,
+            .replacement = BLOCK_GRASS,
+        },
+    };
+    uint64_t beforeBatchRevision = WorldGetRevision(server);
+    SnapshotExpect(WorldApplyBlockBatch(server, batch, 2U)
+        && WorldGetRevision(server) == beforeBatchRevision + 2U
+        && WorldGetBlock(server, batchA[0], batchA[1], batchA[2])
+            == BLOCK_EARTH
+        && WorldGetBlock(server, batchB[0], batchB[1], batchB[2])
+            == BLOCK_GRASS
+        && WorldIsBlockEdited(
+            server, batchA[0], batchA[1], batchA[2])
+        && WorldIsBlockEdited(
+            server, batchB[0], batchB[1], batchB[2]),
+        "atomic batch не опубликовал все правки");
+    WorldBlockState blockState;
+    SnapshotExpect(WorldGetBlockState(server,
+            batchA[0], batchA[1], batchA[2], &blockState)
+        && blockState.edited && blockState.block == BLOCK_EARTH,
+        "атомарный per-cell material/provenance query неверен");
+    const int64_t solidMinimum[3] = {
+        batchA[0], batchA[1], batchA[2]
+    };
+    const int64_t solidMaximum[3] = {
+        batchA[0] + 1, batchA[1], batchA[2]
+    };
+    SnapshotExpect(WorldAnySolidBlockInRange(
+            server, solidMinimum, solidMaximum),
+        "bounded world occupancy не нашёл solid block");
+    const int64_t oversizedMaximum[3] = {
+        batchA[0] + WORLD_MAX_BOUNDED_BLOCK_QUERY_CELLS,
+        batchA[1], batchA[2]
+    };
+    SnapshotExpect(!WorldAnySolidBlockInRange(
+            server, solidMinimum, oversizedMaximum),
+        "oversized fixed-tick world occupancy query принят");
+    for (uint32_t index = 0U;
+         index < WORLD_MAX_BOUNDED_BLOCK_RANGES; ++index)
+    {
+        g_boundedRanges[index] = (WorldBlockRange){
+            .minimum = { 100000, 100000, 100000 },
+            .maximum = { 100000, 100000, 100000 },
+        };
+    }
+    bool anySolid = true;
+    SnapshotExpect(WorldAnySolidBlockInRanges(server, g_boundedRanges,
+            WORLD_MAX_BOUNDED_BLOCK_RANGES, &anySolid) && !anySolid,
+        "maximum bounded world range batch rejected");
+    anySolid = true;
+    SnapshotExpect(!WorldAnySolidBlockInRanges(server, g_boundedRanges,
+            WORLD_MAX_BOUNDED_BLOCK_RANGES + 1U, &anySolid) && !anySolid,
+        "oversized world range batch accepted or left stale output");
+    g_boundedRanges[0] = (WorldBlockRange){
+        .minimum = { batchA[0], batchA[1], batchA[2] },
+        .maximum = { batchA[0], batchA[1], batchA[2] },
+    };
+    SnapshotExpect(WorldAnySolidBlockInRanges(
+            server, g_boundedRanges, 1U, &anySolid) && anySolid,
+        "batched world occupancy missed a solid block");
+
+    const BlockType invalidBlock = (BlockType)(BLOCK_GRASS + 1U);
+    beforeBatchRevision = WorldGetRevision(server);
+    SnapshotExpect(!WorldTrySetBlock(server,
+            batchA[0], batchA[1], batchA[2], invalidBlock)
+        && WorldGetRevision(server) == beforeBatchRevision
+        && WorldGetBlock(server, batchA[0], batchA[1], batchA[2])
+            == BLOCK_EARTH,
+        "invalid single mutation changed world or revision");
+    WorldBlockMutation invalidMutation = {
+        .block = { batchA[0], batchA[1], batchA[2] },
+        .expected = invalidBlock,
+        .replacement = BLOCK_AIR,
+    };
+    SnapshotExpect(!WorldApplyBlockBatch(server, &invalidMutation, 1U)
+        && WorldGetRevision(server) == beforeBatchRevision
+        && WorldGetBlock(server, batchA[0], batchA[1], batchA[2])
+            == BLOCK_EARTH,
+        "invalid expected material changed world or revision");
+    invalidMutation.expected = BLOCK_EARTH;
+    invalidMutation.replacement = invalidBlock;
+    SnapshotExpect(!WorldApplyBlockBatch(server, &invalidMutation, 1U)
+        && WorldGetRevision(server) == beforeBatchRevision
+        && WorldGetBlock(server, batchA[0], batchA[1], batchA[2])
+            == BLOCK_EARTH,
+        "invalid replacement material changed world or revision");
+
+    WorldBlockMutation rejected[2] = {
+        {
+            .block = { batchA[0], batchA[1], batchA[2] },
+            .expected = BLOCK_GRASS,
+            .replacement = BLOCK_AIR,
+        },
+        {
+            .block = { batchB[0], batchB[1], batchB[2] },
+            .expected = BLOCK_GRASS,
+            .replacement = BLOCK_AIR,
+        },
+    };
+    beforeBatchRevision = WorldGetRevision(server);
+    SnapshotExpect(!WorldApplyBlockBatch(server, rejected, 2U)
+        && WorldGetRevision(server) == beforeBatchRevision
+        && WorldGetBlock(server, batchA[0], batchA[1], batchA[2])
+            == BLOCK_EARTH
+        && WorldGetBlock(server, batchB[0], batchB[1], batchB[2])
+            == BLOCK_GRASS,
+        "отклонённый batch частично изменил мир");
+    rejected[0] = batch[0];
+    rejected[1] = batch[0];
+    SnapshotExpect(!WorldApplyBlockBatch(server, rejected, 2U),
+        "batch с повторной координатой принят");
 
     WorldDestroy(client);
     WorldDestroy(server);

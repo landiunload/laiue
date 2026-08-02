@@ -71,6 +71,7 @@ add_subdirectory(src/platform)
 # Ровно этот набор является общим headless runtime для client и server.
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
+add_subdirectory(src/construct)
 add_subdirectory(src/gameplay)
 add_subdirectory(src/interaction)
 add_subdirectory(src/content)
