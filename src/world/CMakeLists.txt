@@ -1,11 +1,7 @@
 laiue_add_module(world
-    RUNTIME_ROLE HEADLESS
+    RUNTIME_ROLE CORE
     SOURCES
         world_infinite.c
-        block_properties.c
-        block_properties.h
-        terrain_noise.c
-        terrain_noise.h
         infinite_coord.c
         infinite_coord.h
         world.h

@@ -38,7 +38,8 @@
 // Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl,
 // float3 выравниваются по границам 16 байт):
 // dword 0..15 — view-projection, 16..18 — смещение чанка,
-// 20..22 — направление от солнца, 24..26 — цвет солнца, 28..30 — ambient.
+// 20..22 — направление от солнца, 23 — число слоёв материалов,
+// 24..26 — цвет солнца, 28..30 — ambient.
 #define ROOT_CONSTANT_COUNT 32
 #define ROOT_CONSTANT_ORIGIN_OFFSET 16
 #define ROOT_CONSTANT_LIGHTING_OFFSET 20
@@ -48,7 +49,7 @@
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
 #define ROOT_PARAMETER_INSTANCES 3
 
-#define MAX_TEXTURE_SUBRESOURCES 48
+#define MAX_TEXTURE_SUBRESOURCES TEXTURE_PACK_MAX_SUBRESOURCES
 
 // Пул геометрии: меши суб-аллоцируются из больших DEFAULT-буферов —
 // без 64-КиБ выравнивания на каждый меш и без чтения через PCIe.
@@ -60,10 +61,8 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
-// One frame can contain up to six panorama scene passes.  Physical
-// constructs alone may contribute 4096 instances per pass, with players and
-// block effects appended afterwards.  Keep the upload arena large enough for
-// that documented worst case so later passes cannot silently lose draws.
+// One frame can contain up to six scene passes with thousands of instances.
+// Keep enough upload space so later passes cannot silently lose caller draws.
 #define INSTANCE_BYTES_PER_FRAME (512u * 1024u)
 
 typedef struct FreeRange
@@ -143,6 +142,7 @@ struct Renderer
     ID3D12DescriptorHeap*      srvHeap;
     UINT                       srvDescriptorSize;
     bool                       blockTextureUploadPending;
+    uint32_t                   blockTextureLayerCount;
 
     // Панорама: кубмапа сцены (грани в пространстве вида) + резолв.
     ID3D12Resource*            cubeColor;
@@ -615,7 +615,13 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
         return false;
     }
 
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts = HeapAlloc(
+        GetProcessHeap(), 0,
+        (SIZE_T)subresourceCount * sizeof(*layouts));
+    if (layouts == NULL)
+    {
+        return false;
+    }
     UINT64 uploadBytes = 0;
     ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
         0, subresourceCount, 0, layouts, NULL, NULL, &uploadBytes);
@@ -635,6 +641,7 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
         D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
         NULL, &IID_ID3D12Resource, (void**)outUpload)))
     {
+        HeapFree(GetProcessHeap(), 0, layouts);
         return false;
     }
 
@@ -642,6 +649,7 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
     unsigned char* mapped = NULL;
     if (FAILED(ID3D12Resource_Map(*outUpload, 0, &emptyRange, (void**)&mapped)))
     {
+        HeapFree(GetProcessHeap(), 0, layouts);
         return false;
     }
 
@@ -654,6 +662,7 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
             if (!getSubresource(pack, layer, mip, &subresource))
             {
                 ID3D12Resource_Unmap(*outUpload, 0, NULL);
+                HeapFree(GetProcessHeap(), 0, layouts);
                 return false;
             }
             unsigned char* destination = mapped + layouts[index].Offset;
@@ -666,6 +675,7 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
         }
     }
     ID3D12Resource_Unmap(*outUpload, 0, NULL);
+    HeapFree(GetProcessHeap(), 0, layouts);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
     memset(&viewDescription, 0, sizeof(viewDescription));
@@ -717,18 +727,21 @@ static bool CreateBlockTexture(Renderer* renderer)
     {
         // Пак без нормалей (LTP1): плоская нормаль 1x1 на каждый слой,
         // AO = 1 — освещение вырождается в чистый ламберт по граням.
-        static const uint8_t flatNormalPixels[TEXTURE_PACK_LAYER_COUNT * 4] = {
-            128, 128, 255, 255,
-            128, 128, 255, 255,
-            128, 128, 255, 255,
-        };
+        uint8_t flatNormalPixels[TEXTURE_PACK_MAX_LAYERS * 4u];
+        for (uint32_t layer = 0; layer < pack.layerCount; ++layer)
+        {
+            flatNormalPixels[layer * 4u + 0u] = 128;
+            flatNormalPixels[layer * 4u + 1u] = 128;
+            flatNormalPixels[layer * 4u + 2u] = 255;
+            flatNormalPixels[layer * 4u + 3u] = 255;
+        }
         TexturePackData flat = {
             .width = 1,
             .height = 1,
-            .layerCount = TEXTURE_PACK_LAYER_COUNT,
+            .layerCount = pack.layerCount,
             .mipCount = 1,
             .pixels = flatNormalPixels,
-            .pixelBytes = sizeof(flatNormalPixels),
+            .pixelBytes = (uint32_t)pack.layerCount * 4u,
         };
         succeeded = CreateBlockArrayTexture(renderer, &flat,
             TexturePackGetSubresource, SRV_SLOT_BLOCK_NORMALS,
@@ -737,6 +750,7 @@ static bool CreateBlockTexture(Renderer* renderer)
     }
 
     renderer->blockTextureUploadPending = succeeded;
+    renderer->blockTextureLayerCount = succeeded ? pack.layerCount : 0u;
     if (!succeeded)
         renderer->texturePackLoadStatus = RENDERER_CONTENT_GPU_ERROR;
     TexturePackRelease(&pack);
@@ -1415,6 +1429,7 @@ void RendererReleaseWorld(Renderer* renderer)
     renderer->blockNormalUpload = NULL;
     renderer->blockNormalTexture = NULL;
     renderer->blockTextureUploadPending = false;
+    renderer->blockTextureLayerCount = 0u;
 
     if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
     if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
@@ -1768,12 +1783,12 @@ void RendererDrawMeshInstances(Renderer* renderer, const RendererMesh* mesh,
 }
 
 static void RecordTextureArrayUpload(Renderer* renderer,
-    ID3D12Resource* texture, ID3D12Resource** upload)
+    ID3D12Resource* texture, ID3D12Resource** upload,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts)
 {
     D3D12_RESOURCE_DESC description;
     ID3D12Resource_GetDesc(texture, &description);
     UINT subresourceCount = (UINT)description.DepthOrArraySize * description.MipLevels;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[MAX_TEXTURE_SUBRESOURCES];
     ID3D12Device_GetCopyableFootprints(renderer->device, &description,
         0, subresourceCount, 0, layouts, NULL, NULL, NULL);
 
@@ -1810,10 +1825,35 @@ static void RecordBlockTextureUpload(Renderer* renderer)
         return;
     }
 
+    D3D12_RESOURCE_DESC albedoDescription;
+    D3D12_RESOURCE_DESC normalDescription;
+    ID3D12Resource_GetDesc(renderer->blockTexture, &albedoDescription);
+    ID3D12Resource_GetDesc(renderer->blockNormalTexture, &normalDescription);
+    UINT albedoSubresources = (UINT)albedoDescription.DepthOrArraySize
+        * albedoDescription.MipLevels;
+    UINT normalSubresources = (UINT)normalDescription.DepthOrArraySize
+        * normalDescription.MipLevels;
+    UINT layoutCount = albedoSubresources > normalSubresources
+        ? albedoSubresources : normalSubresources;
+    if (layoutCount == 0 || layoutCount > MAX_TEXTURE_SUBRESOURCES)
+    {
+        return;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts = HeapAlloc(
+        GetProcessHeap(), 0, (SIZE_T)layoutCount * sizeof(*layouts));
+    if (layouts == NULL)
+    {
+        // Загрузка остаётся pending и будет повторена в
+        // следующем кадре, не оставляя текстуру наполовину записанной.
+        return;
+    }
+
     RecordTextureArrayUpload(renderer,
-        renderer->blockTexture, &renderer->blockTextureUpload);
+        renderer->blockTexture, &renderer->blockTextureUpload, layouts);
     RecordTextureArrayUpload(renderer,
-        renderer->blockNormalTexture, &renderer->blockNormalUpload);
+        renderer->blockNormalTexture, &renderer->blockNormalUpload, layouts);
+    HeapFree(GetProcessHeap(), 0, layouts);
     renderer->blockTextureUploadPending = false;
 }
 
@@ -2099,10 +2139,13 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
         ID3D12Resource_GetGPUVirtualAddress(
             renderer->instanceBuffers[renderer->frameIndex]));
 
-    // Свет кадра: float3 в cbuffer выровнены по 16 байт, между ними pad.
+    // Свет кадра: число текстурных слоёв занимает padding
+    // после sunDirection; остальные float3 выровнены по 16 байт.
     float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
     float lighting[ROOT_CONSTANT_LIGHTING_COUNT] = {
-        frame->sunDirection[0], frame->sunDirection[1], frame->sunDirection[2], 0.0f,
+        frame->sunDirection[0], frame->sunDirection[1], frame->sunDirection[2],
+        (float)(renderer->blockTextureLayerCount > 0u
+            ? renderer->blockTextureLayerCount : 1u),
         frame->sunColor[0], frame->sunColor[1], frame->sunColor[2], 0.0f,
         frame->ambientColor[0], frame->ambientColor[1], frame->ambientColor[2],
         gammaInverse,
@@ -2528,6 +2571,7 @@ bool RendererReloadTexturePack(Renderer* renderer)
         renderer->blockNormalTexture = NULL;
     }
     renderer->blockTextureUploadPending = false;
+    renderer->blockTextureLayerCount = 0u;
 
     return CreateBlockTexture(renderer);
 }

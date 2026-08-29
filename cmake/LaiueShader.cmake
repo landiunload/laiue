@@ -57,6 +57,12 @@ function(laiue_compile_shader shader_name)
                 /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect
                 "/Fh${pixel_output}"
                 /Vn "g_${shader_name}_ps" "${SHADER_SOURCE}"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DINPUT_FILE=${vertex_output}"
+                -P "${PROJECT_SOURCE_DIR}/cmake/NormalizeShaderHeader.cmake"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DINPUT_FILE=${pixel_output}"
+                -P "${PROJECT_SOURCE_DIR}/cmake/NormalizeShaderHeader.cmake"
             DEPENDS "${SHADER_SOURCE}"
             VERBATIM
             COMMENT "Компиляция шейдера ${shader_name}")

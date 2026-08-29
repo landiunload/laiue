@@ -1,19 +1,15 @@
 #include "content/content_format.h"
 #include "test_runtime.h"
 
-// Контракт пользовательского содержимого: какие имена паков и модов движок
-// вообще соглашается принять. LaiueContentNameIsSafe — единственный барьер
+// Контракт render-содержимого: какие имена shader/texture паков движок
+// соглашается принять. LaiueContentNameIsSafe — единственный барьер
 // между именем из чужого архива и путём на диске: его результат подставляется
 // в LaiueContentBuildPath и превращается в каталог рядом с исполняемым файлом.
 // Поэтому здесь проверяются не «удобные» имена, а именно враждебные — выход
 // вверх по дереву, разделители путей, устройства Windows и хвостовые точки,
 // которые проводник молча срезает, а файловая система — нет.
 //
-// content_format.c компилируется в тест напрямую: правила именования — это
-// внутренний контракт laiue_content, и расширять ABI DLL ради проверок нельзя
-// (тот же приём, что в protocol_test и infinite_coord_test). LAIUE_BUILD_CONTENT
-// переводит экспортные макросы в dllexport, чтобы функции определялись здесь,
-// а не импортировались.
+// Правила именования проверяются через публичный ABI laiue_content.
 
 static uint32_t contentFormatTestChecks;
 
@@ -65,13 +61,6 @@ static bool WideEquals(const wchar_t* left, const wchar_t* right)
 
 static void TestFormatTable(void)
 {
-    const LaiueContentFormat* mod = LaiueContentFormatGet(LAIUE_CONTENT_MOD);
-    ContentFormatTestExpect(mod != NULL, "формат мода не найден");
-    ContentFormatTestExpect(WideEquals(mod->extension, L".lm"),
-        "расширение мода не .lm");
-    ContentFormatTestExpect(WideEquals(mod->directoryName, L"mods"),
-        "каталог мода не mods");
-
     const LaiueContentFormat* shaderPack =
         LaiueContentFormatGet(LAIUE_CONTENT_SHADER_PACK);
     ContentFormatTestExpect(WideEquals(shaderPack->extension, L".lsp"),
@@ -128,26 +117,20 @@ static void TestPackFlagFollowsTypeOrder(void)
 static void TestNameMatches(void)
 {
     ContentFormatTestExpect(
-        LaiueContentNameMatches(LAIUE_CONTENT_MOD, L"cool.lm"),
-        "cool.lm не опознан как мод");
+        LaiueContentNameMatches(LAIUE_CONTENT_SHADER, L"chunk.ls"),
+        "chunk.ls не опознан как шейдер");
     // Регистр расширения не важен: архивы приходят с любым.
     ContentFormatTestExpect(
-        LaiueContentNameMatches(LAIUE_CONTENT_MOD, L"cool.LM"),
-        "cool.LM не опознан как мод");
+        LaiueContentNameMatches(LAIUE_CONTENT_SHADER, L"chunk.LS"),
+        "chunk.LS не опознан как шейдер");
     ContentFormatTestExpect(
-        LaiueContentNameMatches(LAIUE_CONTENT_MOD_PACK, L"cool.lmp"),
-        "cool.lmp не опознан как модпак");
+        LaiueContentNameMatches(LAIUE_CONTENT_TEXTURE_PACK, L"blocks.ltp"),
+        "blocks.ltp не опознан как текстурпак");
     ContentFormatTestExpect(
         LaiueContentNameMatches(LAIUE_CONTENT_SHADER_PACK, L"MyShaders.lsp"),
         "MyShaders.lsp не опознан как шейдерпак");
 
-    // Соседние форматы не должны перекрываться: .lm и .lmp различаются.
-    ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_MOD, L"cool.lmp"),
-        "модпак ошибочно опознан как мод");
-    ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_MOD_PACK, L"cool.lm"),
-        "мод ошибочно опознан как модпак");
+    // Одиночные форматы и соответствующие паки не перекрываются.
     ContentFormatTestExpect(
         !LaiueContentNameMatches(LAIUE_CONTENT_SHADER, L"pack.lsp"),
         "шейдерпак ошибочно опознан как шейдер");
@@ -157,16 +140,16 @@ static void TestNameMatches(void)
 
     // Голое расширение без имени — не файл содержимого.
     ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_MOD, L".lm"),
-        "голое .lm принято за мод");
+        !LaiueContentNameMatches(LAIUE_CONTENT_SHADER, L".ls"),
+        "голое .ls принято за шейдер");
     ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_MOD, L""),
-        "пустое имя принято за мод");
+        !LaiueContentNameMatches(LAIUE_CONTENT_SHADER, L""),
+        "пустое имя принято за шейдер");
     ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_MOD, NULL),
-        "NULL принят за мод");
+        !LaiueContentNameMatches(LAIUE_CONTENT_SHADER, NULL),
+        "NULL принят за шейдер");
     ContentFormatTestExpect(
-        !LaiueContentNameMatches(LAIUE_CONTENT_TYPE_COUNT, L"cool.lm"),
+        !LaiueContentNameMatches(LAIUE_CONTENT_TYPE_COUNT, L"chunk.ls"),
         "несуществующий тип что-то опознал");
 }
 
@@ -292,8 +275,8 @@ static void TestNameIsSafeRejectsDeviceNames(void)
     // Расширение не спасает: CON.txt открывает то же устройство.
     ContentFormatTestExpect(!LaiueContentNameIsSafe(L"CON.txt"),
         "CON.txt признан безопасным");
-    ContentFormatTestExpect(!LaiueContentNameIsSafe(L"com1.lm"),
-        "com1.lm признан безопасным");
+    ContentFormatTestExpect(!LaiueContentNameIsSafe(L"com1.ls"),
+        "com1.ls признан безопасным");
 }
 
 LAIUE_TEST_ENTRY(ContentFormatTestEntryPoint)

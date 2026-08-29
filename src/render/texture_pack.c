@@ -16,12 +16,9 @@
 #define PATH_CAPACITY_CHARS   32768u
 #define TEXTURE_MAX_DIMENSION 4096u
 
-// Layer-major fallback: dirt, grass top, grass side.
-static const uint8_t g_fallbackPixels[TEXTURE_PACK_LAYER_COUNT * 4] = {
-    118, 90, 66, 255,
-    117, 173, 85, 255,
-    102, 121, 63, 255,
-};
+// Material-agnostic single-layer fallback. It keeps the renderer usable
+// without assigning any game-specific meaning or palette to material ids.
+static const uint8_t g_fallbackPixels[4] = { 160, 160, 160, 255 };
 
 static uint16_t ReadU16Le(const uint8_t* bytes)
 {
@@ -40,7 +37,7 @@ static void SetFallback(TexturePackData* pack)
 {
     pack->width = 1;
     pack->height = 1;
-    pack->layerCount = TEXTURE_PACK_LAYER_COUNT;
+    pack->layerCount = TEXTURE_PACK_MIN_LAYERS;
     pack->mipCount = 1;
     pack->pixels = g_fallbackPixels;
     pack->pixelBytes = sizeof(g_fallbackPixels);
@@ -274,7 +271,8 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
         && headerSize == LTP_HEADER_SIZE
         && width > 0 && width <= TEXTURE_MAX_DIMENSION
         && height > 0 && height <= TEXTURE_MAX_DIMENSION
-        && layerCount == TEXTURE_PACK_LAYER_COUNT
+        && layerCount >= TEXTURE_PACK_MIN_LAYERS
+        && layerCount <= TEXTURE_PACK_MAX_LAYERS
         && mipCount == FullMipCount(width, height)
         && CalculatePayloadBytes(width, height, layerCount, mipCount, &albedoBytes)
         && albedoBytes <= UINT32_MAX / 2u
@@ -504,8 +502,8 @@ void TexturePackListRelease(TexturePackList* list)
 
 bool TexturePackActivate(const wchar_t* name)
 {
-    // NULL или пустая строка сбрасывают выбор — игра вернётся к встроенной
-    // текстуре при следующей перезагрузке пака.
+    // NULL или пустая строка сбрасывают выбор на нейтральный
+    // однослойный fallback при следующей перезагрузке пака.
     if (name == NULL || name[0] == L'\0')
     {
         return LaiueContentSetActivePack(LAIUE_CONTENT_TEXTURE_PACK, NULL);

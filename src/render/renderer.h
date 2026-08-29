@@ -82,8 +82,8 @@ typedef struct RendererFrameSetup
     uint32_t passCount;
     RendererScenePass passes[RENDERER_MAX_SCENE_PASSES];
 
-    // Свет кадра (цикл дня и ночи задаёт ядро; рендерер лишь передаёт
-    // значения шейдеру и очищает цели цветом неба).
+    // Свет кадра полностью задаёт приложение; рендерер лишь передаёт
+    // значения шейдеру и очищает цели цветом неба.
     float sunDirection[3];   // единичный, от источника к миру
     float sunColor[3];
     float ambientColor[3];
@@ -91,8 +91,8 @@ typedef struct RendererFrameSetup
     float gamma;             // 1.0 — нейтрально; выход шейдера = pow(цвет, 1/gamma)
 } RendererFrameSetup;
 
-// Создаёт только swapchain и UI-слой. Ресурсы мира загружаются отдельно,
-// когда пользователь действительно запускает сессию.
+// Создаёт только swapchain и UI-слой. Ресурсы мира вызывающая сторона
+// загружает отдельно, когда они действительно нужны.
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);
 LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
 LAIUE_RENDER_API bool      RendererPrepareWorld(Renderer* renderer);
@@ -115,7 +115,7 @@ LAIUE_RENDER_API void RendererBeginScenePass(Renderer* renderer, uint32_t passIn
 LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 
 // Статистика последнего успешно показанного кадра. Не синхронизирует CPU
-// с GPU и потому подходит для HUD и внешнего профилировщика.
+// с GPU и потому подходит для диагностики и внешнего профилировщика.
 LAIUE_RENDER_API void RendererGetStats(const Renderer* renderer,
     RendererStats* outStats);
 

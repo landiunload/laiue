@@ -1,14 +1,6 @@
 #include "content/content_format.h"
 
 static const LaiueContentFormat g_formats[LAIUE_CONTENT_TYPE_COUNT] = {
-    [LAIUE_CONTENT_MOD] = {
-        L"Мод", L"mods", L".lm",
-        LAIUE_CONTENT_STORAGE_FILE, false,
-    },
-    [LAIUE_CONTENT_MOD_PACK] = {
-        L"Модпак", L"mods", L".lmp",
-        LAIUE_CONTENT_STORAGE_FILE | LAIUE_CONTENT_STORAGE_DIRECTORY, true,
-    },
     [LAIUE_CONTENT_SHADER] = {
         L"Шейдер", L"shaders", L".ls",
         LAIUE_CONTENT_STORAGE_FILE, false,

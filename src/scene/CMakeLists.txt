@@ -1,0 +1,19 @@
+laiue_add_module(scene
+    RUNTIME_ROLE GRAPHICS
+    SOURCES
+        camera.c
+        camera.h
+        chunk_streaming.c
+        chunk_streaming.h
+        math.c
+        math.h
+        panorama.c
+        panorama.h
+        voxel_raycast.c
+        voxel_raycast.h
+        ../api.h
+    LINK
+        laiue_world
+        laiue_mesher
+        laiue_render
+)

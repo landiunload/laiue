@@ -26,10 +26,10 @@ else()
         PUBLIC Threads::Threads OpenSSL::Crypto ${CMAKE_DL_LIBS})
 endif()
 
-# Window/input/render stack is intentionally absent from Linux server builds.
-if(LAIUE_BUILD_CLIENT)
+# The window boundary is part of the optional Windows graphics layer.
+if(LAIUE_BUILD_GRAPHICS)
     laiue_add_module(window
-        RUNTIME_ROLE CLIENT
+        RUNTIME_ROLE GRAPHICS
         SOURCES
             window.c
             window.h

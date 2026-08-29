@@ -6,6 +6,7 @@ cbuffer FrameConstants : register(b0)
     float3 chunkOriginRelative;
     float meshScale;
     float3 sunDirection;    // единичный, от источника света к миру
+    float textureLayerCount;
     float3 sunColor;
     float3 ambientColor;
     float gammaInverse;     // 1/gamma; упакован в свободный w ambientColor
@@ -90,12 +91,11 @@ PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
         output.textureCoordinates = localPosition.xy;
     }
 
-    // Слои texture array: 0 = земля, 1 = верх травы, 2 = бок травы.
-    uint textureLayer = 0;
-    if (blockType == 2)
-    {
-        textureLayer = face == 4 ? 1 : (face == 5 ? 0 : 2);
-    }
+    // Material id 0 — воздух и обычно не попадает в меш. Для
+    // защиты некорректного меша он тоже отображается слоем 0.
+    uint layerCount = max((uint)textureLayerCount, 1u);
+    uint materialLayer = blockType > 0u ? blockType - 1u : 0u;
+    uint textureLayer = min(materialLayer, layerCount - 1u);
     output.surface = face | (textureLayer << 3);
     return output;
 }

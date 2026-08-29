@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #define TEXTURE_PACK_NAME_MAX 64
+#define TEXTURE_PACK_MIN_LAYERS 1u
+#define TEXTURE_PACK_MAX_LAYERS 64u
 
 typedef struct TexturePackEntry
 {

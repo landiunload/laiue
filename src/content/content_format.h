@@ -6,13 +6,11 @@
 #include <stdint.h>
 #include <wchar.h>
 
-// Единый контракт пользовательского содержимого laiue.
-// Чётные элементы — одиночные сущности, следующий элемент — их пак.
+// Engine-owned render content. Application/game package formats deliberately
+// live outside this catalog.
 typedef enum LaiueContentType
 {
-    LAIUE_CONTENT_MOD = 0,            // .lm
-    LAIUE_CONTENT_MOD_PACK,           // .lmp
-    LAIUE_CONTENT_SHADER,             // .ls
+    LAIUE_CONTENT_SHADER = 0,         // .ls
     LAIUE_CONTENT_SHADER_PACK,        // .lsp
     LAIUE_CONTENT_TEXTURE,            // .lt
     LAIUE_CONTENT_TEXTURE_PACK,       // .ltp

@@ -6,15 +6,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Потокобезопасность: обычные запросы мира можно выполнять параллельно.
-// WorldRebase вызывается только после остановки рабочих потоков мешинга.
+// Ordinary reads and mutations are thread-safe. WorldRebase must be called
+// only while callers which use local coordinates (streaming/meshing/providers)
+// are paused.
 typedef struct World World;
-
 typedef uint8_t BlockType;
 
-#define BLOCK_AIR   0
-#define BLOCK_EARTH 1
-#define BLOCK_GRASS 2
+// Zero is the only material reserved by the engine. Values 1..255 are owned
+// by the embedding application and its content catalog.
+#define BLOCK_AIR 0U
 
 #define CHUNK_SIZE      64
 #define CHUNK_SIZE_LOG2 6
@@ -34,22 +34,32 @@ typedef enum WorldRegionContents
     WORLD_REGION_MIXED
 } WorldRegionContents;
 
-typedef struct WorldChunkSummary
-{
-    int64_t chunk[3];
-    uint64_t revision;
-    uint32_t deltaCount;
-} WorldChunkSummary;
+// A base provider is application-owned and is never freed by the engine.
+// Coordinates start at zero and are local to the current world origin.
+// getBlock is required when a provider is supplied. fillRegion is optional;
+// when present it must fill every output cell using the same layout as
+// WorldFillRegion. rebase is optional and is called before the engine commits
+// an origin shift; false aborts the entire rebase and therefore must leave the
+// provider context unchanged. Provider callbacks may run concurrently with
+// reads, must be thread-safe, and must not re-enter the same World.
+typedef BlockType (*WorldBaseGetBlock)(void* context,
+    int64_t x, int64_t y, int64_t z);
+typedef WorldRegionContents (*WorldBaseFillRegion)(void* context,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ,
+    BlockType* outBlocks);
+typedef bool (*WorldBaseRebase)(void* context,
+    int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
 
-typedef struct WorldChunkDelta
+typedef struct WorldBaseProvider
 {
-    uint32_t localIndex;
-    BlockType block;
-} WorldChunkDelta;
+    void* context;
+    WorldBaseGetBlock getBlock;
+    WorldBaseFillRegion fillRegion;
+    WorldBaseRebase rebase;
+} WorldBaseProvider;
 
 #define WORLD_MAX_ATOMIC_BLOCK_MUTATIONS 4096U
-#define WORLD_MAX_BOUNDED_BLOCK_QUERY_CELLS 64U
-#define WORLD_MAX_BOUNDED_BLOCK_RANGES 512U
 
 typedef struct WorldBlockMutation
 {
@@ -58,105 +68,35 @@ typedef struct WorldBlockMutation
     BlockType replacement;
 } WorldBlockMutation;
 
-typedef struct WorldBlockState
-{
-    BlockType block;
-    bool edited;
-} WorldBlockState;
+// NULL provider creates an empty world. The provider structure is copied, but
+// its context remains application-owned and must outlive the World.
+LAIUE_WORLD_API World* WorldCreate(const WorldBaseProvider* provider);
+LAIUE_WORLD_API void WorldDestroy(World* world);
 
-typedef struct WorldBlockRange
-{
-    int64_t minimum[3];
-    int64_t maximum[3];
-} WorldBlockRange;
-
-LAIUE_WORLD_API World* WorldCreate(int64_t seed);
-LAIUE_WORLD_API void   WorldDestroy(World* world);
-
-// Переносит локальное начало координат на целое число блоков.
-// Сдвиги обязаны быть кратны CHUNK_SIZE. Абсолютные координаты произвольной
-// точности растут динамически, а локальные координаты остаются маленькими.
+// Shifts the local origin by whole chunks. Infinite absolute coordinates and
+// sparse overrides remain unchanged.
 LAIUE_WORLD_API bool WorldRebase(World* world,
     int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
-
-// Возводит абсолютную координату X в квадрат. Возвращает смещение нового
-// chunk-origin относительно старого, если оно помещается в int64.
-LAIUE_WORLD_API bool WorldSquareAbsoluteX(
-    World* world, int64_t localBlockX, int64_t* outLocalBlockX,
-    bool* outChunkOriginDeltaFits, int64_t* outChunkOriginDeltaX);
 
 LAIUE_WORLD_API void WorldFormatAbsoluteBlockCoordinate(World* world,
     int32_t axis, int64_t localBlock, wchar_t* outText, uint32_t capacity);
 
-LAIUE_WORLD_API BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z);
-// Copies material and edit provenance under one shared lock. This is the
-// per-cell primitive for bounded transactional gameplay operations.
-LAIUE_WORLD_API bool WorldGetBlockState(
-    World* world, int64_t x, int64_t y, int64_t z,
-    WorldBlockState* outState);
-// Inclusive, allocation-free solid occupancy query. Oversized ranges are
-// rejected instead of turning a fixed-tick collision check into an unbounded
-// world scan.
-LAIUE_WORLD_API bool WorldAnySolidBlockInRange(
-    World* world, const int64_t minimum[3], const int64_t maximum[3]);
-// Evaluates all inclusive ranges under one shared table lock. Each range and
-// the range count are bounded; false means invalid input and callers which use
-// this for collision should fail closed. outSolid is always initialized.
-LAIUE_WORLD_API bool WorldAnySolidBlockInRanges(
-    World* world, const WorldBlockRange* ranges, uint32_t count,
-    bool* outSolid);
-// Возвращает true, если ячейка хранится как явная правка относительно
-// процедурного terrain. Это provenance для bounded gameplay-операций; сам
-// тип блока не кодирует, был ли он поставлен игроком.
-LAIUE_WORLD_API bool WorldIsBlockEdited(
+LAIUE_WORLD_API BlockType WorldGetBlock(
     World* world, int64_t x, int64_t y, int64_t z);
-// Транзакционные системы используют bool-вариант, чтобы не продолжать после
-// OOM. Совместимый WorldSetBlock оставлен для старых вызовов.
 LAIUE_WORLD_API bool WorldTrySetBlock(
     World* world, int64_t x, int64_t y, int64_t z, BlockType block);
-LAIUE_WORLD_API void      WorldSetBlock(World* world, int64_t x, int64_t y, int64_t z, BlockType block);
-// Проверяет все expected и готовит новые delta-массивы до публикации хоть
-// одной правки. При false содержимое блоков и revisions не меняются.
+LAIUE_WORLD_API void WorldSetBlock(
+    World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+
+// Validates all expected values and prepares all allocations before publishing
+// any change. A false result leaves blocks and revision unchanged.
 LAIUE_WORLD_API bool WorldApplyBlockBatch(
     World* world, const WorldBlockMutation* mutations, uint32_t count);
-
-// Snapshot API для удалённого клиента. Сначала сервер копирует summaries в
-// заданном окне, затем запрашивает deltas каждого чанка. Все буферы принадлежат
-// вызывающему, поэтому allocator модуля world не выходит наружу.
 LAIUE_WORLD_API uint64_t WorldGetRevision(World* world);
-LAIUE_WORLD_API uint64_t WorldGetChunkRevision(
-    World* world, const int64_t chunk[3]);
-LAIUE_WORLD_API uint32_t WorldCopyEditedChunkSummaries(
-    World* world, const int64_t minimumChunk[3], const int64_t maximumChunk[3],
-    WorldChunkSummary* output, uint32_t capacity, bool* outTruncated,
-    uint64_t* outWorldRevision);
-LAIUE_WORLD_API bool WorldCopyChunkDeltas(
-    World* world, const int64_t chunk[3], WorldChunkDelta* output,
-    uint32_t capacity, uint32_t* outCount, uint64_t* outChunkRevision);
-// Revision монотонна: snapshot старше уже применённого состояния считается
-// успешно обработанным no-op и не заменяет содержимое чанка.
-LAIUE_WORLD_API bool WorldReplaceChunkDeltas(
-    World* world, const int64_t chunk[3], const WorldChunkDelta* deltas,
-    uint32_t count, uint64_t chunkRevision, uint64_t worldRevision);
 
+// Output layout is ((y * sizeX) + x) * sizeZ + z. Invalid dimensions return
+// WORLD_REGION_ALL_AIR without touching output.
 LAIUE_WORLD_API WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
-    BlockType* outBlocks,
-    float* heightScratch, size_t heightScratchCount);
-
-// Высота верхнего твёрдого блока в текущих локальных координатах.
-LAIUE_WORLD_API int64_t WorldGetTerrainHeight(World* world, int64_t x, int64_t y);
-
-// === Сохранение правок (Laiue World Format v1, docs/world_format.md) ===
-//
-// WorldSaveDeltas пишет seed, начало координат и все правки блоков
-// (абсолютные координаты произвольной точности) — читать таблицу можно
-// параллельно с рабочими потоками мешинга. WorldLoadDeltas вызывается
-// на свежесозданном мире до запуска стриминга: сверяет seed,
-// восстанавливает начало координат через WorldRebase (v1 требует его
-// представимости в int64) и повторяет правки. Правки чанков, чьи
-// абсолюты не представимы относительно восстановленного начала,
-// в v1 пропускаются.
-LAIUE_WORLD_API bool WorldSaveDeltas(World* world, const wchar_t* path);
-LAIUE_WORLD_API bool WorldLoadDeltas(World* world, const wchar_t* path);
+    BlockType* outBlocks);

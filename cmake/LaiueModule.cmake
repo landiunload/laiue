@@ -18,8 +18,7 @@ function(laiue_register_runtime_target target_name runtime_role)
             "Нельзя зарегистрировать отсутствующую цель ${target_name}")
     endif()
     string(TOUPPER "${runtime_role}" normalized_role)
-    if(NOT normalized_role MATCHES
-       "^(HEADLESS|CLIENT|SERVER|MODSDK)$")
+    if(NOT normalized_role MATCHES "^(CORE|GRAPHICS)$")
         message(FATAL_ERROR
             "Цель ${target_name} имеет неизвестную runtime role: "
             "${runtime_role}")
@@ -31,7 +30,7 @@ endfunction()
 
 function(laiue_add_module module_name)
     cmake_parse_arguments(PARSE_ARGV 1 MODULE
-        ""
+        "PRECISE_FP"
         "RUNTIME_ROLE"
         "SOURCES;WINDOWS_SOURCES;UNIX_SOURCES;LINK;PUBLIC_LINK;WINDOWS_LINK;UNIX_LINK"
     )
@@ -58,10 +57,28 @@ function(laiue_add_module module_name)
     string(TOUPPER "${module_name}" module_name_upper)
 
     add_library(${target_name} SHARED)
+    add_library("laiue::${module_name}" ALIAS ${target_name})
     target_sources(${target_name} PRIVATE ${module_sources})
     source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_sources})
     target_compile_definitions(${target_name}
         PRIVATE "LAIUE_BUILD_${module_name_upper}")
+    if(WIN32)
+        if(MODULE_PRECISE_FP)
+            target_compile_options(${target_name} PRIVATE
+                "$<$<C_COMPILER_ID:MSVC>:/fp:precise>"
+                "$<$<C_COMPILER_ID:Clang>:/clang:-ffp-model=strict>")
+        else()
+            target_compile_options(${target_name} PRIVATE /fp:fast)
+        endif()
+    elseif(MODULE_PRECISE_FP)
+        target_compile_options(${target_name} PRIVATE
+            -fno-fast-math
+            -ffp-contract=off)
+    endif()
+    target_include_directories(${target_name}
+        PUBLIC
+            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
+            "$<INSTALL_INTERFACE:include/laiue>")
     target_link_libraries(${target_name}
         PRIVATE
             laiue_common
@@ -83,4 +100,6 @@ function(laiue_add_module module_name)
 
     laiue_register_runtime_target(
         ${target_name} "${MODULE_RUNTIME_ROLE}")
+    set_target_properties(${target_name} PROPERTIES
+        EXPORT_NAME "${module_name}")
 endfunction()

@@ -5,28 +5,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $sourceRootPath = [System.IO.Path]::GetFullPath($SourceRoot)
 
-# Разрешённые направления include-зависимостей. core — composition root;
-# остальные модули видят только себя и явно перечисленные нижние слои.
+# Разрешённые направления include-зависимостей библиотек движка.
 $allowed = @{
     audio       = @('audio')
     content     = @('content', 'platform')
-    core        = @('audio', 'content', 'core', 'game', 'gameplay', 'input',
-                    'interaction', 'mesh', 'mod', 'network', 'physics',
-                    'platform', 'render', 'world')
-    game        = @('game')
-    gameplay    = @('game', 'gameplay', 'physics')
     input       = @('input')
-    interaction = @('interaction', 'physics', 'world')
-    launcher    = @('launcher')
     mesh        = @('mesh', 'render', 'world')
-    mod         = @('content', 'game', 'gameplay', 'mod', 'platform', 'world')
-    network     = @('network', 'platform')
     physics     = @('physics')
     platform    = @('platform')
     render      = @('content', 'render')
     runtime     = @('runtime')
-    server      = @('content', 'game', 'gameplay', 'interaction', 'mod',
-                    'network', 'physics', 'platform', 'server', 'world')
+    scene       = @('mesh', 'render', 'scene', 'world')
+    ui          = @('render', 'scene', 'ui')
     world       = @('platform', 'world')
 }
 

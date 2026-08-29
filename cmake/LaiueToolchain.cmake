@@ -25,7 +25,7 @@ if(WIN32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         message(FATAL_ERROR
-            "Linux-сервер поддерживает GCC и Clang")
+            "Linux engine core supports GCC and Clang")
     endif()
 else()
     message(FATAL_ERROR
@@ -57,7 +57,7 @@ else()
 endif()
 
 # Общие правила компиляции. Все свойства намеренно target-scoped: выбор
-# сервера не меняет глобальные флаги CMake и не загрязняет потребителей SDK.
+# композиции не меняет глобальные флаги CMake и не загрязняет потребителей.
 add_library(laiue_build_options INTERFACE)
 add_library(laiue::build_options ALIAS laiue_build_options)
 target_include_directories(laiue_build_options
@@ -76,7 +76,7 @@ if(WIN32)
         _UNICODE
     )
     target_compile_options(laiue_build_options INTERFACE
-        /W4 /utf-8 /GS- /fp:fast
+        /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
         $<$<CONFIG:Release>:/O2 /Ot /Oi /Gw>
@@ -91,7 +91,7 @@ else()
     )
 
     set(LAIUE_LINUX_LIBC "gnu" CACHE STRING
-        "Linux libc ABI для server/mod artifacts: gnu или musl")
+        "Linux libc ABI for engine artifacts: gnu or musl")
     set_property(CACHE LAIUE_LINUX_LIBC PROPERTY STRINGS gnu musl)
     include(CheckCSourceCompiles)
     check_c_source_compiles(
@@ -130,25 +130,6 @@ else()
     endif()
 endif()
 
-# --- Точная плавающая арифметика для отдельных файлов ----------------------
-#
-# Недоверенный ввод не должен компилироваться с finite-math-only, а
-# детерминированная симуляция дополнительно запрещает FMA-контракцию.
-if(WIN32)
-    set(LAIUE_PRECISE_FP_OPTIONS
-        "/fp:precise"
-        "$<$<C_COMPILER_ID:Clang>:-Wno-overriding-complex-range>")
-    set(LAIUE_DETERMINISTIC_FP_OPTIONS
-        ${LAIUE_PRECISE_FP_OPTIONS}
-        "$<$<C_COMPILER_ID:Clang>:/clang:-ffp-contract=off>"
-        "$<$<C_COMPILER_ID:Clang>:-Wno-overriding-option>")
-else()
-    set(LAIUE_PRECISE_FP_OPTIONS "-fno-fast-math")
-    set(LAIUE_DETERMINISTIC_FP_OPTIONS
-        "-fno-fast-math"
-        "-ffp-contract=off")
-endif()
-
 # Windows no-CRT является отдельным opt-in контрактом. Linux-цели никогда не
 # наследуют /NODEFAULTLIB или собственные memcpy/memset.
 add_library(laiue_windows_no_crt INTERFACE)
@@ -157,7 +138,7 @@ if(WIN32)
     add_library(laiue_runtime OBJECT
         "${PROJECT_SOURCE_DIR}/src/runtime/memory.c")
     target_compile_options(laiue_runtime PRIVATE
-        /W4 /utf-8 /GS- /fp:fast
+        /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
         $<$<CONFIG:Release>:/O2 /Oi>)
@@ -193,8 +174,7 @@ if(LAIUE_ENABLE_LTO)
     endif()
 endif()
 
-# Обратная совместимость для существующих модулей и внешних локальных
-# скриптов. Новые цели должны предпочитать namespaced build-options.
+# Internal compatibility aggregate used by engine modules and tests.
 add_library(laiue_common INTERFACE)
 target_link_libraries(laiue_common INTERFACE laiue::build_options)
 if(WIN32)

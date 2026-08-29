@@ -1,332 +1,291 @@
 {
-    "version": 8,
-    "configurePresets": [
-        {
-            "name": "windows-base",
-            "hidden": true,
-            "binaryDir": "${sourceDir}/build/${presetName}",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
-            },
-            "cacheVariables": {
-                "LAIUE_REQUIRE_MSQUIC": "ON"
-            }
-        },
-        {
-            "name": "windows-msvc",
-            "displayName": "Windows + Visual Studio/MSVC",
-            "description": "Windows client and server, Debug and Release in one build tree",
-            "inherits": "windows-base",
-            "generator": "Visual Studio 17 2022",
-            "architecture": "x64"
-        },
-        {
-            "name": "windows-clang",
-            "displayName": "Windows + clang-cl",
-            "description": "Windows client and server, Debug and Release in one build tree",
-            "inherits": "windows-base",
-            "generator": "Ninja Multi-Config",
-            "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang-cl.exe",
-                "CMAKE_DEFAULT_BUILD_TYPE": "Release"
-            }
-        },
-        {
-            "name": "windows-msvc-server",
-            "displayName": "Windows + Visual Studio/MSVC (server only)",
-            "description": "Dedicated server without client-only modules",
-            "inherits": "windows-msvc",
-            "cacheVariables": {
-                "LAIUE_BUILD_CLIENT": "OFF",
-                "LAIUE_BUILD_SERVER": "ON"
-            }
-        },
-        {
-            "name": "linux-base",
-            "hidden": true,
-            "generator": "Ninja Multi-Config",
-            "binaryDir": "${sourceDir}/build/${presetName}",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Linux"
-            },
-            "cacheVariables": {
-                "CMAKE_DEFAULT_BUILD_TYPE": "Release",
-                "LAIUE_BUILD_CLIENT": "OFF",
-                "LAIUE_BUILD_SERVER": "ON",
-                "LAIUE_BUILD_EXAMPLE_MODS": "ON",
-                "LAIUE_REQUIRE_MSQUIC": "ON"
-            }
-        },
-        {
-            "name": "linux-gcc",
-            "displayName": "Debian 13/glibc + GCC",
-            "description": "Linux server, Debug and Release in one build tree",
-            "inherits": "linux-base",
-            "cacheVariables": {
-                "CMAKE_C_COMPILER": "gcc",
-                "LAIUE_LINUX_LIBC": "gnu"
-            }
-        },
-        {
-            "name": "linux-clang",
-            "displayName": "Debian 13/glibc + Clang",
-            "description": "Linux server, Debug and Release in one build tree",
-            "inherits": "linux-base",
-            "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang",
-                "LAIUE_LINUX_LIBC": "gnu"
-            }
-        },
-        {
-            "name": "linux-gcc-asan",
-            "displayName": "Debian 13/glibc + GCC + ASan/UBSan",
-            "description": "Sanitized Debug server build",
-            "inherits": "linux-gcc",
-            "cacheVariables": {
-                "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
-                "LAIUE_ENABLE_LTO": "OFF",
-                "LAIUE_ENABLE_SANITIZERS": "ON"
-            }
-        },
-        {
-            "name": "linux-musl",
-            "displayName": "Alpine/musl + GCC",
-            "description": "Linux server, Debug and Release in one build tree",
-            "inherits": "linux-base",
-            "cacheVariables": {
-                "CMAKE_C_COMPILER": "gcc",
-                "LAIUE_LINUX_LIBC": "musl"
-            }
-        }
-    ],
-    "buildPresets": [
-        {
-            "name": "windows-build-debug",
-            "hidden": true,
-            "configuration": "Debug",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
-            }
-        },
-        {
-            "name": "windows-build-release",
-            "hidden": true,
-            "configuration": "Release",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
-            }
-        },
-        {
-            "name": "linux-build-debug",
-            "hidden": true,
-            "configuration": "Debug",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Linux"
-            }
-        },
-        {
-            "name": "linux-build-release",
-            "hidden": true,
-            "configuration": "Release",
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Linux"
-            }
-        },
-        {
-            "name": "windows-msvc-debug",
-            "inherits": "windows-build-debug",
-            "configurePreset": "windows-msvc"
-        },
-        {
-            "name": "windows-msvc-release",
-            "inherits": "windows-build-release",
-            "configurePreset": "windows-msvc"
-        },
-        {
-            "name": "windows-clang-debug",
-            "inherits": "windows-build-debug",
-            "configurePreset": "windows-clang"
-        },
-        {
-            "name": "windows-clang-release",
-            "inherits": "windows-build-release",
-            "configurePreset": "windows-clang"
-        },
-        {
-            "name": "windows-msvc-server-debug",
-            "inherits": "windows-build-debug",
-            "configurePreset": "windows-msvc-server"
-        },
-        {
-            "name": "windows-msvc-server-release",
-            "inherits": "windows-build-release",
-            "configurePreset": "windows-msvc-server"
-        },
-        {
-            "name": "linux-gcc-debug",
-            "inherits": "linux-build-debug",
-            "configurePreset": "linux-gcc"
-        },
-        {
-            "name": "linux-gcc-release",
-            "inherits": "linux-build-release",
-            "configurePreset": "linux-gcc"
-        },
-        {
-            "name": "linux-clang-debug",
-            "inherits": "linux-build-debug",
-            "configurePreset": "linux-clang"
-        },
-        {
-            "name": "linux-clang-release",
-            "inherits": "linux-build-release",
-            "configurePreset": "linux-clang"
-        },
-        {
-            "name": "linux-gcc-asan-debug",
-            "inherits": "linux-build-debug",
-            "configurePreset": "linux-gcc-asan"
-        },
-        {
-            "name": "linux-musl-debug",
-            "inherits": "linux-build-debug",
-            "configurePreset": "linux-musl"
-        },
-        {
-            "name": "linux-musl-release",
-            "inherits": "linux-build-release",
-            "configurePreset": "linux-musl"
-        }
-    ],
-    "testPresets": [
-        {
-            "name": "windows-test-debug",
-            "hidden": true,
-            "configuration": "Debug",
-            "output": {
-                "outputOnFailure": true
-            },
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
-            }
-        },
-        {
-            "name": "windows-test-release",
-            "hidden": true,
-            "configuration": "Release",
-            "output": {
-                "outputOnFailure": true
-            },
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
-            }
-        },
-        {
-            "name": "linux-test-debug",
-            "hidden": true,
-            "configuration": "Debug",
-            "output": {
-                "outputOnFailure": true
-            },
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Linux"
-            }
-        },
-        {
-            "name": "linux-test-release",
-            "hidden": true,
-            "configuration": "Release",
-            "output": {
-                "outputOnFailure": true
-            },
-            "condition": {
-                "type": "equals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Linux"
-            }
-        },
-        {
-            "name": "windows-msvc-debug",
-            "inherits": "windows-test-debug",
-            "configurePreset": "windows-msvc"
-        },
-        {
-            "name": "windows-msvc-release",
-            "inherits": "windows-test-release",
-            "configurePreset": "windows-msvc"
-        },
-        {
-            "name": "windows-clang-debug",
-            "inherits": "windows-test-debug",
-            "configurePreset": "windows-clang"
-        },
-        {
-            "name": "windows-clang-release",
-            "inherits": "windows-test-release",
-            "configurePreset": "windows-clang"
-        },
-        {
-            "name": "windows-msvc-server-debug",
-            "inherits": "windows-test-debug",
-            "configurePreset": "windows-msvc-server"
-        },
-        {
-            "name": "windows-msvc-server-release",
-            "inherits": "windows-test-release",
-            "configurePreset": "windows-msvc-server"
-        },
-        {
-            "name": "linux-gcc-debug",
-            "inherits": "linux-test-debug",
-            "configurePreset": "linux-gcc"
-        },
-        {
-            "name": "linux-gcc-release",
-            "inherits": "linux-test-release",
-            "configurePreset": "linux-gcc"
-        },
-        {
-            "name": "linux-clang-debug",
-            "inherits": "linux-test-debug",
-            "configurePreset": "linux-clang"
-        },
-        {
-            "name": "linux-clang-release",
-            "inherits": "linux-test-release",
-            "configurePreset": "linux-clang"
-        },
-        {
-            "name": "linux-gcc-asan-debug",
-            "inherits": "linux-test-debug",
-            "configurePreset": "linux-gcc-asan"
-        },
-        {
-            "name": "linux-musl-debug",
-            "inherits": "linux-test-debug",
-            "configurePreset": "linux-musl"
-        },
-        {
-            "name": "linux-musl-release",
-            "inherits": "linux-test-release",
-            "configurePreset": "linux-musl"
-        }
-    ]
+  "version": 8,
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "LAIUE_BUILD_GRAPHICS": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows x64 + MSVC",
+      "description": "Core and D3D12 graphics engine libraries",
+      "inherits": "windows-base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64"
+    },
+    {
+      "name": "windows-clang",
+      "displayName": "Windows x64 + clang-cl",
+      "description": "Core and D3D12 graphics engine libraries",
+      "inherits": "windows-base",
+      "generator": "Ninja Multi-Config",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl.exe",
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release",
+        "LAIUE_BUILD_GRAPHICS": "OFF"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux glibc x64 + GCC",
+      "description": "Portable engine core libraries",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "LAIUE_LINUX_LIBC": "gnu"
+      }
+    },
+    {
+      "name": "linux-clang",
+      "displayName": "Linux glibc x64 + Clang",
+      "description": "Portable engine core libraries",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "LAIUE_LINUX_LIBC": "gnu"
+      }
+    },
+    {
+      "name": "linux-gcc-asan",
+      "displayName": "Linux glibc x64 + GCC + ASan/UBSan",
+      "description": "Sanitized portable engine core",
+      "inherits": "linux-gcc",
+      "cacheVariables": {
+        "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
+        "LAIUE_ENABLE_LTO": "OFF",
+        "LAIUE_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "linux-musl",
+      "displayName": "Linux musl x64 + GCC",
+      "description": "Portable engine core libraries",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "LAIUE_LINUX_LIBC": "musl"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-build-debug",
+      "hidden": true,
+      "configuration": "Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-build-release",
+      "hidden": true,
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-build-debug",
+      "hidden": true,
+      "configuration": "Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-build-release",
+      "hidden": true,
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "inherits": "windows-build-debug",
+      "configurePreset": "windows-msvc"
+    },
+    {
+      "name": "windows-msvc-release",
+      "inherits": "windows-build-release",
+      "configurePreset": "windows-msvc"
+    },
+    {
+      "name": "windows-clang-debug",
+      "inherits": "windows-build-debug",
+      "configurePreset": "windows-clang"
+    },
+    {
+      "name": "windows-clang-release",
+      "inherits": "windows-build-release",
+      "configurePreset": "windows-clang"
+    },
+    {
+      "name": "linux-gcc-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-gcc"
+    },
+    {
+      "name": "linux-gcc-release",
+      "inherits": "linux-build-release",
+      "configurePreset": "linux-gcc"
+    },
+    {
+      "name": "linux-clang-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-clang"
+    },
+    {
+      "name": "linux-clang-release",
+      "inherits": "linux-build-release",
+      "configurePreset": "linux-clang"
+    },
+    {
+      "name": "linux-gcc-asan-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-gcc-asan"
+    },
+    {
+      "name": "linux-musl-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-musl"
+    },
+    {
+      "name": "linux-musl-release",
+      "inherits": "linux-build-release",
+      "configurePreset": "linux-musl"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-test-debug",
+      "hidden": true,
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-test-release",
+      "hidden": true,
+      "configuration": "Release",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-test-debug",
+      "hidden": true,
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-test-release",
+      "hidden": true,
+      "configuration": "Release",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "inherits": "windows-test-debug",
+      "configurePreset": "windows-msvc"
+    },
+    {
+      "name": "windows-msvc-release",
+      "inherits": "windows-test-release",
+      "configurePreset": "windows-msvc"
+    },
+    {
+      "name": "windows-clang-debug",
+      "inherits": "windows-test-debug",
+      "configurePreset": "windows-clang"
+    },
+    {
+      "name": "windows-clang-release",
+      "inherits": "windows-test-release",
+      "configurePreset": "windows-clang"
+    },
+    {
+      "name": "linux-gcc-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-gcc"
+    },
+    {
+      "name": "linux-gcc-release",
+      "inherits": "linux-test-release",
+      "configurePreset": "linux-gcc"
+    },
+    {
+      "name": "linux-clang-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-clang"
+    },
+    {
+      "name": "linux-clang-release",
+      "inherits": "linux-test-release",
+      "configurePreset": "linux-clang"
+    },
+    {
+      "name": "linux-gcc-asan-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-gcc-asan"
+    },
+    {
+      "name": "linux-musl-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-musl"
+    },
+    {
+      "name": "linux-musl-release",
+      "inherits": "linux-test-release",
+      "configurePreset": "linux-musl"
+    }
+  ]
 }

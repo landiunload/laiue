@@ -6,8 +6,11 @@
 
 ## О проекте
 
-laiue 0.5.0 — воксельный движок на C17: Windows-клиент/сервер без CRT и
-Linux dedicated server с libc/POSIX. Модульная сборка использует CMake
-(`laiue_add_module`). Канонические правила работы находятся в
-[CONTRIBUTING.md](CONTRIBUTING.md), актуальные команды и ссылки —
-в [README.md](README.md).
+`laiue` 0.6.0 — встраиваемый библиотечный voxel engine на C17. Windows
+собирает полный графический набор без CRT, Linux — переносимое core. Мир по
+умолчанию пуст; внешний базовый слой подключается через `WorldBaseProvider`,
+а бесконечные абсолютные координаты сохраняются через rebasing.
+
+Канонические правила находятся в [CONTRIBUTING.md](CONTRIBUTING.md), команды
+и входная документация — в [README.md](README.md). Прикладной проект находится
+в [landiunload/laiue-game](https://github.com/landiunload/laiue-game).

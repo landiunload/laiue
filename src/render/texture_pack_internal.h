@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "render/texture_pack.h"
+
 typedef enum TexturePackLoadStatus
 {
     TEXTURE_PACK_LOAD_NOT_ATTEMPTED = 0,
@@ -12,14 +14,11 @@ typedef enum TexturePackLoadStatus
     TEXTURE_PACK_LOAD_IO_ERROR,
 } TexturePackLoadStatus;
 
-// Стабильный порядок слоёв между авторингом LTP и chunk shader.
-typedef enum TexturePackLayer
-{
-    TEXTURE_PACK_LAYER_DIRT = 0,
-    TEXTURE_PACK_LAYER_GRASS_TOP = 1,
-    TEXTURE_PACK_LAYER_GRASS_SIDE = 2,
-    TEXTURE_PACK_LAYER_COUNT = 3
-} TexturePackLayer;
+// LTP хранит по одному слою на материал. Material id 1
+// в меше соответствует слою 0; лишние id зажимаются к последнему слою.
+#define TEXTURE_PACK_MAX_MIP_COUNT 13u
+#define TEXTURE_PACK_MAX_SUBRESOURCES \
+    (TEXTURE_PACK_MAX_LAYERS * TEXTURE_PACK_MAX_MIP_COUNT)
 
 typedef struct TexturePackData
 {

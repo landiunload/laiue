@@ -1,155 +1,165 @@
 # laiue
 
-Воксельный движок 0.5.0: Windows-клиент на C17 без CRT и Direct3D 12,
-а также authoritative dedicated server для Windows и Linux x86_64.
-Клиент и сервер используют общий headless-стек мира, физики, gameplay,
-content, network и модов.
+`laiue` 0.6.0 — встраиваемый воксельный движок на C17. Репозиторий
+содержит библиотечные runtime-модули: бесконечные координаты и разреженный
+мир, физику, построение чанковых мешей, D3D12-рендер, окно, ввод, аудио,
+сцену, UI и каталог содержимого.
 
-Сейчас готовы одиночные миры, сохранения, креатив/выживание, инвентарь,
-дропы, физические блочные конструкции и client/server multiplayer.
-Удалённый production transport —
-QUIC/UDP с TLS 1.3, обязательной проверкой server identity и поддержкой
-IPv4/IPv6. Если MsQuic или credentials недоступны, он завершается
-fail-closed без plaintext fallback.
+Прикладной проект из прежнего репозитория сохранён отдельно:
+[landiunload/laiue-game](https://github.com/landiunload/laiue-game).
+
+Движок не создаёт ландшафт самостоятельно. Приложение передаёт источник
+базовых блоков через `WorldBaseProvider`, а `WorldCreate(NULL)` создаёт
+пустой бесконечный мир. Значение `BlockType` 0 зарезервировано для воздуха;
+материалы 1–255 определяет приложение.
+
+## Модули
+
+| Модуль | Назначение |
+|---|---|
+| `platform_support` | внутренняя граница памяти, locks, файлов и времени |
+| `world` | `InfiniteCoord`, rebasing, базовый provider и разреженные правки |
+| `physics` | переносимые AABB и столкновения с вокселями |
+| `content` | безопасные имена, категории и выбор паков |
+| `window`, `input`, `audio` | Windows-окно, Raw Input и Media Foundation |
+| `mesh` | greedy meshing чанков `64³` |
+| `render` | Direct3D 12, GPU-меши, текстуры и шейдеры |
+| `scene` | камера, streaming, panorama и voxel raycast |
+| `ui` | immediate-mode UI поверх renderer |
+
+`laiue::engine` объединяет доступные для выбранной платформы модули.
+Windows собирает полный графический набор. Linux экспортирует переносимое
+ядро: `world`, `physics` и `content`; `platform_support` остаётся внутренней
+реализацией этих библиотек.
 
 ## Сборка
 
-Требуется CMake 3.28+. Windows-клиент собирается MSVC или clang-cl; Linux
-server — GCC/Clang с Ninja, OpenSSL 3 и MsQuic 2.5.9. Все канонические
-configure-presets требуют проверенный MsQuic prefix через
-`LAIUE_MSQUIC_ROOT` либо `-DLAIUE_MSQUIC_ROOT=...`.
+Требуется CMake 3.28+ и компилятор C17. На Windows поддерживаются MSVC и
+`clang-cl`; для графики нужен Windows SDK с Direct3D 12 и `fxc`. Если `fxc`
+не найден, используются закоммиченные fallback-заголовки шейдеров.
 
 ```powershell
-# Visual Studio/MSVC: configure один раз, Debug и Release — в одном дереве
-$env:LAIUE_MSQUIC_ROOT = 'C:\deps\msquic-2.5.9'
+# Visual Studio/MSVC
 cmake --preset windows-msvc
 cmake --build --preset windows-msvc-debug --parallel
-cmake --build --preset windows-msvc-release --parallel
+ctest --preset windows-msvc-debug
 
-# clang-cl: запустите из x64 VS Developer shell с Ninja в PATH
+# clang-cl из x64 VS Developer PowerShell
 cmake --preset windows-clang
 cmake --build --preset windows-clang-release --parallel
+ctest --preset windows-clang-release
 ```
 
-Linux server:
+Linux core:
 
 ```sh
-export LAIUE_MSQUIC_ROOT=/opt/msquic-2.5.9
 cmake --preset linux-gcc
-cmake --build --preset linux-gcc-release \
-  --target laiue_server_bundle --parallel
+cmake --build --preset linux-gcc-release --parallel
 ctest --preset linux-gcc-release
 ```
 
-Configure-presets: `windows-msvc`, `windows-clang`,
-`windows-msvc-server`, `linux-gcc`, `linux-clang`, `linux-musl` и
-`linux-gcc-asan`. Обычные build/test-presets добавляют `-debug` или
-`-release`; sanitizer имеет только `linux-gcc-asan-debug`.
-
-Готовый server stage находится в
-`build/<configure>/bundles/server/<Configuration>`, а отдельные outputs —
-в `build/<configure>/bin/<Configuration>`. Перед пересборкой закройте клиент
-и сервер из этого каталога: Windows блокирует загруженные EXE/DLL. Сборка
-проверяет блокировку заранее и выводит PID. Зависимости, install/package и
-ABI-матрица описаны в
+Для Clang используйте `linux-clang`; диагностический preset —
+`linux-gcc-asan`. Подробная матрица находится в
 [docs/portability.md](docs/portability.md).
 
-## Запуск
+## Установка
 
-Из runtime-каталога:
+Установочный компонент `Engine` содержит библиотеки, публичные заголовки,
+шейдеры и документацию:
 
 ```powershell
-./laiue.exe
-
-# Для локальной сетевой игры — в другом терминале
-./laiue_server.exe
+cmake --install build/windows-msvc --config Release `
+  --prefix .\staging\laiue --component Engine
 ```
 
-Перед удалённым запуском настройте certificate/key и bind policy в
-`server.cfg`. По умолчанию порт — UDP 27180, режим `dual` слушает IPv4 и
-IPv6 одновременно. Инструкции для Linux/Windows, SAN, pin и нестандартного
-порта — в [docs/secure_server.md](docs/secure_server.md).
+Цель `laiue_engine_bundle` собирает готовый stage в
+`build/<configure>/bundles/engine/<Configuration>`. Потребитель, который
+добавляет исходники через `add_subdirectory`, может линковаться с
+`laiue::engine` либо с отдельными `laiue::<module>`. Установленный SDK
+подключается так:
 
-Клиент открывает главное меню без мира и фоновых meshing-задач. Мир,
-игровые GPU-ресурсы и native host модов создаются только после выбора сессии
-и освобождаются при возврате в меню.
-
-## Управление
-
-| Ввод | Действие |
-|---|---|
-| `W A S D` | движение; в креативе — полёт |
-| `Space` | прыжок / вверх в креативе |
-| `Ctrl` | бег |
-| `Shift` | приседание |
-| `ЛКМ` | ломать блок |
-| `ПКМ` | поставить выбранный блок |
-| `ПКМ` с физ. рычагом | превратить связанный блоковый фрагмент в физическую конструкцию |
-| удерживать `ПКМ` на ручке | тянуть конструкцию за рычаг |
-| `E` | инвентарь, 36 слотов |
-| `1`–`9`, колесо | слот хотбара |
-| `G` | креатив/выживание, только в одиночной игре |
-| `Esc` | назад, пауза, возврат в меню или выход |
-| `F3` | статистика streaming/renderer |
-| `F7`, `Shift+F7` | включить / выключить mouse look |
-| `V` | вертикальная синхронизация |
-
-В выживании ломание занимает время, блок выпадает предметом, появляются
-частицы, а установка расходует инвентарь. В креативе ломание мгновенное,
-дропов и частиц нет, предметы не расходуются.
-
-## Архитектура
-
-```text
-laiue.exe -> laiue_core.dll
-             ├─ window + input + audio
-             ├─ mesher + render
-             └─ laiue::headless_stack
-                  └─ world + physics + gameplay + interaction
-                     + content + mod + network
-
-laiue_server(.exe) -> laiue::headless_stack
+```cmake
+find_package(laiue 0.6 CONFIG REQUIRED)
+target_link_libraries(my_application PRIVATE laiue::engine)
 ```
 
-`core` компонует клиент. Сервер не зависит от `core`, окна, input,
-renderer или mesher. Направления include-зависимостей проверяются при
-сборке. Полное описание — в [docs/architecture.md](docs/architecture.md).
+Для узкой зависимости доступны цели `laiue::world`, `laiue::physics`,
+`laiue::content` и графические цели установленной Windows-сборки.
+
+## Мир приложения
+
+Минимальный пустой мир:
+
+```c
+World* world = WorldCreate(NULL);
+if (world == NULL)
+{
+    return false;
+}
+
+WorldSetBlock(world, 0, 0, 0, 1);
+WorldDestroy(world);
+```
+
+Для внешнего источника заполните `WorldBaseProvider`:
+
+```c
+static BlockType ReadBase(void* context, int64_t x, int64_t y, int64_t z)
+{
+    const MyWorldSource* source = context;
+    return MyWorldSourceRead(source, x, y, z);
+}
+
+WorldBaseProvider provider = {
+    .context = &source,
+    .getBlock = ReadBase,
+    .fillRegion = NULL,
+    .rebase = NULL,
+};
+World* world = WorldCreate(&provider);
+```
+
+`getBlock` обязателен для непустого provider. Опциональный `fillRegion`
+ускоряет чтение прямоугольных областей, а `rebase` синхронизирует внешний
+источник при сдвиге локального начала. Структура provider копируется, но
+`context` принадлежит приложению и должен жить дольше `World`. Колбэки могут
+вызываться параллельно, обязаны быть thread-safe и не должны повторно входить
+в тот же `World`.
+
+`World` хранит локальные `int64_t`-координаты рядом с активной областью, а
+абсолютное начало — в `InfiniteCoord`. `WorldRebase` переносит локальное
+начало на целое число чанков, сохраняя абсолютные позиции и разреженные
+правки. Перед вызовом приложение останавливает streaming, meshing и другие
+операции с локальными координатами. Если provider отклоняет сдвиг, состояние
+мира не меняется; отклоняющий callback также оставляет свой `context` без
+изменений.
+
+Абсолютные координаты не передаются в GPU. Приложение выбирает близкую к
+камере локальную точку `render origin`, вычитает её из позиций чанков и лишь
+после этого преобразует результат во `float`. Поэтому точность рендера не
+зависит от удаления от абсолютного нуля.
+
+Подробные контракты описаны в
+[docs/architecture.md](docs/architecture.md).
 
 ## Содержимое
 
-Поддерживаются три категории:
+Renderer поддерживает подключаемые шейдерпаки `.lsp` и GPU-ready
+текстурпаки `.ltp`. Встроенные нейтральные ресурсы используются как fallback;
+проект приложения решает, какие паки поставлять и как показывать выбор
+пользователю.
 
-- моды: `mods/<name>.lmp` с `mod.lm` v2 и платформенными DLL/SO;
-- шейдерпаки: `shaders/<name>.lsp` с DXBC-стадиями `.ls`;
-- текстурпаки: `textures/<name>.ltp`.
-
-`.lr/.lrp` и `.ld/.ldp` удалены. Нативные моды не изолированы и должны
-быть доверенными. Сетевой набор `server`/`both` модов сверяется по
-порядку, id, версии и SHA-256; `client`-моды в сравнении не участвуют.
-
-## Сохранения
-
-Одиночные миры лежат в `saves/<slot>`: метаданные, правки чанков,
-`constructs.dat`, игрок, инвентарь, `mods.lock` и `moddata/`. Основные файлы
-записываются через временный файл с атомарной заменой. Dedicated server
-сохраняет `saves/default/chunks.dat`, `constructs.dat` и данные модов;
-состояние игроков пока временное.
-
-## Документация
-
-- [архитектура](docs/architecture.md)
-- [аудио](docs/audio.md)
-- [актуальный план](docs/improvement_plan.md)
-- [мультиплеер и безопасность](docs/multiplayer.md)
-- [secure remote server](docs/secure_server.md)
-- [переносимость и Linux](docs/portability.md)
-- [моддинг и SDK](docs/modding.md)
+- [архитектура содержимого](docs/content_architecture.md)
 - [форматы содержимого](docs/content_formats.md)
 - [шейдерпаки](docs/shaderpacks.md)
 - [текстурпаки](docs/texturepacks.md)
-- [сохранения](docs/world_format.md)
-- [параметры физики игрока](docs/player_physics.md)
-- [физика конструкций и сетевая репликация](docs/physics.md)
+- [аудио](docs/audio.md)
+
+## Разработка
+
+Правила зависимостей, тестирования и изменения публичного API находятся в
+[CONTRIBUTING.md](CONTRIBUTING.md). Перед отправкой изменения запустите
+релевантный build/CTest, архитектурную проверку и `git diff --check`.
 
 ## Лицензия
 
