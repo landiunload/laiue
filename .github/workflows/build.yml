@@ -55,7 +55,7 @@ jobs:
           --target laiue_engine_bundle
       - name: Upload Windows engine SDK
         if: matrix.preset == 'windows-msvc'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: laiue-engine-windows-x86_64
           path: build/windows-msvc/bundles/engine/Release
@@ -98,7 +98,7 @@ jobs:
           --target laiue_engine_bundle
       - name: Upload Linux engine SDK
         if: matrix.preset == 'linux-clang'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: laiue-engine-linux-gnu-x86_64
           path: build/linux-clang/bundles/engine/Release
