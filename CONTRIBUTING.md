@@ -48,6 +48,8 @@ check: нужен реальный link и запуск релевантных �
   backend-файлах.
 - `world` и `physics` не выполняют platform I/O и не выбирают ОС через
   `#ifdef`.
+- `mod` не включает игровые, сетевые, scene или render interfaces: прикладные
+  возможности публикуются узкими versioned service tables.
 - Крупную библиотеку делят на внутренние `.c/.h`, если новой подсистеме не
   нужен самостоятельный жизненный цикл и отдельный публичный C API.
 - CMake options, include paths, definitions и linker flags target-scoped.
@@ -82,6 +84,33 @@ World origin не заменяет render origin. До преобразован�
 чанка вычитается из близкого к камере локального начала. В шейдеры не
 передаются `InfiniteCoord` и большие абсолютные значения.
 
+## Контракт physics
+
+- Интегратор приложения использует fixed step и стабильный порядок тел.
+- Один simulation step читает неизменяемый snapshot world/collider callbacks.
+- Динамические коллайдеры имеют уникальный ненулевой `stableId`; callback не
+  возвращает усечённую выборку как успешную.
+- Перед шагом приложение вызывает `VoxelBodyLocalRangeIsResolved` и при
+  необходимости синхронно rebases `World` и все локальные тела.
+- Изменение collision arithmetic проверяет x86_64 reference hash, повторный
+  прогон, rebased schedule, границы чанков и resting-contact drift.
+- Детерминизм для новой архитектуры объявляется только после отдельного
+  эталонного запуска; x86_64 результат нельзя автоматически переносить на
+  ARM64.
+
+## Контракт модов
+
+- Нативный мод — доверенный in-process код; path validation не называется
+  sandbox.
+- Мод включает standalone `mod_api.h`, не линкуется с внутренними DLL/SO и
+  запрашивает только versioned services.
+- Registry сервисов не меняется, пока моды загружаются, выгружаются или
+  активны. Service implementation живёт до завершения `unload`.
+- Worker threads мода останавливаются и join-ятся внутри `unload` до закрытия
+  dynamic library.
+- `LoadMany` получает явный детерминированный порядок приложения; discovery
+  никогда не означает автоматическое выполнение найденного кода.
+
 ## Публичный API и совместимость
 
 - Публичные функции отмечаются правильным `LAIUE_<MODULE>_API` из
@@ -104,7 +133,7 @@ World origin не заменяет render origin. До преобразован�
   native representation.
 - Указатели, `wchar_t` и native structs не сериализуются.
 - Имя из внешнего файла проверяется до построения пути. Запрещены traversal,
-  symlink/reparse escape и case-collision.
+  symlink/reparse escape и ASCII case-collision.
 - Windows no-CRT изменение проверяется по imports готового бинарника, а не
   только успешной компиляцией.
 - Linux ABI проверяется отдельно для используемой libc; glibc и musl
@@ -143,6 +172,8 @@ World origin не заменяет render origin. До преобразован�
 - [форматы содержимого](docs/content_formats.md)
 - [шейдерпаки](docs/shaderpacks.md)
 - [текстурпаки](docs/texturepacks.md)
+- [моды](docs/modding.md)
+- [физика](docs/physics.md)
 - [аудио](docs/audio.md)
 
 `CONTRIBUTING.md` — канонический набор правил разработки. Editor/agent-

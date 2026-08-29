@@ -17,6 +17,7 @@ typedef struct WindowsDirectoryIterator
 
 _Static_assert(sizeof(SRWLOCK) <= sizeof(PlatformRwLock),
     "PlatformRwLock storage is too small");
+_Static_assert(sizeof(uint32_t) == sizeof(LONG), "platform atomics require 32-bit LONG");
 _Static_assert(sizeof(WindowsDirectoryIterator) <= sizeof(PlatformDirectoryIterator),
     "PlatformDirectoryIterator storage is too small");
 
@@ -84,6 +85,29 @@ void PlatformRwLockAcquireExclusive(PlatformRwLock* lock)
 void PlatformRwLockReleaseExclusive(PlatformRwLock* lock)
 {
     ReleaseSRWLockExclusive((PSRWLOCK)lock);
+}
+
+uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)
+{
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+}
+
+bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
+                                      uint32_t desired)
+{
+    LONG previous =
+        InterlockedCompareExchange((volatile LONG *)value, (LONG)desired, (LONG)*expected);
+    if ((uint32_t)previous == *expected)
+    {
+        return true;
+    }
+    *expected = (uint32_t)previous;
+    return false;
+}
+
+void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired)
+{
+    InterlockedExchange((volatile LONG *)value, (LONG)desired);
 }
 
 double PlatformMonotonicSeconds(void)

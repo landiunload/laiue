@@ -22,6 +22,24 @@ Contract 1 принимает скомпилированный DXBC, а не HLS
 pipeline replacement; повреждённый или несовместимый pack не заменяет уже
 рабочий pipeline.
 
+Это все стадии, которыми владеет renderer 0.7. Пак не может произвольно
+добавить новый render pass, root signature или compute pipeline: для такого
+расширения нужен новый versioned renderer contract. Структурированный
+`LaiueShaderSet` имеет отдельный slot и bit маски для каждой текущей стадии,
+поэтому частичная настройка не требует шести несвязанных параметров.
+
+Обычный путь применения:
+
+1. приложение создаёт явный `LaiueContentCatalog`;
+2. `ShaderPackActivateIn` записывает выбранное имя;
+3. `RendererReloadShaderPackFrom` загружает pack, создаёт все replacement
+   PSO и переключает их одной операцией;
+4. при ошибке прежние PSO и скопированный bytecode остаются активными.
+
+`ShaderPackLoadActiveSet` доступен отдельно для editor/предпросмотра. Он
+возвращает immutable owned object; renderer копирует bytecode, после чего
+объект освобождается через `ShaderPackLoadedSetRelease`.
+
 ## Contract 1
 
 Эталонные реализации находятся в `shaders/*.hlsl`.

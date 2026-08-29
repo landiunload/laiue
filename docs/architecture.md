@@ -10,6 +10,10 @@
 Прикладная реализация, ранее находившаяся рядом с runtime, сохранена в
 [landiunload/laiue-game](https://github.com/landiunload/laiue-game).
 
+Процедурная генерация, правила игры, сетевой протокол и сервер не входят в
+движок. Их можно строить поверх provider/callback/service contracts, но
+версия 0.7 намеренно не навязывает такие подсистемы.
+
 ## Модули
 
 | Модуль | Ответственность |
@@ -18,6 +22,7 @@
 | `world` | бесконечное начало координат, внешний base provider и sparse overrides |
 | `physics` | переносимые AABB, sweep и столкновения с воксельной геометрией |
 | `content` | безопасные имена, каталог форматов и выбор активного пака |
+| `mod` | discovery паков, native ABI и registry versioned services |
 | `window` | Win32-окно и message loop |
 | `input` | Raw Input клавиатуры и мыши |
 | `audio` | асинхронное воспроизведение через Media Foundation |
@@ -26,7 +31,7 @@
 | `scene` | камера, chunk streaming, panorama и voxel raycast |
 | `ui` | immediate-mode UI поверх `render` |
 
-Первые четыре модуля образуют переносимое ядро. Графические модули доступны
+Первые пять модулей образуют переносимое ядро. Графические модули доступны
 на Windows. Публичные API помечены export-макросами из `src/api.h`;
 владеющие состоянием объекты остаются непрозрачными.
 
@@ -38,10 +43,11 @@ external application
         └── laiue::engine
               ├── platform_support
               ├── content
+              ├── mod ─────────── platform_support
               ├── world ──────── platform_support
               ├── physics
               ├── mesh ───────── world
-              ├── render ─────── platform_support
+              ├── render ─────── content + platform_support
               ├── scene ──────── world + mesh + render
               └── ui ─────────── render + scene
 ```
@@ -50,6 +56,11 @@ external application
 Linux core. Нижние модули не включают заголовки `scene` или `ui`.
 Допустимый include/link-граф задан в `src/*/CMakeLists.txt` и проверяется
 архитектурным тестом.
+
+`mod` не зависит от игровых типов, `World` или renderer. Приложение
+регистрирует узкие versioned service tables, и только через них нативный мод
+получает возможности. Так прикладные интерфейсы зависят от абстракции ABI,
+а не заставляют нижние модули зависеть от игры.
 
 Новая библиотека оправдана, когда подсистема имеет отдельный жизненный цикл,
 узкий C API и самостоятельного потребителя. В остальных случаях добавляется
@@ -124,11 +135,25 @@ Streaming передаёт renderer позиции чанков относите
 | provider `context` | внешнее приложение | живёт дольше `World`; callback thread-safe |
 | `ChunkStreaming` | внешнее приложение | orchestration на основном потоке, CPU meshing workers |
 | `Renderer` и GPU meshes | внешнее приложение | создание/рисование на графическом потоке, release после fence |
+| `LaiueContentCatalog` | внешнее приложение | concurrent reads, сериализованные active-pack updates |
+| `LaiueModHost` | внешнее приложение | сериализованные load/unload; concurrent service queries |
 | `AudioPlayer` | вызывающий код | управляющий поток плюс внутренние Windows callbacks |
 
 Meshing workers читают `World` и создают CPU-геометрию, но не вызывают
 renderer или UI. Rebasing выполняется только после остановки этих workers.
 Публичная release-функция вызывается в том же модуле, который выделил объект.
+
+## Принципы расширения
+
+- Один модуль отвечает за один жизненный цикл и один класс ресурсов.
+- `world` получает данные через `WorldBaseProvider`, physics — через collision
+  callbacks, а моды — через service tables; конкретная игра не прошита в core.
+- Новые visual packs расширяют данные без изменения каталога; новые mod
+  capabilities добавляются отдельными versioned services.
+- Непрозрачные handles, явные Create/Destroy и module-owned release-функции
+  задают единственного владельца памяти и OS/GPU handles.
+- Hot reload сначала полностью готовит replacement и лишь затем меняет
+  рабочее состояние. Ошибка не оставляет частично обновлённый renderer.
 
 ## Горячие пути
 
@@ -143,7 +168,9 @@ renderer или UI. Rebasing выполняется только после ос
 ## Ошибки и совместимость
 
 - Неверный внешний pack не должен повреждать `World`; renderer использует
-  встроенный fallback.
+  прежний рабочий ресурс, а при первой подготовке — встроенный fallback.
+- Нативный мод считается доверенным in-process кодом; manifest validation не
+  подменяет sandbox или проверку происхождения бинарника.
 - Размеры, offsets, counts и enum из файлов проверяются до allocation и
   индексирования.
 - Несовместимое изменение публичного API требует явного обновления версии.

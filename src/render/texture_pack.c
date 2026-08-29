@@ -1,6 +1,7 @@
 #include "render/texture_pack.h"
 #include "render/texture_pack_internal.h"
 #include "content/content_catalog.h"
+#include "platform/system.h"
 
 #include <windows.h>
 #include <string.h>
@@ -12,8 +13,6 @@
 #define LTP_FORMAT_RGBA8 1u
 #define LTP_FORMAT_RGBA8_NORMALS 2u
 
-#define ACTIVE_NAME_MAX_BYTES 128u
-#define PATH_CAPACITY_CHARS   32768u
 #define TEXTURE_MAX_DIMENSION 4096u
 
 // Material-agnostic single-layer fallback. It keeps the renderer usable
@@ -44,51 +43,6 @@ static void SetFallback(TexturePackData* pack)
     pack->normalPixels = NULL;
 }
 
-static uint32_t LiteralLength(const wchar_t* text)
-{
-    uint32_t length = 0;
-    while (text[length] != L'\0') ++length;
-    return length;
-}
-
-static bool BuildPath(wchar_t* path, uint32_t capacity,
-    uint32_t directoryLength, const wchar_t* suffix)
-{
-    uint32_t suffixLength = LiteralLength(suffix);
-    if (directoryLength + suffixLength + 1u > capacity)
-    {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < suffixLength; ++i)
-    {
-        path[directoryLength + i] = suffix[i];
-    }
-    path[directoryLength + suffixLength] = L'\0';
-    return true;
-}
-
-static bool GetExecutableDirectory(
-    wchar_t* path, uint32_t capacity, uint32_t* outDirectoryLength)
-{
-    DWORD length = GetModuleFileNameW(NULL, path, capacity);
-    if (length == 0 || length >= capacity)
-    {
-        return false;
-    }
-
-    for (uint32_t i = (uint32_t)length; i > 0; --i)
-    {
-        wchar_t character = path[i - 1u];
-        if (character == L'\\' || character == L'/')
-        {
-            *outDirectoryLength = i - 1u;
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool ReadFileExact(HANDLE file, void* destination, uint32_t byteCount)
 {
     uint8_t* output = (uint8_t*)destination;
@@ -103,95 +57,6 @@ static bool ReadFileExact(HANDLE file, void* destination, uint32_t byteCount)
         }
         completed += read;
     }
-    return true;
-}
-
-static bool IsAsciiLetterOrDigit(uint8_t character)
-{
-    return (character >= 'a' && character <= 'z')
-        || (character >= 'A' && character <= 'Z')
-        || (character >= '0' && character <= '9');
-}
-
-static uint8_t AsciiLower(uint8_t character)
-{
-    return character >= 'A' && character <= 'Z'
-        ? (uint8_t)(character + ('a' - 'A'))
-        : character;
-}
-
-static bool HasPackExtension(const uint8_t* name, uint32_t length)
-{
-    if (length <= 4u) return false;
-    uint8_t ext4 = AsciiLower(name[length - 4u]);
-    uint8_t ext3 = AsciiLower(name[length - 3u]);
-    uint8_t ext2 = AsciiLower(name[length - 2u]);
-    uint8_t ext1 = AsciiLower(name[length - 1u]);
-    return ext4 == '.' && ext3 == 'l' && ext2 == 't' && ext1 == 'p';
-}
-
-#define HasLtpExtension HasPackExtension
-
-static bool ReadActiveName(
-    const wchar_t* activePath, uint8_t outName[ACTIVE_NAME_MAX_BYTES],
-    uint32_t* outLength)
-{
-    HANDLE file = CreateFileW(activePath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    uint8_t bytes[ACTIVE_NAME_MAX_BYTES + 8u];
-    LARGE_INTEGER size;
-    bool succeeded = GetFileSizeEx(file, &size)
-        && size.QuadPart > 0
-        && size.QuadPart <= (LONGLONG)sizeof(bytes)
-        && ReadFileExact(file, bytes, (uint32_t)size.QuadPart);
-    CloseHandle(file);
-    if (!succeeded)
-    {
-        return false;
-    }
-
-    uint32_t begin = 0;
-    uint32_t end = (uint32_t)size.QuadPart;
-    if (end >= 3u && bytes[0] == 0xEFu && bytes[1] == 0xBBu && bytes[2] == 0xBFu)
-    {
-        begin = 3u;
-    }
-    while (begin < end && (bytes[begin] == ' ' || bytes[begin] == '\t'
-        || bytes[begin] == '\r' || bytes[begin] == '\n'))
-    {
-        ++begin;
-    }
-    while (end > begin && (bytes[end - 1u] == ' ' || bytes[end - 1u] == '\t'
-        || bytes[end - 1u] == '\r' || bytes[end - 1u] == '\n'))
-    {
-        --end;
-    }
-
-    uint32_t length = end - begin;
-    if (length == 0 || length > ACTIVE_NAME_MAX_BYTES
-        || !IsAsciiLetterOrDigit(bytes[begin])
-        || !HasLtpExtension(bytes + begin, length))
-    {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < length; ++i)
-    {
-        uint8_t character = bytes[begin + i];
-        if (!IsAsciiLetterOrDigit(character)
-            && character != '_' && character != '-' && character != '.')
-        {
-            return false;
-        }
-        outName[i] = character;
-    }
-    *outLength = length;
     return true;
 }
 
@@ -284,10 +149,10 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
         return false;
     }
 
-    uint8_t* pixels = HeapAlloc(GetProcessHeap(), 0, dataBytes);
+    uint8_t *pixels = PlatformAllocate(dataBytes, false);
     if (pixels == NULL || !ReadFileExact(file, pixels, dataBytes))
     {
-        if (pixels != NULL) HeapFree(GetProcessHeap(), 0, pixels);
+        PlatformFree(pixels);
         CloseHandle(file);
         return false;
     }
@@ -303,65 +168,54 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
     return true;
 }
 
-TexturePackLoadStatus TexturePackLoadActive(TexturePackData* outPack)
+TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
+                                                TexturePackData *outPack)
 {
-    if (outPack == NULL)
+    if (catalog == NULL || outPack == NULL)
     {
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
     SetFallback(outPack);
 
-    wchar_t* path = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
     if (path == NULL)
     {
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
-    uint32_t directoryLength = 0;
-    uint8_t activeName[ACTIVE_NAME_MAX_BYTES];
-    uint32_t activeNameLength = 0;
-    if (!GetExecutableDirectory(path, PATH_CAPACITY_CHARS, &directoryLength)
-        || !BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-            L"\\textures\\active.txt"))
+    wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
+    if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_TEXTURE_PACK, activeName,
+                                          LAIUE_CONTENT_NAME_CAPACITY))
     {
-        HeapFree(GetProcessHeap(), 0, path);
+        bool activeFileExists =
+            LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_TEXTURE_PACK, NULL, L"active.txt",
+                                         path, LAIUE_CONTENT_PATH_CAPACITY) &&
+            PlatformPathExists(path);
+        PlatformFree(path);
+        return activeFileExists ? TEXTURE_PACK_LOAD_INVALID : TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
+    }
+
+    if (!LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_TEXTURE_PACK, activeName, NULL, path,
+                                      LAIUE_CONTENT_PATH_CAPACITY))
+    {
+        PlatformFree(path);
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
-    DWORD activeAttributes = GetFileAttributesW(path);
-    if (!ReadActiveName(path, activeName, &activeNameLength))
+
+    TexturePackData loaded;
+    if (!LoadLtp(path, &loaded))
     {
-        HeapFree(GetProcessHeap(), 0, path);
-        return activeAttributes == INVALID_FILE_ATTRIBUTES
-            ? TEXTURE_PACK_LOAD_NO_ACTIVE_PACK : TEXTURE_PACK_LOAD_INVALID;
+        PlatformFree(path);
+        return TEXTURE_PACK_LOAD_INVALID;
     }
-    bool ready = BuildPath(path, PATH_CAPACITY_CHARS, directoryLength,
-        L"\\textures\\");
+    *outPack = loaded;
+    PlatformFree(path);
+    return TEXTURE_PACK_LOAD_OK;
+}
 
-    if (ready)
-    {
-        uint32_t prefixLength = directoryLength
-            + LiteralLength(L"\\textures\\");
-        if (prefixLength + activeNameLength + 1u <= PATH_CAPACITY_CHARS)
-        {
-            for (uint32_t i = 0; i < activeNameLength; ++i)
-            {
-                path[prefixLength + i] = (wchar_t)activeName[i];
-            }
-            path[prefixLength + activeNameLength] = L'\0';
-
-            TexturePackData loaded;
-            if (LoadLtp(path, &loaded))
-            {
-                *outPack = loaded;
-                HeapFree(GetProcessHeap(), 0, path);
-                return TEXTURE_PACK_LOAD_OK;
-            }
-        }
-    }
-
-    HeapFree(GetProcessHeap(), 0, path);
-    return ready ? TEXTURE_PACK_LOAD_INVALID : TEXTURE_PACK_LOAD_IO_ERROR;
+TexturePackLoadStatus TexturePackLoadActive(TexturePackData *outPack)
+{
+    return TexturePackLoadActiveFrom(LaiueContentCatalogDefault(), outPack);
 }
 
 static bool GetSubresourceFrom(const TexturePackData* pack,
@@ -430,7 +284,7 @@ void TexturePackRelease(TexturePackData* pack)
     }
     if (pack->pixels != NULL && pack->pixels != g_fallbackPixels)
     {
-        HeapFree(GetProcessHeap(), 0, (void*)pack->pixels);
+        PlatformFree((void *)pack->pixels);
     }
     pack->width = 0;
     pack->height = 0;
@@ -441,9 +295,9 @@ void TexturePackRelease(TexturePackData* pack)
     pack->normalPixels = NULL;
 }
 
-bool TexturePackEnumerate(TexturePackList* outList)
+bool TexturePackEnumerateFrom(LaiueContentCatalog *catalog, TexturePackList *outList)
 {
-    if (outList == NULL)
+    if (catalog == NULL || outList == NULL)
     {
         return false;
     }
@@ -451,8 +305,7 @@ bool TexturePackEnumerate(TexturePackList* outList)
     outList->count = 0;
 
     LaiueContentList contentList;
-    if (!LaiueContentEnumerate(
-            LAIUE_CONTENT_TEXTURE_PACK, &contentList))
+    if (!LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_TEXTURE_PACK, &contentList))
     {
         return false;
     }
@@ -461,8 +314,8 @@ bool TexturePackEnumerate(TexturePackList* outList)
         LaiueContentListRelease(&contentList);
         return true;
     }
-    outList->entries = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)contentList.count * sizeof(TexturePackEntry));
+    outList->entries =
+        PlatformAllocate((size_t)contentList.count * sizeof(TexturePackEntry), false);
     if (outList->entries == NULL)
     {
         LaiueContentListRelease(&contentList);
@@ -486,30 +339,37 @@ bool TexturePackEnumerate(TexturePackList* outList)
     return true;
 }
 
+bool TexturePackEnumerate(TexturePackList *outList)
+{
+    return TexturePackEnumerateFrom(LaiueContentCatalogDefault(), outList);
+}
+
 void TexturePackListRelease(TexturePackList* list)
 {
     if (list == NULL)
     {
         return;
     }
-    if (list->entries != NULL)
-    {
-        HeapFree(GetProcessHeap(), 0, list->entries);
-    }
+    PlatformFree(list->entries);
     list->entries = NULL;
     list->count = 0;
 }
 
-bool TexturePackActivate(const wchar_t* name)
+bool TexturePackActivateIn(LaiueContentCatalog *catalog, const wchar_t *name)
 {
     // NULL или пустая строка сбрасывают выбор на нейтральный
     // однослойный fallback при следующей перезагрузке пака.
     if (name == NULL || name[0] == L'\0')
     {
-        return LaiueContentSetActivePack(LAIUE_CONTENT_TEXTURE_PACK, NULL);
+        return LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_TEXTURE_PACK, NULL);
     }
 
     // Валидация имени и формата, запись active.txt и проверка существования
     // пака целиком живут в едином каталоге содержимого.
-    return LaiueContentSetActivePack(LAIUE_CONTENT_TEXTURE_PACK, name);
+    return LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_TEXTURE_PACK, name);
+}
+
+bool TexturePackActivate(const wchar_t *name)
+{
+    return TexturePackActivateIn(LaiueContentCatalogDefault(), name);
 }

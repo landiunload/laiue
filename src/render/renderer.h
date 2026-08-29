@@ -2,6 +2,7 @@
 
 #include "api.h"
 #include "render/chunk_geometry.h"
+#include "render/shader_pack.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -95,6 +96,7 @@ typedef struct RendererFrameSetup
 // загружает отдельно, когда они действительно нужны.
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);
 LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
+LAIUE_RENDER_API bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog);
 LAIUE_RENDER_API bool      RendererPrepareWorld(Renderer* renderer);
 LAIUE_RENDER_API void      RendererReleaseWorld(Renderer* renderer);
 LAIUE_RENDER_API bool      RendererIsWorldReady(const Renderer* renderer);
@@ -177,7 +179,14 @@ LAIUE_RENDER_API void RendererDrawMeshInstances(Renderer* renderer,
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
 
-// Перезагружает текстурный пак из active.txt (вызывать вне BeginFrame/EndFrame).
+// Explicit-catalog variant keeps content location an application policy.
+// Both calls copy/upload the pack synchronously and do not retain catalog.
+// The swap is transactional: an invalid pack, I/O error or GPU allocation
+// failure leaves the previous textures and descriptors active.  With no
+// active pack, a neutral built-in fallback is selected intentionally.
+LAIUE_RENDER_API bool RendererReloadTexturePackFrom(Renderer *renderer,
+                                                    LaiueContentCatalog *catalog);
+// Compatibility wrapper: reloads from the executable-root default catalog.
 LAIUE_RENDER_API bool RendererReloadTexturePack(Renderer* renderer);
 LAIUE_RENDER_API RendererContentStatus RendererGetTexturePackLoadStatus(
     const Renderer* renderer);
@@ -186,9 +195,23 @@ LAIUE_RENDER_API RendererContentStatus RendererGetTexturePackLoadStatus(
 LAIUE_RENDER_API void RendererSetWireframe(Renderer* renderer, bool enabled);
 LAIUE_RENDER_API bool RendererIsWireframe(const Renderer* renderer);
 
-// Перезагрузка шейдеров из байткода. Каждый параметр — указатель на DXBC
-// и его длина. Если указатель NULL, используется встроенный шейдер.
-// Вызывать вне BeginFrame/EndFrame.
+// Transactionally replaces every renderer pipeline represented by shaderSet.
+// Missing overrides use embedded bytecode.  The renderer copies overrides and
+// retains no pointer into shaderSet.  NULL selects the complete fallback set.
+// On validation/allocation/PSO failure the previous working set is retained.
+// Call outside BeginFrame/EndFrame.
+LAIUE_RENDER_API bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet);
+
+// Loads the active pack from catalog and applies it transactionally.  With no
+// active pack the embedded complete fallback set is applied.  Invalid packs
+// and PSO failures keep the previous working set active and return false.
+LAIUE_RENDER_API bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catalog,
+                                                   ShaderPackLoadStatus *outStatus);
+// Compatibility wrapper: uses the executable-root default catalog.
+LAIUE_RENDER_API bool RendererReloadShaderPack(Renderer *renderer, ShaderPackLoadStatus *outStatus);
+
+// Legacy adapter retained for source compatibility.  Prefer the versioned
+// LaiueShaderSet API above.
 LAIUE_RENDER_API bool RendererReloadShaders(Renderer* renderer,
     const void* chunkVS, uint32_t chunkVSLength,
     const void* chunkPS, uint32_t chunkPSLength,

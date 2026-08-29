@@ -76,6 +76,32 @@ static bool BodyShapeIsValid(const VoxelBodyShape* shape)
         && shape->collisionEpsilon >= 0.0;
 }
 
+static bool CollisionMarginIsResolved(const VoxelBodyBounds *bounds, double collisionEpsilon)
+{
+    if (collisionEpsilon == 0.0)
+    {
+        return true;
+    }
+
+    // A finite coordinate can still be too coarse for a useful collision
+    // margin. Requiring an eighth-margin to change both adjacent values keeps
+    // clipping and overlap tests at least four local ULPs away from silently
+    // collapsing. Absolute world distance is irrelevant here: applications
+    // are expected to rebase active bodies back into this resolved range.
+    double resolutionProbe = collisionEpsilon * 0.125;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        if (!(bounds->minimum[axis] + resolutionProbe > bounds->minimum[axis] &&
+              bounds->minimum[axis] - resolutionProbe < bounds->minimum[axis] &&
+              bounds->maximum[axis] + resolutionProbe > bounds->maximum[axis] &&
+              bounds->maximum[axis] - resolutionProbe < bounds->maximum[axis]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool CalculateValidBodyBounds(const double position[3],
     const VoxelBodyShape* shape, VoxelBodyBounds* outBounds)
 {
@@ -92,7 +118,18 @@ static bool CalculateValidBodyBounds(const double position[3],
         }
     }
     VoxelBodyCalculateBounds(position, shape, outBounds);
-    return BoundsAreValid(outBounds);
+    return BoundsAreValid(outBounds) &&
+           CollisionMarginIsResolved(outBounds, shape->collisionEpsilon);
+}
+
+bool VoxelBodyLocalRangeIsResolved(const double position[3], const VoxelBodyShape *shape)
+{
+    if (position == NULL || shape == NULL)
+    {
+        return false;
+    }
+    VoxelBodyBounds bounds;
+    return CalculateValidBodyBounds(position, shape, &bounds);
 }
 
 static bool TryFloorToInt64(double value, int64_t* outValue)
@@ -495,6 +532,13 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
     {
         return false;
     }
+    // A non-zero command which rounds back to the original coordinate must
+    // not be reported as successful movement. This is the same fail-closed
+    // contract as an out-of-range coordinate and avoids silent sub-ULP drift.
+    if (position[axis] + distance == position[axis])
+    {
+        return true;
+    }
     if (collision->queryDynamicColliders == NULL)
     {
         return MoveAxisAgainstBlocks(
@@ -575,7 +619,6 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
             // tunnel through the opposite face in one axis operation.
             clippedPosition[axis] = position[axis];
             collided = true;
-            clippingStableId = collider->stableId;
             break;
         }
 

@@ -181,13 +181,10 @@ struct Renderer
     bool                       wireframeEnabled;
     bool                       worldReady;
 
-    // Загруженный байткод шейдеров (для шейдерпаков).
-    void* loadedChunkVS;       uint32_t loadedChunkVSLength;
-    void* loadedChunkPS;       uint32_t loadedChunkPSLength;
-    void* loadedPanoramaVS;    uint32_t loadedPanoramaVSLength;
-    void* loadedPanoramaPS;    uint32_t loadedPanoramaPSLength;
-    void* loadedUIVS;          uint32_t loadedUIVSLength;
-    void* loadedUIPS;          uint32_t loadedUIPSLength;
+    // Owned copies of application shader overrides, indexed by
+    // LaiueShaderSlot.  NULL entries select checked-in embedded fallbacks.
+    void *loadedShaders[LAIUE_SHADER_SLOT_COUNT];
+    uint32_t loadedShaderLengths[LAIUE_SHADER_SLOT_COUNT];
 
     GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
     uint32_t                   poolBlockCount;
@@ -215,6 +212,18 @@ struct Renderer
 };
 
 static bool RecreateChunkPipelineState(Renderer* renderer);
+static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
+                                               void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                               const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                               ID3D12PipelineState **outPipelineState);
+static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
+                                                 void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                                 const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                                 ID3D12PipelineState **outPipelineState);
+static bool CreateUiPipelineStateForShaders(Renderer *renderer,
+                                            void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                            const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                            ID3D12PipelineState **outPipelineState);
 
 static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
     ID3D12Resource* resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter)
@@ -547,37 +556,8 @@ static bool CreateRootSignature(Renderer* renderer)
 
 static bool CreatePipelineState(Renderer* renderer)
 {
-    // Vertex pulling: вершинных буферов нет, input layout пуст,
-    // геометрия читается шейдером из ByteAddressBuffer по SV_VertexID.
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
-    memset(&description, 0, sizeof(description));
-    description.pRootSignature = renderer->rootSignature;
-    description.VS.pShaderBytecode = g_chunk_vs;
-    description.VS.BytecodeLength = sizeof(g_chunk_vs);
-    description.PS.pShaderBytecode = g_chunk_ps;
-    description.PS.BytecodeLength = sizeof(g_chunk_ps);
-    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-    // Перестановка Y/Z в геометрии инвертирует winding, но перевод Z-up мира
-    // в D3D view-space (Y-up, Z-forward) инвертирует его ещё раз. Эти две
-    // перестановки компенсируют друг друга, поэтому сохраняем исходное правило:
-    // внешние стороны квада имеют clockwise winding в render-target space.
-    description.RasterizerState.FrontCounterClockwise = FALSE;
-    description.RasterizerState.DepthClipEnable = TRUE;
-    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    description.DepthStencilState.DepthEnable = TRUE;
-    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    description.DepthStencilState.StencilEnable = FALSE;
-    description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    description.SampleMask = 0xFFFFFFFF;
-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    description.SampleDesc.Count = 1;
-
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->pipelineState));
+    return CreateChunkPipelineStateForShaders(
+        renderer, renderer->loadedShaders, renderer->loadedShaderLengths, &renderer->pipelineState);
 }
 
 // Общий путь создания texture array блоков (albedo или нормали):
@@ -585,11 +565,12 @@ static bool CreatePipelineState(Renderer* renderer)
 typedef bool (*PackSubresourceGetter)(const TexturePackData* pack,
     uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
 
-static bool CreateBlockArrayTexture(Renderer* renderer,
-    const TexturePackData* pack, PackSubresourceGetter getSubresource,
-    uint32_t srvSlot, DXGI_FORMAT format,
-    ID3D12Resource** outTexture, ID3D12Resource** outUpload)
+static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *pack,
+                                    PackSubresourceGetter getSubresource, DXGI_FORMAT format,
+                                    ID3D12Resource **outTexture, ID3D12Resource **outUpload)
 {
+    *outTexture = NULL;
+    *outUpload = NULL;
     UINT subresourceCount = (UINT)pack->layerCount * pack->mipCount;
     if (subresourceCount == 0 || subresourceCount > MAX_TEXTURE_SUBRESOURCES)
     {
@@ -620,6 +601,8 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
         (SIZE_T)subresourceCount * sizeof(*layouts));
     if (layouts == NULL)
     {
+        ID3D12Resource_Release(*outTexture);
+        *outTexture = NULL;
         return false;
     }
     UINT64 uploadBytes = 0;
@@ -642,6 +625,8 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
         NULL, &IID_ID3D12Resource, (void**)outUpload)))
     {
         HeapFree(GetProcessHeap(), 0, layouts);
+        ID3D12Resource_Release(*outTexture);
+        *outTexture = NULL;
         return false;
     }
 
@@ -650,6 +635,10 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
     if (FAILED(ID3D12Resource_Map(*outUpload, 0, &emptyRange, (void**)&mapped)))
     {
         HeapFree(GetProcessHeap(), 0, layouts);
+        ID3D12Resource_Release(*outUpload);
+        ID3D12Resource_Release(*outTexture);
+        *outUpload = NULL;
+        *outTexture = NULL;
         return false;
     }
 
@@ -663,6 +652,10 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
             {
                 ID3D12Resource_Unmap(*outUpload, 0, NULL);
                 HeapFree(GetProcessHeap(), 0, layouts);
+                ID3D12Resource_Release(*outUpload);
+                ID3D12Resource_Release(*outTexture);
+                *outUpload = NULL;
+                *outTexture = NULL;
                 return false;
             }
             unsigned char* destination = mapped + layouts[index].Offset;
@@ -677,33 +670,62 @@ static bool CreateBlockArrayTexture(Renderer* renderer,
     ID3D12Resource_Unmap(*outUpload, 0, NULL);
     HeapFree(GetProcessHeap(), 0, layouts);
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
-    memset(&viewDescription, 0, sizeof(viewDescription));
-    viewDescription.Format = textureDescription.Format;
-    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    viewDescription.Texture2DArray.MipLevels = pack->mipCount;
-    viewDescription.Texture2DArray.ArraySize = pack->layerCount;
-
-    ID3D12Device_CreateShaderResourceView(renderer->device, *outTexture,
-        &viewDescription, SrvCpuHandle(renderer, srvSlot));
     return true;
 }
 
-static bool CreateBlockTexture(Renderer* renderer)
+typedef struct BlockTextureReplacement
 {
-    TexturePackData pack;
-    TexturePackLoadStatus loadStatus = TexturePackLoadActive(&pack);
-    switch (loadStatus)
+    ID3D12Resource *albedo;
+    ID3D12Resource *albedoUpload;
+    ID3D12Resource *normal;
+    ID3D12Resource *normalUpload;
+    uint32_t layerCount;
+    uint32_t albedoMipCount;
+    uint32_t normalMipCount;
+    RendererContentStatus status;
+} BlockTextureReplacement;
+
+static RendererContentStatus MapTexturePackLoadStatus(TexturePackLoadStatus status)
+{
+    switch (status)
     {
         case TEXTURE_PACK_LOAD_OK:
-            renderer->texturePackLoadStatus = RENDERER_CONTENT_OK; break;
+            return RENDERER_CONTENT_OK;
         case TEXTURE_PACK_LOAD_NO_ACTIVE_PACK:
-            renderer->texturePackLoadStatus = RENDERER_CONTENT_NO_ACTIVE; break;
+            return RENDERER_CONTENT_NO_ACTIVE;
         case TEXTURE_PACK_LOAD_INVALID:
-            renderer->texturePackLoadStatus = RENDERER_CONTENT_INVALID; break;
+            return RENDERER_CONTENT_INVALID;
         default:
-            renderer->texturePackLoadStatus = RENDERER_CONTENT_IO_ERROR; break;
+            return RENDERER_CONTENT_IO_ERROR;
+        }
+}
+
+static void ReleaseBlockTextureReplacement(BlockTextureReplacement *replacement)
+{
+    if (replacement->albedoUpload != NULL)
+        ID3D12Resource_Release(replacement->albedoUpload);
+    if (replacement->albedo != NULL)
+        ID3D12Resource_Release(replacement->albedo);
+    if (replacement->normalUpload != NULL)
+        ID3D12Resource_Release(replacement->normalUpload);
+    if (replacement->normal != NULL)
+        ID3D12Resource_Release(replacement->normal);
+    memset(replacement, 0, sizeof(*replacement));
+}
+
+static bool CreateBlockTextureReplacement(Renderer *renderer, LaiueContentCatalog *catalog,
+                                          bool rejectInvalidActive,
+                                          BlockTextureReplacement *replacement)
+{
+    memset(replacement, 0, sizeof(*replacement));
+    TexturePackData pack;
+    TexturePackLoadStatus loadStatus = TexturePackLoadActiveFrom(catalog, &pack);
+    replacement->status = MapTexturePackLoadStatus(loadStatus);
+    if (rejectInvalidActive && loadStatus != TEXTURE_PACK_LOAD_OK &&
+        loadStatus != TEXTURE_PACK_LOAD_NO_ACTIVE_PACK)
+    {
+        TexturePackRelease(&pack);
+        return false;
     }
     if (pack.pixels == NULL)
     {
@@ -711,17 +733,15 @@ static bool CreateBlockTexture(Renderer* renderer)
     }
 
     // Albedo хранится в sRGB (декод при выборке), нормали — линейные.
-    bool succeeded = CreateBlockArrayTexture(renderer, &pack,
-        TexturePackGetSubresource, SRV_SLOT_BLOCK_TEXTURES,
-        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-        &renderer->blockTexture, &renderer->blockTextureUpload);
+    bool succeeded = CreateBlockArrayTexture(renderer, &pack, TexturePackGetSubresource,
+                                             DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, &replacement->albedo,
+                                             &replacement->albedoUpload);
 
     if (succeeded && pack.normalPixels != NULL)
     {
-        succeeded = CreateBlockArrayTexture(renderer, &pack,
-            TexturePackGetNormalSubresource, SRV_SLOT_BLOCK_NORMALS,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            &renderer->blockNormalTexture, &renderer->blockNormalUpload);
+        succeeded = CreateBlockArrayTexture(renderer, &pack, TexturePackGetNormalSubresource,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, &replacement->normal,
+                                            &replacement->normalUpload);
     }
     else if (succeeded)
     {
@@ -743,18 +763,67 @@ static bool CreateBlockTexture(Renderer* renderer)
             .pixels = flatNormalPixels,
             .pixelBytes = (uint32_t)pack.layerCount * 4u,
         };
-        succeeded = CreateBlockArrayTexture(renderer, &flat,
-            TexturePackGetSubresource, SRV_SLOT_BLOCK_NORMALS,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            &renderer->blockNormalTexture, &renderer->blockNormalUpload);
+        succeeded = CreateBlockArrayTexture(renderer, &flat, TexturePackGetSubresource,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, &replacement->normal,
+                                            &replacement->normalUpload);
     }
 
-    renderer->blockTextureUploadPending = succeeded;
-    renderer->blockTextureLayerCount = succeeded ? pack.layerCount : 0u;
-    if (!succeeded)
-        renderer->texturePackLoadStatus = RENDERER_CONTENT_GPU_ERROR;
+    replacement->layerCount = succeeded ? pack.layerCount : 0U;
+    replacement->albedoMipCount = succeeded ? pack.mipCount : 0U;
+    replacement->normalMipCount = succeeded ? (pack.normalPixels != NULL ? pack.mipCount : 1U) : 0U;
     TexturePackRelease(&pack);
+    if (!succeeded)
+    {
+        replacement->status = RENDERER_CONTENT_GPU_ERROR;
+        ReleaseBlockTextureReplacement(replacement);
+        replacement->status = RENDERER_CONTENT_GPU_ERROR;
+    }
     return succeeded;
+}
+
+static void CreateBlockTextureView(Renderer *renderer, ID3D12Resource *texture, uint32_t layerCount,
+                                   uint32_t mipCount, DXGI_FORMAT format, uint32_t srvSlot)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = format;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2DArray.MipLevels = mipCount;
+    viewDescription.Texture2DArray.ArraySize = layerCount;
+    ID3D12Device_CreateShaderResourceView(renderer->device, texture, &viewDescription,
+                                          SrvCpuHandle(renderer, srvSlot));
+}
+
+static void CommitBlockTexture(Renderer *renderer, BlockTextureReplacement *replacement)
+{
+    renderer->blockTexture = replacement->albedo;
+    renderer->blockTextureUpload = replacement->albedoUpload;
+    renderer->blockNormalTexture = replacement->normal;
+    renderer->blockNormalUpload = replacement->normalUpload;
+    renderer->blockTextureLayerCount = replacement->layerCount;
+    renderer->blockTextureUploadPending = true;
+    renderer->texturePackLoadStatus = replacement->status;
+    CreateBlockTextureView(renderer, renderer->blockTexture, renderer->blockTextureLayerCount,
+                           replacement->albedoMipCount, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                           SRV_SLOT_BLOCK_TEXTURES);
+    CreateBlockTextureView(renderer, renderer->blockNormalTexture, renderer->blockTextureLayerCount,
+                           replacement->normalMipCount, DXGI_FORMAT_R8G8B8A8_UNORM,
+                           SRV_SLOT_BLOCK_NORMALS);
+    memset(replacement, 0, sizeof(*replacement));
+}
+
+static bool CreateBlockTexture(Renderer *renderer, LaiueContentCatalog *catalog)
+{
+    BlockTextureReplacement replacement;
+    bool succeeded = CreateBlockTextureReplacement(renderer, catalog, false, &replacement);
+    renderer->texturePackLoadStatus = replacement.status;
+    if (!succeeded)
+    {
+        return false;
+    }
+    CommitBlockTexture(renderer, &replacement);
+    return true;
 }
 
 // === Панорама и UI: сигнатуры, конвейеры, ресурсы ===
@@ -817,25 +886,9 @@ static bool CreateResolveRootSignature(Renderer* renderer)
 
 static bool CreateResolvePipelineState(Renderer* renderer)
 {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
-    memset(&description, 0, sizeof(description));
-    description.pRootSignature = renderer->resolveRootSignature;
-    description.VS.pShaderBytecode = g_panorama_vs;
-    description.VS.BytecodeLength = sizeof(g_panorama_vs);
-    description.PS.pShaderBytecode = g_panorama_ps;
-    description.PS.BytecodeLength = sizeof(g_panorama_ps);
-    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    description.RasterizerState.DepthClipEnable = TRUE;
-    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    description.SampleMask = 0xFFFFFFFF;
-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    description.SampleDesc.Count = 1;
-
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->resolvePipelineState));
+    return CreateResolvePipelineStateForShaders(renderer, renderer->loadedShaders,
+                                                renderer->loadedShaderLengths,
+                                                &renderer->resolvePipelineState);
 }
 
 static bool CreateUiRootSignature(Renderer* renderer)
@@ -900,35 +953,9 @@ static bool CreateUiRootSignature(Renderer* renderer)
 
 static bool CreateUiPipelineState(Renderer* renderer)
 {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
-    memset(&description, 0, sizeof(description));
-    description.pRootSignature = renderer->uiRootSignature;
-    description.VS.pShaderBytecode = g_ui_vs;
-    description.VS.BytecodeLength = sizeof(g_ui_vs);
-    description.PS.pShaderBytecode = g_ui_ps;
-    description.PS.BytecodeLength = sizeof(g_ui_ps);
-    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    description.RasterizerState.DepthClipEnable = TRUE;
-
-    D3D12_RENDER_TARGET_BLEND_DESC* blend = &description.BlendState.RenderTarget[0];
-    blend->BlendEnable = TRUE;
-    blend->SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    blend->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    blend->BlendOp = D3D12_BLEND_OP_ADD;
-    blend->SrcBlendAlpha = D3D12_BLEND_ONE;
-    blend->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-    blend->BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-    description.SampleMask = 0xFFFFFFFF;
-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    description.NumRenderTargets = 1;
-    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    description.SampleDesc.Count = 1;
-
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->uiPipelineState));
+    return CreateUiPipelineStateForShaders(renderer, renderer->loadedShaders,
+                                           renderer->loadedShaderLengths,
+                                           &renderer->uiPipelineState);
 }
 
 static bool CreateUiQuadBuffers(Renderer* renderer)
@@ -1461,9 +1488,10 @@ void RendererReleaseWorld(Renderer* renderer)
     renderer->worldReady = false;
 }
 
-bool RendererPrepareWorld(Renderer* renderer)
+bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
 {
-    if (renderer == NULL) return false;
+    if (renderer == NULL || catalog == NULL)
+        return false;
     if (renderer->worldReady) return true;
 
     D3D12_DESCRIPTOR_HEAP_DESC cubeRtvHeapDescription = {
@@ -1474,20 +1502,17 @@ bool RendererPrepareWorld(Renderer* renderer)
         .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
         .NumDescriptors = 1,
     };
-    bool succeeded = SUCCEEDED(ID3D12Device_CreateDescriptorHeap(
-        renderer->device, &cubeRtvHeapDescription,
-        &IID_ID3D12DescriptorHeap, (void**)&renderer->cubeRtvHeap))
-        && SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device,
-            &cubeDsvHeapDescription, &IID_ID3D12DescriptorHeap,
-            (void**)&renderer->cubeDsvHeap))
-        && CreateRootSignature(renderer)
-        && CreatePipelineState(renderer)
-        && CreateResolveRootSignature(renderer)
-        && CreateResolvePipelineState(renderer)
-        && CreateMeshUploadBuffers(renderer)
-        && CreateBlockTexture(renderer)
-        && CreateDepthBuffer(renderer, renderer->windowWidth,
-            renderer->windowHeight);
+    bool succeeded =
+        SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeRtvHeapDescription,
+                                                    &IID_ID3D12DescriptorHeap,
+                                                    (void **)&renderer->cubeRtvHeap)) &&
+        SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeDsvHeapDescription,
+                                                    &IID_ID3D12DescriptorHeap,
+                                                    (void **)&renderer->cubeDsvHeap)) &&
+        CreateRootSignature(renderer) && CreatePipelineState(renderer) &&
+        CreateResolveRootSignature(renderer) && CreateResolvePipelineState(renderer) &&
+        CreateMeshUploadBuffers(renderer) && CreateBlockTexture(renderer, catalog) &&
+        CreateDepthBuffer(renderer, renderer->windowWidth, renderer->windowHeight);
     if (succeeded && renderer->wireframeEnabled)
         succeeded = RecreateChunkPipelineState(renderer);
     if (!succeeded)
@@ -1497,6 +1522,11 @@ bool RendererPrepareWorld(Renderer* renderer)
     }
     renderer->worldReady = true;
     return true;
+}
+
+bool RendererPrepareWorld(Renderer *renderer)
+{
+    return RendererPrepareWorldFrom(renderer, LaiueContentCatalogDefault());
 }
 
 bool RendererIsWorldReady(const Renderer* renderer)
@@ -1604,12 +1634,9 @@ void RendererDestroy(Renderer* renderer)
     if (renderer->factory != NULL) IDXGIFactory4_Release(renderer->factory);
 
     // Освобождаем загруженный байткод шейдеров (если не встроенный).
-    if (renderer->loadedChunkVS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedChunkVS);
-    if (renderer->loadedChunkPS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedChunkPS);
-    if (renderer->loadedPanoramaVS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedPanoramaVS);
-    if (renderer->loadedPanoramaPS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedPanoramaPS);
-    if (renderer->loadedUIVS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedUIVS);
-    if (renderer->loadedUIPS != NULL) HeapFree(GetProcessHeap(), 0, renderer->loadedUIPS);
+    for (uint32_t shader = 0; shader < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++shader)
+        if (renderer->loadedShaders[shader] != NULL)
+            HeapFree(GetProcessHeap(), 0, renderer->loadedShaders[shader]);
 
     HeapFree(GetProcessHeap(), 0, renderer);
 }
@@ -2417,25 +2444,26 @@ static void* CopyShaderBytecode(const void* bytecode, uint32_t length)
     return copy;
 }
 
-static bool RecreateChunkPipelineState(Renderer* renderer)
+static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
+                                               void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                               const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                               ID3D12PipelineState **outPipelineState)
 {
-    if (renderer->pipelineState != NULL)
-    {
-        ID3D12PipelineState_Release(renderer->pipelineState);
-        renderer->pipelineState = NULL;
-    }
-
     D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
     memset(&description, 0, sizeof(description));
     description.pRootSignature = renderer->rootSignature;
-    description.VS.pShaderBytecode = renderer->loadedChunkVS != NULL
-        ? renderer->loadedChunkVS : (const void*)g_chunk_vs;
-    description.VS.BytecodeLength = renderer->loadedChunkVS != NULL
-        ? renderer->loadedChunkVSLength : sizeof(g_chunk_vs);
-    description.PS.pShaderBytecode = renderer->loadedChunkPS != NULL
-        ? renderer->loadedChunkPS : (const void*)g_chunk_ps;
-    description.PS.BytecodeLength = renderer->loadedChunkPS != NULL
-        ? renderer->loadedChunkPSLength : sizeof(g_chunk_ps);
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_CHUNK_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_CHUNK_VERTEX]
+                                         : (const void *)g_chunk_vs;
+    description.VS.BytecodeLength = shaders[LAIUE_SHADER_CHUNK_VERTEX] != NULL
+                                        ? lengths[LAIUE_SHADER_CHUNK_VERTEX]
+                                        : sizeof(g_chunk_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_CHUNK_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_CHUNK_PIXEL]
+                                         : (const void *)g_chunk_ps;
+    description.PS.BytecodeLength = shaders[LAIUE_SHADER_CHUNK_PIXEL] != NULL
+                                        ? lengths[LAIUE_SHADER_CHUNK_PIXEL]
+                                        : sizeof(g_chunk_ps);
     description.RasterizerState.FillMode = renderer->wireframeEnabled
         ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
@@ -2453,29 +2481,43 @@ static bool RecreateChunkPipelineState(Renderer* renderer)
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->pipelineState));
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
 }
 
-static bool RecreateResolvePipelineState(Renderer* renderer)
+static bool RecreateChunkPipelineState(Renderer *renderer)
 {
-    if (renderer->resolvePipelineState != NULL)
-    {
-        ID3D12PipelineState_Release(renderer->resolvePipelineState);
-        renderer->resolvePipelineState = NULL;
-    }
+    ID3D12PipelineState *replacement = NULL;
+    if (!CreateChunkPipelineStateForShaders(renderer, renderer->loadedShaders,
+                                            renderer->loadedShaderLengths, &replacement))
+        return false;
+    if (renderer->pipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->pipelineState);
+    renderer->pipelineState = replacement;
+    return true;
+}
 
+static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
+                                                 void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                                 const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                                 ID3D12PipelineState **outPipelineState)
+{
     D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
     memset(&description, 0, sizeof(description));
     description.pRootSignature = renderer->resolveRootSignature;
-    description.VS.pShaderBytecode = renderer->loadedPanoramaVS != NULL
-        ? renderer->loadedPanoramaVS : (const void*)g_panorama_vs;
-    description.VS.BytecodeLength = renderer->loadedPanoramaVS != NULL
-        ? renderer->loadedPanoramaVSLength : sizeof(g_panorama_vs);
-    description.PS.pShaderBytecode = renderer->loadedPanoramaPS != NULL
-        ? renderer->loadedPanoramaPS : (const void*)g_panorama_ps;
-    description.PS.BytecodeLength = renderer->loadedPanoramaPS != NULL
-        ? renderer->loadedPanoramaPSLength : sizeof(g_panorama_ps);
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_PANORAMA_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_PANORAMA_VERTEX]
+                                         : (const void *)g_panorama_vs;
+    description.VS.BytecodeLength = shaders[LAIUE_SHADER_PANORAMA_VERTEX] != NULL
+                                        ? lengths[LAIUE_SHADER_PANORAMA_VERTEX]
+                                        : sizeof(g_panorama_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_PANORAMA_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_PANORAMA_PIXEL]
+                                         : (const void *)g_panorama_ps;
+    description.PS.BytecodeLength = shaders[LAIUE_SHADER_PANORAMA_PIXEL] != NULL
+                                        ? lengths[LAIUE_SHADER_PANORAMA_PIXEL]
+                                        : sizeof(g_panorama_ps);
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     description.RasterizerState.DepthClipEnable = TRUE;
@@ -2486,29 +2528,29 @@ static bool RecreateResolvePipelineState(Renderer* renderer)
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->resolvePipelineState));
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
 }
 
-static bool RecreateUiPipelineState(Renderer* renderer)
+static bool CreateUiPipelineStateForShaders(Renderer *renderer,
+                                            void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                            const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                            ID3D12PipelineState **outPipelineState)
 {
-    if (renderer->uiPipelineState != NULL)
-    {
-        ID3D12PipelineState_Release(renderer->uiPipelineState);
-        renderer->uiPipelineState = NULL;
-    }
-
     D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
     memset(&description, 0, sizeof(description));
     description.pRootSignature = renderer->uiRootSignature;
-    description.VS.pShaderBytecode = renderer->loadedUIVS != NULL
-        ? renderer->loadedUIVS : (const void*)g_ui_vs;
-    description.VS.BytecodeLength = renderer->loadedUIVS != NULL
-        ? renderer->loadedUIVSLength : sizeof(g_ui_vs);
-    description.PS.pShaderBytecode = renderer->loadedUIPS != NULL
-        ? renderer->loadedUIPS : (const void*)g_ui_ps;
-    description.PS.BytecodeLength = renderer->loadedUIPS != NULL
-        ? renderer->loadedUIPSLength : sizeof(g_ui_ps);
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_UI_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_UI_VERTEX]
+                                         : (const void *)g_ui_vs;
+    description.VS.BytecodeLength =
+        shaders[LAIUE_SHADER_UI_VERTEX] != NULL ? lengths[LAIUE_SHADER_UI_VERTEX] : sizeof(g_ui_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_UI_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_UI_PIXEL]
+                                         : (const void *)g_ui_ps;
+    description.PS.BytecodeLength =
+        shaders[LAIUE_SHADER_UI_PIXEL] != NULL ? lengths[LAIUE_SHADER_UI_PIXEL] : sizeof(g_ui_ps);
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     description.RasterizerState.DepthClipEnable = TRUE;
@@ -2529,13 +2571,14 @@ static bool RecreateUiPipelineState(Renderer* renderer)
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, &description,
-        &IID_ID3D12PipelineState, (void**)&renderer->uiPipelineState));
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
 }
 
-bool RendererReloadTexturePack(Renderer* renderer)
+bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *catalog)
 {
-    if (renderer == NULL)
+    if (renderer == NULL || catalog == NULL)
     {
         return false;
     }
@@ -2546,34 +2589,31 @@ bool RendererReloadTexturePack(Renderer* renderer)
         return true;
     }
 
+    BlockTextureReplacement replacement;
+    bool succeeded = CreateBlockTextureReplacement(renderer, catalog, true, &replacement);
+    renderer->texturePackLoadStatus = replacement.status;
+    if (!succeeded)
+    {
+        return false;
+    }
+
     WaitForGpu(renderer);
     DrainDeferredReleases(renderer, true);
-
-    // Уничтожаем старые текстурные ресурсы.
     if (renderer->blockTextureUpload != NULL)
-    {
         ID3D12Resource_Release(renderer->blockTextureUpload);
-        renderer->blockTextureUpload = NULL;
-    }
     if (renderer->blockTexture != NULL)
-    {
         ID3D12Resource_Release(renderer->blockTexture);
-        renderer->blockTexture = NULL;
-    }
     if (renderer->blockNormalUpload != NULL)
-    {
         ID3D12Resource_Release(renderer->blockNormalUpload);
-        renderer->blockNormalUpload = NULL;
-    }
     if (renderer->blockNormalTexture != NULL)
-    {
         ID3D12Resource_Release(renderer->blockNormalTexture);
-        renderer->blockNormalTexture = NULL;
-    }
-    renderer->blockTextureUploadPending = false;
-    renderer->blockTextureLayerCount = 0u;
+    CommitBlockTexture(renderer, &replacement);
+    return true;
+}
 
-    return CreateBlockTexture(renderer);
+bool RendererReloadTexturePack(Renderer *renderer)
+{
+    return RendererReloadTexturePackFrom(renderer, LaiueContentCatalogDefault());
 }
 
 RendererContentStatus RendererGetTexturePackLoadStatus(
@@ -2602,51 +2642,161 @@ bool RendererIsWireframe(const Renderer* renderer)
     return renderer != NULL && renderer->wireframeEnabled;
 }
 
-bool RendererReloadShaders(Renderer* renderer,
-    const void* chunkVS, uint32_t chunkVSLength,
-    const void* chunkPS, uint32_t chunkPSLength,
-    const void* panoramaVS, uint32_t panoramaVSLength,
-    const void* panoramaPS, uint32_t panoramaPSLength,
-    const void* uiVS, uint32_t uiVSLength,
-    const void* uiPS, uint32_t uiPSLength)
+static void ReleaseShaderArray(void *shaders[LAIUE_SHADER_SLOT_COUNT])
+{
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+        ReleaseLoadedShader(&shaders[index]);
+}
+
+bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet)
 {
     if (renderer == NULL)
     {
         return false;
     }
 
+    LaiueShaderSet fallbackSet;
+    if (shaderSet == NULL)
+    {
+        LaiueShaderSetInitialize(&fallbackSet);
+        shaderSet = &fallbackSet;
+    }
+    if (!LaiueShaderSetIsValid(shaderSet))
+    {
+        return false;
+    }
+
+    void *replacementShaders[LAIUE_SHADER_SLOT_COUNT] = {0};
+    uint32_t replacementLengths[LAIUE_SHADER_SLOT_COUNT] = {0};
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if ((shaderSet->overrideMask & (1U << index)) == 0U)
+            continue;
+        replacementShaders[index] = CopyShaderBytecode(shaderSet->bytecode[index].bytes,
+                                                       shaderSet->bytecode[index].sizeBytes);
+        if (replacementShaders[index] == NULL)
+        {
+            ReleaseShaderArray(replacementShaders);
+            return false;
+        }
+        replacementLengths[index] = shaderSet->bytecode[index].sizeBytes;
+    }
+
+    ID3D12PipelineState *replacementChunk = NULL;
+    ID3D12PipelineState *replacementResolve = NULL;
+    ID3D12PipelineState *replacementUi = NULL;
+    bool pipelinesCreated =
+        !renderer->worldReady ||
+        (CreateChunkPipelineStateForShaders(renderer, replacementShaders, replacementLengths,
+                                            &replacementChunk) &&
+         CreateResolvePipelineStateForShaders(renderer, replacementShaders, replacementLengths,
+                                              &replacementResolve));
+    pipelinesCreated =
+        pipelinesCreated && CreateUiPipelineStateForShaders(renderer, replacementShaders,
+                                                            replacementLengths, &replacementUi);
+    if (!pipelinesCreated)
+    {
+        if (replacementChunk != NULL)
+            ID3D12PipelineState_Release(replacementChunk);
+        if (replacementResolve != NULL)
+            ID3D12PipelineState_Release(replacementResolve);
+        if (replacementUi != NULL)
+            ID3D12PipelineState_Release(replacementUi);
+        ReleaseShaderArray(replacementShaders);
+        return false;
+    }
+
     WaitForGpu(renderer);
     DrainDeferredReleases(renderer, true);
+    if (renderer->worldReady)
+    {
+        if (renderer->pipelineState != NULL)
+            ID3D12PipelineState_Release(renderer->pipelineState);
+        if (renderer->resolvePipelineState != NULL)
+            ID3D12PipelineState_Release(renderer->resolvePipelineState);
+        renderer->pipelineState = replacementChunk;
+        renderer->resolvePipelineState = replacementResolve;
+    }
+    if (renderer->uiPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->uiPipelineState);
+    renderer->uiPipelineState = replacementUi;
 
-    // Освобождаем старый байткод и сохраняем новый.
-    ReleaseLoadedShader(&renderer->loadedChunkVS);
-    ReleaseLoadedShader(&renderer->loadedChunkPS);
-    ReleaseLoadedShader(&renderer->loadedPanoramaVS);
-    ReleaseLoadedShader(&renderer->loadedPanoramaPS);
-    ReleaseLoadedShader(&renderer->loadedUIVS);
-    ReleaseLoadedShader(&renderer->loadedUIPS);
-
-    renderer->loadedChunkVS = CopyShaderBytecode(chunkVS, chunkVSLength);
-    renderer->loadedChunkVSLength = chunkVSLength;
-    renderer->loadedChunkPS = CopyShaderBytecode(chunkPS, chunkPSLength);
-    renderer->loadedChunkPSLength = chunkPSLength;
-    renderer->loadedPanoramaVS = CopyShaderBytecode(panoramaVS, panoramaVSLength);
-    renderer->loadedPanoramaVSLength = panoramaVSLength;
-    renderer->loadedPanoramaPS = CopyShaderBytecode(panoramaPS, panoramaPSLength);
-    renderer->loadedPanoramaPSLength = panoramaPSLength;
-    renderer->loadedUIVS = CopyShaderBytecode(uiVS, uiVSLength);
-    renderer->loadedUIVSLength = uiVSLength;
-    renderer->loadedUIPS = CopyShaderBytecode(uiPS, uiPSLength);
-    renderer->loadedUIPSLength = uiPSLength;
-
-    // Пересоздаём все PSO.
-    if (renderer->worldReady
-        && !RecreateChunkPipelineState(renderer)) return false;
-    if (renderer->worldReady
-        && !RecreateResolvePipelineState(renderer)) return false;
-    if (!RecreateUiPipelineState(renderer)) return false;
-
+    ReleaseShaderArray(renderer->loadedShaders);
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        renderer->loadedShaders[index] = replacementShaders[index];
+        renderer->loadedShaderLengths[index] = replacementLengths[index];
+        replacementShaders[index] = NULL;
+    }
     return true;
+}
+
+bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catalog,
+                                  ShaderPackLoadStatus *outStatus)
+{
+    if (outStatus != NULL)
+        *outStatus = SHADER_PACK_LOAD_IO_ERROR;
+    if (renderer == NULL || catalog == NULL)
+        return false;
+
+    ShaderPackLoadStatus status = SHADER_PACK_LOAD_NOT_ATTEMPTED;
+    ShaderPackLoadedSet *loadedSet = ShaderPackLoadActiveSet(catalog, &status);
+    if (loadedSet == NULL)
+    {
+        if (status != SHADER_PACK_LOAD_NO_ACTIVE_PACK)
+        {
+            if (outStatus != NULL)
+                *outStatus = status;
+            return false;
+        }
+        if (!RendererReloadShaderSet(renderer, NULL))
+        {
+            if (outStatus != NULL)
+                *outStatus = SHADER_PACK_LOAD_PIPELINE_ERROR;
+            return false;
+        }
+        if (outStatus != NULL)
+            *outStatus = status;
+        return true;
+    }
+
+    bool reloaded = RendererReloadShaderSet(renderer, ShaderPackLoadedSetGet(loadedSet));
+    ShaderPackLoadedSetRelease(loadedSet);
+    if (!reloaded)
+        status = SHADER_PACK_LOAD_PIPELINE_ERROR;
+    if (outStatus != NULL)
+        *outStatus = status;
+    return reloaded;
+}
+
+bool RendererReloadShaderPack(Renderer *renderer, ShaderPackLoadStatus *outStatus)
+{
+    return RendererReloadShaderPackFrom(renderer, LaiueContentCatalogDefault(), outStatus);
+}
+
+bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
+                           const void *chunkPS, uint32_t chunkPSLength, const void *panoramaVS,
+                           uint32_t panoramaVSLength, const void *panoramaPS,
+                           uint32_t panoramaPSLength, const void *uiVS, uint32_t uiVSLength,
+                           const void *uiPS, uint32_t uiPSLength)
+{
+    const void *bytecodes[LAIUE_SHADER_SLOT_COUNT] = {
+        chunkVS, chunkPS, panoramaVS, panoramaPS, uiVS, uiPS,
+    };
+    const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT] = {
+        chunkVSLength, chunkPSLength, panoramaVSLength, panoramaPSLength, uiVSLength, uiPSLength,
+    };
+    LaiueShaderSet shaderSet;
+    LaiueShaderSetInitialize(&shaderSet);
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if (bytecodes[index] == NULL && lengths[index] == 0U)
+            continue;
+        if (!LaiueShaderSetSetOverride(&shaderSet, (LaiueShaderSlot)index, bytecodes[index],
+                                       lengths[index]))
+            return false;
+    }
+    return RendererReloadShaderSet(renderer, &shaderSet);
 }
 
 // === Слой интерфейса ===

@@ -40,6 +40,8 @@ typedef struct TexturePackSubresource
     uint32_t byteCount;
 } TexturePackSubresource;
 
+TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
+                                                TexturePackData *outPack);
 TexturePackLoadStatus TexturePackLoadActive(TexturePackData* outPack);
 bool TexturePackGetSubresource(const TexturePackData* pack,
     uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);

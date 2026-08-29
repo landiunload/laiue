@@ -1,26 +1,31 @@
 #include "render/shader_pack.h"
-#include "content/content_catalog.h"
+#include "platform/system.h"
 
-#include <windows.h>
+#include <stddef.h>
 #include <string.h>
 
-#define SHADER_PACK_DIR L"\\shaders\\"
-#define PATH_CAPACITY_CHARS 32768u
-#define SHADER_FILE_MAX 0x40000u  // 256 КБ на шейдер
-#define SHADER_MANIFEST_MAX 4096u
+#define SHADER_MANIFEST_MAX_BYTES 4096u
 
-static uint32_t LiteralLength(const wchar_t* text)
+struct ShaderPackLoadedSet
 {
-    uint32_t length = 0;
-    while (text[length] != L'\0') ++length;
-    return length;
-}
+    LaiueShaderSet shaderSet;
+    void *allocations[LAIUE_SHADER_SLOT_COUNT];
+};
 
-static bool BytesEqual(const uint8_t* left, const char* right, uint32_t count)
+typedef enum ShaderFileLoadResult
 {
-    for (uint32_t i = 0; i < count; ++i)
+    SHADER_FILE_MISSING = 0,
+    SHADER_FILE_LOADED,
+    SHADER_FILE_INVALID,
+    SHADER_FILE_IO_ERROR,
+} ShaderFileLoadResult;
+
+static bool BytesEqual(const uint8_t *left, const char *right, uint32_t count)
+{
+    for (uint32_t index = 0; index < count; ++index)
     {
-        if (left[i] != (uint8_t)right[i]) return false;
+        if (left[index] != (uint8_t)right[index])
+            return false;
     }
     return true;
 }
@@ -33,11 +38,8 @@ static bool HasExactLine(const uint8_t* data, uint32_t length,
     {
         uint32_t end = start;
         while (end < length && data[end] != '\n' && data[end] != '\r') ++end;
-        if (end - start == expectedLength
-            && BytesEqual(data + start, expected, expectedLength))
-        {
+        if (end - start == expectedLength && BytesEqual(data + start, expected, expectedLength))
             return true;
-        }
         if (firstLineOnly) return false;
         while (end < length && (data[end] == '\n' || data[end] == '\r')) ++end;
         start = end;
@@ -45,72 +47,94 @@ static bool HasExactLine(const uint8_t* data, uint32_t length,
     return false;
 }
 
-static bool BuildPath(wchar_t* path, uint32_t capacity,
-    uint32_t directoryLength, const wchar_t* suffix)
+static bool ShaderSetHeaderIsValid(const LaiueShaderSet *shaderSet)
 {
-    uint32_t suffixLength = LiteralLength(suffix);
-    if (directoryLength + suffixLength + 1u > capacity)
-    {
+    return shaderSet != NULL && shaderSet->structSize >= sizeof(*shaderSet) &&
+           shaderSet->contractVersion == LAIUE_SHADER_CONTRACT_VERSION &&
+           shaderSet->reserved == 0U &&
+           (shaderSet->overrideMask & ~LAIUE_SHADER_ALL_SLOTS_MASK) == 0U;
+}
+
+void LaiueShaderSetInitialize(LaiueShaderSet *shaderSet)
+{
+    if (shaderSet == NULL)
+        return;
+    memset(shaderSet, 0, sizeof(*shaderSet));
+    shaderSet->structSize = sizeof(*shaderSet);
+    shaderSet->contractVersion = LAIUE_SHADER_CONTRACT_VERSION;
+}
+
+bool LaiueShaderSetSetOverride(LaiueShaderSet *shaderSet, LaiueShaderSlot slot,
+                               const void *bytecode, uint32_t sizeBytes)
+{
+    if (!ShaderSetHeaderIsValid(shaderSet) || (uint32_t)slot >= (uint32_t)LAIUE_SHADER_SLOT_COUNT ||
+        bytecode == NULL || sizeBytes == 0U || sizeBytes > LAIUE_SHADER_BYTECODE_MAX_BYTES)
         return false;
-    }
-    for (uint32_t i = 0; i < suffixLength; ++i)
-    {
-        path[directoryLength + i] = suffix[i];
-    }
-    path[directoryLength + suffixLength] = L'\0';
+    shaderSet->bytecode[slot].bytes = bytecode;
+    shaderSet->bytecode[slot].sizeBytes = sizeBytes;
+    shaderSet->bytecode[slot].reserved = 0U;
+    shaderSet->overrideMask |= LAIUE_SHADER_SLOT_MASK(slot);
     return true;
 }
 
-static bool GetExecutableDirectory(
-    wchar_t* path, uint32_t capacity, uint32_t* outDirectoryLength)
+bool LaiueShaderSetClearOverride(LaiueShaderSet *shaderSet, LaiueShaderSlot slot)
 {
-    DWORD length = GetModuleFileNameW(NULL, path, capacity);
-    if (length == 0 || length >= capacity)
-    {
+    if (!ShaderSetHeaderIsValid(shaderSet) || (uint32_t)slot >= (uint32_t)LAIUE_SHADER_SLOT_COUNT)
         return false;
-    }
-    for (uint32_t i = (uint32_t)length; i > 0; --i)
-    {
-        wchar_t character = path[i - 1u];
-        if (character == L'\\' || character == L'/')
-        {
-            *outDirectoryLength = i - 1u;
-            return true;
-        }
-    }
-    return false;
+    memset(&shaderSet->bytecode[slot], 0, sizeof(shaderSet->bytecode[slot]));
+    shaderSet->overrideMask &= ~LAIUE_SHADER_SLOT_MASK(slot);
+    return true;
 }
 
-bool ShaderPackEnumerate(ShaderPackList* outList)
+bool LaiueShaderSetIsValid(const LaiueShaderSet *shaderSet)
 {
-    if (outList == NULL)
-    {
+    if (!ShaderSetHeaderIsValid(shaderSet))
         return false;
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        const LaiueShaderBytecode *bytecode = &shaderSet->bytecode[index];
+        bool overridden = (shaderSet->overrideMask & (1U << index)) != 0U;
+        if (bytecode->reserved != 0U)
+            return false;
+        if (overridden)
+        {
+            if (bytecode->bytes == NULL || bytecode->sizeBytes == 0U ||
+                bytecode->sizeBytes > LAIUE_SHADER_BYTECODE_MAX_BYTES)
+                return false;
+        }
+        else if (bytecode->bytes != NULL || bytecode->sizeBytes != 0U)
+            return false;
     }
+    return true;
+}
+
+bool ShaderPackEnumerateFrom(LaiueContentCatalog *catalog, ShaderPackList *outList)
+{
+    if (catalog == NULL || outList == NULL)
+        return false;
     outList->entries = NULL;
     outList->count = 0;
 
     LaiueContentList contentList;
-    if (!LaiueContentEnumerate(LAIUE_CONTENT_SHADER_PACK, &contentList))
-    {
+    if (!LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_SHADER_PACK, &contentList))
         return false;
-    }
-    outList->entries = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)(contentList.count + 1u) * sizeof(ShaderPackEntry));
+
+    outList->entries =
+        PlatformAllocate((size_t)(contentList.count + 1U) * sizeof(ShaderPackEntry), true);
     if (outList->entries == NULL)
     {
         LaiueContentListRelease(&contentList);
         return false;
     }
-    memcpy(outList->entries[0].name, L"Default", 8u * sizeof(wchar_t));
+    memcpy(outList->entries[0].name, L"Default", 8U * sizeof(wchar_t));
     bool hasActive = false;
     for (uint32_t sourceIndex = 0;
         sourceIndex < contentList.count; ++sourceIndex)
     {
-        uint32_t destinationIndex = sourceIndex + 1u;
+        uint32_t destinationIndex = sourceIndex + 1U;
         uint32_t length = 0;
-        while (contentList.entries[sourceIndex].name[length] != L'\0'
-            && length + 1u < SHADER_PACK_NAME_MAX)
+        while (contentList.entries[sourceIndex].name[length] != L'\0' &&
+               length + 1U < SHADER_PACK_NAME_MAX)
         {
             outList->entries[destinationIndex].name[length] =
                 contentList.entries[sourceIndex].name[length];
@@ -122,262 +146,250 @@ bool ShaderPackEnumerate(ShaderPackList* outList)
         hasActive = hasActive || contentList.entries[sourceIndex].active;
     }
     outList->entries[0].active = !hasActive;
-    outList->count = contentList.count + 1u;
+    outList->count = contentList.count + 1U;
     LaiueContentListRelease(&contentList);
     return true;
+}
+
+bool ShaderPackEnumerate(ShaderPackList *outList)
+{
+    return ShaderPackEnumerateFrom(LaiueContentCatalogDefault(), outList);
 }
 
 void ShaderPackListRelease(ShaderPackList* list)
 {
     if (list == NULL)
-    {
         return;
-    }
-    if (list->entries != NULL)
-    {
-        HeapFree(GetProcessHeap(), 0, list->entries);
-    }
+    PlatformFree(list->entries);
     list->entries = NULL;
     list->count = 0;
 }
 
-bool ShaderPackActivate(const wchar_t* name)
+bool ShaderPackActivateIn(LaiueContentCatalog *catalog, const wchar_t *name)
 {
-    // Пустой выбор сбрасывает активный пак; иначе имя и существование
-    // каталога .lsp проверяет единый каталог содержимого.
-    if (name == NULL || name[0] == L'\0')
-    {
-        return LaiueContentSetActivePack(LAIUE_CONTENT_SHADER_PACK, NULL);
-    }
-    return LaiueContentSetActivePack(LAIUE_CONTENT_SHADER_PACK, name);
-}
-static bool ReadActivePackName(wchar_t* dirPath, uint32_t dirPrefixLen,
-    uint8_t* outName, uint32_t* outNameLen, uint32_t nameCapacity)
-{
-    // Используем dirPath как буфер (он выделен на куче, PATH_CAPACITY_CHARS).
-    memcpy(dirPath + dirPrefixLen, L"active.txt", 12 * sizeof(wchar_t));
-
-    *outNameLen = 0;
-    bool hasActive = false;
-    HANDLE activeFile = CreateFileW(dirPath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (activeFile != INVALID_HANDLE_VALUE)
-    {
-        LARGE_INTEGER size;
-        if (GetFileSizeEx(activeFile, &size)
-            && size.QuadPart > 0
-            && (LONGLONG)size.QuadPart <= (LONGLONG)nameCapacity)
-        {
-            DWORD read = 0;
-            if (ReadFile(activeFile, outName, (DWORD)size.QuadPart, &read, NULL))
-            {
-                uint32_t activeNameLength = (uint32_t)size.QuadPart;
-                while (activeNameLength > 0 && (outName[activeNameLength - 1] == ' '
-                    || outName[activeNameLength - 1] == '\n' || outName[activeNameLength - 1] == '\r'))
-                {
-                    --activeNameLength;
-                }
-                outName[activeNameLength] = '\0';
-                *outNameLen = activeNameLength;
-                hasActive = activeNameLength > 0;
-            }
-        }
-        CloseHandle(activeFile);
-    }
-    return hasActive;
+    return LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_SHADER_PACK,
+                                            name == NULL || name[0] == L'\0' ? NULL : name);
 }
 
-static void* LoadCompiledShaderFile(const wchar_t* fullPath, uint32_t* outLength)
+bool ShaderPackActivate(const wchar_t *name)
 {
-    HANDLE file = CreateFileW(fullPath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return NULL;
-    }
-
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(file, &size)
-        || size.QuadPart <= 0
-        || (uint64_t)size.QuadPart > SHADER_FILE_MAX)
-    {
-        CloseHandle(file);
-        return NULL;
-    }
-
-    uint32_t byteCount = (uint32_t)size.QuadPart;
-    void* data = HeapAlloc(GetProcessHeap(), 0, byteCount);
-    if (data == NULL)
-    {
-        CloseHandle(file);
-        return NULL;
-    }
-
-    DWORD read = 0;
-    if (!ReadFile(file, data, byteCount, &read, NULL) || read != byteCount)
-    {
-        HeapFree(GetProcessHeap(), 0, data);
-        CloseHandle(file);
-        return NULL;
-    }
-
-    CloseHandle(file);
-    *outLength = byteCount;
-    return data;
+    return ShaderPackActivateIn(LaiueContentCatalogDefault(), name);
 }
 
-static bool IsCompatibleManifest(const wchar_t* fullPath)
+static bool IsCompatibleManifest(const wchar_t *fullPath)
 {
-    uint32_t length = 0;
-    uint8_t* data = LoadCompiledShaderFile(fullPath, &length);
-    if (data == NULL || length > SHADER_MANIFEST_MAX)
+    PlatformPathInformation information;
+    if (!PlatformGetPathInformation(fullPath, &information) || !information.exists ||
+        information.isDirectory || information.isSymbolicLink || information.size == 0U ||
+        information.size > SHADER_MANIFEST_MAX_BYTES)
+        return false;
+    uint8_t *data = NULL;
+    uint64_t size = 0;
+    if (!PlatformReadEntireFile(fullPath, SHADER_MANIFEST_MAX_BYTES, &data, &size) || size == 0U ||
+        size > UINT32_MAX)
     {
-        if (data != NULL) HeapFree(GetProcessHeap(), 0, data);
+        PlatformFree(data);
         return false;
     }
 
     static const char header[] = "LAIUE SHADER 1";
     static const char contract[] = "contract = 1";
-    bool hasHeader = HasExactLine(data, length,
-        header, sizeof(header) - 1u, true);
-    bool hasContract = HasExactLine(data, length,
-        contract, sizeof(contract) - 1u, false);
-    HeapFree(GetProcessHeap(), 0, data);
-    return hasHeader && hasContract;
+    uint32_t byteOffset =
+        size >= 3U && data[0] == 0xefU && data[1] == 0xbbU && data[2] == 0xbfU ? 3U : 0U;
+    bool compatible = HasExactLine(data + byteOffset, (uint32_t)size - byteOffset, header,
+                                   sizeof(header) - 1U, true) &&
+                      HasExactLine(data + byteOffset, (uint32_t)size - byteOffset, contract,
+                                   sizeof(contract) - 1U, false);
+    PlatformFree(data);
+    return compatible;
 }
 
-bool ShaderPackLoadActiveBytecode(
-    void** outChunkVS, uint32_t* outChunkVSLength,
-    void** outChunkPS, uint32_t* outChunkPSLength,
-    void** outPanoramaVS, uint32_t* outPanoramaVSLength,
-    void** outPanoramaPS, uint32_t* outPanoramaPSLength,
-    void** outUIVS, uint32_t* outUIVSLength,
-    void** outUIPS, uint32_t* outUIPSLength,
-    ShaderPackLoadStatus* outStatus)
+static ShaderFileLoadResult LoadShaderFile(const wchar_t *fullPath, void **outData,
+                                           uint32_t *outSize)
+{
+    *outData = NULL;
+    *outSize = 0U;
+    PlatformPathInformation information;
+    if (!PlatformGetPathInformation(fullPath, &information))
+        return SHADER_FILE_IO_ERROR;
+    if (!information.exists)
+        return SHADER_FILE_MISSING;
+    if (information.isDirectory || information.isSymbolicLink || information.size == 0U ||
+        information.size > LAIUE_SHADER_BYTECODE_MAX_BYTES)
+        return SHADER_FILE_INVALID;
+
+    uint8_t *data = NULL;
+    uint64_t size = 0;
+    if (!PlatformReadEntireFile(fullPath, LAIUE_SHADER_BYTECODE_MAX_BYTES, &data, &size))
+        return SHADER_FILE_IO_ERROR;
+    if (size == 0U || size > LAIUE_SHADER_BYTECODE_MAX_BYTES || size > UINT32_MAX)
+    {
+        PlatformFree(data);
+        return SHADER_FILE_INVALID;
+    }
+    *outData = data;
+    *outSize = (uint32_t)size;
+    return SHADER_FILE_LOADED;
+}
+
+const LaiueShaderSet *ShaderPackLoadedSetGet(const ShaderPackLoadedSet *loadedSet)
+{
+    return loadedSet != NULL ? &loadedSet->shaderSet : NULL;
+}
+
+void ShaderPackLoadedSetRelease(ShaderPackLoadedSet *loadedSet)
+{
+    if (loadedSet == NULL)
+        return;
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+        PlatformFree(loadedSet->allocations[index]);
+    PlatformFree(loadedSet);
+}
+
+ShaderPackLoadedSet *ShaderPackLoadActiveSet(LaiueContentCatalog *catalog,
+                                             ShaderPackLoadStatus *outStatus)
 {
     if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_IO_ERROR;
-    // Инициализируем все выходные параметры в NULL/0
-    *outChunkVS = NULL; *outChunkVSLength = 0;
-    *outChunkPS = NULL; *outChunkPSLength = 0;
-    *outPanoramaVS = NULL; *outPanoramaVSLength = 0;
-    *outPanoramaPS = NULL; *outPanoramaPSLength = 0;
-    *outUIVS = NULL; *outUIVSLength = 0;
-    *outUIPS = NULL; *outUIPSLength = 0;
+    if (catalog == NULL)
+        return NULL;
 
-    wchar_t* pathBuf = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)PATH_CAPACITY_CHARS * sizeof(wchar_t));
-    if (pathBuf == NULL)
+    wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
+    if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_SHADER_PACK, activeName,
+                                          LAIUE_CONTENT_NAME_CAPACITY))
     {
-        return false;
-    }
-
-    uint32_t directoryLength = 0;
-    if (!GetExecutableDirectory(pathBuf, PATH_CAPACITY_CHARS, &directoryLength))
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-    uint32_t dirPrefixLen = directoryLength + LiteralLength(SHADER_PACK_DIR);
-    if (dirPrefixLen + 1u > PATH_CAPACITY_CHARS)
-    {
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
-    }
-    for (uint32_t i = 0; i < dirPrefixLen; ++i)
-    {
-        pathBuf[i] = i < directoryLength
-            ? pathBuf[i]
-            : SHADER_PACK_DIR[i - directoryLength];
-    }
-    pathBuf[dirPrefixLen] = L'\0';
-
-    // Читаем active.txt
-    uint8_t activeName[64];
-    uint32_t activeNameLen = 0;
-    if (!ReadActivePackName(pathBuf, dirPrefixLen, activeName, &activeNameLen, sizeof(activeName)))
-    {
-        if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_NO_ACTIVE_PACK;
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false; // нет активного пака — используем встроенные
+        wchar_t *activePath =
+            PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
+        bool invalidSelection =
+            activePath != NULL &&
+            LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_SHADER_PACK, NULL, L"active.txt",
+                                         activePath, LAIUE_CONTENT_PATH_CAPACITY) &&
+            PlatformPathExists(activePath);
+        PlatformFree(activePath);
+        if (outStatus != NULL)
+            *outStatus = invalidSelection ? SHADER_PACK_LOAD_ACTIVATION_ERROR
+                                          : SHADER_PACK_LOAD_NO_ACTIVE_PACK;
+        return NULL;
     }
 
-    // Строим путь к директории пака в том же буфере
-    for (uint32_t i = 0; i < activeNameLen && dirPrefixLen + i + 1u < PATH_CAPACITY_CHARS; ++i)
+    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
+    if (path == NULL)
+        return NULL;
+    if (!LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_SHADER_PACK, activeName, L"pack.lm",
+                                      path, LAIUE_CONTENT_PATH_CAPACITY) ||
+        !IsCompatibleManifest(path))
     {
-        pathBuf[dirPrefixLen + i] = (wchar_t)activeName[i];
-    }
-    uint32_t packDirLen = dirPrefixLen + activeNameLen;
-    pathBuf[packDirLen] = L'\\';
-    packDirLen++;
-
-    if (!BuildPath(pathBuf, PATH_CAPACITY_CHARS, packDirLen, L"pack.lm")
-        || !IsCompatibleManifest(pathBuf))
-    {
-        if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_INVALID_MANIFEST;
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
+        PlatformFree(path);
+        if (outStatus != NULL)
+            *outStatus = SHADER_PACK_LOAD_INVALID_MANIFEST;
+        return NULL;
     }
 
-    static const wchar_t* const shaderFiles[6] = {
-        L"chunk_vs.ls", L"chunk_ps.ls",
-        L"panorama_vs.ls", L"panorama_ps.ls",
-        L"ui_vs.ls", L"ui_ps.ls",
-    };
-    void** outPtrs[6] = {
-        outChunkVS, outChunkPS,
-        outPanoramaVS, outPanoramaPS,
-        outUIVS, outUIPS,
-    };
-    uint32_t* outLengths[6] = {
-        outChunkVSLength, outChunkPSLength,
-        outPanoramaVSLength, outPanoramaPSLength,
-        outUIVSLength, outUIPSLength,
+    ShaderPackLoadedSet *loadedSet = PlatformAllocate(sizeof(*loadedSet), true);
+    if (loadedSet == NULL)
+    {
+        PlatformFree(path);
+        return NULL;
+    }
+    LaiueShaderSetInitialize(&loadedSet->shaderSet);
+
+    static const wchar_t *const fileNames[LAIUE_SHADER_SLOT_COUNT] = {
+        L"chunk_vs.ls",    L"chunk_ps.ls", L"panorama_vs.ls",
+        L"panorama_ps.ls", L"ui_vs.ls",    L"ui_ps.ls",
     };
 
     bool anyLoaded = false;
-    for (uint32_t i = 0; i < 6; ++i)
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
     {
-        // Строим полный путь, переиспользуя тот же буфер pathBuf
-        for (uint32_t j = 0; j < packDirLen; ++j)
+        if (!LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_SHADER_PACK, activeName,
+                                          fileNames[index], path, LAIUE_CONTENT_PATH_CAPACITY))
         {
-            pathBuf[j] = pathBuf[j]; // уже есть
+            PlatformFree(path);
+            ShaderPackLoadedSetRelease(loadedSet);
+            return NULL;
         }
-        uint32_t sfxLen = LiteralLength(shaderFiles[i]);
-        if (packDirLen + sfxLen + 1u > PATH_CAPACITY_CHARS)
-        {
-            anyLoaded = false;
-            break;
-        }
-        for (uint32_t j = 0; j < sfxLen; ++j)
-        {
-            pathBuf[packDirLen + j] = shaderFiles[i][j];
-        }
-        pathBuf[packDirLen + sfxLen] = L'\0';
 
-        void* data = LoadCompiledShaderFile(pathBuf, outLengths[i]);
-        *outPtrs[i] = data;
-        anyLoaded = anyLoaded || data != NULL;
+        void *data = NULL;
+        uint32_t size = 0;
+        ShaderFileLoadResult result = LoadShaderFile(path, &data, &size);
+        if (result == SHADER_FILE_MISSING)
+            continue;
+        if (result != SHADER_FILE_LOADED)
+        {
+            PlatformFree(path);
+            ShaderPackLoadedSetRelease(loadedSet);
+            if (outStatus != NULL)
+                *outStatus = result == SHADER_FILE_INVALID ? SHADER_PACK_LOAD_INVALID_SHADER
+                                                           : SHADER_PACK_LOAD_IO_ERROR;
+            return NULL;
+        }
+        loadedSet->allocations[index] = data;
+        if (!LaiueShaderSetSetOverride(&loadedSet->shaderSet, (LaiueShaderSlot)index, data, size))
+        {
+            PlatformFree(path);
+            ShaderPackLoadedSetRelease(loadedSet);
+            if (outStatus != NULL)
+                *outStatus = SHADER_PACK_LOAD_INVALID_SHADER;
+            return NULL;
+        }
+        anyLoaded = true;
     }
+    PlatformFree(path);
 
     if (!anyLoaded)
     {
+        ShaderPackLoadedSetRelease(loadedSet);
         if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_EMPTY;
-        for (uint32_t i = 0; i < 6; ++i)
+        return NULL;
+    }
+    if (outStatus != NULL)
+        *outStatus = SHADER_PACK_LOAD_OK;
+    return loadedSet;
+}
+
+bool ShaderPackLoadActiveBytecode(void **outChunkVS, uint32_t *outChunkVSLength, void **outChunkPS,
+                                  uint32_t *outChunkPSLength, void **outPanoramaVS,
+                                  uint32_t *outPanoramaVSLength, void **outPanoramaPS,
+                                  uint32_t *outPanoramaPSLength, void **outUIVS,
+                                  uint32_t *outUIVSLength, void **outUIPS, uint32_t *outUIPSLength,
+                                  ShaderPackLoadStatus *outStatus)
+{
+    void **outputs[LAIUE_SHADER_SLOT_COUNT] = {
+        outChunkVS, outChunkPS, outPanoramaVS, outPanoramaPS, outUIVS, outUIPS,
+    };
+    uint32_t *lengths[LAIUE_SHADER_SLOT_COUNT] = {
+        outChunkVSLength,    outChunkPSLength, outPanoramaVSLength,
+        outPanoramaPSLength, outUIVSLength,    outUIPSLength,
+    };
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if (outputs[index] == NULL || lengths[index] == NULL)
         {
-            if (*outPtrs[i] != NULL)
-            {
-                HeapFree(GetProcessHeap(), 0, *outPtrs[i]);
-                *outPtrs[i] = NULL;
-                *outLengths[i] = 0;
-            }
+            if (outStatus != NULL)
+                *outStatus = SHADER_PACK_LOAD_IO_ERROR;
+            return false;
         }
-        HeapFree(GetProcessHeap(), 0, pathBuf);
-        return false;
+        *outputs[index] = NULL;
+        *lengths[index] = 0U;
     }
 
-    HeapFree(GetProcessHeap(), 0, pathBuf);
-    if (outStatus != NULL) *outStatus = SHADER_PACK_LOAD_OK;
+    ShaderPackLoadedSet *loadedSet =
+        ShaderPackLoadActiveSet(LaiueContentCatalogDefault(), outStatus);
+    if (loadedSet == NULL)
+        return false;
+
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if ((loadedSet->shaderSet.overrideMask & (1U << index)) == 0U)
+            continue;
+        *outputs[index] = loadedSet->allocations[index];
+        *lengths[index] = loadedSet->shaderSet.bytecode[index].sizeBytes;
+        loadedSet->allocations[index] = NULL;
+    }
+    ShaderPackLoadedSetRelease(loadedSet);
     return true;
+}
+
+void ShaderPackBytecodeRelease(void *bytecode)
+{
+    PlatformFree(bytecode);
 }

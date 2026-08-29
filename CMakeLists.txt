@@ -6,7 +6,7 @@ if(POLICY CMP0184)
 endif()
 
 project(laiue
-    VERSION 0.6.0
+    VERSION 0.7.0
     DESCRIPTION "C17 voxel engine libraries with infinite coordinates"
     LANGUAGES C)
 
@@ -48,6 +48,7 @@ add_subdirectory(src/platform)
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
 add_subdirectory(src/content)
+add_subdirectory(src/mod)
 
 if(LAIUE_BUILD_GRAPHICS)
     add_subdirectory(src/input)
@@ -92,6 +93,14 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/content/content_catalog.h"
         "${PROJECT_SOURCE_DIR}/src/content/content_format.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/content"
+    COMPONENT Engine)
+install(FILES
+        "${PROJECT_SOURCE_DIR}/src/mod/mod.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/mod_api.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/mod_host.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/mod_manifest.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/mod_types.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
     COMPONENT Engine)
 if(LAIUE_BUILD_GRAPHICS)
     install(FILES

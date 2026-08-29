@@ -66,6 +66,7 @@ target_compile_definitions(laiue_build_options INTERFACE
     "LAIUE_VERSION_TEXT=L\"${PROJECT_VERSION}\""
     LAIUE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     LAIUE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    LAIUE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
 
 if(WIN32)
@@ -136,7 +137,8 @@ add_library(laiue_windows_no_crt INTERFACE)
 add_library(laiue::windows_no_crt ALIAS laiue_windows_no_crt)
 if(WIN32)
     add_library(laiue_runtime OBJECT
-        "${PROJECT_SOURCE_DIR}/src/runtime/memory.c")
+        "${PROJECT_SOURCE_DIR}/src/runtime/memory.c"
+        "${PROJECT_SOURCE_DIR}/src/runtime/wide_string.c")
     target_compile_options(laiue_runtime PRIVATE
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>

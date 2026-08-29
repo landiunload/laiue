@@ -17,6 +17,14 @@ target_link_libraries(laiue_platform_support
     PRIVATE laiue::build_options)
 set_target_properties(laiue_platform_support PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
+if(NOT WIN32)
+    # Static objects keep their ELF visibility when linked into a shared
+    # module.  Hide the internal OS boundary at its source so Platform*
+    # helpers cannot leak into each public module's dynamic ABI.
+    set_target_properties(laiue_platform_support PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES)
+endif()
 
 if(WIN32)
     target_link_libraries(laiue_platform_support

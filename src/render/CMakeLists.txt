@@ -36,8 +36,9 @@ laiue_add_module(render
         ${chunk_shader_headers}
         ${panorama_shader_headers}
         ${ui_shader_headers}
-    LINK
+    PUBLIC_LINK
         laiue_content
+    LINK
         d3d12
         dxgi
         dxguid

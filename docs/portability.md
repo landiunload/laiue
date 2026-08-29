@@ -9,7 +9,7 @@
 | Alpine x86_64 | CI | — | musl, GCC |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
 
-Core включает `platform_support`, `world`, `physics` и `content`. Graphics
+Core включает `platform_support`, `world`, `physics`, `content` и `mod`. Graphics
 добавляет `window`, `input`, `audio`, `mesh`, `render`, `scene` и `ui`.
 Linux-графический backend пока отсутствует; попытка включить его завершается
 ошибкой configure.
@@ -91,7 +91,8 @@ glibc и musl libraries не взаимозаменяемы. Один configure 
 ## Установка и bundle
 
 Установочный компонент `Engine` содержит созданные библиотеки, публичные
-заголовки, шейдерные исходники/fallback и документацию.
+заголовки и документацию. Windows graphics bundle дополнительно включает
+HLSL-исходники renderer contracts; Linux core bundle их не устанавливает.
 
 ```powershell
 cmake --install build/windows-msvc --config Release `
@@ -119,11 +120,16 @@ cmake --install build/linux-gcc --config Release \
   преобразует их в native representation.
 - Указатели, `wchar_t` и native structs не записываются в переносимые файлы.
 - Имена внутри packs отклоняют absolute path, `..`, separators, symlink или
-  reparse traversal и case-collision.
+  reparse traversal и ASCII case-collision.
 - ELF symbols по умолчанию hidden; наружу выходят только API exports.
 - Windows no-CRT target не должен получать скрытую зависимость от CRT через
   новую библиотеку или compiler helper.
 - Переносимые вычисления собираются без fast-math и FMA contraction.
+
+Native mod ABI в 0.7 имеет отдельные artifacts для Windows x86_64, Linux
+x86_64 glibc и Linux x86_64 musl. ARM64 пока не входит ни в mod ABI, ни в
+битовый контракт физики. Подробнее: [modding.md](modding.md) и
+[physics.md](physics.md).
 
 Новая platform-specific операция сначала получает единый контракт владения
 и ошибок, затем отдельные реализации для поддерживаемых платформ. Нельзя

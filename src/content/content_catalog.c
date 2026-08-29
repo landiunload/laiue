@@ -6,6 +6,25 @@
 
 #define ACTIVE_FILE_NAME L"active.txt"
 #define ACTIVE_UTF8_CAPACITY 512U
+#define CONTENT_ENUMERATION_LIMIT 4096U
+
+struct LaiueContentCatalog
+{
+    PlatformRwLock lock;
+    uint32_t rootLength;
+    wchar_t root[1];
+};
+
+enum DefaultCatalogState
+{
+    DEFAULT_CATALOG_UNINITIALIZED = 0,
+    DEFAULT_CATALOG_INITIALIZING = 1,
+    DEFAULT_CATALOG_READY = 2,
+    DEFAULT_CATALOG_FAILED = 3,
+};
+
+static volatile uint32_t g_defaultCatalogState = DEFAULT_CATALOG_UNINITIALIZED;
+static LaiueContentCatalog *g_defaultCatalog;
 
 static wchar_t* AllocatePathBuffer(void)
 {
@@ -13,32 +32,51 @@ static wchar_t* AllocatePathBuffer(void)
         (size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
 }
 
-static uint32_t TextLength(const wchar_t* text)
+static uint32_t TextLengthBounded(const wchar_t *text, uint32_t capacity)
 {
+    if (text == NULL)
+        return 0;
     uint32_t length = 0;
-    if (text != NULL)
-        while (text[length] != L'\0') ++length;
+    while (length < capacity && text[length] != L'\0')
+        ++length;
     return length;
 }
 
 static bool TextEquals(const wchar_t* left, const wchar_t* right)
 {
-    uint32_t i = 0;
-    while (left[i] != L'\0' && right[i] != L'\0')
+    uint32_t index = 0;
+    while (left[index] != L'\0' && right[index] != L'\0')
     {
-        if (left[i] != right[i]) return false;
-        ++i;
+        if (left[index] != right[index])
+            return false;
+        ++index;
     }
-    return left[i] == right[i];
+    return left[index] == right[index];
+}
+
+static wchar_t FoldAsciiCase(wchar_t character)
+{
+    return character >= L'A' && character <= L'Z' ? character + (L'a' - L'A') : character;
+}
+
+static bool TextEqualsAsciiCaseInsensitive(const wchar_t *left, const wchar_t *right)
+{
+    uint32_t index = 0;
+    while (left[index] != L'\0' && right[index] != L'\0')
+    {
+        if (FoldAsciiCase(left[index]) != FoldAsciiCase(right[index]))
+            return false;
+        ++index;
+    }
+    return left[index] == right[index];
 }
 
 static int32_t TextCompare(const wchar_t* left, const wchar_t* right)
 {
-    uint32_t i = 0;
-    while (left[i] != L'\0' && right[i] != L'\0'
-        && left[i] == right[i])
-        ++i;
-    return left[i] < right[i] ? -1 : left[i] > right[i] ? 1 : 0;
+    uint32_t index = 0;
+    while (left[index] != L'\0' && right[index] != L'\0' && left[index] == right[index])
+        ++index;
+    return left[index] < right[index] ? -1 : left[index] > right[index] ? 1 : 0;
 }
 
 static bool AppendText(wchar_t* destination, uint32_t capacity,
@@ -57,17 +95,97 @@ static bool AppendText(wchar_t* destination, uint32_t capacity,
 static bool AppendCharacter(wchar_t* destination, uint32_t capacity,
     uint32_t* length, wchar_t character)
 {
-    if (*length + 1U >= capacity) return false;
+    if (destination == NULL || length == NULL || *length + 1U >= capacity)
+        return false;
     destination[(*length)++] = character;
     destination[*length] = L'\0';
     return true;
 }
 
-static bool GetExecutableDirectory(wchar_t* destination, uint32_t capacity,
-    uint32_t* outLength)
+static bool AppendSeparator(wchar_t *destination, uint32_t capacity, uint32_t *length)
 {
-    if (!PlatformExecutableDirectory(destination, capacity)) return false;
-    *outLength = TextLength(destination);
+    if (*length > 0U)
+    {
+        wchar_t last = destination[*length - 1U];
+        if (last == L'/' || last == L'\\')
+            return true;
+    }
+    return AppendCharacter(destination, capacity, length, L'/');
+}
+
+LaiueContentCatalog *LaiueContentCatalogCreate(const wchar_t *rootDirectory)
+{
+    wchar_t executableRoot[LAIUE_PLATFORM_PATH_CAPACITY];
+    const wchar_t *root = rootDirectory;
+    if (root == NULL || root[0] == L'\0')
+    {
+        if (!PlatformExecutableDirectory(executableRoot, LAIUE_PLATFORM_PATH_CAPACITY))
+            return NULL;
+        root = executableRoot;
+    }
+
+    uint32_t length = TextLengthBounded(root, LAIUE_CONTENT_PATH_CAPACITY);
+    if (length == 0U || length >= LAIUE_CONTENT_PATH_CAPACITY)
+        return NULL;
+
+    size_t allocationSize =
+        offsetof(LaiueContentCatalog, root) + (size_t)(length + 1U) * sizeof(wchar_t);
+    LaiueContentCatalog *catalog = PlatformAllocate(allocationSize, true);
+    if (catalog == NULL)
+        return NULL;
+    if (!PlatformRwLockInitialize(&catalog->lock))
+    {
+        PlatformFree(catalog);
+        return NULL;
+    }
+    catalog->rootLength = length;
+    memcpy(catalog->root, root, (size_t)(length + 1U) * sizeof(wchar_t));
+    return catalog;
+}
+
+void LaiueContentCatalogDestroy(LaiueContentCatalog *catalog)
+{
+    if (catalog == NULL || catalog == g_defaultCatalog)
+        return;
+    PlatformRwLockDestroy(&catalog->lock);
+    PlatformFree(catalog);
+}
+
+LaiueContentCatalog *LaiueContentCatalogDefault(void)
+{
+    uint32_t state = PlatformAtomicLoadU32Acquire(&g_defaultCatalogState);
+    if (state == DEFAULT_CATALOG_READY)
+        return g_defaultCatalog;
+    if (state == DEFAULT_CATALOG_FAILED)
+        return NULL;
+
+    uint32_t expected = DEFAULT_CATALOG_UNINITIALIZED;
+    if (PlatformAtomicCompareExchangeU32(&g_defaultCatalogState, &expected,
+                                         DEFAULT_CATALOG_INITIALIZING))
+    {
+        g_defaultCatalog = LaiueContentCatalogCreate(NULL);
+        PlatformAtomicStoreU32Release(&g_defaultCatalogState, g_defaultCatalog != NULL
+                                                                  ? DEFAULT_CATALOG_READY
+                                                                  : DEFAULT_CATALOG_FAILED);
+        return g_defaultCatalog;
+    }
+
+    do
+    {
+        PlatformSleepMilliseconds(0U);
+        state = PlatformAtomicLoadU32Acquire(&g_defaultCatalogState);
+    } while (state == DEFAULT_CATALOG_INITIALIZING);
+    return state == DEFAULT_CATALOG_READY ? g_defaultCatalog : NULL;
+}
+
+bool LaiueContentCatalogGetRoot(LaiueContentCatalog *catalog, wchar_t *destination,
+                                uint32_t capacity)
+{
+    if (catalog == NULL || destination == NULL || capacity <= catalog->rootLength)
+        return false;
+    PlatformRwLockAcquireShared(&catalog->lock);
+    memcpy(destination, catalog->root, (size_t)(catalog->rootLength + 1U) * sizeof(wchar_t));
+    PlatformRwLockReleaseShared(&catalog->lock);
     return true;
 }
 
@@ -76,46 +194,60 @@ static bool ChildNameIsSafe(const wchar_t* name)
     return name == NULL || LaiueContentNameIsSafe(name);
 }
 
-bool LaiueContentBuildPath(LaiueContentType type,
-    const wchar_t* name, const wchar_t* childName,
-    wchar_t* destination, uint32_t capacity)
+static bool BuildPathUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                              const wchar_t *name, const wchar_t *childName, wchar_t *destination,
+                              uint32_t capacity)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || destination == NULL || capacity == 0
-        || (name != NULL && (!LaiueContentNameIsSafe(name)
-            || !LaiueContentNameMatches(type, name)))
-        || !ChildNameIsSafe(childName))
+    if (catalog == NULL || format == NULL || destination == NULL || capacity == 0U ||
+        (name != NULL && (!LaiueContentNameIsSafe(name) || !LaiueContentNameMatches(type, name))) ||
+        !ChildNameIsSafe(childName))
         return false;
 
-    uint32_t length = 0;
-    if (!GetExecutableDirectory(destination, capacity, &length)
-        || !AppendCharacter(destination, capacity, &length, L'/')
-        || !AppendText(destination, capacity, &length, format->directoryName))
+    if (catalog->rootLength + 1U > capacity)
         return false;
-    if (name != NULL
-        && (!AppendCharacter(destination, capacity, &length, L'/')
-            || !AppendText(destination, capacity, &length, name)))
+    memcpy(destination, catalog->root, (size_t)(catalog->rootLength + 1U) * sizeof(wchar_t));
+    uint32_t length = catalog->rootLength;
+    if (!AppendSeparator(destination, capacity, &length) ||
+        !AppendText(destination, capacity, &length, format->directoryName))
         return false;
-    if (childName != NULL
-        && (!AppendCharacter(destination, capacity, &length, L'/')
-            || !AppendText(destination, capacity, &length, childName)))
+    if (name != NULL && (!AppendSeparator(destination, capacity, &length) ||
+                         !AppendText(destination, capacity, &length, name)))
+        return false;
+    if (childName != NULL && (!AppendSeparator(destination, capacity, &length) ||
+                              !AppendText(destination, capacity, &length, childName)))
         return false;
     return true;
 }
 
-static bool BuildDirectoryPath(LaiueContentType type, const wchar_t* suffix,
-    wchar_t* destination, uint32_t capacity)
+bool LaiueContentCatalogBuildPath(LaiueContentCatalog *catalog, LaiueContentType type,
+                                  const wchar_t *name, const wchar_t *childName,
+                                  wchar_t *destination, uint32_t capacity)
+{
+    if (catalog == NULL)
+        return false;
+    PlatformRwLockAcquireShared(&catalog->lock);
+    bool built = BuildPathUnlocked(catalog, type, name, childName, destination, capacity);
+    PlatformRwLockReleaseShared(&catalog->lock);
+    return built;
+}
+
+static bool BuildDirectoryPathUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                       const wchar_t *suffix, wchar_t *destination,
+                                       uint32_t capacity)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || destination == NULL || capacity == 0) return false;
-    uint32_t length = 0;
-    if (!GetExecutableDirectory(destination, capacity, &length)
-        || !AppendCharacter(destination, capacity, &length, L'/')
-        || !AppendText(destination, capacity, &length, format->directoryName))
+    if (catalog == NULL || format == NULL || destination == NULL || capacity == 0U ||
+        catalog->rootLength + 1U > capacity)
         return false;
-    return suffix == NULL
-        || (AppendCharacter(destination, capacity, &length, L'/')
-            && AppendText(destination, capacity, &length, suffix));
+
+    memcpy(destination, catalog->root, (size_t)(catalog->rootLength + 1U) * sizeof(wchar_t));
+    uint32_t length = catalog->rootLength;
+    if (!AppendSeparator(destination, capacity, &length) ||
+        !AppendText(destination, capacity, &length, format->directoryName))
+        return false;
+    return suffix == NULL || (AppendSeparator(destination, capacity, &length) &&
+                              AppendText(destination, capacity, &length, suffix));
 }
 
 static bool StorageMatches(
@@ -123,29 +255,30 @@ static bool StorageMatches(
 {
     uint32_t storage = directory
         ? LAIUE_CONTENT_STORAGE_DIRECTORY : LAIUE_CONTENT_STORAGE_FILE;
-    return (format->storageMask & storage) != 0;
+    return (format->storageMask & storage) != 0U;
 }
 
-bool LaiueContentGetActivePack(LaiueContentType type,
-    wchar_t* destination, uint32_t capacity)
+static bool ContentPathMatchesStorageUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                              const wchar_t *name);
+
+static bool GetActivePackUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                  wchar_t *destination, uint32_t capacity)
 {
-    if (!LaiueContentTypeIsPack(type) || destination == NULL || capacity == 0)
+    if (!LaiueContentTypeIsPack(type) || destination == NULL || capacity == 0U)
         return false;
     destination[0] = L'\0';
 
     wchar_t* path = AllocatePathBuffer();
     if (path == NULL) return false;
-    if (!BuildDirectoryPath(
-            type, ACTIVE_FILE_NAME, path, LAIUE_CONTENT_PATH_CAPACITY))
+    if (!BuildDirectoryPathUnlocked(catalog, type, ACTIVE_FILE_NAME, path,
+                                    LAIUE_CONTENT_PATH_CAPACITY))
     {
         PlatformFree(path);
         return false;
     }
     uint8_t* bytes = NULL;
     uint64_t size = 0;
-    if (!PlatformReadEntireFile(
-            path, ACTIVE_UTF8_CAPACITY - 1U, &bytes, &size)
-        || size == 0)
+    if (!PlatformReadEntireFile(path, ACTIVE_UTF8_CAPACITY - 1U, &bytes, &size) || size == 0U)
     {
         PlatformFree(path);
         PlatformFree(bytes);
@@ -167,8 +300,9 @@ bool LaiueContentGetActivePack(LaiueContentType type,
         (const char*)bytes + begin, end - begin,
         destination, capacity, NULL);
     PlatformFree(bytes);
-    if (!converted || !LaiueContentNameIsSafe(destination)
-        || !LaiueContentNameMatches(type, destination))
+    if (!converted || !LaiueContentNameIsSafe(destination) ||
+        !LaiueContentNameMatches(type, destination) ||
+        !ContentPathMatchesStorageUnlocked(catalog, type, destination))
     {
         destination[0] = L'\0';
         return false;
@@ -176,19 +310,33 @@ bool LaiueContentGetActivePack(LaiueContentType type,
     return true;
 }
 
-bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
+bool LaiueContentCatalogGetActivePack(LaiueContentCatalog *catalog, LaiueContentType type,
+                                      wchar_t *destination, uint32_t capacity)
+{
+    if (catalog == NULL)
+        return false;
+    PlatformRwLockAcquireShared(&catalog->lock);
+    bool read = GetActivePackUnlocked(catalog, type, destination, capacity);
+    PlatformRwLockReleaseShared(&catalog->lock);
+    return read;
+}
+
+bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType type,
+                                  LaiueContentList *outList)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || outList == NULL) return false;
+    if (catalog == NULL || format == NULL || outList == NULL)
+        return false;
     outList->entries = NULL;
     outList->count = 0;
 
+    PlatformRwLockAcquireShared(&catalog->lock);
     wchar_t* directoryPath = AllocatePathBuffer();
-    if (directoryPath == NULL) return false;
-    if (!BuildDirectoryPath(
-            type, NULL, directoryPath, LAIUE_CONTENT_PATH_CAPACITY))
+    if (directoryPath == NULL || !BuildDirectoryPathUnlocked(catalog, type, NULL, directoryPath,
+                                                             LAIUE_CONTENT_PATH_CAPACITY))
     {
         PlatformFree(directoryPath);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return false;
     }
     PlatformDirectoryIterator* iterator =
@@ -200,6 +348,7 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
         PlatformFree(file);
         PlatformFree(iterator);
         PlatformFree(directoryPath);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return false;
     }
     if (!PlatformDirectoryOpen(iterator, directoryPath))
@@ -207,6 +356,7 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
         PlatformFree(file);
         PlatformFree(iterator);
         PlatformFree(directoryPath);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return true;
     }
 
@@ -217,14 +367,26 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
             && StorageMatches(format, file->isDirectory)
             && LaiueContentNameIsSafe(file->name)
             && LaiueContentNameMatches(type, file->name))
+        {
+            if (count == CONTENT_ENUMERATION_LIMIT)
+            {
+                PlatformDirectoryClose(iterator);
+                PlatformFree(file);
+                PlatformFree(iterator);
+                PlatformFree(directoryPath);
+                PlatformRwLockReleaseShared(&catalog->lock);
+                return false;
+            }
             ++count;
+        }
     }
     PlatformDirectoryClose(iterator);
-    if (count == 0)
+    if (count == 0U)
     {
         PlatformFree(file);
         PlatformFree(iterator);
         PlatformFree(directoryPath);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return true;
     }
 
@@ -235,11 +397,12 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
         PlatformFree(file);
         PlatformFree(iterator);
         PlatformFree(directoryPath);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return false;
     }
     wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    bool hasActive = format->pack && LaiueContentGetActivePack(
-        type, activeName, LAIUE_CONTENT_NAME_CAPACITY);
+    bool hasActive = format->pack &&
+                     GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY);
 
     uint32_t index = 0;
     if (!PlatformDirectoryOpen(iterator, directoryPath))
@@ -248,6 +411,7 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
         PlatformFree(iterator);
         PlatformFree(directoryPath);
         PlatformFree(entries);
+        PlatformRwLockReleaseShared(&catalog->lock);
         return false;
     }
     while (index < count && PlatformDirectoryNext(iterator, file))
@@ -257,7 +421,7 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
             || !LaiueContentNameIsSafe(file->name)
             || !LaiueContentNameMatches(type, file->name))
             continue;
-        uint32_t length = TextLength(file->name);
+        uint32_t length = TextLengthBounded(file->name, LAIUE_CONTENT_NAME_CAPACITY);
         if (length >= LAIUE_CONTENT_NAME_CAPACITY) continue;
         memcpy(entries[index].name, file->name,
             (size_t)(length + 1U) * sizeof(wchar_t));
@@ -275,16 +439,32 @@ bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList* outList)
     {
         LaiueContentEntry value = entries[i];
         uint32_t position = i;
-        while (position > 0
-            && TextCompare(value.name, entries[position - 1U].name) < 0)
+        while (position > 0U && TextCompare(value.name, entries[position - 1U].name) < 0)
         {
             entries[position] = entries[position - 1U];
             --position;
         }
         entries[position] = value;
     }
+
+    // A content tree must resolve identically on case-sensitive and
+    // case-insensitive filesystems.  Reject the entire ambiguous view instead
+    // of selecting a platform-dependent winner.
+    for (uint32_t left = 0; left < index; ++left)
+    {
+        for (uint32_t right = left + 1U; right < index; ++right)
+        {
+            if (TextEqualsAsciiCaseInsensitive(entries[left].name, entries[right].name))
+            {
+                PlatformFree(entries);
+                PlatformRwLockReleaseShared(&catalog->lock);
+                return false;
+            }
+        }
+    }
     outList->entries = entries;
     outList->count = index;
+    PlatformRwLockReleaseShared(&catalog->lock);
     return true;
 }
 
@@ -296,14 +476,14 @@ void LaiueContentListRelease(LaiueContentList* list)
     list->count = 0;
 }
 
-static bool ContentPathMatchesStorage(
-    LaiueContentType type, const wchar_t* name)
+static bool ContentPathMatchesStorageUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                              const wchar_t *name)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
     if (format == NULL) return false;
     wchar_t* directoryPath = AllocatePathBuffer();
-    if (directoryPath == NULL || !BuildDirectoryPath(
-            type, NULL, directoryPath, LAIUE_CONTENT_PATH_CAPACITY))
+    if (directoryPath == NULL || !BuildDirectoryPathUnlocked(catalog, type, NULL, directoryPath,
+                                                             LAIUE_CONTENT_PATH_CAPACITY))
     {
         PlatformFree(directoryPath);
         return false;
@@ -322,58 +502,89 @@ static bool ContentPathMatchesStorage(
     }
     PlatformFree(directoryPath);
     bool found = false;
+    uint32_t foldedMatchCount = 0U;
     while (PlatformDirectoryNext(iterator, entry))
     {
-        if (!entry->isSymbolicLink && TextEquals(entry->name, name)
-            && StorageMatches(format, entry->isDirectory))
+        if (entry->isSymbolicLink || !StorageMatches(format, entry->isDirectory) ||
+            !LaiueContentNameIsSafe(entry->name) || !LaiueContentNameMatches(type, entry->name) ||
+            !TextEqualsAsciiCaseInsensitive(entry->name, name))
+            continue;
+        ++foldedMatchCount;
+        if (TextEquals(entry->name, name))
         {
             found = true;
-            break;
         }
     }
     PlatformDirectoryClose(iterator);
     PlatformFree(entry);
     PlatformFree(iterator);
-    return found;
+    return found && foldedMatchCount == 1U;
 }
 
-bool LaiueContentSetActivePack(LaiueContentType type, const wchar_t* name)
+bool LaiueContentCatalogSetActivePack(LaiueContentCatalog *catalog, LaiueContentType type,
+                                      const wchar_t *name)
 {
     const LaiueContentFormat* format = LaiueContentFormatGet(type);
-    if (format == NULL || !format->pack) return false;
+    if (catalog == NULL || format == NULL || !format->pack)
+        return false;
+
+    PlatformRwLockAcquireExclusive(&catalog->lock);
     wchar_t* path = AllocatePathBuffer();
-    if (path == NULL) return false;
-    if (!BuildDirectoryPath(
-            type, ACTIVE_FILE_NAME, path, LAIUE_CONTENT_PATH_CAPACITY))
+    if (path == NULL || !BuildDirectoryPathUnlocked(catalog, type, ACTIVE_FILE_NAME, path,
+                                                    LAIUE_CONTENT_PATH_CAPACITY))
     {
         PlatformFree(path);
+        PlatformRwLockReleaseExclusive(&catalog->lock);
         return false;
     }
     if (name == NULL || name[0] == L'\0')
     {
         bool removed = !PlatformPathExists(path) || PlatformDeleteFile(path);
         PlatformFree(path);
+        PlatformRwLockReleaseExclusive(&catalog->lock);
         return removed;
     }
-    if (!LaiueContentNameIsSafe(name)
-        || !LaiueContentNameMatches(type, name)
-        || !ContentPathMatchesStorage(type, name))
+    if (!LaiueContentNameIsSafe(name) || !LaiueContentNameMatches(type, name) ||
+        !ContentPathMatchesStorageUnlocked(catalog, type, name))
     {
         PlatformFree(path);
+        PlatformRwLockReleaseExclusive(&catalog->lock);
         return false;
     }
 
     char utf8[ACTIVE_UTF8_CAPACITY];
     uint32_t byteCount = 0;
-    if (!PlatformWideToUtf8(name, utf8,
-            sizeof(utf8) - 1U, &byteCount)
-        || byteCount + 1U > sizeof(utf8))
+    bool converted = PlatformWideToUtf8(name, utf8, sizeof(utf8) - 1U, &byteCount);
+    bool written = false;
+    if (converted && byteCount + 1U <= sizeof(utf8))
     {
-        PlatformFree(path);
-        return false;
+        utf8[byteCount++] = '\n';
+        written = PlatformWriteFileAtomic(path, utf8, byteCount);
     }
-    utf8[byteCount++] = '\n';
-    bool written = PlatformWriteFileAtomic(path, utf8, byteCount);
     PlatformFree(path);
+    PlatformRwLockReleaseExclusive(&catalog->lock);
     return written;
+}
+
+bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList *outList)
+{
+    return LaiueContentCatalogEnumerate(LaiueContentCatalogDefault(), type, outList);
+}
+
+bool LaiueContentSetActivePack(LaiueContentType type, const wchar_t *name)
+{
+    return LaiueContentCatalogSetActivePack(LaiueContentCatalogDefault(), type, name);
+}
+
+bool LaiueContentGetActivePack(LaiueContentType type, wchar_t *destination, uint32_t capacity)
+{
+    return LaiueContentCatalogGetActivePack(LaiueContentCatalogDefault(), type, destination,
+                                            capacity);
+}
+
+bool LaiueContentBuildPath(LaiueContentType type, const wchar_t *name, const wchar_t *childName,
+                           wchar_t *destination, uint32_t capacity)
+{
+    return LaiueContentCatalogBuildPath(LaiueContentCatalogDefault(), type, name, childName,
+                                        destination, capacity);
 }

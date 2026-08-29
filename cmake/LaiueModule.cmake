@@ -65,7 +65,7 @@ function(laiue_add_module module_name)
     if(WIN32)
         if(MODULE_PRECISE_FP)
             target_compile_options(${target_name} PRIVATE
-                "$<$<C_COMPILER_ID:MSVC>:/fp:precise>"
+                "$<$<C_COMPILER_ID:MSVC>:/fp:strict>"
                 "$<$<C_COMPILER_ID:Clang>:/clang:-ffp-model=strict>")
         else()
             target_compile_options(${target_name} PRIVATE /fp:fast)

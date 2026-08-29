@@ -5,9 +5,11 @@ Renderer использует GPU-ready `.ltp`: изображения и арх
 только имя файла: запрещены separators, управляющие символы, Windows device
 names и конечные пробел/точка.
 
-Повреждённый pack заменяется нейтральным встроенным 1×1 fallback. Приложение
-выбирает момент перечитывания `active.txt` и может сохранить прежние GPU
-ресурсы до успешного создания replacement.
+При первой подготовке без активного валидного pack используется нейтральный
+встроенный 1×1 fallback. При hot reload повреждённый pack, I/O error или
+ошибка создания GPU resource оставляют прежние texture arrays и descriptors
+активными. `RendererReloadTexturePackFrom` читает явный каталог и выполняет
+замену только после полного создания albedo и normal/AO replacement.
 
 ## Материалы и слои
 

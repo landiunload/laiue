@@ -80,6 +80,10 @@ typedef struct VoxelBodyShape
 {
     // Все значения конечны; radius > collisionEpsilon,
     // height > 2 * collisionEpsilon, eyeHeight лежит в [0, height].
+    // Для ненулевого epsilon локальная позиция также должна иметь не менее
+    // четырёх шагов binary64 на величину epsilon; недостаточное разрешение
+    // обрабатывается fail-closed. Абсолютная координата мира не ограничена:
+    // активные тела следует удерживать около локального нуля через rebasing.
     double radius;
     double height;
     double eyeHeight;
@@ -90,13 +94,20 @@ LAIUE_PHYSICS_API void VoxelBodyCalculateBounds(
     const double position[3], const VoxelBodyShape* shape,
     VoxelBodyBounds* outBounds);
 
+// Проверяет входной диапазон до collision query. false означает, что форма,
+// локальная позиция или binary64-разрешение collisionEpsilon недостаточны;
+// приложение должно исправить данные либо выполнить rebasing до симуляции.
+LAIUE_PHYSICS_API bool VoxelBodyLocalRangeIsResolved(const double position[3],
+                                                     const VoxelBodyShape *shape);
+
 LAIUE_PHYSICS_API bool VoxelBodyCollides(
     const VoxelCollisionSource* collision,
     const double position[3], const VoxelBodyShape* shape);
 
 // Двигает тело по одной оси и возвращает true при столкновении. Неконечные,
-// выходящие за simulation range значения и неверная ось fail-closed без
-// изменения position и без вызова broadphase callback.
+// выходящие за simulation range, неразрешимые в текущем binary64 масштабе
+// значения и неверная ось fail-closed без изменения position. Проверки
+// аргументов и sub-ULP движения завершаются до broadphase callback.
 LAIUE_PHYSICS_API bool VoxelBodyMoveAxis(
     const VoxelCollisionSource* collision,
     double position[3], const VoxelBodyShape* shape,

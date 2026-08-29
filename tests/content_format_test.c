@@ -247,6 +247,9 @@ static void TestNameIsSafeRejectsWindowsQuirks(void)
         "управляющий символ признан безопасным");
     ContentFormatTestExpect(!LaiueContentNameIsSafe(L"pa\x1f" L"ck"),
         "символ 0x1F признан безопасным");
+    ContentFormatTestExpect(!LaiueContentNameIsSafe(L"pa\x7f"
+                                                    L"ck"),
+                            "символ DEL признан безопасным");
 }
 
 // --- Безопасность имени: зарезервированные устройства ---------------------

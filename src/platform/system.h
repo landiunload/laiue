@@ -48,6 +48,11 @@ void PlatformRwLockReleaseShared(PlatformRwLock* lock);
 void PlatformRwLockAcquireExclusive(PlatformRwLock* lock);
 void PlatformRwLockReleaseExclusive(PlatformRwLock* lock);
 
+uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value);
+bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
+                                      uint32_t desired);
+void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired);
+
 double PlatformMonotonicSeconds(void);
 uint64_t PlatformMonotonicMilliseconds(void);
 void PlatformSleepMilliseconds(uint32_t milliseconds);

@@ -74,3 +74,9 @@
 #else
 #define LAIUE_CONTENT_API LAIUE_IMPORT
 #endif
+
+#if defined(LAIUE_BUILD_MOD)
+#define LAIUE_MOD_API LAIUE_EXPORT
+#else
+#define LAIUE_MOD_API LAIUE_IMPORT
+#endif

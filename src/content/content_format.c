@@ -108,10 +108,9 @@ bool LaiueContentNameIsSafe(const wchar_t* name)
     for (; name[length] != L'\0'; ++length)
     {
         wchar_t character = name[length];
-        if (character < 0x20 || character == L'/' || character == L'\\'
-            || character == L':' || character == L'*' || character == L'?'
-            || character == L'"' || character == L'<' || character == L'>'
-            || character == L'|')
+        if (character < 0x20 || character == 0x7f || character == L'/' || character == L'\\' ||
+            character == L':' || character == L'*' || character == L'?' || character == L'"' ||
+            character == L'<' || character == L'>' || character == L'|')
         {
             return false;
         }

@@ -86,6 +86,23 @@ void PlatformRwLockReleaseExclusive(PlatformRwLock* lock)
     pthread_rwlock_unlock((pthread_rwlock_t*)lock);
 }
 
+uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)
+{
+    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+}
+
+bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
+                                      uint32_t desired)
+{
+    return __atomic_compare_exchange_n(value, expected, desired, false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
+}
+
+void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired)
+{
+    __atomic_store_n(value, desired, __ATOMIC_RELEASE);
+}
+
 double PlatformMonotonicSeconds(void)
 {
     struct timespec value;
