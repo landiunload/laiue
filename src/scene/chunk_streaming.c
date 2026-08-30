@@ -15,6 +15,12 @@
 #define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
+static int64_t ChunkCoordinateFromBlock(int64_t block)
+{
+    int64_t chunk = block / CHUNK_SIZE;
+    return block % CHUNK_SIZE < 0 ? chunk - 1 : chunk;
+}
+
 typedef enum ChunkEntryState
 {
     CHUNK_ENTRY_EMPTY = 0,
@@ -763,12 +769,12 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
 
 void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, int64_t blockY, int64_t blockZ)
 {
-    int64_t chunkX = blockX >> CHUNK_SIZE_LOG2;
-    int64_t chunkY = blockY >> CHUNK_SIZE_LOG2;
-    int64_t chunkZ = blockZ >> CHUNK_SIZE_LOG2;
-    int64_t localX = blockX & (CHUNK_SIZE - 1);
-    int64_t localY = blockY & (CHUNK_SIZE - 1);
-    int64_t localZ = blockZ & (CHUNK_SIZE - 1);
+    int64_t chunkX = ChunkCoordinateFromBlock(blockX);
+    int64_t chunkY = ChunkCoordinateFromBlock(blockY);
+    int64_t chunkZ = ChunkCoordinateFromBlock(blockZ);
+    int64_t localX = blockX - chunkX * CHUNK_SIZE;
+    int64_t localY = blockY - chunkY * CHUNK_SIZE;
+    int64_t localZ = blockZ - chunkZ * CHUNK_SIZE;
 
     // Блок на границе чанка входит в расширенный регион соседа —
     // соседние чанки перестраиваются тоже.

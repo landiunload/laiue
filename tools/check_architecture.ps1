@@ -4,59 +4,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $sourceRootPath = [System.IO.Path]::GetFullPath($SourceRoot)
+$checkerPath = Join-Path $PSScriptRoot 'check_architecture.cmake'
 
-# Разрешённые направления include-зависимостей библиотек движка.
-$allowed = @{
-    audio       = @('audio')
-    content     = @('content', 'platform')
-    input       = @('input')
-    mesh        = @('mesh', 'render', 'world')
-    physics     = @('physics')
-    platform    = @('platform')
-    render      = @('content', 'render')
-    runtime     = @('runtime')
-    scene       = @('mesh', 'render', 'scene', 'world')
-    ui          = @('render', 'scene', 'ui')
-    world       = @('platform', 'world')
+# Keep a single dependency map in the CMake checker used by configure and CI.
+& cmake "-DSOURCE_ROOT=$sourceRootPath" -P $checkerPath
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
-
-$violations = [System.Collections.Generic.List[string]]::new()
-$files = Get-ChildItem -LiteralPath $sourceRootPath -Recurse -File |
-    Where-Object { $_.Extension -eq '.c' -or $_.Extension -eq '.h' } |
-    Where-Object { $_.FullName -notmatch '[\\/]generated[\\/]' }
-
-foreach ($file in $files) {
-    $relative = $file.FullName.Substring(
-        ([string]$sourceRootPath).Length + 1).Replace('\', '/')
-    if (-not $relative.Contains('/')) { continue }
-    $owner = $relative.Split('/')[0]
-    if (-not $allowed.ContainsKey($owner)) {
-        $violations.Add("${relative}: неизвестный модуль '$owner'")
-        continue
-    }
-
-    $lineNumber = 0
-    foreach ($line in Get-Content -LiteralPath $file.FullName) {
-        $lineNumber++
-        if ($line -notmatch '^\s*#include\s+"([^"]+)"') { continue }
-        $include = $Matches[1].Replace('\', '/')
-        if ($include.Contains('../')) {
-            $violations.Add("${relative}:${lineNumber}: запрещён относительный include '$include'")
-            continue
-        }
-        if (-not $include.Contains('/')) { continue }
-
-        $dependency = $include.Split('/')[0]
-        if ($dependency -notin $allowed[$owner]) {
-            $violations.Add(
-                "${relative}:${lineNumber}: модуль '$owner' не может включать '$include'")
-        }
-    }
-}
-
-if ($violations.Count -gt 0) {
-    $violations | ForEach-Object { Write-Error $_ }
-    exit 1
-}
-
-Write-Host "Architecture boundaries: OK ($($files.Count) files)"

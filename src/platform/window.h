@@ -22,6 +22,7 @@ typedef void (*RawInputCallback)(void* userData, void* rawInputHandle);
 LAIUE_WINDOW_API Window* WindowCreate(const WindowConfiguration* configuration);
 LAIUE_WINDOW_API void    WindowDestroy(Window* window);
 LAIUE_WINDOW_API void*   WindowGetNativeHandle(const Window* window);
+// Passing NULL as callback unregisters the current callback and user data.
 LAIUE_WINDOW_API void    WindowSetRawInputCallback(Window* window, RawInputCallback callback, void* userData);
 LAIUE_WINDOW_API void    WindowGetClientSize(const Window* window, int32_t* width, int32_t* height);
 LAIUE_WINDOW_API bool    WindowConsumeResize(Window* window);
