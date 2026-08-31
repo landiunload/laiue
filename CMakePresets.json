@@ -11,7 +11,8 @@
         "rhs": "Windows"
       },
       "cacheVariables": {
-        "LAIUE_BUILD_GRAPHICS": "ON"
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_AGGRESSIVE_INLINING": "OFF"
       }
     },
     {
@@ -30,7 +31,8 @@
       "generator": "Ninja Multi-Config",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang-cl.exe",
-        "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release",
+        "LAIUE_CLANG_LTO_MODE": "thin"
       }
     },
     {

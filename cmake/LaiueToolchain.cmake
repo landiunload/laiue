@@ -2,6 +2,16 @@ include_guard(GLOBAL)
 
 option(LAIUE_WARNINGS_AS_ERRORS "Считать предупреждения ошибками" ON)
 option(LAIUE_ENABLE_LTO "Включить LTO в Release" ON)
+option(LAIUE_AGGRESSIVE_INLINING
+    "Использовать MSVC /Ob3 в Release speed profile" OFF)
+set(LAIUE_CLANG_LTO_MODE "thin" CACHE STRING
+    "Clang Release LTO mode: thin or full")
+set_property(CACHE LAIUE_CLANG_LTO_MODE PROPERTY STRINGS thin full)
+if(NOT LAIUE_CLANG_LTO_MODE MATCHES "^(thin|full)$")
+    message(FATAL_ERROR
+        "LAIUE_CLANG_LTO_MODE должен быть thin или full, получено: "
+        "${LAIUE_CLANG_LTO_MODE}")
+endif()
 option(LAIUE_ENABLE_SANITIZERS
     "Включить AddressSanitizer и UndefinedBehaviorSanitizer" OFF)
 
@@ -21,6 +31,16 @@ if(WIN32)
             " " _laiue_c_flags_debug "${CMAKE_C_FLAGS_DEBUG}")
         set(CMAKE_C_FLAGS_DEBUG "${_laiue_c_flags_debug}" CACHE STRING
             "C flags used by the compiler during DEBUG builds" FORCE)
+    endif()
+
+    # CMake's MSVC Release default spells out /Ob2 after /O2. When the optional
+    # aggressive profile is selected, remove that directory-scope default so
+    # the target-scoped /Ob3 does not produce a D9025 override warning.
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC" AND LAIUE_AGGRESSIVE_INLINING)
+        string(REGEX REPLACE
+            "(^|[ \t])[-/]Ob2([ \t]|$)"
+            " " _laiue_c_flags_release "${CMAKE_C_FLAGS_RELEASE}")
+        set(CMAKE_C_FLAGS_RELEASE "${_laiue_c_flags_release}")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -81,6 +101,7 @@ if(WIN32)
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
         $<$<CONFIG:Release>:/O2 /Ot /Oi /Gw>
+        $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>,$<BOOL:${LAIUE_AGGRESSIVE_INLINING}>>:/Ob3>
         $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
     )
 else()
@@ -165,7 +186,7 @@ if(LAIUE_ENABLE_LTO)
     if(WIN32)
         target_compile_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/GL>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=thin>)
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=${LAIUE_CLANG_LTO_MODE}>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>)
     else()

@@ -21,6 +21,8 @@ Linux-графический backend пока отсутствует; попыт
 | `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux: `OFF` | графические библиотеки Windows |
 | `LAIUE_WARNINGS_AS_ERRORS` | `ON` | считать предупреждения ошибками |
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
+| `LAIUE_CLANG_LTO_MODE` | `thin` | режим clang-cl: `thin` либо `full`; full следует выбирать по benchmark конкретной нагрузки |
+| `LAIUE_AGGRESSIVE_INLINING` | `OFF` | MSVC `/Ob3`; opt-in, так как увеличивает runtime DLL без подтверждённого общего ускорения |
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
 | `BUILD_TESTING` | `ON` | зарегистрировать CTest targets |
