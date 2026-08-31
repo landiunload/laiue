@@ -63,6 +63,12 @@ cmake --build --preset linux-gcc-release --parallel
 ctest --preset linux-gcc-release
 ```
 
+Стандартный Release ориентирован на скорость: MSVC требует AVX2, а
+Clang/GCC — полный уровень x86-64-v3. Для отдельного совместимого с более
+старыми x86_64 CPU artifact укажите
+`-DLAIUE_X86_64_LEVEL=sse2` при configure; смешивать библиотеки разных ISA
+профилей в одном bundle нельзя.
+
 Для Clang используйте `linux-clang`; диагностический preset —
 `linux-gcc-asan`. Подробная матрица находится в
 [docs/portability.md](docs/portability.md).

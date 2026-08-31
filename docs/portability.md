@@ -21,14 +21,30 @@ Linux-графический backend пока отсутствует; попыт
 | `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux: `OFF` | графические библиотеки Windows |
 | `LAIUE_WARNINGS_AS_ERRORS` | `ON` | считать предупреждения ошибками |
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
-| `LAIUE_CLANG_LTO_MODE` | `thin` | режим clang-cl: `thin` либо `full`; full следует выбирать по benchmark конкретной нагрузки |
-| `LAIUE_AGGRESSIVE_INLINING` | `OFF` | MSVC `/Ob3`; opt-in, так как увеличивает runtime DLL без подтверждённого общего ускорения |
+| `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
+| `LAIUE_AGGRESSIVE_INLINING` | `ON` | MSVC `/Ob3`; отключаемый максимальный inline profile |
+| `LAIUE_X86_64_LEVEL` | `avx2` | ISA Release: `sse2`, `avx2` (MSVC AVX2, Clang/GCC x86-64-v3) либо экспериментальный `avx512` (x86-64-v4) |
+| `LAIUE_X86_64_TUNE` | `generic` | планирование инструкций: `generic` либо opt-in `amd_zen4` |
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
 | `BUILD_TESTING` | `ON` | зарегистрировать CTest targets |
 
 Все определения, include paths и linker flags target-scoped. CMake не
 скачивает зависимости и не записывает generated-файлы в source tree.
+
+Стандартный Release preset является speed-first профилем и требует AVX2 у
+MSVC либо полного x86-64-v3 у Clang/GCC:
+MSVC использует `/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso /Ob3 /GL`, полный
+`/LTCG` и десять проходов ICF; clang-cl — compile `-O3`, `/Qvec`, loop/SLP
+vectorization, `-fno-math-errno`, Full LTO и LLD LTO/codegen level 3. Linux
+использует `-O3`, full LTO, section GC и прямое связывание внутренних вызовов
+shared libraries. Специальный no-CRT runtime object намеренно остаётся без LTO,
+чтобы изолировать linker helpers; он получает тот же ISA baseline и у clang-cl
+также компилируется с `-O3`.
+Строгая математика physics не ослабляется. Для старого x86_64 CPU
+можно сконфигурировать `-DLAIUE_X86_64_LEVEL=sse2`; это отдельный artifact и
+его нельзя смешивать с AVX2 bundle. `amd_zen4` оставлен opt-in: на текущем
+координатном workload vendor tuning оказался медленнее generic AVX2.
 
 ## Presets
 
@@ -126,7 +142,7 @@ cmake --install build/linux-gcc --config Release \
 - ELF symbols по умолчанию hidden; наружу выходят только API exports.
 - Windows no-CRT target не должен получать скрытую зависимость от CRT через
   новую библиотеку или compiler helper.
-- Переносимые вычисления собираются без fast-math и FMA contraction.
+- Авторитетная физика собирается без fast-math и FMA contraction.
 
 Native mod ABI в 0.7 имеет отдельные artifacts для Windows x86_64, Linux
 x86_64 glibc и Linux x86_64 musl. ARM64 пока не входит ни в mod ABI, ни в

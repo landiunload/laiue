@@ -3,14 +3,30 @@ include_guard(GLOBAL)
 option(LAIUE_WARNINGS_AS_ERRORS "Считать предупреждения ошибками" ON)
 option(LAIUE_ENABLE_LTO "Включить LTO в Release" ON)
 option(LAIUE_AGGRESSIVE_INLINING
-    "Использовать MSVC /Ob3 в Release speed profile" OFF)
-set(LAIUE_CLANG_LTO_MODE "thin" CACHE STRING
+    "Использовать MSVC /Ob3 в Release speed profile" ON)
+set(LAIUE_CLANG_LTO_MODE "full" CACHE STRING
     "Clang Release LTO mode: thin or full")
 set_property(CACHE LAIUE_CLANG_LTO_MODE PROPERTY STRINGS thin full)
 if(NOT LAIUE_CLANG_LTO_MODE MATCHES "^(thin|full)$")
     message(FATAL_ERROR
         "LAIUE_CLANG_LTO_MODE должен быть thin или full, получено: "
         "${LAIUE_CLANG_LTO_MODE}")
+endif()
+set(LAIUE_X86_64_LEVEL "avx2" CACHE STRING
+    "Release ISA baseline: sse2, avx2 or avx512")
+set_property(CACHE LAIUE_X86_64_LEVEL PROPERTY STRINGS sse2 avx2 avx512)
+if(NOT LAIUE_X86_64_LEVEL MATCHES "^(sse2|avx2|avx512)$")
+    message(FATAL_ERROR
+        "LAIUE_X86_64_LEVEL должен быть sse2, avx2 или avx512, получено: "
+        "${LAIUE_X86_64_LEVEL}")
+endif()
+set(LAIUE_X86_64_TUNE "generic" CACHE STRING
+    "Release CPU scheduling tune: generic or amd_zen4")
+set_property(CACHE LAIUE_X86_64_TUNE PROPERTY STRINGS generic amd_zen4)
+if(NOT LAIUE_X86_64_TUNE MATCHES "^(generic|amd_zen4)$")
+    message(FATAL_ERROR
+        "LAIUE_X86_64_TUNE должен быть generic или amd_zen4, получено: "
+        "${LAIUE_X86_64_TUNE}")
 endif()
 option(LAIUE_ENABLE_SANITIZERS
     "Включить AddressSanitizer и UndefinedBehaviorSanitizer" OFF)
@@ -57,8 +73,22 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     message(FATAL_ERROR
-        "Текущий SSE2-контракт поддерживает только x86_64; архитектура: "
+        "Текущий ISA-контракт поддерживает только x86_64; архитектура: "
         "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+if(LAIUE_X86_64_LEVEL STREQUAL "sse2")
+    set(LAIUE_MSVC_ARCH_FLAG /arch:SSE2)
+    set(LAIUE_CLANG_CL_ARCH_FLAG /clang:-march=x86-64)
+    set(LAIUE_ELF_ARCH_FLAG -march=x86-64)
+elseif(LAIUE_X86_64_LEVEL STREQUAL "avx2")
+    set(LAIUE_MSVC_ARCH_FLAG /arch:AVX2)
+    set(LAIUE_CLANG_CL_ARCH_FLAG /clang:-march=x86-64-v3)
+    set(LAIUE_ELF_ARCH_FLAG -march=x86-64-v3)
+else()
+    set(LAIUE_MSVC_ARCH_FLAG /arch:AVX512)
+    set(LAIUE_CLANG_CL_ARCH_FLAG /clang:-march=x86-64-v4)
+    set(LAIUE_ELF_ARCH_FLAG -march=x86-64-v4)
 endif()
 
 get_property(LAIUE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -100,17 +130,30 @@ if(WIN32)
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
-        $<$<CONFIG:Release>:/O2 /Ot /Oi /Gw>
+        $<$<CONFIG:Release>:/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso>
+        $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/Zc:inline ${LAIUE_MSVC_ARCH_FLAG}>
+        $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/Qvec ${LAIUE_CLANG_CL_ARCH_FLAG} /clang:-O3 /clang:-fvectorize /clang:-fslp-vectorize /clang:-fno-math-errno>
         $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>,$<BOOL:${LAIUE_AGGRESSIVE_INLINING}>>:/Ob3>
         $<$<C_COMPILER_ID:Clang>:-Wno-unused-command-line-argument>
     )
+    if(LAIUE_X86_64_TUNE STREQUAL "amd_zen4")
+        target_compile_options(laiue_build_options INTERFACE
+            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/favor:AMD64>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/clang:-mtune=znver4>)
+    endif()
 else()
     target_compile_options(laiue_build_options INTERFACE
         -Wall -Wextra -Wpedantic
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:-Werror>
         $<$<CONFIG:Debug>:-O0;-g3>
-        $<$<CONFIG:Release>:-O2>
+        $<$<CONFIG:Release>:-O3;-fno-math-errno;-fno-plt;-fno-semantic-interposition;-ffunction-sections;-fdata-sections;${LAIUE_ELF_ARCH_FLAG}>
     )
+    if(LAIUE_X86_64_TUNE STREQUAL "amd_zen4")
+        target_compile_options(laiue_build_options INTERFACE
+            $<$<CONFIG:Release>:-mtune=znver4>)
+    endif()
+    target_link_options(laiue_build_options INTERFACE
+        $<$<CONFIG:Release>:-Wl,-O1,--gc-sections,--as-needed,-Bsymbolic-functions>)
 
     set(LAIUE_LINUX_LIBC "gnu" CACHE STRING
         "Linux libc ABI for engine artifacts: gnu or musl")
@@ -164,7 +207,14 @@ if(WIN32)
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
-        $<$<CONFIG:Release>:/O2 /Oi>)
+        $<$<CONFIG:Release>:/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso>
+        $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/Zc:inline ${LAIUE_MSVC_ARCH_FLAG}>
+        $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/Qvec ${LAIUE_CLANG_CL_ARCH_FLAG} /clang:-O3 /clang:-fvectorize /clang:-fslp-vectorize /clang:-fno-math-errno>)
+    if(LAIUE_X86_64_TUNE STREQUAL "amd_zen4")
+        target_compile_options(laiue_runtime PRIVATE
+            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/favor:AMD64>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/clang:-mtune=znver4>)
+    endif()
     target_sources(laiue_windows_no_crt INTERFACE
         "$<TARGET_OBJECTS:laiue_runtime>")
     target_link_options(laiue_windows_no_crt INTERFACE
@@ -174,7 +224,7 @@ if(WIN32)
         /MERGE:.rdata=.text /MERGE:.pdata=.text
         $<$<C_COMPILER_ID:MSVC>:/EMITTOOLVERSIONINFO:NO>
         $<$<CONFIG:Debug>:/DEBUG /INCREMENTAL:NO>
-        $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
+        $<$<CONFIG:Release>:/INCREMENTAL:NO /OPT:REF /OPT:ICF=10>
     )
 else()
     # Совместимое имя избавляет старые локальные CMake-потребители от
@@ -188,12 +238,15 @@ if(LAIUE_ENABLE_LTO)
             $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/GL>
             $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=${LAIUE_CLANG_LTO_MODE}>)
         target_link_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>)
+            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/OPT:LLDLTO=3 /OPT:LLDLTOCGO=3>)
     else()
         target_compile_options(laiue_build_options INTERFACE
-            $<$<CONFIG:Release>:-flto>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
-            $<$<CONFIG:Release>:-flto>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto;-flto-partition=one>
+            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
     endif()
 endif()
 
