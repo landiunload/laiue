@@ -5,13 +5,15 @@
 | Платформа | Core | Graphics | ABI |
 |---|---:|---:|---|
 | Windows x86_64 | Tier 1 | Tier 1 | MSVC или clang-cl, no-CRT runtime |
+| Windows ARM64 | clang-cl собран локально | собирается, не запускался | MSVC или clang-cl, no-CRT runtime |
 | Debian x86_64 | Tier 1, Docker CI | — | glibc, GCC или Clang |
-| Alpine x86_64 | Docker CI | — | musl, GCC |
+| Alpine x86_64 | проверено в Docker | — | musl, GCC |
+| Alpine ARM64 | проверено в Docker | — | musl, GCC |
 | Debian ARM64 | Docker-tested; native CI job | — | glibc, GCC |
 | Steam Deck / SteamOS | Linux x86_64 core | — | glibc, нужен будущий Vulkan client |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
-| Android ARM64 | NDK r29 compile/link CI настроен | — | API 28+, static external core |
+| Android ARM64 | NDK r29: собрано и слинковано локально, CI настроен | — | API 28+, static external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
@@ -76,6 +78,8 @@ macOS ARM64 должен подтвердить его собственным н
 |---|---|---|
 | `windows-msvc` | Visual Studio | `windows-msvc-debug`, `windows-msvc-release` |
 | `windows-clang` | Ninja Multi-Config | `windows-clang-debug`, `windows-clang-release` |
+| `windows-msvc-arm64` | Visual Studio ARM64 | `windows-msvc-arm64-debug`, `windows-msvc-arm64-release` |
+| `windows-clang-arm64` | Ninja Multi-Config | `windows-clang-arm64-debug`, `windows-clang-arm64-release` |
 | `linux-gcc` | Ninja Multi-Config | `linux-gcc-debug`, `linux-gcc-release` |
 | `linux-clang` | Ninja Multi-Config | `linux-clang-debug`, `linux-clang-release` |
 | `android-arm64-core` | Ninja + NDK r29 | `android-arm64-core-release` (build-only) |
@@ -103,6 +107,30 @@ ctest --preset windows-msvc-release
 `windows-clang` нужны `clang-cl` и Ninja в `PATH`; запускайте его из x64 VS
 Developer PowerShell/Command Prompt, чтобы были доступны Windows SDK и x64
 libraries.
+
+## Windows on ARM
+
+`windows-msvc-arm64` и `windows-clang-arm64` собирают тот же полный набор,
+включая D3D12-клиент: Direct3D 12 доступен на ARM64, а архитектурно-зависимые
+места имеют собственные реализации. Маска колонны в `mesh` использует NEON
+вместо SSE2, `scene` берёт аппаратный `fsqrt`, а no-CRT runtime заменяет
+`rep stosb`/`rep movsb` явными циклами: у ARM64 нет строковых инструкций.
+Обе реализации маски проверены против скалярного эталона на своей
+архитектуре, а loop-based `memset`/`memcpy`/`memcmp`/`memmove` — запуском на
+реальном aarch64.
+
+Запускайте из ARM64 VS Developer PowerShell:
+
+```powershell
+cmake --preset windows-clang-arm64
+cmake --build --preset windows-clang-arm64-release --parallel
+ctest --preset windows-clang-arm64-release
+```
+
+Кросс-сборка с x64 host требует компонента «MSVC v143 — VS 2022 C++ ARM64
+build tools»; без его CRT libraries линкуются только no-CRT цели движка.
+Локально проверены configure, компиляция и линковка всех ARM64 DLL и тестов;
+запуск на ARM64-устройстве выполняет отдельный native CI job.
 
 ## Linux core
 
@@ -132,7 +160,9 @@ ctest --preset linux-musl-release
 ```
 
 glibc и musl libraries не взаимозаменяемы. Один configure tree нельзя
-повторно использовать с другим compiler, architecture или libc.
+повторно использовать с другим compiler, architecture или libc. musl-профиль
+фактически прошёл полный CTest в Alpine-контейнерах x86_64 и aarch64, и оба
+дали тот же эталонный хеш физики, что и glibc.
 
 Linux ARM64 фактически проверен отдельной Docker-сборкой и полным CTest.
 GitHub Actions использует нативный `ubuntu-24.04-arm` runner и отдельное
@@ -206,7 +236,10 @@ Android и Apple mobile family используют публичный
 `LAIUE_NATIVE_MOD_MODE=OFF`. Android preset фиксирует NDK r29, ARM64 и API 28;
 iOS preset фиксирует iOS 15, ARM64 и отключённую подпись build-only цели. CI
 компилирует Android targets и линкует game `.so`; Apple runner линкует
-минимальный unsigned app bundle. Debug/no-LTO цели whole-archive включают
+минимальный unsigned app bundle. Android-профиль дополнительно собран
+локально в контейнере с NDK r29: получившийся `libsimulation_of_sins.so` —
+AArch64 ELF, экспортирует свою точку входа, а среди неопределённых символов у
+него только Android libc. Debug/no-LTO цели whole-archive включают
 каждый object game core и модулей `world`, `physics`, `content`, `mod` без
 section GC, чтобы статический архив или optimizer не мог скрыть unresolved
 symbol. Отдельная Release-цель проверяет финальную LTO/dead-strip линковку.

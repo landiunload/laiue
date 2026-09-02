@@ -23,7 +23,43 @@
 // Само значение не меняется и не должно занимать writable-секцию.
 const int _fltused = 0;
 
+#if defined(_M_ARM64) || defined(__aarch64__)
+
+// У ARM64 нет rep-строковых инструкций и интринсиков __stosb/__movsb, поэтому
+// резервные реализации — обычные циклы. volatile (и optnone под clang) не даёт
+// распознавателю идиом свернуть цикл обратно в вызов той же самой функции.
 #if defined(__clang__)
+__attribute__((optnone))
+#endif
+void* memset(void* destination, int value, size_t count)
+{
+    volatile unsigned char* output = (volatile unsigned char*)destination;
+
+    for (size_t index = 0; index < count; ++index)
+    {
+        output[index] = (unsigned char)value;
+    }
+
+    return destination;
+}
+
+#if defined(__clang__)
+__attribute__((optnone))
+#endif
+void* memcpy(void* destination, const void* source, size_t count)
+{
+    volatile unsigned char* output = (volatile unsigned char*)destination;
+    const volatile unsigned char* input = (const volatile unsigned char*)source;
+
+    for (size_t index = 0; index < count; ++index)
+    {
+        output[index] = input[index];
+    }
+
+    return destination;
+}
+
+#elif defined(__clang__)
 
 // __stosb под clang понижается до @llvm.memset, а затем может стать вызовом
 // этой же функции. Прямой GNU inline asm не проходит через LLVM memory

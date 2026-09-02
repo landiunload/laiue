@@ -41,11 +41,12 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 | Платформа | Core/headless | Полный клиент |
 |---|---:|---:|
 | Windows x86_64 | CI | D3D12, CI |
-| Linux x86_64 | glibc и musl, CI в Docker | ещё нет графического backend |
-| Linux ARM64 | glibc, проверено в Docker; native CI настроен | ещё нет графического backend |
+| Windows ARM64 | clang-cl собран и слинкован локально; native CI job | D3D12 собирается; на устройстве не запускался |
+| Linux x86_64 | glibc и musl, проверено в Docker | ещё нет графического backend |
+| Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | ещё нет графического backend |
 | Steam Deck / SteamOS | Linux x86_64 core | нужен Vulkan/input/audio client |
 | macOS arm64/x86_64 | macOS 11+, native CI настроен, локально не запускался | ещё нет Metal backend |
-| Android ARM64 | NDK r29 static core и link CI настроены | ещё нет APK/Vulkan/input/audio shell |
+| Android ARM64 | NDK r29: static core и финальный `.so` собраны локально, CI настроен | ещё нет APK/Vulkan/input/audio shell |
 | iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | ещё нет приложения/Metal backend |
 | tvOS/visionOS | mobile adapter contract | нет presets, client и device tests |
 | Xbox / PlayStation / Nintendo | external static seam | нужны одобрение, закрытый SDK и hardware |

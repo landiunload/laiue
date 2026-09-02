@@ -35,9 +35,9 @@ include(LaiueModule)
 include(LaiueShader)
 include(LaiueArchitecture)
 
-if(LAIUE_BUILD_GRAPHICS AND NOT LAIUE_TARGET_X86_64)
+if(LAIUE_BUILD_GRAPHICS AND NOT (LAIUE_TARGET_X86_64 OR LAIUE_TARGET_ARM64))
     message(FATAL_ERROR
-        "The current D3D12 graphics implementation requires x86_64; "
+        "The D3D12 graphics implementation supports x86_64 and ARM64; "
         "use LAIUE_BUILD_GRAPHICS=OFF for the portable core")
 endif()
 

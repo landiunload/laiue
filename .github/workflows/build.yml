@@ -65,6 +65,66 @@ jobs:
           cmake "-DSOURCE_ROOT=$env:GITHUB_WORKSPACE"
           -P tools/verify_source_tree.cmake
 
+  windows-arm64-engine:
+    name: Windows ARM64 engine (${{ matrix.preset }})
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [windows-msvc-arm64, windows-clang-arm64]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Activate ARM64 compiler environment
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            -property installationPath
+          if (!$vsRoot) { throw 'Visual Studio ARM64 C tools were not found' }
+          $vsRoot = @($vsRoot)[0].Trim()
+          Import-Module (Join-Path $vsRoot `
+            'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsRoot `
+            -SkipAutomaticLocation -DevCmdArguments '-arch=arm64 -host_arch=arm64'
+          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'PATH') {
+            "$name=$([Environment]::GetEnvironmentVariable($name))" |
+              Out-File $env:GITHUB_ENV -Append
+          }
+      - name: Confirm the runner is native ARM64
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
+            throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
+          }
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build Debug
+        run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
+      - name: Test Debug
+        run: ctest --preset ${{ matrix.preset }}-debug --no-tests=error
+      - name: Build Release
+        run: cmake --build --preset ${{ matrix.preset }}-release --parallel
+      - name: Test Release
+        run: ctest --preset ${{ matrix.preset }}-release --no-tests=error
+      - name: Stage engine SDK
+        if: matrix.preset == 'windows-msvc-arm64'
+        run: >
+          cmake --build --preset windows-msvc-arm64-release
+          --target laiue_engine_bundle
+      - name: Upload Windows ARM64 engine SDK
+        if: matrix.preset == 'windows-msvc-arm64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: laiue-engine-windows-arm64
+          path: build/windows-msvc-arm64/bundles/engine/Release
+          if-no-files-found: error
+      - name: Verify build did not modify sources
+        run: >
+          cmake "-DSOURCE_ROOT=$env:GITHUB_WORKSPACE"
+          -P tools/verify_source_tree.cmake
+
   linux-engine:
     runs-on: ubuntu-24.04
     container: debian:13-slim

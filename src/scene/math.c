@@ -1,7 +1,18 @@
 #include "scene/math.h"
 
 #include <stdint.h>
+
+// Аппаратный sqrt берётся интринсиком, чтобы не тянуть CRT/libm в no-CRT
+// сборку. У x86_64 это SSE, у ARM64 — скалярный fsqrt.
+#if defined(_M_ARM64) || defined(__aarch64__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
+#include <arm_neon.h>
+#endif
+#else
 #include <xmmintrin.h>
+#endif
 
 float ScalarSin(float radians)
 {
@@ -47,7 +58,13 @@ float ScalarSqrt(float value)
     {
         return 0.0f;
     }
+#if defined(_M_ARM64) || defined(__aarch64__)
+    // Скалярного vsqrts_f32 нет в общем наборе заголовков; однополосный
+    // вектор компилируется в ту же одну инструкцию fsqrt.
+    return vget_lane_f32(vsqrt_f32(vdup_n_f32(value)), 0);
+#else
     return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
+#endif
 }
 
 // Схема Cephes atanf: два порога редукции диапазона

@@ -3,7 +3,15 @@
 
 #include <windows.h>
 #include <intrin.h>
+#if defined(_M_ARM64) || defined(__aarch64__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
+#include <arm_neon.h>
+#endif
+#else
 #include <emmintrin.h>
+#endif
 #include <string.h>
 
 // Расширенный регион: чанк плюс слой соседних блоков с каждой стороны,
@@ -228,10 +236,35 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
     return true;
 }
 
-// Маска непустых вокселей колонны из 64 блоков. SSE2 входит в базовый набор
-// команд x64, поэтому проверки CPU не нужны: четыре сравнения по 16 байт
+// Маска непустых вокселей колонны из 64 блоков: четыре сравнения по 16 байт
 // вместо 64 отдельных. BlockType — байт, BLOCK_AIR — ноль, сравнение с нулём
 // и даёт искомые биты. Чтение неровное по выравниванию — так и задумано.
+// SSE2 входит в базовый набор команд x64, NEON — в базовый набор ARMv8,
+// поэтому проверки CPU не нужны ни на одной из архитектур.
+#if defined(_M_ARM64) || defined(__aarch64__)
+static inline uint64_t ColumnSolidMask(const BlockType* column)
+{
+    // У NEON нет movemask: каждая ненулевая полоса умножается на свой бит,
+    // а горизонтальная сумма половин собирает два байта результата.
+    static const uint8_t laneBitTable[16] = {
+        1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u
+    };
+    const uint8x16_t laneBits = vld1q_u8(laneBitTable);
+    uint64_t solidMask = 0;
+
+    for (uint32_t offset = 0; offset < CHUNK_SIZE; offset += 16)
+    {
+        uint8x16_t voxels = vld1q_u8((const uint8_t*)(column + offset));
+        uint8x16_t solidLanes = vmvnq_u8(vceqq_u8(voxels, vdupq_n_u8(0)));
+        uint8x16_t selected = vandq_u8(solidLanes, laneBits);
+        uint32_t solidBits = (uint32_t)vaddv_u8(vget_low_u8(selected))
+            | ((uint32_t)vaddv_u8(vget_high_u8(selected)) << 8);
+        solidMask |= (uint64_t)solidBits << offset;
+    }
+
+    return solidMask;
+}
+#else
 static inline uint64_t ColumnSolidMask(const BlockType* column)
 {
     const __m128i airVector = _mm_setzero_si128();
@@ -246,6 +279,7 @@ static inline uint64_t ColumnSolidMask(const BlockType* column)
 
     return solidMask;
 }
+#endif
 
 static inline void ScatterFaceBits(uint64_t faceMask, uint64_t* planes, uint32_t row, uint64_t planeBit)
 {

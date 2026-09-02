@@ -39,6 +39,30 @@
       }
     },
     {
+      "name": "windows-msvc-arm64",
+      "displayName": "Windows ARM64 + MSVC",
+      "description": "Core and D3D12 graphics engine libraries for Windows on ARM",
+      "inherits": "windows-base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "ARM64",
+      "cacheVariables": {
+        "LAIUE_EXPECTED_ARCHITECTURE": "arm64"
+      }
+    },
+    {
+      "name": "windows-clang-arm64",
+      "displayName": "Windows ARM64 + clang-cl",
+      "description": "Core and D3D12 graphics engine libraries for Windows on ARM",
+      "inherits": "windows-base",
+      "generator": "Ninja Multi-Config",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl.exe",
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release",
+        "LAIUE_CLANG_LTO_MODE": "full",
+        "LAIUE_EXPECTED_ARCHITECTURE": "arm64"
+      }
+    },
+    {
       "name": "linux-base",
       "hidden": true,
       "generator": "Ninja Multi-Config",
@@ -321,6 +345,26 @@
       "configurePreset": "windows-clang"
     },
     {
+      "name": "windows-msvc-arm64-debug",
+      "inherits": "windows-build-debug",
+      "configurePreset": "windows-msvc-arm64"
+    },
+    {
+      "name": "windows-msvc-arm64-release",
+      "inherits": "windows-build-release",
+      "configurePreset": "windows-msvc-arm64"
+    },
+    {
+      "name": "windows-clang-arm64-debug",
+      "inherits": "windows-build-debug",
+      "configurePreset": "windows-clang-arm64"
+    },
+    {
+      "name": "windows-clang-arm64-release",
+      "inherits": "windows-build-release",
+      "configurePreset": "windows-clang-arm64"
+    },
+    {
       "name": "linux-gcc-debug",
       "inherits": "linux-build-debug",
       "configurePreset": "linux-gcc"
@@ -525,6 +569,26 @@
       "name": "windows-clang-release",
       "inherits": "windows-test-release",
       "configurePreset": "windows-clang"
+    },
+    {
+      "name": "windows-msvc-arm64-debug",
+      "inherits": "windows-test-debug",
+      "configurePreset": "windows-msvc-arm64"
+    },
+    {
+      "name": "windows-msvc-arm64-release",
+      "inherits": "windows-test-release",
+      "configurePreset": "windows-msvc-arm64"
+    },
+    {
+      "name": "windows-clang-arm64-debug",
+      "inherits": "windows-test-debug",
+      "configurePreset": "windows-clang-arm64"
+    },
+    {
+      "name": "windows-clang-arm64-release",
+      "inherits": "windows-test-release",
+      "configurePreset": "windows-clang-arm64"
     },
     {
       "name": "linux-gcc-debug",
