@@ -1,5 +1,7 @@
 #include "physics/voxel_body.h"
 
+#include "physics/fp_environment.h"
+
 #include <stddef.h>
 
 #define VOXEL_DYNAMIC_COORDINATE_LIMIT 1.0e15
@@ -27,15 +29,13 @@ static bool IsFiniteBoundedDouble(double value, double limit)
     return value == value && value >= -limit && value <= limit;
 }
 
-static bool BoundsAreValid(const VoxelBodyBounds* bounds)
+static bool BoundsAreValid(const VoxelBodyBounds *bounds)
 {
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (!IsFiniteBoundedDouble(bounds->minimum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || !IsFiniteBoundedDouble(bounds->maximum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || bounds->minimum[axis] >= bounds->maximum[axis])
+        if (!IsFiniteBoundedDouble(bounds->minimum[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            !IsFiniteBoundedDouble(bounds->maximum[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            bounds->minimum[axis] >= bounds->maximum[axis])
         {
             return false;
         }
@@ -43,15 +43,13 @@ static bool BoundsAreValid(const VoxelBodyBounds* bounds)
     return true;
 }
 
-static bool QueryBoundsAreValid(const VoxelBodyBounds* bounds)
+static bool QueryBoundsAreValid(const VoxelBodyBounds *bounds)
 {
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (!IsFiniteBoundedDouble(bounds->minimum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || !IsFiniteBoundedDouble(bounds->maximum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || bounds->minimum[axis] > bounds->maximum[axis])
+        if (!IsFiniteBoundedDouble(bounds->minimum[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            !IsFiniteBoundedDouble(bounds->maximum[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            bounds->minimum[axis] > bounds->maximum[axis])
         {
             return false;
         }
@@ -59,21 +57,15 @@ static bool QueryBoundsAreValid(const VoxelBodyBounds* bounds)
     return true;
 }
 
-static bool BodyShapeIsValid(const VoxelBodyShape* shape)
+static bool BodyShapeIsValid(const VoxelBodyShape *shape)
 {
-    return IsFiniteBoundedDouble(
-            shape->radius, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        && IsFiniteBoundedDouble(
-            shape->height, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        && IsFiniteBoundedDouble(
-            shape->eyeHeight, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        && IsFiniteBoundedDouble(
-            shape->collisionEpsilon, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        && shape->radius > shape->collisionEpsilon
-        && shape->height > shape->collisionEpsilon * 2.0
-        && shape->eyeHeight >= 0.0
-        && shape->eyeHeight <= shape->height
-        && shape->collisionEpsilon >= 0.0;
+    return IsFiniteBoundedDouble(shape->radius, VOXEL_DYNAMIC_COORDINATE_LIMIT) &&
+           IsFiniteBoundedDouble(shape->height, VOXEL_DYNAMIC_COORDINATE_LIMIT) &&
+           IsFiniteBoundedDouble(shape->eyeHeight, VOXEL_DYNAMIC_COORDINATE_LIMIT) &&
+           IsFiniteBoundedDouble(shape->collisionEpsilon, VOXEL_DYNAMIC_COORDINATE_LIMIT) &&
+           shape->radius > shape->collisionEpsilon &&
+           shape->height > shape->collisionEpsilon * 2.0 && shape->eyeHeight >= 0.0 &&
+           shape->eyeHeight <= shape->height && shape->collisionEpsilon >= 0.0;
 }
 
 static bool CollisionMarginIsResolved(const VoxelBodyBounds *bounds, double collisionEpsilon)
@@ -102,8 +94,21 @@ static bool CollisionMarginIsResolved(const VoxelBodyBounds *bounds, double coll
     return true;
 }
 
-static bool CalculateValidBodyBounds(const double position[3],
-    const VoxelBodyShape* shape, VoxelBodyBounds* outBounds)
+static void CalculateBodyBounds(const double position[3], const VoxelBodyShape *shape,
+                                VoxelBodyBounds *outBounds)
+{
+    double feet = position[2] - shape->eyeHeight;
+
+    outBounds->minimum[0] = position[0] - shape->radius;
+    outBounds->maximum[0] = position[0] + shape->radius;
+    outBounds->minimum[1] = position[1] - shape->radius;
+    outBounds->maximum[1] = position[1] + shape->radius;
+    outBounds->minimum[2] = feet;
+    outBounds->maximum[2] = feet + shape->height;
+}
+
+static bool CalculateValidBodyBounds(const double position[3], const VoxelBodyShape *shape,
+                                     VoxelBodyBounds *outBounds)
 {
     if (!BodyShapeIsValid(shape))
     {
@@ -111,19 +116,19 @@ static bool CalculateValidBodyBounds(const double position[3],
     }
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (!IsFiniteBoundedDouble(
-                position[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT))
+        if (!IsFiniteBoundedDouble(position[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT))
         {
             return false;
         }
     }
-    VoxelBodyCalculateBounds(position, shape, outBounds);
+    CalculateBodyBounds(position, shape, outBounds);
     return BoundsAreValid(outBounds) &&
            CollisionMarginIsResolved(outBounds, shape->collisionEpsilon);
 }
 
 bool VoxelBodyLocalRangeIsResolved(const double position[3], const VoxelBodyShape *shape)
 {
+    PhysicsFpEnvironmentNormalize();
     if (position == NULL || shape == NULL)
     {
         return false;
@@ -132,41 +137,33 @@ bool VoxelBodyLocalRangeIsResolved(const double position[3], const VoxelBodyShap
     return CalculateValidBodyBounds(position, shape, &bounds);
 }
 
-static bool TryFloorToInt64(double value, int64_t* outValue)
+static bool TryFloorToInt64(double value, int64_t *outValue)
 {
     // C leaves an out-of-range floating-to-integer conversion undefined.
     // The exclusive positive bound is exactly 2^63 as a double.
-    if (!(value >= -VOXEL_INT64_EXCLUSIVE_MAXIMUM
-            && value < VOXEL_INT64_EXCLUSIVE_MAXIMUM))
+    if (!(value >= -VOXEL_INT64_EXCLUSIVE_MAXIMUM && value < VOXEL_INT64_EXCLUSIVE_MAXIMUM))
     {
         return false;
     }
     int64_t truncated = (int64_t)value;
-    *outValue = (double)truncated > value
-        ? truncated - 1 : truncated;
+    *outValue = (double)truncated > value ? truncated - 1 : truncated;
     return true;
 }
 
-static bool DynamicColliderIsValid(const VoxelDynamicCollider* collider)
+static bool DynamicColliderIsValid(const VoxelDynamicCollider *collider)
 {
-    if (collider->stableId == 0u
-        || !(collider->friction >= 0.0f && collider->friction <= 1.0f))
+    if (collider->stableId == 0u || !(collider->friction >= 0.0f && collider->friction <= 1.0f))
     {
         return false;
     }
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (!IsFiniteBoundedDouble(
-                collider->bounds.minimum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || !IsFiniteBoundedDouble(
-                collider->bounds.maximum[axis],
-                VOXEL_DYNAMIC_COORDINATE_LIMIT)
-            || collider->bounds.minimum[axis]
-                >= collider->bounds.maximum[axis]
-            || !IsFiniteBoundedDouble(
-                collider->velocity[axis],
-                VOXEL_DYNAMIC_VELOCITY_LIMIT))
+        if (!IsFiniteBoundedDouble(collider->bounds.minimum[axis],
+                                   VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            !IsFiniteBoundedDouble(collider->bounds.maximum[axis],
+                                   VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+            collider->bounds.minimum[axis] >= collider->bounds.maximum[axis] ||
+            !IsFiniteBoundedDouble(collider->velocity[axis], VOXEL_DYNAMIC_VELOCITY_LIMIT))
         {
             return false;
         }
@@ -174,7 +171,7 @@ static bool DynamicColliderIsValid(const VoxelDynamicCollider* collider)
     return true;
 }
 
-static void SortDynamicColliders(DynamicColliderBatch* batch)
+static void SortDynamicColliders(DynamicColliderBatch *batch)
 {
     // Insertion sort keeps the bounded 32-element path allocation-free and
     // makes clipping/contact selection independent from callback order.
@@ -182,21 +179,18 @@ static void SortDynamicColliders(DynamicColliderBatch* batch)
     {
         VoxelDynamicCollider value = batch->colliders[index];
         uint32_t insertion = index;
-        while (insertion > 0u
-            && batch->colliders[insertion - 1u].stableId > value.stableId)
+        while (insertion > 0u && batch->colliders[insertion - 1u].stableId > value.stableId)
         {
-            batch->colliders[insertion] =
-                batch->colliders[insertion - 1u];
+            batch->colliders[insertion] = batch->colliders[insertion - 1u];
             --insertion;
         }
         batch->colliders[insertion] = value;
     }
 }
 
-static bool QueryDynamicColliderBatch(
-    const VoxelCollisionSource* collision,
-    const VoxelBodyBounds* queryBounds,
-    DynamicColliderBatch* outBatch)
+static bool QueryDynamicColliderBatch(const VoxelCollisionSource *collision,
+                                      const VoxelBodyBounds *queryBounds,
+                                      DynamicColliderBatch *outBatch)
 {
     outBatch->count = 0u;
     if (!QueryBoundsAreValid(queryBounds))
@@ -210,10 +204,9 @@ static bool QueryDynamicColliderBatch(
 
     // A callback which forgot to write count fails safely as well.
     uint32_t count = VOXEL_DYNAMIC_COLLIDER_CAPACITY + 1u;
-    if (!collision->queryDynamicColliders(collision->context,
-            queryBounds, outBatch->colliders,
-            VOXEL_DYNAMIC_COLLIDER_CAPACITY, &count)
-        || count > VOXEL_DYNAMIC_COLLIDER_CAPACITY)
+    if (!collision->queryDynamicColliders(collision->context, queryBounds, outBatch->colliders,
+                                          VOXEL_DYNAMIC_COLLIDER_CAPACITY, &count) ||
+        count > VOXEL_DYNAMIC_COLLIDER_CAPACITY)
     {
         outBatch->count = 0u;
         return false;
@@ -229,8 +222,7 @@ static bool QueryDynamicColliderBatch(
         }
         for (uint32_t previous = 0u; previous < index; ++previous)
         {
-            if (outBatch->colliders[previous].stableId
-                == outBatch->colliders[index].stableId)
+            if (outBatch->colliders[previous].stableId == outBatch->colliders[index].stableId)
             {
                 outBatch->count = 0u;
                 return false;
@@ -241,16 +233,13 @@ static bool QueryDynamicColliderBatch(
     return true;
 }
 
-static bool BoundsOverlapDynamicCollider(
-    const VoxelBodyBounds* bounds,
-    const VoxelDynamicCollider* collider, double epsilon)
+static bool BoundsOverlapDynamicCollider(const VoxelBodyBounds *bounds,
+                                         const VoxelDynamicCollider *collider, double epsilon)
 {
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (bounds->maximum[axis]
-                <= collider->bounds.minimum[axis] - epsilon
-            || bounds->minimum[axis]
-                >= collider->bounds.maximum[axis] + epsilon)
+        if (bounds->maximum[axis] <= collider->bounds.minimum[axis] - epsilon ||
+            bounds->minimum[axis] >= collider->bounds.maximum[axis] + epsilon)
         {
             return false;
         }
@@ -258,10 +247,9 @@ static bool BoundsOverlapDynamicCollider(
     return true;
 }
 
-static bool BoundsOverlapDynamicOnOtherAxes(
-    const VoxelBodyBounds* bounds,
-    const VoxelDynamicCollider* collider,
-    int32_t movementAxis, double epsilon)
+static bool BoundsOverlapDynamicOnOtherAxes(const VoxelBodyBounds *bounds,
+                                            const VoxelDynamicCollider *collider,
+                                            int32_t movementAxis, double epsilon)
 {
     for (int32_t axis = 0; axis < 3; ++axis)
     {
@@ -269,10 +257,8 @@ static bool BoundsOverlapDynamicOnOtherAxes(
         {
             continue;
         }
-        if (bounds->maximum[axis]
-                <= collider->bounds.minimum[axis] - epsilon
-            || bounds->minimum[axis]
-                >= collider->bounds.maximum[axis] + epsilon)
+        if (bounds->maximum[axis] <= collider->bounds.minimum[axis] - epsilon ||
+            bounds->minimum[axis] >= collider->bounds.maximum[axis] + epsilon)
         {
             return false;
         }
@@ -280,49 +266,47 @@ static bool BoundsOverlapDynamicOnOtherAxes(
     return true;
 }
 
-static void QueryBlockPhysics(const VoxelCollisionSource* collision,
-    int64_t x, int64_t y, int64_t z, VoxelBlockPhysics* outBlock)
+static void QueryBlockPhysics(const VoxelCollisionSource *collision, int64_t x, int64_t y,
+                              int64_t z, VoxelBlockPhysics *outBlock)
 {
-    collision->queryBlockPhysics(
-        collision->context, x, y, z, outBlock);
+    collision->queryBlockPhysics(collision->context, x, y, z, outBlock);
 }
 
-static bool IsSolidBlock(const VoxelCollisionSource* collision,
-    int64_t x, int64_t y, int64_t z)
+static bool IsSolidBlock(const VoxelCollisionSource *collision, int64_t x, int64_t y, int64_t z)
 {
     VoxelBlockPhysics block;
     QueryBlockPhysics(collision, x, y, z, &block);
     return (block.flags & VOXEL_BLOCK_PHYSICS_SOLID) != 0u;
 }
 
-void VoxelBodyCalculateBounds(const double position[3],
-    const VoxelBodyShape* shape, VoxelBodyBounds* outBounds)
+void VoxelPhysicsConfigureThread(void)
 {
-    double feet = position[2] - shape->eyeHeight;
-
-    outBounds->minimum[0] = position[0] - shape->radius;
-    outBounds->maximum[0] = position[0] + shape->radius;
-    outBounds->minimum[1] = position[1] - shape->radius;
-    outBounds->maximum[1] = position[1] + shape->radius;
-    outBounds->minimum[2] = feet;
-    outBounds->maximum[2] = feet + shape->height;
+    PhysicsFpEnvironmentNormalize();
 }
 
-static bool BoundsContainSolidBlock(
-    const VoxelCollisionSource* collision,
-    const VoxelBodyShape* shape, const VoxelBodyBounds* bounds)
+bool VoxelPhysicsThreadIsConfigured(void)
+{
+    return PhysicsFpEnvironmentIsDeterministic();
+}
+
+void VoxelBodyCalculateBounds(const double position[3], const VoxelBodyShape *shape,
+                              VoxelBodyBounds *outBounds)
+{
+    PhysicsFpEnvironmentNormalize();
+    CalculateBodyBounds(position, shape, outBounds);
+}
+
+static bool BoundsContainSolidBlock(const VoxelCollisionSource *collision,
+                                    const VoxelBodyShape *shape, const VoxelBodyBounds *bounds)
 {
     int64_t minimumBlock[3];
     int64_t maximumBlock[3];
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        if (!TryFloorToInt64(
-                bounds->minimum[axis] + shape->collisionEpsilon,
-                &minimumBlock[axis])
-            || !TryFloorToInt64(
-                bounds->maximum[axis] - shape->collisionEpsilon,
-                &maximumBlock[axis]))
+        if (!TryFloorToInt64(bounds->minimum[axis] + shape->collisionEpsilon,
+                             &minimumBlock[axis]) ||
+            !TryFloorToInt64(bounds->maximum[axis] - shape->collisionEpsilon, &maximumBlock[axis]))
         {
             return true;
         }
@@ -344,9 +328,10 @@ static bool BoundsContainSolidBlock(
     return false;
 }
 
-bool VoxelBodyCollides(const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape)
+bool VoxelBodyCollides(const VoxelCollisionSource *collision, const double position[3],
+                       const VoxelBodyShape *shape)
 {
+    PhysicsFpEnvironmentNormalize();
     VoxelBodyBounds bounds;
     if (!CalculateValidBodyBounds(position, shape, &bounds))
     {
@@ -374,9 +359,7 @@ bool VoxelBodyCollides(const VoxelCollisionSource* collision,
     }
     for (uint32_t index = 0u; index < batch.count; ++index)
     {
-        if (BoundsOverlapDynamicCollider(
-                &bounds, &batch.colliders[index],
-                shape->collisionEpsilon))
+        if (BoundsOverlapDynamicCollider(&bounds, &batch.colliders[index], shape->collisionEpsilon))
         {
             return true;
         }
@@ -384,24 +367,18 @@ bool VoxelBodyCollides(const VoxelCollisionSource* collision,
     return false;
 }
 
-static bool BlockPlaneCollides(
-    const VoxelCollisionSource* collision,
-    const VoxelBodyShape* shape, int32_t axis, int64_t plane,
-    const VoxelBodyBounds* bounds)
+static bool BlockPlaneCollides(const VoxelCollisionSource *collision, const VoxelBodyShape *shape,
+                               int32_t axis, int64_t plane, const VoxelBodyBounds *bounds)
 {
     int64_t minimumBlock[3];
     int64_t maximumBlock[3];
 
     for (int32_t currentAxis = 0; currentAxis < 3; ++currentAxis)
     {
-        if (!TryFloorToInt64(
-                bounds->minimum[currentAxis]
-                    + shape->collisionEpsilon,
-                &minimumBlock[currentAxis])
-            || !TryFloorToInt64(
-                bounds->maximum[currentAxis]
-                    - shape->collisionEpsilon,
-                &maximumBlock[currentAxis]))
+        if (!TryFloorToInt64(bounds->minimum[currentAxis] + shape->collisionEpsilon,
+                             &minimumBlock[currentAxis]) ||
+            !TryFloorToInt64(bounds->maximum[currentAxis] - shape->collisionEpsilon,
+                             &maximumBlock[currentAxis]))
         {
             return true;
         }
@@ -425,13 +402,10 @@ static bool BlockPlaneCollides(
     return false;
 }
 
-static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
-    double position[3], const VoxelBodyShape* shape,
-    int32_t axis, double distance)
+static bool MoveAxisAgainstBlocks(const VoxelCollisionSource *collision, double position[3],
+                                  const VoxelBodyShape *shape, int32_t axis, double distance)
 {
-    if (axis < 0 || axis > 2
-        || !IsFiniteBoundedDouble(
-            distance, VOXEL_DYNAMIC_COORDINATE_LIMIT))
+    if (axis < 0 || axis > 2 || !IsFiniteBoundedDouble(distance, VOXEL_DYNAMIC_COORDINATE_LIMIT))
     {
         return true;
     }
@@ -446,9 +420,7 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
         return true;
     }
 
-    double targetPosition[3] = {
-        position[0], position[1], position[2]
-    };
+    double targetPosition[3] = {position[0], position[1], position[2]};
     targetPosition[axis] += distance;
 
     VoxelBodyBounds newBounds;
@@ -457,22 +429,16 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
         return true;
     }
 
-    double negativeExtent = axis == 2
-        ? shape->eyeHeight
-        : shape->radius;
-    double positiveExtent = axis == 2
-        ? shape->height - shape->eyeHeight
-        : shape->radius;
+    double negativeExtent = axis == 2 ? shape->eyeHeight : shape->radius;
+    double positiveExtent = axis == 2 ? shape->height - shape->eyeHeight : shape->radius;
     double epsilon = shape->collisionEpsilon;
 
     if (distance > 0.0)
     {
         int64_t firstPlane;
         int64_t lastPlane;
-        if (!TryFloorToInt64(
-                oldBounds.maximum[axis] - epsilon, &firstPlane)
-            || !TryFloorToInt64(
-                newBounds.maximum[axis] - epsilon, &lastPlane))
+        if (!TryFloorToInt64(oldBounds.maximum[axis] - epsilon, &firstPlane) ||
+            !TryFloorToInt64(newBounds.maximum[axis] - epsilon, &lastPlane))
         {
             return true;
         }
@@ -480,11 +446,9 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
 
         for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
         {
-            if (BlockPlaneCollides(
-                    collision, shape, axis, plane, &newBounds))
+            if (BlockPlaneCollides(collision, shape, axis, plane, &newBounds))
             {
-                position[axis] =
-                    (double)plane - positiveExtent - epsilon;
+                position[axis] = (double)plane - positiveExtent - epsilon;
                 return true;
             }
         }
@@ -493,10 +457,8 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
     {
         int64_t firstPlane;
         int64_t lastPlane;
-        if (!TryFloorToInt64(
-                oldBounds.minimum[axis] + epsilon, &firstPlane)
-            || !TryFloorToInt64(
-                newBounds.minimum[axis] + epsilon, &lastPlane))
+        if (!TryFloorToInt64(oldBounds.minimum[axis] + epsilon, &firstPlane) ||
+            !TryFloorToInt64(newBounds.minimum[axis] + epsilon, &lastPlane))
         {
             return true;
         }
@@ -504,11 +466,9 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
 
         for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
         {
-            if (BlockPlaneCollides(
-                    collision, shape, axis, plane, &newBounds))
+            if (BlockPlaneCollides(collision, shape, axis, plane, &newBounds))
             {
-                position[axis] =
-                    (double)plane + 1.0 + negativeExtent + epsilon;
+                position[axis] = (double)plane + 1.0 + negativeExtent + epsilon;
                 return true;
             }
         }
@@ -518,13 +478,11 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource* collision,
     return false;
 }
 
-bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
-    double position[3], const VoxelBodyShape* shape,
-    int32_t axis, double distance)
+bool VoxelBodyMoveAxis(const VoxelCollisionSource *collision, double position[3],
+                       const VoxelBodyShape *shape, int32_t axis, double distance)
 {
-    if (axis < 0 || axis > 2
-        || !IsFiniteBoundedDouble(
-            distance, VOXEL_DYNAMIC_COORDINATE_LIMIT))
+    PhysicsFpEnvironmentNormalize();
+    if (axis < 0 || axis > 2 || !IsFiniteBoundedDouble(distance, VOXEL_DYNAMIC_COORDINATE_LIMIT))
     {
         return true;
     }
@@ -541,8 +499,7 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
     }
     if (collision->queryDynamicColliders == NULL)
     {
-        return MoveAxisAgainstBlocks(
-            collision, position, shape, axis, distance);
+        return MoveAxisAgainstBlocks(collision, position, shape, axis, distance);
     }
 
     VoxelBodyBounds oldBounds;
@@ -550,13 +507,10 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
     {
         return true;
     }
-    double requestedPosition[3] = {
-        position[0], position[1], position[2]
-    };
+    double requestedPosition[3] = {position[0], position[1], position[2]};
     requestedPosition[axis] += distance;
     VoxelBodyBounds requestedBounds;
-    if (!CalculateValidBodyBounds(
-            requestedPosition, shape, &requestedBounds))
+    if (!CalculateValidBodyBounds(requestedPosition, shape, &requestedBounds))
     {
         return true;
     }
@@ -567,16 +521,13 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
         // Narrowphase reports an exact end contact at one epsilon of
         // separation. A strict-overlap broadphase needs one more epsilon on
         // the movement axis or it can omit that touching collider entirely.
-        double padding = shape->collisionEpsilon
-            * (currentAxis == (uint32_t)axis ? 2.0 : 1.0);
-        queryBounds.minimum[currentAxis] = MinimumDouble(
-            oldBounds.minimum[currentAxis],
-            requestedBounds.minimum[currentAxis])
-            - padding;
-        queryBounds.maximum[currentAxis] = MaximumDouble(
-            oldBounds.maximum[currentAxis],
-            requestedBounds.maximum[currentAxis])
-            + padding;
+        double padding = shape->collisionEpsilon * (currentAxis == (uint32_t)axis ? 2.0 : 1.0);
+        queryBounds.minimum[currentAxis] =
+            MinimumDouble(oldBounds.minimum[currentAxis], requestedBounds.minimum[currentAxis]) -
+            padding;
+        queryBounds.maximum[currentAxis] =
+            MaximumDouble(oldBounds.maximum[currentAxis], requestedBounds.maximum[currentAxis]) +
+            padding;
     }
 
     DynamicColliderBatch batch;
@@ -586,34 +537,25 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
         return true;
     }
 
-    double clippedPosition[3] = {
-        position[0], position[1], position[2]
-    };
-    bool collided = MoveAxisAgainstBlocks(
-        collision, clippedPosition, shape, axis, distance);
+    double clippedPosition[3] = {position[0], position[1], position[2]};
+    bool collided = MoveAxisAgainstBlocks(collision, clippedPosition, shape, axis, distance);
     VoxelBodyBounds clippedBounds;
-    VoxelBodyCalculateBounds(clippedPosition, shape, &clippedBounds);
+    CalculateBodyBounds(clippedPosition, shape, &clippedBounds);
 
     double epsilon = shape->collisionEpsilon;
-    double negativeExtent = axis == 2
-        ? shape->eyeHeight
-        : shape->radius;
-    double positiveExtent = axis == 2
-        ? shape->height - shape->eyeHeight
-        : shape->radius;
+    double negativeExtent = axis == 2 ? shape->eyeHeight : shape->radius;
+    double positiveExtent = axis == 2 ? shape->height - shape->eyeHeight : shape->radius;
     uint64_t clippingStableId = 0u;
 
     for (uint32_t index = 0u; index < batch.count; ++index)
     {
-        const VoxelDynamicCollider* collider = &batch.colliders[index];
-        if (!BoundsOverlapDynamicOnOtherAxes(
-                &oldBounds, collider, axis, epsilon))
+        const VoxelDynamicCollider *collider = &batch.colliders[index];
+        if (!BoundsOverlapDynamicOnOtherAxes(&oldBounds, collider, axis, epsilon))
         {
             continue;
         }
 
-        if (BoundsOverlapDynamicCollider(
-                &oldBounds, collider, epsilon))
+        if (BoundsOverlapDynamicCollider(&oldBounds, collider, epsilon))
         {
             // Starting penetration is ambiguous. Do not make it deeper or
             // tunnel through the opposite face in one axis operation.
@@ -624,21 +566,18 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
 
         if (distance > 0.0)
         {
-            double collisionPlane =
-                collider->bounds.minimum[axis] - epsilon;
-            if (oldBounds.maximum[axis] <= collisionPlane
-                && clippedBounds.maximum[axis] >= collisionPlane)
+            double collisionPlane = collider->bounds.minimum[axis] - epsilon;
+            if (oldBounds.maximum[axis] <= collisionPlane &&
+                clippedBounds.maximum[axis] >= collisionPlane)
             {
                 double candidate = collisionPlane - positiveExtent;
-                if (candidate < clippedPosition[axis]
-                    || (candidate == clippedPosition[axis]
-                        && (clippingStableId == 0u
-                            || collider->stableId < clippingStableId)))
+                if (candidate < clippedPosition[axis] ||
+                    (candidate == clippedPosition[axis] &&
+                     (clippingStableId == 0u || collider->stableId < clippingStableId)))
                 {
                     clippedPosition[axis] = candidate;
                     clippedBounds.maximum[axis] = collisionPlane;
-                    clippedBounds.minimum[axis] =
-                        candidate - negativeExtent;
+                    clippedBounds.minimum[axis] = candidate - negativeExtent;
                     clippingStableId = collider->stableId;
                 }
                 collided = true;
@@ -646,21 +585,18 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
         }
         else
         {
-            double collisionPlane =
-                collider->bounds.maximum[axis] + epsilon;
-            if (oldBounds.minimum[axis] >= collisionPlane
-                && clippedBounds.minimum[axis] <= collisionPlane)
+            double collisionPlane = collider->bounds.maximum[axis] + epsilon;
+            if (oldBounds.minimum[axis] >= collisionPlane &&
+                clippedBounds.minimum[axis] <= collisionPlane)
             {
                 double candidate = collisionPlane + negativeExtent;
-                if (candidate > clippedPosition[axis]
-                    || (candidate == clippedPosition[axis]
-                        && (clippingStableId == 0u
-                            || collider->stableId < clippingStableId)))
+                if (candidate > clippedPosition[axis] ||
+                    (candidate == clippedPosition[axis] &&
+                     (clippingStableId == 0u || collider->stableId < clippingStableId)))
                 {
                     clippedPosition[axis] = candidate;
                     clippedBounds.minimum[axis] = collisionPlane;
-                    clippedBounds.maximum[axis] =
-                        candidate + positiveExtent;
+                    clippedBounds.maximum[axis] = candidate + positiveExtent;
                     clippingStableId = collider->stableId;
                 }
                 collided = true;
@@ -672,7 +608,7 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource* collision,
     return collided;
 }
 
-static void SetFailClosedGroundContact(VoxelGroundContact* outContact)
+static void SetFailClosedGroundContact(VoxelGroundContact *outContact)
 {
     outContact->friction = 1.0f;
     outContact->supported = true;
@@ -682,10 +618,11 @@ static void SetFailClosedGroundContact(VoxelGroundContact* outContact)
     outContact->surfaceStableId = 0u;
 }
 
-void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape,
-    double probeDepth, VoxelGroundContact* outContact)
+void VoxelBodyQueryGroundContact(const VoxelCollisionSource *collision, const double position[3],
+                                 const VoxelBodyShape *shape, double probeDepth,
+                                 VoxelGroundContact *outContact)
 {
+    PhysicsFpEnvironmentNormalize();
     outContact->friction = 0.0f;
     outContact->supported = false;
     outContact->surfaceVelocity[0] = 0.0;
@@ -694,34 +631,27 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
     outContact->surfaceStableId = 0u;
 
     VoxelBodyBounds bounds;
-    if (!IsFiniteBoundedDouble(
-            probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || probeDepth < 0.0
-        || !CalculateValidBodyBounds(position, shape, &bounds))
+    if (!IsFiniteBoundedDouble(probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT) || probeDepth < 0.0 ||
+        !CalculateValidBodyBounds(position, shape, &bounds))
     {
         SetFailClosedGroundContact(outContact);
         return;
     }
 
-    double footprintMinimumX =
-        bounds.minimum[0] + shape->collisionEpsilon;
-    double footprintMaximumX =
-        bounds.maximum[0] - shape->collisionEpsilon;
-    double footprintMinimumY =
-        bounds.minimum[1] + shape->collisionEpsilon;
-    double footprintMaximumY =
-        bounds.maximum[1] - shape->collisionEpsilon;
+    double footprintMinimumX = bounds.minimum[0] + shape->collisionEpsilon;
+    double footprintMaximumX = bounds.maximum[0] - shape->collisionEpsilon;
+    double footprintMinimumY = bounds.minimum[1] + shape->collisionEpsilon;
+    double footprintMaximumY = bounds.maximum[1] - shape->collisionEpsilon;
     int64_t minimumX;
     int64_t maximumX;
     int64_t minimumY;
     int64_t maximumY;
     int64_t supportZ;
-    if (!TryFloorToInt64(footprintMinimumX, &minimumX)
-        || !TryFloorToInt64(footprintMaximumX, &maximumX)
-        || !TryFloorToInt64(footprintMinimumY, &minimumY)
-        || !TryFloorToInt64(footprintMaximumY, &maximumY)
-        || !TryFloorToInt64(
-            bounds.minimum[2] - probeDepth, &supportZ))
+    if (!TryFloorToInt64(footprintMinimumX, &minimumX) ||
+        !TryFloorToInt64(footprintMaximumX, &maximumX) ||
+        !TryFloorToInt64(footprintMinimumY, &minimumY) ||
+        !TryFloorToInt64(footprintMaximumY, &maximumY) ||
+        !TryFloorToInt64(bounds.minimum[2] - probeDepth, &supportZ))
     {
         SetFailClosedGroundContact(outContact);
         return;
@@ -745,14 +675,14 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
             double blockMaximumX = blockMinimumX + 1.0;
             double blockMinimumY = (double)y;
             double blockMaximumY = blockMinimumY + 1.0;
-            double overlapMinimumX = footprintMinimumX > blockMinimumX
-                ? footprintMinimumX : blockMinimumX;
-            double overlapMaximumX = footprintMaximumX < blockMaximumX
-                ? footprintMaximumX : blockMaximumX;
-            double overlapMinimumY = footprintMinimumY > blockMinimumY
-                ? footprintMinimumY : blockMinimumY;
-            double overlapMaximumY = footprintMaximumY < blockMaximumY
-                ? footprintMaximumY : blockMaximumY;
+            double overlapMinimumX =
+                footprintMinimumX > blockMinimumX ? footprintMinimumX : blockMinimumX;
+            double overlapMaximumX =
+                footprintMaximumX < blockMaximumX ? footprintMaximumX : blockMaximumX;
+            double overlapMinimumY =
+                footprintMinimumY > blockMinimumY ? footprintMinimumY : blockMinimumY;
+            double overlapMaximumY =
+                footprintMaximumY < blockMaximumY ? footprintMaximumY : blockMaximumY;
             double width = overlapMaximumX - overlapMinimumX;
             double height = overlapMaximumY - overlapMinimumY;
             if (width <= 0.0 || height <= 0.0)
@@ -760,9 +690,8 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
                 continue;
             }
 
-            double friction = block.friction >= 0.0f
-                    && block.friction <= 1.0f
-                ? (double)block.friction : 0.0;
+            double friction =
+                block.friction >= 0.0f && block.friction <= 1.0f ? (double)block.friction : 0.0;
             double area = width * height;
             weightedFriction += friction * area;
             supportedArea += area;
@@ -771,8 +700,7 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
 
     if (supportedArea > 0.0)
     {
-        outContact->friction =
-            (float)(weightedFriction / supportedArea);
+        outContact->friction = (float)(weightedFriction / supportedArea);
         outContact->supported = true;
     }
 
@@ -802,13 +730,12 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
         return;
     }
 
-    double selectedTop = outContact->supported
-        ? (double)supportZ + 1.0
-        : -VOXEL_DYNAMIC_COORDINATE_LIMIT;
+    double selectedTop =
+        outContact->supported ? (double)supportZ + 1.0 : -VOXEL_DYNAMIC_COORDINATE_LIMIT;
     double selectedArea = supportedArea;
     for (uint32_t index = 0u; index < batch.count; ++index)
     {
-        const VoxelDynamicCollider* collider = &batch.colliders[index];
+        const VoxelDynamicCollider *collider = &batch.colliders[index];
         double top = collider->bounds.maximum[2];
         double gap = feet - top;
         if (gap < -epsilon || gap > probeDepth + epsilon)
@@ -816,14 +743,10 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
             continue;
         }
 
-        double overlapMinimumX = MaximumDouble(
-            footprintMinimumX, collider->bounds.minimum[0]);
-        double overlapMaximumX = MinimumDouble(
-            footprintMaximumX, collider->bounds.maximum[0]);
-        double overlapMinimumY = MaximumDouble(
-            footprintMinimumY, collider->bounds.minimum[1]);
-        double overlapMaximumY = MinimumDouble(
-            footprintMaximumY, collider->bounds.maximum[1]);
+        double overlapMinimumX = MaximumDouble(footprintMinimumX, collider->bounds.minimum[0]);
+        double overlapMaximumX = MinimumDouble(footprintMaximumX, collider->bounds.maximum[0]);
+        double overlapMinimumY = MaximumDouble(footprintMinimumY, collider->bounds.minimum[1]);
+        double overlapMaximumY = MinimumDouble(footprintMaximumY, collider->bounds.maximum[1]);
         double width = overlapMaximumX - overlapMinimumX;
         double height = overlapMaximumY - overlapMinimumY;
         if (width <= 0.0 || height <= 0.0)
@@ -832,16 +755,12 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
         }
 
         double area = width * height;
-        bool higher = !outContact->supported
-            || top > selectedTop + epsilon;
-        bool sameHeight = top >= selectedTop - epsilon
-            && top <= selectedTop + epsilon;
-        bool betterTie = sameHeight
-            && outContact->surfaceStableId != 0u
-            && (area > selectedArea
-                || (area == selectedArea
-                    && collider->stableId
-                        < outContact->surfaceStableId));
+        bool higher = !outContact->supported || top > selectedTop + epsilon;
+        bool sameHeight = top >= selectedTop - epsilon && top <= selectedTop + epsilon;
+        bool betterTie =
+            sameHeight && outContact->surfaceStableId != 0u &&
+            (area > selectedArea ||
+             (area == selectedArea && collider->stableId < outContact->surfaceStableId));
         if (!higher && !betterTie)
         {
             continue;
@@ -858,28 +777,22 @@ void VoxelBodyQueryGroundContact(const VoxelCollisionSource* collision,
     }
 }
 
-bool VoxelBodyHasGroundContact(const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape,
-    double probeDepth)
+bool VoxelBodyHasGroundContact(const VoxelCollisionSource *collision, const double position[3],
+                               const VoxelBodyShape *shape, double probeDepth)
 {
     VoxelGroundContact contact;
-    VoxelBodyQueryGroundContact(
-        collision, position, shape, probeDepth, &contact);
+    VoxelBodyQueryGroundContact(collision, position, shape, probeDepth, &contact);
     return contact.supported;
 }
 
-bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape,
-    double probeDepth, double supportRadius)
+bool VoxelBodyHasStableGround(const VoxelCollisionSource *collision, const double position[3],
+                              const VoxelBodyShape *shape, double probeDepth, double supportRadius)
 {
+    PhysicsFpEnvironmentNormalize();
     VoxelBodyBounds bodyBounds;
-    if (!IsFiniteBoundedDouble(
-            probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || !IsFiniteBoundedDouble(
-            supportRadius, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || probeDepth < 0.0
-        || !CalculateValidBodyBounds(
-            position, shape, &bodyBounds))
+    if (!IsFiniteBoundedDouble(probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+        !IsFiniteBoundedDouble(supportRadius, VOXEL_DYNAMIC_COORDINATE_LIMIT) || probeDepth < 0.0 ||
+        !CalculateValidBodyBounds(position, shape, &bodyBounds))
     {
         return true;
     }
@@ -898,9 +811,7 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
     {
         return true;
     }
-    const double offsets[3] = {
-        -supportRadius, 0.0, supportRadius
-    };
+    const double offsets[3] = {-supportRadius, 0.0, supportRadius};
 
     for (uint32_t yIndex = 0; yIndex < 3u; ++yIndex)
     {
@@ -908,10 +819,8 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
         {
             int64_t x;
             int64_t y;
-            if (!TryFloorToInt64(
-                    position[0] + offsets[xIndex], &x)
-                || !TryFloorToInt64(
-                    position[1] + offsets[yIndex], &y))
+            if (!TryFloorToInt64(position[0] + offsets[xIndex], &x) ||
+                !TryFloorToInt64(position[1] + offsets[yIndex], &y))
             {
                 return true;
             }
@@ -947,7 +856,7 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
 
     for (uint32_t index = 0u; index < batch.count; ++index)
     {
-        const VoxelDynamicCollider* collider = &batch.colliders[index];
+        const VoxelDynamicCollider *collider = &batch.colliders[index];
         double gap = feet - collider->bounds.maximum[2];
         if (gap < -epsilon || gap > probeDepth + epsilon)
         {
@@ -956,16 +865,16 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
         for (uint32_t yIndex = 0u; yIndex < 3u; ++yIndex)
         {
             double y = position[1] + offsets[yIndex];
-            if (y <= collider->bounds.minimum[1] + epsilon
-                || y >= collider->bounds.maximum[1] - epsilon)
+            if (y <= collider->bounds.minimum[1] + epsilon ||
+                y >= collider->bounds.maximum[1] - epsilon)
             {
                 continue;
             }
             for (uint32_t xIndex = 0u; xIndex < 3u; ++xIndex)
             {
                 double x = position[0] + offsets[xIndex];
-                if (x > collider->bounds.minimum[0] + epsilon
-                    && x < collider->bounds.maximum[0] - epsilon)
+                if (x > collider->bounds.minimum[0] + epsilon &&
+                    x < collider->bounds.maximum[0] - epsilon)
                 {
                     return true;
                 }
@@ -975,9 +884,10 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource* collision,
     return false;
 }
 
-bool VoxelBodyOverlapsBlock(const double position[3],
-    const VoxelBodyShape* shape, const int64_t block[3])
+bool VoxelBodyOverlapsBlock(const double position[3], const VoxelBodyShape *shape,
+                            const int64_t block[3])
 {
+    PhysicsFpEnvironmentNormalize();
     VoxelBodyBounds bounds;
     if (!CalculateValidBodyBounds(position, shape, &bounds))
     {
@@ -988,10 +898,8 @@ bool VoxelBodyOverlapsBlock(const double position[3],
     {
         double blockMinimum = (double)block[axis];
         double blockMaximum = blockMinimum + 1.0;
-        if (bounds.maximum[axis]
-                <= blockMinimum + shape->collisionEpsilon
-            || bounds.minimum[axis]
-                >= blockMaximum - shape->collisionEpsilon)
+        if (bounds.maximum[axis] <= blockMinimum + shape->collisionEpsilon ||
+            bounds.minimum[axis] >= blockMaximum - shape->collisionEpsilon)
         {
             return false;
         }
@@ -999,11 +907,9 @@ bool VoxelBodyOverlapsBlock(const double position[3],
     return true;
 }
 
-static bool HasSupportBelowOffset(
-    const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape,
-    double probeDepth, double xOffset, double yOffset,
-    const DynamicColliderBatch* dynamicColliders)
+static bool HasSupportBelowOffset(const VoxelCollisionSource *collision, const double position[3],
+                                  const VoxelBodyShape *shape, double probeDepth, double xOffset,
+                                  double yOffset, const DynamicColliderBatch *dynamicColliders)
 {
     if (probeDepth <= 0.0)
     {
@@ -1016,8 +922,7 @@ static bool HasSupportBelowOffset(
         position[2],
     };
     VoxelBodyBounds bounds;
-    if (!CalculateValidBodyBounds(
-            shiftedPosition, shape, &bounds))
+    if (!CalculateValidBodyBounds(shiftedPosition, shape, &bounds))
     {
         return false;
     }
@@ -1029,14 +934,12 @@ static bool HasSupportBelowOffset(
     int64_t maximumY;
     int64_t minimumZ;
     int64_t maximumZ;
-    if (!TryFloorToInt64(bounds.minimum[0] + epsilon, &minimumX)
-        || !TryFloorToInt64(bounds.maximum[0] - epsilon, &maximumX)
-        || !TryFloorToInt64(bounds.minimum[1] + epsilon, &minimumY)
-        || !TryFloorToInt64(bounds.maximum[1] - epsilon, &maximumY)
-        || !TryFloorToInt64(
-            bounds.minimum[2] - probeDepth + epsilon, &minimumZ)
-        || !TryFloorToInt64(
-            bounds.minimum[2] - epsilon, &maximumZ))
+    if (!TryFloorToInt64(bounds.minimum[0] + epsilon, &minimumX) ||
+        !TryFloorToInt64(bounds.maximum[0] - epsilon, &maximumX) ||
+        !TryFloorToInt64(bounds.minimum[1] + epsilon, &minimumY) ||
+        !TryFloorToInt64(bounds.maximum[1] - epsilon, &maximumY) ||
+        !TryFloorToInt64(bounds.minimum[2] - probeDepth + epsilon, &minimumZ) ||
+        !TryFloorToInt64(bounds.minimum[2] - epsilon, &maximumZ))
     {
         return false;
     }
@@ -1062,24 +965,18 @@ static bool HasSupportBelowOffset(
         double footprintMinimumY = bounds.minimum[1] + epsilon;
         double footprintMaximumY = bounds.maximum[1] - epsilon;
         double feet = bounds.minimum[2];
-        for (uint32_t index = 0u;
-            index < dynamicColliders->count; ++index)
+        for (uint32_t index = 0u; index < dynamicColliders->count; ++index)
         {
-            const VoxelDynamicCollider* collider =
-                &dynamicColliders->colliders[index];
+            const VoxelDynamicCollider *collider = &dynamicColliders->colliders[index];
             double gap = feet - collider->bounds.maximum[2];
             if (gap < -epsilon || gap > probeDepth + epsilon)
             {
                 continue;
             }
-            if (footprintMaximumX
-                    > collider->bounds.minimum[0] + epsilon
-                && footprintMinimumX
-                    < collider->bounds.maximum[0] - epsilon
-                && footprintMaximumY
-                    > collider->bounds.minimum[1] + epsilon
-                && footprintMinimumY
-                    < collider->bounds.maximum[1] - epsilon)
+            if (footprintMaximumX > collider->bounds.minimum[0] + epsilon &&
+                footprintMinimumX < collider->bounds.maximum[0] - epsilon &&
+                footprintMaximumY > collider->bounds.minimum[1] + epsilon &&
+                footprintMinimumY < collider->bounds.maximum[1] - epsilon)
             {
                 return true;
             }
@@ -1101,27 +998,22 @@ static double ReduceSneakDistance(double value, double step)
     return 0.0;
 }
 
-void VoxelBodyClipSneakingMovement(
-    const VoxelCollisionSource* collision,
-    const double position[3], const VoxelBodyShape* shape,
-    double probeDepth, double* xDistance, double* yDistance)
+void VoxelBodyClipSneakingMovement(const VoxelCollisionSource *collision, const double position[3],
+                                   const VoxelBodyShape *shape, double probeDepth,
+                                   double *xDistance, double *yDistance)
 {
-    if (collision == NULL || collision->queryBlockPhysics == NULL
-        || position == NULL || shape == NULL
-        || xDistance == NULL || yDistance == NULL)
+    PhysicsFpEnvironmentNormalize();
+    if (collision == NULL || collision->queryBlockPhysics == NULL || position == NULL ||
+        shape == NULL || xDistance == NULL || yDistance == NULL)
     {
         return;
     }
 
     VoxelBodyBounds currentBounds;
-    if (!IsFiniteBoundedDouble(
-            probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || !IsFiniteBoundedDouble(
-            *xDistance, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || !IsFiniteBoundedDouble(
-            *yDistance, VOXEL_DYNAMIC_COORDINATE_LIMIT)
-        || !CalculateValidBodyBounds(
-            position, shape, &currentBounds))
+    if (!IsFiniteBoundedDouble(probeDepth, VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+        !IsFiniteBoundedDouble(*xDistance, VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+        !IsFiniteBoundedDouble(*yDistance, VOXEL_DYNAMIC_COORDINATE_LIMIT) ||
+        !CalculateValidBodyBounds(position, shape, &currentBounds))
     {
         *xDistance = 0.0;
         *yDistance = 0.0;
@@ -1129,7 +1021,7 @@ void VoxelBodyClipSneakingMovement(
     }
 
     DynamicColliderBatch dynamicColliders;
-    const DynamicColliderBatch* dynamicColliderView = NULL;
+    const DynamicColliderBatch *dynamicColliderView = NULL;
     if (collision->queryDynamicColliders != NULL)
     {
         double xMinimumOffset = MinimumDouble(0.0, *xDistance);
@@ -1140,8 +1032,7 @@ void VoxelBodyClipSneakingMovement(
             {
                 currentBounds.minimum[0] + xMinimumOffset,
                 currentBounds.minimum[1] + yMinimumOffset,
-                currentBounds.minimum[2] - probeDepth
-                    - shape->collisionEpsilon,
+                currentBounds.minimum[2] - probeDepth - shape->collisionEpsilon,
             },
             {
                 currentBounds.maximum[0] + xMaximumOffset,
@@ -1149,8 +1040,7 @@ void VoxelBodyClipSneakingMovement(
                 currentBounds.minimum[2] + shape->collisionEpsilon,
             },
         };
-        if (!QueryDynamicColliderBatch(
-                collision, &queryBounds, &dynamicColliders))
+        if (!QueryDynamicColliderBatch(collision, &queryBounds, &dynamicColliders))
         {
             *xDistance = 0.0;
             *yDistance = 0.0;
@@ -1160,9 +1050,8 @@ void VoxelBodyClipSneakingMovement(
     }
 
     // Уже падающее или вытолкнутое тело не приклеивается обратно к краю.
-    if (!HasSupportBelowOffset(
-            collision, position, shape, probeDepth, 0.0, 0.0,
-            dynamicColliderView))
+    if (!HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, 0.0,
+                               dynamicColliderView))
     {
         return;
     }
@@ -1173,23 +1062,21 @@ void VoxelBodyClipSneakingMovement(
     double x = *xDistance;
     double y = *yDistance;
 
-    while (x != 0.0 && !HasSupportBelowOffset(
-            collision, position, shape, probeDepth, x, 0.0,
-            dynamicColliderView))
+    while (x != 0.0 && !HasSupportBelowOffset(collision, position, shape, probeDepth, x, 0.0,
+                                              dynamicColliderView))
     {
         x = ReduceSneakDistance(x, reductionStep);
     }
 
-    while (y != 0.0 && !HasSupportBelowOffset(
-            collision, position, shape, probeDepth, 0.0, y,
-            dynamicColliderView))
+    while (y != 0.0 && !HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, y,
+                                              dynamicColliderView))
     {
         y = ReduceSneakDistance(y, reductionStep);
     }
 
-    while (x != 0.0 && y != 0.0 && !HasSupportBelowOffset(
-            collision, position, shape, probeDepth, x, y,
-            dynamicColliderView))
+    while (
+        x != 0.0 && y != 0.0 &&
+        !HasSupportBelowOffset(collision, position, shape, probeDepth, x, y, dynamicColliderView))
     {
         x = ReduceSneakDistance(x, reductionStep);
         y = ReduceSneakDistance(y, reductionStep);

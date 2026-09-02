@@ -35,8 +35,13 @@ static void TestValidManifest(void)
                                "[native]\n"
                                "abi = 1\n"
                                "entry_windows_x86_64 = weather.windows-x86_64.dll\n"
+                               "entry_windows_arm64 = weather.windows-arm64.dll\n"
                                "entry_linux_x86_64_gnu = weather.linux-x86_64-gnu.so\n"
-                               "entry_linux_x86_64_musl = weather.linux-x86_64-musl.so\n";
+                               "entry_linux_x86_64_musl = weather.linux-x86_64-musl.so\n"
+                               "entry_linux_arm64_gnu = weather.linux-arm64-gnu.so\n"
+                               "entry_linux_arm64_musl = weather.linux-arm64-musl.so\n"
+                               "entry_macos_x86_64 = weather.macos-x86_64.dylib\n"
+                               "entry_macos_arm64 = weather.macos-arm64.dylib\n";
     LaiueModManifest manifest;
     LaiueModDiagnostic diagnostic;
     Expect(LaiueModManifestParse(text, sizeof(text) - 1u, &manifest, &diagnostic) ==
@@ -49,6 +54,10 @@ static void TestValidManifest(void)
     Expect(manifest.requiredEngineMajor == 0u && manifest.requiredEngineMinor == 6u &&
                manifest.requiredAbi == 1u,
            "manifest compatibility fields were parsed incorrectly");
+    Expect(manifest.entryWindowsArm64[0] != L'\0' && manifest.entryLinuxArm64Gnu[0] != L'\0' &&
+               manifest.entryLinuxArm64Musl[0] != L'\0' && manifest.entryMacosX86_64[0] != L'\0' &&
+               manifest.entryMacosArm64[0] != L'\0',
+           "cross-platform native entries were not parsed");
 
     wchar_t nativeName[LAIUE_MOD_NATIVE_NAME_CAPACITY];
     Expect(LaiueModManifestSelectNativeEntry(&manifest, nativeName, LAIUE_MOD_NATIVE_NAME_CAPACITY,
@@ -81,6 +90,9 @@ static void TestInvalidManifests(void)
     static const char wrongExtension[] =
         "LAIUE MOD 3\nid = example.bad_extension\nversion = 1\nengine = 0.6\n"
         "[native]\nabi = 1\nentry_windows_x86_64 = mod.so\n";
+    static const char wrongMacosExtension[] =
+        "LAIUE MOD 3\nid = example.bad_macos_extension\nversion = 1\nengine = 0.6\n"
+        "[native]\nabi = 1\nentry_macos_arm64 = mod.so\n";
     static const char missingEngine[] = "LAIUE MOD 3\nid = example.missing\nversion = 1\n"
                                         "[native]\nabi = 1\nentry_windows_x86_64 = mod.dll\n";
     static const char embeddedNul[] = "LAIUE MOD 3\nid = example.nul\0version = 1\nengine = 0.6\n";
@@ -91,6 +103,8 @@ static void TestInvalidManifests(void)
     ExpectInvalid(uppercaseId, sizeof(uppercaseId) - 1u, "non-canonical id was accepted");
     ExpectInvalid(wrongExtension, sizeof(wrongExtension) - 1u,
                   "wrong platform artifact extension was accepted");
+    ExpectInvalid(wrongMacosExtension, sizeof(wrongMacosExtension) - 1u,
+                  "wrong macOS artifact extension was accepted");
     ExpectInvalid(missingEngine, sizeof(missingEngine) - 1u, "missing engine version was accepted");
     ExpectInvalid(embeddedNul, sizeof(embeddedNul) - 1u, "embedded NUL byte was accepted");
 }

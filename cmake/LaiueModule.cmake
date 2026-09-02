@@ -32,17 +32,20 @@ function(laiue_add_module module_name)
     cmake_parse_arguments(PARSE_ARGV 1 MODULE
         "PRECISE_FP"
         "RUNTIME_ROLE"
-        "SOURCES;WINDOWS_SOURCES;UNIX_SOURCES;LINK;PUBLIC_LINK;WINDOWS_LINK;UNIX_LINK"
+        "SOURCES;WINDOWS_SOURCES;POSIX_SOURCES;EXTERNAL_SOURCES;LINK;PUBLIC_LINK;WINDOWS_LINK;POSIX_LINK;EXTERNAL_LINK"
     )
 
     set(selected_sources ${MODULE_SOURCES})
     set(selected_links ${MODULE_LINK})
-    if(WIN32)
+    if(LAIUE_PLATFORM_EXTERNAL)
+        list(APPEND selected_sources ${MODULE_EXTERNAL_SOURCES})
+        list(APPEND selected_links ${MODULE_EXTERNAL_LINK})
+    elseif(LAIUE_PLATFORM_WINDOWS)
         list(APPEND selected_sources ${MODULE_WINDOWS_SOURCES})
         list(APPEND selected_links ${MODULE_WINDOWS_LINK})
     else()
-        list(APPEND selected_sources ${MODULE_UNIX_SOURCES})
-        list(APPEND selected_links ${MODULE_UNIX_LINK})
+        list(APPEND selected_sources ${MODULE_POSIX_SOURCES})
+        list(APPEND selected_links ${MODULE_POSIX_LINK})
     endif()
     if(NOT selected_sources)
         message(FATAL_ERROR "laiue_add_module(${module_name}) требует SOURCES")
@@ -56,24 +59,35 @@ function(laiue_add_module module_name)
     set(target_name "laiue_${module_name}")
     string(TOUPPER "${module_name}" module_name_upper)
 
-    add_library(${target_name} SHARED)
+    add_library(${target_name} ${LAIUE_MODULE_LIBRARY_TYPE_RESOLVED})
     add_library("laiue::${module_name}" ALIAS ${target_name})
     target_sources(${target_name} PRIVATE ${module_sources})
     source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_sources})
     target_compile_definitions(${target_name}
         PRIVATE "LAIUE_BUILD_${module_name_upper}")
-    if(WIN32)
-        if(MODULE_PRECISE_FP)
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
+        target_compile_definitions(${target_name} PUBLIC LAIUE_STATIC=1)
+        if(NOT MSVC)
+            set_target_properties(${target_name} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                VISIBILITY_INLINES_HIDDEN YES)
+        endif()
+    endif()
+    if(MODULE_PRECISE_FP)
+        if(LAIUE_PLATFORM_EXTERNAL)
+            target_link_libraries(${target_name} PRIVATE
+                "${LAIUE_PRECISE_FP_TARGET}")
+        elseif(LAIUE_PLATFORM_WINDOWS)
             target_compile_options(${target_name} PRIVATE
                 "$<$<C_COMPILER_ID:MSVC>:/fp:strict>"
                 "$<$<C_COMPILER_ID:Clang>:/clang:-ffp-model=strict>")
         else()
-            target_compile_options(${target_name} PRIVATE /fp:fast)
+            target_compile_options(${target_name} PRIVATE
+                -fno-fast-math
+                -ffp-contract=off)
         endif()
-    elseif(MODULE_PRECISE_FP)
-        target_compile_options(${target_name} PRIVATE
-            -fno-fast-math
-            -ffp-contract=off)
+    elseif(LAIUE_PLATFORM_WINDOWS)
+        target_compile_options(${target_name} PRIVATE /fp:fast)
     endif()
     target_include_directories(${target_name}
         PUBLIC
@@ -88,14 +102,24 @@ function(laiue_add_module module_name)
         target_link_libraries(${target_name} PUBLIC ${MODULE_PUBLIC_LINK})
     endif()
 
-    if(WIN32)
-        target_link_options(${target_name} PRIVATE /NOENTRY)
-    else()
-        set_target_properties(${target_name} PROPERTIES
-            C_VISIBILITY_PRESET hidden
-            VISIBILITY_INLINES_HIDDEN YES
-            BUILD_RPATH "$ORIGIN"
-            INSTALL_RPATH "$ORIGIN")
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        if(LAIUE_PLATFORM_WINDOWS)
+            target_link_options(${target_name} PRIVATE /NOENTRY)
+        else()
+            set_target_properties(${target_name} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                VISIBILITY_INLINES_HIDDEN YES)
+            if(APPLE)
+                set_target_properties(${target_name} PROPERTIES
+                    BUILD_RPATH "@loader_path"
+                    INSTALL_RPATH "@loader_path"
+                    MACOSX_RPATH ON)
+            else()
+                set_target_properties(${target_name} PROPERTIES
+                    BUILD_RPATH "$ORIGIN"
+                    INSTALL_RPATH "$ORIGIN")
+            endif()
+        endif()
     endif()
 
     laiue_register_runtime_target(

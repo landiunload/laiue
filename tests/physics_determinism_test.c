@@ -1,13 +1,14 @@
 #include "physics/voxel_body.h"
 #include "world/infinite_coord.h"
 #include "world/world.h"
+#include "fp_environment_test_support.h"
 #include "test_runtime.h"
 
 #include <limits.h>
 
-// The reference below is a regression contract for x86_64 binary64 builds
-// compiled with the engine's precise, non-contracting floating-point policy.
-// It is intentionally not a claim about ARM64 or arbitrary future compilers.
+// The reference below is a regression contract for supported x86_64 and ARM64
+// binary64 builds compiled with the engine's precise, non-contracting policy.
+// A new architecture/toolchain must match it before joining that contract.
 #define DETERMINISM_TICKS 60000U
 #define DETERMINISM_EXPECTED_HASH 0x4486debc2d00fab7ULL
 
@@ -539,13 +540,24 @@ static void TestPhysicsAtAbsoluteOriginBeyondInt64(void)
 
 LAIUE_TEST_ENTRY(PhysicsDeterminismTestEntryPoint)
 {
+    LaiueTestSetHostileFpEnvironment();
+    DeterminismExpect(!VoxelPhysicsThreadIsConfigured(), "hostile FP environment was not detected");
+    VoxelPhysicsConfigureThread();
+    DeterminismExpect(VoxelPhysicsThreadIsConfigured(),
+                      "deterministic FP environment was not installed");
+
     TestDynamicColliderOrderIndependence();
     TestChunkEdgesAndContactStability();
     TestInsufficientLocalResolutionFailsClosed();
     TestPhysicsAtAbsoluteOriginBeyondInt64();
 
+    LaiueTestSetHostileFpEnvironment();
     uint64_t referenceHash = RunLongSimulation(false);
+    DeterminismExpect(VoxelPhysicsThreadIsConfigured(),
+                      "physics API did not self-normalize the FP environment");
+    LaiueTestSetHostileFpEnvironment();
     uint64_t rebasedHash = RunLongSimulation(true);
+    LaiueTestSetHostileFpEnvironment();
     uint64_t repeatedHash = RunLongSimulation(false);
     LaiueTestRuntimeWrite("physics-determinism-hash: ");
     DeterminismWriteHex64(referenceHash);
@@ -559,6 +571,6 @@ LAIUE_TEST_ENTRY(PhysicsDeterminismTestEntryPoint)
                       "rebase schedule changed canonical reference hash");
     DeterminismExpect(DETERMINISM_EXPECTED_HASH == 0ULL ||
                           referenceHash == DETERMINISM_EXPECTED_HASH,
-                      "x86_64 reference hash changed");
+                      "supported-platform reference hash changed");
     LAIUE_TEST_SUCCESS();
 }

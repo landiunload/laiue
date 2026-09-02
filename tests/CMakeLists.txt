@@ -10,7 +10,8 @@ function(laiue_configure_test target_name windows_entry)
     endif()
 endfunction()
 
-if(UNIX)
+if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND
+   CMAKE_SYSTEM_NAME STREQUAL "Linux")
     foreach(runtime_target IN LISTS LAIUE_RUNTIME_TARGETS)
         add_test(NAME "laiue.abi.${runtime_target}.exports"
             COMMAND "${CMAKE_COMMAND}"
@@ -18,7 +19,19 @@ if(UNIX)
                 "-DLIBRARY_FILE=$<TARGET_FILE:${runtime_target}>"
                 -P "${PROJECT_SOURCE_DIR}/tools/check_elf_exports.cmake")
     endforeach()
+elseif(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND APPLE)
+    foreach(runtime_target IN LISTS LAIUE_RUNTIME_TARGETS)
+        add_test(NAME "laiue.abi.${runtime_target}.exports"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DNM_TOOL=${CMAKE_NM}"
+                "-DLIBRARY_FILE=$<TARGET_FILE:${runtime_target}>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_macho_exports.cmake")
+    endforeach()
 endif()
+
+add_executable(laiue_platform_crypto_test platform_crypto_test.c)
+laiue_configure_test(laiue_platform_crypto_test PlatformCryptoTestEntry)
+add_test(NAME laiue.platform.crypto COMMAND laiue_platform_crypto_test)
 
 add_executable(laiue_infinite_coord_test infinite_coord_test.c)
 target_link_libraries(laiue_infinite_coord_test PRIVATE laiue_world)
@@ -60,27 +73,34 @@ target_link_libraries(laiue_mod_manifest_test PRIVATE laiue_mod)
 laiue_configure_test(laiue_mod_manifest_test ModManifestTestEntry)
 add_test(NAME laiue.mod.manifest COMMAND laiue_mod_manifest_test)
 
-add_library(laiue_mod_test_extension SHARED
-    mod_test_extension.c
-    mod_test_service.h)
-target_include_directories(laiue_mod_test_extension PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(laiue_mod_test_extension PRIVATE laiue_common)
-if(WIN32)
-    target_link_options(laiue_mod_test_extension PRIVATE /NOENTRY)
-else()
-    set_target_properties(laiue_mod_test_extension PROPERTIES
-        C_VISIBILITY_PRESET hidden
-        VISIBILITY_INLINES_HIDDEN YES)
-endif()
+if(LAIUE_NATIVE_MODS_ENABLED)
+    add_library(laiue_mod_test_extension SHARED
+        mod_test_extension.c
+        mod_test_service.h)
+    target_include_directories(laiue_mod_test_extension PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(laiue_mod_test_extension PRIVATE laiue_common)
+    if(WIN32)
+        target_link_options(laiue_mod_test_extension PRIVATE /NOENTRY)
+    else()
+        set_target_properties(laiue_mod_test_extension PROPERTIES
+            C_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN YES)
+    endif()
 
-add_executable(laiue_mod_host_test
-    mod_host_test.c
-    mod_test_service.h)
-target_link_libraries(laiue_mod_host_test PRIVATE laiue_mod)
-laiue_configure_test(laiue_mod_host_test ModHostTestEntry)
-add_dependencies(laiue_mod_host_test laiue_mod_test_extension)
-add_test(NAME laiue.mod.host COMMAND laiue_mod_host_test)
+    add_executable(laiue_mod_host_test
+        mod_host_test.c
+        mod_test_service.h)
+    target_link_libraries(laiue_mod_host_test PRIVATE laiue_mod)
+    laiue_configure_test(laiue_mod_host_test ModHostTestEntry)
+    add_dependencies(laiue_mod_host_test laiue_mod_test_extension)
+    add_test(NAME laiue.mod.host COMMAND laiue_mod_host_test)
+else()
+    add_executable(laiue_mod_host_disabled_test mod_host_disabled_test.c)
+    target_link_libraries(laiue_mod_host_disabled_test PRIVATE laiue_mod)
+    laiue_configure_test(laiue_mod_host_disabled_test ModHostDisabledTestEntry)
+    add_test(NAME laiue.mod.host_disabled COMMAND laiue_mod_host_disabled_test)
+endif()
 
 if(TARGET laiue_scene)
     add_executable(laiue_voxel_raycast_test voxel_raycast_test.c)

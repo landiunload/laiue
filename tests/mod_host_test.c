@@ -7,18 +7,40 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+#define TEST_EXTENSION_FILE_NAME L"laiue_mod_test_extension.dll"
+#define TEST_NATIVE_MANIFEST_KEY "entry_windows_arm64"
+#define TEST_EXTENSION_FILE_NAME_UTF8 "laiue_mod_test_extension.dll"
+#elif defined(_WIN32)
 #define TEST_EXTENSION_FILE_NAME L"laiue_mod_test_extension.dll"
 #define TEST_NATIVE_MANIFEST_KEY "entry_windows_x86_64"
 #define TEST_EXTENSION_FILE_NAME_UTF8 "laiue_mod_test_extension.dll"
+#elif defined(__linux__) && defined(__aarch64__) && defined(LAIUE_LINUX_LIBC_MUSL)
+#define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.so"
+#define TEST_NATIVE_MANIFEST_KEY "entry_linux_arm64_musl"
+#define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.so"
+#elif defined(__linux__) && defined(__aarch64__)
+#define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.so"
+#define TEST_NATIVE_MANIFEST_KEY "entry_linux_arm64_gnu"
+#define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.so"
 #elif defined(LAIUE_LINUX_LIBC_MUSL)
 #define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.so"
 #define TEST_NATIVE_MANIFEST_KEY "entry_linux_x86_64_musl"
 #define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.so"
-#else
+#elif defined(__linux__)
 #define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.so"
 #define TEST_NATIVE_MANIFEST_KEY "entry_linux_x86_64_gnu"
 #define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.so"
+#elif defined(__APPLE__) && defined(__x86_64__)
+#define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.dylib"
+#define TEST_NATIVE_MANIFEST_KEY "entry_macos_x86_64"
+#define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.dylib"
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+#define TEST_EXTENSION_FILE_NAME L"liblaiue_mod_test_extension.dylib"
+#define TEST_NATIVE_MANIFEST_KEY "entry_macos_arm64"
+#define TEST_EXTENSION_FILE_NAME_UTF8 "liblaiue_mod_test_extension.dylib"
+#else
+#error Unsupported mod-host test platform
 #endif
 
 typedef struct TestCopyScratch

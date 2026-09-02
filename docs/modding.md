@@ -16,9 +16,11 @@
 ```text
 example_weather.lmp/
     mod.lm
-    example_weather.dll
-    libexample_weather_glibc.so
-    libexample_weather_musl.so
+    example_weather.windows-x86_64.dll
+    example_weather.windows-arm64.dll
+    libexample_weather.linux-x86_64-gnu.so
+    libexample_weather.linux-arm64-gnu.so
+    libexample_weather.macos-arm64.dylib
 ```
 
 `mod.lm` — строгий UTF-8-манифест размером не более 64 КиБ:
@@ -32,15 +34,20 @@ engine = 0.7
 
 [native]
 abi = 1
-entry_windows_x86_64 = example_weather.dll
-entry_linux_x86_64_gnu = libexample_weather_glibc.so
-entry_linux_x86_64_musl = libexample_weather_musl.so
+entry_windows_x86_64 = example_weather.windows-x86_64.dll
+entry_windows_arm64 = example_weather.windows-arm64.dll
+entry_linux_x86_64_gnu = libexample_weather.linux-x86_64-gnu.so
+entry_linux_x86_64_musl = libexample_weather.linux-x86_64-musl.so
+entry_linux_arm64_gnu = libexample_weather.linux-arm64-gnu.so
+entry_linux_arm64_musl = libexample_weather.linux-arm64-musl.so
+entry_macos_x86_64 = libexample_weather.macos-x86_64.dylib
+entry_macos_arm64 = libexample_weather.macos-arm64.dylib
 ```
 
 `id` — стабильный lowercase ASCII identifier. `name` — необязательное
 отображаемое UTF-8-имя. `engine` задаёт требуемые major/minor; host принимает
 тот же major и не меньший minor. Для текущего процесса выбирается ровно один
-из x86_64 artifacts. glibc и musl не взаимозаменяемы.
+artifact по OS, архитектуре и ABI. glibc и musl не взаимозаменяемы.
 
 Имена пака, манифеста и native artifact должны быть безопасными leaf names.
 ASCII case-collision вроде `Weather.lmp`/`weather.lmp` делает весь root
@@ -125,8 +132,32 @@ Registry сервисов заморожен, пока загружается, �
 
 ## Границы версии 0.7
 
-- ABI поддерживает Windows x86_64, Linux x86_64 glibc и Linux x86_64 musl.
+- Манифест различает Windows x86_64/ARM64, Linux x86_64/ARM64 для glibc и
+  musl, а также macOS x86_64/ARM64. Каждый artifact собирается отдельно.
+- Linux ARM64 host фактически проверен Docker-тестом. macOS native loader и
+  оба Mach-O slices должны пройти соответствующие CI jobs; настроенный
+  workflow не заменяет просмотр результата реального запуска.
+- На лицензируемой консольной платформе возможность загрузки native code и
+  пользовательского содержимого определяется официальной документацией.
+  Публичный движок не предполагает, что PC-моды там разрешены; data-only
+  packs и внешний статический registry остаются возможными adapter policies.
+- Android/iOS external profiles всегда собираются с native mods `OFF`.
+  Google Play запрещает загружать executable `.dex`, `.jar` и `.so` вне
+  магазина, а App Review 2.5.2 запрещает скачивать или исполнять код,
+  меняющий функциональность приложения. Texture/audio/data packs допустимы
+  как данные; скачиваемые shader sources и scripts требуют отдельной
+  platform/store проверки и не должны молча наследовать PC-поведение.
+- Xbox XR-018 запрещает консольным модам standalone executable, JIT/script
+  compilation в executable, прямой network и filesystem access. Такой порт
+  должен использовать контролируемый data/bytecode sandbox. Публичные правила
+  Nintendo и PlayStation этого не раскрывают, поэтому их политика остаётся
+  неизвестной до доступа к partner documentation.
 - Моды могут использовать только сервисы, явно опубликованные приложением.
 - Движок не предоставляет игровых, сетевых или серверных сервисов.
 - Hot reload кода намеренно не обещан: сначала выгружается старый мод со
   всеми его потоками и указателями, затем обычным путём загружается новый.
+
+Актуальные публичные policy references: [Google Play Device and Network
+Abuse](https://support.google.com/googleplay/android-developer/answer/16559646),
+[Apple App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/)
+и [Xbox XR-018](https://learn.microsoft.com/en-us/gaming/gdk/docs/store/policies/xr/xr018).

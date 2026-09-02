@@ -77,10 +77,10 @@ jobs:
         run: |
           apt-get update
           apt-get install -y ca-certificates clang cmake gcc git \
-            libssl-dev ninja-build
+            ninja-build
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_GRAPHICS=OFF
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -91,6 +91,12 @@ jobs:
       - name: Test Release
         if: matrix.preset != 'linux-gcc-asan'
         run: ctest --preset ${{ matrix.preset }}-release --no-tests=error
+      - name: Compile-test external static core seam
+        if: matrix.preset == 'linux-gcc'
+        run: |
+          cmake --preset linux-external-port-smoke
+          cmake --build --preset linux-external-port-smoke-release --parallel
+          ctest --preset linux-external-port-smoke-release --no-tests=error
       - name: Stage engine SDK
         if: matrix.preset == 'linux-clang'
         run: >
@@ -109,16 +115,54 @@ jobs:
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake
 
+  linux-arm64-engine:
+    name: Linux ARM64 core (GCC)
+    runs-on: ubuntu-24.04-arm
+    container: debian:13-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates cmake gcc git ninja-build
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Configure headless core
+        run: |
+          test "$(uname -m)" = aarch64
+          cmake --preset linux-gcc-arm64
+      - name: Build and test Debug
+        run: |
+          cmake --build --preset linux-gcc-arm64-debug --parallel
+          ctest --preset linux-gcc-arm64-debug --no-tests=error
+      - name: Build and test Release
+        run: |
+          cmake --build --preset linux-gcc-arm64-release --parallel
+          ctest --preset linux-gcc-arm64-release --no-tests=error
+      - name: Stage engine SDK
+        run: >
+          cmake --build --preset linux-gcc-arm64-release
+          --target laiue_engine_bundle --parallel
+      - name: Upload Linux ARM64 engine SDK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: laiue-engine-linux-gnu-arm64
+          path: build/linux-gcc-arm64/bundles/engine/Release
+          if-no-files-found: error
+      - name: Verify build did not modify sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
   musl-engine:
     runs-on: ubuntu-24.04
     container: alpine:3.23
     steps:
       - name: Install build dependencies
         run: >
-          apk add --no-cache build-base cmake git ninja openssl-dev
+          apk add --no-cache build-base cmake git ninja
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - name: Configure
-        run: cmake --preset linux-musl
+        run: cmake --preset linux-musl -DLAIUE_BUILD_GRAPHICS=OFF
       - name: Build and test Debug
         run: |
           cmake --build --preset linux-musl-debug --parallel
@@ -130,5 +174,78 @@ jobs:
       - name: Verify build did not modify sources
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
+  android-arm64-engine:
+    name: Android ARM64 core/link (NDK r29)
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Verify pinned Android NDK
+        run: test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+      - name: Verify complete Android static-link closure
+        run: |
+          cmake --preset android-arm64-core-closure
+          cmake --build --preset android-arm64-core-closure --parallel
+      - name: Configure Android core
+        run: cmake --preset android-arm64-core
+      - name: Compile and link Android targets
+        run: cmake --build --preset android-arm64-core-release --parallel
+      - name: Verify build did not modify sources
+        run: |
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
+  macos-engine:
+    name: macOS core (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            architecture: arm64
+            preset: macos-clang-arm64
+          - runner: macos-26-intel
+            architecture: x86_64
+            preset: macos-clang-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Install build dependencies
+        run: brew install ninja
+      - name: Configure headless core
+        run: |
+          cmake --preset "${{ matrix.preset }}" \
+            -DLAIUE_BUILD_GRAPHICS=OFF
+      - name: Build and test Debug
+        run: |
+          cmake --build --preset "${{ matrix.preset }}-debug" --parallel
+          ctest --preset "${{ matrix.preset }}-debug" --no-tests=error
+      - name: Build and test Release
+        run: |
+          cmake --build --preset "${{ matrix.preset }}-release" --parallel
+          ctest --preset "${{ matrix.preset }}-release" --no-tests=error
+      - name: Stage core SDK
+        run: >
+          cmake --build --preset "${{ matrix.preset }}-release"
+          --target laiue_engine_bundle
+      - name: Compile iOS ARM64 static core
+        if: matrix.architecture == 'arm64'
+        run: |
+          xcodebuild -version
+          cmake --preset ios-arm64-core
+          cmake --build --preset ios-arm64-core-debug --parallel
+          cmake --build --preset ios-arm64-core-release --parallel
+      - name: Upload macOS core SDK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: laiue-engine-macos-${{ matrix.architecture }}
+          path: build/${{ matrix.preset }}/bundles/engine/Release
+          if-no-files-found: error
+      - name: Verify build did not modify sources
+        run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake

@@ -3,11 +3,10 @@
 #include "content/content_catalog.h"
 #include "platform/system.h"
 
-#include <windows.h>
 #include <string.h>
 
-#define LTP_MAGIC       0x3150544Cu
-#define LTP_VERSION     1u
+#define LTP_MAGIC 0x3150544Cu
+#define LTP_VERSION 1u
 #define LTP_VERSION_NORMALS 2u
 #define LTP_HEADER_SIZE 24u
 #define LTP_FORMAT_RGBA8 1u
@@ -17,22 +16,20 @@
 
 // Material-agnostic single-layer fallback. It keeps the renderer usable
 // without assigning any game-specific meaning or palette to material ids.
-static const uint8_t g_fallbackPixels[4] = { 160, 160, 160, 255 };
+static const uint8_t g_fallbackPixels[4] = {160, 160, 160, 255};
 
-static uint16_t ReadU16Le(const uint8_t* bytes)
+static uint16_t ReadU16Le(const uint8_t *bytes)
 {
     return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
-static uint32_t ReadU32Le(const uint8_t* bytes)
+static uint32_t ReadU32Le(const uint8_t *bytes)
 {
-    return (uint32_t)bytes[0]
-        | ((uint32_t)bytes[1] << 8)
-        | ((uint32_t)bytes[2] << 16)
-        | ((uint32_t)bytes[3] << 24);
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
 }
 
-static void SetFallback(TexturePackData* pack)
+static void SetFallback(TexturePackData *pack)
 {
     pack->width = 1;
     pack->height = 1;
@@ -41,23 +38,7 @@ static void SetFallback(TexturePackData* pack)
     pack->pixels = g_fallbackPixels;
     pack->pixelBytes = sizeof(g_fallbackPixels);
     pack->normalPixels = NULL;
-}
-
-static bool ReadFileExact(HANDLE file, void* destination, uint32_t byteCount)
-{
-    uint8_t* output = (uint8_t*)destination;
-    uint32_t completed = 0;
-    while (completed < byteCount)
-    {
-        DWORD read = 0;
-        if (!ReadFile(file, output + completed, byteCount - completed, &read, NULL)
-            || read == 0)
-        {
-            return false;
-        }
-        completed += read;
-    }
-    return true;
+    pack->allocation = NULL;
 }
 
 static uint16_t FullMipCount(uint32_t width, uint32_t height)
@@ -65,22 +46,26 @@ static uint16_t FullMipCount(uint32_t width, uint32_t height)
     uint16_t count = 1;
     while (width > 1u || height > 1u)
     {
-        if (width > 1u) width >>= 1;
-        if (height > 1u) height >>= 1;
+        if (width > 1u)
+            width >>= 1;
+        if (height > 1u)
+            height >>= 1;
         ++count;
     }
     return count;
 }
 
-static bool CalculatePayloadBytes(uint32_t width, uint32_t height,
-    uint32_t layerCount, uint32_t mipCount, uint32_t* outBytes)
+static bool CalculatePayloadBytes(uint32_t width, uint32_t height, uint32_t layerCount,
+                                  uint32_t mipCount, uint32_t *outBytes)
 {
     uint64_t bytesPerLayer = 0;
     for (uint32_t mip = 0; mip < mipCount; ++mip)
     {
         bytesPerLayer += (uint64_t)width * height * 4u;
-        if (width > 1u) width >>= 1;
-        if (height > 1u) height >>= 1;
+        if (width > 1u)
+            width >>= 1;
+        if (height > 1u)
+            height >>= 1;
     }
 
     uint64_t total = bytesPerLayer * layerCount;
@@ -92,26 +77,27 @@ static bool CalculatePayloadBytes(uint32_t width, uint32_t height,
     return true;
 }
 
-static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
+static bool LoadLtp(const wchar_t *path, TexturePackData *outPack)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
+    PlatformPathInformation information;
+    if (!PlatformGetPathInformation(path, &information) || !information.exists ||
+        information.isDirectory || information.isSymbolicLink ||
+        information.size < LTP_HEADER_SIZE ||
+        information.size > (uint64_t)LTP_HEADER_SIZE + UINT32_MAX)
     {
         return false;
     }
 
-    LARGE_INTEGER fileSize;
-    uint8_t header[LTP_HEADER_SIZE];
-    bool headerRead = GetFileSizeEx(file, &fileSize)
-        && fileSize.QuadPart >= LTP_HEADER_SIZE
-        && ReadFileExact(file, header, sizeof(header));
-    if (!headerRead)
+    uint8_t *fileBytes = NULL;
+    uint64_t fileSize = 0;
+    if (!PlatformReadEntireFile(path, (uint64_t)LTP_HEADER_SIZE + UINT32_MAX, &fileBytes,
+                                &fileSize) ||
+        fileSize != information.size)
     {
-        CloseHandle(file);
+        PlatformFree(fileBytes);
         return false;
     }
+    const uint8_t *header = fileBytes;
 
     uint32_t magic = ReadU32Le(header + 0);
     uint16_t version = ReadU16Le(header + 4);
@@ -125,38 +111,25 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
 
     // Версия 1 — только albedo; версия 2 — albedo + идентичный по
     // раскладке блок карт нормалей сразу за ним.
-    bool withNormals = version == LTP_VERSION_NORMALS
-        && format == LTP_FORMAT_RGBA8_NORMALS;
-    bool versionValid = withNormals
-        || (version == LTP_VERSION && format == LTP_FORMAT_RGBA8);
+    bool withNormals = version == LTP_VERSION_NORMALS && format == LTP_FORMAT_RGBA8_NORMALS;
+    bool versionValid = withNormals || (version == LTP_VERSION && format == LTP_FORMAT_RGBA8);
 
     uint32_t albedoBytes = 0;
-    bool valid = magic == LTP_MAGIC
-        && versionValid
-        && headerSize == LTP_HEADER_SIZE
-        && width > 0 && width <= TEXTURE_MAX_DIMENSION
-        && height > 0 && height <= TEXTURE_MAX_DIMENSION
-        && layerCount >= TEXTURE_PACK_MIN_LAYERS
-        && layerCount <= TEXTURE_PACK_MAX_LAYERS
-        && mipCount == FullMipCount(width, height)
-        && CalculatePayloadBytes(width, height, layerCount, mipCount, &albedoBytes)
-        && albedoBytes <= UINT32_MAX / 2u
-        && dataBytes == (withNormals ? albedoBytes * 2u : albedoBytes)
-        && fileSize.QuadPart == (LONGLONG)LTP_HEADER_SIZE + dataBytes;
+    bool valid = magic == LTP_MAGIC && versionValid && headerSize == LTP_HEADER_SIZE && width > 0 &&
+                 width <= TEXTURE_MAX_DIMENSION && height > 0 && height <= TEXTURE_MAX_DIMENSION &&
+                 layerCount >= TEXTURE_PACK_MIN_LAYERS && layerCount <= TEXTURE_PACK_MAX_LAYERS &&
+                 mipCount == FullMipCount(width, height) &&
+                 CalculatePayloadBytes(width, height, layerCount, mipCount, &albedoBytes) &&
+                 albedoBytes <= UINT32_MAX / 2u &&
+                 dataBytes == (withNormals ? albedoBytes * 2u : albedoBytes) &&
+                 fileSize == (uint64_t)LTP_HEADER_SIZE + dataBytes;
     if (!valid)
     {
-        CloseHandle(file);
+        PlatformFree(fileBytes);
         return false;
     }
 
-    uint8_t *pixels = PlatformAllocate(dataBytes, false);
-    if (pixels == NULL || !ReadFileExact(file, pixels, dataBytes))
-    {
-        PlatformFree(pixels);
-        CloseHandle(file);
-        return false;
-    }
-    CloseHandle(file);
+    uint8_t *pixels = fileBytes + LTP_HEADER_SIZE;
 
     outPack->width = width;
     outPack->height = height;
@@ -165,6 +138,7 @@ static bool LoadLtp(const wchar_t* path, TexturePackData* outPack)
     outPack->pixels = pixels;
     outPack->pixelBytes = albedoBytes;
     outPack->normalPixels = withNormals ? pixels + albedoBytes : NULL;
+    outPack->allocation = fileBytes;
     return true;
 }
 
@@ -218,12 +192,11 @@ TexturePackLoadStatus TexturePackLoadActive(TexturePackData *outPack)
     return TexturePackLoadActiveFrom(LaiueContentCatalogDefault(), outPack);
 }
 
-static bool GetSubresourceFrom(const TexturePackData* pack,
-    const uint8_t* base, uint32_t layer, uint32_t mip,
-    TexturePackSubresource* outSubresource)
+static bool GetSubresourceFrom(const TexturePackData *pack, const uint8_t *base, uint32_t layer,
+                               uint32_t mip, TexturePackSubresource *outSubresource)
 {
-    if (pack == NULL || outSubresource == NULL || base == NULL
-        || layer >= pack->layerCount || mip >= pack->mipCount)
+    if (pack == NULL || outSubresource == NULL || base == NULL || layer >= pack->layerCount ||
+        mip >= pack->mipCount)
     {
         return false;
     }
@@ -234,8 +207,10 @@ static bool GetSubresourceFrom(const TexturePackData* pack,
     for (uint32_t level = 0; level < pack->mipCount; ++level)
     {
         bytesPerLayer += (uint64_t)width * height * 4u;
-        if (width > 1u) width >>= 1;
-        if (height > 1u) height >>= 1;
+        if (width > 1u)
+            width >>= 1;
+        if (height > 1u)
+            height >>= 1;
     }
 
     uint64_t offset = bytesPerLayer * layer;
@@ -244,8 +219,10 @@ static bool GetSubresourceFrom(const TexturePackData* pack,
     for (uint32_t level = 0; level < mip; ++level)
     {
         offset += (uint64_t)width * height * 4u;
-        if (width > 1u) width >>= 1;
-        if (height > 1u) height >>= 1;
+        if (width > 1u)
+            width >>= 1;
+        if (height > 1u)
+            height >>= 1;
     }
 
     uint64_t byteCount = (uint64_t)width * height * 4u;
@@ -262,30 +239,26 @@ static bool GetSubresourceFrom(const TexturePackData* pack,
     return true;
 }
 
-bool TexturePackGetSubresource(const TexturePackData* pack,
-    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource)
+bool TexturePackGetSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+                               TexturePackSubresource *outSubresource)
 {
-    return GetSubresourceFrom(pack,
-        pack != NULL ? pack->pixels : NULL, layer, mip, outSubresource);
+    return GetSubresourceFrom(pack, pack != NULL ? pack->pixels : NULL, layer, mip, outSubresource);
 }
 
-bool TexturePackGetNormalSubresource(const TexturePackData* pack,
-    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource)
+bool TexturePackGetNormalSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+                                     TexturePackSubresource *outSubresource)
 {
-    return GetSubresourceFrom(pack,
-        pack != NULL ? pack->normalPixels : NULL, layer, mip, outSubresource);
+    return GetSubresourceFrom(pack, pack != NULL ? pack->normalPixels : NULL, layer, mip,
+                              outSubresource);
 }
 
-void TexturePackRelease(TexturePackData* pack)
+void TexturePackRelease(TexturePackData *pack)
 {
     if (pack == NULL)
     {
         return;
     }
-    if (pack->pixels != NULL && pack->pixels != g_fallbackPixels)
-    {
-        PlatformFree((void *)pack->pixels);
-    }
+    PlatformFree(pack->allocation);
     pack->width = 0;
     pack->height = 0;
     pack->layerCount = 0;
@@ -293,6 +266,7 @@ void TexturePackRelease(TexturePackData* pack)
     pack->pixels = NULL;
     pack->pixelBytes = 0;
     pack->normalPixels = NULL;
+    pack->allocation = NULL;
 }
 
 bool TexturePackEnumerateFrom(LaiueContentCatalog *catalog, TexturePackList *outList)
@@ -324,11 +298,10 @@ bool TexturePackEnumerateFrom(LaiueContentCatalog *catalog, TexturePackList *out
     for (uint32_t index = 0; index < contentList.count; ++index)
     {
         uint32_t length = 0;
-        while (contentList.entries[index].name[length] != L'\0'
-            && length + 1u < TEXTURE_PACK_NAME_MAX)
+        while (contentList.entries[index].name[length] != L'\0' &&
+               length + 1u < TEXTURE_PACK_NAME_MAX)
         {
-            outList->entries[index].name[length] =
-                contentList.entries[index].name[length];
+            outList->entries[index].name[length] = contentList.entries[index].name[length];
             ++length;
         }
         outList->entries[index].name[length] = L'\0';
@@ -344,7 +317,7 @@ bool TexturePackEnumerate(TexturePackList *outList)
     return TexturePackEnumerateFrom(LaiueContentCatalogDefault(), outList);
 }
 
-void TexturePackListRelease(TexturePackList* list)
+void TexturePackListRelease(TexturePackList *list)
 {
     if (list == NULL)
     {

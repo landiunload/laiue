@@ -2,9 +2,10 @@
 
 ## Локальная проверка
 
-Канонические границы — Windows x86_64 с полным графическим набором и Linux
-x86_64 core. Нужны CMake 3.28+ и MSVC/clang-cl на Windows либо GCC/Clang на
-Linux. Матрица и зависимости описаны в
+Канонические границы — Windows x86_64 с полным графическим набором,
+Linux x86_64/ARM64 core и macOS arm64/x86_64 core. Нужны CMake 3.28+,
+MSVC/clang-cl на Windows, GCC/Clang на Linux либо AppleClang на macOS.
+Матрица и зависимости описаны в
 [docs/portability.md](docs/portability.md).
 
 ```powershell
@@ -28,9 +29,36 @@ cmake --build --preset linux-gcc-release --parallel
 ctest --preset linux-gcc-release
 ```
 
+Официальный x86_64 Linux CI выполняет те же команды внутри Debian 13 и Alpine
+3.23 Docker containers. Linux ARM64 фактически прошёл полный CTest в Docker и
+дополнительно назначен нативному GitHub-hosted ARM64 runner. macOS workflow
+назначает отдельные jobs Apple Silicon и Intel:
+
+```sh
+cmake --preset macos-clang-arm64
+cmake --build --preset macos-clang-arm64-release --parallel
+ctest --preset macos-clang-arm64-release --no-tests=error
+
+# На Intel host/runner:
+cmake --preset macos-clang-x86_64
+cmake --build --preset macos-clang-x86_64-release --parallel
+ctest --preset macos-clang-x86_64-release --no-tests=error
+```
+
 Диагностический preset `linux-gcc-asan` добавляет ASan/UBSan. Configure
 выполняется один раз на toolchain; Debug и Release выбираются build/test
 preset с соответствующим суффиксом.
+
+Публичная проверка внешней статической core-границы запускается отдельно:
+
+```sh
+cmake --preset linux-external-port-smoke
+cmake --build --preset linux-external-port-smoke-release --parallel
+ctest --preset linux-external-port-smoke-release --no-tests=error
+```
+
+Она проверяет контракт superbuild, но не заменяет закрытый toolchain и запуск
+на консольном hardware.
 
 Тесты живут в `tests/` и регистрируются в CTest. Аудио-тест может вернуть
 125 и быть отмечен пропущенным, если в Windows отсутствует Media Foundation.
@@ -46,6 +74,8 @@ check: нужен реальный link и запуск релевантных �
   `tools/check_architecture.ps1`.
 - Win32/POSIX API разрешены только в `src/platform` и специализированных
   backend-файлах.
+- `UNIX` не используется как синоним Linux: Darwin и внешние консольные
+  adapters имеют собственные реализации и capability checks.
 - `world` и `physics` не выполняют platform I/O и не выбирают ОС через
   `#ifdef`.
 - `mod` не включает игровые, сетевые, scene или render interfaces: прикладные
@@ -59,6 +89,31 @@ check: нужен реальный link и запуск релевантных �
 - Fixed-step и другие горячие пути не содержат allocation, файлового I/O и
   покадрового logging.
 - Оптимизация требует повторяемого измерения до и после.
+
+## Mobile
+
+- Android ARM64 проверяется NDK r29 build-only job; iOS ARM64 — Xcode 26
+  unsigned link job с deployment target 15.0. Ни один из них не заменяет
+  устройство, APK/IPA, Vulkan/Metal и lifecycle tests.
+- Mobile application обязан передать явный app-container root каталогу
+  содержимого; executable directory там намеренно недоступен как default.
+- Нативные моды на mobile отключены. Data-only packs проходят отдельную
+  store policy review; произвольные shader scripts/source не обещаются.
+
+## Закрытые консоли
+
+- Публичный репозиторий содержит только platform-agnostic contracts и точку
+  подключения внешнего adapter.
+- SDK, toolchain files, proprietary headers, libraries, hardware commands и
+  закрытая документация не добавляются в этот репозиторий или публичный CI.
+- Консольную поддержку подтверждает только закрытая нативная сборка и запуск
+  на официальном dev/test hardware; mock adapter подтверждает лишь границы.
+- Политики native mods, shader packs, storage и пользовательского содержимого
+  не переносятся с PC по предположению: их определяет документация платформы.
+- Self-hosted console runner не исполняет код из pull request. В него попадает
+  только одобренный commit защищённой ветки через закрытый integration repo.
+- До появления закрытой нативной сборки и запуска Xbox, PlayStation и
+  Nintendo считаются не заявленными платформами, даже если mock проходит.
 
 ## Контракт World
 
@@ -92,11 +147,11 @@ World origin не заменяет render origin. До преобразован�
   возвращает усечённую выборку как успешную.
 - Перед шагом приложение вызывает `VoxelBodyLocalRangeIsResolved` и при
   необходимости синхронно rebases `World` и все локальные тела.
-- Изменение collision arithmetic проверяет x86_64 reference hash, повторный
+- Изменение collision arithmetic проверяет общий reference hash, повторный
   прогон, rebased schedule, границы чанков и resting-contact drift.
-- Детерминизм для новой архитектуры объявляется только после отдельного
-  эталонного запуска; x86_64 результат нельзя автоматически переносить на
-  ARM64.
+- Linux ARM64 уже подтвердил тот же hash отдельным Docker-запуском. Каждая
+  новая OS/architecture/toolchain комбинация всё равно требует собственного
+  нативного запуска; результат Linux ARM64 не заменяет macOS ARM64.
 
 ## Контракт модов
 

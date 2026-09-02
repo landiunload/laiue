@@ -11,8 +11,11 @@
 #define LAIUE_CONTENT_PATH_CAPACITY 32768u
 
 // Immutable, application-owned view of a content tree.  The root can point to
-// any directory selected by the embedding application; a NULL or empty root
-// passed to Create selects the executable directory.
+// any directory selected by the embedding application; on desktop, a NULL or
+// empty root passed to Create selects the executable directory. Mobile and
+// licensed external adapters may reject that default because their executable
+// path is not a readable/writable content container. Those application shells
+// must stage data-only packs in an OS-provided app directory and pass it here.
 //
 // A catalog may be shared by any number of threads.  Reads run concurrently;
 // active-pack updates are serialized per catalog and are published with an
@@ -30,7 +33,7 @@ typedef struct LaiueContentEntry
 
 typedef struct LaiueContentList
 {
-    LaiueContentEntry* entries;
+    LaiueContentEntry *entries;
     uint32_t count;
 } LaiueContentList;
 
@@ -61,19 +64,17 @@ LAIUE_CONTENT_API LaiueContentCatalog *LaiueContentCatalogDefault(void);
 // above so content location and lifetime are not hidden process-global state.
 // Перечисляет только один точный формат: пакет одного типа никогда не
 // смешивается с пакетами другой категории.
-LAIUE_CONTENT_API bool LaiueContentEnumerate(
-    LaiueContentType type, LaiueContentList* outList);
-LAIUE_CONTENT_API void LaiueContentListRelease(LaiueContentList* list);
+LAIUE_CONTENT_API bool LaiueContentEnumerate(LaiueContentType type, LaiueContentList *outList);
+LAIUE_CONTENT_API void LaiueContentListRelease(LaiueContentList *list);
 
 // Активный пак хранится в <каталог>/active.txt в UTF-8. Одиночные форматы
 // активировать нельзя. name == NULL или пустая строка очищают выбор.
-LAIUE_CONTENT_API bool LaiueContentSetActivePack(
-    LaiueContentType type, const wchar_t* name);
-LAIUE_CONTENT_API bool LaiueContentGetActivePack(
-    LaiueContentType type, wchar_t* destination, uint32_t capacity);
+LAIUE_CONTENT_API bool LaiueContentSetActivePack(LaiueContentType type, const wchar_t *name);
+LAIUE_CONTENT_API bool LaiueContentGetActivePack(LaiueContentType type, wchar_t *destination,
+                                                 uint32_t capacity);
 
 // Строит путь внутри каталога типа. childName предназначен для содержимого
 // каталогов-паков (например, MyShaders.lsp/chunk_vs.ls) и может быть NULL.
-LAIUE_CONTENT_API bool LaiueContentBuildPath(LaiueContentType type,
-    const wchar_t* name, const wchar_t* childName,
-    wchar_t* destination, uint32_t capacity);
+LAIUE_CONTENT_API bool LaiueContentBuildPath(LaiueContentType type, const wchar_t *name,
+                                             const wchar_t *childName, wchar_t *destination,
+                                             uint32_t capacity);

@@ -33,8 +33,13 @@ typedef struct LaiueModManifest
     uint32_t requiredAbi;
 
     wchar_t entryWindowsX86_64[LAIUE_MOD_NATIVE_NAME_CAPACITY];
+    wchar_t entryWindowsArm64[LAIUE_MOD_NATIVE_NAME_CAPACITY];
     wchar_t entryLinuxX86_64Gnu[LAIUE_MOD_NATIVE_NAME_CAPACITY];
     wchar_t entryLinuxX86_64Musl[LAIUE_MOD_NATIVE_NAME_CAPACITY];
+    wchar_t entryLinuxArm64Gnu[LAIUE_MOD_NATIVE_NAME_CAPACITY];
+    wchar_t entryLinuxArm64Musl[LAIUE_MOD_NATIVE_NAME_CAPACITY];
+    wchar_t entryMacosX86_64[LAIUE_MOD_NATIVE_NAME_CAPACITY];
+    wchar_t entryMacosArm64[LAIUE_MOD_NATIVE_NAME_CAPACITY];
 } LaiueModManifest;
 
 typedef struct LaiueModPackInfo
@@ -63,7 +68,7 @@ LAIUE_MOD_API LaiueModStatus LaiueModManifestParse(const void *bytes, size_t byt
                                                    LaiueModManifest *outManifest,
                                                    LaiueModDiagnostic *diagnostic);
 
-/* Selects the current x86_64 platform artifact declared by the manifest. */
+/* Selects the current supported platform artifact declared by the manifest. */
 LAIUE_MOD_API LaiueModStatus LaiueModManifestSelectNativeEntry(const LaiueModManifest *manifest,
                                                                wchar_t *destination,
                                                                uint32_t capacity,

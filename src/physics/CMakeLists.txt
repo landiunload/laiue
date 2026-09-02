@@ -2,6 +2,8 @@ laiue_add_module(physics
     PRECISE_FP
     RUNTIME_ROLE CORE
     SOURCES
+        fp_environment.c
+        fp_environment.h
         voxel_body.c
         voxel_body.h
         ../api.h

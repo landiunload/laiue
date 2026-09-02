@@ -5,28 +5,45 @@
 | Платформа | Core | Graphics | ABI |
 |---|---:|---:|---|
 | Windows x86_64 | Tier 1 | Tier 1 | MSVC или clang-cl, no-CRT runtime |
-| Debian x86_64 | Tier 1 | — | glibc, GCC или Clang |
-| Alpine x86_64 | CI | — | musl, GCC |
+| Debian x86_64 | Tier 1, Docker CI | — | glibc, GCC или Clang |
+| Alpine x86_64 | Docker CI | — | musl, GCC |
+| Debian ARM64 | Docker-tested; native CI job | — | glibc, GCC |
+| Steam Deck / SteamOS | Linux x86_64 core | — | glibc, нужен будущий Vulkan client |
+| macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
+| macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
+| Android ARM64 | NDK r29 compile/link CI настроен | — | API 28+, static external core |
+| iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
+| tvOS/visionOS | adapter contract | — | без preset и native validation |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
+| Xbox / PlayStation / Nintendo | external seam | не заявлен | закрытый SDK и dev/test hardware |
+| WebAssembly/WebGPU | не заявлен | не заявлен | нужен отдельный web adapter |
 
 Core включает `platform_support`, `world`, `physics`, `content` и `mod`. Graphics
 добавляет `window`, `input`, `audio`, `mesh`, `render`, `scene` и `ui`.
-Linux-графический backend пока отсутствует; попытка включить его завершается
-ошибкой configure.
+Linux- и macOS-графические backends пока отсутствуют; CI на этих системах
+подтверждает core/headless, но не окно, presentation, input, audio или
+пригодность игрового bundle. Попытка запросить отсутствующий backend должна
+завершаться понятной ошибкой configure.
 
 ## Опции CMake
 
 | Опция | Default | Назначение |
 |---|---:|---|
-| `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux: `OFF` | графические библиотеки Windows |
+| `LAIUE_PLATFORM_BACKEND` | `AUTO` | встроенный `WINDOWS`/`POSIX` либо явно подключённый `EXTERNAL` core adapter |
+| `LAIUE_EXTERNAL_PLATFORM_FILE` | пусто | CMake-файл superbuild, создающий platform adapter и strict-FP targets |
+| `LAIUE_MODULE_LIBRARY_TYPE` | desktop: `SHARED`, external: `STATIC` | тип внутренних модулей; первый external-контракт допускает только static |
+| `LAIUE_NATIVE_MOD_MODE` | desktop: `DYNAMIC`, external: `OFF` | политика загружаемого native-кода; data/content packs этим не запрещаются |
+| `LAIUE_ENABLE_SDK_INSTALL` | desktop: `ON`, external: `OFF` | install/export SDK; внешний порт линкуется из родительского superbuild |
+| `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux/macOS: `OFF` | доступный платформенный графический набор |
 | `LAIUE_WARNINGS_AS_ERRORS` | `ON` | считать предупреждения ошибками |
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
 | `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
 | `LAIUE_AGGRESSIVE_INLINING` | `ON` | MSVC `/Ob3`; отключаемый максимальный inline profile |
-| `LAIUE_X86_64_LEVEL` | `avx2` | ISA Release: `sse2`, `avx2` (MSVC AVX2, Clang/GCC x86-64-v3) либо экспериментальный `avx512` (x86-64-v4) |
-| `LAIUE_X86_64_TUNE` | `generic` | планирование инструкций: `generic` либо opt-in `amd_zen4` |
+| `LAIUE_X86_64_LEVEL` | x86_64: `avx2` | ISA Release x86_64: `sse2`, `avx2` либо экспериментальный `avx512`; к ARM64 не применяется |
+| `LAIUE_X86_64_TUNE` | x86_64: `generic` | планирование x86_64: `generic` либо opt-in `amd_zen4`; к ARM64 не применяется |
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
+| `LAIUE_EXPECTED_ARCHITECTURE` | `auto` | fail-fast проверка `x86_64`, `arm64` или macOS `universal2` |
 | `BUILD_TESTING` | `ON` | зарегистрировать CTest targets |
 
 Все определения, include paths и linker flags target-scoped. CMake не
@@ -45,6 +62,10 @@ shared libraries. Специальный no-CRT runtime object намеренн�
 можно сконфигурировать `-DLAIUE_X86_64_LEVEL=sse2`; это отдельный artifact и
 его нельзя смешивать с AVX2 bundle. `amd_zen4` оставлен opt-in: на текущем
 координатном workload vendor tuning оказался медленнее generic AVX2.
+Apple Silicon использует ISA baseline AppleClang для выбранного arm64 slice и
+никогда не наследует x86-флаги. x86_64 и arm64 проходят детерминизм отдельно.
+Linux ARM64 в Docker дал тот же reference hash, включая сценарий rebasing;
+macOS ARM64 должен подтвердить его собственным нативным CI-запуском.
 
 ## Presets
 
@@ -57,8 +78,15 @@ shared libraries. Специальный no-CRT runtime object намеренн�
 | `windows-clang` | Ninja Multi-Config | `windows-clang-debug`, `windows-clang-release` |
 | `linux-gcc` | Ninja Multi-Config | `linux-gcc-debug`, `linux-gcc-release` |
 | `linux-clang` | Ninja Multi-Config | `linux-clang-debug`, `linux-clang-release` |
+| `android-arm64-core` | Ninja + NDK r29 | `android-arm64-core-release` (build-only) |
+| `ios-arm64-core` | Xcode 26 | `ios-arm64-core-release` (build/link-only) |
+| `linux-gcc-arm64` | Ninja Multi-Config | `linux-gcc-arm64-debug`, `linux-gcc-arm64-release` |
+| `linux-clang-arm64` | Ninja Multi-Config | `linux-clang-arm64-debug`, `linux-clang-arm64-release` |
 | `linux-musl` | Ninja Multi-Config | `linux-musl-debug`, `linux-musl-release` |
 | `linux-gcc-asan` | Ninja Multi-Config | `linux-gcc-asan-debug` |
+| `linux-external-port-smoke` | Ninja Multi-Config | `linux-external-port-smoke-release` |
+| `macos-clang-arm64` | Ninja Multi-Config | `macos-clang-arm64-debug`, `macos-clang-arm64-release` |
+| `macos-clang-x86_64` | Ninja Multi-Config | `macos-clang-x86_64-debug`, `macos-clang-x86_64-release` |
 
 Пример Windows/MSVC:
 
@@ -78,8 +106,8 @@ libraries.
 
 ## Linux core
 
-Нужны CMake 3.28+, Ninja, GCC или Clang, pthreads и development package
-OpenSSL 3 для платформенных crypto-примитивов.
+Нужны CMake 3.28+, Ninja, GCC или Clang и pthreads. SHA-256 реализован внутри
+`platform_support`, поэтому внешняя crypto-библиотека для core не требуется.
 
 ```sh
 cmake --preset linux-gcc
@@ -105,6 +133,27 @@ ctest --preset linux-musl-release
 
 glibc и musl libraries не взаимозаменяемы. Один configure tree нельзя
 повторно использовать с другим compiler, architecture или libc.
+
+Linux ARM64 фактически проверен отдельной Docker-сборкой и полным CTest.
+GitHub Actions использует нативный `ubuntu-24.04-arm` runner и отдельное
+дерево `build/linux-gcc-arm64`; x86_64 presets для этой цели не используются.
+
+## macOS core
+
+Нужны CMake 3.28+, Ninja и AppleClang. Каждый configure tree содержит ровно
+один native slice:
+
+```sh
+cmake --preset macos-clang-arm64
+cmake --build --preset macos-clang-arm64-release --parallel
+ctest --preset macos-clang-arm64-release --no-tests=error
+```
+
+На Intel host/runner используется `macos-clang-x86_64`. Workflow назначает
+оба варианта нативным GitHub-hosted runners; локально в текущей Windows-среде
+они не исполнялись. Universal package допустим только как отдельный packaging
+шаг после успешных тестов обоих slices и всех их зависимостей; он сам по себе
+не заменяет два тестовых запуска.
 
 ## Установка и bundle
 
@@ -139,15 +188,66 @@ cmake --install build/linux-gcc --config Release \
 - Указатели, `wchar_t` и native structs не записываются в переносимые файлы.
 - Имена внутри packs отклоняют absolute path, `..`, separators, symlink или
   reparse traversal и ASCII case-collision.
-- ELF symbols по умолчанию hidden; наружу выходят только API exports.
+- ELF и Mach-O symbols по умолчанию hidden; наружу выходят только API exports.
 - Windows no-CRT target не должен получать скрытую зависимость от CRT через
   новую библиотеку или compiler helper.
 - Авторитетная физика собирается без fast-math и FMA contraction.
 
-Native mod ABI в 0.7 имеет отдельные artifacts для Windows x86_64, Linux
-x86_64 glibc и Linux x86_64 musl. ARM64 пока не входит ни в mod ABI, ни в
-битовый контракт физики. Подробнее: [modding.md](modding.md) и
+Native mod artifact обязан точно совпадать с OS, CPU architecture и libc/ABI
+host-процесса. Наличие core-сборки само по себе не обещает совместимость
+старого native-мода. ARM64 получает собственный проверяемый контракт и не
+наследует x86_64 битовый hash. Подробнее: [modding.md](modding.md) и
 [physics.md](physics.md).
+
+## Mobile и закрытые SDK
+
+Android и Apple mobile family используют публичный
+`cmake/platform/MobileCoreAdapter.cmake`, static core и
+`LAIUE_NATIVE_MOD_MODE=OFF`. Android preset фиксирует NDK r29, ARM64 и API 28;
+iOS preset фиксирует iOS 15, ARM64 и отключённую подпись build-only цели. CI
+компилирует Android targets и линкует game `.so`; Apple runner линкует
+минимальный unsigned app bundle. Debug/no-LTO цели whole-archive включают
+каждый object game core и модулей `world`, `physics`, `content`, `mod` без
+section GC, чтобы статический архив или optimizer не мог скрыть unresolved
+symbol. Отдельная Release-цель проверяет финальную LTO/dead-strip линковку.
+Это не запуск на телефоне и не готовый store package.
+
+Mobile shell получает resource и writable application directories от ОС,
+при необходимости копирует data-only packs в app container и передаёт явный
+root в `LaiueContentCatalogCreate`. Mobile adapter намеренно не подменяет его
+путём к process executable. Полноценному клиенту ещё нужны Vulkan/Metal
+renderer, platform window/lifecycle, input, audio, suspend, thermal/memory
+policy и device tests.
+
+Публичный CMake-проект предоставляет compile-tested точку подключения
+platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указанный
+`LAIUE_EXTERNAL_PLATFORM_FILE` обязан создать target из
+`LAIUE_PLATFORM_ADAPTER_TARGET`, реализующий весь внутренний контракт
+`src/platform/system.h`, и interface target из `LAIUE_PRECISE_FP_TARGET` с
+точными FP-флагами закрытого компилятора. В этом режиме graphics выключен,
+модули статические, динамический native-код модов выключен, а SDK export
+принадлежит родительскому superbuild.
+
+Публичный `linux-external-port-smoke` проверяет именно эту границу, static
+link и core-тесты. Он использует тестовый Linux adapter и не является
+эмуляцией консоли. Реальный toolchain file, backend, SDK,
+заголовки, библиотеки, packaging/signing и команды dev/test hardware живут в
+закрытом integration repository зарегистрированного разработчика.
+
+Публичный GitHub Actions workflow не запускает консольный job и не содержит
+NDA-названий API. После получения доступа отдельный защищённый workflow берёт
+только одобренный commit `main`, работает на выделенном self-hosted runner и
+не выполняет код из pull requests. До нативной сборки и запуска на hardware
+статус каждой из Xbox, PlayStation и Nintendo остаётся «не заявлен», а не
+«supported». Nintendo Switch 2 отдельно нельзя считать целью, пока Nintendo
+публично не принимает заявки на доступ к её development environment.
+
+Публичные основания для этой границы: [Android NDK r29](https://developer.android.com/ndk/downloads/),
+[Apple App Review 2.5.2](https://developer.apple.com/app-store/review/guidelines/),
+[Xbox XR-018](https://learn.microsoft.com/en-us/gaming/gdk/docs/store/policies/xr/xr018),
+[Nintendo Developer registration](https://developer.nintendo.com/register) и
+[PlayStation partner process](https://sonyinteractive.com/en/news/blog/showing-your-game-to-playstation/).
+Закрытая partner documentation всегда имеет приоритет для конкретного порта.
 
 Новая platform-specific операция сначала получает единый контракт владения
 и ошибок, затем отдельные реализации для поддерживаемых платформ. Нельзя
@@ -157,7 +257,9 @@ x86_64 glibc и Linux x86_64 musl. ARM64 пока не входит ни в mod 
 
 Для затронутого toolchain выполняются configure, build и CTest. Изменение
 Windows no-CRT boundary дополнительно проверяется по imports готовых DLL;
-изменение Linux boundary — реальной Linux-сборкой, а не только syntax check.
+изменение Linux boundary — реальной Docker-сборкой, изменение Darwin boundary
+— нативными arm64 и x86_64 runs. Mock/external adapter не заменяет закрытую
+консольную сборку и hardware test.
 
 ```powershell
 pwsh -NoProfile -File tools/check_architecture.ps1

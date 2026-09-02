@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifndef LAIUE_NATIVE_MODS_ENABLED
+#define LAIUE_NATIVE_MODS_ENABLED 1
+#endif
+
 typedef struct RegisteredService
 {
     bool used;
@@ -429,6 +433,11 @@ LaiueModStatus LaiueModHostLoad(LaiueModHost *host, const wchar_t *packName,
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_INVALID_ARGUMENT, 0,
                                      "host and pack name are required");
     }
+#if !LAIUE_NATIVE_MODS_ENABLED
+    return LaiueModDiagnosticSet(
+        diagnostic, LAIUE_MOD_STATUS_PLATFORM_UNSUPPORTED, 0,
+        "dynamically loaded native mods are disabled by this platform contract");
+#endif
     if (!BeginLifecycle(host))
     {
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_BUSY, 0,

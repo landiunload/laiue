@@ -17,8 +17,7 @@ typedef enum TexturePackLoadStatus
 // LTP хранит по одному слою на материал. Material id 1
 // в меше соответствует слою 0; лишние id зажимаются к последнему слою.
 #define TEXTURE_PACK_MAX_MIP_COUNT 13u
-#define TEXTURE_PACK_MAX_SUBRESOURCES \
-    (TEXTURE_PACK_MAX_LAYERS * TEXTURE_PACK_MAX_MIP_COUNT)
+#define TEXTURE_PACK_MAX_SUBRESOURCES (TEXTURE_PACK_MAX_LAYERS * TEXTURE_PACK_MAX_MIP_COUNT)
 
 typedef struct TexturePackData
 {
@@ -26,14 +25,15 @@ typedef struct TexturePackData
     uint16_t height;
     uint16_t layerCount;
     uint16_t mipCount;
-    const uint8_t* pixels;
+    const uint8_t *pixels;
     uint32_t pixelBytes;
-    const uint8_t* normalPixels;
+    const uint8_t *normalPixels;
+    void *allocation;
 } TexturePackData;
 
 typedef struct TexturePackSubresource
 {
-    const uint8_t* pixels;
+    const uint8_t *pixels;
     uint32_t width;
     uint32_t height;
     uint32_t rowBytes;
@@ -42,9 +42,9 @@ typedef struct TexturePackSubresource
 
 TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
                                                 TexturePackData *outPack);
-TexturePackLoadStatus TexturePackLoadActive(TexturePackData* outPack);
-bool TexturePackGetSubresource(const TexturePackData* pack,
-    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
-bool TexturePackGetNormalSubresource(const TexturePackData* pack,
-    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
-void TexturePackRelease(TexturePackData* pack);
+TexturePackLoadStatus TexturePackLoadActive(TexturePackData *outPack);
+bool TexturePackGetSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+                               TexturePackSubresource *outSubresource);
+bool TexturePackGetNormalSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+                                     TexturePackSubresource *outSubresource);
+void TexturePackRelease(TexturePackData *pack);

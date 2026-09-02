@@ -21,8 +21,13 @@ typedef struct ManifestParseState
     bool engineSeen;
     bool abiSeen;
     bool windowsSeen;
+    bool windowsArmSeen;
     bool linuxGnuSeen;
     bool linuxMuslSeen;
+    bool linuxArmGnuSeen;
+    bool linuxArmMuslSeen;
+    bool macosX86Seen;
+    bool macosArmSeen;
 } ManifestParseState;
 
 typedef struct PackInspectionScratch
@@ -410,6 +415,15 @@ static bool ParseNativeField(ManifestParseState *state, ByteSlice key, ByteSlice
         }
         state->windowsSeen = true;
     }
+    else if (SliceEqualsAsciiIgnoreCase(key, "entry_windows_arm64"))
+    {
+        if (state->windowsArmSeen || !SliceCopyNativeEntry(value, manifest->entryWindowsArm64) ||
+            !WideEndsWithIgnoreCase(manifest->entryWindowsArm64, L".dll"))
+        {
+            return false;
+        }
+        state->windowsArmSeen = true;
+    }
     else if (SliceEqualsAsciiIgnoreCase(key, "entry_linux_x86_64_gnu"))
     {
         if (state->linuxGnuSeen || !SliceCopyNativeEntry(value, manifest->entryLinuxX86_64Gnu) ||
@@ -428,13 +442,52 @@ static bool ParseNativeField(ManifestParseState *state, ByteSlice key, ByteSlice
         }
         state->linuxMuslSeen = true;
     }
+    else if (SliceEqualsAsciiIgnoreCase(key, "entry_linux_arm64_gnu"))
+    {
+        if (state->linuxArmGnuSeen || !SliceCopyNativeEntry(value, manifest->entryLinuxArm64Gnu) ||
+            !WideEndsWithIgnoreCase(manifest->entryLinuxArm64Gnu, L".so"))
+        {
+            return false;
+        }
+        state->linuxArmGnuSeen = true;
+    }
+    else if (SliceEqualsAsciiIgnoreCase(key, "entry_linux_arm64_musl"))
+    {
+        if (state->linuxArmMuslSeen ||
+            !SliceCopyNativeEntry(value, manifest->entryLinuxArm64Musl) ||
+            !WideEndsWithIgnoreCase(manifest->entryLinuxArm64Musl, L".so"))
+        {
+            return false;
+        }
+        state->linuxArmMuslSeen = true;
+    }
+    else if (SliceEqualsAsciiIgnoreCase(key, "entry_macos_x86_64"))
+    {
+        if (state->macosX86Seen || !SliceCopyNativeEntry(value, manifest->entryMacosX86_64) ||
+            !WideEndsWithIgnoreCase(manifest->entryMacosX86_64, L".dylib"))
+        {
+            return false;
+        }
+        state->macosX86Seen = true;
+    }
+    else if (SliceEqualsAsciiIgnoreCase(key, "entry_macos_arm64"))
+    {
+        if (state->macosArmSeen || !SliceCopyNativeEntry(value, manifest->entryMacosArm64) ||
+            !WideEndsWithIgnoreCase(manifest->entryMacosArm64, L".dylib"))
+        {
+            return false;
+        }
+        state->macosArmSeen = true;
+    }
     return true;
 }
 
 static bool ManifestComplete(const ManifestParseState *state)
 {
     return state->idSeen && state->versionSeen && state->engineSeen && state->abiSeen &&
-           (state->windowsSeen || state->linuxGnuSeen || state->linuxMuslSeen);
+           (state->windowsSeen || state->windowsArmSeen || state->linuxGnuSeen ||
+            state->linuxMuslSeen || state->linuxArmGnuSeen || state->linuxArmMuslSeen ||
+            state->macosX86Seen || state->macosArmSeen);
 }
 
 LaiueModStatus LaiueModManifestParse(const void *bytes, size_t byteCount,
@@ -582,17 +635,26 @@ LaiueModStatus LaiueModManifestSelectNativeEntry(const LaiueModManifest *manifes
     const wchar_t *selected = NULL;
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
     selected = manifest->entryWindowsX86_64;
+#elif defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+    selected = manifest->entryWindowsArm64;
 #elif defined(__linux__) && defined(__x86_64__) && defined(LAIUE_LINUX_LIBC_MUSL)
     selected = manifest->entryLinuxX86_64Musl;
 #elif defined(__linux__) && defined(__x86_64__)
     selected = manifest->entryLinuxX86_64Gnu;
+#elif defined(__linux__) && defined(__aarch64__) && defined(LAIUE_LINUX_LIBC_MUSL)
+    selected = manifest->entryLinuxArm64Musl;
+#elif defined(__linux__) && defined(__aarch64__)
+    selected = manifest->entryLinuxArm64Gnu;
+#elif defined(__APPLE__) && defined(__x86_64__)
+    selected = manifest->entryMacosX86_64;
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    selected = manifest->entryMacosArm64;
 #endif
     if (selected == NULL || selected[0] == L'\0')
     {
         destination[0] = L'\0';
-        return LaiueModDiagnosticSet(
-            diagnostic, LAIUE_MOD_STATUS_PLATFORM_UNSUPPORTED, 0,
-            "manifest has no native artifact for the current x86_64 platform");
+        return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_PLATFORM_UNSUPPORTED, 0,
+                                     "manifest has no native artifact for the current platform");
     }
     if (!LaiueModWideCopy(destination, capacity, selected))
     {

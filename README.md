@@ -33,9 +33,23 @@
 | `ui` | immediate-mode UI поверх renderer |
 
 `laiue::engine` объединяет доступные для выбранной платформы модули.
-Windows собирает полный графический набор. Linux экспортирует переносимое
-ядро: `world`, `physics`, `content` и `mod`; `platform_support` остаётся
-внутренней реализацией этих библиотек.
+Windows собирает полный графический набор. Linux и macOS экспортируют
+headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
+остаётся внутренней реализацией этих библиотек. Наличие core-сборки не
+означает наличие окна или рендера на этой платформе.
+
+| Платформа | Core/headless | Полный клиент |
+|---|---:|---:|
+| Windows x86_64 | CI | D3D12, CI |
+| Linux x86_64 | glibc и musl, CI в Docker | ещё нет графического backend |
+| Linux ARM64 | glibc, проверено в Docker; native CI настроен | ещё нет графического backend |
+| Steam Deck / SteamOS | Linux x86_64 core | нужен Vulkan/input/audio client |
+| macOS arm64/x86_64 | macOS 11+, native CI настроен, локально не запускался | ещё нет Metal backend |
+| Android ARM64 | NDK r29 static core и link CI настроены | ещё нет APK/Vulkan/input/audio shell |
+| iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | ещё нет приложения/Metal backend |
+| tvOS/visionOS | mobile adapter contract | нет presets, client и device tests |
+| Xbox / PlayStation / Nintendo | external static seam | нужны одобрение, закрытый SDK и hardware |
+| WebAssembly/WebGPU | не заявлен | нужен отдельный web adapter |
 
 ## Сборка
 
@@ -63,15 +77,53 @@ cmake --build --preset linux-gcc-release --parallel
 ctest --preset linux-gcc-release
 ```
 
+macOS core проверяется нативно на обеих архитектурах:
+
+```sh
+cmake --preset macos-clang-arm64
+cmake --build --preset macos-clang-arm64-release --parallel
+ctest --preset macos-clang-arm64-release
+
+# На Intel runner/host используйте macos-clang-x86_64.
+```
+
+Android ARM64 core компилируется NDK r29. Это создаёт нативные static
+libraries, а потребитель обязан выполнить финальную `.so`-линковку:
+
+```sh
+export ANDROID_NDK_HOME=/path/to/android-ndk-r29
+cmake --preset android-arm64-core
+cmake --build --preset android-arm64-core-release --parallel
+```
+
+На macOS с Xcode 26 доступен build-only профиль iOS 15 ARM64:
+
+```sh
+cmake --preset ios-arm64-core
+cmake --build --preset ios-arm64-core-release --parallel
+```
+
+Эти mobile-профили не являются APK/IPA и не подтверждают GPU, ввод, звук,
+store packaging или запуск на устройстве.
+
 Стандартный Release ориентирован на скорость: MSVC требует AVX2, а
 Clang/GCC — полный уровень x86-64-v3. Для отдельного совместимого с более
 старыми x86_64 CPU artifact укажите
 `-DLAIUE_X86_64_LEVEL=sse2` при configure; смешивать библиотеки разных ISA
 профилей в одном bundle нельзя.
+Release SDK bundles на Unix-платформах дополнительно проходят `strip`; build
+tree остаётся нетронутым, поэтому диагностика и тестирование не теряют символы.
 
 Для Clang используйте `linux-clang`; диагностический preset —
 `linux-gcc-asan`. Подробная матрица находится в
 [docs/portability.md](docs/portability.md).
+
+Linux CI выполняется внутри фиксированных Debian/Alpine Docker images.
+Linux ARM64 core и детерминированная физика также фактически прошли полный
+набор тестов в ARM64 Docker; workflow дополнительно запускает их на нативном
+GitHub-hosted ARM64 runner. macOS workflow настроен на нативные Apple Silicon
+и Intel runners, но из этой Windows-среды не запускался: один успешный slice
+в любом случае не считается подтверждением второго.
 
 ## Установка
 
@@ -97,6 +149,30 @@ target_link_libraries(my_application PRIVATE laiue::engine)
 Для узкой зависимости доступны цели `laiue::world`, `laiue::physics`,
 `laiue::content`, `laiue::mod` и графические цели установленной
 Windows-сборки.
+
+## Mobile и закрытые платформенные адаптеры
+
+Публичный репозиторий определяет только границы platform/render/input/audio
+и не содержит консольных SDK, путей, заголовков либо NDA API. Внешний core
+подключается через `LAIUE_PLATFORM_BACKEND=EXTERNAL`: закрытый CMake adapter
+предоставляет реализацию `Platform*` и строгие FP-флаги, движок собирает
+статические core-модули без динамических native-модов и без публичного SDK
+export. Эту границу проверяет `linux-external-port-smoke`, но он не эмулирует
+консоль.
+
+Публичный `MobileCoreAdapter.cmake` применяет тот же контракт к Android и
+Apple mobile family. Mobile application shell обязан передать явный каталог
+ресурсов/данных в `LaiueContentCatalogCreate`: executable path на Android и
+read-only app bundle на Apple не считаются допустимым writable content root.
+Нативные динамические моды там отключены; data-only packs остаются отдельной
+политикой приложения и магазина.
+
+Xbox, PlayStation и Nintendo пока не являются поддерживаемыми целями. Их
+реальные adapters собираются только в закрытом integration-проекте
+официальным toolchain после одобрения разработчика. Без SDK и dev/test
+hardware нельзя заявлять, что консольная сборка, рендер, ввод, packaging,
+shader/texture packs или физический hash работают. Steam Deck относится к
+Linux x86_64, но до Vulkan backend это только core, не игровой клиент.
 
 ## Мир приложения
 
