@@ -98,6 +98,30 @@ jobs:
           if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
             throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
           }
+      # Temporary: reports which no-CRT helpers softintrin.lib actually
+      # defines. Remove once the MSVC ARM64 link has stayed green.
+      - name: Report ARM64 intrinsic helper library
+        if: matrix.preset == 'windows-msvc-arm64'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $library = $null
+          foreach ($directory in $env:LIB -split ';') {
+            $candidate = Join-Path $directory 'softintrin.lib'
+            if ($directory -and (Test-Path $candidate)) { $library = $candidate; break }
+          }
+          if (-not $library) { Write-Output 'softintrin.lib not on LIB'; exit 0 }
+          Write-Output "softintrin.lib: $library"
+          $wanted = '_InterlockedCompareExchange', '_InterlockedCompareExchange64',
+            '_InterlockedExchange', '_InterlockedIncrement', '_InterlockedDecrement',
+            '__chkstk'
+          $defined = dumpbin /symbols $library |
+            Select-String -Pattern 'External\s+\|\s+(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          foreach ($symbol in $wanted) {
+            $state = if ($defined -contains $symbol) { 'defined' } else { 'MISSING' }
+            Write-Output ("  {0,-32} {1}" -f $symbol, $state)
+          }
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build Debug

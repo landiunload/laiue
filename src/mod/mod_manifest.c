@@ -965,23 +965,25 @@ LaiueModStatus LaiueModPackInspect(const wchar_t *rootDirectory, const wchar_t *
     return FinishPackInspection(outInfo, diagnostic, status, message);
 }
 
-/* A moved element is almost three kilobytes, and by value the compiler puts an
- * extra intermediate copy on the stack too. On Windows ARM64 such a frame
- * crosses a page, so MSVC emits a __chkstk call that a /NODEFAULTLIB build does
- * not have. The exchange cell lives in the caller's heap allocation instead. */
+/* A pack entry is almost three kilobytes, and MSVC on ARM64 materialises a
+ * stack temporary for every whole-struct assignment at /Od: two of them cross a
+ * page, and the resulting __chkstk call does not exist in a /NODEFAULTLIB
+ * build. Explicit copies keep the frame at a handful of bytes on every
+ * compiler, and the exchange cell lives in the caller's heap allocation. */
 static void SortPackList(LaiueModPackList *list, LaiueModPackInfo *scratch)
 {
     for (uint32_t index = 1; index < list->count; ++index)
     {
-        *scratch = list->entries[index];
+        memcpy(scratch, &list->entries[index], sizeof(*scratch));
         uint32_t insertion = index;
         while (insertion > 0u &&
                ComparePackNames(scratch->packName, list->entries[insertion - 1u].packName) < 0)
         {
-            list->entries[insertion] = list->entries[insertion - 1u];
+            memcpy(&list->entries[insertion], &list->entries[insertion - 1u],
+                   sizeof(*list->entries));
             --insertion;
         }
-        list->entries[insertion] = *scratch;
+        memcpy(&list->entries[insertion], scratch, sizeof(*scratch));
     }
 }
 
