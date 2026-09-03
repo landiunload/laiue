@@ -35,6 +35,12 @@ typedef struct PosixDirectoryIterator
     char *path;
 } PosixDirectoryIterator;
 
+_Static_assert(sizeof(pthread_mutex_t) <= sizeof(PlatformMutex),
+    "PlatformMutex storage must cover pthread_mutex_t");
+_Static_assert(sizeof(pthread_cond_t) <= sizeof(PlatformConditionVariable),
+    "PlatformConditionVariable storage must cover pthread_cond_t");
+_Static_assert(sizeof(pthread_t) <= sizeof(PlatformThread),
+    "PlatformThread storage must cover pthread_t");
 _Static_assert(sizeof(pthread_rwlock_t) <= sizeof(PlatformRwLock),
                "PlatformRwLock storage is too small");
 _Static_assert(sizeof(PosixDirectoryIterator) <= sizeof(PlatformDirectoryIterator),
@@ -103,6 +109,138 @@ void PlatformRwLockAcquireExclusive(PlatformRwLock *lock)
 void PlatformRwLockReleaseExclusive(PlatformRwLock *lock)
 {
     pthread_rwlock_unlock((pthread_rwlock_t *)lock);
+}
+
+bool PlatformMutexInitialize(PlatformMutex *mutex)
+{
+    if (mutex == NULL)
+        return false;
+    memset(mutex, 0, sizeof(*mutex));
+    return pthread_mutex_init((pthread_mutex_t *)mutex, NULL) == 0;
+}
+
+void PlatformMutexDestroy(PlatformMutex *mutex)
+{
+    pthread_mutex_destroy((pthread_mutex_t *)mutex);
+}
+
+void PlatformMutexLock(PlatformMutex *mutex)
+{
+    pthread_mutex_lock((pthread_mutex_t *)mutex);
+}
+
+void PlatformMutexUnlock(PlatformMutex *mutex)
+{
+    pthread_mutex_unlock((pthread_mutex_t *)mutex);
+}
+
+bool PlatformConditionVariableInitialize(PlatformConditionVariable *condition)
+{
+    if (condition == NULL)
+        return false;
+    memset(condition, 0, sizeof(*condition));
+    return pthread_cond_init((pthread_cond_t *)condition, NULL) == 0;
+}
+
+void PlatformConditionVariableDestroy(PlatformConditionVariable *condition)
+{
+    pthread_cond_destroy((pthread_cond_t *)condition);
+}
+
+void PlatformConditionVariableWait(PlatformConditionVariable *condition, PlatformMutex *mutex)
+{
+    pthread_cond_wait((pthread_cond_t *)condition, (pthread_mutex_t *)mutex);
+}
+
+void PlatformConditionVariableWakeOne(PlatformConditionVariable *condition)
+{
+    pthread_cond_signal((pthread_cond_t *)condition);
+}
+
+void PlatformConditionVariableWakeAll(PlatformConditionVariable *condition)
+{
+    pthread_cond_broadcast((pthread_cond_t *)condition);
+}
+
+typedef struct PosixThreadStart
+{
+    PlatformThreadEntry entry;
+    void *context;
+} PosixThreadStart;
+
+/* pthread_create ждёт функцию, возвращающую void *, поэтому контракт
+ * движка переносится переходником: приведение указателя на функцию к
+ * другой сигнатуре — неопределённое поведение. */
+static void *PosixThreadThunk(void *parameter)
+{
+    PosixThreadStart *start = (PosixThreadStart *)parameter;
+    PlatformThreadEntry entry = start->entry;
+    void *context = start->context;
+    PlatformFree(start);
+    entry(context);
+    return NULL;
+}
+
+bool PlatformThreadStart(PlatformThread *thread, PlatformThreadEntry entry, void *context)
+{
+    if (thread == NULL || entry == NULL)
+        return false;
+    memset(thread, 0, sizeof(*thread));
+
+    PosixThreadStart *start = PlatformAllocate(sizeof(*start), false);
+    if (start == NULL)
+        return false;
+    start->entry = entry;
+    start->context = context;
+
+    pthread_t handle;
+    if (pthread_create(&handle, NULL, PosixThreadThunk, start) != 0)
+    {
+        PlatformFree(start);
+        return false;
+    }
+    memcpy(thread->storage, &handle, sizeof(handle));
+    return true;
+}
+
+void PlatformThreadJoin(PlatformThread *thread)
+{
+    if (thread == NULL)
+        return;
+    /* Нулевое хранилище означает, что поток не запускался. */
+    static const uintptr_t emptyStorage[2] = { 0, 0 };
+    if (memcmp(thread->storage, emptyStorage, sizeof(thread->storage)) == 0)
+        return;
+    pthread_t handle;
+    memcpy(&handle, thread->storage, sizeof(handle));
+    pthread_join(handle, NULL);
+    memset(thread, 0, sizeof(*thread));
+}
+
+uint32_t PlatformLogicalProcessorCount(void)
+{
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count > 0 ? (uint32_t)count : 1u;
+}
+
+uint32_t PlatformAtomicIncrementU32(volatile uint32_t *value)
+{
+    return __atomic_add_fetch(value, 1u, __ATOMIC_ACQ_REL);
+}
+
+int64_t PlatformAtomicLoadI64(const volatile int64_t *value)
+{
+    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+}
+
+int64_t PlatformAtomicAddI64(volatile int64_t *value, int64_t addend)
+{
+    return __atomic_add_fetch(value, addend, __ATOMIC_ACQ_REL);
+}
+
+int64_t PlatformAtomicIncrementI64(volatile int64_t *value)
+{
+    return __atomic_add_fetch(value, 1, __ATOMIC_ACQ_REL);
 }
 
 uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)

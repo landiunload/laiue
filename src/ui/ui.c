@@ -1,5 +1,5 @@
 #include "ui/ui.h"
-#include "scene/math.h"
+#include "math/scalar.h"
 
 #define UI_HOVER_SPEED 12.0f
 

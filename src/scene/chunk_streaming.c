@@ -3,24 +3,10 @@
 #include "world/world.h"
 #include "render/renderer.h"
 #include "mesh/chunk_mesher.h"
+#include "platform/system.h"
 
-#include <windows.h>
 #include <string.h>
 
-/* winnt.h requests the interlocked intrinsics only inside its _M_AMD64 and
- * _M_IX86 branches, so on ARM64 a /Od build emits ordinary calls to CRT
- * helpers that a /NODEFAULTLIB link cannot resolve. */
-#if defined(_M_ARM64) && !defined(__clang__)
-#pragma warning(push)
-/* A name without an intrinsic form on this target stays an ordinary call. */
-#pragma warning(disable : 4163)
-#pragma intrinsic(_InterlockedCompareExchange)
-#pragma intrinsic(_InterlockedCompareExchange64)
-#pragma intrinsic(_InterlockedIncrement)
-#pragma intrinsic(_InterlockedIncrement64)
-#pragma intrinsic(_InterlockedAdd64)
-#pragma warning(pop)
-#endif
 
 #define MAX_WORKER_THREADS 4
 
@@ -122,24 +108,26 @@ struct ChunkStreaming
     uint32_t queueCapacity;
     uint32_t unfinishedWork;
 
-    SRWLOCK queueLock;
-    CONDITION_VARIABLE workAvailable;
-    HANDLE workerThreads[MAX_WORKER_THREADS];
+    PlatformMutex queueLock;
+    PlatformConditionVariable workAvailable;
+    PlatformThread workerThreads[MAX_WORKER_THREADS];
     uint32_t workerThreadCount;
     uint32_t desiredWorkerThreadCount;
     uint32_t pausedWorkerCount;
     bool pauseRequested;
     bool shutdownRequested;
 
-    LARGE_INTEGER performanceFrequency;
-    volatile LONG64 queuedRequests;
-    volatile LONG64 completedBuilds;
-    volatile LONG64 cancelledBuilds;
-    volatile LONG64 discardedBuilds;
-    volatile LONG64 uploadedMeshes;
-    volatile LONG64 totalBuildTicks;
+    volatile int64_t queuedRequests;
+    volatile int64_t completedBuilds;
+    volatile int64_t cancelledBuilds;
+    volatile int64_t discardedBuilds;
+    volatile int64_t uploadedMeshes;
+    // Время построения копится в микросекундах: монотонные часы платформы
+    // выдают секунды с плавающей точкой, а счётчик обязан быть целым,
+    // чтобы складываться атомарно из нескольких потоков.
+    volatile int64_t totalBuildMicroseconds;
     uint32_t peakUnfinishedWork;
-    volatile LONG centerEpoch;
+    volatile uint32_t centerEpoch;
 };
 
 static void AddMeshToDrawList(ChunkStreaming* streaming, ChunkEntry* entry)
@@ -294,7 +282,7 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
 {
     bool enqueued = false;
 
-    AcquireSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexLock(&streaming->queueLock);
     if (streaming->unfinishedWork < streaming->queueCapacity)
     {
         uint32_t queueMask = streaming->queueCapacity - 1;
@@ -312,12 +300,12 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
         }
         enqueued = true;
     }
-    ReleaseSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexUnlock(&streaming->queueLock);
 
     if (enqueued)
     {
-        InterlockedIncrement64(&streaming->queuedRequests);
-        WakeConditionVariable(&streaming->workAvailable);
+        PlatformAtomicIncrementI64(&streaming->queuedRequests);
+        PlatformConditionVariableWakeOne(&streaming->workAvailable);
     }
 
     entry->requestQueued = enqueued;
@@ -328,7 +316,7 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
     return enqueued;
 }
 
-static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
+static uint32_t WorkerThreadProcedure(void* parameter)
 {
     ChunkStreaming* streaming = parameter;
 
@@ -342,7 +330,7 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
 
     for (;;)
     {
-        AcquireSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexLock(&streaming->queueLock);
         while (!streaming->shutdownRequested
             && (streaming->pauseRequested || streaming->requestCount == 0))
         {
@@ -350,13 +338,13 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
             {
                 reportedPaused = true;
                 streaming->pausedWorkerCount++;
-                WakeAllConditionVariable(&streaming->workAvailable);
+                PlatformConditionVariableWakeAll(&streaming->workAvailable);
             }
-            SleepConditionVariableSRW(&streaming->workAvailable, &streaming->queueLock, INFINITE, 0);
+            PlatformConditionVariableWait(&streaming->workAvailable, &streaming->queueLock);
         }
         if (streaming->shutdownRequested)
         {
-            ReleaseSRWLockExclusive(&streaming->queueLock);
+            PlatformMutexUnlock(&streaming->queueLock);
             ChunkMesherScratchDestroy(scratch);
             return 0;
         }
@@ -367,32 +355,30 @@ static DWORD WINAPI WorkerThreadProcedure(LPVOID parameter)
         ChunkRequest request = streaming->requests[streaming->requestHead & queueMask];
         streaming->requestHead++;
         streaming->requestCount--;
-        ReleaseSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexUnlock(&streaming->queueLock);
 
         // Тяжёлая работа — без замка.
-        bool cancelled = request.centerEpoch != (uint32_t)InterlockedCompareExchange(
-            &streaming->centerEpoch, 0, 0);
-        LARGE_INTEGER buildStart;
-        LARGE_INTEGER buildEnd;
-        QueryPerformanceCounter(&buildStart);
+        bool cancelled =
+            request.centerEpoch != PlatformAtomicLoadU32Acquire(&streaming->centerEpoch);
+        double buildStart = PlatformMonotonicSeconds();
         ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
         if (cancelled || !BuildChunkMesh(streaming->world, scratch,
             request.x, request.y, request.z, &result.quads, &result.quadCount))
         {
             result.quadCount = CHUNK_MESH_BUILD_FAILED;
         }
-        QueryPerformanceCounter(&buildEnd);
-        InterlockedAdd64(&streaming->totalBuildTicks,
-            buildEnd.QuadPart - buildStart.QuadPart);
-        InterlockedIncrement64(&streaming->completedBuilds);
-        if (cancelled) InterlockedIncrement64(&streaming->cancelledBuilds);
+        double buildEnd = PlatformMonotonicSeconds();
+        PlatformAtomicAddI64(&streaming->totalBuildMicroseconds,
+            (int64_t)((buildEnd - buildStart) * 1000000.0));
+        PlatformAtomicIncrementI64(&streaming->completedBuilds);
+        if (cancelled) PlatformAtomicIncrementI64(&streaming->cancelledBuilds);
 
         // Очередь результатов переполниться не может: unfinishedWork
         // ограничен её ёмкостью.
-        AcquireSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexLock(&streaming->queueLock);
         streaming->results[(streaming->resultHead + streaming->resultCount) & queueMask] = result;
         streaming->resultCount++;
-        ReleaseSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexUnlock(&streaming->queueLock);
     }
 }
 
@@ -404,9 +390,8 @@ static bool StartWorkerThreads(ChunkStreaming* streaming)
     for (uint32_t index = 0;
          index < streaming->desiredWorkerThreadCount; ++index)
     {
-        HANDLE thread = CreateThread(
-            NULL, 0, WorkerThreadProcedure, streaming, 0, NULL);
-        if (thread != NULL)
+        PlatformThread thread;
+        if (PlatformThreadStart(&thread, WorkerThreadProcedure, streaming))
         {
             streaming->workerThreads[streaming->workerThreadCount++] = thread;
         }
@@ -418,50 +403,42 @@ static bool StopWorkerThreads(ChunkStreaming* streaming)
 {
     if (streaming->workerThreadCount == 0) return true;
 
-    AcquireSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexLock(&streaming->queueLock);
     streaming->shutdownRequested = true;
     streaming->pauseRequested = false;
     streaming->pausedWorkerCount = 0;
-    WakeAllConditionVariable(&streaming->workAvailable);
-    ReleaseSRWLockExclusive(&streaming->queueLock);
+    PlatformConditionVariableWakeAll(&streaming->workAvailable);
+    PlatformMutexUnlock(&streaming->queueLock);
 
-    bool succeeded = true;
     for (uint32_t index = 0;
          index < streaming->workerThreadCount; ++index)
     {
-        if (WaitForSingleObject(
-                streaming->workerThreads[index], INFINITE) != WAIT_OBJECT_0)
-        {
-            succeeded = false;
-        }
-        CloseHandle(streaming->workerThreads[index]);
-        streaming->workerThreads[index] = NULL;
+        PlatformThreadJoin(&streaming->workerThreads[index]);
     }
     streaming->workerThreadCount = 0;
     streaming->shutdownRequested = false;
-    return succeeded;
+    return true;
 }
 
 static void ResumeWorkerThreads(ChunkStreaming* streaming)
 {
-    AcquireSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexLock(&streaming->queueLock);
     streaming->pausedWorkerCount = 0;
     streaming->pauseRequested = false;
-    WakeAllConditionVariable(&streaming->workAvailable);
-    ReleaseSRWLockExclusive(&streaming->queueLock);
+    PlatformConditionVariableWakeAll(&streaming->workAvailable);
+    PlatformMutexUnlock(&streaming->queueLock);
 }
 
 bool ChunkStreamingPause(ChunkStreaming* streaming)
 {
     if (streaming->workerThreadCount == 0) return false;
 
-    AcquireSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexLock(&streaming->queueLock);
     streaming->pauseRequested = true;
-    WakeAllConditionVariable(&streaming->workAvailable);
+    PlatformConditionVariableWakeAll(&streaming->workAvailable);
     while (streaming->pausedWorkerCount < streaming->workerThreadCount)
     {
-        SleepConditionVariableSRW(
-            &streaming->workAvailable, &streaming->queueLock, INFINITE, 0);
+        PlatformConditionVariableWait(&streaming->workAvailable, &streaming->queueLock);
     }
 
     // Все рабочие потоки стоят на condition variable и больше не читают World.
@@ -472,7 +449,7 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
             (streaming->resultHead + index) & queueMask];
         if (result->quads != NULL)
         {
-            HeapFree(GetProcessHeap(), 0, result->quads);
+            PlatformFree(result->quads);
             result->quads = NULL;
         }
     }
@@ -484,7 +461,7 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
     streaming->unfinishedWork = 0;
     streaming->hasUnqueuedPending = false;
 
-    ReleaseSRWLockExclusive(&streaming->queueLock);
+    PlatformMutexUnlock(&streaming->queueLock);
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
     {
@@ -600,7 +577,7 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
 
 ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks)
 {
-    ChunkStreaming* streaming = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*streaming));
+    ChunkStreaming* streaming = PlatformAllocate(sizeof(*streaming), true);
     if (streaming == NULL)
     {
         return NULL;
@@ -634,18 +611,18 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
 
     streaming->capacity = capacity;
     streaming->queueCapacity = queueCapacity;
-    streaming->entries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof(ChunkEntry));
-    streaming->spareEntries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)capacity * sizeof(ChunkEntry));
-    streaming->drawItems = HeapAlloc(GetProcessHeap(), 0, (size_t)volume * sizeof(DrawItem));
-    streaming->requests = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)queueCapacity * sizeof(ChunkRequest));
-    streaming->results = HeapAlloc(GetProcessHeap(), 0,
-        (size_t)queueCapacity * sizeof(ChunkMeshResult));
+    streaming->entries = PlatformAllocate((size_t)capacity * sizeof(ChunkEntry), true);
+    streaming->spareEntries = PlatformAllocate((size_t)capacity * sizeof(ChunkEntry), true);
+    streaming->drawItems = PlatformAllocate((size_t)volume * sizeof(DrawItem), false);
+    streaming->requests = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkRequest), false);
+    streaming->results = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkMeshResult), false);
 
-    InitializeSRWLock(&streaming->queueLock);
-    InitializeConditionVariable(&streaming->workAvailable);
-    QueryPerformanceFrequency(&streaming->performanceFrequency);
+    if (!PlatformMutexInitialize(&streaming->queueLock)
+        || !PlatformConditionVariableInitialize(&streaming->workAvailable))
+    {
+        ChunkStreamingDestroy(streaming);
+        return NULL;
+    }
 
     if (streaming->entries == NULL || streaming->spareEntries == NULL
         || streaming->drawItems == NULL
@@ -656,12 +633,9 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     }
 
     // Пул потоков мешинга: масштабируется по ядрам процессора.
-    SYSTEM_INFO systemInformation;
-    GetSystemInfo(&systemInformation);
+    uint32_t processorCount = PlatformLogicalProcessorCount();
     streaming->desiredWorkerThreadCount =
-        systemInformation.dwNumberOfProcessors > 2
-        ? systemInformation.dwNumberOfProcessors - 2
-        : 1;
+        processorCount > 2 ? processorCount - 2 : 1;
     if (streaming->desiredWorkerThreadCount > MAX_WORKER_THREADS)
     {
         streaming->desiredWorkerThreadCount = MAX_WORKER_THREADS;
@@ -692,7 +666,7 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         for (uint32_t i = 0; i < streaming->resultCount; ++i)
         {
             ChunkMeshResult* result = &streaming->results[(streaming->resultHead + i) & queueMask];
-            if (result->quads != NULL) HeapFree(GetProcessHeap(), 0, result->quads);
+            if (result->quads != NULL) PlatformFree(result->quads);
         }
     }
 
@@ -705,17 +679,21 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
                 RendererDestroyMesh(streaming->renderer, streaming->entries[i].mesh);
             }
         }
-        HeapFree(GetProcessHeap(), 0, streaming->entries);
+        PlatformFree(streaming->entries);
     }
 
     if (streaming->spareEntries != NULL)
     {
-        HeapFree(GetProcessHeap(), 0, streaming->spareEntries);
+        PlatformFree(streaming->spareEntries);
     }
-    if (streaming->drawItems != NULL) HeapFree(GetProcessHeap(), 0, streaming->drawItems);
-    if (streaming->requests != NULL) HeapFree(GetProcessHeap(), 0, streaming->requests);
-    if (streaming->results != NULL) HeapFree(GetProcessHeap(), 0, streaming->results);
-    HeapFree(GetProcessHeap(), 0, streaming);
+    if (streaming->drawItems != NULL) PlatformFree(streaming->drawItems);
+    if (streaming->requests != NULL) PlatformFree(streaming->requests);
+    if (streaming->results != NULL) PlatformFree(streaming->results);
+    // Потоки уже остановлены выше, поэтому примитивы синхронизации никто
+    // не держит и их можно разрушить.
+    PlatformConditionVariableDestroy(&streaming->workAvailable);
+    PlatformMutexDestroy(&streaming->queueLock);
+    PlatformFree(streaming);
 }
 
 void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
@@ -727,7 +705,7 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     }
 
     // Вторая таблица переиспользуется при каждом переходе чанка:
-    // никаких HeapAlloc/HeapFree в цикле кадра.
+    // никаких выделений и освобождений памяти в цикле кадра.
     memset(streaming->spareEntries, 0,
         (size_t)streaming->capacity * sizeof(ChunkEntry));
 
@@ -735,7 +713,7 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     streaming->centerX = chunkX;
     streaming->centerY = chunkY;
     streaming->centerZ = chunkZ;
-    InterlockedIncrement(&streaming->centerEpoch);
+    PlatformAtomicIncrementU32(&streaming->centerEpoch);
 
     // Пересборка таблицы с гистерезисом: живущие в радиусе + 1
     // переносятся, дальние освобождаются (отложенно, под fence).
@@ -831,17 +809,16 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
 {
     uint32_t queueMask = streaming->queueCapacity - 1;
     uint32_t uploadBudget = MESH_UPLOADS_PER_FRAME;
-    LARGE_INTEGER pumpStart;
-    QueryPerformanceCounter(&pumpStart);
+    double pumpStart = PlatformMonotonicSeconds();
 
     for (;;)
     {
         // Заглянуть в очередь: результат с геометрией берём только
         // при оставшемся бюджете загрузок, остальные — бесплатны.
-        AcquireSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexLock(&streaming->queueLock);
         if (streaming->resultCount == 0)
         {
-            ReleaseSRWLockExclusive(&streaming->queueLock);
+            PlatformMutexUnlock(&streaming->queueLock);
             break;
         }
 
@@ -849,13 +826,13 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         if (result.quadCount != CHUNK_MESH_BUILD_FAILED
             && result.quadCount > 0 && uploadBudget == 0)
         {
-            ReleaseSRWLockExclusive(&streaming->queueLock);
+            PlatformMutexUnlock(&streaming->queueLock);
             break;
         }
         streaming->resultHead++;
         streaming->resultCount--;
         streaming->unfinishedWork--;
-        ReleaseSRWLockExclusive(&streaming->queueLock);
+        PlatformMutexUnlock(&streaming->queueLock);
 
         ChunkEntry* entry = FindEntry(streaming, result.x, result.y, result.z);
         if (entry != NULL && entry->state == CHUNK_ENTRY_PENDING && entry->revision == result.revision)
@@ -888,7 +865,7 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                     }
                     entry->state = CHUNK_ENTRY_READY;
                     uploadBudget--;
-                    InterlockedIncrement64(&streaming->uploadedMeshes);
+                    PlatformAtomicIncrementI64(&streaming->uploadedMeshes);
                 }
                 else
                 {
@@ -909,20 +886,18 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         }
         else
         {
-            InterlockedIncrement64(&streaming->discardedBuilds);
+            PlatformAtomicIncrementI64(&streaming->discardedBuilds);
         }
 
         if (result.quads != NULL)
         {
-            HeapFree(GetProcessHeap(), 0, result.quads);
+            PlatformFree(result.quads);
         }
 
         if (uploadBudget < MESH_UPLOADS_PER_FRAME)
         {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double elapsedMilliseconds = (double)(now.QuadPart - pumpStart.QuadPart)
-                * 1000.0 / (double)streaming->performanceFrequency.QuadPart;
+            double elapsedMilliseconds =
+                (PlatformMonotonicSeconds() - pumpStart) * 1000.0;
             if (elapsedMilliseconds >= MESH_UPLOAD_BUDGET_MILLISECONDS) break;
         }
     }
@@ -953,30 +928,23 @@ void ChunkStreamingGetStats(ChunkStreaming* streaming,
 {
     if (streaming == NULL || outStats == NULL) return;
 
-    outStats->queuedRequests = (uint64_t)InterlockedCompareExchange64(
-        &streaming->queuedRequests, 0, 0);
-    outStats->completedBuilds = (uint64_t)InterlockedCompareExchange64(
-        &streaming->completedBuilds, 0, 0);
-    outStats->cancelledBuilds = (uint64_t)InterlockedCompareExchange64(
-        &streaming->cancelledBuilds, 0, 0);
-    outStats->discardedBuilds = (uint64_t)InterlockedCompareExchange64(
-        &streaming->discardedBuilds, 0, 0);
-    outStats->uploadedMeshes = (uint64_t)InterlockedCompareExchange64(
-        &streaming->uploadedMeshes, 0, 0);
-    LONG64 totalTicks = InterlockedCompareExchange64(
-        &streaming->totalBuildTicks, 0, 0);
+    outStats->queuedRequests = (uint64_t)PlatformAtomicLoadI64(&streaming->queuedRequests);
+    outStats->completedBuilds = (uint64_t)PlatformAtomicLoadI64(&streaming->completedBuilds);
+    outStats->cancelledBuilds = (uint64_t)PlatformAtomicLoadI64(&streaming->cancelledBuilds);
+    outStats->discardedBuilds = (uint64_t)PlatformAtomicLoadI64(&streaming->discardedBuilds);
+    outStats->uploadedMeshes = (uint64_t)PlatformAtomicLoadI64(&streaming->uploadedMeshes);
+    int64_t totalMicroseconds = PlatformAtomicLoadI64(&streaming->totalBuildMicroseconds);
 
-    AcquireSRWLockShared(&streaming->queueLock);
+    PlatformMutexLock(&streaming->queueLock);
     outStats->pendingRequests = streaming->requestCount;
     outStats->pendingResults = streaming->resultCount;
     outStats->peakUnfinishedWork = streaming->peakUnfinishedWork;
-    ReleaseSRWLockShared(&streaming->queueLock);
+    PlatformMutexUnlock(&streaming->queueLock);
 
-    outStats->averageBuildMilliseconds = outStats->completedBuilds > 0
-        ? (double)totalTicks * 1000.0
-            / ((double)streaming->performanceFrequency.QuadPart
-                * (double)outStats->completedBuilds)
-        : 0.0;
+    outStats->averageBuildMilliseconds =
+        outStats->completedBuilds > 0
+            ? (double)totalMicroseconds / (1000.0 * (double)outStats->completedBuilds)
+            : 0.0;
 }
 
 static void ExpandFrustumPlanesForChunk(float planes[6][4])
@@ -1065,7 +1033,9 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
             chunkOriginRelative[1] + (float)(CHUNK_SIZE / 2),
             chunkOriginRelative[2] + (float)(CHUNK_SIZE / 2),
         };
-        if (!FrustumContainsChunkCenter(planes, center))
+        // До C23 массив float[6][4] не приводится к const float(*)[4]
+        // неявно, поэтому квалификатор добавляется явно.
+        if (!FrustumContainsChunkCenter((const float (*)[4])planes, center))
         {
             continue;
         }

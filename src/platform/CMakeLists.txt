@@ -76,8 +76,10 @@ else()
 endif()
 add_library(laiue::platform_support ALIAS laiue_platform_support)
 
-# The window boundary is part of the optional Windows graphics layer.
-if(LAIUE_BUILD_GRAPHICS)
+# Окно — часть графического слоя и пока написано на Win32. Профиль Vulkan
+# первого этапа рисует offscreen, поэтому окна в нём нет; нативный
+# Wayland/X11-бэкенд появится вместе со swapchain.
+if(LAIUE_BUILD_GRAPHICS AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
     laiue_add_module(window
         RUNTIME_ROLE GRAPHICS
         SOURCES

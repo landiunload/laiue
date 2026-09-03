@@ -4,6 +4,16 @@ if(POLICY CMP0184)
     cmake_policy(SET CMP0184 NEW)
     set(CMAKE_MSVC_RUNTIME_CHECKS "")
 endif()
+if(POLICY CMP0141)
+    # Отладочная информация встраивается в объектный файл (/Z7), а не
+    # пишется в общий PDB: no-CRT сборке не нужен отдельный файл, а
+    # компиляция не сериализуется на записи в него. Формат задаётся один
+    # раз политикой; иначе CMake добавил бы свой /Zi и компилятор ругался
+    # бы на переопределение в каждой единице трансляции.
+    cmake_policy(SET CMP0141 NEW)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+        "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
 
 project(laiue
     VERSION 0.7.0
@@ -23,22 +33,36 @@ else()
     set(_laiue_graphics_default OFF)
 endif()
 option(LAIUE_BUILD_GRAPHICS
-    "Build the Windows window/input/audio/mesher/render/scene/UI layer"
+    "Build the window/input/audio/mesher/render/scene/UI layer"
     ${_laiue_graphics_default})
-if(LAIUE_BUILD_GRAPHICS AND NOT LAIUE_PLATFORM_WINDOWS)
-    message(FATAL_ERROR
-        "LAIUE_BUILD_GRAPHICS is currently supported only on Windows")
+
+# Набор графических модулей задаёт бэкенд, а не платформа. D3D12 несёт
+# весь слой; Vulkan на первом этапе — мешер и offscreen-рендер, потому
+# что окно, ввод, звук, сцена и шрифты интерфейса всё ещё написаны прямо
+# на Win32/GDI. Звук переносим целиком: микшер платформы не знает, а
+# вывод у него свой на каждой. Список выводится в конфигурации, чтобы
+# неполнота профиля была видна, а не подразумевалась.
+if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input audio mesh render scene ui)
+else()
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES audio mesh render scene)
 endif()
 
 include(LaiueToolchain)
 include(LaiueModule)
 include(LaiueShader)
 include(LaiueArchitecture)
+include(LaiueStandaloneExecutable)
 
 if(LAIUE_BUILD_GRAPHICS AND NOT (LAIUE_TARGET_X86_64 OR LAIUE_TARGET_ARM64))
     message(FATAL_ERROR
-        "The D3D12 graphics implementation supports x86_64 and ARM64; "
+        "The graphics implementation supports x86_64 and ARM64; "
         "use LAIUE_BUILD_GRAPHICS=OFF for the portable core")
+endif()
+if(LAIUE_BUILD_GRAPHICS)
+    message(STATUS
+        "laiue graphics modules (${LAIUE_RENDER_BACKEND_RESOLVED}): "
+        "${LAIUE_GRAPHICS_MODULE_DIRECTORIES}")
 endif()
 
 add_custom_target(laiue_architecture_check ALL
@@ -52,6 +76,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>")
 
+add_subdirectory(src/math)
 add_subdirectory(src/platform)
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
@@ -59,12 +84,9 @@ add_subdirectory(src/content)
 add_subdirectory(src/mod)
 
 if(LAIUE_BUILD_GRAPHICS)
-    add_subdirectory(src/input)
-    add_subdirectory(src/audio)
-    add_subdirectory(src/mesh)
-    add_subdirectory(src/render)
-    add_subdirectory(src/scene)
-    add_subdirectory(src/ui)
+    foreach(graphics_directory IN LISTS LAIUE_GRAPHICS_MODULE_DIRECTORIES)
+        add_subdirectory("src/${graphics_directory}")
+    endforeach()
 endif()
 
 get_property(LAIUE_RUNTIME_TARGETS GLOBAL PROPERTY LAIUE_RUNTIME_TARGETS)
@@ -134,21 +156,34 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/mod/mod_types.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
     COMPONENT Engine)
-if(LAIUE_BUILD_GRAPHICS)
+# Заголовки ставятся по собранным целям, а не по одному флагу графики:
+# набор графических модулей зависит от бэкенда, и SDK не должен обещать
+# заголовок модуля, которого в сборке нет.
+if(TARGET laiue_window)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/platform/window.h"
             "${PROJECT_SOURCE_DIR}/src/platform/time.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/platform"
         COMPONENT Engine)
+endif()
+if(TARGET laiue_input)
     install(FILES "${PROJECT_SOURCE_DIR}/src/input/input.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/input"
         COMPONENT Engine)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/audio/audio.h"
+endif()
+if(TARGET laiue_audio)
+    install(FILES
+            "${PROJECT_SOURCE_DIR}/src/audio/audio.h"
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_pack.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
         COMPONENT Engine)
+endif()
+if(TARGET laiue_mesher)
     install(FILES "${PROJECT_SOURCE_DIR}/src/mesh/chunk_mesher.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh"
         COMPONENT Engine)
+endif()
+if(TARGET laiue_render)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/render/chunk_geometry.h"
             "${PROJECT_SOURCE_DIR}/src/render/renderer.h"
@@ -156,6 +191,8 @@ if(LAIUE_BUILD_GRAPHICS)
             "${PROJECT_SOURCE_DIR}/src/render/texture_pack.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/render"
         COMPONENT Engine)
+endif()
+if(TARGET laiue_scene)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/scene/camera.h"
             "${PROJECT_SOURCE_DIR}/src/scene/chunk_streaming.h"
@@ -164,6 +201,8 @@ if(LAIUE_BUILD_GRAPHICS)
             "${PROJECT_SOURCE_DIR}/src/scene/voxel_raycast.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
         COMPONENT Engine)
+endif()
+if(TARGET laiue_ui)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/ui/ui.h"
             "${PROJECT_SOURCE_DIR}/src/ui/ui_font.h"
@@ -238,6 +277,15 @@ else()
     set(CPACK_GENERATOR TGZ)
 endif()
     include(CPack)
+endif()
+
+option(LAIUE_BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)
+if(LAIUE_BUILD_BENCHMARKS)
+    if(NOT TARGET laiue_mesher OR NOT TARGET laiue_audio)
+        message(FATAL_ERROR
+            "Бенчмарк измеряет мешер и микшер; включите LAIUE_BUILD_GRAPHICS")
+    endif()
+    add_subdirectory(benchmarks)
 endif()
 
 include(CTest)

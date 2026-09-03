@@ -2,8 +2,9 @@
 
 `laiue` 0.7.0 — встраиваемый воксельный движок на C17. Репозиторий
 содержит библиотечные runtime-модули: бесконечные координаты и разреженный
-мир, физику, построение чанковых мешей, D3D12-рендер, окно, ввод, аудио,
-сцену, UI, каталог визуального содержимого и host для нативных модов.
+мир, физику, построение чанковых мешей, рендер на D3D12 или Vulkan, окно,
+ввод, микшер звука, сцену, UI, каталог визуального содержимого и host для
+нативных модов.
 
 Текущий прикладной проект на этом движке —
 [landiunload/simulation-of-sins](https://github.com/landiunload/simulation-of-sins).
@@ -28,9 +29,10 @@
 | `physics` | переносимые AABB и столкновения с вокселями |
 | `content` | безопасные имена, категории и выбор паков |
 | `mod` | discovery, ABI v1, versioned services и жизненный цикл нативных модов |
-| `window`, `input`, `audio` | Windows-окно, Raw Input и Media Foundation |
+| `window`, `input` | Windows-окно и Raw Input |
+| `audio` | микшер голосов и звукопаки; WASAPI на Windows, ALSA на Linux |
 | `mesh` | greedy meshing чанков `64³` |
-| `render` | Direct3D 12, GPU-меши, текстуры и шейдеры |
+| `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
 | `scene` | камера, streaming, panorama и voxel raycast |
 | `ui` | immediate-mode UI поверх renderer |
 
@@ -44,9 +46,9 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 |---|---:|---:|
 | Windows x86_64 | CI | D3D12, CI |
 | Windows ARM64 | clang-cl собран и слинкован локально; native CI job | D3D12 собирается; на устройстве не запускался |
-| Linux x86_64 | glibc и musl, проверено в Docker | ещё нет графического backend |
-| Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | ещё нет графического backend |
-| Steam Deck / SteamOS | Linux x86_64 core | нужен Vulkan/input/audio client |
+| Linux x86_64 | glibc и musl, проверено в Docker | Vulkan рисует кадр offscreen, CI на lavapipe; окна, ввода и звука нет |
+| Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | Vulkan-профиль не собирался на ARM64 |
+| Steam Deck / SteamOS | Linux x86_64 core | Vulkan-рендер собирается, но клиенту нужны окно, ввод и звук |
 | macOS arm64/x86_64 | macOS 11+, native CI настроен, локально не запускался | ещё нет Metal backend |
 | Android ARM64 | NDK r29: static core и финальный `.so` собраны локально, CI настроен | ещё нет APK/Vulkan/input/audio shell |
 | iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | ещё нет приложения/Metal backend |
@@ -57,8 +59,10 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 ## Сборка
 
 Требуется CMake 3.28+ и компилятор C17. На Windows поддерживаются MSVC и
-`clang-cl`; для графики нужен Windows SDK с Direct3D 12 и `fxc`. Если `fxc`
-не найден, используются закоммиченные fallback-заголовки шейдеров.
+`clang-cl`; для графики нужен Windows SDK с Direct3D 12 и `fxc`. Для
+Vulkan-профиля нужен `glslang`. Если компилятор шейдеров не найден,
+используются закоммиченные fallback-заголовки: по одному набору на
+бэкенд, `src/render/generated/d3d12/` и `src/render/generated/vulkan/`.
 
 ```powershell
 # Visual Studio/MSVC
@@ -79,6 +83,21 @@ cmake --preset linux-gcc
 cmake --build --preset linux-gcc-release --parallel
 ctest --preset linux-gcc-release
 ```
+
+Vulkan-рендер на Linux рисует кадр offscreen — без окна и swapchain.
+Видеокарта не нужна: программный `lavapipe` из Mesa даёт устройство
+Vulkan 1.4, и тест сверяет кадр по пикселям:
+
+```sh
+sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers     spirv-tools vulkan-validationlayers
+cmake --preset linux-vulkan-offscreen
+cmake --build --preset linux-vulkan-offscreen-release --parallel
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json     ctest --preset linux-vulkan-offscreen-release --no-tests=error
+```
+
+Этот профиль собирает `mesh` и `render`; окно, ввод, звук, сцену и
+интерфейс он не содержит, поэтому игровым клиентом ещё не является.
+Подробности — в [docs/portability.md](docs/portability.md).
 
 macOS core проверяется нативно на обеих архитектурах:
 
@@ -175,7 +194,9 @@ Xbox, PlayStation и Nintendo пока не являются поддержив�
 официальным toolchain после одобрения разработчика. Без SDK и dev/test
 hardware нельзя заявлять, что консольная сборка, рендер, ввод, packaging,
 shader/texture packs или физический hash работают. Steam Deck относится к
-Linux x86_64, но до Vulkan backend это только core, не игровой клиент.
+Linux x86_64: его core и Vulkan-рендер собираются из существующих presets,
+но без окна, ввода и звука это ещё не игровой клиент, и на самом
+устройстве ничего не запускалось.
 
 ## Мир приложения
 

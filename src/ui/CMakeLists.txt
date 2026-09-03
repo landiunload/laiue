@@ -9,6 +9,7 @@ laiue_add_module(ui
         ui_format.h
         ../api.h
     LINK
+        laiue::math_support
         laiue_render
         laiue_scene
     WINDOWS_LINK

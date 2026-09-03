@@ -17,6 +17,17 @@ static const LaiueContentFormat g_formats[LAIUE_CONTENT_TYPE_COUNT] = {
         L"Текстурпак", L"textures", L".ltp",
         LAIUE_CONTENT_STORAGE_FILE, true,
     },
+    [LAIUE_CONTENT_SOUND] = {
+        L"Звук", L"sounds", L".la",
+        LAIUE_CONTENT_STORAGE_FILE, false,
+    },
+    // Звукопак — каталог, а не один файл: имена звуков задаёт приложение,
+    // и заменить один звук должно быть можно, положив рядом файл с тем же
+    // именем. Тот же приём у шейдерпаков.
+    [LAIUE_CONTENT_SOUND_PACK] = {
+        L"Звукопак", L"sounds", L".lap",
+        LAIUE_CONTENT_STORAGE_DIRECTORY, true,
+    },
 };
 
 static wchar_t AsciiLower(wchar_t character)

@@ -21,10 +21,13 @@
     {
       "name": "windows-msvc",
       "displayName": "Windows x64 + MSVC",
-      "description": "Core and D3D12 graphics engine libraries",
+      "description": "Core and D3D12 graphics engine libraries; запускать из Developer Shell нужной архитектуры",
       "inherits": "windows-base",
-      "generator": "Visual Studio 17 2022",
-      "architecture": "x64"
+      "generator": "Ninja Multi-Config",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "windows-clang",
@@ -41,11 +44,12 @@
     {
       "name": "windows-msvc-arm64",
       "displayName": "Windows ARM64 + MSVC",
-      "description": "Core and D3D12 graphics engine libraries for Windows on ARM",
+      "description": "Core and D3D12 graphics engine libraries for Windows on ARM; запускать из Developer Shell нужной архитектуры",
       "inherits": "windows-base",
-      "generator": "Visual Studio 17 2022",
-      "architecture": "ARM64",
+      "generator": "Ninja Multi-Config",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_DEFAULT_BUILD_TYPE": "Release",
         "LAIUE_EXPECTED_ARCHITECTURE": "arm64"
       }
     },
@@ -141,6 +145,18 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "gcc",
         "LAIUE_LINUX_LIBC": "musl"
+      }
+    },
+    {
+      "name": "linux-vulkan-offscreen",
+      "displayName": "Linux x64 Vulkan offscreen renderer",
+      "description": "Mesher and Vulkan renderer without a window; needs a Vulkan driver to test",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_LINUX_LIBC": "gnu",
+        "LAIUE_RENDER_BACKEND": "VULKAN"
       }
     },
     {
@@ -420,6 +436,16 @@
       "configurePreset": "linux-musl"
     },
     {
+      "name": "linux-vulkan-offscreen-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-vulkan-offscreen"
+    },
+    {
+      "name": "linux-vulkan-offscreen-release",
+      "inherits": "linux-build-release",
+      "configurePreset": "linux-vulkan-offscreen"
+    },
+    {
       "name": "linux-external-port-smoke-release",
       "inherits": "linux-build-release",
       "configurePreset": "linux-external-port-smoke"
@@ -488,7 +514,9 @@
       "name": "windows-test-debug",
       "hidden": true,
       "configuration": "Debug",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -499,7 +527,9 @@
       "name": "windows-test-release",
       "hidden": true,
       "configuration": "Release",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -510,7 +540,9 @@
       "name": "linux-test-debug",
       "hidden": true,
       "configuration": "Debug",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -521,7 +553,9 @@
       "name": "linux-test-release",
       "hidden": true,
       "configuration": "Release",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -532,7 +566,9 @@
       "name": "macos-test-debug",
       "hidden": true,
       "configuration": "Debug",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -543,7 +579,9 @@
       "name": "macos-test-release",
       "hidden": true,
       "configuration": "Release",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -644,6 +682,16 @@
       "name": "linux-musl-release",
       "inherits": "linux-test-release",
       "configurePreset": "linux-musl"
+    },
+    {
+      "name": "linux-vulkan-offscreen-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-vulkan-offscreen"
+    },
+    {
+      "name": "linux-vulkan-offscreen-release",
+      "inherits": "linux-test-release",
+      "configurePreset": "linux-vulkan-offscreen"
     },
     {
       "name": "linux-external-port-smoke-release",

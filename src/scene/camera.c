@@ -1,5 +1,6 @@
 #include "scene/camera.h"
 #include "scene/math.h"
+#include "math/scalar.h"
 
 #define PITCH_LIMIT 1.570796f
 #define YAW_LIMIT   3.1415927f

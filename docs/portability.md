@@ -6,11 +6,11 @@
 |---|---:|---:|---|
 | Windows x86_64 | Tier 1 | Tier 1 | MSVC или clang-cl, no-CRT runtime |
 | Windows ARM64 | clang-cl собран локально | собирается, не запускался | MSVC или clang-cl, no-CRT runtime |
-| Debian x86_64 | Tier 1, Docker CI | — | glibc, GCC или Clang |
+| Debian x86_64 | Tier 1, Docker CI | Vulkan offscreen, CI на lavapipe | glibc, GCC или Clang |
 | Alpine x86_64 | проверено в Docker | — | musl, GCC |
 | Alpine ARM64 | проверено в Docker | — | musl, GCC |
 | Debian ARM64 | Docker-tested; native CI job | — | glibc, GCC |
-| Steam Deck / SteamOS | Linux x86_64 core | — | glibc, нужен будущий Vulkan client |
+| Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen собирается, на устройстве не запускался | glibc, нужны окно, ввод и звук |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | Android ARM64 | NDK r29: собрано и слинковано локально, CI настроен | — | API 28+, static external core |
@@ -20,12 +20,32 @@
 | Xbox / PlayStation / Nintendo | external seam | не заявлен | закрытый SDK и dev/test hardware |
 | WebAssembly/WebGPU | не заявлен | не заявлен | нужен отдельный web adapter |
 
-Core включает `platform_support`, `world`, `physics`, `content` и `mod`. Graphics
-добавляет `window`, `input`, `audio`, `mesh`, `render`, `scene` и `ui`.
-Linux- и macOS-графические backends пока отсутствуют; CI на этих системах
-подтверждает core/headless, но не окно, presentation, input, audio или
-пригодность игрового bundle. Попытка запросить отсутствующий backend должна
-завершаться понятной ошибкой configure.
+Core включает `platform_support`, `world`, `physics`, `content` и `mod`.
+Состав Graphics задаёт бэкенд рендера, а не платформа:
+
+| Бэкенд | Графические модули | Чего нет |
+|---|---|---|
+| `D3D12` | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
+| `VULKAN` | `audio`, `mesh`, `render`, `scene` | окно, ввод, интерфейс |
+
+Профиль Vulkan первого этапа рисует кадр offscreen: `RendererCreate`
+принимает только `NULL` вместо оконного хендла, а результат читается
+`RendererCaptureFrame` из `render/renderer_offscreen.h`. Этого достаточно,
+чтобы проверять рендер по пикселям на программном драйвере, но не
+достаточно для игрового клиента: swapchain, нативное окно Wayland/X11 и
+ввод через evdev — отдельные этапы. Вместе с ними переносится `ui`: он
+растеризует шрифты через GDI.
+
+Список собираемых графических модулей печатается при configure, чтобы
+неполнота профиля была видна, а не подразумевалась. Попытка запросить
+отсутствующий backend завершается понятной ошибкой configure: `D3D12` вне
+Windows отвергается сразу.
+
+Звук и сцена переносимы целиком: микшер не знает платформы, а вывод у
+него свой на каждой (WASAPI и ALSA), потоковый стриминг чанков работает
+через контракт потоков платформенного слоя. Вне Vulkan-профиля остаются
+окно и интерфейс: первое написано на Win32, второй растеризует шрифты
+через GDI.
 
 ## Опции CMake
 
@@ -37,6 +57,7 @@ Linux- и macOS-графические backends пока отсутствуют;
 | `LAIUE_NATIVE_MOD_MODE` | desktop: `DYNAMIC`, external: `OFF` | политика загружаемого native-кода; data/content packs этим не запрещаются |
 | `LAIUE_ENABLE_SDK_INSTALL` | desktop: `ON`, external: `OFF` | install/export SDK; внешний порт линкуется из родительского superbuild |
 | `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux/macOS: `OFF` | доступный платформенный графический набор |
+| `LAIUE_RENDER_BACKEND` | `AUTO` | `D3D12` (только Windows) либо переносимый `VULKAN`; `AUTO` выбирает по платформе |
 | `LAIUE_WARNINGS_AS_ERRORS` | `ON` | считать предупреждения ошибками |
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
 | `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
@@ -88,6 +109,7 @@ macOS ARM64 должен подтвердить его собственным н
 | `linux-clang-arm64` | Ninja Multi-Config | `linux-clang-arm64-debug`, `linux-clang-arm64-release` |
 | `linux-musl` | Ninja Multi-Config | `linux-musl-debug`, `linux-musl-release` |
 | `linux-gcc-asan` | Ninja Multi-Config | `linux-gcc-asan-debug` |
+| `linux-vulkan-offscreen` | Ninja Multi-Config | `linux-vulkan-offscreen-debug`, `linux-vulkan-offscreen-release` |
 | `linux-external-port-smoke` | Ninja Multi-Config | `linux-external-port-smoke-release` |
 | `macos-clang-arm64` | Ninja Multi-Config | `macos-clang-arm64-debug`, `macos-clang-arm64-release` |
 | `macos-clang-x86_64` | Ninja Multi-Config | `macos-clang-x86_64-debug`, `macos-clang-x86_64-release` |
@@ -168,6 +190,51 @@ Linux ARM64 фактически проверен отдельной Docker-сб
 GitHub Actions использует нативный `ubuntu-24.04-arm` runner и отдельное
 дерево `build/linux-gcc-arm64`; x86_64 presets для этой цели не используются.
 
+## Vulkan offscreen на Linux
+
+Нужны CMake 3.28+, Ninja, GCC или Clang, заголовки Vulkan и любой драйвер.
+GPU не обязателен: программный `lavapipe` из Mesa даёт устройство Vulkan 1.4
+и позволяет проверять рендер там, где видеокарты нет вовсе — именно так
+кадр проверяется в CI.
+
+```sh
+sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers     spirv-tools vulkan-validationlayers
+cmake --preset linux-vulkan-offscreen
+cmake --build --preset linux-vulkan-offscreen-release --parallel
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json     ctest --preset linux-vulkan-offscreen-release --no-tests=error
+```
+
+Тест `laiue.render.offscreen_frame` рисует кадр целиком и сверяет пиксели:
+очистку небом, положение квада, инстансный путь, шесть граней панорамы с
+резолвом, слой интерфейса и изменение размера. Прогонять его стоит со
+слоями проверки Khronos — без них драйвер молча прощает часть нарушений
+спецификации:
+
+```sh
+VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation     ctest --preset linux-vulkan-offscreen-debug --no-tests=error
+```
+
+### Шейдеры
+
+Исходник шейдера один и тот же HLSL в `shaders/`. Для D3D12 его собирает
+`fxc` в DXBC, для Vulkan — `glslang` в SPIR-V; результаты лежат в
+`src/render/generated/d3d12/` и `src/render/generated/vulkan/` и хранятся в
+репозитории, поэтому сборка без компилятора шейдеров работает на любой
+платформе. Цель `laiue_verify_shaders` сверяет checked-in файлы с тем, что
+компилятор выдаёт из исходника, побайтово.
+
+Раскладка дескрипторов задаётся сдвигами регистров, а не правкой HLSL:
+`fxc` не понимает `[[vk::binding]]`, а общий исходник важнее. Сдвиги
+переводят регистры в один descriptor set без коллизий — `b0` в binding 0,
+`t0`..`t3` в 1..4, `s0` в 5. `ByteAddressBuffer` относится к классу SSBO, а
+не текстур, поэтому ему нужен отдельный сдвиг с тем же значением: оба
+класса нумеруются в общем пространстве `t`-регистров.
+
+Правила упаковки констант HLSL glslang переносит в SPIR-V без изменений,
+поэтому структура констант кадра в C общая для обоих бэкендов. Ось Y
+возвращается к соглашению D3D отрицательной высотой viewport — иначе
+кадр оказался бы перевёрнут, а обход граней инвертирован.
+
 ## macOS core
 
 Нужны CMake 3.28+, Ninja и AppleClang. Каждый configure tree содержит ровно
@@ -213,6 +280,16 @@ cmake --install build/linux-gcc --config Release \
 ## Платформенный код
 
 - Native API изолируется в `src/platform` и специализированных backend-файлах.
+- Переносимые модули (`content`, `mesh`, `mod`, `physics`, `runtime`,
+  `scene`, `world`)
+  включают только стандартные заголовки C и интринсики процессора; память,
+  время, файлы и потоки они получают через `platform/system.h`. Правило
+  проверяется `tools/check_architecture.cmake` и существует потому, что
+  проверка границ между модулями смотрит только на `"..."`-включения:
+  обращение прямо в системный API через угловые скобки она не видит, и
+  мешер именно так вызывал `HeapAlloc` в обход платформенного слоя.
+- Модули `render`, `ui`, `audio` и `input` привязаны к платформе или
+  бэкенду осознанно и в это правило не входят.
 - Внутренние пути канонизируются как UTF-8 с `/`; platform boundary
   преобразует их в native representation.
 - Указатели, `wchar_t` и native structs не записываются в переносимые файлы.

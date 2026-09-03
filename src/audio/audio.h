@@ -5,9 +5,32 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Независимый потоковый проигрыватель. Экземпляров может быть несколько;
-// каждый владеет своим источником, громкостью и очередью событий.
-typedef struct AudioPlayer AudioPlayer;
+// Микшер голосов с низкой задержкой. Устройство владеет одним потоком
+// вывода и смешивает в него активные голоса; приложение управляет
+// голосами из своего потока и никогда не блокирует поток вывода.
+//
+// Границы модуля: движок отвечает за вывод, смешивание, громкость,
+// панораму и скорость воспроизведения. Расстояние, затухание, реверб и
+// прочая пространственная политика принадлежат приложению — оно
+// вычисляет громкость и панораму сам, как вычисляет свет для рендера.
+//
+// Чужие контейнеры движок не декодирует: клип создаётся из готовых
+// PCM-сэмплов. Свой формат `.la` и звукопаки живут в audio_pack.h — так
+// у движка нет ни зависимости от кодеков, ни мнения о форматах файлов
+// приложения.
+
+typedef struct AudioDevice AudioDevice;
+typedef struct AudioClip AudioClip;
+
+// Дескриптор голоса. Ноль означает «голос не выдан»; ненулевые значения
+// не повторяются на протяжении жизни устройства достаточно долго, чтобы
+// устаревший дескриптор нельзя было применить к чужому голосу.
+typedef uint32_t AudioVoice;
+#define AUDIO_VOICE_NONE 0u
+
+// Одновременно звучащих голосов не больше этого числа; попытка сверх
+// лимита возвращает AUDIO_VOICE_NONE, а не вытесняет чужой звук.
+#define AUDIO_MAX_VOICES 128u
 
 typedef enum AudioResult
 {
@@ -21,116 +44,85 @@ typedef enum AudioResult
     AUDIO_RESULT_OPERATION_FAILED,
 } AudioResult;
 
-typedef enum AudioPlaybackState
+typedef enum AudioBackendKind
 {
-    AUDIO_PLAYBACK_EMPTY = 0,
-    AUDIO_PLAYBACK_LOADING,
-    AUDIO_PLAYBACK_READY,
-    AUDIO_PLAYBACK_PLAYING,
-    AUDIO_PLAYBACK_PAUSED,
-    AUDIO_PLAYBACK_BUFFERING,
-    AUDIO_PLAYBACK_ENDED,
-    AUDIO_PLAYBACK_ERROR,
-} AudioPlaybackState;
+    // Системное устройство вывода: WASAPI на Windows, ALSA на Linux.
+    AUDIO_BACKEND_SYSTEM = 0,
+    // Вывода нет; кадры отдаёт AudioDeviceRenderFrames. Существует для
+    // тестов и для профилей без звуковой подсистемы.
+    AUDIO_BACKEND_OFFSCREEN = 1,
+} AudioBackendKind;
 
-typedef enum AudioStreamError
+typedef struct AudioDeviceConfiguration
 {
-    AUDIO_STREAM_ERROR_NONE = 0,
-    AUDIO_STREAM_ERROR_ABORTED,
-    AUDIO_STREAM_ERROR_NETWORK,
-    AUDIO_STREAM_ERROR_DECODE,
-    AUDIO_STREAM_ERROR_SOURCE_NOT_SUPPORTED,
-    AUDIO_STREAM_ERROR_ENCRYPTED,
-    AUDIO_STREAM_ERROR_UNKNOWN,
-} AudioStreamError;
+    AudioBackendKind backend;
+    // Ноль означает «выбрать частоту устройства»; для offscreen — 48000.
+    uint32_t sampleRate;
+    // Ноль означает «выбрать по умолчанию». Смешивание всегда стерео.
+    uint32_t frameCountHint;
+    float masterVolume;   // 0..1, значения вне диапазона ограничиваются
+} AudioDeviceConfiguration;
 
-typedef enum AudioEventType
+typedef struct AudioDeviceStats
 {
-    AUDIO_EVENT_LOADING = 0,
-    AUDIO_EVENT_READY,
-    AUDIO_EVENT_PLAYING,
-    AUDIO_EVENT_PAUSED,
-    AUDIO_EVENT_BUFFERING_STARTED,
-    AUDIO_EVENT_BUFFERING_ENDED,
-    AUDIO_EVENT_SEEK_COMPLETED,
-    AUDIO_EVENT_ENDED,
-    AUDIO_EVENT_DURATION_CHANGED,
-    AUDIO_EVENT_VOLUME_CHANGED,
-    AUDIO_EVENT_CLEARED,
-    AUDIO_EVENT_ERROR,
-} AudioEventType;
+    uint32_t sampleRate;
+    uint32_t channelCount;
+    uint32_t bufferFrameCount;
+    uint32_t activeVoices;
+    // Команды, отброшенные из-за переполнения очереди: приложение
+    // отправляет их быстрее, чем поток вывода успевает разбирать.
+    uint64_t droppedCommands;
+    // Буферы, которые поток вывода не успел подготовить вовремя.
+    uint64_t underruns;
+    uint64_t mixedFrames;
+} AudioDeviceStats;
 
-typedef struct AudioEvent
+// Сэмплы 16-битные знаковые, чередующиеся по каналам. Клип копирует их
+// при создании и не удерживает указатель.
+typedef struct AudioClipDescription
 {
-    AudioEventType type;
-    AudioStreamError streamError;
-    // HRESULT Windows для диагностики; 0, если событие его не содержит.
-    int32_t platformCode;
-} AudioEvent;
+    const int16_t *samples;
+    uint32_t frameCount;
+    uint32_t channelCount;   // 1 или 2
+    uint32_t sampleRate;     // частота исходных сэмплов
+} AudioClipDescription;
 
-typedef struct AudioPlayerConfiguration
+typedef struct AudioVoiceParameters
 {
-    // Диапазон 0..1; значение ограничивается этим диапазоном.
-    float initialVolume;
-    bool initiallyMuted;
+    float volume;    // 0..1
+    float pan;       // -1 слева, 0 по центру, +1 справа
+    float speed;     // 1 — исходная скорость; влияет и на высоту тона
     bool looping;
-} AudioPlayerConfiguration;
+} AudioVoiceParameters;
 
-typedef struct AudioPlayerSnapshot
-{
-    AudioPlaybackState state;
-    AudioStreamError streamError;
-    int32_t platformCode;
+// NULL-конфигурация означает системный бэкенд, частоту устройства и
+// громкость 1. Создавать и уничтожать устройство следует на одном потоке.
+LAIUE_AUDIO_API AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
+                                              AudioDevice **outDevice);
+LAIUE_AUDIO_API void AudioDeviceDestroy(AudioDevice *device);
+LAIUE_AUDIO_API void AudioDeviceSetMasterVolume(AudioDevice *device, float volume);
+LAIUE_AUDIO_API float AudioDeviceGetMasterVolume(const AudioDevice *device);
+LAIUE_AUDIO_API bool AudioDeviceGetStats(const AudioDevice *device, AudioDeviceStats *outStats);
 
-    // Неизвестные длительность и позиция представлены нулём.
-    double positionSeconds;
-    double durationSeconds;
-    float volume;
+// Клип живёт независимо от голосов: остановка голоса его не разрушает.
+// Разрушить клип можно и во время звучания — движок сам остановит его
+// голоса и освободит память тогда, когда поток вывода на неё больше не
+// смотрит. Порядок «сначала остановить, потом разрушить» остаётся
+// предпочтительным: он не обрывает звук на середине.
+LAIUE_AUDIO_API AudioResult AudioClipCreate(AudioDevice *device,
+                                            const AudioClipDescription *description,
+                                            AudioClip **outClip);
+LAIUE_AUDIO_API void AudioClipDestroy(AudioClip *clip);
+LAIUE_AUDIO_API double AudioClipDurationSeconds(const AudioClip *clip);
 
-    bool muted;
-    bool looping;
-    bool seeking;
-    bool seekable;
-    bool hasAudio;
-} AudioPlayerSnapshot;
-
-// NULL-конфигурация означает volume=1, muted=false, looping=false.
-// COM и Media Foundation инициализируются внутри; создавать и уничтожать
-// проигрыватель следует на одном клиентском потоке.
-LAIUE_AUDIO_API AudioResult AudioPlayerCreate(
-    const AudioPlayerConfiguration* configuration, AudioPlayer** outPlayer);
-LAIUE_AUDIO_API void AudioPlayerDestroy(AudioPlayer* player);
-
-// URI принимает http://, https:// и file://. Загрузка асинхронна: успешный
-// возврат означает, что запрос принят; итог приходит через AUDIO_EVENT_READY
-// либо AUDIO_EVENT_ERROR.
-LAIUE_AUDIO_API AudioResult AudioPlayerLoadUri(
-    AudioPlayer* player, const wchar_t* uri);
-// Преобразует абсолютный или относительный путь Windows в file:// URI.
-LAIUE_AUDIO_API AudioResult AudioPlayerLoadFile(
-    AudioPlayer* player, const wchar_t* path);
-LAIUE_AUDIO_API AudioResult AudioPlayerClear(AudioPlayer* player);
-
-LAIUE_AUDIO_API AudioResult AudioPlayerPlay(AudioPlayer* player);
-LAIUE_AUDIO_API AudioResult AudioPlayerPause(AudioPlayer* player);
-LAIUE_AUDIO_API AudioResult AudioPlayerStop(AudioPlayer* player);
-LAIUE_AUDIO_API AudioResult AudioPlayerSeek(
-    AudioPlayer* player, double positionSeconds);
-
-LAIUE_AUDIO_API AudioResult AudioPlayerSetVolume(
-    AudioPlayer* player, float volume);
-LAIUE_AUDIO_API AudioResult AudioPlayerSetMuted(
-    AudioPlayer* player, bool muted);
-LAIUE_AUDIO_API AudioResult AudioPlayerSetLooping(
-    AudioPlayer* player, bool looping);
-
-// Snapshot безопасно читать из главного потока, пока callbacks Media
-// Foundation обновляют состояние на своём рабочем потоке.
-LAIUE_AUDIO_API bool AudioPlayerGetSnapshot(
-    const AudioPlayer* player, AudioPlayerSnapshot* outSnapshot);
-
-// Неблокирующая очередь. События доставляются в порядке поступления;
-// при переполнении сохраняются 32 самых новых события.
-LAIUE_AUDIO_API bool AudioPlayerPollEvent(
-    AudioPlayer* player, AudioEvent* outEvent);
-
+// NULL-параметры означают громкость 1, центр, исходную скорость, без
+// повтора. Возвращает AUDIO_VOICE_NONE, если свободных голосов нет.
+LAIUE_AUDIO_API AudioVoice AudioVoicePlay(AudioDevice *device, const AudioClip *clip,
+                                          const AudioVoiceParameters *parameters);
+// Изменение параметров звучащего голоса. Устаревший дескриптор
+// игнорируется и возвращает false.
+LAIUE_AUDIO_API bool AudioVoiceSetParameters(AudioDevice *device, AudioVoice voice,
+                                             const AudioVoiceParameters *parameters);
+LAIUE_AUDIO_API void AudioVoiceStop(AudioDevice *device, AudioVoice voice);
+LAIUE_AUDIO_API void AudioDeviceStopAllVoices(AudioDevice *device);
+LAIUE_AUDIO_API bool AudioVoiceIsActive(const AudioDevice *device, AudioVoice voice);

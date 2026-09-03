@@ -19,13 +19,30 @@ laiue_compile_shader(ui
     FALLBACK_DIRECTORY "${fallback_directory}"
     OUTPUT_VARIABLE ui_shader_headers)
 
+if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN")
+    find_package(Vulkan REQUIRED)
+    set(backend_sources
+        renderer_vulkan.c
+        renderer_offscreen.h)
+    set(backend_links Vulkan::Vulkan)
+else()
+    set(backend_sources
+        renderer_d3d12.c
+        ui_image_wic.c
+        ui_image_wic.h)
+    set(backend_links
+        d3d12
+        dxgi
+        dxguid
+        ole32
+        windowscodecs)
+endif()
+
 laiue_add_module(render
     RUNTIME_ROLE GRAPHICS
     SOURCES
-        renderer_d3d12.c
+        ${backend_sources}
         renderer.h
-        ui_image_wic.c
-        ui_image_wic.h
         shader_pack.c
         shader_pack.h
         texture_pack.c
@@ -39,13 +56,10 @@ laiue_add_module(render
     PUBLIC_LINK
         laiue_content
     LINK
-        d3d12
-        dxgi
-        dxguid
-        ole32
-        windowscodecs)
+        ${backend_links})
 
-# renderer_d3d12.c включает render/generated/*.h. Binary include идёт первым,
-# поэтому обычная сборка никогда не перезаписывает checked-in fallback.
+# Бэкенд включает render/generated/<backend>/*.h. Binary include идёт
+# первым, поэтому обычная сборка никогда не перезаписывает checked-in
+# fallback.
 target_include_directories(laiue_render BEFORE PRIVATE
     "${PROJECT_BINARY_DIR}/src")

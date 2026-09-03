@@ -5,12 +5,12 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
-#include "render/generated/chunk_vs.h"
-#include "render/generated/chunk_ps.h"
-#include "render/generated/panorama_vs.h"
-#include "render/generated/panorama_ps.h"
-#include "render/generated/ui_vs.h"
-#include "render/generated/ui_ps.h"
+#include "render/generated/d3d12/chunk_vs.h"
+#include "render/generated/d3d12/chunk_ps.h"
+#include "render/generated/d3d12/panorama_vs.h"
+#include "render/generated/d3d12/panorama_ps.h"
+#include "render/generated/d3d12/ui_vs.h"
+#include "render/generated/d3d12/ui_ps.h"
 #include "render/texture_pack_internal.h"
 #include "render/ui_image_wic.h"
 

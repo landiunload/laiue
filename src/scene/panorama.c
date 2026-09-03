@@ -1,6 +1,7 @@
 #include "scene/panorama.h"
 #include "scene/camera.h"
 #include "scene/math.h"
+#include "math/scalar.h"
 
 #include <string.h>
 

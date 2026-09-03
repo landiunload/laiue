@@ -11,11 +11,38 @@
  * 200 bytes on macOS against 56 on glibc and musl and 8 for SRWLOCK, so the
  * headroom follows Darwin. */
 #define LAIUE_PLATFORM_RWLOCK_STORAGE_WORDS 32U
+/* SRWLOCK и CONDITION_VARIABLE занимают по указателю, pthread-примитивы —
+ * от 40 до 64 байт в зависимости от libc. Запас берётся с той же логикой,
+ * что и у rwlock, а точный размер сверяется _Static_assert в реализации. */
+#define LAIUE_PLATFORM_MUTEX_STORAGE_WORDS 16U
+#define LAIUE_PLATFORM_CONDITION_STORAGE_WORDS 16U
 
 typedef struct PlatformRwLock
 {
     uintptr_t storage[LAIUE_PLATFORM_RWLOCK_STORAGE_WORDS];
 } PlatformRwLock;
+
+/* Мьютекс отделён от rwlock намеренно: условная переменная POSIX умеет
+ * ждать только на обычном мьютексе, а разделяемый захват нужен движку
+ * ровно в одном диагностическом месте. */
+typedef struct PlatformMutex
+{
+    uintptr_t storage[LAIUE_PLATFORM_MUTEX_STORAGE_WORDS];
+} PlatformMutex;
+
+typedef struct PlatformConditionVariable
+{
+    uintptr_t storage[LAIUE_PLATFORM_CONDITION_STORAGE_WORDS];
+} PlatformConditionVariable;
+
+typedef struct PlatformThread
+{
+    uintptr_t storage[2];
+} PlatformThread;
+
+/* Возвращаемое значение доходит только до PlatformThreadJoin; сообщать об
+ * ошибке рабочему потоку следует через собственное состояние. */
+typedef uint32_t (*PlatformThreadEntry)(void *context);
 
 typedef struct PlatformDirectoryIterator
 {
@@ -51,7 +78,31 @@ void PlatformRwLockReleaseShared(PlatformRwLock* lock);
 void PlatformRwLockAcquireExclusive(PlatformRwLock* lock);
 void PlatformRwLockReleaseExclusive(PlatformRwLock* lock);
 
+bool PlatformMutexInitialize(PlatformMutex *mutex);
+void PlatformMutexDestroy(PlatformMutex *mutex);
+void PlatformMutexLock(PlatformMutex *mutex);
+void PlatformMutexUnlock(PlatformMutex *mutex);
+
+bool PlatformConditionVariableInitialize(PlatformConditionVariable *condition);
+void PlatformConditionVariableDestroy(PlatformConditionVariable *condition);
+/* Вызывается с захваченным mutex; на время ожидания он отпускается. */
+void PlatformConditionVariableWait(PlatformConditionVariable *condition, PlatformMutex *mutex);
+void PlatformConditionVariableWakeOne(PlatformConditionVariable *condition);
+void PlatformConditionVariableWakeAll(PlatformConditionVariable *condition);
+
+/* Поток запускается сразу. PlatformThreadJoin обязателен: он и дожидается
+ * завершения, и освобождает описатель. */
+bool PlatformThreadStart(PlatformThread *thread, PlatformThreadEntry entry, void *context);
+void PlatformThreadJoin(PlatformThread *thread);
+
+/* Число логических процессоров, доступных процессу; не меньше единицы. */
+uint32_t PlatformLogicalProcessorCount(void);
+
 uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value);
+uint32_t PlatformAtomicIncrementU32(volatile uint32_t *value);
+int64_t PlatformAtomicLoadI64(const volatile int64_t *value);
+int64_t PlatformAtomicAddI64(volatile int64_t *value, int64_t addend);
+int64_t PlatformAtomicIncrementI64(volatile int64_t *value);
 bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
                                       uint32_t desired);
 void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired);

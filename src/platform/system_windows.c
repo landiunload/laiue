@@ -8,19 +8,6 @@
 
 #include <string.h>
 
-/* winnt.h requests the interlocked intrinsics only inside its _M_AMD64 and
- * _M_IX86 branches, so on ARM64 a /Od build emits ordinary calls to CRT
- * helpers that a /NODEFAULTLIB link cannot resolve. Asking for the same
- * intrinsics here is exactly what those branches already do. */
-#if defined(_M_ARM64) && !defined(__clang__)
-#pragma warning(push)
-/* A name without an intrinsic form on this target stays an ordinary call. */
-#pragma warning(disable : 4163)
-#pragma intrinsic(_InterlockedCompareExchange)
-#pragma intrinsic(_InterlockedCompareExchange64)
-#pragma intrinsic(_InterlockedExchange)
-#pragma warning(pop)
-#endif
 
 typedef struct WindowsDirectoryIterator
 {
@@ -29,6 +16,12 @@ typedef struct WindowsDirectoryIterator
     bool hasCurrent;
 } WindowsDirectoryIterator;
 
+_Static_assert(sizeof(SRWLOCK) <= sizeof(PlatformMutex),
+    "PlatformMutex storage must cover SRWLOCK");
+_Static_assert(sizeof(CONDITION_VARIABLE) <= sizeof(PlatformConditionVariable),
+    "PlatformConditionVariable storage must cover CONDITION_VARIABLE");
+_Static_assert(sizeof(HANDLE) <= sizeof(PlatformThread),
+    "PlatformThread storage must cover a thread HANDLE");
 _Static_assert(sizeof(SRWLOCK) <= sizeof(PlatformRwLock),
     "PlatformRwLock storage is too small");
 _Static_assert(sizeof(uint32_t) == sizeof(LONG), "platform atomics require 32-bit LONG");
@@ -99,6 +92,134 @@ void PlatformRwLockAcquireExclusive(PlatformRwLock* lock)
 void PlatformRwLockReleaseExclusive(PlatformRwLock* lock)
 {
     ReleaseSRWLockExclusive((PSRWLOCK)lock);
+}
+
+bool PlatformMutexInitialize(PlatformMutex* mutex)
+{
+    if (mutex == NULL) return false;
+    memset(mutex, 0, sizeof(*mutex));
+    InitializeSRWLock((PSRWLOCK)mutex);
+    return true;
+}
+
+void PlatformMutexDestroy(PlatformMutex* mutex)
+{
+    /* SRWLOCK не владеет ресурсами ядра и не требует разрушения. */
+    (void)mutex;
+}
+
+void PlatformMutexLock(PlatformMutex* mutex)
+{
+    AcquireSRWLockExclusive((PSRWLOCK)mutex);
+}
+
+void PlatformMutexUnlock(PlatformMutex* mutex)
+{
+    ReleaseSRWLockExclusive((PSRWLOCK)mutex);
+}
+
+bool PlatformConditionVariableInitialize(PlatformConditionVariable* condition)
+{
+    if (condition == NULL) return false;
+    memset(condition, 0, sizeof(*condition));
+    InitializeConditionVariable((PCONDITION_VARIABLE)condition);
+    return true;
+}
+
+void PlatformConditionVariableDestroy(PlatformConditionVariable* condition)
+{
+    (void)condition;
+}
+
+void PlatformConditionVariableWait(PlatformConditionVariable* condition, PlatformMutex* mutex)
+{
+    SleepConditionVariableSRW((PCONDITION_VARIABLE)condition, (PSRWLOCK)mutex, INFINITE, 0);
+}
+
+void PlatformConditionVariableWakeOne(PlatformConditionVariable* condition)
+{
+    WakeConditionVariable((PCONDITION_VARIABLE)condition);
+}
+
+void PlatformConditionVariableWakeAll(PlatformConditionVariable* condition)
+{
+    WakeAllConditionVariable((PCONDITION_VARIABLE)condition);
+}
+
+typedef struct WindowsThreadStart
+{
+    PlatformThreadEntry entry;
+    void* context;
+} WindowsThreadStart;
+
+/* CreateThread ждёт stdcall-функцию с DWORD, поэтому контракт движка
+ * переносится через маленький переходник, а не через приведение типа
+ * указателя на функцию: такое приведение — неопределённое поведение. */
+static DWORD WINAPI WindowsThreadThunk(LPVOID parameter)
+{
+    WindowsThreadStart* start = (WindowsThreadStart*)parameter;
+    PlatformThreadEntry entry = start->entry;
+    void* context = start->context;
+    PlatformFree(start);
+    return (DWORD)entry(context);
+}
+
+bool PlatformThreadStart(PlatformThread* thread, PlatformThreadEntry entry, void* context)
+{
+    if (thread == NULL || entry == NULL) return false;
+    memset(thread, 0, sizeof(*thread));
+
+    WindowsThreadStart* start = PlatformAllocate(sizeof(*start), false);
+    if (start == NULL) return false;
+    start->entry = entry;
+    start->context = context;
+
+    HANDLE handle = CreateThread(NULL, 0, WindowsThreadThunk, start, 0, NULL);
+    if (handle == NULL)
+    {
+        PlatformFree(start);
+        return false;
+    }
+    memcpy(thread->storage, &handle, sizeof(handle));
+    return true;
+}
+
+void PlatformThreadJoin(PlatformThread* thread)
+{
+    if (thread == NULL) return;
+    HANDLE handle = NULL;
+    memcpy(&handle, thread->storage, sizeof(handle));
+    if (handle == NULL) return;
+    WaitForSingleObject(handle, INFINITE);
+    CloseHandle(handle);
+    memset(thread, 0, sizeof(*thread));
+}
+
+uint32_t PlatformLogicalProcessorCount(void)
+{
+    SYSTEM_INFO information;
+    GetSystemInfo(&information);
+    return information.dwNumberOfProcessors > 0 ? (uint32_t)information.dwNumberOfProcessors : 1u;
+}
+
+uint32_t PlatformAtomicIncrementU32(volatile uint32_t *value)
+{
+    return (uint32_t)InterlockedIncrement((volatile LONG *)value);
+}
+
+int64_t PlatformAtomicLoadI64(const volatile int64_t *value)
+{
+    return (int64_t)InterlockedCompareExchange64((volatile LONG64 *)value, 0, 0);
+}
+
+int64_t PlatformAtomicAddI64(volatile int64_t *value, int64_t addend)
+{
+    return (int64_t)InterlockedExchangeAdd64((volatile LONG64 *)value, (LONG64)addend) + addend;
+}
+
+int64_t PlatformAtomicIncrementI64(volatile int64_t *value)
+{
+    return (int64_t)InterlockedIncrement64((volatile LONG64 *)value);
 }
 
 uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)

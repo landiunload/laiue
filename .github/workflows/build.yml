@@ -9,13 +9,13 @@ permissions:
 
 jobs:
   windows-engine:
-    runs-on: windows-2022
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
         preset: [windows-msvc, windows-clang]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Activate x64 compiler environment
         shell: pwsh
         run: |
@@ -73,7 +73,7 @@ jobs:
       matrix:
         preset: [windows-msvc-arm64, windows-clang-arm64]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Activate ARM64 compiler environment
         shell: pwsh
         run: |
@@ -138,7 +138,7 @@ jobs:
           apt-get update
           apt-get install -y ca-certificates clang cmake gcc git \
             ninja-build
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_GRAPHICS=OFF
       - name: Build Debug
@@ -175,6 +175,48 @@ jobs:
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake
 
+  linux-vulkan-engine:
+    name: Linux Vulkan offscreen renderer
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates cmake gcc git ninja-build             glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools             vulkan-validationlayers
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure
+        run: cmake --preset linux-vulkan-offscreen
+      - name: Build Debug
+        run: cmake --build --preset linux-vulkan-offscreen-debug --parallel
+      # Кадр рисуется программным драйвером Mesa: GPU у раннера нет, но
+      # рендер проверяется по пикселям, а не только по кодам возврата.
+      # Слои Khronos превращают неверное использование Vulkan в ошибку —
+      # без них драйвер молча прощает часть нарушений спецификации.
+      - name: Test Debug on lavapipe
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
+        run: ctest --preset linux-vulkan-offscreen-debug --no-tests=error
+      - name: Build Release
+        run: cmake --build --preset linux-vulkan-offscreen-release --parallel
+      - name: Test Release on lavapipe
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
+        run: ctest --preset linux-vulkan-offscreen-release --no-tests=error
+      # Checked-in SPIR-V обязан совпадать с тем, что glslang выдаёт из
+      # HLSL: иначе сборка без компилятора шейдеров получила бы другой
+      # рендер, чем сборка с ним.
+      - name: Verify checked-in SPIR-V matches the HLSL sources
+        run: >
+          cmake --build build/linux-vulkan-offscreen
+          --target laiue_verify_shaders
+      - name: Verify build did not modify sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE"             -P tools/verify_source_tree.cmake
+
   linux-arm64-engine:
     name: Linux ARM64 core (GCC)
     runs-on: ubuntu-24.04-arm
@@ -184,7 +226,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y ca-certificates cmake gcc git ninja-build
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure headless core
         run: |
           test "$(uname -m)" = aarch64
@@ -215,12 +257,12 @@ jobs:
 
   musl-engine:
     runs-on: ubuntu-24.04
-    container: alpine:3.23
+    container: alpine:3.24
     steps:
       - name: Install build dependencies
         run: >
           apk add --no-cache build-base cmake git ninja
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure
         run: cmake --preset linux-musl -DLAIUE_BUILD_GRAPHICS=OFF
       - name: Build and test Debug
@@ -243,7 +285,7 @@ jobs:
     env:
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Verify pinned Android NDK
         run: test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
       - name: Verify complete Android static-link closure
@@ -273,7 +315,7 @@ jobs:
             preset: macos-clang-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install build dependencies
         run: brew install ninja
       - name: Configure headless core

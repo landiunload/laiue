@@ -13,6 +13,7 @@ laiue_add_module(scene
         voxel_raycast.h
         ../api.h
     LINK
+        laiue::math_support
         laiue_world
         laiue_mesher
         laiue_render

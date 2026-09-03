@@ -4,23 +4,8 @@
 
 #include <stdbool.h>
 
-// Скалярная математика без CRT: полиномиальные аппроксимации
-// вместо библиотечных sinf/cosf.
-
-LAIUE_SCENE_API float ScalarSin(float radians);
-LAIUE_SCENE_API float ScalarCos(float radians);
-LAIUE_SCENE_API float ScalarTan(float radians);
-LAIUE_SCENE_API float ScalarClamp(
-    float value, float minimum, float maximum);
-LAIUE_SCENE_API float ScalarWrap(float radians);
-LAIUE_SCENE_API float ScalarSqrt(float value);
-
-// Арктангенсы — минимаксный полином, точность ~1e-6 рад.
-// ScalarAtan2 повторяет соглашения atan2f: результат в (-pi, pi],
-// учитывает знаки обоих аргументов.
-LAIUE_SCENE_API float ScalarAtan(float value);
-LAIUE_SCENE_API float ScalarAtan2(float y, float x);
-LAIUE_SCENE_API float ScalarAcos(float value);
+// Матрицы и пирамида видимости остаются частью публичного SDK; скалярная
+// математика вынесена во внутреннюю math/scalar.h и не экспортируется.
 
 // out = left * right (матрицы 4x4, row-major).
 LAIUE_SCENE_API void Matrix4Multiply(

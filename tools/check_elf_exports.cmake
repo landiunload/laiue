@@ -17,11 +17,15 @@ if(NOT nm_result EQUAL 0)
 endif()
 
 string(REPLACE "\r\n" "\n" dynamic_symbols "${dynamic_symbols}")
-string(REGEX MATCH "(^|\n)[^\n]*[ \t]Platform[A-Za-z0-9_]*($|\n)"
-    leaked_platform_symbol "${dynamic_symbols}")
-if(NOT leaked_platform_symbol STREQUAL "")
-    string(STRIP "${leaked_platform_symbol}" leaked_platform_symbol)
-    message(FATAL_ERROR
-        "Internal platform symbol leaked from ${LIBRARY_FILE}: "
-        "${leaked_platform_symbol}")
-endif()
+# Внутренние статические границы движка не должны попадать в публичный
+# ABI: Platform* принадлежит platform_support, Scalar* — math_support.
+foreach(internal_prefix Platform Scalar)
+    string(REGEX MATCH "(^|\n)[^\n]*[ \t]${internal_prefix}[A-Za-z0-9_]*($|\n)"
+        leaked_symbol "${dynamic_symbols}")
+    if(NOT leaked_symbol STREQUAL "")
+        string(STRIP "${leaked_symbol}" leaked_symbol)
+        message(FATAL_ERROR
+            "Internal ${internal_prefix} symbol leaked from ${LIBRARY_FILE}: "
+            "${leaked_symbol}")
+    endif()
+endforeach()

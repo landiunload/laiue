@@ -143,7 +143,30 @@ if(LAIUE_NATIVE_MOD_MODE_RESOLVED STREQUAL "DYNAMIC")
     set(LAIUE_NATIVE_MODS_ENABLED ON)
 endif()
 
+# Графический бэкенд выбирается отдельно от платформенного: D3D12 живёт
+# только на Windows, Vulkan переносим и на первом этапе рисует offscreen,
+# без окна и swapchain.
+set(LAIUE_RENDER_BACKEND "AUTO" CACHE STRING
+    "Render backend: AUTO, D3D12 or VULKAN")
+set_property(CACHE LAIUE_RENDER_BACKEND PROPERTY STRINGS AUTO D3D12 VULKAN)
+string(TOUPPER "${LAIUE_RENDER_BACKEND}" LAIUE_RENDER_BACKEND_RESOLVED)
+if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "AUTO")
+    if(LAIUE_PLATFORM_WINDOWS)
+        set(LAIUE_RENDER_BACKEND_RESOLVED D3D12)
+    else()
+        set(LAIUE_RENDER_BACKEND_RESOLVED VULKAN)
+    endif()
+endif()
+if(NOT LAIUE_RENDER_BACKEND_RESOLVED MATCHES "^(D3D12|VULKAN)$")
+    message(FATAL_ERROR
+        "LAIUE_RENDER_BACKEND must be AUTO, D3D12 or VULKAN")
+endif()
+if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12" AND NOT LAIUE_PLATFORM_WINDOWS)
+    message(FATAL_ERROR "The D3D12 backend requires the Windows platform backend")
+endif()
+
 message(STATUS
     "laiue platform backend: ${_laiue_platform_backend}; modules: "
     "${LAIUE_MODULE_LIBRARY_TYPE_RESOLVED}; native mods: "
-    "${LAIUE_NATIVE_MOD_MODE_RESOLVED}")
+    "${LAIUE_NATIVE_MOD_MODE_RESOLVED}; render backend: "
+    "${LAIUE_RENDER_BACKEND_RESOLVED}")

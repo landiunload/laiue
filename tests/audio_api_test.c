@@ -1,313 +1,199 @@
-#include <windows.h>
-#include <mmeapi.h>
+// Микшер целиком: голоса, панорама, скорость, повтор, устаревшие
+// дескрипторы и предел числа голосов. Проверяются смешанные сэмплы, а не
+// коды возврата: микшер, который «успешно» отдаёт тишину, отличается от
+// работающего только содержимым буфера.
+//
+// Устройство создаётся с offscreen-бэкендом, поэтому тест не требует ни
+// звуковой карты, ни звукового сервера и одинаково идёт в CI и локально.
 
 #include "audio/audio.h"
+#include "audio/audio_offscreen.h"
+#include "platform/system.h"
+#include "test_runtime.h"
 
-static wchar_t audioTestPath[MAX_PATH];
+#include <stdbool.h>
+#include <stdint.h>
 
-// Тест собирается без CRT, поэтому вывод — прямая запись в stdout.
-// Без него падение на CI выглядит как «Failed» и ни строчки причины.
-static void AudioTestWrite(const char* text)
+#define TEST_SAMPLE_RATE 48000u
+#define TEST_FRAMES 512u
+#define CLIP_FRAMES 256u
+
+static void Expect(bool condition, const char *message)
 {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (output == NULL || output == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-
-    uint32_t length = 0;
-    while (text[length] != '\0')
-    {
-        ++length;
-    }
-
-    DWORD written = 0;
-    WriteFile(output, text, length, &written, NULL);
+    if (condition) return;
+    LaiueTestRuntimeWrite("Audio check failed: ");
+    LaiueTestRuntimeWrite(message);
+    LaiueTestRuntimeWrite("\n");
+    LaiueTestRuntimeExit(1);
 }
 
-static void AudioTestWriteHex(uint32_t value)
+static float AbsoluteValue(float value)
 {
-    static const char hexDigits[] = "0123456789abcdef";
-    char text[11];
+    return value < 0.0f ? -value : value;
+}
 
-    text[0] = '0';
-    text[1] = 'x';
-    for (uint32_t index = 0; index < 8; ++index)
+// Пиковая амплитуда по каналу: сравнение пиков отличает панораму,
+// громкость и повтор надёжнее, чем сравнение отдельных сэмплов.
+static float ChannelPeak(const float *frames, uint32_t frameCount, uint32_t channel)
+{
+    float peak = 0.0f;
+    for (uint32_t index = 0; index < frameCount; ++index)
     {
-        text[2 + index] = hexDigits[(value >> ((7 - index) * 4)) & 0xFu];
+        float value = AbsoluteValue(frames[index * 2u + channel]);
+        if (value > peak) peak = value;
     }
-    text[10] = '\0';
-
-    AudioTestWrite(text);
+    return peak;
 }
 
-static void AudioTestWriteNumber(uint32_t value)
+static AudioDevice *CreateOffscreenDevice(void)
 {
-    char text[11];
-    uint32_t position = sizeof(text) - 1;
-
-    text[position] = '\0';
-    do
-    {
-        text[--position] = (char)('0' + (value % 10u));
-        value /= 10u;
-    }
-    while (value != 0 && position != 0);
-
-    AudioTestWrite(&text[position]);
-}
-
-static void AudioTestCleanup(void)
-{
-    if (audioTestPath[0] != L'\0')
-    {
-        DeleteFileW(audioTestPath);
-        audioTestPath[0] = L'\0';
-    }
-}
-
-static void AudioTestFail(uint32_t code, const char* reason)
-{
-    AudioTestWrite("Проверка ");
-    AudioTestWriteNumber(code);
-    AudioTestWrite(" не пройдена: ");
-    AudioTestWrite(reason);
-    AudioTestWrite("\r\n");
-
-    AudioTestCleanup();
-    ExitProcess(code);
-}
-
-// 125 — код пропуска, объявленный в tests/CMakeLists.txt через SKIP_RETURN_CODE.
-static void AudioTestSkip(const char* reason)
-{
-    AudioTestWrite("Пропуск: ");
-    AudioTestWrite(reason);
-    AudioTestWrite("\r\n");
-
-    AudioTestCleanup();
-    ExitProcess(125);
-}
-
-// Единственное обращение к winmm, без COM: ноль устройств вывода означает,
-// что воспроизводить некуда. Так выглядит агент CI и сервер без звуковой
-// карты — проверки контракта API там осмысленны, а проигрывание нет.
-static bool AudioTestHasOutputDevice(void)
-{
-    return waveOutGetNumDevs() != 0;
-}
-
-typedef struct AudioTestWaveHeader
-{
-    char riff[4];
-    uint32_t fileSize;
-    char wave[4];
-    char format[4];
-    uint32_t formatSize;
-    uint16_t audioFormat;
-    uint16_t channelCount;
-    uint32_t sampleRate;
-    uint32_t byteRate;
-    uint16_t blockAlign;
-    uint16_t bitsPerSample;
-    char data[4];
-    uint32_t dataSize;
-} AudioTestWaveHeader;
-
-static bool AudioTestCreateWave(void)
-{
-    wchar_t temporaryDirectory[MAX_PATH];
-    if (GetTempPathW(MAX_PATH, temporaryDirectory) == 0
-        || GetTempFileNameW(temporaryDirectory, L"lau", 0,
-            audioTestPath) == 0)
-    {
-        return false;
-    }
-
-    HANDLE file = CreateFileW(audioTestPath, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    AudioTestWaveHeader header = {
-        .riff = { 'R', 'I', 'F', 'F' },
-        .fileSize = 36U + 16000U,
-        .wave = { 'W', 'A', 'V', 'E' },
-        .format = { 'f', 'm', 't', ' ' },
-        .formatSize = 16,
-        .audioFormat = 1,
-        .channelCount = 1,
-        .sampleRate = 8000,
-        .byteRate = 8000,
-        .blockAlign = 1,
-        .bitsPerSample = 8,
-        .data = { 'd', 'a', 't', 'a' },
-        .dataSize = 16000,
+    AudioDeviceConfiguration configuration = {
+        .backend = AUDIO_BACKEND_OFFSCREEN,
+        .sampleRate = TEST_SAMPLE_RATE,
+        .frameCountHint = TEST_FRAMES,
+        .masterVolume = 1.0f,
     };
-
-    DWORD written = 0;
-    bool succeeded = WriteFile(file, &header, sizeof(header),
-        &written, NULL) && written == sizeof(header);
-
-    uint8_t silence[256];
-    for (uint32_t index = 0; index < sizeof(silence); ++index)
-    {
-        silence[index] = 128;
-    }
-    for (uint32_t offset = 0; succeeded && offset < header.dataSize;
-        offset += sizeof(silence))
-    {
-        uint32_t remaining = header.dataSize - offset;
-        DWORD blockSize = remaining < sizeof(silence)
-            ? remaining : sizeof(silence);
-        succeeded = WriteFile(file, silence, blockSize, &written, NULL)
-            && written == blockSize;
-    }
-    succeeded = CloseHandle(file) && succeeded;
-    return succeeded;
+    AudioDevice *device = NULL;
+    Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+           "the offscreen device could not be created");
+    Expect(device != NULL, "a successful create must return a device");
+    return device;
 }
 
-// Последняя ошибка проигрывателя: нужна и для диагностики, и чтобы отличить
-// «нет устройства вывода» от настоящей поломки.
-static AudioEvent audioTestLastError;
-static bool audioTestSawError;
-
-static bool AudioTestWaitForState(AudioPlayer* player,
-    AudioPlaybackState expected, uint32_t timeoutMilliseconds)
+LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
 {
-    uint32_t elapsed = 0;
-    while (elapsed < timeoutMilliseconds)
-    {
-        AudioEvent event;
-        while (AudioPlayerPollEvent(player, &event))
-        {
-            if (event.type == AUDIO_EVENT_ERROR)
-            {
-                audioTestLastError = event;
-                audioTestSawError = true;
-                return false;
-            }
-        }
+    AudioDevice *device = CreateOffscreenDevice();
 
-        AudioPlayerSnapshot snapshot;
-        if (AudioPlayerGetSnapshot(player, &snapshot)
-            && snapshot.state == expected)
-        {
-            return true;
-        }
-        Sleep(10);
-        elapsed += 10;
-    }
-    return false;
-}
+    AudioDeviceStats stats;
+    Expect(AudioDeviceGetStats(device, &stats), "stats must be readable");
+    Expect(stats.sampleRate == TEST_SAMPLE_RATE, "the device must honour the requested rate");
+    Expect(stats.channelCount == 2u, "mixing is always stereo");
+    Expect(stats.activeVoices == 0u, "a fresh device has no active voices");
 
-// MF_E_NO_AUDIO_PLAYBACK_DEVICE: устройство вывода исчезло между проверкой
-// waveOutGetNumDevs и загрузкой источника — тоже повод пропустить, а не падать.
-#define AUDIO_TEST_NO_PLAYBACK_DEVICE ((int32_t)0xC00D36FA)
+    // Постоянная амплитуда: пик предсказуем и не зависит от фазы.
+    int16_t *samples = PlatformAllocate(CLIP_FRAMES * sizeof(int16_t), false);
+    Expect(samples != NULL, "clip samples could not be allocated");
+    for (uint32_t index = 0; index < CLIP_FRAMES; ++index) samples[index] = 16384;
 
-static void AudioTestFailPlayback(uint32_t code, const char* reason)
-{
-    if (audioTestSawError)
-    {
-        if (audioTestLastError.platformCode == AUDIO_TEST_NO_PLAYBACK_DEVICE)
-        {
-            AudioTestSkip("Media Foundation не нашла устройство вывода");
-        }
+    AudioClipDescription description = {
+        .samples = samples,
+        .frameCount = CLIP_FRAMES,
+        .channelCount = 1u,
+        .sampleRate = TEST_SAMPLE_RATE,
+    };
+    AudioClip *clip = NULL;
+    Expect(AudioClipCreate(device, &description, &clip) == AUDIO_RESULT_OK,
+           "the clip could not be created");
+    // Клип копирует сэмплы: исходный буфер после создания не нужен.
+    PlatformFree(samples);
+    Expect(AudioClipDurationSeconds(clip) > 0.0, "the clip must report a duration");
 
-        AudioTestWrite("Ошибка проигрывателя: поток ");
-        AudioTestWriteNumber((uint32_t)audioTestLastError.streamError);
-        AudioTestWrite(", HRESULT ");
-        AudioTestWriteHex((uint32_t)audioTestLastError.platformCode);
-        AudioTestWrite("\r\n");
-    }
+    float *frames = PlatformAllocate(TEST_FRAMES * 2u * sizeof(float), true);
+    Expect(frames != NULL, "the mix buffer could not be allocated");
 
-    AudioTestFail(code, reason);
-}
+    // === Тишина без голосов ===
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) == 0.0f, "a device without voices must be silent");
 
-void AudioApiTestEntryPoint(void)
-{
-    AudioPlayer* player = NULL;
-    AudioResult result = AudioPlayerCreate(NULL, &player);
-    if (result == AUDIO_RESULT_PLATFORM_INITIALIZATION_FAILED
-        || result == AUDIO_RESULT_BACKEND_INITIALIZATION_FAILED)
-    {
-        // Корректный skip для Windows N/Server без Media Feature Pack.
-        AudioTestSkip("Media Foundation недоступна");
-    }
-    if (result != AUDIO_RESULT_OK || player == NULL)
-    {
-        AudioTestFail(1, "AudioPlayerCreate вернул неожиданный результат");
-    }
+    // === Один голос по центру ===
+    AudioVoice voice = AudioVoicePlay(device, clip, NULL);
+    Expect(voice != AUDIO_VOICE_NONE, "the voice could not be started");
+    Expect(AudioVoiceIsActive(device, voice), "a started voice must report as active");
 
-    AudioPlayerSnapshot snapshot;
-    if (!AudioPlayerGetSnapshot(player, &snapshot)
-        || snapshot.state != AUDIO_PLAYBACK_EMPTY
-        || snapshot.volume != 1.0f
-        || snapshot.muted || snapshot.looping || snapshot.hasAudio)
-    {
-        AudioTestFail(2, "состояние нового проигрывателя не пустое");
-    }
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    float centreLeft = ChannelPeak(frames, TEST_FRAMES, 0u);
+    float centreRight = ChannelPeak(frames, TEST_FRAMES, 1u);
+    Expect(centreLeft > 0.0f, "a playing voice must produce sound");
+    Expect(AbsoluteValue(centreLeft - centreRight) < 0.001f,
+           "a centred voice must reach both channels equally");
 
-    AudioEvent event;
-    if (AudioPlayerPollEvent(player, &event))
-    {
-        AudioTestFail(3, "очередь событий нового проигрывателя не пуста");
-    }
-    if (AudioPlayerPlay(player) != AUDIO_RESULT_INVALID_STATE
-        || AudioPlayerLoadUri(player, L"") != AUDIO_RESULT_INVALID_ARGUMENT
-        || AudioPlayerSeek(player, -1.0) != AUDIO_RESULT_INVALID_ARGUMENT)
-    {
-        AudioTestFail(4, "негодные вызовы не отклонены");
-    }
+    // Клип короче буфера и не зациклен, поэтому к концу кадра он должен
+    // закончиться сам, без остановки со стороны приложения.
+    Expect(!AudioVoiceIsActive(device, voice), "a finished voice must stop reporting as active");
 
-    if (AudioPlayerSetVolume(player, 0.25f) != AUDIO_RESULT_OK
-        || AudioPlayerSetMuted(player, true) != AUDIO_RESULT_OK
-        || AudioPlayerSetLooping(player, true) != AUDIO_RESULT_OK
-        || !AudioPlayerGetSnapshot(player, &snapshot)
-        || snapshot.volume != 0.25f || !snapshot.muted || !snapshot.looping)
-    {
-        AudioTestFail(5, "громкость, приглушение или повтор не применились");
-    }
+    // === Панорама ===
+    AudioVoiceParameters leftParameters = {
+        .volume = 1.0f, .pan = -1.0f, .speed = 1.0f, .looping = false,
+    };
+    voice = AudioVoicePlay(device, clip, &leftParameters);
+    Expect(voice != AUDIO_VOICE_NONE, "the panned voice could not be started");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) > 0.0f, "a hard-left voice must fill the left");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 1u) < 0.001f,
+           "a hard-left voice must leave the right channel silent");
 
-    // Всё выше проверяет контракт API и проходит даже на машине без звука.
-    // Всё ниже требует настоящего устройства вывода.
-    if (!AudioTestHasOutputDevice())
-    {
-        AudioPlayerDestroy(player);
-        AudioTestSkip("в системе нет устройств вывода звука");
-    }
+    // === Повтор и скорость ===
+    AudioVoiceParameters loopParameters = {
+        .volume = 1.0f, .pan = 0.0f, .speed = 1.0f, .looping = true,
+    };
+    AudioVoice loopVoice = AudioVoicePlay(device, clip, &loopParameters);
+    Expect(loopVoice != AUDIO_VOICE_NONE, "the looping voice could not be started");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    // Буфер вдвое длиннее клипа: без повтора вторая половина была бы тихой.
+    Expect(ChannelPeak(frames + CLIP_FRAMES * 2u, TEST_FRAMES - CLIP_FRAMES, 0u) > 0.0f,
+           "a looping voice must keep sounding past the end of its clip");
+    Expect(AudioVoiceIsActive(device, loopVoice), "a looping voice must stay active");
 
-    if (!AudioTestCreateWave())
-    {
-        AudioTestFail(6, "не удалось создать временный WAV");
-    }
-    if (AudioPlayerLoadFile(player, audioTestPath) != AUDIO_RESULT_OK
-        || !AudioTestWaitForState(player, AUDIO_PLAYBACK_READY, 5000)
-        || !AudioPlayerGetSnapshot(player, &snapshot)
-        || !snapshot.hasAudio || snapshot.durationSeconds <= 0.0)
-    {
-        AudioTestFailPlayback(6, "источник не дошёл до состояния READY");
-    }
-    if (AudioPlayerPlay(player) != AUDIO_RESULT_OK
-        || !AudioTestWaitForState(player, AUDIO_PLAYBACK_PLAYING, 3000)
-        || AudioPlayerPause(player) != AUDIO_RESULT_OK
-        || !AudioTestWaitForState(player, AUDIO_PLAYBACK_PAUSED, 3000))
-    {
-        AudioTestFailPlayback(7, "воспроизведение или пауза не сработали");
-    }
+    AudioVoiceParameters fastParameters = loopParameters;
+    fastParameters.speed = 2.0f;
+    Expect(AudioVoiceSetParameters(device, loopVoice, &fastParameters),
+           "parameters of a live voice must be accepted");
 
-    if (AudioPlayerClear(player) != AUDIO_RESULT_OK
-        || !AudioPlayerPollEvent(player, &event)
-        || event.type != AUDIO_EVENT_CLEARED
-        || !AudioPlayerGetSnapshot(player, &snapshot)
-        || snapshot.state != AUDIO_PLAYBACK_EMPTY)
-    {
-        AudioTestFail(8, "очистка не вернула проигрыватель в пустое состояние");
-    }
+    // === Остановка и устаревший дескриптор ===
+    AudioVoiceStop(device, loopVoice);
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(!AudioVoiceIsActive(device, loopVoice), "a stopped voice must not stay active");
+    Expect(!AudioVoiceSetParameters(device, loopVoice, &loopParameters),
+           "a stale handle must be rejected");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) == 0.0f,
+           "no voice may sound after every voice stopped");
 
-    AudioPlayerDestroy(player);
-    AudioTestCleanup();
-    ExitProcess(0);
+    // === Общая громкость ===
+    AudioDeviceSetMasterVolume(device, 0.0f);
+    Expect(AudioDeviceGetMasterVolume(device) == 0.0f, "master volume must be read back");
+    voice = AudioVoicePlay(device, clip, NULL);
+    Expect(voice != AUDIO_VOICE_NONE, "the voice could not be started");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) == 0.0f,
+           "zero master volume must silence the mix");
+    AudioDeviceSetMasterVolume(device, 1.0f);
+
+    // === Предел числа голосов ===
+    // Голоса не вытесняют друг друга: сверх лимита выдача честно
+    // отказывает, а уже звучащее не обрывается.
+    uint32_t startedVoices = 0u;
+    for (uint32_t index = 0; index < AUDIO_MAX_VOICES * 2u; ++index)
+    {
+        if (AudioVoicePlay(device, clip, &loopParameters) != AUDIO_VOICE_NONE) ++startedVoices;
+    }
+    Expect(startedVoices <= AUDIO_MAX_VOICES, "the mixer must not exceed its voice limit");
+    Expect(startedVoices > 0u, "the mixer must accept at least one voice");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(AudioDeviceGetStats(device, &stats), "stats must be readable");
+    Expect(stats.activeVoices > 0u, "active voices must be reported");
+    Expect(stats.mixedFrames > 0u, "mixed frames must be counted");
+
+    AudioDeviceStopAllVoices(device);
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+    Expect(AudioDeviceGetStats(device, &stats), "stats must be readable");
+    Expect(stats.activeVoices == 0u, "stopping every voice must clear the active count");
+
+    // === Отказы контракта ===
+    Expect(AudioClipCreate(device, NULL, &clip) == AUDIO_RESULT_INVALID_ARGUMENT,
+           "a NULL description must be rejected");
+    AudioClipDescription invalid = description;
+    invalid.channelCount = 3u;
+    AudioClip *rejected = NULL;
+    Expect(AudioClipCreate(device, &invalid, &rejected) == AUDIO_RESULT_INVALID_ARGUMENT,
+           "an unsupported channel count must be rejected");
+    Expect(AudioVoicePlay(device, NULL, NULL) == AUDIO_VOICE_NONE,
+           "playing a NULL clip must be refused");
+
+    PlatformFree(frames);
+    AudioClipDestroy(clip);
+    AudioDeviceDestroy(device);
+
+    LaiueTestRuntimeWrite("Audio mixer checks passed\n");
+    LAIUE_TEST_SUCCESS();
 }

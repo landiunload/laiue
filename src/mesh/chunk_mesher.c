@@ -1,8 +1,10 @@
 #include "mesh/chunk_mesher.h"
+#include "platform/system.h"
 #include "world/world.h"
 
-#include <windows.h>
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
+#endif
 #if defined(_M_ARM64) || defined(__aarch64__)
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <arm64_neon.h>
@@ -13,6 +15,20 @@
 #include <emmintrin.h>
 #endif
 #include <string.h>
+
+// MSVC даёт поиск младшего установленного бита как _BitScanForward64,
+// GCC и Clang — как __builtin_ctzll. Обёртка держит вызовы одинаковыми
+// и требует ненулевой аргумент, как обе исходные операции.
+static inline uint32_t LowestSetBitIndex(uint64_t value)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long index;
+    _BitScanForward64(&index, value);
+    return (uint32_t)index;
+#else
+    return (uint32_t)__builtin_ctzll(value);
+#endif
+}
 
 // Расширенный регион: чанк плюс слой соседних блоков с каждой стороны,
 // чтобы грани на границе чанка отсекались без обращений к соседям.
@@ -51,16 +67,16 @@ struct ChunkMesherScratch
 
 ChunkMesherScratch* ChunkMesherScratchCreate(void)
 {
-    ChunkMesherScratch* scratch = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*scratch));
+    ChunkMesherScratch* scratch = PlatformAllocate(sizeof(*scratch), true);
     if (scratch == NULL)
     {
         return NULL;
     }
 
-    scratch->blocks = HeapAlloc(GetProcessHeap(), 0, (size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE);
-    scratch->columns = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * 3 * sizeof(uint64_t));
-    scratch->planesPositive = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * sizeof(uint64_t));
-    scratch->planesNegative = HeapAlloc(GetProcessHeap(), 0, COLUMN_WORDS * sizeof(uint64_t));
+    scratch->blocks = PlatformAllocate((size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE, false);
+    scratch->columns = PlatformAllocate(COLUMN_WORDS * 3 * sizeof(uint64_t), false);
+    scratch->planesPositive = PlatformAllocate(COLUMN_WORDS * sizeof(uint64_t), false);
+    scratch->planesNegative = PlatformAllocate(COLUMN_WORDS * sizeof(uint64_t), false);
 
     if (scratch->blocks == NULL || scratch->columns == NULL ||
         scratch->planesPositive == NULL || scratch->planesNegative == NULL)
@@ -79,12 +95,12 @@ void ChunkMesherScratchDestroy(ChunkMesherScratch* scratch)
         return;
     }
 
-    if (scratch->blocks != NULL) HeapFree(GetProcessHeap(), 0, scratch->blocks);
-    if (scratch->columns != NULL) HeapFree(GetProcessHeap(), 0, scratch->columns);
-    if (scratch->planesPositive != NULL) HeapFree(GetProcessHeap(), 0, scratch->planesPositive);
-    if (scratch->planesNegative != NULL) HeapFree(GetProcessHeap(), 0, scratch->planesNegative);
-    if (scratch->quadBuffer.quads != NULL) HeapFree(GetProcessHeap(), 0, scratch->quadBuffer.quads);
-    HeapFree(GetProcessHeap(), 0, scratch);
+    if (scratch->blocks != NULL) PlatformFree(scratch->blocks);
+    if (scratch->columns != NULL) PlatformFree(scratch->columns);
+    if (scratch->planesPositive != NULL) PlatformFree(scratch->planesPositive);
+    if (scratch->planesNegative != NULL) PlatformFree(scratch->planesNegative);
+    if (scratch->quadBuffer.quads != NULL) PlatformFree(scratch->quadBuffer.quads);
+    PlatformFree(scratch);
 }
 
 static bool QuadBufferAppend(QuadBuffer* buffer, ChunkQuad quad)
@@ -93,8 +109,8 @@ static bool QuadBufferAppend(QuadBuffer* buffer, ChunkQuad quad)
     {
         uint32_t newCapacity = buffer->capacity == 0 ? 1024 : buffer->capacity * 2;
         ChunkQuad* newQuads = buffer->quads == NULL
-            ? HeapAlloc(GetProcessHeap(), 0, (size_t)newCapacity * sizeof(ChunkQuad))
-            : HeapReAlloc(GetProcessHeap(), 0, buffer->quads, (size_t)newCapacity * sizeof(ChunkQuad));
+            ? PlatformAllocate((size_t)newCapacity * sizeof(ChunkQuad), false)
+            : PlatformReallocate(buffer->quads, (size_t)newCapacity * sizeof(ChunkQuad), false);
         if (newQuads == NULL)
         {
             return false;
@@ -170,8 +186,7 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
 
             while (bits != 0)
             {
-                unsigned long runStart;
-                _BitScanForward64(&runStart, bits);
+                uint32_t runStart = LowestSetBitIndex(bits);
 
                 BlockType blockType = FaceBlockType(
                     blocks, face, slice, row, (uint32_t)runStart);
@@ -285,8 +300,7 @@ static inline void ScatterFaceBits(uint64_t faceMask, uint64_t* planes, uint32_t
 {
     while (faceMask != 0)
     {
-        unsigned long slice;
-        _BitScanForward64(&slice, faceMask);
+        uint32_t slice = LowestSetBitIndex(faceMask);
         faceMask &= faceMask - 1;
         planes[(size_t)slice * CHUNK_SIZE + row] |= planeBit;
     }
@@ -349,8 +363,7 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             uint64_t remaining = solidMask;
             while (remaining != 0)
             {
-                unsigned long z;
-                _BitScanForward64(&z, remaining);
+                uint32_t z = LowestSetBitIndex(remaining);
                 remaining &= remaining - 1;
                 columnsY[x * CHUNK_SIZE + (uint32_t)z] |= rowBit;
                 columnsX[y * CHUNK_SIZE + (uint32_t)z] |= columnBit;
@@ -439,7 +452,7 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     if (quadBuffer->count > 0)
     {
         size_t bytes = (size_t)quadBuffer->count * sizeof(ChunkQuad);
-        ChunkQuad* quads = HeapAlloc(GetProcessHeap(), 0, bytes);
+        ChunkQuad* quads = PlatformAllocate(bytes, false);
         if (quads == NULL)
         {
             return false;
