@@ -326,6 +326,16 @@ if(LAIUE_PLATFORM_WINDOWS)
     endif()
     target_sources(laiue_windows_no_crt INTERFACE
         "$<TARGET_OBJECTS:laiue_runtime>")
+    if(LAIUE_TARGET_ARM64)
+        # winnt.h просит развернуть _Interlocked* только в ветках _M_AMD64 и
+        # _M_IX86, поэтому на ARM64 при /Od MSVC оставляет вызовы помощников;
+        # ни /Oi, ни собственная #pragma intrinsic этого не меняют. arm64rt.lib
+        # из Windows SDK — их реализация: нужные члены не определяют memset,
+        # memcpy и прочий CRT и линкуются вообще без импортов. clang-cl
+        # разворачивает интринсики сам, и библиотека ему не нужна.
+        target_link_libraries(laiue_windows_no_crt INTERFACE
+            $<$<C_COMPILER_ID:MSVC>:arm64rt.lib>)
+    endif()
     target_link_options(laiue_windows_no_crt INTERFACE
         /NODEFAULTLIB
         /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT
