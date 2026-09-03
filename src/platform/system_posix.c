@@ -1,4 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+/* Darwin exposes O_NOFOLLOW only at the full BSD level. Under a bare
+ * _POSIX_C_SOURCE the macro disappears, and the symlink swap guard would
+ * silently disappear with it. */
+#define _DARWIN_C_SOURCE 1
+#endif
 
 #include "platform/system.h"
 #include "platform/sha256.h"

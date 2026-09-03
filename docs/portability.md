@@ -221,6 +221,11 @@ cmake --install build/linux-gcc --config Release \
 - ELF и Mach-O symbols по умолчанию hidden; наружу выходят только API exports.
 - Windows no-CRT target не должен получать скрытую зависимость от CRT через
   новую библиотеку или compiler helper.
+- Кадр стека функции в no-CRT сборке остаётся меньше страницы: за границей
+  4 КиБ MSVC вставляет вызов `__chkstk`, которого без CRT нет. Крупные
+  структуры передаются по указателю, а обменные буферы живут в куче.
+  На ARM64 тот же контракт требует `/Oi` в Debug: без него MSVC оставляет
+  `_Interlocked*` вызовами в CRT, тогда как на x86_64 разворачивает их всегда.
 - Авторитетная физика собирается без fast-math и FMA contraction.
 
 Native mod artifact обязан точно совпадать с OS, CPU architecture и libc/ABI

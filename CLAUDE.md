@@ -16,5 +16,6 @@ ARM64. Наличие core-сборки не означает наличие о�
 сетевой, игровой и процедурно-генерирующей политики в движке нет.
 
 Канонические правила находятся в [CONTRIBUTING.md](CONTRIBUTING.md), команды
-и входная документация — в [README.md](README.md). Прикладной проект находится
-в [landiunload/laiue-game](https://github.com/landiunload/laiue-game).
+и входная документация — в [README.md](README.md). Текущий прикладной проект —
+[landiunload/simulation-of-sins](https://github.com/landiunload/simulation-of-sins);
+прежний сохранён в [landiunload/laiue-game](https://github.com/landiunload/laiue-game).

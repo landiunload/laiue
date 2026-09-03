@@ -7,7 +7,9 @@
 `laiue::engine` объединяет модули, доступные на выбранной платформе;
 приложение может линковать и более узкий набор целей.
 
-Прикладная реализация, ранее находившаяся рядом с runtime, сохранена в
+Текущая прикладная реализация —
+[landiunload/simulation-of-sins](https://github.com/landiunload/simulation-of-sins).
+Реализация, ранее находившаяся рядом с runtime, сохранена в
 [landiunload/laiue-game](https://github.com/landiunload/laiue-game).
 
 Процедурная генерация, правила игры, сетевой протокол и сервер не входят в

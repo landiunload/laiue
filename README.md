@@ -5,6 +5,8 @@
 мир, физику, построение чанковых мешей, D3D12-рендер, окно, ввод, аудио,
 сцену, UI, каталог визуального содержимого и host для нативных модов.
 
+Текущий прикладной проект на этом движке —
+[landiunload/simulation-of-sins](https://github.com/landiunload/simulation-of-sins).
 Прикладной проект из прежнего репозитория сохранён отдельно:
 [landiunload/laiue-game](https://github.com/landiunload/laiue-game).
 

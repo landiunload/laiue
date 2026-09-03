@@ -205,6 +205,10 @@ if(LAIUE_PLATFORM_WINDOWS)
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
+        # На ARM64 MSVC при /Od оставляет _Interlocked* вызовами в CRT,
+        # которой в сборке с /NODEFAULTLIB нет. На x64 те же интринсики
+        # разворачиваются всегда, поэтому флаг нужен только здесь.
+        $<$<AND:$<CONFIG:Debug>,$<BOOL:${LAIUE_TARGET_ARM64}>>:/Oi>
         $<$<CONFIG:Release>:/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso>
         $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/Zc:inline ${LAIUE_MSVC_ARCH_FLAG}>
         $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/Qvec ${LAIUE_CLANG_CL_ARCH_FLAG} /clang:-O3 /clang:-fvectorize /clang:-fslp-vectorize /clang:-fno-math-errno>
@@ -316,6 +320,10 @@ if(LAIUE_PLATFORM_WINDOWS)
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>
         $<$<CONFIG:Debug>:/Od /Z7>
+        # На ARM64 MSVC при /Od оставляет _Interlocked* вызовами в CRT,
+        # которой в сборке с /NODEFAULTLIB нет. На x64 те же интринсики
+        # разворачиваются всегда, поэтому флаг нужен только здесь.
+        $<$<AND:$<CONFIG:Debug>,$<BOOL:${LAIUE_TARGET_ARM64}>>:/Oi>
         $<$<CONFIG:Release>:/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso>
         $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/Zc:inline ${LAIUE_MSVC_ARCH_FLAG}>
         $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/Qvec ${LAIUE_CLANG_CL_ARCH_FLAG} /clang:-O3 /clang:-fvectorize /clang:-fslp-vectorize /clang:-fno-math-errno>)

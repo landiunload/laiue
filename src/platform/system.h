@@ -7,7 +7,10 @@
 
 #define LAIUE_PLATFORM_PATH_CAPACITY 1024U
 #define LAIUE_PLATFORM_DIRECTORY_STORAGE_WORDS 160U
-#define LAIUE_PLATFORM_RWLOCK_STORAGE_WORDS 16U
+/* The storage covers the largest known native primitive: pthread_rwlock_t is
+ * 200 bytes on macOS against 56 on glibc and musl and 8 for SRWLOCK, so the
+ * headroom follows Darwin. */
+#define LAIUE_PLATFORM_RWLOCK_STORAGE_WORDS 32U
 
 typedef struct PlatformRwLock
 {

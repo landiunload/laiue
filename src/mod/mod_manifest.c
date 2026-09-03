@@ -965,19 +965,23 @@ LaiueModStatus LaiueModPackInspect(const wchar_t *rootDirectory, const wchar_t *
     return FinishPackInspection(outInfo, diagnostic, status, message);
 }
 
-static void SortPackList(LaiueModPackList *list)
+/* A moved element is almost three kilobytes, and by value the compiler puts an
+ * extra intermediate copy on the stack too. On Windows ARM64 such a frame
+ * crosses a page, so MSVC emits a __chkstk call that a /NODEFAULTLIB build does
+ * not have. The exchange cell lives in the caller's heap allocation instead. */
+static void SortPackList(LaiueModPackList *list, LaiueModPackInfo *scratch)
 {
     for (uint32_t index = 1; index < list->count; ++index)
     {
-        LaiueModPackInfo value = list->entries[index];
+        *scratch = list->entries[index];
         uint32_t insertion = index;
         while (insertion > 0u &&
-               ComparePackNames(value.packName, list->entries[insertion - 1u].packName) < 0)
+               ComparePackNames(scratch->packName, list->entries[insertion - 1u].packName) < 0)
         {
             list->entries[insertion] = list->entries[insertion - 1u];
             --insertion;
         }
-        list->entries[insertion] = value;
+        list->entries[insertion] = *scratch;
     }
 }
 
@@ -1080,7 +1084,18 @@ LaiueModStatus LaiueModPackEnumerate(const wchar_t *rootDirectory, LaiueModPackL
         LaiueModPackListRelease(outList);
         return status;
     }
-    SortPackList(outList);
+    if (outList->count > 1u)
+    {
+        LaiueModPackInfo *sortScratch = PlatformAllocate(sizeof(*sortScratch), false);
+        if (sortScratch == NULL)
+        {
+            LaiueModPackListRelease(outList);
+            return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY, 0,
+                                         "could not allocate pack sort scratch memory");
+        }
+        SortPackList(outList, sortScratch);
+        PlatformFree(sortScratch);
+    }
     return LAIUE_MOD_STATUS_OK;
 }
 

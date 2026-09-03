@@ -420,8 +420,13 @@ bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* sourc
 
 static uint64_t Multiply64(uint64_t left, uint64_t right, uint64_t* outHigh)
 {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
     return _umul128(left, right, outHigh);
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(_M_ARM64)
+    // _umul128 существует только на x64; на ARM64 верхнюю половину даёт umulh,
+    // а нижняя — обычное 64-битное произведение с переносом по модулю 2^64.
+    *outHigh = __umulh(left, right);
+    return left * right;
 #else
     // Four 32x32 products avoid the non-standard __int128 extension and
     // keep the exact same result on MSVC, GCC, Clang, glibc and musl.
