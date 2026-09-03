@@ -7,6 +7,21 @@
 #include <windows.h>
 #include <string.h>
 
+/* winnt.h requests the interlocked intrinsics only inside its _M_AMD64 and
+ * _M_IX86 branches, so on ARM64 a /Od build emits ordinary calls to CRT
+ * helpers that a /NODEFAULTLIB link cannot resolve. */
+#if defined(_M_ARM64) && !defined(__clang__)
+#pragma warning(push)
+/* A name without an intrinsic form on this target stays an ordinary call. */
+#pragma warning(disable : 4163)
+#pragma intrinsic(_InterlockedCompareExchange)
+#pragma intrinsic(_InterlockedCompareExchange64)
+#pragma intrinsic(_InterlockedIncrement)
+#pragma intrinsic(_InterlockedIncrement64)
+#pragma intrinsic(_InterlockedAdd64)
+#pragma warning(pop)
+#endif
+
 #define MAX_WORKER_THREADS 4
 
 // Бюджет загрузок на GPU за один кадр: сглаживает волну готовых мешей

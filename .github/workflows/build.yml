@@ -98,29 +98,59 @@ jobs:
           if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
             throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
           }
-      # Temporary: reports which no-CRT helpers softintrin.lib actually
-      # defines. Remove once the MSVC ARM64 link has stayed green.
-      - name: Report ARM64 intrinsic helper library
+      # Temporary: finds how MSVC ARM64 can satisfy the interlocked helpers
+      # under /NODEFAULTLIB. Remove once the link has stayed green.
+      - name: Diagnose ARM64 interlocked helpers
         if: matrix.preset == 'windows-msvc-arm64'
         continue-on-error: true
         shell: pwsh
         run: |
-          $library = $null
-          foreach ($directory in $env:LIB -split ';') {
-            $candidate = Join-Path $directory 'softintrin.lib'
-            if ($directory -and (Test-Path $candidate)) { $library = $candidate; break }
-          }
-          if (-not $library) { Write-Output 'softintrin.lib not on LIB'; exit 0 }
-          Write-Output "softintrin.lib: $library"
           $wanted = '_InterlockedCompareExchange', '_InterlockedCompareExchange64',
-            '_InterlockedExchange', '_InterlockedIncrement', '_InterlockedDecrement',
-            '__chkstk'
-          $defined = dumpbin /symbols $library |
-            Select-String -Pattern 'External\s+\|\s+(\S+)' |
-            ForEach-Object { $_.Matches[0].Groups[1].Value }
-          foreach ($symbol in $wanted) {
-            $state = if ($defined -contains $symbol) { 'defined' } else { 'MISSING' }
-            Write-Output ("  {0,-32} {1}" -f $symbol, $state)
+            '_InterlockedExchange', '_InterlockedIncrement', '_InterlockedDecrement'
+          Write-Output '== libraries on LIB defining the helpers =='
+          foreach ($directory in ($env:LIB -split ';' | Where-Object { $_ })) {
+            $libraries = Get-ChildItem -LiteralPath $directory -Filter *.lib -ErrorAction SilentlyContinue
+            foreach ($library in $libraries) {
+              $members = dumpbin /linkermember:1 $library.FullName 2>$null
+              if (-not $members) { continue }
+              $hits = @()
+              foreach ($symbol in $wanted) {
+                if ($members -match ('\s' + [regex]::Escape($symbol) + '$')) { $hits += $symbol }
+              }
+              if ($hits.Count) { Write-Output ("  {0}`n    {1}" -f $library.FullName, ($hits -join ' ')) }
+            }
+          }
+          Write-Output '== calls left by source variant, at /Od =='
+          $body = @'
+          long ProbeCas(volatile long *v) { return InterlockedCompareExchange(v, 1, 0); }
+          __int64 ProbeCas64(volatile __int64 *v) { return InterlockedCompareExchange64(v, 1, 0); }
+          long ProbeExchange(volatile long *v) { return InterlockedExchange(v, 1); }
+          long ProbeIncrement(volatile long *v) { return InterlockedIncrement(v); }
+          long ProbeDecrement(volatile long *v) { return InterlockedDecrement(v); }
+          '@
+          $pragmas = ($wanted | ForEach-Object { "#pragma intrinsic($_)" }) -join "`n"
+          $variants = [ordered]@{
+            'plain'   = "#include <windows.h>`n$body"
+            'pragma'  = "#include <windows.h>`n$pragmas`n$body"
+          }
+          $index = 0
+          foreach ($variant in $variants.Keys) {
+            $index++
+            $probe = Join-Path $env:RUNNER_TEMP "atomicprobe$index.c"
+            $object = Join-Path $env:RUNNER_TEMP "atomicprobe$index.obj"
+            Set-Content -Encoding ascii -Path $probe -Value $variants[$variant]
+            $log = cl /nologo /c /Od /W4 $probe "/Fo$object" 2>&1
+            if (-not (Test-Path $object)) {
+              Write-Output ("  {0,-8} did not compile: {1}" -f $variant, ($log -join ' '))
+              continue
+            }
+            $undefined = dumpbin /symbols $object 2>$null |
+              Select-String 'UNDEF' |
+              ForEach-Object { ($_.Line.Trim() -split '\s+')[-1] } |
+              Where-Object { $_ -like '*Interlocked*' } | Sort-Object -Unique
+            $state = if ($undefined) { $undefined -join ' ' } else { 'all expanded inline' }
+            Write-Output ("  {0,-8} {1}" -f $variant, $state)
+            $log | Where-Object { $_ -match 'warning C41' } | ForEach-Object { Write-Output "           $_" }
           }
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}

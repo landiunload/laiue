@@ -8,6 +8,20 @@
 
 #include <string.h>
 
+/* winnt.h requests the interlocked intrinsics only inside its _M_AMD64 and
+ * _M_IX86 branches, so on ARM64 a /Od build emits ordinary calls to CRT
+ * helpers that a /NODEFAULTLIB link cannot resolve. Asking for the same
+ * intrinsics here is exactly what those branches already do. */
+#if defined(_M_ARM64) && !defined(__clang__)
+#pragma warning(push)
+/* A name without an intrinsic form on this target stays an ordinary call. */
+#pragma warning(disable : 4163)
+#pragma intrinsic(_InterlockedCompareExchange)
+#pragma intrinsic(_InterlockedCompareExchange64)
+#pragma intrinsic(_InterlockedExchange)
+#pragma warning(pop)
+#endif
+
 typedef struct WindowsDirectoryIterator
 {
     HANDLE handle;

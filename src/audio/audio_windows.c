@@ -13,6 +13,18 @@
 
 #include <stddef.h>
 
+/* winnt.h requests the interlocked intrinsics only inside its _M_AMD64 and
+ * _M_IX86 branches, so on ARM64 a /Od build emits ordinary calls to CRT
+ * helpers that a /NODEFAULTLIB link cannot resolve. */
+#if defined(_M_ARM64) && !defined(__clang__)
+#pragma warning(push)
+/* A name without an intrinsic form on this target stays an ordinary call. */
+#pragma warning(disable : 4163)
+#pragma intrinsic(_InterlockedIncrement)
+#pragma intrinsic(_InterlockedDecrement)
+#pragma warning(pop)
+#endif
+
 #define AUDIO_EVENT_CAPACITY 32U
 
 typedef struct AudioMediaCallback AudioMediaCallback;

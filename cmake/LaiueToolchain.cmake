@@ -326,15 +326,6 @@ if(LAIUE_PLATFORM_WINDOWS)
     endif()
     target_sources(laiue_windows_no_crt INTERFACE
         "$<TARGET_OBJECTS:laiue_runtime>")
-    if(LAIUE_TARGET_ARM64)
-        # На ARM64 MSVC разворачивает _Interlocked* только оптимизатором, а
-        # /Oi этого не меняет: в Debug они остаются вызовами помощников.
-        # softintrin.lib — поставляемая Microsoft программная реализация ровно
-        # этих интринсиков; она не тянет CRT, и проверка imports готовых DLL
-        # это подтверждает. clang-cl разворачивает их сам и библиотеки не ждёт.
-        target_link_libraries(laiue_windows_no_crt INTERFACE
-            $<$<C_COMPILER_ID:MSVC>:softintrin.lib>)
-    endif()
     target_link_options(laiue_windows_no_crt INTERFACE
         /NODEFAULTLIB
         /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT
