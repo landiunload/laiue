@@ -19,7 +19,7 @@ endif()
 string(REPLACE "\r\n" "\n" dynamic_symbols "${dynamic_symbols}")
 # Внутренние статические границы движка не должны попадать в публичный
 # ABI: Platform* принадлежит platform_support, Scalar* — math_support.
-foreach(internal_prefix Platform Scalar)
+foreach(internal_prefix Platform Scalar Image Png Gif Jpeg Inflate Wave Mp3 Sound Lt)
     string(REGEX MATCH "(^|\n)[^\n]*[ \t]${internal_prefix}[A-Za-z0-9_]*($|\n)"
         leaked_symbol "${dynamic_symbols}")
     if(NOT leaked_symbol STREQUAL "")

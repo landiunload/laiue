@@ -8,7 +8,10 @@
 
 #define TEXTURE_PACK_NAME_MAX LAIUE_CONTENT_NAME_CAPACITY
 #define TEXTURE_PACK_MIN_LAYERS 1u
+// Материалов столько же, сколько было всегда; слоёв в массиве больше,
+// потому что анимированный материал занимает по слою на кадр.
 #define TEXTURE_PACK_MAX_LAYERS 64u
+#define TEXTURE_PACK_MAX_SLICES 256u
 
 typedef struct TexturePackEntry
 {
@@ -22,9 +25,14 @@ typedef struct TexturePackList
     uint32_t count;
 } TexturePackList;
 
-// LTP contains one layer per application-defined material.  Material id N
-// maps to layer N - 1; ids beyond the available 1..64 layers clamp to the last
-// layer.  The renderer assigns no game meaning to any layer.
+// LTP описывает от одного до 64 материалов. Material id N берёт описание
+// N - 1; id сверх имеющихся зажимается к последнему. Материал занимает
+// один слой массива, а анимированный — по слою на кадр подряд.
+//
+// Кадр выбирается по времени, которое приложение передаёт в
+// RendererFrameSetup: расписание лежит в паке, а часы принадлежат
+// приложению — ровно как со светом. Никакого игрового смысла слою
+// рендерер не приписывает.
 LAIUE_RENDER_API bool TexturePackEnumerateFrom(LaiueContentCatalog *catalog,
                                                TexturePackList *outList);
 LAIUE_RENDER_API bool TexturePackActivateIn(LaiueContentCatalog *catalog, const wchar_t *name);

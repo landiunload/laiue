@@ -60,6 +60,11 @@ typedef struct PlatformDirectoryEntry
 typedef struct PlatformPathInformation
 {
     uint64_t size;
+    // Время последней записи в наносекундах от эпохи платформы. Годится
+    // для сравнения двух файлов между собой — «этот новее того», — но
+    // не для показа пользователю: часы и точность у файловых систем
+    // разные. Ноль означает, что время получить не удалось.
+    uint64_t modifiedTime;
     bool exists;
     bool isDirectory;
     bool isSymbolicLink;

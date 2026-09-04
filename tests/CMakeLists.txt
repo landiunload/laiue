@@ -119,8 +119,12 @@ if(TARGET laiue_render AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN")
     # Кадр рисуется целиком и проверяется по пикселям. Драйвер может
     # отсутствовать на машине разработчика, поэтому тест сам сообщает об
     # этом кодом возврата, а не падает молча.
-    add_executable(laiue_renderer_offscreen_test renderer_offscreen_test.c)
-    target_link_libraries(laiue_renderer_offscreen_test PRIVATE laiue_render)
+    add_executable(laiue_renderer_offscreen_test
+        renderer_offscreen_test.c
+        texc_fixtures.h)
+    target_link_libraries(laiue_renderer_offscreen_test PRIVATE
+        laiue_content
+        laiue_render)
     laiue_configure_standalone_executable(
         laiue_renderer_offscreen_test RendererOffscreenTestEntryPoint)
     add_test(NAME laiue.render.offscreen_frame
@@ -134,7 +138,7 @@ if(TARGET laiue_audio)
     laiue_configure_standalone_executable(laiue_audio_api_test AudioApiTestEntryPoint)
     add_test(NAME laiue.audio.mixer COMMAND laiue_audio_api_test)
 
-    add_executable(laiue_audio_pack_test audio_pack_test.c)
+    add_executable(laiue_audio_pack_test audio_pack_test.c mp3_fixtures.h)
     target_link_libraries(laiue_audio_pack_test PRIVATE laiue_audio laiue_content)
     laiue_configure_standalone_executable(
         laiue_audio_pack_test AudioPackTestEntryPoint)
@@ -151,4 +155,34 @@ if(TARGET laiue_audio)
     set_tests_properties(laiue.audio.system_backend PROPERTIES
         SKIP_RETURN_CODE 125
         TIMEOUT 30)
+endif()
+
+if(TARGET laiue_media_support)
+    # Запись `.la` проверяется вместе с движком: круг замыкается
+    # настоящим декодером, если звуковая подсистема в этом профиле
+    # собрана. Без неё остаются разбор WAV и размеры контейнера — они
+    # от звука не зависят.
+    add_executable(laiue_soundc_test soundc_test.c)
+    target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
+    if(TARGET laiue_audio)
+        target_link_libraries(laiue_soundc_test PRIVATE laiue_audio)
+        target_compile_definitions(laiue_soundc_test PRIVATE
+            LAIUE_SOUNDC_TEST_WITH_AUDIO=1)
+    endif()
+    laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)
+    add_test(NAME laiue.tools.soundc COMMAND laiue_soundc_test)
+endif()
+
+if(TARGET laiue_media_support)
+    add_executable(laiue_mp3_test mp3_test.c mp3_fixtures.h)
+    target_link_libraries(laiue_mp3_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_mp3_test Mp3TestEntryPoint)
+    add_test(NAME laiue.media.mp3 COMMAND laiue_mp3_test)
+endif()
+
+if(TARGET laiue_media_support)
+    add_executable(laiue_texc_test texc_test.c texc_fixtures.h)
+    target_link_libraries(laiue_texc_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_texc_test TexcTestEntryPoint)
+    add_test(NAME laiue.tools.texc COMMAND laiue_texc_test)
 endif()

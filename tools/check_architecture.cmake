@@ -3,15 +3,16 @@ if(NOT DEFINED SOURCE_ROOT)
         "${CMAKE_CURRENT_LIST_DIR}/../src" ABSOLUTE)
 endif()
 
-set(allowed_audio audio content math platform)
+set(allowed_audio audio content math media platform)
 set(allowed_content content platform)
 set(allowed_input input)
 set(allowed_math math)
+set(allowed_media media)
 set(allowed_mesh mesh platform render world)
 set(allowed_mod mod platform)
 set(allowed_physics physics)
 set(allowed_platform platform)
-set(allowed_render content platform render)
+set(allowed_render content media platform render)
 set(allowed_runtime runtime)
 set(allowed_scene math mesh platform render scene world)
 set(allowed_ui math render scene ui)
@@ -27,7 +28,7 @@ set(allowed_world platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules content math mesh mod physics runtime scene world)
+set(portable_modules content math media mesh mod physics runtime scene world)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h

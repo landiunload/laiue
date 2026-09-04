@@ -67,6 +67,8 @@ Windows отвергается сразу.
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
 | `LAIUE_EXPECTED_ARCHITECTURE` | `auto` | fail-fast проверка `x86_64`, `arm64` или macOS `universal2` |
+| `LAIUE_BUILD_TOOLS` | desktop: `ON`, external и кросс-сборка: `OFF` | офлайн-инструменты подготовки содержимого; в SDK не устанавливаются |
+| `LAIUE_BUILD_BENCHMARKS` | `OFF` | ручные измерения производительности; в CTest не входят |
 | `BUILD_TESTING` | `ON` | зарегистрировать CTest targets |
 
 Все определения, include paths и linker flags target-scoped. CMake не

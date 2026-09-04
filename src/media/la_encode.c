@@ -1,13 +1,12 @@
-#include "la_encode.h"
+#include "media/la_encode.h"
 
 #include <stddef.h>
 
 #define LA_MAGIC 0x3153414Cu   // L, A, S, 1 little-endian
-#define LA_VERSION 1u
 
 #define LA_MIN_SAMPLE_RATE 1000u
 #define LA_MAX_SAMPLE_RATE 384000u
-#define LA_MAX_FILE_BYTES 0x20000000u
+#define SOUND_LA_MAX_FILE_BYTES 0x20000000u
 
 // === IMA ADPCM ===
 //
@@ -151,87 +150,89 @@ static uint32_t EncodeAdpcmChannel(const int16_t *samples, uint32_t frameCount, 
     return 4u + byteCount;
 }
 
-static LaStatus PayloadBytes(LaEncoding encoding, uint32_t frameCount, uint32_t channelCount,
+static SoundStatus PayloadBytes(SoundEncoding encoding, uint32_t frameCount, uint32_t channelCount,
                              uint32_t *outBytes)
 {
-    if (frameCount == 0u || (channelCount != 1u && channelCount != 2u)) return LA_INVALID_ARGUMENT;
-    if (frameCount > LA_MAX_FRAMES) return LA_TOO_LARGE;
+    if (frameCount == 0u || (channelCount != 1u && channelCount != 2u)) return SOUND_INVALID_ARGUMENT;
+    if (frameCount > SOUND_LA_MAX_FRAMES) return SOUND_TOO_LARGE;
 
-    uint64_t total = encoding == LA_ENCODING_PCM16
+    uint64_t total = encoding == SOUND_ENCODING_PCM16
                          ? (uint64_t)frameCount * channelCount * sizeof(int16_t)
                          : (uint64_t)channelCount * (4u + (uint64_t)AdpcmChannelBytes(frameCount));
-    if (total + LA_HEADER_BYTES > LA_MAX_FILE_BYTES) return LA_TOO_LARGE;
+    if (total + SOUND_LA_HEADER_BYTES > SOUND_LA_MAX_FILE_BYTES) return SOUND_TOO_LARGE;
     *outBytes = (uint32_t)total;
-    return LA_OK;
+    return SOUND_OK;
 }
 
-LaStatus LaEncodedBytes(LaEncoding encoding, uint32_t frameCount, uint32_t channelCount,
+SoundStatus SoundEncodedBytes(SoundEncoding encoding, uint32_t frameCount, uint32_t channelCount,
                         uint32_t *outBytes)
 {
-    if (outBytes == NULL) return LA_INVALID_ARGUMENT;
-    if (encoding != LA_ENCODING_PCM16 && encoding != LA_ENCODING_ADPCM) return LA_INVALID_ARGUMENT;
+    if (outBytes == NULL) return SOUND_INVALID_ARGUMENT;
+    if (encoding != SOUND_ENCODING_PCM16 && encoding != SOUND_ENCODING_ADPCM) return SOUND_INVALID_ARGUMENT;
 
     uint32_t payload = 0u;
-    LaStatus status = PayloadBytes(encoding, frameCount, channelCount, &payload);
-    if (status != LA_OK) return status;
-    *outBytes = LA_HEADER_BYTES + payload;
-    return LA_OK;
+    SoundStatus status = PayloadBytes(encoding, frameCount, channelCount, &payload);
+    if (status != SOUND_OK) return status;
+    *outBytes = SOUND_LA_HEADER_BYTES + payload;
+    return SOUND_OK;
 }
 
-LaStatus LaEncode(const int16_t *samples, uint32_t frameCount, uint32_t channelCount,
-                  uint32_t sampleRate, LaEncoding encoding, void *outBytes,
-                  uint32_t capacityBytes, uint32_t *outWritten)
+SoundStatus SoundEncode(const SoundClip *clip, void *outBytes, uint32_t capacityBytes,
+                        uint32_t *outWritten)
 {
-    if (samples == NULL || outBytes == NULL) return LA_INVALID_ARGUMENT;
-    if (encoding != LA_ENCODING_PCM16 && encoding != LA_ENCODING_ADPCM) return LA_INVALID_ARGUMENT;
-    if (sampleRate < LA_MIN_SAMPLE_RATE || sampleRate > LA_MAX_SAMPLE_RATE)
-        return LA_INVALID_ARGUMENT;
+    if (clip == NULL || clip->samples == NULL || outBytes == NULL) return SOUND_INVALID_ARGUMENT;
+    if (clip->encoding != SOUND_ENCODING_PCM16 && clip->encoding != SOUND_ENCODING_ADPCM)
+    {
+        return SOUND_INVALID_ARGUMENT;
+    }
+    if (clip->sampleRate < LA_MIN_SAMPLE_RATE || clip->sampleRate > LA_MAX_SAMPLE_RATE)
+    {
+        return SOUND_INVALID_ARGUMENT;
+    }
 
     uint32_t payloadBytes = 0u;
-    LaStatus status = PayloadBytes(encoding, frameCount, channelCount, &payloadBytes);
-    if (status != LA_OK) return status;
-    if (capacityBytes < LA_HEADER_BYTES + payloadBytes) return LA_BUFFER_TOO_SMALL;
+    SoundStatus status =
+        PayloadBytes(clip->encoding, clip->frameCount, clip->channelCount, &payloadBytes);
+    if (status != SOUND_OK) return status;
+
+    uint32_t required = SOUND_LA_HEADER_BYTES + payloadBytes;
+    if (capacityBytes < required) return SOUND_BUFFER_TOO_SMALL;
 
     uint8_t *file = (uint8_t *)outBytes;
     WriteU32Le(file, LA_MAGIC);
-    WriteU16Le(file + 4, LA_VERSION);
-    WriteU16Le(file + 6, LA_HEADER_BYTES);
-    WriteU16Le(file + 8, channelCount);
-    WriteU16Le(file + 10, (uint32_t)encoding);
-    WriteU32Le(file + 12, sampleRate);
-    WriteU32Le(file + 16, frameCount);
+    WriteU16Le(file + 4, SOUND_LA_VERSION);
+    WriteU16Le(file + 6, SOUND_LA_HEADER_BYTES);
+    WriteU16Le(file + 8, clip->channelCount);
+    WriteU16Le(file + 10, (uint32_t)clip->encoding);
+    WriteU32Le(file + 12, clip->sampleRate);
+    WriteU32Le(file + 16, clip->frameCount);
     WriteU32Le(file + 20, payloadBytes);
+    // Отпечаток исходника: по нему движок узнаёт, не устарел ли файл, не
+    // читая сам исходник.
+    WriteU32Le(file + 24, (uint32_t)(clip->sourceModifiedTime & 0xFFFFFFFFu));
+    WriteU32Le(file + 28, (uint32_t)(clip->sourceModifiedTime >> 32));
+    WriteU32Le(file + 32, clip->sourceSizeBytes);
+    WriteU32Le(file + 36, 0u);
 
-    uint8_t *payload = file + LA_HEADER_BYTES;
-    if (encoding == LA_ENCODING_PCM16)
+    uint8_t *payload = file + SOUND_LA_HEADER_BYTES;
+    if (clip->encoding == SOUND_ENCODING_PCM16)
     {
         // Сэмплы пишутся побайтово, чтобы файл не зависел от порядка
         // байтов машины, на которой собран пак.
-        for (uint32_t index = 0; index < frameCount * channelCount; ++index)
+        for (uint32_t index = 0; index < clip->frameCount * clip->channelCount; ++index)
         {
-            WriteU16Le(payload + (size_t)index * 2u, (uint32_t)(uint16_t)samples[index]);
+            WriteU16Le(payload + (size_t)index * 2u, (uint32_t)(uint16_t)clip->samples[index]);
         }
     }
     else
     {
-        for (uint32_t channel = 0; channel < channelCount; ++channel)
+        for (uint32_t channel = 0; channel < clip->channelCount; ++channel)
         {
-            payload += EncodeAdpcmChannel(samples + channel, frameCount, channelCount, payload);
+            payload += EncodeAdpcmChannel(clip->samples + channel, clip->frameCount,
+                                          clip->channelCount, payload);
         }
     }
 
-    if (outWritten != NULL) *outWritten = LA_HEADER_BYTES + payloadBytes;
-    return LA_OK;
-}
-
-const char *LaStatusText(LaStatus status)
-{
-    switch (status)
-    {
-    case LA_OK: return "ok";
-    case LA_INVALID_ARGUMENT: return "invalid argument";
-    case LA_TOO_LARGE: return "the sound exceeds the container limits";
-    case LA_BUFFER_TOO_SMALL: return "the output buffer is too small";
-    }
-    return "unknown error";
+    if (outWritten != NULL) *outWritten = required;
+    return SOUND_OK;
 }

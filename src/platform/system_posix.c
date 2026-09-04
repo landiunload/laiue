@@ -509,7 +509,13 @@ bool PlatformCreateDirectory(const wchar_t *path)
         return false;
     if (mkdir(nativePath, 0755) == 0)
         return true;
-    return errno == EEXIST;
+    if (errno != EEXIST)
+        return false;
+    // Каталог уже есть — это успех. Файл на том же месте успехом не
+    // является: вызывающая сторона просила каталог и получит отказ
+    // позже, в непонятном месте, если ответить здесь «да».
+    struct stat status;
+    return stat(nativePath, &status) == 0 && S_ISDIR(status.st_mode);
 }
 
 bool PlatformPathExists(const wchar_t *path)
@@ -534,6 +540,9 @@ bool PlatformGetPathInformation(const wchar_t *path, PlatformPathInformation *in
     information->isDirectory = S_ISDIR(status.st_mode);
     information->isSymbolicLink = S_ISLNK(status.st_mode);
     information->size = status.st_size < 0 ? 0 : (uint64_t)status.st_size;
+    information->modifiedTime = status.st_mtime < 0
+        ? 0U
+        : (uint64_t)status.st_mtime * 1000000000U + (uint64_t)status.st_mtim.tv_nsec;
     return true;
 }
 

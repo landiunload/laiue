@@ -13,9 +13,13 @@ static const LaiueContentFormat g_formats[LAIUE_CONTENT_TYPE_COUNT] = {
         L"Текстура", L"textures", L".lt",
         LAIUE_CONTENT_STORAGE_FILE, false,
     },
+    // Текстурпак — каталог, а не один файл: имена текстур задаёт
+    // приложение, файлы внутри вправе лежать по подпапкам, и заменить
+    // одну текстуру должно быть можно, положив рядом файл с тем же
+    // именем. Тот же приём у шейдерпаков и звукопаков.
     [LAIUE_CONTENT_TEXTURE_PACK] = {
         L"Текстурпак", L"textures", L".ltp",
-        LAIUE_CONTENT_STORAGE_FILE, true,
+        LAIUE_CONTENT_STORAGE_DIRECTORY, true,
     },
     [LAIUE_CONTENT_SOUND] = {
         L"Звук", L"sounds", L".la",
@@ -130,4 +134,46 @@ bool LaiueContentNameIsSafe(const wchar_t* name)
     return length > 0 && name[0] != L' ' && name[length - 1u] != L' '
         && name[length - 1u] != L'.'
         && !IsWindowsDeviceName(name, length);
+}
+
+bool LaiueContentPathIsSafe(const wchar_t* path)
+{
+    if (path == NULL || path[0] == 0)
+    {
+        return false;
+    }
+
+    wchar_t segment[LAIUE_CONTENT_NAME_CAPACITY];
+    uint32_t segmentLength = 0;
+    uint32_t segmentCount = 0;
+    for (uint32_t index = 0;; ++index)
+    {
+        wchar_t character = path[index];
+        if (character != L'/' && character != 0)
+        {
+            if (segmentLength + 1u >= LAIUE_CONTENT_NAME_CAPACITY)
+            {
+                return false;
+            }
+            segment[segmentLength++] = character;
+            continue;
+        }
+
+        // Разделитель или конец: проверяется накопленный сегмент.
+        segment[segmentLength] = 0;
+        if (!LaiueContentNameIsSafe(segment))
+        {
+            return false;
+        }
+        if (++segmentCount > LAIUE_CONTENT_PATH_SEGMENT_MAX)
+        {
+            return false;
+        }
+        segmentLength = 0;
+
+        if (character == 0)
+        {
+            return true;
+        }
+    }
 }

@@ -344,7 +344,13 @@ bool PlatformUtf8ToWide(const char* input, uint32_t length, wchar_t* output,
 bool PlatformCreateDirectory(const wchar_t* path)
 {
     if (CreateDirectoryW(path, NULL)) return true;
-    return GetLastError() == ERROR_ALREADY_EXISTS;
+    if (GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    // Каталог уже есть — это успех. Файл на том же месте успехом не
+    // является: вызывающая сторона просила каталог и получит отказ
+    // позже, в непонятном месте, если ответить здесь «да».
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 bool PlatformPathExists(const wchar_t* path)
@@ -367,6 +373,10 @@ bool PlatformGetPathInformation(
         (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     information->size = ((uint64_t)data.nFileSizeHigh << 32U)
         | data.nFileSizeLow;
+    // FILETIME считает интервалы по сто наносекунд.
+    information->modifiedTime =
+        (((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32U)
+            | data.ftLastWriteTime.dwLowDateTime) * 100U;
     return true;
 }
 

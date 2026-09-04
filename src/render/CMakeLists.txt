@@ -45,6 +45,7 @@ laiue_add_module(render
         renderer.h
         shader_pack.c
         shader_pack.h
+        texture_build.c
         texture_pack.c
         texture_pack.h
         texture_pack_internal.h
@@ -56,7 +57,8 @@ laiue_add_module(render
     PUBLIC_LINK
         laiue_content
     LINK
-        ${backend_links})
+        ${backend_links}
+        laiue::media_support)
 
 # Бэкенд включает render/generated/<backend>/*.h. Binary include идёт
 # первым, поэтому обычная сборка никогда не перезаписывает checked-in

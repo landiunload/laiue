@@ -7,7 +7,6 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define LAIUE_CONTENT_NAME_CAPACITY 128u
 #define LAIUE_CONTENT_PATH_CAPACITY 32768u
 
 // Immutable, application-owned view of a content tree.  The root can point to
@@ -54,6 +53,35 @@ LAIUE_CONTENT_API bool LaiueContentCatalogBuildPath(LaiueContentCatalog *catalog
                                                     LaiueContentType type, const wchar_t *name,
                                                     const wchar_t *childName, wchar_t *destination,
                                                     uint32_t capacity);
+
+// Путь к ресурсу внутри пака: `resourcePath` вправе содержать '/', и
+// каждый его сегмент проверяется как отдельное имя. `extension`
+// дописывается как есть и может быть NULL. Так пак делится на подпапки,
+// а выйти за его пределы всё равно нельзя.
+LAIUE_CONTENT_API bool LaiueContentCatalogBuildResourcePath(
+    LaiueContentCatalog *catalog, LaiueContentType packType, const wchar_t *packName,
+    const wchar_t *resourcePath, const wchar_t *extension, wchar_t *destination,
+    uint32_t capacity);
+
+// Сколько форматов может стоять в списке приоритета одного типа.
+#define LAIUE_CONTENT_FORMAT_ORDER_MAX 8u
+
+// Порядок, в котором движок ищет ресурс: сначала расширения из
+// <каталог типа>/formats.txt в порядке этого файла, затем остальные из
+// `defaults`, сохраняя их исходный порядок.
+//
+// Файл задаёт приоритет, а не белый список: формат, который в нём не
+// упомянут, остаётся доступным — просто позже. Иначе опечатка в одной
+// строке молча прятала бы содержимое пака.
+//
+// Записи `outOrder` указывают внутрь `defaults`, ничего не копируется.
+// Возвращает их число; без файла и без каталога это сам `defaults`.
+LAIUE_CONTENT_API uint32_t LaiueContentCatalogOrderFormats(LaiueContentCatalog *catalog,
+                                                           LaiueContentType packType,
+                                                           const wchar_t *const *defaults,
+                                                           uint32_t defaultCount,
+                                                           const wchar_t **outOrder,
+                                                           uint32_t capacity);
 
 // Borrowed process-wide catalog rooted at the executable directory.  It exists
 // for compatibility wrappers and must not be destroyed by the application.

@@ -69,15 +69,20 @@ typedef struct ChunkConstants
     float chunkOriginRelative[3];
     float meshScale;
     float sunDirection[3];
-    float textureLayerCount;
+    float materialCount;
     float sunColor[3];
     float reserved;
     float ambientColor[3];
     float gammaInverse;
+    // По байту слоя на материал: кадр анимации выбран процессором, и
+    // шейдеру остаётся только достать номер.
+    uint32_t materialSlices[16];
 } ChunkConstants;
 
-_Static_assert(sizeof(ChunkConstants) == 128,
+_Static_assert(sizeof(ChunkConstants) == 192,
     "ChunkConstants shares its layout with the HLSL cbuffer");
+_Static_assert(offsetof(ChunkConstants, materialSlices) == 128,
+    "the slice table follows the lighting rows");
 _Static_assert(offsetof(ChunkConstants, sunDirection) == 80,
     "HLSL packs float3 chunkOriginRelative and float meshScale into one row");
 _Static_assert(offsetof(ChunkConstants, gammaInverse) == 124,
@@ -228,7 +233,8 @@ struct Renderer
 
     GpuImage blockTexture;
     GpuImage blockNormalTexture;
-    uint32_t blockTextureLayerCount;
+    TexturePackAnimationSet blockAnimation;
+    TexturePackMaterialNames materialNames;
     GpuImage fontTexture;
     bool fontReady;
 
@@ -1163,15 +1169,23 @@ static bool UploadImagePixels(Renderer *renderer, GpuImage *image, const uint8_t
 static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *pack, bool normals,
                                     GpuImage *outImage)
 {
-    uint32_t layerCount = pack->layerCount;
+    uint32_t layerCount = pack->sliceCount;
     if (layerCount == 0u) return false;
 
-    if (!ImageCreate(renderer, pack->width, pack->height, layerCount, VK_FORMAT_R8G8B8A8_UNORM,
+    // Пак без карт нормалей: на каждый слой кладётся плоская нормаль
+    // 1x1 с полной открытостью. Освещение вырождается в чистый ламберт
+    // по граням, а не отказывает — иначе пак, собранный без нормалей,
+    // просто не загрузился бы.
+    bool flat = normals && pack->normalPixels == NULL;
+    uint32_t width = flat ? 1u : pack->width;
+    uint32_t height = flat ? 1u : pack->height;
+
+    if (!ImageCreate(renderer, width, height, layerCount, VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D_ARRAY, false, outImage))
         return false;
 
-    VkDeviceSize layerBytes = (VkDeviceSize)pack->width * pack->height * 4u;
+    VkDeviceSize layerBytes = (VkDeviceSize)width * height * 4u;
     GpuBuffer staging;
     if (!BufferCreate(renderer, layerBytes * layerCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
                       &staging))
@@ -1182,6 +1196,16 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
 
     for (uint32_t layer = 0; layer < layerCount; ++layer)
     {
+        uint8_t *destination = staging.mapped + layerBytes * layer;
+        if (flat)
+        {
+            destination[0] = 128u;
+            destination[1] = 128u;
+            destination[2] = 255u;
+            destination[3] = 255u;
+            continue;
+        }
+
         TexturePackSubresource subresource;
         bool ok = normals ? TexturePackGetNormalSubresource(pack, layer, 0u, &subresource)
                           : TexturePackGetSubresource(pack, layer, 0u, &subresource);
@@ -1191,7 +1215,7 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
             ImageDestroy(renderer, outImage);
             return false;
         }
-        memcpy(staging.mapped + layerBytes * layer, subresource.pixels, (size_t)layerBytes);
+        memcpy(destination, subresource.pixels, (size_t)layerBytes);
     }
 
     VkCommandBuffer commandBuffer = BeginImmediate(renderer);
@@ -1205,7 +1229,7 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, layerCount },
-        .imageExtent = { pack->width, pack->height, 1u },
+        .imageExtent = { width, height, 1u },
     };
     vkCmdCopyBufferToImage(commandBuffer, staging.buffer, outImage->image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
@@ -1252,6 +1276,7 @@ static RendererContentStatus MapTexturePackLoadStatus(TexturePackLoadStatus stat
     switch (status)
     {
     case TEXTURE_PACK_LOAD_OK: return RENDERER_CONTENT_OK;
+    case TEXTURE_PACK_LOAD_INCOMPLETE: return RENDERER_CONTENT_INCOMPLETE;
     case TEXTURE_PACK_LOAD_NO_ACTIVE_PACK: return RENDERER_CONTENT_NO_ACTIVE;
     case TEXTURE_PACK_LOAD_INVALID: return RENDERER_CONTENT_INVALID;
     case TEXTURE_PACK_LOAD_IO_ERROR: return RENDERER_CONTENT_IO_ERROR;
@@ -1643,7 +1668,7 @@ void RendererReleaseWorld(Renderer *renderer)
     }
     ImageDestroy(renderer, &renderer->blockTexture);
     ImageDestroy(renderer, &renderer->blockNormalTexture);
-    renderer->blockTextureLayerCount = 0u;
+    memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
 
     for (uint32_t blockIndex = 0; blockIndex < renderer->poolBlockCount; ++blockIndex)
     {
@@ -1668,11 +1693,14 @@ bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
 
     TexturePackData pack;
     memset(&pack, 0, sizeof(pack));
-    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, &pack)
-                                                   : TexturePackLoadActive(&pack);
+    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack)
+                                                   : TexturePackLoadActiveFrom(LaiueContentCatalogDefault(),
+                                  renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack);
     renderer->texturePackLoadStatus = MapTexturePackLoadStatus(status);
 
-    if (status == TEXTURE_PACK_LOAD_OK)
+    if (status == TEXTURE_PACK_LOAD_OK || status == TEXTURE_PACK_LOAD_INCOMPLETE)
     {
         if (!CreateBlockArrayTexture(renderer, &pack, false, &renderer->blockTexture) ||
             !CreateBlockArrayTexture(renderer, &pack, true, &renderer->blockNormalTexture))
@@ -1683,7 +1711,7 @@ bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
         }
         else
         {
-            renderer->blockTextureLayerCount = pack.layerCount;
+            TexturePackCaptureAnimation(&renderer->blockAnimation, &pack);
         }
         TexturePackRelease(&pack);
     }
@@ -1692,7 +1720,7 @@ bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
     {
         ImageDestroy(renderer, &renderer->blockTexture);
         ImageDestroy(renderer, &renderer->blockNormalTexture);
-        renderer->blockTextureLayerCount = 0u;
+        memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
         return false;
     }
 
@@ -2042,8 +2070,11 @@ bool RendererBeginFrame(Renderer *renderer, const RendererFrameSetup *frame)
     memcpy(renderer->chunkConstants.sunDirection, frame->sunDirection, sizeof(float) * 3u);
     memcpy(renderer->chunkConstants.sunColor, frame->sunColor, sizeof(float) * 3u);
     memcpy(renderer->chunkConstants.ambientColor, frame->ambientColor, sizeof(float) * 3u);
-    renderer->chunkConstants.textureLayerCount =
-        (float)(renderer->blockTextureLayerCount > 0u ? renderer->blockTextureLayerCount : 1u);
+    renderer->chunkConstants.materialCount =
+        (float)(renderer->blockAnimation.materialCount > 0u ? renderer->blockAnimation.materialCount
+                                                            : 1u);
+    TexturePackFillSliceTable(&renderer->blockAnimation, frame->animationSeconds,
+                              renderer->chunkConstants.materialSlices);
     renderer->chunkConstants.gammaInverse = gammaInverse;
     renderer->chunkConstants.meshScale = 1.0f;
 
@@ -2312,22 +2343,33 @@ void RendererResize(Renderer *renderer, int32_t width, int32_t height)
 
 // === Контент ===
 
+bool RendererSetMaterialNames(Renderer *renderer, const wchar_t *const *names, uint32_t count)
+{
+    if (renderer == NULL) return false;
+    return TexturePackMaterialNamesSet(&renderer->materialNames, names, count);
+}
+
 bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *catalog)
 {
     if (renderer == NULL || !renderer->worldReady) return false;
 
     TexturePackData pack;
     memset(&pack, 0, sizeof(pack));
-    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, &pack)
-                                                   : TexturePackLoadActive(&pack);
+    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack)
+                                                   : TexturePackLoadActiveFrom(LaiueContentCatalogDefault(),
+                                  renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack);
     renderer->texturePackLoadStatus = MapTexturePackLoadStatus(status);
-    if (status != TEXTURE_PACK_LOAD_OK) return false;
+    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
+        return false;
 
     GpuImage albedo;
     GpuImage normals;
     bool built = CreateBlockArrayTexture(renderer, &pack, false, &albedo) &&
                  CreateBlockArrayTexture(renderer, &pack, true, &normals);
-    uint32_t layerCount = pack.layerCount;
+    TexturePackAnimationSet animation;
+    TexturePackCaptureAnimation(&animation, &pack);
     TexturePackRelease(&pack);
     if (!built)
     {
@@ -2343,7 +2385,7 @@ bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *cata
     ImageDestroy(renderer, &renderer->blockNormalTexture);
     renderer->blockTexture = albedo;
     renderer->blockNormalTexture = normals;
-    renderer->blockTextureLayerCount = layerCount;
+    renderer->blockAnimation = animation;
     RefreshChunkSetTextures(renderer);
     return true;
 }

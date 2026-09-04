@@ -1,11 +1,11 @@
-// soundc — офлайн-конвертер WAV в `.la`. Он готовит содержимое до
-// запуска игры, поэтому декодирование чужих контейнеров остаётся здесь,
-// а движок читает только свой формат. Инструмент собирается тем же
+// soundc — офлайн-конвертер WAV в `.la`. Он необязателен: WAV в паке
+// движок читает и сам, а `.la` лишь избавляет загрузку от разбора и
+// вчетверо сокращает размер при ADPCM. Инструмент собирается тем же
 // профилем, что и движок: без CRT на Windows и поверх платформенного
 // слоя везде.
 
-#include "la_encode.h"
-#include "wave_decode.h"
+#include "media/la_encode.h"
+#include "media/sound.h"
 
 #include "platform/system.h"
 
@@ -79,8 +79,10 @@ static void ReportUsage(void)
         "  --adpcm   store IMA ADPCM: four times smaller, slightly lossy\n"
         "  --help    show this text\n"
         "\n"
-        "Input may be PCM 8, 16, 24 or 32 bit or IEEE float 32 or 64 bit,\n"
-        "mono or stereo, including WAVE_FORMAT_EXTENSIBLE.\n"
+        "WAV input may be PCM 8, 16, 24 or 32 bit or IEEE float 32 or 64 bit,\n"
+        "mono or stereo, including WAVE_FORMAT_EXTENSIBLE. MP3 input is\n"
+        "MPEG-1 Layer III at 32000, 44100 or 48000 Hz; the encoder delay that\n"
+        "LAME records is removed, so the sound starts where it should.\n"
         "Put the result into sounds/<pack>.lap under the name the game asks for.\n");
 }
 
@@ -94,7 +96,7 @@ static bool WideEquals(const wchar_t *left, const wchar_t *right)
     return *left == *right;
 }
 
-static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, LaEncoding encoding)
+static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, SoundEncoding encoding)
 {
     uint8_t *fileBytes = NULL;
     uint64_t fileSize = 0u;
@@ -104,38 +106,43 @@ static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, LaEncodi
         return 1;
     }
 
-    WaveInfo info;
-    WaveStatus waveStatus = WaveInspect(fileBytes, (uint32_t)fileSize, &info);
-    if (waveStatus != WAVE_OK)
+    SoundInfo info;
+    SoundStatus soundStatus = SoundInspect(fileBytes, (uint32_t)fileSize, &info);
+    if (soundStatus != SOUND_OK)
     {
-        Report(WaveStatusText(waveStatus));
+        Report(SoundStatusText(soundStatus));
         PlatformFree(fileBytes);
         return 1;
     }
 
-    uint32_t sampleCount = info.frameCount * info.channelCount;
+    uint32_t sampleCount = info.sampleCount;
     int16_t *samples = PlatformAllocate((size_t)sampleCount * sizeof(int16_t), false);
-    if (samples == NULL)
+    void *scratch = info.scratchBytes != 0u ? PlatformAllocate(info.scratchBytes, false) : NULL;
+    if (samples == NULL || (info.scratchBytes != 0u && scratch == NULL))
     {
         Report("the decoded samples do not fit in memory");
+        PlatformFree(samples);
+        PlatformFree(scratch);
         PlatformFree(fileBytes);
         return 1;
     }
 
-    waveStatus = WaveDecodeSamples(fileBytes, (uint32_t)fileSize, &info, samples, sampleCount);
+    soundStatus = SoundDecodeSamples(fileBytes, (uint32_t)fileSize, &info, samples, sampleCount,
+                                     scratch, info.scratchBytes);
+    PlatformFree(scratch);
     PlatformFree(fileBytes);
-    if (waveStatus != WAVE_OK)
+    if (soundStatus != SOUND_OK)
     {
-        Report(WaveStatusText(waveStatus));
+        Report(SoundStatusText(soundStatus));
         PlatformFree(samples);
         return 1;
     }
 
     uint32_t encodedBytes = 0u;
-    LaStatus laStatus = LaEncodedBytes(encoding, info.frameCount, info.channelCount, &encodedBytes);
-    if (laStatus != LA_OK)
+    SoundStatus laStatus = SoundEncodedBytes(encoding, info.frameCount, info.channelCount, &encodedBytes);
+    if (laStatus != SOUND_OK)
     {
-        Report(LaStatusText(laStatus));
+        Report(SoundStatusText(laStatus));
         PlatformFree(samples);
         return 1;
     }
@@ -148,12 +155,20 @@ static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, LaEncodi
         return 1;
     }
 
-    laStatus = LaEncode(samples, info.frameCount, info.channelCount, info.sampleRate, encoding,
-                        encoded, encodedBytes, NULL);
+    SoundClip clip = {
+        .samples = samples,
+        .frameCount = info.frameCount,
+        .channelCount = info.channelCount,
+        .sampleRate = info.sampleRate,
+        .encoding = encoding,
+    };
+    // Отпечаток исходника остаётся нулевым: результат конвертера —
+    // авторское содержимое, а не кэш, и движок его не пересобирает.
+    laStatus = SoundEncode(&clip, encoded, encodedBytes, NULL);
     PlatformFree(samples);
-    if (laStatus != LA_OK)
+    if (laStatus != SOUND_OK)
     {
-        Report(LaStatusText(laStatus));
+        Report(SoundStatusText(laStatus));
         PlatformFree(encoded);
         return 1;
     }
@@ -184,7 +199,7 @@ static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, LaEncodi
     if (milliseconds % 1000u < 10u) MessageAppend(&message, "0");
     MessageAppendNumber(&message, milliseconds % 1000u);
     MessageAppend(&message, " s -> ");
-    MessageAppend(&message, encoding == LA_ENCODING_ADPCM ? "ADPCM " : "PCM16 ");
+    MessageAppend(&message, encoding == SOUND_ENCODING_ADPCM ? "ADPCM " : "PCM16 ");
     MessageAppendNumber(&message, encodedBytes);
     MessageAppend(&message, " bytes\n");
     PlatformWriteConsoleUtf8(message.text);
@@ -193,7 +208,7 @@ static int Convert(const wchar_t *inputPath, const wchar_t *outputPath, LaEncodi
 
 static int Run(uint32_t argumentCount, const wchar_t *const *arguments)
 {
-    LaEncoding encoding = LA_ENCODING_PCM16;
+    SoundEncoding encoding = SOUND_ENCODING_PCM16;
     const wchar_t *inputPath = NULL;
     const wchar_t *outputPath = NULL;
 
@@ -207,12 +222,12 @@ static int Run(uint32_t argumentCount, const wchar_t *const *arguments)
         }
         if (WideEquals(argument, L"--adpcm"))
         {
-            encoding = LA_ENCODING_ADPCM;
+            encoding = SOUND_ENCODING_ADPCM;
             continue;
         }
         if (WideEquals(argument, L"--pcm16"))
         {
-            encoding = LA_ENCODING_PCM16;
+            encoding = SOUND_ENCODING_PCM16;
             continue;
         }
         if (argument[0] == L'-' && argument[1] != L'\0')

@@ -33,5 +33,6 @@ laiue_add_module(audio
         laiue_content
     LINK
         laiue::math_support
+        laiue::media_support
         ${audio_system_links}
 )

@@ -6,6 +6,8 @@
 
 #define ACTIVE_FILE_NAME L"active.txt"
 #define ACTIVE_UTF8_CAPACITY 512U
+#define FORMATS_FILE_NAME L"formats.txt"
+#define FORMATS_UTF8_CAPACITY 512U
 #define CONTENT_ENUMERATION_LIMIT 4096U
 
 struct LaiueContentCatalog
@@ -220,6 +222,40 @@ static bool BuildPathUnlocked(LaiueContentCatalog *catalog, LaiueContentType typ
     return true;
 }
 
+// Путь к ресурсу внутри пака. Имя ресурса вправе содержать '/', и
+// каждый его сегмент проверяется отдельно: разбирать путь целиком
+// значило бы решать, что делать с `..`, а так этот вопрос не возникает.
+static bool BuildResourcePathUnlocked(LaiueContentCatalog *catalog, LaiueContentType packType,
+                                      const wchar_t *packName, const wchar_t *resourcePath,
+                                      const wchar_t *extension, wchar_t *destination,
+                                      uint32_t capacity)
+{
+    if (resourcePath == NULL || !LaiueContentPathIsSafe(resourcePath)) return false;
+    if (!BuildPathUnlocked(catalog, packType, packName, NULL, destination, capacity)) return false;
+
+    uint32_t length = 0;
+    while (destination[length] != 0) ++length;
+    if (!AppendSeparator(destination, capacity, &length) ||
+        !AppendText(destination, capacity, &length, resourcePath))
+    {
+        return false;
+    }
+    return extension == NULL || AppendText(destination, capacity, &length, extension);
+}
+
+bool LaiueContentCatalogBuildResourcePath(LaiueContentCatalog *catalog, LaiueContentType packType,
+                                          const wchar_t *packName, const wchar_t *resourcePath,
+                                          const wchar_t *extension, wchar_t *destination,
+                                          uint32_t capacity)
+{
+    if (catalog == NULL) return false;
+    PlatformRwLockAcquireShared(&catalog->lock);
+    bool built = BuildResourcePathUnlocked(catalog, packType, packName, resourcePath, extension,
+                                           destination, capacity);
+    PlatformRwLockReleaseShared(&catalog->lock);
+    return built;
+}
+
 bool LaiueContentCatalogBuildPath(LaiueContentCatalog *catalog, LaiueContentType type,
                                   const wchar_t *name, const wchar_t *childName,
                                   wchar_t *destination, uint32_t capacity)
@@ -248,6 +284,107 @@ static bool BuildDirectoryPathUnlocked(LaiueContentCatalog *catalog, LaiueConten
         return false;
     return suffix == NULL || (AppendSeparator(destination, capacity, &length) &&
                               AppendText(destination, capacity, &length, suffix));
+}
+
+// Строка formats.txt против расширения из `defaults`. Точка в начале
+// необязательна с обеих сторон: человек пишет и `wav`, и `.wav`, и
+// спорить с ним об этом файл настройки не должен.
+static bool ExtensionMatchesLine(const wchar_t *extension, const uint8_t *line, uint32_t length)
+{
+    if (extension[0] == L'.') ++extension;
+    if (length != 0U && line[0] == '.')
+    {
+        ++line;
+        --length;
+    }
+    uint32_t index = 0U;
+    while (index < length)
+    {
+        if (extension[index] == L'\0') return false;
+        if (FoldAsciiCase(extension[index]) != FoldAsciiCase((wchar_t)line[index])) return false;
+        ++index;
+    }
+    return extension[index] == L'\0';
+}
+
+static uint8_t *ReadFormatsFile(LaiueContentCatalog *catalog, LaiueContentType packType,
+                                uint32_t *outSize)
+{
+    *outSize = 0U;
+    wchar_t *path = AllocatePathBuffer();
+    if (path == NULL) return NULL;
+
+    PlatformRwLockAcquireShared(&catalog->lock);
+    bool built = BuildDirectoryPathUnlocked(catalog, packType, FORMATS_FILE_NAME, path,
+                                            LAIUE_CONTENT_PATH_CAPACITY);
+    PlatformRwLockReleaseShared(&catalog->lock);
+
+    uint8_t *bytes = NULL;
+    uint64_t size = 0U;
+    if (!built || !PlatformReadEntireFile(path, FORMATS_UTF8_CAPACITY, &bytes, &size))
+    {
+        PlatformFree(path);
+        PlatformFree(bytes);
+        return NULL;
+    }
+    PlatformFree(path);
+    *outSize = (uint32_t)size;
+    return bytes;
+}
+
+uint32_t LaiueContentCatalogOrderFormats(LaiueContentCatalog *catalog, LaiueContentType packType,
+                                         const wchar_t *const *defaults, uint32_t defaultCount,
+                                         const wchar_t **outOrder, uint32_t capacity)
+{
+    if (defaults == NULL || outOrder == NULL) return 0U;
+    if (defaultCount > LAIUE_CONTENT_FORMAT_ORDER_MAX) defaultCount = LAIUE_CONTENT_FORMAT_ORDER_MAX;
+    if (defaultCount > capacity) defaultCount = capacity;
+
+    bool taken[LAIUE_CONTENT_FORMAT_ORDER_MAX];
+    for (uint32_t index = 0; index < LAIUE_CONTENT_FORMAT_ORDER_MAX; ++index) taken[index] = false;
+    uint32_t count = 0U;
+
+    uint32_t size = 0U;
+    uint8_t *bytes = catalog != NULL && LaiueContentTypeIsPack(packType)
+                         ? ReadFormatsFile(catalog, packType, &size)
+                         : NULL;
+
+    uint32_t position = size >= 3U && bytes != NULL && bytes[0] == 0xefU && bytes[1] == 0xbbU &&
+                                bytes[2] == 0xbfU
+                            ? 3U
+                            : 0U;
+    while (bytes != NULL && position < size && count < defaultCount)
+    {
+        uint32_t begin = position;
+        while (position < size && bytes[position] != '\n') ++position;
+        uint32_t end = position;
+        if (position < size) ++position;
+
+        while (begin < end && (bytes[begin] == ' ' || bytes[begin] == '\t')) ++begin;
+        while (end > begin &&
+               (bytes[end - 1U] == ' ' || bytes[end - 1U] == '\t' || bytes[end - 1U] == '\r'))
+            --end;
+        // Пустая строка и комментарий не значат ничего: файл читает
+        // человек, и он вправе оставить в нём пометку.
+        if (begin == end || bytes[begin] == '#') continue;
+
+        for (uint32_t index = 0; index < defaultCount; ++index)
+        {
+            if (taken[index] || !ExtensionMatchesLine(defaults[index], bytes + begin, end - begin))
+                continue;
+            outOrder[count++] = defaults[index];
+            taken[index] = true;
+            break;
+        }
+    }
+    PlatformFree(bytes);
+
+    for (uint32_t index = 0; index < defaultCount && count < defaultCount; ++index)
+    {
+        if (taken[index]) continue;
+        outOrder[count++] = defaults[index];
+    }
+    return count;
 }
 
 static bool StorageMatches(

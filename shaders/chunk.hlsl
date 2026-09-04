@@ -6,10 +6,16 @@ cbuffer FrameConstants : register(b0)
     float3 chunkOriginRelative;
     float meshScale;
     float3 sunDirection;    // единичный, от источника света к миру
-    float textureLayerCount;
+    float materialCount;
     float3 sunColor;
+    float reserved;
     float3 ambientColor;
     float gammaInverse;     // 1/gamma; упакован в свободный w ambientColor
+    // Слой, который каждый материал показывает в этом кадре: по байту на
+    // материал, 64 материала в 64 байтах. Кадр выбирает процессор — на
+    // GPU это значило бы считать одно и то же время для каждой вершины
+    // каждого чанка.
+    uint4 materialSlices[4];
 };
 
 ByteAddressBuffer quadBuffer : register(t0);
@@ -92,10 +98,13 @@ PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     }
 
     // Material id 0 — воздух и обычно не попадает в меш. Для
-    // защиты некорректного меша он тоже отображается слоем 0.
-    uint layerCount = max((uint)textureLayerCount, 1u);
-    uint materialLayer = blockType > 0u ? blockType - 1u : 0u;
-    uint textureLayer = min(materialLayer, layerCount - 1u);
+    // защиты некорректного меша он тоже отображается первым материалом.
+    uint materials = max((uint)materialCount, 1u);
+    uint materialIndex = blockType > 0u ? blockType - 1u : 0u;
+    materialIndex = min(materialIndex, materials - 1u);
+    uint4 slicePack = materialSlices[materialIndex >> 4];
+    uint sliceWord = slicePack[(materialIndex >> 2) & 3u];
+    uint textureLayer = (sliceWord >> ((materialIndex & 3u) * 8u)) & 0xFFu;
     output.surface = face | (textureLayer << 3);
     return output;
 }

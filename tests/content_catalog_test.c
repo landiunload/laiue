@@ -134,9 +134,41 @@ LAIUE_TEST_ENTRY(ContentCatalogTestEntryPoint)
                       PlatformCreateDirectory(paths->textures) &&
                       PlatformCreateDirectory(paths->alpha) && PlatformCreateDirectory(paths->beta),
                   "test directory creation");
-    const uint8_t placeholder = 0x42U;
-    CatalogExpect(PlatformWriteEntireFile(paths->texturePack, &placeholder, sizeof(placeholder)),
-                  "test texture pack creation");
+    // Файл там, где нужен каталог, — это отказ, а не успех. Прежде
+    // создание отвечало «да» на занятый путь, и оставшийся от старого
+    // запуска однофайловый пак давал непонятный отказ двумя проверками
+    // позже, уже при включении пака.
+    CatalogExpect(Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->textures, L"Blocked.ltp"),
+                  "blocked path construction");
+    static const uint8_t blockingByte[1] = {0u};
+    CatalogExpect(PlatformWriteEntireFile(paths->built, blockingByte, sizeof(blockingByte)),
+                  "blocking file could not be written");
+    CatalogExpect(!PlatformCreateDirectory(paths->built),
+                  "a file must not pass for the directory that was asked for");
+    CatalogExpect(PlatformDeleteFile(paths->built), "blocking file cleanup");
+    CatalogExpect(PlatformCreateDirectory(paths->built),
+                  "the same path must become a directory once the file is gone");
+    CatalogExpect(PlatformRemoveDirectory(paths->built), "blocked directory cleanup");
+
+    // Текстурпак — каталог, как шейдерпак и звукопак: текстуры внутри
+    // заменяются по одной, а не пересборкой одного файла.
+    CatalogExpect(PlatformCreateDirectory(paths->texturePack), "test texture pack creation");
+
+    // Выбор активного пака — состояние на диске: прерванный прошлый
+    // запуск оставил бы его включённым, и проверки поехали бы не там,
+    // где ошибка. Поэтому дерево приводится к известному виду.
+    if (Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->shaders, L"active.txt"))
+    {
+        PlatformDeleteFile(paths->built);
+    }
+    if (Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->textures, L"active.txt"))
+    {
+        PlatformDeleteFile(paths->built);
+    }
+    if (Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->textures, L"formats.txt"))
+    {
+        PlatformDeleteFile(paths->built);
+    }
 
     LaiueContentCatalog *catalog = LaiueContentCatalogCreate(paths->root);
     CatalogExpect(catalog != NULL, "explicit catalog creation");
@@ -197,6 +229,36 @@ LAIUE_TEST_ENTRY(ContentCatalogTestEntryPoint)
                       !LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_SHADER_PACK, active,
                                                         LAIUE_CONTENT_NAME_CAPACITY),
                   "fallback activation");
+
+    // === Порядок форматов ===
+    // Разбор `formats.txt` отдельно от загрузчиков: там он виден только
+    // через готовую текстуру, а здесь — сам по себе, на всех платформах.
+    static const wchar_t *const defaults[4] = {L".png", L".gif", L".jpg", L".lt"};
+    const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
+
+    uint32_t count = LaiueContentCatalogOrderFormats(catalog, LAIUE_CONTENT_TEXTURE_PACK, defaults,
+                                                     4u, order, LAIUE_CONTENT_FORMAT_ORDER_MAX);
+    CatalogExpect(count == 4u && WideEquals(order[0], L".png") && WideEquals(order[3], L".lt"),
+                  "without formats.txt the order must be the one the caller gave");
+
+    CatalogExpect(Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->textures, L"formats.txt"),
+                  "formats path construction");
+    // Точка необязательна, регистр не важен, комментарий и пустая строка
+    // ничего не значат, незнакомое расширение пропускается.
+    static const char formatsText[] = "\xef\xbb\xbf# order\r\n.LT\n\nwebp\n  jpg  \n";
+    CatalogExpect(PlatformWriteEntireFile(paths->built, formatsText, sizeof(formatsText) - 1u),
+                  "formats.txt could not be written");
+
+    count = LaiueContentCatalogOrderFormats(catalog, LAIUE_CONTENT_TEXTURE_PACK, defaults, 4u,
+                                            order, LAIUE_CONTENT_FORMAT_ORDER_MAX);
+    CatalogExpect(count == 4u && WideEquals(order[0], L".lt") && WideEquals(order[1], L".jpg"),
+                  "formats.txt must set the order of the formats it names");
+    // Приоритет, а не белый список: неупомянутые идут следом и в
+    // исходном порядке, иначе забытая строка прятала бы содержимое.
+    CatalogExpect(WideEquals(order[2], L".png") && WideEquals(order[3], L".gif"),
+                  "formats missing from formats.txt must keep their own order after it");
+
+    CatalogExpect(PlatformDeleteFile(paths->built), "formats.txt cleanup");
     LaiueContentCatalogDestroy(catalog);
     PlatformFree(paths);
     LAIUE_TEST_SUCCESS();

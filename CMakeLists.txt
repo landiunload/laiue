@@ -77,6 +77,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>")
 
 add_subdirectory(src/math)
+add_subdirectory(src/media)
 add_subdirectory(src/platform)
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
@@ -277,6 +278,21 @@ else()
     set(CPACK_GENERATOR TGZ)
 endif()
     include(CPack)
+endif()
+
+# Инструменты подготовки содержимого — программы для машины
+# разработчика, а не часть SDK. При кросс-компиляции их собирать
+# бессмысленно: запускать их предстоит там же, где лежат исходные файлы.
+if(LAIUE_PLATFORM_EXTERNAL OR CMAKE_CROSSCOMPILING)
+    set(_laiue_tools_default OFF)
+else()
+    set(_laiue_tools_default ON)
+endif()
+option(LAIUE_BUILD_TOOLS "Build the offline content tools"
+    ${_laiue_tools_default})
+if(LAIUE_BUILD_TOOLS)
+    add_subdirectory(tools/soundc)
+    add_subdirectory(tools/texc)
 endif()
 
 option(LAIUE_BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)

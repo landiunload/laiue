@@ -40,10 +40,14 @@
 // dword 0..15 — view-projection, 16..18 — смещение чанка,
 // 20..22 — направление от солнца, 23 — число слоёв материалов,
 // 24..26 — цвет солнца, 28..30 — ambient.
-#define ROOT_CONSTANT_COUNT 32
+#define ROOT_CONSTANT_COUNT 48
 #define ROOT_CONSTANT_ORIGIN_OFFSET 16
 #define ROOT_CONSTANT_LIGHTING_OFFSET 20
 #define ROOT_CONSTANT_LIGHTING_COUNT 12
+// Таблица слоёв материалов: по байту на материал, шестнадцать слов.
+// Пишется раз на проход вместе со светом, а не на каждый чанк.
+#define ROOT_CONSTANT_SLICES_OFFSET 32
+#define ROOT_CONSTANT_SLICES_COUNT 16
 #define ROOT_PARAMETER_CONSTANTS 0
 #define ROOT_PARAMETER_QUAD_BUFFER 1
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
@@ -142,7 +146,8 @@ struct Renderer
     ID3D12DescriptorHeap*      srvHeap;
     UINT                       srvDescriptorSize;
     bool                       blockTextureUploadPending;
-    uint32_t                   blockTextureLayerCount;
+    TexturePackAnimationSet    blockAnimation;
+    TexturePackMaterialNames   materialNames;
 
     // Панорама: кубмапа сцены (грани в пространстве вида) + резолв.
     ID3D12Resource*            cubeColor;
@@ -571,7 +576,7 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
 {
     *outTexture = NULL;
     *outUpload = NULL;
-    UINT subresourceCount = (UINT)pack->layerCount * pack->mipCount;
+    UINT subresourceCount = (UINT)pack->sliceCount * pack->mipCount;
     if (subresourceCount == 0 || subresourceCount > MAX_TEXTURE_SUBRESOURCES)
     {
         return false;
@@ -582,7 +587,7 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
     textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     textureDescription.Width = pack->width;
     textureDescription.Height = pack->height;
-    textureDescription.DepthOrArraySize = (UINT16)pack->layerCount;
+    textureDescription.DepthOrArraySize = (UINT16)pack->sliceCount;
     textureDescription.MipLevels = (UINT16)pack->mipCount;
     textureDescription.Format = format;
     textureDescription.SampleDesc.Count = 1;
@@ -642,7 +647,7 @@ static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *p
         return false;
     }
 
-    for (uint32_t layer = 0; layer < pack->layerCount; ++layer)
+    for (uint32_t layer = 0; layer < pack->sliceCount; ++layer)
     {
         for (uint32_t mip = 0; mip < pack->mipCount; ++mip)
         {
@@ -679,11 +684,17 @@ typedef struct BlockTextureReplacement
     ID3D12Resource *albedoUpload;
     ID3D12Resource *normal;
     ID3D12Resource *normalUpload;
-    uint32_t layerCount;
+    TexturePackAnimationSet animation;
     uint32_t albedoMipCount;
     uint32_t normalMipCount;
     RendererContentStatus status;
 } BlockTextureReplacement;
+
+bool RendererSetMaterialNames(Renderer *renderer, const wchar_t *const *names, uint32_t count)
+{
+    if (renderer == NULL) return false;
+    return TexturePackMaterialNamesSet(&renderer->materialNames, names, count);
+}
 
 static RendererContentStatus MapTexturePackLoadStatus(TexturePackLoadStatus status)
 {
@@ -691,6 +702,8 @@ static RendererContentStatus MapTexturePackLoadStatus(TexturePackLoadStatus stat
     {
         case TEXTURE_PACK_LOAD_OK:
             return RENDERER_CONTENT_OK;
+        case TEXTURE_PACK_LOAD_INCOMPLETE:
+            return RENDERER_CONTENT_INCOMPLETE;
         case TEXTURE_PACK_LOAD_NO_ACTIVE_PACK:
             return RENDERER_CONTENT_NO_ACTIVE;
         case TEXTURE_PACK_LOAD_INVALID:
@@ -719,9 +732,11 @@ static bool CreateBlockTextureReplacement(Renderer *renderer, LaiueContentCatalo
 {
     memset(replacement, 0, sizeof(*replacement));
     TexturePackData pack;
-    TexturePackLoadStatus loadStatus = TexturePackLoadActiveFrom(catalog, &pack);
+    TexturePackLoadStatus loadStatus = TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack);
     replacement->status = MapTexturePackLoadStatus(loadStatus);
     if (rejectInvalidActive && loadStatus != TEXTURE_PACK_LOAD_OK &&
+        loadStatus != TEXTURE_PACK_LOAD_INCOMPLETE &&
         loadStatus != TEXTURE_PACK_LOAD_NO_ACTIVE_PACK)
     {
         TexturePackRelease(&pack);
@@ -747,8 +762,8 @@ static bool CreateBlockTextureReplacement(Renderer *renderer, LaiueContentCatalo
     {
         // Пак без нормалей (LTP1): плоская нормаль 1x1 на каждый слой,
         // AO = 1 — освещение вырождается в чистый ламберт по граням.
-        uint8_t flatNormalPixels[TEXTURE_PACK_MAX_LAYERS * 4u];
-        for (uint32_t layer = 0; layer < pack.layerCount; ++layer)
+        uint8_t flatNormalPixels[TEXTURE_PACK_MAX_SLICES * 4u];
+        for (uint32_t layer = 0; layer < pack.sliceCount; ++layer)
         {
             flatNormalPixels[layer * 4u + 0u] = 128;
             flatNormalPixels[layer * 4u + 1u] = 128;
@@ -758,17 +773,17 @@ static bool CreateBlockTextureReplacement(Renderer *renderer, LaiueContentCatalo
         TexturePackData flat = {
             .width = 1,
             .height = 1,
-            .layerCount = pack.layerCount,
+            .sliceCount = pack.sliceCount,
             .mipCount = 1,
             .pixels = flatNormalPixels,
-            .pixelBytes = (uint32_t)pack.layerCount * 4u,
+            .pixelBytes = (uint32_t)pack.sliceCount * 4u,
         };
         succeeded = CreateBlockArrayTexture(renderer, &flat, TexturePackGetSubresource,
                                             DXGI_FORMAT_R8G8B8A8_UNORM, &replacement->normal,
                                             &replacement->normalUpload);
     }
 
-    replacement->layerCount = succeeded ? pack.layerCount : 0U;
+    if (succeeded) TexturePackCaptureAnimation(&replacement->animation, &pack);
     replacement->albedoMipCount = succeeded ? pack.mipCount : 0U;
     replacement->normalMipCount = succeeded ? (pack.normalPixels != NULL ? pack.mipCount : 1U) : 0U;
     TexturePackRelease(&pack);
@@ -801,15 +816,15 @@ static void CommitBlockTexture(Renderer *renderer, BlockTextureReplacement *repl
     renderer->blockTextureUpload = replacement->albedoUpload;
     renderer->blockNormalTexture = replacement->normal;
     renderer->blockNormalUpload = replacement->normalUpload;
-    renderer->blockTextureLayerCount = replacement->layerCount;
+    renderer->blockAnimation = replacement->animation;
     renderer->blockTextureUploadPending = true;
     renderer->texturePackLoadStatus = replacement->status;
-    CreateBlockTextureView(renderer, renderer->blockTexture, renderer->blockTextureLayerCount,
+    CreateBlockTextureView(renderer, renderer->blockTexture, renderer->blockAnimation.sliceCount,
                            replacement->albedoMipCount, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                            SRV_SLOT_BLOCK_TEXTURES);
-    CreateBlockTextureView(renderer, renderer->blockNormalTexture, renderer->blockTextureLayerCount,
-                           replacement->normalMipCount, DXGI_FORMAT_R8G8B8A8_UNORM,
-                           SRV_SLOT_BLOCK_NORMALS);
+    CreateBlockTextureView(renderer, renderer->blockNormalTexture,
+                           renderer->blockAnimation.sliceCount, replacement->normalMipCount,
+                           DXGI_FORMAT_R8G8B8A8_UNORM, SRV_SLOT_BLOCK_NORMALS);
     memset(replacement, 0, sizeof(*replacement));
 }
 
@@ -1456,7 +1471,7 @@ void RendererReleaseWorld(Renderer* renderer)
     renderer->blockNormalUpload = NULL;
     renderer->blockNormalTexture = NULL;
     renderer->blockTextureUploadPending = false;
-    renderer->blockTextureLayerCount = 0u;
+    memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
 
     if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
     if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
@@ -2166,13 +2181,13 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
         ID3D12Resource_GetGPUVirtualAddress(
             renderer->instanceBuffers[renderer->frameIndex]));
 
-    // Свет кадра: число текстурных слоёв занимает padding
-    // после sunDirection; остальные float3 выровнены по 16 байт.
+    // Свет кадра: число материалов занимает padding после sunDirection;
+    // остальные float3 выровнены по 16 байт.
     float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
     float lighting[ROOT_CONSTANT_LIGHTING_COUNT] = {
         frame->sunDirection[0], frame->sunDirection[1], frame->sunDirection[2],
-        (float)(renderer->blockTextureLayerCount > 0u
-            ? renderer->blockTextureLayerCount : 1u),
+        (float)(renderer->blockAnimation.materialCount > 0u
+            ? renderer->blockAnimation.materialCount : 1u),
         frame->sunColor[0], frame->sunColor[1], frame->sunColor[2], 0.0f,
         frame->ambientColor[0], frame->ambientColor[1], frame->ambientColor[2],
         gammaInverse,
@@ -2180,6 +2195,15 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
         ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_LIGHTING_COUNT, lighting,
         ROOT_CONSTANT_LIGHTING_OFFSET);
+
+    // Кадр анимации выбирается процессором один раз на проход: считать
+    // одно и то же время в каждой вершине каждого чанка незачем.
+    uint32_t materialSlices[ROOT_CONSTANT_SLICES_COUNT];
+    TexturePackFillSliceTable(&renderer->blockAnimation, frame->animationSeconds,
+                              materialSlices);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_SLICES_COUNT, materialSlices,
+        ROOT_CONSTANT_SLICES_OFFSET);
 
     return true;
 }

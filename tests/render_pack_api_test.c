@@ -115,9 +115,8 @@ static void PreparePack(RenderPackTestPaths *paths)
                        PlatformWriteEntireFile(paths->shaderFile, bytecode, sizeof(bytecode)),
                    "shader stage write");
     }
-    const uint8_t placeholder = 0x42U;
-    PackExpect(PlatformWriteEntireFile(paths->texturePack, &placeholder, sizeof(placeholder)),
-               "texture pack placeholder write");
+    // Текстурпак — каталог: перечисление и активация работают с папкой.
+    PackExpect(PlatformCreateDirectory(paths->texturePack), "texture pack directory creation");
 }
 
 static void TestShaderSetHelpers(void)

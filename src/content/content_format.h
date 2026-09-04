@@ -43,3 +43,15 @@ LAIUE_CONTENT_API bool LaiueContentNameMatches(
 // Безопасное имя одной сущности: разрешён Unicode, но запрещены управляющие
 // символы, абсолютные пути, разделители каталогов и специальные имена . / ...
 LAIUE_CONTENT_API bool LaiueContentNameIsSafe(const wchar_t* name);
+
+#define LAIUE_CONTENT_NAME_CAPACITY 128u
+
+// Максимум сегментов в пути ресурса. Ограничение не про вкус, а про то,
+// что глубина дерева не должна зависеть от содержимого пака.
+#define LAIUE_CONTENT_PATH_SEGMENT_MAX 8u
+
+// Безопасный путь ресурса внутри пака: сегменты через '/'. Каждый сегмент
+// проверяется как отдельное имя, поэтому ни `..`, ни абсолютный путь, ни
+// разделитель Windows за пределы пака не выведут. Пустой путь и пустой
+// сегмент запрещены.
+LAIUE_CONTENT_API bool LaiueContentPathIsSafe(const wchar_t* path);

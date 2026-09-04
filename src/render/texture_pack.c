@@ -5,197 +5,97 @@
 
 #include <string.h>
 
-#define LTP_MAGIC 0x3150544Cu
-#define LTP_VERSION 1u
-#define LTP_VERSION_NORMALS 2u
-#define LTP_HEADER_SIZE 24u
-#define LTP_FORMAT_RGBA8 1u
-#define LTP_FORMAT_RGBA8_NORMALS 2u
 
-#define TEXTURE_MAX_DIMENSION 4096u
 
 // Material-agnostic single-layer fallback. It keeps the renderer usable
 // without assigning any game-specific meaning or palette to material ids.
 static const uint8_t g_fallbackPixels[4] = {160, 160, 160, 255};
 
-static uint16_t ReadU16Le(const uint8_t *bytes)
+static void SetStaticAnimation(TexturePackData *pack)
 {
-    return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
-}
-
-static uint32_t ReadU32Le(const uint8_t *bytes)
-{
-    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
-           ((uint32_t)bytes[3] << 24);
+    pack->materialCount = pack->sliceCount;
+    for (uint32_t material = 0; material < pack->materialCount; ++material)
+    {
+        pack->animation[material].firstSlice = (uint16_t)material;
+        pack->animation[material].frameCount = 1u;
+        pack->animation[material].cycleMilliseconds = 0u;
+        pack->sliceMilliseconds[material] = 0u;
+    }
 }
 
 static void SetFallback(TexturePackData *pack)
 {
     pack->width = 1;
     pack->height = 1;
-    pack->layerCount = TEXTURE_PACK_MIN_LAYERS;
+    pack->sliceCount = TEXTURE_PACK_MIN_LAYERS;
     pack->mipCount = 1;
     pack->pixels = g_fallbackPixels;
     pack->pixelBytes = sizeof(g_fallbackPixels);
     pack->normalPixels = NULL;
     pack->allocation = NULL;
+    SetStaticAnimation(pack);
 }
 
-static uint16_t FullMipCount(uint32_t width, uint32_t height)
+bool TexturePackMaterialNamesSet(TexturePackMaterialNames *names, const wchar_t *const *source,
+                                 uint32_t count)
 {
-    uint16_t count = 1;
-    while (width > 1u || height > 1u)
+    if (names == NULL) return false;
+    if (count > TEXTURE_PACK_MAX_LAYERS) return false;
+    if (count != 0u && source == NULL) return false;
+
+    for (uint32_t index = 0; index < count; ++index)
     {
-        if (width > 1u)
-            width >>= 1;
-        if (height > 1u)
-            height >>= 1;
-        ++count;
+        const wchar_t *name = source[index];
+        // Имя проверяется здесь, а не при загрузке: пустое или опасное
+        // имя лучше отвергнуть там, где приложение его задало.
+        if (name == NULL || !LaiueContentPathIsSafe(name)) return false;
+
+        uint32_t length = 0;
+        while (name[length] != 0)
+        {
+            if (length + 1u >= LAIUE_CONTENT_NAME_CAPACITY) return false;
+            names->storage[index][length] = name[length];
+            ++length;
+        }
+        names->storage[index][length] = 0;
+        names->pointers[index] = names->storage[index];
     }
-    return count;
-}
-
-static bool CalculatePayloadBytes(uint32_t width, uint32_t height, uint32_t layerCount,
-                                  uint32_t mipCount, uint32_t *outBytes)
-{
-    uint64_t bytesPerLayer = 0;
-    for (uint32_t mip = 0; mip < mipCount; ++mip)
-    {
-        bytesPerLayer += (uint64_t)width * height * 4u;
-        if (width > 1u)
-            width >>= 1;
-        if (height > 1u)
-            height >>= 1;
-    }
-
-    uint64_t total = bytesPerLayer * layerCount;
-    if (total == 0 || total > UINT32_MAX)
-    {
-        return false;
-    }
-    *outBytes = (uint32_t)total;
-    return true;
-}
-
-static bool LoadLtp(const wchar_t *path, TexturePackData *outPack)
-{
-    PlatformPathInformation information;
-    if (!PlatformGetPathInformation(path, &information) || !information.exists ||
-        information.isDirectory || information.isSymbolicLink ||
-        information.size < LTP_HEADER_SIZE ||
-        information.size > (uint64_t)LTP_HEADER_SIZE + UINT32_MAX)
-    {
-        return false;
-    }
-
-    uint8_t *fileBytes = NULL;
-    uint64_t fileSize = 0;
-    if (!PlatformReadEntireFile(path, (uint64_t)LTP_HEADER_SIZE + UINT32_MAX, &fileBytes,
-                                &fileSize) ||
-        fileSize != information.size)
-    {
-        PlatformFree(fileBytes);
-        return false;
-    }
-    const uint8_t *header = fileBytes;
-
-    uint32_t magic = ReadU32Le(header + 0);
-    uint16_t version = ReadU16Le(header + 4);
-    uint16_t headerSize = ReadU16Le(header + 6);
-    uint16_t width = ReadU16Le(header + 8);
-    uint16_t height = ReadU16Le(header + 10);
-    uint16_t layerCount = ReadU16Le(header + 12);
-    uint16_t mipCount = ReadU16Le(header + 14);
-    uint32_t format = ReadU32Le(header + 16);
-    uint32_t dataBytes = ReadU32Le(header + 20);
-
-    // Версия 1 — только albedo; версия 2 — albedo + идентичный по
-    // раскладке блок карт нормалей сразу за ним.
-    bool withNormals = version == LTP_VERSION_NORMALS && format == LTP_FORMAT_RGBA8_NORMALS;
-    bool versionValid = withNormals || (version == LTP_VERSION && format == LTP_FORMAT_RGBA8);
-
-    uint32_t albedoBytes = 0;
-    bool valid = magic == LTP_MAGIC && versionValid && headerSize == LTP_HEADER_SIZE && width > 0 &&
-                 width <= TEXTURE_MAX_DIMENSION && height > 0 && height <= TEXTURE_MAX_DIMENSION &&
-                 layerCount >= TEXTURE_PACK_MIN_LAYERS && layerCount <= TEXTURE_PACK_MAX_LAYERS &&
-                 mipCount == FullMipCount(width, height) &&
-                 CalculatePayloadBytes(width, height, layerCount, mipCount, &albedoBytes) &&
-                 albedoBytes <= UINT32_MAX / 2u &&
-                 dataBytes == (withNormals ? albedoBytes * 2u : albedoBytes) &&
-                 fileSize == (uint64_t)LTP_HEADER_SIZE + dataBytes;
-    if (!valid)
-    {
-        PlatformFree(fileBytes);
-        return false;
-    }
-
-    uint8_t *pixels = fileBytes + LTP_HEADER_SIZE;
-
-    outPack->width = width;
-    outPack->height = height;
-    outPack->layerCount = layerCount;
-    outPack->mipCount = mipCount;
-    outPack->pixels = pixels;
-    outPack->pixelBytes = albedoBytes;
-    outPack->normalPixels = withNormals ? pixels + albedoBytes : NULL;
-    outPack->allocation = fileBytes;
+    names->count = count;
     return true;
 }
 
 TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
-                                                TexturePackData *outPack)
+                                                const wchar_t *const *materialNames,
+                                                uint32_t materialCount, TexturePackData *outPack)
 {
-    if (catalog == NULL || outPack == NULL)
+    if (outPack == NULL)
     {
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
+    // Нейтральный слой ставится сразу: неудачная загрузка обязана
+    // оставить рендерер с рабочим паком, а не с пустотой.
     SetFallback(outPack);
-
-    wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
-    if (path == NULL)
+    if (catalog == NULL || materialNames == NULL || materialCount == 0u)
     {
-        return TEXTURE_PACK_LOAD_IO_ERROR;
+        return TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
     }
 
-    wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_TEXTURE_PACK, activeName,
-                                          LAIUE_CONTENT_NAME_CAPACITY))
+    TexturePackData built;
+    TexturePackLoadStatus status =
+        TexturePackBuildFrom(catalog, materialNames, materialCount, &built);
+    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
     {
-        bool activeFileExists =
-            LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_TEXTURE_PACK, NULL, L"active.txt",
-                                         path, LAIUE_CONTENT_PATH_CAPACITY) &&
-            PlatformPathExists(path);
-        PlatformFree(path);
-        return activeFileExists ? TEXTURE_PACK_LOAD_INVALID : TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
+        return status;
     }
-
-    if (!LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_TEXTURE_PACK, activeName, NULL, path,
-                                      LAIUE_CONTENT_PATH_CAPACITY))
-    {
-        PlatformFree(path);
-        return TEXTURE_PACK_LOAD_IO_ERROR;
-    }
-
-    TexturePackData loaded;
-    if (!LoadLtp(path, &loaded))
-    {
-        PlatformFree(path);
-        return TEXTURE_PACK_LOAD_INVALID;
-    }
-    *outPack = loaded;
-    PlatformFree(path);
-    return TEXTURE_PACK_LOAD_OK;
+    *outPack = built;
+    return status;
 }
 
-TexturePackLoadStatus TexturePackLoadActive(TexturePackData *outPack)
-{
-    return TexturePackLoadActiveFrom(LaiueContentCatalogDefault(), outPack);
-}
 
-static bool GetSubresourceFrom(const TexturePackData *pack, const uint8_t *base, uint32_t layer,
+static bool GetSubresourceFrom(const TexturePackData *pack, const uint8_t *base, uint32_t slice,
                                uint32_t mip, TexturePackSubresource *outSubresource)
 {
-    if (pack == NULL || outSubresource == NULL || base == NULL || layer >= pack->layerCount ||
+    if (pack == NULL || outSubresource == NULL || base == NULL || slice >= pack->sliceCount ||
         mip >= pack->mipCount)
     {
         return false;
@@ -213,7 +113,7 @@ static bool GetSubresourceFrom(const TexturePackData *pack, const uint8_t *base,
             height >>= 1;
     }
 
-    uint64_t offset = bytesPerLayer * layer;
+    uint64_t offset = bytesPerLayer * slice;
     width = pack->width;
     height = pack->height;
     for (uint32_t level = 0; level < mip; ++level)
@@ -239,17 +139,90 @@ static bool GetSubresourceFrom(const TexturePackData *pack, const uint8_t *base,
     return true;
 }
 
-bool TexturePackGetSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+bool TexturePackGetSubresource(const TexturePackData *pack, uint32_t slice, uint32_t mip,
                                TexturePackSubresource *outSubresource)
 {
-    return GetSubresourceFrom(pack, pack != NULL ? pack->pixels : NULL, layer, mip, outSubresource);
+    return GetSubresourceFrom(pack, pack != NULL ? pack->pixels : NULL, slice, mip, outSubresource);
 }
 
-bool TexturePackGetNormalSubresource(const TexturePackData *pack, uint32_t layer, uint32_t mip,
+bool TexturePackGetNormalSubresource(const TexturePackData *pack, uint32_t slice, uint32_t mip,
                                      TexturePackSubresource *outSubresource)
 {
-    return GetSubresourceFrom(pack, pack != NULL ? pack->normalPixels : NULL, layer, mip,
+    return GetSubresourceFrom(pack, pack != NULL ? pack->normalPixels : NULL, slice, mip,
                               outSubresource);
+}
+
+void TexturePackCaptureAnimation(TexturePackAnimationSet *outSet, const TexturePackData *pack)
+{
+    if (outSet == NULL) return;
+    memset(outSet, 0, sizeof(*outSet));
+    if (pack == NULL) return;
+
+    outSet->sliceCount = pack->sliceCount;
+    outSet->materialCount = pack->materialCount;
+    for (uint32_t material = 0; material < pack->materialCount; ++material)
+    {
+        outSet->animation[material] = pack->animation[material];
+    }
+    for (uint32_t slice = 0; slice < TEXTURE_PACK_MAX_SLICES; ++slice)
+    {
+        outSet->sliceMilliseconds[slice] = pack->sliceMilliseconds[slice];
+    }
+}
+
+// Кадры материала идут по своей длительности каждый, поэтому нужный
+// ищется накоплением, а не делением: у GIF задержки вправе различаться.
+uint32_t TexturePackResolveSlice(const TexturePackAnimationSet *set, uint32_t material,
+                                 double animationSeconds)
+{
+    if (set == NULL || material >= TEXTURE_PACK_MAX_LAYERS) return 0u;
+    const TexturePackAnimation *animation = &set->animation[material];
+    if (animation->frameCount <= 1u || animation->cycleMilliseconds == 0u)
+    {
+        return animation->firstSlice;
+    }
+
+    // Часы принадлежат приложению и могут идти как угодно; кадр от этого
+    // не должен выходить за пределы материала.
+    if (!(animationSeconds > 0.0)) animationSeconds = 0.0;
+    double cycle = (double)animation->cycleMilliseconds;
+    double milliseconds = animationSeconds * 1000.0;
+    // Свёртка по длине цикла до перевода в целое: за сутки анимации
+    // миллисекунды ещё помещаются в double точно, а прямое приведение
+    // большого значения к uint32 не определено.
+    if (milliseconds >= cycle)
+    {
+        milliseconds -= cycle * (double)(uint64_t)(milliseconds / cycle);
+    }
+
+    uint32_t elapsed = (uint32_t)milliseconds;
+    uint32_t accumulated = 0u;
+    for (uint32_t frame = 0; frame < animation->frameCount; ++frame)
+    {
+        uint32_t slice = (uint32_t)animation->firstSlice + frame;
+        if (slice >= TEXTURE_PACK_MAX_SLICES) break;
+        accumulated += set->sliceMilliseconds[slice];
+        if (elapsed < accumulated) return slice;
+    }
+    return (uint32_t)animation->firstSlice + animation->frameCount - 1u;
+}
+
+void TexturePackFillSliceTable(const TexturePackAnimationSet *set, double animationSeconds,
+                               uint32_t *outSlices)
+{
+    if (outSlices == NULL) return;
+    for (uint32_t word = 0; word < 16u; ++word) outSlices[word] = 0u;
+    if (set == NULL || set->materialCount == 0u) return;
+    uint32_t materialCount = set->materialCount;
+    if (materialCount > TEXTURE_PACK_MAX_LAYERS) materialCount = TEXTURE_PACK_MAX_LAYERS;
+
+    for (uint32_t material = 0; material < TEXTURE_PACK_MAX_LAYERS; ++material)
+    {
+        uint32_t source = material < materialCount ? material : materialCount - 1u;
+        uint32_t slice = TexturePackResolveSlice(set, source, animationSeconds);
+        if (slice > 255u) slice = 255u;
+        outSlices[material >> 2] |= slice << ((material & 3u) * 8u);
+    }
 }
 
 void TexturePackRelease(TexturePackData *pack)
@@ -261,8 +234,9 @@ void TexturePackRelease(TexturePackData *pack)
     PlatformFree(pack->allocation);
     pack->width = 0;
     pack->height = 0;
-    pack->layerCount = 0;
+    pack->sliceCount = 0;
     pack->mipCount = 0;
+    pack->materialCount = 0;
     pack->pixels = NULL;
     pack->pixelBytes = 0;
     pack->normalPixels = NULL;

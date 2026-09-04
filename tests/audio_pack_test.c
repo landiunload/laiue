@@ -12,6 +12,7 @@
 #include "content/content_catalog.h"
 #include "platform/system.h"
 #include "test_runtime.h"
+#include "mp3_fixtures.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -57,6 +58,12 @@ static bool Join(wchar_t *destination, uint32_t capacity, const wchar_t *base, c
     }
     destination[length] = L'\0';
     return true;
+}
+
+static uint32_t ReadU32LeAt(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
 }
 
 static void WriteU16Le(uint8_t *bytes, uint32_t value)
@@ -224,7 +231,53 @@ typedef struct AudioPackTestPaths
     wchar_t modSound[LAIUE_PLATFORM_PATH_CAPACITY];
     wchar_t adpcmSound[LAIUE_PLATFORM_PATH_CAPACITY];
     wchar_t brokenSound[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t stepsDirectory[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t nestedSound[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t waveSound[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t mp3Sound[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t waveCache[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t mp3Cache[LAIUE_PLATFORM_PATH_CAPACITY];
 } AudioPackTestPaths;
+
+static bool NameEquals(const wchar_t *left, const wchar_t *right)
+{
+    while (*left != 0 && *left == *right)
+    {
+        ++left;
+        ++right;
+    }
+    return *left == *right;
+}
+
+// Канонический WAV: только `fmt ` и `data`, PCM16 моно. Полный разбор
+// проверяет laiue.tools.soundc; здесь нужен один настоящий файл, чтобы
+// увидеть, что пак его берёт.
+static void BuildCanonicalWave(uint8_t *file, const int16_t *samples, uint32_t frameCount)
+{
+    uint32_t dataBytes = frameCount * 2u;
+    const char *tags = "RIFFWAVEfmt data";
+    for (uint32_t index = 0; index < 4u; ++index)
+    {
+        file[index] = (uint8_t)tags[index];
+        file[8u + index] = (uint8_t)tags[4u + index];
+        file[12u + index] = (uint8_t)tags[8u + index];
+        file[36u + index] = (uint8_t)tags[12u + index];
+    }
+    WriteU32Le(file + 4, 36u + dataBytes);
+    WriteU32Le(file + 16, 16u);              // размер чанка fmt
+    WriteU16Le(file + 20, 1u);               // PCM
+    WriteU16Le(file + 22, 1u);               // каналов
+    WriteU32Le(file + 24, TEST_SAMPLE_RATE);
+    WriteU32Le(file + 28, TEST_SAMPLE_RATE * 2u);
+    WriteU16Le(file + 32, 2u);               // выравнивание блока
+    WriteU16Le(file + 34, 16u);              // бит на сэмпл
+    WriteU32Le(file + 40, dataBytes);
+
+    for (uint32_t index = 0; index < frameCount; ++index)
+    {
+        WriteU16Le(file + 44u + index * 2u, (uint32_t)(uint16_t)samples[index]);
+    }
+}
 
 static int32_t AbsoluteDifference(int32_t left, int32_t right)
 {
@@ -329,18 +382,335 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
     // второй запуск начинался бы с пака, выбранного первым.
     Expect(AudioPackActivateIn(catalog, NULL), "the active pack could not be cleared");
 
-    // Без активного пака звук не находится: это не ошибка формата.
+    // Без активного пака звук не находится, но выдача не пуста: как
+    // текстурпак подставляет нейтральный слой, так звукопак — тишину.
+    // Причина при этом названа статусом, а не спрятана.
     AudioPackLoadStatus status = AUDIO_PACK_LOAD_NOT_ATTEMPTED;
-    Expect(AudioClipLoadFrom(device, catalog, L"step", &status) == NULL,
-           "no clip may load without an active pack");
+    AudioClip *silent = AudioClipLoadFrom(device, catalog, L"step", &status);
+    Expect(silent != NULL, "a missing pack must still yield the silent default");
     Expect(status == AUDIO_PACK_LOAD_NO_ACTIVE_PACK, "the status must name the missing pack");
+    Expect(AudioClipDurationSeconds(silent) < 0.001, "the default sound must be silence");
+    AudioClipDestroy(silent);
 
     Expect(AudioPackActivateIn(catalog, L"Base.lap"), "the base pack could not be activated");
+
+    // Дерево приводится к известному виду до первого перечисления:
+    // прерванный прошлый запуск оставил бы в паке лишние файлы, и
+    // счёт поехал бы не там, где ошибка.
+    if (Join(paths->stepsDirectory, LAIUE_PLATFORM_PATH_CAPACITY, paths->basePack, L"steps"))
+    {
+        // Кэш от прошлого запуска — тоже файл в паке, и его надо
+        // убрать вместе с остальными, иначе счёт звуков поедет.
+        static const wchar_t *const leftovers[6] = {
+            L"stone.la", L"wood.wav", L"gravel.mp3", L"wood.wav.la", L"gravel.mp3.la", L"wood.la",
+        };
+        for (uint32_t index = 0; index < 6u; ++index)
+        {
+            if (Join(paths->nestedSound, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                     leftovers[index]))
+            {
+                PlatformDeleteFile(paths->nestedSound);
+            }
+        }
+    }
+    // Порядок форматов задаёт файл, и прерванный прогон мог его
+    // оставить: следующий начал бы с чужой настройкой.
+    if (Join(paths->nestedSound, LAIUE_PLATFORM_PATH_CAPACITY, paths->sounds, L"formats.txt"))
+    {
+        PlatformDeleteFile(paths->nestedSound);
+    }
 
     AudioPackList soundList;
     Expect(AudioPackEnumerateSoundsFrom(catalog, &soundList), "sounds could not be enumerated");
     Expect(soundList.count == 3u, "every sound in the pack must be listed");
     AudioPackListRelease(&soundList);
+
+    // === Подпапки и исходный WAV ===
+    // Звук адресуется именем, а имя вправе быть путём: пак делится на
+    // папки, как обычное дерево файлов. Рядом со своим `.la` лежит
+    // обычный WAV — его тоже надо уметь взять, иначе «настроить самому»
+    // означало бы обязательную пересборку каждого файла.
+    Expect(Join(paths->stepsDirectory, LAIUE_PLATFORM_PATH_CAPACITY, paths->basePack, L"steps") &&
+               Join(paths->nestedSound, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                    L"stone.la") &&
+               Join(paths->waveSound, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                    L"wood.wav") &&
+               Join(paths->mp3Sound, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                    L"gravel.mp3") &&
+               Join(paths->waveCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                    L"wood.wav.la") &&
+               Join(paths->mp3Cache, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory,
+                    L"gravel.mp3.la"),
+           "nested path construction");
+    Expect(PlatformCreateDirectory(paths->stepsDirectory), "nested directory creation");
+    Expect(PlatformWriteEntireFile(paths->nestedSound, pcmFile, LA_HEADER_SIZE + pcmPayload),
+           "the nested sound could not be written");
+
+    uint32_t waveBytes = 44u + TEST_FRAMES * 2u;
+    uint8_t *waveFile = PlatformAllocate(waveBytes, true);
+    Expect(waveFile != NULL, "wav buffer could not be allocated");
+    BuildCanonicalWave(waveFile, reference, TEST_FRAMES);
+    Expect(PlatformWriteEntireFile(paths->waveSound, waveFile, waveBytes),
+           "the wav sound could not be written");
+    PlatformFree(waveFile);
+
+    Expect(PlatformWriteEntireFile(paths->mp3Sound, MP3_SOUND_FILE, sizeof(MP3_SOUND_FILE)),
+           "the mp3 sound could not be written");
+
+    AudioPackList nestedList;
+    Expect(AudioPackEnumerateSoundsFrom(catalog, &nestedList), "sounds could not be enumerated");
+    Expect(nestedList.count == 6u, "the listing must reach into subdirectories");
+    bool sawNested = false;
+    bool sawWave = false;
+    bool sawMp3 = false;
+    for (uint32_t index = 0; index < nestedList.count; ++index)
+    {
+        sawNested = sawNested || NameEquals(nestedList.entries[index].name, L"steps/stone");
+        sawWave = sawWave || NameEquals(nestedList.entries[index].name, L"steps/wood");
+        sawMp3 = sawMp3 || NameEquals(nestedList.entries[index].name, L"steps/gravel");
+    }
+    AudioPackListRelease(&nestedList);
+    Expect(sawNested, "a sound in a subdirectory must be listed by its path");
+    Expect(sawWave, "a wav sound must be listed under its own name");
+    Expect(sawMp3, "an mp3 sound must be listed under its own name");
+
+    AudioClip *nested = AudioClipLoadFrom(device, catalog, L"steps/stone", &status);
+    Expect(nested != NULL && status == AUDIO_PACK_LOAD_OK,
+           "a sound in a subdirectory must load by its path");
+    AudioClipDestroy(nested);
+
+    AudioClip *fromWave = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(fromWave != NULL && status == AUDIO_PACK_LOAD_OK, "a wav sound must load from the pack");
+    // Длительность считается по кадрам и частоте: если бы WAV разобрался
+    // неправильно, она разъехалась бы вместе с ними.
+    double expectedSeconds = (double)TEST_FRAMES / (double)TEST_SAMPLE_RATE;
+    double actualSeconds = AudioClipDurationSeconds(fromWave);
+    Expect(actualSeconds > expectedSeconds * 0.99 && actualSeconds < expectedSeconds * 1.01,
+           "the wav sound must keep its length");
+    AudioClipDestroy(fromWave);
+
+    // MP3 берётся из пака так же, как WAV. Длительность здесь — не
+    // формальность: она получается только если задержка кодировщика
+    // снята, а кадры разобраны все до одного.
+    AudioClip *fromMp3 = AudioClipLoadFrom(device, catalog, L"steps/gravel", &status);
+    Expect(fromMp3 != NULL && status == AUDIO_PACK_LOAD_OK, "an mp3 sound must load from the pack");
+    double mp3Seconds =
+        (double)(sizeof(MP3_SOUND_PCM) / sizeof(MP3_SOUND_PCM[0])) /
+        ((double)MP3_SOUND_CHANNELS * (double)MP3_SOUND_RATE);
+    double actualMp3Seconds = AudioClipDurationSeconds(fromMp3);
+    Expect(actualMp3Seconds > mp3Seconds * 0.999 && actualMp3Seconds < mp3Seconds * 1.001,
+           "the mp3 sound must keep the length the reference decoder gives");
+    AudioClipDestroy(fromMp3);
+
+    // === Кэш рядом с исходником ===
+    // Прочитав чужой формат, движок кладёт рядом готовый `.la`. Дальше
+    // берётся он: разбирать WAV и MP3 на каждом запуске незачем.
+    Expect(PlatformPathExists(paths->waveCache) && PlatformPathExists(paths->mp3Cache),
+           "loading a foreign format must leave a prepared sound next to it");
+
+    // === Отпечаток исходника ===
+    // Свежесть кэша определяет не «кто новее», а размер и время
+    // исходника, записанные в сам кэш: одно обращение к каталогу, без
+    // чтения исходника.
+    PlatformPathInformation sourceInfo;
+    Expect(PlatformGetPathInformation(paths->waveSound, &sourceInfo) && sourceInfo.exists,
+           "the wav source could not be inspected");
+
+    uint8_t *cacheBytes = NULL;
+    uint64_t cacheSize = 0u;
+    Expect(PlatformReadEntireFile(paths->waveCache, 0x1000000u, &cacheBytes, &cacheSize),
+           "the cached sound could not be read");
+    uint64_t stampTime =
+        (uint64_t)ReadU32LeAt(cacheBytes + 24) | ((uint64_t)ReadU32LeAt(cacheBytes + 28) << 32);
+    Expect(stampTime == sourceInfo.modifiedTime, "the cache must record the time of its source");
+    Expect(ReadU32LeAt(cacheBytes + 32) == (uint32_t)sourceInfo.size,
+           "the cache must record the size of its source");
+
+    // Отпечаток портится — кэш обязан быть пересобран, а не принят на
+    // веру. Проверка не зависит от разрешения часов файловой системы.
+    cacheBytes[32] ^= 0xFFu;
+    Expect(PlatformWriteEntireFile(paths->waveCache, cacheBytes, cacheSize),
+           "the tampered cache could not be written");
+    PlatformFree(cacheBytes);
+
+    AudioClip *restamped = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(restamped != NULL && status == AUDIO_PACK_LOAD_OK,
+           "a sound with a tampered cache must still load");
+    AudioClipDestroy(restamped);
+
+    cacheBytes = NULL;
+    Expect(PlatformReadEntireFile(paths->waveCache, 0x1000000u, &cacheBytes, &cacheSize),
+           "the rebuilt cache could not be read");
+    Expect(ReadU32LeAt(cacheBytes + 32) == (uint32_t)sourceInfo.size,
+           "a cache whose stamp does not match its source must be rebuilt");
+    PlatformFree(cacheBytes);
+
+    // Перечисление обязано остаться прежним: кэш — не отдельный звук.
+    AudioPackList cachedList;
+    Expect(AudioPackEnumerateSoundsFrom(catalog, &cachedList), "sounds could not be enumerated");
+    Expect(cachedList.count == 6u, "a cache file must not appear as a sound of its own");
+    bool sawCacheName = false;
+    for (uint32_t index = 0; index < cachedList.count; ++index)
+    {
+        sawCacheName = sawCacheName || NameEquals(cachedList.entries[index].name, L"steps/wood.wav");
+    }
+    AudioPackListRelease(&cachedList);
+    Expect(!sawCacheName, "a cache file must not be listed under the name of its source");
+
+    // === Приоритет форматов ===
+    // Свой `.la` — запасной путь, а не главный. Пока исходник жив и
+    // читается, играет он: иначе `.la`, положенный когда-то, навсегда
+    // заслонил бы обновлённый рядом WAV, и «положи новый файл» как
+    // способ поменять звук перестал бы работать.
+    wchar_t *authoredPath =
+        PlatformAllocate((size_t)LAIUE_PLATFORM_PATH_CAPACITY * sizeof(wchar_t), false);
+    wchar_t *formatsPath =
+        PlatformAllocate((size_t)LAIUE_PLATFORM_PATH_CAPACITY * sizeof(wchar_t), false);
+    Expect(authoredPath != NULL && formatsPath != NULL, "priority path scratch");
+    Expect(Join(authoredPath, LAIUE_PLATFORM_PATH_CAPACITY, paths->stepsDirectory, L"wood.la") &&
+               Join(formatsPath, LAIUE_PLATFORM_PATH_CAPACITY, paths->sounds, L"formats.txt"),
+           "priority path construction");
+
+    // Длина отличает авторский файл от исходника и от его кэша: это
+    // единственное, что тест здесь и различает.
+    uint32_t authoredFrames = TEST_FRAMES / 4u;
+    uint32_t authoredPayload = authoredFrames * 2u;
+    double authoredSeconds = (double)authoredFrames / (double)TEST_SAMPLE_RATE;
+    WriteHeader(pcmFile, 1u, LA_ENCODING_PCM16, TEST_SAMPLE_RATE, authoredFrames, authoredPayload);
+    for (uint32_t index = 0; index < authoredFrames; ++index)
+    {
+        WriteU16Le(pcmFile + LA_HEADER_SIZE + index * 2u, (uint32_t)(uint16_t)reference[index]);
+    }
+    Expect(PlatformWriteEntireFile(authoredPath, pcmFile, LA_HEADER_SIZE + authoredPayload),
+           "the authored sound could not be written");
+
+    AudioClip *preferred = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(preferred != NULL && status == AUDIO_PACK_LOAD_OK, "the wav sound must still load");
+    double preferredSeconds = AudioClipDurationSeconds(preferred);
+    Expect(preferredSeconds > expectedSeconds * 0.99 && preferredSeconds < expectedSeconds * 1.01,
+           "a live source must win over an authored .la");
+    AudioClipDestroy(preferred);
+
+    // `formats.txt` переставляет порядок. Свой формат первым — играет
+    // он, и рядом ничего не появляется: выводить его не из чего.
+    Expect(PlatformDeleteFile(paths->waveCache), "the cache could not be removed");
+    static const char formatsOwnFirst[] = "# priority\nla\nwav\n";
+    Expect(PlatformWriteEntireFile(formatsPath, formatsOwnFirst, sizeof(formatsOwnFirst) - 1u),
+           "formats.txt could not be written");
+
+    AudioClip *authored = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(authored != NULL && status == AUDIO_PACK_LOAD_OK, "the authored sound must load");
+    double authoredActual = AudioClipDurationSeconds(authored);
+    Expect(authoredActual > authoredSeconds * 0.99 && authoredActual < authoredSeconds * 1.01,
+           "formats.txt must be able to put the engine format first");
+    AudioClipDestroy(authored);
+    Expect(!PlatformPathExists(paths->waveCache),
+           "nothing may be built next to a source the engine never read");
+
+    // Формат, которого в файле нет, не исчезает — он идёт следом.
+    // Иначе одна забытая строка прятала бы содержимое пака.
+    static const char formatsOnlyOwn[] = "la\n";
+    Expect(PlatformWriteEntireFile(formatsPath, formatsOnlyOwn, sizeof(formatsOnlyOwn) - 1u),
+           "formats.txt could not be rewritten");
+    Expect(PlatformDeleteFile(authoredPath), "the authored sound could not be removed");
+    AudioClip *unlisted = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(unlisted != NULL && status == AUDIO_PACK_LOAD_OK,
+           "a format missing from formats.txt must still be reachable");
+    double unlistedSeconds = AudioClipDurationSeconds(unlisted);
+    Expect(unlistedSeconds > expectedSeconds * 0.99 && unlistedSeconds < expectedSeconds * 1.01,
+           "the unlisted wav must be found after the listed formats");
+    AudioClipDestroy(unlisted);
+    Expect(PlatformDeleteFile(formatsPath), "formats.txt could not be removed");
+
+    // Ради чего свой формат и стоит последним: исходник испортился —
+    // играет заранее собранный `.la`, а не тишина.
+    Expect(PlatformWriteEntireFile(authoredPath, pcmFile, LA_HEADER_SIZE + authoredPayload),
+           "the authored sound could not be restored");
+    Expect(PlatformDeleteFile(paths->waveCache), "the rebuilt cache could not be removed");
+    static const uint8_t rubbish[64] = {0};
+    Expect(PlatformWriteEntireFile(paths->waveSound, rubbish, sizeof(rubbish)),
+           "the damaged wav could not be written");
+
+    AudioClip *damaged = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(damaged != NULL && status == AUDIO_PACK_LOAD_OK,
+           "a damaged source must fall through to the authored .la");
+    double damagedSeconds = AudioClipDurationSeconds(damaged);
+    Expect(damagedSeconds > authoredSeconds * 0.99 && damagedSeconds < authoredSeconds * 1.01,
+           "the fallback must be the authored sound, not silence");
+    AudioClipDestroy(damaged);
+    Expect(!PlatformPathExists(paths->waveCache), "a damaged source must not leave a cache");
+
+    // Дальше тест проверяет жизнь кэша, и запасной путь ему помешал бы.
+    uint8_t *restoredWave = PlatformAllocate(waveBytes, true);
+    Expect(restoredWave != NULL, "wav buffer could not be allocated");
+    BuildCanonicalWave(restoredWave, reference, TEST_FRAMES);
+    Expect(PlatformWriteEntireFile(paths->waveSound, restoredWave, waveBytes),
+           "the wav sound could not be restored");
+    PlatformFree(restoredWave);
+    Expect(PlatformDeleteFile(authoredPath), "the authored sound could not be removed");
+    PlatformFree(authoredPath);
+    PlatformFree(formatsPath);
+
+    AudioClip *reread = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(reread != NULL && status == AUDIO_PACK_LOAD_OK, "the restored wav must load");
+    AudioClipDestroy(reread);
+    Expect(PlatformPathExists(paths->waveCache), "the restored wav must be cached again");
+
+    // Исходник пропал — звук остаётся: собранный `.la` его переживает.
+    Expect(PlatformDeleteFile(paths->waveSound) && PlatformDeleteFile(paths->mp3Sound),
+           "the source sounds could not be removed");
+    AudioClip *survivedWave = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(survivedWave != NULL && status == AUDIO_PACK_LOAD_OK,
+           "a sound must survive the loss of its source");
+    double survivedSeconds = AudioClipDurationSeconds(survivedWave);
+    Expect(survivedSeconds > expectedSeconds * 0.99 && survivedSeconds < expectedSeconds * 1.01,
+           "the cached sound must keep the length of its source");
+    AudioClipDestroy(survivedWave);
+
+    AudioClip *survivedMp3 = AudioClipLoadFrom(device, catalog, L"steps/gravel", &status);
+    Expect(survivedMp3 != NULL && status == AUDIO_PACK_LOAD_OK,
+           "an mp3 sound must survive the loss of its source");
+    AudioClipDestroy(survivedMp3);
+
+    // Изменился исходник — кэш пересобирается. Судья здесь отпечаток, а
+    // не часы: у нового файла другой размер, и этого достаточно.
+    uint32_t shortFrames = TEST_FRAMES / 2u;
+    uint32_t shortBytes = 44u + shortFrames * 2u;
+    uint8_t *shortWave = PlatformAllocate(shortBytes, true);
+    Expect(shortWave != NULL, "short wav buffer could not be allocated");
+    BuildCanonicalWave(shortWave, reference, shortFrames);
+    Expect(PlatformWriteEntireFile(paths->waveSound, shortWave, shortBytes),
+           "the shorter wav could not be written");
+    PlatformFree(shortWave);
+
+    AudioClip *rebuilt = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(rebuilt != NULL && status == AUDIO_PACK_LOAD_OK, "the changed sound must load");
+    double rebuiltSeconds = AudioClipDurationSeconds(rebuilt);
+    double shortSeconds = (double)shortFrames / (double)TEST_SAMPLE_RATE;
+    Expect(rebuiltSeconds > shortSeconds * 0.99 && rebuiltSeconds < shortSeconds * 1.01,
+           "the cache must be rebuilt when the source changes");
+    AudioClipDestroy(rebuilt);
+
+    // Нет ни исходника, ни кэша — остаётся тишина.
+    Expect(PlatformDeleteFile(paths->waveSound) && PlatformDeleteFile(paths->waveCache),
+           "the wav and its cache could not be removed");
+    AudioClip *goneWave = AudioClipLoadFrom(device, catalog, L"steps/wood", &status);
+    Expect(goneWave != NULL && status == AUDIO_PACK_LOAD_SOUND_NOT_FOUND,
+           "a sound without a source and without a cache must fall back to silence");
+    Expect(AudioClipDurationSeconds(goneWave) < 0.001, "the default sound must be silence");
+    AudioClipDestroy(goneWave);
+
+    // Выйти за пределы пака нельзя и путём.
+    Expect(AudioClipLoadFrom(device, catalog, L"steps/../../secret", &status) == NULL,
+           "a name that leaves the pack must be refused");
+    Expect(status == AUDIO_PACK_LOAD_INVALID_SOUND, "the refusal must name the invalid sound");
+
+    PlatformDeleteFile(paths->nestedSound);
+    PlatformDeleteFile(paths->waveSound);
+    PlatformDeleteFile(paths->mp3Sound);
+    PlatformDeleteFile(paths->waveCache);
+    PlatformDeleteFile(paths->mp3Cache);
+    PlatformRemoveDirectory(paths->stepsDirectory);
 
     // === PCM16 загружается точно ===
     AudioClip *clip = AudioClipLoadFrom(device, catalog, L"step", &status);
@@ -407,14 +777,21 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
     }
     Expect(residual == 0.0f, "no sound may remain after the clip is destroyed");
 
-    // === Повреждённый файл отвергается ===
-    Expect(AudioClipLoadFrom(device, catalog, L"broken", &status) == NULL,
-           "a truncated sound must be rejected");
+    // === Повреждённый и отсутствующий файл дают тишину ===
+    // Игра не обязана проверять указатель после каждой загрузки: она
+    // получает пригодный клип, а разбираться с причиной может по
+    // статусу — ровно как с материалом, которого нет в текстурпаке.
+    AudioClip *fromBroken = AudioClipLoadFrom(device, catalog, L"broken", &status);
+    Expect(fromBroken != NULL, "a truncated sound must still yield the silent default");
     Expect(status == AUDIO_PACK_LOAD_INVALID_SOUND, "the status must name the invalid sound");
+    Expect(AudioClipDurationSeconds(fromBroken) < 0.001, "the default sound must be silence");
+    AudioClipDestroy(fromBroken);
 
-    Expect(AudioClipLoadFrom(device, catalog, L"missing", &status) == NULL,
-           "an absent sound must be reported as missing");
+    AudioClip *fromMissing = AudioClipLoadFrom(device, catalog, L"missing", &status);
+    Expect(fromMissing != NULL, "an absent sound must still yield the silent default");
     Expect(status == AUDIO_PACK_LOAD_SOUND_NOT_FOUND, "the status must name the missing sound");
+    Expect(AudioClipDurationSeconds(fromMissing) < 0.001, "the default sound must be silence");
+    AudioClipDestroy(fromMissing);
 
     // Выход за пределы пака запрещён именем, а не проверкой пути.
     Expect(AudioClipLoadFrom(device, catalog, L"../step", &status) == NULL,

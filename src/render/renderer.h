@@ -30,6 +30,9 @@ typedef enum RendererContentStatus
     RENDERER_CONTENT_IO_ERROR,
     RENDERER_CONTENT_GPU_ERROR,
     RENDERER_CONTENT_ACTIVATION_ERROR,
+    // Пак загружен, но части материалов в нём не нашлось: они показаны
+    // нейтральным слоем. Отказом это не считается — решает приложение.
+    RENDERER_CONTENT_INCOMPLETE,
 } RendererContentStatus;
 
 // GPU-резидентный меш: квады один раз копируются в общий DEFAULT-буфер
@@ -90,12 +93,28 @@ typedef struct RendererFrameSetup
     float ambientColor[3];
     float skyColor[3];
     float gamma;             // 1.0 — нейтрально; выход шейдера = pow(цвет, 1/gamma)
+
+    // Часы анимации текстур в секундах. Расписание кадров лежит в
+    // текстурпаке, а идти времени или стоять — решает приложение: пауза
+    // это просто одно и то же значение два кадра подряд.
+    double animationSeconds;
 } RendererFrameSetup;
 
 // Создаёт только swapchain и UI-слой. Ресурсы мира вызывающая сторона
 // загружает отдельно, когда они действительно нужны.
 LAIUE_RENDER_API Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height);
 LAIUE_RENDER_API void      RendererDestroy(Renderer* renderer);
+// Имена материалов внутри текстурпака: material id 1 берёт names[0],
+// id 2 — names[1] и так далее, до 64 материалов. Имя вправе содержать
+// '/', поэтому пак делится на подпапки, а расширение движок подбирает
+// сам: `.lt`, `.png` или `.gif`.
+//
+// Имена копируются и применяются при следующей подготовке мира или
+// перезагрузке пака. Пока приложение их не задало, рендерер показывает
+// один нейтральный материал: движок не придумывает, что такое «камень».
+LAIUE_RENDER_API bool RendererSetMaterialNames(Renderer *renderer, const wchar_t *const *names,
+                                               uint32_t count);
+
 LAIUE_RENDER_API bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog);
 LAIUE_RENDER_API bool      RendererPrepareWorld(Renderer* renderer);
 LAIUE_RENDER_API void      RendererReleaseWorld(Renderer* renderer);

@@ -6,8 +6,8 @@
 // из laiue_audio — так ошибка в кодировщике не может спрятаться за
 // симметричной ошибкой в проверке.
 
-#include "la_encode.h"
-#include "wave_decode.h"
+#include "media/la_encode.h"
+#include "media/wave_decode.h"
 
 #include "platform/system.h"
 #include "test_runtime.h"
@@ -28,6 +28,23 @@
 // Панорама равной мощности сохраняет суммарную мощность, а не амплитуду
 // канала: голос по центру звучит в каждом канале с усилением 1/sqrt(2).
 #define CENTRE_GAIN 0.70710678f
+
+// Обёртка над дескриптором: тест проверяет кодирование, а не то, как
+// заполняется структура, и от этого читается лучше.
+static SoundStatus SoundEncodeClip(const int16_t *samples, uint32_t frameCount,
+                                   uint32_t channelCount, uint32_t sampleRate,
+                                   SoundEncoding encoding, void *outBytes, uint32_t capacityBytes,
+                                   uint32_t *outWritten)
+{
+    SoundClip clip = {
+        .samples = samples,
+        .frameCount = frameCount,
+        .channelCount = channelCount,
+        .sampleRate = sampleRate,
+        .encoding = encoding,
+    };
+    return SoundEncode(&clip, outBytes, capacityBytes, outWritten);
+}
 
 static void Expect(bool condition, const char *message)
 {
@@ -146,7 +163,7 @@ typedef struct TestBuffers
     int16_t stereo[TEST_FRAMES * 2u];
     uint8_t wave[WAVE_CAPACITY];
     uint8_t payload[TEST_FRAMES * 2u * 8u];
-    uint8_t encoded[LA_HEADER_BYTES + TEST_FRAMES * 2u * 2u];
+    uint8_t encoded[SOUND_LA_HEADER_BYTES + TEST_FRAMES * 2u * 2u];
 } TestBuffers;
 
 LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
@@ -331,22 +348,22 @@ LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
 
     // === Размеры контейнера ===
     uint32_t encodedBytes = 0u;
-    Expect(LaEncodedBytes(LA_ENCODING_PCM16, TEST_FRAMES, 1u, &encodedBytes) == LA_OK &&
-               encodedBytes == LA_HEADER_BYTES + TEST_FRAMES * 2u,
+    Expect(SoundEncodedBytes(SOUND_ENCODING_PCM16, TEST_FRAMES, 1u, &encodedBytes) == SOUND_OK &&
+               encodedBytes == SOUND_LA_HEADER_BYTES + TEST_FRAMES * 2u,
            "the pcm16 size must follow from the frame count");
-    Expect(LaEncodedBytes(LA_ENCODING_ADPCM, TEST_FRAMES, 1u, &encodedBytes) == LA_OK &&
-               encodedBytes == LA_HEADER_BYTES + 4u + TEST_FRAMES / 2u,
+    Expect(SoundEncodedBytes(SOUND_ENCODING_ADPCM, TEST_FRAMES, 1u, &encodedBytes) == SOUND_OK &&
+               encodedBytes == SOUND_LA_HEADER_BYTES + 4u + TEST_FRAMES / 2u,
            "the adpcm size must follow from the frame count");
-    Expect(LaEncodedBytes(LA_ENCODING_ADPCM, TEST_FRAMES, 2u, &encodedBytes) == LA_OK &&
-               encodedBytes == LA_HEADER_BYTES + 2u * (4u + TEST_FRAMES / 2u),
+    Expect(SoundEncodedBytes(SOUND_ENCODING_ADPCM, TEST_FRAMES, 2u, &encodedBytes) == SOUND_OK &&
+               encodedBytes == SOUND_LA_HEADER_BYTES + 2u * (4u + TEST_FRAMES / 2u),
            "each adpcm channel carries its own state");
-    Expect(LaEncodedBytes(LA_ENCODING_PCM16, 0u, 1u, &encodedBytes) == LA_INVALID_ARGUMENT,
+    Expect(SoundEncodedBytes(SOUND_ENCODING_PCM16, 0u, 1u, &encodedBytes) == SOUND_INVALID_ARGUMENT,
            "an empty sound must be rejected");
-    Expect(LaEncode(buffers->reference, TEST_FRAMES, 1u, 100u, LA_ENCODING_PCM16, buffers->encoded,
-                    sizeof(buffers->encoded), NULL) == LA_INVALID_ARGUMENT,
+    Expect(SoundEncodeClip(buffers->reference, TEST_FRAMES, 1u, 100u, SOUND_ENCODING_PCM16, buffers->encoded,
+                    sizeof(buffers->encoded), NULL) == SOUND_INVALID_ARGUMENT,
            "an impossible sample rate must be rejected by the encoder too");
-    Expect(LaEncode(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, LA_ENCODING_PCM16,
-                    buffers->encoded, LA_HEADER_BYTES, NULL) == LA_BUFFER_TOO_SMALL,
+    Expect(SoundEncodeClip(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, SOUND_ENCODING_PCM16,
+                    buffers->encoded, SOUND_LA_HEADER_BYTES, NULL) == SOUND_BUFFER_TOO_SMALL,
            "a short buffer must be reported, not overrun");
 
 #if defined(LAIUE_SOUNDC_TEST_WITH_AUDIO)
@@ -365,8 +382,8 @@ LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
     Expect(frames != NULL, "mix buffer could not be allocated");
 
     uint32_t written = 0u;
-    Expect(LaEncode(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, LA_ENCODING_PCM16,
-                    buffers->encoded, sizeof(buffers->encoded), &written) == LA_OK,
+    Expect(SoundEncodeClip(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, SOUND_ENCODING_PCM16,
+                    buffers->encoded, sizeof(buffers->encoded), &written) == SOUND_OK,
            "pcm16 encoding must succeed");
 
     AudioPackLoadStatus status = AUDIO_PACK_LOAD_NOT_ATTEMPTED;
@@ -391,10 +408,12 @@ LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
         buffers->stereo[index * 2u] = buffers->reference[index];
         buffers->stereo[index * 2u + 1u] = (int16_t)(-buffers->reference[index]);
     }
-    Expect(LaEncode(buffers->stereo, TEST_FRAMES, 2u, TEST_SAMPLE_RATE, LA_ENCODING_ADPCM,
-                    buffers->encoded, sizeof(buffers->encoded), &written) == LA_OK,
+    Expect(SoundEncodeClip(buffers->stereo, TEST_FRAMES, 2u, TEST_SAMPLE_RATE, SOUND_ENCODING_ADPCM,
+                    buffers->encoded, sizeof(buffers->encoded), &written) == SOUND_OK,
            "adpcm encoding must succeed");
-    Expect(written * 4u < LA_HEADER_BYTES + TEST_FRAMES * 4u + 64u,
+    // Сравниваются полезные нагрузки: заголовок и состояние каналов —
+    // постоянные накладные расходы, к сжатию отношения не имеющие.
+    Expect((written - SOUND_LA_HEADER_BYTES) * 4u < TEST_FRAMES * 4u + 64u,
            "adpcm must be about four times smaller than pcm16");
 
     clip = AudioClipLoadMemory(device, buffers->encoded, written, &status);
