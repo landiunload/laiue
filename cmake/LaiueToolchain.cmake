@@ -43,17 +43,20 @@ elseif(LAIUE_PLATFORM_WINDOWS)
             "Windows-сборка поддерживает cl.exe и clang-cl.exe")
     endif()
 
-    # Before CMake 4.0, /RTC1 lives in the global Debug flag cache and the
-    # MSVC_RUNTIME_CHECKS target abstraction is ignored (CMP0184 OLD).
-    # Remove only CMake's no-CRT-incompatible default. Individual future
-    # CRT-backed targets may still opt in with target_compile_options().
-    if(CMAKE_VERSION VERSION_LESS 4.0)
-        string(REGEX REPLACE
-            "(^|[ \t])[-/]RTC(su|[1suc])([ \t]|$)"
-            " " _laiue_c_flags_debug "${CMAKE_C_FLAGS_DEBUG}")
-        set(CMAKE_C_FLAGS_DEBUG "${_laiue_c_flags_debug}" CACHE STRING
-            "C flags used by the compiler during DEBUG builds" FORCE)
-    endif()
+    # /RTC1 требует CRT, которого в сборке движка нет. CMP0184 NEW убирает
+    # его из флагов, но политика действует с момента project(), а
+    # CMAKE_C_FLAGS_DEBUG кэшируется на самом первом project() — у
+    # суперсборки это project() родителя, где политика вправе остаться
+    # OLD. Поэтому флаг снимается и явно, независимо от версии CMake:
+    # движок не должен требовать, чтобы его собирали корневым проектом.
+    #
+    # Правка живёт в области видимости движка, а не в кэше: у родителя
+    # свой CRT и свои отладочные проверки, отбирать их у него нельзя.
+    # CRT-зависимая цель движка вправе вернуть флаг себе через
+    # target_compile_options().
+    string(REGEX REPLACE
+        "(^|[ \t])[-/]RTC(su|[1suc])([ \t]|$)"
+        " " CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
 
     # CMake's MSVC Release default spells out /Ob2 after /O2. When the optional
     # aggressive profile is selected, remove that directory-scope default so

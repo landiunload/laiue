@@ -10,7 +10,7 @@
 | Alpine x86_64 | проверено в Docker | — | musl, GCC |
 | Alpine ARM64 | проверено в Docker | — | musl, GCC |
 | Debian ARM64 | Docker-tested; native CI job | — | glibc, GCC |
-| Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen собирается, на устройстве не запускался | glibc, нужны окно, ввод и звук |
+| Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA, на устройстве не запускался | glibc, нужны окно, ввод и UI |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | Android ARM64 | NDK r29: собрано и слинковано локально, CI настроен | — | API 28+, static external core |

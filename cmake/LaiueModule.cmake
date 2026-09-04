@@ -62,7 +62,27 @@ function(laiue_add_module module_name)
     add_library(${target_name} ${LAIUE_MODULE_LIBRARY_TYPE_RESOLVED})
     add_library("laiue::${module_name}" ALIAS ${target_name})
     target_sources(${target_name} PRIVATE ${module_sources})
-    source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_sources})
+    # source_group(TREE) отвергает файл вне ROOT, а сгенерированные
+    # заголовки шейдеров лежат в каталоге сборки. У отдельной сборки
+    # движка он оказывается внутри дерева исходников случайно, у
+    # суперсборки чужого проекта — нет, и раскладка IDE не повод
+    # ронять конфигурацию.
+    set(module_tree_sources)
+    set(module_generated_sources)
+    foreach(source IN LISTS module_sources)
+        cmake_path(IS_PREFIX PROJECT_SOURCE_DIR "${source}" NORMALIZE in_source_tree)
+        if(in_source_tree)
+            list(APPEND module_tree_sources "${source}")
+        else()
+            list(APPEND module_generated_sources "${source}")
+        endif()
+    endforeach()
+    if(module_tree_sources)
+        source_group(TREE "${PROJECT_SOURCE_DIR}" FILES ${module_tree_sources})
+    endif()
+    if(module_generated_sources)
+        source_group("generated" FILES ${module_generated_sources})
+    endif()
     target_compile_definitions(${target_name}
         PRIVATE "LAIUE_BUILD_${module_name_upper}")
     if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")

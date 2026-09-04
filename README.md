@@ -46,9 +46,9 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 |---|---:|---:|
 | Windows x86_64 | CI | D3D12, CI |
 | Windows ARM64 | clang-cl собран и слинкован локально; native CI job | D3D12 собирается; на устройстве не запускался |
-| Linux x86_64 | glibc и musl, проверено в Docker | Vulkan рисует кадр offscreen, CI на lavapipe; окна, ввода и звука нет |
+| Linux x86_64 | glibc и musl, проверено в Docker | Vulkan offscreen, ALSA и сцена; окна, ввода и UI ещё нет |
 | Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | Vulkan-профиль не собирался на ARM64 |
-| Steam Deck / SteamOS | Linux x86_64 core | Vulkan-рендер собирается, но клиенту нужны окно, ввод и звук |
+| Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA; нужны окно, ввод, UI и проверка на устройстве |
 | macOS arm64/x86_64 | macOS 11+, native CI настроен, локально не запускался | ещё нет Metal backend |
 | Android ARM64 | NDK r29: static core и финальный `.so` собраны локально, CI настроен | ещё нет APK/Vulkan/input/audio shell |
 | iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | ещё нет приложения/Metal backend |
@@ -95,8 +95,10 @@ cmake --build --preset linux-vulkan-offscreen-release --parallel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json     ctest --preset linux-vulkan-offscreen-release --no-tests=error
 ```
 
-Этот профиль собирает `mesh` и `render`; окно, ввод, звук, сцену и
-интерфейс он не содержит, поэтому игровым клиентом ещё не является.
+Этот профиль собирает `audio`, `mesh`, `render` и `scene`; окна, ввода и
+интерфейса ещё нет, поэтому игровым клиентом он не является. Микшер
+проверяется без звукового устройства; системный вывод ALSA требует
+доступного устройства и может быть пропущен в контейнере.
 Подробности — в [docs/portability.md](docs/portability.md).
 
 macOS core проверяется нативно на обеих архитектурах:
@@ -114,6 +116,8 @@ libraries, а потребитель обязан выполнить финал�
 
 ```sh
 export ANDROID_NDK_HOME=/path/to/android-ndk-r29
+cmake --preset android-arm64-core-closure
+cmake --build --preset android-arm64-core-closure --parallel
 cmake --preset android-arm64-core
 cmake --build --preset android-arm64-core-release --parallel
 ```
@@ -122,11 +126,14 @@ cmake --build --preset android-arm64-core-release --parallel
 
 ```sh
 cmake --preset ios-arm64-core
+cmake --build --preset ios-arm64-core-debug --parallel
 cmake --build --preset ios-arm64-core-release --parallel
 ```
 
-Эти mobile-профили не являются APK/IPA и не подтверждают GPU, ввод, звук,
-store packaging или запуск на устройстве.
+Debug/no-LTO проверяет полную линковку, которую Release LTO/dead-strip
+может скрыть удалением неиспользуемого кода. Release отдельно проверяет
+оптимизированную сборку. Эти mobile-профили не являются APK/IPA и не
+подтверждают GPU, ввод, звук, store packaging или запуск на устройстве.
 
 Стандартный Release ориентирован на скорость: MSVC требует AVX2, а
 Clang/GCC — полный уровень x86-64-v3. Для отдельного совместимого с более
@@ -195,7 +202,7 @@ Xbox, PlayStation и Nintendo пока не являются поддержив�
 hardware нельзя заявлять, что консольная сборка, рендер, ввод, packaging,
 shader/texture packs или физический hash работают. Steam Deck относится к
 Linux x86_64: его core и Vulkan-рендер собираются из существующих presets,
-но без окна, ввода и звука это ещё не игровой клиент, и на самом
+но без окна, ввода и UI это ещё не игровой клиент, и на самом
 устройстве ничего не запускалось.
 
 ## Мир приложения
