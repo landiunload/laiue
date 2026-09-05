@@ -1,5 +1,8 @@
-#include "world/infinite_coord.h"
+#include "numeric/infinite_coord.h"
 #include "test_runtime.h"
+
+#include <float.h>
+#include <string.h>
 
 // InfiniteCoord — публичное знаковое целое произвольной точности, на котором
 // держится бесконечный мир. Тест проходит через экспортированный ABI world.
@@ -427,6 +430,182 @@ static void TestFormatShort(void)
     InfiniteCoordDestroy(&twoPow64);
 }
 
+
+// === Общая арифметика ===
+//
+// Скорость твёрдого тела накапливается именно этими операциями, поэтому
+// проверяются переносы через границу лимба, знаки и насыщение к double.
+
+static void CoordSet(InfiniteCoord* value, int64_t initial)
+{
+    InfiniteCoordInit(value);
+    InfiniteCoord result;
+    if (InfiniteCoordTryCopyAddInt64(&result, value, initial))
+    {
+        InfiniteCoordDestroy(value);
+        *value = result;
+    }
+}
+
+static bool CoordEqualsInt64(const InfiniteCoord* value, int64_t expected)
+{
+    InfiniteCoord reference;
+    CoordSet(&reference, expected);
+    bool equal = InfiniteCoordCompare(value, &reference) == 0;
+    InfiniteCoordDestroy(&reference);
+    return equal;
+}
+
+static void TestAddAndNegate(void)
+{
+    InfiniteCoord left;
+    InfiniteCoord right;
+    InfiniteCoord sum;
+
+    CoordSet(&left, 7);
+    CoordSet(&right, -19);
+    CoordTestExpect(InfiniteCoordTryAdd(&sum, &left, &right), "сложение разных знаков");
+    CoordTestExpect(CoordEqualsInt64(&sum, -12), "7 + (-19) = -12");
+    InfiniteCoordDestroy(&sum);
+    InfiniteCoordDestroy(&right);
+
+    // Ровно противоположные слагаемые обязаны дать канонический ноль.
+    CoordSet(&right, -7);
+    CoordTestExpect(InfiniteCoordTryAdd(&sum, &left, &right), "сложение до нуля");
+    CoordTestExpect(InfiniteCoordSign(&sum) == 0 && sum.limbCount == 0 && sum.limbs == NULL,
+                    "ноль хранится без лимбов");
+    InfiniteCoordDestroy(&sum);
+    InfiniteCoordDestroy(&right);
+    InfiniteCoordDestroy(&left);
+
+    // Перенос через границу лимба: 2^64-1 плюс 1.
+    CoordSet(&left, 0);
+    InfiniteCoord grown;
+    CoordTestExpect(InfiniteCoordTryCopyAddInt64(&grown, &left, INT64_MAX), "подготовка");
+    InfiniteCoordDestroy(&left);
+    CoordTestExpect(InfiniteCoordTryAdd(&sum, &grown, &grown), "удвоение через лимб");
+    CoordTestExpect(sum.limbCount == 1 && sum.limbs[0] == 0xFFFFFFFFFFFFFFFEull,
+                    "2 * (2^63-1) укладывается в один лимб");
+    InfiniteCoordDestroy(&sum);
+
+    InfiniteCoord negated;
+    CoordTestExpect(InfiniteCoordTryCopyNegate(&negated, &grown), "смена знака");
+    CoordTestExpect(InfiniteCoordSign(&negated) == -1, "знак стал отрицательным");
+    CoordTestExpect(InfiniteCoordTryAdd(&sum, &grown, &negated), "число плюс его противоположное");
+    CoordTestExpect(InfiniteCoordSign(&sum) == 0, "сумма противоположных — ноль");
+    InfiniteCoordDestroy(&sum);
+    InfiniteCoordDestroy(&negated);
+    InfiniteCoordDestroy(&grown);
+}
+
+static void TestMultiplyAndShiftLeft(void)
+{
+    InfiniteCoord value;
+    InfiniteCoord product;
+    CoordSet(&value, 3);
+    CoordTestExpect(InfiniteCoordTryCopyMultiplyInt64(&product, &value, -5), "умножение на int64");
+    CoordTestExpect(CoordEqualsInt64(&product, -15), "3 * (-5) = -15");
+    InfiniteCoordDestroy(&product);
+
+    CoordTestExpect(InfiniteCoordTryCopyMultiplyInt64(&product, &value, 0), "умножение на ноль");
+    CoordTestExpect(InfiniteCoordSign(&product) == 0, "ноль поглощает");
+    InfiniteCoordDestroy(&product);
+    InfiniteCoordDestroy(&value);
+
+    // Сдвиг влево обязан пересекать границу лимба.
+    CoordSet(&value, 1);
+    InfiniteCoord shifted;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &value, 64u), "сдвиг на целый лимб");
+    CoordTestExpect(shifted.limbCount == 2 && shifted.limbs[0] == 0 && shifted.limbs[1] == 1,
+                    "1 << 64 — это второй лимб");
+    InfiniteCoordDestroy(&shifted);
+
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &value, 70u), "сдвиг с остатком");
+    CoordTestExpect(shifted.limbCount == 2 && shifted.limbs[0] == 0 &&
+                        shifted.limbs[1] == (1ull << 6),
+                    "1 << 70 — шестой бит второго лимба");
+    InfiniteCoordDestroy(&shifted);
+    InfiniteCoordDestroy(&value);
+
+    // Сдвиг влево и обратно вправо обязан вернуть исходное число.
+    CoordSet(&value, 1234567);
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &value, 40u), "сдвиг туда");
+    InfiniteCoord restored;
+    CoordTestExpect(InfiniteCoordTryCopyShiftRight(&restored, &shifted, 40u), "сдвиг обратно");
+    CoordTestExpect(CoordEqualsInt64(&restored, 1234567), "сдвиг обратим");
+    InfiniteCoordDestroy(&restored);
+    InfiniteCoordDestroy(&shifted);
+    InfiniteCoordDestroy(&value);
+}
+
+static void TestDoubleConversion(void)
+{
+    InfiniteCoord value;
+    CoordSet(&value, 0);
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&value) == 0.0, "ноль в double");
+    InfiniteCoordDestroy(&value);
+
+    CoordSet(&value, -1234567890123);
+    double converted = InfiniteCoordToDoubleSaturating(&value);
+    CoordTestExpect(converted == -1234567890123.0, "точное значение до 2^53");
+    InfiniteCoordDestroy(&value);
+
+    // Число за пределами double обязано насыщаться, а не превращаться в
+    // бесконечность: бесконечность отравила бы дальнейшую арифметику.
+    CoordSet(&value, 1);
+    InfiniteCoord huge;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&huge, &value, 4000u), "очень большое число");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&huge) == DBL_MAX, "насыщение вверх");
+    InfiniteCoord negativeHuge;
+    CoordTestExpect(InfiniteCoordTryCopyNegate(&negativeHuge, &huge), "и вниз");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&negativeHuge) == -DBL_MAX, "насыщение вниз");
+    InfiniteCoordDestroy(&negativeHuge);
+    InfiniteCoordDestroy(&huge);
+    InfiniteCoordDestroy(&value);
+
+    // Обратное преобразование усекает к нулю и отвергает не-числа.
+    InfiniteCoord fromDouble;
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&fromDouble, 7.9), "double в число");
+    CoordTestExpect(CoordEqualsInt64(&fromDouble, 7), "усечение к нулю вверх");
+    InfiniteCoordDestroy(&fromDouble);
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&fromDouble, -7.9), "отрицательный double");
+    CoordTestExpect(CoordEqualsInt64(&fromDouble, -7), "усечение к нулю вниз");
+    InfiniteCoordDestroy(&fromDouble);
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&fromDouble, 0.5), "дробь меньше единицы");
+    CoordTestExpect(InfiniteCoordSign(&fromDouble) == 0, "дробь усекается в ноль");
+    InfiniteCoordDestroy(&fromDouble);
+
+    // Большое, но представимое: 2^70 обязано пройти круг без потерь.
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&fromDouble, 1180591620717411303424.0),
+                    "2^70 из double");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&fromDouble) == 1180591620717411303424.0,
+                    "2^70 обратно в double");
+    InfiniteCoordDestroy(&fromDouble);
+
+    double notANumber = 0.0;
+    uint64_t nanBits = 0x7FF8000000000000ull;
+    memcpy(&notANumber, &nanBits, sizeof(notANumber));
+    CoordTestExpect(!InfiniteCoordTrySetFromDouble(&fromDouble, notANumber), "NaN отвергается");
+}
+
+static void TestCompareOrder(void)
+{
+    InfiniteCoord left;
+    InfiniteCoord right;
+    CoordSet(&left, -5);
+    CoordSet(&right, 3);
+    CoordTestExpect(InfiniteCoordCompare(&left, &right) < 0, "отрицательное меньше положительного");
+    CoordTestExpect(InfiniteCoordCompare(&right, &left) > 0, "и наоборот");
+    CoordTestExpect(InfiniteCoordCompare(&left, &left) == 0, "число равно себе");
+    InfiniteCoordDestroy(&right);
+
+    // У отрицательных больший модуль означает меньшее число.
+    CoordSet(&right, -9);
+    CoordTestExpect(InfiniteCoordCompare(&right, &left) < 0, "-9 меньше -5");
+    InfiniteCoordDestroy(&right);
+    InfiniteCoordDestroy(&left);
+}
+
 LAIUE_TEST_ENTRY(CoordTestEntryPoint)
 {
     TestInitAndInt64RoundTrip();
@@ -440,6 +619,10 @@ LAIUE_TEST_ENTRY(CoordTestEntryPoint)
     TestHashOffset();
     TestSwap();
     TestFormatShort();
+    TestAddAndNegate();
+    TestMultiplyAndShiftLeft();
+    TestDoubleConversion();
+    TestCompareOrder();
 
     CoordTestWrite("Проверок пройдено: ");
     CoordTestWriteNumber(coordTestChecks);

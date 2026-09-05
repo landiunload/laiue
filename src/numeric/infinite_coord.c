@@ -1,5 +1,8 @@
-#include "world/infinite_coord.h"
+#include "numeric/infinite_coord.h"
 #include "platform/system.h"
+
+#include <float.h>
+#include <string.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -987,4 +990,364 @@ void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
     }
 
     InfiniteCoordDestroy(&value);
+}
+
+// === Общая арифметика ===
+
+int32_t InfiniteCoordSign(const InfiniteCoord* value)
+{
+    return value == NULL ? 0 : value->sign;
+}
+
+int32_t InfiniteCoordCompare(const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (left->sign != right->sign)
+    {
+        return left->sign < right->sign ? -1 : 1;
+    }
+    if (left->sign == 0)
+    {
+        return 0;
+    }
+    int32_t magnitude = InfiniteCoordCompareMagnitude(left, right);
+    return left->sign > 0 ? magnitude : -magnitude;
+}
+
+static bool TryAllocateLimbs(InfiniteCoord* value, uint32_t limbCount)
+{
+    if (limbCount == 0)
+    {
+        InfiniteCoordInit(value);
+        return true;
+    }
+    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), true);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    value->limbs = limbs;
+    value->limbCount = limbCount;
+    value->sign = 0;
+    return true;
+}
+
+// |left| + |right| в out. Знак вызывающий ставит сам.
+static bool TryAddMagnitudes(
+    InfiniteCoord* out, const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    uint32_t count = left->limbCount > right->limbCount
+        ? left->limbCount : right->limbCount;
+    if (count == UINT32_MAX)
+    {
+        return false;
+    }
+    InfiniteCoordInit(out);
+    if (!TryAllocateLimbs(out, count + 1u))
+    {
+        return false;
+    }
+
+    uint64_t carry = 0;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        uint64_t a = index < left->limbCount ? left->limbs[index] : 0;
+        uint64_t b = index < right->limbCount ? right->limbs[index] : 0;
+        uint64_t sum = a + b;
+        uint64_t firstCarry = sum < a ? 1u : 0u;
+        uint64_t result = sum + carry;
+        uint64_t secondCarry = result < sum ? 1u : 0u;
+        out->limbs[index] = result;
+        carry = firstCarry | secondCarry;
+    }
+    out->limbs[count] = carry;
+    return true;
+}
+
+// |larger| - |smaller| в out; вызывающий обязан гарантировать порядок.
+static bool TrySubtractMagnitudes(
+    InfiniteCoord* out, const InfiniteCoord* larger, const InfiniteCoord* smaller)
+{
+    InfiniteCoordInit(out);
+    if (!TryAllocateLimbs(out, larger->limbCount))
+    {
+        return false;
+    }
+
+    uint64_t borrow = 0;
+    for (uint32_t index = 0; index < larger->limbCount; ++index)
+    {
+        uint64_t a = larger->limbs[index];
+        uint64_t b = index < smaller->limbCount ? smaller->limbs[index] : 0;
+        uint64_t difference = a - b;
+        uint64_t firstBorrow = a < b ? 1u : 0u;
+        uint64_t result = difference - borrow;
+        uint64_t secondBorrow = difference < borrow ? 1u : 0u;
+        out->limbs[index] = result;
+        borrow = firstBorrow | secondBorrow;
+    }
+    return true;
+}
+
+bool InfiniteCoordTryAdd(
+    InfiniteCoord* out, const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (out == NULL || left == NULL || right == NULL)
+    {
+        return false;
+    }
+    if (left->sign == 0)
+    {
+        return InfiniteCoordTryCopy(out, right);
+    }
+    if (right->sign == 0)
+    {
+        return InfiniteCoordTryCopy(out, left);
+    }
+
+    InfiniteCoord result;
+    if (left->sign == right->sign)
+    {
+        if (!TryAddMagnitudes(&result, left, right))
+        {
+            return false;
+        }
+        result.sign = left->sign;
+    }
+    else
+    {
+        int32_t order = InfiniteCoordCompareMagnitude(left, right);
+        if (order == 0)
+        {
+            InfiniteCoordInit(out);
+            return true;
+        }
+        const InfiniteCoord* larger = order > 0 ? left : right;
+        const InfiniteCoord* smaller = order > 0 ? right : left;
+        if (!TrySubtractMagnitudes(&result, larger, smaller))
+        {
+            return false;
+        }
+        result.sign = larger->sign;
+    }
+
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+bool InfiniteCoordTryCopyNegate(InfiniteCoord* out, const InfiniteCoord* source)
+{
+    if (!InfiniteCoordTryCopy(out, source))
+    {
+        return false;
+    }
+    out->sign = -out->sign;
+    return true;
+}
+
+bool InfiniteCoordTryCopyMultiplyInt64(
+    InfiniteCoord* out, const InfiniteCoord* source, int64_t factor)
+{
+    if (out == NULL || source == NULL)
+    {
+        return false;
+    }
+    if (source->sign == 0 || factor == 0)
+    {
+        InfiniteCoordInit(out);
+        return true;
+    }
+
+    uint64_t magnitude = Int64Magnitude(factor);
+    InfiniteCoord result;
+    InfiniteCoordInit(&result);
+    if (source->limbCount == UINT32_MAX || !TryAllocateLimbs(&result, source->limbCount + 1u))
+    {
+        return false;
+    }
+
+    uint64_t carry = 0;
+    for (uint32_t index = 0; index < source->limbCount; ++index)
+    {
+        uint64_t high = 0;
+        uint64_t low = Multiply64(source->limbs[index], magnitude, &high);
+        uint64_t sum = low + carry;
+        if (sum < low)
+        {
+            ++high;
+        }
+        result.limbs[index] = sum;
+        carry = high;
+    }
+    result.limbs[source->limbCount] = carry;
+    result.sign = factor < 0 ? -source->sign : source->sign;
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+bool InfiniteCoordTryCopyShiftLeft(
+    InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount)
+{
+    if (out == NULL || source == NULL)
+    {
+        return false;
+    }
+    if (source->sign == 0)
+    {
+        InfiniteCoordInit(out);
+        return true;
+    }
+
+    uint32_t limbShift = bitCount / 64u;
+    uint32_t bitShift = bitCount % 64u;
+    if (source->limbCount > UINT32_MAX - limbShift - 1u)
+    {
+        return false;
+    }
+
+    InfiniteCoord result;
+    InfiniteCoordInit(&result);
+    if (!TryAllocateLimbs(&result, source->limbCount + limbShift + 1u))
+    {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < source->limbCount; ++index)
+    {
+        uint64_t limb = source->limbs[index];
+        result.limbs[index + limbShift] |= bitShift == 0 ? limb : limb << bitShift;
+        if (bitShift != 0)
+        {
+            result.limbs[index + limbShift + 1u] |= limb >> (64u - bitShift);
+        }
+    }
+    result.sign = source->sign;
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+// 2^exponent как double, без math.h: показатель кладётся прямо в поле
+// экспоненты IEEE 754. За верхней границей формата возвращается DBL_MAX.
+static double PowerOfTwo(uint32_t exponent)
+{
+    if (exponent > 1023u)
+    {
+        return DBL_MAX;
+    }
+    uint64_t bits = (uint64_t)(exponent + 1023u) << 52;
+    double result = 0.0;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static uint32_t HighestSetBit(uint64_t value)
+{
+    uint32_t index = 0;
+    while (value > 1u)
+    {
+        value >>= 1;
+        ++index;
+    }
+    return index;
+}
+
+double InfiniteCoordToDoubleSaturating(const InfiniteCoord* value)
+{
+    if (value == NULL || value->sign == 0 || value->limbCount == 0)
+    {
+        return 0.0;
+    }
+
+    uint32_t topIndex = value->limbCount - 1u;
+    uint64_t top = value->limbs[topIndex];
+    uint64_t bitLength = (uint64_t)topIndex * 64u + HighestSetBit(top) + 1u;
+    if (bitLength > 1024u)
+    {
+        return value->sign > 0 ? DBL_MAX : -DBL_MAX;
+    }
+
+    // Достаточно 64 старших бит: остальные ниже точности double.
+    uint64_t mantissa = top;
+    uint32_t shift = 0;
+    if (bitLength > 64u)
+    {
+        shift = (uint32_t)(bitLength - 64u);
+        uint32_t bitShift = shift % 64u;
+        if (bitShift != 0 && topIndex > 0)
+        {
+            mantissa = (top << (64u - bitShift)) | (value->limbs[topIndex - 1u] >> bitShift);
+        }
+    }
+
+    double magnitude = (double)mantissa;
+    if (shift != 0)
+    {
+        double scale = PowerOfTwo(shift);
+        if (scale >= DBL_MAX / magnitude)
+        {
+            return value->sign > 0 ? DBL_MAX : -DBL_MAX;
+        }
+        magnitude *= scale;
+    }
+    return value->sign > 0 ? magnitude : -magnitude;
+}
+
+bool InfiniteCoordTrySetFromDouble(InfiniteCoord* out, double value)
+{
+    if (out == NULL)
+    {
+        return false;
+    }
+
+    // NaN и бесконечность распознаются по битам, а не сравнением: модуль
+    // собирается с /fp:fast, где компилятор вправе считать, что таких
+    // значений не бывает, и выкидывает проверку `value != value` целиком.
+    uint64_t valueBits = 0;
+    memcpy(&valueBits, &value, sizeof(valueBits));
+    if (((valueBits >> 52) & 0x7FFu) == 0x7FFu)
+    {
+        return false;
+    }
+
+    InfiniteCoordInit(out);
+    int32_t sign = value < 0.0 ? -1 : 1;
+    double magnitude = value < 0.0 ? -value : value;
+    if (magnitude < 1.0)
+    {
+        return true;
+    }
+
+    uint64_t bits = 0;
+    memcpy(&bits, &magnitude, sizeof(bits));
+    uint32_t exponent = (uint32_t)((bits >> 52) & 0x7FFu);
+    uint64_t fraction = bits & 0xFFFFFFFFFFFFFull;
+    // Нормальное число: 1.fraction * 2^(exponent-1023). Целая часть равна
+    // мантиссе, сдвинутой на exponent-1023-52 бит.
+    uint64_t mantissa = fraction | (1ull << 52);
+    int32_t shift = (int32_t)exponent - 1023 - 52;
+
+    InfiniteCoord base;
+    InfiniteCoordInit(&base);
+    if (!InfiniteCoordTryAddInt64InPlace(&base, (int64_t)mantissa))
+    {
+        return false;
+    }
+    base.sign = sign;
+
+    bool ok;
+    if (shift >= 0)
+    {
+        ok = InfiniteCoordTryCopyShiftLeft(out, &base, (uint32_t)shift);
+    }
+    else
+    {
+        // Отрицательный сдвиг — усечение к нулю: младшие биты отбрасываются.
+        uint32_t right = (uint32_t)(-shift);
+        ok = right >= 64u ? (InfiniteCoordInit(out), true)
+                          : InfiniteCoordTryCopyShiftRight(out, &base, right);
+    }
+    InfiniteCoordDestroy(&base);
+    return ok;
 }

@@ -45,6 +45,12 @@
 #define LAIUE_UI_API LAIUE_IMPORT
 #endif
 
+#if defined(LAIUE_BUILD_NUMERIC)
+#define LAIUE_NUMERIC_API LAIUE_EXPORT
+#else
+#define LAIUE_NUMERIC_API LAIUE_IMPORT
+#endif
+
 #if defined(LAIUE_BUILD_WORLD)
 #define LAIUE_WORLD_API LAIUE_EXPORT
 #else

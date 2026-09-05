@@ -1,5 +1,5 @@
 #include "world/world.h"
-#include "world/infinite_coord.h"
+#include "numeric/infinite_coord.h"
 #include "platform/system.h"
 
 #include <limits.h>

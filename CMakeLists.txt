@@ -77,6 +77,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>")
 
 add_subdirectory(src/math)
+add_subdirectory(src/numeric)
 add_subdirectory(src/media)
 add_subdirectory(src/platform)
 add_subdirectory(src/world)
@@ -103,7 +104,7 @@ if(LAIUE_PLATFORM_EXTERNAL AND
    LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     string(CONCAT _laiue_static_core_link
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,"
-        "laiue_world,laiue_physics,laiue_content,laiue_mod>")
+        "laiue_numeric,laiue_world,laiue_physics,laiue_content,laiue_mod>")
     add_executable(laiue_static_core_link_smoke
         tests/static_core_link_smoke.c)
     target_link_libraries(laiue_static_core_link_smoke PRIVATE
@@ -136,12 +137,15 @@ install(TARGETS ${LAIUE_RUNTIME_TARGETS} laiue_engine
 install(FILES "${PROJECT_SOURCE_DIR}/src/api.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue"
     COMPONENT Engine)
-install(FILES
-        "${PROJECT_SOURCE_DIR}/src/world/world.h"
-        "${PROJECT_SOURCE_DIR}/src/world/infinite_coord.h"
+install(FILES "${PROJECT_SOURCE_DIR}/src/numeric/infinite_coord.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/numeric"
+    COMPONENT Engine)
+install(FILES "${PROJECT_SOURCE_DIR}/src/world/world.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/world"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/physics/voxel_body.h"
+install(FILES
+        "${PROJECT_SOURCE_DIR}/src/physics/rigid_body.h"
+        "${PROJECT_SOURCE_DIR}/src/physics/voxel_body.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
     COMPONENT Engine)
 install(FILES

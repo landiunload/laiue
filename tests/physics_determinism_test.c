@@ -1,5 +1,5 @@
 #include "physics/voxel_body.h"
-#include "world/infinite_coord.h"
+#include "numeric/infinite_coord.h"
 #include "world/world.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"

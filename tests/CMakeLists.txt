@@ -28,9 +28,9 @@ add_test(NAME laiue.platform.threading
     COMMAND laiue_platform_threading_test)
 
 add_executable(laiue_infinite_coord_test infinite_coord_test.c)
-target_link_libraries(laiue_infinite_coord_test PRIVATE laiue_world)
+target_link_libraries(laiue_infinite_coord_test PRIVATE laiue_numeric)
 laiue_configure_standalone_executable(laiue_infinite_coord_test CoordTestEntryPoint)
-add_test(NAME laiue.world.infinite_coord COMMAND laiue_infinite_coord_test)
+add_test(NAME laiue.numeric.infinite_coord COMMAND laiue_infinite_coord_test)
 
 add_executable(laiue_world_provider_test world_provider_test.c)
 target_link_libraries(laiue_world_provider_test PRIVATE laiue_world)
@@ -42,9 +42,15 @@ target_link_libraries(laiue_physics_test PRIVATE laiue_physics)
 laiue_configure_standalone_executable(laiue_physics_test PhysicsTestEntryPoint)
 add_test(NAME laiue.physics.voxel_body COMMAND laiue_physics_test)
 
+add_executable(laiue_rigid_body_test rigid_body_test.c)
+target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics)
+laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPoint)
+add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
+
 add_executable(laiue_physics_determinism_test physics_determinism_test.c)
 target_link_libraries(laiue_physics_determinism_test PRIVATE
     laiue_physics
+    laiue_numeric
     laiue_world)
 laiue_configure_standalone_executable(
     laiue_physics_determinism_test PhysicsDeterminismTestEntryPoint)

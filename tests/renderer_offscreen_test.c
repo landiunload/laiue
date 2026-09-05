@@ -57,6 +57,42 @@ static uint32_t CountPixelsDifferentFrom(const uint8_t *pixels, uint8_t red, uin
     return different;
 }
 
+// Центр тяжести закрашенных пикселей. Поворот инстанса виден именно
+// смещением геометрии, а не изменением их числа.
+static bool CoveredCentroid(const uint8_t *pixels, uint8_t red, uint8_t green, uint8_t blue,
+                            uint32_t tolerance, double *outX, double *outY)
+{
+    double sumX = 0.0;
+    double sumY = 0.0;
+    uint32_t count = 0;
+    for (uint32_t y = 0; y < TEST_HEIGHT; ++y)
+    {
+        for (uint32_t x = 0; x < TEST_WIDTH; ++x)
+        {
+            const uint8_t *pixel = pixels + ((size_t)y * TEST_WIDTH + x) * 4u;
+            uint32_t deltaRed = pixel[0] > red ? (uint32_t)(pixel[0] - red) : (uint32_t)(red - pixel[0]);
+            uint32_t deltaGreen =
+                pixel[1] > green ? (uint32_t)(pixel[1] - green) : (uint32_t)(green - pixel[1]);
+            uint32_t deltaBlue =
+                pixel[2] > blue ? (uint32_t)(pixel[2] - blue) : (uint32_t)(blue - pixel[2]);
+            if (deltaRed <= tolerance && deltaGreen <= tolerance && deltaBlue <= tolerance)
+            {
+                continue;
+            }
+            sumX += (double)x;
+            sumY += (double)y;
+            ++count;
+        }
+    }
+    if (count == 0u)
+    {
+        return false;
+    }
+    *outX = sumX / (double)count;
+    *outY = sumY / (double)count;
+    return true;
+}
+
 static void PutU16(uint8_t *bytes, uint32_t value)
 {
     bytes[0] = (uint8_t)(value & 0xFFu);
@@ -283,6 +319,15 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     // Тот же меш рисуется дважды со своими смещениями: в chunk.hlsl это
     // отдельная ветка, которую обычная отрисовка не задевает.
     RendererMeshInstance instances[2];
+    // Нулевой кватернион обязан означать отсутствие поворота: код, который
+    // заполняет только origin и scale, остаётся верным.
+    for (uint32_t index = 0; index < 2u; ++index)
+    {
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            instances[index].rotation[component] = 0.0f;
+        }
+    }
     instances[0].originRelative[0] = -0.5f;
     instances[0].originRelative[1] = -0.5f;
     instances[0].originRelative[2] = -0.5f;
@@ -304,6 +349,53 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     uint32_t instanced = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
     Expect(instanced > 0u, "instanced drawing produced an empty frame");
     Expect(instanced < covered, "half-scale instances must cover less than the full-size quad");
+
+    // === Поворот инстанса ===
+    // Один инстанс без поворота и он же, повёрнутый на 180 градусов вокруг
+    // Z. Меш растёт от локального нуля в плюс, поэтому такой поворот обязан
+    // перебросить геометрию на противоположную сторону точки привязки.
+    RendererMeshInstance placement = instances[0];
+    placement.originRelative[0] = 0.0f;
+    placement.originRelative[1] = 0.0f;
+    placement.originRelative[2] = -0.5f;
+    placement.scale = 0.75f;
+
+    Expect(RendererBeginFrame(renderer, &setup), "unrotated instance frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMeshInstances(renderer, mesh, &placement, 1u);
+    Expect(RendererEndFrame(renderer), "unrotated instance frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "unrotated instance frame could not be captured");
+    double straightX = 0.0;
+    double straightY = 0.0;
+    Expect(CoveredCentroid(pixels, 255u, 0u, 0u, 8u, &straightX, &straightY),
+           "unrotated instance produced an empty frame");
+
+    // Кватернион (0, 0, 1, 0) — поворот на 180 градусов вокруг Z.
+    placement.rotation[0] = 0.0f;
+    placement.rotation[1] = 0.0f;
+    placement.rotation[2] = 1.0f;
+    placement.rotation[3] = 0.0f;
+
+    Expect(RendererBeginFrame(renderer, &setup), "rotated instance frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMeshInstances(renderer, mesh, &placement, 1u);
+    Expect(RendererEndFrame(renderer), "rotated instance frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "rotated instance frame could not be captured");
+    double turnedX = 0.0;
+    double turnedY = 0.0;
+    Expect(CoveredCentroid(pixels, 255u, 0u, 0u, 8u, &turnedX, &turnedY),
+           "rotated instance produced an empty frame");
+
+    // Геометрия обязана оказаться по другую сторону точки привязки — то есть
+    // левее и ниже центра кадра там, где раньше была правее и выше.
+    double centreX = (double)TEST_WIDTH * 0.5;
+    double centreY = (double)TEST_HEIGHT * 0.5;
+    Expect((straightX - centreX) * (turnedX - centreX) < 0.0,
+           "a half turn must move the instance to the other side by X");
+    Expect((straightY - centreY) * (turnedY - centreY) < 0.0,
+           "a half turn must move the instance to the other side by Y");
 
     // === Панорама ===
     // Шесть граней кубмапы и полноэкранный резолв. Проход рисует только

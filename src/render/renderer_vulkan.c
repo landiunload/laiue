@@ -50,7 +50,7 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
-#define INSTANCE_BYTES_PER_FRAME (512u * 1024u)
+#define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
 // Кольцо констант: D3D12 переписывает корневые константы на каждый
 // вызов отрисовки, у Vulkan та же роль у uniform-буфера с динамическим
 // смещением, поэтому на кадр нужен свой диапазон.

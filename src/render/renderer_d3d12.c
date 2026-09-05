@@ -67,7 +67,7 @@
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 // One frame can contain up to six scene passes with thousands of instances.
 // Keep enough upload space so later passes cannot silently lose caller draws.
-#define INSTANCE_BYTES_PER_FRAME (512u * 1024u)
+#define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
 
 typedef struct FreeRange
 {

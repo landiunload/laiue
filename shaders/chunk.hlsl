@@ -29,7 +29,18 @@ struct PixelInput
     float4 position : SV_POSITION;
     float2 textureCoordinates : TEXCOORD0;
     nointerpolation uint surface : SURFACE;
+    // Поворот инстанса. Касательное пространство грани задано в мировых
+    // осях, поэтому у повёрнутого тела его нужно повернуть тоже — иначе
+    // кувыркающийся куб освещается так, будто лежит неподвижно.
+    nointerpolation float4 rotation : TEXCOORD1;
 };
+
+float3 RotateByQuaternion(float4 rotation, float3 value)
+{
+    float3 axis = rotation.xyz;
+    float3 doubled = 2.0 * cross(axis, value);
+    return value + rotation.w * doubled + cross(axis, doubled);
+}
 
 static const uint CORNER_PATTERN[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -46,8 +57,6 @@ static const uint3 FACE_CORNERS[6][4] =
     { uint3(0,1,1), uint3(1,1,1), uint3(1,1,0), uint3(0,1,0) },  // +Z (высота) — old +Y
     { uint3(1,0,1), uint3(0,0,1), uint3(0,0,0), uint3(1,0,0) },  // -Z          — old -Y
 };
-
-static const float SEAM_INFLATE = 0.0015;
 
 PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
 {
@@ -66,21 +75,22 @@ PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     float3 localPosition = (float3)(start + remapped * extent);
     float3 origin = chunkOriginRelative;
     float scale = meshScale;
+    float4 rotation = float4(0.0, 0.0, 0.0, 0.0);
     [branch]
     if (meshScale < 0.0f)
     {
-        float4 instance = asfloat(meshInstances.Load4(instanceId * 16));
-        origin = instance.xyz;
-        scale = instance.w;
+        float4 placement = asfloat(meshInstances.Load4(instanceId * 32));
+        origin = placement.xyz;
+        scale = placement.w;
+        rotation = asfloat(meshInstances.Load4(instanceId * 32 + 16));
     }
-    float3 worldPosition = origin + localPosition * scale;
-
-    float viewDepth = mul(float4(worldPosition, 1.0), viewProjection).w;
-    float3 cornerSign = (float3)remapped * 2.0 - 1.0;
-    uint originalAxis = face >> 1;
-    uint normalAxis = originalAxis;
-    float3 inPlane = float3(normalAxis != 0, normalAxis != 1, normalAxis != 2);
-    worldPosition += cornerSign * inPlane * (SEAM_INFLATE * viewDepth);
+    float3 offset = localPosition * scale;
+    // Нулевой кватернион — отсутствие поворота, а не вырожденный поворот.
+    if (dot(rotation, rotation) > 0.0001)
+    {
+        offset = RotateByQuaternion(rotation, offset);
+    }
+    float3 worldPosition = origin + offset;
 
     PixelInput output;
     output.position = mul(float4(worldPosition, 1.0), viewProjection);
@@ -106,6 +116,7 @@ PixelInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     uint sliceWord = slicePack[(materialIndex >> 2) & 3u];
     uint textureLayer = (sliceWord >> ((materialIndex & 3u) * 8u)) & 0xFFu;
     output.surface = face | (textureLayer << 3);
+    output.rotation = rotation;
     return output;
 }
 
@@ -145,15 +156,36 @@ float4 PSMain(PixelInput input) : SV_TARGET
     float3 tangentNormal = normalSample.rgb * 2.0 - 1.0;
     float occlusion = normalSample.a;
 
+    float3 tangent = FACE_TANGENT[face];
+    float3 bitangent = FACE_BITANGENT[face];
+    float3 faceNormal = FACE_NORMAL[face];
+    float shade = FACE_SHADE[face];
+    if (dot(input.rotation, input.rotation) > 0.0001)
+    {
+        tangent = RotateByQuaternion(input.rotation, tangent);
+        bitangent = RotateByQuaternion(input.rotation, bitangent);
+        faceNormal = RotateByQuaternion(input.rotation, faceNormal);
+        // Небесная окклюзия принадлежит направлению, а не грани тела:
+        // у повёрнутого куба она берётся по той оси мира, на которую
+        // грань теперь смотрит. Неповёрнутая геометрия идёт прежним
+        // путём и остаётся пиксель в пиксель той же.
+        float3 magnitude = abs(faceNormal);
+        uint dominant = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z
+            ? 0u : (magnitude.y >= magnitude.z ? 2u : 4u);
+        float along = dominant == 0u ? faceNormal.x
+            : (dominant == 2u ? faceNormal.y : faceNormal.z);
+        shade = FACE_SHADE[along < 0.0 ? dominant + 1u : dominant];
+    }
+
     float3 worldNormal = normalize(
-        FACE_TANGENT[face] * tangentNormal.x
-        + FACE_BITANGENT[face] * tangentNormal.y
-        + FACE_NORMAL[face] * tangentNormal.z);
+        tangent * tangentNormal.x
+        + bitangent * tangentNormal.y
+        + faceNormal * tangentNormal.z);
 
     // Ламберт от солнца/луны + ambient с небесной окклюзией грани.
     // AO гасит ambient целиком, прямой свет — наполовину.
     float diffuse = saturate(dot(worldNormal, -sunDirection));
-    float3 light = ambientColor * (FACE_SHADE[face] * occlusion)
+    float3 light = ambientColor * (shade * occlusion)
         + sunColor * (diffuse * (0.55 + 0.45 * occlusion));
     float3 shaded = pow(saturate(baseColor * light), gammaInverse);
     return float4(shaded, 1.0);
