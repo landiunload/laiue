@@ -494,18 +494,27 @@ static bool BuildTemporaryPath(
 bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,
                              uint64_t size)
 {
-    wchar_t temporary[LAIUE_PLATFORM_PATH_CAPACITY];
-    if (!BuildTemporaryPath(path, temporary)) return false;
+    wchar_t* temporary = PlatformAllocate(
+        (size_t)LAIUE_PLATFORM_PATH_CAPACITY * sizeof(*temporary), false);
+    if (temporary == NULL) return false;
+    if (!BuildTemporaryPath(path, temporary))
+    {
+        PlatformFree(temporary);
+        return false;
+    }
     if (!PlatformWriteEntireFile(temporary, bytes, size))
     {
         PlatformDeleteFile(temporary);
+        PlatformFree(temporary);
         return false;
     }
     if (!PlatformMoveReplace(temporary, path))
     {
         PlatformDeleteFile(temporary);
+        PlatformFree(temporary);
         return false;
     }
+    PlatformFree(temporary);
     return true;
 }
 

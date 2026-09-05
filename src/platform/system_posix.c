@@ -540,9 +540,16 @@ bool PlatformGetPathInformation(const wchar_t *path, PlatformPathInformation *in
     information->isDirectory = S_ISDIR(status.st_mode);
     information->isSymbolicLink = S_ISLNK(status.st_mode);
     information->size = status.st_size < 0 ? 0 : (uint64_t)status.st_size;
-    information->modifiedTime = status.st_mtime < 0
+#if defined(__APPLE__)
+    const time_t modifiedSeconds = status.st_mtimespec.tv_sec;
+    const long modifiedNanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    const time_t modifiedSeconds = status.st_mtim.tv_sec;
+    const long modifiedNanoseconds = status.st_mtim.tv_nsec;
+#endif
+    information->modifiedTime = modifiedSeconds < 0
         ? 0U
-        : (uint64_t)status.st_mtime * 1000000000U + (uint64_t)status.st_mtim.tv_nsec;
+        : (uint64_t)modifiedSeconds * 1000000000U + (uint64_t)modifiedNanoseconds;
     return true;
 }
 
