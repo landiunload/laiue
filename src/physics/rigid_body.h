@@ -103,6 +103,17 @@ typedef struct VoxelRigidStepSettings
     uint32_t sleepFrames;
 } VoxelRigidStepSettings;
 
+// Диагностика последнего шага в переданном scratch-буфере. Счётчики не
+// участвуют в решении и позволяют игре отличить стоимость broadphase/SAT от
+// стоимости собственного рендера без скрытых аллокаций и глобального state.
+typedef struct VoxelRigidStepStats
+{
+    uint32_t activeBodyCount;
+    uint32_t awakeBodyCount;
+    uint32_t candidatePairCount;
+    uint32_t contactCount;
+} VoxelRigidStepStats;
+
 LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *outSettings);
 
 // Готовит тело. Возвращает false при неверном описании или нехватке памяти;
@@ -147,6 +158,9 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body,
 // Сколько памяти нужно шагу. Physics ничего не выделяет сам: буфер даёт
 // вызывающий, как и всюду в этом модуле.
 LAIUE_PHYSICS_API uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount);
+LAIUE_PHYSICS_API bool VoxelRigidBodyReadStepStats(const void *scratch, uint32_t bodyCount,
+                                                   uint32_t scratchBytes,
+                                                   VoxelRigidStepStats *outStats);
 
 // Один шаг симуляции для всего набора тел. collision обязан отдавать
 // свойства блоков; queryDynamicColliders не используется — тела берутся из

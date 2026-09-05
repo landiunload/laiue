@@ -810,6 +810,7 @@ typedef struct RigidStepScratch
     double cellSize;
     uint32_t contactCount;
     uint32_t contactCapacity;
+    VoxelRigidStepStats *stats;
 } RigidStepScratch;
 
 static bool BuildStableOrder(const VoxelRigidBody *bodies, uint32_t bodyCount,
@@ -920,8 +921,32 @@ uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
     uint64_t contacts = (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 2u;
     uint64_t buckets = (uint64_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
-    uint64_t total = caches + contacts + links + buckets + 64u;
+    uint64_t total = caches + contacts + links + buckets + sizeof(VoxelRigidStepStats) + 64u;
     return total > 0xFFFFFFFFull ? 0u : (uint32_t)total;
+}
+
+static VoxelRigidStepStats *StepStatsPointer(void *scratch, uint32_t bodyCount)
+{
+    uintptr_t scratchAddress = (uintptr_t)scratch;
+    uintptr_t alignedAddress = (scratchAddress + 63u) & ~(uintptr_t)63u;
+    uint8_t *cursor = (uint8_t *)(void *)alignedAddress;
+    cursor += (size_t)bodyCount * sizeof(RigidBodyCache);
+    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    cursor += (size_t)bodyCount * sizeof(uint32_t) * 2u;
+    cursor += (size_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
+    return (VoxelRigidStepStats *)(void *)cursor;
+}
+
+bool VoxelRigidBodyReadStepStats(const void *scratch, uint32_t bodyCount,
+                                 uint32_t scratchBytes, VoxelRigidStepStats *outStats)
+{
+    uint32_t required = VoxelRigidBodyStepScratchBytes(bodyCount);
+    if (scratch == NULL || outStats == NULL || required == 0u || scratchBytes < required)
+    {
+        return false;
+    }
+    *outStats = *StepStatsPointer((void *)scratch, bodyCount);
+    return true;
 }
 
 static bool BlockIsSolid(const VoxelCollisionSource *collision, int64_t x, int64_t y, int64_t z)
@@ -1294,15 +1319,17 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
             {
                 continue;
             }
-            double inverseLength = 1.0 / SquareRoot(lengthSquared);
-            for (int32_t component = 0; component < 3; ++component)
-            {
-                crossAxis[component] *= inverseLength;
-            }
+            // Separating-axis tests are homogeneous: both the projected
+            // radius and the centre distance scale by the same positive
+            // length of the cross axis.  The old path normalized every one
+            // of these nine axes, paying for a double sqrt and division per
+            // candidate pair even though the normalized value was never
+            // used for the manifold normal.  Compare the unnormalized
+            // projections instead; this is the same homogeneous inequality
+            // and preserves the SAT boundary without changing the manifold.
             double reach = BoxRadius(first, firstHalf, crossAxis) +
                            BoxRadius(second, secondHalf, crossAxis);
-            double overlap = reach - AbsoluteDouble(Dot3(separation, crossAxis));
-            if (overlap <= 0.0)
+            if (AbsoluteDouble(Dot3(separation, crossAxis)) >= reach)
             {
                 return false;
             }
@@ -1469,6 +1496,20 @@ static void BuildBroadphase(const VoxelRigidBody *bodies, uint32_t bodyCount,
 static void AppendPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t second,
                                RigidStepScratch *scratch)
 {
+    if (scratch->stats->candidatePairCount != UINT32_MAX)
+    {
+        ++scratch->stats->candidatePairCount;
+    }
+    // Sleeping bodies form a fixed static island.  The broadphase keeps them
+    // in its buckets so an awake body can still collide with a supporting sleeper,
+    // but never build a SAT manifold for a sleeping/sleeping pair: a dense
+    // resting pile would otherwise make every new spawn revisit O(n^2)
+    // contacts that cannot affect the solution.
+    if (bodies[first].sleeping && bodies[second].sleeping)
+    {
+        return;
+    }
+
     const RigidBodyCache *firstCache = &scratch->caches[first];
     const RigidBodyCache *secondCache = &scratch->caches[second];
 
@@ -1479,24 +1520,12 @@ static void AppendPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t 
         return;
     }
 
-    // Two sleeping bodies form a static island and do not need a solver pass.
-    // A contact with an awake body wakes the sleeping side for this tick;
-    // its cache starts at zero velocity and the impulse then gives it the
-    // correct first response without a second broadphase traversal.
-    if (bodies[first].sleeping && bodies[second].sleeping)
-    {
-        return;
-    }
-    if (bodies[first].sleeping)
-    {
-        bodies[first].sleeping = false;
-        bodies[first].sleepCounter = 0u;
-    }
-    if (bodies[second].sleeping)
-    {
-        bodies[second].sleeping = false;
-        bodies[second].sleepCounter = 0u;
-    }
+    // A sleeping body is a static support until an external impulse or an
+    // explicit VoxelRigidBodyWake call reaches it.  Treating it as dynamic
+    // here would wake an entire settled pile when one new body lands on its
+    // edge, defeating the sleep optimization and creating a frame-time
+    // avalanche.  The solver below excludes its inverse mass and impulse
+    // writes, while the awake body still receives the exact contact response.
     scratch->caches[first].hasBodyContact = true;
     scratch->caches[second].hasBodyContact = true;
 
@@ -1536,26 +1565,27 @@ static void CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
     {
         uint32_t first = scratch->order[ordered];
         const RigidBodyCache *firstCache = &scratch->caches[first];
-        if (!bodies[first].active || !firstCache->collidable)
+        // Only awake bodies need to be the first endpoint.  Sleeping bodies
+        // remain in the buckets as static support, but are never used to
+        // enumerate a second sleeping endpoint.  This turns a dense settled
+        // pile plus one newly spawned body from a quadratic scan into a
+        // neighbourhood scan of the awake frontier.
+        if (!bodies[first].active || bodies[first].sleeping || !firstCache->collidable)
         {
             continue;
         }
+        // The old half-stencil was sufficient while every body could be the
+        // first endpoint.  Sleeping bodies are intentionally skipped as the
+        // first endpoint now, so an awake body must also inspect the negative
+        // half of the stencil to find a sleeping support in a lower cell.
+        // This remains bounded at 27 hash probes per awake body and avoids
+        // the sleeping/sleeping quadratic work that caused spawn stalls.
         for (int32_t dx = -1; dx <= 1; ++dx)
         {
             for (int32_t dy = -1; dy <= 1; ++dy)
             {
                 for (int32_t dz = -1; dz <= 1; ++dz)
                 {
-                    // Each pair is visited from the lexicographically lower
-                    // cell only.  The previous 27-cell sweep did the same
-                    // work twice and discarded the duplicate by stableId;
-                    // the half stencil keeps the result deterministic while
-                    // removing thirteen hash probes per body.
-                    if (!(dx > 0 || (dx == 0 && dy > 0) ||
-                          (dx == 0 && dy == 0 && dz >= 0)))
-                    {
-                        continue;
-                    }
                     int64_t neighbour[3] = {firstCache->cell[0] + dx,
                                             firstCache->cell[1] + dy,
                                             firstCache->cell[2] + dz};
@@ -1573,10 +1603,15 @@ static void CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
                         {
                             continue;
                         }
-                        // Внутри одной ячейки порядок stableId остаётся
-                        // единственным критерием, иначе пара дублировалась
-                        // бы при обходе второго тела.
-                        if (dx == 0 && dy == 0 && dz == 0 &&
+                        if (second == first)
+                        {
+                            continue;
+                        }
+                        // Awake/awake pairs are visited in stableId order;
+                        // awake/sleeping pairs are visited only from the
+                        // awake endpoint, regardless of which cell contains
+                        // the sleeper.
+                        if (!bodies[second].sleeping &&
                             bodies[second].stableId <= bodies[first].stableId)
                         {
                             continue;
@@ -1698,6 +1733,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
             bool paired = contact->otherIndex != UINT32_MAX;
             const VoxelRigidBody *other = paired ? &bodies[contact->otherIndex] : NULL;
             RigidBodyCache *otherCache = paired ? &scratch->caches[contact->otherIndex] : NULL;
+            bool otherDynamic = paired && !other->sleeping;
 
             double velocity[3];
             ContactVelocity(cache, contact->point, velocity);
@@ -1713,7 +1749,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
 
             double normalSpeed = Dot3(velocity, contact->normal);
             double mass = EffectiveMass(body, cache, contact->point, contact->normal);
-            if (paired)
+            if (otherDynamic)
             {
                 mass += EffectiveMass(other, otherCache, contact->point, contact->normal);
             }
@@ -1746,7 +1782,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
             if (magnitude != 0.0 && IsFiniteDouble(magnitude))
             {
                 ApplyImpulse(body, cache, contact->point, contact->normal, magnitude);
-                if (paired)
+                if (otherDynamic)
                 {
                     ApplyImpulse(other, otherCache, contact->point, contact->normal, -magnitude);
                 }
@@ -1773,7 +1809,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
                 }
                 double tangentSpeed = Dot3(velocity, tangents[which]);
                 double tangentMass = EffectiveMass(body, cache, contact->point, tangents[which]);
-                if (paired)
+                if (otherDynamic)
                 {
                     tangentMass +=
                         EffectiveMass(other, otherCache, contact->point, tangents[which]);
@@ -1797,7 +1833,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
                     continue;
                 }
                 ApplyImpulse(body, cache, contact->point, tangents[which], friction);
-                if (paired)
+                if (otherDynamic)
                 {
                     ApplyImpulse(other, otherCache, contact->point, tangents[which], -friction);
                 }
@@ -2032,6 +2068,12 @@ bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyCount,
         return false;
     }
 
+    VoxelRigidStepStats *stepStats = StepStatsPointer(scratch, bodyCount);
+    stepStats->activeBodyCount = 0u;
+    stepStats->awakeBodyCount = 0u;
+    stepStats->candidatePairCount = 0u;
+    stepStats->contactCount = 0u;
+
     // A fully sleeping island is already a fixed point.  Returning before
     // sorting, cache construction and collision queries makes a settled
     // 100k-body scene effectively free.  Callers that mutate the world under
@@ -2039,10 +2081,15 @@ bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyCount,
     bool hasAwakeBody = false;
     for (uint32_t index = 0u; index < bodyCount; ++index)
     {
-        if (bodies[index].active && !bodies[index].sleeping)
+        if (!bodies[index].active)
+        {
+            continue;
+        }
+        ++stepStats->activeBodyCount;
+        if (!bodies[index].sleeping)
         {
             hasAwakeBody = true;
-            break;
+            ++stepStats->awakeBodyCount;
         }
     }
     if (!hasAwakeBody)
@@ -2069,6 +2116,7 @@ bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyCount,
     state.cellSize = 1.0;
     state.contactCount = 0u;
     state.contactCapacity = bodyCount * RIGID_CONTACTS_PER_BODY;
+    state.stats = stepStats;
     if (!BuildStableOrder(bodies, bodyCount, &state))
     {
         return false;
@@ -2106,6 +2154,7 @@ bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyCount,
 
     CollectWorldContacts(bodies, bodyCount, collision, &state);
     CollectBodyContacts(bodies, bodyCount, &state);
+    state.stats->contactCount = state.contactCount;
     SolveContacts(bodies, &state, settings);
 
     for (uint32_t ordered = 0; ordered < state.activeCount; ++ordered)

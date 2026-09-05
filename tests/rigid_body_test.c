@@ -481,6 +481,35 @@ static void TestSleepAndWake(void)
     VoxelRigidBodyRelease(&body);
 }
 
+static void TestSleepingBodyRemainsStaticSupport(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.sleepLinearSpeed = 0.1;
+    harness.settings.sleepAngularSpeed = 0.1;
+    harness.settings.sleepFrames = 4u;
+
+    VoxelRigidBody bodies[2];
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.0, 0.0, 0.49);
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description),
+                "static support body created");
+    RigidExpect(Advance(&harness, bodies, 1u, 16u), "support body settles");
+    RigidExpect(bodies[0].sleeping, "support body sleeps");
+
+    DescribeCube(&description, 0.0, 0.0, 3.0);
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[1], 2u, &description),
+                "falling body created above support");
+    RigidExpect(Advance(&harness, bodies, 2u, 128u), "falling body meets support");
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&bodies[1], position), "falling body position readable");
+    RigidExpect(bodies[0].sleeping && position[2] > 0.9 && position[2] < 2.1,
+                "sleeping support stays static under a new body");
+
+    VoxelRigidBodyRelease(&bodies[0]);
+    VoxelRigidBodyRelease(&bodies[1]);
+}
+
 static void TestScratchRefusals(void)
 {
     // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
@@ -499,6 +528,14 @@ static void TestScratchRefusals(void)
     RigidExpect(VoxelRigidBodyStep(&body, 1u, &harness.collision, &harness.settings,
                                    harness.scratch + 1u, (uint32_t)sizeof(harness.scratch) - 1u),
                 "буфер шага допускает произвольное выравнивание");
+    VoxelRigidStepStats stats;
+    RigidExpect(VoxelRigidBodyReadStepStats(harness.scratch + 1u, 1u,
+                                             (uint32_t)sizeof(harness.scratch) - 1u, &stats),
+                "статистика шага читается из scratch");
+    RigidExpect(stats.activeBodyCount == 1u && stats.awakeBodyCount == 1u,
+                "статистика содержит активное и бодрствующее тело");
+    RigidExpect(!VoxelRigidBodyReadStepStats(harness.scratch + 1u, 1u, required - 1u, &stats),
+                "статистика отвергает малый scratch");
     RigidExpect(!VoxelRigidBodyStep(&body, 1u, &harness.collision, &harness.settings,
                                     harness.scratch, required - 1u),
                 "малый буфер отвергается");
@@ -528,6 +565,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestStableIdOrder();
     TestStackSettles();
     TestSleepAndWake();
+    TestSleepingBodyRemainsStaticSupport();
     TestScratchRefusals();
 
     LaiueTestRuntimeWrite("Rigid body tests passed.\r\n");
