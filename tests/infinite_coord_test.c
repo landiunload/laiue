@@ -458,6 +458,18 @@ static bool CoordEqualsInt64(const InfiniteCoord* value, int64_t expected)
 
 static void TestAddAndNegate(void)
 {
+    InfiniteCoord inPlace;
+    CoordSet(&inPlace, 7);
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&inPlace, 5),
+                    "добавление int64 на месте");
+    CoordTestExpect(CoordEqualsInt64(&inPlace, 12), "7 + 5 на месте = 12");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&inPlace, -20),
+                    "отрицательное добавление int64 на месте");
+    CoordTestExpect(CoordEqualsInt64(&inPlace, -8), "12 - 20 на месте = -8");
+    CoordTestExpect(!InfiniteCoordTryAddInt64InPlace(NULL, 1),
+                    "нулевой указатель отклонён");
+    InfiniteCoordDestroy(&inPlace);
+
     InfiniteCoord left;
     InfiniteCoord right;
     InfiniteCoord sum;

@@ -449,6 +449,38 @@ static void TestStackSettles(void)
     }
 }
 
+static void TestSleepAndWake(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.sleepLinearSpeed = 0.1;
+    harness.settings.sleepAngularSpeed = 0.1;
+    harness.settings.sleepFrames = 4u;
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.25, 0.25, 0.49);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "sleep body created");
+    RigidExpect(Advance(&harness, &body, 1u, 16u), "sleep steps executed");
+    RigidExpect(body.sleeping, "resting body enters sleep");
+
+    double before[3];
+    double after[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, before), "sleep position readable");
+    RigidExpect(Advance(&harness, &body, 1u, 16u), "sleep fast path executed");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, after), "sleep position remains readable");
+    RigidExpect(Near(before[0], after[0], 1e-12) && Near(before[1], after[1], 1e-12) &&
+                    Near(before[2], after[2], 1e-12),
+                "sleep fast path keeps position stable");
+
+    const double impulse[3] = {1.0, 0.0, 0.0};
+    RigidExpect(VoxelRigidBodyAddLinearVelocity(&body, impulse), "external impulse wakes body");
+    RigidExpect(!body.sleeping, "external impulse clears sleep");
+    VoxelRigidBodyWake(&body);
+    RigidExpect(!body.sleeping && body.sleepCounter == 0u, "explicit wake is idempotent");
+    VoxelRigidBodyRelease(&body);
+}
+
 static void TestScratchRefusals(void)
 {
     // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
@@ -495,6 +527,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestRebasing();
     TestStableIdOrder();
     TestStackSettles();
+    TestSleepAndWake();
     TestScratchRefusals();
 
     LaiueTestRuntimeWrite("Rigid body tests passed.\r\n");

@@ -11,3 +11,10 @@ target_include_directories(laiue_benchmark PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")
 laiue_configure_standalone_executable(
     laiue_benchmark EngineBenchmarkEntryPoint)
+
+add_executable(laiue_physics_benchmark EXCLUDE_FROM_ALL physics_benchmark.c)
+target_link_libraries(laiue_physics_benchmark PRIVATE laiue_physics)
+target_include_directories(laiue_physics_benchmark PRIVATE
+    "${PROJECT_SOURCE_DIR}/tests")
+laiue_configure_standalone_executable(
+    laiue_physics_benchmark PhysicsBenchmarkEntryPoint)

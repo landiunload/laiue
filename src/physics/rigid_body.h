@@ -79,6 +79,9 @@ typedef struct VoxelRigidBody
     // воспроизводимыми, а порядок обхода массива — нет.
     uint64_t stableId;
     bool active;
+    // Покой позволяет не решать устойчивые тела на каждом fixed tick.
+    uint32_t sleepCounter;
+    bool sleeping;
 } VoxelRigidBody;
 
 typedef struct VoxelRigidStepSettings
@@ -93,6 +96,11 @@ typedef struct VoxelRigidStepSettings
     // Проникновение, которое считается допустимым: без него тела дрожат,
     // бесконечно выталкивая друг друга из численного шума.
     double penetrationSlop;
+    // Порог сна в блоках/секунду и радианах/секунду. Нулевой порог
+    // отключает переход в сон; sleepFrames задаёт устойчивость порога.
+    double sleepLinearSpeed;
+    double sleepAngularSpeed;
+    uint32_t sleepFrames;
 } VoxelRigidStepSettings;
 
 LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *outSettings);
@@ -102,6 +110,9 @@ LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *out
 LAIUE_PHYSICS_API bool VoxelRigidBodyInitialize(VoxelRigidBody *body, uint64_t stableId,
                                                 const VoxelRigidBodyDescription *description);
 LAIUE_PHYSICS_API void VoxelRigidBodyRelease(VoxelRigidBody *body);
+// Пробуждает тело после изменения мира или другого внешнего состояния,
+// которое не выражается импульсом. Спящие тела пропускают шаг целиком.
+LAIUE_PHYSICS_API void VoxelRigidBodyWake(VoxelRigidBody *body);
 
 // Позиция центра масс в локальных координатах. false означает, что тело
 // улетело за пределы double: рисовать и сталкивать его уже нельзя.

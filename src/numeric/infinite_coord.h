@@ -19,6 +19,10 @@ LAIUE_NUMERIC_API void InfiniteCoordInit(InfiniteCoord* value);
 LAIUE_NUMERIC_API void InfiniteCoordDestroy(InfiniteCoord* value);
 
 LAIUE_NUMERIC_API bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
+// Добавляет небольшое целое непосредственно к значению. В отличие от
+// CopyAdd не создаёт промежуточную копию; это горячий путь для fixed-point
+// физики. При неудаче value остаётся без изменений.
+LAIUE_NUMERIC_API bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend);
 LAIUE_NUMERIC_API bool InfiniteCoordTryCopySquareAddInt64(
     InfiniteCoord* out, const InfiniteCoord* source, int64_t addend);
 LAIUE_NUMERIC_API bool InfiniteCoordTryCopyShiftRight(

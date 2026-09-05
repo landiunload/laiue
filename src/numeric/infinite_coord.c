@@ -154,8 +154,12 @@ static void InfiniteCoordSubtractMagnitudeSmall(InfiniteCoord* value, uint64_t m
     InfiniteCoordNormalize(value);
 }
 
-static bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
+bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
 {
+    if (value == NULL)
+    {
+        return false;
+    }
     if (addend == 0)
     {
         return true;
