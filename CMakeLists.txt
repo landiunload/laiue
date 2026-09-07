@@ -80,6 +80,7 @@ add_subdirectory(src/math)
 add_subdirectory(src/numeric)
 add_subdirectory(src/media)
 add_subdirectory(src/platform)
+add_subdirectory(src/task)
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
 add_subdirectory(src/content)
@@ -104,7 +105,7 @@ if(LAIUE_PLATFORM_EXTERNAL AND
    LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     string(CONCAT _laiue_static_core_link
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,"
-        "laiue_numeric,laiue_world,laiue_physics,laiue_content,laiue_mod>")
+        "laiue_numeric,laiue_world,laiue_physics,laiue_task,laiue_content,laiue_mod>")
     add_executable(laiue_static_core_link_smoke
         tests/static_core_link_smoke.c)
     target_link_libraries(laiue_static_core_link_smoke PRIVATE
@@ -145,8 +146,12 @@ install(FILES "${PROJECT_SOURCE_DIR}/src/world/world.h"
     COMPONENT Engine)
 install(FILES
         "${PROJECT_SOURCE_DIR}/src/physics/rigid_body.h"
+        "${PROJECT_SOURCE_DIR}/src/physics/rigid_broadphase.h"
         "${PROJECT_SOURCE_DIR}/src/physics/voxel_body.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
+    COMPONENT Engine)
+install(FILES "${PROJECT_SOURCE_DIR}/src/task/task_pool.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/task"
     COMPONENT Engine)
 install(FILES
         "${PROJECT_SOURCE_DIR}/src/content/content_catalog.h"

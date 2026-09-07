@@ -27,6 +27,12 @@ laiue_configure_standalone_executable(
 add_test(NAME laiue.platform.threading
     COMMAND laiue_platform_threading_test)
 
+add_executable(laiue_task_pool_test task_pool_test.c)
+target_link_libraries(laiue_task_pool_test PRIVATE laiue::task laiue::platform_support)
+laiue_configure_standalone_executable(laiue_task_pool_test TaskPoolTestEntryPoint)
+add_test(NAME laiue.task.pool COMMAND laiue_task_pool_test)
+set_tests_properties(laiue.task.pool PROPERTIES TIMEOUT 20)
+
 add_executable(laiue_infinite_coord_test infinite_coord_test.c)
 target_link_libraries(laiue_infinite_coord_test PRIVATE laiue_numeric)
 laiue_configure_standalone_executable(laiue_infinite_coord_test CoordTestEntryPoint)
@@ -46,6 +52,27 @@ add_executable(laiue_rigid_body_test rigid_body_test.c)
 target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics)
 laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPoint)
 add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
+
+add_executable(laiue_rigid_solver_test rigid_solver_test.c)
+target_link_libraries(laiue_rigid_solver_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(laiue_rigid_solver_test RigidSolverTestEntryPoint)
+add_test(NAME laiue.physics.rigid_solver COMMAND laiue_rigid_solver_test)
+
+add_executable(laiue_rigid_cache_test rigid_cache_test.c)
+target_link_libraries(laiue_rigid_cache_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(laiue_rigid_cache_test RigidCacheTestEntryPoint)
+add_test(NAME laiue.physics.rigid_cache COMMAND laiue_rigid_cache_test)
+
+add_executable(laiue_rigid_broadphase_test rigid_broadphase_test.c)
+target_link_libraries(laiue_rigid_broadphase_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(laiue_rigid_broadphase_test RigidBroadphaseTestEntryPoint)
+add_test(NAME laiue.physics.rigid_broadphase COMMAND laiue_rigid_broadphase_test)
+
+add_executable(laiue_rigid_parallel_test rigid_parallel_test.c)
+target_link_libraries(laiue_rigid_parallel_test PRIVATE laiue::physics laiue::numeric laiue::task)
+laiue_configure_standalone_executable(laiue_rigid_parallel_test RigidParallelTestEntryPoint)
+add_test(NAME laiue.physics.rigid_parallel COMMAND laiue_rigid_parallel_test)
+set_tests_properties(laiue.physics.rigid_parallel PROPERTIES TIMEOUT 60)
 
 add_executable(laiue_physics_determinism_test physics_determinism_test.c)
 target_link_libraries(laiue_physics_determinism_test PRIVATE

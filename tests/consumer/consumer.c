@@ -2,6 +2,7 @@
 #include "mod/mod_manifest.h"
 #include "mod/mod_types.h"
 #include "physics/voxel_body.h"
+#include "physics/rigid_body.h"
 #include "world/world.h"
 
 #if defined(LAIUE_CONSUMER_HAS_GRAPHICS)
@@ -28,6 +29,9 @@ int main(void)
     };
     const double position[3] = {0.5, 0.5, 2.751};
     succeeded = succeeded && VoxelBodyLocalRangeIsResolved(position, &shape);
+    succeeded = succeeded && VoxelRigidBroadphaseBytes(8u) != 0u &&
+                VoxelRigidBodyStepScratchBytes(8u) != 0u &&
+                LaiueTaskLogicalProcessorCount() >= 1u;
 #if defined(LAIUE_CONSUMER_HAS_GRAPHICS)
     LaiueShaderSet shaderSet;
     LaiueShaderSetInitialize(&shaderSet);

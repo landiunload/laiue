@@ -4,6 +4,8 @@ laiue_add_module(physics
     SOURCES
         fp_environment.c
         fp_environment.h
+        rigid_broadphase.c
+        rigid_broadphase.h
         rigid_body.c
         rigid_body.h
         voxel_body.c
@@ -11,6 +13,7 @@ laiue_add_module(physics
         ../api.h
     PUBLIC_LINK
         laiue::numeric
+        laiue::task
     LINK
         laiue::math_support
 )

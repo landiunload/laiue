@@ -75,6 +75,12 @@
 #define LAIUE_PHYSICS_API LAIUE_IMPORT
 #endif
 
+#if defined(LAIUE_BUILD_TASK)
+#define LAIUE_TASK_API LAIUE_EXPORT
+#else
+#define LAIUE_TASK_API LAIUE_IMPORT
+#endif
+
 #if defined(LAIUE_BUILD_CONTENT)
 #define LAIUE_CONTENT_API LAIUE_EXPORT
 #else

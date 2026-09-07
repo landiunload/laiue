@@ -12,6 +12,7 @@
 #endif
 #else
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #endif
 
 float ScalarSin(float radians)
@@ -64,6 +65,17 @@ float ScalarSqrt(float value)
     return vget_lane_f32(vsqrt_f32(vdup_n_f32(value)), 0);
 #else
     return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
+#endif
+}
+
+double ScalarSqrtDouble(double value)
+{
+    if (!(value > 0.0)) return 0.0;
+#if defined(_M_ARM64) || defined(__aarch64__)
+    return vget_lane_f64(vsqrt_f64(vdup_n_f64(value)), 0);
+#else
+    __m128d input = _mm_set_sd(value);
+    return _mm_cvtsd_f64(_mm_sqrt_sd(input, input));
 #endif
 }
 

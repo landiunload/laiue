@@ -3,6 +3,8 @@
 #include "api.h"
 #include "numeric/infinite_coord.h"
 #include "physics/voxel_body.h"
+#include "physics/rigid_broadphase.h"
+#include "task/task_pool.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -32,19 +34,17 @@
 // точности: умножение на шаг становится сдвигом и не теряет ни бита.
 #define VOXEL_RIGID_STEP_SHIFT 7u
 
-// Верхняя граница здесь не про вкус, а про арифметику: размер буфера
-// шага возвращается в uint32, и при большем числе тел он бы переполнился.
-// Ничего меньше этого модуль не запрещает.
+// Верхняя граница индексов. Дополнительно StepScratchBytes обязан вернуть
+// ненулевой размер: конкретная раскладка scratch может раньше упереться в
+// uint32. Это предел представления буфера, а не обещание скорости симуляции.
 #define VOXEL_RIGID_MAX_BODIES 2097152u
-// Сколько точек контакта отводится одному телу: восемь углов против мира
-// плюс запас на соседей. Дальше манифест всё равно вырожден, а память
-// растёт линейно по числу тел.
+// Общий бюджет контактов = число тел * это значение. Плотные пересечения
+// могут превысить бюджет: Step вернёт false, а не пропустит ограничения.
 #define VOXEL_RIGID_CONTACTS_PER_BODY 16u
 
-// За один шаг тело сдвигается настолько, что никакое столкновение уже не
-// имеет смысла: за такое расстояние оно пролетает мир целиком. Столкновения
-// для него отключаются, остаётся чистая баллистика. Это не ограничение
-// скорости, а признание того, что на таких скоростях контактов не бывает.
+// Legacy ballistic escape: за этим перемещением контакты отключены, но
+// bigint-интеграция продолжается. Это НЕ физическое отсутствие столкновений
+// и НЕ CCD; приложение не должно полагаться на контакты в таком режиме.
 #define VOXEL_RIGID_BALLISTIC_BLOCKS 1048576.0
 
 typedef struct VoxelRigidBodyDescription
@@ -114,6 +114,74 @@ typedef struct VoxelRigidStepStats
     uint32_t contactCount;
 } VoxelRigidStepStats;
 
+// Необязательный persistent cache импульсов для warm-start решателя.
+// storage принадлежит вызывающему, не пересекается со scratch, телами или
+// дескриптором cache и живёт между
+// шагами; скрытых выделений памяти нет. Остальные поля менять вручную нельзя.
+typedef struct VoxelRigidContactCache
+{
+    void *storage;
+    uint32_t storageBytes;
+    uint32_t bodyCapacity;
+    uint32_t contactCount;
+    uint32_t matchedContactCount;
+} VoxelRigidContactCache;
+
+typedef enum VoxelRigidProfileStage
+{
+    VOXEL_RIGID_PROFILE_ORDER,
+    VOXEL_RIGID_PROFILE_FORCES,
+    VOXEL_RIGID_PROFILE_BOUNDS,
+    VOXEL_RIGID_PROFILE_BROADPHASE,
+    VOXEL_RIGID_PROFILE_WAKE,
+    VOXEL_RIGID_PROFILE_WORLD_CONTACTS,
+    VOXEL_RIGID_PROFILE_BODY_CONTACTS,
+    VOXEL_RIGID_PROFILE_PREPARE,
+    VOXEL_RIGID_PROFILE_WARM_START,
+    VOXEL_RIGID_PROFILE_SCHEDULE,
+    VOXEL_RIGID_PROFILE_SOLVE,
+    VOXEL_RIGID_PROFILE_INTEGRATE,
+    VOXEL_RIGID_PROFILE_SLEEP,
+    VOXEL_RIGID_PROFILE_STORE,
+    VOXEL_RIGID_PROFILE_STAGE_COUNT
+} VoxelRigidProfileStage;
+
+// Diagnostic output only, never part of replay. Initialize structSize before use.
+// With no clockSeconds callback timings are zero, but schedule counters work.
+typedef struct VoxelRigidStepProfile
+{
+    uint32_t structSize;
+    double seconds[VOXEL_RIGID_PROFILE_STAGE_COUNT];
+    uint32_t solverBatchCount;
+    uint32_t solverMaxBatchSize;
+    uint32_t solverOverflowContacts;
+} VoxelRigidStepProfile;
+
+typedef enum VoxelRigidSolverOrder
+{
+    VOXEL_RIGID_SOLVER_CANONICAL = 0,
+    VOXEL_RIGID_SOLVER_COLORED = 1
+} VoxelRigidSolverOrder;
+
+// Per-call extensible options. NULL executor runs serially. A supplied executor
+// must synchronously finish all ranges, without re-entering this step or changing
+// its inputs. Physics normalizes FP on each worker range. World callbacks remain
+// on the calling thread. Options, executor and profile must not alias simulation
+// buffers. Clock callbacks are observational and must not mutate physics state.
+// Colored order is deterministic across worker counts but changes trajectories
+// relative to the canonical solver: the order is part of replay configuration.
+typedef struct VoxelRigidStepOptions
+{
+    uint32_t structSize;
+    VoxelRigidContactCache *contactCache;
+    VoxelRigidBroadphase *broadphase;
+    const LaiueTaskExecutor *executor;
+    VoxelRigidSolverOrder solverOrder;
+    VoxelRigidStepProfile *profile;
+    double (*clockSeconds)(void *context);
+    void *clockContext;
+} VoxelRigidStepOptions;
+
 LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *outSettings);
 
 // Готовит тело. Возвращает false при неверном описании или нехватке памяти;
@@ -121,8 +189,9 @@ LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *out
 LAIUE_PHYSICS_API bool VoxelRigidBodyInitialize(VoxelRigidBody *body, uint64_t stableId,
                                                 const VoxelRigidBodyDescription *description);
 LAIUE_PHYSICS_API void VoxelRigidBodyRelease(VoxelRigidBody *body);
-// Пробуждает тело после изменения мира или другого внешнего состояния,
-// которое не выражается импульсом. Спящие тела пропускают шаг целиком.
+// Пробуждает тело после изменения мира или другого внешнего состояния.
+// Контакт с активным телом пробуждает связанную спящую группу автоматически.
+// После удаления опоры вызывающий обязан явно инвалидировать сон через Wake.
 LAIUE_PHYSICS_API void VoxelRigidBodyWake(VoxelRigidBody *body);
 
 // Позиция центра масс в локальных координатах. false означает, что тело
@@ -133,8 +202,7 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyLocalPosition(const VoxelRigidBody *body,
 LAIUE_PHYSICS_API void VoxelRigidBodyOrientationMatrix(const VoxelRigidBody *body,
                                                        float outMatrix[9]);
 
-LAIUE_PHYSICS_API bool VoxelRigidBodyAddLinearVelocity(VoxelRigidBody *body,
-                                                       const double delta[3]);
+LAIUE_PHYSICS_API bool VoxelRigidBodyAddLinearVelocity(VoxelRigidBody *body, const double delta[3]);
 LAIUE_PHYSICS_API bool VoxelRigidBodyAddAngularVelocity(VoxelRigidBody *body,
                                                         const double delta[3]);
 // Составляющие скоростей с насыщением до конечного double. В отличие от
@@ -158,6 +226,7 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body,
 // Сколько памяти нужно шагу. Physics ничего не выделяет сам: буфер даёт
 // вызывающий, как и всюду в этом модуле.
 LAIUE_PHYSICS_API uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount);
+// Читать только после успешного Step с теми же scratch и bodyCount.
 LAIUE_PHYSICS_API bool VoxelRigidBodyReadStepStats(const void *scratch, uint32_t bodyCount,
                                                    uint32_t scratchBytes,
                                                    VoxelRigidStepStats *outStats);
@@ -165,7 +234,8 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyReadStepStats(const void *scratch, uint32_t
 // Один шаг симуляции для всего набора тел. collision обязан отдавать
 // свойства блоков; queryDynamicColliders не используется — тела берутся из
 // массива. Возвращает false при неверных аргументах, малом буфере или
-// нехватке памяти внутри чисел произвольной точности. Каждая операция
+// переполнении контактов или нехватке памяти внутри чисел произвольной
+// точности. Каждая операция
 // арифметики остаётся транзакционной и не оставляет повреждённых лимбов;
 // при отказе после начала шага уже обработанные тела могут быть продвинуты,
 // поэтому вызывающий, которому нужен all-or-nothing шаг, хранит свой снимок.
@@ -173,3 +243,53 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyC
                                           const VoxelCollisionSource *collision,
                                           const VoxelRigidStepSettings *settings, void *scratch,
                                           uint32_t scratchBytes);
+
+// Размер включает запас на произвольное выравнивание storage. Initialize
+// очищает cache; false оставляет переданный дескриптор нулевым, кроме случая
+// пересечения storage с самим дескриптором (отказ без записи). Reset сохраняет
+// storage/capacity, но забывает контакты. bodyCapacity должна покрывать bodyCount.
+LAIUE_PHYSICS_API uint32_t VoxelRigidContactCacheBytes(uint32_t bodyCapacity);
+LAIUE_PHYSICS_API bool VoxelRigidContactCacheInitialize(VoxelRigidContactCache *cache,
+                                                        void *storage, uint32_t bodyCapacity,
+                                                        uint32_t storageBytes);
+LAIUE_PHYSICS_API void VoxelRigidContactCacheReset(VoxelRigidContactCache *cache);
+
+// Тот же fixed step с начальными импульсами предыдущего успешного шага.
+// Контакт сопоставляется один раз по stableId, локальным якорям обоих тел
+// (допуск 0.01 блока) и нормали (dot >= 0.995). Для мира нужен только якорь
+// тела, поэтому общий сдвиг тела и мира при rebasing не требует Reset.
+// Reset обязателен после телепортации, изменения мира/формы/массы/материала/
+// настроек решателя или повторного использования stableId. Обычные импульсы
+// и пробуждение не требуют Reset. Cache — часть состояния воспроизведения:
+// одинаковые тела без одинаковой истории cache не обещают побитового совпадения.
+// Для снимка внутри того же процесса сохраняют дескриптор и его storage;
+// переносимый формат сериализации этим API не задаётся. Смена capacity/reset
+// также должна происходить на одинаковых тиках replay. После частичного отказа
+// Step необходимо восстановить полный снимок либо остановить симуляцию.
+LAIUE_PHYSICS_API bool VoxelRigidBodyStepCached(VoxelRigidBody *bodies, uint32_t bodyCount,
+                                                const VoxelCollisionSource *collision,
+                                                const VoxelRigidStepSettings *settings,
+                                                void *scratch, uint32_t scratchBytes,
+                                                VoxelRigidContactCache *contactCache);
+
+// Persistent broadphase with the same contact/impulse order as Step/StepCached.
+// contactCache is optional; broadphase must be initialized for bodyCount.
+// Every awake step synchronizes current bounds (including inactive/removed/
+// reordered bodies and rebasing). Sleeping bodies remain discoverable.
+// Resetting/rebuilding this index changes performance, not the physical state;
+// unlike the impulse cache, index topology is not part of the replay contract.
+// All buffers/descriptors must be separate from each other and input objects.
+LAIUE_PHYSICS_API bool VoxelRigidBodyStepIndexed(VoxelRigidBody *bodies, uint32_t bodyCount,
+                                                 const VoxelCollisionSource *collision,
+                                                 const VoxelRigidStepSettings *settings,
+                                                 void *scratch, uint32_t scratchBytes,
+                                                 VoxelRigidContactCache *contactCache,
+                                                 VoxelRigidBroadphase *broadphase);
+
+// Same fixed-step input and scratch ownership as Step. The caller initializes
+// options.structSize. Old entry points retain canonical ordering and behavior.
+LAIUE_PHYSICS_API bool VoxelRigidBodyStepEx(VoxelRigidBody *bodies, uint32_t bodyCount,
+                                            const VoxelCollisionSource *collision,
+                                            const VoxelRigidStepSettings *settings, void *scratch,
+                                            uint32_t scratchBytes,
+                                            const VoxelRigidStepOptions *options);

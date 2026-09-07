@@ -39,6 +39,7 @@ static bool Near(double value, double expected, double tolerance)
 typedef struct RigidWorld
 {
     bool step;
+    bool removeFloor;
 } RigidWorld;
 
 // Порядок параметров задан ABI движка.
@@ -47,7 +48,7 @@ static void QueryBlocks(void *context, int64_t x, int64_t y, int64_t z, VoxelBlo
 {
     const RigidWorld *world = (const RigidWorld *)context;
     (void)y;
-    bool solid = z < 0;
+    bool solid = !world->removeFloor && z < 0;
     if (world->step && x >= 4 && z == 0)
     {
         solid = true;
@@ -61,7 +62,7 @@ typedef struct RigidHarness
     RigidWorld world;
     VoxelCollisionSource collision;
     VoxelRigidStepSettings settings;
-    uint8_t scratch[16384];
+    uint8_t scratch[131072];
 } RigidHarness;
 
 static void HarnessInit(RigidHarness *harness, bool step)
@@ -481,31 +482,152 @@ static void TestSleepAndWake(void)
     VoxelRigidBodyRelease(&body);
 }
 
-static void TestSleepingBodyRemainsStaticSupport(void)
+static void TestImpactWakesFiniteMassBody(void)
 {
     static RigidHarness harness;
     HarnessInit(&harness, false);
-    harness.settings.sleepLinearSpeed = 0.1;
-    harness.settings.sleepAngularSpeed = 0.1;
-    harness.settings.sleepFrames = 4u;
+    harness.settings.gravity[2] = 0.0;
+    harness.settings.penetrationCorrection = 0.0;
 
     VoxelRigidBody bodies[2];
     VoxelRigidBodyDescription description;
-    DescribeCube(&description, 0.0, 0.0, 0.49);
-    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description),
-                "static support body created");
-    RigidExpect(Advance(&harness, bodies, 1u, 16u), "support body settles");
-    RigidExpect(bodies[0].sleeping, "support body sleeps");
-
     DescribeCube(&description, 0.0, 0.0, 3.0);
+    description.friction = 0.0;
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description),
+                "sleeping finite-mass body created");
+    bodies[0].sleeping = true;
+    description.position[0] = -0.99;
     RigidExpect(VoxelRigidBodyInitialize(&bodies[1], 2u, &description),
-                "falling body created above support");
-    RigidExpect(Advance(&harness, bodies, 2u, 128u), "falling body meets support");
-    double position[3];
-    RigidExpect(VoxelRigidBodyLocalPosition(&bodies[1], position), "falling body position readable");
-    RigidExpect(bodies[0].sleeping && position[2] > 0.9 && position[2] < 2.1,
-                "sleeping support stays static under a new body");
+                "impact body created");
+    const double impact[3] = {4.0, 0.0, 0.0};
+    RigidExpect(VoxelRigidBodyAddLinearVelocity(&bodies[1], impact), "impact velocity set");
+    RigidExpect(Advance(&harness, bodies, 2u, 1u), "impact step executed");
+    double firstVelocity[3];
+    double secondVelocity[3];
+    RigidExpect(VoxelRigidBodyLinearVelocity(&bodies[0], firstVelocity) &&
+                    VoxelRigidBodyLinearVelocity(&bodies[1], secondVelocity),
+                "impact velocities readable");
+    RigidExpect(!bodies[0].sleeping && firstVelocity[0] > 0.5,
+                "collision wakes sleeper and transfers momentum");
+    RigidExpect(Near(firstVelocity[0] + secondVelocity[0], 4.0, 1e-7),
+                "sleeping finite-mass collision conserves linear momentum");
 
+    VoxelRigidBodyRelease(&bodies[0]);
+    VoxelRigidBodyRelease(&bodies[1]);
+}
+
+static void TestWakePropagatesAgainstStableOrder(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[2] = 0.0;
+    harness.settings.penetrationCorrection = 0.0;
+    VoxelRigidBody bodies[3];
+    for (uint32_t index = 0u; index < 3u; ++index)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, 0.99 * (double)(2u - index), 0.0, 3.0);
+        description.friction = 0.0;
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[index], index + 1u, &description),
+                    "wake-chain body created");
+        bodies[index].sleeping = index != 2u;
+    }
+    const double impact[3] = {4.0, 0.0, 0.0};
+    RigidExpect(VoxelRigidBodyAddLinearVelocity(&bodies[2], impact), "wake-chain impact set");
+    RigidExpect(Advance(&harness, bodies, 3u, 1u), "wake-chain step executed");
+    double momentum = 0.0;
+    for (uint32_t index = 0u; index < 3u; ++index)
+    {
+        double velocity[3];
+        RigidExpect(!bodies[index].sleeping, "whole contact chain wakes in one tick");
+        RigidExpect(VoxelRigidBodyLinearVelocity(&bodies[index], velocity),
+                    "wake-chain velocity readable");
+        momentum += velocity[0];
+        VoxelRigidBodyRelease(&bodies[index]);
+    }
+    RigidExpect(Near(momentum, 4.0, 1e-7), "wake-chain preserves total momentum");
+}
+
+static void TestRemovedSupportWakesWholeIsland(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.penetrationCorrection = 0.0;
+    VoxelRigidBody bodies[2];
+    for (uint32_t index = 0u; index < 2u; ++index)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, 0.0, 0.0, 0.49 + 0.99 * (double)index);
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[index], index + 1u, &description),
+                    "support-removal body created");
+        bodies[index].sleeping = true;
+    }
+    // World mutations invalidate sleeping contacts through the explicit API.
+    harness.world.removeFloor = true;
+    VoxelRigidBodyWake(&bodies[1]);
+    RigidExpect(Advance(&harness, bodies, 2u, 1u), "removed-support step executed");
+    for (uint32_t index = 0u; index < 2u; ++index)
+    {
+        double velocity[3];
+        RigidExpect(!bodies[index].sleeping, "removed-support island wakes together");
+        RigidExpect(VoxelRigidBodyLinearVelocity(&bodies[index], velocity),
+                    "removed-support velocity readable");
+        RigidExpect(Near(velocity[2], -24.0 / 128.0, 1e-7),
+                    "newly awakened member receives gravity in the same tick");
+        VoxelRigidBodyRelease(&bodies[index]);
+    }
+}
+
+static void TestContactIslandSleepsTogether(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[2] = 0.0;
+    harness.settings.penetrationCorrection = 0.0;
+    harness.settings.sleepLinearSpeed = 0.1;
+    harness.settings.sleepAngularSpeed = 0.1;
+    harness.settings.sleepFrames = 2u;
+    VoxelRigidBody bodies[2];
+    for (uint32_t index = 0u; index < 2u; ++index)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, 0.99 * (double)index, 0.0, 3.0);
+        description.friction = 0.0;
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[index], index + 1u, &description),
+                    "island-sleep body created");
+    }
+    const double separating[3] = {0.11, 0.0, 0.0};
+    RigidExpect(VoxelRigidBodyAddLinearVelocity(&bodies[1], separating),
+                "island member remains above sleep speed");
+    RigidExpect(Advance(&harness, bodies, 2u, 4u), "island sleep steps executed");
+    RigidExpect(!bodies[0].sleeping && !bodies[1].sleeping,
+                "quiet body does not freeze inside a moving contact island");
+    VoxelRigidBodyRelease(&bodies[0]);
+    VoxelRigidBodyRelease(&bodies[1]);
+}
+
+static void TestRotatedBroadphaseExtent(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[2] = 0.0;
+    VoxelRigidBody bodies[2];
+    for (uint32_t index = 0u; index < 2u; ++index)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, index == 0u ? 0.99 : 2.1, 0.0, 3.0);
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[index], index + 1u, &description),
+                    "rotated broadphase body created");
+        bodies[index].orientation[2] = 0.38268343236508977173;
+        bodies[index].orientation[3] = 0.92387953251128675613;
+    }
+    RigidExpect(Advance(&harness, bodies, 2u, 1u), "rotated broadphase step executed");
+    VoxelRigidStepStats stats;
+    RigidExpect(VoxelRigidBodyReadStepStats(harness.scratch, 2u,
+                                             (uint32_t)sizeof(harness.scratch), &stats),
+                "rotated broadphase statistics readable");
+    RigidExpect(stats.contactCount != 0u,
+                "rotated boxes touching across two old centre cells still collide");
     VoxelRigidBodyRelease(&bodies[0]);
     VoxelRigidBodyRelease(&bodies[1]);
 }
@@ -565,7 +687,11 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestStableIdOrder();
     TestStackSettles();
     TestSleepAndWake();
-    TestSleepingBodyRemainsStaticSupport();
+    TestImpactWakesFiniteMassBody();
+    TestWakePropagatesAgainstStableOrder();
+    TestRemovedSupportWakesWholeIsland();
+    TestContactIslandSleepsTogether();
+    TestRotatedBroadphaseExtent();
     TestScratchRefusals();
 
     LaiueTestRuntimeWrite("Rigid body tests passed.\r\n");

@@ -15,6 +15,8 @@ float ScalarTan(float radians);
 float ScalarClamp(float value, float minimum, float maximum);
 float ScalarWrap(float radians);
 float ScalarSqrt(float value);
+// Аппаратный binary64 sqrt без промежуточного сужения к float.
+double ScalarSqrtDouble(double value);
 
 // Арктангенсы — минимаксный полином, точность ~1e-6 рад.
 // ScalarAtan2 повторяет соглашения atan2f: результат в (-pi, pi],
