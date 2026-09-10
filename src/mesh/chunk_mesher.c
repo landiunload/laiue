@@ -371,7 +371,6 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
                 }
 
                 bits &= ~runMask;
-                rows[row] &= ~runMask;
 
                 if (!EmitFaceRectangle(buffer, face, slice,
                         (uint32_t)runStart, runLength, row, rowExtent,
@@ -433,28 +432,97 @@ static inline uint64_t ColumnSolidMask(const BlockType* column)
 
 // Транспонирование битовой матрицы 64x64 на месте: после вызова бит i слова
 // s равен биту s слова i до вызова. Шесть раундов обмена половинами, четвертями
-// и так далее — всего около тысячи операций над регистрами.
+// и так далее.
 //
 // Обмен зеркален привычной записи из литературы: там нулевым столбцом считают
 // старший бит, а здесь номер бита и есть номер столбца.
+//
+// Все сдвиги в обмене — внутри одного 64-битного слова, поэтому два соседних
+// слова обрабатываются одной 128-битной командой: раунд со страйдом S читает
+// по паре слов, и обе половины параллельно обмениваются со своими парами.
+// Так проходят страйды 32, 16, 8, 4 и 2. Последний раунд со страйдом 1
+// сцепляет соседние слова, и 128-битное чтение легло бы на границу массива,
+// поэтому он остаётся скалярным — тридцать два обмена над регистрами.
+#if defined(_M_ARM64) || defined(__aarch64__)
+#define TRANSPOSE_ROUND_NEON(S, MASK)                                                    \
+    do                                                                                   \
+    {                                                                                    \
+        const uint32_t step_ = (S)*2u;                                                   \
+        const uint64x2_t mask_ = vdupq_n_u64((uint64_t)(MASK));                          \
+        for (uint32_t base_ = 0u; base_ < CHUNK_SIZE; base_ += step_)                    \
+        {                                                                                \
+            for (uint32_t index_ = base_; index_ < base_ + (S); index_ += 2u)            \
+            {                                                                            \
+                uint64x2_t low_ = vld1q_u64(&matrix[index_]);                            \
+                uint64x2_t high_ = vld1q_u64(&matrix[index_ + (S)]);                     \
+                uint64x2_t swap_ = vandq_u64(veorq_u64(vshrq_n_u64(low_, (S)), high_),   \
+                    mask_);                                                              \
+                low_ = veorq_u64(low_, vshlq_n_u64(swap_, (S)));                         \
+                high_ = veorq_u64(high_, swap_);                                         \
+                vst1q_u64(&matrix[index_], low_);                                        \
+                vst1q_u64(&matrix[index_ + (S)], high_);                                 \
+            }                                                                            \
+        }                                                                                \
+    } while (0)
+
 static void TransposeBits64(uint64_t matrix[CHUNK_SIZE])
 {
-    uint64_t mask = 0x00000000FFFFFFFFull;
-    for (uint32_t stride = 32u; stride != 0u;)
+    TRANSPOSE_ROUND_NEON(32u, 0x00000000FFFFFFFFull);
+    TRANSPOSE_ROUND_NEON(16u, 0x0000FFFF0000FFFFull);
+    TRANSPOSE_ROUND_NEON(8u, 0x00FF00FF00FF00FFull);
+    TRANSPOSE_ROUND_NEON(4u, 0x0F0F0F0F0F0F0F0Full);
+    TRANSPOSE_ROUND_NEON(2u, 0x3333333333333333ull);
     {
-        for (uint32_t index = 0u; index < CHUNK_SIZE; index = ((index | stride) + 1u) & ~stride)
+        const uint64_t mask = 0x5555555555555555ull;
+        for (uint32_t index = 0u; index < CHUNK_SIZE; index += 2u)
         {
-            uint64_t swap = ((matrix[index] >> stride) ^ matrix[index | stride]) & mask;
-            matrix[index] ^= swap << stride;
-            matrix[index | stride] ^= swap;
-        }
-        stride >>= 1;
-        if (stride != 0u)
-        {
-            mask ^= mask << stride;
+            uint64_t swap = ((matrix[index] >> 1u) ^ matrix[index + 1u]) & mask;
+            matrix[index] ^= swap << 1u;
+            matrix[index + 1u] ^= swap;
         }
     }
 }
+#else
+#define TRANSPOSE_ROUND_SSE2(S, MASK)                                                    \
+    do                                                                                   \
+    {                                                                                    \
+        const uint32_t step_ = (S)*2u;                                                   \
+        const __m128i mask_ = _mm_set1_epi64x((long long)(MASK));                        \
+        for (uint32_t base_ = 0u; base_ < CHUNK_SIZE; base_ += step_)                    \
+        {                                                                                \
+            for (uint32_t index_ = base_; index_ < base_ + (S); index_ += 2u)            \
+            {                                                                            \
+                __m128i low_ = _mm_loadu_si128((const __m128i *)(const void *)&matrix[index_]); \
+                __m128i high_ = _mm_loadu_si128(                                         \
+                    (const __m128i *)(const void *)&matrix[index_ + (S)]);               \
+                __m128i swap_ = _mm_and_si128(_mm_xor_si128(_mm_srli_epi64(low_, (S)),   \
+                    high_), mask_);                                                      \
+                low_ = _mm_xor_si128(low_, _mm_slli_epi64(swap_, (S)));                  \
+                high_ = _mm_xor_si128(high_, swap_);                                     \
+                _mm_storeu_si128((__m128i *)(void *)&matrix[index_], low_);              \
+                _mm_storeu_si128((__m128i *)(void *)&matrix[index_ + (S)], high_);       \
+            }                                                                            \
+        }                                                                                \
+    } while (0)
+
+static void TransposeBits64(uint64_t matrix[CHUNK_SIZE])
+{
+    TRANSPOSE_ROUND_SSE2(32u, 0x00000000FFFFFFFFull);
+    TRANSPOSE_ROUND_SSE2(16u, 0x0000FFFF0000FFFFull);
+    TRANSPOSE_ROUND_SSE2(8u, 0x00FF00FF00FF00FFull);
+    TRANSPOSE_ROUND_SSE2(4u, 0x0F0F0F0F0F0F0F0Full);
+    TRANSPOSE_ROUND_SSE2(2u, 0x3333333333333333ull);
+    {
+        const uint64_t mask = 0x5555555555555555ull;
+        for (uint32_t index = 0u; index < CHUNK_SIZE; index += 2u)
+        {
+            uint64_t swap = ((matrix[index] >> 1u) ^ matrix[index + 1u]) & mask;
+            matrix[index] ^= swap << 1u;
+            matrix[index + 1u] ^= swap;
+        }
+    }
+}
+#endif
 
 // В отличие от плоскостей граней, обе раскладки колонн пишутся подряд.
 // Редкая матрица дешевле раскладывается по битам, плотная — транспонируется.
