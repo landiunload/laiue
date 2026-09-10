@@ -1,7 +1,20 @@
+#include "scene/chunk_streaming.h"
 #include "scene/voxel_raycast.h"
 #include "test_runtime.h"
 
 static uint32_t raycastChecks;
+
+// Точечный обход дальней грани куба в ChunkStreamingSetCenter проверяется
+// без рендерера: рабочие потоки останавливаются ChunkStreamingPause, меши
+// не создаются вовсе, а число заявок считается детерминированно.
+static uint8_t StreamingSolid(void *context, int64_t x, int64_t y, int64_t z)
+{
+    (void)context;
+    (void)x;
+    (void)y;
+    (void)z;
+    return 1u;
+}
 
 static void RaycastExpect(bool condition, const char *name)
 {
@@ -56,6 +69,53 @@ LAIUE_TEST_ENTRY(VoxelRaycastTestEntryPoint)
         "invalid ray parameters were accepted");
 
     WorldDestroy(world);
+
+    // Стриминг чанков: за первый вызов в таблицу входит весь куб радиуса R,
+    // а каждый следующий шаг ровно на соседний чанк добавляет только дальнюю
+    // грань. При диагональном шаге это две грани без общего ребра. Счёт
+    // заявок детерминирован и служит эталоном для точечного обхода.
+    {
+        const int32_t radius = 3;
+        const uint64_t side = (uint64_t)(2 * radius + 1);
+        const uint64_t face = side * side;
+        const uint64_t first = face * side;
+
+        WorldBaseProvider provider;
+        provider.context = NULL;
+        provider.getBlock = StreamingSolid;
+        provider.fillRegion = NULL;
+        provider.rebase = NULL;
+        World *streamWorld = WorldCreate(&provider);
+        RaycastExpect(streamWorld != NULL, "streaming world was not created");
+
+        ChunkStreaming *streaming = ChunkStreamingCreate(
+            streamWorld, (Renderer *)&raycastChecks, radius);
+        RaycastExpect(streaming != NULL, "streaming was not created");
+        RaycastExpect(ChunkStreamingPause(streaming), "streaming was not paused");
+
+        ChunkStreamingStats stats;
+        ChunkStreamingSetCenter(streaming, 0, 0, 0);
+        ChunkStreamingGetStats(streaming, &stats);
+        RaycastExpect(stats.queuedRequests == first,
+            "the first streaming cube must request every chunk inside the radius");
+
+        // Диагональ (0,0,0)->(1,1,0): две грани по (2R+1)^2 без общего ребра.
+        ChunkStreamingSetCenter(streaming, 1, 1, 0);
+        ChunkStreamingGetStats(streaming, &stats);
+        RaycastExpect(stats.queuedRequests == first + 2u * face - side,
+            "a diagonal step must request exactly the two leading faces");
+
+        // Обычный шаг по одной оси: одна грань.
+        ChunkStreamingSetCenter(streaming, 2, 1, 0);
+        ChunkStreamingGetStats(streaming, &stats);
+        RaycastExpect(stats.queuedRequests == first + 3u * face - side,
+            "a one-axis step must request exactly one leading face");
+
+        ChunkStreamingDestroy(streaming);
+        WorldDestroy(streamWorld);
+        LaiueTestRuntimeWrite("Chunk streaming leading-face checks passed.\r\n");
+    }
+
     LaiueTestRuntimeWrite("Voxel raycast tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }
