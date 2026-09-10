@@ -905,6 +905,342 @@ static void TestAliasing(void)
     InfiniteCoordDestroy(&value);
 }
 
+// === Независимый эталон: знак и модуль в базе 2^32 ========================
+//
+// Сложение на месте проверяется не повторным прогоном библиотеки, а моделью,
+// которая считает модуль тридцатидвухбитными цифрами. Это другой способ: сама
+// библиотека работает шестидесятичетырёхбитными лимбами, и ошибка в переносе
+// между половинами лимба не может совпасть в обеих реализациях. Эталон не
+// вызывает ни одной функции InfiniteCoord, кроме разбора готового значения.
+
+#define REFERENCE_DIGITS 16u
+
+typedef struct ReferenceInteger
+{
+    int32_t sign;
+    uint32_t count;
+    uint32_t digits[REFERENCE_DIGITS];
+} ReferenceInteger;
+
+static void ReferenceNormalize(ReferenceInteger* value)
+{
+    while (value->count > 0u && value->digits[value->count - 1u] == 0u)
+    {
+        --value->count;
+    }
+    if (value->count == 0u)
+    {
+        value->sign = 0;
+    }
+}
+
+static void ReferenceFromMagnitude(ReferenceInteger* out, uint64_t magnitude, int32_t sign)
+{
+    out->sign = sign;
+    out->count = 0u;
+    while (magnitude != 0u && out->count < REFERENCE_DIGITS)
+    {
+        out->digits[out->count++] = (uint32_t)magnitude;
+        magnitude >>= 32u;
+    }
+    ReferenceNormalize(out);
+}
+
+// Пересобирает уже готовое значение в базу 2^32. Это чтение раскладки, а не
+// вычисление: результат библиотеки сравнивается с моделью, а не с самим собой.
+static void ReferenceFromInfinite(ReferenceInteger* out, const InfiniteCoord* value)
+{
+    out->sign = value->sign;
+    out->count = 0u;
+    for (uint32_t i = 0; i < value->limbCount; ++i)
+    {
+        uint64_t limb = value->limbs[i];
+        out->digits[out->count++] = (uint32_t)limb;
+        out->digits[out->count++] = (uint32_t)(limb >> 32u);
+    }
+    ReferenceNormalize(out);
+}
+
+static int32_t ReferenceCompareMagnitude(
+    const ReferenceInteger* left, const ReferenceInteger* right)
+{
+    if (left->count != right->count)
+    {
+        return left->count < right->count ? -1 : 1;
+    }
+    for (uint32_t i = left->count; i > 0u; --i)
+    {
+        if (left->digits[i - 1u] != right->digits[i - 1u])
+        {
+            return left->digits[i - 1u] < right->digits[i - 1u] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static void ReferenceAddMagnitude(ReferenceInteger* value, const ReferenceInteger* addend)
+{
+    uint32_t count = value->count > addend->count ? value->count : addend->count;
+    for (uint32_t i = value->count; i < count; ++i)
+    {
+        value->digits[i] = 0u;
+    }
+    value->count = count;
+
+    uint64_t carry = 0u;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint64_t sum = (uint64_t)value->digits[i]
+            + (i < addend->count ? addend->digits[i] : 0u) + carry;
+        value->digits[i] = (uint32_t)sum;
+        carry = sum >> 32u;
+    }
+    if (carry != 0u)
+    {
+        value->digits[value->count++] = (uint32_t)carry;
+    }
+    ReferenceNormalize(value);
+}
+
+// Требует |value| >= |subtrahend|; вызывающий это гарантирует сравнением.
+static void ReferenceSubtractMagnitude(
+    ReferenceInteger* value, const ReferenceInteger* subtrahend)
+{
+    int64_t borrow = 0;
+    for (uint32_t i = 0; i < value->count; ++i)
+    {
+        int64_t difference = (int64_t)value->digits[i]
+            - (i < subtrahend->count ? (int64_t)subtrahend->digits[i] : 0) - borrow;
+        if (difference < 0)
+        {
+            difference += 0x100000000LL;
+            borrow = 1;
+        }
+        else
+        {
+            borrow = 0;
+        }
+        value->digits[i] = (uint32_t)difference;
+    }
+    ReferenceNormalize(value);
+}
+
+static void ReferenceAddInt64(ReferenceInteger* value, int64_t addend)
+{
+    if (addend == 0)
+    {
+        return;
+    }
+    int32_t addSign = addend < 0 ? -1 : 1;
+    uint64_t magnitude = addend < 0 ? 0u - (uint64_t)addend : (uint64_t)addend;
+    ReferenceInteger addendValue;
+    ReferenceFromMagnitude(&addendValue, magnitude, addSign);
+
+    if (value->sign == 0)
+    {
+        *value = addendValue;
+        return;
+    }
+    if (value->sign == addSign)
+    {
+        ReferenceAddMagnitude(value, &addendValue);
+        return;
+    }
+
+    int32_t order = ReferenceCompareMagnitude(value, &addendValue);
+    if (order == 0)
+    {
+        value->sign = 0;
+        value->count = 0u;
+        return;
+    }
+    if (order > 0)
+    {
+        ReferenceSubtractMagnitude(value, &addendValue);
+        return;
+    }
+    ReferenceInteger result = addendValue;
+    ReferenceSubtractMagnitude(&result, value);
+    *value = result;
+}
+
+static bool ReferenceEqualsInfinite(const ReferenceInteger* expected, const InfiniteCoord* actual)
+{
+    ReferenceInteger actualValue;
+    ReferenceFromInfinite(&actualValue, actual);
+    if (actualValue.sign != expected->sign || actualValue.count != expected->count)
+    {
+        return false;
+    }
+    for (uint32_t i = 0; i < actualValue.count; ++i)
+    {
+        if (actualValue.digits[i] != expected->digits[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t referenceState = UINT64_C(0x0123456789abcdef);
+
+static uint64_t ReferenceNextRandom(void)
+{
+    referenceState = referenceState * UINT64_C(6364136223846793005)
+        + UINT64_C(1442695040888963407);
+    return referenceState >> 17;
+}
+
+// Прогон по случайным значениям шириной до четырёх лимбов и случайным
+// добавкам, включая крайние int64. Проверяется и путь на месте, и копия.
+static void TestReferenceAddInt64(void)
+{
+    static const int64_t edgeAddends[6] = {
+        INT64_MIN, INT64_MAX, 0, 1, -1, INT64_MIN + 1,
+    };
+
+    for (uint32_t iteration = 0u; iteration < 1500u; ++iteration)
+    {
+        InfiniteCoord value;
+        CoordSet(&value, (int64_t)ReferenceNextRandom());
+
+        uint32_t shift = (uint32_t)(ReferenceNextRandom() % 193u);
+        if (shift != 0u)
+        {
+            InfiniteCoord shifted;
+            CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &value, shift),
+                "эталон: сдвиг заготовки");
+            InfiniteCoordDestroy(&value);
+            value = shifted;
+        }
+
+        int64_t addend;
+        if ((ReferenceNextRandom() % 4u) == 0u)
+        {
+            addend = edgeAddends[ReferenceNextRandom() % 6u];
+        }
+        else
+        {
+            addend = (int64_t)ReferenceNextRandom();
+        }
+
+        ReferenceInteger expected;
+        ReferenceFromInfinite(&expected, &value);
+        ReferenceAddInt64(&expected, addend);
+
+        CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, addend),
+            "эталон: InPlace вернул ошибку");
+        CoordTestExpect(ReferenceEqualsInfinite(&expected, &value),
+            "InPlace разошёлся с эталоном base 2^32");
+        InfiniteCoordDestroy(&value);
+
+        // Тот же вход через копию: путь CopyAdd опирается на тот же код, но
+        // проверяется отдельно, потому что строит приёмник сам.
+        InfiniteCoord source;
+        CoordSet(&source, (int64_t)ReferenceNextRandom());
+        ReferenceInteger sourceReference;
+        ReferenceFromInfinite(&sourceReference, &source);
+        ReferenceAddInt64(&sourceReference, addend);
+
+        InfiniteCoord copied;
+        CoordTestExpect(InfiniteCoordTryCopyAddInt64(&copied, &source, addend),
+            "эталон: CopyAdd вернул ошибку");
+        CoordTestExpect(ReferenceEqualsInfinite(&sourceReference, &copied),
+            "CopyAdd разошёлся с эталоном base 2^32");
+        InfiniteCoordDestroy(&copied);
+        InfiniteCoordDestroy(&source);
+    }
+}
+
+// Точные границы, ради которых и разделены быстрый и медленный пути: перенос
+// из единственного лимба, заём, смена знака и точное погашение. Ожидание
+// снова даёт модель base 2^32, а не сама библиотека.
+static void ReferenceBuildLimb(InfiniteCoord* out, uint64_t limb)
+{
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(out, (int64_t)(limb & 0xffffffffull)),
+        "эталон: младшая половина лимба");
+    uint64_t high = limb >> 32u;
+    if (high != 0u)
+    {
+        InfiniteCoord highValue;
+        InfiniteCoordInit(&highValue);
+        CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&highValue, (int64_t)high),
+            "эталон: старшая половина лимба");
+        InfiniteCoord shifted;
+        CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &highValue, 32u),
+            "эталон: сдвиг старшей половины");
+        InfiniteCoord sum;
+        CoordTestExpect(InfiniteCoordTryAdd(&sum, out, &shifted),
+            "эталон: сборка лимба");
+        InfiniteCoordDestroy(&shifted);
+        InfiniteCoordDestroy(&highValue);
+        InfiniteCoordDestroy(out);
+        *out = sum;
+    }
+}
+
+static void ReferenceBuildTwoLimb(InfiniteCoord* out, uint64_t low, uint64_t high, int32_t sign)
+{
+    InfiniteCoordInit(out);
+    ReferenceBuildLimb(out, low);
+    if (high != 0u)
+    {
+        InfiniteCoord highValue;
+        InfiniteCoordInit(&highValue);
+        ReferenceBuildLimb(&highValue, high);
+        InfiniteCoord shifted;
+        CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &highValue, 64u),
+            "эталон: сдвиг старшего лимба");
+        InfiniteCoord sum;
+        CoordTestExpect(InfiniteCoordTryAdd(&sum, out, &shifted),
+            "эталон: сборка двух лимбов");
+        InfiniteCoordDestroy(&shifted);
+        InfiniteCoordDestroy(&highValue);
+        InfiniteCoordDestroy(out);
+        *out = sum;
+    }
+    if (sign < 0)
+    {
+        out->sign = -out->sign;
+    }
+}
+
+static void TestReferenceAddInt64Boundaries(void)
+{
+    static const struct
+    {
+        uint64_t low;
+        uint64_t high;
+        int32_t sign;
+        int64_t addend;
+    } cases[8] = {
+        { 0xffffffffffffffffull, 0u, 1, 1 },                       // (2^64-1)+1
+        { 0u, 1u, 1, -1 },                                         // 2^64-1
+        { 5ull, 0u, 1, -5 },                                       // погашение
+        { 5ull, 0u, 1, -12 },                                      // смена знака
+        { 0x8000000000000000ull, 0u, 1, INT64_MIN },               // 2^63 + INT64_MIN
+        { 0ull, 0u, 0, INT64_MIN },                                // ноль - 2^63
+        { 0ull, 1u, -1, 1 },                                       // -(2^64-1)+1
+        { 0xffffffffffffffffull, 0xffffffffffffffffull, 1, 1 },    // (2^128-1)+1
+    };
+
+    for (uint32_t index = 0u; index < 8u; ++index)
+    {
+        InfiniteCoord value;
+        ReferenceBuildTwoLimb(&value, cases[index].low, cases[index].high, cases[index].sign);
+
+        ReferenceInteger expected;
+        ReferenceFromInfinite(&expected, &value);
+        ReferenceAddInt64(&expected, cases[index].addend);
+
+        CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, cases[index].addend),
+            "эталон: граничный InPlace");
+        CoordTestExpect(ReferenceEqualsInfinite(&expected, &value),
+            "граничный InPlace разошёлся с эталоном");
+        InfiniteCoordDestroy(&value);
+    }
+}
+
 LAIUE_TEST_ENTRY(CoordTestEntryPoint)
 {
     TestInitAndInt64RoundTrip();
@@ -927,6 +1263,8 @@ LAIUE_TEST_ENTRY(CoordTestEntryPoint)
     TestShiftLeftLayout();
     TestCarryBorrowAndInt64Minimum();
     TestAliasing();
+    TestReferenceAddInt64();
+    TestReferenceAddInt64Boundaries();
 
     CoordTestWrite("Проверок пройдено: ");
     CoordTestWriteNumber(coordTestChecks);

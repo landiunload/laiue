@@ -183,20 +183,18 @@ static void InfiniteCoordSubtractMagnitudeSmall(InfiniteCoord* value, uint64_t m
     InfiniteCoordNormalize(value);
 }
 
-bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
+// Ноль, переносы из старшего лимба, многолимбовые величины и точное
+// погашение. Медленная часть вынесена в отдельную noinline-функцию, чтобы
+// однолимбовый беспереносный случай горячего входа не сохранял регистры и не
+// обращался к куче: физика зовёт его девять раз на тело за шаг.
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static bool InfiniteCoordTryAddInt64InPlaceWide(
+    InfiniteCoord* value, int32_t addSign, uint64_t magnitude)
 {
-    if (value == NULL)
-    {
-        return false;
-    }
-    if (addend == 0)
-    {
-        return true;
-    }
-
-    int32_t addSign = addend < 0 ? -1 : 1;
-    uint64_t magnitude = Int64Magnitude(addend);
-
     if (value->sign == 0)
     {
         if (!InfiniteCoordTryAddMagnitudeSmall(value, magnitude))
@@ -229,6 +227,77 @@ bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
     value->limbCount = 1;
     value->sign = addSign;
     return true;
+}
+
+bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
+{
+    if (value == NULL)
+    {
+        return false;
+    }
+    if (addend == 0)
+    {
+        return true;
+    }
+
+    int32_t addSign = addend < 0 ? -1 : 1;
+    uint64_t magnitude = addend < 0 ? 0u - (uint64_t)addend : (uint64_t)addend;
+
+    // Канонический ноль: физика заводит лимб первой же добавкой к покоящейся
+    // величине, и отдельный вызов ради одного выделения ни к чему.
+    if (value->limbCount == 0u)
+    {
+        uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+        if (limbs == NULL)
+        {
+            return false;
+        }
+        limbs[0] = magnitude;
+        value->limbs = limbs;
+        value->limbCount = 1u;
+        value->sign = addSign;
+        return true;
+    }
+
+    // Обычный случай физики: один лимб, знак либо сохраняется, либо меняется
+    // без переноса. Ровно здесь уходит почти вся стоимость вызова.
+    if (value->limbCount == 1u)
+    {
+        uint64_t current = value->limbs[0];
+        int32_t sign = value->sign;
+        if (sign == addSign)
+        {
+            uint64_t sum = current + magnitude;
+            if (sum >= current)
+            {
+                value->limbs[0] = sum;
+                return true;
+            }
+        }
+        else if (sign != 0)
+        {
+            if (current > magnitude)
+            {
+                value->limbs[0] = current - magnitude;
+                return true;
+            }
+            if (current < magnitude)
+            {
+                value->limbs[0] = magnitude - current;
+                value->sign = addSign;
+                return true;
+            }
+            InfiniteCoordDestroy(value);
+            return true;
+        }
+    }
+
+    if (value->sign == addSign)
+    {
+        return InfiniteCoordTryAddMagnitudeSmall(value, magnitude);
+    }
+
+    return InfiniteCoordTryAddInt64InPlaceWide(value, addSign, magnitude);
 }
 
 static void SignedDifference(int64_t left, int64_t right,
@@ -1292,6 +1361,14 @@ double InfiniteCoordToDoubleSaturating(const InfiniteCoord* value)
     if (value == NULL || value->sign == 0 || value->limbCount == 0)
     {
         return 0.0;
+    }
+
+    // Однолимбовое значение переводится прямо: битовый индекс тут не нужен,
+    // а его поиск был заметной долей стоимости этой функции.
+    if (value->limbCount == 1u)
+    {
+        double magnitude = (double)value->limbs[0];
+        return value->sign > 0 ? magnitude : -magnitude;
     }
 
     uint32_t topIndex = value->limbCount - 1u;
