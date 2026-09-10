@@ -3227,14 +3227,22 @@ static void ContactVelocity(const RigidBodyCache *cache, const double lever[3], 
     }
 }
 
-static double PrepareImpulseResponse(const VoxelRigidBody *body, const RigidBodyCache *cache,
-                                     const double lever[3], const double direction[3],
-                                     double angularResponse[3])
+static double PrepareImpulseResponse(double inverseMass, const double inverseInertia[3],
+                                     const RigidBodyCache *cache, const double lever[3],
+                                     const double direction[3], double angularResponse[3],
+                                     double torqueOut[3])
 {
     double torque[3];
     Cross3(lever, direction, torque);
-    ApplyInverseInertia(cache, body->inverseInertia, torque, angularResponse);
-    return body->inverseMass + Dot3(torque, angularResponse);
+    ApplyInverseInertia(cache, inverseInertia, torque, angularResponse);
+    if (torqueOut != NULL)
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            torqueOut[axis] = torque[axis];
+        }
+    }
+    return inverseMass + Dot3(torque, angularResponse);
 }
 
 static void ApplyPreparedImpulse(RigidBodyCache *cache, const RigidConstraintRow *row,
@@ -3287,52 +3295,69 @@ static void RelativeContactVelocity(const RigidContact *contact, const RigidStep
     }
 }
 
-static double TangentCoupling(const RigidContact *contact, uint32_t endpoint)
+// Крутящий момент первого касательного направления уже посчитан в
+// PrepareImpulseResponse(endpoint, direction = 1): повторный Cross3 тех же
+// операндов дал бы те же биты, поэтому переиспользуем его.
+static double TangentCoupling(const double torque[3], const double angularResponse[3])
 {
-    double torque[3];
-    Cross3(contact->lever[endpoint], contact->rows[1].direction, torque);
-    return Dot3(torque, contact->rows[2].angularResponse[endpoint]);
+    return Dot3(torque, angularResponse);
 }
 
 static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratch,
                             const VoxelRigidStepSettings *settings, uint32_t begin, uint32_t end)
 {
+    const double penetrationSlop = settings->penetrationSlop;
+    const double penetrationCorrection = settings->penetrationCorrection;
     for (uint32_t index = begin; index < end; ++index)
     {
         RigidContact *contact = &scratch->contacts[index];
-        const VoxelRigidBody *body = &bodies[contact->bodyIndex];
-        const RigidBodyCache *cache = &scratch->caches[contact->bodyIndex];
-        bool paired = contact->otherIndex != UINT32_MAX;
+        const uint32_t bodyIndex = contact->bodyIndex;
+        const uint32_t otherIndex = contact->otherIndex;
+        const bool paired = otherIndex != UINT32_MAX;
+        const RigidBodyCache *cache = &scratch->caches[bodyIndex];
+        const RigidBodyCache *otherCache = paired ? &scratch->caches[otherIndex] : NULL;
+        const double bodyInverseMass = bodies[bodyIndex].inverseMass;
+        const double *bodyInverseInertia = bodies[bodyIndex].inverseInertia;
+        const double otherInverseMass = paired ? bodies[otherIndex].inverseMass : 0.0;
+        const double *otherInverseInertia = paired ? bodies[otherIndex].inverseInertia : NULL;
+
+        const double point[3] = {contact->point[0], contact->point[1], contact->point[2]};
+        const double normal[3] = {contact->normal[0], contact->normal[1], contact->normal[2]};
         for (int32_t axis = 0; axis < 3; ++axis)
         {
-            contact->lever[0][axis] = contact->point[axis] - cache->position[axis];
-            contact->lever[1][axis] =
-                paired ? contact->point[axis] - scratch->caches[contact->otherIndex].position[axis]
-                       : 0.0;
-            contact->rows[0].direction[axis] = contact->normal[axis];
+            contact->lever[0][axis] = point[axis] - cache->position[axis];
+            contact->lever[1][axis] = paired ? point[axis] - otherCache->position[axis] : 0.0;
+            contact->rows[0].direction[axis] = normal[axis];
         }
-        BuildTangents(contact->normal, contact->rows[1].direction, contact->rows[2].direction);
+        BuildTangents(normal, contact->rows[1].direction, contact->rows[2].direction);
         double masses[3];
+        // Cross(lever, direction) первого касательного направления совпадает с
+        // крутящим моментом, который нужен TangentCoupling. Сохраняем его по
+        // одному разу на тело вместо повторного Cross3.
+        double couplingTorque[2][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
         for (uint32_t direction = 0; direction < 3u; ++direction)
         {
             RigidConstraintRow *row = &contact->rows[direction];
-            double mass = PrepareImpulseResponse(body, cache, contact->lever[0], row->direction,
-                                                 row->angularResponse[0]);
+            double *torqueOut = direction == 1u ? couplingTorque[0] : NULL;
+            double mass = PrepareImpulseResponse(bodyInverseMass, bodyInverseInertia, cache,
+                                                 contact->lever[0], row->direction,
+                                                 row->angularResponse[0], torqueOut);
             if (paired)
             {
-                mass += PrepareImpulseResponse(
-                    &bodies[contact->otherIndex], &scratch->caches[contact->otherIndex],
-                    contact->lever[1], row->direction, row->angularResponse[1]);
+                torqueOut = direction == 1u ? couplingTorque[1] : NULL;
+                mass += PrepareImpulseResponse(otherInverseMass, otherInverseInertia, otherCache,
+                                               contact->lever[1], row->direction,
+                                               row->angularResponse[1], torqueOut);
             }
             masses[direction] = mass;
             row->inverseEffectiveMass = mass > 0.0 && IsFiniteDouble(mass) ? 1.0 / mass : 0.0;
         }
         // Solve the two coupled tangential directions as a 2x2 block, then
         // project the TOTAL impulse onto the Coulomb disk (not a per-axis box).
-        double coupling = TangentCoupling(contact, 0u);
+        double coupling = TangentCoupling(couplingTorque[0], contact->rows[2].angularResponse[0]);
         if (paired)
         {
-            coupling += TangentCoupling(contact, 1u);
+            coupling += TangentCoupling(couplingTorque[1], contact->rows[2].angularResponse[1]);
         }
         double determinant = masses[1] * masses[2] - coupling * coupling;
         contact->tangentCrossMass = 0.0;
@@ -3345,10 +3370,10 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
 
         double velocity[3];
         RelativeContactVelocity(contact, scratch, velocity);
-        double initialNormalSpeed = Dot3(velocity, contact->normal);
-        double penetration = contact->depth - settings->penetrationSlop;
+        double initialNormalSpeed = Dot3(velocity, normal);
+        double penetration = contact->depth - penetrationSlop;
         double bias = penetration > 0.0
-                          ? settings->penetrationCorrection * penetration / RIGID_STEP_SECONDS
+                          ? penetrationCorrection * penetration / RIGID_STEP_SECONDS
                           : 0.0;
         bias = bias > RIGID_MAX_RECOVERY_SPEED ? RIGID_MAX_RECOVERY_SPEED : bias;
         double bounce = initialNormalSpeed < -RIGID_RESTITUTION_THRESHOLD
