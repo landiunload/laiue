@@ -2991,6 +2991,23 @@ static void GridNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
                                 bodies[second].sleeping)
                                 continue;
                             const RigidBodyCache *secondCache = &scratch->caches[second];
+                            // The grid only bounds centres, so a neighbouring cell
+                            // still holds boxes whose tight AABBs are disjoint. This
+                            // is exactly the first test BuildBoxManifold performs, so
+                            // rejecting here removes a full SAT without changing any
+                            // contact or its order.
+                            bool separated = false;
+                            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                            {
+                                if (firstCache->aabbMax[axis] <= secondCache->aabbMin[axis] ||
+                                    secondCache->aabbMax[axis] <= firstCache->aabbMin[axis])
+                                {
+                                    separated = true;
+                                    break;
+                                }
+                            }
+                            if (separated)
+                                continue;
                             ++pairs;
                             BoxManifold manifold;
                             if (!BuildBoxManifold(firstCache, bodies[first].halfExtent, secondCache,
@@ -3189,6 +3206,24 @@ static bool CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
                             continue;
                         }
                         if (entry->stableOrder <= ordered || bodies[second].sleeping)
+                        {
+                            continue;
+                        }
+                        // Cell adjacency alone admits boxes whose tight AABBs are
+                        // disjoint; BuildBoxManifold would reject them on its first
+                        // test. Rejecting here is exact and removes the full SAT.
+                        const RigidBodyCache *secondCache = &scratch->caches[second];
+                        bool separated = false;
+                        for (uint32_t axis = 0u; axis < 3u; ++axis)
+                        {
+                            if (firstCache->aabbMax[axis] <= secondCache->aabbMin[axis] ||
+                                secondCache->aabbMax[axis] <= firstCache->aabbMin[axis])
+                            {
+                                separated = true;
+                                break;
+                            }
+                        }
+                        if (separated)
                         {
                             continue;
                         }
