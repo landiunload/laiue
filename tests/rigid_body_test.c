@@ -896,6 +896,35 @@ static void TestRotatedBroadphaseExtent(void)
     VoxelRigidBodyRelease(&bodies[1]);
 }
 
+static void TestGridCellBoundaryCandidate(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[2] = 0.0;
+    VoxelRigidBody bodies[2];
+    VoxelRigidBodyDescription description;
+    // Два куба, чьи центры почти ровно на клетку врозь: левый чуть ниже
+    // нуля, правый чуть ниже следующей границы. При верном размере клетки
+    // (два наибольших радиуса AABB) они попадают в соседние клетки и обязаны
+    // найтись широким отбором. Если размер клетки посчитан не из радиуса AABB,
+    // граница уезжает, пара теряется, и контакт пропадает.
+    DescribeCube(&description, -0.002, 0.0, 3.0);
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description),
+                "grid boundary body created");
+    DescribeCube(&description, 0.996, 0.0, 3.0);
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[1], 2u, &description),
+                "grid boundary body created");
+    RigidExpect(Advance(&harness, bodies, 2u, 1u), "grid boundary step executed");
+    VoxelRigidStepStats stats;
+    RigidExpect(
+        VoxelRigidBodyReadStepStats(harness.scratch, 2u, (uint32_t)sizeof(harness.scratch), &stats),
+        "grid boundary statistics readable");
+    RigidExpect(stats.candidatePairCount == 1u && stats.contactCount != 0u,
+                "tight AABB pair across a cell boundary is not lost");
+    VoxelRigidBodyRelease(&bodies[0]);
+    VoxelRigidBodyRelease(&bodies[1]);
+}
+
 static void TestExactScratchLayout(void)
 {
     static RigidHarness harness;
@@ -1004,6 +1033,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestRemovedSupportWakesWholeIsland();
     TestContactIslandSleepsTogether();
     TestRotatedBroadphaseExtent();
+    TestGridCellBoundaryCandidate();
     TestExactScratchLayout();
     TestScratchRefusals();
 
