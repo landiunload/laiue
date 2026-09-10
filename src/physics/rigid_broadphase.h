@@ -38,7 +38,8 @@ bool RigidBroadphaseSetProxy(VoxelRigidBroadphase *broadphase, uint32_t slot,
                               const double minimum[3], const double maximum[3]);
 void RigidBroadphaseRemoveProxy(VoxelRigidBroadphase *broadphase, uint32_t slot);
 // Output order follows tree topology, NOT stableId. The solver must canonicalize
-// results before any order-sensitive processing. No recursion or query stack.
+// results before any order-sensitive processing. A bounded stack and a
+// parent-link fallback need no allocation or recursive calls.
 // false on insufficient output space; outCount reports only the written prefix.
 bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum[3],
                            const double maximum[3], uint32_t *outSlots,

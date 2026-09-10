@@ -357,7 +357,7 @@ LAIUE_TEST_ENTRY(RigidCacheTestEntryPoint)
     Expect(Replay(false, false) == hash, "cache reset and repeated replay match exactly");
     Expect(Replay(true, false) == hash, "cached replay independent of array order");
     Expect(Replay(true, true) == hash, "cached replay restores hostile FP modes");
-    Expect(hash == UINT64_C(0x01d0a286ff9911da), "cached replay matches verified golden state");
     WriteHash(hash);
+    Expect(hash == UINT64_C(0x58c622ddfd840a45), "cached replay matches verified golden state");
     LAIUE_TEST_SUCCESS();
 }

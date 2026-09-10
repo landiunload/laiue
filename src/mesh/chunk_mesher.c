@@ -30,6 +30,23 @@ static inline uint32_t LowestSetBitIndex(uint64_t value)
 #endif
 }
 
+// GCC/Clang выбирают реализацию по целевому ISA. У MSVC явный POPCNT
+// допустим только в профиле AVX2/AVX512: x64/SSE2 сам по себе его не обещает.
+// Для SSE2 и MSVC ARM64 остаётся переносимое суммирование групп битов.
+static inline uint32_t PopCount64(uint64_t value)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint32_t)__builtin_popcountll(value);
+#elif defined(_MSC_VER) && defined(_M_X64) && (defined(__AVX2__) || defined(__AVX512F__))
+    return (uint32_t)__popcnt64(value);
+#else
+    value = value - ((value >> 1) & 0x5555555555555555ull);
+    value = (value & 0x3333333333333333ull) + ((value >> 2) & 0x3333333333333333ull);
+    value = (value + (value >> 4)) & 0x0f0f0f0f0f0f0f0full;
+    return (uint32_t)((value * 0x0101010101010101ull) >> 56);
+#endif
+}
+
 // Расширенный регион: чанк плюс слой соседних блоков с каждой стороны,
 // чтобы грани на границе чанка отсекались без обращений к соседям.
 #define EXTENDED_SIZE (CHUNK_SIZE + 2)
@@ -38,6 +55,11 @@ static inline uint32_t LowestSetBitIndex(uint64_t value)
 #define BLOCK_INDEX(y, x, z) ((((size_t)(y) * EXTENDED_SIZE) + (size_t)(x)) * EXTENDED_SIZE + (size_t)(z))
 
 #define COLUMN_WORDS ((size_t)CHUNK_SIZE * CHUNK_SIZE)
+
+enum
+{
+    FACE_COUNT = 6,
+};
 
 enum
 {
@@ -60,9 +82,12 @@ struct ChunkMesherScratch
 {
     BlockType* blocks;
     uint64_t* columns;
-    uint64_t* planesPositive;
-    uint64_t* planesNegative;
-    QuadBuffer quadBuffer;
+    // Шесть плоскостей сразу, по одной на направление грани. Раньше их было
+    // две и они переиспользовались, потому что greedy-проход запускался сразу
+    // после заполнения очередной пары. Теперь сначала считаются все грани, и
+    // только потом идёт слияние: иначе не узнать точный размер выдачи до того,
+    // как её начали писать.
+    uint64_t* planes;
 };
 
 ChunkMesherScratch* ChunkMesherScratchCreate(void)
@@ -75,11 +100,9 @@ ChunkMesherScratch* ChunkMesherScratchCreate(void)
 
     scratch->blocks = PlatformAllocate((size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE, false);
     scratch->columns = PlatformAllocate(COLUMN_WORDS * 3 * sizeof(uint64_t), false);
-    scratch->planesPositive = PlatformAllocate(COLUMN_WORDS * sizeof(uint64_t), false);
-    scratch->planesNegative = PlatformAllocate(COLUMN_WORDS * sizeof(uint64_t), false);
+    scratch->planes = PlatformAllocate(COLUMN_WORDS * FACE_COUNT * sizeof(uint64_t), false);
 
-    if (scratch->blocks == NULL || scratch->columns == NULL ||
-        scratch->planesPositive == NULL || scratch->planesNegative == NULL)
+    if (scratch->blocks == NULL || scratch->columns == NULL || scratch->planes == NULL)
     {
         ChunkMesherScratchDestroy(scratch);
         return NULL;
@@ -97,50 +120,68 @@ void ChunkMesherScratchDestroy(ChunkMesherScratch* scratch)
 
     if (scratch->blocks != NULL) PlatformFree(scratch->blocks);
     if (scratch->columns != NULL) PlatformFree(scratch->columns);
-    if (scratch->planesPositive != NULL) PlatformFree(scratch->planesPositive);
-    if (scratch->planesNegative != NULL) PlatformFree(scratch->planesNegative);
-    if (scratch->quadBuffer.quads != NULL) PlatformFree(scratch->quadBuffer.quads);
+    if (scratch->planes != NULL) PlatformFree(scratch->planes);
     PlatformFree(scratch);
 }
 
+// Ёмкость буфера — точное число граней, а квадов не бывает больше, чем
+// граней: каждый выпущенный квад гасит хотя бы один бит плоскости. Проверка
+// всё равно остаётся: переполнить выдачу молча хуже, чем отказать.
 static bool QuadBufferAppend(QuadBuffer* buffer, ChunkQuad quad)
 {
     if (buffer->count == buffer->capacity)
     {
-        uint32_t newCapacity = buffer->capacity == 0 ? 1024 : buffer->capacity * 2;
-        ChunkQuad* newQuads = buffer->quads == NULL
-            ? PlatformAllocate((size_t)newCapacity * sizeof(ChunkQuad), false)
-            : PlatformReallocate(buffer->quads, (size_t)newCapacity * sizeof(ChunkQuad), false);
-        if (newQuads == NULL)
-        {
-            return false;
-        }
-        buffer->quads = newQuads;
-        buffer->capacity = newCapacity;
+        return false;
     }
 
     buffer->quads[buffer->count++] = quad;
     return true;
 }
 
-// Материал блока, которому принадлежит грань. Координаты соответствуют
-// раскладке плоскостей greedy-мешера, а +1 переводит их в halo-регион 66^3.
-static inline BlockType FaceBlockType(const BlockType* blocks,
-    uint32_t face, uint32_t slice, uint32_t row, uint32_t bit)
+// Индекс блока грани — линейная функция (slice, row, bit): шаги зависят
+// только от самой грани, а она постоянна на весь проход. Раньше их считал
+// switch внутри самого внутреннего цикла, и на каждый бит уходили переход
+// и два умножения; теперь шаги берутся один раз, а срез и ряд сворачиваются
+// в указатель до входа в цикл по битам.
+typedef struct FaceLayout
 {
+    const BlockType* base;
+    size_t sliceStride;
+    size_t rowStride;
+    size_t bitStride;
+} FaceLayout;
+
+static inline FaceLayout FaceLayoutFor(uint32_t face, const BlockType* blocks)
+{
+    const size_t plane = (size_t)EXTENDED_SIZE * (size_t)EXTENDED_SIZE;
+    FaceLayout layout;
+    layout.base = blocks + BLOCK_INDEX(1, 1, 1);
     switch (face)
     {
         case FACE_POSITIVE_X:
         case FACE_NEGATIVE_X:
-            return blocks[BLOCK_INDEX(row + 1, slice + 1, bit + 1)];
+            // BLOCK_INDEX(row + 1, slice + 1, bit + 1)
+            layout.sliceStride = EXTENDED_SIZE;
+            layout.rowStride = plane;
+            layout.bitStride = 1;
+            break;
 
         case FACE_POSITIVE_Y:
         case FACE_NEGATIVE_Y:
-            return blocks[BLOCK_INDEX(slice + 1, row + 1, bit + 1)];
+            // BLOCK_INDEX(slice + 1, row + 1, bit + 1)
+            layout.sliceStride = plane;
+            layout.rowStride = EXTENDED_SIZE;
+            layout.bitStride = 1;
+            break;
 
         default:
-            return blocks[BLOCK_INDEX(row + 1, bit + 1, slice + 1)];
+            // BLOCK_INDEX(row + 1, bit + 1, slice + 1)
+            layout.sliceStride = 1;
+            layout.rowStride = plane;
+            layout.bitStride = EXTENDED_SIZE;
+            break;
     }
+    return layout;
 }
 
 // Переводит прямоугольник плоскости (slice, биты, ряды) в оси чанка.
@@ -173,34 +214,132 @@ static bool EmitFaceRectangle(QuadBuffer* buffer, uint32_t face, uint32_t slice,
     }
 }
 
+// Сравнение шестнадцати блоков с одним материалом: бит i результата стоит,
+// если блок i совпал. То же, что делает ColumnSolidMask с воздухом, только
+// образец задаёт вызывающая сторона. Номер бита — номер байта в памяти на
+// обеих архитектурах, порядок байтов внутри слова здесь ни при чём.
+#if defined(_M_ARM64) || defined(__aarch64__)
+static inline uint32_t EqualMask16(const BlockType* data, BlockType blockType)
+{
+    static const uint8_t laneBitTable[16] = {
+        1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u
+    };
+    const uint8x16_t laneBits = vld1q_u8(laneBitTable);
+    uint8x16_t lanes = vld1q_u8((const uint8_t*)data);
+    uint8x16_t equal = vceqq_u8(lanes, vdupq_n_u8((uint8_t)blockType));
+    uint8x16_t selected = vandq_u8(equal, laneBits);
+    return (uint32_t)vaddv_u8(vget_low_u8(selected))
+        | ((uint32_t)vaddv_u8(vget_high_u8(selected)) << 8);
+}
+#else
+static inline uint32_t EqualMask16(const BlockType* data, BlockType blockType)
+{
+    __m128i lanes = _mm_loadu_si128((const __m128i*)data);
+    __m128i wanted = _mm_set1_epi8((char)blockType);
+    return (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(lanes, wanted));
+}
+#endif
+
+// Сколько подряд идущих блоков ряда, начиная со start, имеют материал
+// blockType; больше limit не считает.
+//
+// У четырёх направлений из шести ряд грани лежит в памяти сплошняком: у ±X и
+// ±Y бит — это z, а z в регионе идёт подряд. Тогда шестнадцать блоков
+// сравниваются одной командой вместо шестнадцати чтений. Окно сдвигается так,
+// чтобы не выходить за сам ряд, поэтому лишних байтов не читается никогда.
+static inline uint32_t MaterialRunContiguous(const BlockType* row, uint32_t start,
+    uint32_t limit, BlockType blockType)
+{
+    uint32_t length = 0;
+    for (;;)
+    {
+        uint32_t offset = start + length;
+        uint32_t group = offset + 16u <= (uint32_t)CHUNK_SIZE
+            ? offset
+            : (uint32_t)CHUNK_SIZE - 16u;
+        uint32_t shift = offset - group;
+
+        // В дополнении маски разряды выше окна стоят, поэтому нулевого
+        // аргумента у поиска младшего бита не бывает, а ответ не уходит за окно.
+        uint32_t step =
+            LowestSetBitIndex(~(uint64_t)(EqualMask16(row + group, blockType) >> shift));
+        length += step;
+        if (length >= limit)
+        {
+            return limit;
+        }
+        if (step < 16u - shift)
+        {
+            return length;
+        }
+    }
+}
+
+// Тот же счёт для ±Z, где соседние блоки ряда отстоят на целую строку региона
+// и группами их не взять.
+static inline uint32_t MaterialRunStrided(const BlockType* row, uint32_t start,
+    uint32_t length, uint32_t limit, BlockType blockType, size_t bitStride)
+{
+    while (length < limit && row[(size_t)(start + length) * bitStride] == blockType)
+    {
+        ++length;
+    }
+    return length;
+}
+
+// Продолжает полосу, у которой первые length блоков уже совпали.
+static inline uint32_t MaterialRun(const BlockType* row, uint32_t start, uint32_t length,
+    uint32_t limit, BlockType blockType, size_t bitStride)
+{
+    if (length >= limit)
+    {
+        return limit;
+    }
+    if (bitStride == 1)
+    {
+        return MaterialRunContiguous(row, start, limit, blockType);
+    }
+    return MaterialRunStrided(row, start, length, limit, blockType, bitStride);
+}
+
 static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
     uint64_t* planes, const BlockType* blocks)
 {
+    const FaceLayout layout = FaceLayoutFor(face, blocks);
+
     for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
     {
         uint64_t* rows = &planes[(size_t)slice * CHUNK_SIZE];
+        const BlockType* sliceBase = layout.base + (size_t)slice * layout.sliceStride;
 
         for (uint32_t row = 0; row < CHUNK_SIZE; ++row)
         {
             uint64_t bits = rows[row];
+            const BlockType* rowBase = sliceBase + (size_t)row * layout.rowStride;
 
             while (bits != 0)
             {
                 uint32_t runStart = LowestSetBitIndex(bits);
 
-                BlockType blockType = FaceBlockType(
-                    blocks, face, slice, row, (uint32_t)runStart);
+                BlockType blockType = rowBase[(size_t)runStart * layout.bitStride];
+
+                // Второй блок проверяется поштучно, как и раньше: на
+                // несливаемой сцене полоса кончается ровно здесь, и всё
+                // остальное было бы чистым проигрышем. Дальше, то есть на
+                // длинных полосах, работает другой счёт: сплошной участок
+                // установленных битов ограничивает полосу сверху без единого
+                // обращения к блокам, а материал сверяется группами.
+                uint64_t tail = bits >> runStart;
                 uint32_t runLength = 1;
-                while ((uint32_t)runStart + runLength < CHUNK_SIZE)
+                if ((tail & 2u) != 0
+                    && rowBase[(size_t)(runStart + 1) * layout.bitStride] == blockType)
                 {
-                    uint32_t bit = (uint32_t)runStart + runLength;
-                    if ((bits & (1ull << bit)) == 0
-                        || FaceBlockType(blocks, face, slice, row, bit)
-                            != blockType)
-                    {
-                        break;
-                    }
-                    ++runLength;
+                    uint64_t gaps = ~tail;
+                    uint32_t bitRun = gaps != 0
+                        ? LowestSetBitIndex(gaps)
+                        : (uint32_t)CHUNK_SIZE - runStart;
+                    runLength = MaterialRun(rowBase, runStart, 2u, bitRun, blockType,
+                        layout.bitStride);
                 }
 
                 uint64_t runMask = runLength == 64
@@ -216,17 +355,13 @@ static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
                         break;
                     }
 
-                    bool sameMaterial = true;
-                    for (uint32_t offset = 0; offset < runLength; ++offset)
+                    const BlockType* nextBase = sliceBase + (size_t)nextRow * layout.rowStride;
+                    if (nextBase[(size_t)runStart * layout.bitStride] != blockType)
                     {
-                        if (FaceBlockType(blocks, face, slice, nextRow,
-                                (uint32_t)runStart + offset) != blockType)
-                        {
-                            sameMaterial = false;
-                            break;
-                        }
+                        break;
                     }
-                    if (!sameMaterial)
+                    if (MaterialRun(nextBase, runStart, 1u, runLength, blockType,
+                            layout.bitStride) != runLength)
                     {
                         break;
                     }
@@ -296,13 +431,129 @@ static inline uint64_t ColumnSolidMask(const BlockType* column)
 }
 #endif
 
-static inline void ScatterFaceBits(uint64_t faceMask, uint64_t* planes, uint32_t row, uint64_t planeBit)
+// Транспонирование битовой матрицы 64x64 на месте: после вызова бит i слова
+// s равен биту s слова i до вызова. Шесть раундов обмена половинами, четвертями
+// и так далее — всего около тысячи операций над регистрами.
+//
+// Обмен зеркален привычной записи из литературы: там нулевым столбцом считают
+// старший бит, а здесь номер бита и есть номер столбца.
+static void TransposeBits64(uint64_t matrix[CHUNK_SIZE])
 {
-    while (faceMask != 0)
+    uint64_t mask = 0x00000000FFFFFFFFull;
+    for (uint32_t stride = 32u; stride != 0u;)
     {
-        uint32_t slice = LowestSetBitIndex(faceMask);
-        faceMask &= faceMask - 1;
-        planes[(size_t)slice * CHUNK_SIZE + row] |= planeBit;
+        for (uint32_t index = 0u; index < CHUNK_SIZE; index = ((index | stride) + 1u) & ~stride)
+        {
+            uint64_t swap = ((matrix[index] >> stride) ^ matrix[index | stride]) & mask;
+            matrix[index] ^= swap << stride;
+            matrix[index | stride] ^= swap;
+        }
+        stride >>= 1;
+        if (stride != 0u)
+        {
+            mask ^= mask << stride;
+        }
+    }
+}
+
+// В отличие от плоскостей граней, обе раскладки колонн пишутся подряд.
+// Редкая матрица дешевле раскладывается по битам, плотная — транспонируется.
+// Порог проверен A/B; он влияет только на способ построения тех же масок.
+#define MESH_TRANSPOSE_COLUMN_SOLIDS 256u
+#define MESH_SPARSE_CHUNK_SOLIDS 4096u
+
+// source и destination лежат в разных массивах колонн, поэтому sparse-путь
+// может обнулить destination и повторно прочитать исходные слова.
+static void BuildTransverseColumns(uint64_t *destination, const uint64_t *source, size_t stride)
+{
+    uint32_t solidCount = 0;
+    for (uint32_t index = 0; index < CHUNK_SIZE; ++index)
+    {
+        uint64_t column = source[(size_t)index * stride];
+        destination[index] = column;
+        solidCount += PopCount64(column);
+    }
+    if (solidCount == 0)
+    {
+        return;
+    }
+    if (solidCount >= MESH_TRANSPOSE_COLUMN_SOLIDS)
+    {
+        TransposeBits64(destination);
+        return;
+    }
+
+    memset(destination, 0, CHUNK_SIZE * sizeof(uint64_t));
+    for (uint32_t index = 0; index < CHUNK_SIZE; ++index)
+    {
+        uint64_t remaining = source[(size_t)index * stride];
+        uint64_t bit = 1ull << index;
+        while (remaining != 0)
+        {
+            uint32_t offset = LowestSetBitIndex(remaining);
+            remaining &= remaining - 1;
+            destination[offset] |= bit;
+        }
+    }
+}
+
+// Складывает шестьдесят четыре маски одного ряда в плоскость.
+//
+// Маска номер i несёт биты по срезам, а плоскости нужен срез с битами по i —
+// это ровно транспонирование. Раньше то же самое делалось поразрядно: на
+// плотной сцене до четырёх тысяч разбросанных чтений-записей на ряд, каждая в
+// свою строку кэша, потому что соседние срезы отстоят на полкилобайта.
+//
+// Запись, а не наложение: слово plane[slice * CHUNK_SIZE + row] принадлежит
+// одному ряду, и другой ряд в него не пишет. Ряды без единой грани
+// пропускаются целиком и остаются нулевыми после общей очистки плоскостей.
+static void StorePlaneRow(uint64_t* plane, uint32_t row, uint64_t masks[CHUNK_SIZE])
+{
+    TransposeBits64(masks);
+    for (uint32_t slice = 0u; slice < CHUNK_SIZE; ++slice)
+    {
+        plane[(size_t)slice * CHUNK_SIZE + row] = masks[slice];
+    }
+}
+
+// Поразрядная раскладка того же ряда. Транспонирование стоит одинаково при
+// любом числе граней, а этот путь — по одной записи на грань, поэтому на
+// редких рядах он дешевле.
+static void ScatterPlaneRow(uint64_t* plane, uint32_t row, const uint64_t masks[CHUNK_SIZE])
+{
+    for (uint32_t index = 0u; index < CHUNK_SIZE; ++index)
+    {
+        uint64_t faceMask = masks[index];
+        uint64_t planeBit = 1ull << index;
+        while (faceMask != 0)
+        {
+            uint32_t slice = LowestSetBitIndex(faceMask);
+            faceMask &= faceMask - 1;
+            plane[(size_t)slice * CHUNK_SIZE + row] |= planeBit;
+        }
+    }
+}
+
+// Порог, за которым транспонирование окупается. Оно обходится примерно в
+// тысячу операций над регистрами независимо от плотности, а поразрядная
+// раскладка — в одну разбросанную запись на грань, и каждая попадает в свою
+// строку кэша: соседние срезы отстоят на полкилобайта. Значение выбрано
+// замером, а не рассуждением; оба пути дают одну и ту же плоскость.
+#define MESH_TRANSPOSE_FACES 256u
+
+static void EmitPlaneRow(uint64_t* plane, uint32_t row, uint64_t masks[CHUNK_SIZE], uint32_t faces)
+{
+    if (faces == 0u)
+    {
+        return;
+    }
+    if (faces >= MESH_TRANSPOSE_FACES)
+    {
+        StorePlaneRow(plane, row, masks);
+    }
+    else
+    {
+        ScatterPlaneRow(plane, row, masks);
     }
 }
 
@@ -335,132 +586,189 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     uint64_t* columnsZ = scratch->columns;                      // [y*64+x]
     uint64_t* columnsY = scratch->columns + COLUMN_WORDS;       // [x*64+z]
     uint64_t* columnsX = scratch->columns + COLUMN_WORDS * 2;   // [y*64+z]
-    uint64_t* planesPositive = scratch->planesPositive;
-    uint64_t* planesNegative = scratch->planesNegative;
+    uint64_t* planes[FACE_COUNT];
+    for (uint32_t face = 0; face < FACE_COUNT; ++face)
+    {
+        planes[face] = scratch->planes + (size_t)face * COLUMN_WORDS;
+    }
     size_t planeBytes = COLUMN_WORDS * sizeof(uint64_t);
 
-    memset(scratch->columns, 0, planeBytes * 3);
-
-    // Один проход по блокам заполняет колонны всех трёх осей. Колонна вдоль Z
-    // читается целиком одной маской, поперечные оси получают биты обходом
-    // установленных разрядов — пустые колонны (а над поверхностью их
-    // большинство) пропускаются целиком.
+    // Сначала непрерывные Z-колонны. Две поперечные раскладки — это те же
+    // битовые матрицы, транспонированные независимо при фиксированных Y и X.
+    // В dense-пути каждый выходной элемент записывается целиком, поэтому
+    // предварительная очистка колонн не нужна.
+    uint32_t solidCount = 0;
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
-        const uint64_t rowBit = 1ull << y;
-
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
-            const uint64_t solidMask = ColumnSolidMask(&blocks[BLOCK_INDEX(y + 1, x + 1, 1)]);
-            if (solidMask == 0)
-            {
-                continue;
-            }
-
-            columnsZ[y * CHUNK_SIZE + x] = solidMask;
-
-            const uint64_t columnBit = 1ull << x;
-            uint64_t remaining = solidMask;
-            while (remaining != 0)
-            {
-                uint32_t z = LowestSetBitIndex(remaining);
-                remaining &= remaining - 1;
-                columnsY[x * CHUNK_SIZE + (uint32_t)z] |= rowBit;
-                columnsX[y * CHUNK_SIZE + (uint32_t)z] |= columnBit;
-            }
+            uint64_t column = ColumnSolidMask(&blocks[BLOCK_INDEX(y + 1, x + 1, 1)]);
+            columnsZ[y * CHUNK_SIZE + x] = column;
+            solidCount += PopCount64(column);
         }
     }
 
-    QuadBuffer* quadBuffer = &scratch->quadBuffer;
-    quadBuffer->count = 0;
-    bool succeeded = true;
+    if (solidCount == 0)
+    {
+        return true;
+    }
+    // Для почти пустого чанка общий scatter дешевле подготовки 128 матриц.
+    // Даже при полном halo пустое ядро выше выходит без старых масок scratch.
+    if (solidCount < MESH_SPARSE_CHUNK_SOLIDS)
+    {
+        memset(columnsY, 0, planeBytes * 2);
+        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
+        {
+            uint64_t rowBit = 1ull << y;
+            for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
+            {
+                uint64_t remaining = columnsZ[y * CHUNK_SIZE + x];
+                uint64_t columnBit = 1ull << x;
+                while (remaining != 0)
+                {
+                    uint32_t z = LowestSetBitIndex(remaining);
+                    remaining &= remaining - 1;
+                    columnsY[x * CHUNK_SIZE + z] |= rowBit;
+                    columnsX[y * CHUNK_SIZE + z] |= columnBit;
+                }
+            }
+        }
+    }
+    else
+    {
+        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
+        {
+            BuildTransverseColumns(&columnsX[y * CHUNK_SIZE], &columnsZ[y * CHUNK_SIZE], 1);
+        }
+        for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
+        {
+            BuildTransverseColumns(&columnsY[x * CHUNK_SIZE], &columnsZ[x], CHUNK_SIZE);
+        }
+    }
+
+    uint32_t faceCount = 0;
+    memset(scratch->planes, 0, planeBytes * FACE_COUNT);
+
+    // Один ряд масок на оба знака грани; переиспользуется всеми тремя парами
+    // осей, поэтому кадр стека остаётся в килобайте.
+    uint64_t positive[CHUNK_SIZE];
+    uint64_t negative[CHUNK_SIZE];
 
     // === Грани ±Z (высота, нормаль = Z) ===
-    memset(planesPositive, 0, planeBytes);
-    memset(planesNegative, 0, planeBytes);
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
+        uint32_t anyPositive = 0;
+        uint32_t anyNegative = 0;
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
             uint64_t column = columnsZ[y * CHUNK_SIZE + x];
             if (column == 0)
             {
+                positive[x] = 0;
+                negative[x] = 0;
                 continue;
             }
             uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(y + 1, x + 1, EXTENDED_SIZE - 1)] != BLOCK_AIR);
             uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(y + 1, x + 1, 0)] != BLOCK_AIR);
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, y, 1ull << x);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << x);
+            positive[x] = column & ~((column >> 1) | (neighborAbove << 63));
+            negative[x] = column & ~((column << 1) | neighborBelow);
+            anyPositive += PopCount64(positive[x]);
+            anyNegative += PopCount64(negative[x]);
         }
+        faceCount += anyPositive + anyNegative;
+        EmitPlaneRow(planes[FACE_POSITIVE_Z], y, positive, anyPositive);
+        EmitPlaneRow(planes[FACE_NEGATIVE_Z], y, negative, anyNegative);
     }
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_POSITIVE_Z, planesPositive, blocks);
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_NEGATIVE_Z, planesNegative, blocks);
 
     // === Грани ±X ===
-    memset(planesPositive, 0, planeBytes);
-    memset(planesNegative, 0, planeBytes);
-    for (uint32_t y = 0; y < CHUNK_SIZE && succeeded; ++y)
+    for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
+        uint32_t anyPositive = 0;
+        uint32_t anyNegative = 0;
         for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
             uint64_t column = columnsX[y * CHUNK_SIZE + z];
             if (column == 0)
             {
+                positive[z] = 0;
+                negative[z] = 0;
                 continue;
             }
             uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(y + 1, EXTENDED_SIZE - 1, z + 1)] != BLOCK_AIR);
             uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(y + 1, 0, z + 1)] != BLOCK_AIR);
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, y, 1ull << z);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, y, 1ull << z);
+            positive[z] = column & ~((column >> 1) | (neighborAbove << 63));
+            negative[z] = column & ~((column << 1) | neighborBelow);
+            anyPositive += PopCount64(positive[z]);
+            anyNegative += PopCount64(negative[z]);
         }
+        faceCount += anyPositive + anyNegative;
+        EmitPlaneRow(planes[FACE_POSITIVE_X], y, positive, anyPositive);
+        EmitPlaneRow(planes[FACE_NEGATIVE_X], y, negative, anyNegative);
     }
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_POSITIVE_X, planesPositive, blocks);
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_NEGATIVE_X, planesNegative, blocks);
 
     // === Грани ±Y (вторая горизонталь, нормаль = Y) ===
-    memset(planesPositive, 0, planeBytes);
-    memset(planesNegative, 0, planeBytes);
-    for (uint32_t x = 0; x < CHUNK_SIZE && succeeded; ++x)
+    for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
     {
+        uint32_t anyPositive = 0;
+        uint32_t anyNegative = 0;
         for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
             uint64_t column = columnsY[x * CHUNK_SIZE + z];
             if (column == 0)
             {
+                positive[z] = 0;
+                negative[z] = 0;
                 continue;
             }
             uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(EXTENDED_SIZE - 1, x + 1, z + 1)] != BLOCK_AIR);
             uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(0, x + 1, z + 1)] != BLOCK_AIR);
-            ScatterFaceBits(column & ~((column >> 1) | (neighborAbove << 63)), planesPositive, x, 1ull << z);
-            ScatterFaceBits(column & ~((column << 1) | neighborBelow), planesNegative, x, 1ull << z);
+            positive[z] = column & ~((column >> 1) | (neighborAbove << 63));
+            negative[z] = column & ~((column << 1) | neighborBelow);
+            anyPositive += PopCount64(positive[z]);
+            anyNegative += PopCount64(negative[z]);
         }
+        faceCount += anyPositive + anyNegative;
+        EmitPlaneRow(planes[FACE_POSITIVE_Y], x, positive, anyPositive);
+        EmitPlaneRow(planes[FACE_NEGATIVE_Y], x, negative, anyNegative);
     }
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_POSITIVE_Y, planesPositive, blocks);
-    succeeded = succeeded && GreedyMeshPlanes(
-        quadBuffer, FACE_NEGATIVE_Y, planesNegative, blocks);
 
-    if (!succeeded)
+    if (faceCount == 0)
+    {
+        return true;
+    }
+
+    // Выдача выделяется один раз и ровно на число граней: слить их можно
+    // только в меньшее число квадов, больше не станет никогда. Greedy-проход
+    // пишет прямо сюда, поэтому копии в конце нет вовсе.
+    QuadBuffer quadBuffer;
+    quadBuffer.quads = PlatformAllocate((size_t)faceCount * sizeof(ChunkQuad), false);
+    quadBuffer.count = 0;
+    quadBuffer.capacity = faceCount;
+    if (quadBuffer.quads == NULL)
     {
         return false;
     }
 
-    if (quadBuffer->count > 0)
+    // Порядок направлений — часть формата геометрии и менять его нельзя.
+    static const uint32_t order[FACE_COUNT] = {
+        FACE_POSITIVE_Z, FACE_NEGATIVE_Z, FACE_POSITIVE_X,
+        FACE_NEGATIVE_X, FACE_POSITIVE_Y, FACE_NEGATIVE_Y,
+    };
+    for (uint32_t index = 0; index < FACE_COUNT; ++index)
     {
-        size_t bytes = (size_t)quadBuffer->count * sizeof(ChunkQuad);
-        ChunkQuad* quads = PlatformAllocate(bytes, false);
-        if (quads == NULL)
+        if (!GreedyMeshPlanes(&quadBuffer, order[index], planes[order[index]], blocks))
         {
+            PlatformFree(quadBuffer.quads);
             return false;
         }
-        memcpy(quads, quadBuffer->quads, bytes);
-        *outQuads = quads;
-        *outQuadCount = quadBuffer->count;
     }
 
+    // Квадов вышло меньше, чем граней: лишний хвост возвращается аллокатору.
+    // Уменьшение блока обычно происходит на месте; если аллокатор всё же
+    // откажет, прежний блок остаётся годным, просто с запасом.
+    size_t bytes = (size_t)quadBuffer.count * sizeof(ChunkQuad);
+    ChunkQuad* shrunk = PlatformReallocate(quadBuffer.quads, bytes, false);
+    *outQuads = shrunk != NULL ? shrunk : quadBuffer.quads;
+    *outQuadCount = quadBuffer.count;
     return true;
 }

@@ -4,14 +4,21 @@
 
 #include <stddef.h>
 
-#define TEST_INDEX_COUNT 1024u
+// Достаточно широкий набор, чтобы пул раздавал работу пачками: при коротком
+// наборе пачка вырождается в один диапазон, и раздача пачками не проверялась
+// бы вовсе.
+#define TEST_INDEX_COUNT 8192u
 
 typedef struct VisitState
 {
     volatile uint32_t visits[TEST_INDEX_COUNT];
     uint32_t results[TEST_INDEX_COUNT];
+    volatile uint32_t invocations;
     uint32_t count;
     uint32_t grain;
+    // grain после ограничений пула: ноль означает единицу, а grain больше
+    // count укорачивается до count.
+    uint32_t effectiveGrain;
     uint32_t epoch;
 } VisitState;
 
@@ -35,6 +42,7 @@ static void Visit(void *context, uint32_t begin, uint32_t end)
     VisitState *state = context;
     Expect(begin < end && end <= state->count, "valid half-open range");
     Expect(end - begin <= state->grain, "range bounded by grain");
+    PlatformAtomicIncrementU32(&state->invocations);
     for (uint32_t index = begin; index < end; ++index)
     {
         Expect(PlatformAtomicIncrementU32(&state->visits[index]) == 1u,
@@ -103,6 +111,10 @@ static void TestConcurrentDispatch(const LaiueTaskExecutor *executor)
     Expect(PlatformConditionVariableInitialize(&gate.condition), "concurrent gate condition");
     // Blocking each claimed range until all four arrive proves the three
     // persistent workers and caller can really participate concurrently.
+    // Four ranges are far too few for the pool to hand more than one of them
+    // to a single claim, so every participant has to take one. A batching
+    // rule that ever gave one participant two of these four would hang here
+    // rather than fail, so it is spelled out.
     executor->run(executor->context, 4u, 1u, MeetAtGate, &gate);
     Expect(gate.arrived == 4u && gate.completed == 4u, "all four callbacks complete together");
     PlatformConditionVariableDestroy(&gate.condition);
@@ -132,6 +144,10 @@ static void TestDispatch(uint32_t threadCount)
         visitState.count = counts[pass % 8u];
         uint32_t grain = grains[(pass / 8u + pass) % 7u];
         visitState.grain = grain == 0u ? 1u : grain;
+        visitState.effectiveGrain = visitState.grain > visitState.count && visitState.count != 0u
+                                        ? visitState.count
+                                        : visitState.grain;
+        visitState.invocations = 0u;
         visitState.epoch = pass + 1u;
         executor.run(executor.context, visitState.count, grain, Visit, &visitState);
         for (uint32_t index = 0u; index < TEST_INDEX_COUNT; ++index)
@@ -142,6 +158,14 @@ static void TestDispatch(uint32_t threadCount)
             Expect(visitState.results[index] == (visited ? (index ^ visitState.epoch) : 0u),
                    "callback writes visible before synchronous return");
         }
+        // Сколько бы индексов пул ни забирал одним захватом, callback обязан
+        // получить ровно столько вызовов, сколько диапазонов длиной не больше
+        // grain укладывается в count. Проверка ловит и слишком длинный
+        // диапазон, и потерянный или задвоенный неполный хвост.
+        uint32_t expectedRanges =
+            visitState.count == 0u ? 0u : (visitState.count - 1u) / visitState.effectiveGrain + 1u;
+        Expect(visitState.invocations == expectedRanges,
+               "callback is invoked once per grain-sized range");
     }
     nullContextVisits = 0u;
     executor.run(executor.context, 31u, 2u, VisitNullContext, NULL);
@@ -195,6 +219,13 @@ LAIUE_TEST_ENTRY(TaskPoolTestEntryPoint)
     for (uint32_t repeat = 0u; repeat < 12u; ++repeat)
     {
         TestDispatch(4u);
+    }
+    // Восемь участников проходят тот же набор: барьер завершения устроен так,
+    // что мьютекс берёт только последний закончивший, и на четырёх участниках
+    // ошибка в этом счётчике могла бы не проявиться.
+    for (uint32_t repeat = 0u; repeat < 4u; ++repeat)
+    {
+        TestDispatch(8u);
     }
     LaiueTestRuntimeWrite("task-pool-exact-once: passed\n");
     LAIUE_TEST_SUCCESS();

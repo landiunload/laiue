@@ -40,6 +40,11 @@ typedef struct RigidWorld
 {
     bool step;
     bool removeFloor;
+    // Столб шириной в один блок. Повёрнутый куб стоит на нём рёбрами:
+    // ни один его угол внутрь столба не попадает.
+    bool pillar;
+    // Пол ровно в один слой: у него открыта и нижняя грань.
+    bool thinFloor;
 } RigidWorld;
 
 // Порядок параметров задан ABI движка.
@@ -47,9 +52,16 @@ typedef struct RigidWorld
 static void QueryBlocks(void *context, int64_t x, int64_t y, int64_t z, VoxelBlockPhysics *outBlock)
 {
     const RigidWorld *world = (const RigidWorld *)context;
-    (void)y;
     bool solid = !world->removeFloor && z < 0;
-    if (world->step && x >= 4 && z == 0)
+    if (world->pillar)
+    {
+        solid = x == 0 && y == 0 && z < 0;
+    }
+    else if (world->thinFloor)
+    {
+        solid = z == -1;
+    }
+    else if (world->step && x >= 4 && z == 0)
     {
         solid = true;
     }
@@ -67,6 +79,8 @@ typedef struct RigidHarness
 
 static void HarnessInit(RigidHarness *harness, bool step)
 {
+    // The destination size is the exact object size, not external input.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memset(harness, 0, sizeof(*harness));
     harness->world.step = step;
     harness->collision.context = &harness->world;
@@ -77,6 +91,8 @@ static void HarnessInit(RigidHarness *harness, bool step)
 
 static void DescribeCube(VoxelRigidBodyDescription *description, double x, double y, double z)
 {
+    // Exact object bounds; this test also runs with the no-CRT runtime.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memset(description, 0, sizeof(*description));
     description->halfExtent[0] = 0.5;
     description->halfExtent[1] = 0.5;
@@ -157,6 +173,132 @@ static void TestRestsOnFloor(void)
     VoxelRigidBodyRelease(&body);
 }
 
+static void TestRotatedBoxRestsOnPillar(void)
+{
+    // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
+    // 4 КиБ, за ними компилятор зовёт отсутствующий __chkstk.
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.world.pillar = true;
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.5, 0.5, 2.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+    // Поворот на 45 градусов вокруг Z уводит все четыре нижних угла за
+    // пределы столба: их проекции лежат на 0.207 блока дальше его граней.
+    // Держат куб только рёбра, а проверка углов их не видит вовсе.
+    body.orientation[0] = 0.0;
+    body.orientation[1] = 0.0;
+    body.orientation[2] = 0.3826834323650898;
+    body.orientation[3] = 0.9238795325112867;
+
+    RigidExpect(Advance(&harness, &body, 1u, 512u), "шаги выполнены");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[2] > 0.4, "повёрнутый куб не проваливается сквозь столб");
+    RigidExpect(Near(position[2], 0.5, 0.05), "повёрнутый куб лежит на столбе");
+    RigidExpect(Near(position[0], 0.5, 0.2) && Near(position[1], 0.5, 0.2),
+                "опора симметрична и куб не съезжает");
+
+    VoxelRigidBodyRelease(&body);
+}
+
+static void TestThinFloorPushesUp(void)
+{
+    // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
+    // 4 КиБ, за ними компилятор зовёт отсутствующий __chkstk.
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.world.thinFloor = true;
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    // Куб уже сидит в полу глубже половины блока: так его продавливает
+    // куча сверху. Выталкивать его по ближайшей грани блока нельзя —
+    // ближайшей оказывается нижняя, и тело уезжает сквозь пол вниз.
+    DescribeCube(&description, 0.25, 0.25, -0.3);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+
+    RigidExpect(Advance(&harness, &body, 1u, 2048u), "шаги выполнены");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[2] > 0.0, "куб выдавлен наверх, а не сквозь пол");
+    RigidExpect(Near(position[2], 0.5, 0.05), "куб лёг на однослойный пол");
+
+    VoxelRigidBodyRelease(&body);
+}
+
+static void TestOverhangingBoxKeepsContact(void)
+{
+    // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
+    // 4 КиБ, за ними компилятор зовёт отсутствующий __chkstk.
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.world.pillar = true;
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.5, 0.5, 2.0);
+    // Плита шире столба: её углы висят далеко в воздухе, и опирается она
+    // на столб серединой грани. Ни один угол снова не внутри блока.
+    description.halfExtent[0] = 2.0;
+    description.halfExtent[1] = 2.0;
+    description.halfExtent[2] = 0.25;
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+
+    RigidExpect(Advance(&harness, &body, 1u, 256u), "шаги выполнены");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[2] > 0.15, "плита не проваливается сквозь столб гранью");
+
+    VoxelRigidBodyRelease(&body);
+}
+
+static void TestWorldContactsUseSharedBudget(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[2] = 0.0;
+
+    // Широкая плита пересекает шесть выборок сплошного пола. Каждая даёт
+    // четыре опорные точки: общий бюджет двух слотов вмещает все 24, даже
+    // когда второй слот неактивен. Личный лимит 16 тихо терял часть опоры.
+    VoxelRigidBody bodies[2] = {0};
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.25, 0.5, 0.49);
+    description.halfExtent[0] = 16.0;
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description), "плита создана");
+    RigidExpect(Advance(&harness, bodies, 2u, 1u), "общего бюджета хватает для широкой опоры");
+    VoxelRigidStepStats stats;
+    RigidExpect(
+        VoxelRigidBodyReadStepStats(harness.scratch, 2u, (uint32_t)sizeof(harness.scratch), &stats),
+        "статистика широкой опоры читается");
+    RigidExpect(stats.activeBodyCount == 1u && stats.contactCount == 24u,
+                "одно тело использует общий бюджет без потери опорных контактов");
+    VoxelRigidBodyRelease(&bodies[0]);
+
+    // С одним слотом общий бюджет всего 16: такой шаг должен отказать до
+    // решения и интеграции, а не сообщать об успехе усечённой симуляции.
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[0], 1u, &description), "плита создана заново");
+    double before[3];
+    double after[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&bodies[0], before), "исходная позиция читается");
+    RigidExpect(!Advance(&harness, bodies, 1u, 1u), "неполная опора не считается успешным шагом");
+    RigidExpect(VoxelRigidBodyLocalPosition(&bodies[0], after), "позиция после отказа читается");
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        RigidExpect(before[axis] == after[axis], "переполнение не интегрирует положение");
+    }
+    RigidExpect(VoxelRigidBodyLinearSpeed(&bodies[0]) == 0.0 &&
+                    VoxelRigidBodyAngularSpeed(&bodies[0]) == 0.0,
+                "переполнение не применяет неполный набор импульсов");
+    VoxelRigidBodyRelease(&bodies[0]);
+}
+
 static void TestTipsOverEdge(void)
 {
     // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
@@ -166,19 +308,35 @@ static void TestTipsOverEdge(void)
 
     VoxelRigidBody body;
     VoxelRigidBodyDescription description;
-    // Куб свисает со ступеньки: половина ширины лежит на ней, половина
-    // висит над обрывом в блок. Опора несимметрична, и он обязан
-    // повернуться — это и есть проверка, что вращение вообще работает.
-    DescribeCube(&description, 4.3, 0.5, 2.0);
+    // Центр масс вынесен за край ступеньки: опора кончается на x = 4, а
+    // центр стоит на 3.9. Держаться там не за что, и куб обязан
+    // опрокинуться — это и есть проверка, что вращение вообще работает.
+    DescribeCube(&description, 3.9, 0.5, 2.0);
     RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
 
     RigidExpect(Advance(&harness, &body, 1u, 256u), "шаги выполнены");
 
     double columns = Absolute(body.orientation[0]) + Absolute(body.orientation[1]) +
                      Absolute(body.orientation[2]);
-    RigidExpect(columns > 0.02, "несимметричная опора обязана повернуть куб");
+    RigidExpect(columns > 0.02, "опора из-под центра масс обязана повернуть куб");
 
     VoxelRigidBodyRelease(&body);
+
+    // Свес меньше половины ребра опрокидывать нечему: центр масс остаётся
+    // над опорой, и грань куба лежит на ступеньке целиком. Проверке углов
+    // эта грань была не видна, и она роняла куб на ровном месте.
+    VoxelRigidBody resting;
+    DescribeCube(&description, 4.3, 0.5, 2.0);
+    RigidExpect(VoxelRigidBodyInitialize(&resting, 2u, &description), "тело создано");
+
+    RigidExpect(Advance(&harness, &resting, 1u, 256u), "шаги выполнены");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&resting, position), "позиция читается");
+    RigidExpect(Near(position[2], 1.5, 0.05), "куб со свесом остался на ступеньке");
+    RigidExpect(position[0] > 4.0, "куб со свесом с неё не съехал");
+
+    VoxelRigidBodyRelease(&resting);
 }
 
 static void TestFreeSpinPersists(void)
@@ -204,10 +362,9 @@ static void TestFreeSpinPersists(void)
 
     // За секунду при 3 рад/с куб повернётся на 3 радиана — кватернион обязан
     // это показать и остаться единичным.
-    double length = body.orientation[0] * body.orientation[0] +
-                    body.orientation[1] * body.orientation[1] +
-                    body.orientation[2] * body.orientation[2] +
-                    body.orientation[3] * body.orientation[3];
+    double length =
+        body.orientation[0] * body.orientation[0] + body.orientation[1] * body.orientation[1] +
+        body.orientation[2] * body.orientation[2] + body.orientation[3] * body.orientation[3];
     RigidExpect(Near(length, 1.0, 1e-9), "кватернион остался единичным");
     RigidExpect(Near(body.orientation[3], 0.0707372, 0.01), "повернулся ровно на 3 радиана");
 
@@ -291,10 +448,9 @@ static void TestUnboundedSpinStaysSane(void)
     RigidExpect(VoxelRigidBodyAngularSpeed(&body) > 9e29, "угловая скорость сохранена");
 
     RigidExpect(Advance(&harness, &body, 1u, 16u), "шаги на невероятной закрутке");
-    double length = body.orientation[0] * body.orientation[0] +
-                    body.orientation[1] * body.orientation[1] +
-                    body.orientation[2] * body.orientation[2] +
-                    body.orientation[3] * body.orientation[3];
+    double length =
+        body.orientation[0] * body.orientation[0] + body.orientation[1] * body.orientation[1] +
+        body.orientation[2] * body.orientation[2] + body.orientation[3] * body.orientation[3];
     RigidExpect(Near(length, 1.0, 1e-9), "кватернион уцелел");
     RigidExpect(VoxelRigidBodyAngularSpeed(&body) > 9e29, "закрутка не потерялась");
     VoxelRigidBodyRelease(&body);
@@ -343,6 +499,115 @@ static void TestRebasing(void)
     RigidExpect(Near(position[1], -2.5 + 512.0, 1e-9), "Y уехал вместе с сеткой");
     RigidExpect(Near(position[2], 7.5, 1e-9), "Z не тронут");
 
+    VoxelRigidBodyRelease(&body);
+}
+
+// Перенос начала координат проверяется для разных величин и раскладок
+// фиксированной точки. Перенос туда и обратно обязан вернуть позицию
+// ровно на прежнее место, а не приблизительно.
+static void TestRebasingPaths(void)
+{
+    // Позиция, у которой ни одна ось не равна нулю.
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 12.25, -7.75, 3.5);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+
+    const int64_t forward[3] = {1000000, -2000000, 3000000};
+    const int64_t backward[3] = {-1000000, 2000000, -3000000};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, forward), "быстрый перенос");
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(Near(position[0], 12.25 - 1000000.0, 1e-6), "X сдвинут");
+    RigidExpect(Near(position[1], -7.75 + 2000000.0, 1e-6), "Y сдвинут");
+    RigidExpect(Near(position[2], 3.5 - 3000000.0, 1e-6), "Z сдвинут");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, backward), "быстрый перенос обратно");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 12.25 && position[1] == -7.75 && position[2] == 3.5,
+                "возврат обязан быть точным, а не приблизительным");
+    VoxelRigidBodyRelease(&body);
+
+    // Ось ровно в нуле: лимба под неё нет; перенос должен корректно создать
+    // значение, а обратный перенос — восстановить канонический ноль.
+    DescribeCube(&description, 0.0, 5.0, -5.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 2u, &description), "тело в нуле создано");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, forward), "перенос из нуля");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(Near(position[0], -1000000.0, 1e-6), "нулевая ось сдвинута");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, backward), "перенос обратно в ноль");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 0.0 && position[1] == 5.0 && position[2] == -5.0,
+                "возврат в ноль обязан быть точным");
+    VoxelRigidBodyRelease(&body);
+
+    // Сдвиг за 2^31 блока: произведение на 2^32 уже не помещается в int64.
+    DescribeCube(&description, 1.5, 2.5, 3.5);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 3u, &description), "тело создано");
+    const int64_t huge[3] = {INT64_C(4294967296), 0, 0};
+    const int64_t hugeBack[3] = {INT64_C(-4294967296), 0, 0};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, huge), "перенос на 2^32 блока");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] < -4000000000.0, "огромный сдвиг применён");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, hugeBack), "перенос обратно");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 1.5 && position[1] == 2.5 && position[2] == 3.5,
+                "возврат после огромного сдвига обязан быть точным");
+    VoxelRigidBodyRelease(&body);
+
+    // Позиция за 2^31 блока: в фиксированной точке старший бит лимба занят;
+    // результат не должен зависеть от представимости в знаковом int64.
+    DescribeCube(&description, 3000000000.0, 1.0, 1.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 4u, &description), "далёкое тело создано");
+    const int64_t away[3] = {-1000000000, 0, 0};
+    const int64_t awayBack[3] = {1000000000, 0, 0};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, away), "перенос далёкого тела");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(Near(position[0], 4000000000.0, 1.0), "далёкое тело сдвинуто");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, awayBack), "перенос обратно");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 3000000000.0, "возврат далёкого тела обязан быть точным");
+    VoxelRigidBodyRelease(&body);
+
+    // Перенос ровно на собственную координату обращает её в точный ноль.
+    // Внутри это единственная ветка, которая освобождает лимбы прямо во
+    // время переноса, и обратный перенос обязан их вернуть.
+    DescribeCube(&description, 4096.0, -8192.0, 2048.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 6u, &description), "тело на узле создано");
+    const int64_t onto[3] = {4096, -8192, 2048};
+    const int64_t ontoBack[3] = {-4096, 8192, -2048};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, onto), "перенос ровно на координату");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 0.0 && position[1] == 0.0 && position[2] == 0.0,
+                "перенос на собственную координату обязан дать точный ноль");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, ontoBack), "перенос обратно с нуля");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 4096.0 && position[1] == -8192.0 && position[2] == 2048.0,
+                "возврат из точного нуля обязан быть точным");
+    VoxelRigidBodyRelease(&body);
+
+    // Ровно 2^32 блока: в фиксированной точке это два лимба, младший нулевой.
+    // Сдвиг на один блок обязан занять через границу лимба и укоротить число.
+    DescribeCube(&description, 4294967296.0, 0.5, 0.5);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 7u, &description), "тело на границе лимба");
+    const int64_t oneBlock[3] = {1, 0, 0};
+    const int64_t oneBlockBack[3] = {-1, 0, 0};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, oneBlock), "заём через границу лимба");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 4294967295.0, "заём через границу лимба обязан быть точным");
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, oneBlockBack), "перенос обратно");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 4294967296.0 && position[1] == 0.5 && position[2] == 0.5,
+                "возврат через границу лимба обязан быть точным");
+    VoxelRigidBodyRelease(&body);
+
+    // Нулевой сдвиг не обязан ничего менять и не обязан ничего выделять.
+    DescribeCube(&description, 9.5, -9.5, 0.5);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 5u, &description), "тело создано");
+    const int64_t none[3] = {0, 0, 0};
+    RigidExpect(VoxelRigidBodyTranslateBlocks(&body, none), "нулевой перенос");
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(position[0] == 9.5 && position[1] == -9.5 && position[2] == 0.5,
+                "нулевой перенос изменил позицию");
     VoxelRigidBodyRelease(&body);
 }
 
@@ -497,8 +762,7 @@ static void TestImpactWakesFiniteMassBody(void)
                 "sleeping finite-mass body created");
     bodies[0].sleeping = true;
     description.position[0] = -0.99;
-    RigidExpect(VoxelRigidBodyInitialize(&bodies[1], 2u, &description),
-                "impact body created");
+    RigidExpect(VoxelRigidBodyInitialize(&bodies[1], 2u, &description), "impact body created");
     const double impact[3] = {4.0, 0.0, 0.0};
     RigidExpect(VoxelRigidBodyAddLinearVelocity(&bodies[1], impact), "impact velocity set");
     RigidExpect(Advance(&harness, bodies, 2u, 1u), "impact step executed");
@@ -623,13 +887,57 @@ static void TestRotatedBroadphaseExtent(void)
     }
     RigidExpect(Advance(&harness, bodies, 2u, 1u), "rotated broadphase step executed");
     VoxelRigidStepStats stats;
-    RigidExpect(VoxelRigidBodyReadStepStats(harness.scratch, 2u,
-                                             (uint32_t)sizeof(harness.scratch), &stats),
-                "rotated broadphase statistics readable");
+    RigidExpect(
+        VoxelRigidBodyReadStepStats(harness.scratch, 2u, (uint32_t)sizeof(harness.scratch), &stats),
+        "rotated broadphase statistics readable");
     RigidExpect(stats.contactCount != 0u,
                 "rotated boxes touching across two old centre cells still collide");
     VoxelRigidBodyRelease(&bodies[0]);
     VoxelRigidBodyRelease(&bodies[1]);
+}
+
+static void TestExactScratchLayout(void)
+{
+    static RigidHarness harness;
+    static VoxelRigidBody bodies[7];
+    HarnessInit(&harness, false);
+    const uint32_t counts[] = {1u, 2u, 3u, 7u};
+    const uint32_t offsets[] = {1u, 2u, 32u, 64u};
+    for (uint32_t index = 0u; index < 7u; ++index)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, (double)index * 4.0, 0.0, 4.0);
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[index], index + 1u, &description),
+                    "scratch layout body initialized");
+    }
+    for (uint32_t sample = 0u; sample < sizeof(counts) / sizeof(counts[0]); ++sample)
+    {
+        uint32_t count = counts[sample];
+        uint32_t required = VoxelRigidBodyStepScratchBytes(count);
+        for (uint32_t alignment = 0u; alignment < sizeof(offsets) / sizeof(offsets[0]); ++alignment)
+        {
+            uint32_t offset = offsets[alignment];
+            RigidExpect(required != 0u && required + offset < sizeof(harness.scratch),
+                        "exact scratch and guards fit test storage");
+            for (uint32_t byte = 0u; byte < sizeof(harness.scratch); ++byte)
+                harness.scratch[byte] = 0xa5u;
+            RigidExpect(VoxelRigidBodyStep(bodies, count, &harness.collision, &harness.settings,
+                                           harness.scratch + offset, required),
+                        "step accepts exactly the reported scratch bytes");
+            VoxelRigidStepStats stats;
+            RigidExpect(
+                VoxelRigidBodyReadStepStats(harness.scratch + offset, count, required, &stats),
+                "stats share the exact scratch layout");
+            RigidExpect(stats.activeBodyCount == count && stats.awakeBodyCount == count,
+                        "exact scratch stats preserve active and awake counts");
+            for (uint32_t byte = 0u; byte < offset; ++byte)
+                RigidExpect(harness.scratch[byte] == 0xa5u, "scratch prefix guard unchanged");
+            for (uint32_t byte = offset + required; byte < sizeof(harness.scratch); ++byte)
+                RigidExpect(harness.scratch[byte] == 0xa5u, "scratch suffix guard unchanged");
+        }
+    }
+    for (uint32_t index = 0u; index < 7u; ++index)
+        VoxelRigidBodyRelease(&bodies[index]);
 }
 
 static void TestScratchRefusals(void)
@@ -652,7 +960,7 @@ static void TestScratchRefusals(void)
                 "буфер шага допускает произвольное выравнивание");
     VoxelRigidStepStats stats;
     RigidExpect(VoxelRigidBodyReadStepStats(harness.scratch + 1u, 1u,
-                                             (uint32_t)sizeof(harness.scratch) - 1u, &stats),
+                                            (uint32_t)sizeof(harness.scratch) - 1u, &stats),
                 "статистика шага читается из scratch");
     RigidExpect(stats.activeBodyCount == 1u && stats.awakeBodyCount == 1u,
                 "статистика содержит активное и бодрствующее тело");
@@ -661,15 +969,14 @@ static void TestScratchRefusals(void)
     RigidExpect(!VoxelRigidBodyStep(&body, 1u, &harness.collision, &harness.settings,
                                     harness.scratch, required - 1u),
                 "малый буфер отвергается");
-    RigidExpect(!VoxelRigidBodyStep(&body, 1u, NULL, &harness.settings, harness.scratch,
-                                    required),
+    RigidExpect(!VoxelRigidBodyStep(&body, 1u, NULL, &harness.settings, harness.scratch, required),
                 "источник столкновений обязателен");
 
     VoxelRigidStepSettings broken = harness.settings;
     broken.solverIterations = 0u;
-    RigidExpect(!VoxelRigidBodyStep(&body, 1u, &harness.collision, &broken, harness.scratch,
-                                    required),
-                "ноль итераций отвергается");
+    RigidExpect(
+        !VoxelRigidBodyStep(&body, 1u, &harness.collision, &broken, harness.scratch, required),
+        "ноль итераций отвергается");
 
     VoxelRigidBodyRelease(&body);
 }
@@ -677,13 +984,18 @@ static void TestScratchRefusals(void)
 LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
 {
     TestDescriptionRefusals();
+    TestWorldContactsUseSharedBudget();
     TestRestsOnFloor();
+    TestRotatedBoxRestsOnPillar();
+    TestThinFloorPushesUp();
+    TestOverhangingBoxKeepsContact();
     TestTipsOverEdge();
     TestFreeSpinPersists();
     TestPointVelocityCarries();
     TestUnboundedSpeed();
     TestUnboundedSpinStaysSane();
     TestRebasing();
+    TestRebasingPaths();
     TestStableIdOrder();
     TestStackSettles();
     TestSleepAndWake();
@@ -692,6 +1004,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestRemovedSupportWakesWholeIsland();
     TestContactIslandSleepsTogether();
     TestRotatedBroadphaseExtent();
+    TestExactScratchLayout();
     TestScratchRefusals();
 
     LaiueTestRuntimeWrite("Rigid body tests passed.\r\n");

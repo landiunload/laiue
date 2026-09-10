@@ -300,6 +300,8 @@ LAIUE_TEST_ENTRY(RigidSolverTestEntryPoint)
     // Established after the contact corrections on Windows MSVC/clang-cl
     // and Linux GCC, Debug and Release. New platforms must match before
     // joining this contract; changing it requires reviewing physics changes.
-    Expect(hash == UINT64_C(0xfb1c9d5a02972c16), "canonical rigid replay reference");
+    // Пересчитано вместе с переходом мира на склеенные коробки блоков:
+    // опорой тела стали его грани и рёбра, а не только углы.
+    Expect(hash == UINT64_C(0xda25a4455485aafc), "canonical rigid replay reference");
     LAIUE_TEST_SUCCESS();
 }

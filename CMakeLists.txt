@@ -306,10 +306,6 @@ endif()
 
 option(LAIUE_BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)
 if(LAIUE_BUILD_BENCHMARKS)
-    if(NOT TARGET laiue_mesher OR NOT TARGET laiue_audio)
-        message(FATAL_ERROR
-            "Бенчмарк измеряет мешер и микшер; включите LAIUE_BUILD_GRAPHICS")
-    endif()
     add_subdirectory(benchmarks)
 endif()
 

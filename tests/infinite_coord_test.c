@@ -596,6 +596,8 @@ static void TestDoubleConversion(void)
 
     double notANumber = 0.0;
     uint64_t nanBits = 0x7FF8000000000000ull;
+    // Copy one complete IEEE 754 representation; both objects are eight bytes.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memcpy(&notANumber, &nanBits, sizeof(notANumber));
     CoordTestExpect(!InfiniteCoordTrySetFromDouble(&fromDouble, notANumber), "NaN отвергается");
 }
@@ -618,6 +620,291 @@ static void TestCompareOrder(void)
     InfiniteCoordDestroy(&left);
 }
 
+// Пачкает кучу единицами: выделяет блок ровно нужного размера, заполняет его
+// одними единицами и освобождает. Следующее выделение того же размера с
+// большой вероятностью получит именно его, и пропущенная запись лимба
+// перестанет маскироваться нулями свежей страницы. Приём эвристический и
+// санитайзер не заменяет, но без него проверка раскладки проходит по
+// случайности: без него подмена «не заполнять младшие лимбы нулями» тестами
+// не ловилась вовсе.
+static void CoordDirtyHeap(uint32_t limbCount)
+{
+    InfiniteCoord one;
+    CoordSet(&one, 1);
+    InfiniteCoord wide;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&wide, &one, limbCount * 64u),
+        "заготовка мусора");
+    InfiniteCoordDestroy(&one);
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&wide, -1), "заготовка мусора");
+    CoordTestExpect(wide.limbCount == limbCount, "заготовка мусора нужной длины");
+    // Плотная копия выделяет ровно limbCount лимбов, а не с запасом.
+    InfiniteCoord tight;
+    CoordTestExpect(InfiniteCoordTryCopyAddInt64(&tight, &wide, 0), "плотная копия мусора");
+    InfiniteCoordDestroy(&wide);
+    InfiniteCoordDestroy(&tight);
+}
+
+// Старший бит теперь ищется инструкцией процессора, а не побитовым циклом.
+// Ошибка в индексе смещает результат ровно на степень двойки, поэтому
+// проверяются точные значения на границах лимба и слова.
+static void TestBitLengthConversion(void)
+{
+    static const int64_t exact[7] = {
+        1, 2, 3, 255, 4294967296LL, 4611686018427387904LL, 9223372036854775807LL,
+    };
+    static const double expected[7] = {
+        1.0, 2.0, 3.0, 255.0, 4294967296.0, 4611686018427387904.0, 9223372036854775807.0,
+    };
+    for (uint32_t index = 0; index < 7u; ++index)
+    {
+        InfiniteCoord value;
+        CoordSet(&value, exact[index]);
+        double converted = InfiniteCoordToDoubleSaturating(&value);
+        // 2^63-1 в double округляется до 2^63; остальные представимы точно.
+        double reference = index == 6u ? 9223372036854775808.0 : expected[index];
+        CoordTestExpect(converted == reference, "перевод в double сместил степень двойки");
+        InfiniteCoord negative;
+        CoordSet(&negative, exact[index]);
+        negative.sign = -1;
+        CoordTestExpect(InfiniteCoordToDoubleSaturating(&negative) == -reference,
+            "знак при переводе в double потерян");
+        InfiniteCoordDestroy(&negative);
+        InfiniteCoordDestroy(&value);
+    }
+
+    // Ровно 2^64: старший бит лежит в первом лимбе, а младший лимб нулевой.
+    InfiniteCoord wide;
+    CoordSetTwoPow64(&wide);
+    CoordTestExpect(wide.limbCount == 2u && wide.limbs[0] == 0u && wide.limbs[1] == 1u,
+        "2^64 собран неверно");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&wide) == 18446744073709551616.0,
+        "2^64 в double");
+
+    // 2^1023 ещё представимо, 2^1024 уже нет: там начинается насыщение.
+    InfiniteCoord huge;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&huge, &wide, 959u), "сдвиг до 2^1023");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&huge) > 0.0
+            && InfiniteCoordToDoubleSaturating(&huge) < DBL_MAX,
+        "2^1023 обязано остаться конечным и не насыщенным");
+    InfiniteCoord overflowing;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&overflowing, &huge, 2u), "сдвиг за 2^1024");
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&overflowing) == DBL_MAX,
+        "за пределом double обязано быть насыщение, а не бесконечность");
+    overflowing.sign = -1;
+    CoordTestExpect(InfiniteCoordToDoubleSaturating(&overflowing) == -DBL_MAX,
+        "насыщение вниз");
+    InfiniteCoordDestroy(&overflowing);
+    InfiniteCoordDestroy(&huge);
+    InfiniteCoordDestroy(&wide);
+}
+
+// Целая часть double собирается сразу в нужной раскладке лимбов. Проверяется
+// именно раскладка: ошибка в числе лимбов или в границе сдвига даёт число,
+// отличающееся ровно на степень 2^64, и сравнение с int64 её не увидит.
+static void TestSetFromDoubleLayout(void)
+{
+    InfiniteCoord value;
+
+    // Меньше единицы — канонический ноль, знак не сохраняется.
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, 0.5), "0.5 принято");
+    CoordTestExpect(value.sign == 0 && value.limbCount == 0u, "0.5 обязано дать ноль");
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, -0.75), "-0.75 принято");
+    CoordTestExpect(value.sign == 0 && value.limbCount == 0u, "-0.75 обязано дать ноль");
+
+    // Усечение к нулю, а не округление.
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, 1.9), "1.9 принято");
+    CoordTestExpect(CoordEqualsInt64(&value, 1), "1.9 усекается до 1");
+    InfiniteCoordDestroy(&value);
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, -1.9), "-1.9 принято");
+    CoordTestExpect(CoordEqualsInt64(&value, -1), "-1.9 усекается до -1");
+    InfiniteCoordDestroy(&value);
+
+    // 2^64: сдвиг не кратен лимбу, младший лимб обнуляется переносом.
+    CoordDirtyHeap(2u);
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, 18446744073709551616.0), "2^64");
+    CoordTestExpect(value.sign == 1 && value.limbCount == 2u && value.limbs[0] == 0u
+            && value.limbs[1] == 1u,
+        "2^64 из double собран неверно");
+    InfiniteCoordDestroy(&value);
+
+    // 2^116: сдвиг кратен лимбу, младший лимб целиком нулевой.
+    CoordDirtyHeap(2u);
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, 83076749736557242056487941267521536.0),
+        "2^116");
+    CoordTestExpect(value.sign == 1 && value.limbCount == 2u && value.limbs[0] == 0u
+            && value.limbs[1] == 4503599627370496ull,
+        "2^116 из double собран неверно");
+    InfiniteCoordDestroy(&value);
+
+    // 2^128: два пустых лимба снизу, старший бит в третьем.
+    CoordDirtyHeap(3u);
+    CoordTestExpect(
+        InfiniteCoordTrySetFromDouble(&value, 340282366920938463463374607431768211456.0),
+        "2^128");
+    CoordTestExpect(value.sign == 1 && value.limbCount == 3u && value.limbs[0] == 0u
+            && value.limbs[1] == 0u && value.limbs[2] == 1u,
+        "2^128 из double собран неверно");
+    InfiniteCoordDestroy(&value);
+
+    // Отрицательное значение той же величины отличается только знаком.
+    CoordTestExpect(InfiniteCoordTrySetFromDouble(&value, -18446744073709551616.0), "-2^64");
+    CoordTestExpect(value.sign == -1 && value.limbCount == 2u && value.limbs[0] == 0u
+            && value.limbs[1] == 1u,
+        "-2^64 из double собран неверно");
+    InfiniteCoordDestroy(&value);
+
+    // Отказ обязан оставить приёмник нетронутым: вызывающий вправе держать
+    // там своё значение и не терять его из-за бесконечности на входе.
+    InfiniteCoord keeper;
+    CoordSet(&keeper, 12345);
+    double infinity = DBL_MAX * 2.0;
+    CoordTestExpect(!InfiniteCoordTrySetFromDouble(&keeper, infinity), "бесконечность отвергается");
+    CoordTestExpect(CoordEqualsInt64(&keeper, 12345), "отказ испортил приёмник");
+    CoordTestExpect(!InfiniteCoordTrySetFromDouble(&keeper, -infinity),
+        "минус бесконечность отвергается");
+    CoordTestExpect(CoordEqualsInt64(&keeper, 12345), "отказ испортил приёмник");
+    InfiniteCoordDestroy(&keeper);
+}
+
+// Сдвиг влево пишет каждый лимб ровно один раз, поэтому проверяется именно
+// раскладка: потерянный перенос между лимбами иначе останется незамеченным.
+static void TestShiftLeftLayout(void)
+{
+    InfiniteCoord one;
+    CoordSet(&one, 1);
+
+    InfiniteCoord shifted;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &one, 0u), "сдвиг на ноль");
+    CoordTestExpect(shifted.limbCount == 1u && shifted.limbs[0] == 1u, "сдвиг на ноль изменил");
+    InfiniteCoordDestroy(&shifted);
+
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &one, 64u), "сдвиг на лимб");
+    CoordTestExpect(shifted.limbCount == 2u && shifted.limbs[0] == 0u && shifted.limbs[1] == 1u,
+        "сдвиг ровно на лимб собран неверно");
+    InfiniteCoordDestroy(&shifted);
+
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &one, 63u), "сдвиг на 63");
+    CoordTestExpect(shifted.limbCount == 1u && shifted.limbs[0] == (1ull << 63),
+        "сдвиг на 63 не должен заводить второй лимб");
+    InfiniteCoordDestroy(&shifted);
+    InfiniteCoordDestroy(&one);
+
+    // Перенос старших бит в следующий лимб при сдвиге, не кратном лимбу.
+    InfiniteCoord full;
+    CoordSet(&full, (int64_t)0x7fffffffffffffffLL);
+    CoordAddInt64(&full, (int64_t)0x7fffffffffffffffLL);
+    CoordAddInt64(&full, 1);  // 2^64 - 1, один лимб из одних единиц
+    CoordTestExpect(full.limbCount == 1u && full.limbs[0] == 0xffffffffffffffffull,
+        "2^64-1 собран неверно");
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &full, 4u), "сдвиг единиц на 4");
+    CoordTestExpect(shifted.limbCount == 2u && shifted.limbs[0] == 0xfffffffffffffff0ull
+            && shifted.limbs[1] == 0xfull,
+        "перенос при сдвиге влево потерян");
+    InfiniteCoordDestroy(&shifted);
+
+    // Сдвиг многолимбового значения сразу на лимб и ещё немного.
+    CoordDirtyHeap(3u);
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &full, 68u), "сдвиг на 68");
+    CoordTestExpect(shifted.limbCount == 3u && shifted.limbs[0] == 0u
+            && shifted.limbs[1] == 0xfffffffffffffff0ull && shifted.limbs[2] == 0xfull,
+        "сдвиг через границу лимба собран неверно");
+    InfiniteCoordDestroy(&shifted);
+    InfiniteCoordDestroy(&full);
+
+    // Ноль остаётся нулём при любом сдвиге.
+    InfiniteCoord zero;
+    InfiniteCoordInit(&zero);
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&shifted, &zero, 130u), "сдвиг нуля");
+    CoordTestExpect(shifted.sign == 0 && shifted.limbCount == 0u && shifted.limbs == NULL,
+        "сдвиг нуля обязан дать канонический ноль");
+    InfiniteCoordDestroy(&shifted);
+    InfiniteCoordDestroy(&zero);
+}
+
+// Переносы и заёмы через границу лимба вместе с крайними значениями int64.
+static void TestCarryBorrowAndInt64Minimum(void)
+{
+    // Заём из старшего лимба: 2^64 - 1 обязано снова стать одним лимбом.
+    InfiniteCoord value;
+    CoordSetTwoPow64(&value);
+    CoordAddInt64(&value, -1);
+    CoordTestExpect(value.limbCount == 1u && value.limbs[0] == 0xffffffffffffffffull
+            && value.sign == 1,
+        "заём через границу лимба потерян");
+    InfiniteCoordDestroy(&value);
+
+    // INT64_MIN как добавка: модуль 2^63 не помещается в положительный int64,
+    // и знак обязан обрабатываться отдельно от величины.
+    InfiniteCoordInit(&value);
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, INT64_MIN), "0 + INT64_MIN");
+    CoordTestExpect(value.sign == -1 && value.limbCount == 1u
+            && value.limbs[0] == 9223372036854775808ull,
+        "INT64_MIN добавлен неверно");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, INT64_MAX), "прибавление INT64_MAX");
+    CoordTestExpect(CoordEqualsInt64(&value, -1), "INT64_MIN + INT64_MAX = -1");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, 1), "прибавление единицы");
+    CoordTestExpect(value.sign == 0 && value.limbCount == 0u,
+        "погашение до нуля обязано дать канонический ноль");
+    InfiniteCoordDestroy(&value);
+
+    // Смена знака через ноль: модуль добавки больше модуля значения.
+    CoordSet(&value, 5);
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, -12), "смена знака");
+    CoordTestExpect(CoordEqualsInt64(&value, -7), "5 + (-12) = -7");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, INT64_MIN), "-7 + INT64_MIN");
+    // -(2^63 + 7): модуль перевалил за половину лимба, но лимб всё ещё один.
+    CoordTestExpect(value.sign == -1 && value.limbCount == 1u
+            && value.limbs[0] == 9223372036854775815ull,
+        "отрицательная добавка за половину лимба посчитана неверно");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, INT64_MAX), "обратно");
+    CoordTestExpect(CoordEqualsInt64(&value, -8), "-7 + INT64_MIN + INT64_MAX = -8");
+    InfiniteCoordDestroy(&value);
+
+    // Заём через два лимба: 2^128 - 1 обязано дать два лимба из единиц.
+    InfiniteCoord one;
+    CoordSet(&one, 1);
+    InfiniteCoord big;
+    CoordTestExpect(InfiniteCoordTryCopyShiftLeft(&big, &one, 128u), "2^128");
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&big, -1), "2^128 - 1");
+    CoordTestExpect(big.limbCount == 2u && big.limbs[0] == 0xffffffffffffffffull
+            && big.limbs[1] == 0xffffffffffffffffull,
+        "заём через два лимба потерян");
+    InfiniteCoordDestroy(&big);
+    InfiniteCoordDestroy(&one);
+}
+
+// Совпадение указателей там, где заголовок его допускает.
+static void TestAliasing(void)
+{
+    // Сложение числа с самим собой: заголовок запрещает совпадение только с
+    // приёмником, слагаемые совпадать вправе.
+    InfiniteCoord value;
+    CoordSetTwoPow64(&value);
+    InfiniteCoord doubled;
+    CoordTestExpect(InfiniteCoordTryAdd(&doubled, &value, &value), "x + x");
+    CoordTestExpect(doubled.limbCount == 2u && doubled.limbs[0] == 0u && doubled.limbs[1] == 2u,
+        "сложение значения с собой дало не удвоение");
+    InfiniteCoordDestroy(&doubled);
+
+    // Сравнение и равенство со смещением на самом себе.
+    CoordTestExpect(InfiniteCoordCompare(&value, &value) == 0, "значение равно себе");
+    CoordTestExpect(InfiniteCoordEqualsOffset(&value, &value, 0), "значение равно себе со смещением");
+    CoordTestExpect(!InfiniteCoordEqualsOffset(&value, &value, 1), "смещение обязано различать");
+
+    // Обмен значения с самим собой обязан оставить его нетронутым.
+    uint64_t* limbs = value.limbs;
+    uint32_t limbCount = value.limbCount;
+    InfiniteCoordSwap(&value, &value);
+    CoordTestExpect(value.limbs == limbs && value.limbCount == limbCount && value.sign == 1,
+        "обмен с самим собой испортил значение");
+
+    // Накопление на месте — единственный путь, где приёмник и есть источник.
+    CoordTestExpect(InfiniteCoordTryAddInt64InPlace(&value, -1), "накопление на месте");
+    CoordTestExpect(value.limbCount == 1u && value.limbs[0] == 0xffffffffffffffffull,
+        "накопление на месте испортило значение");
+    InfiniteCoordDestroy(&value);
+}
+
 LAIUE_TEST_ENTRY(CoordTestEntryPoint)
 {
     TestInitAndInt64RoundTrip();
@@ -635,6 +922,11 @@ LAIUE_TEST_ENTRY(CoordTestEntryPoint)
     TestMultiplyAndShiftLeft();
     TestDoubleConversion();
     TestCompareOrder();
+    TestBitLengthConversion();
+    TestSetFromDoubleLayout();
+    TestShiftLeftLayout();
+    TestCarryBorrowAndInt64Minimum();
+    TestAliasing();
 
     CoordTestWrite("Проверок пройдено: ");
     CoordTestWriteNumber(coordTestChecks);

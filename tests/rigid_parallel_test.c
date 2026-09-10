@@ -40,6 +40,7 @@ static uint32_t hostileDispatches;
 static uint32_t reverseDispatches;
 static uint32_t hostileRangeCalls;
 static uint32_t reverseRangeCalls;
+static uint32_t splitRangeLimit;
 static union
 {
     VoxelRigidStepOptions options;
@@ -60,7 +61,11 @@ static void Expect(bool condition, const char *message)
 
 static uint64_t DoubleBits(double value)
 {
-    union { double scalar; uint64_t bits; } representation = {value};
+    union
+    {
+        double scalar;
+        uint64_t bits;
+    } representation = {value};
     return representation.bits;
 }
 
@@ -110,10 +115,12 @@ static uint64_t HashBody(uint64_t hash, const VoxelRigidBody *body)
 
 static bool SameCoordinate(const InfiniteCoord *first, const InfiniteCoord *second)
 {
-    if (first->sign != second->sign || first->limbCount != second->limbCount) return false;
+    if (first->sign != second->sign || first->limbCount != second->limbCount)
+        return false;
     for (uint32_t limb = 0u; limb < first->limbCount; ++limb)
     {
-        if (first->limbs[limb] != second->limbs[limb]) return false;
+        if (first->limbs[limb] != second->limbs[limb])
+            return false;
     }
     return true;
 }
@@ -124,19 +131,21 @@ static bool SameBody(const VoxelRigidBody *first, const VoxelRigidBody *second)
         first->sleeping != second->sleeping || first->sleepCounter != second->sleepCounter ||
         DoubleBits(first->inverseMass) != DoubleBits(second->inverseMass) ||
         DoubleBits(first->restitution) != DoubleBits(second->restitution) ||
-        DoubleBits(first->friction) != DoubleBits(second->friction)) return false;
+        DoubleBits(first->friction) != DoubleBits(second->friction))
+        return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
         if (!SameCoordinate(&first->position[axis], &second->position[axis]) ||
             !SameCoordinate(&first->linearVelocity[axis], &second->linearVelocity[axis]) ||
             !SameCoordinate(&first->angularVelocity[axis], &second->angularVelocity[axis]) ||
             DoubleBits(first->halfExtent[axis]) != DoubleBits(second->halfExtent[axis]) ||
-            DoubleBits(first->inverseInertia[axis]) != DoubleBits(second->inverseInertia[axis])) return false;
+            DoubleBits(first->inverseInertia[axis]) != DoubleBits(second->inverseInertia[axis]))
+            return false;
     }
     for (uint32_t component = 0u; component < 4u; ++component)
     {
-        if (DoubleBits(first->orientation[component]) !=
-            DoubleBits(second->orientation[component])) return false;
+        if (DoubleBits(first->orientation[component]) != DoubleBits(second->orientation[component]))
+            return false;
     }
     return true;
 }
@@ -154,29 +163,36 @@ static void HostileRange(void *context, uint32_t begin, uint32_t end)
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void HostileRun(void *context, uint32_t count, uint32_t grain,
-                        LaiueTaskRangeFunction function, void *jobContext)
+                       LaiueTaskRangeFunction function, void *jobContext)
 {
     const LaiueTaskExecutor *executor = context;
     Expect(count <= TEST_RANGE_CAPACITY, "instrumented range storage sufficient");
     uint8_t rangeStarts[TEST_RANGE_CAPACITY];
-    for (uint32_t index = 0u; index < count; ++index) rangeStarts[index] = 0u;
+    for (uint32_t index = 0u; index < count; ++index)
+        rangeStarts[index] = 0u;
     HostileRangeJob job = {function, jobContext, rangeStarts};
     ++hostileDispatches;
     insideExecutor = true;
     uint32_t rangeSize = grain == 0u ? 1u : grain;
-    if (rangeSize > 8u) rangeSize = 8u;
+    if (rangeSize > 8u)
+        rangeSize = 8u;
+    if (splitRangeLimit != 0u && rangeSize > splitRangeLimit)
+        rangeSize = splitRangeLimit;
     executor->run(executor->context, count, rangeSize, HostileRange, &job);
     insideExecutor = false;
-    for (uint32_t index = 0u; index < count; ++index) hostileRangeCalls += rangeStarts[index];
+    for (uint32_t index = 0u; index < count; ++index)
+        hostileRangeCalls += rangeStarts[index];
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void ReverseRun(void *context, uint32_t count, uint32_t grain,
-                        LaiueTaskRangeFunction function, void *jobContext)
+                       LaiueTaskRangeFunction function, void *jobContext)
 {
     (void)context;
     ++reverseDispatches;
     uint32_t rangeSize = grain == 0u ? 1u : grain;
+    if (splitRangeLimit != 0u && rangeSize > splitRangeLimit)
+        rangeSize = splitRangeLimit;
     insideExecutor = true;
     for (uint32_t end = count; end != 0u;)
     {
@@ -200,14 +216,13 @@ static double FakeClock(void *context)
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-static void QueryFloor(void *context, int64_t x, int64_t y, int64_t z,
-                        VoxelBlockPhysics *block)
+static void QueryFloor(void *context, int64_t x, int64_t y, int64_t z, VoxelBlockPhysics *block)
 {
     (void)context;
     Expect(!insideExecutor, "world callbacks remain on coordinator");
     queryHash = HashWord(HashWord(HashWord(queryHash, (uint64_t)x), (uint64_t)y), (uint64_t)z);
-    block->flags = floorEnabled && z + worldOrigin[2] < 0
-                       ? (uint32_t)VOXEL_BLOCK_PHYSICS_SOLID : 0u;
+    block->flags =
+        floorEnabled && z + worldOrigin[2] < 0 ? (uint32_t)VOXEL_BLOCK_PHYSICS_SOLID : 0u;
     block->friction = 0.6f;
 }
 
@@ -220,7 +235,8 @@ static VoxelCollisionSource Collision(void)
 static VoxelRigidBodyDescription Description(void)
 {
     VoxelRigidBodyDescription description = {0};
-    for (uint32_t axis = 0u; axis < 3u; ++axis) description.halfExtent[axis] = 0.5;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        description.halfExtent[axis] = 0.5;
     description.mass = 1.0;
     description.position[2] = 2.0;
     description.friction = 0.5;
@@ -242,7 +258,8 @@ static void ResetFixtures(void)
 {
     ReleaseFixtures();
     floorEnabled = true;
-    for (uint32_t axis = 0u; axis < 3u; ++axis) worldOrigin[axis] = 0;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        worldOrigin[axis] = 0;
     uint32_t cacheBytes = VoxelRigidContactCacheBytes(TEST_CAPACITY);
     Expect(cacheBytes != 0u && cacheBytes <= TEST_CACHE_BYTES, "cache storage sufficient");
     uint32_t scratchBytes = VoxelRigidBodyStepScratchBytes(TEST_CAPACITY);
@@ -251,7 +268,8 @@ static void ResetFixtures(void)
     {
         PhysicsFixture *fixture = &fixtures[index];
         Expect(VoxelRigidContactCacheInitialize(&fixture->cache, fixture->cacheStorage,
-                                                TEST_CAPACITY, TEST_CACHE_BYTES), "cache initialized");
+                                                TEST_CAPACITY, TEST_CACHE_BYTES),
+               "cache initialized");
         fixture->profile = (VoxelRigidStepProfile){.structSize = sizeof(VoxelRigidStepProfile)};
         fixture->clockCalls = 0u;
     }
@@ -263,7 +281,8 @@ static void InitializeBody(uint32_t slot, const VoxelRigidBodyDescription *descr
     {
         LaiueTestSetHostileFpEnvironment();
         Expect(VoxelRigidBodyInitialize(&fixtures[fixture].bodies[slot], (uint64_t)slot + 1u,
-                                         description), "body initialized");
+                                        description),
+               "body initialized");
     }
 }
 
@@ -271,7 +290,8 @@ static VoxelRigidBody *FindBody(PhysicsFixture *fixture, uint32_t count, uint64_
 {
     for (uint32_t slot = 0u; slot < count; ++slot)
     {
-        if (fixture->bodies[slot].stableId == id) return &fixture->bodies[slot];
+        if (fixture->bodies[slot].stableId == id)
+            return &fixture->bodies[slot];
     }
     Expect(false, "stable body id exists");
     return NULL;
@@ -288,7 +308,7 @@ static void AddVelocity(uint32_t count, uint64_t id, const double velocity[3])
 }
 
 static VoxelRigidStepOptions Options(PhysicsFixture *fixture, VoxelRigidSolverOrder order,
-                                      const LaiueTaskExecutor *executor)
+                                     const LaiueTaskExecutor *executor)
 {
     VoxelRigidStepOptions options = {0};
     options.structSize = sizeof(options);
@@ -302,7 +322,7 @@ static VoxelRigidStepOptions Options(PhysicsFixture *fixture, VoxelRigidSolverOr
 }
 
 static void StepAll(uint32_t count, const VoxelRigidStepSettings *settings,
-                      VoxelRigidSolverOrder order)
+                    VoxelRigidSolverOrder order)
 {
     VoxelCollisionSource collision = Collision();
     uint64_t expectedQueries = 0u;
@@ -310,39 +330,44 @@ static void StepAll(uint32_t count, const VoxelRigidStepSettings *settings,
     for (uint32_t index = 0u; index < FIXTURE_COUNT; ++index)
     {
         PhysicsFixture *fixture = &fixtures[index];
-        const LaiueTaskExecutor *executor = index == 0u ? NULL :
-                                              (index == 1u ? &hostileExecutor : &reverseExecutor);
+        const LaiueTaskExecutor *executor =
+            index == 0u ? NULL : (index == 1u ? &hostileExecutor : &reverseExecutor);
         VoxelRigidStepOptions options = Options(fixture, order, executor);
         queryHash = UINT64_C(14695981039346656037);
         LaiueTestSetHostileFpEnvironment();
-        Expect(VoxelRigidBodyStepEx(fixture->bodies, count, &collision, settings,
-                                    fixture->scratch, TEST_SCRATCH_BYTES, &options), "step completed");
+        Expect(VoxelRigidBodyStepEx(fixture->bodies, count, &collision, settings, fixture->scratch,
+                                    TEST_SCRATCH_BYTES, &options),
+               "step completed");
         Expect(VoxelPhysicsThreadIsConfigured(), "coordinator FP environment normalized");
         VoxelRigidStepStats stats;
         Expect(VoxelRigidBodyReadStepStats(fixture->scratch, count, TEST_SCRATCH_BYTES, &stats),
                "step counters available");
-        if (index == 0u) expectedStats = stats;
+        if (index == 0u)
+            expectedStats = stats;
         else
         {
             Expect(stats.activeBodyCount == expectedStats.activeBodyCount &&
-                   stats.awakeBodyCount == expectedStats.awakeBodyCount &&
-                   stats.candidatePairCount == expectedStats.candidatePairCount &&
-                   stats.contactCount == expectedStats.contactCount,
+                       stats.awakeBodyCount == expectedStats.awakeBodyCount &&
+                       stats.candidatePairCount == expectedStats.candidatePairCount &&
+                       stats.contactCount == expectedStats.contactCount,
                    "active, awake, candidate and contact counters independent of executor");
         }
-        if (index == 0u) expectedQueries = queryHash;
-        else Expect(queryHash == expectedQueries, "world callback order independent of executor");
+        if (index == 0u)
+            expectedQueries = queryHash;
+        else
+            Expect(queryHash == expectedQueries, "world callback order independent of executor");
         Expect(fixture->profile.structSize == sizeof(fixture->profile), "profile size preserved");
         for (uint32_t stage = 0u; stage < VOXEL_RIGID_PROFILE_STAGE_COUNT; ++stage)
         {
-            Expect(fixture->profile.seconds[stage] >= 0.0 &&
-                   fixture->profile.seconds[stage] < 1.0, "fake-clock stage duration finite");
+            Expect(fixture->profile.seconds[stage] >= 0.0 && fixture->profile.seconds[stage] < 1.0,
+                   "fake-clock stage duration finite");
         }
     }
     for (uint32_t index = 1u; index < FIXTURE_COUNT; ++index)
     {
         Expect(fixtures[index].cache.contactCount == fixtures[0].cache.contactCount &&
-               fixtures[index].cache.matchedContactCount == fixtures[0].cache.matchedContactCount,
+                   fixtures[index].cache.matchedContactCount ==
+                       fixtures[0].cache.matchedContactCount,
                "contact cache counts independent of executor");
         for (uint32_t slot = 0u; slot < count; ++slot)
         {
@@ -409,7 +434,8 @@ static uint64_t Replay(VoxelRigidSolverOrder order)
                            "common floating-origin rebase applied");
                 }
             }
-            for (uint32_t axis = 0u; axis < 3u; ++axis) worldOrigin[axis] += shift[axis];
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                worldOrigin[axis] += shift[axis];
         }
         if (tick == 384u)
         {
@@ -439,14 +465,15 @@ static void TestDenseParallelGrid(VoxelRigidSolverOrder order)
         uint32_t row = (slot / 8u) % 4u;
         uint32_t layer = slot / 32u;
         VoxelRigidBodyDescription description = Description();
-        for (uint32_t axis = 0u; axis < 3u; ++axis) description.halfExtent[axis] = 0.45;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            description.halfExtent[axis] = 0.45;
         description.position[0] = (double)(slot % 8u);
         description.position[1] = (double)row;
         description.position[2] = 0.44 + (double)layer * 0.89;
         description.friction = 0.6;
         InitializeBody(slot, &description);
         const double velocity[3] = {(double)((int32_t)(slot % 7u) - 3) / 512.0,
-                                     (double)((int32_t)(slot % 5u) - 2) / 512.0, 0.0};
+                                    (double)((int32_t)(slot % 5u) - 2) / 512.0, 0.0};
         AddVelocity(TEST_CAPACITY, (uint64_t)slot + 1u, velocity);
     }
     for (uint32_t slot = 0u; slot < TEST_CAPACITY / 2u; ++slot)
@@ -464,10 +491,75 @@ static void TestDenseParallelGrid(VoxelRigidSolverOrder order)
             VoxelRigidStepStats stats;
             Expect(VoxelRigidBodyReadStepStats(fixtures[0].scratch, TEST_CAPACITY,
                                                TEST_SCRATCH_BYTES, &stats) &&
-                   stats.contactCount > TEST_CAPACITY,
+                       stats.contactCount > TEST_CAPACITY,
                    "dense parallel regression exercises many real contacts");
         }
     }
+}
+
+static void TestSplitWarmCacheRuns(VoxelRigidSolverOrder order)
+{
+    ResetFixtures();
+    VoxelRigidStepSettings settings;
+    VoxelRigidStepSettingsDefault(&settings);
+    settings.sleepFrames = 0u;
+    // With this fixture's 256 cache buckets, every (lower, world) and
+    // (lower, upper) key below lands in bucket zero. Different pair owners
+    // traverse the same chain while consuming only their own used flags.
+    // Fixed input vectors avoid coupling the test to private cache layout.
+    static const uint64_t pairIds[16][2] = {
+        {16u, 100017u},   {280u, 100149u},  {469u, 100313u},  {560u, 101107u},
+        {875u, 101296u},  {958u, 101340u},  {1120u, 101650u}, {1134u, 101735u},
+        {1991u, 102772u}, {2044u, 103190u}, {2280u, 103391u}, {2423u, 103627u},
+        {2815u, 103695u}, {3359u, 104386u}, {3945u, 104788u}, {4171u, 104917u}};
+    for (uint32_t stack = 0u; stack < 16u; ++stack)
+    {
+        for (uint32_t layer = 0u; layer < 2u; ++layer)
+        {
+            uint32_t slot = stack * 2u + layer;
+            VoxelRigidBodyDescription description = Description();
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                description.halfExtent[axis] = 0.45;
+            description.position[0] = (double)stack * 4.0 + 0.25;
+            description.position[1] = 0.25;
+            description.position[2] = 0.449 + (double)layer * 0.899;
+            InitializeBody(slot, &description);
+            // Assign the test identity before a step or cache entry exists.
+            for (uint32_t fixture = 0u; fixture < FIXTURE_COUNT; ++fixture)
+                fixtures[fixture].bodies[slot].stableId = pairIds[stack][layer];
+        }
+    }
+    VoxelRigidBodyDescription wide = Description();
+    wide.halfExtent[0] = 7.0;
+    wide.halfExtent[1] = 7.0;
+    wide.position[0] = -20.0;
+    wide.position[2] = 0.499;
+    InitializeBody(32u, &wide);
+    // This box crosses several six-cell world tiles. Their manifolds form
+    // one long (body, world) run, not independently matchable submanifolds.
+    for (uint32_t slot = 0u; slot < 16u; ++slot)
+    {
+        uint32_t other = 32u - slot;
+        VoxelRigidBody temporary = fixtures[2].bodies[slot];
+        fixtures[2].bodies[slot] = fixtures[2].bodies[other];
+        fixtures[2].bodies[other] = temporary;
+    }
+    for (uint32_t tick = 0u; tick < 32u; ++tick)
+    {
+        // Neither size aligns with four-point manifolds. A run beginning in
+        // another range must still consume each old contact at most once.
+        splitRangeLimit = (tick & 1u) == 0u ? 1u : 3u;
+        StepAll(33u, &settings, order);
+        Expect(fixtures[0].cache.contactCount > 64u,
+               "split-run fixture crosses parallel warm matching threshold");
+        if (tick == 0u)
+            Expect(fixtures[0].cache.contactCount >= 160u,
+                   "wide world body produces a long multi-tile contact run");
+        else
+            Expect(fixtures[0].cache.matchedContactCount > 0u,
+                   "split-run fixture actually reuses cached contact impulses");
+    }
+    splitRangeLimit = 0u;
 }
 
 static void TestSleepWake(VoxelRigidSolverOrder order)
@@ -479,7 +571,8 @@ static void TestSleepWake(VoxelRigidSolverOrder order)
     InitializeBody(0u, &description);
     VoxelRigidStepSettings settings;
     VoxelRigidStepSettingsDefault(&settings);
-    for (uint32_t tick = 0u; tick < 512u; ++tick) StepAll(1u, &settings, order);
+    for (uint32_t tick = 0u; tick < 512u; ++tick)
+        StepAll(1u, &settings, order);
     Expect(fixtures[0].bodies[0].sleeping, "target sleeps before impact");
     Expect(VoxelRigidBodyLocalPosition(&fixtures[0].bodies[0], description.position),
            "sleeping body position available");
@@ -492,7 +585,7 @@ static void TestSleepWake(VoxelRigidSolverOrder order)
     StepAll(2u, &settings, order);
     double velocity[3];
     Expect(!fixtures[0].bodies[0].sleeping &&
-           VoxelRigidBodyLinearVelocity(&fixtures[0].bodies[0], velocity) && velocity[0] > 1.0,
+               VoxelRigidBodyLinearVelocity(&fixtures[0].bodies[0], velocity) && velocity[0] > 1.0,
            "impact wakes a finite-mass target");
     floorEnabled = false;
     ResetCaches();
@@ -501,7 +594,8 @@ static void TestSleepWake(VoxelRigidSolverOrder order)
         VoxelRigidBodyWake(&fixtures[fixture].bodies[0]);
         VoxelRigidBodyWake(&fixtures[fixture].bodies[1]);
     }
-    for (uint32_t tick = 0u; tick < 128u; ++tick) StepAll(2u, &settings, order);
+    for (uint32_t tick = 0u; tick < 128u; ++tick)
+        StepAll(2u, &settings, order);
     double position[3];
     Expect(VoxelRigidBodyLocalPosition(&fixtures[0].bodies[0], position) && position[2] < -1.0,
            "explicit wake and support removal allow falling");
@@ -513,7 +607,8 @@ static void TestColorOverflow(void)
     floorEnabled = false;
     VoxelRigidStepSettings settings;
     VoxelRigidStepSettingsDefault(&settings);
-    for (uint32_t axis = 0u; axis < 3u; ++axis) settings.gravity[axis] = 0.0;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        settings.gravity[axis] = 0.0;
     settings.sleepFrames = 0u;
     VoxelRigidBodyDescription giant = Description();
     giant.halfExtent[0] = 10.0;
@@ -525,7 +620,8 @@ static void TestColorOverflow(void)
     {
         VoxelRigidBodyDescription small = Description();
         uint32_t row = (slot - 1u) / 9u;
-        for (uint32_t axis = 0u; axis < 3u; ++axis) small.halfExtent[axis] = 0.4;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            small.halfExtent[axis] = 0.4;
         small.position[0] = (double)((slot - 1u) % 9u) * 2.0 - 8.0;
         small.position[1] = (double)row * 2.0 - 8.0;
         small.position[2] = 0.8;
@@ -534,7 +630,8 @@ static void TestColorOverflow(void)
     StepAll(82u, &settings, VOXEL_RIGID_SOLVER_COLORED);
     VoxelRigidStepStats stats;
     Expect(VoxelRigidBodyReadStepStats(fixtures[0].scratch, 82u, TEST_SCRATCH_BYTES, &stats) &&
-           stats.contactCount == 324u, "all 81 four-point giant contacts retained");
+               stats.contactCount == 324u,
+           "all 81 four-point giant contacts retained");
     Expect(fixtures[0].profile.solverOverflowContacts > 0u,
            "more than 64 shared-body colors use serial overflow");
     for (uint32_t fixture = 1u; fixture < FIXTURE_COUNT; ++fixture)
@@ -575,7 +672,8 @@ static void TestColoredRestitution(void)
         }
         VoxelRigidStepSettings settings;
         VoxelRigidStepSettingsDefault(&settings);
-        for (uint32_t axis = 0u; axis < 3u; ++axis) settings.gravity[axis] = 0.0;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            settings.gravity[axis] = 0.0;
         settings.penetrationCorrection = 0.0;
         settings.sleepFrames = 0u;
         StepAll(80u, &settings, VOXEL_RIGID_SOLVER_COLORED);
@@ -585,7 +683,7 @@ static void TestColoredRestitution(void)
             double second[3];
             uint32_t firstSlot = pair * 2u;
             Expect(VoxelRigidBodyLinearVelocity(&fixtures[0].bodies[firstSlot], first) &&
-                   VoxelRigidBodyLinearVelocity(&fixtures[0].bodies[firstSlot + 1u], second),
+                       VoxelRigidBodyLinearVelocity(&fixtures[0].bodies[firstSlot + 1u], second),
                    "colored impact velocities available");
             Expect(Absolute(first[0] + second[0] - 10.0) < 1e-7,
                    "colored impact conserves linear momentum");
@@ -616,7 +714,8 @@ static void TestColoredFriction(void)
         }
         VoxelRigidStepSettings settings;
         VoxelRigidStepSettingsDefault(&settings);
-        for (uint32_t axis = 0u; axis < 3u; ++axis) settings.gravity[axis] = 0.0;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            settings.gravity[axis] = 0.0;
         settings.penetrationCorrection = 0.0;
         settings.sleepFrames = 0u;
         StepAll(64u, &settings, VOXEL_RIGID_SOLVER_COLORED);
@@ -649,37 +748,37 @@ static void TestOptionsValidation(void)
     uint64_t before = HashBody(0u, &fixture->bodies[0]);
     VoxelRigidStepOptions options = Options(fixture, VOXEL_RIGID_SOLVER_CANONICAL, NULL);
     --options.structSize;
-    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                 fixture->scratch, TEST_SCRATCH_BYTES, &options),
+    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, fixture->scratch,
+                                 TEST_SCRATCH_BYTES, &options),
            "short options rejected");
     options.structSize = sizeof(options);
     --fixture->profile.structSize;
-    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                 fixture->scratch, TEST_SCRATCH_BYTES, &options),
+    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, fixture->scratch,
+                                 TEST_SCRATCH_BYTES, &options),
            "short profile rejected");
     fixture->profile.structSize = sizeof(fixture->profile);
     // Deliberately exercise the public API's invalid-enum validation.
     // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
     options.solverOrder = (VoxelRigidSolverOrder)99;
-    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                 fixture->scratch, TEST_SCRATCH_BYTES, &options),
+    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, fixture->scratch,
+                                 TEST_SCRATCH_BYTES, &options),
            "unknown solver order rejected");
     options.solverOrder = VOXEL_RIGID_SOLVER_CANONICAL;
     aliasBuffer.options = options;
-    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                 aliasBuffer.bytes, TEST_SCRATCH_BYTES, &aliasBuffer.options),
+    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, aliasBuffer.bytes,
+                                 TEST_SCRATCH_BYTES, &aliasBuffer.options),
            "options and scratch alias rejected");
     aliasBuffer.profile = (VoxelRigidStepProfile){.structSize = sizeof(VoxelRigidStepProfile)};
     options.profile = &aliasBuffer.profile;
-    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                 aliasBuffer.bytes, TEST_SCRATCH_BYTES, &options),
+    Expect(!VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, aliasBuffer.bytes,
+                                 TEST_SCRATCH_BYTES, &options),
            "profile and scratch alias rejected");
     Expect(before == HashBody(0u, &fixture->bodies[0]), "validation failures preserve body state");
     options = Options(fixture, VOXEL_RIGID_SOLVER_CANONICAL, NULL);
     options.clockSeconds = NULL;
     options.clockContext = NULL;
-    Expect(VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings,
-                                fixture->scratch, TEST_SCRATCH_BYTES, &options),
+    Expect(VoxelRigidBodyStepEx(fixture->bodies, 1u, &collision, &settings, fixture->scratch,
+                                TEST_SCRATCH_BYTES, &options),
            "profile counters work without a clock");
     for (uint32_t stage = 0u; stage < VOXEL_RIGID_PROFILE_STAGE_COUNT; ++stage)
     {
@@ -731,6 +830,8 @@ LAIUE_TEST_ENTRY(RigidParallelTestEntryPoint)
     uint64_t coloredHash = Replay(VOXEL_RIGID_SOLVER_COLORED);
     TestDenseParallelGrid(VOXEL_RIGID_SOLVER_CANONICAL);
     TestDenseParallelGrid(VOXEL_RIGID_SOLVER_COLORED);
+    TestSplitWarmCacheRuns(VOXEL_RIGID_SOLVER_CANONICAL);
+    TestSplitWarmCacheRuns(VOXEL_RIGID_SOLVER_COLORED);
     TestSleepWake(VOXEL_RIGID_SOLVER_CANONICAL);
     TestSleepWake(VOXEL_RIGID_SOLVER_COLORED);
     TestColorOverflow();

@@ -948,6 +948,158 @@ static size_t RegionIndex(int64_t x, int64_t y, int64_t z,
         + (size_t)(z - minZ);
 }
 
+/* Разбор региона идёт по восемь ячеек за раз. Смешанный регион находит оба
+ * признака почти сразу и выходит, а вот однородный обязан прочитать всё:
+ * именно он и стоит дорого, потому что чанк без единого блока над
+ * поверхностью — самый частый в мире. BLOCK_AIR равен нулю, поэтому
+ * «есть непустая ячейка» — это ненулевое слово, а «есть пустая» — известный
+ * приём поиска нулевого байта: занять из каждого байта единицу и посмотреть,
+ * у какого из них старший бит поднялся там, где сам байт его не имел. */
+static inline bool WordHasZeroByte(uint64_t word)
+{
+    return ((word - UINT64_C(0x0101010101010101))
+        & ~word & UINT64_C(0x8080808080808080)) != 0;
+}
+
+static WorldRegionContents ClassifyRegion(const BlockType* blocks, size_t cellCount)
+{
+    bool anyAir = false;
+    bool anySolid = false;
+    size_t index = 0;
+
+    /* Копирование в слово, а не приведение указателя: выравнивание массива
+     * задаёт вызывающая сторона, а memcpy этой длины компилятор превращает
+     * в обычную загрузку. */
+    for (; index + sizeof(uint64_t) <= cellCount; index += sizeof(uint64_t))
+    {
+        uint64_t word;
+        memcpy(&word, blocks + index, sizeof(word));
+        anySolid |= word != 0;
+        anyAir |= WordHasZeroByte(word);
+        if (anyAir && anySolid)
+        {
+            return WORLD_REGION_MIXED;
+        }
+    }
+    for (; index < cellCount; ++index)
+    {
+        anyAir |= blocks[index] == BLOCK_AIR;
+        anySolid |= blocks[index] != BLOCK_AIR;
+        if (anyAir && anySolid)
+        {
+            return WORLD_REGION_MIXED;
+        }
+    }
+    return anySolid ? WORLD_REGION_ALL_SOLID : WORLD_REGION_ALL_AIR;
+}
+
+
+/* Кусок чанка, попавший в регион, в его собственных координатах. Оси идут в
+ * том же порядке, в каком они уложены в локальный индекс: x старшая, z
+ * младшая. Поэтому набор нужных индексов — это отрезок по x, внутри него
+ * отрезок по y и внутри того отрезок по z. */
+typedef struct ChunkClip
+{
+    uint32_t low[3];
+    uint32_t high[3];
+    bool whole;
+} ChunkClip;
+
+static uint32_t ClipLocalIndex(const uint32_t coordinate[3])
+{
+    return coordinate[0] * CHUNK_SIZE * CHUNK_SIZE + coordinate[1] * CHUNK_SIZE + coordinate[2];
+}
+
+/* Наименьший локальный индекс не меньше данного, который лежит внутри куска.
+ * Если такого нет, кусок кончился. Обычный перенос разряда: ось, вышедшая за
+ * верхнюю границу, обнуляется до нижней, а старшая соседняя увеличивается. */
+static bool ClipNextIndex(uint32_t index, const ChunkClip* clip, uint32_t* outIndex)
+{
+    uint32_t coordinate[3] = {
+        index / (CHUNK_SIZE * CHUNK_SIZE),
+        (index / CHUNK_SIZE) % CHUNK_SIZE,
+        index % CHUNK_SIZE
+    };
+    for (uint32_t axis = 0; axis < 3U; ++axis)
+    {
+        if (coordinate[axis] < clip->low[axis])
+        {
+            coordinate[axis] = clip->low[axis];
+            for (uint32_t lower = axis + 1U; lower < 3U; ++lower)
+            {
+                coordinate[lower] = clip->low[lower];
+            }
+            *outIndex = ClipLocalIndex(coordinate);
+            return true;
+        }
+        if (coordinate[axis] > clip->high[axis])
+        {
+            uint32_t carry = axis;
+            while (carry != 0U)
+            {
+                --carry;
+                if (coordinate[carry] < clip->high[carry])
+                {
+                    ++coordinate[carry];
+                    for (uint32_t lower = carry + 1U; lower < 3U; ++lower)
+                    {
+                        coordinate[lower] = clip->low[lower];
+                    }
+                    *outIndex = ClipLocalIndex(coordinate);
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    *outIndex = index;
+    return true;
+}
+
+/* Первая дельта не раньше cursor, чей индекс не меньше target. Скачки идут
+ * удвоением, а не сразу двоичным поиском по всему массиву: соседняя нужная
+ * дельта обычно рядом, и тогда хватает пары шагов. */
+static uint32_t ChunkDeltaAdvance(const Chunk* chunk, uint32_t cursor, uint32_t target)
+{
+    uint32_t count = chunk->deltaCount;
+    if (cursor >= count || DeltaLocalIndex(chunk->deltas[cursor]) >= target)
+    {
+        return cursor;
+    }
+    uint32_t low = cursor;
+    uint32_t step = 1U;
+    uint32_t high = cursor + 1U;
+    while (high < count && DeltaLocalIndex(chunk->deltas[high]) < target)
+    {
+        low = high;
+        step <<= 1;
+        high = cursor + step;
+        if (high > count || high < cursor)
+        {
+            high = count;
+        }
+    }
+    if (high > count)
+    {
+        high = count;
+    }
+    uint32_t left = low + 1U;
+    uint32_t right = high;
+    while (left < right)
+    {
+        uint32_t middle = left + (right - left) / 2U;
+        if (DeltaLocalIndex(chunk->deltas[middle]) < target)
+        {
+            left = middle + 1U;
+        }
+        else
+        {
+            right = middle;
+        }
+    }
+    return left;
+}
+
 WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
@@ -988,9 +1140,10 @@ WorldRegionContents WorldFillRegion(World* world,
         memset(outBlocks, BLOCK_AIR, cellCount * sizeof(*outBlocks));
     }
 
-    int64_t maxBlockX = minBlockX + sizeX - 1;
-    int64_t maxBlockY = minBlockY + sizeY - 1;
-    int64_t maxBlockZ = minBlockZ + sizeZ - 1;
+    // RegionValid bounds the inclusive end, not min + size (which can overflow).
+    int64_t maxBlockX = minBlockX + ((int64_t)sizeX - 1);
+    int64_t maxBlockY = minBlockY + ((int64_t)sizeY - 1);
+    int64_t maxBlockZ = minBlockZ + ((int64_t)sizeZ - 1);
     int64_t minChunkX = ChunkFromBlock(minBlockX);
     int64_t minChunkY = ChunkFromBlock(minBlockY);
     int64_t minChunkZ = ChunkFromBlock(minBlockZ);
@@ -1012,28 +1165,106 @@ WorldRegionContents WorldFillRegion(World* world,
                 if (entry != NULL)
                 {
                     const Chunk* chunk = *entry;
-                    for (uint32_t delta = 0;
-                         delta < chunk->deltaCount; ++delta)
+                    /* Регион почти всегда захватывает от соседнего чанка один
+                     * слой блоков, а дельты в чанке лежат по возрастанию
+                     * локального индекса. Раньше слой искали перебором всего
+                     * массива: у заселённого соседа это сотня тысяч записей
+                     * ради нескольких тысяч нужных. Теперь по массиву идут
+                     * скачками, пропуская всё, что заведомо вне куска. */
+                    const int64_t chunkBase[3] = {
+                        chunkX * CHUNK_SIZE, chunkY * CHUNK_SIZE, chunkZ * CHUNK_SIZE
+                    };
+                    const int64_t regionMinimum[3] = { minBlockX, minBlockY, minBlockZ };
+                    const int64_t regionMaximum[3] = { maxBlockX, maxBlockY, maxBlockZ };
+                    ChunkClip clip;
+                    clip.whole = true;
+                    for (uint32_t axis = 0; axis < 3U; ++axis)
                     {
-                        uint32_t localIndex =
-                            DeltaLocalIndex(chunk->deltas[delta]);
-                        int64_t localX = (int64_t)(localIndex
-                            / (CHUNK_SIZE * CHUNK_SIZE));
-                        uint32_t remainder = localIndex
-                            % (CHUNK_SIZE * CHUNK_SIZE);
-                        int64_t localY = (int64_t)(remainder / CHUNK_SIZE);
-                        int64_t localZ = (int64_t)(remainder % CHUNK_SIZE);
-                        int64_t blockX = chunkX * CHUNK_SIZE + localX;
-                        int64_t blockY = chunkY * CHUNK_SIZE + localY;
-                        int64_t blockZ = chunkZ * CHUNK_SIZE + localZ;
-                        if (blockX >= minBlockX && blockX <= maxBlockX
-                            && blockY >= minBlockY && blockY <= maxBlockY
-                            && blockZ >= minBlockZ && blockZ <= maxBlockZ)
+                        int64_t low = regionMinimum[axis] - chunkBase[axis];
+                        int64_t high = regionMaximum[axis] - chunkBase[axis];
+                        if (low < 0)
                         {
-                            outBlocks[RegionIndex(blockX, blockY, blockZ,
-                                minBlockX, minBlockY, minBlockZ,
-                                sizeX, sizeZ)] =
-                                DeltaBlock(chunk->deltas[delta]);
+                            low = 0;
+                        }
+                        if (high > CHUNK_SIZE - 1)
+                        {
+                            high = CHUNK_SIZE - 1;
+                        }
+                        clip.low[axis] = (uint32_t)low;
+                        clip.high[axis] = (uint32_t)high;
+                        clip.whole = clip.whole && low == 0 && high == CHUNK_SIZE - 1;
+                    }
+
+                    /* Чанк целиком внутри региона — обычный случай для того
+                     * чанка, ради которого регион и берут. Тогда проверять
+                     * нечего, и цикл идёт без единой ветки.
+                     *
+                     * Дельты отсортированы по локальному индексу, а младшие
+                     * шесть его бит — это z. Значит подряд идущие индексы
+                     * внутри одной колонны ложатся в регион тоже подряд:
+                     * место считается один раз на отрезок, а внутри него
+                     * хватает наращивания. У заселённого чанка почти вся
+                     * работа приходится на такие отрезки. */
+                    const int64_t strideY = (int64_t)sizeX * (int64_t)sizeZ;
+                    const int64_t strideX = (int64_t)sizeZ;
+                    const int64_t regionBase =
+                        (chunkBase[1] - minBlockY) * strideY +
+                        (chunkBase[0] - minBlockX) * strideX + (chunkBase[2] - minBlockZ);
+                    if (clip.whole)
+                    {
+                        uint32_t delta = 0;
+                        while (delta < chunk->deltaCount)
+                        {
+                            uint32_t localIndex = DeltaLocalIndex(chunk->deltas[delta]);
+                            uint32_t columnEnd = localIndex | (CHUNK_SIZE - 1U);
+                            int64_t place = regionBase +
+                                (int64_t)(localIndex / (CHUNK_SIZE * CHUNK_SIZE)) * strideX +
+                                (int64_t)((localIndex / CHUNK_SIZE) % CHUNK_SIZE) * strideY +
+                                (int64_t)(localIndex % CHUNK_SIZE);
+                            outBlocks[place] = DeltaBlock(chunk->deltas[delta]);
+                            ++delta;
+                            ++place;
+                            ++localIndex;
+                            while (delta < chunk->deltaCount && localIndex <= columnEnd &&
+                                   DeltaLocalIndex(chunk->deltas[delta]) == localIndex)
+                            {
+                                outBlocks[place] = DeltaBlock(chunk->deltas[delta]);
+                                ++delta;
+                                ++place;
+                                ++localIndex;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        uint32_t last = ClipLocalIndex(clip.high);
+                        uint32_t cursor =
+                            ChunkDeltaLowerBound(chunk, ClipLocalIndex(clip.low));
+                        while (cursor < chunk->deltaCount)
+                        {
+                            uint32_t localIndex = DeltaLocalIndex(chunk->deltas[cursor]);
+                            if (localIndex > last)
+                            {
+                                break;
+                            }
+                            uint32_t target;
+                            if (!ClipNextIndex(localIndex, &clip, &target))
+                            {
+                                break;
+                            }
+                            if (target != localIndex)
+                            {
+                                cursor = ChunkDeltaAdvance(chunk, cursor + 1U, target);
+                                continue;
+                            }
+                            int64_t localX = (int64_t)(localIndex / (CHUNK_SIZE * CHUNK_SIZE));
+                            uint32_t remainder = localIndex % (CHUNK_SIZE * CHUNK_SIZE);
+                            int64_t localY = (int64_t)(remainder / CHUNK_SIZE);
+                            int64_t localZ = (int64_t)(remainder % CHUNK_SIZE);
+                            outBlocks[RegionIndex(chunkBase[0] + localX, chunkBase[1] + localY,
+                                chunkBase[2] + localZ, minBlockX, minBlockY, minBlockZ,
+                                sizeX, sizeZ)] = DeltaBlock(chunk->deltas[cursor]);
+                            ++cursor;
                         }
                     }
                 }
@@ -1045,16 +1276,5 @@ WorldRegionContents WorldFillRegion(World* world,
     }
     PlatformRwLockReleaseShared(&world->tableLock);
 
-    bool anyAir = false;
-    bool anySolid = false;
-    for (size_t index = 0; index < cellCount; ++index)
-    {
-        anyAir |= outBlocks[index] == BLOCK_AIR;
-        anySolid |= outBlocks[index] != BLOCK_AIR;
-        if (anyAir && anySolid)
-        {
-            return WORLD_REGION_MIXED;
-        }
-    }
-    return anySolid ? WORLD_REGION_ALL_SOLID : WORLD_REGION_ALL_AIR;
+    return ClassifyRegion(outBlocks, cellCount);
 }

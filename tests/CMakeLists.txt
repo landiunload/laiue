@@ -68,6 +68,14 @@ target_link_libraries(laiue_rigid_broadphase_test PRIVATE laiue_physics laiue_nu
 laiue_configure_standalone_executable(laiue_rigid_broadphase_test RigidBroadphaseTestEntryPoint)
 add_test(NAME laiue.physics.rigid_broadphase COMMAND laiue_rigid_broadphase_test)
 
+add_executable(laiue_rigid_broadphase_scale_test rigid_broadphase_scale_test.c)
+target_link_libraries(laiue_rigid_broadphase_scale_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(
+    laiue_rigid_broadphase_scale_test RigidBroadphaseScaleTestEntryPoint)
+add_test(NAME laiue.physics.rigid_broadphase_scale
+    COMMAND laiue_rigid_broadphase_scale_test)
+set_tests_properties(laiue.physics.rigid_broadphase_scale PROPERTIES TIMEOUT 60)
+
 add_executable(laiue_rigid_parallel_test rigid_parallel_test.c)
 target_link_libraries(laiue_rigid_parallel_test PRIVATE laiue::physics laiue::numeric laiue::task)
 laiue_configure_standalone_executable(laiue_rigid_parallel_test RigidParallelTestEntryPoint)
@@ -127,6 +135,15 @@ else()
     target_link_libraries(laiue_mod_host_disabled_test PRIVATE laiue_mod)
     laiue_configure_standalone_executable(laiue_mod_host_disabled_test ModHostDisabledTestEntry)
     add_test(NAME laiue.mod.host_disabled COMMAND laiue_mod_host_disabled_test)
+endif()
+
+if(TARGET laiue_mesher)
+    add_executable(laiue_chunk_mesher_test chunk_mesher_test.c)
+    target_link_libraries(laiue_chunk_mesher_test PRIVATE laiue::mesher laiue::world)
+    laiue_configure_standalone_executable(
+        laiue_chunk_mesher_test ChunkMesherTestEntryPoint)
+    add_test(NAME laiue.mesh.chunk_mesher COMMAND laiue_chunk_mesher_test)
+    set_tests_properties(laiue.mesh.chunk_mesher PROPERTIES TIMEOUT 120)
 endif()
 
 if(TARGET laiue_scene)

@@ -9,6 +9,12 @@
 // Скорость сближения, ниже которой отскок не применяется. Без порога тело
 // на опоре вечно подпрыгивает на численном шуме.
 #define RIGID_RESTITUTION_THRESHOLD 1.0
+// Потолок скорости, с которой решатель выдавливает тело из проникновения.
+// Без него глубоко утопленное тело получает скорость в десятки блоков в
+// секунду и выстреливает из кучи: доля проникновения, делённая на шаг, тем
+// больше, чем глубже тело сидит. Выталкивание обязано быть настойчивым, а
+// не взрывным — блока за треть секунды хватает.
+#define RIGID_MAX_RECOVERY_SPEED 3.0
 #define RIGID_STEP_SECONDS (1.0 / 128.0)
 #define RIGID_CONTACTS_PER_BODY VOXEL_RIGID_CONTACTS_PER_BODY
 
@@ -664,12 +670,93 @@ double VoxelRigidBodyAngularSpeed(const VoxelRigidBody *body)
     return body == NULL ? 0.0 : SaturatingLength(body->angularVelocity);
 }
 
+#define RIGID_REBASE_MAX_BLOCKS INT64_C(2147483647)
+
+static bool RigidRebaseAddend(int64_t blockShift, int64_t *outAddend)
+{
+    if (blockShift > RIGID_REBASE_MAX_BLOCKS || blockShift < -RIGID_REBASE_MAX_BLOCKS)
+    {
+        return false;
+    }
+    *outAddend = -(blockShift * ((int64_t)1 << VOXEL_RIGID_VELOCITY_SHIFT));
+    return true;
+}
+
+// Ляжет ли добавка на место, ничего не выделив. Выделение внутри числа
+// произвольной точности нужно ровно в двух случаях: под значение ещё нет
+// лимба, либо одинаковые знаки переносят разряд за старший лимб. Первое
+// видно по знаку. Второе исключает свободный старший бит старшего лимба:
+// тогда модуль меньше 2^(64k-1), добавка меньше 2^63, и сумма заведомо
+// остаётся в прежнем числе лимбов. Разные знаки модуль только уменьшают,
+// там выделять нечего и подавно.
+//
+// Смысл проверки не в скорости, а в отказоустойчивости: операция, которая
+// ничего не выделяет, не может и отказать, поэтому три такие добавки подряд
+// безопасны — частично применённого сдвига не получится.
+static bool RigidRebaseFitsInPlace(const InfiniteCoord *value, int64_t addend)
+{
+    if (addend == 0)
+    {
+        return true;
+    }
+    if (value->sign == 0 || value->limbCount == 0u || value->limbs == NULL)
+    {
+        return false;
+    }
+    // Модуль считается через unsigned, иначе INT64_MIN дал бы переполнение.
+    uint64_t magnitude = addend < 0 ? (uint64_t)(-(addend + 1)) + 1u : (uint64_t)addend;
+    if (magnitude >= (UINT64_C(1) << 63))
+    {
+        return false;
+    }
+    if (value->sign != (addend < 0 ? -1 : 1))
+    {
+        return true;
+    }
+    return value->limbs[value->limbCount - 1u] < (UINT64_C(1) << 63);
+}
+
 bool VoxelRigidBodyTranslateBlocks(VoxelRigidBody *body, const int64_t blockShift[3])
 {
     if (body == NULL || blockShift == NULL)
     {
         return false;
     }
+
+    // Быстрый путь берётся только если он годится для всех трёх осей сразу.
+    // Иначе часть осей уже сдвинулась бы, а часть нет.
+    int64_t addends[3] = {0, 0, 0};
+    bool inPlace = true;
+    for (int32_t axis = 0; axis < 3 && inPlace; ++axis)
+    {
+        if (blockShift[axis] == 0)
+        {
+            continue;
+        }
+        inPlace = RigidRebaseAddend(blockShift[axis], &addends[axis]) &&
+                  RigidRebaseFitsInPlace(&body->position[axis], addends[axis]);
+    }
+    if (inPlace)
+    {
+        bool ok = true;
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            if (addends[axis] == 0)
+            {
+                continue;
+            }
+            // Проверка выше исключила оба места, где эта операция способна
+            // выделить память, а других причин отказать у неё нет. Возврат
+            // всё равно проверяется: молча продолжать по предположению хуже,
+            // чем сообщить об отказе. Прогон с отказывающим allocator это
+            // утверждение подтверждает — быстрый путь проходит целиком.
+            ok = InfiniteCoordTryAddInt64InPlace(&body->position[axis], addends[axis]) && ok;
+        }
+        return ok;
+    }
+
+    // Общий путь: результат каждой оси собирается отдельно и публикуется
+    // только после того, как посчитаны все три.
     InfiniteCoord moved[3];
     bool changed[3] = {false, false, false};
     for (int32_t axis = 0; axis < 3; ++axis)
@@ -683,6 +770,18 @@ bool VoxelRigidBodyTranslateBlocks(VoxelRigidBody *body, const int64_t blockShif
             continue;
         }
         changed[axis] = true;
+        int64_t addend = 0;
+        if (RigidRebaseAddend(blockShift[axis], &addend))
+        {
+            // Сдвиг умещается в int64 — хватает одной копии со сложением
+            // вместо четырёх промежуточных чисел.
+            if (!InfiniteCoordTryCopyAddInt64(&moved[axis], &body->position[axis], addend))
+            {
+                goto failure;
+            }
+            continue;
+        }
+
         InfiniteCoord shift;
         InfiniteCoordInit(&shift);
         InfiniteCoord zero;
@@ -768,14 +867,19 @@ bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body, const double point[
 
 // === Шаг ===
 
+// Раскладка не случайна. Решатель за шаг трогает только скорости и
+// обратную массу, зато трогает их десятки тысяч раз в произвольном порядке.
+// Поэтому они лежат в начале и выровнены на кэш-линию: одно тело — одна
+// линия вместо двух-трёх, разбросанных по структуре. Всё остальное нужно
+// только на подготовке и интегрировании, где обход идёт подряд.
 typedef struct RigidBodyCache
 {
-    double position[3];
-    double linear[3];
+    _Alignas(64) double linear[3];
     double angular[3];
     // Mass is constant during this tick. Keep it beside the solver velocities
     // so applying impulses does not revisit the larger public body array.
     double inverseMass;
+    double position[3];
     // Столбцы матрицы поворота и мировая диагональ обратной инерции.
     double columns[3][3];
     double aabbMin[3];
@@ -803,6 +907,10 @@ typedef struct RigidContact
     uint32_t bodyIndex;
     // UINT32_MAX означает неподвижный мир.
     uint32_t otherIndex;
+    // Плечи от центров масс до точки контакта. Считаются один раз на
+    // подготовке: решатель обращается к ним восемь раз за шаг, и разность
+    // point - position каждый раз тянула бы позицию тела из другой кэш-линии.
+    double lever[2][3];
     double point[3];
     double normal[3];
     double depth;
@@ -831,9 +939,34 @@ typedef struct RigidCachedContact
 #define RIGID_SOLVER_COLOR_COUNT 64u
 #define RIGID_SOLVER_BATCH_COUNT (RIGID_SOLVER_COLOR_COUNT + 1u)
 
+// Cache only geometry during the count pass. This is not a contact limit:
+// bodies exceeding the small local cache regenerate their complete manifold
+// list in the fill pass. No persistent/replay state is introduced.
+#define RIGID_NARROWPHASE_POINTS_PER_BODY 8u
+typedef struct RigidNarrowphasePoint
+{
+    uint32_t otherIndex;
+    double point[3];
+    double normal[3];
+    double depth;
+} RigidNarrowphasePoint;
+
+// Hash-chain rejection needs only coordinates and ordering, not the large
+// solver cache or public body. Keep those reads together in a compact stream.
+typedef struct RigidGridEntry
+{
+    int64_t cell[3];
+    uint32_t next;
+    uint32_t stableOrder;
+} RigidGridEntry;
+
+_Static_assert(sizeof(RigidGridEntry) == 32u, "Grid rejection metadata stays compact");
+
 typedef struct RigidStepScratch
 {
     RigidBodyCache *caches;
+    RigidGridEntry *grid;
+    RigidNarrowphasePoint *narrowphasePoints;
     RigidContact *contacts;
     // Индексы активных тел, отсортированные по stableId. Все обходы,
     // влияющие на порядок импульсов, идут только через этот массив.
@@ -1098,14 +1231,17 @@ uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
         return 0u;
     }
     uint64_t caches = (uint64_t)bodyCount * sizeof(RigidBodyCache);
+    uint64_t grid = (uint64_t)bodyCount * sizeof(RigidGridEntry);
+    uint64_t geometry =
+        (uint64_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     uint64_t contacts = (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 4u;
     uint64_t schedule =
         (uint64_t)bodyCount *
         (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
     uint64_t buckets = (uint64_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
-    uint64_t total =
-        caches + contacts + links + schedule + buckets + sizeof(VoxelRigidStepStats) + 64u;
+    uint64_t total = caches + grid + geometry + contacts + links + schedule + buckets +
+                     sizeof(VoxelRigidStepStats) + 64u;
     return total > 0xFFFFFFFFull ? 0u : (uint32_t)total;
 }
 
@@ -1114,6 +1250,8 @@ static VoxelRigidStepStats *StepStatsPointer(void *scratch, uint32_t bodyCount)
     uintptr_t padding = (0u - (uintptr_t)scratch) & 63u;
     uint8_t *cursor = (uint8_t *)scratch + padding;
     cursor += (size_t)bodyCount * sizeof(RigidBodyCache);
+    cursor += (size_t)bodyCount * sizeof(RigidGridEntry);
+    cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     cursor += (size_t)bodyCount * sizeof(uint32_t) * 4u;
     cursor += (size_t)bodyCount *
@@ -1219,121 +1357,6 @@ static bool AppendContact(RigidStepScratch *scratch, const RigidContact *contact
     }
     scratch->contacts[scratch->contactCount++] = *contact;
     return true;
-}
-
-// Ищет грань, через которую угол вышел бы из блока: минимальное погружение
-// среди тех направлений, где соседний блок пуст. Без проверки соседа угол,
-// попавший глубоко в пол, выталкивался бы вбок внутрь соседнего блока.
-static bool ResolveBlockContact(const VoxelCollisionSource *collision, const double point[3],
-                                double outNormal[3], double *outDepth)
-{
-    int64_t block[3];
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (!TryFloorToInt64(point[axis], &block[axis]))
-        {
-            return false;
-        }
-    }
-    if (!BlockIsSolid(collision, block[0], block[1], block[2]))
-    {
-        return false;
-    }
-
-    double best = 0.0;
-    int32_t bestAxis = -1;
-    double bestSign = 0.0;
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        double local = point[axis] - (double)block[axis];
-        for (int32_t direction = 0; direction < 2; ++direction)
-        {
-            double sign = direction == 0 ? -1.0 : 1.0;
-            double depth = direction == 0 ? local : 1.0 - local;
-            if (depth < 0.0)
-            {
-                depth = 0.0;
-            }
-            int64_t neighbour[3] = {block[0], block[1], block[2]};
-            if ((direction == 0 && block[axis] == INT64_MIN) ||
-                (direction != 0 && block[axis] == INT64_MAX))
-            {
-                // An unrepresentable neighbour is not a known empty cell.
-                continue;
-            }
-            neighbour[axis] += direction == 0 ? -1 : 1;
-            if (BlockIsSolid(collision, neighbour[0], neighbour[1], neighbour[2]))
-            {
-                continue;
-            }
-            if (bestAxis < 0 || depth < best)
-            {
-                best = depth;
-                bestAxis = axis;
-                bestSign = sign;
-            }
-        }
-    }
-    if (bestAxis < 0)
-    {
-        return false;
-    }
-
-    outNormal[0] = 0.0;
-    outNormal[1] = 0.0;
-    outNormal[2] = 0.0;
-    outNormal[bestAxis] = bestSign;
-    *outDepth = best;
-    return true;
-}
-
-static void CollectWorldContacts(const VoxelRigidBody *bodies, uint32_t bodyCount,
-                                 const VoxelCollisionSource *collision, RigidStepScratch *scratch)
-{
-    (void)bodyCount;
-    for (uint32_t ordered = 0; ordered < scratch->activeCount; ++ordered)
-    {
-        uint32_t index = scratch->order[ordered];
-        const RigidBodyCache *cache = &scratch->caches[index];
-        if (!bodies[index].active || bodies[index].sleeping || !cache->collidable)
-        {
-            continue;
-        }
-        for (uint32_t corner = 0; corner < 8u; ++corner)
-        {
-            double sign[3] = {
-                (corner & 1u) != 0u ? 1.0 : -1.0,
-                (corner & 2u) != 0u ? 1.0 : -1.0,
-                (corner & 4u) != 0u ? 1.0 : -1.0,
-            };
-            double point[3];
-            for (int32_t axis = 0; axis < 3; ++axis)
-            {
-                point[axis] = cache->position[axis] +
-                              cache->columns[0][axis] * sign[0] * bodies[index].halfExtent[0] +
-                              cache->columns[1][axis] * sign[1] * bodies[index].halfExtent[1] +
-                              cache->columns[2][axis] * sign[2] * bodies[index].halfExtent[2];
-            }
-            RigidContact contact = {0};
-            if (!ResolveBlockContact(collision, point, contact.normal, &contact.depth))
-            {
-                continue;
-            }
-            contact.bodyIndex = index;
-            contact.otherIndex = UINT32_MAX;
-            scratch->caches[index].hasWorldContact = true;
-            for (int32_t axis = 0; axis < 3; ++axis)
-            {
-                contact.point[axis] = point[axis];
-            }
-            contact.restitution = bodies[index].restitution;
-            contact.friction = bodies[index].friction;
-            if (!AppendContact(scratch, &contact))
-            {
-                return;
-            }
-        }
-    }
 }
 
 // === Манифест двух коробок ===
@@ -1541,6 +1564,28 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
         separation[axis] = first->position[axis] - second->position[axis];
     }
 
+    // Матрица взаимной ориентации: rotation[i][j] — косинус угла между осью i
+    // первого тела и осью j второго. Все пятнадцать разделяющих осей
+    // выражаются через неё и через проекции расстояния на оси тел, поэтому ни
+    // одна из них не требует больше ни векторного произведения, ни трёх
+    // скалярных: вместо примерно девятисот умножений на пару выходит около
+    // двухсот. Классический приём из Real-Time Collision Detection (Ericson,
+    // 4.4.1); ту же матрицу считают Bullet, Box2D и Jolt.
+    double rotation[3][3];
+    double absolute[3][3];
+    double firstDistance[3];
+    double secondDistance[3];
+    for (int32_t i = 0; i < 3; ++i)
+    {
+        for (int32_t j = 0; j < 3; ++j)
+        {
+            rotation[i][j] = Dot3(first->columns[i], second->columns[j]);
+            absolute[i][j] = AbsoluteDouble(rotation[i][j]);
+        }
+        firstDistance[i] = Dot3(separation, first->columns[i]);
+        secondDistance[i] = Dot3(separation, second->columns[i]);
+    }
+
     double bestOverlap = DBL_MAX;
     double bestAxis[3] = {0.0, 0.0, 1.0};
     bool referenceIsSecond = true;
@@ -1548,10 +1593,23 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
     int32_t bestSecondEdge = -1;
     for (int32_t which = 0; which < 6; ++which)
     {
-        const RigidBodyCache *owner = which < 3 ? first : second;
-        const double *axis = owner->columns[which % 3];
-        double reach = BoxRadius(first, firstHalf, axis) + BoxRadius(second, secondHalf, axis);
-        double distance = Dot3(separation, axis);
+        int32_t own = which % 3;
+        // Полупротяжённость вдоль собственной оси — само полуребро; вдоль
+        // чужой она набирается из трёх косинусов.
+        double reach;
+        double distance;
+        if (which < 3)
+        {
+            reach = firstHalf[own] + secondHalf[0] * absolute[own][0] +
+                    secondHalf[1] * absolute[own][1] + secondHalf[2] * absolute[own][2];
+            distance = firstDistance[own];
+        }
+        else
+        {
+            reach = secondHalf[own] + firstHalf[0] * absolute[0][own] +
+                    firstHalf[1] * absolute[1][own] + firstHalf[2] * absolute[2][own];
+            distance = secondDistance[own];
+        }
         double overlap = reach - AbsoluteDouble(distance);
         if (overlap <= 0.0)
         {
@@ -1561,6 +1619,7 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
         {
             bestOverlap = overlap;
             // Нормаль всегда смотрит из второго тела в первое.
+            const double *axis = which < 3 ? first->columns[own] : second->columns[own];
             double sign = distance < 0.0 ? -1.0 : 1.0;
             for (int32_t component = 0; component < 3; ++component)
             {
@@ -1571,24 +1630,31 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
     }
 
     // Полный SAT также обязан проверять пары рёбер. У почти параллельных
-    // рёбер cross-ось вырождается и не является разделяющим направлением.
+    // рёбер cross-ось вырождается и не является разделяющим направлением;
+    // её длина здесь равна синусу угла между осями.
     for (int32_t firstAxis = 0; firstAxis < 3; ++firstAxis)
     {
+        int32_t firstNext = (firstAxis + 1) % 3;
+        int32_t firstLast = (firstAxis + 2) % 3;
         for (int32_t secondAxis = 0; secondAxis < 3; ++secondAxis)
         {
-            double crossAxis[3];
-            Cross3(first->columns[firstAxis], second->columns[secondAxis], crossAxis);
-            double lengthSquared = Dot3(crossAxis, crossAxis);
+            double lengthSquared =
+                1.0 - rotation[firstAxis][secondAxis] * rotation[firstAxis][secondAxis];
             if (!(lengthSquared > 1.0e-12))
             {
                 continue;
             }
+            int32_t secondNext = (secondAxis + 1) % 3;
+            int32_t secondLast = (secondAxis + 2) % 3;
             // Test separation without normalization. Normalize only when an
             // edge axis wins the minimum-penetration comparison; rejecting on
             // edge axes but always resolving on a face gives incorrect torque.
-            double reach =
-                BoxRadius(first, firstHalf, crossAxis) + BoxRadius(second, secondHalf, crossAxis);
-            double distance = Dot3(separation, crossAxis);
+            double reach = firstHalf[firstNext] * absolute[firstLast][secondAxis] +
+                           firstHalf[firstLast] * absolute[firstNext][secondAxis] +
+                           secondHalf[secondNext] * absolute[firstAxis][secondLast] +
+                           secondHalf[secondLast] * absolute[firstAxis][secondNext];
+            double distance = firstDistance[firstLast] * rotation[firstNext][secondAxis] -
+                              firstDistance[firstNext] * rotation[firstLast][secondAxis];
             double overlap = reach - AbsoluteDouble(distance);
             if (overlap <= 0.0)
             {
@@ -1596,6 +1662,8 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
             }
             if (overlap * overlap < bestOverlap * bestOverlap * lengthSquared)
             {
+                double crossAxis[3];
+                Cross3(first->columns[firstAxis], second->columns[secondAxis], crossAxis);
                 double length = SquareRoot(lengthSquared);
                 bestOverlap = overlap / length;
                 double sign = distance < 0.0 ? -1.0 : 1.0;
@@ -1697,6 +1765,641 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
         }
     }
     return outManifold->count != 0u;
+}
+
+// === Контакты с миром ===
+//
+// Проверка «угол тела внутри блока» пропускает целые классы касаний.
+// Повёрнутый на 45 градусов куб опирается на столб рёбрами: ни один его
+// угол внутрь блока не попадает, и тело проваливается сквозь опору. И даже
+// когда угол внутри, выталкивать его по ближайшей грани того самого блока
+// нельзя — у пола в один слой открыта и нижняя грань, ближайшей она
+// оказывается уже на половине погружения, и тело уезжает вниз сквозь пол.
+//
+// Поэтому окрестность тела собирается заново: сплошные клетки под его AABB
+// склеиваются жадным разбиением в крупные коробки, грани, упирающиеся в
+// соседнюю сплошную клетку, выбрасываются, и с каждой коробкой строится
+// обычный граневой manifold — тот же, что и между двумя телами. Склейка
+// заодно убирает внутренние рёбра: у слитой плиты пола боковых граней
+// просто нет, и тело не цепляется за стыки блоков.
+
+// Ядро выборки на один проход и её полный размер вместе с гало в одну
+// клетку: гало нужно только чтобы отличить настоящую поверхность от
+// границы выборки. Восемь клеток по оси дают ровно 512 бит.
+#define RIGID_BLOCK_TILE 6
+#define RIGID_BLOCK_SAMPLE (RIGID_BLOCK_TILE + 2)
+#define RIGID_BLOCK_SAMPLE_CELLS (RIGID_BLOCK_SAMPLE * RIGID_BLOCK_SAMPLE * RIGID_BLOCK_SAMPLE)
+#define RIGID_BLOCK_SAMPLE_WORDS (RIGID_BLOCK_SAMPLE_CELLS / 64)
+// Тело, накрывающее больше этого числа клеток, с миром не сталкивается:
+// обход его окрестности стоил бы дороже всего шага. Это предел размера
+// тела, а не скорости; см. контракт в заголовке.
+#define RIGID_BLOCK_MAX_CELLS ((int32_t)VOXEL_RIGID_MAX_WORLD_CELLS)
+
+static bool AddInt64Checked(int64_t left, int64_t right, int64_t *outValue)
+{
+    if (right > 0 && left > INT64_MAX - right)
+    {
+        return false;
+    }
+    if (right < 0 && left < INT64_MIN - right)
+    {
+        return false;
+    }
+    *outValue = left + right;
+    return true;
+}
+
+// Клетки выборки: solid хранит ответ мира, known — был ли вопрос задан,
+// claimed — вошла ли клетка в уже выданную коробку.
+typedef struct BlockSample
+{
+    const VoxelCollisionSource *collision;
+    int64_t origin[3];
+    uint64_t solid[RIGID_BLOCK_SAMPLE_WORDS];
+    uint64_t known[RIGID_BLOCK_SAMPLE_WORDS];
+    uint64_t claimed[RIGID_BLOCK_SAMPLE_WORDS];
+} BlockSample;
+
+static uint32_t SampleIndex(int32_t x, int32_t y, int32_t z)
+{
+    return (uint32_t)((z * RIGID_BLOCK_SAMPLE + y) * RIGID_BLOCK_SAMPLE + x);
+}
+
+static bool SampleBit(const uint64_t *bits, uint32_t index)
+{
+    return (bits[index >> 6] & (UINT64_C(1) << (index & 63u))) != 0u;
+}
+
+static void SampleBitRaise(uint64_t *bits, uint32_t index)
+{
+    bits[index >> 6] |= UINT64_C(1) << (index & 63u);
+}
+
+// Координаты — внутри выборки, вместе с гало. Мир опрашивается лениво: у
+// летящего тела ядро почти всегда пустое, и платить за гало незачем.
+static bool SampleSolid(BlockSample *sample, int32_t x, int32_t y, int32_t z)
+{
+    if (x < 0 || y < 0 || z < 0 || x >= RIGID_BLOCK_SAMPLE || y >= RIGID_BLOCK_SAMPLE ||
+        z >= RIGID_BLOCK_SAMPLE)
+    {
+        // За пределами выборки мир неизвестен. Считать его сплошным
+        // безопаснее: неизвестная грань не станет направлением выталкивания.
+        return true;
+    }
+    uint32_t index = SampleIndex(x, y, z);
+    if (SampleBit(sample->known, index))
+    {
+        return SampleBit(sample->solid, index);
+    }
+    int32_t local[3] = {x, y, z};
+    int64_t world[3];
+    bool solid = true;
+    bool valid = true;
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        valid = valid && AddInt64Checked(sample->origin[axis], local[axis], &world[axis]);
+    }
+    if (valid)
+    {
+        solid = BlockIsSolid(sample->collision, world[0], world[1], world[2]);
+    }
+    SampleBitRaise(sample->known, index);
+    if (solid)
+    {
+        SampleBitRaise(sample->solid, index);
+    }
+    return solid;
+}
+
+// Свободна для склейки: клетка сплошная и ещё не вошла в другую коробку.
+// Спрашивается только про ядро, где ответ мира уже получен.
+static bool SampleMergeable(const BlockSample *sample, int32_t x, int32_t y, int32_t z)
+{
+    uint32_t index = SampleIndex(x + 1, y + 1, z + 1);
+    return SampleBit(sample->solid, index) && !SampleBit(sample->claimed, index);
+}
+
+// Полупротяжённость коробки, выровненной по осям, вдоль произвольной оси.
+static double AxisAlignedRadius(const double half[3], const double axis[3])
+{
+    return half[0] * AbsoluteDouble(axis[0]) + half[1] * AbsoluteDouble(axis[1]) +
+           half[2] * AbsoluteDouble(axis[2]);
+}
+
+// Отсечение опорной гранью даёт до восьми точек, а решателю нужно четыре.
+// Брать первые попавшиеся нельзя: у повёрнутого куба на столбе они лежат по
+// одну сторону от центра масс, и тело заваливается на ровном месте. Поэтому
+// остаются самая глубокая точка, самая от неё далёкая и две крайние по
+// разные стороны от их линии — четырёхугольник наибольшей площади.
+// Вход без const намеренно: в ISO C до C23 указатель на массив нельзя
+// молча подставить под указатель на массив с добавленным квалификатором,
+// и gcc с -Wpedantic это отвергает.
+static void ReduceManifoldPoints(double points[8][3], const double depths[8], uint32_t count,
+                                 const double normal[3], BoxManifold *outManifold)
+{
+    uint32_t chosen[RIGID_MANIFOLD_POINTS];
+    uint32_t chosenCount = 0u;
+    if (count <= RIGID_MANIFOLD_POINTS)
+    {
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            chosen[chosenCount++] = index;
+        }
+    }
+    else
+    {
+        uint32_t deepest = 0u;
+        for (uint32_t index = 1; index < count; ++index)
+        {
+            if (depths[index] > depths[deepest])
+            {
+                deepest = index;
+            }
+        }
+        uint32_t farthest = deepest;
+        double bestDistance = -1.0;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            double delta[3];
+            for (int32_t axis = 0; axis < 3; ++axis)
+            {
+                delta[axis] = points[index][axis] - points[deepest][axis];
+            }
+            double distance = Dot3(delta, delta);
+            if (distance > bestDistance)
+            {
+                bestDistance = distance;
+                farthest = index;
+            }
+        }
+        double reference[3];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            reference[axis] = points[farthest][axis] - points[deepest][axis];
+        }
+        uint32_t positive = deepest;
+        uint32_t negative = deepest;
+        double bestPositive = 0.0;
+        double bestNegative = 0.0;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            double delta[3];
+            for (int32_t axis = 0; axis < 3; ++axis)
+            {
+                delta[axis] = points[index][axis] - points[deepest][axis];
+            }
+            double area[3];
+            Cross3(reference, delta, area);
+            double signedArea = Dot3(area, normal);
+            if (signedArea > bestPositive)
+            {
+                bestPositive = signedArea;
+                positive = index;
+            }
+            if (signedArea < bestNegative)
+            {
+                bestNegative = signedArea;
+                negative = index;
+            }
+        }
+        uint32_t candidates[RIGID_MANIFOLD_POINTS] = {deepest, farthest, positive, negative};
+        for (uint32_t slot = 0; slot < RIGID_MANIFOLD_POINTS; ++slot)
+        {
+            bool duplicate = false;
+            for (uint32_t other = 0; other < chosenCount; ++other)
+            {
+                duplicate = duplicate || chosen[other] == candidates[slot];
+            }
+            if (!duplicate)
+            {
+                chosen[chosenCount++] = candidates[slot];
+            }
+        }
+    }
+
+    outManifold->count = 0u;
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outManifold->normal[axis] = normal[axis];
+    }
+    for (uint32_t slot = 0; slot < chosenCount; ++slot)
+    {
+        uint32_t source = chosen[slot];
+        uint32_t target = outManifold->count++;
+        outManifold->depth[target] = depths[source];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            outManifold->point[target][axis] = points[source][axis];
+        }
+    }
+}
+
+// Manifold тела и коробки блоков. От BuildBoxManifold отличается тем, что
+// направление выталкивания выбирается только среди открытых граней блока:
+// толкать тело внутрь соседнего сплошного блока нельзя, каким бы малым ни
+// было там проникновение. Разделение по-прежнему проверяется полным SAT,
+// иначе повёрнутый куб «касался» бы блока, до которого ему ещё далеко.
+static bool BuildBlockManifold(const RigidBodyCache *cache, const double *halfExtent,
+                               const double blockCentre[3], const double blockHalf[3],
+                               uint32_t exposedMask, BoxManifold *outManifold)
+{
+    if (exposedMask == 0u)
+    {
+        return false;
+    }
+    double separation[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        separation[axis] = cache->position[axis] - blockCentre[axis];
+    }
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        const double *direction = cache->columns[axis];
+        double reach =
+            BoxRadius(cache, halfExtent, direction) + AxisAlignedRadius(blockHalf, direction);
+        if (reach - AbsoluteDouble(Dot3(separation, direction)) <= 0.0)
+        {
+            return false;
+        }
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double direction[3] = {0.0, 0.0, 0.0};
+        direction[axis] = 1.0;
+        double reach = BoxRadius(cache, halfExtent, direction) + blockHalf[axis];
+        if (reach - AbsoluteDouble(separation[axis]) <= 0.0)
+        {
+            return false;
+        }
+    }
+    for (int32_t bodyAxis = 0; bodyAxis < 3; ++bodyAxis)
+    {
+        for (int32_t worldAxis = 0; worldAxis < 3; ++worldAxis)
+        {
+            double unit[3] = {0.0, 0.0, 0.0};
+            unit[worldAxis] = 1.0;
+            double crossAxis[3];
+            Cross3(cache->columns[bodyAxis], unit, crossAxis);
+            if (!(Dot3(crossAxis, crossAxis) > 1.0e-12))
+            {
+                continue;
+            }
+            double reach =
+                BoxRadius(cache, halfExtent, crossAxis) + AxisAlignedRadius(blockHalf, crossAxis);
+            if (reach - AbsoluteDouble(Dot3(separation, crossAxis)) <= 0.0)
+            {
+                return false;
+            }
+        }
+    }
+
+    // Расстояние, на которое пришлось бы вынести тело в каждую сторону.
+    // Минимум среди открытых граней и есть выход наружу.
+    int32_t bestAxis = -1;
+    double bestSign = 1.0;
+    double bestDepth = DBL_MAX;
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double unit[3] = {0.0, 0.0, 0.0};
+        unit[axis] = 1.0;
+        double reach = BoxRadius(cache, halfExtent, unit) + blockHalf[axis];
+        for (int32_t direction = 0; direction < 2; ++direction)
+        {
+            if ((exposedMask & (1u << (axis * 2 + direction))) == 0u)
+            {
+                continue;
+            }
+            double sign = direction == 0 ? -1.0 : 1.0;
+            double depth = reach - sign * separation[axis];
+            if (depth < bestDepth)
+            {
+                bestDepth = depth;
+                bestAxis = axis;
+                bestSign = sign;
+            }
+        }
+    }
+    if (bestAxis < 0 || !(bestDepth > 0.0))
+    {
+        return false;
+    }
+
+    double referenceNormal[3] = {0.0, 0.0, 0.0};
+    referenceNormal[bestAxis] = bestSign;
+
+    double incidentVertices[4][3];
+    IncidentFace(cache, halfExtent, referenceNormal, incidentVertices);
+
+    double polygon[8][3];
+    double clipped[8][3];
+    uint32_t count = 4u;
+    for (uint32_t index = 0; index < 4u; ++index)
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            polygon[index][axis] = incidentVertices[index][axis];
+        }
+    }
+    for (int32_t side = 1; side < 3; ++side)
+    {
+        int32_t axisIndex = (bestAxis + side) % 3;
+        double unit[3] = {0.0, 0.0, 0.0};
+        unit[axisIndex] = 1.0;
+        count = ClipAgainstPlane(polygon, count, unit,
+                                 blockCentre[axisIndex] + blockHalf[axisIndex], clipped);
+        if (count == 0u)
+        {
+            return false;
+        }
+        double negated[3] = {0.0, 0.0, 0.0};
+        negated[axisIndex] = -1.0;
+        count = ClipAgainstPlane(clipped, count, negated,
+                                 -(blockCentre[axisIndex] - blockHalf[axisIndex]), polygon);
+        if (count == 0u)
+        {
+            return false;
+        }
+    }
+
+    double planeDistance = Dot3(blockCentre, referenceNormal) + blockHalf[bestAxis];
+    double points[8][3];
+    double depths[8];
+    uint32_t kept = 0u;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        double depth = planeDistance - Dot3(polygon[index], referenceNormal);
+        if (depth <= 0.0)
+        {
+            continue;
+        }
+        depths[kept] = depth;
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            points[kept][axis] = polygon[index][axis];
+        }
+        ++kept;
+    }
+    if (kept == 0u)
+    {
+        return false;
+    }
+    ReduceManifoldPoints(points, depths, kept, referenceNormal, outManifold);
+    return outManifold->count != 0u;
+}
+
+static bool AppendWorldManifold(const VoxelRigidBody *body, uint32_t index,
+                                const BoxManifold *manifold, RigidStepScratch *scratch)
+{
+    for (uint32_t point = 0; point < manifold->count; ++point)
+    {
+        RigidContact contact = {0};
+        contact.bodyIndex = index;
+        contact.otherIndex = UINT32_MAX;
+        contact.depth = manifold->depth[point];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            contact.normal[axis] = manifold->normal[axis];
+            contact.point[axis] = manifold->point[point][axis];
+        }
+        contact.restitution = body->restitution;
+        contact.friction = body->friction;
+        scratch->caches[index].hasWorldContact = true;
+        if (!AppendContact(scratch, &contact))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Грань открыта, если хотя бы одна соседняя клетка за ней пуста. Клетки за
+// границей выборки считаются сплошными: там ничего не известно, а лишняя
+// открытая грань — это выталкивание в неизвестность.
+static uint32_t BlockBoxExposure(BlockSample *sample, const int32_t low[3], const int32_t high[3])
+{
+    uint32_t exposed = 0u;
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        int32_t first = (axis + 1) % 3;
+        int32_t second = (axis + 2) % 3;
+        for (int32_t direction = 0; direction < 2; ++direction)
+        {
+            int32_t plane = direction == 0 ? low[axis] - 1 : high[axis] + 1;
+            bool open = false;
+            for (int32_t alongFirst = low[first]; alongFirst <= high[first] && !open; ++alongFirst)
+            {
+                for (int32_t alongSecond = low[second]; alongSecond <= high[second] && !open;
+                     ++alongSecond)
+                {
+                    int32_t cell[3];
+                    cell[axis] = plane;
+                    cell[first] = alongFirst;
+                    cell[second] = alongSecond;
+                    open = !SampleSolid(sample, cell[0] + 1, cell[1] + 1, cell[2] + 1);
+                }
+            }
+            if (open)
+            {
+                exposed |= 1u << (axis * 2 + direction);
+            }
+        }
+    }
+    return exposed;
+}
+
+// Разбирает одну выборку на коробки и выдаёт по ним контакты. false —
+// переполнение общего бюджета контактов шага, дальше идти незачем.
+static bool CollectSampleContacts(const VoxelRigidBody *body, uint32_t index,
+                                  const RigidBodyCache *cache, BlockSample *sample,
+                                  const int32_t coreSize[3], RigidStepScratch *scratch)
+{
+    bool anySolid = false;
+    for (int32_t z = 0; z < coreSize[2]; ++z)
+    {
+        for (int32_t y = 0; y < coreSize[1]; ++y)
+        {
+            for (int32_t x = 0; x < coreSize[0]; ++x)
+            {
+                anySolid = SampleSolid(sample, x + 1, y + 1, z + 1) || anySolid;
+            }
+        }
+    }
+    if (!anySolid)
+    {
+        return true;
+    }
+
+    for (int32_t z = 0; z < coreSize[2]; ++z)
+    {
+        for (int32_t y = 0; y < coreSize[1]; ++y)
+        {
+            for (int32_t x = 0; x < coreSize[0]; ++x)
+            {
+                if (!SampleMergeable(sample, x, y, z))
+                {
+                    continue;
+                }
+                // Жадная склейка: сначала вдоль X, потом целыми рядами по Y,
+                // потом целыми слоями по Z. Ровный пол так превращается в
+                // одну плиту, и внутренних граней у него не остаётся.
+                int32_t low[3] = {x, y, z};
+                int32_t high[3] = {x, y, z};
+                while (high[0] + 1 < coreSize[0] && SampleMergeable(sample, high[0] + 1, y, z))
+                {
+                    ++high[0];
+                }
+                bool grow = true;
+                while (grow && high[1] + 1 < coreSize[1])
+                {
+                    for (int32_t along = low[0]; along <= high[0] && grow; ++along)
+                    {
+                        grow = SampleMergeable(sample, along, high[1] + 1, z);
+                    }
+                    if (grow)
+                    {
+                        ++high[1];
+                    }
+                }
+                grow = true;
+                while (grow && high[2] + 1 < coreSize[2])
+                {
+                    for (int32_t alongX = low[0]; alongX <= high[0] && grow; ++alongX)
+                    {
+                        for (int32_t alongY = low[1]; alongY <= high[1] && grow; ++alongY)
+                        {
+                            grow = SampleMergeable(sample, alongX, alongY, high[2] + 1);
+                        }
+                    }
+                    if (grow)
+                    {
+                        ++high[2];
+                    }
+                }
+                for (int32_t claimZ = low[2]; claimZ <= high[2]; ++claimZ)
+                {
+                    for (int32_t claimY = low[1]; claimY <= high[1]; ++claimY)
+                    {
+                        for (int32_t claimX = low[0]; claimX <= high[0]; ++claimX)
+                        {
+                            SampleBitRaise(sample->claimed,
+                                           SampleIndex(claimX + 1, claimY + 1, claimZ + 1));
+                        }
+                    }
+                }
+
+                double blockCentre[3];
+                double blockHalf[3];
+                bool valid = true;
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    int64_t start = 0;
+                    valid = valid && AddInt64Checked(sample->origin[axis], low[axis] + 1, &start);
+                    blockHalf[axis] = (double)(high[axis] - low[axis] + 1) * 0.5;
+                    blockCentre[axis] = valid ? (double)start + blockHalf[axis] : 0.0;
+                }
+                if (!valid)
+                {
+                    continue;
+                }
+                uint32_t exposed = BlockBoxExposure(sample, low, high);
+                BoxManifold manifold;
+                if (!BuildBlockManifold(cache, body->halfExtent, blockCentre, blockHalf, exposed,
+                                        &manifold))
+                {
+                    continue;
+                }
+                if (!AppendWorldManifold(body, index, &manifold, scratch))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void CollectWorldContacts(const VoxelRigidBody *bodies, uint32_t bodyCount,
+                                 const VoxelCollisionSource *collision, RigidStepScratch *scratch)
+{
+    (void)bodyCount;
+    BlockSample sample;
+    sample.collision = collision;
+    for (uint32_t ordered = 0; ordered < scratch->activeCount; ++ordered)
+    {
+        uint32_t index = scratch->order[ordered];
+        const RigidBodyCache *cache = &scratch->caches[index];
+        if (!bodies[index].active || bodies[index].sleeping || !cache->collidable)
+        {
+            continue;
+        }
+
+        int64_t blockMin[3];
+        int64_t blockMax[3];
+        uint64_t span[3];
+        bool valid = true;
+        for (int32_t axis = 0; axis < 3 && valid; ++axis)
+        {
+            valid = TryFloorToInt64(cache->aabbMin[axis], &blockMin[axis]) &&
+                    TryFloorToInt64(cache->aabbMax[axis], &blockMax[axis]);
+        }
+        uint64_t cells = 1u;
+        for (int32_t axis = 0; axis < 3 && valid; ++axis)
+        {
+            span[axis] = (uint64_t)blockMax[axis] - (uint64_t)blockMin[axis] + 1u;
+            valid = span[axis] <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
+            cells = valid ? cells * span[axis] : cells;
+            valid = valid && cells <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
+        }
+        if (!valid)
+        {
+            continue;
+        }
+
+        uint32_t tiles[3];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            tiles[axis] = (uint32_t)((span[axis] + RIGID_BLOCK_TILE - 1u) / RIGID_BLOCK_TILE);
+        }
+        for (uint32_t tileZ = 0; tileZ < tiles[2]; ++tileZ)
+        {
+            for (uint32_t tileY = 0; tileY < tiles[1]; ++tileY)
+            {
+                for (uint32_t tileX = 0; tileX < tiles[0]; ++tileX)
+                {
+                    uint32_t tile[3] = {tileX, tileY, tileZ};
+                    int32_t coreSize[3];
+                    bool ready = true;
+                    for (int32_t axis = 0; axis < 3; ++axis)
+                    {
+                        // Смещение не больше общего числа клеток, а оно уже
+                        // проверено: сумма остаётся внутри blockMax.
+                        int64_t start =
+                            blockMin[axis] + (int64_t)tile[axis] * (int64_t)RIGID_BLOCK_TILE;
+                        int64_t remaining = blockMax[axis] - start + 1;
+                        coreSize[axis] =
+                            remaining < RIGID_BLOCK_TILE ? (int32_t)remaining : RIGID_BLOCK_TILE;
+                        ready = ready && AddInt64Checked(start, -1, &sample.origin[axis]);
+                    }
+                    if (!ready)
+                    {
+                        continue;
+                    }
+                    // Exact fixed-array bounds; Annex K is not available in the no-CRT runtime.
+                    // NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+                    memset(sample.solid, 0, sizeof(sample.solid));
+                    memset(sample.known, 0, sizeof(sample.known));
+                    memset(sample.claimed, 0, sizeof(sample.claimed));
+                    // NOLINTEND(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+                    if (!CollectSampleContacts(&bodies[index], index, cache, &sample, coreSize,
+                                               scratch))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Cell width bounds world-space AABB diameters, including rotated boxes.
@@ -1803,13 +2506,21 @@ static bool BuildBroadphase(const VoxelRigidBody *bodies, uint32_t bodyCount,
     for (uint32_t ordered = scratch->activeCount; ordered > 0u; --ordered)
     {
         uint32_t index = scratch->order[ordered - 1u];
+        RigidGridEntry *entry = &scratch->grid[index];
+        entry->next = RIGID_HASH_EMPTY;
         scratch->next[index] = RIGID_HASH_EMPTY;
         if (!bodies[index].active || !scratch->caches[index].collidable)
         {
             continue;
         }
         uint32_t bucket = CellHash(scratch->caches[index].cell, mask);
-        scratch->next[index] = scratch->buckets[bucket];
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            entry->cell[axis] = scratch->caches[index].cell[axis];
+        entry->stableOrder = ordered - 1u;
+        entry->next = scratch->buckets[bucket];
+        // Wake traversal rejects mostly awake bodies before needing cell data.
+        // Keep its existing dense links; indexed queries reuse this array later.
+        scratch->next[index] = entry->next;
         scratch->buckets[bucket] = index;
     }
     return true;
@@ -1997,10 +2708,13 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
                     for (uint32_t second = scratch->buckets[bucket]; second != RIGID_HASH_EMPTY;
                          second = scratch->next[second])
                     {
-                        RigidBodyCache *secondCache = &scratch->caches[second];
-                        if (!bodies[second].sleeping || secondCache->cell[0] != neighbour[0] ||
-                            secondCache->cell[1] != neighbour[1] ||
-                            secondCache->cell[2] != neighbour[2])
+                        // Most neighbours in an active island are already awake.
+                        // Reject them before loading their grid coordinates.
+                        if (!bodies[second].sleeping)
+                            continue;
+                        const RigidGridEntry *entry = &scratch->grid[second];
+                        if (entry->cell[0] != neighbour[0] || entry->cell[1] != neighbour[1] ||
+                            entry->cell[2] != neighbour[2])
                         {
                             continue;
                         }
@@ -2101,26 +2815,73 @@ static void GridNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
         uint32_t outputEnd = job->writing && ordered + 1u < scratch->activeCount
                                  ? scratch->wakeQueue[scratch->order[ordered + 1u]]
                                  : job->outputEnd;
+        RigidNarrowphasePoint *saved =
+            &scratch->narrowphasePoints[(size_t)first * RIGID_NARROWPHASE_POINTS_PER_BODY];
+        if (job->writing && output <= outputEnd &&
+            outputEnd - output <= RIGID_NARROWPHASE_POINTS_PER_BODY)
+        {
+            for (uint32_t point = 0u; output < outputEnd; ++point)
+            {
+                uint32_t second = saved[point].otherIndex;
+                RigidContact contact = {0};
+                contact.bodyIndex = first;
+                contact.otherIndex = second;
+                contact.depth = saved[point].depth;
+                contact.restitution = bodies[first].restitution < bodies[second].restitution
+                                          ? bodies[first].restitution
+                                          : bodies[second].restitution;
+                contact.friction = bodies[first].friction < bodies[second].friction
+                                       ? bodies[first].friction
+                                       : bodies[second].friction;
+                for (uint32_t axis = 0u; axis < 3u; ++axis)
+                {
+                    contact.point[axis] = saved[point].point[axis];
+                    contact.normal[axis] = saved[point].normal[axis];
+                }
+                scratch->contacts[output++] = contact;
+            }
+            scratch->caches[first].candidatePairs = 0u;
+            continue;
+        }
         if (!bodies[first].sleeping && firstCache->collidable)
         {
+            // Головы всех двадцати семи цепочек читаются заранее: чтения
+            // независимы и уходят в память одновременно, а не по очереди
+            // после каждой пройденной цепочки. Порядок обхода прежний.
+            uint32_t heads[27];
+            uint32_t head = 0u;
             for (int32_t dx = -1; dx <= 1; ++dx)
             {
                 for (int32_t dy = -1; dy <= 1; ++dy)
                 {
                     for (int32_t dz = -1; dz <= 1; ++dz)
                     {
-                        int64_t neighbour[3] = {firstCache->cell[0] + dx, firstCache->cell[1] + dy,
-                                                firstCache->cell[2] + dz};
-                        uint32_t bucket = CellHash(neighbour, mask);
-                        for (uint32_t second = scratch->buckets[bucket]; second != RIGID_HASH_EMPTY;
-                             second = scratch->next[second])
+                        const int64_t neighbour[3] = {firstCache->cell[0] + dx,
+                                                      firstCache->cell[1] + dy,
+                                                      firstCache->cell[2] + dz};
+                        heads[head++] = scratch->buckets[CellHash(neighbour, mask)];
+                    }
+                }
+            }
+            head = 0u;
+            for (int32_t dx = -1; dx <= 1; ++dx)
+            {
+                for (int32_t dy = -1; dy <= 1; ++dy)
+                {
+                    for (int32_t dz = -1; dz <= 1; ++dz)
+                    {
+                        const int64_t neighbour[3] = {firstCache->cell[0] + dx,
+                                                      firstCache->cell[1] + dy,
+                                                      firstCache->cell[2] + dz};
+                        for (uint32_t second = heads[head++]; second != RIGID_HASH_EMPTY;
+                             second = scratch->grid[second].next)
                         {
-                            const RigidBodyCache *secondCache = &scratch->caches[second];
-                            if (secondCache->cell[0] != neighbour[0] ||
-                                secondCache->cell[1] != neighbour[1] ||
-                                secondCache->cell[2] != neighbour[2] || bodies[second].sleeping ||
-                                bodies[second].stableId <= bodies[first].stableId)
+                            const RigidGridEntry *entry = &scratch->grid[second];
+                            if (entry->cell[0] != neighbour[0] || entry->cell[1] != neighbour[1] ||
+                                entry->cell[2] != neighbour[2] || entry->stableOrder <= ordered ||
+                                bodies[second].sleeping)
                                 continue;
+                            const RigidBodyCache *secondCache = &scratch->caches[second];
                             ++pairs;
                             BoxManifold manifold;
                             if (!BuildBoxManifold(firstCache, bodies[first].halfExtent, secondCache,
@@ -2144,6 +2905,23 @@ static void GridNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
                                 {
                                     scratch->contacts[output++] = PairContact(
                                         first, second, &manifold, point, restitution, friction);
+                                }
+                            }
+                            else
+                            {
+                                for (uint32_t point = 0u;
+                                     point < manifold.count &&
+                                     count + point < RIGID_NARROWPHASE_POINTS_PER_BODY;
+                                     ++point)
+                                {
+                                    RigidNarrowphasePoint *destination = &saved[count + point];
+                                    destination->otherIndex = second;
+                                    destination->depth = manifold.depth[point];
+                                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                                    {
+                                        destination->point[axis] = manifold.point[point][axis];
+                                        destination->normal[axis] = manifold.normal[axis];
+                                    }
                                 }
                             }
                             count += manifold.count;
@@ -2172,9 +2950,9 @@ static bool CollectGridContactsParallel(const VoxelRigidBody *bodies, RigidStepS
     ExecuteRange(scratch, scratch->activeCount, 32u, GridNarrowphaseRange, &job);
     uint32_t worldCount = scratch->contactCount;
     uint32_t total = worldCount;
-    // A canonical prefix sum assigns disjoint output ranges. SAT is regenerated
-    // in the second pass, avoiding a per-pair temporary allocation and any fixed
-    // per-body contact limit (one large box may touch hundreds of small boxes).
+    // A canonical prefix sum assigns disjoint output ranges. The second pass
+    // copies cached geometry when it fits, otherwise regenerates every contact.
+    // One large box may still touch hundreds of small boxes without truncation.
     for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
     {
         uint32_t first = scratch->order[ordered];
@@ -2253,35 +3031,55 @@ static bool CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
             }
             continue;
         }
-        // StableId filters, rather than cell ordering, select each pair once.
+        // The rank in unique stableId order selects each pair once, without
+        // loading the public body or large solver cache for hash collisions.
+        // Головы всех двадцати семи цепочек читаются заранее, одним проходом.
+        // Раньше очередная корзина запрашивалась только после того, как
+        // предыдущая цепочка была пройдена до конца, и двадцать семь промахов
+        // мимо кэша выстраивались друг за другом. Независимые чтения процессор
+        // держит в полёте одновременно, и ожидание памяти складывается не в
+        // сумму, а почти в один промах. Порядок обхода не меняется: соседи
+        // перебираются ровно в том же порядке dx, dy, dz.
+        uint32_t heads[27];
+        uint32_t head = 0u;
         for (int32_t dx = -1; dx <= 1; ++dx)
         {
             for (int32_t dy = -1; dy <= 1; ++dy)
             {
                 for (int32_t dz = -1; dz <= 1; ++dz)
                 {
-                    int64_t neighbour[3] = {firstCache->cell[0] + dx, firstCache->cell[1] + dy,
-                                            firstCache->cell[2] + dz};
-                    uint32_t bucket = CellHash(neighbour, mask);
-                    for (uint32_t second = scratch->buckets[bucket]; second != RIGID_HASH_EMPTY;
-                         second = scratch->next[second])
+                    const int64_t neighbour[3] = {firstCache->cell[0] + dx,
+                                                  firstCache->cell[1] + dy,
+                                                  firstCache->cell[2] + dz};
+                    heads[head++] = scratch->buckets[CellHash(neighbour, mask)];
+                }
+            }
+        }
+        head = 0u;
+        for (int32_t dx = -1; dx <= 1; ++dx)
+        {
+            for (int32_t dy = -1; dy <= 1; ++dy)
+            {
+                for (int32_t dz = -1; dz <= 1; ++dz)
+                {
+                    const int64_t neighbour[3] = {firstCache->cell[0] + dx,
+                                                  firstCache->cell[1] + dy,
+                                                  firstCache->cell[2] + dz};
+                    for (uint32_t second = heads[head++]; second != RIGID_HASH_EMPTY;
+                         second = scratch->grid[second].next)
                     {
                         // Хеш не является координатой: несколько из 27
                         // соседних ключей часто попадают в одну корзину. Без
                         // точной проверки ячейки одна пара добавлялась бы
                         // несколько раз и получала бы лишний импульс.
-                        const int64_t *secondCell = scratch->caches[second].cell;
+                        const RigidGridEntry *entry = &scratch->grid[second];
+                        const int64_t *secondCell = entry->cell;
                         if (secondCell[0] != neighbour[0] || secondCell[1] != neighbour[1] ||
                             secondCell[2] != neighbour[2])
                         {
                             continue;
                         }
-                        if (second == first)
-                        {
-                            continue;
-                        }
-                        if (bodies[second].sleeping ||
-                            bodies[second].stableId <= bodies[first].stableId)
+                        if (entry->stableOrder <= ordered || bodies[second].sleeping)
                         {
                             continue;
                         }
@@ -2310,13 +3108,8 @@ static void ApplyInverseInertia(const RigidBodyCache *cache, const double invers
     }
 }
 
-static void ContactVelocity(const RigidBodyCache *cache, const double point[3], double out[3])
+static void ContactVelocity(const RigidBodyCache *cache, const double lever[3], double out[3])
 {
-    double lever[3];
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        lever[axis] = point[axis] - cache->position[axis];
-    }
     double rotational[3];
     Cross3(cache->angular, lever, rotational);
     for (int32_t axis = 0; axis < 3; ++axis)
@@ -2326,14 +3119,9 @@ static void ContactVelocity(const RigidBodyCache *cache, const double point[3], 
 }
 
 static double PrepareImpulseResponse(const VoxelRigidBody *body, const RigidBodyCache *cache,
-                                     const double point[3], const double direction[3],
+                                     const double lever[3], const double direction[3],
                                      double angularResponse[3])
 {
-    double lever[3];
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        lever[axis] = point[axis] - cache->position[axis];
-    }
     double torque[3];
     Cross3(lever, direction, torque);
     ApplyInverseInertia(cache, body->inverseInertia, torque, angularResponse);
@@ -2378,11 +3166,11 @@ static void BuildTangents(const double normal[3], double first[3], double second
 static void RelativeContactVelocity(const RigidContact *contact, const RigidStepScratch *scratch,
                                     double velocity[3])
 {
-    ContactVelocity(&scratch->caches[contact->bodyIndex], contact->point, velocity);
+    ContactVelocity(&scratch->caches[contact->bodyIndex], contact->lever[0], velocity);
     if (contact->otherIndex != UINT32_MAX)
     {
         double otherVelocity[3];
-        ContactVelocity(&scratch->caches[contact->otherIndex], contact->point, otherVelocity);
+        ContactVelocity(&scratch->caches[contact->otherIndex], contact->lever[1], otherVelocity);
         for (int32_t axis = 0; axis < 3; ++axis)
         {
             velocity[axis] -= otherVelocity[axis];
@@ -2390,16 +3178,10 @@ static void RelativeContactVelocity(const RigidContact *contact, const RigidStep
     }
 }
 
-static double TangentCoupling(const RigidBodyCache *cache, const RigidContact *contact,
-                              uint32_t endpoint)
+static double TangentCoupling(const RigidContact *contact, uint32_t endpoint)
 {
-    double lever[3];
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        lever[axis] = contact->point[axis] - cache->position[axis];
-    }
     double torque[3];
-    Cross3(lever, contact->rows[1].direction, torque);
+    Cross3(contact->lever[endpoint], contact->rows[1].direction, torque);
     return Dot3(torque, contact->rows[2].angularResponse[endpoint]);
 }
 
@@ -2414,6 +3196,10 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         bool paired = contact->otherIndex != UINT32_MAX;
         for (int32_t axis = 0; axis < 3; ++axis)
         {
+            contact->lever[0][axis] = contact->point[axis] - cache->position[axis];
+            contact->lever[1][axis] =
+                paired ? contact->point[axis] - scratch->caches[contact->otherIndex].position[axis]
+                       : 0.0;
             contact->rows[0].direction[axis] = contact->normal[axis];
         }
         BuildTangents(contact->normal, contact->rows[1].direction, contact->rows[2].direction);
@@ -2421,23 +3207,23 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         for (uint32_t direction = 0; direction < 3u; ++direction)
         {
             RigidConstraintRow *row = &contact->rows[direction];
-            double mass = PrepareImpulseResponse(body, cache, contact->point, row->direction,
+            double mass = PrepareImpulseResponse(body, cache, contact->lever[0], row->direction,
                                                  row->angularResponse[0]);
             if (paired)
             {
                 mass += PrepareImpulseResponse(
                     &bodies[contact->otherIndex], &scratch->caches[contact->otherIndex],
-                    contact->point, row->direction, row->angularResponse[1]);
+                    contact->lever[1], row->direction, row->angularResponse[1]);
             }
             masses[direction] = mass;
             row->inverseEffectiveMass = mass > 0.0 && IsFiniteDouble(mass) ? 1.0 / mass : 0.0;
         }
         // Solve the two coupled tangential directions as a 2x2 block, then
         // project the TOTAL impulse onto the Coulomb disk (not a per-axis box).
-        double coupling = TangentCoupling(cache, contact, 0u);
+        double coupling = TangentCoupling(contact, 0u);
         if (paired)
         {
-            coupling += TangentCoupling(&scratch->caches[contact->otherIndex], contact, 1u);
+            coupling += TangentCoupling(contact, 1u);
         }
         double determinant = masses[1] * masses[2] - coupling * coupling;
         contact->tangentCrossMass = 0.0;
@@ -2455,6 +3241,7 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         double bias = penetration > 0.0
                           ? settings->penetrationCorrection * penetration / RIGID_STEP_SECONDS
                           : 0.0;
+        bias = bias > RIGID_MAX_RECOVERY_SPEED ? RIGID_MAX_RECOVERY_SPEED : bias;
         double bounce = initialNormalSpeed < -RIGID_RESTITUTION_THRESHOLD
                             ? -contact->restitution * initialNormalSpeed
                             : 0.0;
@@ -2494,14 +3281,9 @@ static void ContactLocalAnchors(const RigidContact *contact, const RigidStepScra
             continue;
         }
         const RigidBodyCache *bodyCache = &scratch->caches[bodyIndex];
-        double relative[3];
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
-            relative[axis] = contact->point[axis] - bodyCache->position[axis];
-        }
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-        {
-            anchors[endpoint][axis] = Dot3(relative, bodyCache->columns[axis]);
+            anchors[endpoint][axis] = Dot3(contact->lever[endpoint], bodyCache->columns[axis]);
         }
     }
 }
@@ -2514,6 +3296,16 @@ static double CacheAnchorDistance(const double first[3], const double second[3])
         difference[axis] = first[axis] - second[axis];
     }
     return Dot3(difference, difference);
+}
+
+static uint32_t ContactRunEnd(const RigidStepScratch *scratch, uint32_t begin)
+{
+    const RigidContact *first = &scratch->contacts[begin];
+    uint32_t end = begin + 1u;
+    while (end < scratch->contactCount && scratch->contacts[end].bodyIndex == first->bodyIndex &&
+           scratch->contacts[end].otherIndex == first->otherIndex)
+        ++end;
+    return end;
 }
 
 static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidContact *contact,
@@ -2532,7 +3324,13 @@ static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidConta
     for (uint32_t index = buckets[bucket]; index != RIGID_HASH_EMPTY; index = entries[index].next)
     {
         const RigidCachedContact *entry = &entries[index];
-        if (entry->used || entry->stableIds[0] != firstId || entry->stableIds[1] != secondId)
+        // Hash collisions may belong to another worker. Only the owner of
+        // this exact pair may read or write its mutable used flag.
+        if (entry->stableIds[0] != firstId || entry->stableIds[1] != secondId)
+        {
+            continue;
+        }
+        if (entry->used)
         {
             continue;
         }
@@ -2566,16 +3364,114 @@ static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidConta
     return best;
 }
 
+static bool PrepareCachedImpulse(RigidContact *contact, const RigidCachedContact *entry)
+{
+    double normalImpulse = Dot3(entry->worldImpulse, contact->normal);
+    double firstImpulse = Dot3(entry->worldImpulse, contact->rows[1].direction);
+    double secondImpulse = Dot3(entry->worldImpulse, contact->rows[2].direction);
+    if (!(normalImpulse > 0.0) || !IsFiniteDouble(normalImpulse) || !IsFiniteDouble(firstImpulse) ||
+        !IsFiniteDouble(secondImpulse))
+    {
+        return false;
+    }
+    double limit = contact->friction * normalImpulse;
+    double largest = AbsoluteDouble(firstImpulse);
+    if (AbsoluteDouble(secondImpulse) > largest)
+    {
+        largest = AbsoluteDouble(secondImpulse);
+    }
+    if (largest > 0.0 && limit < largest * 2.0)
+    {
+        double first = firstImpulse / largest;
+        double second = secondImpulse / largest;
+        double scaledLimit = limit / largest;
+        double lengthSquared = first * first + second * second;
+        if (lengthSquared > scaledLimit * scaledLimit)
+        {
+            double scale = scaledLimit / SquareRoot(lengthSquared);
+            firstImpulse *= scale;
+            secondImpulse *= scale;
+        }
+    }
+    contact->normalImpulse = normalImpulse;
+    contact->tangentImpulse[0] = firstImpulse;
+    contact->tangentImpulse[1] = secondImpulse;
+    return true;
+}
+
+typedef struct RigidWarmMatchJob
+{
+    const VoxelRigidBody *bodies;
+    RigidStepScratch *scratch;
+    RigidCachedContact *entries;
+    const uint32_t *buckets;
+    uint32_t bucketMask;
+} RigidWarmMatchJob;
+
+static void MatchCachedContactsRange(void *context, uint32_t begin, uint32_t end)
+{
+    RigidWarmMatchJob *job = context;
+    RigidStepScratch *scratch = job->scratch;
+    VoxelPhysicsConfigureThread();
+    for (uint32_t cursor = begin; cursor < end;)
+    {
+        const RigidContact *first = &scratch->contacts[cursor];
+        if (cursor != 0u && scratch->contacts[cursor - 1u].bodyIndex == first->bodyIndex &&
+            scratch->contacts[cursor - 1u].otherIndex == first->otherIndex)
+        {
+            // Another range owns this pair's first point and matches the whole
+            // run. Skip only our assigned portion, not a possibly huge tail.
+            ++cursor;
+            continue;
+        }
+        uint32_t last = ContactRunEnd(scratch, cursor);
+        for (uint32_t index = cursor; index < last; ++index)
+        {
+            RigidContact *contact = &scratch->contacts[index];
+            uint32_t match = RIGID_HASH_EMPTY;
+            if (contact->rows[0].inverseEffectiveMass > 0.0)
+            {
+                match = FindCachedContact(job->bodies, contact, scratch, job->entries, job->buckets,
+                                          job->bucketMask);
+            }
+            if (match != RIGID_HASH_EMPTY)
+            {
+                // A chosen old point stays consumed even if its projected
+                // impulse cannot be applied, exactly as in the serial path.
+                job->entries[match].used = true;
+                if (!PrepareCachedImpulse(contact, &job->entries[match]))
+                    match = RIGID_HASH_EMPTY;
+            }
+            // This array is unused until the later solver scheduling phase.
+            scratch->solveOrder[index] = match;
+        }
+        cursor = last;
+    }
+}
+
 static void WarmStartContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratch,
                               VoxelRigidContactCache *contactCache)
 {
     contactCache->matchedContactCount = 0u;
+    if (contactCache->contactCount == 0u)
+        return;
     RigidCachedContact *entries = ContactCacheEntries(contactCache);
     const uint32_t *buckets = ContactCacheBuckets(contactCache);
     uint32_t bucketMask = BucketCountFor(contactCache->bodyCapacity) - 1u;
     for (uint32_t index = 0u; index < contactCache->contactCount; ++index)
     {
         entries[index].used = false;
+    }
+    bool parallelMatch = scratch->options != NULL && scratch->options->executor != NULL &&
+                         scratch->contactCount > 64u;
+    if (parallelMatch)
+    {
+        // Collectors emit each ordered pair in one contiguous run. Matching
+        // needs only prepared geometry, never velocities changed by impulses.
+        // Pair owners can therefore match independently; application stays in
+        // canonical order after the synchronous dispatch barrier.
+        RigidWarmMatchJob job = {bodies, scratch, entries, buckets, bucketMask};
+        ExecuteRange(scratch, scratch->contactCount, 64u, MatchCachedContactsRange, &job);
     }
     for (uint32_t index = 0u; index < scratch->contactCount; ++index)
     {
@@ -2584,46 +3480,23 @@ static void WarmStartContacts(const VoxelRigidBody *bodies, RigidStepScratch *sc
         {
             continue;
         }
-        uint32_t match = FindCachedContact(bodies, contact, scratch, entries, buckets, bucketMask);
+        uint32_t match = parallelMatch ? scratch->solveOrder[index]
+                                       : FindCachedContact(bodies, contact, scratch, entries,
+                                                           buckets, bucketMask);
         if (match == RIGID_HASH_EMPTY)
         {
             continue;
         }
-        RigidCachedContact *entry = &entries[match];
-        entry->used = true;
-        double normalImpulse = Dot3(entry->worldImpulse, contact->normal);
-        double firstImpulse = Dot3(entry->worldImpulse, contact->rows[1].direction);
-        double secondImpulse = Dot3(entry->worldImpulse, contact->rows[2].direction);
-        if (!(normalImpulse > 0.0) || !IsFiniteDouble(normalImpulse) ||
-            !IsFiniteDouble(firstImpulse) || !IsFiniteDouble(secondImpulse))
+        if (!parallelMatch)
         {
-            continue;
+            RigidCachedContact *entry = &entries[match];
+            entry->used = true;
+            if (!PrepareCachedImpulse(contact, entry))
+                continue;
         }
-        double limit = contact->friction * normalImpulse;
-        double largest = AbsoluteDouble(firstImpulse);
-        if (AbsoluteDouble(secondImpulse) > largest)
-        {
-            largest = AbsoluteDouble(secondImpulse);
-        }
-        if (largest > 0.0 && limit < largest * 2.0)
-        {
-            double first = firstImpulse / largest;
-            double second = secondImpulse / largest;
-            double scaledLimit = limit / largest;
-            double lengthSquared = first * first + second * second;
-            if (lengthSquared > scaledLimit * scaledLimit)
-            {
-                double scale = scaledLimit / SquareRoot(lengthSquared);
-                firstImpulse *= scale;
-                secondImpulse *= scale;
-            }
-        }
-        contact->normalImpulse = normalImpulse;
-        contact->tangentImpulse[0] = firstImpulse;
-        contact->tangentImpulse[1] = secondImpulse;
-        ApplyContactImpulse(scratch, contact, 0u, normalImpulse);
-        ApplyContactImpulse(scratch, contact, 1u, firstImpulse);
-        ApplyContactImpulse(scratch, contact, 2u, secondImpulse);
+        ApplyContactImpulse(scratch, contact, 0u, contact->normalImpulse);
+        ApplyContactImpulse(scratch, contact, 1u, contact->tangentImpulse[0]);
+        ApplyContactImpulse(scratch, contact, 2u, contact->tangentImpulse[1]);
         ++contactCache->matchedContactCount;
     }
 }
@@ -2756,16 +3629,6 @@ static void BuildCacheRange(void *context, uint32_t begin, uint32_t end)
     }
 }
 
-static uint32_t ContactRunEnd(const RigidStepScratch *scratch, uint32_t begin)
-{
-    const RigidContact *first = &scratch->contacts[begin];
-    uint32_t end = begin + 1u;
-    while (end < scratch->contactCount && scratch->contacts[end].bodyIndex == first->bodyIndex &&
-           scratch->contacts[end].otherIndex == first->otherIndex)
-        ++end;
-    return end;
-}
-
 static void BuildSolverBatches(RigidStepScratch *scratch)
 {
     uint32_t counts[RIGID_SOLVER_BATCH_COUNT] = {0};
@@ -2856,7 +3719,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
     ProfileFinish(scratch, VOXEL_RIGID_PROFILE_PREPARE, begin);
     begin = ProfileNow(scratch);
     // Complete ALL restitution targets before warm-start changes velocities.
-    // Cache matching/used flags and bucket chains are intentionally serial.
+    // Cache matching is pair-owned; impulse application remains canonical.
     if (contactCache != NULL)
         WarmStartContacts(bodies, scratch, contactCache);
     ProfileFinish(scratch, VOXEL_RIGID_PROFILE_WARM_START, begin);
@@ -3309,6 +4172,10 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     uint8_t *cursor = (uint8_t *)scratch + padding;
     state.caches = (RigidBodyCache *)cursor;
     cursor += (size_t)bodyCount * sizeof(RigidBodyCache);
+    state.grid = (RigidGridEntry *)cursor;
+    cursor += (size_t)bodyCount * sizeof(RigidGridEntry);
+    state.narrowphasePoints = (RigidNarrowphasePoint *)cursor;
+    cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     state.contacts = (RigidContact *)cursor;
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     state.next = (uint32_t *)cursor;

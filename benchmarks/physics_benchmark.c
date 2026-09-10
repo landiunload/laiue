@@ -29,7 +29,8 @@ static void WriteUnsigned(uint64_t value)
 {
     char digits[21];
     uint32_t length = 0u;
-    if (value == 0u) digits[length++] = '0';
+    if (value == 0u)
+        digits[length++] = '0';
     while (value != 0u)
     {
         digits[length++] = (char)('0' + (value % 10u));
@@ -50,8 +51,10 @@ static void WriteMilliseconds(double value)
     WriteUnsigned(thousandths / 1000u);
     WriteText(".");
     uint64_t fraction = thousandths % 1000u;
-    if (fraction < 100u) WriteText("0");
-    if (fraction < 10u) WriteText("0");
+    if (fraction < 100u)
+        WriteText("0");
+    if (fraction < 10u)
+        WriteText("0");
     WriteUnsigned(fraction);
 }
 
@@ -77,9 +80,7 @@ static void QueryBlock(void *context, int64_t x, int64_t y, int64_t z,
     BenchmarkWorld *world = (BenchmarkWorld *)context;
     (void)x;
     (void)y;
-    outPhysics->flags = world->solidGround && z < 0
-                            ? (uint32_t)VOXEL_BLOCK_PHYSICS_SOLID
-                            : 0u;
+    outPhysics->flags = world->solidGround && z < 0 ? (uint32_t)VOXEL_BLOCK_PHYSICS_SOLID : 0u;
     outPhysics->friction = 0.6f;
 }
 
@@ -134,7 +135,8 @@ static bool InitializeDenseBodies(VoxelRigidBody *bodies, uint32_t count)
         // The vertical 0.01 overlap deliberately exercises the contact solver.
         description.position[0] = (double)(index % 16u);
         description.position[1] = (double)((index / 16u) % 16u);
-        description.position[2] = 0.44 + (double)(index / 256u) * 0.89;
+        uint32_t layer = index / 256u;
+        description.position[2] = 0.44 + (double)layer * 0.89;
         description.halfExtent[0] = 0.45;
         description.halfExtent[1] = 0.45;
         description.halfExtent[2] = 0.45;
@@ -174,7 +176,11 @@ static uint64_t HashWord(uint64_t hash, uint64_t word)
 
 static uint64_t HashDouble(uint64_t hash, double value)
 {
-    union { double scalar; uint64_t bits; } representation = {value};
+    union
+    {
+        double scalar;
+        uint64_t bits;
+    } representation = {value};
     return HashWord(hash, representation.bits);
 }
 
@@ -219,10 +225,9 @@ static uint64_t HashBodies(const VoxelRigidBody *bodies, uint32_t bodyCount)
 }
 
 static bool DenseStep(VoxelRigidBody *bodies, uint32_t bodyCount,
-                       const VoxelCollisionSource *collision,
-                       const VoxelRigidStepSettings *settings,
-                       void *scratch, uint32_t scratchBytes,
-                       VoxelRigidContactCache *cache, VoxelRigidBroadphase *broadphase)
+                      const VoxelCollisionSource *collision, const VoxelRigidStepSettings *settings,
+                      void *scratch, uint32_t scratchBytes, VoxelRigidContactCache *cache,
+                      VoxelRigidBroadphase *broadphase)
 {
     if (broadphase != NULL)
     {
@@ -235,14 +240,14 @@ static bool DenseStep(VoxelRigidBody *bodies, uint32_t bodyCount,
                                           scratchBytes, cache);
 }
 
-static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps,
-                         bool indexed, uint64_t *outHash)
+static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps, bool indexed,
+                         uint64_t *outHash)
 {
     uint32_t scratchBytes = VoxelRigidBodyStepScratchBytes(bodyCount);
     uint32_t cacheBytes = cached ? VoxelRigidContactCacheBytes(bodyCount) : 0u;
     uint32_t indexBytes = indexed ? VoxelRigidBroadphaseBytes(bodyCount) : 0u;
-    if (scratchBytes == 0u || (cached && cacheBytes == 0u) ||
-        (indexed && indexBytes == 0u)) return false;
+    if (scratchBytes == 0u || (cached && cacheBytes == 0u) || (indexed && indexBytes == 0u))
+        return false;
 
     BenchmarkWorld world = {.solidGround = true};
     VoxelCollisionSource collision = {
@@ -274,23 +279,29 @@ static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps,
         VoxelRigidContactCache cache = {0};
         VoxelRigidBroadphase broadphase = {0};
         if (bodies == NULL || scratch == NULL ||
-            (cached && (cacheStorage == NULL ||
-                        !VoxelRigidContactCacheInitialize(&cache, cacheStorage,
-                                                           bodyCount, cacheBytes))) ||
-            (indexed && (indexStorage == NULL ||
-                         !VoxelRigidBroadphaseInitialize(&broadphase, indexStorage,
-                                                          bodyCount, indexBytes))))
+            (cached &&
+             (cacheStorage == NULL ||
+              !VoxelRigidContactCacheInitialize(&cache, cacheStorage, bodyCount, cacheBytes))) ||
+            (indexed &&
+             (indexStorage == NULL ||
+              !VoxelRigidBroadphaseInitialize(&broadphase, indexStorage, bodyCount, indexBytes))))
         {
-            if (indexStorage != NULL) PlatformFree(indexStorage);
-            if (cacheStorage != NULL) PlatformFree(cacheStorage);
-            if (scratch != NULL) PlatformFree(scratch);
-            if (bodies != NULL) PlatformFree(bodies);
+            if (indexStorage != NULL)
+                PlatformFree(indexStorage);
+            if (cacheStorage != NULL)
+                PlatformFree(cacheStorage);
+            if (scratch != NULL)
+                PlatformFree(scratch);
+            if (bodies != NULL)
+                PlatformFree(bodies);
             return false;
         }
         if (!InitializeDenseBodies(bodies, bodyCount))
         {
-            if (indexStorage != NULL) PlatformFree(indexStorage);
-            if (cacheStorage != NULL) PlatformFree(cacheStorage);
+            if (indexStorage != NULL)
+                PlatformFree(indexStorage);
+            if (cacheStorage != NULL)
+                PlatformFree(cacheStorage);
             PlatformFree(scratch);
             PlatformFree(bodies);
             return false;
@@ -305,8 +316,8 @@ static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps,
         uint32_t peakContacts = 0u;
         for (uint32_t warmup = 0u; warmup < warmupSteps; ++warmup)
         {
-            if (!DenseStep(bodies, bodyCount, &collision, &settings, scratch,
-                            scratchBytes, cached ? &cache : NULL, indexed ? &broadphase : NULL))
+            if (!DenseStep(bodies, bodyCount, &collision, &settings, scratch, scratchBytes,
+                           cached ? &cache : NULL, indexed ? &broadphase : NULL))
             {
                 succeeded = false;
                 break;
@@ -316,8 +327,8 @@ static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps,
         for (uint32_t step = 0u; succeeded && step < STEP_COUNT; ++step)
         {
             VoxelRigidStepStats stats;
-            if (!DenseStep(bodies, bodyCount, &collision, &settings, scratch,
-                            scratchBytes, cached ? &cache : NULL, indexed ? &broadphase : NULL) ||
+            if (!DenseStep(bodies, bodyCount, &collision, &settings, scratch, scratchBytes,
+                           cached ? &cache : NULL, indexed ? &broadphase : NULL) ||
                 !VoxelRigidBodyReadStepStats(scratch, bodyCount, scratchBytes, &stats) ||
                 stats.activeBodyCount != bodyCount || stats.awakeBodyCount != bodyCount ||
                 stats.contactCount == 0u)
@@ -330,18 +341,21 @@ static bool RunDenseCase(uint32_t bodyCount, bool cached, uint32_t warmupSteps,
             matches += cache.matchedContactCount;
             updates += broadphase.updatedProxyCount;
             visits += broadphase.visitedNodeCount;
-            if (stats.contactCount > peakContacts) peakContacts = stats.contactCount;
+            if (stats.contactCount > peakContacts)
+                peakContacts = stats.contactCount;
         }
-        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0 /
-                          (double)STEP_COUNT;
+        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0 / (double)STEP_COUNT;
         uint64_t stateHash = HashBodies(bodies, bodyCount);
         benchmarkSink ^= contacts;
         ReleaseBodies(bodies, bodyCount);
         PlatformFree(scratch);
         PlatformFree(bodies);
-        if (cacheStorage != NULL) PlatformFree(cacheStorage);
-        if (indexStorage != NULL) PlatformFree(indexStorage);
-        if (!succeeded) return false;
+        if (cacheStorage != NULL)
+            PlatformFree(cacheStorage);
+        if (indexStorage != NULL)
+            PlatformFree(indexStorage);
+        if (!succeeded)
+            return false;
 
         if (sample == 0u)
         {
@@ -403,7 +417,8 @@ static bool RunDensePair(uint32_t bodyCount, bool cached, uint32_t warmupSteps)
     uint64_t gridHash = 0u;
     uint64_t indexHash = 0u;
     if (!RunDenseCase(bodyCount, cached, warmupSteps, false, &gridHash) ||
-        !RunDenseCase(bodyCount, cached, warmupSteps, true, &indexHash)) return false;
+        !RunDenseCase(bodyCount, cached, warmupSteps, true, &indexHash))
+        return false;
     if (gridHash != indexHash)
     {
         WriteText("persistent broadphase changed dense physical state\n");
@@ -419,8 +434,10 @@ static bool RunCase(uint32_t bodyCount, bool solidGround, bool resting)
     void *scratch = scratchBytes == 0u ? NULL : PlatformAllocate(scratchBytes, false);
     if (bodies == NULL || scratch == NULL || !InitializeBodies(bodies, bodyCount, resting))
     {
-        if (scratch != NULL) PlatformFree(scratch);
-        if (bodies != NULL) PlatformFree(bodies);
+        if (scratch != NULL)
+            PlatformFree(scratch);
+        if (bodies != NULL)
+            PlatformFree(bodies);
         return false;
     }
 
@@ -436,8 +453,7 @@ static bool RunCase(uint32_t bodyCount, bool solidGround, bool resting)
 
     for (uint32_t warmup = 0u; warmup < (resting ? 40u : 2u); ++warmup)
     {
-        if (!VoxelRigidBodyStep(bodies, bodyCount, &collision, &settings,
-                                scratch, scratchBytes))
+        if (!VoxelRigidBodyStep(bodies, bodyCount, &collision, &settings, scratch, scratchBytes))
         {
             for (uint32_t index = 0u; index < bodyCount; ++index)
             {
@@ -454,7 +470,8 @@ static bool RunCase(uint32_t bodyCount, bool solidGround, bool resting)
         uint32_t sleeping = 0u;
         for (uint32_t index = 0u; index < bodyCount; ++index)
         {
-            if (bodies[index].sleeping) ++sleeping;
+            if (bodies[index].sleeping)
+                ++sleeping;
         }
         WriteText("rigid.sleeping bodies=");
         WriteUnsigned(sleeping);
@@ -469,26 +486,24 @@ static bool RunCase(uint32_t bodyCount, bool solidGround, bool resting)
         double start = PlatformMonotonicSeconds();
         for (uint32_t step = 0u; step < STEP_COUNT; ++step)
         {
-            if (!VoxelRigidBodyStep(bodies, bodyCount, &collision, &settings,
-                                    scratch, scratchBytes))
+            if (!VoxelRigidBodyStep(bodies, bodyCount, &collision, &settings, scratch,
+                                    scratchBytes))
             {
                 LaiueTestRuntimeExit(2);
             }
         }
-        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0 /
-                          (double)STEP_COUNT;
+        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0 / (double)STEP_COUNT;
     }
 
     WriteText(resting ? "rigid.step.resting bodies="
-                     : (solidGround ? "rigid.step.ground bodies=" : "rigid.step.empty bodies="));
+                      : (solidGround ? "rigid.step.ground bodies=" : "rigid.step.empty bodies="));
     WriteUnsigned(bodyCount);
     WriteText(" median_ms=");
     WriteMilliseconds(Median(samples, SAMPLE_COUNT));
     WriteText(" bodies_per_second=");
     double milliseconds = Median(samples, SAMPLE_COUNT);
-    WriteUnsigned(milliseconds > 0.0
-                      ? (uint64_t)((double)bodyCount / (milliseconds / 1000.0))
-                      : 0u);
+    WriteUnsigned(milliseconds > 0.0 ? (uint64_t)((double)bodyCount / (milliseconds / 1000.0))
+                                     : 0u);
     WriteText("\n");
 
     benchmarkSink ^= (uint64_t)bodies[bodyCount - 1u].stableId;
@@ -501,9 +516,76 @@ static bool RunCase(uint32_t bodyCount, bool solidGround, bool resting)
     return true;
 }
 
+// Перенос начала координат. Шаг его не вызывает, зато вызывает приложение,
+// когда мир уезжает от локального нуля, и делает это сразу для всех тел.
+// Случай отдельный именно поэтому: он не входит ни в один замер шага, а
+// стоимость у него линейна по числу тел.
+static bool RunRebaseCase(uint32_t bodyCount)
+{
+    VoxelRigidBody *bodies = PlatformAllocate((size_t)bodyCount * sizeof(*bodies), true);
+    if (bodies == NULL)
+    {
+        return false;
+    }
+    if (!InitializeBodies(bodies, bodyCount, true))
+    {
+        PlatformFree(bodies);
+        return false;
+    }
+
+    // Туда и обратно: позиции остаются на месте, а работа делается дважды.
+    const int64_t forward[3] = {4096, -8192, 2048};
+    const int64_t backward[3] = {-4096, 8192, -2048};
+    double best = 0.0;
+    for (uint32_t sample = 0u; sample < SAMPLE_COUNT; ++sample)
+    {
+        double begin = PlatformMonotonicSeconds();
+        for (uint32_t index = 0u; index < bodyCount; ++index)
+        {
+            if (!VoxelRigidBodyTranslateBlocks(&bodies[index], forward) ||
+                !VoxelRigidBodyTranslateBlocks(&bodies[index], backward))
+            {
+                ReleaseBodies(bodies, bodyCount);
+                PlatformFree(bodies);
+                return false;
+            }
+        }
+        double elapsed = PlatformMonotonicSeconds() - begin;
+        if (sample == 0u || elapsed < best)
+        {
+            best = elapsed;
+        }
+    }
+
+    benchmarkSink += bodies[0].position[0].limbCount;
+    ReleaseBodies(bodies, bodyCount);
+    PlatformFree(bodies);
+
+    WriteText("rigid.rebase bodies=");
+    WriteUnsigned(bodyCount);
+    WriteText(" shifts_per_body=2 best_ms=");
+    WriteMilliseconds(best * 1000.0);
+    WriteText(" ns_per_shift=");
+    WriteUnsigned((uint64_t)(best * 1000000000.0 / ((double)bodyCount * 2.0)));
+    WriteText("\n");
+    return true;
+}
+
 LAIUE_TEST_ENTRY(PhysicsBenchmarkEntryPoint)
 {
     WriteText("laiue rigid-body benchmark\n");
+    char rebaseOnly[2] = {0};
+    if (PlatformGetEnvironmentUtf8("LAIUE_PHYSICS_BENCHMARK_REBASE_ONLY", rebaseOnly,
+                                   sizeof(rebaseOnly)) == 1u &&
+        rebaseOnly[0] == '1')
+    {
+        if (!RunRebaseCase(2000u) || !RunRebaseCase(100000u))
+        {
+            WriteText("rebase benchmark failed\n");
+            LaiueTestRuntimeExit(1);
+        }
+        LAIUE_TEST_SUCCESS();
+    }
     // Cached and uncached modes have the same initial conditions, not necessarily
     // the same later contact workload: warm starting changes finite-iteration
     // approximations. Report contacts and hashes rather than claiming equivalence.
@@ -516,11 +598,17 @@ LAIUE_TEST_ENTRY(PhysicsBenchmarkEntryPoint)
     }
 
     char denseOnly[2] = {0};
-    if (PlatformGetEnvironmentUtf8("LAIUE_PHYSICS_BENCHMARK_DENSE_ONLY",
-                                   denseOnly, sizeof(denseOnly)) == 1u &&
+    if (PlatformGetEnvironmentUtf8("LAIUE_PHYSICS_BENCHMARK_DENSE_ONLY", denseOnly,
+                                   sizeof(denseOnly)) == 1u &&
         denseOnly[0] == '1')
     {
         LAIUE_TEST_SUCCESS();
+    }
+
+    if (!RunRebaseCase(2000u) || !RunRebaseCase(100000u))
+    {
+        WriteText("rebase benchmark failed\n");
+        LaiueTestRuntimeExit(1);
     }
 
     const uint32_t counts[] = {10000u, 50000u, 100000u};
@@ -533,6 +621,7 @@ LAIUE_TEST_ENTRY(PhysicsBenchmarkEntryPoint)
             LaiueTestRuntimeExit(1);
         }
     }
-    if (benchmarkSink == UINT64_MAX) WriteText("");
+    if (benchmarkSink == UINT64_MAX)
+        WriteText("");
     LAIUE_TEST_SUCCESS();
 }

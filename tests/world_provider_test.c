@@ -300,11 +300,428 @@ static void TestRebaseAndFormatting(void)
     WorldDestroy(farWorld);
 }
 
+// === Разбор региона ===
+//
+// WorldFillRegion заканчивается разбором содержимого: есть ли пустые ячейки,
+// есть ли непустые. Разбор идёт по восемь ячеек за раз, поэтому проверять
+// его надо не на круглых размерах, а ровно на хвостах: длина 1..17 и вокруг
+// кратных восьми, буфер со смещённым на 1..7 адресом, ноль в каждом байте
+// слова и непустые значения на всех четырёх характерных битовых картинах.
+//
+// Эталон здесь побайтный и намеренно тупой: пройти буфер после вызова и
+// посмотреть, встретился ли ноль и встретилось ли что-то кроме нуля.
+
+#define REGION_BUFFER_BYTES 160U
+#define REGION_GUARD 8U
+
+static BlockType regionPattern[REGION_BUFFER_BYTES];
+static uint32_t regionPatternCount;
+
+static WorldRegionContents PatternFillRegion(void *rawContext, int64_t minBlockX, int64_t minBlockY,
+                                             int64_t minBlockZ, int32_t sizeX, int32_t sizeY,
+                                             int32_t sizeZ, BlockType *outBlocks)
+{
+    (void)rawContext;
+    (void)minBlockX;
+    (void)minBlockY;
+    (void)minBlockZ;
+    size_t count = (size_t)sizeX * (size_t)sizeY * (size_t)sizeZ;
+    for (size_t index = 0U; index < count; ++index)
+    {
+        outBlocks[index] = index < regionPatternCount ? regionPattern[index] : BLOCK_AIR;
+    }
+    return WORLD_REGION_MIXED;
+}
+
+static BlockType PatternGetBlock(void *rawContext, int64_t x, int64_t y, int64_t z)
+{
+    (void)rawContext;
+    (void)x;
+    (void)y;
+    int64_t index = z;
+    if (index < 0 || (uint64_t)index >= regionPatternCount)
+    {
+        return BLOCK_AIR;
+    }
+    return regionPattern[index];
+}
+
+static WorldRegionContents ClassifyBytes(const BlockType *cells, uint32_t count)
+{
+    bool anyAir = false;
+    bool anySolid = false;
+    for (uint32_t index = 0U; index < count; ++index)
+    {
+        if (cells[index] == BLOCK_AIR)
+        {
+            anyAir = true;
+        }
+        else
+        {
+            anySolid = true;
+        }
+    }
+    if (anyAir && anySolid)
+    {
+        return WORLD_REGION_MIXED;
+    }
+    return anySolid ? WORLD_REGION_ALL_SOLID : WORLD_REGION_ALL_AIR;
+}
+
+// Один прогон: длина, смещение адреса буфера и значение сторожевых байтов.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+static void RunRegionCase(World *world, uint32_t count, uint32_t offset, BlockType canary,
+                          bool useFillRegion)
+{
+    static BlockType buffer[REGION_BUFFER_BYTES];
+    for (uint32_t index = 0U; index < REGION_BUFFER_BYTES; ++index)
+    {
+        buffer[index] = canary;
+    }
+    BlockType *cells = buffer + REGION_GUARD + offset;
+    WorldRegionContents contents = WorldFillRegion(world, 0, 0, 0, 1, 1, (int32_t)count, cells);
+    ProviderExpect(contents == ClassifyBytes(cells, count),
+                   "разбор региона разошёлся с побайтным эталоном");
+    if (canary != BLOCK_AIR)
+    {
+        for (uint32_t index = 0U; index < REGION_GUARD + offset; ++index)
+        {
+            ProviderExpect(buffer[index] == canary, "запись до начала региона");
+        }
+        for (uint32_t index = REGION_GUARD + offset + count; index < REGION_BUFFER_BYTES; ++index)
+        {
+            ProviderExpect(buffer[index] == canary, "запись за концом региона");
+        }
+    }
+    (void)useFillRegion;
+}
+
+static void RunRegionPatterns(World *world, bool useFillRegion)
+{
+    static const uint32_t counts[] = {1U,  2U,  3U,  4U,  5U,  6U,  7U,  8U,  9U,
+                                      10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U, 23U,
+                                      24U, 25U, 31U, 32U, 33U, 63U, 64U, 65U};
+    static const BlockType solids[] = {(BlockType)0x01U, (BlockType)0x7fU, (BlockType)0x80U,
+                                       (BlockType)0xffU};
+    for (uint32_t sizeIndex = 0U; sizeIndex < sizeof(counts) / sizeof(counts[0]); ++sizeIndex)
+    {
+        uint32_t count = counts[sizeIndex];
+        for (uint32_t solidIndex = 0U; solidIndex < 4U; ++solidIndex)
+        {
+            BlockType solid = solids[solidIndex];
+            for (uint32_t offset = 0U; offset < 8U; ++offset)
+            {
+                // Целиком пусто.
+                regionPatternCount = count;
+                for (uint32_t index = 0U; index < count; ++index)
+                {
+                    regionPattern[index] = BLOCK_AIR;
+                }
+                RunRegionCase(world, count, offset, (BlockType)0xabU, useFillRegion);
+                RunRegionCase(world, count, offset, BLOCK_AIR, useFillRegion);
+
+                // Целиком непусто.
+                for (uint32_t index = 0U; index < count; ++index)
+                {
+                    regionPattern[index] = solid;
+                }
+                RunRegionCase(world, count, offset, (BlockType)0xabU, useFillRegion);
+                RunRegionCase(world, count, offset, BLOCK_AIR, useFillRegion);
+
+                // Ровно один ноль в каждой позиции: и внутри первого слова, и
+                // в хвосте, который слово уже не покрывает.
+                for (uint32_t hole = 0U; hole < count; ++hole)
+                {
+                    for (uint32_t index = 0U; index < count; ++index)
+                    {
+                        regionPattern[index] = index == hole ? BLOCK_AIR : solid;
+                    }
+                    RunRegionCase(world, count, offset, (BlockType)0xabU, useFillRegion);
+                    RunRegionCase(world, count, offset, BLOCK_AIR, useFillRegion);
+                }
+
+                // Ровно одна непустая ячейка в каждой позиции.
+                for (uint32_t spot = 0U; spot < count; ++spot)
+                {
+                    for (uint32_t index = 0U; index < count; ++index)
+                    {
+                        regionPattern[index] = index == spot ? solid : BLOCK_AIR;
+                    }
+                    RunRegionCase(world, count, offset, (BlockType)0xabU, useFillRegion);
+                    RunRegionCase(world, count, offset, BLOCK_AIR, useFillRegion);
+                }
+            }
+        }
+    }
+}
+
+static void TestRegionClassification(void)
+{
+    // Через fillRegion: провайдер сам заполняет весь регион.
+    WorldBaseProvider provider = {0};
+    provider.context = NULL;
+    provider.getBlock = PatternGetBlock;
+    provider.fillRegion = PatternFillRegion;
+    World *world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "мир с провайдером образца создан");
+    RunRegionPatterns(world, true);
+    WorldDestroy(world);
+
+    // Через getBlock: тот же образец, но регион собирается поячеечно.
+    provider.fillRegion = NULL;
+    world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "мир с поячеечным провайдером создан");
+    RunRegionPatterns(world, false);
+
+    // Разреженные правки поверх провайдера: они кладутся после заполнения и
+    // обязаны учитываться разбором.
+    regionPatternCount = 16U;
+    for (uint32_t index = 0U; index < 16U; ++index)
+    {
+        regionPattern[index] = (BlockType)0x7fU;
+    }
+    for (uint32_t hole = 0U; hole < 16U; ++hole)
+    {
+        WorldSetBlock(world, 0, 0, (int64_t)hole, BLOCK_AIR);
+        static BlockType buffer[REGION_BUFFER_BYTES];
+        for (uint32_t index = 0U; index < REGION_BUFFER_BYTES; ++index)
+        {
+            buffer[index] = (BlockType)0xabU;
+        }
+        BlockType *cells = buffer + REGION_GUARD;
+        WorldRegionContents contents = WorldFillRegion(world, 0, 0, 0, 1, 1, 16, cells);
+        ProviderExpect(contents == ClassifyBytes(cells, 16U),
+                       "разреженная правка не учтена разбором региона");
+        ProviderExpect(cells[hole] == BLOCK_AIR, "разреженная правка не попала в регион");
+        WorldSetBlock(world, 0, 0, (int64_t)hole, (BlockType)0x7fU);
+    }
+    WorldDestroy(world);
+}
+
+// === Регион поперёк границ чанков ===
+//
+// Мешеру нужен регион на один блок шире чанка, поэтому он задевает по слою
+// от каждого из двадцати шести соседей. Выборка идёт по отсортированным
+// дельтам скачками, и ошибиться она может ровно там, где кусок чанка узкий:
+// на гранях, рёбрах и углах. Эталон здесь — поячеечный WorldGetBlock,
+// который к этой выборке никакого отношения не имеет.
+
+#define HALO_SPAN 4
+
+// Два образца. Дырявый рвёт всякую последовательность локальных индексов, а
+// сплошной, наоборот, даёт целые колонны подряд. Выборка региона записывает
+// подряд идущие дельты отрезками, и ошибка в длине отрезка видна только на
+// втором образце: на первом отрезков просто нет.
+static bool haloDense;
+
+static BlockType HaloPattern(int64_t x, int64_t y, int64_t z)
+{
+    int64_t mixed = x * 7 + y * 13 + z * 31;
+    if (haloDense)
+    {
+        // Колонны с x, не кратным четырём, заполнены целиком, и такие колонны
+        // идут подряд: локальные индексы соседних переходят одна в другую без
+        // разрыва, и отрезок обязан оборваться на границе колонны сам.
+        // Остальные колонны с дырами через одну — на них проверяется, что
+        // отрезок не продолжается через пропущенный блок.
+        if ((((x % 4) + 4) % 4) != 0)
+        {
+            return (BlockType)(1U + (uint32_t)((((x + y) % 7) + 7) % 7));
+        }
+        return ((((z % 2) + 2) % 2) == 0) ? (BlockType)9U : BLOCK_AIR;
+    }
+    if (((x + y + z) & 3) == 0)
+    {
+        return BLOCK_AIR;
+    }
+    return (BlockType)(1U + (uint32_t)(((mixed % 255) + 255) % 255));
+}
+
+static void HaloFill(World *world, int64_t low, int64_t high)
+{
+    for (int64_t x = low; x < high; ++x)
+    {
+        for (int64_t y = low; y < high; ++y)
+        {
+            for (int64_t z = low; z < high; ++z)
+            {
+                BlockType block = HaloPattern(x, y, z);
+                if (block != BLOCK_AIR)
+                {
+                    WorldSetBlock(world, x, y, z, block);
+                }
+            }
+        }
+    }
+}
+
+// Сверяет каждую ячейку региона с отдельным запросом блока.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+static void HaloCompare(World *world, int64_t minX, int64_t minY, int64_t minZ, int32_t sizeX,
+                        int32_t sizeY, int32_t sizeZ, BlockType *cells)
+{
+    WorldRegionContents contents =
+        WorldFillRegion(world, minX, minY, minZ, sizeX, sizeY, sizeZ, cells);
+    bool anyAir = false;
+    bool anySolid = false;
+    for (int32_t y = 0; y < sizeY; ++y)
+    {
+        for (int32_t x = 0; x < sizeX; ++x)
+        {
+            for (int32_t z = 0; z < sizeZ; ++z)
+            {
+                size_t index =
+                    (((size_t)y * (size_t)sizeX) + (size_t)x) * (size_t)sizeZ + (size_t)z;
+                BlockType expected = WorldGetBlock(world, minX + x, minY + y, minZ + z);
+                ProviderExpect(cells[index] == expected,
+                               "ячейка региона разошлась с отдельным запросом блока");
+                anyAir |= expected == BLOCK_AIR;
+                anySolid |= expected != BLOCK_AIR;
+            }
+        }
+    }
+    WorldRegionContents wanted = anyAir && anySolid
+                                     ? WORLD_REGION_MIXED
+                                     : (anySolid ? WORLD_REGION_ALL_SOLID : WORLD_REGION_ALL_AIR);
+    ProviderExpect(contents == wanted, "разбор региона поперёк чанков разошёлся с эталоном");
+}
+
+static void TestHaloRegionsWithPattern(void)
+{
+    static BlockType cells[(CHUNK_SIZE + 2) * 4 * 4];
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "мир для проверки halo создан");
+
+    // Три чанка подряд по каждой оси, начиная с отрицательных координат:
+    // регион ниже будет резать их по граням, рёбрам и углам.
+    HaloFill(world, -CHUNK_SIZE, 2 * CHUNK_SIZE);
+
+    // Узкие регионы всех форм: слой, брусок и одиночная ячейка, каждый —
+    // на границе чанков и со сдвигом внутрь и наружу.
+    static const int64_t offsets[] = {-CHUNK_SIZE - 1, -CHUNK_SIZE,   -1, 0, 1, CHUNK_SIZE - 1,
+                                      CHUNK_SIZE,      CHUNK_SIZE + 1};
+    static const int32_t spans[] = {1, 2, 3, CHUNK_SIZE + 2};
+    for (uint32_t offsetIndex = 0U; offsetIndex < sizeof(offsets) / sizeof(offsets[0]);
+         ++offsetIndex)
+    {
+        int64_t base = offsets[offsetIndex];
+        for (uint32_t spanIndex = 0U; spanIndex < sizeof(spans) / sizeof(spans[0]); ++spanIndex)
+        {
+            int32_t span = spans[spanIndex];
+            // Слой толщиной в блок по каждой оси по очереди.
+            HaloCompare(world, base, base, base, span, 1, 1, cells);
+            HaloCompare(world, base, base, base, 1, span, 1, cells);
+            HaloCompare(world, base, base, base, 1, 1, span, cells);
+            // Брусок и куб.
+            HaloCompare(world, base, base, base, span, 2, 2, cells);
+            if (span <= HALO_SPAN)
+            {
+                HaloCompare(world, base, base, base, span, span, span, cells);
+            }
+        }
+    }
+
+    // Регион вокруг целого чанка: только здесь центральный чанк попадает
+    // внутрь целиком, и выборка идёт быстрым путём, который пишет подряд
+    // идущие дельты отрезками. На узких регионах этот путь не исполняется
+    // вовсе — первая версия проверки его и пропускала.
+    {
+        static BlockType whole[(CHUNK_SIZE + 2) * (CHUNK_SIZE + 2) * (CHUNK_SIZE + 2)];
+        HaloCompare(world, -1, -1, -1, CHUNK_SIZE + 2, CHUNK_SIZE + 2, CHUNK_SIZE + 2, whole);
+        HaloCompare(world, CHUNK_SIZE - 1, -1, -1, CHUNK_SIZE + 2, CHUNK_SIZE + 2, CHUNK_SIZE + 2,
+                    whole);
+        HaloCompare(world, -CHUNK_SIZE - 1, -CHUNK_SIZE - 1, -CHUNK_SIZE - 1, CHUNK_SIZE + 2,
+                    CHUNK_SIZE + 2, CHUNK_SIZE + 2, whole);
+    }
+
+    // Разреженная правка внутри узкого куска обязана дойти до региона.
+    WorldSetBlock(world, -1, 5, 7, (BlockType)200U);
+    WorldSetBlock(world, CHUNK_SIZE, 5, 7, (BlockType)201U);
+    WorldSetBlock(world, 5, -1, 7, BLOCK_AIR);
+    HaloCompare(world, -1, -1, -1, CHUNK_SIZE + 2, 1, 1, cells);
+    HaloCompare(world, -1, 5, 7, CHUNK_SIZE + 2, 1, 1, cells);
+    HaloCompare(world, 5, -1, 7, 1, CHUNK_SIZE + 2, 1, cells);
+
+    // После переноса начала мира локальные координаты уезжают, а содержимое
+    // региона обязано остаться тем же относительно блоков.
+    ProviderExpect(WorldRebase(world, CHUNK_SIZE, -CHUNK_SIZE, CHUNK_SIZE), "перенос мира");
+    for (uint32_t offsetIndex = 0U; offsetIndex < sizeof(offsets) / sizeof(offsets[0]);
+         ++offsetIndex)
+    {
+        int64_t base = offsets[offsetIndex];
+        HaloCompare(world, base, base, base, CHUNK_SIZE + 2, 1, 1, cells);
+        HaloCompare(world, base, base, base, 1, CHUNK_SIZE + 2, 1, cells);
+        HaloCompare(world, base, base, base, 1, 1, CHUNK_SIZE + 2, cells);
+        HaloCompare(world, base, base, base, 3, 3, 3, cells);
+    }
+    WorldDestroy(world);
+}
+
+static void TestRegionCoordinateLimits(void)
+{
+    static BlockType cells[CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+    const uint32_t localOffsets[] = {0U, 1U, 31U, 62U, 63U};
+    const int32_t spans[] = {1, 2, 63, 64, 65, 66};
+    for (uint32_t end = 0U; end < 2U; ++end)
+    {
+        World *world = WorldCreate(NULL);
+        ProviderExpect(world != NULL, "coordinate-limit world created");
+        int64_t base = end == 0U ? INT64_MIN : INT64_MAX - (CHUNK_SIZE - 1);
+        for (uint32_t x = 0U; x < sizeof(localOffsets) / sizeof(localOffsets[0]); ++x)
+        {
+            for (uint32_t y = 0U; y < sizeof(localOffsets) / sizeof(localOffsets[0]); ++y)
+            {
+                for (uint32_t z = 0U; z < sizeof(localOffsets) / sizeof(localOffsets[0]); ++z)
+                {
+                    ProviderExpect(WorldTrySetBlock(world, base + localOffsets[x],
+                                                    base + localOffsets[y], base + localOffsets[z],
+                                                    (BlockType)(1U + x + y * 5U + z * 25U)),
+                                   "coordinate-limit delta inserted");
+                }
+            }
+        }
+        // Entire edge chunk takes the direct path, including its first/last delta.
+        HaloCompare(world, base, base, base, CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE, cells);
+        for (uint32_t axis = 0U; axis < 3U; ++axis)
+        {
+            for (uint32_t sample = 0U; sample < sizeof(spans) / sizeof(spans[0]); ++sample)
+            {
+                int64_t minimum[3] = {base, base, base};
+                int32_t size[3] = {2, 2, 2};
+                size[axis] = spans[sample];
+                minimum[axis] = end == 0U ? INT64_MIN : INT64_MAX - ((int64_t)size[axis] - 1);
+                HaloCompare(world, minimum[0], minimum[1], minimum[2], size[0], size[1], size[2],
+                            cells);
+            }
+            int64_t invalid[3] = {0, 0, 0};
+            invalid[axis] = INT64_MAX;
+            BlockType guard = (BlockType)0xa5U;
+            ProviderExpect(WorldFillRegion(world, invalid[0], invalid[1], invalid[2], 2, 2, 2,
+                                           &guard) == WORLD_REGION_ALL_AIR &&
+                               guard == (BlockType)0xa5U,
+                           "overflowing region rejected without writing output");
+        }
+        WorldDestroy(world);
+    }
+}
+
+static void TestHaloRegions(void)
+{
+    haloDense = false;
+    TestHaloRegionsWithPattern();
+    haloDense = true;
+    TestHaloRegionsWithPattern();
+    haloDense = false;
+}
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
     TestEmptyWorld();
     TestProviderAndMutations();
     TestRebaseAndFormatting();
+    TestRegionClassification();
+    TestHaloRegions();
+    TestRegionCoordinateLimits();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }

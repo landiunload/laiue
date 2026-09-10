@@ -13,6 +13,33 @@ static uint64_t Int64Magnitude(int64_t value)
     return value < 0 ? 0u - (uint64_t)value : (uint64_t)value;
 }
 
+// Индекс старшего установленного бита. Для нуля и единицы возвращается 0 —
+// ровно как у прежнего побитового цикла, на котором это и держалось.
+// Цикл стоил до шестидесяти трёх итераций, а у обычной координаты физики
+// старший бит сорок четвёртый: перевод в double уходил почти целиком сюда.
+static uint32_t HighestSetBit(uint64_t value)
+{
+    if (value <= 1u)
+    {
+        return 0;
+    }
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long index = 0;
+    _BitScanReverse64(&index, value);
+    return (uint32_t)index;
+#elif defined(__GNUC__) || defined(__clang__)
+    return 63u - (uint32_t)__builtin_clzll(value);
+#else
+    uint32_t index = 0;
+    while (value > 1u)
+    {
+        value >>= 1;
+        ++index;
+    }
+    return index;
+#endif
+}
+
 static void InfiniteCoordNormalize(InfiniteCoord* value)
 {
     while (value->limbCount > 0 && value->limbs[value->limbCount - 1] == 0)
@@ -76,6 +103,8 @@ static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source
         return false;
     }
 
+    // Цикл, а не memcpy: в сборке без CRT это вызов собственной реализации
+    // движка, и на одном-четырёх лимбах он дороже развёрнутого копирования.
     for (uint32_t i = 0; i < source->limbCount; ++i)
     {
         limbs[i] = source->limbs[i];
@@ -917,17 +946,6 @@ static uint32_t UnsignedDecimalDigits(uint64_t value)
     return digits;
 }
 
-static uint32_t HighestSetBitIndex(uint64_t value)
-{
-    uint32_t index = 0;
-    while (value > 1u)
-    {
-        value >>= 1;
-        ++index;
-    }
-    return index;
-}
-
 void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
     wchar_t* outText, uint32_t capacity)
 {
@@ -986,7 +1004,7 @@ void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
     {
         uint64_t top = value.limbs[value.limbCount - 1];
         uint64_t highestBit = (uint64_t)(value.limbCount - 1) * 64u
-            + HighestSetBitIndex(top);
+            + HighestSetBit(top);
         ShortCoordinateWriteCharacter(&writer, L'~');
         ShortCoordinateWriteCharacter(&writer, L'2');
         ShortCoordinateWriteCharacter(&writer, L'^');
@@ -1024,7 +1042,10 @@ static bool TryAllocateLimbs(InfiniteCoord* value, uint32_t limbCount)
         InfiniteCoordInit(value);
         return true;
     }
-    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), true);
+    // Без обнуления: каждый вызывающий записывает все лимбы до единого.
+    // Обнуление кучей стоило лишнего прохода по свежей памяти на каждом
+    // выделении, а пользы не приносило.
+    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), false);
     if (limbs == NULL)
     {
         return false;
@@ -1205,26 +1226,44 @@ bool InfiniteCoordTryCopyShiftLeft(
 
     uint32_t limbShift = bitCount / 64u;
     uint32_t bitShift = bitCount % 64u;
-    if (source->limbCount > UINT32_MAX - limbShift - 1u)
+    uint64_t resultCount = (uint64_t)source->limbCount + limbShift + 1u;
+    if (resultCount > UINT32_MAX)
     {
         return false;
     }
 
     InfiniteCoord result;
     InfiniteCoordInit(&result);
-    if (!TryAllocateLimbs(&result, source->limbCount + limbShift + 1u))
+    uint32_t resultLimbCount = (uint32_t)resultCount;
+    if (resultLimbCount == 0u || !TryAllocateLimbs(&result, resultLimbCount))
     {
         return false;
     }
 
-    for (uint32_t index = 0; index < source->limbCount; ++index)
+    // Каждый лимб результата пишется ровно один раз, а не собирается двумя
+    // «или»: тогда выделенную память не нужно предварительно обнулять.
+    for (uint32_t index = 0; index < limbShift; ++index)
     {
-        uint64_t limb = source->limbs[index];
-        result.limbs[index + limbShift] |= bitShift == 0 ? limb : limb << bitShift;
-        if (bitShift != 0)
+        result.limbs[index] = 0u;
+    }
+    if (bitShift == 0u)
+    {
+        for (uint32_t index = 0; index < source->limbCount; ++index)
         {
-            result.limbs[index + limbShift + 1u] |= limb >> (64u - bitShift);
+            result.limbs[index + limbShift] = source->limbs[index];
         }
+        result.limbs[source->limbCount + limbShift] = 0u;
+    }
+    else
+    {
+        uint64_t carry = 0u;
+        for (uint32_t index = 0; index < source->limbCount; ++index)
+        {
+            uint64_t limb = source->limbs[index];
+            result.limbs[index + limbShift] = (limb << bitShift) | carry;
+            carry = limb >> (64u - bitShift);
+        }
+        result.limbs[source->limbCount + limbShift] = carry;
     }
     result.sign = source->sign;
     InfiniteCoordNormalize(&result);
@@ -1242,19 +1281,10 @@ static double PowerOfTwo(uint32_t exponent)
     }
     uint64_t bits = (uint64_t)(exponent + 1023u) << 52;
     double result = 0.0;
+    // Exact-size IEEE 754 bit copy; the no-CRT runtime has no Annex K API.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memcpy(&result, &bits, sizeof(result));
     return result;
-}
-
-static uint32_t HighestSetBit(uint64_t value)
-{
-    uint32_t index = 0;
-    while (value > 1u)
-    {
-        value >>= 1;
-        ++index;
-    }
-    return index;
 }
 
 double InfiniteCoordToDoubleSaturating(const InfiniteCoord* value)
@@ -1305,10 +1335,11 @@ bool InfiniteCoordTrySetFromDouble(InfiniteCoord* out, double value)
         return false;
     }
 
-    // NaN и бесконечность распознаются по битам, а не сравнением: модуль
-    // собирается с /fp:fast, где компилятор вправе считать, что таких
-    // значений не бывает, и выкидывает проверку `value != value` целиком.
+    // NaN и бесконечность распознаются непосредственно по IEEE 754 битам.
+    // Numeric, как и physics, собирается с точной FP-семантикой.
     uint64_t valueBits = 0;
+    // Exact-size object representation copy; no Annex K in the no-CRT runtime.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memcpy(&valueBits, &value, sizeof(valueBits));
     if (((valueBits >> 52) & 0x7FFu) == 0x7FFu)
     {
@@ -1324,6 +1355,8 @@ bool InfiniteCoordTrySetFromDouble(InfiniteCoord* out, double value)
     }
 
     uint64_t bits = 0;
+    // Exact-size object representation copy; no Annex K in the no-CRT runtime.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memcpy(&bits, &magnitude, sizeof(bits));
     uint32_t exponent = (uint32_t)((bits >> 52) & 0x7FFu);
     uint64_t fraction = bits & 0xFFFFFFFFFFFFFull;
@@ -1332,26 +1365,55 @@ bool InfiniteCoordTrySetFromDouble(InfiniteCoord* out, double value)
     uint64_t mantissa = fraction | (1ull << 52);
     int32_t shift = (int32_t)exponent - 1023 - 52;
 
-    InfiniteCoord base;
-    InfiniteCoordInit(&base);
-    if (!InfiniteCoordTryAddInt64InPlace(&base, (int64_t)mantissa))
-    {
-        return false;
-    }
-    base.sign = sign;
-
-    bool ok;
-    if (shift >= 0)
-    {
-        ok = InfiniteCoordTryCopyShiftLeft(out, &base, (uint32_t)shift);
-    }
-    else
+    // Мантисса укладывается в один лимб, поэтому результат собирается сразу
+    // в нужной раскладке. Прежний путь заводил промежуточное число под саму
+    // мантиссу и второе под сдвинутое значение: два выделения и одно
+    // освобождение там, где хватает одного выделения.
+    if (shift < 0)
     {
         // Отрицательный сдвиг — усечение к нулю: младшие биты отбрасываются.
         uint32_t right = (uint32_t)(-shift);
-        ok = right >= 64u ? (InfiniteCoordInit(out), true)
-                          : InfiniteCoordTryCopyShiftRight(out, &base, right);
+        uint64_t truncated = right >= 64u ? 0u : mantissa >> right;
+        if (truncated == 0u)
+        {
+            return true;
+        }
+        uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+        if (limbs == NULL)
+        {
+            return false;
+        }
+        limbs[0] = truncated;
+        out->limbs = limbs;
+        out->limbCount = 1u;
+        out->sign = sign;
+        return true;
     }
-    InfiniteCoordDestroy(&base);
-    return ok;
+
+    uint32_t limbShift = (uint32_t)shift / 64u;
+    uint32_t bitShift = (uint32_t)shift % 64u;
+    uint64_t high = bitShift == 0u ? 0u : mantissa >> (64u - bitShift);
+    uint32_t limbCount = limbShift + (high != 0u ? 2u : 1u);
+    if (limbCount < limbShift)
+    {
+        return false;
+    }
+    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    for (uint32_t index = 0; index < limbShift; ++index)
+    {
+        limbs[index] = 0u;
+    }
+    limbs[limbShift] = bitShift == 0u ? mantissa : mantissa << bitShift;
+    if (high != 0u)
+    {
+        limbs[limbShift + 1u] = high;
+    }
+    out->limbs = limbs;
+    out->limbCount = limbCount;
+    out->sign = sign;
+    return true;
 }
