@@ -511,6 +511,151 @@ static void RemoveLeaf(VoxelRigidBroadphase *broadphase, RigidTreeNode *nodes, u
     RefreshAncestors(broadphase, nodes, grandparent, improve);
 }
 
+// Перестройка меняет только топологию: листья, их толстые коробки и карта
+// слотов остаются прежними, поэтому набор кандидатов у запроса не меняется.
+// Сборка идёт сверху вниз по середине габарита вдоль самой длинной оси —
+// это приближение медианы, не требующее ни сортировки, ни временного массива:
+// узлы дерева связываются в список через неиспользуемое поле `right` листа.
+// Минимальная доля меньшей половины не даёт выродиться в цепочку.
+
+// Возвращает внутренние узлы поддерева в пул и отцепляет листья. Глубина
+// рекурсии равна высоте дерева, а она логарифмическая.
+static void ReleaseSubtree(VoxelRigidBroadphase *broadphase, RigidTreeNode *nodes,
+                           uint32_t index)
+{
+    if (NodeIsLeaf(&nodes[index]))
+    {
+        nodes[index].parent = RIGID_TREE_EMPTY;
+        return;
+    }
+    uint32_t left = nodes[index].left;
+    uint32_t right = nodes[index].right;
+    ReleaseSubtree(broadphase, nodes, left);
+    ReleaseSubtree(broadphase, nodes, right);
+    ReturnNode(broadphase, nodes, index);
+}
+
+static uint32_t RebuildSubtree(VoxelRigidBroadphase *broadphase, RigidTreeNode *nodes,
+                               uint32_t head, uint32_t count)
+{
+    if (count == 1u)
+    {
+        nodes[head].parent = RIGID_TREE_EMPTY;
+        nodes[head].right = RIGID_TREE_EMPTY;
+        return head;
+    }
+    double minimum[3];
+    double maximum[3];
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        minimum[axis] = nodes[head].minimum[axis];
+        maximum[axis] = nodes[head].maximum[axis];
+    }
+    for (uint32_t item = nodes[head].right; item != RIGID_TREE_EMPTY; item = nodes[item].right)
+    {
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            if (nodes[item].minimum[axis] < minimum[axis]) minimum[axis] = nodes[item].minimum[axis];
+            if (nodes[item].maximum[axis] > maximum[axis]) maximum[axis] = nodes[item].maximum[axis];
+        }
+    }
+    uint32_t axis = 0u;
+    for (uint32_t candidate = 1u; candidate < 3u; ++candidate)
+    {
+        if (maximum[candidate] - minimum[candidate] > maximum[axis] - minimum[axis])
+        {
+            axis = candidate;
+        }
+    }
+    double pivot = (minimum[axis] + maximum[axis]) * 0.5;
+    uint32_t spatialCount = 0u;
+    for (uint32_t item = head; item != RIGID_TREE_EMPTY; item = nodes[item].right)
+    {
+        if ((nodes[item].minimum[axis] + nodes[item].maximum[axis]) * 0.5 <= pivot)
+        {
+            ++spatialCount;
+        }
+    }
+    // Вырожденный разрез по середине габарита заменяется делением по числу:
+    // обе половины не меньше четверти, поэтому высота остаётся логарифмической.
+    bool spatial = spatialCount >= 1u && spatialCount < count &&
+                   spatialCount >= count / 4u && spatialCount <= count - count / 4u;
+    uint32_t half = count / 2u;
+    uint32_t leftHead = RIGID_TREE_EMPTY;
+    uint32_t leftTail = RIGID_TREE_EMPTY;
+    uint32_t rightHead = RIGID_TREE_EMPTY;
+    uint32_t rightTail = RIGID_TREE_EMPTY;
+    uint32_t leftCount = 0u;
+    uint32_t item = head;
+    while (item != RIGID_TREE_EMPTY)
+    {
+        uint32_t next = nodes[item].right;
+        nodes[item].right = RIGID_TREE_EMPTY;
+        bool toLeft = spatial
+                          ? (nodes[item].minimum[axis] + nodes[item].maximum[axis]) * 0.5 <= pivot
+                          : leftCount < half;
+        if (toLeft)
+        {
+            if (leftTail == RIGID_TREE_EMPTY) leftHead = item; else nodes[leftTail].right = item;
+            leftTail = item;
+            ++leftCount;
+        }
+        else
+        {
+            if (rightTail == RIGID_TREE_EMPTY) rightHead = item; else nodes[rightTail].right = item;
+            rightTail = item;
+        }
+        item = next;
+    }
+    uint32_t node = TakeNode(broadphase, nodes);
+    nodes[node].parent = RIGID_TREE_EMPTY;
+    nodes[node].left = RebuildSubtree(broadphase, nodes, leftHead, leftCount);
+    nodes[node].right = RebuildSubtree(broadphase, nodes, rightHead, count - leftCount);
+    nodes[nodes[node].left].parent = node;
+    nodes[nodes[node].right].parent = node;
+    RefreshNode(nodes, node);
+    return node;
+}
+
+static void RebuildTree(VoxelRigidBroadphase *broadphase, RigidTreeNode *nodes, uint32_t *slots)
+{
+    if (broadphase->root == RIGID_TREE_EMPTY)
+    {
+        return;
+    }
+    ReleaseSubtree(broadphase, nodes, broadphase->root);
+    broadphase->root = RIGID_TREE_EMPTY;
+    uint32_t head = RIGID_TREE_EMPTY;
+    uint32_t tail = RIGID_TREE_EMPTY;
+    uint32_t count = 0u;
+    for (uint32_t slot = 0u; slot < broadphase->bodyCapacity; ++slot)
+    {
+        uint32_t leaf = slots[slot];
+        if (leaf == RIGID_TREE_EMPTY)
+        {
+            continue;
+        }
+        nodes[leaf].right = RIGID_TREE_EMPTY;
+        if (tail == RIGID_TREE_EMPTY) head = leaf; else nodes[tail].right = leaf;
+        tail = leaf;
+        ++count;
+    }
+    broadphase->root = RebuildSubtree(broadphase, nodes, head, count);
+}
+
+// Первичная инкрементальная сборка даёт заметно худшую форму, чем сборка
+// сверху вниз: листья вставляются по одному, и топология получается
+// неровной. Когда последний свободный слот впервые получает лист, форма
+// собирается заново, а дальше поддерживается обычными вставками и поворотами.
+static void RebuildWhenFull(VoxelRigidBroadphase *broadphase, RigidTreeNode *nodes,
+                            uint32_t *slots, bool becameFull)
+{
+    if (becameFull)
+    {
+        RebuildTree(broadphase, nodes, slots);
+    }
+}
+
 bool RigidBroadphaseSetProxy(VoxelRigidBroadphase *broadphase, uint32_t slot,
                               const double minimum[3], const double maximum[3])
 {
@@ -597,6 +742,8 @@ bool RigidBroadphaseSetProxy(VoxelRigidBroadphase *broadphase, uint32_t slot,
     slots[slot] = leaf;
     if (!existing) ++broadphase->proxyCount;
     CountEvent(&broadphase->updatedProxyCount);
+    bool becameFull = !existing && broadphase->proxyCount == broadphase->bodyCapacity;
+    RebuildWhenFull(broadphase, nodes, slots, becameFull);
     return true;
 }
 
