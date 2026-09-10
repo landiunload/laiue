@@ -140,6 +140,7 @@ typedef enum FillKind
     FILL_MATRIX_Y_255,
     FILL_MATRIX_Y_256,
     FILL_MATRIX_Y_257,
+    FILL_COLUMN_BITS, // в каждой Z-колонне свой 64-битный узор: транспонирование без структуры
     FILL_KIND_COUNT
 } FillKind;
 
@@ -152,6 +153,7 @@ static const char *FillName(FillKind kind)
         "density_128",  "density_129",    "density_255",  "density_256",         "density_257",
         "density_4095", "density_4096",   "density_4097", "core_empty_halo",     "matrix_x_255",
         "matrix_x_256", "matrix_x_257",   "matrix_y_255", "matrix_y_256",        "matrix_y_257",
+        "column_bits",
     };
     return names[kind];
 }
@@ -178,6 +180,21 @@ static uint32_t MaterialBand(int64_t value)
 static BlockType BandBlock(int64_t x, int64_t y, int64_t z)
 {
     return (BlockType)(1u + MaterialBand(x) + MaterialBand(y) * 3u + MaterialBand(z) * 5u);
+}
+
+// Каждая Z-колонна получает свой 64-битный узор из хеша (x, y). Тогда битовые
+// матрицы, которые мешер транспонирует при построении поперечных колонн и
+// плоскостей, нерегулярны во всех шестидесяти четырёх разрядах: крайние окна
+// обмена проверяются не только на краях однородных полос.
+static uint64_t ColumnBits(int64_t x, int64_t y)
+{
+    uint64_t h = (uint64_t)(uint32_t)(x * 0x9E3779B1ll);
+    h ^= (uint64_t)(uint32_t)(y * 0x85EBCA77ll) << 32;
+    h *= 0x100000001B3ull;
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 32;
+    return h;
 }
 
 static BlockType FillBlock(FillKind kind, int64_t x, int64_t y, int64_t z)
@@ -258,6 +275,11 @@ static BlockType FillBlock(FillKind kind, int64_t x, int64_t y, int64_t z)
         bool occupied =
             plane == CHUNK_SIZE - 1 || (plane == 0 && (uint32_t)(column * CHUNK_SIZE + z) < count);
         return inside && occupied ? (BlockType)17u : BLOCK_AIR;
+    }
+    case FILL_COLUMN_BITS:
+    {
+        uint64_t bits = ColumnBits(x, y);
+        return inside && ((bits >> (uint32_t)z) & 1ull) != 0ull ? (BlockType)23u : BLOCK_AIR;
     }
     case FILL_BAND_GAPS:
     {
@@ -465,6 +487,7 @@ static uint64_t MesherGoldenHash(FillKind kind)
         UINT64_C(0x12f53bcba3c4a974), // matrix_y_255
         UINT64_C(0xaaa34ef7ddb69b18), // matrix_y_256
         UINT64_C(0xa9e3f67bf8eb4e11), // matrix_y_257
+        UINT64_C(0x23217a5fc6f604c2), // column_bits
     };
     return hashes[kind];
 }
@@ -633,6 +656,10 @@ LAIUE_TEST_ENTRY(ChunkMesherTestEntryPoint)
         RunCase((FillKind)kind, -3, 2, -1, false);
         RunCase((FillKind)kind, 2, -4, 3, true);
     }
+    // Нерегулярные Z-колонны отдельно: тот же узор, но в чанке со сдвигом и
+    // после переноса начала мира — транспонирование не должно зависеть от места.
+    RunCase(FILL_COLUMN_BITS, -3, 2, -1, false);
+    RunCase(FILL_COLUMN_BITS, 2, -4, 3, true);
 
     MesherWrite("chunk-mesher checks=");
     MesherWriteUnsigned(mesherChecks);
