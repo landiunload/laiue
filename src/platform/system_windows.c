@@ -5,6 +5,7 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <intrin.h>
 
 #include <string.h>
 
@@ -267,6 +268,15 @@ uint64_t PlatformMonotonicMilliseconds(void)
 void PlatformSleepMilliseconds(uint32_t milliseconds)
 {
     Sleep(milliseconds);
+}
+
+void PlatformCpuRelax(void)
+{
+#if defined(_M_ARM64) || defined(_M_ARM)
+    __yield();
+#else
+    _mm_pause();
+#endif
 }
 
 bool PlatformInstallTerminationHandler(void)

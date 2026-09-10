@@ -310,10 +310,16 @@ static bool AddDoubleToFixed(InfiniteCoord *value, double delta)
     {
         return IsFiniteDouble(delta);
     }
-    int64_t fixedDelta = 0;
-    if (TryDoubleToFixedInt64(delta, &fixedDelta))
+    // Произвольный путь ниже в конечном счёте прибавляет ровно
+    // trunc(delta * 2^32), если это целое помещается в int64: там целая и
+    // дробная половины сдвигаются и усекаются по отдельности, а усечение
+    // линейно по целой части. Дельта скорости, пришедшая от решателя, почти
+    // никогда не кратна 2^-32, и без этого пути на каждую ось и тело каждый
+    // тик заводятся и уничтожаются несколько bigint-объектов.
+    double scaled = delta * 4294967296.0;
+    if (scaled >= -9223372036854775808.0 && scaled < 9223372036854775808.0)
     {
-        return InfiniteCoordTryAddInt64InPlace(value, fixedDelta);
+        return InfiniteCoordTryAddInt64InPlace(value, (int64_t)scaled);
     }
     InfiniteCoord updated;
     InfiniteCoordInit(&updated);
@@ -937,6 +943,9 @@ typedef struct RigidCachedContact
 #define RIGID_CACHE_NORMAL_ALIGNMENT 0.995
 
 #define RIGID_SOLVER_COLOR_COUNT 64u
+// Ниже этого числа прогонов цвет решается вызывающим потоком: диспетчер
+// пула на короткой группе дороже самой группы. Порядок решения не меняется.
+#define RIGID_SOLVER_PARALLEL_GRAIN 16u
 #define RIGID_SOLVER_BATCH_COUNT (RIGID_SOLVER_COLOR_COUNT + 1u)
 
 // Cache only geometry during the count pass. This is not a contact limit:
@@ -2669,22 +2678,25 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
     {
         uint32_t index = scratch->order[ordered];
         scratch->islandParents[index] = index;
-        if (!bodies[index].sleeping)
-        {
-            scratch->wakeQueue[queued++] = index;
-        }
     }
-    uint32_t mask = scratch->bucketCount - 1u;
-    for (uint32_t current = 0u; current < queued && queued < scratch->activeCount; ++current)
+
+    if (scratch->broadphase != NULL)
     {
-        uint32_t first = scratch->wakeQueue[current];
-        const RigidBodyCache *firstCache = &scratch->caches[first];
-        if (!firstCache->collidable)
+        for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
         {
-            continue;
+            uint32_t index = scratch->order[ordered];
+            if (!bodies[index].sleeping)
+            {
+                scratch->wakeQueue[queued++] = index;
+            }
         }
-        if (scratch->broadphase != NULL)
+        for (uint32_t current = 0u; current < queued && queued < scratch->activeCount; ++current)
         {
+            uint32_t first = scratch->wakeQueue[current];
+            if (!scratch->caches[first].collidable)
+            {
+                continue;
+            }
             uint32_t count = 0u;
             if (!IndexedCandidates(bodies, scratch, first, true, &count))
                 return false;
@@ -2694,6 +2706,73 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
                                      &queued))
                     return false;
             }
+        }
+        return true;
+    }
+
+    // Сетка: обход идёт со стороны спящих. Когда спящих меньше, чем
+    // бодрствующих, это просматривает заметно меньше окрестностей, а набор
+    // пробуждённых тот же: спящий просыпается ровно тогда, когда пересекается
+    // с бодрствующим, а пробуждение распространяется через очередь.
+    uint32_t mask = scratch->bucketCount - 1u;
+    for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
+    {
+        uint32_t index = scratch->order[ordered];
+        if (!bodies[index].sleeping)
+        {
+            continue;
+        }
+        const RigidBodyCache *sleeperCache = &scratch->caches[index];
+        if (!sleeperCache->collidable)
+        {
+            continue;
+        }
+        for (int32_t dx = -1; dx <= 1 && bodies[index].sleeping; ++dx)
+        {
+            for (int32_t dy = -1; dy <= 1 && bodies[index].sleeping; ++dy)
+            {
+                for (int32_t dz = -1; dz <= 1 && bodies[index].sleeping; ++dz)
+                {
+                    int64_t neighbour[3] = {sleeperCache->cell[0] + dx,
+                                            sleeperCache->cell[1] + dy,
+                                            sleeperCache->cell[2] + dz};
+                    uint32_t bucket = CellHash(neighbour, mask);
+                    for (uint32_t first = scratch->buckets[bucket]; first != RIGID_HASH_EMPTY;
+                         first = scratch->next[first])
+                    {
+                        if (bodies[first].sleeping)
+                        {
+                            continue;
+                        }
+                        const RigidGridEntry *entry = &scratch->grid[first];
+                        if (entry->cell[0] != neighbour[0] || entry->cell[1] != neighbour[1] ||
+                            entry->cell[2] != neighbour[2])
+                        {
+                            continue;
+                        }
+                        if (!scratch->caches[first].collidable)
+                        {
+                            continue;
+                        }
+                        if (!WakeContactPair(bodies, scratch, settings, first, index, &queued))
+                        {
+                            return false;
+                        }
+                        if (!bodies[index].sleeping)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (uint32_t current = 0u; current < queued; ++current)
+    {
+        uint32_t first = scratch->wakeQueue[current];
+        const RigidBodyCache *firstCache = &scratch->caches[first];
+        if (!firstCache->collidable)
+        {
             continue;
         }
         for (int32_t dx = -1; dx <= 1; ++dx)
@@ -2702,16 +2781,17 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
             {
                 for (int32_t dz = -1; dz <= 1; ++dz)
                 {
-                    int64_t neighbour[3] = {firstCache->cell[0] + dx, firstCache->cell[1] + dy,
+                    int64_t neighbour[3] = {firstCache->cell[0] + dx,
+                                            firstCache->cell[1] + dy,
                                             firstCache->cell[2] + dz};
                     uint32_t bucket = CellHash(neighbour, mask);
                     for (uint32_t second = scratch->buckets[bucket]; second != RIGID_HASH_EMPTY;
                          second = scratch->next[second])
                     {
-                        // Most neighbours in an active island are already awake.
-                        // Reject them before loading their grid coordinates.
                         if (!bodies[second].sleeping)
+                        {
                             continue;
+                        }
                         const RigidGridEntry *entry = &scratch->grid[second];
                         if (entry->cell[0] != neighbour[0] || entry->cell[1] != neighbour[1] ||
                             entry->cell[2] != neighbour[2])
@@ -3501,6 +3581,39 @@ static void WarmStartContacts(const VoxelRigidBody *bodies, RigidStepScratch *sc
     }
 }
 
+typedef struct RigidStoreCacheJob
+{
+    const VoxelRigidBody *bodies;
+    const RigidStepScratch *scratch;
+    RigidCachedContact *entries;
+} RigidStoreCacheJob;
+
+// Поля кэша (ID пары, локальные якоря, нормаль, мировой импульс) не зависят
+// друг от друга, поэтому считаются параллельно. Сшивка цепочек остаётся
+// последовательной: её порядок задаёт канонический порядок в корзине.
+static void StoreCacheFieldsRange(void *context, uint32_t begin, uint32_t end)
+{
+    RigidStoreCacheJob *job = (RigidStoreCacheJob *)context;
+    VoxelPhysicsConfigureThread();
+    for (uint32_t index = begin; index < end; ++index)
+    {
+        const RigidContact *contact = &job->scratch->contacts[index];
+        RigidCachedContact *entry = &job->entries[index];
+        entry->stableIds[0] = job->bodies[contact->bodyIndex].stableId;
+        entry->stableIds[1] =
+            contact->otherIndex == UINT32_MAX ? 0u : job->bodies[contact->otherIndex].stableId;
+        ContactLocalAnchors(contact, job->scratch, entry->localAnchors);
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            entry->normal[axis] = (float)contact->normal[axis];
+            entry->worldImpulse[axis] =
+                contact->normal[axis] * contact->normalImpulse +
+                contact->rows[1].direction[axis] * contact->tangentImpulse[0] +
+                contact->rows[2].direction[axis] * contact->tangentImpulse[1];
+        }
+    }
+}
+
 static void StoreContactCache(const VoxelRigidBody *bodies, const RigidStepScratch *scratch,
                               VoxelRigidContactCache *contactCache)
 {
@@ -3511,25 +3624,17 @@ static void StoreContactCache(const VoxelRigidBody *bodies, const RigidStepScrat
         buckets[index] = RIGID_HASH_EMPTY;
     }
     RigidCachedContact *entries = ContactCacheEntries(contactCache);
+    if (scratch->contactCount != 0u)
+    {
+        RigidStoreCacheJob job = {bodies, scratch, entries};
+        ExecuteRange(scratch, scratch->contactCount, 64u, StoreCacheFieldsRange, &job);
+    }
     // Reverse insertion gives ascending canonical contact order in each chain.
     // The scratch poses still describe the pre-integration contact geometry.
     for (uint32_t remaining = scratch->contactCount; remaining > 0u; --remaining)
     {
         uint32_t index = remaining - 1u;
-        const RigidContact *contact = &scratch->contacts[index];
         RigidCachedContact *entry = &entries[index];
-        entry->stableIds[0] = bodies[contact->bodyIndex].stableId;
-        entry->stableIds[1] =
-            contact->otherIndex == UINT32_MAX ? 0u : bodies[contact->otherIndex].stableId;
-        ContactLocalAnchors(contact, scratch, entry->localAnchors);
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-        {
-            entry->normal[axis] = (float)contact->normal[axis];
-            entry->worldImpulse[axis] =
-                contact->normal[axis] * contact->normalImpulse +
-                contact->rows[1].direction[axis] * contact->tangentImpulse[0] +
-                contact->rows[2].direction[axis] * contact->tangentImpulse[1];
-        }
         uint32_t bucket =
             ContactCacheHash(entry->stableIds[0], entry->stableIds[1], bucketCount - 1u);
         entry->next = buckets[bucket];
@@ -3750,7 +3855,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
             if (color == RIGID_SOLVER_COLOR_COUNT)
                 SolveBatchRange(&job, 0u, count);
             else
-                ExecuteRange(scratch, count, 32u, SolveBatchRange, &job);
+                ExecuteRange(scratch, count, RIGID_SOLVER_PARALLEL_GRAIN, SolveBatchRange, &job);
         }
     }
     ProfileFinish(scratch, VOXEL_RIGID_PROFILE_SOLVE, begin);

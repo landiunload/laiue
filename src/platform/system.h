@@ -115,6 +115,10 @@ void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired);
 double PlatformMonotonicSeconds(void);
 uint64_t PlatformMonotonicMilliseconds(void);
 void PlatformSleepMilliseconds(uint32_t milliseconds);
+/* Короткая пауза процессора для ограниченного спина перед парковкой потока.
+ * На x86 это PAUSE, на ARM — YIELD. На прочих платформах — пустая операция,
+ * но это только подсказка планировщику: корректность от неё не зависит. */
+void PlatformCpuRelax(void);
 
 bool PlatformInstallTerminationHandler(void);
 void PlatformRemoveTerminationHandler(void);

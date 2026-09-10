@@ -287,6 +287,18 @@ void PlatformSleepMilliseconds(uint32_t milliseconds)
     }
 }
 
+void PlatformCpuRelax(void)
+{
+#if defined(__i386__) || defined(__x86_64__)
+    __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    /* Неизвестная архитектура: барьер компилятора без инструкции. */
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
 bool PlatformInstallTerminationHandler(void)
 {
     g_terminationRequested = 0;

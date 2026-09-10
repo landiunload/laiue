@@ -14,6 +14,22 @@
 // swallowing a slow participant's whole turn.
 #define TASK_CLAIM_DIVISOR 2u
 
+// Bounded spin before parking. A participant that just executed `work` range
+// indices may busy-wait that many times `TASK_SPIN_PER_INDEX` relax
+// iterations for the next publication before it sleeps. A participant that
+// claimed nothing spins zero times, so the total spin of the pool cannot
+// exceed this fraction of the useful range work it just performed. The cap
+// bounds the waste when the next publication never comes (for example after
+// the last physics tick of a rendered frame).
+#define TASK_SPIN_PER_INDEX 128u
+#define TASK_SPIN_MAX 65536u
+
+static uint64_t SpinBudget(uint32_t work)
+{
+    uint64_t budget = (uint64_t)work * TASK_SPIN_PER_INDEX;
+    return budget > TASK_SPIN_MAX ? TASK_SPIN_MAX : budget;
+}
+
 struct LaiueTaskPool
 {
     PlatformMutex mutex;
@@ -24,7 +40,12 @@ struct LaiueTaskPool
     PlatformMutex doneMutex;
     PlatformConditionVariable doneCondition;
     PlatformThread workers[TASK_MAX_THREADS - 1u];
-    uint64_t generation;
+    // Read by every participant in the bounded spin before it parks. It is a
+    // plain volatile read on purpose: the spin only decides whether parking is
+    // worth trying, and every path that actually starts work rechecks it under
+    // the mutex. A stale or torn load can cause an extra spin or a park, never
+    // a missed publication.
+    volatile int64_t generation;
     bool stopping;
     bool mutexReady;
     bool doneMutexReady;
@@ -62,7 +83,10 @@ static uint32_t ClaimSpan(uint32_t remaining, uint32_t grain, uint32_t share)
     return batch != 0u ? batch * grain : grain;
 }
 
-static void ExecuteRanges(LaiueTaskPool *pool)
+// Executes the published job and returns how many range indices this
+// participant claimed. The caller turns that into a bounded spin budget, so a
+// participant that finds no work also does not busy-wait.
+static uint32_t ExecuteRanges(LaiueTaskPool *pool)
 {
     // The job description is immutable from publication until the barrier, so
     // it is read once. Otherwise every claim reloads it: an indirect call to
@@ -77,13 +101,14 @@ static void ExecuteRanges(LaiueTaskPool *pool)
     // publication with the job.
     const uint32_t share = (pool->workerCount + 1u) * TASK_CLAIM_DIVISOR;
     uint32_t span = ClaimSpan(count, grain, share);
+    uint32_t work = 0u;
     for (;;)
     {
         int64_t after = PlatformAtomicAddI64(&pool->nextIndex, (int64_t)span);
         int64_t claimed = after - (int64_t)span;
         if (claimed >= (int64_t)count)
         {
-            return;
+            return work;
         }
         uint32_t begin = (uint32_t)claimed;
         // The last batch of the job is short, so the limit is clamped rather
@@ -96,6 +121,7 @@ static void ExecuteRanges(LaiueTaskPool *pool)
             uint32_t length = remaining < grain ? remaining : grain;
             function(jobContext, begin, begin + length);
             begin += length;
+            work += length;
         }
         // The cursor value this claim returned already counts every claim made
         // before it, so the remainder is known rather than guessed. The next
@@ -126,9 +152,20 @@ static void ReportCompletion(LaiueTaskPool *pool)
 static uint32_t WorkerEntry(void *context)
 {
     LaiueTaskPool *pool = context;
-    uint64_t observedGeneration = 0u;
+    int64_t observedGeneration = 0;
+    uint32_t work = 0u;
     for (;;)
     {
+        // Bounded spin before parking. The budget comes from the work this
+        // worker just performed: an idle participant parks immediately, a busy
+        // one waits for the next publication without a kernel sleep.
+        uint64_t spin = 0u;
+        uint64_t budget = SpinBudget(work);
+        while (spin < budget && pool->generation == observedGeneration)
+        {
+            PlatformCpuRelax();
+            ++spin;
+        }
         PlatformMutexLock(&pool->mutex);
         while (!pool->stopping && observedGeneration == pool->generation)
         {
@@ -141,7 +178,7 @@ static uint32_t WorkerEntry(void *context)
         }
         observedGeneration = pool->generation;
         PlatformMutexUnlock(&pool->mutex);
-        ExecuteRanges(pool);
+        work = ExecuteRanges(pool);
         ReportCompletion(pool);
     }
 }
@@ -193,7 +230,18 @@ static void Run(void *context, uint32_t count, uint32_t grain, LaiueTaskRangeFun
     // sleep rechecks the generation under the mutex, so nothing is lost.
     PlatformConditionVariableWakeAll(&pool->startCondition);
 
-    ExecuteRanges(pool);
+    uint32_t work = ExecuteRanges(pool);
+
+    // Bounded spin before parking the dispatcher: the workers usually finish
+    // within the work the caller just performed, and sleeping would cost a
+    // kernel transition on every short dispatch.
+    uint64_t spin = 0u;
+    uint64_t budget = SpinBudget(work);
+    while (spin < budget && pool->remainingWorkers != 0)
+    {
+        PlatformCpuRelax();
+        ++spin;
+    }
 
     PlatformMutexLock(&pool->doneMutex);
     while (PlatformAtomicLoadI64(&pool->remainingWorkers) != 0)
