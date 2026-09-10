@@ -890,6 +890,9 @@ typedef struct RigidBodyCache
     double columns[3][3];
     double aabbMin[3];
     double aabbMax[3];
+    // Наибольший по осям радиус AABB. Заполняется на bounds и переиспользуется
+    // широким отбором: читать его заново по столбцам поворота незачем.
+    double radius;
     int64_t cell[3];
     bool hasWorldContact;
     bool hasBodyContact;
@@ -1353,6 +1356,7 @@ static void BuildCache(const VoxelRigidBody *body, RigidBodyCache *cache)
     // Cheap broadphase rejection for the SAT path.  The uniform grid only
     // bounds centres; most neighbouring cells still contain boxes whose AABBs
     // are disjoint, especially in sparse worlds.
+    double largestRadius = 0.0;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         double radius = AbsoluteDouble(cache->columns[0][axis]) * body->halfExtent[0] +
@@ -1360,7 +1364,12 @@ static void BuildCache(const VoxelRigidBody *body, RigidBodyCache *cache)
                         AbsoluteDouble(cache->columns[2][axis]) * body->halfExtent[2];
         cache->aabbMin[axis] = cache->position[axis] - radius;
         cache->aabbMax[axis] = cache->position[axis] + radius;
+        if (radius > largestRadius)
+        {
+            largestRadius = radius;
+        }
     }
+    cache->radius = largestRadius;
 
     (void)axisAligned;
 }
@@ -2504,26 +2513,21 @@ static uint32_t CellHash(const int64_t cell[3], uint32_t mask)
 // весь бюджет кадра.
 static void PrepareBroadphaseCells(const VoxelRigidBody *bodies, RigidStepScratch *scratch)
 {
+    (void)bodies;
+    // Радиус AABB уже посчитан на стадии bounds и лежит в кэше: повторное
+    // чтение столбцов поворота и halfExtent здесь было чистым дублированием.
     double largest = 0.0;
     for (uint32_t ordered = 0; ordered < scratch->activeCount; ++ordered)
     {
         uint32_t index = scratch->order[ordered];
-        if (!scratch->caches[index].collidable)
+        const RigidBodyCache *cache = &scratch->caches[index];
+        if (!cache->collidable)
         {
             continue;
         }
-        for (int32_t axis = 0; axis < 3; ++axis)
+        if (cache->radius > largest)
         {
-            double radius = AbsoluteDouble(scratch->caches[index].columns[0][axis]) *
-                                bodies[index].halfExtent[0] +
-                            AbsoluteDouble(scratch->caches[index].columns[1][axis]) *
-                                bodies[index].halfExtent[1] +
-                            AbsoluteDouble(scratch->caches[index].columns[2][axis]) *
-                                bodies[index].halfExtent[2];
-            if (radius > largest)
-            {
-                largest = radius;
-            }
+            largest = cache->radius;
         }
     }
     scratch->cellSize = largest > 0.0 ? largest * 2.0 : 1.0;
@@ -4310,10 +4314,14 @@ static bool AngularStepRadians(const InfiniteCoord *component, double *outRadian
 static bool IntegrateBody(VoxelRigidBody *body, const RigidBodyCache *cache)
 {
     // Скорость возвращается в произвольную точность добавкой разницы:
-    // решатель считал в double, а хранится величина без потолка.
+    // решатель считал в double, а хранится величина без потолка. У тела без
+    // единого контакта решатель к кэшу не прикасался, поэтому кэш — это ровно
+    // прочитанная из тела скорость: добавка была бы нулевой, а чтение
+    // шести компонент и вычитание — впустую.
+    bool velocityChanged = cache->collidable && (cache->hasWorldContact || cache->hasBodyContact);
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        if (cache->collidable)
+        if (velocityChanged)
         {
             double linearDelta = cache->linear[axis] - FixedToDouble(&body->linearVelocity[axis]);
             double angularDelta =
@@ -4426,16 +4434,16 @@ static void PutBodyToSleep(VoxelRigidBody *body)
 static void UpdateSleepIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch,
                                const VoxelRigidStepSettings *settings)
 {
-    const uint32_t quietFlag = 1u;
+    // После IntegrateRange весь wakeQueue активных тел обнулён, и ноль здесь
+    // читается как «остров готов и не шумит». Прежний отдельный проход,
+    // проставлявший бит тишины всем телам, был не нужен: бит готовности
+    // ставится только тому острову, где тело ещё не созрело.
+    const uint32_t noisyFlag = 1u;
     const uint32_t supportedFlag = 2u;
     bool sleepEnabled = settings->sleepFrames != 0u && settings->sleepLinearSpeed > 0.0 &&
                         settings->sleepAngularSpeed > 0.0;
     bool hasGravity =
         settings->gravity[0] != 0.0 || settings->gravity[1] != 0.0 || settings->gravity[2] != 0.0;
-    for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
-    {
-        scratch->wakeQueue[scratch->order[ordered]] = quietFlag;
-    }
     for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
     {
         uint32_t index = scratch->order[ordered];
@@ -4465,7 +4473,7 @@ static void UpdateSleepIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
         uint32_t root = IslandRoot(scratch, index);
         if (!sleepEnabled || body->sleepCounter < settings->sleepFrames)
         {
-            scratch->wakeQueue[root] &= ~quietFlag;
+            scratch->wakeQueue[root] |= noisyFlag;
         }
         if (cache->hasWorldContact || !hasGravity)
         {
@@ -4476,7 +4484,7 @@ static void UpdateSleepIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
     {
         uint32_t index = scratch->order[ordered];
         if (!bodies[index].sleeping &&
-            scratch->wakeQueue[IslandRoot(scratch, index)] == (quietFlag | supportedFlag))
+            scratch->wakeQueue[IslandRoot(scratch, index)] == supportedFlag)
         {
             PutBodyToSleep(&bodies[index]);
         }

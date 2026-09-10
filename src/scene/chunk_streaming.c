@@ -276,6 +276,159 @@ static bool IsInsideRadius(const ChunkStreaming* streaming, int64_t x, int64_t y
     return deltaX <= radius && deltaY <= radius && deltaZ <= radius;
 }
 
+// Удаляет запись из таблицы открытой адресации, сдвигая кластер назад,
+// чтобы не заводить надгробий (иначе таблица со временем набивается
+// мёртвыми слотами и её пришлось бы периодически пересобирать целиком).
+// Сдвиг меняет индекс записи в массиве entries, поэтому у каждой
+// перемещённой записи обязательно чинится ссылка в плотном списке
+// отрисовки: drawItems хранит именно индекс, а не указатель.
+static void EraseEntry(ChunkStreaming* streaming, ChunkEntry* entry)
+{
+    const uint32_t mask = streaming->capacity - 1u;
+    uint32_t hole = (uint32_t)(entry - streaming->entries);
+
+    for (uint32_t scan = hole;;)
+    {
+        scan = (scan + 1u) & mask;
+        ChunkEntry* candidate = &streaming->entries[scan];
+        if (candidate->state == CHUNK_ENTRY_EMPTY)
+        {
+            break;
+        }
+
+        // Кандидат переезжает в дыру только если дыра лежит на его пути
+        // пробирования: прямое расстояние от home до дыры не больше, чем
+        // до текущего слота. Иначе home оказался бы за дырой и FindEntry
+        // его больше не нашёл бы.
+        const uint32_t home =
+            WorldHashChunkCoordinate(candidate->x, candidate->y, candidate->z) & mask;
+        const uint32_t homeToHole = (hole - home) & mask;
+        const uint32_t homeToScan = (scan - home) & mask;
+        if (homeToHole <= homeToScan)
+        {
+            streaming->entries[hole] = *candidate;
+            ChunkEntry* moved = &streaming->entries[hole];
+            if (moved->drawSlotPlusOne != 0)
+            {
+                streaming->drawItems[moved->drawSlotPlusOne - 1u].entryIndex = hole;
+            }
+            hole = scan;
+        }
+    }
+
+    ChunkEntry* vacated = &streaming->entries[hole];
+    vacated->state = CHUNK_ENTRY_EMPTY;
+    vacated->mesh = NULL;
+    vacated->drawSlotPlusOne = 0;
+}
+
+#ifndef NDEBUG
+static void VerifyFail(const char* message)
+{
+    PlatformWriteConsoleUtf8(message);
+    PlatformWriteConsoleUtf8("\r\n");
+    volatile int* fault = (volatile int*)0;
+    *fault = 1;
+}
+
+// Проверка целостности после каждого перехода. Ловит потерянную запись
+// (дыра в кластере делает последующие ключи недостижимыми), дубликат
+// ключа и рассинхронизацию плотного списка отрисовки/очереди заявок с
+// таблицей. Работает только в отладочной сборке: полный проход по таблице
+// в релизе недопустим.
+static void VerifyStreamingIntegrity(ChunkStreaming* streaming)
+{
+    const uint32_t mask = streaming->capacity - 1u;
+
+    for (uint32_t index = 0; index < streaming->capacity; ++index)
+    {
+        const ChunkEntry* entry = &streaming->entries[index];
+        if (entry->state == CHUNK_ENTRY_EMPTY)
+        {
+            continue;
+        }
+
+        uint32_t probe = WorldHashChunkCoordinate(entry->x, entry->y, entry->z) & mask;
+        bool reachable = false;
+        for (uint32_t step = 0; step < streaming->capacity; ++step)
+        {
+            if (probe == index)
+            {
+                reachable = true;
+                break;
+            }
+            const ChunkEntry* other = &streaming->entries[probe];
+            if (other->state == CHUNK_ENTRY_EMPTY)
+            {
+                break;
+            }
+            if (other->x == entry->x && other->y == entry->y && other->z == entry->z)
+            {
+                VerifyFail("chunk streaming integrity: duplicate chunk key in table");
+            }
+            probe = (probe + 1u) & mask;
+        }
+        if (!reachable)
+        {
+            VerifyFail("chunk streaming integrity: entry unreachable through FindEntry");
+        }
+    }
+
+    for (uint32_t slot = 0; slot < streaming->drawItemCount; ++slot)
+    {
+        const DrawItem* item = &streaming->drawItems[slot];
+        if (item->entryIndex >= streaming->capacity)
+        {
+            VerifyFail("chunk streaming integrity: draw item index out of range");
+        }
+        const ChunkEntry* entry = &streaming->entries[item->entryIndex];
+        if (entry->mesh == NULL)
+        {
+            VerifyFail("chunk streaming integrity: draw item references an entry without mesh");
+        }
+        if (entry->drawSlotPlusOne != slot + 1u)
+        {
+            VerifyFail("chunk streaming integrity: draw slot does not match its position");
+        }
+        if (FindEntry(streaming, entry->x, entry->y, entry->z) != entry)
+        {
+            VerifyFail("chunk streaming integrity: drawn entry is not the table's own record");
+        }
+    }
+
+    for (uint32_t index = 0; index < streaming->capacity; ++index)
+    {
+        const ChunkEntry* entry = &streaming->entries[index];
+        if (entry->mesh == NULL)
+        {
+            continue;
+        }
+        if (entry->drawSlotPlusOne == 0 || entry->drawSlotPlusOne > streaming->drawItemCount)
+        {
+            VerifyFail("chunk streaming integrity: mesh is missing from the draw list");
+        }
+        if (streaming->drawItems[entry->drawSlotPlusOne - 1u].entryIndex != index)
+        {
+            VerifyFail("chunk streaming integrity: draw list points to the wrong entry");
+        }
+    }
+
+    PlatformMutexLock(&streaming->queueLock);
+    const uint32_t requestCount = streaming->requestCount;
+    const uint32_t resultCount = streaming->resultCount;
+    const uint32_t unfinishedWork = streaming->unfinishedWork;
+    const uint32_t queueCapacity = streaming->queueCapacity;
+    PlatformMutexUnlock(&streaming->queueLock);
+
+    if (requestCount > queueCapacity || resultCount > queueCapacity
+        || unfinishedWork > queueCapacity
+        || unfinishedWork < requestCount + resultCount)
+    {
+        VerifyFail("chunk streaming integrity: request/result ring is inconsistent");
+    }
+}
+#endif
+
 // Ставит заявку текущей ревизии записи; false — очередь занята,
 // повторная попытка произойдёт в ChunkStreamingPump.
 static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
@@ -560,6 +713,72 @@ static void QueueMissingLeadingFace(ChunkStreaming* streaming,
     }
 }
 
+// Выбрасывает один ушедший чанк: снимает меш со списка отрисовки,
+// освобождает его и удаляет запись из таблицы. Повторный вызов для того же
+// ключа безвреден: FindEntry уже вернёт NULL.
+static void EvictChunk(ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
+{
+    ChunkEntry* entry = FindEntry(streaming, x, y, z);
+    if (entry == NULL)
+    {
+        return;
+    }
+
+    if (entry->mesh != NULL)
+    {
+        RemoveMeshFromDrawList(streaming, entry);
+        RendererDestroyMesh(streaming->renderer, entry->mesh);
+        entry->mesh = NULL;
+    }
+    EraseEntry(streaming, entry);
+}
+
+// При переходе ровно на соседний чанк за пределами нового радиуса+1
+// оказываются только уходящие грани старого куба: по одной на каждую ось,
+// изменившую знак. Перебирать всю таблицу, как при первом вызове или
+// телепорте, не нужно.
+static void EvictDepartedChunks(ChunkStreaming* streaming,
+    int64_t previousX, int64_t previousY, int64_t previousZ)
+{
+    const int64_t radius = (int64_t)streaming->viewRadius + 1;
+    const int64_t delta[3] = {
+        streaming->centerX - previousX,
+        streaming->centerY - previousY,
+        streaming->centerZ - previousZ
+    };
+    const int64_t previous[3] = { previousX, previousY, previousZ };
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        if (delta[axis] == 0)
+        {
+            continue;
+        }
+
+        const int64_t sign = delta[axis] > 0 ? 1 : -1;
+        const int32_t axisA = (axis + 1) % 3;
+        const int32_t axisB = (axis + 2) % 3;
+        const int64_t faceCoordinate = previous[axis] - sign * radius;
+
+        for (int64_t offsetA = -radius; offsetA <= radius; ++offsetA)
+        {
+            for (int64_t offsetB = -radius; offsetB <= radius; ++offsetB)
+            {
+                int64_t chunk[3];
+                chunk[axis] = faceCoordinate;
+                chunk[axisA] = previous[axisA] + offsetA;
+                chunk[axisB] = previous[axisB] + offsetB;
+
+                if (IsInsideRadius(streaming, chunk[0], chunk[1], chunk[2], radius))
+                {
+                    continue;
+                }
+                EvictChunk(streaming, chunk[0], chunk[1], chunk[2]);
+            }
+        }
+    }
+}
+
 bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
     bool originDeltaFits,
     int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
@@ -611,6 +830,11 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
     }
 
     QueueMissingChunks(streaming, newCenterX, newCenterY, newCenterZ);
+
+#ifndef NDEBUG
+    VerifyStreamingIntegrity(streaming);
+#endif
+
     ResumeWorkerThreads(streaming);
     return true;
 }
@@ -757,8 +981,31 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         && deltaY >= -1 && deltaY <= 1
         && deltaZ >= -1 && deltaZ <= 1;
 
-    // Вторая таблица переиспользуется при каждом переходе чанка:
-    // никаких выделений и освобождений памяти в цикле кадра.
+    // Переход на соседний чанк: таблицу не пересобираем. Уходят только
+    // уходящие грани, приходят только дальние — их и трогаем точечно.
+    // Раньше здесь memset-илась запасная таблица и в неё заливались все
+    // ≈(2R+3)^3 записи ради (2R+1)^2 изменившихся.
+    if (unitStep)
+    {
+        streaming->hasCenter = true;
+        streaming->centerX = chunkX;
+        streaming->centerY = chunkY;
+        streaming->centerZ = chunkZ;
+        PlatformAtomicIncrementU32(&streaming->centerEpoch);
+
+        EvictDepartedChunks(streaming, previousX, previousY, previousZ);
+        QueueMissingLeadingFace(streaming, previousX, previousY, previousZ,
+            chunkX, chunkY, chunkZ);
+
+#ifndef NDEBUG
+        VerifyStreamingIntegrity(streaming);
+#endif
+        return;
+    }
+
+    // Первый вызов, телепорт или смена центра больше чем на чанк:
+    // пересобираем таблицу целиком. Вторая таблица переиспользуется,
+    // поэтому выделений и освобождений памяти нет.
     memset(streaming->spareEntries, 0,
         (size_t)streaming->capacity * sizeof(ChunkEntry));
 
@@ -810,18 +1057,13 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         }
     }
 
-    // Переход ровно на соседний чанк добавляет лишь дальнюю грань куба:
-    // перебирать весь куб, как при первом вызове, телепорте или смене
-    // origin, здесь не нужно.
-    if (unitStep)
-    {
-        QueueMissingLeadingFace(streaming,
-            previousX, previousY, previousZ, chunkX, chunkY, chunkZ);
-    }
-    else
-    {
-        QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
-    }
+    // Сюда попадают только первый вызов, телепорт и смена origin:
+    // для шага на соседний чанк выше есть точечный путь.
+    QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
+
+#ifndef NDEBUG
+    VerifyStreamingIntegrity(streaming);
+#endif
 }
 
 void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, int64_t blockY, int64_t blockZ)

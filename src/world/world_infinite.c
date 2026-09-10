@@ -5,6 +5,15 @@
 #include <limits.h>
 #include <string.h>
 
+/* Разбор региона читает буфер сравнением с нулём. SSE2 входит в базовый набор
+ * x64, AVX2 включается профилем сборки. Там, где векторного сравнения нет
+ * (например, ARM64), остаётся переносимый 8-байтный цикл. */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
+#include <emmintrin.h>
+#endif
+
 typedef struct LocalChunkCoordinate
 {
     int64_t x;
@@ -948,18 +957,22 @@ static size_t RegionIndex(int64_t x, int64_t y, int64_t z,
         + (size_t)(z - minZ);
 }
 
-/* Разбор региона идёт по восемь ячеек за раз. Смешанный регион находит оба
- * признака почти сразу и выходит, а вот однородный обязан прочитать всё:
- * именно он и стоит дорого, потому что чанк без единого блока над
- * поверхностью — самый частый в мире. BLOCK_AIR равен нулю, поэтому
- * «есть непустая ячейка» — это ненулевое слово, а «есть пустая» — известный
- * приём поиска нулевого байта: занять из каждого байта единицу и посмотреть,
- * у какого из них старший бит поднялся там, где сам байт его не имел. */
+/* Разбор региона ищет в буфере пустые и непустые ячейки. Смешанный регион
+ * находит оба признака почти сразу и выходит, а вот однородный обязан
+ * прочитать всё: именно он и стоит дорого, потому что чанк без единого блока
+ * над поверхностью — самый частый в мире. Поэтому сравнение с нулём идёт
+ * векторами по 32 (AVX2) или 16 (SSE2) байт, и только хвост — словом.
+ * BLOCK_AIR равен нулю, поэтому «есть непустая ячейка» — это ненулевой
+ * вектор, а «есть пустая» — ненулевая маска совпадений с нулём. Там, где
+ * векторов нет (например, ARM64), остаётся прежний приём поиска нулевого
+ * байта в 8-байтном слове. */
+#if !(defined(__AVX2__) || defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))))
 static inline bool WordHasZeroByte(uint64_t word)
 {
     return ((word - UINT64_C(0x0101010101010101))
         & ~word & UINT64_C(0x8080808080808080)) != 0;
 }
+#endif
 
 static WorldRegionContents ClassifyRegion(const BlockType* blocks, size_t cellCount)
 {
@@ -967,6 +980,37 @@ static WorldRegionContents ClassifyRegion(const BlockType* blocks, size_t cellCo
     bool anySolid = false;
     size_t index = 0;
 
+#if defined(__AVX2__)
+    const __m256i airVector = _mm256_setzero_si256();
+    for (; index + 32U <= cellCount; index += 32U)
+    {
+        __m256i voxels = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(blocks + index));
+        uint32_t airBits = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(voxels, airVector));
+        anyAir |= airBits != 0U;
+        anySolid |= airBits != 0xFFFFFFFFU;
+        if (anyAir && anySolid)
+        {
+            return WORLD_REGION_MIXED;
+        }
+    }
+#elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
+    const __m128i airVector = _mm_setzero_si128();
+    for (; index + 16U <= cellCount; index += 16U)
+    {
+        __m128i voxels = _mm_loadu_si128(
+            (const __m128i*)(const void*)(blocks + index));
+        uint32_t airBits = (uint32_t)_mm_movemask_epi8(
+            _mm_cmpeq_epi8(voxels, airVector));
+        anyAir |= airBits != 0U;
+        anySolid |= airBits != 0xFFFFU;
+        if (anyAir && anySolid)
+        {
+            return WORLD_REGION_MIXED;
+        }
+    }
+#else
     /* Копирование в слово, а не приведение указателя: выравнивание массива
      * задаёт вызывающая сторона, а memcpy этой длины компилятор превращает
      * в обычную загрузку. */
@@ -981,6 +1025,7 @@ static WorldRegionContents ClassifyRegion(const BlockType* blocks, size_t cellCo
             return WORLD_REGION_MIXED;
         }
     }
+#endif
     for (; index < cellCount; ++index)
     {
         anyAir |= blocks[index] == BLOCK_AIR;
