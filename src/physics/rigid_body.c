@@ -942,6 +942,10 @@ typedef struct RigidCachedContact
 #define RIGID_CACHE_ANCHOR_DISTANCE_SQUARED 0.0001
 #define RIGID_CACHE_NORMAL_ALIGNMENT 0.995
 
+// Граница между вставками и пирамидальной сортировкой для кандидатов
+// одного тела. Подобрана замером, а не рассуждением.
+#define RIGID_CANDIDATE_INSERTION_MAX 16u
+
 #define RIGID_SOLVER_COLOR_COUNT 64u
 // Ниже этого числа прогонов цвет решается вызывающим потоком: диспетчер
 // пула на короткой группе дороже самой группы. Порядок решения не меняется.
@@ -2599,16 +2603,43 @@ static bool IndexedCandidates(const VoxelRigidBody *bodies, RigidStepScratch *sc
         if (neighbour)
             scratch->next[kept++] = slot;
     }
-    for (uint32_t parent = kept / 2u; parent > 0u; --parent)
+    // Кандидатов у одного тела почти всегда единицы: на осевшей куче из 4096
+    // тел в среднем семь. На таком числе вставки делают вдвое-втрое меньше
+    // сравнений, чем пирамидальная сортировка, а сравнение здесь дорогое — оно
+    // тянет ячейку из рабочего кэша тела и stableId из публичного тела, то
+    // есть до четырёх строк кэша на одно сравнение.
+    //
+    // Порядок получается тот же самый: сравнение задаёт строгий полный
+    // порядок (stableId уникальны), а у такого порядка отсортированная
+    // последовательность единственная. Пирамидальная сортировка остаётся для
+    // больших выборок, чтобы худший случай не стал квадратичным.
+    if (kept <= RIGID_CANDIDATE_INSERTION_MAX)
     {
-        SiftCandidates(bodies, scratch, parent - 1u, kept);
+        for (uint32_t index = 1u; index < kept; ++index)
+        {
+            uint32_t value = scratch->next[index];
+            uint32_t hole = index;
+            while (hole > 0u && CandidateAfter(bodies, scratch, scratch->next[hole - 1u], value))
+            {
+                scratch->next[hole] = scratch->next[hole - 1u];
+                --hole;
+            }
+            scratch->next[hole] = value;
+        }
     }
-    for (uint32_t remaining = kept; remaining > 1u; --remaining)
+    else
     {
-        uint32_t temporary = scratch->next[0];
-        scratch->next[0] = scratch->next[remaining - 1u];
-        scratch->next[remaining - 1u] = temporary;
-        SiftCandidates(bodies, scratch, 0u, remaining - 1u);
+        for (uint32_t parent = kept / 2u; parent > 0u; --parent)
+        {
+            SiftCandidates(bodies, scratch, parent - 1u, kept);
+        }
+        for (uint32_t remaining = kept; remaining > 1u; --remaining)
+        {
+            uint32_t temporary = scratch->next[0];
+            scratch->next[0] = scratch->next[remaining - 1u];
+            scratch->next[remaining - 1u] = temporary;
+            SiftCandidates(bodies, scratch, 0u, remaining - 1u);
+        }
     }
     *outCount = kept;
     return true;
@@ -2733,8 +2764,7 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
             {
                 for (int32_t dz = -1; dz <= 1 && bodies[index].sleeping; ++dz)
                 {
-                    int64_t neighbour[3] = {sleeperCache->cell[0] + dx,
-                                            sleeperCache->cell[1] + dy,
+                    int64_t neighbour[3] = {sleeperCache->cell[0] + dx, sleeperCache->cell[1] + dy,
                                             sleeperCache->cell[2] + dz};
                     uint32_t bucket = CellHash(neighbour, mask);
                     for (uint32_t first = scratch->buckets[bucket]; first != RIGID_HASH_EMPTY;
@@ -2781,8 +2811,7 @@ static bool WakeContactIslands(VoxelRigidBody *bodies, RigidStepScratch *scratch
             {
                 for (int32_t dz = -1; dz <= 1; ++dz)
                 {
-                    int64_t neighbour[3] = {firstCache->cell[0] + dx,
-                                            firstCache->cell[1] + dy,
+                    int64_t neighbour[3] = {firstCache->cell[0] + dx, firstCache->cell[1] + dy,
                                             firstCache->cell[2] + dz};
                     uint32_t bucket = CellHash(neighbour, mask);
                     for (uint32_t second = scratch->buckets[bucket]; second != RIGID_HASH_EMPTY;
