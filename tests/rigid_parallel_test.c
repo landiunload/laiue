@@ -1,4 +1,5 @@
 #include "physics/rigid_body.h"
+#include "physics/rigid_broadphase.h"
 #include "task/task_pool.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"
@@ -9,6 +10,7 @@
 #define REPLAY_TICKS 512u
 #define TEST_SCRATCH_BYTES 1048576u
 #define TEST_CACHE_BYTES 262144u
+#define TEST_BROADPHASE_BYTES 262144u
 #define TEST_RANGE_CAPACITY (TEST_CAPACITY * VOXEL_RIGID_CONTACTS_PER_BODY)
 
 typedef struct PhysicsFixture
@@ -16,6 +18,8 @@ typedef struct PhysicsFixture
     VoxelRigidBody bodies[TEST_CAPACITY];
     uint8_t scratch[TEST_SCRATCH_BYTES];
     uint8_t cacheStorage[TEST_CACHE_BYTES];
+    uint8_t broadphaseStorage[TEST_BROADPHASE_BYTES];
+    VoxelRigidBroadphase broadphase;
     VoxelRigidContactCache cache;
     VoxelRigidStepProfile profile;
     uint32_t clockCalls;
@@ -34,6 +38,9 @@ static LaiueTaskExecutor hostileExecutor;
 static LaiueTaskExecutor reverseExecutor;
 static bool insideExecutor;
 static bool floorEnabled;
+// Дерево широкого отбора включается отдельно: у сеточного и у древесного
+// путей узкая фаза разная, и параллельной проверки требуют оба.
+static bool indexedBroadphase;
 static int64_t worldOrigin[3];
 static uint64_t queryHash;
 static uint32_t hostileDispatches;
@@ -258,6 +265,7 @@ static void ResetFixtures(void)
 {
     ReleaseFixtures();
     floorEnabled = true;
+    indexedBroadphase = false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
         worldOrigin[axis] = 0;
     uint32_t cacheBytes = VoxelRigidContactCacheBytes(TEST_CAPACITY);
@@ -270,6 +278,12 @@ static void ResetFixtures(void)
         Expect(VoxelRigidContactCacheInitialize(&fixture->cache, fixture->cacheStorage,
                                                 TEST_CAPACITY, TEST_CACHE_BYTES),
                "cache initialized");
+        uint32_t indexBytes = VoxelRigidBroadphaseBytes(TEST_CAPACITY);
+        Expect(indexBytes != 0u && indexBytes <= TEST_BROADPHASE_BYTES,
+               "broadphase storage sufficient");
+        Expect(VoxelRigidBroadphaseInitialize(&fixture->broadphase, fixture->broadphaseStorage,
+                                              TEST_CAPACITY, TEST_BROADPHASE_BYTES),
+               "broadphase initialized");
         fixture->profile = (VoxelRigidStepProfile){.structSize = sizeof(VoxelRigidStepProfile)};
         fixture->clockCalls = 0u;
     }
@@ -313,6 +327,7 @@ static VoxelRigidStepOptions Options(PhysicsFixture *fixture, VoxelRigidSolverOr
     VoxelRigidStepOptions options = {0};
     options.structSize = sizeof(options);
     options.contactCache = &fixture->cache;
+    options.broadphase = indexedBroadphase ? &fixture->broadphase : NULL;
     options.executor = executor;
     options.solverOrder = order;
     options.profile = &fixture->profile;
@@ -451,9 +466,13 @@ static uint64_t Replay(VoxelRigidSolverOrder order)
     return hash;
 }
 
-static void TestDenseParallelGrid(VoxelRigidSolverOrder order)
+// Плотная сцена для параллельной узкой фазы. indexed выбирает путь: без
+// дерева работает сеточный обход, с деревом — запрос к дереву. Пути разные,
+// и оба обязаны давать то же состояние, что последовательный шаг.
+static void DenseParallelScene(VoxelRigidSolverOrder order, bool indexed)
 {
     ResetFixtures();
+    indexedBroadphase = indexed;
     VoxelRigidStepSettings settings;
     VoxelRigidStepSettingsDefault(&settings);
     settings.sleepFrames = 0u;
@@ -493,6 +512,77 @@ static void TestDenseParallelGrid(VoxelRigidSolverOrder order)
                                                TEST_SCRATCH_BYTES, &stats) &&
                        stats.contactCount > TEST_CAPACITY,
                    "dense parallel regression exercises many real contacts");
+        }
+    }
+}
+
+static void TestDenseParallelGrid(VoxelRigidSolverOrder order)
+{
+    DenseParallelScene(order, false);
+}
+
+// Девяносто шесть тел переводят древесный путь через порог параллельной узкой
+// фазы. Враждебный и обратный исполнители режут диапазоны иначе, чем
+// последовательный шаг, поэтому этот тест ловит любую зависимость состава или
+// порядка контактов от разбиения работы.
+static void TestDenseParallelTree(VoxelRigidSolverOrder order)
+{
+    DenseParallelScene(order, true);
+}
+
+// Одно широкое тело под россыпью мелких. У плиты наименьший stableId, поэтому
+// все пары записываются от неё, и её контактов заведомо больше восьми — а это
+// ровно тот случай, когда второй проход не может скопировать сохранённую
+// геометрию и обязан построить манифольды заново. Без этой сцены путь
+// перегенерации остаётся непроверенным.
+static void TestWideBodyParallelTree(VoxelRigidSolverOrder order)
+{
+    ResetFixtures();
+    indexedBroadphase = true;
+    VoxelRigidStepSettings settings;
+    VoxelRigidStepSettingsDefault(&settings);
+    settings.sleepFrames = 0u;
+    for (uint32_t slot = 0u; slot < TEST_CAPACITY; ++slot)
+    {
+        VoxelRigidBodyDescription description = Description();
+        if (slot == 0u)
+        {
+            description.halfExtent[0] = 6.0;
+            description.halfExtent[1] = 3.0;
+            description.halfExtent[2] = 0.45;
+            description.mass = 1000.0;
+            description.position[0] = 3.5;
+            description.position[1] = 1.5;
+            description.position[2] = 0.44;
+        }
+        else
+        {
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                description.halfExtent[axis] = 0.45;
+            description.position[0] = (double)((slot - 1u) % 8u);
+            description.position[1] = (double)(((slot - 1u) / 8u) % 4u);
+            description.position[2] = 1.32 + (double)((slot - 1u) / 32u) * 0.89;
+        }
+        description.friction = 0.6;
+        InitializeBody(slot, &description);
+    }
+    for (uint32_t slot = 1u; slot < TEST_CAPACITY / 2u; ++slot)
+    {
+        uint32_t other = TEST_CAPACITY - slot;
+        VoxelRigidBody temporary = fixtures[2].bodies[slot];
+        fixtures[2].bodies[slot] = fixtures[2].bodies[other];
+        fixtures[2].bodies[other] = temporary;
+    }
+    for (uint32_t tick = 0u; tick < 96u; ++tick)
+    {
+        StepAll(TEST_CAPACITY, &settings, order);
+        if (tick == 0u)
+        {
+            VoxelRigidStepStats stats;
+            Expect(VoxelRigidBodyReadStepStats(fixtures[0].scratch, TEST_CAPACITY,
+                                               TEST_SCRATCH_BYTES, &stats) &&
+                       stats.contactCount > 8u * TEST_CAPACITY / 4u,
+                   "wide body parallel scene forces manifold regeneration");
         }
     }
 }
@@ -830,6 +920,10 @@ LAIUE_TEST_ENTRY(RigidParallelTestEntryPoint)
     uint64_t coloredHash = Replay(VOXEL_RIGID_SOLVER_COLORED);
     TestDenseParallelGrid(VOXEL_RIGID_SOLVER_CANONICAL);
     TestDenseParallelGrid(VOXEL_RIGID_SOLVER_COLORED);
+    TestDenseParallelTree(VOXEL_RIGID_SOLVER_CANONICAL);
+    TestDenseParallelTree(VOXEL_RIGID_SOLVER_COLORED);
+    TestWideBodyParallelTree(VOXEL_RIGID_SOLVER_CANONICAL);
+    TestWideBodyParallelTree(VOXEL_RIGID_SOLVER_COLORED);
     TestSplitWarmCacheRuns(VOXEL_RIGID_SOLVER_CANONICAL);
     TestSplitWarmCacheRuns(VOXEL_RIGID_SOLVER_COLORED);
     TestSleepWake(VOXEL_RIGID_SOLVER_CANONICAL);

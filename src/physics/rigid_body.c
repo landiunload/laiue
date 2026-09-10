@@ -994,6 +994,11 @@ typedef struct RigidStepScratch
     uint64_t *bodyColors;
     uint8_t *contactColors;
     uint32_t *solveOrder;
+    // Посещения узлов дерева, накопленные за тело. Запрос считает их в своём
+    // описателе, а описатель у параллельного обхода свой на каждый диапазон:
+    // иначе несколько потоков писали бы в один счётчик. Сумма собирается
+    // последовательно, в каноническом порядке, поэтому число не плавает.
+    uint32_t *narrowVisits;
     uint32_t batchOffsets[RIGID_SOLVER_BATCH_COUNT + 1u];
     const VoxelRigidStepOptions *options;
     uint32_t bucketCount;
@@ -1248,7 +1253,7 @@ uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
     uint64_t geometry =
         (uint64_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     uint64_t contacts = (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
-    uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 4u;
+    uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 5u;
     uint64_t schedule =
         (uint64_t)bodyCount *
         (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
@@ -1266,7 +1271,7 @@ static VoxelRigidStepStats *StepStatsPointer(void *scratch, uint32_t bodyCount)
     cursor += (size_t)bodyCount * sizeof(RigidGridEntry);
     cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
-    cursor += (size_t)bodyCount * sizeof(uint32_t) * 4u;
+    cursor += (size_t)bodyCount * sizeof(uint32_t) * 5u;
     cursor += (size_t)bodyCount *
               (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
     cursor += (size_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
@@ -3104,14 +3109,253 @@ static bool CollectGridContactsParallel(const VoxelRigidBody *bodies, RigidStepS
     return true;
 }
 
+// Список кандидатов одного тела. На осевшей куче из 4096 тел их в среднем
+// семь; сотня с запасом покрывает и заметно более плотные сцены. Если запрос
+// не уложился, стадия целиком возвращается к последовательному пути, где
+// буфер размером с массив тел, — состав контактов от этого не зависит.
+#define RIGID_TREE_NARROW_CANDIDATES 128u
+
+// Узкая фаза по дереву тем же двухпроходным способом, что и сеточная: сначала
+// каждое тело считает свои контакты, затем канонический префиксный проход
+// раздаёт непересекающиеся куски выхода, и второй проход пишет. Порядок
+// контактов задаётся префиксным проходом по scratch->order, то есть он тот же,
+// что и у последовательного обхода, при любом числе рабочих.
+static void TreeNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
+{
+    RigidNarrowphaseJob *job = (RigidNarrowphaseJob *)context;
+    const VoxelRigidBody *bodies = job->bodies;
+    RigidStepScratch *scratch = job->scratch;
+    VoxelPhysicsConfigureThread();
+
+    // Запрос пишет в две общие вещи: список кандидатов scratch->next и счётчик
+    // посещённых узлов внутри описателя дерева. У каждого диапазона они свои —
+    // буфер на стеке и копия описателя, — поэтому потоки не мешают друг другу.
+    // Копия описателя смотрит на то же хранилище: сам обход дерево не меняет.
+    uint32_t candidates[RIGID_TREE_NARROW_CANDIDATES];
+    VoxelRigidBroadphase localTree = *scratch->broadphase;
+    RigidStepScratch localScratch = *scratch;
+    localScratch.broadphase = &localTree;
+    localScratch.next = candidates;
+    localScratch.candidateCapacity = RIGID_TREE_NARROW_CANDIDATES;
+
+    for (uint32_t ordered = begin; ordered < end; ++ordered)
+    {
+        uint32_t first = scratch->order[ordered];
+        const RigidBodyCache *firstCache = &scratch->caches[first];
+        uint32_t count = 0u;
+        uint32_t pairs = 0u;
+        uint32_t output = job->writing ? scratch->wakeQueue[first] : 0u;
+        uint32_t outputEnd = job->writing && ordered + 1u < scratch->activeCount
+                                 ? scratch->wakeQueue[scratch->order[ordered + 1u]]
+                                 : job->outputEnd;
+        RigidNarrowphasePoint *saved =
+            &scratch->narrowphasePoints[(size_t)first * RIGID_NARROWPHASE_POINTS_PER_BODY];
+        if (job->writing && output <= outputEnd &&
+            outputEnd - output <= RIGID_NARROWPHASE_POINTS_PER_BODY)
+        {
+            for (uint32_t point = 0u; output < outputEnd; ++point)
+            {
+                uint32_t second = saved[point].otherIndex;
+                RigidContact contact = {0};
+                contact.bodyIndex = first;
+                contact.otherIndex = second;
+                contact.depth = saved[point].depth;
+                contact.restitution = bodies[first].restitution < bodies[second].restitution
+                                          ? bodies[first].restitution
+                                          : bodies[second].restitution;
+                contact.friction = bodies[first].friction < bodies[second].friction
+                                       ? bodies[first].friction
+                                       : bodies[second].friction;
+                for (uint32_t axis = 0u; axis < 3u; ++axis)
+                {
+                    contact.point[axis] = saved[point].point[axis];
+                    contact.normal[axis] = saved[point].normal[axis];
+                }
+                scratch->contacts[output++] = contact;
+            }
+            scratch->caches[first].candidatePairs = 0u;
+            continue;
+        }
+        if (bodies[first].active && !bodies[first].sleeping && firstCache->collidable)
+        {
+            uint32_t visitsBefore = localTree.visitedNodeCount;
+            uint32_t candidateCount = 0u;
+            if (!IndexedCandidates(bodies, &localScratch, first, false, &candidateCount))
+            {
+                // Кандидаты не поместились в буфер диапазона. Ничего ещё не
+                // записано, поэтому вся стадия честно повторяется
+                // последовательно; метка переживает возврат из диапазона.
+                scratch->wakeQueue[first] = UINT32_MAX;
+                return;
+            }
+            if (!job->writing)
+            {
+                scratch->narrowVisits[first] = localTree.visitedNodeCount - visitsBefore;
+            }
+            for (uint32_t candidate = 0u; candidate < candidateCount; ++candidate)
+            {
+                uint32_t second = candidates[candidate];
+                if (bodies[second].sleeping || bodies[second].stableId <= bodies[first].stableId)
+                {
+                    continue;
+                }
+                ++pairs;
+                const RigidBodyCache *secondCache = &scratch->caches[second];
+                BoxManifold manifold;
+                if (!BuildBoxManifold(firstCache, bodies[first].halfExtent, secondCache,
+                                      bodies[second].halfExtent, &manifold))
+                {
+                    continue;
+                }
+                if (job->writing)
+                {
+                    if (output > outputEnd || manifold.count > outputEnd - output)
+                    {
+                        scratch->caches[first].candidatePairs = 1u;
+                        return;
+                    }
+                    double restitution = bodies[first].restitution < bodies[second].restitution
+                                             ? bodies[first].restitution
+                                             : bodies[second].restitution;
+                    double friction = bodies[first].friction < bodies[second].friction
+                                          ? bodies[first].friction
+                                          : bodies[second].friction;
+                    for (uint32_t point = 0u; point < manifold.count; ++point)
+                    {
+                        scratch->contacts[output++] =
+                            PairContact(first, second, &manifold, point, restitution, friction);
+                    }
+                }
+                else
+                {
+                    for (uint32_t point = 0u;
+                         point < manifold.count &&
+                         count + point < RIGID_NARROWPHASE_POINTS_PER_BODY;
+                         ++point)
+                    {
+                        RigidNarrowphasePoint *destination = &saved[count + point];
+                        destination->otherIndex = second;
+                        destination->depth = manifold.depth[point];
+                        for (uint32_t axis = 0u; axis < 3u; ++axis)
+                        {
+                            destination->point[axis] = manifold.point[point][axis];
+                            destination->normal[axis] = manifold.normal[axis];
+                        }
+                    }
+                }
+                count += manifold.count;
+            }
+        }
+        else if (!job->writing)
+        {
+            scratch->narrowVisits[first] = 0u;
+        }
+        if (!job->writing)
+        {
+            scratch->wakeQueue[first] = count;
+            scratch->caches[first].candidatePairs = pairs;
+        }
+        else
+        {
+            scratch->caches[first].candidatePairs = output == outputEnd ? 0u : 1u;
+        }
+    }
+}
+
+// Возвращает false при настоящей ошибке шага. Если кандидаты одного из тел не
+// поместились в буфер диапазона, стадия не выполнена: outHandled остаётся
+// false, и вызывающий проходит последовательным путём.
+static bool CollectTreeContactsParallel(const VoxelRigidBody *bodies, RigidStepScratch *scratch,
+                                        bool *outHandled)
+{
+    *outHandled = false;
+    RigidNarrowphaseJob job = {bodies, scratch, false, 0u};
+    ExecuteRange(scratch, scratch->activeCount, 32u, TreeNarrowphaseRange, &job);
+    for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
+    {
+        if (scratch->wakeQueue[scratch->order[ordered]] == UINT32_MAX)
+        {
+            return true;
+        }
+    }
+
+    uint32_t worldCount = scratch->contactCount;
+    uint32_t total = worldCount;
+    uint64_t visits = 0u;
+    for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
+    {
+        uint32_t first = scratch->order[ordered];
+        uint32_t count = scratch->wakeQueue[first];
+        if (count > scratch->contactCapacity - total)
+        {
+            return false;
+        }
+        scratch->wakeQueue[first] = total;
+        total += count;
+        uint32_t pairs = scratch->caches[first].candidatePairs;
+        uint32_t previous = scratch->stats->candidatePairCount;
+        scratch->stats->candidatePairCount =
+            pairs > UINT32_MAX - previous ? UINT32_MAX : previous + pairs;
+        visits += scratch->narrowVisits[first];
+    }
+    scratch->broadphase->visitedNodeCount =
+        visits > UINT32_MAX - scratch->broadphase->visitedNodeCount
+            ? UINT32_MAX
+            : scratch->broadphase->visitedNodeCount + (uint32_t)visits;
+
+    job.writing = true;
+    job.outputEnd = total;
+    ExecuteRange(scratch, scratch->activeCount, 32u, TreeNarrowphaseRange, &job);
+    for (uint32_t ordered = 0u; ordered < scratch->activeCount; ++ordered)
+    {
+        if (scratch->caches[scratch->order[ordered]].candidatePairs != 0u)
+        {
+            return false;
+        }
+    }
+    scratch->contactCount = total;
+    // Объединение островов и отметки контактов остаются последовательными и
+    // упорядоченными, ровно как в сеточном пути.
+    uint32_t previousFirst = UINT32_MAX;
+    uint32_t previousSecond = UINT32_MAX;
+    for (uint32_t contact = worldCount; contact < total; ++contact)
+    {
+        uint32_t first = scratch->contacts[contact].bodyIndex;
+        uint32_t second = scratch->contacts[contact].otherIndex;
+        if (first != previousFirst || second != previousSecond)
+        {
+            JoinContactIsland(bodies, scratch, first, second);
+            scratch->caches[first].hasBodyContact = true;
+            scratch->caches[second].hasBodyContact = true;
+            previousFirst = first;
+            previousSecond = second;
+        }
+    }
+    *outHandled = true;
+    return true;
+}
+
 static bool CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
                                 RigidStepScratch *scratch)
 {
     (void)bodyCount;
-    if (scratch->broadphase == NULL && scratch->options != NULL &&
-        scratch->options->executor != NULL && scratch->activeCount > 64u)
+    bool parallel = scratch->options != NULL && scratch->options->executor != NULL &&
+                    scratch->activeCount > 64u;
+    if (parallel && scratch->broadphase == NULL)
     {
         return CollectGridContactsParallel(bodies, scratch);
+    }
+    if (parallel)
+    {
+        bool handled = false;
+        if (!CollectTreeContactsParallel(bodies, scratch, &handled))
+        {
+            return false;
+        }
+        if (handled)
+        {
+            return true;
+        }
     }
     uint32_t mask = scratch->bucketCount - 1u;
 
@@ -4351,6 +4595,8 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(uint8_t);
     state.solveOrder = (uint32_t *)cursor;
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(uint32_t);
+    state.narrowVisits = (uint32_t *)cursor;
+    cursor += (size_t)bodyCount * sizeof(uint32_t);
     state.buckets = (uint32_t *)cursor;
     state.bucketCount = BucketCountFor(bodyCount);
     state.candidateCapacity = bodyCount;
