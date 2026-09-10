@@ -1832,6 +1832,9 @@ static bool AddInt64Checked(int64_t left, int64_t right, int64_t *outValue)
 typedef struct BlockSample
 {
     const VoxelCollisionSource *collision;
+    // true, если origin + любая локальная координата [0,7] не переполняет
+    // int64: тогда проверки AddInt64Checked в горячем пути не нужны.
+    bool originValid;
     int64_t origin[3];
     uint64_t solid[RIGID_BLOCK_SAMPLE_WORDS];
     uint64_t known[RIGID_BLOCK_SAMPLE_WORDS];
@@ -1873,13 +1876,59 @@ static bool SampleSolid(BlockSample *sample, int32_t x, int32_t y, int32_t z)
     int64_t world[3];
     bool solid = true;
     bool valid = true;
-    for (int32_t axis = 0; axis < 3; ++axis)
+    if (sample->originValid)
     {
-        valid = valid && AddInt64Checked(sample->origin[axis], local[axis], &world[axis]);
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            world[axis] = sample->origin[axis] + local[axis];
+        }
+    }
+    else
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            valid = valid && AddInt64Checked(sample->origin[axis], local[axis], &world[axis]);
+        }
     }
     if (valid)
     {
         solid = BlockIsSolid(sample->collision, world[0], world[1], world[2]);
+    }
+    SampleBitRaise(sample->known, index);
+    if (solid)
+    {
+        SampleBitRaise(sample->solid, index);
+    }
+    return solid;
+}
+
+// Ядро выборки: координаты заведомо внутри [0,6], а клетка ещё не
+// спрашивалась — known обнулён в начале плитки. Границы и бит known здесь
+// лишние, и из горячего пути первого прохода они убраны.
+static bool SampleCoreCell(BlockSample *sample, int32_t x, int32_t y, int32_t z)
+{
+    uint32_t index = SampleIndex(x + 1, y + 1, z + 1);
+    int64_t world[3];
+    bool solid = true;
+    if (sample->originValid)
+    {
+        world[0] = sample->origin[0] + x + 1;
+        world[1] = sample->origin[1] + y + 1;
+        world[2] = sample->origin[2] + z + 1;
+        solid = BlockIsSolid(sample->collision, world[0], world[1], world[2]);
+    }
+    else
+    {
+        bool valid = true;
+        int32_t local[3] = {x + 1, y + 1, z + 1};
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            valid = valid && AddInt64Checked(sample->origin[axis], local[axis], &world[axis]);
+        }
+        if (valid)
+        {
+            solid = BlockIsSolid(sample->collision, world[0], world[1], world[2]);
+        }
     }
     SampleBitRaise(sample->known, index);
     if (solid)
@@ -2030,6 +2079,7 @@ static bool BuildBlockManifold(const RigidBodyCache *cache, const double *halfEx
     {
         separation[axis] = cache->position[axis] - blockCentre[axis];
     }
+    double worldReach[3];
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
@@ -2045,8 +2095,8 @@ static bool BuildBlockManifold(const RigidBodyCache *cache, const double *halfEx
     {
         double direction[3] = {0.0, 0.0, 0.0};
         direction[axis] = 1.0;
-        double reach = BoxRadius(cache, halfExtent, direction) + blockHalf[axis];
-        if (reach - AbsoluteDouble(separation[axis]) <= 0.0)
+        worldReach[axis] = BoxRadius(cache, halfExtent, direction) + blockHalf[axis];
+        if (worldReach[axis] - AbsoluteDouble(separation[axis]) <= 0.0)
         {
             return false;
         }
@@ -2079,9 +2129,7 @@ static bool BuildBlockManifold(const RigidBodyCache *cache, const double *halfEx
     double bestDepth = DBL_MAX;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        double unit[3] = {0.0, 0.0, 0.0};
-        unit[axis] = 1.0;
-        double reach = BoxRadius(cache, halfExtent, unit) + blockHalf[axis];
+        double reach = worldReach[axis];
         for (int32_t direction = 0; direction < 2; ++direction)
         {
             if ((exposedMask & (1u << (axis * 2 + direction))) == 0u)
@@ -2239,7 +2287,7 @@ static bool CollectSampleContacts(const VoxelRigidBody *body, uint32_t index,
         {
             for (int32_t x = 0; x < coreSize[0]; ++x)
             {
-                anySolid = SampleSolid(sample, x + 1, y + 1, z + 1) || anySolid;
+                anySolid = SampleCoreCell(sample, x, y, z) || anySolid;
             }
         }
     }
@@ -2402,6 +2450,13 @@ static void CollectWorldContacts(const VoxelRigidBody *bodies, uint32_t bodyCoun
                     if (!ready)
                     {
                         continue;
+                    }
+                    sample.originValid = true;
+                    for (int32_t axis = 0; axis < 3; ++axis)
+                    {
+                        sample.originValid =
+                            sample.originValid &&
+                            (sample.origin[axis] <= INT64_MAX - (RIGID_BLOCK_SAMPLE - 1));
                     }
                     // Exact fixed-array bounds; Annex K is not available in the no-CRT runtime.
                     // NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)

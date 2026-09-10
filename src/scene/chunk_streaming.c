@@ -488,6 +488,16 @@ static bool TrySubtractInt64(
     return true;
 }
 
+static void QueueChunkIfMissing(ChunkStreaming* streaming,
+    int64_t x, int64_t y, int64_t z)
+{
+    if (FindEntry(streaming, x, y, z) != NULL) return;
+
+    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
+    entry->state = CHUNK_ENTRY_PENDING;
+    TryEnqueueRequest(streaming, entry);
+}
+
 static void QueueMissingChunks(
     ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
 {
@@ -506,15 +516,45 @@ static void QueueMissingChunks(
                     if (absoluteZ > chebyshev) chebyshev = absoluteZ;
                     if (chebyshev != shell) continue;
 
-                    int64_t x = chunkX + deltaX;
-                    int64_t y = chunkY + deltaY;
-                    int64_t z = chunkZ + deltaZ;
-                    if (FindEntry(streaming, x, y, z) != NULL) continue;
-
-                    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
-                    entry->state = CHUNK_ENTRY_PENDING;
-                    TryEnqueueRequest(streaming, entry);
+                    QueueChunkIfMissing(streaming,
+                        chunkX + deltaX, chunkY + deltaY, chunkZ + deltaZ);
                 }
+            }
+        }
+    }
+}
+
+// За один шаг на соседний чанк в кубе радиуса viewRadius появляется лишь
+// дальняя грань (а при движении по диагонали — две или три), всё остальное
+// уже стояло в таблице. Точечный обход этих граней заменяет перебор всего
+// куба: на радиусе R это (2R+1) обращений вместо (2R+1)^3.
+static void QueueMissingLeadingFace(ChunkStreaming* streaming,
+    int64_t previousX, int64_t previousY, int64_t previousZ,
+    int64_t chunkX, int64_t chunkY, int64_t chunkZ)
+{
+    const int64_t radius = streaming->viewRadius;
+    const int64_t delta[3] = {
+        chunkX - previousX, chunkY - previousY, chunkZ - previousZ
+    };
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        if (delta[axis] == 0) continue;
+
+        const int64_t sign = delta[axis] > 0 ? 1 : -1;
+        const int32_t axisA = (axis + 1) % 3;
+        const int32_t axisB = (axis + 2) % 3;
+
+        for (int64_t offsetA = -radius; offsetA <= radius; ++offsetA)
+        {
+            for (int64_t offsetB = -radius; offsetB <= radius; ++offsetB)
+            {
+                int64_t offset[3] = { 0, 0, 0 };
+                offset[axis] = sign * radius;
+                offset[axisA] = offsetA;
+                offset[axisB] = offsetB;
+                QueueChunkIfMissing(streaming,
+                    chunkX + offset[0], chunkY + offset[1], chunkZ + offset[2]);
             }
         }
     }
@@ -704,6 +744,19 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         return;
     }
 
+    const int64_t previousX = streaming->centerX;
+    const int64_t previousY = streaming->centerY;
+    const int64_t previousZ = streaming->centerZ;
+    const bool hadCenter = streaming->hasCenter;
+
+    const int64_t deltaX = chunkX - previousX;
+    const int64_t deltaY = chunkY - previousY;
+    const int64_t deltaZ = chunkZ - previousZ;
+    const bool unitStep = hadCenter
+        && deltaX >= -1 && deltaX <= 1
+        && deltaY >= -1 && deltaY <= 1
+        && deltaZ >= -1 && deltaZ <= 1;
+
     // Вторая таблица переиспользуется при каждом переходе чанка:
     // никаких выделений и освобождений памяти в цикле кадра.
     memset(streaming->spareEntries, 0,
@@ -757,7 +810,18 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         }
     }
 
-    QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
+    // Переход ровно на соседний чанк добавляет лишь дальнюю грань куба:
+    // перебирать весь куб, как при первом вызове, телепорте или смене
+    // origin, здесь не нужно.
+    if (unitStep)
+    {
+        QueueMissingLeadingFace(streaming,
+            previousX, previousY, previousZ, chunkX, chunkY, chunkZ);
+    }
+    else
+    {
+        QueueMissingChunks(streaming, chunkX, chunkY, chunkZ);
+    }
 }
 
 void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, int64_t blockY, int64_t blockZ)
