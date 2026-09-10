@@ -65,6 +65,11 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Крупные записи (один большой меш или всплеск чанков, который не влезает
+// в основное кольцо) идут в отдельную арену с тем же двойным
+// буферированием. Она создаётся лениво, при первом переполнении, и
+// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
+#define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
 // One frame can contain up to six scene passes with thousands of instances.
 // Keep enough upload space so later passes cannot silently lose caller draws.
 #define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
@@ -193,12 +198,21 @@ struct Renderer
 
     GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
     uint32_t                   poolBlockCount;
+    // Счётчики пула вместо обхода всех блоков и диапазонов в
+    // RendererGetStats: capacity — сумма размеров блоков, used — сумма
+    // выданных мешам байт. Оба меняются только при создании блока,
+    // успешном PoolAllocate и записанном PoolFree.
+    uint64_t                   poolCapacityBytes;
+    uint64_t                   poolUsedBytes;
 
     PendingUpload              pendingUploads[MAX_PENDING_UPLOADS];
     uint32_t                   pendingUploadCount;
     ID3D12Resource*            meshUploadBuffers[FRAME_COUNT];
     uint8_t*                   meshUploadMapped[FRAME_COUNT];
     uint32_t                   meshUploadOffsets[FRAME_COUNT];
+    ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
+    uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
+    uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
     ID3D12Resource*            instanceBuffers[FRAME_COUNT];
     uint8_t*                   instanceMapped[FRAME_COUNT];
     uint32_t                   instanceOffsets[FRAME_COUNT];
@@ -321,6 +335,7 @@ static bool PoolBlockCreate(Renderer* renderer, uint32_t minimumBytes, uint32_t*
     block->freeRangeCount = 1;
     block->currentState = D3D12_RESOURCE_STATE_COMMON;
 
+    renderer->poolCapacityBytes += totalBytes;
     *outBlockIndex = renderer->poolBlockCount++;
     return true;
 }
@@ -359,6 +374,7 @@ static bool PoolAllocate(Renderer* renderer, uint32_t sizeBytes, uint32_t* outBl
                     block->freeRanges[position] = moved;
                 }
             }
+            renderer->poolUsedBytes += sizeBytes;
             return true;
         }
     }
@@ -375,11 +391,14 @@ static bool PoolAllocate(Renderer* renderer, uint32_t sizeBytes, uint32_t* outBl
     block->freeRanges[0].offset = sizeBytes;
     block->freeRanges[0].size = block->totalBytes - sizeBytes;
     block->freeRangeCount = block->freeRanges[0].size == 0 ? 0 : 1;
+    renderer->poolUsedBytes += sizeBytes;
     return true;
 }
 
 // Возвращает диапазон в список свободных с коалесценцией соседей.
-static void PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
+// false — диапазон потерян из-за OOM при росте списка (счётчик used
+// тогда не уменьшается, как и раньше не уменьшался доступный объём).
+static bool PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
 {
     uint32_t position = 0;
     while (position < block->freeRangeCount && block->freeRanges[position].offset < offset)
@@ -400,18 +419,18 @@ static void PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
             block->freeRanges[i] = block->freeRanges[i + 1];
         }
         block->freeRangeCount--;
-        return;
+        return true;
     }
     if (mergesWithPrevious)
     {
         block->freeRanges[position - 1].size += size;
-        return;
+        return true;
     }
     if (mergesWithNext)
     {
         block->freeRanges[position].offset = offset;
         block->freeRanges[position].size += size;
-        return;
+        return true;
     }
 
     if (block->freeRangeCount == block->freeRangeCapacity)
@@ -420,7 +439,7 @@ static void PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
         FreeRange* newRanges = HeapReAlloc(GetProcessHeap(), 0, block->freeRanges, newCapacity * sizeof(FreeRange));
         if (newRanges == NULL)
         {
-            return; // диапазон потерян до конца жизни пула — только при OOM
+            return false; // диапазон потерян до конца жизни пула — только при OOM
         }
         block->freeRanges = newRanges;
         block->freeRangeCapacity = newCapacity;
@@ -433,6 +452,7 @@ static void PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
     block->freeRanges[position].offset = offset;
     block->freeRanges[position].size = size;
     block->freeRangeCount++;
+    return true;
 }
 
 // Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
@@ -459,7 +479,8 @@ static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
         {
             break;
         }
-        PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size);
+        if (PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size))
+            renderer->poolUsedBytes -= entry->size;
         renderer->deferredRangeHead = (renderer->deferredRangeHead + 1) % DEFERRED_RELEASE_CAPACITY;
         renderer->deferredRangeCount--;
     }
@@ -1435,6 +1456,8 @@ void RendererReleaseWorld(Renderer* renderer)
     }
     memset(renderer->poolBlocks, 0, sizeof(renderer->poolBlocks));
     renderer->poolBlockCount = 0;
+    renderer->poolCapacityBytes = 0;
+    renderer->poolUsedBytes = 0;
 
     for (UINT i = 0; i < FRAME_COUNT; ++i)
     {
@@ -1450,12 +1473,21 @@ void RendererReleaseWorld(Renderer* renderer)
                 ID3D12Resource_Unmap(renderer->instanceBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->instanceBuffers[i]);
         }
+        if (renderer->largeMeshUploadBuffers[i] != NULL)
+        {
+            if (renderer->largeMeshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->largeMeshUploadBuffers[i]);
+        }
         renderer->meshUploadBuffers[i] = NULL;
         renderer->meshUploadMapped[i] = NULL;
         renderer->meshUploadOffsets[i] = 0;
         renderer->instanceBuffers[i] = NULL;
         renderer->instanceMapped[i] = NULL;
         renderer->instanceOffsets[i] = 0;
+        renderer->largeMeshUploadBuffers[i] = NULL;
+        renderer->largeMeshUploadMapped[i] = NULL;
+        renderer->largeMeshUploadOffsets[i] = 0;
     }
 
     if (renderer->blockTextureUpload != NULL)
@@ -1656,6 +1688,48 @@ void RendererDestroy(Renderer* renderer)
     HeapFree(GetProcessHeap(), 0, renderer);
 }
 
+// Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
+// Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
+// не платит за неё ни байтом.
+static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
+{
+    if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
+    {
+        return true;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource,
+        (void**)&renderer->largeMeshUploadBuffers[frameIndex])))
+    {
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(renderer->largeMeshUploadBuffers[frameIndex],
+        0, &emptyRange,
+        (void**)&renderer->largeMeshUploadMapped[frameIndex])))
+    {
+        ID3D12Resource_Release(renderer->largeMeshUploadBuffers[frameIndex]);
+        renderer->largeMeshUploadBuffers[frameIndex] = NULL;
+        return false;
+    }
+    return true;
+}
+
 RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
 {
     if (renderer == NULL || !renderer->worldReady || quads == NULL
@@ -1676,55 +1750,83 @@ RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uin
     }
 
     ID3D12Resource* staging = NULL;
-    uint32_t sourceOffset = (renderer->meshUploadOffsets[renderer->frameIndex] + 15u) & ~15u;
-    bool ownsStaging = sourceOffset > MESH_UPLOAD_BYTES_PER_FRAME
-        || sizeBytes > MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
-    if (!ownsStaging)
+    uint32_t frameIndex = renderer->frameIndex;
+    uint32_t sourceOffset = (renderer->meshUploadOffsets[frameIndex] + 15u) & ~15u;
+    bool ownsStaging = false;
+    bool usedLargeRing = false;
+    bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME
+        && sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
+    if (fitsSmallRing)
     {
-        staging = renderer->meshUploadBuffers[renderer->frameIndex];
-        memcpy(renderer->meshUploadMapped[renderer->frameIndex] + sourceOffset,
+        staging = renderer->meshUploadBuffers[frameIndex];
+        memcpy(renderer->meshUploadMapped[frameIndex] + sourceOffset,
             quads, sizeBytes);
-        renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset + sizeBytes;
+        renderer->meshUploadOffsets[frameIndex] = sourceOffset + sizeBytes;
     }
     else
     {
-        D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-        D3D12_RESOURCE_DESC description;
-        memset(&description, 0, sizeof(description));
-        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        description.Width = sizeBytes;
-        description.Height = 1;
-        description.DepthOrArraySize = 1;
-        description.MipLevels = 1;
-        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        description.SampleDesc.Count = 1;
-        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
-            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
-            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void**)&staging)))
+        // Крупная запись: сначала пробуем общую арену того же кадра, и
+        // только если запись не помещается и туда — отдельный ресурс.
+        uint32_t largeOffset =
+            (renderer->largeMeshUploadOffsets[frameIndex] + 15u) & ~15u;
+        bool fitsLargeRing =
+            largeOffset <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+            && sizeBytes <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME - largeOffset;
+        if (fitsLargeRing && EnsureLargeMeshUploadBuffer(renderer, frameIndex))
         {
-            PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
-            return NULL;
+            staging = renderer->largeMeshUploadBuffers[frameIndex];
+            sourceOffset = largeOffset;
+            usedLargeRing = true;
+            memcpy(renderer->largeMeshUploadMapped[frameIndex] + largeOffset,
+                quads, sizeBytes);
+            renderer->largeMeshUploadOffsets[frameIndex] = largeOffset + sizeBytes;
         }
-        D3D12_RANGE emptyRange = { 0, 0 };
-        void* mapped = NULL;
-        if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
+        else
         {
-            ID3D12Resource_Release(staging);
-            PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
-            return NULL;
+            D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+            D3D12_RESOURCE_DESC description;
+            memset(&description, 0, sizeof(description));
+            description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            description.Width = sizeBytes;
+            description.Height = 1;
+            description.DepthOrArraySize = 1;
+            description.MipLevels = 1;
+            description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            description.SampleDesc.Count = 1;
+            if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+                &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&staging)))
+            {
+                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+                    renderer->poolUsedBytes -= sizeBytes;
+                return NULL;
+            }
+            D3D12_RANGE emptyRange = { 0, 0 };
+            void* mapped = NULL;
+            if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
+            {
+                ID3D12Resource_Release(staging);
+                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+                    renderer->poolUsedBytes -= sizeBytes;
+                return NULL;
+            }
+            memcpy(mapped, quads, sizeBytes);
+            ID3D12Resource_Unmap(staging, 0, NULL);
+            sourceOffset = 0;
+            ownsStaging = true;
         }
-        memcpy(mapped, quads, sizeBytes);
-        ID3D12Resource_Unmap(staging, 0, NULL);
-        sourceOffset = 0;
     }
 
     RendererMesh* mesh = HeapAlloc(GetProcessHeap(), 0, sizeof(*mesh));
     if (mesh == NULL)
     {
         if (ownsStaging) ID3D12Resource_Release(staging);
-        else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
-        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+        else if (usedLargeRing)
+            renderer->largeMeshUploadOffsets[frameIndex] = sourceOffset;
+        else renderer->meshUploadOffsets[frameIndex] = sourceOffset;
+        if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+            renderer->poolUsedBytes -= sizeBytes;
         return NULL;
     }
 
@@ -2392,6 +2494,7 @@ bool RendererEndFrame(Renderer* renderer)
 
     bool waitedForFence = MoveToNextFrame(renderer);
     renderer->meshUploadOffsets[renderer->frameIndex] = 0;
+    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
     renderer->instanceOffsets[renderer->frameIndex] = 0;
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
@@ -2407,21 +2510,8 @@ void RendererGetStats(const Renderer* renderer, RendererStats* outStats)
     if (renderer == NULL || outStats == NULL) return;
 
     *outStats = renderer->lastStats;
-    uint64_t capacity = 0;
-    uint64_t freeBytes = 0;
-    for (uint32_t blockIndex = 0;
-        blockIndex < renderer->poolBlockCount; ++blockIndex)
-    {
-        const GeometryPoolBlock* block = &renderer->poolBlocks[blockIndex];
-        capacity += block->totalBytes;
-        for (uint32_t rangeIndex = 0;
-            rangeIndex < block->freeRangeCount; ++rangeIndex)
-        {
-            freeBytes += block->freeRanges[rangeIndex].size;
-        }
-    }
-    outStats->geometryPoolCapacityBytes = capacity;
-    outStats->geometryPoolUsedBytes = capacity - freeBytes;
+    outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
+    outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
 }
 
 void RendererSetVerticalSync(Renderer* renderer, bool enabled)
