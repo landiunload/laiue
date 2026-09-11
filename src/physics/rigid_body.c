@@ -901,6 +901,8 @@ typedef struct RigidBodyCache
     uint32_t candidatePairs;
 } RigidBodyCache;
 
+_Static_assert(sizeof(RigidBodyCache) == 256u, "body cache keeps its one-line-per-body layout");
+
 // Geometry and inertia do not change during velocity iterations. Prepare the
 // three constraint directions once instead of rotating inertia tensors again
 // for every impulse on every iteration.
@@ -911,26 +913,46 @@ typedef struct RigidConstraintRow
     double inverseEffectiveMass;
 } RigidConstraintRow;
 
+// Холодная часть контакта: то, что нужно только узкой фазе, подготовке и
+// кэшу. Решатель за шаг обходит контакты восемь раз и к этим полям не
+// обращается; держать их в одной структуре с горячими значит втаскивать
+// лишнюю кэш-линию на каждый контакт каждую итерацию.
 typedef struct RigidContact
 {
     uint32_t bodyIndex;
     // UINT32_MAX означает неподвижный мир.
     uint32_t otherIndex;
+    double point[3];
+    double normal[3];
+    double depth;
+    double restitution;
+    double friction;
+} RigidContact;
+
+// Горячая часть: ровно рабочее множество одной итерации решателя. normal
+// здесь не хранится: после подготовки его побитово дублирует
+// rows[0].direction, и решатель читает направление нормали оттуда.
+typedef struct RigidSolverContact
+{
+    uint32_t bodyIndex;
+    uint32_t otherIndex;
     // Плечи от центров масс до точки контакта. Считаются один раз на
     // подготовке: решатель обращается к ним восемь раз за шаг, и разность
     // point - position каждый раз тянула бы позицию тела из другой кэш-линии.
     double lever[2][3];
-    double point[3];
-    double normal[3];
-    double depth;
     double normalImpulse;
-    double restitution;
     double friction;
     RigidConstraintRow rows[3];
     double targetNormalSpeed;
     double tangentImpulse[2];
     double tangentCrossMass;
-} RigidContact;
+} RigidSolverContact;
+
+_Static_assert(sizeof(RigidContact) == 80u, "cold contact geometry stays compact");
+_Static_assert(sizeof(RigidSolverContact) == 344u,
+               "solver contact is the measured per-iteration working set");
+_Static_assert(sizeof(RigidSolverContact) % 8u == 0u,
+               "solver contact stays a plain array element");
 
 typedef struct RigidCachedContact
 {
@@ -967,6 +989,9 @@ typedef struct RigidNarrowphasePoint
     double depth;
 } RigidNarrowphasePoint;
 
+_Static_assert(sizeof(RigidNarrowphasePoint) == 64u,
+               "cached narrowphase geometry stays one line per point");
+
 // Hash-chain rejection needs only coordinates and ordering, not the large
 // solver cache or public body. Keep those reads together in a compact stream.
 typedef struct RigidGridEntry
@@ -984,6 +1009,9 @@ typedef struct RigidStepScratch
     RigidGridEntry *grid;
     RigidNarrowphasePoint *narrowphasePoints;
     RigidContact *contacts;
+    // Горячее зеркало контактов: решатель ходит только сюда, холодные
+    // геометрия и параметры остаются в contacts.
+    RigidSolverContact *solverContacts;
     // Индексы активных тел, отсортированные по stableId. Все обходы,
     // влияющие на порядок импульсов, идут только через этот массив.
     uint32_t *order;
@@ -1256,13 +1284,15 @@ uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
     uint64_t geometry =
         (uint64_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     uint64_t contacts = (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    uint64_t solverContacts =
+        (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
     uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 5u;
     uint64_t schedule =
         (uint64_t)bodyCount *
         (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
     uint64_t buckets = (uint64_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
-    uint64_t total = caches + grid + geometry + contacts + links + schedule + buckets +
-                     sizeof(VoxelRigidStepStats) + 64u;
+    uint64_t total = caches + grid + geometry + contacts + solverContacts + links + schedule +
+                     buckets + sizeof(VoxelRigidStepStats) + 64u;
     return total > 0xFFFFFFFFull ? 0u : (uint32_t)total;
 }
 
@@ -1274,6 +1304,7 @@ static VoxelRigidStepStats *StepStatsPointer(void *scratch, uint32_t bodyCount)
     cursor += (size_t)bodyCount * sizeof(RigidGridEntry);
     cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
     cursor += (size_t)bodyCount * sizeof(uint32_t) * 5u;
     cursor += (size_t)bodyCount *
               (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
@@ -3618,8 +3649,8 @@ static void BuildTangents(const double normal[3], double first[3], double second
     Cross3(normal, first, second);
 }
 
-static void RelativeContactVelocity(const RigidContact *contact, const RigidStepScratch *scratch,
-                                    double velocity[3])
+static void RelativeContactVelocity(const RigidSolverContact *contact,
+                                    const RigidStepScratch *scratch, double velocity[3])
 {
     ContactVelocity(&scratch->caches[contact->bodyIndex], contact->lever[0], velocity);
     if (contact->otherIndex != UINT32_MAX)
@@ -3648,9 +3679,10 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
     const double penetrationCorrection = settings->penetrationCorrection;
     for (uint32_t index = begin; index < end; ++index)
     {
-        RigidContact *contact = &scratch->contacts[index];
-        const uint32_t bodyIndex = contact->bodyIndex;
-        const uint32_t otherIndex = contact->otherIndex;
+        const RigidContact *geometry = &scratch->contacts[index];
+        RigidSolverContact *contact = &scratch->solverContacts[index];
+        const uint32_t bodyIndex = geometry->bodyIndex;
+        const uint32_t otherIndex = geometry->otherIndex;
         const bool paired = otherIndex != UINT32_MAX;
         const RigidBodyCache *cache = &scratch->caches[bodyIndex];
         const RigidBodyCache *otherCache = paired ? &scratch->caches[otherIndex] : NULL;
@@ -3659,8 +3691,16 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         const double otherInverseMass = paired ? bodies[otherIndex].inverseMass : 0.0;
         const double *otherInverseInertia = paired ? bodies[otherIndex].inverseInertia : NULL;
 
-        const double point[3] = {contact->point[0], contact->point[1], contact->point[2]};
-        const double normal[3] = {contact->normal[0], contact->normal[1], contact->normal[2]};
+        contact->bodyIndex = bodyIndex;
+        contact->otherIndex = otherIndex;
+        contact->friction = geometry->friction;
+        // Холодная структура обнулялась при создании; у горячего зеркала
+        // импульсы обязан обнулить первый же проход подготовки.
+        contact->normalImpulse = 0.0;
+        contact->tangentImpulse[0] = 0.0;
+        contact->tangentImpulse[1] = 0.0;
+        const double point[3] = {geometry->point[0], geometry->point[1], geometry->point[2]};
+        const double normal[3] = {geometry->normal[0], geometry->normal[1], geometry->normal[2]};
         for (int32_t axis = 0; axis < 3; ++axis)
         {
             contact->lever[0][axis] = point[axis] - cache->position[axis];
@@ -3709,13 +3749,13 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         double velocity[3];
         RelativeContactVelocity(contact, scratch, velocity);
         double initialNormalSpeed = Dot3(velocity, normal);
-        double penetration = contact->depth - penetrationSlop;
+        double penetration = geometry->depth - penetrationSlop;
         double bias = penetration > 0.0
                           ? penetrationCorrection * penetration / RIGID_STEP_SECONDS
                           : 0.0;
         bias = bias > RIGID_MAX_RECOVERY_SPEED ? RIGID_MAX_RECOVERY_SPEED : bias;
         double bounce = initialNormalSpeed < -RIGID_RESTITUTION_THRESHOLD
-                            ? -contact->restitution * initialNormalSpeed
+                            ? -geometry->restitution * initialNormalSpeed
                             : 0.0;
         // Restitution is based on the pre-solve impact speed. Recomputing it
         // each iteration cancels the bounce when the first iteration separates.
@@ -3723,7 +3763,7 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
     }
 }
 
-static void ApplyContactImpulse(RigidStepScratch *scratch, const RigidContact *contact,
+static void ApplyContactImpulse(RigidStepScratch *scratch, const RigidSolverContact *contact,
                                 uint32_t direction, double magnitude)
 {
     if (magnitude == 0.0 || !IsFiniteDouble(magnitude))
@@ -3738,7 +3778,7 @@ static void ApplyContactImpulse(RigidStepScratch *scratch, const RigidContact *c
     }
 }
 
-static void ContactLocalAnchors(const RigidContact *contact, const RigidStepScratch *scratch,
+static void ContactLocalAnchors(const RigidSolverContact *contact, const RigidStepScratch *scratch,
                                 double anchors[2][3])
 {
     for (uint32_t endpoint = 0u; endpoint < 2u; ++endpoint)
@@ -3780,7 +3820,7 @@ static uint32_t ContactRunEnd(const RigidStepScratch *scratch, uint32_t begin)
     return end;
 }
 
-static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidContact *contact,
+static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidSolverContact *contact,
                                   const RigidStepScratch *scratch,
                                   const RigidCachedContact *entries, const uint32_t *buckets,
                                   uint32_t bucketMask)
@@ -3810,7 +3850,7 @@ static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidConta
         bool finiteImpulse = true;
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
-            alignment += contact->normal[axis] * (double)entry->normal[axis];
+            alignment += contact->rows[0].direction[axis] * (double)entry->normal[axis];
             finiteImpulse = finiteImpulse && IsFiniteDouble(entry->worldImpulse[axis]);
         }
         if (!finiteImpulse || !(alignment >= RIGID_CACHE_NORMAL_ALIGNMENT))
@@ -3836,9 +3876,9 @@ static uint32_t FindCachedContact(const VoxelRigidBody *bodies, const RigidConta
     return best;
 }
 
-static bool PrepareCachedImpulse(RigidContact *contact, const RigidCachedContact *entry)
+static bool PrepareCachedImpulse(RigidSolverContact *contact, const RigidCachedContact *entry)
 {
-    double normalImpulse = Dot3(entry->worldImpulse, contact->normal);
+    double normalImpulse = Dot3(entry->worldImpulse, contact->rows[0].direction);
     double firstImpulse = Dot3(entry->worldImpulse, contact->rows[1].direction);
     double secondImpulse = Dot3(entry->worldImpulse, contact->rows[2].direction);
     if (!(normalImpulse > 0.0) || !IsFiniteDouble(normalImpulse) || !IsFiniteDouble(firstImpulse) ||
@@ -3899,7 +3939,7 @@ static void MatchCachedContactsRange(void *context, uint32_t begin, uint32_t end
         uint32_t last = ContactRunEnd(scratch, cursor);
         for (uint32_t index = cursor; index < last; ++index)
         {
-            RigidContact *contact = &scratch->contacts[index];
+            RigidSolverContact *contact = &scratch->solverContacts[index];
             uint32_t match = RIGID_HASH_EMPTY;
             if (contact->rows[0].inverseEffectiveMass > 0.0)
             {
@@ -3947,7 +3987,7 @@ static void WarmStartContacts(const VoxelRigidBody *bodies, RigidStepScratch *sc
     }
     for (uint32_t index = 0u; index < scratch->contactCount; ++index)
     {
-        RigidContact *contact = &scratch->contacts[index];
+        RigidSolverContact *contact = &scratch->solverContacts[index];
         if (!(contact->rows[0].inverseEffectiveMass > 0.0))
         {
             continue;
@@ -3989,7 +4029,7 @@ static void StoreCacheFieldsRange(void *context, uint32_t begin, uint32_t end)
     VoxelPhysicsConfigureThread();
     for (uint32_t index = begin; index < end; ++index)
     {
-        const RigidContact *contact = &job->scratch->contacts[index];
+        const RigidSolverContact *contact = &job->scratch->solverContacts[index];
         RigidCachedContact *entry = &job->entries[index];
         entry->stableIds[0] = job->bodies[contact->bodyIndex].stableId;
         entry->stableIds[1] =
@@ -3997,9 +4037,9 @@ static void StoreCacheFieldsRange(void *context, uint32_t begin, uint32_t end)
         ContactLocalAnchors(contact, job->scratch, entry->localAnchors);
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
-            entry->normal[axis] = (float)contact->normal[axis];
+            entry->normal[axis] = (float)contact->rows[0].direction[axis];
             entry->worldImpulse[axis] =
-                contact->normal[axis] * contact->normalImpulse +
+                contact->rows[0].direction[axis] * contact->normalImpulse +
                 contact->rows[1].direction[axis] * contact->tangentImpulse[0] +
                 contact->rows[2].direction[axis] * contact->tangentImpulse[1];
         }
@@ -4038,14 +4078,14 @@ static void StoreContactCache(const VoxelRigidBody *bodies, const RigidStepScrat
 
 static void SolveContact(RigidStepScratch *scratch, uint32_t index)
 {
-    RigidContact *contact = &scratch->contacts[index];
+    RigidSolverContact *contact = &scratch->solverContacts[index];
     if (!(contact->rows[0].inverseEffectiveMass > 0.0))
     {
         return;
     }
     double velocity[3];
     RelativeContactVelocity(contact, scratch, velocity);
-    double normalSpeed = Dot3(velocity, contact->normal);
+    double normalSpeed = Dot3(velocity, contact->rows[0].direction);
     double magnitude =
         (contact->targetNormalSpeed - normalSpeed) * contact->rows[0].inverseEffectiveMass;
     double previous = contact->normalImpulse;
@@ -4679,6 +4719,8 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     state.contacts = (RigidContact *)cursor;
     cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    state.solverContacts = (RigidSolverContact *)cursor;
+    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
     state.next = (uint32_t *)cursor;
     cursor += (size_t)bodyCount * sizeof(uint32_t);
     state.order = (uint32_t *)cursor;

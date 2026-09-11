@@ -930,6 +930,13 @@ static void TestExactScratchLayout(void)
     static RigidHarness harness;
     static VoxelRigidBody bodies[7];
     HarnessInit(&harness, false);
+    // Точная раскладка scratch прибита. На одно тело: кэш тела 256 Б, сетка
+    // 32, кэш геометрии узкой фазы 8*64, холодные контакты 16*80, горячее
+    // зеркало решателя 16*344, пять связных массивов 5*4, расписание цветов
+    // 8 + 16*(1+4), корзины 64*4, статистика 16 и запас на выравнивание 64.
+    // Смена раскладки обязана сломать эту проверку, а не пройти молча.
+    RigidExpect(VoxelRigidBodyStepScratchBytes(1u) == 8028u, "exact scratch bytes for one body");
+    RigidExpect(VoxelRigidBodyStepScratchBytes(7u) == 54180u, "exact scratch bytes for seven bodies");
     const uint32_t counts[] = {1u, 2u, 3u, 7u};
     const uint32_t offsets[] = {1u, 2u, 32u, 64u};
     for (uint32_t index = 0u; index < 7u; ++index)
