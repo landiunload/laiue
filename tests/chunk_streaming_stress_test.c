@@ -854,8 +854,72 @@ static void RunPauseAfterResumeScenario(int32_t radius, uint32_t repeats)
     WorldDestroy(world);
 }
 
+// Центр двигается, пока рабочие потоки строят и складывают результаты в
+// очередь. Главный поток разбирает их в Pump и параллельно инвалидирует
+// блоки. Здесь проверяется протокол очереди и номера эпохи под настоящей
+// многопоточностью: заявка, уехавшая рабочему, может завершиться уже после
+// того, как запись сменила ревизию или была сдвинута EraseEntry. Эталон
+// множества ключей считается по-прежнему только по политике центра.
+static void RunConcurrentCenterScenario(int32_t radius, uint64_t seed, uint32_t moves)
+{
+    stressSeed = seed;
+    stressStep = 0u;
+    stressRadius = radius;
+    stressQueueCapacity = StressQueueCapacityFor(radius);
+
+    World* world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming* handle = ChunkStreamingCreate(
+        world, (Renderer*)&stressRendererPlaceholder, radius);
+    EXPECT(handle != NULL, "streaming was not created");
+    // Потоки намеренно не останавливаются: протокол очереди проверяется в
+    // рабочем режиме.
+
+    StressSet* shadow = &stressSetA;
+    StressSet* next = &stressSetB;
+    StressSetClear(shadow);
+    StressSetClear(next);
+
+    int64_t centerX = 0;
+    int64_t centerY = 0;
+    int64_t centerZ = 0;
+    ChunkStreamingSetCenter(handle, centerX, centerY, centerZ);
+    StressAddCube(shadow, centerX, centerY, centerZ, radius);
+
+    uint64_t state = seed;
+    for (uint32_t move = 0u; move < moves; ++move)
+    {
+        stressStep = move + 1u;
+        centerX += StressSigned(&state, 2);
+        centerY += StressSigned(&state, 2);
+        centerZ += StressSigned(&state, 2);
+        ChunkStreamingSetCenter(handle, centerX, centerY, centerZ);
+        StressShadowAdvance(next, shadow, centerX, centerY, centerZ, radius);
+        StressSet* swap = shadow;
+        shadow = next;
+        next = swap;
+
+        for (uint32_t invalid = 0u; invalid < 3u; ++invalid)
+        {
+            int64_t blockX = centerX * CHUNK_SIZE + StressSigned(&state, CHUNK_SIZE + 1);
+            int64_t blockY = centerY * CHUNK_SIZE + StressSigned(&state, CHUNK_SIZE + 1);
+            int64_t blockZ = centerZ * CHUNK_SIZE + StressSigned(&state, CHUNK_SIZE + 1);
+            ChunkStreamingInvalidateBlock(handle, blockX, blockY, blockZ);
+        }
+        ChunkStreamingPump(handle);
+        ChunkStreamingPump(handle);
+    }
+
+    StressSettle(handle);
+    StressVerify(handle, shadow, false);
+    ChunkStreamingDestroy(handle);
+    WorldDestroy(world);
+}
+
 LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
 {
+    RunConcurrentCenterScenario(2, 0x0C0FFEE0ULL, 400u);
+    RunConcurrentCenterScenario(3, 0x0FFFFFFFFULL, 150u);
     RunRandomScenario(2, 0x1111111122222222ULL, 2000u);
     RunRandomScenario(3, 0x3333333344444444ULL, 1500u);
     RunRandomScenario(4, 0x5555555566666666ULL, 800u);
