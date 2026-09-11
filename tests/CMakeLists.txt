@@ -179,7 +179,7 @@ if(TARGET laiue_render)
         laiue_render_pack_api_test RenderPackApiTestEntryPoint)
     add_test(NAME laiue.render.packs COMMAND laiue_render_pack_api_test)
 endif()
-if(TARGET laiue_render AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN")
+if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     # Кадр рисуется целиком и проверяется по пикселям. Драйвер может
     # отсутствовать на машине разработчика, поэтому тест сам сообщает об
     # этом кодом возврата, а не падает молча.
@@ -193,6 +193,26 @@ if(TARGET laiue_render AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN")
         laiue_renderer_offscreen_test RendererOffscreenTestEntryPoint)
     add_test(NAME laiue.render.offscreen_frame
         COMMAND laiue_renderer_offscreen_test)
+    set_tests_properties(laiue.render.offscreen_frame PROPERTIES
+        SKIP_RETURN_CODE 125)
+endif()
+if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
+   AND LAIUE_RENDER_HAS_VULKAN_TARGET)
+    # Оба бэкенда живут в одном процессе и чередуются на кадрах: это бьёт
+    # по одноэлементному кэшу быстрого пути диспетчера. D3D12 нужен
+    # настоящий HWND (скрытое окно), Vulkan рисует offscreen. Без
+    # адаптера D3D12 тест сообщает о пропуске кодом 125.
+    add_executable(laiue_render_dual_backend_test
+        render_dual_backend_test.c)
+    target_link_libraries(laiue_render_dual_backend_test PRIVATE
+        laiue_render)
+    laiue_configure_standalone_executable(
+        laiue_render_dual_backend_test RenderDualBackendTestEntryPoint)
+    add_test(NAME laiue.render.dual_backend
+        COMMAND laiue_render_dual_backend_test)
+    set_tests_properties(laiue.render.dual_backend PROPERTIES
+        SKIP_RETURN_CODE 125
+        TIMEOUT 60)
 endif()
 if(TARGET laiue_audio)
     # Тест берёт offscreen-бэкенд и потому не требует звукового

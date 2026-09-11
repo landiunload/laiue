@@ -46,7 +46,7 @@ ret
 // Approximately 0 instruction slots used
 #endif
 
-const BYTE g_panorama_ps[] =
+static const BYTE g_panorama_ps[] =
 {
      68,  88,  66,  67,  97, 149,
     103,  19, 135, 232, 224, 178,

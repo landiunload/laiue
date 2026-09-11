@@ -132,7 +132,7 @@ ret
 // Approximately 0 instruction slots used
 #endif
 
-const BYTE g_chunk_vs[] =
+static const BYTE g_chunk_vs[] =
 {
      68,  88,  66,  67, 227, 160,
      37,  35,  60,  76, 254, 233,

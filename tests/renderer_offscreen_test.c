@@ -18,6 +18,9 @@
 #define TEST_WIDTH 64u
 #define TEST_HEIGHT 64u
 #define TEST_PIXEL_BYTES (TEST_WIDTH * TEST_HEIGHT * 4u)
+// Драйвера может не быть даже когда бэкенд слинкован (машина без Vulkan
+// ICD): тогда тест сообщает о пропуске, а не о ложном провале.
+#define SKIP_EXIT_CODE 125
 
 static void Expect(bool condition, const char *message)
 {
@@ -219,8 +222,21 @@ static bool ColorMatches(const uint8_t color[3], uint8_t red, uint8_t green, uin
 
 LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
 {
-    Renderer *renderer = RendererCreate(NULL, (int32_t)TEST_WIDTH, (int32_t)TEST_HEIGHT);
-    Expect(renderer != NULL, "offscreen renderer could not be created");
+    if (!RendererBackendIsAvailable(RENDERER_BACKEND_VULKAN))
+    {
+        LaiueTestRuntimeWrite("No Vulkan backend available; skipping\n");
+        LaiueTestRuntimeExit(SKIP_EXIT_CODE);
+    }
+    Renderer *renderer = RendererCreateWithBackend(NULL, (int32_t)TEST_WIDTH,
+                                                   (int32_t)TEST_HEIGHT,
+                                                   RENDERER_BACKEND_VULKAN);
+    if (renderer == NULL)
+    {
+        LaiueTestRuntimeWrite("No Vulkan driver available; skipping\n");
+        LaiueTestRuntimeExit(SKIP_EXIT_CODE);
+    }
+    Expect(RendererGetBackend(renderer) == RENDERER_BACKEND_VULKAN,
+           "the offscreen renderer must report the Vulkan backend");
     Expect(!RendererIsWorldReady(renderer), "a fresh renderer must not report a ready world");
 
     // Активного текстурпака нет: рендерер обязан подняться на встроенных

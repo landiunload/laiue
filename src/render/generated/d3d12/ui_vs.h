@@ -80,7 +80,7 @@ ret
 // Approximately 0 instruction slots used
 #endif
 
-const BYTE g_ui_vs[] =
+static const BYTE g_ui_vs[] =
 {
      68,  88,  66,  67,  68,  19,
      71,  11, 237, 113,  15, 209,

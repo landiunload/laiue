@@ -66,7 +66,7 @@ ret
 // Approximately 0 instruction slots used
 #endif
 
-const BYTE g_ui_ps[] =
+static const BYTE g_ui_ps[] =
 {
      68,  88,  66,  67,  43,  10,
      41, 106, 237,  67,  41, 208,
