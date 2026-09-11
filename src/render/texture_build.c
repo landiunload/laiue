@@ -322,6 +322,11 @@ typedef struct LoadScratch
     wchar_t cachePath[LAIUE_CONTENT_PATH_CAPACITY];
     wchar_t resource[LAIUE_CONTENT_PATH_CAPACITY];
     wchar_t packName[LAIUE_CONTENT_NAME_CAPACITY];
+    // Текущий материал второго прохода. Лежит здесь, а не на стеке:
+    // frameMilliseconds[IMAGE_MAX_FRAMES] вместе с локалями вызывающего,
+    // в который LTO вклеивает всю сборку пака, переваливает предел кадра
+    // 4 КиБ и требует __chkstk, которого без CRT нет.
+    MaterialSource source;
 } LoadScratch;
 
 // Порядок по умолчанию: сначала исходники, свой `.lt` последним. Он
@@ -817,25 +822,25 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
 
     for (uint32_t material = 0; material < materialCount; ++material)
     {
-        MaterialSource source;
-        LoadMaterial(catalog, scratch, materialNames[material], &source);
+        MaterialSource *source = &scratch->source;
+        LoadMaterial(catalog, scratch, materialNames[material], source);
         const ResourceMeta *meta = &metas[material];
         uint32_t frames = meta->found ? meta->frameCount : 1u;
 
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
-            bool hasPixels = source.found && frame < source.frameCount;
+            bool hasPixels = source->found && frame < source->frameCount;
             if (hasPixels)
             {
-                uint32_t frameBytes = source.width * source.height * 4u;
-                WriteSliceChain(source.albedo + (size_t)frame * frameBytes, source.width,
-                                source.height, size, albedoCursor);
+                uint32_t frameBytes = source->width * source->height * 4u;
+                WriteSliceChain(source->albedo + (size_t)frame * frameBytes, source->width,
+                                source->height, size, albedoCursor);
                 if (normalCursor != NULL)
                 {
-                    if (source.normal != NULL)
+                    if (source->normal != NULL)
                     {
-                        WriteSliceChain(source.normal + (size_t)frame * frameBytes, source.width,
-                                        source.height, size, normalCursor);
+                        WriteSliceChain(source->normal + (size_t)frame * frameBytes, source->width,
+                                        source->height, size, normalCursor);
                     }
                     else
                     {
@@ -857,15 +862,15 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         uint32_t cycle = 0u;
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
-            uint16_t duration = source.found && frames > 1u && frame < source.frameCount
-                                    ? source.frameMilliseconds[frame]
+            uint16_t duration = source->found && frames > 1u && frame < source->frameCount
+                                    ? source->frameMilliseconds[frame]
                                     : 0u;
             outPack->sliceMilliseconds[firstSlice + frame] = duration;
             cycle += duration;
         }
         outPack->animation[material].cycleMilliseconds = cycle;
         firstSlice += frames;
-        ReleaseSource(&source);
+        ReleaseSource(source);
     }
     PlatformFree(scratch);
     PlatformFree(metas);
