@@ -15,4 +15,13 @@ string(REGEX REPLACE "(^|\n)[ \t]*#pragma once" "\\1#pragma once"
 string(REPLACE "\t" "    " contents "${contents}")
 string(REGEX REPLACE " +\n" "\n" contents "${contents}")
 string(REGEX REPLACE "\n+$" "\n" contents "${contents}")
+# fxc с /Vn и glslang с --vn дают массиву байткода внешнюю связность:
+# `const BYTE g_<имя>[]` и `const uint32_t g_<имя>[]`. В двухбэкендной
+# сборке обе реализации линкуются в один образ, и одинаковые внешние имена
+# с разным типом нарушают ODR (MSVC: C4742/C4743, затем LNK1257). Байткод
+# нужен ровно одной единице трансляции — своему бэкенду, поэтому
+# объявление делается внутренним. Якорь — начало строки и только
+# идентификатор g_[a-z_]+, чтобы не задеть пояснительный текст.
+string(REGEX REPLACE "(^|\n)const (BYTE|uint32_t) (g_[a-z_]+\\[\\])"
+    "\\1static const \\2 \\3" contents "${contents}")
 file(WRITE "${INPUT_FILE}" "${contents}")

@@ -43,10 +43,18 @@ endif()
 # сразу. Исходная опция сравнивается до resolve: на Windows AUTO тоже
 # разрешается в D3D12, и по LAIUE_RENDER_BACKEND_RESOLVED их не отличить.
 string(TOUPPER "${LAIUE_RENDER_BACKEND}" laiue_render_backend_requested)
+set(LAIUE_RENDER_HAS_D3D12 OFF)
+set(LAIUE_RENDER_HAS_VULKAN_TARGET OFF)
 if(laiue_render_backend_requested STREQUAL "AUTO")
     set(backend_sources renderer_dispatch.c ${available_sources})
     set(backend_links ${available_links})
     set(backend_compile_definitions ${available_definitions})
+    if(WIN32)
+        set(LAIUE_RENDER_HAS_D3D12 ON)
+    endif()
+    if(Vulkan_FOUND)
+        set(LAIUE_RENDER_HAS_VULKAN_TARGET ON)
+    endif()
 elseif(laiue_render_backend_requested STREQUAL "D3D12")
     set(backend_sources
         renderer_dispatch.c
@@ -60,11 +68,13 @@ elseif(laiue_render_backend_requested STREQUAL "D3D12")
         ole32
         windowscodecs)
     set(backend_compile_definitions LAIUE_RENDER_HAS_D3D12)
+    set(LAIUE_RENDER_HAS_D3D12 ON)
 elseif(laiue_render_backend_requested STREQUAL "VULKAN")
     if(Vulkan_FOUND)
         set(backend_sources renderer_dispatch.c renderer_vulkan.c renderer_offscreen.h)
         set(backend_links Vulkan::Vulkan)
         set(backend_compile_definitions LAIUE_RENDER_HAS_VULKAN)
+        set(LAIUE_RENDER_HAS_VULKAN_TARGET ON)
     else()
         set(backend_sources renderer_dispatch.c)
         set(backend_links "")
@@ -118,3 +128,11 @@ target_compile_definitions(laiue_render PRIVATE ${backend_compile_definitions})
 # fallback.
 target_include_directories(laiue_render BEFORE PRIVATE
     "${PROJECT_BINARY_DIR}/src")
+
+# Тесты живут в каталоге, который добавляется после src/render, и решают,
+# какие прогоны регистрировать, по реально слинкованным бэкендам, а не по
+# LAIUE_RENDER_BACKEND_RESOLVED: на Windows AUTO разрешается в D3D12 и по
+# resolved неотличим от явного D3D12, хотя линкует оба.
+set(LAIUE_RENDER_HAS_D3D12 "${LAIUE_RENDER_HAS_D3D12}" PARENT_SCOPE)
+set(LAIUE_RENDER_HAS_VULKAN_TARGET "${LAIUE_RENDER_HAS_VULKAN_TARGET}"
+    PARENT_SCOPE)

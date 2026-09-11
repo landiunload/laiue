@@ -286,3 +286,161 @@ cmake --build build\vulkan-dual --config Release --parallel 4
 `LAIUE_RENDER_HAS_VULKAN` и `LAIUE_RENDER_DEFAULT_BACKEND_VULKAN` — это
 единственное реальное исполнение `_Vulkan`-суффиксов, и оно случится после
 приёма правки.
+
+## 8. Двухбэкендная сборка на Windows: ODR-конфликт байткода шейдеров
+
+Раздел 7 честно фиксировал, что совместная линковка D3D12 и Vulkan не
+проверена. Теперь Vulkan SDK на машине есть (в пользовательском виде, без
+прав администратора), и совместная сборка не просто слинкована — offscreen-
+кадр на настоящем GPU рисуется, а в одном процессе живут оба бэкенда.
+
+### 8.1. Как поставить Vulkan SDK без установщика
+
+Установщик LunarG требует прав администратора, поэтому SDK собран вручную
+в `C:\Users\landi\vulkan-sdk-user`:
+
+- заголовки Khronos (`vulkan/vulkan.h`, `vk_platform.h`, ...) и `vulkan.hpp`;
+- import-библиотека `Lib/vulkan-1.lib`, собранная из экспортов системного
+  драйвера: `dumpbin /exports C:\Windows\System32\vulkan-1.dll` →
+  `vulkan-1.def` → `lib /def:vulkan-1.def /machine:x64 /out:vulkan-1.lib`
+  (скрипты `gen_def.py` и `mklib.bat` лежат рядом в каталоге SDK);
+- переменная окружения `VULKAN_SDK=C:\Users\landi\vulkan-sdk-user`, после
+  чего `find_package(Vulkan QUIET)` находит и `Include`, и `Lib`.
+
+Слоёв валидации нет; GPU — NVIDIA GeForce RTX 4060, драйвер сообщает
+Vulkan 1.4.341. Компилятора GLSL→SPIR-V (`glslangValidator`) на машине нет,
+поэтому Vulkan-шейдеры берутся из checked-in fallback
+`src/render/generated/vulkan/` (копирование, а не компиляция).
+
+### 8.2. Что именно ломалось
+
+`build\peer\setup_auto.bat` (AUTO + Vulkan) компилировался, но не линковался.
+`LTCG`/`LNK1257` — следствие настоящей причины: нарушение ODR. fxc с `/Vn`
+и glslang с `--vn` объявляют массивы байткода одинаковыми именами с
+**внешней** связностью и разными типами:
+
+- `src/render/generated/d3d12/*.h`: `const BYTE g_<имя>[]` (элемент 1 байт,
+  выравнивание 1);
+- `src/render/generated/vulkan/*.h`: `const uint32_t g_<имя>[]` (элемент
+  4 байта, выравнивание 4).
+
+В C `const` на файловом уровне не делает объект внутренним, поэтому обе
+единицы трансляции (`renderer_d3d12.c` и `renderer_vulkan.c`) давали по
+определению одного и того же имени. MSVC сообщал:
+
+```
+warning C4742: "g_ui_ps" имеет разное выравнивание в renderer_vulkan.c и renderer_d3d12.c: 4 и 1
+warning C4743: "g_chunk_vs" имеет разный размер в renderer_vulkan.c и renderer_d3d12.c: 6072 и 3024 байт
+```
+
+Полный список коллизий (размер в байтах, `sizeof` массива в каждом
+бэкенде):
+
+| Символ | D3D12 (`BYTE`, align 1) | Vulkan (`uint32_t`, align 4) |
+| --- | --- | --- |
+| `g_chunk_vs` | 3024 | 6072 |
+| `g_chunk_ps` | 2668 | 5192 |
+| `g_panorama_vs` | 484 | 848 |
+| `g_panorama_ps` | 748 | 2104 |
+| `g_ui_vs` | 1772 | 4136 |
+| `g_ui_ps` | 1144 | 2328 |
+
+Других коллизий внешних символов между бэкендами не было: после правки в
+двухбэкендном линке нет ни `C4742`/`C4743`, ни `LNK2005`/`LNK1169`.
+
+### 8.3. Правка
+
+`cmake/NormalizeShaderHeader.cmake` (он и так пост-обрабатывает каждый
+сгенерированный заголовок) получил шаг, делающий определение внутренним:
+
+```cmake
+string(REGEX REPLACE "(^|\n)const (BYTE|uint32_t) (g_[a-z_]+\\[\\])"
+    "\\1static const \\2 \\3" contents "${contents}")
+```
+
+Регулярное выражение якорено на начало строки и на `g_[a-z_]+[]`, поэтому
+пояснительный текст и дизассемблер в `#if 0` не задеваются. Байткод нужен
+ровно одной единице трансляции — своему бэкенду, так что `static` здесь
+семантически верен. Сами байты массивов не изменились: `git diff` по
+двенадцати fallback-заголовкам — по одной строке на файл
+(`const …` → `static const …`).
+
+Закоммиченные fallback-заголовки обновлены тем же скриптом:
+
+```bat
+for %f in (src\render\generated\d3d12\*.h src\render\generated\vulkan\*.h) do ^
+  cmake -DINPUT_FILE=%f -P cmake\NormalizeShaderHeader.cmake
+```
+
+Нормализация идемпотентна: второй прогон по уже обработанным файлам не
+меняет ни байта (проверено — diff не растёт). Это важно, потому что CI
+(`laiue_verify_shaders`, `cmake/LaiueShader.cmake` → `compare_files`) после
+компиляции прогоняет заголовок через тот же скрипт и сравнивает с
+закоммиченным. Без идемпотентности checked-in fallback в принципе
+непроверяем.
+
+### 8.4. CMake и тесты: AUTO перестаёт скрывать Vulkan
+
+`src/render/CMakeLists.txt` публикует факт «какие бэкенды реально
+слинкованы» в родительскую область:
+
+```cmake
+set(LAIUE_RENDER_HAS_D3D12 "${LAIUE_RENDER_HAS_D3D12}" PARENT_SCOPE)
+set(LAIUE_RENDER_HAS_VULKAN_TARGET "${LAIUE_RENDER_HAS_VULKAN_TARGET}"
+    PARENT_SCOPE)
+```
+
+По `LAIUE_RENDER_BACKEND_RESOLVED` этого не сделать: на Windows AUTO
+разрешается в `D3D12` и неотличим от явного D3D12, хотя линкует оба
+бэкенда. `tests/CMakeLists.txt` теперь регистрирует:
+
+- `laiue.render.offscreen_frame` — при `LAIUE_RENDER_HAS_VULKAN_TARGET`
+  (а не только когда Vulkan единственный); тест зовёт
+  `RendererCreateWithBackend(NULL, …, RENDERER_BACKEND_VULKAN)`, проверяет
+  `RendererGetBackend` и сообщает о пропуске кодом 125, если драйвера нет;
+- `laiue.render.dual_backend` — только когда в сборке оба бэкенда.
+
+`RendererCaptureFrame` (реализация только в Vulkan, объявление в
+`renderer_offscreen.h`) диспетчера не требует: функция не входит в
+`renderer.h` и не дублируется, тест линкует её напрямую из `laiue_render`.
+Публичный API/ABI не менялся, новых экспортов нет.
+
+### 8.5. Новый тест `tests/render_dual_backend_test.c`
+
+Создаёт скрытое Win32-окно (`CreateWindowExW`, без `ShowWindow`), D3D12-
+рендерер на его `HWND` и Vulkan-рендерер на `NULL`, у каждого — по мешу.
+Затем 8 кадров, в которых вызовы чередуются (D3D12 begin/pass/draw/end,
+затем Vulkan): одноэлементный кэш быстрого пути диспетчера
+(`g_rendererFastHandle`/`g_rendererFastKind`) на каждом чередовании
+промахивается и уходит в реестр под мьютексом. Кадр Vulkan захватывается
+через `RendererCaptureFrame` — центральный пиксель не чёрный (небо
+специально чёрное, значит виден меш). `RendererGetStats` обоих даёт
+`geometryPoolCapacityBytes > 0`. Уничтожение проверяется в обоих
+порядках: в первом прогоне первым умирает D3D12 (Vulkan продолжает
+рисовать), во втором — Vulkan (кадр D3D12 после этого проходит). Отдельно
+проверяется, что `RENDERER_BACKEND_AUTO` на Windows даёт D3D12. Без
+D3D12-адаптера или Vulkan-драйвера тест выходит кодом 125; CRT не
+используется, кадр стека соблюдён.
+
+### 8.6. Результат трёх конфигураций
+
+| Конфигурация | Команда | Тесты |
+| --- | --- | --- |
+| D3D12 (штатная) | `build\peer\setup.bat` | 30/30 passed |
+| VULKAN (явная) | `cmake --preset windows-msvc -B build\vk -DLAIUE_RENDER_BACKEND=VULKAN` + SDK | 31/31 passed |
+| AUTO + Vulkan | `build\peer\setup_auto.bat` (`SETUP-AUTO-OK`) | 32/32 passed |
+
+`laiue.render.offscreen_frame` и `laiue.render.dual_backend` — зелёные,
+`dual_backend` прогонялся трижды подряд без флака. `laiue_verify_shaders`
+зелёная в D3D12-сборке (там есть `fxc.exe` из Windows SDK и заголовки
+реально компилируются) и в Vulkan-сборке (там она лишь копирует fallback,
+но проверяет, что checked-in заголовки совпадают с тем, что положит
+сборка). Для Vulkan идемпотентность нормализации проверена отдельно, потому
+что `glslangValidator` на машине нет.
+
+Замечание к разделу 7: утверждение «кадр на Vulkan при двойной линковке не
+нарисуется, пока `LaiueShader.cmake` не научится компилировать оба набора»
+устарело — offscreen-кадр Vulkan теперь рисуется и проверяется по
+пикселям, потому что бэкенд поднимается на встроенном fallback-наборе
+(`RendererReloadShaderSet(NULL)`), а не на скомпилированных в этой сборке
+шейдерах.
