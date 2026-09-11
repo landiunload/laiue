@@ -31,6 +31,7 @@
 #include "scene/chunk_streaming.h"
 #include "render/renderer.h"
 #include "world/world.h"
+#include "platform/system.h"
 #include "test_runtime.h"
 
 #include <stdbool.h>
@@ -476,9 +477,14 @@ static void StressClearInjectedMeshes(ChunkStreaming* handle)
 // Пустой мир даёт нулевые меши, поэтому Pump не зовёт рендерер. Ждём, пока
 // рабочие разберут очередь заявок и результатов, чтобы сценарий смены
 // origin не копил незавершённую работу.
+// Потолок — по времени, а не по числу прокачек: горячий цикл прокачки на
+// быстром главном потоке съедал миллион итераций за доли секунды и на
+// двухъядерном ARM64-раннере в Debug вытеснял рабочих раньше, чем те
+// разбирали очередь. Между прокачками главный поток уступает процессор.
 static void StressSettle(ChunkStreaming* handle)
 {
-    for (uint32_t spin = 0u; ; ++spin)
+    const double start = PlatformMonotonicSeconds();
+    for (;;)
     {
         ChunkStreamingPump(handle);
         ChunkStreamingStats stats;
@@ -487,7 +493,8 @@ static void StressSettle(ChunkStreaming* handle)
         {
             break;
         }
-        EXPECT(spin < 1000000u, "streaming did not settle");
+        EXPECT(PlatformMonotonicSeconds() - start < 60.0, "streaming did not settle");
+        PlatformSleepMilliseconds(0u);
     }
 }
 
