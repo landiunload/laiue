@@ -2416,8 +2416,11 @@ bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalo
     if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
         return false;
 
-    GpuImage albedo;
-    GpuImage normals;
+    // Обнуление нужно MSVC: при неудаче первого CreateBlockArrayTexture
+    // второй не вызывается, и без него компилятор считает normals
+    // возможно неинициализированной (C4701) на общем пути присваивания.
+    GpuImage albedo = {0};
+    GpuImage normals = {0};
     bool built = CreateBlockArrayTexture(renderer, &pack, false, &albedo) &&
                  CreateBlockArrayTexture(renderer, &pack, true, &normals);
     TexturePackAnimationSet animation;

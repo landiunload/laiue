@@ -791,14 +791,14 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     };
     for (uint32_t index = 0; index < sizeof(cached) / sizeof(cached[0]); ++index)
     {
-        ChunkQuad quad[1];
-        quad[0] = PackChunkQuad(0u, 0u, 0u, 4u, cached[index].blockType, 1u, 1u, 1u);
-        RendererMesh *mesh = RendererCreateMesh(renderer, quad, 1u);
-        Expect(mesh != NULL, "the cached mesh could not be created");
+        ChunkQuad cachedQuad[1];
+        cachedQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, cached[index].blockType, 1u, 1u, 1u);
+        RendererMesh *cachedMesh = RendererCreateMesh(renderer, cachedQuad, 1u);
+        Expect(cachedMesh != NULL, "the cached mesh could not be created");
         setup.animationSeconds = cached[index].seconds;
         Expect(RendererBeginFrame(renderer, &setup), "the cached frame could not begin");
         RendererBeginScenePass(renderer, 0u);
-        RendererDrawMesh(renderer, mesh, origin);
+        RendererDrawMesh(renderer, cachedMesh, origin);
         Expect(RendererEndFrame(renderer), "the cached frame could not end");
         Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
                "the cached frame could not be captured");
@@ -808,7 +808,7 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
                    AbsoluteDifference(centre[1], cached[index].green) <= 6 &&
                    AbsoluteDifference(centre[2], cached[index].blue) <= 6,
                cached[index].reason);
-        RendererDestroyMesh(renderer, mesh);
+        RendererDestroyMesh(renderer, cachedMesh);
     }
 
     // Нет ни исходника, ни кэша — остаётся нейтральный слой. Это и есть
