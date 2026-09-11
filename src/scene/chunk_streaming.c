@@ -133,6 +133,12 @@ struct ChunkStreaming
     // номер, а не один раз на «пока не вышел из ожидания»: иначе Pause сразу
     // после Resume при пустой очереди ждал бы отчёта вечно.
     uint32_t pauseGeneration;
+    // Источник ревизий записей. Ревизия обязана быть уникальной во времени,
+    // а не только внутри записи: запись, вытесненная из куба и заказанная
+    // снова, раньше начинала с нуля, и результат прежней сборки той же
+    // клетки мог совпасть с новой заявкой по координатам и ревизии, а
+    // значит, быть принят уже после правки блока в промежутке.
+    uint32_t nextRevision;
     bool pauseRequested;
     bool shutdownRequested;
 
@@ -278,7 +284,7 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     entry->y = y;
     entry->z = z;
     entry->mesh = NULL;
-    entry->revision = 0;
+    entry->revision = ++streaming->nextRevision;
     entry->drawSlotPlusOne = 0;
     entry->requestQueued = false;
     return entry;
@@ -1155,7 +1161,7 @@ void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, in
                 // меш загружен. Иначе чанк мигал бы дырой те кадр-два, что идёт
                 // перестройка.
                 entry->state = CHUNK_ENTRY_PENDING;
-                entry->revision++;
+                entry->revision = ++streaming->nextRevision;
                 TryEnqueueRequest(streaming, entry);
             }
         }
