@@ -6,6 +6,8 @@
 #define JPEG_MAX_SAMPLING 4u
 #define JPEG_HUFFMAN_TABLES 8u
 #define JPEG_QUANT_TABLES 4u
+#define JPEG_FAST_BITS 9u
+#define JPEG_FAST_SIZE (1u << JPEG_FAST_BITS)
 
 // Порядок обхода коэффициентов внутри блока. Коэффициенты хранятся
 // именно в нём, а не в естественном порядке: прогрессивный режим задаёт
@@ -53,6 +55,10 @@ typedef struct JpegHuffman
     int32_t maxCode[17];
     int32_t valuePointer[17];
     uint8_t values[256];
+    // Таблица прямого поиска по девяти старшим битам: (length << 8) |
+    // symbol. Ноль означает код длиннее JPEG_FAST_BITS: его читает
+    // канонический цикл. Символ и длина при этом те же.
+    uint16_t fast[JPEG_FAST_SIZE];
 } JpegHuffman;
 
 typedef struct JpegComponent
@@ -144,39 +150,56 @@ static uint32_t DivideRoundUp(uint32_t value, uint32_t divisor)
     return (value + divisor - 1u) / divisor;
 }
 
+// Следующий байт энтропийных данных. Возвращает false, когда кончился
+// буфер или встретился маркер: байт тогда не выдаётся, а позиция
+// остаётся на маркере, чтобы его нашли рестарт и разбор сегмента.
+static bool NextDataByte(JpegReader *reader, uint32_t *outByte)
+{
+    if (reader->markerReached || reader->position >= reader->sizeBytes)
+    {
+        reader->markerReached = true;
+        return false;
+    }
+    uint8_t byte = reader->bytes[reader->position];
+    reader->position += 1u;
+    if (byte == 0xFFu)
+    {
+        // Заполняющих 0xFF перед маркером может быть сколько угодно.
+        uint32_t look = reader->position;
+        while (look < reader->sizeBytes && reader->bytes[look] == 0xFFu) look += 1u;
+        uint8_t next = look < reader->sizeBytes ? reader->bytes[look] : 0xD9u;
+        if (next == 0x00u)
+        {
+            reader->position = look + 1u;
+        }
+        else
+        {
+            reader->position -= 1u;
+            reader->markerReached = true;
+            return false;
+        }
+    }
+    *outByte = byte;
+    return true;
+}
+
+// Дозаправка буфера до count бит. Маркер не проглатывается: на нём
+// набор останавливается, и разбор получает нули, как и прежде.
+static void EnsureBits(JpegReader *reader, uint32_t count)
+{
+    while (reader->bitCount < count)
+    {
+        uint32_t byte = 0u;
+        if (!NextDataByte(reader, &byte)) return;
+        reader->bitBuffer = (reader->bitBuffer << 8) | byte;
+        reader->bitCount += 8u;
+    }
+}
+
 static uint32_t ReadBit(JpegReader *reader)
 {
-    if (reader->bitCount == 0u)
-    {
-        if (reader->markerReached || reader->position >= reader->sizeBytes)
-        {
-            reader->markerReached = true;
-            return 0u;
-        }
-        uint8_t byte = reader->bytes[reader->position];
-        reader->position += 1u;
-        if (byte == 0xFFu)
-        {
-            // Заполняющих 0xFF перед маркером может быть сколько угодно.
-            uint32_t look = reader->position;
-            while (look < reader->sizeBytes && reader->bytes[look] == 0xFFu) look += 1u;
-            uint8_t next = look < reader->sizeBytes ? reader->bytes[look] : 0xD9u;
-            if (next == 0x00u)
-            {
-                reader->position = look + 1u;
-            }
-            else
-            {
-                // Маркер: возвращаем позицию на него, чтобы рестарт и
-                // разбор следующего сегмента нашли его на месте.
-                reader->position -= 1u;
-                reader->markerReached = true;
-                return 0u;
-            }
-        }
-        reader->bitBuffer = byte;
-        reader->bitCount = 8u;
-    }
+    EnsureBits(reader, 1u);
+    if (reader->bitCount == 0u) return 0u;
     reader->bitCount -= 1u;
     return (reader->bitBuffer >> reader->bitCount) & 1u;
 }
@@ -194,6 +217,24 @@ static uint32_t ReadBits(JpegReader *reader, uint32_t count)
 static int32_t DecodeHuffman(JpegReader *reader, const JpegHuffman *table)
 {
     if (!table->present) return -1;
+
+    // Девять старших бит дают символ сразу для подавляющего большинства
+    // кодов. Более длинные разбираются каноническим циклом, который
+    // читает те же биты с начала: результат тождественен.
+    EnsureBits(reader, JPEG_FAST_BITS);
+    if (reader->bitCount >= JPEG_FAST_BITS)
+    {
+        uint32_t index =
+            (reader->bitBuffer >> (reader->bitCount - JPEG_FAST_BITS)) & (JPEG_FAST_SIZE - 1u);
+        uint16_t entry = table->fast[index];
+        uint32_t length = (uint32_t)entry >> 8;
+        if (length != 0u)
+        {
+            reader->bitCount -= length;
+            return (int32_t)(entry & 0xFFu);
+        }
+    }
+
     int32_t code = (int32_t)ReadBit(reader);
     for (uint32_t length = 1u; length <= 16u; ++length)
     {
@@ -218,11 +259,23 @@ static int32_t Extend(uint32_t value, uint32_t length)
     return (int32_t)value;
 }
 
+// Заполняет таблицу прямого поиска всеми индексами, у которых старшие
+// length бит равны коду: код JPEG читается старшим битом вперёд, как и
+// лежит в буфере.
+static void FillFast(JpegHuffman *table, uint32_t code, uint32_t length, uint8_t symbol)
+{
+    uint32_t step = 1u << (JPEG_FAST_BITS - length);
+    uint32_t base = code << (JPEG_FAST_BITS - length);
+    uint16_t entry = (uint16_t)((length << 8) | symbol);
+    for (uint32_t index = 0; index < step; ++index) table->fast[base + index] = entry;
+}
+
 static ImageStatus BuildHuffman(JpegHuffman *table, const uint8_t *counts, const uint8_t *values,
                                 uint32_t valueCount)
 {
     int32_t code = 0;
     uint32_t taken = 0u;
+    for (uint32_t index = 0; index < JPEG_FAST_SIZE; ++index) table->fast[index] = 0u;
     for (uint32_t length = 1u; length <= 16u; ++length)
     {
         uint32_t count = counts[length - 1u];
@@ -244,6 +297,17 @@ static ImageStatus BuildHuffman(JpegHuffman *table, const uint8_t *counts, const
     }
     if (taken != valueCount) return IMAGE_CORRUPT;
     for (uint32_t index = 0; index < valueCount; ++index) table->values[index] = values[index];
+    // Быстрый путь строится после проверки: до неё counts вправе
+    // ссылаться за пределы списка значений.
+    for (uint32_t length = 1u; length <= JPEG_FAST_BITS; ++length)
+    {
+        uint32_t count = counts[length - 1u];
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            FillFast(table, (uint32_t)(table->minCode[length] + (int32_t)index), length,
+                     values[table->valuePointer[length] + (int32_t)index]);
+        }
+    }
     table->present = true;
     return IMAGE_OK;
 }

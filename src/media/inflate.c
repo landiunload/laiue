@@ -2,25 +2,17 @@
 
 #include <stddef.h>
 
-// Раскодирование канонических кодов идёт по одному биту: таблица
-// быстрого поиска ускорила бы его в несколько раз, но инструмент
-// работает офлайн, а побитовый разбор проверяется глазами целиком.
-// Быстрый путь появится тогда, когда время распаковки станет заметным
-// на измерении, а не раньше.
+// Разбор кода: девять старших бит берутся из таблицы прямого поиска,
+// более длинные коды читаются каноническим циклом по одному биту.
+// Таблица строится из тех же длин, поэтому символ всегда тот же, что
+// дал бы побитовый разбор: меняется только способ его найти.
 
-#define MAX_CODE_BITS 15u
-#define LITERAL_SYMBOLS 288u
+#define LITERAL_SYMBOLS INFLATE_LITERAL_SYMBOLS
 #define DISTANCE_SYMBOLS 30u
 #define CODE_LENGTH_SYMBOLS 19u
-
-typedef struct HuffmanTable
-{
-    // count[n] — сколько кодов длины n; symbol — символы в порядке
-    // возрастания кода. Этого достаточно, чтобы разбирать поток без
-    // таблицы поиска.
-    int16_t count[MAX_CODE_BITS + 1u];
-    int16_t symbol[LITERAL_SYMBOLS];
-} HuffmanTable;
+#define MAX_CODE_BITS INFLATE_MAX_CODE_BITS
+#define FAST_BITS INFLATE_FAST_BITS
+#define FAST_SIZE INFLATE_FAST_SIZE
 
 typedef struct InflateState
 {
@@ -96,8 +88,40 @@ static uint32_t ReadBits(InflateState *state, uint32_t need)
     return value;
 }
 
-static int32_t DecodeSymbol(InflateState *state, const HuffmanTable *table)
+// Дозаправка до need бит. В отличие от ReadBits не выставляет мусорные
+// биты при нехватке: fast-путь должен увидеть, что бит меньше need, и
+// уйти в канонический разбор.
+static void EnsureBits(InflateState *state, uint32_t need)
 {
+    while (state->bitCount < need)
+    {
+        uint32_t byte = NextByte(state);
+        if (state->truncated) return;
+        state->bitBuffer |= byte << state->bitCount;
+        state->bitCount += 8u;
+    }
+}
+
+static int32_t DecodeSymbol(InflateState *state, const InflateHuffmanTable *table)
+{
+    EnsureBits(state, FAST_BITS);
+    if (state->bitCount >= FAST_BITS)
+    {
+        uint16_t entry = table->fast[state->bitBuffer & (FAST_SIZE - 1u)];
+        uint32_t length = (uint32_t)entry >> 9;
+        if (length != 0u)
+        {
+            state->bitBuffer >>= length;
+            state->bitCount -= length;
+            return (int32_t)(entry & 0x1FFu);
+        }
+    }
+
+    // Канонический разбор. Если дозаправка уже заметила конец потока,
+    // когда биты ещё оставались, флаг снимается: прежний разбор узнал бы
+    // об обрыве только исчерпав эти биты. Иначе счётчик выданных байт на
+    // усечённом потоке разошёлся бы.
+    state->truncated = false;
     int32_t code = 0;
     int32_t first = 0;
     int32_t index = 0;
@@ -117,12 +141,31 @@ static int32_t DecodeSymbol(InflateState *state, const HuffmanTable *table)
     return -1;
 }
 
+// Заполняет таблицу прямого поиска всеми индексами, у которых младшие
+// length бит равны коду. Код записан старшим битом вперёд, а битовый
+// буфер отдаёт его младшим битом вперёд, поэтому индекс — обратный код.
+static void FillFast(InflateHuffmanTable *table, uint32_t code, uint32_t length, uint32_t symbol)
+{
+    uint32_t reversed = 0u;
+    for (uint32_t bit = 0; bit < length; ++bit)
+    {
+        reversed = (reversed << 1) | (code & 1u);
+        code >>= 1;
+    }
+    uint16_t entry = (uint16_t)((length << 9) | (symbol & 0x1FFu));
+    for (uint32_t index = reversed; index < FAST_SIZE; index += 1u << length)
+    {
+        table->fast[index] = entry;
+    }
+}
+
 // Строит канонический код по длинам. Недогруженный набор (кодов меньше,
 // чем позволяет длина) допустим только в вырожденном случае с одним
 // символом; перегруженный — всегда повреждение.
-static bool BuildTable(HuffmanTable *table, const uint8_t *lengths, uint32_t symbolCount)
+static bool BuildTable(InflateHuffmanTable *table, const uint8_t *lengths, uint32_t symbolCount)
 {
     for (uint32_t length = 0; length <= MAX_CODE_BITS; ++length) table->count[length] = 0;
+    for (uint32_t index = 0; index < FAST_SIZE; ++index) table->fast[index] = 0u;
     for (uint32_t symbol = 0; symbol < symbolCount; ++symbol)
     {
         ++table->count[lengths[symbol]];
@@ -137,6 +180,16 @@ static bool BuildTable(HuffmanTable *table, const uint8_t *lengths, uint32_t sym
         if (left < 0) return false;
     }
 
+    // nextCode[length] — первый канонический код этой длины. Длины 0
+    // (неиспользуемые символы) в стандартную формулу не входят.
+    uint32_t nextCode[MAX_CODE_BITS + 1u];
+    uint32_t code = 0u;
+    for (uint32_t length = 1; length <= MAX_CODE_BITS; ++length)
+    {
+        code = (code + (length > 1u ? (uint32_t)table->count[length - 1u] : 0u)) << 1;
+        nextCode[length] = code;
+    }
+
     int16_t offsets[MAX_CODE_BITS + 2u];
     offsets[1] = 0;
     for (uint32_t length = 1; length <= MAX_CODE_BITS; ++length)
@@ -145,24 +198,49 @@ static bool BuildTable(HuffmanTable *table, const uint8_t *lengths, uint32_t sym
     }
     for (uint32_t symbol = 0; symbol < symbolCount; ++symbol)
     {
-        if (lengths[symbol] != 0u)
+        uint32_t length = lengths[symbol];
+        if (length != 0u)
         {
-            table->symbol[offsets[lengths[symbol]]++] = (int16_t)symbol;
+            table->symbol[offsets[length]++] = (int16_t)symbol;
+            uint32_t codeValue = nextCode[length]++;
+            if (length <= FAST_BITS) FillFast(table, codeValue, length, symbol);
         }
     }
     return true;
 }
 
+// Выравнивание по границе байта: остаток бит текущего байта
+// отбрасывается, а целые байты, уже попавшие в буфер дозаправкой,
+// сохраняются — иначе они потерялись бы при переходе к несжатому блоку
+// и к контрольной сумме.
+static void AlignToByte(InflateState *state)
+{
+    uint32_t drop = state->bitCount & 7u;
+    state->bitBuffer >>= drop;
+    state->bitCount -= drop;
+}
+
+static uint32_t ReadAlignedByte(InflateState *state)
+{
+    if (state->bitCount >= 8u)
+    {
+        uint32_t value = state->bitBuffer & 0xFFu;
+        state->bitBuffer >>= 8u;
+        state->bitCount -= 8u;
+        return value;
+    }
+    return NextByte(state);
+}
+
 static bool CopyStored(InflateState *state)
 {
     // Несжатый блок выровнен по байту: остаток текущего байта отбрасывается.
-    state->bitBuffer = 0u;
-    state->bitCount = 0u;
+    AlignToByte(state);
 
-    uint32_t length = NextByte(state);
-    length |= NextByte(state) << 8;
-    uint32_t inverted = NextByte(state);
-    inverted |= NextByte(state) << 8;
+    uint32_t length = ReadAlignedByte(state);
+    length |= ReadAlignedByte(state) << 8;
+    uint32_t inverted = ReadAlignedByte(state);
+    inverted |= ReadAlignedByte(state) << 8;
     if (state->truncated) return false;
     if (((length ^ 0xFFFFu) & 0xFFFFu) != inverted)
     {
@@ -177,13 +255,13 @@ static bool CopyStored(InflateState *state)
 
     for (uint32_t index = 0; index < length; ++index)
     {
-        state->output[state->written++] = (uint8_t)NextByte(state);
+        state->output[state->written++] = (uint8_t)ReadAlignedByte(state);
     }
     return !state->truncated;
 }
 
-static bool InflateBlock(InflateState *state, const HuffmanTable *literals,
-                         const HuffmanTable *distances)
+static bool InflateBlock(InflateState *state, const InflateHuffmanTable *literals,
+                         const InflateHuffmanTable *distances)
 {
     for (;;)
     {
@@ -236,7 +314,7 @@ static bool InflateBlock(InflateState *state, const HuffmanTable *literals,
     }
 }
 
-static void BuildFixedTables(HuffmanTable *literals, HuffmanTable *distances)
+static void BuildFixedTables(InflateHuffmanTable *literals, InflateHuffmanTable *distances)
 {
     uint8_t lengths[LITERAL_SYMBOLS];
     for (uint32_t symbol = 0; symbol < 144u; ++symbol) lengths[symbol] = 8u;
@@ -249,8 +327,8 @@ static void BuildFixedTables(HuffmanTable *literals, HuffmanTable *distances)
     BuildTable(distances, lengths, DISTANCE_SYMBOLS);
 }
 
-static bool BuildDynamicTables(InflateState *state, HuffmanTable *literals,
-                               HuffmanTable *distances)
+static bool BuildDynamicTables(InflateState *state, InflateHuffmanTable *literals,
+                               InflateHuffmanTable *distances, InflateHuffmanTable *codeLengths)
 {
     uint32_t literalCount = ReadBits(state, 5u) + 257u;
     uint32_t distanceCount = ReadBits(state, 5u) + 1u;
@@ -270,8 +348,7 @@ static bool BuildDynamicTables(InflateState *state, HuffmanTable *literals,
     }
     if (state->truncated) return false;
 
-    HuffmanTable codeLengths;
-    if (!BuildTable(&codeLengths, lengths, CODE_LENGTH_SYMBOLS))
+    if (!BuildTable(codeLengths, lengths, CODE_LENGTH_SYMBOLS))
     {
         state->corrupt = true;
         return false;
@@ -281,7 +358,7 @@ static bool BuildDynamicTables(InflateState *state, HuffmanTable *literals,
     uint32_t index = 0;
     while (index < total)
     {
-        int32_t symbol = DecodeSymbol(state, &codeLengths);
+        int32_t symbol = DecodeSymbol(state, codeLengths);
         if (symbol < 0) return false;
 
         if (symbol < 16)
@@ -352,9 +429,13 @@ static uint32_t Adler32(const uint8_t *bytes, uint32_t size)
 }
 
 ImageStatus InflateZlib(const InflateSegment *segments, uint32_t segmentCount, void *output,
-                        uint32_t outputBytes, uint32_t *outWritten)
+                        uint32_t outputBytes, void *work, uint32_t workBytes,
+                        uint32_t *outWritten)
 {
     if (segments == NULL || output == NULL || segmentCount == 0u) return IMAGE_INVALID_ARGUMENT;
+    if (work == NULL || workBytes < (uint32_t)sizeof(InflateWork)) return IMAGE_INVALID_ARGUMENT;
+    InflateWork *tables = (InflateWork *)work;
+    tables->fixedReady = false;
 
     InflateState state = {
         .segments = segments,
@@ -385,17 +466,18 @@ ImageStatus InflateZlib(const InflateSegment *segments, uint32_t segmentCount, v
         }
         else if (type == 1u)
         {
-            HuffmanTable literals;
-            HuffmanTable distances;
-            BuildFixedTables(&literals, &distances);
-            ok = InflateBlock(&state, &literals, &distances);
+            if (!tables->fixedReady)
+            {
+                BuildFixedTables(&tables->fixedLiterals, &tables->fixedDistances);
+                tables->fixedReady = true;
+            }
+            ok = InflateBlock(&state, &tables->fixedLiterals, &tables->fixedDistances);
         }
         else if (type == 2u)
         {
-            HuffmanTable literals;
-            HuffmanTable distances;
-            ok = BuildDynamicTables(&state, &literals, &distances) &&
-                 InflateBlock(&state, &literals, &distances);
+            ok = BuildDynamicTables(&state, &tables->literals, &tables->distances,
+                                    &tables->codeLengths) &&
+                 InflateBlock(&state, &tables->literals, &tables->distances);
         }
         else
         {
@@ -409,13 +491,13 @@ ImageStatus InflateZlib(const InflateSegment *segments, uint32_t segmentCount, v
         }
     }
 
-    // Хвост потока выровнен по байту и несёт Adler-32 распакованных данных.
-    state.bitBuffer = 0u;
-    state.bitCount = 0u;
-    uint32_t checksum = NextByte(&state) << 24;
-    checksum |= NextByte(&state) << 16;
-    checksum |= NextByte(&state) << 8;
-    checksum |= NextByte(&state);
+    // Хвост потока выровнен по байту и несёт Adler-32 распакованных
+    // данных: выравнивание сохраняет байты, уже забранные дозаправкой.
+    AlignToByte(&state);
+    uint32_t checksum = ReadAlignedByte(&state) << 24;
+    checksum |= ReadAlignedByte(&state) << 16;
+    checksum |= ReadAlignedByte(&state) << 8;
+    checksum |= ReadAlignedByte(&state);
     if (state.truncated) return IMAGE_TRUNCATED;
     if (checksum != Adler32(state.output, state.written)) return IMAGE_CORRUPT;
 
