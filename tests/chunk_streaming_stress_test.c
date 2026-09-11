@@ -823,6 +823,37 @@ static void RunOriginChangeScenario(int32_t radius, uint32_t iterations)
     WorldDestroy(world);
 }
 
+// Пауза сразу после возобновления при пустой очереди. Раньше рабочий поток
+// отчитывался о паузе флагом, который сбрасывался только после выхода из
+// ожидания; при пустой очереди он из ожидания не выходил, второй Pause
+// его не досчитывался и ждал вечно. Зависание здесь ловится таймаутом
+// CTest, поэтому сценарий короткий и повторяется несколько раз подряд.
+static void RunPauseAfterResumeScenario(int32_t radius, uint32_t repeats)
+{
+    World* world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming* handle = ChunkStreamingCreate(
+        world, (Renderer*)&stressRendererPlaceholder, radius);
+    EXPECT(handle != NULL, "streaming was not created");
+
+    EXPECT(ChunkStreamingPause(handle), "first pause did not complete");
+    ChunkStreamingSetCenter(handle, 0, 0, 0);
+    EXPECT(ChunkStreamingPause(handle), "pause with a queued cube did not complete");
+
+    for (uint32_t repeat = 0u; repeat < repeats; ++repeat)
+    {
+        // Смена origin возобновляет рабочих; заказов при том же центре
+        // нет, поэтому очередь остаётся пустой и потоки не выходят из
+        // ожидания. Следующий Pause обязан завершиться.
+        (void)ChunkStreamingResumeAfterOriginChange(handle, true, 0, 0, 0, 0, 0, 0);
+        EXPECT(ChunkStreamingPause(handle), "pause right after resume did not complete");
+    }
+
+    StressClearInjectedMeshes(handle);
+    ChunkStreamingDestroy(handle);
+    WorldDestroy(world);
+}
+
 LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
 {
     RunRandomScenario(2, 0x1111111122222222ULL, 2000u);
@@ -831,6 +862,7 @@ LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
     RunCircleWalkScenario(2, 20000u);
     RunDrawListShiftScenario(3, 256u);
     RunOriginChangeScenario(2, 16u);
+    RunPauseAfterResumeScenario(2, 8u);
 
     LaiueTestRuntimeWrite("Chunk streaming stress tests passed.\r\n");
     LAIUE_TEST_SUCCESS();

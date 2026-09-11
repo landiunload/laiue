@@ -129,6 +129,10 @@ struct ChunkStreaming
     uint32_t workerThreadCount;
     uint32_t desiredWorkerThreadCount;
     uint32_t pausedWorkerCount;
+    // Номер текущей паузы. Рабочий поток отчитывается о паузе один раз на
+    // номер, а не один раз на «пока не вышел из ожидания»: иначе Pause сразу
+    // после Resume при пустой очереди ждал бы отчёта вечно.
+    uint32_t pauseGeneration;
     bool pauseRequested;
     bool shutdownRequested;
 
@@ -503,7 +507,9 @@ static uint32_t WorkerThreadProcedure(void* parameter)
         return 1;
     }
 
-    bool reportedPaused = false;
+    // Номер паузы, о которой этот поток уже отчитался. Ноль — ни о какой:
+    // счёт пауз начинается с единицы.
+    uint32_t reportedPauseGeneration = 0;
 
     for (;;)
     {
@@ -511,9 +517,10 @@ static uint32_t WorkerThreadProcedure(void* parameter)
         while (!streaming->shutdownRequested
             && (streaming->pauseRequested || streaming->requestCount == 0))
         {
-            if (streaming->pauseRequested && !reportedPaused)
+            if (streaming->pauseRequested
+                && reportedPauseGeneration != streaming->pauseGeneration)
             {
-                reportedPaused = true;
+                reportedPauseGeneration = streaming->pauseGeneration;
                 streaming->pausedWorkerCount++;
                 PlatformConditionVariableWakeAll(&streaming->workAvailable);
             }
@@ -525,8 +532,6 @@ static uint32_t WorkerThreadProcedure(void* parameter)
             ChunkMesherScratchDestroy(scratch);
             return 0;
         }
-
-        reportedPaused = false;
 
         uint32_t queueMask = streaming->queueCapacity - 1;
         ChunkRequest request = streaming->requests[streaming->requestHead & queueMask];
@@ -611,6 +616,11 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
     if (streaming->workerThreadCount == 0) return false;
 
     PlatformMutexLock(&streaming->queueLock);
+    // Каждая пауза — новый номер и новый счёт: рабочие, отчитавшиеся о
+    // прошлой паузе и так и не вышедшие из ожидания, обязаны отчитаться
+    // снова.
+    streaming->pauseGeneration++;
+    streaming->pausedWorkerCount = 0;
     streaming->pauseRequested = true;
     PlatformConditionVariableWakeAll(&streaming->workAvailable);
     while (streaming->pausedWorkerCount < streaming->workerThreadCount)
