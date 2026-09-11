@@ -339,6 +339,48 @@ static Chunk* WorldGetOrCreateChunk(
     return chunk;
 }
 
+/* Убирает запись таблицы целиком, когда у чанка не осталось ни одной правки.
+ * Без этого откат блока до базового значения оставлял бы в таблице пустой
+ * чанк с буфером дельт на всю прежнюю пиковую ёмкость — навсегда, хотя
+ * помнить там уже нечего. Удаление идёт сдвигом кластера (как EraseEntry в
+ * стриминге), чтобы не заводить надгробий и не ломать чужие цепочки
+ * пробирования. Вызывается под исключительным захватом. */
+static void WorldEraseChunkAt(World* world, uint32_t index)
+{
+    ChunkDestroy(world->chunks[index]);
+    GlobalChunkCoordinateDestroy(&world->keys[index]);
+
+    const uint32_t mask = world->capacity - 1U;
+    uint32_t hole = index;
+    for (uint32_t scan = hole;;)
+    {
+        scan = (scan + 1U) & mask;
+        if (!world->occupied[scan])
+        {
+            break;
+        }
+
+        const uint32_t home = (uint32_t)(world->keys[scan].hash
+            ^ (world->keys[scan].hash >> 32U)) & mask;
+        const uint32_t homeToHole = (hole - home) & mask;
+        const uint32_t homeToScan = (scan - home) & mask;
+        if (homeToHole <= homeToScan)
+        {
+            world->keys[hole] = world->keys[scan];
+            world->chunks[hole] = world->chunks[scan];
+            world->occupied[hole] = true;
+            hole = scan;
+        }
+    }
+
+    world->occupied[hole] = false;
+
+    /* Копии ключей в освобождённых слотах — не отдельные ссылки на frame
+     * (referenceCount не увеличивался при сдвиге), поэтому их не трогаем. */
+    --world->count;
+    WorldPublishEditedChunkCount(world);
+}
+
 static uint32_t ChunkDeltaLowerBound(
     const Chunk* chunk, uint32_t localIndex)
 {
@@ -665,6 +707,10 @@ bool WorldTrySetBlock(World* world,
     if (block == base)
     {
         succeeded = entry != NULL && ChunkRemoveDelta(*entry, localIndex);
+        if (succeeded && (*entry)->deltaCount == 0U)
+        {
+            WorldEraseChunkAt(world, (uint32_t)(entry - world->chunks));
+        }
     }
     else
     {
@@ -899,6 +945,18 @@ bool WorldApplyBlockBatch(World* world,
             }
             if (batch->existing != NULL)
             {
+                if (batch->stagedCount == 0U)
+                {
+                    // Все правки чанка откачены: пустую запись убираем
+                    // целиком, чтобы не держать ни буфер дельт, ни слот.
+                    Chunk** slot = WorldFindEntry(world, batch->coordinate);
+                    if (slot != NULL)
+                    {
+                        WorldEraseChunkAt(world,
+                            (uint32_t)(slot - world->chunks));
+                    }
+                    continue;
+                }
                 PlatformFree(batch->existing->deltas);
                 batch->existing->deltas = batch->stagedDeltas;
                 batch->existing->deltaCount = batch->stagedCount;
