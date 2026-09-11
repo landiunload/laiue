@@ -476,6 +476,32 @@ static void TestChunkEdgesAndContactStability(void)
     }
 }
 
+static void TestMultiPlaneSweepExactness(void)
+{
+    VoxelBodyShape shape = DeterminismShape();
+    // Стена далеко за границей чанка: проход идёт через много плоскостей.
+    BoundaryWorld boundary = {.wallX = CHUNK_SIZE * 3 + 5};
+    VoxelCollisionSource source = {
+        .context = &boundary,
+        .queryBlockPhysics = QueryBoundaryWorld,
+    };
+
+    double freeSweep[3] = {0.5, 0.5, 2.751};
+    DeterminismExpect(!VoxelBodyMoveAxis(&source, freeSweep, &shape, 0, 40.0) &&
+                          DoubleBits(freeSweep[0]) == DoubleBits(40.5),
+                      "free multi-plane sweep drifted");
+
+    DeterminismExpect(VoxelBodyMoveAxis(&source, freeSweep, &shape, 0, 200.0) &&
+                          AbsoluteDouble(freeSweep[0] - (double)(CHUNK_SIZE * 3 + 5) + 0.301) <=
+                              1.0e-12,
+                      "far multi-plane wall clip is inaccurate");
+
+    double downSweep[3] = {0.5, 0.5, 7.751};
+    DeterminismExpect(VoxelBodyMoveAxis(&source, downSweep, &shape, 2, -6.0) &&
+                          DoubleBits(downSweep[2]) == DoubleBits(2.751),
+                      "long downward multi-plane clip drifted");
+}
+
 static void TestInsufficientLocalResolutionFailsClosed(void)
 {
     BoundaryWorld boundary = {.wallX = 0};
@@ -548,6 +574,7 @@ LAIUE_TEST_ENTRY(PhysicsDeterminismTestEntryPoint)
 
     TestDynamicColliderOrderIndependence();
     TestChunkEdgesAndContactStability();
+    TestMultiPlaneSweepExactness();
     TestInsufficientLocalResolutionFailsClosed();
     TestPhysicsAtAbsoluteOriginBeyondInt64();
 

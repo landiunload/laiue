@@ -107,13 +107,11 @@ static void CalculateBodyBounds(const double position[3], const VoxelBodyShape *
     outBounds->maximum[2] = feet + shape->height;
 }
 
-static bool CalculateValidBodyBounds(const double position[3], const VoxelBodyShape *shape,
-                                     VoxelBodyBounds *outBounds)
+// Общая часть для позиций при уже проверенной форме: форма — инвариант
+// вызова, и повторная её валидация на второй позиции ничего не меняет.
+static bool CalculateValidBodyBoundsForShape(const double position[3], const VoxelBodyShape *shape,
+                                             VoxelBodyBounds *outBounds)
 {
-    if (!BodyShapeIsValid(shape))
-    {
-        return false;
-    }
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
         if (!IsFiniteBoundedDouble(position[axis], VOXEL_DYNAMIC_COORDINATE_LIMIT))
@@ -124,6 +122,16 @@ static bool CalculateValidBodyBounds(const double position[3], const VoxelBodySh
     CalculateBodyBounds(position, shape, outBounds);
     return BoundsAreValid(outBounds) &&
            CollisionMarginIsResolved(outBounds, shape->collisionEpsilon);
+}
+
+static bool CalculateValidBodyBounds(const double position[3], const VoxelBodyShape *shape,
+                                     VoxelBodyBounds *outBounds)
+{
+    if (!BodyShapeIsValid(shape))
+    {
+        return false;
+    }
+    return CalculateValidBodyBoundsForShape(position, shape, outBounds);
 }
 
 bool VoxelBodyLocalRangeIsResolved(const double position[3], const VoxelBodyShape *shape)
@@ -296,22 +304,26 @@ void VoxelBodyCalculateBounds(const double position[3], const VoxelBodyShape *sh
     CalculateBodyBounds(position, shape, outBounds);
 }
 
-static bool BoundsContainSolidBlock(const VoxelCollisionSource *collision,
-                                    const VoxelBodyShape *shape, const VoxelBodyBounds *bounds)
+// Целочисленный диапазон блоков, который пересекает AABB с учётом
+// collision-эпсилона. false — координата не переводится в int64 (fail-closed).
+static bool ComputeBlockRange(const VoxelBodyBounds *bounds, const VoxelBodyShape *shape,
+                              int64_t minimumBlock[3], int64_t maximumBlock[3])
 {
-    int64_t minimumBlock[3];
-    int64_t maximumBlock[3];
-
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         if (!TryFloorToInt64(bounds->minimum[axis] + shape->collisionEpsilon,
                              &minimumBlock[axis]) ||
             !TryFloorToInt64(bounds->maximum[axis] - shape->collisionEpsilon, &maximumBlock[axis]))
         {
-            return true;
+            return false;
         }
     }
+    return true;
+}
 
+static bool ScanSolidBlocks(const VoxelCollisionSource *collision, const int64_t minimumBlock[3],
+                            const int64_t maximumBlock[3])
+{
     for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
     {
         for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
@@ -326,6 +338,18 @@ static bool BoundsContainSolidBlock(const VoxelCollisionSource *collision,
         }
     }
     return false;
+}
+
+static bool BoundsContainSolidBlock(const VoxelCollisionSource *collision,
+                                    const VoxelBodyShape *shape, const VoxelBodyBounds *bounds)
+{
+    int64_t minimumBlock[3];
+    int64_t maximumBlock[3];
+    if (!ComputeBlockRange(bounds, shape, minimumBlock, maximumBlock))
+    {
+        return true;
+    }
+    return ScanSolidBlocks(collision, minimumBlock, maximumBlock);
 }
 
 bool VoxelBodyCollides(const VoxelCollisionSource *collision, const double position[3],
@@ -367,38 +391,86 @@ bool VoxelBodyCollides(const VoxelCollisionSource *collision, const double posit
     return false;
 }
 
-static bool BlockPlaneCollides(const VoxelCollisionSource *collision, const VoxelBodyShape *shape,
-                               int32_t axis, int64_t plane, const VoxelBodyBounds *bounds)
+// Ядро свипа, когда границы старой и новой позиции уже вычислены и валидны.
+// Динамический путь VoxelBodyMoveAxis переиспользует здесь свои oldBounds и
+// requestedBounds вместо повторного CalculateValidBodyBounds.
+static bool MoveAxisAgainstBlocksBounded(const VoxelCollisionSource *collision, double position[3],
+                                         const VoxelBodyShape *shape, int32_t axis, double distance,
+                                         const VoxelBodyBounds *oldBounds,
+                                         const VoxelBodyBounds *newBounds)
 {
-    int64_t minimumBlock[3];
-    int64_t maximumBlock[3];
+    double negativeExtent = axis == 2 ? shape->eyeHeight : shape->radius;
+    double positiveExtent = axis == 2 ? shape->height - shape->eyeHeight : shape->radius;
+    double epsilon = shape->collisionEpsilon;
 
-    for (int32_t currentAxis = 0; currentAxis < 3; ++currentAxis)
+    if (distance > 0.0)
     {
-        if (!TryFloorToInt64(bounds->minimum[currentAxis] + shape->collisionEpsilon,
-                             &minimumBlock[currentAxis]) ||
-            !TryFloorToInt64(bounds->maximum[currentAxis] - shape->collisionEpsilon,
-                             &maximumBlock[currentAxis]))
+        int64_t firstPlane;
+        int64_t lastPlane;
+        if (!TryFloorToInt64(oldBounds->maximum[axis] - epsilon, &firstPlane) ||
+            !TryFloorToInt64(newBounds->maximum[axis] - epsilon, &lastPlane))
         {
             return true;
         }
-    }
-    minimumBlock[axis] = plane;
-    maximumBlock[axis] = plane;
+        ++firstPlane;
 
-    for (int64_t z = minimumBlock[2]; z <= maximumBlock[2]; ++z)
-    {
-        for (int64_t y = minimumBlock[1]; y <= maximumBlock[1]; ++y)
+        // Диапазон блоков по двум неподвижным осям не зависит от плоскости
+        // среза, поэтому считается один раз, а не в каждой BlockPlaneCollides.
+        if (firstPlane <= lastPlane)
         {
-            for (int64_t x = minimumBlock[0]; x <= maximumBlock[0]; ++x)
+            int64_t minimumBlock[3];
+            int64_t maximumBlock[3];
+            if (!ComputeBlockRange(newBounds, shape, minimumBlock, maximumBlock))
             {
-                if (IsSolidBlock(collision, x, y, z))
+                position[axis] = (double)firstPlane - positiveExtent - epsilon;
+                return true;
+            }
+            for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
+            {
+                minimumBlock[axis] = plane;
+                maximumBlock[axis] = plane;
+                if (ScanSolidBlocks(collision, minimumBlock, maximumBlock))
                 {
+                    position[axis] = (double)plane - positiveExtent - epsilon;
                     return true;
                 }
             }
         }
     }
+    else
+    {
+        int64_t firstPlane;
+        int64_t lastPlane;
+        if (!TryFloorToInt64(oldBounds->minimum[axis] + epsilon, &firstPlane) ||
+            !TryFloorToInt64(newBounds->minimum[axis] + epsilon, &lastPlane))
+        {
+            return true;
+        }
+        --firstPlane;
+
+        if (firstPlane >= lastPlane)
+        {
+            int64_t minimumBlock[3];
+            int64_t maximumBlock[3];
+            if (!ComputeBlockRange(newBounds, shape, minimumBlock, maximumBlock))
+            {
+                position[axis] = (double)firstPlane + 1.0 + negativeExtent + epsilon;
+                return true;
+            }
+            for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
+            {
+                minimumBlock[axis] = plane;
+                maximumBlock[axis] = plane;
+                if (ScanSolidBlocks(collision, minimumBlock, maximumBlock))
+                {
+                    position[axis] = (double)plane + 1.0 + negativeExtent + epsilon;
+                    return true;
+                }
+            }
+        }
+    }
+
+    position[axis] += distance;
     return false;
 }
 
@@ -413,9 +485,13 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource *collision, double 
     {
         return false;
     }
+    if (!BodyShapeIsValid(shape))
+    {
+        return true;
+    }
 
     VoxelBodyBounds oldBounds;
-    if (!CalculateValidBodyBounds(position, shape, &oldBounds))
+    if (!CalculateValidBodyBoundsForShape(position, shape, &oldBounds))
     {
         return true;
     }
@@ -424,58 +500,13 @@ static bool MoveAxisAgainstBlocks(const VoxelCollisionSource *collision, double 
     targetPosition[axis] += distance;
 
     VoxelBodyBounds newBounds;
-    if (!CalculateValidBodyBounds(targetPosition, shape, &newBounds))
+    if (!CalculateValidBodyBoundsForShape(targetPosition, shape, &newBounds))
     {
         return true;
     }
 
-    double negativeExtent = axis == 2 ? shape->eyeHeight : shape->radius;
-    double positiveExtent = axis == 2 ? shape->height - shape->eyeHeight : shape->radius;
-    double epsilon = shape->collisionEpsilon;
-
-    if (distance > 0.0)
-    {
-        int64_t firstPlane;
-        int64_t lastPlane;
-        if (!TryFloorToInt64(oldBounds.maximum[axis] - epsilon, &firstPlane) ||
-            !TryFloorToInt64(newBounds.maximum[axis] - epsilon, &lastPlane))
-        {
-            return true;
-        }
-        ++firstPlane;
-
-        for (int64_t plane = firstPlane; plane <= lastPlane; ++plane)
-        {
-            if (BlockPlaneCollides(collision, shape, axis, plane, &newBounds))
-            {
-                position[axis] = (double)plane - positiveExtent - epsilon;
-                return true;
-            }
-        }
-    }
-    else
-    {
-        int64_t firstPlane;
-        int64_t lastPlane;
-        if (!TryFloorToInt64(oldBounds.minimum[axis] + epsilon, &firstPlane) ||
-            !TryFloorToInt64(newBounds.minimum[axis] + epsilon, &lastPlane))
-        {
-            return true;
-        }
-        --firstPlane;
-
-        for (int64_t plane = firstPlane; plane >= lastPlane; --plane)
-        {
-            if (BlockPlaneCollides(collision, shape, axis, plane, &newBounds))
-            {
-                position[axis] = (double)plane + 1.0 + negativeExtent + epsilon;
-                return true;
-            }
-        }
-    }
-
-    position[axis] = targetPosition[axis];
-    return false;
+    return MoveAxisAgainstBlocksBounded(collision, position, shape, axis, distance, &oldBounds,
+                                        &newBounds);
 }
 
 bool VoxelBodyMoveAxis(const VoxelCollisionSource *collision, double position[3],
@@ -538,7 +569,8 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource *collision, double position[3]
     }
 
     double clippedPosition[3] = {position[0], position[1], position[2]};
-    bool collided = MoveAxisAgainstBlocks(collision, clippedPosition, shape, axis, distance);
+    bool collided = MoveAxisAgainstBlocksBounded(collision, clippedPosition, shape, axis, distance,
+                                                 &oldBounds, &requestedBounds);
     VoxelBodyBounds clippedBounds;
     CalculateBodyBounds(clippedPosition, shape, &clippedBounds);
 
