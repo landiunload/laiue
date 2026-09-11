@@ -10,9 +10,17 @@
 
 #define MAX_WORKER_THREADS 4
 
-// Бюджет загрузок на GPU за один кадр: сглаживает волну готовых мешей
-// при пересечении границы чанка (иначе — разовый фриз кадра).
-#define MESH_UPLOADS_PER_FRAME 4
+// Бюджет загрузок на GPU за один кадр. Ограничивается не число мешей, а то,
+// что реально стоит: байты, записанные в кольцо загрузки рендера (4 МиБ на
+// кадр), и время процессора на разбор очереди. Число мешей выводится из
+// этого само: меш чанка — порядка 100 КБ, то есть байтовый предел держит
+// кадр в районе нескольких десятков загрузок, а не четырёх.
+//
+// Прежний предел MESH_UPLOADS_PER_FRAME = 4 появился, когда загрузка меша
+// была дорогой. После кольца загрузки и крупной арены рендера она стала
+// дешёвой, и счётчик мешей остался единственным ограничителем: при радиусе
+// 12 полный куб — 625 непустых мешей, то есть 157 кадров пустоты.
+#define CHUNK_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 #define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
@@ -107,6 +115,13 @@ struct ChunkStreaming
     uint32_t resultCount;
     uint32_t queueCapacity;
     uint32_t unfinishedWork;
+
+    // Готовый результат, который рендер не принял в прошлом кадре (занята
+    // его очередь загрузок): хранится до следующего кадра, чтобы не строить
+    // чанк заново. Одновременно придерживается не более одного — разбор
+    // очереди на нём останавливается.
+    ChunkMeshResult heldResult;
+    bool hasHeldResult;
 
     PlatformMutex queueLock;
     PlatformConditionVariable workAvailable;
@@ -607,6 +622,16 @@ bool ChunkStreamingPause(ChunkStreaming* streaming)
         }
     }
 
+    if (streaming->hasHeldResult)
+    {
+        if (streaming->heldResult.quads != NULL)
+        {
+            PlatformFree(streaming->heldResult.quads);
+        }
+        streaming->heldResult.quads = NULL;
+        streaming->hasHeldResult = false;
+    }
+
     streaming->requestHead = 0;
     streaming->requestCount = 0;
     streaming->resultHead = 0;
@@ -934,6 +959,13 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         }
     }
 
+    if (streaming->hasHeldResult && streaming->heldResult.quads != NULL)
+    {
+        PlatformFree(streaming->heldResult.quads);
+        streaming->heldResult.quads = NULL;
+        streaming->hasHeldResult = false;
+    }
+
     if (streaming->entries != NULL)
     {
         for (uint32_t i = 0; i < streaming->capacity; ++i)
@@ -1111,16 +1143,76 @@ void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, in
     }
 }
 
+// Пытается загрузить придержанный с прошлого кадра готовый меш.
+// false — рендер снова не принял (оставляем до следующего кадра).
+// Байты успешной загрузки прибавляются к бюджету текущего кадра: кольцо
+// рендера у придержанного и у новых мешей одно и то же.
+static bool TryUploadHeldResult(ChunkStreaming* streaming,
+    uint64_t* uploadBytes, bool* uploadedAny)
+{
+    ChunkMeshResult* held = &streaming->heldResult;
+    ChunkEntry* entry = FindEntry(streaming, held->x, held->y, held->z);
+    if (entry == NULL || entry->state != CHUNK_ENTRY_PENDING
+        || entry->revision != held->revision)
+    {
+        // Запись ушла, была перестроена или сменила ревизию — держать
+        // нечего.
+        if (held->quads != NULL) PlatformFree(held->quads);
+        held->quads = NULL;
+        streaming->hasHeldResult = false;
+        return true;
+    }
+
+    RendererMesh* mesh = RendererCreateMesh(streaming->renderer,
+        held->quads, held->quadCount);
+    if (mesh == NULL)
+    {
+        return false;
+    }
+
+    bool hadMesh = entry->mesh != NULL;
+    if (hadMesh)
+    {
+        RendererDestroyMesh(streaming->renderer, entry->mesh);
+    }
+    entry->mesh = mesh;
+    if (!hadMesh)
+    {
+        AddMeshToDrawList(streaming, entry);
+    }
+    entry->state = CHUNK_ENTRY_READY;
+    entry->requestQueued = false;
+    PlatformAtomicIncrementI64(&streaming->uploadedMeshes);
+    *uploadBytes +=
+        ((uint64_t)held->quadCount * sizeof(ChunkQuad) + 15u) & ~(uint64_t)15u;
+    *uploadedAny = true;
+
+    if (held->quads != NULL) PlatformFree(held->quads);
+    held->quads = NULL;
+    streaming->hasHeldResult = false;
+    return true;
+}
+
 void ChunkStreamingPump(ChunkStreaming* streaming)
 {
     uint32_t queueMask = streaming->queueCapacity - 1;
-    uint32_t uploadBudget = MESH_UPLOADS_PER_FRAME;
+    uint64_t uploadBytes = 0;
+    bool uploadedAny = false;
+    bool holdResult = false;
     double pumpStart = PlatformMonotonicSeconds();
+
+    // Придержанный результат пробуем первым: рендер принимает не больше
+    // своей очереди загрузок на кадр, поэтому переполнение случается.
+    if (streaming->hasHeldResult
+        && !TryUploadHeldResult(streaming, &uploadBytes, &uploadedAny))
+    {
+        return;
+    }
 
     for (;;)
     {
         // Заглянуть в очередь: результат с геометрией берём только
-        // при оставшемся бюджете загрузок, остальные — бесплатны.
+        // при оставшемся байтовом и временном бюджете, пустые — бесплатны.
         PlatformMutexLock(&streaming->queueLock);
         if (streaming->resultCount == 0)
         {
@@ -1129,12 +1221,32 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         }
 
         ChunkMeshResult result = streaming->results[streaming->resultHead & queueMask];
-        if (result.quadCount != CHUNK_MESH_BUILD_FAILED
-            && result.quadCount > 0 && uploadBudget == 0)
+        bool hasGeometry = result.quadCount != CHUNK_MESH_BUILD_FAILED
+            && result.quadCount > 0;
+        uint64_t resultBytes = 0;
+        if (hasGeometry)
         {
-            PlatformMutexUnlock(&streaming->queueLock);
-            break;
+            // Считаем ровно байты кольца рендера: размер с выравниванием.
+            resultBytes =
+                ((uint64_t)result.quadCount * sizeof(ChunkQuad) + 15u) & ~(uint64_t)15u;
+            if (uploadedAny)
+            {
+                if (uploadBytes >= (uint64_t)CHUNK_UPLOAD_BYTES_PER_FRAME
+                    || resultBytes
+                        > (uint64_t)CHUNK_UPLOAD_BYTES_PER_FRAME - uploadBytes)
+                {
+                    PlatformMutexUnlock(&streaming->queueLock);
+                    break;
+                }
+                if ((PlatformMonotonicSeconds() - pumpStart) * 1000.0
+                    >= MESH_UPLOAD_BUDGET_MILLISECONDS)
+                {
+                    PlatformMutexUnlock(&streaming->queueLock);
+                    break;
+                }
+            }
         }
+
         streaming->resultHead++;
         streaming->resultCount--;
         streaming->unfinishedWork--;
@@ -1144,7 +1256,7 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
         if (entry != NULL && entry->state == CHUNK_ENTRY_PENDING && entry->revision == result.revision)
         {
             // Заявка этой ревизии завершена; повторное выставление ниже нужно
-            // только если построение или GPU-загрузка не удались.
+            // только если построение не удалось.
             entry->requestQueued = false;
             if (result.quadCount == CHUNK_MESH_BUILD_FAILED)
             {
@@ -1170,12 +1282,20 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                         AddMeshToDrawList(streaming, entry);
                     }
                     entry->state = CHUNK_ENTRY_READY;
-                    uploadBudget--;
+                    uploadBytes += resultBytes;
+                    uploadedAny = true;
                     PlatformAtomicIncrementI64(&streaming->uploadedMeshes);
                 }
                 else
                 {
-                    streaming->hasUnqueuedPending = true;
+                    // Рендер не принял меш (занята его очередь загрузок).
+                    // Придерживаем готовый результат до следующего кадра:
+                    // перестраивать чанк с нуля незачем. requestQueued
+                    // удерживает условное сканирование от повторной заявки.
+                    entry->requestQueued = true;
+                    streaming->heldResult = result;
+                    streaming->hasHeldResult = true;
+                    holdResult = true;
                 }
             }
             else
@@ -1195,16 +1315,14 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
             PlatformAtomicIncrementI64(&streaming->discardedBuilds);
         }
 
-        if (result.quads != NULL)
+        if (result.quads != NULL && !holdResult)
         {
             PlatformFree(result.quads);
         }
 
-        if (uploadBudget < MESH_UPLOADS_PER_FRAME)
+        if (holdResult)
         {
-            double elapsedMilliseconds =
-                (PlatformMonotonicSeconds() - pumpStart) * 1000.0;
-            if (elapsedMilliseconds >= MESH_UPLOAD_BUDGET_MILLISECONDS) break;
+            break;
         }
     }
 

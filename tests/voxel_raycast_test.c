@@ -16,6 +16,20 @@ static uint8_t StreamingSolid(void *context, int64_t x, int64_t y, int64_t z)
     return 1u;
 }
 
+#if defined(_WIN32)
+// Разреженный мир: ровно один блок в локальном нуле каждого чанка. Так
+// каждая ячейка куба даёт крошечный непустой меш, и проверка бюджета
+// загрузок упирается в предел очереди рендера, а не в число заявок.
+static uint8_t StreamingSparse(void *context, int64_t x, int64_t y, int64_t z)
+{
+    (void)context;
+    const int64_t localX = ((x % 64) + 64) % 64;
+    const int64_t localY = ((y % 64) + 64) % 64;
+    const int64_t localZ = ((z % 64) + 64) % 64;
+    return (localX == 0 && localY == 0 && localZ == 0) ? 1u : 0u;
+}
+#endif
+
 static void RaycastExpect(bool condition, const char *name)
 {
     ++raycastChecks;
@@ -115,6 +129,63 @@ LAIUE_TEST_ENTRY(VoxelRaycastTestEntryPoint)
         WorldDestroy(streamWorld);
         LaiueTestRuntimeWrite("Chunk streaming leading-face checks passed.\r\n");
     }
+
+    // Отказ рендера не должен перезаказывать сборку. Фиктивный рендерер —
+    // обнулённый буфер: worldReady = false, поэтому RendererCreateMesh
+    // всегда возвращает NULL. Раньше это выставляло hasUnqueuedPending и
+    // заказывало чанк заново (двойная сборка); теперь готовый результат
+    // придерживается до следующего кадра. Проверка говорит о конкретном
+    // контракте D3D12-рендера, поэтому только Windows.
+#if defined(_WIN32)
+    {
+        const int32_t holdRadius = 3;
+        const uint64_t holdFirst = 7u * 7u * 7u;
+
+        static unsigned char fakeRenderer[65536];
+        WorldBaseProvider holdProvider;
+        holdProvider.context = NULL;
+        holdProvider.getBlock = StreamingSparse;
+        holdProvider.fillRegion = NULL;
+        holdProvider.rebase = NULL;
+        World *holdWorld = WorldCreate(&holdProvider);
+        RaycastExpect(holdWorld != NULL, "hold world was not created");
+
+        ChunkStreaming *hold = ChunkStreamingCreate(
+            holdWorld, (Renderer *)fakeRenderer, holdRadius);
+        RaycastExpect(hold != NULL, "hold streaming was not created");
+
+        ChunkStreamingSetCenter(hold, 0, 0, 0);
+
+        ChunkStreamingStats holdStats;
+        for (int32_t spin = 0; spin < 4000; ++spin)
+        {
+            ChunkStreamingGetStats(hold, &holdStats);
+            if (holdStats.pendingRequests == 0u
+                && holdStats.queuedRequests == holdStats.completedBuilds)
+            {
+                break;
+            }
+            Sleep(1);
+        }
+        RaycastExpect(holdStats.queuedRequests == holdFirst,
+            "the hold cube must request every chunk exactly once");
+
+        // Рендер отказывает всем мешам: разбор очереди останавливается на
+        // придержанном результате и повторных заявок не появляется.
+        for (int32_t pump = 0; pump < 64; ++pump)
+        {
+            ChunkStreamingPump(hold);
+        }
+        ChunkStreamingGetStats(hold, &holdStats);
+        RaycastExpect(holdStats.uploadedMeshes == 0,
+            "a renderer that refuses meshes must upload nothing");
+        RaycastExpect(holdStats.queuedRequests == holdFirst,
+            "a refused mesh must not be requested for a second build");
+
+        ChunkStreamingDestroy(hold);
+        WorldDestroy(holdWorld);
+    }
+#endif
 
     LaiueTestRuntimeWrite("Voxel raycast tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
