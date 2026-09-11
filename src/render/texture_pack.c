@@ -216,12 +216,18 @@ void TexturePackFillSliceTable(const TexturePackAnimationSet *set, double animat
     uint32_t materialCount = set->materialCount;
     if (materialCount > TEXTURE_PACK_MAX_LAYERS) materialCount = TEXTURE_PACK_MAX_LAYERS;
 
+    // Слоты сверх materialCount повторяют последний материал. Его кадр
+    // решается один раз, а дальше берётся готовое значение: раньше он
+    // решался заново на каждом таком слоте при том же результате.
+    uint32_t slice = 0u;
     for (uint32_t material = 0; material < TEXTURE_PACK_MAX_LAYERS; ++material)
     {
-        uint32_t source = material < materialCount ? material : materialCount - 1u;
-        uint32_t slice = TexturePackResolveSlice(set, source, animationSeconds);
-        if (slice > 255u) slice = 255u;
-        outSlices[material >> 2] |= slice << ((material & 3u) * 8u);
+        if (material < materialCount)
+        {
+            slice = TexturePackResolveSlice(set, material, animationSeconds);
+        }
+        uint32_t packed = slice > 255u ? 255u : slice;
+        outSlices[material >> 2] |= packed << ((material & 3u) * 8u);
     }
 }
 
