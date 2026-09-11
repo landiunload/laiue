@@ -427,6 +427,15 @@ static void VerifyStreamingIntegrity(ChunkStreaming* streaming)
         VerifyFail("chunk streaming integrity: request/result ring is inconsistent");
     }
 }
+
+// Единственная тестовая точка входа: VerifyStreamingIntegrity статична,
+// а стресс-тесту в tests/ нужна работающая проверка в отладочной сборке.
+// Публичный заголовок ради неё не заводится, и в Release символа нет.
+LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
+    ChunkStreaming* streaming)
+{
+    VerifyStreamingIntegrity(streaming);
+}
 #endif
 
 // Ставит заявку текущей ревизии записи; false — очередь занята,
