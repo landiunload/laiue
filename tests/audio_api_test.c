@@ -227,6 +227,138 @@ static void CheckExactMixes(void)
     PlatformFree(frames);
 }
 
+// Общая ветвь на отрезках: зацикленный клип пересекает границу несколько
+// раз, незацикленный обрывается посреди буфера. Шаги 0,5 и 2,5 дают дробь
+// ровно 0 или 0,5, разность соседних кадров кратна 2^-15, и её половина
+// точна, поэтому эталон считается здесь же и совпадает на любом
+// компиляторе. Если бы отрезок перешагнул границу клипа, зацикленный голос
+// выдал бы ноль вместо повтора, а незацикленный — звук после конца.
+#define GENERAL_FRAMES 300u
+#define GENERAL_BUFFER 512u
+#define GENERAL_BUFFERS 4u
+
+static float GeneralReference(const int16_t *samples, uint32_t channels, uint32_t frameCount,
+                              uint32_t index, uint32_t channel, double step, bool looping)
+{
+    double position = (double)index * step;
+    if (looping)
+    {
+        double length = (double)frameCount;
+        position -= length * (double)(uint64_t)(position / length);
+    }
+    else if (position >= (double)frameCount)
+    {
+        return 0.0f;
+    }
+    uint32_t frame = (uint32_t)position;
+    uint32_t nextFrame = frame + 1u < frameCount ? frame + 1u : frame;
+    float fraction = (float)(position - (double)frame);
+    uint32_t offset = channels == 2u ? channel : 0u;
+    float first = SampleToFloat(samples[frame * channels + offset]);
+    float second = SampleToFloat(samples[nextFrame * channels + offset]);
+    return first + (second - first) * fraction;
+}
+
+static void CheckGeneralRuns(void)
+{
+    static int16_t monoSamples[GENERAL_FRAMES];
+    static int16_t stereoSamples[GENERAL_FRAMES * 2u];
+    FillReferenceSamples(monoSamples, GENERAL_FRAMES, 44u);
+    FillReferenceSamples(stereoSamples, GENERAL_FRAMES * 2u, 55u);
+
+    float *frames = PlatformAllocate(GENERAL_BUFFER * 2u * sizeof(float), false);
+    Expect(frames != NULL, "general-run buffer could not be allocated");
+
+    AudioDeviceConfiguration configuration = {
+        .backend = AUDIO_BACKEND_OFFSCREEN,
+        .sampleRate = TEST_SAMPLE_RATE,
+        .frameCountHint = GENERAL_BUFFER,
+        .masterVolume = 1.0f,
+    };
+
+    // Шаг 0,5 в цикле и обрыв на шаге 2,5 — обе границы общей ветви.
+    const double steps[3] = {0.5, 2.5, 2.5};
+    const bool looping[3] = {true, true, false};
+    const uint32_t channels[3] = {1u, 2u, 1u};
+
+    for (uint32_t scenario = 0u; scenario < 3u; ++scenario)
+    {
+        AudioDevice *device = NULL;
+        Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+               "general-run device could not be created");
+        AudioClip *clip = channels[scenario] == 2u
+                              ? MakeExactClip(device, stereoSamples, GENERAL_FRAMES, 2u,
+                                              TEST_SAMPLE_RATE)
+                              : MakeExactClip(device, monoSamples, GENERAL_FRAMES, 1u,
+                                              TEST_SAMPLE_RATE);
+        AudioVoiceParameters parameters = {
+            .volume = 1.0f,
+            .pan = -1.0f,   // только левый канал: усиление 1,0 и 0,0
+            .speed = (float)steps[scenario],
+            .looping = looping[scenario],
+        };
+        Expect(AudioVoicePlay(device, clip, &parameters) != AUDIO_VOICE_NONE,
+               "general-run voice could not be started");
+
+        bool identical = true;
+        for (uint32_t buffer = 0u; buffer < GENERAL_BUFFERS; ++buffer)
+        {
+            Expect(AudioDeviceRenderFrames(device, frames, GENERAL_BUFFER),
+                   "general-run render must succeed");
+            for (uint32_t index = 0u; index < GENERAL_BUFFER; ++index)
+            {
+                uint32_t output = buffer * GENERAL_BUFFER + index;
+                const int16_t *samples =
+                    channels[scenario] == 2u ? stereoSamples : monoSamples;
+                float expectedLeft =
+                    GeneralReference(samples, channels[scenario], GENERAL_FRAMES, output, 0u,
+                                     steps[scenario], looping[scenario]);
+                identical = identical && SameBits(frames[index * 2u], expectedLeft)
+                            && SameBits(frames[index * 2u + 1u], 0.0f);
+            }
+        }
+        Expect(identical, "fractional-step runs must reproduce the interpolated reference");
+
+        AudioClipDestroy(clip);
+        AudioDeviceDestroy(device);
+    }
+
+    // Клип короче шага: одного переноса через границу мало, и каждая
+    // выборка после первой должна молчать, а не читать кадр за концом.
+    {
+        static int16_t tinySamples[2] = {16384, -16384};
+        AudioDevice *device = NULL;
+        Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+               "short-clip device could not be created");
+        AudioClip *clip = MakeExactClip(device, tinySamples, 2u, 1u, TEST_SAMPLE_RATE);
+        AudioVoiceParameters parameters = {
+            .volume = 1.0f, .pan = -1.0f, .speed = 16.0f, .looping = true,
+        };
+        Expect(AudioVoicePlay(device, clip, &parameters) != AUDIO_VOICE_NONE,
+               "short-clip voice could not be started");
+
+        bool identical = true;
+        for (uint32_t buffer = 0u; buffer < 3u; ++buffer)
+        {
+            Expect(AudioDeviceRenderFrames(device, frames, GENERAL_BUFFER),
+                   "short-clip render must succeed");
+            for (uint32_t index = 0u; index < GENERAL_BUFFER; ++index)
+            {
+                uint32_t output = buffer * GENERAL_BUFFER + index;
+                float expectedLeft = output == 0u ? SampleToFloat(tinySamples[0]) : 0.0f;
+                identical = identical && SameBits(frames[index * 2u], expectedLeft)
+                            && SameBits(frames[index * 2u + 1u], 0.0f);
+            }
+        }
+        Expect(identical, "a clip shorter than the step must stay silent after the first frame");
+
+        AudioClipDestroy(clip);
+        AudioDeviceDestroy(device);
+    }
+
+    PlatformFree(frames);
+}
+
 LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
 {
     AudioDevice *device = CreateOffscreenDevice();
@@ -359,6 +491,7 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
 
     // === Побитовая точность микса ===
     CheckExactMixes();
+    CheckGeneralRuns();
 
     PlatformFree(frames);
     AudioClipDestroy(clip);
