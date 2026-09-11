@@ -105,6 +105,18 @@ static void SpreadStereoToDevice(const float *mixFrames, float *deviceFrames,
         memcpy(deviceFrames, mixFrames, (size_t)frameCount * 2u * sizeof(float));
         return;
     }
+    if (deviceChannels == 1u)
+    {
+        // Моно-устройство: каналы складываются с половинным масштабом.
+        // Взять один левый нельзя — всё, запанорамированное вправо,
+        // пропало бы целиком, а сумма без масштаба вышла бы за [-1, 1].
+        for (uint32_t frame = 0; frame < frameCount; ++frame)
+        {
+            deviceFrames[frame] =
+                (mixFrames[frame * 2u] + mixFrames[frame * 2u + 1u]) * 0.5f;
+        }
+        return;
+    }
     memset(deviceFrames, 0, (size_t)frameCount * deviceChannels * sizeof(float));
     uint32_t copied = deviceChannels < 2u ? deviceChannels : 2u;
     for (uint32_t frame = 0; frame < frameCount; ++frame)

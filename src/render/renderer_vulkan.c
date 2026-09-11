@@ -50,6 +50,11 @@
 #define DEFERRED_RELEASE_CAPACITY 256
 #define MAX_PENDING_UPLOADS 64
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Крупные записи (один большой меш или всплеск чанков, который не влезает
+// в основное кольцо) идут в отдельную арену с тем же двойным
+// буферированием. Она создаётся лениво, при первом переполнении, и
+// переиспользуется каждый кадр, поэтому на кадр не создаётся буфер.
+#define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
 #define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
 // Кольцо констант: D3D12 переписывает корневые константы на каждый
 // вызов отрисовки, у Vulkan та же роль у uniform-буфера с динамическим
@@ -242,6 +247,8 @@ struct Renderer
     uint32_t constantOffsets[FRAME_COUNT];
     GpuBuffer meshUploadBuffers[FRAME_COUNT];
     uint32_t meshUploadOffsets[FRAME_COUNT];
+    GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
+    uint32_t largeMeshUploadOffsets[FRAME_COUNT];
     GpuBuffer instanceBuffers[FRAME_COUNT];
     uint32_t instanceOffsets[FRAME_COUNT];
     GpuBuffer uiQuadBuffers[FRAME_COUNT];
@@ -1762,6 +1769,7 @@ void RendererDestroy(Renderer *renderer)
         {
             BufferDestroy(renderer, &renderer->constantBuffers[frame]);
             BufferDestroy(renderer, &renderer->meshUploadBuffers[frame]);
+            BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frame]);
             BufferDestroy(renderer, &renderer->instanceBuffers[frame]);
             BufferDestroy(renderer, &renderer->uiQuadBuffers[frame]);
             if (renderer->frameFences[frame] != VK_NULL_HANDLE)
@@ -1797,6 +1805,20 @@ void RendererDestroy(Renderer *renderer)
 
 // === Меши ===
 
+// Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
+// Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
+// не платит за неё ни байтом.
+static bool EnsureVulkanLargeMeshBuffer(Renderer *renderer, uint32_t frameIndex)
+{
+    if (renderer->largeMeshUploadBuffers[frameIndex].buffer != VK_NULL_HANDLE)
+    {
+        return true;
+    }
+    return BufferCreate(renderer, LARGE_MESH_UPLOAD_BYTES_PER_FRAME,
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                        &renderer->largeMeshUploadBuffers[frameIndex]);
+}
+
 RendererMesh *RendererCreateMesh(Renderer *renderer, const ChunkQuad *quads, uint32_t quadCount)
 {
     if (renderer == NULL || !renderer->worldReady || quads == NULL || quadCount == 0u ||
@@ -1818,9 +1840,11 @@ RendererMesh *RendererCreateMesh(Renderer *renderer, const ChunkQuad *quads, uin
     memset(&ownedStaging, 0, sizeof(ownedStaging));
     VkBuffer staging = VK_NULL_HANDLE;
     uint32_t sourceOffset = AlignUp(renderer->meshUploadOffsets[renderer->frameIndex], 16u);
-    bool ownsStaging = sourceOffset > MESH_UPLOAD_BYTES_PER_FRAME ||
-                       sizeBytes > MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
-    if (!ownsStaging)
+    bool ownsStaging = false;
+    bool usedLargeRing = false;
+    bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME &&
+                         sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
+    if (fitsSmallRing)
     {
         staging = renderer->meshUploadBuffers[renderer->frameIndex].buffer;
         memcpy(renderer->meshUploadBuffers[renderer->frameIndex].mapped + sourceOffset, quads,
@@ -1829,21 +1853,43 @@ RendererMesh *RendererCreateMesh(Renderer *renderer, const ChunkQuad *quads, uin
     }
     else
     {
-        if (!BufferCreate(renderer, sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
-                          &ownedStaging))
+        // Крупная запись: сначала пробуем общую арену того же кадра, и
+        // только если запись не помещается и туда — отдельный буфер.
+        uint32_t largeOffset =
+            AlignUp(renderer->largeMeshUploadOffsets[renderer->frameIndex], 16u);
+        bool fitsLargeRing =
+            largeOffset <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME &&
+            sizeBytes <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME - largeOffset;
+        if (fitsLargeRing && EnsureVulkanLargeMeshBuffer(renderer, renderer->frameIndex))
         {
-            PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
-            return NULL;
+            staging = renderer->largeMeshUploadBuffers[renderer->frameIndex].buffer;
+            sourceOffset = largeOffset;
+            usedLargeRing = true;
+            memcpy(renderer->largeMeshUploadBuffers[renderer->frameIndex].mapped + largeOffset,
+                   quads, sizeBytes);
+            renderer->largeMeshUploadOffsets[renderer->frameIndex] = largeOffset + sizeBytes;
         }
-        memcpy(ownedStaging.mapped, quads, sizeBytes);
-        staging = ownedStaging.buffer;
-        sourceOffset = 0u;
+        else
+        {
+            if (!BufferCreate(renderer, sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                              &ownedStaging))
+            {
+                PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+                return NULL;
+            }
+            memcpy(ownedStaging.mapped, quads, sizeBytes);
+            staging = ownedStaging.buffer;
+            sourceOffset = 0u;
+            ownsStaging = true;
+        }
     }
 
     RendererMesh *mesh = PlatformAllocate(sizeof(*mesh), false);
     if (mesh == NULL)
     {
         if (ownsStaging) BufferDestroy(renderer, &ownedStaging);
+        else if (usedLargeRing)
+            renderer->largeMeshUploadOffsets[renderer->frameIndex] = sourceOffset;
         else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
         PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
         return NULL;
@@ -2030,6 +2076,7 @@ bool RendererBeginFrame(Renderer *renderer, const RendererFrameSetup *frame)
     renderer->uiQuadCount = 0u;
     renderer->constantOffsets[renderer->frameIndex] = 0u;
     renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
+    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
     renderer->instanceOffsets[renderer->frameIndex] = 0u;
     memset(&renderer->currentStats, 0, sizeof(renderer->currentStats));
     renderer->currentStats.scenePasses = frame->passCount;
