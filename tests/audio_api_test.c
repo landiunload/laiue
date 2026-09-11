@@ -60,23 +60,53 @@ static AudioDevice *CreateOffscreenDevice(void)
     return device;
 }
 
-// === Эталонный сценарий ===
-// Фиксированный микс, который задействует оба канала, разные длины,
-// частоты, скорости и повтор. Хеш выхода снят с микшера до оптимизации;
-// любое изменение арифметики микса обязано его сдвинуть.
+// Побитовая проверка микшера без прибитых хешей. Звук собирается с /fp:fast,
+// и биты произвольного сценария зависят от компилятора и конфигурации
+// (сокращение умножения-сложения в FMA, порядок сумм): один и тот же микс
+// даёт три разных хеша на MSVC Release, MSVC Debug и clang Release. Поэтому
+// проверяются два сценария, в которых вся арифметика либо точна, либо
+// содержит ровно одно округление на выборку, — там любой компилятор обязан
+// выдать одни и те же биты, и ожидаемый выход считается прямо здесь:
+//  - шаг 1,0 (частота клипа равна частоте устройства, скорость 1): выборка
+//    одного кадра, это быстрая ветвь микшера;
+//  - шаг ровно 0,5 (клип 24000 на устройстве 48000): общая ветвь с
+//    интерполяцией, где дробь равна 0 или 0,5, а разность соседних кадров
+//    (кратна 2^-15, по модулю не больше 2) и её половина точны.
+// Усиления — ровно 1,0 и 0,0 (панорама до упора, громкость 1), поэтому
+// умножение на усиление точно, а прибавление нуля — тождество. Мастер 1,0.
 
-static AudioClip *MakeReferenceClip(AudioDevice *device, uint32_t frameCount,
-                                    uint32_t channelCount, uint32_t sampleRate, uint32_t seed)
+static void FillReferenceSamples(int16_t *samples, uint32_t count, uint32_t seed)
 {
-    int16_t *samples =
-        PlatformAllocate((size_t)frameCount * channelCount * sizeof(int16_t), false);
-    Expect(samples != NULL, "reference clip samples could not be allocated");
     uint32_t state = seed * 2654435761u + 1u;
-    for (uint32_t index = 0; index < frameCount * channelCount; ++index)
+    for (uint32_t index = 0; index < count; ++index)
     {
         state = state * 1664525u + 1013904223u;
         samples[index] = (int16_t)(int32_t)(state >> 16);
     }
+}
+
+static float SampleToFloat(int16_t sample)
+{
+    return (float)sample * (1.0f / 32768.0f);
+}
+
+// Нули сравниваются без учёта знака: сумма +0 и -0 даёт +0, и знак нуля —
+// единственное, что здесь может законно отличаться от ожидания.
+static bool SameBits(float left, float right)
+{
+    union
+    {
+        float f;
+        uint32_t u;
+    } a, b;
+    a.f = left;
+    b.f = right;
+    return a.u == b.u || (left == 0.0f && right == 0.0f);
+}
+
+static AudioClip *MakeExactClip(AudioDevice *device, const int16_t *samples,
+                                uint32_t frameCount, uint32_t channelCount, uint32_t sampleRate)
+{
     AudioClipDescription description = {
         .samples = samples,
         .frameCount = frameCount,
@@ -85,80 +115,116 @@ static AudioClip *MakeReferenceClip(AudioDevice *device, uint32_t frameCount,
     };
     AudioClip *clip = NULL;
     Expect(AudioClipCreate(device, &description, &clip) == AUDIO_RESULT_OK,
-           "a reference clip could not be created");
-    PlatformFree(samples);
+           "an exact-mix clip could not be created");
     return clip;
 }
 
-static uint64_t ReferenceHashFrames(const float *frames, uint32_t frameCount)
-{
-    uint64_t hash = 1469598103934665603ull;
-    for (uint32_t index = 0; index < frameCount * 2u; ++index)
-    {
-        union
-        {
-            float f;
-            uint32_t u;
-        } pun;
-        pun.f = frames[index];
-        uint32_t bits = pun.u;
-        for (uint32_t byte = 0; byte < 4u; ++byte)
-        {
-            hash ^= (bits >> (byte * 8u)) & 0xffu;
-            hash *= 1099511628211ull;
-        }
-    }
-    return hash;
-}
+#define EXACT_BUFFER_FRAMES 512u
+#define EXACT_BUFFER_COUNT 4u
+#define EXACT_MONO_FRAMES 700u
+#define EXACT_STEREO_FRAMES 300u
+#define EXACT_HALF_FRAMES 900u
 
-static uint64_t ReferenceMixHash(void)
+static void CheckExactMixes(void)
 {
     AudioDeviceConfiguration configuration = {
         .backend = AUDIO_BACKEND_OFFSCREEN,
         .sampleRate = TEST_SAMPLE_RATE,
-        .frameCountHint = 512u,
+        .frameCountHint = EXACT_BUFFER_FRAMES,
         .masterVolume = 1.0f,
     };
-    AudioDevice *device = NULL;
-    Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
-           "the reference device could not be created");
-    AudioClip *mono = MakeReferenceClip(device, 300u, 1u, 48000u, 11u);
-    AudioClip *stereo = MakeReferenceClip(device, 777u, 2u, 44100u, 22u);
-    AudioClip *shortClip = MakeReferenceClip(device, 64u, 1u, 32000u, 33u);
 
-    AudioVoiceParameters first = {
-        .volume = 0.8f, .pan = -0.3f, .speed = 1.0f, .looping = true,
-    };
-    AudioVoiceParameters second = {
-        .volume = 0.6f, .pan = 0.7f, .speed = 0.913f, .looping = true,
-    };
-    AudioVoiceParameters third = {
-        .volume = 1.0f, .pan = 0.0f, .speed = 1.7f, .looping = false,
-    };
-    AudioVoiceParameters fourth = {
-        .volume = 0.5f, .pan = 1.0f, .speed = 2.5f, .looping = true,
-    };
-    Expect(AudioVoicePlay(device, mono, &first) != AUDIO_VOICE_NONE, "reference voice one");
-    Expect(AudioVoicePlay(device, stereo, &second) != AUDIO_VOICE_NONE, "reference voice two");
-    Expect(AudioVoicePlay(device, shortClip, &third) != AUDIO_VOICE_NONE, "reference voice three");
-    Expect(AudioVoicePlay(device, mono, &fourth) != AUDIO_VOICE_NONE, "reference voice four");
+    // Клипы: моно 48000 в цикле (левый канал), стерео 48000 без цикла (правый
+    // канал) и моно 24000 без цикла (шаг 0,5, левый канал).
+    static int16_t monoSamples[EXACT_MONO_FRAMES];
+    static int16_t stereoSamples[EXACT_STEREO_FRAMES * 2u];
+    static int16_t halfSamples[EXACT_HALF_FRAMES];
+    FillReferenceSamples(monoSamples, EXACT_MONO_FRAMES, 11u);
+    FillReferenceSamples(stereoSamples, EXACT_STEREO_FRAMES * 2u, 22u);
+    FillReferenceSamples(halfSamples, EXACT_HALF_FRAMES, 33u);
 
-    float *frames = PlatformAllocate(512u * 2u * sizeof(float), false);
-    Expect(frames != NULL, "reference mix buffer could not be allocated");
-    uint64_t hash = 1469598103934665603ull;
-    for (uint32_t buffer = 0u; buffer < 4u; ++buffer)
+    float *frames = PlatformAllocate(EXACT_BUFFER_FRAMES * 2u * sizeof(float), false);
+    Expect(frames != NULL, "exact mix buffer could not be allocated");
+
+    // === Сценарий 1: целый шаг, быстрая ветвь ===
     {
-        Expect(AudioDeviceRenderFrames(device, frames, 512u), "reference render must succeed");
-        uint64_t part = ReferenceHashFrames(frames, 512u);
-        hash ^= part + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
-    }
-    PlatformFree(frames);
+        AudioDevice *device = NULL;
+        Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+               "the exact-mix device could not be created");
+        AudioClip *mono = MakeExactClip(device, monoSamples, EXACT_MONO_FRAMES, 1u, 48000u);
+        AudioClip *stereo = MakeExactClip(device, stereoSamples, EXACT_STEREO_FRAMES, 2u, 48000u);
+        AudioVoiceParameters leftOnly = {
+            .volume = 1.0f, .pan = -1.0f, .speed = 1.0f, .looping = true,
+        };
+        AudioVoiceParameters rightOnly = {
+            .volume = 1.0f, .pan = 1.0f, .speed = 1.0f, .looping = false,
+        };
+        Expect(AudioVoicePlay(device, mono, &leftOnly) != AUDIO_VOICE_NONE, "exact voice one");
+        Expect(AudioVoicePlay(device, stereo, &rightOnly) != AUDIO_VOICE_NONE, "exact voice two");
 
-    AudioClipDestroy(mono);
-    AudioClipDestroy(stereo);
-    AudioClipDestroy(shortClip);
-    AudioDeviceDestroy(device);
-    return hash;
+        bool identical = true;
+        for (uint32_t buffer = 0u; buffer < EXACT_BUFFER_COUNT; ++buffer)
+        {
+            Expect(AudioDeviceRenderFrames(device, frames, EXACT_BUFFER_FRAMES),
+                   "exact render must succeed");
+            for (uint32_t index = 0u; index < EXACT_BUFFER_FRAMES; ++index)
+            {
+                uint32_t output = buffer * EXACT_BUFFER_FRAMES + index;
+                float expectedLeft = SampleToFloat(monoSamples[output % EXACT_MONO_FRAMES]);
+                float expectedRight = output < EXACT_STEREO_FRAMES
+                                          ? SampleToFloat(stereoSamples[output * 2u + 1u])
+                                          : 0.0f;
+                identical = identical && SameBits(frames[index * 2u], expectedLeft)
+                            && SameBits(frames[index * 2u + 1u], expectedRight);
+            }
+        }
+        Expect(identical, "integer-step mixing must reproduce the clip samples bit for bit");
+
+        AudioClipDestroy(mono);
+        AudioClipDestroy(stereo);
+        AudioDeviceDestroy(device);
+    }
+
+    // === Сценарий 2: шаг ровно 0,5, общая ветвь с интерполяцией ===
+    {
+        AudioDevice *device = NULL;
+        Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+               "the half-step device could not be created");
+        AudioClip *half = MakeExactClip(device, halfSamples, EXACT_HALF_FRAMES, 1u, 24000u);
+        AudioVoiceParameters leftOnly = {
+            .volume = 1.0f, .pan = -1.0f, .speed = 1.0f, .looping = false,
+        };
+        Expect(AudioVoicePlay(device, half, &leftOnly) != AUDIO_VOICE_NONE, "half-step voice");
+
+        bool identical = true;
+        for (uint32_t buffer = 0u; buffer < EXACT_BUFFER_COUNT; ++buffer)
+        {
+            Expect(AudioDeviceRenderFrames(device, frames, EXACT_BUFFER_FRAMES),
+                   "half-step render must succeed");
+            for (uint32_t index = 0u; index < EXACT_BUFFER_FRAMES; ++index)
+            {
+                uint32_t output = buffer * EXACT_BUFFER_FRAMES + index;
+                float expectedLeft = 0.0f;
+                if (output < EXACT_HALF_FRAMES * 2u)
+                {
+                    uint32_t frame = output / 2u;
+                    uint32_t nextFrame = frame + 1u < EXACT_HALF_FRAMES ? frame + 1u : frame;
+                    float fraction = (output & 1u) != 0u ? 0.5f : 0.0f;
+                    float first = SampleToFloat(halfSamples[frame]);
+                    float second = SampleToFloat(halfSamples[nextFrame]);
+                    expectedLeft = first + (second - first) * fraction;
+                }
+                identical = identical && SameBits(frames[index * 2u], expectedLeft)
+                            && SameBits(frames[index * 2u + 1u], 0.0f);
+            }
+        }
+        Expect(identical, "half-step interpolation must match the exact reference bit for bit");
+
+        AudioClipDestroy(half);
+        AudioDeviceDestroy(device);
+    }
+
+    PlatformFree(frames);
 }
 
 LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
@@ -291,9 +357,8 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
     Expect(AudioVoicePlay(device, NULL, NULL) == AUDIO_VOICE_NONE,
            "playing a NULL clip must be refused");
 
-    // === Побитовая неизменность микса ===
-    Expect(ReferenceMixHash() == 0x95070508644f2382ull,
-           "the mixed output must stay bit-identical to the reference");
+    // === Побитовая точность микса ===
+    CheckExactMixes();
 
     PlatformFree(frames);
     AudioClipDestroy(clip);
