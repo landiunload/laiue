@@ -889,6 +889,113 @@ static void TestFastPathConcurrentVisibility(void)
     WorldDestroy(world);
 }
 
+// === Удаление опустевшего чанка: сдвиг кластера не рвёт чужие цепочки ===
+//
+// Откат всех правок чанка убирает запись из таблицы сдвигом кластера.
+// Если сдвиг потеряет соседа по кластеру, тот станет недостижим, и
+// WorldGetBlock вернёт значение провайдера вместо правки. Тест заводит много
+// чанков с правками, откатывает половину (в самых разных слотах) и требует,
+// чтобы каждая уцелевшая правка читалась, а каждая откаченная — нет. Так же
+// проверяется ветка батча, публикующая чанк с нулём оставшихся дельт.
+
+#define REMOVAL_CHUNKS 512U
+
+static void TestEmptyChunkRemovalBackwardShift(void)
+{
+    ProviderContext context = {0};
+    WorldBaseProvider provider = {
+        .context = &context,
+        .getBlock = ProviderGetBlock,
+        .fillRegion = ProviderFillRegion,
+        .rebase = ProviderRebase,
+    };
+    World *world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "removal world was not created");
+
+    const BlockType edited = (BlockType)200U;
+    const int64_t local[3][3] = {
+        { 5, 6, 7 }, { 6, 6, 7 }, { 5, 7, 7 },
+    };
+
+    for (uint32_t index = 0U; index < REMOVAL_CHUNKS; ++index)
+    {
+        int64_t chunkX = (int64_t)index;
+        int64_t chunkY = (int64_t)((index * 7U) % 23U);
+        int64_t chunkZ = (int64_t)((index * 13U) % 19U);
+        for (uint32_t slot = 0U; slot < 3U; ++slot)
+        {
+            int64_t bx = chunkX * CHUNK_SIZE + local[slot][0];
+            int64_t by = chunkY * CHUNK_SIZE + local[slot][1];
+            int64_t bz = chunkZ * CHUNK_SIZE + local[slot][2];
+            ProviderExpect(ProviderPattern(&context, bx, by, bz) != edited,
+                           "removal edit must differ from the provider value");
+            ProviderExpect(WorldTrySetBlock(world, bx, by, bz, edited),
+                           "removal edit failed");
+        }
+    }
+
+    // Откатываем нечётные чанки целиком; чётные обязаны пережить удаление.
+    for (uint32_t index = 1U; index < REMOVAL_CHUNKS; index += 2U)
+    {
+        int64_t chunkX = (int64_t)index;
+        int64_t chunkY = (int64_t)((index * 7U) % 23U);
+        int64_t chunkZ = (int64_t)((index * 13U) % 19U);
+        for (uint32_t slot = 0U; slot < 3U; ++slot)
+        {
+            int64_t bx = chunkX * CHUNK_SIZE + local[slot][0];
+            int64_t by = chunkY * CHUNK_SIZE + local[slot][1];
+            int64_t bz = chunkZ * CHUNK_SIZE + local[slot][2];
+            ProviderExpect(WorldTrySetBlock(world, bx, by, bz,
+                               ProviderPattern(&context, bx, by, bz)),
+                           "removal revert failed");
+        }
+    }
+
+    for (uint32_t index = 0U; index < REMOVAL_CHUNKS; ++index)
+    {
+        int64_t chunkX = (int64_t)index;
+        int64_t chunkY = (int64_t)((index * 7U) % 23U);
+        int64_t chunkZ = (int64_t)((index * 13U) % 19U);
+        bool survives = (index & 1U) == 0U;
+        for (uint32_t slot = 0U; slot < 3U; ++slot)
+        {
+            int64_t bx = chunkX * CHUNK_SIZE + local[slot][0];
+            int64_t by = chunkY * CHUNK_SIZE + local[slot][1];
+            int64_t bz = chunkZ * CHUNK_SIZE + local[slot][2];
+            BlockType wanted = survives ? edited
+                : ProviderPattern(&context, bx, by, bz);
+            ProviderExpect(WorldGetBlock(world, bx, by, bz) == wanted,
+                           survives
+                               ? "surviving edit became unreachable after cluster shift"
+                               : "reverted chunk still reports an edit");
+        }
+    }
+
+    // Батч с полным откатом тоже обязан убрать опустевшую запись.
+    {
+        int64_t chunkX = 100000;
+        int64_t chunkY = 0;
+        int64_t chunkZ = 0;
+        int64_t bx = chunkX * CHUNK_SIZE + 9;
+        int64_t by = chunkY * CHUNK_SIZE + 9;
+        int64_t bz = chunkZ * CHUNK_SIZE + 9;
+        BlockType base = ProviderPattern(&context, bx, by, bz);
+        ProviderExpect(base != edited, "batch base must differ from the edit");
+        ProviderExpect(WorldTrySetBlock(world, bx, by, bz, edited),
+                       "batch setup edit failed");
+        WorldBlockMutation revert = {
+            .block = { bx, by, bz },
+            .expected = edited,
+            .replacement = base,
+        };
+        ProviderExpect(WorldApplyBlockBatch(world, &revert, 1U) &&
+                           WorldGetBlock(world, bx, by, bz) == base,
+                       "batch full revert did not remove the empty chunk");
+    }
+
+    WorldDestroy(world);
+}
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
     TestFastPathConcurrentVisibility();
@@ -899,6 +1006,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestHaloRegions();
     TestRegionCoordinateLimits();
     TestFastPathAfterEmpty();
+    TestEmptyChunkRemovalBackwardShift();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }

@@ -89,7 +89,13 @@ struct ChunkStreaming
 
     // Кеш мешей: открытая адресация, таблица принадлежит главному потоку.
     ChunkEntry* entries;
-    ChunkEntry* spareEntries;
+    // Компактная запасная арена для пересборки таблицы после смены origin.
+    // Origin меняет абсолютные координаты живущих чанков, а с ними и хеш
+    // ключей, поэтому там таблицу действительно приходится строить заново.
+    // Живущих в гистерезисном кубе радиуса + 1 не больше (2R+3)^3 записей,
+    // поэтому арена ровно этого размера — а не второй таблицы на всю
+    // ёмкость, которая была чистой памятью впустую на весь сеанс игры.
+    ChunkEntry* rebuildScratch;
     uint32_t capacity;
 
     // Плотный список записей с мешами. Он же хранит кешированный порядок
@@ -842,6 +848,37 @@ static void EvictChunk(ChunkStreaming* streaming, int64_t x, int64_t y, int64_t 
     EraseEntry(streaming, entry);
 }
 
+// Убирает из таблицы всё, что вышло за радиус + 1 вокруг нового центра.
+// Пересборка в свежую таблицу не нужна: хеш ключа от центра не зависит,
+// поэтому дом каждой оставшейся записи тот же, а удаление сдвигом кластера
+// сохраняет достижимость соседей. Приёмник-таблица тут не требуется вовсе.
+//
+// Индекс не увеличивается после удаления: EraseEntry сдвигает кластер, и на
+// место только что освобождённого слота встаёт следующая запись — её и надо
+// разобрать тем же индексом.
+static void PruneEntriesOutsideRadius(ChunkStreaming* streaming, int64_t radius)
+{
+    uint32_t index = 0u;
+    while (index < streaming->capacity)
+    {
+        ChunkEntry* entry = &streaming->entries[index];
+        if (entry->state == CHUNK_ENTRY_EMPTY
+            || IsInsideRadius(streaming, entry->x, entry->y, entry->z, radius))
+        {
+            ++index;
+            continue;
+        }
+
+        if (entry->mesh != NULL)
+        {
+            RemoveMeshFromDrawList(streaming, entry);
+            RendererDestroyMesh(streaming->renderer, entry->mesh);
+            entry->mesh = NULL;
+        }
+        EraseEntry(streaming, entry);
+    }
+}
+
 // При переходе ровно на соседний чанк за пределами нового радиуса+1
 // оказываются только уходящие грани старого куба: по одной на каждую ось,
 // изменившую знак. Перебирать всю таблицу, как при первом вызове или
@@ -893,22 +930,22 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
     int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
     int64_t newCenterX, int64_t newCenterY, int64_t newCenterZ)
 {
-    memset(streaming->spareEntries, 0,
-        (size_t)streaming->capacity * sizeof(ChunkEntry));
-
-    ChunkEntry* previousEntries = streaming->entries;
-    streaming->entries = streaming->spareEntries;
-    streaming->spareEntries = previousEntries;
     streaming->hasCenter = true;
     streaming->centerX = newCenterX;
     streaming->centerY = newCenterY;
     streaming->centerZ = newCenterZ;
     streaming->hasUnqueuedPending = false;
-    ResetDrawList(streaming);
+
+    // Origin сменился: абсолютные координаты живущих чанков пересчитываются
+    // вместе с их хешем, поэтому таблицу приходится строить заново. Приёмник
+    // берём из компактной арены: живущих в радиусе + 1 не больше (2R+3)^3,
+    // так что второй таблицы на всю ёмкость для этого не нужно.
+    ChunkEntry* scratch = streaming->rebuildScratch;
+    uint32_t scratchCount = 0u;
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
     {
-        ChunkEntry* previous = &previousEntries[index];
+        ChunkEntry* previous = &streaming->entries[index];
         if (previous->mesh == NULL) continue;
 
         int64_t x = 0;
@@ -923,10 +960,14 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
 
         if (keep)
         {
-            ChunkEntry* moved = InsertEntry(streaming, x, y, z);
+            ChunkEntry* moved = &scratch[scratchCount++];
+            moved->x = x;
+            moved->y = y;
+            moved->z = z;
             moved->mesh = previous->mesh;
             moved->state = CHUNK_ENTRY_READY;
-            AddMeshToDrawList(streaming, moved);
+            moved->requestQueued = false;
+            moved->drawSlotPlusOne = 0;
             previous->mesh = NULL;
             previous->drawSlotPlusOne = 0;
         }
@@ -936,6 +977,19 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
             previous->mesh = NULL;
             previous->drawSlotPlusOne = 0;
         }
+    }
+
+    memset(streaming->entries, 0,
+        (size_t)streaming->capacity * sizeof(ChunkEntry));
+    ResetDrawList(streaming);
+
+    for (uint32_t index = 0; index < scratchCount; ++index)
+    {
+        ChunkEntry* moved = InsertEntry(streaming,
+            scratch[index].x, scratch[index].y, scratch[index].z);
+        moved->mesh = scratch[index].mesh;
+        moved->state = CHUNK_ENTRY_READY;
+        AddMeshToDrawList(streaming, moved);
     }
 
     QueueMissingChunks(streaming, newCenterX, newCenterY, newCenterZ);
@@ -974,6 +1028,10 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     // Очередям достаточно вместить весь активный куб радиуса viewRadius.
     // Hash-таблица больше из-за гистерезиса, но переносить этот запас в две
     // очереди нет смысла: переполнение всё равно корректно retry-ится.
+    // Степень двойки поверх этого — не только маска вместо деления, но и
+    // запас на ведущие грани шага: пока не разобраны заявки старого куба,
+    // новые заявки уходящих граней должны поместиться сразу (см. проверку
+    // ведущих граней в voxel_raycast_test.c).
     uint32_t activeDiameter = (uint32_t)(viewRadiusChunks * 2 + 1);
     uint32_t activeVolume = activeDiameter * activeDiameter * activeDiameter;
     uint32_t queueCapacity = 1;
@@ -985,7 +1043,7 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
     streaming->capacity = capacity;
     streaming->queueCapacity = queueCapacity;
     streaming->entries = PlatformAllocate((size_t)capacity * sizeof(ChunkEntry), true);
-    streaming->spareEntries = PlatformAllocate((size_t)capacity * sizeof(ChunkEntry), true);
+    streaming->rebuildScratch = PlatformAllocate((size_t)volume * sizeof(ChunkEntry), false);
     streaming->drawItems = PlatformAllocate((size_t)volume * sizeof(DrawItem), false);
     streaming->requests = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkRequest), false);
     streaming->results = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkMeshResult), false);
@@ -997,7 +1055,7 @@ ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t v
         return NULL;
     }
 
-    if (streaming->entries == NULL || streaming->spareEntries == NULL
+    if (streaming->entries == NULL || streaming->rebuildScratch == NULL
         || streaming->drawItems == NULL
         || streaming->requests == NULL || streaming->results == NULL)
     {
@@ -1062,9 +1120,9 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         PlatformFree(streaming->entries);
     }
 
-    if (streaming->spareEntries != NULL)
+    if (streaming->rebuildScratch != NULL)
     {
-        PlatformFree(streaming->spareEntries);
+        PlatformFree(streaming->rebuildScratch);
     }
     if (streaming->drawItems != NULL) PlatformFree(streaming->drawItems);
     if (streaming->requests != NULL) PlatformFree(streaming->requests);
@@ -1119,57 +1177,29 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
         return;
     }
 
-    // Первый вызов, телепорт или смена центра больше чем на чанк:
-    // пересобираем таблицу целиком. Вторая таблица переиспользуется,
-    // поэтому выделений и освобождений памяти нет.
-    memset(streaming->spareEntries, 0,
-        (size_t)streaming->capacity * sizeof(ChunkEntry));
-
+    // Первый вызов, телепорт или смена центра больше чем на чанк. Хеш ключа
+    // от центра не зависит, поэтому дом каждой оставшейся записи тот же:
+    // таблицу не пересобираем, а прямо в ней вытесняем всё, что вышло за
+    // радиус + 1. Вторая таблица на всю ёмкость (прежний приёмник) больше
+    // не нужна — это и была чистая потеря памяти на весь сеанс игры.
     streaming->hasCenter = true;
     streaming->centerX = chunkX;
     streaming->centerY = chunkY;
     streaming->centerZ = chunkZ;
     PlatformAtomicIncrementU32(&streaming->centerEpoch);
+    streaming->drawOrderDirty = true;
 
-    // Пересборка таблицы с гистерезисом: живущие в радиусе + 1
-    // переносятся, дальние освобождаются (отложенно, под fence).
-    ChunkEntry* previousEntries = streaming->entries;
-    streaming->entries = streaming->spareEntries;
-    streaming->spareEntries = previousEntries;
+    PruneEntriesOutsideRadius(streaming,
+        (int64_t)streaming->viewRadius + 1);
+
     streaming->hasUnqueuedPending = false;
-    ResetDrawList(streaming);
-
     for (uint32_t i = 0; i < streaming->capacity; ++i)
     {
-        ChunkEntry* previous = &previousEntries[i];
-        if (previous->state == CHUNK_ENTRY_EMPTY)
+        const ChunkEntry* entry = &streaming->entries[i];
+        if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
         {
-            continue;
-        }
-
-        if (IsInsideRadius(streaming, previous->x, previous->y, previous->z, (int64_t)streaming->viewRadius + 1))
-        {
-            ChunkEntry* moved = InsertEntry(streaming, previous->x, previous->y, previous->z);
-            moved->state = previous->state;
-            moved->mesh = previous->mesh;
-            moved->revision = previous->revision;
-            moved->requestQueued = previous->requestQueued;
-            if (moved->mesh != NULL)
-            {
-                AddMeshToDrawList(streaming, moved);
-            }
-            if (moved->state == CHUNK_ENTRY_PENDING && !moved->requestQueued)
-            {
-                streaming->hasUnqueuedPending = true;
-            }
-            previous->mesh = NULL;
-            previous->drawSlotPlusOne = 0;
-        }
-        else if (previous->mesh != NULL)
-        {
-            RendererDestroyMesh(streaming->renderer, previous->mesh);
-            previous->mesh = NULL;
-            previous->drawSlotPlusOne = 0;
+            streaming->hasUnqueuedPending = true;
+            break;
         }
     }
 

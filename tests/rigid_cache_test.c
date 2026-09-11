@@ -133,6 +133,11 @@ static void TestInvalidCapacityAndIds(void)
     VoxelRigidContactCache invalid = {0};
     uint32_t bytes = VoxelRigidContactCacheBytes(1u);
     Expect(bytes > 0u, "one-body cache has storage");
+    // Точная раскладка кэша прибита: тело * 16 записей по 112 Б, корзины
+    // BucketCountFor(тело) * 4 и 63 Б запаса на выравнивание. Смена раскладки
+    // обязана сломать проверку, а не пройти молча.
+    Expect(VoxelRigidContactCacheBytes(1u) == 2111u, "exact cache bytes for one body");
+    Expect(VoxelRigidContactCacheBytes(7u) == 12863u, "exact cache bytes for seven bodies");
     Expect(VoxelRigidContactCacheBytes(0u) == 0u &&
            VoxelRigidContactCacheBytes(UINT32_MAX) == 0u, "invalid capacity rejected");
     Expect(!VoxelRigidContactCacheInitialize(NULL, contactStorage, 1u, bytes),

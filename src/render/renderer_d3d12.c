@@ -455,6 +455,54 @@ static bool PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
     return true;
 }
 
+// Полностью опустевший блок пула: все выданные из него области уже
+// вернулись, и в списке свободных лежит ровно весь блок.
+static bool PoolBlockIsEmpty(const GeometryPoolBlock* block)
+{
+    return block->freeRangeCount == 1u && block->freeRanges[0].offset == 0u &&
+           block->freeRanges[0].size == block->totalBytes;
+}
+
+// Блок ещё нужен незакрытым загрузкам или отложенным освобождениям: его
+// индекс обязан остаться валидным до конца дренажа.
+static bool PoolBlockIsReferenced(const Renderer* renderer, uint32_t blockIndex)
+{
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].blockIndex == blockIndex) return true;
+    }
+    for (uint32_t i = 0; i < renderer->deferredRangeCount; ++i)
+    {
+        uint32_t index = (renderer->deferredRangeHead + i) % DEFERRED_RELEASE_CAPACITY;
+        if (renderer->deferredRanges[index].blockIndex == blockIndex) return true;
+    }
+    return false;
+}
+
+// Отдаёт системе хвостовые блоки пула, в которых не осталось ни одной
+// выданной области. Иначе пул только растёт: после разового всплеска
+// геометрии память остаётся занятой до RendererReleaseWorld. Последний
+// блок базового размера сохраняется тёплым кэшем, чтобы одиночный меш не
+// создавал и не уничтожал ресурс каждый кадр; блок крупнее базового
+// (созданный под один большой меш) освобождается всегда.
+static void PoolReclaimEmptyTail(Renderer* renderer)
+{
+    while (renderer->poolBlockCount > 0)
+    {
+        uint32_t last = renderer->poolBlockCount - 1;
+        GeometryPoolBlock* block = &renderer->poolBlocks[last];
+        if (!PoolBlockIsEmpty(block)) break;
+        if (PoolBlockIsReferenced(renderer, last)) break;
+        if (renderer->poolBlockCount == 1u && block->totalBytes == POOL_BLOCK_BYTES) break;
+
+        ID3D12Resource_Release(block->buffer);
+        HeapFree(GetProcessHeap(), 0, block->freeRanges);
+        renderer->poolCapacityBytes -= block->totalBytes;
+        memset(block, 0, sizeof(*block));
+        renderer->poolBlockCount--;
+    }
+}
+
 // Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
 static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
 {
@@ -484,6 +532,8 @@ static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
         renderer->deferredRangeHead = (renderer->deferredRangeHead + 1) % DEFERRED_RELEASE_CAPACITY;
         renderer->deferredRangeCount--;
     }
+
+    PoolReclaimEmptyTail(renderer);
 }
 
 static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)

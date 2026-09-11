@@ -170,7 +170,7 @@ typedef struct StressChunkStreaming
     int64_t centerY;
     int64_t centerZ;
     StressChunkEntry* entries;
-    StressChunkEntry* spareEntries;
+    StressChunkEntry* rebuildScratch;
     uint32_t capacity;
     StressDrawItem* drawItems;
     uint32_t drawItemCount;
