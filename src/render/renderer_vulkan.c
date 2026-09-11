@@ -177,6 +177,9 @@ struct RendererMesh
     uint32_t blockIndex;
     uint32_t offsetBytes;
     uint32_t sizeBytes;
+    // Выровненный диапазон, реально занятый в блоке пула: его же возвращает
+    // PoolFree, иначе хвост выравнивания оставался бы занятым навсегда.
+    uint32_t poolSpanBytes;
     uint32_t quadCount;
 };
 
@@ -266,6 +269,14 @@ struct Renderer
 
     GeometryPoolBlock poolBlocks[MAX_POOL_BLOCKS];
     uint32_t poolBlockCount;
+    // pool accounting
+    // Инкрементальные счётчики вместо обхода всех блоков и свободных
+    // диапазонов в RendererGetStats_Vulkan: capacity — сумма размеров
+    // блоков, used — сумма выданных мешам выровненных диапазонов. Оба
+    // меняются только при создании блока, успешном PoolAllocate, успешном
+    // PoolFree и обоих способах освобождения блока.
+    uint64_t poolCapacityBytes;
+    uint64_t poolUsedBytes;
 
     PendingUpload pendingUploads[MAX_PENDING_UPLOADS];
     uint32_t pendingUploadCount;
@@ -294,6 +305,17 @@ struct Renderer
 static uint32_t AlignUp(uint32_t value, uint32_t alignment)
 {
     return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+// Сколько байт блока занимает выдача sizeBytes с учётом требования
+// выравнивания динамического storage-смещения. PoolAllocate и последующее
+// освобождение обязаны считать один и тот же диапазон, иначе хвост
+// выравнивания остаётся занятым навсегда.
+static uint32_t PoolSpanBytes(const Renderer *renderer, uint32_t sizeBytes)
+{
+    uint32_t alignment = (uint32_t)renderer->storageAlignment;
+    if (alignment == 0u) alignment = 16u;
+    return AlignUp(sizeBytes, alignment);
 }
 
 static bool FindMemoryType(const Renderer *renderer, uint32_t typeBits,
@@ -550,6 +572,7 @@ static bool PoolBlockCreate(Renderer *renderer, uint32_t minimumBytes, uint32_t 
     block->freeRangeCount = 1u;
     block->totalBytes = blockBytes;
 
+    renderer->poolCapacityBytes += blockBytes;
     *outBlockIndex = renderer->poolBlockCount++;
     return true;
 }
@@ -561,7 +584,7 @@ static bool PoolAllocate(Renderer *renderer, uint32_t sizeBytes, uint32_t *outBl
     // каждая выдача выравнивается по требованию устройства.
     uint32_t alignment = (uint32_t)renderer->storageAlignment;
     if (alignment == 0u) alignment = 16u;
-    uint32_t aligned = AlignUp(sizeBytes, alignment);
+    uint32_t aligned = PoolSpanBytes(renderer, sizeBytes);
     if (aligned < sizeBytes) return false;
 
     for (uint32_t attempt = 0; attempt < 2u; ++attempt)
@@ -624,6 +647,7 @@ static bool PoolAllocate(Renderer *renderer, uint32_t sizeBytes, uint32_t *outBl
                         block->freeRangeCount++;
                     }
                 }
+                renderer->poolUsedBytes += aligned;
                 return true;
             }
         }
@@ -634,7 +658,10 @@ static bool PoolAllocate(Renderer *renderer, uint32_t sizeBytes, uint32_t *outBl
     return false;
 }
 
-static void PoolFree(GeometryPoolBlock *block, uint32_t offset, uint32_t size)
+// Возвращает диапазон в список свободных с коалесценцией соседей.
+// false — диапазон потерян из-за OOM при росте списка; вызывающий тогда не
+// уменьшает poolUsedBytes, потому что занятость блока не изменилась.
+static bool PoolFree(GeometryPoolBlock *block, uint32_t offset, uint32_t size)
 {
     uint32_t insertion = 0u;
     while (insertion < block->freeRangeCount && block->freeRanges[insertion].offset < offset)
@@ -645,7 +672,7 @@ static void PoolFree(GeometryPoolBlock *block, uint32_t offset, uint32_t size)
         uint32_t capacity = block->freeRangeCapacity * 2u;
         FreeRange *grown =
             PlatformReallocate(block->freeRanges, capacity * sizeof(FreeRange), false);
-        if (grown == NULL) return;   // диапазон останется занятым, но пул не повредится
+        if (grown == NULL) return false;   // диапазон останется занятым, но пул не повредится
         block->freeRanges = grown;
         block->freeRangeCapacity = capacity;
     }
@@ -675,6 +702,7 @@ static void PoolFree(GeometryPoolBlock *block, uint32_t offset, uint32_t size)
                 (block->freeRangeCount - insertion - 1u) * sizeof(FreeRange));
         block->freeRangeCount--;
     }
+    return true;
 }
 
 // === Отложенные освобождения ===
@@ -682,6 +710,67 @@ static void PoolFree(GeometryPoolBlock *block, uint32_t offset, uint32_t size)
 static void WaitForGpu(Renderer *renderer)
 {
     vkDeviceWaitIdle(renderer->device);
+}
+
+// Полностью опустевший блок пула: все выданные из него области уже
+// вернулись, и в списке свободных лежит ровно весь блок.
+static bool PoolBlockIsEmpty(const GeometryPoolBlock *block)
+{
+    return block->freeRangeCount == 1u && block->freeRanges[0].offset == 0u &&
+           block->freeRanges[0].size == block->totalBytes;
+}
+
+// Блок ещё нужен незакрытым загрузкам или отложенным освобождениям: его
+// индекс обязан остаться валидным до конца дренажа.
+static bool PoolBlockIsReferenced(const Renderer *renderer, uint32_t blockIndex)
+{
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].blockIndex == blockIndex) return true;
+    }
+    for (uint32_t i = 0; i < renderer->deferredRangeCount; ++i)
+    {
+        uint32_t index = (renderer->deferredRangeHead + i) % DEFERRED_RELEASE_CAPACITY;
+        if (renderer->deferredRanges[index].blockIndex == blockIndex) return true;
+    }
+    return false;
+}
+
+// Отдаёт системе хвостовые блоки пула, в которых не осталось ни одной
+// выданной области. Иначе пул только растёт: после разового всплеска
+// геометрии память GPU остаётся занятой до RendererReleaseWorld. Последний
+// блок базового размера сохраняется тёплым кэшем, чтобы одиночный меш не
+// создавал и не уничтожал ресурс каждый кадр; блок крупнее базового
+// освобождается всегда.
+//
+// Безопасность по GPU: блок становится пустым только после дренажа всех
+// отложенных диапазонов, а диапазон дренируется лишь при
+// submittedFrames >= safeFrameIndex = момент удаления + FRAME_COUNT. Ядро
+// кадра устроено так, что каждый кадровый слот переиспользуется не раньше
+// подтверждения своего фенса (RendererBeginFrame ждёт frameFences[slot]),
+// поэтому за FRAME_COUNT отправок командный буфер, читавший блок и его
+// дескрипторные наборы, гарантированно завершён.
+static void PoolReclaimEmptyTail(Renderer *renderer)
+{
+    while (renderer->poolBlockCount > 0u)
+    {
+        uint32_t last = renderer->poolBlockCount - 1u;
+        GeometryPoolBlock *block = &renderer->poolBlocks[last];
+        if (!PoolBlockIsEmpty(block)) break;
+        if (PoolBlockIsReferenced(renderer, last)) break;
+        if (renderer->poolBlockCount == 1u && block->totalBytes == POOL_BLOCK_BYTES) break;
+
+        // Пул дескрипторов создан с VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        // поэтому наборы блока возвращаются пулу наборов, а не остаются в слоте.
+        BufferDestroy(renderer, &block->buffer);
+        if (block->freeRanges != NULL) PlatformFree(block->freeRanges);
+        if (block->sets[0] != VK_NULL_HANDLE)
+            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, FRAME_COUNT,
+                                 block->sets);
+        renderer->poolCapacityBytes -= block->totalBytes;
+        memset(block, 0, sizeof(*block));
+        renderer->poolBlockCount--;
+    }
 }
 
 static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
@@ -702,11 +791,14 @@ static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
     {
         DeferredRangeRelease *entry = &renderer->deferredRanges[renderer->deferredRangeHead];
         if (!releaseEverything && entry->safeFrameIndex > renderer->submittedFrames) break;
-        PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size);
+        if (PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size))
+            renderer->poolUsedBytes -= entry->size;
         renderer->deferredRangeHead =
             (renderer->deferredRangeHead + 1u) % DEFERRED_RELEASE_CAPACITY;
         renderer->deferredRangeCount--;
     }
+
+    PoolReclaimEmptyTail(renderer);
 }
 
 static void DeferBufferRelease(Renderer *renderer, VkBuffer buffer, VkDeviceMemory memory)
@@ -1693,6 +1785,8 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
         memset(block, 0, sizeof(*block));
     }
     renderer->poolBlockCount = 0u;
+    renderer->poolCapacityBytes = 0u;
+    renderer->poolUsedBytes = 0u;
     renderer->pendingUploadCount = 0u;
     renderer->worldReady = false;
     RefreshChunkSetTextures(renderer);
@@ -1832,12 +1926,14 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
         return NULL;
 
     uint32_t sizeBytes = quadCount * (uint32_t)sizeof(ChunkQuad);
+    uint32_t allocatedBytes = PoolSpanBytes(renderer, sizeBytes);
     uint32_t blockIndex = 0u;
     uint32_t offsetBytes = 0u;
     if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes)) return NULL;
     if (!EnsureBlockDescriptorSets(renderer, blockIndex))
     {
-        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+        if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
+            renderer->poolUsedBytes -= allocatedBytes;
         return NULL;
     }
 
@@ -1879,7 +1975,8 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
             if (!BufferCreate(renderer, sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
                               &ownedStaging))
             {
-                PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
+                    renderer->poolUsedBytes -= allocatedBytes;
                 return NULL;
             }
             memcpy(ownedStaging.mapped, quads, sizeBytes);
@@ -1896,13 +1993,15 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
         else if (usedLargeRing)
             renderer->largeMeshUploadOffsets[renderer->frameIndex] = sourceOffset;
         else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
-        PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes);
+        if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
+            renderer->poolUsedBytes -= allocatedBytes;
         return NULL;
     }
 
     mesh->blockIndex = blockIndex;
     mesh->offsetBytes = offsetBytes;
     mesh->sizeBytes = sizeBytes;
+    mesh->poolSpanBytes = allocatedBytes;
     mesh->quadCount = quadCount;
 
     PendingUpload *upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
@@ -1929,7 +2028,7 @@ void RendererDestroyMesh_Vulkan(Renderer *renderer, RendererMesh *mesh)
         (renderer->deferredRangeHead + renderer->deferredRangeCount) % DEFERRED_RELEASE_CAPACITY;
     renderer->deferredRanges[slot].blockIndex = mesh->blockIndex;
     renderer->deferredRanges[slot].offset = mesh->offsetBytes;
-    renderer->deferredRanges[slot].size = mesh->sizeBytes;
+    renderer->deferredRanges[slot].size = mesh->poolSpanBytes;
     renderer->deferredRanges[slot].safeFrameIndex = renderer->submittedFrames + FRAME_COUNT;
     renderer->deferredRangeCount++;
 
@@ -2360,17 +2459,8 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     if (renderer == NULL || outStats == NULL) return;
 
     *outStats = renderer->lastStats;
-    uint64_t capacity = 0u;
-    uint64_t freeBytes = 0u;
-    for (uint32_t blockIndex = 0; blockIndex < renderer->poolBlockCount; ++blockIndex)
-    {
-        const GeometryPoolBlock *block = &renderer->poolBlocks[blockIndex];
-        capacity += block->totalBytes;
-        for (uint32_t rangeIndex = 0; rangeIndex < block->freeRangeCount; ++rangeIndex)
-            freeBytes += block->freeRanges[rangeIndex].size;
-    }
-    outStats->geometryPoolCapacityBytes = capacity;
-    outStats->geometryPoolUsedBytes = capacity - freeBytes;
+    outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
+    outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
 }
 
 void RendererSetVerticalSync_Vulkan(Renderer *renderer, bool enabled)

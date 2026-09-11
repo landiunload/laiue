@@ -857,7 +857,138 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     PlatformDeleteFile(paths->glow);
     PlatformFree(paths);
 
+    // === Пул геометрии: O(1)-счётчики и возврат опустевших блоков ===
+    // Меш сцены больше не нужен: без него сценарий начинается с полностью
+    // свободного пула, и проверки занятости однозначны.
     RendererDestroyMesh(renderer, mesh);
+
+    setup.passCount = 0u;
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "a drain frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    uint64_t warmCapacity = stats.geometryPoolCapacityBytes;
+    Expect(warmCapacity > 0u, "the idle pool must keep one warm block");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "the idle pool must report zero used geometry");
+
+    // 256 мешей по 64 КиБ = 16 МиБ: четыре базовых блока по 4 МиБ.
+    const uint32_t meshQuads = 65536u / (uint32_t)sizeof(ChunkQuad);
+    const uint32_t meshBytes = meshQuads * (uint32_t)sizeof(ChunkQuad);
+    const uint32_t burstMeshes = 256u;
+    ChunkQuad *poolQuads = PlatformAllocate((size_t)meshBytes, false);
+    RendererMesh **poolMeshes =
+        PlatformAllocate((size_t)burstMeshes * sizeof(*poolMeshes), false);
+    Expect(poolQuads != NULL && poolMeshes != NULL,
+           "the pool stress scratch could not be allocated");
+    for (uint32_t quadIndex = 0u; quadIndex < meshQuads; ++quadIndex)
+        poolQuads[quadIndex] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+
+    // Лимит незакрытых загрузок — 64, поэтому партии идут через кадры.
+    for (uint32_t created = 0u; created < burstMeshes; created += 64u)
+    {
+        for (uint32_t index = 0u; index < 64u; ++index)
+        {
+            poolMeshes[created + index] = RendererCreateMesh(renderer, poolQuads, meshQuads);
+            Expect(poolMeshes[created + index] != NULL,
+                   "a pool stress mesh could not be created");
+        }
+        Expect(RendererBeginFrame(renderer, &setup), "a pool stress frame could not begin");
+        Expect(RendererEndFrame(renderer), "a pool stress frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    uint64_t burstCapacity = stats.geometryPoolCapacityBytes;
+    Expect(burstCapacity == warmCapacity * 4u,
+           "the geometry burst must add exactly three base blocks");
+    Expect(stats.geometryPoolUsedBytes == (uint64_t)meshBytes * burstMeshes,
+           "the O(1) counter must account for every allocated mesh byte");
+
+    // Спад: все меши исчезают, дренаж возвращает хвостовые блоки.
+    for (uint32_t index = 0u; index < burstMeshes; ++index)
+        RendererDestroyMesh(renderer, poolMeshes[index]);
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a shrink frame could not begin");
+        Expect(RendererEndFrame(renderer), "a shrink frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == warmCapacity,
+           "the pool must return to a single warm block after the burst");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "the pool must be idle after every mesh went away");
+
+    // Повторный всплеск: блоки берутся заново, геометрия снова рисуется.
+    for (uint32_t created = 0u; created < burstMeshes; created += 64u)
+    {
+        for (uint32_t index = 0u; index < 64u; ++index)
+        {
+            poolMeshes[created + index] = RendererCreateMesh(renderer, poolQuads, meshQuads);
+            Expect(poolMeshes[created + index] != NULL,
+                   "a recreated pool mesh could not be created");
+        }
+        Expect(RendererBeginFrame(renderer, &setup), "a regrow frame could not begin");
+        Expect(RendererEndFrame(renderer), "a regrow frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == burstCapacity,
+           "recreated geometry must fill the same number of blocks");
+
+    setup.passCount = 1u;
+    Expect(RendererBeginFrame(renderer, &setup), "a regrown scene frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, poolMeshes[0], origin);
+    Expect(RendererEndFrame(renderer), "a regrown scene frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 1u, "a mesh in a regrown pool must still draw");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "a regrown scene frame could not be captured");
+    const uint8_t *poolCentre =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(!(poolCentre[0] > 250u && poolCentre[1] > 250u && poolCentre[2] < 5u),
+           "the regrown geometry must cover the frame centre, not the sky");
+
+    for (uint32_t index = 0u; index < burstMeshes; ++index)
+        RendererDestroyMesh(renderer, poolMeshes[index]);
+    setup.passCount = 0u;
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a final drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "a final drain frame could not end");
+    }
+
+    // Крупный меш (> базового блока) получает отдельный блок, и после
+    // дренажа тот освобождается целиком, а не остаётся тёплым.
+    const uint32_t largeBytes = 5u * 1024u * 1024u;
+    const uint32_t largeQuads = largeBytes / (uint32_t)sizeof(ChunkQuad);
+    ChunkQuad *largeGeometry = PlatformAllocate((size_t)largeBytes, false);
+    Expect(largeGeometry != NULL, "the oversized geometry could not be allocated");
+    for (uint32_t quadIndex = 0u; quadIndex < largeQuads; ++quadIndex)
+        largeGeometry[quadIndex] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+    RendererMesh *largeMesh = RendererCreateMesh(renderer, largeGeometry, largeQuads);
+    Expect(largeMesh != NULL, "the oversized mesh could not be created");
+    Expect(RendererBeginFrame(renderer, &setup), "an oversized mesh frame could not begin");
+    Expect(RendererEndFrame(renderer), "an oversized mesh frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes > warmCapacity,
+           "an oversized mesh must allocate its own block");
+    RendererDestroyMesh(renderer, largeMesh);
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "an oversized drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "an oversized drain frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == warmCapacity,
+           "a block larger than the base size must be released, not kept warm");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "an oversized mesh must leave no used bytes after draining");
+
+    PlatformFree(poolQuads);
+    PlatformFree(poolMeshes);
+    PlatformFree(largeGeometry);
+
     PlatformFree(pixels);
     RendererDestroy(renderer);
 
