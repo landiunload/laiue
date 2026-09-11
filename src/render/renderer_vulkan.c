@@ -13,7 +13,23 @@
 #include "render/texture_pack_internal.h"
 #include "platform/system.h"
 
+// Оконный вывод есть только на Windows: поверхность создаётся через
+// Win32 (hwnd), и расширения инстанса/устройства для него включаются
+// лишь при непустом windowHandle. На остальных платформах windowHandle
+// по-прежнему запрещает создание рендера, а весь Win32-код вырезан.
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#define VK_USE_PLATFORM_WIN32_KHR 1
+#endif
+
 #include <vulkan/vulkan.h>
+
+#if defined(_WIN32)
+#include <vulkan/vulkan_win32.h>
+#endif
 
 #include <stddef.h>
 #include <string.h>
@@ -31,6 +47,10 @@
 void RendererDestroy_Vulkan(Renderer *renderer);
 
 #define FRAME_COUNT 2
+
+// Столько образов swapchain максимум держим наготове. minImageCount с
+// этого GPU — 2, максимум — 8; всё, что выше, движок не поддерживает.
+#define MAX_SWAPCHAIN_IMAGES 8u
 
 // Раскладка дескрипторов повторяет сдвиги регистров HLSL.
 #define BINDING_CONSTANTS 0u
@@ -187,6 +207,14 @@ typedef struct BlockTextureReplacement
     uint32_t layerCount;
 } BlockTextureReplacement;
 
+// Итог вывода готового colorTarget в swapchain.
+typedef enum PresentOutcome
+{
+    PRESENT_OUTCOME_NONE = 0,   // поверхность не используется (offscreen)
+    PRESENT_OUTCOME_PRESENT,    // образ захвачен и записан — нужен present
+    PRESENT_OUTCOME_SKIP,       // swapchain устарел: кадр offscreen, без present
+} PresentOutcome;
+
 struct Renderer
 {
     VkInstance instance;
@@ -287,6 +315,23 @@ struct Renderer
     bool verticalSyncEnabled;
     bool wireframeEnabled;
     bool worldReady;
+
+    // swapchain: вывод уже нарисованного colorTarget в окно. Все поля
+    // добавлены одним блоком в конец структуры, чтобы слияние с правками
+    // пула геометрии было бесконфликтным.
+    bool hasSurface;
+    bool swapchainOutOfDate;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkFormat swapchainFormat;
+    VkExtent2D swapchainExtent;
+    uint32_t swapchainImageCount;
+    uint32_t swapchainImageIndex;
+    uint32_t swapchainRecreateCount;   // счётчик пересозданий (диагностика)
+    VkImage swapchainImages[MAX_SWAPCHAIN_IMAGES];
+    VkImageView swapchainViews[MAX_SWAPCHAIN_IMAGES];
+    VkSemaphore imageAvailable[FRAME_COUNT];
+    VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
 };
 
 // === Мелкие помощники ===
@@ -1402,19 +1447,504 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
 static bool ApplyPendingResize(Renderer *renderer)
 {
     renderer->resizeRequested = false;
+    if (renderer->resizeWidth <= 0 || renderer->resizeHeight <= 0)
+    {
+        // Свёрнутое окно: цели кадра не трогаем, кадры пропускаются, но
+        // при восстановлении размера swapchain надо пересобрать.
+        if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
+        return true;
+    }
     if (renderer->resizeWidth == renderer->windowWidth &&
         renderer->resizeHeight == renderer->windowHeight)
         return true;
 
     WaitForGpu(renderer);
     ReleaseFrameTargets(renderer);
-    return CreateFrameTargets(renderer, renderer->resizeWidth, renderer->resizeHeight);
+    if (!CreateFrameTargets(renderer, renderer->resizeWidth, renderer->resizeHeight))
+        return false;
+    // Размер изменился — swapchain придётся пересобрать целиком.
+    if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
+    return true;
+}
+
+// === Swapchain: вывод готового colorTarget в окно ===
+
+// Сборка без CRT не имеет strcmp, а имена расширений — обычный ASCII.
+static bool NameEquals(const char *left, const char *right)
+{
+    while (*left != '\0' && *left == *right)
+    {
+        ++left;
+        ++right;
+    }
+    return *left == *right;
+}
+
+#if defined(_WIN32)
+// Расширения инстанса проверяются до его создания: драйвер без
+// VK_KHR_win32_surface не сможет принять HWND, и честный отказ лучше
+// падения внутри vkCreateWin32SurfaceKHR.
+static bool InstanceExtensionsAvailable(const char *const *names, uint32_t nameCount)
+{
+    uint32_t count = 0u;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) != VK_SUCCESS || count == 0u)
+        return false;
+    VkExtensionProperties *properties = PlatformAllocate(count * sizeof(*properties), false);
+    if (properties == NULL) return false;
+
+    bool available = false;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &count, properties) == VK_SUCCESS)
+    {
+        available = true;
+        for (uint32_t name = 0; name < nameCount && available; ++name)
+        {
+            bool found = false;
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                if (NameEquals(properties[index].extensionName, names[name]))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) available = false;
+        }
+    }
+    PlatformFree(properties);
+    return available;
+}
+#endif
+
+static bool DeviceExtensionSupported(VkPhysicalDevice device, const char *name)
+{
+    uint32_t count = 0u;
+    if (vkEnumerateDeviceExtensionProperties(device, NULL, &count, NULL) != VK_SUCCESS || count == 0u)
+        return false;
+    VkExtensionProperties *properties = PlatformAllocate(count * sizeof(*properties), false);
+    if (properties == NULL) return false;
+
+    bool found = false;
+    if (vkEnumerateDeviceExtensionProperties(device, NULL, &count, properties) == VK_SUCCESS)
+    {
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            if (NameEquals(properties[index].extensionName, name))
+            {
+                found = true;
+                break;
+            }
+        }
+    }
+    PlatformFree(properties);
+    return found;
+}
+
+// Формат swapchain. Приоритет: точное совпадение с форматом offscreen-цели
+// (тогда достаточно vkCmdCopyImage, без конверсии и перестановки каналов),
+// затем B8G8R8A8_UNORM из задачи (тогда — vkCmdBlitImage), затем любой
+// с sRGB-цветовым пространством, затем первый предложенный.
+static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats, uint32_t count)
+{
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (formats[index].format == COLOR_FORMAT &&
+            formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            return formats[index];
+    }
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (formats[index].format == VK_FORMAT_B8G8R8A8_UNORM &&
+            formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            return formats[index];
+    }
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        if (formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            return formats[index];
+    }
+    return formats[0];
+}
+
+// Present-mode: vsync — FIFO; без vsync — IMMEDIATE, иначе MAILBOX, иначе
+// FIFO (он обязан поддерживаться всегда).
+static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync)
+{
+    if (vsync)
+    {
+        for (uint32_t index = 0; index < count; ++index)
+            if (modes[index] == VK_PRESENT_MODE_FIFO_KHR) return VK_PRESENT_MODE_FIFO_KHR;
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    for (uint32_t index = 0; index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    for (uint32_t index = 0; index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+// Освобождает образы, представления, семафоры и сам swapchain. Вызывать
+// только после WaitForGpu; безопасно на частично построенном состоянии.
+static void DestroySwapchainResources(Renderer *renderer)
+{
+    for (uint32_t index = 0; index < FRAME_COUNT; ++index)
+    {
+        if (renderer->imageAvailable[index] != VK_NULL_HANDLE)
+        {
+            vkDestroySemaphore(renderer->device, renderer->imageAvailable[index], NULL);
+            renderer->imageAvailable[index] = VK_NULL_HANDLE;
+        }
+    }
+    for (uint32_t index = 0; index < MAX_SWAPCHAIN_IMAGES; ++index)
+    {
+        if (renderer->renderFinished[index] != VK_NULL_HANDLE)
+        {
+            vkDestroySemaphore(renderer->device, renderer->renderFinished[index], NULL);
+            renderer->renderFinished[index] = VK_NULL_HANDLE;
+        }
+        if (renderer->swapchainViews[index] != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(renderer->device, renderer->swapchainViews[index], NULL);
+            renderer->swapchainViews[index] = VK_NULL_HANDLE;
+        }
+        renderer->swapchainImages[index] = VK_NULL_HANDLE;
+    }
+    if (renderer->swapchain != VK_NULL_HANDLE)
+    {
+        vkDestroySwapchainKHR(renderer->device, renderer->swapchain, NULL);
+        renderer->swapchain = VK_NULL_HANDLE;
+    }
+    renderer->swapchainImageCount = 0u;
+    renderer->swapchainImageIndex = 0u;
+}
+
+static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
+{
+    if (!renderer->hasSurface || renderer->device == VK_NULL_HANDLE)
+        return false;
+
+    VkSurfaceCapabilitiesKHR capabilities;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(renderer->physicalDevice, renderer->surface,
+                                                  &capabilities) != VK_SUCCESS)
+        return false;
+    if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u)
+        return false;
+
+    VkExtent2D extent;
+    if (capabilities.currentExtent.width != UINT32_MAX &&
+        capabilities.currentExtent.height != UINT32_MAX)
+    {
+        extent = capabilities.currentExtent;
+    }
+    else
+    {
+        uint32_t clampedWidth = width > 0 ? (uint32_t)width : 1u;
+        uint32_t clampedHeight = height > 0 ? (uint32_t)height : 1u;
+        if (clampedWidth < capabilities.minImageExtent.width)
+            clampedWidth = capabilities.minImageExtent.width;
+        if (clampedWidth > capabilities.maxImageExtent.width)
+            clampedWidth = capabilities.maxImageExtent.width;
+        if (clampedHeight < capabilities.minImageExtent.height)
+            clampedHeight = capabilities.minImageExtent.height;
+        if (clampedHeight > capabilities.maxImageExtent.height)
+            clampedHeight = capabilities.maxImageExtent.height;
+        extent.width = clampedWidth;
+        extent.height = clampedHeight;
+    }
+    if (extent.width == 0u || extent.height == 0u) return false;
+
+    uint32_t formatCount = 0u;
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
+                                             NULL) != VK_SUCCESS ||
+        formatCount == 0u)
+        return false;
+    VkSurfaceFormatKHR *formats = PlatformAllocate(formatCount * sizeof(*formats), false);
+    if (formats == NULL) return false;
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
+                                             formats) != VK_SUCCESS)
+    {
+        PlatformFree(formats);
+        return false;
+    }
+    VkSurfaceFormatKHR surfaceFormat = SelectSurfaceFormat(formats, formatCount);
+    PlatformFree(formats);
+
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t modeCount = 0u;
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physicalDevice, renderer->surface,
+                                                  &modeCount, NULL) == VK_SUCCESS &&
+        modeCount > 0u)
+    {
+        VkPresentModeKHR *modes = PlatformAllocate(modeCount * sizeof(*modes), false);
+        if (modes == NULL) return false;
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physicalDevice, renderer->surface,
+                                                      &modeCount, modes) == VK_SUCCESS)
+            presentMode = SelectPresentMode(modes, modeCount, renderer->verticalSyncEnabled);
+        PlatformFree(modes);
+    }
+
+    uint32_t imageCount = capabilities.minImageCount;
+    if (imageCount < 2u) imageCount = 2u;
+    if (capabilities.maxImageCount > 0u && imageCount > capabilities.maxImageCount)
+        imageCount = capabilities.maxImageCount;
+    if (imageCount > MAX_SWAPCHAIN_IMAGES) return false;
+
+    VkCompositeAlphaFlagBitsKHR compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if ((capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) == 0u)
+    {
+        if ((capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) != 0u)
+            compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+        else if ((capabilities.supportedCompositeAlpha &
+                  VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) != 0u)
+            compositeAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+        else
+            compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    }
+
+    VkSwapchainCreateInfoKHR swapchainInfo = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = renderer->surface,
+        .minImageCount = imageCount,
+        .imageFormat = surfaceFormat.format,
+        .imageColorSpace = surfaceFormat.colorSpace,
+        .imageExtent = extent,
+        .imageArrayLayers = 1u,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0u,
+        .pQueueFamilyIndices = NULL,
+        .preTransform = capabilities.currentTransform,
+        .compositeAlpha = compositeAlpha,
+        .presentMode = presentMode,
+        .clipped = VK_TRUE,
+        .oldSwapchain = VK_NULL_HANDLE,
+    };
+
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    if (vkCreateSwapchainKHR(renderer->device, &swapchainInfo, NULL, &swapchain) != VK_SUCCESS)
+        return false;
+
+    uint32_t actualCount = 0u;
+    if (vkGetSwapchainImagesKHR(renderer->device, swapchain, &actualCount, NULL) != VK_SUCCESS ||
+        actualCount == 0u || actualCount > MAX_SWAPCHAIN_IMAGES)
+    {
+        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
+        return false;
+    }
+    VkImage images[MAX_SWAPCHAIN_IMAGES];
+    if (vkGetSwapchainImagesKHR(renderer->device, swapchain, &actualCount, images) != VK_SUCCESS)
+    {
+        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
+        return false;
+    }
+
+    VkImageView views[MAX_SWAPCHAIN_IMAGES];
+    uint32_t viewCount = 0u;
+    VkResult viewResult = VK_SUCCESS;
+    for (; viewCount < actualCount; ++viewCount)
+    {
+        VkImageViewCreateInfo viewInfo = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = images[viewCount],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = surfaceFormat.format,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+        };
+        viewResult = vkCreateImageView(renderer->device, &viewInfo, NULL, &views[viewCount]);
+        if (viewResult != VK_SUCCESS) break;
+    }
+    if (viewCount != actualCount)
+    {
+        for (uint32_t index = 0; index < viewCount; ++index)
+            vkDestroyImageView(renderer->device, views[index], NULL);
+        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
+        return false;
+    }
+
+    VkSemaphore imageAvailable[FRAME_COUNT];
+    VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
+    for (uint32_t index = 0; index < FRAME_COUNT; ++index) imageAvailable[index] = VK_NULL_HANDLE;
+    for (uint32_t index = 0; index < MAX_SWAPCHAIN_IMAGES; ++index)
+        renderFinished[index] = VK_NULL_HANDLE;
+
+    VkSemaphoreCreateInfo semaphoreInfo = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    uint32_t availableCount = 0u;
+    uint32_t finishedCount = 0u;
+    bool semaphoresOk = true;
+    for (; availableCount < FRAME_COUNT; ++availableCount)
+    {
+        if (vkCreateSemaphore(renderer->device, &semaphoreInfo, NULL,
+                              &imageAvailable[availableCount]) != VK_SUCCESS)
+        {
+            semaphoresOk = false;
+            break;
+        }
+    }
+    if (semaphoresOk)
+    {
+        for (; finishedCount < actualCount; ++finishedCount)
+        {
+            if (vkCreateSemaphore(renderer->device, &semaphoreInfo, NULL,
+                                  &renderFinished[finishedCount]) != VK_SUCCESS)
+            {
+                semaphoresOk = false;
+                break;
+            }
+        }
+    }
+    if (!semaphoresOk)
+    {
+        for (uint32_t index = 0; index < availableCount; ++index)
+            vkDestroySemaphore(renderer->device, imageAvailable[index], NULL);
+        for (uint32_t index = 0; index < finishedCount; ++index)
+            vkDestroySemaphore(renderer->device, renderFinished[index], NULL);
+        for (uint32_t index = 0; index < actualCount; ++index)
+            vkDestroyImageView(renderer->device, views[index], NULL);
+        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
+        return false;
+    }
+
+    renderer->swapchain = swapchain;
+    renderer->swapchainFormat = surfaceFormat.format;
+    renderer->swapchainExtent = extent;
+    renderer->swapchainImageCount = actualCount;
+    renderer->swapchainImageIndex = 0u;
+    for (uint32_t index = 0; index < actualCount; ++index)
+    {
+        renderer->swapchainImages[index] = images[index];
+        renderer->swapchainViews[index] = views[index];
+    }
+    for (uint32_t index = 0; index < FRAME_COUNT; ++index)
+        renderer->imageAvailable[index] = imageAvailable[index];
+    for (uint32_t index = 0; index < actualCount; ++index)
+        renderer->renderFinished[index] = renderFinished[index];
+    renderer->swapchainOutOfDate = false;
+    return true;
+}
+
+// Пересобрать swapchain под текущий размер окна и вертикальную
+// синхронизацию. Вызывать до записи кадра: старый swapchain уничтожается
+// только после полного простоя GPU.
+static bool SwapchainRecreate(Renderer *renderer)
+{
+    if (!renderer->hasSurface) return false;
+    WaitForGpu(renderer);
+    DestroySwapchainResources(renderer);
+    if (!SwapchainCreate(renderer, renderer->windowWidth, renderer->windowHeight))
+    {
+        renderer->swapchainOutOfDate = true;
+        return false;
+    }
+    renderer->swapchainRecreateCount++;
+    return true;
+}
+
+// Захват образа и запись копии colorTarget в команду кадра. Кадр уже
+// переведён вызывающим в TRANSFER_SRC_OPTIMAL.
+static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
+        return PRESENT_OUTCOME_NONE;
+
+    uint32_t imageIndex = 0u;
+    VkResult acquire = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
+                                             renderer->imageAvailable[renderer->frameIndex],
+                                             VK_NULL_HANDLE, &imageIndex);
+    if (acquire != VK_SUCCESS)
+    {
+        // OUT_OF_DATE/SUBOPTIMAL — не ошибка кадра: помечаем swapchain
+        // устаревшим, пересоберём в начале следующего кадра.
+        renderer->swapchainOutOfDate = true;
+        return PRESENT_OUTCOME_SKIP;
+    }
+
+    renderer->swapchainImageIndex = imageIndex;
+    VkImage destination = renderer->swapchainImages[imageIndex];
+
+    VkImageMemoryBarrier toTransfer = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0u,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = destination,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toTransfer);
+
+    GpuImage *source = &renderer->colorTargets[renderer->frameIndex];
+    bool sameFormat = renderer->swapchainFormat == COLOR_FORMAT;
+    bool sameExtent = renderer->swapchainExtent.width == source->width &&
+                      renderer->swapchainExtent.height == source->height;
+    if (sameFormat && sameExtent)
+    {
+        VkImageCopy region = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u },
+            .srcOffset = { 0, 0, 0 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u },
+            .dstOffset = { 0, 0, 0 },
+            .extent = { source->width, source->height, 1u },
+        };
+        vkCmdCopyImage(commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
+    }
+    else
+    {
+        // Несовпадение формата/размера: blit конвертирует и при
+        // необходимости масштабирует.
+        VkImageBlit region = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u },
+            .srcOffsets = { { 0, 0, 0 },
+                            { (int32_t)source->width, (int32_t)source->height, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u },
+            .dstOffsets = { { 0, 0, 0 },
+                            { (int32_t)renderer->swapchainExtent.width,
+                              (int32_t)renderer->swapchainExtent.height, 1 } },
+        };
+        vkCmdBlitImage(commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region,
+                       VK_FILTER_NEAREST);
+    }
+
+    VkImageMemoryBarrier toPresent = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = 0u,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = destination,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &toPresent);
+    return PRESENT_OUTCOME_PRESENT;
 }
 
 // === Создание и разрушение ===
 
-static bool CreateDeviceObjects(Renderer *renderer)
+static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 {
+    // Оконная поверхность — единственное, ради чего включаются
+    // платформенные расширения инстанса.
+    const char *instanceExtensions[2];
+    uint32_t instanceExtensionCount = 0u;
+#if defined(_WIN32)
+    if (windowHandle != NULL)
+    {
+        const char *required[2] = { VK_KHR_SURFACE_EXTENSION_NAME,
+                                    VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+        if (!InstanceExtensionsAvailable(required, 2u)) return false;
+        instanceExtensions[instanceExtensionCount++] = required[0];
+        instanceExtensions[instanceExtensionCount++] = required[1];
+    }
+#else
+    (void)windowHandle;
+#endif
+
     VkApplicationInfo applicationInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "laiue",
@@ -1423,8 +1953,25 @@ static bool CreateDeviceObjects(Renderer *renderer)
     VkInstanceCreateInfo instanceInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &applicationInfo,
+        .enabledExtensionCount = instanceExtensionCount,
+        .ppEnabledExtensionNames = instanceExtensions,
     };
     if (vkCreateInstance(&instanceInfo, NULL, &renderer->instance) != VK_SUCCESS) return false;
+
+#if defined(_WIN32)
+    if (windowHandle != NULL)
+    {
+        VkWin32SurfaceCreateInfoKHR surfaceInfo = {
+            .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+            .hinstance = GetModuleHandleW(NULL),
+            .hwnd = (HWND)windowHandle,
+        };
+        if (vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) !=
+            VK_SUCCESS)
+            return false;
+        renderer->hasSurface = true;
+    }
+#endif
 
     uint32_t deviceCount = 0u;
     if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, NULL) != VK_SUCCESS ||
@@ -1457,6 +2004,17 @@ static bool CreateDeviceObjects(Renderer *renderer)
             for (uint32_t family = 0; family < familyCount; ++family)
             {
                 if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) continue;
+                // Отдельную present-очередь не поддерживаем: годится
+                // только та же семья, что умеет показывать в surface.
+                if (renderer->hasSurface)
+                {
+                    VkBool32 presentSupport = VK_FALSE;
+                    if (vkGetPhysicalDeviceSurfaceSupportKHR(devices[index], family,
+                                                             renderer->surface,
+                                                             &presentSupport) != VK_SUCCESS ||
+                        presentSupport != VK_TRUE)
+                        continue;
+                }
                 chosen = devices[index];
                 chosenFamily = family;
                 break;
@@ -1497,11 +2055,22 @@ static bool CreateDeviceObjects(Renderer *renderer)
         .dynamicRendering = VK_TRUE,
         .synchronization2 = VK_TRUE,
     };
+    // VK_KHR_swapchain включается только при наличии поверхности: без неё
+    // offscreen-путь не должен зависеть от оконного расширения.
+    const char *deviceExtensions[1];
+    uint32_t deviceExtensionCount = 0u;
+    if (renderer->hasSurface)
+    {
+        if (!DeviceExtensionSupported(chosen, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return false;
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features13,
         .queueCreateInfoCount = 1u,
         .pQueueCreateInfos = &queueInfo,
+        .enabledExtensionCount = deviceExtensionCount,
+        .ppEnabledExtensionNames = deviceExtensions,
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
@@ -1640,9 +2209,13 @@ static bool CreateSharedSets(Renderer *renderer)
 
 Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
 {
-    // Первый этап Vulkan рисует только offscreen: swapchain и оконная
-    // поверхность появятся вместе с нативным Wayland/X11-бэкендом.
+    // Оконный вывод реализован только на Win32. На прочих платформах
+    // ненулевой windowHandle по-прежнему означает отказ.
+#if !defined(_WIN32)
     if (windowHandle != NULL) return NULL;
+#else
+    (void)windowHandle;
+#endif
 
     Renderer *renderer = PlatformAllocate(sizeof(*renderer), true);
     if (renderer == NULL) return NULL;
@@ -1650,10 +2223,36 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
-    if (!CreateDeviceObjects(renderer) || !CreateDescriptorLayouts(renderer) ||
+    if (!CreateDeviceObjects(renderer, windowHandle) || !CreateDescriptorLayouts(renderer) ||
         !CreateDescriptorPool(renderer) || !CreateFrameBuffers(renderer) ||
-        !CreateFallbackImages(renderer) || !CreateSharedSets(renderer) ||
-        !CreateFrameTargets(renderer, width, height) ||
+        !CreateFallbackImages(renderer) || !CreateSharedSets(renderer))
+    {
+        RendererDestroy_Vulkan(renderer);
+        return NULL;
+    }
+
+    // Размер целей кадра держим равным клиентской области surface, иначе
+    // на Win32 (minImageExtent == maxImageExtent) swapchain не создастся.
+    int32_t initialWidth = width;
+    int32_t initialHeight = height;
+    if (renderer->hasSurface)
+    {
+        VkSurfaceCapabilitiesKHR capabilities;
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(renderer->physicalDevice, renderer->surface,
+                                                      &capabilities) == VK_SUCCESS &&
+            capabilities.currentExtent.width != UINT32_MAX &&
+            capabilities.currentExtent.height != UINT32_MAX &&
+            capabilities.currentExtent.width > 0u && capabilities.currentExtent.height > 0u)
+        {
+            initialWidth = (int32_t)capabilities.currentExtent.width;
+            initialHeight = (int32_t)capabilities.currentExtent.height;
+        }
+    }
+    if (initialWidth <= 0) initialWidth = width > 0 ? width : 1;
+    if (initialHeight <= 0) initialHeight = height > 0 ? height : 1;
+
+    if (!CreateFrameTargets(renderer, initialWidth, initialHeight) ||
+        (renderer->hasSurface && !SwapchainCreate(renderer, initialWidth, initialHeight)) ||
         !CreateResolvePipeline(renderer, &renderer->resolvePipeline) ||
         !CreateUiPipeline(renderer, &renderer->uiPipeline))
     {
@@ -1661,8 +2260,8 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
         return NULL;
     }
 
-    renderer->resizeWidth = width;
-    renderer->resizeHeight = height;
+    renderer->resizeWidth = initialWidth;
+    renderer->resizeHeight = initialHeight;
     return renderer;
 }
 
@@ -1802,8 +2401,11 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             vkDestroySampler(renderer->device, renderer->sampler, NULL);
         if (renderer->commandPool != VK_NULL_HANDLE)
             vkDestroyCommandPool(renderer->device, renderer->commandPool, NULL);
+        DestroySwapchainResources(renderer);
         vkDestroyDevice(renderer->device, NULL);
     }
+    if (renderer->surface != VK_NULL_HANDLE && renderer->instance != VK_NULL_HANDLE)
+        vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
     if (renderer->instance != VK_NULL_HANDLE) vkDestroyInstance(renderer->instance, NULL);
     PlatformFree(renderer);
 }
@@ -2072,7 +2674,19 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     vkWaitForFences(renderer->device, 1u, &renderer->frameFences[renderer->frameIndex], VK_TRUE,
                     UINT64_MAX);
 
+    // Свёрнутое окно (нулевой запрошенный размер): кадр пропускаем без
+    // ошибки, пока размер не восстановят. Для offscreen это недостижимо.
+    if (renderer->hasSurface && (renderer->resizeWidth <= 0 || renderer->resizeHeight <= 0))
+        return false;
+
     if (renderer->resizeRequested && !ApplyPendingResize(renderer)) return false;
+
+    // Resize или смена vsync пометили swapchain устаревшим: пересобираем
+    // его до записи кадра.
+    if (renderer->hasSurface && renderer->swapchainOutOfDate &&
+        !SwapchainRecreate(renderer))
+        return false;
+
     if (renderer->colorTargets[renderer->frameIndex].image == VK_NULL_HANDLE ||
         (frame->passCount != 0u && renderer->depthTarget.image == VK_NULL_HANDLE))
         return false;
@@ -2327,8 +2941,11 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
 
     // Без swapchain «показ» кадра — это перевод цели в состояние, из
     // которого её можно прочитать: именно так кадр проверяется в тестах.
+    // С swapchain цель становится источником копии в образ показа.
     ImageBarrier(commandBuffer, &renderer->colorTargets[renderer->frameIndex],
                  VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    PresentOutcome present = RecordPresent(renderer, commandBuffer);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
     {
@@ -2343,9 +2960,39 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
         .commandBufferCount = 1u,
         .pCommandBuffers = &commandBuffer,
     };
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (present == PRESENT_OUTCOME_PRESENT)
+    {
+        // Копия в swapchain ждёт готовности образа, последующий present —
+        // готовности копии. Семафоры возвращаются кадровым слотом и
+        // индексом образа, поэтому не переиспользуются под живой работой.
+        submitInfo.waitSemaphoreCount = 1u;
+        submitInfo.pWaitSemaphores = &renderer->imageAvailable[renderer->frameIndex];
+        submitInfo.pWaitDstStageMask = &waitStage;
+        submitInfo.signalSemaphoreCount = 1u;
+        submitInfo.pSignalSemaphores = &renderer->renderFinished[renderer->swapchainImageIndex];
+    }
     if (vkQueueSubmit(renderer->queue, 1u, &submitInfo,
                       renderer->frameFences[renderer->frameIndex]) != VK_SUCCESS)
         return false;
+
+    if (present == PRESENT_OUTCOME_PRESENT)
+    {
+        uint32_t imageIndex = renderer->swapchainImageIndex;
+        VkPresentInfoKHR presentInfo = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1u,
+            .pWaitSemaphores = &renderer->renderFinished[imageIndex],
+            .swapchainCount = 1u,
+            .pSwapchains = &renderer->swapchain,
+            .pImageIndices = &imageIndex,
+        };
+        VkResult presentResult = vkQueuePresentKHR(renderer->queue, &presentInfo);
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+            renderer->swapchainOutOfDate = true;
+        else if (presentResult != VK_SUCCESS)
+            return false;
+    }
 
     renderer->lastStats = renderer->currentStats;
     renderer->lastFrameIndex = renderer->frameIndex;
@@ -2375,9 +3022,12 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
 
 void RendererSetVerticalSync_Vulkan(Renderer *renderer, bool enabled)
 {
-    // Без present вертикальная синхронизация ни на что не влияет, но
-    // состояние сохраняется: приложение вправе его читать.
-    if (renderer != NULL) renderer->verticalSyncEnabled = enabled;
+    // Смена режима не трогает GPU немедленно: swapchain помечается
+    // устаревшим и пересобирается в начале следующего кадра. Без present
+    // значение просто сохраняется: приложение вправе его читать.
+    if (renderer == NULL || renderer->verticalSyncEnabled == enabled) return;
+    renderer->verticalSyncEnabled = enabled;
+    if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
 }
 
 bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer *renderer)
@@ -2387,7 +3037,15 @@ bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer *renderer)
 
 void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
 {
-    if (renderer == NULL || width <= 0 || height <= 0) return;
+    if (renderer == NULL) return;
+    if (width <= 0 || height <= 0)
+    {
+        // Нулевой размер — свёрнутое окно: кадры пропускаются до
+        // восстановления. У offscreen-рендера прежнее поведение (отказ).
+        if (!renderer->hasSurface) return;
+        width = 0;
+        height = 0;
+    }
     renderer->resizeWidth = width;
     renderer->resizeHeight = height;
     renderer->resizeRequested = true;
