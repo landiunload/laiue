@@ -40,6 +40,25 @@ typedef enum RendererContentStatus
 // без вершинных и индексных буферов.
 typedef struct RendererMesh RendererMesh;
 
+typedef enum RendererBackendKind
+{
+    RENDERER_BACKEND_AUTO = 0,
+    RENDERER_BACKEND_D3D12 = 1,
+    RENDERER_BACKEND_VULKAN = 2,
+} RendererBackendKind;
+
+// Есть ли этот бэкенд в данной сборке (слинкован ли он вообще).
+LAIUE_RENDER_API bool RendererBackendIsAvailable(RendererBackendKind backend);
+// Как RendererCreate, но с явным выбором бэкенда. RENDERER_BACKEND_AUTO —
+// прежнее поведение (бэкенд по умолчанию для этой сборки). Возвращает
+// NULL, если выбранный бэкенд не слинкован в этот бинарник — проверяй
+// RendererBackendIsAvailable() заранее, если это важно отличить от
+// прочих причин отказа создания.
+LAIUE_RENDER_API Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width,
+                                                      int32_t height, RendererBackendKind backend);
+// Каким бэкендом создан этот Renderer.
+LAIUE_RENDER_API RendererBackendKind RendererGetBackend(const Renderer* renderer);
+
 // Инстанс меша: где оказывается локальный ноль меша, во сколько раз он
 // растянут и как повёрнут.
 //
