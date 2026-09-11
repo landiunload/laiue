@@ -1017,6 +1017,123 @@ static void TestScratchRefusals(void)
     VoxelRigidBodyRelease(&body);
 }
 
+// Полоса переполнения цветного решателя: манифольдов больше, чем цветов,
+// поэтому несколько манифольдов делят одно тело. Парный путь для этой полосы
+// запрещён — он нарушил бы последовательный порядок импульсов. Хеш прибит к
+// эталону без парного пути; если полосу переполнения снова начать решать
+// парами, получается 0x6eb08a9579dc70ba вместо эталона.
+static uint64_t OverflowHashWord(uint64_t hash, uint64_t word)
+{
+    for (uint32_t index = 0u; index < 8u; ++index)
+    {
+        hash = (hash ^ (word & 255u)) * UINT64_C(1099511628211);
+        word >>= 8;
+    }
+    return hash;
+}
+
+static uint64_t OverflowDoubleBits(double value)
+{
+    union
+    {
+        double scalar;
+        uint64_t bits;
+    } representation = {value};
+    return representation.bits;
+}
+
+static void TestColoredOverflowReplay(void)
+{
+    static RigidHarness harness;
+    static VoxelRigidBody bodies[82];
+    // Точная раскладка scratch для 82 тел не влезает в общий harness.
+    static uint8_t scratch[800000];
+    HarnessInit(&harness, false);
+    harness.world.removeFloor = true;
+    for (uint32_t slot = 0u; slot < 82u; ++slot)
+    {
+        VoxelRigidBodyDescription description;
+        DescribeCube(&description, 0.0, 0.0, 2.0);
+        description.friction = 0.5;
+        if (slot == 0u)
+        {
+            description.halfExtent[0] = 10.0;
+            description.halfExtent[1] = 10.0;
+            description.mass = 100.0;
+            description.position[2] = 0.0;
+        }
+        else
+        {
+            uint32_t row = (slot - 1u) / 9u;
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                description.halfExtent[axis] = 0.4;
+            }
+            description.position[0] = (double)((slot - 1u) % 9u) * 2.0 - 8.0;
+            description.position[1] = (double)row * 2.0 - 8.0;
+            description.position[2] = 0.8;
+        }
+        RigidExpect(VoxelRigidBodyInitialize(&bodies[slot], (uint64_t)slot + 1u, &description),
+                    "colored overflow body created");
+    }
+    uint32_t required = VoxelRigidBodyStepScratchBytes(82u);
+    RigidExpect(required != 0u && required <= (uint32_t)sizeof(scratch),
+                "colored overflow scratch fits");
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        harness.settings.gravity[axis] = 0.0;
+    }
+    harness.settings.sleepFrames = 0u;
+
+    VoxelRigidStepOptions options = {0};
+    options.structSize = (uint32_t)sizeof(options);
+    options.solverOrder = VOXEL_RIGID_SOLVER_COLORED;
+    VoxelRigidStepProfile profile = {0};
+    profile.structSize = (uint32_t)sizeof(profile);
+    options.profile = &profile;
+
+    uint64_t hash = UINT64_C(14695981039346656037);
+    uint32_t overflowSeen = 0u;
+    for (uint32_t step = 0u; step < 32u; ++step)
+    {
+        RigidExpect(VoxelRigidBodyStepEx(bodies, 82u, &harness.collision, &harness.settings,
+                                         scratch, (uint32_t)sizeof(scratch), &options),
+                    "colored overflow step executed");
+        if (profile.solverOverflowContacts > overflowSeen)
+        {
+            overflowSeen = profile.solverOverflowContacts;
+        }
+        for (uint32_t slot = 0u; slot < 82u; ++slot)
+        {
+            double position[3];
+            double linear[3];
+            double angular[3];
+            RigidExpect(VoxelRigidBodyLocalPosition(&bodies[slot], position) &&
+                            VoxelRigidBodyLinearVelocity(&bodies[slot], linear) &&
+                            VoxelRigidBodyAngularVelocity(&bodies[slot], angular),
+                        "colored overflow state readable");
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                hash = OverflowHashWord(hash, OverflowDoubleBits(position[axis]));
+                hash = OverflowHashWord(hash, OverflowDoubleBits(linear[axis]));
+                hash = OverflowHashWord(hash, OverflowDoubleBits(angular[axis]));
+            }
+            for (uint32_t component = 0u; component < 4u; ++component)
+            {
+                hash =
+                    OverflowHashWord(hash, OverflowDoubleBits(bodies[slot].orientation[component]));
+            }
+        }
+    }
+    RigidExpect(overflowSeen > 0u, "colored overflow scene actually overflows colors");
+    RigidExpect(hash == UINT64_C(0x493245ececa466b1),
+                "colored overflow stays scalar and replay-stable");
+    for (uint32_t slot = 0u; slot < 82u; ++slot)
+    {
+        VoxelRigidBodyRelease(&bodies[slot]);
+    }
+}
+
 LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
 {
     TestDescriptionRefusals();
@@ -1041,6 +1158,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestContactIslandSleepsTogether();
     TestRotatedBroadphaseExtent();
     TestGridCellBoundaryCandidate();
+    TestColoredOverflowReplay();
     TestExactScratchLayout();
     TestScratchRefusals();
 
