@@ -6,6 +6,23 @@
 #include <float.h>
 #include <string.h>
 
+// Парный решатель: два независимых контакта одной полосы раскраски решаются
+// одной 128-битной командой. SSE2 и NEON выполняют точные IEEE-операции над
+// binary64, поэтому полоса повторяет скалярную последовательность шаг в шаг.
+// FMA нигде не используется: слияние умножения-сложения меняло бы биты.
+#if defined(_M_ARM64) || defined(__aarch64__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
+#include <arm_neon.h>
+#endif
+#define LAIUE_RIGID_PAIRED_NEON 1
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||           \
+    defined(__i386__)
+#include <emmintrin.h>
+#define LAIUE_RIGID_PAIRED_SSE2 1
+#endif
+
 // Скорость сближения, ниже которой отскок не применяется. Без порога тело
 // на опоре вечно подпрыгивает на численном шуме.
 #define RIGID_RESTITUTION_THRESHOLD 1.0
@@ -4140,12 +4157,584 @@ static void SolveContact(RigidStepScratch *scratch, uint32_t index)
     contact->tangentImpulse[1] = secondImpulse;
 }
 
+// === Парный решатель (SSE2 / NEON) ===
+//
+// Контакты одной полосы раскраски попарно не делят тел, поэтому два контакта
+// можно решать одной 128-битной командой: полоса 0 — один контакт, полоса 1 —
+// другой. Каждая полоса выполняет ту же последовательность операций над теми
+// же операндами, что и скалярный SolveContact, а SSE2/NEON дают корректно
+// округлённые поэлементные операции над binary64 (без FMA), поэтому результат
+// побитово совпадает. Тела собираются в полосы на входе и раскладываются
+// обратно на выходе.
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+
+#if defined(LAIUE_RIGID_PAIRED_NEON)
+typedef float64x2_t LaiuePairVector;
+typedef uint64x2_t LaiuePairMask;
+
+static inline LaiuePairVector LaiuePairSet(double low, double high)
+{
+    float64x2_t value = vdupq_n_f64(0.0);
+    value = vsetq_lane_f64(low, value, 0);
+    value = vsetq_lane_f64(high, value, 1);
+    return value;
+}
+
+static inline double LaiuePairLow(LaiuePairVector value)
+{
+    return vgetq_lane_f64(value, 0);
+}
+
+static inline double LaiuePairHigh(LaiuePairVector value)
+{
+    return vgetq_lane_f64(value, 1);
+}
+
+static inline LaiuePairVector LaiuePairSplat(double value)
+{
+    return vdupq_n_f64(value);
+}
+
+static inline LaiuePairVector LaiuePairAdd(LaiuePairVector left, LaiuePairVector right)
+{
+    return vaddq_f64(left, right);
+}
+
+static inline LaiuePairVector LaiuePairSub(LaiuePairVector left, LaiuePairVector right)
+{
+    return vsubq_f64(left, right);
+}
+
+static inline LaiuePairVector LaiuePairMul(LaiuePairVector left, LaiuePairVector right)
+{
+    return vmulq_f64(left, right);
+}
+
+static inline LaiuePairVector LaiuePairDiv(LaiuePairVector left, LaiuePairVector right)
+{
+    return vdivq_f64(left, right);
+}
+
+static inline LaiuePairVector LaiuePairNeg(LaiuePairVector value)
+{
+    return vnegq_f64(value);
+}
+
+static inline LaiuePairVector LaiuePairAbs(LaiuePairVector value)
+{
+    return vabsq_f64(value);
+}
+
+static inline LaiuePairVector LaiuePairSqrt(LaiuePairVector value)
+{
+    return vsqrtq_f64(value);
+}
+
+static inline LaiuePairVector LaiuePairInfinity(void)
+{
+    return vreinterpretq_f64_u64(vdupq_n_u64(UINT64_C(0x7ff0000000000000)));
+}
+
+static inline LaiuePairMask LaiuePairLess(LaiuePairVector left, LaiuePairVector right)
+{
+    return vcltq_f64(left, right);
+}
+
+static inline LaiuePairMask LaiuePairGreater(LaiuePairVector left, LaiuePairVector right)
+{
+    return vcgtq_f64(left, right);
+}
+
+static inline LaiuePairMask LaiuePairNotEqual(LaiuePairVector left, LaiuePairVector right)
+{
+    return vbicq_u64(vdupq_n_u64(~UINT64_C(0)), vceqq_f64(left, right));
+}
+
+static inline LaiuePairMask LaiuePairMaskAnd(LaiuePairMask left, LaiuePairMask right)
+{
+    return vandq_u64(left, right);
+}
+
+static inline LaiuePairVector LaiuePairSelect(LaiuePairMask mask, LaiuePairVector yes,
+                                              LaiuePairVector no)
+{
+    return vbslq_f64(mask, yes, no);
+}
+
+static inline LaiuePairMask LaiuePairMaskFromBools(bool low, bool high)
+{
+    uint64x2_t value = vdupq_n_u64(0u);
+    value = vsetq_lane_u64(low ? ~UINT64_C(0) : UINT64_C(0), value, 0);
+    value = vsetq_lane_u64(high ? ~UINT64_C(0) : UINT64_C(0), value, 1);
+    return value;
+}
+#else
+typedef __m128d LaiuePairVector;
+typedef __m128d LaiuePairMask;
+
+static inline LaiuePairVector LaiuePairSet(double low, double high)
+{
+    return _mm_setr_pd(low, high);
+}
+
+static inline double LaiuePairLow(LaiuePairVector value)
+{
+    return _mm_cvtsd_f64(value);
+}
+
+static inline double LaiuePairHigh(LaiuePairVector value)
+{
+    return _mm_cvtsd_f64(_mm_unpackhi_pd(value, value));
+}
+
+static inline LaiuePairVector LaiuePairSplat(double value)
+{
+    return _mm_set1_pd(value);
+}
+
+static inline LaiuePairVector LaiuePairAdd(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_add_pd(left, right);
+}
+
+static inline LaiuePairVector LaiuePairSub(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_sub_pd(left, right);
+}
+
+static inline LaiuePairVector LaiuePairMul(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_mul_pd(left, right);
+}
+
+static inline LaiuePairVector LaiuePairDiv(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_div_pd(left, right);
+}
+
+static inline LaiuePairVector LaiuePairNeg(LaiuePairVector value)
+{
+    return _mm_xor_pd(value, _mm_castsi128_pd(_mm_set1_epi64x((long long)0x8000000000000000LL)));
+}
+
+static inline LaiuePairVector LaiuePairAbs(LaiuePairVector value)
+{
+    return _mm_and_pd(value, _mm_castsi128_pd(_mm_set1_epi64x(0x7fffffffffffffffLL)));
+}
+
+static inline LaiuePairVector LaiuePairSqrt(LaiuePairVector value)
+{
+    return _mm_sqrt_pd(value);
+}
+
+static inline LaiuePairVector LaiuePairInfinity(void)
+{
+    return _mm_castsi128_pd(_mm_set1_epi64x((long long)0x7ff0000000000000LL));
+}
+
+static inline LaiuePairMask LaiuePairLess(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_cmplt_pd(left, right);
+}
+
+static inline LaiuePairMask LaiuePairGreater(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_cmpgt_pd(left, right);
+}
+
+static inline LaiuePairMask LaiuePairNotEqual(LaiuePairVector left, LaiuePairVector right)
+{
+    return _mm_cmpneq_pd(left, right);
+}
+
+static inline LaiuePairMask LaiuePairMaskAnd(LaiuePairMask left, LaiuePairMask right)
+{
+    return _mm_and_pd(left, right);
+}
+
+static inline LaiuePairVector LaiuePairSelect(LaiuePairMask mask, LaiuePairVector yes,
+                                              LaiuePairVector no)
+{
+    return _mm_or_pd(_mm_and_pd(mask, yes), _mm_andnot_pd(mask, no));
+}
+
+static inline LaiuePairMask LaiuePairMaskFromBools(bool low, bool high)
+{
+    return _mm_castsi128_pd(_mm_set_epi64x(high ? -1LL : 0LL, low ? -1LL : 0LL));
+}
+#endif
+
+static inline LaiuePairVector LaiuePairDot3(const LaiuePairVector left[3],
+                                            const LaiuePairVector right[3])
+{
+    return LaiuePairAdd(
+        LaiuePairAdd(LaiuePairMul(left[0], right[0]), LaiuePairMul(left[1], right[1])),
+        LaiuePairMul(left[2], right[2]));
+}
+
+static inline void LaiuePairCross3(const LaiuePairVector left[3], const LaiuePairVector right[3],
+                                   LaiuePairVector out[3])
+{
+    out[0] = LaiuePairSub(LaiuePairMul(left[1], right[2]), LaiuePairMul(left[2], right[1]));
+    out[1] = LaiuePairSub(LaiuePairMul(left[2], right[0]), LaiuePairMul(left[0], right[2]));
+    out[2] = LaiuePairSub(LaiuePairMul(left[0], right[1]), LaiuePairMul(left[1], right[0]));
+}
+
+// IsFiniteDouble без ветвления: |value| < +inf.
+static inline LaiuePairMask LaiuePairFinite(LaiuePairVector value)
+{
+    return LaiuePairLess(LaiuePairAbs(value), LaiuePairInfinity());
+}
+
+// Применение одного ряда импульса к одному концу. Порядок
+// (direction * magnitude) * inverseMass и angularResponse * magnitude
+// повторяет скалярный ApplyPreparedImpulse; выключенные полосы получают
+// прежнее значение выбором, а не добавлением нуля (ноль может сменить знак -0).
+static inline void LaiuePairApplyRow(LaiuePairVector linear[3], LaiuePairVector angular[3],
+                                     LaiuePairVector inverseMass,
+                                     const LaiuePairVector direction[3],
+                                     const LaiuePairVector response[3], LaiuePairVector magnitude,
+                                     LaiuePairMask apply)
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        LaiuePairVector linearIncrement =
+            LaiuePairMul(LaiuePairMul(direction[axis], magnitude), inverseMass);
+        linear[axis] =
+            LaiuePairSelect(apply, LaiuePairAdd(linear[axis], linearIncrement), linear[axis]);
+        LaiuePairVector angularIncrement = LaiuePairMul(response[axis], magnitude);
+        angular[axis] =
+            LaiuePairSelect(apply, LaiuePairAdd(angular[axis], angularIncrement), angular[axis]);
+    }
+}
+
+static inline void LaiuePairLoadRow(const RigidSolverContact *first,
+                                    const RigidSolverContact *second, uint32_t direction,
+                                    LaiuePairVector outDirection[3],
+                                    LaiuePairVector outResponse0[3],
+                                    LaiuePairVector outResponse1[3])
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outDirection[axis] = LaiuePairSet(first->rows[direction].direction[axis],
+                                          second->rows[direction].direction[axis]);
+        outResponse0[axis] = LaiuePairSet(first->rows[direction].angularResponse[0][axis],
+                                          second->rows[direction].angularResponse[0][axis]);
+        outResponse1[axis] = LaiuePairSet(first->rows[direction].angularResponse[1][axis],
+                                          second->rows[direction].angularResponse[1][axis]);
+    }
+}
+
+// Скорости двух концов, собранные в полосы, раскладываются обратно в кэши тел.
+// Контакт с миром второй конец не пишет.
+static inline void LaiuePairScatter(RigidBodyCache *firstCache0, RigidBodyCache *secondCache0,
+                                    RigidBodyCache *firstCache1, RigidBodyCache *secondCache1,
+                                    bool firstPaired, bool secondPaired,
+                                    const LaiuePairVector linear0[3],
+                                    const LaiuePairVector angular0[3],
+                                    const LaiuePairVector linear1[3],
+                                    const LaiuePairVector angular1[3])
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        firstCache0->linear[axis] = LaiuePairLow(linear0[axis]);
+        secondCache0->linear[axis] = LaiuePairHigh(linear0[axis]);
+        firstCache0->angular[axis] = LaiuePairLow(angular0[axis]);
+        secondCache0->angular[axis] = LaiuePairHigh(angular0[axis]);
+        if (firstPaired)
+        {
+            firstCache1->linear[axis] = LaiuePairLow(linear1[axis]);
+            firstCache1->angular[axis] = LaiuePairLow(angular1[axis]);
+        }
+        if (secondPaired)
+        {
+            secondCache1->linear[axis] = LaiuePairHigh(linear1[axis]);
+            secondCache1->angular[axis] = LaiuePairHigh(angular1[axis]);
+        }
+    }
+}
+
+#endif // LAIUE_RIGID_PAIRED_SSE2 || LAIUE_RIGID_PAIRED_NEON
+
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+// Состояние пары между нормальным импульсом и трением. Трение вынесено в
+// отдельную функцию не ради структуры, а ради стека: в сборке без CRT кадр
+// функции ограничен 4 КиБ, а в Debug каждый промежуточный вектор получает
+// свой слот, и целиком SolveContactPair в предел не влезала.
+typedef struct LaiuePairFrictionState
+{
+    // Векторы первыми: у них выравнивание 16, и после девяти указателей
+    // компилятор вставил бы зазор (это ошибка C4324 при /WX). Хвост
+    // добивается явно, чтобы размер остался кратен 16 без скрытого зазора.
+    LaiuePairVector inverseMass0;
+    LaiuePairVector inverseMass1;
+    LaiuePairVector friction;
+    LaiuePairVector accumulated;
+    LaiuePairVector previousNormal;
+    LaiuePairMask hasFriction;
+    LaiuePairMask paired;
+    RigidSolverContact *first;
+    RigidSolverContact *second;
+    LaiuePairVector *linear0;
+    LaiuePairVector *angular0;
+    LaiuePairVector *linear1;
+    LaiuePairVector *angular1;
+    const LaiuePairVector *lever0;
+    const LaiuePairVector *lever1;
+    LaiuePairVector *velocity;
+    uint64_t alignmentPadding;
+} LaiuePairFrictionState;
+
+static void SolveContactPairFriction(const LaiuePairFrictionState *state)
+{
+    RigidSolverContact *first = state->first;
+    RigidSolverContact *second = state->second;
+    LaiuePairVector *linear0 = state->linear0;
+    LaiuePairVector *angular0 = state->angular0;
+    LaiuePairVector *linear1 = state->linear1;
+    LaiuePairVector *angular1 = state->angular1;
+    const LaiuePairVector *lever0 = state->lever0;
+    const LaiuePairVector *lever1 = state->lever1;
+    LaiuePairVector *velocity = state->velocity;
+    const LaiuePairVector inverseMass0 = state->inverseMass0;
+    const LaiuePairVector inverseMass1 = state->inverseMass1;
+    const LaiuePairVector friction = state->friction;
+    const LaiuePairVector accumulated = state->accumulated;
+    const LaiuePairVector previousNormal = state->previousNormal;
+    const LaiuePairMask hasFriction = state->hasFriction;
+    const LaiuePairMask paired = state->paired;
+    const LaiuePairVector zero = LaiuePairSplat(0.0);
+
+    // Трение: скорость пересчитывается там, где нормальный импульс её изменил.
+    {
+        LaiuePairVector rotational0[3];
+        LaiuePairVector rotational1[3];
+        LaiuePairCross3(angular0, lever0, rotational0);
+        LaiuePairCross3(angular1, lever1, rotational1);
+        const LaiuePairMask recompute =
+            LaiuePairMaskAnd(hasFriction, LaiuePairNotEqual(accumulated, previousNormal));
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            LaiuePairVector relative = LaiuePairAdd(linear0[axis], rotational0[axis]);
+            LaiuePairVector other = LaiuePairAdd(linear1[axis], rotational1[axis]);
+            LaiuePairVector updated =
+                LaiuePairSelect(paired, LaiuePairSub(relative, other), relative);
+            velocity[axis] = LaiuePairSelect(recompute, updated, velocity[axis]);
+        }
+    }
+
+    LaiuePairVector firstDirection[3];
+    LaiuePairVector firstResponse0[3];
+    LaiuePairVector firstResponse1[3];
+    LaiuePairLoadRow(first, second, 1u, firstDirection, firstResponse0, firstResponse1);
+    LaiuePairVector secondDirection[3];
+    LaiuePairVector secondResponse0[3];
+    LaiuePairVector secondResponse1[3];
+    LaiuePairLoadRow(first, second, 2u, secondDirection, secondResponse0, secondResponse1);
+
+    const LaiuePairVector firstSpeed = LaiuePairDot3(velocity, firstDirection);
+    const LaiuePairVector secondSpeed = LaiuePairDot3(velocity, secondDirection);
+    const LaiuePairVector firstMass =
+        LaiuePairSet(first->rows[1].inverseEffectiveMass, second->rows[1].inverseEffectiveMass);
+    const LaiuePairVector secondMass =
+        LaiuePairSet(first->rows[2].inverseEffectiveMass, second->rows[2].inverseEffectiveMass);
+    const LaiuePairVector crossMass =
+        LaiuePairSet(first->tangentCrossMass, second->tangentCrossMass);
+    const LaiuePairVector previousFirst =
+        LaiuePairSet(first->tangentImpulse[0], second->tangentImpulse[0]);
+    const LaiuePairVector previousSecond =
+        LaiuePairSet(first->tangentImpulse[1], second->tangentImpulse[1]);
+    LaiuePairVector firstImpulse =
+        LaiuePairSub(LaiuePairSub(previousFirst, LaiuePairMul(firstMass, firstSpeed)),
+                     LaiuePairMul(crossMass, secondSpeed));
+    LaiuePairVector secondImpulse =
+        LaiuePairSub(LaiuePairSub(previousSecond, LaiuePairMul(crossMass, firstSpeed)),
+                     LaiuePairMul(secondMass, secondSpeed));
+
+    // Проекция суммарного импульса на диск Кулона. Масштабирование делается до
+    // возведения в квадрат: только ветвь с наибольшим по модулю импульсом.
+    const LaiuePairVector limit = LaiuePairMul(friction, accumulated);
+    const LaiuePairVector absoluteFirst = LaiuePairAbs(firstImpulse);
+    const LaiuePairVector absoluteSecond = LaiuePairAbs(secondImpulse);
+    const LaiuePairVector largest = LaiuePairSelect(LaiuePairGreater(absoluteSecond, absoluteFirst),
+                                                    absoluteSecond, absoluteFirst);
+    const LaiuePairMask scaleGuard =
+        LaiuePairMaskAnd(LaiuePairGreater(largest, zero),
+                         LaiuePairLess(limit, LaiuePairMul(largest, LaiuePairSplat(2.0))));
+    const LaiuePairVector scaledFirst = LaiuePairDiv(firstImpulse, largest);
+    const LaiuePairVector scaledSecond = LaiuePairDiv(secondImpulse, largest);
+    const LaiuePairVector scaledLimit = LaiuePairDiv(limit, largest);
+    const LaiuePairVector lengthSquared = LaiuePairAdd(LaiuePairMul(scaledFirst, scaledFirst),
+                                                       LaiuePairMul(scaledSecond, scaledSecond));
+    const LaiuePairMask scaleMask = LaiuePairMaskAnd(
+        scaleGuard, LaiuePairGreater(lengthSquared, LaiuePairMul(scaledLimit, scaledLimit)));
+    const LaiuePairVector scale = LaiuePairDiv(scaledLimit, LaiuePairSqrt(lengthSquared));
+    firstImpulse = LaiuePairSelect(scaleMask, LaiuePairMul(firstImpulse, scale), firstImpulse);
+    secondImpulse = LaiuePairSelect(scaleMask, LaiuePairMul(secondImpulse, scale), secondImpulse);
+
+    const LaiuePairVector firstDelta = LaiuePairSub(firstImpulse, previousFirst);
+    const LaiuePairVector secondDelta = LaiuePairSub(secondImpulse, previousSecond);
+    const LaiuePairMask firstApply =
+        LaiuePairMaskAnd(hasFriction, LaiuePairMaskAnd(LaiuePairNotEqual(firstDelta, zero),
+                                                       LaiuePairFinite(firstDelta)));
+    const LaiuePairMask secondApply =
+        LaiuePairMaskAnd(hasFriction, LaiuePairMaskAnd(LaiuePairNotEqual(secondDelta, zero),
+                                                       LaiuePairFinite(secondDelta)));
+    LaiuePairApplyRow(linear0, angular0, inverseMass0, firstDirection, firstResponse0, firstDelta,
+                      firstApply);
+    LaiuePairApplyRow(linear1, angular1, inverseMass1, firstDirection, firstResponse1,
+                      LaiuePairNeg(firstDelta), LaiuePairMaskAnd(firstApply, paired));
+    LaiuePairApplyRow(linear0, angular0, inverseMass0, secondDirection, secondResponse0,
+                      secondDelta, secondApply);
+    LaiuePairApplyRow(linear1, angular1, inverseMass1, secondDirection, secondResponse1,
+                      LaiuePairNeg(secondDelta), LaiuePairMaskAnd(secondApply, paired));
+
+    first->tangentImpulse[0] =
+        LaiuePairLow(LaiuePairSelect(hasFriction, firstImpulse, previousFirst));
+    second->tangentImpulse[0] =
+        LaiuePairHigh(LaiuePairSelect(hasFriction, firstImpulse, previousFirst));
+    first->tangentImpulse[1] =
+        LaiuePairLow(LaiuePairSelect(hasFriction, secondImpulse, previousSecond));
+    second->tangentImpulse[1] =
+        LaiuePairHigh(LaiuePairSelect(hasFriction, secondImpulse, previousSecond));
+
+}
+#endif
+
+static void SolveContactPair(RigidStepScratch *scratch, uint32_t firstIndex, uint32_t secondIndex)
+{
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+    RigidSolverContact *first = &scratch->solverContacts[firstIndex];
+    RigidSolverContact *second = &scratch->solverContacts[secondIndex];
+    if (!(first->rows[0].inverseEffectiveMass > 0.0) ||
+        !(second->rows[0].inverseEffectiveMass > 0.0))
+    {
+        SolveContact(scratch, firstIndex);
+        SolveContact(scratch, secondIndex);
+        return;
+    }
+
+    const bool firstPaired = first->otherIndex != UINT32_MAX;
+    const bool secondPaired = second->otherIndex != UINT32_MAX;
+    RigidBodyCache *firstCache0 = &scratch->caches[first->bodyIndex];
+    RigidBodyCache *secondCache0 = &scratch->caches[second->bodyIndex];
+    RigidBodyCache *firstCache1 = firstPaired ? &scratch->caches[first->otherIndex] : firstCache0;
+    RigidBodyCache *secondCache1 =
+        secondPaired ? &scratch->caches[second->otherIndex] : secondCache0;
+
+    const LaiuePairVector zero = LaiuePairSplat(0.0);
+    const LaiuePairMask paired = LaiuePairMaskFromBools(firstPaired, secondPaired);
+
+    LaiuePairVector linear0[3];
+    LaiuePairVector angular0[3];
+    LaiuePairVector linear1[3];
+    LaiuePairVector angular1[3];
+    LaiuePairVector lever0[3];
+    LaiuePairVector lever1[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        linear0[axis] = LaiuePairSet(firstCache0->linear[axis], secondCache0->linear[axis]);
+        angular0[axis] = LaiuePairSet(firstCache0->angular[axis], secondCache0->angular[axis]);
+        linear1[axis] = LaiuePairSet(firstCache1->linear[axis], secondCache1->linear[axis]);
+        angular1[axis] = LaiuePairSet(firstCache1->angular[axis], secondCache1->angular[axis]);
+        lever0[axis] = LaiuePairSet(first->lever[0][axis], second->lever[0][axis]);
+        lever1[axis] = LaiuePairSet(first->lever[1][axis], second->lever[1][axis]);
+    }
+    const LaiuePairVector inverseMass0 =
+        LaiuePairSet(firstCache0->inverseMass, secondCache0->inverseMass);
+    const LaiuePairVector inverseMass1 =
+        LaiuePairSet(firstCache1->inverseMass, secondCache1->inverseMass);
+    const LaiuePairVector friction = LaiuePairSet(first->friction, second->friction);
+    const LaiuePairMask hasFriction = LaiuePairGreater(friction, zero);
+
+    // Относительная скорость: конец 0 минус конец 1 там, где второй существует.
+    LaiuePairVector velocity[3];
+    {
+        LaiuePairVector rotational0[3];
+        LaiuePairVector rotational1[3];
+        LaiuePairCross3(angular0, lever0, rotational0);
+        LaiuePairCross3(angular1, lever1, rotational1);
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            LaiuePairVector relative = LaiuePairAdd(linear0[axis], rotational0[axis]);
+            LaiuePairVector other = LaiuePairAdd(linear1[axis], rotational1[axis]);
+            velocity[axis] = LaiuePairSelect(paired, LaiuePairSub(relative, other), relative);
+        }
+    }
+
+    // Нормальный импульс.
+    LaiuePairVector direction[3];
+    LaiuePairVector response0[3];
+    LaiuePairVector response1[3];
+    LaiuePairLoadRow(first, second, 0u, direction, response0, response1);
+    const LaiuePairVector normalMass =
+        LaiuePairSet(first->rows[0].inverseEffectiveMass, second->rows[0].inverseEffectiveMass);
+    const LaiuePairVector target =
+        LaiuePairSet(first->targetNormalSpeed, second->targetNormalSpeed);
+    const LaiuePairVector normalSpeed = LaiuePairDot3(velocity, direction);
+    const LaiuePairVector previousNormal =
+        LaiuePairSet(first->normalImpulse, second->normalImpulse);
+    LaiuePairVector accumulated =
+        LaiuePairAdd(previousNormal, LaiuePairMul(LaiuePairSub(target, normalSpeed), normalMass));
+    accumulated = LaiuePairSelect(LaiuePairLess(accumulated, zero), zero, accumulated);
+    first->normalImpulse = LaiuePairLow(accumulated);
+    second->normalImpulse = LaiuePairHigh(accumulated);
+    const LaiuePairVector normalDelta = LaiuePairSub(accumulated, previousNormal);
+    const LaiuePairMask normalApply =
+        LaiuePairMaskAnd(LaiuePairNotEqual(normalDelta, zero), LaiuePairFinite(normalDelta));
+    LaiuePairApplyRow(linear0, angular0, inverseMass0, direction, response0, normalDelta,
+                      normalApply);
+    LaiuePairApplyRow(linear1, angular1, inverseMass1, direction, response1,
+                      LaiuePairNeg(normalDelta), LaiuePairMaskAnd(normalApply, paired));
+
+    if (!(first->friction > 0.0) && !(second->friction > 0.0))
+    {
+        LaiuePairScatter(firstCache0, secondCache0, firstCache1, secondCache1, firstPaired,
+                         secondPaired, linear0, angular0, linear1, angular1);
+        return;
+    }
+
+    {
+        LaiuePairFrictionState state;
+        state.first = first;
+        state.second = second;
+        state.linear0 = linear0;
+        state.angular0 = angular0;
+        state.linear1 = linear1;
+        state.angular1 = angular1;
+        state.lever0 = lever0;
+        state.lever1 = lever1;
+        state.velocity = velocity;
+        state.inverseMass0 = inverseMass0;
+        state.inverseMass1 = inverseMass1;
+        state.friction = friction;
+        state.accumulated = accumulated;
+        state.previousNormal = previousNormal;
+        state.hasFriction = hasFriction;
+        state.paired = paired;
+        state.alignmentPadding = 0u;
+        SolveContactPairFriction(&state);
+    }
+
+    LaiuePairScatter(firstCache0, secondCache0, firstCache1, secondCache1, firstPaired,
+                     secondPaired, linear0, angular0, linear1, angular1);
+#else
+    // Архитектура без парного пути: обе ветви остаются скалярными.
+    SolveContact(scratch, firstIndex);
+    SolveContact(scratch, secondIndex);
+#endif
+}
+
 typedef struct RigidJobContext
 {
     const VoxelRigidBody *bodies;
     RigidStepScratch *scratch;
     const VoxelRigidStepSettings *settings;
     uint32_t offset;
+    // Полосы цветного решателя не делят тел, поэтому их можно решать парами.
+    // Полоса переполнения (больше цветов, чем помещается) остаётся скалярной:
+    // её манифольды могут делить тела, и парный путь нарушил бы порядок.
+    bool pairedRuns;
 } RigidJobContext;
 
 static void PrepareContactRange(void *context, uint32_t begin, uint32_t end)
@@ -4232,11 +4821,127 @@ static void BuildSolverBatches(RigidStepScratch *scratch)
     }
 }
 
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+
+// Точка раздела полосы раскраски: граница между манифольдами (runs), ближайшая
+// к половине контактов. Левая и правая половины состоят из разных манифольдов,
+// а любые два манифольда одной полосы не делят тел, поэтому контакты разных
+// половин независимы и решаются парами. Порядок внутри манифольда сохраняется.
+static uint32_t SolvePairSplit(const RigidStepScratch *scratch, uint32_t offset, uint32_t begin,
+                               uint32_t end)
+{
+    uint32_t total = 0u;
+    for (uint32_t run = begin; run < end; ++run)
+    {
+        uint32_t first = scratch->solveOrder[offset + run];
+        total += ContactRunEnd(scratch, first) - first;
+    }
+    if (total < 2u)
+        return end;
+    uint32_t target = (total + 1u) / 2u;
+    uint32_t prefix = 0u;
+    for (uint32_t run = begin + 1u; run < end; ++run)
+    {
+        uint32_t previous = scratch->solveOrder[offset + run - 1u];
+        prefix += ContactRunEnd(scratch, previous) - previous;
+        if (prefix >= target)
+            return run;
+    }
+    return end - 1u;
+}
+
+// Курсор по контактам одной половины: перебирает контакты манифольд за
+// манифольдом в исходном порядке.
+typedef struct RigidSolverCursor
+{
+    const RigidStepScratch *scratch;
+    uint32_t offset;
+    uint32_t run;
+    uint32_t limit;
+    uint32_t index;
+    uint32_t last;
+} RigidSolverCursor;
+
+static void SolverCursorBegin(RigidSolverCursor *cursor, const RigidStepScratch *scratch,
+                              uint32_t offset, uint32_t run, uint32_t limit)
+{
+    cursor->scratch = scratch;
+    cursor->offset = offset;
+    cursor->run = run;
+    cursor->limit = limit;
+    cursor->index = 0u;
+    cursor->last = 0u;
+    if (run < limit)
+    {
+        cursor->index = scratch->solveOrder[offset + run];
+        cursor->last = ContactRunEnd(scratch, cursor->index);
+    }
+}
+
+static bool SolverCursorValid(const RigidSolverCursor *cursor)
+{
+    return cursor->run < cursor->limit;
+}
+
+static void SolverCursorAdvance(RigidSolverCursor *cursor)
+{
+    if (++cursor->index < cursor->last)
+        return;
+    uint32_t run = cursor->run + 1u;
+    while (run < cursor->limit)
+    {
+        uint32_t index = cursor->scratch->solveOrder[cursor->offset + run];
+        uint32_t last = ContactRunEnd(cursor->scratch, index);
+        if (index < last)
+        {
+            cursor->run = run;
+            cursor->index = index;
+            cursor->last = last;
+            return;
+        }
+        ++run;
+    }
+    cursor->run = cursor->limit;
+    cursor->index = 0u;
+    cursor->last = 0u;
+}
+
+#endif // LAIUE_RIGID_PAIRED_SSE2 || LAIUE_RIGID_PAIRED_NEON
+
 static void SolveBatchRange(void *context, uint32_t begin, uint32_t end)
 {
     RigidJobContext *job = (RigidJobContext *)context;
     RigidStepScratch *scratch = job->scratch;
     VoxelPhysicsConfigureThread();
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+    if (job->pairedRuns)
+    {
+        const uint32_t split = SolvePairSplit(scratch, job->offset, begin, end);
+        RigidSolverCursor left;
+        RigidSolverCursor right;
+        SolverCursorBegin(&left, scratch, job->offset, begin, split);
+        SolverCursorBegin(&right, scratch, job->offset, split, end);
+        while (SolverCursorValid(&left) && SolverCursorValid(&right))
+        {
+            SolveContactPair(scratch, left.index, right.index);
+            SolverCursorAdvance(&left);
+            SolverCursorAdvance(&right);
+        }
+        while (SolverCursorValid(&left))
+        {
+            SolveContact(scratch, left.index);
+            SolverCursorAdvance(&left);
+        }
+        while (SolverCursorValid(&right))
+        {
+            SolveContact(scratch, right.index);
+            SolverCursorAdvance(&right);
+        }
+        return;
+    }
+#endif
+    // Полоса переполнения и архитектуры без парного пути решаются скалярно
+    // в исходном порядке контактов.
     for (uint32_t run = begin; run < end; ++run)
     {
         uint32_t first = scratch->solveOrder[job->offset + run];
@@ -4250,7 +4955,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
                           const VoxelRigidStepSettings *settings,
                           VoxelRigidContactCache *contactCache)
 {
-    RigidJobContext job = {bodies, scratch, settings, 0u};
+    RigidJobContext job = {bodies, scratch, settings, 0u, false};
     double begin = ProfileNow(scratch);
     ExecuteRange(scratch, scratch->contactCount, 32u, PrepareContactRange, &job);
     ProfileFinish(scratch, VOXEL_RIGID_PROFILE_PREPARE, begin);
@@ -4284,6 +4989,7 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
             uint32_t count = scratch->batchOffsets[color + 1u] - job.offset;
             if (count == 0u)
                 continue;
+            job.pairedRuns = color != RIGID_SOLVER_COLOR_COUNT;
             if (color == RIGID_SOLVER_COLOR_COUNT)
                 SolveBatchRange(&job, 0u, count);
             else
@@ -4781,7 +5487,7 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
 
     ProfileFinish(&state, VOXEL_RIGID_PROFILE_FORCES, stageBegin);
     stageBegin = ProfileNow(&state);
-    RigidJobContext cacheJob = {bodies, &state, settings, 0u};
+    RigidJobContext cacheJob = {bodies, &state, settings, 0u, false};
     ExecuteRange(&state, state.activeCount, 64u, BuildCacheRange, &cacheJob);
     ProfileFinish(&state, VOXEL_RIGID_PROFILE_BOUNDS, stageBegin);
     stageBegin = ProfileNow(&state);
