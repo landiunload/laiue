@@ -25,6 +25,11 @@
 #include "render/generated/vulkan/ui_vs.h"
 #include "render/generated/vulkan/ui_ps.h"
 
+// Публичное имя RendererDestroy теперь живёт в renderer_dispatch.c, а
+// путь отката внутри RendererCreate_Vulkan зовёт суффиксную реализацию
+// раньше её определения — объявляем её здесь.
+void RendererDestroy_Vulkan(Renderer *renderer);
+
 #define FRAME_COUNT 2
 
 // Раскладка дескрипторов повторяет сдвиги регистров HLSL.
@@ -1633,7 +1638,7 @@ static bool CreateSharedSets(Renderer *renderer)
     return true;
 }
 
-Renderer *RendererCreate(void *windowHandle, int32_t width, int32_t height)
+Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
 {
     // Первый этап Vulkan рисует только offscreen: swapchain и оконная
     // поверхность появятся вместе с нативным Wayland/X11-бэкендом.
@@ -1652,7 +1657,7 @@ Renderer *RendererCreate(void *windowHandle, int32_t width, int32_t height)
         !CreateResolvePipeline(renderer, &renderer->resolvePipeline) ||
         !CreateUiPipeline(renderer, &renderer->uiPipeline))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_Vulkan(renderer);
         return NULL;
     }
 
@@ -1661,7 +1666,7 @@ Renderer *RendererCreate(void *windowHandle, int32_t width, int32_t height)
     return renderer;
 }
 
-void RendererReleaseWorld(Renderer *renderer)
+void RendererReleaseWorld_Vulkan(Renderer *renderer)
 {
     if (renderer == NULL || !renderer->worldReady) return;
 
@@ -1693,7 +1698,7 @@ void RendererReleaseWorld(Renderer *renderer)
     RefreshChunkSetTextures(renderer);
 }
 
-bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
+bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog)
 {
     if (renderer == NULL) return false;
     if (renderer->worldReady) return true;
@@ -1736,22 +1741,22 @@ bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
     return true;
 }
 
-bool RendererPrepareWorld(Renderer *renderer)
+bool RendererPrepareWorld_Vulkan(Renderer *renderer)
 {
-    return RendererPrepareWorldFrom(renderer, NULL);
+    return RendererPrepareWorldFrom_Vulkan(renderer, NULL);
 }
 
-bool RendererIsWorldReady(const Renderer *renderer)
+bool RendererIsWorldReady_Vulkan(const Renderer *renderer)
 {
     return renderer != NULL && renderer->worldReady;
 }
 
-void RendererDestroy(Renderer *renderer)
+void RendererDestroy_Vulkan(Renderer *renderer)
 {
     if (renderer == NULL) return;
     if (renderer->device != VK_NULL_HANDLE) WaitForGpu(renderer);
 
-    RendererReleaseWorld(renderer);
+    RendererReleaseWorld_Vulkan(renderer);
     if (renderer->device != VK_NULL_HANDLE)
     {
         DrainDeferredReleases(renderer, true);
@@ -1819,7 +1824,7 @@ static bool EnsureVulkanLargeMeshBuffer(Renderer *renderer, uint32_t frameIndex)
                         &renderer->largeMeshUploadBuffers[frameIndex]);
 }
 
-RendererMesh *RendererCreateMesh(Renderer *renderer, const ChunkQuad *quads, uint32_t quadCount)
+RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *quads, uint32_t quadCount)
 {
     if (renderer == NULL || !renderer->worldReady || quads == NULL || quadCount == 0u ||
         quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad) ||
@@ -1910,7 +1915,7 @@ RendererMesh *RendererCreateMesh(Renderer *renderer, const ChunkQuad *quads, uin
     return mesh;
 }
 
-void RendererDestroyMesh(Renderer *renderer, RendererMesh *mesh)
+void RendererDestroyMesh_Vulkan(Renderer *renderer, RendererMesh *mesh)
 {
     if (renderer == NULL || mesh == NULL) return;
 
@@ -1966,7 +1971,7 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
 }
 
-void RendererDrawMesh(Renderer *renderer, const RendererMesh *mesh,
+void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                       const float chunkOriginRelative[3])
 {
     if (renderer == NULL || mesh == NULL || !renderer->renderingActive) return;
@@ -1978,7 +1983,7 @@ void RendererDrawMesh(Renderer *renderer, const RendererMesh *mesh,
     DrawMeshInternal(renderer, mesh, 1u, 0u);
 }
 
-void RendererDrawMeshInstances(Renderer *renderer, const RendererMesh *mesh,
+void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                                const RendererMeshInstance *instances, uint32_t instanceCount)
 {
     if (renderer == NULL || mesh == NULL || instances == NULL || instanceCount == 0u ||
@@ -2058,7 +2063,7 @@ static void RecordPendingUploads(Renderer *renderer)
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1u, &barrier, 0, NULL, 0, NULL);
 }
 
-bool RendererBeginFrame(Renderer *renderer, const RendererFrameSetup *frame)
+bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *frame)
 {
     if (renderer == NULL || frame == NULL || frame->passCount > RENDERER_MAX_SCENE_PASSES ||
         (frame->passCount != 0u && !renderer->worldReady))
@@ -2155,7 +2160,7 @@ bool RendererBeginFrame(Renderer *renderer, const RendererFrameSetup *frame)
     return true;
 }
 
-void RendererBeginScenePass(Renderer *renderer, uint32_t passIndex)
+void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
 {
     if (renderer == NULL || !renderer->frameRecording || !renderer->worldReady ||
         passIndex >= renderer->frame.passCount)
@@ -2310,7 +2315,7 @@ static void RecordUiLayer(Renderer *renderer)
     renderer->currentStats.drawCalls++;
 }
 
-bool RendererEndFrame(Renderer *renderer)
+bool RendererEndFrame_Vulkan(Renderer *renderer)
 {
     if (renderer == NULL || !renderer->frameRecording) return false;
 
@@ -2350,7 +2355,7 @@ bool RendererEndFrame(Renderer *renderer)
     return true;
 }
 
-void RendererGetStats(const Renderer *renderer, RendererStats *outStats)
+void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
 {
     if (renderer == NULL || outStats == NULL) return;
 
@@ -2368,19 +2373,19 @@ void RendererGetStats(const Renderer *renderer, RendererStats *outStats)
     outStats->geometryPoolUsedBytes = capacity - freeBytes;
 }
 
-void RendererSetVerticalSync(Renderer *renderer, bool enabled)
+void RendererSetVerticalSync_Vulkan(Renderer *renderer, bool enabled)
 {
     // Без present вертикальная синхронизация ни на что не влияет, но
     // состояние сохраняется: приложение вправе его читать.
     if (renderer != NULL) renderer->verticalSyncEnabled = enabled;
 }
 
-bool RendererIsVerticalSyncEnabled(const Renderer *renderer)
+bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer *renderer)
 {
     return renderer != NULL && renderer->verticalSyncEnabled;
 }
 
-void RendererResize(Renderer *renderer, int32_t width, int32_t height)
+void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
 {
     if (renderer == NULL || width <= 0 || height <= 0) return;
     renderer->resizeWidth = width;
@@ -2390,13 +2395,13 @@ void RendererResize(Renderer *renderer, int32_t width, int32_t height)
 
 // === Контент ===
 
-bool RendererSetMaterialNames(Renderer *renderer, const wchar_t *const *names, uint32_t count)
+bool RendererSetMaterialNames_Vulkan(Renderer *renderer, const wchar_t *const *names, uint32_t count)
 {
     if (renderer == NULL) return false;
     return TexturePackMaterialNamesSet(&renderer->materialNames, names, count);
 }
 
-bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *catalog)
+bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog)
 {
     if (renderer == NULL || !renderer->worldReady) return false;
 
@@ -2437,17 +2442,17 @@ bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *cata
     return true;
 }
 
-bool RendererReloadTexturePack(Renderer *renderer)
+bool RendererReloadTexturePack_Vulkan(Renderer *renderer)
 {
-    return RendererReloadTexturePackFrom(renderer, NULL);
+    return RendererReloadTexturePackFrom_Vulkan(renderer, NULL);
 }
 
-RendererContentStatus RendererGetTexturePackLoadStatus(const Renderer *renderer)
+RendererContentStatus RendererGetTexturePackLoadStatus_Vulkan(const Renderer *renderer)
 {
     return renderer != NULL ? renderer->texturePackLoadStatus : RENDERER_CONTENT_NOT_ATTEMPTED;
 }
 
-void RendererSetWireframe(Renderer *renderer, bool enabled)
+void RendererSetWireframe_Vulkan(Renderer *renderer, bool enabled)
 {
     if (renderer == NULL || renderer->wireframeEnabled == enabled) return;
     renderer->wireframeEnabled = enabled;
@@ -2464,7 +2469,7 @@ void RendererSetWireframe(Renderer *renderer, bool enabled)
     renderer->chunkPipeline = replacement;
 }
 
-bool RendererIsWireframe(const Renderer *renderer)
+bool RendererIsWireframe_Vulkan(const Renderer *renderer)
 {
     return renderer != NULL && renderer->wireframeEnabled;
 }
@@ -2478,7 +2483,7 @@ static void ReleaseShaderArray(void *shaders[LAIUE_SHADER_SLOT_COUNT])
     }
 }
 
-bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet)
+bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *shaderSet)
 {
     if (renderer == NULL) return false;
     if (shaderSet != NULL && !LaiueShaderSetIsValid(shaderSet)) return false;
@@ -2552,7 +2557,7 @@ bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet
     return true;
 }
 
-bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catalog,
+bool RendererReloadShaderPackFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog,
                                   ShaderPackLoadStatus *outStatus)
 {
     ShaderPackLoadStatus status = SHADER_PACK_LOAD_NOT_ATTEMPTED;
@@ -2560,25 +2565,25 @@ bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catal
     bool applied = false;
     if (loadedSet != NULL)
     {
-        applied = RendererReloadShaderSet(renderer, ShaderPackLoadedSetGet(loadedSet));
+        applied = RendererReloadShaderSet_Vulkan(renderer, ShaderPackLoadedSetGet(loadedSet));
         if (!applied) status = SHADER_PACK_LOAD_PIPELINE_ERROR;
         ShaderPackLoadedSetRelease(loadedSet);
     }
     else if (status == SHADER_PACK_LOAD_NO_ACTIVE_PACK)
     {
-        applied = RendererReloadShaderSet(renderer, NULL);
+        applied = RendererReloadShaderSet_Vulkan(renderer, NULL);
         if (!applied) status = SHADER_PACK_LOAD_PIPELINE_ERROR;
     }
     if (outStatus != NULL) *outStatus = status;
     return applied;
 }
 
-bool RendererReloadShaderPack(Renderer *renderer, ShaderPackLoadStatus *outStatus)
+bool RendererReloadShaderPack_Vulkan(Renderer *renderer, ShaderPackLoadStatus *outStatus)
 {
-    return RendererReloadShaderPackFrom(renderer, NULL, outStatus);
+    return RendererReloadShaderPackFrom_Vulkan(renderer, NULL, outStatus);
 }
 
-bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
+bool RendererReloadShaders_Vulkan(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
                            const void *chunkPS, uint32_t chunkPSLength, const void *panoramaVS,
                            uint32_t panoramaVSLength, const void *panoramaPS,
                            uint32_t panoramaPSLength, const void *uiVS, uint32_t uiVSLength,
@@ -2598,7 +2603,7 @@ bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chu
                                        lengths[slot]))
             return false;
     }
-    return RendererReloadShaderSet(renderer, &shaderSet);
+    return RendererReloadShaderSet_Vulkan(renderer, &shaderSet);
 }
 
 // === Слой интерфейса ===
@@ -2606,7 +2611,7 @@ bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chu
 _Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
     "RendererUiQuad shares its layout with shaders/ui.hlsl");
 
-bool RendererUiSetFontAtlas(Renderer *renderer, const uint8_t *alphaPixels, uint32_t width,
+bool RendererUiSetFontAtlas_Vulkan(Renderer *renderer, const uint8_t *alphaPixels, uint32_t width,
                             uint32_t height)
 {
     if (renderer == NULL || alphaPixels == NULL || width == 0u || height == 0u) return false;
@@ -2634,7 +2639,7 @@ bool RendererUiSetFontAtlas(Renderer *renderer, const uint8_t *alphaPixels, uint
     return true;
 }
 
-bool RendererUiLoadBackground(Renderer *renderer, const wchar_t *path, uint32_t *outWidth,
+bool RendererUiLoadBackground_Vulkan(Renderer *renderer, const wchar_t *path, uint32_t *outWidth,
                               uint32_t *outHeight)
 {
     // Единственная картинка оболочки декодируется системным кодеком: на
@@ -2648,7 +2653,7 @@ bool RendererUiLoadBackground(Renderer *renderer, const wchar_t *path, uint32_t 
     return false;
 }
 
-void RendererUiQueue(Renderer *renderer, const RendererUiQuad *quads, uint32_t count)
+void RendererUiQueue_Vulkan(Renderer *renderer, const RendererUiQuad *quads, uint32_t count)
 {
     if (renderer == NULL || quads == NULL || count == 0u || !renderer->frameRecording) return;
     if (count > RENDERER_UI_MAX_QUADS - renderer->uiQuadCount)

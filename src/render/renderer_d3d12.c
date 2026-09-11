@@ -17,6 +17,11 @@
 #include <stddef.h>
 #include <string.h>
 
+// Публичное имя RendererDestroy теперь живёт в renderer_dispatch.c, а
+// путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
+// раньше её определения — объявляем её здесь.
+void RendererDestroy_D3D12(Renderer* renderer);
+
 #define FRAME_COUNT 2
 
 // Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
@@ -199,7 +204,7 @@ struct Renderer
     GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
     uint32_t                   poolBlockCount;
     // Счётчики пула вместо обхода всех блоков и диапазонов в
-    // RendererGetStats: capacity — сумма размеров блоков, used — сумма
+    // RendererGetStats_D3D12: capacity — сумма размеров блоков, used — сумма
     // выданных мешам байт. Оба меняются только при создании блока,
     // успешном PoolAllocate и записанном PoolFree.
     uint64_t                   poolCapacityBytes;
@@ -761,7 +766,7 @@ typedef struct BlockTextureReplacement
     RendererContentStatus status;
 } BlockTextureReplacement;
 
-bool RendererSetMaterialNames(Renderer *renderer, const wchar_t *const *names, uint32_t count)
+bool RendererSetMaterialNames_D3D12(Renderer *renderer, const wchar_t *const *names, uint32_t count)
 {
     if (renderer == NULL) return false;
     return TexturePackMaterialNamesSet(&renderer->materialNames, names, count);
@@ -1288,7 +1293,7 @@ static bool CreateDepthBuffer(Renderer* renderer, int32_t width, int32_t height)
     return true;
 }
 
-Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
+Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height)
 {
     Renderer* renderer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*renderer));
     if (renderer == NULL)
@@ -1327,7 +1332,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
         IDXGIAdapter* warpAdapter = NULL;
         if (FAILED(IDXGIFactory4_EnumWarpAdapter(renderer->factory, &IID_IDXGIAdapter, (void**)&warpAdapter)))
         {
-            RendererDestroy(renderer);
+            RendererDestroy_D3D12(renderer);
             return NULL;
         }
         HRESULT result = D3D12CreateDevice((IUnknown*)warpAdapter, D3D_FEATURE_LEVEL_11_0,
@@ -1335,7 +1340,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
         IDXGIAdapter_Release(warpAdapter);
         if (FAILED(result))
         {
-            RendererDestroy(renderer);
+            RendererDestroy_D3D12(renderer);
             return NULL;
         }
     }
@@ -1344,7 +1349,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(ID3D12Device_CreateCommandQueue(renderer->device, &queueDescription,
         &IID_ID3D12CommandQueue, (void**)&renderer->commandQueue)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
@@ -1364,7 +1369,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
         (HWND)windowHandle, &swapChainDescription, NULL, NULL, &swapChain1)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
@@ -1372,7 +1377,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     IDXGISwapChain1_Release(swapChain1);
     if (FAILED(queryResult))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
@@ -1385,7 +1390,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &renderTargetHeapDescription,
         &IID_ID3D12DescriptorHeap, (void**)&renderer->renderTargetViewHeap)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
@@ -1404,7 +1409,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     {
         if (FAILED(IDXGISwapChain3_GetBuffer(renderer->swapChain, i, &IID_ID3D12Resource, (void**)&renderer->renderTargets[i])))
         {
-            RendererDestroy(renderer);
+            RendererDestroy_D3D12(renderer);
             return NULL;
         }
         ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i],
@@ -1417,7 +1422,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
         if (FAILED(ID3D12Device_CreateCommandAllocator(renderer->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
             &IID_ID3D12CommandAllocator, (void**)&renderer->commandAllocators[i])))
         {
-            RendererDestroy(renderer);
+            RendererDestroy_D3D12(renderer);
             return NULL;
         }
     }
@@ -1425,7 +1430,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(ID3D12Device_CreateCommandList(renderer->device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
         renderer->commandAllocators[0], NULL, &IID_ID3D12GraphicsCommandList, (void**)&renderer->commandList)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
     ID3D12GraphicsCommandList_Close(renderer->commandList);
@@ -1433,14 +1438,14 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(ID3D12Device_CreateFence(renderer->device, 0, D3D12_FENCE_FLAG_NONE,
         &IID_ID3D12Fence, (void**)&renderer->fence)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
     renderer->fenceEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (renderer->fenceEvent == NULL)
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
 
@@ -1453,15 +1458,15 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &srvHeapDescription,
         &IID_ID3D12DescriptorHeap, (void**)&renderer->srvHeap)))
     {
-        RendererDestroy(renderer);
+        RendererDestroy_D3D12(renderer);
         return NULL;
     }
     renderer->srvDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
         renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    if (!CreateUiRootSignature(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateUiPipelineState(renderer)) { RendererDestroy(renderer); return NULL; }
-    if (!CreateUiQuadBuffers(renderer)) { RendererDestroy(renderer); return NULL; }
+    if (!CreateUiRootSignature(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
+    if (!CreateUiPipelineState(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
+    if (!CreateUiQuadBuffers(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
 
     renderer->viewport.TopLeftX = 0.0f;
     renderer->viewport.TopLeftY = 0.0f;
@@ -1479,7 +1484,7 @@ Renderer* RendererCreate(void* windowHandle, int32_t width, int32_t height)
     return renderer;
 }
 
-void RendererReleaseWorld(Renderer* renderer)
+void RendererReleaseWorld_D3D12(Renderer* renderer)
 {
     if (renderer == NULL) return;
     if (renderer->commandQueue != NULL && renderer->fence != NULL
@@ -1585,7 +1590,7 @@ void RendererReleaseWorld(Renderer* renderer)
     renderer->worldReady = false;
 }
 
-bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
+bool RendererPrepareWorldFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
 {
     if (renderer == NULL || catalog == NULL)
         return false;
@@ -1614,24 +1619,24 @@ bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog)
         succeeded = RecreateChunkPipelineState(renderer);
     if (!succeeded)
     {
-        RendererReleaseWorld(renderer);
+        RendererReleaseWorld_D3D12(renderer);
         return false;
     }
     renderer->worldReady = true;
     return true;
 }
 
-bool RendererPrepareWorld(Renderer *renderer)
+bool RendererPrepareWorld_D3D12(Renderer *renderer)
 {
-    return RendererPrepareWorldFrom(renderer, LaiueContentCatalogDefault());
+    return RendererPrepareWorldFrom_D3D12(renderer, LaiueContentCatalogDefault());
 }
 
-bool RendererIsWorldReady(const Renderer* renderer)
+bool RendererIsWorldReady_D3D12(const Renderer* renderer)
 {
     return renderer != NULL && renderer->worldReady;
 }
 
-void RendererDestroy(Renderer* renderer)
+void RendererDestroy_D3D12(Renderer* renderer)
 {
     if (renderer == NULL)
     {
@@ -1653,7 +1658,7 @@ void RendererDestroy(Renderer* renderer)
         DrainDeferredReleases(renderer, true);
     }
 
-    RendererReleaseWorld(renderer);
+    RendererReleaseWorld_D3D12(renderer);
 
     for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
     {
@@ -1780,7 +1785,7 @@ static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
     return true;
 }
 
-RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
+RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
 {
     if (renderer == NULL || !renderer->worldReady || quads == NULL
         || quadCount == 0
@@ -1896,7 +1901,7 @@ RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uin
     return mesh;
 }
 
-void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)
+void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh)
 {
     if (mesh == NULL)
     {
@@ -1919,7 +1924,7 @@ void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)
     HeapFree(GetProcessHeap(), 0, mesh);
 }
 
-void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
+void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
     const float chunkOriginRelative[3])
 {
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
@@ -1937,7 +1942,7 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh,
     renderer->currentStats.drawnQuads += mesh->quadCount;
 }
 
-void RendererDrawMeshInstances(Renderer* renderer, const RendererMesh* mesh,
+void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mesh,
     const RendererMeshInstance* instances, uint32_t instanceCount)
 {
     if (renderer == NULL || mesh == NULL || instances == NULL
@@ -2245,7 +2250,7 @@ static void RecordBackgroundUpload(Renderer* renderer)
     renderer->backgroundReady = true;
 }
 
-bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
+bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* frame)
 {
     if (renderer == NULL || frame == NULL
         || frame->passCount > RENDERER_MAX_SCENE_PASSES
@@ -2294,7 +2299,7 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
 
     // Общее состояние всех проходов сцены; цель, очистка и viewProjection
-    // назначаются в RendererBeginScenePass.
+    // назначаются в RendererBeginScenePass_D3D12.
     ID3D12DescriptorHeap* descriptorHeaps[1] = { renderer->srvHeap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 1, descriptorHeaps);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2360,7 +2365,7 @@ bool RendererBeginFrame(Renderer* renderer, const RendererFrameSetup* frame)
     return true;
 }
 
-void RendererBeginScenePass(Renderer* renderer, uint32_t passIndex)
+void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex)
 {
     if (renderer == NULL || !renderer->worldReady
         || passIndex >= renderer->frame.passCount)
@@ -2428,7 +2433,7 @@ void RendererBeginScenePass(Renderer* renderer, uint32_t passIndex)
         ROOT_PARAMETER_CONSTANTS, 16, pass->viewProjection, 0);
 }
 
-bool RendererEndFrame(Renderer* renderer)
+bool RendererEndFrame_D3D12(Renderer* renderer)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
@@ -2555,7 +2560,7 @@ bool RendererEndFrame(Renderer* renderer)
     return true;
 }
 
-void RendererGetStats(const Renderer* renderer, RendererStats* outStats)
+void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
 {
     if (renderer == NULL || outStats == NULL) return;
 
@@ -2564,17 +2569,17 @@ void RendererGetStats(const Renderer* renderer, RendererStats* outStats)
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
 }
 
-void RendererSetVerticalSync(Renderer* renderer, bool enabled)
+void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled)
 {
     renderer->verticalSyncEnabled = enabled;
 }
 
-bool RendererIsVerticalSyncEnabled(const Renderer* renderer)
+bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer)
 {
     return renderer->verticalSyncEnabled;
 }
 
-void RendererResize(Renderer* renderer, int32_t width, int32_t height)
+void RendererResize_D3D12(Renderer* renderer, int32_t width, int32_t height)
 {
     if (width <= 0 || height <= 0)
     {
@@ -2740,7 +2745,7 @@ static bool CreateUiPipelineStateForShaders(Renderer *renderer,
         renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
 }
 
-bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *catalog)
+bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
 {
     if (renderer == NULL || catalog == NULL)
     {
@@ -2775,19 +2780,19 @@ bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *cata
     return true;
 }
 
-bool RendererReloadTexturePack(Renderer *renderer)
+bool RendererReloadTexturePack_D3D12(Renderer *renderer)
 {
-    return RendererReloadTexturePackFrom(renderer, LaiueContentCatalogDefault());
+    return RendererReloadTexturePackFrom_D3D12(renderer, LaiueContentCatalogDefault());
 }
 
-RendererContentStatus RendererGetTexturePackLoadStatus(
+RendererContentStatus RendererGetTexturePackLoadStatus_D3D12(
     const Renderer* renderer)
 {
     return renderer != NULL ? renderer->texturePackLoadStatus
         : RENDERER_CONTENT_NOT_ATTEMPTED;
 }
 
-void RendererSetWireframe(Renderer* renderer, bool enabled)
+void RendererSetWireframe_D3D12(Renderer* renderer, bool enabled)
 {
     if (renderer == NULL || renderer->wireframeEnabled == enabled)
     {
@@ -2801,7 +2806,7 @@ void RendererSetWireframe(Renderer* renderer, bool enabled)
     RecreateChunkPipelineState(renderer);
 }
 
-bool RendererIsWireframe(const Renderer* renderer)
+bool RendererIsWireframe_D3D12(const Renderer* renderer)
 {
     return renderer != NULL && renderer->wireframeEnabled;
 }
@@ -2812,7 +2817,7 @@ static void ReleaseShaderArray(void *shaders[LAIUE_SHADER_SLOT_COUNT])
         ReleaseLoadedShader(&shaders[index]);
 }
 
-bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet)
+bool RendererReloadShaderSet_D3D12(Renderer *renderer, const LaiueShaderSet *shaderSet)
 {
     if (renderer == NULL)
     {
@@ -2895,7 +2900,7 @@ bool RendererReloadShaderSet(Renderer *renderer, const LaiueShaderSet *shaderSet
     return true;
 }
 
-bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catalog,
+bool RendererReloadShaderPackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog,
                                   ShaderPackLoadStatus *outStatus)
 {
     if (outStatus != NULL)
@@ -2913,7 +2918,7 @@ bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catal
                 *outStatus = status;
             return false;
         }
-        if (!RendererReloadShaderSet(renderer, NULL))
+        if (!RendererReloadShaderSet_D3D12(renderer, NULL))
         {
             if (outStatus != NULL)
                 *outStatus = SHADER_PACK_LOAD_PIPELINE_ERROR;
@@ -2924,7 +2929,7 @@ bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catal
         return true;
     }
 
-    bool reloaded = RendererReloadShaderSet(renderer, ShaderPackLoadedSetGet(loadedSet));
+    bool reloaded = RendererReloadShaderSet_D3D12(renderer, ShaderPackLoadedSetGet(loadedSet));
     ShaderPackLoadedSetRelease(loadedSet);
     if (!reloaded)
         status = SHADER_PACK_LOAD_PIPELINE_ERROR;
@@ -2933,12 +2938,12 @@ bool RendererReloadShaderPackFrom(Renderer *renderer, LaiueContentCatalog *catal
     return reloaded;
 }
 
-bool RendererReloadShaderPack(Renderer *renderer, ShaderPackLoadStatus *outStatus)
+bool RendererReloadShaderPack_D3D12(Renderer *renderer, ShaderPackLoadStatus *outStatus)
 {
-    return RendererReloadShaderPackFrom(renderer, LaiueContentCatalogDefault(), outStatus);
+    return RendererReloadShaderPackFrom_D3D12(renderer, LaiueContentCatalogDefault(), outStatus);
 }
 
-bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
+bool RendererReloadShaders_D3D12(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
                            const void *chunkPS, uint32_t chunkPSLength, const void *panoramaVS,
                            uint32_t panoramaVSLength, const void *panoramaPS,
                            uint32_t panoramaPSLength, const void *uiVS, uint32_t uiVSLength,
@@ -2960,7 +2965,7 @@ bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chu
                                        lengths[index]))
             return false;
     }
-    return RendererReloadShaderSet(renderer, &shaderSet);
+    return RendererReloadShaderSet_D3D12(renderer, &shaderSet);
 }
 
 // === Слой интерфейса ===
@@ -2968,7 +2973,7 @@ bool RendererReloadShaders(Renderer *renderer, const void *chunkVS, uint32_t chu
 _Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
     "RendererUiQuad is part of the GPU format (shaders/ui.hlsl)");
 
-bool RendererUiSetFontAtlas(Renderer* renderer,
+bool RendererUiSetFontAtlas_D3D12(Renderer* renderer,
     const uint8_t* alphaPixels, uint32_t width, uint32_t height)
 {
     if (alphaPixels == NULL || width == 0 || height == 0)
@@ -3072,7 +3077,7 @@ bool RendererUiSetFontAtlas(Renderer* renderer,
     return true;
 }
 
-bool RendererUiLoadBackground(Renderer* renderer, const wchar_t* path,
+bool RendererUiLoadBackground_D3D12(Renderer* renderer, const wchar_t* path,
     uint32_t* outWidth, uint32_t* outHeight)
 {
     if (renderer == NULL || path == NULL) return false;
@@ -3193,7 +3198,7 @@ bool RendererUiLoadBackground(Renderer* renderer, const wchar_t* path,
     return true;
 }
 
-void RendererUiQueue(Renderer* renderer, const RendererUiQuad* quads, uint32_t count)
+void RendererUiQueue_D3D12(Renderer* renderer, const RendererUiQuad* quads, uint32_t count)
 {
     if (quads == NULL || count == 0)
     {

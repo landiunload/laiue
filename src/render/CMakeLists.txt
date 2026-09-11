@@ -19,14 +19,37 @@ laiue_compile_shader(ui
     FALLBACK_DIRECTORY "${fallback_directory}"
     OUTPUT_VARIABLE ui_shader_headers)
 
-if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN")
-    find_package(Vulkan REQUIRED)
+# Физически доступный на этой платформе набор бэкендов. Оба могут быть
+# слинкованы в один бинарник; выбор бэкенда при создании делает
+# renderer_dispatch.c.
+find_package(Vulkan QUIET)
+
+set(available_sources "")
+set(available_links "")
+set(available_definitions "")
+if(WIN32)
+    list(APPEND available_sources renderer_d3d12.c ui_image_wic.c ui_image_wic.h)
+    list(APPEND available_links d3d12 dxgi dxguid ole32 windowscodecs)
+    list(APPEND available_definitions LAIUE_RENDER_HAS_D3D12)
+endif()
+if(Vulkan_FOUND)
+    list(APPEND available_sources renderer_vulkan.c renderer_offscreen.h)
+    list(APPEND available_links Vulkan::Vulkan)
+    list(APPEND available_definitions LAIUE_RENDER_HAS_VULKAN)
+endif()
+
+# Явный выбор LAIUE_RENDER_BACKEND уважается: тогда линкуется ровно один
+# бэкенд, как и раньше. Только AUTO (умолчание) линкует всё доступное
+# сразу. Исходная опция сравнивается до resolve: на Windows AUTO тоже
+# разрешается в D3D12, и по LAIUE_RENDER_BACKEND_RESOLVED их не отличить.
+string(TOUPPER "${LAIUE_RENDER_BACKEND}" laiue_render_backend_requested)
+if(laiue_render_backend_requested STREQUAL "AUTO")
+    set(backend_sources renderer_dispatch.c ${available_sources})
+    set(backend_links ${available_links})
+    set(backend_compile_definitions ${available_definitions})
+elseif(laiue_render_backend_requested STREQUAL "D3D12")
     set(backend_sources
-        renderer_vulkan.c
-        renderer_offscreen.h)
-    set(backend_links Vulkan::Vulkan)
-else()
-    set(backend_sources
+        renderer_dispatch.c
         renderer_d3d12.c
         ui_image_wic.c
         ui_image_wic.h)
@@ -36,6 +59,34 @@ else()
         dxguid
         ole32
         windowscodecs)
+    set(backend_compile_definitions LAIUE_RENDER_HAS_D3D12)
+elseif(laiue_render_backend_requested STREQUAL "VULKAN")
+    if(Vulkan_FOUND)
+        set(backend_sources renderer_dispatch.c renderer_vulkan.c renderer_offscreen.h)
+        set(backend_links Vulkan::Vulkan)
+        set(backend_compile_definitions LAIUE_RENDER_HAS_VULKAN)
+    else()
+        set(backend_sources renderer_dispatch.c)
+        set(backend_links "")
+        set(backend_compile_definitions "")
+    endif()
+else()
+    message(FATAL_ERROR
+        "LAIUE_RENDER_BACKEND must be AUTO, D3D12 or VULKAN")
+endif()
+
+if(NOT backend_compile_definitions)
+    message(FATAL_ERROR
+        "No render backend available: need Windows (D3D12) or a Vulkan SDK.")
+endif()
+
+# RendererCreate()/RENDERER_BACKEND_AUTO выбирает тот бэкенд, который был
+# разрешён из опции сборки: на Windows это D3D12 (сегодняшнее поведение),
+# иначе Vulkan. При явном VULKAN на Windows сюда тоже попадёт Vulkan.
+if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
+    list(APPEND backend_compile_definitions LAIUE_RENDER_DEFAULT_BACKEND_D3D12)
+else()
+    list(APPEND backend_compile_definitions LAIUE_RENDER_DEFAULT_BACKEND_VULKAN)
 endif()
 
 laiue_add_module(render
@@ -59,6 +110,8 @@ laiue_add_module(render
     LINK
         ${backend_links}
         laiue::media_support)
+
+target_compile_definitions(laiue_render PRIVATE ${backend_compile_definitions})
 
 # Бэкенд включает render/generated/<backend>/*.h. Binary include идёт
 # первым, поэтому обычная сборка никогда не перезаписывает checked-in
