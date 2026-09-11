@@ -250,3 +250,13 @@ if(TARGET laiue_media_support)
     laiue_configure_standalone_executable(laiue_texc_test TexcTestEntryPoint)
     add_test(NAME laiue.tools.texc COMMAND laiue_texc_test)
 endif()
+
+if(TARGET laiue_media_support)
+    # Быстрые пути ресемплера сверяются побайтово с локальной копией
+    # прежнего общего пути на десятках тысяч случайных изображений.
+    add_executable(laiue_image_resample_test image_resample_test.c)
+    target_link_libraries(laiue_image_resample_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(
+        laiue_image_resample_test ImageResampleTestEntryPoint)
+    add_test(NAME laiue.media.resample COMMAND laiue_image_resample_test)
+endif()
