@@ -239,7 +239,8 @@ ImageStatus PngInspect(const void *bytes, uint32_t sizeBytes, ImageInfo *outInfo
     if (header.colorType == 3u && scan.paletteSize == 0u) return IMAGE_CORRUPT;
 
     uint64_t rawBytes = RawStreamBytes(&header);
-    uint64_t scratch = rawBytes + (uint64_t)scan.idatCount * sizeof(InflateSegment);
+    uint64_t scratch = rawBytes + (uint64_t)scan.idatCount * sizeof(InflateSegment) +
+                       (uint64_t)sizeof(InflateWork);
     if (scratch > 0xFFFFFFFFull) return IMAGE_TOO_LARGE;
 
     outInfo->width = header.width;
@@ -254,6 +255,10 @@ ImageStatus PngInspect(const void *bytes, uint32_t sizeBytes, ImageInfo *outInfo
     return IMAGE_OK;
 }
 
+// Ветвящаяся форма оставлена намеренно: переписывание без ветвлений
+// замерено на build/peer и оказалось медленнее (0,63-0,69 от прежней
+// скорости на гладких градиентах), где предсказатель ветвей работает
+// почти идеально, а удлинившаяся цепочка зависимостей — нет.
 static uint8_t PaethPredictor(int32_t left, int32_t above, int32_t upperLeft)
 {
     int32_t estimate = left + above - upperLeft;
@@ -486,12 +491,18 @@ ImageStatus PngDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *in
                         scratchBytes / (uint32_t)sizeof(InflateSegment));
     if (status != IMAGE_OK) return status;
 
+    // Раскладка рабочего буфера: отрезки IDAT, затем таблицы быстрого
+    // разбора, затем распакованный поток. Размер последнего обязан
+    // совпасть с посчитанным по заголовку, поэтому таблицы идут до него.
     uint32_t segmentBytes = scan.idatCount * (uint32_t)sizeof(InflateSegment);
-    uint8_t *raw = (uint8_t *)scratch + segmentBytes;
-    uint32_t rawBytes = info->scratchBytes - segmentBytes;
+    uint32_t workBytes = (uint32_t)sizeof(InflateWork);
+    if (info->scratchBytes < segmentBytes + workBytes) return IMAGE_BUFFER_TOO_SMALL;
+    uint8_t *work = (uint8_t *)scratch + segmentBytes;
+    uint8_t *raw = work + workBytes;
+    uint32_t rawBytes = info->scratchBytes - segmentBytes - workBytes;
 
     uint32_t written = 0u;
-    status = InflateZlib(segments, scan.idatCount, raw, rawBytes, &written);
+    status = InflateZlib(segments, scan.idatCount, raw, rawBytes, work, workBytes, &written);
     if (status != IMAGE_OK) return status;
     if (written != rawBytes) return IMAGE_CORRUPT;
 

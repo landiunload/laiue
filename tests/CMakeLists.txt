@@ -279,4 +279,11 @@ if(TARGET laiue_media_support)
     laiue_configure_standalone_executable(
         laiue_image_resample_test ImageResampleTestEntryPoint)
     add_test(NAME laiue.media.resample COMMAND laiue_image_resample_test)
+
+    # Эквивалентность декодеров PNG и JPEG после ускорения Хаффмана:
+    # эталонные суммы сняты с исходной побитовой реализации.
+    add_executable(laiue_image_decode_test image_decode_test.c texc_fixtures.h)
+    target_link_libraries(laiue_image_decode_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_image_decode_test ImageDecodeTestEntryPoint)
+    add_test(NAME laiue.media.image_decode COMMAND laiue_image_decode_test)
 endif()
