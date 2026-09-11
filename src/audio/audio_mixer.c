@@ -295,6 +295,80 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
     float left = slot->gains.left;
     float right = slot->gains.right;
 
+    // Целый шаг (частота клипа совпала с частотой устройства при скорости 1):
+    // дробная часть позиции в цикле тождественно равна нулю, поэтому
+    // интерполяция вырождается в выборку одного кадра, а позиция остаётся
+    // целой. Отрезок до границы клипа проходится без проверки в каждой
+    // выборке. Арифметика выборки та же — (float)sample * (1/32768) — и
+    // результат совпадает с общей ветвью побитово.
+    if (step == 1.0 && position == (double)(uint32_t)position)
+    {
+        const int16_t *samples = clip->samples;
+        const uint32_t clipFrames = clip->frameCount;
+        const float scale = 1.0f / 32768.0f;
+        uint32_t frame = (uint32_t)position;
+        uint32_t index = 0u;
+        if (clip->channelCount == 2u)
+        {
+            while (index < frameCount)
+            {
+                if (frame >= clipFrames)
+                {
+                    if (!slot->looping)
+                    {
+                        slot->clip = NULL;
+                        PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_FINISHED);
+                        slot->position = (double)frame;
+                        return;
+                    }
+                    frame -= clipFrames;
+                }
+                uint32_t run = clipFrames - frame;
+                uint32_t tail = frameCount - index;
+                uint32_t count = run < tail ? run : tail;
+                for (uint32_t sample = 0u; sample < count; ++sample)
+                {
+                    float channelLeft = (float)samples[frame * 2u] * scale;
+                    float channelRight = (float)samples[frame * 2u + 1u] * scale;
+                    frames[(index + sample) * 2u] += channelLeft * left;
+                    frames[(index + sample) * 2u + 1u] += channelRight * right;
+                    ++frame;
+                }
+                index += count;
+            }
+        }
+        else
+        {
+            while (index < frameCount)
+            {
+                if (frame >= clipFrames)
+                {
+                    if (!slot->looping)
+                    {
+                        slot->clip = NULL;
+                        PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_FINISHED);
+                        slot->position = (double)frame;
+                        return;
+                    }
+                    frame -= clipFrames;
+                }
+                uint32_t run = clipFrames - frame;
+                uint32_t tail = frameCount - index;
+                uint32_t count = run < tail ? run : tail;
+                for (uint32_t sample = 0u; sample < count; ++sample)
+                {
+                    float mono = (float)samples[frame] * scale;
+                    frames[(index + sample) * 2u] += mono * left;
+                    frames[(index + sample) * 2u + 1u] += mono * right;
+                    ++frame;
+                }
+                index += count;
+            }
+        }
+        slot->position = (double)frame;
+        return;
+    }
+
     for (uint32_t index = 0; index < frameCount; ++index)
     {
         if (position >= (double)clip->frameCount)
