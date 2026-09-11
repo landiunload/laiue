@@ -287,6 +287,25 @@ static void SampleClip(const AudioClip *clip, double position, float *outLeft, f
     *outRight = mono;
 }
 
+// Смешивает одну выборку в готовые кадры. Тело совпадает с прежней общей
+// ветвью (SampleClip плюс накопление), поэтому компилятор обязан выдать ту
+// же последовательность операций. Не встраивается: иначе оптимизатор
+// разворачивает конкретный цикл и меняет контракцию FMA на хвосте.
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void MixSample(const AudioClip *clip, double position, float left, float right,
+                      float *outFrame)
+{
+    float sampleLeft;
+    float sampleRight;
+    SampleClip(clip, position, &sampleLeft, &sampleRight);
+    outFrame[0] += sampleLeft * left;
+    outFrame[1] += sampleRight * right;
+}
+
 static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
 {
     const AudioClip *clip = slot->clip;
@@ -369,9 +388,18 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
         return;
     }
 
-    for (uint32_t index = 0; index < frameCount; ++index)
+    // Общая ветвь: дробный шаг, линейная интерполяция. Проверка границы
+    // клипа и ветвление по числу каналов вынесены из внутреннего цикла:
+    // отрезок до ближайшей границы (конец клипа или буфера) считается из
+    // позиции и шага один раз, а арифметика выборки остаётся прежней —
+    // position += step подряд и (float)(position - frame), — поэтому выход
+    // совпадает с прежней ветвью побитово.
+    const uint32_t clipFrames = clip->frameCount;
+    const double clipFramesD = (double)clipFrames;
+    uint32_t index = 0u;
+    while (index < frameCount)
     {
-        if (position >= (double)clip->frameCount)
+        if (position >= clipFramesD)
         {
             if (!slot->looping)
             {
@@ -381,16 +409,77 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 return;
             }
             // Повтор без разрыва: остаток шага переносится в начало.
-            position -= (double)clip->frameCount;
+            position -= clipFramesD;
             if (position < 0.0) position = 0.0;
+            if (position >= clipFramesD)
+            {
+                // Клип короче шага: одного вычитания мало, и выборка молчит.
+                // Прежняя общая ветвь в этом случае отдаёт тишину, а позиция
+                // растёт дальше — так же поступаем и здесь.
+                position += step;
+                ++index;
+                continue;
+            }
         }
 
-        float sampleLeft;
-        float sampleRight;
-        SampleClip(clip, position, &sampleLeft, &sampleRight);
-        frames[index * 2u] += sampleLeft * left;
-        frames[index * 2u + 1u] += sampleRight * right;
-        position += step;
+        // Число выборок до границы клипа. Точное деление может ошибиться на
+        // единицу из-за накопленного округления, поэтому берётся запас.
+        uint32_t run = frameCount - index;
+        double ratio = (clipFramesD - position) / step;
+        if (ratio < (double)run) run = (uint32_t)ratio;
+        if (run > 2u) run -= 2u;
+        else run = 0u;
+        if (run == 0u) run = 1u;
+
+        // Основной отрезок проходится без проверки границы и кратен четырём:
+        // развёрнутый хвост компилятора, где контракция FMA иначе пропадает,
+        // тогда не исполняется. Меньший остаток идёт через MixSample.
+        uint32_t sample = 0u;
+        if (run >= 4u)
+        {
+            uint32_t bulk = run & ~3u;
+            if (clip->channelCount == 2u)
+            {
+                const int16_t *samples = clip->samples;
+                for (; sample < bulk; ++sample)
+                {
+                    uint32_t frame = (uint32_t)position;
+                    uint32_t nextFrame = frame + 1u < clipFrames ? frame + 1u : frame;
+                    float fraction = (float)(position - (double)frame);
+                    float leftA = (float)samples[frame * 2u] * (1.0f / 32768.0f);
+                    float rightA = (float)samples[frame * 2u + 1u] * (1.0f / 32768.0f);
+                    float leftB = (float)samples[nextFrame * 2u] * (1.0f / 32768.0f);
+                    float rightB = (float)samples[nextFrame * 2u + 1u] * (1.0f / 32768.0f);
+                    float sampleLeft = leftA + (leftB - leftA) * fraction;
+                    float sampleRight = rightA + (rightB - rightA) * fraction;
+                    frames[(index + sample) * 2u] += sampleLeft * left;
+                    frames[(index + sample) * 2u + 1u] += sampleRight * right;
+                    position += step;
+                }
+            }
+            else
+            {
+                const int16_t *samples = clip->samples;
+                for (; sample < bulk; ++sample)
+                {
+                    uint32_t frame = (uint32_t)position;
+                    uint32_t nextFrame = frame + 1u < clipFrames ? frame + 1u : frame;
+                    float fraction = (float)(position - (double)frame);
+                    float monoA = (float)samples[frame] * (1.0f / 32768.0f);
+                    float monoB = (float)samples[nextFrame] * (1.0f / 32768.0f);
+                    float sampleMono = monoA + (monoB - monoA) * fraction;
+                    frames[(index + sample) * 2u] += sampleMono * left;
+                    frames[(index + sample) * 2u + 1u] += sampleMono * right;
+                    position += step;
+                }
+            }
+        }
+        for (; sample < run; ++sample)
+        {
+            MixSample(clip, position, left, right, &frames[(index + sample) * 2u]);
+            position += step;
+        }
+        index += run;
     }
     slot->position = position;
 }
