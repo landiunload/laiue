@@ -225,7 +225,17 @@ int64_t PlatformAtomicIncrementI64(volatile int64_t *value)
 
 uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)
 {
+#if defined(_M_IX86) || defined(_M_X64)
+    // На x86 выровненная загрузка сама по себе acquire (TSO): нужен только
+    // барьер компилятора. Блокирующий CAS здесь превращал каждого читателя
+    // в писателя той же кэш-линии, и параллельные читатели одного флага
+    // (рабочие мешера и поток физики у счётчика правок мира) толкались.
+    uint32_t result = (uint32_t)__iso_volatile_load32((const volatile __int32 *)value);
+    _ReadWriteBarrier();
+    return result;
+#else
     return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+#endif
 }
 
 bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
@@ -243,7 +253,15 @@ bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expect
 
 void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired)
 {
+#if defined(_M_IX86) || defined(_M_X64)
+    // Симметрично загрузке: на x86 обычная запись — release, барьер только
+    // компилятору. Блокирующий обмен был полным барьером, которого контракт
+    // release не обещает и ни один вызывающий не требует.
+    _ReadWriteBarrier();
+    __iso_volatile_store32((volatile __int32 *)value, (__int32)desired);
+#else
     InterlockedExchange((volatile LONG *)value, (LONG)desired);
+#endif
 }
 
 double PlatformMonotonicSeconds(void)
