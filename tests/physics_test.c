@@ -5,6 +5,8 @@ typedef struct PhysicsTestContext
 {
     bool useFloor;
     bool useDynamicPlatform;
+    bool useWall;
+    int64_t wallX;
     uint32_t blockQueries;
     uint32_t dynamicQueries;
 } PhysicsTestContext;
@@ -38,11 +40,12 @@ static void QueryBlockPhysics(void *rawContext, int64_t x, int64_t y, int64_t z,
                               VoxelBlockPhysics *outBlock)
 {
     PhysicsTestContext *context = (PhysicsTestContext *)rawContext;
-    (void)x;
     (void)y;
     ++context->blockQueries;
-    outBlock->flags = context->useFloor && z == 0 ? VOXEL_BLOCK_PHYSICS_SOLID : 0U;
-    outBlock->friction = context->useFloor && z == 0 ? 0.75f : 0.0f;
+    bool solid = (context->useFloor && z == 0) ||
+                 (context->useWall && x == context->wallX && z >= 1 && z <= 3);
+    outBlock->flags = solid ? VOXEL_BLOCK_PHYSICS_SOLID : 0U;
+    outBlock->friction = solid ? 0.75f : 0.0f;
 }
 
 static bool QueryDynamicPlatform(void *rawContext, const VoxelBodyBounds *queryBounds,
@@ -141,6 +144,73 @@ static void TestStaticVoxelCollision(void)
                   "invalid shape did not fail closed");
 }
 
+static bool SameBits(double left, double right)
+{
+    union
+    {
+        double value;
+        uint64_t bits;
+    } leftView = {left};
+    union
+    {
+        double value;
+        uint64_t bits;
+    } rightView = {right};
+    return leftView.bits == rightView.bits;
+}
+
+static void TestMultiPlaneSweep(void)
+{
+    PhysicsTestContext context = {
+        .useFloor = true,
+        .useWall = true,
+        .wallX = 40,
+    };
+    VoxelCollisionSource source = {
+        .context = &context,
+        .queryBlockPhysics = QueryBlockPhysics,
+        .queryDynamicColliders = NULL,
+    };
+    VoxelBodyShape shape = TestShape();
+
+    // Длинный свободный свип: диапазон блоков по неподвижным осям считается
+    // один раз на весь проход и не должен изменить ни одну координату.
+    double freeSweep[3] = {0.5, 0.5, 2.6};
+    PhysicsExpect(!VoxelBodyMoveAxis(&source, freeSweep, &shape, 0, 9.0) &&
+                      SameBits(freeSweep[0], 9.5) && SameBits(freeSweep[1], 0.5) &&
+                      SameBits(freeSweep[2], 2.6),
+                  "long free multi-plane sweep changed the result");
+
+    // Дальняя стена: свип обязан остановиться именно на плоскости блока.
+    double wallSweep[3] = {0.5, 0.5, 2.6};
+    PhysicsExpect(VoxelBodyMoveAxis(&source, wallSweep, &shape, 0, 50.0) &&
+                      Near(wallSweep[0], 39.699, 0.000001),
+                  "far multi-plane wall clip is wrong");
+
+    // Длинный свип вниз через много пустых плоскостей до пола.
+    double downSweep[3] = {0.5, 0.5, 6.0};
+    PhysicsExpect(VoxelBodyMoveAxis(&source, downSweep, &shape, 2, -6.0) &&
+                      Near(downSweep[2], 2.601, 0.000001),
+                  "long downward multi-plane clip is wrong");
+
+    // Динамический путь обязан переиспользовать свои границы и дать те же биты.
+    PhysicsTestContext dynamicContext = {
+        .useFloor = true,
+        .useWall = true,
+        .wallX = 40,
+        .useDynamicPlatform = false,
+    };
+    VoxelCollisionSource dynamicSource = {
+        .context = &dynamicContext,
+        .queryBlockPhysics = QueryBlockPhysics,
+        .queryDynamicColliders = QueryDynamicPlatform,
+    };
+    double dynamicSweep[3] = {0.5, 0.5, 2.6};
+    PhysicsExpect(VoxelBodyMoveAxis(&dynamicSource, dynamicSweep, &shape, 0, 50.0) &&
+                      SameBits(dynamicSweep[0], wallSweep[0]),
+                  "dynamic path reused-bounds result differs from static sweep");
+}
+
 static void TestDynamicColliderSource(void)
 {
     PhysicsTestContext context = {
@@ -171,6 +241,7 @@ static void TestDynamicColliderSource(void)
 LAIUE_TEST_ENTRY(PhysicsTestEntryPoint)
 {
     TestStaticVoxelCollision();
+    TestMultiPlaneSweep();
     TestDynamicColliderSource();
     LaiueTestRuntimeWrite("Physics tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
