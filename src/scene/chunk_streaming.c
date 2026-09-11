@@ -45,7 +45,7 @@ typedef struct ChunkEntry
     int64_t y;
     int64_t z;
     RendererMesh* mesh;
-    uint32_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
+    uint64_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
     uint32_t drawSlotPlusOne; // 0 — меша нет, иначе позиция в плотном drawItems + 1
     ChunkEntryState state;
     bool requestQueued;     // есть ли в очереди заявка текущей ревизии
@@ -56,7 +56,7 @@ typedef struct ChunkRequest
     int64_t x;
     int64_t y;
     int64_t z;
-    uint32_t revision;
+    uint64_t revision;
     uint32_t centerEpoch;
 } ChunkRequest;
 
@@ -66,7 +66,7 @@ typedef struct ChunkMeshResult
     int64_t y;
     int64_t z;
     ChunkQuad* quads;
-    uint32_t revision;
+    uint64_t revision;
     uint32_t quadCount;
 } ChunkMeshResult;
 
@@ -138,7 +138,15 @@ struct ChunkStreaming
     // снова, раньше начинала с нуля, и результат прежней сборки той же
     // клетки мог совпасть с новой заявкой по координатам и ревизии, а
     // значит, быть принят уже после правки блока в промежутке.
-    uint32_t nextRevision;
+    //
+    // Счётчик 64-битный. 32-битного хватало бы на ~4,29 млрд присвоений, а
+    // он растёт на каждую вставку записи и каждую инвалидацию (в том числе
+    // когда кольцо заявок уже полно и заявка не ставится), поэтому обернуться
+    // за время жизни процесса он мог бы. После оборота новая заявка получила
+    // бы уже использованную ревизию, и устаревший результат, всё ещё висящий
+    // в кольце, был бы принят как актуальный. 2^64 присвоений недостижимы.
+    // Ноль зарезервирован как «ревизии нет» и пропускается, как и раньше.
+    uint64_t nextRevision;
     bool pauseRequested;
     bool shutdownRequested;
 
@@ -154,6 +162,18 @@ struct ChunkStreaming
     uint32_t peakUnfinishedWork;
     volatile uint32_t centerEpoch;
 };
+
+// Выдаёт следующую ревизию записи. Ноль зарезервирован как «ревизии нет»:
+// если 64-битный счётчик когда-нибудь дойдёт до переполнения, ноль
+// пропускается, чтобы никакая запись и никакая заявка не получили его.
+static uint64_t NextChunkRevision(ChunkStreaming* streaming)
+{
+    if (++streaming->nextRevision == 0u)
+    {
+        ++streaming->nextRevision;
+    }
+    return streaming->nextRevision;
+}
 
 static void AddMeshToDrawList(ChunkStreaming* streaming, ChunkEntry* entry)
 {
@@ -284,7 +304,7 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     entry->y = y;
     entry->z = z;
     entry->mesh = NULL;
-    entry->revision = ++streaming->nextRevision;
+    entry->revision = NextChunkRevision(streaming);
     entry->drawSlotPlusOne = 0;
     entry->requestQueued = false;
     return entry;
@@ -460,6 +480,45 @@ LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
     ChunkStreaming* streaming)
 {
     VerifyStreamingIntegrity(streaming);
+}
+
+// Тестовые лазейки для проверки переполнения счётчика ревизий. Нужны, чтобы
+// стресс-тест мог подвести счётчик к границе и подложить в кольцо результатов
+// синтетический результат с заданной ревизией. Отдельного заголовка нет, в
+// Release символов тоже нет.
+LAIUE_SCENE_API void ChunkStreamingSetNextRevisionForTesting(
+    ChunkStreaming* streaming, uint64_t value)
+{
+    streaming->nextRevision = value;
+}
+
+LAIUE_SCENE_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
+    ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
+{
+    const ChunkEntry* entry = FindEntry(streaming, x, y, z);
+    return entry != NULL ? entry->revision : 0u;
+}
+
+// Кладёт в очередь результатов пустой (ноль квадов) результат с заданной
+// ревизией, как если бы его вернул рабочий поток. unfinishedWork растёт
+// вместе с resultCount, чтобы инварианты кольца не нарушались: Pump затем
+// уменьшит его при разборе.
+LAIUE_SCENE_API void ChunkStreamingPushEmptyResultForTesting(
+    ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, uint64_t revision)
+{
+    PlatformMutexLock(&streaming->queueLock);
+    const uint32_t queueMask = streaming->queueCapacity - 1u;
+    ChunkMeshResult* result = &streaming->results[
+        (streaming->resultHead + streaming->resultCount) & queueMask];
+    result->x = x;
+    result->y = y;
+    result->z = z;
+    result->quads = NULL;
+    result->revision = revision;
+    result->quadCount = 0u;
+    streaming->resultCount++;
+    streaming->unfinishedWork++;
+    PlatformMutexUnlock(&streaming->queueLock);
 }
 #endif
 
@@ -1161,7 +1220,7 @@ void ChunkStreamingInvalidateBlock(ChunkStreaming* streaming, int64_t blockX, in
                 // меш загружен. Иначе чанк мигал бы дырой те кадр-два, что идёт
                 // перестройка.
                 entry->state = CHUNK_ENTRY_PENDING;
-                entry->revision = ++streaming->nextRevision;
+                entry->revision = NextChunkRevision(streaming);
                 TryEnqueueRequest(streaming, entry);
             }
         }

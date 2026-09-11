@@ -44,6 +44,14 @@
 // публичный заголовок для неё не заводится.
 LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
     ChunkStreaming* streaming);
+// Точки входа для проверки переполнения счётчика ревизий. Тоже только под
+// !NDEBUG и тоже без публичного заголовка.
+LAIUE_SCENE_API void ChunkStreamingSetNextRevisionForTesting(
+    ChunkStreaming* streaming, uint64_t value);
+LAIUE_SCENE_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
+    ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z);
+LAIUE_SCENE_API void ChunkStreamingPushEmptyResultForTesting(
+    ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, uint64_t revision);
 #endif
 
 #define STRESS_SET_CAPACITY 8192u
@@ -140,7 +148,7 @@ typedef struct StressChunkEntry
     int64_t y;
     int64_t z;
     RendererMesh* mesh;
-    uint32_t revision;
+    uint64_t revision;
     uint32_t drawSlotPlusOne;
     int state;
     bool requestQueued;
@@ -923,6 +931,89 @@ static void RunConcurrentCenterScenario(int32_t radius, uint64_t seed, uint32_t 
     WorldDestroy(world);
 }
 
+#ifndef NDEBUG
+// Переполнение счётчика ревизий. Счётчик подводится к 64-битной границе, и
+// проверяется, что переход через неё не путает устаревшие и актуальные
+// результаты: ревизия до переполнения и после обязана различаться, ноль
+// зарезервирован и не выдаётся, а синтетический результат со старой ревизией
+// отбрасывается, тогда как результат с текущей — принимается. Работает
+// только в Debug: тестовые лазейки в Release не компилируются.
+static void RunRevisionOverflowScenario(int32_t radius)
+{
+    stressSeed = 0xA11CE0FFULL;
+    stressStep = 0u;
+    stressRadius = radius;
+    stressQueueCapacity = StressQueueCapacityFor(radius);
+
+    World* world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming* handle = ChunkStreamingCreate(
+        world, (Renderer*)&stressRendererPlaceholder, radius);
+    EXPECT(handle != NULL, "streaming was not created");
+    EXPECT(ChunkStreamingPause(handle), "streaming was not paused");
+
+    ChunkStreamingSetCenter(handle, 0, 0, 0);
+    EXPECT(ChunkStreamingPause(handle), "streaming was not paused");
+
+    StressChunkStreaming* streaming = (StressChunkStreaming*)handle;
+    const int64_t chunkX = 0;
+    const int64_t chunkY = 0;
+    const int64_t chunkZ = 0;
+
+    // Блок внутри чанка: инвалидация трогает ровно одну запись.
+    const int64_t blockX = 1;
+    const int64_t blockY = 1;
+    const int64_t blockZ = 1;
+
+    // Одно присвоение ещё даёт UINT64_MAX, следующее переполняется в ноль,
+    // который обязан быть пропущен.
+    ChunkStreamingSetNextRevisionForTesting(handle, UINT64_MAX - 1u);
+    ChunkStreamingInvalidateBlock(handle, blockX, blockY, blockZ);
+    const uint64_t beforeWrap =
+        ChunkStreamingGetEntryRevisionForTesting(handle, chunkX, chunkY, chunkZ);
+    EXPECT(beforeWrap == UINT64_MAX, "revision before wrap was not the maximum");
+
+    ChunkStreamingInvalidateBlock(handle, blockX, blockY, blockZ);
+    const uint64_t afterWrap =
+        ChunkStreamingGetEntryRevisionForTesting(handle, chunkX, chunkY, chunkZ);
+    EXPECT(afterWrap != 0u, "revision after wrap reused the reserved zero");
+    EXPECT(afterWrap == 1u, "revision after wrap must be one");
+    EXPECT(afterWrap != beforeWrap, "wrap reused the previous revision");
+
+    const int64_t entryIndex = StressFindIndex(streaming, chunkX, chunkY, chunkZ);
+    EXPECT(entryIndex >= 0, "chunk entry disappeared from the table");
+    EXPECT(streaming->entries[entryIndex].state == 1,
+        "entry must be pending after invalidation");
+
+    // Устаревший результат с ревизией до переполнения не должен приниматься
+    // записью, которой после переполнения выдана новая ревизия.
+    ChunkStreamingStats statsBefore;
+    ChunkStreamingGetStats(handle, &statsBefore);
+
+    ChunkStreamingPushEmptyResultForTesting(
+        handle, chunkX, chunkY, chunkZ, beforeWrap);
+    ChunkStreamingPump(handle);
+
+    ChunkStreamingStats statsAfterStale;
+    ChunkStreamingGetStats(handle, &statsAfterStale);
+    EXPECT(statsAfterStale.discardedBuilds == statsBefore.discardedBuilds + 1u,
+        "stale pre-wrap result was not discarded");
+    EXPECT(streaming->entries[entryIndex].state == 1,
+        "stale pre-wrap result was accepted as ready");
+
+    // Актуальный результат с текущей ревизией принимается.
+    ChunkStreamingPushEmptyResultForTesting(
+        handle, chunkX, chunkY, chunkZ, afterWrap);
+    ChunkStreamingPump(handle);
+    EXPECT(streaming->entries[entryIndex].state == 2,
+        "current post-wrap result was not accepted");
+
+    StressClearInjectedMeshes(handle);
+    ChunkStreamingDestroy(handle);
+    WorldDestroy(world);
+}
+#endif
+
 LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
 {
     RunConcurrentCenterScenario(2, 0x0C0FFEE0ULL, 400u);
@@ -934,6 +1025,9 @@ LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
     RunDrawListShiftScenario(3, 256u);
     RunOriginChangeScenario(2, 16u);
     RunPauseAfterResumeScenario(2, 8u);
+#ifndef NDEBUG
+    RunRevisionOverflowScenario(2);
+#endif
 
     LaiueTestRuntimeWrite("Chunk streaming stress tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
