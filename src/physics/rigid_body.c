@@ -1650,6 +1650,12 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
     double absolute[3][3];
     double firstDistance[3];
     double secondDistance[3];
+    // Кольцевые соседи оси. Остаток по модулю компилятор не сводит к
+    // безусловному выбору в этих циклах, и на каждой рёберной оси остаётся
+    // умножать на магическую константу; таблица убирает это, не трогая
+    // порядок перебора осей.
+    static const int32_t axisNext[3] = {1, 2, 0};
+    static const int32_t axisLast[3] = {2, 0, 1};
     for (int32_t i = 0; i < 3; ++i)
     {
         for (int32_t j = 0; j < 3; ++j)
@@ -1668,7 +1674,7 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
     int32_t bestSecondEdge = -1;
     for (int32_t which = 0; which < 6; ++which)
     {
-        int32_t own = which % 3;
+        int32_t own = which < 3 ? which : which - 3;
         // Полупротяжённость вдоль собственной оси — само полуребро; вдоль
         // чужой она набирается из трёх косинусов.
         double reach;
@@ -1707,10 +1713,14 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
     // Полный SAT также обязан проверять пары рёбер. У почти параллельных
     // рёбер cross-ось вырождается и не является разделяющим направлением;
     // её длина здесь равна синусу угла между осями.
+    // Квадрат лучшего перекрытия ведётся рядом с самим перекрытием: сравнение
+    // нормируется через него, и без этого произведение лучшего значения на
+    // себя считалось бы на каждой оси заново.
+    double bestOverlapSquared = bestOverlap * bestOverlap;
     for (int32_t firstAxis = 0; firstAxis < 3; ++firstAxis)
     {
-        int32_t firstNext = (firstAxis + 1) % 3;
-        int32_t firstLast = (firstAxis + 2) % 3;
+        int32_t firstNext = axisNext[firstAxis];
+        int32_t firstLast = axisLast[firstAxis];
         for (int32_t secondAxis = 0; secondAxis < 3; ++secondAxis)
         {
             double lengthSquared =
@@ -1719,8 +1729,8 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
             {
                 continue;
             }
-            int32_t secondNext = (secondAxis + 1) % 3;
-            int32_t secondLast = (secondAxis + 2) % 3;
+            int32_t secondNext = axisNext[secondAxis];
+            int32_t secondLast = axisLast[secondAxis];
             // Test separation without normalization. Normalize only when an
             // edge axis wins the minimum-penetration comparison; rejecting on
             // edge axes but always resolving on a face gives incorrect torque.
@@ -1735,12 +1745,13 @@ static bool BuildBoxManifold(const RigidBodyCache *first, const double *firstHal
             {
                 return false;
             }
-            if (overlap * overlap < bestOverlap * bestOverlap * lengthSquared)
+            if (overlap * overlap < bestOverlapSquared * lengthSquared)
             {
                 double crossAxis[3];
                 Cross3(first->columns[firstAxis], second->columns[secondAxis], crossAxis);
                 double length = SquareRoot(lengthSquared);
                 bestOverlap = overlap / length;
+                bestOverlapSquared = bestOverlap * bestOverlap;
                 double sign = distance < 0.0 ? -1.0 : 1.0;
                 for (int32_t component = 0; component < 3; ++component)
                 {
