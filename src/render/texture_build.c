@@ -46,6 +46,19 @@ typedef struct MaterialSource
     bool found;
 } MaterialSource;
 
+// Сведения о ресурсе без его пикселей: ровно то, что нужно первому
+// проходу сборки, чтобы посчитать геометрию пака. Материал, найденный и
+// в `.lt`, и в исходнике, отдаёт здесь то же, что дал бы полный разбор.
+typedef struct ResourceMeta
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t frameCount;
+    bool found;
+    // Карта нормалей пришла внутри самого `.lt` (формат RGBA8_NORMALS).
+    bool hasNormals;
+} ResourceMeta;
+
 static uint16_t ReadU16Le(const uint8_t *bytes)
 {
     return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
@@ -101,8 +114,31 @@ static void ReleaseSource(MaterialSource *source)
 
 // === Свой формат одной текстуры ===
 
-static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, MaterialSource *outSource,
-                               bool wantNormals)
+// Разобранный заголовок своего формата: геометрия, расписание и
+// отпечаток исходника без единого пикселя. Первый проход сборки читает
+// только его, поэтому все раскодированные текстуры в ОЗУ не копятся.
+typedef struct SingleTextureHeader
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t frameCount;
+    // Версия 1 несла одну длительность на всю анимацию.
+    uint32_t frameMilliseconds;
+    // Ноль у версии 1: таблицы длительностей на кадр нет.
+    uint32_t durationTableOffset;
+    uint32_t payloadOffset;
+    uint32_t payloadBytes;
+    uint64_t sourceModifiedTime;
+    uint32_t sourceSizeBytes;
+    bool withNormals;
+} SingleTextureHeader;
+
+// Проверяет заголовок целиком, включая расписание, но пиксели не
+// трогает. Расписание читается из уже прочитанного файла и стоит
+// копейки; так полный разбор строится поверх той же проверки, а не
+// повторяет её.
+static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t fileBytes,
+                                     SingleTextureHeader *outHeader)
 {
     if (fileBytes < LT_HEADER_BYTES_V1) return false;
     if (ReadU32Le(file) != LT_MAGIC) return false;
@@ -142,11 +178,13 @@ static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, Material
     if (frameCount == 0u || frameCount > TEXTURE_MAX_FRAMES) return false;
     if (frameCount > 1u && frameMilliseconds == 0u) return false;
 
+    uint64_t sourceModifiedTime = 0u;
+    uint32_t sourceSizeBytes = 0u;
     if (version != 1u)
     {
-        outSource->sourceModifiedTime =
+        sourceModifiedTime =
             (uint64_t)ReadU32Le(file + 24) | ((uint64_t)ReadU32Le(file + 28) << 32);
-        outSource->sourceSizeBytes = ReadU32Le(file + 32);
+        sourceSizeBytes = ReadU32Le(file + 32);
     }
 
     uint64_t frameBytes = (uint64_t)width * height * 4u;
@@ -163,16 +201,45 @@ static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, Material
         uint32_t duration =
             version == 1u ? frameMilliseconds : ReadU16Le(file + headerSize + frame * 2u);
         if (frameCount > 1u && duration == 0u) return false;
-        outSource->frameMilliseconds[frame] = (uint16_t)(frameCount > 1u ? duration : 0u);
     }
 
-    const uint8_t *payload = file + headerSize + tableBytes;
+    outHeader->width = width;
+    outHeader->height = height;
+    outHeader->frameCount = frameCount;
+    outHeader->frameMilliseconds = frameMilliseconds;
+    outHeader->durationTableOffset = version == 1u ? 0u : headerSize;
+    outHeader->payloadOffset = headerSize + tableBytes;
+    outHeader->payloadBytes = payloadBytes;
+    outHeader->sourceModifiedTime = sourceModifiedTime;
+    outHeader->sourceSizeBytes = sourceSizeBytes;
+    outHeader->withNormals = withNormals;
+    return true;
+}
+
+static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, MaterialSource *outSource,
+                               bool wantNormals)
+{
+    SingleTextureHeader header;
+    if (!ParseSingleTextureHeader(file, fileBytes, &header)) return false;
+
+    uint64_t frameBytes = (uint64_t)header.width * header.height * 4u;
+    uint64_t albedoBytes = frameBytes * header.frameCount;
+
+    for (uint32_t frame = 0; frame < header.frameCount; ++frame)
+    {
+        uint32_t duration = header.durationTableOffset == 0u
+                                ? header.frameMilliseconds
+                                : ReadU16Le(file + header.durationTableOffset + frame * 2u);
+        outSource->frameMilliseconds[frame] = (uint16_t)(header.frameCount > 1u ? duration : 0u);
+    }
+
+    const uint8_t *payload = file + header.payloadOffset;
     uint8_t *albedo = PlatformAllocate((size_t)albedoBytes, false);
     if (albedo == NULL) return false;
     memcpy(albedo, payload, (size_t)albedoBytes);
 
     uint8_t *normal = NULL;
-    if (withNormals && wantNormals)
+    if (header.withNormals && wantNormals)
     {
         normal = PlatformAllocate((size_t)albedoBytes, false);
         if (normal == NULL)
@@ -185,9 +252,11 @@ static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, Material
 
     outSource->albedo = albedo;
     outSource->normal = normal;
-    outSource->width = width;
-    outSource->height = height;
-    outSource->frameCount = frameCount;
+    outSource->width = header.width;
+    outSource->height = header.height;
+    outSource->frameCount = header.frameCount;
+    outSource->sourceModifiedTime = header.sourceModifiedTime;
+    outSource->sourceSizeBytes = header.sourceSizeBytes;
     outSource->found = true;
     return true;
 }
@@ -228,6 +297,22 @@ static bool DecodeImageFile(const uint8_t *file, uint32_t fileBytes, MaterialSou
         outSource->frameMilliseconds[frame] = info.frameMilliseconds[frame];
     }
     outSource->found = true;
+    return true;
+}
+
+// Заголовок обычного изображения без декодирования: размеры и число
+// кадров нужны первому проходу, а сами пиксели — нет.
+static bool InspectImageMeta(const uint8_t *file, uint32_t fileBytes, ResourceMeta *outMeta)
+{
+    ImageInfo info = {0};
+    if (ImageInspect(file, fileBytes, &info) != IMAGE_OK) return false;
+    if (info.frameCount == 0u || info.frameCount > TEXTURE_MAX_FRAMES) return false;
+
+    outMeta->width = info.width;
+    outMeta->height = info.height;
+    outMeta->frameCount = info.frameCount;
+    outMeta->found = true;
+    outMeta->hasNormals = false;
     return true;
 }
 
@@ -447,6 +532,123 @@ static bool BuildNormalResource(const wchar_t *name, wchar_t *destination, uint3
     return true;
 }
 
+static void MetadataFromSingleTexture(const SingleTextureHeader *header, ResourceMeta *outMeta)
+{
+    outMeta->width = header->width;
+    outMeta->height = header->height;
+    outMeta->frameCount = header->frameCount;
+    outMeta->found = true;
+    outMeta->hasNormals = header->withNormals;
+}
+
+// Разбор ресурса до пикселей: тот же перебор форматов и кэшей, что и в
+// LoadResource, но файл читается ради заголовка и сразу освобождается.
+// Итог обязан совпасть с тем, что даст полный разбор на том же
+// состоянии папки.
+static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
+                             const wchar_t *resourcePath, ResourceMeta *outMeta)
+{
+    memset(outMeta, 0, sizeof(*outMeta));
+
+    uint8_t *bytes = NULL;
+    uint64_t size = 0u;
+
+    const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
+    uint32_t orderCount = LaiueContentCatalogOrderFormats(
+        catalog, LAIUE_CONTENT_TEXTURE_PACK, g_textureExtensions,
+        sizeof(g_textureExtensions) / sizeof(g_textureExtensions[0]), order,
+        LAIUE_CONTENT_FORMAT_ORDER_MAX);
+
+    for (uint32_t index = 0; index < orderCount; ++index)
+    {
+        const wchar_t *extension = order[index];
+        if (!BuildPath(catalog, scratch, resourcePath, extension, scratch->path)) continue;
+
+        PlatformPathInformation source;
+        bool hasSource = UsableFile(scratch->path, &source);
+
+        if (ExtensionIs(extension, L".lt"))
+        {
+            if (!hasSource ||
+                !PlatformReadEntireFile(scratch->path, TEXTURE_MAX_FILE_BYTES, &bytes, &size))
+            {
+                continue;
+            }
+            SingleTextureHeader header;
+            bool parsed = ParseSingleTextureHeader(bytes, (uint32_t)size, &header);
+            PlatformFree(bytes);
+            if (parsed)
+            {
+                MetadataFromSingleTexture(&header, outMeta);
+                return;
+            }
+            continue;
+        }
+
+        wchar_t cacheExtension[16];
+        BuildCacheExtension(extension, cacheExtension, 16u);
+        if (!BuildPath(catalog, scratch, resourcePath, cacheExtension, scratch->cachePath))
+        {
+            continue;
+        }
+
+        PlatformPathInformation cache;
+        bool hasCache = UsableFile(scratch->cachePath, &cache);
+        if (!hasSource && !hasCache) continue;
+
+        if (hasCache && PlatformReadEntireFile(scratch->cachePath, TEXTURE_MAX_FILE_BYTES, &bytes,
+                                               &size))
+        {
+            SingleTextureHeader header;
+            bool parsed = ParseSingleTextureHeader(bytes, (uint32_t)size, &header);
+            PlatformFree(bytes);
+            bool fresh = parsed && (!hasSource ||
+                                    (header.sourceSizeBytes == (uint32_t)source.size &&
+                                     header.sourceModifiedTime == source.modifiedTime));
+            if (fresh)
+            {
+                MetadataFromSingleTexture(&header, outMeta);
+                return;
+            }
+            memset(outMeta, 0, sizeof(*outMeta));
+        }
+
+        if (hasSource &&
+            PlatformReadEntireFile(scratch->path, TEXTURE_MAX_FILE_BYTES, &bytes, &size))
+        {
+            bool parsed = InspectImageMeta(bytes, (uint32_t)size, outMeta);
+            PlatformFree(bytes);
+            if (parsed) return;
+            memset(outMeta, 0, sizeof(*outMeta));
+        }
+    }
+}
+
+// Первый проход по материалу: находятся ли albedo и карта нормалей и
+// какова их геометрия. Пиксели не читаются.
+static void LoadMaterialMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
+                             const wchar_t *name, ResourceMeta *outMeta)
+{
+    memset(outMeta, 0, sizeof(*outMeta));
+    if (name == NULL || !LaiueContentPathIsSafe(name)) return;
+
+    ResourceMeta albedo;
+    LoadResourceMeta(catalog, scratch, name, &albedo);
+    if (!albedo.found) return;
+    *outMeta = albedo;
+    if (albedo.hasNormals) return;   // `.lt` уже принёс карту нормалей
+
+    if (!BuildNormalResource(name, scratch->resource, LAIUE_CONTENT_PATH_CAPACITY)) return;
+    ResourceMeta normal;
+    LoadResourceMeta(catalog, scratch, scratch->resource, &normal);
+    if (!normal.found) return;
+
+    // Карта нормалей обязана совпадать по геометрии: либо один кадр на
+    // всю анимацию, либо столько же, сколько у albedo.
+    outMeta->hasNormals = normal.width == albedo.width && normal.height == albedo.height &&
+                          (normal.frameCount == 1u || normal.frameCount == albedo.frameCount);
+}
+
 static void LoadMaterial(LaiueContentCatalog *catalog, LoadScratch *scratch, const wchar_t *name,
                          MaterialSource *outSource)
 {
@@ -539,11 +741,11 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         return TEXTURE_PACK_LOAD_INVALID;
 
     LoadScratch *scratch = PlatformAllocate(sizeof(*scratch), true);
-    MaterialSource *sources = PlatformAllocate(sizeof(*sources) * materialCount, true);
-    if (scratch == NULL || sources == NULL)
+    ResourceMeta *metas = PlatformAllocate(sizeof(*metas) * materialCount, true);
+    if (scratch == NULL || metas == NULL)
     {
         PlatformFree(scratch);
-        PlatformFree(sources);
+        PlatformFree(metas);
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
@@ -551,37 +753,39 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
                                           LAIUE_CONTENT_NAME_CAPACITY))
     {
         PlatformFree(scratch);
-        PlatformFree(sources);
+        PlatformFree(metas);
         return TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
     }
 
+    // === Проход 1: только заголовки. ===
+    // Раскодированные пиксели здесь не задерживаются: файл читается ради
+    // размеров и расписания и сразу освобождается. В ОЗУ живёт лишь
+    // таблица метаданных на 64 материала.
     uint32_t largest = 1u;
     uint32_t sliceCount = 0u;
     uint32_t missing = 0u;
     bool anyNormal = false;
     for (uint32_t material = 0; material < materialCount; ++material)
     {
-        LoadMaterial(catalog, scratch, materialNames[material], &sources[material]);
-        MaterialSource *source = &sources[material];
-        if (!source->found)
+        LoadMaterialMeta(catalog, scratch, materialNames[material], &metas[material]);
+        const ResourceMeta *meta = &metas[material];
+        if (!meta->found)
         {
             ++missing;
             ++sliceCount;
             continue;
         }
-        if (source->width > largest) largest = source->width;
-        if (source->height > largest) largest = source->height;
-        if (source->normal != NULL) anyNormal = true;
-        if (sliceCount > TEXTURE_PACK_MAX_SLICES - source->frameCount)
+        if (meta->width > largest) largest = meta->width;
+        if (meta->height > largest) largest = meta->height;
+        if (meta->hasNormals) anyNormal = true;
+        if (sliceCount > TEXTURE_PACK_MAX_SLICES - meta->frameCount)
         {
-            for (uint32_t index = 0; index <= material; ++index) ReleaseSource(&sources[index]);
             PlatformFree(scratch);
-            PlatformFree(sources);
+            PlatformFree(metas);
             return TEXTURE_PACK_LOAD_INVALID;
         }
-        sliceCount += source->frameCount;
+        sliceCount += meta->frameCount;
     }
-    PlatformFree(scratch);
 
     // Общий размер массива: наибольшая сторона, округлённая вверх до
     // степени двойки. Остальные слои приводятся к нему усреднением —
@@ -597,11 +801,15 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
                           : NULL;
     if (pixels == NULL)
     {
-        for (uint32_t index = 0; index < materialCount; ++index) ReleaseSource(&sources[index]);
-        PlatformFree(sources);
+        PlatformFree(scratch);
+        PlatformFree(metas);
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
+    // === Проход 2: по одному материалу. ===
+    // Пак уже выделен целиком, поэтому в памяти одновременно он и один
+    // раскодированный материал, а не все. Источник освобождается сразу
+    // после записи своей цепочки мипов.
     uint8_t *albedoCursor = pixels;
     uint8_t *normalCursor = anyNormal ? pixels + albedoBytes : NULL;
     uint32_t firstSlice = 0u;
@@ -609,22 +817,25 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
 
     for (uint32_t material = 0; material < materialCount; ++material)
     {
-        MaterialSource *source = &sources[material];
-        uint32_t frames = source->found ? source->frameCount : 1u;
+        MaterialSource source;
+        LoadMaterial(catalog, scratch, materialNames[material], &source);
+        const ResourceMeta *meta = &metas[material];
+        uint32_t frames = meta->found ? meta->frameCount : 1u;
 
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
-            if (source->found)
+            bool hasPixels = source.found && frame < source.frameCount;
+            if (hasPixels)
             {
-                uint32_t frameBytes = source->width * source->height * 4u;
-                WriteSliceChain(source->albedo + (size_t)frame * frameBytes, source->width,
-                                source->height, size, albedoCursor);
+                uint32_t frameBytes = source.width * source.height * 4u;
+                WriteSliceChain(source.albedo + (size_t)frame * frameBytes, source.width,
+                                source.height, size, albedoCursor);
                 if (normalCursor != NULL)
                 {
-                    if (source->normal != NULL)
+                    if (source.normal != NULL)
                     {
-                        WriteSliceChain(source->normal + (size_t)frame * frameBytes, source->width,
-                                        source->height, size, normalCursor);
+                        WriteSliceChain(source.normal + (size_t)frame * frameBytes, source.width,
+                                        source.height, size, normalCursor);
                     }
                     else
                     {
@@ -646,16 +857,18 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         uint32_t cycle = 0u;
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
-            uint16_t duration =
-                source->found && frames > 1u ? source->frameMilliseconds[frame] : 0u;
+            uint16_t duration = source.found && frames > 1u && frame < source.frameCount
+                                    ? source.frameMilliseconds[frame]
+                                    : 0u;
             outPack->sliceMilliseconds[firstSlice + frame] = duration;
             cycle += duration;
         }
         outPack->animation[material].cycleMilliseconds = cycle;
         firstSlice += frames;
-        ReleaseSource(source);
+        ReleaseSource(&source);
     }
-    PlatformFree(sources);
+    PlatformFree(scratch);
+    PlatformFree(metas);
 
     outPack->width = (uint16_t)size;
     outPack->height = (uint16_t)size;
