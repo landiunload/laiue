@@ -56,6 +56,14 @@ struct World
     bool* occupied;
     uint32_t count;
     uint32_t capacity;
+    /* Ненулевое значение означает, что в таблице есть хоть один чанк, а
+     * значит возможна правка. Читается без блокировки в WorldGetBlock:
+     * пока ноль, ни один чанк ещё не опубликован, и запрос можно сразу
+     * отдать провайдеру. Поле только растёт, поэтому гонка с
+     * WorldTrySetBlock безопасна: запись идёт под исключительным захватом
+     * с release, а чтение — с acquire, и увиденный ноль гарантирует, что
+     * правок ещё нет. */
+    volatile uint32_t editedChunkCount;
     uint64_t revision;
 
     InfiniteCoord blockOrigin[3];
@@ -284,6 +292,14 @@ static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
     return NULL;
 }
 
+/* Публикует факт появления чанка с правкой. Вызывается под исключительным
+ * захватом; release-запись гарантирует, что читатель, увидевший ненулевой
+ * счётчик, пойдёт медленным путём и увидит сам чанк. */
+static void WorldPublishEditedChunkCount(World* world)
+{
+    PlatformAtomicStoreU32Release(&world->editedChunkCount, world->count);
+}
+
 static Chunk* WorldGetOrCreateChunk(
     World* world, LocalChunkCoordinate coordinate)
 {
@@ -319,6 +335,7 @@ static Chunk* WorldGetOrCreateChunk(
     world->chunks[slot] = chunk;
     world->occupied[slot] = true;
     ++world->count;
+    WorldPublishEditedChunkCount(world);
     return chunk;
 }
 
@@ -589,6 +606,14 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
     if (world == NULL)
     {
         return BLOCK_AIR;
+    }
+    /* Пока в таблице нет ни одного чанка, правок нет по определению, и
+     * ответ даёт только провайдер. Тогда не нужны ни блокировка, ни
+     * координаты, ни поиск в таблице: именно этот случай и есть основной
+     * для физики в мире без правок. */
+    if (PlatformAtomicLoadU32Acquire(&world->editedChunkCount) == 0U)
+    {
+        return WorldBaseBlock(world, x, y, z);
     }
     LocalChunkCoordinate coordinate = {
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
@@ -899,6 +924,7 @@ bool WorldApplyBlockBatch(World* world,
             world->chunks[slot] = batch->newChunk;
             world->occupied[slot] = true;
             ++world->count;
+            WorldPublishEditedChunkCount(world);
             batch->stagedDeltas = NULL;
             batch->newChunk = NULL;
             batch->newKeyReady = false;

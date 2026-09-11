@@ -714,6 +714,71 @@ static void TestHaloRegions(void)
     haloDense = false;
 }
 
+// === Быстрый путь пустого мира ===
+//
+// WorldGetBlock, пока в таблице нет ни одного чанка, отвечает провайдером,
+// не трогая ни блокировку, ни таблицу. Проверка держит главное свойство
+// этого пути: первая же правка обязана быть видна следующим запросом, а
+// откат к значению провайдера — тоже. Батч публикует чанки отдельной
+// веткой, поэтому проверяется и он.
+
+static void TestFastPathAfterEmpty(void)
+{
+    ProviderContext context = {0};
+    WorldBaseProvider provider = {
+        .context = &context,
+        .getBlock = ProviderGetBlock,
+        .fillRegion = ProviderFillRegion,
+        .rebase = ProviderRebase,
+    };
+    World *world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "fast-path world was not created");
+
+    // До единой правки ответ даёт провайдер, ревизия ещё нулевая.
+    BlockType base = ProviderPattern(&context, 3, 4, 5);
+    ProviderExpect(WorldGetBlock(world, 3, 4, 5) == base && WorldGetRevision(world) == 0U,
+                   "fast path did not read the provider on an empty world");
+
+    // Первая правка должна быть видна следующим же запросом.
+    ProviderExpect(WorldTrySetBlock(world, 3, 4, 5, (BlockType)200U) &&
+                       WorldGetBlock(world, 3, 4, 5) == (BlockType)200U,
+                   "first edit after the empty fast path was not visible");
+    ProviderExpect(WorldGetRevision(world) == 1U, "first edit did not advance the revision");
+
+    // Чанк, в котором правок нет, по-прежнему отдаётся провайдером.
+    BlockType other = ProviderPattern(&context, 99, 4, 5);
+    ProviderExpect(WorldGetBlock(world, 99, 4, 5) == other,
+                   "unedited chunk was not read from the provider");
+
+    // Возврат к значению провайдера обязан быть виден.
+    ProviderExpect(WorldTrySetBlock(world, 3, 4, 5, base) &&
+                       WorldGetBlock(world, 3, 4, 5) == base,
+                   "reverting to the provider value was not visible");
+    WorldDestroy(world);
+
+    // Батч публикует чанки своей веткой: на пустом мире он тоже обязан
+    // пробить быстрый путь с первого же применения.
+    context = (ProviderContext){0};
+    world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "fast-path batch world was not created");
+    BlockType batchBase = ProviderPattern(&context, 7, 8, 9);
+    WorldBlockMutation mutation = {
+        .block = {7, 8, 9},
+        .expected = batchBase,
+        .replacement = (BlockType)123U,
+    };
+    ProviderExpect(WorldApplyBlockBatch(world, &mutation, 1U) &&
+                       WorldGetBlock(world, 7, 8, 9) == (BlockType)123U,
+                   "first batch after the empty fast path was not visible");
+    WorldDestroy(world);
+
+    // Пустой провайдер: быстрый путь обязан вернуть воздух.
+    World *empty = WorldCreate(NULL);
+    ProviderExpect(empty != NULL && WorldGetBlock(empty, 1, 2, 3) == BLOCK_AIR,
+                   "NULL-provider fast path did not return air");
+    WorldDestroy(empty);
+}
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
     TestEmptyWorld();
@@ -722,6 +787,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestRegionClassification();
     TestHaloRegions();
     TestRegionCoordinateLimits();
+    TestFastPathAfterEmpty();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }
