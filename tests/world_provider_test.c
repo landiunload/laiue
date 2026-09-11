@@ -1,4 +1,5 @@
 #include "world/world.h"
+#include "platform/system.h"
 #include "test_runtime.h"
 
 #include <limits.h>
@@ -779,8 +780,118 @@ static void TestFastPathAfterEmpty(void)
     WorldDestroy(empty);
 }
 
+// === Быстрый путь при гонке читателей и первой правки ===
+//
+// Быстрый путь читает editedChunkCount без блокировки. Проверяется именно
+// публикация: как только правка возвращается и флаг phase выставлен с
+// release, любой поток, увидевший phase с acquire, обязан увидеть и правку,
+// а не снова уйти на быстрый путь с нулевым счётчиком.
+//
+// Провайдер здесь без счётчиков: его зовут несколько потоков сразу, а
+// ProviderPattern из основного набора инкрементирует общий счётчик вызовов.
+
+typedef struct FastPathRaceState
+{
+    World *world;
+    int64_t block[3];
+    BlockType edited;
+    volatile uint32_t phase;
+    volatile uint32_t stop;
+    volatile uint32_t badReads;
+} FastPathRaceState;
+
+static BlockType RaceProviderGetBlock(void *rawContext, int64_t x, int64_t y, int64_t z)
+{
+    (void)rawContext;
+    int64_t sum = x + y * 3 + z * 5;
+    return sum % 4 == 0 ? BLOCK_AIR : (BlockType)9U;
+}
+
+static uint32_t FastPathRaceReader(void *rawContext)
+{
+    FastPathRaceState *state = (FastPathRaceState *)rawContext;
+    while (PlatformAtomicLoadU32Acquire(&state->stop) == 0U)
+    {
+        if (PlatformAtomicLoadU32Acquire(&state->phase) != 0U)
+        {
+            if (WorldGetBlock(state->world, state->block[0], state->block[1],
+                              state->block[2]) != state->edited)
+            {
+                PlatformAtomicIncrementU32(&state->badReads);
+            }
+        }
+        else
+        {
+            (void)WorldGetBlock(state->world, state->block[0], state->block[1],
+                                state->block[2]);
+        }
+    }
+    return 0U;
+}
+
+static void TestFastPathConcurrentVisibility(void)
+{
+    const uint32_t readerCount = 4U;
+    WorldBaseProvider provider = {0};
+    provider.getBlock = RaceProviderGetBlock;
+    World *world = WorldCreate(&provider);
+    ProviderExpect(world != NULL, "race world was not created");
+
+    FastPathRaceState state;
+    for (uint32_t index = 0U; index < sizeof(state); ++index)
+    {
+        ((uint8_t *)&state)[index] = 0U;
+    }
+    state.world = world;
+    state.block[0] = 5;
+    state.block[1] = 6;
+    state.block[2] = 7;
+    state.edited = (BlockType)200U;
+    ProviderExpect(RaceProviderGetBlock(NULL, 5, 6, 7) != state.edited,
+                   "the concurrent edit must differ from the provider value");
+
+    PlatformThread readers[4];
+    uint32_t started = 0U;
+    for (uint32_t index = 0U; index < readerCount; ++index)
+    {
+        if (PlatformThreadStart(&readers[index], FastPathRaceReader, &state))
+        {
+            ++started;
+        }
+    }
+    ProviderExpect(started == readerCount, "fast-path readers did not start");
+
+    // Дать читателям поработать на пустом мире (быстрый путь).
+    for (volatile uint32_t warm = 0U; warm < 200000U; ++warm)
+    {
+    }
+
+    ProviderExpect(WorldTrySetBlock(world, state.block[0], state.block[1], state.block[2],
+                                    state.edited),
+                   "the first concurrent edit failed");
+    PlatformAtomicStoreU32Release(&state.phase, 1U);
+
+    for (volatile uint32_t spin = 0U; spin < 400000U; ++spin)
+    {
+    }
+
+    PlatformAtomicStoreU32Release(&state.stop, 1U);
+    for (uint32_t index = 0U; index < readerCount; ++index)
+    {
+        PlatformThreadJoin(&readers[index]);
+    }
+
+    ProviderExpect(PlatformAtomicLoadU32Acquire(&state.badReads) == 0U,
+                   "a reader that saw the published edit still read the provider");
+    ProviderExpect(WorldGetBlock(world, state.block[0], state.block[1], state.block[2])
+                       == state.edited,
+                   "the first edit was not visible after the readers joined");
+    WorldDestroy(world);
+}
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
+    TestFastPathConcurrentVisibility();
     TestEmptyWorld();
     TestProviderAndMutations();
     TestRebaseAndFormatting();

@@ -359,6 +359,147 @@ static void CheckGeneralRuns(void)
     PlatformFree(frames);
 }
 
+// === Гонка производителя и потока вывода ===
+//
+// Поток вывода гонит RenderFrames, пока игровой поток заказывает, меняет и
+// останавливает голоса. Проверяется сам протокол: состояние слота
+// (PENDING/ACTIVE/FINISHED) и SPSC-очередь команд. Если бы повторное
+// использование слота или публикация индекса были согласованы неверно, гонка
+// проявилась бы порчей состояния или падением; наполнение буфера здесь не
+// важно.
+
+typedef struct MixerRaceState
+{
+    AudioDevice *device;
+    AudioClip *clip;
+    volatile uint32_t stop;
+    volatile int64_t renderBuffers;
+} MixerRaceState;
+
+static uint32_t MixerRenderWorker(void *rawContext)
+{
+    MixerRaceState *state = (MixerRaceState *)rawContext;
+    float *frames = PlatformAllocate(
+        (size_t)EXACT_BUFFER_FRAMES * 2U * sizeof(float), false);
+    if (frames == NULL)
+    {
+        return 1U;
+    }
+    while (PlatformAtomicLoadU32Acquire(&state->stop) == 0U)
+    {
+        if (!AudioDeviceRenderFrames(state->device, frames, EXACT_BUFFER_FRAMES))
+        {
+            PlatformFree(frames);
+            return 2U;
+        }
+        PlatformAtomicIncrementI64(&state->renderBuffers);
+    }
+    PlatformFree(frames);
+    return 0U;
+}
+
+static void CheckConcurrentMixer(void)
+{
+    AudioDeviceConfiguration configuration = {
+        .backend = AUDIO_BACKEND_OFFSCREEN,
+        .sampleRate = TEST_SAMPLE_RATE,
+        .frameCountHint = EXACT_BUFFER_FRAMES,
+        .masterVolume = 1.0f,
+    };
+    AudioDevice *device = NULL;
+    Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+           "the concurrent-mixer device could not be created");
+
+    static int16_t samples[EXACT_MONO_FRAMES];
+    FillReferenceSamples(samples, EXACT_MONO_FRAMES, 77U);
+    AudioClip *clip = MakeExactClip(device, samples, EXACT_MONO_FRAMES, 1U, TEST_SAMPLE_RATE);
+
+    MixerRaceState state;
+    for (uint32_t index = 0U; index < sizeof(state); ++index)
+    {
+        ((uint8_t *)&state)[index] = 0U;
+    }
+    state.device = device;
+    state.clip = clip;
+
+    PlatformThread renderThread;
+    Expect(PlatformThreadStart(&renderThread, MixerRenderWorker, &state),
+           "the output thread could not be started");
+
+    // Заказ короче клипа и без повтора: слоты регулярно доходят до FINISHED
+    // и переиспользуются, а очередь команд при этом не пустует.
+    AudioVoice recent[64];
+    uint32_t recentCount = 0U;
+    uint32_t maximumActive = 0U;
+    for (uint32_t index = 0U; index < 20000U; ++index)
+    {
+        AudioVoiceParameters parameters = {
+            .volume = 1.0f,
+            .pan = 0.0f,
+            .speed = 1.0f,
+            .looping = false,
+        };
+        AudioVoice voice = AudioVoicePlay(device, clip, &parameters);
+        if (voice != AUDIO_VOICE_NONE)
+        {
+            recent[recentCount < 64U ? recentCount : (recentCount % 64U)] = voice;
+            ++recentCount;
+            (void)AudioVoiceSetParameters(device, voice, &parameters);
+            if ((index & 1U) == 0U)
+            {
+                AudioVoiceStop(device, voice);
+            }
+        }
+        if ((index & 1023U) == 0U)
+        {
+            AudioDeviceStats sample;
+            if (AudioDeviceGetStats(device, &sample) && sample.activeVoices > maximumActive)
+            {
+                maximumActive = sample.activeVoices;
+            }
+        }
+    }
+    // Очередь и переход PENDING -> ACTIVE действительно работали: хотя бы в
+    // одном буфере поток вывода увидел звучащий голос. Без публикации команд
+    // или без перехода в ACTIVE здесь остаётся ноль.
+    Expect(maximumActive > 0U, "the output thread never saw an active voice");
+    AudioDeviceStopAllVoices(device);
+
+    // Дать потоку вывода разобрать STOP_ALL: activeVoices обновляется только
+    // внутри RenderFrames, поэтому ждём его спада, а не гасим поток сразу.
+    AudioDeviceStats stats;
+    for (uint32_t spin = 0U; spin < 4000U; ++spin)
+    {
+        Expect(AudioDeviceGetStats(device, &stats),
+               "stats while draining the voice race must be readable");
+        if (stats.activeVoices == 0U)
+        {
+            break;
+        }
+        PlatformSleepMilliseconds(1U);
+    }
+
+    PlatformAtomicStoreU32Release(&state.stop, 1U);
+    PlatformThreadJoin(&renderThread);
+
+    Expect(AudioDeviceGetStats(device, &stats), "stats after the mixer race must be readable");
+    Expect(stats.activeVoices == 0U, "stop-all must leave no active voice after the race");
+    Expect(stats.mixedFrames > 0U, "the output thread must have mixed frames");
+
+    // Ни один из недавно выданных дескрипторов не должен остаться активным
+    // после STOP_ALL: слот либо переиспользован (поколение сменилось), либо
+    // переведён в FINISHED.
+    uint32_t checked = recentCount < 64U ? recentCount : 64U;
+    for (uint32_t index = 0U; index < checked; ++index)
+    {
+        Expect(!AudioVoiceIsActive(device, recent[index]),
+               "a voice handle survived stop-all as active");
+    }
+
+    AudioClipDestroy(clip);
+    AudioDeviceDestroy(device);
+}
+
 LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
 {
     AudioDevice *device = CreateOffscreenDevice();
@@ -492,6 +633,9 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
     // === Побитовая точность микса ===
     CheckExactMixes();
     CheckGeneralRuns();
+
+    // === Гонка производителя и потока вывода ===
+    CheckConcurrentMixer();
 
     PlatformFree(frames);
     AudioClipDestroy(clip);
