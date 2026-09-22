@@ -137,11 +137,13 @@ typedef struct SingleTextureHeader
 // трогает. Расписание читается из уже прочитанного файла и стоит
 // копейки; так полный разбор строится поверх той же проверки, а не
 // повторяет её.
-static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t fileBytes,
-                                     SingleTextureHeader *outHeader)
+static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t availableBytes,
+                                     uint64_t fileBytes, SingleTextureHeader *outHeader)
 {
-    if (fileBytes < LT_HEADER_BYTES_V1) return false;
-    if (ReadU32Le(file) != LT_MAGIC) return false;
+    if (availableBytes < LT_HEADER_BYTES_V1)
+        return false;
+    if (ReadU32Le(file) != LT_MAGIC)
+        return false;
 
     uint32_t version = ReadU16Le(file + 4);
     uint32_t headerSize = ReadU16Le(file + 6);
@@ -160,7 +162,7 @@ static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t fileBytes,
     {
         return false;
     }
-    if (fileBytes < headerSize) return false;
+    if (availableBytes < headerSize) return false;
 
     uint32_t width = ReadU16Le(file + 8);
     uint32_t height = ReadU16Le(file + 10);
@@ -194,6 +196,7 @@ static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t fileBytes,
     if (payloadBytes != (uint32_t)expected) return false;
 
     uint32_t tableBytes = version == 1u ? 0u : frameCount * 2u;
+    if (availableBytes < headerSize + tableBytes) return false;
     if ((uint64_t)fileBytes != (uint64_t)headerSize + tableBytes + payloadBytes) return false;
 
     for (uint32_t frame = 0; frame < frameCount; ++frame)
@@ -220,7 +223,7 @@ static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, Material
                                bool wantNormals)
 {
     SingleTextureHeader header;
-    if (!ParseSingleTextureHeader(file, fileBytes, &header)) return false;
+    if (!ParseSingleTextureHeader(file, fileBytes, fileBytes, &header)) return false;
 
     uint64_t frameBytes = (uint64_t)header.width * header.height * 4u;
     uint64_t albedoBytes = frameBytes * header.frameCount;
@@ -327,6 +330,9 @@ typedef struct LoadScratch
     // в который LTO вклеивает всю сборку пака, переваливает предел кадра
     // 4 КиБ и требует __chkstk, которого без CRT нет.
     MaterialSource source;
+    // Заголовок .lt и максимальная таблица длительностей без payload.
+    // Здесь, на heap, чтобы LTO не увеличивал кадр стека renderer.
+    uint8_t headerPrefix[LT_HEADER_BYTES + TEXTURE_MAX_FRAMES * 2u];
 } LoadScratch;
 
 // Порядок по умолчанию: сначала исходники, свой `.lt` последним. Он
@@ -546,6 +552,21 @@ static void MetadataFromSingleTexture(const SingleTextureHeader *header, Resourc
     outMeta->hasNormals = header->withNormals;
 }
 
+static bool ReadSingleTextureHeader(const wchar_t *path, LoadScratch *scratch,
+                                    SingleTextureHeader *outHeader)
+{
+    uint32_t prefixBytes = 0;
+    uint64_t fileBytes = 0;
+    if (!PlatformReadFilePrefix(path, TEXTURE_MAX_FILE_BYTES, scratch->headerPrefix,
+                                (uint32_t)sizeof(scratch->headerPrefix), &prefixBytes, &fileBytes))
+    {
+        return false;
+    }
+    // Полный размер взят из того же handle: усечённый payload по-прежнему
+    // отвергается, хотя ради метаданных сами пиксели больше не читаются.
+    return ParseSingleTextureHeader(scratch->headerPrefix, prefixBytes, fileBytes, outHeader);
+}
+
 // Разбор ресурса до пикселей: тот же перебор форматов и кэшей, что и в
 // LoadResource, но файл читается ради заголовка и сразу освобождается.
 // Итог обязан совпасть с тем, что даст полный разбор на том же
@@ -567,22 +588,16 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
     for (uint32_t index = 0; index < orderCount; ++index)
     {
         const wchar_t *extension = order[index];
-        if (!BuildPath(catalog, scratch, resourcePath, extension, scratch->path)) continue;
+        if (!BuildPath(catalog, scratch, resourcePath, extension, scratch->path))
+            continue;
 
         PlatformPathInformation source;
         bool hasSource = UsableFile(scratch->path, &source);
 
         if (ExtensionIs(extension, L".lt"))
         {
-            if (!hasSource ||
-                !PlatformReadEntireFile(scratch->path, TEXTURE_MAX_FILE_BYTES, &bytes, &size))
-            {
-                continue;
-            }
             SingleTextureHeader header;
-            bool parsed = ParseSingleTextureHeader(bytes, (uint32_t)size, &header);
-            PlatformFree(bytes);
-            if (parsed)
+            if (hasSource && ReadSingleTextureHeader(scratch->path, scratch, &header))
             {
                 MetadataFromSingleTexture(&header, outMeta);
                 return;
@@ -599,17 +614,16 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
 
         PlatformPathInformation cache;
         bool hasCache = UsableFile(scratch->cachePath, &cache);
-        if (!hasSource && !hasCache) continue;
+        if (!hasSource && !hasCache)
+            continue;
 
-        if (hasCache && PlatformReadEntireFile(scratch->cachePath, TEXTURE_MAX_FILE_BYTES, &bytes,
-                                               &size))
+        if (hasCache)
         {
             SingleTextureHeader header;
-            bool parsed = ParseSingleTextureHeader(bytes, (uint32_t)size, &header);
-            PlatformFree(bytes);
-            bool fresh = parsed && (!hasSource ||
-                                    (header.sourceSizeBytes == (uint32_t)source.size &&
-                                     header.sourceModifiedTime == source.modifiedTime));
+            bool parsed = ReadSingleTextureHeader(scratch->cachePath, scratch, &header);
+            bool fresh =
+                parsed && (!hasSource || (header.sourceSizeBytes == (uint32_t)source.size &&
+                                          header.sourceModifiedTime == source.modifiedTime));
             if (fresh)
             {
                 MetadataFromSingleTexture(&header, outMeta);

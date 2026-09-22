@@ -1,6 +1,7 @@
 #include "physics/rigid_body.h"
 
 #include "math/scalar.h"
+#include "physics/compound_bvh.h"
 #include "physics/fp_environment.h"
 
 #include <float.h>
@@ -888,6 +889,246 @@ bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body, const double point[
     return true;
 }
 
+// === Составная форма: массовые свойства ===
+
+static bool CompoundBoxIsValid(const VoxelRigidCompoundBox *box)
+{
+    if (box == NULL)
+    {
+        return false;
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        if (!IsFiniteDouble(box->center[axis]) || !IsFiniteDouble(box->halfExtent[axis]) ||
+            !(box->halfExtent[axis] > 0.0))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Строгое пересечение интервалов: касание гранями перекрытием не считается,
+// потому что пересечение нулевой меры не удваивает ни объём, ни инерцию.
+static bool CompoundBoxesOverlap(const VoxelRigidCompoundBox *first,
+                                 const VoxelRigidCompoundBox *second)
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double firstMin = first->center[axis] - first->halfExtent[axis];
+        double firstMax = first->center[axis] + first->halfExtent[axis];
+        double secondMin = second->center[axis] - second->halfExtent[axis];
+        double secondMax = second->center[axis] + second->halfExtent[axis];
+        if (!(firstMin < secondMax) || !(secondMin < firstMax))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Конечный симметричный положительно определённый тензор. Критерий Сильвестра:
+// положительны все ведущие главные миноры — диагональ, минор 2x2 и
+// определитель. Асимметрия отвергается точно: MassProperties и контракт
+// задают симметричные компоненты побитово равными.
+static bool CompoundInverseInertiaIsSpd(const double inverse[9])
+{
+    for (uint32_t index = 0u; index < 9u; ++index)
+    {
+        if (!IsFiniteDouble(inverse[index]))
+        {
+            return false;
+        }
+    }
+    if (inverse[1] != inverse[3] || inverse[2] != inverse[6] || inverse[5] != inverse[7])
+    {
+        return false;
+    }
+    double a = inverse[0];
+    double b = inverse[1];
+    double c = inverse[2];
+    double d = inverse[4];
+    double e = inverse[5];
+    double f = inverse[8];
+    if (!(a > 0.0) || !(d > 0.0) || !(f > 0.0))
+    {
+        return false;
+    }
+    if (!(a * d - b * b > 0.0))
+    {
+        return false;
+    }
+    double determinant = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c);
+    return determinant > 0.0;
+}
+
+bool VoxelRigidCompoundMassProperties(const VoxelRigidCompoundBox *boxes, uint32_t boxCount,
+                                      double mass, double outCenter[3], double outHalfExtent[3],
+                                      double outInverseInertia[9])
+{
+    if (boxes == NULL || boxCount == 0u ||
+        !(mass > 0.0) || !IsFiniteDouble(mass) || outCenter == NULL || outHalfExtent == NULL ||
+        outInverseInertia == NULL)
+    {
+        return false;
+    }
+    // Тензор и объёмы считаются при фиксированном FP-режиме, как и весь solver:
+    if ((uint64_t)boxCount * sizeof(*boxes) > SIZE_MAX ||
+        (uint64_t)boxCount * sizeof(*boxes) > UINTPTR_MAX - (uintptr_t)boxes)
+        return false;
+    // иначе MassProperties на враждебном MXCSR дал бы другой COM/envelope.
+    VoxelPhysicsConfigureThread();
+    for (uint32_t index = 0; index < boxCount; ++index)
+    {
+        if (!CompoundBoxIsValid(&boxes[index]))
+        {
+            return false;
+        }
+    }
+    for (uint32_t first = 0u; first < boxCount; ++first)
+    {
+        for (uint32_t second = first + 1u; second < boxCount; ++second)
+        {
+            if (CompoundBoxesOverlap(&boxes[first], &boxes[second]))
+            {
+                return false;
+            }
+        }
+    }
+
+    double volume = 0.0;
+    for (uint32_t index = 0; index < boxCount; ++index)
+    {
+        double cells = 8.0 * boxes[index].halfExtent[0] * boxes[index].halfExtent[1] *
+                       boxes[index].halfExtent[2];
+        volume += cells;
+    }
+    if (!(volume > 0.0) || !IsFiniteDouble(volume))
+    {
+        return false;
+    }
+    // Однородная плотность: масса каждой коробки пропорциональна объёму.
+    double density = mass / volume;
+
+    double center[3] = {0.0, 0.0, 0.0};
+    for (uint32_t index = 0; index < boxCount; ++index)
+    {
+        double childMass = density * 8.0 * boxes[index].halfExtent[0] * boxes[index].halfExtent[1] *
+                           boxes[index].halfExtent[2];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            center[axis] += childMass * boxes[index].center[axis];
+        }
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        center[axis] /= mass;
+        if (!IsFiniteDouble(center[axis]))
+        {
+            return false;
+        }
+    }
+
+    double envelope[3] = {0.0, 0.0, 0.0};
+    for (uint32_t index = 0; index < boxCount; ++index)
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            double reach = boxes[index].center[axis] + boxes[index].halfExtent[axis] - center[axis];
+            double lower =
+                center[axis] - (boxes[index].center[axis] - boxes[index].halfExtent[axis]);
+            if (lower > reach)
+            {
+                reach = lower;
+            }
+            if (reach > envelope[axis])
+            {
+                envelope[axis] = reach;
+            }
+        }
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        if (!(envelope[axis] > 0.0) || !IsFiniteDouble(envelope[axis]))
+        {
+            return false;
+        }
+    }
+
+    // Тензор инерции: собственный вклад коробки плюс теорема Гюйгенса—
+    // Штейнера для сдвига к общему центру масс.
+    double inertia[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    for (uint32_t index = 0; index < boxCount; ++index)
+    {
+        const double *half = boxes[index].halfExtent;
+        double childMass = density * 8.0 * half[0] * half[1] * half[2];
+        double offset[3];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            offset[axis] = boxes[index].center[axis] - center[axis];
+        }
+        inertia[0] += childMass * (half[1] * half[1] + half[2] * half[2]) / 3.0 +
+                      childMass * (offset[1] * offset[1] + offset[2] * offset[2]);
+        inertia[4] += childMass * (half[0] * half[0] + half[2] * half[2]) / 3.0 +
+                      childMass * (offset[0] * offset[0] + offset[2] * offset[2]);
+        inertia[8] += childMass * (half[0] * half[0] + half[1] * half[1]) / 3.0 +
+                      childMass * (offset[0] * offset[0] + offset[1] * offset[1]);
+        inertia[1] += -childMass * offset[0] * offset[1];
+        inertia[2] += -childMass * offset[0] * offset[2];
+        inertia[5] += -childMass * offset[1] * offset[2];
+    }
+    inertia[3] = inertia[1];
+    inertia[6] = inertia[2];
+    inertia[7] = inertia[5];
+    for (uint32_t index = 0u; index < 9u; ++index)
+    {
+        if (!IsFiniteDouble(inertia[index]))
+        {
+            return false;
+        }
+    }
+
+    double a = inertia[0];
+    double b = inertia[1];
+    double c = inertia[2];
+    double d = inertia[4];
+    double e = inertia[5];
+    double f = inertia[8];
+    double determinant = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c);
+    if (!(determinant > 0.0) || !IsFiniteDouble(determinant))
+    {
+        return false;
+    }
+    double inverse[9];
+    inverse[0] = (d * f - e * e) / determinant;
+    inverse[1] = (c * e - b * f) / determinant;
+    inverse[2] = (b * e - c * d) / determinant;
+    inverse[3] = inverse[1];
+    inverse[4] = (a * f - c * c) / determinant;
+    inverse[5] = (b * c - a * e) / determinant;
+    inverse[6] = inverse[2];
+    inverse[7] = inverse[5];
+    inverse[8] = (a * d - b * b) / determinant;
+    for (uint32_t index = 0u; index < 9u; ++index)
+    {
+        if (!IsFiniteDouble(inverse[index]))
+        {
+            return false;
+        }
+    }
+
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outCenter[axis] = center[axis];
+        outHalfExtent[axis] = envelope[axis];
+    }
+    for (uint32_t index = 0u; index < 9u; ++index)
+    {
+        outInverseInertia[index] = inverse[index];
+    }
+    return true;
+}
+
 // === Шаг ===
 
 // Раскладка не случайна. Решатель за шаг трогает только скорости и
@@ -919,6 +1160,41 @@ typedef struct RigidBodyCache
 } RigidBodyCache;
 
 _Static_assert(sizeof(RigidBodyCache) == 256u, "body cache keeps its one-line-per-body layout");
+
+// Геометрия дочерней коробки в мире: тот же поворот, что у тела, центр
+// смещён на R * center. Скорости дочернему кэшу не нужны: решатель читает их
+// из кэша тела, а манифольдам достаточно позиции, осей и AABB.
+static void CompoundChildCache(const RigidBodyCache *bodyCache, const VoxelRigidCompoundBox *box,
+                               RigidBodyCache *outCache)
+{
+    for (int32_t column = 0; column < 3; ++column)
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            outCache->columns[column][axis] = bodyCache->columns[column][axis];
+        }
+    }
+    double largestRadius = 0.0;
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        double centre = bodyCache->position[axis];
+        for (int32_t column = 0; column < 3; ++column)
+        {
+            centre += bodyCache->columns[column][axis] * box->center[column];
+        }
+        double radius = AbsoluteDouble(bodyCache->columns[0][axis]) * box->halfExtent[0] +
+                        AbsoluteDouble(bodyCache->columns[1][axis]) * box->halfExtent[1] +
+                        AbsoluteDouble(bodyCache->columns[2][axis]) * box->halfExtent[2];
+        outCache->position[axis] = centre;
+        outCache->aabbMin[axis] = centre - radius;
+        outCache->aabbMax[axis] = centre + radius;
+        if (radius > largestRadius)
+        {
+            largestRadius = radius;
+        }
+    }
+    outCache->radius = largestRadius;
+}
 
 // Geometry and inertia do not change during velocity iterations. Prepare the
 // three constraint directions once instead of rotating inertia tensors again
@@ -1058,6 +1334,21 @@ typedef struct RigidStepScratch
     uint32_t contactCapacity;
     bool contactOverflow;
     VoxelRigidStepStats *stats;
+    // Составные формы текущего вызова. NULL — все тела обычные коробки.
+    const VoxelRigidCompoundShape *shapes;
+    // Transient immutable geometry prepared once per tick, shared by all
+    // world/pair/wake queries. Present only when primitives exceed bodies.
+    RigidBodyCache *compoundCaches;
+    uint32_t *compoundOffsets;
+    RigidCompoundBvhNode *compoundNodes;
+    uint32_t *compoundRoots;
+    // Disjoint builder slices during bounds jobs; one query workspace after
+    // their barrier. Compound pair/wake collection is canonical and serial.
+    uint32_t *compoundWork;
+    // true, если хотя бы одно тело имеет дочерние коробки: narrowphase идёт
+    // детерминированным последовательным путём, параллельные быстрые пути
+    // обычных коробок для такого вызова отключаются.
+    bool compoundScene;
 } RigidStepScratch;
 
 static double ProfileNow(const RigidStepScratch *scratch)
@@ -1239,6 +1530,193 @@ static bool MemoryRangesOverlap(const void *first, uint64_t firstBytes, const vo
                                           : firstAddress - secondAddress < secondBytes);
 }
 
+// === Составная форма: проверка входа и выбор кэша ===
+
+// Форма обязана быть либо обычной коробкой (boxes == NULL и count == 0), либо
+// полным compound-описанием. Тензор — конечный SPD, а envelope тела обязан
+// действительно покрывать каждого ребёнка в координатах тела: иначе broadphase
+// потерял бы контакты крайнего ребёнка. Pairwise overlap не проверяется: это
+// build-time контракт MassProperties, а не работа каждого тика.
+static bool CompoundShapesValid(const VoxelRigidCompoundShape *shapes, uint32_t bodyCount,
+                                const VoxelRigidBody *bodies)
+{
+    if (shapes == NULL)
+    {
+        return true;
+    }
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        const VoxelRigidCompoundShape *shape = &shapes[index];
+        bool hasBoxes = shape->boxCount > 0u;
+        if (hasBoxes != (shape->boxes != NULL))
+        {
+            return false;
+        }
+        if (!hasBoxes)
+        {
+            continue;
+        }
+        if (bodies == NULL || !CompoundInverseInertiaIsSpd(shape->inverseInertia))
+        {
+            return false;
+        }
+        for (uint32_t box = 0u; box < shape->boxCount; ++box)
+        {
+            const VoxelRigidCompoundBox *child = &shape->boxes[box];
+            if (!CompoundBoxIsValid(child))
+            {
+                return false;
+            }
+            for (int32_t axis = 0; axis < 3; ++axis)
+            {
+                double reach = AbsoluteDouble(child->center[axis]) + child->halfExtent[axis];
+                if (!IsFiniteDouble(bodies[index].halfExtent[axis]) ||
+                    !(reach <= bodies[index].halfExtent[axis]))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool CompoundPrimitiveCount(const VoxelRigidCompoundShape *shapes, uint32_t bodyCount,
+                                   uint32_t *outCount)
+{
+    if (bodyCount == 0u || bodyCount > VOXEL_RIGID_MAX_BODIES || outCount == NULL)
+    {
+        return false;
+    }
+    uint64_t total = 0u;
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        uint32_t boxes = 1u;
+        if (shapes != NULL && shapes[index].boxCount > 0u)
+        {
+            boxes = shapes[index].boxCount;
+        }
+        total += boxes;
+        if (total > UINT32_MAX)
+        {
+            return false;
+        }
+    }
+    if (outCount == NULL)
+    {
+        return false;
+    }
+    *outCount = (uint32_t)total;
+    return true;
+}
+
+static bool CompoundSceneDetect(const VoxelRigidCompoundShape *shapes, uint32_t bodyCount)
+{
+    if (shapes == NULL)
+    {
+        return false;
+    }
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        if (shapes[index].boxCount > 0u)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Описания форм и их массивы коробок принадлежат вызывающему и обязаны быть
+// отдельны от буферов шага, иначе часть чтения видела бы уже записанное
+// состояние. Сами значения проверяются отдельно до первой мутации.
+static bool CompoundShapesAliasFree(const VoxelRigidCompoundShape *shapes, uint32_t bodyCount,
+                                    const VoxelRigidBody *bodies, void *scratch,
+                                    uint32_t scratchBytes, const VoxelRigidStepSettings *settings,
+                                    const VoxelCollisionSource *collision,
+                                    const VoxelRigidContactCache *cache,
+                                    const VoxelRigidBroadphase *broadphase)
+{
+    if (shapes == NULL)
+    {
+        return true;
+    }
+    const void *reserved[] = {bodies,     scratch,
+                              settings,   collision,
+                              cache,      cache != NULL ? cache->storage : NULL,
+                              broadphase, broadphase != NULL ? broadphase->storage : NULL};
+    uint64_t lengths[] = {(uint64_t)bodyCount * sizeof(*bodies),
+                          scratchBytes,
+                          sizeof(*settings),
+                          sizeof(*collision),
+                          cache != NULL ? sizeof(*cache) : 0u,
+                          cache != NULL ? cache->storageBytes : 0u,
+                          broadphase != NULL ? sizeof(*broadphase) : 0u,
+                          broadphase != NULL ? broadphase->storageBytes : 0u};
+    for (uint32_t range = 0u; range < sizeof(reserved) / sizeof(reserved[0]); ++range)
+    {
+        if (MemoryRangesOverlap(shapes, (uint64_t)bodyCount * sizeof(*shapes), reserved[range],
+                                lengths[range]))
+        {
+            return false;
+        }
+    }
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        const VoxelRigidCompoundShape *shape = &shapes[index];
+        if (shape->boxCount == 0u || shape->boxes == NULL)
+        {
+            continue;
+        }
+        uint64_t boxBytes = (uint64_t)shape->boxCount * sizeof(*shape->boxes);
+        if (MemoryRangesOverlap(shape->boxes, boxBytes, shapes,
+                                (uint64_t)bodyCount * sizeof(*shapes)))
+        {
+            return false;
+        }
+        for (uint32_t range = 0u; range < sizeof(reserved) / sizeof(reserved[0]); ++range)
+        {
+            if (MemoryRangesOverlap(shape->boxes, boxBytes, reserved[range], lengths[range]))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static const VoxelRigidCompoundShape *CompoundShapeFor(const RigidStepScratch *scratch,
+                                                       uint32_t index)
+{
+    const VoxelRigidCompoundShape *shape = scratch->shapes != NULL ? &scratch->shapes[index] : NULL;
+    return shape != NULL && shape->boxes != NULL && shape->boxCount > 0u ? shape : NULL;
+}
+
+static const RigidBodyCache *PreparedCompoundChild(const RigidStepScratch *scratch,
+                                                  uint32_t bodyIndex, uint32_t childIndex,
+                                                  const VoxelRigidCompoundBox *box,
+                                                  RigidBodyCache *fallback)
+{
+    if (scratch->compoundCaches != NULL)
+        return &scratch->compoundCaches[scratch->compoundOffsets[bodyIndex] + childIndex];
+    CompoundChildCache(&scratch->caches[bodyIndex], box, fallback);
+    return fallback;
+}
+
+// Return original child indices in ascending order. The BVH rejects exactly
+// the same AABB pairs as BuildBoxManifold, never changing accepted SAT work or
+// contact ordering. Tiny compounds retain the cheaper linear path.
+static bool CompoundChildCandidates(RigidStepScratch *scratch, uint32_t bodyIndex,
+                                    const RigidBodyCache *query, uint32_t capacity,
+                                    uint32_t *outCount)
+{
+    if (scratch->compoundRoots == NULL || scratch->compoundRoots[bodyIndex] == UINT32_MAX)
+        return false;
+    const RigidCompoundBvhNode *nodes =
+        scratch->compoundNodes + (size_t)scratch->compoundOffsets[bodyIndex] * 2u;
+    return RigidCompoundBvhQuery(nodes, scratch->compoundRoots[bodyIndex], query->aabbMin,
+                                query->aabbMax, scratch->compoundWork, capacity, outCount);
+}
+
 void VoxelRigidContactCacheReset(VoxelRigidContactCache *cache)
 {
     if (cache == NULL)
@@ -1290,9 +1768,15 @@ static uint32_t ContactCacheHash(uint64_t firstId, uint64_t secondId, uint32_t m
     return (uint32_t)hash & mask;
 }
 
-uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
+// Раскладка scratch одинакова для обычной и составной сцены. От primitiveCount
+// зависят массивы контактов, solver-контактов, раскрасок, порядка решения и
+// подготовленная геометрия детей. При primitiveCount == bodyCount
+// результат побитово совпадает с прежним VoxelRigidBodyStepScratchBytes, поэтому
+// обычные вызовы не меняют размер и не платят за compound.
+static uint32_t RigidStepScratchBytesFor(uint32_t bodyCount, uint32_t primitiveCount)
 {
-    if (bodyCount == 0u || bodyCount > VOXEL_RIGID_MAX_BODIES)
+    if (bodyCount == 0u || bodyCount > VOXEL_RIGID_MAX_BODIES || primitiveCount < bodyCount ||
+        primitiveCount == 0u)
     {
         return 0u;
     }
@@ -1300,17 +1784,32 @@ uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
     uint64_t grid = (uint64_t)bodyCount * sizeof(RigidGridEntry);
     uint64_t geometry =
         (uint64_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
-    uint64_t contacts = (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    uint64_t contacts = (uint64_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     uint64_t solverContacts =
-        (uint64_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
+        (uint64_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
     uint64_t links = (uint64_t)bodyCount * sizeof(uint32_t) * 5u;
     uint64_t schedule =
-        (uint64_t)bodyCount *
-        (sizeof(uint64_t) + RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t)));
+        (uint64_t)bodyCount * sizeof(uint64_t) +
+        (uint64_t)primitiveCount * RIGID_CONTACTS_PER_BODY * (sizeof(uint8_t) + sizeof(uint32_t));
     uint64_t buckets = (uint64_t)BucketCountFor(bodyCount) * sizeof(uint32_t);
     uint64_t total = caches + grid + geometry + contacts + solverContacts + links + schedule +
                      buckets + sizeof(VoxelRigidStepStats) + 64u;
+    if (primitiveCount > bodyCount)
+        total += (uint64_t)primitiveCount *
+                     (sizeof(RigidBodyCache) + 2u * sizeof(RigidCompoundBvhNode) +
+                      sizeof(uint32_t)) +
+                 (uint64_t)bodyCount * 2u * sizeof(uint32_t) + _Alignof(RigidBodyCache);
     return total > 0xFFFFFFFFull ? 0u : (uint32_t)total;
+}
+
+uint32_t VoxelRigidBodyStepScratchBytes(uint32_t bodyCount)
+{
+    return RigidStepScratchBytesFor(bodyCount, bodyCount);
+}
+
+uint32_t VoxelRigidBodyStepCompoundScratchBytes(uint32_t bodyCount, uint32_t primitiveCount)
+{
+    return RigidStepScratchBytesFor(bodyCount, primitiveCount);
 }
 
 static VoxelRigidStepStats *StepStatsPointer(void *scratch, uint32_t bodyCount)
@@ -2345,7 +2844,8 @@ static uint32_t BlockBoxExposure(BlockSample *sample, const int32_t low[3], cons
 // Разбирает одну выборку на коробки и выдаёт по ним контакты. false —
 // переполнение общего бюджета контактов шага, дальше идти незачем.
 static bool CollectSampleContacts(const VoxelRigidBody *body, uint32_t index,
-                                  const RigidBodyCache *cache, BlockSample *sample,
+                                  const RigidBodyCache *cache, const double halfExtent[3],
+                                  const VoxelRigidCompoundShape *shape, BlockSample *sample,
                                   const int32_t coreSize[3], RigidStepScratch *scratch)
 {
     bool anySolid = false;
@@ -2437,13 +2937,120 @@ static bool CollectSampleContacts(const VoxelRigidBody *body, uint32_t index,
                     continue;
                 }
                 uint32_t exposed = BlockBoxExposure(sample, low, high);
-                BoxManifold manifold;
-                if (!BuildBlockManifold(cache, body->halfExtent, blockCentre, blockHalf, exposed,
-                                        &manifold))
+                if (shape == NULL)
+                {
+                    BoxManifold manifold;
+                    if (!BuildBlockManifold(cache, halfExtent, blockCentre, blockHalf,
+                                            exposed, &manifold))
+                    {
+                        continue;
+                    }
+                    if (!AppendWorldManifold(body, index, &manifold, scratch))
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                // Составное тело: пустоты между дочерними коробками не
+                // заполняются, каждая коробка сталкивается с миром отдельно.
+                for (uint32_t child = 0u; child < shape->boxCount; ++child)
+                {
+                    RigidBodyCache childStorage;
+                    const RigidBodyCache *childCache = PreparedCompoundChild(
+                        scratch, index, child, &shape->boxes[child], &childStorage);
+                    BoxManifold manifold;
+                    if (!BuildBlockManifold(childCache, shape->boxes[child].halfExtent,
+                                            blockCentre, blockHalf, exposed, &manifold))
+                    {
+                        continue;
+                    }
+                    if (!AppendWorldManifold(body, index, &manifold, scratch))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Sample one bounded envelope. A compound whose whole envelope is too large
+// can retry each child independently; small compounds keep their contact order.
+static bool CollectShapeWorldContacts(const VoxelRigidBody *body, uint32_t index,
+                                      const RigidBodyCache *cache, const double halfExtent[3],
+                                      const VoxelRigidCompoundShape *shape,
+                                      const VoxelCollisionSource *collision,
+                                      RigidStepScratch *scratch)
+{
+    BlockSample sample;
+    sample.collision = collision;
+    int64_t blockMin[3];
+    int64_t blockMax[3];
+    uint64_t span[3];
+    bool valid = true;
+    for (int32_t axis = 0; axis < 3 && valid; ++axis)
+    {
+        valid = TryFloorToInt64(cache->aabbMin[axis], &blockMin[axis]) &&
+                TryFloorToInt64(cache->aabbMax[axis], &blockMax[axis]);
+    }
+    uint64_t cells = 1u;
+    for (int32_t axis = 0; axis < 3 && valid; ++axis)
+    {
+        span[axis] = (uint64_t)blockMax[axis] - (uint64_t)blockMin[axis] + 1u;
+        valid = span[axis] != 0u && span[axis] <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
+        cells = valid ? cells * span[axis] : cells;
+        valid = valid && cells <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
+    }
+    if (!valid)
+    {
+        return false;
+    }
+
+    uint32_t tiles[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        tiles[axis] = (uint32_t)((span[axis] + RIGID_BLOCK_TILE - 1u) / RIGID_BLOCK_TILE);
+    }
+    for (uint32_t tileZ = 0; tileZ < tiles[2]; ++tileZ)
+    {
+        for (uint32_t tileY = 0; tileY < tiles[1]; ++tileY)
+        {
+            for (uint32_t tileX = 0; tileX < tiles[0]; ++tileX)
+            {
+                uint32_t tile[3] = {tileX, tileY, tileZ};
+                int32_t coreSize[3];
+                bool ready = true;
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    // Смещение не больше общего числа клеток, а оно уже
+                    // проверено: сумма остаётся внутри blockMax.
+                    int64_t start =
+                        blockMin[axis] + (int64_t)tile[axis] * (int64_t)RIGID_BLOCK_TILE;
+                    int64_t remaining = blockMax[axis] - start + 1;
+                    coreSize[axis] =
+                        remaining < RIGID_BLOCK_TILE ? (int32_t)remaining : RIGID_BLOCK_TILE;
+                    ready = ready && AddInt64Checked(start, -1, &sample.origin[axis]);
+                }
+                if (!ready)
                 {
                     continue;
                 }
-                if (!AppendWorldManifold(body, index, &manifold, scratch))
+                sample.originValid = true;
+                for (int32_t axis = 0; axis < 3; ++axis)
+                {
+                    sample.originValid =
+                        sample.originValid &&
+                        (sample.origin[axis] <= INT64_MAX - (RIGID_BLOCK_SAMPLE - 1));
+                }
+                // Exact fixed-array bounds; Annex K is not available in the no-CRT runtime.
+                // NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+                memset(sample.solid, 0, sizeof(sample.solid));
+                memset(sample.known, 0, sizeof(sample.known));
+                memset(sample.claimed, 0, sizeof(sample.claimed));
+                // NOLINTEND(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+                if (!CollectSampleContacts(body, index, cache, halfExtent, shape, &sample, coreSize,
+                                           scratch))
                 {
                     return false;
                 }
@@ -2457,87 +3064,43 @@ static void CollectWorldContacts(const VoxelRigidBody *bodies, uint32_t bodyCoun
                                  const VoxelCollisionSource *collision, RigidStepScratch *scratch)
 {
     (void)bodyCount;
-    BlockSample sample;
-    sample.collision = collision;
     for (uint32_t ordered = 0; ordered < scratch->activeCount; ++ordered)
     {
         uint32_t index = scratch->order[ordered];
+        const VoxelRigidBody *body = &bodies[index];
         const RigidBodyCache *cache = &scratch->caches[index];
-        if (!bodies[index].active || bodies[index].sleeping || !cache->collidable)
+        if (!body->active || body->sleeping || !cache->collidable)
         {
             continue;
         }
-
-        int64_t blockMin[3];
-        int64_t blockMax[3];
-        uint64_t span[3];
-        bool valid = true;
-        for (int32_t axis = 0; axis < 3 && valid; ++axis)
-        {
-            valid = TryFloorToInt64(cache->aabbMin[axis], &blockMin[axis]) &&
-                    TryFloorToInt64(cache->aabbMax[axis], &blockMax[axis]);
-        }
-        uint64_t cells = 1u;
-        for (int32_t axis = 0; axis < 3 && valid; ++axis)
-        {
-            span[axis] = (uint64_t)blockMax[axis] - (uint64_t)blockMin[axis] + 1u;
-            valid = span[axis] <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
-            cells = valid ? cells * span[axis] : cells;
-            valid = valid && cells <= (uint64_t)RIGID_BLOCK_MAX_CELLS;
-        }
-        if (!valid)
+        const VoxelRigidCompoundShape *shape = CompoundShapeFor(scratch, index);
+        if (CollectShapeWorldContacts(body, index, cache, body->halfExtent, shape, collision,
+                                      scratch))
         {
             continue;
         }
-
-        uint32_t tiles[3];
-        for (int32_t axis = 0; axis < 3; ++axis)
+        if (scratch->contactOverflow)
         {
-            tiles[axis] = (uint32_t)((span[axis] + RIGID_BLOCK_TILE - 1u) / RIGID_BLOCK_TILE);
+            return;
         }
-        for (uint32_t tileZ = 0; tileZ < tiles[2]; ++tileZ)
+        if (shape == NULL)
         {
-            for (uint32_t tileY = 0; tileY < tiles[1]; ++tileY)
+            // Preserve the documented oversized legacy-box behavior.
+            continue;
+        }
+        for (uint32_t child = 0u; child < shape->boxCount; ++child)
+        {
+            RigidBodyCache childStorage;
+            const VoxelRigidCompoundBox *box = &shape->boxes[child];
+            const RigidBodyCache *childCache =
+                PreparedCompoundChild(scratch, index, child, box, &childStorage);
+            if (!CollectShapeWorldContacts(body, index, childCache, box->halfExtent, NULL,
+                                           collision, scratch))
             {
-                for (uint32_t tileX = 0; tileX < tiles[0]; ++tileX)
-                {
-                    uint32_t tile[3] = {tileX, tileY, tileZ};
-                    int32_t coreSize[3];
-                    bool ready = true;
-                    for (int32_t axis = 0; axis < 3; ++axis)
-                    {
-                        // Смещение не больше общего числа клеток, а оно уже
-                        // проверено: сумма остаётся внутри blockMax.
-                        int64_t start =
-                            blockMin[axis] + (int64_t)tile[axis] * (int64_t)RIGID_BLOCK_TILE;
-                        int64_t remaining = blockMax[axis] - start + 1;
-                        coreSize[axis] =
-                            remaining < RIGID_BLOCK_TILE ? (int32_t)remaining : RIGID_BLOCK_TILE;
-                        ready = ready && AddInt64Checked(start, -1, &sample.origin[axis]);
-                    }
-                    if (!ready)
-                    {
-                        continue;
-                    }
-                    sample.originValid = true;
-                    for (int32_t axis = 0; axis < 3; ++axis)
-                    {
-                        sample.originValid =
-                            sample.originValid &&
-                            (sample.origin[axis] <= INT64_MAX - (RIGID_BLOCK_SAMPLE - 1));
-                    }
-                    // Exact fixed-array bounds; Annex K is not available in the no-CRT runtime.
-                    // NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-                    memset(sample.solid, 0, sizeof(sample.solid));
-                    memset(sample.known, 0, sizeof(sample.known));
-                    memset(sample.claimed, 0, sizeof(sample.claimed));
-                    // NOLINTEND(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-                    if (!CollectSampleContacts(&bodies[index], index, cache, &sample, coreSize,
-                                               scratch))
-                    {
-                        return;
-                    }
-                }
+                // A child itself outside the query budget is an explicit step
+                // failure, never a successful step with missing world contacts.
+                scratch->contactOverflow = true;
+                return;
             }
         }
     }
@@ -2768,6 +3331,63 @@ static bool IndexedCandidates(const VoxelRigidBody *bodies, RigidStepScratch *sc
     return true;
 }
 
+// Реальное касание пары для пробуждения. Обычные коробки проверяются прежним
+// SAT по envelope. Если есть составное тело, перебираются дети: спящая
+// L-форма не должна просыпаться от объекта, попавшего в её пустую нишу без
+// фактического контакта.
+static bool WakePairTouches(const VoxelRigidBody *bodies, RigidStepScratch *scratch, uint32_t first,
+                            uint32_t second)
+{
+    const VoxelRigidCompoundShape *firstShape = CompoundShapeFor(scratch, first);
+    const VoxelRigidCompoundShape *secondShape = CompoundShapeFor(scratch, second);
+    if (firstShape == NULL && secondShape == NULL)
+    {
+        BoxManifold manifold;
+        return BuildBoxManifold(&scratch->caches[first], bodies[first].halfExtent,
+                                &scratch->caches[second], bodies[second].halfExtent, &manifold);
+    }
+    const RigidBodyCache *firstCache = &scratch->caches[first];
+    const RigidBodyCache *secondCache = &scratch->caches[second];
+    uint32_t firstCount = firstShape != NULL ? firstShape->boxCount : 1u;
+    uint32_t secondCount = secondShape != NULL ? secondShape->boxCount : 1u;
+    for (uint32_t firstChild = 0u; firstChild < firstCount; ++firstChild)
+    {
+        RigidBodyCache firstStorage;
+        const RigidBodyCache *firstBoxCache = firstCache;
+        const double *firstHalf = bodies[first].halfExtent;
+        if (firstShape != NULL)
+        {
+            firstBoxCache = PreparedCompoundChild(scratch, first, firstChild,
+                                                  &firstShape->boxes[firstChild], &firstStorage);
+            firstHalf = firstShape->boxes[firstChild].halfExtent;
+        }
+        uint32_t candidateCount = secondCount;
+        bool indexed = CompoundChildCandidates(scratch, second, firstBoxCache, secondCount,
+                                                &candidateCount);
+        if (!indexed)
+            candidateCount = secondCount;
+        for (uint32_t candidate = 0u; candidate < candidateCount; ++candidate)
+        {
+            uint32_t secondChild = indexed ? scratch->compoundWork[candidate] : candidate;
+            RigidBodyCache secondStorage;
+            const RigidBodyCache *secondBoxCache = secondCache;
+            const double *secondHalf = bodies[second].halfExtent;
+            if (secondShape != NULL)
+            {
+                secondBoxCache = PreparedCompoundChild(scratch, second, secondChild,
+                    &secondShape->boxes[secondChild], &secondStorage);
+                secondHalf = secondShape->boxes[secondChild].halfExtent;
+            }
+            BoxManifold manifold;
+            if (BuildBoxManifold(firstBoxCache, firstHalf, secondBoxCache, secondHalf, &manifold))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool WakeContactPair(VoxelRigidBody *bodies, RigidStepScratch *scratch,
                             const VoxelRigidStepSettings *settings, uint32_t first, uint32_t second,
                             uint32_t *queued)
@@ -2779,9 +3399,7 @@ static bool WakeContactPair(VoxelRigidBody *bodies, RigidStepScratch *scratch,
     {
         ++scratch->stats->candidatePairCount;
     }
-    BoxManifold manifold;
-    if (!BuildBoxManifold(&scratch->caches[first], bodies[first].halfExtent, secondCache,
-                          bodies[second].halfExtent, &manifold))
+    if (!WakePairTouches(bodies, scratch, first, second))
         return true;
     VoxelRigidBodyWake(&bodies[second]);
     ++scratch->stats->awakeBodyCount;
@@ -2979,6 +3597,78 @@ static RigidContact PairContact(uint32_t first, uint32_t second, const BoxManifo
     return contact;
 }
 
+// Пара составных тел: каждый ребёнок первой формы против пересекающихся детей
+// второй, отобранных BVH. Порядок фиксирован (firstChild, secondChild), поэтому
+// контакты одной пары остаются непрерывным run-ом. Дети одного тела между
+// собой не проверяются никогда.
+static void AppendCompoundPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t second,
+                                       const VoxelRigidCompoundShape *firstShape,
+                                       const VoxelRigidCompoundShape *secondShape,
+                                       RigidStepScratch *scratch)
+{
+    const RigidBodyCache *firstCache = &scratch->caches[first];
+    const RigidBodyCache *secondCache = &scratch->caches[second];
+    double restitution = bodies[first].restitution < bodies[second].restitution
+                             ? bodies[first].restitution
+                             : bodies[second].restitution;
+    double friction = bodies[first].friction < bodies[second].friction ? bodies[first].friction
+                                                                       : bodies[second].friction;
+    uint32_t firstCount = firstShape != NULL ? firstShape->boxCount : 1u;
+    uint32_t secondCount = secondShape != NULL ? secondShape->boxCount : 1u;
+    bool joined = false;
+    for (uint32_t firstChild = 0u; firstChild < firstCount; ++firstChild)
+    {
+        RigidBodyCache firstStorage;
+        const RigidBodyCache *firstBoxCache = firstCache;
+        const double *firstHalf = bodies[first].halfExtent;
+        if (firstShape != NULL)
+        {
+            firstBoxCache = PreparedCompoundChild(scratch, first, firstChild,
+                                                  &firstShape->boxes[firstChild], &firstStorage);
+            firstHalf = firstShape->boxes[firstChild].halfExtent;
+        }
+        uint32_t candidateCount = secondCount;
+        bool indexed = CompoundChildCandidates(scratch, second, firstBoxCache, secondCount,
+                                                &candidateCount);
+        if (!indexed)
+            candidateCount = secondCount;
+        for (uint32_t candidate = 0u; candidate < candidateCount; ++candidate)
+        {
+            uint32_t secondChild = indexed ? scratch->compoundWork[candidate] : candidate;
+            RigidBodyCache secondStorage;
+            const RigidBodyCache *secondBoxCache = secondCache;
+            const double *secondHalf = bodies[second].halfExtent;
+            if (secondShape != NULL)
+            {
+                secondBoxCache = PreparedCompoundChild(scratch, second, secondChild,
+                    &secondShape->boxes[secondChild], &secondStorage);
+                secondHalf = secondShape->boxes[secondChild].halfExtent;
+            }
+            BoxManifold manifold;
+            if (!BuildBoxManifold(firstBoxCache, firstHalf, secondBoxCache, secondHalf, &manifold))
+            {
+                continue;
+            }
+            if (!joined)
+            {
+                JoinContactIsland(bodies, scratch, first, second);
+                scratch->caches[first].hasBodyContact = true;
+                scratch->caches[second].hasBodyContact = true;
+                joined = true;
+            }
+            for (uint32_t point = 0u; point < manifold.count; ++point)
+            {
+                RigidContact contact =
+                    PairContact(first, second, &manifold, point, restitution, friction);
+                if (!AppendContact(scratch, &contact))
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void AppendPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t second,
                                RigidStepScratch *scratch)
 {
@@ -2990,6 +3680,14 @@ static void AppendPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t 
     // touched by an awake body has already been woken by the frontier pass.
     if (bodies[first].sleeping && bodies[second].sleeping)
     {
+        return;
+    }
+
+    const VoxelRigidCompoundShape *firstShape = CompoundShapeFor(scratch, first);
+    const VoxelRigidCompoundShape *secondShape = CompoundShapeFor(scratch, second);
+    if (firstShape != NULL || secondShape != NULL)
+    {
+        AppendCompoundPairContacts(bodies, first, second, firstShape, secondShape, scratch);
         return;
     }
 
@@ -3474,8 +4172,11 @@ static bool CollectBodyContacts(VoxelRigidBody *bodies, uint32_t bodyCount,
                                 RigidStepScratch *scratch)
 {
     (void)bodyCount;
-    bool parallel = scratch->options != NULL && scratch->options->executor != NULL &&
-                    scratch->activeCount > 64u;
+    // Составные формы идут каноническим последовательным путём: параллельные
+    // быстрые коллекторы обычных коробок собрали бы contacts по envelope и
+    // заполнили бы пустоты L-формы.
+    bool parallel = !scratch->compoundScene && scratch->options != NULL &&
+                    scratch->options->executor != NULL && scratch->activeCount > 64u;
     if (parallel && scratch->broadphase == NULL)
     {
         return CollectGridContactsParallel(bodies, scratch);
@@ -3614,6 +4315,25 @@ static void ApplyInverseInertia(const RigidBodyCache *cache, const double invers
     }
 }
 
+// Полный обратный тензор для составного тела: R * I_inv * R^T * v. Обычные
+// коробки продолжают идти диагональным путём выше, чтобы их биты не менялись.
+static void ApplyInverseInertiaFull(const RigidBodyCache *cache, const double inverseInertia[9],
+                                    const double vector[3], double out[3])
+{
+    double body[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        body[axis] = inverseInertia[axis * 3 + 0] * Dot3(vector, cache->columns[0]) +
+                     inverseInertia[axis * 3 + 1] * Dot3(vector, cache->columns[1]) +
+                     inverseInertia[axis * 3 + 2] * Dot3(vector, cache->columns[2]);
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        out[axis] = cache->columns[0][axis] * body[0] + cache->columns[1][axis] * body[1] +
+                    cache->columns[2][axis] * body[2];
+    }
+}
+
 static void ContactVelocity(const RigidBodyCache *cache, const double lever[3], double out[3])
 {
     double rotational[3];
@@ -3624,14 +4344,21 @@ static void ContactVelocity(const RigidBodyCache *cache, const double lever[3], 
     }
 }
 
-static double PrepareImpulseResponse(double inverseMass, const double inverseInertia[3],
-                                     const RigidBodyCache *cache, const double lever[3],
-                                     const double direction[3], double angularResponse[3],
-                                     double torqueOut[3])
+static double PrepareImpulseResponse(double inverseMass, bool fullInertia,
+                                     const double *inverseInertia, const RigidBodyCache *cache,
+                                     const double lever[3], const double direction[3],
+                                     double angularResponse[3], double torqueOut[3])
 {
     double torque[3];
     Cross3(lever, direction, torque);
-    ApplyInverseInertia(cache, inverseInertia, torque, angularResponse);
+    if (fullInertia)
+    {
+        ApplyInverseInertiaFull(cache, inverseInertia, torque, angularResponse);
+    }
+    else
+    {
+        ApplyInverseInertia(cache, inverseInertia, torque, angularResponse);
+    }
     if (torqueOut != NULL)
     {
         for (int32_t axis = 0; axis < 3; ++axis)
@@ -3715,9 +4442,15 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         const RigidBodyCache *cache = &scratch->caches[bodyIndex];
         const RigidBodyCache *otherCache = paired ? &scratch->caches[otherIndex] : NULL;
         const double bodyInverseMass = bodies[bodyIndex].inverseMass;
-        const double *bodyInverseInertia = bodies[bodyIndex].inverseInertia;
+        const VoxelRigidCompoundShape *bodyShape = CompoundShapeFor(scratch, bodyIndex);
+        const VoxelRigidCompoundShape *otherShape =
+            paired ? CompoundShapeFor(scratch, otherIndex) : NULL;
+        const double *bodyInverseInertia =
+            bodyShape != NULL ? bodyShape->inverseInertia : bodies[bodyIndex].inverseInertia;
         const double otherInverseMass = paired ? bodies[otherIndex].inverseMass : 0.0;
-        const double *otherInverseInertia = paired ? bodies[otherIndex].inverseInertia : NULL;
+        const double *otherInverseInertia =
+            otherShape != NULL ? otherShape->inverseInertia
+                               : (paired ? bodies[otherIndex].inverseInertia : NULL);
 
         contact->bodyIndex = bodyIndex;
         contact->otherIndex = otherIndex;
@@ -3745,15 +4478,15 @@ static void PrepareContacts(const VoxelRigidBody *bodies, RigidStepScratch *scra
         {
             RigidConstraintRow *row = &contact->rows[direction];
             double *torqueOut = direction == 1u ? couplingTorque[0] : NULL;
-            double mass = PrepareImpulseResponse(bodyInverseMass, bodyInverseInertia, cache,
-                                                 contact->lever[0], row->direction,
-                                                 row->angularResponse[0], torqueOut);
+            double mass = PrepareImpulseResponse(
+                bodyInverseMass, bodyShape != NULL, bodyInverseInertia, cache, contact->lever[0],
+                row->direction, row->angularResponse[0], torqueOut);
             if (paired)
             {
                 torqueOut = direction == 1u ? couplingTorque[1] : NULL;
-                mass += PrepareImpulseResponse(otherInverseMass, otherInverseInertia, otherCache,
-                                               contact->lever[1], row->direction,
-                                               row->angularResponse[1], torqueOut);
+                mass += PrepareImpulseResponse(otherInverseMass, otherShape != NULL,
+                                               otherInverseInertia, otherCache, contact->lever[1],
+                                               row->direction, row->angularResponse[1], torqueOut);
             }
             masses[direction] = mass;
             row->inverseEffectiveMass = mass > 0.0 && IsFiniteDouble(mass) ? 1.0 / mass : 0.0;
@@ -4763,6 +5496,31 @@ static void BuildCacheRange(void *context, uint32_t begin, uint32_t end)
     {
         uint32_t index = job->scratch->order[ordered];
         BuildCache(&job->bodies[index], &job->scratch->caches[index]);
+        const VoxelRigidCompoundShape *shape = CompoundShapeFor(job->scratch, index);
+        if (job->scratch->compoundRoots != NULL)
+            job->scratch->compoundRoots[index] = UINT32_MAX;
+        if (job->scratch->compoundCaches != NULL && shape != NULL &&
+            job->scratch->caches[index].collidable)
+        {
+            RigidBodyCache *children =
+                job->scratch->compoundCaches + job->scratch->compoundOffsets[index];
+            for (uint32_t child = 0u; child < shape->boxCount; ++child)
+                CompoundChildCache(&job->scratch->caches[index], &shape->boxes[child],
+                                   &children[child]);
+#if !defined(LAIUE_COMPOUND_LINEAR_REFERENCE)
+            // Validation builds can retain the exhaustive oracle to compare
+            // full replay traces. This does not alter the production API.
+            if (shape->boxCount >= 8u)
+            {
+                uint32_t offset = job->scratch->compoundOffsets[index];
+                (void)RigidCompoundBvhBuild(
+                    children[0].aabbMin, sizeof(*children), shape->boxCount,
+                    job->scratch->compoundNodes + (size_t)offset * 2u,
+                    shape->boxCount * 2u, job->scratch->compoundWork + offset,
+                    &job->scratch->compoundRoots[index]);
+            }
+#endif
+        }
     }
 }
 
@@ -5308,7 +6066,8 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
                                   const VoxelRigidStepSettings *settings, void *scratch,
                                   uint32_t scratchBytes, VoxelRigidContactCache *contactCache,
                                   VoxelRigidBroadphase *broadphase,
-                                  const VoxelRigidStepOptions *options)
+                                  const VoxelRigidStepOptions *options,
+                                  const VoxelRigidCompoundShape *shapes, uint32_t primitiveCount)
 {
     if (bodies == NULL || settings == NULL || scratch == NULL || bodyCount == 0u ||
         bodyCount > VOXEL_RIGID_MAX_BODIES || collision == NULL ||
@@ -5331,12 +6090,20 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
             return false;
         }
     }
-    uint32_t required = VoxelRigidBodyStepScratchBytes(bodyCount);
+    // primitiveCount не меньше bodyCount и посчитан без переполнения, поэтому
+    // бюджет контактов масштабируется по форме, а прежний размер обычной сцены
+    // остаётся ровно прежним.
+    uint32_t required = RigidStepScratchBytesFor(bodyCount, primitiveCount);
     if (required == 0u || scratchBytes < required)
     {
         return false;
     }
     if (!StepOptionsValid(options, bodies, bodyCount, collision, settings, scratch, scratchBytes))
+        return false;
+    // Значения форм проверяются до первой мутации состояния тел.
+    if (!CompoundShapesValid(shapes, bodyCount, bodies) ||
+        !CompoundShapesAliasFree(shapes, bodyCount, bodies, scratch, scratchBytes, settings,
+                                 collision, contactCache, broadphase))
         return false;
     if (contactCache != NULL)
     {
@@ -5396,7 +6163,14 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     }
 
     VoxelPhysicsConfigureThread();
-    VoxelRigidStepStats *stepStats = StepStatsPointer(scratch, bodyCount);
+    // Compound расширяет только массивы контактов, поэтому его stats копятся в
+    // локальной структуре и копируются в legacy StepStatsPointer лишь после
+    // завершения: до этого адрес legacy stats перекрыт рабочими массивами.
+    // Обычная сцена пишет прямо туда, как раньше.
+    bool compoundEntry = shapes != NULL;
+    VoxelRigidStepStats localStats = {0};
+    VoxelRigidStepStats *stepStats =
+        compoundEntry ? &localStats : StepStatsPointer(scratch, bodyCount);
     stepStats->activeBodyCount = 0u;
     stepStats->awakeBodyCount = 0u;
     stepStats->candidatePairCount = 0u;
@@ -5422,6 +6196,8 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     }
     if (!hasAwakeBody)
     {
+        if (compoundEntry)
+            *StepStatsPointer(scratch, bodyCount) = *stepStats;
         return true;
     }
 
@@ -5435,9 +6211,9 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     state.narrowphasePoints = (RigidNarrowphasePoint *)cursor;
     cursor += (size_t)bodyCount * RIGID_NARROWPHASE_POINTS_PER_BODY * sizeof(RigidNarrowphasePoint);
     state.contacts = (RigidContact *)cursor;
-    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
+    cursor += (size_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidContact);
     state.solverContacts = (RigidSolverContact *)cursor;
-    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
+    cursor += (size_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(RigidSolverContact);
     state.next = (uint32_t *)cursor;
     cursor += (size_t)bodyCount * sizeof(uint32_t);
     state.order = (uint32_t *)cursor;
@@ -5449,21 +6225,48 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     state.bodyColors = (uint64_t *)cursor;
     cursor += (size_t)bodyCount * sizeof(uint64_t);
     state.contactColors = cursor;
-    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(uint8_t);
+    cursor += (size_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(uint8_t);
     state.solveOrder = (uint32_t *)cursor;
-    cursor += (size_t)bodyCount * RIGID_CONTACTS_PER_BODY * sizeof(uint32_t);
+    cursor += (size_t)primitiveCount * RIGID_CONTACTS_PER_BODY * sizeof(uint32_t);
     state.narrowVisits = (uint32_t *)cursor;
     cursor += (size_t)bodyCount * sizeof(uint32_t);
     state.buckets = (uint32_t *)cursor;
     state.bucketCount = BucketCountFor(bodyCount);
+    state.compoundCaches = NULL;
+    state.compoundOffsets = NULL;
+    state.compoundNodes = NULL;
+    state.compoundRoots = NULL;
+    state.compoundWork = NULL;
+    if (primitiveCount > bodyCount)
+    {
+        cursor += (size_t)state.bucketCount * sizeof(uint32_t);
+        state.compoundOffsets = (uint32_t *)cursor;
+        cursor += (size_t)bodyCount * sizeof(uint32_t);
+        state.compoundRoots = (uint32_t *)cursor;
+        cursor += (size_t)bodyCount * sizeof(uint32_t);
+        cursor += (0u - (uintptr_t)cursor) & (_Alignof(RigidBodyCache) - 1u);
+        state.compoundCaches = (RigidBodyCache *)cursor;
+        cursor += (size_t)primitiveCount * sizeof(RigidBodyCache);
+        state.compoundNodes = (RigidCompoundBvhNode *)cursor;
+        cursor += (size_t)primitiveCount * 2u * sizeof(RigidCompoundBvhNode);
+        state.compoundWork = (uint32_t *)cursor;
+        uint32_t offset = 0u;
+        for (uint32_t index = 0u; index < bodyCount; ++index)
+        {
+            state.compoundOffsets[index] = offset;
+            offset += shapes[index].boxCount > 0u ? shapes[index].boxCount : 1u;
+        }
+    }
     state.candidateCapacity = bodyCount;
     state.broadphase = broadphase;
     state.cellSize = 1.0;
     state.contactCount = 0u;
-    state.contactCapacity = bodyCount * RIGID_CONTACTS_PER_BODY;
+    state.contactCapacity = primitiveCount * RIGID_CONTACTS_PER_BODY;
     state.contactOverflow = false;
     state.stats = stepStats;
     state.options = options;
+    state.shapes = shapes;
+    state.compoundScene = CompoundSceneDetect(shapes, bodyCount);
     double stageBegin = ProfileNow(&state);
     if (!BuildStableOrder(bodies, bodyCount, &state))
     {
@@ -5521,6 +6324,15 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     {
         return false;
     }
+    // Cache хранит по 16 записей на bodyCapacity. Если бюджет контактов
+    // составного шага его перерос, это явный отказ до записи, а не тихое
+    // усечение или переполнение storage. Игра резервирует bodyCapacity не
+    // меньше primitiveCount.
+    if (contactCache != NULL && (uint64_t)state.contactCount >
+                                    (uint64_t)contactCache->bodyCapacity * RIGID_CONTACTS_PER_BODY)
+    {
+        return false;
+    }
     SolveContacts(bodies, &state, settings, contactCache);
     stageBegin = ProfileNow(&state);
     RigidIntegrationJob integrationJob = {bodies, &state};
@@ -5541,6 +6353,8 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
         StoreContactCache(bodies, &state, contactCache);
     }
     ProfileFinish(&state, VOXEL_RIGID_PROFILE_STORE, stageBegin);
+    if (compoundEntry)
+        *StepStatsPointer(scratch, bodyCount) = *stepStats;
     return true;
 }
 
@@ -5550,7 +6364,7 @@ bool VoxelRigidBodyStep(VoxelRigidBody *bodies, uint32_t bodyCount,
                         uint32_t scratchBytes)
 {
     return RigidBodyStepInternal(bodies, bodyCount, collision, settings, scratch, scratchBytes,
-                                 NULL, NULL, NULL);
+                                 NULL, NULL, NULL, NULL, bodyCount);
 }
 
 bool VoxelRigidBodyStepCached(VoxelRigidBody *bodies, uint32_t bodyCount,
@@ -5563,7 +6377,7 @@ bool VoxelRigidBodyStepCached(VoxelRigidBody *bodies, uint32_t bodyCount,
         return false;
     }
     return RigidBodyStepInternal(bodies, bodyCount, collision, settings, scratch, scratchBytes,
-                                 contactCache, NULL, NULL);
+                                 contactCache, NULL, NULL, NULL, bodyCount);
 }
 
 bool VoxelRigidBodyStepIndexed(VoxelRigidBody *bodies, uint32_t bodyCount,
@@ -5575,7 +6389,7 @@ bool VoxelRigidBodyStepIndexed(VoxelRigidBody *bodies, uint32_t bodyCount,
     if (broadphase == NULL)
         return false;
     return RigidBodyStepInternal(bodies, bodyCount, collision, settings, scratch, scratchBytes,
-                                 contactCache, broadphase, NULL);
+                                 contactCache, broadphase, NULL, NULL, bodyCount);
 }
 
 bool VoxelRigidBodyStepEx(VoxelRigidBody *bodies, uint32_t bodyCount,
@@ -5586,5 +6400,23 @@ bool VoxelRigidBodyStepEx(VoxelRigidBody *bodies, uint32_t bodyCount,
     if (options == NULL || options->structSize < sizeof(*options))
         return false;
     return RigidBodyStepInternal(bodies, bodyCount, collision, settings, scratch, scratchBytes,
-                                 options->contactCache, options->broadphase, options);
+                                 options->contactCache, options->broadphase, options, NULL,
+                                 bodyCount);
+}
+
+bool VoxelRigidBodyStepCompoundEx(VoxelRigidBody *bodies, uint32_t bodyCount,
+                                  const VoxelCollisionSource *collision,
+                                  const VoxelRigidStepSettings *settings, void *scratch,
+                                  uint32_t scratchBytes, const VoxelRigidStepOptions *options,
+                                  const VoxelRigidCompoundShape *shapes)
+{
+    if (options != NULL && options->structSize < sizeof(*options))
+        return false;
+    uint32_t primitiveCount = 0u;
+    if (!CompoundPrimitiveCount(shapes, bodyCount, &primitiveCount))
+        return false;
+    VoxelRigidContactCache *contactCache = options != NULL ? options->contactCache : NULL;
+    VoxelRigidBroadphase *broadphase = options != NULL ? options->broadphase : NULL;
+    return RigidBodyStepInternal(bodies, bodyCount, collision, settings, scratch, scratchBytes,
+                                 contactCache, broadphase, options, shapes, primitiveCount);
 }

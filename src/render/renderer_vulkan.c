@@ -80,7 +80,14 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // буферированием. Она создаётся лениво, при первом переполнении, и
 // переиспользуется каждый кадр, поэтому на кадр не создаётся буфер.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
-#define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
+// Инстансы идут в независимых storage-буферах: descriptor set фиксирует
+// конкретный буфер до конца командного списка, поэтому растить один
+// VkBuffer заменой нельзя без копирования уже записанных данных. Чанки
+// создаются лениво и живут до RendererDestroy; курсор слота сбрасывается
+// только после ожидания его fence.
+#define INSTANCE_CHUNK_BYTES (1u * 1024u * 1024u)
+#define INSTANCE_MAX_BYTES_PER_FRAME (64u * 1024u * 1024u)
+#define INSTANCE_MAX_CHUNKS_PER_FRAME 64u
 // Кольцо констант: D3D12 переписывает корневые константы на каждый
 // вызов отрисовки, у Vulkan та же роль у uniform-буфера с динамическим
 // смещением, поэтому на кадр нужен свой диапазон.
@@ -164,7 +171,10 @@ typedef struct GeometryPoolBlock
     FreeRange *freeRanges;      // отсортированы по offset, соседние слиты
     uint32_t freeRangeCount;
     uint32_t freeRangeCapacity;
-    VkDescriptorSet sets[FRAME_COUNT];
+    // Один набор на кадровый слот и instance-чank. Набор намеренно не
+    // переиспользуется для другого VkBuffer: он может быть уже записан в
+    // ожидающий командный буфер.
+    VkDescriptorSet sets[INSTANCE_MAX_CHUNKS_PER_FRAME][FRAME_COUNT];
 } GeometryPoolBlock;
 
 typedef struct PendingUpload
@@ -285,8 +295,11 @@ struct Renderer
     uint32_t meshUploadOffsets[FRAME_COUNT];
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
-    GpuBuffer instanceBuffers[FRAME_COUNT];
-    uint32_t instanceOffsets[FRAME_COUNT];
+    GpuBuffer instanceBuffers[FRAME_COUNT][INSTANCE_MAX_CHUNKS_PER_FRAME];
+    uint32_t instanceChunkCount[FRAME_COUNT];
+    uint32_t instanceChunkIndex[FRAME_COUNT];
+    uint32_t instanceChunkOffset[FRAME_COUNT];
+    uint32_t instancePoolBytes[FRAME_COUNT];
     GpuBuffer uiQuadBuffers[FRAME_COUNT];
     uint32_t uiQuadCount;
 
@@ -443,6 +456,43 @@ static bool BufferCreate(Renderer *renderer, VkDeviceSize sizeBytes, VkBufferUsa
     }
     outBuffer->sizeBytes = sizeBytes;
     return true;
+}
+
+static uint32_t InstanceStorageAlignment(const Renderer *renderer)
+{
+    // firstInstance must express the byte offset as a whole shader element.
+    VkDeviceSize alignment = renderer->storageAlignment;
+    if (alignment < 16u) alignment = 16u;
+    if (alignment < sizeof(RendererMeshInstance)) alignment = sizeof(RendererMeshInstance);
+    if (alignment > UINT32_MAX) return 0u;
+    return (uint32_t)alignment;
+}
+
+static bool AlignInstanceBytes(const Renderer *renderer, uint32_t requestedBytes,
+                               uint32_t *outCapacityBytes)
+{
+    uint32_t alignment = InstanceStorageAlignment(renderer);
+    if (alignment == 0u || requestedBytes == 0u ||
+        requestedBytes > UINT32_MAX - alignment + 1u)
+        return false;
+    uint32_t capacityBytes = AlignUp(requestedBytes, alignment);
+    if (capacityBytes < requestedBytes) return false;
+    *outCapacityBytes = capacityBytes;
+    return true;
+}
+
+static bool CreateVulkanInstanceChunk(Renderer *renderer, uint32_t frameIndex,
+                                      uint32_t chunkIndex, uint32_t requestedBytes)
+{
+    if (frameIndex >= FRAME_COUNT || chunkIndex >= INSTANCE_MAX_CHUNKS_PER_FRAME ||
+        requestedBytes == 0u)
+        return false;
+
+    uint32_t capacityBytes = 0u;
+    if (!AlignInstanceBytes(renderer, requestedBytes, &capacityBytes)) return false;
+
+    return BufferCreate(renderer, capacityBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
+                        &renderer->instanceBuffers[frameIndex][chunkIndex]);
 }
 
 static void ImageDestroy(Renderer *renderer, GpuImage *image)
@@ -781,6 +831,20 @@ static bool PoolBlockIsReferenced(const Renderer *renderer, uint32_t blockIndex)
     return false;
 }
 
+static void FreeBlockDescriptorSets(Renderer *renderer, GeometryPoolBlock *block)
+{
+    for (uint32_t chunk = 0u; chunk < INSTANCE_MAX_CHUNKS_PER_FRAME; ++chunk)
+    {
+        for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+        {
+            VkDescriptorSet *set = &block->sets[chunk][frame];
+            if (*set == VK_NULL_HANDLE) continue;
+            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, 1u, set);
+            *set = VK_NULL_HANDLE;
+        }
+    }
+}
+
 // Отдаёт системе хвостовые блоки пула, в которых не осталось ни одной
 // выданной области. Иначе пул только растёт: после разового всплеска
 // геометрии память GPU остаётся занятой до RendererReleaseWorld. Последний
@@ -809,9 +873,7 @@ static void PoolReclaimEmptyTail(Renderer *renderer)
         // поэтому наборы блока возвращаются пулу наборов, а не остаются в слоте.
         BufferDestroy(renderer, &block->buffer);
         if (block->freeRanges != NULL) PlatformFree(block->freeRanges);
-        if (block->sets[0] != VK_NULL_HANDLE)
-            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, FRAME_COUNT,
-                                 block->sets);
+        FreeBlockDescriptorSets(renderer, block);
         renderer->poolCapacityBytes -= block->totalBytes;
         memset(block, 0, sizeof(*block));
         renderer->poolBlockCount--;
@@ -1230,22 +1292,46 @@ static void RefreshChunkSetTextures(Renderer *renderer)
 {
     for (uint32_t blockIndex = 0; blockIndex < renderer->poolBlockCount; ++blockIndex)
     {
-        for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+        for (uint32_t chunk = 0u; chunk < INSTANCE_MAX_CHUNKS_PER_FRAME; ++chunk)
         {
-            VkDescriptorSet set = renderer->poolBlocks[blockIndex].sets[frame];
-            if (set == VK_NULL_HANDLE) continue;
-            WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
-                                 ActiveBlockAlbedoView(renderer));
-            WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
-                                 ActiveBlockNormalView(renderer));
+            for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+            {
+                VkDescriptorSet set = renderer->poolBlocks[blockIndex].sets[chunk][frame];
+                if (set == VK_NULL_HANDLE) continue;
+                WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
+                                     ActiveBlockAlbedoView(renderer));
+                WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
+                                     ActiveBlockNormalView(renderer));
+            }
         }
     }
+}
+
+static void PopulateBlockDescriptorSet(Renderer *renderer, GeometryPoolBlock *block,
+                                       uint32_t frameIndex, uint32_t chunkIndex,
+                                       VkDescriptorSet set)
+{
+    WriteBufferDescriptor(renderer, set, BINDING_CONSTANTS,
+                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                          renderer->constantBuffers[frameIndex].buffer, sizeof(ChunkConstants));
+    WriteBufferDescriptor(renderer, set, BINDING_QUAD_BUFFER,
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, block->buffer.buffer,
+                          block->buffer.sizeBytes > 0u ? VK_WHOLE_SIZE : 0u);
+    WriteBufferDescriptor(renderer, set, BINDING_INSTANCES,
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+                          renderer->instanceBuffers[frameIndex][chunkIndex].buffer,
+                          VK_WHOLE_SIZE);
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
+                         ActiveBlockAlbedoView(renderer));
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
+                         ActiveBlockNormalView(renderer));
+    WriteSamplerDescriptor(renderer, set);
 }
 
 static bool EnsureBlockDescriptorSets(Renderer *renderer, uint32_t blockIndex)
 {
     GeometryPoolBlock *block = &renderer->poolBlocks[blockIndex];
-    if (block->sets[0] != VK_NULL_HANDLE) return true;
+    if (block->sets[0][0] != VK_NULL_HANDLE) return true;
 
     VkDescriptorSetLayout layouts[FRAME_COUNT];
     for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame) layouts[frame] = renderer->chunkSetLayout;
@@ -1255,27 +1341,40 @@ static bool EnsureBlockDescriptorSets(Renderer *renderer, uint32_t blockIndex)
         .descriptorSetCount = FRAME_COUNT,
         .pSetLayouts = layouts,
     };
-    if (vkAllocateDescriptorSets(renderer->device, &allocateInfo, block->sets) != VK_SUCCESS)
+    if (vkAllocateDescriptorSets(renderer->device, &allocateInfo, block->sets[0]) != VK_SUCCESS)
         return false;
 
     for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
     {
-        VkDescriptorSet set = block->sets[frame];
-        WriteBufferDescriptor(renderer, set, BINDING_CONSTANTS,
-                              VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-                              renderer->constantBuffers[frame].buffer, sizeof(ChunkConstants));
-        WriteBufferDescriptor(renderer, set, BINDING_QUAD_BUFFER,
-                              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, block->buffer.buffer,
-                              block->buffer.sizeBytes > 0u ? VK_WHOLE_SIZE : 0u);
-        WriteBufferDescriptor(renderer, set, BINDING_INSTANCES,
-                              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
-                              renderer->instanceBuffers[frame].buffer, VK_WHOLE_SIZE);
-        WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
-                             ActiveBlockAlbedoView(renderer));
-        WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
-                             ActiveBlockNormalView(renderer));
-        WriteSamplerDescriptor(renderer, set);
+        PopulateBlockDescriptorSet(renderer, block, frame, 0u, block->sets[0][frame]);
     }
+    return true;
+}
+
+static bool EnsureBlockInstanceDescriptorSet(Renderer *renderer, uint32_t blockIndex,
+                                              uint32_t frameIndex, uint32_t chunkIndex)
+{
+    if (blockIndex >= renderer->poolBlockCount || frameIndex >= FRAME_COUNT ||
+        chunkIndex >= renderer->instanceChunkCount[frameIndex])
+        return false;
+    // The base set is also needed by non-instanced draws.  Ensure it before
+    // allocating a higher chunk set; otherwise a block whose first call is a
+    // >1 MiB instanced draw would leave its ordinary mesh path unbound.
+    if (!EnsureBlockDescriptorSets(renderer, blockIndex)) return false;
+
+    GeometryPoolBlock *block = &renderer->poolBlocks[blockIndex];
+    VkDescriptorSet *set = &block->sets[chunkIndex][frameIndex];
+    if (*set != VK_NULL_HANDLE) return true;
+
+    VkDescriptorSetAllocateInfo allocateInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = renderer->descriptorPool,
+        .descriptorSetCount = 1u,
+        .pSetLayouts = &renderer->chunkSetLayout,
+    };
+    if (vkAllocateDescriptorSets(renderer->device, &allocateInfo, set) != VK_SUCCESS)
+        return false;
+    PopulateBlockDescriptorSet(renderer, block, frameIndex, chunkIndex, *set);
     return true;
 }
 
@@ -1536,24 +1635,44 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
     return true;
 }
 
+static bool FrameTargetsReady(const Renderer *renderer)
+{
+    if (renderer->depthTarget.image == VK_NULL_HANDLE) return false;
+    for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+    {
+        if (renderer->colorTargets[frame].image == VK_NULL_HANDLE) return false;
+    }
+    return true;
+}
+
 static bool ApplyPendingResize(Renderer *renderer)
 {
-    renderer->resizeRequested = false;
     if (renderer->resizeWidth <= 0 || renderer->resizeHeight <= 0)
     {
         // Свёрнутое окно: цели кадра не трогаем, кадры пропускаются, но
         // при восстановлении размера swapchain надо пересобрать.
+        renderer->resizeRequested = false;
         if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
         return true;
     }
     if (renderer->resizeWidth == renderer->windowWidth &&
-        renderer->resizeHeight == renderer->windowHeight)
+        renderer->resizeHeight == renderer->windowHeight && FrameTargetsReady(renderer))
+    {
+        renderer->resizeRequested = false;
         return true;
+    }
 
     WaitForGpu(renderer);
     ReleaseFrameTargets(renderer);
     if (!CreateFrameTargets(renderer, renderer->resizeWidth, renderer->resizeHeight))
+    {
+        // Keep the request pending so a transient allocation failure can be
+        // retried on the next frame, including when the requested size equals
+        // the last successfully created size.
+        renderer->resizeRequested = true;
         return false;
+    }
+    renderer->resizeRequested = false;
     // Размер изменился — swapchain придётся пересобрать целиком.
     if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
     return true;
@@ -2213,18 +2332,20 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 
 static bool CreateDescriptorPool(Renderer *renderer)
 {
+    const uint32_t chunkSetCount = MAX_POOL_BLOCKS * FRAME_COUNT *
+                                   INSTANCE_MAX_CHUNKS_PER_FRAME;
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAX_POOL_BLOCKS * FRAME_COUNT + 4u },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, MAX_POOL_BLOCKS * FRAME_COUNT * 2u + 4u },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_POOL_BLOCKS * FRAME_COUNT * 2u + 8u },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, MAX_POOL_BLOCKS * FRAME_COUNT + 4u },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, chunkSetCount + 4u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, chunkSetCount * 2u + 4u },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, chunkSetCount * 2u + 8u },
+        { VK_DESCRIPTOR_TYPE_SAMPLER, chunkSetCount + 4u },
     };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         // Наборы блоков пула освобождаются вместе с миром, а не только
         // вместе с рендерером, поэтому пул обязан это разрешать.
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = MAX_POOL_BLOCKS * FRAME_COUNT + 2u * FRAME_COUNT,
+        .maxSets = chunkSetCount + 2u * FRAME_COUNT,
         .poolSizeCount = 4u,
         .pPoolSizes = sizes,
     };
@@ -2242,9 +2363,13 @@ static bool CreateFrameBuffers(Renderer *renderer)
         if (!BufferCreate(renderer, MESH_UPLOAD_BYTES_PER_FRAME, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                           true, &renderer->meshUploadBuffers[frame]))
             return false;
-        if (!BufferCreate(renderer, INSTANCE_BYTES_PER_FRAME, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                          true, &renderer->instanceBuffers[frame]))
+        uint32_t instanceChunkBytes = 0u;
+        if (!AlignInstanceBytes(renderer, INSTANCE_CHUNK_BYTES, &instanceChunkBytes) ||
+            instanceChunkBytes > INSTANCE_MAX_BYTES_PER_FRAME ||
+            !CreateVulkanInstanceChunk(renderer, frame, 0u, instanceChunkBytes))
             return false;
+        renderer->instanceChunkCount[frame] = 1u;
+        renderer->instancePoolBytes[frame] = instanceChunkBytes;
         if (!BufferCreate(renderer, RENDERER_UI_MAX_QUADS * UI_QUAD_BYTES,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
                           &renderer->uiQuadBuffers[frame]))
@@ -2378,9 +2503,7 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
         GeometryPoolBlock *block = &renderer->poolBlocks[blockIndex];
         BufferDestroy(renderer, &block->buffer);
         if (block->freeRanges != NULL) PlatformFree(block->freeRanges);
-        if (block->sets[0] != VK_NULL_HANDLE)
-            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, FRAME_COUNT,
-                                 block->sets);
+        FreeBlockDescriptorSets(renderer, block);
         memset(block, 0, sizeof(*block));
     }
     renderer->poolBlockCount = 0u;
@@ -2468,7 +2591,8 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             BufferDestroy(renderer, &renderer->constantBuffers[frame]);
             BufferDestroy(renderer, &renderer->meshUploadBuffers[frame]);
             BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frame]);
-            BufferDestroy(renderer, &renderer->instanceBuffers[frame]);
+            for (uint32_t chunk = 0u; chunk < renderer->instanceChunkCount[frame]; ++chunk)
+                BufferDestroy(renderer, &renderer->instanceBuffers[frame][chunk]);
             BufferDestroy(renderer, &renderer->uiQuadBuffers[frame]);
             if (renderer->frameFences[frame] != VK_NULL_HANDLE)
                 vkDestroyFence(renderer->device, renderer->frameFences[frame], NULL);
@@ -2651,11 +2775,56 @@ static bool PushConstants(Renderer *renderer, const void *bytes, uint32_t sizeBy
     return true;
 }
 
+static bool ReserveVulkanInstanceSpace(Renderer *renderer, uint32_t bytes,
+                                       uint32_t *outChunkIndex, uint32_t *outOffset)
+{
+    if (bytes == 0u || bytes > INSTANCE_MAX_BYTES_PER_FRAME) return false;
+
+    uint32_t alignment = InstanceStorageAlignment(renderer);
+    if (alignment == 0u) return false;
+    uint32_t chunkIndex = renderer->instanceChunkIndex[renderer->frameIndex];
+    uint32_t currentOffset = renderer->instanceChunkOffset[renderer->frameIndex];
+    if (currentOffset > UINT32_MAX - alignment + 1u) return false;
+    uint32_t offset = AlignUp(currentOffset, alignment);
+
+    while (chunkIndex < renderer->instanceChunkCount[renderer->frameIndex])
+    {
+        GpuBuffer *chunk = &renderer->instanceBuffers[renderer->frameIndex][chunkIndex];
+        if (offset <= chunk->sizeBytes && bytes <= chunk->sizeBytes - offset) break;
+        ++chunkIndex;
+        offset = 0u;
+    }
+
+    if (chunkIndex == renderer->instanceChunkCount[renderer->frameIndex])
+    {
+        if (chunkIndex == INSTANCE_MAX_CHUNKS_PER_FRAME) return false;
+
+        uint32_t capacityBytes = bytes > INSTANCE_CHUNK_BYTES ? bytes : INSTANCE_CHUNK_BYTES;
+        if (!AlignInstanceBytes(renderer, capacityBytes, &capacityBytes) ||
+            renderer->instancePoolBytes[renderer->frameIndex] > INSTANCE_MAX_BYTES_PER_FRAME ||
+            capacityBytes > INSTANCE_MAX_BYTES_PER_FRAME -
+                                renderer->instancePoolBytes[renderer->frameIndex])
+            return false;
+        if (!CreateVulkanInstanceChunk(renderer, renderer->frameIndex, chunkIndex, capacityBytes))
+            return false;
+        renderer->instanceChunkCount[renderer->frameIndex] = chunkIndex + 1u;
+        renderer->instancePoolBytes[renderer->frameIndex] += capacityBytes;
+        offset = 0u;
+    }
+
+    renderer->instanceChunkIndex[renderer->frameIndex] = chunkIndex;
+    renderer->instanceChunkOffset[renderer->frameIndex] = offset + bytes;
+    *outChunkIndex = chunkIndex;
+    *outOffset = offset;
+    return true;
+}
+
 static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint32_t instanceCount,
-                             uint32_t instanceOffset)
+                             uint32_t instanceChunkIndex, uint32_t instanceOffset)
 {
     GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
-    VkDescriptorSet set = block->sets[renderer->frameIndex];
+    if (instanceChunkIndex >= INSTANCE_MAX_CHUNKS_PER_FRAME) return;
+    VkDescriptorSet set = block->sets[instanceChunkIndex][renderer->frameIndex];
     if (set == VK_NULL_HANDLE) return;
 
     uint32_t constantOffset = 0u;
@@ -2663,11 +2832,15 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
                        &constantOffset))
         return;
 
-    uint32_t dynamicOffsets[3] = { constantOffset, mesh->offsetBytes, instanceOffset };
+    // VK_WHOLE_SIZE storage descriptors require zero dynamic offsets (06715).
+    // VertexIndex and InstanceIndex include these bases without changing shaders.
+    uint32_t dynamicOffsets[3] = { constantOffset, 0u, 0u };
+    uint32_t firstVertex = (mesh->offsetBytes / (uint32_t)sizeof(ChunkQuad)) * 6u;
+    uint32_t firstInstance = instanceOffset / (uint32_t)sizeof(RendererMeshInstance);
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->chunkPipelineLayout, 0u, 1u, &set, 3u, dynamicOffsets);
-    vkCmdDraw(commandBuffer, mesh->quadCount * 6u, instanceCount, 0u, 0u);
+    vkCmdDraw(commandBuffer, mesh->quadCount * 6u, instanceCount, firstVertex, firstInstance);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
 }
@@ -2681,7 +2854,7 @@ void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
     renderer->chunkConstants.chunkOriginRelative[1] = chunkOriginRelative[1];
     renderer->chunkConstants.chunkOriginRelative[2] = chunkOriginRelative[2];
     renderer->chunkConstants.meshScale = 1.0f;
-    DrawMeshInternal(renderer, mesh, 1u, 0u);
+    DrawMeshInternal(renderer, mesh, 1u, 0u, 0u);
 }
 
 void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -2689,22 +2862,25 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
 {
     if (renderer == NULL || mesh == NULL || instances == NULL || instanceCount == 0u ||
         !renderer->renderingActive ||
-        instanceCount > INSTANCE_BYTES_PER_FRAME / (uint32_t)sizeof(RendererMeshInstance))
+        instanceCount > INSTANCE_MAX_BYTES_PER_FRAME / (uint32_t)sizeof(RendererMeshInstance))
         return;
 
     uint32_t bytes = instanceCount * (uint32_t)sizeof(RendererMeshInstance);
-    uint32_t alignment = (uint32_t)renderer->storageAlignment;
-    uint32_t offset = AlignUp(renderer->instanceOffsets[renderer->frameIndex], alignment);
-    if (offset > INSTANCE_BYTES_PER_FRAME || bytes > INSTANCE_BYTES_PER_FRAME - offset) return;
-    memcpy(renderer->instanceBuffers[renderer->frameIndex].mapped + offset, instances, bytes);
-    renderer->instanceOffsets[renderer->frameIndex] = offset + bytes;
+    uint32_t chunkIndex = 0u;
+    uint32_t offset = 0u;
+    if (!ReserveVulkanInstanceSpace(renderer, bytes, &chunkIndex, &offset) ||
+        !EnsureBlockInstanceDescriptorSet(renderer, mesh->blockIndex, renderer->frameIndex,
+                                          chunkIndex))
+        return;
+    memcpy(renderer->instanceBuffers[renderer->frameIndex][chunkIndex].mapped + offset, instances,
+           bytes);
 
     // Отрицательный масштаб — признак инстансного пути в chunk.hlsl.
     renderer->chunkConstants.chunkOriginRelative[0] = 0.0f;
     renderer->chunkConstants.chunkOriginRelative[1] = 0.0f;
     renderer->chunkConstants.chunkOriginRelative[2] = 0.0f;
     renderer->chunkConstants.meshScale = -1.0f;
-    DrawMeshInternal(renderer, mesh, instanceCount, offset);
+    DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset);
 }
 
 // === Кадр ===
@@ -2795,7 +2971,8 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     renderer->constantOffsets[renderer->frameIndex] = 0u;
     renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
     renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
-    renderer->instanceOffsets[renderer->frameIndex] = 0u;
+    renderer->instanceChunkIndex[renderer->frameIndex] = 0u;
+    renderer->instanceChunkOffset[renderer->frameIndex] = 0u;
     memset(&renderer->currentStats, 0, sizeof(renderer->currentStats));
     renderer->currentStats.scenePasses = frame->passCount;
 

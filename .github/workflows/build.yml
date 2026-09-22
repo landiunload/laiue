@@ -186,7 +186,7 @@ jobs:
           apt-get install -y ca-certificates cmake gcc git ninja-build             glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools             vulkan-validationlayers
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure
-        run: cmake --preset linux-vulkan-offscreen
+        run: cmake --preset linux-vulkan-offscreen -DLAIUE_REQUIRE_VULKAN_TEST_DRIVER=ON
       - name: Build Debug
         run: cmake --build --preset linux-vulkan-offscreen-debug --parallel
       # Кадр рисуется программным драйвером Mesa: GPU у раннера нет, но

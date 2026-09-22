@@ -37,10 +37,10 @@ option(LAIUE_BUILD_GRAPHICS
     ${_laiue_graphics_default})
 
 # Набор графических модулей задаёт бэкенд, а не платформа. D3D12 несёт
-# весь слой; Vulkan на первом этапе — мешер и offscreen-рендер, потому
-# что окно, ввод, звук, сцена и шрифты интерфейса всё ещё написаны прямо
-# на Win32/GDI. Звук переносим целиком: микшер платформы не знает, а
-# вывод у него свой на каждой. Список выводится в конфигурации, чтобы
+# полный Windows-слой; Vulkan остаётся переносимым и поддерживает offscreen
+# без хендла, а на Windows с HWND — Win32 swapchain. Оконный, вводный и UI
+# слои Vulkan-профиль не включает; звук переносим целиком, а вывод у него
+# свой на каждой платформе. Список выводится в конфигурации, чтобы
 # неполнота профиля была видна, а не подразумевалась.
 if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input audio mesh render scene ui)
@@ -146,6 +146,7 @@ install(FILES "${PROJECT_SOURCE_DIR}/src/world/world.h"
     COMPONENT Engine)
 install(FILES
         "${PROJECT_SOURCE_DIR}/src/physics/rigid_body.h"
+        "${PROJECT_SOURCE_DIR}/src/physics/compound_shape.h"
         "${PROJECT_SOURCE_DIR}/src/physics/rigid_broadphase.h"
         "${PROJECT_SOURCE_DIR}/src/physics/voxel_body.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"

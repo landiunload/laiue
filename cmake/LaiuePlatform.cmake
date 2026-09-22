@@ -144,8 +144,8 @@ if(LAIUE_NATIVE_MOD_MODE_RESOLVED STREQUAL "DYNAMIC")
 endif()
 
 # Графический бэкенд выбирается отдельно от платформенного: D3D12 живёт
-# только на Windows, Vulkan переносим и на первом этапе рисует offscreen,
-# без окна и swapchain.
+# только на Windows, Vulkan переносим; без window handle он рисует offscreen,
+# а на Windows при HWND использует Win32 surface/swapchain.
 set(LAIUE_RENDER_BACKEND "AUTO" CACHE STRING
     "Render backend: AUTO, D3D12 or VULKAN")
 set_property(CACHE LAIUE_RENDER_BACKEND PROPERTY STRINGS AUTO D3D12 VULKAN)

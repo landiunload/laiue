@@ -634,6 +634,61 @@ bool PlatformReadEntireFile(const wchar_t *path, uint64_t maximumBytes, uint8_t 
     return true;
 }
 
+bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void *buffer,
+                            uint32_t capacity, uint32_t *outBytesRead, uint64_t *outFileSize)
+{
+    if (outBytesRead != NULL)
+        *outBytesRead = 0U;
+    if (outFileSize != NULL)
+        *outFileSize = 0U;
+    if (path == NULL || outBytesRead == NULL || outFileSize == NULL ||
+        (capacity != 0U && buffer == NULL))
+        return false;
+
+    char nativePath[LAIUE_PLATFORM_PATH_CAPACITY * 4U];
+    if (!WidePathToUtf8(path, nativePath))
+        return false;
+    int file;
+    do
+    {
+        /* O_NONBLOCK lets fstat reject a FIFO without waiting for its writer.
+         * It has no effect on the regular files accepted below. */
+        file = open(nativePath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    } while (file < 0 && errno == EINTR);
+    if (file < 0)
+        return false;
+    struct stat status;
+    int statResult;
+    do
+    {
+        statResult = fstat(file, &status);
+    } while (statResult < 0 && errno == EINTR);
+    bool valid = statResult == 0 && S_ISREG(status.st_mode) && status.st_size >= 0 &&
+                 (uint64_t)status.st_size <= maximumFileBytes;
+    uint32_t wanted =
+        valid && (uint64_t)status.st_size < capacity ? (uint32_t)status.st_size : capacity;
+    uint32_t completed = 0U;
+    while (valid && completed < wanted)
+    {
+        uint32_t part = wanted - completed;
+        if (part > 0x7ffff000U)
+            part = 0x7ffff000U;
+        ssize_t result = read(file, (uint8_t *)buffer + completed, part);
+        if (result < 0 && errno == EINTR)
+            continue;
+        if (result <= 0)
+            valid = false;
+        else
+            completed += (uint32_t)result;
+    }
+    close(file);
+    if (!valid)
+        return false;
+    *outBytesRead = completed;
+    *outFileSize = (uint64_t)status.st_size;
+    return true;
+}
+
 static bool WriteAll(int file, const void *bytes, uint64_t size)
 {
     const uint8_t *source = bytes;

@@ -37,14 +37,17 @@
 | `ui` | immediate-mode UI поверх renderer |
 
 `laiue::engine` объединяет доступные для выбранной платформы модули.
-Windows собирает полный графический набор. Linux и macOS экспортируют
+Windows собирает полный графический набор. При найденном Vulkan SDK
+`AUTO`-сборка на Windows дополнительно связывает Vulkan, и
+`RendererCreateWithBackend` выбирает бэкенд явно: `RendererCreate` по
+умолчанию даёт D3D12. Linux и macOS экспортируют
 headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 остаётся внутренней реализацией этих библиотек. Наличие core-сборки не
 означает наличие окна или рендера на этой платформе.
 
 | Платформа | Core/headless | Полный клиент |
 |---|---:|---:|
-| Windows x86_64 | CI | D3D12, CI |
+| Windows x86_64 | CI | D3D12, CI; Vulkan (Win32 swapchain) при Vulkan SDK |
 | Windows ARM64 | clang-cl собран и слинкован локально; native CI job | D3D12 собирается; на устройстве не запускался |
 | Linux x86_64 | glibc и musl, проверено в Docker | Vulkan offscreen, ALSA и сцена; окна, ввода и UI ещё нет |
 | Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | Vulkan-профиль не собирался на ARM64 |

@@ -473,6 +473,51 @@ bool PlatformReadEntireFile(const wchar_t* path, uint64_t maximumBytes,
     return true;
 }
 
+bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void *buffer,
+                            uint32_t capacity, uint32_t *outBytesRead, uint64_t *outFileSize)
+{
+    if (outBytesRead != NULL)
+        *outBytesRead = 0U;
+    if (outFileSize != NULL)
+        *outFileSize = 0U;
+    if (path == NULL || outBytesRead == NULL || outFileSize == NULL ||
+        (capacity != 0U && buffer == NULL))
+        return false;
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    LARGE_INTEGER size = {0};
+    bool valid = GetFileType(file) == FILE_TYPE_DISK &&
+                 GetFileInformationByHandle(file, &information) &&
+                 (information.dwFileAttributes &
+                  (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0U &&
+                 GetFileSizeEx(file, &size) && size.QuadPart >= 0 &&
+                 (uint64_t)size.QuadPart <= maximumFileBytes;
+    uint32_t wanted =
+        valid && (uint64_t)size.QuadPart < capacity ? (uint32_t)size.QuadPart : capacity;
+    uint32_t completed = 0U;
+    while (valid && completed < wanted)
+    {
+        DWORD part = wanted - completed;
+        if (part > 0x7ffff000U)
+            part = 0x7ffff000U;
+        DWORD read = 0U;
+        if (!ReadFile(file, (uint8_t *)buffer + completed, part, &read, NULL) || read == 0U)
+            valid = false;
+        else
+            completed += read;
+    }
+    CloseHandle(file);
+    if (!valid)
+        return false;
+    *outBytesRead = completed;
+    *outFileSize = (uint64_t)size.QuadPart;
+    return true;
+}
+
 bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
                              uint64_t size)
 {

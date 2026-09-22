@@ -4,7 +4,7 @@
 
 | Платформа | Core | Graphics | ABI |
 |---|---:|---:|---|
-| Windows x86_64 | Tier 1 | Tier 1 | MSVC или clang-cl, no-CRT runtime |
+| Windows x86_64 | Tier 1 | Tier 1: D3D12; при Vulkan SDK ещё и Vulkan (Win32 swapchain) | MSVC или clang-cl, no-CRT runtime |
 | Windows ARM64 | clang-cl собран локально | собирается, не запускался | MSVC или clang-cl, no-CRT runtime |
 | Debian x86_64 | Tier 1, Docker CI | Vulkan offscreen, CI на lavapipe | glibc, GCC или Clang |
 | Alpine x86_64 | проверено в Docker | — | musl, GCC |
@@ -26,15 +26,23 @@ Core включает `platform_support`, `world`, `physics`, `content` и `mod`
 | Бэкенд | Графические модули | Чего нет |
 |---|---|---|
 | `D3D12` | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
-| `VULKAN` | `audio`, `mesh`, `render`, `scene` | окно, ввод, интерфейс |
+| `VULKAN` | `audio`, `mesh`, `render`, `scene` | оконный, вводный и интерфейсный модули движка |
 
-Профиль Vulkan первого этапа рисует кадр offscreen: `RendererCreate`
-принимает только `NULL` вместо оконного хендла, а результат читается
+На Windows `LAIUE_RENDER_BACKEND=AUTO` (умолчание) связывает все физически
+доступные бэкенды: D3D12 и, если найден Vulkan SDK, Vulkan. `RendererCreate`
+и `RENDERER_BACKEND_AUTO` при этом дают D3D12, а конкретный бэкенд выбирает
+`RendererCreateWithBackend`. Явные `D3D12`/`VULKAN` линкуют ровно один
+бэкенд.
+
+Путь вывода зависит от платформы, а не от одного признака «Vulkan». На
+Windows Vulkan с непустым `windowHandle` создаёт Win32 surface и swapchain
+и показывает кадр в переданном HWND; модулей `window`, `input` и `ui` в
+наборе Vulkan всё равно нет — окно и ввод предоставляет приложение, а `ui`
+остаётся Win32/GDI-модулем D3D12-профиля. Vulkan без `windowHandle`, а
+также весь Vulkan вне Windows рисует кадр offscreen: результат читается
 `RendererCaptureFrame` из `render/renderer_offscreen.h`. Этого достаточно,
-чтобы проверять рендер по пикселям на программном драйвере, но не
-достаточно для игрового клиента: swapchain, нативное окно Wayland/X11 и
-ввод через evdev — отдельные этапы. Вместе с ними переносится `ui`: он
-растеризует шрифты через GDI.
+чтобы проверять рендер по пикселям на программном драйвере; переносимое
+нативное окно Wayland/X11 и ввод через evdev остаются отдельными этапами.
 
 Список собираемых графических модулей печатается при configure, чтобы
 неполнота профиля была видна, а не подразумевалась. Попытка запросить
@@ -43,9 +51,9 @@ Windows отвергается сразу.
 
 Звук и сцена переносимы целиком: микшер не знает платформы, а вывод у
 него свой на каждой (WASAPI и ALSA), потоковый стриминг чанков работает
-через контракт потоков платформенного слоя. Вне Vulkan-профиля остаются
-окно и интерфейс: первое написано на Win32, второй растеризует шрифты
-через GDI.
+через контракт потоков платформенного слоя. Вне D3D12-профиля остаются
+окно и интерфейс: окно написано на Win32, `ui` растеризует шрифты через
+GDI.
 
 ## Опции CMake
 
@@ -57,7 +65,7 @@ Windows отвергается сразу.
 | `LAIUE_NATIVE_MOD_MODE` | desktop: `DYNAMIC`, external: `OFF` | политика загружаемого native-кода; data/content packs этим не запрещаются |
 | `LAIUE_ENABLE_SDK_INSTALL` | desktop: `ON`, external: `OFF` | install/export SDK; внешний порт линкуется из родительского superbuild |
 | `LAIUE_BUILD_GRAPHICS` | Windows: `ON`, Linux/macOS: `OFF` | доступный платформенный графический набор |
-| `LAIUE_RENDER_BACKEND` | `AUTO` | `D3D12` (только Windows) либо переносимый `VULKAN`; `AUTO` выбирает по платформе |
+| `LAIUE_RENDER_BACKEND` | `AUTO` | `D3D12` (только Windows) либо переносимый `VULKAN`; `AUTO` связывает всё доступное и по умолчанию выбирает D3D12 на Windows, иначе Vulkan |
 | `LAIUE_WARNINGS_AS_ERRORS` | `ON` | считать предупреждения ошибками |
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
 | `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
@@ -70,6 +78,7 @@ Windows отвергается сразу.
 | `LAIUE_BUILD_TOOLS` | desktop: `ON`, external и кросс-сборка: `OFF` | офлайн-инструменты подготовки содержимого; в SDK не устанавливаются |
 | `LAIUE_BUILD_BENCHMARKS` | `OFF` | ручные измерения производительности; в CTest не входят |
 | `BUILD_TESTING` | `ON` | зарегистрировать CTest targets |
+| `LAIUE_REQUIRE_VULKAN_TEST_DRIVER` | `OFF` | при `BUILD_TESTING=ON` считать отсутствие Vulkan-драйвера ошибкой offscreen/instance-ring тестов; включено в Linux Vulkan CI |
 
 Все определения, include paths и linker flags target-scoped. CMake не
 скачивает зависимости и не записывает generated-файлы в source tree.
@@ -297,6 +306,14 @@ cmake --install build/linux-gcc --config Release \
 - Указатели, `wchar_t` и native structs не записываются в переносимые файлы.
 - Имена внутри packs отклоняют absolute path, `..`, separators, symlink или
   reparse traversal и ASCII case-collision.
+- `PlatformReadFilePrefix` читает ограниченный префикс в буфер вызывающей
+  стороны без выделения памяти размером с файл. Размер полного файла
+  проверяется на том же открытом handle; каталоги, устройства, FIFO и
+  symlink/reparse в последнем компоненте отклоняются. Проверку родительских
+  каталогов по-прежнему выполняет вызывающая сторона. Префикс не является
+  snapshot при конкурентной записи в файл; при ошибке оба счётчика
+  обнуляются, но буфер мог быть частично изменён. `laiue.platform.file`
+  проверяет этот контракт, включая размер sparse-файла больше 4 ГиБ.
 - ELF и Mach-O symbols по умолчанию hidden; наружу выходят только API exports.
 - Windows no-CRT target не должен получать скрытую зависимость от CRT через
   новую библиотеку или compiler helper.

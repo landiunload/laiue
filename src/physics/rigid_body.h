@@ -34,10 +34,11 @@
 // точности: умножение на шаг становится сдвигом и не теряет ни бита.
 #define VOXEL_RIGID_STEP_SHIFT 7u
 
-// Верхняя граница индексов. Дополнительно StepScratchBytes обязан вернуть
+// Верхняя граница представления: дерево требует до 2*N-1 uint32-индексов.
+// Дополнительно StepScratchBytes обязан вернуть
 // ненулевой размер: конкретная раскладка scratch может раньше упереться в
 // uint32. Это предел представления буфера, а не обещание скорости симуляции.
-#define VOXEL_RIGID_MAX_BODIES 2097152u
+#define VOXEL_RIGID_MAX_BODIES (UINT32_MAX / 2u)
 // Общий бюджет контактов = число тел * это значение. Плотные пересечения
 // могут превысить бюджет: Step вернёт false, а не пропустит ограничения.
 #define VOXEL_RIGID_CONTACTS_PER_BODY 16u
@@ -51,6 +52,8 @@
 // разбирает всю эту окрестность, поэтому тело большего размера с блоками не
 // сталкивается вовсе (с другими телами — по-прежнему да). Это предел
 // размера тела, а не его скорости.
+// Для compound большой envelope разбирается по детям: каждый ребёнок обязан
+// уложиться в этот предел. Если не помещается и ребёнок, шаг вернёт false.
 #define VOXEL_RIGID_MAX_WORLD_CELLS 4096u
 
 typedef struct VoxelRigidBodyDescription
@@ -307,3 +310,71 @@ LAIUE_PHYSICS_API bool VoxelRigidBodyStepEx(VoxelRigidBody *bodies, uint32_t bod
                                             const VoxelRigidStepSettings *settings, void *scratch,
                                             uint32_t scratchBytes,
                                             const VoxelRigidStepOptions *options);
+
+// Составное тело: набор коробок, жёстко связанных с одним VoxelRigidBody.
+// center — центр дочерней коробки относительно центра масс тела, halfExtent —
+// её полурёбра. children ориентируются вместе с телом. boxes не должны
+// перекрываться, иначе объём и тензор инерции были бы посчитаны дважды.
+typedef struct VoxelRigidCompoundBox
+{
+    double center[3];
+    double halfExtent[3];
+} VoxelRigidCompoundBox;
+
+// Описание формы тела на время шага. boxes — массив из boxCount элементов,
+// каждый center отсчитывается от COM тела. inverseInertia — полный
+// симметричный обратный тензор инерции в координатах тела, row-major 3x3.
+// boxes == NULL и boxCount == 0 означают обычную коробку тела.
+typedef struct VoxelRigidCompoundShape
+{
+    const VoxelRigidCompoundBox *boxes;
+    uint32_t boxCount;
+    double inverseInertia[9];
+} VoxelRigidCompoundShape;
+
+// Число детей не имеет отдельного лимита игры. Оно представлено uint32_t;
+// допустимость конкретного шага определяется размером буферов и суммарным
+// бюджетом через VoxelRigidBodyStepCompoundScratchBytes, а не размером формы.
+
+// Считает COM, консервативный envelope относительно COM и обратный тензор
+// инерции для набора неперекрывающихся коробок при однородной плотности и
+// заданной массе. Массы распределяются по объёму. mass обязана быть
+// положительной конечной. При отказе (неверный вход, перекрытие, вырожденный
+// тензор) возвращает false и не трогает out-параметры.
+LAIUE_PHYSICS_API bool VoxelRigidCompoundMassProperties(const VoxelRigidCompoundBox *boxes,
+                                                        uint32_t boxCount, double mass,
+                                                        double outCenter[3],
+                                                        double outHalfExtent[3],
+                                                        double outInverseInertia[9]);
+
+// Размер scratch для StepCompoundEx. primitiveCount — суммарное число
+// примитивов: каждое обычное box-тело считается за один, составное тело — за
+// boxCount. Общий бюджет контактов шага = primitiveCount * 16, поэтому форма
+// с сотней детей получает честный бюджет, а не 16 точек на тело. Значения
+// primitiveCount < bodyCount отклоняются. Обычный VoxelRigidBodyStepScratchBytes
+// остаётся размером обычной сцены и равен этой функции при primitiveCount ==
+// bodyCount. При primitiveCount > bodyCount scratch также хранит мировую
+// геометрию детей и BVH, вычисляемые один раз за тик без persistent-указателей.
+LAIUE_PHYSICS_API uint32_t VoxelRigidBodyStepCompoundScratchBytes(uint32_t bodyCount,
+                                                                  uint32_t primitiveCount);
+
+// Тот же fixed step, что и StepEx, но с составными формами. shapes — массив из
+// bodyCount описаний; элемент с boxCount == 0 означает обычную коробку тела и
+// сохраняет прежний быстрый путь. boxes == NULL тогда и только тогда, когда
+// boxCount == 0. Шаг сам вычисляет primitiveCount по shapes и требует не меньше
+// VoxelRigidBodyStepCompoundScratchBytes(bodyCount, primitiveCount) байт;
+// прежний scratch обычной сцены остаётся действительным, когда все формы
+// обычные. Дочерние коробки одного тела не сталкиваются между собой. Порядок
+// контактов детерминирован и не зависит от числа worker. Переполнение общего
+// бюджета контактов — явный false без усечения. Тензор обязан быть конечным,
+// симметричным, положительно определённым, а envelope тела — покрывать детей;
+// иначе шаг отклоняется до первой мутации. Рекомендуется contact cache с
+// bodyCapacity >= primitiveCount. При меньшем cache шаг откажет, если реальных
+// контактов больше bodyCapacity * 16; это может случиться после гравитации и
+// пробуждения. Отказ не усекает контакты, но не обещает отката всего шага.
+LAIUE_PHYSICS_API bool VoxelRigidBodyStepCompoundEx(VoxelRigidBody *bodies, uint32_t bodyCount,
+                                                    const VoxelCollisionSource *collision,
+                                                    const VoxelRigidStepSettings *settings,
+                                                    void *scratch, uint32_t scratchBytes,
+                                                    const VoxelRigidStepOptions *options,
+                                                    const VoxelRigidCompoundShape *shapes);

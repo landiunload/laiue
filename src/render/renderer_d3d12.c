@@ -75,9 +75,23 @@ void RendererDestroy_D3D12(Renderer* renderer);
 // буферированием. Она создаётся лениво, при первом переполнении, и
 // переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
-// One frame can contain up to six scene passes with thousands of instances.
-// Keep enough upload space so later passes cannot silently lose caller draws.
-#define INSTANCE_BYTES_PER_FRAME (16u * 1024u * 1024u)
+// Инстансное кольцо — чанковый upload-пул: кадровый слот начинает с одного
+// небольшого чанка и добавляет новый только тогда, когда очередной вызов
+// перестаёт влезать в уже существующие. Стартовая плата падает с 2 x 16 МиБ
+// до 2 x INSTANCE_CHUNK_BYTES, но ни один вызов не теряется: под него либо
+// находится место в существующем чанке, либо выделяется новый. Чанки не
+// уничтожаются, пока рендерер жив, поэтому GPU никогда не читает освобождённую
+// память, а фенс слота гарантирует, что кадр перезаписывает только тот чанк,
+// который GPU уже перестал читать.
+#define INSTANCE_CHUNK_BYTES (1u * 1024u * 1024u)
+// Бюджет на кадровый слот. Он выше прежних 16 МиБ: нагрузка сверх старого
+// лимита теперь не отбрасывается молча, но остаётся ограниченной.
+#define INSTANCE_MAX_BYTES_PER_FRAME (64u * 1024u * 1024u)
+#define INSTANCE_MAX_BYTES_PER_DRAW INSTANCE_MAX_BYTES_PER_FRAME
+// Каждый чанк не меньше INSTANCE_CHUNK_BYTES, поэтому бюджета хватает не
+// более чем на столько чанков на слот.
+#define INSTANCE_MAX_CHUNKS_PER_FRAME \
+    (INSTANCE_MAX_BYTES_PER_FRAME / INSTANCE_CHUNK_BYTES)
 
 typedef struct FreeRange
 {
@@ -120,6 +134,13 @@ typedef struct DeferredRangeRelease
     uint32_t size;
     UINT64 safeFenceValue;
 } DeferredRangeRelease;
+
+typedef struct InstanceChunk
+{
+    ID3D12Resource* buffer;
+    uint8_t* mapped;
+    uint32_t capacityBytes;
+} InstanceChunk;
 
 struct RendererMesh
 {
@@ -218,9 +239,16 @@ struct Renderer
     ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
-    ID3D12Resource*            instanceBuffers[FRAME_COUNT];
-    uint8_t*                   instanceMapped[FRAME_COUNT];
-    uint32_t                   instanceOffsets[FRAME_COUNT];
+    // Чанковый пул инстансов, по независимому набору на кадровый слот.
+    // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
+    // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
+    // всех выделенных чанков слота (чанки не уменьшаются).
+    InstanceChunk              instanceChunks[FRAME_COUNT]
+                                             [INSTANCE_MAX_CHUNKS_PER_FRAME];
+    uint32_t                   instanceChunkCount[FRAME_COUNT];
+    uint32_t                   instanceChunkIndex[FRAME_COUNT];
+    uint32_t                   instanceChunkOffset[FRAME_COUNT];
+    uint32_t                   instancePoolBytes[FRAME_COUNT];
 
     DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredResourceHead;
@@ -1110,23 +1138,141 @@ static bool CreateMeshUploadBuffers(Renderer* renderer)
         {
             return false;
         }
-
-        description.Width = INSTANCE_BYTES_PER_FRAME;
-        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
-            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
-            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void**)&renderer->instanceBuffers[i])))
-        {
-            return false;
-        }
-        if (FAILED(ID3D12Resource_Map(renderer->instanceBuffers[i], 0,
-            &emptyRange, (void**)&renderer->instanceMapped[i])))
-        {
-            return false;
-        }
-        description.Width = MESH_UPLOAD_BYTES_PER_FRAME;
     }
     return true;
+}
+
+// Создаёт ещё один инстансный чанк в слоте и делает его mapped. Чанк для
+// одиночного вызова больше базового выделяется ровно под этот вызов.
+static bool CreateInstanceChunk(Renderer* renderer, uint32_t slot,
+    uint32_t index, uint32_t capacityBytes)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = capacityBytes;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    InstanceChunk* chunk = &renderer->instanceChunks[slot][index];
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource, (void**)&chunk->buffer)))
+    {
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(chunk->buffer, 0, &emptyRange,
+        (void**)&chunk->mapped)))
+    {
+        ID3D12Resource_Release(chunk->buffer);
+        chunk->buffer = NULL;
+        return false;
+    }
+
+    chunk->capacityBytes = capacityBytes;
+    renderer->instanceChunkCount[slot] = index + 1;
+    return true;
+}
+
+// Лениво создаёт первый чанк слота: без него корневой SRV t3, который
+// проходы сцены выставляют до инстансных вызовов, указывал бы в никуда.
+static bool EnsureInstancePool(Renderer* renderer, uint32_t slot)
+{
+    if (renderer->instanceChunkCount[slot] != 0)
+    {
+        return true;
+    }
+    if (renderer->instancePoolBytes[slot]
+        > INSTANCE_MAX_BYTES_PER_FRAME - INSTANCE_CHUNK_BYTES)
+    {
+        return false;
+    }
+    if (!CreateInstanceChunk(renderer, slot, 0, INSTANCE_CHUNK_BYTES))
+    {
+        return false;
+    }
+    renderer->instancePoolBytes[slot] = INSTANCE_CHUNK_BYTES;
+    return true;
+}
+
+// Резервирует contiguous-диапазон под один вызов. Курсор внутри кадра
+// монотонен: назад он не идёт, иначе перезапись уже записанного в командный
+// список диапазона исказила бы ранние вызовы кадра.
+static bool ReserveInstanceSpace(Renderer* renderer, uint32_t slot,
+    uint32_t bytes, uint32_t* outChunkIndex, uint32_t* outOffset)
+{
+    uint32_t chunkIndex = renderer->instanceChunkIndex[slot];
+    uint32_t offset = (renderer->instanceChunkOffset[slot] + 15u) & ~15u;
+
+    while (chunkIndex < renderer->instanceChunkCount[slot])
+    {
+        InstanceChunk* chunk = &renderer->instanceChunks[slot][chunkIndex];
+        if (offset <= chunk->capacityBytes
+            && bytes <= chunk->capacityBytes - offset)
+        {
+            break;
+        }
+        chunkIndex++;
+        offset = 0u;
+    }
+
+    if (chunkIndex == renderer->instanceChunkCount[slot])
+    {
+        if (renderer->instanceChunkCount[slot]
+            == INSTANCE_MAX_CHUNKS_PER_FRAME)
+        {
+            return false;
+        }
+        uint32_t capacityBytes = bytes > INSTANCE_CHUNK_BYTES
+            ? bytes : INSTANCE_CHUNK_BYTES;
+        if (renderer->instancePoolBytes[slot]
+            > INSTANCE_MAX_BYTES_PER_FRAME - capacityBytes)
+        {
+            return false;
+        }
+        if (!CreateInstanceChunk(renderer, slot, chunkIndex, capacityBytes))
+        {
+            return false;
+        }
+        renderer->instancePoolBytes[slot] += capacityBytes;
+        offset = 0u;
+    }
+
+    renderer->instanceChunkIndex[slot] = chunkIndex;
+    renderer->instanceChunkOffset[slot] = offset + bytes;
+    *outChunkIndex = chunkIndex;
+    *outOffset = offset;
+    return true;
+}
+
+static void ReleaseInstancePool(Renderer* renderer)
+{
+    for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
+    {
+        for (uint32_t index = 0; index < renderer->instanceChunkCount[slot];
+            ++index)
+        {
+            InstanceChunk* chunk = &renderer->instanceChunks[slot][index];
+            if (chunk->buffer != NULL)
+            {
+                if (chunk->mapped != NULL)
+                    ID3D12Resource_Unmap(chunk->buffer, 0, NULL);
+                ID3D12Resource_Release(chunk->buffer);
+            }
+            memset(chunk, 0, sizeof(*chunk));
+        }
+        renderer->instanceChunkCount[slot] = 0;
+        renderer->instanceChunkIndex[slot] = 0;
+        renderer->instanceChunkOffset[slot] = 0;
+        renderer->instancePoolBytes[slot] = 0;
+    }
 }
 
 // Создаёт (или пересоздаёт под новое разрешение) кубмапу сцены и её
@@ -1522,12 +1668,6 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
                 ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
         }
-        if (renderer->instanceBuffers[i] != NULL)
-        {
-            if (renderer->instanceMapped[i] != NULL)
-                ID3D12Resource_Unmap(renderer->instanceBuffers[i], 0, NULL);
-            ID3D12Resource_Release(renderer->instanceBuffers[i]);
-        }
         if (renderer->largeMeshUploadBuffers[i] != NULL)
         {
             if (renderer->largeMeshUploadMapped[i] != NULL)
@@ -1537,13 +1677,11 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
         renderer->meshUploadBuffers[i] = NULL;
         renderer->meshUploadMapped[i] = NULL;
         renderer->meshUploadOffsets[i] = 0;
-        renderer->instanceBuffers[i] = NULL;
-        renderer->instanceMapped[i] = NULL;
-        renderer->instanceOffsets[i] = 0;
         renderer->largeMeshUploadBuffers[i] = NULL;
         renderer->largeMeshUploadMapped[i] = NULL;
         renderer->largeMeshUploadOffsets[i] = 0;
     }
+    ReleaseInstancePool(renderer);
 
     if (renderer->blockTextureUpload != NULL)
         ID3D12Resource_Release(renderer->blockTextureUpload);
@@ -1696,12 +1834,6 @@ void RendererDestroy_D3D12(Renderer* renderer)
             if (renderer->meshUploadMapped[i] != NULL)
                 ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
-        }
-        if (renderer->instanceBuffers[i] != NULL)
-        {
-            if (renderer->instanceMapped[i] != NULL)
-                ID3D12Resource_Unmap(renderer->instanceBuffers[i], 0, NULL);
-            ID3D12Resource_Release(renderer->instanceBuffers[i]);
         }
     }
     if (renderer->fontTextureUpload != NULL) ID3D12Resource_Release(renderer->fontTextureUpload);
@@ -1947,20 +2079,19 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
 {
     if (renderer == NULL || mesh == NULL || instances == NULL
         || instanceCount == 0
-        || instanceCount > INSTANCE_BYTES_PER_FRAME
+        || instanceCount > INSTANCE_MAX_BYTES_PER_DRAW
             / (uint32_t)sizeof(RendererMeshInstance))
         return;
 
     uint32_t bytes = instanceCount
         * (uint32_t)sizeof(RendererMeshInstance);
-    uint32_t offset = (renderer->instanceOffsets[renderer->frameIndex] + 15U)
-        & ~15U;
-    if (offset > INSTANCE_BYTES_PER_FRAME
-        || bytes > INSTANCE_BYTES_PER_FRAME - offset)
+    uint32_t slot = renderer->frameIndex;
+    uint32_t chunkIndex;
+    uint32_t offset;
+    if (!ReserveInstanceSpace(renderer, slot, bytes, &chunkIndex, &offset))
         return;
-    memcpy(renderer->instanceMapped[renderer->frameIndex] + offset,
-        instances, bytes);
-    renderer->instanceOffsets[renderer->frameIndex] = offset + bytes;
+    InstanceChunk* chunk = &renderer->instanceChunks[slot][chunkIndex];
+    memcpy(chunk->mapped + offset, instances, bytes);
 
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
     float transform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
@@ -1972,8 +2103,7 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
         block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
         renderer->commandList, ROOT_PARAMETER_INSTANCES,
-        ID3D12Resource_GetGPUVirtualAddress(
-            renderer->instanceBuffers[renderer->frameIndex]) + offset);
+        ID3D12Resource_GetGPUVirtualAddress(chunk->buffer) + offset);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
         mesh->quadCount * 6, instanceCount, 0, 0);
     renderer->currentStats.drawCalls++;
@@ -2117,6 +2247,15 @@ static bool ApplyPendingResize(Renderer* renderer)
     }
 
     WaitForGpu(renderer);
+
+    // После WaitForGpu GPU простаивает, поэтому курсоры чанков обоих слотов
+    // можно безопасно вернуть в начало: смена индекса back-буфера не должна
+    // оставлять слот с недосброшенным курсором и лишним чанком.
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        renderer->instanceChunkIndex[i] = 0;
+        renderer->instanceChunkOffset[i] = 0;
+    }
 
     for (UINT i = 0; i < FRAME_COUNT; ++i)
     {
@@ -2276,6 +2415,14 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     memset(&renderer->currentStats, 0, sizeof(renderer->currentStats));
     renderer->currentStats.scenePasses = frame->passCount;
 
+    // Первый чанк слота нужен проходам сцены как валидный t3 по умолчанию.
+    // Создаётся лениво, ровно один раз на слот, после чего переиспользуется.
+    if (frame->passCount != 0
+        && !EnsureInstancePool(renderer, renderer->frameIndex))
+    {
+        return false;
+    }
+
     if (renderer->frame.panorama
         && !EnsureCubeResources(renderer, renderer->frame.faceResolution))
     {
@@ -2331,12 +2478,12 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
         ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
     // fxc вправе спекулятивно выполнить Load из t3 даже для обычного чанка,
-    // где meshScale положителен. Поэтому корневой SRV всегда указывает на
-    // валидный буфер; инстансные draw-вызовы ниже заменяют адрес на свой offset.
+    // где meshScale положителен. Поэтому корневой SRV указывает на первый
+    // чанк слота; инстансные draw-вызовы ниже заменяют адрес на свой.
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
         renderer->commandList, ROOT_PARAMETER_INSTANCES,
         ID3D12Resource_GetGPUVirtualAddress(
-            renderer->instanceBuffers[renderer->frameIndex]));
+            renderer->instanceChunks[renderer->frameIndex][0].buffer));
 
     // Свет кадра: число материалов занимает padding после sunDirection;
     // остальные float3 выровнены по 16 байт.
@@ -2550,7 +2697,10 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     bool waitedForFence = MoveToNextFrame(renderer);
     renderer->meshUploadOffsets[renderer->frameIndex] = 0;
     renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
-    renderer->instanceOffsets[renderer->frameIndex] = 0;
+    // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
+    // больше не читает: курсор можно вернуть в начало. Сами чанки остаются.
+    renderer->instanceChunkIndex[renderer->frameIndex] = 0;
+    renderer->instanceChunkOffset[renderer->frameIndex] = 0;
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
         // Без vsync Present не является точкой ожидания. Отдаём остаток

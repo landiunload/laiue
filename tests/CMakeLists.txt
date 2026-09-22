@@ -1,3 +1,10 @@
+option(LAIUE_REQUIRE_VULKAN_TEST_DRIVER
+    "Fail Vulkan offscreen tests instead of skipping when no driver is available" OFF)
+if(LAIUE_REQUIRE_VULKAN_TEST_DRIVER AND
+   NOT (TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET))
+    message(FATAL_ERROR "LAIUE_REQUIRE_VULKAN_TEST_DRIVER requires the Vulkan render target")
+endif()
+
 if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND
    CMAKE_SYSTEM_NAME STREQUAL "Linux")
     foreach(runtime_target IN LISTS LAIUE_RUNTIME_TARGETS)
@@ -20,6 +27,11 @@ endif()
 add_executable(laiue_platform_crypto_test platform_crypto_test.c)
 laiue_configure_standalone_executable(laiue_platform_crypto_test PlatformCryptoTestEntry)
 add_test(NAME laiue.platform.crypto COMMAND laiue_platform_crypto_test)
+
+add_executable(laiue_platform_file_test platform_file_test.c)
+laiue_configure_standalone_executable(laiue_platform_file_test PlatformFileTestEntryPoint)
+add_test(NAME laiue.platform.file COMMAND laiue_platform_file_test)
+set_tests_properties(laiue.platform.file PROPERTIES TIMEOUT 20)
 
 add_executable(laiue_platform_threading_test platform_threading_test.c)
 laiue_configure_standalone_executable(
@@ -81,6 +93,41 @@ target_link_libraries(laiue_rigid_parallel_test PRIVATE laiue::physics laiue::nu
 laiue_configure_standalone_executable(laiue_rigid_parallel_test RigidParallelTestEntryPoint)
 add_test(NAME laiue.physics.rigid_parallel COMMAND laiue_rigid_parallel_test)
 set_tests_properties(laiue.physics.rigid_parallel PROPERTIES TIMEOUT 60)
+
+# Составные вращающиеся тела: массовые свойства, обратный тензор 3x3,
+# вогнутая L-форма, взаимный импульс, warm-start cache, детерминированный
+# replay, эквивалентность executor-ов и rebasing.
+add_executable(laiue_rigid_compound_test rigid_compound_test.c)
+target_link_libraries(laiue_rigid_compound_test PRIVATE
+    laiue::physics
+    laiue::numeric
+    laiue::task)
+laiue_configure_standalone_executable(
+    laiue_rigid_compound_test RigidCompoundTestEntryPoint)
+add_test(NAME laiue.physics.rigid_compound COMMAND laiue_rigid_compound_test)
+set_tests_properties(laiue.physics.rigid_compound PROPERTIES TIMEOUT 120)
+
+add_executable(laiue_compound_shape_test compound_shape_test.c)
+target_link_libraries(laiue_compound_shape_test PRIVATE laiue::physics)
+laiue_configure_standalone_executable(laiue_compound_shape_test CompoundShapeTestEntryPoint)
+add_test(NAME laiue.physics.compound_shape COMMAND laiue_compound_shape_test)
+set_tests_properties(laiue.physics.compound_shape PROPERTIES TIMEOUT 30)
+
+# Test the private spatial helper directly; it is not an exported SDK ABI.
+add_executable(laiue_compound_bvh_test compound_bvh_test.c ../src/physics/compound_bvh.c)
+target_link_libraries(laiue_compound_bvh_test PRIVATE laiue::physics)
+if(LAIUE_PLATFORM_EXTERNAL)
+    target_link_libraries(laiue_compound_bvh_test PRIVATE "${LAIUE_PRECISE_FP_TARGET}")
+elseif(LAIUE_PLATFORM_WINDOWS)
+    target_compile_options(laiue_compound_bvh_test PRIVATE
+        "$<$<C_COMPILER_ID:MSVC>:/fp:strict>"
+        "$<$<C_COMPILER_ID:Clang>:/clang:-ffp-model=strict>")
+else()
+    target_compile_options(laiue_compound_bvh_test PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+laiue_configure_standalone_executable(laiue_compound_bvh_test CompoundBvhTestEntryPoint)
+add_test(NAME laiue.physics.compound_bvh COMMAND laiue_compound_bvh_test)
+set_tests_properties(laiue.physics.compound_bvh PROPERTIES TIMEOUT 30)
 
 add_executable(laiue_physics_determinism_test physics_determinism_test.c)
 target_link_libraries(laiue_physics_determinism_test PRIVATE
@@ -178,6 +225,28 @@ if(TARGET laiue_render)
     laiue_configure_standalone_executable(
         laiue_render_pack_api_test RenderPackApiTestEntryPoint)
     add_test(NAME laiue.render.packs COMMAND laiue_render_pack_api_test)
+
+    # Двухпроходная сборка пака проверяется напрямую, без GPU и без новых
+    # экспортов: цель компилирует внутренний texture_build.c в тестовый
+    # исполняемый файл. Сквозной путь по цвету пикселя отдельно проверяет
+    # laiue.render.offscreen_frame, но требует настоящего драйвера; этот
+    # тест детерминирован и идёт на любой машине.
+    add_executable(laiue_texture_pack_build_test
+        texture_pack_build_test.c
+        texc_fixtures.h
+        "${PROJECT_SOURCE_DIR}/src/render/texture_build.c")
+    target_include_directories(laiue_texture_pack_build_test PRIVATE
+        "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(laiue_texture_pack_build_test PRIVATE
+        laiue_content
+        laiue::media_support)
+    # The test source marks its large scenario functions noinline so Release
+    # LTO cannot flatten every TexturePackData frame into the entry point and
+    # reintroduce a __chkstk-only dependency in this no-CRT executable.
+    laiue_configure_standalone_executable(
+        laiue_texture_pack_build_test TexturePackBuildTestEntryPoint)
+    add_test(NAME laiue.render.texture_build
+        COMMAND laiue_texture_pack_build_test)
 endif()
 if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     # Кадр рисуется целиком и проверяется по пикселям. Драйвер может
@@ -193,8 +262,45 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
         laiue_renderer_offscreen_test RendererOffscreenTestEntryPoint)
     add_test(NAME laiue.render.offscreen_frame
         COMMAND laiue_renderer_offscreen_test)
-    set_tests_properties(laiue.render.offscreen_frame PROPERTIES
-        SKIP_RETURN_CODE 125)
+
+    # Адаптивное Vulkan instance-кольцо: четыре вызова по 200000 инстансов
+    # превышают прежние 16 МиБ на кадр. Проверяются оба кадровых слота,
+    # rollover чанков и resize; без Vulkan-драйвера тест сообщает SKIP.
+    add_executable(laiue_renderer_vulkan_instance_ring_test
+        renderer_vulkan_instance_ring_test.c)
+    target_link_libraries(laiue_renderer_vulkan_instance_ring_test PRIVATE
+        laiue_render)
+    laiue_configure_standalone_executable(
+        laiue_renderer_vulkan_instance_ring_test RendererVulkanInstanceRingTestEntryPoint)
+    add_test(NAME laiue.render.vulkan_instance_ring
+        COMMAND laiue_renderer_vulkan_instance_ring_test)
+    set_tests_properties(laiue.render.vulkan_instance_ring PROPERTIES
+        TIMEOUT 180)
+    set_tests_properties(laiue.render.offscreen_frame
+        laiue.render.vulkan_instance_ring PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Validation Error")
+    if(NOT LAIUE_REQUIRE_VULKAN_TEST_DRIVER)
+        set_tests_properties(laiue.render.offscreen_frame
+            laiue.render.vulkan_instance_ring PROPERTIES SKIP_RETURN_CODE 125)
+    endif()
+
+    # Жизненный цикл окна/swapchain Vulkan: повторное создание и
+    # уничтожение, resize/minimize/restore, смена vsync, переключение
+    # D3D12<->Vulkan и несколько кадровых слотов. Окна скрытые; без
+    # Vulkan-драйвера или рабочей поверхности тест сообщает о пропуске,
+    # а не о ложном успехе.
+    add_executable(laiue_renderer_vulkan_lifecycle_test
+        renderer_vulkan_lifecycle_test.c)
+    target_link_libraries(laiue_renderer_vulkan_lifecycle_test PRIVATE
+        laiue_render)
+    laiue_configure_standalone_executable(
+        laiue_renderer_vulkan_lifecycle_test RendererVulkanLifecycleTestEntryPoint)
+    add_test(NAME laiue.render.vulkan_lifecycle
+        COMMAND laiue_renderer_vulkan_lifecycle_test)
+    set_tests_properties(laiue.render.vulkan_lifecycle PROPERTIES
+        SKIP_RETURN_CODE 125
+        FAIL_REGULAR_EXPRESSION "Validation Error"
+        TIMEOUT 180)
 endif()
 if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
    AND LAIUE_RENDER_HAS_VULKAN_TARGET)
@@ -211,6 +317,23 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
     add_test(NAME laiue.render.dual_backend
         COMMAND laiue_render_dual_backend_test)
     set_tests_properties(laiue.render.dual_backend PROPERTIES
+        SKIP_RETURN_CODE 125
+        FAIL_REGULAR_EXPRESSION "Validation Error"
+        TIMEOUT 60)
+endif()
+if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12)
+    # Адаптивный чанковый instance ring: вызовы сверх прежних 16 МиБ на кадр
+    # не теряются, смена кадрового слота и resize не рвут пул. Нужен
+    # настоящий HWND; без адаптера D3D12 тест сообщает о пропуске кодом 125.
+    add_executable(laiue_renderer_instance_ring_test
+        renderer_instance_ring_test.c)
+    target_link_libraries(laiue_renderer_instance_ring_test PRIVATE
+        laiue_render)
+    laiue_configure_standalone_executable(
+        laiue_renderer_instance_ring_test RendererInstanceRingTestEntryPoint)
+    add_test(NAME laiue.render.instance_ring
+        COMMAND laiue_renderer_instance_ring_test)
+    set_tests_properties(laiue.render.instance_ring PROPERTIES
         SKIP_RETURN_CODE 125
         TIMEOUT 60)
 endif()

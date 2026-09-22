@@ -144,6 +144,16 @@ bool PlatformMoveReplace(const wchar_t* source, const wchar_t* destination);
 bool PlatformValidatePrivateKeyFile(const wchar_t* path);
 bool PlatformReadEntireFile(const wchar_t* path, uint64_t maximumBytes,
                             uint8_t** outBytes, uint64_t* outSize);
+/* Reads min(fileSize, capacity) bytes into caller-owned storage without allocating
+ * a file-sized buffer. Both output pointers are required; they are zeroed on
+ * failure when non-NULL. A NULL buffer is allowed only for capacity == 0.
+ * Empty files succeed. The size and bytes come from the same open regular file;
+ * files larger than maximumFileBytes and final-component symlinks/reparse points
+ * are rejected. Parent-directory validation remains the caller's responsibility.
+ * The reported size is sampled before reading, not a concurrent-write snapshot.
+ * On failure buffer contents are unspecified and may have been partially changed. */
+bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void *buffer,
+                            uint32_t capacity, uint32_t *outBytesRead, uint64_t *outFileSize);
 bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
                              uint64_t size);
 bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,

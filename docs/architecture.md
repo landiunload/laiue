@@ -27,15 +27,16 @@
 | `mod` | discovery паков, native ABI и registry versioned services |
 | `window` | Win32-окно и message loop |
 | `input` | Raw Input клавиатуры и мыши |
-| `audio` | асинхронное воспроизведение через Media Foundation |
+| `audio` | асинхронное воспроизведение; WASAPI на Windows, ALSA на Linux |
 | `mesh` | greedy meshing областей `World` |
-| `render` | D3D12, GPU-меши, шейдеры и текстуры |
+| `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры |
 | `scene` | камера, chunk streaming, panorama и voxel raycast |
 | `ui` | immediate-mode UI поверх `render` |
 
-Первые пять модулей образуют переносимое ядро. Графические модули доступны
-на Windows. Публичные API помечены export-макросами из `src/api.h`;
-владеющие состоянием объекты остаются непрозрачными.
+Первые пять модулей образуют переносимое ядро. Полный графический набор
+доступен на Windows; Linux дополнительно собирает профиль Vulkan из
+`audio`, `mesh`, `render` и `scene`. Публичные API помечены export-макросами
+из `src/api.h`; владеющие состоянием объекты остаются непрозрачными.
 
 ## Направление зависимостей
 
@@ -54,8 +55,9 @@ external application
               └── ui ─────────── render + scene
 ```
 
-`window`, `input` и `audio` находятся на той же Windows-границе и не нужны
-Linux core. Нижние модули не включают заголовки `scene` или `ui`.
+`window` и `input` находятся на Windows-границе и не нужны Linux core;
+`audio` собирается и там, получая ALSA-вывод через платформенный контракт.
+Нижние модули не включают заголовки `scene` или `ui`.
 Допустимый include/link-граф задан в `src/*/CMakeLists.txt` и проверяется
 архитектурным тестом.
 
