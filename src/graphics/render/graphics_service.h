@@ -48,3 +48,5 @@ typedef struct LaiueGraphicsServiceV1
     void (*setWireframe)(Renderer *renderer, bool enabled);
     bool (*isWireframe)(const Renderer *renderer);
 } LaiueGraphicsServiceV1;
+
+LAIUE_RENDER_API const LaiueGraphicsServiceV1 *LaiueGraphicsGetStaticServiceV1(void);

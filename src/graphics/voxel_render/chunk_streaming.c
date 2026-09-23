@@ -1,8 +1,11 @@
 #include "voxel_render/chunk_streaming.h"
 #include "scene/math_service.h"
 #include "world/world.h"
+#include "world/world_service.h"
 #include "render/renderer.h"
+#include "render/graphics_service.h"
 #include "mesh/chunk_mesher.h"
+#include "mesh/mesher_service.h"
 #include "platform/system.h"
 
 #include <string.h>
@@ -25,11 +28,90 @@
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
 static const LaiueSceneMathServiceV1* sceneMathService;
+static const LaiueWorldServiceV1* worldService;
+static const LaiueMesherServiceV1* mesherService;
+static const LaiueGraphicsServiceV1* graphicsService;
 
 void ChunkStreamingSetSceneMathService(const LaiueSceneMathServiceV1* service)
 {
     sceneMathService = service;
 }
+
+void ChunkStreamingSetWorldService(const LaiueWorldServiceV1* service)
+{
+    worldService = service;
+}
+
+void ChunkStreamingSetMesherService(const LaiueMesherServiceV1* service)
+{
+    mesherService = service;
+}
+
+void ChunkStreamingSetGraphicsService(const LaiueGraphicsServiceV1* service)
+{
+    graphicsService = service;
+}
+
+static WorldRegionContents VoxelRenderWorldFillRegion(
+    World* world, int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
+{
+    return worldService != NULL && worldService->fillRegion != NULL && world != NULL
+               ? worldService->fillRegion(world, minBlockX, minBlockY, minBlockZ,
+                                          sizeX, sizeY, sizeZ, outBlocks)
+               : WORLD_REGION_ALL_AIR;
+}
+
+static ChunkMesherScratch* VoxelRenderMesherScratchCreate(void)
+{
+    return mesherService != NULL && mesherService->scratchCreate != NULL
+               ? mesherService->scratchCreate()
+               : NULL;
+}
+
+static void VoxelRenderMesherScratchDestroy(ChunkMesherScratch* scratch)
+{
+    if (mesherService != NULL && mesherService->scratchDestroy != NULL)
+        mesherService->scratchDestroy(scratch);
+}
+
+static bool VoxelRenderBuildChunkMesh(const ChunkMesherWorldSource* source,
+    ChunkMesherScratch* scratch, int64_t chunkX, int64_t chunkY, int64_t chunkZ,
+    ChunkQuad** outQuads, uint32_t* outQuadCount)
+{
+    return mesherService != NULL && mesherService->buildChunkMesh != NULL &&
+           mesherService->buildChunkMesh(source, scratch, chunkX, chunkY, chunkZ,
+                                         outQuads, outQuadCount);
+}
+
+static RendererMesh* VoxelRenderCreateMesh(Renderer* renderer,
+    const ChunkQuad* quads, uint32_t quadCount)
+{
+    return graphicsService != NULL && graphicsService->createMesh != NULL
+               ? graphicsService->createMesh(renderer, quads, quadCount)
+               : NULL;
+}
+
+static void VoxelRenderDestroyMesh(Renderer* renderer, RendererMesh* mesh)
+{
+    if (graphicsService != NULL && graphicsService->destroyMesh != NULL)
+        graphicsService->destroyMesh(renderer, mesh);
+}
+
+static void VoxelRenderDrawMesh(Renderer* renderer, const RendererMesh* mesh,
+    const float chunkOriginRelative[3])
+{
+    if (graphicsService != NULL && graphicsService->drawMesh != NULL)
+        graphicsService->drawMesh(renderer, mesh, chunkOriginRelative);
+}
+
+#define WorldFillRegion VoxelRenderWorldFillRegion
+#define ChunkMesherScratchCreate VoxelRenderMesherScratchCreate
+#define ChunkMesherScratchDestroy VoxelRenderMesherScratchDestroy
+#define BuildChunkMesh VoxelRenderBuildChunkMesh
+#define RendererCreateMesh VoxelRenderCreateMesh
+#define RendererDestroyMesh VoxelRenderDestroyMesh
+#define RendererDrawMesh VoxelRenderDrawMesh
 
 // Мешер принимает только абстрактный region provider. Voxel-render связывает
 // его с выбранным world здесь, на границе технологии; сам mesher поэтому не

@@ -6,9 +6,8 @@ laiue_add_module(voxel_render
         module_entry.c
         voxel_render_service.h
         ../scene/math_service.h
+        ../mesh/mesher_service.h
+        ../render/graphics_service.h
+        ../../simulation/world/world_service.h
         ../../api.h
-    LINK
-        laiue_world
-        laiue_mesher
-        laiue_render
 )

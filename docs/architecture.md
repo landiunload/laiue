@@ -30,6 +30,7 @@
 | `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
 | `mesh` | greedy meshing областей `World` |
 | `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
+| `voxel_render` | композиционный adapter для world/mesh/render; не импортирует эти DLL напрямую |
 | `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |
 | `ui` | immediate-mode UI поверх `render` |
 
@@ -51,6 +52,7 @@ external application
               ├── physics ────── platform_support (numeric/jobs services)
               ├── mesh ───────── world
               ├── render ─────── platform_support (content service)
+              ├── voxel_render ─ world + mesh + render (service tables)
               ├── scene ──────── world + mesh + render
               └── ui ─────────── render + scene
 ```
@@ -72,6 +74,13 @@ Standalone-приложение, которое вызывает C API напр�
 операции провайдера возвращают безопасный отказ. Поэтому удаление DLL
 отключает только зависящую технологию, а независимые модули продолжают
 загружаться.
+
+`voxel_render` — намеренно композиционный модуль: при старте он получает
+таблицы `world`, `mesh`, `render` и `scene_math`, а внутри вызывает только
+эти уже проверенные функции. Его публичный streaming/raycast путь не имеет
+обязательных импортов соседних DLL. Если один из поставщиков отсутствует,
+загрузчик отклоняет только `voxel_render` и оставляет остальные технологии
+доступными.
 
 `mod` не зависит от игровых типов, `World` или renderer. Приложение
 регистрирует узкие versioned service tables, и только через них нативный мод

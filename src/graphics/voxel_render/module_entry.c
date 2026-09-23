@@ -41,6 +41,10 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     moduleState.world = NULL;
     moduleState.mesher = NULL;
     moduleState.graphics = NULL;
+    ChunkStreamingSetSceneMathService(NULL);
+    ChunkStreamingSetWorldService(NULL);
+    ChunkStreamingSetMesherService(NULL);
+    ChunkStreamingSetGraphicsService(NULL);
     *outContext = &moduleState;
     return 1u;
 }
@@ -50,6 +54,10 @@ static uint32_t ModuleStart(void *context)
     LaiueVoxelRenderModuleState *state = (LaiueVoxelRenderModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
+    ChunkStreamingSetSceneMathService(NULL);
+    ChunkStreamingSetWorldService(NULL);
+    ChunkStreamingSetMesherService(NULL);
+    ChunkStreamingSetGraphicsService(NULL);
     state->sceneMath = (const LaiueSceneMathServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_SCENE_MATH_SERVICE_NAME,
         LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1, sizeof(LaiueSceneMathServiceV1));
@@ -66,6 +74,9 @@ static uint32_t ModuleStart(void *context)
         state->graphics == NULL)
     {
         ChunkStreamingSetSceneMathService(NULL);
+        ChunkStreamingSetWorldService(NULL);
+        ChunkStreamingSetMesherService(NULL);
+        ChunkStreamingSetGraphicsService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
@@ -73,6 +84,9 @@ static uint32_t ModuleStart(void *context)
         return 0u;
     }
     ChunkStreamingSetSceneMathService(state->sceneMath);
+    ChunkStreamingSetWorldService(state->world);
+    ChunkStreamingSetMesherService(state->mesher);
+    ChunkStreamingSetGraphicsService(state->graphics);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_RENDER_SERVICE_NAME,
         .version = LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1,
@@ -82,6 +96,9 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         ChunkStreamingSetSceneMathService(NULL);
+        ChunkStreamingSetWorldService(NULL);
+        ChunkStreamingSetMesherService(NULL);
+        ChunkStreamingSetGraphicsService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
@@ -100,6 +117,9 @@ static void ModuleStop(void *context)
     if (state != NULL)
     {
         ChunkStreamingSetSceneMathService(NULL);
+        ChunkStreamingSetWorldService(NULL);
+        ChunkStreamingSetMesherService(NULL);
+        ChunkStreamingSetGraphicsService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
@@ -112,6 +132,9 @@ static void ModuleDestroy(void *context)
     (void)context;
     moduleState.host = NULL;
     ChunkStreamingSetSceneMathService(NULL);
+    ChunkStreamingSetWorldService(NULL);
+    ChunkStreamingSetMesherService(NULL);
+    ChunkStreamingSetGraphicsService(NULL);
     moduleState.sceneMath = NULL;
     moduleState.world = NULL;
     moduleState.mesher = NULL;

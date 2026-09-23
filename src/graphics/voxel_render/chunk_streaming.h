@@ -16,6 +16,9 @@ typedef struct ChunkStreaming ChunkStreaming;
 typedef struct World World;
 typedef struct Renderer Renderer;
 struct LaiueSceneMathServiceV1;
+struct LaiueWorldServiceV1;
+struct LaiueMesherServiceV1;
+struct LaiueGraphicsServiceV1;
 
 typedef struct ChunkStreamingStats
 {
@@ -34,6 +37,12 @@ typedef struct ChunkStreamingStats
 // implementation keeps no link-time dependency on scene_math.
 LAIUE_VOXEL_RENDER_API void ChunkStreamingSetSceneMathService(
     const struct LaiueSceneMathServiceV1* service);
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetWorldService(
+    const struct LaiueWorldServiceV1* service);
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetMesherService(
+    const struct LaiueMesherServiceV1* service);
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetGraphicsService(
+    const struct LaiueGraphicsServiceV1* service);
 
 LAIUE_VOXEL_RENDER_API ChunkStreaming* ChunkStreamingCreate(
     World* world, Renderer* renderer, int32_t viewRadiusChunks);

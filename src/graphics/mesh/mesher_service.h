@@ -18,3 +18,5 @@ typedef struct LaiueMesherServiceV1
                            int64_t chunkX, int64_t chunkY, int64_t chunkZ,
                            ChunkQuad **outQuads, uint32_t *outQuadCount);
 } LaiueMesherServiceV1;
+
+LAIUE_MESHER_API const LaiueMesherServiceV1 *LaiueMesherGetStaticServiceV1(void);

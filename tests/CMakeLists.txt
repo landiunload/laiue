@@ -351,6 +351,7 @@ if(TARGET laiue_voxel_raycast AND TARGET laiue_voxel_render)
         laiue_voxel_raycast
         laiue_voxel_render
         laiue_world
+        laiue_mesher
         laiue_numeric)
     laiue_configure_standalone_executable(
         laiue_voxel_raycast_test VoxelRaycastTestEntryPoint)
@@ -367,6 +368,7 @@ if(TARGET laiue_voxel_render)
     target_link_libraries(laiue_chunk_streaming_stress_test PRIVATE
         laiue_voxel_render
         laiue_world
+        laiue_mesher
         laiue_numeric)
     laiue_configure_standalone_executable(
         laiue_chunk_streaming_stress_test ChunkStreamingStressTestEntryPoint)

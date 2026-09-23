@@ -28,3 +28,5 @@ typedef struct LaiueWorldServiceV1
                                       int32_t sizeX, int32_t sizeY,
                                       int32_t sizeZ, BlockType *outBlocks);
 } LaiueWorldServiceV1;
+
+LAIUE_WORLD_API const LaiueWorldServiceV1 *LaiueWorldGetStaticServiceV1(void);

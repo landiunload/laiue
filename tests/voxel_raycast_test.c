@@ -1,6 +1,8 @@
 #include "voxel_render/chunk_streaming.h"
 #include "voxel/raycast.h"
+#include "mesh/mesher_service.h"
 #include "world/numeric_provider.h"
+#include "world/world_service.h"
 #include "test_runtime.h"
 
 static uint32_t raycastChecks;
@@ -57,6 +59,9 @@ static BlockType ReadWorld(void *context, int64_t x, int64_t y, int64_t z)
 LAIUE_TEST_ENTRY(VoxelRaycastTestEntryPoint)
 {
     WorldSetNumericService(LaiueNumericGetStaticServiceV1());
+    ChunkStreamingSetWorldService(LaiueWorldGetStaticServiceV1());
+    ChunkStreamingSetMesherService(LaiueMesherGetStaticServiceV1());
+    ChunkStreamingSetGraphicsService(NULL);
     World *world = WorldCreate(NULL);
     RaycastExpect(world != NULL, "empty world was not created");
 
