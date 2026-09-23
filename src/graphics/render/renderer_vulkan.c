@@ -261,6 +261,12 @@ struct Renderer
      * desktop and mobile providers on the same ABI-safe path. */
     PFN_vkCmdBeginRendering cmdBeginRendering;
     PFN_vkCmdEndRendering cmdEndRendering;
+    bool useDynamicRendering;
+    VkRenderPass colorRenderPass;
+    VkRenderPass depthRenderPass;
+    VkFramebuffer colorFramebuffers[FRAME_COUNT];
+    VkFramebuffer depthFramebuffers[FRAME_COUNT];
+    VkFramebuffer cubeFramebuffers[6];
     uint32_t queueFamily;
     VkQueue queue;
     VkCommandPool commandPool;
@@ -592,6 +598,133 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height, uin
     outImage->width = width;
     outImage->height = height;
     outImage->layerCount = layerCount;
+    return true;
+}
+
+/* Vulkan 1.3 dynamic rendering is the fast path, but Android devices still
+ * commonly expose only Vulkan 1.2.  Keep the same backend usable there with a
+ * small render-pass compatibility path.  The render passes intentionally use
+ * LOAD for color/depth; callers clear attachments explicitly when a pass
+ * starts, so the same compatible pipeline can be reused by the resolve and UI
+ * passes without creating duplicate pipeline layouts. */
+static bool CreateRenderPasses(Renderer *renderer)
+{
+    VkAttachmentDescription color = {
+        .format = COLOR_FORMAT,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+    VkAttachmentReference colorReference = {
+        .attachment = 0u,
+        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+    VkSubpassDescription colorSubpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1u,
+        .pColorAttachments = &colorReference,
+    };
+    VkRenderPassCreateInfo colorInfo = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1u,
+        .pAttachments = &color,
+        .subpassCount = 1u,
+        .pSubpasses = &colorSubpass,
+    };
+    if (vkCreateRenderPass(renderer->device, &colorInfo, NULL, &renderer->colorRenderPass) !=
+        VK_SUCCESS)
+        return false;
+
+    VkAttachmentDescription attachments[2] = { color };
+    attachments[1] = (VkAttachmentDescription){
+        .format = DEPTH_FORMAT,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    VkAttachmentReference depthReference = {
+        .attachment = 1u,
+        .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    VkSubpassDescription depthSubpass = colorSubpass;
+    depthSubpass.pDepthStencilAttachment = &depthReference;
+    VkRenderPassCreateInfo depthInfo = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 2u,
+        .pAttachments = attachments,
+        .subpassCount = 1u,
+        .pSubpasses = &depthSubpass,
+    };
+    if (vkCreateRenderPass(renderer->device, &depthInfo, NULL, &renderer->depthRenderPass) !=
+        VK_SUCCESS)
+    {
+        vkDestroyRenderPass(renderer->device, renderer->colorRenderPass, NULL);
+        renderer->colorRenderPass = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+static bool CreateFrameTargetFramebuffers(Renderer *renderer)
+{
+    if (renderer->useDynamicRendering) return true;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    {
+        VkImageView colorAttachments[1] = { renderer->colorTargets[frame].view };
+        VkFramebufferCreateInfo colorInfo = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = renderer->colorRenderPass,
+            .attachmentCount = 1u,
+            .pAttachments = colorAttachments,
+            .width = renderer->colorTargets[frame].width,
+            .height = renderer->colorTargets[frame].height,
+            .layers = 1u,
+        };
+        if (vkCreateFramebuffer(renderer->device, &colorInfo, NULL,
+                                &renderer->colorFramebuffers[frame]) != VK_SUCCESS)
+            return false;
+
+        VkImageView depthAttachments[2] = {
+            renderer->colorTargets[frame].view, renderer->depthTarget.view,
+        };
+        VkFramebufferCreateInfo depthInfo = colorInfo;
+        depthInfo.renderPass = renderer->depthRenderPass;
+        depthInfo.attachmentCount = 2u;
+        depthInfo.pAttachments = depthAttachments;
+        if (vkCreateFramebuffer(renderer->device, &depthInfo, NULL,
+                                &renderer->depthFramebuffers[frame]) != VK_SUCCESS)
+            return false;
+    }
+    return true;
+}
+
+static bool CreateCubeFramebuffers(Renderer *renderer)
+{
+    if (renderer->useDynamicRendering) return true;
+    for (uint32_t face = 0u; face < 6u; ++face)
+    {
+        VkImageView attachments[2] = { renderer->cubeFaceViews[face], renderer->cubeDepth.view };
+        VkFramebufferCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = renderer->depthRenderPass,
+            .attachmentCount = 2u,
+            .pAttachments = attachments,
+            .width = renderer->cubeColor.width,
+            .height = renderer->cubeColor.height,
+            .layers = 1u,
+        };
+        if (vkCreateFramebuffer(renderer->device, &info, NULL,
+                                &renderer->cubeFramebuffers[face]) != VK_SUCCESS)
+            return false;
+    }
     return true;
 }
 
@@ -1085,17 +1218,8 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         .pDynamicStates = dynamicStates,
     };
 
-    VkFormat colorFormat = COLOR_FORMAT;
-    VkPipelineRenderingCreateInfo renderingInfo = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount = 1u,
-        .pColorAttachmentFormats = &colorFormat,
-        .depthAttachmentFormat = recipe->depthTest ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
-    };
-
     VkGraphicsPipelineCreateInfo pipelineInfo = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &renderingInfo,
         .stageCount = 2u,
         .pStages = stages,
         .pVertexInputState = &vertexInput,
@@ -1108,6 +1232,24 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         .pDynamicState = &dynamicState,
         .layout = recipe->layout,
     };
+    VkFormat colorFormat = COLOR_FORMAT;
+    VkPipelineRenderingCreateInfo renderingInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1u,
+        .pColorAttachmentFormats = &colorFormat,
+        .depthAttachmentFormat = recipe->depthTest ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
+    };
+    if (renderer->useDynamicRendering)
+    {
+        pipelineInfo.pNext = &renderingInfo;
+        pipelineInfo.renderPass = VK_NULL_HANDLE;
+    }
+    else
+    {
+        pipelineInfo.renderPass = recipe->depthTest ? renderer->depthRenderPass
+                                                    : renderer->colorRenderPass;
+        pipelineInfo.subpass = 0u;
+    }
 
     VkResult result = vkCreateGraphicsPipelines(renderer->device, VK_NULL_HANDLE, 1u,
                                                 &pipelineInfo, NULL, outPipeline);
@@ -1563,6 +1705,14 @@ static void ReleaseCubeResources(Renderer *renderer)
 {
     for (uint32_t face = 0; face < 6u; ++face)
     {
+        if (renderer->cubeFramebuffers[face] != VK_NULL_HANDLE)
+        {
+            vkDestroyFramebuffer(renderer->device, renderer->cubeFramebuffers[face], NULL);
+            renderer->cubeFramebuffers[face] = VK_NULL_HANDLE;
+        }
+    }
+    for (uint32_t face = 0; face < 6u; ++face)
+    {
         if (renderer->cubeFaceViews[face] != VK_NULL_HANDLE)
         {
             vkDestroyImageView(renderer->device, renderer->cubeFaceViews[face], NULL);
@@ -1613,6 +1763,12 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
         }
     }
 
+    if (!CreateCubeFramebuffers(renderer))
+    {
+        ReleaseCubeResources(renderer);
+        return false;
+    }
+
     renderer->cubeResolution = resolution;
     for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
     {
@@ -1626,6 +1782,15 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
 
 static void ReleaseFrameTargets(Renderer *renderer)
 {
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    {
+        if (renderer->colorFramebuffers[frame] != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(renderer->device, renderer->colorFramebuffers[frame], NULL);
+        if (renderer->depthFramebuffers[frame] != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(renderer->device, renderer->depthFramebuffers[frame], NULL);
+        renderer->colorFramebuffers[frame] = VK_NULL_HANDLE;
+        renderer->depthFramebuffers[frame] = VK_NULL_HANDLE;
+    }
     for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
         ImageDestroy(renderer, &renderer->colorTargets[frame]);
     ImageDestroy(renderer, &renderer->depthTarget);
@@ -1650,6 +1815,12 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
     if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, DEPTH_FORMAT,
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
                      VK_IMAGE_VIEW_TYPE_2D, false, &renderer->depthTarget))
+    {
+        ReleaseFrameTargets(renderer);
+        return false;
+    }
+
+    if (!CreateFrameTargetFramebuffers(renderer))
     {
         ReleaseFrameTargets(renderer);
         return false;
@@ -2275,7 +2446,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         {
             VkPhysicalDeviceProperties properties;
             vkGetPhysicalDeviceProperties(devices[index], &properties);
-            if (properties.apiVersion < VK_API_VERSION_1_3) continue;
+            if (properties.apiVersion < VK_API_VERSION_1_2) continue;
             if (pass == 0u && properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
                 continue;
 
@@ -2338,6 +2509,20 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .dynamicRendering = VK_TRUE,
         .synchronization2 = VK_TRUE,
     };
+    renderer->useDynamicRendering = false;
+    if (properties.apiVersion >= VK_API_VERSION_1_3)
+    {
+        VkPhysicalDeviceVulkan13Features available13 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        };
+        VkPhysicalDeviceFeatures2 availableFeatures = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &available13,
+        };
+        vkGetPhysicalDeviceFeatures2(chosen, &availableFeatures);
+        renderer->useDynamicRendering = available13.dynamicRendering == VK_TRUE &&
+                                        available13.synchronization2 == VK_TRUE;
+    }
     // VK_KHR_swapchain включается только при наличии поверхности: без неё
     // offscreen-путь не должен зависеть от оконного расширения.
     const char *deviceExtensions[1];
@@ -2349,7 +2534,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &features13,
+        .pNext = renderer->useDynamicRendering ? &features13 : NULL,
         .queueCreateInfoCount = 1u,
         .pQueueCreateInfos = &queueInfo,
         .enabledExtensionCount = deviceExtensionCount,
@@ -2357,12 +2542,15 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
-    renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
-        renderer->device, "vkCmdBeginRendering");
-    renderer->cmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(
-        renderer->device, "vkCmdEndRendering");
-    if (renderer->cmdBeginRendering == NULL || renderer->cmdEndRendering == NULL)
-        return false;
+    if (renderer->useDynamicRendering)
+    {
+        renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
+            renderer->device, "vkCmdBeginRendering");
+        renderer->cmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(
+            renderer->device, "vkCmdEndRendering");
+        if (renderer->cmdBeginRendering == NULL || renderer->cmdEndRendering == NULL)
+            return false;
+    }
     vkGetDeviceQueue(renderer->device, chosenFamily, 0u, &renderer->queue);
 
     VkCommandPoolCreateInfo poolInfo = {
@@ -2519,7 +2707,8 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
-    if (!CreateDeviceObjects(renderer, windowHandle) || !CreateDescriptorLayouts(renderer) ||
+    if (!CreateDeviceObjects(renderer, windowHandle) || !CreateRenderPasses(renderer) ||
+        !CreateDescriptorLayouts(renderer) ||
         !CreateDescriptorPool(renderer) || !CreateFrameBuffers(renderer) ||
         !CreateFallbackImages(renderer) || !CreateSharedSets(renderer))
     {
@@ -2699,6 +2888,10 @@ void RendererDestroy_Vulkan(Renderer *renderer)
         if (renderer->commandPool != VK_NULL_HANDLE)
             vkDestroyCommandPool(renderer->device, renderer->commandPool, NULL);
         DestroySwapchainResources(renderer);
+        if (renderer->depthRenderPass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(renderer->device, renderer->depthRenderPass, NULL);
+        if (renderer->colorRenderPass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(renderer->device, renderer->colorRenderPass, NULL);
         vkDestroyDevice(renderer->device, NULL);
     }
     if (renderer->surface != VK_NULL_HANDLE && renderer->instance != VK_NULL_HANDLE)
@@ -2967,8 +3160,57 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
 static void EndRenderingIfActive(Renderer *renderer)
 {
     if (!renderer->renderingActive) return;
-    renderer->cmdEndRendering(renderer->commandBuffers[renderer->frameIndex]);
+    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    if (renderer->useDynamicRendering)
+        renderer->cmdEndRendering(commandBuffer);
+    else
+        vkCmdEndRenderPass(commandBuffer);
     renderer->renderingActive = false;
+}
+
+static void BeginLegacyRenderPass(Renderer *renderer, VkFramebuffer framebuffer,
+                                  bool depth, int32_t x, int32_t y, uint32_t width,
+                                  uint32_t height, const float clearColor[4],
+                                  bool clearDepth)
+{
+    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    VkRenderPassBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = depth ? renderer->depthRenderPass : renderer->colorRenderPass,
+        .framebuffer = framebuffer,
+        .renderArea = { { x, y }, { width, height } },
+    };
+    vkCmdBeginRenderPass(commandBuffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkClearAttachment clears[2];
+    uint32_t clearCount = 0u;
+    if (clearColor != NULL)
+    {
+        clears[clearCount] = (VkClearAttachment){
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .colorAttachment = 0u,
+        };
+        memcpy(clears[clearCount].clearValue.color.float32, clearColor, sizeof(float) * 4u);
+        ++clearCount;
+    }
+    if (depth && clearDepth)
+    {
+        clears[clearCount] = (VkClearAttachment){
+            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .clearValue = { .depthStencil = { 1.0f, 0u } },
+        };
+        ++clearCount;
+    }
+    if (clearCount != 0u)
+    {
+        VkClearRect rect = {
+            .rect = { { x, y }, { width, height } },
+            .baseArrayLayer = 0u,
+            .layerCount = 1u,
+        };
+        vkCmdClearAttachments(commandBuffer, clearCount, clears, 1u, &rect);
+    }
+    renderer->renderingActive = true;
 }
 
 static void SetViewportAndScissor(VkCommandBuffer commandBuffer, int32_t x, int32_t y,
@@ -3075,13 +3317,13 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     ImageBarrier(commandBuffer, &renderer->colorTargets[renderer->frameIndex],
                  VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ImageBarrier(commandBuffer, &renderer->depthTarget, VK_IMAGE_ASPECT_DEPTH_BIT,
-                 VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     if (renderer->cubeColor.image != VK_NULL_HANDLE)
     {
         ImageBarrier(commandBuffer, &renderer->cubeColor, VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         ImageBarrier(commandBuffer, &renderer->cubeDepth, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     }
 
     // Свет и число слоёв одинаковы для всех проходов кадра; проход
@@ -3101,6 +3343,19 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
 
     if (frame->passCount == 0u)
     {
+        const float clearColor[4] = {
+            frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
+        };
+        if (!renderer->useDynamicRendering)
+        {
+            BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
+                                  false, 0, 0, (uint32_t)renderer->windowWidth,
+                                  (uint32_t)renderer->windowHeight, clearColor, false);
+            SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
+                                  (uint32_t)renderer->windowHeight);
+            EndRenderingIfActive(renderer);
+            return true;
+        }
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = renderer->colorTargets[renderer->frameIndex].view,
@@ -3166,6 +3421,27 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     }
     if (width == 0u || height == 0u || colorView == VK_NULL_HANDLE) return;
 
+    if (!renderer->useDynamicRendering)
+    {
+        const float clearColor[4] = {
+            renderer->frame.skyColor[0], renderer->frame.skyColor[1],
+            renderer->frame.skyColor[2], 1.0f,
+        };
+        VkFramebuffer framebuffer = renderer->frame.panorama
+                                        ? renderer->cubeFramebuffers[pass->faceIndex < 6u
+                                                                         ? pass->faceIndex
+                                                                         : 0u]
+                                        : renderer->depthFramebuffers[renderer->frameIndex];
+        BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height,
+                              clearColor, true);
+        SetViewportAndScissor(commandBuffer, x, y, width, height);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          renderer->chunkPipeline);
+        memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection,
+               sizeof(float) * 16u);
+        return;
+    }
+
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = colorView,
@@ -3181,7 +3457,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     VkRenderingAttachmentInfo depthAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = depthView,
-        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
@@ -3216,6 +3492,27 @@ static void RecordPanoramaResolve(Renderer *renderer)
     };
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+
+    if (!renderer->useDynamicRendering)
+    {
+        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
+                              false, 0, 0, (uint32_t)renderer->windowWidth,
+                              (uint32_t)renderer->windowHeight, NULL, false);
+        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
+                              (uint32_t)renderer->windowHeight);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          renderer->resolvePipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                renderer->resolvePipelineLayout, 0u, 1u,
+                                &renderer->resolveSets[renderer->frameIndex], 1u,
+                                &constantOffset);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+        EndRenderingIfActive(renderer);
+        renderer->currentStats.drawCalls++;
+        ImageBarrier(commandBuffer, &renderer->cubeColor, VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        return;
+    }
 
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -3255,6 +3552,26 @@ static void RecordUiLayer(Renderer *renderer)
     };
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+
+    if (!renderer->useDynamicRendering)
+    {
+        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
+                              false, 0, 0, (uint32_t)renderer->windowWidth,
+                              (uint32_t)renderer->windowHeight, NULL, false);
+        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
+                              (uint32_t)renderer->windowHeight);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          renderer->uiPipeline);
+        uint32_t dynamicOffsets[2] = { constantOffset, 0u };
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                renderer->uiPipelineLayout, 0u, 1u,
+                                &renderer->uiSets[renderer->frameIndex], 2u,
+                                dynamicOffsets);
+        vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
+        EndRenderingIfActive(renderer);
+        renderer->currentStats.drawCalls++;
+        return;
+    }
 
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,

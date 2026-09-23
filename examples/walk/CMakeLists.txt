@@ -1,6 +1,7 @@
-add_executable(laiue_walk walk.c)
-target_link_libraries(laiue_walk PRIVATE laiue_bootstrap)
-target_compile_definitions(laiue_walk PRIVATE LAIUE_STATIC=1)
+if(NOT ANDROID OR NOT LAIUE_BUILD_ANDROID_WALK)
+    add_executable(laiue_walk walk.c)
+    target_link_libraries(laiue_walk PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_walk PRIVATE LAIUE_STATIC=1)
 if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     option(LAIUE_WALK_STATIC_WITH_VOXEL
         "Register the optional voxel provider in the static walk profile" ON)
@@ -24,7 +25,9 @@ else()
 endif()
 target_include_directories(laiue_walk PRIVATE
     "${PROJECT_SOURCE_DIR}/src")
-laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)
+
+    laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)
+endif()
 
 if(ANDROID AND LAIUE_BUILD_ANDROID_WALK)
     option(LAIUE_ANDROID_WALK_WITH_VOXEL

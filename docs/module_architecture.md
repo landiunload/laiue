@@ -62,8 +62,8 @@ selections; при конфликте providers он также не делае�
 
 Публичные header-only контракты не импортируют друг друга:
 
-* `graphics/graphics_api.h` — буферы, текстуры, samplers, pipelines, uploads,
-  draw items и кадр; в нём нет voxel/chunk/pack-типов;
+* `graphics/graphics_api.h` — шейдеры, буферы, текстуры, samplers, pipelines,
+  uploads, draw items и кадр; в нём нет voxel/chunk/pack-типов;
 * `graphics/graphics_device_service.h` — runtime create/resize/destroy для
   backend-neutral устройства; D3D12 и Vulkan являются providers одной таблицы;
 * `simulation/voxel/voxel_api.h` — sparse block provider, запросы collision и

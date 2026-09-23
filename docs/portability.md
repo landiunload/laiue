@@ -221,7 +221,13 @@ cmake --build D:\build\laiue\android-x86_64-core-api35 --config Release --parall
 `laiue-api35-x86_64` через `adb`; это проверяет native ABI и статическое
 замыкание. Для NativeActivity-клиента используйте preset
 `android-x86_64-walk-api35`: он собирает Vulkan surface path и `.so`; APK
-target включается только когда явно заданы SDK build-tools и keystore.
+target автоматически получает build-tools и `android.jar` из
+`ANDROID_SDK_ROOT`/`ANDROID_HOME`, если они установлены, и включается после
+явного задания `-DLAIUE_ANDROID_KEYSTORE=<keystore>`. Движок не создаёт и не
+хранит ключ подписи. Renderer выбирает dynamic rendering на Vulkan 1.3 и
+совместимые render-pass/framebuffer на Vulkan 1.2; поэтому API 35 emulator с
+SwiftShader 1.2 также проходит NativeActivity smoke, не требуя 1.3-only
+расширений.
 
 На Windows с динамическими модулями сборка также создаёт
 `laiue_graphics_d3d12.dll`. При найденном Vulkan SDK Linux/Windows собирают

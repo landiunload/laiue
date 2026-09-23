@@ -29,7 +29,9 @@ diagnostic headless check instead.
 `android/` is a small static-registry client using the same module ABI. It
 creates a Vulkan surface from `ANativeWindow`, recreates the device after
 `APP_CMD_TERM_WINDOW`/`APP_CMD_INIT_WINDOW`, pauses its fixed 128 Hz loop when
-the activity loses focus, and accepts keyboard plus touch input. The sparse
+the activity loses focus, and accepts keyboard plus touch input. Vulkan 1.3
+uses dynamic rendering; Vulkan 1.2 devices use the compatible render-pass
+path, so the same APK does not require a 1.3-only device. The sparse
 voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
 character on the example's deterministic infinite base plane.
 
@@ -44,5 +46,8 @@ cmake --build D:\build\laiue\android-x86_64-walk --config Release --target laiue
 
 The result is `android/Release/liblaiue_walk.so` plus the manifest staged by
 the `laiue_walk_android_manifest` target. APK signing/zipalign intentionally
-remain a packaging step: they require the Android SDK build-tools (`aapt2`,
-`zipalign`, `apksigner`) and a keystore supplied by the application owner.
+remain a packaging step. If `ANDROID_SDK_ROOT`/`ANDROID_HOME` points at an SDK
+with build-tools, CMake discovers `aapt2`, `zipalign`, `apksigner` and the
+highest installed `android.jar`; set `LAIUE_ANDROID_KEYSTORE` to enable the
+`laiue_walk_android_apk` target. A keystore is still supplied by the
+application owner, never generated or embedded by the engine.

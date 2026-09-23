@@ -60,6 +60,14 @@ typedef struct LaiueGraphicsSamplerDescV1
     uint32_t addressModeW;
 } LaiueGraphicsSamplerDescV1;
 
+typedef struct LaiueGraphicsShaderDescV1
+{
+    uint32_t structSize;
+    uint32_t stage;
+    const void *code;
+    uint64_t codeSizeBytes;
+} LaiueGraphicsShaderDescV1;
+
 typedef struct LaiueGraphicsPipelineDescV1
 {
     uint32_t structSize;
@@ -101,6 +109,9 @@ typedef uint32_t (*LaiueGraphicsCreateSamplerFn)(LaiueGraphicsDeviceV1 *,
 typedef uint32_t (*LaiueGraphicsCreatePipelineFn)(LaiueGraphicsDeviceV1 *,
                                                   const LaiueGraphicsPipelineDescV1 *,
                                                   LaiueGraphicsHandle *outPipeline);
+typedef uint32_t (*LaiueGraphicsCreateShaderFn)(LaiueGraphicsDeviceV1 *,
+                                                const LaiueGraphicsShaderDescV1 *,
+                                                LaiueGraphicsHandle *outShader);
 typedef uint32_t (*LaiueGraphicsUploadBufferFn)(LaiueGraphicsDeviceV1 *,
                                                 const LaiueGraphicsBufferUploadV1 *upload);
 typedef void (*LaiueGraphicsDestroyHandleFn)(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
@@ -125,5 +136,8 @@ struct LaiueGraphicsDeviceV1
     LaiueGraphicsBeginFrameFn beginFrame;
     LaiueGraphicsSubmitFn submit;
     LaiueGraphicsEndFrameFn endFrame;
-    uintptr_t reserved[5];
+    /* Tail extension: older consumers still see their original fields and
+     * gate this optional operation by structSize. */
+    LaiueGraphicsCreateShaderFn createShader;
+    uintptr_t reserved[4];
 };

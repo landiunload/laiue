@@ -29,6 +29,10 @@ Remove-Item -LiteralPath $unsigned, $aligned, $output -Force -ErrorAction Silent
     --auto-add-overlay -o $unsigned
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed with exit code $LASTEXITCODE" }
 
+# Windows PowerShell 5.1 keeps ZipArchiveMode in the base compression
+# assembly, while PowerShell 7 may load it transitively.  Load both explicitly
+# so the SDK packaging script behaves identically in either host.
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::Open($unsigned,
     [System.IO.Compression.ZipArchiveMode]::Update)
