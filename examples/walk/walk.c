@@ -590,6 +590,9 @@ static LaiueModuleStatus LoadWalkModules(
 #if !defined(LAIUE_WALK_RUNTIME_ONLY)
 static bool RunWalkExample(bool headless)
 {
+#if !defined(LAIUE_WALK_WINDOWED)
+    (void)headless;
+#endif
     LaiueModuleHostConfigV1 config;
     LaiueModuleHostConfigInitialize(&config);
     LaiueModuleDiagnostic diagnostic;
@@ -840,9 +843,27 @@ void WalkExampleEntryPoint(void)
     ExitProcess(RunWalkExample(WalkHeadlessArgument()) ? 0u : 1u);
 }
 #else
-int main(void)
+static bool WalkHeadlessArgument(int argc, char **argv)
 {
-    return RunWalkExample(true) ? 0 : 1;
+    for (int32_t argument = 1; argument < argc; ++argument)
+    {
+        const char *value = argv[argument];
+        static const char expected[] = "--headless";
+        uint32_t index = 0u;
+        if (value == NULL)
+            continue;
+        while (value[index] != '\0' && expected[index] != '\0' &&
+               value[index] == expected[index])
+            ++index;
+        if (value[index] == '\0' && expected[index] == '\0')
+            return true;
+    }
+    return false;
+}
+
+int main(int argc, char **argv)
+{
+    return RunWalkExample(WalkHeadlessArgument(argc, argv)) ? 0 : 1;
 }
 #endif
 #endif /* !LAIUE_WALK_RUNTIME_ONLY */

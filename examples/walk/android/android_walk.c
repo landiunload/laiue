@@ -88,6 +88,23 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
         state->graphics->destroyDevice(state->device);
     state->device = NULL;
     state->windowReady = false;
+    state->running = false;
+    state->touchActive = false;
+    state->jumpPending = false;
+    memset(state->keyDown, 0, sizeof(state->keyDown));
+    state->accumulator = 0.0;
+    state->lastTime = 0.0;
+}
+
+static void AndroidResetInputClock(AndroidWalkState *state)
+{
+    if (state == NULL)
+        return;
+    state->touchActive = false;
+    state->jumpPending = false;
+    memset(state->keyDown, 0, sizeof(state->keyDown));
+    state->accumulator = 0.0;
+    state->lastTime = PlatformMonotonicSeconds();
 }
 
 static void AndroidCreateDevice(AndroidWalkState *state)
@@ -175,10 +192,15 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
             AndroidDestroyDevice(state);
             break;
         case APP_CMD_GAINED_FOCUS:
-            state->running = true;
+            if (state->windowReady)
+            {
+                AndroidResetInputClock(state);
+                state->running = true;
+            }
             break;
         case APP_CMD_LOST_FOCUS:
             state->running = false;
+            AndroidResetInputClock(state);
             break;
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONTENT_RECT_CHANGED:
@@ -301,13 +323,14 @@ void android_main(struct android_app *app)
     {
         int events = 0;
         struct android_poll_source *source = NULL;
-        const int timeout = state.running && state.windowReady ? 0 : -1;
+        int timeout = state.running && state.windowReady ? 0 : -1;
         while (ALooper_pollOnce(timeout, NULL, &events, (void **)&source) >= 0)
         {
             if (source != NULL && source->process != NULL)
                 source->process(app, source);
             if (app->destroyRequested != 0)
                 break;
+            timeout = state.running && state.windowReady ? 0 : -1;
             if (timeout == 0)
                 break;
         }
