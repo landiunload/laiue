@@ -76,10 +76,11 @@ else()
 endif()
 add_library(laiue::platform_support ALIAS laiue_platform_support)
 
-# Окно — часть графического слоя и пока написано на Win32. Профиль Vulkan
-# первого этапа рисует offscreen, поэтому окна в нём нет; нативный
-# Wayland/X11-бэкенд появится вместе со swapchain.
-if(LAIUE_BUILD_GRAPHICS AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
+# Окно — самостоятельный platform provider, а не свойство конкретного
+# graphics backend-а. Поэтому Win32-окно собирается и для D3D12, и для
+# Vulkan; headless Vulkan по-прежнему можно использовать без загрузки этого
+# модуля. Нативные Wayland/X11/mobile providers подключаются внешним adapter.
+if(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_WINDOWS)
     laiue_add_module(window
         RUNTIME_ROLE GRAPHICS
         SOURCES

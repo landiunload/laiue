@@ -1,8 +1,8 @@
 #pragma once
 
 #include "api.h"
+#include "graphics/graphics_api.h"
 #include "ui/ui_font.h"
-#include "render/ui_quad.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -11,7 +11,7 @@
 // кадр заново собирают список квадов для RendererUiQueue. Состояние
 // между кадрами — только анимации наведения и захват мыши слайдером.
 
-#define UI_MAX_DRAW_QUADS RENDERER_UI_MAX_QUADS
+#define UI_MAX_DRAW_QUADS LAIUE_GRAPHICS_UI_MAX_QUADS
 #define UI_MAX_ANIMATIONS 48
 
 typedef struct UiAnimation
@@ -44,7 +44,7 @@ typedef struct UiContext
     UiAnimation animations[UI_MAX_ANIMATIONS];
     uint32_t animationCount;
 
-    RendererUiQuad quads[UI_MAX_DRAW_QUADS];
+    LaiueGraphicsUiQuadV1 quads[UI_MAX_DRAW_QUADS];
     uint32_t quadCount;
 } UiContext;
 

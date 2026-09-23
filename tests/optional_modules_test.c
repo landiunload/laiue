@@ -1,6 +1,7 @@
 #include "audio/audio_service.h"
 #include "audio/audio_pack_service.h"
 #include "content/content_service.h"
+#include "input/input_service.h"
 #include "mesh/mesher_service.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
@@ -11,12 +12,14 @@
 #include "ui/ui_service.h"
 #include "voxel_render/voxel_render_service.h"
 #include "world/world_service.h"
+#include "platform/window_service.h"
 
 #include <stdbool.h>
 
 #if defined(_WIN32)
 #define AUDIO_MODULE_NAME L"laiue_audio.dll"
 #define AUDIO_PACK_MODULE_NAME L"laiue_audio_pack.dll"
+#define INPUT_MODULE_NAME L"laiue_input.dll"
 #define CONTENT_MODULE_NAME L"laiue_content.dll"
 #define UI_MODULE_NAME L"laiue_ui.dll"
 #define VOXEL_RENDER_MODULE_NAME L"laiue_voxel_render.dll"
@@ -26,9 +29,11 @@
 #define RENDER_MODULE_NAME L"laiue_render.dll"
 #define NUMERIC_MODULE_NAME L"laiue_numeric.dll"
 #define SCENE_MODULE_NAME L"laiue_scene.dll"
+#define WINDOW_MODULE_NAME L"laiue_window.dll"
 #elif defined(__APPLE__)
 #define AUDIO_MODULE_NAME L"liblaiue_audio.dylib"
 #define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.dylib"
+#define INPUT_MODULE_NAME L"liblaiue_input.dylib"
 #define CONTENT_MODULE_NAME L"liblaiue_content.dylib"
 #define UI_MODULE_NAME L"liblaiue_ui.dylib"
 #define VOXEL_RENDER_MODULE_NAME L"liblaiue_voxel_render.dylib"
@@ -38,9 +43,11 @@
 #define RENDER_MODULE_NAME L"liblaiue_render.dylib"
 #define NUMERIC_MODULE_NAME L"liblaiue_numeric.dylib"
 #define SCENE_MODULE_NAME L"liblaiue_scene.dylib"
+#define WINDOW_MODULE_NAME L"liblaiue_window.dylib"
 #else
 #define AUDIO_MODULE_NAME L"liblaiue_audio.so"
 #define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.so"
+#define INPUT_MODULE_NAME L"liblaiue_input.so"
 #define CONTENT_MODULE_NAME L"liblaiue_content.so"
 #define UI_MODULE_NAME L"liblaiue_ui.so"
 #define VOXEL_RENDER_MODULE_NAME L"liblaiue_voxel_render.so"
@@ -50,6 +57,7 @@
 #define RENDER_MODULE_NAME L"liblaiue_render.so"
 #define NUMERIC_MODULE_NAME L"liblaiue_numeric.so"
 #define SCENE_MODULE_NAME L"liblaiue_scene.so"
+#define WINDOW_MODULE_NAME L"liblaiue_window.so"
 #endif
 
 static void Expect(bool condition, const char *message)
@@ -86,6 +94,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     static wchar_t missingPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t audioPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t audioPackPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t inputPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t contentPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t uiPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t voxelRenderPath[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -95,12 +104,14 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t numericPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t scenePath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
     Expect(PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY),
            "executable directory is available");
     Expect(Join(missingPath, directory, L"laiue_optional_module_absent_9f3c.dll"),
            "missing path fits");
     Expect(Join(audioPath, directory, AUDIO_MODULE_NAME), "audio path fits");
     Expect(Join(audioPackPath, directory, AUDIO_PACK_MODULE_NAME), "audio pack path fits");
+    Expect(Join(inputPath, directory, INPUT_MODULE_NAME), "input path fits");
     Expect(Join(contentPath, directory, CONTENT_MODULE_NAME), "content path fits");
     Expect(Join(uiPath, directory, UI_MODULE_NAME), "UI path fits");
     Expect(Join(voxelRenderPath, directory, VOXEL_RENDER_MODULE_NAME),
@@ -112,6 +123,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(Join(renderPath, directory, RENDER_MODULE_NAME), "render path fits");
     Expect(Join(numericPath, directory, NUMERIC_MODULE_NAME), "numeric path fits");
     Expect(Join(scenePath, directory, SCENE_MODULE_NAME), "scene path fits");
+    Expect(Join(windowPath, directory, WINDOW_MODULE_NAME), "window path fits");
 
     LaiueModuleHostConfigV1 config;
     LaiueModuleHostConfigInitialize(&config);
@@ -174,6 +186,31 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(packService != NULL && version == LAIUE_AUDIO_PACK_SERVICE_ABI_VERSION_1 &&
                size >= sizeof(*packService) && packService->loadMemory != NULL,
            "audio pack service is published after dependencies");
+    LaiueModuleHostUnloadAll(host);
+
+    /* Window and input are platform providers, not a D3D12-only feature.
+     * On Windows the same graph must load when the graphics backend is
+     * explicitly Vulkan. */
+    LaiueModuleBinaryV1 platformGraph[] = {
+        {inputPath, 0u, NULL},
+        {windowPath, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, platformGraph,
+                               (uint32_t)(sizeof(platformGraph) /
+                                          sizeof(platformGraph[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    const LaiueInputServiceV1 *inputService =
+        (const LaiueInputServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_INPUT_SERVICE_NAME, LAIUE_INPUT_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueInputServiceV1), &version, &size);
+    const LaiueWindowServiceV1 *windowService =
+        (const LaiueWindowServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_WINDOW_SERVICE_NAME, LAIUE_WINDOW_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueWindowServiceV1), &version, &size);
+    Expect(inputService != NULL && inputService->create != NULL &&
+               windowService != NULL && windowService->create != NULL,
+           "platform providers load independently of the render backend");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 uiOnly = {uiPath, 0u, NULL};

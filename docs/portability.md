@@ -27,7 +27,8 @@ Core включает `platform_support`, `world`, `physics`, `content` и `mod`
 | Бэкенд | Графические модули | Чего нет |
 |---|---|---|
 | `D3D12` | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
-| `VULKAN` | `audio`, `mesh`, `render`, `scene` | оконный, вводный и интерфейсный модули движка |
+| `VULKAN` на Windows | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
+| `VULKAN` на POSIX | `audio`, `mesh`, `render`, `scene`, `ui` | native `window`/`input` до подключения platform adapter |
 
 На Windows `LAIUE_RENDER_BACKEND=AUTO` (умолчание) связывает все физически
 доступные бэкенды: D3D12 и, если найден Vulkan SDK, Vulkan. `RendererCreate`
@@ -37,9 +38,9 @@ Core включает `platform_support`, `world`, `physics`, `content` и `mod`
 
 Путь вывода зависит от платформы, а не от одного признака «Vulkan». На
 Windows Vulkan с непустым `windowHandle` создаёт Win32 surface и swapchain
-и показывает кадр в переданном HWND; модулей `window`, `input` и `ui` в
-наборе Vulkan всё равно нет — окно и ввод предоставляет приложение, а `ui`
-остаётся Win32/GDI-модулем D3D12-профиля. Vulkan без `windowHandle`, а
+и показывает кадр в переданном HWND; те же самостоятельные `window`, `input`
+и `ui` providers доступны независимо от выбранного backend-а. Vulkan без
+`windowHandle`, а
 также весь Vulkan вне Windows рисует кадр offscreen: результат читается
 `RendererCaptureFrame` из `render/renderer_offscreen.h`. Этого достаточно,
 чтобы проверять рендер по пикселям на программном драйвере; переносимое
@@ -52,9 +53,10 @@ Windows отвергается сразу.
 
 Звук и сцена переносимы целиком: микшер не знает платформы, а вывод у
 него свой на каждой (WASAPI и ALSA), потоковый стриминг чанков работает
-через контракт потоков платформенного слоя. Вне D3D12-профиля остаются
-окно и интерфейс: окно написано на Win32, `ui` растеризует шрифты через
-GDI.
+через контракт потоков платформенного слоя. На POSIX headless-профиле окно
+и ввод пока должны прийти от внешнего platform adapter; `ui` остаётся
+доступным и использует portable font fallback, а на Windows растеризует
+шрифты через GDI.
 
 ## Опции CMake
 

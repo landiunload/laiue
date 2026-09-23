@@ -4,21 +4,14 @@
  * a renderer may consume it without importing the UI implementation DLL. */
 
 #include "mod/module_api.h"
+#include "graphics/graphics_api.h"
 
 #include <stdint.h>
 
 #define LAIUE_UI_SERVICE_ABI_VERSION_1 1u
 #define LAIUE_UI_SERVICE_NAME "laiue.ui"
 
-typedef struct LaiueUiQuadV1
-{
-    float rect[4];
-    float uv[4];
-    uint32_t colorRGBA;
-    float cornerRadius;
-    uint32_t flags;
-    uint32_t reserved;
-} LaiueUiQuadV1;
+typedef LaiueGraphicsUiQuadV1 LaiueUiQuadV1;
 
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueUiContextCreateFn)(void **outContext);
 typedef void(LAIUE_MODULE_CALL *LaiueUiContextDestroyFn)(void *context);

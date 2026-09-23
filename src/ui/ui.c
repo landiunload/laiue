@@ -94,7 +94,7 @@ void UiClearClip(UiContext* ui)
 
 // Подрезает готовый квад по прямоугольнику клипа; UV пересчитываются
 // пропорционально срезанным сторонам. false — квад целиком за пределами.
-static bool ClipQuad(const UiContext* ui, RendererUiQuad* quad)
+static bool ClipQuad(const UiContext* ui, LaiueGraphicsUiQuadV1* quad)
 {
     if (!ui->clipEnabled)
     {
@@ -135,13 +135,13 @@ static bool ClipQuad(const UiContext* ui, RendererUiQuad* quad)
     return true;
 }
 
-static RendererUiQuad* PushQuad(UiContext* ui)
+static LaiueGraphicsUiQuadV1* PushQuad(UiContext* ui)
 {
     if (ui->quadCount == UI_MAX_DRAW_QUADS)
     {
         return NULL;
     }
-    RendererUiQuad* quad = &ui->quads[ui->quadCount++];
+    LaiueGraphicsUiQuadV1* quad = &ui->quads[ui->quadCount++];
     quad->uv[0] = quad->uv[1] = quad->uv[2] = quad->uv[3] = 0.0f;
     quad->cornerRadius = 0.0f;
     quad->flags = 0;
@@ -152,7 +152,7 @@ static RendererUiQuad* PushQuad(UiContext* ui)
 void UiRect(UiContext* ui, float x, float y, float width, float height,
     float cornerRadius, uint32_t color)
 {
-    RendererUiQuad* quad = PushQuad(ui);
+    LaiueGraphicsUiQuadV1* quad = PushQuad(ui);
     if (quad == NULL)
     {
         return;
@@ -172,7 +172,7 @@ void UiRect(UiContext* ui, float x, float y, float width, float height,
 void UiImage(UiContext* ui, float x, float y, float width, float height,
     float u0, float v0, float u1, float v1, uint32_t color)
 {
-    RendererUiQuad* quad = PushQuad(ui);
+    LaiueGraphicsUiQuadV1* quad = PushQuad(ui);
     if (quad == NULL || width <= 0.0f || height <= 0.0f) return;
     quad->rect[0] = x;
     quad->rect[1] = y;
@@ -184,7 +184,7 @@ void UiImage(UiContext* ui, float x, float y, float width, float height,
     quad->uv[3] = v1;
     quad->colorRGBA = color;
     quad->cornerRadius = 0.0f;
-    quad->flags = RENDERER_UI_QUAD_IMAGE;
+    quad->flags = LAIUE_GRAPHICS_UI_QUAD_IMAGE;
     quad->reserved = 0;
 }
 
@@ -212,7 +212,7 @@ void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
         }
         if (glyph->width != 0 && glyph->height != 0)
         {
-            RendererUiQuad* quad = PushQuad(ui);
+            LaiueGraphicsUiQuadV1* quad = PushQuad(ui);
             if (quad == NULL)
             {
                 return;
@@ -228,7 +228,7 @@ void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
             quad->uv[2] = glyph->u1;
             quad->uv[3] = glyph->v1;
             quad->colorRGBA = color;
-            quad->flags = RENDERER_UI_QUAD_TEXT;
+            quad->flags = LAIUE_GRAPHICS_UI_QUAD_TEXT;
             if (!ClipQuad(ui, quad))
             {
                 --ui->quadCount;

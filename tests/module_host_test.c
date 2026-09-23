@@ -158,6 +158,40 @@ static const LaiueModuleApiV1 duplicateProviderApi = {
     .destroy = StaticDestroy,
 };
 
+static const char *const selectedProviderServices[] = {"example.selection"};
+static const LaiueModuleApiV1 selectedProviderAlphaApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.provider.alpha",
+        .version = "1.0.0",
+        .providesServices = selectedProviderServices,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+static const LaiueModuleApiV1 selectedProviderZetaApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.provider.zeta",
+        .version = "1.0.0",
+        .providesServices = selectedProviderServices,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
 static const LaiueModuleApiV1 badAbiApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = 99u,
@@ -269,6 +303,51 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u,
            "partial profile report contains per-module state");
     LaiueModuleHostUnloadAll(host);
+
+    /* A profile explicitly selects a provider instead of relying on the
+     * order in which artifacts happen to be listed. */
+    static LaiueModuleLoadReportEntryV1 selectionEntries[2];
+    LaiueModuleLoadReportV1 selectionReport;
+    LaiueModuleLoadReportInitialize(&selectionReport, selectionEntries, 2u);
+    static const LaiueModuleProviderSelectionV1 providerSelection = {
+        .structSize = sizeof(LaiueModuleProviderSelectionV1),
+        .serviceName = "example.selection",
+        .moduleId = "example.provider.zeta",
+    };
+    static const LaiueModuleBinaryV1 selectionBinaries[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &selectedProviderAlphaApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &selectedProviderZetaApi},
+    };
+    LaiueModuleProfileV1 selectionProfile = {
+        .structSize = sizeof(selectionProfile),
+        .flags = 0u,
+        .binaries = selectionBinaries,
+        .binaryCount = 2u,
+        .providerSelections = &providerSelection,
+        .providerSelectionCount = 1u,
+    };
+    Expect(LaiueModuleHostLoadProfileV1(host, &selectionProfile, &selectionReport,
+                                        &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    Expect(LaiueModuleHostLoadedCount(host) == 1u &&
+               LaiueModuleHostIsLoaded(host, "example.provider.zeta") &&
+               !LaiueModuleHostIsLoaded(host, "example.provider.alpha") &&
+               (selectionEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+               (selectionEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+           "profile provider selection is explicit and deterministic");
+    LaiueModuleHostUnloadAll(host);
+
+    static const LaiueModuleProviderSelectionV1 invalidSelection = {
+        .structSize = sizeof(LaiueModuleProviderSelectionV1),
+        .serviceName = "example.selection",
+        .moduleId = "example.provider.missing",
+    };
+    selectionProfile.providerSelections = &invalidSelection;
+    LaiueModuleLoadReportInitialize(&selectionReport, selectionEntries, 2u);
+    Expect(LaiueModuleHostLoadProfileV1(host, &selectionProfile, &selectionReport,
+                                        &diagnostic) == LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleHostLoadedCount(host) == 0u,
+           "invalid provider selection is rejected before callbacks");
 
     /* A present optional provider may fail in create/start. The profile
      * retries without that provider, while the independent static module

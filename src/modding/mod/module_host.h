@@ -59,6 +59,28 @@ typedef struct LaiueModuleBinaryV1
  * ABI for consoles/mobile and external platform adapters. */
 #define LAIUE_MODULE_BINARY_STATIC UINT32_C(1) << 1
 
+/* A profile may pin the provider of a service explicitly.  Provider IDs are
+ * module descriptor IDs, not file names, so the same profile remains valid
+ * when the artifact is replaced for another platform. */
+typedef struct LaiueModuleProviderSelectionV1
+{
+    uint32_t structSize;
+    const char *serviceName;
+    const char *moduleId;
+    uintptr_t reserved[2];
+} LaiueModuleProviderSelectionV1;
+
+typedef struct LaiueModuleProfileV1
+{
+    uint32_t structSize;
+    uint32_t flags;
+    const LaiueModuleBinaryV1 *binaries;
+    uint32_t binaryCount;
+    const LaiueModuleProviderSelectionV1 *providerSelections;
+    uint32_t providerSelectionCount;
+    uintptr_t reserved[4];
+} LaiueModuleProfileV1;
+
 typedef void (*LaiueModuleHostLogCallback)(void *context, LaiueModuleLogLevel level,
                                            const char *moduleId, const char *message);
 
@@ -102,6 +124,14 @@ LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadProfile(
     LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries, uint32_t count,
     uint32_t profileFlags, LaiueModuleLoadReportV1 *report,
     LaiueModuleDiagnostic *diagnostic);
+/* Extended profile form with explicit service-provider choices.  The
+ * compatibility overload above remains the shorthand for a profile without
+ * selections.  When selections are present, the selected provider is loaded
+ * even in strict mode; an unselected competing provider is intentionally
+ * reported as disabled rather than treated as a random load-order choice. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadProfileV1(
+    LaiueModuleHost *host, const LaiueModuleProfileV1 *profile,
+    LaiueModuleLoadReportV1 *report, LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleLoadReportInitialize(
     LaiueModuleLoadReportV1 *report,
     LaiueModuleLoadReportEntryV1 *entries, uint32_t capacity);

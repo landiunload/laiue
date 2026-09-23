@@ -1,20 +1,13 @@
 #pragma once
 
-/* Renderer-neutral UI upload contract.  The UI provider owns construction;
- * graphics providers only consume this fixed layout at the frame boundary. */
+/* Compatibility spelling for the old renderer headers.  The canonical
+ * layout belongs to the backend-neutral graphics contract; UI no longer
+ * imports this renderer-private header. */
 
-#include <stdint.h>
+#include "graphics/graphics_api.h"
 
-#define RENDERER_UI_MAX_QUADS 2048u
-#define RENDERER_UI_QUAD_TEXT 1u
-#define RENDERER_UI_QUAD_IMAGE 2u
+#define RENDERER_UI_MAX_QUADS LAIUE_GRAPHICS_UI_MAX_QUADS
+#define RENDERER_UI_QUAD_TEXT LAIUE_GRAPHICS_UI_QUAD_TEXT
+#define RENDERER_UI_QUAD_IMAGE LAIUE_GRAPHICS_UI_QUAD_IMAGE
 
-typedef struct RendererUiQuad
-{
-    float rect[4];
-    float uv[4];
-    uint32_t colorRGBA;
-    float cornerRadius;
-    uint32_t flags;
-    uint32_t reserved;
-} RendererUiQuad;
+typedef LaiueGraphicsUiQuadV1 RendererUiQuad;

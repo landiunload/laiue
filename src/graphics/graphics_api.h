@@ -8,6 +8,23 @@
 
 #define LAIUE_GRAPHICS_ABI_VERSION_1 1u
 
+/* Shared frame-boundary layout for backend-neutral UI draw lists.  The UI
+ * provider produces these records; graphics backends only consume them and
+ * do not need to know about widgets, scenes, or voxel geometry. */
+#define LAIUE_GRAPHICS_UI_MAX_QUADS 2048u
+#define LAIUE_GRAPHICS_UI_QUAD_TEXT 1u
+#define LAIUE_GRAPHICS_UI_QUAD_IMAGE 2u
+
+typedef struct LaiueGraphicsUiQuadV1
+{
+    float rect[4];
+    float uv[4];
+    uint32_t colorRGBA;
+    float cornerRadius;
+    uint32_t flags;
+    uint32_t reserved;
+} LaiueGraphicsUiQuadV1;
+
 typedef uint64_t LaiueGraphicsHandle;
 
 typedef struct LaiueGraphicsExtentV1

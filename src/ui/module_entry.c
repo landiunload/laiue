@@ -4,8 +4,8 @@
 
 #include <string.h>
 
-_Static_assert(sizeof(LaiueUiQuadV1) == sizeof(RendererUiQuad),
-               "UI service quad layout must match renderer upload layout");
+_Static_assert(sizeof(LaiueUiQuadV1) == sizeof(LaiueGraphicsUiQuadV1),
+               "UI service quad layout must match graphics upload layout");
 
 static const LaiueModuleHostV1 *moduleHost;
 static const LaiueGraphicsServiceV1 *graphicsService;

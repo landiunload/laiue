@@ -282,6 +282,7 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     add_test(NAME laiue.mod.module_host COMMAND laiue_module_host_test)
 
     if(TARGET laiue_audio AND TARGET laiue_ui AND TARGET laiue_voxel_render AND
+       TARGET laiue_window AND TARGET laiue_input AND
        LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
         add_executable(laiue_optional_modules_test optional_modules_test.c)
         target_link_libraries(laiue_optional_modules_test PRIVATE laiue_bootstrap)
@@ -289,7 +290,8 @@ if(LAIUE_NATIVE_MODS_ENABLED)
         laiue_configure_standalone_executable(
             laiue_optional_modules_test OptionalModulesTestEntryPoint)
         add_dependencies(laiue_optional_modules_test
-            laiue_audio laiue_ui laiue_voxel_render laiue_scene_math
+            laiue_audio laiue_audio_pack laiue_ui laiue_input laiue_window
+            laiue_voxel_render laiue_scene_math
             laiue_scene laiue_world laiue_mesher laiue_render laiue_numeric
             laiue_content)
         add_test(NAME laiue.mod.optional_components COMMAND laiue_optional_modules_test)

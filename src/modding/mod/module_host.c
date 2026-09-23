@@ -854,6 +854,21 @@ static int ProfileCompareIds(const ProfileCandidate *left, const ProfileCandidat
     return (unsigned char)left->id[index] - (unsigned char)right->id[index];
 }
 
+static const char *ProfileSelectionFor(const LaiueModuleProfileV1 *profile,
+                                       const char *serviceName)
+{
+    if (profile == NULL || serviceName == NULL)
+        return NULL;
+    for (uint32_t index = 0u; index < profile->providerSelectionCount; ++index)
+    {
+        const LaiueModuleProviderSelectionV1 *selection =
+            &profile->providerSelections[index];
+        if (LaiueModAsciiEquals(selection->serviceName, serviceName))
+            return selection->moduleId;
+    }
+    return NULL;
+}
+
 static void ProfileFillReport(LaiueModuleLoadReportV1 *report,
                               const ProfileCandidate *candidates, uint32_t count,
                               uint32_t loadedCount)
@@ -1157,17 +1172,41 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
     return LAIUE_MODULE_OK;
 }
 
-LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
-                                              const LaiueModuleBinaryV1 *binaries,
-                                              uint32_t count, uint32_t profileFlags,
-                                              LaiueModuleLoadReportV1 *report,
-                                              LaiueModuleDiagnostic *diagnostic)
+LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
+                                               const LaiueModuleProfileV1 *profile,
+                                               LaiueModuleLoadReportV1 *report,
+                                               LaiueModuleDiagnostic *diagnostic)
 {
     DiagnosticClear(diagnostic);
-    if (host == NULL || binaries == NULL || count == 0u ||
-        count > LAIUE_MODULE_HOST_MAX_MODULES)
+    if (host == NULL || profile == NULL ||
+        profile->structSize < offsetof(LaiueModuleProfileV1, reserved) ||
+        profile->binaries == NULL || profile->binaryCount == 0u ||
+        profile->binaryCount > LAIUE_MODULE_HOST_MAX_MODULES)
         return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
                     "module paths and count are required");
+    const LaiueModuleBinaryV1 *binaries = profile->binaries;
+    const uint32_t count = profile->binaryCount;
+    const uint32_t profileFlags = profile->flags;
+    const bool allowPartial =
+        (profileFlags & LAIUE_MODULE_PROFILE_ALLOW_PARTIAL) != 0u;
+    if (profile->providerSelectionCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
+        (profile->providerSelectionCount != 0u && profile->providerSelections == NULL))
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                    "provider selection storage is invalid");
+    for (uint32_t index = 0u; index < profile->providerSelectionCount; ++index)
+    {
+        const LaiueModuleProviderSelectionV1 *selection =
+            &profile->providerSelections[index];
+        if (selection->structSize < offsetof(LaiueModuleProviderSelectionV1, reserved) ||
+            !SafeName(selection->serviceName) || !SafeName(selection->moduleId))
+            return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                        "provider selection is invalid");
+        for (uint32_t prior = 0u; prior < index; ++prior)
+            if (LaiueModAsciiEquals(profile->providerSelections[prior].serviceName,
+                                    selection->serviceName))
+                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                            "provider selection is duplicated");
+    }
     if (report != NULL &&
         (report->structSize < sizeof(*report) || report->capacity < count ||
          report->entries == NULL))
@@ -1182,7 +1221,7 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
     if (lifecycleBusy || modulesAlreadyLoaded)
         return Fail(diagnostic, LAIUE_MODULE_BUSY,
                     "module lifecycle is active or modules are already loaded");
-    if ((profileFlags & LAIUE_MODULE_PROFILE_ALLOW_PARTIAL) == 0u)
+    if (!allowPartial && profile->providerSelectionCount == 0u)
     {
         const LaiueModuleStatus status = LaiueModuleHostLoad(host, binaries, count, diagnostic);
         if (report != NULL)
@@ -1217,8 +1256,9 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
         (void)ProfileProbeBinary(&binaries[index], &candidates[index]);
 
     /* Duplicate IDs and providers are resolved before any module callback.
-     * Partial profiles choose the lexicographically first provider; strict
-     * LaiueModuleHostLoad keeps reporting these as hard graph errors. */
+     * A profile may pin a provider explicitly. When it does not, the
+     * deterministic ID order remains the compatibility fallback for partial
+     * profiles; the strict loader still rejects ambiguous providers. */
     for (uint32_t left = 0u; left < count; ++left)
         if (candidates[left].active)
             for (uint32_t right = left + 1u; right < count; ++right)
@@ -1243,6 +1283,53 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
             }
         }
     }
+    bool invalidProviderSelection = false;
+    for (uint32_t selectionIndex = 0u;
+         selectionIndex < profile->providerSelectionCount; ++selectionIndex)
+    {
+        const LaiueModuleProviderSelectionV1 *selection =
+            &profile->providerSelections[selectionIndex];
+        bool selectedProviderFound = false;
+        bool serviceProviderFound = false;
+        if (ProfileHostProvides(host, selection->serviceName))
+        {
+            invalidProviderSelection = true;
+            continue;
+        }
+        for (uint32_t candidateIndex = 0u; candidateIndex < count; ++candidateIndex)
+        {
+            ProfileCandidate *candidate = &candidates[candidateIndex];
+            if (!candidate->active ||
+                !ProfileCandidateProvides(candidate, selection->serviceName))
+                continue;
+            serviceProviderFound = true;
+            if (LaiueModAsciiEquals(candidate->id, selection->moduleId))
+                selectedProviderFound = true;
+        }
+        if (!selectedProviderFound || !serviceProviderFound)
+        {
+            invalidProviderSelection = true;
+            for (uint32_t candidateIndex = 0u; candidateIndex < count; ++candidateIndex)
+            {
+                ProfileCandidate *candidate = &candidates[candidateIndex];
+                if (candidate->active &&
+                    ProfileCandidateProvides(candidate, selection->serviceName))
+                    ProfileSetFailure(candidate, LAIUE_MODULE_INVALID_ARGUMENT,
+                                      "selected service provider is not present");
+            }
+        }
+    }
+    if (invalidProviderSelection)
+    {
+        ProfileFillReport(report, candidates, count, 0u);
+        ProfileCloseProbes(candidates, count);
+        PlatformFree(candidates);
+        PlatformFree(selected);
+        PlatformFree(planned);
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                    "provider selection does not match the profile");
+    }
+
     for (uint32_t left = 0u; left < count; ++left)
         if (candidates[left].active)
             for (uint32_t right = left + 1u; right < count; ++right)
@@ -1253,20 +1340,38 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
                     const LaiueModuleDescriptorV1 *rightDescriptor =
                         &candidates[right].api->descriptor;
                     bool conflict = false;
+                    const char *conflictService = NULL;
                     for (uint32_t a = 0u; a < leftDescriptor->providesCount && !conflict; ++a)
                         for (uint32_t b = 0u; b < rightDescriptor->providesCount; ++b)
                             if (LaiueModAsciiEquals(leftDescriptor->providesServices[a],
                                                     rightDescriptor->providesServices[b]))
                             {
                                 conflict = true;
+                                conflictService = leftDescriptor->providesServices[a];
                                 break;
                             }
                     if (conflict)
                     {
-                        ProfileCandidate *loser = ProfileCompareIds(&candidates[left],
-                                                                     &candidates[right]) <= 0
-                                                        ? &candidates[right]
-                                                        : &candidates[left];
+                        const char *selection = ProfileSelectionFor(profile, conflictService);
+                        ProfileCandidate *loser = NULL;
+                        if (selection != NULL)
+                        {
+                            const bool leftSelected =
+                                LaiueModAsciiEquals(candidates[left].id, selection);
+                            const bool rightSelected =
+                                LaiueModAsciiEquals(candidates[right].id, selection);
+                            loser = leftSelected ? &candidates[right]
+                                                  : (rightSelected ? &candidates[left] : NULL);
+                        }
+                        else
+                        {
+                            loser = ProfileCompareIds(&candidates[left],
+                                                      &candidates[right]) <= 0
+                                        ? &candidates[right]
+                                        : &candidates[left];
+                        }
+                        if (loser == NULL)
+                            continue;
                         ProfileSetFailure(loser, LAIUE_MODULE_DUPLICATE_SERVICE,
                                           "service provider disabled by profile selection");
                     }
@@ -1335,13 +1440,25 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
             selected[selectedCount++] = binaries[index];
     if (selectedCount == 0u)
     {
+        LaiueModuleStatus noStartStatus = LAIUE_MODULE_PARTIAL;
+        char noStartMessage[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
+        ProfileCopyMessage(noStartMessage, "profile has no startable modules");
+        if (!allowPartial)
+            for (uint32_t index = 0u; index < count; ++index)
+                if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u &&
+                    candidates[index].status != LAIUE_MODULE_OK &&
+                    candidates[index].status != LAIUE_MODULE_DUPLICATE_SERVICE)
+                {
+                    noStartStatus = candidates[index].status;
+                    ProfileCopyMessage(noStartMessage, candidates[index].message);
+                    break;
+                }
         ProfileFillReport(report, candidates, count, 0u);
         ProfileCloseProbes(candidates, count);
         PlatformFree(candidates);
         PlatformFree(selected);
         PlatformFree(planned);
-        return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
-                    "profile has no startable modules");
+        return Fail(diagnostic, noStartStatus, noStartMessage);
     }
 
     LaiueModuleStatus status =
@@ -1418,16 +1535,43 @@ LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
     for (uint32_t index = 0u; index < count; ++index)
         if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u)
         {
+            if (!allowPartial &&
+                (candidates[index].status == LAIUE_MODULE_OK ||
+                 candidates[index].status == LAIUE_MODULE_DUPLICATE_SERVICE))
+                continue;
+            const LaiueModuleStatus disabledStatus = candidates[index].status;
+            const bool partialResult = allowPartial;
+            char disabledMessage[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
+            ProfileCopyMessage(disabledMessage, candidates[index].message);
+            if (!partialResult)
+                LaiueModuleHostUnloadAll(host);
             PlatformFree(candidates);
             PlatformFree(selected);
             PlatformFree(planned);
-            return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
-                        "profile loaded with disabled modules");
+            return Fail(diagnostic, partialResult ? LAIUE_MODULE_PARTIAL
+                                                   : disabledStatus,
+                        partialResult ? "profile loaded with disabled modules"
+                                      : disabledMessage);
         }
     PlatformFree(candidates);
     PlatformFree(selected);
     PlatformFree(planned);
     return LAIUE_MODULE_OK;
+}
+
+LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
+                                              const LaiueModuleBinaryV1 *binaries,
+                                              uint32_t count, uint32_t profileFlags,
+                                              LaiueModuleLoadReportV1 *report,
+                                              LaiueModuleDiagnostic *diagnostic)
+{
+    LaiueModuleProfileV1 profile;
+    memset(&profile, 0, sizeof(profile));
+    profile.structSize = sizeof(profile);
+    profile.flags = profileFlags;
+    profile.binaries = binaries;
+    profile.binaryCount = count;
+    return LaiueModuleHostLoadProfileV1(host, &profile, report, diagnostic);
 }
 
 LaiueModuleStatus LaiueModuleHostLoadStatic(LaiueModuleHost *host,

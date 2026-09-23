@@ -46,13 +46,11 @@ option(LAIUE_BUILD_AUDIO_OUTPUT "Build the optional WASAPI/ALSA audio output pro
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 
-# Набор графических модулей задаёт бэкенд, а не платформа. D3D12 несёт
-# полный Windows-слой; Vulkan остаётся переносимым и поддерживает offscreen
-# без хендла, а на Windows с HWND — Win32 swapchain. Оконный, вводный и UI
-# слои Vulkan-профиль не включает; звук переносим целиком, а вывод у него
-# свой на каждой платформе. Список выводится в конфигурации, чтобы
-# неполнота профиля была видна, а не подразумевалась.
-if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
+# Набор графического backend-а не выбирает оконный и вводный provider.
+# Windows-слой одинаково доступен для D3D12 и Vulkan; сам Vulkan при этом
+# также умеет headless/offscreen. На POSIX эти native providers пока
+# отсутствуют и внешний adapter может заменить их своей реализацией.
+if(LAIUE_PLATFORM_WINDOWS)
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene voxel_render)
 else()
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene voxel_render)
