@@ -251,6 +251,27 @@
       }
     },
     {
+      "name": "android-x86_64-core-api35",
+      "displayName": "Android x86_64 API 35 core + NDK Clang",
+      "description": "Static portable core for the API 35 x86_64 emulator",
+      "inherits": "android-arm64-core",
+      "cacheVariables": {
+        "ANDROID_ABI": "x86_64",
+        "ANDROID_PLATFORM": "android-35",
+        "LAIUE_EXPECTED_ARCHITECTURE": "x86_64"
+      }
+    },
+    {
+      "name": "android-x86_64-core-api35-closure",
+      "displayName": "Android x86_64 API 35 complete static-link closure",
+      "description": "Debug/no-LTO API 35 emulator link smoke",
+      "inherits": "android-x86_64-core-api35",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LAIUE_ENABLE_LTO": "OFF"
+      }
+    },
+    {
       "name": "ios-arm64-core",
       "displayName": "iOS ARM64 static core + AppleClang",
       "description": "Static core plus unsigned link smoke; not a product app or Metal client",
@@ -482,6 +503,24 @@
     {
       "name": "android-arm64-core-release",
       "configurePreset": "android-arm64-core",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-x86_64-core-api35-release",
+      "configurePreset": "android-x86_64-core-api35",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-x86_64-core-api35-closure",
+      "configurePreset": "android-x86_64-core-api35-closure",
       "condition": {
         "type": "notEquals",
         "lhs": "$env{ANDROID_NDK_HOME}",

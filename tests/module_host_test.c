@@ -76,6 +76,30 @@ static const LaiueModuleApiV1 staticApi = {
     .destroy = StaticDestroy,
 };
 
+static uint32_t LAIUE_MODULE_CALL FailingStart(void *context)
+{
+    (void)context;
+    return false;
+}
+
+static const char *const failingProvides[] = {"example.profile.failing"};
+static const LaiueModuleApiV1 failingStartApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.profile.failing",
+        .version = "1.0.0",
+        .providesServices = failingProvides,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = FailingStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
 static const char *const cycleAProvides[] = {"example.cycle.a"};
 static const char *const cycleBProvides[] = {"example.cycle.b"};
 static const LaiueModuleRequirementV1 cycleARequires[] = {{"example.cycle.b", 1u}};
@@ -220,6 +244,52 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     LaiueModuleHostUnloadAll(host);
     Expect(staticState.stops == 1u && LaiueModuleHostLoadedCount(host) == 0u,
            "static module unloads through bootstrap");
+
+    /* A best-effort profile keeps an independent provider alive while
+     * disabling a cyclic component. The strict loader below remains a hard
+     * transaction and still rejects the same cycle. */
+    static LaiueModuleLoadReportEntryV1 profileEntries[3];
+    LaiueModuleLoadReportV1 profileReport;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 3u);
+    LaiueModuleBinaryV1 profileBinaries[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &cycleAApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &cycleBApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, profileBinaries,
+               (uint32_t)(sizeof(profileBinaries) / sizeof(profileBinaries[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "partial profile reports disabled cycle");
+    Expect(LaiueModuleHostLoadedCount(host) == 1u && staticState.starts == 1u,
+           "partial profile keeps independent provider running");
+    Expect(profileReport.count == 3u && profileReport.loadedCount == 1u &&
+               (profileEntries[2].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u &&
+               (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u,
+           "partial profile report contains per-module state");
+    LaiueModuleHostUnloadAll(host);
+
+    /* A present optional provider may fail in create/start. The profile
+     * retries without that provider, while the independent static module
+     * still reaches a clean running graph. */
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
+    LaiueModuleBinaryV1 failingProfile[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &failingStartApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, failingProfile,
+               (uint32_t)(sizeof(failingProfile) / sizeof(failingProfile[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "partial profile isolates optional start failure");
+    Expect(LaiueModuleHostLoadedCount(host) == 1u &&
+               (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+               (profileEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+           "optional start failure leaves independent module running");
+    LaiueModuleHostUnloadAll(host);
 
     const LaiueModuleApiV1 *badApis[] = {&badAbiApi};
     Expect(LaiueModuleHostLoadStatic(host, badApis, 1u, &diagnostic) ==

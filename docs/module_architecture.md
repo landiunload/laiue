@@ -36,6 +36,17 @@ artifact. Такой файл пропускается; обязательный
 повреждённый artifact завершает транзакцию. Горячей выгрузки кода нет: перед
 закрытием библиотеки приложение прекращает callbacks и worker jobs.
 
+Для приложений, которым нужен деградирующий профиль, есть отдельный
+`LaiueModuleHostLoadProfile`. С флагом `LAIUE_MODULE_PROFILE_ALLOW_PARTIAL` он
+сначала проверяет выбранные native artifacts и строит только startable часть
+DAG: отсутствующий optional файл, отсутствующий provider и цикл получают
+собственную запись в caller-owned `LaiueModuleLoadReportV1`, а независимые
+модули продолжают запускаться. Provider conflict выбирается стабильно по ID.
+Обычный `LaiueModuleHostLoad` не меняет строгую транзакционную семантику и
+по-прежнему откатывает весь граф при ошибке callback-а. Report предназначен
+только для startup/diagnostics; service tables после разрешения остаются
+прямыми указателями в рабочем цикле.
+
 ## Границы контрактов
 
 Публичные header-only контракты не импортируют друг друга:
@@ -89,7 +100,10 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
 * `laiue.world` публикует операции бесконечного мира и явно требует
   `laiue.numeric`;
 * `laiue.physics` публикует детерминированный rigid/compound step, scratch и
-  contact-cache API, требует `laiue.numeric` и `laiue.jobs`;
+  contact-cache API, требует `laiue.numeric`, а `laiue.jobs` использует как
+  необязательный executor. При отсутствии jobs применяется тот же
+  детерминированный последовательный путь, поэтому physics.dll можно
+  запускать в минимальном профиле без планировщика;
 * `laiue.mesher` публикует scratch и greedy chunk meshing поверх generic
   `ChunkMesherWorldSource` callback. Он не требует и не импортирует
   `laiue.world`: world, voxel provider или тестовый источник адаптируются

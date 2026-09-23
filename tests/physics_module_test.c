@@ -56,7 +56,7 @@ LAIUE_TEST_ENTRY(PhysicsModuleTestEntryPoint)
     Expect(host != NULL, "module host creates");
     LaiueModuleBinaryV1 binary = {path, 0u, NULL};
     Expect(LaiueModuleHostLoad(host, &binary, 1u, &diagnostic) == LAIUE_MODULE_DEPENDENCY_MISSING,
-           "physics without numeric/jobs reports missing dependencies");
+           "physics without numeric reports missing dependencies");
     Expect(LaiueModuleHostLoadedCount(host) == 0u,
            "failed physics graph rolls back");
     LaiueModuleHostDestroy(host);
@@ -78,6 +78,26 @@ LAIUE_TEST_ENTRY(PhysicsModuleTestEntryPoint)
 #endif
     Expect(Join(numericPath, directory, numericName), "numeric module path fits");
     Expect(Join(taskPath, directory, taskName), "task module path fits");
+
+    /* jobs.dll is an optional acceleration provider. Physics must remain
+     * usable with only the numeric provider and keep its deterministic
+     * sequential fallback. */
+    host = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(host != NULL, "numeric-only physics host creates");
+    LaiueModuleBinaryV1 numericOnly[] = {{path, 0u, NULL}, {numericPath, 0u, NULL}};
+    Expect(LaiueModuleHostLoad(host, numericOnly,
+                               (uint32_t)(sizeof(numericOnly) / sizeof(numericOnly[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    const LaiuePhysicsServiceV1 *sequentialService =
+        (const LaiuePhysicsServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_PHYSICS_SERVICE_NAME, LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
+            sizeof(LaiuePhysicsServiceV1), NULL, NULL);
+    Expect(sequentialService != NULL && sequentialService->step != NULL,
+           "physics starts without jobs provider");
+    LaiueModuleHostUnloadAll(host);
+    LaiueModuleHostDestroy(host);
+
     host = LaiueModuleHostCreate(&config, &diagnostic);
     Expect(host != NULL, "second module host creates");
     LaiueModuleBinaryV1 binaries[] = {

@@ -14,6 +14,7 @@
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | Android ARM64 | NDK r29: собрано и слинковано локально, CI настроен | — | API 28+, static external core |
+| Android x86_64 | API 35 Google APIs AVD + WHPX, локальный core smoke | — | NDK r29, static external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
@@ -115,6 +116,7 @@ macOS ARM64 должен подтвердить его собственным н
 | `linux-gcc` | Ninja Multi-Config | `linux-gcc-debug`, `linux-gcc-release` |
 | `linux-clang` | Ninja Multi-Config | `linux-clang-debug`, `linux-clang-release` |
 | `android-arm64-core` | Ninja + NDK r29 | `android-arm64-core-release` (build-only) |
+| `android-x86_64-core-api35` | Ninja + NDK r29 | `android-x86_64-core-api35-release` (build/link-only; AVD отдельно) |
 | `ios-arm64-core` | Xcode 26 | `ios-arm64-core-release` (build/link-only) |
 | `linux-gcc-arm64` | Ninja Multi-Config | `linux-gcc-arm64-debug`, `linux-gcc-arm64-release` |
 | `linux-clang-arm64` | Ninja Multi-Config | `linux-clang-arm64-debug`, `linux-clang-arm64-release` |
@@ -200,6 +202,20 @@ glibc и musl libraries не взаимозаменяемы. Один configure 
 Linux ARM64 фактически проверен отдельной Docker-сборкой и полным CTest.
 GitHub Actions использует нативный `ubuntu-24.04-arm` runner и отдельное
 дерево `build/linux-gcc-arm64`; x86_64 presets для этой цели не используются.
+
+Локальный Android API 35 smoke не требует Android Studio: достаточно
+command-line tools, NDK r29 и AVD, размещённых вне исходного дерева. Пример
+для Windows (все крупные файлы остаются на D:):
+
+```powershell
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\29.0.14206865'
+cmake --preset android-x86_64-core-api35 -B D:\build\laiue\android-x86_64-core-api35
+cmake --build D:\build\laiue\android-x86_64-core-api35 --config Release --parallel
+```
+
+`laiue_static_core_link_smoke` можно передать в запущенный
+`laiue-api35-x86_64` через `adb`; это проверяет native ABI и статическое
+замыкание, но не заявляет наличие Android UI/renderer APK.
 
 ## Vulkan offscreen на Linux
 

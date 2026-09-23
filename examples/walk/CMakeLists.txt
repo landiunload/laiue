@@ -1,6 +1,12 @@
 add_executable(laiue_walk walk.c)
 target_link_libraries(laiue_walk PRIVATE laiue_bootstrap)
 target_compile_definitions(laiue_walk PRIVATE LAIUE_STATIC=1)
+if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
+    target_link_libraries(laiue_walk PRIVATE laiue_character laiue_voxel)
+else()
+    target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_DYNAMIC=1)
+    add_dependencies(laiue_walk laiue_character laiue_voxel)
+endif()
 target_include_directories(laiue_walk PRIVATE
     "${PROJECT_SOURCE_DIR}/src")
 laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)

@@ -66,10 +66,14 @@ static uint32_t ModuleStart(void *context)
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_NUMERIC_SERVICE_NAME,
         LAIUE_NUMERIC_SERVICE_ABI_VERSION_1, sizeof(LaiueNumericServiceV1));
-    state->jobs = (const LaiueTaskServiceV1 *)LaiueModuleQueryRequiredService(
+    /* Parallel execution is an optimization, not a lifecycle prerequisite.
+     * The rigid-body entry points already have a deterministic sequential
+     * path when no executor is supplied, so a profile may omit jobs.dll
+     * (notably small/mobile builds) without making physics unavailable. */
+    state->jobs = (const LaiueTaskServiceV1 *)LaiueModuleQueryOptionalService(
         state->host, LAIUE_TASK_SERVICE_NAME,
         LAIUE_TASK_SERVICE_ABI_VERSION_1, sizeof(LaiueTaskServiceV1));
-    if (state->numeric == NULL || state->jobs == NULL)
+    if (state->numeric == NULL)
     {
         state->numeric = NULL;
         state->jobs = NULL;
@@ -118,6 +122,8 @@ static void ModuleDestroy(void *context)
 static const char *const provides[] = {LAIUE_PHYSICS_SERVICE_NAME};
 static const LaiueModuleRequirementV1 requiresServices[] = {
     {LAIUE_NUMERIC_SERVICE_NAME, LAIUE_NUMERIC_SERVICE_ABI_VERSION_1},
+};
+static const LaiueModuleRequirementV1 optionalServices[] = {
     {LAIUE_TASK_SERVICE_NAME, LAIUE_TASK_SERVICE_ABI_VERSION_1},
 };
 
@@ -133,6 +139,9 @@ static const LaiueModuleApiV1 api = {
         .requiresCount = sizeof(requiresServices) / sizeof(requiresServices[0]),
         .providesServices = provides,
         .providesCount = 1u,
+        .optionalServices = optionalServices,
+        .optionalCount = sizeof(optionalServices) / sizeof(optionalServices[0]),
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
     },
     .create = ModuleCreate,
     .start = ModuleStart,

@@ -9,12 +9,39 @@
 #define LAIUE_MODULE_HOST_MAX_MODULES 64u
 #define LAIUE_MODULE_HOST_MAX_SERVICES 128u
 #define LAIUE_MODULE_DIAGNOSTIC_CAPACITY 256u
+#define LAIUE_MODULE_PROFILE_ALLOW_PARTIAL UINT32_C(1) << 0
+#define LAIUE_MODULE_PROFILE_ENTRY_SKIPPED UINT32_C(1) << 0
+#define LAIUE_MODULE_PROFILE_ENTRY_LOADED UINT32_C(1) << 1
+#define LAIUE_MODULE_PROFILE_ENTRY_DISABLED UINT32_C(1) << 2
 
 typedef struct LaiueModuleDiagnostic
 {
     LaiueModuleStatus status;
     char message[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
 } LaiueModuleDiagnostic;
+
+/* Startup-only, caller-owned diagnostics for a profile load. The report is
+ * deliberately a flat C table so a UI, logger, or platform adapter can use it
+ * without retaining loader internals. */
+typedef struct LaiueModuleLoadReportEntryV1
+{
+    uint32_t structSize;
+    uint32_t status;
+    uint32_t flags;
+    char id[LAIUE_MODULE_MAX_NAME];
+    char message[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
+} LaiueModuleLoadReportEntryV1;
+
+typedef struct LaiueModuleLoadReportV1
+{
+    uint32_t structSize;
+    uint32_t flags;
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t loadedCount;
+    uint32_t skippedCount;
+    LaiueModuleLoadReportEntryV1 *entries;
+} LaiueModuleLoadReportV1;
 
 typedef struct LaiueModuleBinaryV1
 {
@@ -67,6 +94,17 @@ LAIUE_MOD_API const void *LaiueModuleHostQueryService(
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoad(
     LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
+/* Profile loading is opt-in. With ALLOW_PARTIAL, invalid/missing optional
+ * artifacts and disconnected dependency components are reported per entry;
+ * independent providers still start. Without the flag this is equivalent to
+ * the strict transactional loader above. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadProfile(
+    LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries, uint32_t count,
+    uint32_t profileFlags, LaiueModuleLoadReportV1 *report,
+    LaiueModuleDiagnostic *diagnostic);
+LAIUE_MOD_API void LaiueModuleLoadReportInitialize(
+    LaiueModuleLoadReportV1 *report,
+    LaiueModuleLoadReportEntryV1 *entries, uint32_t capacity);
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadStatic(
     LaiueModuleHost *host, const LaiueModuleApiV1 *const *apis, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
