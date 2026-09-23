@@ -1,6 +1,5 @@
 #include "scene/panorama.h"
 #include "scene/camera.h"
-#include "scene/math.h"
 #include "math/scalar.h"
 
 #include <string.h>
@@ -14,6 +13,13 @@
 // Запас прямоугольника: разреженность выборки + билинейная фильтрация.
 #define RECT_MARGIN_UV 0.02f
 #define RECT_MARGIN_TEXELS 4.0f
+
+static const LaiueSceneMathServiceV1* sceneMathService;
+
+void PanoramaSetSceneMathService(const LaiueSceneMathServiceV1* service)
+{
+    sceneMathService = service;
+}
 
 // Базисы граней кубмапы в пространстве вида (соглашение D3D:
 // порядок +X, -X, +Y, -Y, +Z, -Z; up и right дают совпадение
@@ -398,7 +404,16 @@ void PanoramaBuildFrameSetup(PanoramaCache* cache,
     int32_t width, int32_t height, float nearPlane, float farPlane,
     const float view[16], RendererFrameSetup* outSetup)
 {
+    if (outSetup == NULL)
+    {
+        return;
+    }
     memset(outSetup, 0, sizeof(*outSetup));
+    if (cache == NULL || sceneMathService == NULL ||
+        sceneMathService->matrix4Multiply == NULL)
+    {
+        return;
+    }
 
     float fovDegrees = EffectiveFovDegrees(projection, fovHorizontalDegrees);
     float fovRadians = fovDegrees * DEGREES_TO_RADIANS;
@@ -423,7 +438,8 @@ void PanoramaBuildFrameSetup(PanoramaCache* cache,
         outSetup->passes[0].rectMinY = 0;
         outSetup->passes[0].rectMaxX = (uint32_t)width;
         outSetup->passes[0].rectMaxY = (uint32_t)height;
-        Matrix4Multiply(view, perspective, outSetup->passes[0].viewProjection);
+        sceneMathService->matrix4Multiply(
+            view, perspective, outSetup->passes[0].viewProjection);
         return;
     }
 
@@ -483,8 +499,8 @@ void PanoramaBuildFrameSetup(PanoramaCache* cache,
         float faceBasis[16];
         float faceView[16];
         FaceBasisMatrix(cache->faceIndex[slot], faceBasis);
-        Matrix4Multiply(view, faceBasis, faceView);
-        Matrix4Multiply(faceView, cache->faceProjection[slot],
+        sceneMathService->matrix4Multiply(view, faceBasis, faceView);
+        sceneMathService->matrix4Multiply(faceView, cache->faceProjection[slot],
             pass->viewProjection);
     }
 }

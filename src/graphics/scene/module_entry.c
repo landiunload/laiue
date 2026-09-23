@@ -63,6 +63,7 @@ static uint32_t ModuleStart(void *context)
         state->sceneMath = NULL;
         return 0u;
     }
+    PanoramaSetSceneMathService(state->sceneMath);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_SCENE_SERVICE_NAME,
         .version = LAIUE_SCENE_SERVICE_ABI_VERSION_1,
@@ -71,6 +72,7 @@ static uint32_t ModuleStart(void *context)
     };
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
+        PanoramaSetSceneMathService(NULL);
         state->graphics = NULL;
         state->sceneMath = NULL;
         return 0u;
@@ -86,6 +88,7 @@ static void ModuleStop(void *context)
                                              LAIUE_SCENE_SERVICE_NAME);
     if (state != NULL)
     {
+        PanoramaSetSceneMathService(NULL);
         state->graphics = NULL;
         state->sceneMath = NULL;
     }
@@ -95,6 +98,7 @@ static void ModuleDestroy(void *context)
 {
     (void)context;
     moduleState.host = NULL;
+    PanoramaSetSceneMathService(NULL);
     moduleState.graphics = NULL;
     moduleState.sceneMath = NULL;
 }

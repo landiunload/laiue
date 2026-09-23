@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/renderer.h"
+#include "scene/math_service.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,6 +54,12 @@ typedef struct PanoramaCache
     float faceProjection[RENDERER_MAX_SCENE_PASSES][16]; // off-center проекция грани
     float verticalScale;
 } PanoramaCache;
+
+// Scene resolves matrix operations once during module start. Keeping the
+// provider pointer here avoids a link-time dependency on scene_math while
+// preserving the existing frame-setup API.
+LAIUE_SCENE_API void PanoramaSetSceneMathService(
+    const LaiueSceneMathServiceV1* service);
 
 // Панорамный ли режим при данных настройках (для подписи в меню).
 LAIUE_SCENE_API bool PanoramaIsActive(

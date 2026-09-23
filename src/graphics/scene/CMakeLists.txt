@@ -21,8 +21,5 @@ laiue_add_module(scene
         scene_service.h
         module_entry.c
         ../../api.h
-    LINK
-        laiue_scene_math
-        laiue::math_support
-        laiue_render
+    LINK laiue::math_support
 )
