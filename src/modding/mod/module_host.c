@@ -408,6 +408,10 @@ static void RemoveUnstartedModule(LaiueModuleHost *host, uint32_t index)
     LoadedModule *module = &host->modules[index];
     if (!module->used || module->started || module->created)
         return;
+    /* create() is allowed to publish services before it reports an error.
+     * Remove those entries before closing the library; otherwise the service
+     * registry can retain pointers into an unloaded module. */
+    RemoveOwnedServices(host, index);
     PlatformDynamicLibraryClose(module->library);
     memset(module, 0, sizeof(*module));
 }
@@ -428,6 +432,10 @@ static void RemoveStartedModule(LaiueModuleHost *host, uint32_t index)
         if (host->loadedCount != 0u)
             --host->loadedCount;
     }
+    /* start() may publish a service and then fail before the started flag is
+     * committed.  Service ownership is independent of that flag and must be
+     * cleared on every failure path before the DLL is closed. */
+    RemoveOwnedServices(host, index);
     if (module->created)
     {
         if (module->api->destroy != NULL)
@@ -1057,8 +1065,9 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
         }
         for (uint32_t requirement = 0u; requirement < optionalCount; ++requirement)
         {
-            const LaiueModuleRequirementV1 *optional = &optionalServices[requirement];
-            if (optional->minimumVersion == 0u || !SafeName(optional->name))
+            const LaiueModuleRequirementV1 *optionalRequirement = &optionalServices[requirement];
+            if (optionalRequirement->minimumVersion == 0u ||
+                !SafeName(optionalRequirement->name))
             {
                 PlatformDynamicLibraryClose(library);
                 Rollback(host, moduleCount);
@@ -1513,9 +1522,11 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
                                              allowPartial, failedModuleId);
     if (status != LAIUE_MODULE_OK && status != LAIUE_MODULE_PARTIAL)
     {
+        const char *message = diagnostic != NULL ? diagnostic->message
+                                                  : LaiueModuleStatusString(status);
         for (uint32_t index = 0u; index < count; ++index)
             if (planned[index])
-                ProfileSetFailure(&candidates[index], status, diagnostic->message);
+                ProfileSetFailure(&candidates[index], status, message);
         ProfileFillReport(report, candidates, count, 0u);
         ProfileCloseProbes(candidates, count);
         PlatformFree(candidates);

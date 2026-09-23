@@ -30,6 +30,51 @@ typedef struct StaticModuleState
 
 static StaticModuleState staticState;
 static uint32_t failingStartCalls;
+static uint32_t publishingFailureCreateCalls;
+static CounterState publishedFailureState;
+
+static void LAIUE_MODULE_CALL StaticDestroy(void *context);
+
+static const char *const publishedFailureServices[] = {"example.profile.failing.published"};
+
+static uint32_t LAIUE_MODULE_CALL PublishFailureService(const LaiueModuleHostV1 *host)
+{
+    if (host == NULL || host->publishService == NULL)
+        return false;
+    LaiueModuleServiceV1 service = {
+        .name = publishedFailureServices[0],
+        .version = 1u,
+        .table = &publishedFailureState,
+        .tableSize = sizeof(publishedFailureState),
+    };
+    return host->publishService(host->context, &service) == LAIUE_MODULE_OK;
+}
+
+static uint32_t LAIUE_MODULE_CALL PublishingFailCreate(const LaiueModuleHostV1 *host,
+                                                        void **outContext)
+{
+    if (host == NULL || outContext == NULL)
+        return false;
+    ++publishingFailureCreateCalls;
+    *outContext = NULL;
+    (void)PublishFailureService(host);
+    return false;
+}
+
+static const LaiueModuleApiV1 publishingFailCreateApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.profile.create_published_failure",
+        .version = "1.0.0",
+        .providesServices = publishedFailureServices,
+        .providesCount = 1u,
+    },
+    .create = PublishingFailCreate,
+    .destroy = StaticDestroy,
+};
 
 static uint32_t LAIUE_MODULE_CALL StaticCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
@@ -83,6 +128,32 @@ static uint32_t LAIUE_MODULE_CALL FailingStart(void *context)
     ++failingStartCalls;
     return false;
 }
+
+static uint32_t LAIUE_MODULE_CALL PublishingFailStartCreate(const LaiueModuleHostV1 *host,
+                                                            void **outContext)
+{
+    if (host == NULL || outContext == NULL)
+        return false;
+    *outContext = &staticState;
+    (void)PublishFailureService(host);
+    return true;
+}
+
+static const LaiueModuleApiV1 publishingFailStartApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.profile.start_published_failure",
+        .version = "1.0.0",
+        .providesServices = publishedFailureServices,
+        .providesCount = 1u,
+    },
+    .create = PublishingFailStartCreate,
+    .start = FailingStart,
+    .destroy = StaticDestroy,
+};
 
 static const char *const failingProvides[] = {"example.profile.failing"};
 static const LaiueModuleApiV1 failingStartApi = {
@@ -389,6 +460,49 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
            "optional start failure leaves independent module running");
     Expect(failingStartCalls == 1u && staticState.starts == 1u,
            "optional start failure does not replay lifecycle callbacks");
+    LaiueModuleHostUnloadAll(host);
+
+    /* A callback may publish a service before create/start reports failure.
+     * The failed branch must remove that service before its context/library is
+     * discarded; querying it after the partial transaction must be safe. */
+    publishingFailureCreateCalls = 0u;
+    publishedFailureState.starts = 0u;
+    publishedFailureState.stops = 0u;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
+    LaiueModuleBinaryV1 createPublishedFailure[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &publishingFailCreateApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, createPublishedFailure,
+               (uint32_t)(sizeof(createPublishedFailure) / sizeof(createPublishedFailure[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "partial profile isolates optional create failure after publication");
+    Expect(publishingFailureCreateCalls == 1u, "create failure callback was invoked");
+    Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
+                                       NULL, NULL) == NULL,
+           "create failure removes published service");
+    LaiueModuleHostUnloadAll(host);
+
+    failingStartCalls = 0u;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
+    LaiueModuleBinaryV1 startPublishedFailure[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &publishingFailStartApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, startPublishedFailure,
+               (uint32_t)(sizeof(startPublishedFailure) / sizeof(startPublishedFailure[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "partial profile isolates optional start failure after publication");
+    Expect(failingStartCalls == 1u, "start failure callback was invoked");
+    Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
+                                       NULL, NULL) == NULL,
+           "start failure removes published service");
     LaiueModuleHostUnloadAll(host);
 
     const LaiueModuleApiV1 *badApis[] = {&badAbiApi};
