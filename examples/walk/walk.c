@@ -164,8 +164,10 @@ static bool JoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t
 }
 #endif
 
-static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host,
-                                          LaiueModuleDiagnostic *diagnostic)
+static LaiueModuleStatus LoadWalkModules(
+    LaiueModuleHost *host, LaiueModuleLoadReportV1 *report,
+    LaiueModuleLoadReportEntryV1 *reportEntries,
+    LaiueModuleDiagnostic *diagnostic)
 {
 #if defined(LAIUE_WALK_DYNAMIC)
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -186,18 +188,24 @@ static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host,
         !JoinPath(voxelPath, directory, voxelName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
     LaiueModuleBinaryV1 binaries[] = {
-        {characterPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL},
+        {characterPath, 0u, NULL},
         {voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL},
     };
-    return LaiueModuleHostLoad(host, binaries,
-                               (uint32_t)(sizeof(binaries) / sizeof(binaries[0])), diagnostic);
+    LaiueModuleLoadReportInitialize(report, reportEntries,
+                                    (uint32_t)(sizeof(binaries) / sizeof(binaries[0])));
+    return LaiueModuleHostLoadProfile(
+        host, binaries, (uint32_t)(sizeof(binaries) / sizeof(binaries[0])),
+        LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
 #else
-    const LaiueModuleApiV1 *modules[] = {
-        LaiueCharacterGetStaticModuleApiV1(),
-        LaiueVoxelGetStaticModuleApiV1(),
-    };
+    (void)report;
+    (void)reportEntries;
+    const LaiueModuleApiV1 *modules[2] = {LaiueCharacterGetStaticModuleApiV1()};
+    uint32_t moduleCount = 1u;
+#if defined(LAIUE_WALK_STATIC_WITH_VOXEL)
+    modules[moduleCount++] = LaiueVoxelGetStaticModuleApiV1();
+#endif
     return LaiueModuleHostLoadStatic(host, modules,
-                                     (uint32_t)(sizeof(modules) / sizeof(modules[0])), diagnostic);
+                                     moduleCount, diagnostic);
 #endif
 }
 
@@ -213,7 +221,11 @@ static bool RunWalkExample(void)
         return false;
     }
 
-    if (LoadWalkModules(host, &diagnostic) != LAIUE_MODULE_OK)
+    static LaiueModuleLoadReportEntryV1 reportEntries[2];
+    LaiueModuleLoadReportV1 report;
+    LaiueModuleStatus moduleStatus =
+        LoadWalkModules(host, &report, reportEntries, &diagnostic);
+    if (moduleStatus != LAIUE_MODULE_OK && moduleStatus != LAIUE_MODULE_PARTIAL)
     {
         PlatformWriteConsoleUtf8("laiue walk: module graph failed: ");
         PlatformWriteConsoleUtf8(diagnostic.message);
@@ -230,13 +242,18 @@ static bool RunWalkExample(void)
         (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
             sizeof(LaiueVoxelServiceV1), NULL, NULL);
-    if (character == NULL || voxel == NULL || character->create == NULL || voxel->create == NULL)
+    if (character == NULL || character->create == NULL)
     {
-        PlatformWriteConsoleUtf8("laiue walk: required SDK services are unavailable\n");
+        PlatformWriteConsoleUtf8(
+            "laiue walk: character provider is unavailable; cannot control player\n");
         LaiueModuleHostUnloadAll(host);
         LaiueModuleHostDestroy(host);
         return false;
     }
+
+    if (voxel == NULL || voxel->create == NULL || voxel->getProvider == NULL)
+        PlatformWriteConsoleUtf8(
+            "laiue walk: voxel provider unavailable; using base strata only\n");
 
     LaiueVoxelWorldConfigV1 voxelConfig = {
         .structSize = sizeof(voxelConfig),
@@ -246,8 +263,22 @@ static bool RunWalkExample(void)
     LaiueVoxelWorldV1 *world = NULL;
     LaiueVoxelProviderV1 sparse = {0};
     LaiueCharacterControllerV1 *controller = NULL;
-    bool success = voxel->create(&voxelConfig, &world) != 0u && world != NULL &&
-                   voxel->getProvider(world, &sparse) != 0u;
+    bool success = true;
+    if (voxel != NULL && voxel->create != NULL && voxel->getProvider != NULL)
+    {
+        success = voxel->create(&voxelConfig, &world) != 0u && world != NULL &&
+                  voxel->getProvider(world, &sparse) != 0u;
+        if (!success)
+        {
+            PlatformWriteConsoleUtf8(
+                "laiue walk: voxel world could not be created; using base strata only\n");
+            if (world != NULL && voxel->destroy != NULL)
+                voxel->destroy(world);
+            success = true;
+            world = NULL;
+            sparse = (LaiueVoxelProviderV1){0};
+        }
+    }
     WalkVoxelContext walkContext = {.sparse = sparse};
     LaiueVoxelProviderV1 walkProvider = {
         .structSize = sizeof(walkProvider),
@@ -300,7 +331,7 @@ static bool RunWalkExample(void)
 
     if (controller != NULL && character->destroy != NULL)
         character->destroy(controller);
-    if (world != NULL && voxel->destroy != NULL)
+    if (world != NULL && voxel != NULL && voxel->destroy != NULL)
         voxel->destroy(world);
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
