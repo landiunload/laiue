@@ -51,6 +51,11 @@ typedef WorldRegionContents (*WorldBaseFillRegion)(void* context,
 typedef bool (*WorldBaseRebase)(void* context,
     int64_t blockShiftX, int64_t blockShiftY, int64_t blockShiftZ);
 
+/* Called while WorldEnumerateOverrides holds its read lock. The callback must
+ * not mutate or re-enter the same World. Returning false stops enumeration. */
+typedef bool (*WorldOverrideVisitor)(void* context, int64_t x, int64_t y,
+    int64_t z, BlockType block);
+
 typedef struct WorldBaseProvider
 {
     void* context;
@@ -85,6 +90,18 @@ LAIUE_WORLD_API BlockType WorldGetBlock(
     World* world, int64_t x, int64_t y, int64_t z);
 LAIUE_WORLD_API bool WorldTrySetBlock(
     World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+/* Voxel adapters use this variant when a write equal to the base provider
+ * still has semantic meaning (for example, an explicit air edit). The normal
+ * WorldTrySetBlock compatibility semantics remain unchanged. */
+LAIUE_WORLD_API bool WorldTrySetBlockExplicit(
+    World* world, int64_t x, int64_t y, int64_t z, BlockType block);
+LAIUE_WORLD_API bool WorldGetBlockState(
+    World* world, int64_t x, int64_t y, int64_t z, BlockType* outBlock,
+    bool* outExplicit);
+LAIUE_WORLD_API bool WorldEnumerateOverrides(
+    World* world, int64_t minimumX, int64_t minimumY, int64_t minimumZ,
+    int64_t maximumX, int64_t maximumY, int64_t maximumZ,
+    WorldOverrideVisitor visitor, void* context);
 LAIUE_WORLD_API void WorldSetBlock(
     World* world, int64_t x, int64_t y, int64_t z, BlockType block);
 

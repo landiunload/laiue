@@ -1,6 +1,7 @@
 #pragma once
 
 #include "world/world.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -27,6 +28,15 @@ typedef struct LaiueWorldServiceV1
                                       int64_t minBlockY, int64_t minBlockZ,
                                       int32_t sizeX, int32_t sizeY,
                                       int32_t sizeZ, BlockType *outBlocks);
+    bool (*getBlockState)(World *world, int64_t x, int64_t y, int64_t z,
+                          BlockType *outBlock, bool *outExplicit);
+    bool (*enumerateOverrides)(World *world, int64_t minimumX, int64_t minimumY,
+                               int64_t minimumZ, int64_t maximumX,
+                               int64_t maximumY, int64_t maximumZ,
+                               WorldOverrideVisitor visitor, void *context);
+    bool (*trySetBlockExplicit)(World *world, int64_t x, int64_t y, int64_t z,
+                                BlockType block);
 } LaiueWorldServiceV1;
 
 LAIUE_WORLD_API const LaiueWorldServiceV1 *LaiueWorldGetStaticServiceV1(void);
+LAIUE_WORLD_API const LaiueModuleApiV1 *LaiueWorldGetStaticModuleApiV1(void);

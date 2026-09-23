@@ -7,10 +7,16 @@
 
 #if defined(_WIN32)
 #define VOXEL_PROVIDER_NAME L"laiue_voxel.dll"
+#define WORLD_PROVIDER_NAME L"laiue_world.dll"
+#define NUMERIC_PROVIDER_NAME L"laiue_numeric.dll"
 #elif defined(__APPLE__)
 #define VOXEL_PROVIDER_NAME L"liblaiue_voxel.dylib"
+#define WORLD_PROVIDER_NAME L"liblaiue_world.dylib"
+#define NUMERIC_PROVIDER_NAME L"liblaiue_numeric.dylib"
 #else
 #define VOXEL_PROVIDER_NAME L"liblaiue_voxel.so"
+#define WORLD_PROVIDER_NAME L"liblaiue_world.so"
+#define NUMERIC_PROVIDER_NAME L"liblaiue_numeric.so"
 #endif
 
 static void Expect(bool condition, const char *message)
@@ -68,17 +74,29 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
 {
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t providerPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t worldPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t numericPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static LaiueModuleHostConfigV1 config;
     static LaiueModuleDiagnostic diagnostic;
     Expect(PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY),
            "voxel test executable directory is available");
     Expect(Join(providerPath, directory, VOXEL_PROVIDER_NAME),
            "voxel provider path fits");
+    Expect(Join(worldPath, directory, WORLD_PROVIDER_NAME),
+           "world provider path fits");
+    Expect(Join(numericPath, directory, NUMERIC_PROVIDER_NAME),
+           "numeric provider path fits");
     LaiueModuleHostConfigInitialize(&config);
     LaiueModuleHost *host = LaiueModuleHostCreate(&config, &diagnostic);
     Expect(host != NULL, "voxel module host creates");
-    LaiueModuleBinaryV1 binary = {providerPath, 0u, NULL};
-    Expect(LaiueModuleHostLoad(host, &binary, 1u, &diagnostic) == LAIUE_MODULE_OK,
+    LaiueModuleBinaryV1 binaries[] = {
+        {providerPath, 0u, NULL},
+        {worldPath, 0u, NULL},
+        {numericPath, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, binaries,
+                               (uint32_t)(sizeof(binaries) / sizeof(binaries[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
            diagnostic.message);
 
     uint32_t version = 0u;
@@ -89,11 +107,12 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
             sizeof(LaiueVoxelServiceV1), &version, &size);
     Expect(voxel != NULL && version == LAIUE_VOXEL_SERVICE_ABI_VERSION_1 &&
                size >= sizeof(*voxel) && voxel->create != NULL &&
-               voxel->getProvider != NULL && voxel->setBlock != NULL,
+               voxel->getProvider != NULL && voxel->setBlock != NULL &&
+               voxel->createWithContext != NULL && voxel->context != NULL,
            "voxel service table is published");
 
     LaiueVoxelWorldV1 *world = NULL;
-    Expect(voxel->create(NULL, &world) != 0u && world != NULL,
+    Expect(voxel->createWithContext(voxel->context, NULL, &world) != 0u && world != NULL,
            "sparse voxel world creates");
     LaiueVoxelProviderV1 provider = {0};
     Expect(voxel->getProvider(world, &provider) != 0u && provider.getBlock != NULL &&

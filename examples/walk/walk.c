@@ -1,7 +1,9 @@
 #include "character/character_service.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
+#include "numeric/numeric_service.h"
 #include "voxel/voxel_service.h"
+#include "world/world_service.h"
 #include "walk_runtime.h"
 #if defined(LAIUE_WALK_WINDOWED)
 #include "graphics/graphics_device_service.h"
@@ -511,6 +513,8 @@ static LaiueModuleStatus LoadWalkModules(
 #if defined(LAIUE_WALK_DYNAMIC)
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t characterPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t numericPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t worldPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t voxelPath[LAIUE_PLATFORM_PATH_CAPACITY];
 #if defined(LAIUE_WALK_WINDOWED)
     static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -519,6 +523,8 @@ static LaiueModuleStatus LoadWalkModules(
 #endif
 #if defined(_WIN32)
     const wchar_t *characterName = L"laiue_character.dll";
+    const wchar_t *numericName = L"laiue_numeric.dll";
+    const wchar_t *worldName = L"laiue_world.dll";
     const wchar_t *voxelName = L"laiue_voxel.dll";
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"laiue_window.dll";
@@ -527,6 +533,8 @@ static LaiueModuleStatus LoadWalkModules(
 #endif
 #elif defined(__APPLE__)
     const wchar_t *characterName = L"liblaiue_character.dylib";
+    const wchar_t *numericName = L"liblaiue_numeric.dylib";
+    const wchar_t *worldName = L"liblaiue_world.dylib";
     const wchar_t *voxelName = L"liblaiue_voxel.dylib";
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"liblaiue_window.dylib";
@@ -535,6 +543,8 @@ static LaiueModuleStatus LoadWalkModules(
 #endif
 #else
     const wchar_t *characterName = L"liblaiue_character.so";
+    const wchar_t *numericName = L"liblaiue_numeric.so";
+    const wchar_t *worldName = L"liblaiue_world.so";
     const wchar_t *voxelName = L"liblaiue_voxel.so";
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"liblaiue_window.so";
@@ -544,11 +554,17 @@ static LaiueModuleStatus LoadWalkModules(
 #endif
     if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY) ||
         !JoinPath(characterPath, directory, characterName) ||
+        !JoinPath(numericPath, directory, numericName) ||
+        !JoinPath(worldPath, directory, worldName) ||
         !JoinPath(voxelPath, directory, voxelName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
-    LaiueModuleBinaryV1 binaries[8];
+    LaiueModuleBinaryV1 binaries[12];
     uint32_t binaryCount = 0u;
     binaries[binaryCount++] = (LaiueModuleBinaryV1){characterPath, 0u, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){numericPath,
+                                                   LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){worldPath,
+                                                   LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
 #if defined(LAIUE_WALK_WINDOWED)
@@ -571,9 +587,11 @@ static LaiueModuleStatus LoadWalkModules(
 #else
     (void)report;
     (void)reportEntries;
-    const LaiueModuleApiV1 *modules[8] = {LaiueCharacterGetStaticModuleApiV1()};
+    const LaiueModuleApiV1 *modules[12] = {LaiueCharacterGetStaticModuleApiV1()};
     uint32_t moduleCount = 1u;
 #if defined(LAIUE_WALK_STATIC_WITH_VOXEL)
+    modules[moduleCount++] = LaiueNumericGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueWorldGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueVoxelGetStaticModuleApiV1();
 #endif
 #if defined(LAIUE_WALK_WINDOWED)
@@ -633,7 +651,8 @@ static bool RunWalkExample(bool headless)
         return false;
     }
 
-    if (voxel == NULL || voxel->create == NULL || voxel->getProvider == NULL)
+    if (voxel == NULL || voxel->getProvider == NULL ||
+        voxel->createWithContext == NULL)
         PlatformWriteConsoleUtf8(
             "laiue walk: voxel provider unavailable; using base strata only\n");
 
@@ -646,9 +665,11 @@ static bool RunWalkExample(bool headless)
     LaiueVoxelProviderV1 sparse = {0};
     LaiueCharacterControllerV1 *controller = NULL;
     bool success = true;
-    if (voxel != NULL && voxel->create != NULL && voxel->getProvider != NULL)
+    if (voxel != NULL && voxel->getProvider != NULL &&
+        voxel->createWithContext != NULL)
     {
-        success = voxel->create(&voxelConfig, &world) != 0u && world != NULL &&
+        success = voxel->createWithContext(voxel->context, &voxelConfig, &world) != 0u &&
+                  world != NULL &&
                   voxel->getProvider(world, &sparse) != 0u;
         if (!success)
         {

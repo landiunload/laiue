@@ -1,8 +1,10 @@
 #include "character/character_service.h"
 #include "graphics/graphics_device_service.h"
 #include "mod/module_host.h"
+#include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "voxel/voxel_service.h"
+#include "world/world_service.h"
 #include "walk_runtime.h"
 
 #include <android/input.h>
@@ -53,12 +55,14 @@ static void AndroidLog(AndroidWalkState *state, int priority, const char *messag
 
 static uint32_t AndroidLoadModules(AndroidWalkState *state)
 {
-    const LaiueModuleApiV1 *modules[3] = {
+    const LaiueModuleApiV1 *modules[5] = {
         LaiueCharacterGetStaticModuleApiV1(),
         LaiueGraphicsGetStaticModuleApiV1(),
     };
     uint32_t moduleCount = 2u;
 #if defined(LAIUE_ANDROID_WALK_WITH_VOXEL)
+    modules[moduleCount++] = LaiueNumericGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueWorldGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueVoxelGetStaticModuleApiV1();
 #endif
     LaiueModuleDiagnostic diagnostic;
@@ -294,7 +298,9 @@ void android_main(struct android_app *app)
             .abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
             .defaultBlock = {0u, 0u},
         };
-        (void)state.voxel->create(&voxelConfig, &state.world);
+        if (state.voxel != NULL && state.voxel->createWithContext != NULL)
+            (void)state.voxel->createWithContext(state.voxel->context,
+                                                  &voxelConfig, &state.world);
         if (state.world != NULL && state.voxel->getProvider != NULL)
             (void)state.voxel->getProvider(state.world, &state.provider);
 #endif

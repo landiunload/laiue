@@ -652,19 +652,21 @@ void WorldFormatAbsoluteBlockCoordinate(World* world,
     PlatformRwLockReleaseShared(&world->tableLock);
 }
 
-BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
+bool WorldGetBlockState(World* world, int64_t x, int64_t y, int64_t z,
+    BlockType* outBlock, bool* outExplicit)
 {
-    if (world == NULL)
-    {
-        return BLOCK_AIR;
-    }
+    if (world == NULL || outBlock == NULL || outExplicit == NULL)
+        return false;
+    *outBlock = BLOCK_AIR;
+    *outExplicit = false;
     /* Пока в таблице нет ни одного чанка, правок нет по определению, и
      * ответ даёт только провайдер. Тогда не нужны ни блокировка, ни
      * координаты, ни поиск в таблице: именно этот случай и есть основной
      * для физики в мире без правок. */
     if (PlatformAtomicLoadU32Acquire(&world->editedChunkCount) == 0U)
     {
-        return WorldBaseBlock(world, x, y, z);
+        *outBlock = WorldBaseBlock(world, x, y, z);
+        return true;
     }
     LocalChunkCoordinate coordinate = {
         ChunkFromBlock(x), ChunkFromBlock(y), ChunkFromBlock(z)
@@ -680,11 +682,21 @@ BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
     bool overridden = entry != NULL
         && ChunkGetDelta(*entry, localIndex, &block);
     PlatformRwLockReleaseShared(&world->tableLock);
-    return overridden ? block : WorldBaseBlock(world, x, y, z);
+    *outExplicit = overridden;
+    *outBlock = overridden ? block : WorldBaseBlock(world, x, y, z);
+    return true;
 }
 
-bool WorldTrySetBlock(World* world,
-    int64_t x, int64_t y, int64_t z, BlockType block)
+BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
+{
+    BlockType block = BLOCK_AIR;
+    bool explicitEdit = false;
+    (void)WorldGetBlockState(world, x, y, z, &block, &explicitEdit);
+    return block;
+}
+
+static bool WorldTrySetBlockInternal(World* world,
+    int64_t x, int64_t y, int64_t z, BlockType block, bool preserveBase)
 {
     if (world == NULL)
     {
@@ -713,7 +725,7 @@ bool WorldTrySetBlock(World* world,
     }
 
     bool succeeded;
-    if (block == base)
+    if (block == base && !preserveBase)
     {
         succeeded = entry != NULL && ChunkRemoveDelta(*entry, localIndex);
         if (succeeded && (*entry)->deltaCount == 0U)
@@ -733,6 +745,74 @@ bool WorldTrySetBlock(World* world,
     }
     PlatformRwLockReleaseExclusive(&world->tableLock);
     return succeeded;
+}
+
+bool WorldTrySetBlock(World* world,
+    int64_t x, int64_t y, int64_t z, BlockType block)
+{
+    return WorldTrySetBlockInternal(world, x, y, z, block, false);
+}
+
+bool WorldTrySetBlockExplicit(World* world,
+    int64_t x, int64_t y, int64_t z, BlockType block)
+{
+    return WorldTrySetBlockInternal(world, x, y, z, block, true);
+}
+
+static bool WorldChunkLocalToBlock(int64_t chunk, uint32_t local, int64_t *outBlock)
+{
+    if (outBlock == NULL || local >= CHUNK_SIZE ||
+        chunk > INT64_MAX / CHUNK_SIZE || chunk < INT64_MIN / CHUNK_SIZE)
+        return false;
+    int64_t block = chunk * CHUNK_SIZE;
+    if (local != 0u && block > INT64_MAX - (int64_t)local)
+        return false;
+    if (local != 0u && block < INT64_MIN + (int64_t)local)
+        return false;
+    *outBlock = block + (int64_t)local;
+    return true;
+}
+
+bool WorldEnumerateOverrides(World* world,
+    int64_t minimumX, int64_t minimumY, int64_t minimumZ,
+    int64_t maximumX, int64_t maximumY, int64_t maximumZ,
+    WorldOverrideVisitor visitor, void* context)
+{
+    if (world == NULL || visitor == NULL || minimumX > maximumX ||
+        minimumY > maximumY || minimumZ > maximumZ)
+        return false;
+    PlatformRwLockAcquireShared(&world->tableLock);
+    for (uint32_t chunkIndex = 0u; chunkIndex < world->capacity; ++chunkIndex)
+    {
+        if (!world->occupied[chunkIndex])
+            continue;
+        const GlobalChunkCoordinate *key = &world->keys[chunkIndex];
+        const Chunk *chunk = world->chunks[chunkIndex];
+        for (uint32_t deltaIndex = 0u; deltaIndex < chunk->deltaCount; ++deltaIndex)
+        {
+            const uint32_t localIndex = DeltaLocalIndex(chunk->deltas[deltaIndex]);
+            int64_t x = 0;
+            int64_t y = 0;
+            int64_t z = 0;
+            if (!WorldChunkLocalToBlock(key->local.x,
+                                        localIndex / (CHUNK_SIZE * CHUNK_SIZE), &x) ||
+                !WorldChunkLocalToBlock(key->local.y,
+                                        (localIndex / CHUNK_SIZE) % CHUNK_SIZE, &y) ||
+                !WorldChunkLocalToBlock(key->local.z,
+                                        localIndex % CHUNK_SIZE, &z))
+                continue;
+            if (x < minimumX || x > maximumX || y < minimumY || y > maximumY ||
+                z < minimumZ || z > maximumZ)
+                continue;
+            if (!visitor(context, x, y, z, DeltaBlock(chunk->deltas[deltaIndex])))
+            {
+                PlatformRwLockReleaseShared(&world->tableLock);
+                return false;
+            }
+        }
+    }
+    PlatformRwLockReleaseShared(&world->tableLock);
+    return true;
 }
 
 void WorldSetBlock(World* world,

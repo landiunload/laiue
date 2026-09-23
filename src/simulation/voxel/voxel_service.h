@@ -23,6 +23,11 @@ typedef struct LaiueVoxelWorldConfigV1
 typedef uint32_t (*LaiueVoxelWorldCreateFn)(
     const LaiueVoxelWorldConfigV1 *config,
     LaiueVoxelWorldV1 **outWorld);
+/* New callers pass the provider context explicitly so the voxel module can
+ * use the selected world technology without importing its DLL. */
+typedef uint32_t (*LaiueVoxelWorldCreateWithContextFn)(
+    void *serviceContext, const LaiueVoxelWorldConfigV1 *config,
+    LaiueVoxelWorldV1 **outWorld);
 typedef void (*LaiueVoxelWorldDestroyFn)(LaiueVoxelWorldV1 *world);
 typedef uint32_t (*LaiueVoxelWorldGetProviderFn)(
     LaiueVoxelWorldV1 *world,
@@ -44,6 +49,8 @@ typedef struct LaiueVoxelServiceV1
     LaiueVoxelWorldSetBlockFn setBlock;
     LaiueVoxelWorldGetRevisionFn getRevision;
     uintptr_t reserved[8];
+    LaiueVoxelWorldCreateWithContextFn createWithContext;
+    void *context;
 } LaiueVoxelServiceV1;
 
 const LaiueModuleApiV1 *LaiueVoxelGetStaticModuleApiV1(void);

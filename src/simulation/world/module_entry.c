@@ -25,6 +25,9 @@ static const LaiueWorldServiceV1 service = {
     .applyBlockBatch = WorldApplyBlockBatch,
     .getRevision = WorldGetRevision,
     .fillRegion = WorldFillRegion,
+    .getBlockState = WorldGetBlockState,
+    .enumerateOverrides = WorldEnumerateOverrides,
+    .trySetBlockExplicit = WorldTrySetBlockExplicit,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
