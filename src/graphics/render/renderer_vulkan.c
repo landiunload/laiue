@@ -1,8 +1,7 @@
-// Vulkan-бэкенд рендерера: тот же контракт renderer.h, что и у D3D12,
-// но кадр рисуется offscreen — без окна, swapchain и present. Этого
-// достаточно, чтобы проверять рендер на CPU-драйвере в CI и переносить
-// движок на платформы, где D3D12 нет; окно и swapchain добавляются
-// отдельным этапом и контракт не меняют.
+// Vulkan-бэкенд рендерера: тот же контракт renderer.h, что и у D3D12.
+// Без native handle он остаётся deterministic offscreen provider; при
+// переданном HWND/X11 handle/ANativeWindow создаёт соответствующую surface,
+// swapchain и present, не меняя публичный контракт.
 //
 // Шейдеры те же самые HLSL, скомпилированные glslang в SPIR-V. Регистры
 // HLSL переводятся в один descriptor set сдвигами (cmake/LaiueShader.cmake):
@@ -14,10 +13,9 @@
 #include "render/content_provider.h"
 #include "platform/system.h"
 
-// Оконный вывод есть только на Windows: поверхность создаётся через
-// Win32 (hwnd), и расширения инстанса/устройства для него включаются
-// лишь при непустом windowHandle. На остальных платформах windowHandle
-// по-прежнему запрещает создание рендера, а весь Win32-код вырезан.
+// Оконный вывод выбирается платформенным provider-ом. Рендерер не знает
+// Window и принимает только native surface payload: HWND на Windows,
+// {Display, Window} на X11 и ANativeWindow на Android.
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +25,9 @@
 #endif
 #if defined(LAIUE_RENDER_HAS_X11)
 #define VK_USE_PLATFORM_XLIB_KHR 1
+#endif
+#if defined(__ANDROID__)
+#define VK_USE_PLATFORM_ANDROID_KHR 1
 #endif
 
 #include <vulkan/vulkan.h>
@@ -43,6 +44,10 @@ typedef struct LaiueWindowNativeHandleV1
     void *display;
     uintptr_t window;
 } LaiueWindowNativeHandleV1;
+#endif
+#if defined(__ANDROID__)
+#include <vulkan/vulkan_android.h>
+#include <android/native_window.h>
 #endif
 
 #include <stddef.h>
@@ -250,6 +255,12 @@ struct Renderer
     VkDeviceSize uniformAlignment;
     VkDeviceSize storageAlignment;
     VkDevice device;
+    /* Vulkan 1.3 commands are loaded from the device rather than imported
+     * from libvulkan.  Android's loader intentionally exports only the
+     * dispatch entry points, so taking these addresses also keeps the
+     * desktop and mobile providers on the same ABI-safe path. */
+    PFN_vkCmdBeginRendering cmdBeginRendering;
+    PFN_vkCmdEndRendering cmdEndRendering;
     uint32_t queueFamily;
     VkQueue queue;
     VkCommandPool commandPool;
@@ -1705,7 +1716,7 @@ static bool NameEquals(const char *left, const char *right)
     return *left == *right;
 }
 
-#if defined(_WIN32) || defined(LAIUE_RENDER_HAS_X11)
+#if defined(_WIN32) || defined(LAIUE_RENDER_HAS_X11) || defined(__ANDROID__)
 // Расширения инстанса проверяются до его создания: драйвер без
 // VK_KHR_win32_surface не сможет принять HWND, и честный отказ лучше
 // падения внутри vkCreateWin32SurfaceKHR.
@@ -2175,6 +2186,15 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         instanceExtensions[instanceExtensionCount++] = required[0];
         instanceExtensions[instanceExtensionCount++] = required[1];
     }
+#elif defined(__ANDROID__)
+    if (windowHandle != NULL)
+    {
+        const char *required[2] = { VK_KHR_SURFACE_EXTENSION_NAME,
+                                    VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
+        if (!InstanceExtensionsAvailable(required, 2u)) return false;
+        instanceExtensions[instanceExtensionCount++] = required[0];
+        instanceExtensions[instanceExtensionCount++] = required[1];
+    }
 #else
     (void)windowHandle;
 #endif
@@ -2219,6 +2239,18 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         };
         if (vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
                                    &renderer->surface) != VK_SUCCESS)
+            return false;
+        renderer->hasSurface = true;
+    }
+#elif defined(__ANDROID__)
+    if (windowHandle != NULL)
+    {
+        VkAndroidSurfaceCreateInfoKHR surfaceInfo = {
+            .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+            .window = (ANativeWindow *)windowHandle,
+        };
+        if (vkCreateAndroidSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
+                                      &renderer->surface) != VK_SUCCESS)
             return false;
         renderer->hasSurface = true;
     }
@@ -2325,6 +2357,12 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
+    renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
+        renderer->device, "vkCmdBeginRendering");
+    renderer->cmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(
+        renderer->device, "vkCmdEndRendering");
+    if (renderer->cmdBeginRendering == NULL || renderer->cmdEndRendering == NULL)
+        return false;
     vkGetDeviceQueue(renderer->device, chosenFamily, 0u, &renderer->queue);
 
     VkCommandPoolCreateInfo poolInfo = {
@@ -2466,9 +2504,10 @@ static bool CreateSharedSets(Renderer *renderer)
 
 Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
 {
-    // Оконный вывод реализован только на Win32. На прочих платформах
-    // ненулевой windowHandle по-прежнему означает отказ.
-#if !defined(_WIN32) && !defined(LAIUE_RENDER_HAS_X11)
+    // Headless Vulkan остаётся допустимым на любой платформе. Если
+    // native handle передан, соответствующий surface provider должен быть
+    // скомпилирован в этот renderer.
+#if !defined(_WIN32) && !defined(LAIUE_RENDER_HAS_X11) && !defined(__ANDROID__)
     if (windowHandle != NULL) return NULL;
 #else
     (void)windowHandle;
@@ -2928,7 +2967,7 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
 static void EndRenderingIfActive(Renderer *renderer)
 {
     if (!renderer->renderingActive) return;
-    vkCmdEndRendering(renderer->commandBuffers[renderer->frameIndex]);
+    renderer->cmdEndRendering(renderer->commandBuffers[renderer->frameIndex]);
     renderer->renderingActive = false;
 }
 
@@ -3082,10 +3121,10 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
             .colorAttachmentCount = 1u,
             .pColorAttachments = &colorAttachment,
         };
-        vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
         SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                               (uint32_t)renderer->windowHeight);
-        vkCmdEndRendering(commandBuffer);
+        renderer->cmdEndRendering(commandBuffer);
     }
     return true;
 }
@@ -3156,7 +3195,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         .pColorAttachments = &colorAttachment,
         .pDepthAttachment = &depthAttachment,
     };
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
     renderer->renderingActive = true;
 
     SetViewportAndScissor(commandBuffer, x, y, width, height);
@@ -3193,7 +3232,7 @@ static void RecordPanoramaResolve(Renderer *renderer)
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
     SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                           (uint32_t)renderer->windowHeight);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->resolvePipeline);
@@ -3201,7 +3240,7 @@ static void RecordPanoramaResolve(Renderer *renderer)
                             renderer->resolvePipelineLayout, 0u, 1u,
                             &renderer->resolveSets[renderer->frameIndex], 1u, &constantOffset);
     vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
-    vkCmdEndRendering(commandBuffer);
+    renderer->cmdEndRendering(commandBuffer);
     renderer->currentStats.drawCalls++;
 
     ImageBarrier(commandBuffer, &renderer->cubeColor, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3232,7 +3271,7 @@ static void RecordUiLayer(Renderer *renderer)
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
     SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                           (uint32_t)renderer->windowHeight);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->uiPipeline);
@@ -3241,7 +3280,7 @@ static void RecordUiLayer(Renderer *renderer)
                             renderer->uiPipelineLayout, 0u, 1u,
                             &renderer->uiSets[renderer->frameIndex], 2u, dynamicOffsets);
     vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
-    vkCmdEndRendering(commandBuffer);
+    renderer->cmdEndRendering(commandBuffer);
     renderer->currentStats.drawCalls++;
 }
 

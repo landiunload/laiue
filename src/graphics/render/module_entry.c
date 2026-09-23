@@ -24,6 +24,7 @@ typedef struct LaiueGraphicsDeviceState
     Renderer *renderer;
     uint32_t generations[256];
     uint64_t sizes[256];
+    void *storage[256];
     uint8_t kinds[256];
     uint8_t live[256];
     uint32_t submittedItems;
@@ -148,6 +149,8 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
         (LaiueGraphicsDeviceState *)device->context;
     if (state == NULL)
         return;
+    for (uint32_t index = 0u; index < 256u; ++index)
+        PlatformFree(state->storage[index]);
     RendererDestroy(state->renderer);
     PlatformFree(state);
 }
@@ -177,8 +180,18 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || description == NULL || outBuffer == NULL ||
         description->structSize < sizeof(*description) || description->sizeBytes == 0u)
         return 0u;
-    return DeviceAllocateHandle(state, DEVICE_HANDLE_BUFFER, description->sizeBytes,
-                                outBuffer);
+    if (!DeviceAllocateHandle(state, DEVICE_HANDLE_BUFFER, description->sizeBytes,
+                              outBuffer))
+        return 0u;
+    const uint32_t index = (uint32_t)*outBuffer - 1u;
+    if (description->sizeBytes > (uint64_t)SIZE_MAX ||
+        (state->storage[index] = PlatformAllocate((size_t)description->sizeBytes, true)) == NULL)
+    {
+        DeviceDestroyHandle(device, *outBuffer);
+        *outBuffer = 0u;
+        return 0u;
+    }
+    return 1u;
 }
 
 static uint32_t DeviceCreateTexture(LaiueGraphicsDeviceV1 *device,
@@ -227,12 +240,15 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || upload == NULL || upload->structSize < sizeof(*upload) ||
         !DeviceHandleIsLive(state, upload->buffer, DEVICE_HANDLE_BUFFER) ||
         upload->data == NULL || upload->sizeBytes == 0u ||
+        upload->sizeBytes > (uint64_t)SIZE_MAX ||
         upload->offsetBytes > UINT64_MAX - upload->sizeBytes)
         return 0u;
     const uint32_t index = (uint32_t)upload->buffer - 1u;
     if (upload->offsetBytes > state->sizes[index] ||
         upload->sizeBytes > state->sizes[index] - upload->offsetBytes)
         return 0u;
+    memcpy((uint8_t *)state->storage[index] + (size_t)upload->offsetBytes,
+           upload->data, (size_t)upload->sizeBytes);
     return 1u;
 }
 
@@ -243,6 +259,8 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
     const uint32_t index = (uint32_t)handle - 1u;
+    PlatformFree(state->storage[index]);
+    state->storage[index] = NULL;
     state->live[index] = 0u;
     state->sizes[index] = 0u;
     state->kinds[index] = 0u;

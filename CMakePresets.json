@@ -160,6 +160,15 @@
       }
     },
     {
+      "name": "linux-vulkan-x11-walk",
+      "displayName": "Linux x64 X11/Vulkan walk example",
+      "description": "Window/input walk client; use X11 for presentation and Vulkan for graphics",
+      "inherits": "linux-vulkan-offscreen",
+      "cacheVariables": {
+        "LAIUE_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
       "name": "linux-external-port-smoke",
       "displayName": "Linux x64 external core adapter smoke",
       "description": "Compile-tests the static external-platform seam",
@@ -269,6 +278,32 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "LAIUE_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "android-arm64-walk",
+      "displayName": "Android ARM64 NativeActivity walk + Vulkan",
+      "description": "Static NativeActivity client; package with the Android SDK build tools",
+      "inherits": "android-arm64-core",
+      "cacheVariables": {
+        "BUILD_TESTING": "OFF",
+        "LAIUE_BUILD_EXAMPLES": "ON",
+        "LAIUE_BUILD_ANDROID_WALK": "ON",
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_BUILD_TOOLS": "OFF"
+      }
+    },
+    {
+      "name": "android-x86_64-walk-api35",
+      "displayName": "Android x86_64 API 35 NativeActivity walk + Vulkan",
+      "description": "Static NativeActivity client for the API 35 emulator",
+      "inherits": "android-x86_64-core-api35",
+      "cacheVariables": {
+        "BUILD_TESTING": "OFF",
+        "LAIUE_BUILD_EXAMPLES": "ON",
+        "LAIUE_BUILD_ANDROID_WALK": "ON",
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_BUILD_TOOLS": "OFF"
       }
     },
     {
@@ -467,6 +502,11 @@
       "configurePreset": "linux-vulkan-offscreen"
     },
     {
+      "name": "linux-vulkan-x11-walk-release",
+      "inherits": "linux-build-release",
+      "configurePreset": "linux-vulkan-x11-walk"
+    },
+    {
       "name": "linux-external-port-smoke-release",
       "inherits": "linux-build-release",
       "configurePreset": "linux-external-port-smoke"
@@ -521,6 +561,24 @@
     {
       "name": "android-x86_64-core-api35-closure",
       "configurePreset": "android-x86_64-core-api35-closure",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-arm64-walk-release",
+      "configurePreset": "android-arm64-walk",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-x86_64-walk-api35-release",
+      "configurePreset": "android-x86_64-walk-api35",
       "condition": {
         "type": "notEquals",
         "lhs": "$env{ANDROID_NDK_HOME}",

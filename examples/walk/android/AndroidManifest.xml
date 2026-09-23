@@ -1,0 +1,17 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.laiue.walk">
+    <uses-feature android:name="android.hardware.vulkan.version" android:required="true" />
+    <application android:theme="@android:style/Theme.Material.NoActionBar"
+        android:label="LAIUE Walk" android:hasCode="false">
+        <activity android:name="android.app.NativeActivity"
+            android:label="LAIUE Walk" android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="laiue_walk" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

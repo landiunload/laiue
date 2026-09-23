@@ -23,3 +23,26 @@ CI and validates the no-window/no-render bootstrap profile. Window, input and
 graphics are loaded as optional providers; if an artifact is absent or the
 device cannot be created, the example reports the reason and runs the same
 diagnostic headless check instead.
+
+## Android NativeActivity
+
+`android/` is a small static-registry client using the same module ABI. It
+creates a Vulkan surface from `ANativeWindow`, recreates the device after
+`APP_CMD_TERM_WINDOW`/`APP_CMD_INIT_WINDOW`, pauses its fixed 128 Hz loop when
+the activity loses focus, and accepts keyboard plus touch input. The sparse
+voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
+character on the example's deterministic infinite base plane.
+
+Configure it with the API 35 emulator preset (put the build tree on the
+scratch disk as shown below):
+
+```powershell
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\29.0.14206865'
+cmake --preset android-x86_64-walk-api35 -B D:\build\laiue\android-x86_64-walk
+cmake --build D:\build\laiue\android-x86_64-walk --config Release --target laiue_walk_android
+```
+
+The result is `android/Release/liblaiue_walk.so` plus the manifest staged by
+the `laiue_walk_android_manifest` target. APK signing/zipalign intentionally
+remain a packaging step: they require the Android SDK build-tools (`aapt2`,
+`zipalign`, `apksigner`) and a keystore supplied by the application owner.

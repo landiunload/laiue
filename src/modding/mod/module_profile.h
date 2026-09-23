@@ -35,4 +35,3 @@ typedef struct LaiueModuleProfileStorageV1
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleProfileParseTextV1(
     const char *text, uint32_t textSize, LaiueModuleProfileStorageV1 *storage,
     LaiueModuleDiagnostic *diagnostic);
-

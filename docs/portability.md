@@ -13,8 +13,8 @@
 | Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA, на устройстве не запускался | glibc, нужны окно, ввод и UI |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
-| Android ARM64 | NDK r29: собрано и слинковано локально, CI настроен | — | API 28+, static external core |
-| Android x86_64 | API 35 Google APIs AVD + WHPX, локальный core smoke | — | NDK r29, static external core |
+| Android ARM64 | NDK r29: core и NativeActivity/Vulkan `.so` собираются локально | — | API 28+, static external core |
+| Android x86_64 | API 35 Google APIs AVD + WHPX, NativeActivity/Vulkan `.so` build | — | NDK r29, static external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
@@ -28,7 +28,7 @@ Core включает `platform_support`, `world`, `physics`, `content` и `mod`
 |---|---|---|
 | `D3D12` | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
 | `VULKAN` на Windows | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
-| `VULKAN` на POSIX | `audio`, `mesh`, `render`, `scene`, `ui` | native `window`/`input` до подключения platform adapter |
+| `VULKAN` на POSIX | `audio`, `mesh`, `render`, `scene`, `ui`; X11 `window`/`input` when X11 is found | Wayland and evdev adapters |
 
 На Windows `LAIUE_RENDER_BACKEND=AUTO` (умолчание) связывает все физически
 доступные бэкенды: D3D12 и, если найден Vulkan SDK, Vulkan. `RendererCreate`
@@ -43,8 +43,9 @@ Windows Vulkan с непустым `windowHandle` создаёт Win32 surface �
 `windowHandle`, а
 также весь Vulkan вне Windows рисует кадр offscreen: результат читается
 `RendererCaptureFrame` из `render/renderer_offscreen.h`. Этого достаточно,
-чтобы проверять рендер по пикселям на программном драйвере; переносимое
-нативное окно Wayland/X11 и ввод через evdev остаются отдельными этапами.
+чтобы проверять рендер по пикселям на программном драйвере; при наличии X11
+тот же provider создаёт Xlib surface и input, а Wayland остаётся отдельным
+adapter.
 
 Список собираемых графических модулей печатается при configure, чтобы
 неполнота профиля была видна, а не подразумевалась. Попытка запросить
@@ -54,8 +55,8 @@ Windows отвергается сразу.
 Звук и сцена переносимы целиком: микшер не знает платформы, а вывод у
 него свой на каждой (WASAPI и ALSA), потоковый стриминг чанков работает
 через контракт потоков платформенного слоя. На POSIX headless-профиле окно
-и ввод пока должны прийти от внешнего platform adapter; `ui` остаётся
-доступным и использует portable font fallback, а на Windows растеризует
+и ввод можно подключить X11 provider-ом; `ui` остаётся доступным и использует
+portable font fallback, а на Windows растеризует
 шрифты через GDI.
 
 ## Опции CMake
@@ -125,6 +126,7 @@ macOS ARM64 должен подтвердить его собственным н
 | `linux-musl` | Ninja Multi-Config | `linux-musl-debug`, `linux-musl-release` |
 | `linux-gcc-asan` | Ninja Multi-Config | `linux-gcc-asan-debug` |
 | `linux-vulkan-offscreen` | Ninja Multi-Config | `linux-vulkan-offscreen-debug`, `linux-vulkan-offscreen-release` |
+| `linux-vulkan-x11-walk` | Ninja Multi-Config | `linux-vulkan-x11-walk-release` |
 | `linux-external-port-smoke` | Ninja Multi-Config | `linux-external-port-smoke-release` |
 | `macos-clang-arm64` | Ninja Multi-Config | `macos-clang-arm64-debug`, `macos-clang-arm64-release` |
 | `macos-clang-x86_64` | Ninja Multi-Config | `macos-clang-x86_64-debug`, `macos-clang-x86_64-release` |
@@ -217,7 +219,9 @@ cmake --build D:\build\laiue\android-x86_64-core-api35 --config Release --parall
 
 `laiue_static_core_link_smoke` можно передать в запущенный
 `laiue-api35-x86_64` через `adb`; это проверяет native ABI и статическое
-замыкание, но не заявляет наличие Android UI/renderer APK.
+замыкание. Для NativeActivity-клиента используйте preset
+`android-x86_64-walk-api35`: он собирает Vulkan surface path и `.so`; APK
+target включается только когда явно заданы SDK build-tools и keystore.
 
 ## Vulkan offscreen на Linux
 
@@ -359,7 +363,8 @@ host-процесса. Наличие core-сборки само по себе �
 
 Android и Apple mobile family используют публичный
 `cmake/platform/MobileCoreAdapter.cmake`, static core и
-`LAIUE_NATIVE_MOD_MODE=OFF`. Android preset фиксирует NDK r29, ARM64 и API 28;
+`LAIUE_NATIVE_MOD_MODE=OFF`. Android core preset фиксирует NDK r29 и API 28,
+а walk preset добавляет NativeActivity/Vulkan для ARM64 или API 35 x86_64;
 iOS preset фиксирует iOS 15, ARM64 и отключённую подпись build-only цели. CI
 компилирует Android targets и линкует game `.so`; Apple runner линкует
 минимальный unsigned app bundle. Android-профиль дополнительно собран
@@ -369,14 +374,16 @@ AArch64 ELF, экспортирует свою точку входа, а сре�
 каждый object game core и модулей `world`, `physics`, `content`, `mod` без
 section GC, чтобы статический архив или optimizer не мог скрыть unresolved
 symbol. Отдельная Release-цель проверяет финальную LTO/dead-strip линковку.
-Это не запуск на телефоне и не готовый store package.
+Это не подписанный store package: подпись и zipalign выполняются только
+явно заданными SDK build-tools и keystore. NativeActivity `.so` отдельно
+проверяется ELF-импортами и может быть встроен в приложение владельца.
 
 Mobile shell получает resource и writable application directories от ОС,
 при необходимости копирует data-only packs в app container и передаёт явный
-root в `LaiueContentCatalogCreate`. Mobile adapter намеренно не подменяет его
-путём к process executable. Полноценному клиенту ещё нужны Vulkan/Metal
-renderer, platform window/lifecycle, input, audio, suspend, thermal/memory
-policy и device tests.
+root в `LaiueContentCatalogCreate`. Android walk уже покрывает Vulkan
+surface/lifecycle, touch и pause/resume; полноценный Apple-клиент с Metal,
+audio-output и store-specific memory/thermal policy остаётся следующим
+этапом.
 
 Публичный CMake-проект предоставляет compile-tested точку подключения
 platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указанный

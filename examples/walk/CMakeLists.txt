@@ -25,3 +25,9 @@ endif()
 target_include_directories(laiue_walk PRIVATE
     "${PROJECT_SOURCE_DIR}/src")
 laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)
+
+if(ANDROID AND LAIUE_BUILD_ANDROID_WALK)
+    option(LAIUE_ANDROID_WALK_WITH_VOXEL
+        "Register the optional sparse voxel provider in the Android walk profile" ON)
+    add_subdirectory(android)
+endif()

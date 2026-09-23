@@ -471,6 +471,9 @@ option(LAIUE_BUILD_TOOLS "Build the offline content tools"
     ${_laiue_tools_default})
 
 option(LAIUE_BUILD_EXAMPLES "Build the public SDK examples" OFF)
+option(LAIUE_BUILD_ANDROID_WALK
+    "Build the NativeActivity/Vulkan Android walk client (requires Android NDK)"
+    OFF)
 if(LAIUE_BUILD_EXAMPLES)
     add_subdirectory(examples/walk)
 endif()

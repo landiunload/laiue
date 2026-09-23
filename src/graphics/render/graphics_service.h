@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/renderer.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -50,3 +51,4 @@ typedef struct LaiueGraphicsServiceV1
 } LaiueGraphicsServiceV1;
 
 LAIUE_RENDER_API const LaiueGraphicsServiceV1 *LaiueGraphicsGetStaticServiceV1(void);
+const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);

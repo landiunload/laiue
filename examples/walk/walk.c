@@ -2,6 +2,7 @@
 #include "mod/module_host.h"
 #include "platform/system.h"
 #include "voxel/voxel_service.h"
+#include "walk_runtime.h"
 #if defined(LAIUE_WALK_WINDOWED)
 #include "graphics/graphics_device_service.h"
 #include "render/graphics_service.h"
@@ -22,11 +23,6 @@ enum
     WALK_VOXEL_SIZE = 1000,
     WALK_BLOCKS_PER_CELL = LAIUE_CHARACTER_LOCAL_CELL_SIZE / WALK_VOXEL_SIZE,
 };
-
-typedef struct WalkVoxelContext
-{
-    LaiueVoxelProviderV1 sparse;
-} WalkVoxelContext;
 
 static int64_t FloorDiv(int64_t value, int64_t divisor)
 {
@@ -301,9 +297,10 @@ static uint32_t BaseGetBlock(const LaiueVoxelCoordV1 *coordinate,
     return 1u;
 }
 
-static uint32_t WalkGetBlock(const LaiueVoxelProviderV1 *provider,
-                             const LaiueVoxelCoordV1 *coordinate,
-                             LaiueVoxelBlockV1 *outBlock)
+LAIUE_WALK_RUNTIME_API uint32_t WalkGetBlock(
+    const LaiueVoxelProviderV1 *provider,
+    const LaiueVoxelCoordV1 *coordinate,
+    LaiueVoxelBlockV1 *outBlock)
 {
     if (provider == NULL || coordinate == NULL || outBlock == NULL)
         return 0u;
@@ -342,11 +339,15 @@ static bool WalkIsSolid(const LaiueVoxelProviderV1 *provider, int64_t x, int64_t
            provider->getBlock(provider, &coordinate, &block) != 0u && block.material != 0u;
 }
 
-static uint32_t WalkSweepAabb(const LaiueCharacterCollisionV1 *collision,
-                              const LaiueCharacterPositionV1 *position,
-                              int64_t halfExtent, int64_t deltaX, int64_t deltaY,
-                              int64_t deltaZ, LaiueCharacterPositionV1 *outPosition,
-                              uint32_t *outGrounded)
+LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
+    const LaiueCharacterCollisionV1 *collision,
+    const LaiueCharacterPositionV1 *position,
+    int64_t halfExtent,
+    int64_t deltaX,
+    int64_t deltaY,
+    int64_t deltaZ,
+    LaiueCharacterPositionV1 *outPosition,
+    uint32_t *outGrounded)
 {
     if (collision == NULL || position == NULL || outPosition == NULL || outGrounded == NULL)
         return 0u;
@@ -501,6 +502,7 @@ static bool JoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t
 }
 #endif
 
+#if !defined(LAIUE_WALK_RUNTIME_ONLY)
 static LaiueModuleStatus LoadWalkModules(
     LaiueModuleHost *host, LaiueModuleLoadReportV1 *report,
     LaiueModuleLoadReportEntryV1 *reportEntries,
@@ -526,9 +528,19 @@ static LaiueModuleStatus LoadWalkModules(
 #elif defined(__APPLE__)
     const wchar_t *characterName = L"liblaiue_character.dylib";
     const wchar_t *voxelName = L"liblaiue_voxel.dylib";
+#if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *windowName = L"liblaiue_window.dylib";
+    const wchar_t *inputName = L"liblaiue_input.dylib";
+    const wchar_t *renderName = L"liblaiue_render.dylib";
+#endif
 #else
     const wchar_t *characterName = L"liblaiue_character.so";
     const wchar_t *voxelName = L"liblaiue_voxel.so";
+#if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *windowName = L"liblaiue_window.so";
+    const wchar_t *inputName = L"liblaiue_input.so";
+    const wchar_t *renderName = L"liblaiue_render.so";
+#endif
 #endif
     if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY) ||
         !JoinPath(characterPath, directory, characterName) ||
@@ -573,7 +585,9 @@ static LaiueModuleStatus LoadWalkModules(
                                      moduleCount, diagnostic);
 #endif
 }
+#endif /* !LAIUE_WALK_RUNTIME_ONLY */
 
+#if !defined(LAIUE_WALK_RUNTIME_ONLY)
 static bool RunWalkExample(bool headless)
 {
     LaiueModuleHostConfigV1 config;
@@ -831,3 +845,4 @@ int main(void)
     return RunWalkExample(true) ? 0 : 1;
 }
 #endif
+#endif /* !LAIUE_WALK_RUNTIME_ONLY */

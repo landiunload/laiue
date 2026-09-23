@@ -68,12 +68,13 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 |---|---:|---:|
 | Windows x86_64 | CI | D3D12, CI; Vulkan (Win32 swapchain) при Vulkan SDK |
 | Windows ARM64 | clang-cl собран и слинкован локально; native CI job | D3D12 собирается; на устройстве не запускался |
-| Linux x86_64 | glibc и musl, проверено в Docker | Vulkan offscreen, ALSA и сцена; окна, ввода и UI ещё нет |
+| Linux x86_64 | glibc и musl, проверено в WSL/CI | Vulkan offscreen или X11 surface при наличии X11, ALSA и сцена |
 | Linux ARM64 | glibc и musl, проверено в Docker; native CI настроен | Vulkan-профиль не собирался на ARM64 |
 | Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA; нужны окно, ввод, UI и проверка на устройстве |
 | macOS arm64/x86_64 | macOS 11+, native CI настроен, локально не запускался | ещё нет Metal backend |
-| Android ARM64 | NDK r29: static core и финальный `.so` собраны локально, CI настроен | ещё нет APK/Vulkan/input/audio shell |
-| iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | ещё нет приложения/Metal backend |
+| Android ARM64 | NDK r29: static core и NativeActivity/Vulkan `.so` собираются локально | APK требует SDK build-tools и keystore |
+| Android x86_64 | API 35 emulator NativeActivity/Vulkan `.so` собирается локально | APK требует SDK build-tools и keystore |
+| iOS/iPadOS ARM64 | iOS 15+ static core и unsigned link CI настроены | приложение/Metal backend — следующий этап |
 | tvOS/visionOS | mobile adapter contract | нет presets, client и device tests |
 | Xbox / PlayStation / Nintendo | external static seam | нужны одобрение, закрытый SDK и hardware |
 | WebAssembly/WebGPU | не заявлен | нужен отдельный web adapter |
@@ -144,6 +145,21 @@ cmake --build --preset android-arm64-core-closure --parallel
 cmake --preset android-arm64-core
 cmake --build --preset android-arm64-core-release --parallel
 ```
+
+Для демонстрационного клиента с окном NativeActivity и Vulkan surface можно
+использовать API 35 preset:
+
+```powershell
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\29.0.14206865'
+cmake --preset android-x86_64-walk-api35 -B D:\build\laiue\android-x86_64-walk
+cmake --build D:\build\laiue\android-x86_64-walk --config Release --target laiue_walk_android
+```
+
+Это собирает `liblaiue_walk.so` и манифест. Для APK-поставки задайте в
+CMake пути к `aapt2`, `zipalign`, `apksigner`, `android.jar` и keystore;
+после этого target `laiue_walk_android_apk` выполняет упаковку и проверяет
+подпись. В текущем рабочем окружении SDK build-tools не установлены, поэтому
+проверен native `.so`-путь, а не подписанная установка на AVD.
 
 На macOS с Xcode 26 доступен build-only профиль iOS 15 ARM64:
 
