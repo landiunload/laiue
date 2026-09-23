@@ -3,6 +3,7 @@
 #include "mod/module_api.h"
 #include "render/graphics_service.h"
 #include "scene/math_service.h"
+#include "platform/system.h"
 
 typedef struct LaiueSceneModuleState
 {
@@ -10,8 +11,6 @@ typedef struct LaiueSceneModuleState
     const LaiueGraphicsServiceV1 *graphics;
     const LaiueSceneMathServiceV1 *sceneMath;
 } LaiueSceneModuleState;
-
-static LaiueSceneModuleState moduleState;
 
 static const LaiueSceneServiceV1 service = {
     .structSize = sizeof(LaiueSceneServiceV1),
@@ -30,10 +29,15 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.graphics = NULL;
-    moduleState.sceneMath = NULL;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueSceneModuleState *state =
+        (LaiueSceneModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    state->graphics = NULL;
+    state->sceneMath = NULL;
+    *outContext = state;
     return 1u;
 }
 
@@ -98,11 +102,15 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueSceneModuleState *state = (LaiueSceneModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        state->graphics = NULL;
+        state->sceneMath = NULL;
+        PlatformFree(state);
+    }
     PanoramaSetSceneMathService(NULL);
-    moduleState.graphics = NULL;
-    moduleState.sceneMath = NULL;
 }
 
 static const char *const provides[] = {LAIUE_SCENE_SERVICE_NAME};

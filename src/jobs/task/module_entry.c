@@ -1,11 +1,11 @@
 #include "task/task_service.h"
 
+#include "platform/system.h"
+
 typedef struct LaiueTaskModuleState
 {
     const LaiueModuleHostV1 *host;
 } LaiueTaskModuleState;
-
-static LaiueTaskModuleState moduleState;
 
 static uint32_t GetExecutor(
     LaiueTaskPool *pool, LaiueTaskExecutor *outExecutor)
@@ -27,8 +27,13 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueTaskModuleState *state =
+        (LaiueTaskModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -56,8 +61,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueTaskModuleState *state = (LaiueTaskModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_TASK_SERVICE_NAME};

@@ -1,11 +1,11 @@
 #include "numeric/numeric_service.h"
 
+#include "platform/system.h"
+
 typedef struct LaiueNumericModuleState
 {
     const LaiueModuleHostV1 *host;
 } LaiueNumericModuleState;
-
-static LaiueNumericModuleState moduleState;
 
 static uint32_t TryCopyAddInt64(
     InfiniteCoord *out, const InfiniteCoord *source, int64_t addend)
@@ -110,8 +110,13 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueNumericModuleState *state =
+        (LaiueNumericModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -139,8 +144,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueNumericModuleState *state = (LaiueNumericModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_NUMERIC_SERVICE_NAME};

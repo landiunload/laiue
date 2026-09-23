@@ -296,15 +296,18 @@ typedef struct LaiueVoxelModuleState
     const LaiueModuleHostV1 *host;
 } LaiueVoxelModuleState;
 
-static LaiueVoxelModuleState moduleState;
-
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueVoxelModuleState *state =
+        (LaiueVoxelModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -332,8 +335,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueVoxelModuleState *state = (LaiueVoxelModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_VOXEL_SERVICE_NAME};

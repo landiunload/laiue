@@ -2,13 +2,12 @@
 
 #include "mod/module_api.h"
 #include "mod/module_service.h"
+#include "platform/system.h"
 
 typedef struct LaiueMesherModuleState
 {
     const LaiueModuleHostV1 *host;
 } LaiueMesherModuleState;
-
-static LaiueMesherModuleState moduleState;
 
 static const LaiueMesherServiceV1 service = {
     .structSize = sizeof(LaiueMesherServiceV1),
@@ -23,8 +22,13 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueMesherModuleState *state =
+        (LaiueMesherModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -54,8 +58,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueMesherModuleState *state = (LaiueMesherModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_MESHER_SERVICE_NAME};

@@ -2,14 +2,13 @@
 #include "audio/audio_pack_runtime.h"
 #include "audio/audio_service.h"
 #include "content/content_service.h"
+#include "platform/system.h"
 
 typedef struct AudioPackModuleState
 {
     const LaiueModuleHostV1 *host;
     uint32_t runtimeInstalled;
 } AudioPackModuleState;
-
-static AudioPackModuleState moduleState;
 
 static uint32_t Enumerate(LaiueContentCatalog *catalog, AudioPackList *outList)
 {
@@ -48,9 +47,14 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.runtimeInstalled = 0u;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    AudioPackModuleState *state =
+        (AudioPackModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    state->runtimeInstalled = 0u;
+    *outContext = state;
     return 1u;
 }
 
@@ -114,8 +118,12 @@ static void ModuleDestroy(void *context)
     AudioPackModuleState *state = (AudioPackModuleState *)context;
     if (state != NULL && state->runtimeInstalled != 0u)
         AudioPackRuntimeSet(NULL);
-    moduleState.host = NULL;
-    moduleState.runtimeInstalled = 0u;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        state->runtimeInstalled = 0u;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_AUDIO_PACK_SERVICE_NAME};

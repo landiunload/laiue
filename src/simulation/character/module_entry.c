@@ -207,15 +207,18 @@ typedef struct LaiueCharacterModuleState
     const LaiueModuleHostV1 *host;
 } LaiueCharacterModuleState;
 
-static LaiueCharacterModuleState moduleState;
-
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueCharacterModuleState *state =
+        (LaiueCharacterModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -243,8 +246,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueCharacterModuleState *state = (LaiueCharacterModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_CHARACTER_SERVICE_NAME};

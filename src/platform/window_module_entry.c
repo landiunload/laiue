@@ -1,13 +1,12 @@
 #include "platform/window_service.h"
 
 #include "mod/module_api.h"
+#include "platform/system.h"
 
 typedef struct LaiueWindowModuleState
 {
     const LaiueModuleHostV1 *host;
 } LaiueWindowModuleState;
-
-static LaiueWindowModuleState moduleState;
 
 static const LaiueWindowServiceV1 service = {
     .structSize = sizeof(LaiueWindowServiceV1),
@@ -34,8 +33,13 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueWindowModuleState *state =
+        (LaiueWindowModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -64,8 +68,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueWindowModuleState *state = (LaiueWindowModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_WINDOW_SERVICE_NAME};

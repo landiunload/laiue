@@ -1,13 +1,12 @@
 #include "input/input_service.h"
 
 #include "mod/module_api.h"
+#include "platform/system.h"
 
 typedef struct LaiueInputModuleState
 {
     const LaiueModuleHostV1 *host;
 } LaiueInputModuleState;
-
-static LaiueInputModuleState moduleState;
 
 static const LaiueInputServiceV1 service = {
     .structSize = sizeof(LaiueInputServiceV1),
@@ -30,8 +29,13 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL)
         return 0u;
-    moduleState.host = host;
-    *outContext = &moduleState;
+    *outContext = NULL;
+    LaiueInputModuleState *state =
+        (LaiueInputModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
     return 1u;
 }
 
@@ -60,8 +64,12 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueInputModuleState *state = (LaiueInputModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_INPUT_SERVICE_NAME};

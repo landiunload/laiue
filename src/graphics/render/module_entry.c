@@ -16,8 +16,6 @@ typedef struct LaiueGraphicsModuleState
     const LaiueContentServiceV1 *content;
 } LaiueGraphicsModuleState;
 
-static LaiueGraphicsModuleState moduleState;
-
 typedef struct LaiueGraphicsDeviceState
 {
     LaiueGraphicsDeviceV1 device;
@@ -372,10 +370,15 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.content = NULL;
+    *outContext = NULL;
+    LaiueGraphicsModuleState *state =
+        (LaiueGraphicsModuleState *)PlatformAllocate(sizeof(*state), true);
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    state->content = NULL;
     RendererSetContentService(NULL);
-    *outContext = &moduleState;
+    *outContext = state;
     return 1u;
 }
 
@@ -437,9 +440,13 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
-    moduleState.content = NULL;
+    LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        state->content = NULL;
+        PlatformFree(state);
+    }
     RendererSetContentService(NULL);
 }
 
