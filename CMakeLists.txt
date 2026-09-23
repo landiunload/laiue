@@ -54,6 +54,12 @@ if(LAIUE_PLATFORM_WINDOWS)
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene voxel_render)
 else()
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene voxel_render)
+    if(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND NOT APPLE)
+        find_package(X11 QUIET)
+        if(X11_FOUND)
+            list(APPEND LAIUE_GRAPHICS_MODULE_DIRECTORIES input)
+        endif()
+    endif()
 endif()
 
 include(LaiueToolchain)
@@ -112,6 +118,8 @@ add_library(laiue_bootstrap STATIC
     src/modding/mod/module_api.h
     src/modding/mod/module_manifest.c
     src/modding/mod/module_manifest.h
+    src/modding/mod/module_profile.c
+    src/modding/mod/module_profile.h
     src/modding/mod/module_host.c
     src/modding/mod/module_host.h
     src/modding/mod/mod_internal.c
@@ -259,6 +267,7 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_api.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_service.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_manifest.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/module_profile.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_host.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
     COMPONENT Engine)
@@ -481,7 +490,7 @@ if(BUILD_TESTING)
     find_package(Git REQUIRED)
     add_subdirectory(tests)
     if(TARGET laiue_walk)
-        add_test(NAME laiue.example.walk COMMAND laiue_walk)
+        add_test(NAME laiue.example.walk COMMAND laiue_walk --headless)
     endif()
     add_test(NAME laiue.architecture.boundaries
         COMMAND "${CMAKE_COMMAND}"

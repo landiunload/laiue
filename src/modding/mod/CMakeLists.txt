@@ -8,6 +8,8 @@ laiue_add_module(mod
         module_api.h
         module_manifest.c
         module_manifest.h
+        module_profile.c
+        module_profile.h
         module_host.c
         module_host.h
         mod_internal.c

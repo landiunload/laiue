@@ -25,6 +25,9 @@
 #include <windows.h>
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #endif
+#if defined(LAIUE_RENDER_HAS_X11)
+#define VK_USE_PLATFORM_XLIB_KHR 1
+#endif
 
 #include <vulkan/vulkan.h>
 
@@ -32,6 +35,14 @@
 
 #if defined(_WIN32)
 #include <vulkan/vulkan_win32.h>
+#endif
+#if defined(LAIUE_RENDER_HAS_X11)
+#include <vulkan/vulkan_xlib.h>
+typedef struct LaiueWindowNativeHandleV1
+{
+    void *display;
+    uintptr_t window;
+} LaiueWindowNativeHandleV1;
 #endif
 
 #include <stddef.h>
@@ -1694,7 +1705,7 @@ static bool NameEquals(const char *left, const char *right)
     return *left == *right;
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(LAIUE_RENDER_HAS_X11)
 // Расширения инстанса проверяются до его создания: драйвер без
 // VK_KHR_win32_surface не сможет принять HWND, и честный отказ лучше
 // падения внутри vkCreateWin32SurfaceKHR.
@@ -2144,13 +2155,22 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 {
     // Оконная поверхность — единственное, ради чего включаются
     // платформенные расширения инстанса.
-    const char *instanceExtensions[2];
+    const char *instanceExtensions[4];
     uint32_t instanceExtensionCount = 0u;
 #if defined(_WIN32)
     if (windowHandle != NULL)
     {
         const char *required[2] = { VK_KHR_SURFACE_EXTENSION_NAME,
                                     VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+        if (!InstanceExtensionsAvailable(required, 2u)) return false;
+        instanceExtensions[instanceExtensionCount++] = required[0];
+        instanceExtensions[instanceExtensionCount++] = required[1];
+    }
+#elif defined(LAIUE_RENDER_HAS_X11)
+    if (windowHandle != NULL)
+    {
+        const char *required[2] = { VK_KHR_SURFACE_EXTENSION_NAME,
+                                    VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
         if (!InstanceExtensionsAvailable(required, 2u)) return false;
         instanceExtensions[instanceExtensionCount++] = required[0];
         instanceExtensions[instanceExtensionCount++] = required[1];
@@ -2182,6 +2202,23 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         };
         if (vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) !=
             VK_SUCCESS)
+            return false;
+        renderer->hasSurface = true;
+    }
+#elif defined(LAIUE_RENDER_HAS_X11)
+    if (windowHandle != NULL)
+    {
+        const LaiueWindowNativeHandleV1 *nativeHandle =
+            (const LaiueWindowNativeHandleV1 *)windowHandle;
+        if (nativeHandle->display == NULL || nativeHandle->window == 0u)
+            return false;
+        VkXlibSurfaceCreateInfoKHR surfaceInfo = {
+            .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+            .dpy = (Display *)nativeHandle->display,
+            .window = (Window)nativeHandle->window,
+        };
+        if (vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
+                                   &renderer->surface) != VK_SUCCESS)
             return false;
         renderer->hasSurface = true;
     }
@@ -2431,7 +2468,7 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
 {
     // Оконный вывод реализован только на Win32. На прочих платформах
     // ненулевой windowHandle по-прежнему означает отказ.
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(LAIUE_RENDER_HAS_X11)
     if (windowHandle != NULL) return NULL;
 #else
     (void)windowHandle;

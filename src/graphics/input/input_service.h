@@ -1,6 +1,7 @@
 #pragma once
 
 #include "input/input.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -23,3 +24,5 @@ typedef struct LaiueInputServiceV1
     bool (*wasMouseButtonPressed)(const Input *input, InputMouseButton button);
     void (*getMouseDelta)(const Input *input, int32_t *deltaX, int32_t *deltaY);
 } LaiueInputServiceV1;
+
+const LaiueModuleApiV1 *LaiueInputGetStaticModuleApiV1(void);

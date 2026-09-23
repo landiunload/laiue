@@ -94,4 +94,17 @@ if(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_WINDOWS)
         WINDOWS_LINK
             user32
             gdi32)
+elseif(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND X11_FOUND)
+    laiue_add_module(window
+        RUNTIME_ROLE GRAPHICS
+        SOURCES
+            window_x11.c
+            window.h
+            window_service.h
+            window_module_entry.c
+            time.c
+            time.h
+            ../api.h
+        POSIX_LINK
+            X11::X11)
 endif()

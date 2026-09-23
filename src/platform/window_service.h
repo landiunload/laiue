@@ -1,6 +1,7 @@
 #pragma once
 
 #include "platform/window.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -28,3 +29,5 @@ typedef struct LaiueWindowServiceV1
     void (*setFullscreen)(Window *window, bool enabled);
     bool (*isFullscreen)(const Window *window);
 } LaiueWindowServiceV1;
+
+const LaiueModuleApiV1 *LaiueWindowGetStaticModuleApiV1(void);

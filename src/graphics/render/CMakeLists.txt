@@ -23,6 +23,7 @@ laiue_compile_shader(ui
 # слинкованы в один бинарник; выбор бэкенда при создании делает
 # renderer_dispatch.c.
 find_package(Vulkan QUIET)
+find_package(X11 QUIET)
 
 set(available_sources "")
 set(available_links "")
@@ -83,6 +84,11 @@ elseif(laiue_render_backend_requested STREQUAL "VULKAN")
 else()
     message(FATAL_ERROR
         "LAIUE_RENDER_BACKEND must be AUTO, D3D12 or VULKAN")
+endif()
+
+if(LAIUE_RENDER_HAS_VULKAN_TARGET AND X11_FOUND)
+    list(APPEND backend_links X11::X11)
+    list(APPEND backend_compile_definitions LAIUE_RENDER_HAS_X11)
 endif()
 
 if(NOT backend_compile_definitions)

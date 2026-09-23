@@ -16,7 +16,10 @@ degraded mode at startup. Static/mobile profiles can set
 `LAIUE_WALK_STATIC_WITH_VOXEL=OFF` to omit the voxel artifact at link time;
 the same fallback is then used without changing the application code.
 
-Build it with `-DLAIUE_BUILD_EXAMPLES=ON`. Window/input/graphics/UI adapters
-can register their services around this core without changing the world or
-character code. The current sample is intentionally headless so it also
-validates the no-graphics bootstrap profile.
+Build it with `-DLAIUE_BUILD_EXAMPLES=ON`. On Windows graphics builds the
+same executable starts a small windowed session by default: WASD moves,
+Shift sprints, Space jumps, and Escape closes it. `--headless` is retained for
+CI and validates the no-window/no-render bootstrap profile. Window, input and
+graphics are loaded as optional providers; if an artifact is absent or the
+device cannot be created, the example reports the reason and runs the same
+diagnostic headless check instead.

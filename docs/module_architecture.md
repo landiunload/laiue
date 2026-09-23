@@ -161,6 +161,14 @@ optional flag. Валидатор не открывает файл. После �
 приложение может дополнительно вызвать `LaiueModuleManifestValidateApi`, чтобы
 проверить совпадение манифеста и descriptor, возвращённого DLL.
 
+Для упаковщиков есть bounded-парсер `LaiueModuleManifestParseTextV1` и
+`LaiueModuleManifestParseFileV1`: они разбирают UTF-8 `module.laiue` в
+caller-owned storage, проверяют имена, версии, зависимости и traversal, но не
+открывают `binary` и не исполняют native code. `mod/module_profile.h` содержит
+аналогичный `LaiueModuleProfileParseTextV1` для явных строк `module = ...` и
+`provider = service:module-id`; полученный профиль передаётся в
+`LaiueModuleHostLoadProfileV1`, где выбор provider проверяется до lifecycle.
+
 Это доверенный native code, а не sandbox. Для Windows/Linux/macOS/ARM64 и
 консолей собирается отдельный artifact. На mobile/console profile может
 использовать статический registry вместо dynamic loading.

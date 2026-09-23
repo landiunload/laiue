@@ -2,10 +2,20 @@
 #include "mod/module_host.h"
 #include "platform/system.h"
 #include "voxel/voxel_service.h"
+#if defined(LAIUE_WALK_WINDOWED)
+#include "graphics/graphics_device_service.h"
+#include "render/graphics_service.h"
+#include "input/input_service.h"
+#include "platform/window_service.h"
+#endif
 
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+#if defined(LAIUE_WALK_WINDOWED)
+#include <wchar.h>
+#endif
 
 enum
 {
@@ -371,6 +381,105 @@ static uint32_t WalkSweepAabb(const LaiueCharacterCollisionV1 *collision,
     return 1u;
 }
 
+#if defined(LAIUE_WALK_WINDOWED)
+typedef struct WalkWindowState
+{
+    const LaiueWindowServiceV1 *windowService;
+    const LaiueInputServiceV1 *inputService;
+    const LaiueGraphicsDeviceServiceV1 *graphicsService;
+    const LaiueCharacterServiceV1 *characterService;
+    Window *window;
+    Input *input;
+    LaiueGraphicsDeviceV1 *device;
+    LaiueCharacterControllerV1 *controller;
+    double lastTime;
+    double accumulator;
+    bool failed;
+} WalkWindowState;
+
+static void WalkRawInput(void *opaque, void *rawInput)
+{
+    WalkWindowState *state = (WalkWindowState *)opaque;
+    if (state != NULL && state->inputService != NULL && state->input != NULL &&
+        state->inputService->handleRawInput != NULL)
+        state->inputService->handleRawInput(state->input, rawInput);
+}
+
+static void WalkWindowFrame(void *opaque)
+{
+    WalkWindowState *state = (WalkWindowState *)opaque;
+    if (state == NULL || state->window == NULL || state->input == NULL ||
+        state->device == NULL || state->controller == NULL)
+        return;
+    if (state->windowService->consumeFocusLoss != NULL &&
+        state->windowService->consumeFocusLoss(state->window) != 0 &&
+        state->inputService->resetState != NULL)
+        state->inputService->resetState(state->input);
+    if (state->windowService->consumeResize != NULL &&
+        state->windowService->consumeResize(state->window) != 0)
+    {
+        int32_t width = 0;
+        int32_t height = 0;
+        state->windowService->getClientSize(state->window, &width, &height);
+        if (width > 0 && height > 0)
+            state->graphicsService->resize(state->device, width, height);
+    }
+    if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_ESCAPE))
+    {
+        (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_ESCAPE);
+        state->windowService->requestClose(state->window);
+    }
+    const double now = PlatformMonotonicSeconds();
+    double elapsed = state->lastTime == 0.0 ? 0.0 : now - state->lastTime;
+    state->lastTime = now;
+    if (elapsed < 0.0)
+        elapsed = 0.0;
+    if (elapsed > 0.25)
+        elapsed = 0.25;
+    state->accumulator += elapsed;
+    const double fixedStep = 1.0 / 128.0;
+    uint32_t ticks = 0u;
+    while (state->accumulator >= fixedStep && ticks < 8u)
+    {
+        LaiueCharacterInputV1 input = {0};
+        input.moveX = (state->inputService->isKeyDown(state->input, INPUT_KEY_D) ? 1 : 0) -
+                      (state->inputService->isKeyDown(state->input, INPUT_KEY_A) ? 1 : 0);
+        input.moveY = (state->inputService->isKeyDown(state->input, INPUT_KEY_W) ? 1 : 0) -
+                      (state->inputService->isKeyDown(state->input, INPUT_KEY_S) ? 1 : 0);
+        if (state->inputService->isKeyDown(state->input, INPUT_KEY_SHIFT))
+            input.flags |= LAIUE_CHARACTER_INPUT_SPRINT;
+        if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_SPACE))
+        {
+            input.flags |= LAIUE_CHARACTER_INPUT_JUMP;
+            (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_SPACE);
+        }
+        if (state->characterService->step(state->controller, &input) == 0u)
+        {
+            state->failed = true;
+            state->windowService->requestClose(state->window);
+            break;
+        }
+        state->accumulator -= fixedStep;
+        ++ticks;
+    }
+    if (ticks == 8u && state->accumulator >= fixedStep)
+        state->accumulator = 0.0;
+
+    int32_t width = 0;
+    int32_t height = 0;
+    state->windowService->getClientSize(state->window, &width, &height);
+    if (width > 0 && height > 0 && state->graphicsService->createDevice != NULL)
+    {
+        if (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u)
+            state->failed = true;
+        else if (state->device->endFrame(state->device) == 0u)
+            state->failed = true;
+    }
+    if (state->inputService->endFrame != NULL)
+        state->inputService->endFrame(state->input);
+}
+#endif
+
 #if defined(LAIUE_WALK_DYNAMIC)
 static bool JoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t *root,
                      const wchar_t *name)
@@ -401,9 +510,19 @@ static LaiueModuleStatus LoadWalkModules(
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t characterPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t voxelPath[LAIUE_PLATFORM_PATH_CAPACITY];
+#if defined(LAIUE_WALK_WINDOWED)
+    static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t inputPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
+#endif
 #if defined(_WIN32)
     const wchar_t *characterName = L"laiue_character.dll";
     const wchar_t *voxelName = L"laiue_voxel.dll";
+#if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *windowName = L"laiue_window.dll";
+    const wchar_t *inputName = L"laiue_input.dll";
+    const wchar_t *renderName = L"laiue_render.dll";
+#endif
 #elif defined(__APPLE__)
     const wchar_t *characterName = L"liblaiue_character.dylib";
     const wchar_t *voxelName = L"liblaiue_voxel.dylib";
@@ -415,29 +534,47 @@ static LaiueModuleStatus LoadWalkModules(
         !JoinPath(characterPath, directory, characterName) ||
         !JoinPath(voxelPath, directory, voxelName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
-    LaiueModuleBinaryV1 binaries[] = {
-        {characterPath, 0u, NULL},
-        {voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL},
-    };
+    LaiueModuleBinaryV1 binaries[8];
+    uint32_t binaryCount = 0u;
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){characterPath, 0u, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+#if defined(LAIUE_WALK_WINDOWED)
+    if (!JoinPath(windowPath, directory, windowName) ||
+        !JoinPath(inputPath, directory, inputName) ||
+        !JoinPath(renderPath, directory, renderName))
+        return LAIUE_MODULE_INVALID_ARGUMENT;
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){windowPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+#endif
     LaiueModuleLoadReportInitialize(report, reportEntries,
-                                    (uint32_t)(sizeof(binaries) / sizeof(binaries[0])));
+                                    binaryCount);
     return LaiueModuleHostLoadProfile(
-        host, binaries, (uint32_t)(sizeof(binaries) / sizeof(binaries[0])),
+        host, binaries, binaryCount,
         LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
 #else
     (void)report;
     (void)reportEntries;
-    const LaiueModuleApiV1 *modules[2] = {LaiueCharacterGetStaticModuleApiV1()};
+    const LaiueModuleApiV1 *modules[8] = {LaiueCharacterGetStaticModuleApiV1()};
     uint32_t moduleCount = 1u;
 #if defined(LAIUE_WALK_STATIC_WITH_VOXEL)
     modules[moduleCount++] = LaiueVoxelGetStaticModuleApiV1();
+#endif
+#if defined(LAIUE_WALK_WINDOWED)
+    modules[moduleCount++] = LaiueWindowGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueInputGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueGraphicsGetStaticModuleApiV1();
 #endif
     return LaiueModuleHostLoadStatic(host, modules,
                                      moduleCount, diagnostic);
 #endif
 }
 
-static bool RunWalkExample(void)
+static bool RunWalkExample(bool headless)
 {
     LaiueModuleHostConfigV1 config;
     LaiueModuleHostConfigInitialize(&config);
@@ -449,7 +586,7 @@ static bool RunWalkExample(void)
         return false;
     }
 
-    static LaiueModuleLoadReportEntryV1 reportEntries[2];
+    static LaiueModuleLoadReportEntryV1 reportEntries[8];
     LaiueModuleLoadReportV1 report;
     LaiueModuleStatus moduleStatus =
         LoadWalkModules(host, &report, reportEntries, &diagnostic);
@@ -531,45 +668,129 @@ static bool RunWalkExample(void)
     };
     success = success && character->setPosition(controller, &start, 1u) != 0u;
 
-    LaiueVoxelBlockV1 grass = {0u, 0u};
-    LaiueVoxelCoordV1 grassCoordinate = {0, 0, 0};
-    success = success && walkProvider.getBlock(&walkProvider, &grassCoordinate, &grass) != 0u &&
-              grass.material == 1u;
-    LaiueVoxelBlockV1 air = {0u, 0u};
-    LaiueVoxelCoordV1 airCoordinate = {0, 0, 1};
-    LaiueVoxelBlockV1 earth = {0u, 0u};
-    LaiueVoxelCoordV1 earthCoordinate = {0, 0, -1};
-    LaiueVoxelBlockV1 stone = {0u, 0u};
-    LaiueVoxelCoordV1 stoneCoordinate = {0, 0, -4};
-    success = success && walkProvider.getBlock(&walkProvider, &airCoordinate, &air) != 0u &&
-              air.material == 0u &&
-              walkProvider.getBlock(&walkProvider, &earthCoordinate, &earth) != 0u &&
-              earth.material == 2u &&
-              walkProvider.getBlock(&walkProvider, &stoneCoordinate, &stone) != 0u &&
-              stone.material == 3u;
-    /* One jump takes a little over one second with the fixed-point gravity
-     * constants. Run two fixed-step seconds so the smoke test observes both
-     * the airborne path and a deterministic landing on z=0. */
-    for (uint32_t tick = 0u; success && tick < LAIUE_CHARACTER_TICK_HZ * 2u; ++tick)
+    bool ranWindow = false;
+#if defined(LAIUE_WALK_WINDOWED)
+    if (!headless)
     {
-        LaiueCharacterInputV1 input = {
-            .moveX = 1,
-            .moveY = 0,
-            .flags = LAIUE_CHARACTER_INPUT_SPRINT |
-                     (tick == 0u ? LAIUE_CHARACTER_INPUT_JUMP : 0u),
-        };
-        success = character->step(controller, &input) != 0u;
+        const LaiueWindowServiceV1 *windowService =
+            (const LaiueWindowServiceV1 *)LaiueModuleHostQueryService(
+                host, LAIUE_WINDOW_SERVICE_NAME, LAIUE_WINDOW_SERVICE_ABI_VERSION_1,
+                sizeof(LaiueWindowServiceV1), NULL, NULL);
+        const LaiueInputServiceV1 *inputService =
+            (const LaiueInputServiceV1 *)LaiueModuleHostQueryService(
+                host, LAIUE_INPUT_SERVICE_NAME, LAIUE_INPUT_SERVICE_ABI_VERSION_1,
+                sizeof(LaiueInputServiceV1), NULL, NULL);
+        const LaiueGraphicsDeviceServiceV1 *graphicsService =
+            (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
+                host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+                LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
+                sizeof(LaiueGraphicsDeviceServiceV1), NULL, NULL);
+        if (windowService != NULL && inputService != NULL && graphicsService != NULL &&
+            windowService->create != NULL && inputService->create != NULL &&
+            graphicsService->createDevice != NULL)
+        {
+            WindowConfiguration windowConfiguration = {
+                .title = L"LAIUE Walk",
+                .width = 1280,
+                .height = 720,
+            };
+            Window *window = windowService->create(&windowConfiguration);
+            Input *input = window == NULL ? NULL :
+                inputService->create(windowService->getNativeHandle(window));
+            LaiueGraphicsDeviceV1 *device = NULL;
+            if (window != NULL && input != NULL)
+            {
+                windowService->setRawInputCallback(window, WalkRawInput, NULL);
+                if (graphicsService->createDevice(
+                        windowService->getNativeHandle(window), 1280, 720,
+                        LAIUE_GRAPHICS_BACKEND_AUTO, &device) == 0u)
+                    device = NULL;
+                /* The callback context is installed after the state is
+                 * complete, so the window never observes a half-built input. */
+            }
+            if (window != NULL && input != NULL && device != NULL)
+            {
+                WalkWindowState state = {
+                    .windowService = windowService,
+                    .inputService = inputService,
+                    .graphicsService = graphicsService,
+                    .characterService = character,
+                    .window = window,
+                    .input = input,
+                    .device = device,
+                    .controller = controller,
+                    .lastTime = PlatformMonotonicSeconds(),
+                };
+                windowService->setRawInputCallback(window, WalkRawInput, &state);
+                windowService->setMouseLook(window, false);
+                PlatformWriteConsoleUtf8(
+                    "laiue walk: windowed mode (WASD, Shift, Space, Esc)\n");
+                windowService->runLoop(window, WalkWindowFrame, &state);
+                success = success && !state.failed;
+                ranWindow = true;
+                if (!state.failed)
+                    PlatformWriteConsoleUtf8("laiue walk: windowed session ended cleanly\n");
+                graphicsService->destroyDevice(device);
+            }
+            else
+            {
+                PlatformWriteConsoleUtf8(
+                    "laiue walk: graphics/window unavailable; using diagnostic headless mode\n");
+                if (device != NULL)
+                    graphicsService->destroyDevice(device);
+            }
+            if (input != NULL)
+                inputService->destroy(input);
+            if (window != NULL)
+                windowService->destroy(window);
+        }
+        else
+            PlatformWriteConsoleUtf8(
+                "laiue walk: graphics/window modules missing; using diagnostic headless mode\n");
     }
-    LaiueCharacterPositionV1 end = {0};
-    success = success && character->getPosition(controller, &end) != 0u &&
-              character->isGrounded(controller) != 0u;
-    if (success)
+#endif
+    if (!ranWindow)
     {
-        PlatformWriteConsoleUtf8("laiue walk: SDK character/voxel graph passed\n");
-        PlatformWriteConsoleUtf8(end.cellX != start.cellX
-                                     ? "laiue walk: infinite-coordinate rebase passed\n"
-                                     : "laiue walk: infinite-coordinate rebase failed\n");
-        success = end.cellX != start.cellX;
+        LaiueVoxelBlockV1 grass = {0u, 0u};
+        LaiueVoxelCoordV1 grassCoordinate = {0, 0, 0};
+        success = success && walkProvider.getBlock(&walkProvider, &grassCoordinate, &grass) != 0u &&
+                  grass.material == 1u;
+        LaiueVoxelBlockV1 air = {0u, 0u};
+        LaiueVoxelCoordV1 airCoordinate = {0, 0, 1};
+        LaiueVoxelBlockV1 earth = {0u, 0u};
+        LaiueVoxelCoordV1 earthCoordinate = {0, 0, -1};
+        LaiueVoxelBlockV1 stone = {0u, 0u};
+        LaiueVoxelCoordV1 stoneCoordinate = {0, 0, -4};
+        success = success && walkProvider.getBlock(&walkProvider, &airCoordinate, &air) != 0u &&
+                  air.material == 0u &&
+                  walkProvider.getBlock(&walkProvider, &earthCoordinate, &earth) != 0u &&
+                  earth.material == 2u &&
+                  walkProvider.getBlock(&walkProvider, &stoneCoordinate, &stone) != 0u &&
+                  stone.material == 3u;
+        /* One jump takes a little over one second with the fixed-point gravity
+         * constants. Run two fixed-step seconds so the smoke test observes both
+         * the airborne path and a deterministic landing on z=0. */
+        for (uint32_t tick = 0u; success && tick < LAIUE_CHARACTER_TICK_HZ * 2u; ++tick)
+        {
+            LaiueCharacterInputV1 input = {
+                .moveX = 1,
+                .moveY = 0,
+                .flags = LAIUE_CHARACTER_INPUT_SPRINT |
+                         (tick == 0u ? LAIUE_CHARACTER_INPUT_JUMP : 0u),
+            };
+            success = character->step(controller, &input) != 0u;
+        }
+        LaiueCharacterPositionV1 end = {0};
+        success = success && character->getPosition(controller, &end) != 0u &&
+                  character->isGrounded(controller) != 0u;
+        if (success)
+        {
+            PlatformWriteConsoleUtf8("laiue walk: SDK character/voxel graph passed\n");
+            PlatformWriteConsoleUtf8(end.cellX != start.cellX
+                                         ? "laiue walk: infinite-coordinate rebase passed\n"
+                                         : "laiue walk: infinite-coordinate rebase failed\n");
+            success = end.cellX != start.cellX;
+        }
     }
 
     if (controller != NULL && character->destroy != NULL)
@@ -583,14 +804,30 @@ static bool RunWalkExample(void)
 
 #if defined(_WIN32)
 __declspec(dllimport) __declspec(noreturn) void __stdcall ExitProcess(unsigned int);
+__declspec(dllimport) const wchar_t *__stdcall GetCommandLineW(void);
+
+static bool WalkHeadlessArgument(void)
+{
+    const wchar_t *commandLine = GetCommandLineW();
+    if (commandLine == NULL)
+        return false;
+    for (uint32_t index = 0u; commandLine[index] != L'\0'; ++index)
+        if (commandLine[index] == L'-' && commandLine[index + 1u] == L'-' &&
+            commandLine[index + 2u] == L'h' && commandLine[index + 3u] == L'e' &&
+            commandLine[index + 4u] == L'a' && commandLine[index + 5u] == L'd' &&
+            commandLine[index + 6u] == L'l' && commandLine[index + 7u] == L'e' &&
+            commandLine[index + 8u] == L's' && commandLine[index + 9u] == L's')
+            return true;
+    return false;
+}
 
 void WalkExampleEntryPoint(void)
 {
-    ExitProcess(RunWalkExample() ? 0u : 1u);
+    ExitProcess(RunWalkExample(WalkHeadlessArgument()) ? 0u : 1u);
 }
 #else
 int main(void)
 {
-    return RunWalkExample() ? 0 : 1;
+    return RunWalkExample(true) ? 0 : 1;
 }
 #endif

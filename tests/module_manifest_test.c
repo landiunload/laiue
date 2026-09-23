@@ -1,4 +1,5 @@
 #include "mod/module_manifest.h"
+#include "mod/module_profile.h"
 #include "test_runtime.h"
 
 #include <stddef.h>
@@ -61,5 +62,53 @@ LAIUE_TEST_ENTRY(ModuleManifestTestEntryPoint)
     Expect(LaiueModuleManifestValidateApi(&unsafe, &api, &diagnostic) ==
                LAIUE_MODULE_DESCRIPTOR_INVALID,
            "manifest identity mismatch is rejected");
+
+    static const char text[] =
+        "# comments are ignored\n"
+        "LAIUE MODULE 1\n"
+        "id = example.renderer\n"
+        "author = example.author\n"
+        "version = 1.0.0\n"
+        "platform = windows-x86_64\n"
+        "binary = example_renderer.dll\n"
+        "provides = example.graphics:1\n"
+        "requires = example.window:2\n"
+        "optional = false\n";
+    static LaiueModuleManifestStorageV1 storage;
+    Expect(LaiueModuleManifestParseTextV1(text, (uint32_t)(sizeof(text) - 1u),
+                                           &storage, &diagnostic) == LAIUE_MODULE_OK,
+           "text module manifest parses without loading an artifact");
+    Expect(storage.manifest.providesCount == 1u && storage.manifest.requiresCount == 1u &&
+               storage.manifest.requiresServices[0].minimumVersion == 2u,
+           "text manifest preserves service versions");
+    static const char malformed[] =
+        "LAIUE MODULE 1\n"
+        "id = example.renderer\n"
+        "author = example.author\n"
+        "version = 1.0.0\n"
+        "platform = windows-x86_64\n"
+        "binary = ../renderer.dll\n";
+    Expect(LaiueModuleManifestParseTextV1(malformed, (uint32_t)(sizeof(malformed) - 1u),
+                                          &storage, &diagnostic) ==
+               LAIUE_MODULE_DESCRIPTOR_INVALID,
+           "text manifest rejects traversal before artifact loading");
+
+    static const char profileText[] =
+        "LAIUE PROFILE 1\n"
+        "flags = partial\n"
+        "module = laiue_character.dll\n"
+        "module = laiue_voxel.dll optional\n"
+        "provider = laiue.graphics.device:laiue.graphics\n";
+    static LaiueModuleProfileStorageV1 profileStorage;
+    LaiueModuleDiagnostic profileDiagnostic;
+    Expect(LaiueModuleProfileParseTextV1(
+               profileText, (uint32_t)(sizeof(profileText) - 1u),
+               &profileStorage, &profileDiagnostic) == LAIUE_MODULE_OK,
+           "application profile parses without opening modules");
+    Expect(profileStorage.profile.flags == LAIUE_MODULE_PROFILE_ALLOW_PARTIAL &&
+               profileStorage.profile.binaryCount == 2u &&
+               (profileStorage.profile.binaries[1].flags & LAIUE_MODULE_BINARY_OPTIONAL) != 0u &&
+               profileStorage.profile.providerSelectionCount == 1u,
+           "profile parser preserves optional modules and provider choices");
     LAIUE_TEST_SUCCESS();
 }

@@ -10,6 +10,16 @@
 // поэтому окон может быть сколько угодно и глобальных переменных нет.
 typedef struct Window Window;
 
+/* Native surface payload used by non-Win32 presentation providers.  On
+ * Windows WindowGetNativeHandle returns the HWND directly; on X11 it returns
+ * a pointer to this pair so a Vulkan provider can create an Xlib surface
+ * without importing the window implementation DLL. */
+typedef struct LaiueWindowNativeHandleV1
+{
+    void *display;
+    uintptr_t window;
+} LaiueWindowNativeHandleV1;
+
 typedef struct WindowConfiguration
 {
     const wchar_t* title;
