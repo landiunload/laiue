@@ -7,6 +7,7 @@
 #include "audio/audio.h"
 #include "audio/audio_backend.h"
 #include "audio/audio_offscreen.h"
+#include "audio/audio_output_service.h"
 #include "math/scalar.h"
 #include "platform/system.h"
 
@@ -19,6 +20,13 @@
 // щелчок и не уводил интерполяцию за границы буфера.
 #define AUDIO_MIN_SPEED 0.05f
 #define AUDIO_MAX_SPEED 16.0f
+
+static const LaiueAudioOutputServiceV1 *g_audioOutputService;
+
+void AudioMixerSetOutputService(const LaiueAudioOutputServiceV1 *service)
+{
+    g_audioOutputService = service;
+}
 
 static float ClampFloat(float value, float minimum, float maximum)
 {
@@ -96,7 +104,12 @@ typedef struct AudioCommand
 
 struct AudioDevice
 {
-    AudioBackend *backend;
+    // Offscreen is owned by the mixer. System output is an optional
+    // provider and is deliberately held as an opaque handle/table pair so
+    // this module has no platform-backend imports.
+    AudioBackend *offscreenBackend;
+    const LaiueAudioOutputServiceV1 *outputService;
+    LaiueAudioOutputBackend *outputBackend;
     AudioBackendKind backendKind;
     uint32_t sampleRate;
 
@@ -529,6 +542,9 @@ AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
         .masterVolume = 1.0f,
     };
     if (configuration != NULL) resolved = *configuration;
+    if (resolved.backend != AUDIO_BACKEND_SYSTEM &&
+        resolved.backend != AUDIO_BACKEND_OFFSCREEN)
+        return AUDIO_RESULT_INVALID_ARGUMENT;
 
     AudioDevice *device = PlatformAllocate(sizeof(*device), true);
     if (device == NULL) return AUDIO_RESULT_OUT_OF_MEMORY;
@@ -549,16 +565,62 @@ AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
         .context = device,
     };
     device->backendKind = resolved.backend;
-    bool created = resolved.backend == AUDIO_BACKEND_OFFSCREEN
-                       ? AudioOffscreenBackendCreate(&description, &device->backend)
-                       : AudioSystemBackendCreate(&description, &device->backend);
+    bool created = false;
+    if (resolved.backend == AUDIO_BACKEND_OFFSCREEN)
+    {
+        created = AudioOffscreenBackendCreate(&description, &device->offscreenBackend);
+    }
+    else if (g_audioOutputService != NULL && g_audioOutputService->create != NULL)
+    {
+        LaiueAudioOutputDescription outputDescription = {
+            .sampleRate = description.sampleRate,
+            .frameCountHint = description.frameCountHint,
+            .render = description.render,
+            .context = description.context,
+        };
+        created = g_audioOutputService->create(&outputDescription, &device->outputBackend) != 0u &&
+                  device->outputBackend != NULL;
+        if (created)
+        {
+            device->outputService = g_audioOutputService;
+            if (device->outputService->sampleRate == NULL ||
+                device->outputService->channelCount == NULL ||
+                device->outputService->bufferFrameCount == NULL ||
+                device->outputService->underrunCount == NULL)
+            {
+                if (device->outputService->destroy != NULL)
+                    device->outputService->destroy(device->outputBackend);
+                device->outputService = NULL;
+                device->outputBackend = NULL;
+                created = false;
+            }
+        }
+    }
     if (!created)
     {
         AudioDeviceDestroy(device);
         return AUDIO_RESULT_BACKEND_INITIALIZATION_FAILED;
     }
 
-    device->sampleRate = device->backend->sampleRate;
+    if (resolved.backend == AUDIO_BACKEND_OFFSCREEN)
+    {
+        device->sampleRate = device->offscreenBackend->sampleRate;
+    }
+    else
+    {
+        device->sampleRate = device->outputService->sampleRate(device->outputBackend);
+        uint32_t channelCount = device->outputService->channelCount(device->outputBackend);
+        uint32_t bufferFrameCount =
+            device->outputService->bufferFrameCount(device->outputBackend);
+        if (device->sampleRate == 0u || channelCount == 0u || bufferFrameCount == 0u)
+        {
+            device->outputService->destroy(device->outputBackend);
+            device->outputService = NULL;
+            device->outputBackend = NULL;
+            AudioDeviceDestroy(device);
+            return AUDIO_RESULT_BACKEND_INITIALIZATION_FAILED;
+        }
+    }
     *outDevice = device;
     return AUDIO_RESULT_OK;
 }
@@ -568,7 +630,11 @@ void AudioDeviceDestroy(AudioDevice *device)
     if (device == NULL) return;
     // Бэкенд разрушается первым: после этого поток вывода не работает и
     // остальное состояние можно освобождать без синхронизации.
-    if (device->backend != NULL) device->backend->vtable->destroy(device->backend);
+    if (device->offscreenBackend != NULL)
+        device->offscreenBackend->vtable->destroy(device->offscreenBackend);
+    if (device->outputBackend != NULL && device->outputService != NULL &&
+        device->outputService->destroy != NULL)
+        device->outputService->destroy(device->outputBackend);
     // Поток вывода остановлен, поэтому отложенные клипы можно освободить
     // безусловно: смотреть на них больше некому.
     ReleaseRetiredClips(device, true);
@@ -594,11 +660,25 @@ bool AudioDeviceGetStats(const AudioDevice *device, AudioDeviceStats *outStats)
     if (device == NULL || outStats == NULL) return false;
     outStats->sampleRate = device->sampleRate;
     outStats->channelCount = AUDIO_MIX_CHANNELS;
-    outStats->bufferFrameCount = device->backend != NULL ? device->backend->bufferFrameCount : 0u;
+    outStats->bufferFrameCount = device->backendKind == AUDIO_BACKEND_OFFSCREEN
+                                     ? (device->offscreenBackend != NULL
+                                            ? device->offscreenBackend->bufferFrameCount
+                                            : 0u)
+                                     : (device->outputBackend != NULL &&
+                                                device->outputService != NULL
+                                            ? device->outputService->bufferFrameCount(
+                                                  device->outputBackend)
+                                            : 0u);
     outStats->activeVoices = PlatformAtomicLoadU32Acquire(&device->activeVoices);
     outStats->droppedCommands = (uint64_t)PlatformAtomicLoadI64(&device->droppedCommands);
-    outStats->underruns =
-        device->backend != NULL ? device->backend->vtable->underrunCount(device->backend) : 0u;
+    outStats->underruns = device->backendKind == AUDIO_BACKEND_OFFSCREEN
+                              ? (device->offscreenBackend != NULL
+                                     ? device->offscreenBackend->vtable->underrunCount(
+                                           device->offscreenBackend)
+                                     : 0u)
+                              : (device->outputBackend != NULL && device->outputService != NULL
+                                     ? device->outputService->underrunCount(device->outputBackend)
+                                     : 0u);
     outStats->mixedFrames = (uint64_t)PlatformAtomicLoadI64(&device->mixedFrames);
     return true;
 }
@@ -855,7 +935,8 @@ bool AudioDeviceRenderFrames(AudioDevice *device, float *outFrames, uint32_t fra
     if (device == NULL || outFrames == NULL || frameCount == 0u) return false;
     // У системного бэкенда кадры готовит его собственный поток вывода;
     // вызов отсюда наложился бы на него и испортил и микс, и статистику.
-    if (device->backend == NULL || device->backendKind != AUDIO_BACKEND_OFFSCREEN) return false;
+    if (device->offscreenBackend == NULL || device->backendKind != AUDIO_BACKEND_OFFSCREEN)
+        return false;
     RenderFrames(device, outFrames, frameCount);
     return true;
 }

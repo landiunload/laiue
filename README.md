@@ -41,7 +41,7 @@ runtime-сервисы с единым C ABI.
 | `physics` | переносимые AABB и столкновения с вокселями |
 | `mod` | discovery, ABI v1, versioned services и жизненный цикл нативных модов |
 | `window`, `input` | Windows-окно и Raw Input |
-| `audio` | микшер голосов и звукопаки; WASAPI на Windows, ALSA на Linux |
+| `audio` | PCM-микшер и offscreen provider; системный вывод вынесен в `audio_output`, звукопаки — в `audio_pack` |
 | `mesh` | greedy meshing чанков `64³` |
 | `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
 | `scene` | камера, матрицы и panorama |

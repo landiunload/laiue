@@ -1,18 +1,21 @@
 #pragma once
 
+#include "audio/audio_output_service.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
-// Внутренняя граница вывода. Микшер знает только этот контракт и потому
-// собирается и проверяется без звуковой подсистемы; системный бэкенд
-// (WASAPI, ALSA) и offscreen подставляются на этапе сборки.
+// Внутренняя граница offscreen-вывода. Микшер знает только этот контракт и
+// потому собирается и проверяется без звуковой подсистемы. Системный
+// бэкенд (WASAPI, ALSA) использует тот же layout внутри отдельного
+// `audio_output` provider-а и наружу отдаётся только versioned service table.
 //
 // Заголовок в SDK не устанавливается: это контракт между файлами модуля,
 // а не часть публичного API.
 
 // Вызывается потоком вывода. Обязан заполнить frameCount кадров стерео
 // float в диапазоне [-1, 1] и не выполнять блокирующих операций.
-typedef void (*AudioRenderCallback)(void *context, float *frames, uint32_t frameCount);
+typedef LaiueAudioOutputRenderFn AudioRenderCallback;
 
 typedef struct AudioBackend AudioBackend;
 

@@ -503,15 +503,20 @@ if(TARGET laiue_audio)
 
     # Системный вывод проверяется отдельно и беззвучно. Там, где
     # звукового устройства нет, тест сообщает о пропуске кодом 125.
-    add_executable(laiue_audio_system_backend_test audio_system_backend_test.c)
-    target_link_libraries(laiue_audio_system_backend_test PRIVATE laiue_audio)
-    laiue_configure_standalone_executable(
-        laiue_audio_system_backend_test AudioSystemBackendTestEntryPoint)
-    add_test(NAME laiue.audio.system_backend
-        COMMAND laiue_audio_system_backend_test)
-    set_tests_properties(laiue.audio.system_backend PROPERTIES
-        SKIP_RETURN_CODE 125
-        TIMEOUT 30)
+    if(TARGET laiue_audio_output AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_audio_system_backend_test audio_system_backend_test.c)
+        target_link_libraries(laiue_audio_system_backend_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_audio_system_backend_test PRIVATE LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_audio_system_backend_test AudioSystemBackendTestEntryPoint)
+        add_dependencies(laiue_audio_system_backend_test laiue_audio laiue_audio_output)
+        add_test(NAME laiue.audio.system_backend
+            COMMAND laiue_audio_system_backend_test)
+        set_tests_properties(laiue.audio.system_backend PROPERTIES
+            SKIP_RETURN_CODE 125
+            TIMEOUT 30)
+    endif()
 endif()
 
 if(TARGET laiue_media_support)

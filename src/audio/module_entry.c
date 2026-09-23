@@ -1,6 +1,9 @@
 #include "audio/audio_service.h"
+#include "audio/audio_mixer_internal.h"
+#include "audio/audio_output_service.h"
 
 static LaiueModuleHostV1 const *moduleHost;
+static const LaiueAudioOutputServiceV1 *moduleOutput;
 
 static uint32_t DeviceCreate(const AudioDeviceConfiguration *configuration,
                              AudioDevice **outDevice)
@@ -98,9 +101,11 @@ static const LaiueAudioServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
     moduleHost = host;
+    moduleOutput = NULL;
+    AudioMixerSetOutputService(NULL);
     *outContext = (void *)&moduleHost;
     return 1u;
 }
@@ -108,16 +113,35 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 static uint32_t ModuleStart(void *context)
 {
     (void)context;
+    if (moduleHost == NULL || moduleHost->queryService == NULL) return 0u;
+    uint32_t outputVersion = 0u;
+    uint32_t outputSize = 0u;
+    moduleOutput = (const LaiueAudioOutputServiceV1 *)moduleHost->queryService(
+        moduleHost->context, LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
+        LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1, sizeof(LaiueAudioOutputServiceV1),
+        &outputVersion, &outputSize);
+    if (moduleOutput != NULL &&
+        (outputVersion < LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 ||
+         outputSize < sizeof(*moduleOutput) || moduleOutput->create == NULL ||
+         moduleOutput->destroy == NULL || moduleOutput->sampleRate == NULL ||
+         moduleOutput->channelCount == NULL || moduleOutput->bufferFrameCount == NULL ||
+         moduleOutput->underrunCount == NULL))
+    {
+        moduleOutput = NULL;
+        return 0u;
+    }
+    AudioMixerSetOutputService(moduleOutput);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_AUDIO_SERVICE_NAME,
         .version = LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
         .table = &service,
         .tableSize = sizeof(service),
     };
-    return moduleHost != NULL &&
-                   moduleHost->publishService(moduleHost->context, &published) == LAIUE_MODULE_OK
-               ? 1u
-               : 0u;
+    if (moduleHost->publishService(moduleHost->context, &published) == LAIUE_MODULE_OK)
+        return 1u;
+    AudioMixerSetOutputService(NULL);
+    moduleOutput = NULL;
+    return 0u;
 }
 
 static void ModuleStop(void *context)
@@ -125,15 +149,22 @@ static void ModuleStop(void *context)
     (void)context;
     if (moduleHost != NULL && moduleHost->unpublishService != NULL)
         (void)moduleHost->unpublishService(moduleHost->context, LAIUE_AUDIO_SERVICE_NAME);
+    AudioMixerSetOutputService(NULL);
+    moduleOutput = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
     (void)context;
+    AudioMixerSetOutputService(NULL);
+    moduleOutput = NULL;
     moduleHost = NULL;
 }
 
 static const char *const provides[] = {LAIUE_AUDIO_SERVICE_NAME};
+static const LaiueModuleRequirementV1 optionalServices[] = {
+    {LAIUE_AUDIO_OUTPUT_SERVICE_NAME, LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1},
+};
 
 static const LaiueModuleApiV1 api = {
     .structSize = sizeof(LaiueModuleApiV1),
@@ -145,6 +176,9 @@ static const LaiueModuleApiV1 api = {
         .version = "1.0.0",
         .providesServices = provides,
         .providesCount = 1u,
+        .optionalServices = optionalServices,
+        .optionalCount = sizeof(optionalServices) / sizeof(optionalServices[0]),
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
     },
     .create = ModuleCreate,
     .start = ModuleStart,

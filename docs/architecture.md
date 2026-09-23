@@ -27,10 +27,10 @@
 | `mod` | discovery паков, native ABI и registry versioned services |
 | `window` | Win32-окно и message loop |
 | `input` | Raw Input клавиатуры и мыши |
-| `audio` | асинхронное воспроизведение; WASAPI на Windows, ALSA на Linux |
+| `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
 | `mesh` | greedy meshing областей `World` |
 | `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры |
-| `scene` | камера, chunk streaming, panorama и voxel raycast |
+| `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |
 | `ui` | immediate-mode UI поверх `render` |
 
 Первые пять модулей образуют переносимое ядро. Полный графический набор
@@ -56,7 +56,8 @@ external application
 ```
 
 `window` и `input` находятся на Windows-границе и не нужны Linux core;
-`audio` собирается и там, получая ALSA-вывод через платформенный контракт.
+`audio_output` — отдельный optional provider, поэтому `audio` остаётся
+работоспособным с offscreen даже при удалённом системном выводе.
 Нижние модули не включают заголовки `scene` или `ui`.
 Допустимый include/link-граф задан в `src/*/CMakeLists.txt` и проверяется
 архитектурным тестом.

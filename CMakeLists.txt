@@ -36,11 +36,13 @@ option(LAIUE_BUILD_GRAPHICS
     "Build the window/input/mesher/render/scene graphics layer"
     ${_laiue_graphics_default})
 
-# Audio and UI are technology modules in their own right.  UI does not require
+# Audio mixer, platform output, and UI are technology modules in their own
+# right. UI does not require
 # a renderer at compile time, but its runtime service graph explicitly
 # requires laiue.graphics; headless profiles can still build it and omit it
 # from the selected module profile.
-option(LAIUE_BUILD_AUDIO "Build the audio mixer and system/offscreen output" ON)
+option(LAIUE_BUILD_AUDIO "Build the audio mixer and deterministic offscreen output" ON)
+option(LAIUE_BUILD_AUDIO_OUTPUT "Build the optional WASAPI/ALSA audio output provider" ON)
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 
@@ -95,7 +97,7 @@ add_subdirectory(src/assets/content)
 add_subdirectory(src/simulation/character)
 add_subdirectory(src/simulation/voxel)
 add_subdirectory(src/modding/mod)
-if(LAIUE_BUILD_AUDIO OR LAIUE_BUILD_AUDIO_PACK)
+if(LAIUE_BUILD_AUDIO OR LAIUE_BUILD_AUDIO_OUTPUT OR LAIUE_BUILD_AUDIO_PACK)
     add_subdirectory(src/audio)
 endif()
 if(LAIUE_BUILD_UI)
@@ -285,6 +287,12 @@ if(TARGET laiue_audio)
             "${PROJECT_SOURCE_DIR}/src/audio/audio.h"
             "${PROJECT_SOURCE_DIR}/src/audio/audio_offscreen.h"
             "${PROJECT_SOURCE_DIR}/src/audio/audio_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_audio_output)
+    install(FILES
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_output_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
         COMPONENT Engine)
 endif()

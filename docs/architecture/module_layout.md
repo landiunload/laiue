@@ -13,7 +13,7 @@ logical include names (`physics/...`, `render/...`, and so on).
 | `src/simulation/` | `world`, `physics`, `character`, `voxel` | world coordinates, deterministic simulation and voxel provider |
 | `src/modding/` | `mod` | bootstrap-compatible native module ABI and host |
 | `src/platform/` | `platform`, `window` | OS boundary and window implementation |
-| `src/audio/` | `audio`, `audio_pack` | mixer/output and optional sound-pack provider |
+| `src/audio/` | `audio`, `audio_output`, `audio_pack` | mixer/offscreen core, optional platform output provider, and optional sound-pack provider |
 | `src/ui/` | `ui` | backend-neutral UI draw lists |
 | `src/numeric/` | `numeric` | infinite-coordinate service provider |
 

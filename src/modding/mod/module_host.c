@@ -342,6 +342,12 @@ static bool RequiredServicesReady(LaiueModuleHost *host, const LoadedModule *mod
     return true;
 }
 
+static bool DescriptorHasOptionalServices(const LaiueModuleDescriptorV1 *descriptor)
+{
+    return descriptor != NULL &&
+           descriptor->optionalMagic == LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC;
+}
+
 static void RemoveOwnedServices(LaiueModuleHost *host, uint32_t owner)
 {
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
@@ -526,6 +532,26 @@ static bool HasPotentialProvider(const LaiueModuleHost *host, uint32_t moduleCou
     return false;
 }
 
+static bool OptionalServicesReady(LaiueModuleHost *host, const LoadedModule *module,
+                                  uint32_t moduleCount)
+{
+    const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
+    if (!DescriptorHasOptionalServices(descriptor)) return true;
+    for (uint32_t index = 0u; index < descriptor->optionalCount; ++index)
+    {
+        const LaiueModuleRequirementV1 *optional = &descriptor->optionalServices[index];
+        uint32_t version = 0u;
+        if (ApiQuery((void *)module, optional->name, optional->minimumVersion, 1u, &version,
+                     NULL) != NULL)
+            continue;
+        /* If a selected module can publish the optional service, defer this
+         * consumer until that provider has started. If no provider was
+         * selected, absence is the documented fallback path. */
+        if (HasPotentialProvider(host, moduleCount, optional->name)) return false;
+    }
+    return true;
+}
+
 static bool HasProviderConflict(const LaiueModuleHost *host, uint32_t moduleCount)
 {
     /* Resolve provider choice before invoking user code. A duplicate service
@@ -682,6 +708,21 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
             End(host);
             return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID, "module dependency arrays are invalid");
         }
+        uint32_t optionalCount = DescriptorHasOptionalServices(descriptor)
+                                     ? descriptor->optionalCount
+                                     : 0u;
+        const LaiueModuleRequirementV1 *optionalServices =
+            DescriptorHasOptionalServices(descriptor) ? descriptor->optionalServices : NULL;
+        if ((optionalCount != 0u && optionalServices == NULL) ||
+            optionalCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
+            (DescriptorHasOptionalServices(descriptor) && descriptor->optionalReserved != 0u))
+        {
+            PlatformDynamicLibraryClose(library);
+            Rollback(host, moduleCount);
+            End(host);
+            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
+                        "module optional dependency arrays are invalid");
+        }
         for (uint32_t requirement = 0u; requirement < descriptor->requiresCount; ++requirement)
         {
             const LaiueModuleRequirementV1 *required = &descriptor->requiresServices[requirement];
@@ -692,6 +733,18 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
                 End(host);
                 return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
                             "module service requirement is invalid");
+            }
+        }
+        for (uint32_t requirement = 0u; requirement < optionalCount; ++requirement)
+        {
+            const LaiueModuleRequirementV1 *optional = &optionalServices[requirement];
+            if (optional->minimumVersion == 0u || !SafeName(optional->name))
+            {
+                PlatformDynamicLibraryClose(library);
+                Rollback(host, moduleCount);
+                End(host);
+                return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
+                            "module optional service requirement is invalid");
             }
         }
         for (uint32_t provided = 0u; provided < descriptor->providesCount; ++provided)
@@ -740,7 +793,8 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
         {
             uint32_t index = indices[order];
             LoadedModule *module = &host->modules[index];
-            if (module->created || !RequiredServicesReady(host, module))
+            if (module->created || !RequiredServicesReady(host, module) ||
+                !OptionalServicesReady(host, module, moduleCount))
                 continue;
             BuildApi(host, module);
             if (!module->api->create(&module->hostApi, &module->context))

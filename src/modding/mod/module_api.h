@@ -15,6 +15,7 @@
 #define LAIUE_MODULE_ABI_VERSION_CURRENT LAIUE_MODULE_ABI_VERSION_1
 #define LAIUE_MODULE_ENTRY_NAME_V1 "LaiueModuleGetApiV1"
 #define LAIUE_MODULE_MAX_NAME 96u
+#define LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC UINT32_C(0x4C41494F)
 
 #if defined(_WIN32)
 #define LAIUE_MODULE_CALL __cdecl
@@ -112,7 +113,21 @@ typedef struct LaiueModuleDescriptorV1
     uint32_t requiresCount;
     const char *const *providesServices;
     uint32_t providesCount;
-    uintptr_t reserved[4];
+    /* The union deliberately keeps the original descriptor size and offsets.
+     * Optional dependencies use reserved storage plus a magic marker, so a
+     * host built today can still call a V1 binary built before this field was
+     * introduced. */
+    union
+    {
+        uintptr_t reserved[4];
+        struct
+        {
+            const LaiueModuleRequirementV1 *optionalServices;
+            uint32_t optionalCount;
+            uint32_t optionalReserved;
+            uint32_t optionalMagic;
+        };
+    };
 } LaiueModuleDescriptorV1;
 
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueModuleCreateFn)(const LaiueModuleHostV1 *host,
