@@ -43,6 +43,18 @@ laiue_configure_standalone_executable(
 add_test(NAME laiue.platform.threading
     COMMAND laiue_platform_threading_test)
 
+add_executable(laiue_walk_runtime_test
+    walk_runtime_test.c
+    "${PROJECT_SOURCE_DIR}/examples/walk/walk.c")
+target_compile_definitions(laiue_walk_runtime_test PRIVATE
+    LAIUE_WALK_RUNTIME_ONLY=1)
+target_include_directories(laiue_walk_runtime_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/examples/walk")
+laiue_configure_standalone_executable(
+    laiue_walk_runtime_test WalkRuntimeTestEntryPoint)
+add_test(NAME laiue.example.walk_runtime COMMAND laiue_walk_runtime_test)
+
 add_executable(laiue_task_pool_test task_pool_test.c)
 target_link_libraries(laiue_task_pool_test PRIVATE laiue::task laiue::platform_support)
 laiue_configure_standalone_executable(laiue_task_pool_test TaskPoolTestEntryPoint)

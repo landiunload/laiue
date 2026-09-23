@@ -214,7 +214,12 @@ static uint32_t WalkSweepAxis(const LaiueVoxelProviderV1 *provider,
     if (provider == NULL || position == NULL || outPosition == NULL || outCollided == NULL ||
         halfExtent < 0)
         return 0u;
-    *outPosition = *position;
+    /* The public caller intentionally reuses one position buffer for the
+     * three sequential axes.  Keep an immutable start snapshot so aliasing
+     * position/outPosition cannot erase the swept interval before it is
+     * inspected. */
+    const LaiueCharacterPositionV1 startPosition = *position;
+    *outPosition = startPosition;
     *outCollided = 0u;
     if (!AddWalkAxis(outPosition, axis, delta))
         return 0u;
@@ -222,13 +227,38 @@ static uint32_t WalkSweepAxis(const LaiueVoxelProviderV1 *provider,
         return 1u;
 
     int64_t startCenterBlock = 0;
-    if (!WalkAxisCenterBlock(position, axis, &startCenterBlock))
+    if (!WalkAxisCenterBlock(&startPosition, axis, &startCenterBlock))
         return 0u;
+    int64_t startRanges[3][2];
+    int64_t endRanges[3][2];
     int64_t ranges[3][2];
     for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
-        if (!WalkAxisBlockRange(outPosition, currentAxis, halfExtent,
-                                &ranges[currentAxis][0], &ranges[currentAxis][1]))
+        if (!WalkAxisBlockRange(&startPosition, currentAxis, halfExtent,
+                                &startRanges[currentAxis][0],
+                                &startRanges[currentAxis][1]) ||
+            !WalkAxisBlockRange(outPosition, currentAxis, halfExtent,
+                                &endRanges[currentAxis][0],
+                                &endRanges[currentAxis][1]))
             return 0u;
+    for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
+    {
+        if (currentAxis != axis)
+        {
+            ranges[currentAxis][0] = endRanges[currentAxis][0];
+            ranges[currentAxis][1] = endRanges[currentAxis][1];
+            continue;
+        }
+        /* The old implementation inspected only the final AABB.  A fast
+         * fixed-step movement could therefore jump over a one-block wall.
+         * Sweep the complete integer interval between the start and end
+         * occupied ranges, then choose the nearest hit below. */
+        ranges[currentAxis][0] = startRanges[currentAxis][0] < endRanges[currentAxis][0]
+                                     ? startRanges[currentAxis][0]
+                                     : endRanges[currentAxis][0];
+        ranges[currentAxis][1] = startRanges[currentAxis][1] > endRanges[currentAxis][1]
+                                     ? startRanges[currentAxis][1]
+                                     : endRanges[currentAxis][1];
+    }
     uint32_t counts[3];
     for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
         if (!WalkRangeCount(ranges[currentAxis][0], ranges[currentAxis][1], &counts[currentAxis]))
