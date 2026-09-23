@@ -88,7 +88,8 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
 * `laiue.mesher` публикует scratch и greedy chunk meshing, требует
   `laiue.world`;
 * `laiue.graphics` публикует backend-neutral renderer table, а `laiue.scene`
-  и `laiue.voxel_render` требуют этот provider вместо поиска функций в
+  требует этот provider и `laiue.scene_math`, а `laiue.voxel_render` требует
+  graphics и остальные перечисленные providers вместо поиска функций в
   глобальном диспетчере;
 * `laiue.scene_math` и `laiue.voxel_raycast` являются самостоятельными
   providers без renderer-зависимости; последний требует только `laiue.world`;
