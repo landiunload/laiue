@@ -505,6 +505,36 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
            "start failure removes published service");
     LaiueModuleHostUnloadAll(host);
 
+    /* Two independent optional callbacks may fail in the same transaction.
+     * The report must retain both concrete callback failures instead of
+     * overwriting the first one with the last failed module ID. */
+    publishingFailureCreateCalls = 0u;
+    failingStartCalls = 0u;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 3u);
+    LaiueModuleBinaryV1 simultaneousFailures[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &publishingFailCreateApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &failingStartApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, simultaneousFailures,
+               (uint32_t)(sizeof(simultaneousFailures) /
+                          sizeof(simultaneousFailures[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "partial profile isolates simultaneous callback failures");
+    Expect(publishingFailureCreateCalls == 1u && failingStartCalls == 1u &&
+               LaiueModuleHostLoadedCount(host) == 1u &&
+               profileEntries[0].status == LAIUE_MODULE_PARTIAL &&
+               profileEntries[1].status == LAIUE_MODULE_PARTIAL &&
+               (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+               (profileEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+               (profileEntries[2].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+           "report preserves both callback failures and independent success");
+    LaiueModuleHostUnloadAll(host);
+
     const LaiueModuleApiV1 *badApis[] = {&badAbiApi};
     Expect(LaiueModuleHostLoadStatic(host, badApis, 1u, &diagnostic) ==
                LAIUE_MODULE_ABI_MISMATCH,
