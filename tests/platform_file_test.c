@@ -204,12 +204,24 @@ static void TestLargeFile(FileTestState *state)
     Expect(PlatformDeleteFile(state->large), "delete sparse file");
 }
 
+static bool GetFixtureRoot(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY])
+{
+    static char configuredRoot[LAIUE_PLATFORM_PATH_CAPACITY * 4U];
+    uint32_t length = PlatformGetEnvironmentUtf8(
+        "LAIUE_PLATFORM_FILE_TEST_ROOT", configuredRoot, sizeof(configuredRoot));
+    if (length != 0U)
+    {
+        return PlatformUtf8ToWide(configuredRoot, length, output,
+                                  LAIUE_PLATFORM_PATH_CAPACITY, NULL);
+    }
+    return PlatformExecutableDirectory(output, LAIUE_PLATFORM_PATH_CAPACITY);
+}
+
 LAIUE_TEST_ENTRY(PlatformFileTestEntryPoint)
 {
     FileTestState *state = PlatformAllocate(sizeof(*state), false);
     Expect(state != NULL, "scratch allocation");
-    Expect(PlatformExecutableDirectory(state->file, LAIUE_PLATFORM_PATH_CAPACITY),
-           "executable directory");
+    Expect(GetFixtureRoot(state->file), "fixture root");
     wchar_t name[] = L"platform_file_test_0000000000000000";
     static const wchar_t digits[] = L"0123456789abcdef";
     uint8_t random[8];

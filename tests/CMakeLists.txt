@@ -32,6 +32,10 @@ add_executable(laiue_platform_file_test platform_file_test.c)
 laiue_configure_standalone_executable(laiue_platform_file_test PlatformFileTestEntryPoint)
 add_test(NAME laiue.platform.file COMMAND laiue_platform_file_test)
 set_tests_properties(laiue.platform.file PROPERTIES TIMEOUT 20)
+if(LAIUE_PLATFORM_POSIX)
+    set_tests_properties(laiue.platform.file PROPERTIES
+        ENVIRONMENT "LAIUE_PLATFORM_FILE_TEST_ROOT=/tmp")
+endif()
 
 add_executable(laiue_platform_threading_test platform_threading_test.c)
 laiue_configure_standalone_executable(
