@@ -65,12 +65,14 @@ static uint32_t ModuleStart(void *context)
     if (state->sceneMath == NULL || state->world == NULL || state->mesher == NULL ||
         state->graphics == NULL)
     {
+        ChunkStreamingSetSceneMathService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
         state->graphics = NULL;
         return 0u;
     }
+    ChunkStreamingSetSceneMathService(state->sceneMath);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_RENDER_SERVICE_NAME,
         .version = LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1,
@@ -79,6 +81,7 @@ static uint32_t ModuleStart(void *context)
     };
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
+        ChunkStreamingSetSceneMathService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
@@ -96,6 +99,7 @@ static void ModuleStop(void *context)
                                              LAIUE_VOXEL_RENDER_SERVICE_NAME);
     if (state != NULL)
     {
+        ChunkStreamingSetSceneMathService(NULL);
         state->sceneMath = NULL;
         state->world = NULL;
         state->mesher = NULL;
@@ -107,6 +111,7 @@ static void ModuleDestroy(void *context)
 {
     (void)context;
     moduleState.host = NULL;
+    ChunkStreamingSetSceneMathService(NULL);
     moduleState.sceneMath = NULL;
     moduleState.world = NULL;
     moduleState.mesher = NULL;

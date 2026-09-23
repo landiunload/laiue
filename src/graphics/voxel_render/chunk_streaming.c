@@ -1,5 +1,5 @@
 #include "voxel_render/chunk_streaming.h"
-#include "scene/math.h"
+#include "scene/math_service.h"
 #include "world/world.h"
 #include "render/renderer.h"
 #include "mesh/chunk_mesher.h"
@@ -23,6 +23,13 @@
 #define CHUNK_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 #define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
+
+static const LaiueSceneMathServiceV1* sceneMathService;
+
+void ChunkStreamingSetSceneMathService(const LaiueSceneMathServiceV1* service)
+{
+    sceneMathService = service;
+}
 
 // Мешер принимает только абстрактный region provider. Voxel-render связывает
 // его с выбранным world здесь, на границе технологии; сам mesher поэтому не
@@ -1530,6 +1537,11 @@ static bool FrustumContainsChunkCenter(const float planes[6][4], const float cen
 void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16],
     const int64_t renderOriginBlock[3])
 {
+    if (streaming == NULL || viewProjection == NULL || renderOriginBlock == NULL ||
+        sceneMathService == NULL || sceneMathService->matrix4ExtractFrustumPlanes == NULL)
+    {
+        return;
+    }
     bool renderOriginChanged = !streaming->hasDrawRenderOrigin
         || streaming->drawRenderOriginBlock[0] != renderOriginBlock[0]
         || streaming->drawRenderOriginBlock[1] != renderOriginBlock[1]
@@ -1567,7 +1579,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
     }
 
     float planes[6][4];
-    Matrix4ExtractFrustumPlanes(viewProjection, planes);
+    sceneMathService->matrix4ExtractFrustumPlanes(viewProjection, planes);
     ExpandFrustumPlanesForChunk(planes);
 
     // Frustum зависит от поворота камеры, поэтому отсечение остаётся
