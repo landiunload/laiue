@@ -38,6 +38,10 @@ typedef struct LaiueVoxelProviderV1 LaiueVoxelProviderV1;
 typedef uint32_t (*LaiueVoxelGetBlockFn)(const LaiueVoxelProviderV1 *,
                                          const LaiueVoxelCoordV1 *,
                                          LaiueVoxelBlockV1 *outBlock);
+typedef uint32_t (*LaiueVoxelGetBlockStateFn)(const LaiueVoxelProviderV1 *,
+                                              const LaiueVoxelCoordV1 *,
+                                              LaiueVoxelBlockV1 *outBlock,
+                                              uint32_t *outExplicit);
 typedef uint32_t (*LaiueVoxelEnumerateSolidFn)(const LaiueVoxelProviderV1 *,
                                                const LaiueVoxelAabbV1 *,
                                                uint32_t (*visitor)(void *,
@@ -55,7 +59,8 @@ struct LaiueVoxelProviderV1
     uint32_t abiVersion;
     void *context;
     LaiueVoxelGetBlockFn getBlock;
+    LaiueVoxelGetBlockStateFn getBlockState;
     LaiueVoxelEnumerateSolidFn enumerateSolid;
     LaiueVoxelBuildMeshFn buildMesh;
-    uintptr_t reserved[8];
+    uintptr_t reserved[7];
 };

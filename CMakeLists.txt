@@ -388,6 +388,7 @@ install(DIRECTORY "${PROJECT_SOURCE_DIR}/sdk/native_module_template/"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/laiue/sdk/native_module_template"
     COMPONENT Engine
     FILES_MATCHING
+        PATTERN "CMakeLists.txt"
         PATTERN "*.c"
         PATTERN "*.h"
         PATTERN "*.cmake"

@@ -29,6 +29,7 @@ typedef struct StaticModuleState
 } StaticModuleState;
 
 static StaticModuleState staticState;
+static uint32_t failingStartCalls;
 
 static uint32_t LAIUE_MODULE_CALL StaticCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
@@ -79,6 +80,7 @@ static const LaiueModuleApiV1 staticApi = {
 static uint32_t LAIUE_MODULE_CALL FailingStart(void *context)
 {
     (void)context;
+    ++failingStartCalls;
     return false;
 }
 
@@ -305,18 +307,34 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     LaiueModuleHostUnloadAll(host);
 
     /* A profile explicitly selects a provider instead of relying on the
-     * order in which artifacts happen to be listed. */
+     * order in which artifacts happen to be listed. An unselected conflict
+     * is disabled as a graph component instead of choosing by ID. */
     static LaiueModuleLoadReportEntryV1 selectionEntries[2];
     LaiueModuleLoadReportV1 selectionReport;
+    LaiueModuleLoadReportInitialize(&selectionReport, selectionEntries, 2u);
+    static const LaiueModuleBinaryV1 selectionBinaries[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &selectedProviderAlphaApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &selectedProviderZetaApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, selectionBinaries,
+               (uint32_t)(sizeof(selectionBinaries) / sizeof(selectionBinaries[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &selectionReport, &diagnostic) ==
+               LAIUE_MODULE_PARTIAL,
+           "unselected provider conflict is partial");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u && selectionReport.loadedCount == 0u &&
+               (selectionEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+               (selectionEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u,
+           "unselected provider conflict does not choose by ID");
+    LaiueModuleHostUnloadAll(host);
+
     LaiueModuleLoadReportInitialize(&selectionReport, selectionEntries, 2u);
     static const LaiueModuleProviderSelectionV1 providerSelection = {
         .structSize = sizeof(LaiueModuleProviderSelectionV1),
         .serviceName = "example.selection",
         .moduleId = "example.provider.zeta",
-    };
-    static const LaiueModuleBinaryV1 selectionBinaries[] = {
-        {NULL, LAIUE_MODULE_BINARY_STATIC, &selectedProviderAlphaApi},
-        {NULL, LAIUE_MODULE_BINARY_STATIC, &selectedProviderZetaApi},
     };
     LaiueModuleProfileV1 selectionProfile = {
         .structSize = sizeof(selectionProfile),
@@ -350,8 +368,9 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
            "invalid provider selection is rejected before callbacks");
 
     /* A present optional provider may fail in create/start. The profile
-     * retries without that provider, while the independent static module
-     * still reaches a clean running graph. */
+     * disables it in the same transaction, while the independent static
+     * module still reaches a clean running graph without a second start. */
+    failingStartCalls = 0u;
     LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
     LaiueModuleBinaryV1 failingProfile[] = {
         {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
@@ -368,6 +387,8 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
                (profileEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
            "optional start failure leaves independent module running");
+    Expect(failingStartCalls == 1u && staticState.starts == 1u,
+           "optional start failure does not replay lifecycle callbacks");
     LaiueModuleHostUnloadAll(host);
 
     const LaiueModuleApiV1 *badApis[] = {&badAbiApi};

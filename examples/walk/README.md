@@ -2,7 +2,8 @@
 
 This is the smallest public-SDK walk slice. It owns the game-specific base
 provider (grass at `z=0`, earth at `z=-1..-3`, stone below), loads the public
-`laiue.character` and optional `laiue.voxel` service tables through the bootstrap, keeps
+`laiue.character` and optional `laiue.voxel` service tables through the
+bootstrap, keeps
 authoritative coordinates as integer cell plus local offsets, and advances a
 kinematic character at 128 Hz. It does not link `physics`, `render`, or
 `scene`; those can be supplied later as independent modules through the same

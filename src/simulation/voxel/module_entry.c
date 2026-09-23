@@ -106,16 +106,6 @@ static bool Resize(VoxelEntry **entries, uint32_t *capacity, uint32_t newCapacit
     return true;
 }
 
-static bool BlocksEqual(const LaiueVoxelBlockV1 *left, const LaiueVoxelBlockV1 *right)
-{
-    return left->material == right->material && left->flags == right->flags;
-}
-
-static bool IsDefaultBlock(const LaiueVoxelWorldV1 *world, const LaiueVoxelBlockV1 *block)
-{
-    return BlocksEqual(&world->defaultBlock, block);
-}
-
 static uint32_t VoxelGetBlock(const LaiueVoxelProviderV1 *provider,
                               const LaiueVoxelCoordV1 *coordinate,
                               LaiueVoxelBlockV1 *outBlock)
@@ -129,6 +119,28 @@ static uint32_t VoxelGetBlock(const LaiueVoxelProviderV1 *provider,
     uint32_t slot = FindSlot(world, coordinate, hash, &found);
     if (slot != UINT32_MAX && found != 0U)
         *outBlock = world->entries[slot].block;
+    return 1u;
+}
+
+static uint32_t VoxelGetBlockState(const LaiueVoxelProviderV1 *provider,
+                                   const LaiueVoxelCoordV1 *coordinate,
+                                   LaiueVoxelBlockV1 *outBlock,
+                                   uint32_t *outExplicit)
+{
+    if (provider == NULL || coordinate == NULL || outBlock == NULL || outExplicit == NULL ||
+        provider->context == NULL)
+        return 0u;
+    const LaiueVoxelWorldV1 *world = (const LaiueVoxelWorldV1 *)provider->context;
+    *outBlock = world->defaultBlock;
+    *outExplicit = 0u;
+    const uint64_t hash = CoordinateHash(coordinate);
+    uint32_t found = 0U;
+    const uint32_t slot = FindSlot(world, coordinate, hash, &found);
+    if (slot != UINT32_MAX && found != 0U)
+    {
+        *outBlock = world->entries[slot].block;
+        *outExplicit = 1u;
+    }
     return 1u;
 }
 
@@ -200,34 +212,12 @@ static uint32_t VoxelSetBlock(LaiueVoxelWorldV1 *world,
         return 0u;
     if (found != 0U)
     {
-        if (IsDefaultBlock(world, block))
-        {
-            world->entries[slot].used = 0U;
-            --world->count;
-            /* Reinsert the cluster after an open-addressing deletion. */
-            uint32_t next = (slot + 1U) & (world->capacity - 1U);
-            while (world->entries[next].used)
-            {
-                VoxelEntry displaced = world->entries[next];
-                world->entries[next].used = 0U;
-                --world->count;
-                uint32_t displacedFound = 0U;
-                uint32_t displacedSlot = FindSlot(world, &displaced.coordinate,
-                                                   displaced.hash, &displacedFound);
-                if (displacedSlot == UINT32_MAX || displacedFound != 0U ||
-                    !InsertEntry(world->entries, world->capacity, &displaced))
-                    return 0u;
-                ++world->count;
-                next = (next + 1U) & (world->capacity - 1U);
-            }
-        }
-        else
-            world->entries[slot].block = *block;
+        /* Keep default/air writes as explicit entries. This lets a sparse
+         * edit mask a game-owned infinite terrain provider. */
+        world->entries[slot].block = *block;
         ++world->revision;
         return 1u;
     }
-    if (IsDefaultBlock(world, block))
-        return 1u;
     if (world->count > world->capacity - world->capacity / 3U)
     {
         if (world->capacity > UINT32_MAX / 2U ||
@@ -271,6 +261,7 @@ static uint32_t VoxelCreate(const LaiueVoxelWorldConfigV1 *config,
     world->provider.abiVersion = LAIUE_VOXEL_ABI_VERSION_1;
     world->provider.context = world;
     world->provider.getBlock = VoxelGetBlock;
+    world->provider.getBlockState = VoxelGetBlockState;
     world->provider.enumerateSolid = VoxelEnumerateSolid;
     world->provider.buildMesh = VoxelBuildMesh;
     *outWorld = world;

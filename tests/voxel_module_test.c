@@ -97,6 +97,7 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
            "sparse voxel world creates");
     LaiueVoxelProviderV1 provider = {0};
     Expect(voxel->getProvider(world, &provider) != 0u && provider.getBlock != NULL &&
+               provider.getBlockState != NULL &&
                provider.enumerateSolid != NULL,
            "voxel world returns an independent provider table");
 
@@ -112,6 +113,10 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
     Expect(provider.getBlock(&provider, &coordinate, &result) != 0u &&
                result.material == stone.material && result.flags == stone.flags,
            "provider reads the exact override");
+    uint32_t explicitEdit = 0u;
+    Expect(provider.getBlockState(&provider, &coordinate, &result, &explicitEdit) != 0u &&
+               explicitEdit != 0u && result.material == stone.material,
+           "provider reports an explicit solid edit");
     Expect(voxel->getRevision(world) == 1u, "voxel revision advances once");
 
     LaiueVoxelAabbV1 bounds = {
@@ -126,10 +131,17 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
 
     const LaiueVoxelBlockV1 air = {0};
     Expect(voxel->setBlock(world, &coordinate, &air) != 0u,
-           "setting the default block removes an override");
+           "setting air stores an explicit removal");
     Expect(provider.getBlock(&provider, &coordinate, &result) != 0u &&
-               result.material == 0u && voxel->getRevision(world) == 2u,
-           "removed override falls back to air");
+               result.material == 0u &&
+               provider.getBlockState(&provider, &coordinate, &result, &explicitEdit) != 0u &&
+               explicitEdit != 0u && voxel->getRevision(world) == 2u,
+           "explicit air remains distinguishable from an untouched coordinate");
+    const LaiueVoxelCoordV1 untouched = {.x = coordinate.x + 1, .y = coordinate.y,
+                                         .z = coordinate.z};
+    Expect(provider.getBlockState(&provider, &untouched, &result, &explicitEdit) != 0u &&
+               explicitEdit == 0u && result.material == 0u,
+           "untouched coordinate reports the default block");
     voxel->destroy(world);
 
     LaiueModuleHostUnloadAll(host);

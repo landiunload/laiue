@@ -16,6 +16,7 @@ typedef struct ModuleService
 typedef struct LoadedModule
 {
     bool used;
+    bool optional;
     bool created;
     bool started;
     PlatformDynamicLibrary library;
@@ -398,6 +399,43 @@ static void Rollback(LaiueModuleHost *host, uint32_t count)
         }
     }
     host->loadedCount = 0u;
+}
+
+static void RemoveUnstartedModule(LaiueModuleHost *host, uint32_t index)
+{
+    if (host == NULL || index >= LAIUE_MODULE_HOST_MAX_MODULES)
+        return;
+    LoadedModule *module = &host->modules[index];
+    if (!module->used || module->started || module->created)
+        return;
+    PlatformDynamicLibraryClose(module->library);
+    memset(module, 0, sizeof(*module));
+}
+
+static void RemoveStartedModule(LaiueModuleHost *host, uint32_t index)
+{
+    if (host == NULL || index >= LAIUE_MODULE_HOST_MAX_MODULES)
+        return;
+    LoadedModule *module = &host->modules[index];
+    if (!module->used)
+        return;
+    if (module->started)
+    {
+        if (module->api->stop != NULL)
+            module->api->stop(module->context);
+        module->started = false;
+        RemoveOwnedServices(host, index);
+        if (host->loadedCount != 0u)
+            --host->loadedCount;
+    }
+    if (module->created)
+    {
+        if (module->api->destroy != NULL)
+            module->api->destroy(module->context);
+        module->created = false;
+    }
+    PlatformDynamicLibraryClose(module->library);
+    memset(module, 0, sizeof(*module));
 }
 
 void LaiueModuleHostConfigInitialize(LaiueModuleHostConfigV1 *config)
@@ -805,55 +843,6 @@ static bool ProfilePlannedProvides(const ProfileCandidate *candidates, uint32_t 
     return false;
 }
 
-static bool ProfileMaskProvides(const ProfileCandidate *candidates, uint32_t count,
-                                const bool mask[LAIUE_MODULE_HOST_MAX_MODULES],
-                                const char *name)
-{
-    for (uint32_t index = 0u; index < count; ++index)
-        if (mask[index] && ProfileCandidateProvides(&candidates[index], name))
-            return true;
-    return false;
-}
-
-static void ProfileRemoveDependents(const LaiueModuleHost *host,
-                                    const ProfileCandidate *candidates, uint32_t count,
-                                    bool mask[LAIUE_MODULE_HOST_MAX_MODULES],
-                                    uint32_t root)
-{
-    mask[root] = false;
-    bool changed = true;
-    while (changed)
-    {
-        changed = false;
-        for (uint32_t index = 0u; index < count; ++index)
-        {
-            if (!mask[index])
-                continue;
-            const LaiueModuleDescriptorV1 *descriptor = &candidates[index].api->descriptor;
-            for (uint32_t requirement = 0u; requirement < descriptor->requiresCount;
-                 ++requirement)
-            {
-                const char *name = descriptor->requiresServices[requirement].name;
-                if (!ProfileHostProvides(host, name) &&
-                    !ProfileMaskProvides(candidates, count, mask, name))
-                {
-                    mask[index] = false;
-                    changed = true;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-static int ProfileCompareIds(const ProfileCandidate *left, const ProfileCandidate *right)
-{
-    uint32_t index = 0u;
-    while (left->id[index] != '\0' && left->id[index] == right->id[index])
-        ++index;
-    return (unsigned char)left->id[index] - (unsigned char)right->id[index];
-}
-
 static const char *ProfileSelectionFor(const LaiueModuleProfileV1 *profile,
                                        const char *serviceName)
 {
@@ -906,10 +895,15 @@ void LaiueModuleLoadReportInitialize(LaiueModuleLoadReportV1 *report,
         memset(entries, 0, sizeof(*entries) * capacity);
 }
 
-LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries,
-                                      uint32_t count, LaiueModuleDiagnostic *diagnostic)
+static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
+                                      const LaiueModuleBinaryV1 *binaries, uint32_t count,
+                                      LaiueModuleDiagnostic *diagnostic,
+                                      bool allowOptionalFailures,
+                                      char failedModuleId[LAIUE_MODULE_MAX_NAME])
 {
     DiagnosticClear(diagnostic);
+    if (failedModuleId != NULL)
+        failedModuleId[0] = '\0';
     if (host == NULL || binaries == NULL || count == 0u || count > LAIUE_MODULE_HOST_MAX_MODULES)
         return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "module paths and count are required");
     if (!Begin(host))
@@ -922,6 +916,7 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
     memset(host->modules, 0, sizeof(host->modules));
     uint32_t indices[LAIUE_MODULE_HOST_MAX_MODULES];
     uint32_t moduleCount = 0u;
+    uint32_t activeCount = 0u;
     for (uint32_t input = 0u; input < count; ++input)
     {
         bool optional = (binaries[input].flags & LAIUE_MODULE_BINARY_OPTIONAL) != 0u;
@@ -1096,9 +1091,11 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
         host->modules[moduleCount].api = api;
         host->modules[moduleCount].owner = host;
         host->modules[moduleCount].library = library;
+        host->modules[moduleCount].optional = optional;
         host->modules[moduleCount].used = true;
         indices[moduleCount] = moduleCount;
         ++moduleCount;
+        ++activeCount;
     }
     if (HasProviderConflict(host, moduleCount))
     {
@@ -1110,8 +1107,9 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
     StableSortIndices(host, indices, moduleCount);
     uint32_t created = 0u;
     uint32_t started = 0u;
+    bool partial = false;
     bool progress = true;
-    while (started < moduleCount && progress)
+    while (started < activeCount && progress)
     {
         progress = false;
         for (uint32_t order = 0u; order < moduleCount; ++order)
@@ -1124,6 +1122,16 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
             BuildApi(host, module);
             if (!module->api->create(&module->hostApi, &module->context))
             {
+                if (allowOptionalFailures && module->optional)
+                {
+                    if (failedModuleId != NULL)
+                        (void)CopyName(failedModuleId, module->id);
+                    RemoveUnstartedModule(host, index);
+                    --activeCount;
+                    partial = true;
+                    progress = true;
+                    continue;
+                }
                 Rollback(host, moduleCount);
                 End(host);
                 return Fail(diagnostic, LAIUE_MODULE_CREATE_FAILED, "module create callback failed");
@@ -1132,6 +1140,16 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
             module->createOrder = created++;
             if (module->api->start != NULL && !module->api->start(module->context))
             {
+                if (allowOptionalFailures && module->optional)
+                {
+                    if (failedModuleId != NULL)
+                        (void)CopyName(failedModuleId, module->id);
+                    RemoveStartedModule(host, index);
+                    --activeCount;
+                    partial = true;
+                    progress = true;
+                    continue;
+                }
                 Rollback(host, moduleCount);
                 End(host);
                 return Fail(diagnostic, LAIUE_MODULE_START_FAILED, "module start callback failed");
@@ -1143,7 +1161,27 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
             progress = true;
         }
     }
-    if (started != moduleCount)
+    if (allowOptionalFailures)
+    {
+        bool removed = true;
+        while (removed)
+        {
+            removed = false;
+            for (uint32_t index = 0u; index < moduleCount; ++index)
+            {
+                LoadedModule *module = &host->modules[index];
+                if (!module->used || module->created || !module->optional)
+                    continue;
+                if (failedModuleId != NULL && failedModuleId[0] == '\0')
+                    (void)CopyName(failedModuleId, module->id);
+                RemoveUnstartedModule(host, index);
+                --activeCount;
+                partial = true;
+                removed = true;
+            }
+        }
+    }
+    if (started != activeCount)
     {
         bool missing = false;
         for (uint32_t index = 0u; index < moduleCount && !missing; ++index)
@@ -1169,7 +1207,16 @@ LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBi
                             : "module dependencies contain a cycle");
     }
     End(host);
-    return LAIUE_MODULE_OK;
+    return partial ? Fail(diagnostic, LAIUE_MODULE_PARTIAL,
+                          "profile disabled an optional module")
+                   : LAIUE_MODULE_OK;
+}
+
+LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host,
+                                      const LaiueModuleBinaryV1 *binaries, uint32_t count,
+                                      LaiueModuleDiagnostic *diagnostic)
+{
+    return LoadInternal(host, binaries, count, diagnostic, false, NULL);
 }
 
 LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
@@ -1256,9 +1303,9 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         (void)ProfileProbeBinary(&binaries[index], &candidates[index]);
 
     /* Duplicate IDs and providers are resolved before any module callback.
-     * A profile may pin a provider explicitly. When it does not, the
-     * deterministic ID order remains the compatibility fallback for partial
-     * profiles; the strict loader still rejects ambiguous providers. */
+     * A profile must pin an alternative provider explicitly. ID order is used
+     * only for the stable lifecycle order; it never silently chooses a
+     * technology implementation. */
     for (uint32_t left = 0u; left < count; ++left)
         if (candidates[left].active)
             for (uint32_t right = left + 1u; right < count; ++right)
@@ -1365,15 +1412,15 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
                         }
                         else
                         {
-                            loser = ProfileCompareIds(&candidates[left],
-                                                      &candidates[right]) <= 0
-                                        ? &candidates[right]
-                                        : &candidates[left];
-                        }
-                        if (loser == NULL)
+                            ProfileSetFailure(&candidates[left], LAIUE_MODULE_DUPLICATE_SERVICE,
+                                              "provider selection is required for this service");
+                            ProfileSetFailure(&candidates[right], LAIUE_MODULE_DUPLICATE_SERVICE,
+                                              "provider selection is required for this service");
                             continue;
-                        ProfileSetFailure(loser, LAIUE_MODULE_DUPLICATE_SERVICE,
-                                          "service provider disabled by profile selection");
+                        }
+                        if (loser != NULL)
+                            ProfileSetFailure(loser, LAIUE_MODULE_DUPLICATE_SERVICE,
+                                              "service provider disabled by profile selection");
                     }
                 }
 
@@ -1461,58 +1508,11 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         return Fail(diagnostic, noStartStatus, noStartMessage);
     }
 
-    LaiueModuleStatus status =
-        LaiueModuleHostLoad(host, selected, selectedCount, diagnostic);
-    if (status != LAIUE_MODULE_OK)
+    char failedModuleId[LAIUE_MODULE_MAX_NAME];
+    LaiueModuleStatus status = LoadInternal(host, selected, selectedCount, diagnostic,
+                                             allowPartial, failedModuleId);
+    if (status != LAIUE_MODULE_OK && status != LAIUE_MODULE_PARTIAL)
     {
-        /* A callback failure in an optional provider must not take unrelated
-         * technologies down. Retry only by removing that provider and its
-         * transitive dependents; required modules remain strict failures. */
-        bool recovered = false;
-        bool trial[LAIUE_MODULE_HOST_MAX_MODULES];
-        for (uint32_t root = 0u; root < count && !recovered; ++root)
-        {
-            if (!planned[root] || !candidates[root].optional)
-                continue;
-            memcpy(trial, planned, sizeof(trial));
-            ProfileRemoveDependents(host, candidates, count, trial, root);
-            uint32_t trialCount = 0u;
-            for (uint32_t index = 0u; index < count; ++index)
-                if (trial[index])
-                    selected[trialCount++] = binaries[index];
-            if (trialCount != 0u)
-            {
-                LaiueModuleStatus trialStatus =
-                    LaiueModuleHostLoad(host, selected, trialCount, diagnostic);
-                if (trialStatus != LAIUE_MODULE_OK)
-                    continue;
-            }
-            for (uint32_t index = 0u; index < count; ++index)
-                if (planned[index] && !trial[index])
-                    ProfileSetFailure(&candidates[index],
-                                      index == root ? status : LAIUE_MODULE_DEPENDENCY_MISSING,
-                                      index == root ? "optional module start failed"
-                                                    : "dependent module disabled");
-            memcpy(planned, trial, sizeof(trial));
-            recovered = true;
-        }
-        if (recovered)
-        {
-            for (uint32_t index = 0u; index < count; ++index)
-                if (planned[index])
-                {
-                    candidates[index].status = LAIUE_MODULE_OK;
-                    candidates[index].flags = LAIUE_MODULE_PROFILE_ENTRY_LOADED;
-                    candidates[index].message[0] = '\0';
-                }
-            ProfileFillReport(report, candidates, count, LaiueModuleHostLoadedCount(host));
-            ProfileCloseProbes(candidates, count);
-            PlatformFree(candidates);
-            PlatformFree(selected);
-            PlatformFree(planned);
-            return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
-                        "profile disabled an optional module");
-        }
         for (uint32_t index = 0u; index < count; ++index)
             if (planned[index])
                 ProfileSetFailure(&candidates[index], status, diagnostic->message);
@@ -1522,6 +1522,41 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         PlatformFree(selected);
         PlatformFree(planned);
         return status;
+    }
+    if (status == LAIUE_MODULE_PARTIAL)
+    {
+        /* LoadInternal removes only the optional module that failed and any
+         * optional modules left without a runnable dependency. The successful
+         * branch is already running; do not replay create/start for it. */
+        for (uint32_t index = 0u; index < count; ++index)
+        {
+            if (!planned[index])
+                continue;
+            if (LaiueModuleHostIsLoaded(host, candidates[index].id))
+            {
+                candidates[index].status = LAIUE_MODULE_OK;
+                candidates[index].flags = LAIUE_MODULE_PROFILE_ENTRY_LOADED;
+                candidates[index].message[0] = '\0';
+            }
+            else if (candidates[index].active)
+            {
+                ProfileSetFailure(&candidates[index], LAIUE_MODULE_DEPENDENCY_MISSING,
+                                  "optional module was disabled after a dependency failure");
+            }
+        }
+        if (failedModuleId[0] != '\0')
+            for (uint32_t index = 0u; index < count; ++index)
+                if (planned[index] &&
+                    LaiueModAsciiEquals(candidates[index].id, failedModuleId))
+                    ProfileSetFailure(&candidates[index], LAIUE_MODULE_PARTIAL,
+                                      "optional module create/start callback failed");
+        ProfileFillReport(report, candidates, count, LaiueModuleHostLoadedCount(host));
+        ProfileCloseProbes(candidates, count);
+        PlatformFree(candidates);
+        PlatformFree(selected);
+        PlatformFree(planned);
+        return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
+                    "profile disabled an optional module");
     }
     for (uint32_t index = 0u; index < count; ++index)
         if (planned[index])
