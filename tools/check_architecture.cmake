@@ -4,22 +4,25 @@ if(NOT DEFINED SOURCE_ROOT)
 endif()
 
 set(allowed_audio audio content math media platform)
-set(allowed_content content platform)
+set(allowed_character character mod platform)
+set(allowed_content content mod platform)
+set(allowed_graphics graphics)
 set(allowed_input input)
 set(allowed_math math)
 set(allowed_media media)
 set(allowed_mesh mesh platform render world)
 set(allowed_mod mod platform)
-set(allowed_numeric numeric platform)
+set(allowed_numeric mod numeric platform)
 # Физике доступны только числа: реализация мира ей по-прежнему не
 # видна, свойства блоков приходят через callback.
 set(allowed_physics math numeric physics task)
 set(allowed_platform platform)
 set(allowed_render content media platform render)
 set(allowed_runtime runtime)
-set(allowed_task task platform)
+set(allowed_task mod task platform)
 set(allowed_scene math mesh platform render scene world)
 set(allowed_ui math render scene ui)
+set(allowed_voxel mod platform voxel)
 set(allowed_world numeric platform world)
 
 # Переносимое ядро обязано оставаться переносимым. Правила выше смотрят
@@ -32,7 +35,7 @@ set(allowed_world numeric platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules content math media mesh mod numeric physics runtime scene task world)
+set(portable_modules character content graphics math media mesh mod numeric physics runtime scene task world voxel)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h

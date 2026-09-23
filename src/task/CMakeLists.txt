@@ -3,5 +3,7 @@ laiue_add_module(task
     SOURCES
         task_pool.c
         task_pool.h
+        task_service.h
+        module_entry.c
         ../api.h
 )

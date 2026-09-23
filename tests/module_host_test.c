@@ -1,0 +1,266 @@
+#include "mod/module_host.h"
+#include "platform/system.h"
+#include "test_runtime.h"
+
+#include <stddef.h>
+#include <stdbool.h>
+
+#if defined(_WIN32)
+#define PROVIDER_NAME L"laiue_module_provider.dll"
+#define CONSUMER_NAME L"laiue_module_consumer.dll"
+#elif defined(__APPLE__)
+#define PROVIDER_NAME L"liblaiue_module_provider.dylib"
+#define CONSUMER_NAME L"liblaiue_module_consumer.dylib"
+#else
+#define PROVIDER_NAME L"liblaiue_module_provider.so"
+#define CONSUMER_NAME L"liblaiue_module_consumer.so"
+#endif
+
+typedef struct CounterState
+{
+    uint32_t starts;
+    uint32_t stops;
+} CounterState;
+
+typedef struct StaticModuleState
+{
+    uint32_t starts;
+    uint32_t stops;
+} StaticModuleState;
+
+static StaticModuleState staticState;
+
+static uint32_t LAIUE_MODULE_CALL StaticCreate(const LaiueModuleHostV1 *host, void **outContext)
+{
+    if (host == NULL || outContext == NULL)
+        return false;
+    staticState.starts = 0u;
+    staticState.stops = 0u;
+    *outContext = &staticState;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL StaticStart(void *context)
+{
+    StaticModuleState *state = context;
+    if (state == NULL)
+        return false;
+    ++state->starts;
+    return true;
+}
+
+static void LAIUE_MODULE_CALL StaticStop(void *context)
+{
+    StaticModuleState *state = context;
+    if (state != NULL)
+        ++state->stops;
+}
+
+static void LAIUE_MODULE_CALL StaticDestroy(void *context)
+{
+    (void)context;
+}
+
+static const LaiueModuleApiV1 staticApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.static",
+        .version = "1.0.0",
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
+static const char *const cycleAProvides[] = {"example.cycle.a"};
+static const char *const cycleBProvides[] = {"example.cycle.b"};
+static const LaiueModuleRequirementV1 cycleARequires[] = {{"example.cycle.b", 1u}};
+static const LaiueModuleRequirementV1 cycleBRequires[] = {{"example.cycle.a", 1u}};
+static const LaiueModuleApiV1 cycleAApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.cycle.a",
+        .version = "1.0.0",
+        .requiresServices = cycleARequires,
+        .requiresCount = 1u,
+        .providesServices = cycleAProvides,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+static const LaiueModuleApiV1 cycleBApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.cycle.b",
+        .version = "1.0.0",
+        .requiresServices = cycleBRequires,
+        .requiresCount = 1u,
+        .providesServices = cycleBProvides,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
+static const LaiueModuleApiV1 duplicateProviderApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.cycle.duplicate",
+        .version = "1.0.0",
+        .providesServices = cycleAProvides,
+        .providesCount = 1u,
+    },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
+static const LaiueModuleApiV1 badAbiApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = 99u,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.bad_abi",
+        .version = "1.0.0",
+    },
+    .create = StaticCreate,
+    .destroy = StaticDestroy,
+};
+
+static void Expect(bool condition, const char *message)
+{
+    if (!condition)
+    {
+        LaiueTestRuntimeWrite(message);
+        LaiueTestRuntimeWrite("\n");
+        LaiueTestRuntimeExit(1);
+    }
+}
+
+static bool Join(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t *root,
+                 const wchar_t *name)
+{
+    uint32_t index = 0u;
+    while (root[index] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
+    {
+        output[index] = root[index];
+        ++index;
+    }
+    if (root[index] != L'\0')
+        return false;
+    if (index != 0u && output[index - 1u] != L'/' && output[index - 1u] != L'\\')
+        output[index++] = L'/';
+    uint32_t nameIndex = 0u;
+    while (name[nameIndex] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
+        output[index++] = name[nameIndex++];
+    if (name[nameIndex] != L'\0')
+        return false;
+    output[index] = L'\0';
+    return true;
+}
+
+LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
+{
+    /* Keep the no-CRT test entry below the Windows stack-probe threshold. */
+    static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t missingPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t providerPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t consumerPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    Expect(PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY),
+           "executable directory is available");
+    Expect(Join(providerPath, directory, PROVIDER_NAME), "provider path fits");
+    Expect(Join(consumerPath, directory, CONSUMER_NAME), "consumer path fits");
+    Expect(Join(missingPath, directory, L"laiue_module_file_that_does_not_exist.dll"),
+           "missing path fits");
+
+    LaiueModuleHostConfigV1 config;
+    LaiueModuleHostConfigInitialize(&config);
+    LaiueModuleDiagnostic diagnostic;
+    LaiueModuleHost *host = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(host != NULL, "module host creates");
+
+    LaiueModuleBinaryV1 missing = {missingPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(host, &missing, 1u, &diagnostic) == LAIUE_MODULE_LOAD_FAILED,
+           "missing module is reported without aborting the process");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "failed load leaves no partially loaded modules");
+
+    LaiueModuleBinaryV1 optionalMissing = {
+        missingPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    Expect(LaiueModuleHostLoad(host, &optionalMissing, 1u, &diagnostic) == LAIUE_MODULE_OK,
+           "missing optional module is skipped");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "skipping an optional module keeps the host usable");
+
+    const LaiueModuleApiV1 *staticApis[] = {&staticApi};
+    Expect(LaiueModuleHostLoadStatic(host, staticApis, 1u, &diagnostic) == LAIUE_MODULE_OK,
+           "static registry uses the same module ABI");
+    Expect(staticState.starts == 1u && LaiueModuleHostLoadedCount(host) == 1u,
+           "static module starts through bootstrap");
+    LaiueModuleHostUnloadAll(host);
+    Expect(staticState.stops == 1u && LaiueModuleHostLoadedCount(host) == 0u,
+           "static module unloads through bootstrap");
+
+    const LaiueModuleApiV1 *badApis[] = {&badAbiApi};
+    Expect(LaiueModuleHostLoadStatic(host, badApis, 1u, &diagnostic) ==
+               LAIUE_MODULE_ABI_MISMATCH,
+           "incompatible module ABI is rejected");
+    const LaiueModuleApiV1 *duplicateApis[] = {&cycleAApi, &duplicateProviderApi};
+    Expect(LaiueModuleHostLoadStatic(host, duplicateApis, 2u, &diagnostic) ==
+               LAIUE_MODULE_DUPLICATE_SERVICE,
+           "ambiguous service providers are rejected before callbacks");
+    const LaiueModuleApiV1 *cycleApis[] = {&cycleAApi, &cycleBApi};
+    Expect(LaiueModuleHostLoadStatic(host, cycleApis, 2u, &diagnostic) ==
+               LAIUE_MODULE_DEPENDENCY_CYCLE,
+           "dependency cycle is reported");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "cycle failure rolls back static modules");
+
+    LaiueModuleBinaryV1 onlyConsumer = {consumerPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(host, &onlyConsumer, 1u, &diagnostic) ==
+               LAIUE_MODULE_DEPENDENCY_MISSING,
+           "missing service dependency is reported");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "dependency failure rolls back the module graph");
+
+    LaiueModuleBinaryV1 binaries[2] = {{providerPath, 0u, NULL}, {consumerPath, 0u, NULL}};
+    Expect(LaiueModuleHostLoad(host, binaries, 2u, &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    Expect(LaiueModuleHostLoadedCount(host) == 2u, "both optional modules started");
+    Expect(LaiueModuleHostIsLoaded(host, "example.provider"), "provider is loaded");
+    Expect(LaiueModuleHostIsLoaded(host, "example.consumer"), "consumer is loaded");
+    uint32_t version = 0u;
+    uint32_t size = 0u;
+    CounterState *counter = (CounterState *)LaiueModuleHostQueryService(
+        host, "example.counter", 1u, sizeof(*counter), &version, &size);
+    Expect(counter != NULL && version == 1u && size >= sizeof(*counter),
+           "provider service is visible");
+    Expect(counter->starts == 2u, "dependency order starts provider before consumer");
+
+    LaiueModuleHostUnloadAll(host);
+    Expect(LaiueModuleHostLoadedCount(host) == 0u, "unload clears all modules");
+    Expect(LaiueModuleHostQueryService(host, "example.counter", 1u, 1u, NULL, NULL) == NULL,
+           "unload removes module services");
+    LaiueModuleHostDestroy(host);
+    LAIUE_TEST_SUCCESS();
+}

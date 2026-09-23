@@ -155,7 +155,54 @@ target_link_libraries(laiue_mod_manifest_test PRIVATE laiue_mod)
 laiue_configure_standalone_executable(laiue_mod_manifest_test ModManifestTestEntry)
 add_test(NAME laiue.mod.manifest COMMAND laiue_mod_manifest_test)
 
+add_executable(laiue_module_manifest_test module_manifest_test.c)
+target_link_libraries(laiue_module_manifest_test PRIVATE laiue_bootstrap)
+target_compile_definitions(laiue_module_manifest_test PRIVATE LAIUE_STATIC=1)
+laiue_configure_standalone_executable(
+    laiue_module_manifest_test ModuleManifestTestEntryPoint)
+add_test(NAME laiue.mod.module_manifest COMMAND laiue_module_manifest_test)
+
 if(LAIUE_NATIVE_MODS_ENABLED)
+    add_executable(laiue_numeric_module_test numeric_module_test.c)
+    target_link_libraries(laiue_numeric_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_numeric_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_numeric_module_test NumericModuleTestEntryPoint)
+    add_dependencies(laiue_numeric_module_test laiue_numeric)
+    add_test(NAME laiue.mod.numeric_module COMMAND laiue_numeric_module_test)
+
+    add_executable(laiue_task_module_test task_module_test.c)
+    target_link_libraries(laiue_task_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_task_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_task_module_test TaskModuleTestEntryPoint)
+    add_dependencies(laiue_task_module_test laiue_task)
+    add_test(NAME laiue.mod.task_module COMMAND laiue_task_module_test)
+
+    add_executable(laiue_content_module_test content_module_test.c)
+    target_link_libraries(laiue_content_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_content_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_content_module_test ContentModuleTestEntryPoint)
+    add_dependencies(laiue_content_module_test laiue_content)
+    add_test(NAME laiue.mod.content_module COMMAND laiue_content_module_test)
+
+    add_executable(laiue_character_module_test character_module_test.c)
+    target_link_libraries(laiue_character_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_character_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_character_module_test CharacterModuleTestEntryPoint)
+    add_dependencies(laiue_character_module_test laiue_character)
+    add_test(NAME laiue.mod.character_module COMMAND laiue_character_module_test)
+
+    add_executable(laiue_voxel_module_test voxel_module_test.c)
+    target_link_libraries(laiue_voxel_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_voxel_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_voxel_module_test VoxelModuleTestEntryPoint)
+    add_dependencies(laiue_voxel_module_test laiue_voxel)
+    add_test(NAME laiue.mod.voxel_module COMMAND laiue_voxel_module_test)
+
     add_library(laiue_mod_test_extension SHARED
         mod_test_extension.c
         mod_test_service.h)
@@ -177,6 +224,35 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_configure_standalone_executable(laiue_mod_host_test ModHostTestEntry)
     add_dependencies(laiue_mod_host_test laiue_mod_test_extension)
     add_test(NAME laiue.mod.host COMMAND laiue_mod_host_test)
+
+    # The standalone module ABI is intentionally tested with two DLLs that do
+    # not link to any LAIUE runtime library. The consumer can only start after
+    # the provider publishes its service, which exercises dependency ordering,
+    # explicit loading, service lookup, and reverse lifecycle teardown.
+    add_library(laiue_module_provider SHARED module_provider.c)
+    add_library(laiue_module_consumer SHARED module_consumer.c)
+    foreach(module_target IN ITEMS laiue_module_provider laiue_module_consumer)
+        target_include_directories(${module_target} PRIVATE
+            "${PROJECT_SOURCE_DIR}/src")
+        target_link_libraries(${module_target} PRIVATE laiue_common)
+        if(WIN32)
+            target_link_options(${module_target} PRIVATE /NOENTRY)
+        else()
+            set_target_properties(${module_target} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                VISIBILITY_INLINES_HIDDEN YES)
+        endif()
+    endforeach()
+
+    add_executable(laiue_module_host_test
+        module_host_test.c)
+    target_link_libraries(laiue_module_host_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_module_host_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_module_host_test ModuleHostTestEntryPoint)
+    add_dependencies(laiue_module_host_test
+        laiue_module_provider laiue_module_consumer)
+    add_test(NAME laiue.mod.module_host COMMAND laiue_module_host_test)
 else()
     add_executable(laiue_mod_host_disabled_test mod_host_disabled_test.c)
     target_link_libraries(laiue_mod_host_disabled_test PRIVATE laiue_mod)

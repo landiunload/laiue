@@ -84,7 +84,62 @@ add_subdirectory(src/task)
 add_subdirectory(src/world)
 add_subdirectory(src/physics)
 add_subdirectory(src/content)
+add_subdirectory(src/character)
+add_subdirectory(src/voxel)
 add_subdirectory(src/mod)
+
+# Minimal application bootstrap. It contains only the standalone module
+# resolver and the platform boundary; it deliberately does not link the
+# legacy aggregate `laiue_engine` or any graphics/physics/voxel library. An
+# application can therefore embed this static archive and choose an explicit
+# module graph at runtime. The existing `laiue::mod` target remains the
+# compatibility aggregate for old native mods.
+add_library(laiue_bootstrap STATIC
+    src/mod/module_api.h
+    src/mod/module_manifest.c
+    src/mod/module_manifest.h
+    src/mod/module_host.c
+    src/mod/module_host.h
+    src/mod/mod_internal.c
+    src/mod/mod_internal.h
+    src/mod/mod_types.h)
+add_library(laiue::bootstrap ALIAS laiue_bootstrap)
+target_include_directories(laiue_bootstrap
+    PUBLIC
+        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
+        "$<INSTALL_INTERFACE:include/laiue>")
+target_link_libraries(laiue_bootstrap
+    PRIVATE
+        laiue_common
+        laiue::platform_support)
+target_compile_definitions(laiue_bootstrap PRIVATE LAIUE_STATIC=1)
+set_target_properties(laiue_bootstrap PROPERTIES
+    EXPORT_NAME bootstrap
+    POSITION_INDEPENDENT_CODE ON)
+
+# Public contracts for optional technology providers. These are intentionally
+# header-only interface targets: applications can compile a provider without
+# pulling the voxel, renderer, or physics implementation into the process.
+add_library(laiue_graphics_api INTERFACE)
+add_library(laiue::graphics_api ALIAS laiue_graphics_api)
+target_include_directories(laiue_graphics_api INTERFACE
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
+    "$<INSTALL_INTERFACE:include/laiue>")
+set_target_properties(laiue_graphics_api PROPERTIES EXPORT_NAME graphics_api)
+
+add_library(laiue_voxel_api INTERFACE)
+add_library(laiue::voxel_api ALIAS laiue_voxel_api)
+target_include_directories(laiue_voxel_api INTERFACE
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
+    "$<INSTALL_INTERFACE:include/laiue>")
+set_target_properties(laiue_voxel_api PROPERTIES EXPORT_NAME voxel_api)
+
+add_library(laiue_character_api INTERFACE)
+add_library(laiue::character_api ALIAS laiue_character_api)
+target_include_directories(laiue_character_api INTERFACE
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
+    "$<INSTALL_INTERFACE:include/laiue>")
+set_target_properties(laiue_character_api PROPERTIES EXPORT_NAME character_api)
 
 if(LAIUE_BUILD_GRAPHICS)
     foreach(graphics_directory IN LISTS LAIUE_GRAPHICS_MODULE_DIRECTORIES)
@@ -105,7 +160,7 @@ if(LAIUE_PLATFORM_EXTERNAL AND
    LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     string(CONCAT _laiue_static_core_link
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,"
-        "laiue_numeric,laiue_world,laiue_physics,laiue_task,laiue_content,laiue_mod>")
+        "laiue_numeric,laiue_world,laiue_physics,laiue_task,laiue_content,laiue_character,laiue_voxel,laiue_mod>")
     add_executable(laiue_static_core_link_smoke
         tests/static_core_link_smoke.c)
     target_link_libraries(laiue_static_core_link_smoke PRIVATE
@@ -128,6 +183,7 @@ if(LAIUE_ENABLE_SDK_INSTALL_RESOLVED)
     include(CMakePackageConfigHelpers)
 
 install(TARGETS ${LAIUE_RUNTIME_TARGETS} laiue_engine
+        laiue_graphics_api laiue_voxel_api laiue_character_api
     EXPORT laiueTargets
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Engine
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Engine
@@ -135,10 +191,24 @@ install(TARGETS ${LAIUE_RUNTIME_TARGETS} laiue_engine
     INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue"
 )
 
+# The bootstrap archive intentionally keeps its private platform/no-CRT link
+# implementation out of the public aggregate export. It is still staged with
+# the SDK and can be linked directly by applications built in the same
+# toolchain; the package export for the legacy aggregate remains unchanged.
+install(TARGETS laiue_bootstrap
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Engine
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Engine
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Engine)
+install(TARGETS laiue_platform_support
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Engine
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Engine
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Engine)
+
 install(FILES "${PROJECT_SOURCE_DIR}/src/api.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/numeric/infinite_coord.h"
+        "${PROJECT_SOURCE_DIR}/src/numeric/numeric_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/numeric"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/world/world.h"
@@ -152,11 +222,13 @@ install(FILES
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/task/task_pool.h"
+        "${PROJECT_SOURCE_DIR}/src/task/task_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/task"
     COMPONENT Engine)
 install(FILES
         "${PROJECT_SOURCE_DIR}/src/content/content_catalog.h"
         "${PROJECT_SOURCE_DIR}/src/content/content_format.h"
+        "${PROJECT_SOURCE_DIR}/src/content/content_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/content"
     COMPONENT Engine)
 install(FILES
@@ -165,7 +237,22 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/mod/mod_host.h"
         "${PROJECT_SOURCE_DIR}/src/mod/mod_manifest.h"
         "${PROJECT_SOURCE_DIR}/src/mod/mod_types.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/module_api.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/module_manifest.h"
+        "${PROJECT_SOURCE_DIR}/src/mod/module_host.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
+    COMPONENT Engine)
+install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/graphics_api.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/graphics"
+    COMPONENT Engine)
+install(FILES "${PROJECT_SOURCE_DIR}/src/voxel/voxel_api.h"
+        "${PROJECT_SOURCE_DIR}/src/voxel/voxel_service.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/voxel"
+    COMPONENT Engine)
+install(FILES
+        "${PROJECT_SOURCE_DIR}/src/character/character_api.h"
+        "${PROJECT_SOURCE_DIR}/src/character/character_service.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/character"
     COMPONENT Engine)
 # Заголовки ставятся по собранным целям, а не по одному флагу графики:
 # набор графических модулей зависит от бэкенда, и SDK не должен обещать
@@ -236,6 +323,15 @@ install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/laiue/docs"
     COMPONENT Engine
     FILES_MATCHING PATTERN "*.md")
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/sdk/native_module_template/"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/laiue/sdk/native_module_template"
+    COMPONENT Engine
+    FILES_MATCHING
+        PATTERN "*.c"
+        PATTERN "*.h"
+        PATTERN "*.cmake"
+        PATTERN "*.laiue"
+        PATTERN "*.md")
 
 configure_package_config_file(
     "${PROJECT_SOURCE_DIR}/cmake/laiue-config.cmake.in"
@@ -270,7 +366,7 @@ add_custom_target(laiue_engine_bundle
         --prefix "${_laiue_bundle_directory}"
         --component Engine
         ${_laiue_bundle_strip_argument}
-    DEPENDS ${LAIUE_RUNTIME_TARGETS}
+    DEPENDS ${LAIUE_RUNTIME_TARGETS} laiue_bootstrap laiue_platform_support
     COMMAND_EXPAND_LISTS
     COMMENT "Staging the laiue engine SDK"
     VERBATIM)
@@ -300,6 +396,12 @@ else()
 endif()
 option(LAIUE_BUILD_TOOLS "Build the offline content tools"
     ${_laiue_tools_default})
+
+option(LAIUE_BUILD_EXAMPLES "Build the public SDK examples" OFF)
+if(LAIUE_BUILD_EXAMPLES)
+    add_subdirectory(examples/walk)
+endif()
+
 if(LAIUE_BUILD_TOOLS)
     add_subdirectory(tools/soundc)
     add_subdirectory(tools/texc)
@@ -314,6 +416,9 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Git REQUIRED)
     add_subdirectory(tests)
+    if(TARGET laiue_walk)
+        add_test(NAME laiue.example.walk COMMAND laiue_walk)
+    endif()
     add_test(NAME laiue.architecture.boundaries
         COMMAND "${CMAKE_COMMAND}"
             "-DSOURCE_ROOT=${PROJECT_SOURCE_DIR}/src"

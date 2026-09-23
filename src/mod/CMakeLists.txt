@@ -5,6 +5,11 @@ laiue_add_module(mod
         mod_api.h
         mod_host.c
         mod_host.h
+        module_api.h
+        module_manifest.c
+        module_manifest.h
+        module_host.c
+        module_host.h
         mod_internal.c
         mod_internal.h
         mod_manifest.c

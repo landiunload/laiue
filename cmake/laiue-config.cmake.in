@@ -1,4 +1,43 @@
 @PACKAGE_INIT@
 
 include("${CMAKE_CURRENT_LIST_DIR}/laiueTargets.cmake")
+
+# `laiue::bootstrap` is a deliberately static, minimal entry point. It is
+# installed outside the legacy aggregate export because its platform archive
+# is private to the selected target, so materialise both imported archives
+# here with the correct system link dependencies.
+if(NOT TARGET laiue::bootstrap)
+    if(WIN32)
+        set(_laiue_bootstrap_archive
+            "${PACKAGE_PREFIX_DIR}/lib/laiue_bootstrap.lib")
+        set(_laiue_platform_archive
+            "${PACKAGE_PREFIX_DIR}/lib/laiue_platform_support.lib")
+        set(_laiue_platform_links "kernel32;bcrypt")
+    else()
+        set(_laiue_bootstrap_archive
+            "${PACKAGE_PREFIX_DIR}/lib/liblaiue_bootstrap.a")
+        set(_laiue_platform_archive
+            "${PACKAGE_PREFIX_DIR}/lib/liblaiue_platform_support.a")
+        include(CMakeFindDependencyMacro)
+        find_dependency(Threads)
+        set(_laiue_platform_links "Threads::Threads;${CMAKE_DL_LIBS}")
+        if(APPLE)
+            find_library(_laiue_security Security REQUIRED)
+            list(APPEND _laiue_platform_links "${_laiue_security}")
+        endif()
+    endif()
+    if(EXISTS "${_laiue_platform_archive}" AND EXISTS "${_laiue_bootstrap_archive}")
+        add_library(laiue::platform_support STATIC IMPORTED)
+        set_target_properties(laiue::platform_support PROPERTIES
+            IMPORTED_LOCATION "${_laiue_platform_archive}"
+            INTERFACE_LINK_LIBRARIES "${_laiue_platform_links}")
+        add_library(laiue::bootstrap STATIC IMPORTED)
+        set_target_properties(laiue::bootstrap PROPERTIES
+            IMPORTED_LOCATION "${_laiue_bootstrap_archive}"
+            INTERFACE_INCLUDE_DIRECTORIES
+                "${PACKAGE_PREFIX_DIR}/include/laiue"
+            INTERFACE_COMPILE_DEFINITIONS LAIUE_STATIC=1
+            INTERFACE_LINK_LIBRARIES laiue::platform_support)
+    endif()
+endif()
 check_required_components(laiue)

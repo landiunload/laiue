@@ -10,5 +10,7 @@ laiue_add_module(numeric
     SOURCES
         infinite_coord.c
         infinite_coord.h
+        numeric_service.h
+        module_entry.c
         ../api.h
 )

@@ -1,10 +1,10 @@
 # laiue
 
-`laiue` 0.7.0 — встраиваемый воксельный движок на C17. Репозиторий
-содержит библиотечные runtime-модули: бесконечные координаты и разреженный
-мир, физику, построение чанковых мешей, рендер на D3D12 или Vulkan, окно,
-ввод, микшер звука, сцену, UI, каталог визуального содержимого и host для
-нативных модов.
+`laiue` 0.7.0 — набор подключаемых технологических модулей на C17. Воксельный
+мир, физика, графика, окно, ввод, UI, звук и ресурсы — отдельные технологии;
+приложение выбирает нужный граф. В репозитории сохраняется совместимый
+воксельный aggregate, но новый путь использует статический bootstrap и
+runtime-сервисы с единым C ABI.
 
 Текущий прикладной проект на этом движке —
 [landiunload/simulation-of-sins](https://github.com/landiunload/simulation-of-sins).
@@ -25,9 +25,13 @@
 | Модуль | Назначение |
 |---|---|
 | `platform_support` | внутренняя граница памяти, locks, файлов и времени |
+| `bootstrap` | статический loader, DAG сервисов, диагностика и static registry |
+| `numeric` | provider `laiue.numeric`: точные бесконечные координаты через service table |
+| `task` | provider `laiue.jobs`: opaque pool и пакетный executor через service table |
+| `content` | provider `laiue.assets`: catalog, active packs и безопасные resource paths |
+| `character` | provider `laiue.character`: детерминированный 128 Hz kinematic controller |
 | `world` | `InfiniteCoord`, rebasing, базовый provider и разреженные правки |
 | `physics` | переносимые AABB и столкновения с вокселями |
-| `content` | безопасные имена, категории и выбор паков |
 | `mod` | discovery, ABI v1, versioned services и жизненный цикл нативных модов |
 | `window`, `input` | Windows-окно и Raw Input |
 | `audio` | микшер голосов и звукопаки; WASAPI на Windows, ALSA на Linux |
@@ -35,6 +39,11 @@
 | `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
 | `scene` | камера, streaming, panorama и voxel raycast |
 | `ui` | immediate-mode UI поверх renderer |
+
+Публичные header-only контракты `graphics/graphics_api.h`,
+`voxel/voxel_api.h` и `character/character_api.h` не тянут друг друга и не
+содержат форматов чанков в Graphics API. `examples/walk` — минимальный
+headless-клиент, который использует только bootstrap и эти контракты.
 
 `laiue::engine` объединяет доступные для выбранной платформы модули.
 Windows собирает полный графический набор. При найденном Vulkan SDK
@@ -180,7 +189,10 @@ target_link_libraries(my_application PRIVATE laiue::engine)
 
 Для узкой зависимости доступны цели `laiue::world`, `laiue::physics`,
 `laiue::content`, `laiue::mod` и графические цели установленной
-Windows-сборки.
+Windows-сборки. Для приложения без агрегата используйте
+`laiue::bootstrap`: он не импортирует physics/render/voxel DLL и разрешает
+явно выбранный профиль модулей. Установленный SDK экспортирует этот target
+вместе с `laiue_platform_support`.
 
 ## Mobile и закрытые платформенные адаптеры
 
@@ -294,6 +306,11 @@ Renderer поддерживает подключаемые шейдерпаки 
 Нативные моды поставляются отдельными каталогами `.lmp`. Приложение задаёт
 точный порядок включения и публикует модам только явно зарегистрированные
 versioned services. Это доверенный in-process код, а не sandbox.
+
+Для новых native-технологий используйте единый `LaiueModuleGetApiV1` и
+`module.laiue` metadata из [docs/module_architecture.md](docs/module_architecture.md);
+старый `LaiueModLoadV1` и data/texture/shader packs остаются compatibility
+слоем для существующих проектов и не являются обязательными для bootstrap.
 
 - [архитектура содержимого](docs/content_architecture.md)
 - [форматы содержимого](docs/content_formats.md)
