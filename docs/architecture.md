@@ -29,10 +29,10 @@
 | `input` | Raw Input клавиатуры и мыши |
 | `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
 | `mesh` | greedy meshing областей `World` |
-| `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
+| `render` | backend-neutral graphics device плюс providers D3D12/Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
 | `voxel_render` | композиционный adapter для world/mesh/render; не импортирует эти DLL напрямую |
 | `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |
-| `ui` | immediate-mode UI поверх `render` |
+| `ui` | immediate-mode UI draw lists поверх `laiue.graphics.device` |
 
 Первые пять модулей образуют переносимое ядро. Полный графический набор
 доступен на Windows; Linux дополнительно собирает профиль Vulkan из
@@ -51,10 +51,10 @@ external application
               ├── world ──────── platform_support (numeric service)
               ├── physics ────── platform_support (numeric/jobs services)
               ├── mesh ───────── world
-              ├── render ─────── platform_support (content service)
+              ├── render ─────── platform_support (content и device services)
               ├── voxel_render ─ world + mesh + render (service tables)
               ├── scene ──────── world + mesh + render
-              └── ui ─────────── render + scene
+              └── ui ─────────── graphics.device
 ```
 
 `window` и `input` находятся на Windows-границе и не нужны Linux core;

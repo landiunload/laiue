@@ -45,7 +45,10 @@ DAG: отсутствующий optional файл, отсутствующий pr
 Обычный `LaiueModuleHostLoad` не меняет строгую транзакционную семантику и
 по-прежнему откатывает весь граф при ошибке callback-а. Report предназначен
 только для startup/diagnostics; service tables после разрешения остаются
-прямыми указателями в рабочем цикле.
+прямыми указателями в рабочем цикле. В partial-режиме provider не выбирается
+автоматически: если профиль не связал сервис с конкретным module ID, конфликт
+поставщиков отключает конфликтующую ветвь и записывается в report. Сортировка
+по ID используется только для стабильного порядка запуска.
 
 Для выбора альтернативного поставщика без зависимости от порядка файлов
 используется `LaiueModuleHostLoadProfileV1` и массив
@@ -53,14 +56,16 @@ DAG: отсутствующий optional файл, отсутствующий pr
 Такой выбор проверяется до вызова `create`, не допускает выбора host-owned
 сервиса и отображает проигравший provider как намеренно отключённый в report.
 Совместимый `LaiueModuleHostLoadProfile` остаётся сокращённой формой без
-selections; для него сохраняется детерминированный fallback по ID.
+selections; при конфликте providers он также не делает скрытого fallback.
 
 ## Границы контрактов
 
 Публичные header-only контракты не импортируют друг друга:
 
-* `graphics/graphics_api.h` — буферы, текстуры, draw items и кадр; в нём нет
-  voxel/chunk/pack-типов;
+* `graphics/graphics_api.h` — буферы, текстуры, samplers, pipelines, uploads,
+  draw items и кадр; в нём нет voxel/chunk/pack-типов;
+* `graphics/graphics_device_service.h` — runtime create/resize/destroy для
+  backend-neutral устройства; D3D12 и Vulkan являются providers одной таблицы;
 * `simulation/voxel/voxel_api.h` — sparse block provider, запросы collision и
   meshing;
 * `character/character_api.h` — 128 Hz кинематический контроллер и integer
@@ -116,7 +121,9 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
   `ChunkMesherWorldSource` callback. Он не требует и не импортирует
   `laiue.world`: world, voxel provider или тестовый источник адаптируются
   вызывающей стороной;
-* `laiue.graphics` публикует backend-neutral renderer table, а `laiue.scene`
+* `laiue.graphics` публикует legacy renderer table для существующих scene
+  compatibility-потребителей, а `laiue.graphics.device` публикует общий
+  device/resource contract для новых модулей. `laiue.scene`
   требует этот provider и `laiue.scene_math`, а `laiue.voxel_render` требует
   graphics и остальные перечисленные providers вместо поиска функций в
   глобальном диспетчере;
@@ -125,7 +132,8 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
 * `laiue.window` и `laiue.input` отделены от renderer и публикуются только в
   профилях, где соответствующий OS backend собран.
 * `laiue.ui` публикует backend-neutral draw lists и требует
-  `laiue.graphics` только на runtime-графе; его DLL не импортирует renderer.
+  `laiue.graphics.device` только на runtime-графе; его DLL не импортирует
+  renderer или backend.
 * `laiue.audio` содержит PCM-микшер и offscreen-путь, а `laiue.audio.output`
   отдельно публикует системный вывод. Первый объявляет второй optional:
   удаление output DLL оставляет микшер и игру работоспособными, а запрос

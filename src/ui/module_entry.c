@@ -1,6 +1,6 @@
 #include "ui/ui.h"
 #include "ui/ui_service.h"
-#include "render/graphics_service.h"
+#include "graphics/graphics_device_service.h"
 
 #include <string.h>
 
@@ -8,7 +8,7 @@ _Static_assert(sizeof(LaiueUiQuadV1) == sizeof(LaiueGraphicsUiQuadV1),
                "UI service quad layout must match graphics upload layout");
 
 static const LaiueModuleHostV1 *moduleHost;
-static const LaiueGraphicsServiceV1 *graphicsService;
+static const LaiueGraphicsDeviceServiceV1 *graphicsService;
 
 static uint32_t ContextCreate(void **outContext)
 {
@@ -213,11 +213,13 @@ static uint32_t ModuleStart(void *context)
     graphicsService = NULL;
     uint32_t version = 0u;
     uint32_t size = 0u;
-    graphicsService = (const LaiueGraphicsServiceV1 *)moduleHost->queryService(
-        moduleHost->context, LAIUE_GRAPHICS_SERVICE_NAME,
-        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1, sizeof(LaiueGraphicsServiceV1),
+    graphicsService = (const LaiueGraphicsDeviceServiceV1 *)moduleHost->queryService(
+        moduleHost->context, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+        LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueGraphicsDeviceServiceV1),
         &version, &size);
-    if (graphicsService == NULL || version < LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1 ||
+    if (graphicsService == NULL ||
+        version < LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1 ||
         size < sizeof(*graphicsService))
     {
         graphicsService = NULL;
@@ -254,7 +256,8 @@ static void ModuleDestroy(void *context)
 
 static const char *const provides[] = {LAIUE_UI_SERVICE_NAME};
 static const LaiueModuleRequirementV1 requiresServices[] = {
-    {LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1},
+    {LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+     LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1},
 };
 
 static const LaiueModuleApiV1 api = {

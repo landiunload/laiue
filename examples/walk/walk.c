@@ -141,6 +141,11 @@ static bool WalkRangeCount(int64_t minimum, int64_t maximum, uint32_t *outCount)
 {
     if (outCount == NULL || maximum < minimum)
         return false;
+    /* A range spanning INT64_MIN cannot be represented by the checked
+     * subtraction below. It is also far outside the bounded swept-AABB
+     * neighbourhood, so reject it before evaluating -minimum. */
+    if (minimum == INT64_MIN)
+        return false;
     int64_t distance = 0;
     if (!AddChecked(maximum, -minimum, &distance) || distance > 64)
         return false;
@@ -258,7 +263,11 @@ static uint32_t WalkSweepAxis(const LaiueVoxelProviderV1 *provider,
     }
     if (!haveCollision)
         return 1u;
-    const int64_t offset = delta > 0 ? -halfExtent : halfExtent + WALK_VOXEL_SIZE;
+    int64_t offset = 0;
+    if (delta > 0)
+        offset = -halfExtent;
+    else if (!AddChecked(halfExtent, WALK_VOXEL_SIZE, &offset))
+        return 0u;
     if (!WalkBlockFacePosition(outPosition, axis, bestBlock, offset))
         return 0u;
     *outCollided = 1u;

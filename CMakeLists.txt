@@ -262,7 +262,9 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_host.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/graphics_api.h"
+install(FILES
+        "${PROJECT_SOURCE_DIR}/src/graphics/graphics_api.h"
+        "${PROJECT_SOURCE_DIR}/src/graphics/graphics_device_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/graphics"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/voxel/voxel_api.h"

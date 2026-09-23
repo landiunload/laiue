@@ -1,0 +1,9 @@
+LAIUE MODULE 1
+id = example.ui.extension
+author = example.author
+version = 1.0.0
+platform = windows-x86_64
+binary = example_ui_extension.dll
+provides = example.ui.extension:1
+requires = laiue.ui:1
+optional = false

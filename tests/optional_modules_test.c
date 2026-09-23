@@ -5,6 +5,7 @@
 #include "mesh/mesher_service.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
+#include "graphics/graphics_device_service.h"
 #include "render/graphics_service.h"
 #include "scene/math_service.h"
 #include "scene/scene_service.h"
@@ -233,6 +234,14 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
             sizeof(LaiueGraphicsServiceV1), &version, &size);
     Expect(fallbackGraphics != NULL && fallbackGraphics->createWithBackend != NULL,
            "graphics service survives missing content provider");
+    const LaiueGraphicsDeviceServiceV1 *fallbackDevice =
+        (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueGraphicsDeviceServiceV1), &version, &size);
+    Expect(fallbackDevice != NULL && fallbackDevice->createDevice != NULL &&
+               fallbackDevice->destroyDevice != NULL,
+           "generic graphics device service survives missing content provider");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 uiGraph[] = {
@@ -305,6 +314,13 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                sceneService != NULL && sceneService->cameraUpdate != NULL &&
                worldService != NULL && worldService->getBlock != NULL,
            "graphics dependency graph services are published");
+    const LaiueGraphicsDeviceServiceV1 *deviceService =
+        (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueGraphicsDeviceServiceV1), &version, &size);
+    Expect(deviceService != NULL && deviceService->getBackend != NULL,
+           "graphics dependency graph exposes the backend-neutral device");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleHostDestroy(host);

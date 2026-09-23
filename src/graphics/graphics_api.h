@@ -50,6 +50,34 @@ typedef struct LaiueGraphicsTextureDescV1
     uint32_t usageFlags;
 } LaiueGraphicsTextureDescV1;
 
+typedef struct LaiueGraphicsSamplerDescV1
+{
+    uint32_t structSize;
+    uint32_t minFilter;
+    uint32_t magFilter;
+    uint32_t addressModeU;
+    uint32_t addressModeV;
+    uint32_t addressModeW;
+} LaiueGraphicsSamplerDescV1;
+
+typedef struct LaiueGraphicsPipelineDescV1
+{
+    uint32_t structSize;
+    uint32_t topology;
+    uint32_t vertexStride;
+    LaiueGraphicsHandle vertexShader;
+    LaiueGraphicsHandle fragmentShader;
+} LaiueGraphicsPipelineDescV1;
+
+typedef struct LaiueGraphicsBufferUploadV1
+{
+    uint32_t structSize;
+    LaiueGraphicsHandle buffer;
+    uint64_t offsetBytes;
+    const void *data;
+    uint64_t sizeBytes;
+} LaiueGraphicsBufferUploadV1;
+
 typedef struct LaiueGraphicsDrawItemV1
 {
     LaiueGraphicsHandle pipeline;
@@ -67,6 +95,14 @@ typedef uint32_t (*LaiueGraphicsCreateBufferFn)(LaiueGraphicsDeviceV1 *,
 typedef uint32_t (*LaiueGraphicsCreateTextureFn)(LaiueGraphicsDeviceV1 *,
                                                  const LaiueGraphicsTextureDescV1 *,
                                                  LaiueGraphicsHandle *outTexture);
+typedef uint32_t (*LaiueGraphicsCreateSamplerFn)(LaiueGraphicsDeviceV1 *,
+                                                 const LaiueGraphicsSamplerDescV1 *,
+                                                 LaiueGraphicsHandle *outSampler);
+typedef uint32_t (*LaiueGraphicsCreatePipelineFn)(LaiueGraphicsDeviceV1 *,
+                                                  const LaiueGraphicsPipelineDescV1 *,
+                                                  LaiueGraphicsHandle *outPipeline);
+typedef uint32_t (*LaiueGraphicsUploadBufferFn)(LaiueGraphicsDeviceV1 *,
+                                                const LaiueGraphicsBufferUploadV1 *upload);
 typedef void (*LaiueGraphicsDestroyHandleFn)(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
 typedef uint32_t (*LaiueGraphicsBeginFrameFn)(LaiueGraphicsDeviceV1 *, uint32_t width,
                                               uint32_t height);
@@ -82,9 +118,12 @@ struct LaiueGraphicsDeviceV1
     void *context;
     LaiueGraphicsCreateBufferFn createBuffer;
     LaiueGraphicsCreateTextureFn createTexture;
+    LaiueGraphicsCreateSamplerFn createSampler;
+    LaiueGraphicsCreatePipelineFn createPipeline;
+    LaiueGraphicsUploadBufferFn uploadBuffer;
     LaiueGraphicsDestroyHandleFn destroyHandle;
     LaiueGraphicsBeginFrameFn beginFrame;
     LaiueGraphicsSubmitFn submit;
     LaiueGraphicsEndFrameFn endFrame;
-    uintptr_t reserved[8];
+    uintptr_t reserved[5];
 };
