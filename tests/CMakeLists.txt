@@ -436,14 +436,15 @@ if(TARGET laiue_audio)
     laiue_configure_standalone_executable(laiue_audio_api_test AudioApiTestEntryPoint)
     add_test(NAME laiue.audio.mixer COMMAND laiue_audio_api_test)
 
-    if(TARGET laiue_audio_pack_legacy)
+    if(TARGET laiue_audio_pack AND TARGET laiue_content AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
         add_executable(laiue_audio_pack_test audio_pack_test.c mp3_fixtures.h)
-        target_link_libraries(laiue_audio_pack_test PRIVATE
-            laiue_audio_pack_legacy
-            laiue_audio
-            laiue_content)
+        target_link_libraries(laiue_audio_pack_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_audio_pack_test PRIVATE LAIUE_STATIC=1)
         laiue_configure_standalone_executable(
             laiue_audio_pack_test AudioPackTestEntryPoint)
+        add_dependencies(laiue_audio_pack_test
+            laiue_audio_pack laiue_audio laiue_content)
         add_test(NAME laiue.audio.packs COMMAND laiue_audio_pack_test)
     endif()
 
@@ -461,19 +462,10 @@ if(TARGET laiue_audio)
 endif()
 
 if(TARGET laiue_media_support)
-    # Запись `.la` проверяется вместе с движком: круг замыкается
-    # настоящим декодером, если звуковая подсистема в этом профиле
-    # собрана. Без неё остаются разбор WAV и размеры контейнера — они
-    # от звука не зависят.
+    # Конвертер проверяется отдельно от provider-а: его формат и разбор WAV
+    # не должны притягивать аудио DLL в минимальный профиль.
     add_executable(laiue_soundc_test soundc_test.c)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
-    if(TARGET laiue_audio AND TARGET laiue_audio_pack_legacy)
-        target_link_libraries(laiue_soundc_test PRIVATE
-            laiue_audio_pack_legacy
-            laiue_audio)
-        target_compile_definitions(laiue_soundc_test PRIVATE
-            LAIUE_SOUNDC_TEST_WITH_AUDIO=1)
-    endif()
     laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)
     add_test(NAME laiue.tools.soundc COMMAND laiue_soundc_test)
 endif()

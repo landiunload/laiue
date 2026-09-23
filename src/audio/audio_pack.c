@@ -16,9 +16,8 @@
 
 /* The decoder is usable without the mixer or catalog DLL being linked into
  * this image.  The bootstrap installs these service tables before a pack
- * module is started; the legacy compatibility target supplies an in-process
- * adapter.  Keep the lookup in one place so every public operation has the
- * same fail-closed behaviour when a dependency is absent. */
+ * module is started.  Keep the lookup in one place so every public operation
+ * has the same fail-closed behaviour when a dependency is absent. */
 static const AudioPackRuntime *PackRuntime(void)
 {
     return AudioPackRuntimeGet();
@@ -969,20 +968,4 @@ void AudioPackListRelease(AudioPackList *list)
     PlatformFree(list->entries);
     list->entries = NULL;
     list->count = 0u;
-}
-
-bool AudioPackEnumerate(AudioPackList *outList)
-{
-    const LaiueContentServiceV1 *content = PackContent();
-    return content != NULL && content->defaultCatalog != NULL
-               ? AudioPackEnumerateFrom(content->defaultCatalog(), outList)
-               : false;
-}
-
-bool AudioPackActivate(const wchar_t *name)
-{
-    const LaiueContentServiceV1 *content = PackContent();
-    return content != NULL && content->defaultCatalog != NULL
-               ? AudioPackActivateIn(content->defaultCatalog(), name)
-               : false;
 }

@@ -2,9 +2,8 @@
 // разобрать нельзя, и круговой проход кодировщик — декодер движка.
 //
 // Проверяется ровно тот код, который выполняет инструмент: тест линкует
-// его ядро, а не повторяет логику. Круг замыкается настоящим декодером
-// из laiue_audio — так ошибка в кодировщике не может спрятаться за
-// симметричной ошибкой в проверке.
+// его ядро, а не повторяет логику. Декодирование готового provider-модуля
+// проверяется отдельно через bootstrap-тест звукопаков.
 
 #include "media/la_encode.h"
 #include "media/wave_decode.h"
@@ -12,22 +11,12 @@
 #include "platform/system.h"
 #include "test_runtime.h"
 
-#if defined(LAIUE_SOUNDC_TEST_WITH_AUDIO)
-#include "audio/audio.h"
-#include "audio/audio_offscreen.h"
-#include "audio/audio_pack.h"
-#endif
-
 #include <stdbool.h>
 #include <stdint.h>
 
 #define TEST_FRAMES 512u
 #define TEST_SAMPLE_RATE 48000u
 #define WAVE_CAPACITY 16384u
-
-// Панорама равной мощности сохраняет суммарную мощность, а не амплитуду
-// канала: голос по центру звучит в каждом канале с усилением 1/sqrt(2).
-#define CENTRE_GAIN 0.70710678f
 
 // Обёртка над дескриптором: тест проверяет кодирование, а не то, как
 // заполняется структура, и от этого читается лучше.
@@ -160,7 +149,6 @@ typedef struct TestBuffers
 {
     int16_t reference[TEST_FRAMES];
     int16_t decoded[TEST_FRAMES * 2u];
-    int16_t stereo[TEST_FRAMES * 2u];
     uint8_t wave[WAVE_CAPACITY];
     uint8_t payload[TEST_FRAMES * 2u * 8u];
     uint8_t encoded[SOUND_LA_HEADER_BYTES + TEST_FRAMES * 2u * 2u];
@@ -365,82 +353,6 @@ LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
     Expect(SoundEncodeClip(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, SOUND_ENCODING_PCM16,
                     buffers->encoded, SOUND_LA_HEADER_BYTES, NULL) == SOUND_BUFFER_TOO_SMALL,
            "a short buffer must be reported, not overrun");
-
-#if defined(LAIUE_SOUNDC_TEST_WITH_AUDIO)
-    // === Круг замыкается декодером движка ===
-    AudioDeviceConfiguration configuration = {
-        .backend = AUDIO_BACKEND_OFFSCREEN,
-        .sampleRate = TEST_SAMPLE_RATE,
-        .frameCountHint = TEST_FRAMES,
-        .masterVolume = 1.0f,
-    };
-    AudioDevice *device = NULL;
-    Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
-           "offscreen device could not be created");
-
-    float *frames = PlatformAllocate(TEST_FRAMES * 2u * sizeof(float), true);
-    Expect(frames != NULL, "mix buffer could not be allocated");
-
-    uint32_t written = 0u;
-    Expect(SoundEncodeClip(buffers->reference, TEST_FRAMES, 1u, TEST_SAMPLE_RATE, SOUND_ENCODING_PCM16,
-                    buffers->encoded, sizeof(buffers->encoded), &written) == SOUND_OK,
-           "pcm16 encoding must succeed");
-
-    AudioPackLoadStatus status = AUDIO_PACK_LOAD_NOT_ATTEMPTED;
-    AudioClip *clip = AudioClipLoadMemory(device, buffers->encoded, written, &status);
-    Expect(clip != NULL && status == AUDIO_PACK_LOAD_OK, "the engine must accept the written file");
-    Expect(AudioVoicePlay(device, clip, NULL) != AUDIO_VOICE_NONE, "the clip must be playable");
-    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
-    for (uint32_t index = 0; index < TEST_FRAMES; ++index)
-    {
-        int32_t decoded = (int32_t)(frames[index * 2u] / CENTRE_GAIN * 32768.0f);
-        Expect(AbsoluteDifference(decoded, buffers->reference[index]) <= 2,
-               "pcm16 must reach the mixer unchanged");
-    }
-    AudioClipDestroy(clip);
-    AudioDeviceStopAllVoices(device);
-    AudioDeviceRenderFrames(device, frames, TEST_FRAMES);
-
-    // ADPCM стерео: каналы кодируются по отдельности, поэтому проверяется
-    // и то, что они не перепутались.
-    for (uint32_t index = 0; index < TEST_FRAMES; ++index)
-    {
-        buffers->stereo[index * 2u] = buffers->reference[index];
-        buffers->stereo[index * 2u + 1u] = (int16_t)(-buffers->reference[index]);
-    }
-    Expect(SoundEncodeClip(buffers->stereo, TEST_FRAMES, 2u, TEST_SAMPLE_RATE, SOUND_ENCODING_ADPCM,
-                    buffers->encoded, sizeof(buffers->encoded), &written) == SOUND_OK,
-           "adpcm encoding must succeed");
-    // Сравниваются полезные нагрузки: заголовок и состояние каналов —
-    // постоянные накладные расходы, к сжатию отношения не имеющие.
-    Expect((written - SOUND_LA_HEADER_BYTES) * 4u < TEST_FRAMES * 4u + 64u,
-           "adpcm must be about four times smaller than pcm16");
-
-    clip = AudioClipLoadMemory(device, buffers->encoded, written, &status);
-    Expect(clip != NULL && status == AUDIO_PACK_LOAD_OK, "the engine must accept the adpcm file");
-    Expect(AudioVoicePlay(device, clip, NULL) != AUDIO_VOICE_NONE, "the adpcm clip must be playable");
-    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
-
-    int32_t worstError = 0;
-    for (uint32_t index = 0; index < TEST_FRAMES; ++index)
-    {
-        int32_t left = (int32_t)(frames[index * 2u] / CENTRE_GAIN * 32768.0f);
-        int32_t right = (int32_t)(frames[index * 2u + 1u] / CENTRE_GAIN * 32768.0f);
-        int32_t error = AbsoluteDifference(left, buffers->reference[index]);
-        if (error > worstError) worstError = error;
-        error = AbsoluteDifference(right, -(int32_t)buffers->reference[index]);
-        if (error > worstError) worstError = error;
-    }
-    // На этом сигнале кодек даёт около 70 единиц из 32768. Порог взят с
-    // запасом вчетверо: он ловит расхождение с декодером или потерянный
-    // начальный шаг, но не срабатывает от разницы округления.
-    Expect(worstError < 300, "the adpcm round trip must stay close to the original signal");
-    Expect(worstError > 0, "a lossy codec that reproduces the input exactly is suspicious");
-
-    AudioClipDestroy(clip);
-    PlatformFree(frames);
-    AudioDeviceDestroy(device);
-#endif
 
     PlatformFree(buffers);
     LaiueTestRuntimeWrite("soundc test passed\n");

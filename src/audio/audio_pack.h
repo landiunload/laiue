@@ -81,7 +81,3 @@ LAIUE_AUDIO_API AudioClip *AudioClipLoadFile(AudioDevice *device, const wchar_t 
 // доставляют содержимое своим способом (архив, сеть, app bundle).
 LAIUE_AUDIO_API AudioClip *AudioClipLoadMemory(AudioDevice *device, const void *bytes,
                                                uint32_t sizeBytes, AudioPackLoadStatus *outStatus);
-
-// Совместимые обёртки поверх каталога, укоренённого в каталоге программы.
-LAIUE_AUDIO_API bool AudioPackEnumerate(AudioPackList *outList);
-LAIUE_AUDIO_API bool AudioPackActivate(const wchar_t *name);

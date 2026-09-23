@@ -4,9 +4,8 @@
 #include "content/content_service.h"
 
 /* Internal indirection used by the pack component.  The standalone module
- * receives these tables from the bootstrap; the legacy compatibility target
- * supplies a local adapter.  Consequently the standalone pack DLL has no
- * import dependency on either the mixer or the content DLL. */
+ * receives these tables from the bootstrap, so the pack DLL has no import
+ * dependency on either the mixer or the content DLL. */
 typedef struct AudioPackRuntime
 {
     const LaiueAudioServiceV1 *audio;

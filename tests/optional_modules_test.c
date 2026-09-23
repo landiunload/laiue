@@ -97,6 +97,20 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
            "audio service is published");
     LaiueModuleHostUnloadAll(host);
 
+    /* A present pack provider must not silently degrade when its mixer
+     * dependency is absent: the host rejects only that graph and remains
+     * usable for unrelated technologies. */
+    LaiueModuleBinaryV1 packWithoutAudio[] = {
+        {audioPackPath, 0u, NULL},
+        {contentPath, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, packWithoutAudio,
+                               sizeof(packWithoutAudio) / sizeof(packWithoutAudio[0]),
+                               &diagnostic) == LAIUE_MODULE_DEPENDENCY_MISSING,
+           "audio pack without mixer must report its missing dependency");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "failed audio pack graph must roll back completely");
+
     /* The pack provider is a real dependency graph: its DLL has no imports
      * from either provider and receives both tables only after the host has
      * started them.  Listing it first also checks that ordering is resolved

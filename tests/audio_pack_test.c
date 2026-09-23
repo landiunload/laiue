@@ -8,14 +8,32 @@
 
 #include "audio/audio.h"
 #include "audio/audio_offscreen.h"
+#include "audio/audio_service.h"
 #include "audio/audio_pack.h"
+#include "audio/audio_pack_service.h"
 #include "content/content_catalog.h"
+#include "content/content_service.h"
+#include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 #include "mp3_fixtures.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#if defined(_WIN32)
+#define AUDIO_MODULE_NAME L"laiue_audio.dll"
+#define AUDIO_PACK_MODULE_NAME L"laiue_audio_pack.dll"
+#define CONTENT_MODULE_NAME L"laiue_content.dll"
+#elif defined(__APPLE__)
+#define AUDIO_MODULE_NAME L"liblaiue_audio.dylib"
+#define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.dylib"
+#define CONTENT_MODULE_NAME L"liblaiue_content.dylib"
+#else
+#define AUDIO_MODULE_NAME L"liblaiue_audio.so"
+#define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.so"
+#define CONTENT_MODULE_NAME L"liblaiue_content.so"
+#endif
 
 #define TEST_SAMPLE_RATE 48000u
 #define TEST_FRAMES 512u
@@ -36,6 +54,108 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeWrite("\n");
     LaiueTestRuntimeExit(1);
 }
+
+/* The pack test talks to the same tables an application receives.  Keeping
+ * these adapters in the test avoids linking the provider implementation into
+ * the test executable and therefore catches accidental cross-DLL imports. */
+static const LaiueAudioServiceV1 *audioService;
+static const LaiueAudioPackServiceV1 *audioPackService;
+static const LaiueContentServiceV1 *contentService;
+
+static LaiueContentCatalog *TestContentCatalogCreate(const wchar_t *root)
+{
+    return contentService->createCatalog(root);
+}
+
+static void TestContentCatalogDestroy(LaiueContentCatalog *catalog)
+{
+    contentService->destroyCatalog(catalog);
+}
+
+static AudioResult TestAudioDeviceCreate(const AudioDeviceConfiguration *configuration,
+                                         AudioDevice **outDevice)
+{
+    return (AudioResult)audioService->deviceCreate(configuration, outDevice);
+}
+
+static void TestAudioDeviceDestroy(AudioDevice *device)
+{
+    audioService->deviceDestroy(device);
+}
+
+static bool TestAudioDeviceRenderFrames(AudioDevice *device, float *frames, uint32_t count)
+{
+    return audioService->renderFrames(device, frames, count) != 0u;
+}
+
+static void TestAudioDeviceStopAllVoices(AudioDevice *device)
+{
+    audioService->stopAll(device);
+}
+
+static void TestAudioClipDestroy(AudioClip *clip)
+{
+    audioService->clipDestroy(clip);
+}
+
+static double TestAudioClipDurationSeconds(const AudioClip *clip)
+{
+    return audioService->clipDuration(clip);
+}
+
+static AudioVoice TestAudioVoicePlay(AudioDevice *device, const AudioClip *clip,
+                                     const AudioVoiceParameters *parameters)
+{
+    return audioService->voicePlay(device, clip, parameters);
+}
+
+static bool TestAudioVoiceIsActive(const AudioDevice *device, AudioVoice voice)
+{
+    return audioService->voiceIsActive(device, voice) != 0u;
+}
+
+static bool TestAudioPackEnumerateFrom(LaiueContentCatalog *catalog, AudioPackList *outList)
+{
+    return audioPackService->enumerate(catalog, outList) != 0u;
+}
+
+static bool TestAudioPackActivateIn(LaiueContentCatalog *catalog, const wchar_t *name)
+{
+    return audioPackService->activate(catalog, name) != 0u;
+}
+
+static void TestAudioPackListRelease(AudioPackList *list)
+{
+    audioPackService->releaseList(list);
+}
+
+static bool TestAudioPackEnumerateSoundsFrom(LaiueContentCatalog *catalog,
+                                             AudioPackList *outList)
+{
+    return audioPackService->enumerateSounds(catalog, outList) != 0u;
+}
+
+static AudioClip *TestAudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
+                                        const wchar_t *name, AudioPackLoadStatus *status)
+{
+    return audioPackService->loadFrom(device, catalog, name, status);
+}
+
+#define LaiueContentCatalogCreate TestContentCatalogCreate
+#define LaiueContentCatalogDestroy TestContentCatalogDestroy
+#define AudioDeviceCreate TestAudioDeviceCreate
+#define AudioDeviceDestroy TestAudioDeviceDestroy
+#define AudioDeviceRenderFrames TestAudioDeviceRenderFrames
+#define AudioDeviceStopAllVoices TestAudioDeviceStopAllVoices
+#define AudioClipDestroy TestAudioClipDestroy
+#define AudioClipDurationSeconds TestAudioClipDurationSeconds
+#define AudioVoicePlay TestAudioVoicePlay
+#define AudioVoiceIsActive TestAudioVoiceIsActive
+#define AudioPackEnumerateFrom TestAudioPackEnumerateFrom
+#define AudioPackActivateIn TestAudioPackActivateIn
+#define AudioPackListRelease TestAudioPackListRelease
+#define AudioPackEnumerateSoundsFrom TestAudioPackEnumerateSoundsFrom
+#define AudioClipLoadFrom TestAudioClipLoadFrom
 
 static bool Join(wchar_t *destination, uint32_t capacity, const wchar_t *base, const wchar_t *part)
 {
@@ -223,6 +343,9 @@ static void FillTriangle(int16_t *samples, uint32_t frameCount)
 typedef struct AudioPackTestPaths
 {
     wchar_t executable[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t audioModule[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t audioPackModule[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t contentModule[LAIUE_PLATFORM_PATH_CAPACITY];
     wchar_t root[LAIUE_PLATFORM_PATH_CAPACITY];
     wchar_t sounds[LAIUE_PLATFORM_PATH_CAPACITY];
     wchar_t basePack[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -294,7 +417,13 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
 
     Expect(PlatformExecutableDirectory(paths->executable, LAIUE_PLATFORM_PATH_CAPACITY),
            "executable directory");
-    Expect(Join(paths->root, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
+    Expect(Join(paths->audioModule, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
+                AUDIO_MODULE_NAME) &&
+               Join(paths->audioPackModule, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
+                    AUDIO_PACK_MODULE_NAME) &&
+               Join(paths->contentModule, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
+                    CONTENT_MODULE_NAME) &&
+               Join(paths->root, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
                 L"audio_pack_test_v1") &&
                Join(paths->sounds, LAIUE_PLATFORM_PATH_CAPACITY, paths->root, L"sounds") &&
                Join(paths->basePack, LAIUE_PLATFORM_PATH_CAPACITY, paths->sounds, L"Base.lap") &&
@@ -359,7 +488,45 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
     Expect(PlatformWriteEntireFile(paths->modSound, pcmFile, LA_HEADER_SIZE + pcmPayload),
            "replacement sound could not be written");
 
-    // === Каталог и устройство ===
+    // === Каталог и устройство через настоящий provider-граф ===
+    LaiueModuleHostConfigV1 hostConfig;
+    LaiueModuleHostConfigInitialize(&hostConfig);
+    LaiueModuleDiagnostic diagnostic;
+    LaiueModuleHost *host = LaiueModuleHostCreate(&hostConfig, &diagnostic);
+    Expect(host != NULL, "module host could not be created");
+
+    LaiueModuleBinaryV1 providers[] = {
+        {paths->audioPackModule, 0u, NULL},
+        {paths->audioModule, 0u, NULL},
+        {paths->contentModule, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, providers,
+                               (uint32_t)(sizeof(providers) / sizeof(providers[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+
+    uint32_t serviceVersion = 0u;
+    uint32_t serviceSize = 0u;
+    audioService = (const LaiueAudioServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_AUDIO_SERVICE_NAME, LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueAudioServiceV1), &serviceVersion, &serviceSize);
+    Expect(audioService != NULL && serviceVersion >= LAIUE_AUDIO_SERVICE_ABI_VERSION_1 &&
+               serviceSize >= sizeof(*audioService) && audioService->deviceCreate != NULL,
+           "audio service is unavailable");
+    audioPackService = (const LaiueAudioPackServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_AUDIO_PACK_SERVICE_NAME, LAIUE_AUDIO_PACK_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueAudioPackServiceV1), &serviceVersion, &serviceSize);
+    Expect(audioPackService != NULL &&
+               serviceVersion >= LAIUE_AUDIO_PACK_SERVICE_ABI_VERSION_1 &&
+               serviceSize >= sizeof(*audioPackService) && audioPackService->loadFrom != NULL,
+           "audio pack service is unavailable");
+    contentService = (const LaiueContentServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_CONTENT_SERVICE_NAME, LAIUE_CONTENT_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueContentServiceV1), &serviceVersion, &serviceSize);
+    Expect(contentService != NULL && serviceVersion >= LAIUE_CONTENT_SERVICE_ABI_VERSION_1 &&
+               serviceSize >= sizeof(*contentService) && contentService->createCatalog != NULL,
+           "content service is unavailable");
+
     LaiueContentCatalog *catalog = LaiueContentCatalogCreate(paths->root);
     Expect(catalog != NULL, "catalog could not be created");
 
@@ -827,6 +994,8 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
     PlatformFree(paths);
     AudioDeviceDestroy(device);
     LaiueContentCatalogDestroy(catalog);
+    LaiueModuleHostUnloadAll(host);
+    LaiueModuleHostDestroy(host);
 
     LaiueTestRuntimeWrite("Audio pack checks passed\n");
     LAIUE_TEST_SUCCESS();
