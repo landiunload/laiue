@@ -1,4 +1,5 @@
 #include "physics/rigid_body.h"
+#include "physics/numeric_provider.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"
 
@@ -355,6 +356,7 @@ static void WriteHash(uint64_t hash)
 
 LAIUE_TEST_ENTRY(RigidCacheTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     TestInvalidCapacityAndIds();
     TestSleepingImpactAndRemovedSupport();
     TestCommonOriginTranslation();

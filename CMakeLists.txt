@@ -230,6 +230,7 @@ install(FILES "${PROJECT_SOURCE_DIR}/src/numeric/infinite_coord.h"
 install(FILES
     "${PROJECT_SOURCE_DIR}/src/simulation/world/world.h"
     "${PROJECT_SOURCE_DIR}/src/simulation/world/world_service.h"
+    "${PROJECT_SOURCE_DIR}/src/simulation/world/numeric_provider.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/world"
     COMPONENT Engine)
 install(FILES
@@ -238,6 +239,7 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_broadphase.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/voxel_body.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/physics_service.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/numeric_provider.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/jobs/task/task_pool.h"
@@ -315,6 +317,7 @@ if(TARGET laiue_render)
             "${PROJECT_SOURCE_DIR}/src/graphics/render/chunk_geometry.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/renderer.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/graphics_service.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/ui_quad.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/shader_pack.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_pack.h"

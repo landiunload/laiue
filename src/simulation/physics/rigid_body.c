@@ -3,9 +3,22 @@
 #include "math/scalar.h"
 #include "physics/compound_bvh.h"
 #include "physics/fp_environment.h"
+#include "physics/numeric_provider.h"
 
 #include <float.h>
 #include <string.h>
+
+#define InfiniteCoordInit PhysicsNumericInit
+#define InfiniteCoordDestroy PhysicsNumericDestroy
+#define InfiniteCoordTryCopyAddInt64 PhysicsNumericTryCopyAddInt64
+#define InfiniteCoordTryAddInt64InPlace PhysicsNumericTryAddInt64InPlace
+#define InfiniteCoordDivFloorSmallLow PhysicsNumericDivFloorSmallLow
+#define InfiniteCoordTryAdd PhysicsNumericTryAdd
+#define InfiniteCoordTryCopyNegate PhysicsNumericTryCopyNegate
+#define InfiniteCoordTryCopyShiftLeft PhysicsNumericTryCopyShiftLeft
+#define InfiniteCoordTryCopyShiftRight PhysicsNumericTryCopyShiftRight
+#define InfiniteCoordTrySetFromDouble PhysicsNumericTrySetFromDouble
+#define InfiniteCoordToDoubleSaturating PhysicsNumericToDoubleSaturating
 
 // Парный решатель: два независимых контакта одной полосы раскраски решаются
 // одной 128-битной командой. SSE2 и NEON выполняют точные IEEE-операции над

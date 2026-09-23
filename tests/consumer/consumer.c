@@ -4,6 +4,9 @@
 #include "physics/voxel_body.h"
 #include "physics/rigid_body.h"
 #include "world/world.h"
+#include "world/numeric_provider.h"
+#include "physics/numeric_provider.h"
+#include "numeric/numeric_service.h"
 
 #if defined(LAIUE_CONSUMER_HAS_GRAPHICS)
 #include "render/shader_pack.h"
@@ -11,6 +14,8 @@
 
 int main(void)
 {
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     World* world = WorldCreate(NULL);
     if (world == NULL)
     {

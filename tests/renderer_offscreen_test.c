@@ -5,6 +5,7 @@
 
 #include "content/content_catalog.h"
 #include "render/chunk_geometry.h"
+#include "render/content_provider.h"
 #include "render/renderer.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack.h"
@@ -222,6 +223,7 @@ static bool ColorMatches(const uint8_t color[3], uint8_t red, uint8_t green, uin
 
 LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     if (!RendererBackendIsAvailable(RENDERER_BACKEND_VULKAN))
     {
         LaiueTestRuntimeWrite("No Vulkan backend available; skipping\n");

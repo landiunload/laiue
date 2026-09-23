@@ -106,6 +106,8 @@ laiue_add_module(render
         renderer.h
         graphics_service.h
         module_entry.c
+        content_provider.c
+        content_provider.h
         ui_quad.h
         shader_pack.c
         shader_pack.h
@@ -118,8 +120,6 @@ laiue_add_module(render
         ${chunk_shader_headers}
         ${panorama_shader_headers}
         ${ui_shader_headers}
-    PUBLIC_LINK
-        laiue_content
     LINK
         ${backend_links}
         laiue::media_support)

@@ -87,3 +87,4 @@ typedef struct LaiueNumericServiceV1
 /* A static build cannot have several global LaiueModuleGetApiV1 symbols in
  * one executable, so static registries use this module-specific accessor. */
 LAIUE_NUMERIC_API const LaiueModuleApiV1 *LaiueNumericGetStaticModuleApiV1(void);
+LAIUE_NUMERIC_API const LaiueNumericServiceV1 *LaiueNumericGetStaticServiceV1(void);

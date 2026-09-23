@@ -1,5 +1,6 @@
 #include "physics/rigid_body.h"
 #include "physics/rigid_broadphase.h"
+#include "physics/numeric_provider.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -447,6 +448,7 @@ static void ReportRun(ScaleScene scene, const ScaleRun *indexedRun, const ScaleR
 
 LAIUE_TEST_ENTRY(RigidBroadphaseScaleTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     uint32_t scratchBytes = VoxelRigidBodyStepScratchBytes(SCALE_BODIES);
     uint32_t cacheBytes = VoxelRigidContactCacheBytes(SCALE_BODIES);
     uint32_t indexBytes = VoxelRigidBroadphaseBytes(SCALE_BODIES);

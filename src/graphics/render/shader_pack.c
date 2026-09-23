@@ -1,10 +1,18 @@
 #include "render/shader_pack.h"
+#include "render/content_provider.h"
 #include "platform/system.h"
 
 #include <stddef.h>
 #include <string.h>
 
 #define SHADER_MANIFEST_MAX_BYTES 4096u
+
+#define LaiueContentCatalogEnumerate RendererContentCatalogEnumerate
+#define LaiueContentListRelease RendererContentListRelease
+#define LaiueContentCatalogSetActivePack RendererContentCatalogSetActivePack
+#define LaiueContentCatalogDefault RendererContentDefaultCatalog
+#define LaiueContentCatalogGetActivePack RendererContentCatalogGetActivePack
+#define LaiueContentCatalogBuildPath RendererContentCatalogBuildPath
 
 struct ShaderPackLoadedSet
 {

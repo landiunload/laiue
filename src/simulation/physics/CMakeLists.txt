@@ -6,6 +6,8 @@ laiue_add_module(physics
         compound_bvh.h
         compound_shape.c
         compound_shape.h
+        numeric_provider.c
+        numeric_provider.h
         fp_environment.c
         fp_environment.h
         rigid_broadphase.c
@@ -17,9 +19,6 @@ laiue_add_module(physics
         physics_service.h
         module_entry.c
         ../../api.h
-    PUBLIC_LINK
-        laiue::numeric
-        laiue::task
     LINK
         laiue::math_support
 )

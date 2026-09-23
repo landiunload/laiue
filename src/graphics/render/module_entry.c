@@ -1,4 +1,5 @@
 #include "render/graphics_service.h"
+#include "render/content_provider.h"
 
 #include "content/content_service.h"
 #include "mod/module_api.h"
@@ -50,6 +51,7 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         return 0u;
     moduleState.host = host;
     moduleState.content = NULL;
+    RendererSetContentService(NULL);
     *outContext = &moduleState;
     return 1u;
 }
@@ -59,11 +61,11 @@ static uint32_t ModuleStart(void *context)
     LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
-    state->content = (const LaiueContentServiceV1 *)LaiueModuleQueryRequiredService(
+    RendererSetContentService(NULL);
+    state->content = (const LaiueContentServiceV1 *)LaiueModuleQueryOptionalService(
         state->host, LAIUE_CONTENT_SERVICE_NAME,
         LAIUE_CONTENT_SERVICE_ABI_VERSION_1, sizeof(LaiueContentServiceV1));
-    if (state->content == NULL)
-        return 0u;
+    RendererSetContentService(state->content);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_GRAPHICS_SERVICE_NAME,
         .version = LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
@@ -73,6 +75,7 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->content = NULL;
+        RendererSetContentService(NULL);
         return 0u;
     }
     return 1u;
@@ -85,7 +88,10 @@ static void ModuleStop(void *context)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_GRAPHICS_SERVICE_NAME);
     if (state != NULL)
+    {
         state->content = NULL;
+        RendererSetContentService(NULL);
+    }
 }
 
 static void ModuleDestroy(void *context)
@@ -93,10 +99,11 @@ static void ModuleDestroy(void *context)
     (void)context;
     moduleState.host = NULL;
     moduleState.content = NULL;
+    RendererSetContentService(NULL);
 }
 
 static const char *const provides[] = {LAIUE_GRAPHICS_SERVICE_NAME};
-static const LaiueModuleRequirementV1 requiresServices[] = {
+static const LaiueModuleRequirementV1 optionalServices[] = {
     {LAIUE_CONTENT_SERVICE_NAME, LAIUE_CONTENT_SERVICE_ABI_VERSION_1},
 };
 
@@ -108,10 +115,11 @@ static const LaiueModuleApiV1 api = {
         .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
         .id = "laiue.graphics",
         .version = "1.0.0",
-        .requiresServices = requiresServices,
-        .requiresCount = sizeof(requiresServices) / sizeof(requiresServices[0]),
         .providesServices = provides,
         .providesCount = 1u,
+        .optionalServices = optionalServices,
+        .optionalCount = sizeof(optionalServices) / sizeof(optionalServices[0]),
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
     },
     .create = ModuleCreate,
     .start = ModuleStart,

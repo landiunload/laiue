@@ -3,6 +3,7 @@
 #include "mod/module_api.h"
 #include "mod/module_service.h"
 #include "numeric/numeric_service.h"
+#include "physics/numeric_provider.h"
 #include "task/task_service.h"
 
 typedef struct LaiuePhysicsModuleState
@@ -49,6 +50,7 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     moduleState.host = host;
     moduleState.numeric = NULL;
     moduleState.jobs = NULL;
+    PhysicsSetNumericService(NULL);
     *outContext = &moduleState;
     return 1u;
 }
@@ -58,6 +60,7 @@ static uint32_t ModuleStart(void *context)
     LaiuePhysicsModuleState *state = (LaiuePhysicsModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
+    PhysicsSetNumericService(NULL);
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_NUMERIC_SERVICE_NAME,
         LAIUE_NUMERIC_SERVICE_ABI_VERSION_1, sizeof(LaiueNumericServiceV1));
@@ -70,6 +73,7 @@ static uint32_t ModuleStart(void *context)
         state->jobs = NULL;
         return 0u;
     }
+    PhysicsSetNumericService(state->numeric);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_PHYSICS_SERVICE_NAME,
         .version = LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
@@ -80,6 +84,7 @@ static uint32_t ModuleStart(void *context)
     {
         state->numeric = NULL;
         state->jobs = NULL;
+        PhysicsSetNumericService(NULL);
         return 0u;
     }
     return 1u;
@@ -95,6 +100,7 @@ static void ModuleStop(void *context)
     {
         state->numeric = NULL;
         state->jobs = NULL;
+        PhysicsSetNumericService(NULL);
     }
 }
 
@@ -104,6 +110,7 @@ static void ModuleDestroy(void *context)
     moduleState.host = NULL;
     moduleState.numeric = NULL;
     moduleState.jobs = NULL;
+    PhysicsSetNumericService(NULL);
 }
 
 static const char *const provides[] = {LAIUE_PHYSICS_SERVICE_NAME};

@@ -183,6 +183,21 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(LaiueModuleHostLoadedCount(host) == 0u,
            "failed UI graph rolls back completely");
 
+    /* Graphics owns a built-in texture/shader fallback and only uses the
+     * content catalog when a pack is requested. Removing the asset DLL must
+     * therefore leave the renderer service available. */
+    LaiueModuleBinaryV1 renderWithoutContent = {renderPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(host, &renderWithoutContent, 1u, &diagnostic) ==
+               LAIUE_MODULE_OK,
+           diagnostic.message);
+    const LaiueGraphicsServiceV1 *fallbackGraphics =
+        (const LaiueGraphicsServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueGraphicsServiceV1), &version, &size);
+    Expect(fallbackGraphics != NULL && fallbackGraphics->createWithBackend != NULL,
+           "graphics service survives missing content provider");
+    LaiueModuleHostUnloadAll(host);
+
     LaiueModuleBinaryV1 uiGraph[] = {
         {uiPath, 0u, NULL},
         {renderPath, 0u, NULL},

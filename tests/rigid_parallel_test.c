@@ -1,5 +1,6 @@
 #include "physics/rigid_body.h"
 #include "physics/rigid_broadphase.h"
+#include "physics/numeric_provider.h"
 #include "task/task_pool.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"
@@ -905,6 +906,7 @@ static void WriteCount(const char *label, uint32_t value)
 
 LAIUE_TEST_ENTRY(RigidParallelTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     LaiueTaskPool *pool = LaiueTaskPoolCreate(4u);
     Expect(pool != NULL, "persistent four-participant pool created");
     poolExecutor.structSize = sizeof(poolExecutor);

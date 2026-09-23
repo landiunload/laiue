@@ -14,6 +14,7 @@
 // No-CRT builds must not emit a large stack probe, so every buffer is static.
 
 #include "physics/rigid_body.h"
+#include "physics/numeric_provider.h"
 #include "task/task_pool.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"
@@ -1996,6 +1997,7 @@ static void WriteHash(const char *label, uint64_t hash)
 
 LAIUE_TEST_ENTRY(RigidCompoundTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     InitializeCaches();
     TestMassPropertiesAnalytic();
     TestMassPropertiesReject();

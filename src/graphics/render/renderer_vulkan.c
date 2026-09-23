@@ -11,6 +11,7 @@
 #include "render/renderer.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
+#include "render/content_provider.h"
 #include "platform/system.h"
 
 // Оконный вывод есть только на Windows: поверхность создаётся через
@@ -26,6 +27,8 @@
 #endif
 
 #include <vulkan/vulkan.h>
+
+#define LaiueContentCatalogDefault RendererContentDefaultCatalog
 
 #if defined(_WIN32)
 #include <vulkan/vulkan_win32.h>

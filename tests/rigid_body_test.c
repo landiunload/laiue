@@ -1,4 +1,5 @@
 #include "physics/rigid_body.h"
+#include "physics/numeric_provider.h"
 #include "test_runtime.h"
 
 #include <float.h>
@@ -1136,6 +1137,7 @@ static void TestColoredOverflowReplay(void)
 
 LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     TestDescriptionRefusals();
     TestWorldContactsUseSharedBudget();
     TestRestsOnFloor();

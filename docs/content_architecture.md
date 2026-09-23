@@ -45,6 +45,14 @@ state. При hot reload ошибка сохраняет прежний рабо
 portable installation и несколько профилей не зависят от скрытого current
 directory или process-global пути.
 
+`render` не импортирует `content` напрямую. При запуске module host передаёт
+`LaiueContentServiceV1` через `RendererSetContentService`; прямой статический
+интегратор может получить ту же таблицу через
+`LaiueContentGetStaticServiceV1`. Поэтому DLL рендера можно распространять
+без content-провайдера: GPU и встроенный fallback остаются доступными, а
+операции с текстурными/шейдерными паками дают контролируемый отказ до
+подключения сервиса.
+
 ## Доверие и границы
 
 Имена отклоняются, если содержат абсолютный путь, separators, `..`,

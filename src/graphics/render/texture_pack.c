@@ -1,9 +1,16 @@
 #include "render/texture_pack.h"
 #include "render/texture_pack_internal.h"
 #include "content/content_catalog.h"
+#include "render/content_provider.h"
 #include "platform/system.h"
 
 #include <string.h>
+
+#define LaiueContentPathIsSafe RendererContentPathIsSafe
+#define LaiueContentCatalogEnumerate RendererContentCatalogEnumerate
+#define LaiueContentListRelease RendererContentListRelease
+#define LaiueContentCatalogSetActivePack RendererContentCatalogSetActivePack
+#define LaiueContentCatalogDefault RendererContentDefaultCatalog
 
 
 

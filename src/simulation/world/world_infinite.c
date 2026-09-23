@@ -1,9 +1,18 @@
 #include "world/world.h"
 #include "numeric/infinite_coord.h"
+#include "world/numeric_provider.h"
 #include "platform/system.h"
 
 #include <limits.h>
 #include <string.h>
+
+#define InfiniteCoordInit WorldNumericInit
+#define InfiniteCoordDestroy WorldNumericDestroy
+#define InfiniteCoordTryCopyAddInt64 WorldNumericTryCopyAddInt64
+#define InfiniteCoordEqualsOffsets WorldNumericEqualsOffsets
+#define InfiniteCoordSwap WorldNumericSwap
+#define InfiniteCoordHashOffset WorldNumericHashOffset
+#define InfiniteCoordFormatShortOffsetW WorldNumericFormatShortOffsetW
 
 /* Разбор региона читает буфер сравнением с нулём. SSE2 входит в базовый набор
  * x64, AVX2 включается профилем сборки. Там, где векторного сравнения нет

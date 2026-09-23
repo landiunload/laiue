@@ -12,6 +12,7 @@
 #include "render/texture_pack_internal.h"
 
 #include "content/content_catalog.h"
+#include "render/content_provider.h"
 #include "media/image.h"
 #include "media/lt_encode.h"
 #include "platform/system.h"
@@ -24,6 +25,11 @@
 
 #define TEXTURE_MAX_DIMENSION 4096u
 #define TEXTURE_MAX_FRAMES 256u
+
+#define LaiueContentCatalogBuildResourcePath RendererContentCatalogBuildResourcePath
+#define LaiueContentCatalogOrderFormats RendererContentCatalogOrderFormats
+#define LaiueContentPathIsSafe RendererContentPathIsSafe
+#define LaiueContentCatalogGetActivePack RendererContentCatalogGetActivePack
 
 // Нейтральный слой для материала, которого в паке нет. Молча показать
 // чужую текстуру было бы хуже: серый квадрат сразу виден.

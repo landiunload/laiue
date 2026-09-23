@@ -55,7 +55,7 @@ laiue_configure_standalone_executable(laiue_infinite_coord_test CoordTestEntryPo
 add_test(NAME laiue.numeric.infinite_coord COMMAND laiue_infinite_coord_test)
 
 add_executable(laiue_world_provider_test world_provider_test.c)
-target_link_libraries(laiue_world_provider_test PRIVATE laiue_world)
+target_link_libraries(laiue_world_provider_test PRIVATE laiue_world laiue_numeric)
 laiue_configure_standalone_executable(laiue_world_provider_test WorldProviderTestEntryPoint)
 add_test(NAME laiue.world.provider COMMAND laiue_world_provider_test)
 
@@ -71,7 +71,7 @@ if(TARGET laiue_world AND
 endif()
 
 add_executable(laiue_physics_test physics_test.c)
-target_link_libraries(laiue_physics_test PRIVATE laiue_physics)
+target_link_libraries(laiue_physics_test PRIVATE laiue_physics laiue_numeric)
 laiue_configure_standalone_executable(laiue_physics_test PhysicsTestEntryPoint)
 add_test(NAME laiue.physics.voxel_body COMMAND laiue_physics_test)
 
@@ -88,7 +88,7 @@ if(TARGET laiue_physics AND
 endif()
 
 add_executable(laiue_rigid_body_test rigid_body_test.c)
-target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics)
+target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics laiue_numeric)
 laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPoint)
 add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
 
@@ -315,7 +315,8 @@ endif()
 
 if(TARGET laiue_mesher)
     add_executable(laiue_chunk_mesher_test chunk_mesher_test.c)
-    target_link_libraries(laiue_chunk_mesher_test PRIVATE laiue::mesher laiue::world)
+    target_link_libraries(laiue_chunk_mesher_test PRIVATE
+        laiue::mesher laiue::world laiue::numeric)
     laiue_configure_standalone_executable(
         laiue_chunk_mesher_test ChunkMesherTestEntryPoint)
     add_test(NAME laiue.mesh.chunk_mesher COMMAND laiue_chunk_mesher_test)
@@ -336,7 +337,8 @@ if(TARGET laiue_voxel_raycast)
     add_executable(laiue_voxel_raycast_core_test voxel_raycast_core_test.c)
     target_link_libraries(laiue_voxel_raycast_core_test PRIVATE
         laiue_voxel_raycast
-        laiue_world)
+        laiue_world
+        laiue_numeric)
     laiue_configure_standalone_executable(
         laiue_voxel_raycast_core_test VoxelRaycastCoreTestEntryPoint)
     add_test(NAME laiue.voxel.raycast_core
@@ -348,7 +350,8 @@ if(TARGET laiue_voxel_raycast AND TARGET laiue_voxel_render)
     target_link_libraries(laiue_voxel_raycast_test PRIVATE
         laiue_voxel_raycast
         laiue_voxel_render
-        laiue_world)
+        laiue_world
+        laiue_numeric)
     laiue_configure_standalone_executable(
         laiue_voxel_raycast_test VoxelRaycastTestEntryPoint)
     add_test(NAME laiue.voxel.render_raycast
@@ -363,7 +366,8 @@ if(TARGET laiue_voxel_render)
         chunk_streaming_stress_test.c)
     target_link_libraries(laiue_chunk_streaming_stress_test PRIVATE
         laiue_voxel_render
-        laiue_world)
+        laiue_world
+        laiue_numeric)
     laiue_configure_standalone_executable(
         laiue_chunk_streaming_stress_test ChunkStreamingStressTestEntryPoint)
     add_test(NAME laiue.voxel.render_chunk_streaming_stress
@@ -388,9 +392,12 @@ if(TARGET laiue_render)
     add_executable(laiue_texture_pack_build_test
         texture_pack_build_test.c
         texc_fixtures.h
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.c"
         "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_build.c")
     target_include_directories(laiue_texture_pack_build_test PRIVATE
         "${PROJECT_SOURCE_DIR}/src")
+    target_compile_definitions(laiue_texture_pack_build_test PRIVATE
+        LAIUE_BUILD_RENDER=1)
     target_link_libraries(laiue_texture_pack_build_test PRIVATE
         laiue_content
         laiue::media_support)
@@ -423,7 +430,8 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     add_executable(laiue_renderer_vulkan_instance_ring_test
         renderer_vulkan_instance_ring_test.c)
     target_link_libraries(laiue_renderer_vulkan_instance_ring_test PRIVATE
-        laiue_render)
+        laiue_render
+        laiue_content)
     laiue_configure_standalone_executable(
         laiue_renderer_vulkan_instance_ring_test RendererVulkanInstanceRingTestEntryPoint)
     add_test(NAME laiue.render.vulkan_instance_ring
@@ -446,7 +454,8 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     add_executable(laiue_renderer_vulkan_lifecycle_test
         renderer_vulkan_lifecycle_test.c)
     target_link_libraries(laiue_renderer_vulkan_lifecycle_test PRIVATE
-        laiue_render)
+        laiue_render
+        laiue_content)
     laiue_configure_standalone_executable(
         laiue_renderer_vulkan_lifecycle_test RendererVulkanLifecycleTestEntryPoint)
     add_test(NAME laiue.render.vulkan_lifecycle
@@ -465,7 +474,8 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
     add_executable(laiue_render_dual_backend_test
         render_dual_backend_test.c)
     target_link_libraries(laiue_render_dual_backend_test PRIVATE
-        laiue_render)
+        laiue_render
+        laiue_content)
     laiue_configure_standalone_executable(
         laiue_render_dual_backend_test RenderDualBackendTestEntryPoint)
     add_test(NAME laiue.render.dual_backend
@@ -482,7 +492,8 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12)
     add_executable(laiue_renderer_instance_ring_test
         renderer_instance_ring_test.c)
     target_link_libraries(laiue_renderer_instance_ring_test PRIVATE
-        laiue_render)
+        laiue_render
+        laiue_content)
     laiue_configure_standalone_executable(
         laiue_renderer_instance_ring_test RendererInstanceRingTestEntryPoint)
     add_test(NAME laiue.render.instance_ring

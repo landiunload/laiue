@@ -3,6 +3,7 @@
 #include "mod/module_api.h"
 #include "mod/module_service.h"
 #include "numeric/numeric_service.h"
+#include "world/numeric_provider.h"
 
 typedef struct LaiueWorldModuleState
 {
@@ -33,6 +34,7 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         return 0u;
     moduleState.host = host;
     moduleState.numeric = NULL;
+    WorldSetNumericService(NULL);
     *outContext = &moduleState;
     return 1u;
 }
@@ -42,11 +44,13 @@ static uint32_t ModuleStart(void *context)
     LaiueWorldModuleState *state = (LaiueWorldModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
+    WorldSetNumericService(NULL);
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_NUMERIC_SERVICE_NAME,
         LAIUE_NUMERIC_SERVICE_ABI_VERSION_1, sizeof(LaiueNumericServiceV1));
     if (state->numeric == NULL)
         return 0u;
+    WorldSetNumericService(state->numeric);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_WORLD_SERVICE_NAME,
         .version = LAIUE_WORLD_SERVICE_ABI_VERSION_1,
@@ -56,6 +60,7 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->numeric = NULL;
+        WorldSetNumericService(NULL);
         return 0u;
     }
     return 1u;
@@ -68,7 +73,10 @@ static void ModuleStop(void *context)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_WORLD_SERVICE_NAME);
     if (state != NULL)
+    {
         state->numeric = NULL;
+        WorldSetNumericService(NULL);
+    }
 }
 
 static void ModuleDestroy(void *context)
@@ -76,6 +84,7 @@ static void ModuleDestroy(void *context)
     (void)context;
     moduleState.host = NULL;
     moduleState.numeric = NULL;
+    WorldSetNumericService(NULL);
 }
 
 static const char *const provides[] = {LAIUE_WORLD_SERVICE_NAME};

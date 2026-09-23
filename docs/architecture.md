@@ -21,15 +21,15 @@
 | Модуль | Ответственность |
 |---|---|
 | `platform_support` | внутренняя allocator/locks/files backend-граница |
-| `world` | бесконечное начало координат, внешний base provider и sparse overrides |
-| `physics` | переносимые AABB, sweep и столкновения с воксельной геометрией |
+| `world` | бесконечное начало координат, внешний base provider и sparse overrides; numeric подключается таблицей сервиса |
+| `physics` | переносимые AABB, sweep и столкновения с воксельной геометрией; numeric/jobs подключаются таблицами сервисов |
 | `content` | безопасные имена, каталог форматов и выбор активного пака |
 | `mod` | discovery паков, native ABI и registry versioned services |
 | `window` | Win32-окно и message loop |
 | `input` | Raw Input клавиатуры и мыши |
 | `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
 | `mesh` | greedy meshing областей `World` |
-| `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры |
+| `render` | D3D12 или Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
 | `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |
 | `ui` | immediate-mode UI поверх `render` |
 
@@ -47,10 +47,10 @@ external application
               ├── platform_support
               ├── content
               ├── mod ─────────── platform_support
-              ├── world ──────── platform_support
-              ├── physics
+              ├── world ──────── platform_support (numeric service)
+              ├── physics ────── platform_support (numeric/jobs services)
               ├── mesh ───────── world
-              ├── render ─────── content + platform_support
+              ├── render ─────── platform_support (content service)
               ├── scene ──────── world + mesh + render
               └── ui ─────────── render + scene
 ```
@@ -61,6 +61,17 @@ external application
 Нижние модули не включают заголовки `scene` или `ui`.
 Допустимый include/link-граф задан в `src/*/CMakeLists.txt` и проверяется
 архитектурным тестом.
+
+Стрелки в этой схеме показывают compile-time владение кодом, а не скрытые
+импорты DLL. `world`, `physics` и `render` хранят только проверенную таблицу
+соответствующего сервиса (`WorldSetNumericService`,
+`PhysicsSetNumericService`, `RendererSetContentService`). Runtime-загрузчик
+устанавливает её между `create` и `start` и очищает до `stop`/`destroy`.
+Standalone-приложение, которое вызывает C API напрямую без module host,
+должно явно установить таблицу через `Laiue*GetStaticServiceV1`; иначе
+операции провайдера возвращают безопасный отказ. Поэтому удаление DLL
+отключает только зависящую технологию, а независимые модули продолжают
+загружаться.
 
 `mod` не зависит от игровых типов, `World` или renderer. Приложение
 регистрирует узкие versioned service tables, и только через них нативный мод

@@ -1,4 +1,5 @@
 #include "physics/voxel_body.h"
+#include "physics/numeric_provider.h"
 #include "test_runtime.h"
 
 typedef struct PhysicsTestContext
@@ -240,6 +241,7 @@ static void TestDynamicColliderSource(void)
 
 LAIUE_TEST_ENTRY(PhysicsTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     TestStaticVoxelCollision();
     TestMultiPlaneSweep();
     TestDynamicColliderSource();

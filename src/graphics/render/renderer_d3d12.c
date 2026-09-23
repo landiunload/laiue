@@ -12,10 +12,13 @@
 #include "render/generated/d3d12/ui_vs.h"
 #include "render/generated/d3d12/ui_ps.h"
 #include "render/texture_pack_internal.h"
+#include "render/content_provider.h"
 #include "render/ui_image_wic.h"
 
 #include <stddef.h>
 #include <string.h>
+
+#define LaiueContentCatalogDefault RendererContentDefaultCatalog
 
 // Публичное имя RendererDestroy теперь живёт в renderer_dispatch.c, а
 // путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
@@ -1730,7 +1733,7 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
 
 bool RendererPrepareWorldFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
 {
-    if (renderer == NULL || catalog == NULL)
+    if (renderer == NULL)
         return false;
     if (renderer->worldReady) return true;
 
@@ -2897,7 +2900,7 @@ static bool CreateUiPipelineStateForShaders(Renderer *renderer,
 
 bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
 {
-    if (renderer == NULL || catalog == NULL)
+    if (renderer == NULL)
     {
         return false;
     }

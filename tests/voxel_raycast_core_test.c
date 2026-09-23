@@ -1,4 +1,5 @@
 #include "voxel/raycast.h"
+#include "world/numeric_provider.h"
 #include "test_runtime.h"
 
 static uint32_t checks;
@@ -28,6 +29,7 @@ static BlockType ReadWorld(void *context, int64_t x, int64_t y, int64_t z)
 
 LAIUE_TEST_ENTRY(VoxelRaycastCoreTestEntryPoint)
 {
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     World *world = WorldCreate(NULL);
     Expect(world != NULL, "empty world was not created");
 

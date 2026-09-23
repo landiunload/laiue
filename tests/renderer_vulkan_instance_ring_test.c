@@ -21,6 +21,7 @@
 // маску, и тест падает. Без Vulkan-драйвера тест сообщает SKIP (125).
 
 #include "render/chunk_geometry.h"
+#include "render/content_provider.h"
 #include "render/renderer.h"
 #include "render/renderer_offscreen.h"
 #include "platform/system.h"
@@ -424,6 +425,7 @@ static void RunScenario(Renderer *renderer, RendererMesh *mesh, const RendererMe
 
 LAIUE_TEST_ENTRY(RendererVulkanInstanceRingTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     if (!RendererBackendIsAvailable(RENDERER_BACKEND_VULKAN))
     {
         LaiueTestRuntimeWrite("No Vulkan backend available; skipping\n");

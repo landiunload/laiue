@@ -21,6 +21,7 @@
 #include "render/chunk_geometry.h"
 #include "test_runtime.h"
 #include "world/world.h"
+#include "world/numeric_provider.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -632,6 +633,7 @@ static void TestUniformShortcuts(void)
 
 LAIUE_TEST_ENTRY(ChunkMesherTestEntryPoint)
 {
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     ChunkMesherScratchDestroy(NULL);
     TestUniformShortcuts();
 

@@ -1,5 +1,6 @@
 #include "content/content_catalog.h"
 #include "platform/system.h"
+#include "render/content_provider.h"
 #include "render/shader_pack.h"
 #include "render/texture_pack.h"
 #include "test_runtime.h"
@@ -202,6 +203,7 @@ static void TestPackLoading(LaiueContentCatalog *catalog, RenderPackTestPaths *p
 
 LAIUE_TEST_ENTRY(RenderPackApiTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     RenderPackTestPaths *paths = PlatformAllocate(sizeof(*paths), true);
     PackExpect(paths != NULL, "scratch allocation");
     PreparePack(paths);

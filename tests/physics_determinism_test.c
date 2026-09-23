@@ -1,6 +1,8 @@
 #include "physics/voxel_body.h"
+#include "physics/numeric_provider.h"
 #include "numeric/infinite_coord.h"
 #include "world/world.h"
+#include "world/numeric_provider.h"
 #include "fp_environment_test_support.h"
 #include "test_runtime.h"
 
@@ -566,6 +568,8 @@ static void TestPhysicsAtAbsoluteOriginBeyondInt64(void)
 
 LAIUE_TEST_ENTRY(PhysicsDeterminismTestEntryPoint)
 {
+    PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     LaiueTestSetHostileFpEnvironment();
     DeterminismExpect(!VoxelPhysicsThreadIsConfigured(), "hostile FP environment was not detected");
     VoxelPhysicsConfigureThread();

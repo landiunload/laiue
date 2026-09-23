@@ -58,3 +58,4 @@ typedef struct LaiueContentServiceV1
 } LaiueContentServiceV1;
 
 LAIUE_CONTENT_API const LaiueModuleApiV1 *LaiueContentGetStaticModuleApiV1(void);
+LAIUE_CONTENT_API const LaiueContentServiceV1 *LaiueContentGetStaticServiceV1(void);

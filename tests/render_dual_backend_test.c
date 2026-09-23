@@ -6,6 +6,7 @@
 // голым Win32 и не показывается; Vulkan на этом этапе рисует offscreen.
 
 #include "render/chunk_geometry.h"
+#include "render/content_provider.h"
 #include "render/renderer.h"
 #include "render/renderer_offscreen.h"
 #include "platform/system.h"
@@ -156,6 +157,7 @@ static bool CreateBoth(void *windowHandle, Renderer **outD3D12, Renderer **outVu
 
 LAIUE_TEST_ENTRY(RenderDualBackendTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
 #if !defined(_WIN32)
     LaiueTestRuntimeWrite("The dual backend test needs Win32; skipping\n");
     LaiueTestRuntimeExit(SKIP_EXIT_CODE);

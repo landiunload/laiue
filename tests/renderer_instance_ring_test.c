@@ -8,6 +8,7 @@
 // голым Win32 и не показывается.
 
 #include "render/chunk_geometry.h"
+#include "render/content_provider.h"
 #include "render/renderer.h"
 #include "platform/system.h"
 #include "test_runtime.h"
@@ -147,6 +148,7 @@ static bool RunFrame(Renderer *renderer, const RendererMesh *mesh,
 
 LAIUE_TEST_ENTRY(RendererInstanceRingTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
 #if !defined(_WIN32)
     LaiueTestRuntimeWrite("The instance ring test needs Win32; skipping\n");
     LaiueTestRuntimeExit(SKIP_EXIT_CODE);

@@ -1,4 +1,5 @@
 #include "world/world.h"
+#include "world/numeric_provider.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -998,6 +999,7 @@ static void TestEmptyChunkRemovalBackwardShift(void)
 
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     TestFastPathConcurrentVisibility();
     TestEmptyWorld();
     TestProviderAndMutations();

@@ -33,6 +33,7 @@
 #include "world/world.h"
 #include "platform/system.h"
 #include "test_runtime.h"
+#include "world/numeric_provider.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -1016,6 +1017,7 @@ static void RunRevisionOverflowScenario(int32_t radius)
 
 LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
 {
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     RunConcurrentCenterScenario(2, 0x0C0FFEE0ULL, 400u);
     RunConcurrentCenterScenario(3, 0x0FFFFFFFFULL, 150u);
     RunRandomScenario(2, 0x1111111122222222ULL, 2000u);

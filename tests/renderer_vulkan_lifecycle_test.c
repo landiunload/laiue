@@ -11,6 +11,7 @@
 // чтобы «успешный» кадр с пустым present отличался от работающего.
 
 #include "render/chunk_geometry.h"
+#include "render/content_provider.h"
 #include "render/renderer.h"
 #include "render/renderer_offscreen.h"
 #include "platform/system.h"
@@ -536,6 +537,7 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
 
 LAIUE_TEST_ENTRY(RendererVulkanLifecycleTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
 #if !defined(_WIN32)
     LaiueTestRuntimeWrite("The Vulkan lifecycle test needs Win32; skipping\n");
     LaiueTestRuntimeExit(SKIP_EXIT_CODE);

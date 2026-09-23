@@ -158,6 +158,11 @@ const LaiueModuleApiV1 *LaiueContentGetStaticModuleApiV1(void)
     return &api;
 }
 
+const LaiueContentServiceV1 *LaiueContentGetStaticServiceV1(void)
+{
+    return &service;
+}
+
 #if !defined(LAIUE_STATIC)
 LAIUE_MODULE_EXPORT const LaiueModuleApiV1 *LAIUE_MODULE_CALL LaiueModuleGetApiV1(void)
 {

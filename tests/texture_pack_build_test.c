@@ -16,6 +16,7 @@
 #include "content/content_catalog.h"
 #include "media/lt_encode.h"
 #include "platform/system.h"
+#include "render/content_provider.h"
 #include "render/texture_pack_internal.h"
 #include "test_runtime.h"
 #include "texc_fixtures.h"
@@ -684,6 +685,7 @@ static TEXTURE_TEST_NOINLINE void TestColdWarmEquality(LaiueContentCatalog *cata
 
 LAIUE_TEST_ENTRY(TexturePackBuildTestEntryPoint)
 {
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     TestPaths *paths = PlatformAllocate(sizeof(*paths), true);
     Expect(paths != NULL, "path scratch allocation");
 
