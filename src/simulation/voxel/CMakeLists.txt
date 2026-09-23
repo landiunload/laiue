@@ -14,6 +14,11 @@ laiue_add_module(voxel_raycast
         raycast_module_entry.c
         raycast_service.h
         ../../api.h
-    LINK
-        laiue_world
 )
+
+if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
+    target_link_libraries(laiue_voxel_raycast PRIVATE laiue_world)
+else()
+    target_compile_definitions(laiue_voxel_raycast PRIVATE
+        LAIUE_VOXEL_RAYCAST_NO_WORLD_IMPORT=1)
+endif()

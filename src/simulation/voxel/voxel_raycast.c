@@ -45,11 +45,11 @@ static bool CheckedAddStep(int64_t value, int64_t step, int64_t* output)
     return true;
 }
 
-bool VoxelRaycast(World* world, const double origin[3],
-    const float direction[3], float maximumDistance,
-    VoxelRaycastHit* outHit)
+bool VoxelRaycastWithBlockQuery(void *context, VoxelRaycastGetBlockFn getBlock,
+    const double origin[3], const float direction[3],
+    float maximumDistance, VoxelRaycastHit *outHit)
 {
-    if (world == NULL || origin == NULL || direction == NULL ||
+    if (context == NULL || getBlock == NULL || origin == NULL || direction == NULL ||
         outHit == NULL || !FiniteFloat(maximumDistance) ||
         !(maximumDistance > 0.0f) ||
         maximumDistance > VOXEL_RAYCAST_MAX_DISTANCE)
@@ -114,7 +114,7 @@ bool VoxelRaycast(World* world, const double origin[3],
         }
         tMaximum[axis] += tDelta[axis];
 
-        if (WorldGetBlock(world, block[0], block[1], block[2]) != BLOCK_AIR)
+        if (getBlock(context, block[0], block[1], block[2]) != BLOCK_AIR)
         {
             outHit->block[0] = block[0];
             outHit->block[1] = block[1];
@@ -128,3 +128,17 @@ bool VoxelRaycast(World* world, const double origin[3],
         }
     }
 }
+
+#if !defined(LAIUE_VOXEL_RAYCAST_NO_WORLD_IMPORT)
+static BlockType DirectWorldGetBlock(void *context, int64_t x, int64_t y, int64_t z)
+{
+    return WorldGetBlock((World *)context, x, y, z);
+}
+
+bool VoxelRaycast(World *world, const double origin[3], const float direction[3],
+    float maximumDistance, VoxelRaycastHit *outHit)
+{
+    return VoxelRaycastWithBlockQuery(world, DirectWorldGetBlock, origin, direction,
+                                      maximumDistance, outHit);
+}
+#endif

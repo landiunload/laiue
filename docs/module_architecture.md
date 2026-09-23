@@ -73,6 +73,12 @@ sweep-а. Он работает без `physics.dll`; collision provider ост�
 enumeration. Оно не генерирует ландшафт и намеренно не строит mesh: meshing и
 связка с graphics остаются отдельными технологиями.
 
+`laiue_voxel_raycast` принимает чтение блока как callback. В dynamic-профиле
+его DLL получает `laiue.world` через `queryService` и не имеет импортов другой
+LAIUE DLL; отсутствие мира поэтому диагностируется загрузчиком как обычная
+ошибка графа, а не как падение загрузчика ОС. Статический путь сохраняет
+совместимую обёртку `VoxelRaycast(World*)`.
+
 Остальные providers используют тот же entry point и lifecycle ABI:
 
 * `laiue.world` публикует операции бесконечного мира и явно требует
@@ -92,6 +98,11 @@ enumeration. Оно не генерирует ландшафт и намерен
 Таким образом, отсутствие physics, voxel-render, UI, audio или window artifact
 не делает bootstrap недействительным: профиль получает только диагностику
 неразрешённого required service, а независимые providers продолжают работать.
+
+Остальные адаптеры пока сохраняют явные link-зависимости на свои provider DLL,
+но эти зависимости перечислены в дескрипторах и проверяются до `start`. Их
+перевод на те же runtime service callbacks выполняется по одному модулю, чтобы
+не менять физику, meshing и renderer одновременно.
 
 Интеграционные тесты загружают реальные `laiue_numeric`, `laiue_task`,
 `laiue_content`, `laiue_character` и `laiue_voxel` DLL, вызывают сервисные таблицы и
