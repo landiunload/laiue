@@ -2,10 +2,12 @@
 
 #include "content/content_service.h"
 #include "mod/module_api.h"
+#include "mod/module_service.h"
 
 typedef struct LaiueGraphicsModuleState
 {
     const LaiueModuleHostV1 *host;
+    const LaiueContentServiceV1 *content;
 } LaiueGraphicsModuleState;
 
 static LaiueGraphicsModuleState moduleState;
@@ -44,9 +46,10 @@ static const LaiueGraphicsServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
     moduleState.host = host;
+    moduleState.content = NULL;
     *outContext = &moduleState;
     return 1u;
 }
@@ -54,16 +57,25 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 static uint32_t ModuleStart(void *context)
 {
     LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
+    if (state == NULL || state->host == NULL)
+        return 0u;
+    state->content = (const LaiueContentServiceV1 *)LaiueModuleQueryRequiredService(
+        state->host, LAIUE_CONTENT_SERVICE_NAME,
+        LAIUE_CONTENT_SERVICE_ABI_VERSION_1, sizeof(LaiueContentServiceV1));
+    if (state->content == NULL)
+        return 0u;
     LaiueModuleServiceV1 published = {
         .name = LAIUE_GRAPHICS_SERVICE_NAME,
         .version = LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
         .table = &service,
         .tableSize = sizeof(service),
     };
-    return state != NULL && state->host != NULL &&
-                   state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK
-               ? 1u
-               : 0u;
+    if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
+    {
+        state->content = NULL;
+        return 0u;
+    }
+    return 1u;
 }
 
 static void ModuleStop(void *context)
@@ -72,12 +84,15 @@ static void ModuleStop(void *context)
     if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_GRAPHICS_SERVICE_NAME);
+    if (state != NULL)
+        state->content = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
     (void)context;
     moduleState.host = NULL;
+    moduleState.content = NULL;
 }
 
 static const char *const provides[] = {LAIUE_GRAPHICS_SERVICE_NAME};

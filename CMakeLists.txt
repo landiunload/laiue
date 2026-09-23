@@ -255,6 +255,7 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_manifest.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_types.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_api.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/module_service.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_manifest.h"
         "${PROJECT_SOURCE_DIR}/src/modding/mod/module_host.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"

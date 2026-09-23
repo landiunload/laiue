@@ -1,11 +1,13 @@
 #include "mesh/mesher_service.h"
 
 #include "mod/module_api.h"
+#include "mod/module_service.h"
 #include "world/world_service.h"
 
 typedef struct LaiueMesherModuleState
 {
     const LaiueModuleHostV1 *host;
+    const LaiueWorldServiceV1 *world;
 } LaiueMesherModuleState;
 
 static LaiueMesherModuleState moduleState;
@@ -21,9 +23,10 @@ static const LaiueMesherServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
     moduleState.host = host;
+    moduleState.world = NULL;
     *outContext = &moduleState;
     return 1u;
 }
@@ -31,16 +34,25 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 static uint32_t ModuleStart(void *context)
 {
     LaiueMesherModuleState *state = (LaiueMesherModuleState *)context;
+    if (state == NULL || state->host == NULL)
+        return 0u;
+    state->world = (const LaiueWorldServiceV1 *)LaiueModuleQueryRequiredService(
+        state->host, LAIUE_WORLD_SERVICE_NAME,
+        LAIUE_WORLD_SERVICE_ABI_VERSION_1, sizeof(LaiueWorldServiceV1));
+    if (state->world == NULL)
+        return 0u;
     LaiueModuleServiceV1 published = {
         .name = LAIUE_MESHER_SERVICE_NAME,
         .version = LAIUE_MESHER_SERVICE_ABI_VERSION_1,
         .table = &service,
         .tableSize = sizeof(service),
     };
-    return state != NULL && state->host != NULL &&
-                   state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK
-               ? 1u
-               : 0u;
+    if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
+    {
+        state->world = NULL;
+        return 0u;
+    }
+    return 1u;
 }
 
 static void ModuleStop(void *context)
@@ -49,12 +61,15 @@ static void ModuleStop(void *context)
     if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_MESHER_SERVICE_NAME);
+    if (state != NULL)
+        state->world = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
     (void)context;
     moduleState.host = NULL;
+    moduleState.world = NULL;
 }
 
 static const char *const provides[] = {LAIUE_MESHER_SERVICE_NAME};
