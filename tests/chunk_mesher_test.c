@@ -32,6 +32,14 @@
 static uint32_t mesherChecks;
 static uint32_t mesherFailures;
 
+static WorldRegionContents FillMesherRegionFromWorld(void* context,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
+{
+    return WorldFillRegion((World*)context, minBlockX, minBlockY, minBlockZ,
+        sizeX, sizeY, sizeZ, outBlocks);
+}
+
 // Ожидаемый материал грани; ноль означает, что грани здесь быть не должно.
 static uint8_t mesherExpected[MESHER_FACE_COUNT][MESHER_BLOCKS];
 
@@ -500,6 +508,10 @@ static void RunCaseWithScratch(FillKind kind, int64_t chunkX, int64_t chunkY, in
 {
     World *world = WorldCreate(NULL);
     MesherExpect(world != NULL, "мир создан");
+    const ChunkMesherWorldSource source = {
+        .context = world,
+        .fillRegion = FillMesherRegionFromWorld,
+    };
 
     int64_t baseX = chunkX * CHUNK_SIZE;
     int64_t baseY = chunkY * CHUNK_SIZE;
@@ -523,7 +535,7 @@ static void RunCaseWithScratch(FillKind kind, int64_t chunkX, int64_t chunkY, in
 
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
-    MesherExpect(BuildChunkMesh(world, scratch, chunkX, chunkY, chunkZ, &quads, &quadCount),
+    MesherExpect(BuildChunkMesh(&source, scratch, chunkX, chunkY, chunkZ, &quads, &quadCount),
                  "мешинг завершился успехом");
     MesherExpect(quadCount == 0u || quads != NULL, "непустая выдача обязана иметь массив");
     MesherExpect(quadCount != 0u || quads == NULL, "пустая выдача обязана быть без массива");
@@ -536,7 +548,7 @@ static void RunCaseWithScratch(FillKind kind, int64_t chunkX, int64_t chunkY, in
     // Повторный мешинг того же чанка обязан дать тот же порядок квадов.
     ChunkQuad *again = NULL;
     uint32_t againCount = 0u;
-    MesherExpect(BuildChunkMesh(world, scratch, chunkX, chunkY, chunkZ, &again, &againCount),
+    MesherExpect(BuildChunkMesh(&source, scratch, chunkX, chunkY, chunkZ, &again, &againCount),
                  "повторный мешинг завершился успехом");
     MesherExpect(againCount == quadCount, "повторный мешинг дал другое число квадов");
     MesherExpect(HashQuads(again, againCount) == hash, "повторный мешинг изменил порядок квадов");
@@ -598,16 +610,20 @@ static void TestUniformShortcuts(void)
     World *world = WorldCreate(NULL);
     ChunkMesherScratch *scratch = ChunkMesherScratchCreate();
     MesherExpect(world != NULL && scratch != NULL, "мир и буферы для однородных случаев");
+    const ChunkMesherWorldSource source = {
+        .context = world,
+        .fillRegion = FillMesherRegionFromWorld,
+    };
 
     ChunkQuad *quads = (ChunkQuad *)(void *)&mesherChecks;
     uint32_t quadCount = 12345u;
-    MesherExpect(BuildChunkMesh(world, scratch, 0, 0, 0, &quads, &quadCount), "пустой чанк");
+    MesherExpect(BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount), "пустой чанк");
     MesherExpect(quads == NULL && quadCount == 0u, "пустой чанк обязан обнулить выход");
 
     ApplyFill(world, FILL_SOLID_CLOSED, 0, 0, 0);
     quads = (ChunkQuad *)(void *)&mesherChecks;
     quadCount = 12345u;
-    MesherExpect(BuildChunkMesh(world, scratch, 0, 0, 0, &quads, &quadCount), "сплошной чанк");
+    MesherExpect(BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount), "сплошной чанк");
     MesherExpect(quads == NULL && quadCount == 0u, "сплошной чанк обязан обнулить выход");
 
     ChunkMesherScratchDestroy(scratch);

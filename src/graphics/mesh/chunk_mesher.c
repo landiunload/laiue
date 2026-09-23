@@ -1,6 +1,5 @@
 #include "mesh/chunk_mesher.h"
 #include "platform/system.h"
-#include "world/world.h"
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -625,12 +624,22 @@ static void EmitPlaneRow(uint64_t* plane, uint32_t row, uint64_t masks[CHUNK_SIZ
     }
 }
 
-bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
+bool BuildChunkMesh(const ChunkMesherWorldSource* source, ChunkMesherScratch* scratch,
     int64_t chunkX, int64_t chunkY, int64_t chunkZ,
     ChunkQuad** outQuads, uint32_t* outQuadCount)
 {
+    if (outQuads == NULL || outQuadCount == NULL)
+    {
+        return false;
+    }
     *outQuads = NULL;
     *outQuadCount = 0;
+
+    if (source == NULL || source->fillRegion == NULL || scratch == NULL ||
+        scratch->blocks == NULL || scratch->columns == NULL || scratch->planes == NULL)
+    {
+        return false;
+    }
 
     int64_t baseX = chunkX * CHUNK_SIZE;
     int64_t baseY = chunkY * CHUNK_SIZE;  // Y = вторая горизонталь
@@ -638,7 +647,7 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
 
     BlockType* blocks = scratch->blocks;
 
-    WorldRegionContents contents = WorldFillRegion(world,
+    WorldRegionContents contents = source->fillRegion(source->context,
         baseX - 1, baseY - 1, baseZ - 1,
         EXTENDED_SIZE, EXTENDED_SIZE, EXTENDED_SIZE,
         blocks);

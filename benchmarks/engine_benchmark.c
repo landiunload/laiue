@@ -129,11 +129,23 @@ static void FillChunk(World *world)
     }
 }
 
+static WorldRegionContents FillMesherRegionFromWorld(void* context,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
+{
+    return WorldFillRegion((World*)context, minBlockX, minBlockY, minBlockZ,
+        sizeX, sizeY, sizeZ, outBlocks);
+}
+
 static bool RunMeshBenchmark(void)
 {
     World *world = WorldCreate(NULL);
     if (world == NULL) return false;
     FillChunk(world);
+    const ChunkMesherWorldSource source = {
+        .context = world,
+        .fillRegion = FillMesherRegionFromWorld,
+    };
 
     ChunkMesherScratch *scratch = ChunkMesherScratchCreate();
     if (scratch == NULL)
@@ -145,7 +157,7 @@ static bool RunMeshBenchmark(void)
     // Прогрев: первый проход платит за страницы и кеш.
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
-    if (BuildChunkMesh(world, scratch, 0, 0, 0, &quads, &quadCount) && quads != NULL)
+    if (BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount) && quads != NULL)
     {
         PlatformFree(quads);
     }
@@ -158,7 +170,7 @@ static bool RunMeshBenchmark(void)
         {
             quads = NULL;
             quadCount = 0u;
-            if (BuildChunkMesh(world, scratch, 0, 0, 0, &quads, &quadCount))
+            if (BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount))
             {
                 benchmarkSink += quadCount;
                 if (quads != NULL) PlatformFree(quads);

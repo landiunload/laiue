@@ -89,8 +89,10 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
   `laiue.numeric`;
 * `laiue.physics` публикует детерминированный rigid/compound step, scratch и
   contact-cache API, требует `laiue.numeric` и `laiue.jobs`;
-* `laiue.mesher` публикует scratch и greedy chunk meshing, требует
-  `laiue.world`;
+* `laiue.mesher` публикует scratch и greedy chunk meshing поверх generic
+  `ChunkMesherWorldSource` callback. Он не требует и не импортирует
+  `laiue.world`: world, voxel provider или тестовый источник адаптируются
+  вызывающей стороной;
 * `laiue.graphics` публикует backend-neutral renderer table, а `laiue.scene`
   требует этот provider и `laiue.scene_math`, а `laiue.voxel_render` требует
   graphics и остальные перечисленные providers вместо поиска функций в

@@ -24,6 +24,17 @@
 #define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
+// Мешер принимает только абстрактный region provider. Voxel-render связывает
+// его с выбранным world здесь, на границе технологии; сам mesher поэтому не
+// импортирует world DLL.
+static WorldRegionContents FillMesherRegionFromWorld(void* context,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
+{
+    return WorldFillRegion((World*)context, minBlockX, minBlockY, minBlockZ,
+        sizeX, sizeY, sizeZ, outBlocks);
+}
+
 static int64_t ChunkCoordinateFromBlock(int64_t block)
 {
     int64_t chunk = block / CHUNK_SIZE;
@@ -615,7 +626,11 @@ static uint32_t WorkerThreadProcedure(void* parameter)
             request.centerEpoch != PlatformAtomicLoadU32Acquire(&streaming->centerEpoch);
         double buildStart = PlatformMonotonicSeconds();
         ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
-        if (cancelled || !BuildChunkMesh(streaming->world, scratch,
+        ChunkMesherWorldSource source = {
+            .context = streaming->world,
+            .fillRegion = FillMesherRegionFromWorld,
+        };
+        if (cancelled || !BuildChunkMesh(&source, scratch,
             request.x, request.y, request.z, &result.quads, &result.quadCount))
         {
             result.quadCount = CHUNK_MESH_BUILD_FAILED;

@@ -144,8 +144,10 @@ Streaming передаёт renderer позиции чанков относите
 | `LaiueModHost` | внешнее приложение | сериализованные load/unload; concurrent service queries |
 | `AudioPlayer` | вызывающий код | управляющий поток плюс внутренние Windows callbacks |
 
-Meshing workers читают `World` и создают CPU-геометрию, но не вызывают
-renderer или UI. Rebasing выполняется только после остановки этих workers.
+Meshing workers получают snapshot-подобный `ChunkMesherWorldSource` callback и
+создают CPU-геометрию, но не знают о `World` и не вызывают renderer или UI.
+Конкретный world/voxel provider адаптируется на границе `voxel_render`.
+Rebasing выполняется только после остановки этих workers.
 Публичная release-функция вызывается в том же модуле, который выделил объект.
 
 ## Принципы расширения

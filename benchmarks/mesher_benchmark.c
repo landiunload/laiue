@@ -24,6 +24,14 @@
 
 static volatile uint64_t mesherSink;
 
+static WorldRegionContents FillMesherRegionFromWorld(void* context,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
+{
+    return WorldFillRegion((World*)context, minBlockX, minBlockY, minBlockZ,
+        sizeX, sizeY, sizeZ, outBlocks);
+}
+
 static void WriteText(const char *text)
 {
     LaiueTestRuntimeWrite(text);
@@ -207,11 +215,15 @@ static void RunCase(MesherFill fill)
         LaiueTestRuntimeExit(1);
     }
     Fill(world, fill);
+    const ChunkMesherWorldSource source = {
+        .context = world,
+        .fillRegion = FillMesherRegionFromWorld,
+    };
 
     // Прогрев: первый проход платит за страницы и кэш.
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
-    if (!BuildChunkMesh(world, scratch, 0, 0, 0, &quads, &quadCount))
+    if (!BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount))
     {
         WriteText("mesher benchmark build failed\n");
         LaiueTestRuntimeExit(1);
@@ -230,7 +242,7 @@ static void RunCase(MesherFill fill)
         {
             ChunkQuad *pass = NULL;
             uint32_t passCount = 0u;
-            if (!BuildChunkMesh(world, scratch, 0, 0, 0, &pass, &passCount))
+            if (!BuildChunkMesh(&source, scratch, 0, 0, 0, &pass, &passCount))
             {
                 WriteText("mesher benchmark build failed\n");
                 LaiueTestRuntimeExit(1);

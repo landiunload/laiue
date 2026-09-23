@@ -320,6 +320,16 @@ if(TARGET laiue_mesher)
         laiue_chunk_mesher_test ChunkMesherTestEntryPoint)
     add_test(NAME laiue.mesh.chunk_mesher COMMAND laiue_chunk_mesher_test)
     set_tests_properties(laiue.mesh.chunk_mesher PROPERTIES TIMEOUT 120)
+
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_mesher_module_test mesher_module_test.c)
+        target_link_libraries(laiue_mesher_module_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_mesher_module_test PRIVATE LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_mesher_module_test MesherModuleTestEntryPoint)
+        add_dependencies(laiue_mesher_module_test laiue_mesher)
+        add_test(NAME laiue.mesh.module COMMAND laiue_mesher_module_test)
+    endif()
 endif()
 
 if(TARGET laiue_voxel_raycast)

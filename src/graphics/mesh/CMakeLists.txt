@@ -7,5 +7,4 @@ laiue_add_module(mesher
         module_entry.c
         ../render/chunk_geometry.h
         ../../api.h
-    LINK laiue_world
 )
