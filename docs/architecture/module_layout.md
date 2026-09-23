@@ -8,7 +8,7 @@ logical include names (`physics/...`, `render/...`, and so on).
 |---|---|---|
 | `src/core/` | `math`, `runtime` | no-CRT runtime and scalar support |
 | `src/assets/` | `content`, `media` | resource catalogs and format codecs |
-| `src/graphics/` | `graphics`, `input`, `mesh`, `render`, `scene` | graphics contract, input, meshing, backends and presentation scene |
+| `src/graphics/` | `graphics`, `input`, `mesh`, `render`, `scene_math`, `scene`, `scene_streaming` | graphics contract, input, meshing, backends, shared scene math, presentation scene and streaming |
 | `src/jobs/` | `task` | optional work scheduler |
 | `src/simulation/` | `world`, `physics`, `character`, `voxel` | world coordinates, deterministic simulation and voxel provider |
 | `src/modding/` | `mod` | bootstrap-compatible native module ABI and host |
@@ -24,10 +24,10 @@ to preserve an old path. `tools/check_architecture.cmake` checks both include
 boundaries and the canonical location, so a new flat duplicate is rejected at
 configure time.
 
-`scene` currently owns camera, panorama, voxel raycast and chunk streaming as
-one graphics-facing provider. The next boundary split can move those parts to
-dedicated providers without changing the folder contract: rendering remains
-under `graphics`, while world and physics stay under `simulation` and never
+`scene_math` is the single owner of public matrix/frustum code. `scene` now
+contains only camera and panorama. The renderer-facing `scene_streaming` provider owns chunk meshing/upload queues,
+while `voxel_raycast` is a core provider that depends on `world` and has no
+renderer dependency. World and physics remain under `simulation` and never
 gain a dependency on a renderer.
 
 The public SDK continues to install headers directly under

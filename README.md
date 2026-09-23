@@ -44,7 +44,10 @@ runtime-сервисы с единым C ABI.
 | `audio` | микшер голосов и звукопаки; WASAPI на Windows, ALSA на Linux |
 | `mesh` | greedy meshing чанков `64³` |
 | `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
-| `scene` | камера, streaming, panorama и voxel raycast |
+| `scene` | камера, матрицы и panorama |
+| `scene_math` | общий поставщик матриц и frustum без renderer |
+| `scene_streaming` | асинхронный chunk streaming и GPU-загрузка мешей |
+| `voxel_raycast` | переносимый raycast по World без renderer |
 | `ui` | immediate-mode UI поверх renderer |
 
 Публичные header-only контракты `graphics/graphics_api.h`,

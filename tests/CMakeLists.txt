@@ -284,22 +284,26 @@ if(TARGET laiue_mesher)
     set_tests_properties(laiue.mesh.chunk_mesher PROPERTIES TIMEOUT 120)
 endif()
 
-if(TARGET laiue_scene)
+if(TARGET laiue_voxel_raycast)
     add_executable(laiue_voxel_raycast_test voxel_raycast_test.c)
     target_link_libraries(laiue_voxel_raycast_test PRIVATE
-        laiue_scene
+        laiue_voxel_raycast
+        laiue_scene_streaming
         laiue_world)
     laiue_configure_standalone_executable(
         laiue_voxel_raycast_test VoxelRaycastTestEntryPoint)
     add_test(NAME laiue.scene.voxel_raycast
         COMMAND laiue_voxel_raycast_test)
 
+endif()
+
+if(TARGET laiue_scene_streaming)
     # Стресс таблицы чанков: случайные переходы и блуждание по кольцу с
     # независимым эталоном множества ключей и проверкой списка отрисовки.
     add_executable(laiue_chunk_streaming_stress_test
         chunk_streaming_stress_test.c)
     target_link_libraries(laiue_chunk_streaming_stress_test PRIVATE
-        laiue_scene
+        laiue_scene_streaming
         laiue_world)
     laiue_configure_standalone_executable(
         laiue_chunk_streaming_stress_test ChunkStreamingStressTestEntryPoint)

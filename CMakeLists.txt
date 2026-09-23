@@ -315,10 +315,18 @@ endif()
 if(TARGET laiue_scene)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/camera.h"
-            "${PROJECT_SOURCE_DIR}/src/graphics/scene/chunk_streaming.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/math.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/panorama.h"
-            "${PROJECT_SOURCE_DIR}/src/graphics/scene/voxel_raycast.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_scene_streaming)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/scene/chunk_streaming.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_voxel_raycast)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/scene/voxel_raycast.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
         COMPONENT Engine)
 endif()

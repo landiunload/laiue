@@ -16,7 +16,7 @@ typedef struct VoxelRaycastHit
     double distance;
 } VoxelRaycastHit;
 
-LAIUE_SCENE_API bool VoxelRaycast(World* world,
+LAIUE_VOXEL_RAYCAST_API bool VoxelRaycast(World* world,
     const double origin[3],
     const float direction[3], float maximumDistance,
     VoxelRaycastHit* outHit);

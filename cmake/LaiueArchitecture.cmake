@@ -13,7 +13,8 @@ function(laiue_assert_build_architecture)
 
     if(NOT LAIUE_BUILD_GRAPHICS)
         foreach(graphics_target IN ITEMS
-                laiue_window laiue_input laiue_mesher laiue_render laiue_scene)
+            laiue_window laiue_input laiue_mesher laiue_render laiue_scene
+            laiue_scene_math laiue_scene_streaming)
             if(TARGET "${graphics_target}")
                 message(FATAL_ERROR
                     "Core-only graph unexpectedly contains ${graphics_target}")
