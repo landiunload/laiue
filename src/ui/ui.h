@@ -2,7 +2,7 @@
 
 #include "api.h"
 #include "ui/ui_font.h"
-#include "render/renderer.h"
+#include "render/ui_quad.h"
 
 #include <stdbool.h>
 #include <stdint.h>

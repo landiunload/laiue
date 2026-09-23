@@ -9,6 +9,8 @@
 
 #include "audio/audio_backend.h"
 
+#include <stddef.h>
+
 bool AudioSystemBackendCreate(const AudioBackendDescription *description,
                               AudioBackend **outBackend)
 {

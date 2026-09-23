@@ -6,12 +6,35 @@
 // движку, и офлайн-конвертеру.
 
 #include "audio/audio_pack.h"
+#include "audio/audio_pack_runtime.h"
 #include "content/content_catalog.h"
 #include "media/la_encode.h"
 #include "media/sound.h"
 #include "platform/system.h"
 
 #include <string.h>
+
+/* The decoder is usable without the mixer or catalog DLL being linked into
+ * this image.  The bootstrap installs these service tables before a pack
+ * module is started; the legacy compatibility target supplies an in-process
+ * adapter.  Keep the lookup in one place so every public operation has the
+ * same fail-closed behaviour when a dependency is absent. */
+static const AudioPackRuntime *PackRuntime(void)
+{
+    return AudioPackRuntimeGet();
+}
+
+static const LaiueAudioServiceV1 *PackAudio(void)
+{
+    const AudioPackRuntime *runtime = PackRuntime();
+    return runtime == NULL ? NULL : runtime->audio;
+}
+
+static const LaiueContentServiceV1 *PackContent(void)
+{
+    const AudioPackRuntime *runtime = PackRuntime();
+    return runtime == NULL ? NULL : runtime->content;
+}
 
 #define LA_MAGIC 0x3153414Cu   // 'L','A','S','1' little-endian
 #define LA_VERSION 1u
@@ -240,7 +263,10 @@ static AudioClip *CreateClipFromDecoded(AudioDevice *device, DecodedSound *sound
         .sampleRate = sound->sampleRate,
     };
     AudioClip *clip = NULL;
-    AudioResult result = AudioClipCreate(device, &description, &clip);
+    const LaiueAudioServiceV1 *audio = PackAudio();
+    AudioResult result = audio == NULL || audio->clipCreate == NULL
+                             ? AUDIO_RESULT_INVALID_STATE
+                             : (AudioResult)audio->clipCreate(device, &description, &clip);
     PlatformFree(sound->samples);
     sound->samples = NULL;
 
@@ -351,15 +377,21 @@ static bool BuildActivePackChildPath(LaiueContentCatalog *catalog, const wchar_t
                                      wchar_t *destination, uint32_t capacity,
                                      AudioPackLoadStatus *outStatus)
 {
+    const LaiueContentServiceV1 *content = PackContent();
+    if (content == NULL || content->getActivePack == NULL || content->buildPath == NULL)
+    {
+        if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_IO_ERROR;
+        return false;
+    }
     wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                          LAIUE_CONTENT_NAME_CAPACITY))
+    if (content->getActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
+                               LAIUE_CONTENT_NAME_CAPACITY) == 0u)
     {
         if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_NO_ACTIVE_PACK;
         return false;
     }
-    if (!LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName, childName,
-                                      destination, capacity))
+    if (content->buildPath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName, childName,
+                           destination, capacity) == 0u)
     {
         if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_IO_ERROR;
         return false;
@@ -474,7 +506,9 @@ static AudioClip *CreateSilentClip(AudioDevice *device)
         .sampleRate = 44100u,
     };
     AudioClip *clip = NULL;
-    return AudioClipCreate(device, &description, &clip) == AUDIO_RESULT_OK ? clip : NULL;
+    const LaiueAudioServiceV1 *audio = PackAudio();
+    if (audio == NULL || audio->clipCreate == NULL) return NULL;
+    return audio->clipCreate(device, &description, &clip) == AUDIO_RESULT_OK ? clip : NULL;
 }
 
 typedef struct SoundLookup
@@ -487,14 +521,25 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
                              const wchar_t *soundName, AudioPackLoadStatus *outStatus)
 {
     if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_NOT_ATTEMPTED;
+    const LaiueContentServiceV1 *content = PackContent();
     // Небезопасное имя — ошибка приложения, а не отсутствие содержимого:
     // здесь подставлять тишину значило бы прятать опечатку в коде.
-    if (device == NULL || soundName == NULL || !LaiueContentPathIsSafe(soundName))
+    if (device == NULL || soundName == NULL || content == NULL || content->pathIsSafe == NULL ||
+        content->pathIsSafe(soundName) == 0u)
     {
         if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_INVALID_SOUND;
         return NULL;
     }
-    if (catalog == NULL) catalog = LaiueContentCatalogDefault();
+    if (catalog == NULL && content->defaultCatalog != NULL)
+        catalog = content->defaultCatalog();
+    if (catalog == NULL)
+    {
+        AudioClip *silent = CreateSilentClip(device);
+        if (outStatus != NULL)
+            *outStatus = silent == NULL ? AUDIO_PACK_LOAD_OUT_OF_MEMORY
+                                        : AUDIO_PACK_LOAD_NO_ACTIVE_PACK;
+        return silent;
+    }
 
     AudioPackLoadStatus status = AUDIO_PACK_LOAD_SOUND_NOT_FOUND;
     DecodedSound sound;
@@ -510,25 +555,29 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
         if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_OUT_OF_MEMORY;
         return NULL;
     }
-    if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                          LAIUE_CONTENT_NAME_CAPACITY))
+    if (content->getActivePack == NULL ||
+        content->getActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
+                               LAIUE_CONTENT_NAME_CAPACITY) == 0u)
     {
         status = AUDIO_PACK_LOAD_NO_ACTIVE_PACK;
     }
     else
     {
         const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
-        uint32_t orderCount = LaiueContentCatalogOrderFormats(
-            catalog, LAIUE_CONTENT_SOUND_PACK, g_soundExtensions,
-            sizeof(g_soundExtensions) / sizeof(g_soundExtensions[0]), order,
-            LAIUE_CONTENT_FORMAT_ORDER_MAX);
+        uint32_t orderCount = content->orderFormats == NULL
+                                  ? 0u
+                                  : content->orderFormats(
+                                        catalog, LAIUE_CONTENT_SOUND_PACK, g_soundExtensions,
+                                        sizeof(g_soundExtensions) / sizeof(g_soundExtensions[0]), order,
+                                        LAIUE_CONTENT_FORMAT_ORDER_MAX);
 
         for (uint32_t index = 0; !decoded && index < orderCount; ++index)
         {
             const wchar_t *extension = order[index];
-            if (!LaiueContentCatalogBuildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                                      soundName, extension, lookup->path,
-                                                      LAIUE_CONTENT_PATH_CAPACITY))
+            if (content->buildResourcePath == NULL ||
+                content->buildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
+                                           soundName, extension, lookup->path,
+                                           LAIUE_CONTENT_PATH_CAPACITY) == 0u)
             {
                 status = AUDIO_PACK_LOAD_IO_ERROR;
                 continue;
@@ -554,9 +603,10 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
 
             wchar_t cacheExtension[16];
             BuildSoundCacheExtension(extension, cacheExtension, 16u);
-            if (!LaiueContentCatalogBuildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                                      soundName, cacheExtension, lookup->cachePath,
-                                                      LAIUE_CONTENT_PATH_CAPACITY))
+            if (content->buildResourcePath == NULL ||
+                content->buildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
+                                           soundName, cacheExtension, lookup->cachePath,
+                                           LAIUE_CONTENT_PATH_CAPACITY) == 0u)
             {
                 status = AUDIO_PACK_LOAD_IO_ERROR;
                 continue;
@@ -683,14 +733,17 @@ static bool CopyContentListInto(const LaiueContentList *source, AudioPackList *o
 
 bool AudioPackEnumerateFrom(LaiueContentCatalog *catalog, AudioPackList *outList)
 {
-    if (catalog == NULL || outList == NULL) return false;
+    const LaiueContentServiceV1 *content = PackContent();
+    if (catalog == NULL || outList == NULL || content == NULL || content->enumerate == NULL ||
+        content->releaseList == NULL)
+        return false;
 
     LaiueContentList contentList;
-    if (!LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_SOUND_PACK, &contentList))
+    if (content->enumerate(catalog, LAIUE_CONTENT_SOUND_PACK, &contentList) == 0u)
         return false;
 
     bool copied = CopyContentListInto(&contentList, outList, false);
-    LaiueContentListRelease(&contentList);
+    content->releaseList(&contentList);
     return copied;
 }
 
@@ -790,7 +843,10 @@ static void ScanSounds(const wchar_t *directory, const wchar_t *prefix, uint32_t
     while (PlatformDirectoryNext(&scratch->iterator, &scratch->entry))
     {
         if (scratch->entry.isSymbolicLink) continue;
-        if (!LaiueContentNameIsSafe(scratch->entry.name)) continue;
+        const LaiueContentServiceV1 *content = PackContent();
+        if (content == NULL || content->nameIsSafe == NULL ||
+            content->nameIsSafe(scratch->entry.name) == 0u)
+            continue;
 
         if (scratch->entry.isDirectory)
         {
@@ -847,10 +903,16 @@ static void ScanSounds(const wchar_t *directory, const wchar_t *prefix, uint32_t
 
 bool AudioPackEnumerateSoundsFrom(LaiueContentCatalog *catalog, AudioPackList *outList)
 {
+    const LaiueContentServiceV1 *content = PackContent();
     if (outList == NULL) return false;
     outList->entries = NULL;
     outList->count = 0u;
-    if (catalog == NULL) catalog = LaiueContentCatalogDefault();
+    if (content == NULL) return false;
+    if (catalog == NULL)
+    {
+        if (content->defaultCatalog == NULL) return false;
+        catalog = content->defaultCatalog();
+    }
 
     wchar_t *path = PlatformAllocate((size_t)LAIUE_CONTENT_PATH_CAPACITY * sizeof(wchar_t), false);
     if (path == NULL) return false;
@@ -896,8 +958,9 @@ bool AudioPackEnumerateSoundsFrom(LaiueContentCatalog *catalog, AudioPackList *o
 
 bool AudioPackActivateIn(LaiueContentCatalog *catalog, const wchar_t *name)
 {
-    if (catalog == NULL) return false;
-    return LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, name);
+    const LaiueContentServiceV1 *content = PackContent();
+    if (catalog == NULL || content == NULL || content->setActivePack == NULL) return false;
+    return content->setActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, name) != 0u;
 }
 
 void AudioPackListRelease(AudioPackList *list)
@@ -910,10 +973,16 @@ void AudioPackListRelease(AudioPackList *list)
 
 bool AudioPackEnumerate(AudioPackList *outList)
 {
-    return AudioPackEnumerateFrom(LaiueContentCatalogDefault(), outList);
+    const LaiueContentServiceV1 *content = PackContent();
+    return content != NULL && content->defaultCatalog != NULL
+               ? AudioPackEnumerateFrom(content->defaultCatalog(), outList)
+               : false;
 }
 
 bool AudioPackActivate(const wchar_t *name)
 {
-    return AudioPackActivateIn(LaiueContentCatalogDefault(), name);
+    const LaiueContentServiceV1 *content = PackContent();
+    return content != NULL && content->defaultCatalog != NULL
+               ? AudioPackActivateIn(content->defaultCatalog(), name)
+               : false;
 }

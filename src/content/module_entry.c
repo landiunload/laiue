@@ -49,6 +49,35 @@ static uint32_t BuildResourcePath(
                : 0u;
 }
 
+static uint32_t Enumerate(
+    LaiueContentCatalog *catalog, uint32_t type, LaiueContentList *outList)
+{
+    return LaiueContentCatalogEnumerate(catalog, (LaiueContentType)type, outList) ? 1u : 0u;
+}
+
+static void ReleaseList(LaiueContentList *list)
+{
+    LaiueContentListRelease(list);
+}
+
+static uint32_t OrderFormats(
+    LaiueContentCatalog *catalog, uint32_t type, const wchar_t *const *defaults,
+    uint32_t defaultCount, const wchar_t **outOrder, uint32_t capacity)
+{
+    return LaiueContentCatalogOrderFormats(catalog, (LaiueContentType)type, defaults,
+                                            defaultCount, outOrder, capacity);
+}
+
+static uint32_t NameIsSafe(const wchar_t *name)
+{
+    return LaiueContentNameIsSafe(name) ? 1u : 0u;
+}
+
+static uint32_t PathIsSafe(const wchar_t *path)
+{
+    return LaiueContentPathIsSafe(path) ? 1u : 0u;
+}
+
 static const LaiueContentServiceV1 service = {
     .structSize = sizeof(LaiueContentServiceV1),
     .abiVersion = LAIUE_CONTENT_SERVICE_ABI_VERSION_1,
@@ -59,6 +88,12 @@ static const LaiueContentServiceV1 service = {
     .getActivePack = GetActivePack,
     .buildPath = BuildPath,
     .buildResourcePath = BuildResourcePath,
+    .enumerate = Enumerate,
+    .releaseList = ReleaseList,
+    .orderFormats = OrderFormats,
+    .nameIsSafe = NameIsSafe,
+    .pathIsSafe = PathIsSafe,
+    .defaultCatalog = LaiueContentCatalogDefault,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

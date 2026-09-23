@@ -1,7 +1,13 @@
 #include "ui/ui_font.h"
 
-#include <windows.h>
+#include <stddef.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+#if defined(_WIN32)
 
 // Диапазоны запекаемых кодовых точек (включительно).
 typedef struct GlyphRange
@@ -238,6 +244,124 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
     font->pixelSize = pixelSize;
     return true;
 }
+
+#else
+
+/*
+ * Mobile and POSIX builds do not have GDI.  Keep the UI useful without
+ * pulling a font engine into the core: this deterministic monochrome atlas
+ * is a safe fallback, while a platform font provider can replace it later.
+ */
+#include "platform/system.h"
+
+typedef struct GlyphRange
+{
+    uint16_t first;
+    uint16_t last;
+} GlyphRange;
+
+static const GlyphRange GLYPH_RANGES[] = {
+    {0x0020, 0x007E},
+    {0x00B0, 0x00B0},
+    {0x0401, 0x0401},
+    {0x0410, 0x044F},
+    {0x0451, 0x0451},
+};
+#define GLYPH_RANGE_COUNT (sizeof(GLYPH_RANGES) / sizeof(GLYPH_RANGES[0]))
+
+static uint32_t PortableGlyphCount(void)
+{
+    uint32_t count = 0u;
+    for (uint32_t range = 0u; range < GLYPH_RANGE_COUNT; ++range)
+        count += (uint32_t)(GLYPH_RANGES[range].last - GLYPH_RANGES[range].first + 1u);
+    return count;
+}
+
+void UiFontRelease(UiFont *font)
+{
+    if (font == NULL)
+        return;
+    PlatformFree(font->atlas);
+    PlatformFree(font->glyphs);
+    memset(font, 0, sizeof(*font));
+}
+
+bool UiFontBake(UiFont *font, int32_t pixelSize)
+{
+    if (font == NULL)
+        return false;
+    if (pixelSize < 6)
+        pixelSize = 6;
+
+    uint32_t glyphCount = PortableGlyphCount();
+    uint32_t cellWidth = (uint32_t)pixelSize / 2u + 3u;
+    uint32_t cellHeight = (uint32_t)pixelSize + 2u;
+    uint32_t columns = 32u;
+    uint32_t rows = (glyphCount + columns - 1u) / columns;
+    uint32_t atlasWidth = columns * cellWidth;
+    uint32_t atlasHeight = rows * cellHeight;
+    if (atlasWidth == 0u || atlasHeight == 0u ||
+        (uint64_t)atlasWidth * atlasHeight > (uint64_t)SIZE_MAX)
+        return false;
+
+    UiGlyph *glyphs = PlatformAllocate((size_t)glyphCount * sizeof(*glyphs), true);
+    uint8_t *atlas = PlatformAllocate((size_t)atlasWidth * atlasHeight, true);
+    if (glyphs == NULL || atlas == NULL)
+    {
+        PlatformFree(glyphs);
+        PlatformFree(atlas);
+        return false;
+    }
+
+    uint32_t glyphIndex = 0u;
+    for (uint32_t range = 0u; range < GLYPH_RANGE_COUNT; ++range)
+    {
+        for (uint32_t code = GLYPH_RANGES[range].first;
+             code <= GLYPH_RANGES[range].last; ++code, ++glyphIndex)
+        {
+            UiGlyph *glyph = &glyphs[glyphIndex];
+            uint32_t column = glyphIndex % columns;
+            uint32_t row = glyphIndex / columns;
+            uint32_t atlasX = column * cellWidth + 1u;
+            uint32_t atlasY = row * cellHeight + 1u;
+            glyph->codepoint = (uint16_t)code;
+            glyph->offsetX = 0;
+            glyph->offsetY = (int16_t)pixelSize;
+            glyph->width = (uint16_t)(code == L' ' ? 0u : cellWidth - 2u);
+            glyph->height = (uint16_t)(code == L' ' ? 0u : (uint32_t)pixelSize);
+            glyph->advance = (float)cellWidth;
+            if (glyph->width != 0u)
+            {
+                for (uint32_t y = 0u; y < glyph->height; ++y)
+                    for (uint32_t x = 0u; x < glyph->width; ++x)
+                    {
+                        bool border = x == 0u || y == 0u || x + 1u == glyph->width ||
+                                      y + 1u == glyph->height;
+                        bool stripe = ((x + y + code) & 7u) == 0u;
+                        atlas[(size_t)(atlasY + y) * atlasWidth + atlasX + x] =
+                            (uint8_t)(border || stripe ? 255u : 0u);
+                    }
+                glyph->u0 = (float)atlasX / (float)atlasWidth;
+                glyph->v0 = (float)atlasY / (float)atlasHeight;
+                glyph->u1 = (float)(atlasX + glyph->width) / (float)atlasWidth;
+                glyph->v1 = (float)(atlasY + glyph->height) / (float)atlasHeight;
+            }
+        }
+    }
+
+    UiFontRelease(font);
+    font->atlas = atlas;
+    font->atlasWidth = atlasWidth;
+    font->atlasHeight = atlasHeight;
+    font->glyphs = glyphs;
+    font->glyphCount = glyphCount;
+    font->ascent = (float)pixelSize * 0.8f;
+    font->lineHeight = (float)cellHeight;
+    font->pixelSize = pixelSize;
+    return true;
+}
+
+#endif
 
 const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
 {

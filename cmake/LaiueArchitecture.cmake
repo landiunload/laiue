@@ -13,13 +13,21 @@ function(laiue_assert_build_architecture)
 
     if(NOT LAIUE_BUILD_GRAPHICS)
         foreach(graphics_target IN ITEMS
-                laiue_window laiue_input laiue_audio laiue_mesher
-                laiue_render laiue_scene laiue_ui)
+                laiue_window laiue_input laiue_mesher laiue_render laiue_scene)
             if(TARGET "${graphics_target}")
                 message(FATAL_ERROR
                     "Core-only graph unexpectedly contains ${graphics_target}")
             endif()
         endforeach()
+    endif()
+    if(NOT LAIUE_BUILD_AUDIO AND TARGET laiue_audio)
+        message(FATAL_ERROR "Audio-disabled graph unexpectedly contains laiue_audio")
+    endif()
+    if(NOT LAIUE_BUILD_AUDIO_PACK AND TARGET laiue_audio_pack)
+        message(FATAL_ERROR "Audio-pack-disabled graph unexpectedly contains laiue_audio_pack")
+    endif()
+    if(NOT LAIUE_BUILD_UI AND TARGET laiue_ui)
+        message(FATAL_ERROR "UI-disabled graph unexpectedly contains laiue_ui")
     endif()
 
     message(STATUS

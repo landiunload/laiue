@@ -3,6 +3,7 @@
 #include "api.h"
 #include "render/chunk_geometry.h"
 #include "render/shader_pack.h"
+#include "render/ui_quad.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -179,20 +180,6 @@ LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
 //
 // Квады в пиксельных координатах окна, рисуются поверх кадра в EndFrame
 // с альфа-смешиванием. Раскладка повторяет shaders/ui.hlsl (48 байт).
-
-#define RENDERER_UI_MAX_QUADS 2048u
-#define RENDERER_UI_QUAD_TEXT 1u  // альфа берётся из атласа шрифта
-#define RENDERER_UI_QUAD_IMAGE 2u // цвет берётся из фоновой UI-текстуры
-
-typedef struct RendererUiQuad
-{
-    float rect[4];        // x0, y0, x1, y1 в пикселях окна
-    float uv[4];          // u0, v0, u1, v1 атласа (для текста)
-    uint32_t colorRGBA;   // R в младшем байте, A в старшем
-    float cornerRadius;   // радиус скругления, px (0 — прямые углы)
-    uint32_t flags;
-    uint32_t reserved;
-} RendererUiQuad;
 
 // Атлас шрифта: 8-битная альфа. Вызов заменяет предыдущий атлас
 // (дожидается GPU — вызывать редко, при смене масштаба интерфейса).

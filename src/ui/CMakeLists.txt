@@ -1,8 +1,10 @@
 laiue_add_module(ui
-    RUNTIME_ROLE GRAPHICS
+    RUNTIME_ROLE CORE
     SOURCES
         ui.c
         ui.h
+        ui_service.h
+        module_entry.c
         ui_font.c
         ui_font.h
         ui_format.c
@@ -10,8 +12,6 @@ laiue_add_module(ui
         ../api.h
     LINK
         laiue::math_support
-        laiue_render
-        laiue_scene
     WINDOWS_LINK
         gdi32
 )

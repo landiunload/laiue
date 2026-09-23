@@ -32,7 +32,7 @@ add_executable(laiue_platform_file_test platform_file_test.c)
 laiue_configure_standalone_executable(laiue_platform_file_test PlatformFileTestEntryPoint)
 add_test(NAME laiue.platform.file COMMAND laiue_platform_file_test)
 set_tests_properties(laiue.platform.file PROPERTIES TIMEOUT 20)
-if(LAIUE_PLATFORM_POSIX)
+if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
     set_tests_properties(laiue.platform.file PROPERTIES
         ENVIRONMENT "LAIUE_PLATFORM_FILE_TEST_ROOT=/tmp")
 endif()
@@ -257,6 +257,17 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     add_dependencies(laiue_module_host_test
         laiue_module_provider laiue_module_consumer)
     add_test(NAME laiue.mod.module_host COMMAND laiue_module_host_test)
+
+    if(TARGET laiue_audio AND TARGET laiue_ui AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_optional_modules_test optional_modules_test.c)
+        target_link_libraries(laiue_optional_modules_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_optional_modules_test PRIVATE LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_optional_modules_test OptionalModulesTestEntryPoint)
+        add_dependencies(laiue_optional_modules_test laiue_audio laiue_ui)
+        add_test(NAME laiue.mod.optional_components COMMAND laiue_optional_modules_test)
+    endif()
 else()
     add_executable(laiue_mod_host_disabled_test mod_host_disabled_test.c)
     target_link_libraries(laiue_mod_host_disabled_test PRIVATE laiue_mod)
@@ -425,11 +436,16 @@ if(TARGET laiue_audio)
     laiue_configure_standalone_executable(laiue_audio_api_test AudioApiTestEntryPoint)
     add_test(NAME laiue.audio.mixer COMMAND laiue_audio_api_test)
 
-    add_executable(laiue_audio_pack_test audio_pack_test.c mp3_fixtures.h)
-    target_link_libraries(laiue_audio_pack_test PRIVATE laiue_audio laiue_content)
-    laiue_configure_standalone_executable(
-        laiue_audio_pack_test AudioPackTestEntryPoint)
-    add_test(NAME laiue.audio.packs COMMAND laiue_audio_pack_test)
+    if(TARGET laiue_audio_pack_legacy)
+        add_executable(laiue_audio_pack_test audio_pack_test.c mp3_fixtures.h)
+        target_link_libraries(laiue_audio_pack_test PRIVATE
+            laiue_audio_pack_legacy
+            laiue_audio
+            laiue_content)
+        laiue_configure_standalone_executable(
+            laiue_audio_pack_test AudioPackTestEntryPoint)
+        add_test(NAME laiue.audio.packs COMMAND laiue_audio_pack_test)
+    endif()
 
     # Системный вывод проверяется отдельно и беззвучно. Там, где
     # звукового устройства нет, тест сообщает о пропуске кодом 125.
@@ -451,8 +467,10 @@ if(TARGET laiue_media_support)
     # от звука не зависят.
     add_executable(laiue_soundc_test soundc_test.c)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
-    if(TARGET laiue_audio)
-        target_link_libraries(laiue_soundc_test PRIVATE laiue_audio)
+    if(TARGET laiue_audio AND TARGET laiue_audio_pack_legacy)
+        target_link_libraries(laiue_soundc_test PRIVATE
+            laiue_audio_pack_legacy
+            laiue_audio)
         target_compile_definitions(laiue_soundc_test PRIVATE
             LAIUE_SOUNDC_TEST_WITH_AUDIO=1)
     endif()

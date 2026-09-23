@@ -27,6 +27,15 @@ typedef uint32_t (*LaiueContentBuildResourcePathFn)(
     LaiueContentCatalog *catalog, uint32_t type, const wchar_t *name,
     const wchar_t *resourcePath, const wchar_t *extension,
     wchar_t *destination, uint32_t capacity);
+typedef uint32_t (*LaiueContentEnumerateFn)(
+    LaiueContentCatalog *catalog, uint32_t type, LaiueContentList *outList);
+typedef void (*LaiueContentListReleaseFn)(LaiueContentList *list);
+typedef uint32_t (*LaiueContentOrderFormatsFn)(
+    LaiueContentCatalog *catalog, uint32_t type, const wchar_t *const *defaults,
+    uint32_t defaultCount, const wchar_t **outOrder, uint32_t capacity);
+typedef uint32_t (*LaiueContentNameIsSafeFn)(const wchar_t *name);
+typedef uint32_t (*LaiueContentPathIsSafeFn)(const wchar_t *path);
+typedef LaiueContentCatalog *(*LaiueContentDefaultCatalogFn)(void);
 
 typedef struct LaiueContentServiceV1
 {
@@ -39,6 +48,12 @@ typedef struct LaiueContentServiceV1
     LaiueContentGetActivePackFn getActivePack;
     LaiueContentBuildPathFn buildPath;
     LaiueContentBuildResourcePathFn buildResourcePath;
+    LaiueContentEnumerateFn enumerate;
+    LaiueContentListReleaseFn releaseList;
+    LaiueContentOrderFormatsFn orderFormats;
+    LaiueContentNameIsSafeFn nameIsSafe;
+    LaiueContentPathIsSafeFn pathIsSafe;
+    LaiueContentDefaultCatalogFn defaultCatalog;
     uintptr_t reserved[8];
 } LaiueContentServiceV1;
 

@@ -33,8 +33,15 @@ else()
     set(_laiue_graphics_default OFF)
 endif()
 option(LAIUE_BUILD_GRAPHICS
-    "Build the window/input/audio/mesher/render/scene/UI layer"
+    "Build the window/input/mesher/render/scene graphics layer"
     ${_laiue_graphics_default})
+
+# Audio and UI are technology modules in their own right.  They do not
+# require a renderer to compile, so portable/headless/mobile profiles can
+# select them independently of a window or GPU backend.
+option(LAIUE_BUILD_AUDIO "Build the audio mixer and system/offscreen output" ON)
+option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
+option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 
 # Набор графических модулей задаёт бэкенд, а не платформа. D3D12 несёт
 # полный Windows-слой; Vulkan остаётся переносимым и поддерживает offscreen
@@ -43,9 +50,9 @@ option(LAIUE_BUILD_GRAPHICS
 # свой на каждой платформе. Список выводится в конфигурации, чтобы
 # неполнота профиля была видна, а не подразумевалась.
 if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input audio mesh render scene ui)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene)
 else()
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES audio mesh render scene)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene)
 endif()
 
 include(LaiueToolchain)
@@ -87,6 +94,12 @@ add_subdirectory(src/content)
 add_subdirectory(src/character)
 add_subdirectory(src/voxel)
 add_subdirectory(src/mod)
+if(LAIUE_BUILD_AUDIO OR LAIUE_BUILD_AUDIO_PACK)
+    add_subdirectory(src/audio)
+endif()
+if(LAIUE_BUILD_UI)
+    add_subdirectory(src/ui)
+endif()
 
 # Minimal application bootstrap. It contains only the standalone module
 # resolver and the platform boundary; it deliberately does not link the
@@ -272,7 +285,15 @@ endif()
 if(TARGET laiue_audio)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/audio/audio.h"
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_offscreen.h"
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_audio_pack)
+    install(FILES
             "${PROJECT_SOURCE_DIR}/src/audio/audio_pack.h"
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_pack_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
         COMPONENT Engine)
 endif()
@@ -285,6 +306,7 @@ if(TARGET laiue_render)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/render/chunk_geometry.h"
             "${PROJECT_SOURCE_DIR}/src/render/renderer.h"
+            "${PROJECT_SOURCE_DIR}/src/render/ui_quad.h"
             "${PROJECT_SOURCE_DIR}/src/render/shader_pack.h"
             "${PROJECT_SOURCE_DIR}/src/render/texture_pack.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/render"
@@ -303,6 +325,7 @@ endif()
 if(TARGET laiue_ui)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/ui/ui.h"
+            "${PROJECT_SOURCE_DIR}/src/ui/ui_service.h"
             "${PROJECT_SOURCE_DIR}/src/ui/ui_font.h"
             "${PROJECT_SOURCE_DIR}/src/ui/ui_format.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/ui"
