@@ -8,6 +8,7 @@
 #include "mesh/mesher_service.h"
 #include "platform/system.h"
 
+#include <stddef.h>
 #include <string.h>
 
 
@@ -32,24 +33,66 @@ static const LaiueWorldServiceV1* worldService;
 static const LaiueMesherServiceV1* mesherService;
 static const LaiueGraphicsServiceV1* graphicsService;
 
+static bool ServiceFieldPresent(uint32_t structSize, size_t offset, size_t size)
+{
+    return (size_t)structSize >= offset && (size_t)structSize - offset >= size;
+}
+
+static bool SceneMathServiceUsable(const LaiueSceneMathServiceV1* service)
+{
+    return service != NULL &&
+           service->abiVersion == LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1 &&
+           ServiceFieldPresent(service->structSize,
+                               offsetof(LaiueSceneMathServiceV1,
+                                        matrix4ExtractFrustumPlanes),
+                               sizeof(service->matrix4ExtractFrustumPlanes));
+}
+
+static bool WorldServiceUsable(const LaiueWorldServiceV1* service)
+{
+    return service != NULL &&
+           service->abiVersion == LAIUE_WORLD_SERVICE_ABI_VERSION_1 &&
+           ServiceFieldPresent(service->structSize,
+                               offsetof(LaiueWorldServiceV1, fillRegion),
+                               sizeof(service->fillRegion));
+}
+
+static bool MesherServiceUsable(const LaiueMesherServiceV1* service)
+{
+    return service != NULL &&
+           service->abiVersion == LAIUE_MESHER_SERVICE_ABI_VERSION_1 &&
+           ServiceFieldPresent(service->structSize,
+                               offsetof(LaiueMesherServiceV1, buildChunkMesh),
+                               sizeof(service->buildChunkMesh));
+}
+
+static bool GraphicsServiceUsable(const LaiueGraphicsServiceV1* service)
+{
+    return service != NULL &&
+           service->abiVersion == LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1 &&
+           ServiceFieldPresent(service->structSize,
+                               offsetof(LaiueGraphicsServiceV1, drawMesh),
+                               sizeof(service->drawMesh));
+}
+
 void ChunkStreamingSetSceneMathService(const LaiueSceneMathServiceV1* service)
 {
-    sceneMathService = service;
+    sceneMathService = SceneMathServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetWorldService(const LaiueWorldServiceV1* service)
 {
-    worldService = service;
+    worldService = WorldServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetMesherService(const LaiueMesherServiceV1* service)
 {
-    mesherService = service;
+    mesherService = MesherServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetGraphicsService(const LaiueGraphicsServiceV1* service)
 {
-    graphicsService = service;
+    graphicsService = GraphicsServiceUsable(service) ? service : NULL;
 }
 
 static WorldRegionContents VoxelRenderWorldFillRegion(

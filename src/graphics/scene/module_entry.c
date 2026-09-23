@@ -42,6 +42,8 @@ static uint32_t ModuleStart(void *context)
     LaiueSceneModuleState *state = (LaiueSceneModuleState *)context;
     if (state == NULL || state->host == NULL || state->host->queryService == NULL)
         return 0u;
+    state->graphics = NULL;
+    state->sceneMath = NULL;
     uint32_t graphicsVersion = 0u;
     uint32_t graphicsSize = 0u;
     uint32_t sceneMathVersion = 0u;

@@ -42,7 +42,8 @@ artifact. Такой файл пропускается; обязательный
 
 * `graphics/graphics_api.h` — буферы, текстуры, draw items и кадр; в нём нет
   voxel/chunk/pack-типов;
-* `voxel/voxel_api.h` — sparse block provider, запросы collision и meshing;
+* `simulation/voxel/voxel_api.h` — sparse block provider, запросы collision и
+  meshing;
 * `character/character_api.h` — 128 Hz кинематический контроллер и integer
   cell/local coordinates; физический rigid-body модуль ему не нужен.
 
@@ -112,10 +113,11 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
 не делает bootstrap недействительным: профиль получает только диагностику
 неразрешённого required service, а независимые providers продолжают работать.
 
-Остальные адаптеры пока сохраняют явные link-зависимости на свои provider DLL,
-но эти зависимости перечислены в дескрипторах и проверяются до `start`. Их
-перевод на те же runtime service callbacks выполняется по одному модулю, чтобы
-не менять физику, meshing и renderer одновременно.
+Все текущие динамические provider DLL не имеют обязательных импортов других
+LAIUE DLL: соседние технологии передаются через таблицы сервисов и проверяются
+до `start`. Статические профили могут использовать прямую линковку для
+совместимого legacy-wrapper, но публичный модульный путь остаётся тем же
+versioned ABI и не требует отдельного runtime-диспетчера в горячем цикле.
 
 Интеграционные тесты загружают реальные `laiue_numeric`, `laiue_task`,
 `laiue_content`, `laiue_character` и `laiue_voxel` DLL, вызывают сервисные таблицы и

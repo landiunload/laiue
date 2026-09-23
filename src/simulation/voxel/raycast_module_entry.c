@@ -49,6 +49,7 @@ static uint32_t ModuleStart(void *context)
     LaiueVoxelRaycastModuleState *state = (LaiueVoxelRaycastModuleState *)context;
     if (state == NULL || state->host == NULL || state->host->queryService == NULL)
         return 0u;
+    state->world = NULL;
     uint32_t version = 0u;
     uint32_t size = 0u;
     state->world = (const LaiueWorldServiceV1 *)state->host->queryService(
@@ -67,10 +68,12 @@ static uint32_t ModuleStart(void *context)
         .table = &service,
         .tableSize = sizeof(service),
     };
-    return state != NULL && state->host != NULL &&
-                   state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK
-               ? 1u
-               : 0u;
+    if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
+    {
+        state->world = NULL;
+        return 0u;
+    }
+    return 1u;
 }
 
 static void ModuleStop(void *context)

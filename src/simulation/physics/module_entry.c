@@ -61,6 +61,8 @@ static uint32_t ModuleStart(void *context)
     if (state == NULL || state->host == NULL)
         return 0u;
     PhysicsSetNumericService(NULL);
+    state->numeric = NULL;
+    state->jobs = NULL;
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_NUMERIC_SERVICE_NAME,
         LAIUE_NUMERIC_SERVICE_ABI_VERSION_1, sizeof(LaiueNumericServiceV1));

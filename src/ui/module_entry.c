@@ -210,6 +210,7 @@ static uint32_t ModuleStart(void *context)
     (void)context;
     if (moduleHost == NULL || moduleHost->queryService == NULL)
         return 0u;
+    graphicsService = NULL;
     uint32_t version = 0u;
     uint32_t size = 0u;
     graphicsService = (const LaiueGraphicsServiceV1 *)moduleHost->queryService(
