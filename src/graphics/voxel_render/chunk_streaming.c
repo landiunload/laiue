@@ -1,4 +1,4 @@
-#include "scene/chunk_streaming.h"
+#include "voxel_render/chunk_streaming.h"
 #include "scene/math.h"
 #include "world/world.h"
 #include "render/renderer.h"
@@ -482,7 +482,7 @@ static void VerifyStreamingIntegrity(ChunkStreaming* streaming)
 // Единственная тестовая точка входа: VerifyStreamingIntegrity статична,
 // а стресс-тесту в tests/ нужна работающая проверка в отладочной сборке.
 // Публичный заголовок ради неё не заводится, и в Release символа нет.
-LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingVerifyIntegrityForTesting(
     ChunkStreaming* streaming)
 {
     VerifyStreamingIntegrity(streaming);
@@ -492,13 +492,13 @@ LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
 // стресс-тест мог подвести счётчик к границе и подложить в кольцо результатов
 // синтетический результат с заданной ревизией. Отдельного заголовка нет, в
 // Release символов тоже нет.
-LAIUE_SCENE_API void ChunkStreamingSetNextRevisionForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetNextRevisionForTesting(
     ChunkStreaming* streaming, uint64_t value)
 {
     streaming->nextRevision = value;
 }
 
-LAIUE_SCENE_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
+LAIUE_VOXEL_RENDER_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z)
 {
     const ChunkEntry* entry = FindEntry(streaming, x, y, z);
@@ -509,7 +509,7 @@ LAIUE_SCENE_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
 // ревизией, как если бы его вернул рабочий поток. unfinishedWork растёт
 // вместе с resultCount, чтобы инварианты кольца не нарушались: Pump затем
 // уменьшит его при разборе.
-LAIUE_SCENE_API void ChunkStreamingPushEmptyResultForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingPushEmptyResultForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, uint64_t revision)
 {
     PlatformMutexLock(&streaming->queueLock);

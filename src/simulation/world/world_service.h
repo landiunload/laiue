@@ -1,0 +1,30 @@
+#pragma once
+
+#include "world/world.h"
+
+#include <stdint.h>
+
+#define LAIUE_WORLD_SERVICE_NAME "laiue.world"
+#define LAIUE_WORLD_SERVICE_ABI_VERSION_1 1u
+
+typedef struct LaiueWorldServiceV1
+{
+    uint32_t structSize;
+    uint32_t abiVersion;
+    World *(*create)(const WorldBaseProvider *provider);
+    void (*destroy)(World *world);
+    bool (*rebase)(World *world, int64_t blockShiftX,
+                   int64_t blockShiftY, int64_t blockShiftZ);
+    BlockType (*getBlock)(World *world, int64_t x, int64_t y, int64_t z);
+    bool (*trySetBlock)(World *world, int64_t x, int64_t y, int64_t z,
+                        BlockType block);
+    void (*setBlock)(World *world, int64_t x, int64_t y, int64_t z,
+                     BlockType block);
+    bool (*applyBlockBatch)(World *world, const WorldBlockMutation *mutations,
+                            uint32_t count);
+    uint64_t (*getRevision)(World *world);
+    WorldRegionContents (*fillRegion)(World *world, int64_t minBlockX,
+                                      int64_t minBlockY, int64_t minBlockZ,
+                                      int32_t sizeX, int32_t sizeY,
+                                      int32_t sizeZ, BlockType *outBlocks);
+} LaiueWorldServiceV1;

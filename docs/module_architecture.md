@@ -73,6 +73,26 @@ sweep-а. Он работает без `physics.dll`; collision provider ост�
 enumeration. Оно не генерирует ландшафт и намеренно не строит mesh: meshing и
 связка с graphics остаются отдельными технологиями.
 
+Остальные providers используют тот же entry point и lifecycle ABI:
+
+* `laiue.world` публикует операции бесконечного мира и явно требует
+  `laiue.numeric`;
+* `laiue.physics` публикует детерминированный rigid/compound step, scratch и
+  contact-cache API, требует `laiue.numeric` и `laiue.jobs`;
+* `laiue.mesher` публикует scratch и greedy chunk meshing, требует
+  `laiue.world`;
+* `laiue.graphics` публикует backend-neutral renderer table, а `laiue.scene`
+  и `laiue.voxel_render` требуют этот provider вместо поиска функций в
+  глобальном диспетчере;
+* `laiue.scene_math` и `laiue.voxel_raycast` являются самостоятельными
+  providers без renderer-зависимости; последний требует только `laiue.world`;
+* `laiue.window` и `laiue.input` отделены от renderer и публикуются только в
+  профилях, где соответствующий OS backend собран.
+
+Таким образом, отсутствие physics, voxel-render, UI, audio или window artifact
+не делает bootstrap недействительным: профиль получает только диагностику
+неразрешённого required service, а независимые providers продолжают работать.
+
 Интеграционные тесты загружают реальные `laiue_numeric`, `laiue_task`,
 `laiue_content`, `laiue_character` и `laiue_voxel` DLL, вызывают сервисные таблицы и
 проверяют исчезновение сервисов после остановки.

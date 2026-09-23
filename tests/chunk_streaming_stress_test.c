@@ -1,6 +1,6 @@
 // Стресс-тест таблицы стриминга чанков с независимым эталоном целостности.
 //
-// src/graphics/scene/chunk_streaming.c держит меши чанков в открытой адресации и
+// src/graphics/voxel_render/chunk_streaming.c держит меши чанков в открытой адресации и
 // удаляет записи сдвигом кластера (backward-shift), не оставляя надгробий.
 // Удаление меняет индекс записи в массиве entries, а плотный список
 // отрисовки хранит именно индекс, поэтому каждое перемещение обязано чинить
@@ -28,7 +28,7 @@
 // выйти из цикла ожидания (см. отчёт). Поэтому сценарий смены origin не
 // ставит потоки обратно на паузу сразу, а даёт очереди опустеть.
 
-#include "scene/chunk_streaming.h"
+#include "voxel_render/chunk_streaming.h"
 #include "render/renderer.h"
 #include "world/world.h"
 #include "platform/system.h"
@@ -42,15 +42,15 @@
 // Единственная тестовая точка входа, добавленная в chunk_streaming.c под
 // !NDEBUG: тест не видит static VerifyStreamingIntegrity, отдельный
 // публичный заголовок для неё не заводится.
-LAIUE_SCENE_API void ChunkStreamingVerifyIntegrityForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingVerifyIntegrityForTesting(
     ChunkStreaming* streaming);
 // Точки входа для проверки переполнения счётчика ревизий. Тоже только под
 // !NDEBUG и тоже без публичного заголовка.
-LAIUE_SCENE_API void ChunkStreamingSetNextRevisionForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetNextRevisionForTesting(
     ChunkStreaming* streaming, uint64_t value);
-LAIUE_SCENE_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
+LAIUE_VOXEL_RENDER_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z);
-LAIUE_SCENE_API void ChunkStreamingPushEmptyResultForTesting(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingPushEmptyResultForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, uint64_t revision);
 #endif
 

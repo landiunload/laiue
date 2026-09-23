@@ -3,6 +3,8 @@ laiue_add_module(scene_math
     SOURCES
         math.c
         math.h
+        math_service.h
+        math_module_entry.c
         ../../api.h
     LINK
         laiue::math_support
@@ -16,33 +18,11 @@ laiue_add_module(scene
         math.h
         panorama.c
         panorama.h
+        scene_service.h
+        module_entry.c
         ../../api.h
     LINK
         laiue_scene_math
         laiue::math_support
         laiue_render
-)
-
-laiue_add_module(scene_streaming
-    RUNTIME_ROLE GRAPHICS
-    SOURCES
-        chunk_streaming.c
-        chunk_streaming.h
-        math.h
-        ../../api.h
-    LINK
-        laiue_scene_math
-        laiue_world
-        laiue_mesher
-        laiue_render
-)
-
-laiue_add_module(voxel_raycast
-    RUNTIME_ROLE CORE
-    SOURCES
-        voxel_raycast.c
-        voxel_raycast.h
-        ../../api.h
-    LINK
-        laiue_world
 )

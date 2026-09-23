@@ -104,6 +104,8 @@ laiue_add_module(render
     SOURCES
         ${backend_sources}
         renderer.h
+        graphics_service.h
+        module_entry.c
         ui_quad.h
         shader_pack.c
         shader_pack.h

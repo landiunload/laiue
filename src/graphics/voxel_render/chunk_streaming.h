@@ -29,14 +29,14 @@ typedef struct ChunkStreamingStats
     double averageBuildMilliseconds;
 } ChunkStreamingStats;
 
-LAIUE_SCENE_STREAMING_API ChunkStreaming* ChunkStreamingCreate(
+LAIUE_VOXEL_RENDER_API ChunkStreaming* ChunkStreamingCreate(
     World* world, Renderer* renderer, int32_t viewRadiusChunks);
-LAIUE_SCENE_STREAMING_API void ChunkStreamingDestroy(ChunkStreaming* streaming);
-LAIUE_SCENE_STREAMING_API bool ChunkStreamingPause(ChunkStreaming* streaming);
+LAIUE_VOXEL_RENDER_API void ChunkStreamingDestroy(ChunkStreaming* streaming);
+LAIUE_VOXEL_RENDER_API bool ChunkStreamingPause(ChunkStreaming* streaming);
 
 // Вызывается после смены origin мира. Сохраняет только уже готовые GPU-меши,
 // абсолютные чанки которых попадают в новую зону обзора.
-LAIUE_SCENE_STREAMING_API bool ChunkStreamingResumeAfterOriginChange(
+LAIUE_VOXEL_RENDER_API bool ChunkStreamingResumeAfterOriginChange(
     ChunkStreaming* streaming,
     bool originDeltaFits,
     int64_t chunkOriginDeltaX, int64_t chunkOriginDeltaY, int64_t chunkOriginDeltaZ,
@@ -44,28 +44,28 @@ LAIUE_SCENE_STREAMING_API bool ChunkStreamingResumeAfterOriginChange(
 
 // Смена центра обзора (в координатах чанков): заказывает недостающие
 // меши от ближних к дальним и выбрасывает вышедшие из радиуса+1.
-LAIUE_SCENE_STREAMING_API void ChunkStreamingSetCenter(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingSetCenter(
     ChunkStreaming* streaming,
     int64_t chunkX, int64_t chunkY, int64_t chunkZ);
 
 // Пометить чанки, содержащие блок (включая соседей при границе),
 // устаревшими — они будут перестроены рабочими потоками.
-LAIUE_SCENE_STREAMING_API void ChunkStreamingInvalidateBlock(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingInvalidateBlock(
     ChunkStreaming* streaming,
     int64_t blockX, int64_t blockY, int64_t blockZ);
 
 // Забирает готовые меши из рабочих потоков и загружает их на GPU
 // (не больше бюджета на кадр). Вызывается каждый кадр до начала кадра.
-LAIUE_SCENE_STREAMING_API void ChunkStreamingPump(ChunkStreaming* streaming);
+LAIUE_VOXEL_RENDER_API void ChunkStreamingPump(ChunkStreaming* streaming);
 
 // Снимок накопительных счётчиков для диагностики/профилировщика. Вызов дешёвый и
 // не останавливает рабочие потоки надолго.
-LAIUE_SCENE_STREAMING_API void ChunkStreamingGetStats(ChunkStreaming* streaming,
+LAIUE_VOXEL_RENDER_API void ChunkStreamingGetStats(ChunkStreaming* streaming,
     ChunkStreamingStats* outStats);
 
 // Рисует видимые меши спереди-назад (между Begin/EndFrame).
 // renderOriginBlock — локальный блок, который GPU считает (0,0,0).
 // Благодаря этому абсолютная дальность мира не попадает во float-рендер.
-LAIUE_SCENE_STREAMING_API void ChunkStreamingDraw(
+LAIUE_VOXEL_RENDER_API void ChunkStreamingDraw(
     ChunkStreaming* streaming, const float viewProjection[16],
     const int64_t renderOriginBlock[3]);

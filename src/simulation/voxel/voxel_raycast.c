@@ -1,4 +1,4 @@
-#include "scene/voxel_raycast.h"
+#include "voxel/raycast.h"
 
 #include <limits.h>
 #include <stddef.h>

@@ -1,10 +1,16 @@
 #include "audio/audio_service.h"
 #include "audio/audio_pack_service.h"
 #include "content/content_service.h"
+#include "mesh/mesher_service.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
+#include "render/graphics_service.h"
+#include "scene/math_service.h"
+#include "scene/scene_service.h"
 #include "test_runtime.h"
 #include "ui/ui_service.h"
+#include "voxel_render/voxel_render_service.h"
+#include "world/world_service.h"
 
 #include <stdbool.h>
 
@@ -13,16 +19,37 @@
 #define AUDIO_PACK_MODULE_NAME L"laiue_audio_pack.dll"
 #define CONTENT_MODULE_NAME L"laiue_content.dll"
 #define UI_MODULE_NAME L"laiue_ui.dll"
+#define VOXEL_RENDER_MODULE_NAME L"laiue_voxel_render.dll"
+#define SCENE_MATH_MODULE_NAME L"laiue_scene_math.dll"
+#define WORLD_MODULE_NAME L"laiue_world.dll"
+#define MESHER_MODULE_NAME L"laiue_mesher.dll"
+#define RENDER_MODULE_NAME L"laiue_render.dll"
+#define NUMERIC_MODULE_NAME L"laiue_numeric.dll"
+#define SCENE_MODULE_NAME L"laiue_scene.dll"
 #elif defined(__APPLE__)
 #define AUDIO_MODULE_NAME L"liblaiue_audio.dylib"
 #define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.dylib"
 #define CONTENT_MODULE_NAME L"liblaiue_content.dylib"
 #define UI_MODULE_NAME L"liblaiue_ui.dylib"
+#define VOXEL_RENDER_MODULE_NAME L"liblaiue_voxel_render.dylib"
+#define SCENE_MATH_MODULE_NAME L"liblaiue_scene_math.dylib"
+#define WORLD_MODULE_NAME L"liblaiue_world.dylib"
+#define MESHER_MODULE_NAME L"liblaiue_mesher.dylib"
+#define RENDER_MODULE_NAME L"liblaiue_render.dylib"
+#define NUMERIC_MODULE_NAME L"liblaiue_numeric.dylib"
+#define SCENE_MODULE_NAME L"liblaiue_scene.dylib"
 #else
 #define AUDIO_MODULE_NAME L"liblaiue_audio.so"
 #define AUDIO_PACK_MODULE_NAME L"liblaiue_audio_pack.so"
 #define CONTENT_MODULE_NAME L"liblaiue_content.so"
 #define UI_MODULE_NAME L"liblaiue_ui.so"
+#define VOXEL_RENDER_MODULE_NAME L"liblaiue_voxel_render.so"
+#define SCENE_MATH_MODULE_NAME L"liblaiue_scene_math.so"
+#define WORLD_MODULE_NAME L"liblaiue_world.so"
+#define MESHER_MODULE_NAME L"liblaiue_mesher.so"
+#define RENDER_MODULE_NAME L"liblaiue_render.so"
+#define NUMERIC_MODULE_NAME L"liblaiue_numeric.so"
+#define SCENE_MODULE_NAME L"liblaiue_scene.so"
 #endif
 
 static void Expect(bool condition, const char *message)
@@ -61,6 +88,13 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     static wchar_t audioPackPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t contentPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t uiPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t voxelRenderPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t sceneMathPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t worldPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t mesherPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t numericPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t scenePath[LAIUE_PLATFORM_PATH_CAPACITY];
     Expect(PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY),
            "executable directory is available");
     Expect(Join(missingPath, directory, L"laiue_optional_module_absent_9f3c.dll"),
@@ -69,6 +103,15 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(Join(audioPackPath, directory, AUDIO_PACK_MODULE_NAME), "audio pack path fits");
     Expect(Join(contentPath, directory, CONTENT_MODULE_NAME), "content path fits");
     Expect(Join(uiPath, directory, UI_MODULE_NAME), "UI path fits");
+    Expect(Join(voxelRenderPath, directory, VOXEL_RENDER_MODULE_NAME),
+           "voxel render path fits");
+    Expect(Join(sceneMathPath, directory, SCENE_MATH_MODULE_NAME),
+           "scene math path fits");
+    Expect(Join(worldPath, directory, WORLD_MODULE_NAME), "world path fits");
+    Expect(Join(mesherPath, directory, MESHER_MODULE_NAME), "mesher path fits");
+    Expect(Join(renderPath, directory, RENDER_MODULE_NAME), "render path fits");
+    Expect(Join(numericPath, directory, NUMERIC_MODULE_NAME), "numeric path fits");
+    Expect(Join(scenePath, directory, SCENE_MODULE_NAME), "scene path fits");
 
     LaiueModuleHostConfigV1 config;
     LaiueModuleHostConfigInitialize(&config);
@@ -144,6 +187,61 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                size >= sizeof(*uiService) && uiService->contextCreate != NULL,
            "UI service is published");
     LaiueModuleHostUnloadAll(host);
+
+    LaiueModuleBinaryV1 voxelRenderGraph[] = {
+        {voxelRenderPath, 0u, NULL},
+        {mesherPath, 0u, NULL},
+        {sceneMathPath, 0u, NULL},
+        {renderPath, 0u, NULL},
+        {scenePath, 0u, NULL},
+        {worldPath, 0u, NULL},
+        {numericPath, 0u, NULL},
+        {contentPath, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, voxelRenderGraph,
+                               (uint32_t)(sizeof(voxelRenderGraph) /
+                                          sizeof(voxelRenderGraph[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    const LaiueVoxelRenderServiceV1 *voxelRenderService =
+        (const LaiueVoxelRenderServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_VOXEL_RENDER_SERVICE_NAME,
+            LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueVoxelRenderServiceV1), &version, &size);
+    Expect(voxelRenderService != NULL &&
+               version == LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1 &&
+               size >= sizeof(*voxelRenderService) && voxelRenderService->create != NULL &&
+               voxelRenderService->draw != NULL,
+           "voxel render service is published");
+    const LaiueGraphicsServiceV1 *graphicsService =
+        (const LaiueGraphicsServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueGraphicsServiceV1), &version, &size);
+    const LaiueMesherServiceV1 *mesherService =
+        (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueMesherServiceV1), &version, &size);
+    const LaiueSceneMathServiceV1 *sceneMathService =
+        (const LaiueSceneMathServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_SCENE_MATH_SERVICE_NAME,
+            LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueSceneMathServiceV1), &version, &size);
+    const LaiueSceneServiceV1 *sceneService =
+        (const LaiueSceneServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_SCENE_SERVICE_NAME, LAIUE_SCENE_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueSceneServiceV1), &version, &size);
+    const LaiueWorldServiceV1 *worldService =
+        (const LaiueWorldServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_WORLD_SERVICE_NAME, LAIUE_WORLD_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueWorldServiceV1), &version, &size);
+    Expect(graphicsService != NULL && graphicsService->createWithBackend != NULL &&
+               mesherService != NULL && mesherService->buildChunkMesh != NULL &&
+               sceneMathService != NULL && sceneMathService->matrix4Multiply != NULL &&
+               sceneService != NULL && sceneService->cameraUpdate != NULL &&
+               worldService != NULL && worldService->getBlock != NULL,
+           "graphics dependency graph services are published");
+    LaiueModuleHostUnloadAll(host);
+
     LaiueModuleHostDestroy(host);
     LAIUE_TEST_SUCCESS();
 }

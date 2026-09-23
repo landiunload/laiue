@@ -50,9 +50,9 @@ option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 # свой на каждой платформе. Список выводится в конфигурации, чтобы
 # неполнота профиля была видна, а не подразумевалась.
 if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene voxel_render)
 else()
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene voxel_render)
 endif()
 
 include(LaiueToolchain)
@@ -224,7 +224,9 @@ install(FILES "${PROJECT_SOURCE_DIR}/src/numeric/infinite_coord.h"
         "${PROJECT_SOURCE_DIR}/src/numeric/numeric_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/numeric"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/world/world.h"
+install(FILES
+    "${PROJECT_SOURCE_DIR}/src/simulation/world/world.h"
+    "${PROJECT_SOURCE_DIR}/src/simulation/world/world_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/world"
     COMPONENT Engine)
 install(FILES
@@ -232,6 +234,7 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/compound_shape.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_broadphase.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/voxel_body.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/physics_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/jobs/task/task_pool.h"
@@ -271,15 +274,8 @@ install(FILES
 # набор графических модулей зависит от бэкенда, и SDK не должен обещать
 # заголовок модуля, которого в сборке нет.
 if(TARGET laiue_window)
-    install(FILES
-            "${PROJECT_SOURCE_DIR}/src/platform/window.h"
-            "${PROJECT_SOURCE_DIR}/src/platform/time.h"
+    install(FILES "${PROJECT_SOURCE_DIR}/src/platform/time.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/platform"
-        COMPONENT Engine)
-endif()
-if(TARGET laiue_input)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/input/input.h"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/input"
         COMPONENT Engine)
 endif()
 if(TARGET laiue_audio)
@@ -298,7 +294,9 @@ if(TARGET laiue_audio_pack)
         COMPONENT Engine)
 endif()
 if(TARGET laiue_mesher)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/mesh/chunk_mesher.h"
+    install(FILES
+        "${PROJECT_SOURCE_DIR}/src/graphics/mesh/chunk_mesher.h"
+        "${PROJECT_SOURCE_DIR}/src/graphics/mesh/mesher_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh"
         COMPONENT Engine)
 endif()
@@ -306,28 +304,42 @@ if(TARGET laiue_render)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/graphics/render/chunk_geometry.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/renderer.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/graphics_service.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/ui_quad.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/shader_pack.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_pack.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/render"
         COMPONENT Engine)
 endif()
+if(TARGET laiue_input)
+    install(FILES
+            "${PROJECT_SOURCE_DIR}/src/graphics/input/input.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/input/input_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/input"
+        COMPONENT Engine)
+endif()
 if(TARGET laiue_scene)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/camera.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/math.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/math_service.h"
             "${PROJECT_SOURCE_DIR}/src/graphics/scene/panorama.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/scene_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
         COMPONENT Engine)
 endif()
-if(TARGET laiue_scene_streaming)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/scene/chunk_streaming.h"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
+if(TARGET laiue_voxel_render)
+    install(FILES
+        "${PROJECT_SOURCE_DIR}/src/graphics/voxel_render/chunk_streaming.h"
+        "${PROJECT_SOURCE_DIR}/src/graphics/voxel_render/voxel_render_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/voxel_render"
         COMPONENT Engine)
 endif()
 if(TARGET laiue_voxel_raycast)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/scene/voxel_raycast.h"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
+    install(FILES
+        "${PROJECT_SOURCE_DIR}/src/simulation/voxel/raycast.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/voxel/raycast_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/voxel"
         COMPONENT Engine)
 endif()
 if(TARGET laiue_ui)
@@ -337,6 +349,13 @@ if(TARGET laiue_ui)
             "${PROJECT_SOURCE_DIR}/src/ui/ui_font.h"
             "${PROJECT_SOURCE_DIR}/src/ui/ui_format.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/ui"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_window)
+    install(FILES
+            "${PROJECT_SOURCE_DIR}/src/platform/window.h"
+            "${PROJECT_SOURCE_DIR}/src/platform/window_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/window"
         COMPONENT Engine)
 endif()
 if(LAIUE_BUILD_GRAPHICS)

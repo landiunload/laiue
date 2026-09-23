@@ -85,6 +85,8 @@ if(LAIUE_BUILD_GRAPHICS AND LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
         SOURCES
             window.c
             window.h
+            window_service.h
+            window_module_entry.c
             time.c
             time.h
             ../api.h

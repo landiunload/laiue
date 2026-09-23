@@ -59,10 +59,33 @@ target_link_libraries(laiue_world_provider_test PRIVATE laiue_world)
 laiue_configure_standalone_executable(laiue_world_provider_test WorldProviderTestEntryPoint)
 add_test(NAME laiue.world.provider COMMAND laiue_world_provider_test)
 
+if(TARGET laiue_world AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    add_executable(laiue_world_module_test world_module_test.c)
+    target_link_libraries(laiue_world_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_world_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_world_module_test WorldModuleTestEntryPoint)
+    add_dependencies(laiue_world_module_test laiue_world)
+    add_test(NAME laiue.world.module COMMAND laiue_world_module_test)
+endif()
+
 add_executable(laiue_physics_test physics_test.c)
 target_link_libraries(laiue_physics_test PRIVATE laiue_physics)
 laiue_configure_standalone_executable(laiue_physics_test PhysicsTestEntryPoint)
 add_test(NAME laiue.physics.voxel_body COMMAND laiue_physics_test)
+
+if(TARGET laiue_physics AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    add_executable(laiue_physics_module_test physics_module_test.c)
+    target_link_libraries(laiue_physics_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_physics_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_physics_module_test PhysicsModuleTestEntryPoint)
+    add_dependencies(laiue_physics_module_test
+        laiue_physics laiue_numeric laiue_task)
+    add_test(NAME laiue.physics.module COMMAND laiue_physics_module_test)
+endif()
 
 add_executable(laiue_rigid_body_test rigid_body_test.c)
 target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics)
@@ -258,14 +281,17 @@ if(LAIUE_NATIVE_MODS_ENABLED)
         laiue_module_provider laiue_module_consumer)
     add_test(NAME laiue.mod.module_host COMMAND laiue_module_host_test)
 
-    if(TARGET laiue_audio AND TARGET laiue_ui AND
+    if(TARGET laiue_audio AND TARGET laiue_ui AND TARGET laiue_voxel_render AND
        LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
         add_executable(laiue_optional_modules_test optional_modules_test.c)
         target_link_libraries(laiue_optional_modules_test PRIVATE laiue_bootstrap)
         target_compile_definitions(laiue_optional_modules_test PRIVATE LAIUE_STATIC=1)
         laiue_configure_standalone_executable(
             laiue_optional_modules_test OptionalModulesTestEntryPoint)
-        add_dependencies(laiue_optional_modules_test laiue_audio laiue_ui)
+        add_dependencies(laiue_optional_modules_test
+            laiue_audio laiue_ui laiue_voxel_render laiue_scene_math
+            laiue_scene laiue_world laiue_mesher laiue_render laiue_numeric
+            laiue_content)
         add_test(NAME laiue.mod.optional_components COMMAND laiue_optional_modules_test)
     endif()
 else()
@@ -273,6 +299,18 @@ else()
     target_link_libraries(laiue_mod_host_disabled_test PRIVATE laiue_mod)
     laiue_configure_standalone_executable(laiue_mod_host_disabled_test ModHostDisabledTestEntry)
     add_test(NAME laiue.mod.host_disabled COMMAND laiue_mod_host_disabled_test)
+endif()
+
+if(TARGET laiue_voxel_raycast AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    add_executable(laiue_voxel_raycast_module_test voxel_raycast_module_test.c)
+    target_link_libraries(laiue_voxel_raycast_module_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_voxel_raycast_module_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_voxel_raycast_module_test VoxelRaycastModuleTestEntryPoint)
+    add_dependencies(laiue_voxel_raycast_module_test laiue_voxel_raycast)
+    add_test(NAME laiue.voxel.raycast_module
+        COMMAND laiue_voxel_raycast_module_test)
 endif()
 
 if(TARGET laiue_mesher)
@@ -285,31 +323,42 @@ if(TARGET laiue_mesher)
 endif()
 
 if(TARGET laiue_voxel_raycast)
+    add_executable(laiue_voxel_raycast_core_test voxel_raycast_core_test.c)
+    target_link_libraries(laiue_voxel_raycast_core_test PRIVATE
+        laiue_voxel_raycast
+        laiue_world)
+    laiue_configure_standalone_executable(
+        laiue_voxel_raycast_core_test VoxelRaycastCoreTestEntryPoint)
+    add_test(NAME laiue.voxel.raycast_core
+        COMMAND laiue_voxel_raycast_core_test)
+endif()
+
+if(TARGET laiue_voxel_raycast AND TARGET laiue_voxel_render)
     add_executable(laiue_voxel_raycast_test voxel_raycast_test.c)
     target_link_libraries(laiue_voxel_raycast_test PRIVATE
         laiue_voxel_raycast
-        laiue_scene_streaming
+        laiue_voxel_render
         laiue_world)
     laiue_configure_standalone_executable(
         laiue_voxel_raycast_test VoxelRaycastTestEntryPoint)
-    add_test(NAME laiue.scene.voxel_raycast
+    add_test(NAME laiue.voxel.render_raycast
         COMMAND laiue_voxel_raycast_test)
 
 endif()
 
-if(TARGET laiue_scene_streaming)
+if(TARGET laiue_voxel_render)
     # Стресс таблицы чанков: случайные переходы и блуждание по кольцу с
     # независимым эталоном множества ключей и проверкой списка отрисовки.
     add_executable(laiue_chunk_streaming_stress_test
         chunk_streaming_stress_test.c)
     target_link_libraries(laiue_chunk_streaming_stress_test PRIVATE
-        laiue_scene_streaming
+        laiue_voxel_render
         laiue_world)
     laiue_configure_standalone_executable(
         laiue_chunk_streaming_stress_test ChunkStreamingStressTestEntryPoint)
-    add_test(NAME laiue.scene.chunk_streaming_stress
+    add_test(NAME laiue.voxel.render_chunk_streaming_stress
         COMMAND laiue_chunk_streaming_stress_test)
-    set_tests_properties(laiue.scene.chunk_streaming_stress PROPERTIES
+    set_tests_properties(laiue.voxel.render_chunk_streaming_stress PROPERTIES
         TIMEOUT 120)
 endif()
 if(TARGET laiue_render)

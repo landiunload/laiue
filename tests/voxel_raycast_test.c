@@ -1,5 +1,5 @@
-#include "scene/chunk_streaming.h"
-#include "scene/voxel_raycast.h"
+#include "voxel_render/chunk_streaming.h"
+#include "voxel/raycast.h"
 #include "test_runtime.h"
 
 static uint32_t raycastChecks;
