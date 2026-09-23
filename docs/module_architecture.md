@@ -94,6 +94,8 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
   providers без renderer-зависимости; последний требует только `laiue.world`;
 * `laiue.window` и `laiue.input` отделены от renderer и публикуются только в
   профилях, где соответствующий OS backend собран.
+* `laiue.ui` публикует backend-neutral draw lists и требует
+  `laiue.graphics` только на runtime-графе; его DLL не импортирует renderer.
 
 Таким образом, отсутствие physics, voxel-render, UI, audio или window artifact
 не делает bootstrap недействительным: профиль получает только диагностику

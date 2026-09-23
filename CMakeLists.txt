@@ -36,9 +36,10 @@ option(LAIUE_BUILD_GRAPHICS
     "Build the window/input/mesher/render/scene graphics layer"
     ${_laiue_graphics_default})
 
-# Audio and UI are technology modules in their own right.  They do not
-# require a renderer to compile, so portable/headless/mobile profiles can
-# select them independently of a window or GPU backend.
+# Audio and UI are technology modules in their own right.  UI does not require
+# a renderer at compile time, but its runtime service graph explicitly
+# requires laiue.graphics; headless profiles can still build it and omit it
+# from the selected module profile.
 option(LAIUE_BUILD_AUDIO "Build the audio mixer and system/offscreen output" ON)
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)

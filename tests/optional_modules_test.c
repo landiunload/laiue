@@ -176,8 +176,21 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
            "audio pack service is published after dependencies");
     LaiueModuleHostUnloadAll(host);
 
-    LaiueModuleBinaryV1 ui = {uiPath, 0u, NULL};
-    Expect(LaiueModuleHostLoad(host, &ui, 1u, &diagnostic) == LAIUE_MODULE_OK,
+    LaiueModuleBinaryV1 uiOnly = {uiPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(host, &uiOnly, 1u, &diagnostic) ==
+               LAIUE_MODULE_DEPENDENCY_MISSING,
+           "UI without graphics reports missing dependency");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u,
+           "failed UI graph rolls back completely");
+
+    LaiueModuleBinaryV1 uiGraph[] = {
+        {uiPath, 0u, NULL},
+        {renderPath, 0u, NULL},
+        {contentPath, 0u, NULL},
+    };
+    Expect(LaiueModuleHostLoad(host, uiGraph,
+                               (uint32_t)(sizeof(uiGraph) / sizeof(uiGraph[0])),
+                               &diagnostic) == LAIUE_MODULE_OK,
            diagnostic.message);
     const LaiueUiServiceV1 *uiService =
         (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(

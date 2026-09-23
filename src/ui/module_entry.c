@@ -1,5 +1,6 @@
 #include "ui/ui.h"
 #include "ui/ui_service.h"
+#include "render/graphics_service.h"
 
 #include <string.h>
 
@@ -7,6 +8,7 @@ _Static_assert(sizeof(LaiueUiQuadV1) == sizeof(RendererUiQuad),
                "UI service quad layout must match renderer upload layout");
 
 static const LaiueModuleHostV1 *moduleHost;
+static const LaiueGraphicsServiceV1 *graphicsService;
 
 static uint32_t ContextCreate(void **outContext)
 {
@@ -194,9 +196,11 @@ static const LaiueUiServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->allocate == NULL || host->free == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
     moduleHost = host;
+    graphicsService = NULL;
     *outContext = (void *)&moduleHost;
     return 1u;
 }
@@ -204,16 +208,32 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 static uint32_t ModuleStart(void *context)
 {
     (void)context;
+    if (moduleHost == NULL || moduleHost->queryService == NULL)
+        return 0u;
+    uint32_t version = 0u;
+    uint32_t size = 0u;
+    graphicsService = (const LaiueGraphicsServiceV1 *)moduleHost->queryService(
+        moduleHost->context, LAIUE_GRAPHICS_SERVICE_NAME,
+        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1, sizeof(LaiueGraphicsServiceV1),
+        &version, &size);
+    if (graphicsService == NULL || version < LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1 ||
+        size < sizeof(*graphicsService))
+    {
+        graphicsService = NULL;
+        return 0u;
+    }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_UI_SERVICE_NAME,
         .version = LAIUE_UI_SERVICE_ABI_VERSION_1,
         .table = &service,
         .tableSize = sizeof(service),
     };
-    return moduleHost != NULL &&
-                   moduleHost->publishService(moduleHost->context, &published) == LAIUE_MODULE_OK
-               ? 1u
-               : 0u;
+    if (moduleHost->publishService(moduleHost->context, &published) != LAIUE_MODULE_OK)
+    {
+        graphicsService = NULL;
+        return 0u;
+    }
+    return 1u;
 }
 
 static void ModuleStop(void *context)
@@ -221,15 +241,20 @@ static void ModuleStop(void *context)
     (void)context;
     if (moduleHost != NULL && moduleHost->unpublishService != NULL)
         (void)moduleHost->unpublishService(moduleHost->context, LAIUE_UI_SERVICE_NAME);
+    graphicsService = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
     (void)context;
     moduleHost = NULL;
+    graphicsService = NULL;
 }
 
 static const char *const provides[] = {LAIUE_UI_SERVICE_NAME};
+static const LaiueModuleRequirementV1 requiresServices[] = {
+    {LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1},
+};
 
 static const LaiueModuleApiV1 api = {
     .structSize = sizeof(LaiueModuleApiV1),
@@ -239,6 +264,8 @@ static const LaiueModuleApiV1 api = {
         .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
         .id = "laiue.ui",
         .version = "1.0.0",
+        .requiresServices = requiresServices,
+        .requiresCount = sizeof(requiresServices) / sizeof(requiresServices[0]),
         .providesServices = provides,
         .providesCount = 1u,
     },
