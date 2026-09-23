@@ -58,10 +58,29 @@ typedef struct EnumerateState
     LaiueVoxelBlockV1 block;
 } EnumerateState;
 
+typedef struct EnumerateStateV2
+{
+    uint32_t count;
+    LaiueVoxelCoordV2 coordinate;
+    LaiueVoxelBlockV1 block;
+} EnumerateStateV2;
+
 static uint32_t CaptureSolid(void *context, const LaiueVoxelCoordV1 *coordinate,
                              const LaiueVoxelBlockV1 *block)
 {
     EnumerateState *state = (EnumerateState *)context;
+    if (state == NULL || coordinate == NULL || block == NULL)
+        return 0u;
+    ++state->count;
+    state->coordinate = *coordinate;
+    state->block = *block;
+    return 1u;
+}
+
+static uint32_t CaptureSolidV2(void *context, const LaiueVoxelCoordV2 *coordinate,
+                               const LaiueVoxelBlockV1 *block)
+{
+    EnumerateStateV2 *state = (EnumerateStateV2 *)context;
     if (state == NULL || coordinate == NULL || block == NULL)
         return 0u;
     ++state->count;
@@ -162,6 +181,48 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
                explicitEdit == 0u && result.material == 0u,
            "untouched coordinate reports the default block");
     voxel->destroy(world);
+
+    const LaiueVoxelServiceV2 *voxelV2 =
+        (const LaiueVoxelServiceV2 *)LaiueModuleHostQueryService(
+            host, LAIUE_VOXEL_SERVICE_NAME_V2, LAIUE_VOXEL_SERVICE_ABI_VERSION_2,
+            sizeof(LaiueVoxelServiceV2), &version, &size);
+    Expect(voxelV2 != NULL && version == LAIUE_VOXEL_SERVICE_ABI_VERSION_2 &&
+               size >= sizeof(*voxelV2) && voxelV2->createWithContext != NULL &&
+               voxelV2->getProvider != NULL && voxelV2->setBlock != NULL,
+           "wide-coordinate voxel service table is published");
+    LaiueVoxelWorldV2 *worldV2 = NULL;
+    Expect(voxelV2->createWithContext(voxelV2->context, NULL, &worldV2) != 0u &&
+               worldV2 != NULL,
+           "wide-coordinate voxel world creates");
+    LaiueVoxelProviderV2 providerV2 = {0};
+    Expect(voxelV2->getProvider(worldV2, &providerV2) != 0u &&
+               providerV2.getBlock != NULL && providerV2.enumerateSolid != NULL,
+           "wide-coordinate provider is available");
+    const LaiueVoxelCoordV2 wideCoordinate = {
+        .x = -(INT64_C(1) << 60),
+        .y = INT64_C(1) << 59,
+        .z = INT64_C(1) << 40,
+    };
+    const LaiueVoxelBlockV1 wideStone = {.material = 9u, .flags = 13u};
+    Expect(voxelV2->setBlock(worldV2, &wideCoordinate, &wideStone) != 0u,
+           "wide-coordinate override is stored");
+    LaiueVoxelBlockV1 wideResult = {0};
+    Expect(providerV2.getBlock(&providerV2, &wideCoordinate, &wideResult) != 0u &&
+               wideResult.material == wideStone.material &&
+               wideResult.flags == wideStone.flags,
+           "wide-coordinate provider reads the exact override");
+    LaiueVoxelAabbV2 wideBounds = {
+        .minimum = wideCoordinate,
+        .maximum = wideCoordinate,
+    };
+    EnumerateStateV2 wideState = {0};
+    Expect(providerV2.enumerateSolid(&providerV2, &wideBounds, CaptureSolidV2,
+                                     &wideState) != 0u &&
+               wideState.count == 1u && wideState.coordinate.x == wideCoordinate.x &&
+               wideState.coordinate.y == wideCoordinate.y &&
+               wideState.coordinate.z == wideCoordinate.z,
+           "wide-coordinate enumeration preserves all axes");
+    voxelV2->destroy(worldV2);
 
     LaiueModuleHostUnloadAll(host);
     Expect(LaiueModuleHostQueryService(host, LAIUE_VOXEL_SERVICE_NAME, 1u, 1u,

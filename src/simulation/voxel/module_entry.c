@@ -18,6 +18,7 @@ struct LaiueVoxelModuleState
     const LaiueModuleHostV1 *host;
     const LaiueWorldServiceV1 *worldService;
     LaiueVoxelServiceV1 service;
+    LaiueVoxelServiceV2 serviceV2;
 };
 
 /* World owns the sparse coordinate/chunk storage.  The voxel adapter only
@@ -124,6 +125,45 @@ static uint32_t VoxelGetBlockState(const LaiueVoxelProviderV1 *provider,
     return 1u;
 }
 
+static uint32_t VoxelGetBlockV2(const LaiueVoxelProviderV2 *provider,
+                                const LaiueVoxelCoordV2 *coordinate,
+                                LaiueVoxelBlockV1 *outBlock)
+{
+    if (provider == NULL || coordinate == NULL || outBlock == NULL ||
+        provider->context == NULL)
+        return 0u;
+    const LaiueVoxelWorldV1 *world =
+        (const LaiueVoxelWorldV1 *)provider->context;
+    if (world->worldService == NULL || world->worldService->getBlock == NULL)
+        return 0u;
+    const BlockType id = world->worldService->getBlock(
+        world->world, coordinate->x, coordinate->y, coordinate->z);
+    VoxelDecodeBlock(world, id, outBlock);
+    return 1u;
+}
+
+static uint32_t VoxelGetBlockStateV2(const LaiueVoxelProviderV2 *provider,
+                                     const LaiueVoxelCoordV2 *coordinate,
+                                     LaiueVoxelBlockV1 *outBlock,
+                                     uint32_t *outExplicit)
+{
+    if (provider == NULL || coordinate == NULL || outBlock == NULL ||
+        outExplicit == NULL || provider->context == NULL)
+        return 0u;
+    const LaiueVoxelWorldV1 *world =
+        (const LaiueVoxelWorldV1 *)provider->context;
+    BlockType id = BLOCK_AIR;
+    bool explicitEdit = false;
+    if (world->worldService == NULL || world->worldService->getBlockState == NULL ||
+        !world->worldService->getBlockState(world->world, coordinate->x,
+                                            coordinate->y, coordinate->z, &id,
+                                            &explicitEdit))
+        return 0u;
+    VoxelDecodeBlock(world, id, outBlock);
+    *outExplicit = explicitEdit ? 1u : 0u;
+    return 1u;
+}
+
 typedef struct VoxelEnumerationContext
 {
     const LaiueVoxelWorldV1 *world;
@@ -175,6 +215,55 @@ static uint32_t VoxelEnumerateSolid(const LaiueVoxelProviderV1 *provider,
                : 0u;
 }
 
+typedef struct VoxelEnumerationContextV2
+{
+    const LaiueVoxelWorldV1 *world;
+    uint32_t (*visitor)(void *, const LaiueVoxelCoordV2 *,
+                        const LaiueVoxelBlockV1 *);
+    void *visitorContext;
+} VoxelEnumerationContextV2;
+
+static bool VoxelEnumerationVisitorV2(void *context, int64_t x, int64_t y,
+                                      int64_t z, BlockType id)
+{
+    VoxelEnumerationContextV2 *state = (VoxelEnumerationContextV2 *)context;
+    if (state == NULL || state->world == NULL || state->visitor == NULL)
+        return false;
+    LaiueVoxelBlockV1 block;
+    VoxelDecodeBlock(state->world, id, &block);
+    if (block.material == 0u)
+        return true;
+    const LaiueVoxelCoordV2 coordinate = {.x = x, .y = y, .z = z};
+    return state->visitor(state->visitorContext, &coordinate, &block) != 0u;
+}
+
+static uint32_t VoxelEnumerateSolidV2(
+    const LaiueVoxelProviderV2 *provider, const LaiueVoxelAabbV2 *bounds,
+    uint32_t (*visitor)(void *, const LaiueVoxelCoordV2 *,
+                        const LaiueVoxelBlockV1 *),
+    void *visitorContext)
+{
+    if (provider == NULL || bounds == NULL || visitor == NULL ||
+        provider->context == NULL || bounds->minimum.x > bounds->maximum.x ||
+        bounds->minimum.y > bounds->maximum.y || bounds->minimum.z > bounds->maximum.z)
+        return 0u;
+    const LaiueVoxelWorldV1 *world =
+        (const LaiueVoxelWorldV1 *)provider->context;
+    VoxelEnumerationContextV2 enumeration = {
+        .world = world,
+        .visitor = visitor,
+        .visitorContext = visitorContext,
+    };
+    if (world->worldService == NULL || world->worldService->enumerateOverrides == NULL)
+        return 0u;
+    return world->worldService->enumerateOverrides(
+               world->world, bounds->minimum.x, bounds->minimum.y,
+               bounds->minimum.z, bounds->maximum.x, bounds->maximum.y,
+               bounds->maximum.z, VoxelEnumerationVisitorV2, &enumeration)
+               ? 1u
+               : 0u;
+}
+
 static uint32_t VoxelBuildMesh(const LaiueVoxelProviderV1 *provider,
                                const LaiueVoxelAabbV1 *bounds,
                                void *vertexOutput, uint64_t vertexCapacity,
@@ -190,6 +279,23 @@ static uint32_t VoxelBuildMesh(const LaiueVoxelProviderV1 *provider,
     if (outRange != NULL)
         *outRange = (LaiueVoxelMeshRangeV1){0};
     /* Meshing remains a separate voxel_render/mesher technology. */
+    return 0u;
+}
+
+static uint32_t VoxelBuildMeshV2(const LaiueVoxelProviderV2 *provider,
+                                 const LaiueVoxelAabbV2 *bounds,
+                                 void *vertexOutput, uint64_t vertexCapacity,
+                                 void *indexOutput, uint64_t indexCapacity,
+                                 LaiueVoxelMeshRangeV1 *outRange)
+{
+    (void)provider;
+    (void)bounds;
+    (void)vertexOutput;
+    (void)vertexCapacity;
+    (void)indexOutput;
+    (void)indexCapacity;
+    if (outRange != NULL)
+        *outRange = (LaiueVoxelMeshRangeV1){0};
     return 0u;
 }
 
@@ -216,6 +322,39 @@ static uint32_t VoxelSetBlock(LaiueVoxelWorldV1 *world,
     return world->worldService->trySetBlockExplicit(
                world->world, coordinate->x, coordinate->y,
                (int64_t)coordinate->z, id)
+               ? 1u
+               : 0u;
+}
+
+static uint32_t VoxelGetProviderV2(LaiueVoxelWorldV2 *world,
+                                   LaiueVoxelProviderV2 *outProvider)
+{
+    if (world == NULL || outProvider == NULL)
+        return 0u;
+    *outProvider = (LaiueVoxelProviderV2){
+        .structSize = sizeof(*outProvider),
+        .abiVersion = LAIUE_VOXEL_ABI_VERSION_2,
+        .context = world,
+        .getBlock = VoxelGetBlockV2,
+        .getBlockState = VoxelGetBlockStateV2,
+        .enumerateSolid = VoxelEnumerateSolidV2,
+        .buildMesh = VoxelBuildMeshV2,
+    };
+    return 1u;
+}
+
+static uint32_t VoxelSetBlockV2(LaiueVoxelWorldV2 *world,
+                                const LaiueVoxelCoordV2 *coordinate,
+                                const LaiueVoxelBlockV1 *block)
+{
+    if (world == NULL || coordinate == NULL || block == NULL)
+        return 0u;
+    BlockType id = BLOCK_AIR;
+    if (!VoxelEncodeBlock(world, block, &id) || world->worldService == NULL ||
+        world->worldService->trySetBlockExplicit == NULL)
+        return 0u;
+    return world->worldService->trySetBlockExplicit(
+               world->world, coordinate->x, coordinate->y, coordinate->z, id)
                ? 1u
                : 0u;
 }
@@ -331,6 +470,14 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->service.getRevision = VoxelGetRevision;
     state->service.createWithContext = VoxelCreateWithContext;
     state->service.context = state;
+    state->serviceV2.structSize = sizeof(state->serviceV2);
+    state->serviceV2.abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_2;
+    state->serviceV2.createWithContext = VoxelCreateWithContext;
+    state->serviceV2.destroy = VoxelDestroy;
+    state->serviceV2.getProvider = VoxelGetProviderV2;
+    state->serviceV2.setBlock = VoxelSetBlockV2;
+    state->serviceV2.getRevision = VoxelGetRevision;
+    state->serviceV2.context = state;
     *outContext = state;
     return 1u;
 }
@@ -363,6 +510,20 @@ static uint32_t ModuleStart(void *context)
         state->worldService = NULL;
         return 0u;
     }
+    LaiueModuleServiceV1 publishedV2 = {
+        .name = LAIUE_VOXEL_SERVICE_NAME_V2,
+        .version = LAIUE_VOXEL_SERVICE_ABI_VERSION_2,
+        .table = &state->serviceV2,
+        .tableSize = sizeof(state->serviceV2),
+    };
+    if (state->host->publishService(state->host->context, &publishedV2) !=
+        LAIUE_MODULE_OK)
+    {
+        (void)state->host->unpublishService(state->host->context,
+                                             LAIUE_VOXEL_SERVICE_NAME);
+        state->worldService = NULL;
+        return 0u;
+    }
     return 1u;
 }
 
@@ -370,7 +531,11 @@ static void ModuleStop(void *context)
 {
     LaiueVoxelModuleState *state = (LaiueVoxelModuleState *)context;
     if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
+    {
+        (void)state->host->unpublishService(state->host->context,
+                                             LAIUE_VOXEL_SERVICE_NAME_V2);
         (void)state->host->unpublishService(state->host->context, LAIUE_VOXEL_SERVICE_NAME);
+    }
     if (state != NULL)
         state->worldService = NULL;
 }
@@ -386,7 +551,10 @@ static void ModuleDestroy(void *context)
     }
 }
 
-static const char *const provides[] = {LAIUE_VOXEL_SERVICE_NAME};
+static const char *const provides[] = {
+    LAIUE_VOXEL_SERVICE_NAME,
+    LAIUE_VOXEL_SERVICE_NAME_V2,
+};
 static const LaiueModuleRequirementV1 requiresServices[] = {
     {LAIUE_WORLD_SERVICE_NAME, LAIUE_WORLD_SERVICE_ABI_VERSION_1},
 };
@@ -402,7 +570,7 @@ static const LaiueModuleApiV1 api = {
         .requiresServices = requiresServices,
         .requiresCount = 1u,
         .providesServices = provides,
-        .providesCount = 1u,
+        .providesCount = sizeof(provides) / sizeof(provides[0]),
     },
     .create = ModuleCreate,
     .start = ModuleStart,
