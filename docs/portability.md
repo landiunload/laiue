@@ -223,6 +223,14 @@ cmake --build D:\build\laiue\android-x86_64-core-api35 --config Release --parall
 `android-x86_64-walk-api35`: он собирает Vulkan surface path и `.so`; APK
 target включается только когда явно заданы SDK build-tools и keystore.
 
+На Windows с динамическими модулями сборка также создаёт
+`laiue_graphics_d3d12.dll`. При найденном Vulkan SDK Linux/Windows собирают
+`laiue_graphics_vulkan.so|dll` отдельно. Оба provider-а используют один
+`laiue.graphics` service ABI, но имеют разные descriptor ID; в поставку
+включают только выбранный профилем artifact. Старый `laiue_render` намеренно
+оставлен compatibility-мостом и может содержать оба backend-а для прежних
+клиентов.
+
 ## Vulkan offscreen на Linux
 
 Нужны CMake 3.28+, Ninja, GCC или Clang, заголовки Vulkan и любой драйвер.

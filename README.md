@@ -44,6 +44,7 @@ runtime-сервисы с единым C ABI.
 | `audio` | PCM-микшер и offscreen provider; системный вывод вынесен в `audio_output`, звукопаки — в `audio_pack` |
 | `mesh` | greedy meshing чанков `64³` |
 | `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
+| `graphics_d3d12`, `graphics_vulkan` | самостоятельные альтернативные providers общего Graphics ABI; выбираются профилем |
 | `scene` | камера, матрицы и panorama |
 | `scene_math` | общий поставщик матриц и frustum без renderer |
 | `voxel_render` | асинхронный chunk streaming и GPU-загрузка мешей |

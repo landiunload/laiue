@@ -126,7 +126,15 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
   device/resource contract для новых модулей. `laiue.scene`
   требует этот provider и `laiue.scene_math`, а `laiue.voxel_render` требует
   graphics и остальные перечисленные providers вместо поиска функций в
-  глобальном диспетчере;
+  глобальном диспетчере. На desktop-сборках дополнительно доступны
+  самостоятельные providers `laiue_graphics_d3d12` и
+  `laiue_graphics_vulkan`. Они публикуют те же сервисы с descriptor ID
+  `laiue.graphics.d3d12` и `laiue.graphics.vulkan`, но каждый бинарник
+  компилирует только свой backend. Профиль с двумя артефактами обязан явно
+  выбрать один, например `provider = laiue.graphics:laiue.graphics.vulkan`;
+  загрузчик не выбирает backend по порядку файлов и не импортирует соседний
+  DLL. `laiue_render` остаётся объединённым compatibility-мостом для старых
+  приложений;
 * `laiue.scene_math` и `laiue.voxel_raycast` являются самостоятельными
   providers без renderer-зависимости; последний требует только `laiue.world`;
 * `laiue.window` и `laiue.input` отделены от renderer и публикуются только в

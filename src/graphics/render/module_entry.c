@@ -10,6 +10,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+
+#ifndef LAIUE_RENDER_PROVIDER_ID
+#define LAIUE_RENDER_PROVIDER_ID "laiue.graphics"
+#endif
 typedef struct LaiueGraphicsModuleState
 {
     const LaiueModuleHostV1 *host;
@@ -464,7 +468,7 @@ static const LaiueModuleApiV1 api = {
     .descriptor = {
         .structSize = sizeof(LaiueModuleDescriptorV1),
         .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
-        .id = "laiue.graphics",
+        .id = LAIUE_RENDER_PROVIDER_ID,
         .version = "1.0.0",
         .providesServices = provides,
         .providesCount = sizeof(provides) / sizeof(provides[0]),

@@ -138,6 +138,86 @@ target_compile_definitions(laiue_render PRIVATE ${backend_compile_definitions})
 target_include_directories(laiue_render BEFORE PRIVATE
     "${PROJECT_BINARY_DIR}/src")
 
+# The compatibility `laiue_render` target above can contain both backends so
+# existing applications keep their one-DLL entry point.  New profiles should
+# prefer one of these provider targets: each one contains the same generic
+# graphics service but compiles exactly one native backend and therefore has
+# no link-time dependency on its alternative.  They intentionally publish the
+# same service name (`laiue.graphics`); the module descriptor ID is distinct
+# so a profile must select one explicitly when both artifacts are present.
+option(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS
+    "Build standalone D3D12 and Vulkan graphics provider modules" ON)
+
+if(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    set(_laiue_render_provider_common_sources
+        renderer_dispatch.c
+        renderer.h
+        graphics_service.h
+        module_entry.c
+        content_provider.c
+        content_provider.h
+        ui_quad.h
+        shader_pack.c
+        shader_pack.h
+        texture_build.c
+        texture_pack.c
+        texture_pack.h
+        texture_pack_internal.h
+        chunk_geometry.h
+        ../../api.h
+        ${chunk_shader_headers}
+        ${panorama_shader_headers}
+        ${ui_shader_headers})
+
+    if(WIN32)
+        laiue_add_module(graphics_d3d12
+            RUNTIME_ROLE GRAPHICS
+            SOURCES
+                ${_laiue_render_provider_common_sources}
+                renderer_d3d12.c
+                ui_image_wic.c
+                ui_image_wic.h
+            LINK
+                d3d12
+                dxgi
+                dxguid
+                ole32
+                windowscodecs
+                laiue::media_support)
+        target_compile_definitions(laiue_graphics_d3d12 PRIVATE
+            LAIUE_BUILD_RENDER
+            LAIUE_RENDER_HAS_D3D12
+            LAIUE_RENDER_DEFAULT_BACKEND_D3D12
+            "LAIUE_RENDER_PROVIDER_ID=\"laiue.graphics.d3d12\"")
+        target_include_directories(laiue_graphics_d3d12 BEFORE PRIVATE
+            "${PROJECT_BINARY_DIR}/src")
+    endif()
+
+    if(Vulkan_FOUND)
+        laiue_add_module(graphics_vulkan
+            RUNTIME_ROLE GRAPHICS
+            SOURCES
+                ${_laiue_render_provider_common_sources}
+                renderer_vulkan.c
+                renderer_offscreen.h
+            LINK
+                Vulkan::Vulkan
+                laiue::media_support)
+        target_compile_definitions(laiue_graphics_vulkan PRIVATE
+            LAIUE_BUILD_RENDER
+            LAIUE_RENDER_HAS_VULKAN
+            LAIUE_RENDER_DEFAULT_BACKEND_VULKAN
+            "LAIUE_RENDER_PROVIDER_ID=\"laiue.graphics.vulkan\"")
+        if(X11_FOUND)
+            target_link_libraries(laiue_graphics_vulkan PRIVATE X11::X11)
+            target_compile_definitions(laiue_graphics_vulkan PRIVATE LAIUE_RENDER_HAS_X11)
+        endif()
+        target_include_directories(laiue_graphics_vulkan BEFORE PRIVATE
+            "${PROJECT_BINARY_DIR}/src")
+    endif()
+endif()
+
 # Тесты живут в каталоге, который добавляется после src/render, и решают,
 # какие прогоны регистрировать, по реально слинкованным бэкендам, а не по
 # LAIUE_RENDER_BACKEND_RESOLVED: на Windows AUTO разрешается в D3D12 и по
