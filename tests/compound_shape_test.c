@@ -1,7 +1,7 @@
 // Regression tests for the build-time compound-box coalescer:
 //   VoxelRigidCompoundMergeBoxes
 //
-// The contract is the one documented in src/physics/compound_shape.h. The test
+// The contract is the one documented in src/simulation/physics/compound_shape.h. The test
 // deliberately exercises argument rejection, non-finite/degenerate geometry,
 // overlap rejection, capacity and aliasing rules, transactional failure,
 // deterministic repetition, exact in-place operation, positive/negative and

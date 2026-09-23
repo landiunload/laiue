@@ -11,7 +11,7 @@ laiue_add_module(scene
         panorama.h
         voxel_raycast.c
         voxel_raycast.h
-        ../api.h
+        ../../api.h
     LINK
         laiue::math_support
         laiue_world

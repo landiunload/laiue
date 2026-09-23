@@ -4,6 +4,6 @@ laiue_add_module(mesher
         chunk_mesher.c
         chunk_mesher.h
         ../render/chunk_geometry.h
-        ../api.h
+        ../../api.h
     LINK laiue_world
 )

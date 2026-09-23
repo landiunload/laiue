@@ -22,6 +22,13 @@ runtime-сервисы с единым C ABI.
 
 ## Модули
 
+Исходники разложены по семействам технологий: `src/core`, `src/assets`,
+`src/graphics`, `src/jobs`, `src/simulation` и `src/modding`; самостоятельные
+границы `platform`, `audio`, `ui` и `numeric` остаются отдельными каталогами.
+Это физическая организация исходников, а не новый ABI: публичные имена
+сервисов и заголовков остаются стабильными. Полная карта находится в
+[docs/architecture/module_layout.md](docs/architecture/module_layout.md).
+
 | Модуль | Назначение |
 |---|---|
 | `platform_support` | внутренняя граница памяти, locks, файлов и времени |
@@ -74,7 +81,8 @@ headless-ядро: `world`, `physics`, `content` и `mod`; `platform_support`
 `clang-cl`; для графики нужен Windows SDK с Direct3D 12 и `fxc`. Для
 Vulkan-профиля нужен `glslang`. Если компилятор шейдеров не найден,
 используются закоммиченные fallback-заголовки: по одному набору на
-бэкенд, `src/render/generated/d3d12/` и `src/render/generated/vulkan/`.
+бэкенд, `src/graphics/render/generated/d3d12/` и
+`src/graphics/render/generated/vulkan/`.
 
 ```powershell
 # Visual Studio/MSVC

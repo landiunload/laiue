@@ -1,7 +1,7 @@
 set(generated_directory
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(fallback_directory
-    "${PROJECT_SOURCE_DIR}/src/render/generated")
+    "${PROJECT_SOURCE_DIR}/src/graphics/render/generated")
 
 laiue_compile_shader(chunk
     SOURCE "${PROJECT_SOURCE_DIR}/shaders/chunk.hlsl"
@@ -112,7 +112,7 @@ laiue_add_module(render
         texture_pack.h
         texture_pack_internal.h
         chunk_geometry.h
-        ../api.h
+        ../../api.h
         ${chunk_shader_headers}
         ${panorama_shader_headers}
         ${ui_shader_headers}

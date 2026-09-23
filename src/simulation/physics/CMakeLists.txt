@@ -14,7 +14,7 @@ laiue_add_module(physics
         rigid_body.h
         voxel_body.c
         voxel_body.h
-        ../api.h
+        ../../api.h
     PUBLIC_LINK
         laiue::numeric
         laiue::task

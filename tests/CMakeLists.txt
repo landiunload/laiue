@@ -118,7 +118,7 @@ add_test(NAME laiue.physics.compound_shape COMMAND laiue_compound_shape_test)
 set_tests_properties(laiue.physics.compound_shape PROPERTIES TIMEOUT 30)
 
 # Test the private spatial helper directly; it is not an exported SDK ABI.
-add_executable(laiue_compound_bvh_test compound_bvh_test.c ../src/physics/compound_bvh.c)
+add_executable(laiue_compound_bvh_test compound_bvh_test.c ../src/simulation/physics/compound_bvh.c)
 target_link_libraries(laiue_compound_bvh_test PRIVATE laiue::physics)
 if(LAIUE_PLATFORM_EXTERNAL)
     target_link_libraries(laiue_compound_bvh_test PRIVATE "${LAIUE_PRECISE_FP_TARGET}")
@@ -325,7 +325,7 @@ if(TARGET laiue_render)
     add_executable(laiue_texture_pack_build_test
         texture_pack_build_test.c
         texc_fixtures.h
-        "${PROJECT_SOURCE_DIR}/src/render/texture_build.c")
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_build.c")
     target_include_directories(laiue_texture_pack_build_test PRIVATE
         "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(laiue_texture_pack_build_test PRIVATE

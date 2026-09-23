@@ -17,7 +17,7 @@ endif()
 
 project(laiue
     VERSION 0.7.0
-    DESCRIPTION "C17 voxel engine libraries with infinite coordinates"
+    DESCRIPTION "C17 technology modules with infinite coordinates"
     LANGUAGES C)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -83,17 +83,17 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>")
 
-add_subdirectory(src/math)
+add_subdirectory(src/core/math)
 add_subdirectory(src/numeric)
-add_subdirectory(src/media)
+add_subdirectory(src/assets/media)
 add_subdirectory(src/platform)
-add_subdirectory(src/task)
-add_subdirectory(src/world)
-add_subdirectory(src/physics)
-add_subdirectory(src/content)
-add_subdirectory(src/character)
-add_subdirectory(src/voxel)
-add_subdirectory(src/mod)
+add_subdirectory(src/jobs/task)
+add_subdirectory(src/simulation/world)
+add_subdirectory(src/simulation/physics)
+add_subdirectory(src/assets/content)
+add_subdirectory(src/simulation/character)
+add_subdirectory(src/simulation/voxel)
+add_subdirectory(src/modding/mod)
 if(LAIUE_BUILD_AUDIO OR LAIUE_BUILD_AUDIO_PACK)
     add_subdirectory(src/audio)
 endif()
@@ -108,14 +108,14 @@ endif()
 # module graph at runtime. The existing `laiue::mod` target remains the
 # compatibility aggregate for old native mods.
 add_library(laiue_bootstrap STATIC
-    src/mod/module_api.h
-    src/mod/module_manifest.c
-    src/mod/module_manifest.h
-    src/mod/module_host.c
-    src/mod/module_host.h
-    src/mod/mod_internal.c
-    src/mod/mod_internal.h
-    src/mod/mod_types.h)
+    src/modding/mod/module_api.h
+    src/modding/mod/module_manifest.c
+    src/modding/mod/module_manifest.h
+    src/modding/mod/module_host.c
+    src/modding/mod/module_host.h
+    src/modding/mod/mod_internal.c
+    src/modding/mod/mod_internal.h
+    src/modding/mod/mod_types.h)
 add_library(laiue::bootstrap ALIAS laiue_bootstrap)
 target_include_directories(laiue_bootstrap
     PUBLIC
@@ -156,7 +156,7 @@ set_target_properties(laiue_character_api PROPERTIES EXPORT_NAME character_api)
 
 if(LAIUE_BUILD_GRAPHICS)
     foreach(graphics_directory IN LISTS LAIUE_GRAPHICS_MODULE_DIRECTORIES)
-        add_subdirectory("src/${graphics_directory}")
+        add_subdirectory("src/graphics/${graphics_directory}")
     endforeach()
 endif()
 
@@ -224,47 +224,47 @@ install(FILES "${PROJECT_SOURCE_DIR}/src/numeric/infinite_coord.h"
         "${PROJECT_SOURCE_DIR}/src/numeric/numeric_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/numeric"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/world/world.h"
+install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/world/world.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/world"
     COMPONENT Engine)
 install(FILES
-        "${PROJECT_SOURCE_DIR}/src/physics/rigid_body.h"
-        "${PROJECT_SOURCE_DIR}/src/physics/compound_shape.h"
-        "${PROJECT_SOURCE_DIR}/src/physics/rigid_broadphase.h"
-        "${PROJECT_SOURCE_DIR}/src/physics/voxel_body.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_body.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/compound_shape.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_broadphase.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/voxel_body.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/physics"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/task/task_pool.h"
-        "${PROJECT_SOURCE_DIR}/src/task/task_service.h"
+install(FILES "${PROJECT_SOURCE_DIR}/src/jobs/task/task_pool.h"
+        "${PROJECT_SOURCE_DIR}/src/jobs/task/task_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/task"
     COMPONENT Engine)
 install(FILES
-        "${PROJECT_SOURCE_DIR}/src/content/content_catalog.h"
-        "${PROJECT_SOURCE_DIR}/src/content/content_format.h"
-        "${PROJECT_SOURCE_DIR}/src/content/content_service.h"
+        "${PROJECT_SOURCE_DIR}/src/assets/content/content_catalog.h"
+        "${PROJECT_SOURCE_DIR}/src/assets/content/content_format.h"
+        "${PROJECT_SOURCE_DIR}/src/assets/content/content_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/content"
     COMPONENT Engine)
 install(FILES
-        "${PROJECT_SOURCE_DIR}/src/mod/mod.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/mod_api.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/mod_host.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/mod_manifest.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/mod_types.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/module_api.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/module_manifest.h"
-        "${PROJECT_SOURCE_DIR}/src/mod/module_host.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/mod.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_api.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_host.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_manifest.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/mod_types.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/module_api.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/module_manifest.h"
+        "${PROJECT_SOURCE_DIR}/src/modding/mod/module_host.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mod"
     COMPONENT Engine)
 install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/graphics_api.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/graphics"
     COMPONENT Engine)
-install(FILES "${PROJECT_SOURCE_DIR}/src/voxel/voxel_api.h"
-        "${PROJECT_SOURCE_DIR}/src/voxel/voxel_service.h"
+install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/voxel/voxel_api.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/voxel/voxel_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/voxel"
     COMPONENT Engine)
 install(FILES
-        "${PROJECT_SOURCE_DIR}/src/character/character_api.h"
-        "${PROJECT_SOURCE_DIR}/src/character/character_service.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/character/character_api.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/character/character_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/character"
     COMPONENT Engine)
 # Заголовки ставятся по собранным целям, а не по одному флагу графики:
@@ -278,7 +278,7 @@ if(TARGET laiue_window)
         COMPONENT Engine)
 endif()
 if(TARGET laiue_input)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/input/input.h"
+    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/input/input.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/input"
         COMPONENT Engine)
 endif()
@@ -298,27 +298,27 @@ if(TARGET laiue_audio_pack)
         COMPONENT Engine)
 endif()
 if(TARGET laiue_mesher)
-    install(FILES "${PROJECT_SOURCE_DIR}/src/mesh/chunk_mesher.h"
+    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/mesh/chunk_mesher.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh"
         COMPONENT Engine)
 endif()
 if(TARGET laiue_render)
     install(FILES
-            "${PROJECT_SOURCE_DIR}/src/render/chunk_geometry.h"
-            "${PROJECT_SOURCE_DIR}/src/render/renderer.h"
-            "${PROJECT_SOURCE_DIR}/src/render/ui_quad.h"
-            "${PROJECT_SOURCE_DIR}/src/render/shader_pack.h"
-            "${PROJECT_SOURCE_DIR}/src/render/texture_pack.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/chunk_geometry.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/renderer.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/ui_quad.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/shader_pack.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_pack.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/render"
         COMPONENT Engine)
 endif()
 if(TARGET laiue_scene)
     install(FILES
-            "${PROJECT_SOURCE_DIR}/src/scene/camera.h"
-            "${PROJECT_SOURCE_DIR}/src/scene/chunk_streaming.h"
-            "${PROJECT_SOURCE_DIR}/src/scene/math.h"
-            "${PROJECT_SOURCE_DIR}/src/scene/panorama.h"
-            "${PROJECT_SOURCE_DIR}/src/scene/voxel_raycast.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/camera.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/chunk_streaming.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/math.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/panorama.h"
+            "${PROJECT_SOURCE_DIR}/src/graphics/scene/voxel_raycast.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/scene"
         COMPONENT Engine)
 endif()

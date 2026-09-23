@@ -67,7 +67,9 @@ check: нужен реальный link и запуск релевантных �
 
 ## Архитектурные правила
 
-- Новая зависимость объявляется в `src/<module>/CMakeLists.txt`.
+- Новая зависимость объявляется в каноническом
+  `src/<category>/<module>/CMakeLists.txt` (либо в самостоятельном
+  `src/<module>/CMakeLists.txt` для platform/audio/ui/numeric).
 - Production `.c` компилируется ровно в одном модуле; общие исходники не
   копируются между targets.
 - Нижний модуль не включает заголовки верхнего. Допустимый граф проверяет
@@ -245,7 +247,7 @@ World origin не заменяет render origin. До преобразован�
 - Не маскируйте предупреждения глобальным отключением.
 - Для затронутых C/H-файлов применяйте `.clang-format`; не форматируйте весь
   проект вместе с функциональным изменением.
-- `src/render/generated/*.h` — checked-in shader fallback. Обычная сборка
+- `src/graphics/render/generated/*.h` — checked-in shader fallback. Обычная сборка
   создаёт headers в binary tree; fallback обновляется только явной командой
   и проверяется diff.
 - Изменение `shaders/*.hlsl` проверяется компиляцией всех затронутых entry/

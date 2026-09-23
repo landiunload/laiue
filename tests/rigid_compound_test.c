@@ -3,7 +3,7 @@
 //   VoxelRigidBodyStepCompoundScratchBytes
 //   VoxelRigidBodyStepCompoundEx
 //
-// The contract is the one documented in src/physics/rigid_body.h. The test
+// The contract is the one documented in src/simulation/physics/rigid_body.h. The test
 // deliberately exercises real trajectories, mutual impulses, concave gaps,
 // inversion of the full row-major 3x3 tensor, SPD/envelope rejection before
 // mutation, children-aware waking, scaled primitive contact budgets, cache warm

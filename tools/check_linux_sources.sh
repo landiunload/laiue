@@ -8,10 +8,10 @@ cd "${source_root}"
 common_flags='-std=c17 -Wall -Wextra -Wpedantic -Werror -DLAIUE_VERSION_MAJOR=0 -DLAIUE_VERSION_MINOR=7 -DLAIUE_VERSION_PATCH=0 -DLAIUE_LINUX_LIBC_GNU=1'
 for source in \
     src/platform/system_posix.c \
-    src/world/*.c \
-    src/physics/*.c \
-    src/content/*.c \
-    src/mod/*.c
+    src/simulation/world/*.c \
+    src/simulation/physics/*.c \
+    src/assets/content/*.c \
+    src/modding/mod/*.c
 do
     echo "checking ${source}"
     # shellcheck disable=SC2086

@@ -189,7 +189,14 @@ endif()
 add_library(laiue_build_options INTERFACE)
 add_library(laiue::build_options ALIAS laiue_build_options)
 target_include_directories(laiue_build_options
-    INTERFACE "${PROJECT_SOURCE_DIR}/src")
+    INTERFACE
+        "${PROJECT_SOURCE_DIR}/src"
+        "${PROJECT_SOURCE_DIR}/src/core"
+        "${PROJECT_SOURCE_DIR}/src/assets"
+        "${PROJECT_SOURCE_DIR}/src/graphics"
+        "${PROJECT_SOURCE_DIR}/src/jobs"
+        "${PROJECT_SOURCE_DIR}/src/simulation"
+        "${PROJECT_SOURCE_DIR}/src/modding")
 target_compile_definitions(laiue_build_options INTERFACE
     "LAIUE_VERSION_TEXT=L\"${PROJECT_VERSION}\""
     LAIUE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
@@ -313,8 +320,8 @@ add_library(laiue_windows_no_crt INTERFACE)
 add_library(laiue::windows_no_crt ALIAS laiue_windows_no_crt)
 if(LAIUE_PLATFORM_WINDOWS)
     add_library(laiue_runtime OBJECT
-        "${PROJECT_SOURCE_DIR}/src/runtime/memory.c"
-        "${PROJECT_SOURCE_DIR}/src/runtime/wide_string.c")
+        "${PROJECT_SOURCE_DIR}/src/core/runtime/memory.c"
+        "${PROJECT_SOURCE_DIR}/src/core/runtime/wide_string.c")
     target_compile_options(laiue_runtime PRIVATE
         /W4 /utf-8 /GS-
         $<$<BOOL:${LAIUE_WARNINGS_AS_ERRORS}>:/WX>

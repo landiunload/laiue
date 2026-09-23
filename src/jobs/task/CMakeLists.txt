@@ -5,5 +5,5 @@ laiue_add_module(task
         task_pool.h
         task_service.h
         module_entry.c
-        ../api.h
+        ../../api.h
 )

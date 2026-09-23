@@ -15,7 +15,7 @@ laiue_add_module(mod
         mod_manifest.c
         mod_manifest.h
         mod_types.h
-        ../api.h
+        ../../api.h
     POSIX_LINK
         ${CMAKE_DL_LIBS}
 )

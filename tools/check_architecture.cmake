@@ -43,6 +43,47 @@ set(portable_system_headers
     nmmintrin.h pmmintrin.h smmintrin.h tmmintrin.h x86intrin.h
     xmmintrin.h)
 
+# Physical source folders describe the technology family, while the second
+# path component names the logical module whose include boundary is checked.
+# Keeping that mapping here lets us organize the tree without weakening the
+# existing module-level dependency rules or changing the public include names.
+function(laiue_logical_owner relative_path output_variable)
+    string(REPLACE "\\" "/" normalized_path "${relative_path}")
+    if(NOT normalized_path MATCHES "^([^/]+)/")
+        set(${output_variable} "" PARENT_SCOPE)
+        return()
+    endif()
+    set(owner "${CMAKE_MATCH_1}")
+    if(owner MATCHES "^(core|assets|graphics|jobs|simulation|modding)$")
+        string(REGEX MATCH "^[^/]+/([^/]+)/" nested_module
+            "${normalized_path}")
+        if(nested_module)
+            set(owner "${CMAKE_MATCH_1}")
+        endif()
+    endif()
+    set(${output_variable} "${owner}" PARENT_SCOPE)
+endfunction()
+
+set(canonical_prefix_graphics "graphics")
+set(canonical_prefix_audio "audio")
+set(canonical_prefix_ui "ui")
+set(canonical_prefix_platform "platform")
+set(canonical_prefix_numeric "numeric")
+set(canonical_prefix_math "core/math")
+set(canonical_prefix_runtime "core/runtime")
+set(canonical_prefix_media "assets/media")
+set(canonical_prefix_content "assets/content")
+set(canonical_prefix_input "graphics/input")
+set(canonical_prefix_mesh "graphics/mesh")
+set(canonical_prefix_render "graphics/render")
+set(canonical_prefix_scene "graphics/scene")
+set(canonical_prefix_task "jobs/task")
+set(canonical_prefix_world "simulation/world")
+set(canonical_prefix_physics "simulation/physics")
+set(canonical_prefix_character "simulation/character")
+set(canonical_prefix_voxel "simulation/voxel")
+set(canonical_prefix_mod "modding/mod")
+
 file(GLOB_RECURSE source_files
     "${SOURCE_ROOT}/*.c" "${SOURCE_ROOT}/*.h")
 set(violations)
@@ -50,11 +91,20 @@ set(checked 0)
 foreach(source_file IN LISTS source_files)
     file(RELATIVE_PATH relative "${SOURCE_ROOT}" "${source_file}")
     string(REPLACE "\\" "/" relative "${relative}")
-    if(relative MATCHES "(^|/)generated/" OR
-       NOT relative MATCHES "^([^/]+)/")
+    if(relative MATCHES "(^|/)generated/")
         continue()
     endif()
-    set(owner "${CMAKE_MATCH_1}")
+    laiue_logical_owner("${relative}" owner)
+    if(owner STREQUAL "")
+        continue()
+    endif()
+    set(expected_prefix "${canonical_prefix_${owner}}")
+    if(NOT expected_prefix STREQUAL "" AND
+       NOT relative MATCHES "^${expected_prefix}(/|$)")
+        list(APPEND violations
+            "${relative}: module '${owner}' must live under '${expected_prefix}'")
+        continue()
+    endif()
     if(NOT DEFINED allowed_${owner})
         list(APPEND violations
             "${relative}: unknown engine module '${owner}'")

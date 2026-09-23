@@ -3,7 +3,7 @@ laiue_add_module(world
     SOURCES
         world_infinite.c
         world.h
-        ../api.h
+        ../../api.h
     LINK
         laiue::numeric
 )
