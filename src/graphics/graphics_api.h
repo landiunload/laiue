@@ -120,6 +120,13 @@ typedef uint32_t (*LaiueGraphicsBeginFrameFn)(LaiueGraphicsDeviceV1 *, uint32_t 
 typedef uint32_t (*LaiueGraphicsSubmitFn)(LaiueGraphicsDeviceV1 *,
                                           const LaiueGraphicsDrawItemV1 *items,
                                           uint32_t itemCount);
+/* Queue backend-neutral UI quads for the current frame.  The record layout
+ * is part of this contract, so UI and graphics remain separately replaceable
+ * providers.  The operation is an optional tail extension: consumers must
+ * gate it by structSize before calling. */
+typedef uint32_t (*LaiueGraphicsSubmitUiFn)(LaiueGraphicsDeviceV1 *,
+                                            const LaiueGraphicsUiQuadV1 *quads,
+                                            uint32_t quadCount);
 typedef uint32_t (*LaiueGraphicsEndFrameFn)(LaiueGraphicsDeviceV1 *);
 
 struct LaiueGraphicsDeviceV1
@@ -137,7 +144,10 @@ struct LaiueGraphicsDeviceV1
     LaiueGraphicsSubmitFn submit;
     LaiueGraphicsEndFrameFn endFrame;
     /* Tail extension: older consumers still see their original fields and
-     * gate this optional operation by structSize. */
+     * gate optional operations by structSize. */
     LaiueGraphicsCreateShaderFn createShader;
     uintptr_t reserved[4];
+    /* Appended after the original reserved tail so its offsets remain stable
+     * for consumers built against the first revision. */
+    LaiueGraphicsSubmitUiFn submitUi;
 };

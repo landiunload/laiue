@@ -110,6 +110,8 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
 static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *, uint32_t, uint32_t);
 static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *,
                              const LaiueGraphicsDrawItemV1 *, uint32_t);
+static uint32_t DeviceSubmitUi(LaiueGraphicsDeviceV1 *,
+                               const LaiueGraphicsUiQuadV1 *, uint32_t);
 static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *);
 
 static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
@@ -144,6 +146,7 @@ static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
     state->device.submit = DeviceSubmit;
     state->device.endFrame = DeviceEndFrame;
     state->device.createShader = DeviceCreateShader;
+    state->device.submitUi = DeviceSubmitUi;
     *outDevice = &state->device;
     return 1u;
 }
@@ -341,6 +344,21 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
              !DeviceHandleIsLive(state, item->indexBuffer, DEVICE_HANDLE_BUFFER)))
             return 0u;
     }
+    return 1u;
+}
+
+static uint32_t DeviceSubmitUi(LaiueGraphicsDeviceV1 *device,
+                               const LaiueGraphicsUiQuadV1 *quads,
+                               uint32_t quadCount)
+{
+    LaiueGraphicsDeviceState *state = DeviceState(device);
+    if (state == NULL || !state->frameActive ||
+        (quadCount != 0u && quads == NULL) ||
+        quadCount > LAIUE_GRAPHICS_UI_MAX_QUADS)
+        return 0u;
+    if (quadCount != 0u)
+        RendererUiQueue(state->renderer, (const RendererUiQuad *)quads, quadCount);
+    state->submittedItems += quadCount;
     return 1u;
 }
 
