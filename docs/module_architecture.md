@@ -77,6 +77,12 @@ selections; при конфликте providers он также не делае�
 ресурсных паков, включая `audio_pack`, работают только через собственные
 versioned service tables и не имеют отдельной legacy-копии.
 
+`LaiueGraphicsDrawItemV2` принимает texture/sampler handles в необязательном
+хвосте таблицы: старый потребитель может передать legacy prefix, а новый —
+получает проверку принадлежности ресурсов тому же device namespace до записи
+команд. Pipeline дополнительно удерживает shader handles до своего удаления;
+это предотвращает dangling resources при отказе или частичном teardown.
+
 ## Перенесённые providers
 
 `laiue_numeric` уже экспортирует новый entry point и service

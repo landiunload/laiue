@@ -273,6 +273,15 @@ static bool DevicePipelineHandlesAreLive(const LaiueGraphicsDeviceState *state,
     return true;
 }
 
+static bool DeviceOptionalBindingsAreLive(const LaiueGraphicsDeviceState *state,
+                                          LaiueGraphicsHandle texture,
+                                          LaiueGraphicsHandle sampler)
+{
+    return state != NULL &&
+           (texture == 0u || DeviceHandleIsLive(state, texture, DEVICE_HANDLE_TEXTURE)) &&
+           (sampler == 0u || DeviceHandleIsLive(state, sampler, DEVICE_HANDLE_SAMPLER));
+}
+
 static uint32_t DeviceBuildGenericMesh(LaiueGraphicsDeviceState *state,
                                        uint32_t vertexIndex,
                                        LaiueGraphicsHandle indexBuffer,
@@ -769,7 +778,9 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
 static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
                                LaiueGraphicsHandle pipeline,
                                LaiueGraphicsHandle vertexBuffer,
-                               LaiueGraphicsHandle indexBuffer)
+                               LaiueGraphicsHandle indexBuffer,
+                               LaiueGraphicsHandle texture,
+                               LaiueGraphicsHandle sampler)
 {
     return state != NULL &&
            (pipeline == 0u ||
@@ -777,7 +788,8 @@ static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
              DevicePipelineHandlesAreLive(
                  state, &state->pipelines[DeviceHandleSlot(pipeline) - 1u]))) &&
            (vertexBuffer == 0u || DeviceHandleIsLive(state, vertexBuffer, DEVICE_HANDLE_BUFFER)) &&
-           (indexBuffer == 0u || DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER));
+           (indexBuffer == 0u || DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER)) &&
+           DeviceOptionalBindingsAreLive(state, texture, sampler);
 }
 
 static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
@@ -834,7 +846,7 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
     {
         const LaiueGraphicsDrawItemV1 *item = &items[index];
         if (!DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
-                                item->indexBuffer))
+                                item->indexBuffer, 0u, 0u))
             return 0u;
         if (item->indexBuffer != 0u && item->vertexBuffer != 0u &&
             DeviceBufferIsGeneric(state, DeviceHandleSlot(item->vertexBuffer) - 1u) &&
@@ -1041,9 +1053,16 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
     for (uint32_t index = 0u; index < itemCount; ++index)
     {
         const LaiueGraphicsDrawItemV2 *item = &items[index];
-        if (item->structSize < sizeof(*item) ||
+        LaiueGraphicsHandle texture = 0u;
+        LaiueGraphicsHandle sampler = 0u;
+        if (item->structSize >= LAIUE_GRAPHICS_DRAW_ITEM_V2_RESOURCE_SIZE)
+        {
+            texture = item->texture;
+            sampler = item->sampler;
+        }
+        if (item->structSize < LAIUE_GRAPHICS_DRAW_ITEM_V2_LEGACY_SIZE ||
             !DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
-                                item->indexBuffer))
+                                item->indexBuffer, texture, sampler))
             return 0u;
         if (item->vertexBuffer != 0u &&
             DeviceBufferIsGeneric(state, DeviceHandleSlot(item->vertexBuffer) - 1u))

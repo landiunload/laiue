@@ -329,6 +329,20 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(resourceDevice->createSampler(resourceDevice, &samplerDescription, &sampler) != 0u &&
                sampler != 0u,
            "graphics device stores sampler descriptor state");
+    Expect(resourceDevice->beginFrame(resourceDevice, 16u, 16u) != 0u,
+           "graphics device begins a resource-binding frame");
+    LaiueGraphicsDrawItemV2 boundItem = {
+        .structSize = sizeof(boundItem),
+        .pipeline = 0u,
+        .vertexBuffer = 0u,
+        .indexBuffer = 0u,
+        .texture = texture,
+        .sampler = sampler,
+    };
+    Expect(resourceDevice->submit(resourceDevice, &boundItem, 1u) != 0u,
+           "graphics device validates texture and sampler bindings");
+    Expect(resourceDevice->endFrame(resourceDevice) != 0u,
+           "graphics device ends a resource-binding frame");
     resourceDevice->destroyHandle(resourceDevice, texture);
     resourceDevice->destroyHandle(resourceDevice, sampler);
     fallbackDeviceV2->destroyDevice(resourceDevice);

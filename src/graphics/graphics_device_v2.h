@@ -29,7 +29,17 @@ typedef struct LaiueGraphicsDrawItemV2
     int32_t vertexOffset;
     float originRelative[3];
     float scale;
+    /* Optional tail: old V2 clients may omit these fields.  When present,
+     * the handles are validated against the same device namespace as the
+     * pipeline and vertex/index buffers. */
+    LaiueGraphicsHandle texture;
+    LaiueGraphicsHandle sampler;
 } LaiueGraphicsDrawItemV2;
+
+#define LAIUE_GRAPHICS_DRAW_ITEM_V2_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueGraphicsDrawItemV2, texture))
+#define LAIUE_GRAPHICS_DRAW_ITEM_V2_RESOURCE_SIZE \
+    ((uint32_t)sizeof(LaiueGraphicsDrawItemV2))
 
 /* Camera state is supplied in render-local coordinates. Providers never
  * receive the application's absolute origin, which keeps float precision
