@@ -29,6 +29,7 @@ typedef struct LaiueGraphicsDeviceState
     LaiueGraphicsDeviceV2 deviceV2;
     const LaiueModuleHostV1 *host;
     Renderer *renderer;
+    uint32_t handleNamespace;
     uint32_t generations[256];
     uint64_t sizes[256];
     uint32_t usageFlags[256];
@@ -56,6 +57,32 @@ enum
     DEVICE_HANDLE_SHADER = 5u,
 };
 
+static volatile uint32_t g_nextHandleNamespace;
+
+static uint32_t DeviceAllocateNamespace(void)
+{
+    uint32_t value = PlatformAtomicIncrementU32(&g_nextHandleNamespace);
+    /* Namespace zero is reserved for an invalid handle. */
+    if (value == 0u)
+        value = PlatformAtomicIncrementU32(&g_nextHandleNamespace);
+    return value;
+}
+
+static uint32_t DeviceHandleSlot(LaiueGraphicsHandle handle)
+{
+    return (uint32_t)(handle & UINT64_C(0xffff));
+}
+
+static uint32_t DeviceHandleGeneration(LaiueGraphicsHandle handle)
+{
+    return (uint32_t)((handle >> 16u) & UINT64_C(0xffff));
+}
+
+static uint32_t DeviceHandleNamespace(LaiueGraphicsHandle handle)
+{
+    return (uint32_t)(handle >> 32u);
+}
+
 static LaiueGraphicsDeviceState *DeviceState(LaiueGraphicsDeviceV1 *device)
 {
     return device == NULL ? NULL : (LaiueGraphicsDeviceState *)device->context;
@@ -70,14 +97,15 @@ static uint32_t DeviceAllocateHandle(LaiueGraphicsDeviceState *state,
     for (uint32_t index = 0u; index < 256u; ++index)
         if (state->live[index] == 0u)
         {
-            uint32_t generation = state->generations[index] + 1u;
+            uint32_t generation = (state->generations[index] + 1u) & UINT32_C(0xffff);
             if (generation == 0u)
                 generation = 1u;
             state->generations[index] = generation;
             state->sizes[index] = size;
             state->kinds[index] = kind;
             state->live[index] = 1u;
-            *outHandle = ((uint64_t)generation << 32u) | (uint64_t)(index + 1u);
+            *outHandle = ((uint64_t)state->handleNamespace << 32u) |
+                         ((uint64_t)generation << 16u) | (uint64_t)(index + 1u);
             return 1u;
         }
     return 0u;
@@ -86,11 +114,13 @@ static uint32_t DeviceAllocateHandle(LaiueGraphicsDeviceState *state,
 static uint32_t DeviceHandleIsLive(const LaiueGraphicsDeviceState *state,
                                    LaiueGraphicsHandle handle, uint8_t expectedKind)
 {
-    const uint32_t index = (uint32_t)handle;
-    const uint32_t generation = (uint32_t)(handle >> 32u);
-    return state != NULL && index != 0u && index <= 256u && generation != 0u &&
+    const uint32_t index = DeviceHandleSlot(handle);
+    const uint32_t generation = DeviceHandleGeneration(handle);
+    return state != NULL && state->handleNamespace != 0u &&
+                   DeviceHandleNamespace(handle) == state->handleNamespace &&
+                   index != 0u && index <= 256u && generation != 0u &&
                    state->live[index - 1u] != 0u &&
-                   state->generations[index - 1u] == generation &&
+                   (state->generations[index - 1u] & UINT32_C(0xffff)) == generation &&
                    (expectedKind == 0u || state->kinds[index - 1u] == expectedKind)
                ? 1u
                : 0u;
@@ -224,7 +254,7 @@ static uint32_t DeviceBuildGenericMesh(LaiueGraphicsDeviceState *state,
     }
     if (!DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER))
         return 0u;
-    const uint32_t indexSlot = (uint32_t)indexBuffer - 1u;
+    const uint32_t indexSlot = DeviceHandleSlot(indexBuffer) - 1u;
     if ((state->usageFlags[indexSlot] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) == 0u ||
         state->storage[indexSlot] == NULL || state->sizes[indexSlot] % sizeof(uint32_t) != 0u ||
         firstIndex > state->sizes[indexSlot] / sizeof(uint32_t) ||
@@ -291,6 +321,12 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
         return 0u;
     memset(state, 0, sizeof(*state));
     state->host = host;
+    state->handleNamespace = DeviceAllocateNamespace();
+    if (state->handleNamespace == 0u)
+    {
+        DeviceFree(state, state);
+        return 0u;
+    }
     Renderer *renderer = RendererCreateWithBackend(
         nativeWindow, width, height, (RendererBackendKind)backend);
     if (renderer == NULL)
@@ -408,7 +444,7 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_BUFFER, description->sizeBytes,
                               outBuffer))
         return 0u;
-    const uint32_t index = (uint32_t)*outBuffer - 1u;
+    const uint32_t index = DeviceHandleSlot(*outBuffer) - 1u;
     state->usageFlags[index] = description->usageFlags;
     if (description->sizeBytes > (uint64_t)SIZE_MAX ||
         (state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true)) == NULL)
@@ -471,7 +507,7 @@ static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_SHADER, description->codeSizeBytes,
                               outShader))
         return 0u;
-    const uint32_t index = (uint32_t)*outShader - 1u;
+    const uint32_t index = DeviceHandleSlot(*outShader) - 1u;
     state->storage[index] = DeviceAllocate(state, (size_t)description->codeSizeBytes, false);
     if (state->storage[index] == NULL)
     {
@@ -493,7 +529,7 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
         upload->sizeBytes > (uint64_t)SIZE_MAX ||
         upload->offsetBytes > UINT64_MAX - upload->sizeBytes)
         return 0u;
-    const uint32_t index = (uint32_t)upload->buffer - 1u;
+    const uint32_t index = DeviceHandleSlot(upload->buffer) - 1u;
     if (upload->offsetBytes > state->sizes[index] ||
         upload->sizeBytes > state->sizes[index] - upload->offsetBytes)
         return 0u;
@@ -547,7 +583,7 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     LaiueGraphicsDeviceState *state = DeviceState(device);
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
-    const uint32_t index = (uint32_t)handle - 1u;
+    const uint32_t index = DeviceHandleSlot(handle) - 1u;
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
         for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
             if (state->meshIndexHandles[vertex] == handle &&
@@ -635,7 +671,7 @@ static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
 {
     if (state == NULL || vertexBuffer == 0u)
         return true;
-    const uint32_t index = (uint32_t)vertexBuffer - 1u;
+    const uint32_t index = DeviceHandleSlot(vertexBuffer) - 1u;
     if (state->meshes[index] == NULL)
         return true;
     if (DeviceBufferIsGeneric(state, index))
@@ -685,8 +721,8 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
                                 item->indexBuffer))
             return 0u;
         if (item->indexBuffer != 0u && item->vertexBuffer != 0u &&
-            DeviceBufferIsGeneric(state, (uint32_t)item->vertexBuffer - 1u) &&
-            !DeviceBuildGenericMesh(state, (uint32_t)item->vertexBuffer - 1u,
+            DeviceBufferIsGeneric(state, DeviceHandleSlot(item->vertexBuffer) - 1u) &&
+            !DeviceBuildGenericMesh(state, DeviceHandleSlot(item->vertexBuffer) - 1u,
                                     item->indexBuffer, item->firstIndex,
                                     item->indexCount, item->vertexOffset))
             return 0u;
@@ -894,9 +930,9 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
                                 item->indexBuffer))
             return 0u;
         if (item->vertexBuffer != 0u &&
-            DeviceBufferIsGeneric(state, (uint32_t)item->vertexBuffer - 1u))
+            DeviceBufferIsGeneric(state, DeviceHandleSlot(item->vertexBuffer) - 1u))
         {
-            const uint32_t vertexIndex = (uint32_t)item->vertexBuffer - 1u;
+            const uint32_t vertexIndex = DeviceHandleSlot(item->vertexBuffer) - 1u;
             if (item->indexBuffer != 0u)
             {
                 if (!DeviceBuildGenericMesh(state, vertexIndex, item->indexBuffer,

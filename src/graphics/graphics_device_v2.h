@@ -3,7 +3,8 @@
 /* Version 2 is a deliberately separate service name.  It keeps the V1
  * facade source-compatible while exposing a complete frame/device contract
  * with camera-relative draw origins.  All handles remain owned by the
- * provider instance and carry a generation in their high 32 bits. */
+ * provider instance and carry a device namespace, generation, and slot so a
+ * handle from another device cannot accidentally validate. */
 
 #include "graphics/graphics_api.h"
 
