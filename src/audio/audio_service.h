@@ -18,6 +18,9 @@
 
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueAudioDeviceCreateFn)(
     const AudioDeviceConfiguration *configuration, AudioDevice **outDevice);
+typedef uint32_t(LAIUE_MODULE_CALL *LaiueAudioDeviceCreateWithContextFn)(
+    void *moduleContext, const AudioDeviceConfiguration *configuration,
+    AudioDevice **outDevice);
 typedef void(LAIUE_MODULE_CALL *LaiueAudioDeviceDestroyFn)(AudioDevice *device);
 typedef void(LAIUE_MODULE_CALL *LaiueAudioDeviceSetMasterVolumeFn)(AudioDevice *device,
                                                                     float volume);
@@ -58,6 +61,8 @@ typedef struct LaiueAudioServiceV1
     LaiueAudioVoiceIsActiveFn voiceIsActive;
     LaiueAudioRenderFramesFn renderFrames;
     uintptr_t reserved[8];
+    LaiueAudioDeviceCreateWithContextFn deviceCreateWithContext;
+    void *context;
 } LaiueAudioServiceV1;
 
 LAIUE_AUDIO_API const LaiueModuleApiV1 *LaiueAudioGetStaticModuleApiV1(void);

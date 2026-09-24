@@ -2,13 +2,32 @@
 #include "audio/audio_mixer_internal.h"
 #include "audio/audio_output_service.h"
 
-static LaiueModuleHostV1 const *moduleHost;
-static const LaiueAudioOutputServiceV1 *moduleOutput;
+#include "mod/module_service.h"
+
+#include <string.h>
+
+typedef struct AudioModuleState
+{
+    const LaiueModuleHostV1 *host;
+    const LaiueAudioOutputServiceV1 *output;
+    LaiueAudioServiceV1 service;
+} AudioModuleState;
 
 static uint32_t DeviceCreate(const AudioDeviceConfiguration *configuration,
                              AudioDevice **outDevice)
 {
     return (uint32_t)AudioDeviceCreate(configuration, outDevice);
+}
+
+static uint32_t DeviceCreateWithContext(void *moduleContext,
+                                        const AudioDeviceConfiguration *configuration,
+                                        AudioDevice **outDevice)
+{
+    AudioModuleState *state = (AudioModuleState *)moduleContext;
+    if (state == NULL)
+        return (uint32_t)AUDIO_RESULT_INVALID_STATE;
+    return (uint32_t)AudioDeviceCreateWithOutputService(configuration, state->output,
+                                                        outDevice);
 }
 
 static void DeviceDestroy(AudioDevice *device)
@@ -79,86 +98,104 @@ static uint32_t RenderFrames(AudioDevice *device, float *outFrames, uint32_t fra
     return AudioDeviceRenderFrames(device, outFrames, frameCount) ? 1u : 0u;
 }
 
-static const LaiueAudioServiceV1 service = {
-    .structSize = sizeof(LaiueAudioServiceV1),
-    .abiVersion = LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
-    .deviceCreate = DeviceCreate,
-    .deviceDestroy = DeviceDestroy,
-    .deviceSetMasterVolume = DeviceSetMasterVolume,
-    .deviceGetMasterVolume = DeviceGetMasterVolume,
-    .deviceGetStats = DeviceGetStats,
-    .clipCreate = ClipCreate,
-    .clipDestroy = ClipDestroy,
-    .clipDuration = ClipDuration,
-    .voicePlay = VoicePlay,
-    .voiceSetParameters = VoiceSetParameters,
-    .voiceStop = VoiceStop,
-    .stopAll = StopAll,
-    .voiceIsActive = VoiceIsActive,
-    .renderFrames = RenderFrames,
-};
-
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
-    moduleHost = host;
-    moduleOutput = NULL;
+    AudioModuleState *state =
+        (AudioModuleState *)host->allocate(host->context, sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
+    state->service = (LaiueAudioServiceV1){
+        .structSize = sizeof(LaiueAudioServiceV1),
+        .abiVersion = LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
+        .deviceCreate = DeviceCreate,
+        .deviceDestroy = DeviceDestroy,
+        .deviceSetMasterVolume = DeviceSetMasterVolume,
+        .deviceGetMasterVolume = DeviceGetMasterVolume,
+        .deviceGetStats = DeviceGetStats,
+        .clipCreate = ClipCreate,
+        .clipDestroy = ClipDestroy,
+        .clipDuration = ClipDuration,
+        .voicePlay = VoicePlay,
+        .voiceSetParameters = VoiceSetParameters,
+        .voiceStop = VoiceStop,
+        .stopAll = StopAll,
+        .voiceIsActive = VoiceIsActive,
+        .renderFrames = RenderFrames,
+        .deviceCreateWithContext = DeviceCreateWithContext,
+        .context = state,
+    };
     AudioMixerSetOutputService(NULL);
-    *outContext = (void *)&moduleHost;
+    *outContext = state;
     return 1u;
 }
 
 static uint32_t ModuleStart(void *context)
 {
-    (void)context;
-    if (moduleHost == NULL || moduleHost->queryService == NULL) return 0u;
+    AudioModuleState *state = (AudioModuleState *)context;
+    if (state == NULL || state->host == NULL || state->host->queryService == NULL)
+        return 0u;
+    state->output = NULL;
     uint32_t outputVersion = 0u;
     uint32_t outputSize = 0u;
-    moduleOutput = (const LaiueAudioOutputServiceV1 *)moduleHost->queryService(
-        moduleHost->context, LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
+    state->output = (const LaiueAudioOutputServiceV1 *)state->host->queryService(
+        state->host->context, LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
         LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1, sizeof(LaiueAudioOutputServiceV1),
         &outputVersion, &outputSize);
-    if (moduleOutput != NULL &&
+    if (state->output != NULL &&
         (outputVersion < LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 ||
-         outputSize < sizeof(*moduleOutput) || moduleOutput->create == NULL ||
-         moduleOutput->destroy == NULL || moduleOutput->sampleRate == NULL ||
-         moduleOutput->channelCount == NULL || moduleOutput->bufferFrameCount == NULL ||
-         moduleOutput->underrunCount == NULL))
+         outputSize < sizeof(*state->output) || state->output->create == NULL ||
+         state->output->destroy == NULL || state->output->sampleRate == NULL ||
+         state->output->channelCount == NULL || state->output->bufferFrameCount == NULL ||
+         state->output->underrunCount == NULL))
     {
-        moduleOutput = NULL;
+        state->output = NULL;
         return 0u;
     }
-    AudioMixerSetOutputService(moduleOutput);
+    /* Keep the legacy deviceCreate entry point operational for existing
+     * clients. New clients should use deviceCreateWithContext, which never
+     * consults this process-wide compatibility slot. */
+    AudioMixerSetOutputService(state->output);
     LaiueModuleServiceV1 published = {
         .name = LAIUE_AUDIO_SERVICE_NAME,
         .version = LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = sizeof(state->service),
     };
-    if (moduleHost->publishService(moduleHost->context, &published) == LAIUE_MODULE_OK)
+    if (state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK)
         return 1u;
     AudioMixerSetOutputService(NULL);
-    moduleOutput = NULL;
+    state->output = NULL;
     return 0u;
 }
 
 static void ModuleStop(void *context)
 {
-    (void)context;
-    if (moduleHost != NULL && moduleHost->unpublishService != NULL)
-        (void)moduleHost->unpublishService(moduleHost->context, LAIUE_AUDIO_SERVICE_NAME);
+    AudioModuleState *state = (AudioModuleState *)context;
+    if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
+        (void)state->host->unpublishService(state->host->context, LAIUE_AUDIO_SERVICE_NAME);
     AudioMixerSetOutputService(NULL);
-    moduleOutput = NULL;
+    if (state != NULL)
+        state->output = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    AudioMixerSetOutputService(NULL);
-    moduleOutput = NULL;
-    moduleHost = NULL;
+    AudioModuleState *state = (AudioModuleState *)context;
+    if (state != NULL)
+    {
+        const LaiueModuleHostV1 *host = state->host;
+        state->host = NULL;
+        state->output = NULL;
+        AudioMixerSetOutputService(NULL);
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_AUDIO_SERVICE_NAME};

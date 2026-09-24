@@ -94,7 +94,12 @@ LAIUE_TEST_ENTRY(AudioSystemBackendTestEntryPoint)
         .masterVolume = 0.0f,
     };
     AudioDevice *device = NULL;
-    AudioResult result = (AudioResult)audio->deviceCreate(&configuration, &device);
+    AudioResult result;
+    if (audio->deviceCreateWithContext != NULL && audio->context != NULL)
+        result = (AudioResult)audio->deviceCreateWithContext(audio->context, &configuration,
+                                                             &device);
+    else
+        result = (AudioResult)audio->deviceCreate(&configuration, &device);
     if (result != AUDIO_RESULT_OK)
     {
         LaiueTestRuntimeWrite("No system audio output available; skipping\n");

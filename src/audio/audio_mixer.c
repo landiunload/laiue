@@ -529,8 +529,10 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
 
 // === Устройство ===
 
-AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
-                              AudioDevice **outDevice)
+AudioResult AudioDeviceCreateWithOutputService(
+    const AudioDeviceConfiguration *configuration,
+    const LaiueAudioOutputServiceV1 *outputService,
+    AudioDevice **outDevice)
 {
     if (outDevice == NULL) return AUDIO_RESULT_INVALID_ARGUMENT;
     *outDevice = NULL;
@@ -570,7 +572,7 @@ AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
     {
         created = AudioOffscreenBackendCreate(&description, &device->offscreenBackend);
     }
-    else if (g_audioOutputService != NULL && g_audioOutputService->create != NULL)
+    else if (outputService != NULL && outputService->create != NULL)
     {
         LaiueAudioOutputDescription outputDescription = {
             .sampleRate = description.sampleRate,
@@ -578,11 +580,11 @@ AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
             .render = description.render,
             .context = description.context,
         };
-        created = g_audioOutputService->create(&outputDescription, &device->outputBackend) != 0u &&
+        created = outputService->create(&outputDescription, &device->outputBackend) != 0u &&
                   device->outputBackend != NULL;
         if (created)
         {
-            device->outputService = g_audioOutputService;
+            device->outputService = outputService;
             if (device->outputService->sampleRate == NULL ||
                 device->outputService->channelCount == NULL ||
                 device->outputService->bufferFrameCount == NULL ||
@@ -623,6 +625,12 @@ AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
     }
     *outDevice = device;
     return AUDIO_RESULT_OK;
+}
+
+AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,
+                              AudioDevice **outDevice)
+{
+    return AudioDeviceCreateWithOutputService(configuration, g_audioOutputService, outDevice);
 }
 
 void AudioDeviceDestroy(AudioDevice *device)

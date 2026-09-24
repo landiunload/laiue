@@ -149,8 +149,23 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
             host, LAIUE_AUDIO_SERVICE_NAME, LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
             sizeof(LaiueAudioServiceV1), &version, &size);
     Expect(audioService != NULL && version == LAIUE_AUDIO_SERVICE_ABI_VERSION_1 &&
-               size >= sizeof(*audioService) && audioService->deviceCreate != NULL,
+               size >= sizeof(*audioService) && audioService->deviceCreate != NULL &&
+               audioService->deviceCreateWithContext != NULL &&
+               audioService->context != NULL,
            "audio service is published");
+    AudioDeviceConfiguration offscreenConfiguration = {
+        .backend = AUDIO_BACKEND_OFFSCREEN,
+        .sampleRate = 0u,
+        .frameCountHint = 0u,
+        .masterVolume = 1.0f,
+    };
+    AudioDevice *offscreenDevice = NULL;
+    Expect(audioService->deviceCreateWithContext(audioService->context,
+                                                 &offscreenConfiguration,
+                                                 &offscreenDevice) == AUDIO_RESULT_OK &&
+               offscreenDevice != NULL,
+           "audio device uses the owning module instance");
+    audioService->deviceDestroy(offscreenDevice);
     LaiueModuleHostUnloadAll(host);
 
     /* A present pack provider must not silently degrade when its mixer
