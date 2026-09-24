@@ -753,10 +753,11 @@ static bool RunWalkExample(bool headless)
         (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
             sizeof(LaiueCharacterServiceV1), NULL, NULL);
+    uint32_t voxelServiceSize = 0u;
     const LaiueVoxelServiceV1 *voxel =
         (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueVoxelServiceV1), NULL, NULL);
+            LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &voxelServiceSize);
     if (character == NULL || character->create == NULL)
     {
         PlatformWriteConsoleUtf8(
@@ -766,8 +767,11 @@ static bool RunWalkExample(bool headless)
         return false;
     }
 
+    const bool voxelHasContextCreate =
+        voxel != NULL && voxelServiceSize >= LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE &&
+        voxel->createWithContext != NULL && voxel->context != NULL;
     if (voxel == NULL || voxel->getProvider == NULL ||
-        voxel->createWithContext == NULL)
+        (!voxelHasContextCreate && voxel->create == NULL))
         PlatformWriteConsoleUtf8(
             "laiue walk: voxel provider unavailable; using base strata only\n");
 
@@ -781,10 +785,13 @@ static bool RunWalkExample(bool headless)
     LaiueCharacterControllerV1 *controller = NULL;
     bool success = true;
     if (voxel != NULL && voxel->getProvider != NULL &&
-        voxel->createWithContext != NULL)
+        (voxelHasContextCreate || voxel->create != NULL))
     {
-        success = voxel->createWithContext(voxel->context, &voxelConfig, &world) != 0u &&
-                  world != NULL &&
+        const uint32_t created = voxelHasContextCreate
+                                     ? voxel->createWithContext(voxel->context, &voxelConfig,
+                                                                &world)
+                                     : voxel->create(&voxelConfig, &world);
+        success = created != 0u && world != NULL &&
                   voxel->getProvider(world, &sparse) != 0u;
         if (!success)
         {
@@ -825,6 +832,7 @@ static bool RunWalkExample(bool headless)
 #if defined(LAIUE_WALK_WINDOWED)
     void *walkUiContext = NULL;
     const LaiueUiServiceV1 *walkUiService = NULL;
+    uint32_t walkUiServiceSize = 0u;
     if (!headless)
     {
         const LaiueWindowServiceV1 *windowService =
@@ -844,7 +852,7 @@ static bool RunWalkExample(bool headless)
                 &graphicsServiceSize);
         walkUiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueUiServiceV1), NULL, NULL);
+                LAIUE_UI_SERVICE_V1_LEGACY_SIZE, NULL, &walkUiServiceSize);
         if (windowService != NULL && inputService != NULL && graphicsService != NULL &&
             windowService->create != NULL && inputService->create != NULL &&
             graphicsService->createDevice != NULL)
@@ -858,7 +866,9 @@ static bool RunWalkExample(bool headless)
             Input *input = window == NULL ? NULL :
                 inputService->create(windowService->getNativeHandle(window));
             LaiueGraphicsDeviceV1 *device = NULL;
-            if (walkUiService != NULL && walkUiService->contextCreateWithContext != NULL &&
+            if (walkUiService != NULL &&
+                walkUiServiceSize >= LAIUE_UI_SERVICE_V1_CONTEXT_SIZE &&
+                walkUiService->contextCreateWithContext != NULL &&
                 walkUiService->contextDestroy != NULL && walkUiService->context != NULL)
                 (void)walkUiService->contextCreateWithContext(walkUiService->context,
                                                           &walkUiContext);

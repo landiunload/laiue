@@ -2,6 +2,7 @@
 
 #include "voxel/raycast.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_VOXEL_RAYCAST_SERVICE_NAME "laiue.voxel_raycast"
@@ -20,3 +21,8 @@ typedef struct LaiueVoxelRaycastServiceV1
                                float maximumDistance, VoxelRaycastHit *outHit);
     void *context;
 } LaiueVoxelRaycastServiceV1;
+
+#define LAIUE_VOXEL_RAYCAST_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueVoxelRaycastServiceV1, raycastWithContext))
+#define LAIUE_VOXEL_RAYCAST_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueVoxelRaycastServiceV1, context) + sizeof(void *)))

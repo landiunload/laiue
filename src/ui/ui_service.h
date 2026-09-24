@@ -6,6 +6,7 @@
 #include "mod/module_api.h"
 #include "graphics/graphics_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_UI_SERVICE_ABI_VERSION_1 1u
@@ -62,5 +63,10 @@ typedef struct LaiueUiServiceV1
     LaiueUiContextCreateWithContextFn contextCreateWithContext;
     void *context;
 } LaiueUiServiceV1;
+
+#define LAIUE_UI_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueUiServiceV1, contextCreateWithContext))
+#define LAIUE_UI_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueUiServiceV1, context) + sizeof(void *)))
 
 LAIUE_UI_API const LaiueModuleApiV1 *LaiueUiGetStaticModuleApiV1(void);

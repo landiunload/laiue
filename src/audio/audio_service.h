@@ -11,6 +11,7 @@
 #include "audio/audio_offscreen.h"
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_AUDIO_SERVICE_ABI_VERSION_1 1u
@@ -64,5 +65,10 @@ typedef struct LaiueAudioServiceV1
     LaiueAudioDeviceCreateWithContextFn deviceCreateWithContext;
     void *context;
 } LaiueAudioServiceV1;
+
+#define LAIUE_AUDIO_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueAudioServiceV1, deviceCreateWithContext))
+#define LAIUE_AUDIO_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueAudioServiceV1, context) + sizeof(void *)))
 
 LAIUE_AUDIO_API const LaiueModuleApiV1 *LaiueAudioGetStaticModuleApiV1(void);

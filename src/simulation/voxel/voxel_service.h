@@ -5,6 +5,7 @@
 #include "mod/module_api.h"
 #include "voxel/voxel_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_VOXEL_SERVICE_NAME "laiue.voxel"
@@ -54,6 +55,11 @@ typedef struct LaiueVoxelServiceV1
     LaiueVoxelWorldCreateWithContextFn createWithContext;
     void *context;
 } LaiueVoxelServiceV1;
+
+#define LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueVoxelServiceV1, createWithContext))
+#define LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueVoxelServiceV1, context) + sizeof(void *)))
 
 /* The V2 service is a distinct name because its coordinate contract is not
  * layout-compatible with V1.  It shares the same opaque world instance and

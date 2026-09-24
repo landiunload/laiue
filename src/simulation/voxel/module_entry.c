@@ -306,6 +306,10 @@ static uint32_t VoxelBuildMeshV2(const LaiueVoxelProviderV2 *provider,
     return 0u;
 }
 
+/* The V1 create signature has no service context. Keep one narrow bridge for
+ * legacy callers while all new code uses createWithContext. */
+static const LaiueWorldServiceV1 *compatWorldService;
+
 static uint32_t VoxelGetProvider(LaiueVoxelWorldV1 *world,
                                  LaiueVoxelProviderV1 *outProvider)
 {
@@ -431,13 +435,7 @@ static uint32_t VoxelCreateWithWorldService(
 static uint32_t VoxelCreateLegacy(const LaiueVoxelWorldConfigV1 *config,
                                   LaiueVoxelWorldV1 **outWorld)
 {
-    (void)config;
-    if (outWorld != NULL)
-        *outWorld = NULL;
-    /* The old signature has no service context. New applications must use
-     * createWithContext; returning failure is safer than importing a hidden
-     * world implementation or selecting a global provider. */
-    return 0u;
+    return VoxelCreateWithWorldService(compatWorldService, config, outWorld);
 }
 
 static uint32_t VoxelCreateWithContext(void *serviceContext,
@@ -510,7 +508,7 @@ static uint32_t ModuleStart(void *context)
         return 0u;
     state->worldService = (const LaiueWorldServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_WORLD_SERVICE_NAME, LAIUE_WORLD_SERVICE_ABI_VERSION_1,
-        sizeof(LaiueWorldServiceV1));
+        LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE);
     if (state->worldService == NULL || state->worldService->create == NULL ||
         state->worldService->destroy == NULL || state->worldService->getBlock == NULL ||
         state->worldService->getBlockState == NULL ||
@@ -518,8 +516,10 @@ static uint32_t ModuleStart(void *context)
         state->worldService->trySetBlockExplicit == NULL)
     {
         state->worldService = NULL;
+        compatWorldService = NULL;
         return 0u;
     }
+    compatWorldService = state->worldService;
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_SERVICE_NAME,
         .version = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
@@ -558,7 +558,11 @@ static void ModuleStop(void *context)
         (void)state->host->unpublishService(state->host->context, LAIUE_VOXEL_SERVICE_NAME);
     }
     if (state != NULL)
+    {
+        if (compatWorldService == state->worldService)
+            compatWorldService = NULL;
         state->worldService = NULL;
+    }
 }
 
 static void ModuleDestroy(void *context)
@@ -568,6 +572,8 @@ static void ModuleDestroy(void *context)
     {
         const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
+        if (compatWorldService == state->worldService)
+            compatWorldService = NULL;
         state->worldService = NULL;
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);

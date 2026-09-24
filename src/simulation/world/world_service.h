@@ -3,6 +3,7 @@
 #include "world/world.h"
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_WORLD_SERVICE_NAME "laiue.world"
@@ -41,6 +42,11 @@ typedef struct LaiueWorldServiceV1
                                 const WorldBaseProvider *provider);
     void *context;
 } LaiueWorldServiceV1;
+
+#define LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueWorldServiceV1, createWithContext))
+#define LAIUE_WORLD_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueWorldServiceV1, context) + sizeof(void *)))
 
 LAIUE_WORLD_API const LaiueWorldServiceV1 *LaiueWorldGetStaticServiceV1(void);
 LAIUE_WORLD_API const LaiueModuleApiV1 *LaiueWorldGetStaticModuleApiV1(void);

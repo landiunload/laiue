@@ -2,6 +2,7 @@
 
 #include "voxel_render/chunk_streaming.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_VOXEL_RENDER_SERVICE_NAME "laiue.voxel_render"
@@ -33,3 +34,8 @@ typedef struct LaiueVoxelRenderServiceV1
                                          int32_t viewRadiusChunks);
     void *context;
 } LaiueVoxelRenderServiceV1;
+
+#define LAIUE_VOXEL_RENDER_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueVoxelRenderServiceV1, createWithContext))
+#define LAIUE_VOXEL_RENDER_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueVoxelRenderServiceV1, context) + sizeof(void *)))

@@ -70,7 +70,7 @@ static uint32_t ModuleStart(void *context)
     const LaiueAudioServiceV1 *audio =
         (const LaiueAudioServiceV1 *)state->host->queryService(
             state->host->context, LAIUE_AUDIO_SERVICE_NAME, LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueAudioServiceV1), &audioVersion, &audioSize);
+            LAIUE_AUDIO_SERVICE_V1_LEGACY_SIZE, &audioVersion, &audioSize);
     uint32_t contentVersion = 0u;
     uint32_t contentSize = 0u;
     const LaiueContentServiceV1 *content =
@@ -78,7 +78,8 @@ static uint32_t ModuleStart(void *context)
             state->host->context, LAIUE_CONTENT_SERVICE_NAME,
             LAIUE_CONTENT_SERVICE_ABI_VERSION_1, sizeof(LaiueContentServiceV1), &contentVersion,
             &contentSize);
-    if (audio == NULL || content == NULL || audioSize < sizeof(*audio) ||
+    if (audio == NULL || content == NULL ||
+        audioSize < LAIUE_AUDIO_SERVICE_V1_LEGACY_SIZE ||
         contentSize < sizeof(*content) || audioVersion < LAIUE_AUDIO_SERVICE_ABI_VERSION_1 ||
         contentVersion < LAIUE_CONTENT_SERVICE_ABI_VERSION_1 || audio->clipCreate == NULL ||
         content->enumerate == NULL || content->releaseList == NULL)

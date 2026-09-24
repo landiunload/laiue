@@ -29,6 +29,7 @@ struct AndroidWalkState
     LaiueModuleHost *host;
     const LaiueCharacterServiceV1 *character;
     const LaiueVoxelServiceV1 *voxel;
+    uint32_t voxelServiceSize;
     const LaiueGraphicsDeviceServiceV1 *graphics;
     uint32_t graphicsServiceSize;
     LaiueCharacterControllerV1 *controller;
@@ -79,7 +80,7 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
         sizeof(LaiueCharacterServiceV1), NULL, NULL);
     state->voxel = (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
-        sizeof(LaiueVoxelServiceV1), NULL, NULL);
+        LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &state->voxelServiceSize);
     state->graphicsServiceSize = 0u;
     state->graphics = (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
@@ -311,9 +312,13 @@ void android_main(struct android_app *app)
             .abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
             .defaultBlock = {0u, 0u},
         };
-        if (state.voxel != NULL && state.voxel->createWithContext != NULL)
+        if (state.voxel != NULL &&
+            state.voxelServiceSize >= LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE &&
+            state.voxel->createWithContext != NULL && state.voxel->context != NULL)
             (void)state.voxel->createWithContext(state.voxel->context,
                                                   &voxelConfig, &state.world);
+        else if (state.voxel != NULL && state.voxel->create != NULL)
+            (void)state.voxel->create(&voxelConfig, &state.world);
         if (state.world != NULL && state.voxel->getProvider != NULL)
             (void)state.voxel->getProvider(state.world, &state.provider);
 #endif

@@ -77,7 +77,7 @@ static uint32_t ModuleStart(void *context)
         LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1, sizeof(LaiueSceneMathServiceV1));
     state->world = (const LaiueWorldServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_WORLD_SERVICE_NAME,
-        LAIUE_WORLD_SERVICE_ABI_VERSION_1, sizeof(LaiueWorldServiceV1));
+        LAIUE_WORLD_SERVICE_ABI_VERSION_1, LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE);
     state->mesher = (const LaiueMesherServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_MESHER_SERVICE_NAME,
         LAIUE_MESHER_SERVICE_ABI_VERSION_1, sizeof(LaiueMesherServiceV1));

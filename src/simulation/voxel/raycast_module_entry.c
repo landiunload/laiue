@@ -98,10 +98,10 @@ static uint32_t ModuleStart(void *context)
     uint32_t size = 0u;
     state->world = (const LaiueWorldServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_WORLD_SERVICE_NAME,
-        LAIUE_WORLD_SERVICE_ABI_VERSION_1, sizeof(LaiueWorldServiceV1),
+        LAIUE_WORLD_SERVICE_ABI_VERSION_1, LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE,
         &version, &size);
     if (state->world == NULL || version < LAIUE_WORLD_SERVICE_ABI_VERSION_1 ||
-        size < sizeof(*state->world) || state->world->getBlock == NULL)
+        size < LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE || state->world->getBlock == NULL)
     {
         state->world = NULL;
         return 0u;

@@ -182,6 +182,11 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
            "untouched coordinate reports the default block");
     voxel->destroy(world);
 
+    LaiueVoxelWorldV1 *legacyWorld = NULL;
+    Expect(voxel->create(NULL, &legacyWorld) != 0u && legacyWorld != NULL,
+           "legacy voxel create remains a compatibility bridge");
+    voxel->destroy(legacyWorld);
+
     const LaiueVoxelServiceV2 *voxelV2 =
         (const LaiueVoxelServiceV2 *)LaiueModuleHostQueryService(
             host, LAIUE_VOXEL_SERVICE_NAME_V2, LAIUE_VOXEL_SERVICE_ABI_VERSION_2,
