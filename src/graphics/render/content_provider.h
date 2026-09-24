@@ -18,6 +18,13 @@ LAIUE_RENDER_API void RendererSetContentService(
     const LaiueContentServiceV1 *service);
 LAIUE_RENDER_API const LaiueContentServiceV1 *RendererGetContentService(void);
 
+/* The old renderer helpers use a process-default bridge.  Dynamic provider
+ * instances acquire it with their host state as owner so a second host cannot
+ * clear or replace the first host's content service during rollback. */
+bool RendererTryAcquireContentService(const void *owner,
+                                      const LaiueContentServiceV1 *service);
+void RendererReleaseContentService(const void *owner);
+
 LaiueContentCatalog *RendererContentDefaultCatalog(void);
 bool RendererContentCatalogEnumerate(
     LaiueContentCatalog *catalog, uint32_t type, LaiueContentList *outList);

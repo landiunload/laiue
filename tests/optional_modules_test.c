@@ -269,6 +269,19 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                fallbackDeviceV2->createDevice != NULL &&
                fallbackDeviceV2->createDeviceWithContext != NULL,
            "graphics device v2 is published independently of content");
+    LaiueModuleHost *secondRenderHost = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(secondRenderHost != NULL, "second concurrent graphics host creates");
+    LaiueModuleBinaryV1 secondRender = {renderPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(secondRenderHost, &secondRender, 1u, &diagnostic) ==
+               LAIUE_MODULE_START_FAILED,
+           "second concurrent graphics host is rejected by the owner guard");
+    Expect(LaiueModuleHostLoadedCount(secondRenderHost) == 0u,
+           "failed concurrent graphics host rolls back independently");
+    LaiueModuleHostDestroy(secondRenderHost);
+    Expect(LaiueModuleHostQueryService(host, LAIUE_GRAPHICS_SERVICE_NAME,
+                                       LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
+                                       sizeof(LaiueGraphicsServiceV1), NULL, NULL) != NULL,
+           "first graphics host remains usable after second host failure");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 uiGraph[] = {

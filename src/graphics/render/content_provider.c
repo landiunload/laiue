@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 static const LaiueContentServiceV1 *g_contentService;
+static const void *g_contentOwner;
 
 static bool HasField(const LaiueContentServiceV1 *service, size_t offset,
                      size_t size)
@@ -22,12 +23,44 @@ static const LaiueContentServiceV1 *ValidService(void)
 
 void RendererSetContentService(const LaiueContentServiceV1 *service)
 {
-    if (service == NULL || service->abiVersion != LAIUE_CONTENT_SERVICE_ABI_VERSION_1 ||
+    if (service == NULL)
+    {
+        if (g_contentOwner == NULL)
+            g_contentService = NULL;
+        return;
+    }
+    if (service->abiVersion != LAIUE_CONTENT_SERVICE_ABI_VERSION_1 ||
         service->structSize < offsetof(LaiueContentServiceV1, createCatalog) +
                                   sizeof(service->createCatalog))
-        g_contentService = NULL;
-    else
+        return;
+    if (g_contentOwner == NULL || g_contentService == service)
         g_contentService = service;
+}
+
+bool RendererTryAcquireContentService(const void *owner,
+                                      const LaiueContentServiceV1 *service)
+{
+    if (owner == NULL)
+        return false;
+    if (service != NULL &&
+        (service->abiVersion != LAIUE_CONTENT_SERVICE_ABI_VERSION_1 ||
+         service->structSize < offsetof(LaiueContentServiceV1, createCatalog) +
+                                   sizeof(service->createCatalog)))
+        return false;
+    if (g_contentOwner != NULL && g_contentOwner != owner)
+        return false;
+    g_contentOwner = owner;
+    g_contentService = service;
+    return true;
+}
+
+void RendererReleaseContentService(const void *owner)
+{
+    if (owner != NULL && g_contentOwner == owner)
+    {
+        g_contentOwner = NULL;
+        g_contentService = NULL;
+    }
 }
 
 const LaiueContentServiceV1 *RendererGetContentService(void)

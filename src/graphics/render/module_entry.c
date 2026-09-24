@@ -832,7 +832,6 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->deviceService.context = state;
     state->deviceServiceV2 = deviceServiceV2Template;
     state->deviceServiceV2.context = state;
-    RendererSetContentService(NULL);
     *outContext = state;
     return 1u;
 }
@@ -842,11 +841,14 @@ static uint32_t ModuleStart(void *context)
     LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
-    RendererSetContentService(NULL);
     state->content = (const LaiueContentServiceV1 *)LaiueModuleQueryOptionalService(
         state->host, LAIUE_CONTENT_SERVICE_NAME,
         LAIUE_CONTENT_SERVICE_ABI_VERSION_1, sizeof(LaiueContentServiceV1));
-    RendererSetContentService(state->content);
+    if (!RendererTryAcquireContentService(state, state->content))
+    {
+        state->content = NULL;
+        return 0u;
+    }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_GRAPHICS_SERVICE_NAME,
         .version = LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
@@ -856,7 +858,7 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->content = NULL;
-        RendererSetContentService(NULL);
+        RendererReleaseContentService(state);
         return 0u;
     }
     LaiueModuleServiceV1 devicePublished = {
@@ -870,7 +872,7 @@ static uint32_t ModuleStart(void *context)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_GRAPHICS_SERVICE_NAME);
         state->content = NULL;
-        RendererSetContentService(NULL);
+        RendererReleaseContentService(state);
         return 0u;
     }
     LaiueModuleServiceV1 deviceV2Published = {
@@ -887,7 +889,7 @@ static uint32_t ModuleStart(void *context)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_GRAPHICS_SERVICE_NAME);
         state->content = NULL;
-        RendererSetContentService(NULL);
+        RendererReleaseContentService(state);
         return 0u;
     }
     return 1u;
@@ -908,7 +910,7 @@ static void ModuleStop(void *context)
     if (state != NULL)
     {
         state->content = NULL;
-        RendererSetContentService(NULL);
+        RendererReleaseContentService(state);
     }
 }
 
@@ -923,7 +925,7 @@ static void ModuleDestroy(void *context)
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);
     }
-    RendererSetContentService(NULL);
+    RendererReleaseContentService(state);
 }
 
 static const char *const provides[] = {
