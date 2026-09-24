@@ -31,6 +31,7 @@ struct LaiueVoxelWorldV1
 {
     World *world;
     const LaiueWorldServiceV1 *worldService;
+    uint32_t worldServiceSize;
     const LaiueModuleHostV1 *host;
     PlatformMutex paletteLock;
     LaiueVoxelBlockV1 palette[VOXEL_PALETTE_CAPACITY];
@@ -39,10 +40,11 @@ struct LaiueVoxelWorldV1
     LaiueVoxelProviderV1 provider;
 };
 
-static bool ServiceFieldPresent(uint32_t structSize, size_t offset, size_t size)
+static bool ServiceFieldPresent(uint32_t actualSize, uint32_t declaredSize,
+                                size_t offset, size_t size)
 {
-    return (size_t)structSize >= offset &&
-           (size_t)structSize - offset >= size;
+    return (size_t)actualSize >= offset && (size_t)actualSize - offset >= size &&
+           (size_t)declaredSize >= offset && (size_t)declaredSize - offset >= size;
 }
 
 static bool VoxelBlocksEqual(const LaiueVoxelBlockV1 *left,
@@ -396,11 +398,16 @@ static void VoxelFree(const LaiueModuleHostV1 *host, void *memory)
 
 static uint32_t VoxelCreateWithWorldService(
     const LaiueWorldServiceV1 *worldService,
+    uint32_t worldServiceSize,
     const LaiueVoxelWorldConfigV1 *config,
     const LaiueModuleHostV1 *host,
     LaiueVoxelWorldV1 **outWorld)
 {
-    if (outWorld == NULL || worldService == NULL || worldService->create == NULL)
+    if (outWorld == NULL || worldService == NULL ||
+        !ServiceFieldPresent(worldServiceSize, worldService->structSize,
+                             offsetof(LaiueWorldServiceV1, create),
+                             sizeof(worldService->create)) ||
+        worldService->create == NULL)
         return 0u;
     *outWorld = NULL;
     LaiueVoxelWorldV1 *world =
@@ -411,6 +418,7 @@ static uint32_t VoxelCreateWithWorldService(
         return 0u;
     }
     world->worldService = worldService;
+    world->worldServiceSize = worldServiceSize;
     world->host = host;
     world->paletteCount = 1u;
     world->palette[0] = (LaiueVoxelBlockV1){0};
@@ -428,11 +436,11 @@ static uint32_t VoxelCreateWithWorldService(
         .context = world,
         .getBlock = VoxelBaseGetBlock,
     };
-    if (ServiceFieldPresent(worldService->structSize,
+    if (ServiceFieldPresent(world->worldServiceSize, world->worldService->structSize,
             offsetof(LaiueWorldServiceV1, createWithContext),
             sizeof(worldService->createWithContext)) &&
         worldService->createWithContext != NULL &&
-        ServiceFieldPresent(worldService->structSize,
+        ServiceFieldPresent(world->worldServiceSize, world->worldService->structSize,
             offsetof(LaiueWorldServiceV1, context), sizeof(worldService->context)) &&
         worldService->context != NULL)
     {
@@ -462,7 +470,11 @@ static uint32_t VoxelCreateWithWorldService(
 static uint32_t VoxelCreateLegacy(const LaiueVoxelWorldConfigV1 *config,
                                   LaiueVoxelWorldV1 **outWorld)
 {
-    return VoxelCreateWithWorldService(compatWorldService, config, NULL, outWorld);
+    return VoxelCreateWithWorldService(compatWorldService,
+                                       compatWorldService == NULL
+                                           ? 0u
+                                           : (uint32_t)sizeof(*compatWorldService),
+                                       config, NULL, outWorld);
 }
 
 static uint32_t VoxelCreateWithContext(void *serviceContext,
@@ -473,7 +485,8 @@ static uint32_t VoxelCreateWithContext(void *serviceContext,
         (const LaiueVoxelModuleState *)serviceContext;
     return state == NULL ? 0u
                          : VoxelCreateWithWorldService(state->worldService,
-                                                        config, state->host, outWorld);
+                                                        state->worldServiceSize, config,
+                                                        state->host, outWorld);
 }
 
 static void VoxelDestroy(LaiueVoxelWorldV1 *world)
@@ -492,6 +505,22 @@ static uint64_t VoxelGetRevision(const LaiueVoxelWorldV1 *world)
                    world->worldService->getRevision == NULL
                ? 0u
                : world->worldService->getRevision(world->world);
+}
+
+static uint32_t VoxelRebase(LaiueVoxelWorldV1 *world, int64_t blockShiftX,
+                            int64_t blockShiftY, int64_t blockShiftZ)
+{
+    if (world == NULL || world->worldService == NULL ||
+        !ServiceFieldPresent(world->worldServiceSize,
+                             world->worldService->structSize,
+                             offsetof(LaiueWorldServiceV1, rebase),
+                             sizeof(world->worldService->rebase)) ||
+        world->worldService->rebase == NULL)
+        return 0u;
+    return world->worldService->rebase(world->world, blockShiftX, blockShiftY,
+                                       blockShiftZ)
+               ? 1u
+               : 0u;
 }
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
@@ -519,6 +548,7 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->service.getRevision = VoxelGetRevision;
     state->service.createWithContext = VoxelCreateWithContext;
     state->service.context = state;
+    state->service.rebase = VoxelRebase;
     state->serviceV2.structSize = sizeof(state->serviceV2);
     state->serviceV2.abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_2;
     state->serviceV2.createWithContext = VoxelCreateWithContext;
@@ -527,6 +557,7 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->serviceV2.setBlock = VoxelSetBlockV2;
     state->serviceV2.getRevision = VoxelGetRevision;
     state->serviceV2.context = state;
+    state->serviceV2.rebase = VoxelRebase;
     *outContext = state;
     return 1u;
 }
@@ -553,13 +584,13 @@ static uint32_t ModuleStart(void *context)
     state->worldServiceVersion = worldView.version;
     if (state->worldService == NULL || state->worldService->create == NULL ||
         state->worldService->destroy == NULL || state->worldService->getBlock == NULL ||
-        !ServiceFieldPresent(state->worldServiceSize,
+        !ServiceFieldPresent(state->worldServiceSize, state->worldService->structSize,
             offsetof(LaiueWorldServiceV1, getBlockState),
             sizeof(state->worldService->getBlockState)) ||
-        !ServiceFieldPresent(state->worldServiceSize,
+        !ServiceFieldPresent(state->worldServiceSize, state->worldService->structSize,
             offsetof(LaiueWorldServiceV1, enumerateOverrides),
             sizeof(state->worldService->enumerateOverrides)) ||
-        !ServiceFieldPresent(state->worldServiceSize,
+        !ServiceFieldPresent(state->worldServiceSize, state->worldService->structSize,
             offsetof(LaiueWorldServiceV1, trySetBlockExplicit),
             sizeof(state->worldService->trySetBlockExplicit)) ||
         state->worldService->getBlockState == NULL ||

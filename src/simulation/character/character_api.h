@@ -34,11 +34,18 @@ typedef struct LaiueCharacterInputV1
 #define LAIUE_CHARACTER_INPUT_SPRINT UINT32_C(1) << 1
 
 typedef struct LaiueCharacterCollisionV1 LaiueCharacterCollisionV1;
+typedef struct LaiueCharacterControllerV1 LaiueCharacterControllerV1;
 typedef uint32_t (*LaiueCharacterSweepAabbFn)(const LaiueCharacterCollisionV1 *,
                                               const LaiueCharacterPositionV1 *position,
                                               int64_t halfExtent, int64_t deltaX, int64_t deltaY,
                                               int64_t deltaZ, LaiueCharacterPositionV1 *outPosition,
                                               uint32_t *outGrounded);
+/* Translate the local origin without resetting velocity or fixed-point
+ * remainders. The world and streaming providers call this between fixed
+ * steps as part of one rebasing transaction. */
+typedef uint32_t (*LaiueCharacterRebaseOriginFn)(
+    LaiueCharacterControllerV1 *controller, int64_t cellDeltaX,
+    int64_t cellDeltaY, int64_t localDeltaX, int64_t localDeltaY);
 
 struct LaiueCharacterCollisionV1
 {

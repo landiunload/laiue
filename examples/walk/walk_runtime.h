@@ -31,3 +31,12 @@ LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
     int64_t deltaZ,
     LaiueCharacterPositionV1 *outPosition,
     uint32_t *outGrounded);
+
+/* Rebase the sparse world and character together between fixed steps.  The
+ * service-size arguments are the sizes returned by the host query; both the
+ * published size and each table's structSize are checked before using an
+ * optional tail. */
+LAIUE_WALK_RUNTIME_API uint32_t WalkRebaseWorldAndCharacter(
+    const LaiueVoxelServiceV1 *voxel, uint32_t voxelServiceSize,
+    LaiueVoxelWorldV1 *world, const LaiueCharacterServiceV1 *character,
+    uint32_t characterServiceSize, LaiueCharacterControllerV1 *controller);

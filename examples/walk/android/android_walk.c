@@ -37,6 +37,7 @@ struct AndroidWalkState
     struct android_app *app;
     LaiueModuleHost *host;
     const LaiueCharacterServiceV1 *character;
+    uint32_t characterServiceSize;
     const LaiueVoxelServiceV1 *voxel;
     uint32_t voxelServiceSize;
     const LaiueGraphicsDeviceServiceV2 *graphics;
@@ -106,9 +107,10 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
         AndroidLog(state, ANDROID_LOG_ERROR, diagnostic.message);
         return 0u;
     }
+    state->characterServiceSize = 0u;
     state->character = (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
-        sizeof(LaiueCharacterServiceV1), NULL, NULL);
+        LAIUE_CHARACTER_SERVICE_V1_LEGACY_SIZE, NULL, &state->characterServiceSize);
     state->voxel = (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
         LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &state->voxelServiceSize);
@@ -502,6 +504,16 @@ static void AndroidStep(AndroidWalkState *state)
             state->character->step(state->controller, &input) == 0u)
         {
             AndroidLog(state, ANDROID_LOG_ERROR, "deterministic character step failed");
+            state->running = false;
+            break;
+        }
+        if (WalkRebaseWorldAndCharacter(
+                state->voxel, state->voxelServiceSize, state->world,
+                state->character, state->characterServiceSize,
+                state->controller) == 0u)
+        {
+            AndroidLog(state, ANDROID_LOG_ERROR,
+                       "world/character rebase transaction failed");
             state->running = false;
             break;
         }

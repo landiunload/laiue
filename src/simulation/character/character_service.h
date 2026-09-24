@@ -7,6 +7,7 @@
 #include "character/character_api.h"
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_CHARACTER_SERVICE_NAME "laiue.character"
@@ -43,6 +44,12 @@ typedef struct LaiueCharacterServiceV1
     LaiueCharacterSetPositionFn setPosition;
     LaiueCharacterIsGroundedFn isGrounded;
     uintptr_t reserved[8];
+    LaiueCharacterRebaseOriginFn rebaseOrigin;
 } LaiueCharacterServiceV1;
+
+#define LAIUE_CHARACTER_SERVICE_V1_REBASE_ORIGIN_OFFSET \
+    ((uint32_t)offsetof(LaiueCharacterServiceV1, rebaseOrigin))
+#define LAIUE_CHARACTER_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueCharacterServiceV1, rebaseOrigin))
 
 const LaiueModuleApiV1 *LaiueCharacterGetStaticModuleApiV1(void);

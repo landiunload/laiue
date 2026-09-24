@@ -163,6 +163,23 @@ static uint32_t CharacterSetPosition(
     return 1u;
 }
 
+static uint32_t CharacterRebaseOrigin(LaiueCharacterControllerV1 *controller,
+                                      int64_t cellDeltaX, int64_t cellDeltaY,
+                                      int64_t localDeltaX, int64_t localDeltaY)
+{
+    if (controller == NULL)
+        return 0u;
+    LaiueCharacterPositionV1 candidate = controller->position;
+    if (!AddInt64Checked(candidate.cellX, cellDeltaX, &candidate.cellX) ||
+        !AddInt64Checked(candidate.cellY, cellDeltaY, &candidate.cellY) ||
+        !AddInt64Checked(candidate.localX, localDeltaX, &candidate.localX) ||
+        !AddInt64Checked(candidate.localY, localDeltaY, &candidate.localY) ||
+        !NormalizePosition(&candidate))
+        return 0u;
+    controller->position = candidate;
+    return 1u;
+}
+
 static uint32_t CharacterIsGrounded(const LaiueCharacterControllerV1 *controller)
 {
     return controller != NULL && controller->grounded != 0u ? 1u : 0u;
@@ -247,6 +264,7 @@ static const LaiueCharacterServiceV1 service = {
     .getPosition = CharacterGetPosition,
     .setPosition = CharacterSetPosition,
     .isGrounded = CharacterIsGrounded,
+    .rebaseOrigin = CharacterRebaseOrigin,
 };
 
 typedef struct LaiueCharacterModuleState

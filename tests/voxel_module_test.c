@@ -127,7 +127,8 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
     Expect(voxel != NULL && version == LAIUE_VOXEL_SERVICE_ABI_VERSION_1 &&
                size >= sizeof(*voxel) && voxel->create != NULL &&
                voxel->getProvider != NULL && voxel->setBlock != NULL &&
-               voxel->createWithContext != NULL && voxel->context != NULL,
+               voxel->createWithContext != NULL && voxel->context != NULL &&
+               voxel->rebase != NULL,
            "voxel service table is published");
 
     LaiueVoxelWorldV1 *world = NULL;
@@ -180,6 +181,17 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
     Expect(provider.getBlockState(&provider, &untouched, &result, &explicitEdit) != 0u &&
                explicitEdit == 0u && result.material == 0u,
            "untouched coordinate reports the default block");
+    Expect(voxel->rebase(world, 64, -64, 0) != 0u,
+           "voxel world origin rebases through the public service");
+    const LaiueVoxelCoordV1 rebasedCoordinate = {
+        .x = coordinate.x - 64,
+        .y = coordinate.y + 64,
+        .z = coordinate.z,
+    };
+    Expect(provider.getBlockState(&provider, &rebasedCoordinate, &result,
+                                  &explicitEdit) != 0u && explicitEdit != 0u &&
+               result.material == 0u,
+           "voxel rebase preserves an explicit air edit");
     voxel->destroy(world);
 
     LaiueVoxelWorldV1 *legacyWorld = NULL;
@@ -193,7 +205,8 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
             sizeof(LaiueVoxelServiceV2), &version, &size);
     Expect(voxelV2 != NULL && version == LAIUE_VOXEL_SERVICE_ABI_VERSION_2 &&
                size >= sizeof(*voxelV2) && voxelV2->createWithContext != NULL &&
-               voxelV2->getProvider != NULL && voxelV2->setBlock != NULL,
+               voxelV2->getProvider != NULL && voxelV2->setBlock != NULL &&
+               voxelV2->rebase != NULL,
            "wide-coordinate voxel service table is published");
     LaiueVoxelWorldV2 *worldV2 = NULL;
     Expect(voxelV2->createWithContext(voxelV2->context, NULL, &worldV2) != 0u &&

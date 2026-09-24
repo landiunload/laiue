@@ -157,6 +157,14 @@ LAIUE_TEST_ENTRY(CharacterModuleTestEntryPoint)
            "horizontal rebasing crosses the cell boundary exactly");
     Expect(character->isGrounded(controller) != 0u,
            "floor collision restores grounded state");
+    Expect(character->rebaseOrigin != NULL &&
+               character->rebaseOrigin(controller, -initial.cellX, -initial.cellY,
+                                       0, 0) != 0u,
+           "origin rebasing preserves a live controller");
+    LaiueCharacterPositionV1 rebased;
+    Expect(character->getPosition(controller, &rebased) != 0u &&
+               rebased.cellX == 1 && rebased.cellY == -1,
+           "origin rebasing translates cells without resetting the state");
 
     bool collisionFails = true;
     LaiueCharacterCollisionV1 failingCollision = {

@@ -15,6 +15,13 @@
 
 typedef struct LaiueVoxelWorldV1 LaiueVoxelWorldV1;
 
+/* Move the world's local origin by whole blocks while preserving absolute
+ * coordinates.  The call is transactional: a zero result leaves the world
+ * unchanged. */
+typedef uint32_t (*LaiueVoxelWorldRebaseFn)(
+    LaiueVoxelWorldV1 *world, int64_t blockShiftX, int64_t blockShiftY,
+    int64_t blockShiftZ);
+
 typedef struct LaiueVoxelWorldConfigV1
 {
     uint32_t structSize;
@@ -54,12 +61,15 @@ typedef struct LaiueVoxelServiceV1
     uintptr_t reserved[8];
     LaiueVoxelWorldCreateWithContextFn createWithContext;
     void *context;
+    LaiueVoxelWorldRebaseFn rebase;
 } LaiueVoxelServiceV1;
 
 #define LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE \
     ((uint32_t)offsetof(LaiueVoxelServiceV1, createWithContext))
 #define LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE \
     ((uint32_t)(offsetof(LaiueVoxelServiceV1, context) + sizeof(void *)))
+#define LAIUE_VOXEL_SERVICE_V1_REBASE_OFFSET \
+    ((uint32_t)offsetof(LaiueVoxelServiceV1, rebase))
 
 /* The V2 service is a distinct name because its coordinate contract is not
  * layout-compatible with V1.  It shares the same opaque world instance and
@@ -82,6 +92,10 @@ typedef struct LaiueVoxelServiceV2
     LaiueVoxelWorldGetRevisionFn getRevision;
     uintptr_t reserved[8];
     void *context;
+    LaiueVoxelWorldRebaseFn rebase;
 } LaiueVoxelServiceV2;
+
+#define LAIUE_VOXEL_SERVICE_V2_REBASE_OFFSET \
+    ((uint32_t)offsetof(LaiueVoxelServiceV2, rebase))
 
 const LaiueModuleApiV1 *LaiueVoxelGetStaticModuleApiV1(void);

@@ -31,6 +31,7 @@ enum
     WALK_ACTIVE_CHUNK_RADIUS = 1,
     WALK_ACTIVE_CHUNK_DIAMETER = WALK_ACTIVE_CHUNK_RADIUS * 2 + 1,
     WALK_ACTIVE_CHUNK_COUNT = WALK_ACTIVE_CHUNK_DIAMETER * WALK_ACTIVE_CHUNK_DIAMETER,
+    WALK_REBASE_RADIUS_BLOCKS = 8192,
 };
 
 static int64_t FloorDiv(int64_t value, int64_t divisor)
@@ -427,6 +428,85 @@ LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
     return 1u;
 }
 
+static bool WalkServiceFieldPresent(uint32_t actualSize, uint32_t declaredSize,
+                                    size_t offset, size_t size)
+{
+    return (size_t)actualSize >= offset && (size_t)actualSize - offset >= size &&
+           (size_t)declaredSize >= offset && (size_t)declaredSize - offset >= size;
+}
+
+static bool WalkBlockShiftToCharacterDelta(int64_t blockShift,
+                                           int64_t *outCellDelta,
+                                           int64_t *outLocalDelta)
+{
+    if (outCellDelta == NULL || outLocalDelta == NULL)
+        return false;
+    const int64_t cellShift = FloorDiv(blockShift, WALK_BLOCKS_PER_CELL);
+    const int64_t remainder = blockShift - cellShift * WALK_BLOCKS_PER_CELL;
+    if (remainder < 0 || remainder >= WALK_BLOCKS_PER_CELL ||
+        cellShift == INT64_MIN)
+        return false;
+    *outCellDelta = -cellShift;
+    *outLocalDelta = -remainder * WALK_VOXEL_SIZE;
+    return true;
+}
+
+LAIUE_WALK_RUNTIME_API uint32_t WalkRebaseWorldAndCharacter(
+    const LaiueVoxelServiceV1 *voxel, uint32_t voxelServiceSize,
+    LaiueVoxelWorldV1 *world, const LaiueCharacterServiceV1 *character,
+    uint32_t characterServiceSize, LaiueCharacterControllerV1 *controller)
+{
+    if (voxel == NULL || world == NULL || character == NULL || controller == NULL ||
+        character->getPosition == NULL ||
+        !WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                 LAIUE_VOXEL_SERVICE_V1_REBASE_OFFSET,
+                                 sizeof(voxel->rebase)) ||
+        voxel->rebase == NULL ||
+        !WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                 LAIUE_CHARACTER_SERVICE_V1_REBASE_ORIGIN_OFFSET,
+                                 sizeof(character->rebaseOrigin)) ||
+        character->rebaseOrigin == NULL)
+        return 1u;
+
+    LaiueCharacterPositionV1 position;
+    if (character->getPosition(controller, &position) == 0u)
+        return 0u;
+    int64_t blockX = 0;
+    int64_t blockY = 0;
+    if (!PositionAxisToBlock(position.cellX, position.localX, &blockX) ||
+        !PositionAxisToBlock(position.cellY, position.localY, &blockY))
+        return 0u;
+    const bool farX = blockX > WALK_REBASE_RADIUS_BLOCKS ||
+                      blockX < -WALK_REBASE_RADIUS_BLOCKS;
+    const bool farY = blockY > WALK_REBASE_RADIUS_BLOCKS ||
+                      blockY < -WALK_REBASE_RADIUS_BLOCKS;
+    if (!farX && !farY)
+        return 1u;
+
+    const int64_t shiftX = farX ? FloorDiv(blockX, 64) * 64 : 0;
+    const int64_t shiftY = farY ? FloorDiv(blockY, 64) * 64 : 0;
+    int64_t cellDeltaX = 0;
+    int64_t cellDeltaY = 0;
+    int64_t localDeltaX = 0;
+    int64_t localDeltaY = 0;
+    if (!WalkBlockShiftToCharacterDelta(shiftX, &cellDeltaX, &localDeltaX) ||
+        !WalkBlockShiftToCharacterDelta(shiftY, &cellDeltaY, &localDeltaY))
+        return 0u;
+
+    /* Move the consumer first, then the provider.  If the world rejects the
+     * shift, restore the character exactly; no fixed-point state is touched by
+     * the origin callback. */
+    if (character->rebaseOrigin(controller, cellDeltaX, cellDeltaY,
+                                localDeltaX, localDeltaY) == 0u)
+        return 0u;
+    if (voxel->rebase(world, shiftX, shiftY, 0) != 0u)
+        return 1u;
+    if (character->rebaseOrigin(controller, -cellDeltaX, -cellDeltaY,
+                                -localDeltaX, -localDeltaY) == 0u)
+        return 0u;
+    return 0u;
+}
+
 #if defined(LAIUE_WALK_WINDOWED)
 typedef struct WalkWindowState
 {
@@ -437,6 +517,10 @@ typedef struct WalkWindowState
     const LaiueSceneMathServiceV1 *sceneMath;
     const LaiueUiServiceV1 *uiService;
     const LaiueCharacterServiceV1 *characterService;
+    const LaiueVoxelServiceV1 *voxelService;
+    uint32_t voxelServiceSize;
+    uint32_t characterServiceSize;
+    LaiueVoxelWorldV1 *world;
     Window *window;
     Input *input;
     LaiueGraphicsDeviceV2 *device;
@@ -646,6 +730,15 @@ static void WalkWindowFrame(void *opaque)
             (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_SPACE);
         }
         if (state->characterService->step(state->controller, &input) == 0u)
+        {
+            state->failed = true;
+            state->windowService->requestClose(state->window);
+            break;
+        }
+        if (WalkRebaseWorldAndCharacter(
+                state->voxelService, state->voxelServiceSize, state->world,
+                state->characterService, state->characterServiceSize,
+                state->controller) == 0u)
         {
             state->failed = true;
             state->windowService->requestClose(state->window);
@@ -964,10 +1057,11 @@ static bool RunWalkExample(bool headless)
         return false;
     }
 
+    uint32_t characterServiceSize = 0u;
     const LaiueCharacterServiceV1 *character =
         (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueCharacterServiceV1), NULL, NULL);
+            LAIUE_CHARACTER_SERVICE_V1_LEGACY_SIZE, NULL, &characterServiceSize);
     uint32_t voxelServiceSize = 0u;
     const LaiueVoxelServiceV1 *voxel =
         (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
@@ -1132,6 +1226,10 @@ static bool RunWalkExample(bool headless)
                     .sceneMath = sceneMath,
                     .uiService = walkUiService,
                     .characterService = characterReady ? character : NULL,
+                    .characterServiceSize = characterServiceSize,
+                    .voxelService = voxel,
+                    .voxelServiceSize = voxelServiceSize,
+                    .world = world,
                     .window = window,
                     .input = input,
                     .device = device,
@@ -1212,6 +1310,10 @@ static bool RunWalkExample(bool headless)
                          (tick == 0u ? LAIUE_CHARACTER_INPUT_JUMP : 0u),
             };
             success = character->step(controller, &input) != 0u;
+            if (success && WalkRebaseWorldAndCharacter(
+                              voxel, voxelServiceSize, world, character,
+                              characterServiceSize, controller) == 0u)
+                success = false;
         }
         LaiueCharacterPositionV1 end = {0};
         success = success && character->getPosition(controller, &end) != 0u &&
