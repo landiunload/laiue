@@ -516,7 +516,9 @@ static void WalkWindowFrame(void *opaque)
         else
         {
             if (state->uiService != NULL && state->uiContext != NULL &&
-                state->uiService->begin != NULL)
+                state->uiService->begin != NULL && state->uiService->rect != NULL &&
+                state->uiService->textUtf8 != NULL &&
+                state->uiService->copyDrawList != NULL)
             {
                 int32_t mouseX = 0;
                 int32_t mouseY = 0;
