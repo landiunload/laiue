@@ -10,6 +10,7 @@
 #include "render/graphics_service.h"
 #include "input/input_service.h"
 #include "platform/window_service.h"
+#include "ui/ui_service.h"
 #endif
 
 #include <limits.h>
@@ -420,15 +421,22 @@ typedef struct WalkWindowState
     const LaiueWindowServiceV1 *windowService;
     const LaiueInputServiceV1 *inputService;
     const LaiueGraphicsDeviceServiceV1 *graphicsService;
+    const LaiueUiServiceV1 *uiService;
     const LaiueCharacterServiceV1 *characterService;
     Window *window;
     Input *input;
     LaiueGraphicsDeviceV1 *device;
+    void *uiContext;
+    const uint8_t *fontPixels;
+    uint32_t fontWidth;
+    uint32_t fontHeight;
     LaiueCharacterControllerV1 *controller;
     double lastTime;
     double accumulator;
     bool failed;
 } WalkWindowState;
+
+static LaiueUiQuadV1 walkUiQuads[LAIUE_GRAPHICS_UI_MAX_QUADS];
 
 static void WalkRawInput(void *opaque, void *rawInput)
 {
@@ -505,8 +513,75 @@ static void WalkWindowFrame(void *opaque)
     {
         if (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u)
             state->failed = true;
-        else if (state->device->endFrame(state->device) == 0u)
-            state->failed = true;
+        else
+        {
+            if (state->uiService != NULL && state->uiContext != NULL &&
+                state->uiService->begin != NULL)
+            {
+                int32_t mouseX = 0;
+                int32_t mouseY = 0;
+                state->windowService->getCursorClientPosition(state->window, &mouseX, &mouseY);
+                const uint32_t mouseDown =
+                    state->inputService->isMouseButtonDown(state->input,
+                                                           INPUT_MOUSE_BUTTON_LEFT)
+                        ? 1u
+                        : 0u;
+                const uint32_t mousePressed =
+                    state->inputService->wasMouseButtonPressed(state->input,
+                                                               INPUT_MOUSE_BUTTON_LEFT)
+                        ? 1u
+                        : 0u;
+                const float wheel = state->windowService->consumeMouseWheelSteps != NULL
+                                        ? state->windowService->consumeMouseWheelSteps(
+                                              state->window)
+                                        : 0.0f;
+                if (state->uiService->begin(state->uiContext, width, height,
+                                            (float)mouseX, (float)mouseY, mouseDown,
+                                            mousePressed, wheel, (float)elapsed) != 0u)
+                {
+                    if (state->device->setUiFontAtlas != NULL &&
+                        state->uiService->getFontAtlas != NULL)
+                    {
+                        const uint8_t *pixels = NULL;
+                        uint32_t atlasWidth = 0u;
+                        uint32_t atlasHeight = 0u;
+                        if (state->uiService->getFontAtlas(state->uiContext, &pixels,
+                                                           &atlasWidth, &atlasHeight) != 0u &&
+                            pixels != NULL && atlasWidth != 0u && atlasHeight != 0u &&
+                            (pixels != state->fontPixels || atlasWidth != state->fontWidth ||
+                             atlasHeight != state->fontHeight))
+                        {
+                            if (state->device->setUiFontAtlas(state->device, pixels,
+                                                               atlasWidth, atlasHeight) != 0u)
+                            {
+                                state->fontPixels = pixels;
+                                state->fontWidth = atlasWidth;
+                                state->fontHeight = atlasHeight;
+                            }
+                        }
+                    }
+                    state->uiService->rect(state->uiContext, 16.0f, 16.0f, 330.0f, 126.0f,
+                                           8.0f, 0xF4221A16u);
+                    state->uiService->textUtf8(state->uiContext, 32.0f, 32.0f, 0xFFFFFFFFu,
+                                               "LAIUE Walk");
+                    state->uiService->textUtf8(state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
+                                               "WASD move   Shift sprint   Space jump");
+                    state->uiService->textUtf8(state->uiContext, 32.0f, 84.0f, 0xFFB8C8FFu,
+                                               "Character: online");
+                    state->uiService->textUtf8(state->uiContext, 32.0f, 106.0f, 0xFFB8C8FFu,
+                                               "Voxel: optional sparse edits");
+                    uint32_t quadCount = 0u;
+                    if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
+                                                       LAIUE_GRAPHICS_UI_MAX_QUADS,
+                                                       &quadCount) == 0u ||
+                        state->device->submitUi == NULL ||
+                        state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
+                        state->failed = true;
+                }
+            }
+            if (state->device->endFrame(state->device) == 0u)
+                state->failed = true;
+        }
     }
     if (state->inputService->endFrame != NULL)
         state->inputService->endFrame(state->input);
@@ -550,6 +625,7 @@ static LaiueModuleStatus LoadWalkModules(
     static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t inputPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t uiPath[LAIUE_PLATFORM_PATH_CAPACITY];
 #endif
 #if defined(_WIN32)
     const wchar_t *characterName = L"laiue_character.dll";
@@ -560,6 +636,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *windowName = L"laiue_window.dll";
     const wchar_t *inputName = L"laiue_input.dll";
     const wchar_t *renderName = L"laiue_render.dll";
+    const wchar_t *uiName = L"laiue_ui.dll";
 #endif
 #elif defined(__APPLE__)
     const wchar_t *characterName = L"liblaiue_character.dylib";
@@ -570,6 +647,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *windowName = L"liblaiue_window.dylib";
     const wchar_t *inputName = L"liblaiue_input.dylib";
     const wchar_t *renderName = L"liblaiue_render.dylib";
+    const wchar_t *uiName = L"liblaiue_ui.dylib";
 #endif
 #else
     const wchar_t *characterName = L"liblaiue_character.so";
@@ -580,6 +658,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *windowName = L"liblaiue_window.so";
     const wchar_t *inputName = L"liblaiue_input.so";
     const wchar_t *renderName = L"liblaiue_render.so";
+    const wchar_t *uiName = L"liblaiue_ui.so";
 #endif
 #endif
     if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY) ||
@@ -600,7 +679,8 @@ static LaiueModuleStatus LoadWalkModules(
 #if defined(LAIUE_WALK_WINDOWED)
     if (!JoinPath(windowPath, directory, windowName) ||
         !JoinPath(inputPath, directory, inputName) ||
-        !JoinPath(renderPath, directory, renderName))
+        !JoinPath(renderPath, directory, renderName) ||
+        !JoinPath(uiPath, directory, uiName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){windowPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
@@ -608,6 +688,8 @@ static LaiueModuleStatus LoadWalkModules(
         (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){uiPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
 #endif
     LaiueModuleLoadReportInitialize(report, reportEntries,
                                     binaryCount);
@@ -628,6 +710,7 @@ static LaiueModuleStatus LoadWalkModules(
     modules[moduleCount++] = LaiueWindowGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueInputGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueGraphicsGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueUiGetStaticModuleApiV1();
 #endif
     return LaiueModuleHostLoadStatic(host, modules,
                                      moduleCount, diagnostic);
@@ -738,6 +821,8 @@ static bool RunWalkExample(bool headless)
 
     bool ranWindow = false;
 #if defined(LAIUE_WALK_WINDOWED)
+    void *walkUiContext = NULL;
+    const LaiueUiServiceV1 *walkUiService = NULL;
     if (!headless)
     {
         const LaiueWindowServiceV1 *windowService =
@@ -753,6 +838,9 @@ static bool RunWalkExample(bool headless)
                 host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
                 LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
                 sizeof(LaiueGraphicsDeviceServiceV1), NULL, NULL);
+        walkUiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
+                host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
+                sizeof(LaiueUiServiceV1), NULL, NULL);
         if (windowService != NULL && inputService != NULL && graphicsService != NULL &&
             windowService->create != NULL && inputService->create != NULL &&
             graphicsService->createDevice != NULL)
@@ -766,6 +854,10 @@ static bool RunWalkExample(bool headless)
             Input *input = window == NULL ? NULL :
                 inputService->create(windowService->getNativeHandle(window));
             LaiueGraphicsDeviceV1 *device = NULL;
+            if (walkUiService != NULL && walkUiService->contextCreateWithContext != NULL &&
+                walkUiService->contextDestroy != NULL && walkUiService->context != NULL)
+                (void)walkUiService->contextCreateWithContext(walkUiService->context,
+                                                          &walkUiContext);
             if (window != NULL && input != NULL)
             {
                 windowService->setRawInputCallback(window, WalkRawInput, NULL);
@@ -782,10 +874,12 @@ static bool RunWalkExample(bool headless)
                     .windowService = windowService,
                     .inputService = inputService,
                     .graphicsService = graphicsService,
+                    .uiService = walkUiService,
                     .characterService = character,
                     .window = window,
                     .input = input,
                     .device = device,
+                    .uiContext = walkUiContext,
                     .controller = controller,
                     .lastTime = PlatformMonotonicSeconds(),
                 };
@@ -816,6 +910,9 @@ static bool RunWalkExample(bool headless)
             PlatformWriteConsoleUtf8(
                 "laiue walk: graphics/window modules missing; using diagnostic headless mode\n");
     }
+    if (walkUiContext != NULL && walkUiService != NULL &&
+        walkUiService->contextDestroy != NULL)
+        walkUiService->contextDestroy(walkUiContext);
 #endif
     if (!ranWindow)
     {

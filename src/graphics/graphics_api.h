@@ -127,6 +127,12 @@ typedef uint32_t (*LaiueGraphicsSubmitFn)(LaiueGraphicsDeviceV1 *,
 typedef uint32_t (*LaiueGraphicsSubmitUiFn)(LaiueGraphicsDeviceV1 *,
                                             const LaiueGraphicsUiQuadV1 *quads,
                                             uint32_t quadCount);
+/* Upload the alpha font atlas used by text quads.  This remains optional so
+ * a client that only emits coloured rectangles can run against an older
+ * device provider. */
+typedef uint32_t (*LaiueGraphicsSetUiFontAtlasFn)(LaiueGraphicsDeviceV1 *,
+                                                  const uint8_t *alphaPixels,
+                                                  uint32_t width, uint32_t height);
 typedef uint32_t (*LaiueGraphicsEndFrameFn)(LaiueGraphicsDeviceV1 *);
 
 struct LaiueGraphicsDeviceV1
@@ -150,4 +156,5 @@ struct LaiueGraphicsDeviceV1
     /* Appended after the original reserved tail so its offsets remain stable
      * for consumers built against the first revision. */
     LaiueGraphicsSubmitUiFn submitUi;
+    LaiueGraphicsSetUiFontAtlasFn setUiFontAtlas;
 };

@@ -112,6 +112,8 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *,
                              const LaiueGraphicsDrawItemV1 *, uint32_t);
 static uint32_t DeviceSubmitUi(LaiueGraphicsDeviceV1 *,
                                const LaiueGraphicsUiQuadV1 *, uint32_t);
+static uint32_t DeviceSetUiFontAtlas(LaiueGraphicsDeviceV1 *, const uint8_t *, uint32_t,
+                                     uint32_t);
 static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *);
 
 static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
@@ -147,6 +149,7 @@ static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
     state->device.endFrame = DeviceEndFrame;
     state->device.createShader = DeviceCreateShader;
     state->device.submitUi = DeviceSubmitUi;
+    state->device.setUiFontAtlas = DeviceSetUiFontAtlas;
     *outDevice = &state->device;
     return 1u;
 }
@@ -360,6 +363,17 @@ static uint32_t DeviceSubmitUi(LaiueGraphicsDeviceV1 *device,
         RendererUiQueue(state->renderer, (const RendererUiQuad *)quads, quadCount);
     state->submittedItems += quadCount;
     return 1u;
+}
+
+static uint32_t DeviceSetUiFontAtlas(LaiueGraphicsDeviceV1 *device,
+                                     const uint8_t *alphaPixels, uint32_t width,
+                                     uint32_t height)
+{
+    LaiueGraphicsDeviceState *state = DeviceState(device);
+    if (state == NULL || state->renderer == NULL || alphaPixels == NULL || width == 0u ||
+        height == 0u)
+        return 0u;
+    return RendererUiSetFontAtlas(state->renderer, alphaPixels, width, height) ? 1u : 0u;
 }
 
 static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *device)
