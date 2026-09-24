@@ -37,6 +37,8 @@ typedef struct LaiueGraphicsDeviceState
     uint8_t kinds[256];
     uint8_t live[256];
     uint32_t submittedItems;
+    float viewProjection[16];
+    bool cameraSet;
     bool frameActive;
 } LaiueGraphicsDeviceState;
 
@@ -151,6 +153,8 @@ static uint32_t DeviceV2UploadBuffer(LaiueGraphicsDeviceV2 *,
                                      const LaiueGraphicsBufferUploadV1 *);
 static void DeviceV2DestroyHandle(LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle);
 static uint32_t DeviceV2BeginFrame(LaiueGraphicsDeviceV2 *, uint32_t, uint32_t);
+static uint32_t DeviceV2SetCamera(LaiueGraphicsDeviceV2 *,
+                                  const LaiueGraphicsCameraV2 *);
 static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *,
                                const LaiueGraphicsDrawItemV2 *, uint32_t);
 static uint32_t DeviceV2SubmitUi(LaiueGraphicsDeviceV2 *,
@@ -244,6 +248,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.createShader = DeviceV2CreateShader;
     state->deviceV2.submitUi = DeviceV2SubmitUi;
     state->deviceV2.setUiFontAtlas = DeviceV2SetUiFontAtlas;
+    state->deviceV2.setCamera = DeviceV2SetCamera;
     *outDevice = &state->device;
     return 1u;
 }
@@ -450,15 +455,19 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
     frame.passCount = 1u;
     frame.passes[0].rectMaxX = width;
     frame.passes[0].rectMaxY = height;
-    /* The compatibility device has no camera setter yet.  Use a stable
-     * camera-relative orthographic fallback so a submitted terrain batch is
-     * visible immediately; V2 callers can place batches with origin/scale. */
-    frame.passes[0].viewProjection[0] = 0.03f;
-    frame.passes[0].viewProjection[5] = 0.03f;
-    frame.passes[0].viewProjection[10] = 0.03f;
-    frame.passes[0].viewProjection[15] = 1.0f;
-    frame.passes[0].viewProjection[12] = -1.0f;
-    frame.passes[0].viewProjection[13] = -1.0f;
+    if (state->cameraSet)
+        memcpy(frame.passes[0].viewProjection, state->viewProjection,
+               sizeof(state->viewProjection));
+    else
+    {
+        /* Stable camera-relative orthographic fallback for V1 clients. */
+        frame.passes[0].viewProjection[0] = 0.03f;
+        frame.passes[0].viewProjection[5] = 0.03f;
+        frame.passes[0].viewProjection[10] = 0.03f;
+        frame.passes[0].viewProjection[15] = 1.0f;
+        frame.passes[0].viewProjection[12] = -1.0f;
+        frame.passes[0].viewProjection[13] = -1.0f;
+    }
     frame.skyColor[0] = 0.035f;
     frame.skyColor[1] = 0.055f;
     frame.skyColor[2] = 0.09f;
@@ -706,6 +715,18 @@ static uint32_t DeviceV2BeginFrame(LaiueGraphicsDeviceV2 *device, uint32_t width
 {
     LaiueGraphicsDeviceState *state = DeviceV2State(device);
     return state == NULL ? 0u : DeviceBeginFrame(&state->device, width, height);
+}
+
+static uint32_t DeviceV2SetCamera(LaiueGraphicsDeviceV2 *device,
+                                   const LaiueGraphicsCameraV2 *camera)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL || camera == NULL || camera->structSize < sizeof(*camera))
+        return 0u;
+    memcpy(state->viewProjection, camera->viewProjection,
+           sizeof(state->viewProjection));
+    state->cameraSet = true;
+    return 1u;
 }
 
 static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,

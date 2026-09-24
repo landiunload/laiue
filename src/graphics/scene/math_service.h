@@ -1,6 +1,7 @@
 #pragma once
 
 #include "scene/math.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -18,3 +19,5 @@ typedef struct LaiueSceneMathServiceV1
     bool (*frustumIntersectsBox)(const float planes[6][4],
                                  const float minimum[3], const float maximum[3]);
 } LaiueSceneMathServiceV1;
+
+const LaiueModuleApiV1 *LaiueSceneMathGetStaticModuleApiV1(void);

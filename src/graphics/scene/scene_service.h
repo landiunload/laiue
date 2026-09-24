@@ -2,6 +2,7 @@
 
 #include "scene/camera.h"
 #include "scene/panorama.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -35,3 +36,5 @@ typedef struct LaiueSceneServiceV1
                                     float farPlane, const float view[16],
                                     RendererFrameSetup *outSetup);
 } LaiueSceneServiceV1;
+
+const LaiueModuleApiV1 *LaiueSceneGetStaticModuleApiV1(void);

@@ -12,14 +12,16 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     endif()
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
         target_link_libraries(laiue_walk PRIVATE
-            laiue_window laiue_input laiue_render laiue_ui)
+            laiue_window laiue_input laiue_render laiue_ui
+            laiue_scene_math laiue_scene)
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_WINDOWED=1)
     endif()
 else()
     target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_DYNAMIC=1)
     add_dependencies(laiue_walk laiue_character)
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
-        add_dependencies(laiue_walk laiue_window laiue_input laiue_render laiue_ui)
+        add_dependencies(laiue_walk laiue_window laiue_input laiue_render laiue_ui
+            laiue_scene_math laiue_scene)
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_WINDOWED=1)
     endif()
 endif()

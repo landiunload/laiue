@@ -30,6 +30,16 @@ typedef struct LaiueGraphicsDrawItemV2
     float scale;
 } LaiueGraphicsDrawItemV2;
 
+/* Camera state is supplied in render-local coordinates. Providers never
+ * receive the application's absolute origin, which keeps float precision
+ * stable even when the simulation is many cells away from zero. */
+typedef struct LaiueGraphicsCameraV2
+{
+    uint32_t structSize;
+    uint32_t flags;
+    float viewProjection[16];
+} LaiueGraphicsCameraV2;
+
 typedef uint32_t (*LaiueGraphicsV2CreateBufferFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsBufferDescV1 *,
     LaiueGraphicsHandle *outBuffer);
@@ -51,6 +61,8 @@ typedef void (*LaiueGraphicsV2DestroyHandleFn)(
     LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle handle);
 typedef uint32_t (*LaiueGraphicsV2BeginFrameFn)(
     LaiueGraphicsDeviceV2 *, uint32_t width, uint32_t height);
+typedef uint32_t (*LaiueGraphicsV2SetCameraFn)(
+    LaiueGraphicsDeviceV2 *, const LaiueGraphicsCameraV2 *camera);
 typedef uint32_t (*LaiueGraphicsV2SubmitFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsDrawItemV2 *, uint32_t itemCount);
 typedef uint32_t (*LaiueGraphicsV2SubmitUiFn)(
@@ -76,6 +88,8 @@ struct LaiueGraphicsDeviceV2
     LaiueGraphicsV2CreateShaderFn createShader;
     LaiueGraphicsV2SubmitUiFn submitUi;
     LaiueGraphicsV2SetUiFontAtlasFn setUiFontAtlas;
+    /* Optional tail: 2D-only providers may omit camera control. */
+    LaiueGraphicsV2SetCameraFn setCamera;
 };
 
 typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(
