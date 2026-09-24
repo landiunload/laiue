@@ -14,11 +14,8 @@ typedef struct ProviderContext
     bool rejectRebase;
 } ProviderContext;
 
-static uint32_t worldProviderChecks;
-
 static void ProviderExpect(bool condition, const char *name)
 {
-    ++worldProviderChecks;
     if (condition)
     {
         return;

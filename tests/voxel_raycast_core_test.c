@@ -2,11 +2,8 @@
 #include "world/numeric_provider.h"
 #include "test_runtime.h"
 
-static uint32_t checks;
-
 static void Expect(bool condition, const char *message)
 {
-    ++checks;
     if (condition)
     {
         return;

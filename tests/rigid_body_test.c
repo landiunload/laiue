@@ -10,11 +10,8 @@
 // высоте, опрокидывается через край, крутится сам по себе, и разгон без
 // потолка остаётся разгоном без потолка.
 
-static uint32_t rigidChecks;
-
 static void RigidExpect(bool condition, const char *name)
 {
-    ++rigidChecks;
     if (condition)
     {
         return;

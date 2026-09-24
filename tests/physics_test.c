@@ -12,11 +12,8 @@ typedef struct PhysicsTestContext
     uint32_t dynamicQueries;
 } PhysicsTestContext;
 
-static uint32_t physicsChecks;
-
 static void PhysicsExpect(bool condition, const char *name)
 {
-    ++physicsChecks;
     if (condition)
     {
         return;

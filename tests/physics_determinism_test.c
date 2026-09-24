@@ -32,8 +32,6 @@ typedef struct Simulation
     uint32_t collisionMask;
 } Simulation;
 
-static uint32_t determinismChecks;
-
 static void DeterminismWriteHex64(uint64_t value)
 {
     static const char digits[] = "0123456789abcdef";
@@ -51,7 +49,6 @@ static void DeterminismWriteHex64(uint64_t value)
 
 static void DeterminismExpect(bool condition, const char *name)
 {
-    ++determinismChecks;
     if (condition)
     {
         return;
