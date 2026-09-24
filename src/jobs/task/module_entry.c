@@ -25,11 +25,12 @@ static const LaiueTaskServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL)
+        host->unpublishService == NULL || host->allocate == NULL ||
+        host->free == NULL)
         return 0u;
     *outContext = NULL;
     LaiueTaskModuleState *state =
-        (LaiueTaskModuleState *)PlatformAllocate(sizeof(*state), true);
+        (LaiueTaskModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
     state->host = host;
@@ -64,8 +65,10 @@ static void ModuleDestroy(void *context)
     LaiueTaskModuleState *state = (LaiueTaskModuleState *)context;
     if (state != NULL)
     {
+        const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
-        PlatformFree(state);
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
     }
 }
 

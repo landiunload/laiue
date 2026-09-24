@@ -27,11 +27,12 @@ static const LaiueSceneServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
     *outContext = NULL;
     LaiueSceneModuleState *state =
-        (LaiueSceneModuleState *)PlatformAllocate(sizeof(*state), true);
+        (LaiueSceneModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
     state->host = host;
@@ -105,10 +106,12 @@ static void ModuleDestroy(void *context)
     LaiueSceneModuleState *state = (LaiueSceneModuleState *)context;
     if (state != NULL)
     {
+        const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
         state->graphics = NULL;
         state->sceneMath = NULL;
-        PlatformFree(state);
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
     }
     PanoramaSetSceneMathService(NULL);
 }

@@ -472,11 +472,12 @@ static uint64_t VoxelGetRevision(const LaiueVoxelWorldV1 *world)
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
     *outContext = NULL;
     LaiueVoxelModuleState *state =
-        (LaiueVoxelModuleState *)PlatformAllocate(sizeof(*state), true);
+        (LaiueVoxelModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
     state->host = host;
@@ -565,9 +566,11 @@ static void ModuleDestroy(void *context)
     LaiueVoxelModuleState *state = (LaiueVoxelModuleState *)context;
     if (state != NULL)
     {
+        const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
         state->worldService = NULL;
-        PlatformFree(state);
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
     }
 }
 
