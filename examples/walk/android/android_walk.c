@@ -29,6 +29,17 @@
 #define ANDROID_WALK_ACTIVE_CHUNK_COUNT \
     (ANDROID_WALK_ACTIVE_CHUNK_DIAMETER * ANDROID_WALK_ACTIVE_CHUNK_DIAMETER)
 
+/* Touch controls are deliberately owned by the walk example rather than by
+ * the renderer or the Android window provider.  The left lower quadrant is a
+ * fixed virtual stick, the two lower-right circles are sprint and jump, and
+ * the remaining right-hand surface is reserved for camera look. */
+#define ANDROID_WALK_TOUCH_LEFT_ZONE 0.48f
+#define ANDROID_WALK_TOUCH_LOWER_ZONE 0.46f
+#define ANDROID_WALK_TOUCH_LOOK_ZONE 0.46f
+#define ANDROID_WALK_TOUCH_JOYSTICK_RADIUS 0.16f
+#define ANDROID_WALK_TOUCH_BUTTON_RADIUS 0.095f
+#define ANDROID_WALK_TOUCH_MARGIN 0.06f
+
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
 
 typedef struct AndroidWalkState AndroidWalkState;
@@ -62,6 +73,8 @@ struct AndroidWalkState
     bool touchActive;
     bool joystickActive;
     bool lookActive;
+    bool sprintActive;
+    bool touchUiReady;
     float joystickOriginX;
     float joystickOriginY;
     float joystickX;
@@ -72,6 +85,8 @@ struct AndroidWalkState
     int32_t lookDeltaY;
     int32_t joystickPointerId;
     int32_t lookPointerId;
+    int32_t sprintPointerId;
+    int32_t jumpPointerId;
     bool jumpPending;
     bool keyDown[10];
     double lastTime;
@@ -91,6 +106,75 @@ static bool AndroidFieldPresent(uint32_t actualSize, uint32_t declaredSize,
 {
     return (size_t)actualSize >= offset && (size_t)actualSize - offset >= size &&
            (size_t)declaredSize >= offset && (size_t)declaredSize - offset >= size;
+}
+
+static float AndroidTouchMinimumDimension(const AndroidWalkState *state)
+{
+    if (state == NULL)
+        return 1.0f;
+    const float width = state->width > 0 ? (float)state->width : 1.0f;
+    const float height = state->height > 0 ? (float)state->height : 1.0f;
+    return width < height ? width : height;
+}
+
+static void AndroidTouchLayout(const AndroidWalkState *state,
+                               float *joystickCenterX, float *joystickCenterY,
+                               float *joystickRadius, float *jumpCenterX,
+                               float *jumpCenterY, float *sprintCenterX,
+                               float *sprintCenterY, float *buttonRadius)
+{
+    const float width = state != NULL && state->width > 0 ? (float)state->width : 1.0f;
+    const float height = state != NULL && state->height > 0 ? (float)state->height : 1.0f;
+    const float minimum = AndroidTouchMinimumDimension(state);
+    float stickRadius = minimum * ANDROID_WALK_TOUCH_JOYSTICK_RADIUS;
+    float actionRadius = minimum * ANDROID_WALK_TOUCH_BUTTON_RADIUS;
+    float margin = minimum * ANDROID_WALK_TOUCH_MARGIN;
+    if (stickRadius < 56.0f) stickRadius = 56.0f;
+    if (actionRadius < 48.0f) actionRadius = 48.0f;
+    if (margin < 24.0f) margin = 24.0f;
+
+    if (joystickCenterX != NULL) *joystickCenterX = margin + stickRadius;
+    if (joystickCenterY != NULL) *joystickCenterY = height - margin - stickRadius;
+    if (joystickRadius != NULL) *joystickRadius = stickRadius;
+    if (jumpCenterX != NULL) *jumpCenterX = width - margin - actionRadius;
+    if (jumpCenterY != NULL) *jumpCenterY = height - margin - actionRadius;
+    if (sprintCenterX != NULL) *sprintCenterX = width - margin - actionRadius * 3.0f;
+    if (sprintCenterY != NULL) *sprintCenterY = height - margin - actionRadius;
+    if (buttonRadius != NULL) *buttonRadius = actionRadius;
+}
+
+static bool AndroidTouchInsideCircle(float x, float y, float centerX, float centerY,
+                                     float radius)
+{
+    const float dx = x - centerX;
+    const float dy = y - centerY;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static float AndroidTouchClamp(float value)
+{
+    if (value < -1.0f) return -1.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static void AndroidClearTouchState(AndroidWalkState *state)
+{
+    if (state == NULL)
+        return;
+    state->touchActive = false;
+    state->joystickActive = false;
+    state->lookActive = false;
+    state->sprintActive = false;
+    state->joystickX = 0.0f;
+    state->joystickY = 0.0f;
+    state->lookDeltaX = 0;
+    state->lookDeltaY = 0;
+    state->joystickPointerId = -1;
+    state->lookPointerId = -1;
+    state->sprintPointerId = -1;
+    state->jumpPointerId = -1;
+    state->jumpPending = false;
 }
 
 static uint32_t AndroidLoadModules(AndroidWalkState *state)
@@ -161,14 +245,8 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
     state->device = NULL;
     state->windowReady = false;
     state->running = false;
-    state->touchActive = false;
-    state->joystickActive = false;
-    state->lookActive = false;
-    state->lookDeltaX = 0;
-    state->lookDeltaY = 0;
-    state->joystickPointerId = -1;
-    state->lookPointerId = -1;
-    state->jumpPending = false;
+    state->touchUiReady = false;
+    AndroidClearTouchState(state);
     memset(state->keyDown, 0, sizeof(state->keyDown));
     state->accumulator = 0.0;
     state->lastTime = 0.0;
@@ -178,8 +256,7 @@ static void AndroidResetInputClock(AndroidWalkState *state)
 {
     if (state == NULL)
         return;
-    state->touchActive = false;
-    state->jumpPending = false;
+    AndroidClearTouchState(state);
     memset(state->keyDown, 0, sizeof(state->keyDown));
     state->accumulator = 0.0;
     state->lastTime = PlatformMonotonicSeconds();
@@ -263,6 +340,21 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     }
     if (state->scene != NULL && state->scene->cameraInit != NULL)
         state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, 0.0f);
+
+    /* The renderer only records UI quads after a font atlas has been
+     * installed.  A 1x1 opaque atlas is enough for the coloured touch
+     * controls because their quads do not use the text flag.  This keeps the
+     * controls independent from the optional UI technology module. */
+    static const uint8_t touchUiAtlasPixel = 255u;
+    if (AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, setUiFontAtlas),
+                            sizeof(state->device->setUiFontAtlas)) &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, submitUi),
+                            sizeof(state->device->submitUi)) &&
+        state->device->setUiFontAtlas != NULL && state->device->submitUi != NULL)
+        state->touchUiReady = state->device->setUiFontAtlas(
+            state->device, &touchUiAtlasPixel, 1u, 1u) != 0u;
 }
 
 static int32_t AndroidKeyIndex(int32_t keyCode)
@@ -304,30 +396,64 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
     }
     if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION)
         return 0;
+    if (state->width <= 0 || state->height <= 0)
+        return 0;
     const int32_t rawAction = AMotionEvent_getAction(event);
     const int32_t action = rawAction & AMOTION_EVENT_ACTION_MASK;
-    const size_t actionIndex = (size_t)(rawAction >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    const size_t actionIndex = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >>
+                                        AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     const size_t pointerCount = AMotionEvent_getPointerCount(event);
+    if (action == AMOTION_EVENT_ACTION_CANCEL)
+    {
+        AndroidClearTouchState(state);
+        return 1;
+    }
     if (pointerCount == 0u || actionIndex >= pointerCount)
         return 0;
     const float width = state->width > 0 ? (float)state->width : 1.0f;
+    const float height = state->height > 0 ? (float)state->height : 1.0f;
     const int32_t pointerId = AMotionEvent_getPointerId(event, actionIndex);
     const float x = AMotionEvent_getX(event, actionIndex);
     const float y = AMotionEvent_getY(event, actionIndex);
+    float joystickCenterX = 0.0f;
+    float joystickCenterY = 0.0f;
+    float joystickRadius = 0.0f;
+    float jumpCenterX = 0.0f;
+    float jumpCenterY = 0.0f;
+    float sprintCenterX = 0.0f;
+    float sprintCenterY = 0.0f;
+    float buttonRadius = 0.0f;
+    AndroidTouchLayout(state, &joystickCenterX, &joystickCenterY, &joystickRadius,
+                       &jumpCenterX, &jumpCenterY, &sprintCenterX, &sprintCenterY,
+                       &buttonRadius);
     if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_POINTER_DOWN)
     {
         state->touchActive = true;
-        state->jumpPending = true;
-        if (x < width * 0.5f && state->joystickPointerId < 0)
+        const float buttonHitRadius = buttonRadius * 1.20f;
+        if (state->jumpPointerId < 0 &&
+            AndroidTouchInsideCircle(x, y, jumpCenterX, jumpCenterY, buttonHitRadius))
+        {
+            state->jumpPointerId = pointerId;
+            state->jumpPending = true;
+        }
+        else if (state->sprintPointerId < 0 &&
+                 AndroidTouchInsideCircle(x, y, sprintCenterX, sprintCenterY,
+                                          buttonHitRadius))
+        {
+            state->sprintPointerId = pointerId;
+            state->sprintActive = true;
+        }
+        else if (state->joystickPointerId < 0 && x < width * ANDROID_WALK_TOUCH_LEFT_ZONE &&
+                 y > height * ANDROID_WALK_TOUCH_LOWER_ZONE)
         {
             state->joystickPointerId = pointerId;
             state->joystickActive = true;
-            state->joystickOriginX = x;
-            state->joystickOriginY = y;
+            state->joystickOriginX = joystickCenterX;
+            state->joystickOriginY = joystickCenterY;
             state->joystickX = 0.0f;
             state->joystickY = 0.0f;
         }
-        else if (state->lookPointerId < 0)
+        else if (state->lookPointerId < 0 && x >= width * ANDROID_WALK_TOUCH_LOOK_ZONE)
         {
             state->lookPointerId = pointerId;
             state->lookActive = true;
@@ -344,15 +470,10 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
             const float py = AMotionEvent_getY(event, pointer);
             if (id == state->joystickPointerId)
             {
-                const float radius = 160.0f;
-                float dx = (px - state->joystickOriginX) / radius;
-                float dy = (py - state->joystickOriginY) / radius;
-                if (dx > 1.0f) dx = 1.0f;
-                if (dx < -1.0f) dx = -1.0f;
-                if (dy > 1.0f) dy = 1.0f;
-                if (dy < -1.0f) dy = -1.0f;
-                state->joystickX = dx;
-                state->joystickY = -dy;
+                float dx = (px - state->joystickOriginX) / joystickRadius;
+                float dy = (py - state->joystickOriginY) / joystickRadius;
+                state->joystickX = AndroidTouchClamp(dx);
+                state->joystickY = -AndroidTouchClamp(dy);
             }
             else if (id == state->lookPointerId)
             {
@@ -363,8 +484,7 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
             }
         }
     }
-    else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_POINTER_UP ||
-             action == AMOTION_EVENT_ACTION_CANCEL)
+    else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_POINTER_UP)
     {
         if (pointerId == state->joystickPointerId)
         {
@@ -373,12 +493,20 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
             state->joystickX = 0.0f;
             state->joystickY = 0.0f;
         }
-        if (pointerId == state->lookPointerId || action == AMOTION_EVENT_ACTION_CANCEL)
+        if (pointerId == state->lookPointerId)
         {
             state->lookPointerId = -1;
             state->lookActive = false;
         }
-        state->touchActive = state->joystickActive || state->lookActive;
+        if (pointerId == state->sprintPointerId)
+        {
+            state->sprintPointerId = -1;
+            state->sprintActive = false;
+        }
+        if (pointerId == state->jumpPointerId)
+            state->jumpPointerId = -1;
+        state->touchActive = state->joystickActive || state->lookActive ||
+                             state->sprintActive || state->jumpPointerId >= 0;
     }
     return 1;
 }
@@ -417,6 +545,12 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
                 state->graphics->resize(state->device,
                                         ANativeWindow_getWidth(state->app->window),
                                         ANativeWindow_getHeight(state->app->window));
+            if (state->app->window != NULL)
+            {
+                state->width = ANativeWindow_getWidth(state->app->window);
+                state->height = ANativeWindow_getHeight(state->app->window);
+                AndroidClearTouchState(state);
+            }
             break;
         default:
             break;
@@ -506,6 +640,73 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     (void)state->device->setCamera(state->device, &camera);
 }
 
+static LaiueGraphicsUiQuadV1 AndroidTouchQuad(float x0, float y0, float x1, float y1,
+                                               float cornerRadius, uint32_t color)
+{
+    LaiueGraphicsUiQuadV1 quad = {
+        .rect = {x0, y0, x1, y1},
+        .uv = {0.0f, 0.0f, 1.0f, 1.0f},
+        .colorRGBA = color,
+        .cornerRadius = cornerRadius,
+        .flags = 0u,
+        .reserved = 0u,
+    };
+    return quad;
+}
+
+static void AndroidSubmitTouchUi(AndroidWalkState *state, int32_t width, int32_t height)
+{
+    if (state == NULL || !state->touchUiReady || state->device == NULL || width <= 0 ||
+        height <= 0 || !AndroidFieldPresent(state->device->structSize,
+                                            state->device->structSize,
+                                            offsetof(LaiueGraphicsDeviceV2, submitUi),
+                                            sizeof(state->device->submitUi)) ||
+        state->device->submitUi == NULL)
+        return;
+
+    float joystickCenterX = 0.0f;
+    float joystickCenterY = 0.0f;
+    float joystickRadius = 0.0f;
+    float jumpCenterX = 0.0f;
+    float jumpCenterY = 0.0f;
+    float sprintCenterX = 0.0f;
+    float sprintCenterY = 0.0f;
+    float buttonRadius = 0.0f;
+    AndroidTouchLayout(state, &joystickCenterX, &joystickCenterY, &joystickRadius,
+                       &jumpCenterX, &jumpCenterY, &sprintCenterX, &sprintCenterY,
+                       &buttonRadius);
+
+    LaiueGraphicsUiQuadV1 quads[4];
+    uint32_t quadCount = 0u;
+    quads[quadCount++] = AndroidTouchQuad(
+        joystickCenterX - joystickRadius, joystickCenterY - joystickRadius,
+        joystickCenterX + joystickRadius, joystickCenterY + joystickRadius,
+        joystickRadius, UINT32_C(0x702A3448));
+    const float knobX = joystickCenterX + state->joystickX * joystickRadius * 0.62f;
+    const float knobY = joystickCenterY - state->joystickY * joystickRadius * 0.62f;
+    const float knobRadius = joystickRadius * 0.42f;
+    quads[quadCount++] = AndroidTouchQuad(
+        knobX - knobRadius, knobY - knobRadius, knobX + knobRadius, knobY + knobRadius,
+        knobRadius, state->joystickActive ? UINT32_C(0xD0E7F1FF) : UINT32_C(0xA0B9C7D8));
+
+    const uint32_t sprintColor = state->sprintActive
+                                     ? UINT32_C(0xE0FFB347)
+                                     : UINT32_C(0x906B5528);
+    quads[quadCount++] = AndroidTouchQuad(
+        sprintCenterX - buttonRadius, sprintCenterY - buttonRadius,
+        sprintCenterX + buttonRadius, sprintCenterY + buttonRadius,
+        buttonRadius, sprintColor);
+    const uint32_t jumpColor = state->jumpPointerId >= 0
+                                   ? UINT32_C(0xE06EC8FF)
+                                   : UINT32_C(0x906E4C9C);
+    quads[quadCount++] = AndroidTouchQuad(
+        jumpCenterX - buttonRadius, jumpCenterY - buttonRadius,
+        jumpCenterX + buttonRadius, jumpCenterY + buttonRadius,
+        buttonRadius, jumpColor);
+    if (state->device->submitUi(state->device, quads, quadCount) == 0u)
+        state->touchUiReady = false;
+}
+
 static void AndroidStep(AndroidWalkState *state)
 {
     if (state == NULL || !state->windowReady)
@@ -527,14 +728,23 @@ static void AndroidStep(AndroidWalkState *state)
            state->character->step != NULL && state->accumulator >= fixedStep && ticks < 8u)
     {
         LaiueCharacterInputV1 input = {0};
-        input.moveX = (state->keyDown[3] ? 1 : 0) - (state->keyDown[1] ? 1 : 0);
-        input.moveY = (state->keyDown[0] ? 1 : 0) - (state->keyDown[2] ? 1 : 0);
+        float strafe = (float)((state->keyDown[3] ? 1 : 0) -
+                               (state->keyDown[1] ? 1 : 0));
+        float forwardInput = (float)((state->keyDown[0] ? 1 : 0) -
+                                     (state->keyDown[2] ? 1 : 0));
         if (state->joystickActive)
         {
-            input.moveX = state->joystickX > 0.35f ? 1 : (state->joystickX < -0.35f ? -1 : 0);
-            input.moveY = state->joystickY > 0.35f ? 1 : (state->joystickY < -0.35f ? -1 : 0);
+            strafe = state->joystickX;
+            forwardInput = state->joystickY;
         }
-        if (state->keyDown[4] || state->joystickActive)
+        float forward[3] = {0.0f, 1.0f, 0.0f};
+        if (state->scene != NULL && state->scene->cameraGetForwardVector != NULL)
+            state->scene->cameraGetForwardVector(&state->camera, forward);
+        const float worldX = forwardInput * forward[0] + strafe * forward[1];
+        const float worldY = forwardInput * forward[1] - strafe * forward[0];
+        input.moveX = worldX > 0.35f ? 1 : (worldX < -0.35f ? -1 : 0);
+        input.moveY = worldY > 0.35f ? 1 : (worldY < -0.35f ? -1 : 0);
+        if (state->keyDown[4] || state->sprintActive)
             input.flags |= LAIUE_CHARACTER_INPUT_SPRINT;
         if (state->jumpPending)
         {
@@ -616,6 +826,8 @@ static void AndroidStep(AndroidWalkState *state)
                 submitted = state->device->submit(state->device, draws,
                                                   ANDROID_WALK_ACTIVE_CHUNK_COUNT);
             }
+            if (began != 0u)
+                AndroidSubmitTouchUi(state, width, height);
             if (began == 0u || submitted == 0u ||
                 state->device->endFrame(state->device) == 0u)
             AndroidLog(state, ANDROID_LOG_WARN, "frame skipped after surface change");

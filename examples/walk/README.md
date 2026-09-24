@@ -36,7 +36,11 @@ desktop walk executable.
 `android/` is a small static-registry client using the same module ABI. It
 creates a Vulkan surface from `ANativeWindow`, recreates the device after
 `APP_CMD_TERM_WINDOW`/`APP_CMD_INIT_WINDOW`, pauses its fixed 128 Hz loop when
-the activity loses focus, and accepts keyboard plus touch input. Vulkan 1.3
+the activity loses focus, and accepts keyboard plus touch input. On a phone,
+the lower-left virtual stick moves relative to the camera, the lower-right
+orange button enables sprint, the purple button jumps, and dragging the rest
+of the right half looks around. Touch state is cleared on pause, surface
+recreation, and resize. Vulkan 1.3
 uses dynamic rendering; Vulkan 1.2 devices use the compatible render-pass
 path, so the same APK does not require a 1.3-only device. The sparse
 voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
