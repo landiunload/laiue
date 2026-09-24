@@ -1,24 +1,56 @@
 #include "ui/ui.h"
 #include "ui/ui_service.h"
 #include "graphics/graphics_device_service.h"
+#include "platform/system.h"
 
 #include <string.h>
 
 _Static_assert(sizeof(LaiueUiQuadV1) == sizeof(LaiueGraphicsUiQuadV1),
                "UI service quad layout must match graphics upload layout");
 
-static const LaiueModuleHostV1 *moduleHost;
-static const LaiueGraphicsDeviceServiceV1 *graphicsService;
+typedef struct UiModuleState
+{
+    const LaiueModuleHostV1 *host;
+    const LaiueGraphicsDeviceServiceV1 *graphics;
+    LaiueUiServiceV1 service;
+} UiModuleState;
+
+/* The public UI context remains layout-compatible with UiContext.  The
+ * ownership trailer lets both compatibility and context-aware creation free
+ * the same opaque pointer without a DLL-global allocator or host pointer. */
+typedef struct UiOwnedContext
+{
+    UiContext ui;
+    LaiueModuleFreeFn freeFn;
+    void *freeContext;
+} UiOwnedContext;
 
 static uint32_t ContextCreate(void **outContext)
 {
-    if (moduleHost == NULL || moduleHost->allocate == NULL || outContext == NULL)
+    if (outContext == NULL)
         return 0u;
-    UiContext *ui = (UiContext *)moduleHost->allocate(moduleHost->context, sizeof(*ui));
-    if (ui == NULL)
+    UiOwnedContext *owned =
+        (UiOwnedContext *)PlatformAllocate(sizeof(*owned), true);
+    if (owned == NULL)
         return 0u;
-    memset(ui, 0, sizeof(*ui));
-    *outContext = ui;
+    *outContext = &owned->ui;
+    return 1u;
+}
+
+static uint32_t ContextCreateWithContext(void *moduleContext, void **outContext)
+{
+    UiModuleState *state = (UiModuleState *)moduleContext;
+    if (state == NULL || state->host == NULL || state->host->allocate == NULL ||
+        state->host->free == NULL || outContext == NULL)
+        return 0u;
+    UiOwnedContext *owned = (UiOwnedContext *)state->host->allocate(
+        state->host->context, sizeof(*owned));
+    if (owned == NULL)
+        return 0u;
+    memset(owned, 0, sizeof(*owned));
+    owned->freeFn = state->host->free;
+    owned->freeContext = state->host->context;
+    *outContext = &owned->ui;
     return 1u;
 }
 
@@ -26,9 +58,12 @@ static void ContextDestroy(void *context)
 {
     if (context == NULL)
         return;
-    UiRelease((UiContext *)context);
-    if (moduleHost != NULL && moduleHost->free != NULL)
-        moduleHost->free(moduleHost->context, context);
+    UiOwnedContext *owned = (UiOwnedContext *)context;
+    UiRelease(&owned->ui);
+    if (owned->freeFn != NULL)
+        owned->freeFn(owned->freeContext, owned);
+    else
+        PlatformFree(owned);
 }
 
 static uint32_t Begin(void *context, int32_t width, int32_t height, float mouseX, float mouseY,
@@ -177,63 +212,68 @@ static float TextWidthUtf8(const void *context, const char *text)
     return UiTextWidth((const UiContext *)context, converted);
 }
 
-static const LaiueUiServiceV1 service = {
-    .structSize = sizeof(LaiueUiServiceV1),
-    .abiVersion = LAIUE_UI_SERVICE_ABI_VERSION_1,
-    .contextCreate = ContextCreate,
-    .contextDestroy = ContextDestroy,
-    .begin = Begin,
-    .setClip = SetClip,
-    .clearClip = ClearClip,
-    .rect = Rect,
-    .image = Image,
-    .textUtf8 = TextUtf8,
-    .copyDrawList = CopyDrawList,
-    .getFontAtlas = GetFontAtlas,
-    .textWidthUtf8 = TextWidthUtf8,
-};
-
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL ||
         host->allocate == NULL || host->free == NULL)
         return 0u;
-    moduleHost = host;
-    graphicsService = NULL;
-    *outContext = (void *)&moduleHost;
+    UiModuleState *state = (UiModuleState *)host->allocate(host->context,
+                                                            sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
+    state->service = (LaiueUiServiceV1){
+        .structSize = sizeof(LaiueUiServiceV1),
+        .abiVersion = LAIUE_UI_SERVICE_ABI_VERSION_1,
+        .contextCreate = ContextCreate,
+        .contextDestroy = ContextDestroy,
+        .begin = Begin,
+        .setClip = SetClip,
+        .clearClip = ClearClip,
+        .rect = Rect,
+        .image = Image,
+        .textUtf8 = TextUtf8,
+        .copyDrawList = CopyDrawList,
+        .getFontAtlas = GetFontAtlas,
+        .textWidthUtf8 = TextWidthUtf8,
+        .contextCreateWithContext = ContextCreateWithContext,
+        .context = state,
+    };
+    *outContext = state;
     return 1u;
 }
 
 static uint32_t ModuleStart(void *context)
 {
-    (void)context;
-    if (moduleHost == NULL || moduleHost->queryService == NULL)
+    UiModuleState *state = (UiModuleState *)context;
+    if (state == NULL || state->host == NULL || state->host->queryService == NULL)
         return 0u;
-    graphicsService = NULL;
+    state->graphics = NULL;
     uint32_t version = 0u;
     uint32_t size = 0u;
-    graphicsService = (const LaiueGraphicsDeviceServiceV1 *)moduleHost->queryService(
-        moduleHost->context, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+    state->graphics = (const LaiueGraphicsDeviceServiceV1 *)state->host->queryService(
+        state->host->context, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
         LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
         sizeof(LaiueGraphicsDeviceServiceV1),
         &version, &size);
-    if (graphicsService == NULL ||
+    if (state->graphics == NULL ||
         version < LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1 ||
-        size < sizeof(*graphicsService))
+        size < sizeof(*state->graphics))
     {
-        graphicsService = NULL;
+        state->graphics = NULL;
         return 0u;
     }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_UI_SERVICE_NAME,
         .version = LAIUE_UI_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = sizeof(state->service),
     };
-    if (moduleHost->publishService(moduleHost->context, &published) != LAIUE_MODULE_OK)
+    if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
-        graphicsService = NULL;
+        state->graphics = NULL;
         return 0u;
     }
     return 1u;
@@ -241,17 +281,26 @@ static uint32_t ModuleStart(void *context)
 
 static void ModuleStop(void *context)
 {
-    (void)context;
-    if (moduleHost != NULL && moduleHost->unpublishService != NULL)
-        (void)moduleHost->unpublishService(moduleHost->context, LAIUE_UI_SERVICE_NAME);
-    graphicsService = NULL;
+    UiModuleState *state = (UiModuleState *)context;
+    if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
+        (void)state->host->unpublishService(state->host->context, LAIUE_UI_SERVICE_NAME);
+    if (state != NULL)
+        state->graphics = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleHost = NULL;
-    graphicsService = NULL;
+    UiModuleState *state = (UiModuleState *)context;
+    if (state != NULL)
+    {
+        const LaiueModuleHostV1 *host = state->host;
+        state->host = NULL;
+        state->graphics = NULL;
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
+        else
+            PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_UI_SERVICE_NAME};

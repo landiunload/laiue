@@ -258,8 +258,20 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
             host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
             sizeof(LaiueUiServiceV1), &version, &size);
     Expect(uiService != NULL && version == LAIUE_UI_SERVICE_ABI_VERSION_1 &&
-               size >= sizeof(*uiService) && uiService->contextCreate != NULL,
+               size >= sizeof(*uiService) && uiService->contextCreate != NULL &&
+               uiService->contextDestroy != NULL &&
+               uiService->contextCreateWithContext != NULL &&
+               uiService->context != NULL,
            "UI service is published");
+    void *uiContext = NULL;
+    Expect(uiService->contextCreateWithContext(uiService->context, &uiContext) != 0u &&
+               uiContext != NULL,
+           "UI context uses the owning module instance");
+    uiService->contextDestroy(uiContext);
+    uiContext = NULL;
+    Expect(uiService->contextCreate(&uiContext) != 0u && uiContext != NULL,
+           "legacy UI context creation remains available");
+    uiService->contextDestroy(uiContext);
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 voxelRenderGraph[] = {

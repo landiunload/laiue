@@ -14,6 +14,11 @@
 typedef LaiueGraphicsUiQuadV1 LaiueUiQuadV1;
 
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueUiContextCreateFn)(void **outContext);
+/* Context-aware creation keeps module state instance-owned.  The original
+ * contextCreate remains a compatibility entry point for clients that do not
+ * need a host allocator. */
+typedef uint32_t(LAIUE_MODULE_CALL *LaiueUiContextCreateWithContextFn)(
+    void *moduleContext, void **outContext);
 typedef void(LAIUE_MODULE_CALL *LaiueUiContextDestroyFn)(void *context);
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueUiBeginFn)(
     void *context, int32_t width, int32_t height, float mouseX, float mouseY,
@@ -54,6 +59,8 @@ typedef struct LaiueUiServiceV1
     LaiueUiGetFontAtlasFn getFontAtlas;
     LaiueUiTextWidthUtf8Fn textWidthUtf8;
     uintptr_t reserved[8];
+    LaiueUiContextCreateWithContextFn contextCreateWithContext;
+    void *context;
 } LaiueUiServiceV1;
 
 LAIUE_UI_API const LaiueModuleApiV1 *LaiueUiGetStaticModuleApiV1(void);
