@@ -35,9 +35,15 @@ static World *CreateWithContext(void *moduleContext,
     const WorldBaseProvider *provider)
 {
     LaiueWorldModuleState *state = moduleContext;
-    return state != NULL && state->numeric != NULL
-               ? WorldCreateWithNumericService(provider, state->numeric)
-               : NULL;
+    if (state == NULL || state->numeric == NULL || state->host == NULL)
+        return NULL;
+    WorldAllocator allocator = {
+        .context = state->host->context,
+        .allocate = state->host->allocate,
+        .reallocate = state->host->reallocate,
+        .free = state->host->free,
+    };
+    return WorldCreateWithNumericServiceAndAllocator(provider, state->numeric, &allocator);
 }
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

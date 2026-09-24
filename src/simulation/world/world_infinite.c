@@ -33,6 +33,7 @@ typedef struct LocalChunkCoordinate
 typedef struct CoordinateFrame
 {
     const LaiueNumericServiceV1* numeric;
+    WorldAllocator allocator;
     InfiniteCoord chunkOrigin[3];
     uint32_t referenceCount;
 } CoordinateFrame;
@@ -54,6 +55,7 @@ typedef struct Chunk
     uint32_t deltaCount;
     uint32_t deltaCapacity;
     DeltaEntry* deltas;
+    WorldAllocator allocator;
 } Chunk;
 
 #define WORLD_INITIAL_CAPACITY 32U
@@ -61,6 +63,7 @@ typedef struct Chunk
 struct World
 {
     const LaiueNumericServiceV1* numeric;
+    WorldAllocator allocator;
     PlatformRwLock tableLock;
     GlobalChunkCoordinate* keys;
     Chunk** chunks;
@@ -82,6 +85,45 @@ struct World
     CoordinateFrame* editFrame;
     WorldBaseProvider provider;
 };
+
+static WorldAllocator NormalizeAllocator(const WorldAllocator *allocator)
+{
+    if (allocator != NULL && allocator->allocate != NULL &&
+        allocator->reallocate != NULL && allocator->free != NULL)
+        return *allocator;
+    return (WorldAllocator){0};
+}
+
+static void *WorldAllocateMemory(const WorldAllocator *allocator, size_t size, bool zero)
+{
+    void *memory = allocator != NULL && allocator->allocate != NULL
+                       ? allocator->allocate(allocator->context, (uint64_t)size)
+                       : PlatformAllocate(size, false);
+    if (memory != NULL && zero)
+        memset(memory, 0, size);
+    return memory;
+}
+
+static void *WorldReallocateMemory(const WorldAllocator *allocator, void *memory,
+                                   size_t size, bool zeroNewMemory)
+{
+    void *result = allocator != NULL && allocator->reallocate != NULL
+                       ? allocator->reallocate(allocator->context, memory, (uint64_t)size)
+                       : PlatformReallocate(memory, size, zeroNewMemory);
+    if (result != NULL && zeroNewMemory && memory == NULL)
+        memset(result, 0, size);
+    return result;
+}
+
+static void WorldFreeMemory(const WorldAllocator *allocator, void *memory)
+{
+    if (memory == NULL)
+        return;
+    if (allocator != NULL && allocator->free != NULL)
+        allocator->free(allocator->context, memory);
+    else
+        PlatformFree(memory);
+}
 
 static int64_t ChunkFromBlock(int64_t block)
 {
@@ -147,7 +189,7 @@ static void CoordinateFrameRelease(CoordinateFrame* frame)
         WorldNumericDestroyWithService(frame->numeric,
             &frame->chunkOrigin[axis]);
     }
-    PlatformFree(frame);
+    WorldFreeMemory(&frame->allocator, frame);
 }
 
 static CoordinateFrame* WorldGetEditFrame(World* world)
@@ -157,13 +199,15 @@ static CoordinateFrame* WorldGetEditFrame(World* world)
         return world->editFrame;
     }
 
-    CoordinateFrame* frame = PlatformAllocate(sizeof(*frame), true);
+    CoordinateFrame* frame =
+        (CoordinateFrame *)WorldAllocateMemory(&world->allocator, sizeof(*frame), true);
     if (frame == NULL)
     {
         return NULL;
     }
     frame->referenceCount = 1U;
     frame->numeric = world->numeric;
+    frame->allocator = world->allocator;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         WorldNumericInitWithService(frame->numeric, &frame->chunkOrigin[axis]);
@@ -228,8 +272,8 @@ static void ChunkDestroy(Chunk* chunk)
     {
         return;
     }
-    PlatformFree(chunk->deltas);
-    PlatformFree(chunk);
+    WorldFreeMemory(&chunk->allocator, chunk->deltas);
+    WorldFreeMemory(&chunk->allocator, chunk);
 }
 
 static bool WorldGrow(World* world)
@@ -239,17 +283,17 @@ static bool WorldGrow(World* world)
         return false;
     }
     uint32_t newCapacity = world->capacity * 2U;
-    GlobalChunkCoordinate* newKeys = PlatformAllocate(
-        (size_t)newCapacity * sizeof(*newKeys), true);
-    Chunk** newChunks = PlatformAllocate(
-        (size_t)newCapacity * sizeof(*newChunks), true);
-    bool* newOccupied = PlatformAllocate(
-        (size_t)newCapacity * sizeof(*newOccupied), true);
+    GlobalChunkCoordinate* newKeys = (GlobalChunkCoordinate *)WorldAllocateMemory(
+        &world->allocator, (size_t)newCapacity * sizeof(*newKeys), true);
+    Chunk** newChunks = (Chunk **)WorldAllocateMemory(
+        &world->allocator, (size_t)newCapacity * sizeof(*newChunks), true);
+    bool* newOccupied = (bool *)WorldAllocateMemory(
+        &world->allocator, (size_t)newCapacity * sizeof(*newOccupied), true);
     if (newKeys == NULL || newChunks == NULL || newOccupied == NULL)
     {
-        PlatformFree(newKeys);
-        PlatformFree(newChunks);
-        PlatformFree(newOccupied);
+        WorldFreeMemory(&world->allocator, newKeys);
+        WorldFreeMemory(&world->allocator, newChunks);
+        WorldFreeMemory(&world->allocator, newOccupied);
         return false;
     }
 
@@ -270,9 +314,9 @@ static bool WorldGrow(World* world)
         newOccupied[slot] = true;
     }
 
-    PlatformFree(world->keys);
-    PlatformFree(world->chunks);
-    PlatformFree(world->occupied);
+    WorldFreeMemory(&world->allocator, world->keys);
+    WorldFreeMemory(&world->allocator, world->chunks);
+    WorldFreeMemory(&world->allocator, world->occupied);
     world->keys = newKeys;
     world->chunks = newChunks;
     world->occupied = newOccupied;
@@ -332,12 +376,14 @@ static Chunk* WorldGetOrCreateChunk(
     {
         return NULL;
     }
-    Chunk* chunk = PlatformAllocate(sizeof(*chunk), true);
+    Chunk* chunk =
+        (Chunk *)WorldAllocateMemory(&world->allocator, sizeof(*chunk), true);
     if (chunk == NULL)
     {
         GlobalChunkCoordinateDestroy(&key);
         return NULL;
     }
+    chunk->allocator = world->allocator;
 
     uint32_t mask = world->capacity - 1U;
     uint32_t slot = (uint32_t)(key.hash ^ (key.hash >> 32U)) & mask;
@@ -446,8 +492,9 @@ static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
             return false;
         }
         DeltaEntry* expanded = chunk->deltas == NULL
-            ? PlatformAllocate((size_t)newCapacity * sizeof(*expanded), false)
-            : PlatformReallocate(chunk->deltas,
+            ? (DeltaEntry *)WorldAllocateMemory(&chunk->allocator,
+                (size_t)newCapacity * sizeof(*expanded), false)
+            : (DeltaEntry *)WorldReallocateMemory(&chunk->allocator, chunk->deltas,
                 (size_t)newCapacity * sizeof(*expanded), false);
         if (expanded == NULL)
         {
@@ -505,21 +552,29 @@ World* WorldCreate(const WorldBaseProvider* provider)
 World* WorldCreateWithNumericService(const WorldBaseProvider* provider,
     const LaiueNumericServiceV1* numeric)
 {
+    return WorldCreateWithNumericServiceAndAllocator(provider, numeric, NULL);
+}
+
+World* WorldCreateWithNumericServiceAndAllocator(const WorldBaseProvider* provider,
+    const LaiueNumericServiceV1* numeric, const WorldAllocator* allocator)
+{
     if (provider != NULL && provider->getBlock == NULL)
     {
         return NULL;
     }
-    World* world = PlatformAllocate(sizeof(*world), true);
+    WorldAllocator resolvedAllocator = NormalizeAllocator(allocator);
+    World* world = (World *)WorldAllocateMemory(&resolvedAllocator, sizeof(*world), true);
     if (world == NULL)
     {
         return NULL;
     }
     if (!PlatformRwLockInitialize(&world->tableLock))
     {
-        PlatformFree(world);
+        WorldFreeMemory(&resolvedAllocator, world);
         return NULL;
     }
     world->numeric = numeric;
+    world->allocator = resolvedAllocator;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         WorldNumericInitWithService(world->numeric, &world->blockOrigin[axis]);
@@ -527,12 +582,12 @@ World* WorldCreateWithNumericService(const WorldBaseProvider* provider,
     }
 
     world->capacity = WORLD_INITIAL_CAPACITY;
-    world->keys = PlatformAllocate(
-        (size_t)world->capacity * sizeof(*world->keys), true);
-    world->chunks = PlatformAllocate(
-        (size_t)world->capacity * sizeof(*world->chunks), true);
-    world->occupied = PlatformAllocate(
-        (size_t)world->capacity * sizeof(*world->occupied), true);
+    world->keys = (GlobalChunkCoordinate *)WorldAllocateMemory(
+        &world->allocator, (size_t)world->capacity * sizeof(*world->keys), true);
+    world->chunks = (Chunk **)WorldAllocateMemory(
+        &world->allocator, (size_t)world->capacity * sizeof(*world->chunks), true);
+    world->occupied = (bool *)WorldAllocateMemory(
+        &world->allocator, (size_t)world->capacity * sizeof(*world->occupied), true);
     if (world->keys == NULL || world->chunks == NULL
         || world->occupied == NULL)
     {
@@ -575,11 +630,11 @@ void WorldDestroy(World* world)
         WorldNumericDestroyWithService(world->numeric,
             &world->chunkOrigin[axis]);
     }
-    PlatformFree(world->keys);
-    PlatformFree(world->chunks);
-    PlatformFree(world->occupied);
+    WorldFreeMemory(&world->allocator, world->keys);
+    WorldFreeMemory(&world->allocator, world->chunks);
+    WorldFreeMemory(&world->allocator, world->occupied);
     PlatformRwLockDestroy(&world->tableLock);
-    PlatformFree(world);
+    WorldFreeMemory(&world->allocator, world);
 }
 
 bool WorldRebase(World* world,
@@ -845,6 +900,7 @@ typedef struct WorldBatchChunk
 {
     LocalChunkCoordinate coordinate;
     Chunk* existing;
+    WorldAllocator allocator;
     DeltaEntry* stagedDeltas;
     uint32_t stagedCount;
     uint32_t stagedCapacity;
@@ -860,9 +916,9 @@ static bool LocalChunkCoordinateEqual(
     return left.x == right.x && left.y == right.y && left.z == right.z;
 }
 
-static void WorldBatchCleanup(WorldBatchChunk* chunks, uint32_t count)
+static void WorldBatchCleanup(World* world, WorldBatchChunk* chunks, uint32_t count)
 {
-    if (chunks == NULL)
+    if (world == NULL || chunks == NULL)
     {
         return;
     }
@@ -870,15 +926,15 @@ static void WorldBatchCleanup(WorldBatchChunk* chunks, uint32_t count)
     {
         if (chunks[index].newChunk != NULL)
         {
-            PlatformFree(chunks[index].newChunk);
+            WorldFreeMemory(&world->allocator, chunks[index].newChunk);
         }
         if (chunks[index].newKeyReady)
         {
             GlobalChunkCoordinateDestroy(&chunks[index].newKey);
         }
-        PlatformFree(chunks[index].stagedDeltas);
+        WorldFreeMemory(&world->allocator, chunks[index].stagedDeltas);
     }
-    PlatformFree(chunks);
+    WorldFreeMemory(&world->allocator, chunks);
 }
 
 static bool WorldBatchSetValue(WorldBatchChunk* batch,
@@ -888,6 +944,7 @@ static bool WorldBatchSetValue(WorldBatchChunk* batch,
         .deltaCount = batch->stagedCount,
         .deltaCapacity = batch->stagedCapacity,
         .deltas = batch->stagedDeltas,
+        .allocator = batch->allocator,
     };
     bool succeeded = replacement == base
         ? (ChunkRemoveDelta(&staged, localIndex), true)
@@ -928,8 +985,8 @@ bool WorldApplyBlockBatch(World* world,
         }
     }
 
-    WorldBatchChunk* chunks = PlatformAllocate(
-        (size_t)count * sizeof(*chunks), true);
+    WorldBatchChunk* chunks = (WorldBatchChunk *)WorldAllocateMemory(
+        &world->allocator, (size_t)count * sizeof(*chunks), true);
     if (chunks == NULL)
     {
         return false;
@@ -961,12 +1018,14 @@ bool WorldApplyBlockBatch(World* world,
         {
             batch = &chunks[chunkCount++];
             batch->coordinate = coordinate;
+            batch->allocator = world->allocator;
             Chunk** entry = WorldFindEntry(world, coordinate);
             batch->existing = entry == NULL ? NULL : *entry;
             uint32_t existingCount = batch->existing == NULL
                 ? 0U : batch->existing->deltaCount;
             batch->stagedCapacity = existingCount + count;
-            batch->stagedDeltas = PlatformAllocate(
+            batch->stagedDeltas = (DeltaEntry *)WorldAllocateMemory(
+                &world->allocator,
                 (size_t)batch->stagedCapacity * sizeof(DeltaEntry), false);
             if (batch->stagedDeltas == NULL)
             {
@@ -989,6 +1048,7 @@ bool WorldApplyBlockBatch(World* world,
             .deltaCount = batch->stagedCount,
             .deltaCapacity = batch->stagedCapacity,
             .deltas = batch->stagedDeltas,
+            .allocator = batch->allocator,
         };
         BlockType base = WorldBaseBlock(world,
             mutation->block[0], mutation->block[1], mutation->block[2]);
@@ -1032,7 +1092,8 @@ bool WorldApplyBlockBatch(World* world,
         {
             continue;
         }
-        batch->newChunk = PlatformAllocate(sizeof(*batch->newChunk), true);
+        batch->newChunk = (Chunk *)WorldAllocateMemory(
+            &world->allocator, sizeof(*batch->newChunk), true);
         if (batch->newChunk == NULL
             || !GlobalChunkCoordinateTryCreate(
                 &batch->newKey, world, batch->coordinate))
@@ -1040,6 +1101,7 @@ bool WorldApplyBlockBatch(World* world,
             succeeded = false;
             break;
         }
+        batch->newChunk->allocator = world->allocator;
         batch->newKeyReady = true;
     }
 
@@ -1066,7 +1128,7 @@ bool WorldApplyBlockBatch(World* world,
                     }
                     continue;
                 }
-                PlatformFree(batch->existing->deltas);
+                WorldFreeMemory(&world->allocator, batch->existing->deltas);
                 batch->existing->deltas = batch->stagedDeltas;
                 batch->existing->deltaCount = batch->stagedCount;
                 batch->existing->deltaCapacity = batch->stagedCapacity;
@@ -1100,7 +1162,7 @@ bool WorldApplyBlockBatch(World* world,
             world->revision, totalChanged);
     }
     PlatformRwLockReleaseExclusive(&world->tableLock);
-    WorldBatchCleanup(chunks, chunkCount);
+    WorldBatchCleanup(world, chunks, chunkCount);
     return succeeded;
 }
 

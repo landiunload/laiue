@@ -13,6 +13,18 @@ typedef struct World World;
 typedef uint8_t BlockType;
 struct LaiueNumericServiceV1;
 
+typedef void *(*WorldAllocateFn)(void *context, uint64_t size);
+typedef void *(*WorldReallocateFn)(void *context, void *memory, uint64_t size);
+typedef void(*WorldFreeFn)(void *context, void *memory);
+
+typedef struct WorldAllocator
+{
+    void *context;
+    WorldAllocateFn allocate;
+    WorldReallocateFn reallocate;
+    WorldFreeFn free;
+} WorldAllocator;
+
 // Zero is the only material reserved by the engine. Values 1..255 are owned
 // by the embedding application and its content catalog.
 #define BLOCK_AIR 0U
@@ -82,6 +94,14 @@ LAIUE_WORLD_API World* WorldCreate(const WorldBaseProvider* provider);
 LAIUE_WORLD_API World* WorldCreateWithNumericService(
     const WorldBaseProvider* provider,
     const struct LaiueNumericServiceV1* numeric);
+/* Context-bound variant used by the module provider.  The callbacks are
+ * copied into the opaque world and used for every allocation, including
+ * sparse chunks and rebasing frames.  A zero/invalid table falls back to the
+ * platform allocator for the standalone compatibility path. */
+LAIUE_WORLD_API World* WorldCreateWithNumericServiceAndAllocator(
+    const WorldBaseProvider* provider,
+    const struct LaiueNumericServiceV1* numeric,
+    const WorldAllocator* allocator);
 LAIUE_WORLD_API void WorldDestroy(World* world);
 
 // Shifts the local origin by whole chunks. Infinite absolute coordinates and
