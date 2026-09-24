@@ -746,6 +746,13 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
         return;
     const uint32_t index = DeviceHandleSlot(handle) - 1u;
     const uint8_t kind = state->kinds[index];
+    /* Draw commands may already reference backend descriptors in this frame.
+     * The void destroy ABI cannot report a deferred-release token, so keep
+     * texture/sampler handles live until EndFrame rather than invalidating a
+     * descriptor set or GPU heap entry mid-recording. */
+    if (state->frameActive &&
+        (kind == DEVICE_HANDLE_TEXTURE || kind == DEVICE_HANDLE_SAMPLER))
+        return;
     /* A shader remains owned by the device while any pipeline references it.
      * The void destroy ABI cannot report an error, so a premature release is
      * a safe no-op instead of turning a live pipeline into a dangling handle. */
@@ -871,7 +878,9 @@ static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
 static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
                            LaiueGraphicsHandle vertexBuffer,
                            const float origin[3], float scale,
-                           uint32_t firstVertex, uint32_t vertexCount)
+                           uint32_t firstVertex, uint32_t vertexCount,
+                           const RendererTexture *texture,
+                           const RendererSampler *sampler)
 {
     if (state == NULL || vertexBuffer == 0u)
         return true;
@@ -885,9 +894,9 @@ static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
             (vertexCount != UINT32_MAX &&
              vertexCount > available - firstVertex))
             return false;
-        RendererDrawGenericMeshRange(state->renderer, state->meshes[index], origin,
-                                     scale == 0.0f ? 1.0f : scale, firstVertex,
-                                     vertexCount);
+        RendererDrawGenericMeshRangeBound(
+            state->renderer, state->meshes[index], origin,
+            scale == 0.0f ? 1.0f : scale, firstVertex, vertexCount, texture, sampler);
         return true;
     }
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u)
@@ -931,7 +940,8 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
                                     item->indexCount, item->vertexOffset))
             return 0u;
         if (!DeviceDrawMesh(state, item->vertexBuffer, NULL, 1.0f, 0u,
-                            item->indexBuffer != 0u ? item->indexCount : UINT32_MAX))
+                            item->indexBuffer != 0u ? item->indexCount : UINT32_MAX,
+                            NULL, NULL))
             return 0u;
     }
     state->submittedItems += itemCount;
@@ -1147,6 +1157,22 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
             !DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
                                 item->indexBuffer, texture, sampler))
             return 0u;
+        const RendererTexture *textureResource = NULL;
+        const RendererSampler *samplerResource = NULL;
+        if (texture != 0u)
+        {
+            textureResource = (const RendererTexture *)
+                state->backendResources[DeviceHandleSlot(texture) - 1u];
+            if (textureResource == NULL)
+                return 0u;
+        }
+        if (sampler != 0u)
+        {
+            samplerResource = (const RendererSampler *)
+                state->backendResources[DeviceHandleSlot(sampler) - 1u];
+            if (samplerResource == NULL)
+                return 0u;
+        }
         if (item->vertexBuffer != 0u &&
             DeviceBufferIsGeneric(state, DeviceHandleSlot(item->vertexBuffer) - 1u))
         {
@@ -1159,17 +1185,18 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
                     return 0u;
                 if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
                                     item->scale == 0.0f ? 1.0f : item->scale, 0u,
-                                    item->indexCount))
+                                    item->indexCount, textureResource, samplerResource))
                     return 0u;
             }
             else if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
                                      item->scale == 0.0f ? 1.0f : item->scale, 0u,
-                                     item->indexCount == 0u ? UINT32_MAX : item->indexCount))
+                                     item->indexCount == 0u ? UINT32_MAX : item->indexCount,
+                                     textureResource, samplerResource))
                 return 0u;
         }
         else if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
                                  item->scale == 0.0f ? 1.0f : item->scale, 0u,
-                                 UINT32_MAX))
+                                 UINT32_MAX, textureResource, samplerResource))
             return 0u;
     }
     state->submittedItems += itemCount;

@@ -362,6 +362,35 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
         pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
     Expect(!(genericCentre[0] > 250u && genericCentre[1] < 5u && genericCentre[2] < 5u),
            "the generic mesh centre must not remain the sky colour");
+
+    // Generic draws may override the default voxel texture and sampler.  A
+    // real 2D image is deliberately used here: binding it to the old
+    // Texture2DArray declaration would be invalid on both backends.
+    RendererTexture *genericTexture = RendererCreateTexture(
+        renderer, 1u, 1u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+    RendererSampler *genericSampler = RendererCreateSampler(
+        renderer, LAIUE_GRAPHICS_FILTER_NEAREST, LAIUE_GRAPHICS_FILTER_NEAREST,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_CLAMP,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP);
+    const uint8_t customPixel[4] = {0u, 255u, 0u, 255u};
+    Expect(genericTexture != NULL && genericSampler != NULL &&
+               RendererUploadTexture(renderer, genericTexture, customPixel,
+                                     sizeof(customPixel), sizeof(customPixel)),
+           "the generic resource texture and sampler must be uploadable");
+    Expect(RendererBeginFrame(renderer, &setup), "bound generic frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 1.0f, 0u, 3u,
+                                      genericTexture, genericSampler);
+    Expect(RendererEndFrame(renderer), "bound generic frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "bound generic frame could not be captured");
+    const uint8_t *boundCentre =
+        pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(boundCentre[1] > boundCentre[0] + 32u &&
+               boundCentre[1] > boundCentre[2] + 32u,
+           "the bound generic texture must reach the pixel shader");
+    RendererDestroySampler(renderer, genericSampler);
+    RendererDestroyTexture(renderer, genericTexture);
     RendererDestroyMesh(renderer, genericMesh);
 
     // === Инстансный путь ===

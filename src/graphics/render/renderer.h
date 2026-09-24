@@ -259,6 +259,15 @@ LAIUE_RENDER_API void RendererDrawGenericMesh(Renderer *renderer,
 LAIUE_RENDER_API void RendererDrawGenericMeshRange(Renderer *renderer,
     const RendererMesh *mesh, const float originRelative[3], float scale,
     uint32_t firstVertex, uint32_t vertexCount);
+/* Optional per-draw resources for the generic 2D-textured path.  NULL keeps
+ * the renderer's neutral/default resource, preserving the legacy entrypoint. */
+LAIUE_RENDER_API void RendererDrawGenericMeshBound(Renderer *renderer,
+    const RendererMesh *mesh, const float originRelative[3], float scale,
+    const RendererTexture *texture, const RendererSampler *sampler);
+LAIUE_RENDER_API void RendererDrawGenericMeshRangeBound(Renderer *renderer,
+    const RendererMesh *mesh, const float originRelative[3], float scale,
+    uint32_t firstVertex, uint32_t vertexCount,
+    const RendererTexture *texture, const RendererSampler *sampler);
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
 

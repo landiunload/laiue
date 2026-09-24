@@ -109,6 +109,7 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define INSTANCE_CHUNK_BYTES (1u * 1024u * 1024u)
 #define INSTANCE_MAX_BYTES_PER_FRAME (64u * 1024u * 1024u)
 #define INSTANCE_MAX_CHUNKS_PER_FRAME 64u
+#define GENERIC_DESCRIPTOR_SET_CAPACITY 256u
 // Кольцо констант: D3D12 переписывает корневые константы на каждый
 // вызов отрисовки, у Vulkan та же роль у uniform-буфера с динамическим
 // смещением, поэтому на кадр нужен свой диапазон.
@@ -181,11 +182,13 @@ typedef struct GpuImage
 
 struct RendererTexture
 {
+    Renderer *owner;
     GpuImage image;
 };
 
 struct RendererSampler
 {
+    Renderer *owner;
     VkSampler sampler;
 };
 
@@ -320,6 +323,8 @@ struct Renderer
     VkPipeline uiPipeline;
     VkDescriptorSet resolveSets[FRAME_COUNT];
     VkDescriptorSet uiSets[FRAME_COUNT];
+    VkDescriptorSet genericSets[FRAME_COUNT][GENERIC_DESCRIPTOR_SET_CAPACITY];
+    uint32_t genericSetCount[FRAME_COUNT];
     VkSampler sampler;
 
     // Нейтральные заглушки: шейдер статически читает все свои ресурсы,
@@ -1463,9 +1468,10 @@ static void WriteBufferDescriptor(Renderer *renderer, VkDescriptorSet set, uint3
     vkUpdateDescriptorSets(renderer->device, 1u, &write, 0u, NULL);
 }
 
-static void WriteSamplerDescriptor(Renderer *renderer, VkDescriptorSet set)
+static void WriteSamplerDescriptorValue(Renderer *renderer, VkDescriptorSet set,
+                                        VkSampler sampler)
 {
-    VkDescriptorImageInfo imageInfo = { .sampler = renderer->sampler };
+    VkDescriptorImageInfo imageInfo = { .sampler = sampler };
     VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set,
@@ -1475,6 +1481,11 @@ static void WriteSamplerDescriptor(Renderer *renderer, VkDescriptorSet set)
         .pImageInfo = &imageInfo,
     };
     vkUpdateDescriptorSets(renderer->device, 1u, &write, 0u, NULL);
+}
+
+static void WriteSamplerDescriptor(Renderer *renderer, VkDescriptorSet set)
+{
+    WriteSamplerDescriptorValue(renderer, set, renderer->sampler);
 }
 
 // Текущие текстуры блоков: до загрузки пака шейдер читает нейтральную
@@ -1530,6 +1541,64 @@ static void PopulateBlockDescriptorSet(Renderer *renderer, GeometryPoolBlock *bl
     WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
                          ActiveBlockNormalView(renderer));
     WriteSamplerDescriptor(renderer, set);
+}
+
+static void FreeGenericDescriptorSets(Renderer *renderer, uint32_t frameIndex)
+{
+    if (renderer == NULL || frameIndex >= FRAME_COUNT)
+        return;
+    for (uint32_t index = 0u; index < renderer->genericSetCount[frameIndex]; ++index)
+    {
+        VkDescriptorSet set = renderer->genericSets[frameIndex][index];
+        if (set != VK_NULL_HANDLE)
+            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, 1u, &set);
+        renderer->genericSets[frameIndex][index] = VK_NULL_HANDLE;
+    }
+    renderer->genericSetCount[frameIndex] = 0u;
+}
+
+static VkDescriptorSet CreateGenericDescriptorSet(
+    Renderer *renderer, const RendererMesh *mesh, const RendererTexture *texture,
+    const RendererSampler *sampler)
+{
+    if (renderer == NULL || mesh == NULL || mesh->blockIndex >= renderer->poolBlockCount ||
+        renderer->genericSetCount[renderer->frameIndex] >= GENERIC_DESCRIPTOR_SET_CAPACITY ||
+        (texture != NULL &&
+         (texture->owner != renderer || texture->image.view == VK_NULL_HANDLE)) ||
+        (sampler != NULL &&
+         (sampler->owner != renderer || sampler->sampler == VK_NULL_HANDLE)))
+        return VK_NULL_HANDLE;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo allocateInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = renderer->descriptorPool,
+        .descriptorSetCount = 1u,
+        .pSetLayouts = &renderer->chunkSetLayout,
+    };
+    if (vkAllocateDescriptorSets(renderer->device, &allocateInfo, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+
+    const uint32_t frameIndex = renderer->frameIndex;
+    const GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
+    WriteBufferDescriptor(renderer, set, BINDING_CONSTANTS,
+                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                          renderer->constantBuffers[frameIndex].buffer, sizeof(ChunkConstants));
+    WriteBufferDescriptor(renderer, set, BINDING_QUAD_BUFFER,
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, block->buffer.buffer,
+                          block->buffer.sizeBytes > 0u ? VK_WHOLE_SIZE : 0u);
+    WriteBufferDescriptor(renderer, set, BINDING_INSTANCES,
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+                          renderer->instanceBuffers[frameIndex][0].buffer, VK_WHOLE_SIZE);
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
+                         texture != NULL ? texture->image.view
+                                          : renderer->fallbackImage.view);
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
+                         ActiveBlockNormalView(renderer));
+    WriteSamplerDescriptorValue(renderer, set,
+                                sampler != NULL ? sampler->sampler : renderer->sampler);
+    renderer->genericSets[frameIndex][renderer->genericSetCount[frameIndex]++] = set;
+    return set;
 }
 
 static bool EnsureBlockDescriptorSets(Renderer *renderer, uint32_t blockIndex)
@@ -2637,18 +2706,19 @@ static bool CreateDescriptorPool(Renderer *renderer)
 {
     const uint32_t chunkSetCount = MAX_POOL_BLOCKS * FRAME_COUNT *
                                    INSTANCE_MAX_CHUNKS_PER_FRAME;
+    const uint32_t genericSetCount = FRAME_COUNT * GENERIC_DESCRIPTOR_SET_CAPACITY;
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, chunkSetCount + 4u },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, chunkSetCount * 2u + 4u },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, chunkSetCount * 2u + 8u },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, chunkSetCount + 4u },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, chunkSetCount + genericSetCount + 4u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, chunkSetCount * 2u + genericSetCount * 2u + 4u },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, chunkSetCount * 2u + genericSetCount + 8u },
+        { VK_DESCRIPTOR_TYPE_SAMPLER, chunkSetCount + genericSetCount + 4u },
     };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         // Наборы блоков пула освобождаются вместе с миром, а не только
         // вместе с рендерером, поэтому пул обязан это разрешать.
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = chunkSetCount + 2u * FRAME_COUNT,
+        .maxSets = chunkSetCount + genericSetCount + 2u * FRAME_COUNT,
         .poolSizeCount = 4u,
         .pPoolSizes = sizes,
     };
@@ -3124,6 +3194,7 @@ RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width
         PlatformFree(texture);
         return NULL;
     }
+    texture->owner = renderer;
     return texture;
 }
 
@@ -3131,7 +3202,8 @@ bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                   const void *data, uint64_t sizeBytes,
                                   uint32_t rowPitchBytes)
 {
-    if (renderer == NULL || texture == NULL || data == NULL || renderer->frameRecording ||
+    if (renderer == NULL || texture == NULL || texture->owner != renderer || data == NULL ||
+        renderer->frameRecording ||
         texture->image.image == VK_NULL_HANDLE || rowPitchBytes == 0u ||
         texture->image.width > UINT32_MAX / 4u ||
         rowPitchBytes != texture->image.width * 4u ||
@@ -3187,12 +3259,15 @@ RendererSampler *RendererCreateSampler_Vulkan(Renderer *renderer, uint32_t minFi
         PlatformFree(sampler);
         return NULL;
     }
+    sampler->owner = renderer;
     return sampler;
 }
 
 void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler)
 {
     if (sampler == NULL)
+        return;
+    if (renderer != NULL && sampler->owner != renderer)
         return;
     if (renderer != NULL && renderer->device != VK_NULL_HANDLE &&
         sampler->sampler != VK_NULL_HANDLE)
@@ -3206,6 +3281,8 @@ void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler)
 void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
+        return;
+    if (renderer != NULL && texture->owner != renderer)
         return;
     if (renderer != NULL && renderer->device != VK_NULL_HANDLE)
         vkDeviceWaitIdle(renderer->device);
@@ -3323,7 +3400,9 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
 
 static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh,
                                     const float originRelative[3], float scale,
-                                    uint32_t firstVertex, uint32_t vertexCount)
+                                    uint32_t firstVertex, uint32_t vertexCount,
+                                    const RendererTexture *texture,
+                                    const RendererSampler *sampler)
 {
     if (renderer == NULL || mesh == NULL || !mesh->generic ||
         !renderer->renderingActive || renderer->genericPipeline == VK_NULL_HANDLE ||
@@ -3332,8 +3411,7 @@ static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh
         return;
     if (vertexCount == UINT32_MAX)
         vertexCount = mesh->vertexCount - firstVertex;
-    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
-    VkDescriptorSet set = block->sets[0][renderer->frameIndex];
+    VkDescriptorSet set = CreateGenericDescriptorSet(renderer, mesh, texture, sampler);
     if (set == VK_NULL_HANDLE)
         return;
     renderer->chunkConstants.chunkOriginRelative[0] =
@@ -3385,7 +3463,17 @@ void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh
 {
     DrawGenericMeshInternal(renderer, mesh, originRelative,
                             scale == 0.0f ? 1.0f : scale, firstVertex,
-                            vertexCount);
+                            vertexCount, NULL, NULL);
+}
+
+void RendererDrawGenericMeshRangeBound_Vulkan(
+    Renderer *renderer, const RendererMesh *mesh, const float originRelative[3], float scale,
+    uint32_t firstVertex, uint32_t vertexCount, const RendererTexture *texture,
+    const RendererSampler *sampler)
+{
+    DrawGenericMeshInternal(renderer, mesh, originRelative,
+                            scale == 0.0f ? 1.0f : scale, firstVertex,
+                            vertexCount, texture, sampler);
 }
 
 void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -3530,6 +3618,10 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
 
     vkWaitForFences(renderer->device, 1u, &renderer->frameFences[renderer->frameIndex], VK_TRUE,
                     UINT64_MAX);
+    /* Descriptor sets allocated by generic draws belong to this frame slot.
+     * Its fence has completed, so they can be returned before recording the
+     * next command buffer without touching sets used by the other slot. */
+    FreeGenericDescriptorSets(renderer, renderer->frameIndex);
 
     // Свёрнутое окно (нулевой запрошенный размер): кадр пропускаем без
     // ошибки, пока размер не восстановят. Для offscreen это недостижимо.

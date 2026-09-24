@@ -341,12 +341,30 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(resourceDevice->createSampler(resourceDevice, &samplerDescription, &sampler) != 0u &&
                sampler != 0u,
            "graphics device stores sampler descriptor state");
+    LaiueGraphicsBufferDescV1 boundVertexDescription = {
+        sizeof(boundVertexDescription), LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+        3u * sizeof(LaiueGraphicsVertexV2)};
+    LaiueGraphicsHandle boundVertexBuffer = 0u;
+    static const LaiueGraphicsVertexV2 boundVertices[3] = {
+        {{-0.75f, -0.75f, 0.0f}, {0.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+        {{ 0.75f, -0.75f, 0.0f}, {1.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+        {{ 0.00f,  0.75f, 0.0f}, {0.5f, 1.0f}, UINT32_C(0xFFFFFFFF)},
+    };
+    LaiueGraphicsBufferUploadV1 boundVertexUpload = {
+        sizeof(boundVertexUpload), 0u, 0u, boundVertices, sizeof(boundVertices)};
+    Expect(resourceDevice->createBuffer(resourceDevice, &boundVertexDescription,
+                                         &boundVertexBuffer) != 0u &&
+               boundVertexBuffer != 0u,
+           "graphics device creates a generic vertex buffer for resource binding");
+    boundVertexUpload.buffer = boundVertexBuffer;
+    Expect(resourceDevice->uploadBuffer(resourceDevice, &boundVertexUpload) != 0u,
+           "graphics device uploads the generic vertex buffer for resource binding");
     Expect(resourceDevice->beginFrame(resourceDevice, 16u, 16u) != 0u,
            "graphics device begins a resource-binding frame");
     LaiueGraphicsDrawItemV2 boundItem = {
         .structSize = sizeof(boundItem),
         .pipeline = 0u,
-        .vertexBuffer = 0u,
+        .vertexBuffer = boundVertexBuffer,
         .indexBuffer = 0u,
         .texture = texture,
         .sampler = sampler,
@@ -355,6 +373,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
            "graphics device validates texture and sampler bindings");
     Expect(resourceDevice->endFrame(resourceDevice) != 0u,
            "graphics device ends a resource-binding frame");
+    resourceDevice->destroyHandle(resourceDevice, boundVertexBuffer);
     resourceDevice->destroyHandle(resourceDevice, texture);
     resourceDevice->destroyHandle(resourceDevice, sampler);
     fallbackDeviceV2->destroyDevice(resourceDevice);

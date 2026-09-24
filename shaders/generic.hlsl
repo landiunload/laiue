@@ -11,8 +11,11 @@ cbuffer FrameConstants : register(b0)
 };
 
 ByteAddressBuffer genericVertices : register(t0);
-Texture2DArray blockTextures : register(t1);
-SamplerState blockSampler : register(s0);
+/* Generic resources are ordinary 2D images.  The voxel path has its own
+ * Texture2DArray declarations in chunk.hlsl; sharing that type here made a
+ * public 2D texture handle incompatible with both backends. */
+Texture2D genericTexture : register(t1);
+SamplerState genericSampler : register(s0);
 
 struct GenericPixelInput
 {
@@ -43,5 +46,5 @@ GenericPixelInput VSMain(uint vertexId : SV_VertexID)
 
 float4 PSMain(GenericPixelInput input) : SV_TARGET
 {
-    return blockTextures.Sample(blockSampler, float3(input.uv, 0.0)) * input.color;
+    return genericTexture.Sample(genericSampler, input.uv) * input.color;
 }

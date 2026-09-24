@@ -171,6 +171,17 @@ static void DrawMeshFrame(Renderer *renderer, RendererFrameSetup *setup, Rendere
     Expect(RendererEndFrame(renderer), "a mesh frame could not end");
 }
 
+static void DrawBoundGenericFrame(Renderer *renderer, RendererFrameSetup *setup,
+                                  RendererMesh *mesh, RendererTexture *texture,
+                                  RendererSampler *sampler)
+{
+    Expect(RendererBeginFrame(renderer, setup), "a bound generic frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRangeBound(renderer, mesh, NULL, 1.0f, 0u, 3u,
+                                      texture, sampler);
+    Expect(RendererEndFrame(renderer), "a bound generic frame could not end");
+}
+
 // Первый пиксель кадра только с очисткой обязан быть цветом неба (0,0,1).
 // Это отличает по-настоящему записанный кадр от цели, которую «успешно»
 // прочитали, но вовсе не рисовали.
@@ -522,6 +533,23 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
                "both backends must create native sampler resources");
         RendererMesh *d3d12Mesh = CreateUnitMesh(d3d12);
         RendererMesh *vulkanMesh = CreateUnitMesh(vulkan);
+        static const RendererGenericVertex genericVertices[3] = {
+            {{-0.75f, -0.75f, 0.0f}, {0.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+            {{ 0.75f, -0.75f, 0.0f}, {1.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+            {{ 0.00f,  0.75f, 0.0f}, {0.5f, 1.0f}, UINT32_C(0xFFFFFFFF)},
+        };
+        RendererMesh *d3d12Generic = RendererCreateGenericMesh(
+            d3d12, genericVertices, 3u);
+        RendererMesh *vulkanGeneric = RendererCreateGenericMesh(
+            vulkan, genericVertices, 3u);
+        Expect(d3d12Generic != NULL && vulkanGeneric != NULL,
+               "both backends must create generic meshes for resource bindings");
+
+        // The first scene frame uses the user texture/sampler on both
+        // providers.  This exercises the descriptor-table path, not just
+        // resource creation and ownership checks.
+        DrawBoundGenericFrame(d3d12, &setup, d3d12Generic, d3d12Texture, d3d12Sampler);
+        DrawBoundGenericFrame(vulkan, &setup, vulkanGeneric, vulkanTexture, vulkanSampler);
 
         for (uint32_t frame = 0u; frame < 4u; ++frame)
         {
@@ -533,6 +561,8 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
 
         RendererDestroyMesh(d3d12, d3d12Mesh);
         RendererDestroyMesh(vulkan, vulkanMesh);
+        RendererDestroyMesh(d3d12, d3d12Generic);
+        RendererDestroyMesh(vulkan, vulkanGeneric);
         RendererDestroyTexture(d3d12, d3d12Texture);
         RendererDestroyTexture(vulkan, vulkanTexture);
         RendererDestroySampler(d3d12, d3d12Sampler);

@@ -172,6 +172,14 @@ extern void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
 extern void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
                                           const float originRelative[3], float scale,
                                           uint32_t firstVertex, uint32_t vertexCount);
+extern void RendererDrawGenericMeshRangeBound_D3D12(Renderer *renderer,
+                                                    const RendererMesh *mesh,
+                                                    const float originRelative[3],
+                                                    float scale,
+                                                    uint32_t firstVertex,
+                                                    uint32_t vertexCount,
+                                                    const RendererTexture *texture,
+                                                    const RendererSampler *sampler);
 extern void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mesh, const RendererMeshInstance* instances, uint32_t instanceCount);
 extern void RendererResize_D3D12(Renderer* renderer, int32_t width, int32_t height);
 extern bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -223,6 +231,14 @@ extern void RendererDrawMesh_Vulkan(Renderer* renderer, const RendererMesh* mesh
 extern void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                                            const float originRelative[3], float scale,
                                            uint32_t firstVertex, uint32_t vertexCount);
+extern void RendererDrawGenericMeshRangeBound_Vulkan(Renderer *renderer,
+                                                     const RendererMesh *mesh,
+                                                     const float originRelative[3],
+                                                     float scale,
+                                                     uint32_t firstVertex,
+                                                     uint32_t vertexCount,
+                                                     const RendererTexture *texture,
+                                                     const RendererSampler *sampler);
 extern void RendererDrawMeshInstances_Vulkan(Renderer* renderer, const RendererMesh* mesh, const RendererMeshInstance* instances, uint32_t instanceCount);
 extern void RendererResize_Vulkan(Renderer* renderer, int32_t width, int32_t height);
 extern bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -734,26 +750,45 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh, const float 
 void RendererDrawGenericMesh(Renderer *renderer, const RendererMesh *mesh,
                              const float originRelative[3], float scale)
 {
-    RendererDrawGenericMeshRange(renderer, mesh, originRelative, scale, 0u,
-                                  UINT32_MAX);
+    RendererDrawGenericMeshRangeBound(renderer, mesh, originRelative, scale, 0u,
+                                      UINT32_MAX, NULL, NULL);
 }
 
 void RendererDrawGenericMeshRange(Renderer *renderer, const RendererMesh *mesh,
                                   const float originRelative[3], float scale,
                                   uint32_t firstVertex, uint32_t vertexCount)
 {
+    RendererDrawGenericMeshRangeBound(renderer, mesh, originRelative, scale,
+                                      firstVertex, vertexCount, NULL, NULL);
+}
+
+void RendererDrawGenericMeshBound(Renderer *renderer, const RendererMesh *mesh,
+                                  const float originRelative[3], float scale,
+                                  const RendererTexture *texture,
+                                  const RendererSampler *sampler)
+{
+    RendererDrawGenericMeshRangeBound(renderer, mesh, originRelative, scale, 0u,
+                                      UINT32_MAX, texture, sampler);
+}
+
+void RendererDrawGenericMeshRangeBound(Renderer *renderer, const RendererMesh *mesh,
+                                       const float originRelative[3], float scale,
+                                       uint32_t firstVertex, uint32_t vertexCount,
+                                       const RendererTexture *texture,
+                                       const RendererSampler *sampler)
+{
     switch (LookupBackend(renderer))
     {
 #if defined(LAIUE_RENDER_HAS_D3D12)
     case RENDERER_BACKEND_D3D12:
-        RendererDrawGenericMesh_D3D12(renderer, mesh, originRelative, scale,
-                                       firstVertex, vertexCount);
+        RendererDrawGenericMeshRangeBound_D3D12(renderer, mesh, originRelative, scale,
+                                                firstVertex, vertexCount, texture, sampler);
         return;
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
-        RendererDrawGenericMesh_Vulkan(renderer, mesh, originRelative, scale,
-                                        firstVertex, vertexCount);
+        RendererDrawGenericMeshRangeBound_Vulkan(renderer, mesh, originRelative, scale,
+                                                 firstVertex, vertexCount, texture, sampler);
         return;
 #endif
     default: break;

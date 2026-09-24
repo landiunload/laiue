@@ -26,6 +26,13 @@
 // путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
 // раньше её определения — объявляем её здесь.
 void RendererDestroy_D3D12(Renderer* renderer);
+RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
+                                              uint32_t height, uint32_t mipLevels,
+                                              uint32_t format);
+bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
+                                 const void *data, uint64_t sizeBytes,
+                                 uint32_t rowPitchBytes);
+void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 
 #define FRAME_COUNT 2
 
@@ -39,6 +46,7 @@ void RendererDestroy_D3D12(Renderer* renderer);
 #define SRV_STATIC_SLOT_COUNT   5
 #define SRV_SLOT_COUNT          64
 #define SAMPLER_SLOT_COUNT      64
+#define SAMPLER_STATIC_SLOT_COUNT 1
 
 // Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
 // Число квадов является частью публичного контракта renderer.h.
@@ -64,6 +72,11 @@ void RendererDestroy_D3D12(Renderer* renderer);
 #define ROOT_PARAMETER_QUAD_BUFFER 1
 #define ROOT_PARAMETER_BLOCK_TEXTURES 2
 #define ROOT_PARAMETER_INSTANCES 3
+
+#define GENERIC_ROOT_PARAMETER_CONSTANTS 0
+#define GENERIC_ROOT_PARAMETER_QUAD_BUFFER 1
+#define GENERIC_ROOT_PARAMETER_TEXTURE 2
+#define GENERIC_ROOT_PARAMETER_SAMPLER 3
 
 #define MAX_TEXTURE_SUBRESOURCES TEXTURE_PACK_MAX_SUBRESOURCES
 
@@ -161,12 +174,14 @@ struct RendererMesh
 
 struct RendererTexture
 {
+    Renderer *owner;
     ID3D12Resource *resource;
     uint32_t srvSlot;
 };
 
 struct RendererSampler
 {
+    Renderer *owner;
     uint32_t samplerSlot;
 };
 
@@ -189,12 +204,14 @@ struct Renderer
     UINT64                     lastSignaledFenceValue;
     UINT                       frameIndex;
     ID3D12RootSignature*       rootSignature;
+    ID3D12RootSignature*       genericRootSignature;
     ID3D12PipelineState*       pipelineState;
     ID3D12PipelineState*       genericPipelineState;
     ID3D12Resource*            blockTexture;
     ID3D12Resource*            blockTextureUpload;
     ID3D12Resource*            blockNormalTexture;
     ID3D12Resource*            blockNormalUpload;
+    RendererTexture*            genericFallbackTexture;
     ID3D12DescriptorHeap*      srvHeap;
     UINT                       srvDescriptorSize;
     uint32_t                   dynamicSrvNext;
@@ -204,7 +221,7 @@ struct Renderer
     UINT                       samplerDescriptorSize;
     uint32_t                   dynamicSamplerNext;
     uint32_t                   dynamicSamplerFreeCount;
-    uint32_t                   dynamicSamplerFree[SAMPLER_SLOT_COUNT];
+    uint32_t                   dynamicSamplerFree[SAMPLER_SLOT_COUNT - SAMPLER_STATIC_SLOT_COUNT];
     bool                       blockTextureUploadPending;
     TexturePackAnimationSet    blockAnimation;
     TexturePackMaterialNames   materialNames;
@@ -631,6 +648,34 @@ static D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(Renderer* renderer, uint32_t slo
     return handle;
 }
 
+static D3D12_GPU_DESCRIPTOR_HANDLE SamplerGpuHandle(Renderer *renderer, uint32_t slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(renderer->samplerHeap, &handle);
+    handle.ptr += (UINT64)slot * renderer->samplerDescriptorSize;
+    return handle;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SamplerCpuHandle(Renderer *renderer,
+                                                    uint32_t slot);
+
+static bool CreateDefaultSamplerDescriptor(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->samplerHeap == NULL)
+        return false;
+    D3D12_SAMPLER_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    description.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.MaxLOD = D3D12_FLOAT32_MAX;
+    ID3D12Device_CreateSampler(renderer->device, &description,
+                               SamplerCpuHandle(renderer, 0u));
+    return true;
+}
+
 static uint32_t AllocateDynamicSrvSlot(Renderer *renderer)
 {
     if (renderer == NULL)
@@ -666,6 +711,8 @@ static uint32_t AllocateDynamicSamplerSlot(Renderer *renderer)
         return UINT32_MAX;
     if (renderer->dynamicSamplerFreeCount != 0u)
         return renderer->dynamicSamplerFree[--renderer->dynamicSamplerFreeCount];
+    if (renderer->dynamicSamplerNext < SAMPLER_STATIC_SLOT_COUNT)
+        renderer->dynamicSamplerNext = SAMPLER_STATIC_SLOT_COUNT;
     if (renderer->dynamicSamplerNext >= SAMPLER_SLOT_COUNT)
         return UINT32_MAX;
     return renderer->dynamicSamplerNext++;
@@ -673,10 +720,84 @@ static uint32_t AllocateDynamicSamplerSlot(Renderer *renderer)
 
 static void FreeDynamicSamplerSlot(Renderer *renderer, uint32_t slot)
 {
-    if (renderer == NULL || slot >= SAMPLER_SLOT_COUNT ||
-        renderer->dynamicSamplerFreeCount >= SAMPLER_SLOT_COUNT)
+    if (renderer == NULL || slot < SAMPLER_STATIC_SLOT_COUNT ||
+        slot >= SAMPLER_SLOT_COUNT ||
+        renderer->dynamicSamplerFreeCount >= SAMPLER_SLOT_COUNT - SAMPLER_STATIC_SLOT_COUNT)
         return;
     renderer->dynamicSamplerFree[renderer->dynamicSamplerFreeCount++] = slot;
+}
+
+static bool CreateGenericRootSignature(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->device == NULL)
+        return false;
+
+    D3D12_ROOT_PARAMETER parameters[4];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].Constants.ShaderRegister = 0;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].Constants.Num32BitValues =
+        ROOT_CONSTANT_COUNT;
+
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
+
+    D3D12_DESCRIPTOR_RANGE textureRange;
+    memset(&textureRange, 0, sizeof(textureRange));
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 1;
+    textureRange.BaseShaderRegister = 1;
+    textureRange.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].DescriptorTable.pDescriptorRanges =
+        &textureRange;
+
+    D3D12_DESCRIPTOR_RANGE samplerRange;
+    memset(&samplerRange, 0, sizeof(samplerRange));
+    samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    samplerRange.NumDescriptors = 1;
+    samplerRange.BaseShaderRegister = 0;
+    samplerRange.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].DescriptorTable.pDescriptorRanges =
+        &samplerRange;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 4;
+    description.pParameters = parameters;
+
+    ID3DBlob *signatureBlob = NULL;
+    ID3DBlob *errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+    HRESULT result = ID3D12Device_CreateRootSignature(
+        renderer->device, 0, ID3D10Blob_GetBufferPointer(signatureBlob),
+        ID3D10Blob_GetBufferSize(signatureBlob), &IID_ID3D12RootSignature,
+        (void **)&renderer->genericRootSignature);
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
 }
 
 static bool CreateRootSignature(Renderer* renderer)
@@ -745,9 +866,11 @@ static bool CreateRootSignature(Renderer* renderer)
 
 static bool CreatePipelineState(Renderer* renderer)
 {
-    return CreateChunkPipelineStateForShaders(
-               renderer, renderer->loadedShaders, renderer->loadedShaderLengths,
-               &renderer->pipelineState) &&
+    if (!CreateChunkPipelineStateForShaders(
+            renderer, renderer->loadedShaders, renderer->loadedShaderLengths,
+            &renderer->pipelineState))
+        return false;
+    return CreateGenericRootSignature(renderer) &&
            CreateGenericPipelineState(renderer, &renderer->genericPipelineState);
 }
 
@@ -1706,6 +1829,11 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     }
     renderer->samplerDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
         renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (!CreateDefaultSamplerDescriptor(renderer))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
 
     if (!CreateUiRootSignature(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
     if (!CreateUiPipelineState(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
@@ -1780,6 +1908,10 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
     }
     ReleaseInstancePool(renderer);
 
+    if (renderer->genericFallbackTexture != NULL)
+        RendererDestroyTexture_D3D12(renderer, renderer->genericFallbackTexture);
+    renderer->genericFallbackTexture = NULL;
+
     if (renderer->blockTextureUpload != NULL)
         ID3D12Resource_Release(renderer->blockTextureUpload);
     if (renderer->blockTexture != NULL)
@@ -1814,10 +1946,13 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
         ID3D12PipelineState_Release(renderer->pipelineState);
     if (renderer->genericPipelineState != NULL)
         ID3D12PipelineState_Release(renderer->genericPipelineState);
+    if (renderer->genericRootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->genericRootSignature);
     if (renderer->rootSignature != NULL)
         ID3D12RootSignature_Release(renderer->rootSignature);
     renderer->pipelineState = NULL;
     renderer->genericPipelineState = NULL;
+    renderer->genericRootSignature = NULL;
     renderer->rootSignature = NULL;
     if (renderer->depthBuffer != NULL)
         ID3D12Resource_Release(renderer->depthBuffer);
@@ -1826,6 +1961,27 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
     renderer->depthBuffer = NULL;
     renderer->depthStencilViewHeap = NULL;
     renderer->worldReady = false;
+}
+
+static bool EnsureGenericFallbackTexture_D3D12(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return false;
+    if (renderer->genericFallbackTexture != NULL)
+        return true;
+    static const uint8_t whitePixel[4] = {255u, 255u, 255u, 255u};
+    RendererTexture *texture = RendererCreateTexture_D3D12(
+        renderer, 1u, 1u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+    if (texture == NULL ||
+        !RendererUploadTexture_D3D12(renderer, texture, whitePixel,
+                                     sizeof(whitePixel), sizeof(whitePixel)))
+    {
+        if (texture != NULL)
+            RendererDestroyTexture_D3D12(renderer, texture);
+        return false;
+    }
+    renderer->genericFallbackTexture = texture;
+    return true;
 }
 
 bool RendererPrepareWorldFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
@@ -1852,6 +2008,7 @@ bool RendererPrepareWorldFrom_D3D12(Renderer *renderer, LaiueContentCatalog *cat
         CreateRootSignature(renderer) && CreatePipelineState(renderer) &&
         CreateResolveRootSignature(renderer) && CreateResolvePipelineState(renderer) &&
         CreateMeshUploadBuffers(renderer) && CreateBlockTexture(renderer, catalog) &&
+        EnsureGenericFallbackTexture_D3D12(renderer) &&
         CreateDepthBuffer(renderer, renderer->windowWidth, renderer->windowHeight);
     if (succeeded && renderer->wireframeEnabled)
         succeeded = RecreateChunkPipelineState(renderer);
@@ -2221,6 +2378,7 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
     view.Texture2D.MipLevels = mipLevels;
     ID3D12Device_CreateShaderResourceView(renderer->device, texture->resource, &view,
                                           SrvCpuHandle(renderer, srvSlot));
+    texture->owner = renderer;
     texture->srvSlot = srvSlot;
     return texture;
 }
@@ -2229,7 +2387,8 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes)
 {
-    if (renderer == NULL || texture == NULL || texture->resource == NULL || data == NULL ||
+    if (renderer == NULL || texture == NULL || texture->owner != renderer ||
+        texture->resource == NULL || data == NULL ||
         renderer->frameRecording || rowPitchBytes == 0u)
         return false;
     D3D12_RESOURCE_DESC textureDescription;
@@ -2379,6 +2538,7 @@ RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer, uint32_t minFil
     description.MaxLOD = D3D12_FLOAT32_MAX;
     ID3D12Device_CreateSampler(renderer->device, &description,
                                 SamplerCpuHandle(renderer, samplerSlot));
+    sampler->owner = renderer;
     sampler->samplerSlot = samplerSlot;
     return sampler;
 }
@@ -2386,6 +2546,8 @@ RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer, uint32_t minFil
 void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
 {
     if (sampler == NULL)
+        return;
+    if (renderer != NULL && sampler->owner != renderer)
         return;
     if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
         renderer->fenceEvent != NULL)
@@ -2398,6 +2560,8 @@ void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
+        return;
+    if (renderer != NULL && texture->owner != renderer)
         return;
     if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
         renderer->fenceEvent != NULL)
@@ -2440,6 +2604,8 @@ void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
         return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
 
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+                                                       renderer->rootSignature);
     ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
                                                renderer->pipelineState);
 
@@ -2456,12 +2622,29 @@ void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
     renderer->currentStats.drawnQuads += mesh->quadCount;
 }
 
+void RendererDrawGenericMeshRangeBound_D3D12(
+    Renderer *renderer, const RendererMesh *mesh, const float originRelative[3], float scale,
+    uint32_t firstVertex, uint32_t vertexCount, const RendererTexture *texture,
+    const RendererSampler *sampler);
+
 void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
                                    const float originRelative[3], float scale,
                                    uint32_t firstVertex, uint32_t vertexCount)
 {
+    RendererDrawGenericMeshRangeBound_D3D12(renderer, mesh, originRelative, scale,
+                                             firstVertex, vertexCount, NULL, NULL);
+}
+
+void RendererDrawGenericMeshRangeBound_D3D12(
+    Renderer *renderer, const RendererMesh *mesh, const float originRelative[3], float scale,
+    uint32_t firstVertex, uint32_t vertexCount, const RendererTexture *texture,
+    const RendererSampler *sampler)
+{
     if (renderer == NULL || mesh == NULL || !mesh->generic ||
         renderer->commandList == NULL || renderer->genericPipelineState == NULL ||
+        renderer->genericRootSignature == NULL ||
+        (texture != NULL && (texture->owner != renderer || texture->resource == NULL)) ||
+        (sampler != NULL && sampler->owner != renderer) ||
         firstVertex > mesh->vertexCount ||
         (vertexCount != UINT32_MAX && vertexCount > mesh->vertexCount - firstVertex))
         return;
@@ -2474,15 +2657,29 @@ void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
         originRelative != NULL ? originRelative[2] : 0.0f,
     };
     const float transform[4] = {origin[0], origin[1], origin[2], scale};
+    if (texture == NULL && renderer->genericFallbackTexture == NULL)
+        return;
+    const uint32_t textureSlot = texture != NULL
+                                     ? texture->srvSlot
+                                     : renderer->genericFallbackTexture->srvSlot;
+    const uint32_t samplerSlot = sampler != NULL ? sampler->samplerSlot : 0u;
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+                                                       renderer->genericRootSignature);
     ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
                                                renderer->genericPipelineState);
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
-        renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform,
+        renderer->commandList, GENERIC_ROOT_PARAMETER_CONSTANTS, 4, transform,
         ROOT_CONSTANT_ORIGIN_OFFSET);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
-        renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
+        renderer->commandList, GENERIC_ROOT_PARAMETER_QUAD_BUFFER,
         block->address + mesh->offsetBytes +
             firstVertex * (UINT64)sizeof(RendererGenericVertex));
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_TEXTURE,
+        SrvGpuHandle(renderer, textureSlot));
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_SAMPLER,
+        SamplerGpuHandle(renderer, samplerSlot));
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
                                              vertexCount, 1u, 0u, 0u);
     renderer->currentStats.drawCalls++;
@@ -2511,6 +2708,8 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
     if (mesh->generic || renderer->commandList == NULL || renderer->pipelineState == NULL)
         return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
+                                                       renderer->rootSignature);
     ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
                                                renderer->pipelineState);
     float transform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
@@ -3235,7 +3434,7 @@ static bool CreateGenericPipelineState(Renderer *renderer,
         return false;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
     memset(&description, 0, sizeof(description));
-    description.pRootSignature = renderer->rootSignature;
+    description.pRootSignature = renderer->genericRootSignature;
     description.VS.pShaderBytecode = g_generic_vs;
     description.VS.BytecodeLength = sizeof(g_generic_vs);
     description.PS.pShaderBytecode = g_generic_ps;
