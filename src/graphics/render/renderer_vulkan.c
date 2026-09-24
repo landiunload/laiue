@@ -1293,7 +1293,11 @@ static bool CreateGenericPipeline(Renderer *renderer, VkPipeline *outPipeline)
         .layout = renderer->chunkPipelineLayout,
         .depthTest = true,
         .blend = false,
-        .cullMode = VK_CULL_MODE_BACK_BIT,
+        // Generic geometry has no voxel-specific winding contract.  The
+        // public V2 mesh ABI accepts ordinary vertex streams, so both
+        // clockwise and counter-clockwise triangles must reach the target;
+        // voxel quads keep their specialized back-face culling below.
+        .cullMode = VK_CULL_MODE_NONE,
         .wireframe = renderer->wireframeEnabled,
     };
     return CreateGraphicsPipeline(renderer, &recipe, outPipeline);
@@ -3209,16 +3213,20 @@ static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh
     if (!PushConstants(renderer, &renderer->chunkConstants,
                        sizeof(renderer->chunkConstants), &constantOffset))
         return;
-    uint32_t dynamicOffsets[3] = {constantOffset, 0u, 0u};
+    // Generic records are allocated from the shared byte pool, whose
+    // alignment is the device's storage-buffer alignment rather than a
+    // multiple of RendererGenericVertex.  Bind the mesh byte offset as the
+    // dynamic storage offset and keep firstVertex relative to that mesh;
+    // deriving it by dividing offsetBytes by the 24-byte record size would
+    // silently round and read the preceding allocation.
+    uint32_t dynamicOffsets[3] = {constantOffset, mesh->offsetBytes, 0u};
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       renderer->genericPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->chunkPipelineLayout, 0u, 1u, &set, 3u,
                             dynamicOffsets);
-    vkCmdDraw(commandBuffer, vertexCount, 1u,
-              mesh->offsetBytes / (uint32_t)sizeof(RendererGenericVertex) + firstVertex,
-              0u);
+    vkCmdDraw(commandBuffer, vertexCount, 1u, firstVertex, 0u);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += vertexCount / 3u;
 }
