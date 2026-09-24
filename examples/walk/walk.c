@@ -18,6 +18,7 @@
 
 #include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(LAIUE_WALK_WINDOWED)
@@ -66,6 +67,14 @@ static bool PositionAxisToBlock(int64_t cell, int64_t local, int64_t *out)
     const int64_t localBlock = FloorDiv(local, WALK_VOXEL_SIZE);
     return MulAddChecked(cell, WALK_BLOCKS_PER_CELL, localBlock, out);
 }
+
+#if defined(LAIUE_WALK_RUNTIME_ONLY)
+LAIUE_WALK_RUNTIME_API uint32_t WalkPositionAxisToBlock(
+    int64_t cell, int64_t local, int64_t *outBlock)
+{
+    return PositionAxisToBlock(cell, local, outBlock) ? 1u : 0u;
+}
+#endif
 
 static bool WalkIsSolid(const LaiueVoxelProviderV1 *provider, int64_t x, int64_t y, int32_t z);
 
@@ -1072,7 +1081,13 @@ static bool RunWalkExample(bool headless)
             "laiue walk: character provider is unavailable; controls disabled\n");
 
     const bool voxelHasContextCreate =
-        voxel != NULL && voxelServiceSize >= LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE &&
+        voxel != NULL &&
+        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, createWithContext),
+                                sizeof(voxel->createWithContext)) &&
+        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, context),
+                                sizeof(voxel->context)) &&
         voxel->createWithContext != NULL && voxel->context != NULL;
     if (voxel == NULL || voxel->getProvider == NULL ||
         (!voxelHasContextCreate && voxel->create == NULL))
@@ -1129,7 +1144,15 @@ static bool RunWalkExample(bool headless)
         .localZ = 1400,
     };
     bool characterReady = false;
-    if (character != NULL && character->create != NULL && character->setPosition != NULL)
+    const bool characterHasCore =
+        character != NULL &&
+        WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                offsetof(LaiueCharacterServiceV1, create),
+                                sizeof(character->create)) &&
+        WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                offsetof(LaiueCharacterServiceV1, setPosition),
+                                sizeof(character->setPosition));
+    if (characterHasCore && character->create != NULL && character->setPosition != NULL)
     {
         characterReady = character->create(&collision, 400, &controller) != 0u &&
                          controller != NULL &&

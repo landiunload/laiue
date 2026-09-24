@@ -17,6 +17,7 @@
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -85,6 +86,13 @@ static void AndroidLog(AndroidWalkState *state, int priority, const char *messag
     __android_log_print(priority, ANDROID_WALK_LOG_TAG, "%s", message == NULL ? "" : message);
 }
 
+static bool AndroidFieldPresent(uint32_t actualSize, uint32_t declaredSize,
+                               size_t offset, size_t size)
+{
+    return (size_t)actualSize >= offset && (size_t)actualSize - offset >= size &&
+           (size_t)declaredSize >= offset && (size_t)declaredSize - offset >= size;
+}
+
 static uint32_t AndroidLoadModules(AndroidWalkState *state)
 {
     const LaiueModuleApiV1 *modules[7] = {
@@ -137,11 +145,18 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
     if (state == NULL)
         return;
     if (state->terrainReady && state->device != NULL &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                            sizeof(state->device->destroyHandle)) &&
         state->device->destroyHandle != NULL)
         state->device->destroyHandle(state->device, state->terrainBuffer);
     state->terrainReady = false;
     state->terrainBuffer = 0u;
-    if (state->device != NULL && state->graphics != NULL && state->graphics->destroyDevice != NULL)
+    if (state->device != NULL && state->graphics != NULL &&
+        AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                            offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
+                            sizeof(state->graphics->destroyDevice)) &&
+        state->graphics->destroyDevice != NULL)
         state->graphics->destroyDevice(state->device);
     state->device = NULL;
     state->windowReady = false;
@@ -179,13 +194,22 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     const int32_t height = ANativeWindow_getHeight(state->app->window);
     uint32_t created = 0u;
     if (width > 0 && height > 0 &&
-        state->graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V2_CONTEXT_SIZE &&
+        AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                            offsetof(LaiueGraphicsDeviceServiceV2, createDeviceWithContext),
+                            sizeof(state->graphics->createDeviceWithContext)) &&
+        AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                            offsetof(LaiueGraphicsDeviceServiceV2, context),
+                            sizeof(state->graphics->context)) &&
         state->graphics->createDeviceWithContext != NULL &&
         state->graphics->context != NULL)
         created = state->graphics->createDeviceWithContext(
             state->graphics->context, state->app->window, width, height,
             LAIUE_GRAPHICS_BACKEND_VULKAN, &state->device);
-    else if (width > 0 && height > 0 && state->graphics->createDevice != NULL)
+    else if (width > 0 && height > 0 &&
+             AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                                 offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
+                                 sizeof(state->graphics->createDevice)) &&
+             state->graphics->createDevice != NULL)
         created = state->graphics->createDevice(
             state->app->window, width, height, LAIUE_GRAPHICS_BACKEND_VULKAN,
             &state->device);
@@ -199,7 +223,13 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     state->width = width;
     state->height = height;
     state->lastTime = PlatformMonotonicSeconds();
-    if (state->device->createBuffer != NULL && state->device->uploadBuffer != NULL)
+    if (AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, createBuffer),
+                            sizeof(state->device->createBuffer)) &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
+                            sizeof(state->device->uploadBuffer)) &&
+        state->device->createBuffer != NULL && state->device->uploadBuffer != NULL)
     {
         ChunkQuad quads[5];
         const uint32_t quadCount = WalkBuildTerrainQuads(quads);
@@ -222,6 +252,9 @@ static void AndroidCreateDevice(AndroidWalkState *state)
                 state->device, &upload) != 0u;
         }
         if (!state->terrainReady && state->terrainBuffer != 0u &&
+            AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                                offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                                sizeof(state->device->destroyHandle)) &&
             state->device->destroyHandle != NULL)
         {
             state->device->destroyHandle(state->device, state->terrainBuffer);
@@ -377,6 +410,9 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONTENT_RECT_CHANGED:
             if (state->windowReady && state->app->window != NULL && state->graphics != NULL &&
+                AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, resize),
+                                    sizeof(state->graphics->resize)) &&
                 state->graphics->resize != NULL)
                 state->graphics->resize(state->device,
                                         ANativeWindow_getWidth(state->app->window),
@@ -402,6 +438,9 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
         state->scene->cameraGetViewMatrix == NULL ||
         state->scene->cameraGetProjectionMatrix == NULL ||
         state->sceneMath->matrix4Multiply == NULL || state->device == NULL ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, setCamera),
+                             sizeof(state->device->setCamera)) ||
         state->device->setCamera == NULL)
         return;
     int64_t blockX = 0;
@@ -413,10 +452,9 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
         LaiueCharacterPositionV1 position;
         if (state->character->getPosition(state->controller, &position) != 0u)
         {
-            const int64_t blocksPerCell =
-                LAIUE_CHARACTER_LOCAL_CELL_SIZE / 1000;
-            blockX = position.cellX * blocksPerCell + position.localX / 1000;
-            blockY = position.cellY * blocksPerCell + position.localY / 1000;
+            if (WalkPositionAxisToBlock(position.cellX, position.localX, &blockX) == 0u ||
+                WalkPositionAxisToBlock(position.cellY, position.localY, &blockY) == 0u)
+                return;
             localZ = position.localZ;
         }
     }
@@ -424,7 +462,8 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     const int64_t originY = AndroidFloorDiv(blockY, 64) * 64;
     int64_t fractionX = state->controller != NULL ? 0 : 0;
     int64_t fractionY = state->controller != NULL ? 0 : 0;
-    if (state->controller != NULL && state->character->getPosition != NULL)
+    if (state->controller != NULL && state->character != NULL &&
+        state->character->getPosition != NULL)
     {
         LaiueCharacterPositionV1 position;
         if (state->character->getPosition(state->controller, &position) != 0u)
@@ -515,12 +554,22 @@ static void AndroidStep(AndroidWalkState *state)
     }
     if (ticks == 8u && state->accumulator >= fixedStep)
         state->accumulator = 0.0;
-    if (state->device != NULL && state->device->beginFrame != NULL &&
-        state->device->endFrame != NULL)
+    if (state->device != NULL &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, beginFrame),
+                            sizeof(state->device->beginFrame)) &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, endFrame),
+                            sizeof(state->device->endFrame)) &&
+        state->device->beginFrame != NULL && state->device->endFrame != NULL)
     {
         const int32_t width = ANativeWindow_getWidth(state->app->window);
         const int32_t height = ANativeWindow_getHeight(state->app->window);
-        if ((width != state->width || height != state->height) && state->graphics->resize != NULL)
+        if ((width != state->width || height != state->height) &&
+            AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
+                                offsetof(LaiueGraphicsDeviceServiceV2, resize),
+                                sizeof(state->graphics->resize)) &&
+            state->graphics->resize != NULL)
         {
             state->graphics->resize(state->device, width, height);
             state->width = width;
@@ -532,7 +581,11 @@ static void AndroidStep(AndroidWalkState *state)
             const uint32_t began = state->device->beginFrame(
                 state->device, (uint32_t)width, (uint32_t)height);
             uint32_t submitted = 1u;
-            if (began != 0u && state->terrainReady && state->device->submit != NULL)
+            if (began != 0u && state->terrainReady &&
+                AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                                    offsetof(LaiueGraphicsDeviceV2, submit),
+                                    sizeof(state->device->submit)) &&
+                state->device->submit != NULL)
             {
                 LaiueGraphicsDrawItemV2 draws[ANDROID_WALK_ACTIVE_CHUNK_COUNT];
                 uint32_t drawIndex = 0u;

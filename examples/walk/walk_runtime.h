@@ -22,6 +22,10 @@ LAIUE_WALK_RUNTIME_API uint32_t WalkGetBlock(
     const LaiueVoxelProviderV1 *provider,
     const LaiueVoxelCoordV1 *coordinate,
     LaiueVoxelBlockV1 *outBlock);
+#if defined(LAIUE_WALK_RUNTIME_ONLY)
+LAIUE_WALK_RUNTIME_API uint32_t WalkPositionAxisToBlock(
+    int64_t cell, int64_t local, int64_t *outBlock);
+#endif
 LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
     const LaiueCharacterCollisionV1 *collision,
     const LaiueCharacterPositionV1 *position,
