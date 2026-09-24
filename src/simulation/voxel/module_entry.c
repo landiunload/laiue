@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #define VOXEL_PALETTE_CAPACITY 256u
 
@@ -28,6 +29,7 @@ struct LaiueVoxelWorldV1
 {
     World *world;
     const LaiueWorldServiceV1 *worldService;
+    const LaiueModuleHostV1 *host;
     PlatformMutex paletteLock;
     LaiueVoxelBlockV1 palette[VOXEL_PALETTE_CAPACITY];
     uint32_t paletteCount;
@@ -370,21 +372,44 @@ static uint32_t VoxelSetBlockV2(LaiueVoxelWorldV2 *world,
                : 0u;
 }
 
+static void *VoxelAllocate(const LaiueModuleHostV1 *host, size_t size, bool zero)
+{
+    void *memory = host != NULL && host->allocate != NULL
+                       ? host->allocate(host->context, (uint64_t)size)
+                       : PlatformAllocate(size, false);
+    if (memory != NULL && zero)
+        memset(memory, 0, size);
+    return memory;
+}
+
+static void VoxelFree(const LaiueModuleHostV1 *host, void *memory)
+{
+    if (memory == NULL)
+        return;
+    if (host != NULL && host->free != NULL)
+        host->free(host->context, memory);
+    else
+        PlatformFree(memory);
+}
+
 static uint32_t VoxelCreateWithWorldService(
     const LaiueWorldServiceV1 *worldService,
-    const LaiueVoxelWorldConfigV1 *config, LaiueVoxelWorldV1 **outWorld)
+    const LaiueVoxelWorldConfigV1 *config,
+    const LaiueModuleHostV1 *host,
+    LaiueVoxelWorldV1 **outWorld)
 {
     if (outWorld == NULL || worldService == NULL || worldService->create == NULL)
         return 0u;
     *outWorld = NULL;
     LaiueVoxelWorldV1 *world =
-        (LaiueVoxelWorldV1 *)PlatformAllocate(sizeof(*world), true);
+        (LaiueVoxelWorldV1 *)VoxelAllocate(host, sizeof(*world), true);
     if (world == NULL || !PlatformMutexInitialize(&world->paletteLock))
     {
-        PlatformFree(world);
+        VoxelFree(host, world);
         return 0u;
     }
     world->worldService = worldService;
+    world->host = host;
     world->paletteCount = 1u;
     world->palette[0] = (LaiueVoxelBlockV1){0};
     LaiueVoxelBlockV1 defaultBlock = {0};
@@ -394,7 +419,7 @@ static uint32_t VoxelCreateWithWorldService(
     if (!VoxelEncodeBlock(world, &defaultBlock, &world->defaultPaletteId))
     {
         PlatformMutexDestroy(&world->paletteLock);
-        PlatformFree(world);
+        VoxelFree(host, world);
         return 0u;
     }
     WorldBaseProvider base = {
@@ -418,7 +443,7 @@ static uint32_t VoxelCreateWithWorldService(
     if (world->world == NULL)
     {
         PlatformMutexDestroy(&world->paletteLock);
-        PlatformFree(world);
+        VoxelFree(host, world);
         return 0u;
     }
     world->provider.structSize = sizeof(world->provider);
@@ -435,7 +460,7 @@ static uint32_t VoxelCreateWithWorldService(
 static uint32_t VoxelCreateLegacy(const LaiueVoxelWorldConfigV1 *config,
                                   LaiueVoxelWorldV1 **outWorld)
 {
-    return VoxelCreateWithWorldService(compatWorldService, config, outWorld);
+    return VoxelCreateWithWorldService(compatWorldService, config, NULL, outWorld);
 }
 
 static uint32_t VoxelCreateWithContext(void *serviceContext,
@@ -446,7 +471,7 @@ static uint32_t VoxelCreateWithContext(void *serviceContext,
         (const LaiueVoxelModuleState *)serviceContext;
     return state == NULL ? 0u
                          : VoxelCreateWithWorldService(state->worldService,
-                                                        config, outWorld);
+                                                        config, state->host, outWorld);
 }
 
 static void VoxelDestroy(LaiueVoxelWorldV1 *world)
@@ -456,7 +481,7 @@ static void VoxelDestroy(LaiueVoxelWorldV1 *world)
     if (world->worldService != NULL && world->worldService->destroy != NULL)
         world->worldService->destroy(world->world);
     PlatformMutexDestroy(&world->paletteLock);
-    PlatformFree(world);
+    VoxelFree(world->host, world);
 }
 
 static uint64_t VoxelGetRevision(const LaiueVoxelWorldV1 *world)
