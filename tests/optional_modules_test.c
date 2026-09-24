@@ -315,6 +315,12 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(resourceDevice->createTexture(resourceDevice, &invalidTextureDescription,
                                          &invalidTexture) == 0u && invalidTexture == 0u,
            "invalid texture mip count is rejected and output is cleared");
+    LaiueGraphicsTextureDescV1 unsupportedTextureDescription = {
+        sizeof(unsupportedTextureDescription), UINT32_C(99), {4u, 4u, 1u}, 1u, 0u};
+    LaiueGraphicsHandle unsupportedTexture = UINT64_C(1);
+    Expect(resourceDevice->createTexture(resourceDevice, &unsupportedTextureDescription,
+                                         &unsupportedTexture) == 0u && unsupportedTexture == 0u,
+           "unsupported texture format is rejected before handle publication");
     LaiueGraphicsTextureDescV1 textureDescription = {
         sizeof(textureDescription), 0u, {4u, 4u, 1u}, 1u, 0u};
     LaiueGraphicsHandle texture = 0u;

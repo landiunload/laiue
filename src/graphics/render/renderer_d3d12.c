@@ -36,7 +36,8 @@ void RendererDestroy_D3D12(Renderer* renderer);
 #define SRV_SLOT_PANORAMA_CUBE  2
 #define SRV_SLOT_FONT_ATLAS     3
 #define SRV_SLOT_UI_BACKGROUND  4
-#define SRV_SLOT_COUNT          5
+#define SRV_STATIC_SLOT_COUNT   5
+#define SRV_SLOT_COUNT          64
 
 // Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
 // Число квадов является частью публичного контракта renderer.h.
@@ -157,6 +158,12 @@ struct RendererMesh
     bool generic;
 };
 
+struct RendererTexture
+{
+    ID3D12Resource *resource;
+    uint32_t srvSlot;
+};
+
 struct Renderer
 {
     IDXGIFactory4*             factory;
@@ -184,6 +191,9 @@ struct Renderer
     ID3D12Resource*            blockNormalUpload;
     ID3D12DescriptorHeap*      srvHeap;
     UINT                       srvDescriptorSize;
+    uint32_t                   dynamicSrvNext;
+    uint32_t                   dynamicSrvFreeCount;
+    uint32_t                   dynamicSrvFree[SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT];
     bool                       blockTextureUploadPending;
     TexturePackAnimationSet    blockAnimation;
     TexturePackMaterialNames   materialNames;
@@ -607,6 +617,27 @@ static D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(Renderer* renderer, uint32_t slo
     ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(renderer->srvHeap, &handle);
     handle.ptr += (UINT64)slot * renderer->srvDescriptorSize;
     return handle;
+}
+
+static uint32_t AllocateDynamicSrvSlot(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return UINT32_MAX;
+    if (renderer->dynamicSrvFreeCount != 0u)
+        return renderer->dynamicSrvFree[--renderer->dynamicSrvFreeCount];
+    if (renderer->dynamicSrvNext < SRV_STATIC_SLOT_COUNT)
+        renderer->dynamicSrvNext = SRV_STATIC_SLOT_COUNT;
+    if (renderer->dynamicSrvNext >= SRV_SLOT_COUNT)
+        return UINT32_MAX;
+    return renderer->dynamicSrvNext++;
+}
+
+static void FreeDynamicSrvSlot(Renderer *renderer, uint32_t slot)
+{
+    if (renderer == NULL || slot < SRV_STATIC_SLOT_COUNT || slot >= SRV_SLOT_COUNT ||
+        renderer->dynamicSrvFreeCount >= SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT)
+        return;
+    renderer->dynamicSrvFree[renderer->dynamicSrvFreeCount++] = slot;
 }
 
 static bool CreateRootSignature(Renderer* renderer)
@@ -2069,6 +2100,88 @@ RendererMesh *RendererCreateGenericMesh_D3D12(Renderer *renderer,
     return CreateMeshFromBytes_D3D12(renderer, vertices,
                                      vertexCount * (uint32_t)sizeof(RendererGenericVertex),
                                      vertexCount, true);
+}
+
+static DXGI_FORMAT TextureFormat_D3D12(uint32_t format)
+{
+    switch (format)
+    {
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
+                                              uint32_t height, uint32_t mipLevels,
+                                              uint32_t format)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->srvHeap == NULL ||
+        width == 0u || height == 0u || mipLevels != 1u)
+        return NULL;
+    DXGI_FORMAT dxgiFormat = TextureFormat_D3D12(format);
+    if (dxgiFormat == DXGI_FORMAT_UNKNOWN)
+        return NULL;
+
+    uint32_t srvSlot = AllocateDynamicSrvSlot(renderer);
+    if (srvSlot == UINT32_MAX)
+        return NULL;
+    RendererTexture *texture = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(*texture));
+    if (texture == NULL)
+    {
+        FreeDynamicSrvSlot(renderer, srvSlot);
+        return NULL;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = width;
+    description.Height = height;
+    description.DepthOrArraySize = 1u;
+    description.MipLevels = (UINT16)mipLevels;
+    description.Format = dxgiFormat;
+    description.SampleDesc.Count = 1u;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+            &IID_ID3D12Resource, (void **)&texture->resource)))
+    {
+        HeapFree(GetProcessHeap(), 0, texture);
+        FreeDynamicSrvSlot(renderer, srvSlot);
+        return NULL;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC view;
+    memset(&view, 0, sizeof(view));
+    view.Format = dxgiFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = mipLevels;
+    ID3D12Device_CreateShaderResourceView(renderer->device, texture->resource, &view,
+                                          SrvCpuHandle(renderer, srvSlot));
+    texture->srvSlot = srvSlot;
+    return texture;
+}
+
+void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture == NULL)
+        return;
+    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
+        renderer->fenceEvent != NULL)
+        WaitForGpu(renderer);
+    if (texture->resource != NULL)
+        ID3D12Resource_Release(texture->resource);
+    if (renderer != NULL)
+        FreeDynamicSrvSlot(renderer, texture->srvSlot);
+    HeapFree(GetProcessHeap(), 0, texture);
 }
 
 void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh)

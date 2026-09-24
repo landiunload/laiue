@@ -40,6 +40,9 @@ typedef enum RendererContentStatus
 // (суб-аллокация, без 64-КиБ ресурса на меш) и рисуются vertex pulling'ом
 // без вершинных и индексных буферов.
 typedef struct RendererMesh RendererMesh;
+/* Backend-owned sampled image.  The graphics device exposes this only as an
+ * opaque handle; the renderer keeps the native resource behind this type. */
+typedef struct RendererTexture RendererTexture;
 
 /* Portable non-voxel mesh record used by the graphics device V2 contract.
  * The backend may store it in a different GPU representation. */
@@ -218,6 +221,15 @@ LAIUE_RENDER_API RendererMesh* RendererCreateMesh(Renderer* renderer,
 LAIUE_RENDER_API RendererMesh *RendererCreateGenericMesh(
     Renderer *renderer, const RendererGenericVertex *vertices,
     uint32_t vertexCount);
+
+/* Creates a backend-resident 2D RGBA8 sampled image.  The first revision
+ * intentionally accepts one mip level; upload/update is a separate frame
+ * safe operation.  Format 0 is RGBA8_UNORM and format 1 is RGBA8_SRGB. */
+LAIUE_RENDER_API RendererTexture *RendererCreateTexture(
+    Renderer *renderer, uint32_t width, uint32_t height,
+    uint32_t mipLevels, uint32_t format);
+LAIUE_RENDER_API void RendererDestroyTexture(Renderer *renderer,
+                                             RendererTexture *texture);
 
 // Удаление меша безопасно в любой момент: диапазон пула освобождается
 // отложенно, когда GPU гарантированно закончил кадры, читавшие его.

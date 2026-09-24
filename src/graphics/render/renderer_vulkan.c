@@ -179,6 +179,11 @@ typedef struct GpuImage
     uint32_t layerCount;
 } GpuImage;
 
+struct RendererTexture
+{
+    GpuImage image;
+};
+
 typedef struct FreeRange
 {
     uint32_t offset;
@@ -3078,6 +3083,54 @@ RendererMesh *RendererCreateGenericMesh_Vulkan(Renderer *renderer,
     return CreateMeshFromBytes_Vulkan(renderer, vertices,
                                       vertexCount * (uint32_t)sizeof(RendererGenericVertex),
                                       vertexCount, true);
+}
+
+static VkFormat TextureFormat_Vulkan(uint32_t format)
+{
+    switch (format)
+    {
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB:
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+}
+
+RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width,
+                                               uint32_t height, uint32_t mipLevels,
+                                               uint32_t format)
+{
+    if (renderer == NULL || renderer->device == VK_NULL_HANDLE || width == 0u ||
+        height == 0u || mipLevels != 1u)
+        return NULL;
+    VkFormat vkFormat = TextureFormat_Vulkan(format);
+    if (vkFormat == VK_FORMAT_UNDEFINED)
+        return NULL;
+    RendererTexture *texture = PlatformAllocate(sizeof(*texture), true);
+    if (texture == NULL)
+        return NULL;
+    if (!ImageCreate(renderer, width, height, 1u, vkFormat,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                     &texture->image))
+    {
+        PlatformFree(texture);
+        return NULL;
+    }
+    return texture;
+}
+
+void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture == NULL)
+        return;
+    if (renderer != NULL && renderer->device != VK_NULL_HANDLE)
+        vkDeviceWaitIdle(renderer->device);
+    if (renderer != NULL)
+        ImageDestroy(renderer, &texture->image);
+    PlatformFree(texture);
 }
 
 void RendererDestroyMesh_Vulkan(Renderer *renderer, RendererMesh *mesh)

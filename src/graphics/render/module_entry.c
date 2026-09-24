@@ -44,6 +44,7 @@ typedef struct LaiueGraphicsDeviceState
     uint32_t meshIndexCounts[256];
     int32_t meshVertexOffsets[256];
     void *storage[256];
+    void *backendResources[256];
     RendererMesh *meshes[256];
     uint8_t kinds[256];
     uint8_t live[256];
@@ -234,6 +235,11 @@ static bool DeviceTextureExtentIsRepresentable(const LaiueGraphicsExtentV1 *exte
         return false;
     const uint64_t area = (uint64_t)extent->width * (uint64_t)extent->height;
     return (uint64_t)extent->depth <= UINT64_MAX / area;
+}
+
+static bool DeviceTextureFormatIsSupported(const LaiueGraphicsTextureDescV1 *description)
+{
+    return description != NULL && description->format <= LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB;
 }
 
 static bool DeviceSamplerIsValid(const LaiueGraphicsSamplerDescV1 *description)
@@ -470,6 +476,11 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
     {
         if (state->meshes[index] != NULL)
             RendererDestroyMesh(state->renderer, state->meshes[index]);
+        if (state->backendResources[index] != NULL &&
+            state->kinds[index] == DEVICE_HANDLE_TEXTURE)
+            RendererDestroyTexture(state->renderer,
+                                   (RendererTexture *)state->backendResources[index]);
+        state->backendResources[index] = NULL;
         DeviceFree(state, state->storage[index]);
     }
     RendererDestroy(state->renderer);
@@ -527,14 +538,25 @@ static uint32_t DeviceCreateTexture(LaiueGraphicsDeviceV1 *device,
         return 0u;
     *outTexture = 0u;
     if (state == NULL || description == NULL ||
-        description->structSize < sizeof(*description) || description->mipLevels == 0u ||
+        description->structSize < sizeof(*description) || description->mipLevels != 1u ||
+        description->extent.depth != 1u || !DeviceTextureFormatIsSupported(description) ||
         !DeviceTextureExtentIsRepresentable(&description->extent))
         return 0u;
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_TEXTURE, 0u, outTexture))
         return 0u;
     const uint32_t index = DeviceHandleSlot(*outTexture) - 1u;
+    RendererTexture *backendTexture = RendererCreateTexture(
+        state->renderer, description->extent.width, description->extent.height,
+        description->mipLevels, description->format);
+    if (backendTexture == NULL)
+    {
+        DeviceDestroyHandle(device, *outTexture);
+        *outTexture = 0u;
+        return 0u;
+    }
     state->textures[index] = *description;
     state->textures[index].structSize = sizeof(state->textures[index]);
+    state->backendResources[index] = backendTexture;
     return 1u;
 }
 
@@ -713,6 +735,10 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state->meshes[index] != NULL)
         RendererDestroyMesh(state->renderer, state->meshes[index]);
     state->meshes[index] = NULL;
+    if (kind == DEVICE_HANDLE_TEXTURE && state->backendResources[index] != NULL)
+        RendererDestroyTexture(state->renderer,
+                               (RendererTexture *)state->backendResources[index]);
+    state->backendResources[index] = NULL;
     DeviceFree(state, state->storage[index]);
     state->storage[index] = NULL;
     state->live[index] = 0u;

@@ -498,6 +498,12 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
 
         Expect(RendererPrepareWorld(d3d12), "the D3D12 switch world could not be prepared");
         Expect(RendererPrepareWorld(vulkan), "the Vulkan switch world could not be prepared");
+        RendererTexture *d3d12Texture = RendererCreateTexture(
+            d3d12, 4u, 4u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+        RendererTexture *vulkanTexture = RendererCreateTexture(
+            vulkan, 4u, 4u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB);
+        Expect(d3d12Texture != NULL && vulkanTexture != NULL,
+               "both backends must create native texture resources");
         RendererMesh *d3d12Mesh = CreateUnitMesh(d3d12);
         RendererMesh *vulkanMesh = CreateUnitMesh(vulkan);
 
@@ -511,6 +517,8 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
 
         RendererDestroyMesh(d3d12, d3d12Mesh);
         RendererDestroyMesh(vulkan, vulkanMesh);
+        RendererDestroyTexture(d3d12, d3d12Texture);
+        RendererDestroyTexture(vulkan, vulkanTexture);
         if (order == 0u)
         {
             // D3D12 умирает первым — Vulkan обязан пережить.

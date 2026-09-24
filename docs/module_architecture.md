@@ -80,7 +80,10 @@ versioned service tables и не имеют отдельной legacy-копии
 `LaiueGraphicsDrawItemV2` принимает texture/sampler handles в необязательном
 хвосте таблицы: старый потребитель может передать legacy prefix, а новый —
 получает проверку принадлежности ресурсов тому же device namespace до записи
-команд. Pipeline дополнительно удерживает shader handles до своего удаления;
+команд. Texture handle создаёт backend-owned 2D RGBA8 image и освобождает его
+через тот же provider; первая версия намеренно ограничена одним mip и глубиной
+1, поэтому неподдержанный формат отклоняется до публикации handle. Pipeline
+дополнительно удерживает shader handles до своего удаления;
 это предотвращает dangling resources при отказе или частичном teardown.
 
 ## Перенесённые providers

@@ -155,6 +155,10 @@ extern RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQua
 extern RendererMesh* RendererCreateGenericMesh_D3D12(Renderer *renderer,
                                                        const RendererGenericVertex *vertices,
                                                        uint32_t vertexCount);
+extern RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer,
+                                                     uint32_t width, uint32_t height,
+                                                     uint32_t mipLevels, uint32_t format);
+extern void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 extern void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
@@ -194,6 +198,10 @@ extern RendererMesh* RendererCreateMesh_Vulkan(Renderer* renderer, const ChunkQu
 extern RendererMesh* RendererCreateGenericMesh_Vulkan(Renderer *renderer,
                                                        const RendererGenericVertex *vertices,
                                                        uint32_t vertexCount);
+extern RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer,
+                                                      uint32_t width, uint32_t height,
+                                                      uint32_t mipLevels, uint32_t format);
+extern void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture);
 extern void RendererDestroyMesh_Vulkan(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_Vulkan(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -567,6 +575,45 @@ RendererMesh *RendererCreateGenericMesh(Renderer *renderer,
     default: break;
     }
     return NULL;
+}
+
+RendererTexture *RendererCreateTexture(Renderer *renderer, uint32_t width,
+                                       uint32_t height, uint32_t mipLevels,
+                                       uint32_t format)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCreateTexture_D3D12(renderer, width, height, mipLevels, format);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCreateTexture_Vulkan(renderer, width, height, mipLevels, format);
+#endif
+    default:
+        return NULL;
+    }
+}
+
+void RendererDestroyTexture(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture == NULL) return;
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        RendererDestroyTexture_D3D12(renderer, texture);
+        return;
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        RendererDestroyTexture_Vulkan(renderer, texture);
+        return;
+#endif
+    default:
+        return;
+    }
 }
 
 void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)

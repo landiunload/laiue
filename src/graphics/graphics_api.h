@@ -42,6 +42,9 @@ typedef uint64_t LaiueGraphicsHandle;
 #define LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES 0u
 #define LAIUE_GRAPHICS_TOPOLOGY_LINES 1u
 #define LAIUE_GRAPHICS_TOPOLOGY_POINTS 2u
+/* The first portable texture contract is a 2D, single-mip RGBA8 image. */
+#define LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM 0u
+#define LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB 1u
 
 /* Buffer flags are backend-neutral.  VERTEX is the standard mesh stream
  * below; VERTEX_PULLING is the separate compact chunk adapter used by
