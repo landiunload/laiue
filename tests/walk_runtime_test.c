@@ -99,6 +99,16 @@ static LaiueCharacterCollisionV1 MakeCollision(
 
 LAIUE_TEST_ENTRY(WalkRuntimeTestEntryPoint)
 {
+    int64_t block = INT64_C(-1);
+    Expect(WalkPositionAxisToBlock(0, 0, &block) != 0u && block == 0,
+           "zero infinite-coordinate axis maps to block zero");
+    Expect(WalkPositionAxisToBlock(INT64_MAX, 0, &block) == 0u,
+           "infinite-coordinate conversion rejects positive overflow");
+    Expect(WalkPositionAxisToBlock(INT64_MIN, 0, &block) == 0u,
+           "infinite-coordinate conversion rejects negative overflow");
+    Expect(WalkPositionAxisToBlock(0, 0, NULL) == 0u,
+           "infinite-coordinate conversion rejects a missing output");
+
     TestTerrain terrain = {.wall = true};
     LaiueVoxelProviderV1 provider = {
         .structSize = sizeof(provider),
