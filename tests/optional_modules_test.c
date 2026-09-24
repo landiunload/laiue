@@ -259,6 +259,16 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                fallbackDevice->createDeviceWithContext != NULL &&
                fallbackDevice->context != NULL,
            "generic graphics device service survives missing content provider");
+    const LaiueGraphicsDeviceServiceV2 *fallbackDeviceV2 =
+        (const LaiueGraphicsDeviceServiceV2 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, &version, &size);
+    Expect(fallbackDeviceV2 != NULL && version == LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2 &&
+               size >= LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE &&
+               fallbackDeviceV2->createDevice != NULL &&
+               fallbackDeviceV2->createDeviceWithContext != NULL,
+           "graphics device v2 is published independently of content");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 uiGraph[] = {
@@ -357,6 +367,13 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
             sizeof(LaiueGraphicsDeviceServiceV1), &version, &size);
     Expect(deviceService != NULL && deviceService->getBackend != NULL,
            "graphics dependency graph exposes the backend-neutral device");
+    const LaiueGraphicsDeviceServiceV2 *deviceServiceV2 =
+        (const LaiueGraphicsDeviceServiceV2 *)LaiueModuleHostQueryService(
+            host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
+            LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, &version, &size);
+    Expect(deviceServiceV2 != NULL && deviceServiceV2->getBackend != NULL,
+           "graphics dependency graph exposes device v2");
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleHostDestroy(host);

@@ -18,6 +18,8 @@ struct LaiueVoxelModuleState
 {
     const LaiueModuleHostV1 *host;
     const LaiueWorldServiceV1 *worldService;
+    uint32_t worldServiceSize;
+    uint32_t worldServiceVersion;
     LaiueVoxelServiceV1 service;
     LaiueVoxelServiceV2 serviceV2;
 };
@@ -503,6 +505,9 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         (LaiueVoxelModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
+    state->worldService = NULL;
+    state->worldServiceSize = 0u;
+    state->worldServiceVersion = 0u;
     state->host = host;
     state->worldService = NULL;
     state->service.structSize = sizeof(state->service);
@@ -531,20 +536,42 @@ static uint32_t ModuleStart(void *context)
     LaiueVoxelModuleState *state = (LaiueVoxelModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
-    state->worldService = (const LaiueWorldServiceV1 *)LaiueModuleQueryRequiredService(
-        state->host, LAIUE_WORLD_SERVICE_NAME, LAIUE_WORLD_SERVICE_ABI_VERSION_1,
-        LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE);
+    LaiueModuleServiceViewV1 worldView;
+    state->worldService = NULL;
+    state->worldServiceSize = 0u;
+    state->worldServiceVersion = 0u;
+    if (!LaiueModuleQueryServiceView(
+            state->host, LAIUE_WORLD_SERVICE_NAME,
+            LAIUE_WORLD_SERVICE_ABI_VERSION_1,
+            LAIUE_WORLD_SERVICE_V1_LEGACY_SIZE, &worldView))
+    {
+        compatWorldService = NULL;
+        return 0u;
+    }
+    state->worldService = (const LaiueWorldServiceV1 *)worldView.table;
+    state->worldServiceSize = worldView.tableSize;
+    state->worldServiceVersion = worldView.version;
     if (state->worldService == NULL || state->worldService->create == NULL ||
         state->worldService->destroy == NULL || state->worldService->getBlock == NULL ||
+        !ServiceFieldPresent(state->worldServiceSize,
+            offsetof(LaiueWorldServiceV1, getBlockState),
+            sizeof(state->worldService->getBlockState)) ||
+        !ServiceFieldPresent(state->worldServiceSize,
+            offsetof(LaiueWorldServiceV1, enumerateOverrides),
+            sizeof(state->worldService->enumerateOverrides)) ||
+        !ServiceFieldPresent(state->worldServiceSize,
+            offsetof(LaiueWorldServiceV1, trySetBlockExplicit),
+            sizeof(state->worldService->trySetBlockExplicit)) ||
         state->worldService->getBlockState == NULL ||
         state->worldService->enumerateOverrides == NULL ||
         state->worldService->trySetBlockExplicit == NULL)
     {
         state->worldService = NULL;
+        state->worldServiceSize = 0u;
+        state->worldServiceVersion = 0u;
         compatWorldService = NULL;
         return 0u;
     }
-    compatWorldService = state->worldService;
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_SERVICE_NAME,
         .version = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
@@ -554,6 +581,8 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->worldService = NULL;
+        state->worldServiceSize = 0u;
+        state->worldServiceVersion = 0u;
         return 0u;
     }
     LaiueModuleServiceV1 publishedV2 = {
@@ -568,8 +597,12 @@ static uint32_t ModuleStart(void *context)
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_VOXEL_SERVICE_NAME);
         state->worldService = NULL;
+        state->worldServiceSize = 0u;
+        state->worldServiceVersion = 0u;
         return 0u;
     }
+    /* Publish the legacy bridge only after both service tables are live. */
+    compatWorldService = state->worldService;
     return 1u;
 }
 
@@ -587,6 +620,8 @@ static void ModuleStop(void *context)
         if (compatWorldService == state->worldService)
             compatWorldService = NULL;
         state->worldService = NULL;
+        state->worldServiceSize = 0u;
+        state->worldServiceVersion = 0u;
     }
 }
 
@@ -600,6 +635,8 @@ static void ModuleDestroy(void *context)
         if (compatWorldService == state->worldService)
             compatWorldService = NULL;
         state->worldService = NULL;
+        state->worldServiceSize = 0u;
+        state->worldServiceVersion = 0u;
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);
     }

@@ -5,6 +5,7 @@
  * these operations to D3D12, Vulkan, or another platform provider. */
 
 #include "graphics/graphics_api.h"
+#include "graphics/graphics_device_v2.h"
 
 #include <stddef.h>
 #include <stdint.h>

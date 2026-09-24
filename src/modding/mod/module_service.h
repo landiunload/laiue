@@ -6,21 +6,40 @@
 
 #include "mod/module_api.h"
 
+#include <stdbool.h>
+
+typedef struct LaiueModuleServiceViewV1
+{
+    const void *table;
+    uint32_t version;
+    uint32_t tableSize;
+} LaiueModuleServiceViewV1;
+
+static inline bool LaiueModuleQueryServiceView(
+    const LaiueModuleHostV1 *host, const char *name,
+    uint32_t minimumVersion, uint32_t minimumSize,
+    LaiueModuleServiceViewV1 *outView)
+{
+    if (outView != NULL)
+        *outView = (LaiueModuleServiceViewV1){0};
+    if (host == NULL || host->queryService == NULL || name == NULL ||
+        minimumVersion == 0u || minimumSize == 0u || outView == NULL)
+        return false;
+    outView->table = host->queryService(host->context, name, minimumVersion,
+                                        minimumSize, &outView->version,
+                                        &outView->tableSize);
+    return outView->table != NULL && outView->version >= minimumVersion &&
+           outView->tableSize >= minimumSize;
+}
+
 static inline const void *LaiueModuleQueryRequiredService(
     const LaiueModuleHostV1 *host, const char *name,
     uint32_t minimumVersion, uint32_t minimumSize)
 {
-    if (host == NULL || host->queryService == NULL || name == NULL ||
-        minimumVersion == 0u || minimumSize == 0u)
+    LaiueModuleServiceViewV1 view;
+    if (!LaiueModuleQueryServiceView(host, name, minimumVersion, minimumSize, &view))
         return NULL;
-
-    uint32_t version = 0u;
-    uint32_t size = 0u;
-    const void *table = host->queryService(
-        host->context, name, minimumVersion, minimumSize, &version, &size);
-    return table != NULL && version >= minimumVersion && size >= minimumSize
-               ? table
-               : NULL;
+    return view.table;
 }
 
 /* Optional services deliberately have the same validation as required ones,
@@ -31,15 +50,8 @@ static inline const void *LaiueModuleQueryOptionalService(
     const LaiueModuleHostV1 *host, const char *name,
     uint32_t minimumVersion, uint32_t minimumSize)
 {
-    if (host == NULL || host->queryService == NULL || name == NULL ||
-        minimumVersion == 0u || minimumSize == 0u)
+    LaiueModuleServiceViewV1 view;
+    if (!LaiueModuleQueryServiceView(host, name, minimumVersion, minimumSize, &view))
         return NULL;
-
-    uint32_t version = 0u;
-    uint32_t size = 0u;
-    const void *table = host->queryService(
-        host->context, name, minimumVersion, minimumSize, &version, &size);
-    return table != NULL && version >= minimumVersion && size >= minimumSize
-               ? table
-               : NULL;
+    return view.table;
 }

@@ -27,6 +27,14 @@ typedef struct LaiueGraphicsUiQuadV1
 
 typedef uint64_t LaiueGraphicsHandle;
 
+/* Buffer flags are backend-neutral.  VERTEX_PULLING is a compact, tightly
+ * packed geometry stream consumed by the renderer's built-in batch pipeline;
+ * the provider owns the actual GPU representation. */
+#define LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX UINT32_C(1) << 0
+#define LAIUE_GRAPHICS_BUFFER_USAGE_INDEX UINT32_C(1) << 1
+#define LAIUE_GRAPHICS_BUFFER_USAGE_STORAGE UINT32_C(1) << 2
+#define LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING UINT32_C(1) << 3
+
 typedef struct LaiueGraphicsExtentV1
 {
     uint32_t width;

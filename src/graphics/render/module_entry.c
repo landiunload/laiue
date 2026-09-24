@@ -1,5 +1,6 @@
 #include "render/graphics_service.h"
 #include "render/content_provider.h"
+#include "render/chunk_geometry.h"
 #include "graphics/graphics_device_service.h"
 
 #include "content/content_service.h"
@@ -19,16 +20,20 @@ typedef struct LaiueGraphicsModuleState
     const LaiueModuleHostV1 *host;
     const LaiueContentServiceV1 *content;
     LaiueGraphicsDeviceServiceV1 deviceService;
+    LaiueGraphicsDeviceServiceV2 deviceServiceV2;
 } LaiueGraphicsModuleState;
 
 typedef struct LaiueGraphicsDeviceState
 {
     LaiueGraphicsDeviceV1 device;
+    LaiueGraphicsDeviceV2 deviceV2;
     const LaiueModuleHostV1 *host;
     Renderer *renderer;
     uint32_t generations[256];
     uint64_t sizes[256];
+    uint32_t usageFlags[256];
     void *storage[256];
+    RendererMesh *meshes[256];
     uint8_t kinds[256];
     uint8_t live[256];
     uint32_t submittedItems;
@@ -120,6 +125,40 @@ static uint32_t DeviceSetUiFontAtlas(LaiueGraphicsDeviceV1 *, const uint8_t *, u
                                      uint32_t);
 static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *);
 
+static uint32_t DeviceV2Create(void *, int32_t, int32_t, uint32_t,
+                               LaiueGraphicsDeviceV2 **);
+static uint32_t DeviceV2CreateWithContext(void *, void *, int32_t, int32_t, uint32_t,
+                                          LaiueGraphicsDeviceV2 **);
+static void DeviceV2Destroy(LaiueGraphicsDeviceV2 *);
+static uint32_t DeviceV2GetBackend(const LaiueGraphicsDeviceV2 *);
+static void DeviceV2Resize(LaiueGraphicsDeviceV2 *, int32_t, int32_t);
+static uint32_t DeviceV2CreateBuffer(LaiueGraphicsDeviceV2 *,
+                                     const LaiueGraphicsBufferDescV1 *,
+                                     LaiueGraphicsHandle *);
+static uint32_t DeviceV2CreateTexture(LaiueGraphicsDeviceV2 *,
+                                      const LaiueGraphicsTextureDescV1 *,
+                                      LaiueGraphicsHandle *);
+static uint32_t DeviceV2CreateSampler(LaiueGraphicsDeviceV2 *,
+                                      const LaiueGraphicsSamplerDescV1 *,
+                                      LaiueGraphicsHandle *);
+static uint32_t DeviceV2CreatePipeline(LaiueGraphicsDeviceV2 *,
+                                       const LaiueGraphicsPipelineDescV1 *,
+                                       LaiueGraphicsHandle *);
+static uint32_t DeviceV2CreateShader(LaiueGraphicsDeviceV2 *,
+                                     const LaiueGraphicsShaderDescV1 *,
+                                     LaiueGraphicsHandle *);
+static uint32_t DeviceV2UploadBuffer(LaiueGraphicsDeviceV2 *,
+                                     const LaiueGraphicsBufferUploadV1 *);
+static void DeviceV2DestroyHandle(LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle);
+static uint32_t DeviceV2BeginFrame(LaiueGraphicsDeviceV2 *, uint32_t, uint32_t);
+static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *,
+                               const LaiueGraphicsDrawItemV2 *, uint32_t);
+static uint32_t DeviceV2SubmitUi(LaiueGraphicsDeviceV2 *,
+                                 const LaiueGraphicsUiQuadV1 *, uint32_t);
+static uint32_t DeviceV2SetUiFontAtlas(LaiueGraphicsDeviceV2 *, const uint8_t *,
+                                       uint32_t, uint32_t);
+static uint32_t DeviceV2EndFrame(LaiueGraphicsDeviceV2 *);
+
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
 {
@@ -165,6 +204,15 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
         DeviceFree(state, state);
         return 0u;
     }
+    /* Device submissions use the same backend-owned mesh/pipeline path as
+     * voxel_render.  Preparing it once here makes the device contract real:
+     * a successful draw reaches D3D12/Vulkan command recording. */
+    if (!RendererPrepareWorld(renderer))
+    {
+        RendererDestroy(renderer);
+        DeviceFree(state, state);
+        return 0u;
+    }
     state->renderer = renderer;
     state->device.structSize = sizeof(state->device);
     state->device.abiVersion = LAIUE_GRAPHICS_ABI_VERSION_1;
@@ -181,6 +229,21 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->device.createShader = DeviceCreateShader;
     state->device.submitUi = DeviceSubmitUi;
     state->device.setUiFontAtlas = DeviceSetUiFontAtlas;
+    state->deviceV2.structSize = sizeof(state->deviceV2);
+    state->deviceV2.abiVersion = LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION;
+    state->deviceV2.context = state;
+    state->deviceV2.createBuffer = DeviceV2CreateBuffer;
+    state->deviceV2.createTexture = DeviceV2CreateTexture;
+    state->deviceV2.createSampler = DeviceV2CreateSampler;
+    state->deviceV2.createPipeline = DeviceV2CreatePipeline;
+    state->deviceV2.uploadBuffer = DeviceV2UploadBuffer;
+    state->deviceV2.destroyHandle = DeviceV2DestroyHandle;
+    state->deviceV2.beginFrame = DeviceV2BeginFrame;
+    state->deviceV2.submit = DeviceV2Submit;
+    state->deviceV2.endFrame = DeviceV2EndFrame;
+    state->deviceV2.createShader = DeviceV2CreateShader;
+    state->deviceV2.submitUi = DeviceV2SubmitUi;
+    state->deviceV2.setUiFontAtlas = DeviceV2SetUiFontAtlas;
     *outDevice = &state->device;
     return 1u;
 }
@@ -213,7 +276,11 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
     if (state == NULL)
         return;
     for (uint32_t index = 0u; index < 256u; ++index)
+    {
+        if (state->meshes[index] != NULL)
+            RendererDestroyMesh(state->renderer, state->meshes[index]);
         DeviceFree(state, state->storage[index]);
+    }
     RendererDestroy(state->renderer);
     DeviceFree(state, state);
 }
@@ -247,6 +314,7 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
                               outBuffer))
         return 0u;
     const uint32_t index = (uint32_t)*outBuffer - 1u;
+    state->usageFlags[index] = description->usageFlags;
     if (description->sizeBytes > (uint64_t)SIZE_MAX ||
         (state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true)) == NULL)
     {
@@ -323,7 +391,7 @@ static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
 static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
                                    const LaiueGraphicsBufferUploadV1 *upload)
 {
-    const LaiueGraphicsDeviceState *state = DeviceStateConst(device);
+    LaiueGraphicsDeviceState *state = DeviceState(device);
     if (state == NULL || upload == NULL || upload->structSize < sizeof(*upload) ||
         !DeviceHandleIsLive(state, upload->buffer, DEVICE_HANDLE_BUFFER) ||
         upload->data == NULL || upload->sizeBytes == 0u ||
@@ -336,6 +404,20 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
         return 0u;
     memcpy((uint8_t *)state->storage[index] + (size_t)upload->offsetBytes,
            upload->data, (size_t)upload->sizeBytes);
+    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) != 0u &&
+        upload->offsetBytes == 0u && upload->sizeBytes == state->sizes[index] &&
+        upload->sizeBytes >= sizeof(ChunkQuad) &&
+        upload->sizeBytes / sizeof(ChunkQuad) <= UINT32_MAX)
+    {
+        RendererMesh *mesh = RendererCreateMesh(
+            state->renderer, (const ChunkQuad *)state->storage[index],
+            (uint32_t)(upload->sizeBytes / sizeof(ChunkQuad)));
+        if (mesh == NULL)
+            return 0u;
+        if (state->meshes[index] != NULL)
+            RendererDestroyMesh(state->renderer, state->meshes[index]);
+        state->meshes[index] = mesh;
+    }
     return 1u;
 }
 
@@ -346,10 +428,14 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
     const uint32_t index = (uint32_t)handle - 1u;
+    if (state->meshes[index] != NULL)
+        RendererDestroyMesh(state->renderer, state->meshes[index]);
+    state->meshes[index] = NULL;
     DeviceFree(state, state->storage[index]);
     state->storage[index] = NULL;
     state->live[index] = 0u;
     state->sizes[index] = 0u;
+    state->usageFlags[index] = 0u;
     state->kinds[index] = 0u;
 }
 
@@ -361,7 +447,18 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
         return 0u;
     RendererFrameSetup frame;
     memset(&frame, 0, sizeof(frame));
-    frame.passCount = 0u;
+    frame.passCount = 1u;
+    frame.passes[0].rectMaxX = width;
+    frame.passes[0].rectMaxY = height;
+    /* The compatibility device has no camera setter yet.  Use a stable
+     * camera-relative orthographic fallback so a submitted terrain batch is
+     * visible immediately; V2 callers can place batches with origin/scale. */
+    frame.passes[0].viewProjection[0] = 0.03f;
+    frame.passes[0].viewProjection[5] = 0.03f;
+    frame.passes[0].viewProjection[10] = 0.03f;
+    frame.passes[0].viewProjection[15] = 1.0f;
+    frame.passes[0].viewProjection[12] = -1.0f;
+    frame.passes[0].viewProjection[13] = -1.0f;
     frame.skyColor[0] = 0.035f;
     frame.skyColor[1] = 0.055f;
     frame.skyColor[2] = 0.09f;
@@ -377,26 +474,67 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
         return 0u;
     state->frameActive = true;
     state->submittedItems = 0u;
+    RendererBeginScenePass(state->renderer, 0u);
     return 1u;
+}
+
+static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
+                               LaiueGraphicsHandle pipeline,
+                               LaiueGraphicsHandle vertexBuffer,
+                               LaiueGraphicsHandle indexBuffer)
+{
+    return state != NULL &&
+           (pipeline == 0u || DeviceHandleIsLive(state, pipeline, DEVICE_HANDLE_PIPELINE)) &&
+           (vertexBuffer == 0u || DeviceHandleIsLive(state, vertexBuffer, DEVICE_HANDLE_BUFFER)) &&
+           (indexBuffer == 0u || DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER));
+}
+
+static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
+                           LaiueGraphicsHandle vertexBuffer,
+                           const float origin[3], float scale)
+{
+    if (state == NULL || vertexBuffer == 0u)
+        return true;
+    const uint32_t index = (uint32_t)vertexBuffer - 1u;
+    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u ||
+        state->meshes[index] == NULL)
+        return true;
+    if (scale == 0.0f || scale == 1.0f)
+    {
+        const float zeroOrigin[3] = {0.0f, 0.0f, 0.0f};
+        RendererDrawMesh(state->renderer, state->meshes[index],
+                         origin != NULL ? origin : zeroOrigin);
+    }
+    else
+    {
+        RendererMeshInstance instance;
+        memset(&instance, 0, sizeof(instance));
+        instance.originRelative[0] = origin != NULL ? origin[0] : 0.0f;
+        instance.originRelative[1] = origin != NULL ? origin[1] : 0.0f;
+        instance.originRelative[2] = origin != NULL ? origin[2] : 0.0f;
+        instance.scale = scale;
+        instance.rotation[3] = 1.0f;
+        RendererDrawMeshInstances(state->renderer, state->meshes[index], &instance, 1u);
+    }
+    return true;
 }
 
 static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
                              const LaiueGraphicsDrawItemV1 *items, uint32_t itemCount)
 {
-    const LaiueGraphicsDeviceState *state = DeviceStateConst(device);
+    LaiueGraphicsDeviceState *state = DeviceState(device);
     if (state == NULL || !state->frameActive || (itemCount != 0u && items == NULL))
         return 0u;
     for (uint32_t index = 0u; index < itemCount; ++index)
     {
         const LaiueGraphicsDrawItemV1 *item = &items[index];
-        if ((item->pipeline != 0u &&
-             !DeviceHandleIsLive(state, item->pipeline, DEVICE_HANDLE_PIPELINE)) ||
-            (item->vertexBuffer != 0u &&
-             !DeviceHandleIsLive(state, item->vertexBuffer, DEVICE_HANDLE_BUFFER)) ||
-            (item->indexBuffer != 0u &&
-             !DeviceHandleIsLive(state, item->indexBuffer, DEVICE_HANDLE_BUFFER)))
+        if (!DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
+                                item->indexBuffer))
+            return 0u;
+        if (!DeviceDrawMesh(state, item->vertexBuffer, NULL, 1.0f))
             return 0u;
     }
+    state->submittedItems += itemCount;
     return 1u;
 }
 
@@ -440,6 +578,178 @@ static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *device)
     return 1u;
 }
 
+static LaiueGraphicsDeviceState *DeviceV2State(LaiueGraphicsDeviceV2 *device)
+{
+    return device == NULL ? NULL : (LaiueGraphicsDeviceState *)device->context;
+}
+
+static const LaiueGraphicsDeviceState *DeviceV2StateConst(
+    const LaiueGraphicsDeviceV2 *device)
+{
+    return device == NULL ? NULL :
+        (const LaiueGraphicsDeviceState *)device->context;
+}
+
+static uint32_t DeviceV2Create(void *nativeWindow, int32_t width, int32_t height,
+                               uint32_t backend, LaiueGraphicsDeviceV2 **outDevice)
+{
+    if (outDevice == NULL)
+        return 0u;
+    LaiueGraphicsDeviceV1 *base = NULL;
+    if (!DeviceCreate(nativeWindow, width, height, backend, &base))
+    {
+        *outDevice = NULL;
+        return 0u;
+    }
+    LaiueGraphicsDeviceState *state = DeviceState(base);
+    *outDevice = state != NULL ? &state->deviceV2 : NULL;
+    return *outDevice != NULL ? 1u : 0u;
+}
+
+static uint32_t DeviceV2CreateWithContext(void *moduleContext, void *nativeWindow,
+                                          int32_t width, int32_t height, uint32_t backend,
+                                          LaiueGraphicsDeviceV2 **outDevice)
+{
+    if (outDevice == NULL)
+        return 0u;
+    const LaiueGraphicsModuleState *module =
+        (const LaiueGraphicsModuleState *)moduleContext;
+    LaiueGraphicsDeviceV1 *base = NULL;
+    if (module == NULL || !DeviceCreateWithContext(moduleContext, nativeWindow, width,
+                                                   height, backend, &base))
+    {
+        *outDevice = NULL;
+        return 0u;
+    }
+    LaiueGraphicsDeviceState *state = DeviceState(base);
+    *outDevice = state != NULL ? &state->deviceV2 : NULL;
+    return *outDevice != NULL ? 1u : 0u;
+}
+
+static void DeviceV2Destroy(LaiueGraphicsDeviceV2 *device)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state != NULL)
+        DeviceDestroy(&state->device);
+}
+
+static uint32_t DeviceV2GetBackend(const LaiueGraphicsDeviceV2 *device)
+{
+    const LaiueGraphicsDeviceState *state = DeviceV2StateConst(device);
+    return state == NULL ? LAIUE_GRAPHICS_BACKEND_AUTO : DeviceGetBackend(&state->device);
+}
+
+static void DeviceV2Resize(LaiueGraphicsDeviceV2 *device, int32_t width, int32_t height)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state != NULL)
+        DeviceResize(&state->device, width, height);
+}
+
+static uint32_t DeviceV2CreateBuffer(LaiueGraphicsDeviceV2 *device,
+                                     const LaiueGraphicsBufferDescV1 *description,
+                                     LaiueGraphicsHandle *outBuffer)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceCreateBuffer(&state->device, description, outBuffer);
+}
+
+static uint32_t DeviceV2CreateTexture(LaiueGraphicsDeviceV2 *device,
+                                      const LaiueGraphicsTextureDescV1 *description,
+                                      LaiueGraphicsHandle *outTexture)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceCreateTexture(&state->device, description, outTexture);
+}
+
+static uint32_t DeviceV2CreateSampler(LaiueGraphicsDeviceV2 *device,
+                                      const LaiueGraphicsSamplerDescV1 *description,
+                                      LaiueGraphicsHandle *outSampler)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceCreateSampler(&state->device, description, outSampler);
+}
+
+static uint32_t DeviceV2CreatePipeline(LaiueGraphicsDeviceV2 *device,
+                                       const LaiueGraphicsPipelineDescV1 *description,
+                                       LaiueGraphicsHandle *outPipeline)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceCreatePipeline(&state->device, description, outPipeline);
+}
+
+static uint32_t DeviceV2CreateShader(LaiueGraphicsDeviceV2 *device,
+                                     const LaiueGraphicsShaderDescV1 *description,
+                                     LaiueGraphicsHandle *outShader)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceCreateShader(&state->device, description, outShader);
+}
+
+static uint32_t DeviceV2UploadBuffer(LaiueGraphicsDeviceV2 *device,
+                                     const LaiueGraphicsBufferUploadV1 *upload)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceUploadBuffer(&state->device, upload);
+}
+
+static void DeviceV2DestroyHandle(LaiueGraphicsDeviceV2 *device,
+                                  LaiueGraphicsHandle handle)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state != NULL)
+        DeviceDestroyHandle(&state->device, handle);
+}
+
+static uint32_t DeviceV2BeginFrame(LaiueGraphicsDeviceV2 *device, uint32_t width,
+                                   uint32_t height)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceBeginFrame(&state->device, width, height);
+}
+
+static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
+                               const LaiueGraphicsDrawItemV2 *items, uint32_t itemCount)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL || !state->frameActive || (itemCount != 0u && items == NULL))
+        return 0u;
+    for (uint32_t index = 0u; index < itemCount; ++index)
+    {
+        const LaiueGraphicsDrawItemV2 *item = &items[index];
+        if (item->structSize < sizeof(*item) ||
+            !DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
+                                item->indexBuffer))
+            return 0u;
+        if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
+                            item->scale == 0.0f ? 1.0f : item->scale))
+            return 0u;
+    }
+    state->submittedItems += itemCount;
+    return 1u;
+}
+
+static uint32_t DeviceV2SubmitUi(LaiueGraphicsDeviceV2 *device,
+                                 const LaiueGraphicsUiQuadV1 *quads, uint32_t quadCount)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceSubmitUi(&state->device, quads, quadCount);
+}
+
+static uint32_t DeviceV2SetUiFontAtlas(LaiueGraphicsDeviceV2 *device,
+                                       const uint8_t *pixels, uint32_t width,
+                                       uint32_t height)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceSetUiFontAtlas(&state->device, pixels, width, height);
+}
+
+static uint32_t DeviceV2EndFrame(LaiueGraphicsDeviceV2 *device)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceEndFrame(&state->device);
+}
+
 static const LaiueGraphicsServiceV1 service = {
     .structSize = sizeof(LaiueGraphicsServiceV1),
     .abiVersion = LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
@@ -481,6 +791,16 @@ static const LaiueGraphicsDeviceServiceV1 deviceServiceTemplate = {
     .createDeviceWithContext = DeviceCreateWithContext,
 };
 
+static const LaiueGraphicsDeviceServiceV2 deviceServiceV2Template = {
+    .structSize = sizeof(LaiueGraphicsDeviceServiceV2),
+    .abiVersion = LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
+    .createDevice = DeviceV2Create,
+    .destroyDevice = DeviceV2Destroy,
+    .getBackend = DeviceV2GetBackend,
+    .resize = DeviceV2Resize,
+    .createDeviceWithContext = DeviceV2CreateWithContext,
+};
+
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
@@ -496,6 +816,8 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->content = NULL;
     state->deviceService = deviceServiceTemplate;
     state->deviceService.context = state;
+    state->deviceServiceV2 = deviceServiceV2Template;
+    state->deviceServiceV2.context = state;
     RendererSetContentService(NULL);
     *outContext = state;
     return 1u;
@@ -537,6 +859,23 @@ static uint32_t ModuleStart(void *context)
         RendererSetContentService(NULL);
         return 0u;
     }
+    LaiueModuleServiceV1 deviceV2Published = {
+        .name = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
+        .version = LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
+        .table = &state->deviceServiceV2,
+        .tableSize = sizeof(state->deviceServiceV2),
+    };
+    if (state->host->publishService(state->host->context, &deviceV2Published) !=
+        LAIUE_MODULE_OK)
+    {
+        (void)state->host->unpublishService(state->host->context,
+                                             LAIUE_GRAPHICS_DEVICE_SERVICE_NAME);
+        (void)state->host->unpublishService(state->host->context,
+                                             LAIUE_GRAPHICS_SERVICE_NAME);
+        state->content = NULL;
+        RendererSetContentService(NULL);
+        return 0u;
+    }
     return 1u;
 }
 
@@ -545,6 +884,8 @@ static void ModuleStop(void *context)
     LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
     if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
     {
+        (void)state->host->unpublishService(state->host->context,
+                                            LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2);
         (void)state->host->unpublishService(state->host->context,
                                              LAIUE_GRAPHICS_DEVICE_SERVICE_NAME);
         (void)state->host->unpublishService(state->host->context,
@@ -574,6 +915,7 @@ static void ModuleDestroy(void *context)
 static const char *const provides[] = {
     LAIUE_GRAPHICS_SERVICE_NAME,
     LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
+    LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
 };
 static const LaiueModuleRequirementV1 optionalServices[] = {
     {LAIUE_CONTENT_SERVICE_NAME, LAIUE_CONTENT_SERVICE_ABI_VERSION_1},

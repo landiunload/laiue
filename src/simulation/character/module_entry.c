@@ -10,6 +10,9 @@ struct LaiueCharacterControllerV1
     int64_t halfExtent;
     LaiueCharacterPositionV1 position;
     int64_t verticalVelocity;
+    int64_t horizontalRemainderX;
+    int64_t horizontalRemainderY;
+    int64_t verticalRemainder;
     uint32_t grounded;
 };
 
@@ -52,6 +55,22 @@ static bool MultiplyInt64Checked(int64_t left, int64_t right, int64_t *out)
             return false;
     }
     *out = left * right;
+    return true;
+}
+
+static bool DivideTickChecked(int64_t value, int64_t remainder,
+                              int64_t *outDelta, int64_t *outRemainder)
+{
+    if (outDelta == NULL || outRemainder == NULL ||
+        remainder <= -(int64_t)LAIUE_CHARACTER_TICK_HZ ||
+        remainder >= (int64_t)LAIUE_CHARACTER_TICK_HZ)
+        return false;
+    if ((value > 0 && remainder > INT64_MAX - value) ||
+        (value < 0 && remainder < INT64_MIN - value))
+        return false;
+    const int64_t total = value + remainder;
+    *outDelta = total / LAIUE_CHARACTER_TICK_HZ;
+    *outRemainder = total % LAIUE_CHARACTER_TICK_HZ;
     return true;
 }
 
@@ -98,6 +117,9 @@ static uint32_t CharacterCreate(
     controller->collision.structSize = sizeof(controller->collision);
     controller->collision.abiVersion = LAIUE_CHARACTER_ABI_VERSION_1;
     controller->halfExtent = halfExtent;
+    controller->horizontalRemainderX = 0;
+    controller->horizontalRemainderY = 0;
+    controller->verticalRemainder = 0;
     controller->grounded = 0u;
     *outController = controller;
     return 1u;
@@ -130,8 +152,14 @@ static uint32_t CharacterSetPosition(
         return 0u;
     controller->position = normalized;
     controller->grounded = grounded != 0u ? 1u : 0u;
+    controller->horizontalRemainderX = 0;
+    controller->horizontalRemainderY = 0;
+    controller->verticalRemainder = 0;
     if (controller->grounded)
+    {
         controller->verticalVelocity = 0;
+        controller->verticalRemainder = 0;
+    }
     return 1u;
 }
 
@@ -155,19 +183,31 @@ static uint32_t CharacterStep(
     if (!MultiplyInt64Checked(speed, (int64_t)input->moveX, &deltaX) ||
         !MultiplyInt64Checked(speed, (int64_t)input->moveY, &deltaY))
         return 0u;
-    deltaX /= LAIUE_CHARACTER_TICK_HZ;
-    deltaY /= LAIUE_CHARACTER_TICK_HZ;
-
-    if ((input->flags & LAIUE_CHARACTER_INPUT_JUMP) != 0u && controller->grounded != 0u)
-    {
-        controller->verticalVelocity = LAIUE_CHARACTER_JUMP_SPEED;
-        controller->grounded = 0u;
-    }
-    if (controller->verticalVelocity > INT64_MIN + LAIUE_CHARACTER_GRAVITY_PER_TICK)
-        controller->verticalVelocity -= LAIUE_CHARACTER_GRAVITY_PER_TICK;
-    else
+    int64_t remainderX = 0;
+    int64_t remainderY = 0;
+    if (!DivideTickChecked(deltaX, controller->horizontalRemainderX,
+                           &deltaX, &remainderX) ||
+        !DivideTickChecked(deltaY, controller->horizontalRemainderY,
+                           &deltaY, &remainderY))
         return 0u;
-    const int64_t deltaZ = controller->verticalVelocity / LAIUE_CHARACTER_TICK_HZ;
+
+    uint32_t candidateGrounded = controller->grounded;
+    int64_t candidateVelocity = controller->verticalVelocity;
+    int64_t candidateVerticalRemainder = controller->verticalRemainder;
+    if ((input->flags & LAIUE_CHARACTER_INPUT_JUMP) != 0u && candidateGrounded != 0u)
+    {
+        candidateVelocity = LAIUE_CHARACTER_JUMP_SPEED;
+        candidateVerticalRemainder = 0;
+        candidateGrounded = 0u;
+    }
+    if (candidateVelocity < INT64_MIN + LAIUE_CHARACTER_GRAVITY_PER_TICK)
+        return 0u;
+    candidateVelocity -= LAIUE_CHARACTER_GRAVITY_PER_TICK;
+    int64_t deltaZ = 0;
+    int64_t remainderZ = 0;
+    if (!DivideTickChecked(candidateVelocity, candidateVerticalRemainder,
+                           &deltaZ, &remainderZ))
+        return 0u;
 
     LaiueCharacterPositionV1 next = controller->position;
     uint32_t grounded = 0u;
@@ -176,7 +216,7 @@ static uint32_t CharacterStep(
         if (controller->collision.sweepAabb(
                 &controller->collision, &controller->position, controller->halfExtent,
                 deltaX, deltaY, deltaZ, &next, &grounded) == 0u)
-            return 0u;
+                return 0u;
     }
     else if (!AddInt64Checked(next.localX, deltaX, &next.localX) ||
              !AddInt64Checked(next.localY, deltaY, &next.localY) ||
@@ -186,8 +226,15 @@ static uint32_t CharacterStep(
         return 0u;
     controller->position = next;
     controller->grounded = grounded != 0u ? 1u : 0u;
+    controller->horizontalRemainderX = remainderX;
+    controller->horizontalRemainderY = remainderY;
+    controller->verticalRemainder = remainderZ;
+    controller->verticalVelocity = candidateVelocity;
     if (controller->grounded)
+    {
         controller->verticalVelocity = 0;
+        controller->verticalRemainder = 0;
+    }
     return 1u;
 }
 

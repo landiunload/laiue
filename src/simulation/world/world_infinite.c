@@ -94,6 +94,13 @@ static WorldAllocator NormalizeAllocator(const WorldAllocator *allocator)
     return (WorldAllocator){0};
 }
 
+static bool WorldAllocatorIsComplete(const WorldAllocator *allocator)
+{
+    return allocator == NULL ||
+           (allocator->allocate != NULL && allocator->reallocate != NULL &&
+            allocator->free != NULL);
+}
+
 static void *WorldAllocateMemory(const WorldAllocator *allocator, size_t size, bool zero)
 {
     void *memory = allocator != NULL && allocator->allocate != NULL
@@ -558,6 +565,11 @@ World* WorldCreateWithNumericService(const WorldBaseProvider* provider,
 World* WorldCreateWithNumericServiceAndAllocator(const WorldBaseProvider* provider,
     const LaiueNumericServiceV1* numeric, const WorldAllocator* allocator)
 {
+    /* Do not mix a user heap with the platform heap on later growth paths. */
+    if (!WorldAllocatorIsComplete(allocator))
+    {
+        return NULL;
+    }
     if (provider != NULL && provider->getBlock == NULL)
     {
         return NULL;

@@ -7,6 +7,7 @@
 #include "walk_runtime.h"
 #if defined(LAIUE_WALK_WINDOWED)
 #include "graphics/graphics_device_service.h"
+#include "render/chunk_geometry.h"
 #include "render/graphics_service.h"
 #include "input/input_service.h"
 #include "platform/window_service.h"
@@ -368,8 +369,14 @@ static bool WalkIsSolid(const LaiueVoxelProviderV1 *provider, int64_t x, int64_t
 {
     LaiueVoxelCoordV1 coordinate = {x, y, z};
     LaiueVoxelBlockV1 block = {0u, 0u};
-    return provider != NULL && provider->getBlock != NULL &&
-           provider->getBlock(provider, &coordinate, &block) != 0u && block.material != 0u;
+    if (provider == NULL || provider->getBlock == NULL)
+        return true;
+    /* A provider error is a collision failure, not air.  Conservatively
+     * treating it as solid prevents the character from tunnelling through a
+     * missing/failed voxel service. */
+    if (provider->getBlock(provider, &coordinate, &block) == 0u)
+        return true;
+    return block.material != 0u;
 }
 
 LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
@@ -431,12 +438,59 @@ typedef struct WalkWindowState
     uint32_t fontWidth;
     uint32_t fontHeight;
     LaiueCharacterControllerV1 *controller;
+    LaiueGraphicsHandle terrainBuffer;
+    bool terrainReady;
     double lastTime;
     double accumulator;
     bool failed;
 } WalkWindowState;
 
 static LaiueUiQuadV1 walkUiQuads[LAIUE_GRAPHICS_UI_MAX_QUADS];
+
+static bool WalkDeviceFieldPresent(const LaiueGraphicsDeviceV1 *device,
+                                  size_t offset, size_t size)
+{
+    return device != NULL && (size_t)device->structSize >= offset &&
+           (size_t)device->structSize - offset >= size;
+}
+
+static bool WalkCreateTerrain(LaiueGraphicsDeviceV1 *device,
+                              LaiueGraphicsHandle *outBuffer)
+{
+    if (device == NULL || outBuffer == NULL || device->createBuffer == NULL ||
+        device->uploadBuffer == NULL)
+        return false;
+    const ChunkQuad quads[] = {
+        /* grass surface, two side walls and a lower earth layer */
+        PackChunkQuad(0u, 0u, 0u, 4u, 1u, 64u, 64u, 1u),
+        PackChunkQuad(0u, 0u, 0u, 0u, 2u, 1u, 64u, 4u),
+        PackChunkQuad(63u, 0u, 0u, 1u, 2u, 1u, 64u, 4u),
+        PackChunkQuad(0u, 0u, 0u, 2u, 2u, 64u, 1u, 4u),
+        PackChunkQuad(0u, 63u, 0u, 3u, 2u, 64u, 1u, 4u),
+    };
+    LaiueGraphicsBufferDescV1 description = {
+        .structSize = sizeof(description),
+        .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING,
+        .sizeBytes = sizeof(quads),
+    };
+    *outBuffer = 0u;
+    if (device->createBuffer(device, &description, outBuffer) == 0u)
+        return false;
+    LaiueGraphicsBufferUploadV1 upload = {
+        .structSize = sizeof(upload),
+        .buffer = *outBuffer,
+        .data = quads,
+        .sizeBytes = sizeof(quads),
+    };
+    if (device->uploadBuffer(device, &upload) == 0u)
+    {
+        if (device->destroyHandle != NULL)
+            device->destroyHandle(device, *outBuffer);
+        *outBuffer = 0u;
+        return false;
+    }
+    return true;
+}
 
 static void WalkRawInput(void *opaque, void *rawInput)
 {
@@ -450,7 +504,7 @@ static void WalkWindowFrame(void *opaque)
 {
     WalkWindowState *state = (WalkWindowState *)opaque;
     if (state == NULL || state->window == NULL || state->input == NULL ||
-        state->device == NULL || state->controller == NULL)
+        state->device == NULL)
         return;
     if (state->windowService->consumeFocusLoss != NULL &&
         state->windowService->consumeFocusLoss(state->window) != 0 &&
@@ -480,7 +534,8 @@ static void WalkWindowFrame(void *opaque)
     state->accumulator += elapsed;
     const double fixedStep = 1.0 / 128.0;
     uint32_t ticks = 0u;
-    while (state->accumulator >= fixedStep && ticks < 8u)
+    while (state->controller != NULL && state->characterService != NULL &&
+           state->accumulator >= fixedStep && ticks < 8u)
     {
         LaiueCharacterInputV1 input = {0};
         input.moveX = (state->inputService->isKeyDown(state->input, INPUT_KEY_D) ? 1 : 0) -
@@ -541,7 +596,10 @@ static void WalkWindowFrame(void *opaque)
                                             (float)mouseX, (float)mouseY, mouseDown,
                                             mousePressed, wheel, (float)elapsed) != 0u)
                 {
-                    if (state->device->setUiFontAtlas != NULL &&
+                    if (WalkDeviceFieldPresent(state->device,
+                            offsetof(LaiueGraphicsDeviceV1, setUiFontAtlas),
+                            sizeof(state->device->setUiFontAtlas)) &&
+                        state->device->setUiFontAtlas != NULL &&
                         state->uiService->getFontAtlas != NULL)
                     {
                         const uint8_t *pixels = NULL;
@@ -576,10 +634,22 @@ static void WalkWindowFrame(void *opaque)
                     if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
                                                        LAIUE_GRAPHICS_UI_MAX_QUADS,
                                                        &quadCount) == 0u ||
+                        !WalkDeviceFieldPresent(state->device,
+                            offsetof(LaiueGraphicsDeviceV1, submitUi),
+                            sizeof(state->device->submitUi)) ||
                         state->device->submitUi == NULL ||
                         state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
                         state->failed = true;
                 }
+            }
+            if (state->terrainReady && state->device->submit != NULL)
+            {
+                LaiueGraphicsDrawItemV1 terrainDraw = {
+                    .vertexBuffer = state->terrainBuffer,
+                    .indexCount = 30u,
+                };
+                if (state->device->submit(state->device, &terrainDraw, 1u) == 0u)
+                    state->failed = true;
             }
             if (state->device->endFrame(state->device) == 0u)
                 state->failed = true;
@@ -817,8 +887,6 @@ static bool RunWalkExample(bool headless)
         .context = &walkProvider,
         .sweepAabb = WalkSweepAabb,
     };
-    success = success && character->create(&collision, 400, &controller) != 0u &&
-              controller != NULL;
     LaiueCharacterPositionV1 start = {
         .cellX = (int64_t)1 << 40,
         .cellY = -((int64_t)1 << 39),
@@ -826,7 +894,21 @@ static bool RunWalkExample(bool headless)
         .localY = 0,
         .localZ = 1400,
     };
-    success = success && character->setPosition(controller, &start, 1u) != 0u;
+    bool characterReady = false;
+    if (character != NULL && character->create != NULL && character->setPosition != NULL)
+    {
+        characterReady = character->create(&collision, 400, &controller) != 0u &&
+                         controller != NULL &&
+                         character->setPosition(controller, &start, 1u) != 0u;
+        if (!characterReady && controller != NULL && character->destroy != NULL)
+        {
+            character->destroy(controller);
+            controller = NULL;
+        }
+    }
+    if (!characterReady)
+        PlatformWriteConsoleUtf8(
+            "laiue walk: character module unavailable; continuing diagnostic shell\n");
 
     bool ranWindow = false;
 #if defined(LAIUE_WALK_WINDOWED)
@@ -898,7 +980,7 @@ static bool RunWalkExample(bool headless)
                     .inputService = inputService,
                     .graphicsService = graphicsService,
                     .uiService = walkUiService,
-                    .characterService = character,
+                    .characterService = characterReady ? character : NULL,
                     .window = window,
                     .input = input,
                     .device = device,
@@ -906,6 +988,9 @@ static bool RunWalkExample(bool headless)
                     .controller = controller,
                     .lastTime = PlatformMonotonicSeconds(),
                 };
+                state.terrainReady = WalkCreateTerrain(device, &state.terrainBuffer);
+                if (!state.terrainReady)
+                    state.failed = true;
                 windowService->setRawInputCallback(window, WalkRawInput, &state);
                 windowService->setMouseLook(window, false);
                 PlatformWriteConsoleUtf8(
@@ -915,6 +1000,8 @@ static bool RunWalkExample(bool headless)
                 ranWindow = true;
                 if (!state.failed)
                     PlatformWriteConsoleUtf8("laiue walk: windowed session ended cleanly\n");
+                if (state.terrainReady && state.device->destroyHandle != NULL)
+                    state.device->destroyHandle(state.device, state.terrainBuffer);
                 graphicsService->destroyDevice(device);
             }
             else
@@ -955,6 +1042,8 @@ static bool RunWalkExample(bool headless)
                   earth.material == 2u &&
                   walkProvider.getBlock(&walkProvider, &stoneCoordinate, &stone) != 0u &&
                   stone.material == 3u;
+        if (characterReady)
+        {
         /* One jump takes a little over one second with the fixed-point gravity
          * constants. Run two fixed-step seconds so the smoke test observes both
          * the airborne path and a deterministic landing on z=0. */
@@ -978,6 +1067,12 @@ static bool RunWalkExample(bool headless)
                                          ? "laiue walk: infinite-coordinate rebase passed\n"
                                          : "laiue walk: infinite-coordinate rebase failed\n");
             success = end.cellX != start.cellX;
+        }
+        }
+        else
+        {
+            PlatformWriteConsoleUtf8(
+                "laiue walk: terrain diagnostics passed; character controls disabled\n");
         }
     }
 

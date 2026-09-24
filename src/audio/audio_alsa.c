@@ -183,7 +183,8 @@ bool AudioSystemBackendCreate(const AudioBackendDescription *description,
 
     if (!AlsaApiLoad(&backend->api))
     {
-        PlatformFree(backend);
+        /* The backend belongs to the allocator supplied by the host. */
+        AudioBackendFree(&backend->base.allocator, backend);
         return false;
     }
 

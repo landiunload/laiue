@@ -52,9 +52,16 @@ static uint32_t SweepFlatFloor(const LaiueCharacterCollisionV1 *collision,
                                int64_t deltaZ, LaiueCharacterPositionV1 *outPosition,
                                uint32_t *outGrounded)
 {
-    (void)collision;
+    const bool *fail = collision != NULL ? (const bool *)collision->context : NULL;
     if (position == NULL || outPosition == NULL || outGrounded == NULL)
         return 0u;
+    if (fail != NULL && *fail)
+    {
+        *outPosition = *position;
+        outPosition->localX += INT64_C(999999);
+        *outGrounded = 0u;
+        return 0u;
+    }
     *outPosition = *position;
     outPosition->localX += deltaX;
     outPosition->localY += deltaY;
@@ -150,6 +157,32 @@ LAIUE_TEST_ENTRY(CharacterModuleTestEntryPoint)
            "horizontal rebasing crosses the cell boundary exactly");
     Expect(character->isGrounded(controller) != 0u,
            "floor collision restores grounded state");
+
+    bool collisionFails = true;
+    LaiueCharacterCollisionV1 failingCollision = {
+        .structSize = sizeof(failingCollision),
+        .abiVersion = LAIUE_CHARACTER_ABI_VERSION_1,
+        .context = &collisionFails,
+        .sweepAabb = SweepFlatFloor,
+    };
+    /* The controller owns a copy of its callback table.  Recreate it with a
+     * failing callback and verify that no position/state mutation leaks out
+     * when the provider rejects a step. */
+    character->destroy(controller);
+    controller = NULL;
+    Expect(character->create(&failingCollision, 500, &controller) != 0u &&
+               character->setPosition(controller, &initial, 1u) != 0u,
+           "character recreates for failure-atomicity check");
+    LaiueCharacterPositionV1 beforeFailure;
+    Expect(character->getPosition(controller, &beforeFailure) != 0u,
+           "position is readable before failed step");
+    LaiueCharacterInputV1 input = {.moveX = 1, .moveY = 0, .flags = 0u};
+    Expect(character->step(controller, &input) == 0u,
+           "collision failure is reported");
+    LaiueCharacterPositionV1 afterFailure;
+    Expect(character->getPosition(controller, &afterFailure) != 0u &&
+               memcmp(&beforeFailure, &afterFailure, sizeof(beforeFailure)) == 0,
+           "failed collision step leaves position unchanged");
     character->destroy(controller);
 
     LaiueModuleHostUnloadAll(host);
