@@ -152,8 +152,14 @@ extern bool RendererUiSetFontAtlas_D3D12(Renderer* renderer, const uint8_t* alph
 extern bool RendererUiLoadBackground_D3D12(Renderer* renderer, const wchar_t* path, uint32_t* outWidth, uint32_t* outHeight);
 extern void RendererUiQueue_D3D12(Renderer* renderer, const RendererUiQuad* quads, uint32_t count);
 extern RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount);
+extern RendererMesh* RendererCreateGenericMesh_D3D12(Renderer *renderer,
+                                                       const RendererGenericVertex *vertices,
+                                                       uint32_t vertexCount);
 extern void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
+extern void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                                          const float originRelative[3], float scale,
+                                          uint32_t firstVertex, uint32_t vertexCount);
 extern void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mesh, const RendererMeshInstance* instances, uint32_t instanceCount);
 extern void RendererResize_D3D12(Renderer* renderer, int32_t width, int32_t height);
 extern bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -185,8 +191,14 @@ extern bool RendererUiSetFontAtlas_Vulkan(Renderer* renderer, const uint8_t* alp
 extern bool RendererUiLoadBackground_Vulkan(Renderer* renderer, const wchar_t* path, uint32_t* outWidth, uint32_t* outHeight);
 extern void RendererUiQueue_Vulkan(Renderer* renderer, const RendererUiQuad* quads, uint32_t count);
 extern RendererMesh* RendererCreateMesh_Vulkan(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount);
+extern RendererMesh* RendererCreateGenericMesh_Vulkan(Renderer *renderer,
+                                                       const RendererGenericVertex *vertices,
+                                                       uint32_t vertexCount);
 extern void RendererDestroyMesh_Vulkan(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_Vulkan(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
+extern void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
+                                           const float originRelative[3], float scale,
+                                           uint32_t firstVertex, uint32_t vertexCount);
 extern void RendererDrawMeshInstances_Vulkan(Renderer* renderer, const RendererMesh* mesh, const RendererMeshInstance* instances, uint32_t instanceCount);
 extern void RendererResize_Vulkan(Renderer* renderer, int32_t width, int32_t height);
 extern bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -538,6 +550,25 @@ RendererMesh* RendererCreateMesh(Renderer* renderer, const ChunkQuad* quads, uin
     return NULL;
 }
 
+RendererMesh *RendererCreateGenericMesh(Renderer *renderer,
+                                         const RendererGenericVertex *vertices,
+                                         uint32_t vertexCount)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCreateGenericMesh_D3D12(renderer, vertices, vertexCount);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCreateGenericMesh_Vulkan(renderer, vertices, vertexCount);
+#endif
+    default: break;
+    }
+    return NULL;
+}
+
 void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh)
 {
     switch (LookupBackend(renderer))
@@ -568,6 +599,35 @@ void RendererDrawMesh(Renderer* renderer, const RendererMesh* mesh, const float 
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
         RendererDrawMesh_Vulkan(renderer, mesh, chunkOriginRelative);
+        return;
+#endif
+    default: break;
+    }
+}
+
+void RendererDrawGenericMesh(Renderer *renderer, const RendererMesh *mesh,
+                             const float originRelative[3], float scale)
+{
+    RendererDrawGenericMeshRange(renderer, mesh, originRelative, scale, 0u,
+                                  UINT32_MAX);
+}
+
+void RendererDrawGenericMeshRange(Renderer *renderer, const RendererMesh *mesh,
+                                  const float originRelative[3], float scale,
+                                  uint32_t firstVertex, uint32_t vertexCount)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        RendererDrawGenericMesh_D3D12(renderer, mesh, originRelative, scale,
+                                       firstVertex, vertexCount);
+        return;
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        RendererDrawGenericMesh_Vulkan(renderer, mesh, originRelative, scale,
+                                        firstVertex, vertexCount);
         return;
 #endif
     default: break;

@@ -27,13 +27,26 @@ typedef struct LaiueGraphicsUiQuadV1
 
 typedef uint64_t LaiueGraphicsHandle;
 
-/* Buffer flags are backend-neutral.  VERTEX_PULLING is a compact, tightly
- * packed geometry stream consumed by the renderer's built-in batch pipeline;
- * the provider owns the actual GPU representation. */
+/* Buffer flags are backend-neutral.  VERTEX is the standard mesh stream
+ * below; VERTEX_PULLING is the separate compact chunk adapter used by
+ * voxel_render. */
 #define LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX UINT32_C(1) << 0
 #define LAIUE_GRAPHICS_BUFFER_USAGE_INDEX UINT32_C(1) << 1
 #define LAIUE_GRAPHICS_BUFFER_USAGE_STORAGE UINT32_C(1) << 2
 #define LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING UINT32_C(1) << 3
+
+/* The first portable mesh record.  It is intentionally fixed-width and
+ * contains no voxel/material/world fields.  Indexed and non-indexed V2 draws
+ * consume this exact 24-byte layout. */
+typedef struct LaiueGraphicsVertexV2
+{
+    float position[3];
+    float uv[2];
+    uint32_t colorRGBA;
+} LaiueGraphicsVertexV2;
+
+_Static_assert(sizeof(LaiueGraphicsVertexV2) == 24u,
+               "portable graphics vertex must match generic.hlsl");
 
 typedef struct LaiueGraphicsExtentV1
 {

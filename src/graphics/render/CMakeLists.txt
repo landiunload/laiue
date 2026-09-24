@@ -18,6 +18,11 @@ laiue_compile_shader(ui
     OUTPUT_DIRECTORY "${generated_directory}"
     FALLBACK_DIRECTORY "${fallback_directory}"
     OUTPUT_VARIABLE ui_shader_headers)
+laiue_compile_shader(generic
+    SOURCE "${PROJECT_SOURCE_DIR}/shaders/generic.hlsl"
+    OUTPUT_DIRECTORY "${generated_directory}"
+    FALLBACK_DIRECTORY "${fallback_directory}"
+    OUTPUT_VARIABLE generic_shader_headers)
 
 # Физически доступный на этой платформе набор бэкендов. Оба могут быть
 # слинкованы в один бинарник; выбор бэкенда при создании делает
@@ -126,6 +131,7 @@ laiue_add_module(render
         ${chunk_shader_headers}
         ${panorama_shader_headers}
         ${ui_shader_headers}
+        ${generic_shader_headers}
     LINK
         ${backend_links}
         laiue::media_support)
@@ -168,7 +174,8 @@ if(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS AND
         ../../api.h
         ${chunk_shader_headers}
         ${panorama_shader_headers}
-        ${ui_shader_headers})
+        ${ui_shader_headers}
+        ${generic_shader_headers})
 
     if(WIN32)
         laiue_add_module(graphics_d3d12

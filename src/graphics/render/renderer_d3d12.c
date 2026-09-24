@@ -11,6 +11,8 @@
 #include "render/generated/d3d12/panorama_ps.h"
 #include "render/generated/d3d12/ui_vs.h"
 #include "render/generated/d3d12/ui_ps.h"
+#include "render/generated/d3d12/generic_vs.h"
+#include "render/generated/d3d12/generic_ps.h"
 #include "render/texture_pack_internal.h"
 #include "render/content_provider.h"
 #include "render/ui_image_wic.h"
@@ -151,6 +153,8 @@ struct RendererMesh
     uint32_t offsetBytes;
     uint32_t sizeBytes;
     uint32_t quadCount;
+    uint32_t vertexCount;
+    bool generic;
 };
 
 struct Renderer
@@ -173,6 +177,7 @@ struct Renderer
     UINT                       frameIndex;
     ID3D12RootSignature*       rootSignature;
     ID3D12PipelineState*       pipelineState;
+    ID3D12PipelineState*       genericPipelineState;
     ID3D12Resource*            blockTexture;
     ID3D12Resource*            blockTextureUpload;
     ID3D12Resource*            blockNormalTexture;
@@ -271,6 +276,8 @@ static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
                                                void *const shaders[LAIUE_SHADER_SLOT_COUNT],
                                                const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
                                                ID3D12PipelineState **outPipelineState);
+static bool CreateGenericPipelineState(Renderer *renderer,
+                                       ID3D12PipelineState **outPipelineState);
 static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
                                                  void *const shaders[LAIUE_SHADER_SLOT_COUNT],
                                                  const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
@@ -669,7 +676,9 @@ static bool CreateRootSignature(Renderer* renderer)
 static bool CreatePipelineState(Renderer* renderer)
 {
     return CreateChunkPipelineStateForShaders(
-        renderer, renderer->loadedShaders, renderer->loadedShaderLengths, &renderer->pipelineState);
+               renderer, renderer->loadedShaders, renderer->loadedShaderLengths,
+               &renderer->pipelineState) &&
+           CreateGenericPipelineState(renderer, &renderer->genericPipelineState);
 }
 
 // Общий путь создания texture array блоков (albedo или нормали):
@@ -1718,9 +1727,12 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
     renderer->resolveRootSignature = NULL;
     if (renderer->pipelineState != NULL)
         ID3D12PipelineState_Release(renderer->pipelineState);
+    if (renderer->genericPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->genericPipelineState);
     if (renderer->rootSignature != NULL)
         ID3D12RootSignature_Release(renderer->rootSignature);
     renderer->pipelineState = NULL;
+    renderer->genericPipelineState = NULL;
     renderer->rootSignature = NULL;
     if (renderer->depthBuffer != NULL)
         ID3D12Resource_Release(renderer->depthBuffer);
@@ -1920,17 +1932,16 @@ static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
     return true;
 }
 
-RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount)
+static RendererMesh *CreateMeshFromBytes_D3D12(Renderer *renderer, const void *data,
+                                               uint32_t sizeBytes, uint32_t elementCount,
+                                               bool generic)
 {
-    if (renderer == NULL || !renderer->worldReady || quads == NULL
-        || quadCount == 0
-        || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad)
+    if (renderer == NULL || !renderer->worldReady || data == NULL
+        || sizeBytes == 0u || elementCount == 0u
         || renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
     {
         return NULL;
     }
-
-    uint32_t sizeBytes = quadCount * (uint32_t)sizeof(ChunkQuad);
 
     uint32_t blockIndex;
     uint32_t offsetBytes;
@@ -1950,7 +1961,7 @@ RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quad
     {
         staging = renderer->meshUploadBuffers[frameIndex];
         memcpy(renderer->meshUploadMapped[frameIndex] + sourceOffset,
-            quads, sizeBytes);
+            data, sizeBytes);
         renderer->meshUploadOffsets[frameIndex] = sourceOffset + sizeBytes;
     }
     else
@@ -1968,7 +1979,7 @@ RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quad
             sourceOffset = largeOffset;
             usedLargeRing = true;
             memcpy(renderer->largeMeshUploadMapped[frameIndex] + largeOffset,
-                quads, sizeBytes);
+                data, sizeBytes);
             renderer->largeMeshUploadOffsets[frameIndex] = largeOffset + sizeBytes;
         }
         else
@@ -2001,7 +2012,7 @@ RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quad
                     renderer->poolUsedBytes -= sizeBytes;
                 return NULL;
             }
-            memcpy(mapped, quads, sizeBytes);
+            memcpy(mapped, data, sizeBytes);
             ID3D12Resource_Unmap(staging, 0, NULL);
             sourceOffset = 0;
             ownsStaging = true;
@@ -2023,7 +2034,9 @@ RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quad
     mesh->blockIndex = blockIndex;
     mesh->offsetBytes = offsetBytes;
     mesh->sizeBytes = sizeBytes;
-    mesh->quadCount = quadCount;
+    mesh->quadCount = generic ? 0u : elementCount;
+    mesh->vertexCount = generic ? elementCount : 0u;
+    mesh->generic = generic;
 
     PendingUpload* upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
     upload->staging = staging;
@@ -2034,6 +2047,28 @@ RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQuad* quad
     upload->ownsStaging = ownsStaging;
 
     return mesh;
+}
+
+RendererMesh *RendererCreateMesh_D3D12(Renderer *renderer, const ChunkQuad *quads,
+                                        uint32_t quadCount)
+{
+    if (quadCount == 0u || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad))
+        return NULL;
+    return CreateMeshFromBytes_D3D12(renderer, quads,
+                                     quadCount * (uint32_t)sizeof(ChunkQuad),
+                                     quadCount, false);
+}
+
+RendererMesh *RendererCreateGenericMesh_D3D12(Renderer *renderer,
+                                               const RendererGenericVertex *vertices,
+                                               uint32_t vertexCount)
+{
+    if (vertexCount == 0u ||
+        vertexCount > UINT32_MAX / (uint32_t)sizeof(RendererGenericVertex))
+        return NULL;
+    return CreateMeshFromBytes_D3D12(renderer, vertices,
+                                     vertexCount * (uint32_t)sizeof(RendererGenericVertex),
+                                     vertexCount, true);
 }
 
 void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh)
@@ -2062,7 +2097,13 @@ void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh)
 void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
     const float chunkOriginRelative[3])
 {
+    if (renderer == NULL || mesh == NULL || mesh->generic ||
+        renderer->commandList == NULL || renderer->pipelineState == NULL)
+        return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+
+    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+                                               renderer->pipelineState);
 
     float transform[4] = {
         chunkOriginRelative[0], chunkOriginRelative[1],
@@ -2075,6 +2116,39 @@ void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += mesh->quadCount;
+}
+
+void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                                   const float originRelative[3], float scale,
+                                   uint32_t firstVertex, uint32_t vertexCount)
+{
+    if (renderer == NULL || mesh == NULL || !mesh->generic ||
+        renderer->commandList == NULL || renderer->genericPipelineState == NULL ||
+        firstVertex > mesh->vertexCount ||
+        (vertexCount != UINT32_MAX && vertexCount > mesh->vertexCount - firstVertex))
+        return;
+    if (vertexCount == UINT32_MAX)
+        vertexCount = mesh->vertexCount - firstVertex;
+    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
+    const float origin[3] = {
+        originRelative != NULL ? originRelative[0] : 0.0f,
+        originRelative != NULL ? originRelative[1] : 0.0f,
+        originRelative != NULL ? originRelative[2] : 0.0f,
+    };
+    const float transform[4] = {origin[0], origin[1], origin[2], scale};
+    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+                                               renderer->genericPipelineState);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+        renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform,
+        ROOT_CONSTANT_ORIGIN_OFFSET);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
+        block->address + mesh->offsetBytes +
+            firstVertex * (UINT64)sizeof(RendererGenericVertex));
+    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
+                                             vertexCount, 1u, 0u, 0u);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += vertexCount / 3u;
 }
 
 void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mesh,
@@ -2096,7 +2170,11 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
     InstanceChunk* chunk = &renderer->instanceChunks[slot][chunkIndex];
     memcpy(chunk->mapped + offset, instances, bytes);
 
+    if (mesh->generic || renderer->commandList == NULL || renderer->pipelineState == NULL)
+        return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
+    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
+                                               renderer->pipelineState);
     float transform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
         renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform,
@@ -2808,6 +2886,40 @@ static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
         renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
 }
 
+static bool CreateGenericPipelineState(Renderer *renderer,
+                                       ID3D12PipelineState **outPipelineState)
+{
+    if (renderer == NULL || outPipelineState == NULL)
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->rootSignature;
+    description.VS.pShaderBytecode = g_generic_vs;
+    description.VS.BytecodeLength = sizeof(g_generic_vs);
+    description.PS.pShaderBytecode = g_generic_ps;
+    description.PS.BytecodeLength = sizeof(g_generic_ps);
+    description.RasterizerState.FillMode = renderer->wireframeEnabled
+        ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    description.RasterizerState.FrontCounterClockwise = FALSE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.DepthStencilState.DepthEnable = TRUE;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    description.SampleDesc.Count = 1;
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState,
+        (void **)outPipelineState));
+}
+
 static bool RecreateChunkPipelineState(Renderer *renderer)
 {
     ID3D12PipelineState *replacement = NULL;
@@ -2817,6 +2929,17 @@ static bool RecreateChunkPipelineState(Renderer *renderer)
     if (renderer->pipelineState != NULL)
         ID3D12PipelineState_Release(renderer->pipelineState);
     renderer->pipelineState = replacement;
+    return true;
+}
+
+static bool RecreateGenericPipelineState(Renderer *renderer)
+{
+    ID3D12PipelineState *replacement = NULL;
+    if (!CreateGenericPipelineState(renderer, &replacement))
+        return false;
+    if (renderer->genericPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->genericPipelineState);
+    renderer->genericPipelineState = replacement;
     return true;
 }
 
@@ -2956,7 +3079,8 @@ void RendererSetWireframe_D3D12(Renderer* renderer, bool enabled)
     if (!renderer->worldReady) return;
 
     WaitForGpu(renderer);
-    RecreateChunkPipelineState(renderer);
+    (void)RecreateChunkPipelineState(renderer);
+    (void)RecreateGenericPipelineState(renderer);
 }
 
 bool RendererIsWireframe_D3D12(const Renderer* renderer)

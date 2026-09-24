@@ -176,6 +176,30 @@ LAIUE_TEST_ENTRY(RendererInstanceRingTestEntryPoint)
     RendererMesh *mesh = RendererCreateMesh(renderer, &quad, 1u);
     Expect(mesh != NULL, "the instanced mesh could not be created");
 
+    // The backend must also execute the backend-neutral generic vertex path;
+    // this deliberately bypasses ChunkQuad and only checks GPU submission
+    // counters because the hidden D3D12 window has no readback contract.
+    const RendererGenericVertex genericVertices[3] = {
+        { { -0.25f, -0.25f, 0.0f }, { 0.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.25f, -0.25f, 0.0f }, { 1.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.00f,  0.25f, 0.0f }, { 0.5f, 1.0f }, 0xFFFFFFFFu },
+    };
+    RendererMesh *genericMesh = RendererCreateGenericMesh(renderer,
+                                                           genericVertices, 3u);
+    Expect(genericMesh != NULL, "the generic D3D12 mesh could not be created");
+    RendererFrameSetup genericSetup;
+    BuildFrameSetup(&genericSetup);
+    Expect(RendererBeginFrame(renderer, &genericSetup),
+           "the generic D3D12 frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    Expect(RendererEndFrame(renderer), "the generic D3D12 frame could not end");
+    RendererStats genericStats;
+    RendererGetStats(renderer, &genericStats);
+    Expect(genericStats.drawCalls == 1u && genericStats.drawnQuads == 1u,
+           "the generic D3D12 mesh must reach the GPU draw path");
+    RendererDestroyMesh(renderer, genericMesh);
+
     const uint32_t capacity = BIG_INSTANCES_PER_DRAW;
     RendererMeshInstance *instances = (RendererMeshInstance *)PlatformAllocate(
         (size_t)capacity * sizeof(RendererMeshInstance), true);

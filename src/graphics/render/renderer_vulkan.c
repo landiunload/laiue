@@ -59,6 +59,8 @@ typedef struct LaiueWindowNativeHandleV1
 #include "render/generated/vulkan/panorama_ps.h"
 #include "render/generated/vulkan/ui_vs.h"
 #include "render/generated/vulkan/ui_ps.h"
+#include "render/generated/vulkan/generic_vs.h"
+#include "render/generated/vulkan/generic_ps.h"
 
 // Публичное имя RendererDestroy теперь живёт в renderer_dispatch.c, а
 // путь отката внутри RendererCreate_Vulkan зовёт суффиксную реализацию
@@ -230,6 +232,8 @@ struct RendererMesh
     // PoolFree, иначе хвост выравнивания оставался бы занятым навсегда.
     uint32_t poolSpanBytes;
     uint32_t quadCount;
+    uint32_t vertexCount;
+    bool generic;
 };
 
 typedef struct BlockTextureReplacement
@@ -301,6 +305,7 @@ struct Renderer
     VkPipelineLayout resolvePipelineLayout;
     VkPipelineLayout uiPipelineLayout;
     VkPipeline chunkPipeline;
+    VkPipeline genericPipeline;
     VkPipeline resolvePipeline;
     VkPipeline uiPipeline;
     VkDescriptorSet resolveSets[FRAME_COUNT];
@@ -1105,7 +1110,7 @@ static const void *SelectShader(const Renderer *renderer, LaiueShaderSlot slot,
                                 const void *fallback, uint32_t fallbackBytes,
                                 uint32_t *outSizeBytes)
 {
-    if (renderer->loadedShaders[slot] != NULL)
+    if (slot < LAIUE_SHADER_SLOT_COUNT && renderer->loadedShaders[slot] != NULL)
     {
         *outSizeBytes = renderer->loadedShaderLengths[slot];
         return renderer->loadedShaders[slot];
@@ -1267,6 +1272,24 @@ static bool CreateChunkPipeline(Renderer *renderer, VkPipeline *outPipeline)
         .vertexFallbackBytes = (uint32_t)sizeof(g_chunk_vs),
         .pixelFallback = g_chunk_ps,
         .pixelFallbackBytes = (uint32_t)sizeof(g_chunk_ps),
+        .layout = renderer->chunkPipelineLayout,
+        .depthTest = true,
+        .blend = false,
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .wireframe = renderer->wireframeEnabled,
+    };
+    return CreateGraphicsPipeline(renderer, &recipe, outPipeline);
+}
+
+static bool CreateGenericPipeline(Renderer *renderer, VkPipeline *outPipeline)
+{
+    PipelineRecipe recipe = {
+        .vertexSlot = LAIUE_SHADER_SLOT_COUNT,
+        .pixelSlot = LAIUE_SHADER_SLOT_COUNT,
+        .vertexFallback = g_generic_vs,
+        .vertexFallbackBytes = (uint32_t)sizeof(g_generic_vs),
+        .pixelFallback = g_generic_ps,
+        .pixelFallbackBytes = (uint32_t)sizeof(g_generic_ps),
         .layout = renderer->chunkPipelineLayout,
         .depthTest = true,
         .blend = false,
@@ -2762,6 +2785,11 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
         vkDestroyPipeline(renderer->device, renderer->chunkPipeline, NULL);
         renderer->chunkPipeline = VK_NULL_HANDLE;
     }
+    if (renderer->genericPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(renderer->device, renderer->genericPipeline, NULL);
+        renderer->genericPipeline = VK_NULL_HANDLE;
+    }
     ImageDestroy(renderer, &renderer->blockTexture);
     ImageDestroy(renderer, &renderer->blockNormalTexture);
     memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
@@ -2812,8 +2840,19 @@ bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *ca
         TexturePackRelease(&pack);
     }
 
-    if (!CreateChunkPipeline(renderer, &renderer->chunkPipeline))
+    if (!CreateChunkPipeline(renderer, &renderer->chunkPipeline) ||
+        !CreateGenericPipeline(renderer, &renderer->genericPipeline))
     {
+        if (renderer->genericPipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(renderer->device, renderer->genericPipeline, NULL);
+            renderer->genericPipeline = VK_NULL_HANDLE;
+        }
+        if (renderer->chunkPipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(renderer->device, renderer->chunkPipeline, NULL);
+            renderer->chunkPipeline = VK_NULL_HANDLE;
+        }
         ImageDestroy(renderer, &renderer->blockTexture);
         ImageDestroy(renderer, &renderer->blockNormalTexture);
         memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
@@ -2916,14 +2955,15 @@ static bool EnsureVulkanLargeMeshBuffer(Renderer *renderer, uint32_t frameIndex)
                         &renderer->largeMeshUploadBuffers[frameIndex]);
 }
 
-RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *quads, uint32_t quadCount)
+static RendererMesh *CreateMeshFromBytes_Vulkan(Renderer *renderer, const void *data,
+                                                uint32_t sizeBytes, uint32_t elementCount,
+                                                bool generic)
 {
-    if (renderer == NULL || !renderer->worldReady || quads == NULL || quadCount == 0u ||
-        quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad) ||
+    if (renderer == NULL || !renderer->worldReady || data == NULL || sizeBytes == 0u ||
+        elementCount == 0u ||
         renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
         return NULL;
 
-    uint32_t sizeBytes = quadCount * (uint32_t)sizeof(ChunkQuad);
     uint32_t allocatedBytes = PoolSpanBytes(renderer, sizeBytes);
     uint32_t blockIndex = 0u;
     uint32_t offsetBytes = 0u;
@@ -2946,7 +2986,7 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
     if (fitsSmallRing)
     {
         staging = renderer->meshUploadBuffers[renderer->frameIndex].buffer;
-        memcpy(renderer->meshUploadBuffers[renderer->frameIndex].mapped + sourceOffset, quads,
+        memcpy(renderer->meshUploadBuffers[renderer->frameIndex].mapped + sourceOffset, data,
                sizeBytes);
         renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset + sizeBytes;
     }
@@ -2965,7 +3005,7 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
             sourceOffset = largeOffset;
             usedLargeRing = true;
             memcpy(renderer->largeMeshUploadBuffers[renderer->frameIndex].mapped + largeOffset,
-                   quads, sizeBytes);
+                   data, sizeBytes);
             renderer->largeMeshUploadOffsets[renderer->frameIndex] = largeOffset + sizeBytes;
         }
         else
@@ -2977,7 +3017,7 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
                     renderer->poolUsedBytes -= allocatedBytes;
                 return NULL;
             }
-            memcpy(ownedStaging.mapped, quads, sizeBytes);
+            memcpy(ownedStaging.mapped, data, sizeBytes);
             staging = ownedStaging.buffer;
             sourceOffset = 0u;
             ownsStaging = true;
@@ -3000,7 +3040,9 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
     mesh->offsetBytes = offsetBytes;
     mesh->sizeBytes = sizeBytes;
     mesh->poolSpanBytes = allocatedBytes;
-    mesh->quadCount = quadCount;
+    mesh->quadCount = generic ? 0u : elementCount;
+    mesh->vertexCount = generic ? elementCount : 0u;
+    mesh->generic = generic;
 
     PendingUpload *upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
     upload->staging = staging;
@@ -3010,6 +3052,28 @@ RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *qua
     upload->destinationOffset = offsetBytes;
     upload->sizeBytes = sizeBytes;
     return mesh;
+}
+
+RendererMesh *RendererCreateMesh_Vulkan(Renderer *renderer, const ChunkQuad *quads,
+                                         uint32_t quadCount)
+{
+    if (quadCount == 0u || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad))
+        return NULL;
+    return CreateMeshFromBytes_Vulkan(renderer, quads,
+                                      quadCount * (uint32_t)sizeof(ChunkQuad),
+                                      quadCount, false);
+}
+
+RendererMesh *RendererCreateGenericMesh_Vulkan(Renderer *renderer,
+                                                const RendererGenericVertex *vertices,
+                                                uint32_t vertexCount)
+{
+    if (vertexCount == 0u ||
+        vertexCount > UINT32_MAX / (uint32_t)sizeof(RendererGenericVertex))
+        return NULL;
+    return CreateMeshFromBytes_Vulkan(renderer, vertices,
+                                      vertexCount * (uint32_t)sizeof(RendererGenericVertex),
+                                      vertexCount, true);
 }
 
 void RendererDestroyMesh_Vulkan(Renderer *renderer, RendererMesh *mesh)
@@ -3094,6 +3158,8 @@ static bool ReserveVulkanInstanceSpace(Renderer *renderer, uint32_t bytes,
 static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint32_t instanceCount,
                              uint32_t instanceChunkIndex, uint32_t instanceOffset)
 {
+    if (mesh == NULL || mesh->generic)
+        return;
     GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
     if (instanceChunkIndex >= INSTANCE_MAX_CHUNKS_PER_FRAME) return;
     VkDescriptorSet set = block->sets[instanceChunkIndex][renderer->frameIndex];
@@ -3117,22 +3183,73 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
 }
 
+static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh,
+                                    const float originRelative[3], float scale,
+                                    uint32_t firstVertex, uint32_t vertexCount)
+{
+    if (renderer == NULL || mesh == NULL || !mesh->generic ||
+        !renderer->renderingActive || renderer->genericPipeline == VK_NULL_HANDLE ||
+        firstVertex > mesh->vertexCount ||
+        (vertexCount != UINT32_MAX && vertexCount > mesh->vertexCount - firstVertex))
+        return;
+    if (vertexCount == UINT32_MAX)
+        vertexCount = mesh->vertexCount - firstVertex;
+    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
+    VkDescriptorSet set = block->sets[0][renderer->frameIndex];
+    if (set == VK_NULL_HANDLE)
+        return;
+    renderer->chunkConstants.chunkOriginRelative[0] =
+        originRelative != NULL ? originRelative[0] : 0.0f;
+    renderer->chunkConstants.chunkOriginRelative[1] =
+        originRelative != NULL ? originRelative[1] : 0.0f;
+    renderer->chunkConstants.chunkOriginRelative[2] =
+        originRelative != NULL ? originRelative[2] : 0.0f;
+    renderer->chunkConstants.meshScale = scale;
+    uint32_t constantOffset = 0u;
+    if (!PushConstants(renderer, &renderer->chunkConstants,
+                       sizeof(renderer->chunkConstants), &constantOffset))
+        return;
+    uint32_t dynamicOffsets[3] = {constantOffset, 0u, 0u};
+    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      renderer->genericPipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            renderer->chunkPipelineLayout, 0u, 1u, &set, 3u,
+                            dynamicOffsets);
+    vkCmdDraw(commandBuffer, vertexCount, 1u,
+              mesh->offsetBytes / (uint32_t)sizeof(RendererGenericVertex) + firstVertex,
+              0u);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += vertexCount / 3u;
+}
+
 void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                       const float chunkOriginRelative[3])
 {
-    if (renderer == NULL || mesh == NULL || !renderer->renderingActive) return;
+    if (renderer == NULL || mesh == NULL || mesh->generic || !renderer->renderingActive) return;
 
     renderer->chunkConstants.chunkOriginRelative[0] = chunkOriginRelative[0];
     renderer->chunkConstants.chunkOriginRelative[1] = chunkOriginRelative[1];
     renderer->chunkConstants.chunkOriginRelative[2] = chunkOriginRelative[2];
     renderer->chunkConstants.meshScale = 1.0f;
+    vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
+                      VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
     DrawMeshInternal(renderer, mesh, 1u, 0u, 0u);
+}
+
+void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
+                                    const float originRelative[3], float scale,
+                                    uint32_t firstVertex, uint32_t vertexCount)
+{
+    DrawGenericMeshInternal(renderer, mesh, originRelative,
+                            scale == 0.0f ? 1.0f : scale, firstVertex,
+                            vertexCount);
 }
 
 void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                                const RendererMeshInstance *instances, uint32_t instanceCount)
 {
-    if (renderer == NULL || mesh == NULL || instances == NULL || instanceCount == 0u ||
+    if (renderer == NULL || mesh == NULL || mesh->generic || instances == NULL || instanceCount == 0u ||
         !renderer->renderingActive ||
         instanceCount > INSTANCE_MAX_BYTES_PER_FRAME / (uint32_t)sizeof(RendererMeshInstance))
         return;
@@ -3152,6 +3269,8 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
     renderer->chunkConstants.chunkOriginRelative[1] = 0.0f;
     renderer->chunkConstants.chunkOriginRelative[2] = 0.0f;
     renderer->chunkConstants.meshScale = -1.0f;
+    vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
+                      VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
     DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset);
 }
 
@@ -3783,14 +3902,22 @@ void RendererSetWireframe_Vulkan(Renderer *renderer, bool enabled)
     if (!renderer->worldReady) return;
 
     VkPipeline replacement = VK_NULL_HANDLE;
-    if (!CreateChunkPipeline(renderer, &replacement))
+    VkPipeline genericReplacement = VK_NULL_HANDLE;
+    if (!CreateChunkPipeline(renderer, &replacement) ||
+        !CreateGenericPipeline(renderer, &genericReplacement))
     {
+        if (replacement != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, replacement, NULL);
+        if (genericReplacement != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, genericReplacement, NULL);
         renderer->wireframeEnabled = !enabled;
         return;
     }
     WaitForGpu(renderer);
     vkDestroyPipeline(renderer->device, renderer->chunkPipeline, NULL);
+    vkDestroyPipeline(renderer->device, renderer->genericPipeline, NULL);
     renderer->chunkPipeline = replacement;
+    renderer->genericPipeline = genericReplacement;
 }
 
 bool RendererIsWireframe_Vulkan(const Renderer *renderer)

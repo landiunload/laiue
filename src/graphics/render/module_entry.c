@@ -32,6 +32,11 @@ typedef struct LaiueGraphicsDeviceState
     uint32_t generations[256];
     uint64_t sizes[256];
     uint32_t usageFlags[256];
+    uint32_t vertexCounts[256];
+    LaiueGraphicsHandle meshIndexHandles[256];
+    uint32_t meshFirstIndices[256];
+    uint32_t meshIndexCounts[256];
+    int32_t meshVertexOffsets[256];
     void *storage[256];
     RendererMesh *meshes[256];
     uint8_t kinds[256];
@@ -177,6 +182,98 @@ static void DeviceFree(const LaiueGraphicsDeviceState *state, void *memory)
         state->host->free(state->host->context, memory);
     else
         PlatformFree(memory);
+}
+
+static bool DeviceBufferIsGeneric(const LaiueGraphicsDeviceState *state,
+                                  uint32_t index)
+{
+    return state != NULL && index < 256u &&
+           (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX) != 0u &&
+           (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u;
+}
+
+static uint32_t DeviceBuildGenericMesh(LaiueGraphicsDeviceState *state,
+                                       uint32_t vertexIndex,
+                                       LaiueGraphicsHandle indexBuffer,
+                                       uint32_t firstIndex, uint32_t indexCount,
+                                       int32_t vertexOffset)
+{
+    if (state == NULL || vertexIndex >= 256u ||
+        !DeviceBufferIsGeneric(state, vertexIndex) || state->storage[vertexIndex] == NULL ||
+        state->sizes[vertexIndex] % sizeof(LaiueGraphicsVertexV2) != 0u)
+        return 0u;
+    const uint32_t vertexCount = (uint32_t)(state->sizes[vertexIndex] /
+                                            sizeof(LaiueGraphicsVertexV2));
+    if (vertexCount == 0u)
+        return 0u;
+    if (indexBuffer == 0u)
+    {
+        if (state->meshes[vertexIndex] != NULL)
+            RendererDestroyMesh(state->renderer, state->meshes[vertexIndex]);
+        state->meshes[vertexIndex] = RendererCreateGenericMesh(
+            state->renderer, (const RendererGenericVertex *)state->storage[vertexIndex],
+            vertexCount);
+        state->vertexCounts[vertexIndex] = state->meshes[vertexIndex] != NULL
+                                                ? vertexCount
+                                                : 0u;
+        state->meshIndexHandles[vertexIndex] = 0u;
+        state->meshFirstIndices[vertexIndex] = 0u;
+        state->meshIndexCounts[vertexIndex] = 0u;
+        state->meshVertexOffsets[vertexIndex] = 0;
+        return state->meshes[vertexIndex] != NULL ? 1u : 0u;
+    }
+    if (!DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER))
+        return 0u;
+    const uint32_t indexSlot = (uint32_t)indexBuffer - 1u;
+    if ((state->usageFlags[indexSlot] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) == 0u ||
+        state->storage[indexSlot] == NULL || state->sizes[indexSlot] % sizeof(uint32_t) != 0u ||
+        firstIndex > state->sizes[indexSlot] / sizeof(uint32_t) ||
+        indexCount > state->sizes[indexSlot] / sizeof(uint32_t) - firstIndex ||
+        indexCount == 0u || (indexCount % 3u) != 0u)
+        return 0u;
+    if (state->meshes[vertexIndex] != NULL &&
+        state->meshIndexHandles[vertexIndex] == indexBuffer &&
+        state->meshFirstIndices[vertexIndex] == firstIndex &&
+        state->meshIndexCounts[vertexIndex] == indexCount &&
+        state->meshVertexOffsets[vertexIndex] == vertexOffset)
+        return 1u;
+    if (indexCount > UINT32_MAX / sizeof(LaiueGraphicsVertexV2))
+        return 0u;
+    LaiueGraphicsVertexV2 *expanded = (LaiueGraphicsVertexV2 *)DeviceAllocate(
+        state, (size_t)indexCount * sizeof(*expanded), false);
+    if (expanded == NULL)
+        return 0u;
+    const uint32_t *indices = (const uint32_t *)state->storage[indexSlot];
+    const LaiueGraphicsVertexV2 *vertices =
+        (const LaiueGraphicsVertexV2 *)state->storage[vertexIndex];
+    bool valid = true;
+    for (uint32_t item = 0u; item < indexCount; ++item)
+    {
+        const uint32_t raw = indices[firstIndex + item];
+        const int64_t resolved = (int64_t)raw + (int64_t)vertexOffset;
+        if (resolved < 0 || resolved >= (int64_t)vertexCount)
+        {
+            valid = false;
+            break;
+        }
+        expanded[item] = vertices[(uint32_t)resolved];
+    }
+    if (valid)
+    {
+        if (state->meshes[vertexIndex] != NULL)
+            RendererDestroyMesh(state->renderer, state->meshes[vertexIndex]);
+        state->meshes[vertexIndex] = RendererCreateGenericMesh(
+            state->renderer, (const RendererGenericVertex *)expanded, indexCount);
+    }
+    DeviceFree(state, expanded);
+    if (!valid || state->meshes[vertexIndex] == NULL)
+        return 0u;
+    state->vertexCounts[vertexIndex] = indexCount;
+    state->meshIndexHandles[vertexIndex] = indexBuffer;
+    state->meshFirstIndices[vertexIndex] = firstIndex;
+    state->meshIndexCounts[vertexIndex] = indexCount;
+    state->meshVertexOffsets[vertexIndex] = vertexOffset;
+    return 1u;
 }
 
 static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
@@ -400,6 +497,23 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
     if (upload->offsetBytes > state->sizes[index] ||
         upload->sizeBytes > state->sizes[index] - upload->offsetBytes)
         return 0u;
+    if (DeviceBufferIsGeneric(state, index) && state->meshes[index] != NULL)
+    {
+        RendererDestroyMesh(state->renderer, state->meshes[index]);
+        state->meshes[index] = NULL;
+        state->vertexCounts[index] = 0u;
+        state->meshIndexHandles[index] = 0u;
+    }
+    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
+        for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
+            if (state->meshIndexHandles[vertex] == upload->buffer &&
+                state->meshes[vertex] != NULL)
+            {
+                RendererDestroyMesh(state->renderer, state->meshes[vertex]);
+                state->meshes[vertex] = NULL;
+                state->vertexCounts[vertex] = 0u;
+                state->meshIndexHandles[vertex] = 0u;
+            }
     memcpy((uint8_t *)state->storage[index] + (size_t)upload->offsetBytes,
            upload->data, (size_t)upload->sizeBytes);
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) != 0u &&
@@ -416,6 +530,14 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
             RendererDestroyMesh(state->renderer, state->meshes[index]);
         state->meshes[index] = mesh;
     }
+    else if (DeviceBufferIsGeneric(state, index) &&
+             upload->offsetBytes == 0u && upload->sizeBytes == state->sizes[index] &&
+             upload->sizeBytes % sizeof(LaiueGraphicsVertexV2) == 0u &&
+             upload->sizeBytes / sizeof(LaiueGraphicsVertexV2) <= UINT32_MAX)
+    {
+        if (!DeviceBuildGenericMesh(state, index, 0u, 0u, 0u, 0))
+            return 0u;
+    }
     return 1u;
 }
 
@@ -426,6 +548,16 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
     const uint32_t index = (uint32_t)handle - 1u;
+    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
+        for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
+            if (state->meshIndexHandles[vertex] == handle &&
+                state->meshes[vertex] != NULL)
+            {
+                RendererDestroyMesh(state->renderer, state->meshes[vertex]);
+                state->meshes[vertex] = NULL;
+                state->vertexCounts[vertex] = 0u;
+                state->meshIndexHandles[vertex] = 0u;
+            }
     if (state->meshes[index] != NULL)
         RendererDestroyMesh(state->renderer, state->meshes[index]);
     state->meshes[index] = NULL;
@@ -434,6 +566,11 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     state->live[index] = 0u;
     state->sizes[index] = 0u;
     state->usageFlags[index] = 0u;
+    state->vertexCounts[index] = 0u;
+    state->meshIndexHandles[index] = 0u;
+    state->meshFirstIndices[index] = 0u;
+    state->meshIndexCounts[index] = 0u;
+    state->meshVertexOffsets[index] = 0;
     state->kinds[index] = 0u;
 }
 
@@ -493,13 +630,27 @@ static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
 
 static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
                            LaiueGraphicsHandle vertexBuffer,
-                           const float origin[3], float scale)
+                           const float origin[3], float scale,
+                           uint32_t firstVertex, uint32_t vertexCount)
 {
     if (state == NULL || vertexBuffer == 0u)
         return true;
     const uint32_t index = (uint32_t)vertexBuffer - 1u;
-    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u ||
-        state->meshes[index] == NULL)
+    if (state->meshes[index] == NULL)
+        return true;
+    if (DeviceBufferIsGeneric(state, index))
+    {
+        const uint32_t available = state->vertexCounts[index];
+        if (firstVertex > available ||
+            (vertexCount != UINT32_MAX &&
+             vertexCount > available - firstVertex))
+            return false;
+        RendererDrawGenericMeshRange(state->renderer, state->meshes[index], origin,
+                                     scale == 0.0f ? 1.0f : scale, firstVertex,
+                                     vertexCount);
+        return true;
+    }
+    if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u)
         return true;
     if (scale == 0.0f || scale == 1.0f)
     {
@@ -533,7 +684,14 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
         if (!DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
                                 item->indexBuffer))
             return 0u;
-        if (!DeviceDrawMesh(state, item->vertexBuffer, NULL, 1.0f))
+        if (item->indexBuffer != 0u && item->vertexBuffer != 0u &&
+            DeviceBufferIsGeneric(state, (uint32_t)item->vertexBuffer - 1u) &&
+            !DeviceBuildGenericMesh(state, (uint32_t)item->vertexBuffer - 1u,
+                                    item->indexBuffer, item->firstIndex,
+                                    item->indexCount, item->vertexOffset))
+            return 0u;
+        if (!DeviceDrawMesh(state, item->vertexBuffer, NULL, 1.0f, 0u,
+                            item->indexBuffer != 0u ? item->indexCount : UINT32_MAX))
             return 0u;
     }
     state->submittedItems += itemCount;
@@ -735,8 +893,29 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
             !DeviceValidateDraw(state, item->pipeline, item->vertexBuffer,
                                 item->indexBuffer))
             return 0u;
-        if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
-                            item->scale == 0.0f ? 1.0f : item->scale))
+        if (item->vertexBuffer != 0u &&
+            DeviceBufferIsGeneric(state, (uint32_t)item->vertexBuffer - 1u))
+        {
+            const uint32_t vertexIndex = (uint32_t)item->vertexBuffer - 1u;
+            if (item->indexBuffer != 0u)
+            {
+                if (!DeviceBuildGenericMesh(state, vertexIndex, item->indexBuffer,
+                                            item->firstIndex, item->indexCount,
+                                            item->vertexOffset))
+                    return 0u;
+                if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
+                                    item->scale == 0.0f ? 1.0f : item->scale, 0u,
+                                    item->indexCount))
+                    return 0u;
+            }
+            else if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
+                                     item->scale == 0.0f ? 1.0f : item->scale, 0u,
+                                     item->indexCount == 0u ? UINT32_MAX : item->indexCount))
+                return 0u;
+        }
+        else if (!DeviceDrawMesh(state, item->vertexBuffer, item->originRelative,
+                                 item->scale == 0.0f ? 1.0f : item->scale, 0u,
+                                 UINT32_MAX))
             return 0u;
     }
     state->submittedItems += itemCount;

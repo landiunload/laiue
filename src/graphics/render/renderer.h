@@ -41,6 +41,18 @@ typedef enum RendererContentStatus
 // без вершинных и индексных буферов.
 typedef struct RendererMesh RendererMesh;
 
+/* Portable non-voxel mesh record used by the graphics device V2 contract.
+ * The backend may store it in a different GPU representation. */
+typedef struct RendererGenericVertex
+{
+    float position[3];
+    float uv[2];
+    uint32_t colorRGBA;
+} RendererGenericVertex;
+
+_Static_assert(sizeof(RendererGenericVertex) == 24u,
+               "generic renderer vertex must match the public graphics ABI");
+
 typedef enum RendererBackendKind
 {
     RENDERER_BACKEND_AUTO = 0,
@@ -203,6 +215,10 @@ LAIUE_RENDER_API void RendererUiQueue(Renderer* renderer,
 LAIUE_RENDER_API RendererMesh* RendererCreateMesh(Renderer* renderer,
     const ChunkQuad* quads, uint32_t quadCount);
 
+LAIUE_RENDER_API RendererMesh *RendererCreateGenericMesh(
+    Renderer *renderer, const RendererGenericVertex *vertices,
+    uint32_t vertexCount);
+
 // Удаление меша безопасно в любой момент: диапазон пула освобождается
 // отложенно, когда GPU гарантированно закончил кадры, читавшие его.
 LAIUE_RENDER_API void RendererDestroyMesh(Renderer* renderer, RendererMesh* mesh);
@@ -214,6 +230,11 @@ LAIUE_RENDER_API void RendererDrawMesh(Renderer* renderer, const RendererMesh* m
 LAIUE_RENDER_API void RendererDrawMeshInstances(Renderer* renderer,
     const RendererMesh* mesh, const RendererMeshInstance* instances,
     uint32_t instanceCount);
+LAIUE_RENDER_API void RendererDrawGenericMesh(Renderer *renderer,
+    const RendererMesh *mesh, const float originRelative[3], float scale);
+LAIUE_RENDER_API void RendererDrawGenericMeshRange(Renderer *renderer,
+    const RendererMesh *mesh, const float originRelative[3], float scale,
+    uint32_t firstVertex, uint32_t vertexCount);
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
 

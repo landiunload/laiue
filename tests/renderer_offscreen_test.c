@@ -333,6 +333,37 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(corner[0] > 250u && corner[1] < 5u && corner[2] < 5u,
            "the frame corner must stay the sky colour");
 
+    // === Универсальный V2 mesh path ===
+    // Это не ChunkQuad: обычный фиксированный vertex stream должен доходить
+    // до того же GPU-прохода и менять пиксели, а не только увеличивать
+    // счётчик submit. Проверяем также range draw (первый и последний
+    // vertices передаются отдельно от cached mesh).
+    RendererGenericVertex genericVertices[3] = {
+        { { -0.75f, -0.75f, 0.0f }, { 0.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.75f, -0.75f, 0.0f }, { 1.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.00f,  0.75f, 0.0f }, { 0.5f, 1.0f }, 0xFFFFFFFFu },
+    };
+    RendererMesh *genericMesh = RendererCreateGenericMesh(renderer,
+                                                           genericVertices, 3u);
+    Expect(genericMesh != NULL, "the generic mesh could not be created");
+    Expect(RendererBeginFrame(renderer, &setup), "generic mesh frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    Expect(RendererEndFrame(renderer), "generic mesh frame could not end");
+    RendererStats genericStats;
+    RendererGetStats(renderer, &genericStats);
+    Expect(genericStats.drawCalls == 1u, "the generic mesh must issue one draw call");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "generic mesh frame could not be captured");
+    uint32_t genericCovered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(genericCovered > (TEST_WIDTH * TEST_HEIGHT) / 32u,
+           "the generic mesh must change visible pixels");
+    const uint8_t *genericCentre =
+        pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(!(genericCentre[0] > 250u && genericCentre[1] < 5u && genericCentre[2] < 5u),
+           "the generic mesh centre must not remain the sky colour");
+    RendererDestroyMesh(renderer, genericMesh);
+
     // === Инстансный путь ===
     // Тот же меш рисуется дважды со своими смещениями: в chunk.hlsl это
     // отдельная ветка, которую обычная отрисовка не задевает.
