@@ -36,6 +36,10 @@ typedef struct LaiueWorldServiceV1
                                WorldOverrideVisitor visitor, void *context);
     bool (*trySetBlockExplicit)(World *world, int64_t x, int64_t y, int64_t z,
                                 BlockType block);
+    /* Optional tail: binds World creation to the owning provider instance. */
+    World *(*createWithContext)(void *moduleContext,
+                                const WorldBaseProvider *provider);
+    void *context;
 } LaiueWorldServiceV1;
 
 LAIUE_WORLD_API const LaiueWorldServiceV1 *LaiueWorldGetStaticServiceV1(void);

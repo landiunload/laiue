@@ -5,15 +5,16 @@
 #include "numeric/numeric_service.h"
 #include "world/numeric_provider.h"
 
+#include <string.h>
+
 typedef struct LaiueWorldModuleState
 {
     const LaiueModuleHostV1 *host;
     const LaiueNumericServiceV1 *numeric;
+    LaiueWorldServiceV1 service;
 } LaiueWorldModuleState;
 
-static LaiueWorldModuleState moduleState;
-
-static const LaiueWorldServiceV1 service = {
+static const LaiueWorldServiceV1 compatibilityService = {
     .structSize = sizeof(LaiueWorldServiceV1),
     .abiVersion = LAIUE_WORLD_SERVICE_ABI_VERSION_1,
     .create = WorldCreate,
@@ -30,15 +31,46 @@ static const LaiueWorldServiceV1 service = {
     .trySetBlockExplicit = WorldTrySetBlockExplicit,
 };
 
+static World *CreateWithContext(void *moduleContext,
+    const WorldBaseProvider *provider)
+{
+    LaiueWorldModuleState *state = moduleContext;
+    return state != NULL && state->numeric != NULL
+               ? WorldCreateWithNumericService(provider, state->numeric)
+               : NULL;
+}
+
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.numeric = NULL;
+    if (host->allocate == NULL || host->free == NULL)
+        return 0u;
+    LaiueWorldModuleState *state = host->allocate(host->context,
+        sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
+    state->service.structSize = sizeof(state->service);
+    state->service.abiVersion = LAIUE_WORLD_SERVICE_ABI_VERSION_1;
+    state->service.create = WorldCreate;
+    state->service.destroy = WorldDestroy;
+    state->service.rebase = WorldRebase;
+    state->service.getBlock = WorldGetBlock;
+    state->service.trySetBlock = WorldTrySetBlock;
+    state->service.setBlock = WorldSetBlock;
+    state->service.applyBlockBatch = WorldApplyBlockBatch;
+    state->service.getRevision = WorldGetRevision;
+    state->service.fillRegion = WorldFillRegion;
+    state->service.getBlockState = WorldGetBlockState;
+    state->service.enumerateOverrides = WorldEnumerateOverrides;
+    state->service.trySetBlockExplicit = WorldTrySetBlockExplicit;
+    state->service.createWithContext = CreateWithContext;
+    state->service.context = state;
     WorldSetNumericService(NULL);
-    *outContext = &moduleState;
+    *outContext = state;
     return 1u;
 }
 
@@ -58,8 +90,8 @@ static uint32_t ModuleStart(void *context)
     LaiueModuleServiceV1 published = {
         .name = LAIUE_WORLD_SERVICE_NAME,
         .version = LAIUE_WORLD_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = sizeof(state->service),
     };
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
@@ -85,10 +117,15 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
-    moduleState.numeric = NULL;
+    LaiueWorldModuleState *state = context;
     WorldSetNumericService(NULL);
+    if (state == NULL)
+        return;
+    const LaiueModuleHostV1 *host = state->host;
+    state->host = NULL;
+    state->numeric = NULL;
+    if (host != NULL && host->free != NULL)
+        host->free(host->context, state);
 }
 
 static const char *const provides[] = {LAIUE_WORLD_SERVICE_NAME};
@@ -122,7 +159,7 @@ const LaiueModuleApiV1 *LaiueWorldGetStaticModuleApiV1(void)
 
 const LaiueWorldServiceV1 *LaiueWorldGetStaticServiceV1(void)
 {
-    return &service;
+    return &compatibilityService;
 }
 
 #if !defined(LAIUE_STATIC)

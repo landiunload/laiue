@@ -32,6 +32,7 @@ typedef struct LocalChunkCoordinate
 
 typedef struct CoordinateFrame
 {
+    const LaiueNumericServiceV1* numeric;
     InfiniteCoord chunkOrigin[3];
     uint32_t referenceCount;
 } CoordinateFrame;
@@ -59,6 +60,7 @@ typedef struct Chunk
 
 struct World
 {
+    const LaiueNumericServiceV1* numeric;
     PlatformRwLock tableLock;
     GlobalChunkCoordinate* keys;
     Chunk** chunks;
@@ -125,12 +127,12 @@ static uint64_t HashRotateLeft64(uint64_t value, uint32_t amount)
 static uint64_t HashLocalChunkCoordinate(
     const World* world, LocalChunkCoordinate coordinate)
 {
-    uint64_t x = InfiniteCoordHashOffset(
-        &world->chunkOrigin[0], coordinate.x);
-    uint64_t y = InfiniteCoordHashOffset(
-        &world->chunkOrigin[1], coordinate.y);
-    uint64_t z = InfiniteCoordHashOffset(
-        &world->chunkOrigin[2], coordinate.z);
+    uint64_t x = WorldNumericHashOffsetWithService(
+        world->numeric, &world->chunkOrigin[0], coordinate.x);
+    uint64_t y = WorldNumericHashOffsetWithService(
+        world->numeric, &world->chunkOrigin[1], coordinate.y);
+    uint64_t z = WorldNumericHashOffsetWithService(
+        world->numeric, &world->chunkOrigin[2], coordinate.z);
     return x ^ HashRotateLeft64(y, 21U) ^ HashRotateLeft64(z, 42U);
 }
 
@@ -142,7 +144,8 @@ static void CoordinateFrameRelease(CoordinateFrame* frame)
     }
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordDestroy(&frame->chunkOrigin[axis]);
+        WorldNumericDestroyWithService(frame->numeric,
+            &frame->chunkOrigin[axis]);
     }
     PlatformFree(frame);
 }
@@ -160,10 +163,12 @@ static CoordinateFrame* WorldGetEditFrame(World* world)
         return NULL;
     }
     frame->referenceCount = 1U;
+    frame->numeric = world->numeric;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordInit(&frame->chunkOrigin[axis]);
-        if (!InfiniteCoordTryCopyAddInt64(
+        WorldNumericInitWithService(frame->numeric, &frame->chunkOrigin[axis]);
+        if (!WorldNumericTryCopyAddInt64WithService(
+                frame->numeric,
                 &frame->chunkOrigin[axis], &world->chunkOrigin[axis], 0))
         {
             CoordinateFrameRelease(frame);
@@ -184,13 +189,13 @@ static bool GlobalChunkCoordinateMatchesLocal(
             && global->local.y == local.y
             && global->local.z == local.z;
     }
-    return InfiniteCoordEqualsOffsets(
+    return WorldNumericEqualsOffsetsWithService(world->numeric,
             &global->frame->chunkOrigin[0], global->local.x,
             &world->chunkOrigin[0], local.x)
-        && InfiniteCoordEqualsOffsets(
+        && WorldNumericEqualsOffsetsWithService(world->numeric,
             &global->frame->chunkOrigin[1], global->local.y,
             &world->chunkOrigin[1], local.y)
-        && InfiniteCoordEqualsOffsets(
+        && WorldNumericEqualsOffsetsWithService(world->numeric,
             &global->frame->chunkOrigin[2], global->local.z,
             &world->chunkOrigin[2], local.z);
 }
@@ -494,6 +499,12 @@ static uint64_t SaturatingAddRevision(uint64_t value, uint32_t amount)
 
 World* WorldCreate(const WorldBaseProvider* provider)
 {
+    return WorldCreateWithNumericService(provider, WorldGetNumericService());
+}
+
+World* WorldCreateWithNumericService(const WorldBaseProvider* provider,
+    const LaiueNumericServiceV1* numeric)
+{
     if (provider != NULL && provider->getBlock == NULL)
     {
         return NULL;
@@ -508,10 +519,11 @@ World* WorldCreate(const WorldBaseProvider* provider)
         PlatformFree(world);
         return NULL;
     }
+    world->numeric = numeric;
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordInit(&world->blockOrigin[axis]);
-        InfiniteCoordInit(&world->chunkOrigin[axis]);
+        WorldNumericInitWithService(world->numeric, &world->blockOrigin[axis]);
+        WorldNumericInitWithService(world->numeric, &world->chunkOrigin[axis]);
     }
 
     world->capacity = WORLD_INITIAL_CAPACITY;
@@ -558,8 +570,10 @@ void WorldDestroy(World* world)
     CoordinateFrameRelease(world->editFrame);
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordDestroy(&world->blockOrigin[axis]);
-        InfiniteCoordDestroy(&world->chunkOrigin[axis]);
+        WorldNumericDestroyWithService(world->numeric,
+            &world->blockOrigin[axis]);
+        WorldNumericDestroyWithService(world->numeric,
+            &world->chunkOrigin[axis]);
     }
     PlatformFree(world->keys);
     PlatformFree(world->chunks);
@@ -580,18 +594,20 @@ bool WorldRebase(World* world,
     InfiniteCoord newChunkOrigin[3];
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordInit(&newBlockOrigin[axis]);
-        InfiniteCoordInit(&newChunkOrigin[axis]);
+        WorldNumericInitWithService(world->numeric, &newBlockOrigin[axis]);
+        WorldNumericInitWithService(world->numeric, &newChunkOrigin[axis]);
     }
 
     bool prepared = true;
     for (int32_t axis = 0; axis < 3 && prepared; ++axis)
     {
         prepared = shifts[axis] % CHUNK_SIZE == 0
-            && InfiniteCoordTryCopyAddInt64(
+            && WorldNumericTryCopyAddInt64WithService(
+                world->numeric,
                 &newBlockOrigin[axis], &world->blockOrigin[axis],
                 shifts[axis])
-            && InfiniteCoordTryCopyAddInt64(
+            && WorldNumericTryCopyAddInt64WithService(
+                world->numeric,
                 &newChunkOrigin[axis], &world->chunkOrigin[axis],
                 shifts[axis] / CHUNK_SIZE);
     }
@@ -599,8 +615,10 @@ bool WorldRebase(World* world,
     {
         for (int32_t axis = 0; axis < 3; ++axis)
         {
-            InfiniteCoordDestroy(&newBlockOrigin[axis]);
-            InfiniteCoordDestroy(&newChunkOrigin[axis]);
+            WorldNumericDestroyWithService(world->numeric,
+                &newBlockOrigin[axis]);
+            WorldNumericDestroyWithService(world->numeric,
+                &newChunkOrigin[axis]);
         }
         return false;
     }
@@ -613,9 +631,9 @@ bool WorldRebase(World* world,
     {
         for (int32_t axis = 0; axis < 3; ++axis)
         {
-            InfiniteCoordSwap(
+            WorldNumericSwapWithService(world->numeric,
                 &world->blockOrigin[axis], &newBlockOrigin[axis]);
-            InfiniteCoordSwap(
+            WorldNumericSwapWithService(world->numeric,
                 &world->chunkOrigin[axis], &newChunkOrigin[axis]);
         }
         CoordinateFrameRelease(world->editFrame);
@@ -625,8 +643,10 @@ bool WorldRebase(World* world,
 
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        InfiniteCoordDestroy(&newBlockOrigin[axis]);
-        InfiniteCoordDestroy(&newChunkOrigin[axis]);
+        WorldNumericDestroyWithService(world->numeric,
+            &newBlockOrigin[axis]);
+        WorldNumericDestroyWithService(world->numeric,
+            &newChunkOrigin[axis]);
     }
     return providerAccepted;
 }
@@ -647,7 +667,7 @@ void WorldFormatAbsoluteBlockCoordinate(World* world,
         return;
     }
     PlatformRwLockAcquireShared(&world->tableLock);
-    InfiniteCoordFormatShortOffsetW(
+    WorldNumericFormatShortOffsetWWithService(world->numeric,
         &world->blockOrigin[axis], localBlock, outText, capacity);
     PlatformRwLockReleaseShared(&world->tableLock);
 }

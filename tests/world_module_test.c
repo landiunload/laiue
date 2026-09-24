@@ -87,8 +87,14 @@ LAIUE_TEST_ENTRY(WorldModuleTestEntryPoint)
             sizeof(LaiueWorldServiceV1), &version, &size);
     Expect(service != NULL && version == LAIUE_WORLD_SERVICE_ABI_VERSION_1 &&
                size >= sizeof(*service) && service->create != NULL &&
-               service->fillRegion != NULL,
+               service->fillRegion != NULL && service->createWithContext != NULL &&
+               service->context != NULL,
            "world service is published");
+
+    World *boundWorld = service->createWithContext(service->context, NULL);
+    Expect(boundWorld != NULL && service->getBlock(boundWorld, 0, 0, 0) == BLOCK_AIR,
+           "world context-bound creation failed");
+    service->destroy(boundWorld);
 
     World *world = service->create(NULL);
     Expect(world != NULL && service->trySetBlock(world, 9, -2, 3, (BlockType)4U) &&

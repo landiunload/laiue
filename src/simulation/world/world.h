@@ -11,6 +11,7 @@
 // are paused.
 typedef struct World World;
 typedef uint8_t BlockType;
+struct LaiueNumericServiceV1;
 
 // Zero is the only material reserved by the engine. Values 1..255 are owned
 // by the embedding application and its content catalog.
@@ -76,6 +77,11 @@ typedef struct WorldBlockMutation
 // NULL provider creates an empty world. The provider structure is copied, but
 // its context remains application-owned and must outlive the World.
 LAIUE_WORLD_API World* WorldCreate(const WorldBaseProvider* provider);
+/* Instance-bound variant used by the modular provider.  The compatibility
+ * WorldCreate call keeps using the process-default numeric service. */
+LAIUE_WORLD_API World* WorldCreateWithNumericService(
+    const WorldBaseProvider* provider,
+    const struct LaiueNumericServiceV1* numeric);
 LAIUE_WORLD_API void WorldDestroy(World* world);
 
 // Shifts the local origin by whole chunks. Infinite absolute coordinates and
