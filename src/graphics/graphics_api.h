@@ -126,6 +126,18 @@ typedef struct LaiueGraphicsBufferUploadV1
     uint64_t sizeBytes;
 } LaiueGraphicsBufferUploadV1;
 
+/* Optional texture upload tail.  The first provider revision accepts one
+ * tightly packed RGBA8 mip; rowPitchBytes may be zero to select width * 4. */
+typedef struct LaiueGraphicsTextureUploadV1
+{
+    uint32_t structSize;
+    LaiueGraphicsHandle texture;
+    const void *data;
+    uint64_t sizeBytes;
+    uint32_t rowPitchBytes;
+    uint32_t reserved;
+} LaiueGraphicsTextureUploadV1;
+
 typedef struct LaiueGraphicsDrawItemV1
 {
     LaiueGraphicsHandle pipeline;
@@ -173,6 +185,8 @@ typedef uint32_t (*LaiueGraphicsSubmitUiFn)(LaiueGraphicsDeviceV1 *,
 typedef uint32_t (*LaiueGraphicsSetUiFontAtlasFn)(LaiueGraphicsDeviceV1 *,
                                                   const uint8_t *alphaPixels,
                                                   uint32_t width, uint32_t height);
+typedef uint32_t (*LaiueGraphicsUploadTextureFn)(
+    LaiueGraphicsDeviceV1 *, const LaiueGraphicsTextureUploadV1 *upload);
 typedef uint32_t (*LaiueGraphicsEndFrameFn)(LaiueGraphicsDeviceV1 *);
 
 struct LaiueGraphicsDeviceV1
@@ -197,4 +211,5 @@ struct LaiueGraphicsDeviceV1
      * for consumers built against the first revision. */
     LaiueGraphicsSubmitUiFn submitUi;
     LaiueGraphicsSetUiFontAtlasFn setUiFontAtlas;
+    LaiueGraphicsUploadTextureFn uploadTexture;
 };

@@ -230,6 +230,12 @@ LAIUE_RENDER_API RendererTexture *RendererCreateTexture(
     uint32_t mipLevels, uint32_t format);
 LAIUE_RENDER_API void RendererDestroyTexture(Renderer *renderer,
                                              RendererTexture *texture);
+/* Uploads one tightly packed RGBA8 mip into a backend-owned texture. */
+LAIUE_RENDER_API bool RendererUploadTexture(Renderer *renderer,
+                                            RendererTexture *texture,
+                                            const void *data,
+                                            uint64_t sizeBytes,
+                                            uint32_t rowPitchBytes);
 
 // Удаление меша безопасно в любой момент: диапазон пула освобождается
 // отложенно, когда GPU гарантированно закончил кадры, читавшие его.

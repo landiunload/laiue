@@ -159,6 +159,9 @@ extern RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer,
                                                      uint32_t width, uint32_t height,
                                                      uint32_t mipLevels, uint32_t format);
 extern void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
+extern bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
+                                        const void *data, uint64_t sizeBytes,
+                                        uint32_t rowPitchBytes);
 extern void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
@@ -202,6 +205,9 @@ extern RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer,
                                                       uint32_t width, uint32_t height,
                                                       uint32_t mipLevels, uint32_t format);
 extern void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture);
+extern bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
+                                         const void *data, uint64_t sizeBytes,
+                                         uint32_t rowPitchBytes);
 extern void RendererDestroyMesh_Vulkan(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_Vulkan(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -613,6 +619,27 @@ void RendererDestroyTexture(Renderer *renderer, RendererTexture *texture)
 #endif
     default:
         return;
+    }
+}
+
+bool RendererUploadTexture(Renderer *renderer, RendererTexture *texture,
+                           const void *data, uint64_t sizeBytes,
+                           uint32_t rowPitchBytes)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererUploadTexture_D3D12(renderer, texture, data, sizeBytes,
+                                           rowPitchBytes);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererUploadTexture_Vulkan(renderer, texture, data, sizeBytes,
+                                            rowPitchBytes);
+#endif
+    default:
+        return false;
     }
 }
 

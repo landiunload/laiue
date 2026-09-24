@@ -80,6 +80,8 @@ typedef uint32_t (*LaiueGraphicsV2SubmitUiFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsUiQuadV1 *, uint32_t quadCount);
 typedef uint32_t (*LaiueGraphicsV2SetUiFontAtlasFn)(
     LaiueGraphicsDeviceV2 *, const uint8_t *, uint32_t width, uint32_t height);
+typedef uint32_t (*LaiueGraphicsV2UploadTextureFn)(
+    LaiueGraphicsDeviceV2 *, const LaiueGraphicsTextureUploadV1 *upload);
 typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 
 struct LaiueGraphicsDeviceV2
@@ -101,6 +103,7 @@ struct LaiueGraphicsDeviceV2
     LaiueGraphicsV2SetUiFontAtlasFn setUiFontAtlas;
     /* Optional tail: 2D-only providers may omit camera control. */
     LaiueGraphicsV2SetCameraFn setCamera;
+    LaiueGraphicsV2UploadTextureFn uploadTexture;
 };
 
 typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(

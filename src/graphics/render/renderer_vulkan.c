@@ -3122,6 +3122,20 @@ RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width
     return texture;
 }
 
+bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
+                                  const void *data, uint64_t sizeBytes,
+                                  uint32_t rowPitchBytes)
+{
+    if (renderer == NULL || texture == NULL || data == NULL || renderer->frameRecording ||
+        texture->image.image == VK_NULL_HANDLE || rowPitchBytes == 0u ||
+        texture->image.width > UINT32_MAX / 4u ||
+        rowPitchBytes != texture->image.width * 4u ||
+        texture->image.height > UINT64_MAX / rowPitchBytes ||
+        sizeBytes != (uint64_t)texture->image.height * rowPitchBytes)
+        return false;
+    return UploadImagePixels(renderer, &texture->image, (const uint8_t *)data, 4u, 1u);
+}
+
 void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)

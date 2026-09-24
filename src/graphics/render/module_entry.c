@@ -151,6 +151,8 @@ static uint32_t DeviceCreateWithContext(void *, void *, int32_t, int32_t, uint32
                                         LaiueGraphicsDeviceV1 **);
 static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *,
                                    const LaiueGraphicsBufferUploadV1 *);
+static uint32_t DeviceUploadTexture(LaiueGraphicsDeviceV1 *,
+                                    const LaiueGraphicsTextureUploadV1 *);
 static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
 static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *, uint32_t, uint32_t);
 static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *,
@@ -185,6 +187,8 @@ static uint32_t DeviceV2CreateShader(LaiueGraphicsDeviceV2 *,
                                      LaiueGraphicsHandle *);
 static uint32_t DeviceV2UploadBuffer(LaiueGraphicsDeviceV2 *,
                                      const LaiueGraphicsBufferUploadV1 *);
+static uint32_t DeviceV2UploadTexture(LaiueGraphicsDeviceV2 *,
+                                      const LaiueGraphicsTextureUploadV1 *);
 static void DeviceV2DestroyHandle(LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle);
 static uint32_t DeviceV2BeginFrame(LaiueGraphicsDeviceV2 *, uint32_t, uint32_t);
 static uint32_t DeviceV2SetCamera(LaiueGraphicsDeviceV2 *,
@@ -418,6 +422,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->device.createSampler = DeviceCreateSampler;
     state->device.createPipeline = DeviceCreatePipeline;
     state->device.uploadBuffer = DeviceUploadBuffer;
+    state->device.uploadTexture = DeviceUploadTexture;
     state->device.destroyHandle = DeviceDestroyHandle;
     state->device.beginFrame = DeviceBeginFrame;
     state->device.submit = DeviceSubmit;
@@ -433,6 +438,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.createSampler = DeviceV2CreateSampler;
     state->deviceV2.createPipeline = DeviceV2CreatePipeline;
     state->deviceV2.uploadBuffer = DeviceV2UploadBuffer;
+    state->deviceV2.uploadTexture = DeviceV2UploadTexture;
     state->deviceV2.destroyHandle = DeviceV2DestroyHandle;
     state->deviceV2.beginFrame = DeviceV2BeginFrame;
     state->deviceV2.submit = DeviceV2Submit;
@@ -689,6 +695,33 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
             return 0u;
     }
     return 1u;
+}
+
+static uint32_t DeviceUploadTexture(LaiueGraphicsDeviceV1 *device,
+                                    const LaiueGraphicsTextureUploadV1 *upload)
+{
+    LaiueGraphicsDeviceState *state = DeviceState(device);
+    if (state == NULL || upload == NULL || upload->structSize < sizeof(*upload) ||
+        !DeviceHandleIsLive(state, upload->texture, DEVICE_HANDLE_TEXTURE) ||
+        upload->data == NULL || upload->sizeBytes > (uint64_t)SIZE_MAX)
+        return 0u;
+
+    const uint32_t index = DeviceHandleSlot(upload->texture) - 1u;
+    const LaiueGraphicsTextureDescV1 *description = &state->textures[index];
+    const uint64_t tightRowPitch = (uint64_t)description->extent.width * 4u;
+    const uint64_t rowPitch = upload->rowPitchBytes == 0u
+                                  ? tightRowPitch
+                                  : (uint64_t)upload->rowPitchBytes;
+    if (rowPitch != tightRowPitch ||
+        (uint64_t)description->extent.height > UINT64_MAX / rowPitch ||
+        upload->sizeBytes != rowPitch * description->extent.height ||
+        state->backendResources[index] == NULL)
+        return 0u;
+    return RendererUploadTexture(
+               state->renderer, (RendererTexture *)state->backendResources[index],
+               upload->data, upload->sizeBytes, (uint32_t)rowPitch)
+               ? 1u
+               : 0u;
 }
 
 static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
@@ -1041,6 +1074,13 @@ static uint32_t DeviceV2UploadBuffer(LaiueGraphicsDeviceV2 *device,
 {
     LaiueGraphicsDeviceState *state = DeviceV2State(device);
     return state == NULL ? 0u : DeviceUploadBuffer(&state->device, upload);
+}
+
+static uint32_t DeviceV2UploadTexture(LaiueGraphicsDeviceV2 *device,
+                                      const LaiueGraphicsTextureUploadV1 *upload)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    return state == NULL ? 0u : DeviceUploadTexture(&state->device, upload);
 }
 
 static void DeviceV2DestroyHandle(LaiueGraphicsDeviceV2 *device,

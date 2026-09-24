@@ -234,6 +234,7 @@ struct Renderer
     bool                       tearingPresentEnabled;
     bool                       wireframeEnabled;
     bool                       worldReady;
+    bool                       frameRecording;
 
     // Owned copies of application shader overrides, indexed by
     // LaiueShaderSlot.  NULL entries select checked-in embedded fallbacks.
@@ -2170,6 +2171,104 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
     return texture;
 }
 
+bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
+                                 const void *data, uint64_t sizeBytes,
+                                 uint32_t rowPitchBytes)
+{
+    if (renderer == NULL || texture == NULL || texture->resource == NULL || data == NULL ||
+        renderer->frameRecording || rowPitchBytes == 0u)
+        return false;
+    D3D12_RESOURCE_DESC textureDescription;
+    ID3D12Resource_GetDesc(texture->resource, &textureDescription);
+    if (textureDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        textureDescription.DepthOrArraySize != 1u || textureDescription.MipLevels != 1u ||
+        textureDescription.Width > UINT64_MAX / 4u ||
+        rowPitchBytes != textureDescription.Width * 4u ||
+        textureDescription.Height > UINT64_MAX / rowPitchBytes ||
+        sizeBytes != textureDescription.Height * rowPitchBytes)
+        return false;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    UINT rows = 0u;
+    UINT64 rowSize = 0u;
+    UINT64 uploadBytes = 0u;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+                                        0u, 1u, 0u, &layout, &rows, &rowSize,
+                                        &uploadBytes);
+    if (rows != textureDescription.Height || rowSize != rowPitchBytes || uploadBytes == 0u)
+        return false;
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1u;
+    uploadDescription.DepthOrArraySize = 1u;
+    uploadDescription.MipLevels = 1u;
+    uploadDescription.SampleDesc.Count = 1u;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    ID3D12Resource *upload = NULL;
+    if (FAILED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+            (void **)&upload)))
+        return false;
+
+    D3D12_RANGE emptyRange = {0, 0};
+    uint8_t *mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(upload, 0u, &emptyRange, (void **)&mapped)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    const uint8_t *source = (const uint8_t *)data;
+    for (UINT row = 0u; row < rows; ++row)
+        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
+               source + (size_t)row * rowPitchBytes, (size_t)rowPitchBytes);
+    ID3D12Resource_Unmap(upload, 0u, NULL);
+
+    WaitForGpu(renderer);
+    if (FAILED(ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex])) ||
+        FAILED(ID3D12GraphicsCommandList_Reset(renderer->commandList,
+                                                renderer->commandAllocators[renderer->frameIndex],
+                                                NULL)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+        texture->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = texture->resource;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
+    memset(&sourceLocation, 0, sizeof(sourceLocation));
+    sourceLocation.pResource = upload;
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sourceLocation.PlacedFootprint = layout;
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+                                                 &destination, 0u, 0u, 0u,
+                                                 &sourceLocation, NULL);
+    D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
+        texture->resource, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
+    if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
+    ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
+    WaitForGpu(renderer);
+    ID3D12Resource_Release(upload);
+    return true;
+}
+
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
@@ -2629,6 +2728,7 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     ID3D12GraphicsCommandList_Reset(renderer->commandList,
         renderer->commandAllocators[renderer->frameIndex],
         renderer->worldReady ? renderer->pipelineState : NULL);
+    renderer->frameRecording = true;
 
     if (renderer->worldReady) RecordBlockTextureUpload(renderer);
     RecordFontAtlasUpload(renderer);
@@ -2855,6 +2955,7 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         renderer->commandList);
     if (FAILED(closeResult))
     {
+        renderer->frameRecording = false;
         return false;
     }
 
@@ -2883,6 +2984,7 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     }
     if (FAILED(presentResult))
     {
+        renderer->frameRecording = false;
         return false;
     }
 
@@ -2901,6 +3003,7 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         // кванта рабочим потокам, не вводя задержку или предел FPS.
         SwitchToThread();
     }
+    renderer->frameRecording = false;
     return true;
 }
 

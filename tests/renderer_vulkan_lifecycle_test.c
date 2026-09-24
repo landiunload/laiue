@@ -504,6 +504,12 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
             vulkan, 4u, 4u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB);
         Expect(d3d12Texture != NULL && vulkanTexture != NULL,
                "both backends must create native texture resources");
+        uint8_t texturePixels[4u * 4u * 4u] = {0};
+        Expect(RendererUploadTexture(d3d12, d3d12Texture, texturePixels,
+                                     sizeof(texturePixels), 4u * 4u) &&
+                   RendererUploadTexture(vulkan, vulkanTexture, texturePixels,
+                                         sizeof(texturePixels), 4u * 4u),
+               "both backends must upload native texture pixels");
         RendererMesh *d3d12Mesh = CreateUnitMesh(d3d12);
         RendererMesh *vulkanMesh = CreateUnitMesh(vulkan);
 
