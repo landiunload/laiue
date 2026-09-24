@@ -6,6 +6,8 @@
 #include "physics/numeric_provider.h"
 #include "task/task_service.h"
 
+#include <string.h>
+
 typedef struct LaiuePhysicsModuleState
 {
     const LaiueModuleHostV1 *host;
@@ -13,7 +15,9 @@ typedef struct LaiuePhysicsModuleState
     const LaiueTaskServiceV1 *jobs;
 } LaiuePhysicsModuleState;
 
-static LaiuePhysicsModuleState moduleState;
+/* The solver keeps its historical process-default numeric bridge for the
+ * compatibility entry points.  Lifecycle state itself is host-owned so a
+ * failed/removed module cannot leave a DLL-heap allocation behind. */
 
 static uint32_t ThreadIsConfigured(void)
 {
@@ -45,13 +49,16 @@ static const LaiuePhysicsServiceV1 service = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.numeric = NULL;
-    moduleState.jobs = NULL;
+    LaiuePhysicsModuleState *state = host->allocate(host->context, sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
     PhysicsSetNumericService(NULL);
-    *outContext = &moduleState;
+    *outContext = state;
     return 1u;
 }
 
@@ -112,11 +119,17 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
-    moduleState.numeric = NULL;
-    moduleState.jobs = NULL;
+    LaiuePhysicsModuleState *state = (LaiuePhysicsModuleState *)context;
+    const LaiueModuleHostV1 *host = state != NULL ? state->host : NULL;
+    if (state != NULL)
+    {
+        state->host = NULL;
+        state->numeric = NULL;
+        state->jobs = NULL;
+    }
     PhysicsSetNumericService(NULL);
+    if (host != NULL && host->free != NULL)
+        host->free(host->context, state);
 }
 
 static const char *const provides[] = {LAIUE_PHYSICS_SERVICE_NAME};
