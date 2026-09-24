@@ -82,10 +82,11 @@ static void VoxelDecodeBlock(const LaiueVoxelWorldV1 *world,
     if (outBlock == NULL)
         return;
     *outBlock = (LaiueVoxelBlockV1){0};
-    if (world == NULL || (uint32_t)id >= VOXEL_PALETTE_CAPACITY)
+    if (world == NULL)
         return;
     PlatformMutexLock((PlatformMutex *)&world->paletteLock);
-    *outBlock = world->palette[id];
+    if ((uint32_t)id < world->paletteCount)
+        *outBlock = world->palette[id];
     PlatformMutexUnlock((PlatformMutex *)&world->paletteLock);
 }
 
