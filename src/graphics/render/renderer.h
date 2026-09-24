@@ -43,6 +43,7 @@ typedef struct RendererMesh RendererMesh;
 /* Backend-owned sampled image.  The graphics device exposes this only as an
  * opaque handle; the renderer keeps the native resource behind this type. */
 typedef struct RendererTexture RendererTexture;
+typedef struct RendererSampler RendererSampler;
 
 /* Portable non-voxel mesh record used by the graphics device V2 contract.
  * The backend may store it in a different GPU representation. */
@@ -236,6 +237,11 @@ LAIUE_RENDER_API bool RendererUploadTexture(Renderer *renderer,
                                             const void *data,
                                             uint64_t sizeBytes,
                                             uint32_t rowPitchBytes);
+LAIUE_RENDER_API RendererSampler *RendererCreateSampler(
+    Renderer *renderer, uint32_t minFilter, uint32_t magFilter,
+    uint32_t addressModeU, uint32_t addressModeV, uint32_t addressModeW);
+LAIUE_RENDER_API void RendererDestroySampler(Renderer *renderer,
+                                             RendererSampler *sampler);
 
 // Удаление меша безопасно в любой момент: диапазон пула освобождается
 // отложенно, когда GPU гарантированно закончил кадры, читавшие его.

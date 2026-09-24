@@ -486,6 +486,10 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
             state->kinds[index] == DEVICE_HANDLE_TEXTURE)
             RendererDestroyTexture(state->renderer,
                                    (RendererTexture *)state->backendResources[index]);
+        else if (state->backendResources[index] != NULL &&
+                 state->kinds[index] == DEVICE_HANDLE_SAMPLER)
+            RendererDestroySampler(state->renderer,
+                                   (RendererSampler *)state->backendResources[index]);
         state->backendResources[index] = NULL;
         DeviceFree(state, state->storage[index]);
     }
@@ -580,8 +584,18 @@ static uint32_t DeviceCreateSampler(LaiueGraphicsDeviceV1 *device,
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_SAMPLER, 0u, outSampler))
         return 0u;
     const uint32_t index = DeviceHandleSlot(*outSampler) - 1u;
+    RendererSampler *backendSampler = RendererCreateSampler(
+        state->renderer, description->minFilter, description->magFilter,
+        description->addressModeU, description->addressModeV, description->addressModeW);
+    if (backendSampler == NULL)
+    {
+        DeviceDestroyHandle(device, *outSampler);
+        *outSampler = 0u;
+        return 0u;
+    }
     state->samplers[index] = *description;
     state->samplers[index].structSize = sizeof(state->samplers[index]);
+    state->backendResources[index] = backendSampler;
     return 1u;
 }
 
@@ -771,6 +785,9 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (kind == DEVICE_HANDLE_TEXTURE && state->backendResources[index] != NULL)
         RendererDestroyTexture(state->renderer,
                                (RendererTexture *)state->backendResources[index]);
+    else if (kind == DEVICE_HANDLE_SAMPLER && state->backendResources[index] != NULL)
+        RendererDestroySampler(state->renderer,
+                               (RendererSampler *)state->backendResources[index]);
     state->backendResources[index] = NULL;
     DeviceFree(state, state->storage[index]);
     state->storage[index] = NULL;

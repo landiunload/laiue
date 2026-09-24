@@ -510,6 +510,16 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
                    RendererUploadTexture(vulkan, vulkanTexture, texturePixels,
                                          sizeof(texturePixels), 4u * 4u),
                "both backends must upload native texture pixels");
+        RendererSampler *d3d12Sampler = RendererCreateSampler(
+            d3d12, LAIUE_GRAPHICS_FILTER_LINEAR, LAIUE_GRAPHICS_FILTER_NEAREST,
+            LAIUE_GRAPHICS_ADDRESS_REPEAT, LAIUE_GRAPHICS_ADDRESS_CLAMP,
+            LAIUE_GRAPHICS_ADDRESS_MIRROR);
+        RendererSampler *vulkanSampler = RendererCreateSampler(
+            vulkan, LAIUE_GRAPHICS_FILTER_NEAREST, LAIUE_GRAPHICS_FILTER_LINEAR,
+            LAIUE_GRAPHICS_ADDRESS_REPEAT, LAIUE_GRAPHICS_ADDRESS_CLAMP,
+            LAIUE_GRAPHICS_ADDRESS_MIRROR);
+        Expect(d3d12Sampler != NULL && vulkanSampler != NULL,
+               "both backends must create native sampler resources");
         RendererMesh *d3d12Mesh = CreateUnitMesh(d3d12);
         RendererMesh *vulkanMesh = CreateUnitMesh(vulkan);
 
@@ -525,6 +535,8 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
         RendererDestroyMesh(vulkan, vulkanMesh);
         RendererDestroyTexture(d3d12, d3d12Texture);
         RendererDestroyTexture(vulkan, vulkanTexture);
+        RendererDestroySampler(d3d12, d3d12Sampler);
+        RendererDestroySampler(vulkan, vulkanSampler);
         if (order == 0u)
         {
             // D3D12 умирает первым — Vulkan обязан пережить.

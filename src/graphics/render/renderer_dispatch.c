@@ -162,6 +162,11 @@ extern void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *te
 extern bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                         const void *data, uint64_t sizeBytes,
                                         uint32_t rowPitchBytes);
+extern RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer,
+                                                     uint32_t minFilter, uint32_t magFilter,
+                                                     uint32_t addressModeU, uint32_t addressModeV,
+                                                     uint32_t addressModeW);
+extern void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler);
 extern void RendererDestroyMesh_D3D12(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
@@ -208,6 +213,11 @@ extern void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *t
 extern bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                          const void *data, uint64_t sizeBytes,
                                          uint32_t rowPitchBytes);
+extern RendererSampler *RendererCreateSampler_Vulkan(Renderer *renderer,
+                                                      uint32_t minFilter, uint32_t magFilter,
+                                                      uint32_t addressModeU, uint32_t addressModeV,
+                                                      uint32_t addressModeW);
+extern void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler);
 extern void RendererDestroyMesh_Vulkan(Renderer* renderer, RendererMesh* mesh);
 extern void RendererDrawMesh_Vulkan(Renderer* renderer, const RendererMesh* mesh, const float chunkOriginRelative[3]);
 extern void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -640,6 +650,48 @@ bool RendererUploadTexture(Renderer *renderer, RendererTexture *texture,
 #endif
     default:
         return false;
+    }
+}
+
+RendererSampler *RendererCreateSampler(Renderer *renderer, uint32_t minFilter,
+                                       uint32_t magFilter, uint32_t addressModeU,
+                                       uint32_t addressModeV, uint32_t addressModeW)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCreateSampler_D3D12(renderer, minFilter, magFilter, addressModeU,
+                                           addressModeV, addressModeW);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCreateSampler_Vulkan(renderer, minFilter, magFilter, addressModeU,
+                                            addressModeV, addressModeW);
+#endif
+    default:
+        return NULL;
+    }
+}
+
+void RendererDestroySampler(Renderer *renderer, RendererSampler *sampler)
+{
+    if (sampler == NULL)
+        return;
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        RendererDestroySampler_D3D12(renderer, sampler);
+        return;
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        RendererDestroySampler_Vulkan(renderer, sampler);
+        return;
+#endif
+    default:
+        return;
     }
 }
 

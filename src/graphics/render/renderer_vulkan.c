@@ -184,6 +184,11 @@ struct RendererTexture
     GpuImage image;
 };
 
+struct RendererSampler
+{
+    VkSampler sampler;
+};
+
 typedef struct FreeRange
 {
     uint32_t offset;
@@ -3134,6 +3139,68 @@ bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
         sizeBytes != (uint64_t)texture->image.height * rowPitchBytes)
         return false;
     return UploadImagePixels(renderer, &texture->image, (const uint8_t *)data, 4u, 1u);
+}
+
+static VkFilter SamplerFilter_Vulkan(uint32_t filter)
+{
+    return filter == LAIUE_GRAPHICS_FILTER_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+}
+
+static VkSamplerAddressMode SamplerAddress_Vulkan(uint32_t mode)
+{
+    switch (mode)
+    {
+    case LAIUE_GRAPHICS_ADDRESS_CLAMP: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    case LAIUE_GRAPHICS_ADDRESS_MIRROR: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case LAIUE_GRAPHICS_ADDRESS_BORDER: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    }
+}
+
+RendererSampler *RendererCreateSampler_Vulkan(Renderer *renderer, uint32_t minFilter,
+                                               uint32_t magFilter, uint32_t addressModeU,
+                                               uint32_t addressModeV, uint32_t addressModeW)
+{
+    if (renderer == NULL || renderer->device == VK_NULL_HANDLE ||
+        minFilter > LAIUE_GRAPHICS_FILTER_LINEAR || magFilter > LAIUE_GRAPHICS_FILTER_LINEAR ||
+        addressModeU > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeV > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeW > LAIUE_GRAPHICS_ADDRESS_BORDER)
+        return NULL;
+    RendererSampler *sampler = PlatformAllocate(sizeof(*sampler), true);
+    if (sampler == NULL)
+        return NULL;
+    VkSamplerCreateInfo description = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = SamplerFilter_Vulkan(magFilter),
+        .minFilter = SamplerFilter_Vulkan(minFilter),
+        .mipmapMode = minFilter == LAIUE_GRAPHICS_FILTER_LINEAR
+                          ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                          : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = SamplerAddress_Vulkan(addressModeU),
+        .addressModeV = SamplerAddress_Vulkan(addressModeV),
+        .addressModeW = SamplerAddress_Vulkan(addressModeW),
+        .maxLod = 0.0f,
+    };
+    if (vkCreateSampler(renderer->device, &description, NULL, &sampler->sampler) != VK_SUCCESS)
+    {
+        PlatformFree(sampler);
+        return NULL;
+    }
+    return sampler;
+}
+
+void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler)
+{
+    if (sampler == NULL)
+        return;
+    if (renderer != NULL && renderer->device != VK_NULL_HANDLE &&
+        sampler->sampler != VK_NULL_HANDLE)
+    {
+        vkDeviceWaitIdle(renderer->device);
+        vkDestroySampler(renderer->device, sampler->sampler, NULL);
+    }
+    PlatformFree(sampler);
 }
 
 void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)

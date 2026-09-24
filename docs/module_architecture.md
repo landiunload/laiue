@@ -85,7 +85,9 @@ versioned service tables и не имеют отдельной legacy-копии
 1, поэтому неподдержанный формат отклоняется до публикации handle. Optional
 `uploadTexture` принимает плотный RGBA8 mip и записывает его через staging на
 GPU; вызов во время активной записи кадра отклоняется, чтобы не нарушать
-синхронизацию command buffer. Pipeline
+синхронизацию command buffer. Sampler handle также создаёт native sampler
+descriptor/state в выбранном provider и освобождается только после безопасной
+границы GPU. Pipeline
 дополнительно удерживает shader handles до своего удаления;
 это предотвращает dangling resources при отказе или частичном teardown.
 

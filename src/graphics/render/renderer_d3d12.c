@@ -38,6 +38,7 @@ void RendererDestroy_D3D12(Renderer* renderer);
 #define SRV_SLOT_UI_BACKGROUND  4
 #define SRV_STATIC_SLOT_COUNT   5
 #define SRV_SLOT_COUNT          64
+#define SAMPLER_SLOT_COUNT      64
 
 // Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
 // Число квадов является частью публичного контракта renderer.h.
@@ -164,6 +165,11 @@ struct RendererTexture
     uint32_t srvSlot;
 };
 
+struct RendererSampler
+{
+    uint32_t samplerSlot;
+};
+
 struct Renderer
 {
     IDXGIFactory4*             factory;
@@ -194,6 +200,11 @@ struct Renderer
     uint32_t                   dynamicSrvNext;
     uint32_t                   dynamicSrvFreeCount;
     uint32_t                   dynamicSrvFree[SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT];
+    ID3D12DescriptorHeap*      samplerHeap;
+    UINT                       samplerDescriptorSize;
+    uint32_t                   dynamicSamplerNext;
+    uint32_t                   dynamicSamplerFreeCount;
+    uint32_t                   dynamicSamplerFree[SAMPLER_SLOT_COUNT];
     bool                       blockTextureUploadPending;
     TexturePackAnimationSet    blockAnimation;
     TexturePackMaterialNames   materialNames;
@@ -639,6 +650,33 @@ static void FreeDynamicSrvSlot(Renderer *renderer, uint32_t slot)
         renderer->dynamicSrvFreeCount >= SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT)
         return;
     renderer->dynamicSrvFree[renderer->dynamicSrvFreeCount++] = slot;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SamplerCpuHandle(Renderer *renderer, uint32_t slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->samplerHeap, &handle);
+    handle.ptr += (SIZE_T)slot * renderer->samplerDescriptorSize;
+    return handle;
+}
+
+static uint32_t AllocateDynamicSamplerSlot(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return UINT32_MAX;
+    if (renderer->dynamicSamplerFreeCount != 0u)
+        return renderer->dynamicSamplerFree[--renderer->dynamicSamplerFreeCount];
+    if (renderer->dynamicSamplerNext >= SAMPLER_SLOT_COUNT)
+        return UINT32_MAX;
+    return renderer->dynamicSamplerNext++;
+}
+
+static void FreeDynamicSamplerSlot(Renderer *renderer, uint32_t slot)
+{
+    if (renderer == NULL || slot >= SAMPLER_SLOT_COUNT ||
+        renderer->dynamicSamplerFreeCount >= SAMPLER_SLOT_COUNT)
+        return;
+    renderer->dynamicSamplerFree[renderer->dynamicSamplerFreeCount++] = slot;
 }
 
 static bool CreateRootSignature(Renderer* renderer)
@@ -1654,6 +1692,21 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     renderer->srvDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
         renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    D3D12_DESCRIPTOR_HEAP_DESC samplerHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        .NumDescriptors = SAMPLER_SLOT_COUNT,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(
+            renderer->device, &samplerHeapDescription, &IID_ID3D12DescriptorHeap,
+            (void **)&renderer->samplerHeap)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+    renderer->samplerDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
+        renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
     if (!CreateUiRootSignature(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
     if (!CreateUiPipelineState(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
     if (!CreateUiQuadBuffers(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
@@ -1862,6 +1915,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     if (renderer->blockNormalUpload != NULL) ID3D12Resource_Release(renderer->blockNormalUpload);
     if (renderer->blockNormalTexture != NULL) ID3D12Resource_Release(renderer->blockNormalTexture);
     if (renderer->srvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->srvHeap);
+    if (renderer->samplerHeap != NULL) ID3D12DescriptorHeap_Release(renderer->samplerHeap);
 
     if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
     if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
@@ -2267,6 +2321,78 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
     WaitForGpu(renderer);
     ID3D12Resource_Release(upload);
     return true;
+}
+
+static D3D12_FILTER SamplerFilter_D3D12(uint32_t minFilter, uint32_t magFilter)
+{
+    if (minFilter == LAIUE_GRAPHICS_FILTER_LINEAR &&
+        magFilter == LAIUE_GRAPHICS_FILTER_LINEAR)
+        return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    if (minFilter == LAIUE_GRAPHICS_FILTER_NEAREST &&
+        magFilter == LAIUE_GRAPHICS_FILTER_LINEAR)
+        return D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    if (minFilter == LAIUE_GRAPHICS_FILTER_LINEAR &&
+        magFilter == LAIUE_GRAPHICS_FILTER_NEAREST)
+        return D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+    return D3D12_FILTER_MIN_MAG_MIP_POINT;
+}
+
+static D3D12_TEXTURE_ADDRESS_MODE SamplerAddress_D3D12(uint32_t mode)
+{
+    switch (mode)
+    {
+    case LAIUE_GRAPHICS_ADDRESS_REPEAT: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    case LAIUE_GRAPHICS_ADDRESS_CLAMP: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    case LAIUE_GRAPHICS_ADDRESS_MIRROR: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case LAIUE_GRAPHICS_ADDRESS_BORDER: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    }
+}
+
+RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer, uint32_t minFilter,
+                                              uint32_t magFilter, uint32_t addressModeU,
+                                              uint32_t addressModeV, uint32_t addressModeW)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->samplerHeap == NULL ||
+        minFilter > LAIUE_GRAPHICS_FILTER_LINEAR || magFilter > LAIUE_GRAPHICS_FILTER_LINEAR ||
+        addressModeU > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeV > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeW > LAIUE_GRAPHICS_ADDRESS_BORDER)
+        return NULL;
+    uint32_t samplerSlot = AllocateDynamicSamplerSlot(renderer);
+    if (samplerSlot == UINT32_MAX)
+        return NULL;
+    RendererSampler *sampler = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(*sampler));
+    if (sampler == NULL)
+    {
+        FreeDynamicSamplerSlot(renderer, samplerSlot);
+        return NULL;
+    }
+    D3D12_SAMPLER_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Filter = SamplerFilter_D3D12(minFilter, magFilter);
+    description.AddressU = SamplerAddress_D3D12(addressModeU);
+    description.AddressV = SamplerAddress_D3D12(addressModeV);
+    description.AddressW = SamplerAddress_D3D12(addressModeW);
+    description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.MaxLOD = D3D12_FLOAT32_MAX;
+    ID3D12Device_CreateSampler(renderer->device, &description,
+                                SamplerCpuHandle(renderer, samplerSlot));
+    sampler->samplerSlot = samplerSlot;
+    return sampler;
+}
+
+void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
+{
+    if (sampler == NULL)
+        return;
+    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
+        renderer->fenceEvent != NULL)
+        WaitForGpu(renderer);
+    if (renderer != NULL)
+        FreeDynamicSamplerSlot(renderer, sampler->samplerSlot);
+    HeapFree(GetProcessHeap(), 0, sampler);
 }
 
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
@@ -2741,8 +2867,8 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
 
     // Общее состояние всех проходов сцены; цель, очистка и viewProjection
     // назначаются в RendererBeginScenePass_D3D12.
-    ID3D12DescriptorHeap* descriptorHeaps[1] = { renderer->srvHeap };
-    ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 1, descriptorHeaps);
+    ID3D12DescriptorHeap* descriptorHeaps[2] = { renderer->srvHeap, renderer->samplerHeap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 2, descriptorHeaps);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     if (frame->passCount == 0)
