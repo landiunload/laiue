@@ -1,46 +1,90 @@
 #include "voxel/raycast_service.h"
 
 #include "mod/module_api.h"
+#include "mod/module_service.h"
+#include "platform/system.h"
 #include "world/world_service.h"
+
+#include <string.h>
 
 typedef struct LaiueVoxelRaycastModuleState
 {
     const LaiueModuleHostV1 *host;
     const LaiueWorldServiceV1 *world;
+    LaiueVoxelRaycastServiceV1 service;
 } LaiueVoxelRaycastModuleState;
 
-static LaiueVoxelRaycastModuleState moduleState;
+/* Compatibility calls predate the context-aware tail and therefore cannot
+ * carry a module instance. Keep the fallback deliberately narrow; new code
+ * must call raycastWithContext and pass the published context. */
+static const LaiueWorldServiceV1 *compatWorldService;
+
+typedef struct RaycastQueryContext
+{
+    const LaiueWorldServiceV1 *worldService;
+    World *world;
+} RaycastQueryContext;
 
 static BlockType ModuleGetBlock(void *context, int64_t x, int64_t y, int64_t z)
 {
-    return moduleState.world->getBlock((World *)context, x, y, z);
+    const RaycastQueryContext *query = (const RaycastQueryContext *)context;
+    return query != NULL && query->worldService != NULL &&
+                   query->worldService->getBlock != NULL && query->world != NULL
+               ? query->worldService->getBlock(query->world, x, y, z)
+               : BLOCK_AIR;
+}
+
+static bool ModuleRaycastWithState(const LaiueVoxelRaycastModuleState *state,
+                                   World *world, const double origin[3],
+                                   const float direction[3], float maximumDistance,
+                                   VoxelRaycastHit *outHit)
+{
+    if (state == NULL || world == NULL || state->world == NULL ||
+        state->world->getBlock == NULL)
+        return false;
+    RaycastQueryContext query = {state->world, world};
+    return VoxelRaycastWithBlockQuery(&query, ModuleGetBlock, origin, direction,
+                                      maximumDistance, outHit);
 }
 
 static bool ModuleRaycast(World *world, const double origin[3], const float direction[3],
-    float maximumDistance, VoxelRaycastHit *outHit)
+                          float maximumDistance, VoxelRaycastHit *outHit)
 {
-    if (world == NULL || moduleState.world == NULL || moduleState.world->getBlock == NULL)
-        return false;
-    /* The service table is resolved once at start; no string lookup occurs in
-     * the hot ray traversal. The callback context is the host-owned World. */
-    return VoxelRaycastWithBlockQuery(
-        (void *)world, ModuleGetBlock, origin, direction, maximumDistance, outHit);
+    LaiueVoxelRaycastModuleState compatibility = {
+        .world = compatWorldService,
+    };
+    return ModuleRaycastWithState(&compatibility, world, origin, direction,
+                                  maximumDistance, outHit);
 }
 
-static const LaiueVoxelRaycastServiceV1 service = {
-    .structSize = sizeof(LaiueVoxelRaycastServiceV1),
-    .abiVersion = LAIUE_VOXEL_RAYCAST_SERVICE_ABI_VERSION_1,
-    .raycast = ModuleRaycast,
-};
+static bool ModuleRaycastWithContext(void *moduleContext, World *world,
+                                     const double origin[3], const float direction[3],
+                                     float maximumDistance, VoxelRaycastHit *outHit)
+{
+    return ModuleRaycastWithState((const LaiueVoxelRaycastModuleState *)moduleContext,
+                                  world, origin, direction, maximumDistance, outHit);
+}
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.world = NULL;
-    *outContext = &moduleState;
+    LaiueVoxelRaycastModuleState *state =
+        (LaiueVoxelRaycastModuleState *)host->allocate(host->context, sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
+    state->service = (LaiueVoxelRaycastServiceV1){
+        .structSize = sizeof(LaiueVoxelRaycastServiceV1),
+        .abiVersion = LAIUE_VOXEL_RAYCAST_SERVICE_ABI_VERSION_1,
+        .raycast = ModuleRaycast,
+        .raycastWithContext = ModuleRaycastWithContext,
+        .context = state,
+    };
+    *outContext = state;
     return 1u;
 }
 
@@ -62,15 +106,17 @@ static uint32_t ModuleStart(void *context)
         state->world = NULL;
         return 0u;
     }
+    compatWorldService = state->world;
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_RAYCAST_SERVICE_NAME,
         .version = LAIUE_VOXEL_RAYCAST_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = sizeof(state->service),
     };
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->world = NULL;
+        compatWorldService = NULL;
         return 0u;
     }
     return 1u;
@@ -84,13 +130,25 @@ static void ModuleStop(void *context)
                                              LAIUE_VOXEL_RAYCAST_SERVICE_NAME);
     if (state != NULL)
         state->world = NULL;
+    compatWorldService = NULL;
 }
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
-    moduleState.world = NULL;
+    LaiueVoxelRaycastModuleState *state = (LaiueVoxelRaycastModuleState *)context;
+    if (state != NULL)
+    {
+        const LaiueModuleHostV1 *host = state->host;
+        const LaiueWorldServiceV1 *world = state->world;
+        state->host = NULL;
+        state->world = NULL;
+        if (compatWorldService == world)
+            compatWorldService = NULL;
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
+        else
+            PlatformFree(state);
+    }
 }
 
 static const char *const provides[] = {LAIUE_VOXEL_RAYCAST_SERVICE_NAME};

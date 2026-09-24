@@ -14,4 +14,9 @@ typedef struct LaiueVoxelRaycastServiceV1
     bool (*raycast)(World *world, const double origin[3],
                     const float direction[3], float maximumDistance,
                     VoxelRaycastHit *outHit);
+    uintptr_t reserved[8];
+    bool (*raycastWithContext)(void *moduleContext, World *world,
+                               const double origin[3], const float direction[3],
+                               float maximumDistance, VoxelRaycastHit *outHit);
+    void *context;
 } LaiueVoxelRaycastServiceV1;

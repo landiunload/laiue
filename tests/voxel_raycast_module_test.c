@@ -93,7 +93,8 @@ LAIUE_TEST_ENTRY(VoxelRaycastModuleTestEntryPoint)
             LAIUE_VOXEL_RAYCAST_SERVICE_ABI_VERSION_1,
             sizeof(LaiueVoxelRaycastServiceV1), &version, &size);
     Expect(service != NULL && version == LAIUE_VOXEL_RAYCAST_SERVICE_ABI_VERSION_1 &&
-               size >= sizeof(*service) && service->raycast != NULL,
+               size >= sizeof(*service) && service->raycast != NULL &&
+               service->raycastWithContext != NULL && service->context != NULL,
            "raycast service is published");
 
     LaiueModuleHostUnloadAll(host);
