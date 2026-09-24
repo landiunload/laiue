@@ -13,6 +13,7 @@
 
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 1u
@@ -33,6 +34,9 @@ typedef struct LaiueAudioOutputDescription
 
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueAudioOutputCreateFn)(
     const LaiueAudioOutputDescription *description, LaiueAudioOutputBackend **outBackend);
+typedef uint32_t(LAIUE_MODULE_CALL *LaiueAudioOutputCreateWithContextFn)(
+    void *moduleContext, const LaiueAudioOutputDescription *description,
+    LaiueAudioOutputBackend **outBackend);
 typedef void(LAIUE_MODULE_CALL *LaiueAudioOutputDestroyFn)(LaiueAudioOutputBackend *backend);
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueAudioOutputGetSampleRateFn)(
     const LaiueAudioOutputBackend *backend);
@@ -54,7 +58,13 @@ typedef struct LaiueAudioOutputServiceV1
     LaiueAudioOutputGetBufferFrameCountFn bufferFrameCount;
     LaiueAudioOutputGetUnderrunCountFn underrunCount;
     uintptr_t reserved[8];
+    LaiueAudioOutputCreateWithContextFn createWithContext;
+    void *context;
 } LaiueAudioOutputServiceV1;
 
-const LaiueModuleApiV1 *LaiueAudioOutputGetStaticModuleApiV1(void);
+#define LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueAudioOutputServiceV1, createWithContext))
+#define LAIUE_AUDIO_OUTPUT_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueAudioOutputServiceV1, context) + sizeof(void *)))
 
+const LaiueModuleApiV1 *LaiueAudioOutputGetStaticModuleApiV1(void);

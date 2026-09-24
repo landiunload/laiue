@@ -10,6 +10,7 @@ typedef struct AudioModuleState
 {
     const LaiueModuleHostV1 *host;
     const LaiueAudioOutputServiceV1 *output;
+    uint32_t outputSize;
     LaiueAudioServiceV1 service;
 } AudioModuleState;
 
@@ -26,8 +27,8 @@ static uint32_t DeviceCreateWithContext(void *moduleContext,
     AudioModuleState *state = (AudioModuleState *)moduleContext;
     if (state == NULL)
         return (uint32_t)AUDIO_RESULT_INVALID_STATE;
-    return (uint32_t)AudioDeviceCreateWithOutputService(configuration, state->output,
-                                                        outDevice);
+    return (uint32_t)AudioDeviceCreateWithOutputServiceEx(configuration, state->output,
+                                                           state->outputSize, outDevice);
 }
 
 static void DeviceDestroy(AudioDevice *device)
@@ -145,16 +146,21 @@ static uint32_t ModuleStart(void *context)
     uint32_t outputSize = 0u;
     state->output = (const LaiueAudioOutputServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
-        LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1, sizeof(LaiueAudioOutputServiceV1),
+        LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
+        LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE,
         &outputVersion, &outputSize);
+    state->outputSize = outputSize;
     if (state->output != NULL &&
         (outputVersion < LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 ||
-         outputSize < sizeof(*state->output) || state->output->create == NULL ||
+         outputSize < LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE ||
+         state->output->structSize < LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE ||
+         state->output->create == NULL ||
          state->output->destroy == NULL || state->output->sampleRate == NULL ||
          state->output->channelCount == NULL || state->output->bufferFrameCount == NULL ||
          state->output->underrunCount == NULL))
     {
         state->output = NULL;
+        state->outputSize = 0u;
         return 0u;
     }
     /* Keep the legacy deviceCreate entry point operational for existing
@@ -171,6 +177,7 @@ static uint32_t ModuleStart(void *context)
         return 1u;
     AudioMixerSetOutputService(NULL);
     state->output = NULL;
+    state->outputSize = 0u;
     return 0u;
 }
 
@@ -192,6 +199,7 @@ static void ModuleDestroy(void *context)
         const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
         state->output = NULL;
+        state->outputSize = 0u;
         AudioMixerSetOutputService(NULL);
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);

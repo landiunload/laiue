@@ -3,8 +3,17 @@
 
 #include "platform/system.h"
 
-static uint32_t CreateOutput(const LaiueAudioOutputDescription *description,
-                             LaiueAudioOutputBackend **outBackend)
+typedef struct AudioOutputModuleState AudioOutputModuleState;
+
+struct AudioOutputModuleState
+{
+    const LaiueModuleHostV1 *host;
+    LaiueAudioOutputServiceV1 service;
+};
+
+static uint32_t CreateOutputInternal(const LaiueAudioOutputDescription *description,
+                                     LaiueAudioOutputBackend **outBackend,
+                                     const LaiueModuleHostV1 *host)
 {
     if (description == NULL || outBackend == NULL || description->render == NULL)
         return 0u;
@@ -15,6 +24,17 @@ static uint32_t CreateOutput(const LaiueAudioOutputDescription *description,
         .render = description->render,
         .context = description->context,
     };
+    if (host != NULL)
+    {
+        internal.allocator.context = host->context;
+        internal.allocator.allocate = host->allocate;
+        internal.allocator.free = host->free;
+    }
+    if (!AudioBackendAllocatorIsValid(&internal.allocator))
+    {
+        *outBackend = NULL;
+        return 0u;
+    }
     AudioBackend *backend = NULL;
     if (!AudioSystemBackendCreate(&internal, &backend))
     {
@@ -23,6 +43,25 @@ static uint32_t CreateOutput(const LaiueAudioOutputDescription *description,
     }
     *outBackend = (LaiueAudioOutputBackend *)backend;
     return 1u;
+}
+
+static uint32_t CreateOutput(const LaiueAudioOutputDescription *description,
+                             LaiueAudioOutputBackend **outBackend)
+{
+    return CreateOutputInternal(description, outBackend, NULL);
+}
+
+static uint32_t CreateOutputWithContext(void *moduleContext,
+                                       const LaiueAudioOutputDescription *description,
+                                       LaiueAudioOutputBackend **outBackend)
+{
+    AudioOutputModuleState *state = (AudioOutputModuleState *)moduleContext;
+    if (state == NULL || state->host == NULL)
+    {
+        if (outBackend != NULL) *outBackend = NULL;
+        return 0u;
+    }
+    return CreateOutputInternal(description, outBackend, state->host);
 }
 
 static void DestroyOutput(LaiueAudioOutputBackend *backend)
@@ -60,23 +99,7 @@ static uint64_t OutputUnderrunCount(const LaiueAudioOutputBackend *backend)
                : internal->vtable->underrunCount(internal);
 }
 
-static const LaiueAudioOutputServiceV1 service = {
-    .structSize = sizeof(LaiueAudioOutputServiceV1),
-    .abiVersion = LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
-    .create = CreateOutput,
-    .destroy = DestroyOutput,
-    .sampleRate = OutputSampleRate,
-    .channelCount = OutputChannelCount,
-    .bufferFrameCount = OutputBufferFrameCount,
-    .underrunCount = OutputUnderrunCount,
-};
-
 static const char *const provides[] = {LAIUE_AUDIO_OUTPUT_SERVICE_NAME};
-
-typedef struct AudioOutputModuleState
-{
-    const LaiueModuleHostV1 *host;
-} AudioOutputModuleState;
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
@@ -88,6 +111,18 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     if (state == NULL)
         return 0u;
     state->host = host;
+    state->service = (LaiueAudioOutputServiceV1){
+        .structSize = sizeof(LaiueAudioOutputServiceV1),
+        .abiVersion = LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
+        .create = CreateOutput,
+        .destroy = DestroyOutput,
+        .sampleRate = OutputSampleRate,
+        .channelCount = OutputChannelCount,
+        .bufferFrameCount = OutputBufferFrameCount,
+        .underrunCount = OutputUnderrunCount,
+        .createWithContext = CreateOutputWithContext,
+        .context = state,
+    };
     *outContext = state;
     return 1u;
 }
@@ -100,8 +135,8 @@ static uint32_t ModuleStart(void *context)
     LaiueModuleServiceV1 published = {
         .name = LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
         .version = LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = state->service.structSize,
     };
     return state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK
                ? 1u

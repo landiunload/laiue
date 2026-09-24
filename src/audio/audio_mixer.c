@@ -529,9 +529,10 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
 
 // === Устройство ===
 
-AudioResult AudioDeviceCreateWithOutputService(
+AudioResult AudioDeviceCreateWithOutputServiceEx(
     const AudioDeviceConfiguration *configuration,
     const LaiueAudioOutputServiceV1 *outputService,
+    uint32_t outputServiceSize,
     AudioDevice **outDevice)
 {
     if (outDevice == NULL) return AUDIO_RESULT_INVALID_ARGUMENT;
@@ -580,8 +581,16 @@ AudioResult AudioDeviceCreateWithOutputService(
             .render = description.render,
             .context = description.context,
         };
-        created = outputService->create(&outputDescription, &device->outputBackend) != 0u &&
-                  device->outputBackend != NULL;
+        bool hasContextCreate =
+            outputServiceSize >= LAIUE_AUDIO_OUTPUT_SERVICE_V1_CONTEXT_SIZE &&
+            outputService->structSize >= LAIUE_AUDIO_OUTPUT_SERVICE_V1_CONTEXT_SIZE &&
+            outputService->createWithContext != NULL && outputService->context != NULL;
+        created = hasContextCreate
+                      ? outputService->createWithContext(outputService->context,
+                                                         &outputDescription,
+                                                         &device->outputBackend) != 0u
+                      : outputService->create(&outputDescription, &device->outputBackend) != 0u;
+        created = created && device->outputBackend != NULL;
         if (created)
         {
             device->outputService = outputService;
@@ -625,6 +634,16 @@ AudioResult AudioDeviceCreateWithOutputService(
     }
     *outDevice = device;
     return AUDIO_RESULT_OK;
+}
+
+AudioResult AudioDeviceCreateWithOutputService(
+    const AudioDeviceConfiguration *configuration,
+    const LaiueAudioOutputServiceV1 *outputService,
+    AudioDevice **outDevice)
+{
+    uint32_t outputServiceSize = outputService != NULL ? outputService->structSize : 0u;
+    return AudioDeviceCreateWithOutputServiceEx(configuration, outputService, outputServiceSize,
+                                                outDevice);
 }
 
 AudioResult AudioDeviceCreate(const AudioDeviceConfiguration *configuration,

@@ -1,8 +1,10 @@
 #pragma once
 
 #include "audio/audio_output_service.h"
+#include "platform/system.h"
 
 #include <stdbool.h>
+#include <string.h>
 #include <stdint.h>
 
 // Внутренняя граница offscreen-вывода. Микшер знает только этот контракт и
@@ -19,6 +21,42 @@ typedef LaiueAudioOutputRenderFn AudioRenderCallback;
 
 typedef struct AudioBackend AudioBackend;
 
+typedef void *(LAIUE_MODULE_CALL *AudioBackendAllocateFn)(void *context, uint64_t size);
+typedef void(LAIUE_MODULE_CALL *AudioBackendFreeFn)(void *context, void *memory);
+
+typedef struct AudioBackendAllocator
+{
+    void *context;
+    AudioBackendAllocateFn allocate;
+    AudioBackendFreeFn free;
+} AudioBackendAllocator;
+
+static inline bool AudioBackendAllocatorIsValid(const AudioBackendAllocator *allocator)
+{
+    return allocator == NULL ||
+           ((allocator->allocate == NULL) == (allocator->free == NULL));
+}
+
+static inline void *AudioBackendAllocate(const AudioBackendAllocator *allocator,
+                                         uint64_t size, bool zero)
+{
+    if (size == 0u) return NULL;
+    void *memory = (allocator != NULL && allocator->allocate != NULL)
+                       ? allocator->allocate(allocator->context, size)
+                       : PlatformAllocate((size_t)size, false);
+    if (memory != NULL && zero) memset(memory, 0, (size_t)size);
+    return memory;
+}
+
+static inline void AudioBackendFree(const AudioBackendAllocator *allocator, void *memory)
+{
+    if (memory == NULL) return;
+    if (allocator != NULL && allocator->free != NULL)
+        allocator->free(allocator->context, memory);
+    else
+        PlatformFree(memory);
+}
+
 typedef struct AudioBackendVtable
 {
     void (*destroy)(AudioBackend *backend);
@@ -33,6 +71,7 @@ struct AudioBackend
     uint32_t sampleRate;
     uint32_t channelCount;
     uint32_t bufferFrameCount;
+    AudioBackendAllocator allocator;
 };
 
 typedef struct AudioBackendDescription
@@ -41,6 +80,7 @@ typedef struct AudioBackendDescription
     uint32_t frameCountHint;   // 0 — размер буфера по умолчанию
     AudioRenderCallback render;
     void *context;
+    AudioBackendAllocator allocator;
 } AudioBackendDescription;
 
 // Системный вывод платформы. Реализуется ровно одним файлом на платформу.

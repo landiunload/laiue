@@ -175,7 +175,9 @@ static uint32_t RenderThreadEntry(void *parameter)
     if (FAILED(IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&renderClient)))
         goto failed;
 
-    backend->mixFrames = PlatformAllocate((size_t)bufferFrameCount * 2u * sizeof(float), false);
+    backend->mixFrames =
+        (float *)AudioBackendAllocate(&backend->base.allocator,
+                                      (uint64_t)bufferFrameCount * 2u * sizeof(float), false);
     if (backend->mixFrames == NULL) goto failed;
     backend->mixFrameCapacity = bufferFrameCount;
     backend->deviceChannelCount = mixFormat->nChannels;
@@ -244,10 +246,11 @@ static void WasapiDestroy(AudioBackend *base)
     if (backend->threadStarted) PlatformThreadJoin(&backend->thread);
 
     if (backend->bufferEvent != NULL) CloseHandle(backend->bufferEvent);
-    if (backend->mixFrames != NULL) PlatformFree(backend->mixFrames);
+    if (backend->mixFrames != NULL)
+        AudioBackendFree(&backend->base.allocator, backend->mixFrames);
     if (backend->startSignalReady) PlatformConditionVariableDestroy(&backend->startSignal);
     if (backend->startLockReady) PlatformMutexDestroy(&backend->startLock);
-    PlatformFree(backend);
+    AudioBackendFree(&backend->base.allocator, backend);
 }
 
 static uint64_t WasapiUnderrunCount(const AudioBackend *base)
@@ -266,11 +269,15 @@ bool AudioSystemBackendCreate(const AudioBackendDescription *description,
 {
     if (description == NULL || outBackend == NULL || description->render == NULL) return false;
     *outBackend = NULL;
+    if (!AudioBackendAllocatorIsValid(&description->allocator)) return false;
 
-    AudioWasapiBackend *backend = PlatformAllocate(sizeof(*backend), true);
+    AudioWasapiBackend *backend =
+        (AudioWasapiBackend *)AudioBackendAllocate(&description->allocator, sizeof(*backend),
+                                                  true);
     if (backend == NULL) return false;
 
     backend->base.vtable = &WASAPI_VTABLE;
+    backend->base.allocator = description->allocator;
     backend->render = description->render;
     backend->context = description->context;
     backend->running = 1u;

@@ -16,3 +16,9 @@ AudioResult AudioDeviceCreateWithOutputService(
     const AudioDeviceConfiguration *configuration,
     const LaiueAudioOutputServiceV1 *outputService,
     AudioDevice **outDevice);
+
+AudioResult AudioDeviceCreateWithOutputServiceEx(
+    const AudioDeviceConfiguration *configuration,
+    const LaiueAudioOutputServiceV1 *outputService,
+    uint32_t outputServiceSize,
+    AudioDevice **outDevice);

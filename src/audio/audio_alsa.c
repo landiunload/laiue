@@ -146,9 +146,10 @@ static void AlsaDestroy(AudioBackend *base)
         PlatformThreadJoin(&backend->thread);
     }
     if (backend->pcm != NULL) backend->api.close(backend->pcm);
-    if (backend->mixFrames != NULL) PlatformFree(backend->mixFrames);
+    if (backend->mixFrames != NULL)
+        AudioBackendFree(&backend->base.allocator, backend->mixFrames);
     AlsaApiUnload(&backend->api);
-    PlatformFree(backend);
+    AudioBackendFree(&backend->base.allocator, backend);
 }
 
 static uint64_t AlsaUnderrunCount(const AudioBackend *base)
@@ -167,11 +168,15 @@ bool AudioSystemBackendCreate(const AudioBackendDescription *description,
 {
     if (description == NULL || outBackend == NULL || description->render == NULL) return false;
     *outBackend = NULL;
+    if (!AudioBackendAllocatorIsValid(&description->allocator)) return false;
 
-    AudioAlsaBackend *backend = PlatformAllocate(sizeof(*backend), true);
+    AudioAlsaBackend *backend =
+        (AudioAlsaBackend *)AudioBackendAllocate(&description->allocator, sizeof(*backend),
+                                                true);
     if (backend == NULL) return false;
 
     backend->base.vtable = &ALSA_VTABLE;
+    backend->base.allocator = description->allocator;
     backend->render = description->render;
     backend->context = description->context;
     backend->running = 1u;
@@ -218,8 +223,10 @@ bool AudioSystemBackendCreate(const AudioBackendDescription *description,
 
     backend->periodFrames = (uint32_t)periodFrames;
     backend->mixFrames =
-        PlatformAllocate((size_t)backend->periodFrames * AUDIO_ALSA_CHANNELS * sizeof(float),
-                         false);
+        (float *)AudioBackendAllocate(&backend->base.allocator,
+                                      (uint64_t)backend->periodFrames * AUDIO_ALSA_CHANNELS *
+                                          sizeof(float),
+                                      false);
     if (backend->mixFrames == NULL)
     {
         AlsaDestroy(&backend->base);

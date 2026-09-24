@@ -3,6 +3,7 @@
 // provider удалить, этот тест не маскирует отсутствие звука offscreen-тестом.
 
 #include "audio/audio_service.h"
+#include "audio/audio_output_service.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
@@ -75,6 +76,18 @@ LAIUE_TEST_ENTRY(AudioSystemBackendTestEntryPoint)
     };
     Expect(LaiueModuleHostLoad(host, binaries, 2u, &diagnostic) == LAIUE_MODULE_OK,
            diagnostic.message);
+
+    uint32_t outputVersion = 0u;
+    uint32_t outputSize = 0u;
+    const LaiueAudioOutputServiceV1 *output =
+        (const LaiueAudioOutputServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_AUDIO_OUTPUT_SERVICE_NAME, LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
+            LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE, &outputVersion, &outputSize);
+    Expect(output != NULL && outputVersion >= LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 &&
+               outputSize >= LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE &&
+               output->create != NULL && output->destroy != NULL &&
+               output->createWithContext != NULL && output->context != NULL,
+           "audio output publishes an instance-bound creation path");
 
     uint32_t serviceVersion = 0u;
     uint32_t serviceSize = 0u;

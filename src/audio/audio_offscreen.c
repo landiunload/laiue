@@ -17,7 +17,7 @@ typedef struct AudioOffscreenBackend
 
 static void OffscreenDestroy(AudioBackend *backend)
 {
-    PlatformFree(backend);
+    AudioBackendFree(&backend->allocator, backend);
 }
 
 static uint64_t OffscreenUnderrunCount(const AudioBackend *backend)
@@ -38,10 +38,14 @@ bool AudioOffscreenBackendCreate(const AudioBackendDescription *description,
     if (description == NULL || outBackend == NULL || description->render == NULL) return false;
     *outBackend = NULL;
 
-    AudioOffscreenBackend *backend = PlatformAllocate(sizeof(*backend), true);
+    if (!AudioBackendAllocatorIsValid(&description->allocator)) return false;
+    AudioOffscreenBackend *backend =
+        (AudioOffscreenBackend *)AudioBackendAllocate(&description->allocator,
+                                                      sizeof(*backend), true);
     if (backend == NULL) return false;
 
     backend->base.vtable = &OFFSCREEN_VTABLE;
+    backend->base.allocator = description->allocator;
     backend->base.sampleRate = description->sampleRate != 0u
                                    ? description->sampleRate
                                    : AUDIO_OFFSCREEN_DEFAULT_SAMPLE_RATE;
