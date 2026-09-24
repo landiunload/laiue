@@ -312,8 +312,15 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(voxelRenderService != NULL &&
                version == LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1 &&
                size >= sizeof(*voxelRenderService) && voxelRenderService->create != NULL &&
-               voxelRenderService->draw != NULL,
+               voxelRenderService->draw != NULL &&
+               voxelRenderService->createWithContext != NULL &&
+               voxelRenderService->context != NULL,
            "voxel render service is published");
+    ChunkStreaming *instanceStreaming = voxelRenderService->createWithContext(
+        voxelRenderService->context, NULL, NULL, 0);
+    Expect(instanceStreaming != NULL,
+           "voxel render creates an instance with bound services");
+    voxelRenderService->destroy(instanceStreaming);
     const LaiueGraphicsServiceV1 *graphicsService =
         (const LaiueGraphicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,

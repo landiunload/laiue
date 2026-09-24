@@ -26,4 +26,10 @@ typedef struct LaiueVoxelRenderServiceV1
     void (*getStats)(ChunkStreaming *streaming, ChunkStreamingStats *outStats);
     void (*draw)(ChunkStreaming *streaming, const float viewProjection[16],
                  const int64_t renderOriginBlock[3]);
+    /* Optional tail: binds every streaming instance to this module context.
+     * The original create remains source/binary compatible for legacy hosts. */
+    ChunkStreaming *(*createWithContext)(void *moduleContext, World *world,
+                                         Renderer *renderer,
+                                         int32_t viewRadiusChunks);
+    void *context;
 } LaiueVoxelRenderServiceV1;

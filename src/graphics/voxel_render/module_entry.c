@@ -7,6 +7,8 @@
 #include "scene/math_service.h"
 #include "world/world_service.h"
 
+#include <string.h>
+
 typedef struct LaiueVoxelRenderModuleState
 {
     const LaiueModuleHostV1 *host;
@@ -14,38 +16,50 @@ typedef struct LaiueVoxelRenderModuleState
     const LaiueWorldServiceV1 *world;
     const LaiueMesherServiceV1 *mesher;
     const LaiueGraphicsServiceV1 *graphics;
+    LaiueVoxelRenderServiceV1 service;
 } LaiueVoxelRenderModuleState;
 
-static LaiueVoxelRenderModuleState moduleState;
-
-static const LaiueVoxelRenderServiceV1 service = {
-    .structSize = sizeof(LaiueVoxelRenderServiceV1),
-    .abiVersion = LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1,
-    .create = ChunkStreamingCreate,
-    .destroy = ChunkStreamingDestroy,
-    .pause = ChunkStreamingPause,
-    .setCenter = ChunkStreamingSetCenter,
-    .invalidateBlock = ChunkStreamingInvalidateBlock,
-    .pump = ChunkStreamingPump,
-    .getStats = ChunkStreamingGetStats,
-    .draw = ChunkStreamingDraw,
-};
+static ChunkStreaming* CreateWithContext(void *moduleContext, World *world,
+    Renderer *renderer, int32_t viewRadiusChunks)
+{
+    LaiueVoxelRenderModuleState *state = moduleContext;
+    if (state == NULL || state->sceneMath == NULL || state->world == NULL ||
+        state->mesher == NULL || state->graphics == NULL)
+        return NULL;
+    return ChunkStreamingCreateWithServices(world, renderer, viewRadiusChunks,
+        state->sceneMath, state->world, state->mesher, state->graphics);
+}
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
         host->unpublishService == NULL || host->queryService == NULL)
         return 0u;
-    moduleState.host = host;
-    moduleState.sceneMath = NULL;
-    moduleState.world = NULL;
-    moduleState.mesher = NULL;
-    moduleState.graphics = NULL;
+    if (host->allocate == NULL || host->free == NULL)
+        return 0u;
+    LaiueVoxelRenderModuleState *state = host->allocate(host->context,
+        sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
+    state->service.structSize = sizeof(state->service);
+    state->service.abiVersion = LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1;
+    state->service.create = ChunkStreamingCreate;
+    state->service.destroy = ChunkStreamingDestroy;
+    state->service.pause = ChunkStreamingPause;
+    state->service.setCenter = ChunkStreamingSetCenter;
+    state->service.invalidateBlock = ChunkStreamingInvalidateBlock;
+    state->service.pump = ChunkStreamingPump;
+    state->service.getStats = ChunkStreamingGetStats;
+    state->service.draw = ChunkStreamingDraw;
+    state->service.createWithContext = CreateWithContext;
+    state->service.context = state;
     ChunkStreamingSetSceneMathService(NULL);
     ChunkStreamingSetWorldService(NULL);
     ChunkStreamingSetMesherService(NULL);
     ChunkStreamingSetGraphicsService(NULL);
-    *outContext = &moduleState;
+    *outContext = state;
     return 1u;
 }
 
@@ -90,8 +104,8 @@ static uint32_t ModuleStart(void *context)
     LaiueModuleServiceV1 published = {
         .name = LAIUE_VOXEL_RENDER_SERVICE_NAME,
         .version = LAIUE_VOXEL_RENDER_SERVICE_ABI_VERSION_1,
-        .table = &service,
-        .tableSize = sizeof(service),
+        .table = &state->service,
+        .tableSize = sizeof(state->service),
     };
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
@@ -129,16 +143,21 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
-    (void)context;
-    moduleState.host = NULL;
+    LaiueVoxelRenderModuleState *state = context;
     ChunkStreamingSetSceneMathService(NULL);
     ChunkStreamingSetWorldService(NULL);
     ChunkStreamingSetMesherService(NULL);
     ChunkStreamingSetGraphicsService(NULL);
-    moduleState.sceneMath = NULL;
-    moduleState.world = NULL;
-    moduleState.mesher = NULL;
-    moduleState.graphics = NULL;
+    if (state == NULL)
+        return;
+    const LaiueModuleHostV1 *host = state->host;
+    state->host = NULL;
+    state->sceneMath = NULL;
+    state->world = NULL;
+    state->mesher = NULL;
+    state->graphics = NULL;
+    if (host != NULL && host->free != NULL)
+        host->free(host->context, state);
 }
 
 static const char *const provides[] = {LAIUE_VOXEL_RENDER_SERVICE_NAME};

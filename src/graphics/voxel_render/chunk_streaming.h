@@ -46,6 +46,16 @@ LAIUE_VOXEL_RENDER_API void ChunkStreamingSetGraphicsService(
 
 LAIUE_VOXEL_RENDER_API ChunkStreaming* ChunkStreamingCreate(
     World* world, Renderer* renderer, int32_t viewRadiusChunks);
+
+/* Instance-owned service bindings.  The legacy create/setter path remains
+ * available for older callers, but new modules must use this constructor so
+ * two streaming instances never race through process-global service slots. */
+LAIUE_VOXEL_RENDER_API ChunkStreaming* ChunkStreamingCreateWithServices(
+    World* world, Renderer* renderer, int32_t viewRadiusChunks,
+    const struct LaiueSceneMathServiceV1* sceneMath,
+    const struct LaiueWorldServiceV1* worldService,
+    const struct LaiueMesherServiceV1* mesher,
+    const struct LaiueGraphicsServiceV1* graphics);
 LAIUE_VOXEL_RENDER_API void ChunkStreamingDestroy(ChunkStreaming* streaming);
 LAIUE_VOXEL_RENDER_API bool ChunkStreamingPause(ChunkStreaming* streaming);
 

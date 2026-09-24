@@ -28,10 +28,12 @@
 #define MESH_UPLOAD_BUDGET_MILLISECONDS 2.0
 #define CHUNK_MESH_BUILD_FAILED UINT32_MAX
 
-static const LaiueSceneMathServiceV1* sceneMathService;
-static const LaiueWorldServiceV1* worldService;
-static const LaiueMesherServiceV1* mesherService;
-static const LaiueGraphicsServiceV1* graphicsService;
+/* Compatibility defaults used only by the legacy setter/create entry points.
+ * Every new ChunkStreaming instance snapshots its own validated bindings. */
+static const LaiueSceneMathServiceV1* legacySceneMathService;
+static const LaiueWorldServiceV1* legacyWorldService;
+static const LaiueMesherServiceV1* legacyMesherService;
+static const LaiueGraphicsServiceV1* legacyGraphicsService;
 
 static bool ServiceFieldPresent(uint32_t structSize, size_t offset, size_t size)
 {
@@ -77,84 +79,109 @@ static bool GraphicsServiceUsable(const LaiueGraphicsServiceV1* service)
 
 void ChunkStreamingSetSceneMathService(const LaiueSceneMathServiceV1* service)
 {
-    sceneMathService = SceneMathServiceUsable(service) ? service : NULL;
+    legacySceneMathService = SceneMathServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetWorldService(const LaiueWorldServiceV1* service)
 {
-    worldService = WorldServiceUsable(service) ? service : NULL;
+    legacyWorldService = WorldServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetMesherService(const LaiueMesherServiceV1* service)
 {
-    mesherService = MesherServiceUsable(service) ? service : NULL;
+    legacyMesherService = MesherServiceUsable(service) ? service : NULL;
 }
 
 void ChunkStreamingSetGraphicsService(const LaiueGraphicsServiceV1* service)
 {
-    graphicsService = GraphicsServiceUsable(service) ? service : NULL;
+    legacyGraphicsService = GraphicsServiceUsable(service) ? service : NULL;
 }
 
+typedef struct ChunkStreamingServiceBindings
+{
+    const LaiueSceneMathServiceV1* sceneMath;
+    const LaiueWorldServiceV1* world;
+    const LaiueMesherServiceV1* mesher;
+    const LaiueGraphicsServiceV1* graphics;
+} ChunkStreamingServiceBindings;
+
+struct ChunkStreaming;
+
 static WorldRegionContents VoxelRenderWorldFillRegion(
-    World* world, int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
+    const ChunkStreamingServiceBindings* services, World* world,
+    int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
 {
-    return worldService != NULL && worldService->fillRegion != NULL && world != NULL
-               ? worldService->fillRegion(world, minBlockX, minBlockY, minBlockZ,
+    return services != NULL && services->world != NULL &&
+           services->world->fillRegion != NULL && world != NULL
+               ? services->world->fillRegion(world, minBlockX, minBlockY, minBlockZ,
                                           sizeX, sizeY, sizeZ, outBlocks)
                : WORLD_REGION_ALL_AIR;
 }
 
-static ChunkMesherScratch* VoxelRenderMesherScratchCreate(void)
+static ChunkMesherScratch* VoxelRenderMesherScratchCreate(
+    const ChunkStreamingServiceBindings* services)
 {
-    return mesherService != NULL && mesherService->scratchCreate != NULL
-               ? mesherService->scratchCreate()
+    return services != NULL && services->mesher != NULL &&
+           services->mesher->scratchCreate != NULL
+               ? services->mesher->scratchCreate()
                : NULL;
 }
 
-static void VoxelRenderMesherScratchDestroy(ChunkMesherScratch* scratch)
+static void VoxelRenderMesherScratchDestroy(
+    const ChunkStreamingServiceBindings* services, ChunkMesherScratch* scratch)
 {
-    if (mesherService != NULL && mesherService->scratchDestroy != NULL)
-        mesherService->scratchDestroy(scratch);
+    if (services != NULL && services->mesher != NULL &&
+        services->mesher->scratchDestroy != NULL)
+        services->mesher->scratchDestroy(scratch);
 }
 
-static bool VoxelRenderBuildChunkMesh(const ChunkMesherWorldSource* source,
+static bool VoxelRenderBuildChunkMesh(const ChunkStreamingServiceBindings* services,
+    const ChunkMesherWorldSource* source,
     ChunkMesherScratch* scratch, int64_t chunkX, int64_t chunkY, int64_t chunkZ,
     ChunkQuad** outQuads, uint32_t* outQuadCount)
 {
-    return mesherService != NULL && mesherService->buildChunkMesh != NULL &&
-           mesherService->buildChunkMesh(source, scratch, chunkX, chunkY, chunkZ,
+    return services != NULL && services->mesher != NULL &&
+           services->mesher->buildChunkMesh != NULL &&
+           services->mesher->buildChunkMesh(source, scratch, chunkX, chunkY, chunkZ,
                                          outQuads, outQuadCount);
 }
 
-static RendererMesh* VoxelRenderCreateMesh(Renderer* renderer,
+static RendererMesh* VoxelRenderCreateMesh(const ChunkStreamingServiceBindings* services,
+    Renderer* renderer,
     const ChunkQuad* quads, uint32_t quadCount)
 {
-    return graphicsService != NULL && graphicsService->createMesh != NULL
-               ? graphicsService->createMesh(renderer, quads, quadCount)
+    return services != NULL && services->graphics != NULL &&
+           services->graphics->createMesh != NULL
+               ? services->graphics->createMesh(renderer, quads, quadCount)
                : NULL;
 }
 
-static void VoxelRenderDestroyMesh(Renderer* renderer, RendererMesh* mesh)
+static void VoxelRenderDestroyMesh(const ChunkStreamingServiceBindings* services,
+    Renderer* renderer, RendererMesh* mesh)
 {
-    if (graphicsService != NULL && graphicsService->destroyMesh != NULL)
-        graphicsService->destroyMesh(renderer, mesh);
+    if (services != NULL && services->graphics != NULL &&
+        services->graphics->destroyMesh != NULL)
+        services->graphics->destroyMesh(renderer, mesh);
 }
 
-static void VoxelRenderDrawMesh(Renderer* renderer, const RendererMesh* mesh,
+static void VoxelRenderDrawMesh(const ChunkStreamingServiceBindings* services,
+    Renderer* renderer, const RendererMesh* mesh,
     const float chunkOriginRelative[3])
 {
-    if (graphicsService != NULL && graphicsService->drawMesh != NULL)
-        graphicsService->drawMesh(renderer, mesh, chunkOriginRelative);
+    if (services != NULL && services->graphics != NULL &&
+        services->graphics->drawMesh != NULL)
+        services->graphics->drawMesh(renderer, mesh, chunkOriginRelative);
 }
 
-#define WorldFillRegion VoxelRenderWorldFillRegion
-#define ChunkMesherScratchCreate VoxelRenderMesherScratchCreate
-#define ChunkMesherScratchDestroy VoxelRenderMesherScratchDestroy
-#define BuildChunkMesh VoxelRenderBuildChunkMesh
-#define RendererCreateMesh VoxelRenderCreateMesh
-#define RendererDestroyMesh VoxelRenderDestroyMesh
-#define RendererDrawMesh VoxelRenderDrawMesh
+/* The worker source is short-lived and carries both the stream instance and
+ * its world.  This avoids a global callback context while preserving the
+ * mesher's provider-only contract. */
+typedef struct ChunkMesherWorldContext
+{
+    const ChunkStreamingServiceBindings* services;
+    World* world;
+} ChunkMesherWorldContext;
 
 // Мешер принимает только абстрактный region provider. Voxel-render связывает
 // его с выбранным world здесь, на границе технологии; сам mesher поэтому не
@@ -163,8 +190,11 @@ static WorldRegionContents FillMesherRegionFromWorld(void* context,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType* outBlocks)
 {
-    return WorldFillRegion((World*)context, minBlockX, minBlockY, minBlockZ,
-        sizeX, sizeY, sizeZ, outBlocks);
+    ChunkMesherWorldContext* worldContext = context;
+    return VoxelRenderWorldFillRegion(worldContext != NULL ?
+            worldContext->services : NULL,
+        worldContext != NULL ? worldContext->world : NULL,
+        minBlockX, minBlockY, minBlockZ, sizeX, sizeY, sizeZ, outBlocks);
 }
 
 static int64_t ChunkCoordinateFromBlock(int64_t block)
@@ -245,6 +275,7 @@ struct ChunkStreaming
     // от ближних к дальним: полную hash-таблицу Draw не обходит.
     DrawItem* drawItems;
     uint32_t drawItemCount;
+    ChunkStreamingServiceBindings services;
     int64_t drawRenderOriginBlock[3];
     bool hasDrawRenderOrigin;
     bool drawOrderDirty;
@@ -715,7 +746,7 @@ static uint32_t WorkerThreadProcedure(void* parameter)
 {
     ChunkStreaming* streaming = parameter;
 
-    ChunkMesherScratch* scratch = ChunkMesherScratchCreate();
+    ChunkMesherScratch* scratch = VoxelRenderMesherScratchCreate(&streaming->services);
     if (scratch == NULL)
     {
         return 1;
@@ -743,7 +774,7 @@ static uint32_t WorkerThreadProcedure(void* parameter)
         if (streaming->shutdownRequested)
         {
             PlatformMutexUnlock(&streaming->queueLock);
-            ChunkMesherScratchDestroy(scratch);
+            VoxelRenderMesherScratchDestroy(&streaming->services, scratch);
             return 0;
         }
 
@@ -758,11 +789,16 @@ static uint32_t WorkerThreadProcedure(void* parameter)
             request.centerEpoch != PlatformAtomicLoadU32Acquire(&streaming->centerEpoch);
         double buildStart = PlatformMonotonicSeconds();
         ChunkMeshResult result = { .x = request.x, .y = request.y, .z = request.z, .revision = request.revision };
+        ChunkMesherWorldContext worldContext = {
+            .services = &streaming->services,
+            .world = streaming->world,
+        };
         ChunkMesherWorldSource source = {
-            .context = streaming->world,
+            .context = &worldContext,
             .fillRegion = FillMesherRegionFromWorld,
         };
-        if (cancelled || !BuildChunkMesh(&source, scratch,
+        if (cancelled || !VoxelRenderBuildChunkMesh(&streaming->services,
+            &source, scratch,
             request.x, request.y, request.z, &result.quads, &result.quadCount))
         {
             result.quadCount = CHUNK_MESH_BUILD_FAILED;
@@ -989,7 +1025,7 @@ static void EvictChunk(ChunkStreaming* streaming, int64_t x, int64_t y, int64_t 
     if (entry->mesh != NULL)
     {
         RemoveMeshFromDrawList(streaming, entry);
-        RendererDestroyMesh(streaming->renderer, entry->mesh);
+        VoxelRenderDestroyMesh(&streaming->services, streaming->renderer, entry->mesh);
         entry->mesh = NULL;
     }
     EraseEntry(streaming, entry);
@@ -1019,7 +1055,7 @@ static void PruneEntriesOutsideRadius(ChunkStreaming* streaming, int64_t radius)
         if (entry->mesh != NULL)
         {
             RemoveMeshFromDrawList(streaming, entry);
-            RendererDestroyMesh(streaming->renderer, entry->mesh);
+            VoxelRenderDestroyMesh(&streaming->services, streaming->renderer, entry->mesh);
             entry->mesh = NULL;
         }
         EraseEntry(streaming, entry);
@@ -1120,7 +1156,7 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
         }
         else
         {
-            RendererDestroyMesh(streaming->renderer, previous->mesh);
+            VoxelRenderDestroyMesh(&streaming->services, streaming->renderer, previous->mesh);
             previous->mesh = NULL;
             previous->drawSlotPlusOne = 0;
         }
@@ -1151,12 +1187,26 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
 
 ChunkStreaming* ChunkStreamingCreate(World* world, Renderer* renderer, int32_t viewRadiusChunks)
 {
+    return ChunkStreamingCreateWithServices(world, renderer, viewRadiusChunks,
+        legacySceneMathService, legacyWorldService, legacyMesherService,
+        legacyGraphicsService);
+}
+
+ChunkStreaming* ChunkStreamingCreateWithServices(World* world, Renderer* renderer,
+    int32_t viewRadiusChunks, const LaiueSceneMathServiceV1* sceneMath,
+    const LaiueWorldServiceV1* worldService, const LaiueMesherServiceV1* mesher,
+    const LaiueGraphicsServiceV1* graphics)
+{
     ChunkStreaming* streaming = PlatformAllocate(sizeof(*streaming), true);
     if (streaming == NULL)
     {
         return NULL;
     }
 
+    streaming->services.sceneMath = SceneMathServiceUsable(sceneMath) ? sceneMath : NULL;
+    streaming->services.world = WorldServiceUsable(worldService) ? worldService : NULL;
+    streaming->services.mesher = MesherServiceUsable(mesher) ? mesher : NULL;
+    streaming->services.graphics = GraphicsServiceUsable(graphics) ? graphics : NULL;
     streaming->world = world;
     streaming->renderer = renderer;
     streaming->viewRadius = viewRadiusChunks;
@@ -1261,7 +1311,8 @@ void ChunkStreamingDestroy(ChunkStreaming* streaming)
         {
             if (streaming->entries[i].mesh != NULL)
             {
-                RendererDestroyMesh(streaming->renderer, streaming->entries[i].mesh);
+                VoxelRenderDestroyMesh(&streaming->services, streaming->renderer,
+                    streaming->entries[i].mesh);
             }
         }
         PlatformFree(streaming->entries);
@@ -1424,7 +1475,8 @@ static bool TryUploadHeldResult(ChunkStreaming* streaming,
         return true;
     }
 
-    RendererMesh* mesh = RendererCreateMesh(streaming->renderer,
+    RendererMesh* mesh = VoxelRenderCreateMesh(&streaming->services,
+        streaming->renderer,
         held->quads, held->quadCount);
     if (mesh == NULL)
     {
@@ -1434,7 +1486,7 @@ static bool TryUploadHeldResult(ChunkStreaming* streaming,
     bool hadMesh = entry->mesh != NULL;
     if (hadMesh)
     {
-        RendererDestroyMesh(streaming->renderer, entry->mesh);
+        VoxelRenderDestroyMesh(&streaming->services, streaming->renderer, entry->mesh);
     }
     entry->mesh = mesh;
     if (!hadMesh)
@@ -1527,7 +1579,8 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
             }
             else if (result.quadCount > 0)
             {
-                RendererMesh* mesh = RendererCreateMesh(streaming->renderer, result.quads, result.quadCount);
+                RendererMesh* mesh = VoxelRenderCreateMesh(&streaming->services,
+                    streaming->renderer, result.quads, result.quadCount);
                 if (mesh != NULL)
                 {
                     // Свап готов: старый меш освобождаем только теперь (отложенно
@@ -1535,7 +1588,8 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                     bool hadMesh = entry->mesh != NULL;
                     if (hadMesh)
                     {
-                        RendererDestroyMesh(streaming->renderer, entry->mesh);
+                        VoxelRenderDestroyMesh(&streaming->services, streaming->renderer,
+                            entry->mesh);
                     }
                     entry->mesh = mesh;
                     if (!hadMesh)
@@ -1565,7 +1619,8 @@ void ChunkStreamingPump(ChunkStreaming* streaming)
                 if (entry->mesh != NULL)
                 {
                     RemoveMeshFromDrawList(streaming, entry);
-                    RendererDestroyMesh(streaming->renderer, entry->mesh);
+                    VoxelRenderDestroyMesh(&streaming->services, streaming->renderer,
+                        entry->mesh);
                     entry->mesh = NULL;
                 }
                 entry->state = CHUNK_ENTRY_READY;
@@ -1663,7 +1718,8 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
     const int64_t renderOriginBlock[3])
 {
     if (streaming == NULL || viewProjection == NULL || renderOriginBlock == NULL ||
-        sceneMathService == NULL || sceneMathService->matrix4ExtractFrustumPlanes == NULL)
+        streaming->services.sceneMath == NULL ||
+        streaming->services.sceneMath->matrix4ExtractFrustumPlanes == NULL)
     {
         return;
     }
@@ -1704,7 +1760,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
     }
 
     float planes[6][4];
-    sceneMathService->matrix4ExtractFrustumPlanes(viewProjection, planes);
+    streaming->services.sceneMath->matrix4ExtractFrustumPlanes(viewProjection, planes);
     ExpandFrustumPlanesForChunk(planes);
 
     // Frustum зависит от поворота камеры, поэтому отсечение остаётся
@@ -1730,6 +1786,7 @@ void ChunkStreamingDraw(ChunkStreaming* streaming, const float viewProjection[16
             continue;
         }
 
-        RendererDrawMesh(streaming->renderer, entry->mesh, chunkOriginRelative);
+        VoxelRenderDrawMesh(&streaming->services, streaming->renderer, entry->mesh,
+            chunkOriginRelative);
     }
 }
