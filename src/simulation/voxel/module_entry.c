@@ -35,6 +35,12 @@ struct LaiueVoxelWorldV1
     LaiueVoxelProviderV1 provider;
 };
 
+static bool ServiceFieldPresent(uint32_t structSize, size_t offset, size_t size)
+{
+    return (size_t)structSize >= offset &&
+           (size_t)structSize - offset >= size;
+}
+
 static bool VoxelBlocksEqual(const LaiueVoxelBlockV1 *left,
                              const LaiueVoxelBlockV1 *right)
 {
@@ -391,7 +397,20 @@ static uint32_t VoxelCreateWithWorldService(
         .context = world,
         .getBlock = VoxelBaseGetBlock,
     };
-    world->world = worldService->create(&base);
+    if (ServiceFieldPresent(worldService->structSize,
+            offsetof(LaiueWorldServiceV1, createWithContext),
+            sizeof(worldService->createWithContext)) &&
+        worldService->createWithContext != NULL &&
+        ServiceFieldPresent(worldService->structSize,
+            offsetof(LaiueWorldServiceV1, context), sizeof(worldService->context)) &&
+        worldService->context != NULL)
+    {
+        world->world = worldService->createWithContext(worldService->context, &base);
+    }
+    else
+    {
+        world->world = worldService->create(&base);
+    }
     if (world->world == NULL)
     {
         PlatformMutexDestroy(&world->paletteLock);
