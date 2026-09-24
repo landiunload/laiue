@@ -36,7 +36,14 @@ target_link_libraries(laiue_walk_android PRIVATE
     log
     "${Vulkan_LIBRARY}")
 if(LAIUE_ANDROID_WALK_WITH_VOXEL)
-    target_link_libraries(laiue_walk_android PRIVATE laiue_voxel)
+    # The static registry below explicitly registers the complete voxel
+    # dependency chain.  Keep all three archives in the final NativeActivity
+    # image; relying on the voxel archive alone leaves the numeric/world
+    # entrypoints unresolved under --no-undefined.
+    target_link_libraries(laiue_walk_android PRIVATE
+        laiue_numeric
+        laiue_world
+        laiue_voxel)
     target_compile_definitions(laiue_walk_android PRIVATE LAIUE_ANDROID_WALK_WITH_VOXEL=1)
 endif()
 target_link_options(laiue_walk_android PRIVATE
