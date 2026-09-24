@@ -22,6 +22,11 @@
 
 #define ANDROID_WALK_LOG_TAG "laiue.walk"
 #define ANDROID_WALK_HALF_EXTENT INT64_C(400)
+#define ANDROID_WALK_ACTIVE_CHUNK_RADIUS 1
+#define ANDROID_WALK_ACTIVE_CHUNK_DIAMETER \
+    (ANDROID_WALK_ACTIVE_CHUNK_RADIUS * 2 + 1)
+#define ANDROID_WALK_ACTIVE_CHUNK_COUNT \
+    (ANDROID_WALK_ACTIVE_CHUNK_DIAMETER * ANDROID_WALK_ACTIVE_CHUNK_DIAMETER)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
 
@@ -524,14 +529,25 @@ static void AndroidStep(AndroidWalkState *state)
             uint32_t submitted = 1u;
             if (began != 0u && state->terrainReady && state->device->submit != NULL)
             {
-                LaiueGraphicsDrawItemV2 draw = {
-                    .structSize = sizeof(draw),
-                    .vertexBuffer = state->terrainBuffer,
-                    .indexCount = 30u,
-                    .originRelative = {0.0f, 0.0f, 0.0f},
-                    .scale = 1.0f,
-                };
-                submitted = state->device->submit(state->device, &draw, 1u);
+                LaiueGraphicsDrawItemV2 draws[ANDROID_WALK_ACTIVE_CHUNK_COUNT];
+                uint32_t drawIndex = 0u;
+                for (int32_t y = -ANDROID_WALK_ACTIVE_CHUNK_RADIUS;
+                     y <= ANDROID_WALK_ACTIVE_CHUNK_RADIUS; ++y)
+                    for (int32_t x = -ANDROID_WALK_ACTIVE_CHUNK_RADIUS;
+                         x <= ANDROID_WALK_ACTIVE_CHUNK_RADIUS; ++x)
+                    {
+                        draws[drawIndex] = (LaiueGraphicsDrawItemV2){
+                            .structSize = sizeof(draws[drawIndex]),
+                            .vertexBuffer = state->terrainBuffer,
+                            .indexCount = 30u,
+                            .originRelative = {(float)x * 64.0f,
+                                                (float)y * 64.0f, 0.0f},
+                            .scale = 1.0f,
+                        };
+                        ++drawIndex;
+                    }
+                submitted = state->device->submit(state->device, draws,
+                                                  ANDROID_WALK_ACTIVE_CHUNK_COUNT);
             }
             if (began == 0u || submitted == 0u ||
                 state->device->endFrame(state->device) == 0u)

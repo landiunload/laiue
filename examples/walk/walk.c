@@ -28,6 +28,9 @@ enum
 {
     WALK_VOXEL_SIZE = 1000,
     WALK_BLOCKS_PER_CELL = LAIUE_CHARACTER_LOCAL_CELL_SIZE / WALK_VOXEL_SIZE,
+    WALK_ACTIVE_CHUNK_RADIUS = 1,
+    WALK_ACTIVE_CHUNK_DIAMETER = WALK_ACTIVE_CHUNK_RADIUS * 2 + 1,
+    WALK_ACTIVE_CHUNK_COUNT = WALK_ACTIVE_CHUNK_DIAMETER * WALK_ACTIVE_CHUNK_DIAMETER,
 };
 
 static int64_t FloorDiv(int64_t value, int64_t divisor)
@@ -748,18 +751,32 @@ static void WalkWindowFrame(void *opaque)
             }
             if (state->terrainReady && state->device->submit != NULL)
             {
-                LaiueGraphicsDrawItemV2 terrainDraw = {
-                    .structSize = sizeof(terrainDraw),
-                    .vertexBuffer = state->terrainBuffer,
-                    .indexCount = 30u,
-                    .originRelative = {
-                        state->terrainOriginRelative[0],
-                        state->terrainOriginRelative[1],
-                        state->terrainOriginRelative[2],
-                    },
-                    .scale = 1.0f,
-                };
-                if (state->device->submit(state->device, &terrainDraw, 1u) == 0u)
+                /* Keep a bounded 3x3 active area around the rebased camera.
+                 * The same immutable chunk buffer is instanced at camera-
+                 * relative offsets, so crossing a chunk boundary never grows
+                 * memory or sends absolute coordinates to the GPU. */
+                LaiueGraphicsDrawItemV2 terrainDraws[WALK_ACTIVE_CHUNK_COUNT];
+                uint32_t drawIndex = 0u;
+                for (int32_t y = -WALK_ACTIVE_CHUNK_RADIUS;
+                     y <= WALK_ACTIVE_CHUNK_RADIUS; ++y)
+                    for (int32_t x = -WALK_ACTIVE_CHUNK_RADIUS;
+                         x <= WALK_ACTIVE_CHUNK_RADIUS; ++x)
+                    {
+                        terrainDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
+                            .structSize = sizeof(terrainDraws[drawIndex]),
+                            .vertexBuffer = state->terrainBuffer,
+                            .indexCount = 30u,
+                            .originRelative = {
+                                state->terrainOriginRelative[0] + (float)x * 64.0f,
+                                state->terrainOriginRelative[1] + (float)y * 64.0f,
+                                state->terrainOriginRelative[2],
+                            },
+                            .scale = 1.0f,
+                        };
+                        ++drawIndex;
+                    }
+                if (state->device->submit(state->device, terrainDraws,
+                                          WALK_ACTIVE_CHUNK_COUNT) == 0u)
                     state->failed = true;
             }
             if (state->device->endFrame(state->device) == 0u)
