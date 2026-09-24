@@ -1,10 +1,14 @@
 #include "character/character_service.h"
 #include "graphics/graphics_device_service.h"
+#include "render/chunk_geometry.h"
 #include "mod/module_host.h"
 #include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "voxel/voxel_service.h"
 #include "world/world_service.h"
+#include "scene/scene_service.h"
+#include "scene/math_service.h"
+#include "walk_terrain.h"
 #include "walk_runtime.h"
 
 #include <android/input.h>
@@ -30,17 +34,37 @@ struct AndroidWalkState
     const LaiueCharacterServiceV1 *character;
     const LaiueVoxelServiceV1 *voxel;
     uint32_t voxelServiceSize;
-    const LaiueGraphicsDeviceServiceV1 *graphics;
+    const LaiueGraphicsDeviceServiceV2 *graphics;
     uint32_t graphicsServiceSize;
     LaiueCharacterControllerV1 *controller;
     LaiueVoxelWorldV1 *world;
     LaiueVoxelProviderV1 provider;
     WalkVoxelContext walkContext;
-    LaiueGraphicsDeviceV1 *device;
+    LaiueGraphicsDeviceV2 *device;
+    LaiueGraphicsHandle terrainBuffer;
+    bool terrainReady;
+    const LaiueSceneServiceV1 *scene;
+    const LaiueSceneMathServiceV1 *sceneMath;
+    Camera camera;
+    float cameraRelativeEye[3];
+    float terrainOriginRelative[3];
+    float viewProjection[16];
     LaiueVoxelProviderV1 walkProvider;
     bool windowReady;
     bool running;
     bool touchActive;
+    bool joystickActive;
+    bool lookActive;
+    float joystickOriginX;
+    float joystickOriginY;
+    float joystickX;
+    float joystickY;
+    float lastLookX;
+    float lastLookY;
+    int32_t lookDeltaX;
+    int32_t lookDeltaY;
+    int32_t joystickPointerId;
+    int32_t lookPointerId;
     bool jumpPending;
     bool keyDown[10];
     double lastTime;
@@ -57,11 +81,13 @@ static void AndroidLog(AndroidWalkState *state, int priority, const char *messag
 
 static uint32_t AndroidLoadModules(AndroidWalkState *state)
 {
-    const LaiueModuleApiV1 *modules[5] = {
+    const LaiueModuleApiV1 *modules[7] = {
         LaiueCharacterGetStaticModuleApiV1(),
         LaiueGraphicsGetStaticModuleApiV1(),
+        LaiueSceneMathGetStaticModuleApiV1(),
+        LaiueSceneGetStaticModuleApiV1(),
     };
-    uint32_t moduleCount = 2u;
+    uint32_t moduleCount = 4u;
 #if defined(LAIUE_ANDROID_WALK_WITH_VOXEL)
     modules[moduleCount++] = LaiueNumericGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueWorldGetStaticModuleApiV1();
@@ -82,22 +108,51 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
         state->host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
         LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &state->voxelServiceSize);
     state->graphicsServiceSize = 0u;
-    state->graphics = (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
-        state->host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
-        LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
-        LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE, NULL,
+    state->graphics = (const LaiueGraphicsDeviceServiceV2 *)LaiueModuleHostQueryService(
+        state->host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
+        LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
+        LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, NULL,
         &state->graphicsServiceSize);
-    return state->character != NULL && state->graphics != NULL;
+    state->scene = (const LaiueSceneServiceV1 *)LaiueModuleHostQueryService(
+        state->host, LAIUE_SCENE_SERVICE_NAME, LAIUE_SCENE_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueSceneServiceV1), NULL, NULL);
+    state->sceneMath = (const LaiueSceneMathServiceV1 *)LaiueModuleHostQueryService(
+        state->host, LAIUE_SCENE_MATH_SERVICE_NAME,
+        LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueSceneMathServiceV1), NULL, NULL);
+    if (state->character == NULL)
+        AndroidLog(state, ANDROID_LOG_WARN, "character module unavailable; controls disabled");
+    return state->graphics != NULL;
 }
 
 static void AndroidDestroyDevice(AndroidWalkState *state)
 {
+    if (state != NULL && state->terrainReady && state->device != NULL &&
+        state->device->destroyHandle != NULL)
+        state->device->destroyHandle(state->device, state->terrainBuffer);
+    if (state != NULL)
+    {
+        state->terrainReady = false;
+        state->terrainBuffer = 0u;
+    }
     if (state->device != NULL && state->graphics != NULL && state->graphics->destroyDevice != NULL)
         state->graphics->destroyDevice(state->device);
     state->device = NULL;
     state->windowReady = false;
     state->running = false;
     state->touchActive = false;
+    state->joystickActive = false;
+    state->lookActive = false;
+    state->lookDeltaX = 0;
+    state->lookDeltaY = 0;
+    state->joystickPointerId = -1;
+    state->lookPointerId = -1;
+    state->joystickActive = false;
+    state->lookActive = false;
+    state->lookDeltaX = 0;
+    state->lookDeltaY = 0;
+    state->joystickPointerId = -1;
+    state->lookPointerId = -1;
     state->jumpPending = false;
     memset(state->keyDown, 0, sizeof(state->keyDown));
     state->accumulator = 0.0;
@@ -124,7 +179,7 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     const int32_t height = ANativeWindow_getHeight(state->app->window);
     uint32_t created = 0u;
     if (width > 0 && height > 0 &&
-        state->graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V1_CONTEXT_SIZE &&
+        state->graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V2_CONTEXT_SIZE &&
         state->graphics->createDeviceWithContext != NULL &&
         state->graphics->context != NULL)
         created = state->graphics->createDeviceWithContext(
@@ -144,6 +199,37 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     state->width = width;
     state->height = height;
     state->lastTime = PlatformMonotonicSeconds();
+    if (state->device->createBuffer != NULL && state->device->uploadBuffer != NULL)
+    {
+        ChunkQuad quads[5];
+        const uint32_t quadCount = WalkBuildTerrainQuads(quads);
+        LaiueGraphicsBufferDescV1 description = {
+            .structSize = sizeof(description),
+            .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING,
+            .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
+        };
+        LaiueGraphicsBufferUploadV1 upload = {
+            .structSize = sizeof(upload),
+            .data = quads,
+            .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
+        };
+        state->terrainReady = state->device->createBuffer(
+            state->device, &description, &state->terrainBuffer) != 0u;
+        if (state->terrainReady)
+        {
+            upload.buffer = state->terrainBuffer;
+            state->terrainReady = state->device->uploadBuffer(
+                state->device, &upload) != 0u;
+        }
+        if (!state->terrainReady && state->terrainBuffer != 0u &&
+            state->device->destroyHandle != NULL)
+        {
+            state->device->destroyHandle(state->device, state->terrainBuffer);
+            state->terrainBuffer = 0u;
+        }
+    }
+    if (state->scene != NULL && state->scene->cameraInit != NULL)
+        state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, 0.0f);
 }
 
 static int32_t AndroidKeyIndex(int32_t keyCode)
@@ -185,14 +271,82 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
     }
     if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION)
         return 0;
-    const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
-    if (action == AMOTION_EVENT_ACTION_DOWN)
+    const int32_t rawAction = AMotionEvent_getAction(event);
+    const int32_t action = rawAction & AMOTION_EVENT_ACTION_MASK;
+    const size_t actionIndex = (size_t)(rawAction >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    const size_t pointerCount = AMotionEvent_getPointerCount(event);
+    if (pointerCount == 0u || actionIndex >= pointerCount)
+        return 0;
+    const float width = state->width > 0 ? (float)state->width : 1.0f;
+    const int32_t pointerId = AMotionEvent_getPointerId(event, actionIndex);
+    const float x = AMotionEvent_getX(event, actionIndex);
+    const float y = AMotionEvent_getY(event, actionIndex);
+    if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_POINTER_DOWN)
     {
         state->touchActive = true;
         state->jumpPending = true;
+        if (x < width * 0.5f && state->joystickPointerId < 0)
+        {
+            state->joystickPointerId = pointerId;
+            state->joystickActive = true;
+            state->joystickOriginX = x;
+            state->joystickOriginY = y;
+            state->joystickX = 0.0f;
+            state->joystickY = 0.0f;
+        }
+        else if (state->lookPointerId < 0)
+        {
+            state->lookPointerId = pointerId;
+            state->lookActive = true;
+            state->lastLookX = x;
+            state->lastLookY = y;
+        }
     }
-    else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL)
-        state->touchActive = false;
+    else if (action == AMOTION_EVENT_ACTION_MOVE)
+    {
+        for (size_t pointer = 0u; pointer < pointerCount; ++pointer)
+        {
+            const int32_t id = AMotionEvent_getPointerId(event, pointer);
+            const float px = AMotionEvent_getX(event, pointer);
+            const float py = AMotionEvent_getY(event, pointer);
+            if (id == state->joystickPointerId)
+            {
+                const float radius = 160.0f;
+                float dx = (px - state->joystickOriginX) / radius;
+                float dy = (py - state->joystickOriginY) / radius;
+                if (dx > 1.0f) dx = 1.0f;
+                if (dx < -1.0f) dx = -1.0f;
+                if (dy > 1.0f) dy = 1.0f;
+                if (dy < -1.0f) dy = -1.0f;
+                state->joystickX = dx;
+                state->joystickY = -dy;
+            }
+            else if (id == state->lookPointerId)
+            {
+                state->lookDeltaX += (int32_t)(px - state->lastLookX);
+                state->lookDeltaY += (int32_t)(py - state->lastLookY);
+                state->lastLookX = px;
+                state->lastLookY = py;
+            }
+        }
+    }
+    else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_POINTER_UP ||
+             action == AMOTION_EVENT_ACTION_CANCEL)
+    {
+        if (pointerId == state->joystickPointerId)
+        {
+            state->joystickPointerId = -1;
+            state->joystickActive = false;
+            state->joystickX = 0.0f;
+            state->joystickY = 0.0f;
+        }
+        if (pointerId == state->lookPointerId || action == AMOTION_EVENT_ACTION_CANCEL)
+        {
+            state->lookPointerId = -1;
+            state->lookActive = false;
+        }
+        state->touchActive = state->joystickActive || state->lookActive;
+    }
     return 1;
 }
 
@@ -233,9 +387,83 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
     }
 }
 
+static int64_t AndroidFloorDiv(int64_t value, int64_t divisor)
+{
+    int64_t quotient = value / divisor;
+    if (value % divisor < 0)
+        --quotient;
+    return quotient;
+}
+
+static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t height,
+                                float elapsed)
+{
+    if (state == NULL || state->scene == NULL || state->sceneMath == NULL ||
+        state->scene->cameraGetViewMatrix == NULL ||
+        state->scene->cameraGetProjectionMatrix == NULL ||
+        state->sceneMath->matrix4Multiply == NULL || state->device == NULL ||
+        state->device->setCamera == NULL)
+        return;
+    int64_t blockX = 0;
+    int64_t blockY = 0;
+    int64_t localZ = 1400;
+    if (state->controller != NULL && state->character != NULL &&
+        state->character->getPosition != NULL)
+    {
+        LaiueCharacterPositionV1 position;
+        if (state->character->getPosition(state->controller, &position) != 0u)
+        {
+            const int64_t blocksPerCell =
+                LAIUE_CHARACTER_LOCAL_CELL_SIZE / 1000;
+            blockX = position.cellX * blocksPerCell + position.localX / 1000;
+            blockY = position.cellY * blocksPerCell + position.localY / 1000;
+            localZ = position.localZ;
+        }
+    }
+    const int64_t originX = AndroidFloorDiv(blockX, 64) * 64;
+    const int64_t originY = AndroidFloorDiv(blockY, 64) * 64;
+    int64_t fractionX = state->controller != NULL ? 0 : 0;
+    int64_t fractionY = state->controller != NULL ? 0 : 0;
+    if (state->controller != NULL && state->character->getPosition != NULL)
+    {
+        LaiueCharacterPositionV1 position;
+        if (state->character->getPosition(state->controller, &position) != 0u)
+        {
+            fractionX = position.localX % 1000;
+            fractionY = position.localY % 1000;
+            if (fractionX < 0) fractionX += 1000;
+            if (fractionY < 0) fractionY += 1000;
+        }
+    }
+    state->terrainOriginRelative[0] = 0.0f;
+    state->terrainOriginRelative[1] = 0.0f;
+    state->terrainOriginRelative[2] = 0.0f;
+    state->cameraRelativeEye[0] = (float)(blockX - originX) + (float)fractionX / 1000.0f;
+    state->cameraRelativeEye[1] = (float)(blockY - originY) + (float)fractionY / 1000.0f;
+    state->cameraRelativeEye[2] = (float)localZ / 1000.0f + 1.6f;
+    if (state->scene->cameraUpdate != NULL)
+        state->scene->cameraUpdate(&state->camera, elapsed, false, false, false, false, false,
+                                   state->lookDeltaX, state->lookDeltaY, 0.0f, 0.0025f);
+    state->lookDeltaX = 0;
+    state->lookDeltaY = 0;
+    float view[16];
+    float projection[16];
+    state->scene->cameraGetViewMatrix(&state->camera, state->cameraRelativeEye, view);
+    state->scene->cameraGetProjectionMatrix(
+        height > 0 ? (float)width / (float)height : 1.0f,
+        1.04719755f, 0.05f, 4096.0f, projection);
+    state->sceneMath->matrix4Multiply(view, projection, state->viewProjection);
+    LaiueGraphicsCameraV2 camera = {
+        .structSize = sizeof(camera),
+        .flags = 0u,
+    };
+    memcpy(camera.viewProjection, state->viewProjection, sizeof(camera.viewProjection));
+    (void)state->device->setCamera(state->device, &camera);
+}
+
 static void AndroidStep(AndroidWalkState *state)
 {
-    if (state == NULL || !state->windowReady || state->controller == NULL)
+    if (state == NULL || !state->windowReady)
         return;
     const double now = PlatformMonotonicSeconds();
     double elapsed = state->lastTime == 0.0 ? 0.0 : now - state->lastTime;
@@ -247,20 +475,26 @@ static void AndroidStep(AndroidWalkState *state)
     state->accumulator += elapsed;
     const double fixedStep = 1.0 / (double)LAIUE_CHARACTER_TICK_HZ;
     uint32_t ticks = 0u;
-    while (state->accumulator >= fixedStep && ticks < 8u)
+    while (state->controller != NULL && state->character != NULL &&
+           state->accumulator >= fixedStep && ticks < 8u)
     {
         LaiueCharacterInputV1 input = {0};
         input.moveX = (state->keyDown[3] ? 1 : 0) - (state->keyDown[1] ? 1 : 0);
-        input.moveY = (state->keyDown[0] ? 1 : 0) - (state->keyDown[2] ? 1 : 0) +
-                      (state->touchActive ? 1 : 0);
-        if (state->keyDown[4] || state->touchActive)
+        input.moveY = (state->keyDown[0] ? 1 : 0) - (state->keyDown[2] ? 1 : 0);
+        if (state->joystickActive)
+        {
+            input.moveX = state->joystickX > 0.35f ? 1 : (state->joystickX < -0.35f ? -1 : 0);
+            input.moveY = state->joystickY > 0.35f ? 1 : (state->joystickY < -0.35f ? -1 : 0);
+        }
+        if (state->keyDown[4] || state->joystickActive)
             input.flags |= LAIUE_CHARACTER_INPUT_SPRINT;
         if (state->jumpPending)
         {
             input.flags |= LAIUE_CHARACTER_INPUT_JUMP;
             state->jumpPending = false;
         }
-        if (state->character->step(state->controller, &input) == 0u)
+        if (state->character == NULL || state->controller == NULL ||
+            state->character->step(state->controller, &input) == 0u)
         {
             AndroidLog(state, ANDROID_LOG_ERROR, "deterministic character step failed");
             state->running = false;
@@ -282,10 +516,27 @@ static void AndroidStep(AndroidWalkState *state)
             state->width = width;
             state->height = height;
         }
-        if (width > 0 && height > 0 &&
-            (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u ||
-             state->device->endFrame(state->device) == 0u))
+        if (width > 0 && height > 0)
+        {
+            AndroidUpdateCamera(state, width, height, (float)elapsed);
+            const uint32_t began = state->device->beginFrame(
+                state->device, (uint32_t)width, (uint32_t)height);
+            uint32_t submitted = 1u;
+            if (began != 0u && state->terrainReady && state->device->submit != NULL)
+            {
+                LaiueGraphicsDrawItemV2 draw = {
+                    .structSize = sizeof(draw),
+                    .vertexBuffer = state->terrainBuffer,
+                    .indexCount = 30u,
+                    .originRelative = {0.0f, 0.0f, 0.0f},
+                    .scale = 1.0f,
+                };
+                submitted = state->device->submit(state->device, &draw, 1u);
+            }
+            if (began == 0u || submitted == 0u ||
+                state->device->endFrame(state->device) == 0u)
             AndroidLog(state, ANDROID_LOG_WARN, "frame skipped after surface change");
+        }
     }
 }
 
@@ -333,7 +584,9 @@ void android_main(struct android_app *app)
             .context = &state.walkProvider,
             .sweepAabb = WalkSweepAabb,
         };
-        if (state.character->create(&collision, ANDROID_WALK_HALF_EXTENT,
+        if (state.character != NULL && state.character->create != NULL &&
+            state.character->setPosition != NULL &&
+            state.character->create(&collision, ANDROID_WALK_HALF_EXTENT,
                                     &state.controller) != 0u)
         {
             LaiueCharacterPositionV1 start = {

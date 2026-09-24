@@ -16,6 +16,7 @@ endif()
 add_library(laiue_walk_android SHARED
     android_walk.c
     ../walk.c
+    ../walk_terrain.h
     "${_laiue_android_native_app_glue}")
 target_compile_definitions(laiue_walk_android PRIVATE
     LAIUE_STATIC=1
@@ -23,6 +24,7 @@ target_compile_definitions(laiue_walk_android PRIVATE
     LAIUE_WALK_RUNTIME_ONLY=1)
 target_include_directories(laiue_walk_android PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/src/assets"
     "${PROJECT_SOURCE_DIR}/src/simulation"
     "${PROJECT_SOURCE_DIR}/src/graphics"
     "${PROJECT_SOURCE_DIR}/src/modding"
@@ -32,6 +34,8 @@ target_link_libraries(laiue_walk_android PRIVATE
     laiue_bootstrap
     laiue_character
     laiue_render
+    laiue_scene_math
+    laiue_scene
     android
     log
     "${Vulkan_LIBRARY}")

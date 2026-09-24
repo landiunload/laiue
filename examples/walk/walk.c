@@ -8,6 +8,7 @@
 #if defined(LAIUE_WALK_WINDOWED)
 #include "graphics/graphics_device_service.h"
 #include "render/chunk_geometry.h"
+#include "walk_terrain.h"
 #include "render/graphics_service.h"
 #include "scene/scene_service.h"
 #include "input/input_service.h"
@@ -468,18 +469,12 @@ static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
     if (device == NULL || outBuffer == NULL || device->createBuffer == NULL ||
         device->uploadBuffer == NULL)
         return false;
-    const ChunkQuad quads[] = {
-        /* grass surface, two side walls and a lower earth layer */
-        PackChunkQuad(0u, 0u, 0u, 4u, 1u, 64u, 64u, 1u),
-        PackChunkQuad(0u, 0u, 0u, 0u, 2u, 1u, 64u, 4u),
-        PackChunkQuad(63u, 0u, 0u, 1u, 2u, 1u, 64u, 4u),
-        PackChunkQuad(0u, 0u, 0u, 2u, 2u, 64u, 1u, 4u),
-        PackChunkQuad(0u, 63u, 0u, 3u, 2u, 64u, 1u, 4u),
-    };
+    ChunkQuad quads[5];
+    const uint32_t quadCount = WalkBuildTerrainQuads(quads);
     LaiueGraphicsBufferDescV1 description = {
         .structSize = sizeof(description),
         .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING,
-        .sizeBytes = sizeof(quads),
+        .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
     };
     *outBuffer = 0u;
     if (device->createBuffer(device, &description, outBuffer) == 0u)
@@ -488,7 +483,7 @@ static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
         .structSize = sizeof(upload),
         .buffer = *outBuffer,
         .data = quads,
-        .sizeBytes = sizeof(quads),
+        .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
     };
     if (device->uploadBuffer(device, &upload) == 0u)
     {

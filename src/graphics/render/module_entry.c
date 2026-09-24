@@ -56,13 +56,6 @@ static LaiueGraphicsDeviceState *DeviceState(LaiueGraphicsDeviceV1 *device)
     return device == NULL ? NULL : (LaiueGraphicsDeviceState *)device->context;
 }
 
-static const LaiueGraphicsDeviceState *DeviceStateConst(
-    const LaiueGraphicsDeviceV1 *device)
-{
-    return device == NULL ? NULL :
-        (const LaiueGraphicsDeviceState *)device->context;
-}
-
 static uint32_t DeviceAllocateHandle(LaiueGraphicsDeviceState *state,
                                      uint8_t kind, uint64_t size,
                                      LaiueGraphicsHandle *outHandle)

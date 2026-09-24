@@ -1,5 +1,5 @@
 if(NOT ANDROID OR NOT LAIUE_BUILD_ANDROID_WALK)
-    add_executable(laiue_walk walk.c)
+    add_executable(laiue_walk walk.c walk_terrain.h)
     target_link_libraries(laiue_walk PRIVATE laiue_bootstrap)
     target_compile_definitions(laiue_walk PRIVATE LAIUE_STATIC=1)
 if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
