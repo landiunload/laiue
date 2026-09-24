@@ -447,6 +447,9 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     int64_t blockY = 0;
     int64_t localZ = 1400;
     if (state->controller != NULL && state->character != NULL &&
+        AndroidFieldPresent(state->characterServiceSize, state->character->structSize,
+                            offsetof(LaiueCharacterServiceV1, getPosition),
+                            sizeof(state->character->getPosition)) &&
         state->character->getPosition != NULL)
     {
         LaiueCharacterPositionV1 position;
@@ -463,6 +466,9 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     int64_t fractionX = state->controller != NULL ? 0 : 0;
     int64_t fractionY = state->controller != NULL ? 0 : 0;
     if (state->controller != NULL && state->character != NULL &&
+        AndroidFieldPresent(state->characterServiceSize, state->character->structSize,
+                            offsetof(LaiueCharacterServiceV1, getPosition),
+                            sizeof(state->character->getPosition)) &&
         state->character->getPosition != NULL)
     {
         LaiueCharacterPositionV1 position;
@@ -515,7 +521,10 @@ static void AndroidStep(AndroidWalkState *state)
     const double fixedStep = 1.0 / (double)LAIUE_CHARACTER_TICK_HZ;
     uint32_t ticks = 0u;
     while (state->controller != NULL && state->character != NULL &&
-           state->accumulator >= fixedStep && ticks < 8u)
+           AndroidFieldPresent(state->characterServiceSize, state->character->structSize,
+                               offsetof(LaiueCharacterServiceV1, step),
+                               sizeof(state->character->step)) &&
+           state->character->step != NULL && state->accumulator >= fixedStep && ticks < 8u)
     {
         LaiueCharacterInputV1 input = {0};
         input.moveX = (state->keyDown[3] ? 1 : 0) - (state->keyDown[1] ? 1 : 0);
@@ -565,7 +574,7 @@ static void AndroidStep(AndroidWalkState *state)
     {
         const int32_t width = ANativeWindow_getWidth(state->app->window);
         const int32_t height = ANativeWindow_getHeight(state->app->window);
-        if ((width != state->width || height != state->height) &&
+        if ((width != state->width || height != state->height) && state->graphics != NULL &&
             AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
                                 offsetof(LaiueGraphicsDeviceServiceV2, resize),
                                 sizeof(state->graphics->resize)) &&
@@ -637,14 +646,29 @@ void android_main(struct android_app *app)
             .abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
             .defaultBlock = {0u, 0u},
         };
-        if (state.voxel != NULL &&
-            state.voxelServiceSize >= LAIUE_VOXEL_SERVICE_V1_CONTEXT_SIZE &&
-            state.voxel->createWithContext != NULL && state.voxel->context != NULL)
+        const bool voxelHasContextCreate =
+            state.voxel != NULL &&
+            AndroidFieldPresent(state.voxelServiceSize, state.voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, createWithContext),
+                                sizeof(state.voxel->createWithContext)) &&
+            AndroidFieldPresent(state.voxelServiceSize, state.voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, context),
+                                sizeof(state.voxel->context)) &&
+            state.voxel->createWithContext != NULL && state.voxel->context != NULL;
+        if (voxelHasContextCreate)
             (void)state.voxel->createWithContext(state.voxel->context,
                                                   &voxelConfig, &state.world);
-        else if (state.voxel != NULL && state.voxel->create != NULL)
+        else if (state.voxel != NULL &&
+                 AndroidFieldPresent(state.voxelServiceSize, state.voxel->structSize,
+                                     offsetof(LaiueVoxelServiceV1, create),
+                                     sizeof(state.voxel->create)) &&
+                 state.voxel->create != NULL)
             (void)state.voxel->create(&voxelConfig, &state.world);
-        if (state.world != NULL && state.voxel->getProvider != NULL)
+        if (state.world != NULL && state.voxel != NULL &&
+            AndroidFieldPresent(state.voxelServiceSize, state.voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, getProvider),
+                                sizeof(state.voxel->getProvider)) &&
+            state.voxel->getProvider != NULL)
             (void)state.voxel->getProvider(state.world, &state.provider);
 #endif
         state.walkContext.sparse = state.provider;
@@ -658,8 +682,14 @@ void android_main(struct android_app *app)
             .context = &state.walkProvider,
             .sweepAabb = WalkSweepAabb,
         };
-        if (state.character != NULL && state.character->create != NULL &&
-            state.character->setPosition != NULL &&
+        if (state.character != NULL &&
+            AndroidFieldPresent(state.characterServiceSize, state.character->structSize,
+                                offsetof(LaiueCharacterServiceV1, create),
+                                sizeof(state.character->create)) &&
+            AndroidFieldPresent(state.characterServiceSize, state.character->structSize,
+                                offsetof(LaiueCharacterServiceV1, setPosition),
+                                sizeof(state.character->setPosition)) &&
+            state.character->create != NULL && state.character->setPosition != NULL &&
             state.character->create(&collision, ANDROID_WALK_HALF_EXTENT,
                                     &state.controller) != 0u)
         {
@@ -690,9 +720,17 @@ void android_main(struct android_app *app)
     }
 
     AndroidDestroyDevice(&state);
-    if (state.controller != NULL && state.character != NULL)
+    if (state.controller != NULL && state.character != NULL &&
+        AndroidFieldPresent(state.characterServiceSize, state.character->structSize,
+                            offsetof(LaiueCharacterServiceV1, destroy),
+                            sizeof(state.character->destroy)) &&
+        state.character->destroy != NULL)
         state.character->destroy(state.controller);
-    if (state.world != NULL && state.voxel != NULL)
+    if (state.world != NULL && state.voxel != NULL &&
+        AndroidFieldPresent(state.voxelServiceSize, state.voxel->structSize,
+                            offsetof(LaiueVoxelServiceV1, destroy),
+                            sizeof(state.voxel->destroy)) &&
+        state.voxel->destroy != NULL)
         state.voxel->destroy(state.world);
     if (state.host != NULL)
     {
