@@ -1099,12 +1099,16 @@ static void ModuleDestroy(void *context)
     if (state != NULL)
     {
         const LaiueModuleHostV1 *host = state->host;
+        /* The content bridge stores the module state as its owner token.
+         * Release that token before returning the state to the host allocator;
+         * otherwise a failed start (where destroy runs without stop) leaves a
+         * dangling owner pointer in the process-wide compatibility bridge. */
+        RendererReleaseContentService(state);
         state->host = NULL;
         state->content = NULL;
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);
     }
-    RendererReleaseContentService(state);
 }
 
 static const char *const provides[] = {

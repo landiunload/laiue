@@ -11,17 +11,52 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_STATIC_WITH_VOXEL=1)
     endif()
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
+        # Desktop walk must load the selected backend provider, not the
+        # compatibility bundle that links every available backend.  Keep the
+        # bundle as a deliberate fallback for profiles that disable the
+        # standalone provider targets.
+        set(_laiue_walk_graphics_target laiue_render)
+        if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+            if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12" AND
+               TARGET laiue_graphics_d3d12)
+                set(_laiue_walk_graphics_target laiue_graphics_d3d12)
+                target_compile_definitions(laiue_walk PRIVATE
+                    LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER=1
+                    LAIUE_WALK_GRAPHICS_PROVIDER_D3D12=1)
+            elseif(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN" AND
+                   TARGET laiue_graphics_vulkan)
+                set(_laiue_walk_graphics_target laiue_graphics_vulkan)
+                target_compile_definitions(laiue_walk PRIVATE
+                    LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER=1
+                    LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN=1)
+            endif()
+        endif()
         target_link_libraries(laiue_walk PRIVATE
-            laiue_window laiue_input laiue_render laiue_ui
+            laiue_window laiue_input ${_laiue_walk_graphics_target} laiue_ui
             laiue_scene_math laiue_scene)
+        add_dependencies(laiue_walk ${_laiue_walk_graphics_target})
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_WINDOWED=1)
     endif()
 else()
     target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_DYNAMIC=1)
     add_dependencies(laiue_walk laiue_character)
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
-        add_dependencies(laiue_walk laiue_window laiue_input laiue_render laiue_ui
-            laiue_scene_math laiue_scene)
+        set(_laiue_walk_graphics_target laiue_render)
+        if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12" AND
+           TARGET laiue_graphics_d3d12)
+            set(_laiue_walk_graphics_target laiue_graphics_d3d12)
+            target_compile_definitions(laiue_walk PRIVATE
+                LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER=1
+                LAIUE_WALK_GRAPHICS_PROVIDER_D3D12=1)
+        elseif(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "VULKAN" AND
+               TARGET laiue_graphics_vulkan)
+            set(_laiue_walk_graphics_target laiue_graphics_vulkan)
+            target_compile_definitions(laiue_walk PRIVATE
+                LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER=1
+                LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN=1)
+        endif()
+        add_dependencies(laiue_walk laiue_window laiue_input ${_laiue_walk_graphics_target}
+            laiue_ui laiue_scene_math laiue_scene)
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_WINDOWED=1)
     endif()
 endif()

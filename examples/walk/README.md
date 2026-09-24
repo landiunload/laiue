@@ -24,6 +24,13 @@ graphics are loaded as optional providers; if an artifact is absent or the
 device cannot be created, the example reports the reason and runs the same
 diagnostic headless check instead.
 
+For shared desktop builds the profile names one backend artifact explicitly:
+`laiue_graphics_d3d12.dll` for a D3D12 configure or
+`laiue_graphics_vulkan.dll` for Vulkan (with the corresponding `.so`/`.dylib`
+name on POSIX). The legacy `laiue_render` bundle is only used when standalone
+provider targets are disabled; it is not an implicit dependency of the normal
+desktop walk executable.
+
 ## Android NativeActivity
 
 `android/` is a small static-registry client using the same module ABI. It

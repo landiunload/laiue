@@ -978,7 +978,19 @@ static LaiueModuleStatus LoadWalkModules(
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"laiue_window.dll";
     const wchar_t *inputName = L"laiue_input.dll";
+#if defined(LAIUE_WALK_GRAPHICS_PROVIDER_D3D12)
+    const wchar_t *renderName = L"laiue_graphics_d3d12.dll";
+#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
+    const char *renderModuleId = "laiue.graphics.d3d12";
+#endif
+#elif defined(LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN)
+    const wchar_t *renderName = L"laiue_graphics_vulkan.dll";
+#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
+    const char *renderModuleId = "laiue.graphics.vulkan";
+#endif
+#else
     const wchar_t *renderName = L"laiue_render.dll";
+#endif
     const wchar_t *uiName = L"laiue_ui.dll";
     const wchar_t *sceneMathName = L"laiue_scene_math.dll";
     const wchar_t *sceneName = L"laiue_scene.dll";
@@ -991,7 +1003,12 @@ static LaiueModuleStatus LoadWalkModules(
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"liblaiue_window.dylib";
     const wchar_t *inputName = L"liblaiue_input.dylib";
+#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
+    const wchar_t *renderName = L"liblaiue_graphics_vulkan.dylib";
+    const char *renderModuleId = "laiue.graphics.vulkan";
+#else
     const wchar_t *renderName = L"liblaiue_render.dylib";
+#endif
     const wchar_t *uiName = L"liblaiue_ui.dylib";
     const wchar_t *sceneMathName = L"liblaiue_scene_math.dylib";
     const wchar_t *sceneName = L"liblaiue_scene.dylib";
@@ -1004,7 +1021,12 @@ static LaiueModuleStatus LoadWalkModules(
 #if defined(LAIUE_WALK_WINDOWED)
     const wchar_t *windowName = L"liblaiue_window.so";
     const wchar_t *inputName = L"liblaiue_input.so";
+#if defined(LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN)
+    const wchar_t *renderName = L"liblaiue_graphics_vulkan.so";
+    const char *renderModuleId = "laiue.graphics.vulkan";
+#else
     const wchar_t *renderName = L"liblaiue_render.so";
+#endif
     const wchar_t *uiName = L"liblaiue_ui.so";
     const wchar_t *sceneMathName = L"liblaiue_scene_math.so";
     const wchar_t *sceneName = L"liblaiue_scene.so";
@@ -1049,9 +1071,31 @@ static LaiueModuleStatus LoadWalkModules(
 #endif
     LaiueModuleLoadReportInitialize(report, reportEntries,
                                     binaryCount);
+#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
+    /* The executable chooses exactly one standalone provider at configure
+     * time.  Pin that descriptor in the profile when its optional artifact is
+     * present; if it was removed, keep the partial graph usable and let walk
+     * fall back to its diagnostic/headless mode. */
+    LaiueModuleProviderSelectionV1 graphicsSelection = {
+        .structSize = sizeof(graphicsSelection),
+        .serviceName = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
+        .moduleId = renderModuleId,
+    };
+    const bool renderArtifactPresent = PlatformPathExists(renderPath);
+    LaiueModuleProfileV1 profile = {
+        .structSize = sizeof(profile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .binaries = binaries,
+        .binaryCount = binaryCount,
+        .providerSelections = renderArtifactPresent ? &graphicsSelection : NULL,
+        .providerSelectionCount = renderArtifactPresent ? 1u : 0u,
+    };
+    return LaiueModuleHostLoadProfileV1(host, &profile, report, diagnostic);
+#else
     return LaiueModuleHostLoadProfile(
         host, binaries, binaryCount,
         LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
+#endif
 #else
     (void)report;
     (void)reportEntries;
