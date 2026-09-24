@@ -269,6 +269,70 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                fallbackDeviceV2->createDevice != NULL &&
                fallbackDeviceV2->createDeviceWithContext != NULL,
            "graphics device v2 is published independently of content");
+
+    /* Exercise the ownership rules through the public service, not through
+     * renderer internals.  This is deliberately an offscreen device: the
+     * same check works for D3D12 and Vulkan providers and does not require a
+     * platform window. */
+    LaiueGraphicsDeviceV2 *resourceDevice = NULL;
+    Expect(fallbackDeviceV2->createDeviceWithContext(
+               fallbackDeviceV2->context, NULL, 16, 16,
+               LAIUE_GRAPHICS_BACKEND_AUTO, &resourceDevice) != 0u &&
+               resourceDevice != NULL,
+           "graphics device v2 creates an offscreen instance");
+    static const uint8_t shaderBytes[4] = {0x03u, 0x02u, 0x23u, 0x07u};
+    LaiueGraphicsShaderDescV1 shaderDescription = {
+        sizeof(shaderDescription), LAIUE_GRAPHICS_SHADER_STAGE_VERTEX,
+        shaderBytes, sizeof(shaderBytes)};
+    LaiueGraphicsHandle shader = 0u;
+    Expect(resourceDevice->createShader(resourceDevice, &shaderDescription, &shader) != 0u &&
+               shader != 0u,
+           "graphics device creates a shader handle");
+    LaiueGraphicsPipelineDescV1 pipelineDescription = {
+        sizeof(pipelineDescription), LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES,
+        sizeof(LaiueGraphicsVertexV2), shader, 0u};
+    LaiueGraphicsHandle firstPipeline = 0u;
+    Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
+                                          &firstPipeline) != 0u &&
+               firstPipeline != 0u,
+           "graphics device records pipeline shader dependencies");
+    /* Destroying a referenced shader is intentionally a no-op in the void
+     * ABI.  Creating another pipeline proves that the original handle stayed
+     * live instead of becoming a dangling pointer. */
+    resourceDevice->destroyHandle(resourceDevice, shader);
+    LaiueGraphicsHandle secondPipeline = 0u;
+    Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
+                                          &secondPipeline) != 0u &&
+               secondPipeline != 0u,
+           "referenced shader remains live until all pipelines are gone");
+    resourceDevice->destroyHandle(resourceDevice, firstPipeline);
+    resourceDevice->destroyHandle(resourceDevice, secondPipeline);
+    resourceDevice->destroyHandle(resourceDevice, shader);
+
+    LaiueGraphicsTextureDescV1 invalidTextureDescription = {
+        sizeof(invalidTextureDescription), 0u, {4u, 4u, 1u}, 0u, 0u};
+    LaiueGraphicsHandle invalidTexture = UINT64_C(1);
+    Expect(resourceDevice->createTexture(resourceDevice, &invalidTextureDescription,
+                                         &invalidTexture) == 0u && invalidTexture == 0u,
+           "invalid texture mip count is rejected and output is cleared");
+    LaiueGraphicsTextureDescV1 textureDescription = {
+        sizeof(textureDescription), 0u, {4u, 4u, 1u}, 1u, 0u};
+    LaiueGraphicsHandle texture = 0u;
+    Expect(resourceDevice->createTexture(resourceDevice, &textureDescription, &texture) != 0u &&
+               texture != 0u,
+           "graphics device stores texture descriptor state");
+    LaiueGraphicsSamplerDescV1 samplerDescription = {
+        sizeof(samplerDescription), LAIUE_GRAPHICS_FILTER_LINEAR,
+        LAIUE_GRAPHICS_FILTER_LINEAR, LAIUE_GRAPHICS_ADDRESS_REPEAT,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_BORDER};
+    LaiueGraphicsHandle sampler = 0u;
+    Expect(resourceDevice->createSampler(resourceDevice, &samplerDescription, &sampler) != 0u &&
+               sampler != 0u,
+           "graphics device stores sampler descriptor state");
+    resourceDevice->destroyHandle(resourceDevice, texture);
+    resourceDevice->destroyHandle(resourceDevice, sampler);
+    fallbackDeviceV2->destroyDevice(resourceDevice);
+
     LaiueModuleHost *secondRenderHost = LaiueModuleHostCreate(&config, &diagnostic);
     Expect(secondRenderHost != NULL, "second concurrent graphics host creates");
     LaiueModuleBinaryV1 secondRender = {renderPath, 0u, NULL};

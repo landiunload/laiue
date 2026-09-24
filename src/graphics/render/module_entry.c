@@ -33,6 +33,11 @@ typedef struct LaiueGraphicsDeviceState
     uint32_t generations[256];
     uint64_t sizes[256];
     uint32_t usageFlags[256];
+    LaiueGraphicsTextureDescV1 textures[256];
+    LaiueGraphicsSamplerDescV1 samplers[256];
+    LaiueGraphicsPipelineDescV1 pipelines[256];
+    uint32_t shaderRefCounts[256];
+    uint32_t shaderStages[256];
     uint32_t vertexCounts[256];
     LaiueGraphicsHandle meshIndexHandles[256];
     uint32_t meshFirstIndices[256];
@@ -220,6 +225,52 @@ static bool DeviceBufferIsGeneric(const LaiueGraphicsDeviceState *state,
     return state != NULL && index < 256u &&
            (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX) != 0u &&
            (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u;
+}
+
+static bool DeviceTextureExtentIsRepresentable(const LaiueGraphicsExtentV1 *extent)
+{
+    if (extent == NULL || extent->width == 0u || extent->height == 0u ||
+        extent->depth == 0u)
+        return false;
+    const uint64_t area = (uint64_t)extent->width * (uint64_t)extent->height;
+    return (uint64_t)extent->depth <= UINT64_MAX / area;
+}
+
+static bool DeviceSamplerIsValid(const LaiueGraphicsSamplerDescV1 *description)
+{
+    return description != NULL &&
+           description->minFilter <= LAIUE_GRAPHICS_FILTER_LINEAR &&
+           description->magFilter <= LAIUE_GRAPHICS_FILTER_LINEAR &&
+           description->addressModeU <= LAIUE_GRAPHICS_ADDRESS_BORDER &&
+           description->addressModeV <= LAIUE_GRAPHICS_ADDRESS_BORDER &&
+           description->addressModeW <= LAIUE_GRAPHICS_ADDRESS_BORDER;
+}
+
+static bool DevicePipelineIsValid(const LaiueGraphicsPipelineDescV1 *description)
+{
+    return description != NULL && description->topology <= LAIUE_GRAPHICS_TOPOLOGY_POINTS;
+}
+
+static bool DevicePipelineHandlesAreLive(const LaiueGraphicsDeviceState *state,
+                                         const LaiueGraphicsPipelineDescV1 *description)
+{
+    if (state == NULL || !DevicePipelineIsValid(description))
+        return false;
+    if (description->vertexShader != 0u)
+    {
+        if (!DeviceHandleIsLive(state, description->vertexShader, DEVICE_HANDLE_SHADER) ||
+            state->shaderStages[DeviceHandleSlot(description->vertexShader) - 1u] !=
+                LAIUE_GRAPHICS_SHADER_STAGE_VERTEX)
+            return false;
+    }
+    if (description->fragmentShader != 0u)
+    {
+        if (!DeviceHandleIsLive(state, description->fragmentShader, DEVICE_HANDLE_SHADER) ||
+            state->shaderStages[DeviceHandleSlot(description->fragmentShader) - 1u] !=
+                LAIUE_GRAPHICS_SHADER_STAGE_FRAGMENT)
+            return false;
+    }
+    return true;
 }
 
 static uint32_t DeviceBuildGenericMesh(LaiueGraphicsDeviceState *state,
@@ -438,7 +489,10 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
                                    LaiueGraphicsHandle *outBuffer)
 {
     LaiueGraphicsDeviceState *state = DeviceState(device);
-    if (state == NULL || description == NULL || outBuffer == NULL ||
+    if (outBuffer == NULL)
+        return 0u;
+    *outBuffer = 0u;
+    if (state == NULL || description == NULL ||
         description->structSize < sizeof(*description) || description->sizeBytes == 0u)
         return 0u;
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_BUFFER, description->sizeBytes,
@@ -450,7 +504,6 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
         (state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true)) == NULL)
     {
         DeviceDestroyHandle(device, *outBuffer);
-        *outBuffer = 0u;
         return 0u;
     }
     return 1u;
@@ -461,11 +514,19 @@ static uint32_t DeviceCreateTexture(LaiueGraphicsDeviceV1 *device,
                                     LaiueGraphicsHandle *outTexture)
 {
     LaiueGraphicsDeviceState *state = DeviceState(device);
-    if (state == NULL || description == NULL || outTexture == NULL ||
-        description->structSize < sizeof(*description) || description->extent.width == 0u ||
-        description->extent.height == 0u || description->extent.depth == 0u)
+    if (outTexture == NULL)
         return 0u;
-    return DeviceAllocateHandle(state, DEVICE_HANDLE_TEXTURE, 0u, outTexture);
+    *outTexture = 0u;
+    if (state == NULL || description == NULL ||
+        description->structSize < sizeof(*description) || description->mipLevels == 0u ||
+        !DeviceTextureExtentIsRepresentable(&description->extent))
+        return 0u;
+    if (!DeviceAllocateHandle(state, DEVICE_HANDLE_TEXTURE, 0u, outTexture))
+        return 0u;
+    const uint32_t index = DeviceHandleSlot(*outTexture) - 1u;
+    state->textures[index] = *description;
+    state->textures[index].structSize = sizeof(state->textures[index]);
+    return 1u;
 }
 
 static uint32_t DeviceCreateSampler(LaiueGraphicsDeviceV1 *device,
@@ -473,10 +534,18 @@ static uint32_t DeviceCreateSampler(LaiueGraphicsDeviceV1 *device,
                                     LaiueGraphicsHandle *outSampler)
 {
     LaiueGraphicsDeviceState *state = DeviceState(device);
-    if (state == NULL || description == NULL || outSampler == NULL ||
-        description->structSize < sizeof(*description))
+    if (outSampler == NULL)
         return 0u;
-    return DeviceAllocateHandle(state, DEVICE_HANDLE_SAMPLER, 0u, outSampler);
+    *outSampler = 0u;
+    if (state == NULL || description == NULL ||
+        description->structSize < sizeof(*description) || !DeviceSamplerIsValid(description))
+        return 0u;
+    if (!DeviceAllocateHandle(state, DEVICE_HANDLE_SAMPLER, 0u, outSampler))
+        return 0u;
+    const uint32_t index = DeviceHandleSlot(*outSampler) - 1u;
+    state->samplers[index] = *description;
+    state->samplers[index].structSize = sizeof(state->samplers[index]);
+    return 1u;
 }
 
 static uint32_t DeviceCreatePipeline(LaiueGraphicsDeviceV1 *device,
@@ -484,15 +553,24 @@ static uint32_t DeviceCreatePipeline(LaiueGraphicsDeviceV1 *device,
                                      LaiueGraphicsHandle *outPipeline)
 {
     LaiueGraphicsDeviceState *state = DeviceState(device);
-    if (state == NULL || description == NULL || outPipeline == NULL ||
-        description->structSize < sizeof(*description))
+    if (outPipeline == NULL)
         return 0u;
-    if ((description->vertexShader != 0u &&
-         !DeviceHandleIsLive(state, description->vertexShader, DEVICE_HANDLE_SHADER)) ||
-        (description->fragmentShader != 0u &&
-         !DeviceHandleIsLive(state, description->fragmentShader, DEVICE_HANDLE_SHADER)))
+    *outPipeline = 0u;
+    if (state == NULL || description == NULL ||
+        description->structSize < sizeof(*description) || !DevicePipelineIsValid(description))
         return 0u;
-    return DeviceAllocateHandle(state, DEVICE_HANDLE_PIPELINE, 0u, outPipeline);
+    if (!DevicePipelineHandlesAreLive(state, description))
+        return 0u;
+    if (!DeviceAllocateHandle(state, DEVICE_HANDLE_PIPELINE, 0u, outPipeline))
+        return 0u;
+    const uint32_t index = DeviceHandleSlot(*outPipeline) - 1u;
+    state->pipelines[index] = *description;
+    state->pipelines[index].structSize = sizeof(state->pipelines[index]);
+    if (description->vertexShader != 0u)
+        ++state->shaderRefCounts[DeviceHandleSlot(description->vertexShader) - 1u];
+    if (description->fragmentShader != 0u)
+        ++state->shaderRefCounts[DeviceHandleSlot(description->fragmentShader) - 1u];
+    return 1u;
 }
 
 static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
@@ -500,8 +578,13 @@ static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
                                    LaiueGraphicsHandle *outShader)
 {
     LaiueGraphicsDeviceState *state = DeviceState(device);
-    if (state == NULL || description == NULL || outShader == NULL ||
-        description->structSize < sizeof(*description) || description->code == NULL ||
+    if (outShader == NULL)
+        return 0u;
+    *outShader = 0u;
+    if (state == NULL || description == NULL ||
+        description->structSize < sizeof(*description) ||
+        description->stage == 0u || description->stage > LAIUE_GRAPHICS_SHADER_STAGE_COMPUTE ||
+        description->code == NULL ||
         description->codeSizeBytes == 0u || description->codeSizeBytes > (uint64_t)SIZE_MAX)
         return 0u;
     if (!DeviceAllocateHandle(state, DEVICE_HANDLE_SHADER, description->codeSizeBytes,
@@ -512,10 +595,10 @@ static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
     if (state->storage[index] == NULL)
     {
         DeviceDestroyHandle(device, *outShader);
-        *outShader = 0u;
         return 0u;
     }
     memcpy(state->storage[index], description->code, (size_t)description->codeSizeBytes);
+    state->shaderStages[index] = description->stage;
     return 1u;
 }
 
@@ -584,6 +667,30 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
     const uint32_t index = DeviceHandleSlot(handle) - 1u;
+    const uint8_t kind = state->kinds[index];
+    /* A shader remains owned by the device while any pipeline references it.
+     * The void destroy ABI cannot report an error, so a premature release is
+     * a safe no-op instead of turning a live pipeline into a dangling handle. */
+    if (kind == DEVICE_HANDLE_SHADER && state->shaderRefCounts[index] != 0u)
+        return;
+    if (kind == DEVICE_HANDLE_PIPELINE)
+    {
+        const LaiueGraphicsPipelineDescV1 *pipeline = &state->pipelines[index];
+        if (pipeline->vertexShader != 0u &&
+            DeviceHandleIsLive(state, pipeline->vertexShader, DEVICE_HANDLE_SHADER))
+        {
+            const uint32_t shaderIndex = DeviceHandleSlot(pipeline->vertexShader) - 1u;
+            if (state->shaderRefCounts[shaderIndex] != 0u)
+                --state->shaderRefCounts[shaderIndex];
+        }
+        if (pipeline->fragmentShader != 0u &&
+            DeviceHandleIsLive(state, pipeline->fragmentShader, DEVICE_HANDLE_SHADER))
+        {
+            const uint32_t shaderIndex = DeviceHandleSlot(pipeline->fragmentShader) - 1u;
+            if (state->shaderRefCounts[shaderIndex] != 0u)
+                --state->shaderRefCounts[shaderIndex];
+        }
+    }
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
         for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
             if (state->meshIndexHandles[vertex] == handle &&
@@ -602,6 +709,12 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     state->live[index] = 0u;
     state->sizes[index] = 0u;
     state->usageFlags[index] = 0u;
+    memset(&state->textures[index], 0, sizeof(state->textures[index]));
+    memset(&state->samplers[index], 0, sizeof(state->samplers[index]));
+    memset(&state->pipelines[index], 0, sizeof(state->pipelines[index]));
+    if (kind != DEVICE_HANDLE_SHADER)
+        state->shaderRefCounts[index] = 0u;
+    state->shaderStages[index] = 0u;
     state->vertexCounts[index] = 0u;
     state->meshIndexHandles[index] = 0u;
     state->meshFirstIndices[index] = 0u;
@@ -659,7 +772,10 @@ static bool DeviceValidateDraw(const LaiueGraphicsDeviceState *state,
                                LaiueGraphicsHandle indexBuffer)
 {
     return state != NULL &&
-           (pipeline == 0u || DeviceHandleIsLive(state, pipeline, DEVICE_HANDLE_PIPELINE)) &&
+           (pipeline == 0u ||
+            (DeviceHandleIsLive(state, pipeline, DEVICE_HANDLE_PIPELINE) &&
+             DevicePipelineHandlesAreLive(
+                 state, &state->pipelines[DeviceHandleSlot(pipeline) - 1u]))) &&
            (vertexBuffer == 0u || DeviceHandleIsLive(state, vertexBuffer, DEVICE_HANDLE_BUFFER)) &&
            (indexBuffer == 0u || DeviceHandleIsLive(state, indexBuffer, DEVICE_HANDLE_BUFFER));
 }

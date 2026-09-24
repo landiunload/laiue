@@ -27,6 +27,22 @@ typedef struct LaiueGraphicsUiQuadV1
 
 typedef uint64_t LaiueGraphicsHandle;
 
+/* Portable descriptor values.  Zero is the default for the common case, so
+ * providers built against the first revision remain source-compatible with
+ * callers that zero-initialize descriptors. */
+#define LAIUE_GRAPHICS_FILTER_NEAREST 0u
+#define LAIUE_GRAPHICS_FILTER_LINEAR 1u
+#define LAIUE_GRAPHICS_ADDRESS_REPEAT 0u
+#define LAIUE_GRAPHICS_ADDRESS_CLAMP 1u
+#define LAIUE_GRAPHICS_ADDRESS_MIRROR 2u
+#define LAIUE_GRAPHICS_ADDRESS_BORDER 3u
+#define LAIUE_GRAPHICS_SHADER_STAGE_VERTEX 1u
+#define LAIUE_GRAPHICS_SHADER_STAGE_FRAGMENT 2u
+#define LAIUE_GRAPHICS_SHADER_STAGE_COMPUTE 3u
+#define LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES 0u
+#define LAIUE_GRAPHICS_TOPOLOGY_LINES 1u
+#define LAIUE_GRAPHICS_TOPOLOGY_POINTS 2u
+
 /* Buffer flags are backend-neutral.  VERTEX is the standard mesh stream
  * below; VERTEX_PULLING is the separate compact chunk adapter used by
  * voxel_render. */
