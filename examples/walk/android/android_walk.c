@@ -118,9 +118,17 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     AndroidDestroyDevice(state);
     const int32_t width = ANativeWindow_getWidth(state->app->window);
     const int32_t height = ANativeWindow_getHeight(state->app->window);
-    if (width <= 0 || height <= 0 || state->graphics->createDevice == NULL ||
-        state->graphics->createDevice(state->app->window, width, height,
-                                      LAIUE_GRAPHICS_BACKEND_VULKAN, &state->device) == 0u)
+    uint32_t created = 0u;
+    if (width > 0 && height > 0 && state->graphics->createDeviceWithContext != NULL &&
+        state->graphics->context != NULL)
+        created = state->graphics->createDeviceWithContext(
+            state->graphics->context, state->app->window, width, height,
+            LAIUE_GRAPHICS_BACKEND_VULKAN, &state->device);
+    else if (width > 0 && height > 0 && state->graphics->createDevice != NULL)
+        created = state->graphics->createDevice(
+            state->app->window, width, height, LAIUE_GRAPHICS_BACKEND_VULKAN,
+            &state->device);
+    if (created == 0u)
     {
         AndroidLog(state, ANDROID_LOG_ERROR, "Vulkan device/surface creation failed");
         return;

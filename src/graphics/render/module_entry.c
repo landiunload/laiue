@@ -18,11 +18,13 @@ typedef struct LaiueGraphicsModuleState
 {
     const LaiueModuleHostV1 *host;
     const LaiueContentServiceV1 *content;
+    LaiueGraphicsDeviceServiceV1 deviceService;
 } LaiueGraphicsModuleState;
 
 typedef struct LaiueGraphicsDeviceState
 {
     LaiueGraphicsDeviceV1 device;
+    const LaiueModuleHostV1 *host;
     Renderer *renderer;
     uint32_t generations[256];
     uint64_t sizes[256];
@@ -104,6 +106,8 @@ static uint32_t DeviceCreatePipeline(LaiueGraphicsDeviceV1 *,
 static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *,
                                    const LaiueGraphicsShaderDescV1 *,
                                    LaiueGraphicsHandle *);
+static uint32_t DeviceCreateWithContext(void *, void *, int32_t, int32_t, uint32_t,
+                                        LaiueGraphicsDeviceV1 **);
 static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *,
                                    const LaiueGraphicsBufferUploadV1 *);
 static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
@@ -116,24 +120,51 @@ static uint32_t DeviceSetUiFontAtlas(LaiueGraphicsDeviceV1 *, const uint8_t *, u
                                      uint32_t);
 static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *);
 
-static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
-                             uint32_t backend, LaiueGraphicsDeviceV1 **outDevice)
+static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
+                            bool clear)
+{
+    if (state != NULL && state->host != NULL && state->host->allocate != NULL)
+    {
+        void *memory = state->host->allocate(state->host->context, size);
+        if (memory != NULL && clear)
+            memset(memory, 0, size);
+        return memory;
+    }
+    return PlatformAllocate(size, clear);
+}
+
+static void DeviceFree(const LaiueGraphicsDeviceState *state, void *memory)
+{
+    if (memory == NULL)
+        return;
+    if (state != NULL && state->host != NULL && state->host->free != NULL)
+        state->host->free(state->host->context, memory);
+    else
+        PlatformFree(memory);
+}
+
+static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
+                                     void *nativeWindow, int32_t width, int32_t height,
+                                     uint32_t backend, LaiueGraphicsDeviceV1 **outDevice)
 {
     if (outDevice == NULL)
         return 0u;
     *outDevice = NULL;
     LaiueGraphicsDeviceState *state =
-        (LaiueGraphicsDeviceState *)PlatformAllocate(sizeof(*state), true);
+        (LaiueGraphicsDeviceState *)(host != NULL && host->allocate != NULL
+                                         ? host->allocate(host->context, sizeof(*state))
+                                         : PlatformAllocate(sizeof(*state), true));
     if (state == NULL)
         return 0u;
+    memset(state, 0, sizeof(*state));
+    state->host = host;
     Renderer *renderer = RendererCreateWithBackend(
         nativeWindow, width, height, (RendererBackendKind)backend);
     if (renderer == NULL)
     {
-        PlatformFree(state);
+        DeviceFree(state, state);
         return 0u;
     }
-    memset(state, 0, sizeof(*state));
     state->renderer = renderer;
     state->device.structSize = sizeof(state->device);
     state->device.abiVersion = LAIUE_GRAPHICS_ABI_VERSION_1;
@@ -154,6 +185,25 @@ static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
     return 1u;
 }
 
+static uint32_t DeviceCreate(void *nativeWindow, int32_t width, int32_t height,
+                             uint32_t backend, LaiueGraphicsDeviceV1 **outDevice)
+{
+    return DeviceCreateInternal(NULL, nativeWindow, width, height, backend, outDevice);
+}
+
+static uint32_t DeviceCreateWithContext(void *moduleContext, void *nativeWindow,
+                                        int32_t width, int32_t height, uint32_t backend,
+                                        LaiueGraphicsDeviceV1 **outDevice)
+{
+    const LaiueGraphicsModuleState *module =
+        (const LaiueGraphicsModuleState *)moduleContext;
+    if (module == NULL || module->host == NULL || module->host->allocate == NULL ||
+        module->host->free == NULL)
+        return 0u;
+    return DeviceCreateInternal(module->host, nativeWindow, width, height, backend,
+                                outDevice);
+}
+
 static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
 {
     if (device == NULL)
@@ -163,9 +213,9 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
     if (state == NULL)
         return;
     for (uint32_t index = 0u; index < 256u; ++index)
-        PlatformFree(state->storage[index]);
+        DeviceFree(state, state->storage[index]);
     RendererDestroy(state->renderer);
-    PlatformFree(state);
+    DeviceFree(state, state);
 }
 
 static uint32_t DeviceGetBackend(const LaiueGraphicsDeviceV1 *device)
@@ -198,7 +248,7 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
         return 0u;
     const uint32_t index = (uint32_t)*outBuffer - 1u;
     if (description->sizeBytes > (uint64_t)SIZE_MAX ||
-        (state->storage[index] = PlatformAllocate((size_t)description->sizeBytes, true)) == NULL)
+        (state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true)) == NULL)
     {
         DeviceDestroyHandle(device, *outBuffer);
         *outBuffer = 0u;
@@ -259,7 +309,7 @@ static uint32_t DeviceCreateShader(LaiueGraphicsDeviceV1 *device,
                               outShader))
         return 0u;
     const uint32_t index = (uint32_t)*outShader - 1u;
-    state->storage[index] = PlatformAllocate((size_t)description->codeSizeBytes, false);
+    state->storage[index] = DeviceAllocate(state, (size_t)description->codeSizeBytes, false);
     if (state->storage[index] == NULL)
     {
         DeviceDestroyHandle(device, *outShader);
@@ -296,7 +346,7 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
     if (state == NULL || !DeviceHandleIsLive(state, handle, 0u))
         return;
     const uint32_t index = (uint32_t)handle - 1u;
-    PlatformFree(state->storage[index]);
+    DeviceFree(state, state->storage[index]);
     state->storage[index] = NULL;
     state->live[index] = 0u;
     state->sizes[index] = 0u;
@@ -421,13 +471,14 @@ static const LaiueGraphicsServiceV1 service = {
     .isWireframe = RendererIsWireframe,
 };
 
-static const LaiueGraphicsDeviceServiceV1 deviceService = {
+static const LaiueGraphicsDeviceServiceV1 deviceServiceTemplate = {
     .structSize = sizeof(LaiueGraphicsDeviceServiceV1),
     .abiVersion = LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
     .createDevice = DeviceCreate,
     .destroyDevice = DeviceDestroy,
     .getBackend = DeviceGetBackend,
     .resize = DeviceResize,
+    .createDeviceWithContext = DeviceCreateWithContext,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
@@ -443,6 +494,8 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         return 0u;
     state->host = host;
     state->content = NULL;
+    state->deviceService = deviceServiceTemplate;
+    state->deviceService.context = state;
     RendererSetContentService(NULL);
     *outContext = state;
     return 1u;
@@ -473,8 +526,8 @@ static uint32_t ModuleStart(void *context)
     LaiueModuleServiceV1 devicePublished = {
         .name = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
         .version = LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
-        .table = &deviceService,
-        .tableSize = sizeof(deviceService),
+        .table = &state->deviceService,
+        .tableSize = sizeof(state->deviceService),
     };
     if (state->host->publishService(state->host->context, &devicePublished) != LAIUE_MODULE_OK)
     {

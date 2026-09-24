@@ -21,6 +21,12 @@ enum
 typedef uint32_t (*LaiueGraphicsDeviceCreateFn)(
     void *nativeWindow, int32_t width, int32_t height, uint32_t backend,
     LaiueGraphicsDeviceV1 **outDevice);
+/* Context-aware creation binds device-owned allocations to the provider
+ * instance.  The original createDevice entry point remains for older hosts
+ * that do not have an owning module context. */
+typedef uint32_t (*LaiueGraphicsDeviceCreateWithContextFn)(
+    void *moduleContext, void *nativeWindow, int32_t width, int32_t height,
+    uint32_t backend, LaiueGraphicsDeviceV1 **outDevice);
 typedef void (*LaiueGraphicsDeviceDestroyFn)(LaiueGraphicsDeviceV1 *device);
 typedef uint32_t (*LaiueGraphicsDeviceGetBackendFn)(
     const LaiueGraphicsDeviceV1 *device);
@@ -36,4 +42,6 @@ typedef struct LaiueGraphicsDeviceServiceV1
     LaiueGraphicsDeviceGetBackendFn getBackend;
     LaiueGraphicsDeviceResizeFn resize;
     uintptr_t reserved[8];
+    LaiueGraphicsDeviceCreateWithContextFn createDeviceWithContext;
+    void *context;
 } LaiueGraphicsDeviceServiceV1;

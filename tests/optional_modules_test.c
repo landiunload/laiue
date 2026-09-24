@@ -255,7 +255,9 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
             LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
             sizeof(LaiueGraphicsDeviceServiceV1), &version, &size);
     Expect(fallbackDevice != NULL && fallbackDevice->createDevice != NULL &&
-               fallbackDevice->destroyDevice != NULL,
+               fallbackDevice->destroyDevice != NULL &&
+               fallbackDevice->createDeviceWithContext != NULL &&
+               fallbackDevice->context != NULL,
            "generic graphics device service survives missing content provider");
     LaiueModuleHostUnloadAll(host);
 

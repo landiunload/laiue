@@ -863,9 +863,17 @@ static bool RunWalkExample(bool headless)
             if (window != NULL && input != NULL)
             {
                 windowService->setRawInputCallback(window, WalkRawInput, NULL);
-                if (graphicsService->createDevice(
+                uint32_t created = 0u;
+                if (graphicsService->createDeviceWithContext != NULL &&
+                    graphicsService->context != NULL)
+                    created = graphicsService->createDeviceWithContext(
+                        graphicsService->context, windowService->getNativeHandle(window),
+                        1280, 720, LAIUE_GRAPHICS_BACKEND_AUTO, &device);
+                else if (graphicsService->createDevice != NULL)
+                    created = graphicsService->createDevice(
                         windowService->getNativeHandle(window), 1280, 720,
-                        LAIUE_GRAPHICS_BACKEND_AUTO, &device) == 0u)
+                        LAIUE_GRAPHICS_BACKEND_AUTO, &device);
+                if (created == 0u)
                     device = NULL;
                 /* The callback context is installed after the state is
                  * complete, so the window never observes a half-built input. */
