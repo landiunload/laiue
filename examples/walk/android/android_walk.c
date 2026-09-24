@@ -134,26 +134,19 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
 
 static void AndroidDestroyDevice(AndroidWalkState *state)
 {
-    if (state != NULL && state->terrainReady && state->device != NULL &&
+    if (state == NULL)
+        return;
+    if (state->terrainReady && state->device != NULL &&
         state->device->destroyHandle != NULL)
         state->device->destroyHandle(state->device, state->terrainBuffer);
-    if (state != NULL)
-    {
-        state->terrainReady = false;
-        state->terrainBuffer = 0u;
-    }
+    state->terrainReady = false;
+    state->terrainBuffer = 0u;
     if (state->device != NULL && state->graphics != NULL && state->graphics->destroyDevice != NULL)
         state->graphics->destroyDevice(state->device);
     state->device = NULL;
     state->windowReady = false;
     state->running = false;
     state->touchActive = false;
-    state->joystickActive = false;
-    state->lookActive = false;
-    state->lookDeltaX = 0;
-    state->lookDeltaY = 0;
-    state->joystickPointerId = -1;
-    state->lookPointerId = -1;
     state->joystickActive = false;
     state->lookActive = false;
     state->lookDeltaX = 0;
