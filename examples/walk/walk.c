@@ -466,6 +466,9 @@ LAIUE_WALK_RUNTIME_API uint32_t WalkRebaseWorldAndCharacter(
     uint32_t characterServiceSize, LaiueCharacterControllerV1 *controller)
 {
     if (voxel == NULL || world == NULL || character == NULL || controller == NULL ||
+        !WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                 offsetof(LaiueCharacterServiceV1, getPosition),
+                                 sizeof(character->getPosition)) ||
         character->getPosition == NULL ||
         !WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
                                  LAIUE_VOXEL_SERVICE_V1_REBASE_OFFSET,
@@ -522,6 +525,7 @@ typedef struct WalkWindowState
     const LaiueWindowServiceV1 *windowService;
     const LaiueInputServiceV1 *inputService;
     const LaiueGraphicsDeviceServiceV2 *graphicsService;
+    uint32_t graphicsServiceSize;
     const LaiueSceneServiceV1 *sceneService;
     const LaiueSceneMathServiceV1 *sceneMath;
     const LaiueUiServiceV1 *uiService;
@@ -562,8 +566,12 @@ static bool WalkDeviceFieldPresent(const LaiueGraphicsDeviceV2 *device,
 static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
                               LaiueGraphicsHandle *outBuffer)
 {
-    if (device == NULL || outBuffer == NULL || device->createBuffer == NULL ||
-        device->uploadBuffer == NULL)
+    if (device == NULL || outBuffer == NULL ||
+        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, createBuffer),
+                                sizeof(device->createBuffer)) ||
+        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
+                                sizeof(device->uploadBuffer)) ||
+        device->createBuffer == NULL || device->uploadBuffer == NULL)
         return false;
     ChunkQuad quads[5];
     const uint32_t quadCount = WalkBuildTerrainQuads(quads);
@@ -583,7 +591,9 @@ static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
     };
     if (device->uploadBuffer(device, &upload) == 0u)
     {
-        if (device->destroyHandle != NULL)
+        if (WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                                   sizeof(device->destroyHandle)) &&
+            device->destroyHandle != NULL)
             device->destroyHandle(device, *outBuffer);
         *outBuffer = 0u;
         return false;
@@ -593,8 +603,12 @@ static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
 
 static void WalkUpdateRenderOrigin(WalkWindowState *state)
 {
-    if (state == NULL || state->controller == NULL ||
-        state->characterService == NULL || state->characterService->getPosition == NULL)
+    if (state == NULL || state->controller == NULL || state->characterService == NULL ||
+        !WalkServiceFieldPresent(state->characterServiceSize,
+                                 state->characterService->structSize,
+                                 offsetof(LaiueCharacterServiceV1, getPosition),
+                                 sizeof(state->characterService->getPosition)) ||
+        state->characterService->getPosition == NULL)
         return;
     LaiueCharacterPositionV1 position;
     if (state->characterService->getPosition(state->controller, &position) == 0u)
@@ -632,15 +646,20 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
 static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
                              int32_t mouseDeltaX, int32_t mouseDeltaY)
 {
-    if (state == NULL || state->sceneService == NULL || state->device == NULL ||
+    if (state == NULL || state->sceneService == NULL || state->sceneMath == NULL ||
+        state->windowService == NULL || state->window == NULL || state->device == NULL ||
+        state->sceneService->cameraGetViewMatrix == NULL ||
+        state->sceneService->cameraGetProjectionMatrix == NULL ||
+        state->sceneMath->matrix4Multiply == NULL ||
         !WalkDeviceFieldPresent(state->device,
             offsetof(LaiueGraphicsDeviceV2, setCamera),
             sizeof(state->device->setCamera)) || state->device->setCamera == NULL)
         return false;
-    state->sceneService->cameraUpdate(
-        &state->camera, elapsed,
-        false, false, false, false, false,
-        mouseDeltaX, mouseDeltaY, 0.0f, 0.0025f);
+    if (state->sceneService->cameraUpdate != NULL)
+        state->sceneService->cameraUpdate(
+            &state->camera, elapsed,
+            false, false, false, false, false,
+            mouseDeltaX, mouseDeltaY, 0.0f, 0.0025f);
     float view[16];
     state->sceneService->cameraGetViewMatrix(&state->camera,
                                              state->cameraRelativeEye, view);
@@ -673,7 +692,13 @@ static void WalkWindowFrame(void *opaque)
 {
     WalkWindowState *state = (WalkWindowState *)opaque;
     if (state == NULL || state->window == NULL || state->input == NULL ||
-        state->device == NULL)
+        state->windowService == NULL || state->inputService == NULL ||
+        state->graphicsService == NULL || state->device == NULL ||
+        !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, beginFrame),
+                                sizeof(state->device->beginFrame)) ||
+        !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, endFrame),
+                                sizeof(state->device->endFrame)) ||
+        state->device->beginFrame == NULL || state->device->endFrame == NULL)
         return;
     if (state->windowService->consumeFocusLoss != NULL &&
         state->windowService->consumeFocusLoss(state->window) != 0 &&
@@ -685,7 +710,12 @@ static void WalkWindowFrame(void *opaque)
         int32_t width = 0;
         int32_t height = 0;
         state->windowService->getClientSize(state->window, &width, &height);
-        if (width > 0 && height > 0)
+        if (width > 0 && height > 0 &&
+            WalkServiceFieldPresent(state->graphicsServiceSize,
+                                    state->graphicsService->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, resize),
+                                    sizeof(state->graphicsService->resize)) &&
+            state->graphicsService->resize != NULL)
             state->graphicsService->resize(state->device, width, height);
     }
     if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_ESCAPE))
@@ -771,7 +801,12 @@ static void WalkWindowFrame(void *opaque)
     int32_t width = 0;
     int32_t height = 0;
     state->windowService->getClientSize(state->window, &width, &height);
-    if (width > 0 && height > 0 && state->graphicsService->createDevice != NULL)
+    if (width > 0 && height > 0 &&
+        WalkServiceFieldPresent(state->graphicsServiceSize,
+                                state->graphicsService->structSize,
+                                offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
+                                sizeof(state->graphicsService->createDevice)) &&
+        state->graphicsService->createDevice != NULL)
     {
         if (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u)
             state->failed = true;
@@ -851,7 +886,11 @@ static void WalkWindowFrame(void *opaque)
                         state->failed = true;
                 }
             }
-            if (state->terrainReady && state->device->submit != NULL)
+            if (state->terrainReady &&
+                WalkDeviceFieldPresent(state->device,
+                                       offsetof(LaiueGraphicsDeviceV2, submit),
+                                       sizeof(state->device->submit)) &&
+                state->device->submit != NULL)
             {
                 /* Keep a bounded 3x3 active area around the rebased camera.
                  * The same immutable chunk buffer is instanced at camera-
@@ -1089,7 +1128,15 @@ static bool RunWalkExample(bool headless)
                                 offsetof(LaiueVoxelServiceV1, context),
                                 sizeof(voxel->context)) &&
         voxel->createWithContext != NULL && voxel->context != NULL;
-    if (voxel == NULL || voxel->getProvider == NULL ||
+    const bool voxelHasCore =
+        voxel != NULL &&
+        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, getProvider),
+                                sizeof(voxel->getProvider)) &&
+        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, destroy),
+                                sizeof(voxel->destroy));
+    if (!voxelHasCore || voxel->getProvider == NULL ||
         (!voxelHasContextCreate && voxel->create == NULL))
         PlatformWriteConsoleUtf8(
             "laiue walk: voxel provider unavailable; using base strata only\n");
@@ -1103,7 +1150,7 @@ static bool RunWalkExample(bool headless)
     LaiueVoxelProviderV1 sparse = {0};
     LaiueCharacterControllerV1 *controller = NULL;
     bool success = true;
-    if (voxel != NULL && voxel->getProvider != NULL &&
+    if (voxelHasCore && voxel->getProvider != NULL &&
         (voxelHasContextCreate || voxel->create != NULL))
     {
         const uint32_t created = voxelHasContextCreate
@@ -1157,7 +1204,11 @@ static bool RunWalkExample(bool headless)
         characterReady = character->create(&collision, 400, &controller) != 0u &&
                          controller != NULL &&
                          character->setPosition(controller, &start, 1u) != 0u;
-        if (!characterReady && controller != NULL && character->destroy != NULL)
+        if (!characterReady && controller != NULL &&
+            WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                    offsetof(LaiueCharacterServiceV1, destroy),
+                                    sizeof(character->destroy)) &&
+            character->destroy != NULL)
         {
             character->destroy(controller);
             controller = NULL;
@@ -1203,6 +1254,9 @@ static bool RunWalkExample(bool headless)
                 LAIUE_UI_SERVICE_V1_LEGACY_SIZE, NULL, &walkUiServiceSize);
         if (windowService != NULL && inputService != NULL && graphicsService != NULL &&
             windowService->create != NULL && inputService->create != NULL &&
+            WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
+                                    sizeof(graphicsService->createDevice)) &&
             graphicsService->createDevice != NULL)
         {
             WindowConfiguration windowConfiguration = {
@@ -1215,7 +1269,12 @@ static bool RunWalkExample(bool headless)
                 inputService->create(windowService->getNativeHandle(window));
             LaiueGraphicsDeviceV2 *device = NULL;
             if (walkUiService != NULL &&
-                walkUiServiceSize >= LAIUE_UI_SERVICE_V1_CONTEXT_SIZE &&
+                WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
+                                        offsetof(LaiueUiServiceV1, contextCreateWithContext),
+                                        sizeof(walkUiService->contextCreateWithContext)) &&
+                WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
+                                        offsetof(LaiueUiServiceV1, contextDestroy),
+                                        sizeof(walkUiService->contextDestroy)) &&
                 walkUiService->contextCreateWithContext != NULL &&
                 walkUiService->contextDestroy != NULL && walkUiService->context != NULL)
                 (void)walkUiService->contextCreateWithContext(walkUiService->context,
@@ -1224,7 +1283,13 @@ static bool RunWalkExample(bool headless)
             {
                 windowService->setRawInputCallback(window, WalkRawInput, NULL);
                 uint32_t created = 0u;
-                if (graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V2_CONTEXT_SIZE &&
+                if (WalkServiceFieldPresent(
+                        graphicsServiceSize, graphicsService->structSize,
+                        offsetof(LaiueGraphicsDeviceServiceV2, createDeviceWithContext),
+                        sizeof(graphicsService->createDeviceWithContext)) &&
+                    WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                            offsetof(LaiueGraphicsDeviceServiceV2, context),
+                                            sizeof(graphicsService->context)) &&
                     graphicsService->createDeviceWithContext != NULL &&
                     graphicsService->context != NULL)
                     created = graphicsService->createDeviceWithContext(
@@ -1245,6 +1310,7 @@ static bool RunWalkExample(bool headless)
                     .windowService = windowService,
                     .inputService = inputService,
                     .graphicsService = graphicsService,
+                    .graphicsServiceSize = graphicsServiceSize,
                     .sceneService = sceneService,
                     .sceneMath = sceneMath,
                     .uiService = walkUiService,
@@ -1277,15 +1343,27 @@ static bool RunWalkExample(bool headless)
                 ranWindow = true;
                 if (!state.failed)
                     PlatformWriteConsoleUtf8("laiue walk: windowed session ended cleanly\n");
-                if (state.terrainReady && state.device->destroyHandle != NULL)
+                if (state.terrainReady &&
+                    WalkDeviceFieldPresent(state.device,
+                                           offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                                           sizeof(state.device->destroyHandle)) &&
+                    state.device->destroyHandle != NULL)
                     state.device->destroyHandle(state.device, state.terrainBuffer);
-                graphicsService->destroyDevice(device);
+                if (WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                            offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
+                                            sizeof(graphicsService->destroyDevice)) &&
+                    graphicsService->destroyDevice != NULL)
+                    graphicsService->destroyDevice(device);
             }
             else
             {
                 PlatformWriteConsoleUtf8(
                     "laiue walk: graphics/window unavailable; using diagnostic headless mode\n");
-                if (device != NULL)
+                if (device != NULL &&
+                    WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                            offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
+                                            sizeof(graphicsService->destroyDevice)) &&
+                    graphicsService->destroyDevice != NULL)
                     graphicsService->destroyDevice(device);
             }
             if (input != NULL)
@@ -1298,6 +1376,9 @@ static bool RunWalkExample(bool headless)
                 "laiue walk: graphics/window modules missing; using diagnostic headless mode\n");
     }
     if (walkUiContext != NULL && walkUiService != NULL &&
+        WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
+                                offsetof(LaiueUiServiceV1, contextDestroy),
+                                sizeof(walkUiService->contextDestroy)) &&
         walkUiService->contextDestroy != NULL)
         walkUiService->contextDestroy(walkUiContext);
 #endif
@@ -1332,14 +1413,25 @@ static bool RunWalkExample(bool headless)
                 .flags = LAIUE_CHARACTER_INPUT_SPRINT |
                          (tick == 0u ? LAIUE_CHARACTER_INPUT_JUMP : 0u),
             };
-            success = character->step(controller, &input) != 0u;
+            success = WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                              offsetof(LaiueCharacterServiceV1, step),
+                                              sizeof(character->step)) &&
+                      character->step != NULL && character->step(controller, &input) != 0u;
             if (success && WalkRebaseWorldAndCharacter(
                               voxel, voxelServiceSize, world, character,
                               characterServiceSize, controller) == 0u)
                 success = false;
         }
         LaiueCharacterPositionV1 end = {0};
-        success = success && character->getPosition(controller, &end) != 0u &&
+        success = success &&
+                  WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                           offsetof(LaiueCharacterServiceV1, getPosition),
+                                           sizeof(character->getPosition)) &&
+                  WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                           offsetof(LaiueCharacterServiceV1, isGrounded),
+                                           sizeof(character->isGrounded)) &&
+                  character->getPosition != NULL && character->isGrounded != NULL &&
+                  character->getPosition(controller, &end) != 0u &&
                   character->isGrounded(controller) != 0u;
         if (success)
         {
@@ -1357,9 +1449,17 @@ static bool RunWalkExample(bool headless)
         }
     }
 
-    if (controller != NULL && character->destroy != NULL)
+    if (controller != NULL && character != NULL &&
+        WalkServiceFieldPresent(characterServiceSize, character->structSize,
+                                offsetof(LaiueCharacterServiceV1, destroy),
+                                sizeof(character->destroy)) &&
+        character->destroy != NULL)
         character->destroy(controller);
-    if (world != NULL && voxel != NULL && voxel->destroy != NULL)
+    if (world != NULL && voxel != NULL &&
+        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
+                                offsetof(LaiueVoxelServiceV1, destroy),
+                                sizeof(voxel->destroy)) &&
+        voxel->destroy != NULL)
         voxel->destroy(world);
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
