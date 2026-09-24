@@ -6,6 +6,7 @@
 
 #include "graphics/graphics_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_GRAPHICS_DEVICE_SERVICE_NAME "laiue.graphics.device"
@@ -45,3 +46,11 @@ typedef struct LaiueGraphicsDeviceServiceV1
     LaiueGraphicsDeviceCreateWithContextFn createDeviceWithContext;
     void *context;
 } LaiueGraphicsDeviceServiceV1;
+
+/* Consumers that only need the original device lifecycle must request this
+ * prefix, not sizeof(LaiueGraphicsDeviceServiceV1).  That keeps a provider
+ * built before the context-aware tail usable with a newer host. */
+#define LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE \
+    ((uint32_t)offsetof(LaiueGraphicsDeviceServiceV1, createDeviceWithContext))
+#define LAIUE_GRAPHICS_DEVICE_SERVICE_V1_CONTEXT_SIZE \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceServiceV1, context) + sizeof(void *)))

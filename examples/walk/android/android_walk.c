@@ -30,6 +30,7 @@ struct AndroidWalkState
     const LaiueCharacterServiceV1 *character;
     const LaiueVoxelServiceV1 *voxel;
     const LaiueGraphicsDeviceServiceV1 *graphics;
+    uint32_t graphicsServiceSize;
     LaiueCharacterControllerV1 *controller;
     LaiueVoxelWorldV1 *world;
     LaiueVoxelProviderV1 provider;
@@ -79,10 +80,12 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
     state->voxel = (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
         sizeof(LaiueVoxelServiceV1), NULL, NULL);
+    state->graphicsServiceSize = 0u;
     state->graphics = (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
         LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
-        sizeof(LaiueGraphicsDeviceServiceV1), NULL, NULL);
+        LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE, NULL,
+        &state->graphicsServiceSize);
     return state->character != NULL && state->graphics != NULL;
 }
 
@@ -119,7 +122,9 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     const int32_t width = ANativeWindow_getWidth(state->app->window);
     const int32_t height = ANativeWindow_getHeight(state->app->window);
     uint32_t created = 0u;
-    if (width > 0 && height > 0 && state->graphics->createDeviceWithContext != NULL &&
+    if (width > 0 && height > 0 &&
+        state->graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V1_CONTEXT_SIZE &&
+        state->graphics->createDeviceWithContext != NULL &&
         state->graphics->context != NULL)
         created = state->graphics->createDeviceWithContext(
             state->graphics->context, state->app->window, width, height,

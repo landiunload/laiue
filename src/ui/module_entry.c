@@ -256,11 +256,11 @@ static uint32_t ModuleStart(void *context)
     state->graphics = (const LaiueGraphicsDeviceServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
         LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
-        sizeof(LaiueGraphicsDeviceServiceV1),
+        LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE,
         &version, &size);
     if (state->graphics == NULL ||
         version < LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1 ||
-        size < sizeof(*state->graphics))
+        size < LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE)
     {
         state->graphics = NULL;
         return 0u;

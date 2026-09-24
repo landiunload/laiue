@@ -835,11 +835,13 @@ static bool RunWalkExample(bool headless)
             (const LaiueInputServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_INPUT_SERVICE_NAME, LAIUE_INPUT_SERVICE_ABI_VERSION_1,
                 sizeof(LaiueInputServiceV1), NULL, NULL);
+        uint32_t graphicsServiceSize = 0u;
         const LaiueGraphicsDeviceServiceV1 *graphicsService =
             (const LaiueGraphicsDeviceServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME,
                 LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueGraphicsDeviceServiceV1), NULL, NULL);
+                LAIUE_GRAPHICS_DEVICE_SERVICE_V1_LEGACY_SIZE, NULL,
+                &graphicsServiceSize);
         walkUiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
                 sizeof(LaiueUiServiceV1), NULL, NULL);
@@ -864,7 +866,8 @@ static bool RunWalkExample(bool headless)
             {
                 windowService->setRawInputCallback(window, WalkRawInput, NULL);
                 uint32_t created = 0u;
-                if (graphicsService->createDeviceWithContext != NULL &&
+                if (graphicsServiceSize >= LAIUE_GRAPHICS_DEVICE_SERVICE_V1_CONTEXT_SIZE &&
+                    graphicsService->createDeviceWithContext != NULL &&
                     graphicsService->context != NULL)
                     created = graphicsService->createDeviceWithContext(
                         graphicsService->context, windowService->getNativeHandle(window),
