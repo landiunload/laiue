@@ -75,7 +75,6 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
     state->service.trySetBlockExplicit = WorldTrySetBlockExplicit;
     state->service.createWithContext = CreateWithContext;
     state->service.context = state;
-    WorldSetNumericService(NULL);
     *outContext = state;
     return 1u;
 }
@@ -85,14 +84,17 @@ static uint32_t ModuleStart(void *context)
     LaiueWorldModuleState *state = (LaiueWorldModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
-    WorldSetNumericService(NULL);
     state->numeric = NULL;
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_NUMERIC_SERVICE_NAME,
         LAIUE_NUMERIC_SERVICE_ABI_VERSION_1, sizeof(LaiueNumericServiceV1));
     if (state->numeric == NULL)
         return 0u;
-    WorldSetNumericService(state->numeric);
+    if (!WorldTryAcquireNumericService(state, state->numeric))
+    {
+        state->numeric = NULL;
+        return 0u;
+    }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_WORLD_SERVICE_NAME,
         .version = LAIUE_WORLD_SERVICE_ABI_VERSION_1,
@@ -102,7 +104,7 @@ static uint32_t ModuleStart(void *context)
     if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
     {
         state->numeric = NULL;
-        WorldSetNumericService(NULL);
+        WorldReleaseNumericService(state);
         return 0u;
     }
     return 1u;
@@ -117,14 +119,14 @@ static void ModuleStop(void *context)
     if (state != NULL)
     {
         state->numeric = NULL;
-        WorldSetNumericService(NULL);
+        WorldReleaseNumericService(state);
     }
 }
 
 static void ModuleDestroy(void *context)
 {
     LaiueWorldModuleState *state = context;
-    WorldSetNumericService(NULL);
+    WorldReleaseNumericService(state);
     if (state == NULL)
         return;
     const LaiueModuleHostV1 *host = state->host;

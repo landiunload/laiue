@@ -95,6 +95,25 @@ LAIUE_TEST_ENTRY(PhysicsModuleTestEntryPoint)
             sizeof(LaiuePhysicsServiceV1), NULL, NULL);
     Expect(sequentialService != NULL && sequentialService->step != NULL,
            "physics starts without jobs provider");
+
+    /* The legacy numeric bridge is process-global for source compatibility,
+     * so a second host must fail cleanly instead of stealing the first
+     * host's service or clearing it during create/rollback. */
+    LaiueModuleHost *secondHost = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(secondHost != NULL, "second concurrent physics host creates");
+    LaiueModuleBinaryV1 secondBinaries[] = {{path, 0u, NULL}, {numericPath, 0u, NULL}};
+    Expect(LaiueModuleHostLoad(secondHost, secondBinaries,
+                               (uint32_t)(sizeof(secondBinaries) /
+                                          sizeof(secondBinaries[0])),
+                               &diagnostic) == LAIUE_MODULE_START_FAILED,
+           "second concurrent physics host is rejected by the owner guard");
+    Expect(LaiueModuleHostLoadedCount(secondHost) == 0u,
+           "failed concurrent physics host rolls back independently");
+    LaiueModuleHostDestroy(secondHost);
+    Expect(LaiueModuleHostQueryService(host, LAIUE_PHYSICS_SERVICE_NAME,
+                                       LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
+                                       sizeof(LaiuePhysicsServiceV1), NULL, NULL) != NULL,
+           "first physics host remains usable after second host failure");
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
 

@@ -100,6 +100,20 @@ LAIUE_TEST_ENTRY(AudioSystemBackendTestEntryPoint)
                audio->deviceDestroy != NULL && audio->deviceGetStats != NULL,
            "audio service is available");
 
+    LaiueModuleHost *secondHost = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(secondHost != NULL, "second concurrent audio host creates");
+    LaiueModuleBinaryV1 secondAudio = {audioPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(secondHost, &secondAudio, 1u, &diagnostic) ==
+               LAIUE_MODULE_START_FAILED,
+           "second concurrent audio host is rejected by the owner guard");
+    Expect(LaiueModuleHostLoadedCount(secondHost) == 0u,
+           "failed concurrent audio host rolls back independently");
+    LaiueModuleHostDestroy(secondHost);
+    Expect(LaiueModuleHostQueryService(host, LAIUE_AUDIO_SERVICE_NAME,
+                                       LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
+                                       sizeof(LaiueAudioServiceV1), NULL, NULL) != NULL,
+           "first audio host remains usable after second host failure");
+
     AudioDeviceConfiguration configuration = {
         .backend = AUDIO_BACKEND_SYSTEM,
         .sampleRate = 0u,

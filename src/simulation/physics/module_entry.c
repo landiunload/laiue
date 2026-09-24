@@ -57,7 +57,6 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         return 0u;
     memset(state, 0, sizeof(*state));
     state->host = host;
-    PhysicsSetNumericService(NULL);
     *outContext = state;
     return 1u;
 }
@@ -67,7 +66,6 @@ static uint32_t ModuleStart(void *context)
     LaiuePhysicsModuleState *state = (LaiuePhysicsModuleState *)context;
     if (state == NULL || state->host == NULL)
         return 0u;
-    PhysicsSetNumericService(NULL);
     state->numeric = NULL;
     state->jobs = NULL;
     state->numeric = (const LaiueNumericServiceV1 *)LaiueModuleQueryRequiredService(
@@ -86,7 +84,12 @@ static uint32_t ModuleStart(void *context)
         state->jobs = NULL;
         return 0u;
     }
-    PhysicsSetNumericService(state->numeric);
+    if (!PhysicsTryAcquireNumericService(state, state->numeric))
+    {
+        state->numeric = NULL;
+        state->jobs = NULL;
+        return 0u;
+    }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_PHYSICS_SERVICE_NAME,
         .version = LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
@@ -97,7 +100,7 @@ static uint32_t ModuleStart(void *context)
     {
         state->numeric = NULL;
         state->jobs = NULL;
-        PhysicsSetNumericService(NULL);
+        PhysicsReleaseNumericService(state);
         return 0u;
     }
     return 1u;
@@ -113,7 +116,7 @@ static void ModuleStop(void *context)
     {
         state->numeric = NULL;
         state->jobs = NULL;
-        PhysicsSetNumericService(NULL);
+        PhysicsReleaseNumericService(state);
     }
 }
 
@@ -127,7 +130,7 @@ static void ModuleDestroy(void *context)
         state->numeric = NULL;
         state->jobs = NULL;
     }
-    PhysicsSetNumericService(NULL);
+    PhysicsReleaseNumericService(state);
     if (host != NULL && host->free != NULL)
         host->free(host->context, state);
 }

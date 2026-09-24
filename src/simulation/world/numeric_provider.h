@@ -8,6 +8,13 @@
 LAIUE_WORLD_API void WorldSetNumericService(const LaiueNumericServiceV1 *service);
 LAIUE_WORLD_API const LaiueNumericServiceV1 *WorldGetNumericService(void);
 
+/* The compatibility entry points below are process-wide by design, but the
+ * dynamically loaded world module must not let one host overwrite another.
+ * A non-NULL owner token is retained until the matching release. */
+bool WorldTryAcquireNumericService(const void *owner,
+                                   const LaiueNumericServiceV1 *service);
+void WorldReleaseNumericService(const void *owner);
+
 void WorldNumericInit(InfiniteCoord *value);
 void WorldNumericDestroy(InfiniteCoord *value);
 bool WorldNumericTryCopyAddInt64(InfiniteCoord *out, const InfiniteCoord *source,

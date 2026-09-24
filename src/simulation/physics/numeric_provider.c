@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 static const LaiueNumericServiceV1 *g_numericService;
+static const void *g_numericOwner;
 
 static bool HasField(const LaiueNumericServiceV1 *service, size_t offset,
                      size_t size)
@@ -22,12 +23,44 @@ static const LaiueNumericServiceV1 *ValidService(void)
 
 void PhysicsSetNumericService(const LaiueNumericServiceV1 *service)
 {
-    if (service == NULL || service->abiVersion != LAIUE_NUMERIC_SERVICE_ABI_VERSION_1 ||
+    if (service == NULL)
+    {
+        if (g_numericOwner == NULL)
+            g_numericService = NULL;
+        return;
+    }
+    if (service->abiVersion != LAIUE_NUMERIC_SERVICE_ABI_VERSION_1 ||
         service->structSize < offsetof(LaiueNumericServiceV1, init) +
                                   sizeof(service->init))
-        g_numericService = NULL;
-    else
+        return;
+    if (g_numericOwner == NULL || g_numericService == service)
         g_numericService = service;
+}
+
+bool PhysicsTryAcquireNumericService(const void *owner,
+                                     const LaiueNumericServiceV1 *service)
+{
+    if (owner == NULL || service == NULL ||
+        service->abiVersion != LAIUE_NUMERIC_SERVICE_ABI_VERSION_1 ||
+        service->structSize < offsetof(LaiueNumericServiceV1, init) +
+                                  sizeof(service->init))
+        return false;
+    if (g_numericOwner != NULL && g_numericOwner != owner)
+        return false;
+    if (g_numericService != NULL && g_numericService != service)
+        return false;
+    g_numericOwner = owner;
+    g_numericService = service;
+    return true;
+}
+
+void PhysicsReleaseNumericService(const void *owner)
+{
+    if (owner != NULL && g_numericOwner == owner)
+    {
+        g_numericOwner = NULL;
+        g_numericService = NULL;
+    }
 }
 
 const LaiueNumericServiceV1 *PhysicsGetNumericService(void)

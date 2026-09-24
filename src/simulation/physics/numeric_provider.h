@@ -8,6 +8,11 @@
 LAIUE_PHYSICS_API void PhysicsSetNumericService(const LaiueNumericServiceV1 *service);
 LAIUE_PHYSICS_API const LaiueNumericServiceV1 *PhysicsGetNumericService(void);
 
+/* Instance-bound guard for the legacy process-default bridge. */
+bool PhysicsTryAcquireNumericService(const void *owner,
+                                     const LaiueNumericServiceV1 *service);
+void PhysicsReleaseNumericService(const void *owner);
+
 void PhysicsNumericInit(InfiniteCoord *value);
 void PhysicsNumericDestroy(InfiniteCoord *value);
 bool PhysicsNumericTryCopyAddInt64(InfiniteCoord *out, const InfiniteCoord *source,

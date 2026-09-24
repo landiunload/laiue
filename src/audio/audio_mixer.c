@@ -12,6 +12,7 @@
 #include "platform/system.h"
 
 #include <string.h>
+#include <stdbool.h>
 
 #define AUDIO_MIX_CHANNELS 2u
 #define AUDIO_COMMAND_CAPACITY 256u
@@ -22,10 +23,38 @@
 #define AUDIO_MAX_SPEED 16.0f
 
 static const LaiueAudioOutputServiceV1 *g_audioOutputService;
+static const void *g_audioOutputOwner;
 
 void AudioMixerSetOutputService(const LaiueAudioOutputServiceV1 *service)
 {
+    if (g_audioOutputOwner != NULL)
+    {
+        if (service == g_audioOutputService)
+            return;
+        return;
+    }
     g_audioOutputService = service;
+}
+
+bool AudioMixerTryAcquireOutputService(const void *owner,
+                                       const LaiueAudioOutputServiceV1 *service)
+{
+    if (owner == NULL)
+        return false;
+    if (g_audioOutputOwner != NULL && g_audioOutputOwner != owner)
+        return false;
+    g_audioOutputOwner = owner;
+    g_audioOutputService = service;
+    return true;
+}
+
+void AudioMixerReleaseOutputService(const void *owner)
+{
+    if (owner != NULL && g_audioOutputOwner == owner)
+    {
+        g_audioOutputOwner = NULL;
+        g_audioOutputService = NULL;
+    }
 }
 
 static float ClampFloat(float value, float minimum, float maximum)

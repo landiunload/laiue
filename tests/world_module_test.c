@@ -103,6 +103,22 @@ LAIUE_TEST_ENTRY(WorldModuleTestEntryPoint)
            "world service operations failed");
     service->destroy(world);
 
+    LaiueModuleHost *secondHost = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(secondHost != NULL, "second concurrent world host creates");
+    LaiueModuleBinaryV1 secondBinaries[] = {{path, 0u, NULL}, {numericPath, 0u, NULL}};
+    Expect(LaiueModuleHostLoad(secondHost, secondBinaries,
+                               (uint32_t)(sizeof(secondBinaries) /
+                                          sizeof(secondBinaries[0])),
+                               &diagnostic) == LAIUE_MODULE_START_FAILED,
+           "second concurrent world host is rejected by the owner guard");
+    Expect(LaiueModuleHostLoadedCount(secondHost) == 0u,
+           "failed concurrent world host rolls back independently");
+    LaiueModuleHostDestroy(secondHost);
+    Expect(LaiueModuleHostQueryService(host, LAIUE_WORLD_SERVICE_NAME,
+                                       LAIUE_WORLD_SERVICE_ABI_VERSION_1,
+                                       sizeof(LaiueWorldServiceV1), NULL, NULL) != NULL,
+           "first world host remains usable after second host failure");
+
     LaiueModuleHostUnloadAll(host);
     Expect(LaiueModuleHostQueryService(host, LAIUE_WORLD_SERVICE_NAME, 1u, 1u,
                                        NULL, NULL) == NULL,

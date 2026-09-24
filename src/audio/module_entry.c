@@ -131,7 +131,6 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         .deviceCreateWithContext = DeviceCreateWithContext,
         .context = state,
     };
-    AudioMixerSetOutputService(NULL);
     *outContext = state;
     return 1u;
 }
@@ -166,7 +165,12 @@ static uint32_t ModuleStart(void *context)
     /* Keep the legacy deviceCreate entry point operational for existing
      * clients. New clients should use deviceCreateWithContext, which never
      * consults this process-wide compatibility slot. */
-    AudioMixerSetOutputService(state->output);
+    if (!AudioMixerTryAcquireOutputService(state, state->output))
+    {
+        state->output = NULL;
+        state->outputSize = 0u;
+        return 0u;
+    }
     LaiueModuleServiceV1 published = {
         .name = LAIUE_AUDIO_SERVICE_NAME,
         .version = LAIUE_AUDIO_SERVICE_ABI_VERSION_1,
@@ -175,7 +179,7 @@ static uint32_t ModuleStart(void *context)
     };
     if (state->host->publishService(state->host->context, &published) == LAIUE_MODULE_OK)
         return 1u;
-    AudioMixerSetOutputService(NULL);
+    AudioMixerReleaseOutputService(state);
     state->output = NULL;
     state->outputSize = 0u;
     return 0u;
@@ -186,7 +190,7 @@ static void ModuleStop(void *context)
     AudioModuleState *state = (AudioModuleState *)context;
     if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
         (void)state->host->unpublishService(state->host->context, LAIUE_AUDIO_SERVICE_NAME);
-    AudioMixerSetOutputService(NULL);
+    AudioMixerReleaseOutputService(state);
     if (state != NULL)
         state->output = NULL;
 }
@@ -200,7 +204,7 @@ static void ModuleDestroy(void *context)
         state->host = NULL;
         state->output = NULL;
         state->outputSize = 0u;
-        AudioMixerSetOutputService(NULL);
+        AudioMixerReleaseOutputService(state);
         if (host != NULL && host->free != NULL)
             host->free(host->context, state);
     }
