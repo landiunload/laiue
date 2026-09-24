@@ -433,11 +433,12 @@ static const LaiueGraphicsDeviceServiceV1 deviceService = {
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL)
+        host->unpublishService == NULL || host->queryService == NULL ||
+        host->allocate == NULL || host->free == NULL)
         return 0u;
     *outContext = NULL;
     LaiueGraphicsModuleState *state =
-        (LaiueGraphicsModuleState *)PlatformAllocate(sizeof(*state), true);
+        (LaiueGraphicsModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
     state->host = host;
@@ -508,9 +509,11 @@ static void ModuleDestroy(void *context)
     LaiueGraphicsModuleState *state = (LaiueGraphicsModuleState *)context;
     if (state != NULL)
     {
+        const LaiueModuleHostV1 *host = state->host;
         state->host = NULL;
         state->content = NULL;
-        PlatformFree(state);
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
     }
     RendererSetContentService(NULL);
 }
