@@ -2,6 +2,7 @@
 #include "walk_runtime.h"
 
 #include <stdbool.h>
+#include <string.h>
 
 typedef struct TestTerrain
 {
@@ -9,6 +10,51 @@ typedef struct TestTerrain
     bool wall;
     bool ceiling;
 } TestTerrain;
+
+typedef struct RebaseProbe
+{
+    LaiueCharacterPositionV1 position;
+    bool worldAccepts;
+    uint32_t worldCalls;
+    uint32_t characterCalls;
+} RebaseProbe;
+
+static RebaseProbe g_rebaseProbe;
+
+static uint32_t ProbeGetPosition(const LaiueCharacterControllerV1 *controller,
+                                 LaiueCharacterPositionV1 *outPosition)
+{
+    (void)controller;
+    if (outPosition == NULL)
+        return 0u;
+    *outPosition = g_rebaseProbe.position;
+    return 1u;
+}
+
+static uint32_t ProbeCharacterRebase(LaiueCharacterControllerV1 *controller,
+                                     int64_t cellDeltaX, int64_t cellDeltaY,
+                                     int64_t localDeltaX, int64_t localDeltaY)
+{
+    (void)controller;
+    ++g_rebaseProbe.characterCalls;
+    g_rebaseProbe.position.cellX += cellDeltaX;
+    g_rebaseProbe.position.cellY += cellDeltaY;
+    g_rebaseProbe.position.localX += localDeltaX;
+    g_rebaseProbe.position.localY += localDeltaY;
+    return 1u;
+}
+
+static uint32_t ProbeVoxelRebase(LaiueVoxelWorldV1 *world,
+                                 int64_t blockShiftX, int64_t blockShiftY,
+                                 int64_t blockShiftZ)
+{
+    (void)world;
+    (void)blockShiftX;
+    (void)blockShiftY;
+    (void)blockShiftZ;
+    ++g_rebaseProbe.worldCalls;
+    return g_rebaseProbe.worldAccepts ? 1u : 0u;
+}
 
 static uint32_t TestGetBlock(const LaiueVoxelProviderV1 *provider,
                              const LaiueVoxelCoordV1 *coordinate,
@@ -95,6 +141,61 @@ LAIUE_TEST_ENTRY(WalkRuntimeTestEntryPoint)
            "vertical floor sweep succeeds");
     Expect(result.localZ == 1400 && grounded != 0u,
            "vertical sweep resolves a floor contact and grounds the body");
+
+    LaiueVoxelServiceV1 voxelService = {
+        .structSize = sizeof(voxelService),
+        .abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
+        .rebase = ProbeVoxelRebase,
+    };
+    LaiueCharacterServiceV1 characterService = {
+        .structSize = sizeof(characterService),
+        .abiVersion = LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
+        .getPosition = ProbeGetPosition,
+        .rebaseOrigin = ProbeCharacterRebase,
+    };
+    LaiueCharacterPositionV1 original = {
+        .cellX = INT64_C(1) << 40,
+        .cellY = -(INT64_C(1) << 39),
+        .localX = 0,
+        .localY = 0,
+        .localZ = 1400,
+    };
+    g_rebaseProbe = (RebaseProbe){
+        .position = original,
+        .worldAccepts = false,
+    };
+    Expect(WalkRebaseWorldAndCharacter(
+               &voxelService, sizeof(voxelService),
+               (LaiueVoxelWorldV1 *)(uintptr_t)1u, &characterService,
+               sizeof(characterService),
+               (LaiueCharacterControllerV1 *)(uintptr_t)1u) == 0u,
+           "world rebase rejection is reported");
+    Expect(g_rebaseProbe.worldCalls == 1u && g_rebaseProbe.characterCalls == 2u &&
+               memcmp(&g_rebaseProbe.position, &original, sizeof(original)) == 0,
+           "failed world rebase rolls the character origin back");
+
+    g_rebaseProbe = (RebaseProbe){
+        .position = original,
+        .worldAccepts = true,
+    };
+    Expect(WalkRebaseWorldAndCharacter(
+               &voxelService, sizeof(voxelService),
+               (LaiueVoxelWorldV1 *)(uintptr_t)1u, &characterService,
+               sizeof(characterService),
+               (LaiueCharacterControllerV1 *)(uintptr_t)1u) != 0u &&
+               g_rebaseProbe.worldCalls == 1u && g_rebaseProbe.characterCalls == 1u &&
+               g_rebaseProbe.position.cellX == 0 &&
+               g_rebaseProbe.position.cellY == 0,
+           "accepted rebase commits both sides once");
+
+    g_rebaseProbe = (RebaseProbe){.position = original, .worldAccepts = true};
+    Expect(WalkRebaseWorldAndCharacter(
+               &voxelService, LAIUE_VOXEL_SERVICE_V1_REBASE_OFFSET,
+               (LaiueVoxelWorldV1 *)(uintptr_t)1u, &characterService,
+               sizeof(characterService),
+               (LaiueCharacterControllerV1 *)(uintptr_t)1u) != 0u &&
+               g_rebaseProbe.worldCalls == 0u && g_rebaseProbe.characterCalls == 0u,
+           "short voxel tables do not call an absent rebase tail");
 
     LAIUE_TEST_SUCCESS();
 }
