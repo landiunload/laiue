@@ -143,6 +143,28 @@ static bool RunFrame(Renderer *renderer, const RendererMesh *mesh,
     RendererGetStats(renderer, &stats);
     return stats.drawCalls == draws && stats.drawnQuads == expectedQuads;
 }
+
+// Чередование обычного и инстансного вызова в одном кадре: смещение
+// инстанса — общее состояние кадра, обычный вызов обязан его перезаписать,
+// а следующий инстансный — восстановить. Проверяются счётчики кадра:
+// 1 + 3 + 1 + 2 = 7 квадов за четыре вызова.
+static bool RunMixedFrame(Renderer *renderer, const RendererMesh *mesh,
+                          const RendererMeshInstance *instances,
+                          const RendererFrameSetup *setup)
+{
+    Expect(RendererBeginFrame(renderer, setup), "the mixed draw frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    const float origin[3] = {0.0f, 0.0f, 0.0f};
+    RendererDrawMesh(renderer, mesh, origin);
+    RendererDrawMeshInstances(renderer, mesh, instances, 3u);
+    RendererDrawMesh(renderer, mesh, origin);
+    RendererDrawMeshInstances(renderer, mesh, instances, 2u);
+    Expect(RendererEndFrame(renderer), "the mixed draw frame could not end");
+
+    RendererStats stats;
+    RendererGetStats(renderer, &stats);
+    return stats.drawCalls == 4u && stats.drawnQuads == 7u;
+}
 #endif
 
 LAIUE_TEST_ENTRY(RendererInstanceRingTestEntryPoint)
@@ -215,7 +237,11 @@ LAIUE_TEST_ENTRY(RendererInstanceRingTestEntryPoint)
                     "an instanced frame after resize back could not begin"),
            "the small frame after resize back lost its draw");
 
-    // 4. Release: меш и рендерер (со всеми чанками) обязаны освободиться
+    // 4. Смешение обычных и инстансных вызовов в одном кадре.
+    Expect(RunMixedFrame(renderer, mesh, instances, &setup),
+           "the mixed plain/instanced frame lost a call");
+
+    // 5. Release: меш и рендерер (со всеми чанками) обязаны освободиться
     //    без утечек и падений.
     RendererDestroyMesh(renderer, mesh);
     RendererDestroy(renderer);

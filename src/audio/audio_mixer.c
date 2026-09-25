@@ -240,16 +240,20 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
     }
 }
 
-static void DrainCommands(AudioDevice *device)
+// Возвращает true, если из кольца была разобрана хотя бы одна команда:
+// вызывающий использует это, чтобы понять, мог ли появиться активный голос.
+static bool DrainCommands(AudioDevice *device)
 {
     uint32_t read = device->commandRead;
     uint32_t write = PlatformAtomicLoadU32Acquire(&device->commandWrite);
+    if (read == write) return false;
     while (read != write)
     {
         ApplyCommand(device, &device->commands[read]);
         read = (read + 1u) % AUDIO_COMMAND_CAPACITY;
     }
     PlatformAtomicStoreU32Release(&device->commandRead, read);
+    return true;
 }
 
 // === Смешивание ===
@@ -489,27 +493,53 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     AudioDevice *device = (AudioDevice *)context;
     memset(frames, 0, (size_t)frameCount * AUDIO_MIX_CHANNELS * sizeof(float));
 
-    DrainCommands(device);
+    bool commandsApplied = DrainCommands(device);
+
+    // Громкость читается здесь же: после memset буфер нулевой, и нулём он
+    // остаётся только при конечной громкости — NaN или бесконечность дали бы
+    // NaN. Холостой путь это учитывает, чтобы не менять семантику сэмплов.
+    uint32_t masterBits = PlatformAtomicLoadU32Acquire(&device->masterVolumeBits);
+    bool finiteMaster = (masterBits & 0x7f800000u) != 0x7f800000u;
+
+    // Холостого микшера не касаются ни обход слотов, ни масштабирование:
+    // activeVoices и кольцо команд принадлежат потоку вывода, и нулевой счёт
+    // без разобранных команд означает, что ни один слот не ACTIVE. Буфер уже
+    // нулевой после memset, поэтому тишина не платит за проход по слотам и
+    // громкости. Голос становится ACTIVE только через COMMAND_START, значит
+    // без команд его появление невозможно.
+    if (!commandsApplied && finiteMaster
+        && PlatformAtomicLoadU32Acquire(&device->activeVoices) == 0u)
+    {
+        PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
+        return;
+    }
 
     uint32_t active = 0u;
+    bool mixedVoice = false;
     for (uint32_t index = 0; index < AUDIO_MAX_VOICES; ++index)
     {
         VoiceSlot *slot = &device->voices[index];
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
         if (slot->clip == NULL) continue;
         MixVoice(slot, frames, frameCount);
+        mixedVoice = true;
         if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE) ++active;
     }
     PlatformAtomicStoreU32Release(&device->activeVoices, active);
 
-    float master = BitsToFloat(PlatformAtomicLoadU32Acquire(&device->masterVolumeBits));
+    // Разобранные команды были, но ни один голос не дожил до микса — буфер
+    // весь нулевой, и конечная громкость с ограничением вернула бы те же нули.
     uint32_t sampleCount = frameCount * AUDIO_MIX_CHANNELS;
-    for (uint32_t index = 0; index < sampleCount; ++index)
+    if (mixedVoice || !finiteMaster)
     {
-        // Мягкое ограничение отсутствует намеренно: сумма голосов
-        // обрезается по диапазону, а решение о запасе громкости
-        // принадлежит приложению, как и остальная политика микса.
-        frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
+        float master = BitsToFloat(masterBits);
+        for (uint32_t index = 0; index < sampleCount; ++index)
+        {
+            // Мягкое ограничение отсутствует намеренно: сумма голосов
+            // обрезается по диапазону, а решение о запасе громкости
+            // принадлежит приложению, как и остальная политика микса.
+            frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
+        }
     }
     PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
 }

@@ -932,6 +932,21 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
                                 int16_t *output, uint32_t stride)
 {
     float *buffer = state->synthesis[channel];
+    // Матрица синтеза задана косинусами от (16+i)(2k+1)pi/64, поэтому у
+    // неё есть точная симметрия: M[i][31-k] = M[i][k] для чётных i и
+    // M[i][31-k] = -M[i][k] для нечётных. Свернув пару отсчётов в сумму
+    // и разность один раз на все 64 строки, каждая строка требует 16
+    // умножений вместо 32. Математически результат тот же; меняется лишь
+    // порядок сложений float, что на выходе остаётся в пределах
+    // допуска декодера (+/-2 отсчёта).
+    const uint32_t half = MP3_SUBBANDS / 2u;
+    float folded[MP3_SUBBANDS];
+    for (uint32_t band = 0; band < half; ++band)
+    {
+        folded[band] = subband[band] + subband[MP3_SUBBANDS - 1u - band];
+        folded[half + band] = subband[band] - subband[MP3_SUBBANDS - 1u - band];
+    }
+
     // Кольцевой буфер вместо сдвига на 64 значения: сдвигать 960 чисел
     // восемнадцать раз на гранулу — это мегабайты копирования в секунду
     // ради того же результата.
@@ -940,10 +955,12 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
 
     for (uint32_t index = 0; index < 64u; ++index)
     {
+        const float *row = MP3_SYNTH_MATRIX[index];
+        const float *source = (index & 1u) == 0u ? folded : folded + half;
         float sum = 0.0f;
-        for (uint32_t band = 0; band < MP3_SUBBANDS; ++band)
+        for (uint32_t band = 0; band < half; ++band)
         {
-            sum += MP3_SYNTH_MATRIX[index][band] * subband[band];
+            sum += row[band] * source[band];
         }
         buffer[(offset + index) & 1023u] = sum;
     }
@@ -986,7 +1003,13 @@ static void Mp3BuildPow43(float *table)
         // Кубический корень методом Ньютона: без CRT нет ни pow, ни
         // cbrt, а корень предыдущего числа — отличное начальное
         // приближение, потому что аргумент растёт на единицу.
-        for (uint32_t step = 0; step < 8u; ++step)
+        //
+        // Четырёх шагов достаточно: начиная с корня соседнего числа,
+        // ошибка уже порядка 1e-3, и Ньютон удваивает число верных цифр
+        // за шаг. Пятый и следующие шаги не меняют ни одного бита
+        // результата (проверено полным сравнением таблицы), поэтому
+        // прежде они были чистой переработкой.
+        for (uint32_t step = 0; step < 4u; ++step)
         {
             root = (2.0 * root + value / (root * root)) / 3.0;
         }

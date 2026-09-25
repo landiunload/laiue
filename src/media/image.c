@@ -413,6 +413,48 @@ void ImageResample(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceH
         return;
     }
 
+    // Увеличение: блок выборки — ровно один исходный пиксель. При
+    // samples == 1 взвешенное частное (texel·alpha + alpha/2)/alpha равно
+    // texel, ведь 0 ≤ alpha/2 < alpha; прозрачный пиксель даёт то же
+    // обычным средним, а альфа-канал — сам alpha. Значит увеличение есть
+    // повтор ближайшего пикселя, и его можно копировать без делений.
+    if (sourceWidth <= destinationWidth && sourceHeight <= destinationHeight)
+    {
+        uint32_t columnStep = sourceWidth / destinationWidth;
+        uint32_t columnRemainderStep = sourceWidth % destinationWidth;
+
+        for (uint32_t row = 0; row < destinationHeight; ++row)
+        {
+            uint32_t sourceRow = (uint32_t)((uint64_t)row * sourceHeight / destinationHeight);
+            const uint8_t *sourceLine = source + (size_t)sourceRow * sourceWidth * 4u;
+            uint8_t *destinationLine = destination + (size_t)row * destinationWidth * 4u;
+
+            // firstColumn(c) = floor(c·sourceWidth / destinationWidth)
+            // считается накопительным счётчиком: на выходной пиксель не
+            // приходится ни одного деления.
+            uint32_t sourceColumn = 0u;
+            uint32_t remainder = 0u;
+            for (uint32_t column = 0; column < destinationWidth; ++column)
+            {
+                const uint8_t *texel = sourceLine + (size_t)sourceColumn * 4u;
+                uint8_t *out = destinationLine + (size_t)column * 4u;
+                out[0] = texel[0];
+                out[1] = texel[1];
+                out[2] = texel[2];
+                out[3] = texel[3];
+
+                sourceColumn += columnStep;
+                remainder += columnRemainderStep;
+                if (remainder >= destinationWidth)
+                {
+                    remainder -= destinationWidth;
+                    ++sourceColumn;
+                }
+            }
+        }
+        return;
+    }
+
     for (uint32_t row = 0; row < destinationHeight; ++row)
     {
         // Границы исходного прямоугольника считаются в целых числах:

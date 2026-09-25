@@ -238,11 +238,63 @@ static void TestDynamicColliderSource(void)
                   "dynamic collider overlap was missed");
 }
 
+typedef struct EdgeContext
+{
+    int64_t holeMinimumX;
+    int64_t holeMaximumX;
+} EdgeContext;
+
+static void QueryEdgeBlock(void *rawContext, int64_t x, int64_t y, int64_t z,
+                           VoxelBlockPhysics *outBlock)
+{
+    EdgeContext *context = (EdgeContext *)rawContext;
+    (void)y;
+    bool solid = z <= 0 && (x < context->holeMinimumX || x > context->holeMaximumX);
+    outBlock->flags = solid ? VOXEL_BLOCK_PHYSICS_SOLID : 0U;
+    outBlock->friction = solid ? 0.75f : 0.0f;
+}
+
+// Три точки на ось могут попасть в один блок: над дырой опоры нет, на краю
+// одна из точек стоит на блоке, а sneak обязан уменьшить ход в пустоту.
+static void TestStableGroundAndSneakEdges(void)
+{
+    EdgeContext context = {
+        .holeMinimumX = 6,
+        .holeMaximumX = 13,
+    };
+    VoxelCollisionSource source = {
+        .context = &context,
+        .queryBlockPhysics = QueryEdgeBlock,
+        .queryDynamicColliders = NULL,
+    };
+    VoxelBodyShape shape = TestShape();
+
+    const double overHole[3] = {9.5, 0.5, 2.601};
+    PhysicsExpect(!VoxelBodyHasStableGround(&source, overHole, &shape, 0.01, 0.2),
+                  "solid ground was reported under a hole");
+    const double onEdge[3] = {5.8, 0.5, 2.601};
+    PhysicsExpect(VoxelBodyHasStableGround(&source, onEdge, &shape, 0.01, 0.2),
+                  "edge support was missed");
+    // Первая проба попадает в край отверстия, а следующая — на блок.
+    // Повтор первой пробы не должен скрывать поддержку на соседнем столбце.
+    const double firstProbeInHole[3] = {13.9, 0.5, 2.601};
+    PhysicsExpect(VoxelBodyHasStableGround(&source, firstProbeInHole, &shape, 0.01, 0.2),
+                  "support after an empty first probe was missed");
+
+    const double sneakPosition[3] = {5.8, 0.5, 2.601};
+    double xDistance = 0.6;
+    double yDistance = 0.6;
+    VoxelBodyClipSneakingMovement(&source, sneakPosition, &shape, 0.01, &xDistance, &yDistance);
+    PhysicsExpect(Near(xDistance, 0.45, 1.0e-9) && Near(yDistance, 0.6, 1.0e-9),
+                  "sneak edge protection did not reduce movement into a hole");
+}
+
 LAIUE_TEST_ENTRY(PhysicsTestEntryPoint)
 {
     TestStaticVoxelCollision();
     TestMultiPlaneSweep();
     TestDynamicColliderSource();
+    TestStableGroundAndSneakEdges();
     LaiueTestRuntimeWrite("Physics tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }

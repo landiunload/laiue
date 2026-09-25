@@ -230,6 +230,65 @@ LAIUE_TEST_ENTRY(ContentCatalogTestEntryPoint)
                                                         LAIUE_CONTENT_NAME_CAPACITY),
                   "fallback activation");
 
+    // === Сортировка большого каталога ===
+    // Порядок обхода каталога не определён, поэтому перечисление обязано
+    // вернуть каждую запись ровно один раз и по возрастанию кодовых единиц.
+    // На десятках записей проверяется точный порядок, а не только наличие:
+    // прежний insertion sort и попарная проверка регистра давали тот же
+    // результат, и замена алгоритма не вправе его изменить.
+    wchar_t orderedName[16];
+    for (uint32_t orderedIndex = 0U; orderedIndex < 60U; ++orderedIndex)
+    {
+        uint32_t value = orderedIndex;
+        orderedName[0] = L'p';
+        orderedName[1] = L'a';
+        orderedName[2] = L'c';
+        orderedName[3] = L'k';
+        orderedName[4] = L'_';
+        for (uint32_t digit = 0U; digit < 4U; ++digit)
+        {
+            orderedName[5U + (3U - digit)] = (wchar_t)(L'0' + (value % 10U));
+            value /= 10U;
+        }
+        orderedName[9] = L'.';
+        orderedName[10] = L'l';
+        orderedName[11] = L's';
+        orderedName[12] = L'p';
+        orderedName[13] = L'\0';
+        CatalogExpect(Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->shaders, orderedName) &&
+                          PlatformCreateDirectory(paths->built),
+                      "ordered pack creation");
+    }
+    LaiueContentList ordered;
+    CatalogExpect(LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_SHADER_PACK, &ordered) &&
+                      ordered.count == 62U,
+                  "large catalog enumeration count");
+    CatalogExpect(WideEquals(ordered.entries[0].name, L"Alpha.lsp") &&
+                      WideEquals(ordered.entries[1].name, L"Beta.lsp"),
+                  "large catalog sorted head");
+    for (uint32_t orderedIndex = 0U; orderedIndex < 60U; ++orderedIndex)
+    {
+        uint32_t value = orderedIndex;
+        orderedName[0] = L'p';
+        orderedName[1] = L'a';
+        orderedName[2] = L'c';
+        orderedName[3] = L'k';
+        orderedName[4] = L'_';
+        for (uint32_t digit = 0U; digit < 4U; ++digit)
+        {
+            orderedName[5U + (3U - digit)] = (wchar_t)(L'0' + (value % 10U));
+            value /= 10U;
+        }
+        orderedName[9] = L'.';
+        orderedName[10] = L'l';
+        orderedName[11] = L's';
+        orderedName[12] = L'p';
+        orderedName[13] = L'\0';
+        CatalogExpect(WideEquals(ordered.entries[orderedIndex + 2U].name, orderedName),
+                      "large catalog entry order");
+    }
+    LaiueContentListRelease(&ordered);
+
     // === Порядок форматов ===
     // Разбор `formats.txt` отдельно от загрузчиков: там он виден только
     // через готовую текстуру, а здесь — сам по себе, на всех платформах.

@@ -11,6 +11,7 @@
 #include "media/sound.h"
 #include "platform/system.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #define LA_MAGIC 0x3153414Cu   // 'L','A','S','1' little-endian
@@ -35,6 +36,17 @@ static uint32_t ReadU32Le(const uint8_t *bytes)
 {
     return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
            ((uint32_t)bytes[3] << 24);
+}
+
+// Порядок байтов машины. На little-endian сэмплы PCM16 из файла уже лежат
+// как int16, и собирать их побайтово незачем; на big-endian остаётся
+// переносимый путь через ReadU16Le.
+static bool HostUsesLittleEndian(void)
+{
+    const uint16_t probe = 1u;
+    uint8_t first = 0u;
+    memcpy(&first, &probe, sizeof(first));
+    return first == 1u;
 }
 
 // === IMA ADPCM ===
@@ -137,6 +149,11 @@ static bool AdpcmDecode(const uint8_t *payload, uint32_t payloadBytes, uint32_t 
 typedef struct DecodedSound
 {
     int16_t *samples;
+    // Буфер, которым владеет разобранный звук и который надо вернуть после
+    // создания клипа. У обычного пути совпадает с `samples`; у вида на
+    // PCM16-payload это исходный файл, из которого сэмплы взяты как есть;
+    // NULL означает, что буфер принадлежит вызывающему.
+    void *allocation;
     uint32_t frameCount;
     uint32_t channelCount;
     uint32_t sampleRate;
@@ -146,7 +163,10 @@ typedef struct DecodedSound
     uint32_t sourceSizeBytes;
 } DecodedSound;
 
-static AudioPackLoadStatus DecodeSound(const uint8_t *bytes, uint32_t sizeBytes,
+// `bytesOwned` означает, что вызывающий передаёт владение `bytes`:
+// тогда после создания клипа буфер будет возвращён. Если false, `bytes`
+// принадлежит вызывающему и только читается.
+static AudioPackLoadStatus DecodeSound(const uint8_t *bytes, uint32_t sizeBytes, bool bytesOwned,
                                        DecodedSound *outSound)
 {
     if (bytes == NULL || sizeBytes < SOUND_LA_HEADER_BYTES_V1) return AUDIO_PACK_LOAD_INVALID_SOUND;
@@ -203,11 +223,25 @@ static AudioPackLoadStatus DecodeSound(const uint8_t *bytes, uint32_t sizeBytes,
     }
     if (payloadBytes != expectedPayload) return AUDIO_PACK_LOAD_INVALID_SOUND;
 
+    const uint8_t *payload = bytes + headerSize;
+    // На little-endian выровненный PCM16-payload можно передать как int16
+    // без промежуточной копии. Невыровненные данные идут через побайтовый
+    // декодер ниже: простое приведение указателя нарушило бы требования C.
+    if (encoding == LA_ENCODING_PCM16 && HostUsesLittleEndian() &&
+        (uintptr_t)(const void *)payload % _Alignof(int16_t) == 0u)
+    {
+        outSound->samples = (int16_t *)(void *)payload;
+        outSound->allocation = bytesOwned ? (void *)bytes : NULL;
+        outSound->frameCount = frameCount;
+        outSound->channelCount = channelCount;
+        outSound->sampleRate = sampleRate;
+        return AUDIO_PACK_LOAD_OK;
+    }
+
     size_t sampleBytes = (size_t)frameCount * channelCount * sizeof(int16_t);
     int16_t *samples = PlatformAllocate(sampleBytes, false);
     if (samples == NULL) return AUDIO_PACK_LOAD_OUT_OF_MEMORY;
 
-    const uint8_t *payload = bytes + headerSize;
     if (encoding == LA_ENCODING_PCM16)
     {
         // Сэмплы в файле little-endian; собираются побайтово, чтобы
@@ -224,6 +258,7 @@ static AudioPackLoadStatus DecodeSound(const uint8_t *bytes, uint32_t sizeBytes,
     }
 
     outSound->samples = samples;
+    outSound->allocation = samples;
     outSound->frameCount = frameCount;
     outSound->channelCount = channelCount;
     outSound->sampleRate = sampleRate;
@@ -241,7 +276,8 @@ static AudioClip *CreateClipFromDecoded(AudioDevice *device, DecodedSound *sound
     };
     AudioClip *clip = NULL;
     AudioResult result = AudioClipCreate(device, &description, &clip);
-    PlatformFree(sound->samples);
+    PlatformFree(sound->allocation);
+    sound->allocation = NULL;
     sound->samples = NULL;
 
     if (result != AUDIO_RESULT_OK)
@@ -289,6 +325,7 @@ static AudioPackLoadStatus DecodeForeign(const uint8_t *bytes, uint32_t sizeByte
     }
 
     outSound->samples = samples;
+    outSound->allocation = samples;
     outSound->frameCount = info.frameCount;
     outSound->channelCount = info.channelCount;
     outSound->sampleRate = info.sampleRate;
@@ -313,7 +350,7 @@ AudioClip *AudioClipLoadMemory(AudioDevice *device, const void *bytes, uint32_t 
     AudioPackLoadStatus status =
         SoundProbe(bytes, sizeBytes) != SOUND_FORMAT_UNKNOWN
             ? DecodeForeign((const uint8_t *)bytes, sizeBytes, &sound)
-            : DecodeSound((const uint8_t *)bytes, sizeBytes, &sound);
+            : DecodeSound((const uint8_t *)bytes, sizeBytes, false, &sound);
     if (status != AUDIO_PACK_LOAD_OK)
     {
         if (outStatus != NULL) *outStatus = status;
@@ -420,8 +457,10 @@ static AudioPackLoadStatus DecodeSoundFile(const wchar_t *path, DecodedSound *ou
     AudioPackLoadStatus status =
         SoundProbe(fileBytes, (uint32_t)fileSize) != SOUND_FORMAT_UNKNOWN
             ? DecodeForeign(fileBytes, (uint32_t)fileSize, outSound)
-            : DecodeSound(fileBytes, (uint32_t)fileSize, outSound);
-    PlatformFree(fileBytes);
+            : DecodeSound(fileBytes, (uint32_t)fileSize, true, outSound);
+    // PCM16-вид передаёт владение файловым буфером разобранному звуку: он
+    // возвращается после создания клипа. В остальных случаях буфер наш.
+    if (outSound->allocation != (void *)fileBytes) PlatformFree(fileBytes);
     return status;
 }
 
@@ -546,7 +585,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
                 decoded = status == AUDIO_PACK_LOAD_OK;
                 if (!decoded)
                 {
-                    PlatformFree(sound.samples);
+                    PlatformFree(sound.allocation);
                     memset(&sound, 0, sizeof(sound));
                 }
                 continue;
@@ -582,7 +621,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
                     decoded = true;
                     break;
                 }
-                PlatformFree(sound.samples);
+                PlatformFree(sound.allocation);
                 memset(&sound, 0, sizeof(sound));
             }
             if (hasSource)
@@ -597,7 +636,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
                 }
                 // Исходник не разобрался — очередь следующего формата, а
                 // за ними своего `.la`. Он для того и последний.
-                PlatformFree(sound.samples);
+                PlatformFree(sound.allocation);
                 memset(&sound, 0, sizeof(sound));
             }
         }

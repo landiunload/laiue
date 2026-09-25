@@ -793,6 +793,51 @@ LAIUE_TEST_ENTRY(AudioPackTestEntryPoint)
     Expect(AudioClipDurationSeconds(fromMissing) < 0.001, "the default sound must be silence");
     AudioClipDestroy(fromMissing);
 
+    // === Вид на PCM16: нечётный адрес буфера ===
+    // Разбор `.la` отдаёт сэмплы PCM16 как вид в исходный буфер, не
+    // копируя их. Публичный вход принимает любой указатель, поэтому
+    // payload вправе лежать по нечётному адресу: выравнивание не должно
+    // менять ни длину, ни сами сэмплы.
+    {
+        uint32_t viewPayload = TEST_FRAMES * 2u;
+        uint32_t viewTotal = LA_HEADER_SIZE + viewPayload;
+        uint8_t *raw = PlatformAllocate(viewTotal + 1u, false);
+        Expect(raw != NULL, "view scratch could not be allocated");
+        uint8_t *unaligned = raw + 1u;
+        WriteHeader(unaligned, 1u, LA_ENCODING_PCM16, TEST_SAMPLE_RATE, TEST_FRAMES, viewPayload);
+        for (uint32_t frame = 0; frame < TEST_FRAMES; ++frame)
+        {
+            int16_t value = (int16_t)((int32_t)(frame % 64u) * 256 - 8192);
+            WriteU16Le(unaligned + LA_HEADER_SIZE + (size_t)frame * 2u, (uint32_t)(uint16_t)value);
+        }
+
+        AudioPackLoadStatus viewStatus = AUDIO_PACK_LOAD_NOT_ATTEMPTED;
+        AudioClip *view = AudioClipLoadMemory(device, unaligned, viewTotal, &viewStatus);
+        Expect(view != NULL && viewStatus == AUDIO_PACK_LOAD_OK,
+               "an unaligned pcm16 sound must load from memory");
+        double expectedViewSeconds = (double)TEST_FRAMES / (double)TEST_SAMPLE_RATE;
+        double viewSeconds = AudioClipDurationSeconds(view);
+        Expect(viewSeconds > expectedViewSeconds * 0.99 && viewSeconds < expectedViewSeconds * 1.01,
+               "the pcm16 view must keep the frame count");
+        Expect(AudioVoicePlay(device, view, NULL) != AUDIO_VOICE_NONE,
+               "the pcm16 view must be playable");
+        Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
+
+        int32_t viewWorst = 0;
+        for (uint32_t frame = 0; frame < TEST_FRAMES; ++frame)
+        {
+            int32_t expected = (int32_t)(frame % 64u) * 256 - 8192;
+            int32_t decoded = (int32_t)(frames[frame * 2u] / CENTRE_GAIN * 32768.0f);
+            int32_t error = AbsoluteDifference(decoded, expected);
+            if (error > viewWorst) viewWorst = error;
+        }
+        Expect(viewWorst < 300, "the pcm16 view must reproduce the samples of its file");
+        AudioClipDestroy(view);
+        AudioDeviceStopAllVoices(device);
+        AudioDeviceRenderFrames(device, frames, TEST_FRAMES);
+        PlatformFree(raw);
+    }
+
     // Выход за пределы пака запрещён именем, а не проверкой пути.
     Expect(AudioClipLoadFrom(device, catalog, L"../step", &status) == NULL,
            "a traversing name must be refused");

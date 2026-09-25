@@ -81,6 +81,24 @@ static int32_t TextCompare(const wchar_t* left, const wchar_t* right)
     return left[index] < right[index] ? -1 : left[index] > right[index] ? 1 : 0;
 }
 
+// Порядок по свёрнутому ASCII-регистру. Две строки сравниваются нулём
+// ровно тогда, когда они равны в смысле TextEqualsAsciiCaseInsensitive:
+// этого достаточно, чтобы искать неоднозначные имена в отсортированном
+// массиве, а не перебором всех пар.
+static int32_t TextCompareAsciiFolded(const wchar_t* left, const wchar_t* right)
+{
+    uint32_t index = 0;
+    while (left[index] != L'\0' && right[index] != L'\0')
+    {
+        wchar_t leftFolded = FoldAsciiCase(left[index]);
+        wchar_t rightFolded = FoldAsciiCase(right[index]);
+        if (leftFolded != rightFolded)
+            return leftFolded < rightFolded ? -1 : 1;
+        ++index;
+    }
+    return left[index] < right[index] ? -1 : left[index] > right[index] ? 1 : 0;
+}
+
 static bool AppendText(wchar_t* destination, uint32_t capacity,
     uint32_t* length, const wchar_t* source)
 {
@@ -458,6 +476,52 @@ bool LaiueContentCatalogGetActivePack(LaiueContentCatalog *catalog, LaiueContent
     return read;
 }
 
+// In-place heapsort с прямым сравнением имён. Insertion sort был O(n^2) по
+// копиям крупных LaiueContentEntry: на каталоге в тысячи записей это
+// доминировало над самим перечислением. Порядок при строгом сравнении тот же,
+// что и раньше, — возрастание кодовых единиц.
+static int32_t CompareEntryNames(const LaiueContentEntry* left, const LaiueContentEntry* right,
+                                 bool folded)
+{
+    return folded ? TextCompareAsciiFolded(left->name, right->name)
+                  : TextCompare(left->name, right->name);
+}
+
+static void SiftEntriesDown(LaiueContentEntry* entries, uint32_t count, uint32_t root,
+                            bool folded)
+{
+    for (;;)
+    {
+        uint32_t child = root * 2U + 1U;
+        if (child >= count)
+            return;
+        if (child + 1U < count &&
+            CompareEntryNames(&entries[child + 1U], &entries[child], folded) > 0)
+            ++child;
+        if (CompareEntryNames(&entries[root], &entries[child], folded) >= 0)
+            return;
+        LaiueContentEntry swap = entries[root];
+        entries[root] = entries[child];
+        entries[child] = swap;
+        root = child;
+    }
+}
+
+static void SortEntriesByName(LaiueContentEntry* entries, uint32_t count, bool folded)
+{
+    if (count < 2U)
+        return;
+    for (uint32_t start = count / 2U; start > 0U; --start)
+        SiftEntriesDown(entries, count, start - 1U, folded);
+    for (uint32_t end = count - 1U; end > 0U; --end)
+    {
+        LaiueContentEntry swap = entries[0];
+        entries[0] = entries[end];
+        entries[end] = swap;
+        SiftEntriesDown(entries, end, 0U, folded);
+    }
+}
+
 bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType type,
                                   LaiueContentList *outList)
 {
@@ -572,32 +636,25 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
     PlatformFree(iterator);
     PlatformFree(directoryPath);
 
-    for (uint32_t i = 1; i < index; ++i)
-    {
-        LaiueContentEntry value = entries[i];
-        uint32_t position = i;
-        while (position > 0U && TextCompare(value.name, entries[position - 1U].name) < 0)
-        {
-            entries[position] = entries[position - 1U];
-            --position;
-        }
-        entries[position] = value;
-    }
-
     // A content tree must resolve identically on case-sensitive and
     // case-insensitive filesystems.  Reject the entire ambiguous view instead
     // of selecting a platform-dependent winner.
-    for (uint32_t left = 0; left < index; ++left)
+    //
+    // Неоднозначные имена соседствуют в порядке по свёрнутому регистру,
+    // поэтому проверка идёт за один проход, а не перебором всех пар.
+    if (index > 1U)
     {
-        for (uint32_t right = left + 1U; right < index; ++right)
+        SortEntriesByName(entries, index, true);
+        for (uint32_t i = 1U; i < index; ++i)
         {
-            if (TextEqualsAsciiCaseInsensitive(entries[left].name, entries[right].name))
+            if (TextCompareAsciiFolded(entries[i - 1U].name, entries[i].name) == 0)
             {
                 PlatformFree(entries);
                 PlatformRwLockReleaseShared(&catalog->lock);
                 return false;
             }
         }
+        SortEntriesByName(entries, index, false);
     }
     outList->entries = entries;
     outList->count = index;

@@ -678,11 +678,15 @@ static LaiueModStatus FinishPackInspection(LaiueModPackInfo *info, LaiueModDiagn
     return status;
 }
 
-static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar_t *packName,
-                                       LaiueModPackInfo *outInfo, LaiueModDiagnostic *diagnostic)
+static LaiueModStatus InspectPackEntryBuffered(const wchar_t *rootDirectory,
+                                               const wchar_t *packName, LaiueModPackInfo *outInfo,
+                                               LaiueModDiagnostic *diagnostic,
+                                               PackInspectionScratch *scratch,
+                                               uint8_t **manifestBytes, uint32_t *manifestCapacity)
 {
     LaiueModDiagnosticClear(diagnostic);
-    if (rootDirectory == NULL || rootDirectory[0] == L'\0' || outInfo == NULL)
+    if (rootDirectory == NULL || rootDirectory[0] == L'\0' || outInfo == NULL || scratch == NULL ||
+        manifestBytes == NULL || manifestCapacity == NULL)
     {
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_INVALID_ARGUMENT, 0,
                                      "pack root and output are required");
@@ -694,19 +698,11 @@ static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_UNSAFE_PACK_NAME,
                                     "pack name must be one safe leaf ending in .lmp");
     }
-
-    PackInspectionScratch *scratch = PlatformAllocate(sizeof(*scratch), false);
-    if (scratch == NULL)
-    {
-        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY,
-                                    "could not allocate pack inspection scratch memory");
-    }
     if (!LaiueModPathJoin(scratch->packPath, LAIUE_PLATFORM_PATH_CAPACITY, rootDirectory, packName,
                           NULL) ||
         !LaiueModPathJoin(scratch->manifestPath, LAIUE_PLATFORM_PATH_CAPACITY, rootDirectory,
                           packName, LAIUE_MOD_MANIFEST_FILE_NAME))
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_UNSAFE_PACK_NAME,
                                     "pack path exceeds the platform limit");
     }
@@ -714,57 +710,70 @@ static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar
     PlatformPathInformation information;
     if (!PlatformGetPathInformation(scratch->packPath, &information) || !information.exists)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_PACK_NOT_FOUND,
                                     "pack directory does not exist");
     }
     if (information.isSymbolicLink)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_PACK_IS_SYMBOLIC_LINK,
                                     "symbolic-link and reparse-point packs are rejected");
     }
     if (!information.isDirectory)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_PACK_NOT_DIRECTORY,
                                     "pack path is not a directory");
     }
-    if (!PlatformGetPathInformation(scratch->manifestPath, &information) || !information.exists)
+    // PlatformReadFilePrefix already validates existence, file type, reparse
+    // points and the 64 KiB ceiling, so the common path needs no separate
+    // metadata stat: only a rejected read is classified with one stat, which
+    // keeps the exact diagnostic. One reusable maximum-sized buffer is read
+    // in a single pass for every pack, so a large manifest never costs a
+    // second open. The read opens the final component with
+    // FILE_FLAG_OPEN_REPARSE_POINT, so a manifest symlink is still rejected.
+    if (*manifestCapacity < LAIUE_MOD_MANIFEST_MAX_BYTES)
     {
-        PlatformFree(scratch);
-        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_NOT_FOUND,
-                                    "pack has no mod.lm manifest");
+        void *grown = PlatformReallocate(*manifestBytes, LAIUE_MOD_MANIFEST_MAX_BYTES, false);
+        if (grown == NULL)
+        {
+            return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY,
+                                        "could not allocate the manifest read buffer");
+        }
+        *manifestBytes = grown;
+        *manifestCapacity = LAIUE_MOD_MANIFEST_MAX_BYTES;
     }
-    if (information.isDirectory || information.isSymbolicLink)
+    uint32_t bytesRead = 0u;
+    uint64_t fileSize = 0u;
+    if (!PlatformReadFilePrefix(scratch->manifestPath, LAIUE_MOD_MANIFEST_MAX_BYTES, *manifestBytes,
+                                *manifestCapacity, &bytesRead, &fileSize))
     {
-        PlatformFree(scratch);
-        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_INVALID,
-                                    "mod.lm must be a regular non-symbolic-link file");
-    }
-    if (information.size == 0u || information.size > LAIUE_MOD_MANIFEST_MAX_BYTES)
-    {
-        PlatformFree(scratch);
-        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_TOO_LARGE,
-                                    "mod.lm must contain 1 to 65536 bytes");
-    }
-
-    uint8_t *bytes = NULL;
-    uint64_t byteCount = 0;
-    if (!PlatformReadEntireFile(scratch->manifestPath, LAIUE_MOD_MANIFEST_MAX_BYTES, &bytes,
-                                &byteCount))
-    {
-        PlatformFree(scratch);
+        if (!PlatformGetPathInformation(scratch->manifestPath, &information) || !information.exists)
+        {
+            return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_NOT_FOUND,
+                                        "pack has no mod.lm manifest");
+        }
+        if (information.isDirectory || information.isSymbolicLink)
+        {
+            return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_INVALID,
+                                        "mod.lm must be a regular non-symbolic-link file");
+        }
+        if (information.size == 0u || information.size > LAIUE_MOD_MANIFEST_MAX_BYTES)
+        {
+            return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_TOO_LARGE,
+                                        "mod.lm must contain 1 to 65536 bytes");
+        }
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_NOT_FOUND,
                                     "mod.lm could not be read safely");
     }
+    if (fileSize == 0u)
+    {
+        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_MANIFEST_TOO_LARGE,
+                                    "mod.lm must contain 1 to 65536 bytes");
+    }
     LaiueModDiagnostic parseDiagnostic;
-    LaiueModStatus status =
-        LaiueModManifestParse(bytes, (size_t)byteCount, &outInfo->manifest, &parseDiagnostic);
-    PlatformFree(bytes);
+    LaiueModStatus status = LaiueModManifestParse(*manifestBytes, (size_t)bytesRead,
+                                                  &outInfo->manifest, &parseDiagnostic);
     if (status != LAIUE_MOD_STATUS_OK)
     {
-        PlatformFree(scratch);
         outInfo->status = status;
         outInfo->diagnostic = parseDiagnostic;
         if (diagnostic != NULL)
@@ -779,7 +788,6 @@ static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar
                                                LAIUE_MOD_NATIVE_NAME_CAPACITY, &selectDiagnostic);
     if (status != LAIUE_MOD_STATUS_OK)
     {
-        PlatformFree(scratch);
         outInfo->status = status;
         outInfo->diagnostic = selectDiagnostic;
         if (diagnostic != NULL)
@@ -792,19 +800,16 @@ static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar
     if (!LaiueModPathJoin(scratch->nativePath, LAIUE_PLATFORM_PATH_CAPACITY, rootDirectory,
                           packName, scratch->nativeName))
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_NATIVE_ARTIFACT_INVALID,
                                     "native artifact path exceeds the platform limit");
     }
     if (!PlatformGetPathInformation(scratch->nativePath, &information) || !information.exists)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_NATIVE_ARTIFACT_NOT_FOUND,
                                     "current-platform native artifact does not exist");
     }
     if (information.isSymbolicLink)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(
             outInfo, diagnostic, LAIUE_MOD_STATUS_NATIVE_ARTIFACT_IS_SYMBOLIC_LINK,
             "symbolic-link and reparse-point native artifacts are rejected");
@@ -812,16 +817,39 @@ static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar
     if (information.isDirectory || information.size == 0u ||
         information.size > LAIUE_MOD_NATIVE_MAX_BYTES)
     {
-        PlatformFree(scratch);
         return FinishPackInspection(
             outInfo, diagnostic, LAIUE_MOD_STATUS_NATIVE_ARTIFACT_INVALID,
             "native artifact must be a regular file no larger than 256 MiB");
     }
 
-    PlatformFree(scratch);
     outInfo->status = LAIUE_MOD_STATUS_OK;
     LaiueModDiagnosticClear(&outInfo->diagnostic);
     return LAIUE_MOD_STATUS_OK;
+}
+
+// Allocating wrapper for callers that inspect a single pack. Enumeration
+// reuses the same scratch and manifest buffer for every entry instead.
+static LaiueModStatus InspectPackEntry(const wchar_t *rootDirectory, const wchar_t *packName,
+                                       LaiueModPackInfo *outInfo, LaiueModDiagnostic *diagnostic)
+{
+    if (outInfo == NULL)
+    {
+        return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_INVALID_ARGUMENT, 0,
+                                     "pack root and output are required");
+    }
+    PackInspectionScratch *scratch = PlatformAllocate(sizeof(*scratch), false);
+    if (scratch == NULL)
+    {
+        return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY,
+                                    "could not allocate pack inspection scratch memory");
+    }
+    uint8_t *manifestBytes = NULL;
+    uint32_t manifestCapacity = 0u;
+    LaiueModStatus status = InspectPackEntryBuffered(rootDirectory, packName, outInfo, diagnostic,
+                                                     scratch, &manifestBytes, &manifestCapacity);
+    PlatformFree(manifestBytes);
+    PlatformFree(scratch);
+    return status;
 }
 
 static int ComparePackNames(const wchar_t *first, const wchar_t *second)
@@ -1012,8 +1040,10 @@ LaiueModStatus LaiueModPackEnumerate(const wchar_t *rootDirectory, LaiueModPackL
 
     PlatformDirectoryIterator *iterator = PlatformAllocate(sizeof(*iterator), false);
     PlatformDirectoryEntry *entry = PlatformAllocate(sizeof(*entry), false);
-    if (iterator == NULL || entry == NULL)
+    PackInspectionScratch *inspectionScratch = PlatformAllocate(sizeof(*inspectionScratch), false);
+    if (iterator == NULL || entry == NULL || inspectionScratch == NULL)
     {
+        PlatformFree(inspectionScratch);
         PlatformFree(entry);
         PlatformFree(iterator);
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY, 0,
@@ -1021,11 +1051,14 @@ LaiueModStatus LaiueModPackEnumerate(const wchar_t *rootDirectory, LaiueModPackL
     }
     if (!PlatformDirectoryOpen(iterator, rootDirectory))
     {
+        PlatformFree(inspectionScratch);
         PlatformFree(entry);
         PlatformFree(iterator);
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_PACK_NOT_FOUND, 0,
                                      "pack root directory could not be enumerated");
     }
+    uint8_t *manifestBytes = NULL;
+    uint32_t manifestCapacity = 0u;
 
     uint32_t capacity = 0;
     LaiueModStatus status = LAIUE_MOD_STATUS_OK;
@@ -1075,9 +1108,12 @@ LaiueModStatus LaiueModPackEnumerate(const wchar_t *rootDirectory, LaiueModPackL
             capacity = nextCapacity;
         }
         LaiueModPackInfo *pack = &outList->entries[outList->count++];
-        InspectPackEntry(rootDirectory, entry->name, pack, NULL);
+        InspectPackEntryBuffered(rootDirectory, entry->name, pack, NULL, inspectionScratch,
+                                 &manifestBytes, &manifestCapacity);
     }
     PlatformDirectoryClose(iterator);
+    PlatformFree(manifestBytes);
+    PlatformFree(inspectionScratch);
     PlatformFree(entry);
     PlatformFree(iterator);
 

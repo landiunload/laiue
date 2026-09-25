@@ -321,6 +321,29 @@ static bool ComputeBlockRange(const VoxelBodyBounds *bounds, const VoxelBodyShap
     return true;
 }
 
+// Диапазон по двум осям, не считая ось движения. В свипе по плоскостям
+// координата оси движения подменяется номером плоскости, поэтому её перевод
+// в int64 всё равно был бы выброшен. Неподвижные оси считаются один раз.
+static bool ComputeBlockRangeExceptAxis(const VoxelBodyBounds *bounds,
+                                        const VoxelBodyShape *shape, int32_t excludedAxis,
+                                        int64_t minimumBlock[3], int64_t maximumBlock[3])
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        if (axis == excludedAxis)
+        {
+            continue;
+        }
+        if (!TryFloorToInt64(bounds->minimum[axis] + shape->collisionEpsilon,
+                             &minimumBlock[axis]) ||
+            !TryFloorToInt64(bounds->maximum[axis] - shape->collisionEpsilon, &maximumBlock[axis]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ScanSolidBlocks(const VoxelCollisionSource *collision, const int64_t minimumBlock[3],
                             const int64_t maximumBlock[3])
 {
@@ -420,7 +443,7 @@ static bool MoveAxisAgainstBlocksBounded(const VoxelCollisionSource *collision, 
         {
             int64_t minimumBlock[3];
             int64_t maximumBlock[3];
-            if (!ComputeBlockRange(newBounds, shape, minimumBlock, maximumBlock))
+            if (!ComputeBlockRangeExceptAxis(newBounds, shape, axis, minimumBlock, maximumBlock))
             {
                 position[axis] = (double)firstPlane - positiveExtent - epsilon;
                 return true;
@@ -452,7 +475,7 @@ static bool MoveAxisAgainstBlocksBounded(const VoxelCollisionSource *collision, 
         {
             int64_t minimumBlock[3];
             int64_t maximumBlock[3];
-            if (!ComputeBlockRange(newBounds, shape, minimumBlock, maximumBlock))
+            if (!ComputeBlockRangeExceptAxis(newBounds, shape, axis, minimumBlock, maximumBlock))
             {
                 position[axis] = (double)firstPlane + 1.0 + negativeExtent + epsilon;
                 return true;
@@ -541,7 +564,9 @@ bool VoxelBodyMoveAxis(const VoxelCollisionSource *collision, double position[3]
     double requestedPosition[3] = {position[0], position[1], position[2]};
     requestedPosition[axis] += distance;
     VoxelBodyBounds requestedBounds;
-    if (!CalculateValidBodyBounds(requestedPosition, shape, &requestedBounds))
+    // Форма уже проверена первым CalculateValidBodyBounds: на второй позиции
+    // повторная её валидация не меняет результат.
+    if (!CalculateValidBodyBoundsForShape(requestedPosition, shape, &requestedBounds))
     {
         return true;
     }
@@ -845,18 +870,84 @@ bool VoxelBodyHasStableGround(const VoxelCollisionSource *collision, const doubl
     }
     const double offsets[3] = {-supportRadius, 0.0, supportRadius};
 
-    for (uint32_t yIndex = 0; yIndex < 3u; ++yIndex)
+    // Быстрая проба первой точки: при обычной опоре под ногами она уже
+    // сплошная, и полный разбор различных столбцов не нужен. Инвариант тот же,
+    // что и первая итерация прежнего обхода.
+    int64_t firstX;
+    int64_t firstY;
+    if (!TryFloorToInt64(position[0] + offsets[0], &firstX) ||
+        !TryFloorToInt64(position[1] + offsets[0], &firstY))
     {
-        for (uint32_t xIndex = 0; xIndex < 3u; ++xIndex)
+        return true;
+    }
+    if (IsSolidBlock(collision, firstX, firstY, supportZ))
+    {
+        return true;
+    }
+
+    // Три точки на ось часто попадают в один и тот же блок. Целые координаты
+    // считаются один раз, а обход идёт только по различным столбцам, чтобы не
+    // переспрашивать один блок до девяти раз.
+    int64_t blockX[3];
+    uint32_t blockXCount = 0u;
+    blockX[blockXCount++] = firstX;
+    for (uint32_t xIndex = 1u; xIndex < 3u; ++xIndex)
+    {
+        int64_t x;
+        if (!TryFloorToInt64(position[0] + offsets[xIndex], &x))
         {
-            int64_t x;
-            int64_t y;
-            if (!TryFloorToInt64(position[0] + offsets[xIndex], &x) ||
-                !TryFloorToInt64(position[1] + offsets[yIndex], &y))
+            return true;
+        }
+        bool duplicate = false;
+        for (uint32_t previous = 0u; previous < blockXCount; ++previous)
+        {
+            if (blockX[previous] == x)
             {
-                return true;
+                duplicate = true;
+                break;
             }
-            if (IsSolidBlock(collision, x, y, supportZ))
+        }
+        if (!duplicate)
+        {
+            blockX[blockXCount++] = x;
+        }
+    }
+    int64_t blockY[3];
+    uint32_t blockYCount = 0u;
+    blockY[blockYCount++] = firstY;
+    for (uint32_t yIndex = 1u; yIndex < 3u; ++yIndex)
+    {
+        int64_t y;
+        if (!TryFloorToInt64(position[1] + offsets[yIndex], &y))
+        {
+            return true;
+        }
+        bool duplicate = false;
+        for (uint32_t previous = 0u; previous < blockYCount; ++previous)
+        {
+            if (blockY[previous] == y)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+        {
+            blockY[blockYCount++] = y;
+        }
+    }
+
+    for (uint32_t yIndex = 0u; yIndex < blockYCount; ++yIndex)
+    {
+        for (uint32_t xIndex = 0u; xIndex < blockXCount; ++xIndex)
+        {
+            // Центр уже проверен выше; после неудачной быстрой проверки
+            // повторный запрос того же столбца не может добавить опору.
+            if (yIndex == 0u && xIndex == 0u)
+            {
+                continue;
+            }
+            if (IsSolidBlock(collision, blockX[xIndex], blockY[yIndex], supportZ))
             {
                 return true;
             }
@@ -941,7 +1032,8 @@ bool VoxelBodyOverlapsBlock(const double position[3], const VoxelBodyShape *shap
 
 static bool HasSupportBelowOffset(const VoxelCollisionSource *collision, const double position[3],
                                   const VoxelBodyShape *shape, double probeDepth, double xOffset,
-                                  double yOffset, const DynamicColliderBatch *dynamicColliders)
+                                  double yOffset, int64_t minimumZ, int64_t maximumZ,
+                                  const DynamicColliderBatch *dynamicColliders)
 {
     if (probeDepth <= 0.0)
     {
@@ -953,8 +1045,11 @@ static bool HasSupportBelowOffset(const VoxelCollisionSource *collision, const d
         position[1] + yOffset,
         position[2],
     };
+    // Форма уже проверена вызывающим VoxelBodyClipSneakingMovement, а диапазон
+    // по z не зависит от горизонтального сдвига: и то, и другое считается один
+    // раз на всю операцию, а не на каждый пробный сдвиг.
     VoxelBodyBounds bounds;
-    if (!CalculateValidBodyBounds(shiftedPosition, shape, &bounds))
+    if (!CalculateValidBodyBoundsForShape(shiftedPosition, shape, &bounds))
     {
         return false;
     }
@@ -964,14 +1059,10 @@ static bool HasSupportBelowOffset(const VoxelCollisionSource *collision, const d
     int64_t maximumX;
     int64_t minimumY;
     int64_t maximumY;
-    int64_t minimumZ;
-    int64_t maximumZ;
     if (!TryFloorToInt64(bounds.minimum[0] + epsilon, &minimumX) ||
         !TryFloorToInt64(bounds.maximum[0] - epsilon, &maximumX) ||
         !TryFloorToInt64(bounds.minimum[1] + epsilon, &minimumY) ||
-        !TryFloorToInt64(bounds.maximum[1] - epsilon, &maximumY) ||
-        !TryFloorToInt64(bounds.minimum[2] - probeDepth + epsilon, &minimumZ) ||
-        !TryFloorToInt64(bounds.minimum[2] - epsilon, &maximumZ))
+        !TryFloorToInt64(bounds.maximum[1] - epsilon, &maximumY))
     {
         return false;
     }
@@ -1081,8 +1172,23 @@ void VoxelBodyClipSneakingMovement(const VoxelCollisionSource *collision, const 
         dynamicColliderView = &dynamicColliders;
     }
 
+    // Диапазон блоков по z у всех пробных сдвигов одинаков: он зависит только
+    // от высоты стоп и глубины пробы. Считается один раз на операцию.
+    if (probeDepth <= 0.0)
+    {
+        return;
+    }
+    double epsilon = shape->collisionEpsilon;
+    int64_t minimumZ;
+    int64_t maximumZ;
+    if (!TryFloorToInt64(currentBounds.minimum[2] - probeDepth + epsilon, &minimumZ) ||
+        !TryFloorToInt64(currentBounds.minimum[2] - epsilon, &maximumZ))
+    {
+        return;
+    }
+
     // Уже падающее или вытолкнутое тело не приклеивается обратно к краю.
-    if (!HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, 0.0,
+    if (!HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, 0.0, minimumZ, maximumZ,
                                dynamicColliderView))
     {
         return;
@@ -1094,21 +1200,23 @@ void VoxelBodyClipSneakingMovement(const VoxelCollisionSource *collision, const 
     double x = *xDistance;
     double y = *yDistance;
 
-    while (x != 0.0 && !HasSupportBelowOffset(collision, position, shape, probeDepth, x, 0.0,
-                                              dynamicColliderView))
+    while (x != 0.0 &&
+           !HasSupportBelowOffset(collision, position, shape, probeDepth, x, 0.0, minimumZ,
+                                  maximumZ, dynamicColliderView))
     {
         x = ReduceSneakDistance(x, reductionStep);
     }
 
-    while (y != 0.0 && !HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, y,
-                                              dynamicColliderView))
+    while (y != 0.0 &&
+           !HasSupportBelowOffset(collision, position, shape, probeDepth, 0.0, y, minimumZ,
+                                  maximumZ, dynamicColliderView))
     {
         y = ReduceSneakDistance(y, reductionStep);
     }
 
-    while (
-        x != 0.0 && y != 0.0 &&
-        !HasSupportBelowOffset(collision, position, shape, probeDepth, x, y, dynamicColliderView))
+    while (x != 0.0 && y != 0.0 &&
+           !HasSupportBelowOffset(collision, position, shape, probeDepth, x, y, minimumZ, maximumZ,
+                                  dynamicColliderView))
     {
         x = ReduceSneakDistance(x, reductionStep);
         y = ReduceSneakDistance(y, reductionStep);

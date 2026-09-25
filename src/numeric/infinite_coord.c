@@ -183,52 +183,6 @@ static void InfiniteCoordSubtractMagnitudeSmall(InfiniteCoord* value, uint64_t m
     InfiniteCoordNormalize(value);
 }
 
-// Ноль, переносы из старшего лимба, многолимбовые величины и точное
-// погашение. Медленная часть вынесена в отдельную noinline-функцию, чтобы
-// однолимбовый беспереносный случай горячего входа не сохранял регистры и не
-// обращался к куче: физика зовёт его девять раз на тело за шаг.
-#if defined(_MSC_VER) && !defined(__clang__)
-__declspec(noinline)
-#else
-__attribute__((noinline))
-#endif
-static bool InfiniteCoordTryAddInt64InPlaceWide(
-    InfiniteCoord* value, int32_t addSign, uint64_t magnitude)
-{
-    if (value->sign == 0)
-    {
-        if (!InfiniteCoordTryAddMagnitudeSmall(value, magnitude))
-        {
-            return false;
-        }
-        value->sign = addSign;
-        return true;
-    }
-
-    if (value->sign == addSign)
-    {
-        return InfiniteCoordTryAddMagnitudeSmall(value, magnitude);
-    }
-
-    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(value, magnitude);
-    if (comparison == 0)
-    {
-        InfiniteCoordDestroy(value);
-        return true;
-    }
-    if (comparison > 0)
-    {
-        InfiniteCoordSubtractMagnitudeSmall(value, magnitude);
-        return true;
-    }
-
-    uint64_t current = value->limbCount == 0 ? 0 : value->limbs[0];
-    value->limbs[0] = magnitude - current;
-    value->limbCount = 1;
-    value->sign = addSign;
-    return true;
-}
-
 bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
 {
     if (value == NULL)
@@ -297,7 +251,16 @@ bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
         return InfiniteCoordTryAddMagnitudeSmall(value, magnitude);
     }
 
-    return InfiniteCoordTryAddInt64InPlaceWide(value, addSign, magnitude);
+    // Сюда попадает только каноническое значение с противоположным знаком,
+    // которое не разобрал однолимбовый путь. Канонический ноль лимбов не
+    // имеет и обработан раньше, значит у значения не меньше двух лимбов, а
+    // его модуль (2^64 и больше) заведомо перевешивает любую добавку int64
+    // (не больше 2^63). Точное погашение и смена знака возможны только в
+    // однолимбовом случае, который выше и разобран, поэтому сравнение
+    // модулей здесь не нужно: остаётся чистое вычитание меньшего из
+    // большего, а знак результата не меняется.
+    InfiniteCoordSubtractMagnitudeSmall(value, magnitude);
+    return true;
 }
 
 static void SignedDifference(int64_t left, int64_t right,

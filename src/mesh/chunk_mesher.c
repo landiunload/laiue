@@ -88,6 +88,13 @@ struct ChunkMesherScratch
     // только потом идёт слияние: иначе не узнать точный размер выдачи до того,
     // как её начали писать.
     uint64_t* planes;
+    // Для каждой из шести плоскостей — признак непустоты каждого слова:
+    // слово — срез, бит — ряд. Слово плоскости, в котором нет ни одной грани,
+    // greedy-проходу делать нечего, а ряды без граней всё равно остаются
+    // нулевыми после общей очистки. Маска позволяет перепрыгнуть такие
+    // участки вместо того, чтобы перебрать все 64×64 слов каждой грани.
+    // Расположение: [face * CHUNK_SIZE + slice], бит — номер ряда.
+    uint64_t* sliceRows;
 };
 
 ChunkMesherScratch* ChunkMesherScratchCreate(void)
@@ -101,8 +108,10 @@ ChunkMesherScratch* ChunkMesherScratchCreate(void)
     scratch->blocks = PlatformAllocate((size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE, false);
     scratch->columns = PlatformAllocate(COLUMN_WORDS * 3 * sizeof(uint64_t), false);
     scratch->planes = PlatformAllocate(COLUMN_WORDS * FACE_COUNT * sizeof(uint64_t), false);
+    scratch->sliceRows = PlatformAllocate(FACE_COUNT * CHUNK_SIZE * sizeof(uint64_t), false);
 
-    if (scratch->blocks == NULL || scratch->columns == NULL || scratch->planes == NULL)
+    if (scratch->blocks == NULL || scratch->columns == NULL || scratch->planes == NULL
+        || scratch->sliceRows == NULL)
     {
         ChunkMesherScratchDestroy(scratch);
         return NULL;
@@ -121,6 +130,7 @@ void ChunkMesherScratchDestroy(ChunkMesherScratch* scratch)
     if (scratch->blocks != NULL) PlatformFree(scratch->blocks);
     if (scratch->columns != NULL) PlatformFree(scratch->columns);
     if (scratch->planes != NULL) PlatformFree(scratch->planes);
+    if (scratch->sliceRows != NULL) PlatformFree(scratch->sliceRows);
     PlatformFree(scratch);
 }
 
@@ -303,12 +313,19 @@ static inline uint32_t MaterialRun(const BlockType* row, uint32_t start, uint32_
 }
 
 static bool GreedyMeshPlanes(QuadBuffer* buffer, uint32_t face,
-    uint64_t* planes, const BlockType* blocks)
+    uint64_t* planes, const uint64_t* sliceRows, const BlockType* blocks)
 {
     const FaceLayout layout = FaceLayoutFor(face, blocks);
 
     for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
     {
+        // Срез без единой грани пропускается целиком: раньше пустой ряд
+        // всё равно стоил чтения слова из плоскости и проверки на ноль.
+        if (sliceRows[slice] == 0)
+        {
+            continue;
+        }
+
         uint64_t* rows = &planes[(size_t)slice * CHUNK_SIZE];
         const BlockType* sliceBase = layout.base + (size_t)slice * layout.sliceStride;
 
@@ -727,6 +744,8 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     {
         uint32_t anyPositive = 0;
         uint32_t anyNegative = 0;
+        uint64_t spanPositive = 0;
+        uint64_t spanNegative = 0;
         for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
             uint64_t column = columnsZ[y * CHUNK_SIZE + x];
@@ -742,17 +761,26 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             negative[x] = column & ~((column << 1) | neighborBelow);
             anyPositive += PopCount64(positive[x]);
             anyNegative += PopCount64(negative[x]);
+            spanPositive |= positive[x];
+            spanNegative |= negative[x];
         }
+        // Бит среза в этом ряду для маски непустых слов плоскости.
+        scratch->sliceRows[(size_t)FACE_POSITIVE_Z * CHUNK_SIZE + y] = spanPositive;
+        scratch->sliceRows[(size_t)FACE_NEGATIVE_Z * CHUNK_SIZE + y] = spanNegative;
         faceCount += anyPositive + anyNegative;
         EmitPlaneRow(planes[FACE_POSITIVE_Z], y, positive, anyPositive);
         EmitPlaneRow(planes[FACE_NEGATIVE_Z], y, negative, anyNegative);
     }
+    TransposeBits64(&scratch->sliceRows[FACE_POSITIVE_Z * CHUNK_SIZE]);
+    TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_Z * CHUNK_SIZE]);
 
     // === Грани ±X ===
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
         uint32_t anyPositive = 0;
         uint32_t anyNegative = 0;
+        uint64_t spanPositive = 0;
+        uint64_t spanNegative = 0;
         for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
             uint64_t column = columnsX[y * CHUNK_SIZE + z];
@@ -768,17 +796,25 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             negative[z] = column & ~((column << 1) | neighborBelow);
             anyPositive += PopCount64(positive[z]);
             anyNegative += PopCount64(negative[z]);
+            spanPositive |= positive[z];
+            spanNegative |= negative[z];
         }
+        scratch->sliceRows[(size_t)FACE_POSITIVE_X * CHUNK_SIZE + y] = spanPositive;
+        scratch->sliceRows[(size_t)FACE_NEGATIVE_X * CHUNK_SIZE + y] = spanNegative;
         faceCount += anyPositive + anyNegative;
         EmitPlaneRow(planes[FACE_POSITIVE_X], y, positive, anyPositive);
         EmitPlaneRow(planes[FACE_NEGATIVE_X], y, negative, anyNegative);
     }
+    TransposeBits64(&scratch->sliceRows[FACE_POSITIVE_X * CHUNK_SIZE]);
+    TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_X * CHUNK_SIZE]);
 
     // === Грани ±Y (вторая горизонталь, нормаль = Y) ===
     for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
     {
         uint32_t anyPositive = 0;
         uint32_t anyNegative = 0;
+        uint64_t spanPositive = 0;
+        uint64_t spanNegative = 0;
         for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
         {
             uint64_t column = columnsY[x * CHUNK_SIZE + z];
@@ -794,11 +830,17 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
             negative[z] = column & ~((column << 1) | neighborBelow);
             anyPositive += PopCount64(positive[z]);
             anyNegative += PopCount64(negative[z]);
+            spanPositive |= positive[z];
+            spanNegative |= negative[z];
         }
+        scratch->sliceRows[(size_t)FACE_POSITIVE_Y * CHUNK_SIZE + x] = spanPositive;
+        scratch->sliceRows[(size_t)FACE_NEGATIVE_Y * CHUNK_SIZE + x] = spanNegative;
         faceCount += anyPositive + anyNegative;
         EmitPlaneRow(planes[FACE_POSITIVE_Y], x, positive, anyPositive);
         EmitPlaneRow(planes[FACE_NEGATIVE_Y], x, negative, anyNegative);
     }
+    TransposeBits64(&scratch->sliceRows[FACE_POSITIVE_Y * CHUNK_SIZE]);
+    TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_Y * CHUNK_SIZE]);
 
     if (faceCount == 0)
     {
@@ -824,7 +866,8 @@ bool BuildChunkMesh(World* world, ChunkMesherScratch* scratch,
     };
     for (uint32_t index = 0; index < FACE_COUNT; ++index)
     {
-        if (!GreedyMeshPlanes(&quadBuffer, order[index], planes[order[index]], blocks))
+        if (!GreedyMeshPlanes(&quadBuffer, order[index], planes[order[index]],
+                &scratch->sliceRows[(size_t)order[index] * CHUNK_SIZE], blocks))
         {
             PlatformFree(quadBuffer.quads);
             return false;

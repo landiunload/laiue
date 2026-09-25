@@ -206,11 +206,21 @@ static uint32_t ReadBit(JpegReader *reader)
 
 static uint32_t ReadBits(JpegReader *reader, uint32_t count)
 {
-    uint32_t value = 0u;
-    for (uint32_t index = 0; index < count; ++index)
+    if (count == 0u) return 0u;
+    // Чтение сразу нужного числа бит вместо вызова ReadBit на каждый:
+    // байты при этом расходуются ровно так же, как в побитовом цикле,
+    // а после маркера недостающие биты так же считаются нулями.
+    EnsureBits(reader, count);
+    if (reader->bitCount >= count)
     {
-        value = (value << 1) | ReadBit(reader);
+        reader->bitCount -= count;
+        return (reader->bitBuffer >> reader->bitCount) & ((1u << count) - 1u);
     }
+    uint32_t available = reader->bitCount;
+    uint32_t value = available != 0u
+                         ? (reader->bitBuffer & ((1u << available) - 1u)) << (count - available)
+                         : 0u;
+    reader->bitCount = 0u;
     return value;
 }
 

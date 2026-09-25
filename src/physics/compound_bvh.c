@@ -106,6 +106,95 @@ static void CompoundBvhSortRange(const unsigned char *base, size_t stride, uint3
     }
 }
 
+// Медиана трёх по полному порядку компаратора: возвращает индекс среднего
+// значения. Нужна как детерминированная опора разбиения.
+static uint32_t CompoundBvhMedianOfThree(const unsigned char *base, size_t stride,
+                                         const uint32_t *values, uint32_t first, uint32_t middle,
+                                         uint32_t last, int32_t axis)
+{
+    uint32_t firstValue = values[first];
+    uint32_t middleValue = values[middle];
+    uint32_t lastValue = values[last];
+    if (CompoundBvhBefore(base, stride, firstValue, middleValue, axis))
+    {
+        if (CompoundBvhBefore(base, stride, middleValue, lastValue, axis))
+        {
+            return middle;
+        }
+        return CompoundBvhBefore(base, stride, firstValue, lastValue, axis) ? last : first;
+    }
+    if (CompoundBvhBefore(base, stride, firstValue, lastValue, axis))
+    {
+        return first;
+    }
+    return CompoundBvhBefore(base, stride, middleValue, lastValue, axis) ? last : middle;
+}
+
+// Разбиение Хоара (схема Ломуто) вокруг values[pivot]: возвращает индекс, на
+// который встал опорный элемент. Влево попадают строго меньшие, вправо — не
+// меньшие, поэтому диапазон остаётся корректно разделённым.
+static uint32_t CompoundBvhPartition(const unsigned char *base, size_t stride, uint32_t *values,
+                                     uint32_t begin, uint32_t end, uint32_t pivot, int32_t axis)
+{
+    CompoundBvhSwap(&values[pivot], &values[end - 1u]);
+    uint32_t pivotValue = values[end - 1u];
+    uint32_t store = begin;
+    for (uint32_t index = begin; index + 1u < end; ++index)
+    {
+        if (CompoundBvhBefore(base, stride, values[index], pivotValue, axis))
+        {
+            CompoundBvhSwap(&values[store], &values[index]);
+            ++store;
+        }
+    }
+    CompoundBvhSwap(&values[store], &values[end - 1u]);
+    return store;
+}
+
+// Quickselect с медианой трёх: ставит элемент ранга target на место target,
+// оставляя слева меньшие, справа не меньшие. Это дешевле полной сортировки
+// диапазона на каждом уровне рекурсии Build. Глубина ограничена, иначе
+// враждебный порядок центров дал бы квадратичный худший случай; после лимита
+// диапазон честно сортируется heapsort-ом, то есть асимптотика не хуже
+// прежней, а типичная — линейная на уровень.
+static void CompoundBvhSelectRange(const unsigned char *base, size_t stride, uint32_t *values,
+                                   uint32_t begin, uint32_t end, uint32_t target, int32_t axis)
+{
+    uint32_t depthLimit = 0u;
+    for (uint32_t size = end - begin; size > 1u; size >>= 1u)
+    {
+        ++depthLimit;
+    }
+    depthLimit *= 2u;
+
+    uint32_t depth = 0u;
+    while (end - begin > 1u)
+    {
+        if (depth >= depthLimit)
+        {
+            CompoundBvhSortRange(base, stride, values, begin, end, axis);
+            return;
+        }
+        ++depth;
+        uint32_t medianIndex = begin + (end - begin) / 2u;
+        uint32_t pivot =
+            CompoundBvhMedianOfThree(base, stride, values, begin, medianIndex, end - 1u, axis);
+        uint32_t position = CompoundBvhPartition(base, stride, values, begin, end, pivot, axis);
+        if (position == target)
+        {
+            return;
+        }
+        if (target < position)
+        {
+            end = position;
+        }
+        else
+        {
+            begin = position + 1u;
+        }
+    }
+}
+
 // Пост-обход: сначала полностью строится левое поддерево, затем правое,
 // затем их родитель. Поэтому first < second у каждого внутреннего узла, а
 // индекс родителя больше индексов обоих детей. Глубина не больше log2(count).
@@ -155,9 +244,9 @@ static uint32_t CompoundBvhBuildRange(const unsigned char *base, size_t stride,
         }
     }
 
-    CompoundBvhSortRange(base, stride, workspace, begin, end, axis);
-
     uint32_t middle = begin + size / 2u;
+    CompoundBvhSelectRange(base, stride, workspace, begin, end, middle, axis);
+
     uint32_t left = CompoundBvhBuildRange(base, stride, workspace, nodes, begin, middle, next);
     uint32_t right = CompoundBvhBuildRange(base, stride, workspace, nodes, middle, end, next);
     uint32_t index = *next;

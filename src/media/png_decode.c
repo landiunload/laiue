@@ -3,6 +3,7 @@
 #include "media/inflate.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #define PNG_SIGNATURE_BYTES 8u
 #define PNG_MAX_IDAT_CHUNKS 65536u
@@ -353,11 +354,156 @@ typedef struct DecodeContext
     uint32_t transparencySize;
 } DecodeContext;
 
+// Глубина 8 бит — подавляющее большинство файлов. Отдельные циклы на тип
+// цвета убирают из горячего пути переключение по colorType/bitDepth и
+// ReadPackedSample на каждый канал; результат побайтово тот же, что у
+// общего пути ниже.
+static void ExpandRow8Gray(const DecodeContext *context, const uint8_t *row,
+                           uint32_t rowWidth, uint8_t *destination,
+                           uint32_t destinationStride)
+{
+    bool keyed = context->transparencySize >= 2u;
+    uint8_t key = keyed ? context->transparency[1] : 0u;
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        uint8_t *out = destination + (size_t)pixel * destinationStride;
+        uint8_t level = row[pixel];
+        out[0] = level;
+        out[1] = level;
+        out[2] = level;
+        out[3] = keyed && level == key ? 0u : 255u;
+    }
+}
+
+static void ExpandRow8Rgb(const DecodeContext *context, const uint8_t *row, uint32_t rowWidth,
+                          uint8_t *destination, uint32_t destinationStride)
+{
+    bool keyed = context->transparencySize >= 6u;
+    uint8_t keyRed = keyed ? context->transparency[1] : 0u;
+    uint8_t keyGreen = keyed ? context->transparency[3] : 0u;
+    uint8_t keyBlue = keyed ? context->transparency[5] : 0u;
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        uint8_t *out = destination + (size_t)pixel * destinationStride;
+        const uint8_t *source = row + (size_t)pixel * 3u;
+        out[0] = source[0];
+        out[1] = source[1];
+        out[2] = source[2];
+        out[3] = keyed && source[0] == keyRed && source[1] == keyGreen && source[2] == keyBlue
+                     ? 0u
+                     : 255u;
+    }
+}
+
+static void ExpandRow8Palette(const DecodeContext *context, const uint8_t *row,
+                              uint32_t rowWidth, uint8_t *destination,
+                              uint32_t destinationStride)
+{
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        uint8_t *out = destination + (size_t)pixel * destinationStride;
+        uint32_t index = row[pixel];
+        if (index >= context->paletteEntries) index = 0u;
+        out[0] = context->palette[index * 3u];
+        out[1] = context->palette[index * 3u + 1u];
+        out[2] = context->palette[index * 3u + 2u];
+        out[3] = index < context->transparencySize ? context->transparency[index] : 255u;
+    }
+}
+
+static void ExpandRow8GrayAlpha(const DecodeContext *context, const uint8_t *row,
+                                uint32_t rowWidth, uint8_t *destination,
+                                uint32_t destinationStride)
+{
+    (void)context;
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        uint8_t *out = destination + (size_t)pixel * destinationStride;
+        const uint8_t *source = row + (size_t)pixel * 2u;
+        out[0] = source[0];
+        out[1] = source[0];
+        out[2] = source[0];
+        out[3] = source[1];
+    }
+}
+
+static void ExpandRow8Rgba(const DecodeContext *context, const uint8_t *row, uint32_t rowWidth,
+                           uint8_t *destination, uint32_t destinationStride)
+{
+    (void)context;
+    if (destinationStride == 4u)
+    {
+        memcpy(destination, row, (size_t)rowWidth * 4u);
+        return;
+    }
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        memcpy(destination + (size_t)pixel * destinationStride, row + (size_t)pixel * 4u, 4u);
+    }
+}
+
+// Палитра с упакованными отсчётами 1/2/4 бита: позиция бита ведётся
+// счётчиком, поэтому на пиксель нет ни деления, ни переключения по
+// глубине, которые есть у общего ReadPackedSample.
+static void ExpandRowPackedPalette(const DecodeContext *context, const uint8_t *row,
+                                   uint32_t rowWidth, uint8_t *destination,
+                                   uint32_t destinationStride, uint32_t depth)
+{
+    uint32_t perByte = 8u / depth;
+    uint32_t mask = (1u << depth) - 1u;
+    uint32_t sourceIndex = 0u;
+    uint32_t shift = (perByte - 1u) * depth;
+    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    {
+        uint8_t *out = destination + (size_t)pixel * destinationStride;
+        uint32_t index = (row[sourceIndex] >> shift) & mask;
+        if (shift == 0u)
+        {
+            shift = (perByte - 1u) * depth;
+            ++sourceIndex;
+        }
+        else
+        {
+            shift -= depth;
+        }
+        if (index >= context->paletteEntries) index = 0u;
+        out[0] = context->palette[index * 3u];
+        out[1] = context->palette[index * 3u + 1u];
+        out[2] = context->palette[index * 3u + 2u];
+        out[3] = index < context->transparencySize ? context->transparency[index] : 255u;
+    }
+}
+
 static void ExpandRow(const DecodeContext *context, const uint8_t *row, uint32_t rowWidth,
                       uint8_t *destination, uint32_t destinationStride)
 {
     const PngHeader *header = context->header;
     uint32_t depth = header->bitDepth;
+
+    if (header->colorType == 3u && depth < 8u)
+    {
+        ExpandRowPackedPalette(context, row, rowWidth, destination, destinationStride, depth);
+        return;
+    }
+
+    if (depth == 8u)
+    {
+        switch (header->colorType)
+        {
+        case 0u: ExpandRow8Gray(context, row, rowWidth, destination, destinationStride); return;
+        case 2u: ExpandRow8Rgb(context, row, rowWidth, destination, destinationStride); return;
+        case 3u:
+            ExpandRow8Palette(context, row, rowWidth, destination, destinationStride);
+            return;
+        case 4u:
+            ExpandRow8GrayAlpha(context, row, rowWidth, destination, destinationStride);
+            return;
+        default:
+            ExpandRow8Rgba(context, row, rowWidth, destination, destinationStride);
+            return;
+        }
+    }
+
     // Глубина 16 бит приводится к 8 старшим битам: LTP хранит RGBA8, а
     // младший байт всё равно потерялся бы при записи.
     uint32_t shift = depth == 16u ? 8u : 0u;

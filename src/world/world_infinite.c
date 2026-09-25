@@ -745,6 +745,62 @@ typedef struct WorldBatchChunk
     bool newKeyReady;
 } WorldBatchChunk;
 
+/* Слот открытой таблицы пакета. value == 0 — слот пуст, иначе хранит
+ * значение 1..(число записей). Ключ — тройка int64: для таблицы дублей это
+ * координата блока, для таблицы чанков — координата чанка. */
+typedef struct WorldBatchProbe
+{
+    int64_t x;
+    int64_t y;
+    int64_t z;
+    uint32_t value;
+} WorldBatchProbe;
+
+static uint64_t WorldBatchHash3(int64_t x, int64_t y, int64_t z)
+{
+    uint64_t hash = (uint64_t)x * UINT64_C(0x9E3779B97F4A7C15);
+    hash ^= (uint64_t)y * UINT64_C(0xC2B2AE3D27D4EB4F);
+    hash ^= (uint64_t)z * UINT64_C(0x165667B19E3779F9);
+    hash ^= hash >> 29U;
+    hash *= UINT64_C(0xBF58476D1CE4E5B9);
+    hash ^= hash >> 32U;
+    return hash;
+}
+
+/* Ищет точный ключ; при первом вхождении вставляет его со значением value и
+ * возвращает false. Нагрузка не выше половины, поэтому пустой слот всегда
+ * найдётся и цикл завершается. */
+static bool WorldBatchProbeFindOrInsert(
+    WorldBatchProbe* table, uint32_t mask, uint64_t hash,
+    int64_t x, int64_t y, int64_t z, uint32_t value, uint32_t* outValue)
+{
+    uint32_t slot = (uint32_t)hash & mask;
+    for (;;)
+    {
+        WorldBatchProbe* entry = &table[slot];
+        if (entry->value == 0U)
+        {
+            entry->x = x;
+            entry->y = y;
+            entry->z = z;
+            entry->value = value;
+            *outValue = 0U;
+            return false;
+        }
+        if (entry->x == x && entry->y == y && entry->z == z)
+        {
+            *outValue = entry->value;
+            return true;
+        }
+        slot = (slot + 1U) & mask;
+    }
+}
+
+/* Порог, с которого пакет обслуживается хеш-таблицами. Ниже него прежний
+ * линейный поиск дешевле: пара таблиц на несколько мутаций стоит дороже
+ * самого пакета. */
+#define WORLD_BATCH_HASH_MIN 64U
+
 static bool LocalChunkCoordinateEqual(
     LocalChunkCoordinate left, LocalChunkCoordinate right)
 {
@@ -806,16 +862,32 @@ bool WorldApplyBlockBatch(World* world,
     {
         return true;
     }
-    for (uint32_t index = 0; index < count; ++index)
+
+    /* Мелкий пакет выгоднее обслужить прежним линейным поиском: пара
+     * хеш-таблиц на восемь мутаций стоит дороже самого пакета. Хеширование
+     * включается там, где квадрат уже заметен. */
+    const bool hashed = count >= WORLD_BATCH_HASH_MIN;
+    uint32_t tableCapacity = 0U;
+    uint32_t tableMask = 0U;
+    WorldBatchProbe* duplicates = NULL;
+    WorldBatchProbe* groups = NULL;
+    if (hashed)
     {
-        for (uint32_t previous = 0; previous < index; ++previous)
+        tableCapacity = 1U;
+        while (tableCapacity < count * 2U)
         {
-            if (mutations[index].block[0] == mutations[previous].block[0]
-                && mutations[index].block[1] == mutations[previous].block[1]
-                && mutations[index].block[2] == mutations[previous].block[2])
-            {
-                return false;
-            }
+            tableCapacity <<= 1U;
+        }
+        tableMask = tableCapacity - 1U;
+        duplicates = PlatformAllocate(
+            (size_t)tableCapacity * sizeof(*duplicates), true);
+        groups = PlatformAllocate(
+            (size_t)tableCapacity * sizeof(*groups), true);
+        if (duplicates == NULL || groups == NULL)
+        {
+            PlatformFree(duplicates);
+            PlatformFree(groups);
+            return false;
         }
     }
 
@@ -823,8 +895,56 @@ bool WorldApplyBlockBatch(World* world,
         (size_t)count * sizeof(*chunks), true);
     if (chunks == NULL)
     {
+        PlatformFree(duplicates);
+        PlatformFree(groups);
         return false;
     }
+
+    /* Две мутации с одной координатой отвергают весь набор. В крупном
+     * пакете — хеш-таблицей, а не попарным сравнением: у 4096 мутаций
+     * прежний квадрат — восемь миллионов сравнений ещё до первой правки. */
+    bool duplicateFound = false;
+    if (hashed)
+    {
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const WorldBlockMutation* mutation = &mutations[index];
+            uint32_t duplicate = 0U;
+            if (WorldBatchProbeFindOrInsert(duplicates, tableMask,
+                    WorldBatchHash3(mutation->block[0], mutation->block[1],
+                        mutation->block[2]),
+                    mutation->block[0], mutation->block[1],
+                    mutation->block[2], 1U, &duplicate))
+            {
+                duplicateFound = true;
+                break;
+            }
+        }
+    }
+    else
+    {
+        for (uint32_t index = 0; index < count && !duplicateFound; ++index)
+        {
+            for (uint32_t previous = 0; previous < index; ++previous)
+            {
+                if (mutations[index].block[0] == mutations[previous].block[0]
+                    && mutations[index].block[1] == mutations[previous].block[1]
+                    && mutations[index].block[2] == mutations[previous].block[2])
+                {
+                    duplicateFound = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (duplicateFound)
+    {
+        PlatformFree(duplicates);
+        PlatformFree(groups);
+        PlatformFree(chunks);
+        return false;
+    }
+
     uint32_t chunkCount = 0U;
     uint32_t totalChanged = 0U;
     bool succeeded = true;
@@ -838,14 +958,28 @@ bool WorldApplyBlockBatch(World* world,
             ChunkFromBlock(mutation->block[1]),
             ChunkFromBlock(mutation->block[2]),
         };
+        uint32_t groupValue = 0U;
         WorldBatchChunk* batch = NULL;
-        for (uint32_t candidate = 0; candidate < chunkCount; ++candidate)
+        if (hashed)
         {
-            if (LocalChunkCoordinateEqual(
-                    chunks[candidate].coordinate, coordinate))
+            if (WorldBatchProbeFindOrInsert(groups, tableMask,
+                    WorldBatchHash3(coordinate.x, coordinate.y, coordinate.z),
+                    coordinate.x, coordinate.y, coordinate.z,
+                    chunkCount + 1U, &groupValue))
             {
-                batch = &chunks[candidate];
-                break;
+                batch = &chunks[groupValue - 1U];
+            }
+        }
+        else
+        {
+            for (uint32_t candidate = 0U; candidate < chunkCount; ++candidate)
+            {
+                if (LocalChunkCoordinateEqual(
+                        chunks[candidate].coordinate, coordinate))
+                {
+                    batch = &chunks[candidate];
+                    break;
+                }
             }
         }
         if (batch == NULL)
@@ -856,17 +990,21 @@ bool WorldApplyBlockBatch(World* world,
             batch->existing = entry == NULL ? NULL : *entry;
             uint32_t existingCount = batch->existing == NULL
                 ? 0U : batch->existing->deltaCount;
-            batch->stagedCapacity = existingCount + count;
-            batch->stagedDeltas = PlatformAllocate(
-                (size_t)batch->stagedCapacity * sizeof(DeltaEntry), false);
-            if (batch->stagedDeltas == NULL)
-            {
-                succeeded = false;
-                break;
-            }
             batch->stagedCount = existingCount;
+            batch->stagedCapacity = existingCount;
             if (existingCount != 0U)
             {
+                /* Резерв точный: только под существующие дельты. Новые
+                 * добавки буфер добирает сам удвоением ёмкости, поэтому
+                 * пакету из count мутаций на count разных чанков больше не
+                 * нужен count-элементный запас в каждом чанке. */
+                batch->stagedDeltas = PlatformAllocate(
+                    (size_t)existingCount * sizeof(DeltaEntry), false);
+                if (batch->stagedDeltas == NULL)
+                {
+                    succeeded = false;
+                    break;
+                }
                 memcpy(batch->stagedDeltas, batch->existing->deltas,
                     (size_t)existingCount * sizeof(DeltaEntry));
             }
@@ -991,6 +1129,8 @@ bool WorldApplyBlockBatch(World* world,
             world->revision, totalChanged);
     }
     PlatformRwLockReleaseExclusive(&world->tableLock);
+    PlatformFree(duplicates);
+    PlatformFree(groups);
     WorldBatchCleanup(chunks, chunkCount);
     return succeeded;
 }
@@ -1066,19 +1206,55 @@ static WorldRegionContents ClassifyRegion(const BlockType* blocks, size_t cellCo
 
 #if defined(__AVX2__)
     const __m256i airVector = _mm256_setzero_si256();
+    /* Маски совпадений с нулём копятся по четыре вектора сразу. «Есть пустая
+     * ячейка» — это ненулевая дизъюнкция масок, «есть непустая» — не все
+     * единицы в их конъюнкции. Ветка выхода на смешанном регионе остаётся
+     * одна на 128 байт вместо одной на 32, а разбор упирается в число
+     * инструкций на байт: SSE2 и AVX2 удешевили его вдвое каждый, и этот шаг
+     * продолжает тот же ряд. Ответ тот же: смешанный регион по-прежнему
+     * выходит сразу, однородный обязан прочитать всё. */
+    uint32_t airAny = 0U;
+    uint32_t airAll = 0xFFFFFFFFU;
+    for (; index + 128U <= cellCount; index += 128U)
+    {
+        __m256i voxels0 = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(blocks + index));
+        __m256i voxels1 = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(blocks + index + 32U));
+        __m256i voxels2 = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(blocks + index + 64U));
+        __m256i voxels3 = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(blocks + index + 96U));
+        uint32_t bits0 = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(voxels0, airVector));
+        uint32_t bits1 = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(voxels1, airVector));
+        uint32_t bits2 = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(voxels2, airVector));
+        uint32_t bits3 = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(voxels3, airVector));
+        airAny |= bits0 | bits1 | bits2 | bits3;
+        airAll &= bits0 & bits1 & bits2 & bits3;
+        if (airAny != 0U && airAll != 0xFFFFFFFFU)
+        {
+            return WORLD_REGION_MIXED;
+        }
+    }
     for (; index + 32U <= cellCount; index += 32U)
     {
         __m256i voxels = _mm256_loadu_si256(
             (const __m256i*)(const void*)(blocks + index));
         uint32_t airBits = (uint32_t)_mm256_movemask_epi8(
             _mm256_cmpeq_epi8(voxels, airVector));
-        anyAir |= airBits != 0U;
-        anySolid |= airBits != 0xFFFFFFFFU;
-        if (anyAir && anySolid)
+        airAny |= airBits;
+        airAll &= airBits;
+        if (airAny != 0U && airAll != 0xFFFFFFFFU)
         {
             return WORLD_REGION_MIXED;
         }
     }
+    anyAir = airAny != 0U;
+    anySolid = airAll != 0xFFFFFFFFU;
 #elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
     const __m128i airVector = _mm_setzero_si128();
     for (; index + 16U <= cellCount; index += 16U)
@@ -1267,6 +1443,24 @@ WorldRegionContents WorldFillRegion(World* world,
     else
     {
         memset(outBlocks, BLOCK_AIR, cellCount * sizeof(*outBlocks));
+    }
+
+    /* Пока в таблице нет ни одного чанка, правок нет по определению, и обход
+     * чанков региона не нашёл бы ни одной дельты. Тогда не нужны ни
+     * разделяемый захват, ни поиск в таблице. Это ровно тот же случай, что и
+     * быстрый путь WorldGetBlock, и он так же част: мир без правок — основной
+     * для чтения, а provider для него единственный источник ответа.
+     *
+     * Если при этом базовый слой пуст (провайдера нет), то весь регион —
+     * воздух, и разбор содержимого тоже не нужен: буфер только что заполнен
+     * нулями, а дельт, которые могли бы его изменить, в таблице нет. */
+    if (PlatformAtomicLoadU32Acquire(&world->editedChunkCount) == 0U)
+    {
+        if (world->provider.getBlock == NULL)
+        {
+            return WORLD_REGION_ALL_AIR;
+        }
+        return ClassifyRegion(outBlocks, cellCount);
     }
 
     // RegionValid bounds the inclusive end, not min + size (which can overflow).

@@ -197,13 +197,15 @@ static bool WritePack(const wchar_t *executableDirectory, const wchar_t *packRoo
 
     uint32_t length = 0;
     const char *parts[] = {
-        "LAIUE MOD 3\nid = ",
-        id,
-        "\nname = Test Extension\nversion = 1.0.0\nengine = 0.6\n[native]\nabi = 1\n",
-        TEST_NATIVE_MANIFEST_KEY,
-        " = ",
-        TEST_EXTENSION_FILE_NAME_UTF8,
-        "\n"};
+        "LAIUE MOD 3\nid = ", id,
+        // Комментарии игнорируются парсером, но делают манифест заметно
+        // больше мелкого буфера чтения: Inspect обязан прочитать манифест
+        // целиком, а не только его префикс.
+        "\n# ---------------------------------------------------------------------------\n"
+        "# padding keeps this manifest larger than the small read buffer\n"
+        "# ---------------------------------------------------------------------------\n",
+        "name = Test Extension\nversion = 1.0.0\nengine = 0.6\n[native]\nabi = 1\n",
+        TEST_NATIVE_MANIFEST_KEY, " = ", TEST_EXTENSION_FILE_NAME_UTF8, "\n"};
     for (uint32_t partIndex = 0; partIndex < (uint32_t)(sizeof(parts) / sizeof(parts[0]));
          ++partIndex)
     {

@@ -353,7 +353,12 @@ struct Renderer
     uint32_t swapchainImageIndex;
     uint32_t swapchainRecreateCount;   // счётчик пересозданий (диагностика)
     VkImage swapchainImages[MAX_SWAPCHAIN_IMAGES];
-    VkImageView swapchainViews[MAX_SWAPCHAIN_IMAGES];
+    // Представлений образов swapchain нет намеренно: кадр копируется/блитится
+    // в VkImage напрямую, представление не используется ни одной командой.
+    // Образ swapchain создаётся только с VK_IMAGE_USAGE_TRANSFER_DST_BIT, а
+    // vkCreateImageView для такого образа нарушает
+    // VUID-VkImageViewCreateInfo-image-04441; лишние представления были бы
+    // ещё и мёртвым ресурсом.
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
 };
@@ -1793,8 +1798,8 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
-// Освобождает образы, представления, семафоры и сам swapchain. Вызывать
-// только после WaitForGpu; безопасно на частично построенном состоянии.
+// Освобождает образы, семафоры и сам swapchain. Вызывать только после
+// WaitForGpu; безопасно на частично построенном состоянии.
 static void DestroySwapchainResources(Renderer *renderer)
 {
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
@@ -1811,11 +1816,6 @@ static void DestroySwapchainResources(Renderer *renderer)
         {
             vkDestroySemaphore(renderer->device, renderer->renderFinished[index], NULL);
             renderer->renderFinished[index] = VK_NULL_HANDLE;
-        }
-        if (renderer->swapchainViews[index] != VK_NULL_HANDLE)
-        {
-            vkDestroyImageView(renderer->device, renderer->swapchainViews[index], NULL);
-            renderer->swapchainViews[index] = VK_NULL_HANDLE;
         }
         renderer->swapchainImages[index] = VK_NULL_HANDLE;
     }
@@ -1948,29 +1948,6 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         return false;
     }
 
-    VkImageView views[MAX_SWAPCHAIN_IMAGES];
-    uint32_t viewCount = 0u;
-    VkResult viewResult = VK_SUCCESS;
-    for (; viewCount < actualCount; ++viewCount)
-    {
-        VkImageViewCreateInfo viewInfo = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = images[viewCount],
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = surfaceFormat.format,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
-        };
-        viewResult = vkCreateImageView(renderer->device, &viewInfo, NULL, &views[viewCount]);
-        if (viewResult != VK_SUCCESS) break;
-    }
-    if (viewCount != actualCount)
-    {
-        for (uint32_t index = 0; index < viewCount; ++index)
-            vkDestroyImageView(renderer->device, views[index], NULL);
-        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
-        return false;
-    }
-
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
     for (uint32_t index = 0; index < FRAME_COUNT; ++index) imageAvailable[index] = VK_NULL_HANDLE;
@@ -2008,8 +1985,6 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
             vkDestroySemaphore(renderer->device, imageAvailable[index], NULL);
         for (uint32_t index = 0; index < finishedCount; ++index)
             vkDestroySemaphore(renderer->device, renderFinished[index], NULL);
-        for (uint32_t index = 0; index < actualCount; ++index)
-            vkDestroyImageView(renderer->device, views[index], NULL);
         vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
         return false;
     }
@@ -2020,10 +1995,7 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
     for (uint32_t index = 0; index < actualCount; ++index)
-    {
         renderer->swapchainImages[index] = images[index];
-        renderer->swapchainViews[index] = views[index];
-    }
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
         renderer->imageAvailable[index] = imageAvailable[index];
     for (uint32_t index = 0; index < actualCount; ++index)

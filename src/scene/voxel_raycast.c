@@ -97,17 +97,22 @@ bool VoxelRaycast(World* world, const double origin[3],
     for (;;)
     {
         int32_t axis = 0;
-        if (tMaximum[1] < tMaximum[axis]) axis = 1;
-        if (tMaximum[2] < tMaximum[axis]) axis = 2;
-        if (tMaximum[axis] > (double)maximumDistance)
+        double hitDistance = tMaximum[0];
+        if (tMaximum[1] < hitDistance)
+        {
+            axis = 1;
+            hitDistance = tMaximum[1];
+        }
+        if (tMaximum[2] < hitDistance)
+        {
+            axis = 2;
+            hitDistance = tMaximum[2];
+        }
+        if (hitDistance > (double)maximumDistance)
         {
             return false;
         }
 
-        double hitDistance = tMaximum[axis];
-        outHit->previousBlock[0] = block[0];
-        outHit->previousBlock[1] = block[1];
-        outHit->previousBlock[2] = block[2];
         if (!CheckedAddStep(block[axis], step[axis], &block[axis]))
         {
             return false;
@@ -116,9 +121,16 @@ bool VoxelRaycast(World* world, const double origin[3],
 
         if (WorldGetBlock(world, block[0], block[1], block[2]) != BLOCK_AIR)
         {
+            // Предыдущий блок восстанавливается из текущего: за шаг менялась
+            // ровно одна ось, поэтому нет нужды писать previousBlock на
+            // каждом пустом вокселе.
             outHit->block[0] = block[0];
             outHit->block[1] = block[1];
             outHit->block[2] = block[2];
+            outHit->previousBlock[0] = block[0];
+            outHit->previousBlock[1] = block[1];
+            outHit->previousBlock[2] = block[2];
+            outHit->previousBlock[axis] -= step[axis];
             outHit->normal[0] = 0;
             outHit->normal[1] = 0;
             outHit->normal[2] = 0;

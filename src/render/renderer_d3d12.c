@@ -139,6 +139,7 @@ typedef struct InstanceChunk
 {
     ID3D12Resource* buffer;
     uint8_t* mapped;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
     uint32_t capacityBytes;
 } InstanceChunk;
 
@@ -249,6 +250,10 @@ struct Renderer
     uint32_t                   instanceChunkIndex[FRAME_COUNT];
     uint32_t                   instanceChunkOffset[FRAME_COUNT];
     uint32_t                   instancePoolBytes[FRAME_COUNT];
+    // Известно ли CPU, что корневые константы смещения уже равны
+    // (0, 0, 0, -1) — значению, общему для всех инстансных вызовов кадра.
+    // Пока это так, повторная запись тех же констант не делается.
+    bool                       instanceOriginActive;
 
     DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredResourceHead;
@@ -1177,6 +1182,7 @@ static bool CreateInstanceChunk(Renderer* renderer, uint32_t slot,
     }
 
     chunk->capacityBytes = capacityBytes;
+    chunk->address = ID3D12Resource_GetGPUVirtualAddress(chunk->buffer);
     renderer->instanceChunkCount[slot] = index + 1;
     return true;
 }
@@ -2067,6 +2073,9 @@ void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
     };
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
         ROOT_PARAMETER_CONSTANTS, 4, transform, ROOT_CONSTANT_ORIGIN_OFFSET);
+    // Обычный вызов пишет переменное смещение: общий инстансный ноль
+    // корневых констант этим перезаписан.
+    renderer->instanceOriginActive = false;
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
         ROOT_PARAMETER_QUAD_BUFFER, block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6, 1, 0, 0);
@@ -2094,16 +2103,22 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
     memcpy(chunk->mapped + offset, instances, bytes);
 
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
-    float transform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
-        renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform,
-        ROOT_CONSTANT_ORIGIN_OFFSET);
+    // Смещение инстанса одинаково для всех инстансных вызовов кадра:
+    // пишем его один раз до первого изменения другим путём.
+    if (!renderer->instanceOriginActive)
+    {
+        static const float instanceTransform[4] = { 0.0f, 0.0f, 0.0f, -1.0f };
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+            renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, instanceTransform,
+            ROOT_CONSTANT_ORIGIN_OFFSET);
+        renderer->instanceOriginActive = true;
+    }
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
         renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
         block->address + mesh->offsetBytes);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
         renderer->commandList, ROOT_PARAMETER_INSTANCES,
-        ID3D12Resource_GetGPUVirtualAddress(chunk->buffer) + offset);
+        chunk->address + offset);
     ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
         mesh->quadCount * 6, instanceCount, 0, 0);
     renderer->currentStats.drawCalls++;
@@ -2435,6 +2450,9 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     ID3D12GraphicsCommandList_Reset(renderer->commandList,
         renderer->commandAllocators[renderer->frameIndex],
         renderer->worldReady ? renderer->pipelineState : NULL);
+    // Reset возвращает корневые константы к нулю: общего инстансного
+    // смещения в новом командном списке ещё нет.
+    renderer->instanceOriginActive = false;
 
     if (renderer->worldReady) RecordBlockTextureUpload(renderer);
     RecordFontAtlasUpload(renderer);
@@ -2482,8 +2500,7 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     // чанк слота; инстансные draw-вызовы ниже заменяют адрес на свой.
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
         renderer->commandList, ROOT_PARAMETER_INSTANCES,
-        ID3D12Resource_GetGPUVirtualAddress(
-            renderer->instanceChunks[renderer->frameIndex][0].buffer));
+        renderer->instanceChunks[renderer->frameIndex][0].address);
 
     // Свет кадра: число материалов занимает padding после sunDirection;
     // остальные float3 выровнены по 16 байт.

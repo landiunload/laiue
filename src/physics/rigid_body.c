@@ -5469,6 +5469,137 @@ static void SolveContactPair(RigidStepScratch *scratch, uint32_t firstIndex, uin
 #endif
 }
 
+// === Канонический порядок с парным решателем ===
+//
+// Скалярный Gauss-Seidel решает контакты строго по одному, хотя манифольды
+// разных тел не делят тела и независимы. Пару таких контактов можно решить
+// одной 128-битной командой: каждая полоса повторяет скалярную
+// последовательность шаг в шаг. Расписание составляется один раз на шаг и
+// зависит только от состава контактов (bodyIndex/otherIndex), но не от
+// скоростей, поэтому оно одинаково во всех итерациях. Пара (i, j), i < j,
+// допустима ровно тогда, когда она повторяет скалярный результат бит в бит:
+//   * i и j не делят ни одного динамического тела;
+//   * каждый ещё не решённый контакт между ними не делит тела с j: j должен
+//     увидеть его импульс, а парный решатель применяет j раньше;
+//   * каждый уже решённый контакт между ними не делит тела с i: иначе i
+//     получил бы импульс, который в последовательном порядке идёт позже.
+// Если допустимого партнёра рядом нет, контакт решается скалярно как раньше.
+// Поэтому состав и порядок импульсов не меняются ни на одном входе.
+#define RIGID_SOLVE_MATE_SCALAR 0xFFFFFFFFu
+#define RIGID_SOLVE_MATE_HANDLED 0xFFFFFFFEu
+// Просмотр ограничен размером манифольда: пара всегда берётся внутри одной
+// полосы соседних манифольдов, а не после линейного поиска по всему массиву.
+#define RIGID_CANONICAL_PAIR_LOOKAHEAD RIGID_NARROWPHASE_POINTS_PER_BODY
+
+static bool ContactsShareBody(const RigidContact *first, const RigidContact *second)
+{
+    if (first->bodyIndex == second->bodyIndex)
+    {
+        return true;
+    }
+    if (first->otherIndex != UINT32_MAX &&
+        (first->otherIndex == second->bodyIndex || first->otherIndex == second->otherIndex))
+    {
+        return true;
+    }
+    return second->otherIndex != UINT32_MAX && second->otherIndex == first->bodyIndex;
+}
+
+static void BuildCanonicalSolveSchedule(RigidStepScratch *scratch)
+{
+    uint32_t count = scratch->contactCount;
+    uint32_t *schedule = scratch->solveOrder;
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        schedule[index] = RIGID_SOLVE_MATE_SCALAR;
+    }
+#if defined(LAIUE_RIGID_PAIRED_SSE2) || defined(LAIUE_RIGID_PAIRED_NEON)
+    for (uint32_t first = 0u; first < count; ++first)
+    {
+        if (schedule[first] == RIGID_SOLVE_MATE_HANDLED)
+        {
+            continue;
+        }
+        uint32_t limit = first + RIGID_CANONICAL_PAIR_LOOKAHEAD;
+        if (limit > count)
+        {
+            limit = count;
+        }
+        uint32_t partner = RIGID_SOLVE_MATE_SCALAR;
+        // Как только в окне встретился уже решённый контакт, делящий тело с
+        // first, ни один более далёкий second тоже не подойдёт: окно только
+        // растёт. Дальнейший просмотр прекращается.
+        bool solvedSharingFirst = false;
+        for (uint32_t second = first + 1u; second < limit; ++second)
+        {
+            if (schedule[second] == RIGID_SOLVE_MATE_HANDLED)
+            {
+                continue;
+            }
+            if (solvedSharingFirst)
+            {
+                break;
+            }
+            if (ContactsShareBody(&scratch->contacts[first], &scratch->contacts[second]))
+            {
+                continue;
+            }
+            bool valid = true;
+            for (uint32_t between = first + 1u; between < second; ++between)
+            {
+                const RigidContact *middle = &scratch->contacts[between];
+                if (schedule[between] == RIGID_SOLVE_MATE_HANDLED)
+                {
+                    if (ContactsShareBody(middle, &scratch->contacts[first]))
+                    {
+                        solvedSharingFirst = true;
+                        valid = false;
+                        break;
+                    }
+                }
+                else if (ContactsShareBody(middle, &scratch->contacts[second]))
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid)
+            {
+                partner = second;
+                break;
+            }
+        }
+        if (partner != RIGID_SOLVE_MATE_SCALAR)
+        {
+            schedule[first] = partner;
+            schedule[partner] = RIGID_SOLVE_MATE_HANDLED;
+        }
+    }
+#endif
+}
+
+static void SolveCanonicalSchedule(RigidStepScratch *scratch)
+{
+    uint32_t count = scratch->contactCount;
+    const uint32_t *schedule = scratch->solveOrder;
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        uint32_t mate = schedule[index];
+        if (mate == RIGID_SOLVE_MATE_HANDLED)
+        {
+            continue;
+        }
+        if (mate != RIGID_SOLVE_MATE_SCALAR)
+        {
+            SolveContactPair(scratch, index, mate);
+        }
+        else
+        {
+            SolveContact(scratch, index);
+        }
+    }
+}
+
 typedef struct RigidJobContext
 {
     const VoxelRigidBody *bodies;
@@ -5739,17 +5870,20 @@ static void SolveContacts(const VoxelRigidBody *bodies, RigidStepScratch *scratc
         scratch->options != NULL && scratch->options->solverOrder == VOXEL_RIGID_SOLVER_COLORED;
     begin = ProfileNow(scratch);
     if (colored)
+    {
         BuildSolverBatches(scratch);
+    }
+    else
+    {
+        BuildCanonicalSolveSchedule(scratch);
+    }
     ProfileFinish(scratch, VOXEL_RIGID_PROFILE_SCHEDULE, begin);
     begin = ProfileNow(scratch);
     for (uint32_t iteration = 0u; iteration < settings->solverIterations; ++iteration)
     {
         if (!colored)
         {
-            for (uint32_t index = 0u; index < scratch->contactCount; ++index)
-            {
-                SolveContact(scratch, index);
-            }
+            SolveCanonicalSchedule(scratch);
             continue;
         }
         for (uint32_t color = 0u; color < RIGID_SOLVER_BATCH_COUNT; ++color)

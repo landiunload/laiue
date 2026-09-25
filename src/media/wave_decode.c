@@ -193,40 +193,74 @@ WaveStatus WaveDecodeSamples(const void *bytes, uint32_t sizeBytes, const WaveIn
         return WAVE_TRUNCATED;
 
     const uint8_t *data = (const uint8_t *)bytes + info->dataOffset;
-    for (uint32_t index = 0; index < sampleCount; ++index)
+    // Ширина сэмпла выбирается один раз на весь буфер, а не на каждый
+    // сэмпл: внутри цикла остаётся только чтение и арифметика нужной
+    // ширины, без повторной проверки формата и умножения индекса.
+    if (info->isFloat)
     {
-        const uint8_t *sample = data + (size_t)index * sampleBytes;
-        if (info->isFloat)
+        if (info->bitsPerSample == 32u)
         {
-            outSamples[index] =
-                info->bitsPerSample == 32u
-                    ? FloatToI16((double)BitsToFloat(ReadU32Le(sample)))
-                    : FloatToI16(BitsToDouble((uint64_t)ReadU32Le(sample) |
-                                              ((uint64_t)ReadU32Le(sample + 4) << 32)));
-            continue;
+            const uint8_t *sample = data;
+            for (uint32_t index = 0; index < sampleCount; ++index, sample += 4u)
+            {
+                outSamples[index] = FloatToI16((double)BitsToFloat(ReadU32Le(sample)));
+            }
         }
-
-        switch (info->bitsPerSample)
+        else
         {
-        case 8u:
+            const uint8_t *sample = data;
+            for (uint32_t index = 0; index < sampleCount; ++index, sample += 8u)
+            {
+                outSamples[index] =
+                    FloatToI16(BitsToDouble((uint64_t)ReadU32Le(sample) |
+                                            ((uint64_t)ReadU32Le(sample + 4) << 32)));
+            }
+        }
+        return WAVE_OK;
+    }
+
+    switch (info->bitsPerSample)
+    {
+    case 8u:
+    {
+        const uint8_t *sample = data;
+        for (uint32_t index = 0; index < sampleCount; ++index, sample += 1u)
+        {
             // Восьмибитный PCM в WAV беззнаковый, с нулём в 128.
             outSamples[index] = (int16_t)(((int32_t)sample[0] - 128) * 256);
-            break;
-        case 16u:
+        }
+        break;
+    }
+    case 16u:
+    {
+        const uint8_t *sample = data;
+        for (uint32_t index = 0; index < sampleCount; ++index, sample += 2u)
+        {
             outSamples[index] = (int16_t)ReadU16Le(sample);
-            break;
-        case 24u:
+        }
+        break;
+    }
+    case 24u:
+    {
+        const uint8_t *sample = data;
+        for (uint32_t index = 0; index < sampleCount; ++index, sample += 3u)
         {
             int32_t raw = (int32_t)((uint32_t)sample[0] | ((uint32_t)sample[1] << 8) |
                                     ((uint32_t)sample[2] << 16));
             if ((raw & 0x00800000) != 0) raw -= 0x01000000;
             outSamples[index] = ScaleToI16(raw, 256);
-            break;
         }
-        default:
+        break;
+    }
+    default:
+    {
+        const uint8_t *sample = data;
+        for (uint32_t index = 0; index < sampleCount; ++index, sample += 4u)
+        {
             outSamples[index] = ScaleToI16((int32_t)ReadU32Le(sample), 65536);
-            break;
         }
+        break;
+    }
     }
     return WAVE_OK;
 }

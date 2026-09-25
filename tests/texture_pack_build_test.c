@@ -463,6 +463,45 @@ static TEXTURE_TEST_NOINLINE void TestNormalGeometry(LaiueContentCatalog *catalo
     ReleasePack(&pack);
 }
 
+// === Карта нормалей на один кадр при анимированном albedo ===
+
+// Отдельный файл карты нормалей вправе нести один кадр на всю анимацию.
+// Такой кадр обязан попасть в каждый слой нормалей без изменений: раньше
+// он размножался в памяти, теперь берётся по нулевому индексу, и проверка
+// закрепляет равенство результата.
+static TEXTURE_TEST_NOINLINE void TestSeparateNormalSharedFrame(LaiueContentCatalog *catalog,
+                                                                TestPaths *paths)
+{
+    wchar_t *albedoPath = paths->slots[0];
+    wchar_t *normalPath = paths->slots[1];
+    MainFile(paths, albedoPath, PATH_CAP, L"share_nm", L".lt");
+    MainFile(paths, normalPath, PATH_CAP, L"share_nm.normal", L".lt");
+
+    uint8_t frames[2u * SOLID_BYTES];
+    FillSolid(frames + 0u * SOLID_BYTES, 4u, 4u, kRed);
+    FillSolid(frames + 1u * SOLID_BYTES, 4u, 4u, kBlue);
+    static const uint16_t durations[2] = {30u, 70u};
+    WriteLtV2(albedoPath, frames, NULL, 4u, 4u, 2u, durations, 0u, 0u);
+
+    uint8_t normal[SOLID_BYTES];
+    FillSolid(normal, 4u, 4u, kMagenta);
+    WriteLtV2(normalPath, normal, NULL, 4u, 4u, 1u, NULL, 0u, 0u);
+
+    static const wchar_t *const names[1] = {L"main/share_nm"};
+    TexturePackData pack;
+    Expect(Build(catalog, names, 1u, &pack) == TEXTURE_PACK_LOAD_OK,
+           "shared normal frame status");
+    Expect((uint32_t)pack.sliceCount == 2u && pack.normalPixels != NULL,
+           "a shared normal frame must reach every albedo frame");
+    Expect(TexelEquals(AlbedoMip0(&pack, 0u), kRed) &&
+               TexelEquals(AlbedoMip0(&pack, 1u), kBlue),
+           "albedo frames must stay in order");
+    Expect(TexelEquals(NormalMip0(&pack, 0u), kMagenta) &&
+               TexelEquals(NormalMip0(&pack, 1u), kMagenta),
+           "one normal frame must be reused by every albedo frame");
+    ReleasePack(&pack);
+}
+
 // === Отсутствующий материал ===
 
 static TEXTURE_TEST_NOINLINE void TestMissingMaterial(LaiueContentCatalog *catalog)
@@ -711,6 +750,7 @@ LAIUE_TEST_ENTRY(TexturePackBuildTestEntryPoint)
     TestSingleTextureV2Durations(catalog, paths);
     TestSingleTextureV2Normals(catalog, paths);
     TestNormalGeometry(catalog, paths);
+    TestSeparateNormalSharedFrame(catalog, paths);
     TestMissingMaterial(catalog);
     TestStaleCache(catalog, paths);
     TestCorruptCache(catalog, paths);

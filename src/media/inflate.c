@@ -1,6 +1,7 @@
 #include "media/inflate.h"
 
 #include <stddef.h>
+#include <string.h>
 
 // Разбор кода: девять старших бит берутся из таблицы прямого поиска,
 // более длинные коды читаются каноническим циклом по одному биту.
@@ -253,11 +254,45 @@ static bool CopyStored(InflateState *state)
         return false;
     }
 
-    for (uint32_t index = 0; index < length; ++index)
+    uint32_t remaining = length;
+    // Целые байты, уже забранные дозаправкой в битовый буфер, идут
+    // первыми: остаток текущего байта отброшен выравниванием выше.
+    while (remaining != 0u && state->bitCount >= 8u)
     {
-        state->output[state->written++] = (uint8_t)ReadAlignedByte(state);
+        state->output[state->written++] = (uint8_t)(state->bitBuffer & 0xFFu);
+        state->bitBuffer >>= 8u;
+        state->bitCount -= 8u;
+        --remaining;
     }
-    return !state->truncated;
+    // Дальше данные лежат в отрезках IDAT непрерывно, поэтому копируются
+    // кусками, а не по байту через ReadAlignedByte.
+    while (remaining != 0u)
+    {
+        while (state->segmentIndex < state->segmentCount &&
+               state->position >= state->segments[state->segmentIndex].size)
+        {
+            state->position = 0u;
+            ++state->segmentIndex;
+        }
+        if (state->segmentIndex >= state->segmentCount)
+        {
+            // Прежний ReadAlignedByte на исчерпанном входе отдавал ноль,
+            // поэтому остаток блока дописывается нулями, а счётчик
+            // выданных байт доходит до конца блока — ровно как раньше.
+            memset(state->output + state->written, 0, remaining);
+            state->written += remaining;
+            state->truncated = true;
+            return false;
+        }
+        const InflateSegment *segment = &state->segments[state->segmentIndex];
+        uint32_t available = segment->size - state->position;
+        uint32_t take = remaining < available ? remaining : available;
+        memcpy(state->output + state->written, segment->bytes + state->position, take);
+        state->written += take;
+        state->position += take;
+        remaining -= take;
+    }
+    return true;
 }
 
 static bool InflateBlock(InflateState *state, const InflateHuffmanTable *literals,

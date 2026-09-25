@@ -778,6 +778,18 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
     }
     *outCount = 0u;
     const RigidTreeNode *nodes = TreeNodes(broadphase);
+    // Запрос на каждом попадании пишет в outSlots, а компилятор не может
+    // доказать, что этот массив не пересекается с minimum/maximum. Без
+    // локальных копий он обязан перечитывать границы после каждой записи.
+    // Копии лежат в стеке, их адрес не уходит наружу, и шесть чисел живут в
+    // регистрах весь обход. Значения те же, поведение не меняется.
+    double queryMinimum[3];
+    double queryMaximum[3];
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        queryMinimum[axis] = minimum[axis];
+        queryMaximum[axis] = maximum[axis];
+    }
     // Явный стек вместо хождения по родительским ссылкам. Обход по ссылкам
     // возвращался в узел ещё раз после каждого поддерева, и на каждый
     // проверенный узел приходилось ровно две итерации цикла: половина работы
@@ -808,7 +820,7 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
     {
         const RigidTreeNode *root = &nodes[broadphase->root];
         ++visited;
-        if (BoundsOverlap(root, minimum, maximum))
+        if (BoundsOverlap(root, queryMinimum, queryMaximum))
         {
             if (!NodeIsLeaf(root))
             {
@@ -842,8 +854,8 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
         {
             const RigidTreeNode *left = &nodes[leftIndex];
             const RigidTreeNode *right = &nodes[rightIndex];
-            bool leftHit = BoundsOverlap(left, minimum, maximum);
-            bool rightHit = BoundsOverlap(right, minimum, maximum);
+            bool leftHit = BoundsOverlap(left, queryMinimum, queryMaximum);
+            bool rightHit = BoundsOverlap(right, queryMinimum, queryMaximum);
             bool leftLeaf = NodeIsLeaf(left);
             bool rightLeaf = NodeIsLeaf(right);
             visited += 2u;
@@ -916,7 +928,7 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
         if (previous == node->parent)
         {
             ++visited;
-            if (BoundsOverlap(node, minimum, maximum))
+            if (BoundsOverlap(node, queryMinimum, queryMaximum))
             {
                 if (NodeIsLeaf(node))
                 {

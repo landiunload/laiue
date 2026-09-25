@@ -1,5 +1,11 @@
 option(LAIUE_REQUIRE_VULKAN_TEST_DRIVER
     "Fail Vulkan offscreen tests instead of skipping when no driver is available" OFF)
+# Прогон Vulkan-тестов под Khronos validation layer. Тесты уже считают
+# "Validation Error" провалом, поэтому слой превращает их в регрессию
+# spec-корректности (например, VUID-VkImageViewCreateInfo-image-04441 для
+# представлений образов swapchain). Требует установленного Vulkan SDK.
+option(LAIUE_VULKAN_VALIDATION
+    "Run Vulkan renderer tests under VK_LAYER_KHRONOS_validation" OFF)
 if(LAIUE_REQUIRE_VULKAN_TEST_DRIVER AND
    NOT (TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET))
     message(FATAL_ERROR "LAIUE_REQUIRE_VULKAN_TEST_DRIVER requires the Vulkan render target")
@@ -203,6 +209,15 @@ if(TARGET laiue_scene)
     add_test(NAME laiue.scene.voxel_raycast
         COMMAND laiue_voxel_raycast_test)
 
+    add_executable(laiue_voxel_raycast_dda_test voxel_raycast_dda_test.c)
+    target_link_libraries(laiue_voxel_raycast_dda_test PRIVATE
+        laiue_scene
+        laiue_world)
+    laiue_configure_standalone_executable(
+        laiue_voxel_raycast_dda_test VoxelRaycastDdaTestEntryPoint)
+    add_test(NAME laiue.scene.voxel_raycast_dda
+        COMMAND laiue_voxel_raycast_dda_test)
+
     # Стресс таблицы чанков: случайные переходы и блуждание по кольцу с
     # независимым эталоном множества ключей и проверкой списка отрисовки.
     add_executable(laiue_chunk_streaming_stress_test
@@ -216,6 +231,12 @@ if(TARGET laiue_scene)
         COMMAND laiue_chunk_streaming_stress_test)
     set_tests_properties(laiue.scene.chunk_streaming_stress PROPERTIES
         TIMEOUT 120)
+
+    add_executable(laiue_panorama_test panorama_test.c)
+    target_link_libraries(laiue_panorama_test PRIVATE laiue_scene)
+    laiue_configure_standalone_executable(
+        laiue_panorama_test PanoramaTestEntryPoint)
+    add_test(NAME laiue.scene.panorama COMMAND laiue_panorama_test)
 endif()
 if(TARGET laiue_render)
     add_executable(laiue_render_pack_api_test render_pack_api_test.c)
@@ -301,6 +322,19 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
         SKIP_RETURN_CODE 125
         FAIL_REGULAR_EXPRESSION "Validation Error"
         TIMEOUT 180)
+    if(LAIUE_VULKAN_VALIDATION)
+        set(laiue_vulkan_validation_env
+            "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation")
+        if(DEFINED ENV{VULKAN_SDK})
+            list(APPEND laiue_vulkan_validation_env
+                "VK_LAYER_PATH=$ENV{VULKAN_SDK}/Bin")
+        endif()
+        set_tests_properties(
+            laiue.render.offscreen_frame
+            laiue.render.vulkan_instance_ring
+            laiue.render.vulkan_lifecycle
+            PROPERTIES ENVIRONMENT "${laiue_vulkan_validation_env}")
+    endif()
 endif()
 if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
    AND LAIUE_RENDER_HAS_VULKAN_TARGET)
@@ -392,6 +426,13 @@ if(TARGET laiue_media_support)
     target_link_libraries(laiue_texc_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_texc_test TexcTestEntryPoint)
     add_test(NAME laiue.tools.texc COMMAND laiue_texc_test)
+endif()
+
+if(TARGET laiue_media_support)
+    add_executable(laiue_inflate_test inflate_test.c inflate_fixtures.h)
+    target_link_libraries(laiue_inflate_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_inflate_test InflateTestEntryPoint)
+    add_test(NAME laiue.media.inflate COMMAND laiue_inflate_test)
 endif()
 
 if(TARGET laiue_media_support)

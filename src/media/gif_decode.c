@@ -317,6 +317,12 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
 
     uint32_t writtenPixels = 0u;
     uint32_t total = frame->width * frame->height;
+    // Строка и столбец текущего пикселя ведутся счётчиками, а не
+    // делением writtenPixels на ширину: на кадр 256x256 это убирает
+    // сотни тысяч делений из самого горячего цикла. Значения те же,
+    // что дали бы writtenPixels / width и writtenPixels % width.
+    uint32_t frameRow = 0u;
+    uint32_t frameColumn = 0u;
     while (writtenPixels < total)
     {
         uint32_t code = ReadCode(&reader, codeBits);
@@ -358,23 +364,30 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
         while (stackDepth > 0u && writtenPixels < total)
         {
             uint8_t index = dictionary->stack[--stackDepth];
-            uint32_t frameRow = writtenPixels / frame->width;
-            uint32_t frameColumn = writtenPixels % frame->width;
             ++writtenPixels;
 
-            if ((int32_t)index == frame->transparentIndex) continue;
-
-            uint32_t canvasRow =
-                frame->top + (frame->interlaced ? InterlacedRow(frameRow, frame->height) : frameRow);
-            uint8_t *texel =
-                canvas + ((size_t)canvasRow * canvasWidth + frame->left + frameColumn) * 4u;
-            if (index < frame->paletteEntries)
+            if ((int32_t)index != frame->transparentIndex)
             {
-                texel[0] = palette[index * 3u];
-                texel[1] = palette[index * 3u + 1u];
-                texel[2] = palette[index * 3u + 2u];
+                uint32_t canvasRow = frame->top + (frame->interlaced
+                                                       ? InterlacedRow(frameRow, frame->height)
+                                                       : frameRow);
+                uint8_t *texel =
+                    canvas + ((size_t)canvasRow * canvasWidth + frame->left + frameColumn) * 4u;
+                if (index < frame->paletteEntries)
+                {
+                    texel[0] = palette[index * 3u];
+                    texel[1] = palette[index * 3u + 1u];
+                    texel[2] = palette[index * 3u + 2u];
+                }
+                texel[3] = 255u;
             }
-            texel[3] = 255u;
+
+            ++frameColumn;
+            if (frameColumn == frame->width)
+            {
+                frameColumn = 0u;
+                ++frameRow;
+            }
         }
 
         if (previousCode >= 0 && nextCode < GIF_MAX_CODES)
