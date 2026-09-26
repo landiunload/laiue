@@ -697,10 +697,15 @@ add_test(NAME laiue.r2.mod_manifest COMMAND laiue_r2_18_manifest_test)
     # ROUND2 24-shaders: краевые случаи валидации манифеста (большой файл,
     # BOM, неверный заголовок, отсутствие contract, пустой и сверхлимитный).
     add_executable(laiue_r2_24_shaders_manifest_test
-        r2_24_shaders_manifest_test.c)
+        r2_24_shaders_manifest_test.c
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.c"
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/shader_pack.c")
+    target_include_directories(laiue_r2_24_shaders_manifest_test PRIVATE
+        "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(laiue_r2_24_shaders_manifest_test PRIVATE
-        laiue_content
-        laiue_render)
+        laiue_content)
+    target_compile_definitions(laiue_r2_24_shaders_manifest_test
+        PRIVATE LAIUE_STATIC=1)
     laiue_configure_standalone_executable(
         laiue_r2_24_shaders_manifest_test R2ShadersManifestTestEntryPoint)
     add_test(NAME laiue.render.r2_24_shaders_manifest
