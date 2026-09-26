@@ -2229,6 +2229,14 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
             compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     }
 
+    /* Render targets and camera/UI coordinates already use the window's
+     * current width and height.  Ask the presentation engine to keep those
+     * pixels in that orientation when it supports identity; otherwise retain
+     * its required transform. */
+    const VkSurfaceTransformFlagBitsKHR preTransform =
+        (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0u
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+            : capabilities.currentTransform;
     VkSwapchainCreateInfoKHR swapchainInfo = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = renderer->surface,
@@ -2241,7 +2249,7 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0u,
         .pQueueFamilyIndices = NULL,
-        .preTransform = capabilities.currentTransform,
+        .preTransform = preTransform,
         .compositeAlpha = compositeAlpha,
         .presentMode = presentMode,
         .clipped = VK_TRUE,

@@ -36,6 +36,7 @@ target_link_libraries(laiue_walk_android PRIVATE
     laiue_render
     laiue_scene_math
     laiue_scene
+    laiue_media_support
     android
     log
     "${Vulkan_LIBRARY}")
@@ -150,6 +151,7 @@ if(LAIUE_ANDROID_AAPT2 AND LAIUE_ANDROID_ZIPALIGN AND LAIUE_ANDROID_APKSIGNER AN
             -FrameworkJar "${LAIUE_ANDROID_FRAMEWORK_JAR}"
             -Manifest "${CMAKE_CURRENT_SOURCE_DIR}/AndroidManifest.xml"
             -NativeLib "$<TARGET_FILE:laiue_walk_android>"
+            -AssetsDirectory "${CMAKE_CURRENT_SOURCE_DIR}/assets"
             -Abi "${ANDROID_ABI}"
             -Keystore "${LAIUE_ANDROID_KEYSTORE}"
             -KeystorePassword "${LAIUE_ANDROID_KEYSTORE_PASSWORD}"
