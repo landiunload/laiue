@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$FrameworkJar,
     [Parameter(Mandatory = $true)][string]$Manifest,
     [Parameter(Mandatory = $true)][string]$NativeLib,
+    [string]$AssetsDirectory = '',
     [Parameter(Mandatory = $true)][string]$Abi,
     [Parameter(Mandatory = $true)][string]$Keystore,
     [Parameter(Mandatory = $true)][string]$KeystorePassword,
@@ -44,6 +45,23 @@ try {
         $stream = $entry.Open()
         try { $input.CopyTo($stream) } finally { $stream.Dispose() }
     } finally { $input.Dispose() }
+    if ($AssetsDirectory) {
+        if (-not (Test-Path -LiteralPath $AssetsDirectory -PathType Container)) {
+            throw "Android asset directory does not exist: $AssetsDirectory"
+        }
+        $assetRoot = [System.IO.Path]::GetFullPath($AssetsDirectory).TrimEnd('\', '/')
+        Get-ChildItem -LiteralPath $assetRoot -File -Recurse | ForEach-Object {
+            $relative = $_.FullName.Substring($assetRoot.Length).TrimStart('\', '/')
+            $entryName = 'assets/' + $relative.Replace('\', '/')
+            $assetEntry = $archive.CreateEntry($entryName,
+                [System.IO.Compression.CompressionLevel]::Optimal)
+            $assetInput = [System.IO.File]::OpenRead($_.FullName)
+            try {
+                $assetStream = $assetEntry.Open()
+                try { $assetInput.CopyTo($assetStream) } finally { $assetStream.Dispose() }
+            } finally { $assetInput.Dispose() }
+        }
+    }
 } finally { $archive.Dispose() }
 
 & $Zipalign -f -p 4 $unsigned $aligned

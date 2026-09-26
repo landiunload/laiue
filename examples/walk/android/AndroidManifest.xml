@@ -4,7 +4,7 @@
     <application android:theme="@android:style/Theme.Material.NoActionBar"
         android:label="LAIUE Walk" android:hasCode="false">
         <activity android:name="android.app.NativeActivity"
-            android:label="LAIUE Walk" android:screenOrientation="landscape"
+            android:label="LAIUE Walk" android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="true">
             <meta-data android:name="android.app.lib_name" android:value="laiue_walk" />

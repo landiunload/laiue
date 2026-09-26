@@ -10,7 +10,9 @@
 #include "scene/math_service.h"
 #include "walk_terrain.h"
 #include "walk_runtime.h"
+#include "media/image.h"
 
+#include <android/asset_manager.h>
 #include <android/input.h>
 #include <android/log.h>
 #include <android/native_activity.h>
@@ -39,6 +41,12 @@
 #define ANDROID_WALK_TOUCH_JOYSTICK_RADIUS 0.16f
 #define ANDROID_WALK_TOUCH_BUTTON_RADIUS 0.095f
 #define ANDROID_WALK_TOUCH_MARGIN 0.06f
+#define ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT 3u
+#define ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT 24u
+#define ANDROID_WALK_TEXTURED_TERRAIN_MIN_X (-64.0f)
+#define ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y (-64.0f)
+#define ANDROID_WALK_TEXTURED_TERRAIN_MAX_X 128.0f
+#define ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y 128.0f
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
 
@@ -61,6 +69,10 @@ struct AndroidWalkState
     LaiueGraphicsDeviceV2 *device;
     LaiueGraphicsHandle terrainBuffer;
     bool terrainReady;
+    LaiueGraphicsHandle texturedTerrainBuffers[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT];
+    LaiueGraphicsHandle terrainTextures[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT];
+    LaiueGraphicsHandle terrainSampler;
+    bool texturedTerrainReady;
     const LaiueSceneServiceV1 *scene;
     const LaiueSceneMathServiceV1 *sceneMath;
     Camera camera;
@@ -224,6 +236,280 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
     return state->graphics != NULL;
 }
 
+static void AndroidReleaseGraphicsHandle(AndroidWalkState *state,
+                                         LaiueGraphicsHandle *handle)
+{
+    if (state == NULL || handle == NULL || *handle == 0u)
+        return;
+    if (state->device != NULL &&
+        AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                            offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                            sizeof(state->device->destroyHandle)) &&
+        state->device->destroyHandle != NULL)
+        state->device->destroyHandle(state->device, *handle);
+    *handle = 0u;
+}
+
+static void AndroidDestroyTexturedTerrain(AndroidWalkState *state)
+{
+    if (state == NULL)
+        return;
+    for (uint32_t index = 0u; index < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT; ++index)
+    {
+        AndroidReleaseGraphicsHandle(state, &state->texturedTerrainBuffers[index]);
+        AndroidReleaseGraphicsHandle(state, &state->terrainTextures[index]);
+    }
+    AndroidReleaseGraphicsHandle(state, &state->terrainSampler);
+    state->texturedTerrainReady = false;
+}
+
+static bool AndroidLoadTextureAsset(AndroidWalkState *state, const char *assetPath,
+                                    LaiueGraphicsHandle *outTexture)
+{
+    if (outTexture != NULL)
+        *outTexture = 0u;
+    if (state == NULL || state->app == NULL || state->app->activity == NULL ||
+        state->app->activity->assetManager == NULL || assetPath == NULL ||
+        outTexture == NULL || state->device == NULL ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, createTexture),
+                             sizeof(state->device->createTexture)) ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, uploadTexture),
+                             sizeof(state->device->uploadTexture)) ||
+        state->device->createTexture == NULL || state->device->uploadTexture == NULL)
+        return false;
+
+    AAsset *asset = AAssetManager_open(state->app->activity->assetManager,
+                                       assetPath, AASSET_MODE_BUFFER);
+    if (asset == NULL)
+        return false;
+    const off_t assetLength = AAsset_getLength(asset);
+    if (assetLength <= 0 || (uint64_t)assetLength > UINT32_MAX ||
+        (uint64_t)assetLength > INT32_MAX)
+    {
+        AAsset_close(asset);
+        return false;
+    }
+
+    const uint32_t encodedBytes = (uint32_t)assetLength;
+    uint8_t *encoded = (uint8_t *)PlatformAllocate(encodedBytes, false);
+    uint8_t *pixels = NULL;
+    uint8_t *scratch = NULL;
+    bool succeeded = false;
+    if (encoded == NULL)
+        goto cleanup;
+    uint32_t bytesRead = 0u;
+    while (bytesRead < encodedBytes)
+    {
+        const int32_t result = AAsset_read(asset, encoded + bytesRead,
+                                           encodedBytes - bytesRead);
+        if (result <= 0)
+            goto cleanup;
+        bytesRead += (uint32_t)result;
+    }
+    AAsset_close(asset);
+    asset = NULL;
+
+    ImageInfo info;
+    memset(&info, 0, sizeof(info));
+    if (ImageInspect(encoded, encodedBytes, &info) != IMAGE_OK ||
+        info.frameCount != 1u || info.frameBytes == 0u ||
+        info.pixelBytes != info.frameBytes || info.width > UINT32_MAX / 4u)
+        goto cleanup;
+    pixels = (uint8_t *)PlatformAllocate(info.pixelBytes, false);
+    if (info.scratchBytes != 0u)
+        scratch = (uint8_t *)PlatformAllocate(info.scratchBytes, false);
+    if (pixels == NULL || (info.scratchBytes != 0u && scratch == NULL) ||
+        ImageDecode(encoded, encodedBytes, &info, pixels, info.pixelBytes,
+                    scratch, info.scratchBytes) != IMAGE_OK)
+        goto cleanup;
+
+    LaiueGraphicsTextureDescV1 description = {
+        .structSize = sizeof(description),
+        .format = LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB,
+        .extent = {info.width, info.height, 1u},
+        .mipLevels = 1u,
+        .usageFlags = 0u,
+    };
+    if (state->device->createTexture(state->device, &description, outTexture) == 0u)
+        goto cleanup;
+    LaiueGraphicsTextureUploadV1 upload = {
+        .structSize = sizeof(upload),
+        .texture = *outTexture,
+        .data = pixels,
+        .sizeBytes = info.frameBytes,
+        .rowPitchBytes = info.width * 4u,
+        .reserved = 0u,
+    };
+    succeeded = state->device->uploadTexture(state->device, &upload) != 0u;
+
+cleanup:
+    if (asset != NULL)
+        AAsset_close(asset);
+    PlatformFree(scratch);
+    PlatformFree(pixels);
+    PlatformFree(encoded);
+    if (!succeeded)
+        AndroidReleaseGraphicsHandle(state, outTexture);
+    return succeeded;
+}
+
+static LaiueGraphicsVertexV2 AndroidTerrainVertex(float x, float y, float z,
+                                                  float u, float v)
+{
+    LaiueGraphicsVertexV2 vertex = {
+        .position = {x, y, z},
+        .uv = {u, v},
+        .colorRGBA = UINT32_MAX,
+    };
+    return vertex;
+}
+
+static void AndroidAppendTerrainQuad(LaiueGraphicsVertexV2 *vertices,
+                                    uint32_t *vertexCount,
+                                    const float positions[4][3],
+                                    const float uv[4][2])
+{
+    if (vertices == NULL || vertexCount == NULL || positions == NULL || uv == NULL)
+        return;
+    const LaiueGraphicsVertexV2 corners[4] = {
+        AndroidTerrainVertex(positions[0][0], positions[0][1], positions[0][2],
+                             uv[0][0], uv[0][1]),
+        AndroidTerrainVertex(positions[1][0], positions[1][1], positions[1][2],
+                             uv[1][0], uv[1][1]),
+        AndroidTerrainVertex(positions[2][0], positions[2][1], positions[2][2],
+                             uv[2][0], uv[2][1]),
+        AndroidTerrainVertex(positions[3][0], positions[3][1], positions[3][2],
+                             uv[3][0], uv[3][1]),
+    };
+    const uint32_t pattern[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    for (uint32_t index = 0u; index < 6u; ++index)
+        vertices[(*vertexCount)++] = corners[pattern[index]];
+}
+
+static bool AndroidCreateGenericTerrainBuffer(AndroidWalkState *state,
+                                              const LaiueGraphicsVertexV2 *vertices,
+                                              uint32_t vertexCount,
+                                              LaiueGraphicsHandle *outBuffer)
+{
+    if (outBuffer != NULL)
+        *outBuffer = 0u;
+    if (state == NULL || state->device == NULL || vertices == NULL ||
+        vertexCount == 0u || outBuffer == NULL ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, createBuffer),
+                             sizeof(state->device->createBuffer)) ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
+                             sizeof(state->device->uploadBuffer)) ||
+        state->device->createBuffer == NULL || state->device->uploadBuffer == NULL)
+        return false;
+    LaiueGraphicsBufferDescV1 description = {
+        .structSize = sizeof(description),
+        .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+        .sizeBytes = (uint64_t)vertexCount * sizeof(*vertices),
+    };
+    if (state->device->createBuffer(state->device, &description, outBuffer) == 0u)
+        return false;
+    LaiueGraphicsBufferUploadV1 upload = {
+        .structSize = sizeof(upload),
+        .buffer = *outBuffer,
+        .data = vertices,
+        .sizeBytes = description.sizeBytes,
+    };
+    if (state->device->uploadBuffer(state->device, &upload) != 0u)
+        return true;
+    AndroidReleaseGraphicsHandle(state, outBuffer);
+    return false;
+}
+
+static void AndroidBuildTerrainSkirt(LaiueGraphicsVertexV2 *vertices,
+                                     float bottomZ, float topZ)
+{
+    const float minX = ANDROID_WALK_TEXTURED_TERRAIN_MIN_X;
+    const float minY = ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y;
+    const float maxX = ANDROID_WALK_TEXTURED_TERRAIN_MAX_X;
+    const float maxY = ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y;
+    const float padding = 0.01f;
+    const float uvSide[4][2] = {{0.0f, 0.0f}, {192.0f, 0.0f},
+                                {192.0f, topZ - bottomZ}, {0.0f, topZ - bottomZ}};
+    const float faces[4][4][3] = {
+        {{minX, minY - padding, bottomZ}, {maxX, minY - padding, bottomZ},
+         {maxX, minY - padding, topZ}, {minX, minY - padding, topZ}},
+        {{maxX + padding, minY, bottomZ}, {maxX + padding, maxY, bottomZ},
+         {maxX + padding, maxY, topZ}, {maxX + padding, minY, topZ}},
+        {{maxX, maxY + padding, bottomZ}, {minX, maxY + padding, bottomZ},
+         {minX, maxY + padding, topZ}, {maxX, maxY + padding, topZ}},
+        {{minX - padding, maxY, bottomZ}, {minX - padding, minY, bottomZ},
+         {minX - padding, minY, topZ}, {minX - padding, maxY, topZ}},
+    };
+    uint32_t vertexCount = 0u;
+    for (uint32_t face = 0u; face < 4u; ++face)
+        AndroidAppendTerrainQuad(vertices, &vertexCount, faces[face], uvSide);
+}
+
+static bool AndroidCreateTexturedTerrain(AndroidWalkState *state)
+{
+    static const char *const textureAssets[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT] = {
+        "textures/grass.png", "textures/dirt.png", "textures/stone.png",
+    };
+    if (state == NULL || state->device == NULL ||
+        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
+                             offsetof(LaiueGraphicsDeviceV2, createSampler),
+                             sizeof(state->device->createSampler)) ||
+        state->device->createSampler == NULL)
+        return false;
+    for (uint32_t index = 0u; index < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT; ++index)
+        if (!AndroidLoadTextureAsset(state, textureAssets[index],
+                                     &state->terrainTextures[index]))
+            goto failed;
+
+    LaiueGraphicsSamplerDescV1 sampler = {
+        .structSize = sizeof(sampler),
+        .minFilter = LAIUE_GRAPHICS_FILTER_NEAREST,
+        .magFilter = LAIUE_GRAPHICS_FILTER_NEAREST,
+        .addressModeU = LAIUE_GRAPHICS_ADDRESS_REPEAT,
+        .addressModeV = LAIUE_GRAPHICS_ADDRESS_REPEAT,
+        .addressModeW = LAIUE_GRAPHICS_ADDRESS_REPEAT,
+    };
+    if (state->device->createSampler(state->device, &sampler,
+                                     &state->terrainSampler) == 0u)
+        goto failed;
+
+    LaiueGraphicsVertexV2 top[6];
+    const float topPositions[4][3] = {
+        {ANDROID_WALK_TEXTURED_TERRAIN_MIN_X, ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y, 1.01f},
+        {ANDROID_WALK_TEXTURED_TERRAIN_MAX_X, ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y, 1.01f},
+        {ANDROID_WALK_TEXTURED_TERRAIN_MAX_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
+        {ANDROID_WALK_TEXTURED_TERRAIN_MIN_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
+    };
+    const float topUv[4][2] = {{0.0f, 0.0f}, {192.0f, 0.0f},
+                               {192.0f, 192.0f}, {0.0f, 192.0f}};
+    uint32_t topCount = 0u;
+    AndroidAppendTerrainQuad(top, &topCount, topPositions, topUv);
+
+    LaiueGraphicsVertexV2 dirt[ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT];
+    LaiueGraphicsVertexV2 stone[ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT];
+    AndroidBuildTerrainSkirt(dirt, -3.0f, 1.0f);
+    AndroidBuildTerrainSkirt(stone, -7.0f, -3.0f);
+    if (!AndroidCreateGenericTerrainBuffer(state, top, topCount,
+                                           &state->texturedTerrainBuffers[0]) ||
+        !AndroidCreateGenericTerrainBuffer(state, dirt,
+                                           ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT,
+                                           &state->texturedTerrainBuffers[1]) ||
+        !AndroidCreateGenericTerrainBuffer(state, stone,
+                                           ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT,
+                                           &state->texturedTerrainBuffers[2]))
+        goto failed;
+    state->texturedTerrainReady = true;
+    return true;
+
+failed:
+    AndroidDestroyTexturedTerrain(state);
+    return false;
+}
+
 static void AndroidDestroyDevice(AndroidWalkState *state)
 {
     if (state == NULL)
@@ -236,6 +522,7 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
         state->device->destroyHandle(state->device, state->terrainBuffer);
     state->terrainReady = false;
     state->terrainBuffer = 0u;
+    AndroidDestroyTexturedTerrain(state);
     if (state->device != NULL && state->graphics != NULL &&
         AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
                             offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
@@ -339,7 +626,10 @@ static void AndroidCreateDevice(AndroidWalkState *state)
         }
     }
     if (state->scene != NULL && state->scene->cameraInit != NULL)
-        state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, 0.0f);
+        state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, -0.32f);
+    if (!AndroidCreateTexturedTerrain(state))
+        AndroidLog(state, ANDROID_LOG_WARN,
+                   "Android walk texture assets unavailable; using flat terrain fallback");
 
     /* The renderer only records UI quads after a font atlas has been
      * installed.  A 1x1 opaque atlas is enough for the coloured touch
@@ -535,6 +825,7 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
             state->running = false;
             AndroidResetInputClock(state);
             break;
+        case APP_CMD_CONFIG_CHANGED:
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONTENT_RECT_CHANGED:
             if (state->windowReady && state->app->window != NULL && state->graphics != NULL &&
@@ -806,7 +1097,7 @@ static void AndroidStep(AndroidWalkState *state)
                                     sizeof(state->device->submit)) &&
                 state->device->submit != NULL)
             {
-                LaiueGraphicsDrawItemV2 draws[ANDROID_WALK_ACTIVE_CHUNK_COUNT];
+                LaiueGraphicsDrawItemV2 draws[ANDROID_WALK_ACTIVE_CHUNK_COUNT + 3u];
                 uint32_t drawIndex = 0u;
                 for (int32_t y = -ANDROID_WALK_ACTIVE_CHUNK_RADIUS;
                      y <= ANDROID_WALK_ACTIVE_CHUNK_RADIUS; ++y)
@@ -823,8 +1114,26 @@ static void AndroidStep(AndroidWalkState *state)
                         };
                         ++drawIndex;
                     }
-                submitted = state->device->submit(state->device, draws,
-                                                  ANDROID_WALK_ACTIVE_CHUNK_COUNT);
+                if (state->texturedTerrainReady)
+                    for (uint32_t material = 0u;
+                         material < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT;
+                         ++material)
+                    {
+                        const uint32_t vertexCount = material == 0u
+                                                         ? 6u
+                                                         : ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT;
+                        draws[drawIndex] = (LaiueGraphicsDrawItemV2){
+                            .structSize = sizeof(draws[drawIndex]),
+                            .vertexBuffer = state->texturedTerrainBuffers[material],
+                            .indexCount = vertexCount,
+                            .originRelative = {0.0f, 0.0f, 0.0f},
+                            .scale = 1.0f,
+                            .texture = state->terrainTextures[material],
+                            .sampler = state->terrainSampler,
+                        };
+                        ++drawIndex;
+                    }
+                submitted = state->device->submit(state->device, draws, drawIndex);
             }
             if (began != 0u)
                 AndroidSubmitTouchUi(state, width, height);
