@@ -384,6 +384,21 @@ endif()
 laiue_configure_standalone_executable(
     laiue_r2_16_catalog_benchmark R2CatalogBenchmarkEntryPoint)
 
+# ROUND3 A/B harness задачи 37-catalog-peak: transient peak памяти
+# однопроходного перечисления каталога. Один exe с baseline/candidate
+# laiue_content.dll; в CTest не регистрируется. psapi — только ради measured
+# peak committed/working set процесса.
+add_executable(laiue_r3_37_catalog_peak_benchmark EXCLUDE_FROM_ALL
+    r3_37_catalog_peak_benchmark.c)
+target_link_libraries(laiue_r3_37_catalog_peak_benchmark PRIVATE laiue_content)
+target_include_directories(laiue_r3_37_catalog_peak_benchmark PRIVATE
+    "${PROJECT_SOURCE_DIR}/tests")
+if(WIN32)
+    target_link_libraries(laiue_r3_37_catalog_peak_benchmark PRIVATE psapi)
+endif()
+laiue_configure_standalone_executable(
+    laiue_r3_37_catalog_peak_benchmark R3CatalogPeakBenchmarkEntryPoint)
+
 # ROUND 2: узкий A/B-стенд парсера манифеста и читателя пака. Тот же
 # исполняемый файл запускается с baseline- и candidate-копией laiue_mod.dll,
 # поэтому сравнение не зависит от сборки harness. EXCLUDE_FROM_ALL.

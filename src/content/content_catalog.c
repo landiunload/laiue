@@ -9,7 +9,12 @@
 #define FORMATS_FILE_NAME L"formats.txt"
 #define FORMATS_UTF8_CAPACITY 512U
 #define CONTENT_ENUMERATION_LIMIT 4096U
-#define CONTENT_ENUMERATION_INITIAL_CAPACITY 16U
+// Компактная staging-запись: заголовок из двух uint16 (длина имени без NUL и
+// флаг каталога) и следом length+1 wchar_t. Худший размер записи —
+// 4 + 128*2 = 260 B, поэтому потолок буфера при лимите 4096 около 1.07 MB.
+#define CONTENT_COMPACT_INITIAL_CAPACITY 1024U
+#define CONTENT_COMPACT_MAX_CAPACITY \
+    (CONTENT_ENUMERATION_LIMIT * (4U + LAIUE_CONTENT_NAME_CAPACITY * (uint32_t)sizeof(wchar_t)))
 
 struct LaiueContentCatalog
 {
@@ -523,24 +528,75 @@ static void SortEntriesByName(LaiueContentEntry* entries, uint32_t count, bool f
     }
 }
 
-// Буфер записей растёт по мере заполнения: маленький каталог не платит за
-// большой, крупный растёт геометрически. `needed` не превышает
-// CONTENT_ENUMERATION_LIMIT, потому что лимит проверяется до записи.
-static bool EnsureEntryCapacity(LaiueContentEntry **entries, uint32_t *capacity,
-                                uint32_t needed)
+// Компактная запись staging-буфера: маленький заголовок и имя ровно той
+// длины, какая пришла от каталога. За единственный обход копятся именно
+// такие записи, а полный массив LaiueContentEntry выводится из них одной
+// точной аллокацией в конце. Поэтому transient-пик не включает HeapReAlloc-
+// копии 258-байтных записей и подрезку буфера.
+struct CompactEntryHeader
 {
-    uint32_t current = *capacity;
-    uint32_t next = current == 0U
-        ? CONTENT_ENUMERATION_INITIAL_CAPACITY : current + current / 2U;
-    if (next < needed) next = needed;
-    if (next > CONTENT_ENUMERATION_LIMIT) next = CONTENT_ENUMERATION_LIMIT;
-    LaiueContentEntry *grown = PlatformReallocate(
-        *entries, (size_t)next * sizeof(*grown), false);
-    if (grown == NULL)
+    uint16_t length;    // число wchar_t в имени без завершающего NUL
+    uint16_t directory; // 0/1
+};
+
+static bool AppendCompactEntry(uint8_t **buffer, uint32_t *size, uint32_t *capacity,
+                               const wchar_t *name, uint32_t length, bool directory)
+{
+    if (length >= LAIUE_CONTENT_NAME_CAPACITY)
         return false;
-    *entries = grown;
-    *capacity = next;
+    uint32_t recordSize = (uint32_t)sizeof(struct CompactEntryHeader) +
+                          (length + 1U) * (uint32_t)sizeof(wchar_t);
+    if (*size > CONTENT_COMPACT_MAX_CAPACITY - recordSize)
+        return false;
+    if (*size + recordSize > *capacity)
+    {
+        uint32_t next = *capacity == 0U
+            ? CONTENT_COMPACT_INITIAL_CAPACITY : *capacity;
+        while (next < *size + recordSize)
+            next += next / 2U;
+        if (next > CONTENT_COMPACT_MAX_CAPACITY)
+            next = CONTENT_COMPACT_MAX_CAPACITY;
+        uint8_t *grown = PlatformReallocate(*buffer, next, false);
+        if (grown == NULL)
+            return false;
+        *buffer = grown;
+        *capacity = next;
+    }
+    struct CompactEntryHeader header;
+    header.length = (uint16_t)length;
+    header.directory = directory ? 1U : 0U;
+    memcpy(*buffer + *size, &header, sizeof(header));
+    memcpy(*buffer + *size + sizeof(header), name,
+           (size_t)(length + 1U) * sizeof(wchar_t));
+    *size += recordSize;
     return true;
+}
+
+// Выводит точный массив LaiueContentEntry из компактных записей и всегда
+// освобождает staging-буфер (в том числе при отказе аллокации). Размер
+// массива ровно stored, без последующей подрезки.
+static LaiueContentEntry* MaterializeEntries(uint8_t *buffer, uint32_t stored)
+{
+    LaiueContentEntry *entries =
+        PlatformAllocate((size_t)stored * sizeof(*entries), false);
+    if (entries == NULL)
+    {
+        PlatformFree(buffer);
+        return NULL;
+    }
+    const uint8_t *cursor = buffer;
+    for (uint32_t index = 0U; index < stored; ++index)
+    {
+        struct CompactEntryHeader header;
+        memcpy(&header, cursor, sizeof(header));
+        cursor += sizeof(header);
+        memcpy(entries[index].name, cursor, (size_t)(header.length + 1U) * sizeof(wchar_t));
+        entries[index].directory = header.directory != 0U;
+        entries[index].active = false;
+        cursor += (size_t)(header.length + 1U) * sizeof(wchar_t);
+    }
+    PlatformFree(buffer);
+    return entries;
 }
 
 bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType type,
@@ -582,14 +638,15 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
         return true;
     }
 
-    // Один обход каталога вместо двух: записи копятся в растущем буфере
-    // прямо во время чтения, а не после отдельного прохода-счётчика.
+    // Один обход каталога вместо двух: записи копятся в компактном растущем
+    // буфере прямо во время чтения, а не после отдельного прохода-счётчика.
     // `matching` считает записи, прошедшие фильтр, включая слишком длинные
     // имена, — так граница CONTENT_ENUMERATION_LIMIT остаётся прежней.
     uint32_t matching = 0U;
     uint32_t stored = 0U;
-    uint32_t capacity = 0U;
-    LaiueContentEntry* entries = NULL;
+    uint32_t compactCapacity = 0U;
+    uint32_t compactSize = 0U;
+    uint8_t* compact = NULL;
     bool overflow = false;
     bool allocationFailed = false;
     while (PlatformDirectoryNext(iterator, file))
@@ -608,15 +665,12 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
         uint32_t length = TextLengthBounded(file->name, LAIUE_CONTENT_NAME_CAPACITY);
         if (length >= LAIUE_CONTENT_NAME_CAPACITY)
             continue;
-        if (stored == capacity && !EnsureEntryCapacity(&entries, &capacity, stored + 1U))
+        if (!AppendCompactEntry(&compact, &compactSize, &compactCapacity,
+                                file->name, length, file->isDirectory))
         {
             allocationFailed = true;
             break;
         }
-        memcpy(entries[stored].name, file->name,
-            (size_t)(length + 1U) * sizeof(wchar_t));
-        entries[stored].directory = file->isDirectory;
-        entries[stored].active = false;
         ++stored;
     }
     PlatformDirectoryClose(iterator);
@@ -626,15 +680,24 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
 
     if (overflow || allocationFailed)
     {
-        PlatformFree(entries);
+        PlatformFree(compact);
         PlatformRwLockReleaseShared(&catalog->lock);
         return false;
     }
     if (stored == 0U)
     {
-        PlatformFree(entries);
+        PlatformFree(compact);
         PlatformRwLockReleaseShared(&catalog->lock);
         return true;
+    }
+
+    // Удержанная память совпадает с прежней (ровно stored записей), но
+    // достигается без HeapReAlloc-подрезки: единственная точная аллокация.
+    LaiueContentEntry* entries = MaterializeEntries(compact, stored);
+    if (entries == NULL)
+    {
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return false;
     }
 
     // Активный пак читается один раз и только для непустого списка, как и
@@ -648,16 +711,6 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
             for (uint32_t index = 0U; index < stored; ++index)
                 entries[index].active = TextEquals(entries[index].name, activeName);
         }
-    }
-
-    // Удержанная память совпадает с прежней: буфер подрезается до точного
-    // числа записей. Неудача подрезки не отменяет валидный больший буфер.
-    if (capacity != stored)
-    {
-        LaiueContentEntry* shrunk = PlatformReallocate(
-            entries, (size_t)stored * sizeof(*shrunk), false);
-        if (shrunk != NULL)
-            entries = shrunk;
     }
 
     // A content tree must resolve identically on case-sensitive and
