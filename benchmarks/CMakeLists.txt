@@ -53,7 +53,9 @@ laiue_configure_standalone_executable(
 # соседей, сплошным чанком и провайдером. EXCLUDE_FROM_ALL, как и остальные
 # бенчмарки: в CTest не регистрируется, запускается руками.
 add_executable(laiue_world_benchmark EXCLUDE_FROM_ALL world_read_benchmark.c)
-target_link_libraries(laiue_world_benchmark PRIVATE laiue_world)
+target_link_libraries(laiue_world_benchmark PRIVATE
+    laiue_world
+    laiue_numeric)
 target_include_directories(laiue_world_benchmark PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")
 laiue_configure_standalone_executable(

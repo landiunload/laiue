@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <stdbool.h>
+#include <float.h>
 
 // Быстрый путь целочисленного шага разворачивается векторно, когда профиль
 // сборки даёт AVX2 и слитное умножение-сложение: скалярный код компилятора
@@ -373,6 +374,22 @@ static void MixSample(const AudioClip *clip, double position, float left, float 
     outFrame[1] += sampleRight * right;
 }
 
+// Множитель выборки 1/32768 — степень двойки, поэтому на целом шаге его можно
+// вынести из цикла в усиление голоса и сэкономить умножение на выборку. Вынос
+// точен для конечного усиления, когда оно не меньше FLT_MIN * 2^15 (либо
+// равно нулю); положительная бесконечность тоже сохраняет результат. Тогда
+// мантисса не теряется, и
+// `(float)sample * (1/32768) * gain` считается с тем же единственным
+// округлением, что и прежняя последовательность «умножить выборку на 2^-15,
+// затем FMA с усилением». Денормальное произведение выносить нельзя: такой
+// редкий случай остаётся в общей ветви, которая даёт те же биты.
+static inline bool GainsFoldExact(float left, float right)
+{
+    const float minimumGain = FLT_MIN * 32768.0f;
+    return (left == 0.0f || left >= minimumGain)
+           && (right == 0.0f || right >= minimumGain);
+}
+
 static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
 {
     const AudioClip *clip = slot->clip;
@@ -385,13 +402,17 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
     // дробная часть позиции в цикле тождественно равна нулю, поэтому
     // интерполяция вырождается в выборку одного кадра, а позиция остаётся
     // целой. Отрезок до границы клипа проходится без проверки в каждой
-    // выборке. Арифметика выборки та же — (float)sample * (1/32768) — и
-    // результат совпадает с общей ветвью побитово.
-    if (step == 1.0 && position == (double)(uint32_t)position)
+    // выборке. Усиление уже содержит множитель 2^-15 (см. GainsFoldExact),
+    // поэтому умножение на выборку в цикле не нужно, а результат совпадает с
+    // общей ветвью побитово.
+    if (step == 1.0 && position == (double)(uint32_t)position
+        && GainsFoldExact(left, right))
     {
+        const float scale = 1.0f / 32768.0f;
+        const float scaledLeft = left * scale;
+        const float scaledRight = right * scale;
         const int16_t *samples = clip->samples;
         const uint32_t clipFrames = clip->frameCount;
-        const float scale = 1.0f / 32768.0f;
         uint32_t frame = (uint32_t)position;
         uint32_t index = 0u;
         if (clip->channelCount == 2u)
@@ -415,29 +436,29 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 uint32_t sample = 0u;
 #if defined(AUDIO_MIX_AVX2_FMA)
                 // Восемь float за итерацию — четыре стереокадра. Порядок
-                // операций на дорожку тот же, что у скалярной ветви:
-                // int16->float, умножение на scale, FMA с усилением, поэтому
+                // операций на дорожку тот же, что и в скалярной ветви:
+                // int16->float и FMA с усилением, содержащим 2^-15, — поэтому
                 // биты выхода совпадают.
-                const __m256 scaleVector = _mm256_set1_ps(scale);
-                const __m256 gainVector =
-                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                const __m256 gainVector = _mm256_setr_ps(
+                    scaledLeft, scaledRight, scaledLeft, scaledRight,
+                    scaledLeft, scaledRight, scaledLeft, scaledRight);
                 for (; sample + 4u <= count; sample += 4u)
                 {
                     __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame * 2u));
-                    __m256 scaled = _mm256_mul_ps(
-                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
+                    __m256 converted = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed));
                     float *destination = frames + (index + sample) * 2u;
-                    __m256 mix = _mm256_fmadd_ps(gainVector, scaled, _mm256_loadu_ps(destination));
+                    __m256 mix =
+                        _mm256_fmadd_ps(gainVector, converted, _mm256_loadu_ps(destination));
                     _mm256_storeu_ps(destination, mix);
                     frame += 4u;
                 }
 #endif
                 for (; sample < count; ++sample)
                 {
-                    float channelLeft = (float)samples[frame * 2u] * scale;
-                    float channelRight = (float)samples[frame * 2u + 1u] * scale;
-                    frames[(index + sample) * 2u] += channelLeft * left;
-                    frames[(index + sample) * 2u + 1u] += channelRight * right;
+                    float channelLeft = (float)samples[frame * 2u];
+                    float channelRight = (float)samples[frame * 2u + 1u];
+                    frames[(index + sample) * 2u] += channelLeft * scaledLeft;
+                    frames[(index + sample) * 2u + 1u] += channelRight * scaledRight;
                     ++frame;
                 }
                 index += count;
@@ -465,19 +486,18 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
 #if defined(AUDIO_MIX_AVX2_FMA)
                 // Восемь моносемплов за итерацию: каждый дублируется в оба
                 // канала, что даёт восемь кадров. Дублирование — перестановка
-                // уже масштабированных значений, арифметика не меняется.
-                const __m256 scaleVector = _mm256_set1_ps(scale);
-                const __m256 gainVector =
-                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                // уже приведённых к float значений, арифметика не меняется.
+                const __m256 gainVector = _mm256_setr_ps(
+                    scaledLeft, scaledRight, scaledLeft, scaledRight,
+                    scaledLeft, scaledRight, scaledLeft, scaledRight);
                 const __m256i duplicateLow = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
                 const __m256i duplicateHigh = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
                 for (; sample + 8u <= count; sample += 8u)
                 {
                     __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame));
-                    __m256 scaled = _mm256_mul_ps(
-                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
-                    __m256 low = _mm256_permutevar8x32_ps(scaled, duplicateLow);
-                    __m256 high = _mm256_permutevar8x32_ps(scaled, duplicateHigh);
+                    __m256 converted = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed));
+                    __m256 low = _mm256_permutevar8x32_ps(converted, duplicateLow);
+                    __m256 high = _mm256_permutevar8x32_ps(converted, duplicateHigh);
                     float *destination = frames + (index + sample) * 2u;
                     __m256 mixLow =
                         _mm256_fmadd_ps(gainVector, low, _mm256_loadu_ps(destination));
@@ -490,9 +510,9 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
 #endif
                 for (; sample < count; ++sample)
                 {
-                    float mono = (float)samples[frame] * scale;
-                    frames[(index + sample) * 2u] += mono * left;
-                    frames[(index + sample) * 2u + 1u] += mono * right;
+                    float mono = (float)samples[frame];
+                    frames[(index + sample) * 2u] += mono * scaledLeft;
+                    frames[(index + sample) * 2u + 1u] += mono * scaledRight;
                     ++frame;
                 }
                 index += count;

@@ -16,6 +16,7 @@
 //
 // Числа здесь — про один вызов; долей кадра игры они не являются.
 
+#include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 #include "world/world.h"
@@ -33,6 +34,10 @@
 
 static volatile uint64_t wbrSink;
 static uint64_t wbrChecksum;
+/* Мир без привязанного numeric-сервиса молча теряет правки: кадр координат
+ * не копируется, и вставка чанка не проходит. Все миры стенда создаются
+ * через WorldCreateWithNumericService с этим сервисом. */
+static const LaiueNumericServiceV1 *wbrNumeric;
 
 static BlockType wbrRegion[WBR_REGION_CELLS];
 
@@ -358,6 +363,11 @@ static void BenchmarkFillRegion(const char *name, World *world,
 
 // === Сценарии ===
 
+static World *CreateEmptyWorld(void)
+{
+    return WorldCreateWithNumericService(NULL, wbrNumeric);
+}
+
 static World *CreateProviderWorld(BenchProvider *provider, bool withFillRegion)
 {
     WorldBaseProvider description = {0};
@@ -367,7 +377,7 @@ static World *CreateProviderWorld(BenchProvider *provider, bool withFillRegion)
     {
         description.fillRegion = BenchProviderFillRegion;
     }
-    return WorldCreate(&description);
+    return WorldCreateWithNumericService(&description, wbrNumeric);
 }
 
 static void RunGetBlockCases(void)
@@ -424,7 +434,7 @@ static void RunFillCases(void)
 {
     BenchProvider provider = {0};
 
-    World *nullEmpty = WorldCreate(NULL);
+    World *nullEmpty = CreateEmptyWorld();
     if (nullEmpty == NULL)
     {
         LaiueTestRuntimeExit(1);
@@ -435,19 +445,24 @@ static void RunFillCases(void)
     // Единственная правка далеко за пределами региона: таблица непуста, но в
     // регион не попадает ни одна дельта, и весь он — воздух. Отделяет разбор
     // содержимого от обхода чанков и от записи базового слоя.
-    World *nullFarEdit = WorldCreate(NULL);
+    World *nullFarEdit = CreateEmptyWorld();
     if (nullFarEdit == NULL)
     {
         LaiueTestRuntimeExit(1);
     }
     ApplyEdit(nullFarEdit, 100000, 0, 200000, (BlockType)17U);
+    if (WorldGetBlock(nullFarEdit, 100000, 0, 200000) != (BlockType)17U)
+    {
+        WriteText("ERROR distant world edit was not applied\n");
+        LaiueTestRuntimeExit(1);
+    }
     BenchmarkFillRegion("fill.null_faredit", nullFarEdit, -1, -1, -1, WBR_REGION_SPAN);
     WorldDestroy(nullFarEdit);
 
     // Регион ровно из одного сплошного чанка: весь он непуст, и разбор обязан
     // прочитать все ячейки. Это тот же однородный путь, что и у полностью
     // пустого региона, только маски совпадений с нулём нулевые.
-    World *nullSolid = WorldCreate(NULL);
+    World *nullSolid = CreateEmptyWorld();
     if (nullSolid == NULL)
     {
         LaiueTestRuntimeExit(1);
@@ -466,7 +481,7 @@ static void RunFillCases(void)
     BenchmarkFillRegion("fill.null_solid", nullSolid, 0, 0, 0, CHUNK_SIZE);
     WorldDestroy(nullSolid);
 
-    World *nullCentral = WorldCreate(NULL);
+    World *nullCentral = CreateEmptyWorld();
     if (nullCentral == NULL)
     {
         LaiueTestRuntimeExit(1);
@@ -475,7 +490,7 @@ static void RunFillCases(void)
     BenchmarkFillRegion("fill.null_central", nullCentral, -1, -1, -1, WBR_REGION_SPAN);
     WorldDestroy(nullCentral);
 
-    World *nullNeighbours = WorldCreate(NULL);
+    World *nullNeighbours = CreateEmptyWorld();
     if (nullNeighbours == NULL)
     {
         LaiueTestRuntimeExit(1);
@@ -505,6 +520,13 @@ static void RunFillCases(void)
 
 LAIUE_TEST_ENTRY(WorldReadBenchmarkEntryPoint)
 {
+    wbrNumeric = LaiueNumericGetStaticServiceV1();
+    if (wbrNumeric == NULL)
+    {
+        WriteText("ERROR numeric provider unavailable\n");
+        LaiueTestRuntimeExit(1);
+    }
+
     char selection[64];
     uint32_t selectionLength = PlatformGetEnvironmentUtf8(
         "LAIUE_WORLD_BENCHMARK_GROUP", selection, (uint32_t)sizeof(selection));
