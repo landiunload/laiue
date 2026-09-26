@@ -40,12 +40,14 @@ struct LaiueTaskPool
     PlatformMutex doneMutex;
     PlatformConditionVariable doneCondition;
     PlatformThread workers[TASK_MAX_THREADS - 1u];
-    // Read by every participant in the bounded spin before it parks. It is a
-    // plain volatile read on purpose: the spin only decides whether parking is
-    // worth trying, and every path that actually starts work rechecks it under
-    // the mutex. A stale or torn load can cause an extra spin or a park, never
-    // a missed publication.
-    volatile int64_t generation;
+    // Read by every participant in the bounded spin before it parks. The spin
+    // itself uses plain volatile reads: a stale or torn load can cause an extra
+    // spin or a park, never a missed publication. The publication is stored
+    // release and read acquire on the path that starts work without the mutex,
+    // so a participant that observes a new generation also observes the job
+    // description written before it. Thirty-two bits are enough: only equality
+    // against the last observed value is tested, so a wrap is harmless.
+    volatile uint32_t generation;
     bool stopping;
     bool mutexReady;
     bool doneMutexReady;
@@ -152,7 +154,7 @@ static void ReportCompletion(LaiueTaskPool *pool)
 static uint32_t WorkerEntry(void *context)
 {
     LaiueTaskPool *pool = context;
-    int64_t observedGeneration = 0;
+    uint32_t observedGeneration = 0u;
     uint32_t work = 0u;
     for (;;)
     {
@@ -165,6 +167,24 @@ static uint32_t WorkerEntry(void *context)
         {
             PlatformCpuRelax();
             ++spin;
+        }
+        // The spin is plain volatile: on its own it only decides that a
+        // publication is worth taking. When a new generation is visible, the
+        // acquire read pairs with the release store in Run and lets this
+        // participant start without the mutex. A participant that saw nothing
+        // takes the mutex exactly as before, so the parked path pays no extra
+        // synchronisation on platforms where the acquire read is a locked
+        // operation.
+        if (pool->generation != observedGeneration)
+        {
+            uint32_t generation = PlatformAtomicLoadU32Acquire(&pool->generation);
+            if (generation != observedGeneration)
+            {
+                observedGeneration = generation;
+                work = ExecuteRanges(pool);
+                ReportCompletion(pool);
+                continue;
+            }
         }
         PlatformMutexLock(&pool->mutex);
         while (!pool->stopping && observedGeneration == pool->generation)
@@ -223,7 +243,9 @@ static void Run(void *context, uint32_t count, uint32_t grain, LaiueTaskRangeFun
     // far below INT64_MAX.
     pool->nextIndex = 0;
     pool->remainingWorkers = (int64_t)pool->workerCount;
-    ++pool->generation;
+    // Release so a participant that sees the new generation also sees the job
+    // description, the cursor and the barrier counter written just above.
+    PlatformAtomicStoreU32Release(&pool->generation, pool->generation + 1u);
     PlatformMutexUnlock(&pool->mutex);
     // Waking after the release keeps the woken workers from immediately
     // blocking on a mutex this thread still holds. A worker that was about to

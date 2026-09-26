@@ -14,6 +14,17 @@
 #include <string.h>
 #include <stdbool.h>
 
+// Быстрый путь целочисленного шага разворачивается векторно, когда профиль
+// сборки даёт AVX2 и слитное умножение-сложение: скалярный код компилятора
+// контрактит `frames += sample * gain` в FMA, и вектор обязан повторить ту же
+// одну округлёнку на дорожку, иначе микс перестанет совпадать побитово.
+// Прочие профили (SSE2, ARM NEON, внешние) остаются на прежнем скалярном
+// пути без изменения арифметики.
+#if defined(__AVX2__) && (defined(_MSC_VER) || defined(__FMA__))
+#include <immintrin.h>
+#define AUDIO_MIX_AVX2_FMA 1
+#endif
+
 #define AUDIO_MIX_CHANNELS 2u
 #define AUDIO_COMMAND_CAPACITY 256u
 #define AUDIO_DEFAULT_SAMPLE_RATE 48000u
@@ -282,16 +293,20 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
     }
 }
 
-static void DrainCommands(AudioDevice *device)
+// Возвращает true, если из кольца была разобрана хотя бы одна команда:
+// вызывающий использует это, чтобы понять, мог ли появиться активный голос.
+static bool DrainCommands(AudioDevice *device)
 {
     uint32_t read = device->commandRead;
     uint32_t write = PlatformAtomicLoadU32Acquire(&device->commandWrite);
+    if (read == write) return false;
     while (read != write)
     {
         ApplyCommand(device, &device->commands[read]);
         read = (read + 1u) % AUDIO_COMMAND_CAPACITY;
     }
     PlatformAtomicStoreU32Release(&device->commandRead, read);
+    return true;
 }
 
 // === Смешивание ===
@@ -387,7 +402,27 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 uint32_t run = clipFrames - frame;
                 uint32_t tail = frameCount - index;
                 uint32_t count = run < tail ? run : tail;
-                for (uint32_t sample = 0u; sample < count; ++sample)
+                uint32_t sample = 0u;
+#if defined(AUDIO_MIX_AVX2_FMA)
+                // Восемь float за итерацию — четыре стереокадра. Порядок
+                // операций на дорожку тот же, что у скалярной ветви:
+                // int16->float, умножение на scale, FMA с усилением, поэтому
+                // биты выхода совпадают.
+                const __m256 scaleVector = _mm256_set1_ps(scale);
+                const __m256 gainVector =
+                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                for (; sample + 4u <= count; sample += 4u)
+                {
+                    __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame * 2u));
+                    __m256 scaled = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
+                    float *destination = frames + (index + sample) * 2u;
+                    __m256 mix = _mm256_fmadd_ps(gainVector, scaled, _mm256_loadu_ps(destination));
+                    _mm256_storeu_ps(destination, mix);
+                    frame += 4u;
+                }
+#endif
+                for (; sample < count; ++sample)
                 {
                     float channelLeft = (float)samples[frame * 2u] * scale;
                     float channelRight = (float)samples[frame * 2u + 1u] * scale;
@@ -416,7 +451,34 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 uint32_t run = clipFrames - frame;
                 uint32_t tail = frameCount - index;
                 uint32_t count = run < tail ? run : tail;
-                for (uint32_t sample = 0u; sample < count; ++sample)
+                uint32_t sample = 0u;
+#if defined(AUDIO_MIX_AVX2_FMA)
+                // Восемь моносемплов за итерацию: каждый дублируется в оба
+                // канала, что даёт восемь кадров. Дублирование — перестановка
+                // уже масштабированных значений, арифметика не меняется.
+                const __m256 scaleVector = _mm256_set1_ps(scale);
+                const __m256 gainVector =
+                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                const __m256i duplicateLow = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+                const __m256i duplicateHigh = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
+                for (; sample + 8u <= count; sample += 8u)
+                {
+                    __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame));
+                    __m256 scaled = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
+                    __m256 low = _mm256_permutevar8x32_ps(scaled, duplicateLow);
+                    __m256 high = _mm256_permutevar8x32_ps(scaled, duplicateHigh);
+                    float *destination = frames + (index + sample) * 2u;
+                    __m256 mixLow =
+                        _mm256_fmadd_ps(gainVector, low, _mm256_loadu_ps(destination));
+                    __m256 mixHigh =
+                        _mm256_fmadd_ps(gainVector, high, _mm256_loadu_ps(destination + 8u));
+                    _mm256_storeu_ps(destination, mixLow);
+                    _mm256_storeu_ps(destination + 8u, mixHigh);
+                    frame += 8u;
+                }
+#endif
+                for (; sample < count; ++sample)
                 {
                     float mono = (float)samples[frame] * scale;
                     frames[(index + sample) * 2u] += mono * left;
@@ -531,27 +593,53 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     AudioDevice *device = (AudioDevice *)context;
     memset(frames, 0, (size_t)frameCount * AUDIO_MIX_CHANNELS * sizeof(float));
 
-    DrainCommands(device);
+    bool commandsApplied = DrainCommands(device);
+
+    // Громкость читается здесь же: после memset буфер нулевой, и нулём он
+    // остаётся только при конечной громкости — NaN или бесконечность дали бы
+    // NaN. Холостой путь это учитывает, чтобы не менять семантику сэмплов.
+    uint32_t masterBits = PlatformAtomicLoadU32Acquire(&device->masterVolumeBits);
+    bool finiteMaster = (masterBits & 0x7f800000u) != 0x7f800000u;
+
+    // Холостого микшера не касаются ни обход слотов, ни масштабирование:
+    // activeVoices и кольцо команд принадлежат потоку вывода, и нулевой счёт
+    // без разобранных команд означает, что ни один слот не ACTIVE. Буфер уже
+    // нулевой после memset, поэтому тишина не платит за проход по слотам и
+    // громкости. Голос становится ACTIVE только через COMMAND_START, значит
+    // без команд его появление невозможно.
+    if (!commandsApplied && finiteMaster
+        && PlatformAtomicLoadU32Acquire(&device->activeVoices) == 0u)
+    {
+        PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
+        return;
+    }
 
     uint32_t active = 0u;
+    bool mixedVoice = false;
     for (uint32_t index = 0; index < AUDIO_MAX_VOICES; ++index)
     {
         VoiceSlot *slot = &device->voices[index];
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
         if (slot->clip == NULL) continue;
         MixVoice(slot, frames, frameCount);
+        mixedVoice = true;
         if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE) ++active;
     }
     PlatformAtomicStoreU32Release(&device->activeVoices, active);
 
-    float master = BitsToFloat(PlatformAtomicLoadU32Acquire(&device->masterVolumeBits));
+    // Разобранные команды были, но ни один голос не дожил до микса — буфер
+    // весь нулевой, и конечная громкость с ограничением вернула бы те же нули.
     uint32_t sampleCount = frameCount * AUDIO_MIX_CHANNELS;
-    for (uint32_t index = 0; index < sampleCount; ++index)
+    if (mixedVoice || !finiteMaster)
     {
-        // Мягкое ограничение отсутствует намеренно: сумма голосов
-        // обрезается по диапазону, а решение о запасе громкости
-        // принадлежит приложению, как и остальная политика микса.
-        frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
+        float master = BitsToFloat(masterBits);
+        for (uint32_t index = 0; index < sampleCount; ++index)
+        {
+            // Мягкое ограничение отсутствует намеренно: сумма голосов
+            // обрезается по диапазону, а решение о запасе громкости
+            // принадлежит приложению, как и остальная политика микса.
+            frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
+        }
     }
     PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
 }

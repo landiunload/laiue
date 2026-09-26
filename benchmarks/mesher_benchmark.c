@@ -205,6 +205,40 @@ static void Fill(World *world, MesherFill fill)
     }
 }
 
+// Независимый счёт граней чанка: для каждого непустого блока и каждого из
+// шести направлений грань есть ровно тогда, когда сосед пуст. Столько же
+// элементарных граней видит и мешер до greedy-слияния, поэтому это ровно та
+// ёмкость, которую BuildChunkMesh выделяет под выдачу до укорачивания.
+static uint32_t CountVisibleFaces(World *world)
+{
+    static const int32_t offsets[6][3] = {
+        {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+    };
+    uint32_t total = 0u;
+    for (int64_t x = 0; x < CHUNK_SIZE; ++x)
+    {
+        for (int64_t y = 0; y < CHUNK_SIZE; ++y)
+        {
+            for (int64_t z = 0; z < CHUNK_SIZE; ++z)
+            {
+                if (WorldGetBlock(world, x, y, z) == BLOCK_AIR)
+                {
+                    continue;
+                }
+                for (uint32_t face = 0u; face < 6u; ++face)
+                {
+                    if (WorldGetBlock(world, x + offsets[face][0], y + offsets[face][1],
+                            z + offsets[face][2]) == BLOCK_AIR)
+                    {
+                        ++total;
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
 static void RunCase(MesherFill fill)
 {
     World *world = WorldCreate(NULL);
@@ -260,10 +294,17 @@ static void RunCase(MesherFill fill)
         }
     }
 
+    uint32_t faces = CountVisibleFaces(world);
     WriteText("mesher fill=");
     WriteText(FillName(fill));
     WriteText(" quads=");
     WriteUnsigned(reported);
+    WriteText(" faces=");
+    WriteUnsigned(faces);
+    WriteText(" quad_bytes=");
+    WriteUnsigned((uint64_t)reported * sizeof(ChunkQuad));
+    WriteText(" capacity_bytes=");
+    WriteUnsigned((uint64_t)faces * sizeof(ChunkQuad));
     WriteText(" best_ms=");
     WriteMilliseconds(best * 1000.0 / (double)MESHER_ITERATIONS);
     WriteText("\n");

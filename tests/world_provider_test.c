@@ -310,7 +310,7 @@ static void TestRebaseAndFormatting(void)
 // Эталон здесь побайтный и намеренно тупой: пройти буфер после вызова и
 // посмотреть, встретился ли ноль и встретилось ли что-то кроме нуля.
 
-#define REGION_BUFFER_BYTES 160U
+#define REGION_BUFFER_BYTES 320U
 #define REGION_GUARD 8U
 
 static BlockType regionPattern[REGION_BUFFER_BYTES];
@@ -399,7 +399,12 @@ static void RunRegionPatterns(World *world, bool useFillRegion)
 {
     static const uint32_t counts[] = {1U,  2U,  3U,  4U,  5U,  6U,  7U,  8U,  9U,
                                       10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U, 23U,
-                                      24U, 25U, 31U, 32U, 33U, 63U, 64U, 65U};
+                                      24U, 25U, 31U, 32U, 33U, 63U, 64U, 65U,
+                                      // Границы разбора по 128, 32 и 8 байт:
+                                      // однородный регион обязан прочитать всё,
+                                      // и хвост каждого шага надо покрыть.
+                                      95U, 96U, 97U, 127U, 128U, 129U, 159U, 160U, 161U,
+                                      255U, 256U, 257U};
     static const BlockType solids[] = {(BlockType)0x01U, (BlockType)0x7fU, (BlockType)0x80U,
                                        (BlockType)0xffU};
     for (uint32_t sizeIndex = 0U; sizeIndex < sizeof(counts) / sizeof(counts[0]); ++sizeIndex)
@@ -778,6 +783,60 @@ static void TestFastPathAfterEmpty(void)
     WorldDestroy(empty);
 }
 
+// === Регион на свежем мире: быстрый путь и полный откат ===
+//
+// WorldFillRegion, пока в таблице нет ни одного чанка, отвечает без
+// разделяемого захвата и обхода чанков. Проверяется не сам факт пропуска, а
+// то, что он не прячет правки: первая же правка внутри региона обязана быть
+// видна следующим вызовом, полный откат — вернуть исходный ответ, а целиком
+// заполненный регион — классифицироваться как сплошной. Последнее заодно
+// гоняет однородный путь разбора на всех векторах подряд.
+
+static void TestRegionEmptyOverrideFastPath(void)
+{
+    static BlockType cells[4 * 4 * 4];
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "region fast-path world was created");
+
+    for (uint32_t index = 0U; index < 64U; ++index)
+    {
+        cells[index] = (BlockType)0x5aU;
+    }
+    ProviderExpect(WorldFillRegion(world, 0, 0, 0, 4, 4, 4, cells) == WORLD_REGION_ALL_AIR,
+                   "empty world region was not all air");
+    for (uint32_t index = 0U; index < 64U; ++index)
+    {
+        ProviderExpect(cells[index] == BLOCK_AIR, "empty world region was not cleared");
+    }
+
+    ProviderExpect(WorldTrySetBlock(world, 1, 1, 1, (BlockType)77U),
+                   "region fast-path edit failed");
+    ProviderExpect(WorldFillRegion(world, 0, 0, 0, 4, 4, 4, cells) == WORLD_REGION_MIXED &&
+                       cells[((1U * 4U) + 1U) * 4U + 1U] == (BlockType)77U,
+                   "first edit after the region fast path was not visible");
+
+    // Откат последней дельты убирает опустевший чанк: счётчик снова ноль, и
+    // быстрый путь обязан сработать вторично.
+    ProviderExpect(WorldTrySetBlock(world, 1, 1, 1, BLOCK_AIR),
+                   "region fast-path revert failed");
+    ProviderExpect(WorldFillRegion(world, 0, 0, 0, 4, 4, 4, cells) == WORLD_REGION_ALL_AIR,
+                   "reverted region was not all air again");
+
+    for (int64_t x = 0; x < 4; ++x)
+    {
+        for (int64_t y = 0; y < 4; ++y)
+        {
+            for (int64_t z = 0; z < 4; ++z)
+            {
+                WorldSetBlock(world, x, y, z, (BlockType)5U);
+            }
+        }
+    }
+    ProviderExpect(WorldFillRegion(world, 0, 0, 0, 4, 4, 4, cells) == WORLD_REGION_ALL_SOLID,
+                   "solid region was not classified as all solid");
+    WorldDestroy(world);
+}
+
 // === Быстрый путь при гонке читателей и первой правки ===
 //
 // Быстрый путь читает editedChunkCount без блокировки. Проверяется именно
@@ -994,6 +1053,215 @@ static void TestEmptyChunkRemovalBackwardShift(void)
     WorldDestroy(world);
 }
 
+// === Пакет до предела: максимум одного чанка и максимум разных чанков ===
+//
+// Новая группировка и проверка дублей идут хеш-таблицами, поэтому проверяются
+// ровно границы прежнего кода: пакет на WORLD_MAX_ATOMIC_BLOCK_MUTATIONS
+// целиком в одном чанке (рост буфера дельт от нуля), тот же предел по числу
+// разных чанков, повтор координаты в мелком (линейная ветка) и крупном
+// (хеш-ветка) пакете, а также настоящая транзакционность: валидный префикс
+// крупного пакета не публикуется, если поздняя мутация не сошлась в expected.
+
+static WorldBlockMutation limitBatch[WORLD_MAX_ATOMIC_BLOCK_MUTATIONS];
+static WorldBlockMutation wideBatch[WORLD_MAX_ATOMIC_BLOCK_MUTATIONS];
+static WorldBlockMutation duplicateBatch[WORLD_MAX_ATOMIC_BLOCK_MUTATIONS];
+
+// Разные координаты, разведённые по разным чанкам: группа растёт в ширину.
+static void FillDistinctMutations(
+    WorldBlockMutation *mutations, uint32_t count, int64_t baseX)
+{
+    for (uint32_t index = 0U; index < count; ++index)
+    {
+        mutations[index].block[0] = baseX + (int64_t)index * 3 + 1;
+        mutations[index].block[1] = (int64_t)index * 7 + 2;
+        mutations[index].block[2] = (int64_t)index * 11 + 5;
+        mutations[index].expected = BLOCK_AIR;
+        mutations[index].replacement = (BlockType)(1U + (index % 200U));
+    }
+}
+
+static void TestBatchLimitsAndDuplicates(void)
+{
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "batch limit world was not created");
+
+    // Пакет во весь предел, целиком в одном чанке: буфер дельт растёт с нуля.
+    for (uint32_t index = 0U; index < WORLD_MAX_ATOMIC_BLOCK_MUTATIONS; ++index)
+    {
+        uint32_t local = index;
+        limitBatch[index].block[0] = (int64_t)(local / 4096U);
+        limitBatch[index].block[1] =
+            (int64_t)((local / CHUNK_SIZE) % CHUNK_SIZE);
+        limitBatch[index].block[2] = (int64_t)(local % CHUNK_SIZE);
+        limitBatch[index].expected = BLOCK_AIR;
+        limitBatch[index].replacement = (BlockType)(1U + (index % 255U));
+    }
+    ProviderExpect(WorldApplyBlockBatch(world, limitBatch,
+                       WORLD_MAX_ATOMIC_BLOCK_MUTATIONS),
+                   "max-size single-chunk batch was rejected");
+    ProviderExpect(WorldGetRevision(world) == WORLD_MAX_ATOMIC_BLOCK_MUTATIONS,
+                   "max-size batch revision is wrong");
+    for (uint32_t index = 0U; index < WORLD_MAX_ATOMIC_BLOCK_MUTATIONS; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, limitBatch[index].block[0],
+                           limitBatch[index].block[1],
+                           limitBatch[index].block[2]) ==
+                           limitBatch[index].replacement,
+                       "max-size batch value is wrong");
+        limitBatch[index].expected = limitBatch[index].replacement;
+        limitBatch[index].replacement = BLOCK_AIR;
+    }
+    ProviderExpect(WorldApplyBlockBatch(world, limitBatch,
+                       WORLD_MAX_ATOMIC_BLOCK_MUTATIONS),
+                   "max-size batch revert failed");
+    for (uint32_t index = 0U; index < WORLD_MAX_ATOMIC_BLOCK_MUTATIONS; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, limitBatch[index].block[0],
+                           limitBatch[index].block[1],
+                           limitBatch[index].block[2]) == BLOCK_AIR,
+                       "max-size batch revert left an override");
+    }
+
+    // Пакет во весь предел по максимуму разных чанков.
+    FillDistinctMutations(wideBatch, WORLD_MAX_ATOMIC_BLOCK_MUTATIONS, 0);
+    ProviderExpect(WorldApplyBlockBatch(world, wideBatch,
+                       WORLD_MAX_ATOMIC_BLOCK_MUTATIONS),
+                   "max-size many-chunk batch was rejected");
+    for (uint32_t index = 0U; index < WORLD_MAX_ATOMIC_BLOCK_MUTATIONS; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, wideBatch[index].block[0],
+                           wideBatch[index].block[1],
+                           wideBatch[index].block[2]) ==
+                           wideBatch[index].replacement,
+                       "max-size many-chunk batch value is wrong");
+        wideBatch[index].expected = wideBatch[index].replacement;
+        wideBatch[index].replacement = BLOCK_AIR;
+    }
+    ProviderExpect(WorldApplyBlockBatch(world, wideBatch,
+                       WORLD_MAX_ATOMIC_BLOCK_MUTATIONS),
+                   "max-size many-chunk batch revert failed");
+    for (uint32_t index = 0U; index < WORLD_MAX_ATOMIC_BLOCK_MUTATIONS; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, wideBatch[index].block[0],
+                           wideBatch[index].block[1],
+                           wideBatch[index].block[2]) == BLOCK_AIR,
+                       "many-chunk batch revert left an override");
+    }
+
+    // Мелкий дубль координаты (линейная ветка). Вторая мутация повторяет
+    // первую как no-op: без проверки дублей пакет прошёл бы и оставил пятёрку.
+    static WorldBlockMutation small[3];
+    small[0].block[0] = 700000;
+    small[0].block[1] = -13;
+    small[0].block[2] = 900001;
+    small[1].block[0] = 700003;
+    small[1].block[1] = -13;
+    small[1].block[2] = 900001;
+    small[2] = small[0];
+    small[0].expected = BLOCK_AIR;
+    small[0].replacement = (BlockType)5U;
+    small[1].expected = BLOCK_AIR;
+    small[1].replacement = (BlockType)6U;
+    small[2].expected = (BlockType)5U;
+    small[2].replacement = (BlockType)5U;
+    uint64_t beforeSmall = WorldGetRevision(world);
+    ProviderExpect(!WorldApplyBlockBatch(world, small, 3U) &&
+                       WorldGetRevision(world) == beforeSmall &&
+                       WorldGetBlock(world, small[0].block[0], small[0].block[1],
+                           small[0].block[2]) == BLOCK_AIR,
+                   "small duplicate batch was not rejected atomically");
+
+    // Крупный дубль (хеш-ветка): 128 разных чанков, последняя мутация
+    // повторяет первую как no-op.
+    FillDistinctMutations(duplicateBatch, 128U, 10000000);
+    duplicateBatch[127].block[0] = duplicateBatch[0].block[0];
+    duplicateBatch[127].block[1] = duplicateBatch[0].block[1];
+    duplicateBatch[127].block[2] = duplicateBatch[0].block[2];
+    duplicateBatch[127].expected = duplicateBatch[0].replacement;
+    duplicateBatch[127].replacement = duplicateBatch[0].replacement;
+    uint64_t beforeLarge = WorldGetRevision(world);
+    ProviderExpect(!WorldApplyBlockBatch(world, duplicateBatch, 128U) &&
+                       WorldGetRevision(world) == beforeLarge &&
+                       WorldGetBlock(world, duplicateBatch[0].block[0],
+                           duplicateBatch[0].block[1],
+                           duplicateBatch[0].block[2]) == BLOCK_AIR,
+                   "large duplicate batch was not rejected atomically");
+
+    // Транзакционность: валидный префикс и несовпадение expected в середине.
+    FillDistinctMutations(duplicateBatch, 128U, 20000000);
+    duplicateBatch[64].expected = (BlockType)99U;
+    uint64_t beforeMismatch = WorldGetRevision(world);
+    ProviderExpect(!WorldApplyBlockBatch(world, duplicateBatch, 128U) &&
+                       WorldGetRevision(world) == beforeMismatch,
+                   "expected mismatch was not rejected atomically");
+    for (uint32_t index = 0U; index < 64U; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, duplicateBatch[index].block[0],
+                           duplicateBatch[index].block[1],
+                           duplicateBatch[index].block[2]) == BLOCK_AIR,
+                       "rejected batch published an earlier block");
+    }
+
+    duplicateBatch[64].expected = BLOCK_AIR;
+    ProviderExpect(WorldApplyBlockBatch(world, duplicateBatch, 128U) &&
+                       WorldGetRevision(world) == beforeMismatch + 128U,
+                   "fixed large batch was rejected");
+    for (uint32_t index = 0U; index < 128U; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, duplicateBatch[index].block[0],
+                           duplicateBatch[index].block[1],
+                           duplicateBatch[index].block[2]) ==
+                           duplicateBatch[index].replacement,
+                       "fixed large batch value is wrong");
+    }
+
+    // Крупный пакет с несколькими мутациями в одном чанке: хеш-ветка обязана
+    // свести их в одну группу, а не завести отдельный чанк на мутацию.
+    for (uint32_t index = 0U; index < 128U; ++index)
+    {
+        uint32_t chunkIndex = index / 32U;
+        uint32_t localIndex = (index % 32U) * 128U;
+        int64_t chunkX = (int64_t)chunkIndex * 3 + 30000000;
+        int64_t chunkY = (int64_t)chunkIndex * 7 + 2;
+        int64_t chunkZ = (int64_t)chunkIndex * 11 + 5;
+        duplicateBatch[index].block[0] =
+            chunkX * CHUNK_SIZE + (int64_t)(localIndex / 4096U);
+        duplicateBatch[index].block[1] = chunkY * CHUNK_SIZE
+            + (int64_t)((localIndex / CHUNK_SIZE) % CHUNK_SIZE);
+        duplicateBatch[index].block[2] =
+            chunkZ * CHUNK_SIZE + (int64_t)(localIndex % CHUNK_SIZE);
+        duplicateBatch[index].expected = BLOCK_AIR;
+        duplicateBatch[index].replacement = (BlockType)(1U + (index % 200U));
+    }
+    uint64_t beforeGrouped = WorldGetRevision(world);
+    ProviderExpect(WorldApplyBlockBatch(world, duplicateBatch, 128U) &&
+                       WorldGetRevision(world) == beforeGrouped + 128U,
+                   "grouped large batch was rejected");
+    for (uint32_t index = 0U; index < 128U; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, duplicateBatch[index].block[0],
+                           duplicateBatch[index].block[1],
+                           duplicateBatch[index].block[2]) ==
+                           duplicateBatch[index].replacement,
+                       "grouped large batch value is wrong");
+        duplicateBatch[index].expected = duplicateBatch[index].replacement;
+        duplicateBatch[index].replacement = BLOCK_AIR;
+    }
+    ProviderExpect(WorldApplyBlockBatch(world, duplicateBatch, 128U) &&
+                       WorldGetRevision(world) == beforeGrouped + 256U,
+                   "grouped large batch revert failed");
+    for (uint32_t index = 0U; index < 128U; ++index)
+    {
+        ProviderExpect(WorldGetBlock(world, duplicateBatch[index].block[0],
+                           duplicateBatch[index].block[1],
+                           duplicateBatch[index].block[2]) == BLOCK_AIR,
+                       "grouped large batch revert left an override");
+    }
+
+    WorldDestroy(world);
+}
+
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
     WorldSetNumericService(LaiueNumericGetStaticServiceV1());
@@ -1005,7 +1273,9 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestHaloRegions();
     TestRegionCoordinateLimits();
     TestFastPathAfterEmpty();
+    TestRegionEmptyOverrideFastPath();
     TestEmptyChunkRemovalBackwardShift();
+    TestBatchLimitsAndDuplicates();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
 }

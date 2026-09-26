@@ -40,9 +40,18 @@ typedef struct MaterialSource
 {
     uint8_t *albedo;    // frameCount кадров width*height*4
     uint8_t *normal;    // NULL, если карты нормалей нет
+    // Владелец памяти `albedo`: либо сам `albedo` (PNG/JPEG/GIF), либо
+    // прочитанный целиком файл `.lt`, внутрь которого смотрит `albedo`.
+    void *albedoOwner;
+    // Владелец памяти `normal`. У встроенной в `.lt` карты нормалей он
+    // остаётся NULL: её кадры лежат в том же буфере, что и albedo.
+    void *normalOwner;
     uint32_t width;
     uint32_t height;
     uint32_t frameCount;
+    // Сколько кадров у карты нормалей: отдельный файл вправе нести один
+    // кадр на всю анимацию.
+    uint32_t normalFrameCount;
     // Длительность каждого кадра: в GIF они вправе различаться.
     uint16_t frameMilliseconds[IMAGE_MAX_FRAMES];
     // Отпечаток исходника, записанный в `.lt`. Нулевой размер означает,
@@ -112,10 +121,19 @@ static uint32_t MipChainBytes(uint32_t size)
 
 static void ReleaseSource(MaterialSource *source)
 {
-    PlatformFree(source->albedo);
-    PlatformFree(source->normal);
+    // У `.lt` пиксели смотрят внутрь прочитанного файла, и освобождать
+    // нужно именно его один раз; у остальных форматов владелец — сам
+    // `albedo`.
+    if (source->albedoOwner != NULL)
+        PlatformFree(source->albedoOwner);
+    else
+        PlatformFree(source->albedo);
+    PlatformFree(source->normalOwner);
     source->albedo = NULL;
     source->normal = NULL;
+    source->albedoOwner = NULL;
+    source->normalOwner = NULL;
+    source->normalFrameCount = 0u;
 }
 
 // === Свой формат одной текстуры ===
@@ -225,14 +243,19 @@ static bool ParseSingleTextureHeader(const uint8_t *file, uint32_t availableByte
     return true;
 }
 
-static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, MaterialSource *outSource,
+// Разбирает `.lt`, забирая буфер файла себе. Пиксели не копируются: они
+// смотрят внутрь этого буфера, и освобождает его ReleaseSource вместе с
+// источником. Так на большой текстуре не появляется второй буфер размером
+// с payload. При отказе буфер освобождается здесь же.
+static bool ParseSingleTexture(uint8_t *file, uint32_t fileBytes, MaterialSource *outSource,
                                bool wantNormals)
 {
     SingleTextureHeader header;
-    if (!ParseSingleTextureHeader(file, fileBytes, fileBytes, &header)) return false;
-
-    uint64_t frameBytes = (uint64_t)header.width * header.height * 4u;
-    uint64_t albedoBytes = frameBytes * header.frameCount;
+    if (!ParseSingleTextureHeader(file, fileBytes, fileBytes, &header))
+    {
+        PlatformFree(file);
+        return false;
+    }
 
     for (uint32_t frame = 0; frame < header.frameCount; ++frame)
     {
@@ -242,25 +265,20 @@ static bool ParseSingleTexture(const uint8_t *file, uint32_t fileBytes, Material
         outSource->frameMilliseconds[frame] = (uint16_t)(header.frameCount > 1u ? duration : 0u);
     }
 
-    const uint8_t *payload = file + header.payloadOffset;
-    uint8_t *albedo = PlatformAllocate((size_t)albedoBytes, false);
-    if (albedo == NULL) return false;
-    memcpy(albedo, payload, (size_t)albedoBytes);
-
+    // Заголовок уже проверил, что payload целиком лежит в файле и
+    // помещается в uint32.
+    uint8_t *albedo = file + header.payloadOffset;
     uint8_t *normal = NULL;
     if (header.withNormals && wantNormals)
     {
-        normal = PlatformAllocate((size_t)albedoBytes, false);
-        if (normal == NULL)
-        {
-            PlatformFree(albedo);
-            return false;
-        }
-        memcpy(normal, payload + albedoBytes, (size_t)albedoBytes);
+        normal = albedo + (size_t)header.width * header.height * 4u * header.frameCount;
     }
 
     outSource->albedo = albedo;
+    outSource->albedoOwner = file;
     outSource->normal = normal;
+    outSource->normalOwner = NULL;
+    outSource->normalFrameCount = normal != NULL ? header.frameCount : 0u;
     outSource->width = header.width;
     outSource->height = header.height;
     outSource->frameCount = header.frameCount;
@@ -339,6 +357,11 @@ typedef struct LoadScratch
     // Заголовок .lt и максимальная таблица длительностей без payload.
     // Здесь, на heap, чтобы LTO не увеличивал кадр стека renderer.
     uint8_t headerPrefix[LT_HEADER_BYTES + TEXTURE_MAX_FRAMES * 2u];
+    // Порядок форматов вычисляется один раз на сборку: файл
+    // `formats.txt` читается и разбирается, и делать это заново на каждый
+    // ресурс обоих проходов незачем.
+    const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
+    uint32_t orderCount;
 } LoadScratch;
 
 // Порядок по умолчанию: сначала исходники, свой `.lt` последним. Он
@@ -455,11 +478,9 @@ static void LoadResource(LaiueContentCatalog *catalog, LoadScratch *scratch,
     uint8_t *bytes = NULL;
     uint64_t size = 0u;
 
-    const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
-    uint32_t orderCount = LaiueContentCatalogOrderFormats(
-        catalog, LAIUE_CONTENT_TEXTURE_PACK, g_textureExtensions,
-        sizeof(g_textureExtensions) / sizeof(g_textureExtensions[0]), order,
-        LAIUE_CONTENT_FORMAT_ORDER_MAX);
+    // Порядок форматов посчитан один раз на сборку.
+    const wchar_t *const *order = scratch->order;
+    uint32_t orderCount = scratch->orderCount;
 
     for (uint32_t index = 0; index < orderCount; ++index)
     {
@@ -478,9 +499,8 @@ static void LoadResource(LaiueContentCatalog *catalog, LoadScratch *scratch,
             {
                 continue;
             }
-            bool parsed = ParseSingleTexture(bytes, (uint32_t)size, outSource, wantNormals);
-            PlatformFree(bytes);
-            if (parsed) return;
+            // Разбор забирает буфер: он же становится владельцем пикселей.
+            if (ParseSingleTexture(bytes, (uint32_t)size, outSource, wantNormals)) return;
             ReleaseSource(outSource);
             memset(outSource, 0, sizeof(*outSource));
             continue;
@@ -501,7 +521,6 @@ static void LoadResource(LaiueContentCatalog *catalog, LoadScratch *scratch,
                                                &size))
         {
             bool parsed = ParseSingleTexture(bytes, (uint32_t)size, outSource, wantNormals);
-            PlatformFree(bytes);
             bool fresh = parsed && (!hasSource ||
                                     (outSource->sourceSizeBytes == (uint32_t)source.size &&
                                      outSource->sourceModifiedTime == source.modifiedTime));
@@ -585,11 +604,9 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
     uint8_t *bytes = NULL;
     uint64_t size = 0u;
 
-    const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
-    uint32_t orderCount = LaiueContentCatalogOrderFormats(
-        catalog, LAIUE_CONTENT_TEXTURE_PACK, g_textureExtensions,
-        sizeof(g_textureExtensions) / sizeof(g_textureExtensions[0]), order,
-        LAIUE_CONTENT_FORMAT_ORDER_MAX);
+    // Порядок форматов посчитан один раз на сборку.
+    const wchar_t *const *order = scratch->order;
+    uint32_t orderCount = scratch->orderCount;
 
     for (uint32_t index = 0; index < orderCount; ++index)
     {
@@ -682,7 +699,13 @@ static void LoadMaterial(LaiueContentCatalog *catalog, LoadScratch *scratch, con
 
     LoadResource(catalog, scratch, name, true, outSource);
     if (!outSource->found) return;
-    if (outSource->normal != NULL) return;   // `.lt` уже принёс карту нормалей
+    if (outSource->normal != NULL)
+    {
+        // `.lt` уже принёс карту нормалей: её кадров столько же, сколько
+        // у albedo.
+        outSource->normalFrameCount = outSource->frameCount;
+        return;
+    }
 
     // Карта нормалей отдельным файлом: её отсутствие — норма, а не
     // ошибка. У неё свой исходник и свой кэш рядом с ним.
@@ -703,25 +726,15 @@ static void LoadMaterial(LaiueContentCatalog *catalog, LoadScratch *scratch, con
         return;
     }
 
-    uint32_t frameBytes = outSource->width * outSource->height * 4u;
-    if (normalSource.frameCount == outSource->frameCount)
-    {
-        outSource->normal = normalSource.albedo;
-        normalSource.albedo = NULL;
-    }
-    else
-    {
-        // Один кадр карты повторяется на все кадры albedo.
-        uint8_t *expanded = PlatformAllocate((size_t)frameBytes * outSource->frameCount, false);
-        if (expanded != NULL)
-        {
-            for (uint32_t frame = 0; frame < outSource->frameCount; ++frame)
-            {
-                memcpy(expanded + (size_t)frame * frameBytes, normalSource.albedo, frameBytes);
-            }
-            outSource->normal = expanded;
-        }
-    }
+    // Один кадр повторяется на все кадры albedo без копии: читатель
+    // берёт нулевой кадр по индексу. Раньше под это выделялся буфер во
+    // всю анимацию и заполнялся копиями одного и того же кадра.
+    outSource->normal = normalSource.albedo;
+    outSource->normalOwner = normalSource.albedoOwner != NULL ? normalSource.albedoOwner
+                                                              : (void *)normalSource.albedo;
+    outSource->normalFrameCount = normalSource.frameCount;
+    normalSource.albedo = NULL;
+    normalSource.albedoOwner = NULL;
     ReleaseSource(&normalSource);
 }
 
@@ -781,6 +794,13 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         PlatformFree(metas);
         return TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
     }
+
+    // Порядок форматов один на всю сборку: файл `formats.txt` читается
+    // здесь, а не заново на каждый ресурс каждого прохода.
+    scratch->orderCount = LaiueContentCatalogOrderFormats(
+        catalog, LAIUE_CONTENT_TEXTURE_PACK, g_textureExtensions,
+        sizeof(g_textureExtensions) / sizeof(g_textureExtensions[0]), scratch->order,
+        LAIUE_CONTENT_FORMAT_ORDER_MAX);
 
     // === Проход 1: только заголовки. ===
     // Раскодированные пиксели здесь не задерживаются: файл читается ради
@@ -847,32 +867,62 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         const ResourceMeta *meta = &metas[material];
         uint32_t frames = meta->found ? meta->frameCount : 1u;
 
+        // Источник карты нормалей предыдущего кадра. У карты с одним кадром на
+        // всю анимацию он повторяется кадр в кадр, и цепочку мипов достаточно
+        // посчитать один раз: одинаковый вход даёт побайтово одинаковый выход,
+        // поэтому следующий слой копируется, а не пересчитывается заново.
+        const uint8_t *previousNormal = NULL;
+        bool havePreviousNormal = false;
+
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
             bool hasPixels = source->found && frame < source->frameCount;
+            const uint8_t *normalSource = NULL;
             if (hasPixels)
             {
                 uint32_t frameBytes = source->width * source->height * 4u;
                 WriteSliceChain(source->albedo + (size_t)frame * frameBytes, source->width,
                                 source->height, size, albedoCursor);
-                if (normalCursor != NULL)
+                if (source->normal != NULL)
                 {
-                    if (source->normal != NULL)
-                    {
-                        WriteSliceChain(source->normal + (size_t)frame * frameBytes, source->width,
-                                        source->height, size, normalCursor);
-                    }
-                    else
-                    {
-                        WriteConstantChain(g_flatNormalTexel, size, normalCursor);
-                    }
+                    // Один кадр карты нормалей может обслуживать всю
+                    // анимацию: тогда он берётся по нулевому индексу.
+                    uint32_t normalFrame = frame < source->normalFrameCount ? frame : 0u;
+                    normalSource = source->normal + (size_t)normalFrame * frameBytes;
                 }
             }
             else
             {
                 WriteConstantChain(g_missingTexel, size, albedoCursor);
-                if (normalCursor != NULL) WriteConstantChain(g_flatNormalTexel, size, normalCursor);
             }
+
+            if (normalCursor != NULL)
+            {
+                if (normalSource != NULL)
+                {
+                    if (havePreviousNormal && normalSource == previousNormal)
+                    {
+                        memcpy(normalCursor, normalCursor - chainBytes, chainBytes);
+                    }
+                    else
+                    {
+                        WriteSliceChain(normalSource, source->width, source->height, size,
+                                        normalCursor);
+                    }
+                }
+                else if (havePreviousNormal && previousNormal == NULL)
+                {
+                    // Нейтральная нормаль одинакова байт в байт на всех кадрах.
+                    memcpy(normalCursor, normalCursor - chainBytes, chainBytes);
+                }
+                else
+                {
+                    WriteConstantChain(g_flatNormalTexel, size, normalCursor);
+                }
+                previousNormal = normalSource;
+                havePreviousNormal = true;
+            }
+
             albedoCursor += chainBytes;
             if (normalCursor != NULL) normalCursor += chainBytes;
         }

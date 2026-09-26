@@ -73,7 +73,7 @@ LAIUE_RENDER_API bool RendererBackendIsAvailable(RendererBackendKind backend);
 // прочих причин отказа создания.
 LAIUE_RENDER_API Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width,
                                                       int32_t height, RendererBackendKind backend);
-// Каким бэкендом создан этот Renderer.
+// Каким бэкендом создан этот живой Renderer. NULL возвращает AUTO.
 LAIUE_RENDER_API RendererBackendKind RendererGetBackend(const Renderer* renderer);
 
 // Инстанс меша: где оказывается локальный ноль меша, во сколько раз он

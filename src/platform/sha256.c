@@ -16,10 +16,31 @@ static uint32_t RotateRight(uint32_t value, uint32_t count)
     return (value >> count) | (value << (32U - count));
 }
 
+static uint32_t ByteSwap32(uint32_t value)
+{
+    return (value >> 24U) | ((value >> 8U) & 0x0000ff00U) | ((value << 8U) & 0x00ff0000U) |
+           (value << 24U);
+}
+
 static uint32_t ReadBigEndian32(const uint8_t *bytes)
 {
+    // На известных little-endian хостах (все целевые платформы движка) один
+    // 32-битный load + bswap дешевле четырёх байтовых load'ов со сдвигами.
+    // Порядок байт меняется только если host действительно little-endian;
+    // иначе остаётся переносимая байтовая реализация.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    uint32_t value;
+    memcpy(&value, bytes, sizeof(value));
+    return ByteSwap32(value);
+#elif defined(_WIN32) || defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64)
+    uint32_t value;
+    memcpy(&value, bytes, sizeof(value));
+    return ByteSwap32(value);
+#else
     return ((uint32_t)bytes[0] << 24U) | ((uint32_t)bytes[1] << 16U) | ((uint32_t)bytes[2] << 8U) |
            (uint32_t)bytes[3];
+#endif
 }
 
 static void WriteBigEndian32(uint8_t *bytes, uint32_t value)
@@ -44,20 +65,10 @@ static void Transform(LaiueSha256Context *context, const uint8_t block[64])
         0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U,
         0xc67178f2U,
     };
-    uint32_t schedule[64];
+    uint32_t schedule[16];
     for (uint32_t index = 0; index < 16U; ++index)
     {
         schedule[index] = ReadBigEndian32(block + index * 4U);
-    }
-    for (uint32_t index = 16U; index < 64U; ++index)
-    {
-        uint32_t previous15 = schedule[index - 15U];
-        uint32_t previous2 = schedule[index - 2U];
-        uint32_t sigma0 =
-            RotateRight(previous15, 7U) ^ RotateRight(previous15, 18U) ^ (previous15 >> 3U);
-        uint32_t sigma1 =
-            RotateRight(previous2, 17U) ^ RotateRight(previous2, 19U) ^ (previous2 >> 10U);
-        schedule[index] = schedule[index - 16U] + sigma0 + schedule[index - 7U] + sigma1;
     }
 
     uint32_t a = context->state[0];
@@ -70,9 +81,27 @@ static void Transform(LaiueSha256Context *context, const uint8_t block[64])
     uint32_t h = context->state[7];
     for (uint32_t index = 0; index < 64U; ++index)
     {
+        // Расписание — кольцо из 16 слов: расширение переиспользует слот
+        // index-16, поэтому scratch вчетверо меньше прежних 64 слов.
+        uint32_t word;
+        if (index < 16U)
+        {
+            word = schedule[index];
+        }
+        else
+        {
+            uint32_t previous15 = schedule[(index + 1U) & 15U];
+            uint32_t previous2 = schedule[(index + 14U) & 15U];
+            uint32_t sigma0 =
+                RotateRight(previous15, 7U) ^ RotateRight(previous15, 18U) ^ (previous15 >> 3U);
+            uint32_t sigma1 =
+                RotateRight(previous2, 17U) ^ RotateRight(previous2, 19U) ^ (previous2 >> 10U);
+            word = schedule[index & 15U] + sigma0 + schedule[(index + 9U) & 15U] + sigma1;
+            schedule[index & 15U] = word;
+        }
         uint32_t sum1 = RotateRight(e, 6U) ^ RotateRight(e, 11U) ^ RotateRight(e, 25U);
         uint32_t choose = (e & f) ^ (~e & g);
-        uint32_t temporary1 = h + sum1 + choose + roundConstants[index] + schedule[index];
+        uint32_t temporary1 = h + sum1 + choose + roundConstants[index] + word;
         uint32_t sum0 = RotateRight(a, 2U) ^ RotateRight(a, 13U) ^ RotateRight(a, 22U);
         uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
         uint32_t temporary2 = sum0 + majority;
@@ -109,6 +138,17 @@ static void Initialize(LaiueSha256Context *context)
 static void Update(LaiueSha256Context *context, const uint8_t *bytes, size_t size)
 {
     context->totalBytes += (uint64_t)size;
+    // Полные блоки при пустом буфере сжимаются прямо из входа: копирование в
+    // context->block было чистой накладной работой, а Transform блок не пишет.
+    if (context->blockBytes == 0U)
+    {
+        while (size >= sizeof(context->block))
+        {
+            Transform(context, bytes);
+            bytes += sizeof(context->block);
+            size -= sizeof(context->block);
+        }
+    }
     while (size > 0U)
     {
         size_t available = sizeof(context->block) - context->blockBytes;

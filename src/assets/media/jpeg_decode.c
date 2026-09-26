@@ -206,11 +206,21 @@ static uint32_t ReadBit(JpegReader *reader)
 
 static uint32_t ReadBits(JpegReader *reader, uint32_t count)
 {
-    uint32_t value = 0u;
-    for (uint32_t index = 0; index < count; ++index)
+    if (count == 0u) return 0u;
+    // Чтение сразу нужного числа бит вместо вызова ReadBit на каждый:
+    // байты при этом расходуются ровно так же, как в побитовом цикле,
+    // а после маркера недостающие биты так же считаются нулями.
+    EnsureBits(reader, count);
+    if (reader->bitCount >= count)
     {
-        value = (value << 1) | ReadBit(reader);
+        reader->bitCount -= count;
+        return (reader->bitBuffer >> reader->bitCount) & ((1u << count) - 1u);
     }
+    uint32_t available = reader->bitCount;
+    uint32_t value = available != 0u
+                         ? (reader->bitBuffer & ((1u << available) - 1u)) << (count - available)
+                         : 0u;
+    reader->bitCount = 0u;
     return value;
 }
 
@@ -694,9 +704,40 @@ static void OutputBlock(const JpegDecoder *decoder, const JpegComponent *compone
     InverseTransform(values, destination, component->sampleWidth);
 }
 
-static ImageStatus DecodeSequentialBlock(JpegDecoder *decoder, JpegComponent *component,
-                                         int16_t *block)
+// Блок только с DC: обратное ДКП даёт постоянный уровень. Значение
+// считается той же последовательностью float-операций, что и общий путь:
+// natural[0] = dc*quant[0], два умножения на IDCT_BASIS[0][0], затем
+// сложение с 128.5; остальные слагаемые — точные нули.
+static void OutputFlatBlock(const JpegDecoder *decoder, const JpegComponent *component, int16_t dc,
+                            uint32_t blockRow, uint32_t blockColumn)
 {
+    if (blockRow >= component->blocksPerColumn || blockColumn >= component->blocksPerLine) return;
+
+    const uint16_t *quant = decoder->quant + (size_t)component->quantTable * 64u;
+    float natural0 = (float)dc * (float)quant[0];
+    float row = 0.0f;
+    row += natural0 * IDCT_BASIS[0][0];
+    float level = 0.0f;
+    level += row * IDCT_BASIS[0][0];
+    level += 128.5f;
+    int32_t sample = 0;
+    if (level >= 256.0f) sample = 255;
+    else if (level > 0.0f) sample = (int32_t)level;
+    uint8_t value = (uint8_t)sample;
+
+    uint8_t *destination = component->samples +
+                           (size_t)blockRow * 8u * component->sampleWidth + (size_t)blockColumn * 8u;
+    for (uint32_t y = 0; y < 8u; ++y)
+    {
+        uint8_t *line = destination + (size_t)y * component->sampleWidth;
+        for (uint32_t x = 0; x < 8u; ++x) line[x] = value;
+    }
+}
+
+static ImageStatus DecodeSequentialBlock(JpegDecoder *decoder, JpegComponent *component,
+                                         int16_t *block, bool *outAcPresent)
+{
+    bool acPresent = false;
     int32_t symbol = DecodeHuffman(&decoder->reader, &decoder->huffman[component->dcTable]);
     if (symbol < 0 || symbol > 15) return IMAGE_CORRUPT;
     int32_t difference =
@@ -722,8 +763,10 @@ static ImageStatus DecodeSequentialBlock(JpegDecoder *decoder, JpegComponent *co
         index += run;
         if (index >= 64u) return IMAGE_CORRUPT;
         block[index] = (int16_t)Extend(ReadBits(&decoder->reader, size), size);
+        acPresent = true;
         index += 1u;
     }
+    *outAcPresent = acPresent;
     return IMAGE_OK;
 }
 
@@ -900,8 +943,14 @@ static ImageStatus DecodeBlock(JpegDecoder *decoder, const JpegScan *scan,
 
     int16_t block[64];
     for (uint32_t index = 0; index < 64u; ++index) block[index] = 0;
-    ImageStatus status = DecodeSequentialBlock(decoder, component, block);
+    bool acPresent = false;
+    ImageStatus status = DecodeSequentialBlock(decoder, component, block, &acPresent);
     if (status != IMAGE_OK) return status;
+    if (!acPresent)
+    {
+        OutputFlatBlock(decoder, component, block[0], blockRow, blockColumn);
+        return IMAGE_OK;
+    }
     OutputBlock(decoder, component, block, blockRow, blockColumn);
     return IMAGE_OK;
 }

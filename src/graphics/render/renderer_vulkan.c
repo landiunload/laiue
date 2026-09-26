@@ -7,7 +7,7 @@
 // HLSL переводятся в один descriptor set сдвигами (cmake/LaiueShader.cmake):
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
-#include "render/renderer.h"
+#include "render/renderer_internal.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
 #include "render/content_provider.h"
@@ -266,6 +266,7 @@ typedef enum PresentOutcome
 
 struct Renderer
 {
+    RendererHeader header;
     VkInstance instance;
     VkPhysicalDevice physicalDevice;
     VkPhysicalDeviceMemoryProperties memoryProperties;
@@ -404,10 +405,30 @@ struct Renderer
     uint32_t swapchainImageIndex;
     uint32_t swapchainRecreateCount;   // счётчик пересозданий (диагностика)
     VkImage swapchainImages[MAX_SWAPCHAIN_IMAGES];
-    VkImageView swapchainViews[MAX_SWAPCHAIN_IMAGES];
+    // Представлений образов swapchain нет намеренно: кадр копируется/блитится
+    // в VkImage напрямую, представление не используется ни одной командой.
+    // Образ swapchain создаётся только с VK_IMAGE_USAGE_TRANSFER_DST_BIT, а
+    // vkCreateImageView для такого образа нарушает
+    // VUID-VkImageViewCreateInfo-image-04441; лишние представления были бы
+    // ещё и мёртвым ресурсом.
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
+
+    // Vulkan пишет константы в кольцо на каждый draw. У инстансного пути все
+    // вызовы одного прохода несут один и тот же блок (origin = 0, meshScale =
+    // -1, остальное задано кадром и проходом), а кольцо только дописывается,
+    // поэтому первый такой draw пишет блок, а следующие переиспользуют его
+    // смещение, не копируя данные. Эта же запись позволяет не перепривязывать
+    // descriptor set, если совпали и набор, и смещение констант. Поля
+    // добавлены в конец, чтобы не сдвигать раскладку горячих полей выше.
+    bool instancedConstantsValid;
+    uint32_t instancedConstantOffset;
+    VkDescriptorSet boundChunkSet;
+    uint32_t boundChunkConstantOffset;
+    bool chunkSetBound;
 };
+
+_Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
 
 // === Мелкие помощники ===
 
@@ -2095,8 +2116,8 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
-// Освобождает образы, представления, семафоры и сам swapchain. Вызывать
-// только после WaitForGpu; безопасно на частично построенном состоянии.
+// Освобождает образы, семафоры и сам swapchain. Вызывать только после
+// WaitForGpu; безопасно на частично построенном состоянии.
 static void DestroySwapchainResources(Renderer *renderer)
 {
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
@@ -2113,11 +2134,6 @@ static void DestroySwapchainResources(Renderer *renderer)
         {
             vkDestroySemaphore(renderer->device, renderer->renderFinished[index], NULL);
             renderer->renderFinished[index] = VK_NULL_HANDLE;
-        }
-        if (renderer->swapchainViews[index] != VK_NULL_HANDLE)
-        {
-            vkDestroyImageView(renderer->device, renderer->swapchainViews[index], NULL);
-            renderer->swapchainViews[index] = VK_NULL_HANDLE;
         }
         renderer->swapchainImages[index] = VK_NULL_HANDLE;
     }
@@ -2250,29 +2266,6 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         return false;
     }
 
-    VkImageView views[MAX_SWAPCHAIN_IMAGES];
-    uint32_t viewCount = 0u;
-    VkResult viewResult = VK_SUCCESS;
-    for (; viewCount < actualCount; ++viewCount)
-    {
-        VkImageViewCreateInfo viewInfo = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = images[viewCount],
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = surfaceFormat.format,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
-        };
-        viewResult = vkCreateImageView(renderer->device, &viewInfo, NULL, &views[viewCount]);
-        if (viewResult != VK_SUCCESS) break;
-    }
-    if (viewCount != actualCount)
-    {
-        for (uint32_t index = 0; index < viewCount; ++index)
-            vkDestroyImageView(renderer->device, views[index], NULL);
-        vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
-        return false;
-    }
-
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
     for (uint32_t index = 0; index < FRAME_COUNT; ++index) imageAvailable[index] = VK_NULL_HANDLE;
@@ -2310,8 +2303,6 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
             vkDestroySemaphore(renderer->device, imageAvailable[index], NULL);
         for (uint32_t index = 0; index < finishedCount; ++index)
             vkDestroySemaphore(renderer->device, renderFinished[index], NULL);
-        for (uint32_t index = 0; index < actualCount; ++index)
-            vkDestroyImageView(renderer->device, views[index], NULL);
         vkDestroySwapchainKHR(renderer->device, swapchain, NULL);
         return false;
     }
@@ -2322,10 +2313,7 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
     for (uint32_t index = 0; index < actualCount; ++index)
-    {
         renderer->swapchainImages[index] = images[index];
-        renderer->swapchainViews[index] = views[index];
-    }
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
         renderer->imageAvailable[index] = imageAvailable[index];
     for (uint32_t index = 0; index < actualCount; ++index)
@@ -2811,6 +2799,7 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     Renderer *renderer = PlatformAllocate(sizeof(*renderer), true);
     if (renderer == NULL) return NULL;
 
+    renderer->header.backend = RENDERER_BACKEND_VULKAN;
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
@@ -3371,7 +3360,7 @@ static bool ReserveVulkanInstanceSpace(Renderer *renderer, uint32_t bytes,
 }
 
 static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint32_t instanceCount,
-                             uint32_t instanceChunkIndex, uint32_t instanceOffset)
+                             uint32_t instanceChunkIndex, uint32_t instanceOffset, bool instanced)
 {
     if (mesh == NULL || mesh->generic)
         return;
@@ -3380,19 +3369,45 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
     VkDescriptorSet set = block->sets[instanceChunkIndex][renderer->frameIndex];
     if (set == VK_NULL_HANDLE) return;
 
+    // Инстансные вызовы прохода несут один и тот же блок констант, поэтому
+    // первый из них записывает его в кольцо, а остальные берут то же смещение.
     uint32_t constantOffset = 0u;
-    if (!PushConstants(renderer, &renderer->chunkConstants, sizeof(ChunkConstants),
-                       &constantOffset))
-        return;
+    if (instanced && renderer->instancedConstantsValid)
+    {
+        constantOffset = renderer->instancedConstantOffset;
+    }
+    else
+    {
+        if (!PushConstants(renderer, &renderer->chunkConstants, sizeof(ChunkConstants),
+                           &constantOffset))
+            return;
+        if (instanced)
+        {
+            renderer->instancedConstantOffset = constantOffset;
+            renderer->instancedConstantsValid = true;
+        }
+    }
 
     // VK_WHOLE_SIZE storage descriptors require zero dynamic offsets (06715).
     // VertexIndex and InstanceIndex include these bases without changing shaders.
-    uint32_t dynamicOffsets[3] = { constantOffset, 0u, 0u };
     uint32_t firstVertex = (mesh->offsetBytes / (uint32_t)sizeof(ChunkQuad)) * 6u;
     uint32_t firstInstance = instanceOffset / (uint32_t)sizeof(RendererMeshInstance);
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            renderer->chunkPipelineLayout, 0u, 1u, &set, 3u, dynamicOffsets);
+    // Та же привязка набора с тем же смещением ничего не меняет в состоянии
+    // команды, а драйверу стоит времени; в потоке однотипных инстансных
+    // вызовов одного блока она повторяется почти на каждый вызов. Обычный
+    // draw каждый раз пишет своё смещение констант, поэтому его путь
+    // остаётся прежним: привязка без проверки кэша.
+    if (!instanced || !renderer->chunkSetBound || renderer->boundChunkSet != set ||
+        renderer->boundChunkConstantOffset != constantOffset)
+    {
+        uint32_t dynamicOffsets[3] = { constantOffset, 0u, 0u };
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                renderer->chunkPipelineLayout, 0u, 1u, &set, 3u, dynamicOffsets);
+        renderer->boundChunkSet = set;
+        renderer->boundChunkConstantOffset = constantOffset;
+        renderer->chunkSetBound = true;
+    }
     vkCmdDraw(commandBuffer, mesh->quadCount * 6u, instanceCount, firstVertex, firstInstance);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
@@ -3454,7 +3469,7 @@ void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
     renderer->chunkConstants.meshScale = 1.0f;
     vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
                       VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
-    DrawMeshInternal(renderer, mesh, 1u, 0u, 0u);
+    DrawMeshInternal(renderer, mesh, 1u, 0u, 0u, false);
 }
 
 void RendererDrawGenericMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -3491,6 +3506,7 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
         !EnsureBlockInstanceDescriptorSet(renderer, mesh->blockIndex, renderer->frameIndex,
                                           chunkIndex))
         return;
+
     memcpy(renderer->instanceBuffers[renderer->frameIndex][chunkIndex].mapped + offset, instances,
            bytes);
 
@@ -3501,7 +3517,7 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
     renderer->chunkConstants.meshScale = -1.0f;
     vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
                       VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
-    DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset);
+    DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset, true);
 }
 
 // === Кадр ===
@@ -3693,6 +3709,10 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
                               renderer->chunkConstants.materialSlices);
     renderer->chunkConstants.gammaInverse = gammaInverse;
     renderer->chunkConstants.meshScale = 1.0f;
+    // Свет и таблица слоёв этого кадра уже записаны: блок прошлого кадра
+    // больше не описывает нужные константы, кэш невалиден.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 
     if (frame->passCount == 0u)
     {
@@ -3830,6 +3850,9 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     SetViewportAndScissor(commandBuffer, x, y, width, height);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
     memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
+    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 }
 
 static void RecordPanoramaResolve(Renderer *renderer)

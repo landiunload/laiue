@@ -6,6 +6,9 @@
 #include "test_runtime.h"
 
 static uint32_t raycastChecks;
+// Стриминг без рендерера хранит лишь указатель. Нули читаются диспетчером
+// рендера как AUTO, поэтому даже случайный вызов остался бы no-op.
+static uint64_t raycastRendererPlaceholder;
 
 // Точечный обход дальней грани куба в ChunkStreamingSetCenter проверяется
 // без рендерера: рабочие потоки останавливаются ChunkStreamingPause, меши
@@ -120,7 +123,7 @@ LAIUE_TEST_ENTRY(VoxelRaycastTestEntryPoint)
         RaycastExpect(streamWorld != NULL, "streaming world was not created");
 
         ChunkStreaming *streaming = ChunkStreamingCreate(
-            streamWorld, (Renderer *)&raycastChecks, radius);
+            streamWorld, (Renderer *)&raycastRendererPlaceholder, radius);
         RaycastExpect(streaming != NULL, "streaming was not created");
         RaycastExpect(ChunkStreamingPause(streaming), "streaming was not paused");
 

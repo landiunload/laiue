@@ -120,6 +120,7 @@ laiue_add_module(render
         content_provider.c
         content_provider.h
         ui_quad.h
+        renderer_internal.h
         shader_pack.c
         shader_pack.h
         texture_build.c

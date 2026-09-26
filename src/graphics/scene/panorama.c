@@ -211,6 +211,28 @@ static void AccumulateDirection(FaceBounds bounds[6], const float direction[3])
 // её границы на гранях покрываются образом периметра экрана плюс участками
 // рёбер граней, попавшими внутрь области; выборка обоих множеств с запасом
 // RECT_MARGIN даёт консервативный прямоугольник.
+//
+// У куба 12 геометрических рёбер, но перебор «6 граней x 4 ребра» даёт 24
+// полурёбра. Восемь полурёбер задают ровно те же точки, что и соседнее
+// ребро с той же дробью t (совпадает и формула ndc, и её значение), поэтому
+// их выборка лишь повторяет уже учтённые направления. Ниже оставлены 16
+// полурёбер, покрывающих все 12 рёбер: четыре зеркальных пары (a и -a при
+// одном t) остаются целиком, а точные дубликаты убраны. Набор направлений
+// не меняется, значит не меняются и прямоугольники.
+typedef struct FaceEdgeSample
+{
+    uint8_t face;
+    uint8_t edge;
+} FaceEdgeSample;
+
+static const FaceEdgeSample FACE_EDGE_SAMPLES[16] = {
+    { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 },
+    { 1, 0 }, { 1, 1 }, { 1, 2 }, { 1, 3 },
+    { 2, 0 }, { 2, 1 }, { 2, 3 },
+    { 3, 0 }, { 3, 1 }, { 3, 2 },
+    { 5, 0 }, { 5, 1 },
+};
+
 static void ComputeFaceBounds(RendererResolveMapping mapping, float fovHalf,
     float verticalScale, FaceBounds bounds[6])
 {
@@ -237,29 +259,28 @@ static void ComputeFaceBounds(RendererResolveMapping mapping, float fovHalf,
     AccumulateDirection(bounds, center);
 
     // Рёбра граней: участки, попавшие в отображаемую область.
-    for (uint32_t face = 0; face < 6; ++face)
+    for (uint32_t sample = 0; sample < 16; ++sample)
     {
-        for (uint32_t edge = 0; edge < 4; ++edge)
+        uint32_t face = FACE_EDGE_SAMPLES[sample].face;
+        uint32_t edge = FACE_EDGE_SAMPLES[sample].edge;
+        for (uint32_t i = 0; i <= EDGE_SAMPLES; ++i)
         {
-            for (uint32_t i = 0; i <= EDGE_SAMPLES; ++i)
+            float t = (float)i / (float)EDGE_SAMPLES;
+            float u;
+            float v;
+            switch (edge)
             {
-                float t = (float)i / (float)EDGE_SAMPLES;
-                float u;
-                float v;
-                switch (edge)
-                {
-                    case 0:  u = t;    v = 0.0f; break;
-                    case 1:  u = t;    v = 1.0f; break;
-                    case 2:  u = 0.0f; v = t;    break;
-                    default: u = 1.0f; v = t;    break;
-                }
+                case 0:  u = t;    v = 0.0f; break;
+                case 1:  u = t;    v = 1.0f; break;
+                case 2:  u = 0.0f; v = t;    break;
+                default: u = 1.0f; v = t;    break;
+            }
 
-                float direction[3];
-                FaceUvToDirection(face, u, v, direction);
-                if (DirectionOnScreen(mapping, fovHalf, verticalScale, direction))
-                {
-                    AccumulateDirection(bounds, direction);
-                }
+            float direction[3];
+            FaceUvToDirection(face, u, v, direction);
+            if (DirectionOnScreen(mapping, fovHalf, verticalScale, direction))
+            {
+                AccumulateDirection(bounds, direction);
             }
         }
     }

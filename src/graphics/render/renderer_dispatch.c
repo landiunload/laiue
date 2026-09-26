@@ -1,136 +1,11 @@
 #include "render/renderer.h"
-#include "platform/system.h"
+#include "render/renderer_internal.h"
 
 #include <string.h>
 
-// Renderer* — непрозрачный указатель; полная раскладка struct Renderer
-// приватна каждому бэкенду и здесь недостижима (как и раньше — это не
-// новое ограничение, приложение тоже никогда не видела настоящую
-// структуру). Единственное, что нужно диспетчеру, — помнить, каким
-// бэкендом создан конкретный указатель, чтобы звать нужный набор
-// суффиксных функций. Создание/уничтожение рендера — редкая операция
-// (не на кадр), поэтому линейный реестр под мьютексом ничего не стоит.
-#define RENDERER_REGISTRY_CAPACITY 8u
-
-typedef struct RendererRegistryEntry
-{
-    const Renderer* handle;
-    RendererBackendKind backend;
-} RendererRegistryEntry;
-
-static RendererRegistryEntry g_rendererRegistry[RENDERER_REGISTRY_CAPACITY];
-static PlatformMutex g_rendererRegistryLock;
-static volatile uint32_t g_rendererRegistryLockState; // 0=не готов,1=готовится,2=готов
-
-// Быстрый путь без мьютекса для типичного случая одного активного рендера:
-// LookupBackend вызывается на каждый публичный вызов (в том числе на
-// тысячи DrawMesh за кадр), а захват мьютекса там стоит дороже самой
-// отрисовки. Реестр под мьютексом остаётся источником истины; здесь лишь
-// кэш одной записи. Writer (Register/Unregister, редкий) пишет handle
-// простым присваиванием и лишь потом публикует backend release-записью.
-// Reader читает backend acquire-загрузкой, и только увидев ненулевой
-// backend, читает handle: acquire гарантирует видимость записи handle.
-// Ноль означает «кэш пуст, иди в реестр под мьютексом».
-static const Renderer* g_rendererFastHandle;
-static volatile uint32_t g_rendererFastKind; // 0=пусто, иначе backend+1
-
-static void PublishFastRenderer(const Renderer* renderer, RendererBackendKind backend)
-{
-    g_rendererFastHandle = renderer;
-    PlatformAtomicStoreU32Release(&g_rendererFastKind,
-                                  renderer != NULL ? (uint32_t)backend + 1u : 0u);
-}
-
-static void EnsureRegistryLockReady(void)
-{
-    if (PlatformAtomicLoadU32Acquire(&g_rendererRegistryLockState) == 2u) return;
-    uint32_t expected = 0u;
-    if (PlatformAtomicCompareExchangeU32(&g_rendererRegistryLockState, &expected, 1u))
-    {
-        (void)PlatformMutexInitialize(&g_rendererRegistryLock);
-        PlatformAtomicStoreU32Release(&g_rendererRegistryLockState, 2u);
-        return;
-    }
-    while (PlatformAtomicLoadU32Acquire(&g_rendererRegistryLockState) != 2u)
-    {
-        PlatformSleepMilliseconds(0u);
-    }
-}
-
-static void RegisterRenderer(Renderer* renderer, RendererBackendKind backend)
-{
-    EnsureRegistryLockReady();
-    PlatformMutexLock(&g_rendererRegistryLock);
-    for (uint32_t i = 0; i < RENDERER_REGISTRY_CAPACITY; ++i)
-    {
-        if (g_rendererRegistry[i].handle == NULL)
-        {
-            g_rendererRegistry[i].handle = renderer;
-            g_rendererRegistry[i].backend = backend;
-            break;
-        }
-    }
-    if (g_rendererFastHandle == NULL)
-    {
-        PublishFastRenderer(renderer, backend);
-    }
-    PlatformMutexUnlock(&g_rendererRegistryLock);
-}
-
-static void UnregisterRenderer(const Renderer* renderer)
-{
-    EnsureRegistryLockReady();
-    PlatformMutexLock(&g_rendererRegistryLock);
-    for (uint32_t i = 0; i < RENDERER_REGISTRY_CAPACITY; ++i)
-    {
-        if (g_rendererRegistry[i].handle == renderer)
-        {
-            g_rendererRegistry[i].handle = NULL;
-            break;
-        }
-    }
-    if (g_rendererFastHandle == renderer)
-    {
-        // Гасим кэш release-записью нуля и поднимаем любого оставшегося.
-        PlatformAtomicStoreU32Release(&g_rendererFastKind, 0u);
-        g_rendererFastHandle = NULL;
-        for (uint32_t i = 0; i < RENDERER_REGISTRY_CAPACITY; ++i)
-        {
-            if (g_rendererRegistry[i].handle != NULL)
-            {
-                PublishFastRenderer(g_rendererRegistry[i].handle,
-                                    g_rendererRegistry[i].backend);
-                break;
-            }
-        }
-    }
-    PlatformMutexUnlock(&g_rendererRegistryLock);
-}
-
 static RendererBackendKind LookupBackend(const Renderer* renderer)
 {
-    if (renderer == NULL) return RENDERER_BACKEND_AUTO;
-
-    // Горячий путь: один активный рендер — ни мьютекса, ни линейного скана.
-    uint32_t fastKind = PlatformAtomicLoadU32Acquire(&g_rendererFastKind);
-    if (fastKind != 0u && g_rendererFastHandle == renderer)
-    {
-        return (RendererBackendKind)(fastKind - 1u);
-    }
-
-    EnsureRegistryLockReady();
-    PlatformMutexLock(&g_rendererRegistryLock);
-    RendererBackendKind result = RENDERER_BACKEND_AUTO;
-    for (uint32_t i = 0; i < RENDERER_REGISTRY_CAPACITY; ++i)
-    {
-        if (g_rendererRegistry[i].handle == renderer)
-        {
-            result = g_rendererRegistry[i].backend;
-            break;
-        }
-    }
-    PlatformMutexUnlock(&g_rendererRegistryLock);
-    return result;
+    return renderer != NULL ? ((const RendererHeader *)renderer)->backend : RENDERER_BACKEND_AUTO;
 }
 
 // === Внешние объявления обеих суффиксных реализаций ===
@@ -295,7 +170,6 @@ Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width, int32_t h
     default:
         return NULL;
     }
-    if (renderer != NULL) RegisterRenderer(renderer, backend);
     return renderer;
 }
 
@@ -316,13 +190,11 @@ void RendererDestroy(Renderer* renderer)
     {
 #if defined(LAIUE_RENDER_HAS_D3D12)
     case RENDERER_BACKEND_D3D12:
-        UnregisterRenderer(renderer);
         RendererDestroy_D3D12(renderer);
         return;
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
-        UnregisterRenderer(renderer);
         RendererDestroy_Vulkan(renderer);
         return;
 #endif

@@ -9,6 +9,12 @@
 #define FORMATS_FILE_NAME L"formats.txt"
 #define FORMATS_UTF8_CAPACITY 512U
 #define CONTENT_ENUMERATION_LIMIT 4096U
+// Компактная staging-запись: заголовок из двух uint16 (длина имени без NUL и
+// флаг каталога) и следом length+1 wchar_t. Худший размер записи —
+// 4 + 128*2 = 260 B, поэтому потолок буфера при лимите 4096 около 1.07 MB.
+#define CONTENT_COMPACT_INITIAL_CAPACITY 1024U
+#define CONTENT_COMPACT_MAX_CAPACITY \
+    (CONTENT_ENUMERATION_LIMIT * (4U + LAIUE_CONTENT_NAME_CAPACITY * (uint32_t)sizeof(wchar_t)))
 
 struct LaiueContentCatalog
 {
@@ -78,6 +84,24 @@ static int32_t TextCompare(const wchar_t* left, const wchar_t* right)
     uint32_t index = 0;
     while (left[index] != L'\0' && right[index] != L'\0' && left[index] == right[index])
         ++index;
+    return left[index] < right[index] ? -1 : left[index] > right[index] ? 1 : 0;
+}
+
+// Порядок по свёрнутому ASCII-регистру. Две строки сравниваются нулём
+// ровно тогда, когда они равны в смысле TextEqualsAsciiCaseInsensitive:
+// этого достаточно, чтобы искать неоднозначные имена в отсортированном
+// массиве, а не перебором всех пар.
+static int32_t TextCompareAsciiFolded(const wchar_t* left, const wchar_t* right)
+{
+    uint32_t index = 0;
+    while (left[index] != L'\0' && right[index] != L'\0')
+    {
+        wchar_t leftFolded = FoldAsciiCase(left[index]);
+        wchar_t rightFolded = FoldAsciiCase(right[index]);
+        if (leftFolded != rightFolded)
+            return leftFolded < rightFolded ? -1 : 1;
+        ++index;
+    }
     return left[index] < right[index] ? -1 : left[index] > right[index] ? 1 : 0;
 }
 
@@ -458,6 +482,123 @@ bool LaiueContentCatalogGetActivePack(LaiueContentCatalog *catalog, LaiueContent
     return read;
 }
 
+// In-place heapsort с прямым сравнением имён. Insertion sort был O(n^2) по
+// копиям крупных LaiueContentEntry: на каталоге в тысячи записей это
+// доминировало над самим перечислением. Порядок при строгом сравнении тот же,
+// что и раньше, — возрастание кодовых единиц.
+static int32_t CompareEntryNames(const LaiueContentEntry* left, const LaiueContentEntry* right,
+                                 bool folded)
+{
+    return folded ? TextCompareAsciiFolded(left->name, right->name)
+                  : TextCompare(left->name, right->name);
+}
+
+static void SiftEntriesDown(LaiueContentEntry* entries, uint32_t count, uint32_t root,
+                            bool folded)
+{
+    for (;;)
+    {
+        uint32_t child = root * 2U + 1U;
+        if (child >= count)
+            return;
+        if (child + 1U < count &&
+            CompareEntryNames(&entries[child + 1U], &entries[child], folded) > 0)
+            ++child;
+        if (CompareEntryNames(&entries[root], &entries[child], folded) >= 0)
+            return;
+        LaiueContentEntry swap = entries[root];
+        entries[root] = entries[child];
+        entries[child] = swap;
+        root = child;
+    }
+}
+
+static void SortEntriesByName(LaiueContentEntry* entries, uint32_t count, bool folded)
+{
+    if (count < 2U)
+        return;
+    for (uint32_t start = count / 2U; start > 0U; --start)
+        SiftEntriesDown(entries, count, start - 1U, folded);
+    for (uint32_t end = count - 1U; end > 0U; --end)
+    {
+        LaiueContentEntry swap = entries[0];
+        entries[0] = entries[end];
+        entries[end] = swap;
+        SiftEntriesDown(entries, end, 0U, folded);
+    }
+}
+
+// Компактная запись staging-буфера: маленький заголовок и имя ровно той
+// длины, какая пришла от каталога. За единственный обход копятся именно
+// такие записи, а полный массив LaiueContentEntry выводится из них одной
+// точной аллокацией в конце. Поэтому transient-пик не включает HeapReAlloc-
+// копии 258-байтных записей и подрезку буфера.
+struct CompactEntryHeader
+{
+    uint16_t length;    // число wchar_t в имени без завершающего NUL
+    uint16_t directory; // 0/1
+};
+
+static bool AppendCompactEntry(uint8_t **buffer, uint32_t *size, uint32_t *capacity,
+                               const wchar_t *name, uint32_t length, bool directory)
+{
+    if (length >= LAIUE_CONTENT_NAME_CAPACITY)
+        return false;
+    uint32_t recordSize = (uint32_t)sizeof(struct CompactEntryHeader) +
+                          (length + 1U) * (uint32_t)sizeof(wchar_t);
+    if (*size > CONTENT_COMPACT_MAX_CAPACITY - recordSize)
+        return false;
+    if (*size + recordSize > *capacity)
+    {
+        uint32_t next = *capacity == 0U
+            ? CONTENT_COMPACT_INITIAL_CAPACITY : *capacity;
+        while (next < *size + recordSize)
+            next += next / 2U;
+        if (next > CONTENT_COMPACT_MAX_CAPACITY)
+            next = CONTENT_COMPACT_MAX_CAPACITY;
+        uint8_t *grown = PlatformReallocate(*buffer, next, false);
+        if (grown == NULL)
+            return false;
+        *buffer = grown;
+        *capacity = next;
+    }
+    struct CompactEntryHeader header;
+    header.length = (uint16_t)length;
+    header.directory = directory ? 1U : 0U;
+    memcpy(*buffer + *size, &header, sizeof(header));
+    memcpy(*buffer + *size + sizeof(header), name,
+           (size_t)(length + 1U) * sizeof(wchar_t));
+    *size += recordSize;
+    return true;
+}
+
+// Выводит точный массив LaiueContentEntry из компактных записей и всегда
+// освобождает staging-буфер (в том числе при отказе аллокации). Размер
+// массива ровно stored, без последующей подрезки.
+static LaiueContentEntry* MaterializeEntries(uint8_t *buffer, uint32_t stored)
+{
+    LaiueContentEntry *entries =
+        PlatformAllocate((size_t)stored * sizeof(*entries), false);
+    if (entries == NULL)
+    {
+        PlatformFree(buffer);
+        return NULL;
+    }
+    const uint8_t *cursor = buffer;
+    for (uint32_t index = 0U; index < stored; ++index)
+    {
+        struct CompactEntryHeader header;
+        memcpy(&header, cursor, sizeof(header));
+        cursor += sizeof(header);
+        memcpy(entries[index].name, cursor, (size_t)(header.length + 1U) * sizeof(wchar_t));
+        entries[index].directory = header.directory != 0U;
+        entries[index].active = false;
+        cursor += (size_t)(header.length + 1U) * sizeof(wchar_t);
+    }
+    PlatformFree(buffer);
+    return entries;
+}
+
 bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType type,
                                   LaiueContentList *outList)
 {
@@ -497,110 +638,103 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
         return true;
     }
 
-    uint32_t count = 0;
+    // Один обход каталога вместо двух: записи копятся в компактном растущем
+    // буфере прямо во время чтения, а не после отдельного прохода-счётчика.
+    // `matching` считает записи, прошедшие фильтр, включая слишком длинные
+    // имена, — так граница CONTENT_ENUMERATION_LIMIT остаётся прежней.
+    uint32_t matching = 0U;
+    uint32_t stored = 0U;
+    uint32_t compactCapacity = 0U;
+    uint32_t compactSize = 0U;
+    uint8_t* compact = NULL;
+    bool overflow = false;
+    bool allocationFailed = false;
     while (PlatformDirectoryNext(iterator, file))
-    {
-        if (!file->isSymbolicLink
-            && StorageMatches(format, file->isDirectory)
-            && LaiueContentNameIsSafe(file->name)
-            && LaiueContentNameMatches(type, file->name))
-        {
-            if (count == CONTENT_ENUMERATION_LIMIT)
-            {
-                PlatformDirectoryClose(iterator);
-                PlatformFree(file);
-                PlatformFree(iterator);
-                PlatformFree(directoryPath);
-                PlatformRwLockReleaseShared(&catalog->lock);
-                return false;
-            }
-            ++count;
-        }
-    }
-    PlatformDirectoryClose(iterator);
-    if (count == 0U)
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return true;
-    }
-
-    LaiueContentEntry* entries = PlatformAllocate(
-        (size_t)count * sizeof(*entries), true);
-    if (entries == NULL)
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return false;
-    }
-    wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    bool hasActive = format->pack &&
-                     GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY);
-
-    uint32_t index = 0;
-    if (!PlatformDirectoryOpen(iterator, directoryPath))
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformFree(entries);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return false;
-    }
-    while (index < count && PlatformDirectoryNext(iterator, file))
     {
         if (file->isSymbolicLink
             || !StorageMatches(format, file->isDirectory)
             || !LaiueContentNameIsSafe(file->name)
             || !LaiueContentNameMatches(type, file->name))
             continue;
+        if (matching == CONTENT_ENUMERATION_LIMIT)
+        {
+            overflow = true;
+            break;
+        }
+        ++matching;
         uint32_t length = TextLengthBounded(file->name, LAIUE_CONTENT_NAME_CAPACITY);
-        if (length >= LAIUE_CONTENT_NAME_CAPACITY) continue;
-        memcpy(entries[index].name, file->name,
-            (size_t)(length + 1U) * sizeof(wchar_t));
-        entries[index].directory = file->isDirectory;
-        entries[index].active = hasActive
-            && TextEquals(entries[index].name, activeName);
-        ++index;
+        if (length >= LAIUE_CONTENT_NAME_CAPACITY)
+            continue;
+        if (!AppendCompactEntry(&compact, &compactSize, &compactCapacity,
+                                file->name, length, file->isDirectory))
+        {
+            allocationFailed = true;
+            break;
+        }
+        ++stored;
     }
     PlatformDirectoryClose(iterator);
     PlatformFree(file);
     PlatformFree(iterator);
     PlatformFree(directoryPath);
 
-    for (uint32_t i = 1; i < index; ++i)
+    if (overflow || allocationFailed)
     {
-        LaiueContentEntry value = entries[i];
-        uint32_t position = i;
-        while (position > 0U && TextCompare(value.name, entries[position - 1U].name) < 0)
+        PlatformFree(compact);
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return false;
+    }
+    if (stored == 0U)
+    {
+        PlatformFree(compact);
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return true;
+    }
+
+    // Удержанная память совпадает с прежней (ровно stored записей), но
+    // достигается без HeapReAlloc-подрезки: единственная точная аллокация.
+    LaiueContentEntry* entries = MaterializeEntries(compact, stored);
+    if (entries == NULL)
+    {
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return false;
+    }
+
+    // Активный пак читается один раз и только для непустого списка, как и
+    // раньше; пометка `active` ставится после заполнения, чтобы чтение
+    // active.txt не попадало в горячий обход каталога.
+    if (format->pack)
+    {
+        wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
+        if (GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY))
         {
-            entries[position] = entries[position - 1U];
-            --position;
+            for (uint32_t index = 0U; index < stored; ++index)
+                entries[index].active = TextEquals(entries[index].name, activeName);
         }
-        entries[position] = value;
     }
 
     // A content tree must resolve identically on case-sensitive and
     // case-insensitive filesystems.  Reject the entire ambiguous view instead
     // of selecting a platform-dependent winner.
-    for (uint32_t left = 0; left < index; ++left)
+    //
+    // Неоднозначные имена соседствуют в порядке по свёрнутому регистру,
+    // поэтому проверка идёт за один проход, а не перебором всех пар.
+    if (stored > 1U)
     {
-        for (uint32_t right = left + 1U; right < index; ++right)
+        SortEntriesByName(entries, stored, true);
+        for (uint32_t i = 1U; i < stored; ++i)
         {
-            if (TextEqualsAsciiCaseInsensitive(entries[left].name, entries[right].name))
+            if (TextCompareAsciiFolded(entries[i - 1U].name, entries[i].name) == 0)
             {
                 PlatformFree(entries);
                 PlatformRwLockReleaseShared(&catalog->lock);
                 return false;
             }
         }
+        SortEntriesByName(entries, stored, false);
     }
     outList->entries = entries;
-    outList->count = index;
+    outList->count = stored;
     PlatformRwLockReleaseShared(&catalog->lock);
     return true;
 }

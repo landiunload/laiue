@@ -23,7 +23,6 @@ typedef struct LoadedMod
 {
     bool reserved;
     bool used;
-    uint64_t loadSequence;
     wchar_t packName[LAIUE_MOD_NATIVE_NAME_CAPACITY];
     LaiueModManifest manifest;
     PlatformDynamicLibrary library;
@@ -52,9 +51,14 @@ struct LaiueModHost
     RegisteredService services[LAIUE_MOD_HOST_MAX_SERVICES];
     LoadedMod loaded[LAIUE_MOD_HOST_MAX_LOADED];
     uint32_t loadedCount;
-    uint64_t nextLoadSequence;
     bool lifecycleBusy;
+    // Slots stay at fixed addresses because extensions retain api.hostContext.
+    // This list alone defines load order; no per-slot sequence counters needed.
+    uint8_t loadedOrder[LAIUE_MOD_HOST_MAX_LOADED];
 };
+
+_Static_assert(LAIUE_MOD_HOST_MAX_LOADED <= UINT8_MAX + 1u,
+               "loaded slot indices must fit in uint8_t");
 
 _Static_assert(sizeof(LaiueModLoadFunctionV1) == sizeof(void *),
                "dynamic-library symbols must fit ABI function pointers");
@@ -577,10 +581,9 @@ LaiueModStatus LaiueModHostLoad(LaiueModHost *host, const wchar_t *packName,
 
     PlatformRwLockAcquireExclusive(&host->lock);
     slot->library = library;
-    slot->loadSequence = ++host->nextLoadSequence;
     slot->used = true;
     slot->reserved = false;
-    ++host->loadedCount;
+    host->loadedOrder[host->loadedCount++] = (uint8_t)(slot - host->loaded);
     FillLoadedInfo(slot, outInfo);
     host->lifecycleBusy = false;
     PlatformRwLockReleaseExclusive(&host->lock);
@@ -676,8 +679,18 @@ LaiueModStatus LaiueModHostUnload(LaiueModHost *host, const char *modId,
     PlatformDynamicLibraryClose(slot->library);
 
     PlatformRwLockAcquireExclusive(&host->lock);
-    memset(slot, 0, sizeof(*slot));
+    uint32_t position = 0u;
+    while (position + 1u < host->loadedCount &&
+           host->loadedOrder[position] != (uint8_t)(slot - host->loaded))
+    {
+        ++position;
+    }
     --host->loadedCount;
+    for (; position < host->loadedCount; ++position)
+    {
+        host->loadedOrder[position] = host->loadedOrder[position + 1u];
+    }
+    memset(slot, 0, sizeof(*slot));
     host->lifecycleBusy = false;
     PlatformRwLockReleaseExclusive(&host->lock);
     return LAIUE_MOD_STATUS_OK;
@@ -693,16 +706,11 @@ void LaiueModHostUnloadAll(LaiueModHost *host)
     {
         char latestId[LAIUE_MOD_ID_CAPACITY];
         latestId[0] = '\0';
-        uint64_t latestSequence = 0u;
         PlatformRwLockAcquireShared(&host->lock);
-        for (uint32_t index = 0; index < LAIUE_MOD_HOST_MAX_LOADED; ++index)
+        if (host->loadedCount != 0u)
         {
-            const LoadedMod *mod = &host->loaded[index];
-            if (mod->used && mod->loadSequence > latestSequence)
-            {
-                latestSequence = mod->loadSequence;
-                CopyAscii(latestId, LAIUE_MOD_ID_CAPACITY, mod->manifest.id);
-            }
+            const LoadedMod *mod = &host->loaded[host->loadedOrder[host->loadedCount - 1u]];
+            CopyAscii(latestId, LAIUE_MOD_ID_CAPACITY, mod->manifest.id);
         }
         PlatformRwLockReleaseShared(&host->lock);
         if (latestId[0] == '\0')
@@ -743,28 +751,7 @@ bool LaiueModHostGetLoaded(const LaiueModHost *host, uint32_t index, LaiueModLoa
         return false;
     }
 
-    const LoadedMod *selected = NULL;
-    uint64_t previousSequence = 0u;
-    for (uint32_t rank = 0; rank <= index; ++rank)
-    {
-        selected = NULL;
-        for (uint32_t slotIndex = 0; slotIndex < LAIUE_MOD_HOST_MAX_LOADED; ++slotIndex)
-        {
-            const LoadedMod *candidate = &host->loaded[slotIndex];
-            if (candidate->used && candidate->loadSequence > previousSequence &&
-                (selected == NULL || candidate->loadSequence < selected->loadSequence))
-            {
-                selected = candidate;
-            }
-        }
-        if (selected == NULL)
-        {
-            PlatformRwLockReleaseShared(&mutableHost->lock);
-            return false;
-        }
-        previousSequence = selected->loadSequence;
-    }
-    FillLoadedInfo(selected, outInfo);
+    FillLoadedInfo(&host->loaded[host->loadedOrder[index]], outInfo);
     PlatformRwLockReleaseShared(&mutableHost->lock);
     return true;
 }

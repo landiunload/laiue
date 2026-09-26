@@ -413,22 +413,82 @@ void ImageResample(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceH
         return;
     }
 
+    // Увеличение: блок выборки — ровно один исходный пиксель. При
+    // samples == 1 взвешенное частное (texel·alpha + alpha/2)/alpha равно
+    // texel, ведь 0 ≤ alpha/2 < alpha; прозрачный пиксель даёт то же
+    // обычным средним, а альфа-канал — сам alpha. Значит увеличение есть
+    // повтор ближайшего пикселя, и его можно копировать без делений.
+    if (sourceWidth <= destinationWidth && sourceHeight <= destinationHeight)
+    {
+        uint32_t columnStep = sourceWidth / destinationWidth;
+        uint32_t columnRemainderStep = sourceWidth % destinationWidth;
+
+        for (uint32_t row = 0; row < destinationHeight; ++row)
+        {
+            uint32_t sourceRow = (uint32_t)((uint64_t)row * sourceHeight / destinationHeight);
+            const uint8_t *sourceLine = source + (size_t)sourceRow * sourceWidth * 4u;
+            uint8_t *destinationLine = destination + (size_t)row * destinationWidth * 4u;
+
+            // firstColumn(c) = floor(c·sourceWidth / destinationWidth)
+            // считается накопительным счётчиком: на выходной пиксель не
+            // приходится ни одного деления.
+            uint32_t sourceColumn = 0u;
+            uint32_t remainder = 0u;
+            for (uint32_t column = 0; column < destinationWidth; ++column)
+            {
+                const uint8_t *texel = sourceLine + (size_t)sourceColumn * 4u;
+                uint8_t *out = destinationLine + (size_t)column * 4u;
+                out[0] = texel[0];
+                out[1] = texel[1];
+                out[2] = texel[2];
+                out[3] = texel[3];
+
+                sourceColumn += columnStep;
+                remainder += columnRemainderStep;
+                if (remainder >= destinationWidth)
+                {
+                    remainder -= destinationWidth;
+                    ++sourceColumn;
+                }
+            }
+        }
+        return;
+    }
+
+    // Общий путь: уменьшение с произвольным коэффициентом и смешанный
+    // масштаб (одна ось вниз, другая вверх). Границы исходного
+    // прямоугольника считаются в целых числах: одна и та же формула даёт
+    // и усреднение при уменьшении, и ближайший пиксель при увеличении.
+    //
+    // Границы столбцов firstColumn(c) = floor(c·sourceWidth/destinationWidth)
+    // зависят только от номера столбца, поэтому ведутся накопительным
+    // счётчиком, как в пути увеличения: на выходной пиксель не приходится
+    // ни одного деления. Значения те же самые, что и у прямого деления.
+    uint32_t columnStep = sourceWidth / destinationWidth;
+    uint32_t columnRemainderStep = sourceWidth % destinationWidth;
+
     for (uint32_t row = 0; row < destinationHeight; ++row)
     {
-        // Границы исходного прямоугольника считаются в целых числах:
-        // одна и та же формула даёт и усреднение при уменьшении, и
-        // ближайший пиксель при увеличении.
         uint32_t firstRow = (uint32_t)((uint64_t)row * sourceHeight / destinationHeight);
         uint32_t lastRow = (uint32_t)(((uint64_t)row + 1u) * sourceHeight / destinationHeight);
         if (lastRow <= firstRow) lastRow = firstRow + 1u;
 
+        uint32_t columnBegin = 0u;
+        uint32_t columnRemainder = 0u;
+
         for (uint32_t column = 0; column < destinationWidth; ++column)
         {
-            uint32_t firstColumn =
-                (uint32_t)((uint64_t)column * sourceWidth / destinationWidth);
-            uint32_t lastColumn =
-                (uint32_t)(((uint64_t)column + 1u) * sourceWidth / destinationWidth);
+            uint32_t columnEnd = columnBegin + columnStep;
+            columnRemainder += columnRemainderStep;
+            if (columnRemainder >= destinationWidth)
+            {
+                columnRemainder -= destinationWidth;
+                ++columnEnd;
+            }
+            uint32_t firstColumn = columnBegin;
+            uint32_t lastColumn = columnEnd;
             if (lastColumn <= firstColumn) lastColumn = firstColumn + 1u;
+            columnBegin = columnEnd;
 
             uint64_t weightedRed = 0u;
             uint64_t weightedGreen = 0u;

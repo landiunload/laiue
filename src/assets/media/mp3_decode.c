@@ -72,6 +72,12 @@ typedef struct Mp3State
     uint32_t reservoirFill;
 
     float pow43[MP3_POW43_COUNT];
+    // Таблица pow43 строится лениво: сколько записей уже готово и корень
+    // последней. Записи строятся по порядку с тем же seed Ньютона, что и
+    // в полном цикле, поэтому значения побитово те же; непостроенный
+    // хвост не читается вовсе.
+    uint32_t pow43Built;
+    double pow43Root;
     // Хвост предыдущего блока для перекрытия и кольцевой буфер банка
     // фильтров — то, что обязано пережить кадр.
     float overlap[2][MP3_SUBBANDS * MP3_SUBBAND_SAMPLES];
@@ -83,7 +89,11 @@ typedef struct Mp3State
 
     // Целые значения после Хаффмана и они же после требантования:
     // знак и величина нужны раздельно, поэтому не одно поле, а два.
+    // quantMax — наибольшая величина гранулы: по ней лениво достраивается
+    // pow43. Всё, что не переполняет linbits, не больше пятнадцати,
+    // поэтому обновляется она только на редких чтениях linbits.
     int16_t quantized[2][MP3_GRANULE_SAMPLES];
+    uint32_t quantMax[2];
     float spectrum[2][MP3_GRANULE_SAMPLES];
     float reorderScratch[MP3_GRANULE_SAMPLES];
     float blockScratch[36];
@@ -489,7 +499,14 @@ static void Mp3ReadHuffman(Mp3State *state, uint32_t granule, uint32_t channel,
     int16_t *quantized = state->quantized[channel];
     for (uint32_t index = 0; index < MP3_GRANULE_SAMPLES; ++index) quantized[index] = 0;
     info->nonZeroCount = 0u;
+    state->quantMax[channel] = 0u;
     if (info->part2And3Length == 0u) return;
+
+    // Всё, что не переполняет linbits, лежит в пределах 0..15: в этом и
+    // смысл границы. Больше пятнадцати величина становится только тогда,
+    // когда полубайт равен 15 и к нему добавлены linbits — вот эти редкие
+    // случаи и поднимают максимум.
+    uint32_t maxMagnitude = 15u;
 
     uint32_t endBit = part2Start + info->part2And3Length;
     const uint16_t *bandLong = MP3_BAND_LONG[state->header.sampleRateIndex];
@@ -528,9 +545,19 @@ static void Mp3ReadHuffman(Mp3State *state, uint32_t granule, uint32_t channel,
             x = (packed >> 4) & 15;
             y = packed & 15;
             uint32_t linbits = MP3_HUFFMAN_LINBITS[table];
-            if (linbits != 0u && x == 15) x += (int32_t)Mp3ReadBits(&state->bits, linbits);
+            if (linbits != 0u && x == 15)
+            {
+                uint32_t extra = Mp3ReadBits(&state->bits, linbits);
+                x += (int32_t)extra;
+                if (15u + extra > maxMagnitude) maxMagnitude = 15u + extra;
+            }
             if (x != 0 && Mp3ReadBits(&state->bits, 1u) != 0u) x = -x;
-            if (linbits != 0u && y == 15) y += (int32_t)Mp3ReadBits(&state->bits, linbits);
+            if (linbits != 0u && y == 15)
+            {
+                uint32_t extra = Mp3ReadBits(&state->bits, linbits);
+                y += (int32_t)extra;
+                if (15u + extra > maxMagnitude) maxMagnitude = 15u + extra;
+            }
             if (y != 0 && Mp3ReadBits(&state->bits, 1u) != 0u) y = -y;
         }
         quantized[position] = (int16_t)x;
@@ -561,6 +588,7 @@ static void Mp3ReadHuffman(Mp3State *state, uint32_t granule, uint32_t channel,
         for (uint32_t index = 0; index < 4u; ++index) quantized[position + index] = 0;
     }
     info->nonZeroCount = position;
+    state->quantMax[channel] = maxMagnitude;
     // Следующая гранула начинается на своей границе, а не там, где
     // остановилось чтение: лишние или недочитанные биты не сдвигают её.
     state->bits.bitPosition = endBit;
@@ -586,6 +614,38 @@ static float Mp3PowerOfTwoQuarters(int32_t quarters)
         whole += 1;
     }
     return value;
+}
+
+// Дописывает pow43 до индекса magnitude включительно. Полный цикл строил
+// все 8207 значений на каждый вызов декодера, хотя выше реально
+// встреченной величины таблица не нужна. Порядок и seed совпадают с
+// полным циклом: запись k считается из корня записи k-1, поэтому каждое
+// готовое значение бит в бит равно прежнему. Первому значению прежний
+// цикл давал seed 1.0 — он и лежит в pow43Root после сброса состояния.
+static void Mp3EnsurePow43(Mp3State *state, uint32_t magnitude)
+{
+    while (state->pow43Built < magnitude)
+    {
+        uint32_t index = state->pow43Built + 1u;
+        double value = (double)index;
+        double root = state->pow43Root;
+        // Кубический корень методом Ньютона: без CRT нет ни pow, ни
+        // cbrt, а корень предыдущего числа — отличное начальное
+        // приближение, потому что аргумент растёт на единицу.
+        //
+        // Четырёх шагов достаточно: начиная с корня соседнего числа,
+        // ошибка уже порядка 1e-3, и Ньютон удваивает число верных цифр
+        // за шаг. Пятый и следующие шаги не меняют ни одного бита
+        // результата (проверено полным сравнением таблицы), поэтому
+        // прежде они были чистой переработкой.
+        for (uint32_t step = 0; step < 4u; ++step)
+        {
+            root = (2.0 * root + value / (root * root)) / 3.0;
+        }
+        state->pow43[index] = (float)(value * root);
+        state->pow43Root = root;
+        state->pow43Built = index;
+    }
 }
 
 static void Mp3ScaleRange(Mp3State *state, uint32_t channel, uint32_t start, uint32_t stop,
@@ -932,6 +992,21 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
                                 int16_t *output, uint32_t stride)
 {
     float *buffer = state->synthesis[channel];
+    // Матрица синтеза задана косинусами от (16+i)(2k+1)pi/64, поэтому у
+    // неё есть точная симметрия: M[i][31-k] = M[i][k] для чётных i и
+    // M[i][31-k] = -M[i][k] для нечётных. Свернув пару отсчётов в сумму
+    // и разность один раз на все 64 строки, каждая строка требует 16
+    // умножений вместо 32. Математически результат тот же; меняется лишь
+    // порядок сложений float, что на выходе остаётся в пределах
+    // допуска декодера (+/-2 отсчёта).
+    const uint32_t half = MP3_SUBBANDS / 2u;
+    float folded[MP3_SUBBANDS];
+    for (uint32_t band = 0; band < half; ++band)
+    {
+        folded[band] = subband[band] + subband[MP3_SUBBANDS - 1u - band];
+        folded[half + band] = subband[band] - subband[MP3_SUBBANDS - 1u - band];
+    }
+
     // Кольцевой буфер вместо сдвига на 64 значения: сдвигать 960 чисел
     // восемнадцать раз на гранулу — это мегабайты копирования в секунду
     // ради того же результата.
@@ -940,10 +1015,12 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
 
     for (uint32_t index = 0; index < 64u; ++index)
     {
+        const float *row = MP3_SYNTH_MATRIX[index];
+        const float *source = (index & 1u) == 0u ? folded : folded + half;
         float sum = 0.0f;
-        for (uint32_t band = 0; band < MP3_SUBBANDS; ++band)
+        for (uint32_t band = 0; band < half; ++band)
         {
-            sum += MP3_SYNTH_MATRIX[index][band] * subband[band];
+            sum += row[band] * source[band];
         }
         buffer[(offset + index) & 1023u] = sum;
     }
@@ -975,24 +1052,6 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
 }
 
 // === Кадр ===
-
-static void Mp3BuildPow43(float *table)
-{
-    table[0] = 0.0f;
-    double root = 1.0;
-    for (uint32_t index = 1u; index < MP3_POW43_COUNT; ++index)
-    {
-        double value = (double)index;
-        // Кубический корень методом Ньютона: без CRT нет ни pow, ни
-        // cbrt, а корень предыдущего числа — отличное начальное
-        // приближение, потому что аргумент растёт на единицу.
-        for (uint32_t step = 0; step < 8u; ++step)
-        {
-            root = (2.0 * root + value / (root * root)) / 3.0;
-        }
-        table[index] = (float)(value * root);
-    }
-}
 
 static Mp3Status Mp3DecodeFrame(Mp3State *state, const uint8_t *frame, const Mp3Header *header,
                                 int16_t *output)
@@ -1055,6 +1114,9 @@ static Mp3Status Mp3DecodeFrame(Mp3State *state, const uint8_t *frame, const Mp3
         }
         for (uint32_t channel = 0; channel < channels; ++channel)
         {
+            uint32_t needed = state->quantMax[channel];
+            if (needed >= MP3_POW43_COUNT) needed = MP3_POW43_COUNT - 1u;
+            Mp3EnsurePow43(state, needed);
             Mp3Requantize(state, granule, channel);
             Mp3Reorder(state, granule, channel);
         }
@@ -1094,7 +1156,9 @@ Mp3Status Mp3DecodeSamples(const void *bytes, uint32_t sizeBytes, const Mp3Info 
     Mp3State *state = (Mp3State *)scratch;
     uint8_t *raw = (uint8_t *)scratch;
     for (uint32_t index = 0; index < (uint32_t)sizeof(Mp3State); ++index) raw[index] = 0u;
-    Mp3BuildPow43(state->pow43);
+    // Ноль повторов и seed 1.0 для первой записи pow43: дальше таблица
+    // достраивается по мере надобности в Mp3EnsurePow43.
+    state->pow43Root = 1.0;
 
     for (uint32_t index = 0; index < (uint32_t)needed; ++index) outSamples[index] = 0;
 

@@ -742,6 +742,82 @@ static bool TryEnqueueRequest(ChunkStreaming* streaming, ChunkEntry* entry)
     return enqueued;
 }
 
+// Пакетная постановка заявок для обхода куба/грани. Одиночный путь берёт
+// замок и будит рабочий поток на каждую заявку; на первом заполнении куба
+// это десятки тысяч пар lock/unlock и столько же пробуждений подряд.
+// Пакет пишет заявки в кольцо под одним замком и будит рабочих один раз.
+// Порядок заявок — порядок обхода, тот же, что и у одиночных вызовов.
+//
+// Инвариант: unfinishedWork меняет только главный поток (здесь и в
+// ChunkStreamingPump), между пакетами он не убывает, поэтому разбиение
+// потока заявок на пакеты не меняет, сколько именно заявок поместилось.
+#define CHUNK_REQUEST_ENQUEUE_BATCH 64
+
+typedef struct ChunkEnqueueBatch
+{
+    ChunkEntry* entries[CHUNK_REQUEST_ENQUEUE_BATCH];
+    uint32_t count;
+} ChunkEnqueueBatch;
+
+static void FlushEnqueueBatch(ChunkStreaming* streaming, ChunkEnqueueBatch* batch)
+{
+    if (batch->count == 0u)
+    {
+        return;
+    }
+
+    uint32_t enqueued = 0u;
+    const uint32_t queueMask = streaming->queueCapacity - 1u;
+    PlatformMutexLock(&streaming->queueLock);
+    // Пока requestCount > 0, рабочий поток не засыпает: из цикла ожидания он
+    // выходит, видит непустую очередь и берётся за работу. Значит, будить
+    // нужно ровно в переходе «очередь была пуста → стала непуста», а не на
+    // каждом пакете: иначе WakeAll держит всех рабочих горячими, даже когда
+    // работы ещё нет, и забивает замок.
+    const bool queueWasEmpty = streaming->requestCount == 0u;
+    while (enqueued < batch->count
+        && streaming->unfinishedWork < streaming->queueCapacity)
+    {
+        ChunkEntry* entry = batch->entries[enqueued];
+        ChunkRequest* request = &streaming->requests[
+            (streaming->requestHead + streaming->requestCount) & queueMask];
+        request->x = entry->x;
+        request->y = entry->y;
+        request->z = entry->z;
+        request->revision = entry->revision;
+        request->centerEpoch = streaming->centerEpoch;
+        streaming->requestCount++;
+        streaming->unfinishedWork++;
+        if (streaming->unfinishedWork > streaming->peakUnfinishedWork)
+        {
+            streaming->peakUnfinishedWork = streaming->unfinishedWork;
+        }
+        entry->requestQueued = true;
+        enqueued++;
+    }
+    if (enqueued < batch->count)
+    {
+        // Не поместилось — повторная попытка будет в условном сканировании
+        // ChunkStreamingPump, как и у одиночного пути.
+        streaming->hasUnqueuedPending = true;
+        for (uint32_t index = enqueued; index < batch->count; ++index)
+        {
+            batch->entries[index]->requestQueued = false;
+        }
+    }
+    PlatformMutexUnlock(&streaming->queueLock);
+
+    if (enqueued != 0u)
+    {
+        PlatformAtomicAddI64(&streaming->queuedRequests, (int64_t)enqueued);
+        if (queueWasEmpty)
+        {
+            PlatformConditionVariableWakeAll(&streaming->workAvailable);
+        }
+    }
+    batch->count = 0u;
+}
+
 static uint32_t WorkerThreadProcedure(void* parameter)
 {
     ChunkStreaming* streaming = parameter;
@@ -940,18 +1016,23 @@ static bool TrySubtractInt64(
 }
 
 static void QueueChunkIfMissing(ChunkStreaming* streaming,
-    int64_t x, int64_t y, int64_t z)
+    int64_t x, int64_t y, int64_t z, ChunkEnqueueBatch* batch)
 {
     if (FindEntry(streaming, x, y, z) != NULL) return;
 
     ChunkEntry* entry = InsertEntry(streaming, x, y, z);
     entry->state = CHUNK_ENTRY_PENDING;
-    TryEnqueueRequest(streaming, entry);
+    batch->entries[batch->count++] = entry;
+    if (batch->count == CHUNK_REQUEST_ENQUEUE_BATCH)
+    {
+        FlushEnqueueBatch(streaming, batch);
+    }
 }
 
 static void QueueMissingChunks(
     ChunkStreaming* streaming, int64_t chunkX, int64_t chunkY, int64_t chunkZ)
 {
+    ChunkEnqueueBatch batch = { .count = 0u };
     for (int64_t shell = 0; shell <= streaming->viewRadius; ++shell)
     {
         for (int64_t deltaZ = -shell; deltaZ <= shell; ++deltaZ)
@@ -968,11 +1049,12 @@ static void QueueMissingChunks(
                     if (chebyshev != shell) continue;
 
                     QueueChunkIfMissing(streaming,
-                        chunkX + deltaX, chunkY + deltaY, chunkZ + deltaZ);
+                        chunkX + deltaX, chunkY + deltaY, chunkZ + deltaZ, &batch);
                 }
             }
         }
     }
+    FlushEnqueueBatch(streaming, &batch);
 }
 
 // За один шаг на соседний чанк в кубе радиуса viewRadius появляется лишь
@@ -988,6 +1070,7 @@ static void QueueMissingLeadingFace(ChunkStreaming* streaming,
         chunkX - previousX, chunkY - previousY, chunkZ - previousZ
     };
 
+    ChunkEnqueueBatch batch = { .count = 0u };
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         if (delta[axis] == 0) continue;
@@ -1005,10 +1088,12 @@ static void QueueMissingLeadingFace(ChunkStreaming* streaming,
                 offset[axisA] = offsetA;
                 offset[axisB] = offsetB;
                 QueueChunkIfMissing(streaming,
-                    chunkX + offset[0], chunkY + offset[1], chunkZ + offset[2]);
+                    chunkX + offset[0], chunkY + offset[1], chunkZ + offset[2],
+                    &batch);
             }
         }
     }
+    FlushEnqueueBatch(streaming, &batch);
 }
 
 // Выбрасывает один ушедший чанк: снимает меш со списка отрисовки,

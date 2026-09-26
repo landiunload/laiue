@@ -1,5 +1,11 @@
 option(LAIUE_REQUIRE_VULKAN_TEST_DRIVER
     "Fail Vulkan offscreen tests instead of skipping when no driver is available" OFF)
+# Прогон Vulkan-тестов под Khronos validation layer. Тесты уже считают
+# "Validation Error" провалом, поэтому слой превращает их в регрессию
+# spec-корректности (например, VUID-VkImageViewCreateInfo-image-04441 для
+# представлений образов swapchain). Требует установленного Vulkan SDK.
+option(LAIUE_VULKAN_VALIDATION
+    "Run Vulkan renderer tests under VK_LAYER_KHRONOS_validation" OFF)
 if(LAIUE_REQUIRE_VULKAN_TEST_DRIVER AND
    NOT (TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET))
     message(FATAL_ERROR "LAIUE_REQUIRE_VULKAN_TEST_DRIVER requires the Vulkan render target")
@@ -375,6 +381,16 @@ if(TARGET laiue_voxel_raycast AND TARGET laiue_voxel_render)
 endif()
 
 if(TARGET laiue_voxel_render)
+    add_executable(laiue_voxel_raycast_dda_test voxel_raycast_dda_test.c)
+    target_link_libraries(laiue_voxel_raycast_dda_test PRIVATE
+        laiue_voxel_raycast
+        laiue_world
+        laiue_numeric)
+    laiue_configure_standalone_executable(
+        laiue_voxel_raycast_dda_test VoxelRaycastDdaTestEntryPoint)
+    add_test(NAME laiue.voxel.raycast_dda
+        COMMAND laiue_voxel_raycast_dda_test)
+
     # Стресс таблицы чанков: случайные переходы и блуждание по кольцу с
     # независимым эталоном множества ключей и проверкой списка отрисовки.
     add_executable(laiue_chunk_streaming_stress_test
@@ -390,6 +406,14 @@ if(TARGET laiue_voxel_render)
         COMMAND laiue_chunk_streaming_stress_test)
     set_tests_properties(laiue.voxel.render_chunk_streaming_stress PROPERTIES
         TIMEOUT 120)
+
+    add_executable(laiue_panorama_test panorama_test.c)
+    target_link_libraries(laiue_panorama_test PRIVATE
+        laiue_scene
+        laiue_scene_math)
+    laiue_configure_standalone_executable(
+        laiue_panorama_test PanoramaTestEntryPoint)
+    add_test(NAME laiue.scene.panorama COMMAND laiue_panorama_test)
 endif()
 if(TARGET laiue_render)
     add_executable(laiue_render_pack_api_test render_pack_api_test.c)
@@ -480,6 +504,19 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
         SKIP_RETURN_CODE 125
         FAIL_REGULAR_EXPRESSION "Validation Error"
         TIMEOUT 180)
+    if(LAIUE_VULKAN_VALIDATION)
+        set(laiue_vulkan_validation_env
+            "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation")
+        if(DEFINED ENV{VULKAN_SDK})
+            list(APPEND laiue_vulkan_validation_env
+                "VK_LAYER_PATH=$ENV{VULKAN_SDK}/Bin")
+        endif()
+        set_tests_properties(
+            laiue.render.offscreen_frame
+            laiue.render.vulkan_instance_ring
+            laiue.render.vulkan_lifecycle
+            PROPERTIES ENVIRONMENT "${laiue_vulkan_validation_env}")
+    endif()
 endif()
 if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12
    AND LAIUE_RENDER_HAS_VULKAN_TARGET)
@@ -580,6 +617,13 @@ if(TARGET laiue_media_support)
 endif()
 
 if(TARGET laiue_media_support)
+    add_executable(laiue_inflate_test inflate_test.c inflate_fixtures.h)
+    target_link_libraries(laiue_inflate_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_inflate_test InflateTestEntryPoint)
+    add_test(NAME laiue.media.inflate COMMAND laiue_inflate_test)
+endif()
+
+if(TARGET laiue_media_support)
     # Быстрые пути ресемплера сверяются побайтово с локальной копией
     # прежнего общего пути на десятках тысяч случайных изображений.
     add_executable(laiue_image_resample_test image_resample_test.c)
@@ -594,4 +638,132 @@ if(TARGET laiue_media_support)
     target_link_libraries(laiue_image_decode_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_image_decode_test ImageDecodeTestEntryPoint)
     add_test(NAME laiue.media.image_decode COMMAND laiue_image_decode_test)
+endif()
+# ROUND 2, agent 01-world: точечный сдвиг массива дельт (r2_01_world_).
+add_executable(laiue_r2_01_world_shift_test r2_01_world_shift_test.c)
+target_link_libraries(laiue_r2_01_world_shift_test PRIVATE
+    laiue_world
+    laiue_numeric)
+laiue_configure_standalone_executable(laiue_r2_01_world_shift_test R2WorldShiftTestEntryPoint)
+add_test(NAME laiue.r2_01.world.shift COMMAND laiue_r2_01_world_shift_test)
+
+# ROUND2 07-compound: property regression для overlap-скана без проверок
+# конечности (unchecked bounds допустимы только после превалидации).
+add_executable(laiue_r2_07_compound_overlap_test r2_07_compound_overlap_test.c)
+target_link_libraries(laiue_r2_07_compound_overlap_test PRIVATE laiue::physics)
+laiue_configure_standalone_executable(laiue_r2_07_compound_overlap_test
+    R2CompoundOverlapTestEntryPoint)
+add_test(NAME laiue.physics.r2_07_compound_overlap COMMAND laiue_r2_07_compound_overlap_test)
+set_tests_properties(laiue.physics.r2_07_compound_overlap PROPERTIES TIMEOUT 60)
+
+# ROUND 2: регрессия парсера манифеста и читателя пака (NUL-скан, ASCII fast
+# path, ленивый буфер чтения). Чёрный ящик через публичный API модуля.
+add_executable(laiue_r2_18_manifest_test r2_18_manifest_test.c)
+target_link_libraries(laiue_r2_18_manifest_test PRIVATE laiue_mod)
+laiue_configure_standalone_executable(laiue_r2_18_manifest_test R2ModManifestTestEntry)
+add_test(NAME laiue.r2.mod_manifest COMMAND laiue_r2_18_manifest_test)
+
+
+    # Эквивалентность runtime-части текстурпака (r2 23-texture-pack):
+    # таблица кадров, покадровое решение и поля субресурса сверяются с
+    # дословными копиями прежних реализаций, плюс семантика fallback и
+    # успешной загрузки. `texture_pack.c` не экспортируется, поэтому
+    # компилируется прямо в тест; LAIUE_STATIC снимает dllimport.
+    add_executable(laiue_r2_23_texture_pack_equivalence_test
+        r2_23_texture_pack_equivalence_test.c
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.c"
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_pack.c"
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_build.c")
+    target_include_directories(laiue_r2_23_texture_pack_equivalence_test PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+        "${PROJECT_SOURCE_DIR}/tests")
+    target_link_libraries(laiue_r2_23_texture_pack_equivalence_test PRIVATE
+        laiue_content
+        laiue::media_support)
+    target_compile_definitions(laiue_r2_23_texture_pack_equivalence_test
+        PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_r2_23_texture_pack_equivalence_test R2TexturePackEquivalenceTestEntryPoint)
+    add_test(NAME laiue.render.texture_pack_equiv
+        COMMAND laiue_r2_23_texture_pack_equivalence_test)
+    # ROUND2 24-shaders: краевые случаи валидации манифеста (большой файл,
+    # BOM, неверный заголовок, отсутствие contract, пустой и сверхлимитный).
+    add_executable(laiue_r2_24_shaders_manifest_test
+        r2_24_shaders_manifest_test.c)
+    target_link_libraries(laiue_r2_24_shaders_manifest_test PRIVATE
+        laiue_content
+        laiue_render)
+    laiue_configure_standalone_executable(
+        laiue_r2_24_shaders_manifest_test R2ShadersManifestTestEntryPoint)
+    add_test(NAME laiue.render.r2_24_shaders_manifest
+        COMMAND laiue_r2_24_shaders_manifest_test)
+
+if(TARGET laiue_media_support)
+    # R2: дифференциальная проверка backreference-копирования на потоках с
+    # управляемыми distance/length. Ожидаемый выход считает генератор, а не
+    # сам декодер, поэтому ловится ошибка фазы широкого копирования.
+    add_executable(laiue_r2_26_inflate_test r2_26_inflate_test.c r2_26_inflate_fixtures.h)
+    target_link_libraries(laiue_r2_26_inflate_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_r2_26_inflate_test R2InflateTestEntryPoint)
+    add_test(NAME laiue.media.r2_inflate COMMAND laiue_r2_26_inflate_test)
+endif()
+
+
+    # Эквивалентность GIF-декодера агенту 28-gif: полный кадр и все усечения
+    # входов сверяются с эталонами baseline.
+    add_executable(laiue_r2_28_gif_test r2_28_gif_test.c r2_28_gif_fixtures.h
+        texc_fixtures.h)
+    target_link_libraries(laiue_r2_28_gif_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_r2_28_gif_test R2GifTestEntryPoint)
+    add_test(NAME laiue.media.r2_28_gif COMMAND laiue_r2_28_gif_test)
+if(TARGET laiue_media_support)
+    # ROUND2 30-sound: регрессия на запись `.la` — точные байты PCM16 и
+    # упаковка нибблов ADPCM (включая нечётный хвост). Кодировщик
+    # проверяется независимым декодером теста.
+    add_executable(laiue_r2_30_sound_test r2_30_sound_test.c)
+    target_link_libraries(laiue_r2_30_sound_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_r2_30_sound_test R2SoundTestEntryPoint)
+    add_test(NAME laiue.media.r2_sound COMMAND laiue_r2_30_sound_test)
+endif()
+
+
+if(TARGET laiue_ui)
+    # UI-пути без тайминга: точный поиск глифа (O(1)-индекс и запасной
+    # бинарный поиск дают тот же результат), метрики, builder/форматтеры и
+    # геометрия квадов с клипом. Модуль UI собирается только с D3D12.
+    add_executable(laiue_r2_31_ui_test r2_31_ui_test.c)
+    target_link_libraries(laiue_r2_31_ui_test PRIVATE laiue_ui)
+    laiue_configure_standalone_executable(
+        laiue_r2_31_ui_test R2UiTestEntryPoint)
+    add_test(NAME laiue.r2.ui COMMAND laiue_r2_31_ui_test)
+endif()
+    # ROUND 2, агент 32-image: эквивалентность общего пути после перевода
+    # границ столбцов на накопительный счётчик. Покрытие шире базового.
+    add_executable(laiue_r2_32_image_resample_test r2_32_image_resample_test.c)
+    target_link_libraries(laiue_r2_32_image_resample_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(
+        laiue_r2_32_image_resample_test R2ImageResampleTestEntryPoint)
+    add_test(NAME laiue.media.r2_resample COMMAND laiue_r2_32_image_resample_test)
+
+# ROUND2 33-sha256: на Windows PlatformSha256 идёт через BCrypt, поэтому прямой
+# регрессии sha256.c в platform_crypto_test нет. Тест компилирует production-файл
+# в себя (на POSIX он и так уже в platform_support) и сверяет с векторами FIPS,
+# c BCrypt и с невыровненным входом.
+set(_laiue_r2_sha256_test_sources "")
+if(LAIUE_PLATFORM_WINDOWS)
+    set(_laiue_r2_sha256_test_sources "${PROJECT_SOURCE_DIR}/src/platform/sha256.c")
+endif()
+add_executable(laiue_r2_sha256_test r2_33_sha256_test.c ${_laiue_r2_sha256_test_sources})
+target_include_directories(laiue_r2_sha256_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+laiue_configure_standalone_executable(laiue_r2_sha256_test R2Sha256TestEntryPoint)
+add_test(NAME laiue.platform.sha256_round2 COMMAND laiue_r2_sha256_test)
+set_tests_properties(laiue.platform.sha256_round2 PROPERTIES TIMEOUT 60)
+unset(_laiue_r2_sha256_test_sources)
+
+if(LAIUE_NATIVE_MODS_ENABLED)
+    add_executable(laiue_mod_host_order_test mod_host_order_test.c mod_test_service.h)
+    target_link_libraries(laiue_mod_host_order_test PRIVATE laiue_mod)
+    laiue_configure_standalone_executable(laiue_mod_host_order_test ModHostOrderTestEntry)
+    add_dependencies(laiue_mod_host_order_test laiue_mod_test_extension)
+    add_test(NAME laiue.mod.host_order COMMAND laiue_mod_host_order_test)
 endif()

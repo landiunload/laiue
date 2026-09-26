@@ -5,6 +5,22 @@
 #include <float.h>
 #include <stddef.h>
 
+// Тест перекрытия AABB — самая горячая операция обхода запроса, и узлы дерева
+// умещаются в L2 на целевых сценах, поэтому решает не задержка памяти, а число
+// инструкций. Шесть скалярных сравнений double сворачиваются побитовым OR, и
+// MSVC их не векторизует. Раскладка узла — minimum[3], затем maximum[3] —
+// позволяет проверить по три оси двумя 256-битными сравнениями. Семантика
+// IEEE (GT/LT ordered, NaN -> false) и итог совпадают со скалярной побитово,
+// поэтому набор кандидатов, порядок обхода и эталонные хеши не меняются.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define LAIUE_BROADPHASE_OVERLAP_AVX2 1
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||           \
+    defined(__i386__)
+#include <emmintrin.h>
+#define LAIUE_BROADPHASE_OVERLAP_SSE2 1
+#endif
+
 // The pooled-index/fat-AABB design and the need for active rotations are
 // described by Box2D's primary documentation:
 // https://box2d.org/documentation/group__tree.html
@@ -204,10 +220,41 @@ static void CountEvent(uint32_t *counter)
 static bool BoundsOverlap(const RigidTreeNode *node,
                            const double minimum[3], const double maximum[3])
 {
+#if defined(LAIUE_BROADPHASE_OVERLAP_AVX2)
+    // Дорожки 0..2 — оси X,Y,Z. Дорожка 3 первой загрузки — maximum[0], второй —
+    // поля узла; обе отбрасываются маской & 7, поэтому на результат не влияют.
+    // Вторая загрузка читает байты 24..55 — в пределах той же 64-байтной
+    // строки узла.
+    __m256d nodeMinimum = _mm256_loadu_pd(&node->minimum[0]);
+    __m256d nodeMaximum = _mm256_loadu_pd(&node->maximum[0]);
+    __m256d queryMaximum = _mm256_setr_pd(maximum[0], maximum[1], maximum[2], 0.0);
+    __m256d queryMinimum = _mm256_setr_pd(minimum[0], minimum[1], minimum[2], 0.0);
+    __m256d separated = _mm256_or_pd(_mm256_cmp_pd(nodeMinimum, queryMaximum, _CMP_GT_OQ),
+                                     _mm256_cmp_pd(nodeMaximum, queryMinimum, _CMP_LT_OQ));
+    return (_mm256_movemask_pd(separated) & 7) == 0;
+#elif defined(LAIUE_BROADPHASE_OVERLAP_SSE2)
+    // Оси 0..1 сравниваются одной парой, ось 2 — парной загрузкой со сдвигом,
+    // у которой значима только младшая дорожка.
+    __m128d nodeMinimum01 = _mm_loadu_pd(&node->minimum[0]);
+    __m128d nodeMaximum01 = _mm_loadu_pd(&node->maximum[0]);
+    __m128d nodeMinimum2 = _mm_loadu_pd(&node->minimum[2]);
+    __m128d nodeMaximum2 = _mm_loadu_pd(&node->maximum[2]);
+    __m128d queryMaximum01 = _mm_loadu_pd(&maximum[0]);
+    __m128d queryMinimum01 = _mm_loadu_pd(&minimum[0]);
+    __m128d queryMaximum2 = _mm_set1_pd(maximum[2]);
+    __m128d queryMinimum2 = _mm_set1_pd(minimum[2]);
+    __m128d separated01 = _mm_or_pd(_mm_cmplt_pd(nodeMaximum01, queryMinimum01),
+                                    _mm_cmpgt_pd(nodeMinimum01, queryMaximum01));
+    __m128d separated2 = _mm_or_pd(_mm_cmplt_pd(nodeMaximum2, queryMinimum2),
+                                   _mm_cmpgt_pd(nodeMinimum2, queryMaximum2));
+    int separatedBits = _mm_movemask_pd(separated01) | (_mm_movemask_pd(separated2) & 1);
+    return separatedBits == 0;
+#else
     int separated = (node->minimum[0] > maximum[0]) | (node->maximum[0] < minimum[0]) |
                     (node->minimum[1] > maximum[1]) | (node->maximum[1] < minimum[1]) |
                     (node->minimum[2] > maximum[2]) | (node->maximum[2] < minimum[2]);
     return separated == 0;
+#endif
 }
 
 // Метрика узла — половина площади поверхности, а не сумма рёбер. Сумма
@@ -778,6 +825,18 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
     }
     *outCount = 0u;
     const RigidTreeNode *nodes = TreeNodes(broadphase);
+    // Запрос на каждом попадании пишет в outSlots, а компилятор не может
+    // доказать, что этот массив не пересекается с minimum/maximum. Без
+    // локальных копий он обязан перечитывать границы после каждой записи.
+    // Копии лежат в стеке, их адрес не уходит наружу, и шесть чисел живут в
+    // регистрах весь обход. Значения те же, поведение не меняется.
+    double queryMinimum[3];
+    double queryMaximum[3];
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        queryMinimum[axis] = minimum[axis];
+        queryMaximum[axis] = maximum[axis];
+    }
     // Явный стек вместо хождения по родительским ссылкам. Обход по ссылкам
     // возвращался в узел ещё раз после каждого поддерева, и на каждый
     // проверенный узел приходилось ровно две итерации цикла: половина работы
@@ -808,7 +867,7 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
     {
         const RigidTreeNode *root = &nodes[broadphase->root];
         ++visited;
-        if (BoundsOverlap(root, minimum, maximum))
+        if (BoundsOverlap(root, queryMinimum, queryMaximum))
         {
             if (!NodeIsLeaf(root))
             {
@@ -842,8 +901,8 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
         {
             const RigidTreeNode *left = &nodes[leftIndex];
             const RigidTreeNode *right = &nodes[rightIndex];
-            bool leftHit = BoundsOverlap(left, minimum, maximum);
-            bool rightHit = BoundsOverlap(right, minimum, maximum);
+            bool leftHit = BoundsOverlap(left, queryMinimum, queryMaximum);
+            bool rightHit = BoundsOverlap(right, queryMinimum, queryMaximum);
             bool leftLeaf = NodeIsLeaf(left);
             bool rightLeaf = NodeIsLeaf(right);
             visited += 2u;
@@ -916,7 +975,7 @@ bool RigidBroadphaseQuery(VoxelRigidBroadphase *broadphase, const double minimum
         if (previous == node->parent)
         {
             ++visited;
-            if (BoundsOverlap(node, minimum, maximum))
+            if (BoundsOverlap(node, queryMinimum, queryMaximum))
             {
                 if (NodeIsLeaf(node))
                 {
