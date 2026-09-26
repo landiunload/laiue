@@ -23,6 +23,7 @@
 
 #include "platform/system.h"
 #include "test_runtime.h"
+#include "numeric/numeric_service.h"
 #include "world/world.h"
 
 #include <stdbool.h>
@@ -54,6 +55,13 @@ __declspec(dllimport) int __stdcall K32GetProcessMemoryInfo(
 #define WORLD_BENCH_MAX_MUTATIONS WORLD_MAX_ATOMIC_BLOCK_MUTATIONS
 
 static volatile uint64_t worldBenchSink;
+static uint32_t worldBenchFailures;
+static const LaiueNumericServiceV1* worldBenchNumeric;
+
+static World* CreateBenchmarkWorld(void)
+{
+    return WorldCreateWithNumericService(NULL, worldBenchNumeric);
+}
 
 // === Вывод без CRT ===
 
@@ -270,6 +278,10 @@ static double TimeAlternating(World* world, const WorldBlockMutation* even,
         {
             ++*sink;
         }
+        else
+        {
+            ++worldBenchFailures;
+        }
     }
     return (PlatformMonotonicSeconds() - start) * 1000.0;
 }
@@ -296,10 +308,11 @@ static void RunSingleToggle(uint32_t rounds)
     static int64_t blockX[4096];
     static int64_t blockY[4096];
     static int64_t blockZ[4096];
-    World* world = WorldCreate(NULL);
+    World* world = CreateBenchmarkWorld();
     if (world == NULL)
     {
         WriteText("RESULT single_toggle ERROR world\n");
+        ++worldBenchFailures;
         return;
     }
     for (uint32_t index = 0u; index < coordinateCount; ++index)
@@ -326,6 +339,10 @@ static void RunSingleToggle(uint32_t rounds)
                 {
                     ++worldBenchSink;
                 }
+                else
+                {
+                    ++worldBenchFailures;
+                }
             }
             for (uint32_t index = 0u; index < coordinateCount; ++index)
             {
@@ -333,6 +350,10 @@ static void RunSingleToggle(uint32_t rounds)
                         blockZ[index], BLOCK_AIR))
                 {
                     ++worldBenchSink;
+                }
+                else
+                {
+                    ++worldBenchFailures;
                 }
             }
         }
@@ -365,7 +386,7 @@ static void RunBatch(const char* name, uint32_t perChunk, uint32_t chunkCount,
         (size_t)count * sizeof(*even), false);
     WorldBlockMutation* odd = PlatformAllocate(
         (size_t)count * sizeof(*odd), false);
-    World* world = WorldCreate(NULL);
+    World* world = CreateBenchmarkWorld();
     if (even == NULL || odd == NULL || world == NULL)
     {
         PlatformFree(even);
@@ -374,6 +395,7 @@ static void RunBatch(const char* name, uint32_t perChunk, uint32_t chunkCount,
         WriteText("RESULT ");
         WriteText(name);
         WriteText(" ERROR allocation\n");
+        ++worldBenchFailures;
         return;
     }
 
@@ -393,6 +415,7 @@ static void RunBatch(const char* name, uint32_t perChunk, uint32_t chunkCount,
         WriteText("RESULT ");
         WriteText(name);
         WriteText(" ERROR precreate\n");
+        ++worldBenchFailures;
         PlatformFree(even);
         PlatformFree(odd);
         WorldDestroy(world);
@@ -458,6 +481,13 @@ LAIUE_TEST_ENTRY(WorldBatchBenchmarkEntryPoint)
 {
     WriteText("laiue world batch benchmark\n");
 
+    worldBenchNumeric = LaiueNumericGetStaticServiceV1();
+    if (worldBenchNumeric == NULL)
+    {
+        WriteText("ERROR numeric provider unavailable\n");
+        LaiueTestRuntimeExit(1);
+    }
+
     const char* only = ReadSingleScenario();
     if (only != NULL)
     {
@@ -473,5 +503,12 @@ LAIUE_TEST_ENTRY(WorldBatchBenchmarkEntryPoint)
         WriteText("");
     }
     PrintPeakMemory();
+    if (worldBenchFailures != 0u)
+    {
+        WriteText("ERROR benchmark failures=");
+        WriteUnsigned(worldBenchFailures);
+        WriteText("\n");
+        LaiueTestRuntimeExit(1);
+    }
     LAIUE_TEST_SUCCESS();
 }
