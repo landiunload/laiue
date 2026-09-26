@@ -172,8 +172,11 @@ void UiRect(UiContext* ui, float x, float y, float width, float height,
 void UiImage(UiContext* ui, float x, float y, float width, float height,
     float u0, float v0, float u1, float v1, uint32_t color)
 {
+    // Пустой прямоугольник не занимает слот квада: иначе PushQuad увеличил
+    // бы quadCount, а вернувшийся квад с нулевыми полями остался бы в списке.
+    if (width <= 0.0f || height <= 0.0f) return;
     RendererUiQuad* quad = PushQuad(ui);
-    if (quad == NULL || width <= 0.0f || height <= 0.0f) return;
+    if (quad == NULL) return;
     quad->rect[0] = x;
     quad->rect[1] = y;
     quad->rect[2] = x + width;

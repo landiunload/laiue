@@ -6,6 +6,12 @@
 #include <limits.h>
 #include <string.h>
 
+// Smallest reusable manifest read buffer. Typical manifests are a few hundred
+// bytes, so a small first allocation keeps the transient at one page instead
+// of the 64 KiB ceiling; a genuinely large manifest grows the same reusable
+// buffer to its exact size on the next iteration.
+#define LAIUE_MOD_MANIFEST_READ_MIN_BYTES 4096u
+
 typedef struct ByteSlice
 {
     const uint8_t *data;
@@ -53,6 +59,22 @@ static ByteSlice SliceTrim(ByteSlice slice)
         --slice.length;
     }
     return slice;
+}
+
+// True when every byte is ASCII. An all-ASCII slice needs no UTF-8
+// validation, so callers may copy it byte for byte instead of paying for a
+// platform conversion; a NUL byte cannot reach here because the manifest-wide
+// scan rejects the whole input first.
+static bool SliceIsAscii(ByteSlice slice)
+{
+    for (uint32_t index = 0; index < slice.length; ++index)
+    {
+        if (slice.data[index] >= 0x80u)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool SliceEqualsAsciiIgnoreCase(ByteSlice slice, const char *text)
@@ -117,13 +139,16 @@ static bool SliceCopyUtf8(ByteSlice slice, char *destination, uint32_t capacity)
     {
         return false;
     }
-    wchar_t validation[LAIUE_MOD_DISPLAY_NAME_CAPACITY];
-    uint32_t wideLength = 0;
-    if (!PlatformUtf8ToWide((const char *)slice.data, slice.length, validation,
-                            LAIUE_MOD_DISPLAY_NAME_CAPACITY, &wideLength) ||
-        wideLength == 0u)
+    if (!SliceIsAscii(slice))
     {
-        return false;
+        wchar_t validation[LAIUE_MOD_DISPLAY_NAME_CAPACITY];
+        uint32_t wideLength = 0;
+        if (!PlatformUtf8ToWide((const char *)slice.data, slice.length, validation,
+                                LAIUE_MOD_DISPLAY_NAME_CAPACITY, &wideLength) ||
+            wideLength == 0u)
+        {
+            return false;
+        }
     }
     for (uint32_t index = 0; index < slice.length; ++index)
     {
@@ -321,12 +346,27 @@ static bool SliceCopyNativeEntry(ByteSlice slice, wchar_t *destination)
     {
         return false;
     }
-    uint32_t written = 0;
-    if (!PlatformUtf8ToWide((const char *)slice.data, slice.length, destination,
-                            LAIUE_MOD_NATIVE_NAME_CAPACITY, &written) ||
-        written == 0u)
+    if (SliceIsAscii(slice))
     {
-        return false;
+        if (slice.length >= LAIUE_MOD_NATIVE_NAME_CAPACITY)
+        {
+            return false;
+        }
+        for (uint32_t index = 0; index < slice.length; ++index)
+        {
+            destination[index] = (wchar_t)slice.data[index];
+        }
+        destination[slice.length] = L'\0';
+    }
+    else
+    {
+        uint32_t written = 0;
+        if (!PlatformUtf8ToWide((const char *)slice.data, slice.length, destination,
+                                LAIUE_MOD_NATIVE_NAME_CAPACITY, &written) ||
+            written == 0u)
+        {
+            return false;
+        }
     }
     return WideLeafNameIsSafe(destination, LAIUE_MOD_NATIVE_NAME_CAPACITY);
 }
@@ -490,6 +530,33 @@ static bool ManifestComplete(const ManifestParseState *state)
             state->macosX86Seen || state->macosArmSeen);
 }
 
+// Rejects an embedded NUL over the whole input eight bytes at a time: the
+// classic has-zero-byte test finds a zero lane in one step, so the mandatory
+// scan stays cheap even for a 64 KiB manifest with no NUL at all.
+static bool BytesContainZero(const uint8_t *data, uint32_t length)
+{
+    uint32_t index = 0u;
+    while (index + 8u <= length)
+    {
+        uint64_t word = 0u;
+        memcpy(&word, data + index, sizeof(word));
+        if ((word - 0x0101010101010101ull) & ~word & 0x8080808080808080ull)
+        {
+            return true;
+        }
+        index += 8u;
+    }
+    while (index < length)
+    {
+        if (data[index] == 0u)
+        {
+            return true;
+        }
+        ++index;
+    }
+    return false;
+}
+
 LaiueModStatus LaiueModManifestParse(const void *bytes, size_t byteCount,
                                      LaiueModManifest *outManifest, LaiueModDiagnostic *diagnostic)
 {
@@ -507,13 +574,10 @@ LaiueModStatus LaiueModManifestParse(const void *bytes, size_t byteCount,
 
     const uint8_t *input = bytes;
     uint32_t length = (uint32_t)byteCount;
-    for (uint32_t index = 0; index < length; ++index)
+    if (BytesContainZero(input, length))
     {
-        if (input[index] == 0u)
-        {
-            return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_MANIFEST_INVALID, 0,
-                                         "manifest contains an embedded NUL byte");
-        }
+        return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_MANIFEST_INVALID, 0,
+                                     "manifest contains an embedded NUL byte");
     }
 
     memset(outManifest, 0, sizeof(*outManifest));
@@ -726,25 +790,51 @@ static LaiueModStatus InspectPackEntryBuffered(const wchar_t *rootDirectory,
     // PlatformReadFilePrefix already validates existence, file type, reparse
     // points and the 64 KiB ceiling, so the common path needs no separate
     // metadata stat: only a rejected read is classified with one stat, which
-    // keeps the exact diagnostic. One reusable maximum-sized buffer is read
-    // in a single pass for every pack, so a large manifest never costs a
-    // second open. The read opens the final component with
-    // FILE_FLAG_OPEN_REPARSE_POINT, so a manifest symlink is still rejected.
-    if (*manifestCapacity < LAIUE_MOD_MANIFEST_MAX_BYTES)
+    // keeps the exact diagnostic. The reusable buffer starts at one page and
+    // grows to the file size only when a manifest actually needs it, so a root
+    // of small manifests never holds the 64 KiB ceiling. The read opens the
+    // final component with FILE_FLAG_OPEN_REPARSE_POINT, so a manifest symlink
+    // is still rejected.
+    uint32_t bytesRead = 0u;
+    uint64_t fileSize = 0u;
+    bool readOk = false;
+    for (;;)
     {
-        void *grown = PlatformReallocate(*manifestBytes, LAIUE_MOD_MANIFEST_MAX_BYTES, false);
+        if (*manifestCapacity < LAIUE_MOD_MANIFEST_READ_MIN_BYTES)
+        {
+            void *grown =
+                PlatformReallocate(*manifestBytes, LAIUE_MOD_MANIFEST_READ_MIN_BYTES, false);
+            if (grown == NULL)
+            {
+                return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY,
+                                            "could not allocate the manifest read buffer");
+            }
+            *manifestBytes = grown;
+            *manifestCapacity = LAIUE_MOD_MANIFEST_READ_MIN_BYTES;
+        }
+        if (!PlatformReadFilePrefix(scratch->manifestPath, LAIUE_MOD_MANIFEST_MAX_BYTES,
+                                    *manifestBytes, *manifestCapacity, &bytesRead, &fileSize))
+        {
+            break;
+        }
+        if (fileSize <= (uint64_t)*manifestCapacity)
+        {
+            readOk = true;
+            break;
+        }
+        // The read proved fileSize <= the 64 KiB ceiling; re-read once into a
+        // buffer sized exactly for this manifest.
+        uint32_t needed = (uint32_t)fileSize;
+        void *grown = PlatformReallocate(*manifestBytes, needed, false);
         if (grown == NULL)
         {
             return FinishPackInspection(outInfo, diagnostic, LAIUE_MOD_STATUS_OUT_OF_MEMORY,
                                         "could not allocate the manifest read buffer");
         }
         *manifestBytes = grown;
-        *manifestCapacity = LAIUE_MOD_MANIFEST_MAX_BYTES;
+        *manifestCapacity = needed;
     }
-    uint32_t bytesRead = 0u;
-    uint64_t fileSize = 0u;
-    if (!PlatformReadFilePrefix(scratch->manifestPath, LAIUE_MOD_MANIFEST_MAX_BYTES, *manifestBytes,
-                                *manifestCapacity, &bytesRead, &fileSize))
+    if (!readOk)
     {
         if (!PlatformGetPathInformation(scratch->manifestPath, &information) || !information.exists)
         {

@@ -361,6 +361,19 @@ struct Renderer
     // ещё и мёртвым ресурсом.
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
+
+    // Vulkan пишет константы в кольцо на каждый draw. У инстансного пути все
+    // вызовы одного прохода несут один и тот же блок (origin = 0, meshScale =
+    // -1, остальное задано кадром и проходом), а кольцо только дописывается,
+    // поэтому первый такой draw пишет блок, а следующие переиспользуют его
+    // смещение, не копируя данные. Эта же запись позволяет не перепривязывать
+    // descriptor set, если совпали и набор, и смещение констант. Поля
+    // добавлены в конец, чтобы не сдвигать раскладку горячих полей выше.
+    bool instancedConstantsValid;
+    uint32_t instancedConstantOffset;
+    VkDescriptorSet boundChunkSet;
+    uint32_t boundChunkConstantOffset;
+    bool chunkSetBound;
 };
 
 // === Мелкие помощники ===
@@ -2792,26 +2805,52 @@ static bool ReserveVulkanInstanceSpace(Renderer *renderer, uint32_t bytes,
 }
 
 static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint32_t instanceCount,
-                             uint32_t instanceChunkIndex, uint32_t instanceOffset)
+                             uint32_t instanceChunkIndex, uint32_t instanceOffset, bool instanced)
 {
     GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
     if (instanceChunkIndex >= INSTANCE_MAX_CHUNKS_PER_FRAME) return;
     VkDescriptorSet set = block->sets[instanceChunkIndex][renderer->frameIndex];
     if (set == VK_NULL_HANDLE) return;
 
+    // Инстансные вызовы прохода несут один и тот же блок констант, поэтому
+    // первый из них записывает его в кольцо, а остальные берут то же смещение.
     uint32_t constantOffset = 0u;
-    if (!PushConstants(renderer, &renderer->chunkConstants, sizeof(ChunkConstants),
-                       &constantOffset))
-        return;
+    if (instanced && renderer->instancedConstantsValid)
+    {
+        constantOffset = renderer->instancedConstantOffset;
+    }
+    else
+    {
+        if (!PushConstants(renderer, &renderer->chunkConstants, sizeof(ChunkConstants),
+                           &constantOffset))
+            return;
+        if (instanced)
+        {
+            renderer->instancedConstantOffset = constantOffset;
+            renderer->instancedConstantsValid = true;
+        }
+    }
 
     // VK_WHOLE_SIZE storage descriptors require zero dynamic offsets (06715).
     // VertexIndex and InstanceIndex include these bases without changing shaders.
-    uint32_t dynamicOffsets[3] = { constantOffset, 0u, 0u };
     uint32_t firstVertex = (mesh->offsetBytes / (uint32_t)sizeof(ChunkQuad)) * 6u;
     uint32_t firstInstance = instanceOffset / (uint32_t)sizeof(RendererMeshInstance);
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            renderer->chunkPipelineLayout, 0u, 1u, &set, 3u, dynamicOffsets);
+    // Та же привязка набора с тем же смещением ничего не меняет в состоянии
+    // команды, а драйверу стоит времени; в потоке однотипных инстансных
+    // вызовов одного блока она повторяется почти на каждый вызов. Обычный
+    // draw каждый раз пишет своё смещение констант, поэтому его путь
+    // остаётся прежним: привязка без проверки кэша.
+    if (!instanced || !renderer->chunkSetBound || renderer->boundChunkSet != set ||
+        renderer->boundChunkConstantOffset != constantOffset)
+    {
+        uint32_t dynamicOffsets[3] = { constantOffset, 0u, 0u };
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                renderer->chunkPipelineLayout, 0u, 1u, &set, 3u, dynamicOffsets);
+        renderer->boundChunkSet = set;
+        renderer->boundChunkConstantOffset = constantOffset;
+        renderer->chunkSetBound = true;
+    }
     vkCmdDraw(commandBuffer, mesh->quadCount * 6u, instanceCount, firstVertex, firstInstance);
     renderer->currentStats.drawCalls++;
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
@@ -2826,7 +2865,7 @@ void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
     renderer->chunkConstants.chunkOriginRelative[1] = chunkOriginRelative[1];
     renderer->chunkConstants.chunkOriginRelative[2] = chunkOriginRelative[2];
     renderer->chunkConstants.meshScale = 1.0f;
-    DrawMeshInternal(renderer, mesh, 1u, 0u, 0u);
+    DrawMeshInternal(renderer, mesh, 1u, 0u, 0u, false);
 }
 
 void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
@@ -2844,6 +2883,7 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
         !EnsureBlockInstanceDescriptorSet(renderer, mesh->blockIndex, renderer->frameIndex,
                                           chunkIndex))
         return;
+
     memcpy(renderer->instanceBuffers[renderer->frameIndex][chunkIndex].mapped + offset, instances,
            bytes);
 
@@ -2852,7 +2892,7 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
     renderer->chunkConstants.chunkOriginRelative[1] = 0.0f;
     renderer->chunkConstants.chunkOriginRelative[2] = 0.0f;
     renderer->chunkConstants.meshScale = -1.0f;
-    DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset);
+    DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset, true);
 }
 
 // === Кадр ===
@@ -2991,6 +3031,10 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
                               renderer->chunkConstants.materialSlices);
     renderer->chunkConstants.gammaInverse = gammaInverse;
     renderer->chunkConstants.meshScale = 1.0f;
+    // Свет и таблица слоёв этого кадра уже записаны: блок прошлого кадра
+    // больше не описывает нужные константы, кэш невалиден.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 
     if (frame->passCount == 0u)
     {
@@ -3094,6 +3138,9 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     SetViewportAndScissor(commandBuffer, x, y, width, height);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
     memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
+    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 }
 
 static void RecordPanoramaResolve(Renderer *renderer)

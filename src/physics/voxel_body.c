@@ -179,20 +179,41 @@ static bool DynamicColliderIsValid(const VoxelDynamicCollider *collider)
     return true;
 }
 
-static void SortDynamicColliders(DynamicColliderBatch *batch)
+// Упорядочивает colliders по возрастанию stableId за один проход по
+// перестановке: ключи сортируются в локальном массиве индексов, а сами
+// 72-байтовые структуры переставляются ровно один раз. Порядок по уникальному
+// stableId однозначен, поэтому результат не зависит от порядка callback.
+static void ApplyDynamicColliderOrder(DynamicColliderBatch *batch)
 {
-    // Insertion sort keeps the bounded 32-element path allocation-free and
-    // makes clipping/contact selection independent from callback order.
+    uint32_t order[VOXEL_DYNAMIC_COLLIDER_CAPACITY];
+    for (uint32_t index = 0u; index < batch->count; ++index)
+    {
+        order[index] = index;
+    }
     for (uint32_t index = 1u; index < batch->count; ++index)
     {
-        VoxelDynamicCollider value = batch->colliders[index];
+        uint32_t value = order[index];
+        uint64_t valueId = batch->colliders[value].stableId;
         uint32_t insertion = index;
-        while (insertion > 0u && batch->colliders[insertion - 1u].stableId > value.stableId)
+        while (insertion > 0u &&
+               batch->colliders[order[insertion - 1u]].stableId > valueId)
         {
-            batch->colliders[insertion] = batch->colliders[insertion - 1u];
+            order[insertion] = order[insertion - 1u];
             --insertion;
         }
-        batch->colliders[insertion] = value;
+        order[insertion] = value;
+    }
+    for (uint32_t index = 0u; index < batch->count; ++index)
+    {
+        while (order[index] != index)
+        {
+            uint32_t swapIndex = order[index];
+            VoxelDynamicCollider temporary = batch->colliders[index];
+            batch->colliders[index] = batch->colliders[swapIndex];
+            batch->colliders[swapIndex] = temporary;
+            order[index] = order[swapIndex];
+            order[swapIndex] = swapIndex;
+        }
     }
 }
 
@@ -228,16 +249,19 @@ static bool QueryDynamicColliderBatch(const VoxelCollisionSource *collision,
             outBatch->count = 0u;
             return false;
         }
-        for (uint32_t previous = 0u; previous < index; ++previous)
+    }
+    // После fail-closed проверки stableId уникальны. Сортировка делает
+    // возможные дубликаты соседними, поэтому проверка — один линейный проход,
+    // а не O(count^2).
+    ApplyDynamicColliderOrder(outBatch);
+    for (uint32_t index = 1u; index < count; ++index)
+    {
+        if (outBatch->colliders[index - 1u].stableId == outBatch->colliders[index].stableId)
         {
-            if (outBatch->colliders[previous].stableId == outBatch->colliders[index].stableId)
-            {
-                outBatch->count = 0u;
-                return false;
-            }
+            outBatch->count = 0u;
+            return false;
         }
     }
-    SortDynamicColliders(outBatch);
     return true;
 }
 

@@ -5012,6 +5012,13 @@ static inline LaiuePairMask LaiuePairMaskFromBools(bool low, bool high)
     value = vsetq_lane_u64(high ? ~UINT64_C(0) : UINT64_C(0), value, 1);
     return value;
 }
+
+// true, если хотя бы одна полоса маски выставлена. Нужно, чтобы не считать
+// дорогую нормировку там, где обе полосы её всё равно проигнорируют.
+static inline bool LaiuePairMaskAny(LaiuePairMask mask)
+{
+    return (vgetq_lane_u64(mask, 0) | vgetq_lane_u64(mask, 1)) != 0u;
+}
 #else
 typedef __m128d LaiuePairVector;
 typedef __m128d LaiuePairMask;
@@ -5105,6 +5112,13 @@ static inline LaiuePairVector LaiuePairSelect(LaiuePairMask mask, LaiuePairVecto
 static inline LaiuePairMask LaiuePairMaskFromBools(bool low, bool high)
 {
     return _mm_castsi128_pd(_mm_set_epi64x(high ? -1LL : 0LL, low ? -1LL : 0LL));
+}
+
+// true, если хотя бы одна полоса маски выставлена. Нужно, чтобы не считать
+// дорогую нормировку там, где обе полосы её всё равно проигнорируют.
+static inline bool LaiuePairMaskAny(LaiuePairMask mask)
+{
+    return _mm_movemask_pd(mask) != 0;
 }
 #endif
 
@@ -5305,16 +5319,31 @@ static void SolveContactPairFriction(const LaiuePairFrictionState *state)
     const LaiuePairMask scaleGuard =
         LaiuePairMaskAnd(LaiuePairGreater(largest, zero),
                          LaiuePairLess(limit, LaiuePairMul(largest, LaiuePairSplat(2.0))));
-    const LaiuePairVector scaledFirst = LaiuePairDiv(firstImpulse, largest);
-    const LaiuePairVector scaledSecond = LaiuePairDiv(secondImpulse, largest);
-    const LaiuePairVector scaledLimit = LaiuePairDiv(limit, largest);
-    const LaiuePairVector lengthSquared = LaiuePairAdd(LaiuePairMul(scaledFirst, scaledFirst),
-                                                       LaiuePairMul(scaledSecond, scaledSecond));
-    const LaiuePairMask scaleMask = LaiuePairMaskAnd(
-        scaleGuard, LaiuePairGreater(lengthSquared, LaiuePairMul(scaledLimit, scaledLimit)));
-    const LaiuePairVector scale = LaiuePairDiv(scaledLimit, LaiuePairSqrt(lengthSquared));
-    firstImpulse = LaiuePairSelect(scaleMask, LaiuePairMul(firstImpulse, scale), firstImpulse);
-    secondImpulse = LaiuePairSelect(scaleMask, LaiuePairMul(secondImpulse, scale), secondImpulse);
+    // Перемасштабирование перед возведением в квадрат защищает от переполнения,
+    // поэтому оно нужно только там, где суммарный импульс вообще способен выйти
+    // за конус Кулона. Скалярный SolveContact и PrepareCachedImpulse уже считают
+    // эту ветвь лениво; парный путь повторял три деления и sqrt на каждой паре
+    // каждой итерации, хотя LaiuePairSelect ниже отбрасывал их результат, когда
+    // ни одна полоса не нормируется. Совпадение по битам сохраняется: при
+    // выключенной маске select возвращает исходное значение.
+    if (LaiuePairMaskAny(scaleGuard))
+    {
+        const LaiuePairVector scaledFirst = LaiuePairDiv(firstImpulse, largest);
+        const LaiuePairVector scaledSecond = LaiuePairDiv(secondImpulse, largest);
+        const LaiuePairVector scaledLimit = LaiuePairDiv(limit, largest);
+        const LaiuePairVector lengthSquared = LaiuePairAdd(LaiuePairMul(scaledFirst, scaledFirst),
+                                                           LaiuePairMul(scaledSecond, scaledSecond));
+        const LaiuePairMask scaleMask = LaiuePairMaskAnd(
+            scaleGuard, LaiuePairGreater(lengthSquared, LaiuePairMul(scaledLimit, scaledLimit)));
+        if (LaiuePairMaskAny(scaleMask))
+        {
+            const LaiuePairVector scale = LaiuePairDiv(scaledLimit, LaiuePairSqrt(lengthSquared));
+            firstImpulse =
+                LaiuePairSelect(scaleMask, LaiuePairMul(firstImpulse, scale), firstImpulse);
+            secondImpulse =
+                LaiuePairSelect(scaleMask, LaiuePairMul(secondImpulse, scale), secondImpulse);
+        }
+    }
 
     const LaiuePairVector firstDelta = LaiuePairSub(firstImpulse, previousFirst);
     const LaiuePairVector secondDelta = LaiuePairSub(secondImpulse, previousSecond);

@@ -133,11 +133,26 @@ static bool AdpcmDecode(const uint8_t *payload, uint32_t payloadBytes, uint32_t 
         if (state.stepIndex < 0 || state.stepIndex > 88) return false;
         cursor += 4;
 
-        for (uint32_t frame = 0; frame < frameCount; ++frame)
+        // По два отсчёта на байт: младший полубайт идёт первым. Парный
+        // проход снимает деление и проверку чётности с каждого кадра и
+        // читает упакованные байты последовательно. Нечётный последний
+        // кадр берёт младший полубайт последнего байта; порядок отсчётов
+        // и обновление состояния декодера при этом не меняются.
+        const uint8_t *packed = cursor;
+        int16_t *out = outSamples + channel;
+        uint32_t remaining = frameCount;
+        while (remaining >= 2u)
         {
-            uint8_t packed = cursor[frame / 2u];
-            uint32_t nibble = (frame & 1u) != 0u ? (uint32_t)(packed >> 4) : (uint32_t)(packed & 15u);
-            outSamples[frame * channelCount + channel] = AdpcmDecodeNibble(&state, nibble);
+            uint8_t byte = *packed++;
+            *out = AdpcmDecodeNibble(&state, (uint32_t)(byte & 15u));
+            out += channelCount;
+            *out = AdpcmDecodeNibble(&state, (uint32_t)(byte >> 4));
+            out += channelCount;
+            remaining -= 2u;
+        }
+        if (remaining != 0u)
+        {
+            *out = AdpcmDecodeNibble(&state, (uint32_t)(*packed & 15u));
         }
         cursor += AdpcmChannelBytes(frameCount);
     }
@@ -244,11 +259,20 @@ static AudioPackLoadStatus DecodeSound(const uint8_t *bytes, uint32_t sizeBytes,
 
     if (encoding == LA_ENCODING_PCM16)
     {
-        // Сэмплы в файле little-endian; собираются побайтово, чтобы
-        // формат не зависел от порядка байтов машины.
-        for (uint32_t index = 0; index < frameCount * channelCount; ++index)
+        // Сэмплы в файле little-endian. На совпадающей по порядку байтов
+        // машине раскладка int16 уже такая же, и перенос идёт одним memcpy;
+        // на big-endian остаётся побайтовый путь, иначе формат зависел бы
+        // от машины.
+        if (HostUsesLittleEndian())
         {
-            samples[index] = (int16_t)ReadU16Le(payload + (size_t)index * 2u);
+            memcpy(samples, payload, sampleBytes);
+        }
+        else
+        {
+            for (uint32_t index = 0; index < frameCount * channelCount; ++index)
+            {
+                samples[index] = (int16_t)ReadU16Le(payload + (size_t)index * 2u);
+            }
         }
     }
     else if (!AdpcmDecode(payload, payloadBytes, frameCount, channelCount, samples))
@@ -516,11 +540,37 @@ static AudioClip *CreateSilentClip(AudioDevice *device)
     return AudioClipCreate(device, &description, &clip) == AUDIO_RESULT_OK ? clip : NULL;
 }
 
-typedef struct SoundLookup
+// Ёмкость под путь ресурса: корень + каталог типа + активный пак + имя
+// звука + расширение. Считается по фактическим строкам, а не по потолку
+// пути: буфер в 128 КиБ на каждый поиск — плата ни за что. Корень длиннее
+// пробы означает, что его фактическая длина неизвестна, и тогда берётся
+// прежний потолок, чтобы путь гарантированно поместился.
+static uint32_t SoundResourcePathCapacity(LaiueContentCatalog *catalog, const wchar_t *activeName,
+                                          const wchar_t *soundName)
 {
-    wchar_t path[LAIUE_CONTENT_PATH_CAPACITY];
-    wchar_t cachePath[LAIUE_CONTENT_PATH_CAPACITY];
-} SoundLookup;
+    const LaiueContentFormat *format = LaiueContentFormatGet(LAIUE_CONTENT_SOUND_PACK);
+    if (format == NULL || format->directoryName == NULL) return LAIUE_CONTENT_PATH_CAPACITY;
+
+    wchar_t root[LAIUE_CONTENT_NAME_CAPACITY];
+    if (!LaiueContentCatalogGetRoot(catalog, root, LAIUE_CONTENT_NAME_CAPACITY))
+        return LAIUE_CONTENT_PATH_CAPACITY;
+
+    uint32_t rootLength = 0u;
+    while (root[rootLength] != 0) ++rootLength;
+    uint32_t directoryLength = 0u;
+    while (format->directoryName[directoryLength] != 0) ++directoryLength;
+    uint32_t activeLength = 0u;
+    while (activeName[activeLength] != 0) ++activeLength;
+    uint32_t soundLength = 0u;
+    while (soundName[soundLength] != 0) ++soundLength;
+
+    // Три разделителя, расширение кэша («.wav.la») и завершающий ноль;
+    // запас 16 покрывает их с избытком, поэтому буфер годится и для пути
+    // кэша, а не только для пути исходника.
+    uint64_t needed = (uint64_t)rootLength + directoryLength + activeLength + soundLength + 16u;
+    if (needed >= LAIUE_CONTENT_PATH_CAPACITY) return LAIUE_CONTENT_PATH_CAPACITY;
+    return (uint32_t)needed;
+}
 
 AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
                              const wchar_t *soundName, AudioPackLoadStatus *outStatus)
@@ -541,14 +591,11 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
     bool decoded = false;
     uint64_t staleModifiedTime = 0u;
     uint32_t staleSizeBytes = 0u;
+    wchar_t *pathScratch = NULL;
+    wchar_t *path = NULL;
+    wchar_t *cachePath = NULL;
 
     wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    SoundLookup *lookup = PlatformAllocate(sizeof(*lookup), false);
-    if (lookup == NULL)
-    {
-        if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_OUT_OF_MEMORY;
-        return NULL;
-    }
     if (!LaiueContentCatalogGetActivePack(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
                                           LAIUE_CONTENT_NAME_CAPACITY))
     {
@@ -556,6 +603,19 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
     }
     else
     {
+        // Буферы путей берутся по фактической длине корня и имени, а не по
+        // потолку пути: поиск платит байты, а не 128 КиБ. При отсутствии
+        // активного пака не выделяется вовсе.
+        uint32_t pathCapacity = SoundResourcePathCapacity(catalog, activeName, soundName);
+        pathScratch = PlatformAllocate((size_t)pathCapacity * 2u * sizeof(wchar_t), false);
+        if (pathScratch == NULL)
+        {
+            if (outStatus != NULL) *outStatus = AUDIO_PACK_LOAD_OUT_OF_MEMORY;
+            return NULL;
+        }
+        path = pathScratch;
+        cachePath = pathScratch + pathCapacity;
+
         const wchar_t *order[LAIUE_CONTENT_FORMAT_ORDER_MAX];
         uint32_t orderCount = LaiueContentCatalogOrderFormats(
             catalog, LAIUE_CONTENT_SOUND_PACK, g_soundExtensions,
@@ -566,22 +626,21 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
         {
             const wchar_t *extension = order[index];
             if (!LaiueContentCatalogBuildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                                      soundName, extension, lookup->path,
-                                                      LAIUE_CONTENT_PATH_CAPACITY))
+                                                      soundName, extension, path, pathCapacity))
             {
                 status = AUDIO_PACK_LOAD_IO_ERROR;
                 continue;
             }
 
             PlatformPathInformation source;
-            bool hasSource = SoundFileUsable(lookup->path, &source);
+            bool hasSource = SoundFileUsable(path, &source);
 
             // Свой формат играется как есть: выводить его не из чего, и
             // кэш рядом с ним не появляется.
             if (ExtensionIs(extension, L".la"))
             {
                 if (!hasSource) continue;
-                status = DecodeSoundFile(lookup->path, &sound);
+                status = DecodeSoundFile(path, &sound);
                 decoded = status == AUDIO_PACK_LOAD_OK;
                 if (!decoded)
                 {
@@ -594,15 +653,15 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
             wchar_t cacheExtension[16];
             BuildSoundCacheExtension(extension, cacheExtension, 16u);
             if (!LaiueContentCatalogBuildResourcePath(catalog, LAIUE_CONTENT_SOUND_PACK, activeName,
-                                                      soundName, cacheExtension, lookup->cachePath,
-                                                      LAIUE_CONTENT_PATH_CAPACITY))
+                                                      soundName, cacheExtension, cachePath,
+                                                      pathCapacity))
             {
                 status = AUDIO_PACK_LOAD_IO_ERROR;
                 continue;
             }
 
             PlatformPathInformation cache;
-            bool hasCache = SoundFileUsable(lookup->cachePath, &cache);
+            bool hasCache = SoundFileUsable(cachePath, &cache);
 
             // Свежесть определяет отпечаток исходника, записанный в
             // кэш при сборке: размер и время изменения. Достаточно
@@ -612,7 +671,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
             (void)cache;
             if (hasCache)
             {
-                status = DecodeSoundFile(lookup->cachePath, &sound);
+                status = DecodeSoundFile(cachePath, &sound);
                 bool fresh = status == AUDIO_PACK_LOAD_OK &&
                              (!hasSource || (sound.sourceSizeBytes == (uint32_t)source.size &&
                                              sound.sourceModifiedTime == source.modifiedTime));
@@ -626,7 +685,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
             }
             if (hasSource)
             {
-                status = DecodeSoundFile(lookup->path, &sound);
+                status = DecodeSoundFile(path, &sound);
                 if (status == AUDIO_PACK_LOAD_OK)
                 {
                     decoded = true;
@@ -647,7 +706,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
     {
         if (staleSizeBytes != 0u)
         {
-            WriteSoundCache(lookup->cachePath, &sound, staleModifiedTime, staleSizeBytes);
+            WriteSoundCache(cachePath, &sound, staleModifiedTime, staleSizeBytes);
         }
         clip = CreateClipFromDecoded(device, &sound, &status);
     }
@@ -657,7 +716,7 @@ AudioClip *AudioClipLoadFrom(AudioDevice *device, LaiueContentCatalog *catalog,
         if (clip == NULL) status = AUDIO_PACK_LOAD_OUT_OF_MEMORY;
     }
 
-    PlatformFree(lookup);
+    PlatformFree(pathScratch);
     if (outStatus != NULL) *outStatus = status;
     return clip;
 }

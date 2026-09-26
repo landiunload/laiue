@@ -414,6 +414,72 @@ static bool ChunkGetDelta(
     return true;
 }
 
+/* Сдвиг хвоста дельт на одну позицию вправо: [position, count) переезжает в
+ * [position+1, count+1). Это горячая точка одиночной правки: на заселённом
+ * чанке хвост — тысячи записей, и поэлементный цикл копирует одну запись за
+ * итерацию. Копия идёт блоками от конца к началу: следующее чтение лежит
+ * строго ниже уже записанного, поэтому перекрытие в одну запись безопасно.
+ * Векторные ветки — тот же приём, что и в ClassifyRegion; там, где векторов
+ * нет (например, ARM64), остаётся прежний переносимый цикл. */
+static void ChunkShiftRight(
+    DeltaEntry* deltas, uint32_t position, uint32_t count)
+{
+    uint32_t index = count;
+#if defined(__AVX2__)
+    while (index >= position + 8U)
+    {
+        __m256i tail = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(deltas + index - 8U));
+        _mm256_storeu_si256((__m256i*)(void*)(deltas + index - 7U), tail);
+        index -= 8U;
+    }
+#elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
+    while (index >= position + 4U)
+    {
+        __m128i tail = _mm_loadu_si128(
+            (const __m128i*)(const void*)(deltas + index - 4U));
+        _mm_storeu_si128((__m128i*)(void*)(deltas + index - 3U), tail);
+        index -= 4U;
+    }
+#endif
+    while (index > position)
+    {
+        deltas[index] = deltas[index - 1U];
+        --index;
+    }
+}
+
+/* Сдвиг хвоста на одну позицию влево: [position+1, count) переезжает в
+ * [position, count-1). Идём от начала к концу: блок читается целиком до
+ * записи, а следующий блок лежит выше уже записанного. */
+static void ChunkShiftLeft(
+    DeltaEntry* deltas, uint32_t position, uint32_t count)
+{
+    uint32_t index = position + 1U;
+#if defined(__AVX2__)
+    while (index + 8U <= count)
+    {
+        __m256i head = _mm256_loadu_si256(
+            (const __m256i*)(const void*)(deltas + index));
+        _mm256_storeu_si256((__m256i*)(void*)(deltas + index - 1U), head);
+        index += 8U;
+    }
+#elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
+    while (index + 4U <= count)
+    {
+        __m128i head = _mm_loadu_si128(
+            (const __m128i*)(const void*)(deltas + index));
+        _mm_storeu_si128((__m128i*)(void*)(deltas + index - 1U), head);
+        index += 4U;
+    }
+#endif
+    while (index < count)
+    {
+        deltas[index - 1U] = deltas[index];
+        ++index;
+    }
+}
+
 static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
 {
     uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
@@ -442,10 +508,10 @@ static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
         chunk->deltas = expanded;
         chunk->deltaCapacity = newCapacity;
     }
-    for (uint32_t index = chunk->deltaCount; index > position; --index)
-    {
-        chunk->deltas[index] = chunk->deltas[index - 1U];
-    }
+    /* Сдвиг хвоста — единственная стоимость вставки на заселённом чанке,
+     * поэтому копируется блоками, а не по одной записи. Порядок и
+     * содержимое массива те же. */
+    ChunkShiftRight(chunk->deltas, position, chunk->deltaCount);
     chunk->deltas[position] = PackDelta(localIndex, block);
     ++chunk->deltaCount;
     return true;
@@ -459,11 +525,9 @@ static bool ChunkRemoveDelta(Chunk* chunk, uint32_t localIndex)
     {
         return false;
     }
-    for (uint32_t index = position + 1U;
-         index < chunk->deltaCount; ++index)
-    {
-        chunk->deltas[index - 1U] = chunk->deltas[index];
-    }
+    /* Сдвиг хвоста влево — такое же копирование, как при вставке, и та же
+     * горячая точка одиночных правок. */
+    ChunkShiftLeft(chunk->deltas, position, chunk->deltaCount);
     --chunk->deltaCount;
     return true;
 }

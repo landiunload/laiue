@@ -239,8 +239,77 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
     return true;
 }
 
+// Индекс глифа по кодпоинту без бинарного поиска: состав и порядок глифов
+// фиксированы таблицей GLYPH_RANGES и запекаются строго в её порядке,
+// поэтому индекс вычисляется прямым обходом диапазонов (для ASCII —
+// одно сравнение). false — кодпоинт не входит ни в один диапазон.
+static bool GlyphIndexForCodepoint(uint16_t codepoint, uint32_t* outIndex)
+{
+    uint32_t base = 0;
+    for (uint32_t range = 0; range < GLYPH_RANGE_COUNT; ++range)
+    {
+        if (codepoint < GLYPH_RANGES[range].first)
+        {
+            return false;
+        }
+        if (codepoint <= GLYPH_RANGES[range].last)
+        {
+            *outIndex = base
+                + (uint32_t)(codepoint - GLYPH_RANGES[range].first);
+            return true;
+        }
+        base += (uint32_t)(GLYPH_RANGES[range].last
+            - GLYPH_RANGES[range].first + 1);
+    }
+    return false;
+}
+
+// Совпадает ли раскладка шрифта с фиксированным набором диапазонов: число
+// глифов и границы. Для шрифта, запечённого UiFontBake, всегда true — тогда
+// кодпоинт вне диапазонов заведомо отсутствует и бинарный поиск не нужен.
+static bool FontMatchesGlyphRanges(const UiFont* font)
+{
+    return font->glyphs != NULL
+        && font->glyphCount == CountGlyphs()
+        && font->glyphs[0].codepoint == GLYPH_RANGES[0].first
+        && font->glyphs[font->glyphCount - 1u].codepoint
+            == GLYPH_RANGES[GLYPH_RANGE_COUNT - 1u].last;
+}
+
 const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
 {
+    // glyphs отсортированы по codepoint, поэтому выход за весь набор
+    // отсекается без поиска.
+    if (font->glyphs == NULL || font->glyphCount == 0)
+    {
+        return NULL;
+    }
+    if (codepoint < font->glyphs[0].codepoint
+        || codepoint > font->glyphs[font->glyphCount - 1u].codepoint)
+    {
+        return NULL;
+    }
+
+    // Быстрый путь: индекс из фиксированных диапазонов и проверка, что
+    // позиция действительно занята нужным кодпоинтом (страховка на случай
+    // шрифта, запечённого по другой таблице диапазонов).
+    uint32_t index = 0;
+    if (GlyphIndexForCodepoint(codepoint, &index))
+    {
+        if (index < font->glyphCount
+            && font->glyphs[index].codepoint == codepoint)
+        {
+            return &font->glyphs[index];
+        }
+    }
+    else if (FontMatchesGlyphRanges(font))
+    {
+        // Кодпоинт вне диапазонов, а раскладка — наша: глифа точно нет.
+        return NULL;
+    }
+
+    // Запасной путь — прежний бинарный поиск по отсортированному массиву.
+    // Достижим только для шрифта чужой раскладки.
     uint32_t low = 0;
     uint32_t high = font->glyphCount;
     while (low < high)

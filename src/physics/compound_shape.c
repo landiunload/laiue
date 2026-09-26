@@ -35,6 +35,19 @@ static bool CompoundShapeBounds(const VoxelRigidCompoundBox *box, double outMin[
     return true;
 }
 
+// Вычисляет границы без проверок конечности/невырожденности. Допустим только
+// после успешной превалидации CompoundShapeBounds: те же самые c-h и c+h дают
+// побитово те же значения, а лишние проверки в горячем O(n^2) скане не нужны.
+static void CompoundShapeBoundsUnchecked(const VoxelRigidCompoundBox *box, double outMin[3],
+                                         double outMax[3])
+{
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outMin[axis] = box->center[axis] - box->halfExtent[axis];
+        outMax[axis] = box->center[axis] + box->halfExtent[axis];
+    }
+}
+
 // Строгое пересечение интервалов: касание гранями перекрытием не считается.
 static bool CompoundShapeOverlap(const double firstMin[3], const double firstMax[3],
                                  const double secondMin[3], const double secondMax[3])
@@ -161,12 +174,12 @@ bool VoxelRigidCompoundMergeBoxes(const VoxelRigidCompoundBox *boxes, uint32_t c
     {
         double firstMin[3];
         double firstMax[3];
-        CompoundShapeBounds(&boxes[first], firstMin, firstMax);
+        CompoundShapeBoundsUnchecked(&boxes[first], firstMin, firstMax);
         for (uint32_t second = first + 1u; second < count; ++second)
         {
             double secondMin[3];
             double secondMax[3];
-            CompoundShapeBounds(&boxes[second], secondMin, secondMax);
+            CompoundShapeBoundsUnchecked(&boxes[second], secondMin, secondMax);
             if (CompoundShapeOverlap(firstMin, firstMax, secondMin, secondMax))
             {
                 return false;

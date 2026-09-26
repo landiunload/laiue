@@ -12,6 +12,17 @@
 
 #include <string.h>
 
+// Быстрый путь целочисленного шага разворачивается векторно, когда профиль
+// сборки даёт AVX2 и слитное умножение-сложение: скалярный код компилятора
+// контрактит `frames += sample * gain` в FMA, и вектор обязан повторить ту же
+// одну округлёнку на дорожку, иначе микс перестанет совпадать побитово.
+// Прочие профили (SSE2, ARM NEON, внешние) остаются на прежнем скалярном
+// пути без изменения арифметики.
+#if defined(__AVX2__) && (defined(_MSC_VER) || defined(__FMA__))
+#include <immintrin.h>
+#define AUDIO_MIX_AVX2_FMA 1
+#endif
+
 #define AUDIO_MIX_CHANNELS 2u
 #define AUDIO_COMMAND_CAPACITY 256u
 #define AUDIO_DEFAULT_SAMPLE_RATE 48000u
@@ -349,7 +360,27 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 uint32_t run = clipFrames - frame;
                 uint32_t tail = frameCount - index;
                 uint32_t count = run < tail ? run : tail;
-                for (uint32_t sample = 0u; sample < count; ++sample)
+                uint32_t sample = 0u;
+#if defined(AUDIO_MIX_AVX2_FMA)
+                // Восемь float за итерацию — четыре стереокадра. Порядок
+                // операций на дорожку тот же, что у скалярной ветви:
+                // int16->float, умножение на scale, FMA с усилением, поэтому
+                // биты выхода совпадают.
+                const __m256 scaleVector = _mm256_set1_ps(scale);
+                const __m256 gainVector =
+                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                for (; sample + 4u <= count; sample += 4u)
+                {
+                    __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame * 2u));
+                    __m256 scaled = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
+                    float *destination = frames + (index + sample) * 2u;
+                    __m256 mix = _mm256_fmadd_ps(gainVector, scaled, _mm256_loadu_ps(destination));
+                    _mm256_storeu_ps(destination, mix);
+                    frame += 4u;
+                }
+#endif
+                for (; sample < count; ++sample)
                 {
                     float channelLeft = (float)samples[frame * 2u] * scale;
                     float channelRight = (float)samples[frame * 2u + 1u] * scale;
@@ -378,7 +409,34 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 uint32_t run = clipFrames - frame;
                 uint32_t tail = frameCount - index;
                 uint32_t count = run < tail ? run : tail;
-                for (uint32_t sample = 0u; sample < count; ++sample)
+                uint32_t sample = 0u;
+#if defined(AUDIO_MIX_AVX2_FMA)
+                // Восемь моносемплов за итерацию: каждый дублируется в оба
+                // канала, что даёт восемь кадров. Дублирование — перестановка
+                // уже масштабированных значений, арифметика не меняется.
+                const __m256 scaleVector = _mm256_set1_ps(scale);
+                const __m256 gainVector =
+                    _mm256_setr_ps(left, right, left, right, left, right, left, right);
+                const __m256i duplicateLow = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+                const __m256i duplicateHigh = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
+                for (; sample + 8u <= count; sample += 8u)
+                {
+                    __m128i packed = _mm_loadu_si128((const __m128i *)(samples + frame));
+                    __m256 scaled = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(packed)), scaleVector);
+                    __m256 low = _mm256_permutevar8x32_ps(scaled, duplicateLow);
+                    __m256 high = _mm256_permutevar8x32_ps(scaled, duplicateHigh);
+                    float *destination = frames + (index + sample) * 2u;
+                    __m256 mixLow =
+                        _mm256_fmadd_ps(gainVector, low, _mm256_loadu_ps(destination));
+                    __m256 mixHigh =
+                        _mm256_fmadd_ps(gainVector, high, _mm256_loadu_ps(destination + 8u));
+                    _mm256_storeu_ps(destination, mixLow);
+                    _mm256_storeu_ps(destination + 8u, mixHigh);
+                    frame += 8u;
+                }
+#endif
+                for (; sample < count; ++sample)
                 {
                     float mono = (float)samples[frame] * scale;
                     frames[(index + sample) * 2u] += mono * left;

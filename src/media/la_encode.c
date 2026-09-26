@@ -1,6 +1,7 @@
 #include "media/la_encode.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #define LA_MAGIC 0x3153414Cu   // L, A, S, 1 little-endian
 
@@ -140,12 +141,23 @@ static uint32_t EncodeAdpcmChannel(const int16_t *samples, uint32_t frameCount, 
 
     uint8_t *nibbles = payload + 4;
     uint32_t byteCount = AdpcmChannelBytes(frameCount);
-    for (uint32_t index = 0; index < byteCount; ++index) nibbles[index] = 0u;
-    for (uint32_t frame = 0; frame < frameCount; ++frame)
+    // Два ниббла складываются в регистре и записываются одним байтом:
+    // отдельный проход обнуления и read-modify-write на каждый кадр не
+    // нужны, а байты получаются те же (младший — чётный кадр, старший —
+    // нечётный). Нечётный последний кадр остаётся в младшем ниббле, как и
+    // прежде при обнулённом буфере.
+    uint32_t frame = 0u;
+    uint32_t fullBytes = frameCount / 2u;
+    for (uint32_t index = 0; index < fullBytes; ++index)
     {
-        uint32_t nibble = EncodeNibble(&state, samples[(size_t)frame * stride]);
-        if ((frame & 1u) != 0u) nibbles[frame / 2u] |= (uint8_t)(nibble << 4);
-        else nibbles[frame / 2u] |= (uint8_t)nibble;
+        uint32_t low = EncodeNibble(&state, samples[(size_t)frame * stride]);
+        uint32_t high = EncodeNibble(&state, samples[(size_t)(frame + 1u) * stride]);
+        nibbles[index] = (uint8_t)(low | (high << 4));
+        frame += 2u;
+    }
+    if ((frameCount & 1u) != 0u)
+    {
+        nibbles[fullBytes] = (uint8_t)EncodeNibble(&state, samples[(size_t)frame * stride]);
     }
     return 4u + byteCount;
 }
@@ -218,10 +230,22 @@ SoundStatus SoundEncode(const SoundClip *clip, void *outBytes, uint32_t capacity
     if (clip->encoding == SOUND_ENCODING_PCM16)
     {
         // Сэмплы пишутся побайтово, чтобы файл не зависел от порядка
-        // байтов машины, на которой собран пак.
-        for (uint32_t index = 0; index < clip->frameCount * clip->channelCount; ++index)
+        // байтов машины, на которой собран пак. На little-endian хосте
+        // байты payload побитово равны байтам массива сэмплов, и целый
+        // блок копируется одним вызовом; на big-endian остаётся точный
+        // побайтовый путь.
+        uint32_t sampleCount = clip->frameCount * clip->channelCount;
+        uint16_t endianProbe = 1u;
+        if (*(const uint8_t *)&endianProbe == 1u)
         {
-            WriteU16Le(payload + (size_t)index * 2u, (uint32_t)(uint16_t)clip->samples[index]);
+            memcpy(payload, clip->samples, (size_t)sampleCount * sizeof(int16_t));
+        }
+        else
+        {
+            for (uint32_t index = 0; index < sampleCount; ++index)
+            {
+                WriteU16Le(payload + (size_t)index * 2u, (uint32_t)(uint16_t)clip->samples[index]);
+            }
         }
     }
     else

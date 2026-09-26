@@ -274,7 +274,9 @@ static uint8_t PaethPredictor(int32_t left, int32_t above, int32_t upperLeft)
 }
 
 // Снимает фильтр со строки на месте. Предыдущая строка уже развёрнута,
-// поэтому обратные ссылки читают готовые байты.
+// поэтому обратные ссылки читают готовые байты. Проверка previous == NULL
+// и граница filterUnit инвариантны внутри строки, поэтому вынесены из
+// горячих циклов: результат побайтово тот же, что у общей формы ниже.
 static bool Unfilter(uint8_t *row, const uint8_t *previous, uint32_t rowBytes, uint32_t filterUnit,
                      uint32_t filterType)
 {
@@ -295,23 +297,55 @@ static bool Unfilter(uint8_t *row, const uint8_t *previous, uint32_t rowBytes, u
         }
         return true;
     case 3u:
-        for (uint32_t index = 0; index < rowBytes; ++index)
+    {
+        uint32_t index = 0u;
+        if (previous == NULL)
         {
-            uint32_t left = index >= filterUnit ? row[index - filterUnit] : 0u;
-            uint32_t above = previous != NULL ? previous[index] : 0u;
-            row[index] = (uint8_t)(row[index] + (left + above) / 2u);
+            for (; index < rowBytes; ++index)
+            {
+                uint32_t left = index >= filterUnit ? row[index - filterUnit] : 0u;
+                row[index] = (uint8_t)(row[index] + left / 2u);
+            }
+            return true;
+        }
+        for (; index < filterUnit && index < rowBytes; ++index)
+        {
+            row[index] = (uint8_t)(row[index] + previous[index] / 2u);
+        }
+        for (; index < rowBytes; ++index)
+        {
+            row[index] =
+                (uint8_t)(row[index] + (row[index - filterUnit] + (uint32_t)previous[index]) / 2u);
         }
         return true;
+    }
     case 4u:
-        for (uint32_t index = 0; index < rowBytes; ++index)
+    {
+        uint32_t index = 0u;
+        if (previous == NULL)
         {
-            int32_t left = index >= filterUnit ? row[index - filterUnit] : 0;
-            int32_t above = previous != NULL ? previous[index] : 0;
-            int32_t upperLeft =
-                (previous != NULL && index >= filterUnit) ? previous[index - filterUnit] : 0;
+            // Paeth(left, 0, 0) == left, то есть фильтр 4 вырождается в Sub.
+            for (index = filterUnit; index < rowBytes; ++index)
+            {
+                row[index] = (uint8_t)(row[index] + row[index - filterUnit]);
+            }
+            return true;
+        }
+        // Paeth(0, above, 0) == above: первые filterUnit байт строки не имеют
+        // левого и верхнего-левого соседа, и предиктор равен верхнему байту.
+        for (; index < filterUnit && index < rowBytes; ++index)
+        {
+            row[index] = (uint8_t)(row[index] + previous[index]);
+        }
+        for (; index < rowBytes; ++index)
+        {
+            int32_t left = row[index - filterUnit];
+            int32_t above = previous[index];
+            int32_t upperLeft = previous[index - filterUnit];
             row[index] = (uint8_t)(row[index] + PaethPredictor(left, above, upperLeft));
         }
         return true;
+    }
     default: return false;
     }
 }
@@ -357,41 +391,70 @@ typedef struct DecodeContext
 // Глубина 8 бит — подавляющее большинство файлов. Отдельные циклы на тип
 // цвета убирают из горячего пути переключение по colorType/bitDepth и
 // ReadPackedSample на каждый канал; результат побайтово тот же, что у
-// общего пути ниже.
+// общего пути ниже. Признак tRNS и шаг строки инвариантны для всего
+// вызова, поэтому разведены по отдельным циклам, а адрес пикселя ведётся
+// приращением, а не умножением на каждом шаге.
 static void ExpandRow8Gray(const DecodeContext *context, const uint8_t *row,
                            uint32_t rowWidth, uint8_t *destination,
                            uint32_t destinationStride)
 {
-    bool keyed = context->transparencySize >= 2u;
-    uint8_t key = keyed ? context->transparency[1] : 0u;
+    if (context->transparencySize >= 2u)
+    {
+        uint8_t key = context->transparency[1];
+        for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+        {
+            uint8_t level = row[pixel];
+            destination[0] = level;
+            destination[1] = level;
+            destination[2] = level;
+            destination[3] = level == key ? 0u : 255u;
+            destination += destinationStride;
+        }
+        return;
+    }
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
         uint8_t level = row[pixel];
-        out[0] = level;
-        out[1] = level;
-        out[2] = level;
-        out[3] = keyed && level == key ? 0u : 255u;
+        destination[0] = level;
+        destination[1] = level;
+        destination[2] = level;
+        destination[3] = 255u;
+        destination += destinationStride;
     }
 }
 
 static void ExpandRow8Rgb(const DecodeContext *context, const uint8_t *row, uint32_t rowWidth,
                           uint8_t *destination, uint32_t destinationStride)
 {
-    bool keyed = context->transparencySize >= 6u;
-    uint8_t keyRed = keyed ? context->transparency[1] : 0u;
-    uint8_t keyGreen = keyed ? context->transparency[3] : 0u;
-    uint8_t keyBlue = keyed ? context->transparency[5] : 0u;
+    if (context->transparencySize >= 6u)
+    {
+        uint8_t keyRed = context->transparency[1];
+        uint8_t keyGreen = context->transparency[3];
+        uint8_t keyBlue = context->transparency[5];
+        const uint8_t *source = row;
+        for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+        {
+            destination[0] = source[0];
+            destination[1] = source[1];
+            destination[2] = source[2];
+            destination[3] = source[0] == keyRed && source[1] == keyGreen &&
+                                     source[2] == keyBlue
+                                 ? 0u
+                                 : 255u;
+            source += 3u;
+            destination += destinationStride;
+        }
+        return;
+    }
+    const uint8_t *source = row;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
-        const uint8_t *source = row + (size_t)pixel * 3u;
-        out[0] = source[0];
-        out[1] = source[1];
-        out[2] = source[2];
-        out[3] = keyed && source[0] == keyRed && source[1] == keyGreen && source[2] == keyBlue
-                     ? 0u
-                     : 255u;
+        destination[0] = source[0];
+        destination[1] = source[1];
+        destination[2] = source[2];
+        destination[3] = 255u;
+        source += 3u;
+        destination += destinationStride;
     }
 }
 
@@ -399,15 +462,33 @@ static void ExpandRow8Palette(const DecodeContext *context, const uint8_t *row,
                               uint32_t rowWidth, uint8_t *destination,
                               uint32_t destinationStride)
 {
+    const uint8_t *palette = context->palette;
+    uint32_t paletteEntries = context->paletteEntries;
+    if (context->transparencySize == 0u)
+    {
+        for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+        {
+            uint32_t index = row[pixel];
+            if (index >= paletteEntries) index = 0u;
+            destination[0] = palette[index * 3u];
+            destination[1] = palette[index * 3u + 1u];
+            destination[2] = palette[index * 3u + 2u];
+            destination[3] = 255u;
+            destination += destinationStride;
+        }
+        return;
+    }
+    const uint8_t *transparency = context->transparency;
+    uint32_t transparencySize = context->transparencySize;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
         uint32_t index = row[pixel];
-        if (index >= context->paletteEntries) index = 0u;
-        out[0] = context->palette[index * 3u];
-        out[1] = context->palette[index * 3u + 1u];
-        out[2] = context->palette[index * 3u + 2u];
-        out[3] = index < context->transparencySize ? context->transparency[index] : 255u;
+        if (index >= paletteEntries) index = 0u;
+        destination[0] = palette[index * 3u];
+        destination[1] = palette[index * 3u + 1u];
+        destination[2] = palette[index * 3u + 2u];
+        destination[3] = index < transparencySize ? transparency[index] : 255u;
+        destination += destinationStride;
     }
 }
 
@@ -416,14 +497,16 @@ static void ExpandRow8GrayAlpha(const DecodeContext *context, const uint8_t *row
                                 uint32_t destinationStride)
 {
     (void)context;
+    const uint8_t *source = row;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
-        const uint8_t *source = row + (size_t)pixel * 2u;
-        out[0] = source[0];
-        out[1] = source[0];
-        out[2] = source[0];
-        out[3] = source[1];
+        uint8_t level = source[0];
+        destination[0] = level;
+        destination[1] = level;
+        destination[2] = level;
+        destination[3] = source[1];
+        source += 2u;
+        destination += destinationStride;
     }
 }
 
@@ -436,9 +519,12 @@ static void ExpandRow8Rgba(const DecodeContext *context, const uint8_t *row, uin
         memcpy(destination, row, (size_t)rowWidth * 4u);
         return;
     }
+    const uint8_t *source = row;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        memcpy(destination + (size_t)pixel * destinationStride, row + (size_t)pixel * 4u, 4u);
+        memcpy(destination, source, 4u);
+        source += 4u;
+        destination += destinationStride;
     }
 }
 
@@ -453,9 +539,12 @@ static void ExpandRowPackedPalette(const DecodeContext *context, const uint8_t *
     uint32_t mask = (1u << depth) - 1u;
     uint32_t sourceIndex = 0u;
     uint32_t shift = (perByte - 1u) * depth;
+    const uint8_t *palette = context->palette;
+    uint32_t paletteEntries = context->paletteEntries;
+    const uint8_t *transparency = context->transparency;
+    uint32_t transparencySize = context->transparencySize;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
         uint32_t index = (row[sourceIndex] >> shift) & mask;
         if (shift == 0u)
         {
@@ -466,11 +555,12 @@ static void ExpandRowPackedPalette(const DecodeContext *context, const uint8_t *
         {
             shift -= depth;
         }
-        if (index >= context->paletteEntries) index = 0u;
-        out[0] = context->palette[index * 3u];
-        out[1] = context->palette[index * 3u + 1u];
-        out[2] = context->palette[index * 3u + 2u];
-        out[3] = index < context->transparencySize ? context->transparency[index] : 255u;
+        if (index >= paletteEntries) index = 0u;
+        destination[0] = palette[index * 3u];
+        destination[1] = palette[index * 3u + 1u];
+        destination[2] = palette[index * 3u + 2u];
+        destination[3] = index < transparencySize ? transparency[index] : 255u;
+        destination += destinationStride;
     }
 }
 
@@ -508,27 +598,25 @@ static void ExpandRow(const DecodeContext *context, const uint8_t *row, uint32_t
     // младший байт всё равно потерялся бы при записи.
     uint32_t shift = depth == 16u ? 8u : 0u;
 
+    uint32_t base = 0u;
     for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
     {
-        uint8_t *out = destination + (size_t)pixel * destinationStride;
-        uint32_t base = pixel * header->channels;
-
         switch (header->colorType)
         {
         case 0u:
         {
             uint32_t gray = ReadPackedSample(row, base, depth);
             uint8_t level = ScaleSample(gray >> shift, depth == 16u ? 8u : depth);
-            out[0] = level;
-            out[1] = level;
-            out[2] = level;
-            out[3] = 255u;
+            destination[0] = level;
+            destination[1] = level;
+            destination[2] = level;
+            destination[3] = 255u;
             if (context->transparencySize >= 2u)
             {
                 uint32_t key = ((uint32_t)context->transparency[0] << 8) |
                                context->transparency[1];
                 if (depth != 16u) key &= (1u << depth) - 1u;
-                if (gray == key) out[3] = 0u;
+                if (gray == key) destination[3] = 0u;
             }
             break;
         }
@@ -537,10 +625,10 @@ static void ExpandRow(const DecodeContext *context, const uint8_t *row, uint32_t
             uint32_t red = ReadPackedSample(row, base, depth);
             uint32_t green = ReadPackedSample(row, base + 1u, depth);
             uint32_t blue = ReadPackedSample(row, base + 2u, depth);
-            out[0] = (uint8_t)(red >> shift);
-            out[1] = (uint8_t)(green >> shift);
-            out[2] = (uint8_t)(blue >> shift);
-            out[3] = 255u;
+            destination[0] = (uint8_t)(red >> shift);
+            destination[1] = (uint8_t)(green >> shift);
+            destination[2] = (uint8_t)(blue >> shift);
+            destination[3] = 255u;
             if (context->transparencySize >= 6u)
             {
                 uint32_t keyRed = ((uint32_t)context->transparency[0] << 8) |
@@ -556,7 +644,7 @@ static void ExpandRow(const DecodeContext *context, const uint8_t *row, uint32_t
                     keyGreen &= mask;
                     keyBlue &= mask;
                 }
-                if (red == keyRed && green == keyGreen && blue == keyBlue) out[3] = 0u;
+                if (red == keyRed && green == keyGreen && blue == keyBlue) destination[3] = 0u;
             }
             break;
         }
@@ -564,29 +652,32 @@ static void ExpandRow(const DecodeContext *context, const uint8_t *row, uint32_t
         {
             uint32_t index = ReadPackedSample(row, base, depth);
             if (index >= context->paletteEntries) index = 0u;
-            out[0] = context->palette[index * 3u];
-            out[1] = context->palette[index * 3u + 1u];
-            out[2] = context->palette[index * 3u + 2u];
-            out[3] = index < context->transparencySize ? context->transparency[index] : 255u;
+            destination[0] = context->palette[index * 3u];
+            destination[1] = context->palette[index * 3u + 1u];
+            destination[2] = context->palette[index * 3u + 2u];
+            destination[3] =
+                index < context->transparencySize ? context->transparency[index] : 255u;
             break;
         }
         case 4u:
         {
             uint32_t gray = ReadPackedSample(row, base, depth) >> shift;
             uint32_t alpha = ReadPackedSample(row, base + 1u, depth) >> shift;
-            out[0] = (uint8_t)gray;
-            out[1] = (uint8_t)gray;
-            out[2] = (uint8_t)gray;
-            out[3] = (uint8_t)alpha;
+            destination[0] = (uint8_t)gray;
+            destination[1] = (uint8_t)gray;
+            destination[2] = (uint8_t)gray;
+            destination[3] = (uint8_t)alpha;
             break;
         }
         default:
-            out[0] = (uint8_t)(ReadPackedSample(row, base, depth) >> shift);
-            out[1] = (uint8_t)(ReadPackedSample(row, base + 1u, depth) >> shift);
-            out[2] = (uint8_t)(ReadPackedSample(row, base + 2u, depth) >> shift);
-            out[3] = (uint8_t)(ReadPackedSample(row, base + 3u, depth) >> shift);
+            destination[0] = (uint8_t)(ReadPackedSample(row, base, depth) >> shift);
+            destination[1] = (uint8_t)(ReadPackedSample(row, base + 1u, depth) >> shift);
+            destination[2] = (uint8_t)(ReadPackedSample(row, base + 2u, depth) >> shift);
+            destination[3] = (uint8_t)(ReadPackedSample(row, base + 3u, depth) >> shift);
             break;
         }
+        destination += destinationStride;
+        base += header->channels;
     }
 }
 

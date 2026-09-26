@@ -80,15 +80,11 @@ TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
         return TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
     }
 
-    TexturePackData built;
-    TexturePackLoadStatus status =
-        TexturePackBuildFrom(catalog, materialNames, materialCount, &built);
-    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
-    {
-        return status;
-    }
-    *outPack = built;
-    return status;
+    // Сборка пишет прямо в outPack: все пути отказа TexturePackBuildFrom
+    // возвращаются до первой записи в него, поэтому поставленный выше
+    // нейтральный слой сохраняется. Так нет ни временного TexturePackData
+    // на стеке, ни копии всего описания пака в outPack.
+    return TexturePackBuildFrom(catalog, materialNames, materialCount, outPack);
 }
 
 
@@ -164,29 +160,24 @@ void TexturePackCaptureAnimation(TexturePackAnimationSet *outSet, const TextureP
     {
         outSet->animation[material] = pack->animation[material];
     }
-    for (uint32_t slice = 0; slice < TEXTURE_PACK_MAX_SLICES; ++slice)
-    {
-        outSet->sliceMilliseconds[slice] = pack->sliceMilliseconds[slice];
-    }
+    // Вся таблица длительностей копируется целиком: один блочный перенос
+    // вместо 256 поэлементных присваиваний.
+    memcpy(outSet->sliceMilliseconds, pack->sliceMilliseconds,
+           sizeof(outSet->sliceMilliseconds));
 }
 
 // Кадры материала идут по своей длительности каждый, поэтому нужный
 // ищется накоплением, а не делением: у GIF задержки вправе различаться.
-uint32_t TexturePackResolveSlice(const TexturePackAnimationSet *set, uint32_t material,
-                                 double animationSeconds)
+//
+// Сюда приходят только материалы, у которых уже отсеяны «меньше двух
+// кадров» и нулевой цикл. `milliseconds` — неотрицательное время в
+// миллисекундах. Общий помощник с `TexturePackFillSliceTable`: масштаб
+// часов считается у вызывающего, а не заново на каждом материале.
+static uint32_t ResolveSliceFromMilliseconds(const TexturePackAnimationSet *set,
+                                             const TexturePackAnimation *animation,
+                                             double milliseconds)
 {
-    if (set == NULL || material >= TEXTURE_PACK_MAX_LAYERS) return 0u;
-    const TexturePackAnimation *animation = &set->animation[material];
-    if (animation->frameCount <= 1u || animation->cycleMilliseconds == 0u)
-    {
-        return animation->firstSlice;
-    }
-
-    // Часы принадлежат приложению и могут идти как угодно; кадр от этого
-    // не должен выходить за пределы материала.
-    if (!(animationSeconds > 0.0)) animationSeconds = 0.0;
     double cycle = (double)animation->cycleMilliseconds;
-    double milliseconds = animationSeconds * 1000.0;
     // Свёртка по длине цикла до перевода в целое: за сутки анимации
     // миллисекунды ещё помещаются в double точно, а прямое приведение
     // большого значения к uint32 не определено.
@@ -207,27 +198,54 @@ uint32_t TexturePackResolveSlice(const TexturePackAnimationSet *set, uint32_t ma
     return (uint32_t)animation->firstSlice + animation->frameCount - 1u;
 }
 
+uint32_t TexturePackResolveSlice(const TexturePackAnimationSet *set, uint32_t material,
+                                 double animationSeconds)
+{
+    if (set == NULL || material >= TEXTURE_PACK_MAX_LAYERS) return 0u;
+    const TexturePackAnimation *animation = &set->animation[material];
+    if (animation->frameCount <= 1u || animation->cycleMilliseconds == 0u)
+    {
+        return animation->firstSlice;
+    }
+
+    // Часы принадлежат приложению и могут идти как угодно; кадр от этого
+    // не должен выходить за пределы материала.
+    if (!(animationSeconds > 0.0)) animationSeconds = 0.0;
+    return ResolveSliceFromMilliseconds(set, animation, animationSeconds * 1000.0);
+}
+
 void TexturePackFillSliceTable(const TexturePackAnimationSet *set, double animationSeconds,
                                uint32_t *outSlices)
 {
     if (outSlices == NULL) return;
-    for (uint32_t word = 0; word < 16u; ++word) outSlices[word] = 0u;
-    if (set == NULL || set->materialCount == 0u) return;
-    uint32_t materialCount = set->materialCount;
+    // Часы одни на все материалы: масштаб считается один раз, а не заново
+    // на каждом из шестидесяти четырёх слотов.
+    double milliseconds = animationSeconds > 0.0 ? animationSeconds * 1000.0 : 0.0;
+    uint32_t materialCount = set != NULL ? set->materialCount : 0u;
     if (materialCount > TEXTURE_PACK_MAX_LAYERS) materialCount = TEXTURE_PACK_MAX_LAYERS;
 
-    // Слоты сверх materialCount повторяют последний материал. Его кадр
-    // решается один раз, а дальше берётся готовое значение: раньше он
-    // решался заново на каждом таком слоте при том же результате.
+    // Слоты сверх materialCount повторяют последний материал: его кадр
+    // решается один раз, а в хвост переносится готовое значение. Слово
+    // собирается целиком и пишется один раз — без зануления всей таблицы и
+    // без read-modify-write на каждый из шестидесяти четырёх материалов.
     uint32_t slice = 0u;
-    for (uint32_t material = 0; material < TEXTURE_PACK_MAX_LAYERS; ++material)
+    for (uint32_t word = 0; word < 16u; ++word)
     {
-        if (material < materialCount)
+        uint32_t packed = 0u;
+        for (uint32_t byte = 0; byte < 4u; ++byte)
         {
-            slice = TexturePackResolveSlice(set, material, animationSeconds);
+            uint32_t material = word * 4u + byte;
+            if (material < materialCount)
+            {
+                const TexturePackAnimation *animation = &set->animation[material];
+                slice = animation->frameCount <= 1u || animation->cycleMilliseconds == 0u
+                            ? animation->firstSlice
+                            : ResolveSliceFromMilliseconds(set, animation, milliseconds);
+            }
+            uint32_t clamped = slice > 255u ? 255u : slice;
+            packed |= clamped << (byte * 8u);
         }
-        uint32_t packed = slice > 255u ? 255u : slice;
-        outSlices[material >> 2] |= packed << ((material & 3u) * 8u);
+        outSlices[word] = packed;
     }
 }
 

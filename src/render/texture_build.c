@@ -861,36 +861,62 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         const ResourceMeta *meta = &metas[material];
         uint32_t frames = meta->found ? meta->frameCount : 1u;
 
+        // Источник карты нормалей предыдущего кадра. У карты с одним кадром на
+        // всю анимацию он повторяется кадр в кадр, и цепочку мипов достаточно
+        // посчитать один раз: одинаковый вход даёт побайтово одинаковый выход,
+        // поэтому следующий слой копируется, а не пересчитывается заново.
+        const uint8_t *previousNormal = NULL;
+        bool havePreviousNormal = false;
+
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
             bool hasPixels = source->found && frame < source->frameCount;
+            const uint8_t *normalSource = NULL;
             if (hasPixels)
             {
                 uint32_t frameBytes = source->width * source->height * 4u;
                 WriteSliceChain(source->albedo + (size_t)frame * frameBytes, source->width,
                                 source->height, size, albedoCursor);
-                if (normalCursor != NULL)
+                if (source->normal != NULL)
                 {
-                    if (source->normal != NULL)
-                    {
-                        // Один кадр карты нормалей может обслуживать всю
-                        // анимацию: тогда он берётся по нулевому индексу.
-                        uint32_t normalFrame =
-                            frame < source->normalFrameCount ? frame : 0u;
-                        WriteSliceChain(source->normal + (size_t)normalFrame * frameBytes,
-                                        source->width, source->height, size, normalCursor);
-                    }
-                    else
-                    {
-                        WriteConstantChain(g_flatNormalTexel, size, normalCursor);
-                    }
+                    // Один кадр карты нормалей может обслуживать всю
+                    // анимацию: тогда он берётся по нулевому индексу.
+                    uint32_t normalFrame = frame < source->normalFrameCount ? frame : 0u;
+                    normalSource = source->normal + (size_t)normalFrame * frameBytes;
                 }
             }
             else
             {
                 WriteConstantChain(g_missingTexel, size, albedoCursor);
-                if (normalCursor != NULL) WriteConstantChain(g_flatNormalTexel, size, normalCursor);
             }
+
+            if (normalCursor != NULL)
+            {
+                if (normalSource != NULL)
+                {
+                    if (havePreviousNormal && normalSource == previousNormal)
+                    {
+                        memcpy(normalCursor, normalCursor - chainBytes, chainBytes);
+                    }
+                    else
+                    {
+                        WriteSliceChain(normalSource, source->width, source->height, size,
+                                        normalCursor);
+                    }
+                }
+                else if (havePreviousNormal && previousNormal == NULL)
+                {
+                    // Нейтральная нормаль одинакова байт в байт на всех кадрах.
+                    memcpy(normalCursor, normalCursor - chainBytes, chainBytes);
+                }
+                else
+                {
+                    WriteConstantChain(g_flatNormalTexel, size, normalCursor);
+                }
+                previousNormal = normalSource;
+                havePreviousNormal = true;
+            }
+
             albedoCursor += chainBytes;
             if (normalCursor != NULL) normalCursor += chainBytes;
         }

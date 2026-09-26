@@ -116,6 +116,23 @@ static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source
     return true;
 }
 
+// Однолимбовый результат одним выделением: физика и мир почти всегда
+// укладываются в лимб, и заводить под него «лишний» лимб незачем.
+static bool InfiniteCoordTryAssignSingleLimb(
+    InfiniteCoord* out, uint64_t magnitude, int32_t sign)
+{
+    uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    limbs[0] = magnitude;
+    out->limbs = limbs;
+    out->limbCount = 1u;
+    out->sign = sign;
+    return true;
+}
+
 static bool InfiniteCoordTryAddMagnitudeSmall(InfiniteCoord* value, uint64_t magnitude)
 {
     if (magnitude == 0)
@@ -472,6 +489,62 @@ void InfiniteCoordDestroy(InfiniteCoord* value)
 
 bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
 {
+    // Однолимбовый источник — это почти вся физика и мир. Раньше копия
+    // заводила лимб, а добавка при переносе перевыделяла его. Теперь сумму
+    // считаем прямо над limbs[0] и заводим результат (ноль, один или два
+    // лимба) ровно один раз, без промежуточной копии и без Normalize.
+    if (source->limbCount == 0u || (source->limbCount == 1u && source->sign != 0))
+    {
+        uint64_t current = source->limbCount == 0u ? 0u : source->limbs[0];
+        int32_t sign = source->limbCount == 0u ? 0 : source->sign;
+        // Источник прочитан: при неудаче выделения приёмник, как и прежде,
+        // остаётся каноническим нулём.
+        InfiniteCoordInit(out);
+        if (addend == 0)
+        {
+            return sign == 0
+                ? true
+                : InfiniteCoordTryAssignSingleLimb(out, current, sign);
+        }
+
+        int32_t addSign = addend < 0 ? -1 : 1;
+        uint64_t magnitude = Int64Magnitude(addend);
+        if (sign == 0)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, magnitude, addSign);
+        }
+        if (sign == addSign)
+        {
+            uint64_t sum = current + magnitude;
+            if (sum >= current)
+            {
+                return InfiniteCoordTryAssignSingleLimb(out, sum, sign);
+            }
+            // Перенос из старшего (и единственного) лимба: ровно два лимба.
+            uint64_t* limbs = PlatformAllocate(2u * sizeof(uint64_t), false);
+            if (limbs == NULL)
+            {
+                return false;
+            }
+            limbs[0] = sum;
+            limbs[1] = 1u;
+            out->limbs = limbs;
+            out->limbCount = 2u;
+            out->sign = sign;
+            return true;
+        }
+        if (current > magnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, current - magnitude, sign);
+        }
+        if (current < magnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, magnitude - current, addSign);
+        }
+        InfiniteCoordInit(out);
+        return true;
+    }
+
     InfiniteCoord temporary;
     if (!InfiniteCoordTryCopy(&temporary, source))
     {
@@ -1159,6 +1232,49 @@ bool InfiniteCoordTryAdd(
     if (right->sign == 0)
     {
         return InfiniteCoordTryCopy(out, left);
+    }
+
+    // Типовой малоразмерный случай: оба слагаемых — один лимб. Сумма
+    // считается прямо над их limbs[0], и заводится ровно нужное число лимбов:
+    // прежний общий путь всегда просил «max + 1» и вдобавок прогонял Normalize
+    // по готовому результату.
+    if (left->limbCount == 1u && right->limbCount == 1u)
+    {
+        uint64_t leftMagnitude = left->limbs[0];
+        uint64_t rightMagnitude = right->limbs[0];
+        InfiniteCoordInit(out);
+
+        if (left->sign == right->sign)
+        {
+            uint64_t sum = leftMagnitude + rightMagnitude;
+            if (sum >= leftMagnitude)
+            {
+                return InfiniteCoordTryAssignSingleLimb(out, sum, left->sign);
+            }
+            uint64_t* limbs = PlatformAllocate(2u * sizeof(uint64_t), false);
+            if (limbs == NULL)
+            {
+                return false;
+            }
+            limbs[0] = sum;
+            limbs[1] = 1u;
+            out->limbs = limbs;
+            out->limbCount = 2u;
+            out->sign = left->sign;
+            return true;
+        }
+
+        if (leftMagnitude == rightMagnitude)
+        {
+            return true;
+        }
+        if (leftMagnitude > rightMagnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(
+                out, leftMagnitude - rightMagnitude, left->sign);
+        }
+        return InfiniteCoordTryAssignSingleLimb(
+            out, rightMagnitude - leftMagnitude, right->sign);
     }
 
     InfiniteCoord result;

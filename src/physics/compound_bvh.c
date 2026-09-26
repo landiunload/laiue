@@ -33,15 +33,38 @@ static double CompoundBvhCenter(double low, double high)
     return low + (high - low) * 0.5;
 }
 
+// Центр AABB листа берётся из contiguous nodes: bounds листа скопированы туда
+// побитово тем же Build, поэтому ключ совпадает с входным до последнего бита и
+// порядок сортировки не меняется.
+static double CompoundBvhNodeCenter(const RigidCompoundBvhNode *node, int32_t axis)
+{
+    return CompoundBvhCenter(node->minimum[axis], node->maximum[axis]);
+}
+
 // Полный детерминированный порядок: сначала ключ, при равенстве — исходный
 // индекс. Ключи конечны, поэтому сравнения задают строгий порядок.
-static bool CompoundBvhBefore(const unsigned char *base, size_t stride, uint32_t left,
-                              uint32_t right, int32_t axis)
+static bool CompoundBvhBefore(const RigidCompoundBvhNode *nodes, uint32_t left, uint32_t right,
+                              int32_t axis)
 {
-    const double *leftEntry = CompoundBvhEntry(base, stride, left);
-    const double *rightEntry = CompoundBvhEntry(base, stride, right);
-    double leftCenter = CompoundBvhCenter(leftEntry[axis], leftEntry[3 + axis]);
-    double rightCenter = CompoundBvhCenter(rightEntry[axis], rightEntry[3 + axis]);
+    double leftCenter = CompoundBvhNodeCenter(&nodes[left], axis);
+    double rightCenter = CompoundBvhNodeCenter(&nodes[right], axis);
+    if (leftCenter < rightCenter)
+    {
+        return true;
+    }
+    if (leftCenter > rightCenter)
+    {
+        return false;
+    }
+    return left < right;
+}
+
+// Вариант с уже посчитанным центром правого операнда: позволяет вынести
+// инвариантный ключ опоры разбиения из цикла, не меняя результат.
+static bool CompoundBvhBeforeCenter(const RigidCompoundBvhNode *nodes, uint32_t left,
+                                    uint32_t right, double rightCenter, int32_t axis)
+{
+    double leftCenter = CompoundBvhNodeCenter(&nodes[left], axis);
     if (leftCenter < rightCenter)
     {
         return true;
@@ -62,8 +85,8 @@ static void CompoundBvhSwap(uint32_t *left, uint32_t *right)
 
 // Heapsort без выделения памяти. Компаратор задаёт полный порядок, поэтому
 // перестановки равных элементов не влияют на результат.
-static void CompoundBvhSift(const unsigned char *base, size_t stride, uint32_t *values,
-                            uint32_t root, uint32_t size, int32_t axis)
+static void CompoundBvhSift(const RigidCompoundBvhNode *nodes, uint32_t *values, uint32_t root,
+                            uint32_t size, int32_t axis)
 {
     for (;;)
     {
@@ -72,12 +95,11 @@ static void CompoundBvhSift(const unsigned char *base, size_t stride, uint32_t *
         {
             break;
         }
-        if (child + 1u < size &&
-            CompoundBvhBefore(base, stride, values[child], values[child + 1u], axis))
+        if (child + 1u < size && CompoundBvhBefore(nodes, values[child], values[child + 1u], axis))
         {
             ++child;
         }
-        if (!CompoundBvhBefore(base, stride, values[root], values[child], axis))
+        if (!CompoundBvhBefore(nodes, values[root], values[child], axis))
         {
             break;
         }
@@ -86,7 +108,7 @@ static void CompoundBvhSift(const unsigned char *base, size_t stride, uint32_t *
     }
 }
 
-static void CompoundBvhSortRange(const unsigned char *base, size_t stride, uint32_t *values,
+static void CompoundBvhSortRange(const RigidCompoundBvhNode *nodes, uint32_t *values,
                                  uint32_t begin, uint32_t end, int32_t axis)
 {
     uint32_t size = end - begin;
@@ -97,51 +119,55 @@ static void CompoundBvhSortRange(const unsigned char *base, size_t stride, uint3
     uint32_t *range = values + begin;
     for (uint32_t start = size / 2u; start > 0u; --start)
     {
-        CompoundBvhSift(base, stride, range, start - 1u, size, axis);
+        CompoundBvhSift(nodes, range, start - 1u, size, axis);
     }
     for (uint32_t last = size; last > 1u; --last)
     {
         CompoundBvhSwap(&range[0], &range[last - 1u]);
-        CompoundBvhSift(base, stride, range, 0u, last - 1u, axis);
+        CompoundBvhSift(nodes, range, 0u, last - 1u, axis);
     }
 }
 
 // Медиана трёх по полному порядку компаратора: возвращает индекс среднего
 // значения. Нужна как детерминированная опора разбиения.
-static uint32_t CompoundBvhMedianOfThree(const unsigned char *base, size_t stride,
-                                         const uint32_t *values, uint32_t first, uint32_t middle,
-                                         uint32_t last, int32_t axis)
+static uint32_t CompoundBvhMedianOfThree(const RigidCompoundBvhNode *nodes, const uint32_t *values,
+                                         uint32_t first, uint32_t middle, uint32_t last,
+                                         int32_t axis)
 {
     uint32_t firstValue = values[first];
     uint32_t middleValue = values[middle];
     uint32_t lastValue = values[last];
-    if (CompoundBvhBefore(base, stride, firstValue, middleValue, axis))
+    if (CompoundBvhBefore(nodes, firstValue, middleValue, axis))
     {
-        if (CompoundBvhBefore(base, stride, middleValue, lastValue, axis))
+        if (CompoundBvhBefore(nodes, middleValue, lastValue, axis))
         {
             return middle;
         }
-        return CompoundBvhBefore(base, stride, firstValue, lastValue, axis) ? last : first;
+        return CompoundBvhBefore(nodes, firstValue, lastValue, axis) ? last : first;
     }
-    if (CompoundBvhBefore(base, stride, firstValue, lastValue, axis))
+    if (CompoundBvhBefore(nodes, firstValue, lastValue, axis))
     {
         return first;
     }
-    return CompoundBvhBefore(base, stride, middleValue, lastValue, axis) ? last : middle;
+    return CompoundBvhBefore(nodes, middleValue, lastValue, axis) ? last : middle;
 }
 
 // Разбиение Хоара (схема Ломуто) вокруг values[pivot]: возвращает индекс, на
 // который встал опорный элемент. Влево попадают строго меньшие, вправо — не
 // меньшие, поэтому диапазон остаётся корректно разделённым.
-static uint32_t CompoundBvhPartition(const unsigned char *base, size_t stride, uint32_t *values,
+static uint32_t CompoundBvhPartition(const RigidCompoundBvhNode *nodes, uint32_t *values,
                                      uint32_t begin, uint32_t end, uint32_t pivot, int32_t axis)
 {
     CompoundBvhSwap(&values[pivot], &values[end - 1u]);
     uint32_t pivotValue = values[end - 1u];
+    // Ключ опоры инвариантен в цикле: считаем его один раз вместо каждой
+    // итерации. При равенстве центров по-прежнему сравниваются индексы, так
+    // что порядок и результат разбиения не меняются.
+    double pivotCenter = CompoundBvhNodeCenter(&nodes[pivotValue], axis);
     uint32_t store = begin;
     for (uint32_t index = begin; index + 1u < end; ++index)
     {
-        if (CompoundBvhBefore(base, stride, values[index], pivotValue, axis))
+        if (CompoundBvhBeforeCenter(nodes, values[index], pivotValue, pivotCenter, axis))
         {
             CompoundBvhSwap(&values[store], &values[index]);
             ++store;
@@ -157,7 +183,7 @@ static uint32_t CompoundBvhPartition(const unsigned char *base, size_t stride, u
 // враждебный порядок центров дал бы квадратичный худший случай; после лимита
 // диапазон честно сортируется heapsort-ом, то есть асимптотика не хуже
 // прежней, а типичная — линейная на уровень.
-static void CompoundBvhSelectRange(const unsigned char *base, size_t stride, uint32_t *values,
+static void CompoundBvhSelectRange(const RigidCompoundBvhNode *nodes, uint32_t *values,
                                    uint32_t begin, uint32_t end, uint32_t target, int32_t axis)
 {
     uint32_t depthLimit = 0u;
@@ -172,14 +198,14 @@ static void CompoundBvhSelectRange(const unsigned char *base, size_t stride, uin
     {
         if (depth >= depthLimit)
         {
-            CompoundBvhSortRange(base, stride, values, begin, end, axis);
+            CompoundBvhSortRange(nodes, values, begin, end, axis);
             return;
         }
         ++depth;
         uint32_t medianIndex = begin + (end - begin) / 2u;
         uint32_t pivot =
-            CompoundBvhMedianOfThree(base, stride, values, begin, medianIndex, end - 1u, axis);
-        uint32_t position = CompoundBvhPartition(base, stride, values, begin, end, pivot, axis);
+            CompoundBvhMedianOfThree(nodes, values, begin, medianIndex, end - 1u, axis);
+        uint32_t position = CompoundBvhPartition(nodes, values, begin, end, pivot, axis);
         if (position == target)
         {
             return;
@@ -198,8 +224,7 @@ static void CompoundBvhSelectRange(const unsigned char *base, size_t stride, uin
 // Пост-обход: сначала полностью строится левое поддерево, затем правое,
 // затем их родитель. Поэтому first < second у каждого внутреннего узла, а
 // индекс родителя больше индексов обоих детей. Глубина не больше log2(count).
-static uint32_t CompoundBvhBuildRange(const unsigned char *base, size_t stride,
-                                      uint32_t *workspace, RigidCompoundBvhNode *nodes,
+static uint32_t CompoundBvhBuildRange(uint32_t *workspace, RigidCompoundBvhNode *nodes,
                                       uint32_t begin, uint32_t end, uint32_t *next)
 {
     uint32_t size = end - begin;
@@ -208,26 +233,26 @@ static uint32_t CompoundBvhBuildRange(const unsigned char *base, size_t stride,
         return workspace[begin];
     }
 
-    const double *firstEntry = CompoundBvhEntry(base, stride, workspace[begin]);
+    const RigidCompoundBvhNode *firstNode = &nodes[workspace[begin]];
     double low[3];
     double high[3];
     for (int32_t axis = 0; axis < 3; ++axis)
     {
-        low[axis] = firstEntry[axis];
-        high[axis] = firstEntry[3 + axis];
+        low[axis] = firstNode->minimum[axis];
+        high[axis] = firstNode->maximum[axis];
     }
     for (uint32_t position = begin + 1u; position < end; ++position)
     {
-        const double *entry = CompoundBvhEntry(base, stride, workspace[position]);
+        const RigidCompoundBvhNode *node = &nodes[workspace[position]];
         for (int32_t axis = 0; axis < 3; ++axis)
         {
-            if (entry[axis] < low[axis])
+            if (node->minimum[axis] < low[axis])
             {
-                low[axis] = entry[axis];
+                low[axis] = node->minimum[axis];
             }
-            if (entry[3 + axis] > high[axis])
+            if (node->maximum[axis] > high[axis])
             {
-                high[axis] = entry[3 + axis];
+                high[axis] = node->maximum[axis];
             }
         }
     }
@@ -245,10 +270,10 @@ static uint32_t CompoundBvhBuildRange(const unsigned char *base, size_t stride,
     }
 
     uint32_t middle = begin + size / 2u;
-    CompoundBvhSelectRange(base, stride, workspace, begin, end, middle, axis);
+    CompoundBvhSelectRange(nodes, workspace, begin, end, middle, axis);
 
-    uint32_t left = CompoundBvhBuildRange(base, stride, workspace, nodes, begin, middle, next);
-    uint32_t right = CompoundBvhBuildRange(base, stride, workspace, nodes, middle, end, next);
+    uint32_t left = CompoundBvhBuildRange(workspace, nodes, begin, middle, next);
+    uint32_t right = CompoundBvhBuildRange(workspace, nodes, middle, end, next);
     uint32_t index = *next;
     *next = index + 1u;
     for (int32_t component = 0; component < 3; ++component)
@@ -266,8 +291,8 @@ static uint32_t CompoundBvhBuildRange(const unsigned char *base, size_t stride,
 }
 
 bool RigidCompoundBvhBuild(const void *bounds, size_t stride, uint32_t count,
-                           RigidCompoundBvhNode *nodes, uint32_t nodeCapacity,
-                           uint32_t *workspace, uint32_t *outRoot)
+                           RigidCompoundBvhNode *nodes, uint32_t nodeCapacity, uint32_t *workspace,
+                           uint32_t *outRoot)
 {
     if (bounds == NULL || nodes == NULL || workspace == NULL || outRoot == NULL)
     {
@@ -331,7 +356,7 @@ bool RigidCompoundBvhBuild(const void *bounds, size_t stride, uint32_t count,
     }
 
     uint32_t next = count;
-    uint32_t root = CompoundBvhBuildRange(base, stride, workspace, nodes, 0u, count, &next);
+    uint32_t root = CompoundBvhBuildRange(workspace, nodes, 0u, count, &next);
     *outRoot = root;
     return true;
 }
@@ -390,8 +415,8 @@ static void CompoundBvhSortIndices(uint32_t *values, uint32_t size)
 }
 
 bool RigidCompoundBvhQuery(const RigidCompoundBvhNode *nodes, uint32_t root,
-                           const double minimum[3], const double maximum[3],
-                           uint32_t *outIndices, uint32_t capacity, uint32_t *outCount)
+                           const double minimum[3], const double maximum[3], uint32_t *outIndices,
+                           uint32_t capacity, uint32_t *outCount)
 {
     if (nodes == NULL || minimum == NULL || maximum == NULL || outIndices == NULL ||
         outCount == NULL)
@@ -413,32 +438,42 @@ bool RigidCompoundBvhQuery(const RigidCompoundBvhNode *nodes, uint32_t root,
 
     uint32_t stack[COMPOUND_BVH_STACK_FRAMES];
     uint32_t stackSize = 0u;
-    stack[stackSize++] = root;
+    uint32_t index = root;
     uint32_t hits = 0u;
-    while (stackSize > 0u)
+    for (;;)
     {
-        uint32_t index = stack[--stackSize];
         const RigidCompoundBvhNode *node = &nodes[index];
-        if (!CompoundBvhTouches(node, minimum, maximum))
+        if (CompoundBvhTouches(node, minimum, maximum))
         {
-            continue;
-        }
-        if (node->second == UINT32_MAX)
-        {
-            if (hits >= capacity)
+            if (node->second == UINT32_MAX)
             {
-                return false;
+                if (hits >= capacity)
+                {
+                    return false;
+                }
+                outIndices[hits++] = node->first;
             }
-            outIndices[hits++] = node->first;
-            continue;
+            else
+            {
+                // Итеративный спуск: идём в second и откладываем first. Порядок
+                // обхода остаётся ровно таким же, как у явного стека с двумя
+                // кадрами (сначала second, затем first), поэтому массив
+                // попаданий и работа финальной сортировки не меняются, но
+                // кадров на стеке вдвое меньше.
+                if (stackSize >= COMPOUND_BVH_STACK_FRAMES)
+                {
+                    return false;
+                }
+                stack[stackSize++] = node->first;
+                index = node->second;
+                continue;
+            }
         }
-        // Перед двумя записями проверяем, что кадры помещаются целиком.
-        if (stackSize > COMPOUND_BVH_STACK_FRAMES - 2u)
+        if (stackSize == 0u)
         {
-            return false;
+            break;
         }
-        stack[stackSize++] = node->first;
-        stack[stackSize++] = node->second;
+        index = stack[--stackSize];
     }
 
     CompoundBvhSortIndices(outIndices, hits);

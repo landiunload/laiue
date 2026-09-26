@@ -9,6 +9,7 @@
 #define FORMATS_FILE_NAME L"formats.txt"
 #define FORMATS_UTF8_CAPACITY 512U
 #define CONTENT_ENUMERATION_LIMIT 4096U
+#define CONTENT_ENUMERATION_INITIAL_CAPACITY 16U
 
 struct LaiueContentCatalog
 {
@@ -522,6 +523,26 @@ static void SortEntriesByName(LaiueContentEntry* entries, uint32_t count, bool f
     }
 }
 
+// Буфер записей растёт по мере заполнения: маленький каталог не платит за
+// большой, крупный растёт геометрически. `needed` не превышает
+// CONTENT_ENUMERATION_LIMIT, потому что лимит проверяется до записи.
+static bool EnsureEntryCapacity(LaiueContentEntry **entries, uint32_t *capacity,
+                                uint32_t needed)
+{
+    uint32_t current = *capacity;
+    uint32_t next = current == 0U
+        ? CONTENT_ENUMERATION_INITIAL_CAPACITY : current + current / 2U;
+    if (next < needed) next = needed;
+    if (next > CONTENT_ENUMERATION_LIMIT) next = CONTENT_ENUMERATION_LIMIT;
+    LaiueContentEntry *grown = PlatformReallocate(
+        *entries, (size_t)next * sizeof(*grown), false);
+    if (grown == NULL)
+        return false;
+    *entries = grown;
+    *capacity = next;
+    return true;
+}
+
 bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType type,
                                   LaiueContentList *outList)
 {
@@ -561,80 +582,83 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
         return true;
     }
 
-    uint32_t count = 0;
+    // Один обход каталога вместо двух: записи копятся в растущем буфере
+    // прямо во время чтения, а не после отдельного прохода-счётчика.
+    // `matching` считает записи, прошедшие фильтр, включая слишком длинные
+    // имена, — так граница CONTENT_ENUMERATION_LIMIT остаётся прежней.
+    uint32_t matching = 0U;
+    uint32_t stored = 0U;
+    uint32_t capacity = 0U;
+    LaiueContentEntry* entries = NULL;
+    bool overflow = false;
+    bool allocationFailed = false;
     while (PlatformDirectoryNext(iterator, file))
-    {
-        if (!file->isSymbolicLink
-            && StorageMatches(format, file->isDirectory)
-            && LaiueContentNameIsSafe(file->name)
-            && LaiueContentNameMatches(type, file->name))
-        {
-            if (count == CONTENT_ENUMERATION_LIMIT)
-            {
-                PlatformDirectoryClose(iterator);
-                PlatformFree(file);
-                PlatformFree(iterator);
-                PlatformFree(directoryPath);
-                PlatformRwLockReleaseShared(&catalog->lock);
-                return false;
-            }
-            ++count;
-        }
-    }
-    PlatformDirectoryClose(iterator);
-    if (count == 0U)
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return true;
-    }
-
-    LaiueContentEntry* entries = PlatformAllocate(
-        (size_t)count * sizeof(*entries), true);
-    if (entries == NULL)
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return false;
-    }
-    wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-    bool hasActive = format->pack &&
-                     GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY);
-
-    uint32_t index = 0;
-    if (!PlatformDirectoryOpen(iterator, directoryPath))
-    {
-        PlatformFree(file);
-        PlatformFree(iterator);
-        PlatformFree(directoryPath);
-        PlatformFree(entries);
-        PlatformRwLockReleaseShared(&catalog->lock);
-        return false;
-    }
-    while (index < count && PlatformDirectoryNext(iterator, file))
     {
         if (file->isSymbolicLink
             || !StorageMatches(format, file->isDirectory)
             || !LaiueContentNameIsSafe(file->name)
             || !LaiueContentNameMatches(type, file->name))
             continue;
+        if (matching == CONTENT_ENUMERATION_LIMIT)
+        {
+            overflow = true;
+            break;
+        }
+        ++matching;
         uint32_t length = TextLengthBounded(file->name, LAIUE_CONTENT_NAME_CAPACITY);
-        if (length >= LAIUE_CONTENT_NAME_CAPACITY) continue;
-        memcpy(entries[index].name, file->name,
+        if (length >= LAIUE_CONTENT_NAME_CAPACITY)
+            continue;
+        if (stored == capacity && !EnsureEntryCapacity(&entries, &capacity, stored + 1U))
+        {
+            allocationFailed = true;
+            break;
+        }
+        memcpy(entries[stored].name, file->name,
             (size_t)(length + 1U) * sizeof(wchar_t));
-        entries[index].directory = file->isDirectory;
-        entries[index].active = hasActive
-            && TextEquals(entries[index].name, activeName);
-        ++index;
+        entries[stored].directory = file->isDirectory;
+        entries[stored].active = false;
+        ++stored;
     }
     PlatformDirectoryClose(iterator);
     PlatformFree(file);
     PlatformFree(iterator);
     PlatformFree(directoryPath);
+
+    if (overflow || allocationFailed)
+    {
+        PlatformFree(entries);
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return false;
+    }
+    if (stored == 0U)
+    {
+        PlatformFree(entries);
+        PlatformRwLockReleaseShared(&catalog->lock);
+        return true;
+    }
+
+    // Активный пак читается один раз и только для непустого списка, как и
+    // раньше; пометка `active` ставится после заполнения, чтобы чтение
+    // active.txt не попадало в горячий обход каталога.
+    if (format->pack)
+    {
+        wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
+        if (GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY))
+        {
+            for (uint32_t index = 0U; index < stored; ++index)
+                entries[index].active = TextEquals(entries[index].name, activeName);
+        }
+    }
+
+    // Удержанная память совпадает с прежней: буфер подрезается до точного
+    // числа записей. Неудача подрезки не отменяет валидный больший буфер.
+    if (capacity != stored)
+    {
+        LaiueContentEntry* shrunk = PlatformReallocate(
+            entries, (size_t)stored * sizeof(*shrunk), false);
+        if (shrunk != NULL)
+            entries = shrunk;
+    }
 
     // A content tree must resolve identically on case-sensitive and
     // case-insensitive filesystems.  Reject the entire ambiguous view instead
@@ -642,10 +666,10 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
     //
     // Неоднозначные имена соседствуют в порядке по свёрнутому регистру,
     // поэтому проверка идёт за один проход, а не перебором всех пар.
-    if (index > 1U)
+    if (stored > 1U)
     {
-        SortEntriesByName(entries, index, true);
-        for (uint32_t i = 1U; i < index; ++i)
+        SortEntriesByName(entries, stored, true);
+        for (uint32_t i = 1U; i < stored; ++i)
         {
             if (TextCompareAsciiFolded(entries[i - 1U].name, entries[i].name) == 0)
             {
@@ -654,10 +678,10 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
                 return false;
             }
         }
-        SortEntriesByName(entries, index, false);
+        SortEntriesByName(entries, stored, false);
     }
     outList->entries = entries;
-    outList->count = index;
+    outList->count = stored;
     PlatformRwLockReleaseShared(&catalog->lock);
     return true;
 }

@@ -61,18 +61,30 @@ static const uint8_t CODE_LENGTH_ORDER[CODE_LENGTH_SYMBOLS] = {
 
 static uint32_t NextByte(InflateState *state)
 {
-    while (state->segmentIndex < state->segmentCount &&
-           state->position >= state->segments[state->segmentIndex].size)
+    // Общий случай — байт из текущего отрезка. Проверка границы вынесена
+    // первой: на горячем пути сегмент не кончается, и второй while не нужен.
+    uint32_t index = state->segmentIndex;
+    uint32_t position = state->position;
+    if (index < state->segmentCount && position < state->segments[index].size)
     {
-        state->position = 0u;
-        ++state->segmentIndex;
+        state->position = position + 1u;
+        return state->segments[index].bytes[position];
     }
-    if (state->segmentIndex >= state->segmentCount)
+    while (index < state->segmentCount && position >= state->segments[index].size)
     {
+        position = 0u;
+        ++index;
+    }
+    if (index >= state->segmentCount)
+    {
+        state->segmentIndex = index;
+        state->position = position;
         state->truncated = true;
         return 0u;
     }
-    return state->segments[state->segmentIndex].bytes[state->position++];
+    state->segmentIndex = index;
+    state->position = position + 1u;
+    return state->segments[index].bytes[position];
 }
 
 static uint32_t ReadBits(InflateState *state, uint32_t need)
@@ -295,6 +307,74 @@ static bool CopyStored(InflateState *state)
     return true;
 }
 
+// Копирование match. Источник вправе перекрываться с приёмником: DEFLATE
+// именно так кодирует повторяющийся узор, когда длина больше distance.
+// Разбор по перекрытию:
+//   distance >= 8 — внутри одного 8-байтового блока источник не догоняет
+//                   приёмник (source+8 <= destination), широкое копирование;
+//   distance == 1 — байт множится, memset;
+//   distance < 8 и length <= distance — источник целиком до приёмника,
+//                   побайтовое копирование (короткие match дешевле вызова memcpy);
+//   1 < distance < 8 — первые unit байт (кратное distance, не меньше 8)
+//                   выводятся побайтово, затем выданный период удваивается
+//                   широким копированием.
+// За конец выхода запись невозможна: length уже проверен против остатка
+// буфера, а хвост копируется побайтово.
+static void CopyMatch(uint8_t *output, uint32_t written, uint32_t distance, uint32_t length)
+{
+    uint8_t *destination = output + written;
+    const uint8_t *source = destination - distance;
+
+    if (distance >= 8u)
+    {
+        uint32_t index = 0u;
+        while (index + 8u <= length)
+        {
+            memcpy(destination + index, source + index, 8u);
+            index += 8u;
+        }
+        while (index < length)
+        {
+            destination[index] = source[index];
+            ++index;
+        }
+        return;
+    }
+    if (distance == 1u)
+    {
+        memset(destination, source[0], length);
+        return;
+    }
+    if (length <= distance)
+    {
+        for (uint32_t index = 0u; index < length; ++index)
+        {
+            destination[index] = source[index];
+        }
+        return;
+    }
+
+    // 1 < distance < 8 и length > distance. Материализуем первые `unit`
+    // байт (unit — кратное distance, не меньше 8), затем удваиваем уже
+    // выданный период. Удвоение корректно, потому что длина выданной части
+    // всегда кратна distance, а байт i равен байту i-distance.
+    uint32_t unit = distance;
+    while (unit < 8u) unit += distance;
+    uint32_t index = 0u;
+    while (index < unit && index < length)
+    {
+        destination[index] = index < distance ? source[index] : destination[index - distance];
+        ++index;
+    }
+    while (index < length)
+    {
+        uint32_t remaining = length - index;
+        uint32_t copy = index < remaining ? index : remaining;
+        memcpy(destination + index, destination, copy);
+        index += copy;
+    }
+}
+
 static bool InflateBlock(InflateState *state, const InflateHuffmanTable *literals,
                          const InflateHuffmanTable *distances)
 {
@@ -339,13 +419,10 @@ static bool InflateBlock(InflateState *state, const InflateHuffmanTable *literal
             return false;
         }
 
-        // Копирование побайтово намеренно: длина вправе перекрывать
-        // источник, и именно так поток кодирует повторяющийся узор.
-        uint32_t source = state->written - distance;
-        for (uint32_t index = 0; index < length; ++index)
-        {
-            state->output[state->written++] = state->output[source++];
-        }
+        // Копирование через CopyMatch: длина вправе перекрывать источник,
+        // и именно так поток кодирует повторяющийся узор.
+        CopyMatch(state->output, state->written, distance, length);
+        state->written += length;
     }
 }
 

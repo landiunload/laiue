@@ -1,6 +1,7 @@
 #include "media/gif_decode.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #define GIF_MAX_CODES 4096u
 #define GIF_HEADER_BYTES 13u
@@ -258,9 +259,26 @@ static uint32_t ReadCode(GifBitReader *reader, uint32_t codeBits)
                 return 0u;
             }
         }
-        reader->bitBuffer |= (uint32_t)reader->file[reader->cursor++] << reader->bitCount;
-        reader->bitCount += 8u;
-        --reader->blockRemaining;
+        // Внутри подблока байты читаются парами: это вдвое сокращает
+        // проверки blockRemaining на горячем пути. Оба байта уже
+        // принадлежат проверенному блоку, поэтому момент исчерпания и
+        // число принятых кодов не меняются. bitCount < codeBits <= 12,
+        // так что 16 добавленных бит не переполняют 32-битный буфер.
+        if (reader->blockRemaining >= 2u)
+        {
+            reader->bitBuffer |= ((uint32_t)reader->file[reader->cursor] |
+                                  ((uint32_t)reader->file[reader->cursor + 1u] << 8))
+                                 << reader->bitCount;
+            reader->cursor += 2u;
+            reader->blockRemaining -= 2u;
+            reader->bitCount += 16u;
+        }
+        else
+        {
+            reader->bitBuffer |= (uint32_t)reader->file[reader->cursor++] << reader->bitCount;
+            reader->bitCount += 8u;
+            --reader->blockRemaining;
+        }
     }
 
     uint32_t code = reader->bitBuffer & ((1u << codeBits) - 1u);
@@ -302,6 +320,14 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
     };
 
     const uint8_t *palette = file + frame->paletteOffset;
+    uint32_t paletteEntries = frame->paletteEntries;
+    int32_t transparentIndex = frame->transparentIndex;
+    uint32_t frameWidth = frame->width;
+    uint32_t frameHeight = frame->height;
+    uint32_t frameLeft = frame->left;
+    uint32_t frameTop = frame->top;
+    bool interlaced = frame->interlaced;
+
     uint32_t clearCode = 1u << minimumCodeBits;
     uint32_t endCode = clearCode + 1u;
     uint32_t nextCode = clearCode + 2u;
@@ -316,13 +342,20 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
     }
 
     uint32_t writtenPixels = 0u;
-    uint32_t total = frame->width * frame->height;
+    uint32_t total = frameWidth * frameHeight;
     // Строка и столбец текущего пикселя ведутся счётчиками, а не
     // делением writtenPixels на ширину: на кадр 256x256 это убирает
     // сотни тысяч делений из самого горячего цикла. Значения те же,
     // что дали бы writtenPixels / width и writtenPixels % width.
     uint32_t frameRow = 0u;
     uint32_t frameColumn = 0u;
+    // Смещение текущего пикселя в холсте. Ведётся целым числом и
+    // приращением: на каждый пиксель остаётся +4, а умножение на ширину
+    // холста считается только на границе строки. На последней строке
+    // кадра смещение уже может не адресовать холст, поэтому это именно
+    // смещение, а не указатель: разыменовывается только при записи.
+    size_t texelOffset = ((size_t)frameTop * canvasWidth + frameLeft) * 4u;
+
     while (writtenPixels < total)
     {
         uint32_t code = ReadCode(&reader, codeBits);
@@ -366,14 +399,10 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
             uint8_t index = dictionary->stack[--stackDepth];
             ++writtenPixels;
 
-            if ((int32_t)index != frame->transparentIndex)
+            if ((int32_t)index != transparentIndex)
             {
-                uint32_t canvasRow = frame->top + (frame->interlaced
-                                                       ? InterlacedRow(frameRow, frame->height)
-                                                       : frameRow);
-                uint8_t *texel =
-                    canvas + ((size_t)canvasRow * canvasWidth + frame->left + frameColumn) * 4u;
-                if (index < frame->paletteEntries)
+                uint8_t *texel = canvas + texelOffset;
+                if (index < paletteEntries)
                 {
                     texel[0] = palette[index * 3u];
                     texel[1] = palette[index * 3u + 1u];
@@ -382,11 +411,18 @@ static ImageStatus DrawFrame(const uint8_t *file, uint32_t sizeBytes, const GifF
                 texel[3] = 255u;
             }
 
+            texelOffset += 4u;
             ++frameColumn;
-            if (frameColumn == frame->width)
+            if (frameColumn == frameWidth)
             {
                 frameColumn = 0u;
                 ++frameRow;
+                // Границы проходов чересстрочности считаются внутри
+                // InterlacedRow; вызов на строку, а не на пиксель, убирает
+                // их из горячего цикла.
+                uint32_t canvasRow =
+                    frameTop + (interlaced ? InterlacedRow(frameRow, frameHeight) : frameRow);
+                texelOffset = ((size_t)canvasRow * canvasWidth + frameLeft) * 4u;
             }
         }
 
@@ -408,7 +444,7 @@ static void ClearRect(uint8_t *canvas, uint32_t canvasWidth, const GifFrame *fra
     for (uint32_t row = 0; row < frame->height; ++row)
     {
         uint8_t *line = canvas + ((size_t)(frame->top + row) * canvasWidth + frame->left) * 4u;
-        for (uint32_t index = 0; index < frame->width * 4u; ++index) line[index] = 0u;
+        memset(line, 0, (size_t)frame->width * 4u);
     }
 }
 
@@ -446,15 +482,12 @@ ImageStatus GifDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *in
         uint8_t *canvas = output + (size_t)frameIndex * info->frameBytes;
         if (frameIndex == 0u)
         {
-            for (uint32_t index = 0; index < info->frameBytes; ++index) canvas[index] = 0u;
+            memset(canvas, 0, info->frameBytes);
         }
         else
         {
             const uint8_t *earlier = canvas - info->frameBytes;
-            for (uint32_t index = 0; index < info->frameBytes; ++index)
-            {
-                canvas[index] = earlier[index];
-            }
+            memcpy(canvas, earlier, info->frameBytes);
             // Способ убирания относится к кадру, который уже показан:
             // 2 очищает его прямоугольник, 3 возвращает то, что было
             // под ним, остальные оставляют картинку как есть.
@@ -464,16 +497,13 @@ ImageStatus GifDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *in
             }
             else if (havePrevious && previousFrame.disposal == 3u)
             {
-                for (uint32_t index = 0; index < info->frameBytes; ++index)
-                {
-                    canvas[index] = saved[index];
-                }
+                memcpy(canvas, saved, info->frameBytes);
             }
         }
 
         if (frame.disposal == 3u)
         {
-            for (uint32_t index = 0; index < info->frameBytes; ++index) saved[index] = canvas[index];
+            memcpy(saved, canvas, info->frameBytes);
         }
 
         status = DrawFrame(file, sizeBytes, &frame, reader.canvasWidth, dictionary, canvas);

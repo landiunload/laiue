@@ -5,6 +5,11 @@
 #include <string.h>
 
 #define SHADER_MANIFEST_MAX_BYTES 4096u
+// Типичный манифест много меньше страницы. Префикс читается в стек и не
+// трогает кучу; файл длиннее префикса (но в пределах максимума) дочитывается
+// целиком, как раньше. Кадр обязан оставаться меньше страницы: MSVC иначе
+// зовёт __chkstk, которого нет в no-CRT сборке.
+#define SHADER_MANIFEST_PREFIX_BYTES 2048u
 
 struct ShaderPackLoadedSet
 {
@@ -30,17 +35,34 @@ static bool BytesEqual(const uint8_t *left, const char *right, uint32_t count)
     return true;
 }
 
-static bool HasExactLine(const uint8_t* data, uint32_t length,
-    const char* expected, uint32_t expectedLength, bool firstLineOnly)
+// Манифест читается как единый буфер: заголовок обязан быть первой строкой,
+// `contract = 1` — любой строкой. Раньше это были два отдельных прохода по
+// одному и тому же буферу; здесь оба условия проверяются за один проход.
+static bool ManifestLinesAreCompatible(const uint8_t *data, uint32_t length)
 {
-    uint32_t start = 0;
+    static const char header[] = "LAIUE SHADER 1";
+    static const char contract[] = "contract = 1";
+    const uint32_t headerLength = (uint32_t)sizeof(header) - 1U;
+    const uint32_t contractLength = (uint32_t)sizeof(contract) - 1U;
+    uint32_t start =
+        length >= 3U && data[0] == 0xefU && data[1] == 0xbbU && data[2] == 0xbfU ? 3U : 0U;
+    bool firstLine = true;
     while (start < length)
     {
         uint32_t end = start;
         while (end < length && data[end] != '\n' && data[end] != '\r') ++end;
-        if (end - start == expectedLength && BytesEqual(data + start, expected, expectedLength))
+        uint32_t lineLength = end - start;
+        if (firstLine)
+        {
+            if (lineLength != headerLength || !BytesEqual(data + start, header, headerLength))
+                return false;
+            firstLine = false;
+        }
+        else if (lineLength == contractLength &&
+                 BytesEqual(data + start, contract, contractLength))
+        {
             return true;
-        if (firstLineOnly) return false;
+        }
         while (end < length && (data[end] == '\n' || data[end] == '\r')) ++end;
         start = end;
     }
@@ -119,8 +141,11 @@ bool ShaderPackEnumerateFrom(LaiueContentCatalog *catalog, ShaderPackList *outLi
     if (!LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_SHADER_PACK, &contentList))
         return false;
 
+    // Ниже для каждой записи явно пишутся name (с терминатором) и active,
+    // поэтому обнуление всего массива (на тысячах паков это сотни килобайт)
+    // не нужно.
     outList->entries =
-        PlatformAllocate((size_t)(contentList.count + 1U) * sizeof(ShaderPackEntry), true);
+        PlatformAllocate((size_t)(contentList.count + 1U) * sizeof(ShaderPackEntry), false);
     if (outList->entries == NULL)
     {
         LaiueContentListRelease(&contentList);
@@ -178,11 +203,19 @@ bool ShaderPackActivate(const wchar_t *name)
 
 static bool IsCompatibleManifest(const wchar_t *fullPath)
 {
-    PlatformPathInformation information;
-    if (!PlatformGetPathInformation(fullPath, &information) || !information.exists ||
-        information.isDirectory || information.isSymbolicLink || information.size == 0U ||
-        information.size > SHADER_MANIFEST_MAX_BYTES)
+    // PlatformReadFilePrefix сам отвергает каталог, reparse point, пустой файл
+    // и размер больше лимита, поэтому отдельный PlatformGetPathInformation не
+    // нужен. Файл в пределах префикса разбирается без обращения к куче.
+    uint8_t prefix[SHADER_MANIFEST_PREFIX_BYTES];
+    uint32_t prefixBytes = 0;
+    uint64_t fileSize = 0;
+    if (!PlatformReadFilePrefix(fullPath, SHADER_MANIFEST_MAX_BYTES, prefix,
+                                (uint32_t)sizeof(prefix), &prefixBytes, &fileSize) ||
+        fileSize == 0U)
         return false;
+    if (fileSize <= (uint64_t)sizeof(prefix))
+        return ManifestLinesAreCompatible(prefix, prefixBytes);
+
     uint8_t *data = NULL;
     uint64_t size = 0;
     if (!PlatformReadEntireFile(fullPath, SHADER_MANIFEST_MAX_BYTES, &data, &size) || size == 0U ||
@@ -191,15 +224,7 @@ static bool IsCompatibleManifest(const wchar_t *fullPath)
         PlatformFree(data);
         return false;
     }
-
-    static const char header[] = "LAIUE SHADER 1";
-    static const char contract[] = "contract = 1";
-    uint32_t byteOffset =
-        size >= 3U && data[0] == 0xefU && data[1] == 0xbbU && data[2] == 0xbfU ? 3U : 0U;
-    bool compatible = HasExactLine(data + byteOffset, (uint32_t)size - byteOffset, header,
-                                   sizeof(header) - 1U, true) &&
-                      HasExactLine(data + byteOffset, (uint32_t)size - byteOffset, contract,
-                                   sizeof(contract) - 1U, false);
+    bool compatible = ManifestLinesAreCompatible(data, (uint32_t)size);
     PlatformFree(data);
     return compatible;
 }
