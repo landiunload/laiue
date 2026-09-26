@@ -1607,7 +1607,7 @@ static VkDescriptorSet CreateGenericDescriptorSet(
                           renderer->constantBuffers[frameIndex].buffer, sizeof(ChunkConstants));
     WriteBufferDescriptor(renderer, set, BINDING_QUAD_BUFFER,
                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, block->buffer.buffer,
-                          block->buffer.sizeBytes > 0u ? VK_WHOLE_SIZE : 0u);
+                          mesh->sizeBytes);
     WriteBufferDescriptor(renderer, set, BINDING_INSTANCES,
                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
                           renderer->instanceBuffers[frameIndex][0].buffer, VK_WHOLE_SIZE);

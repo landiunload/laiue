@@ -620,8 +620,11 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
     Expect(stats.activeVoices == 0u, "stopping every voice must clear the active count");
 
     // === Отказы контракта ===
-    Expect(AudioClipCreate(device, NULL, &clip) == AUDIO_RESULT_INVALID_ARGUMENT,
+    AudioClip *rejectedDescription = clip;
+    Expect(AudioClipCreate(device, NULL, &rejectedDescription) == AUDIO_RESULT_INVALID_ARGUMENT,
            "a NULL description must be rejected");
+    Expect(rejectedDescription == NULL,
+           "a rejected clip creation must clear its output pointer");
     AudioClipDescription invalid = description;
     invalid.channelCount = 3u;
     AudioClip *rejected = NULL;

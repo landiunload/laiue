@@ -282,7 +282,8 @@ static void TestEscapedValues(R2Scratch *scratch)
     {
         scratch->text[overLength++] = 'a';
     }
-    for (uint32_t index = 0u; index < 5u; ++index)
+    for (uint32_t index = 0u;
+         index < (uint32_t)(sizeof(R2_ARTIFACT_SUFFIX_UTF8) - 1u); ++index)
     {
         scratch->text[overLength++] = R2_ARTIFACT_SUFFIX_UTF8[index];
     }
