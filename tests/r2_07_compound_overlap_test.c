@@ -32,11 +32,6 @@ static uint32_t NextRandom(void)
     return r2Rng;
 }
 
-static double RandomUnit(void)
-{
-    return (double)(NextRandom() >> 8) / 16777216.0;
-}
-
 static void Expect(bool condition, const char *message)
 {
     if (!condition)
@@ -55,7 +50,7 @@ static bool Finite(double value)
         double scalar;
         uint64_t bits;
     } representation = {value};
-    return ((representation.bits >> 52) & 0x7ffu) != 0x7fffu;
+    return ((representation.bits >> 52) & 0x7ffu) != 0x7ffu;
 }
 
 // Эталонная валидация одной коробки (та же арифметика, что и в production).

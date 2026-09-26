@@ -305,6 +305,14 @@ if(LAIUE_NATIVE_MODS_ENABLED)
         add_executable(laiue_optional_modules_test optional_modules_test.c)
         target_link_libraries(laiue_optional_modules_test PRIVATE laiue_bootstrap)
         target_compile_definitions(laiue_optional_modules_test PRIVATE LAIUE_STATIC=1)
+        if(LAIUE_RENDER_HAS_VULKAN_TARGET)
+            target_compile_definitions(laiue_optional_modules_test
+                PRIVATE LAIUE_TEST_HAS_VULKAN_RENDERER=1)
+        endif()
+        if(LAIUE_REQUIRE_VULKAN_TEST_DRIVER)
+            target_compile_definitions(laiue_optional_modules_test
+                PRIVATE LAIUE_TEST_REQUIRE_OFFSCREEN_DEVICE=1)
+        endif()
         laiue_configure_standalone_executable(
             laiue_optional_modules_test OptionalModulesTestEntryPoint)
         add_dependencies(laiue_optional_modules_test
