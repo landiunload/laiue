@@ -5,7 +5,8 @@ if(TARGET laiue_mesher AND TARGET laiue_audio)
     target_link_libraries(laiue_benchmark PRIVATE
         laiue_audio
         laiue_mesher
-        laiue_world)
+        laiue_world
+        laiue_numeric)
     # Харнесс без CRT лежит рядом с тестами: у бенчмарка та же задача —
     # писать в консоль и завершаться без библиотеки C.
     target_include_directories(laiue_benchmark PRIVATE

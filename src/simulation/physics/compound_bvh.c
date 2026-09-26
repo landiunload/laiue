@@ -1,5 +1,20 @@
 #include "physics/compound_bvh.h"
 
+// Тест касания узла — самая горячая операция обхода, а шесть скалярных
+// сравнений double MSVC не векторизует (особенно под /fp:strict). Раскладка
+// узла — minimum[3], затем maximum[3] — позволяет проверить три оси двумя
+// 256-битными сравнениями; лишние дорожки отбрасываются маской. Семантика
+// совпадает со скалярной побитово: оба конца AABB конечны (Build и Query их
+// проверяют), поэтому упорядоченные LE-сравнения дают тот же булев результат.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define LAIUE_COMPOUND_BVH_OVERLAP_AVX2 1
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||           \
+    defined(__i386__)
+#include <emmintrin.h>
+#define LAIUE_COMPOUND_BVH_OVERLAP_SSE2 1
+#endif
+
 // Шесть подряд идущих double: minimum[0..2], maximum[0..2].
 #define COMPOUND_BVH_ENTRY_BYTES (6u * sizeof(double))
 // Сбалансированное дерево из Build не глубже log2(UINT32_MAX) == 31, поэтому
@@ -363,10 +378,40 @@ bool RigidCompoundBvhBuild(const void *bounds, size_t stride, uint32_t count,
 
 // Тот же строгий тест, что первая строка BuildBoxManifold: касание гранями
 // перекрытием не считается. Сравнение через > отбрасывает NaN, если он всё
-// же дойдёт сюда.
+// же дойдёт сюда. Векторная ветка проверяет то же условие разделения
+// node.maximum <= query.minimum || query.maximum <= node.minimum.
 static bool CompoundBvhTouches(const RigidCompoundBvhNode *node, const double minimum[3],
                                const double maximum[3])
 {
+#if defined(LAIUE_COMPOUND_BVH_OVERLAP_AVX2)
+    // Дорожки 0..2 — оси X,Y,Z. Дорожка 3 первой загрузки — maximum[0], второй —
+    // поля узла; обе отбрасываются маской & 7. Вторая загрузка читает байты
+    // 24..55 — в пределах того же узла (sizeof == 56).
+    __m256d nodeMinimum = _mm256_loadu_pd(&node->minimum[0]);
+    __m256d nodeMaximum = _mm256_loadu_pd(&node->maximum[0]);
+    __m256d queryMinimum = _mm256_setr_pd(minimum[0], minimum[1], minimum[2], 0.0);
+    __m256d queryMaximum = _mm256_setr_pd(maximum[0], maximum[1], maximum[2], 0.0);
+    __m256d separated = _mm256_or_pd(_mm256_cmp_pd(nodeMaximum, queryMinimum, _CMP_LE_OQ),
+                                     _mm256_cmp_pd(queryMaximum, nodeMinimum, _CMP_LE_OQ));
+    return (_mm256_movemask_pd(separated) & 7) == 0;
+#elif defined(LAIUE_COMPOUND_BVH_OVERLAP_SSE2)
+    // Оси 0..1 сравниваются одной парой, ось 2 — парной загрузкой со сдвигом,
+    // у которой значима только младшая дорожка.
+    __m128d nodeMinimum01 = _mm_loadu_pd(&node->minimum[0]);
+    __m128d nodeMaximum01 = _mm_loadu_pd(&node->maximum[0]);
+    __m128d nodeMinimum2 = _mm_loadu_pd(&node->minimum[2]);
+    __m128d nodeMaximum2 = _mm_loadu_pd(&node->maximum[2]);
+    __m128d queryMinimum01 = _mm_loadu_pd(&minimum[0]);
+    __m128d queryMaximum01 = _mm_loadu_pd(&maximum[0]);
+    __m128d queryMinimum2 = _mm_set1_pd(minimum[2]);
+    __m128d queryMaximum2 = _mm_set1_pd(maximum[2]);
+    __m128d separated01 = _mm_or_pd(_mm_cmple_pd(nodeMaximum01, queryMinimum01),
+                                    _mm_cmple_pd(queryMaximum01, nodeMinimum01));
+    __m128d separated2 = _mm_or_pd(_mm_cmple_pd(nodeMaximum2, queryMinimum2),
+                                   _mm_cmple_pd(queryMaximum2, nodeMinimum2));
+    int separatedBits = _mm_movemask_pd(separated01) | (_mm_movemask_pd(separated2) & 1);
+    return separatedBits == 0;
+#else
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         if (!(node->maximum[axis] > minimum[axis]) || !(maximum[axis] > node->minimum[axis]))
@@ -375,6 +420,7 @@ static bool CompoundBvhTouches(const RigidCompoundBvhNode *node, const double mi
         }
     }
     return true;
+#endif
 }
 
 static void CompoundBvhSiftValues(uint32_t *values, uint32_t root, uint32_t size)

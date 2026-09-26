@@ -14,6 +14,7 @@
 #include "audio/audio_offscreen.h"
 #include "mesh/chunk_mesher.h"
 #include "platform/system.h"
+#include "world/numeric_provider.h"
 #include "world/world.h"
 
 // Харнесс без CRT общий с тестами: Windows собирает движок с
@@ -157,10 +158,19 @@ static bool RunMeshBenchmark(void)
     // Прогрев: первый проход платит за страницы и кеш.
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
-    if (BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount) && quads != NULL)
+    if (!BuildChunkMesh(&source, scratch, 0, 0, 0, &quads, &quadCount)
+        || quadCount == 0u)
     {
-        PlatformFree(quads);
+        // Мир без numeric-сервиса молча теряет правки, и мешер получает
+        // пустой чанк. Ненулевой счётчик квадов отделяет рабочую настройку
+        // стенда от измерения пустоты.
+        WriteText("mesh benchmark produced an empty chunk\n");
+        if (quads != NULL) PlatformFree(quads);
+        ChunkMesherScratchDestroy(scratch);
+        WorldDestroy(world);
+        return false;
     }
+    PlatformFree(quads);
 
     double samples[SAMPLE_COUNT];
     for (uint32_t sample = 0; sample < SAMPLE_COUNT; ++sample)
@@ -287,6 +297,11 @@ static bool RunMixBenchmark(void)
 
 LAIUE_TEST_ENTRY(EngineBenchmarkEntryPoint)
 {
+    // Мешер тянет мир через WorldFillRegion: без numeric-сервиса правки
+    // молча не применяются, и стенд мерил бы пустой чанк. Ставим сервис так
+    // же, как mesher_benchmark и world-стенды.
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
+
     WriteText("laiue engine benchmark\n");
     WriteText("voices=");
     WriteUnsigned(MIX_VOICE_COUNT);
