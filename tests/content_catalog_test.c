@@ -208,6 +208,44 @@ LAIUE_TEST_ENTRY(ContentCatalogTestEntryPoint)
                   "active shader enumeration state");
     LaiueContentListRelease(&shaders);
 
+    // Case-folded and strict code-unit orders disagree for these names, so
+    // enumeration must take the strict-sort fallback after folded sorting.
+    CatalogExpect(Join(paths->built, LAIUE_CONTENT_PATH_CAPACITY, paths->shaders,
+                       L"aardvark.lsp") &&
+                      Join(paths->copiedRoot, LAIUE_CONTENT_PATH_CAPACITY, paths->shaders,
+                           L"Zulu.lsp") &&
+                      PlatformCreateDirectory(paths->built) &&
+                      PlatformCreateDirectory(paths->copiedRoot),
+                  "mixed-case fallback pack creation");
+    CatalogExpect(LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_SHADER_PACK,
+                                                   L"aardvark.lsp"),
+                  "mixed-case fallback pack activation");
+    LaiueContentList mixedOrder;
+    CatalogExpect(LaiueContentCatalogEnumerate(catalog, LAIUE_CONTENT_SHADER_PACK, &mixedOrder),
+                  "mixed-case fallback enumeration");
+    uint32_t alphaPosition = UINT32_MAX;
+    uint32_t betaPosition = UINT32_MAX;
+    uint32_t zuluPosition = UINT32_MAX;
+    uint32_t aardvarkPosition = UINT32_MAX;
+    for (uint32_t index = 0U; index < mixedOrder.count; ++index)
+    {
+        const wchar_t *name = mixedOrder.entries[index].name;
+        if (WideEquals(name, L"Alpha.lsp")) alphaPosition = index;
+        if (WideEquals(name, L"Beta.lsp")) betaPosition = index;
+        if (WideEquals(name, L"Zulu.lsp")) zuluPosition = index;
+        if (WideEquals(name, L"aardvark.lsp")) aardvarkPosition = index;
+    }
+    CatalogExpect(alphaPosition < betaPosition && betaPosition < zuluPosition &&
+                      zuluPosition < aardvarkPosition &&
+                      ListContains(&mixedOrder, L"aardvark.lsp", true),
+                  "mixed-case fallback strict order or active flag");
+    LaiueContentListRelease(&mixedOrder);
+    CatalogExpect(LaiueContentCatalogSetActivePack(catalog, LAIUE_CONTENT_SHADER_PACK, NULL),
+                  "mixed-case fallback pack deactivation");
+    CatalogExpect(PlatformRemoveDirectory(paths->built) &&
+                      PlatformRemoveDirectory(paths->copiedRoot),
+                  "mixed-case fallback pack cleanup");
+
     CatalogExpect(LaiueContentCatalogBuildPath(catalog, LAIUE_CONTENT_SHADER_PACK, L"Beta.lsp",
                                                L"pack.lm", paths->built,
                                                LAIUE_CONTENT_PATH_CAPACITY),

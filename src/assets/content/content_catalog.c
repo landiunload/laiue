@@ -422,8 +422,14 @@ static bool StorageMatches(
 static bool ContentPathMatchesStorageUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
                                               const wchar_t *name);
 
-static bool GetActivePackUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
-                                  wchar_t *destination, uint32_t capacity)
+// Читает <каталог типа>/active.txt и проверяет само имя: непусто, безопасно
+// и совпадает по типу пака. Существование и однозначность имени в каталоге
+// здесь не проверяются: это отдельный обход, и вызывающий может подтвердить
+// имя по уже собранному списку (`LaiueContentCatalogEnumerate`) либо
+// отдельным обходом (`GetActivePackUnlocked`). Иначе перечисление паков
+// читало бы каталог дважды за вызов.
+static bool ReadActivePackNameUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                       wchar_t *destination, uint32_t capacity)
 {
     if (!LaiueContentTypeIsPack(type) || destination == NULL || capacity == 0U)
         return false;
@@ -462,8 +468,20 @@ static bool GetActivePackUnlocked(LaiueContentCatalog *catalog, LaiueContentType
         destination, capacity, NULL);
     PlatformFree(bytes);
     if (!converted || !LaiueContentNameIsSafe(destination) ||
-        !LaiueContentNameMatches(type, destination) ||
-        !ContentPathMatchesStorageUnlocked(catalog, type, destination))
+        !LaiueContentNameMatches(type, destination))
+    {
+        destination[0] = L'\0';
+        return false;
+    }
+    return true;
+}
+
+static bool GetActivePackUnlocked(LaiueContentCatalog *catalog, LaiueContentType type,
+                                  wchar_t *destination, uint32_t capacity)
+{
+    if (!ReadActivePackNameUnlocked(catalog, type, destination, capacity))
+        return false;
+    if (!ContentPathMatchesStorageUnlocked(catalog, type, destination))
     {
         destination[0] = L'\0';
         return false;
@@ -703,13 +721,31 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
     // Активный пак читается один раз и только для непустого списка, как и
     // раньше; пометка `active` ставится после заполнения, чтобы чтение
     // active.txt не попадало в горячий обход каталога.
+    //
+    // Имя активного пака подтверждается по уже собранному списку, а не
+    // повторным обходом каталога: состав и фильтр записей здесь ровно те,
+    // что проверял бы ContentPathMatchesStorageUnlocked, поэтому достаточно
+    // найти точное имя и убедиться, что совпадение по регистру единственное.
     if (format->pack)
     {
         wchar_t activeName[LAIUE_CONTENT_NAME_CAPACITY];
-        if (GetActivePackUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY))
+        if (ReadActivePackNameUnlocked(catalog, type, activeName, LAIUE_CONTENT_NAME_CAPACITY))
         {
+            bool exact = false;
+            uint32_t foldedMatches = 0U;
             for (uint32_t index = 0U; index < stored; ++index)
-                entries[index].active = TextEquals(entries[index].name, activeName);
+            {
+                if (!TextEqualsAsciiCaseInsensitive(entries[index].name, activeName))
+                    continue;
+                ++foldedMatches;
+                if (TextEquals(entries[index].name, activeName))
+                    exact = true;
+            }
+            if (exact && foldedMatches == 1U)
+            {
+                for (uint32_t index = 0U; index < stored; ++index)
+                    entries[index].active = TextEquals(entries[index].name, activeName);
+            }
         }
     }
 
@@ -722,6 +758,16 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
     if (stored > 1U)
     {
         SortEntriesByName(entries, stored, true);
+        // Строгий порядок совпадает со свёрнутым всякий раз, когда ни одна
+        // пара соседей не требует обратного регистра впереди прямого.
+        // Тогда массив уже лежит в выходном порядке, и второй полный
+        // heapsort — чистая перестановка 258-байтных записей — не нужен.
+        // Проверка идёт по тем же соседям, что и поиск неоднозначных имён,
+        // поэтому дополнительного обхода нет; как только пара нарушает
+        // строгий порядок, флаг снимается, и сортировка выполняется как
+        // прежде. Имена уникальны (это гарантировала проверка выше), значит
+        // строго возрастающая перестановка совпадает с прежним результатом.
+        bool strictOrder = true;
         for (uint32_t i = 1U; i < stored; ++i)
         {
             if (TextCompareAsciiFolded(entries[i - 1U].name, entries[i].name) == 0)
@@ -730,8 +776,14 @@ bool LaiueContentCatalogEnumerate(LaiueContentCatalog *catalog, LaiueContentType
                 PlatformRwLockReleaseShared(&catalog->lock);
                 return false;
             }
+            if (strictOrder &&
+                TextCompare(entries[i - 1U].name, entries[i].name) >= 0)
+            {
+                strictOrder = false;
+            }
         }
-        SortEntriesByName(entries, stored, false);
+        if (!strictOrder)
+            SortEntriesByName(entries, stored, false);
     }
     outList->entries = entries;
     outList->count = stored;

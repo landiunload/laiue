@@ -302,6 +302,12 @@ struct Renderer
     // (0, 0, 0, -1) — значению, общему для всех инстансных вызовов кадра.
     // Пока это так, повторная запись тех же констант не делается.
     bool                       instanceOriginActive;
+    // Последние записанные в командный список PSO и корневая подпись.
+    // В потоке однотипных вызовов одного прохода оба значения постоянны,
+    // поэтому повторная запись пропускается. Сбрасываются Reset'ом
+    // командного списка и пересозданием PSO.
+    ID3D12PipelineState*       boundPipelineState;
+    ID3D12RootSignature*       boundRootSignature;
 
     DeferredResourceRelease    deferredResources[DEFERRED_RELEASE_CAPACITY];
     uint32_t                   deferredResourceHead;
@@ -345,6 +351,32 @@ static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
     barrier.Transition.StateAfter = stateAfter;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     return barrier;
+}
+
+// Смена состояния командного списка через кэш: повторная запись того же
+// PSO или корневой подписи — это запись, которую драйвер перечитывает на
+// каждом draw, даже если значение не изменилось. В потоке однотипных
+// вызовов одного прохода оба значения постоянны, поэтому последнее
+// записанное запоминается. Все места смены состояния обязаны идти через
+// эти помощники, иначе кэш разойдётся с фактическим состоянием списка.
+static void SetPipelineStateCached(Renderer *renderer, ID3D12PipelineState *pipelineState)
+{
+    if (renderer->boundPipelineState == pipelineState)
+    {
+        return;
+    }
+    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList, pipelineState);
+    renderer->boundPipelineState = pipelineState;
+}
+
+static void SetRootSignatureCached(Renderer *renderer, ID3D12RootSignature *rootSignature)
+{
+    if (renderer->boundRootSignature == rootSignature)
+    {
+        return;
+    }
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList, rootSignature);
+    renderer->boundRootSignature = rootSignature;
 }
 
 static void WaitForGpu(Renderer* renderer)
@@ -1964,6 +1996,8 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
     renderer->genericPipelineState = NULL;
     renderer->genericRootSignature = NULL;
     renderer->rootSignature = NULL;
+    renderer->boundPipelineState = NULL;
+    renderer->boundRootSignature = NULL;
     if (renderer->depthBuffer != NULL)
         ID3D12Resource_Release(renderer->depthBuffer);
     if (renderer->depthStencilViewHeap != NULL)
@@ -2460,6 +2494,10 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
         ID3D12Resource_Release(upload);
         return false;
     }
+    // Reset начинает новый command list с PSO=NULL; он не наследует
+    // привязки предыдущей записи.
+    renderer->boundPipelineState = NULL;
+    renderer->boundRootSignature = NULL;
     D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
         texture->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2614,10 +2652,8 @@ void RendererDrawMesh_D3D12(Renderer* renderer, const RendererMesh* mesh,
         return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
 
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-                                                       renderer->rootSignature);
-    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
-                                               renderer->pipelineState);
+    SetRootSignatureCached(renderer, renderer->rootSignature);
+    SetPipelineStateCached(renderer, renderer->pipelineState);
 
     float transform[4] = {
         chunkOriginRelative[0], chunkOriginRelative[1],
@@ -2676,10 +2712,8 @@ void RendererDrawGenericMeshRangeBound_D3D12(
                                      ? texture->srvSlot
                                      : renderer->genericFallbackTexture->srvSlot;
     const uint32_t samplerSlot = sampler != NULL ? sampler->samplerSlot : 0u;
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-                                                       renderer->genericRootSignature);
-    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
-                                               renderer->genericPipelineState);
+    SetRootSignatureCached(renderer, renderer->genericRootSignature);
+    SetPipelineStateCached(renderer, renderer->genericPipelineState);
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
         renderer->commandList, GENERIC_ROOT_PARAMETER_CONSTANTS, 4, transform,
         ROOT_CONSTANT_ORIGIN_OFFSET);
@@ -2721,10 +2755,8 @@ void RendererDrawMeshInstances_D3D12(Renderer* renderer, const RendererMesh* mes
     if (mesh->generic || renderer->commandList == NULL || renderer->pipelineState == NULL)
         return;
     GeometryPoolBlock* block = &renderer->poolBlocks[mesh->blockIndex];
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-                                                       renderer->rootSignature);
-    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
-                                               renderer->pipelineState);
+    SetRootSignatureCached(renderer, renderer->rootSignature);
+    SetPipelineStateCached(renderer, renderer->pipelineState);
     // Смещение инстанса одинаково для всех инстансных вызовов кадра:
     // пишем его один раз до первого изменения другим путём.
     if (!renderer->instanceOriginActive)
@@ -3073,6 +3105,11 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
         renderer->commandAllocators[renderer->frameIndex],
         renderer->worldReady ? renderer->pipelineState : NULL);
     renderer->frameRecording = true;
+    // После Reset кэш аннулируется независимо от результата вызова выше:
+    // первая отрисовка явно запишет обе привязки и не полагается на состояние
+    // командного списка до Reset.
+    renderer->boundRootSignature = NULL;
+    renderer->boundPipelineState = NULL;
     // Reset возвращает корневые константы к нулю: общего инстансного
     // смещения в новом командном списке ещё нет.
     renderer->instanceOriginActive = false;
@@ -3114,8 +3151,7 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
         return true;
     }
 
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-        renderer->rootSignature);
+    SetRootSignatureCached(renderer, renderer->rootSignature);
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
         ROOT_PARAMETER_BLOCK_TEXTURES, SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
     // fxc вправе спекулятивно выполнить Load из t3 даже для обычного чанка,
@@ -3239,10 +3275,8 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
         ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
 
-        ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
-            renderer->resolvePipelineState);
-        ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-            renderer->resolveRootSignature);
+        SetPipelineStateCached(renderer, renderer->resolvePipelineState);
+        SetRootSignatureCached(renderer, renderer->resolveRootSignature);
 
         float resolveConstants[2] = {
             renderer->frame.fovHalfRadians,
@@ -3271,10 +3305,8 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
         ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
 
-        ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList,
-            renderer->uiPipelineState);
-        ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList,
-            renderer->uiRootSignature);
+        SetPipelineStateCached(renderer, renderer->uiPipelineState);
+        SetRootSignatureCached(renderer, renderer->uiRootSignature);
 
         float screenSize[2] = {
             (float)renderer->windowWidth,
@@ -3491,6 +3523,9 @@ static bool RecreateChunkPipelineState(Renderer *renderer)
     if (renderer->pipelineState != NULL)
         ID3D12PipelineState_Release(renderer->pipelineState);
     renderer->pipelineState = replacement;
+    // Старый PSO освобождён: сохранённая привязка больше не описывает
+    // состояние командного списка.
+    renderer->boundPipelineState = NULL;
     return true;
 }
 
@@ -3502,6 +3537,7 @@ static bool RecreateGenericPipelineState(Renderer *renderer)
     if (renderer->genericPipelineState != NULL)
         ID3D12PipelineState_Release(renderer->genericPipelineState);
     renderer->genericPipelineState = replacement;
+    renderer->boundPipelineState = NULL;
     return true;
 }
 
@@ -3728,6 +3764,9 @@ bool RendererReloadShaderSet_D3D12(Renderer *renderer, const LaiueShaderSet *sha
     if (renderer->uiPipelineState != NULL)
         ID3D12PipelineState_Release(renderer->uiPipelineState);
     renderer->uiPipelineState = replacementUi;
+    // Все графические PSO могли быть освобождены и пересозданы: кэш
+    // привязки невалиден.
+    renderer->boundPipelineState = NULL;
 
     ReleaseShaderArray(renderer->loadedShaders);
     for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)

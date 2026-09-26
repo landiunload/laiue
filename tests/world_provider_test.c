@@ -837,6 +837,28 @@ static void TestRegionEmptyOverrideFastPath(void)
     WorldDestroy(world);
 }
 
+// Проверяет ранний возврат после обхода дельт: тот же чанк изменён, но все
+// записи лежат за границей региона. Буфер заранее заполнен не-air значениями,
+// чтобы проверить и его очистку перед пропуском классификации.
+static void TestRegionNoLocalOverridesFastPath(void)
+{
+    BlockType cells[2 * 2 * 2];
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "sparse region fast-path world was created");
+    ProviderExpect(WorldTrySetBlock(world, 2, 0, 0, (BlockType)77U),
+                   "sparse region outside edit failed");
+
+    for (uint32_t index = 0U; index < 8U; ++index)
+        cells[index] = (BlockType)0x5aU;
+    ProviderExpect(WorldFillRegion(world, 0, 0, 0, 2, 2, 2, cells) == WORLD_REGION_ALL_AIR,
+                   "region without local overrides was not all air");
+    for (uint32_t index = 0U; index < 8U; ++index)
+        ProviderExpect(cells[index] == BLOCK_AIR,
+                       "region without local overrides was not cleared");
+
+    WorldDestroy(world);
+}
+
 // === Быстрый путь при гонке читателей и первой правки ===
 //
 // Быстрый путь читает editedChunkCount без блокировки. Проверяется именно
@@ -1274,6 +1296,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestRegionCoordinateLimits();
     TestFastPathAfterEmpty();
     TestRegionEmptyOverrideFastPath();
+    TestRegionNoLocalOverridesFastPath();
     TestEmptyChunkRemovalBackwardShift();
     TestBatchLimitsAndDuplicates();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");

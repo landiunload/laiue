@@ -1750,6 +1750,12 @@ WorldRegionContents WorldFillRegion(World* world,
     int64_t maxChunkY = ChunkFromBlock(maxBlockY);
     int64_t maxChunkZ = ChunkFromBlock(maxBlockZ);
 
+    /* Без базового слоя буфер целиком заполнен воздухом, поэтому «применена
+     * хоть одна дельта» равносильно «разбор может вернуть не ALL_AIR». Если
+     * дельт в регионе нет, финальный проход по буферу не нужен. */
+    const bool baseIsEmpty = world->provider.getBlock == NULL;
+    bool anyDeltaApplied = false;
+
     PlatformRwLockAcquireShared(&world->tableLock);
     for (int64_t chunkY = minChunkY;; ++chunkY)
     {
@@ -1814,6 +1820,7 @@ WorldRegionContents WorldFillRegion(World* world,
                         uint32_t delta = 0;
                         while (delta < chunk->deltaCount)
                         {
+                            anyDeltaApplied = true;
                             uint32_t localIndex = DeltaLocalIndex(chunk->deltas[delta]);
                             uint32_t columnEnd = localIndex | (CHUNK_SIZE - 1U);
                             int64_t place = regionBase +
@@ -1860,6 +1867,7 @@ WorldRegionContents WorldFillRegion(World* world,
                             uint32_t remainder = localIndex % (CHUNK_SIZE * CHUNK_SIZE);
                             int64_t localY = (int64_t)(remainder / CHUNK_SIZE);
                             int64_t localZ = (int64_t)(remainder % CHUNK_SIZE);
+                            anyDeltaApplied = true;
                             outBlocks[RegionIndex(chunkBase[0] + localX, chunkBase[1] + localY,
                                 chunkBase[2] + localZ, minBlockX, minBlockY, minBlockZ,
                                 sizeX, sizeZ)] = DeltaBlock(chunk->deltas[cursor]);
@@ -1875,5 +1883,13 @@ WorldRegionContents WorldFillRegion(World* world,
     }
     PlatformRwLockReleaseShared(&world->tableLock);
 
+    /* Пустой базовый слой и ни одной попавшей в регион дельты — буфер так и
+     * остался заполненным воздухом, и разбор это подтвердил бы, прочитав весь
+     * регион. Ответ известен заранее, поэтому лишний проход пропускается.
+     * Если провайдер задан, его содержимое неизвестно и разбор обязателен. */
+    if (baseIsEmpty && !anyDeltaApplied)
+    {
+        return WORLD_REGION_ALL_AIR;
+    }
     return ClassifyRegion(outBlocks, cellCount);
 }
