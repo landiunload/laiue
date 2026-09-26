@@ -490,6 +490,41 @@ static ChunkEntry* InsertEntry(ChunkStreaming* streaming, int64_t x, int64_t y, 
     return entry;
 }
 
+// FindEntry + InsertEntry одним проходом. При постановке заявок почти каждая
+// клетка новой грани отсутствует в таблице: прежний код дважды проходил её
+// цепочку пробирования. Здесь поиск и вставка делят один проход; при наличии
+// ключа возвращается запись, иначе она занимает первый свободный слот.
+// InsertEntry остаётся для пересборки после смены origin: там таблица только
+// что обнулена и ключи заведомо новые.
+static ChunkEntry* FindOrInsertEntry(ChunkStreaming* streaming,
+    int64_t x, int64_t y, int64_t z, bool* outInserted)
+{
+    const uint32_t mask = streaming->capacity - 1u;
+    uint32_t index = WorldHashChunkCoordinate(x, y, z) & mask;
+
+    while (streaming->entries[index].state != CHUNK_ENTRY_EMPTY)
+    {
+        ChunkEntry* entry = &streaming->entries[index];
+        if (entry->x == x && entry->y == y && entry->z == z)
+        {
+            *outInserted = false;
+            return entry;
+        }
+        index = (index + 1u) & mask;
+    }
+
+    ChunkEntry* entry = &streaming->entries[index];
+    entry->x = x;
+    entry->y = y;
+    entry->z = z;
+    entry->mesh = NULL;
+    entry->revision = NextChunkRevision(streaming);
+    entry->drawSlotPlusOne = 0;
+    entry->requestQueued = false;
+    *outInserted = true;
+    return entry;
+}
+
 static bool IsInsideRadius(const ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, int64_t radius)
 {
     int64_t deltaX = x - streaming->centerX;
@@ -699,6 +734,17 @@ LAIUE_VOXEL_RENDER_API void ChunkStreamingPushEmptyResultForTesting(
     streaming->resultCount++;
     streaming->unfinishedWork++;
     PlatformMutexUnlock(&streaming->queueLock);
+}
+
+// Снимок эпохи центра. Эпоха растёт на каждом реальном сдвиге центра, но не
+// на повторной установке того же центра: ранний return в ChunkStreamingSetCenter
+// выходит до инкремента. Стресс-тесту это нужно, потому что при нулевой дельте
+// счётчики заявок не меняются и удаление return иначе не заметить. Отдельного
+// заголовка нет, в Release символа тоже нет.
+LAIUE_VOXEL_RENDER_API uint32_t ChunkStreamingGetCenterEpochForTesting(
+    ChunkStreaming* streaming)
+{
+    return PlatformAtomicLoadU32Acquire(&streaming->centerEpoch);
 }
 #endif
 
@@ -1018,9 +1064,10 @@ static bool TrySubtractInt64(
 static void QueueChunkIfMissing(ChunkStreaming* streaming,
     int64_t x, int64_t y, int64_t z, ChunkEnqueueBatch* batch)
 {
-    if (FindEntry(streaming, x, y, z) != NULL) return;
+    bool inserted = false;
+    ChunkEntry* entry = FindOrInsertEntry(streaming, x, y, z, &inserted);
+    if (!inserted) return;
 
-    ChunkEntry* entry = InsertEntry(streaming, x, y, z);
     entry->state = CHUNK_ENTRY_PENDING;
     batch->entries[batch->count++] = entry;
     if (batch->count == CHUNK_REQUEST_ENQUEUE_BATCH)

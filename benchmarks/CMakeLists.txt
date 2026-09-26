@@ -120,15 +120,18 @@ endif()
 laiue_configure_standalone_executable(
     laiue_compound_benchmark CompoundBenchmarkEntryPoint)
 
-if(TARGET laiue_scene)
+if(TARGET laiue_voxel_render AND TARGET laiue_world AND TARGET laiue_mesher AND
+   TARGET laiue_numeric)
     # Ручной benchmark главного потока стриминга чанков: смена центра,
     # вытеснение, постановка заявок и разбор очереди результатов. Мир пуст,
     # рендерер фиктивный, поэтому GPU не нужен.
     add_executable(laiue_streaming_benchmark EXCLUDE_FROM_ALL
         streaming_benchmark.c)
     target_link_libraries(laiue_streaming_benchmark PRIVATE
-        laiue_scene
-        laiue_world)
+        laiue_voxel_render
+        laiue_world
+        laiue_mesher
+        laiue_numeric)
     target_include_directories(laiue_streaming_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(

@@ -55,6 +55,11 @@ LAIUE_VOXEL_RENDER_API uint64_t ChunkStreamingGetEntryRevisionForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z);
 LAIUE_VOXEL_RENDER_API void ChunkStreamingPushEmptyResultForTesting(
     ChunkStreaming* streaming, int64_t x, int64_t y, int64_t z, uint64_t revision);
+// Снимок эпохи центра: тоже только под !NDEBUG. В сценарии повторной
+// установки того же центра счётчики заявок не меняются, поэтому именно
+// эпоха ловит отсутствие fast-path return.
+LAIUE_VOXEL_RENDER_API uint32_t ChunkStreamingGetCenterEpochForTesting(
+    ChunkStreaming* streaming);
 #endif
 
 #define STRESS_SET_CAPACITY 8192u
@@ -874,6 +879,86 @@ static void RunPauseAfterResumeScenario(int32_t radius, uint32_t repeats)
     WorldDestroy(world);
 }
 
+// Быстрый путь ChunkStreamingSetCenter: повторная установка точно того же
+// центра обязана быть без побочных эффектов и не порождать повторных заявок
+// на чанки. Рабочие потоки ставятся на паузу до первой установки: тогда
+// requestCount (pendingRequests) меняет только главный поток, а
+// queuedRequests вообще растёт лишь из путей постановки заявок. Pause идёт
+// до SetCenter, потому что он очищает кольца заявок и результатов.
+// Контрольная смена центра в конце подтверждает, что счётчик заявок реагирует
+// на настоящую смену центра, — иначе равенство выше было бы тривиальным.
+//
+// При нулевой дельте счётчики заявок не меняются, поэтому одного их равенства
+// мало: удаление раннего return в ChunkStreamingSetCenter тест бы не заметил.
+// Единственный наблюдаемый след удаления — рост centerEpoch, поэтому в Debug
+// дополнительно снимается эпоха до и после повторов. В Release тестовая
+// лазейка не компилируется, и там остаются только проверки stats.
+static void RunSameCenterNoOpScenario(int32_t radius)
+{
+    stressSeed = 0x5A3E0FF0ULL;
+    stressStep = 0u;
+    stressRadius = radius;
+    stressQueueCapacity = StressQueueCapacityFor(radius);
+
+    World* world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming* handle = ChunkStreamingCreate(
+        world, (Renderer*)&stressRendererPlaceholder, radius);
+    EXPECT(handle != NULL, "streaming was not created");
+    EXPECT(ChunkStreamingPause(handle),
+        "streaming was not paused before the first center set");
+
+    const int64_t centerX = 0;
+    const int64_t centerY = 0;
+    const int64_t centerZ = 0;
+    ChunkStreamingSetCenter(handle, centerX, centerY, centerZ);
+
+    ChunkStreamingStats baseline;
+    ChunkStreamingGetStats(handle, &baseline);
+#ifndef NDEBUG
+    const uint32_t baselineEpoch = ChunkStreamingGetCenterEpochForTesting(handle);
+#endif
+    // Первый вызов обязан реально заказать работу: иначе равенство ниже
+    // ничего не доказывало бы.
+    EXPECT(baseline.queuedRequests > 0u, "the first center set queued nothing");
+    EXPECT(baseline.pendingRequests > 0u,
+        "the first center set left no pending request");
+
+    for (uint32_t repeat = 0u; repeat < 8u; ++repeat)
+    {
+        stressStep = repeat + 1u;
+        ChunkStreamingSetCenter(handle, centerX, centerY, centerZ);
+    }
+
+    ChunkStreamingStats repeated;
+    ChunkStreamingGetStats(handle, &repeated);
+    EXPECT(repeated.queuedRequests == baseline.queuedRequests,
+        "repeated identical center set queued more requests");
+    EXPECT(repeated.pendingRequests == baseline.pendingRequests,
+        "repeated identical center set changed the pending request count");
+#ifndef NDEBUG
+    // Наблюдаемый след удаления fast-path return: эпоха центра выросла бы.
+    EXPECT(ChunkStreamingGetCenterEpochForTesting(handle) == baselineEpoch,
+        "repeated identical center set advanced the center epoch");
+#endif
+
+    // Контроль чувствительности: реальная смена центра на соседний чанк
+    // обязана увеличить накопительное число заявок.
+    ChunkStreamingSetCenter(handle, centerX + 1, centerY, centerZ);
+    ChunkStreamingStats shifted;
+    ChunkStreamingGetStats(handle, &shifted);
+    EXPECT(shifted.queuedRequests > baseline.queuedRequests,
+        "a real center change queued no request");
+#ifndef NDEBUG
+    EXPECT(ChunkStreamingGetCenterEpochForTesting(handle) > baselineEpoch,
+        "a real center change did not advance the center epoch");
+#endif
+
+    StressClearInjectedMeshes(handle);
+    ChunkStreamingDestroy(handle);
+    WorldDestroy(world);
+}
+
 // Центр двигается, пока рабочие потоки строят и складывают результаты в
 // очередь. Главный поток разбирает их в Pump и параллельно инвалидирует
 // блоки. Здесь проверяется протокол очереди и номера эпохи под настоящей
@@ -1034,6 +1119,7 @@ LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
     RunDrawListShiftScenario(3, 256u);
     RunOriginChangeScenario(2, 16u);
     RunPauseAfterResumeScenario(2, 8u);
+    RunSameCenterNoOpScenario(2);
 #ifndef NDEBUG
     RunRevisionOverflowScenario(2);
 #endif

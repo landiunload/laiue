@@ -19,8 +19,11 @@
 // Это микробенчмарк одной подсистемы; о FPS по нему судить нельзя.
 
 #include "platform/system.h"
-#include "scene/chunk_streaming.h"
+#include "voxel_render/chunk_streaming.h"
+#include "mesh/mesher_service.h"
+#include "world/numeric_provider.h"
 #include "world/world.h"
+#include "world/world_service.h"
 #include "test_runtime.h"
 
 #include <stdbool.h>
@@ -458,6 +461,13 @@ static void RunInvalidate(uint32_t radius, uint32_t count)
 
 LAIUE_TEST_ENTRY(StreamingBenchmarkEntryPoint)
 {
+    // Keep the standalone benchmark's service setup aligned with the stress
+    // test; without providers, worker threads cannot drain the request ring.
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
+    ChunkStreamingSetWorldService(LaiueWorldGetStaticServiceV1());
+    ChunkStreamingSetMesherService(LaiueMesherGetStaticServiceV1());
+    ChunkStreamingSetGraphicsService(NULL);
+
     char scenarioBuffer[32];
     for (uint32_t index = 0u; index < sizeof(scenarioBuffer); ++index)
     {
