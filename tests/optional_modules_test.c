@@ -277,7 +277,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     LaiueGraphicsDeviceV2 *resourceDevice = NULL;
     Expect(fallbackDeviceV2->createDeviceWithContext(
                fallbackDeviceV2->context, NULL, 16, 16,
-               LAIUE_GRAPHICS_BACKEND_AUTO, &resourceDevice) != 0u &&
+               LAIUE_GRAPHICS_BACKEND_VULKAN, &resourceDevice) != 0u &&
                resourceDevice != NULL,
            "graphics device v2 creates an offscreen instance");
     static const uint8_t shaderBytes[4] = {0x03u, 0x02u, 0x23u, 0x07u};
