@@ -58,7 +58,9 @@ laiue_configure_standalone_executable(
 if(TARGET laiue_world)
     add_executable(laiue_world_batch_benchmark EXCLUDE_FROM_ALL
         world_batch_benchmark.c)
-    target_link_libraries(laiue_world_batch_benchmark PRIVATE laiue_world)
+    target_link_libraries(laiue_world_batch_benchmark PRIVATE
+        laiue_world
+        laiue_numeric)
     target_include_directories(laiue_world_batch_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(
