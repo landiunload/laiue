@@ -258,8 +258,9 @@ static void GlobalChunkCoordinateDestroy(GlobalChunkCoordinate* coordinate)
     coordinate->hash = 0U;
 }
 
-static bool GlobalChunkCoordinateTryCreate(
-    GlobalChunkCoordinate* out, World* world, LocalChunkCoordinate local)
+static bool GlobalChunkCoordinateTryCreateHashed(
+    GlobalChunkCoordinate* out, World* world, LocalChunkCoordinate local,
+    uint64_t hash)
 {
     CoordinateFrame* frame = WorldGetEditFrame(world);
     if (frame == NULL || frame->referenceCount == UINT32_MAX)
@@ -267,10 +268,17 @@ static bool GlobalChunkCoordinateTryCreate(
         return false;
     }
     ++frame->referenceCount;
-    out->hash = HashLocalChunkCoordinate(world, local);
+    out->hash = hash;
     out->frame = frame;
     out->local = local;
     return true;
+}
+
+static bool GlobalChunkCoordinateTryCreate(
+    GlobalChunkCoordinate* out, World* world, LocalChunkCoordinate local)
+{
+    return GlobalChunkCoordinateTryCreateHashed(out, world, local,
+        HashLocalChunkCoordinate(world, local));
 }
 
 static void ChunkDestroy(Chunk* chunk)
@@ -331,13 +339,11 @@ static bool WorldGrow(World* world)
     return true;
 }
 
-static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
+/* Хешированный поиск: вызывает сторона, которая уже посчитала хеш (например,
+ * путь правки, где тот же хеш нужен и для вставки нового чанка). */
+static Chunk** WorldFindEntryHashed(
+    World* world, LocalChunkCoordinate key, uint64_t hash)
 {
-    if (world->count == 0U)
-    {
-        return NULL;
-    }
-    uint64_t hash = HashLocalChunkCoordinate(world, key);
     uint32_t mask = world->capacity - 1U;
     uint32_t index = (uint32_t)(hash ^ (hash >> 32U)) & mask;
     for (uint32_t probe = 0; probe < world->capacity; ++probe)
@@ -357,6 +363,16 @@ static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
     return NULL;
 }
 
+static Chunk** WorldFindEntry(World* world, LocalChunkCoordinate key)
+{
+    if (world->count == 0U)
+    {
+        return NULL;
+    }
+    return WorldFindEntryHashed(
+        world, key, HashLocalChunkCoordinate(world, key));
+}
+
 /* Публикует факт появления чанка с правкой. Вызывается под исключительным
  * захватом; release-запись гарантирует, что читатель, увидевший ненулевой
  * счётчик, пойдёт медленным путём и увидит сам чанк. */
@@ -365,21 +381,20 @@ static void WorldPublishEditedChunkCount(World* world)
     PlatformAtomicStoreU32Release(&world->editedChunkCount, world->count);
 }
 
-static Chunk* WorldGetOrCreateChunk(
-    World* world, LocalChunkCoordinate coordinate)
+/* Вставляет новый чанк, о котором вызывающий уже знает, что его нет. Поиск
+ * не повторяется, а хеш координаты приходит готовым: путь правки посчитал
+ * его для поиска и переиспользует для ключа. */
+static Chunk* WorldInsertChunk(
+    World* world, LocalChunkCoordinate coordinate, uint64_t hash)
 {
-    Chunk** entry = WorldFindEntry(world, coordinate);
-    if (entry != NULL)
-    {
-        return *entry;
-    }
     if (world->count * 2U >= world->capacity && !WorldGrow(world))
     {
         return NULL;
     }
 
     GlobalChunkCoordinate key;
-    if (!GlobalChunkCoordinateTryCreate(&key, world, coordinate))
+    if (!GlobalChunkCoordinateTryCreateHashed(
+            &key, world, coordinate, hash))
     {
         return NULL;
     }
@@ -393,7 +408,7 @@ static Chunk* WorldGetOrCreateChunk(
     chunk->allocator = world->allocator;
 
     uint32_t mask = world->capacity - 1U;
-    uint32_t slot = (uint32_t)(key.hash ^ (key.hash >> 32U)) & mask;
+    uint32_t slot = (uint32_t)(hash ^ (hash >> 32U)) & mask;
     while (world->occupied[slot])
     {
         slot = (slot + 1U) & mask;
@@ -863,7 +878,18 @@ static bool WorldTrySetBlockInternal(World* world,
     BlockType base = WorldBaseBlock(world, x, y, z);
 
     PlatformRwLockAcquireExclusive(&world->tableLock);
-    Chunk** entry = WorldFindEntry(world, coordinate);
+    /* Preserve the empty-world no-op fast path: before hashing in this case
+     * would add work to a write that cannot create or remove any delta. */
+    if (world->count == 0U && block == base && !preserveBase)
+    {
+        PlatformRwLockReleaseExclusive(&world->tableLock);
+        return true;
+    }
+    /* Хеш считается один раз: он нужен и поиску, и вставке нового чанка, а
+     * прежде отсутствующий чанк искался повторно внутри
+     * WorldGetOrCreateChunk. */
+    uint64_t hash = HashLocalChunkCoordinate(world, coordinate);
+    Chunk** entry = WorldFindEntryHashed(world, coordinate, hash);
     BlockType current = base;
     if (entry != NULL)
     {
@@ -884,9 +910,13 @@ static bool WorldTrySetBlockInternal(World* world,
             WorldEraseChunkAt(world, (uint32_t)(entry - world->chunks));
         }
     }
+    else if (entry != NULL)
+    {
+        succeeded = ChunkSetDelta(*entry, localIndex, block);
+    }
     else
     {
-        Chunk* chunk = WorldGetOrCreateChunk(world, coordinate);
+        Chunk* chunk = WorldInsertChunk(world, coordinate, hash);
         succeeded = chunk != NULL
             && ChunkSetDelta(chunk, localIndex, block);
     }

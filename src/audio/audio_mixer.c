@@ -169,6 +169,12 @@ struct AudioDevice
     AudioClip *retiredClips;
     uint32_t nextGeneration;
 
+    // Верхняя граница обхода слотов. Слоты выдаются с младших индексов,
+    // поэтому число одновременно звучавших голосов ограничивает и размах.
+    // Поле принадлежит только потоку вывода: его поднимает ApplyCommand при
+    // разборе COMMAND_START, и RenderFrames обходит слоты только до границы.
+    uint32_t voiceScanLimit;
+
     volatile uint32_t masterVolumeBits;
     volatile uint32_t activeVoices;
     volatile int64_t droppedCommands;
@@ -273,6 +279,10 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
         slot->gains = command->gains;
         slot->looping = command->looping;
         PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_ACTIVE);
+        // Голос занял индекс не ниже любого из ранее звучавших: обход обязан
+        // дотянуться до него и в следующих буферах.
+        if (command->slot >= device->voiceScanLimit)
+            device->voiceScanLimit = command->slot + 1u;
         break;
     case COMMAND_UPDATE:
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) return;
@@ -616,7 +626,9 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
 
     uint32_t active = 0u;
     bool mixedVoice = false;
-    for (uint32_t index = 0; index < AUDIO_MAX_VOICES; ++index)
+    // Звучащие голоса лежат ниже voiceScanLimit: все они когда-то прошли
+    // COMMAND_START на этом же потоке. Пустые хвостовые слоты не обходятся.
+    for (uint32_t index = 0; index < device->voiceScanLimit; ++index)
     {
         VoiceSlot *slot = &device->voices[index];
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;

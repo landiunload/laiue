@@ -366,6 +366,80 @@ static void RunSingleToggle(uint32_t rounds)
     WorldDestroy(world);
 }
 
+// === Сценарий: обновление существующих дельт без изменения набора ===
+//
+// Дельты заводятся заранее, затем координаты только перезаписываются
+// (1 <-> 2). Сдвига буфера и создания/удаления записи нет: остаётся ровно
+// путь правки существующего чанка — поиск чанка, поиск дельты и перезапись.
+// Dense-нагрузка держит все дельты в одном чанке, sparse — по одной дельте
+// в разных чанках (крупная таблица и промахи пробы).
+static void RunSingleUpdate(const char* name, uint32_t perChunk,
+    uint32_t chunkCount, uint32_t rounds)
+{
+    uint32_t count = perChunk * chunkCount;
+    if (count == 0u || count > WORLD_BENCH_MAX_MUTATIONS
+        || (4096u % perChunk) != 0u)
+    {
+        WriteText("RESULT ");
+        WriteText(name);
+        WriteText(" SKIP bad parameters\n");
+        return;
+    }
+    WorldBlockMutation* coordinates = PlatformAllocate(
+        (size_t)count * sizeof(*coordinates), false);
+    World* world = CreateBenchmarkWorld();
+    if (coordinates == NULL || world == NULL)
+    {
+        PlatformFree(coordinates);
+        WorldDestroy(world);
+        WriteText("RESULT ");
+        WriteText(name);
+        WriteText(" ERROR allocation\n");
+        ++worldBenchFailures;
+        return;
+    }
+    FillMutations(coordinates, count, perChunk, BLOCK_AIR, (BlockType)1u, 3);
+    if (!WorldApplyBlockBatch(world, coordinates, count))
+    {
+        WriteText("RESULT ");
+        WriteText(name);
+        WriteText(" ERROR precreate\n");
+        ++worldBenchFailures;
+        PlatformFree(coordinates);
+        WorldDestroy(world);
+        return;
+    }
+
+    double samples[WORLD_BENCH_SAMPLES];
+    for (uint32_t sample = 0u; sample < WORLD_BENCH_SAMPLES; ++sample)
+    {
+        double start = PlatformMonotonicSeconds();
+        for (uint32_t round = 0u; round < rounds; ++round)
+        {
+            BlockType value = (round & 1u) == 0u ? (BlockType)2u : (BlockType)1u;
+            for (uint32_t index = 0u; index < count; ++index)
+            {
+                if (WorldTrySetBlock(world, coordinates[index].block[0],
+                        coordinates[index].block[1], coordinates[index].block[2],
+                        value))
+                {
+                    ++worldBenchSink;
+                }
+                else
+                {
+                    ++worldBenchFailures;
+                }
+            }
+        }
+        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0;
+    }
+    uint64_t checksum = SampleChecksum(world, coordinates, count);
+    ReportScenario(name, samples, WORLD_BENCH_SAMPLES,
+        (uint64_t)rounds * count, checksum);
+    PlatformFree(coordinates);
+    WorldDestroy(world);
+}
+
 // === Сценарий: пакеты ===
 
 // mode = false: обновление существующих дельт (1<->2);
@@ -441,6 +515,8 @@ static void RunBatch(const char* name, uint32_t perChunk, uint32_t chunkCount,
 static void RunAll(void)
 {
     RunSingleToggle(300u);
+    RunSingleUpdate("single_update_dense", 2048u, 1u, 200u);
+    RunSingleUpdate("single_update_sparse", 1u, 4096u, 50u);
     RunBatch("batch_small", 4u, 2u, 20000u, false);
     RunBatch("batch_few", 1024u, 4u, 30u, false);
     RunBatch("batch_wide", 1u, 4096u, 20u, false);
@@ -452,6 +528,14 @@ static void RunOne(const char* name)
     if (TextEquals(name, "single_toggle"))
     {
         RunSingleToggle(300u);
+    }
+    else if (TextEquals(name, "single_update_dense"))
+    {
+        RunSingleUpdate("single_update_dense", 2048u, 1u, 200u);
+    }
+    else if (TextEquals(name, "single_update_sparse"))
+    {
+        RunSingleUpdate("single_update_sparse", 1u, 4096u, 50u);
     }
     else if (TextEquals(name, "batch_small"))
     {
