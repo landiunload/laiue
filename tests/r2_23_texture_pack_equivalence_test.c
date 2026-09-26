@@ -23,7 +23,7 @@
 #define TEST_PACK L"Equiv.ltp"
 #define PATH_CAP LAIUE_PLATFORM_PATH_CAPACITY
 
-#if defined(_MSC_VER) || defined(__clang__)
+#if defined(_MSC_VER)
 #define EQ_NOINLINE __declspec(noinline)
 #else
 #define EQ_NOINLINE __attribute__((noinline))

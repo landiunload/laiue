@@ -270,113 +270,127 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                fallbackDeviceV2->createDeviceWithContext != NULL,
            "graphics device v2 is published independently of content");
 
-    /* Exercise the ownership rules through the public service, not through
-     * renderer internals.  This is deliberately an offscreen device: the
-     * same check works for D3D12 and Vulkan providers and does not require a
-     * platform window. */
+    /* Exercise device-owned resource rules through the public service. Use
+     * Vulkan when this build has it, since its offscreen path needs no window;
+     * otherwise AUTO selects the platform renderer, which may require one. */
     LaiueGraphicsDeviceV2 *resourceDevice = NULL;
-    Expect(fallbackDeviceV2->createDeviceWithContext(
-               fallbackDeviceV2->context, NULL, 16, 16,
-               LAIUE_GRAPHICS_BACKEND_VULKAN, &resourceDevice) != 0u &&
-               resourceDevice != NULL,
-           "graphics device v2 creates an offscreen instance");
-    static const uint8_t shaderBytes[4] = {0x03u, 0x02u, 0x23u, 0x07u};
-    LaiueGraphicsShaderDescV1 shaderDescription = {
-        sizeof(shaderDescription), LAIUE_GRAPHICS_SHADER_STAGE_VERTEX,
-        shaderBytes, sizeof(shaderBytes)};
-    LaiueGraphicsHandle shader = 0u;
-    Expect(resourceDevice->createShader(resourceDevice, &shaderDescription, &shader) != 0u &&
-               shader != 0u,
-           "graphics device creates a shader handle");
-    LaiueGraphicsPipelineDescV1 pipelineDescription = {
-        sizeof(pipelineDescription), LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES,
-        sizeof(LaiueGraphicsVertexV2), shader, 0u};
-    LaiueGraphicsHandle firstPipeline = 0u;
-    Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
-                                          &firstPipeline) != 0u &&
-               firstPipeline != 0u,
-           "graphics device records pipeline shader dependencies");
-    /* Destroying a referenced shader is intentionally a no-op in the void
-     * ABI.  Creating another pipeline proves that the original handle stayed
-     * live instead of becoming a dangling pointer. */
-    resourceDevice->destroyHandle(resourceDevice, shader);
-    LaiueGraphicsHandle secondPipeline = 0u;
-    Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
-                                          &secondPipeline) != 0u &&
-               secondPipeline != 0u,
-           "referenced shader remains live until all pipelines are gone");
-    resourceDevice->destroyHandle(resourceDevice, firstPipeline);
-    resourceDevice->destroyHandle(resourceDevice, secondPipeline);
-    resourceDevice->destroyHandle(resourceDevice, shader);
+    uint32_t offscreenBackend = LAIUE_GRAPHICS_BACKEND_AUTO;
+#if defined(LAIUE_TEST_HAS_VULKAN_RENDERER)
+    offscreenBackend = LAIUE_GRAPHICS_BACKEND_VULKAN;
+#endif
+    uint32_t deviceCreated = fallbackDeviceV2->createDeviceWithContext(
+        fallbackDeviceV2->context, NULL, 16, 16, offscreenBackend, &resourceDevice);
+    Expect((deviceCreated != 0u) == (resourceDevice != NULL),
+           "graphics device creation status matches its output");
+    if (deviceCreated == 0u)
+    {
+#if defined(LAIUE_TEST_REQUIRE_OFFSCREEN_DEVICE)
+        Expect(false, "required offscreen graphics device is unavailable");
+#else
+        LaiueTestRuntimeWrite(
+            "graphics device resource checks skipped: renderer needs a window or is unavailable\n");
+#endif
+    }
+    else
+    {
+        static const uint8_t shaderBytes[4] = {0x03u, 0x02u, 0x23u, 0x07u};
+        LaiueGraphicsShaderDescV1 shaderDescription = {
+            sizeof(shaderDescription), LAIUE_GRAPHICS_SHADER_STAGE_VERTEX,
+            shaderBytes, sizeof(shaderBytes)};
+        LaiueGraphicsHandle shader = 0u;
+        Expect(resourceDevice->createShader(resourceDevice, &shaderDescription, &shader) != 0u &&
+                   shader != 0u,
+               "graphics device creates a shader handle");
+        LaiueGraphicsPipelineDescV1 pipelineDescription = {
+            sizeof(pipelineDescription), LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES,
+            sizeof(LaiueGraphicsVertexV2), shader, 0u};
+        LaiueGraphicsHandle firstPipeline = 0u;
+        Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
+                                              &firstPipeline) != 0u &&
+                   firstPipeline != 0u,
+               "graphics device records pipeline shader dependencies");
+        /* Destroying a referenced shader is intentionally a no-op in the void
+         * ABI.  Creating another pipeline proves that the original handle stayed
+         * live instead of becoming a dangling pointer. */
+        resourceDevice->destroyHandle(resourceDevice, shader);
+        LaiueGraphicsHandle secondPipeline = 0u;
+        Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
+                                              &secondPipeline) != 0u &&
+                   secondPipeline != 0u,
+               "referenced shader remains live until all pipelines are gone");
+        resourceDevice->destroyHandle(resourceDevice, firstPipeline);
+        resourceDevice->destroyHandle(resourceDevice, secondPipeline);
+        resourceDevice->destroyHandle(resourceDevice, shader);
 
-    LaiueGraphicsTextureDescV1 invalidTextureDescription = {
-        sizeof(invalidTextureDescription), 0u, {4u, 4u, 1u}, 0u, 0u};
-    LaiueGraphicsHandle invalidTexture = UINT64_C(1);
-    Expect(resourceDevice->createTexture(resourceDevice, &invalidTextureDescription,
-                                         &invalidTexture) == 0u && invalidTexture == 0u,
-           "invalid texture mip count is rejected and output is cleared");
-    LaiueGraphicsTextureDescV1 unsupportedTextureDescription = {
-        sizeof(unsupportedTextureDescription), UINT32_C(99), {4u, 4u, 1u}, 1u, 0u};
-    LaiueGraphicsHandle unsupportedTexture = UINT64_C(1);
-    Expect(resourceDevice->createTexture(resourceDevice, &unsupportedTextureDescription,
-                                         &unsupportedTexture) == 0u && unsupportedTexture == 0u,
-           "unsupported texture format is rejected before handle publication");
-    LaiueGraphicsTextureDescV1 textureDescription = {
-        sizeof(textureDescription), 0u, {4u, 4u, 1u}, 1u, 0u};
-    LaiueGraphicsHandle texture = 0u;
-    Expect(resourceDevice->createTexture(resourceDevice, &textureDescription, &texture) != 0u &&
-               texture != 0u,
-           "graphics device stores texture descriptor state");
-    uint8_t texturePixels[4u * 4u * 4u] = {0};
-    LaiueGraphicsTextureUploadV1 textureUpload = {
-        sizeof(textureUpload), texture, texturePixels, sizeof(texturePixels), 0u, 0u};
-    Expect(resourceDevice->uploadTexture != NULL &&
-               resourceDevice->uploadTexture(resourceDevice, &textureUpload) != 0u,
-           "graphics device uploads texture pixels to the backend image");
-    LaiueGraphicsSamplerDescV1 samplerDescription = {
-        sizeof(samplerDescription), LAIUE_GRAPHICS_FILTER_LINEAR,
-        LAIUE_GRAPHICS_FILTER_LINEAR, LAIUE_GRAPHICS_ADDRESS_REPEAT,
-        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_BORDER};
-    LaiueGraphicsHandle sampler = 0u;
-    Expect(resourceDevice->createSampler(resourceDevice, &samplerDescription, &sampler) != 0u &&
-               sampler != 0u,
-           "graphics device stores sampler descriptor state");
-    LaiueGraphicsBufferDescV1 boundVertexDescription = {
-        sizeof(boundVertexDescription), LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
-        3u * sizeof(LaiueGraphicsVertexV2)};
-    LaiueGraphicsHandle boundVertexBuffer = 0u;
-    static const LaiueGraphicsVertexV2 boundVertices[3] = {
-        {{-0.75f, -0.75f, 0.0f}, {0.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
-        {{ 0.75f, -0.75f, 0.0f}, {1.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
-        {{ 0.00f,  0.75f, 0.0f}, {0.5f, 1.0f}, UINT32_C(0xFFFFFFFF)},
-    };
-    LaiueGraphicsBufferUploadV1 boundVertexUpload = {
-        sizeof(boundVertexUpload), 0u, 0u, boundVertices, sizeof(boundVertices)};
-    Expect(resourceDevice->createBuffer(resourceDevice, &boundVertexDescription,
-                                         &boundVertexBuffer) != 0u &&
-               boundVertexBuffer != 0u,
-           "graphics device creates a generic vertex buffer for resource binding");
-    boundVertexUpload.buffer = boundVertexBuffer;
-    Expect(resourceDevice->uploadBuffer(resourceDevice, &boundVertexUpload) != 0u,
-           "graphics device uploads the generic vertex buffer for resource binding");
-    Expect(resourceDevice->beginFrame(resourceDevice, 16u, 16u) != 0u,
-           "graphics device begins a resource-binding frame");
-    LaiueGraphicsDrawItemV2 boundItem = {
-        .structSize = sizeof(boundItem),
-        .pipeline = 0u,
-        .vertexBuffer = boundVertexBuffer,
-        .indexBuffer = 0u,
-        .texture = texture,
-        .sampler = sampler,
-    };
-    Expect(resourceDevice->submit(resourceDevice, &boundItem, 1u) != 0u,
-           "graphics device validates texture and sampler bindings");
-    Expect(resourceDevice->endFrame(resourceDevice) != 0u,
-           "graphics device ends a resource-binding frame");
-    resourceDevice->destroyHandle(resourceDevice, boundVertexBuffer);
-    resourceDevice->destroyHandle(resourceDevice, texture);
-    resourceDevice->destroyHandle(resourceDevice, sampler);
-    fallbackDeviceV2->destroyDevice(resourceDevice);
+        LaiueGraphicsTextureDescV1 invalidTextureDescription = {
+            sizeof(invalidTextureDescription), 0u, {4u, 4u, 1u}, 0u, 0u};
+        LaiueGraphicsHandle invalidTexture = UINT64_C(1);
+        Expect(resourceDevice->createTexture(resourceDevice, &invalidTextureDescription,
+                                             &invalidTexture) == 0u && invalidTexture == 0u,
+               "invalid texture mip count is rejected and output is cleared");
+        LaiueGraphicsTextureDescV1 unsupportedTextureDescription = {
+            sizeof(unsupportedTextureDescription), UINT32_C(99), {4u, 4u, 1u}, 1u, 0u};
+        LaiueGraphicsHandle unsupportedTexture = UINT64_C(1);
+        Expect(resourceDevice->createTexture(resourceDevice, &unsupportedTextureDescription,
+                                             &unsupportedTexture) == 0u && unsupportedTexture == 0u,
+               "unsupported texture format is rejected before handle publication");
+        LaiueGraphicsTextureDescV1 textureDescription = {
+            sizeof(textureDescription), 0u, {4u, 4u, 1u}, 1u, 0u};
+        LaiueGraphicsHandle texture = 0u;
+        Expect(resourceDevice->createTexture(resourceDevice, &textureDescription, &texture) != 0u &&
+                   texture != 0u,
+               "graphics device stores texture descriptor state");
+        uint8_t texturePixels[4u * 4u * 4u] = {0};
+        LaiueGraphicsTextureUploadV1 textureUpload = {
+            sizeof(textureUpload), texture, texturePixels, sizeof(texturePixels), 0u, 0u};
+        Expect(resourceDevice->uploadTexture != NULL &&
+                   resourceDevice->uploadTexture(resourceDevice, &textureUpload) != 0u,
+               "graphics device uploads texture pixels to the backend image");
+        LaiueGraphicsSamplerDescV1 samplerDescription = {
+            sizeof(samplerDescription), LAIUE_GRAPHICS_FILTER_LINEAR,
+            LAIUE_GRAPHICS_FILTER_LINEAR, LAIUE_GRAPHICS_ADDRESS_REPEAT,
+            LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_BORDER};
+        LaiueGraphicsHandle sampler = 0u;
+        Expect(resourceDevice->createSampler(resourceDevice, &samplerDescription, &sampler) != 0u &&
+                   sampler != 0u,
+               "graphics device stores sampler descriptor state");
+        LaiueGraphicsBufferDescV1 boundVertexDescription = {
+            sizeof(boundVertexDescription), LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+            3u * sizeof(LaiueGraphicsVertexV2)};
+        LaiueGraphicsHandle boundVertexBuffer = 0u;
+        static const LaiueGraphicsVertexV2 boundVertices[3] = {
+            {{-0.75f, -0.75f, 0.0f}, {0.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+            {{ 0.75f, -0.75f, 0.0f}, {1.0f, 0.0f}, UINT32_C(0xFFFFFFFF)},
+            {{ 0.00f,  0.75f, 0.0f}, {0.5f, 1.0f}, UINT32_C(0xFFFFFFFF)},
+        };
+        LaiueGraphicsBufferUploadV1 boundVertexUpload = {
+            sizeof(boundVertexUpload), 0u, 0u, boundVertices, sizeof(boundVertices)};
+        Expect(resourceDevice->createBuffer(resourceDevice, &boundVertexDescription,
+                                             &boundVertexBuffer) != 0u &&
+                   boundVertexBuffer != 0u,
+               "graphics device creates a generic vertex buffer for resource binding");
+        boundVertexUpload.buffer = boundVertexBuffer;
+        Expect(resourceDevice->uploadBuffer(resourceDevice, &boundVertexUpload) != 0u,
+               "graphics device uploads the generic vertex buffer for resource binding");
+        Expect(resourceDevice->beginFrame(resourceDevice, 16u, 16u) != 0u,
+               "graphics device begins a resource-binding frame");
+        LaiueGraphicsDrawItemV2 boundItem = {
+            .structSize = sizeof(boundItem),
+            .pipeline = 0u,
+            .vertexBuffer = boundVertexBuffer,
+            .indexBuffer = 0u,
+            .texture = texture,
+            .sampler = sampler,
+        };
+        Expect(resourceDevice->submit(resourceDevice, &boundItem, 1u) != 0u,
+               "graphics device validates texture and sampler bindings");
+        Expect(resourceDevice->endFrame(resourceDevice) != 0u,
+               "graphics device ends a resource-binding frame");
+        resourceDevice->destroyHandle(resourceDevice, boundVertexBuffer);
+        resourceDevice->destroyHandle(resourceDevice, texture);
+        resourceDevice->destroyHandle(resourceDevice, sampler);
+        fallbackDeviceV2->destroyDevice(resourceDevice);
+    }
 
     LaiueModuleHost *secondRenderHost = LaiueModuleHostCreate(&config, &diagnostic);
     Expect(secondRenderHost != NULL, "second concurrent graphics host creates");
