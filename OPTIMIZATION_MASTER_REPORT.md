@@ -104,7 +104,7 @@ A/B-цифры сняты агентами в Windows x64 Release на MSVC 19.5
 - Windows x64, Visual Studio 2026 / MSVC 19.51: Release и Debug сборки; архитектурные границы OK (173 файла).
 - Release CTest **71/71**, Debug CTest **71/71**.
 - World, D3D12 renderer submit, audio R2_14 и catalog R2_16 benchmark targets собраны; финальные smoke-запуски world и catalog завершились с кодом 0 и ненулевыми стабильными checksums.
-- Полный GitHub CI будет проверен после push.
+- GitHub Actions build для `87a0b6a` завершился успешно: [run 36278377122](https://github.com/landiunload/laiue/actions/runs/36278377122).
 
 ## Раунд 6: DeepSeek V4.1 Flash, 2026-09-27
 
@@ -127,4 +127,4 @@ A/B-цифры сняты агентами в Windows x64 Release на MSVC 19.5
 - Visual Studio 2026 / MSVC, Windows x64, Release и Debug build прошли; архитектурные границы OK (173 файла).
 - Полный Release CTest **71/71**, Debug CTest **71/71**. Первый Release CTest вне Developer Shell не нашёл `cl.exe` для `laiue.install.consumer`; повтор внутри Developer Shell прошёл полностью.
 - World read, compound BVH, audio mixer и engine benchmark targets собраны и запущены. Engine benchmark теперь подтверждает непустую сцену: 104,238 квадов; checksums world, BVH и audio совпали с A/B-результатами.
-- `git diff --check` прошёл. GitHub CI будет проверен после push.
+- `git diff --check` прошёл. GitHub Actions build для интеграционного коммита `2e4c6fe` завершился успешно: [run 36280745569](https://github.com/landiunload/laiue/actions/runs/36280745569).
