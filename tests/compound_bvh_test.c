@@ -641,6 +641,65 @@ static void TestOriginalIndexOrdering(void)
     }
 }
 
+// Дифференциальная регрессия для границ сравнения перекрытия: и коробки, и
+// запросы берут концы из одной решётки, поэтому грани совпадают точно.
+// Векторная ветка обязана вернуть тот же набор и порядок, что скалярный
+// BoxTouches (brute force) — включая отрицательные координаты, вырожденные
+// коробки, нулевую толщину запроса и касание без перекрытия.
+static void TestBoundaryTieDifferential(void)
+{
+    static const double lattice[4] = {-4.0, -1.0, 1.0, 4.0};
+    const uint32_t count = 16u;
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        double minimum[3];
+        double maximum[3];
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            uint32_t low = (index * 5u + (uint32_t)axis * 3u) % 3u;
+            minimum[axis] = lattice[low];
+            maximum[axis] = lattice[low + 1u];
+        }
+        // Половина коробок вырождена по x, каждая четвёртая — ещё и по z.
+        if ((index & 1u) == 0u) minimum[0] = maximum[0];
+        if ((index & 2u) == 0u) minimum[2] = maximum[2];
+        StoreBoundEntry(compactBounds + 6u * index, minimum, maximum);
+    }
+
+    uint32_t root = UINT32_MAX;
+    Expect(RigidCompoundBvhBuild(compactBounds, 6u * sizeof(double), count, nodesA,
+                                 2u * count - 1u, workspaceA, &root),
+           "boundary tie build");
+
+    uint32_t trials = 0u;
+    for (uint32_t a = 0u; a < 4u; ++a)
+    for (uint32_t b = 0u; b < 4u; ++b)
+    for (uint32_t c = 0u; c < 4u; ++c)
+    for (uint32_t d = 0u; d < 4u; ++d)
+    for (uint32_t e = 0u; e < 4u; ++e)
+    for (uint32_t f = 0u; f < 4u; ++f)
+    {
+        double minimum[3] = {lattice[a], lattice[b], lattice[c]};
+        double maximum[3] = {lattice[d], lattice[e], lattice[f]};
+        if (minimum[0] > maximum[0] || minimum[1] > maximum[1] ||
+            minimum[2] > maximum[2])
+        {
+            continue;
+        }
+        uint32_t expected = BruteForce(compactBounds, count, minimum, maximum, bruteOutput);
+        uint32_t actual = 0u;
+        Expect(RigidCompoundBvhQuery(nodesA, root, minimum, maximum, queryOutput, count,
+                                     &actual),
+               "boundary tie query");
+        Expect(actual == expected, "boundary tie count matches brute force");
+        Expect(SameIndices(queryOutput, bruteOutput, actual),
+               "boundary tie indices match brute force");
+        Expect(Ascending(queryOutput, actual), "boundary tie indices ascend");
+        ++trials;
+    }
+    Expect(trials >= 1000u, "boundary tie sweep covered the lattice");
+}
+
 LAIUE_TEST_ENTRY(CompoundBvhTestEntryPoint)
 {
     TestSingleBox();
@@ -653,6 +712,7 @@ LAIUE_TEST_ENTRY(CompoundBvhTestEntryPoint)
     TestRandomAgainstBruteForce();
     TestCapacityAndCanaries();
     TestOriginalIndexOrdering();
+    TestBoundaryTieDifferential();
     LaiueTestRuntimeWrite("compound-bvh: ok\n");
     LAIUE_TEST_SUCCESS();
 }

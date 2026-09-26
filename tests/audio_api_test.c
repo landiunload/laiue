@@ -359,6 +359,110 @@ static void CheckGeneralRuns(void)
     PlatformFree(frames);
 }
 
+// === Быстрый путь мастера при одном голосе ===
+//
+// Общая громкость 1,0 с одним голосом делает проход громкости и ограничения
+// тождеством, и микшер его пропускает. Тождество проверяется прямо: клип,
+// голос и мастер подобраны так, что каждая выборка вычисляется здесь же
+// в точности — шаг 1,0 (частая ветвь), панорама до упора (усиление ровно
+// 1,0 или 0,0), громкость голоса 1,0 и общая громкость 1,0. Тогда выход
+// равен sample * 2^-15, ограничение ничего не усекает, а пропущенный проход
+// обязан вернуть те же биты. Клип короче буфера и не зациклен, поэтому
+// нулевой хвост проверяется вместе с сигналом: ошибочный пропуск прохода
+// оставил бы там ненулевые значения или испортил бы сигнал.
+static void CheckSingleVoiceMasterFastPath(void)
+{
+    static int16_t monoSamples[GENERAL_FRAMES];
+    static int16_t stereoSamples[GENERAL_FRAMES * 2u];
+    FillReferenceSamples(monoSamples, GENERAL_FRAMES, 66u);
+    FillReferenceSamples(stereoSamples, GENERAL_FRAMES * 2u, 67u);
+
+    float *frames = PlatformAllocate(GENERAL_BUFFER * 2u * sizeof(float), false);
+    Expect(frames != NULL, "single-voice master buffer could not be allocated");
+
+    AudioDeviceConfiguration configuration = {
+        .backend = AUDIO_BACKEND_OFFSCREEN,
+        .sampleRate = TEST_SAMPLE_RATE,
+        .frameCountHint = GENERAL_BUFFER,
+        .masterVolume = 1.0f,
+    };
+    AudioDevice *device = NULL;
+    Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+           "the unity-master device could not be created");
+
+    // Первый буфер: моно-клип в левый канал (усиление 1,0 и 0,0).
+    AudioClip *mono = MakeExactClip(device, monoSamples, GENERAL_FRAMES, 1u, TEST_SAMPLE_RATE);
+    AudioVoiceParameters leftOnly = {
+        .volume = 1.0f, .pan = -1.0f, .speed = 1.0f, .looping = false,
+    };
+    Expect(AudioVoicePlay(device, mono, &leftOnly) != AUDIO_VOICE_NONE,
+           "the unity-master voice could not be started");
+
+    bool identical = true;
+    for (uint32_t buffer = 0u; buffer < GENERAL_BUFFERS; ++buffer)
+    {
+        Expect(AudioDeviceRenderFrames(device, frames, GENERAL_BUFFER),
+               "the unity-master render must succeed");
+        for (uint32_t index = 0u; index < GENERAL_BUFFER; ++index)
+        {
+            uint32_t output = buffer * GENERAL_BUFFER + index;
+            float expectedLeft = output < GENERAL_FRAMES
+                                     ? SampleToFloat(monoSamples[output])
+                                     : 0.0f;
+            identical = identical && SameBits(frames[index * 2u], expectedLeft)
+                        && SameBits(frames[index * 2u + 1u], 0.0f);
+        }
+    }
+    Expect(identical, "voice samples must equal the clip without the master pass");
+    AudioClipDestroy(mono);
+
+    // Второй буфер: стерео-клип в правый канал без повтора, затем живая
+    // посылка громкости голоса между кадрами — устройство обязано остаться
+    // в быстром пути и не исказить ни сигнал, ни мастер.
+    AudioClip *stereo = MakeExactClip(device, stereoSamples, GENERAL_FRAMES, 2u, TEST_SAMPLE_RATE);
+    AudioVoiceParameters rightOnly = {
+        .volume = 1.0f, .pan = 1.0f, .speed = 1.0f, .looping = false,
+    };
+    AudioVoice right = AudioVoicePlay(device, stereo, &rightOnly);
+    Expect(right != AUDIO_VOICE_NONE, "the stereo unity-master voice could not be started");
+
+    bool stereoIdentical = true;
+    for (uint32_t index = 0u; index < GENERAL_FRAMES; ++index)
+    {
+        Expect(AudioDeviceRenderFrames(device, frames, 1u),
+               "the single-frame render must succeed");
+        float expectedRight = SampleToFloat(stereoSamples[index * 2u + 1u]);
+        stereoIdentical = stereoIdentical && SameBits(frames[0], 0.0f)
+                          && SameBits(frames[1], expectedRight);
+    }
+    Expect(stereoIdentical, "a panned unity-master voice must reach only its channel");
+    AudioClipDestroy(stereo);
+
+    // Третий случай: два голоса того же клипа перегружают сумму, поэтому
+    // пропуск прохода недопустим. Каждый голос даёт почти +1, сумма уходит
+    // выше единицы, и микшер обязан её ограничить; иначе здесь будет больше
+    // единицы. Здесь же проверяется, что пропуск не сработал по ошибке.
+    static int16_t loudSamples[8];
+    for (uint32_t index = 0u; index < 8u; ++index) loudSamples[index] = 32767;
+    AudioClip *loud = MakeExactClip(device, loudSamples, 8u, 1u, TEST_SAMPLE_RATE);
+    AudioVoiceParameters centre = {
+        .volume = 1.0f, .pan = 0.0f, .speed = 1.0f, .looping = true,
+    };
+    Expect(AudioVoicePlay(device, loud, &centre) != AUDIO_VOICE_NONE, "loud voice one");
+    Expect(AudioVoicePlay(device, loud, &centre) != AUDIO_VOICE_NONE, "loud voice two");
+    Expect(AudioDeviceRenderFrames(device, frames, 8u), "overload render must succeed");
+    bool bounded = true;
+    for (uint32_t sample = 0u; sample < 8u * 2u; ++sample)
+    {
+        bounded = bounded && frames[sample] <= 1.0f && frames[sample] >= -1.0f;
+    }
+    Expect(bounded, "two overloaded voices must be clamped by the master pass");
+    AudioClipDestroy(loud);
+
+    AudioDeviceDestroy(device);
+    PlatformFree(frames);
+}
+
 // === Гонка производителя и потока вывода ===
 //
 // Поток вывода гонит RenderFrames, пока игровой поток заказывает, меняет и
@@ -636,6 +740,9 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
     // === Побитовая точность микса ===
     CheckExactMixes();
     CheckGeneralRuns();
+
+    // === Быстрый путь мастера при одном голосе ===
+    CheckSingleVoiceMasterFastPath();
 
     // === Гонка производителя и потока вывода ===
     CheckConcurrentMixer();

@@ -6,6 +6,18 @@
 #include <limits.h>
 #include <string.h>
 
+/* Тело чтения обязано инлайниться в WorldGetBlock: иначе каждый точечный
+ * вызов платит лишний call/ret, а именно WorldGetBlock — самый горячий путь
+ * физики и рейкаста. Это тот же эффект, из-за которого ранее отклоняли
+ * правку WorldGetBlockState. */
+#if defined(_MSC_VER)
+#define WORLD_READ_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define WORLD_READ_INLINE inline __attribute__((always_inline))
+#else
+#define WORLD_READ_INLINE inline
+#endif
+
 #define InfiniteCoordInit WorldNumericInit
 #define InfiniteCoordDestroy WorldNumericDestroy
 #define InfiniteCoordTryCopyAddInt64 WorldNumericTryCopyAddInt64
@@ -600,21 +612,6 @@ static bool ChunkSetDelta(Chunk* chunk, uint32_t localIndex, BlockType block)
     return true;
 }
 
-static bool ChunkRemoveDelta(Chunk* chunk, uint32_t localIndex)
-{
-    uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
-    if (position >= chunk->deltaCount
-        || DeltaLocalIndex(chunk->deltas[position]) != localIndex)
-    {
-        return false;
-    }
-    /* Сдвиг хвоста влево — такое же копирование, как при вставке, и та же
-     * горячая точка одиночных правок. */
-    ChunkShiftLeft(chunk->deltas, position, chunk->deltaCount);
-    --chunk->deltaCount;
-    return true;
-}
-
 static BlockType WorldBaseBlock(
     const World* world, int64_t x, int64_t y, int64_t z)
 {
@@ -818,8 +815,8 @@ void WorldFormatAbsoluteBlockCoordinate(World* world,
     PlatformRwLockReleaseShared(&world->tableLock);
 }
 
-bool WorldGetBlockState(World* world, int64_t x, int64_t y, int64_t z,
-    BlockType* outBlock, bool* outExplicit)
+static WORLD_READ_INLINE bool WorldGetBlockStateImpl(World* world, int64_t x,
+    int64_t y, int64_t z, BlockType* outBlock, bool* outExplicit)
 {
     if (world == NULL || outBlock == NULL || outExplicit == NULL)
         return false;
@@ -853,13 +850,38 @@ bool WorldGetBlockState(World* world, int64_t x, int64_t y, int64_t z,
     return true;
 }
 
+bool WorldGetBlockState(World* world, int64_t x, int64_t y, int64_t z,
+    BlockType* outBlock, bool* outExplicit)
+{
+    return WorldGetBlockStateImpl(world, x, y, z, outBlock, outExplicit);
+}
+
 BlockType WorldGetBlock(World* world, int64_t x, int64_t y, int64_t z)
 {
+    /* Мир без правок отдаётся провайдеру прямо здесь: это первый и самый
+     * частый путь WorldGetBlockState, но без вызова. У миров с правками
+     * остаётся общий медленный путь через статическую реализацию. */
+    if (world != NULL
+        && PlatformAtomicLoadU32Acquire(&world->editedChunkCount) == 0U)
+    {
+        return WorldBaseBlock(world, x, y, z);
+    }
     BlockType block = BLOCK_AIR;
     bool explicitEdit = false;
-    (void)WorldGetBlockState(world, x, y, z, &block, &explicitEdit);
+    (void)WorldGetBlockStateImpl(world, x, y, z, &block, &explicitEdit);
     return block;
 }
+
+/* Пути записи ищут позицию дельты один раз и переиспользуют её для записи или
+ * удаления. Это отдельные функции, а не общий вид с ChunkGetDelta: те
+ * обслуживают путь чтения WorldGetBlockState и остаются без изменений.
+ * Определения стоят в конце файла, чтобы не сдвигать горячий код чтения. */
+static bool ChunkFindDelta(
+    const Chunk* chunk, uint32_t localIndex, uint32_t* outPosition,
+    BlockType* outBlock);
+static bool ChunkSetDeltaAt(Chunk* chunk, uint32_t position, bool found,
+    uint32_t localIndex, BlockType block);
+static void ChunkRemoveDeltaAt(Chunk* chunk, uint32_t position);
 
 static bool WorldTrySetBlockInternal(World* world,
     int64_t x, int64_t y, int64_t z, BlockType block, bool preserveBase)
@@ -891,9 +913,11 @@ static bool WorldTrySetBlockInternal(World* world,
     uint64_t hash = HashLocalChunkCoordinate(world, coordinate);
     Chunk** entry = WorldFindEntryHashed(world, coordinate, hash);
     BlockType current = base;
+    uint32_t deltaPosition = 0U;
+    bool deltaFound = false;
     if (entry != NULL)
     {
-        (void)ChunkGetDelta(*entry, localIndex, &current);
+        deltaFound = ChunkFindDelta(*entry, localIndex, &deltaPosition, &current);
     }
     if (current == block)
     {
@@ -904,15 +928,20 @@ static bool WorldTrySetBlockInternal(World* world,
     bool succeeded;
     if (block == base && !preserveBase)
     {
-        succeeded = entry != NULL && ChunkRemoveDelta(*entry, localIndex);
-        if (succeeded && (*entry)->deltaCount == 0U)
+        succeeded = deltaFound;
+        if (succeeded)
         {
-            WorldEraseChunkAt(world, (uint32_t)(entry - world->chunks));
+            ChunkRemoveDeltaAt(*entry, deltaPosition);
+            if ((*entry)->deltaCount == 0U)
+            {
+                WorldEraseChunkAt(world, (uint32_t)(entry - world->chunks));
+            }
         }
     }
     else if (entry != NULL)
     {
-        succeeded = ChunkSetDelta(*entry, localIndex, block);
+        succeeded = ChunkSetDeltaAt(
+            *entry, deltaPosition, deltaFound, localIndex, block);
     }
     else
     {
@@ -1099,29 +1128,6 @@ static void WorldBatchCleanup(World* world, WorldBatchChunk* chunks, uint32_t co
     WorldFreeMemory(&world->allocator, chunks);
 }
 
-static bool WorldBatchSetValue(WorldBatchChunk* batch,
-    uint32_t localIndex, BlockType base, BlockType replacement)
-{
-    Chunk staged = {
-        .deltaCount = batch->stagedCount,
-        .deltaCapacity = batch->stagedCapacity,
-        .deltas = batch->stagedDeltas,
-        .allocator = batch->allocator,
-    };
-    bool succeeded = replacement == base
-        ? (ChunkRemoveDelta(&staged, localIndex), true)
-        : ChunkSetDelta(&staged, localIndex, replacement);
-    if (!succeeded)
-    {
-        return false;
-    }
-    batch->stagedDeltas = staged.deltas;
-    batch->stagedCount = staged.deltaCount;
-    batch->stagedCapacity = staged.deltaCapacity;
-    ++batch->changedCount;
-    return true;
-}
-
 bool WorldApplyBlockBatch(World* world,
     const WorldBlockMutation* mutations, uint32_t count)
 {
@@ -1295,8 +1301,10 @@ bool WorldApplyBlockBatch(World* world,
         };
         BlockType base = WorldBaseBlock(world,
             mutation->block[0], mutation->block[1], mutation->block[2]);
+        uint32_t deltaPosition = 0U;
         BlockType current = base;
-        (void)ChunkGetDelta(&stagedView, localIndex, &current);
+        bool deltaFound = ChunkFindDelta(
+            &stagedView, localIndex, &deltaPosition, &current);
         if (current != mutation->expected)
         {
             succeeded = false;
@@ -1306,12 +1314,29 @@ bool WorldApplyBlockBatch(World* world,
         {
             continue;
         }
-        succeeded = WorldBatchSetValue(
-            batch, localIndex, base, mutation->replacement);
-        if (succeeded)
+        if (mutation->replacement == base)
         {
-            ++totalChanged;
+            /* current == base здесь невозможно: тогда сработал бы continue
+             * выше. Значит дельта есть, и её позиция уже найдена. */
+            if (deltaFound)
+            {
+                ChunkRemoveDeltaAt(&stagedView, deltaPosition);
+            }
         }
+        else
+        {
+            succeeded = ChunkSetDeltaAt(&stagedView, deltaPosition, deltaFound,
+                localIndex, mutation->replacement);
+            if (!succeeded)
+            {
+                break;
+            }
+        }
+        batch->stagedDeltas = stagedView.deltas;
+        batch->stagedCount = stagedView.deltaCount;
+        batch->stagedCapacity = stagedView.deltaCapacity;
+        ++batch->changedCount;
+        ++totalChanged;
     }
 
     uint32_t newChunkCount = 0U;
@@ -1892,4 +1917,67 @@ WorldRegionContents WorldFillRegion(World* world,
         return WORLD_REGION_ALL_AIR;
     }
     return ClassifyRegion(outBlocks, cellCount);
+}
+
+/* Определения помощников пути записи: объявлены выше, стоят в конце файла,
+ * чтобы их добавление не сдвигало горячий код чтения (WorldGetBlockState)
+ * выше по объекту. */
+
+static bool ChunkFindDelta(
+    const Chunk* chunk, uint32_t localIndex, uint32_t* outPosition,
+    BlockType* outBlock)
+{
+    uint32_t position = ChunkDeltaLowerBound(chunk, localIndex);
+    *outPosition = position;
+    if (position >= chunk->deltaCount
+        || DeltaLocalIndex(chunk->deltas[position]) != localIndex)
+    {
+        return false;
+    }
+    *outBlock = DeltaBlock(chunk->deltas[position]);
+    return true;
+}
+
+/* Запись в известную позицию: found — дельта на ней уже лежит (тогда это
+ * перезапись без сдвига), иначе позиция — место вставки. */
+static bool ChunkSetDeltaAt(Chunk* chunk, uint32_t position, bool found,
+    uint32_t localIndex, BlockType block)
+{
+    if (found)
+    {
+        chunk->deltas[position] = PackDelta(localIndex, block);
+        return true;
+    }
+    if (chunk->deltaCount == chunk->deltaCapacity)
+    {
+        uint32_t newCapacity = chunk->deltaCapacity < 4U
+            ? 4U : chunk->deltaCapacity * 2U;
+        if (newCapacity < chunk->deltaCapacity)
+        {
+            return false;
+        }
+        DeltaEntry* expanded = chunk->deltas == NULL
+            ? (DeltaEntry *)WorldAllocateMemory(&chunk->allocator,
+                (size_t)newCapacity * sizeof(*expanded), false)
+            : (DeltaEntry *)WorldReallocateMemory(&chunk->allocator, chunk->deltas,
+                (size_t)newCapacity * sizeof(*expanded), false);
+        if (expanded == NULL)
+        {
+            return false;
+        }
+        chunk->deltas = expanded;
+        chunk->deltaCapacity = newCapacity;
+    }
+    ChunkShiftRight(chunk->deltas, position, chunk->deltaCount);
+    chunk->deltas[position] = PackDelta(localIndex, block);
+    ++chunk->deltaCount;
+    return true;
+}
+
+/* Удаление по известной позиции: вызывающий уже убедился через
+ * ChunkFindDelta, что дельта там есть. */
+static void ChunkRemoveDeltaAt(Chunk* chunk, uint32_t position)
+{
+    ChunkShiftLeft(chunk->deltas, position, chunk->deltaCount);
+    --chunk->deltaCount;
 }

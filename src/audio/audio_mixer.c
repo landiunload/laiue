@@ -76,6 +76,20 @@ static float ClampFloat(float value, float minimum, float maximum)
     return value;
 }
 
+// Общая громкость и ограничение диапазона по всему буферу. Тело совпадает с
+// прежним встроенным циклом RenderFrames: компилятор по-прежнему сам его
+// векторизует. Отдельная функция нужна только чтобы вызывать проход по
+// условию — когда он заведомо ничего не меняет, его можно пропустить.
+static void ApplyMasterGain(float *frames, uint32_t sampleCount, float master)
+{
+    // Мягкое ограничение отсутствует намеренно: сумма голосов обрезается по
+    // диапазону, а решение о запасе громкости принадлежит приложению.
+    for (uint32_t index = 0; index < sampleCount; ++index)
+    {
+        frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
+    }
+}
+
 struct AudioClip
 {
     int16_t *samples;
@@ -645,7 +659,7 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     }
 
     uint32_t active = 0u;
-    bool mixedVoice = false;
+    uint32_t mixedVoices = 0u;
     // Звучащие голоса лежат ниже voiceScanLimit: все они когда-то прошли
     // COMMAND_START на этом же потоке. Пустые хвостовые слоты не обходятся.
     for (uint32_t index = 0; index < device->voiceScanLimit; ++index)
@@ -654,7 +668,7 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
         if (slot->clip == NULL) continue;
         MixVoice(slot, frames, frameCount);
-        mixedVoice = true;
+        ++mixedVoices;
         if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE) ++active;
     }
     PlatformAtomicStoreU32Release(&device->activeVoices, active);
@@ -662,17 +676,16 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     // Разобранные команды были, но ни один голос не дожил до микса — буфер
     // весь нулевой, и конечная громкость с ограничением вернула бы те же нули.
     uint32_t sampleCount = frameCount * AUDIO_MIX_CHANNELS;
-    if (mixedVoice || !finiteMaster)
-    {
-        float master = BitsToFloat(masterBits);
-        for (uint32_t index = 0; index < sampleCount; ++index)
-        {
-            // Мягкое ограничение отсутствует намеренно: сумма голосов
-            // обрезается по диапазону, а решение о запасе громкости
-            // принадлежит приложению, как и остальная политика микса.
-            frames[index] = ClampFloat(frames[index] * master, -1.0f, 1.0f);
-        }
-    }
+    // В буфер миксовался ровно один голос, а общая громкость равна ровно 1,0.
+    // Выборки клипа лежат в [-1,1], усиление голоса тоже (громкость и панорама
+    // ограничены единицей), поэтому итог уже в диапазоне, а умножение на 1,0
+    // и ограничение — тождество. Полный проход по буферу ничего бы не изменил,
+    // и его можно пропустить, не меняя ни одного бита. При двух и более
+    // голосах сумма может выйти за диапазон, поэтому там проход обязателен;
+    // нефинитная громкость тоже сохраняет прежний путь (NaN остаётся NaN).
+    bool unityMaster = masterBits == 0x3f800000u;
+    if ((mixedVoices > 0u || !finiteMaster) && (!unityMaster || mixedVoices > 1u))
+        ApplyMasterGain(frames, sampleCount, BitsToFloat(masterBits));
     PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
 }
 

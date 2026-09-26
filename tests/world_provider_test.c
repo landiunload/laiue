@@ -1284,6 +1284,82 @@ static void TestBatchLimitsAndDuplicates(void)
 }
 
 
+// === Переиспользование позиции дельты при записи ===
+//
+// Путь правки ищет позицию дельты один раз и переиспользует её для вставки,
+// перезаписи и удаления. Проверяются все три случая в одном чанке: вставка
+// между существующими дельтами (позиция найдена, дельты нет), перезапись
+// существующей дельты без сдвига и удаление из середины. Те же операции
+// выполняются пакетом, где позиция живёт в промежуточном буфере.
+
+static void TestDeltaPositionReuse(void)
+{
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "delta-position world was not created");
+
+    // x = y = 0, поэтому локальный индекс совпадает с z: 1, 5, 9, 13, 17, 21.
+    ProviderExpect(WorldTrySetBlock(world, 0, 0, 1, (BlockType)11U) &&
+                       WorldTrySetBlock(world, 0, 0, 9, (BlockType)13U) &&
+                       WorldTrySetBlock(world, 0, 0, 17, (BlockType)15U),
+                   "delta-position setup failed");
+
+    // Вставка в середину: дельты на позиции нет, сдвиг хвоста.
+    ProviderExpect(WorldTrySetBlock(world, 0, 0, 5, (BlockType)21U) &&
+                       WorldGetBlock(world, 0, 0, 1) == (BlockType)11U &&
+                       WorldGetBlock(world, 0, 0, 5) == (BlockType)21U &&
+                       WorldGetBlock(world, 0, 0, 9) == (BlockType)13U &&
+                       WorldGetBlock(world, 0, 0, 17) == (BlockType)15U,
+                   "middle insert produced wrong values");
+
+    // Перезапись существующей дельты: позиция та же, сдвига быть не должно.
+    ProviderExpect(WorldTrySetBlock(world, 0, 0, 9, (BlockType)41U) &&
+                       WorldGetBlock(world, 0, 0, 9) == (BlockType)41U,
+                   "in-place delta update failed");
+
+    // Ещё одна вставка в середину, затем удаление из середины.
+    ProviderExpect(WorldTrySetBlock(world, 0, 0, 13, (BlockType)23U) &&
+                       WorldGetBlock(world, 0, 0, 13) == (BlockType)23U,
+                   "second middle insert failed");
+    ProviderExpect(WorldTrySetBlock(world, 0, 0, 5, BLOCK_AIR) &&
+                       WorldGetBlock(world, 0, 0, 5) == BLOCK_AIR,
+                   "middle delta removal failed");
+    ProviderExpect(WorldGetBlock(world, 0, 0, 1) == (BlockType)11U &&
+                       WorldGetBlock(world, 0, 0, 9) == (BlockType)41U &&
+                       WorldGetBlock(world, 0, 0, 13) == (BlockType)23U &&
+                       WorldGetBlock(world, 0, 0, 17) == (BlockType)15U,
+                   "surviving deltas changed after middle removal");
+
+    // Пакет в одном чанке: перезапись (1), вставка в середину (15) и в
+    // конец (21) — три разные позиции в промежуточном буфере.
+    WorldBlockMutation batch[3] = {
+        { .block = {0, 0, 1}, .expected = (BlockType)11U, .replacement = (BlockType)51U },
+        { .block = {0, 0, 15}, .expected = BLOCK_AIR, .replacement = (BlockType)53U },
+        { .block = {0, 0, 21}, .expected = BLOCK_AIR, .replacement = (BlockType)52U },
+    };
+    uint64_t beforeBatch = WorldGetRevision(world);
+    ProviderExpect(WorldApplyBlockBatch(world, batch, 3U) &&
+                       WorldGetRevision(world) == beforeBatch + 3U &&
+                       WorldGetBlock(world, 0, 0, 1) == (BlockType)51U &&
+                       WorldGetBlock(world, 0, 0, 15) == (BlockType)53U &&
+                       WorldGetBlock(world, 0, 0, 21) == (BlockType)52U,
+                   "position-reuse batch produced wrong values");
+
+    // Пакетное удаление из середины и перезапись соседней дельты.
+    WorldBlockMutation revert[2] = {
+        { .block = {0, 0, 9}, .expected = (BlockType)41U, .replacement = BLOCK_AIR },
+        { .block = {0, 0, 13}, .expected = (BlockType)23U, .replacement = (BlockType)61U },
+    };
+    ProviderExpect(WorldApplyBlockBatch(world, revert, 2U) &&
+                       WorldGetBlock(world, 0, 0, 9) == BLOCK_AIR &&
+                       WorldGetBlock(world, 0, 0, 13) == (BlockType)61U &&
+                       WorldGetBlock(world, 0, 0, 1) == (BlockType)51U &&
+                       WorldGetBlock(world, 0, 0, 17) == (BlockType)15U,
+                   "batch middle removal or update failed");
+
+    WorldDestroy(world);
+}
+
+
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
     WorldSetNumericService(LaiueNumericGetStaticServiceV1());
@@ -1298,6 +1374,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestRegionEmptyOverrideFastPath();
     TestRegionNoLocalOverridesFastPath();
     TestEmptyChunkRemovalBackwardShift();
+    TestDeltaPositionReuse();
     TestBatchLimitsAndDuplicates();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();
