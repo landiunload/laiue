@@ -14,6 +14,7 @@
 #include "platform/system.h"
 #include "render/chunk_geometry.h"
 #include "test_runtime.h"
+#include "world/numeric_provider.h"
 #include "world/world.h"
 
 #include <stdbool.h>
@@ -205,6 +206,27 @@ static void Fill(World *world, MesherFill fill)
     }
 }
 
+// FNV-1a по восьми байтам каждого квада: контрольная сумма самой выдачи,
+// а не только её размера. Совпадает у baseline и candidate тогда и только
+// тогда, когда совпали и порядок, и содержимое квадов.
+static uint64_t HashQuads(const ChunkQuad *quads, uint32_t count)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        uint32_t words[2] = {quads[index].positionAndFace, quads[index].extents};
+        for (uint32_t word = 0u; word < 2u; ++word)
+        {
+            for (uint32_t byte = 0u; byte < 4u; ++byte)
+            {
+                hash ^= (words[word] >> (byte * 8u)) & 0xffu;
+                hash *= UINT64_C(1099511628211);
+            }
+        }
+    }
+    return hash;
+}
+
 // Независимый счёт граней чанка: для каждого непустого блока и каждого из
 // шести направлений грань есть ровно тогда, когда сосед пуст. Столько же
 // элементарных граней видит и мешер до greedy-слияния, поэтому это ровно та
@@ -263,6 +285,7 @@ static void RunCase(MesherFill fill)
         LaiueTestRuntimeExit(1);
     }
     uint32_t reported = quadCount;
+    uint64_t reportedHash = quads != NULL ? HashQuads(quads, quadCount) : 0u;
     if (quads != NULL)
     {
         PlatformFree(quads);
@@ -307,6 +330,8 @@ static void RunCase(MesherFill fill)
     WriteUnsigned((uint64_t)faces * sizeof(ChunkQuad));
     WriteText(" best_ms=");
     WriteMilliseconds(best * 1000.0 / (double)MESHER_ITERATIONS);
+    WriteText(" hash=");
+    WriteUnsigned(reportedHash);
     WriteText("\n");
 
     ChunkMesherScratchDestroy(scratch);
@@ -315,6 +340,11 @@ static void RunCase(MesherFill fill)
 
 LAIUE_TEST_ENTRY(MesherBenchmarkEntryPoint)
 {
+    // Мир с бесконечными координатами не публикует правки без числового
+    // сервиса: без него WorldSetBlock молча ничего не сохраняет, и стенд
+    // мерил бы пустой чанк. Тест мешера ставит сервис так же.
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
+
     // Для A/B отдельного наполнения без истории аллокаций предыдущих сцен.
     char selected[64];
     uint32_t selectedLength = PlatformGetEnvironmentUtf8("LAIUE_MESHER_BENCHMARK_FILL", selected,

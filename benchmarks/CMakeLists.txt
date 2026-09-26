@@ -14,9 +14,12 @@ if(TARGET laiue_mesher AND TARGET laiue_audio)
         laiue_benchmark EngineBenchmarkEntryPoint)
 endif()
 
-if(TARGET laiue_mesher)
+if(TARGET laiue_mesher AND TARGET laiue_numeric)
     add_executable(laiue_mesher_benchmark EXCLUDE_FROM_ALL mesher_benchmark.c)
-    target_link_libraries(laiue_mesher_benchmark PRIVATE laiue_mesher laiue_world)
+    target_link_libraries(laiue_mesher_benchmark PRIVATE
+        laiue_mesher
+        laiue_world
+        laiue_numeric)
     target_include_directories(laiue_mesher_benchmark PRIVATE "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(
         laiue_mesher_benchmark MesherBenchmarkEntryPoint)
@@ -92,7 +95,7 @@ laiue_configure_standalone_executable(
     laiue_broadphase_benchmark BroadphaseBenchmarkEntryPoint)
 
 add_executable(laiue_rigid_solver_profile EXCLUDE_FROM_ALL rigid_solver_profile.c)
-target_link_libraries(laiue_rigid_solver_profile PRIVATE laiue_physics)
+target_link_libraries(laiue_rigid_solver_profile PRIVATE laiue_physics laiue_numeric)
 target_include_directories(laiue_rigid_solver_profile PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")
 laiue_configure_standalone_executable(
@@ -203,6 +206,20 @@ if(TARGET laiue_mod)
         laiue_mod_benchmark ModBenchmarkEntryPoint)
 endif()
 
+# Versioned `laiue::bootstrap` module host: service lookup, registry
+# register/unregister and both flat and chained static lifecycle graphs.
+# Static modules keep the harness DLL-free and deterministic.
+if(TARGET laiue_bootstrap)
+    add_executable(laiue_r3_53_module_host_benchmark EXCLUDE_FROM_ALL
+        r3_53_module_host_benchmark.c)
+    target_link_libraries(laiue_r3_53_module_host_benchmark PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_r3_53_module_host_benchmark PRIVATE LAIUE_STATIC=1)
+    target_include_directories(laiue_r3_53_module_host_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    laiue_configure_standalone_executable(
+        laiue_r3_53_module_host_benchmark R3ModuleHostBenchmarkEntry)
+endif()
+
 if(TARGET laiue_render)
     # CPU-времена отправки кадра D3D12 (постановка мешей и инстансов,
     # пул геометрии). GPU-времена не измеряются: время берётся вокруг
@@ -309,6 +326,7 @@ laiue_configure_standalone_executable(
 add_executable(laiue_r2_05_solver_benchmark EXCLUDE_FROM_ALL r2_05_solver_bench.c)
 target_link_libraries(laiue_r2_05_solver_benchmark PRIVATE
     laiue_physics
+    laiue_numeric
     laiue::task)
 target_include_directories(laiue_r2_05_solver_benchmark PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")

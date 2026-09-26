@@ -14,7 +14,9 @@
 //   LAIUE_R2_05_SAMPLES  = число проб               (по умолчанию 7)
 //   LAIUE_R2_05_STEPS    = шагов в пробе            (по умолчанию 8)
 
+#include "physics/numeric_provider.h"
 #include "physics/rigid_body.h"
+#include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "task/task_pool.h"
 #include "test_runtime.h"
@@ -474,6 +476,16 @@ static bool RunScenario(const char *scenario, uint32_t bodyCount, bool parallel,
 
 LAIUE_TEST_ENTRY(R2SolverBenchmarkEntryPoint)
 {
+    // laiue_physics obtains arbitrary-precision arithmetic through the numeric
+    // service table; a bare process that links both DLLs must inject it the same
+    // way tests do, before any body is created.
+    const LaiueNumericServiceV1 *numeric = LaiueNumericGetStaticServiceV1();
+    if (numeric == NULL)
+    {
+        WriteText("r2_05 numeric service unavailable\n");
+        LaiueTestRuntimeExit(1);
+    }
+    PhysicsSetNumericService(numeric);
     const char *scenario = "dense";
     if (EnvironmentEquals("LAIUE_R2_05_SCENARIO", "stack"))
         scenario = "stack";

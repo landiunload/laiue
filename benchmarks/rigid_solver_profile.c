@@ -3,7 +3,9 @@
 // выбрать гипотезу оптимизации по измерению, а не по догадке, и чтобы потом
 // повторить тот же замер на candidate.
 
+#include "physics/numeric_provider.h"
 #include "physics/rigid_body.h"
+#include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -321,6 +323,13 @@ static bool RunDenseProfile(uint32_t bodyCount, bool cached, bool indexed, uint3
 
 LAIUE_TEST_ENTRY(RigidSolverProfileEntryPoint)
 {
+    const LaiueNumericServiceV1 *numeric = LaiueNumericGetStaticServiceV1();
+    if (numeric == NULL)
+    {
+        WriteText("rigid profile numeric service unavailable\n");
+        LaiueTestRuntimeExit(1);
+    }
+    PhysicsSetNumericService(numeric);
     if (!RunDenseProfile(512u, false, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||
         !RunDenseProfile(512u, true, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||
         !RunDenseProfile(2048u, false, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||

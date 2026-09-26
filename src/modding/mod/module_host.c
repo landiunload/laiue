@@ -10,6 +10,11 @@ typedef struct ModuleService
 {
     bool used;
     uint32_t owner;
+    /* Precomputed from value.name at publish time. It is only a prefilter:
+     * an equal hash still falls back to the exact name comparison, so a
+     * collision cannot change which service is found. The service contract
+     * keeps published names immutable for the lifetime of the registration. */
+    uint32_t nameHash;
     LaiueModuleServiceV1 value;
 } ModuleService;
 
@@ -123,6 +128,20 @@ static bool CopyName(char destination[LAIUE_MODULE_MAX_NAME], const char *source
     return true;
 }
 
+/* FNV-1a over the exact service name bytes. SafeName already guarantees the
+ * string is bounded and NUL-terminated, so this cannot walk past it. */
+static uint32_t NameHash(const char *name)
+{
+    uint32_t hash = 2166136261u;
+    while (*name != '\0')
+    {
+        hash ^= (unsigned char)*name;
+        hash *= 16777619u;
+        ++name;
+    }
+    return hash;
+}
+
 static bool Begin(LaiueModuleHost *host)
 {
     bool result = false;
@@ -211,11 +230,13 @@ const void *LaiueModuleHostQueryService(const LaiueModuleHost *host, const char 
         return NULL;
     const void *result = NULL;
     LaiueModuleHost *mutableHost = (LaiueModuleHost *)host;
+    const uint32_t nameHash = NameHash(name);
     PlatformRwLockAcquireShared(&mutableHost->lock);
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
     {
         const ModuleService *service = &host->services[index];
-        if (service->used && service->value.version >= minimumVersion &&
+        if (service->used && service->nameHash == nameHash &&
+            service->value.version >= minimumVersion &&
             service->value.tableSize >= minimumSize && LaiueModAsciiEquals(service->value.name, name))
         {
             result = service->value.table;
@@ -249,10 +270,12 @@ static LaiueModuleStatus PublishFor(LaiueModuleHost *host, uint32_t owner,
         (owner < LAIUE_MODULE_HOST_MAX_MODULES &&
          !DeclaresService(&host->modules[owner], service->name)))
         return Fail(diagnostic, LAIUE_MODULE_SERVICE_INVALID, "service is not declared by module");
+    const uint32_t serviceHash = NameHash(service->name);
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
     {
         ModuleService *current = &host->services[index];
-        if (current->used && LaiueModAsciiEquals(current->value.name, service->name))
+        if (current->used && current->nameHash == serviceHash &&
+            LaiueModAsciiEquals(current->value.name, service->name))
             return Fail(diagnostic, LAIUE_MODULE_DUPLICATE_SERVICE, "service already published");
     }
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
@@ -262,6 +285,7 @@ static LaiueModuleStatus PublishFor(LaiueModuleHost *host, uint32_t owner,
         {
             current->used = true;
             current->owner = owner;
+            current->nameHash = serviceHash;
             current->value = *service;
             return LAIUE_MODULE_OK;
         }
@@ -291,11 +315,13 @@ static LaiueModuleStatus LAIUE_MODULE_CALL ApiUnpublish(void *context, const cha
         return LAIUE_MODULE_INVALID_ARGUMENT;
     if (!SafeName(name))
         return LAIUE_MODULE_SERVICE_INVALID;
+    const uint32_t nameHash = NameHash(name);
     PlatformRwLockAcquireExclusive(&host->lock);
     LaiueModuleStatus status = LAIUE_MODULE_SERVICE_NOT_FOUND;
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
     {
         if (host->services[index].used && host->services[index].owner == (uint32_t)(module - host->modules) &&
+            host->services[index].nameHash == nameHash &&
             LaiueModAsciiEquals(host->services[index].value.name, name))
         {
             memset(&host->services[index], 0, sizeof(host->services[index]));
@@ -517,8 +543,10 @@ LaiueModuleStatus LaiueModuleHostUnregisterService(LaiueModuleHost *host, const 
         return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
     PlatformRwLockAcquireExclusive(&host->lock);
     LaiueModuleStatus status = LAIUE_MODULE_SERVICE_NOT_FOUND;
+    const uint32_t nameHash = NameHash(name);
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
         if (host->services[index].used && host->services[index].owner == LAIUE_MODULE_HOST_MAX_MODULES &&
+            host->services[index].nameHash == nameHash &&
             LaiueModAsciiEquals(host->services[index].value.name, name))
         {
             memset(&host->services[index], 0, sizeof(host->services[index]));

@@ -426,6 +426,12 @@ struct Renderer
     VkDescriptorSet boundChunkSet;
     uint32_t boundChunkConstantOffset;
     bool chunkSetBound;
+    // Последний привязанный графический конвейер: обычный draw в потоке
+    // одного прохода всегда привязывает chunkPipeline, и повторная запись
+    // той же привязки — чистая работа драйвера. Кэш сбрасывается началом
+    // командного буфера и сменой/пересозданием конвейеров.
+    VkPipeline boundPipeline;
+    bool pipelineBound;
 };
 
 _Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
@@ -2888,6 +2894,9 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
     renderer->poolUsedBytes = 0u;
     renderer->pendingUploadCount = 0u;
     renderer->worldReady = false;
+    // chunkPipeline уничтожен: адресный handle мог быть переиспользован,
+    // поэтому сохранённая привязка больше не описывает состояние буфера.
+    renderer->pipelineBound = false;
     RefreshChunkSetTextures(renderer);
 }
 
@@ -2941,6 +2950,7 @@ bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *ca
     }
 
     renderer->worldReady = true;
+    renderer->pipelineBound = false;
     RefreshChunkSetTextures(renderer);
     return true;
 }
@@ -3367,6 +3377,24 @@ static bool ReserveVulkanInstanceSpace(Renderer *renderer, uint32_t bytes,
     return true;
 }
 
+// Привязка графического конвейера к командному буферу — запись состояния,
+// которую драйвер перечитывает на каждом draw, даже если конвейер тот же.
+// В потоке чанковых вызовов одного прохода конвейер постоянен, поэтому
+// последняя привязка запоминается, а повторная запись пропускается. Кэш
+// сбрасывается началом командного буфера (Vulkan не сохраняет привязки
+// между vkBeginCommandBuffer) и сменой/пересозданием конвейеров. Все места
+// смены графического конвейера должны проходить через этот помощник, иначе
+// кэш разойдётся с фактическим состоянием командного буфера.
+static void BindGraphicsPipeline(Renderer *renderer, VkCommandBuffer commandBuffer,
+                                 VkPipeline pipeline)
+{
+    if (pipeline == VK_NULL_HANDLE) return;
+    if (renderer->pipelineBound && renderer->boundPipeline == pipeline) return;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    renderer->boundPipeline = pipeline;
+    renderer->pipelineBound = true;
+}
+
 static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint32_t instanceCount,
                              uint32_t instanceChunkIndex, uint32_t instanceOffset, bool instanced)
 {
@@ -3456,8 +3484,7 @@ static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh
     // silently round and read the preceding allocation.
     uint32_t dynamicOffsets[3] = {constantOffset, mesh->offsetBytes, 0u};
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      renderer->genericPipeline);
+    BindGraphicsPipeline(renderer, commandBuffer, renderer->genericPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->chunkPipelineLayout, 0u, 1u, &set, 3u,
                             dynamicOffsets);
@@ -3475,8 +3502,8 @@ void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
     renderer->chunkConstants.chunkOriginRelative[1] = chunkOriginRelative[1];
     renderer->chunkConstants.chunkOriginRelative[2] = chunkOriginRelative[2];
     renderer->chunkConstants.meshScale = 1.0f;
-    vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
-                      VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
+    BindGraphicsPipeline(renderer, renderer->commandBuffers[renderer->frameIndex],
+                         renderer->chunkPipeline);
     DrawMeshInternal(renderer, mesh, 1u, 0u, 0u, false);
 }
 
@@ -3523,8 +3550,8 @@ void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *me
     renderer->chunkConstants.chunkOriginRelative[1] = 0.0f;
     renderer->chunkConstants.chunkOriginRelative[2] = 0.0f;
     renderer->chunkConstants.meshScale = -1.0f;
-    vkCmdBindPipeline(renderer->commandBuffers[renderer->frameIndex],
-                      VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
+    BindGraphicsPipeline(renderer, renderer->commandBuffers[renderer->frameIndex],
+                         renderer->chunkPipeline);
     DrawMeshInternal(renderer, mesh, instanceCount, chunkIndex, offset, true);
 }
 
@@ -3688,6 +3715,8 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) return false;
     renderer->frameRecording = true;
     renderer->renderingActive = false;
+    // vkBeginCommandBuffer сбрасывает привязки состояния: кэш невалиден.
+    renderer->pipelineBound = false;
 
     RecordPendingUploads(renderer);
 
@@ -3816,8 +3845,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height,
                               clearColor, true);
         SetViewportAndScissor(commandBuffer, x, y, width, height);
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          renderer->chunkPipeline);
+        BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
         memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection,
                sizeof(float) * 16u);
         return;
@@ -3856,7 +3884,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     renderer->renderingActive = true;
 
     SetViewportAndScissor(commandBuffer, x, y, width, height);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->chunkPipeline);
+    BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
     memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
     // viewProjection сменился — кэш инстансных констант и привязки сброшен.
     renderer->instancedConstantsValid = false;
@@ -3884,8 +3912,7 @@ static void RecordPanoramaResolve(Renderer *renderer)
                               (uint32_t)renderer->windowHeight, NULL, false);
         SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                               (uint32_t)renderer->windowHeight);
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          renderer->resolvePipeline);
+        BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 renderer->resolvePipelineLayout, 0u, 1u,
                                 &renderer->resolveSets[renderer->frameIndex], 1u,
@@ -3916,7 +3943,7 @@ static void RecordPanoramaResolve(Renderer *renderer)
     renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
     SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                           (uint32_t)renderer->windowHeight);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->resolvePipeline);
+    BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->resolvePipelineLayout, 0u, 1u,
                             &renderer->resolveSets[renderer->frameIndex], 1u, &constantOffset);
@@ -3944,8 +3971,7 @@ static void RecordUiLayer(Renderer *renderer)
                               (uint32_t)renderer->windowHeight, NULL, false);
         SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                               (uint32_t)renderer->windowHeight);
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          renderer->uiPipeline);
+        BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
         uint32_t dynamicOffsets[2] = { constantOffset, 0u };
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 renderer->uiPipelineLayout, 0u, 1u,
@@ -3975,7 +4001,7 @@ static void RecordUiLayer(Renderer *renderer)
     renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
     SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                           (uint32_t)renderer->windowHeight);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->uiPipeline);
+    BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
     uint32_t dynamicOffsets[2] = { constantOffset, 0u };
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->uiPipelineLayout, 0u, 1u,
@@ -4183,6 +4209,9 @@ void RendererSetWireframe_Vulkan(Renderer *renderer, bool enabled)
     vkDestroyPipeline(renderer->device, renderer->genericPipeline, NULL);
     renderer->chunkPipeline = replacement;
     renderer->genericPipeline = genericReplacement;
+    // Старые конвейеры уничтожены, а драйвер вправе переиспользовать их
+    // handle для новых: сохранённая привязка больше не описывает состояние.
+    renderer->pipelineBound = false;
 }
 
 bool RendererIsWireframe_Vulkan(const Renderer *renderer)
@@ -4269,6 +4298,7 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
             vkDestroyPipeline(renderer->device, renderer->chunkPipeline, NULL);
         renderer->chunkPipeline = chunkPipeline;
     }
+    renderer->pipelineBound = false;
     ReleaseShaderArray(previousShaders);
     return true;
 }

@@ -53,6 +53,14 @@ typedef uint32_t LaiueModuleLogLevel;
 #define LAIUE_MODULE_LOG_WARNING UINT32_C(2)
 #define LAIUE_MODULE_LOG_ERROR UINT32_C(3)
 
+/* Publishing copies this descriptor, but `name` and `table` remain borrowed
+ * pointers owned by the publisher. Their storage must stay valid and its
+ * bytes must not change until the service is unpublished/unregistered (or the
+ * publishing module is unloaded). This includes the name bytes themselves:
+ * `const char*` only forbids writes through this pointer, so the publisher
+ * must not mutate the string through another alias while the registration is
+ * live. The host may cache derived data (for example a name hash) while a
+ * registration is active and is not required to observe later edits. */
 typedef struct LaiueModuleServiceV1
 {
     const char *name;
