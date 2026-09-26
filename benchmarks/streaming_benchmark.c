@@ -35,8 +35,9 @@ static uint32_t benchSampleCount;
 static volatile uint64_t benchSink;
 
 // Фиктивный рендерер: мир пуст, меши не создаются, ни один Renderer*-вызов
-// не исполняется. Указатель только хранится стримингом.
-static uint8_t benchRendererPlaceholder;
+// не исполняется. Указатель только хранится стримингом; нули читаются
+// диспетчером рендера как AUTO.
+static uint64_t benchRendererPlaceholder;
 
 static void WriteText(const char* text)
 {

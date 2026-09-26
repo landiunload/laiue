@@ -1,4 +1,4 @@
-#include "render/renderer.h"
+#include "render/renderer_internal.h"
 
 #define COBJMACROS
 #include <windows.h>
@@ -153,6 +153,7 @@ struct RendererMesh
 
 struct Renderer
 {
+    RendererHeader header;
     IDXGIFactory4*             factory;
     ID3D12Device*              device;
     ID3D12CommandQueue*        commandQueue;
@@ -267,6 +268,8 @@ struct Renderer
     RendererStats              lastStats;
     RendererContentStatus     texturePackLoadStatus;
 };
+
+_Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
 
 static bool RecreateChunkPipelineState(Renderer* renderer);
 static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
@@ -1453,6 +1456,7 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         return NULL;
     }
 
+    renderer->header.backend = RENDERER_BACKEND_D3D12;
     renderer->windowWidth = width;
     renderer->windowHeight = height;
     renderer->verticalSyncEnabled = true;

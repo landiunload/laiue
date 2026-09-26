@@ -253,6 +253,29 @@ LAIUE_TEST_ENTRY(RenderDualBackendTestEntryPoint)
            "AUTO must resolve to the D3D12 default on Windows");
     RendererDestroy(automatic);
 
+    Expect(RendererGetBackend(NULL) == RENDERER_BACKEND_AUTO, "a null renderer must report AUTO");
+    RendererDestroy(NULL);
+
+    // More than the old global registry's eight slots. Each live object must
+    // retain its backend even when other renderers are destroyed out of order.
+    Renderer *many[9] = {0};
+    for (uint32_t index = 0u; index < 9u; ++index)
+    {
+        many[index] = RendererCreateWithBackend(NULL, 16, 16, RENDERER_BACKEND_VULKAN);
+        Expect(many[index] != NULL, "the independent offscreen renderer could not be created");
+        Expect(RendererGetBackend(many[index]) == RENDERER_BACKEND_VULKAN,
+               "all nine renderers must retain their backend");
+    }
+    for (uint32_t parity = 0u; parity < 2u; ++parity)
+    {
+        for (uint32_t index = parity; index < 9u; index += 2u)
+        {
+            Expect(RendererGetBackend(many[index]) == RENDERER_BACKEND_VULKAN,
+                   "destroying another renderer must not change the backend");
+            RendererDestroy(many[index]);
+        }
+    }
+
     PlatformFree(pixels);
     DestroyWindow(window);
     LaiueTestRuntimeWrite("Dual backend checks passed\n");

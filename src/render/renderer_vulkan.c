@@ -8,7 +8,7 @@
 // HLSL переводятся в один descriptor set сдвигами (cmake/LaiueShader.cmake):
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
-#include "render/renderer.h"
+#include "render/renderer_internal.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
 #include "platform/system.h"
@@ -230,6 +230,7 @@ typedef enum PresentOutcome
 
 struct Renderer
 {
+    RendererHeader header;
     VkInstance instance;
     VkPhysicalDevice physicalDevice;
     VkPhysicalDeviceMemoryProperties memoryProperties;
@@ -375,6 +376,8 @@ struct Renderer
     uint32_t boundChunkConstantOffset;
     bool chunkSetBound;
 };
+
+_Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
 
 // === Мелкие помощники ===
 
@@ -2422,6 +2425,7 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     Renderer *renderer = PlatformAllocate(sizeof(*renderer), true);
     if (renderer == NULL) return NULL;
 
+    renderer->header.backend = RENDERER_BACKEND_VULKAN;
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 

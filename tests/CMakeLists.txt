@@ -568,3 +568,11 @@ laiue_configure_standalone_executable(laiue_r2_sha256_test R2Sha256TestEntryPoin
 add_test(NAME laiue.platform.sha256_round2 COMMAND laiue_r2_sha256_test)
 set_tests_properties(laiue.platform.sha256_round2 PROPERTIES TIMEOUT 60)
 unset(_laiue_r2_sha256_test_sources)
+
+if(LAIUE_NATIVE_MODS_ENABLED)
+    add_executable(laiue_mod_host_order_test mod_host_order_test.c mod_test_service.h)
+    target_link_libraries(laiue_mod_host_order_test PRIVATE laiue_mod)
+    laiue_configure_standalone_executable(laiue_mod_host_order_test ModHostOrderTestEntry)
+    add_dependencies(laiue_mod_host_order_test laiue_mod_test_extension)
+    add_test(NAME laiue.mod.host_order COMMAND laiue_mod_host_order_test)
+endif()

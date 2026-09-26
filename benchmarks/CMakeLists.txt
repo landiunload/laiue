@@ -599,3 +599,51 @@ target_include_directories(laiue_sha256_benchmark PRIVATE
 laiue_configure_standalone_executable(
     laiue_sha256_benchmark R2Sha256BenchmarkEntryPoint)
 unset(_laiue_r2_sha256_sources)
+if(TARGET laiue_render)
+    # ROUND 3, задача 43-render-dispatch: CPU-цена выбора бэкенда/диспетчера и
+    # реестра живых Renderer-объектов, отделённая от работы бэкенда.
+    # Dispatch-only циклы RendererGetBackend не трогают GPU; покадровые стадии
+    # меряют только время постановки на CPU. Один exe сравнивается с
+    # baseline/candidate laiue_render.dll в отдельных каталогах.
+    add_executable(laiue_r3_43_render_dispatch_benchmark EXCLUDE_FROM_ALL
+        r3_43_render_dispatch_benchmark.c)
+    target_link_libraries(laiue_r3_43_render_dispatch_benchmark PRIVATE laiue_render)
+    target_include_directories(laiue_r3_43_render_dispatch_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    if(WIN32)
+        target_link_libraries(laiue_r3_43_render_dispatch_benchmark PRIVATE psapi)
+    endif()
+    laiue_configure_standalone_executable(
+        laiue_r3_43_render_dispatch_benchmark R3RenderDispatchBenchmarkEntryPoint)
+endif()
+
+
+# ROUND3 52-mod-host-alt: ordering/enumeration загруженных модов плюс реестр
+# сервисов и поиск сервиса изнутри расширения. Расширение — отдельная
+# shared-библиотека, потому что queryService доступен только изнутри мода.
+# laiue_mod на Windows shared, поэтому baseline/candidate делят один exe и
+# одну DLL расширения, а подменяется только laiue_mod.dll.
+if(TARGET laiue_mod AND LAIUE_NATIVE_MODS_ENABLED)
+    add_library(laiue_r3_52_mod_host_query_extension SHARED EXCLUDE_FROM_ALL
+        r3_52_mod_host_query_extension.c)
+    target_link_libraries(laiue_r3_52_mod_host_query_extension PRIVATE
+        laiue_common)
+    if(WIN32)
+        target_link_options(laiue_r3_52_mod_host_query_extension PRIVATE
+            /NOENTRY)
+    else()
+        set_target_properties(laiue_r3_52_mod_host_query_extension PROPERTIES
+            C_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN YES)
+    endif()
+
+    add_executable(laiue_r3_52_mod_host_benchmark EXCLUDE_FROM_ALL
+        r3_52_mod_host_registry_benchmark.c)
+    target_link_libraries(laiue_r3_52_mod_host_benchmark PRIVATE laiue_mod)
+    target_include_directories(laiue_r3_52_mod_host_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    laiue_configure_standalone_executable(
+        laiue_r3_52_mod_host_benchmark R3ModHostRegistryBenchmarkEntry)
+    add_dependencies(laiue_r3_52_mod_host_benchmark
+        laiue_r3_52_mod_host_query_extension)
+endif()
