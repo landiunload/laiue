@@ -2,17 +2,15 @@
 //
 // В обычную сборку и в CTest не входит: включается LAIUE_BUILD_BENCHMARKS и
 // запускается руками из A/B-скрипта. Стенд компилирует внутренний
-// `src/render/texture_build.c` прямо в свой исполняемый файл: сборщик не
+// `src/graphics/render/texture_build.c` прямо в свой исполняемый файл: сборщик не
 // экспортируется из `laiue_render`, а новые экспорты запрещены.
 //
 // Стенд сам готовит детерминированное содержимое — `.lt`-файлы без
 // PNG/GIF/JPEG — и прогоняет четыре сценария, различающихся данными
 // (статика, встроенные нормали, анимация с отдельной картой нормалей и
-// анимация со встроенными нормалями). Каждый сценарий: прогрев, затем
-// один измеренный сбор, затем свёртка собранного пака. Свёртка печатается
-// рядом с временем, чтобы A/B-скрипт мог убедиться, что baseline и
-// candidate отдают байт-в-байт одинаковый результат, а компилятор не
-// выбросил работу.
+// анимация со встроенными нормалями). Каждый сценарий: прогрев, затем девять
+// парных замеров full/base-only с чередованием порядка; печатается медиана.
+// Checksum убеждается, что mip 0 и метаданные не изменились.
 //
 // Windows собирает движок без CRT, поэтому вывод — через общий с
 // тестами `test_runtime.h`, а не через printf.
@@ -55,6 +53,7 @@
 #define ANIM_COUNT 8u
 #define ANIM_FRAMES 8u
 #define TOTAL_COUNT (STATIC_COUNT + NORMAL_COUNT + ANIM_COUNT + ANIM_COUNT)
+#define BENCH_SAMPLES 9u
 
 typedef struct BenchPaths
 {
@@ -256,6 +255,31 @@ static BENCH_NOINLINE uint64_t HashPack(const TexturePackData *pack)
     return hash;
 }
 
+static BENCH_NOINLINE uint64_t HashBaseLevels(const TexturePackData *pack)
+{
+    uint64_t hash = 1469598103934665603ull;
+    uint32_t mip0Bytes = (uint32_t)pack->width * pack->height * 4u;
+    uint32_t fullSliceBytes = 0u;
+    uint32_t mipSize = pack->width;
+    for (uint32_t mip = 0u; mip < pack->mipCount; ++mip)
+    {
+        fullSliceBytes += mipSize * mipSize * 4u;
+        if (mipSize > 1u) mipSize >>= 1;
+    }
+    for (uint32_t slice = 0u; slice < pack->sliceCount; ++slice)
+        hash = HashBytes(hash, pack->pixels + (size_t)slice * fullSliceBytes, mip0Bytes);
+    if (pack->normalPixels != NULL)
+    {
+        for (uint32_t slice = 0u; slice < pack->sliceCount; ++slice)
+            hash = HashBytes(hash, pack->normalPixels + (size_t)slice * fullSliceBytes,
+                             mip0Bytes);
+    }
+    hash = HashBytes(hash, (const uint8_t *)pack->animation, (uint32_t)sizeof(pack->animation));
+    hash = HashBytes(hash, (const uint8_t *)pack->sliceMilliseconds,
+                     (uint32_t)sizeof(pack->sliceMilliseconds));
+    return hash;
+}
+
 static void ReleasePack(TexturePackData *pack)
 {
     PlatformFree(pack->allocation);
@@ -268,6 +292,107 @@ static BENCH_NOINLINE TexturePackLoadStatus Build(LaiueContentCatalog *catalog,
 {
     memset(outPack, 0, sizeof(*outPack));
     return TexturePackBuildFrom(catalog, names, count, outPack);
+}
+
+static BENCH_NOINLINE TexturePackLoadStatus BuildBaseLevel(
+    LaiueContentCatalog *catalog, const wchar_t *const *names, uint32_t count,
+    TexturePackData *outPack)
+{
+    memset(outPack, 0, sizeof(*outPack));
+    return TexturePackBuildBaseLevelFrom(catalog, names, count, outPack);
+}
+
+typedef TexturePackLoadStatus (*TexturePackBuilder)(
+    LaiueContentCatalog *, const wchar_t *const *, uint32_t, TexturePackData *);
+
+typedef struct PackSummary
+{
+    uint16_t width;
+    uint16_t height;
+    uint16_t mipCount;
+    uint16_t sliceCount;
+    uint16_t materialCount;
+    uint32_t pixelBytes;
+    uint64_t totalPixelBytes;
+    uint64_t checksum;
+    uint64_t baseChecksum;
+} PackSummary;
+
+static BENCH_NOINLINE bool MeasureBuild(
+    TexturePackBuilder builder, LaiueContentCatalog *catalog,
+    const wchar_t *const *names, uint32_t count, double *outMilliseconds,
+    PackSummary *outSummary)
+{
+    TexturePackData pack;
+    memset(&pack, 0, sizeof(pack));
+    double start = PlatformMonotonicSeconds();
+    TexturePackLoadStatus status = builder(catalog, names, count, &pack);
+    *outMilliseconds = (PlatformMonotonicSeconds() - start) * 1000.0;
+    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
+    {
+        ReleasePack(&pack);
+        return false;
+    }
+
+    outSummary->width = pack.width;
+    outSummary->height = pack.height;
+    outSummary->mipCount = pack.mipCount;
+    outSummary->sliceCount = pack.sliceCount;
+    outSummary->materialCount = pack.materialCount;
+    outSummary->pixelBytes = pack.pixelBytes;
+    outSummary->totalPixelBytes = (uint64_t)pack.pixelBytes *
+                                  (pack.normalPixels != NULL ? 2u : 1u);
+    outSummary->checksum = HashPack(&pack);
+    outSummary->baseChecksum = HashBaseLevels(&pack);
+    ReleasePack(&pack);
+    return true;
+}
+
+static void SortSamples(double *samples)
+{
+    for (uint32_t index = 1u; index < BENCH_SAMPLES; ++index)
+    {
+        double value = samples[index];
+        uint32_t cursor = index;
+        while (cursor > 0u && samples[cursor - 1u] > value)
+        {
+            samples[cursor] = samples[cursor - 1u];
+            --cursor;
+        }
+        samples[cursor] = value;
+    }
+}
+
+static void ReportMeasuredScenario(const char *label, double milliseconds,
+                                   const PackSummary *summary, bool baseOnly, bool verified)
+{
+    WriteText("RESULT scenario=");
+    WriteText(label);
+    if (baseOnly) WriteText("_base");
+    WriteText(" ms=");
+    WriteMilliseconds(milliseconds);
+    WriteText(" samples=");
+    WriteUnsigned(BENCH_SAMPLES);
+    WriteText(" checksum=");
+    WriteHex(summary->checksum);
+    WriteText(" width=");
+    WriteUnsigned(summary->width);
+    WriteText(" height=");
+    WriteUnsigned(summary->height);
+    WriteText(" mip=");
+    WriteUnsigned(summary->mipCount);
+    WriteText(" slices=");
+    WriteUnsigned(summary->sliceCount);
+    WriteText(" materials=");
+    WriteUnsigned(summary->materialCount);
+    WriteText(" pixelbytes=");
+    WriteUnsigned(summary->pixelBytes);
+    WriteText(" totalpixelbytes=");
+    WriteUnsigned(summary->totalPixelBytes);
+    WriteText(" base_checksum=");
+    WriteHex(summary->baseChecksum);
+    WriteText(" verify=");
+    WriteText(verified ? "ok\n" : "fail\n");
 }
 
 static BENCH_NOINLINE bool PrepareContent(BenchPaths *paths)
@@ -359,61 +484,63 @@ static BENCH_NOINLINE bool PrepareContent(BenchPaths *paths)
     return ok;
 }
 
-static BENCH_NOINLINE void ReportScenario(const char *label, double milliseconds, uint64_t checksum,
-                                          const TexturePackData *pack)
-{
-    WriteText("RESULT scenario=");
-    WriteText(label);
-    WriteText(" ms=");
-    WriteMilliseconds(milliseconds);
-    WriteText(" checksum=");
-    WriteHex(checksum);
-    WriteText(" width=");
-    WriteUnsigned(pack->width);
-    WriteText(" mip=");
-    WriteUnsigned(pack->mipCount);
-    WriteText(" slices=");
-    WriteUnsigned(pack->sliceCount);
-    WriteText(" materials=");
-    WriteUnsigned(pack->materialCount);
-    WriteText(" pixelbytes=");
-    WriteUnsigned(pack->pixelBytes);
-    WriteText(" normals=");
-    WriteUnsigned(pack->normalPixels != NULL ? 1u : 0u);
-    WriteText("\n");
-}
-
 static BENCH_NOINLINE void RunScenario(LaiueContentCatalog *catalog, const char *label,
                                        const wchar_t *const *names, uint32_t count)
 {
-    TexturePackData pack;
-    TexturePackLoadStatus status = Build(catalog, names, count, &pack);
-    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
+    double fullSamples[BENCH_SAMPLES];
+    double baseSamples[BENCH_SAMPLES];
+    PackSummary fullSummary;
+    PackSummary baseSummary;
+    double ignoredMilliseconds = 0.0;
+    if (!MeasureBuild(Build, catalog, names, count, &ignoredMilliseconds, &fullSummary) ||
+        !MeasureBuild(BuildBaseLevel, catalog, names, count, &ignoredMilliseconds, &baseSummary))
     {
         WriteText("ERROR scenario=");
         WriteText(label);
-        WriteText(" status=");
-        WriteUnsigned((uint32_t)status);
-        WriteText("\n");
+        WriteText(" warmup\n");
         return;
     }
-    ReleasePack(&pack);   // прогрев: страницы, кеш файловой системы, кеш кода
 
-    double start = PlatformMonotonicSeconds();
-    status = Build(catalog, names, count, &pack);
-    double milliseconds = (PlatformMonotonicSeconds() - start) * 1000.0;
-    if (status != TEXTURE_PACK_LOAD_OK && status != TEXTURE_PACK_LOAD_INCOMPLETE)
+    bool verified = true;
+    uint64_t expectedFullChecksum = fullSummary.checksum;
+    uint64_t expectedBaseChecksum = fullSummary.baseChecksum;
+    for (uint32_t sample = 0u; sample < BENCH_SAMPLES; ++sample)
+    {
+        // Alternate order to reduce clock and scheduler drift bias.
+        bool baseFirst = (sample & 1u) != 0u;
+        if (!baseFirst)
+        {
+            verified = MeasureBuild(Build, catalog, names, count, &fullSamples[sample],
+                                    &fullSummary) && verified;
+            if (!MeasureBuild(BuildBaseLevel, catalog, names, count, &baseSamples[sample],
+                              &baseSummary)) verified = false;
+        }
+        else
+        {
+            if (!MeasureBuild(BuildBaseLevel, catalog, names, count, &baseSamples[sample],
+                              &baseSummary)) verified = false;
+            verified = MeasureBuild(Build, catalog, names, count, &fullSamples[sample],
+                                    &fullSummary) && verified;
+        }
+
+        verified = verified && fullSummary.checksum == expectedFullChecksum &&
+                   fullSummary.baseChecksum == expectedBaseChecksum &&
+                   baseSummary.checksum == expectedBaseChecksum &&
+                   baseSummary.baseChecksum == expectedBaseChecksum;
+    }
+    if (!verified)
     {
         WriteText("ERROR scenario=");
         WriteText(label);
-        WriteText(" status=");
-        WriteUnsigned((uint32_t)status);
-        WriteText("\n");
+        WriteText(" benchmark build or checksum mismatch\n");
         return;
     }
-    uint64_t checksum = HashPack(&pack);
-    ReportScenario(label, milliseconds, checksum, &pack);
-    ReleasePack(&pack);
+
+    SortSamples(fullSamples);
+    SortSamples(baseSamples);
+    bool match = baseSummary.checksum == fullSummary.baseChecksum;
+    ReportMeasuredScenario(label, fullSamples[BENCH_SAMPLES / 2u], &fullSummary, false, match);
+    ReportMeasuredScenario(label, baseSamples[BENCH_SAMPLES / 2u], &baseSummary, true, match);
 }
 
 LAIUE_TEST_ENTRY(TextureBuildBenchmarkEntryPoint)
@@ -457,6 +584,9 @@ LAIUE_TEST_ENTRY(TextureBuildBenchmarkEntryPoint)
     for (uint32_t index = 0; index < ANIM_COUNT; ++index)
         animEmbedNames[index] = paths->names[STATIC_COUNT + NORMAL_COUNT + ANIM_COUNT + index];
 
+    WriteText("texture build benchmark paired samples=");
+    WriteUnsigned(BENCH_SAMPLES);
+    WriteText(" (ms is median wall time per build)\n");
     RunScenario(catalog, "lt_static", staticNames, STATIC_COUNT);
     RunScenario(catalog, "lt_normals", normalNames, NORMAL_COUNT);
     RunScenario(catalog, "lt_anim_separate_normal", animNames, ANIM_COUNT);

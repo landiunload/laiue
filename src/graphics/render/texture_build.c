@@ -137,13 +137,13 @@ static uint32_t FullMipCount(uint32_t size)
     return count;
 }
 
-static uint32_t MipChainBytes(uint32_t size)
+static uint32_t MipChainBytes(uint32_t size, uint32_t mipCount)
 {
     uint32_t total = 0u;
-    for (uint32_t level = size;; level >>= 1)
+    for (uint32_t mip = 0u; mip < mipCount; ++mip)
     {
-        total += level * level * 4u;
-        if (level == 1u) break;
+        total += size * size * 4u;
+        if (size > 1u) size >>= 1;
     }
     return total;
 }
@@ -919,14 +919,14 @@ static void LoadMaterialResolved(LaiueContentCatalog *catalog, LoadScratch *scra
 // Заполняет цепочку mip одного слоя: уровень 0 приводится к общему
 // размеру, остальные считаются из предыдущего.
 static void WriteSliceChain(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceHeight,
-                            uint32_t size, uint8_t *cursor)
+                            uint32_t size, uint32_t mipCount, uint8_t *cursor)
 {
     ImageResample(source, sourceWidth, sourceHeight, cursor, size, size);
     uint8_t *previous = cursor;
     uint32_t previousSize = size;
     cursor += size * size * 4u;
 
-    while (previousSize > 1u)
+    for (uint32_t mip = 1u; mip < mipCount && previousSize > 1u; ++mip)
     {
         uint32_t nextSize = previousSize >> 1;
         ImageResample(previous, previousSize, previousSize, cursor, nextSize, nextSize);
@@ -936,9 +936,10 @@ static void WriteSliceChain(const uint8_t *source, uint32_t sourceWidth, uint32_
     }
 }
 
-static void WriteConstantChain(const uint8_t texel[4], uint32_t size, uint8_t *cursor)
+static void WriteConstantChain(const uint8_t texel[4], uint32_t size,
+                               uint32_t mipCount, uint8_t *cursor)
 {
-    uint32_t total = MipChainBytes(size) / 4u;
+    uint32_t total = MipChainBytes(size, mipCount) / 4u;
     for (uint32_t index = 0; index < total; ++index)
     {
         cursor[index * 4u + 0u] = texel[0];
@@ -948,9 +949,9 @@ static void WriteConstantChain(const uint8_t texel[4], uint32_t size, uint8_t *c
     }
 }
 
-TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
-                                           const wchar_t *const *materialNames,
-                                           uint32_t materialCount, TexturePackData *outPack)
+static TexturePackLoadStatus TexturePackBuild(
+    LaiueContentCatalog *catalog, const wchar_t *const *materialNames,
+    uint32_t materialCount, TexturePackData *outPack, bool includeMipChain)
 {
     if (catalog == NULL || outPack == NULL || materialNames == NULL) return TEXTURE_PACK_LOAD_IO_ERROR;
     if (materialCount == 0u || materialCount > TEXTURE_PACK_MAX_LAYERS)
@@ -1021,7 +1022,8 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     uint32_t size = IsPowerOfTwo(largest) ? largest : RoundUpToPowerOfTwo(largest);
     if (size > TEXTURE_MAX_DIMENSION) size = TEXTURE_MAX_DIMENSION;
 
-    uint32_t chainBytes = MipChainBytes(size);
+    uint32_t mipCount = includeMipChain ? FullMipCount(size) : 1u;
+    uint32_t chainBytes = MipChainBytes(size, mipCount);
     uint64_t albedoBytes = (uint64_t)chainBytes * sliceCount;
     uint64_t totalBytes = anyNormal ? albedoBytes * 2u : albedoBytes;
     uint8_t *pixels = totalBytes <= 0xFFFFFFFFull
@@ -1067,7 +1069,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
             {
                 uint32_t frameBytes = source->width * source->height * 4u;
                 WriteSliceChain(source->albedo + (size_t)frame * frameBytes, source->width,
-                                source->height, size, albedoCursor);
+                                source->height, size, mipCount, albedoCursor);
                 if (source->normal != NULL)
                 {
                     // Один кадр карты нормалей может обслуживать всю
@@ -1078,7 +1080,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
             }
             else
             {
-                WriteConstantChain(g_missingTexel, size, albedoCursor);
+                WriteConstantChain(g_missingTexel, size, mipCount, albedoCursor);
             }
 
             if (normalCursor != NULL)
@@ -1092,7 +1094,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
                     else
                     {
                         WriteSliceChain(normalSource, source->width, source->height, size,
-                                        normalCursor);
+                                        mipCount, normalCursor);
                     }
                 }
                 else if (havePreviousNormal && previousNormal == NULL)
@@ -1102,7 +1104,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
                 }
                 else
                 {
-                    WriteConstantChain(g_flatNormalTexel, size, normalCursor);
+                    WriteConstantChain(g_flatNormalTexel, size, mipCount, normalCursor);
                 }
                 previousNormal = normalSource;
                 havePreviousNormal = true;
@@ -1134,11 +1136,25 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     outPack->width = (uint16_t)size;
     outPack->height = (uint16_t)size;
     outPack->sliceCount = (uint16_t)sliceCount;
-    outPack->mipCount = (uint16_t)FullMipCount(size);
+    outPack->mipCount = (uint16_t)mipCount;
     outPack->materialCount = (uint16_t)materialCount;
     outPack->pixels = pixels;
     outPack->pixelBytes = (uint32_t)albedoBytes;
     outPack->normalPixels = anyNormal ? pixels + albedoBytes : NULL;
     outPack->allocation = pixels;
     return missing == 0u ? TEXTURE_PACK_LOAD_OK : TEXTURE_PACK_LOAD_INCOMPLETE;
+}
+
+TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
+                                           const wchar_t *const *materialNames,
+                                           uint32_t materialCount, TexturePackData *outPack)
+{
+    return TexturePackBuild(catalog, materialNames, materialCount, outPack, true);
+}
+
+TexturePackLoadStatus TexturePackBuildBaseLevelFrom(
+    LaiueContentCatalog *catalog, const wchar_t *const *materialNames,
+    uint32_t materialCount, TexturePackData *outPack)
+{
+    return TexturePackBuild(catalog, materialNames, materialCount, outPack, false);
 }

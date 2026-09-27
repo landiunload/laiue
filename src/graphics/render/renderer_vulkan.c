@@ -3006,9 +3006,9 @@ bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *ca
 
     TexturePackData pack;
     memset(&pack, 0, sizeof(pack));
-    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveBaseLevelFrom(catalog, renderer->materialNames.pointers,
                                   renderer->materialNames.count, &pack)
-                                                   : TexturePackLoadActiveFrom(LaiueContentCatalogDefault(),
+                                                   : TexturePackLoadActiveBaseLevelFrom(LaiueContentCatalogDefault(),
                                   renderer->materialNames.pointers,
                                   renderer->materialNames.count, &pack);
     renderer->texturePackLoadStatus = MapTexturePackLoadStatus(status);
@@ -4281,9 +4281,9 @@ bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalo
 
     TexturePackData pack;
     memset(&pack, 0, sizeof(pack));
-    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+    TexturePackLoadStatus status = catalog != NULL ? TexturePackLoadActiveBaseLevelFrom(catalog, renderer->materialNames.pointers,
                                   renderer->materialNames.count, &pack)
-                                                   : TexturePackLoadActiveFrom(LaiueContentCatalogDefault(),
+                                                   : TexturePackLoadActiveBaseLevelFrom(LaiueContentCatalogDefault(),
                                   renderer->materialNames.pointers,
                                   renderer->materialNames.count, &pack);
     renderer->texturePackLoadStatus = MapTexturePackLoadStatus(status);
