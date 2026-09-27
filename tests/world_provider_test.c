@@ -1359,6 +1359,89 @@ static void TestDeltaPositionReuse(void)
     WorldDestroy(world);
 }
 
+typedef struct TestWorldAllocationHeader
+{
+    uint64_t size;
+    uint64_t alignmentPadding;
+} TestWorldAllocationHeader;
+
+typedef struct TestWorldAllocationStats
+{
+    uint64_t liveBytes;
+} TestWorldAllocationStats;
+
+static void *TestWorldAllocate(void *context, uint64_t size)
+{
+    TestWorldAllocationHeader *header = (TestWorldAllocationHeader *)PlatformAllocate(
+        sizeof(*header) + (size_t)size, false);
+    if (header == NULL) return NULL;
+    header->size = size;
+    ((TestWorldAllocationStats *)context)->liveBytes += size;
+    return header + 1;
+}
+
+static void *TestWorldReallocate(void *context, void *memory, uint64_t size)
+{
+    if (memory == NULL) return TestWorldAllocate(context, size);
+    TestWorldAllocationHeader *header = (TestWorldAllocationHeader *)memory - 1;
+    uint64_t oldSize = header->size;
+    TestWorldAllocationHeader *resized = (TestWorldAllocationHeader *)PlatformReallocate(
+        header, sizeof(*header) + (size_t)size, false);
+    if (resized == NULL) return NULL;
+    resized->size = size;
+    TestWorldAllocationStats *stats = (TestWorldAllocationStats *)context;
+    stats->liveBytes = stats->liveBytes - oldSize + size;
+    return resized + 1;
+}
+
+static void TestWorldFree(void *context, void *memory)
+{
+    if (memory == NULL) return;
+    TestWorldAllocationHeader *header = (TestWorldAllocationHeader *)memory - 1;
+    ((TestWorldAllocationStats *)context)->liveBytes -= header->size;
+    PlatformFree(header);
+}
+
+static void TestSparseChunkReleasesDeltaCapacity(void)
+{
+    TestWorldAllocationStats stats = {0};
+    WorldAllocator allocator = {
+        .context = &stats,
+        .allocate = TestWorldAllocate,
+        .reallocate = TestWorldReallocate,
+        .free = TestWorldFree,
+    };
+    World *world = WorldCreateWithNumericServiceAndAllocator(
+        NULL, LaiueNumericGetStaticServiceV1(), &allocator);
+    ProviderExpect(world != NULL, "tracked allocator world was not created");
+
+    for (uint32_t index = 0u; index < 2048u; ++index)
+    {
+        uint32_t localIndex = index * 2u;
+        ProviderExpect(WorldTrySetBlock(world, 0, localIndex / CHUNK_SIZE,
+                           localIndex % CHUNK_SIZE, (BlockType)7U),
+                       "large delta setup failed");
+    }
+    uint64_t highWaterBytes = stats.liveBytes;
+    for (uint32_t index = 2048u; index-- > 1u;)
+    {
+        uint32_t localIndex = index * 2u;
+        ProviderExpect(WorldTrySetBlock(world, 0, localIndex / CHUNK_SIZE,
+                           localIndex % CHUNK_SIZE, BLOCK_AIR),
+                       "sparse delta cleanup failed");
+    }
+    ProviderExpect(WorldGetBlock(world, 0, 0, 0) == (BlockType)7U &&
+                       WorldGetBlock(world, 0, 0, 2) == BLOCK_AIR,
+                   "capacity shrink changed surviving world values");
+    ProviderExpect(highWaterBytes > stats.liveBytes &&
+                       highWaterBytes - stats.liveBytes >= 4096U,
+                   "sparse chunk retained most of its high-water delta buffer");
+
+    WorldDestroy(world);
+    ProviderExpect(stats.liveBytes == 0U,
+                   "tracked allocator bytes remained after world destruction");
+}
+
 
 LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
 {
@@ -1375,6 +1458,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestRegionNoLocalOverridesFastPath();
     TestEmptyChunkRemovalBackwardShift();
     TestDeltaPositionReuse();
+    TestSparseChunkReleasesDeltaCapacity();
     TestBatchLimitsAndDuplicates();
     LaiueTestRuntimeWrite("World provider tests passed.\r\n");
     LAIUE_TEST_SUCCESS();

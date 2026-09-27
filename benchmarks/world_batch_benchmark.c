@@ -27,6 +27,7 @@
 #include "world/world.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -57,6 +58,56 @@ __declspec(dllimport) int __stdcall K32GetProcessMemoryInfo(
 static volatile uint64_t worldBenchSink;
 static uint32_t worldBenchFailures;
 static const LaiueNumericServiceV1* worldBenchNumeric;
+
+typedef struct WorldBenchAllocationHeader
+{
+    uint64_t size;
+    uint64_t alignmentPadding;
+} WorldBenchAllocationHeader;
+
+typedef struct WorldBenchAllocatorStats
+{
+    uint64_t liveBytes;
+    uint64_t peakBytes;
+} WorldBenchAllocatorStats;
+
+static void *WorldBenchAllocate(void *context, uint64_t size)
+{
+    if (size > SIZE_MAX - sizeof(WorldBenchAllocationHeader)) return NULL;
+    WorldBenchAllocationHeader *header = (WorldBenchAllocationHeader *)PlatformAllocate(
+        sizeof(*header) + (size_t)size, false);
+    if (header == NULL) return NULL;
+    header->size = size;
+    WorldBenchAllocatorStats *stats = (WorldBenchAllocatorStats *)context;
+    stats->liveBytes += size;
+    if (stats->liveBytes > stats->peakBytes) stats->peakBytes = stats->liveBytes;
+    return header + 1;
+}
+
+static void *WorldBenchReallocate(void *context, void *memory, uint64_t size)
+{
+    if (memory == NULL) return WorldBenchAllocate(context, size);
+    if (size > SIZE_MAX - sizeof(WorldBenchAllocationHeader)) return NULL;
+    WorldBenchAllocationHeader *header = (WorldBenchAllocationHeader *)memory - 1;
+    uint64_t previousSize = header->size;
+    WorldBenchAllocationHeader *resized = (WorldBenchAllocationHeader *)PlatformReallocate(
+        header, sizeof(*header) + (size_t)size, false);
+    if (resized == NULL) return NULL;
+    resized->size = size;
+    WorldBenchAllocatorStats *stats = (WorldBenchAllocatorStats *)context;
+    stats->liveBytes = stats->liveBytes - previousSize + size;
+    if (stats->liveBytes > stats->peakBytes) stats->peakBytes = stats->liveBytes;
+    return resized + 1;
+}
+
+static void WorldBenchFree(void *context, void *memory)
+{
+    if (memory == NULL) return;
+    WorldBenchAllocationHeader *header = (WorldBenchAllocationHeader *)memory - 1;
+    WorldBenchAllocatorStats *stats = (WorldBenchAllocatorStats *)context;
+    stats->liveBytes -= header->size;
+    PlatformFree(header);
+}
 
 static World* CreateBenchmarkWorld(void)
 {
@@ -366,6 +417,81 @@ static void RunSingleToggle(uint32_t rounds)
     WorldDestroy(world);
 }
 
+// Один чанк сначала растёт до 2048 правок, затем остаётся одна. Учёт через
+// allocator показывает именно удерживаемые World байты, а таймер охватывает
+// только удаление — подготовка высокого уровня занятости в цену не входит.
+static void RunDeltaHighwaterSparse(void)
+{
+    const uint32_t deltaCount = 2048u;
+    WorldBenchAllocatorStats allocatorStats = {0};
+    WorldAllocator allocator = {
+        .context = &allocatorStats,
+        .allocate = WorldBenchAllocate,
+        .reallocate = WorldBenchReallocate,
+        .free = WorldBenchFree,
+    };
+    World *world = WorldCreateWithNumericServiceAndAllocator(
+        NULL, worldBenchNumeric, &allocator);
+    if (world == NULL)
+    {
+        WriteText("RESULT delta_highwater_sparse ERROR world\n");
+        ++worldBenchFailures;
+        return;
+    }
+
+    const uint64_t emptyBytes = allocatorStats.liveBytes;
+    double samples[WORLD_BENCH_SAMPLES];
+    uint64_t highWaterBytes = 0u;
+    uint64_t sparseBytes = 0u;
+    for (uint32_t sample = 0u; sample < WORLD_BENCH_SAMPLES; ++sample)
+    {
+        for (uint32_t index = 0u; index < deltaCount; ++index)
+        {
+            uint32_t localIndex = index * 2u;
+            if (!WorldTrySetBlock(world, 0, localIndex / CHUNK_SIZE,
+                    localIndex % CHUNK_SIZE, (BlockType)5u))
+            {
+                ++worldBenchFailures;
+            }
+        }
+        highWaterBytes = allocatorStats.liveBytes;
+        double start = PlatformMonotonicSeconds();
+        for (uint32_t index = deltaCount; index-- > 1u;)
+        {
+            uint32_t localIndex = index * 2u;
+            if (!WorldTrySetBlock(world, 0, localIndex / CHUNK_SIZE,
+                    localIndex % CHUNK_SIZE, BLOCK_AIR))
+            {
+                ++worldBenchFailures;
+            }
+        }
+        samples[sample] = (PlatformMonotonicSeconds() - start) * 1000.0;
+        sparseBytes = allocatorStats.liveBytes;
+    }
+
+    uint64_t checksum = WorldGetRevision(world) * 1000003u +
+                        WorldGetBlock(world, 0, 0, 0);
+    ReportScenario("delta_highwater_sparse", samples, WORLD_BENCH_SAMPLES,
+        (uint64_t)(deltaCount - 1u) * WORLD_BENCH_SAMPLES, checksum);
+    WriteText("MEMORY delta_highwater_sparse empty=");
+    WriteUnsigned(emptyBytes);
+    WriteText(" high_water=");
+    WriteUnsigned(highWaterBytes);
+    WriteText(" one_remaining=");
+    WriteUnsigned(sparseBytes);
+    WriteText(" delta_capacity_bytes=");
+    WriteUnsigned(highWaterBytes - sparseBytes);
+    WriteText(" peak=");
+    WriteUnsigned(allocatorStats.peakBytes);
+    WriteText("\n");
+    WorldDestroy(world);
+    if (allocatorStats.liveBytes != 0u)
+    {
+        WriteText("ERROR tracked allocator leaked bytes\n");
+        ++worldBenchFailures;
+    }
+}
+
 // === Сценарий: обновление существующих дельт без изменения набора ===
 //
 // Дельты заводятся заранее, затем координаты только перезаписываются
@@ -515,6 +641,7 @@ static void RunBatch(const char* name, uint32_t perChunk, uint32_t chunkCount,
 static void RunAll(void)
 {
     RunSingleToggle(300u);
+    RunDeltaHighwaterSparse();
     RunSingleUpdate("single_update_dense", 2048u, 1u, 200u);
     RunSingleUpdate("single_update_sparse", 1u, 4096u, 50u);
     RunBatch("batch_small", 4u, 2u, 20000u, false);
@@ -528,6 +655,10 @@ static void RunOne(const char* name)
     if (TextEquals(name, "single_toggle"))
     {
         RunSingleToggle(300u);
+    }
+    else if (TextEquals(name, "delta_highwater_sparse"))
+    {
+        RunDeltaHighwaterSparse();
     }
     else if (TextEquals(name, "single_update_dense"))
     {
