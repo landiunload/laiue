@@ -203,6 +203,28 @@ static void TestRotatedBoxRestsOnPillar(void)
     VoxelRigidBodyRelease(&body);
 }
 
+static void TestNearlyAxisAlignedBoxRestsOnFloor(void)
+{
+    // A tiny nonzero rotation must keep using the general SAT axes.
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.25, 0.25, 6.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+    body.orientation[2] = 0.0001;
+    body.orientation[3] = 0.999999995;
+
+    RigidExpect(Advance(&harness, &body, 1u, 512u), "шаги почти выровненного тела выполнены");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(Near(position[2], 0.5, 0.05), "почти выровненный куб лежит на полу");
+    RigidExpect(body.orientation[2] != 0.0, "малый поворот не округляется до выровненного");
+    VoxelRigidBodyRelease(&body);
+}
+
 static void TestThinFloorPushesUp(void)
 {
     // Буфер шага не помещается в кадр стека: сборка без CRT ограничена
@@ -1139,6 +1161,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestWorldContactsUseSharedBudget();
     TestRestsOnFloor();
     TestRotatedBoxRestsOnPillar();
+    TestNearlyAxisAlignedBoxRestsOnFloor();
     TestThinFloorPushesUp();
     TestOverhangingBoxKeepsContact();
     TestTipsOverEdge();

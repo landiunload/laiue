@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -321,6 +322,169 @@ static bool RunDenseProfile(uint32_t bodyCount, bool cached, bool indexed, uint3
     return true;
 }
 
+static bool InitializeWorldOnlyBodies(VoxelRigidBody *bodies, uint32_t bodyCount)
+{
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        VoxelRigidBodyDescription description = {0};
+        description.position[0] = (double)(index % 32u) * 2.0 + 0.5;
+        description.position[1] = (double)(index / 32u) * 2.0 + 0.5;
+        description.position[2] = 0.4999;
+        description.halfExtent[0] = 0.5;
+        description.halfExtent[1] = 0.5;
+        description.halfExtent[2] = 0.5;
+        description.mass = 1.0;
+        description.restitution = 0.0;
+        description.friction = 0.6;
+        if (!VoxelRigidBodyInitialize(&bodies[index], (uint64_t)index + 1u, &description))
+        {
+            for (uint32_t release = 0u; release <= index; ++release)
+                VoxelRigidBodyRelease(&bodies[release]);
+            return false;
+        }
+        if ((index & 1u) != 0u)
+            bodies[index].orientation[3] = -1.0;
+    }
+    return true;
+}
+
+static uint64_t HashProfileDouble(uint64_t hash, double value)
+{
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (hash ^ bits) * UINT64_C(1099511628211);
+}
+
+static bool HashWorldOnlyBodies(const VoxelRigidBody *bodies, uint32_t bodyCount,
+                                uint64_t *outHash)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (uint32_t index = 0u; index < bodyCount; ++index)
+    {
+        const VoxelRigidBody *body = &bodies[index];
+        double position[3];
+        double linear[3];
+        double angular[3];
+        if (!VoxelRigidBodyLocalPosition(body, position) ||
+            !VoxelRigidBodyLinearVelocity(body, linear) ||
+            !VoxelRigidBodyAngularVelocity(body, angular))
+        {
+            return false;
+        }
+        hash = (hash ^ body->stableId) * UINT64_C(1099511628211);
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            hash = HashProfileDouble(hash, position[axis]);
+            hash = HashProfileDouble(hash, linear[axis]);
+            hash = HashProfileDouble(hash, angular[axis]);
+        }
+        for (uint32_t component = 0u; component < 4u; ++component)
+            hash = HashProfileDouble(hash, body->orientation[component]);
+    }
+    *outHash = hash;
+    return true;
+}
+
+static bool RunWorldOnlyProfile(uint32_t bodyCount)
+{
+    uint32_t scratchBytes = VoxelRigidBodyStepScratchBytes(bodyCount);
+    if (scratchBytes == 0u) return false;
+
+    ProfileWorld world = {.solidGround = true};
+    VoxelCollisionSource collision = {
+        .context = &world, .queryBlockPhysics = QueryBlock, .queryDynamicColliders = NULL};
+    VoxelRigidStepSettings settings;
+    VoxelRigidStepSettingsDefault(&settings);
+    settings.gravity[0] = 0.0;
+    settings.gravity[1] = 0.0;
+    settings.gravity[2] = 0.0;
+    settings.sleepLinearSpeed = 0.0;
+    settings.sleepAngularSpeed = 0.0;
+
+    double samples[PROFILE_SAMPLE_COUNT];
+    double worldStageTotal = 0.0;
+    uint64_t referenceContacts = 0u;
+    uint64_t referenceHash = 0u;
+    for (uint32_t sample = 0u; sample < PROFILE_SAMPLE_COUNT; ++sample)
+    {
+        VoxelRigidBody *bodies = PlatformAllocate((size_t)bodyCount * sizeof(*bodies), true);
+        void *scratch = PlatformAllocate(scratchBytes, true);
+        if (bodies == NULL || scratch == NULL)
+        {
+            if (scratch != NULL) PlatformFree(scratch);
+            if (bodies != NULL) PlatformFree(bodies);
+            return false;
+        }
+        if (!InitializeWorldOnlyBodies(bodies, bodyCount))
+        {
+            PlatformFree(scratch);
+            PlatformFree(bodies);
+            return false;
+        }
+
+        uint64_t contacts = 0u;
+        double worldStage = 0.0;
+        double begin = PlatformMonotonicSeconds();
+        for (uint32_t step = 0u; step < PROFILE_STEP_COUNT; ++step)
+        {
+            VoxelRigidStepProfile profile = {0};
+            profile.structSize = sizeof(profile);
+            VoxelRigidStepStats stats;
+            if (!StepOnce(bodies, bodyCount, &collision, &settings, scratch, scratchBytes,
+                          NULL, NULL, &profile) ||
+                !VoxelRigidBodyReadStepStats(scratch, bodyCount, scratchBytes, &stats) ||
+                stats.contactCount == 0u)
+            {
+                for (uint32_t release = 0u; release < bodyCount; ++release)
+                    VoxelRigidBodyRelease(&bodies[release]);
+                PlatformFree(scratch);
+                PlatformFree(bodies);
+                return false;
+            }
+            contacts += stats.contactCount;
+            worldStage += profile.seconds[5u];
+        }
+        samples[sample] =
+            (PlatformMonotonicSeconds() - begin) * 1000.0 / (double)PROFILE_STEP_COUNT;
+        worldStageTotal += worldStage / (double)PROFILE_STEP_COUNT;
+
+        uint64_t stateHash = 0u;
+        if (!HashWorldOnlyBodies(bodies, bodyCount, &stateHash) ||
+            (sample != 0u && (contacts != referenceContacts || stateHash != referenceHash)))
+        {
+            for (uint32_t release = 0u; release < bodyCount; ++release)
+                VoxelRigidBodyRelease(&bodies[release]);
+            PlatformFree(scratch);
+            PlatformFree(bodies);
+            return false;
+        }
+        referenceContacts = contacts;
+        referenceHash = stateHash;
+        profileSink ^= contacts ^ stateHash;
+        for (uint32_t release = 0u; release < bodyCount; ++release)
+            VoxelRigidBodyRelease(&bodies[release]);
+        PlatformFree(scratch);
+        PlatformFree(bodies);
+    }
+
+    WriteText("profile.world_aligned bodies=");
+    WriteUnsigned(bodyCount);
+    WriteText(" median_ms=");
+    WriteMilliseconds(Median(samples, PROFILE_SAMPLE_COUNT));
+    WriteText(" contacts_avg=");
+    WriteUnsigned(referenceContacts / PROFILE_STEP_COUNT);
+    WriteText(" world_ms=");
+    WriteMilliseconds(worldStageTotal / (double)PROFILE_SAMPLE_COUNT * 1000.0);
+    WriteText(" state_hash=");
+    WriteUnsigned(referenceHash);
+    WriteText(" samples=");
+    WriteUnsigned(PROFILE_SAMPLE_COUNT);
+    WriteText(" steps=");
+    WriteUnsigned(PROFILE_STEP_COUNT);
+    WriteText("\n");
+    return true;
+}
+
 LAIUE_TEST_ENTRY(RigidSolverProfileEntryPoint)
 {
     const LaiueNumericServiceV1 *numeric = LaiueNumericGetStaticServiceV1();
@@ -330,6 +494,24 @@ LAIUE_TEST_ENTRY(RigidSolverProfileEntryPoint)
         LaiueTestRuntimeExit(1);
     }
     PhysicsSetNumericService(numeric);
+    char scenario[32] = {0};
+    uint32_t scenarioLength = PlatformGetEnvironmentUtf8(
+        "LAIUE_RIGID_PROFILE_SCENARIO", scenario, (uint32_t)sizeof(scenario));
+    static const char worldOnlyScenario[] = "world_only";
+    bool worldOnly = scenarioLength == sizeof(worldOnlyScenario) - 1u &&
+        scenario[0] == worldOnlyScenario[0];
+    for (uint32_t index = 1u; worldOnly && index < scenarioLength; ++index)
+        worldOnly = scenario[index] == worldOnlyScenario[index];
+    if (worldOnly)
+    {
+        if (!RunWorldOnlyProfile(512u))
+        {
+            WriteText("world-only rigid profile failed\n");
+            LaiueTestRuntimeExit(1);
+        }
+        if (profileSink == UINT64_MAX) WriteText("");
+        LAIUE_TEST_SUCCESS();
+    }
     if (!RunDenseProfile(512u, false, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||
         !RunDenseProfile(512u, true, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||
         !RunDenseProfile(2048u, false, false, 8u, VOXEL_RIGID_SOLVER_CANONICAL) ||

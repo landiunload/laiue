@@ -1176,8 +1176,9 @@ typedef struct RigidBodyCache
     bool hasWorldContact;
     bool hasBodyContact;
     bool collidable;
-    // Per-first-body narrowphase count; occupies former tail padding.
+    // Per-body narrowphase count and exact identity flag occupy tail padding.
     uint32_t candidatePairs;
+    bool exactIdentityOrientation;
 } RigidBodyCache;
 
 _Static_assert(sizeof(RigidBodyCache) == 256u, "body cache keeps its one-line-per-body layout");
@@ -1188,6 +1189,7 @@ _Static_assert(sizeof(RigidBodyCache) == 256u, "body cache keeps its one-line-pe
 static void CompoundChildCache(const RigidBodyCache *bodyCache, const VoxelRigidCompoundBox *box,
                                RigidBodyCache *outCache)
 {
+    outCache->exactIdentityOrientation = bodyCache->exactIdentityOrientation;
     for (int32_t column = 0; column < 3; ++column)
     {
         for (int32_t axis = 0; axis < 3; ++axis)
@@ -1885,10 +1887,12 @@ static void BuildCache(const VoxelRigidBody *body, RigidBodyCache *cache)
             cache->collidable = false;
         }
     }
-    bool axisAligned = body->orientation[0] == 0.0 && body->orientation[1] == 0.0 &&
-                       body->orientation[2] == 0.0 &&
-                       (body->orientation[3] == 1.0 || body->orientation[3] == -1.0);
-    if (axisAligned)
+    bool exactIdentityOrientation = body->orientation[0] == 0.0 &&
+                                   body->orientation[1] == 0.0 &&
+                                   body->orientation[2] == 0.0 &&
+                                   (body->orientation[3] == 1.0 || body->orientation[3] == -1.0);
+    cache->exactIdentityOrientation = exactIdentityOrientation;
+    if (exactIdentityOrientation)
     {
         cache->columns[0][0] = 1.0;
         cache->columns[0][1] = 0.0;
@@ -1939,7 +1943,6 @@ static void BuildCache(const VoxelRigidBody *body, RigidBodyCache *cache)
     }
     cache->radius = largestRadius;
 
-    (void)axisAligned;
 }
 
 static bool AppendContact(RigidStepScratch *scratch, const RigidContact *contact)
@@ -2674,38 +2677,45 @@ static bool BuildBlockManifold(const RigidBodyCache *cache, const double *halfEx
         const double *direction = cache->columns[axis];
         double reach =
             BoxRadius(cache, halfExtent, direction) + AxisAlignedRadius(blockHalf, direction);
+        if (cache->exactIdentityOrientation)
+        {
+            worldReach[axis] = reach;
+        }
         if (reach - AbsoluteDouble(Dot3(separation, direction)) <= 0.0)
         {
             return false;
         }
     }
-    for (int32_t axis = 0; axis < 3; ++axis)
+    if (!cache->exactIdentityOrientation)
     {
-        double direction[3] = {0.0, 0.0, 0.0};
-        direction[axis] = 1.0;
-        worldReach[axis] = BoxRadius(cache, halfExtent, direction) + blockHalf[axis];
-        if (worldReach[axis] - AbsoluteDouble(separation[axis]) <= 0.0)
+        for (int32_t axis = 0; axis < 3; ++axis)
         {
-            return false;
-        }
-    }
-    for (int32_t bodyAxis = 0; bodyAxis < 3; ++bodyAxis)
-    {
-        for (int32_t worldAxis = 0; worldAxis < 3; ++worldAxis)
-        {
-            double unit[3] = {0.0, 0.0, 0.0};
-            unit[worldAxis] = 1.0;
-            double crossAxis[3];
-            Cross3(cache->columns[bodyAxis], unit, crossAxis);
-            if (!(Dot3(crossAxis, crossAxis) > 1.0e-12))
-            {
-                continue;
-            }
-            double reach =
-                BoxRadius(cache, halfExtent, crossAxis) + AxisAlignedRadius(blockHalf, crossAxis);
-            if (reach - AbsoluteDouble(Dot3(separation, crossAxis)) <= 0.0)
+            double direction[3] = {0.0, 0.0, 0.0};
+            direction[axis] = 1.0;
+            worldReach[axis] = BoxRadius(cache, halfExtent, direction) + blockHalf[axis];
+            if (worldReach[axis] - AbsoluteDouble(separation[axis]) <= 0.0)
             {
                 return false;
+            }
+        }
+        for (int32_t bodyAxis = 0; bodyAxis < 3; ++bodyAxis)
+        {
+            for (int32_t worldAxis = 0; worldAxis < 3; ++worldAxis)
+            {
+                double unit[3] = {0.0, 0.0, 0.0};
+                unit[worldAxis] = 1.0;
+                double crossAxis[3];
+                Cross3(cache->columns[bodyAxis], unit, crossAxis);
+                if (!(Dot3(crossAxis, crossAxis) > 1.0e-12))
+                {
+                    continue;
+                }
+                double reach =
+                    BoxRadius(cache, halfExtent, crossAxis) + AxisAlignedRadius(blockHalf, crossAxis);
+                if (reach - AbsoluteDouble(Dot3(separation, crossAxis)) <= 0.0)
+                {
+                    return false;
+                }
             }
         }
     }
