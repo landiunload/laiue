@@ -25,6 +25,7 @@ typedef struct LaiueCharacterPositionV1
 
 typedef struct LaiueCharacterInputV1
 {
+    /* Digital whole-step axes unless ANALOG is set; analog axes are Q15. */
     int32_t moveX;
     int32_t moveY;
     uint32_t flags;
@@ -32,6 +33,10 @@ typedef struct LaiueCharacterInputV1
 
 #define LAIUE_CHARACTER_INPUT_JUMP UINT32_C(1) << 0
 #define LAIUE_CHARACTER_INPUT_SPRINT UINT32_C(1) << 1
+/* Opt-in normalized fixed-point axes for analog sources. Without this flag,
+ * moveX/moveY retain their original whole-step digital meaning. */
+#define LAIUE_CHARACTER_INPUT_ANALOG (UINT32_C(1) << 2)
+#define LAIUE_CHARACTER_INPUT_AXIS_SCALE INT32_C(32768)
 
 typedef struct LaiueCharacterCollisionV1 LaiueCharacterCollisionV1;
 typedef struct LaiueCharacterControllerV1 LaiueCharacterControllerV1;

@@ -36,6 +36,7 @@ target_link_libraries(laiue_walk_android PRIVATE
     laiue_render
     laiue_scene_math
     laiue_scene
+    laiue_math_support
     laiue_media_support
     android
     log

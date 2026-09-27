@@ -10,6 +10,7 @@
 #include "scene/math_service.h"
 #include "walk_terrain.h"
 #include "walk_runtime.h"
+#include "touch_controls.h"
 #include "media/image.h"
 
 #include <android/asset_manager.h>
@@ -32,8 +33,8 @@
     (ANDROID_WALK_ACTIVE_CHUNK_DIAMETER * ANDROID_WALK_ACTIVE_CHUNK_DIAMETER)
 
 /* Touch controls are deliberately owned by the walk example rather than by
- * the renderer or the Android window provider.  The left lower quadrant is a
- * fixed virtual stick, the two lower-right circles are sprint and jump, and
+ * the renderer or the Android window provider. The lower-left circle is a
+ * fixed virtual stick, the lower-right circles toggle sprint and jump, and
  * the remaining right-hand surface is reserved for camera look. */
 #define ANDROID_WALK_TOUCH_LEFT_ZONE 0.48f
 #define ANDROID_WALK_TOUCH_LOWER_ZONE 0.46f
@@ -85,7 +86,7 @@ struct AndroidWalkState
     bool touchActive;
     bool joystickActive;
     bool lookActive;
-    bool sprintActive;
+    bool sprintToggled;
     bool touchUiReady;
     float joystickOriginX;
     float joystickOriginY;
@@ -150,7 +151,7 @@ static void AndroidTouchLayout(const AndroidWalkState *state,
     if (joystickRadius != NULL) *joystickRadius = stickRadius;
     if (jumpCenterX != NULL) *jumpCenterX = width - margin - actionRadius;
     if (jumpCenterY != NULL) *jumpCenterY = height - margin - actionRadius;
-    if (sprintCenterX != NULL) *sprintCenterX = width - margin - actionRadius * 3.0f;
+    if (sprintCenterX != NULL) *sprintCenterX = width - margin - actionRadius * 3.8f;
     if (sprintCenterY != NULL) *sprintCenterY = height - margin - actionRadius;
     if (buttonRadius != NULL) *buttonRadius = actionRadius;
 }
@@ -163,13 +164,6 @@ static bool AndroidTouchInsideCircle(float x, float y, float centerX, float cent
     return dx * dx + dy * dy <= radius * radius;
 }
 
-static float AndroidTouchClamp(float value)
-{
-    if (value < -1.0f) return -1.0f;
-    if (value > 1.0f) return 1.0f;
-    return value;
-}
-
 static void AndroidClearTouchState(AndroidWalkState *state)
 {
     if (state == NULL)
@@ -177,7 +171,6 @@ static void AndroidClearTouchState(AndroidWalkState *state)
     state->touchActive = false;
     state->joystickActive = false;
     state->lookActive = false;
-    state->sprintActive = false;
     state->joystickX = 0.0f;
     state->joystickY = 0.0f;
     state->lookDeltaX = 0;
@@ -731,7 +724,7 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
                                           buttonHitRadius))
         {
             state->sprintPointerId = pointerId;
-            state->sprintActive = true;
+            state->sprintToggled = !state->sprintToggled;
         }
         else if (state->joystickPointerId < 0 && x < width * ANDROID_WALK_TOUCH_LEFT_ZONE &&
                  y > height * ANDROID_WALK_TOUCH_LOWER_ZONE)
@@ -762,8 +755,10 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
             {
                 float dx = (px - state->joystickOriginX) / joystickRadius;
                 float dy = (py - state->joystickOriginY) / joystickRadius;
-                state->joystickX = AndroidTouchClamp(dx);
-                state->joystickY = -AndroidTouchClamp(dy);
+                dy = -dy;
+                AndroidWalkClampStick(&dx, &dy);
+                state->joystickX = dx;
+                state->joystickY = dy;
             }
             else if (id == state->lookPointerId)
             {
@@ -789,14 +784,11 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
             state->lookActive = false;
         }
         if (pointerId == state->sprintPointerId)
-        {
             state->sprintPointerId = -1;
-            state->sprintActive = false;
-        }
         if (pointerId == state->jumpPointerId)
             state->jumpPointerId = -1;
         state->touchActive = state->joystickActive || state->lookActive ||
-                             state->sprintActive || state->jumpPointerId >= 0;
+                             state->sprintPointerId >= 0 || state->jumpPointerId >= 0;
     }
     return 1;
 }
@@ -973,16 +965,16 @@ static void AndroidSubmitTouchUi(AndroidWalkState *state, int32_t width, int32_t
         joystickCenterX - joystickRadius, joystickCenterY - joystickRadius,
         joystickCenterX + joystickRadius, joystickCenterY + joystickRadius,
         joystickRadius, UINT32_C(0x702A3448));
-    const float knobX = joystickCenterX + state->joystickX * joystickRadius * 0.62f;
-    const float knobY = joystickCenterY - state->joystickY * joystickRadius * 0.62f;
+    const float knobX = joystickCenterX + state->joystickX * joystickRadius * 0.58f;
+    const float knobY = joystickCenterY - state->joystickY * joystickRadius * 0.58f;
     const float knobRadius = joystickRadius * 0.42f;
     quads[quadCount++] = AndroidTouchQuad(
         knobX - knobRadius, knobY - knobRadius, knobX + knobRadius, knobY + knobRadius,
         knobRadius, state->joystickActive ? UINT32_C(0xD0E7F1FF) : UINT32_C(0xA0B9C7D8));
 
-    const uint32_t sprintColor = state->sprintActive
-                                     ? UINT32_C(0xE0FFB347)
-                                     : UINT32_C(0x906B5528);
+    const uint32_t sprintColor = state->sprintToggled
+                                     ? UINT32_C(0xE047B3FF)
+                                     : UINT32_C(0x90425A70);
     quads[quadCount++] = AndroidTouchQuad(
         sprintCenterX - buttonRadius, sprintCenterY - buttonRadius,
         sprintCenterX + buttonRadius, sprintCenterY + buttonRadius,
@@ -1031,11 +1023,14 @@ static void AndroidStep(AndroidWalkState *state)
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene != NULL && state->scene->cameraGetForwardVector != NULL)
             state->scene->cameraGetForwardVector(&state->camera, forward);
-        const float worldX = forwardInput * forward[0] + strafe * forward[1];
-        const float worldY = forwardInput * forward[1] - strafe * forward[0];
-        input.moveX = worldX > 0.35f ? 1 : (worldX < -0.35f ? -1 : 0);
-        input.moveY = worldY > 0.35f ? 1 : (worldY < -0.35f ? -1 : 0);
-        if (state->keyDown[4] || state->sprintActive)
+        float worldX = 0.0f;
+        float worldY = 0.0f;
+        AndroidWalkCameraRelativeMovement(
+            strafe, forwardInput, forward[0], forward[1], &worldX, &worldY);
+        input.moveX = AndroidWalkAxisToFixed(worldX);
+        input.moveY = AndroidWalkAxisToFixed(worldY);
+        input.flags |= LAIUE_CHARACTER_INPUT_ANALOG;
+        if (state->keyDown[4] || state->sprintToggled)
             input.flags |= LAIUE_CHARACTER_INPUT_SPRINT;
         if (state->jumpPending)
         {
