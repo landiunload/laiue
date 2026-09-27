@@ -248,6 +248,20 @@ static TexturePackLoadStatus Build(LaiueContentCatalog *catalog, const wchar_t *
     return status;
 }
 
+static TexturePackLoadStatus BuildBaseLevel(LaiueContentCatalog *catalog,
+                                            const wchar_t *const *names,
+                                            uint32_t count, TexturePackData *outPack)
+{
+    memset(outPack, 0, sizeof(*outPack));
+    TexturePackLoadStatus status =
+        TexturePackBuildBaseLevelFrom(catalog, names, count, outPack);
+    if (status == TEXTURE_PACK_LOAD_OK || status == TEXTURE_PACK_LOAD_INCOMPLETE)
+    {
+        Expect(outPack->pixels != NULL, "a base-level pack must carry pixels");
+    }
+    return status;
+}
+
 static void ReleasePack(TexturePackData *pack)
 {
     PlatformFree(pack->allocation);
@@ -503,6 +517,105 @@ static TEXTURE_TEST_NOINLINE void TestSeparateNormalSharedFrame(LaiueContentCata
     ReleasePack(&pack);
 }
 
+// The Vulkan backend creates single-mip images. Building its pack must keep
+// the exact base pixels and animation metadata while omitting unused levels.
+static void ExpectBaseLevelMatchesFull(const TexturePackData *full,
+                                       const TexturePackData *base)
+{
+    uint32_t mip0Bytes = (uint32_t)full->width * full->height * 4u;
+    uint32_t fullSliceBytes = (uint32_t)ChainBytes(full->width);
+    Expect(full->mipCount >= 1u && base->mipCount == 1u,
+           "base-level mode must retain exactly one mip");
+    Expect(base->pixelBytes == mip0Bytes * base->sliceCount &&
+               base->pixelBytes <= full->pixelBytes &&
+               full->pixelBytes == ChainBytes(full->width) * full->sliceCount,
+           "base-level mode must allocate only mip 0 for each slice");
+    if (full->width > 1u)
+        Expect(base->pixelBytes < full->pixelBytes,
+               "base-level mode must omit lower mips for textures larger than 1x1");
+    Expect(full->width == base->width && full->height == base->height &&
+               full->sliceCount == base->sliceCount && full->materialCount == base->materialCount &&
+               memcmp(full->animation, base->animation, sizeof(full->animation)) == 0 &&
+               memcmp(full->sliceMilliseconds, base->sliceMilliseconds,
+                      sizeof(full->sliceMilliseconds)) == 0,
+           "base-level mode must preserve dimensions and animation metadata");
+    for (uint32_t slice = 0u; slice < full->sliceCount; ++slice)
+    {
+        Expect(memcmp(full->pixels + (size_t)slice * fullSliceBytes,
+                      base->pixels + (size_t)slice * mip0Bytes, mip0Bytes) == 0,
+               "base albedo pixels must match full-pack mip 0");
+        if (full->normalPixels != NULL || base->normalPixels != NULL)
+        {
+            Expect(full->normalPixels != NULL && base->normalPixels != NULL &&
+                       memcmp(full->normalPixels + (size_t)slice * fullSliceBytes,
+                              base->normalPixels + (size_t)slice * mip0Bytes, mip0Bytes) == 0,
+                   "base normal pixels must match full-pack mip 0");
+        }
+    }
+}
+
+static TEXTURE_TEST_NOINLINE void TestBaseLevelPackMatchesFull(
+    LaiueContentCatalog *catalog, TestPaths *paths)
+{
+    wchar_t *path = paths->slots[7];
+    MainFile(paths, path, PATH_CAP, L"base_level", L".lt");
+
+    uint8_t albedo[2u * SOLID_BYTES];
+    uint8_t normals[2u * SOLID_BYTES];
+    FillSolid(albedo, 4u, 4u, kRed);
+    FillSolid(albedo + SOLID_BYTES, 4u, 4u, kGreen);
+    FillSolid(normals, 4u, 4u, kBlue);
+    FillSolid(normals + SOLID_BYTES, 4u, 4u, kMagenta);
+    static const uint16_t durations[2] = {40u, 90u};
+    WriteLtV2(path, albedo, normals, 4u, 4u, 2u, durations, 0u, 0u);
+
+    static const wchar_t *const names[1] = {L"main/base_level"};
+    TexturePackData full;
+    TexturePackData base;
+    Expect(Build(catalog, names, 1u, &full) == TEXTURE_PACK_LOAD_OK,
+           "full-mip reference pack status");
+    Expect(BuildBaseLevel(catalog, names, 1u, &base) == TEXTURE_PACK_LOAD_OK,
+           "base-level pack status");
+
+    ExpectBaseLevelMatchesFull(&full, &base);
+    ReleasePack(&full);
+    ReleasePack(&base);
+
+    // A single normal frame is repeated across all albedo frames. The compact
+    // path must retain both copies while storing only one mip per slice.
+    wchar_t *normalPath = paths->slots[6];
+    MainFile(paths, path, PATH_CAP, L"base_shared", L".lt");
+    MainFile(paths, normalPath, PATH_CAP, L"base_shared.normal", L".lt");
+    WriteLtV2(path, albedo, NULL, 4u, 4u, 2u, durations, 0u, 0u);
+    WriteLtV2(normalPath, normals, NULL, 4u, 4u, 1u, NULL, 0u, 0u);
+    static const wchar_t *const sharedNames[1] = {L"main/base_shared"};
+    Expect(Build(catalog, sharedNames, 1u, &full) == TEXTURE_PACK_LOAD_OK,
+           "full shared-normal pack status");
+    Expect(BuildBaseLevel(catalog, sharedNames, 1u, &base) == TEXTURE_PACK_LOAD_OK,
+           "base shared-normal pack status");
+    ExpectBaseLevelMatchesFull(&full, &base);
+    Expect(memcmp(base.normalPixels, base.normalPixels + SOLID_BYTES, SOLID_BYTES) == 0,
+           "a shared normal frame must be copied to each base-level slice");
+    ReleasePack(&full);
+    ReleasePack(&base);
+}
+
+static TEXTURE_TEST_NOINLINE void TestBaseLevelMissingMaterial(LaiueContentCatalog *catalog)
+{
+    static const wchar_t *const names[1] = {L"main/base_missing"};
+    TexturePackData full;
+    TexturePackData base;
+    Expect(Build(catalog, names, 1u, &full) == TEXTURE_PACK_LOAD_INCOMPLETE,
+           "full missing-material pack status");
+    Expect(BuildBaseLevel(catalog, names, 1u, &base) == TEXTURE_PACK_LOAD_INCOMPLETE,
+           "base missing-material pack status");
+    ExpectBaseLevelMatchesFull(&full, &base);
+    Expect(TexelEquals(base.pixels, kMissing),
+           "base-level missing material must keep its neutral texel");
+    ReleasePack(&full);
+    ReleasePack(&base);
+}
+
 // === Отсутствующий материал ===
 
 static TEXTURE_TEST_NOINLINE void TestMissingMaterial(LaiueContentCatalog *catalog)
@@ -753,6 +866,8 @@ LAIUE_TEST_ENTRY(TexturePackBuildTestEntryPoint)
     TestSingleTextureV2Normals(catalog, paths);
     TestNormalGeometry(catalog, paths);
     TestSeparateNormalSharedFrame(catalog, paths);
+    TestBaseLevelPackMatchesFull(catalog, paths);
+    TestBaseLevelMissingMaterial(catalog);
     TestMissingMaterial(catalog);
     TestStaleCache(catalog, paths);
     TestCorruptCache(catalog, paths);

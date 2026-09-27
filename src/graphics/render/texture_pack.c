@@ -71,9 +71,11 @@ bool TexturePackMaterialNamesSet(TexturePackMaterialNames *names, const wchar_t 
     return true;
 }
 
-TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
-                                                const wchar_t *const *materialNames,
-                                                uint32_t materialCount, TexturePackData *outPack)
+static TexturePackLoadStatus LoadActiveFrom(LaiueContentCatalog *catalog,
+                                            const wchar_t *const *materialNames,
+                                            uint32_t materialCount,
+                                            TexturePackData *outPack,
+                                            bool baseLevelOnly)
 {
     if (outPack == NULL)
     {
@@ -91,7 +93,23 @@ TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
     // возвращаются до первой записи в него, поэтому поставленный выше
     // нейтральный слой сохраняется. Так нет ни временного TexturePackData
     // на стеке, ни копии всего описания пака в outPack.
-    return TexturePackBuildFrom(catalog, materialNames, materialCount, outPack);
+    return baseLevelOnly
+               ? TexturePackBuildBaseLevelFrom(catalog, materialNames, materialCount, outPack)
+               : TexturePackBuildFrom(catalog, materialNames, materialCount, outPack);
+}
+
+TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
+                                                const wchar_t *const *materialNames,
+                                                uint32_t materialCount, TexturePackData *outPack)
+{
+    return LoadActiveFrom(catalog, materialNames, materialCount, outPack, false);
+}
+
+TexturePackLoadStatus TexturePackLoadActiveBaseLevelFrom(
+    LaiueContentCatalog *catalog, const wchar_t *const *materialNames,
+    uint32_t materialCount, TexturePackData *outPack)
+{
+    return LoadActiveFrom(catalog, materialNames, materialCount, outPack, true);
 }
 
 

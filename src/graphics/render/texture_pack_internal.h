@@ -91,6 +91,13 @@ TexturePackLoadStatus TexturePackLoadActiveFrom(LaiueContentCatalog *catalog,
 TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
                                            const wchar_t *const *materialNames,
                                            uint32_t materialCount, TexturePackData *outPack);
+// Vulkan uploads only mip 0; use this path to avoid building unused levels.
+TexturePackLoadStatus TexturePackBuildBaseLevelFrom(
+    LaiueContentCatalog *catalog, const wchar_t *const *materialNames,
+    uint32_t materialCount, TexturePackData *outPack);
+TexturePackLoadStatus TexturePackLoadActiveBaseLevelFrom(
+    LaiueContentCatalog *catalog, const wchar_t *const *materialNames,
+    uint32_t materialCount, TexturePackData *outPack);
 bool TexturePackGetSubresource(const TexturePackData *pack, uint32_t slice, uint32_t mip,
                                TexturePackSubresource *outSubresource);
 bool TexturePackGetNormalSubresource(const TexturePackData *pack, uint32_t slice, uint32_t mip,
