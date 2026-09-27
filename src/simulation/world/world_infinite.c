@@ -1980,4 +1980,22 @@ static void ChunkRemoveDeltaAt(Chunk* chunk, uint32_t position)
 {
     ChunkShiftLeft(chunk->deltas, position, chunk->deltaCount);
     --chunk->deltaCount;
+    // Wait for substantial slack, then keep only twice the live entries. This
+    // returns high-water memory without reallocating on ordinary removals.
+    if (chunk->deltaCount != 0U && chunk->deltaCapacity > 16U &&
+        chunk->deltaCount <= chunk->deltaCapacity / 16U)
+    {
+        uint32_t newCapacity = chunk->deltaCount * 2U;
+        if (newCapacity < 16U) newCapacity = 16U;
+        if (newCapacity < chunk->deltaCapacity)
+        {
+            DeltaEntry* shrunk = (DeltaEntry*)WorldReallocateMemory(&chunk->allocator,
+                chunk->deltas, (size_t)newCapacity * sizeof(*shrunk), false);
+            if (shrunk != NULL)
+            {
+                chunk->deltas = shrunk;
+                chunk->deltaCapacity = newCapacity;
+            }
+        }
+    }
 }
