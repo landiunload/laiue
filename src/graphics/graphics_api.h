@@ -42,7 +42,7 @@ typedef uint64_t LaiueGraphicsHandle;
 #define LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES 0u
 #define LAIUE_GRAPHICS_TOPOLOGY_LINES 1u
 #define LAIUE_GRAPHICS_TOPOLOGY_POINTS 2u
-/* The first portable texture contract is a 2D, single-mip RGBA8 image. */
+/* Portable sampled textures use RGBA8 storage and may include a full mip chain. */
 #define LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM 0u
 #define LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB 1u
 
@@ -126,8 +126,8 @@ typedef struct LaiueGraphicsBufferUploadV1
     uint64_t sizeBytes;
 } LaiueGraphicsBufferUploadV1;
 
-/* Optional texture upload tail.  The first provider revision accepts one
- * tightly packed RGBA8 mip; rowPitchBytes may be zero to select width * 4. */
+/* Optional texture upload tail. Texture data is tightly packed RGBA8; a zero
+ * rowPitchBytes selects the tightly packed width for the selected mip level. */
 typedef struct LaiueGraphicsTextureUploadV1
 {
     uint32_t structSize;
@@ -135,7 +135,11 @@ typedef struct LaiueGraphicsTextureUploadV1
     const void *data;
     uint64_t sizeBytes;
     uint32_t rowPitchBytes;
-    uint32_t reserved;
+    union
+    {
+        uint32_t mipLevel;
+        uint32_t reserved; /* source compatibility; zero selects the base mip */
+    };
 } LaiueGraphicsTextureUploadV1;
 
 typedef struct LaiueGraphicsDrawItemV1

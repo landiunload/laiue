@@ -23,6 +23,7 @@
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
 #include <stdbool.h>
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -57,9 +58,15 @@
     (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 3u)
 #define ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS \
     (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 2u)
+#define ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS 4u
+#define ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS 8u
+#define ANDROID_WALK_RAGDOLL_JOINT_VERTEX_COUNT \
+    (ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS * \
+     ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS * 6u)
 #define ANDROID_WALK_RAGDOLL_VERTEX_COUNT \
     (WALK_RAGDOLL_BODY_COUNT * 6u * ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * \
-     ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 6u)
+     ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 6u + \
+     WALK_RAGDOLL_JOINT_COUNT * ANDROID_WALK_RAGDOLL_JOINT_VERTEX_COUNT)
 #define ANDROID_WALK_RAGDOLL_STABLE_ID UINT64_C(0x57414C4B52414744)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
@@ -389,6 +396,7 @@ static bool AndroidLoadTextureAsset(AndroidWalkState *state, const char *assetPa
     uint8_t *encoded = (uint8_t *)PlatformAllocate(encodedBytes, false);
     uint8_t *pixels = NULL;
     uint8_t *scratch = NULL;
+    uint8_t *generatedMip = NULL;
     bool succeeded = false;
     if (encoded == NULL)
         goto cleanup;
@@ -418,29 +426,59 @@ static bool AndroidLoadTextureAsset(AndroidWalkState *state, const char *assetPa
                     scratch, info.scratchBytes) != IMAGE_OK)
         goto cleanup;
 
+    uint32_t mipLevels = 1u;
+    for (uint32_t largestDimension = info.width > info.height ? info.width : info.height;
+         largestDimension > 1u; largestDimension >>= 1u)
+        ++mipLevels;
     LaiueGraphicsTextureDescV1 description = {
         .structSize = sizeof(description),
         .format = LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB,
         .extent = {info.width, info.height, 1u},
-        .mipLevels = 1u,
+        .mipLevels = mipLevels,
         .usageFlags = 0u,
     };
     if (state->device->createTexture(state->device, &description, outTexture) == 0u)
         goto cleanup;
-    LaiueGraphicsTextureUploadV1 upload = {
-        .structSize = sizeof(upload),
-        .texture = *outTexture,
-        .data = pixels,
-        .sizeBytes = info.frameBytes,
-        .rowPitchBytes = info.width * 4u,
-        .reserved = 0u,
-    };
-    succeeded = state->device->uploadTexture(state->device, &upload) != 0u;
+    const uint8_t *mipSource = pixels;
+    uint32_t mipWidth = info.width;
+    uint32_t mipHeight = info.height;
+    for (uint32_t mipLevel = 0u; mipLevel < mipLevels; ++mipLevel)
+    {
+        LaiueGraphicsTextureUploadV1 upload = {
+            .structSize = sizeof(upload),
+            .texture = *outTexture,
+            .data = mipSource,
+            .sizeBytes = (uint64_t)mipWidth * mipHeight * 4u,
+            .rowPitchBytes = mipWidth * 4u,
+            .mipLevel = mipLevel,
+        };
+        if (state->device->uploadTexture(state->device, &upload) == 0u)
+            goto cleanup;
+        if (mipLevel + 1u == mipLevels)
+            break;
+
+        const uint32_t nextWidth = mipWidth > 1u ? mipWidth >> 1u : 1u;
+        const uint32_t nextHeight = mipHeight > 1u ? mipHeight >> 1u : 1u;
+        const uint64_t nextBytes = (uint64_t)nextWidth * nextHeight * 4u;
+        if (nextBytes > UINT32_MAX)
+            goto cleanup;
+        uint8_t *nextMip = (uint8_t *)PlatformAllocate((uint32_t)nextBytes, false);
+        if (nextMip == NULL)
+            goto cleanup;
+        ImageResample(mipSource, mipWidth, mipHeight, nextMip, nextWidth, nextHeight);
+        PlatformFree(generatedMip);
+        generatedMip = nextMip;
+        mipSource = generatedMip;
+        mipWidth = nextWidth;
+        mipHeight = nextHeight;
+    }
+    succeeded = true;
 
 cleanup:
     if (asset != NULL)
         AAsset_close(asset);
     PlatformFree(scratch);
+    PlatformFree(generatedMip);
     PlatformFree(pixels);
     PlatformFree(encoded);
     if (!succeeded)
@@ -729,6 +767,105 @@ static bool AndroidUpdateRagdollBuffer(AndroidWalkState *state)
                 }
             }
     }
+    /* The collision bodies stay separate boxes. Small render-only spheres
+     * at their ball joints hide the seams without changing deterministic
+     * contacts or making the physical limbs wider. */
+    static const uint8_t triangleCorner[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    static const float identity[9] = {1.0f, 0.0f, 0.0f,
+                                      0.0f, 1.0f, 0.0f,
+                                      0.0f, 0.0f, 1.0f};
+    const double pi = 3.14159265358979323846;
+    double jointLatitudeSin[ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
+    double jointLatitudeCos[ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
+    double jointLongitudeSin[ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
+    double jointLongitudeCos[ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
+    for (uint32_t index = 0u;
+         index <= ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS; ++index)
+    {
+        const double angle = -0.5 * pi + pi * (double)index /
+            ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
+        jointLatitudeSin[index] = ScalarSin((float)angle);
+        jointLatitudeCos[index] = ScalarCos((float)angle);
+    }
+    for (uint32_t index = 0u;
+         index <= ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS; ++index)
+    {
+        const double angle = 2.0 * pi * (double)index /
+            ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS;
+        jointLongitudeSin[index] = ScalarSin((float)angle);
+        jointLongitudeCos[index] = ScalarCos((float)angle);
+    }
+    for (uint32_t jointIndex = 0u; jointIndex < state->ragdoll.jointCount;
+         ++jointIndex)
+    {
+        const VoxelRagdollBallJointDefinition *joint =
+            &state->ragdoll.joints[jointIndex];
+        const VoxelRigidBody *parent = &state->ragdoll.bodies[joint->bodyA];
+        const VoxelRigidBody *child = &state->ragdoll.bodies[joint->bodyB];
+        double center[3];
+        float rotation[9];
+        if (!VoxelRigidBodyLocalPosition(parent, center))
+            return false;
+        VoxelRigidBodyOrientationMatrix(parent, rotation);
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            center[axis] += (double)rotation[axis] * joint->anchorA[0] +
+                            (double)rotation[3u + axis] * joint->anchorA[1] +
+                            (double)rotation[6u + axis] * joint->anchorA[2];
+        double smallestExtent = DBL_MAX;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            const double extent = fmin(parent->halfExtent[axis],
+                                       child->halfExtent[axis]);
+            if (extent < smallestExtent)
+                smallestExtent = extent;
+        }
+        const double radius = smallestExtent * 0.88;
+        for (uint32_t latitude = 0u;
+             latitude < ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
+             ++latitude)
+            for (uint32_t longitude = 0u;
+                 longitude < ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS;
+                 ++longitude)
+            {
+                const double latitudeSin[2] = {
+                    jointLatitudeSin[latitude], jointLatitudeSin[latitude + 1u],
+                };
+                const double latitudeCos[2] = {
+                    jointLatitudeCos[latitude], jointLatitudeCos[latitude + 1u],
+                };
+                const double longitudeSin[2] = {
+                    jointLongitudeSin[longitude], jointLongitudeSin[longitude + 1u],
+                };
+                const double longitudeCos[2] = {
+                    jointLongitudeCos[longitude], jointLongitudeCos[longitude + 1u],
+                };
+                const double points[4][3] = {
+                    {radius * latitudeCos[0] * longitudeCos[0],
+                     radius * latitudeCos[0] * longitudeSin[0],
+                     radius * latitudeSin[0]},
+                    {radius * latitudeCos[0] * longitudeCos[1],
+                     radius * latitudeCos[0] * longitudeSin[1],
+                     radius * latitudeSin[0]},
+                    {radius * latitudeCos[1] * longitudeCos[1],
+                     radius * latitudeCos[1] * longitudeSin[1],
+                     radius * latitudeSin[1]},
+                    {radius * latitudeCos[1] * longitudeCos[0],
+                     radius * latitudeCos[1] * longitudeSin[0],
+                     radius * latitudeSin[1]},
+                };
+                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
+                {
+                    const uint32_t corner = triangleCorner[vertex];
+                    if (!AndroidWriteRagdollVertex(
+                            &vertices[vertexIndex++], state, center, identity,
+                            points[corner], 0.0f, 0.0f,
+                            colors[joint->bodyA]))
+                        return false;
+                }
+            }
+    }
+    if (vertexIndex != ANDROID_WALK_RAGDOLL_VERTEX_COUNT)
+        return false;
     LaiueGraphicsBufferUploadV1 upload = {
         .structSize = sizeof(upload),
         .buffer = state->ragdollBuffer,
@@ -746,8 +883,9 @@ static void AndroidBuildTerrainSkirt(LaiueGraphicsVertexV2 *vertices,
     const float maxX = ANDROID_WALK_TEXTURED_TERRAIN_MAX_X;
     const float maxY = ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y;
     const float padding = 0.01f;
-    const float uvSide[4][2] = {{0.0f, 0.0f}, {192.0f, 0.0f},
-                                {192.0f, topZ - bottomZ}, {0.0f, topZ - bottomZ}};
+    const float uvSide[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
+                                {24.0f, (topZ - bottomZ) / 8.0f},
+                                {0.0f, (topZ - bottomZ) / 8.0f}};
     const float faces[4][4][3] = {
         {{minX, minY - padding, bottomZ}, {maxX, minY - padding, bottomZ},
          {maxX, minY - padding, topZ}, {minX, minY - padding, topZ}},
@@ -781,8 +919,8 @@ static bool AndroidCreateTexturedTerrain(AndroidWalkState *state)
 
     LaiueGraphicsSamplerDescV1 sampler = {
         .structSize = sizeof(sampler),
-        .minFilter = LAIUE_GRAPHICS_FILTER_NEAREST,
-        .magFilter = LAIUE_GRAPHICS_FILTER_NEAREST,
+        .minFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
+        .magFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
         .addressModeU = LAIUE_GRAPHICS_ADDRESS_REPEAT,
         .addressModeV = LAIUE_GRAPHICS_ADDRESS_REPEAT,
         .addressModeW = LAIUE_GRAPHICS_ADDRESS_REPEAT,
@@ -798,8 +936,8 @@ static bool AndroidCreateTexturedTerrain(AndroidWalkState *state)
         {ANDROID_WALK_TEXTURED_TERRAIN_MAX_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
         {ANDROID_WALK_TEXTURED_TERRAIN_MIN_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
     };
-    const float topUv[4][2] = {{0.0f, 0.0f}, {192.0f, 0.0f},
-                               {192.0f, 192.0f}, {0.0f, 192.0f}};
+    const float topUv[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
+                               {24.0f, 24.0f}, {0.0f, 24.0f}};
     uint32_t topCount = 0u;
     AndroidAppendTerrainQuad(top, &topCount, topPositions, topUv);
 
@@ -1195,6 +1333,7 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
             return;
         state->renderOrigin[0] = floor(pelvis[0] / 64.0) * 64.0;
         state->renderOrigin[1] = floor(pelvis[1] / 64.0) * 64.0;
+        state->renderOrigin[2] = floor(pelvis[2] / 64.0) * 64.0;
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene->cameraGetForwardVector != NULL)
             state->scene->cameraGetForwardVector(&state->camera, forward);
@@ -1214,7 +1353,8 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
             (float)(pelvis[0] - state->renderOrigin[0]) - forward[0] * 5.5f;
         state->cameraRelativeEye[1] =
             (float)(pelvis[1] - state->renderOrigin[1]) - forward[1] * 5.5f;
-        state->cameraRelativeEye[2] = (float)pelvis[2] + 2.8f;
+        state->cameraRelativeEye[2] =
+            (float)(pelvis[2] - state->renderOrigin[2]) + 2.8f;
     }
     else
     {
@@ -1242,6 +1382,8 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
                 if (fractionY < 0) fractionY += 1000;
                 const int64_t originX = AndroidFloorDiv(blockX, 64) * 64;
                 const int64_t originY = AndroidFloorDiv(blockY, 64) * 64;
+                state->renderOrigin[0] = (double)originX;
+                state->renderOrigin[1] = (double)originY;
                 state->cameraRelativeEye[0] =
                     (float)(blockX - originX) + (float)fractionX / 1000.0f;
                 state->cameraRelativeEye[1] =
@@ -1253,7 +1395,10 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
             state->cameraRelativeEye[0] = 0.0f;
             state->cameraRelativeEye[1] = 0.0f;
         }
-        state->cameraRelativeEye[2] = (float)localZ / 1000.0f + 1.6f;
+        const int64_t originZFixed = (localZ / INT64_C(64000)) * INT64_C(64000);
+        state->renderOrigin[2] = (double)originZFixed / 1000.0;
+        state->cameraRelativeEye[2] =
+            (float)(localZ - originZFixed) / 1000.0f + 1.6f;
     }
     if (state->scene->cameraUpdate != NULL)
         state->scene->cameraUpdate(&state->camera, elapsed, false, false, false, false, false,
@@ -1265,7 +1410,7 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     state->scene->cameraGetViewMatrix(&state->camera, state->cameraRelativeEye, view);
     state->scene->cameraGetProjectionMatrix(
         height > 0 ? (float)width / (float)height : 1.0f,
-        1.04719755f, 0.05f, 4096.0f, projection);
+        1.04719755f, 0.1f, 1024.0f, projection);
     state->sceneMath->matrix4Multiply(view, projection, state->viewProjection);
     LaiueGraphicsCameraV2 camera = {
         .structSize = sizeof(camera),
@@ -1502,7 +1647,8 @@ static void AndroidStep(AndroidWalkState *state)
                                 .vertexBuffer = state->terrainBuffer,
                                 .indexCount = 30u,
                                 .originRelative = {(float)x * 64.0f,
-                                                    (float)y * 64.0f, 0.0f},
+                                                   (float)y * 64.0f,
+                                                   (float)-state->renderOrigin[2]},
                                 .scale = 1.0f,
                             };
                             ++drawIndex;
@@ -1519,7 +1665,14 @@ static void AndroidStep(AndroidWalkState *state)
                             .structSize = sizeof(draws[drawIndex]),
                             .vertexBuffer = state->texturedTerrainBuffers[material],
                             .indexCount = vertexCount,
-                            .originRelative = {0.0f, 0.0f, 0.0f},
+                            /* This is the walk sample's repeating preview floor,
+                             * not a finite world landmark. Keep its 192 m patch
+                             * centered under the rebased camera so it remains
+                             * textured after crossing any number of 64 m cells.
+                             * Eight UV repeats per cell make each rebase seamless. */
+                            .originRelative = {state->cameraRelativeEye[0] - 32.0f,
+                                               state->cameraRelativeEye[1] - 32.0f,
+                                               (float)-state->renderOrigin[2]},
                             .scale = 1.0f,
                             .texture = state->terrainTextures[material],
                             .sampler = state->terrainSampler,

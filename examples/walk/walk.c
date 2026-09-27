@@ -623,6 +623,9 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
      * far from zero; only these bounded differences become floats. */
     const int64_t originX = FloorDiv(blockX, 64) * 64;
     const int64_t originY = FloorDiv(blockY, 64) * 64;
+    const int64_t originZFixed =
+        (position.localZ / (INT64_C(64) * WALK_VOXEL_SIZE)) *
+        (INT64_C(64) * WALK_VOXEL_SIZE);
     const int64_t withinX = blockX - originX;
     const int64_t withinY = blockY - originY;
     int64_t fractionX = position.localX % WALK_VOXEL_SIZE;
@@ -634,12 +637,13 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
      * than as a lossy absolute coordinate. */
     state->terrainOriginRelative[0] = 0.0f;
     state->terrainOriginRelative[1] = 0.0f;
-    state->terrainOriginRelative[2] = 0.0f;
+    state->terrainOriginRelative[2] =
+        (float)(-(double)originZFixed / (double)WALK_VOXEL_SIZE);
     state->cameraRelativeEye[0] = (float)withinX +
                                   (float)fractionX / (float)WALK_VOXEL_SIZE;
     state->cameraRelativeEye[1] = (float)withinY +
                                   (float)fractionY / (float)WALK_VOXEL_SIZE;
-    state->cameraRelativeEye[2] = (float)position.localZ /
+    state->cameraRelativeEye[2] = (float)(position.localZ - originZFixed) /
                                   (float)WALK_VOXEL_SIZE + 1.6f;
 }
 

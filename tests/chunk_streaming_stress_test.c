@@ -916,6 +916,32 @@ static void RunFarTeleportScenario(int32_t radius)
         StressVerify(handle, shadow, true);
     }
 
+    // The same eviction path must follow vertical travel: old meshes above
+    // the player are released when the center moves far upward, then again
+    // when it moves below the origin.
+    StressInjectInteriorMeshes(handle, margin * 3 + 5, 0, 0);
+    {
+        const int64_t centerX = margin * 3 + 5;
+        const int64_t nextZ = margin * 3 + 5;
+        StressShadowAdvance(scratch, shadow, centerX, 0, nextZ, radius);
+        StressSet *swap = shadow;
+        shadow = scratch;
+        scratch = swap;
+        ChunkStreamingSetCenter(handle, centerX, 0, nextZ);
+        StressInjectInteriorMeshes(handle, centerX, 0, nextZ);
+        StressVerify(handle, shadow, true);
+    }
+    {
+        const int64_t centerX = margin * 3 + 5;
+        const int64_t nextZ = -(margin * 3 + 5);
+        StressShadowAdvance(scratch, shadow, centerX, 0, nextZ, radius);
+        StressSet *swap = shadow;
+        shadow = scratch;
+        scratch = swap;
+        ChunkStreamingSetCenter(handle, centerX, 0, nextZ);
+        StressVerify(handle, shadow, true);
+    }
+
     StressClearInjectedMeshes(handle);
     ChunkStreamingDestroy(handle);
     WorldDestroy(world);

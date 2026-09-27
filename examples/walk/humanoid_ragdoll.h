@@ -184,6 +184,23 @@ static inline bool WalkRagdollPoseDrive(VoxelRagdoll *ragdoll, double facingYaw,
         !VoxelRigidBodyLinearVelocity(&ragdoll->bodies[WALK_RAGDOLL_PELVIS],
                                       rootVelocity))
         return false;
+    double torsoAngularVelocity[3];
+    if (!VoxelRigidBodyAngularVelocity(&ragdoll->bodies[WALK_RAGDOLL_TORSO],
+                                       torsoAngularVelocity))
+        return false;
+    const double torsoAngularSpeed = ScalarSqrtDouble(
+        torsoAngularVelocity[0] * torsoAngularVelocity[0] +
+        torsoAngularVelocity[1] * torsoAngularVelocity[1] +
+        torsoAngularVelocity[2] * torsoAngularVelocity[2]);
+    double fallBrace = (-rootVelocity[2] - 1.0) / 5.0;
+    double tumbleBrace = (torsoAngularSpeed - 3.0) / 7.0;
+    if (fallBrace < 0.0)
+        fallBrace = 0.0;
+    if (tumbleBrace < 0.0)
+        tumbleBrace = 0.0;
+    double braceAmount = fallBrace > tumbleBrace ? fallBrace : tumbleBrace;
+    if (braceAmount > 1.0)
+        braceAmount = 1.0;
     double leftFootPosition[3];
     double rightFootPosition[3];
     double leftFootVelocity[3];
@@ -218,7 +235,14 @@ static inline bool WalkRagdollPoseDrive(VoxelRagdoll *ragdoll, double facingYaw,
     double targetOrientations[WALK_RAGDOLL_BODY_COUNT][4];
     for (uint32_t body = 0u; body < WALK_RAGDOLL_BODY_COUNT; ++body)
     {
-        const double halfPitch = pitches[body] * 0.5;
+        double targetPitch = pitches[body];
+        if (body == WALK_RAGDOLL_LEFT_UPPER_ARM ||
+            body == WALK_RAGDOLL_RIGHT_UPPER_ARM)
+            targetPitch -= 0.7 * braceAmount;
+        else if (body == WALK_RAGDOLL_LEFT_FOREARM ||
+                 body == WALK_RAGDOLL_RIGHT_FOREARM)
+            targetPitch -= 0.45 * braceAmount;
+        const double halfPitch = targetPitch * 0.5;
         const double halfTilt = armTilts[body] * 0.5;
         const double pitchSin = ScalarSin((float)halfPitch);
         const double pitchCos = ScalarCos((float)halfPitch);

@@ -415,6 +415,49 @@ static void RunGroundedJumpRegression(RagdollHarness *harness, VoxelRagdoll *rag
     VoxelRagdollRelease(ragdoll);
 }
 
+static void RunFallBraceResponseRegression(void)
+{
+    VoxelRagdoll *normal = PlatformAllocate(sizeof(*normal), false);
+    VoxelRagdoll *falling = PlatformAllocate(sizeof(*falling), false);
+    RagdollExpect(normal != NULL && falling != NULL,
+                  "brace response allocates fixed-capacity humanoids");
+    memset(normal, 0, sizeof(*normal));
+    memset(falling, 0, sizeof(*falling));
+    RagdollExpect(InitializeHumanoid(normal, 7000u) &&
+                      InitializeHumanoid(falling, 8000u),
+                  "brace response initializes two deterministic humanoids");
+    const double downwardVelocity[3] = {0.0, 0.0, -6.0};
+    RagdollExpect(VoxelRigidBodyAddLinearVelocity(
+                      &falling->bodies[WALK_RAGDOLL_PELVIS], downwardVelocity),
+                  "brace response receives a fixed downward impact velocity");
+    RagdollExpect(WalkRagdollPoseDrive(normal, 0.0, 0.0, 0.0, 1.0 / 128.0) &&
+                      WalkRagdollPoseDrive(falling, 0.0, 0.0, 0.0, 1.0 / 128.0),
+                  "pose motors accept both calm and falling states");
+    double angularDifferenceSquared = 0.0;
+    for (uint32_t body = WALK_RAGDOLL_LEFT_UPPER_ARM;
+         body <= WALK_RAGDOLL_RIGHT_FOREARM; ++body)
+    {
+        double normalVelocity[3];
+        double fallingVelocity[3];
+        RagdollExpect(VoxelRigidBodyAngularVelocity(&normal->bodies[body],
+                                                     normalVelocity) &&
+                          VoxelRigidBodyAngularVelocity(&falling->bodies[body],
+                                                       fallingVelocity),
+                      "brace response reads finite arm motor velocities");
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            const double difference = fallingVelocity[axis] - normalVelocity[axis];
+            angularDifferenceSquared += difference * difference;
+        }
+    }
+    RagdollExpect(angularDifferenceSquared > 1.0e-8,
+                  "fast falling deterministically moves the arms into a brace pose");
+    VoxelRagdollRelease(falling);
+    VoxelRagdollRelease(normal);
+    PlatformFree(falling);
+    PlatformFree(normal);
+}
+
 static void RunUprightRecoveryRegression(RagdollHarness *harness,
                                          VoxelRagdoll *ragdoll)
 {
@@ -514,6 +557,7 @@ LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
                       JointErrorSquared(first) < 1.0e-18,
                   "13-part humanoid with feet begins at satisfied joint anchors");
     RunGroundedJumpRegression(&harness, invalid);
+    RunFallBraceResponseRegression();
     RunHumanoidReplay(&harness, first, second);
     RunUprightRecoveryRegression(&harness, second);
     VoxelRagdollRelease(second);

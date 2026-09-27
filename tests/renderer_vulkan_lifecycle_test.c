@@ -510,17 +510,27 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
         Expect(RendererPrepareWorld(d3d12), "the D3D12 switch world could not be prepared");
         Expect(RendererPrepareWorld(vulkan), "the Vulkan switch world could not be prepared");
         RendererTexture *d3d12Texture = RendererCreateTexture(
-            d3d12, 4u, 4u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+            d3d12, 4u, 4u, 3u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
         RendererTexture *vulkanTexture = RendererCreateTexture(
-            vulkan, 4u, 4u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB);
+            vulkan, 4u, 4u, 3u, LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB);
         Expect(d3d12Texture != NULL && vulkanTexture != NULL,
                "both backends must create native texture resources");
         uint8_t texturePixels[4u * 4u * 4u] = {0};
         Expect(RendererUploadTexture(d3d12, d3d12Texture, texturePixels,
                                      sizeof(texturePixels), 4u * 4u) &&
                    RendererUploadTexture(vulkan, vulkanTexture, texturePixels,
-                                         sizeof(texturePixels), 4u * 4u),
-               "both backends must upload native texture pixels");
+                                         sizeof(texturePixels), 4u * 4u) &&
+                   RendererUploadTextureMip(d3d12, d3d12Texture, 1u,
+                       texturePixels, 2u * 2u * 4u, 2u * 4u) &&
+                   RendererUploadTextureMip(vulkan, vulkanTexture, 1u,
+                       texturePixels, 2u * 2u * 4u, 2u * 4u) &&
+                   RendererUploadTextureMip(d3d12, d3d12Texture, 2u,
+                       texturePixels, 4u, 4u) &&
+                   RendererUploadTextureMip(vulkan, vulkanTexture, 2u,
+                       texturePixels, 4u, 4u) &&
+                   !RendererUploadTextureMip(vulkan, vulkanTexture, 3u,
+                       texturePixels, 4u, 4u),
+               "both backends must upload valid mip levels and reject out-of-range levels");
         RendererSampler *d3d12Sampler = RendererCreateSampler(
             d3d12, LAIUE_GRAPHICS_FILTER_LINEAR, LAIUE_GRAPHICS_FILTER_NEAREST,
             LAIUE_GRAPHICS_ADDRESS_REPEAT, LAIUE_GRAPHICS_ADDRESS_CLAMP,
