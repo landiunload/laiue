@@ -4078,7 +4078,8 @@ _Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
 bool RendererUiSetFontAtlas_D3D12(Renderer* renderer,
     const uint8_t* alphaPixels, uint32_t width, uint32_t height)
 {
-    if (alphaPixels == NULL || width == 0 || height == 0)
+    if (renderer == NULL || renderer->frameRecording || alphaPixels == NULL ||
+        width == 0 || height == 0)
     {
         return false;
     }

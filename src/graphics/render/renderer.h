@@ -214,7 +214,7 @@ LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);
 // с альфа-смешиванием. Раскладка повторяет shaders/ui.hlsl (48 байт).
 
 // Атлас шрифта: 8-битная альфа. Вызов заменяет предыдущий атлас
-// (дожидается GPU — вызывать редко, при смене масштаба интерфейса).
+// (дожидается GPU — вызывать между кадрами, редко, при смене масштаба).
 LAIUE_RENDER_API bool RendererUiSetFontAtlas(Renderer* renderer,
     const uint8_t* alphaPixels, uint32_t width, uint32_t height);
 
