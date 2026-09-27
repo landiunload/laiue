@@ -19,7 +19,11 @@
 #include "audio/audio.h"
 #include "audio/audio_offscreen.h"
 #include "audio/audio_pack.h"
+#include "audio/audio_pack_service.h"
+#include "audio/audio_service.h"
 #include "content/content_catalog.h"
+#include "content/content_service.h"
+#include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -394,6 +398,25 @@ LAIUE_TEST_ENTRY(AudioPackBenchmarkEntryPoint)
         LaiueTestRuntimeExit(1);
     }
 
+    // The pack loader reaches its dependencies through the runtime table the
+    // pack module installs on start; a standalone benchmark drives the same
+    // static module graph the engine uses and keeps the host alive for the run.
+    LaiueModuleHostConfigV1 hostConfig;
+    LaiueModuleHostConfigInitialize(&hostConfig);
+    LaiueModuleDiagnostic diagnostic;
+    LaiueModuleHost *host = LaiueModuleHostCreate(&hostConfig, &diagnostic);
+    const LaiueModuleApiV1 *modules[3] = {
+        LaiueAudioPackGetStaticModuleApiV1(),
+        LaiueAudioGetStaticModuleApiV1(),
+        LaiueContentGetStaticModuleApiV1(),
+    };
+    if (host == NULL ||
+        LaiueModuleHostLoadStatic(host, modules, 3u, &diagnostic) != LAIUE_MODULE_OK)
+    {
+        WriteText("audio pack benchmark module graph failed\n");
+        LaiueTestRuntimeExit(1);
+    }
+
     BenchPaths *paths = PlatformAllocate(sizeof(*paths), false);
     if (paths == NULL)
     {
@@ -514,6 +537,8 @@ LAIUE_TEST_ENTRY(AudioPackBenchmarkEntryPoint)
     AudioDeviceDestroy(context.device);
     LaiueContentCatalogDestroy(context.catalog);
     PlatformFree(paths);
+    LaiueModuleHostUnloadAll(host);
+    LaiueModuleHostDestroy(host);
 
     if (benchmarkSink == UINT64_MAX) WriteText("");
     WriteText("audio pack benchmark done\n");

@@ -1,7 +1,9 @@
 // Ручной benchmark горячего шага rigid-body физики. Не входит в CTest:
 // запускается явно, чтобы сравнивать изменения на одной машине.
 
+#include "physics/numeric_provider.h"
 #include "physics/rigid_body.h"
+#include "numeric/numeric_service.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -573,6 +575,16 @@ static bool RunRebaseCase(uint32_t bodyCount)
 
 LAIUE_TEST_ENTRY(PhysicsBenchmarkEntryPoint)
 {
+    // laiue_physics reaches arbitrary-precision arithmetic through the numeric
+    // service table. A bare process that links both DLLs must inject it exactly
+    // as the tests and the solver profile harness do, before any body exists.
+    const LaiueNumericServiceV1 *numeric = LaiueNumericGetStaticServiceV1();
+    if (numeric == NULL)
+    {
+        WriteText("physics benchmark numeric service unavailable\n");
+        LaiueTestRuntimeExit(1);
+    }
+    PhysicsSetNumericService(numeric);
     WriteText("laiue rigid-body benchmark\n");
     char rebaseOnly[2] = {0};
     if (PlatformGetEnvironmentUtf8("LAIUE_PHYSICS_BENCHMARK_REBASE_ONLY", rebaseOnly,

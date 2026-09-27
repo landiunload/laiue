@@ -1,4 +1,5 @@
 #include "ui/ui_font.h"
+#include "ui/ui_font_internal.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -9,33 +10,7 @@
 
 #if defined(_WIN32)
 
-// Диапазоны запекаемых кодовых точек (включительно).
-typedef struct GlyphRange
-{
-    uint16_t first;
-    uint16_t last;
-} GlyphRange;
-
-static const GlyphRange GLYPH_RANGES[] = {
-    { 0x0020, 0x007E },  // ASCII
-    { 0x00B0, 0x00B0 },  // знак градуса
-    { 0x0401, 0x0401 },  // Ё
-    { 0x0410, 0x044F },  // А..я
-    { 0x0451, 0x0451 },  // ё
-};
-#define GLYPH_RANGE_COUNT (sizeof(GLYPH_RANGES) / sizeof(GLYPH_RANGES[0]))
-
 #define GLYPH_PADDING 1
-
-static uint32_t CountGlyphs(void)
-{
-    uint32_t count = 0;
-    for (uint32_t range = 0; range < GLYPH_RANGE_COUNT; ++range)
-    {
-        count += (uint32_t)(GLYPH_RANGES[range].last - GLYPH_RANGES[range].first + 1);
-    }
-    return count;
-}
 
 void UiFontRelease(UiFont* font)
 {
@@ -89,7 +64,7 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
     }
 
     const MAT2 identity = { { 0, 1 }, { 0, 0 }, { 0, 0 }, { 0, 1 } };
-    uint32_t glyphCount = CountGlyphs();
+    uint32_t glyphCount = UiGlyphCount();
     UiGlyph* glyphs = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         (size_t)glyphCount * sizeof(UiGlyph));
     if (glyphs == NULL)
@@ -108,10 +83,10 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
     uint32_t maxGlyphBytes = 0;
     uint32_t glyphIndex = 0;
 
-    for (uint32_t range = 0; range < GLYPH_RANGE_COUNT; ++range)
+    for (uint32_t range = 0; range < UI_GLYPH_RANGE_COUNT; ++range)
     {
-        for (uint32_t code = GLYPH_RANGES[range].first;
-             code <= GLYPH_RANGES[range].last; ++code, ++glyphIndex)
+        for (uint32_t code = UI_GLYPH_RANGES[range].first; code <= UI_GLYPH_RANGES[range].last;
+             ++code, ++glyphIndex)
         {
             UiGlyph* glyph = &glyphs[glyphIndex];
             glyph->codepoint = (uint16_t)code;
@@ -254,29 +229,6 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
  */
 #include "platform/system.h"
 
-typedef struct GlyphRange
-{
-    uint16_t first;
-    uint16_t last;
-} GlyphRange;
-
-static const GlyphRange GLYPH_RANGES[] = {
-    {0x0020, 0x007E},
-    {0x00B0, 0x00B0},
-    {0x0401, 0x0401},
-    {0x0410, 0x044F},
-    {0x0451, 0x0451},
-};
-#define GLYPH_RANGE_COUNT (sizeof(GLYPH_RANGES) / sizeof(GLYPH_RANGES[0]))
-
-static uint32_t PortableGlyphCount(void)
-{
-    uint32_t count = 0u;
-    for (uint32_t range = 0u; range < GLYPH_RANGE_COUNT; ++range)
-        count += (uint32_t)(GLYPH_RANGES[range].last - GLYPH_RANGES[range].first + 1u);
-    return count;
-}
-
 void UiFontRelease(UiFont *font)
 {
     if (font == NULL)
@@ -293,7 +245,7 @@ bool UiFontBake(UiFont *font, int32_t pixelSize)
     if (pixelSize < 6)
         pixelSize = 6;
 
-    uint32_t glyphCount = PortableGlyphCount();
+    uint32_t glyphCount = UiGlyphCount();
     uint32_t cellWidth = (uint32_t)pixelSize / 2u + 3u;
     uint32_t cellHeight = (uint32_t)pixelSize + 2u;
     uint32_t columns = 32u;
@@ -314,10 +266,10 @@ bool UiFontBake(UiFont *font, int32_t pixelSize)
     }
 
     uint32_t glyphIndex = 0u;
-    for (uint32_t range = 0u; range < GLYPH_RANGE_COUNT; ++range)
+    for (uint32_t range = 0u; range < UI_GLYPH_RANGE_COUNT; ++range)
     {
-        for (uint32_t code = GLYPH_RANGES[range].first;
-             code <= GLYPH_RANGES[range].last; ++code, ++glyphIndex)
+        for (uint32_t code = UI_GLYPH_RANGES[range].first; code <= UI_GLYPH_RANGES[range].last;
+             ++code, ++glyphIndex)
         {
             UiGlyph *glyph = &glyphs[glyphIndex];
             uint32_t column = glyphIndex % columns;
@@ -363,53 +315,11 @@ bool UiFontBake(UiFont *font, int32_t pixelSize)
 
 #endif
 
-// Индекс глифа по кодпоинту без бинарного поиска: состав и порядок глифов
-// фиксированы таблицей GLYPH_RANGES и запекаются строго в её порядке,
-// поэтому индекс вычисляется прямым обходом диапазонов (для ASCII —
-// одно сравнение). false — кодпоинт не входит ни в один диапазон.
-static bool GlyphIndexForCodepoint(uint16_t codepoint, uint32_t* outIndex)
-{
-    uint32_t base = 0;
-    for (uint32_t range = 0; range < GLYPH_RANGE_COUNT; ++range)
-    {
-        if (codepoint < GLYPH_RANGES[range].first)
-        {
-            return false;
-        }
-        if (codepoint <= GLYPH_RANGES[range].last)
-        {
-            *outIndex = base
-                + (uint32_t)(codepoint - GLYPH_RANGES[range].first);
-            return true;
-        }
-        base += (uint32_t)(GLYPH_RANGES[range].last
-            - GLYPH_RANGES[range].first + 1);
-    }
-    return false;
-}
-
-// Совпадает ли раскладка шрифта с фиксированным набором диапазонов: число
-// глифов и границы. Для шрифта, запечённого UiFontBake, всегда true — тогда
-// кодпоинт вне диапазонов заведомо отсутствует и бинарный поиск не нужен.
-static bool FontMatchesGlyphRanges(const UiFont* font)
-{
-#if defined(_WIN32)
-    const uint32_t bakedGlyphCount = CountGlyphs();
-#else
-    const uint32_t bakedGlyphCount = PortableGlyphCount();
-#endif
-    return font->glyphs != NULL
-        && font->glyphCount == bakedGlyphCount
-        && font->glyphs[0].codepoint == GLYPH_RANGES[0].first
-        && font->glyphs[font->glyphCount - 1u].codepoint
-            == GLYPH_RANGES[GLYPH_RANGE_COUNT - 1u].last;
-}
-
 const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
 {
     // glyphs отсортированы по codepoint, поэтому выход за весь набор
     // отсекается без поиска.
-    if (font->glyphs == NULL || font->glyphCount == 0)
+    if (font == NULL || font->glyphs == NULL || font->glyphCount == 0)
     {
         return NULL;
     }
@@ -422,8 +332,8 @@ const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
     // Быстрый путь: индекс из фиксированных диапазонов и проверка, что
     // позиция действительно занята нужным кодпоинтом (страховка на случай
     // шрифта, запечённого по другой таблице диапазонов).
-    uint32_t index = 0;
-    if (GlyphIndexForCodepoint(codepoint, &index))
+    uint32_t index = UiGlyphLayoutIndex(codepoint);
+    if (index != UI_GLYPH_INDEX_NONE)
     {
         if (index < font->glyphCount
             && font->glyphs[index].codepoint == codepoint)
@@ -431,14 +341,10 @@ const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
             return &font->glyphs[index];
         }
     }
-    else if (FontMatchesGlyphRanges(font))
-    {
-        // Кодпоинт вне диапазонов, а раскладка — наша: глифа точно нет.
-        return NULL;
-    }
-
     // Запасной путь — прежний бинарный поиск по отсортированному массиву.
-    // Достижим только для шрифта чужой раскладки.
+    // Он нужен также для пользовательского шрифта, чьи размер и крайние
+    // кодовые точки совпали со стандартной раскладкой, но внутренние глифы
+    // отличаются.
     uint32_t low = 0;
     uint32_t high = font->glyphCount;
     while (low < high)
@@ -462,10 +368,14 @@ const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
 
 float UiFontMeasure(const UiFont* font, const wchar_t* text)
 {
+    // Раскладка постоянна для шрифта, поэтому проверяется один раз на
+    // строку, а не на каждый символ: дальше индекс глифа считается
+    // формулой внутри UiFontLookupGlyph.
+    bool hasBakedShape = UiFontHasBakedGlyphShape(font);
     float width = 0.0f;
     for (const wchar_t* character = text; *character != L'\0'; ++character)
     {
-        const UiGlyph* glyph = UiFontFindGlyph(font, (uint16_t)*character);
+        const UiGlyph *glyph = UiFontLookupGlyph(font, (uint16_t)*character, hasBakedShape);
         if (glyph != NULL)
         {
             width += glyph->advance;

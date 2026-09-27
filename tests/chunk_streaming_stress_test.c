@@ -848,6 +848,68 @@ static void RunOriginChangeScenario(int32_t radius, uint32_t iterations)
     WorldDestroy(world);
 }
 
+// Дальний перенос центра (портал/респавн/быстрая камера). Зоны видимости
+// радиуса + 1 вокруг старого и нового центра не пересекаются, поэтому таблица
+// обязана очиститься целиком и собраться заново из нового куба. Проверяются
+// обе ветви: ровно на границе (обычная построчная очистка со сдвигом
+// кластеров) и дальше границы (быстрая общая очистка). Меши внутри куба
+// проверяют, что очистка снимает их и обнуляет список отрисовки.
+static void RunFarTeleportScenario(int32_t radius)
+{
+    stressSeed = 0xFA2A7E1EULL;
+    stressStep = 0u;
+    stressRadius = radius;
+    stressQueueCapacity = StressQueueCapacityFor(radius);
+
+    World *world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming *handle =
+        ChunkStreamingCreate(world, (Renderer *)&stressRendererPlaceholder, radius);
+    EXPECT(handle != NULL, "streaming was not created");
+    EXPECT(ChunkStreamingPause(handle), "streaming was not paused");
+
+    StressSet *shadow = &stressSetA;
+    StressSet *scratch = &stressSetB;
+    StressSetClear(shadow);
+    StressSetClear(scratch);
+
+    ChunkStreamingSetCenter(handle, 0, 0, 0);
+    StressAddCube(shadow, 0, 0, 0, radius);
+    StressInjectInteriorMeshes(handle, 0, 0, 0);
+    StressVerify(handle, shadow, true);
+
+    const int64_t margin = 2 * ((int64_t)radius + 1);
+
+    // Ровно на пороге зоны ещё пересекаются по одной координате, поэтому
+    // ветвь остаётся обычной построчной очисткой; меши проверяют её удаление.
+    {
+        const int64_t nextX = margin;
+        StressShadowAdvance(scratch, shadow, nextX, 0, 0, radius);
+        StressSet *swap = shadow;
+        shadow = scratch;
+        scratch = swap;
+        ChunkStreamingSetCenter(handle, nextX, 0, 0);
+        StressInjectInteriorMeshes(handle, nextX, 0, 0);
+        StressVerify(handle, shadow, true);
+    }
+
+    // Дальше границы: быстрая общая очистка обязана снять меши и список
+    // отрисовки и собрать новый куб.
+    {
+        const int64_t nextX = margin * 3 + 5;
+        StressShadowAdvance(scratch, shadow, nextX, 0, 0, radius);
+        StressSet *swap = shadow;
+        shadow = scratch;
+        scratch = swap;
+        ChunkStreamingSetCenter(handle, nextX, 0, 0);
+        StressVerify(handle, shadow, true);
+    }
+
+    StressClearInjectedMeshes(handle);
+    ChunkStreamingDestroy(handle);
+    WorldDestroy(world);
+}
+
 // Пауза сразу после возобновления при пустой очереди. Раньше рабочий поток
 // отчитывался о паузе флагом, который сбрасывался только после выхода из
 // ожидания; при пустой очереди он из ожидания не выходил, второй Pause
@@ -1117,6 +1179,8 @@ LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
     RunRandomScenario(4, 0x5555555566666666ULL, 800u);
     RunCircleWalkScenario(2, 20000u);
     RunDrawListShiftScenario(3, 256u);
+    RunFarTeleportScenario(2);
+    RunFarTeleportScenario(3);
     RunOriginChangeScenario(2, 16u);
     RunPauseAfterResumeScenario(2, 8u);
     RunSameCenterNoOpScenario(2);

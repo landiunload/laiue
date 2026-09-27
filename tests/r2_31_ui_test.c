@@ -13,6 +13,7 @@
 // Тест не измеряет время и не зависит от производительности.
 
 #include "ui/ui.h"
+#include "ui/ui_font_internal.h"
 #include "ui/ui_format.h"
 #include "render/ui_quad.h"
 
@@ -145,6 +146,62 @@ static void TestFontLookup(const UiContext* ui)
         }
     }
     CHECK(noneFound, "absent codepoints return NULL");
+}
+
+// Дифференциальная проверка ускоренного пути поиска глифа, которым теперь
+// пользуются UiText/UiFontMeasure: для каждого 16-битного кодпоинта
+// UiFontLookupGlyph(layout=true) обязан вернуть тот же глиф, что и
+// независимый линейный поиск по массиву. Проверка ловит ошибку в вычислении
+// индекса фиксированной раскладки (сдвиг диапазона, неверная база).
+static void TestFontLookupLayout(const UiContext *ui)
+{
+    const UiFont *font = &ui->font;
+    bool identical = true;
+    for (uint32_t codepoint = 0u; codepoint <= 0xFFFFu; ++codepoint)
+    {
+        const UiGlyph *expected = NULL;
+        for (uint32_t index = 0u; index < font->glyphCount; ++index)
+        {
+            if (font->glyphs[index].codepoint == (uint16_t)codepoint)
+            {
+                expected = &font->glyphs[index];
+                break;
+            }
+        }
+        const UiGlyph *fast = UiFontLookupGlyph(font, (uint16_t)codepoint, true);
+        if (fast != expected)
+        {
+            identical = false;
+        }
+    }
+    CHECK(identical, "layout fast path matches linear scan for all codepoints");
+
+    // У пользовательского шрифта могут совпасть count и крайние точки, но
+    // один внутренний кодпоинт может быть другим. Индексный путь должен
+    // проверить сам элемент и перейти к бинарному поиску.
+    UiGlyph *customGlyphs =
+        PlatformAllocate((size_t)font->glyphCount * sizeof(*customGlyphs), false);
+    CHECK(customGlyphs != NULL, "custom font test allocation succeeds");
+    if (customGlyphs != NULL)
+    {
+        for (uint32_t index = 0u; index < font->glyphCount; ++index)
+        {
+            customGlyphs[index] = font->glyphs[index];
+        }
+        customGlyphs[UI_GLYPH_INDEX_DEGREE].codepoint = 0x00AFu;
+        UiFont customFont = *font;
+        customFont.glyphs = customGlyphs;
+        CHECK(UiFontLookupGlyph(&customFont, 0x00AFu, true) == &customGlyphs[UI_GLYPH_INDEX_DEGREE],
+              "shape-compatible custom font finds a nonstandard interior glyph");
+        CHECK(UiFontLookupGlyph(&customFont, 0x00B0u, true) == NULL,
+              "shape-compatible custom font does not invent a replaced glyph");
+        PlatformFree(customGlyphs);
+    }
+
+    UiFont emptyFont = {0};
+    CHECK(!UiFontHasBakedGlyphShape(&emptyFont), "empty font is not treated as baked layout");
+    CHECK(UiFontLookupGlyph(&emptyFont, 0x0041u, true) == NULL, "empty font lookup returns NULL");
+    CHECK(!UiFontHasBakedGlyphShape(NULL), "NULL font is not treated as baked layout");
 }
 
 static void TestMeasure(const UiContext* ui)
@@ -317,6 +374,7 @@ LAIUE_TEST_ENTRY(R2UiTestEntryPoint)
     }
 
     TestFontLookup(ui);
+    TestFontLookupLayout(ui);
     TestMeasure(ui);
     TestBuilderAndFormat();
     TestQuads(ui);

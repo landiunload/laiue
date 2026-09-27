@@ -7,6 +7,7 @@ laiue_add_module(ui
         module_entry.c
         ui_font.c
         ui_font.h
+        ui_font_internal.h
         ui_format.c
         ui_format.h
         ../api.h

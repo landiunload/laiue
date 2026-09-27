@@ -19,6 +19,7 @@
 #include "content/content_catalog.h"
 #include "media/lt_encode.h"
 #include "platform/system.h"
+#include "render/content_provider.h"
 #include "render/texture_pack_internal.h"
 #include "test_runtime.h"
 
@@ -579,6 +580,11 @@ static BENCH_NOINLINE void RunEnumerate(const char *name, LaiueContentCatalog *c
 
 LAIUE_TEST_ENTRY(R2TexturePackBenchmarkEntryPoint)
 {
+    // `TexturePackBuildFrom`/`TexturePackLoadActiveFrom` общаются с
+    // каталогом через мост `RendererContent*`. Без сервиса загрузка и
+    // material_names/enumerate молча уходят в fallback, и стенд меряет
+    // не то, что заявляет.
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     BenchPaths *paths = PlatformAllocate(sizeof(*paths), true);
     if (paths == NULL)
     {

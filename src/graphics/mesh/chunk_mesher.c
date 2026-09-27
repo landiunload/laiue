@@ -105,7 +105,10 @@ ChunkMesherScratch* ChunkMesherScratchCreate(void)
     }
 
     scratch->blocks = PlatformAllocate((size_t)EXTENDED_SIZE * EXTENDED_SIZE * EXTENDED_SIZE, false);
-    scratch->columns = PlatformAllocate(COLUMN_WORDS * 3 * sizeof(uint64_t), false);
+    // columnsZ плюс четыре гало-колонны по краям региона: по слову на каждый
+    // ряд осей X и Y. Поперечные транспонированные раскладки больше не нужны —
+    // грани ±X и ±Y считаются прямо из columnsZ.
+    scratch->columns = PlatformAllocate((COLUMN_WORDS + 4u * CHUNK_SIZE) * sizeof(uint64_t), false);
     scratch->planes = PlatformAllocate(COLUMN_WORDS * FACE_COUNT * sizeof(uint64_t), false);
     scratch->sliceRows = PlatformAllocate(FACE_COUNT * CHUNK_SIZE * sizeof(uint64_t), false);
 
@@ -540,47 +543,6 @@ static void TransposeBits64(uint64_t matrix[CHUNK_SIZE])
 }
 #endif
 
-// В отличие от плоскостей граней, обе раскладки колонн пишутся подряд.
-// Редкая матрица дешевле раскладывается по битам, плотная — транспонируется.
-// Порог проверен A/B; он влияет только на способ построения тех же масок.
-#define MESH_TRANSPOSE_COLUMN_SOLIDS 256u
-#define MESH_SPARSE_CHUNK_SOLIDS 4096u
-
-// source и destination лежат в разных массивах колонн, поэтому sparse-путь
-// может обнулить destination и повторно прочитать исходные слова.
-static void BuildTransverseColumns(uint64_t *destination, const uint64_t *source, size_t stride)
-{
-    uint32_t solidCount = 0;
-    for (uint32_t index = 0; index < CHUNK_SIZE; ++index)
-    {
-        uint64_t column = source[(size_t)index * stride];
-        destination[index] = column;
-        solidCount += PopCount64(column);
-    }
-    if (solidCount == 0)
-    {
-        return;
-    }
-    if (solidCount >= MESH_TRANSPOSE_COLUMN_SOLIDS)
-    {
-        TransposeBits64(destination);
-        return;
-    }
-
-    memset(destination, 0, CHUNK_SIZE * sizeof(uint64_t));
-    for (uint32_t index = 0; index < CHUNK_SIZE; ++index)
-    {
-        uint64_t remaining = source[(size_t)index * stride];
-        uint64_t bit = 1ull << index;
-        while (remaining != 0)
-        {
-            uint32_t offset = LowestSetBitIndex(remaining);
-            remaining &= remaining - 1;
-            destination[offset] |= bit;
-        }
-    }
-}
-
 // Складывает шестьдесят четыре маски одного ряда в плоскость.
 //
 // Маска номер i несёт биты по срезам, а плоскости нужен срез с битами по i —
@@ -674,12 +636,15 @@ bool BuildChunkMesh(const ChunkMesherWorldSource* source, ChunkMesherScratch* sc
         return true;
     }
 
-    // columnsZ[y*64+x] — биты вдоль Z (высота)
-    // columnsY[x*64+z] — биты вдоль Y (вторая горизонталь)
-    // columnsX[y*64+z] — биты вдоль X
-    uint64_t* columnsZ = scratch->columns;                      // [y*64+x]
-    uint64_t* columnsY = scratch->columns + COLUMN_WORDS;       // [x*64+z]
-    uint64_t* columnsX = scratch->columns + COLUMN_WORDS * 2;   // [y*64+z]
+    // columnsZ[y*64+x] — биты вдоль Z (высота). Грани ±X и ±Y читаются прямо
+    // из этих же слов: сосед по x или по y — это соседнее слово columnsZ, а
+    // слово уже несёт биты вдоль z, то есть ровно ту маску, которую ждёт
+    // плоскость. Двух поперечных транспонированных раскладок больше нет.
+    uint64_t *columnsZ = scratch->columns;                // [y*64+x]
+    uint64_t *haloXLow = scratch->columns + COLUMN_WORDS; // [y]
+    uint64_t *haloXHigh = haloXLow + CHUNK_SIZE;          // [y]
+    uint64_t *haloYLow = haloXHigh + CHUNK_SIZE;          // [x]
+    uint64_t *haloYHigh = haloYLow + CHUNK_SIZE;          // [x]
     uint64_t* planes[FACE_COUNT];
     for (uint32_t face = 0; face < FACE_COUNT; ++face)
     {
@@ -687,10 +652,7 @@ bool BuildChunkMesh(const ChunkMesherWorldSource* source, ChunkMesherScratch* sc
     }
     size_t planeBytes = COLUMN_WORDS * sizeof(uint64_t);
 
-    // Сначала непрерывные Z-колонны. Две поперечные раскладки — это те же
-    // битовые матрицы, транспонированные независимо при фиксированных Y и X.
-    // В dense-пути каждый выходной элемент записывается целиком, поэтому
-    // предварительная очистка колонн не нужна.
+    // Сначала непрерывные Z-колонны ядра.
     uint32_t solidCount = 0;
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
@@ -706,45 +668,25 @@ bool BuildChunkMesh(const ChunkMesherWorldSource* source, ChunkMesherScratch* sc
     {
         return true;
     }
-    // Для почти пустого чанка общий scatter дешевле подготовки 128 матриц.
-    // Даже при полном halo пустое ядро выше выходит без старых масок scratch.
-    if (solidCount < MESH_SPARSE_CHUNK_SOLIDS)
+    // Гало-колонны по краям: для ±X срезы x = -1 и x = 64, для ±Y —
+    // y = -1 и y = 64. Это те же маски вдоль z, что и columnsZ.
+    for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
-        memset(columnsY, 0, planeBytes * 2);
-        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
-        {
-            uint64_t rowBit = 1ull << y;
-            for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
-            {
-                uint64_t remaining = columnsZ[y * CHUNK_SIZE + x];
-                uint64_t columnBit = 1ull << x;
-                while (remaining != 0)
-                {
-                    uint32_t z = LowestSetBitIndex(remaining);
-                    remaining &= remaining - 1;
-                    columnsY[x * CHUNK_SIZE + z] |= rowBit;
-                    columnsX[y * CHUNK_SIZE + z] |= columnBit;
-                }
-            }
-        }
+        haloXLow[y] = ColumnSolidMask(&blocks[BLOCK_INDEX(y + 1, 0, 1)]);
+        haloXHigh[y] = ColumnSolidMask(&blocks[BLOCK_INDEX(y + 1, EXTENDED_SIZE - 1, 1)]);
     }
-    else
+    for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
     {
-        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
-        {
-            BuildTransverseColumns(&columnsX[y * CHUNK_SIZE], &columnsZ[y * CHUNK_SIZE], 1);
-        }
-        for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
-        {
-            BuildTransverseColumns(&columnsY[x * CHUNK_SIZE], &columnsZ[x], CHUNK_SIZE);
-        }
+        haloYLow[x] = ColumnSolidMask(&blocks[BLOCK_INDEX(0, x + 1, 1)]);
+        haloYHigh[x] = ColumnSolidMask(&blocks[BLOCK_INDEX(EXTENDED_SIZE - 1, x + 1, 1)]);
     }
 
     uint32_t faceCount = 0;
     memset(scratch->planes, 0, planeBytes * FACE_COUNT);
 
-    // Один ряд масок на оба знака грани; переиспользуется всеми тремя парами
-    // осей, поэтому кадр стека остаётся в килобайте.
+    // Один ряд масок на оба знака грани. ±Z держит здесь ряд плоскостных
+    // масок, а ±X/±Y копят признак непустого среза; кадр стека остаётся в
+    // килобайте.
     uint64_t positive[CHUNK_SIZE];
     uint64_t negative[CHUNK_SIZE];
 
@@ -784,72 +726,75 @@ bool BuildChunkMesh(const ChunkMesherWorldSource* source, ChunkMesherScratch* sc
     TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_Z * CHUNK_SIZE]);
 
     // === Грани ±X ===
+    // Для среза x и ряда y слово плоскости — это биты вдоль z, то есть ровно
+    // columnsZ[y*64+x] без соседнего по x слова. Запись присваиванием: слово
+    // принадлежит одной паре (x, y), а незаписанные слова уже обнулены.
+    // positive/negative здесь копят непустые срезы, а не ряд масок.
+    for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
+    {
+        positive[slice] = 0;
+        negative[slice] = 0;
+    }
     for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
     {
-        uint32_t anyPositive = 0;
-        uint32_t anyNegative = 0;
-        uint64_t spanPositive = 0;
-        uint64_t spanNegative = 0;
-        for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
+        const uint64_t *rowZ = &columnsZ[(size_t)y * CHUNK_SIZE];
+        for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
         {
-            uint64_t column = columnsX[y * CHUNK_SIZE + z];
+            uint64_t column = rowZ[x];
             if (column == 0)
             {
-                positive[z] = 0;
-                negative[z] = 0;
                 continue;
             }
-            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(y + 1, EXTENDED_SIZE - 1, z + 1)] != BLOCK_AIR);
-            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(y + 1, 0, z + 1)] != BLOCK_AIR);
-            positive[z] = column & ~((column >> 1) | (neighborAbove << 63));
-            negative[z] = column & ~((column << 1) | neighborBelow);
-            anyPositive += PopCount64(positive[z]);
-            anyNegative += PopCount64(negative[z]);
-            spanPositive |= positive[z];
-            spanNegative |= negative[z];
+            uint64_t neighborAbove = x + 1u < CHUNK_SIZE ? rowZ[x + 1u] : haloXHigh[y];
+            uint64_t neighborBelow = x > 0u ? rowZ[x - 1u] : haloXLow[y];
+            uint64_t positiveMask = column & ~neighborAbove;
+            uint64_t negativeMask = column & ~neighborBelow;
+            planes[FACE_POSITIVE_X][(size_t)x * CHUNK_SIZE + y] = positiveMask;
+            planes[FACE_NEGATIVE_X][(size_t)x * CHUNK_SIZE + y] = negativeMask;
+            positive[x] |= positiveMask;
+            negative[x] |= negativeMask;
+            faceCount += PopCount64(positiveMask) + PopCount64(negativeMask);
         }
-        scratch->sliceRows[(size_t)FACE_POSITIVE_X * CHUNK_SIZE + y] = spanPositive;
-        scratch->sliceRows[(size_t)FACE_NEGATIVE_X * CHUNK_SIZE + y] = spanNegative;
-        faceCount += anyPositive + anyNegative;
-        EmitPlaneRow(planes[FACE_POSITIVE_X], y, positive, anyPositive);
-        EmitPlaneRow(planes[FACE_NEGATIVE_X], y, negative, anyNegative);
     }
-    TransposeBits64(&scratch->sliceRows[FACE_POSITIVE_X * CHUNK_SIZE]);
-    TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_X * CHUNK_SIZE]);
+    for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
+    {
+        scratch->sliceRows[(size_t)FACE_POSITIVE_X * CHUNK_SIZE + slice] = positive[slice];
+        scratch->sliceRows[(size_t)FACE_NEGATIVE_X * CHUNK_SIZE + slice] = negative[slice];
+    }
 
     // === Грани ±Y (вторая горизонталь, нормаль = Y) ===
+    for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
+    {
+        positive[slice] = 0;
+        negative[slice] = 0;
+    }
     for (uint32_t x = 0; x < CHUNK_SIZE; ++x)
     {
-        uint32_t anyPositive = 0;
-        uint32_t anyNegative = 0;
-        uint64_t spanPositive = 0;
-        uint64_t spanNegative = 0;
-        for (uint32_t z = 0; z < CHUNK_SIZE; ++z)
+        for (uint32_t y = 0; y < CHUNK_SIZE; ++y)
         {
-            uint64_t column = columnsY[x * CHUNK_SIZE + z];
+            uint64_t column = columnsZ[(size_t)y * CHUNK_SIZE + x];
             if (column == 0)
             {
-                positive[z] = 0;
-                negative[z] = 0;
                 continue;
             }
-            uint64_t neighborAbove = (uint64_t)(blocks[BLOCK_INDEX(EXTENDED_SIZE - 1, x + 1, z + 1)] != BLOCK_AIR);
-            uint64_t neighborBelow = (uint64_t)(blocks[BLOCK_INDEX(0, x + 1, z + 1)] != BLOCK_AIR);
-            positive[z] = column & ~((column >> 1) | (neighborAbove << 63));
-            negative[z] = column & ~((column << 1) | neighborBelow);
-            anyPositive += PopCount64(positive[z]);
-            anyNegative += PopCount64(negative[z]);
-            spanPositive |= positive[z];
-            spanNegative |= negative[z];
+            uint64_t neighborAbove =
+                y + 1u < CHUNK_SIZE ? columnsZ[(size_t)(y + 1u) * CHUNK_SIZE + x] : haloYHigh[x];
+            uint64_t neighborBelow =
+                y > 0u ? columnsZ[(size_t)(y - 1u) * CHUNK_SIZE + x] : haloYLow[x];
+            uint64_t positiveMask = column & ~neighborAbove;
+            uint64_t negativeMask = column & ~neighborBelow;
+            planes[FACE_POSITIVE_Y][(size_t)y * CHUNK_SIZE + x] = positiveMask;
+            planes[FACE_NEGATIVE_Y][(size_t)y * CHUNK_SIZE + x] = negativeMask;
+            positive[y] |= positiveMask;
+            negative[y] |= negativeMask;
+            faceCount += PopCount64(positiveMask) + PopCount64(negativeMask);
         }
-        scratch->sliceRows[(size_t)FACE_POSITIVE_Y * CHUNK_SIZE + x] = spanPositive;
-        scratch->sliceRows[(size_t)FACE_NEGATIVE_Y * CHUNK_SIZE + x] = spanNegative;
-        faceCount += anyPositive + anyNegative;
-        EmitPlaneRow(planes[FACE_POSITIVE_Y], x, positive, anyPositive);
-        EmitPlaneRow(planes[FACE_NEGATIVE_Y], x, negative, anyNegative);
     }
-    TransposeBits64(&scratch->sliceRows[FACE_POSITIVE_Y * CHUNK_SIZE]);
-    TransposeBits64(&scratch->sliceRows[FACE_NEGATIVE_Y * CHUNK_SIZE]);
+    for (uint32_t slice = 0; slice < CHUNK_SIZE; ++slice)
+    {
+        scratch->sliceRows[(size_t)FACE_POSITIVE_Y * CHUNK_SIZE + slice] = positive[slice];
+        scratch->sliceRows[(size_t)FACE_NEGATIVE_Y * CHUNK_SIZE + slice] = negative[slice];
+    }
 
     if (faceCount == 0)
     {
