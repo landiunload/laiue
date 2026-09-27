@@ -1253,6 +1253,7 @@ static const LaiueGraphicsServiceV1 service = {
     .getTexturePackLoadStatus = RendererGetTexturePackLoadStatus,
     .setWireframe = RendererSetWireframe,
     .isWireframe = RendererIsWireframe,
+    .getGpuTimingV1 = RendererGetGpuTimingV1,
 };
 
 static const LaiueGraphicsDeviceServiceV1 deviceServiceTemplate = {

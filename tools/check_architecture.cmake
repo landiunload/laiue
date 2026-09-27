@@ -17,6 +17,7 @@ set(allowed_numeric mod numeric platform)
 # видна, свойства блоков приходят через callback.
 set(allowed_physics math mod numeric physics task)
 set(allowed_platform mod platform)
+set(allowed_profile mod profile render)
 set(allowed_render content graphics media mod platform render)
 set(allowed_runtime runtime)
 set(allowed_task mod task platform)
@@ -36,7 +37,7 @@ set(allowed_world mod numeric platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules character content graphics math media mesh mod numeric physics runtime scene task voxel voxel_render world)
+set(portable_modules character content graphics math media mesh mod numeric physics profile runtime scene task voxel voxel_render world)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h
@@ -76,6 +77,7 @@ set(canonical_prefix_media "assets/media")
 set(canonical_prefix_content "assets/content")
 set(canonical_prefix_input "graphics/input")
 set(canonical_prefix_mesh "graphics/mesh")
+set(canonical_prefix_profile "graphics/profile")
 set(canonical_prefix_render "graphics/render")
 set(canonical_prefix_scene "graphics/scene")
 set(canonical_prefix_voxel_render "graphics/voxel_render")

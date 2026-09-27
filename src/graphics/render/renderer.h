@@ -22,6 +22,18 @@ typedef struct RendererStats
     uint32_t scenePasses;
 } RendererStats;
 
+// Latest completed GPU frame interval. Results are delayed until the backend's
+// frame fence completes; polling never stalls the CPU for an in-flight frame.
+#define RENDERER_GPU_TIMING_SUPPORTED (1u << 0)
+#define RENDERER_GPU_TIMING_VALID (1u << 1)
+typedef struct RendererGpuTimingV1
+{
+    uint32_t structSize;
+    uint32_t flags;
+    uint64_t frameIndex;
+    uint64_t durationNanoseconds;
+} RendererGpuTimingV1;
+
 typedef enum RendererContentStatus
 {
     RENDERER_CONTENT_NOT_ATTEMPTED = 0,
@@ -190,6 +202,8 @@ LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 // с GPU и потому подходит для диагностики и внешнего профилировщика.
 LAIUE_RENDER_API void RendererGetStats(const Renderer* renderer,
     RendererStats* outStats);
+LAIUE_RENDER_API void RendererGetGpuTimingV1(const Renderer *renderer,
+                                             RendererGpuTimingV1 *outTiming);
 
 LAIUE_RENDER_API void RendererSetVerticalSync(Renderer* renderer, bool enabled);
 LAIUE_RENDER_API bool RendererIsVerticalSyncEnabled(const Renderer* renderer);

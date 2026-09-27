@@ -83,7 +83,8 @@ static uint32_t ModuleStart(void *context)
         LAIUE_MESHER_SERVICE_ABI_VERSION_1, sizeof(LaiueMesherServiceV1));
     state->graphics = (const LaiueGraphicsServiceV1 *)LaiueModuleQueryRequiredService(
         state->host, LAIUE_GRAPHICS_SERVICE_NAME,
-        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1, sizeof(LaiueGraphicsServiceV1));
+        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
+        LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE);
     if (state->sceneMath == NULL || state->world == NULL || state->mesher == NULL ||
         state->graphics == NULL)
     {

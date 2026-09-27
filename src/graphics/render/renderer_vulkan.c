@@ -444,6 +444,14 @@ struct Renderer
     // командного буфера и сменой/пересозданием конвейеров.
     VkPipeline boundPipeline;
     bool pipelineBound;
+
+    uint32_t timestampValidBits;
+    float timestampPeriodNanoseconds;
+    VkQueryPool gpuTimingQueries[FRAME_COUNT];
+    bool gpuTimingSupported;
+    bool gpuTimingPending[FRAME_COUNT];
+    uint64_t gpuTimingFrameIndices[FRAME_COUNT];
+    RendererGpuTimingV1 gpuTimingLatest;
 };
 
 _Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
@@ -1641,6 +1649,80 @@ static bool FindGenericDescriptorSet(Renderer *renderer, uint32_t frameIndex,
     return false;
 }
 
+// Timestamp queries are optional diagnostics. A device or driver that cannot
+// create them must still be able to create and use the normal renderer.
+static void CreateGpuTimingQueries(Renderer *renderer)
+{
+    if (renderer->timestampValidBits == 0u ||
+        !(renderer->timestampPeriodNanoseconds > 0.0f))
+        return;
+
+    VkQueryPoolCreateInfo queryPoolInfo = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2u,
+    };
+    uint32_t created = 0u;
+    for (; created < FRAME_COUNT; ++created)
+    {
+        if (vkCreateQueryPool(renderer->device, &queryPoolInfo, NULL,
+                              &renderer->gpuTimingQueries[created]) != VK_SUCCESS)
+            break;
+    }
+    if (created != FRAME_COUNT)
+    {
+        while (created > 0u)
+        {
+            --created;
+            vkDestroyQueryPool(renderer->device, renderer->gpuTimingQueries[created], NULL);
+            renderer->gpuTimingQueries[created] = VK_NULL_HANDLE;
+        }
+        return;
+    }
+
+    renderer->gpuTimingSupported = true;
+    renderer->gpuTimingLatest.structSize = sizeof(renderer->gpuTimingLatest);
+    renderer->gpuTimingLatest.flags = RENDERER_GPU_TIMING_SUPPORTED;
+}
+
+// Called only after the corresponding frame fence signals. Query retrieval
+// has no WAIT bit, so even a driver error cannot stall or fail rendering.
+static void CollectGpuTiming(Renderer *renderer, uint32_t frameIndex)
+{
+    if (!renderer->gpuTimingSupported || frameIndex >= FRAME_COUNT ||
+        !renderer->gpuTimingPending[frameIndex] ||
+        vkGetFenceStatus(renderer->device, renderer->frameFences[frameIndex]) != VK_SUCCESS)
+        return;
+
+    uint64_t timestamps[2] = { 0u, 0u };
+    VkResult result = vkGetQueryPoolResults(renderer->device,
+                                            renderer->gpuTimingQueries[frameIndex],
+                                            0u, 2u, sizeof(timestamps), timestamps,
+                                            sizeof(timestamps), VK_QUERY_RESULT_64_BIT);
+    renderer->gpuTimingPending[frameIndex] = false;
+    if (result != VK_SUCCESS) return;
+
+    uint32_t validBits = renderer->timestampValidBits;
+    uint64_t validMask = validBits >= 64u ? UINT64_MAX : ((UINT64_C(1) << validBits) - 1u);
+    uint64_t elapsedTicks = (timestamps[1] - timestamps[0]) & validMask;
+    double elapsedNanoseconds = (double)elapsedTicks *
+                                (double)renderer->timestampPeriodNanoseconds;
+    // 2^64 is exactly representable as double; exclude it before conversion
+    // to avoid an out-of-range floating-point-to-integer conversion.
+    if (!(elapsedNanoseconds >= 0.0 && elapsedNanoseconds < 18446744073709551616.0))
+        return;
+
+    uint64_t completedFrameIndex = renderer->gpuTimingFrameIndices[frameIndex];
+    if ((renderer->gpuTimingLatest.flags & RENDERER_GPU_TIMING_VALID) != 0u &&
+        completedFrameIndex < renderer->gpuTimingLatest.frameIndex)
+        return;
+    renderer->gpuTimingLatest.structSize = sizeof(renderer->gpuTimingLatest);
+    renderer->gpuTimingLatest.flags =
+        RENDERER_GPU_TIMING_SUPPORTED | RENDERER_GPU_TIMING_VALID;
+    renderer->gpuTimingLatest.frameIndex = completedFrameIndex;
+    renderer->gpuTimingLatest.durationNanoseconds = (uint64_t)elapsedNanoseconds;
+}
+
 static void FreeGenericDescriptorSets(Renderer *renderer, uint32_t frameIndex)
 {
     if (renderer == NULL || frameIndex >= FRAME_COUNT)
@@ -2646,6 +2728,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     // именно он позволяет проверять рендер там, где GPU нет вовсе.
     VkPhysicalDevice chosen = VK_NULL_HANDLE;
     uint32_t chosenFamily = 0u;
+    uint32_t chosenTimestampValidBits = 0u;
     for (uint32_t pass = 0; pass < 2u && chosen == VK_NULL_HANDLE; ++pass)
     {
         for (uint32_t index = 0; index < deviceCount; ++index)
@@ -2677,6 +2760,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
                 }
                 chosen = devices[index];
                 chosenFamily = family;
+                chosenTimestampValidBits = families[family].timestampValidBits;
                 break;
             }
         }
@@ -2685,10 +2769,12 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 
     renderer->physicalDevice = chosen;
     renderer->queueFamily = chosenFamily;
+    renderer->timestampValidBits = chosenTimestampValidBits;
     vkGetPhysicalDeviceMemoryProperties(chosen, &renderer->memoryProperties);
 
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(chosen, &properties);
+    renderer->timestampPeriodNanoseconds = properties.limits.timestampPeriod;
     renderer->uniformAlignment = properties.limits.minUniformBufferOffsetAlignment;
     if (renderer->uniformAlignment < sizeof(ChunkConstants))
         renderer->uniformAlignment = sizeof(ChunkConstants);
@@ -2758,6 +2844,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
             return false;
     }
     vkGetDeviceQueue(renderer->device, chosenFamily, 0u, &renderer->queue);
+    CreateGpuTimingQueries(renderer);
 
     VkCommandPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -3091,6 +3178,8 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             for (uint32_t chunk = 0u; chunk < renderer->instanceChunkCount[frame]; ++chunk)
                 BufferDestroy(renderer, &renderer->instanceBuffers[frame][chunk]);
             BufferDestroy(renderer, &renderer->uiQuadBuffers[frame]);
+            if (renderer->gpuTimingQueries[frame] != VK_NULL_HANDLE)
+                vkDestroyQueryPool(renderer->device, renderer->gpuTimingQueries[frame], NULL);
             if (renderer->frameFences[frame] != VK_NULL_HANDLE)
                 vkDestroyFence(renderer->device, renderer->frameFences[frame], NULL);
         }
@@ -3812,6 +3901,7 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
 
     vkWaitForFences(renderer->device, 1u, &renderer->frameFences[renderer->frameIndex], VK_TRUE,
                     UINT64_MAX);
+    CollectGpuTiming(renderer, renderer->frameIndex);
     /* Descriptor sets allocated by generic draws belong to this frame slot.
      * Its fence has completed, so they can be returned before recording the
      * next command buffer without touching sets used by the other slot. */
@@ -3858,6 +3948,13 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) return false;
     renderer->frameRecording = true;
     renderer->renderingActive = false;
+    if (renderer->gpuTimingSupported)
+    {
+        vkCmdResetQueryPool(commandBuffer, renderer->gpuTimingQueries[renderer->frameIndex],
+                            0u, 2u);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            renderer->gpuTimingQueries[renderer->frameIndex], 0u);
+    }
     // vkBeginCommandBuffer сбрасывает привязки состояния: кэш невалиден.
     renderer->pipelineBound = false;
 
@@ -4172,6 +4269,10 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
 
     PresentOutcome present = RecordPresent(renderer, commandBuffer);
 
+    if (renderer->gpuTimingSupported)
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            renderer->gpuTimingQueries[renderer->frameIndex], 1u);
+
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
     {
         renderer->frameRecording = false;
@@ -4200,6 +4301,11 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     if (vkQueueSubmit(renderer->queue, 1u, &submitInfo,
                       renderer->frameFences[renderer->frameIndex]) != VK_SUCCESS)
         return false;
+    if (renderer->gpuTimingSupported)
+    {
+        renderer->gpuTimingPending[renderer->frameIndex] = true;
+        renderer->gpuTimingFrameIndices[renderer->frameIndex] = renderer->submittedFrames;
+    }
 
     if (present == PRESENT_OUTCOME_PRESENT)
     {
@@ -4234,6 +4340,28 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+}
+
+void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
+{
+    if (outTiming == NULL) return;
+    memset(outTiming, 0, sizeof(*outTiming));
+    outTiming->structSize = sizeof(*outTiming);
+    if (renderer == NULL || renderer->device == VK_NULL_HANDLE) return;
+
+    // Poll completed slots only. The frame fence guarantees query availability;
+    // neither this API nor the query read waits for an in-flight frame.
+    Renderer *mutableRenderer = (Renderer *)renderer;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+        CollectGpuTiming(mutableRenderer, frame);
+
+    if (renderer->gpuTimingSupported)
+    {
+        outTiming->structSize = sizeof(*outTiming);
+        outTiming->flags = RENDERER_GPU_TIMING_SUPPORTED;
+        if ((renderer->gpuTimingLatest.flags & RENDERER_GPU_TIMING_VALID) != 0u)
+            *outTiming = renderer->gpuTimingLatest;
+    }
 }
 
 void RendererSetVerticalSync_Vulkan(Renderer *renderer, bool enabled)

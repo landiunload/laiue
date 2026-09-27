@@ -55,14 +55,15 @@ static uint32_t ModuleStart(void *context)
     uint32_t sceneMathSize = 0u;
     state->graphics = (const LaiueGraphicsServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_GRAPHICS_SERVICE_NAME,
-        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1, sizeof(LaiueGraphicsServiceV1),
+        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
+        LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE,
         &graphicsVersion, &graphicsSize);
     state->sceneMath = (const LaiueSceneMathServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_SCENE_MATH_SERVICE_NAME,
         LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1, sizeof(LaiueSceneMathServiceV1),
         &sceneMathVersion, &sceneMathSize);
     if (state->graphics == NULL || graphicsVersion < LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1 ||
-        graphicsSize < sizeof(*state->graphics) || state->sceneMath == NULL ||
+        graphicsSize < LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE || state->sceneMath == NULL ||
         sceneMathVersion < LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1 ||
         sceneMathSize < sizeof(*state->sceneMath))
     {

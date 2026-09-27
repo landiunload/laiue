@@ -51,9 +51,9 @@ option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 # также умеет headless/offscreen. На POSIX эти native providers пока
 # отсутствуют и внешний adapter может заменить их своей реализацией.
 if(LAIUE_PLATFORM_WINDOWS)
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh render scene voxel_render)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh profile render scene voxel_render)
 else()
-    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh render scene voxel_render)
+    set(LAIUE_GRAPHICS_MODULE_DIRECTORIES mesh profile render scene voxel_render)
     if(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND NOT APPLE)
         find_package(X11 QUIET)
         if(X11_FOUND)

@@ -204,6 +204,16 @@ struct Renderer
     HANDLE                     fenceEvent;
     UINT64                     fenceValues[FRAME_COUNT];
     UINT64                     lastSignaledFenceValue;
+    ID3D12QueryHeap*            gpuTimingQueryHeap;
+    ID3D12Resource*             gpuTimingReadback;
+    uint8_t*                    gpuTimingMapped;
+    UINT64                      gpuTimingFrequency;
+    UINT64                      gpuTimingFenceValues[FRAME_COUNT];
+    uint64_t                    gpuTimingFrameIndices[FRAME_COUNT];
+    bool                        gpuTimingPending[FRAME_COUNT];
+    uint64_t                    gpuTimingNextFrameIndex;
+    bool                        gpuTimingSupported;
+    bool                        gpuTimingRecording;
     UINT                       frameIndex;
     ID3D12RootSignature*       rootSignature;
     ID3D12RootSignature*       genericRootSignature;
@@ -351,6 +361,87 @@ static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
     barrier.Transition.StateAfter = stateAfter;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     return barrier;
+}
+
+// Profiling is optional: failure to allocate either resource leaves rendering
+// unchanged and the backend reports timing as unsupported.
+static void ReleaseGpuTimingResources(Renderer *renderer);
+
+static bool CreateGpuTimingResources(Renderer *renderer)
+{
+    UINT64 frequency = 0;
+    if (FAILED(ID3D12CommandQueue_GetTimestampFrequency(renderer->commandQueue,
+                                                        &frequency))
+        || frequency == 0)
+        return false;
+
+    D3D12_QUERY_HEAP_DESC queryHeapDescription = {
+        .Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+        .Count = FRAME_COUNT * 2u,
+    };
+    if (FAILED(ID3D12Device_CreateQueryHeap(renderer->device,
+            &queryHeapDescription, &IID_ID3D12QueryHeap,
+            (void **)&renderer->gpuTimingQueryHeap)))
+    {
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC readbackDescription;
+    memset(&readbackDescription, 0, sizeof(readbackDescription));
+    readbackDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackDescription.Width = FRAME_COUNT * 2u * sizeof(UINT64);
+    readbackDescription.Height = 1u;
+    readbackDescription.DepthOrArraySize = 1u;
+    readbackDescription.MipLevels = 1u;
+    readbackDescription.SampleDesc.Count = 1u;
+    readbackDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readbackHeap = { .Type = D3D12_HEAP_TYPE_READBACK };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDescription,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+            (void **)&renderer->gpuTimingReadback)))
+    {
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    D3D12_RANGE readRange = {
+        .Begin = 0,
+        .End = FRAME_COUNT * 2u * sizeof(UINT64),
+    };
+    if (FAILED(ID3D12Resource_Map(renderer->gpuTimingReadback, 0, &readRange,
+                                  (void **)&renderer->gpuTimingMapped)))
+    {
+        renderer->gpuTimingMapped = NULL;
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    renderer->gpuTimingFrequency = frequency;
+    renderer->gpuTimingSupported = true;
+    return true;
+}
+
+static void ReleaseGpuTimingResources(Renderer *renderer)
+{
+    if (renderer->gpuTimingReadback != NULL)
+    {
+        if (renderer->gpuTimingMapped != NULL)
+        {
+            const D3D12_RANGE noCpuWrites = {0, 0};
+            ID3D12Resource_Unmap(renderer->gpuTimingReadback, 0,
+                                 &noCpuWrites);
+        }
+        ID3D12Resource_Release(renderer->gpuTimingReadback);
+    }
+    if (renderer->gpuTimingQueryHeap != NULL)
+        ID3D12QueryHeap_Release(renderer->gpuTimingQueryHeap);
+    renderer->gpuTimingReadback = NULL;
+    renderer->gpuTimingMapped = NULL;
+    renderer->gpuTimingQueryHeap = NULL;
+    renderer->gpuTimingFrequency = 0;
+    renderer->gpuTimingSupported = false;
 }
 
 // Смена состояния командного списка через кэш: повторная запись того же
@@ -1745,6 +1836,8 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         RendererDestroy_D3D12(renderer);
         return NULL;
     }
+    // Timestamp support is optional and must never prevent renderer creation.
+    (void)CreateGpuTimingResources(renderer);
 
     DXGI_SWAP_CHAIN_DESC1 swapChainDescription;
     memset(&swapChainDescription, 0, sizeof(swapChainDescription));
@@ -2163,6 +2256,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     if (renderer->depthStencilViewHeap != NULL) ID3D12DescriptorHeap_Release(renderer->depthStencilViewHeap);
     if (renderer->renderTargetViewHeap != NULL) ID3D12DescriptorHeap_Release(renderer->renderTargetViewHeap);
     if (renderer->commandList != NULL) ID3D12GraphicsCommandList_Release(renderer->commandList);
+    ReleaseGpuTimingResources(renderer);
     if (renderer->fence != NULL) ID3D12Fence_Release(renderer->fence);
     if (renderer->swapChain != NULL) IDXGISwapChain3_Release(renderer->swapChain);
     if (renderer->commandQueue != NULL) ID3D12CommandQueue_Release(renderer->commandQueue);
@@ -3105,6 +3199,14 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
         renderer->commandAllocators[renderer->frameIndex],
         renderer->worldReady ? renderer->pipelineState : NULL);
     renderer->frameRecording = true;
+    renderer->gpuTimingRecording = renderer->gpuTimingSupported;
+    if (renderer->gpuTimingRecording)
+    {
+        UINT queryIndex = renderer->frameIndex * 2u;
+        ID3D12GraphicsCommandList_EndQuery(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex);
+    }
     // После Reset кэш аннулируется независимо от результата вызова выше:
     // первая отрисовка явно запишет обе привязки и не полагается на состояние
     // командного списка до Reset.
@@ -3325,6 +3427,21 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         renderer->currentStats.drawCalls++;
     }
 
+    // The end timestamp follows all scene, panorama, and UI work. Resolving
+    // happens afterward, so the readback copy is outside the measured interval.
+    bool hasGpuTimingSample = renderer->gpuTimingRecording;
+    if (hasGpuTimingSample)
+    {
+        UINT queryIndex = renderer->frameIndex * 2u;
+        ID3D12GraphicsCommandList_EndQuery(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex + 1u);
+        ID3D12GraphicsCommandList_ResolveQueryData(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex, 2u, renderer->gpuTimingReadback,
+            (UINT64)renderer->frameIndex * 2u * sizeof(UINT64));
+    }
+
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
@@ -3333,10 +3450,15 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         renderer->commandList);
     if (FAILED(closeResult))
     {
+        renderer->gpuTimingRecording = false;
         renderer->frameRecording = false;
         return false;
     }
 
+    UINT submittedSlot = renderer->frameIndex;
+    renderer->gpuTimingRecording = false;
+    if (hasGpuTimingSample)
+        renderer->gpuTimingPending[submittedSlot] = false;
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
@@ -3366,6 +3488,16 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         return false;
     }
 
+    if (hasGpuTimingSample
+        && renderer->gpuTimingNextFrameIndex != UINT64_MAX)
+    {
+        renderer->gpuTimingFrameIndices[submittedSlot] =
+            ++renderer->gpuTimingNextFrameIndex;
+        renderer->gpuTimingFenceValues[submittedSlot] =
+            renderer->fenceValues[submittedSlot];
+        renderer->gpuTimingPending[submittedSlot] = true;
+    }
+
     renderer->lastStats = renderer->currentStats;
 
     bool waitedForFence = MoveToNextFrame(renderer);
@@ -3392,6 +3524,72 @@ void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+}
+
+void RendererGetGpuTiming_D3D12(const Renderer *renderer,
+                                RendererGpuTimingV1 *outTiming)
+{
+    if (outTiming == NULL)
+        return;
+    memset(outTiming, 0, sizeof(*outTiming));
+    outTiming->structSize = sizeof(*outTiming);
+    if (renderer == NULL || !renderer->gpuTimingSupported
+        || renderer->gpuTimingMapped == NULL || renderer->fence == NULL)
+        return;
+
+    outTiming->flags = RENDERER_GPU_TIMING_SUPPORTED;
+    UINT64 completedValue = ID3D12Fence_GetCompletedValue(renderer->fence);
+    // UINT64_MAX means the device was removed; mapped query data is not trusted.
+    if (completedValue == UINT64_MAX)
+        return;
+
+    uint64_t bestFrameIndex = 0;
+    uint64_t bestDurationNanoseconds = 0;
+    for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
+    {
+        if (!renderer->gpuTimingPending[slot]
+            || renderer->gpuTimingFenceValues[slot] > completedValue
+            || renderer->gpuTimingFrameIndices[slot] <= bestFrameIndex)
+            continue;
+
+        UINT64 timestamps[2];
+        memcpy(timestamps,
+            renderer->gpuTimingMapped + (size_t)slot * 2u * sizeof(UINT64),
+            sizeof(timestamps));
+        if (timestamps[1] < timestamps[0])
+            continue;
+
+        UINT64 ticks = timestamps[1] - timestamps[0];
+        UINT64 wholeSeconds = ticks / renderer->gpuTimingFrequency;
+        UINT64 remainder = ticks % renderer->gpuTimingFrequency;
+        if (wholeSeconds > UINT64_MAX / 1000000000ull)
+            continue;
+
+        UINT64 duration = wholeSeconds * 1000000000ull;
+        UINT64 fractionalNanoseconds;
+        if (remainder <= UINT64_MAX / 1000000000ull)
+        {
+            fractionalNanoseconds = remainder * 1000000000ull
+                / renderer->gpuTimingFrequency;
+        }
+        else
+        {
+            fractionalNanoseconds = (UINT64)(((long double)remainder
+                / (long double)renderer->gpuTimingFrequency) * 1000000000.0L);
+        }
+        if (fractionalNanoseconds > UINT64_MAX - duration)
+            continue;
+
+        bestFrameIndex = renderer->gpuTimingFrameIndices[slot];
+        bestDurationNanoseconds = duration + fractionalNanoseconds;
+    }
+
+    if (bestFrameIndex != 0)
+    {
+        outTiming->flags |= RENDERER_GPU_TIMING_VALID;
+        outTiming->frameIndex = bestFrameIndex;
+        outTiming->durationNanoseconds = bestDurationNanoseconds;
+    }
 }
 
 void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled)

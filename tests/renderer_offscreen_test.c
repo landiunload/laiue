@@ -1163,6 +1163,18 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(stats.geometryPoolUsedBytes == 0u,
            "an oversized mesh must leave no used bytes after draining");
 
+    // GPU timing is optional on unsupported queues/drivers. A supported
+    // backend publishes only completed-frame samples and never blocks here.
+    RendererGpuTimingV1 gpuTiming;
+    RendererGetGpuTimingV1(renderer, &gpuTiming);
+    Expect(gpuTiming.structSize == sizeof(gpuTiming),
+           "GPU timing must report its versioned structure size");
+    Expect((gpuTiming.flags & ~(RENDERER_GPU_TIMING_SUPPORTED |
+                                RENDERER_GPU_TIMING_VALID)) == 0u,
+           "GPU timing must not publish unknown status flags");
+    Expect((gpuTiming.flags & RENDERER_GPU_TIMING_VALID) == 0u ||
+               (gpuTiming.flags & RENDERER_GPU_TIMING_SUPPORTED) != 0u,
+           "a valid GPU sample must imply timestamp support");
     PlatformFree(poolQuads);
     PlatformFree(poolMeshes);
     PlatformFree(largeGeometry);
