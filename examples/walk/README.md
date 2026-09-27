@@ -4,9 +4,9 @@ This is the smallest public-SDK walk slice. It owns the game-specific base
 provider (grass at `z=0`, earth at `z=-1..-3`, stone below), loads the public
 `laiue.character`, `laiue.physics`, `laiue.voxel`, `laiue.scene`, and
 `laiue.graphics` service tables through the bootstrap, and advances simulation
-at 128 Hz. Desktop keeps the kinematic character controller; Android runs an
-11-box humanoid ragdoll with pelvis, torso, head, upper/lower arms, thighs, and
-shins. Rendering is camera-relative; mouse-look, WASD, sprint, and jump are
+at 128 Hz. Desktop keeps the kinematic character controller; Android runs a
+13-part active humanoid ragdoll with pelvis, torso, head, upper/lower arms,
+thighs, shins, and feet. Rendering is camera-relative; mouse-look, WASD, sprint, and jump are
 enabled when the corresponding optional platform providers are present.
 
 The character provider is optional. Without it the window and diagnostic
@@ -46,12 +46,15 @@ rendering; Vulkan 1.2 devices use the compatible render-pass
 path, so the same APK does not require a 1.3-only device. The sparse
 voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
 ragdoll on the example's deterministic infinite base plane. On Android, the
-lower-left stick drives the ragdoll pelvis relative to the camera, the orange
-button toggles its velocity target, and the purple button adds a jump impulse.
-Each body part is a colliding rigid box joined by a ball joint. The initial
-anchors coincide, and the rigid solver checks contacts between connected parts.
-Joint motors, anatomical angle limits, animation, and foot placement are not
-part of this first physics-driven prototype.
+lower-left stick drives the active ragdoll relative to the camera, the orange
+button toggles its speed, and the purple button jumps only while a foot is
+supported by a solid surface. The 13 colliding body boxes have rounded render
+meshes, two physical feet, and 12 ball joints. A fixed-step pose controller
+stabilizes the torso and limbs, targets an alternating leg stride, and keeps
+body parts near their anatomical offsets. Directly joined parts skip
+self-collision while all non-adjacent body and world contacts remain active.
+The controller and contact solver are deterministic; a large external impact
+can still knock the character down because the demo has no get-up animation.
 
 Configure it with the API 35 emulator preset (put the build tree on the
 scratch disk as shown below):

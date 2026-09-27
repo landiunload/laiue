@@ -14,6 +14,7 @@
 #include "touch_controls.h"
 #include "../humanoid_ragdoll.h"
 #include "media/image.h"
+#include "math/scalar.h"
 
 #include <android/asset_manager.h>
 #include <android/input.h>
@@ -51,7 +52,14 @@
 #define ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y (-64.0f)
 #define ANDROID_WALK_TEXTURED_TERRAIN_MAX_X 128.0f
 #define ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y 128.0f
-#define ANDROID_WALK_RAGDOLL_VERTEX_COUNT (WALK_RAGDOLL_BODY_COUNT * 36u)
+#define ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS 4u
+#define ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS \
+    (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 3u)
+#define ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS \
+    (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 2u)
+#define ANDROID_WALK_RAGDOLL_VERTEX_COUNT \
+    (WALK_RAGDOLL_BODY_COUNT * 6u * ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * \
+     ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 6u)
 #define ANDROID_WALK_RAGDOLL_STABLE_ID UINT64_C(0x57414C4B52414744)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
@@ -72,6 +80,9 @@ struct AndroidWalkState
     uint32_t ragdollScratchBytes;
     LaiueGraphicsHandle ragdollBuffer;
     bool ragdollReady;
+    bool ragdollGrounded;
+    double ragdollFacingYaw;
+    double ragdollGaitPhase;
     const LaiueCharacterServiceV1 *character;
     uint32_t characterServiceSize;
     const LaiueVoxelServiceV1 *voxel;
@@ -292,8 +303,8 @@ static bool AndroidInitializeRagdoll(AndroidWalkState *state)
     };
     state->ragdollRigidSettings = (VoxelRigidStepSettings){
         .gravity = {0.0, 0.0, -9.81},
-        .solverIterations = 10u,
-        .penetrationCorrection = 0.35,
+        .solverIterations = 16u,
+        .penetrationCorrection = 0.55,
         .penetrationSlop = 0.005,
         .sleepLinearSpeed = 0.02,
         .sleepAngularSpeed = 0.05,
@@ -518,18 +529,43 @@ static bool AndroidCreateRagdollBuffer(AndroidWalkState *state)
     return true;
 }
 
+static bool AndroidWriteRagdollVertex(LaiueGraphicsVertexV2 *output,
+                                      const AndroidWalkState *state,
+                                      const double center[3], const float rotation[9],
+                                      const double local[3], float u, float v,
+                                      uint32_t color)
+{
+    if (output == NULL || state == NULL || center == NULL || rotation == NULL ||
+        local == NULL)
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const double world = center[axis] - state->renderOrigin[axis] +
+            (double)rotation[axis] * local[0] +
+            (double)rotation[3u + axis] * local[1] +
+            (double)rotation[6u + axis] * local[2];
+        if (!isfinite(world) || fabs(world) > 1000000.0)
+            return false;
+        output->position[axis] = (float)world;
+    }
+    output->uv[0] = u;
+    output->uv[1] = v;
+    output->colorRGBA = color;
+    return true;
+}
+
 static bool AndroidUpdateRagdollBuffer(AndroidWalkState *state)
 {
-    static const uint8_t faceCorners[6][6] = {
-        {0u, 1u, 2u, 0u, 2u, 3u}, {4u, 7u, 6u, 4u, 6u, 5u},
-        {0u, 4u, 5u, 0u, 5u, 1u}, {3u, 2u, 6u, 3u, 6u, 7u},
-        {0u, 3u, 7u, 0u, 7u, 4u}, {1u, 5u, 6u, 1u, 6u, 2u},
+    static const uint8_t faceQuad[6][4] = {
+        {0u, 1u, 2u, 3u}, {4u, 7u, 6u, 5u}, {0u, 4u, 5u, 1u},
+        {3u, 2u, 6u, 7u}, {0u, 3u, 7u, 4u}, {1u, 5u, 6u, 2u},
     };
     static const uint32_t colors[WALK_RAGDOLL_BODY_COUNT] = {
         UINT32_C(0xFF389AE3), UINT32_C(0xFFD67F52), UINT32_C(0xFFA4C9F0),
         UINT32_C(0xFFD67F52), UINT32_C(0xFFD67F52), UINT32_C(0xFFB8683F),
         UINT32_C(0xFFB8683F), UINT32_C(0xFF6BA64D), UINT32_C(0xFF6BA64D),
-        UINT32_C(0xFF508035), UINT32_C(0xFF508035),
+        UINT32_C(0xFF508035), UINT32_C(0xFF508035), UINT32_C(0xFF313C45),
+        UINT32_C(0xFF313C45),
     };
     if (state == NULL || !state->ragdollReady ||
         state->ragdoll.bodyCount != WALK_RAGDOLL_BODY_COUNT ||
@@ -549,41 +585,148 @@ static bool AndroidUpdateRagdollBuffer(AndroidWalkState *state)
         if (!VoxelRigidBodyLocalPosition(body, center))
             return false;
         VoxelRigidBodyOrientationMatrix(body, rotation);
+        if (bodyIndex == WALK_RAGDOLL_HEAD)
+        {
+            static const uint8_t triangleCorner[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+            const double pi = 3.14159265358979323846;
+            for (uint32_t latitude = 0u;
+                 latitude < ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS; ++latitude)
+                for (uint32_t longitude = 0u;
+                     longitude < ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
+                     ++longitude)
+                {
+                    const double latitude0 = -0.5 * pi + pi * (double)latitude /
+                        ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS;
+                    const double latitude1 = -0.5 * pi + pi * (double)(latitude + 1u) /
+                        ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS;
+                    const double longitude0 = 2.0 * pi * (double)longitude /
+                        ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
+                    const double longitude1 = 2.0 * pi * (double)(longitude + 1u) /
+                        ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
+                    const double latitudeSin[2] = {
+                        ScalarSin((float)latitude0), ScalarSin((float)latitude1),
+                    };
+                    const double latitudeCos[2] = {
+                        ScalarCos((float)latitude0), ScalarCos((float)latitude1),
+                    };
+                    const double longitudeSin[2] = {
+                        ScalarSin((float)longitude0), ScalarSin((float)longitude1),
+                    };
+                    const double longitudeCos[2] = {
+                        ScalarCos((float)longitude0), ScalarCos((float)longitude1),
+                    };
+                    const double points[4][3] = {
+                        {body->halfExtent[0] * latitudeCos[0] * longitudeCos[0],
+                         body->halfExtent[1] * latitudeCos[0] * longitudeSin[0],
+                         body->halfExtent[2] * latitudeSin[0]},
+                        {body->halfExtent[0] * latitudeCos[0] * longitudeCos[1],
+                         body->halfExtent[1] * latitudeCos[0] * longitudeSin[1],
+                         body->halfExtent[2] * latitudeSin[0]},
+                        {body->halfExtent[0] * latitudeCos[1] * longitudeCos[1],
+                         body->halfExtent[1] * latitudeCos[1] * longitudeSin[1],
+                         body->halfExtent[2] * latitudeSin[1]},
+                        {body->halfExtent[0] * latitudeCos[1] * longitudeCos[0],
+                         body->halfExtent[1] * latitudeCos[1] * longitudeSin[0],
+                         body->halfExtent[2] * latitudeSin[1]},
+                    };
+                    for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
+                    {
+                        const uint32_t corner = triangleCorner[vertex];
+                        LaiueGraphicsVertexV2 *output = &vertices[vertexIndex++];
+                        if (!AndroidWriteRagdollVertex(
+                                output, state, center, rotation, points[corner],
+                                (float)((longitude + (corner == 1u || corner == 2u)) /
+                                        (double)ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS),
+                                (float)((latitude + (corner >= 2u)) /
+                                        (double)ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS),
+                                colors[bodyIndex]))
+                            return false;
+                    }
+                }
+            continue;
+        }
         double corners[8][3];
         for (uint32_t corner = 0u; corner < 8u; ++corner)
         {
-            const double local[3] = {
+            corners[corner][0] =
                 (corner & 1u) != 0u ? body->halfExtent[0] : -body->halfExtent[0],
-                (corner & 2u) != 0u ? body->halfExtent[1] : -body->halfExtent[1],
-                (corner & 4u) != 0u ? body->halfExtent[2] : -body->halfExtent[2],
-            };
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
-            {
-                corners[corner][axis] = center[axis] - state->renderOrigin[axis] +
-                                        (double)rotation[axis] * local[0] +
-                                        (double)rotation[3u + axis] * local[1] +
-                                        (double)rotation[6u + axis] * local[2];
-            }
+            corners[corner][1] =
+                (corner & 2u) != 0u ? body->halfExtent[1] : -body->halfExtent[1];
+            corners[corner][2] =
+                (corner & 4u) != 0u ? body->halfExtent[2] : -body->halfExtent[2];
         }
+        const double bevel = fmin(body->halfExtent[0],
+                                  fmin(body->halfExtent[1],
+                                       body->halfExtent[2])) * 0.82;
         for (uint32_t face = 0u; face < 6u; ++face)
-            for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
+            for (uint32_t cellY = 0u; cellY < ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                 ++cellY)
+                for (uint32_t cellX = 0u; cellX < ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                     ++cellX)
             {
-                const uint32_t corner = faceCorners[face][vertex];
-                LaiueGraphicsVertexV2 *output = &vertices[vertexIndex++];
-                for (uint32_t axis = 0u; axis < 3u; ++axis)
+                const double u0 = (double)cellX /
+                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                const double u1 = (double)(cellX + 1u) /
+                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                const double v0 = (double)cellY /
+                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                const double v1 = (double)(cellY + 1u) /
+                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
+                const double uv[6][2] = {
+                    {u0, v0}, {u1, v0}, {u1, v1},
+                    {u0, v0}, {u1, v1}, {u0, v1},
+                };
+                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
                 {
-                    if (!isfinite(corners[corner][axis]) ||
-                        fabs(corners[corner][axis]) > 1000000.0)
-                        return false;
-                    output->position[axis] = (float)corners[corner][axis];
+                    double local[3];
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                    {
+                        const double low = corners[faceQuad[face][0]][axis];
+                        const double high = corners[faceQuad[face][1]][axis];
+                        const double farHigh = corners[faceQuad[face][2]][axis];
+                        const double farLow = corners[faceQuad[face][3]][axis];
+                        const double near = low + (high - low) * uv[vertex][0];
+                        const double far = farLow + (farHigh - farLow) * uv[vertex][0];
+                        local[axis] = near + (far - near) * uv[vertex][1];
+                    }
+                    double inner[3];
+                    double roundedOffset[3];
+                    double offsetLengthSquared = 0.0;
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                    {
+                        const double limit = fmax(0.0, body->halfExtent[axis] - bevel);
+                        inner[axis] = fmax(-limit, fmin(limit, local[axis]));
+                        roundedOffset[axis] = local[axis] - inner[axis];
+                        offsetLengthSquared += roundedOffset[axis] * roundedOffset[axis];
+                    }
+                    const double offsetLength = sqrt(offsetLengthSquared);
+                    double rounded[3];
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                        rounded[axis] = offsetLength > 1.0e-9
+                            ? inner[axis] + roundedOffset[axis] * bevel / offsetLength
+                            : local[axis];
+                    LaiueGraphicsVertexV2 *output = &vertices[vertexIndex++];
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                    {
+                        const double world = center[axis] - state->renderOrigin[axis] +
+                            (double)rotation[axis] * rounded[0] +
+                            (double)rotation[3u + axis] * rounded[1] +
+                            (double)rotation[6u + axis] * rounded[2];
+                        if (!isfinite(world) || fabs(world) > 1000000.0)
+                            return false;
+                        output->position[axis] = (float)world;
+                    }
+                    output->uv[0] = (float)uv[vertex][0];
+                    output->uv[1] = (float)uv[vertex][1];
+                    const uint32_t shade = face == 1u ? 255u :
+                                           (face < 2u ? 238u : 205u);
+                    const uint32_t base = colors[bodyIndex];
+                    const uint32_t red = ((base >> 0u) & 0xFFu) * shade / 255u;
+                    const uint32_t green = ((base >> 8u) & 0xFFu) * shade / 255u;
+                    const uint32_t blue = ((base >> 16u) & 0xFFu) * shade / 255u;
+                    output->colorRGBA = (base & UINT32_C(0xFF000000)) |
+                                        (blue << 16u) | (green << 8u) | red;
                 }
-                output->uv[0] = (vertex == 1u || vertex == 2u || vertex == 4u)
-                                   ? 1.0f
-                                   : 0.0f;
-                output->uv[1] = (vertex == 2u || vertex == 4u || vertex == 5u)
-                                   ? 1.0f
-                                   : 0.0f;
-                output->colorRGBA = colors[bodyIndex];
             }
     }
     LaiueGraphicsBufferUploadV1 upload = {
@@ -1221,8 +1364,7 @@ static void AndroidStep(AndroidWalkState *state)
         state->character->step != NULL;
     const bool ragdollCanStep = state->ragdollReady && state->physics != NULL &&
                                 state->physics->ragdollStep != NULL &&
-                                state->physics->ragdollDrive != NULL &&
-                                state->physics->ragdollJump != NULL;
+                                state->physics->ragdollDrive != NULL;
     while ((ragdollCanStep || characterCanStep) && state->accumulator >= fixedStep &&
            ticks < 8u)
     {
@@ -1246,12 +1388,23 @@ static void AndroidStep(AndroidWalkState *state)
         if (ragdollCanStep)
         {
             const double targetSpeed = state->keyDown[4] || state->sprintToggled ? 4.2 : 2.6;
-            const bool jumpOkay = !state->jumpPending ||
-                                  state->physics->ragdollJump(&state->ragdoll, 5.0);
+            const double inputMagnitude = sqrt((double)worldX * worldX +
+                                               (double)worldY * worldY);
+            const double gaitAmount = fmin(1.0, inputMagnitude);
+            if (gaitAmount > 1.0e-3)
+                state->ragdollFacingYaw = ScalarAtan2(-worldX, worldY);
+            state->ragdollGaitPhase += targetSpeed * gaitAmount * fixedStep * 4.8;
+            if (state->ragdollGaitPhase >= 6.2831853071795864769)
+                state->ragdollGaitPhase -= 6.2831853071795864769;
+            if (state->jumpPending)
+                (void)WalkRagdollJumpIfGrounded(&state->ragdoll,
+                                                &state->ragdollCollision, 5.0);
             state->jumpPending = false;
-            if (!jumpOkay ||
-                !state->physics->ragdollDrive(&state->ragdoll, worldX, worldY,
-                                              targetSpeed, 16.0) ||
+            const double driveAcceleration = state->ragdollGrounded ? 8.0 : 2.5;
+            if (!WalkRagdollDrivePlanar(&state->ragdoll, worldX, worldY,
+                                        targetSpeed, driveAcceleration, fixedStep) ||
+                !WalkRagdollPoseDrive(&state->ragdoll, state->ragdollFacingYaw,
+                                      state->ragdollGaitPhase, gaitAmount, fixedStep) ||
                 !state->physics->ragdollStep(&state->ragdoll,
                                              &state->ragdollCollision,
                                              &state->ragdollRigidSettings,
@@ -1264,6 +1417,8 @@ static void AndroidStep(AndroidWalkState *state)
                 state->running = false;
                 break;
             }
+            state->ragdollGrounded = WalkRagdollGrounded(
+                &state->ragdoll, &state->ragdollCollision);
         }
         else
         {
