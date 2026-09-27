@@ -1105,6 +1105,7 @@ static void TestCompoundRestsOnFloor(void)
     sceneWork.count = 1u;
     const double offset[3] = {0.0, 0.0, 2.0};
     InitCompoundBody(&sceneWork, 0u, plate, 2u, 2.0, offset, 1u, 0.0, 0.6);
+    sceneWork.bodies[0].orientation[3] = -1.0;
     for (uint32_t tick = 0u; tick < REPLAY_TICKS; ++tick)
     {
         Expect(StepScene(&sceneWork, &settings, &options), "compound resting step succeeded");
