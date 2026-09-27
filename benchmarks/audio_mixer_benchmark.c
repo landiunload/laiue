@@ -102,6 +102,8 @@ typedef struct MixScenario
     uint32_t sourceRate;
     uint32_t iterations;
     bool unifiedSpeed;   // true — все голоса со скоростью 1 (целочисленный шаг)
+    // 0 keeps every voice; otherwise stop the higher slots before measuring.
+    uint32_t activeVoicesAfterStop;
 } MixScenario;
 
 static uint32_t NextRandom(uint32_t *state)
@@ -183,6 +185,7 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
         return false;
     }
 
+    AudioVoice handles[AUDIO_MAX_VOICES];
     for (uint32_t index = 0; index < scenario->voices; ++index)
     {
         AudioVoiceParameters parameters = {
@@ -192,7 +195,32 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
                                             : 0.75f + (float)(index % 7u) * 0.1f,
             .looping = true,
         };
-        if (AudioVoicePlay(device, clip, &parameters) == AUDIO_VOICE_NONE)
+        handles[index] = AudioVoicePlay(device, clip, &parameters);
+        if (handles[index] == AUDIO_VOICE_NONE)
+        {
+            PlatformFree(frames);
+            AudioClipDestroy(clip);
+            AudioDeviceDestroy(device);
+            return false;
+        }
+    }
+
+    if (scenario->activeVoicesAfterStop != 0u)
+    {
+        if (scenario->activeVoicesAfterStop > scenario->voices ||
+            !AudioDeviceRenderFrames(device, frames, BUFFER_FRAMES))
+        {
+            PlatformFree(frames);
+            AudioClipDestroy(clip);
+            AudioDeviceDestroy(device);
+            return false;
+        }
+        for (uint32_t index = scenario->activeVoicesAfterStop;
+             index < scenario->voices; ++index)
+        {
+            AudioVoiceStop(device, handles[index]);
+        }
+        if (!AudioDeviceRenderFrames(device, frames, BUFFER_FRAMES))
         {
             PlatformFree(frames);
             AudioClipDestroy(clip);
@@ -236,6 +264,11 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
     WriteUnsigned(scenario->channels);
     WriteText(" rate=");
     WriteUnsigned(scenario->sourceRate);
+    if (scenario->activeVoicesAfterStop != 0u)
+    {
+        WriteText(" active_after_stop=");
+        WriteUnsigned(scenario->activeVoicesAfterStop);
+    }
     WriteText(" hash=");
     WriteHex(*hashOut);
     WriteText("\n");
@@ -249,16 +282,17 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
 LAIUE_TEST_ENTRY(AudioMixerBenchmarkEntryPoint)
 {
     static const MixScenario scenarios[] = {
-        {"silence", 0u, 1u, DEVICE_SAMPLE_RATE, 20000u, true},
-        {"mono1_step1", 1u, 1u, DEVICE_SAMPLE_RATE, 4000u, true},
-        {"stereo1_step1", 1u, 2u, DEVICE_SAMPLE_RATE, 4000u, true},
-        {"mono1_resample", 1u, 1u, 44100u, 4000u, true},
-        {"mono16", 16u, 1u, DEVICE_SAMPLE_RATE, 1000u, false},
-        {"stereo16", 16u, 2u, DEVICE_SAMPLE_RATE, 1000u, false},
-        {"mono64", 64u, 1u, DEVICE_SAMPLE_RATE, 300u, false},
-        {"stereo64", 64u, 2u, DEVICE_SAMPLE_RATE, 300u, false},
-        {"mono128", 128u, 1u, DEVICE_SAMPLE_RATE, 150u, false},
-        {"stereo128", 128u, 2u, DEVICE_SAMPLE_RATE, 150u, false},
+        {"silence", 0u, 1u, DEVICE_SAMPLE_RATE, 20000u, true, 0u},
+        {"mono1_step1", 1u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 0u},
+        {"stereo1_step1", 1u, 2u, DEVICE_SAMPLE_RATE, 4000u, true, 0u},
+        {"mono1_resample", 1u, 1u, 44100u, 4000u, true, 0u},
+        {"mono16", 16u, 1u, DEVICE_SAMPLE_RATE, 1000u, false, 0u},
+        {"stereo16", 16u, 2u, DEVICE_SAMPLE_RATE, 1000u, false, 0u},
+        {"mono64", 64u, 1u, DEVICE_SAMPLE_RATE, 300u, false, 0u},
+        {"stereo64", 64u, 2u, DEVICE_SAMPLE_RATE, 300u, false, 0u},
+        {"mono128", 128u, 1u, DEVICE_SAMPLE_RATE, 150u, false, 0u},
+        {"stereo128", 128u, 2u, DEVICE_SAMPLE_RATE, 150u, false, 0u},
+        {"mono128_tail_trim", 128u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 1u},
     };
 
     WriteText("laiue audio mixer benchmark\n");

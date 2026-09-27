@@ -707,16 +707,47 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
     // Голоса не вытесняют друг друга: сверх лимита выдача честно
     // отказывает, а уже звучащее не обрывается.
     uint32_t startedVoices = 0u;
+    AudioVoice startedHandles[AUDIO_MAX_VOICES];
     for (uint32_t index = 0; index < AUDIO_MAX_VOICES * 2u; ++index)
     {
-        if (AudioVoicePlay(device, clip, &loopParameters) != AUDIO_VOICE_NONE) ++startedVoices;
+        AudioVoice started = AudioVoicePlay(device, clip, &loopParameters);
+        if (started != AUDIO_VOICE_NONE)
+        {
+            startedHandles[startedVoices++] = started;
+        }
     }
-    Expect(startedVoices <= AUDIO_MAX_VOICES, "the mixer must not exceed its voice limit");
-    Expect(startedVoices > 0u, "the mixer must accept at least one voice");
+    Expect(startedVoices == AUDIO_MAX_VOICES, "the mixer must accept every available voice slot");
     Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
     Expect(AudioDeviceGetStats(device, &stats), "stats must be readable");
-    Expect(stats.activeVoices > 0u, "active voices must be reported");
+    Expect(stats.activeVoices == AUDIO_MAX_VOICES, "all started voices must be reported active");
     Expect(stats.mixedFrames > 0u, "mixed frames must be counted");
+
+    // Stopping the tail should shorten the mixer's scan on this same render.
+    // The low voice must keep sounding, and a later start in the newly empty
+    // tail must raise the boundary again.
+    for (uint32_t index = 1u; index < AUDIO_MAX_VOICES; ++index)
+    {
+        AudioVoiceStop(device, startedHandles[index]);
+    }
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES),
+           "rendering after tail stop must succeed");
+    Expect(AudioDeviceGetStats(device, &stats), "stats after tail stop must be readable");
+    Expect(stats.activeVoices == 1u, "stopping tail voices must preserve the low voice");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) > 0.0f,
+           "the low voice must keep sounding after the scan boundary shrinks");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES),
+           "rendering after tail trim must succeed");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) > 0.0f,
+           "the low voice must keep sounding on the shortened scan path");
+
+    AudioVoice afterTrim = AudioVoicePlay(device, clip, &loopParameters);
+    Expect(afterTrim != AUDIO_VOICE_NONE, "a freed tail slot must be reusable after trimming");
+    Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES),
+           "rendering a reused tail slot must succeed");
+    Expect(AudioDeviceGetStats(device, &stats), "stats after tail reuse must be readable");
+    Expect(stats.activeVoices == 2u, "a new voice must raise the shortened scan boundary");
+    Expect(ChannelPeak(frames, TEST_FRAMES, 0u) > 0.0f,
+           "a voice started beyond the shortened boundary must sound");
 
     AudioDeviceStopAllVoices(device);
     Expect(AudioDeviceRenderFrames(device, frames, TEST_FRAMES), "rendering must succeed");
