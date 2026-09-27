@@ -265,6 +265,52 @@ static void RunHumanoidReplay(RagdollHarness *harness, VoxelRagdoll *first,
     }
 }
 
+static void RunIdleDriveSleepRegression(RagdollHarness *harness, VoxelRagdoll *ragdoll)
+{
+    const VoxelRagdollDefinition definition = {
+        .stableIdBase = 3000u,
+        .origin = {0.0, 0.0, 10.0},
+        .bodies = walkRagdollBodies,
+        .bodyCount = WALK_RAGDOLL_BODY_COUNT,
+        .joints = walkRagdollJoints,
+        .jointCount = WALK_RAGDOLL_JOINT_COUNT,
+        .rootBody = WALK_RAGDOLL_PELVIS,
+    };
+    RagdollExpect(VoxelRagdollInitialize(ragdoll, &definition),
+                  "idle ragdoll initializes for sleep regression");
+    for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+    {
+        ragdoll->bodies[body].sleeping = true;
+        ragdoll->bodies[body].sleepCounter = 17u;
+    }
+
+    for (uint32_t tick = 0u; tick < 8u; ++tick)
+    {
+        RagdollExpect(VoxelRagdollDrive(ragdoll, 0.0, 0.0, 2.6, 16.0),
+                      "zero input is a valid idle motor command");
+        for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+            RagdollExpect(ragdoll->bodies[body].sleeping &&
+                              ragdoll->bodies[body].sleepCounter == 17u,
+                          "zero input preserves an idle sleeping island");
+    }
+
+    VoxelRigidStepStats stats;
+    RagdollExpect(VoxelRigidBodyStep(ragdoll->bodies, ragdoll->bodyCount,
+                                    &harness->collision, &harness->rigidSettings,
+                                    harness->scratch, harness->scratchBytes) &&
+                      VoxelRigidBodyReadStepStats(harness->scratch, ragdoll->bodyCount,
+                                                  harness->scratchBytes, &stats) &&
+                      stats.awakeBodyCount == 0u,
+                  "idle drive leaves the physics fast path fully asleep");
+
+    RagdollExpect(VoxelRagdollDrive(ragdoll, 1.0, 0.0, 2.6, 16.0),
+                  "nonzero input is accepted by a sleeping ragdoll");
+    for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+        RagdollExpect(!ragdoll->bodies[body].sleeping,
+                      "movement input wakes the articulated island");
+    VoxelRagdollRelease(ragdoll);
+}
+
 LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
 {
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
@@ -288,6 +334,7 @@ LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
     RunHumanoidReplay(&harness, first, second);
     VoxelRagdollRelease(second);
     VoxelRagdollRelease(first);
+    RunIdleDriveSleepRegression(&harness, first);
 
     const VoxelRagdollDefinition badDefinition = {
         .stableIdBase = 1u,
