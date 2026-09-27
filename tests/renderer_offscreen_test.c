@@ -348,11 +348,13 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(genericMesh != NULL, "the generic mesh could not be created");
     Expect(RendererBeginFrame(renderer, &setup), "generic mesh frame could not begin");
     RendererBeginScenePass(renderer, 0u);
-    RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    for (uint32_t draw = 0u; draw < 300u; ++draw)
+        RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
     Expect(RendererEndFrame(renderer), "generic mesh frame could not end");
     RendererStats genericStats;
     RendererGetStats(renderer, &genericStats);
-    Expect(genericStats.drawCalls == 1u, "the generic mesh must issue one draw call");
+    Expect(genericStats.drawCalls == 300u,
+           "repeated generic draws must reuse descriptors past the cache capacity");
     Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
            "generic mesh frame could not be captured");
     uint32_t genericCovered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
@@ -379,9 +381,17 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
            "the generic resource texture and sampler must be uploadable");
     Expect(RendererBeginFrame(renderer, &setup), "bound generic frame could not begin");
     RendererBeginScenePass(renderer, 0u);
-    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 1.0f, 0u, 3u,
+    const float defaultOrigin[3] = { -0.6f, 0.0f, 0.0f };
+    RendererDrawGenericMeshRange(renderer, genericMesh, defaultOrigin, 0.25f, 0u, 3u);
+    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 0.5f, 0u, 3u,
+                                      genericTexture, genericSampler);
+    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 0.5f, 0u, 3u,
                                       genericTexture, genericSampler);
     Expect(RendererEndFrame(renderer), "bound generic frame could not end");
+    RendererStats boundGenericStats;
+    RendererGetStats(renderer, &boundGenericStats);
+    Expect(boundGenericStats.drawCalls == 3u,
+           "different and repeated generic descriptor keys must all draw");
     Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
            "bound generic frame could not be captured");
     const uint8_t *boundCentre =
@@ -389,8 +399,25 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(boundCentre[1] > boundCentre[0] + 32u &&
                boundCentre[1] > boundCentre[2] + 32u,
            "the bound generic texture must reach the pixel shader");
+    const uint8_t *defaultPixel = pixels +
+        ((TEST_HEIGHT / 2u) * TEST_WIDTH + 13u) * 4u;
+    Expect(defaultPixel[0] > 200u && defaultPixel[1] > 200u && defaultPixel[2] > 200u,
+           "generic draws with different textures must use distinct descriptor sets");
     RendererDestroySampler(renderer, genericSampler);
     RendererDestroyTexture(renderer, genericTexture);
+
+    Expect(RendererBeginFrame(renderer, &setup),
+           "a frame after generic texture destruction could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    Expect(RendererEndFrame(renderer),
+           "a frame after generic texture destruction could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the generic fallback frame could not be captured after resource destruction");
+    uint32_t fallbackCovered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(fallbackCovered > 0u,
+           "generic fallback descriptors must be recreated after resource destruction");
+
     RendererDestroyMesh(renderer, genericMesh);
 
     // === Инстансный путь ===

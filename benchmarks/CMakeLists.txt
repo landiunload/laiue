@@ -454,6 +454,16 @@ if(TARGET laiue_render)
         "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(
         laiue_r2_21_vulkan_submit_benchmark R2VulkanSubmitBenchmarkEntryPoint)
+
+    # ROUND 3 (54-generic-descriptors): сравнение цены создания descriptor set
+    # при повторе одного, 16 и 256 наборов ресурсов на кадр.
+    add_executable(laiue_r3_54_generic_descriptor_benchmark EXCLUDE_FROM_ALL
+        r3_54_generic_descriptor_benchmark.c)
+    target_link_libraries(laiue_r3_54_generic_descriptor_benchmark PRIVATE laiue_render)
+    target_include_directories(laiue_r3_54_generic_descriptor_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    laiue_configure_standalone_executable(
+        laiue_r3_54_generic_descriptor_benchmark R3GenericDescriptorBenchmarkEntryPoint)
 endif()
 
 # ROUND2 A/B-стенд 22-texture-build: тот же сборщик, но каждый сценарий
