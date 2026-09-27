@@ -351,6 +351,8 @@ bool VoxelRagdollDrive(VoxelRagdoll *ragdoll, double directionX, double directio
         Clamp(directionY * targetSpeed - velocity[1], -maximumDelta, maximumDelta),
         0.0,
     };
+    if (delta[0] == 0.0 && delta[1] == 0.0)
+        return true;
     if (!VoxelRigidBodyAddLinearVelocity(root, delta))
         return false;
     for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
