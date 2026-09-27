@@ -27,7 +27,7 @@ if(TARGET laiue_mesher AND TARGET laiue_numeric)
 endif()
 
 add_executable(laiue_physics_benchmark EXCLUDE_FROM_ALL physics_benchmark.c)
-target_link_libraries(laiue_physics_benchmark PRIVATE laiue_physics)
+target_link_libraries(laiue_physics_benchmark PRIVATE laiue_physics laiue_numeric)
 target_include_directories(laiue_physics_benchmark PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")
 laiue_configure_standalone_executable(
@@ -181,6 +181,8 @@ if(TARGET laiue_audio)
     add_executable(laiue_audio_pack_benchmark EXCLUDE_FROM_ALL audio_pack_benchmark.c)
     target_link_libraries(laiue_audio_pack_benchmark PRIVATE
         laiue_audio
+        laiue_audio_pack
+        laiue_mod
         laiue_content)
     target_include_directories(laiue_audio_pack_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/tests")
@@ -242,6 +244,7 @@ endif()
 if(TARGET laiue_render AND TARGET laiue_media_support)
     add_executable(laiue_texture_build_benchmark EXCLUDE_FROM_ALL
         texture_build_benchmark.c
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.c"
         "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_build.c")
     target_include_directories(laiue_texture_build_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/src"
@@ -249,6 +252,7 @@ if(TARGET laiue_render AND TARGET laiue_media_support)
     target_link_libraries(laiue_texture_build_benchmark PRIVATE
         laiue_content
         laiue::media_support)
+    target_compile_definitions(laiue_texture_build_benchmark PRIVATE LAIUE_STATIC=1)
     laiue_configure_standalone_executable(
         laiue_texture_build_benchmark TextureBuildBenchmarkEntryPoint)
 endif()
@@ -387,7 +391,9 @@ if(TARGET laiue_audio AND TARGET laiue_media_support)
         r2_15_audio_pack_benchmark.c)
     target_link_libraries(r2_15_audio_pack_benchmark PRIVATE
         laiue_audio
+        laiue_audio_pack
         laiue_content
+        laiue_mod
         laiue::media_support)
     target_include_directories(r2_15_audio_pack_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/src"
@@ -457,6 +463,7 @@ endif()
 if(TARGET laiue_render AND TARGET laiue_media_support)
     add_executable(laiue_r2_22_texture_build_repeat EXCLUDE_FROM_ALL
         r2_22_texture_build_repeat.c
+        "${PROJECT_SOURCE_DIR}/src/graphics/render/content_provider.c"
         "${PROJECT_SOURCE_DIR}/src/graphics/render/texture_build.c")
     target_include_directories(laiue_r2_22_texture_build_repeat PRIVATE
         "${PROJECT_SOURCE_DIR}/src"
@@ -464,6 +471,7 @@ if(TARGET laiue_render AND TARGET laiue_media_support)
     target_link_libraries(laiue_r2_22_texture_build_repeat PRIVATE
         laiue_content
         laiue::media_support)
+    target_compile_definitions(laiue_r2_22_texture_build_repeat PRIVATE LAIUE_STATIC=1)
     laiue_configure_standalone_executable(
         laiue_r2_22_texture_build_repeat R2TextureBuildRepeatEntryPoint)
 endif()

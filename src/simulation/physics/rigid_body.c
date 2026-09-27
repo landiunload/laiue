@@ -34,6 +34,14 @@
 #elif defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||           \
     defined(__i386__)
 #include <emmintrin.h>
+// Парный выбор полосы — чистая перестановка битов, поэтому там, где доступна
+// BLENDVPD (SSE4.1/AVX), она заменяет связку and/andn/or без изменения
+// результата: маски сравнения заполнены целиком (-1 или 0), а BLENDVPD
+// выбирает по знаковому биту. На SSE2-only цели остаётся прежний путь.
+#if defined(__AVX2__) || defined(__AVX__) || defined(__SSE4_1__)
+#include <smmintrin.h>
+#define LAIUE_RIGID_PAIRED_BLEND 1
+#endif
 #define LAIUE_RIGID_PAIRED_SSE2 1
 #endif
 
@@ -5119,7 +5127,13 @@ static inline LaiuePairMask LaiuePairMaskAnd(LaiuePairMask left, LaiuePairMask r
 static inline LaiuePairVector LaiuePairSelect(LaiuePairMask mask, LaiuePairVector yes,
                                               LaiuePairVector no)
 {
+#if defined(LAIUE_RIGID_PAIRED_BLEND)
+    // Одна команда вместо трёх логических: маски сравнения заполнены целиком,
+    // поэтому выбор по знаковому биту даёт те же биты, что and/andn/or.
+    return _mm_blendv_pd(no, yes, mask);
+#else
     return _mm_or_pd(_mm_and_pd(mask, yes), _mm_andnot_pd(mask, no));
+#endif
 }
 
 static inline LaiuePairMask LaiuePairMaskFromBools(bool low, bool high)

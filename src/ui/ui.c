@@ -1,4 +1,5 @@
 #include "ui/ui.h"
+#include "ui/ui_font_internal.h"
 #include "math/scalar.h"
 
 #define UI_HOVER_SPEED 12.0f
@@ -204,11 +205,15 @@ void UiPanel(UiContext* ui, float x, float y, float width, float height)
 void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
     const wchar_t* text)
 {
+    const UiFont *font = &ui->font;
     float penX = x;
-    float baseline = lineTopY + ui->font.ascent;
+    float baseline = lineTopY + font->ascent;
+    // Раскладка постоянна для шрифта: проверяется один раз на строку, а не
+    // на каждый символ в UiFontFindGlyph.
+    bool hasBakedShape = UiFontHasBakedGlyphShape(font);
     for (const wchar_t* character = text; *character != L'\0'; ++character)
     {
-        const UiGlyph* glyph = UiFontFindGlyph(&ui->font, (uint16_t)*character);
+        const UiGlyph *glyph = UiFontLookupGlyph(font, (uint16_t)*character, hasBakedShape);
         if (glyph == NULL)
         {
             continue;

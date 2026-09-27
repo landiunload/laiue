@@ -19,8 +19,12 @@
 #include "audio/audio.h"
 #include "audio/audio_offscreen.h"
 #include "audio/audio_pack.h"
+#include "audio/audio_pack_service.h"
+#include "audio/audio_service.h"
 #include "content/content_catalog.h"
+#include "content/content_service.h"
 #include "media/la_encode.h"
+#include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
 
@@ -495,6 +499,30 @@ static void Verify(const char *name, const Context *context)
     WriteText("\n");
 }
 
+// The pack loader reaches its dependencies through the runtime table that the
+// pack module installs on start. A standalone benchmark never links that
+// startup, so it drives the same static module graph the engine uses. The
+// module host owns the loaded instances and keeps them alive for the whole run.
+static LaiueModuleHost *g_moduleHost;
+
+static void LoadAudioPackModules(void)
+{
+    LaiueModuleHostConfigV1 config;
+    LaiueModuleHostConfigInitialize(&config);
+    LaiueModuleDiagnostic diagnostic;
+    g_moduleHost = LaiueModuleHostCreate(&config, &diagnostic);
+    if (g_moduleHost == NULL)
+        Fail("module host could not be created");
+
+    const LaiueModuleApiV1 *modules[3] = {
+        LaiueAudioPackGetStaticModuleApiV1(),
+        LaiueAudioGetStaticModuleApiV1(),
+        LaiueContentGetStaticModuleApiV1(),
+    };
+    if (LaiueModuleHostLoadStatic(g_moduleHost, modules, 3u, &diagnostic) != LAIUE_MODULE_OK)
+        Fail(diagnostic.message);
+}
+
 LAIUE_TEST_ENTRY(R2AudioPackBenchmarkEntryPoint)
 {
     WriteText(g_verify ? "r2 audio pack benchmark (verify)\n" : "r2 audio pack benchmark\n");
@@ -517,6 +545,8 @@ LAIUE_TEST_ENTRY(R2AudioPackBenchmarkEntryPoint)
     const bool wantFile = WantWorkload("pcm_la_file");
     if (!wantView && !wantCopy && !wantAdpcmMono && !wantAdpcmStereo && !wantFile)
         Fail("unknown workload");
+
+    LoadAudioPackModules();
 
     AudioDeviceConfiguration configuration = {
         .backend = AUDIO_BACKEND_OFFSCREEN,

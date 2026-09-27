@@ -19,6 +19,7 @@
 #include "content/content_catalog.h"
 #include "media/lt_encode.h"
 #include "platform/system.h"
+#include "render/content_provider.h"
 #include "render/texture_pack_internal.h"
 #include "test_runtime.h"
 
@@ -419,6 +420,9 @@ static BENCH_NOINLINE void RunScenario(LaiueContentCatalog *catalog, const char 
 
 LAIUE_TEST_ENTRY(R2TextureBuildRepeatEntryPoint)
 {
+    // Без установленного сервиса `TexturePackBuildFrom` не видит каталог
+    // контента и стенд меряет fallback вместо сборки.
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
     BenchPaths *paths = PlatformAllocate(sizeof(*paths), true);
     if (paths == NULL)
     {

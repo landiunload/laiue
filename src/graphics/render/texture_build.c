@@ -74,6 +74,35 @@ typedef struct ResourceMeta
     bool hasNormals;
 } ResourceMeta;
 
+// Откуда взят ресурс. Первый проход уже нашёл источник, поэтому второй
+// не перебирает форматы заново, а идёт сразу к тому же файлу: перебор
+// пяти расширений с проверкой источника и кэша на каждом — самая дорогая
+// часть разбора для маленьких текстур.
+typedef enum ResourceOrigin
+{
+    RESOURCE_ORIGIN_NONE = 0,
+    // Свой `.lt` по разрешению `extensionIndex`.
+    RESOURCE_ORIGIN_LT,
+    // Свежий кэш `.lt` рядом с исходником.
+    RESOURCE_ORIGIN_CACHE,
+    // Исходник PNG/GIF/JPEG, который надо раскодировать.
+    RESOURCE_ORIGIN_SOURCE,
+} ResourceOrigin;
+
+typedef struct ResourceResolution
+{
+    uint8_t origin;
+    // Индекс в `scratch->order`; действителен, когда origin не NONE.
+    uint8_t extensionIndex;
+} ResourceResolution;
+
+// Разрешение обоих ресурсов материала за один вызов первого прохода.
+typedef struct MaterialResolution
+{
+    ResourceResolution albedo;
+    ResourceResolution normal;
+} MaterialResolution;
+
 static uint16_t ReadU16Le(const uint8_t *bytes)
 {
     return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
@@ -597,9 +626,11 @@ static bool ReadSingleTextureHeader(const wchar_t *path, LoadScratch *scratch,
 // Итог обязан совпасть с тем, что даст полный разбор на том же
 // состоянии папки.
 static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
-                             const wchar_t *resourcePath, ResourceMeta *outMeta)
+                             const wchar_t *resourcePath, ResourceMeta *outMeta,
+                             ResourceResolution *outResolution)
 {
     memset(outMeta, 0, sizeof(*outMeta));
+    memset(outResolution, 0, sizeof(*outResolution));
 
     uint8_t *bytes = NULL;
     uint64_t size = 0u;
@@ -623,6 +654,8 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
             if (hasSource && ReadSingleTextureHeader(scratch->path, scratch, &header))
             {
                 MetadataFromSingleTexture(&header, outMeta);
+                outResolution->origin = RESOURCE_ORIGIN_LT;
+                outResolution->extensionIndex = (uint8_t)index;
                 return;
             }
             continue;
@@ -650,6 +683,8 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
             if (fresh)
             {
                 MetadataFromSingleTexture(&header, outMeta);
+                outResolution->origin = RESOURCE_ORIGIN_CACHE;
+                outResolution->extensionIndex = (uint8_t)index;
                 return;
             }
             memset(outMeta, 0, sizeof(*outMeta));
@@ -660,7 +695,12 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
         {
             bool parsed = InspectImageMeta(bytes, (uint32_t)size, outMeta);
             PlatformFree(bytes);
-            if (parsed) return;
+            if (parsed)
+            {
+                outResolution->origin = RESOURCE_ORIGIN_SOURCE;
+                outResolution->extensionIndex = (uint8_t)index;
+                return;
+            }
             memset(outMeta, 0, sizeof(*outMeta));
         }
     }
@@ -669,20 +709,23 @@ static void LoadResourceMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
 // Первый проход по материалу: находятся ли albedo и карта нормалей и
 // какова их геометрия. Пиксели не читаются.
 static void LoadMaterialMeta(LaiueContentCatalog *catalog, LoadScratch *scratch,
-                             const wchar_t *name, ResourceMeta *outMeta)
+                             const wchar_t *name, ResourceMeta *outMeta,
+                             ResourceResolution *outAlbedo, ResourceResolution *outNormal)
 {
     memset(outMeta, 0, sizeof(*outMeta));
+    memset(outAlbedo, 0, sizeof(*outAlbedo));
+    memset(outNormal, 0, sizeof(*outNormal));
     if (name == NULL || !LaiueContentPathIsSafe(name)) return;
 
     ResourceMeta albedo;
-    LoadResourceMeta(catalog, scratch, name, &albedo);
+    LoadResourceMeta(catalog, scratch, name, &albedo, outAlbedo);
     if (!albedo.found) return;
     *outMeta = albedo;
     if (albedo.hasNormals) return;   // `.lt` уже принёс карту нормалей
 
     if (!BuildNormalResource(name, scratch->resource, LAIUE_CONTENT_PATH_CAPACITY)) return;
     ResourceMeta normal;
-    LoadResourceMeta(catalog, scratch, scratch->resource, &normal);
+    LoadResourceMeta(catalog, scratch, scratch->resource, &normal, outNormal);
     if (!normal.found) return;
 
     // Карта нормалей обязана совпадать по геометрии: либо один кадр на
@@ -738,6 +781,141 @@ static void LoadMaterial(LaiueContentCatalog *catalog, LoadScratch *scratch, con
     ReleaseSource(&normalSource);
 }
 
+// Читает ресурс, уже найденный первым проходом: путь строится только для
+// выбранного расширения, а не для всех пяти. `outSource` обнуляется.
+static bool LoadResolvedResource(LaiueContentCatalog *catalog, LoadScratch *scratch,
+                                 const wchar_t *resourcePath, bool wantNormals,
+                                 const ResourceResolution *resolution, MaterialSource *outSource)
+{
+    memset(outSource, 0, sizeof(*outSource));
+    if (resolution->origin == RESOURCE_ORIGIN_NONE)
+        return false;
+
+    const wchar_t *extension = scratch->order[resolution->extensionIndex];
+    if (!BuildPath(catalog, scratch, resourcePath, extension, scratch->path))
+        return false;
+
+    if (resolution->origin == RESOURCE_ORIGIN_CACHE)
+    {
+        wchar_t cacheExtension[16];
+        BuildCacheExtension(extension, cacheExtension, 16u);
+        if (!BuildPath(catalog, scratch, resourcePath, cacheExtension, scratch->cachePath))
+            return false;
+        uint8_t *bytes = NULL;
+        uint64_t size = 0u;
+        if (!PlatformReadEntireFile(scratch->cachePath, TEXTURE_MAX_FILE_BYTES, &bytes, &size))
+            return false;
+        if (!ParseSingleTexture(bytes, (uint32_t)size, outSource, wantNormals))
+        {
+            ReleaseSource(outSource);
+            memset(outSource, 0, sizeof(*outSource));
+            return false;
+        }
+        return true;
+    }
+
+    uint8_t *bytes = NULL;
+    uint64_t size = 0u;
+    if (!PlatformReadEntireFile(scratch->path, TEXTURE_MAX_FILE_BYTES, &bytes, &size))
+        return false;
+
+    if (resolution->origin == RESOURCE_ORIGIN_LT)
+    {
+        if (!ParseSingleTexture(bytes, (uint32_t)size, outSource, wantNormals))
+        {
+            ReleaseSource(outSource);
+            memset(outSource, 0, sizeof(*outSource));
+            return false;
+        }
+        return true;
+    }
+
+    // Исходник: раскодировать и, как раньше, положить рядом кэш `.lt`.
+    bool parsed = DecodeImageFile(bytes, (uint32_t)size, outSource);
+    PlatformFree(bytes);
+    if (!parsed)
+    {
+        ReleaseSource(outSource);
+        memset(outSource, 0, sizeof(*outSource));
+        return false;
+    }
+    PlatformPathInformation source;
+    if (UsableFile(scratch->path, &source))
+    {
+        wchar_t cacheExtension[16];
+        BuildCacheExtension(extension, cacheExtension, 16u);
+        if (BuildPath(catalog, scratch, resourcePath, cacheExtension, scratch->cachePath))
+        {
+            WriteTextureCache(scratch->cachePath, outSource, source.modifiedTime,
+                              (uint32_t)source.size);
+        }
+    }
+    return true;
+}
+
+// Второй проход по заранее найденному источнику. Если файл исчез между
+// проходами (чего штатный сценарий не делает), поведение откатывается к
+// полному перебору форматов.
+static void LoadMaterialResolved(LaiueContentCatalog *catalog, LoadScratch *scratch,
+                                 const wchar_t *name, const MaterialResolution *resolution,
+                                 MaterialSource *outSource)
+{
+    memset(outSource, 0, sizeof(*outSource));
+    if (name == NULL || !LaiueContentPathIsSafe(name))
+        return;
+
+    if (!LoadResolvedResource(catalog, scratch, name, true, &resolution->albedo, outSource))
+    {
+        if (resolution->albedo.origin != RESOURCE_ORIGIN_NONE)
+            LoadMaterial(catalog, scratch, name, outSource);
+        return;
+    }
+    if (outSource->normal != NULL)
+    {
+        // `.lt` уже принёс карту нормалей: её кадров столько же, сколько
+        // у albedo.
+        outSource->normalFrameCount = outSource->frameCount;
+        return;
+    }
+    if (resolution->normal.origin == RESOURCE_ORIGIN_NONE)
+        return;
+
+    if (!BuildNormalResource(name, scratch->resource, LAIUE_CONTENT_PATH_CAPACITY))
+        return;
+    MaterialSource normalSource;
+    if (!LoadResolvedResource(catalog, scratch, scratch->resource, false, &resolution->normal,
+                              &normalSource))
+    {
+        // Файл исчез или испортился между проходами: полный перебор
+        // сохраняет прежнее поведение.
+        LoadResource(catalog, scratch, scratch->resource, false, &normalSource);
+    }
+    if (!normalSource.found)
+        return;
+
+    // Карта нормалей обязана совпадать по геометрии: либо один кадр на
+    // всю анимацию, либо столько же, сколько у albedo.
+    bool usable =
+        normalSource.width == outSource->width && normalSource.height == outSource->height &&
+        (normalSource.frameCount == 1u || normalSource.frameCount == outSource->frameCount);
+    if (!usable)
+    {
+        ReleaseSource(&normalSource);
+        return;
+    }
+
+    // Один кадр повторяется на все кадры albedo без копии: читатель
+    // берёт нулевой кадр по индексу. Раньше под это выделялся буфер во
+    // всю анимацию и заполнялся копиями одного и того же кадра.
+    outSource->normal = normalSource.albedo;
+    outSource->normalOwner =
+        normalSource.albedoOwner != NULL ? normalSource.albedoOwner : (void *)normalSource.albedo;
+    outSource->normalFrameCount = normalSource.frameCount;
+    normalSource.albedo = NULL;
+    normalSource.albedoOwner = NULL;
+    ReleaseSource(&normalSource);
+}
+
 // Заполняет цепочку mip одного слоя: уровень 0 приводится к общему
 // размеру, остальные считаются из предыдущего.
 static void WriteSliceChain(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceHeight,
@@ -780,10 +958,12 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
 
     LoadScratch *scratch = PlatformAllocate(sizeof(*scratch), true);
     ResourceMeta *metas = PlatformAllocate(sizeof(*metas) * materialCount, true);
-    if (scratch == NULL || metas == NULL)
+    MaterialResolution *resolutions = PlatformAllocate(sizeof(*resolutions) * materialCount, true);
+    if (scratch == NULL || metas == NULL || resolutions == NULL)
     {
         PlatformFree(scratch);
         PlatformFree(metas);
+        PlatformFree(resolutions);
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
@@ -792,6 +972,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     {
         PlatformFree(scratch);
         PlatformFree(metas);
+        PlatformFree(resolutions);
         return TEXTURE_PACK_LOAD_NO_ACTIVE_PACK;
     }
 
@@ -812,7 +993,8 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     bool anyNormal = false;
     for (uint32_t material = 0; material < materialCount; ++material)
     {
-        LoadMaterialMeta(catalog, scratch, materialNames[material], &metas[material]);
+        LoadMaterialMeta(catalog, scratch, materialNames[material], &metas[material],
+                         &resolutions[material].albedo, &resolutions[material].normal);
         const ResourceMeta *meta = &metas[material];
         if (!meta->found)
         {
@@ -827,6 +1009,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
         {
             PlatformFree(scratch);
             PlatformFree(metas);
+            PlatformFree(resolutions);
             return TEXTURE_PACK_LOAD_INVALID;
         }
         sliceCount += meta->frameCount;
@@ -848,6 +1031,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     {
         PlatformFree(scratch);
         PlatformFree(metas);
+        PlatformFree(resolutions);
         return TEXTURE_PACK_LOAD_IO_ERROR;
     }
 
@@ -863,7 +1047,8 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     for (uint32_t material = 0; material < materialCount; ++material)
     {
         MaterialSource *source = &scratch->source;
-        LoadMaterial(catalog, scratch, materialNames[material], source);
+        LoadMaterialResolved(catalog, scratch, materialNames[material], &resolutions[material],
+                             source);
         const ResourceMeta *meta = &metas[material];
         uint32_t frames = meta->found ? meta->frameCount : 1u;
 
@@ -944,6 +1129,7 @@ TexturePackLoadStatus TexturePackBuildFrom(LaiueContentCatalog *catalog,
     }
     PlatformFree(scratch);
     PlatformFree(metas);
+    PlatformFree(resolutions);
 
     outPack->width = (uint16_t)size;
     outPack->height = (uint16_t)size;

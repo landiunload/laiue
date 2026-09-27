@@ -1194,6 +1194,24 @@ static void PruneEntriesOutsideRadius(ChunkStreaming* streaming, int64_t radius)
     }
 }
 
+// Дальний перенос центра: две зоны видимости (радиус + 1 вокруг старого и
+// нового центра) не пересекаются ни по одной оси, значит ни одна запись не
+// остаётся. Тогда незачем искать и удалять каждую запись со сдвигом кластера:
+// достаточно один раз пройти таблицу, уничтожить меши и обнулить её.
+static void ClearAllEntries(ChunkStreaming *streaming)
+{
+    for (uint32_t index = 0; index < streaming->capacity; ++index)
+    {
+        ChunkEntry *entry = &streaming->entries[index];
+        if (entry->mesh != NULL)
+        {
+            VoxelRenderDestroyMesh(&streaming->services, streaming->renderer, entry->mesh);
+        }
+    }
+    memset(streaming->entries, 0, (size_t)streaming->capacity * sizeof(ChunkEntry));
+    ResetDrawList(streaming);
+}
+
 // При переходе ровно на соседний чанк за пределами нового радиуса+1
 // оказываются только уходящие грани старого куба: по одной на каждую ось,
 // изменившую знак. Перебирать всю таблицу, как при первом вызове или
@@ -1519,17 +1537,36 @@ void ChunkStreamingSetCenter(ChunkStreaming* streaming, int64_t chunkX, int64_t 
     PlatformAtomicIncrementU32(&streaming->centerEpoch);
     streaming->drawOrderDirty = true;
 
-    PruneEntriesOutsideRadius(streaming,
-        (int64_t)streaming->viewRadius + 1);
+    // Зона видимости радиуса + 1 вокруг старого и нового центра не
+    // пересекается, если хотя бы по одной оси центры разошлись больше чем на
+    // два таких радиуса. Тогда после переноса не остаётся ни одной записи, и
+    // таблицу можно очистить целиком, без удаления каждой записи сдвигом.
+    const int64_t viewSpan = (int64_t)streaming->viewRadius + 1;
+    const int64_t farMargin = viewSpan * 2;
+    const bool farJump =
+        hadCenter && (deltaX > farMargin || deltaX < -farMargin || deltaY > farMargin ||
+                      deltaY < -farMargin || deltaZ > farMargin || deltaZ < -farMargin);
+
+    if (farJump)
+    {
+        ClearAllEntries(streaming);
+    }
+    else
+    {
+        PruneEntriesOutsideRadius(streaming, viewSpan);
+    }
 
     streaming->hasUnqueuedPending = false;
-    for (uint32_t i = 0; i < streaming->capacity; ++i)
+    if (!farJump)
     {
-        const ChunkEntry* entry = &streaming->entries[i];
-        if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
+        for (uint32_t i = 0; i < streaming->capacity; ++i)
         {
-            streaming->hasUnqueuedPending = true;
-            break;
+            const ChunkEntry *entry = &streaming->entries[i];
+            if (entry->state == CHUNK_ENTRY_PENDING && !entry->requestQueued)
+            {
+                streaming->hasUnqueuedPending = true;
+                break;
+            }
         }
     }
 

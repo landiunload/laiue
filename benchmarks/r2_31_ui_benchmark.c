@@ -137,8 +137,14 @@ static void WriteHex64(uint64_t value)
     WriteText(text);
 }
 
+// checksum == NULL отключает хеширование: так контрольная сумма считается
+// отдельным проходом (см. RunStage) и не попадает в измеряемый интервал.
 static void HashBytes(uint64_t* checksum, const void* data, size_t count)
 {
+    if (checksum == NULL)
+    {
+        return;
+    }
     const uint8_t* bytes = (const uint8_t*)data;
     uint64_t value = *checksum;
     for (size_t index = 0u; index < count; ++index)
@@ -151,6 +157,10 @@ static void HashBytes(uint64_t* checksum, const void* data, size_t count)
 
 static void HashWide(uint64_t* checksum, const wchar_t* text)
 {
+    if (checksum == NULL)
+    {
+        return;
+    }
     for (const wchar_t* character = text; *character != L'\0'; ++character)
     {
         HashBytes(checksum, character, sizeof(wchar_t));
@@ -159,7 +169,7 @@ static void HashWide(uint64_t* checksum, const wchar_t* text)
 
 static void HashQuads(UiContext* ui, uint64_t* checksum)
 {
-    HashBytes(checksum, ui->quads, (size_t)ui->quadCount * sizeof(RendererUiQuad));
+    HashBytes(checksum, ui->quads, (size_t)ui->quadCount * sizeof(LaiueGraphicsUiQuadV1));
 }
 
 static uint64_t NowNanoseconds(void)
@@ -313,12 +323,21 @@ static void RunStage(const char* name, StageFn stage, UiContext* ui,
 {
     for (uint32_t sample = 0u; sample < STAGE_SAMPLES; ++sample)
     {
+        // Контрольная сумма FNV-1a по байтам всех кадров стадии считается
+        // отдельным проходом вне таймера: на плотных сценах (menu, text_draw,
+        // text_unsupported) это хеширование дороже самого горячего пути UI и
+        // ранее доминировало в измерении, маскируя изменения движка.
         uint64_t checksum = FNV_OFFSET;
+        for (uint32_t frame = 0u; frame < frames; ++frame)
+        {
+            (void)stage(ui, &checksum);
+        }
+
         uint64_t start = NowNanoseconds();
         uint32_t quads = 0u;
         for (uint32_t frame = 0u; frame < frames; ++frame)
         {
-            quads = stage(ui, &checksum);
+            quads = stage(ui, NULL);
         }
         uint64_t elapsed = NowNanoseconds() - start;
         ReportSample(name, sample, elapsed, frames, quads, checksum);
