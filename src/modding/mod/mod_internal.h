@@ -11,7 +11,7 @@ LaiueModStatus LaiueModDiagnosticSet(LaiueModDiagnostic *diagnostic, LaiueModSta
                                      int32_t modResult, const char *message);
 
 bool LaiueModAsciiEquals(const char *first, const char *second);
-bool LaiueModServiceNameIsSafe(const char *name);
+bool LaiueModServiceNameHashIfSafe(const char *name, uint32_t *outHash);
 bool LaiueModWideCopy(wchar_t *destination, uint32_t capacity, const wchar_t *source);
 bool LaiueModPathJoin(wchar_t *destination, uint32_t capacity, const wchar_t *first,
                       const wchar_t *second, const wchar_t *third);

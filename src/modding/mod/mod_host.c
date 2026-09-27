@@ -17,6 +17,7 @@ typedef struct RegisteredService
     uint32_t version;
     const void *implementation;
     uint32_t implementationSize;
+    uint32_t nameHash;
 } RegisteredService;
 
 typedef struct LoadedMod
@@ -140,6 +141,7 @@ static const void *LAIUE_MOD_CALL ApiQueryService(void *hostContext, const char 
                                                   uint32_t minimumVersion, uint32_t minimumSize,
                                                   uint32_t *outVersion, uint32_t *outSize)
 {
+    uint32_t serviceNameHash = 0u;
     if (outVersion != NULL)
     {
         *outVersion = 0u;
@@ -149,7 +151,8 @@ static const void *LAIUE_MOD_CALL ApiQueryService(void *hostContext, const char 
         *outSize = 0u;
     }
     LoadedMod *mod = hostContext;
-    if (mod == NULL || mod->owner == NULL || !LaiueModServiceNameIsSafe(serviceName))
+    if (mod == NULL || mod->owner == NULL ||
+        !LaiueModServiceNameHashIfSafe(serviceName, &serviceNameHash))
     {
         return NULL;
     }
@@ -161,7 +164,7 @@ static const void *LAIUE_MOD_CALL ApiQueryService(void *hostContext, const char 
     {
         const RegisteredService *service = &host->services[index];
         if (service->used && service->version >= minimumVersion &&
-            service->implementationSize >= minimumSize &&
+            service->implementationSize >= minimumSize && service->nameHash == serviceNameHash &&
             LaiueModAsciiEquals(service->name, serviceName))
         {
             result = service->implementation;
@@ -303,13 +306,14 @@ LaiueModStatus LaiueModHostRegisterService(LaiueModHost *host, const LaiueModSer
                                            LaiueModDiagnostic *diagnostic)
 {
     LaiueModDiagnosticClear(diagnostic);
+    uint32_t serviceNameHash = 0u;
     if (host == NULL || service == NULL || service->version == 0u ||
         service->implementation == NULL || service->implementationSize == 0u)
     {
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_INVALID_ARGUMENT, 0,
                                      "service, version, implementation and size are required");
     }
-    if (!LaiueModServiceNameIsSafe(service->name))
+    if (!LaiueModServiceNameHashIfSafe(service->name, &serviceNameHash))
     {
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_SERVICE_NAME_INVALID, 0,
                                      "service name must be a safe case-sensitive ASCII identifier");
@@ -328,7 +332,8 @@ LaiueModStatus LaiueModHostRegisterService(LaiueModHost *host, const LaiueModSer
         for (uint32_t index = 0; index < LAIUE_MOD_HOST_MAX_SERVICES; ++index)
         {
             RegisteredService *current = &host->services[index];
-            if (current->used && LaiueModAsciiEquals(current->name, service->name))
+            if (current->used && current->nameHash == serviceNameHash &&
+                LaiueModAsciiEquals(current->name, service->name))
             {
                 status =
                     LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_SERVICE_ALREADY_REGISTERED,
@@ -352,6 +357,7 @@ LaiueModStatus LaiueModHostRegisterService(LaiueModHost *host, const LaiueModSer
             freeService->version = service->version;
             freeService->implementation = service->implementation;
             freeService->implementationSize = service->implementationSize;
+            freeService->nameHash = serviceNameHash;
             freeService->used = true;
         }
     }
@@ -363,7 +369,8 @@ LaiueModStatus LaiueModHostUnregisterService(LaiueModHost *host, const char *ser
                                              LaiueModDiagnostic *diagnostic)
 {
     LaiueModDiagnosticClear(diagnostic);
-    if (host == NULL || !LaiueModServiceNameIsSafe(serviceName))
+    uint32_t serviceNameHash = 0u;
+    if (host == NULL || !LaiueModServiceNameHashIfSafe(serviceName, &serviceNameHash))
     {
         return LaiueModDiagnosticSet(diagnostic, LAIUE_MOD_STATUS_SERVICE_NAME_INVALID, 0,
                                      "valid host and service name are required");
@@ -381,7 +388,8 @@ LaiueModStatus LaiueModHostUnregisterService(LaiueModHost *host, const char *ser
         for (uint32_t index = 0; index < LAIUE_MOD_HOST_MAX_SERVICES; ++index)
         {
             RegisteredService *service = &host->services[index];
-            if (service->used && LaiueModAsciiEquals(service->name, serviceName))
+            if (service->used && service->nameHash == serviceNameHash &&
+                LaiueModAsciiEquals(service->name, serviceName))
             {
                 memset(service, 0, sizeof(*service));
                 status = LAIUE_MOD_STATUS_OK;

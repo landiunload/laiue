@@ -113,14 +113,15 @@ bool LaiueModAsciiEquals(const char *first, const char *second)
     return first[index] == second[index];
 }
 
-bool LaiueModServiceNameIsSafe(const char *name)
+bool LaiueModServiceNameHashIfSafe(const char *name, uint32_t *outHash)
 {
-    if (name == NULL || name[0] == '\0')
+    if (name == NULL || name[0] == '\0' || outHash == NULL)
     {
         return false;
     }
 
     uint32_t length = 0;
+    uint32_t hash = 2166136261u;
     bool previousDot = false;
     while (name[length] != '\0')
     {
@@ -134,6 +135,7 @@ bool LaiueModServiceNameIsSafe(const char *name)
         {
             return false;
         }
+        hash = (hash ^ character) * 16777619u;
         previousDot = character == '.';
         ++length;
     }
@@ -144,7 +146,12 @@ bool LaiueModServiceNameIsSafe(const char *name)
                              (first >= '0' && first <= '9');
     bool lastAlphaNumeric = (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') ||
                             (last >= '0' && last <= '9');
-    return firstAlphaNumeric && lastAlphaNumeric;
+    if (!firstAlphaNumeric || !lastAlphaNumeric)
+    {
+        return false;
+    }
+    *outHash = hash;
+    return true;
 }
 
 bool LaiueModWideCopy(wchar_t *destination, uint32_t capacity, const wchar_t *source)
