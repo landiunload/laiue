@@ -1,6 +1,7 @@
 add_library(laiue_walk_common STATIC
     walk_humanoid.c walk_humanoid.h
-    walk_visuals.c walk_visuals.h)
+    walk_visuals.c walk_visuals.h
+    walk_world.c walk_world.h)
 target_include_directories(laiue_walk_common PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/src/assets"
@@ -28,6 +29,7 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_STATIC_WITH_VOXEL=1)
     endif()
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
+        target_link_libraries(laiue_walk PRIVATE laiue_mesher)
         target_link_libraries(laiue_walk PRIVATE laiue_physics)
         if(NOT LAIUE_WALK_STATIC_WITH_VOXEL)
             target_link_libraries(laiue_walk PRIVATE laiue_numeric)
@@ -55,13 +57,14 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
         target_link_libraries(laiue_walk PRIVATE
             laiue_window laiue_input ${_laiue_walk_graphics_target} laiue_ui
             laiue_scene_math laiue_scene)
-        add_dependencies(laiue_walk ${_laiue_walk_graphics_target})
+        add_dependencies(laiue_walk ${_laiue_walk_graphics_target} laiue_mesher)
         target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_WINDOWED=1)
     endif()
 else()
     target_compile_definitions(laiue_walk PRIVATE LAIUE_WALK_DYNAMIC=1)
     add_dependencies(laiue_walk laiue_character)
     if(LAIUE_BUILD_GRAPHICS AND (WIN32 OR X11_FOUND))
+        add_dependencies(laiue_walk laiue_mesher)
         add_dependencies(laiue_walk laiue_physics)
         set(_laiue_walk_graphics_target laiue_render)
         if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12" AND

@@ -7,15 +7,18 @@
 #include "world/world_service.h"
 #include "walk_runtime.h"
 #if defined(LAIUE_WALK_WINDOWED)
+#include "walk_world.h"
+#endif
+#if defined(LAIUE_WALK_WINDOWED)
+const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 #include "graphics/graphics_device_service.h"
-#include "render/chunk_geometry.h"
-#include "walk_terrain.h"
 #include "render/graphics_service.h"
 #include "scene/scene_service.h"
 #include "input/input_service.h"
 #include "platform/window_service.h"
 #include "ui/ui_service.h"
 #include "physics/physics_service.h"
+#include "mesh/mesher_service.h"
 #include "walk_humanoid.h"
 #include "walk_visuals.h"
 #endif
@@ -35,9 +38,6 @@ enum
 {
     WALK_VOXEL_SIZE = 1000,
     WALK_BLOCKS_PER_CELL = LAIUE_CHARACTER_LOCAL_CELL_SIZE / WALK_VOXEL_SIZE,
-    WALK_ACTIVE_CHUNK_RADIUS = 1,
-    WALK_ACTIVE_CHUNK_DIAMETER = WALK_ACTIVE_CHUNK_RADIUS * 2 + 1,
-    WALK_ACTIVE_CHUNK_COUNT = WALK_ACTIVE_CHUNK_DIAMETER * WALK_ACTIVE_CHUNK_DIAMETER,
     WALK_REBASE_RADIUS_BLOCKS = 8192,
 };
 
@@ -536,6 +536,7 @@ typedef struct WalkWindowState
     const LaiueSceneMathServiceV1 *sceneMath;
     const LaiueUiServiceV1 *uiService;
     const LaiuePhysicsServiceV1 *physicsService;
+    const LaiueMesherServiceV1 *mesherService;
     uint32_t physicsServiceSize;
     const LaiueVoxelProviderV1 *voxelProvider;
     const LaiueCharacterServiceV1 *characterService;
@@ -564,16 +565,20 @@ typedef struct WalkWindowState
     double ragdollGaitPhase;
     int64_t ragdollBlockOriginX;
     int64_t ragdollBlockOriginY;
-    LaiueGraphicsHandle terrainBuffer;
-    bool terrainReady;
+    WalkVisualChunkSet chunkSet;
+    bool chunksReady;
     LaiueGraphicsHandle ragdollBuffer;
     LaiueGraphicsHandle texturedTerrainBuffers[WALK_VISUAL_TEXTURE_COUNT];
     LaiueGraphicsHandle terrainTextures[WALK_VISUAL_TEXTURE_COUNT];
     LaiueGraphicsHandle terrainSampler;
+    LaiueGraphicsHandle farTerrainBuffer;
     bool texturedTerrainReady;
+    bool firstPerson;
+    uint8_t selectedMaterial;
+    int64_t ragdollRenderOriginBlock[3];
+    int64_t renderOriginBlock[3];
     Camera camera;
     LaiueCharacterPositionV1 lastPosition;
-    float terrainOriginRelative[3];
     float cameraRelativeEye[3];
     float viewProjection[16];
     double lastTime;
@@ -582,50 +587,13 @@ typedef struct WalkWindowState
 } WalkWindowState;
 
 static LaiueUiQuadV1 walkUiQuads[LAIUE_GRAPHICS_UI_MAX_QUADS];
+static LaiueGraphicsDrawItemV2 walkDraws[WALK_VISUAL_CHUNK_DRAW_COUNT + 2u];
 
 static bool WalkDeviceFieldPresent(const LaiueGraphicsDeviceV2 *device,
                                    size_t offset, size_t size)
 {
     return device != NULL && (size_t)device->structSize >= offset &&
            (size_t)device->structSize - offset >= size;
-}
-
-static bool WalkCreateTerrain(LaiueGraphicsDeviceV2 *device,
-                              LaiueGraphicsHandle *outBuffer)
-{
-    if (device == NULL || outBuffer == NULL ||
-        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, createBuffer),
-                                sizeof(device->createBuffer)) ||
-        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                                sizeof(device->uploadBuffer)) ||
-        device->createBuffer == NULL || device->uploadBuffer == NULL)
-        return false;
-    ChunkQuad quads[5];
-    const uint32_t quadCount = WalkBuildTerrainQuads(quads);
-    LaiueGraphicsBufferDescV1 description = {
-        .structSize = sizeof(description),
-        .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING,
-        .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
-    };
-    *outBuffer = 0u;
-    if (device->createBuffer(device, &description, outBuffer) == 0u)
-        return false;
-    LaiueGraphicsBufferUploadV1 upload = {
-        .structSize = sizeof(upload),
-        .buffer = *outBuffer,
-        .data = quads,
-        .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
-    };
-    if (device->uploadBuffer(device, &upload) == 0u)
-    {
-        if (WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, destroyHandle),
-                                   sizeof(device->destroyHandle)) &&
-            device->destroyHandle != NULL)
-            device->destroyHandle(device, *outBuffer);
-        *outBuffer = 0u;
-        return false;
-    }
-    return true;
 }
 
 static void WalkUpdateRenderOrigin(WalkWindowState *state)
@@ -636,9 +604,6 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
         if (!VoxelRigidBodyLocalPosition(
                 &state->ragdoll.bodies[state->ragdoll.rootBody], root))
             return;
-        state->terrainOriginRelative[0] = (float)((int64_t)(root[0] / 64.0) * 64);
-        state->terrainOriginRelative[1] = (float)((int64_t)(root[1] / 64.0) * 64);
-        state->terrainOriginRelative[2] = 0.0f;
         state->cameraRelativeEye[0] = (float)root[0];
         state->cameraRelativeEye[1] = (float)root[1];
         state->cameraRelativeEye[2] = (float)root[2] + 1.8f;
@@ -664,8 +629,8 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
      * far from zero; only these bounded differences become floats. */
     const int64_t originX = FloorDiv(blockX, 64) * 64;
     const int64_t originY = FloorDiv(blockY, 64) * 64;
-    const int64_t originZFixed =
-        (position.localZ / (INT64_C(64) * WALK_VOXEL_SIZE)) *
+    const int64_t originZFixed = FloorDiv(
+        position.localZ, INT64_C(64) * WALK_VOXEL_SIZE) *
         (INT64_C(64) * WALK_VOXEL_SIZE);
     const int64_t withinX = blockX - originX;
     const int64_t withinY = blockY - originY;
@@ -673,19 +638,35 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
     int64_t fractionY = position.localY % WALK_VOXEL_SIZE;
     if (fractionX < 0) fractionX += WALK_VOXEL_SIZE;
     if (fractionY < 0) fractionY += WALK_VOXEL_SIZE;
-    /* The demo mesh is the active chunk itself, so its absolute origin is
-     * the same rebase origin.  It therefore reaches the GPU as zero rather
-     * than as a lossy absolute coordinate. */
-    state->terrainOriginRelative[0] = 0.0f;
-    state->terrainOriginRelative[1] = 0.0f;
-    state->terrainOriginRelative[2] =
-        (float)(-(double)originZFixed / (double)WALK_VOXEL_SIZE);
     state->cameraRelativeEye[0] = (float)withinX +
                                   (float)fractionX / (float)WALK_VOXEL_SIZE;
     state->cameraRelativeEye[1] = (float)withinY +
                                   (float)fractionY / (float)WALK_VOXEL_SIZE;
     state->cameraRelativeEye[2] = (float)(position.localZ - originZFixed) /
                                   (float)WALK_VOXEL_SIZE + 1.6f;
+}
+
+static bool WalkGetRagdollRenderOrigin(const WalkWindowState *state,
+                                      double renderOrigin[3],
+                                      int64_t renderOriginBlock[3])
+{
+    if (state == NULL || renderOrigin == NULL || renderOriginBlock == NULL ||
+        !state->ragdollReady)
+        return false;
+    double root[3];
+    if (!VoxelRigidBodyLocalPosition(
+            &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const double origin = floor(root[axis] / 64.0) * 64.0;
+        if (!isfinite(origin) || origin < -9223372036854775808.0 ||
+            origin >= 9223372036854775808.0)
+            return false;
+        renderOrigin[axis] = origin;
+        renderOriginBlock[axis] = (int64_t)origin;
+    }
+    return true;
 }
 
 static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
@@ -708,15 +689,32 @@ static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
     if (state->ragdollReady)
     {
         double root[3];
+        double renderOrigin[3];
+        int64_t renderOriginBlock[3];
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (!VoxelRigidBodyLocalPosition(
-                &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+                &state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
+            !WalkGetRagdollRenderOrigin(state, renderOrigin, renderOriginBlock))
             return false;
+        memcpy(state->ragdollRenderOriginBlock, renderOriginBlock,
+               sizeof(state->ragdollRenderOriginBlock));
         if (state->sceneService->cameraGetForwardVector != NULL)
             state->sceneService->cameraGetForwardVector(&state->camera, forward);
-        state->cameraRelativeEye[0] = (float)(root[0] - (double)forward[0] * 5.0);
-        state->cameraRelativeEye[1] = (float)(root[1] - (double)forward[1] * 5.0);
-        state->cameraRelativeEye[2] = (float)(root[2] + 2.4);
+        if (state->firstPerson)
+        {
+            state->cameraRelativeEye[0] = (float)(root[0] - renderOrigin[0]);
+            state->cameraRelativeEye[1] = (float)(root[1] - renderOrigin[1]);
+            state->cameraRelativeEye[2] = (float)(root[2] - renderOrigin[2] + 1.65);
+        }
+        else
+        {
+            state->cameraRelativeEye[0] =
+                (float)(root[0] - renderOrigin[0] - (double)forward[0] * 5.0);
+            state->cameraRelativeEye[1] =
+                (float)(root[1] - renderOrigin[1] - (double)forward[1] * 5.0);
+            state->cameraRelativeEye[2] =
+                (float)(root[2] - renderOrigin[2] + 2.4);
+        }
     }
     float view[16];
     state->sceneService->cameraGetViewMatrix(&state->camera,
@@ -736,6 +734,119 @@ static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
     memcpy(camera.viewProjection, state->viewProjection,
            sizeof(camera.viewProjection));
     return state->device->setCamera(state->device, &camera) != 0u;
+}
+
+static uint8_t WalkReadVisualBlock(void *opaque, int64_t x, int64_t y, int64_t z)
+{
+    const LaiueVoxelProviderV1 *provider = (const LaiueVoxelProviderV1 *)opaque;
+    if (provider == NULL || provider->getBlock == NULL || z < INT32_MIN || z > INT32_MAX)
+        return 0u;
+    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
+    LaiueVoxelBlockV1 block = {0u, 0u};
+    return provider->getBlock(provider, &coordinate, &block) != 0u
+               ? (uint8_t)block.material : 0u;
+}
+
+static bool WalkSetWorldBlock(void *opaque, int64_t x, int64_t y, int64_t z,
+                              uint8_t material)
+{
+    WalkWindowState *state = (WalkWindowState *)opaque;
+    if (state == NULL || state->world == NULL || state->voxelService == NULL ||
+        z < INT32_MIN || z > INT32_MAX ||
+        !WalkServiceFieldPresent(state->voxelServiceSize,
+                                 state->voxelService->structSize,
+                                 offsetof(LaiueVoxelServiceV1, setBlock),
+                                 sizeof(state->voxelService->setBlock)) ||
+        state->voxelService->setBlock == NULL)
+        return false;
+    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
+    const LaiueVoxelBlockV1 block = {material, 0u};
+    return state->voxelService->setBlock(state->world, &coordinate, &block) != 0u;
+}
+
+static bool WalkGetChunkCoordinates(WalkWindowState *state,
+                                    int64_t centerBlock[3])
+{
+    if (state == NULL || centerBlock == NULL)
+        return false;
+    if (!state->ragdollReady)
+    {
+        if (state->controller == NULL || state->characterService == NULL ||
+            !WalkServiceFieldPresent(state->characterServiceSize,
+                state->characterService->structSize,
+                offsetof(LaiueCharacterServiceV1, getPosition),
+                sizeof(state->characterService->getPosition)) ||
+            state->characterService->getPosition == NULL)
+            return false;
+        LaiueCharacterPositionV1 position;
+        if (state->characterService->getPosition(state->controller, &position) == 0u ||
+            !PositionAxisToBlock(position.cellX, position.localX, &centerBlock[0]) ||
+            !PositionAxisToBlock(position.cellY, position.localY, &centerBlock[1]))
+            return false;
+        centerBlock[2] = FloorDiv(position.localZ, WALK_VOXEL_SIZE);
+        state->renderOriginBlock[0] = FloorDiv(centerBlock[0], 64) * 64;
+        state->renderOriginBlock[1] = FloorDiv(centerBlock[1], 64) * 64;
+        state->renderOriginBlock[2] = FloorDiv(centerBlock[2], 64) * 64;
+        return true;
+    }
+    double root[3];
+    if (!VoxelRigidBodyLocalPosition(
+            &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const double floored = floor(root[axis]);
+        if (!isfinite(floored) || floored < -9223372036854775808.0 ||
+            floored >= 9223372036854775808.0)
+            return false;
+        const int64_t localBlock = (int64_t)floored;
+        const int64_t localChunk = (int64_t)floor(root[axis] / 64.0) * 64;
+        state->ragdollRenderOriginBlock[axis] = localChunk;
+        if (axis < 2u)
+        {
+            const int64_t worldOrigin = axis == 0u
+                                            ? state->ragdollBlockOriginX
+                                            : state->ragdollBlockOriginY;
+            int64_t worldRenderOrigin = 0;
+            if (!AddChecked(worldOrigin, localBlock, &centerBlock[axis]) ||
+                !AddChecked(worldOrigin, localChunk, &worldRenderOrigin))
+                return false;
+            state->renderOriginBlock[axis] = worldRenderOrigin;
+        }
+        else
+        {
+            centerBlock[axis] = localBlock;
+            state->renderOriginBlock[axis] = localChunk;
+        }
+    }
+    return true;
+}
+
+static void WalkEditTarget(WalkWindowState *state, bool place)
+{
+    if (state == NULL || state->voxelProvider == NULL || state->sceneService == NULL)
+        return;
+    double origin[3] = {state->cameraRelativeEye[0], state->cameraRelativeEye[1],
+                        state->cameraRelativeEye[2]};
+    const int64_t offset[3] = {state->renderOriginBlock[0],
+                               state->renderOriginBlock[1],
+                               state->renderOriginBlock[2]};
+    float direction[3] = {0.0f, 1.0f, 0.0f};
+    if (state->sceneService->cameraGetForwardVector == NULL)
+        return;
+    state->sceneService->cameraGetForwardVector(&state->camera, direction);
+    WalkWorldBlockHit hit;
+    if (!WalkWorldRaycast(WalkReadVisualBlock, (void *)state->voxelProvider,
+                          origin, offset, direction,
+                          WALK_WORLD_INTERACTION_DISTANCE, &hit))
+        return;
+    if (!WalkWorldEditHit(WalkSetWorldBlock, state, &hit, place,
+                          state->selectedMaterial))
+        return;
+    WalkVisualsInvalidateBlock(&state->chunkSet, state->device,
+                               place ? hit.previousBlock[0] : hit.block[0],
+                               place ? hit.previousBlock[1] : hit.block[1],
+                               place ? hit.previousBlock[2] : hit.block[2]);
 }
 
 static void WalkRawInput(void *opaque, void *rawInput)
@@ -868,11 +979,12 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
         root[0] >= (double)INT64_MAX / 2.0 || root[0] <= (double)INT64_MIN / 2.0 ||
         root[1] >= (double)INT64_MAX / 2.0 || root[1] <= (double)INT64_MIN / 2.0)
         return false;
-    const int64_t shiftX = (int64_t)(root[0] / 64.0) * 64;
-    const int64_t shiftY = (int64_t)(root[1] / 64.0) * 64;
+    const int64_t shiftX = (int64_t)floor(root[0] / 64.0) * 64;
+    const int64_t shiftY = (int64_t)floor(root[1] / 64.0) * 64;
     if (shiftX == 0 && shiftY == 0)
         return true;
-    const int64_t localShift[3] = {-shiftX, -shiftY, 0};
+    /* TranslateBlocks subtracts its argument from local body positions. */
+    const int64_t localShift[3] = {shiftX, shiftY, 0};
     int64_t nextOriginX = 0;
     int64_t nextOriginY = 0;
     if (!AddChecked(state->ragdollBlockOriginX, shiftX, &nextOriginX) ||
@@ -928,6 +1040,21 @@ static void WalkWindowFrame(void *opaque)
         (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_ESCAPE);
         state->windowService->requestClose(state->window);
     }
+    if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_V))
+    {
+        (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_V);
+        state->firstPerson = !state->firstPerson;
+    }
+    static const InputKey materialKeys[WALK_VISUAL_TEXTURE_COUNT] = {
+        INPUT_KEY_1, INPUT_KEY_2, INPUT_KEY_3,
+    };
+    for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
+        if (state->inputService->wasKeyPressed(state->input, materialKeys[material]))
+        {
+            (void)state->inputService->consumeKeyPress(state->input,
+                                                       materialKeys[material]);
+            state->selectedMaterial = (uint8_t)(material + 1u);
+        }
     const double now = PlatformMonotonicSeconds();
     double elapsed = state->lastTime == 0.0 ? 0.0 : now - state->lastTime;
     state->lastTime = now;
@@ -952,6 +1079,19 @@ static void WalkWindowFrame(void *opaque)
         if (state->sceneService != NULL &&
             state->sceneService->cameraGetForwardVector != NULL)
             state->sceneService->cameraGetForwardVector(&state->camera, cameraForward);
+        float horizontalLength = (float)ScalarSqrtDouble(
+            (double)cameraForward[0] * cameraForward[0] +
+            (double)cameraForward[1] * cameraForward[1]);
+        if (horizontalLength > 1.0e-6f)
+        {
+            cameraForward[0] /= horizontalLength;
+            cameraForward[1] /= horizontalLength;
+        }
+        else
+        {
+            cameraForward[0] = 0.0f;
+            cameraForward[1] = 1.0f;
+        }
         const float rightX = cameraForward[1];
         const float rightY = -cameraForward[0];
         float worldX = forwardInput * cameraForward[0] + strafe * rightX;
@@ -976,7 +1116,7 @@ static void WalkWindowFrame(void *opaque)
                 &state->ragdollRigidSettings, &state->ragdollSettings,
                 state->ragdollScratch, state->ragdollScratchBytes,
                 worldX, worldY, sprint, jump, fixedStep, &state->ragdollGrounded,
-                &state->ragdollFacingYaw, &state->ragdollGaitPhase) &&
+                &state->ragdollFacingYaw, &state->ragdollGaitPhase, NULL) &&
                 WalkRebaseRagdoll(state);
             if (!stepped)
             {
@@ -1020,9 +1160,32 @@ static void WalkWindowFrame(void *opaque)
     if (state->sceneService != NULL && state->sceneMath != NULL &&
         !WalkUpdateCamera(state, (float)elapsed, mouseDeltaX, mouseDeltaY))
         state->failed = true;
+    int64_t chunkCenter[3] = {0, 0, 0};
+    if (!state->failed && !WalkGetChunkCoordinates(state, chunkCenter))
+    {
+        state->failed = true;
+        state->windowService->requestClose(state->window);
+    }
+    if (!state->failed && state->inputService->wasMouseButtonPressed(
+            state->input, INPUT_MOUSE_BUTTON_LEFT))
+        WalkEditTarget(state, false);
+    if (!state->failed && state->inputService->wasMouseButtonPressed(
+            state->input, INPUT_MOUSE_BUTTON_RIGHT))
+        WalkEditTarget(state, true);
+    if (!state->failed &&
+        !WalkVisualsUpdateChunkSet(state->device, state->mesherService,
+                                   &state->chunkSet, WalkReadVisualBlock,
+                                   (void *)state->voxelProvider, chunkCenter))
+    {
+        state->failed = true;
+        state->windowService->requestClose(state->window);
+    }
     if (state->ragdollReady && !WalkVisualsUpdateRagdollBuffer(
             state->device, state->ragdollBuffer, &state->ragdoll,
-            (double[3]){0.0, 0.0, 0.0}, state->ragdollVisualScratch))
+            (double[3]){(double)state->ragdollRenderOriginBlock[0],
+                        (double)state->ragdollRenderOriginBlock[1],
+                        (double)state->ragdollRenderOriginBlock[2]},
+            state->ragdollVisualScratch))
     {
         state->failed = true;
         state->windowService->requestClose(state->window);
@@ -1102,15 +1265,17 @@ static void WalkWindowFrame(void *opaque)
                 state->uiService->textUtf8(state->uiContext, 32.0f, 32.0f, 0xFFFFFFFFu,
                                            "LAIUE Walk");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
-                                           "WASD move   Shift run   Space jump   Mouse look");
+                    "WASD move  Shift run  Space jump  V view  LMB break  RMB place");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 84.0f, 0xFFB8C8FFu,
                                            state->ragdollReady
                                                ? "Ragdoll: deterministic physics"
                                                : "Ragdoll: physics module unavailable");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 108.0f, 0xFFB8C8FFu,
-                                           state->texturedTerrainReady
-                                               ? "Terrain: grass / dirt / stone textures"
+                                           state->chunksReady && state->texturedTerrainReady
+                                               ? "Infinite voxel chunks: grass / dirt / stone"
                                                : "Terrain textures: unavailable");
+                state->uiService->textUtf8(state->uiContext, 32.0f, 132.0f, 0xFFE8ECF4u,
+                    state->firstPerson ? "View: first person" : "View: third person");
                 uint32_t quadCount = 0u;
                 if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
                                                    LAIUE_GRAPHICS_UI_MAX_QUADS,
@@ -1122,65 +1287,25 @@ static void WalkWindowFrame(void *opaque)
                     state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
                     state->failed = true;
             }
-            if ((state->terrainReady || state->texturedTerrainReady ||
-                 state->ragdollReady) &&
+            if ((state->chunksReady || state->ragdollReady) &&
                 WalkDeviceFieldPresent(state->device,
                                        offsetof(LaiueGraphicsDeviceV2, submit),
                                        sizeof(state->device->submit)) &&
                 state->device->submit != NULL)
             {
-                /* Keep a bounded 3x3 active area around the rebased camera.
-                 * The same immutable chunk buffer is instanced at camera-
-                 * relative offsets, so crossing a chunk boundary never grows
-                 * memory or sends absolute coordinates to the GPU. */
-                LaiueGraphicsDrawItemV2 terrainDraws[
-                    WALK_ACTIVE_CHUNK_COUNT + WALK_VISUAL_TEXTURE_COUNT + 1u];
                 uint32_t drawIndex = 0u;
-                if (state->terrainReady)
-                    for (int32_t y = -WALK_ACTIVE_CHUNK_RADIUS;
-                         y <= WALK_ACTIVE_CHUNK_RADIUS; ++y)
-                        for (int32_t x = -WALK_ACTIVE_CHUNK_RADIUS;
-                             x <= WALK_ACTIVE_CHUNK_RADIUS; ++x)
-                        {
-                            terrainDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
-                                .structSize = sizeof(terrainDraws[drawIndex]),
-                                .vertexBuffer = state->terrainBuffer,
-                                .indexCount = 30u,
-                                .originRelative = {
-                                    state->terrainOriginRelative[0] + (float)x * 64.0f,
-                                    state->terrainOriginRelative[1] + (float)y * 64.0f,
-                                    state->terrainOriginRelative[2],
-                                },
-                                .scale = 1.0f,
-                            };
-                            ++drawIndex;
-                        }
-                double root[3] = {0.0, 0.0, 0.0};
-                if (state->ragdollReady)
-                    (void)VoxelRigidBodyLocalPosition(
-                        &state->ragdoll.bodies[state->ragdoll.rootBody], root);
-                if (state->texturedTerrainReady)
-                    for (uint32_t material = 0u;
-                         material < WALK_VISUAL_TEXTURE_COUNT; ++material)
-                    {
-                        const uint32_t vertexCount = material == 0u
-                            ? 6u : WALK_TERRAIN_SKIRT_VERTEX_COUNT;
-                        terrainDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
-                            .structSize = sizeof(terrainDraws[drawIndex]),
-                            .vertexBuffer = state->texturedTerrainBuffers[material],
-                            .indexCount = vertexCount,
-                            .originRelative = {(float)root[0] - 32.0f,
-                                               (float)root[1] - 32.0f, 0.0f},
-                            .scale = 1.0f,
-                            .texture = state->terrainTextures[material],
-                            .sampler = state->terrainSampler,
-                        };
-                        ++drawIndex;
-                    }
-                if (state->ragdollReady)
+                if (WalkVisualsBuildFarTerrainDraw(
+                        state->farTerrainBuffer, state->renderOriginBlock,
+                        state->terrainTextures, state->terrainSampler,
+                        &walkDraws[drawIndex]))
+                    ++drawIndex;
+                drawIndex += WalkVisualsBuildChunkDraws(
+                    &state->chunkSet, state->renderOriginBlock, state->terrainTextures,
+                    state->terrainSampler, &walkDraws[drawIndex]);
+                if (state->ragdollReady && !state->firstPerson)
                 {
-                    terrainDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
-                        .structSize = sizeof(terrainDraws[drawIndex]),
+                    walkDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
+                        .structSize = sizeof(walkDraws[drawIndex]),
                         .vertexBuffer = state->ragdollBuffer,
                         .indexCount = WALK_RAGDOLL_VISUAL_VERTEX_COUNT,
                         .originRelative = {0.0f, 0.0f, 0.0f},
@@ -1188,7 +1313,7 @@ static void WalkWindowFrame(void *opaque)
                     };
                     ++drawIndex;
                 }
-                if (state->device->submit(state->device, terrainDraws, drawIndex) == 0u)
+                if (state->device->submit(state->device, walkDraws, drawIndex) == 0u)
                     state->failed = true;
             }
             if (state->device->endFrame(state->device) == 0u)
@@ -1240,6 +1365,7 @@ static LaiueModuleStatus LoadWalkModules(
     static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t inputPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t physicsPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t mesherPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t uiPath[LAIUE_PLATFORM_PATH_CAPACITY];
     static wchar_t sceneMathPath[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -1251,6 +1377,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *worldName = L"laiue_world.dll";
     const wchar_t *voxelName = L"laiue_voxel.dll";
 #if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *mesherName = L"laiue_mesher.dll";
     const wchar_t *windowName = L"laiue_window.dll";
     const wchar_t *inputName = L"laiue_input.dll";
     const wchar_t *physicsName = L"laiue_physics.dll";
@@ -1277,6 +1404,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *worldName = L"liblaiue_world.dylib";
     const wchar_t *voxelName = L"liblaiue_voxel.dylib";
 #if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *mesherName = L"liblaiue_mesher.dylib";
     const wchar_t *windowName = L"liblaiue_window.dylib";
     const wchar_t *inputName = L"liblaiue_input.dylib";
     const wchar_t *physicsName = L"liblaiue_physics.dylib";
@@ -1296,6 +1424,7 @@ static LaiueModuleStatus LoadWalkModules(
     const wchar_t *worldName = L"liblaiue_world.so";
     const wchar_t *voxelName = L"liblaiue_voxel.so";
 #if defined(LAIUE_WALK_WINDOWED)
+    const wchar_t *mesherName = L"liblaiue_mesher.so";
     const wchar_t *windowName = L"liblaiue_window.so";
     const wchar_t *inputName = L"liblaiue_input.so";
     const wchar_t *physicsName = L"liblaiue_physics.so";
@@ -1330,6 +1459,7 @@ static LaiueModuleStatus LoadWalkModules(
     if (!JoinPath(windowPath, directory, windowName) ||
         !JoinPath(inputPath, directory, inputName) ||
         !JoinPath(physicsPath, directory, physicsName) ||
+        !JoinPath(mesherPath, directory, mesherName) ||
         !JoinPath(renderPath, directory, renderName) ||
         !JoinPath(uiPath, directory, uiName) ||
         !JoinPath(sceneMathPath, directory, sceneMathName) ||
@@ -1341,6 +1471,8 @@ static LaiueModuleStatus LoadWalkModules(
         (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){physicsPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){mesherPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
@@ -1398,6 +1530,7 @@ static LaiueModuleStatus LoadWalkModules(
     modules[moduleCount++] = LaiueUiGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueSceneMathGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueSceneGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueMesherGetStaticModuleApiV1();
 #endif
     return LaiueModuleHostLoadStatic(host, modules,
                                      moduleCount, diagnostic);
@@ -1445,6 +1578,10 @@ static bool RunWalkExample(bool headless)
         (const LaiuePhysicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_PHYSICS_SERVICE_NAME, LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
             sizeof(LaiuePhysicsServiceV1), NULL, &physicsServiceSize);
+    const LaiueMesherServiceV1 *mesherService =
+        (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueMesherServiceV1), NULL, NULL);
 #endif
     uint32_t voxelServiceSize = 0u;
     const LaiueVoxelServiceV1 *voxel =
@@ -1653,6 +1790,7 @@ static bool RunWalkExample(bool headless)
                 state.uiService = walkUiService;
                 state.physicsService = physicsService;
                 state.physicsServiceSize = physicsServiceSize;
+                state.mesherService = mesherService;
                 state.voxelProvider = &walkProvider;
                 state.characterService = characterReady ? character : NULL;
                 state.characterServiceSize = characterServiceSize;
@@ -1664,6 +1802,7 @@ static bool RunWalkExample(bool headless)
                 state.device = device;
                 state.uiContext = walkUiContext;
                 state.controller = controller;
+                state.selectedMaterial = 1u;
                 state.lastTime = PlatformMonotonicSeconds();
                 if (sceneService != NULL && sceneMath != NULL &&
                     sceneService->cameraInit != NULL)
@@ -1674,13 +1813,23 @@ static bool RunWalkExample(bool headless)
                     PlatformWriteConsoleUtf8(
                         "laiue walk: deterministic ragdoll could not be initialized\n");
                 WalkUpdateRenderOrigin(&state);
-                state.terrainReady = WalkCreateTerrain(device, &state.terrainBuffer);
+                state.chunksReady = WalkVisualsCreateChunkSet(
+                    state.mesherService, &state.chunkSet);
+                int64_t chunkCenter[3] = {0, 0, 0};
+                if (state.chunksReady && WalkGetChunkCoordinates(&state, chunkCenter))
+                    state.chunksReady = WalkVisualsUpdateChunkSet(
+                        device, state.mesherService, &state.chunkSet,
+                        WalkReadVisualBlock, (void *)state.voxelProvider, chunkCenter);
+                else
+                    state.chunksReady = false;
                 state.texturedTerrainReady = WalkVisualsCreateTerrain(
                     device, WalkReadDesktopAsset, NULL, state.texturedTerrainBuffers,
                     state.terrainTextures, &state.terrainSampler);
                 if (!state.texturedTerrainReady)
                     PlatformWriteConsoleUtf8(
                         "laiue walk: bundled terrain textures could not be loaded\n");
+                const bool farTerrainReady = WalkVisualsCreateFarTerrainBuffer(
+                    device, &state.farTerrainBuffer);
                 if (state.ragdollReady)
                     state.ragdollVisualScratch =
                         (WalkRagdollVisualScratch *)PlatformAllocate(
@@ -1688,26 +1837,23 @@ static bool RunWalkExample(bool headless)
                 const bool ragdollBufferReady = state.ragdollReady &&
                     state.ragdollVisualScratch != NULL &&
                     WalkVisualsCreateRagdollBuffer(device, &state.ragdollBuffer);
-                if (!state.terrainReady || !state.texturedTerrainReady ||
+                if (!state.chunksReady || !state.texturedTerrainReady || !farTerrainReady ||
                     !ragdollBufferReady)
                     state.failed = true;
                 windowService->setRawInputCallback(window, WalkRawInput, &state);
                 windowService->setMouseLook(window, true);
                 PlatformWriteConsoleUtf8(
-                    "laiue walk: windowed ragdoll mode (WASD, Shift, Space, mouse, Esc)\n");
+                    "laiue walk: walk mode (WASD, Shift, Space, V view, mouse break/place, Esc)\n");
                 windowService->runLoop(window, WalkWindowFrame, &state);
                 success = success && !state.failed;
                 ranWindow = true;
                 if (!state.failed)
                     PlatformWriteConsoleUtf8("laiue walk: windowed session ended cleanly\n");
-                if (state.terrainReady &&
-                    WalkDeviceFieldPresent(state.device,
-                                           offsetof(LaiueGraphicsDeviceV2, destroyHandle),
-                                           sizeof(state.device->destroyHandle)) &&
-                    state.device->destroyHandle != NULL)
-                    state.device->destroyHandle(state.device, state.terrainBuffer);
+                WalkVisualsDestroyChunkSet(state.device, state.mesherService,
+                                           &state.chunkSet);
                 WalkVisualsDestroyTerrain(state.device, state.texturedTerrainBuffers,
                                           state.terrainTextures, &state.terrainSampler);
+                WalkVisualsDestroyBuffer(state.device, &state.farTerrainBuffer);
                 if (state.ragdollBuffer != 0u &&
                     WalkDeviceFieldPresent(state.device,
                         offsetof(LaiueGraphicsDeviceV2, destroyHandle),

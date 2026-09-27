@@ -1,6 +1,6 @@
 #include "character/character_service.h"
 #include "graphics/graphics_device_service.h"
-#include "render/chunk_geometry.h"
+#include "mesh/mesher_service.h"
 #include "mod/module_host.h"
 #include "numeric/numeric_service.h"
 #include "physics/physics_service.h"
@@ -9,7 +9,7 @@
 #include "world/world_service.h"
 #include "scene/scene_service.h"
 #include "scene/math_service.h"
-#include "walk_terrain.h"
+#include "../walk_world.h"
 #include "walk_runtime.h"
 #include "touch_controls.h"
 #include "../humanoid_ragdoll.h"
@@ -33,12 +33,6 @@
 
 #define ANDROID_WALK_LOG_TAG "laiue.walk"
 #define ANDROID_WALK_HALF_EXTENT INT64_C(400)
-#define ANDROID_WALK_ACTIVE_CHUNK_RADIUS 1
-#define ANDROID_WALK_ACTIVE_CHUNK_DIAMETER \
-    (ANDROID_WALK_ACTIVE_CHUNK_RADIUS * 2 + 1)
-#define ANDROID_WALK_ACTIVE_CHUNK_COUNT \
-    (ANDROID_WALK_ACTIVE_CHUNK_DIAMETER * ANDROID_WALK_ACTIVE_CHUNK_DIAMETER)
-
 /* Touch controls are deliberately owned by the walk example rather than by
  * the renderer or the Android window provider. The lower-left circle is a
  * fixed virtual stick, the lower-right circles toggle sprint and jump, and
@@ -54,6 +48,7 @@
 #define ANDROID_WALK_RAGDOLL_STABLE_ID UINT64_C(0x57414C4B52414744)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
+const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 
 typedef struct AndroidWalkState AndroidWalkState;
 
@@ -63,6 +58,7 @@ struct AndroidWalkState
     LaiueModuleHost *host;
     const LaiuePhysicsServiceV1 *physics;
     uint32_t physicsServiceSize;
+    const LaiueMesherServiceV1 *mesher;
     VoxelRagdoll ragdoll;
     VoxelCollisionSource ragdollCollision;
     VoxelRigidStepSettings ragdollRigidSettings;
@@ -75,6 +71,8 @@ struct AndroidWalkState
     bool ragdollGrounded;
     double ragdollFacingYaw;
     double ragdollGaitPhase;
+    int64_t ragdollBlockOriginX;
+    int64_t ragdollBlockOriginY;
     const LaiueCharacterServiceV1 *character;
     uint32_t characterServiceSize;
     const LaiueVoxelServiceV1 *voxel;
@@ -86,18 +84,22 @@ struct AndroidWalkState
     LaiueVoxelProviderV1 provider;
     WalkVoxelContext walkContext;
     LaiueGraphicsDeviceV2 *device;
-    LaiueGraphicsHandle terrainBuffer;
-    bool terrainReady;
+    WalkVisualChunkSet chunkSet;
+    bool chunksReady;
     LaiueGraphicsHandle texturedTerrainBuffers[WALK_VISUAL_TEXTURE_COUNT];
     LaiueGraphicsHandle terrainTextures[WALK_VISUAL_TEXTURE_COUNT];
     LaiueGraphicsHandle terrainSampler;
+    LaiueGraphicsHandle farTerrainBuffer;
     bool texturedTerrainReady;
+    bool firstPerson;
+    uint8_t selectedMaterial;
     const LaiueSceneServiceV1 *scene;
     const LaiueSceneMathServiceV1 *sceneMath;
     Camera camera;
     float cameraRelativeEye[3];
     float terrainOriginRelative[3];
-    double renderOrigin[3];
+    double cameraRenderOrigin[3];
+    int64_t renderOriginBlock[3];
     float viewProjection[16];
     LaiueVoxelProviderV1 walkProvider;
     bool windowReady;
@@ -107,6 +109,7 @@ struct AndroidWalkState
     bool lookActive;
     bool sprintToggled;
     bool touchUiReady;
+    bool renderTelemetryLogged;
     float joystickOriginX;
     float joystickOriginY;
     float joystickX;
@@ -120,6 +123,8 @@ struct AndroidWalkState
     int32_t sprintPointerId;
     int32_t jumpPointerId;
     bool jumpPending;
+    bool breakPending;
+    bool placePending;
     bool keyDown[10];
     double lastTime;
     double accumulator;
@@ -175,6 +180,27 @@ static void AndroidTouchLayout(const AndroidWalkState *state,
     if (buttonRadius != NULL) *buttonRadius = actionRadius;
 }
 
+static void AndroidTouchActionLayout(const AndroidWalkState *state,
+                                     float centers[3][2], float *radius)
+{
+    const float width = state != NULL && state->width > 0 ? (float)state->width : 1.0f;
+    const float minimum = AndroidTouchMinimumDimension(state);
+    float actionRadius = minimum * 0.075f;
+    float margin = minimum * ANDROID_WALK_TOUCH_MARGIN;
+    if (actionRadius < 32.0f) actionRadius = 32.0f;
+    if (margin < 18.0f) margin = 18.0f;
+    const float y = margin + actionRadius;
+    if (centers != NULL)
+    {
+        centers[0][0] = width - margin - actionRadius;
+        centers[1][0] = width - margin - actionRadius * 3.1f;
+        centers[2][0] = width - margin - actionRadius * 5.2f;
+        for (uint32_t i = 0u; i < 3u; ++i)
+            centers[i][1] = y;
+    }
+    if (radius != NULL) *radius = actionRadius;
+}
+
 static bool AndroidTouchInsideCircle(float x, float y, float centerX, float centerY,
                                      float radius)
 {
@@ -199,11 +225,13 @@ static void AndroidClearTouchState(AndroidWalkState *state)
     state->sprintPointerId = -1;
     state->jumpPointerId = -1;
     state->jumpPending = false;
+    state->breakPending = false;
+    state->placePending = false;
 }
 
 static uint32_t AndroidLoadModules(AndroidWalkState *state)
 {
-    const LaiueModuleApiV1 *modules[8] = {
+    const LaiueModuleApiV1 *modules[9] = {
         LaiueCharacterGetStaticModuleApiV1(),
         LaiueGraphicsGetStaticModuleApiV1(),
         LaiueSceneMathGetStaticModuleApiV1(),
@@ -212,6 +240,7 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
     uint32_t moduleCount = 4u;
     modules[moduleCount++] = LaiueNumericGetStaticModuleApiV1();
     modules[moduleCount++] = LaiuePhysicsGetStaticModuleApiV1();
+    modules[moduleCount++] = LaiueMesherGetStaticModuleApiV1();
 #if defined(LAIUE_ANDROID_WALK_WITH_VOXEL)
     modules[moduleCount++] = LaiueWorldGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueVoxelGetStaticModuleApiV1();
@@ -233,6 +262,9 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
         state->host, LAIUE_PHYSICS_SERVICE_NAME,
         LAIUE_PHYSICS_SERVICE_ABI_VERSION_1, sizeof(LaiuePhysicsServiceV1), NULL,
         &state->physicsServiceSize);
+    state->mesher = (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
+        state->host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueMesherServiceV1), NULL, NULL);
     state->voxel = (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
         LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &state->voxelServiceSize);
@@ -262,13 +294,191 @@ static void AndroidRagdollQueryBlock(void *context, int64_t x, int64_t y, int64_
     outBlock->flags = VOXEL_BLOCK_PHYSICS_SOLID;
     outBlock->friction = 0.75f;
     AndroidWalkState *state = (AndroidWalkState *)context;
-    if (state == NULL || z < INT32_MIN || z > INT32_MAX)
+    if (state == NULL || z < INT32_MIN || z > INT32_MAX ||
+        (state->ragdollBlockOriginX > 0 && x > INT64_MAX - state->ragdollBlockOriginX) ||
+        (state->ragdollBlockOriginX < 0 && x < INT64_MIN - state->ragdollBlockOriginX) ||
+        (state->ragdollBlockOriginY > 0 && y > INT64_MAX - state->ragdollBlockOriginY) ||
+        (state->ragdollBlockOriginY < 0 && y < INT64_MIN - state->ragdollBlockOriginY))
         return;
-    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
+    const LaiueVoxelCoordV1 coordinate = {state->ragdollBlockOriginX + x,
+                                           state->ragdollBlockOriginY + y,
+                                           (int32_t)z};
     LaiueVoxelBlockV1 block = {0u, 0u};
     if (WalkGetBlock(&state->walkProvider, &coordinate, &block) != 0u &&
         block.material == 0u)
         outBlock->flags = 0u;
+}
+
+static uint8_t AndroidReadVisualBlock(void *opaque, int64_t x, int64_t y, int64_t z)
+{
+    AndroidWalkState *state = (AndroidWalkState *)opaque;
+    if (state == NULL || state->walkProvider.getBlock == NULL ||
+        z < INT32_MIN || z > INT32_MAX)
+        return 0u;
+    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
+    LaiueVoxelBlockV1 block = {0u, 0u};
+    return WalkGetBlock(&state->walkProvider, &coordinate, &block) != 0u
+               ? (uint8_t)block.material : 0u;
+}
+
+static bool AndroidSetWorldBlock(void *opaque, int64_t x, int64_t y, int64_t z,
+                                 uint8_t material)
+{
+    AndroidWalkState *state = (AndroidWalkState *)opaque;
+    if (state == NULL || state->world == NULL || state->voxel == NULL ||
+        z < INT32_MIN || z > INT32_MAX ||
+        !AndroidFieldPresent(state->voxelServiceSize, state->voxel->structSize,
+                             offsetof(LaiueVoxelServiceV1, setBlock),
+                             sizeof(state->voxel->setBlock)) ||
+        state->voxel->setBlock == NULL)
+        return false;
+    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
+    const LaiueVoxelBlockV1 block = {material, 0u};
+    return state->voxel->setBlock(state->world, &coordinate, &block) != 0u;
+}
+
+static bool AndroidGetChunkCoordinates(AndroidWalkState *state,
+                                       int64_t centerBlock[3])
+{
+    if (state == NULL || !state->ragdollReady || centerBlock == NULL)
+        return false;
+    double pelvis[3];
+    if (!VoxelRigidBodyLocalPosition(
+            &state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const double localBlockDouble = floor(pelvis[axis]);
+        const double localChunkDouble = floor(pelvis[axis] / 64.0) * 64.0;
+        if (!isfinite(localBlockDouble) || !isfinite(localChunkDouble) ||
+            localBlockDouble < -9223372036854775808.0 ||
+            localBlockDouble >= 9223372036854775808.0 ||
+            localChunkDouble < -9223372036854775808.0 ||
+            localChunkDouble >= 9223372036854775808.0)
+            return false;
+        const int64_t localBlock = (int64_t)localBlockDouble;
+        const int64_t localChunk = (int64_t)localChunkDouble;
+        if (axis == 0u)
+        {
+            if ((state->ragdollBlockOriginX > 0 &&
+                 localBlock > INT64_MAX - state->ragdollBlockOriginX) ||
+                (state->ragdollBlockOriginX < 0 &&
+                 localBlock < INT64_MIN - state->ragdollBlockOriginX) ||
+                (state->ragdollBlockOriginX > 0 &&
+                 localChunk > INT64_MAX - state->ragdollBlockOriginX) ||
+                (state->ragdollBlockOriginX < 0 &&
+                 localChunk < INT64_MIN - state->ragdollBlockOriginX))
+                return false;
+            centerBlock[axis] = state->ragdollBlockOriginX + localBlock;
+            state->renderOriginBlock[axis] = state->ragdollBlockOriginX + localChunk;
+        }
+        else if (axis == 1u)
+        {
+            if ((state->ragdollBlockOriginY > 0 &&
+                 localBlock > INT64_MAX - state->ragdollBlockOriginY) ||
+                (state->ragdollBlockOriginY < 0 &&
+                 localBlock < INT64_MIN - state->ragdollBlockOriginY) ||
+                (state->ragdollBlockOriginY > 0 &&
+                 localChunk > INT64_MAX - state->ragdollBlockOriginY) ||
+                (state->ragdollBlockOriginY < 0 &&
+                 localChunk < INT64_MIN - state->ragdollBlockOriginY))
+                return false;
+            centerBlock[axis] = state->ragdollBlockOriginY + localBlock;
+            state->renderOriginBlock[axis] = state->ragdollBlockOriginY + localChunk;
+        }
+        else
+        {
+            centerBlock[axis] = localBlock;
+            state->renderOriginBlock[axis] = localChunk;
+        }
+        state->cameraRenderOrigin[axis] = localChunk;
+    }
+    return true;
+}
+
+static bool AndroidRebaseRagdoll(AndroidWalkState *state)
+{
+    if (state == NULL || !state->ragdollReady)
+        return false;
+    double root[3];
+    if (!VoxelRigidBodyLocalPosition(
+            &state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
+        !isfinite(root[0]) || !isfinite(root[1]))
+    {
+        AndroidLog(state, ANDROID_LOG_ERROR, "ragdoll rebase could not read finite root");
+        return false;
+    }
+    const double shiftXD = floor(root[0] / 64.0) * 64.0;
+    const double shiftYD = floor(root[1] / 64.0) * 64.0;
+    if (fabs(shiftXD) < 1.0 && fabs(shiftYD) < 1.0)
+        return true;
+    if (shiftXD < -9223372036854775808.0 || shiftXD >= 9223372036854775808.0 ||
+        shiftYD < -9223372036854775808.0 || shiftYD >= 9223372036854775808.0)
+    {
+        __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                            "ragdoll rebase shift out of range root=(%.3f,%.3f) shift=(%.3f,%.3f)",
+                            root[0], root[1], shiftXD, shiftYD);
+        return false;
+    }
+    const int64_t shiftX = (int64_t)shiftXD;
+    const int64_t shiftY = (int64_t)shiftYD;
+    if (shiftX == INT64_MIN || shiftY == INT64_MIN ||
+        (shiftX > 0 && state->ragdollBlockOriginX > INT64_MAX - shiftX) ||
+        (shiftX < 0 && state->ragdollBlockOriginX < INT64_MIN - shiftX) ||
+        (shiftY > 0 && state->ragdollBlockOriginY > INT64_MAX - shiftY) ||
+        (shiftY < 0 && state->ragdollBlockOriginY < INT64_MIN - shiftY))
+    {
+        __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                            "ragdoll rebase world-coordinate overflow root=(%.3f,%.3f) shift=(%lld,%lld) origin=(%lld,%lld)",
+                            root[0], root[1], (long long)shiftX, (long long)shiftY,
+                            (long long)state->ragdollBlockOriginX,
+                            (long long)state->ragdollBlockOriginY);
+        return false;
+    }
+    /* TranslateBlocks subtracts its argument from local body positions. */
+    const int64_t delta[3] = {shiftX, shiftY, 0};
+    for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
+        if (!VoxelRigidBodyTranslateBlocks(&state->ragdoll.bodies[body], delta))
+        {
+            __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                                "ragdoll rebase translation failed body=%u root=(%.3f,%.3f) delta=(%lld,%lld)",
+                                body, root[0], root[1], (long long)delta[0],
+                                (long long)delta[1]);
+            return false;
+        }
+    state->ragdollBlockOriginX += shiftX;
+    state->ragdollBlockOriginY += shiftY;
+    return true;
+}
+
+static void AndroidEditTarget(AndroidWalkState *state, bool place)
+{
+    if (state == NULL || state->scene == NULL ||
+        state->scene->cameraGetForwardVector == NULL)
+        return;
+    const double origin[3] = {state->cameraRelativeEye[0], state->cameraRelativeEye[1],
+                              state->cameraRelativeEye[2]};
+    const int64_t offset[3] = {state->renderOriginBlock[0],
+                               state->renderOriginBlock[1],
+                               state->renderOriginBlock[2]};
+    float direction[3] = {0.0f, 1.0f, 0.0f};
+    state->scene->cameraGetForwardVector(&state->camera, direction);
+    WalkWorldBlockHit hit;
+    if (!WalkWorldRaycast(AndroidReadVisualBlock, state, origin, offset,
+                          direction, WALK_WORLD_INTERACTION_DISTANCE, &hit))
+    {
+        AndroidLog(state, ANDROID_LOG_INFO, "block edit ray found no block");
+        return;
+    }
+    if (!WalkWorldEditHit(AndroidSetWorldBlock, state, &hit, place,
+                          state->selectedMaterial))
+    {
+        AndroidLog(state, ANDROID_LOG_WARN, "block edit provider rejected the change");
+        return;
+    }
+    const int64_t *edited = place ? hit.previousBlock : hit.block;
+    WalkVisualsInvalidateBlock(&state->chunkSet, state->device,
+                               edited[0], edited[1], edited[2]);
 }
 
 static bool AndroidInitializeRagdoll(AndroidWalkState *state)
@@ -382,7 +592,7 @@ static bool AndroidUpdateRagdollBuffer(AndroidWalkState *state)
 {
     return state != NULL && state->ragdollReady &&
            WalkVisualsUpdateRagdollBuffer(state->device, state->ragdollBuffer,
-                                          &state->ragdoll, state->renderOrigin,
+                                          &state->ragdoll, state->cameraRenderOrigin,
                                           state->ragdollVisualScratch);
 }
 
@@ -401,16 +611,11 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
     if (state == NULL)
         return;
     AndroidReleaseGraphicsHandle(state, &state->ragdollBuffer);
+    WalkVisualsDestroyBuffer(state->device, &state->farTerrainBuffer);
     PlatformFree(state->ragdollVisualScratch);
     state->ragdollVisualScratch = NULL;
-    if (state->terrainReady && state->device != NULL &&
-        AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                            offsetof(LaiueGraphicsDeviceV2, destroyHandle),
-                            sizeof(state->device->destroyHandle)) &&
-        state->device->destroyHandle != NULL)
-        state->device->destroyHandle(state->device, state->terrainBuffer);
-    state->terrainReady = false;
-    state->terrainBuffer = 0u;
+    WalkVisualsDestroyChunkSet(state->device, state->mesher, &state->chunkSet);
+    state->chunksReady = false;
     AndroidDestroyTexturedTerrain(state);
     if (state->device != NULL && state->graphics != NULL &&
         AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
@@ -476,49 +681,36 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     state->width = width;
     state->height = height;
     state->lastTime = PlatformMonotonicSeconds();
-    if (AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                            offsetof(LaiueGraphicsDeviceV2, createBuffer),
-                            sizeof(state->device->createBuffer)) &&
-        AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                            offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                            sizeof(state->device->uploadBuffer)) &&
-        state->device->createBuffer != NULL && state->device->uploadBuffer != NULL)
-    {
-        ChunkQuad quads[5];
-        const uint32_t quadCount = WalkBuildTerrainQuads(quads);
-        LaiueGraphicsBufferDescV1 description = {
-            .structSize = sizeof(description),
-            .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING,
-            .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
-        };
-        LaiueGraphicsBufferUploadV1 upload = {
-            .structSize = sizeof(upload),
-            .data = quads,
-            .sizeBytes = (uint64_t)quadCount * sizeof(quads[0]),
-        };
-        state->terrainReady = state->device->createBuffer(
-            state->device, &description, &state->terrainBuffer) != 0u;
-        if (state->terrainReady)
-        {
-            upload.buffer = state->terrainBuffer;
-            state->terrainReady = state->device->uploadBuffer(
-                state->device, &upload) != 0u;
-        }
-        if (!state->terrainReady && state->terrainBuffer != 0u &&
-            AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                                offsetof(LaiueGraphicsDeviceV2, destroyHandle),
-                                sizeof(state->device->destroyHandle)) &&
-            state->device->destroyHandle != NULL)
-        {
-            state->device->destroyHandle(state->device, state->terrainBuffer);
-            state->terrainBuffer = 0u;
-        }
-    }
     if (state->scene != NULL && state->scene->cameraInit != NULL)
         state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, -0.32f);
     if (!AndroidCreateTexturedTerrain(state))
         AndroidLog(state, ANDROID_LOG_WARN,
-                   "Android walk texture assets unavailable; using flat terrain fallback");
+                   "Android walk terrain textures could not be loaded");
+    if (!WalkVisualsCreateFarTerrainBuffer(state->device,
+                                           &state->farTerrainBuffer))
+        AndroidLog(state, ANDROID_LOG_WARN, "far terrain LOD buffer unavailable");
+    state->chunksReady = WalkVisualsCreateChunkSet(state->mesher, &state->chunkSet);
+    int64_t chunkCenter[3] = {0, 0, 0};
+    if (state->chunksReady && AndroidGetChunkCoordinates(state, chunkCenter))
+        state->chunksReady = WalkVisualsUpdateChunkSet(
+            state->device, state->mesher, &state->chunkSet,
+            AndroidReadVisualBlock, state, chunkCenter);
+    else
+        state->chunksReady = false;
+    if (!state->chunksReady)
+        AndroidLog(state, ANDROID_LOG_ERROR, "real voxel chunk mesh initialization failed");
+    if (state->chunksReady)
+    {
+        LaiueGraphicsDrawItemV2 initialDraws[WALK_VISUAL_CHUNK_DRAW_COUNT];
+        const uint32_t initialDrawCount = WalkVisualsBuildChunkDraws(
+            &state->chunkSet, state->renderOriginBlock, state->terrainTextures,
+            state->terrainSampler, initialDraws);
+        __android_log_print(ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                            "initial terrain chunks ready; draw items=%u textures=%u/%u/%u",
+                            initialDrawCount, state->terrainTextures[0] != 0u,
+                            state->terrainTextures[1] != 0u,
+                            state->terrainTextures[2] != 0u);
+    }
     if (state->ragdollReady && !AndroidCreateRagdollBuffer(state))
         AndroidLog(state, ANDROID_LOG_WARN, "ragdoll mesh buffer unavailable");
 
@@ -561,10 +753,24 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
         return 0;
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
     {
-        const int32_t index = AndroidKeyIndex(AKeyEvent_getKeyCode(event));
+        const int32_t keyCode = AKeyEvent_getKeyCode(event);
+        const int32_t action = AKeyEvent_getAction(event);
+        if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(event) == 0)
+        {
+            if (keyCode == AKEYCODE_V)
+            {
+                state->firstPerson = !state->firstPerson;
+                return 1;
+            }
+            if (keyCode >= AKEYCODE_1 && keyCode <= AKEYCODE_3)
+            {
+                state->selectedMaterial = (uint8_t)(keyCode - AKEYCODE_1 + 1);
+                return 1;
+            }
+        }
+        const int32_t index = AndroidKeyIndex(keyCode);
         if (index < 0)
             return 0;
-        const int32_t action = AKeyEvent_getAction(event);
         if (action == AKEY_EVENT_ACTION_DOWN)
         {
             if (index == 5 && !state->keyDown[index])
@@ -604,14 +810,32 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
     float sprintCenterX = 0.0f;
     float sprintCenterY = 0.0f;
     float buttonRadius = 0.0f;
+    float actionCenters[3][2];
+    float actionRadius = 0.0f;
     AndroidTouchLayout(state, &joystickCenterX, &joystickCenterY, &joystickRadius,
                        &jumpCenterX, &jumpCenterY, &sprintCenterX, &sprintCenterY,
                        &buttonRadius);
+    AndroidTouchActionLayout(state, actionCenters, &actionRadius);
     if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_POINTER_DOWN)
     {
         state->touchActive = true;
         const float buttonHitRadius = buttonRadius * 1.20f;
-        if (state->jumpPointerId < 0 &&
+        if (AndroidTouchInsideCircle(x, y, actionCenters[0][0], actionCenters[0][1],
+                                     actionRadius * 1.25f))
+        {
+            state->firstPerson = !state->firstPerson;
+        }
+        else if (AndroidTouchInsideCircle(x, y, actionCenters[1][0], actionCenters[1][1],
+                                          actionRadius * 1.25f))
+        {
+            state->breakPending = true;
+        }
+        else if (AndroidTouchInsideCircle(x, y, actionCenters[2][0], actionCenters[2][1],
+                                          actionRadius * 1.25f))
+        {
+            state->placePending = true;
+        }
+        else if (state->jumpPointerId < 0 &&
             AndroidTouchInsideCircle(x, y, jumpCenterX, jumpCenterY, buttonHitRadius))
         {
             state->jumpPointerId = pointerId;
@@ -758,18 +982,23 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
                              sizeof(state->device->setCamera)) ||
         state->device->setCamera == NULL)
         return;
-    state->renderOrigin[0] = 0.0;
-    state->renderOrigin[1] = 0.0;
-    state->renderOrigin[2] = 0.0;
+    if (state->scene->cameraUpdate != NULL)
+        state->scene->cameraUpdate(&state->camera, elapsed, false, false, false, false, false,
+                                   state->lookDeltaX, state->lookDeltaY, 0.0f, 0.0025f);
+    state->lookDeltaX = 0;
+    state->lookDeltaY = 0;
+    memset(state->cameraRenderOrigin, 0, sizeof(state->cameraRenderOrigin));
+    memset(state->renderOriginBlock, 0, sizeof(state->renderOriginBlock));
     if (state->ragdollReady)
     {
         double pelvis[3];
         if (!VoxelRigidBodyLocalPosition(
                 &state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
             return;
-        state->renderOrigin[0] = floor(pelvis[0] / 64.0) * 64.0;
-        state->renderOrigin[1] = floor(pelvis[1] / 64.0) * 64.0;
-        state->renderOrigin[2] = floor(pelvis[2] / 64.0) * 64.0;
+        int64_t centerBlock[3];
+        if (!AndroidGetChunkCoordinates(state, centerBlock))
+            return;
+        state->cameraRenderOrigin[2] = (double)state->renderOriginBlock[2];
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene->cameraGetForwardVector != NULL)
             state->scene->cameraGetForwardVector(&state->camera, forward);
@@ -785,12 +1014,24 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
             forward[0] = 0.0f;
             forward[1] = 1.0f;
         }
-        state->cameraRelativeEye[0] =
-            (float)(pelvis[0] - state->renderOrigin[0]) - forward[0] * 5.5f;
-        state->cameraRelativeEye[1] =
-            (float)(pelvis[1] - state->renderOrigin[1]) - forward[1] * 5.5f;
-        state->cameraRelativeEye[2] =
-            (float)(pelvis[2] - state->renderOrigin[2]) + 2.8f;
+        if (state->firstPerson)
+        {
+            state->cameraRelativeEye[0] =
+                (float)(pelvis[0] - state->cameraRenderOrigin[0]);
+            state->cameraRelativeEye[1] =
+                (float)(pelvis[1] - state->cameraRenderOrigin[1]);
+            state->cameraRelativeEye[2] =
+                (float)(pelvis[2] - state->cameraRenderOrigin[2]) + 1.65f;
+        }
+        else
+        {
+            state->cameraRelativeEye[0] =
+                (float)(pelvis[0] - state->cameraRenderOrigin[0]) - forward[0] * 5.5f;
+            state->cameraRelativeEye[1] =
+                (float)(pelvis[1] - state->cameraRenderOrigin[1]) - forward[1] * 5.5f;
+            state->cameraRelativeEye[2] =
+                (float)(pelvis[2] - state->cameraRenderOrigin[2]) + 2.8f;
+        }
     }
     else
     {
@@ -818,8 +1059,10 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
                 if (fractionY < 0) fractionY += 1000;
                 const int64_t originX = AndroidFloorDiv(blockX, 64) * 64;
                 const int64_t originY = AndroidFloorDiv(blockY, 64) * 64;
-                state->renderOrigin[0] = (double)originX;
-                state->renderOrigin[1] = (double)originY;
+                state->renderOriginBlock[0] = originX;
+                state->renderOriginBlock[1] = originY;
+                state->renderOriginBlock[2] =
+                    AndroidFloorDiv(AndroidFloorDiv(localZ, 1000), 64) * 64;
                 state->cameraRelativeEye[0] =
                     (float)(blockX - originX) + (float)fractionX / 1000.0f;
                 state->cameraRelativeEye[1] =
@@ -831,16 +1074,13 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
             state->cameraRelativeEye[0] = 0.0f;
             state->cameraRelativeEye[1] = 0.0f;
         }
-        const int64_t originZFixed = (localZ / INT64_C(64000)) * INT64_C(64000);
-        state->renderOrigin[2] = (double)originZFixed / 1000.0;
+        const int64_t originZFixed =
+            AndroidFloorDiv(localZ, INT64_C(64000)) * INT64_C(64000);
+        state->renderOriginBlock[2] = originZFixed / 1000;
+        state->cameraRenderOrigin[2] = (double)state->renderOriginBlock[2];
         state->cameraRelativeEye[2] =
             (float)(localZ - originZFixed) / 1000.0f + 1.6f;
     }
-    if (state->scene->cameraUpdate != NULL)
-        state->scene->cameraUpdate(&state->camera, elapsed, false, false, false, false, false,
-                                   state->lookDeltaX, state->lookDeltaY, 0.0f, 0.0025f);
-    state->lookDeltaX = 0;
-    state->lookDeltaY = 0;
     float view[16];
     float projection[16];
     state->scene->cameraGetViewMatrix(&state->camera, state->cameraRelativeEye, view);
@@ -870,6 +1110,36 @@ static LaiueGraphicsUiQuadV1 AndroidTouchQuad(float x0, float y0, float x1, floa
     return quad;
 }
 
+static void AndroidAppendTouchGlyph(LaiueGraphicsUiQuadV1 *quads,
+                                    uint32_t capacity, uint32_t *count,
+                                    float centerX, float centerY, float radius,
+                                    uint32_t glyph)
+{
+    static const uint8_t rows[3][7] = {
+        {17u, 17u, 17u, 17u, 17u, 10u, 4u}, /* V: view */
+        {17u, 10u, 4u, 4u, 4u, 10u, 17u},   /* X: break */
+        {4u, 4u, 4u, 31u, 4u, 4u, 4u},      /* +: place */
+    };
+    if (quads == NULL || count == NULL || glyph >= 3u)
+        return;
+    const float cell = radius * 0.095f;
+    const float gap = radius * 0.035f;
+    const float width = 5.0f * cell + 4.0f * gap;
+    const float height = 7.0f * cell + 6.0f * gap;
+    const float left = centerX - width * 0.5f;
+    const float top = centerY - height * 0.5f;
+    for (uint32_t y = 0u; y < 7u && *count < capacity; ++y)
+        for (uint32_t x = 0u; x < 5u && *count < capacity; ++x)
+            if ((rows[glyph][y] & (1u << (4u - x))) != 0u)
+            {
+                const float x0 = left + (float)x * (cell + gap);
+                const float y0 = top + (float)y * (cell + gap);
+                quads[(*count)++] = AndroidTouchQuad(
+                    x0, y0, x0 + cell, y0 + cell, cell * 0.12f,
+                    UINT32_C(0xFFF5F7FA));
+            }
+}
+
 static void AndroidSubmitTouchUi(AndroidWalkState *state, int32_t width, int32_t height)
 {
     if (state == NULL || !state->touchUiReady || state->device == NULL || width <= 0 ||
@@ -892,7 +1162,7 @@ static void AndroidSubmitTouchUi(AndroidWalkState *state, int32_t width, int32_t
                        &jumpCenterX, &jumpCenterY, &sprintCenterX, &sprintCenterY,
                        &buttonRadius);
 
-    LaiueGraphicsUiQuadV1 quads[4];
+    LaiueGraphicsUiQuadV1 quads[48];
     uint32_t quadCount = 0u;
     quads[quadCount++] = AndroidTouchQuad(
         joystickCenterX - joystickRadius, joystickCenterY - joystickRadius,
@@ -919,6 +1189,30 @@ static void AndroidSubmitTouchUi(AndroidWalkState *state, int32_t width, int32_t
         jumpCenterX - buttonRadius, jumpCenterY - buttonRadius,
         jumpCenterX + buttonRadius, jumpCenterY + buttonRadius,
         buttonRadius, jumpColor);
+    float actionCenters[3][2];
+    float actionRadius = 0.0f;
+    AndroidTouchActionLayout(state, actionCenters, &actionRadius);
+    const uint32_t viewColor = state->firstPerson
+                                   ? UINT32_C(0xE047B3FF)
+                                   : UINT32_C(0x90425A70);
+    quads[quadCount++] = AndroidTouchQuad(
+        actionCenters[0][0] - actionRadius, actionCenters[0][1] - actionRadius,
+        actionCenters[0][0] + actionRadius, actionCenters[0][1] + actionRadius,
+        actionRadius, viewColor);
+    quads[quadCount++] = AndroidTouchQuad(
+        actionCenters[1][0] - actionRadius, actionCenters[1][1] - actionRadius,
+        actionCenters[1][0] + actionRadius, actionCenters[1][1] + actionRadius,
+        actionRadius, UINT32_C(0xC0D85D56));
+    quads[quadCount++] = AndroidTouchQuad(
+        actionCenters[2][0] - actionRadius, actionCenters[2][1] - actionRadius,
+        actionCenters[2][0] + actionRadius, actionCenters[2][1] + actionRadius,
+        actionRadius, UINT32_C(0xC05FAF68));
+    AndroidAppendTouchGlyph(quads, 48u, &quadCount,
+                            actionCenters[0][0], actionCenters[0][1], actionRadius, 0u);
+    AndroidAppendTouchGlyph(quads, 48u, &quadCount,
+                            actionCenters[1][0], actionCenters[1][1], actionRadius, 1u);
+    AndroidAppendTouchGlyph(quads, 48u, &quadCount,
+                            actionCenters[2][0], actionCenters[2][1], actionRadius, 2u);
     if (state->device->submitUi(state->device, quads, quadCount) == 0u)
         state->touchUiReady = false;
 }
@@ -971,16 +1265,19 @@ static void AndroidStep(AndroidWalkState *state)
             const bool sprint = state->keyDown[4] || state->sprintToggled;
             const bool jump = state->jumpPending;
             state->jumpPending = false;
-            if (!WalkHumanoidStep(
+            WalkHumanoidStepFailure stepFailure = WALK_HUMANOID_STEP_OK;
+            const bool humanoidStepped = WalkHumanoidStep(
                     state->physics, &state->ragdoll, &state->ragdollCollision,
                     &state->ragdollRigidSettings, &state->ragdollSettings,
                     state->ragdollScratch, state->ragdollScratchBytes,
                     worldX, worldY, sprint, jump, fixedStep,
                     &state->ragdollGrounded, &state->ragdollFacingYaw,
-                    &state->ragdollGaitPhase))
+                    &state->ragdollGaitPhase, &stepFailure);
+            if (!humanoidStepped || !AndroidRebaseRagdoll(state))
             {
-                AndroidLog(state, ANDROID_LOG_ERROR,
-                           "deterministic ragdoll step failed");
+                __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                                    "deterministic ragdoll step failed at stage %u (rebase=%u)",
+                                    (uint32_t)stepFailure, humanoidStepped ? 1u : 0u);
                 state->running = false;
                 break;
             }
@@ -1044,62 +1341,44 @@ static void AndroidStep(AndroidWalkState *state)
         if (width > 0 && height > 0)
         {
             AndroidUpdateCamera(state, width, height, (float)elapsed);
+            if (state->breakPending)
+                AndroidEditTarget(state, false);
+            if (state->placePending)
+                AndroidEditTarget(state, true);
+            state->breakPending = false;
+            state->placePending = false;
+            int64_t chunkCenter[3] = {0, 0, 0};
+            if (state->chunksReady &&
+                AndroidGetChunkCoordinates(state, chunkCenter) &&
+                !WalkVisualsUpdateChunkSet(state->device, state->mesher,
+                                           &state->chunkSet, AndroidReadVisualBlock,
+                                           state, chunkCenter))
+            {
+                AndroidLog(state, ANDROID_LOG_ERROR, "voxel chunk rebuild failed");
+                state->running = false;
+            }
             const bool ragdollMeshReady = AndroidUpdateRagdollBuffer(state);
             const uint32_t began = state->device->beginFrame(
                 state->device, (uint32_t)width, (uint32_t)height);
             uint32_t submitted = 1u;
-            if (began != 0u && (state->terrainReady || ragdollMeshReady) &&
+            uint32_t sceneDrawCount = 0u;
+            if (began != 0u && (state->chunksReady || ragdollMeshReady) &&
                 AndroidFieldPresent(state->device->structSize, state->device->structSize,
                                     offsetof(LaiueGraphicsDeviceV2, submit),
                                     sizeof(state->device->submit)) &&
                 state->device->submit != NULL)
             {
-                LaiueGraphicsDrawItemV2 draws[ANDROID_WALK_ACTIVE_CHUNK_COUNT + 4u];
+                LaiueGraphicsDrawItemV2 draws[WALK_VISUAL_CHUNK_DRAW_COUNT + 2u];
                 uint32_t drawIndex = 0u;
-                if (state->terrainReady)
-                    for (int32_t y = -ANDROID_WALK_ACTIVE_CHUNK_RADIUS;
-                         y <= ANDROID_WALK_ACTIVE_CHUNK_RADIUS; ++y)
-                        for (int32_t x = -ANDROID_WALK_ACTIVE_CHUNK_RADIUS;
-                             x <= ANDROID_WALK_ACTIVE_CHUNK_RADIUS; ++x)
-                        {
-                            draws[drawIndex] = (LaiueGraphicsDrawItemV2){
-                                .structSize = sizeof(draws[drawIndex]),
-                                .vertexBuffer = state->terrainBuffer,
-                                .indexCount = 30u,
-                                .originRelative = {(float)x * 64.0f,
-                                                   (float)y * 64.0f,
-                                                   (float)-state->renderOrigin[2]},
-                                .scale = 1.0f,
-                            };
-                            ++drawIndex;
-                        }
-                if (state->texturedTerrainReady)
-                    for (uint32_t material = 0u;
-                         material < WALK_VISUAL_TEXTURE_COUNT;
-                         ++material)
-                    {
-                        const uint32_t vertexCount = material == 0u
-                                                         ? 6u
-                                                         : WALK_TERRAIN_SKIRT_VERTEX_COUNT;
-                        draws[drawIndex] = (LaiueGraphicsDrawItemV2){
-                            .structSize = sizeof(draws[drawIndex]),
-                            .vertexBuffer = state->texturedTerrainBuffers[material],
-                            .indexCount = vertexCount,
-                            /* This is the walk sample's repeating preview floor,
-                             * not a finite world landmark. Keep its 192 m patch
-                             * centered under the rebased camera so it remains
-                             * textured after crossing any number of 64 m cells.
-                             * Eight UV repeats per cell make each rebase seamless. */
-                            .originRelative = {state->cameraRelativeEye[0] - 32.0f,
-                                               state->cameraRelativeEye[1] - 32.0f,
-                                               (float)-state->renderOrigin[2]},
-                            .scale = 1.0f,
-                            .texture = state->terrainTextures[material],
-                            .sampler = state->terrainSampler,
-                        };
-                        ++drawIndex;
-                    }
-                if (ragdollMeshReady)
+                if (WalkVisualsBuildFarTerrainDraw(
+                        state->farTerrainBuffer, state->renderOriginBlock,
+                        state->terrainTextures, state->terrainSampler,
+                        &draws[drawIndex]))
+                    ++drawIndex;
+                drawIndex += WalkVisualsBuildChunkDraws(
+                    &state->chunkSet, state->renderOriginBlock, state->terrainTextures,
+                    state->terrainSampler, &draws[drawIndex]);
+                if (ragdollMeshReady && !state->firstPerson)
                 {
                     draws[drawIndex] = (LaiueGraphicsDrawItemV2){
                         .structSize = sizeof(draws[drawIndex]),
@@ -1110,13 +1389,26 @@ static void AndroidStep(AndroidWalkState *state)
                     };
                     ++drawIndex;
                 }
+                sceneDrawCount = drawIndex;
                 submitted = state->device->submit(state->device, draws, drawIndex);
             }
             if (began != 0u)
                 AndroidSubmitTouchUi(state, width, height);
-            if (began == 0u || submitted == 0u ||
-                state->device->endFrame(state->device) == 0u)
-            AndroidLog(state, ANDROID_LOG_WARN, "frame skipped after surface change");
+            const uint32_t ended = began != 0u
+                ? state->device->endFrame(state->device) : 0u;
+            if (!state->renderTelemetryLogged)
+            {
+                __android_log_print(ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                                    "frame telemetry begin=%u draws=%u submit=%u end=%u camera=(%.2f,%.2f,%.2f) vp=(%.3f,%.3f,%.3f,%.3f)",
+                                    began, sceneDrawCount, submitted, ended,
+                                    state->cameraRelativeEye[0], state->cameraRelativeEye[1],
+                                    state->cameraRelativeEye[2], state->viewProjection[0],
+                                    state->viewProjection[5], state->viewProjection[10],
+                                    state->viewProjection[15]);
+                state->renderTelemetryLogged = true;
+            }
+            if (began == 0u || submitted == 0u || ended == 0u)
+                AndroidLog(state, ANDROID_LOG_WARN, "frame skipped after surface change");
         }
     }
 }
@@ -1125,6 +1417,7 @@ void android_main(struct android_app *app)
 {
     AndroidWalkState state;
     memset(&state, 0, sizeof(state));
+    state.selectedMaterial = 1u;
     state.app = app;
     app->userData = &state;
     app->onAppCmd = AndroidHandleCommand;

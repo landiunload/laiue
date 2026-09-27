@@ -5,6 +5,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef enum WalkHumanoidStepFailure
+{
+    WALK_HUMANOID_STEP_OK = 0,
+    WALK_HUMANOID_STEP_INVALID_STATE,
+    WALK_HUMANOID_STEP_PLANAR_DRIVE,
+    WALK_HUMANOID_STEP_POSE_DRIVE,
+    WALK_HUMANOID_STEP_PHYSICS,
+} WalkHumanoidStepFailure;
+
 bool WalkHumanoidInitialize(const LaiuePhysicsServiceV1 *physics,
                            VoxelRagdoll *ragdoll,
                            const VoxelCollisionSource *collision,
@@ -20,7 +29,8 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
                       void *scratch, uint32_t scratchBytes,
                       double moveX, double moveY, bool sprint, bool jump,
                       double deltaSeconds, bool *inOutGrounded,
-                      double *inOutFacingYaw, double *inOutGaitPhase);
+                      double *inOutFacingYaw, double *inOutGaitPhase,
+                      WalkHumanoidStepFailure *outFailure);
 bool WalkHumanoidIsGrounded(const VoxelRagdoll *ragdoll,
                             const VoxelCollisionSource *collision);
 void WalkHumanoidRelease(const LaiuePhysicsServiceV1 *physics,
