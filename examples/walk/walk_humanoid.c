@@ -72,8 +72,11 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
                       void *scratch, uint32_t scratchBytes,
                       double moveX, double moveY, bool sprint, bool jump,
                       double deltaSeconds, bool *inOutGrounded,
-                      double *inOutFacingYaw, double *inOutGaitPhase)
+                      double *inOutFacingYaw, double *inOutGaitPhase,
+                      WalkHumanoidStepFailure *outFailure)
 {
+    if (outFailure != NULL)
+        *outFailure = WALK_HUMANOID_STEP_OK;
     if (physics == NULL || physics->ragdollStep == NULL || ragdoll == NULL ||
         collision == NULL || rigidSettings == NULL || ragdollSettings == NULL ||
         scratch == NULL || scratchBytes == 0u || inOutGrounded == NULL ||
@@ -81,10 +84,18 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
         !isfinite(moveY) || !isfinite(deltaSeconds) || !(deltaSeconds > 0.0) ||
         deltaSeconds > 1.0 / 30.0 || !isfinite(*inOutFacingYaw) ||
         !isfinite(*inOutGaitPhase))
+    {
+        if (outFailure != NULL)
+            *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
         return false;
+    }
     const double magnitudeSquared = moveX * moveX + moveY * moveY;
     if (!isfinite(magnitudeSquared))
+    {
+        if (outFailure != NULL)
+            *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
         return false;
+    }
     double magnitude = ScalarSqrtDouble(magnitudeSquared);
     if (magnitude > 1.0)
     {
@@ -101,12 +112,26 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
     if (jump)
         (void)WalkRagdollJumpIfGrounded(ragdoll, collision, 5.0);
     if (!WalkRagdollDrivePlanar(ragdoll, moveX, moveY, targetSpeed,
-                                *inOutGrounded ? 8.0 : 2.5, deltaSeconds) ||
-        !WalkRagdollPoseDrive(ragdoll, *inOutFacingYaw, *inOutGaitPhase,
-                              magnitude, deltaSeconds) ||
-        !physics->ragdollStep(ragdoll, collision, rigidSettings, ragdollSettings,
-                              scratch, scratchBytes, NULL))
+                                *inOutGrounded ? 8.0 : 2.5, deltaSeconds))
+    {
+        if (outFailure != NULL)
+            *outFailure = WALK_HUMANOID_STEP_PLANAR_DRIVE;
         return false;
+    }
+    if (!WalkRagdollPoseDrive(ragdoll, *inOutFacingYaw, *inOutGaitPhase,
+                              magnitude, deltaSeconds))
+    {
+        if (outFailure != NULL)
+            *outFailure = WALK_HUMANOID_STEP_POSE_DRIVE;
+        return false;
+    }
+    if (!physics->ragdollStep(ragdoll, collision, rigidSettings, ragdollSettings,
+                              scratch, scratchBytes, NULL))
+    {
+        if (outFailure != NULL)
+            *outFailure = WALK_HUMANOID_STEP_PHYSICS;
+        return false;
+    }
     *inOutGrounded = WalkRagdollGrounded(ragdoll, collision);
     return true;
 }

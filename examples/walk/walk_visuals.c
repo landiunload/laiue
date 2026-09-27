@@ -5,6 +5,7 @@
 #include "platform/system.h"
 
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
@@ -188,50 +189,6 @@ cleanup:
     return succeeded;
 }
 
-static LaiueGraphicsVertexV2 TerrainVertex(float x, float y, float z,
-                                           float u, float v)
-{
-    return (LaiueGraphicsVertexV2){
-        .position = {x, y, z}, .uv = {u, v}, .colorRGBA = UINT32_MAX,
-    };
-}
-
-static void AppendTerrainQuad(LaiueGraphicsVertexV2 *vertices, uint32_t *count,
-                              const float positions[4][3], const float uv[4][2])
-{
-    const LaiueGraphicsVertexV2 corners[4] = {
-        TerrainVertex(positions[0][0], positions[0][1], positions[0][2], uv[0][0], uv[0][1]),
-        TerrainVertex(positions[1][0], positions[1][1], positions[1][2], uv[1][0], uv[1][1]),
-        TerrainVertex(positions[2][0], positions[2][1], positions[2][2], uv[2][0], uv[2][1]),
-        TerrainVertex(positions[3][0], positions[3][1], positions[3][2], uv[3][0], uv[3][1]),
-    };
-    static const uint8_t indices[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-    for (uint32_t index = 0u; index < 6u; ++index)
-        vertices[(*count)++] = corners[indices[index]];
-}
-
-static void BuildTerrainSkirt(LaiueGraphicsVertexV2 *vertices,
-                              float bottom, float top)
-{
-    const float pad = 0.01f;
-    const float uv[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
-                            {24.0f, (top - bottom) / 8.0f},
-                            {0.0f, (top - bottom) / 8.0f}};
-    const float sides[4][4][3] = {
-        {{-64.0f, -64.0f - pad, bottom}, {128.0f, -64.0f - pad, bottom},
-         {128.0f, -64.0f - pad, top}, {-64.0f, -64.0f - pad, top}},
-        {{128.0f + pad, -64.0f, bottom}, {128.0f + pad, 128.0f, bottom},
-         {128.0f + pad, 128.0f, top}, {128.0f + pad, -64.0f, top}},
-        {{128.0f, 128.0f + pad, bottom}, {-64.0f, 128.0f + pad, bottom},
-         {-64.0f, 128.0f + pad, top}, {128.0f, 128.0f + pad, top}},
-        {{-64.0f - pad, 128.0f, bottom}, {-64.0f - pad, -64.0f, bottom},
-         {-64.0f - pad, -64.0f, top}, {-64.0f - pad, 128.0f, top}},
-    };
-    uint32_t count = 0u;
-    for (uint32_t side = 0u; side < 4u; ++side)
-        AppendTerrainQuad(vertices, &count, sides[side], uv);
-}
-
 bool WalkVisualsCreateTerrain(LaiueGraphicsDeviceV2 *device,
                               WalkReadAssetFn readAsset, void *assetContext,
                               LaiueGraphicsHandle outBuffers[WALK_VISUAL_TEXTURE_COUNT],
@@ -264,30 +221,430 @@ bool WalkVisualsCreateTerrain(LaiueGraphicsDeviceV2 *device,
     if (device->createSampler(device, &sampler, outSampler) == 0u)
         goto failed;
 
-    LaiueGraphicsVertexV2 grass[6];
-    const float topPositions[4][3] = {
-        {-64.0f, -64.0f, 1.01f}, {128.0f, -64.0f, 1.01f},
-        {128.0f, 128.0f, 1.01f}, {-64.0f, 128.0f, 1.01f},
-    };
-    const float topUv[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
-                               {24.0f, 24.0f}, {0.0f, 24.0f}};
-    uint32_t count = 0u;
-    AppendTerrainQuad(grass, &count, topPositions, topUv);
-    LaiueGraphicsVertexV2 dirt[WALK_TERRAIN_SKIRT_VERTEX_COUNT];
-    LaiueGraphicsVertexV2 stone[WALK_TERRAIN_SKIRT_VERTEX_COUNT];
-    BuildTerrainSkirt(dirt, -3.0f, 1.0f);
-    BuildTerrainSkirt(stone, -7.0f, -3.0f);
-    if (!UploadVertexBuffer(device, grass, 6u, &outBuffers[0]) ||
-        !UploadVertexBuffer(device, dirt, WALK_TERRAIN_SKIRT_VERTEX_COUNT,
-                            &outBuffers[1]) ||
-        !UploadVertexBuffer(device, stone, WALK_TERRAIN_SKIRT_VERTEX_COUNT,
-                            &outBuffers[2]))
-        goto failed;
+    /* Geometry now comes from the actual voxel mesher.  Keep this compatibility
+     * entrypoint's buffer outputs empty while it owns the shared tile textures. */
     return true;
 
 failed:
     WalkVisualsDestroyTerrain(device, outBuffers, outTextures, outSampler);
     return false;
+}
+
+static bool AddInt64(int64_t left, int64_t right, int64_t *out)
+{
+    if (out == NULL || (right > 0 && left > INT64_MAX - right) ||
+        (right < 0 && left < INT64_MIN - right))
+        return false;
+    *out = left + right;
+    return true;
+}
+
+static int64_t FloorDiv64(int64_t value)
+{
+    int64_t quotient = value / 64;
+    if (value % 64 < 0)
+        --quotient;
+    return quotient;
+}
+
+static bool SubtractInt64(int64_t left, int64_t right, int64_t *out)
+{
+    if (out == NULL || (right > 0 && left < INT64_MIN + right) ||
+        (right < 0 && left > INT64_MAX + right))
+        return false;
+    *out = left - right;
+    return true;
+}
+
+typedef struct WalkVisualBuildContext
+{
+    WalkVisualGetBlockFn getBlock;
+    void *blockContext;
+} WalkVisualBuildContext;
+
+static WorldRegionContents WalkVisualFillRegion(void *opaque,
+    int64_t minX, int64_t minY, int64_t minZ,
+    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType *blocks)
+{
+    WalkVisualBuildContext *context = (WalkVisualBuildContext *)opaque;
+    if (context == NULL || context->getBlock == NULL || blocks == NULL ||
+        sizeX <= 0 || sizeY <= 0 || sizeZ <= 0)
+        return WORLD_REGION_ALL_AIR;
+    for (int32_t y = 0; y < sizeY; ++y)
+        for (int32_t x = 0; x < sizeX; ++x)
+            for (int32_t z = 0; z < sizeZ; ++z)
+            {
+                int64_t worldX = 0, worldY = 0, worldZ = 0;
+                uint8_t material = 0u;
+                if (AddInt64(minX, x, &worldX) && AddInt64(minY, y, &worldY) &&
+                    AddInt64(minZ, z, &worldZ))
+                    material = context->getBlock(context->blockContext,
+                                                  worldX, worldY, worldZ);
+                blocks[((size_t)y * (size_t)sizeX + (size_t)x) *
+                           (size_t)sizeZ + (size_t)z] = material;
+            }
+    return WORLD_REGION_MIXED;
+}
+
+static void DestroyChunk(LaiueGraphicsDeviceV2 *device, WalkVisualChunk *chunk)
+{
+    if (chunk == NULL)
+        return;
+    for (uint32_t i = 0u; i < WALK_VISUAL_TEXTURE_COUNT; ++i)
+        ReleaseHandle(device, &chunk->buffers[i]);
+    memset(chunk, 0, sizeof(*chunk));
+}
+
+bool WalkVisualsCreateChunkSet(const LaiueMesherServiceV1 *mesher,
+                               WalkVisualChunkSet *outSet)
+{
+    if (outSet == NULL)
+        return false;
+    memset(outSet, 0, sizeof(*outSet));
+    if (mesher == NULL || mesher->structSize < sizeof(*mesher) ||
+        mesher->scratchCreate == NULL || mesher->scratchDestroy == NULL ||
+        mesher->buildChunkMesh == NULL)
+        return false;
+    outSet->scratch = mesher->scratchCreate();
+    return outSet->scratch != NULL;
+}
+
+void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device,
+                                const LaiueMesherServiceV1 *mesher,
+                                WalkVisualChunkSet *set)
+{
+    if (set == NULL)
+        return;
+    for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
+        DestroyChunk(device, &set->chunks[i]);
+    if (set->scratch != NULL && mesher != NULL && mesher->scratchDestroy != NULL)
+        mesher->scratchDestroy(set->scratch);
+    memset(set, 0, sizeof(*set));
+}
+
+static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device,
+                             const LaiueMesherServiceV1 *mesher,
+                             ChunkMesherScratch *scratch,
+                             WalkVisualGetBlockFn getBlock, void *blockContext,
+                             const int64_t coordinate[3], WalkVisualChunk *outChunk)
+{
+    if (device == NULL || mesher == NULL || scratch == NULL || getBlock == NULL ||
+        coordinate == NULL || outChunk == NULL ||
+        coordinate[0] < INT64_MIN / 64 + 1 || coordinate[0] > INT64_MAX / 64 - 1 ||
+        coordinate[1] < INT64_MIN / 64 + 1 || coordinate[1] > INT64_MAX / 64 - 1 ||
+        coordinate[2] < INT64_MIN / 64 + 1 || coordinate[2] > INT64_MAX / 64 - 1)
+        return false;
+
+    WalkVisualBuildContext context = {getBlock, blockContext};
+    const ChunkMesherWorldSource source = {&context, WalkVisualFillRegion};
+    ChunkQuad *quads = NULL;
+    uint32_t quadCount = 0u;
+    if (!mesher->buildChunkMesh(&source, scratch, coordinate[0], coordinate[1],
+                                coordinate[2], &quads, &quadCount))
+        return false;
+    uint32_t counts[WALK_VISUAL_TEXTURE_COUNT] = {0u, 0u, 0u};
+    for (uint32_t i = 0u; i < quadCount; ++i)
+    {
+        const uint32_t material = quads[i].positionAndFace >> 24u;
+        if (material != 0u)
+            ++counts[material <= WALK_VISUAL_TEXTURE_COUNT ? material - 1u : 2u];
+    }
+    WalkVisualChunk built = {0};
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        built.coordinate[axis] = coordinate[axis];
+    built.ready = true;
+    static const uint8_t faceCorners[6][4] = {
+        {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u},
+        {7u, 6u, 2u, 3u}, {4u, 5u, 1u, 0u},
+        {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
+    };
+    static const uint8_t triangleCorners[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    static const uint8_t shadeByFace[6] = {204u, 204u, 230u, 179u, 255u, 140u};
+    uint32_t written[WALK_VISUAL_TEXTURE_COUNT] = {0u, 0u, 0u};
+    for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
+    {
+        if (counts[material] == 0u)
+            continue;
+        if (counts[material] > UINT32_MAX / 6u ||
+            (uint64_t)counts[material] * 6u * sizeof(LaiueGraphicsVertexV2) > UINT32_MAX)
+            goto failed;
+        const uint32_t vertexCount = counts[material] * 6u;
+        LaiueGraphicsVertexV2 *vertices = (LaiueGraphicsVertexV2 *)PlatformAllocate(
+            (uint32_t)((uint64_t)vertexCount * sizeof(*vertices)), false);
+        if (vertices == NULL)
+            goto failed;
+        for (uint32_t q = 0u; q < quadCount; ++q)
+        {
+            const uint32_t blockMaterial = quads[q].positionAndFace >> 24u;
+            const uint32_t materialIndex = blockMaterial == 0u ? UINT32_MAX :
+                (blockMaterial <= WALK_VISUAL_TEXTURE_COUNT ? blockMaterial - 1u : 2u);
+            if (materialIndex != material)
+                continue;
+            const uint32_t face = (quads[q].positionAndFace >> 21u) & 7u;
+            if (face >= 6u)
+                continue;
+            const uint32_t start[3] = {
+                quads[q].positionAndFace & 127u,
+                (quads[q].positionAndFace >> 14u) & 127u,
+                (quads[q].positionAndFace >> 7u) & 127u,
+            };
+            const uint32_t extent[3] = {
+                quads[q].extents & 127u,
+                (quads[q].extents >> 14u) & 127u,
+                (quads[q].extents >> 7u) & 127u,
+            };
+            LaiueGraphicsVertexV2 corners[4];
+            for (uint32_t cornerIndex = 0u; cornerIndex < 4u; ++cornerIndex)
+            {
+                const uint32_t corner = faceCorners[face][cornerIndex];
+                const float x = (float)(start[0] + ((corner & 1u) ? extent[0] : 0u));
+                const float y = (float)(start[1] + ((corner & 2u) ? extent[1] : 0u));
+                const float z = (float)(start[2] + ((corner & 4u) ? extent[2] : 0u));
+                float u, v;
+                /* Voxel coordinates are in block units. Repeat each 16x16 tile
+                 * once per block instead of stretching it over eight blocks. */
+                if (face < 2u) { u = y; v = -z; }
+                else if (face < 4u) { u = x; v = -z; }
+                else { u = x; v = y; }
+                const uint32_t shade = shadeByFace[face];
+                corners[cornerIndex] = (LaiueGraphicsVertexV2){
+                    .position = {x, y, z}, .uv = {u, v},
+                    .colorRGBA = UINT32_C(0xFF000000) | (shade << 16u) |
+                                 (shade << 8u) | shade,
+                };
+            }
+            for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
+                vertices[written[material]++] = corners[triangleCorners[vertex]];
+        }
+        const bool uploaded = written[material] == vertexCount &&
+            UploadVertexBuffer(device, vertices, vertexCount, &built.buffers[material]);
+        PlatformFree(vertices);
+        if (!uploaded)
+            goto failed;
+        built.vertexCounts[material] = vertexCount;
+    }
+    PlatformFree(quads);
+    *outChunk = built;
+    return true;
+
+failed:
+    PlatformFree(quads);
+    DestroyChunk(device, &built);
+    return false;
+}
+
+bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device,
+                               const LaiueMesherServiceV1 *mesher,
+                               WalkVisualChunkSet *set,
+                               WalkVisualGetBlockFn getBlock, void *blockContext,
+                               const int64_t centerBlock[3])
+{
+    if (device == NULL || mesher == NULL || set == NULL || set->scratch == NULL ||
+        getBlock == NULL || centerBlock == NULL)
+        return false;
+    int64_t desired[WALK_VISUAL_CHUNK_COUNT][3];
+    const int64_t centerX = FloorDiv64(centerBlock[0]);
+    const int64_t centerY = FloorDiv64(centerBlock[1]);
+    const int64_t centerZ = FloorDiv64(centerBlock[2]);
+    uint32_t desiredCount = 0u;
+    for (int32_t y = -WALK_VISUAL_CHUNK_RADIUS; y <= WALK_VISUAL_CHUNK_RADIUS; ++y)
+        for (int32_t x = -WALK_VISUAL_CHUNK_RADIUS; x <= WALK_VISUAL_CHUNK_RADIUS; ++x)
+            for (uint32_t level = 0u; level < WALK_VISUAL_CHUNK_LEVELS; ++level)
+            {
+                int64_t cx = 0, cy = 0, cz = 0;
+                const int64_t verticalOffset =
+                    (int64_t)level - (int64_t)(WALK_VISUAL_CHUNK_LEVELS / 2u);
+                if (!AddInt64(centerX, x, &cx) || !AddInt64(centerY, y, &cy) ||
+                    !AddInt64(centerZ, verticalOffset, &cz))
+                    return false;
+                desired[desiredCount][0] = cx;
+                desired[desiredCount][1] = cy;
+                desired[desiredCount][2] = cz;
+                ++desiredCount;
+            }
+    bool used[WALK_VISUAL_CHUNK_COUNT] = {false};
+    for (uint32_t d = 0u; d < desiredCount; ++d)
+    {
+        uint32_t slot = WALK_VISUAL_CHUNK_COUNT;
+        for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
+            if (!used[i] && set->chunks[i].ready &&
+                set->chunks[i].coordinate[0] == desired[d][0] &&
+                set->chunks[i].coordinate[1] == desired[d][1] &&
+                set->chunks[i].coordinate[2] == desired[d][2])
+            {
+                slot = i;
+                break;
+            }
+        if (slot != WALK_VISUAL_CHUNK_COUNT)
+        {
+            used[slot] = true;
+            continue;
+        }
+        for (slot = 0u; slot < WALK_VISUAL_CHUNK_COUNT && used[slot]; ++slot) {}
+        if (slot == WALK_VISUAL_CHUNK_COUNT)
+            return false;
+        WalkVisualChunk replacement = {0};
+        if (!BuildChunkVisual(device, mesher, set->scratch, getBlock, blockContext,
+                              desired[d], &replacement))
+            return false;
+        DestroyChunk(device, &set->chunks[slot]);
+        set->chunks[slot] = replacement;
+        used[slot] = true;
+    }
+    for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
+        if (!used[i])
+            DestroyChunk(device, &set->chunks[i]);
+    memcpy(set->center, (int64_t[3]){centerX, centerY, centerZ}, sizeof(set->center));
+    set->centerValid = true;
+    return true;
+}
+
+void WalkVisualsInvalidateBlock(WalkVisualChunkSet *set,
+                                LaiueGraphicsDeviceV2 *device,
+                                int64_t blockX, int64_t blockY, int64_t blockZ)
+{
+    if (set == NULL)
+        return;
+    const int64_t block[3] = {blockX, blockY, blockZ};
+    int64_t base[3];
+    uint32_t edgeMask[3];
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const int64_t chunk = FloorDiv64(block[axis]);
+        base[axis] = chunk * 64;
+        const int64_t local = block[axis] - base[axis];
+        edgeMask[axis] = local == 0 ? 1u : (local == 63 ? 2u : 0u);
+    }
+    int32_t offsets[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+    uint32_t counts[3] = {1u, 1u, 1u};
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        if (edgeMask[axis] == 1u) offsets[axis][counts[axis]++] = -1;
+        else if (edgeMask[axis] == 2u) offsets[axis][counts[axis]++] = 1;
+    }
+    for (uint32_t z = 0u; z < counts[2]; ++z)
+        for (uint32_t y = 0u; y < counts[1]; ++y)
+            for (uint32_t x = 0u; x < counts[0]; ++x)
+                for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
+                    if (set->chunks[i].ready &&
+                        set->chunks[i].coordinate[0] == FloorDiv64(blockX) + offsets[0][x] &&
+                        set->chunks[i].coordinate[1] == FloorDiv64(blockY) + offsets[1][y] &&
+                        set->chunks[i].coordinate[2] == FloorDiv64(blockZ) + offsets[2][z])
+                        DestroyChunk(device, &set->chunks[i]);
+}
+
+uint32_t WalkVisualsBuildChunkDraws(const WalkVisualChunkSet *set,
+                                    const int64_t renderOriginBlock[3],
+                                    const LaiueGraphicsHandle textures[WALK_VISUAL_TEXTURE_COUNT],
+                                    LaiueGraphicsHandle sampler,
+                                    LaiueGraphicsDrawItemV2 outDraws[WALK_VISUAL_CHUNK_DRAW_COUNT])
+{
+    if (set == NULL || renderOriginBlock == NULL || textures == NULL || outDraws == NULL)
+        return 0u;
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
+    {
+        const WalkVisualChunk *chunk = &set->chunks[i];
+        if (!chunk->ready)
+            continue;
+        int64_t relativeOrigin[3];
+        bool relativeOriginValid = true;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+        {
+            if (chunk->coordinate[axis] > INT64_MAX / 64 ||
+                chunk->coordinate[axis] < INT64_MIN / 64 ||
+                !SubtractInt64(chunk->coordinate[axis] * 64,
+                               renderOriginBlock[axis], &relativeOrigin[axis]))
+            {
+                relativeOriginValid = false;
+                break;
+            }
+        }
+        if (!relativeOriginValid)
+            continue;
+        for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
+        {
+            if (chunk->vertexCounts[material] == 0u || chunk->buffers[material] == 0u)
+                continue;
+            LaiueGraphicsDrawItemV2 *draw = &outDraws[count++];
+            memset(draw, 0, sizeof(*draw));
+            draw->structSize = sizeof(*draw);
+            draw->vertexBuffer = chunk->buffers[material];
+            draw->indexCount = chunk->vertexCounts[material];
+            draw->originRelative[0] = (float)relativeOrigin[0];
+            draw->originRelative[1] = (float)relativeOrigin[1];
+            draw->originRelative[2] = (float)relativeOrigin[2];
+            draw->scale = 1.0f;
+            draw->texture = textures[material];
+            draw->sampler = sampler;
+        }
+    }
+    return count;
+}
+
+static void AppendFarTerrainQuad(LaiueGraphicsVertexV2 vertices[6],
+                                 uint32_t *written, float x0, float y0,
+                                 float x1, float y1)
+{
+    const LaiueGraphicsVertexV2 corners[4] = {
+        {.position = {x0, y0, 0.0f}, .uv = {x0, y0}, .colorRGBA = UINT32_MAX},
+        {.position = {x1, y0, 0.0f}, .uv = {x1, y0}, .colorRGBA = UINT32_MAX},
+        {.position = {x1, y1, 0.0f}, .uv = {x1, y1}, .colorRGBA = UINT32_MAX},
+        {.position = {x0, y1, 0.0f}, .uv = {x0, y1}, .colorRGBA = UINT32_MAX},
+    };
+    static const uint8_t triangleCorners[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    for (uint32_t i = 0u; i < 6u; ++i)
+        vertices[(*written)++] = corners[triangleCorners[i]];
+}
+
+bool WalkVisualsCreateFarTerrainBuffer(LaiueGraphicsDeviceV2 *device,
+                                       LaiueGraphicsHandle *outBuffer)
+{
+    if (outBuffer != NULL)
+        *outBuffer = 0u;
+    if (outBuffer == NULL)
+        return false;
+    const float outer = 8192.0f;
+    const float innerMinimum = -64.0f;
+    const float innerMaximum = 128.0f;
+    LaiueGraphicsVertexV2 vertices[WALK_VISUAL_FAR_TERRAIN_VERTEX_COUNT];
+    uint32_t written = 0u;
+    /* Leave the active 3x3 chunk window open so edits and holes remain visible. */
+    AppendFarTerrainQuad(vertices, &written, -outer, innerMaximum, outer, outer);
+    AppendFarTerrainQuad(vertices, &written, -outer, -outer, outer, innerMinimum);
+    AppendFarTerrainQuad(vertices, &written, -outer, innerMinimum,
+                         innerMinimum, innerMaximum);
+    AppendFarTerrainQuad(vertices, &written, innerMaximum, innerMinimum,
+                         outer, innerMaximum);
+    return written == WALK_VISUAL_FAR_TERRAIN_VERTEX_COUNT &&
+        UploadVertexBuffer(device, vertices, written, outBuffer);
+}
+
+bool WalkVisualsBuildFarTerrainDraw(
+    LaiueGraphicsHandle buffer, const int64_t renderOriginBlock[3],
+    const LaiueGraphicsHandle textures[WALK_VISUAL_TEXTURE_COUNT],
+    LaiueGraphicsHandle sampler, LaiueGraphicsDrawItemV2 *outDraw)
+{
+    if (outDraw == NULL)
+        return false;
+    memset(outDraw, 0, sizeof(*outDraw));
+    if (buffer == 0u || renderOriginBlock == NULL || textures == NULL ||
+        textures[0] == 0u || sampler == 0u)
+        return false;
+    outDraw->structSize = sizeof(*outDraw);
+    outDraw->vertexBuffer = buffer;
+    outDraw->indexCount = WALK_VISUAL_FAR_TERRAIN_VERTEX_COUNT;
+    outDraw->originRelative[2] = (float)(0.95 - (double)renderOriginBlock[2]);
+    outDraw->scale = 1.0f;
+    outDraw->texture = textures[0];
+    outDraw->sampler = sampler;
+    return true;
+}
+
+void WalkVisualsDestroyBuffer(LaiueGraphicsDeviceV2 *device,
+                              LaiueGraphicsHandle *buffer)
+{
+    ReleaseHandle(device, buffer);
 }
 
 void WalkVisualsDestroyTerrain(LaiueGraphicsDeviceV2 *device,
@@ -390,9 +747,13 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
                                     const double renderOrigin[3],
                                     WalkRagdollVisualScratch *scratch)
 {
+    /* Keep the corner order cyclic and in lockstep with FACE_CORNERS in
+     * shaders/chunk.hlsl.  Corner bits are X=1, Y=2, Z=4; the old table
+     * crossed several diagonals, twisting rounded-body faces. */
     static const uint8_t faceCorners[6][4] = {
-        {0u, 1u, 2u, 3u}, {4u, 7u, 6u, 5u}, {0u, 4u, 5u, 1u},
-        {3u, 2u, 6u, 7u}, {0u, 3u, 7u, 4u}, {1u, 5u, 6u, 2u},
+        {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u},
+        {7u, 6u, 2u, 3u}, {4u, 5u, 1u, 0u},
+        {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
     };
     static const uint8_t triangles[6] = {0u, 1u, 2u, 0u, 2u, 3u};
     static const uint32_t colors[WALK_VISUAL_RAGDOLL_BODY_COUNT] = {

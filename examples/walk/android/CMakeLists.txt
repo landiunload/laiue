@@ -39,6 +39,7 @@ target_link_libraries(laiue_walk_android PRIVATE
     laiue_physics
     laiue_walk_common
     laiue_render
+    laiue_mesher
     laiue_scene_math
     laiue_scene
     laiue_math_support

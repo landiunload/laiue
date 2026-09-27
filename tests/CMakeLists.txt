@@ -61,6 +61,16 @@ laiue_configure_standalone_executable(
     laiue_walk_runtime_test WalkRuntimeTestEntryPoint)
 add_test(NAME laiue.example.walk_runtime COMMAND laiue_walk_runtime_test)
 
+add_executable(laiue_walk_world_test
+    walk_world_test.c
+    "${PROJECT_SOURCE_DIR}/examples/walk/walk_world.c")
+target_include_directories(laiue_walk_world_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/examples/walk")
+target_link_libraries(laiue_walk_world_test PRIVATE laiue::math_support)
+laiue_configure_standalone_executable(
+    laiue_walk_world_test WalkWorldTestEntryPoint)
+add_test(NAME laiue.example.walk_world COMMAND laiue_walk_world_test)
+
 add_executable(laiue_task_pool_test task_pool_test.c)
 target_link_libraries(laiue_task_pool_test PRIVATE laiue::task laiue::platform_support)
 laiue_configure_standalone_executable(laiue_task_pool_test TaskPoolTestEntryPoint)

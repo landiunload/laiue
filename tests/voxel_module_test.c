@@ -181,6 +181,11 @@ LAIUE_TEST_ENTRY(VoxelModuleTestEntryPoint)
     Expect(provider.getBlockState(&provider, &untouched, &result, &explicitEdit) != 0u &&
                explicitEdit == 0u && result.material == 0u,
            "untouched coordinate reports the default block");
+    Expect(voxel->setBlock(world, &untouched, &air) != 0u &&
+               provider.getBlockState(&provider, &untouched, &result, &explicitEdit) != 0u &&
+               explicitEdit != 0u && result.material == 0u &&
+               voxel->getRevision(world) == 3u,
+           "explicit air over sparse default air is retained as an overlay deletion");
     Expect(voxel->rebase(world, 64, -64, 0) != 0u,
            "voxel world origin rebases through the public service");
     const LaiueVoxelCoordV1 rebasedCoordinate = {

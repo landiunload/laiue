@@ -919,7 +919,11 @@ static bool WorldTrySetBlockInternal(World* world,
     {
         deltaFound = ChunkFindDelta(*entry, localIndex, &deltaPosition, &current);
     }
-    if (current == block)
+    /* Explicit writes must also record a value that matches this sparse
+     * world's own base. A higher-level provider may overlay generated terrain
+     * on top of this world, so explicit air over sparse air is still a real
+     * deletion and must mask that generated block. */
+    if (current == block && (deltaFound || !preserveBase))
     {
         PlatformRwLockReleaseExclusive(&world->tableLock);
         return true;
