@@ -1141,14 +1141,13 @@ bool WorldApplyBlockBatch(World* world,
         return true;
     }
 
-    /* Мелкий пакет выгоднее обслужить прежним линейным поиском: пара
-     * хеш-таблиц на восемь мутаций стоит дороже самого пакета. Хеширование
+    /* Мелкий пакет выгоднее обслужить прежним линейным поиском: хеш-таблица
+     * и её очистка на восемь мутаций стоят дороже самого пакета. Хеширование
      * включается там, где квадрат уже заметен. */
     const bool hashed = count >= WORLD_BATCH_HASH_MIN;
     uint32_t tableCapacity = 0U;
     uint32_t tableMask = 0U;
-    WorldBatchProbe* duplicates = NULL;
-    WorldBatchProbe* groups = NULL;
+    WorldBatchProbe* probes = NULL;
     if (hashed)
     {
         tableCapacity = 1U;
@@ -1157,14 +1156,10 @@ bool WorldApplyBlockBatch(World* world,
             tableCapacity <<= 1U;
         }
         tableMask = tableCapacity - 1U;
-        duplicates = PlatformAllocate(
-            (size_t)tableCapacity * sizeof(*duplicates), true);
-        groups = PlatformAllocate(
-            (size_t)tableCapacity * sizeof(*groups), true);
-        if (duplicates == NULL || groups == NULL)
+        probes = PlatformAllocate(
+            (size_t)tableCapacity * sizeof(*probes), true);
+        if (probes == NULL)
         {
-            PlatformFree(duplicates);
-            PlatformFree(groups);
             return false;
         }
     }
@@ -1173,8 +1168,7 @@ bool WorldApplyBlockBatch(World* world,
         &world->allocator, (size_t)count * sizeof(*chunks), true);
     if (chunks == NULL)
     {
-        PlatformFree(duplicates);
-        PlatformFree(groups);
+        PlatformFree(probes);
         return false;
     }
 
@@ -1188,7 +1182,7 @@ bool WorldApplyBlockBatch(World* world,
         {
             const WorldBlockMutation* mutation = &mutations[index];
             uint32_t duplicate = 0U;
-            if (WorldBatchProbeFindOrInsert(duplicates, tableMask,
+            if (WorldBatchProbeFindOrInsert(probes, tableMask,
                     WorldBatchHash3(mutation->block[0], mutation->block[1],
                         mutation->block[2]),
                     mutation->block[0], mutation->block[1],
@@ -1217,10 +1211,15 @@ bool WorldApplyBlockBatch(World* world,
     }
     if (duplicateFound)
     {
-        PlatformFree(duplicates);
-        PlatformFree(groups);
+        PlatformFree(probes);
         WorldBatchCleanup(world, chunks, 0U);
         return false;
+    }
+
+    if (hashed)
+    {
+        /* Duplicate checks are complete; reuse their table to group chunks. */
+        memset(probes, 0, (size_t)tableCapacity * sizeof(*probes));
     }
 
     uint32_t chunkCount = 0U;
@@ -1240,7 +1239,7 @@ bool WorldApplyBlockBatch(World* world,
         WorldBatchChunk* batch = NULL;
         if (hashed)
         {
-            if (WorldBatchProbeFindOrInsert(groups, tableMask,
+            if (WorldBatchProbeFindOrInsert(probes, tableMask,
                     WorldBatchHash3(coordinate.x, coordinate.y, coordinate.z),
                     coordinate.x, coordinate.y, coordinate.z,
                     chunkCount + 1U, &groupValue))
@@ -1430,8 +1429,7 @@ bool WorldApplyBlockBatch(World* world,
             world->revision, totalChanged);
     }
     PlatformRwLockReleaseExclusive(&world->tableLock);
-    PlatformFree(duplicates);
-    PlatformFree(groups);
+    PlatformFree(probes);
     WorldBatchCleanup(world, chunks, chunkCount);
     return succeeded;
 }
