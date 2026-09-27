@@ -110,6 +110,7 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define INSTANCE_MAX_BYTES_PER_FRAME (64u * 1024u * 1024u)
 #define INSTANCE_MAX_CHUNKS_PER_FRAME 64u
 #define GENERIC_DESCRIPTOR_SET_CAPACITY 256u
+#define GENERIC_DESCRIPTOR_LOOKUP_CAPACITY (GENERIC_DESCRIPTOR_SET_CAPACITY * 2u)
 // Кольцо констант: D3D12 переписывает корневые константы на каждый
 // вызов отрисовки, у Vulkan та же роль у uniform-буфера с динамическим
 // смещением, поэтому на кадр нужен свой диапазон.
@@ -256,6 +257,15 @@ typedef struct BlockTextureReplacement
     uint32_t layerCount;
 } BlockTextureReplacement;
 
+typedef struct GenericDescriptorKey
+{
+    uint32_t blockIndex;
+    uint32_t rangeBytes;
+    VkImageView albedoView;
+    VkImageView normalView;
+    VkSampler sampler;
+} GenericDescriptorKey;
+
 // Итог вывода готового colorTarget в swapchain.
 typedef enum PresentOutcome
 {
@@ -325,6 +335,8 @@ struct Renderer
     VkDescriptorSet resolveSets[FRAME_COUNT];
     VkDescriptorSet uiSets[FRAME_COUNT];
     VkDescriptorSet genericSets[FRAME_COUNT][GENERIC_DESCRIPTOR_SET_CAPACITY];
+    GenericDescriptorKey genericKeys[FRAME_COUNT][GENERIC_DESCRIPTOR_SET_CAPACITY];
+    uint16_t genericLookup[FRAME_COUNT][GENERIC_DESCRIPTOR_LOOKUP_CAPACITY];
     uint32_t genericSetCount[FRAME_COUNT];
     VkSampler sampler;
 
@@ -435,6 +447,11 @@ struct Renderer
 };
 
 _Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
+_Static_assert((GENERIC_DESCRIPTOR_LOOKUP_CAPACITY &
+    (GENERIC_DESCRIPTOR_LOOKUP_CAPACITY - 1u)) == 0u,
+    "generic descriptor lookup capacity must be a power of two");
+_Static_assert(GENERIC_DESCRIPTOR_SET_CAPACITY < UINT16_MAX,
+    "generic descriptor indices must fit in the lookup table");
 
 // === Мелкие помощники ===
 
@@ -1570,30 +1587,112 @@ static void PopulateBlockDescriptorSet(Renderer *renderer, GeometryPoolBlock *bl
     WriteSamplerDescriptor(renderer, set);
 }
 
+static bool GenericDescriptorKeyEquals(const GenericDescriptorKey *left,
+    const GenericDescriptorKey *right)
+{
+    return left->blockIndex == right->blockIndex &&
+        left->rangeBytes == right->rangeBytes &&
+        left->albedoView == right->albedoView &&
+        left->normalView == right->normalView &&
+        left->sampler == right->sampler;
+}
+
+static uint64_t GenericDescriptorKeyHash(const GenericDescriptorKey *key)
+{
+    uint64_t hash = 14695981039346656037ull;
+    hash = (hash ^ key->blockIndex) * 1099511628211ull;
+    hash = (hash ^ key->rangeBytes) * 1099511628211ull;
+#if VK_USE_64_BIT_PTR_DEFINES
+    hash = (hash ^ (uint64_t)(uintptr_t)key->albedoView) * 1099511628211ull;
+    hash = (hash ^ (uint64_t)(uintptr_t)key->normalView) * 1099511628211ull;
+    return (hash ^ (uint64_t)(uintptr_t)key->sampler) * 1099511628211ull;
+#else
+    hash = (hash ^ (uint64_t)key->albedoView) * 1099511628211ull;
+    hash = (hash ^ (uint64_t)key->normalView) * 1099511628211ull;
+    return (hash ^ (uint64_t)key->sampler) * 1099511628211ull;
+#endif
+}
+
+static bool FindGenericDescriptorSet(Renderer *renderer, uint32_t frameIndex,
+    const GenericDescriptorKey *key, VkDescriptorSet *outSet,
+    uint32_t *outEmptySlot)
+{
+    const uint32_t mask = GENERIC_DESCRIPTOR_LOOKUP_CAPACITY - 1u;
+    uint32_t slot = (uint32_t)GenericDescriptorKeyHash(key) & mask;
+    for (uint32_t probe = 0u; probe < GENERIC_DESCRIPTOR_LOOKUP_CAPACITY; ++probe)
+    {
+        uint16_t cachedIndexPlusOne = renderer->genericLookup[frameIndex][slot];
+        if (cachedIndexPlusOne == 0u)
+        {
+            *outSet = VK_NULL_HANDLE;
+            *outEmptySlot = slot;
+            return true;
+        }
+
+        uint32_t cachedIndex = (uint32_t)cachedIndexPlusOne - 1u;
+        if (GenericDescriptorKeyEquals(&renderer->genericKeys[frameIndex][cachedIndex], key))
+        {
+            *outSet = renderer->genericSets[frameIndex][cachedIndex];
+            *outEmptySlot = slot;
+            return true;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return false;
+}
+
 static void FreeGenericDescriptorSets(Renderer *renderer, uint32_t frameIndex)
 {
     if (renderer == NULL || frameIndex >= FRAME_COUNT)
         return;
-    for (uint32_t index = 0u; index < renderer->genericSetCount[frameIndex]; ++index)
+    uint32_t setCount = renderer->genericSetCount[frameIndex];
+    if (setCount != 0u)
     {
-        VkDescriptorSet set = renderer->genericSets[frameIndex][index];
-        if (set != VK_NULL_HANDLE)
-            vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, 1u, &set);
-        renderer->genericSets[frameIndex][index] = VK_NULL_HANDLE;
+        vkFreeDescriptorSets(renderer->device, renderer->descriptorPool, setCount,
+                             renderer->genericSets[frameIndex]);
+        for (uint32_t index = 0u; index < setCount; ++index)
+            renderer->genericSets[frameIndex][index] = VK_NULL_HANDLE;
     }
+    memset(renderer->genericLookup[frameIndex], 0,
+           sizeof(renderer->genericLookup[frameIndex]));
     renderer->genericSetCount[frameIndex] = 0u;
+}
+
+static void FreeAllGenericDescriptorSets(Renderer *renderer)
+{
+    if (renderer == NULL) return;
+    for (uint32_t frameIndex = 0u; frameIndex < FRAME_COUNT; ++frameIndex)
+        FreeGenericDescriptorSets(renderer, frameIndex);
 }
 
 static VkDescriptorSet CreateGenericDescriptorSet(
     Renderer *renderer, const RendererMesh *mesh, const RendererTexture *texture,
     const RendererSampler *sampler)
 {
-    if (renderer == NULL || mesh == NULL || mesh->blockIndex >= renderer->poolBlockCount ||
-        renderer->genericSetCount[renderer->frameIndex] >= GENERIC_DESCRIPTOR_SET_CAPACITY ||
+    if (renderer == NULL || mesh == NULL || renderer->frameIndex >= FRAME_COUNT ||
+        mesh->blockIndex >= renderer->poolBlockCount ||
         (texture != NULL &&
          (texture->owner != renderer || texture->image.view == VK_NULL_HANDLE)) ||
         (sampler != NULL &&
          (sampler->owner != renderer || sampler->sampler == VK_NULL_HANDLE)))
+        return VK_NULL_HANDLE;
+
+    const uint32_t frameIndex = renderer->frameIndex;
+    const GenericDescriptorKey key = {
+        .blockIndex = mesh->blockIndex,
+        .rangeBytes = mesh->sizeBytes,
+        .albedoView = texture != NULL ? texture->image.view : renderer->fallbackImage.view,
+        .normalView = ActiveBlockNormalView(renderer),
+        .sampler = sampler != NULL ? sampler->sampler : renderer->sampler,
+    };
+    VkDescriptorSet cachedSet = VK_NULL_HANDLE;
+    uint32_t lookupSlot = UINT32_MAX;
+    if (!FindGenericDescriptorSet(renderer, frameIndex, &key, &cachedSet, &lookupSlot))
+        return VK_NULL_HANDLE;
+    if (cachedSet != VK_NULL_HANDLE)
+        return cachedSet;
+    if (renderer->genericSetCount[frameIndex] >= GENERIC_DESCRIPTOR_SET_CAPACITY ||
+        lookupSlot == UINT32_MAX)
         return VK_NULL_HANDLE;
 
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -1606,7 +1705,6 @@ static VkDescriptorSet CreateGenericDescriptorSet(
     if (vkAllocateDescriptorSets(renderer->device, &allocateInfo, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
 
-    const uint32_t frameIndex = renderer->frameIndex;
     const GeometryPoolBlock *block = &renderer->poolBlocks[mesh->blockIndex];
     WriteBufferDescriptor(renderer, set, BINDING_CONSTANTS,
                           VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
@@ -1617,14 +1715,14 @@ static VkDescriptorSet CreateGenericDescriptorSet(
     WriteBufferDescriptor(renderer, set, BINDING_INSTANCES,
                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
                           renderer->instanceBuffers[frameIndex][0].buffer, VK_WHOLE_SIZE);
-    WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES,
-                         texture != NULL ? texture->image.view
-                                          : renderer->fallbackImage.view);
-    WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS,
-                         ActiveBlockNormalView(renderer));
-    WriteSamplerDescriptorValue(renderer, set,
-                                sampler != NULL ? sampler->sampler : renderer->sampler);
-    renderer->genericSets[frameIndex][renderer->genericSetCount[frameIndex]++] = set;
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_TEXTURES, key.albedoView);
+    WriteImageDescriptor(renderer, set, BINDING_BLOCK_NORMALS, key.normalView);
+    WriteSamplerDescriptorValue(renderer, set, key.sampler);
+
+    uint32_t setIndex = renderer->genericSetCount[frameIndex]++;
+    renderer->genericSets[frameIndex][setIndex] = set;
+    renderer->genericKeys[frameIndex][setIndex] = key;
+    renderer->genericLookup[frameIndex][lookupSlot] = (uint16_t)(setIndex + 1u);
     return set;
 }
 
@@ -2865,6 +2963,7 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
     if (renderer == NULL || !renderer->worldReady) return;
 
     WaitForGpu(renderer);
+    FreeAllGenericDescriptorSets(renderer);
     DrainDeferredReleases(renderer, true);
 
     if (renderer->chunkPipeline != VK_NULL_HANDLE)
@@ -3280,6 +3379,7 @@ void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler)
         sampler->sampler != VK_NULL_HANDLE)
     {
         vkDeviceWaitIdle(renderer->device);
+        FreeAllGenericDescriptorSets(renderer);
         vkDestroySampler(renderer->device, sampler->sampler, NULL);
     }
     PlatformFree(sampler);
@@ -3292,7 +3392,10 @@ void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
     if (renderer != NULL && texture->owner != renderer)
         return;
     if (renderer != NULL && renderer->device != VK_NULL_HANDLE)
+    {
         vkDeviceWaitIdle(renderer->device);
+        FreeAllGenericDescriptorSets(renderer);
+    }
     if (renderer != NULL)
         ImageDestroy(renderer, &texture->image);
     PlatformFree(texture);
@@ -4167,6 +4270,7 @@ bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalo
     // Подмена транзакционна: старые текстуры живут до конца кадров,
     // которые могли их читать.
     WaitForGpu(renderer);
+    FreeAllGenericDescriptorSets(renderer);
     ImageDestroy(renderer, &renderer->blockTexture);
     ImageDestroy(renderer, &renderer->blockNormalTexture);
     renderer->blockTexture = albedo;

@@ -166,6 +166,8 @@ LAIUE_RENDER_API bool RendererSetMaterialNames(Renderer *renderer, const wchar_t
 
 LAIUE_RENDER_API bool RendererPrepareWorldFrom(Renderer *renderer, LaiueContentCatalog *catalog);
 LAIUE_RENDER_API bool      RendererPrepareWorld(Renderer* renderer);
+// Освобождение мира и уничтожение текстур/сэмплеров вызывайте между кадрами:
+// до RendererBeginFrame или после RendererEndFrame.
 LAIUE_RENDER_API void      RendererReleaseWorld(Renderer* renderer);
 LAIUE_RENDER_API bool      RendererIsWorldReady(const Renderer* renderer);
 
