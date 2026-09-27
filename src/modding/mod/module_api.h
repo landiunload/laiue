@@ -86,11 +86,17 @@ typedef void *(LAIUE_MODULE_CALL *LaiueModuleAllocateFn)(void *context, uint64_t
 typedef void *(LAIUE_MODULE_CALL *LaiueModuleReallocateFn)(void *context, void *memory,
                                                             uint64_t size);
 typedef void(LAIUE_MODULE_CALL *LaiueModuleFreeFn)(void *context, void *memory);
+/* Query returns a borrowed service-table pointer. It remains valid until the
+ * provider is stopped/unloaded; the application must quiesce all users and
+ * worker jobs before host teardown begins. */
 typedef const void *(LAIUE_MODULE_CALL *LaiueModuleQueryServiceFn)(
     void *context, const char *name, uint32_t minimumVersion, uint32_t minimumSize,
     uint32_t *outVersion, uint32_t *outSize);
 typedef LaiueModuleStatus(LAIUE_MODULE_CALL *LaiueModulePublishServiceFn)(
     void *context, const LaiueModuleServiceV1 *service);
+/* Service tables are frozen after a profile has loaded successfully. Runtime
+ * publish/unpublish attempts return BUSY; the host removes owned services as
+ * it stops their provider. */
 typedef LaiueModuleStatus(LAIUE_MODULE_CALL *LaiueModuleUnpublishServiceFn)(
     void *context, const char *name);
 
@@ -139,6 +145,10 @@ typedef struct LaiueModuleDescriptorV1
     };
 } LaiueModuleDescriptorV1;
 
+/* On create failure the host does not call destroy: create must release any
+ * partial resources and return with no live work. After successful create,
+ * destroy is called exactly once, including when start fails. A failed start
+ * is not followed by stop, so destroy must also clean partial start effects. */
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueModuleCreateFn)(const LaiueModuleHostV1 *host,
                                                          void **outContext);
 typedef uint32_t(LAIUE_MODULE_CALL *LaiueModuleStartFn)(void *context);

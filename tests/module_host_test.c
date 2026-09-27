@@ -31,9 +31,15 @@ typedef struct StaticModuleState
 static StaticModuleState staticState;
 static uint32_t failingStartCalls;
 static uint32_t publishingFailureCreateCalls;
+static uint32_t createFailureDestroyCalls;
+static uint32_t startFailureStopCalls;
+static uint32_t startFailureDestroyCalls;
 static CounterState publishedFailureState;
 
 static void LAIUE_MODULE_CALL StaticDestroy(void *context);
+static void LAIUE_MODULE_CALL CountCreateFailureDestroy(void *context);
+static void LAIUE_MODULE_CALL CountStartFailureStop(void *context);
+static void LAIUE_MODULE_CALL CountStartFailureDestroy(void *context);
 
 static const char *const publishedFailureServices[] = {"example.profile.failing.published"};
 
@@ -73,7 +79,7 @@ static const LaiueModuleApiV1 publishingFailCreateApi = {
         .providesCount = 1u,
     },
     .create = PublishingFailCreate,
-    .destroy = StaticDestroy,
+    .destroy = CountCreateFailureDestroy,
 };
 
 static uint32_t LAIUE_MODULE_CALL StaticCreate(const LaiueModuleHostV1 *host, void **outContext)
@@ -107,6 +113,24 @@ static void LAIUE_MODULE_CALL StaticDestroy(void *context)
     (void)context;
 }
 
+static void LAIUE_MODULE_CALL CountCreateFailureDestroy(void *context)
+{
+    (void)context;
+    ++createFailureDestroyCalls;
+}
+
+static void LAIUE_MODULE_CALL CountStartFailureStop(void *context)
+{
+    (void)context;
+    ++startFailureStopCalls;
+}
+
+static void LAIUE_MODULE_CALL CountStartFailureDestroy(void *context)
+{
+    (void)context;
+    ++startFailureDestroyCalls;
+}
+
 static const LaiueModuleApiV1 staticApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
@@ -119,6 +143,296 @@ static const LaiueModuleApiV1 staticApi = {
     .create = StaticCreate,
     .start = StaticStart,
     .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
+typedef struct OptionalFallbackState
+{
+    const LaiueModuleHostV1 *host;
+    uint32_t starts;
+    bool observedMissingService;
+} OptionalFallbackState;
+
+static OptionalFallbackState optionalFallbackState;
+static uint32_t optionalProviderServiceTable;
+static const char optionalVersionedServiceName[] = "example.optional.versioned";
+static const char optionalConsumerServiceName[] = "example.optional.consumer.ready";
+static const char optionalThirdServiceName[] = "example.optional.third";
+static const char *const optionalConsumerServices[] = {optionalConsumerServiceName};
+static const char *const optionalProviderServices[] = {optionalVersionedServiceName};
+static const char *const optionalThirdServices[] = {optionalThirdServiceName};
+static const LaiueModuleRequirementV1 optionalConsumerRequirement[] = {
+    {optionalVersionedServiceName, 2u},
+};
+static const LaiueModuleRequirementV1 optionalProviderRequirement[] = {
+    {optionalConsumerServiceName, 1u},
+};
+static const LaiueModuleRequirementV1 optionalMiddleRequirement[] = {
+    {optionalThirdServiceName, 1u},
+};
+static const LaiueModuleRequirementV1 optionalThirdRequirement[] = {
+    {optionalConsumerServiceName, 1u},
+};
+
+static uint32_t LAIUE_MODULE_CALL OptionalFallbackCreate(const LaiueModuleHostV1 *host,
+                                                         void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    LaiueModuleServiceV1 service = {
+        .name = optionalConsumerServiceName,
+        .version = 1u,
+        .table = &optionalFallbackState,
+        .tableSize = sizeof(optionalFallbackState),
+    };
+    if (host->publishService(host->context, &service) != LAIUE_MODULE_OK)
+        return false;
+    optionalFallbackState.host = host;
+    optionalFallbackState.starts = 0u;
+    optionalFallbackState.observedMissingService = false;
+    *outContext = &optionalFallbackState;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalFallbackStart(void *context)
+{
+    OptionalFallbackState *state = context;
+    if (state == NULL || state->host == NULL || state->host->queryService == NULL)
+        return false;
+    ++state->starts;
+    state->observedMissingService =
+        state->host->queryService(state->host->context, optionalVersionedServiceName, 2u,
+                                  1u, NULL, NULL) == NULL;
+    return state->observedMissingService;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalProviderCreate(const LaiueModuleHostV1 *host,
+                                                         void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    LaiueModuleServiceV1 service = {
+        .name = optionalVersionedServiceName,
+        .version = 1u,
+        .table = &optionalProviderServiceTable,
+        .tableSize = sizeof(optionalProviderServiceTable),
+    };
+    if (host->publishService(host->context, &service) != LAIUE_MODULE_OK)
+        return false;
+    *outContext = &optionalProviderServiceTable;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalProviderStart(void *context)
+{
+    return context != NULL;
+}
+
+typedef struct OptionalCycleNodeState
+{
+    const LaiueModuleHostV1 *host;
+    uint32_t serviceValue;
+    bool observedOptionalService;
+} OptionalCycleNodeState;
+
+static OptionalCycleNodeState optionalMiddleState;
+static OptionalCycleNodeState optionalThirdState;
+
+static uint32_t LAIUE_MODULE_CALL OptionalMiddleCreate(const LaiueModuleHostV1 *host,
+                                                       void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    optionalMiddleState.host = host;
+    optionalMiddleState.serviceValue = 1u;
+    optionalMiddleState.observedOptionalService = false;
+    LaiueModuleServiceV1 service = {
+        .name = optionalVersionedServiceName,
+        .version = 1u,
+        .table = &optionalMiddleState,
+        .tableSize = sizeof(optionalMiddleState),
+    };
+    if (host->publishService(host->context, &service) != LAIUE_MODULE_OK)
+        return false;
+    *outContext = &optionalMiddleState;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalMiddleStart(void *context)
+{
+    OptionalCycleNodeState *state = context;
+    if (state == NULL || state->host == NULL || state->host->queryService == NULL)
+        return false;
+    state->observedOptionalService =
+        state->host->queryService(state->host->context, optionalThirdServiceName, 1u,
+                                  1u, NULL, NULL) != NULL;
+    return state->observedOptionalService;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalThirdCreate(const LaiueModuleHostV1 *host,
+                                                      void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    optionalThirdState.host = host;
+    optionalThirdState.serviceValue = 1u;
+    optionalThirdState.observedOptionalService = false;
+    LaiueModuleServiceV1 service = {
+        .name = optionalThirdServiceName,
+        .version = 1u,
+        .table = &optionalThirdState,
+        .tableSize = sizeof(optionalThirdState),
+    };
+    if (host->publishService(host->context, &service) != LAIUE_MODULE_OK)
+        return false;
+    *outContext = &optionalThirdState;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL OptionalThirdStart(void *context)
+{
+    OptionalCycleNodeState *state = context;
+    if (state == NULL || state->host == NULL || state->host->queryService == NULL)
+        return false;
+    state->observedOptionalService =
+        state->host->queryService(state->host->context, optionalConsumerServiceName, 1u,
+                                  1u, NULL, NULL) != NULL;
+    return state->observedOptionalService;
+}
+
+static const LaiueModuleApiV1 optionalConsumerApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.optional.a",
+        .version = "1.0.0",
+        .providesServices = optionalConsumerServices,
+        .providesCount = 1u,
+        .optionalServices = optionalConsumerRequirement,
+        .optionalCount = 1u,
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
+    },
+    .create = OptionalFallbackCreate,
+    .start = OptionalFallbackStart,
+    .destroy = StaticDestroy,
+};
+
+static const LaiueModuleApiV1 optionalProviderApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.optional.provider",
+        .version = "1.0.0",
+        .providesServices = optionalProviderServices,
+        .providesCount = 1u,
+    },
+    .create = OptionalProviderCreate,
+    .start = OptionalProviderStart,
+    .destroy = StaticDestroy,
+};
+
+static const LaiueModuleApiV1 optionalCycleProviderApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.optional.b",
+        .version = "1.0.0",
+        .requiresServices = optionalProviderRequirement,
+        .requiresCount = 1u,
+        .providesServices = optionalProviderServices,
+        .providesCount = 1u,
+        .optionalServices = optionalMiddleRequirement,
+        .optionalCount = 1u,
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
+    },
+    .create = OptionalMiddleCreate,
+    .start = OptionalMiddleStart,
+    .destroy = StaticDestroy,
+};
+
+static const LaiueModuleApiV1 optionalThirdCycleApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.optional.c",
+        .version = "1.0.0",
+        .providesServices = optionalThirdServices,
+        .providesCount = 1u,
+        .optionalServices = optionalThirdRequirement,
+        .optionalCount = 1u,
+        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
+    },
+    .create = OptionalThirdCreate,
+    .start = OptionalThirdStart,
+    .destroy = StaticDestroy,
+};
+
+typedef struct ServiceLifetimeState
+{
+    const LaiueModuleHostV1 *host;
+    uint32_t value;
+} ServiceLifetimeState;
+
+static ServiceLifetimeState serviceLifetimeState;
+static uint32_t hostLifetimeServiceTable;
+static uint32_t serviceLifetimeStopUnpublishStatus = UINT32_MAX;
+static const char moduleLifetimeServiceName[] = "example.module.lifetime";
+static const char *const moduleLifetimeServices[] = {moduleLifetimeServiceName};
+
+static uint32_t LAIUE_MODULE_CALL ServiceLifetimeCreate(const LaiueModuleHostV1 *host,
+                                                        void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    serviceLifetimeState.host = host;
+    serviceLifetimeState.value = 1u;
+    LaiueModuleServiceV1 service = {
+        .name = moduleLifetimeServiceName,
+        .version = 1u,
+        .table = &serviceLifetimeState,
+        .tableSize = sizeof(serviceLifetimeState),
+    };
+    if (host->publishService(host->context, &service) != LAIUE_MODULE_OK)
+        return false;
+    *outContext = &serviceLifetimeState;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL ServiceLifetimeStart(void *context)
+{
+    return context == &serviceLifetimeState;
+}
+
+static void LAIUE_MODULE_CALL ServiceLifetimeStop(void *context)
+{
+    ServiceLifetimeState *state = context;
+    if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
+        serviceLifetimeStopUnpublishStatus = state->host->unpublishService(
+            state->host->context, moduleLifetimeServiceName);
+}
+
+static const LaiueModuleApiV1 serviceLifetimeApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "example.service_lifetime",
+        .version = "1.0.0",
+        .providesServices = moduleLifetimeServices,
+        .providesCount = 1u,
+    },
+    .create = ServiceLifetimeCreate,
+    .start = ServiceLifetimeStart,
+    .stop = ServiceLifetimeStop,
     .destroy = StaticDestroy,
 };
 
@@ -152,7 +466,8 @@ static const LaiueModuleApiV1 publishingFailStartApi = {
     },
     .create = PublishingFailStartCreate,
     .start = FailingStart,
-    .destroy = StaticDestroy,
+    .stop = CountStartFailureStop,
+    .destroy = CountStartFailureDestroy,
 };
 
 static const char *const failingProvides[] = {"example.profile.failing"};
@@ -169,8 +484,8 @@ static const LaiueModuleApiV1 failingStartApi = {
     },
     .create = StaticCreate,
     .start = FailingStart,
-    .stop = StaticStop,
-    .destroy = StaticDestroy,
+    .stop = CountStartFailureStop,
+    .destroy = CountStartFailureDestroy,
 };
 
 static const char *const cycleAProvides[] = {"example.cycle.a"};
@@ -330,6 +645,100 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     LaiueModuleHost *host = LaiueModuleHostCreate(&config, &diagnostic);
     Expect(host != NULL, "module host creates");
 
+    static const char hostLifetimeName[] = "example.host.lifetime";
+    static const char lateHostServiceName[] = "example.host.late";
+    static uint32_t lateHostServiceTable;
+    LaiueModuleServiceV1 hostLifetimeService = {
+        .name = hostLifetimeName,
+        .version = 1u,
+        .table = &hostLifetimeServiceTable,
+        .tableSize = sizeof(hostLifetimeServiceTable),
+    };
+    LaiueModuleServiceV1 lateHostService = {
+        .name = lateHostServiceName,
+        .version = 1u,
+        .table = &lateHostServiceTable,
+        .tableSize = sizeof(lateHostServiceTable),
+    };
+    Expect(LaiueModuleHostRegisterService(host, &hostLifetimeService, &diagnostic) ==
+               LAIUE_MODULE_OK,
+           "host service registers before modules load");
+    const LaiueModuleApiV1 *lifetimeApis[] = {&serviceLifetimeApi};
+    Expect(LaiueModuleHostLoadStatic(host, lifetimeApis, 1u, &diagnostic) == LAIUE_MODULE_OK,
+           "service lifetime fixture loads");
+    Expect(LaiueModuleHostUnregisterService(host, hostLifetimeName, &diagnostic) ==
+               LAIUE_MODULE_BUSY &&
+               LaiueModuleHostQueryService(host, hostLifetimeName, 1u, sizeof(hostLifetimeServiceTable),
+                                           NULL, NULL) == &hostLifetimeServiceTable,
+           "host service remains available while a module may retain its pointer");
+    Expect(LaiueModuleHostRegisterService(host, &lateHostService, &diagnostic) ==
+               LAIUE_MODULE_BUSY,
+           "host service registry cannot change while modules are loaded");
+    Expect(serviceLifetimeState.host->unpublishService(
+               serviceLifetimeState.host->context, moduleLifetimeServiceName) ==
+               LAIUE_MODULE_BUSY &&
+               LaiueModuleHostQueryService(host, moduleLifetimeServiceName, 1u,
+                                           sizeof(serviceLifetimeState), NULL, NULL) ==
+                   &serviceLifetimeState,
+           "a running provider cannot invalidate a cached service table");
+    LaiueModuleHostUnloadAll(host);
+    Expect(serviceLifetimeStopUnpublishStatus == LAIUE_MODULE_BUSY &&
+               LaiueModuleHostQueryService(host, moduleLifetimeServiceName, 1u, 1u,
+                                       NULL, NULL) == NULL,
+           "the registry stays frozen during stop and host removes services after unload");
+    Expect(LaiueModuleHostUnregisterService(host, hostLifetimeName, &diagnostic) ==
+               LAIUE_MODULE_OK &&
+               LaiueModuleHostRegisterService(host, &lateHostService, &diagnostic) ==
+                   LAIUE_MODULE_OK &&
+               LaiueModuleHostUnregisterService(host, lateHostServiceName, &diagnostic) ==
+                   LAIUE_MODULE_OK,
+           "host service registry becomes mutable again after unload");
+
+    LaiueModuleServiceV1 oldHostService = {
+        .name = optionalVersionedServiceName,
+        .version = 1u,
+        .table = &optionalProviderServiceTable,
+        .tableSize = sizeof(optionalProviderServiceTable),
+    };
+    Expect(LaiueModuleHostRegisterService(host, &oldHostService, &diagnostic) == LAIUE_MODULE_OK,
+           "older optional host service registers");
+    const LaiueModuleApiV1 *optionalConsumerOnly[] = {&optionalConsumerApi};
+    Expect(LaiueModuleHostLoadStatic(host, optionalConsumerOnly, 1u, &diagnostic) ==
+               LAIUE_MODULE_OK && optionalFallbackState.starts == 1u &&
+               optionalFallbackState.observedMissingService,
+           "an incompatible optional host service uses the fallback path");
+    LaiueModuleHostUnloadAll(host);
+    Expect(LaiueModuleHostUnregisterService(host, optionalVersionedServiceName, &diagnostic) ==
+               LAIUE_MODULE_OK,
+           "old optional host service unregisters after consumer unload");
+
+    const LaiueModuleApiV1 *oldOptionalProvider[] = {&optionalConsumerApi,
+                                                     &optionalProviderApi};
+    optionalFallbackState.starts = 0u;
+    optionalFallbackState.observedMissingService = false;
+    Expect(LaiueModuleHostLoadStatic(host, oldOptionalProvider, 2u, &diagnostic) ==
+               LAIUE_MODULE_OK && optionalFallbackState.starts == 1u &&
+               optionalFallbackState.observedMissingService &&
+               LaiueModuleHostLoadedCount(host) == 2u,
+           "a started provider with an older service version does not block an optional consumer");
+    LaiueModuleHostUnloadAll(host);
+
+    const LaiueModuleApiV1 *optionalCycle[] = {&optionalThirdCycleApi,
+                                                &optionalCycleProviderApi,
+                                                &optionalConsumerApi};
+    optionalFallbackState.starts = 0u;
+    optionalFallbackState.observedMissingService = false;
+    optionalMiddleState.observedOptionalService = false;
+    optionalThirdState.observedOptionalService = false;
+    Expect(LaiueModuleHostLoadStatic(host, optionalCycle, 3u, &diagnostic) ==
+               LAIUE_MODULE_OK && optionalFallbackState.starts == 1u &&
+               optionalFallbackState.observedMissingService &&
+               optionalMiddleState.observedOptionalService &&
+               optionalThirdState.observedOptionalService &&
+               LaiueModuleHostLoadedCount(host) == 3u,
+           "one optional fallback unlocks a three-module dependency cycle");
+    LaiueModuleHostUnloadAll(host);
+
     LaiueModuleBinaryV1 missing = {missingPath, 0u, NULL};
     Expect(LaiueModuleHostLoad(host, &missing, 1u, &diagnostic) == LAIUE_MODULE_LOAD_FAILED,
            "missing module is reported without aborting the process");
@@ -442,6 +851,8 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
      * disables it in the same transaction, while the independent static
      * module still reaches a clean running graph without a second start. */
     failingStartCalls = 0u;
+    startFailureStopCalls = 0u;
+    startFailureDestroyCalls = 0u;
     LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
     LaiueModuleBinaryV1 failingProfile[] = {
         {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
@@ -458,14 +869,16 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                (profileEntries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
                (profileEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
            "optional start failure leaves independent module running");
-    Expect(failingStartCalls == 1u && staticState.starts == 1u,
-           "optional start failure does not replay lifecycle callbacks");
+    Expect(failingStartCalls == 1u && staticState.starts == 1u &&
+               startFailureStopCalls == 0u && startFailureDestroyCalls == 1u,
+           "failed start skips stop and destroys the successfully created context once");
     LaiueModuleHostUnloadAll(host);
 
     /* A callback may publish a service before create/start reports failure.
      * The failed branch must remove that service before its context/library is
      * discarded; querying it after the partial transaction must be safe. */
     publishingFailureCreateCalls = 0u;
+    createFailureDestroyCalls = 0u;
     publishedFailureState.starts = 0u;
     publishedFailureState.stops = 0u;
     LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
@@ -480,13 +893,16 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
                LAIUE_MODULE_PARTIAL,
            "partial profile isolates optional create failure after publication");
-    Expect(publishingFailureCreateCalls == 1u, "create failure callback was invoked");
+    Expect(publishingFailureCreateCalls == 1u && createFailureDestroyCalls == 0u,
+           "failed create cleans itself because destroy is not called");
     Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
                                        NULL, NULL) == NULL,
            "create failure removes published service");
     LaiueModuleHostUnloadAll(host);
 
     failingStartCalls = 0u;
+    startFailureStopCalls = 0u;
+    startFailureDestroyCalls = 0u;
     LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 2u);
     LaiueModuleBinaryV1 startPublishedFailure[] = {
         {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
@@ -499,7 +915,9 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport, &diagnostic) ==
                LAIUE_MODULE_PARTIAL,
            "partial profile isolates optional start failure after publication");
-    Expect(failingStartCalls == 1u, "start failure callback was invoked");
+    Expect(failingStartCalls == 1u && startFailureStopCalls == 0u &&
+               startFailureDestroyCalls == 1u,
+           "failed start is cleaned by destroy without calling stop");
     Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
                                        NULL, NULL) == NULL,
            "start failure removes published service");
@@ -510,6 +928,9 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
      * overwriting the first one with the last failed module ID. */
     publishingFailureCreateCalls = 0u;
     failingStartCalls = 0u;
+    createFailureDestroyCalls = 0u;
+    startFailureStopCalls = 0u;
+    startFailureDestroyCalls = 0u;
     LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 3u);
     LaiueModuleBinaryV1 simultaneousFailures[] = {
         {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
@@ -526,6 +947,8 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                LAIUE_MODULE_PARTIAL,
            "partial profile isolates simultaneous callback failures");
     Expect(publishingFailureCreateCalls == 1u && failingStartCalls == 1u &&
+               createFailureDestroyCalls == 0u && startFailureStopCalls == 0u &&
+               startFailureDestroyCalls == 1u &&
                LaiueModuleHostLoadedCount(host) == 1u &&
                profileEntries[0].status == LAIUE_MODULE_PARTIAL &&
                profileEntries[1].status == LAIUE_MODULE_PARTIAL &&
