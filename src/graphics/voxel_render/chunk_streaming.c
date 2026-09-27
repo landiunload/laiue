@@ -203,12 +203,12 @@ static int64_t ChunkCoordinateFromBlock(int64_t block)
     return block % CHUNK_SIZE < 0 ? chunk - 1 : chunk;
 }
 
-typedef enum ChunkEntryState
+enum
 {
     CHUNK_ENTRY_EMPTY = 0,
     CHUNK_ENTRY_PENDING,
     CHUNK_ENTRY_READY,
-} ChunkEntryState;
+};
 
 // PENDING не гасит отрисовку: mesh (если есть) — последняя готовая
 // геометрия, она рисуется, пока рабочий поток строит замену.
@@ -220,7 +220,7 @@ typedef struct ChunkEntry
     RendererMesh* mesh;
     uint64_t revision;      // растёт при инвалидации: устаревшие результаты отбрасываются
     uint32_t drawSlotPlusOne; // 0 — меша нет, иначе позиция в плотном drawItems + 1
-    ChunkEntryState state;
+    uint8_t state; // три значения CHUNK_ENTRY_* помещаются в байт
     bool requestQueued;     // есть ли в очереди заявка текущей ревизии
 } ChunkEntry;
 
