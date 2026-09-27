@@ -186,8 +186,8 @@ struct AudioDevice
 
     // Верхняя граница обхода слотов. Слоты выдаются с младших индексов,
     // поэтому число одновременно звучавших голосов ограничивает и размах.
-    // Поле принадлежит только потоку вывода: его поднимает ApplyCommand при
-    // разборе COMMAND_START, и RenderFrames обходит слоты только до границы.
+    // Поле принадлежит только потоку вывода: ApplyCommand поднимает его при
+    // COMMAND_START, а RenderFrames опускает до последнего активного слота.
     uint32_t voiceScanLimit;
 
     volatile uint32_t masterVolumeBits;
@@ -660,17 +660,26 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
 
     uint32_t active = 0u;
     uint32_t mixedVoices = 0u;
+    uint32_t scanLimit = device->voiceScanLimit;
+    uint32_t activeScanLimit = 0u;
     // Звучащие голоса лежат ниже voiceScanLimit: все они когда-то прошли
     // COMMAND_START на этом же потоке. Пустые хвостовые слоты не обходятся.
-    for (uint32_t index = 0; index < device->voiceScanLimit; ++index)
+    for (uint32_t index = 0; index < scanLimit; ++index)
     {
         VoiceSlot *slot = &device->voices[index];
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
         if (slot->clip == NULL) continue;
         MixVoice(slot, frames, frameCount);
         ++mixedVoices;
-        if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE) ++active;
+        if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE)
+        {
+            ++active;
+            activeScanLimit = index + 1u;
+        }
     }
+    // Reuse the state loads above to trim stopped or naturally finished tail
+    // slots. A later COMMAND_START raises this output-thread-owned boundary.
+    if (activeScanLimit < scanLimit) device->voiceScanLimit = activeScanLimit;
     PlatformAtomicStoreU32Release(&device->activeVoices, active);
 
     // Разобранные команды были, но ни один голос не дожил до микса — буфер
