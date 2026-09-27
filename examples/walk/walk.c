@@ -561,6 +561,7 @@ typedef struct WalkWindowState
     bool ragdollReady;
     bool ragdollGrounded;
     WalkRagdollVisualScratch *ragdollVisualScratch;
+    WalkHumanoidControllerState humanoidController;
     double ragdollFacingYaw;
     double ragdollGaitPhase;
     int64_t ragdollBlockOriginX;
@@ -993,6 +994,7 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
     for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
         if (!VoxelRigidBodyTranslateBlocks(&state->ragdoll.bodies[body], localShift))
             return false;
+    WalkHumanoidControllerRebase(&state->humanoidController, localShift);
     state->ragdollBlockOriginX = nextOriginX;
     state->ragdollBlockOriginY = nextOriginY;
     return true;
@@ -1112,7 +1114,8 @@ static void WalkWindowFrame(void *opaque)
         if (state->ragdollReady)
         {
             const bool stepped = WalkHumanoidStep(
-                state->physicsService, &state->ragdoll, &state->ragdollCollision,
+                state->physicsService, &state->ragdoll,
+                &state->humanoidController, &state->ragdollCollision,
                 &state->ragdollRigidSettings, &state->ragdollSettings,
                 state->ragdollScratch, state->ragdollScratchBytes,
                 worldX, worldY, sprint, jump, fixedStep, &state->ragdollGrounded,
