@@ -412,6 +412,53 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
     float left = slot->gains.left;
     float right = slot->gains.right;
 
+    // Для mono-клипа при точном целом шаге от двух кадров позиция остаётся
+    // целой, так что интерполяция всегда выбирает первый сэмпл. Пропускаем её
+    // и читаем выборки с постоянным шагом; очень короткие клипы оставляем
+    // общей ветви, где сохраняется поведение при нескольких оборотах за шаг.
+    if (clip->channelCount == 1u && step > 1.0 &&
+        step <= (double)clip->frameCount &&
+        step == (double)(uint32_t)step && position <= (double)UINT32_MAX &&
+        position == (double)(uint32_t)position && GainsFoldExact(left, right))
+    {
+        const uint32_t stepFrames = (uint32_t)step;
+        const uint32_t clipFrames = clip->frameCount;
+        const float scaledLeft = left * (1.0f / 32768.0f);
+        const float scaledRight = right * (1.0f / 32768.0f);
+        const int16_t *samples = clip->samples;
+        uint64_t frame = (uint32_t)position;
+        uint32_t index = 0u;
+
+        while (index < frameCount)
+        {
+            if (frame >= clipFrames)
+            {
+                if (!slot->looping)
+                {
+                    slot->clip = NULL;
+                    PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_FINISHED);
+                    slot->position = (double)frame;
+                    return;
+                }
+                frame -= clipFrames;
+            }
+
+            uint32_t run = 1u + (clipFrames - 1u - (uint32_t)frame) / stepFrames;
+            uint32_t count = frameCount - index;
+            if (run < count) count = run;
+            for (uint32_t sample = 0u; sample < count; ++sample)
+            {
+                float mono = (float)samples[(size_t)frame];
+                frames[(index + sample) * 2u] += mono * scaledLeft;
+                frames[(index + sample) * 2u + 1u] += mono * scaledRight;
+                frame += stepFrames;
+            }
+            index += count;
+        }
+        slot->position = (double)frame;
+        return;
+    }
+
     // Целый шаг (частота клипа совпала с частотой устройства при скорости 1):
     // дробная часть позиции в цикле тождественно равна нулю, поэтому
     // интерполяция вырождается в выборку одного кадра, а позиция остаётся

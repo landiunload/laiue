@@ -104,6 +104,7 @@ typedef struct MixScenario
     bool unifiedSpeed;   // true — все голоса со скоростью 1 (целочисленный шаг)
     // 0 keeps every voice; otherwise stop the higher slots before measuring.
     uint32_t activeVoicesAfterStop;
+    float fixedSpeed;    // Overrides unified or varied speed when nonzero.
 } MixScenario;
 
 static uint32_t NextRandom(uint32_t *state)
@@ -191,8 +192,9 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
         AudioVoiceParameters parameters = {
             .volume = 0.5f,
             .pan = ((float)(index % 5u) - 2.0f) * 0.5f,
-            .speed = scenario->unifiedSpeed ? 1.0f
-                                            : 0.75f + (float)(index % 7u) * 0.1f,
+            .speed = scenario->fixedSpeed != 0.0f ? scenario->fixedSpeed
+                     : scenario->unifiedSpeed ? 1.0f
+                                              : 0.75f + (float)(index % 7u) * 0.1f,
             .looping = true,
         };
         handles[index] = AudioVoicePlay(device, clip, &parameters);
@@ -269,6 +271,11 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
         WriteText(" active_after_stop=");
         WriteUnsigned(scenario->activeVoicesAfterStop);
     }
+    if (scenario->fixedSpeed != 0.0f)
+    {
+        WriteText(" speed=");
+        WriteUnsigned((uint32_t)scenario->fixedSpeed);
+    }
     WriteText(" hash=");
     WriteHex(*hashOut);
     WriteText("\n");
@@ -282,17 +289,23 @@ static bool RunScenario(const MixScenario *scenario, uint64_t *hashOut)
 LAIUE_TEST_ENTRY(AudioMixerBenchmarkEntryPoint)
 {
     static const MixScenario scenarios[] = {
-        {"silence", 0u, 1u, DEVICE_SAMPLE_RATE, 20000u, true, 0u},
-        {"mono1_step1", 1u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 0u},
-        {"stereo1_step1", 1u, 2u, DEVICE_SAMPLE_RATE, 4000u, true, 0u},
-        {"mono1_resample", 1u, 1u, 44100u, 4000u, true, 0u},
-        {"mono16", 16u, 1u, DEVICE_SAMPLE_RATE, 1000u, false, 0u},
-        {"stereo16", 16u, 2u, DEVICE_SAMPLE_RATE, 1000u, false, 0u},
-        {"mono64", 64u, 1u, DEVICE_SAMPLE_RATE, 300u, false, 0u},
-        {"stereo64", 64u, 2u, DEVICE_SAMPLE_RATE, 300u, false, 0u},
-        {"mono128", 128u, 1u, DEVICE_SAMPLE_RATE, 150u, false, 0u},
-        {"stereo128", 128u, 2u, DEVICE_SAMPLE_RATE, 150u, false, 0u},
-        {"mono128_tail_trim", 128u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 1u},
+        {"silence", 0u, 1u, DEVICE_SAMPLE_RATE, 20000u, true, 0u, 0.0f},
+        {"mono1_step1", 1u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 0u, 0.0f},
+        {"stereo1_step1", 1u, 2u, DEVICE_SAMPLE_RATE, 4000u, true, 0u, 0.0f},
+        {"mono1_resample", 1u, 1u, 44100u, 4000u, true, 0u, 0.0f},
+        {"mono16", 16u, 1u, DEVICE_SAMPLE_RATE, 1000u, false, 0u, 0.0f},
+        {"stereo16", 16u, 2u, DEVICE_SAMPLE_RATE, 1000u, false, 0u, 0.0f},
+        {"mono64", 64u, 1u, DEVICE_SAMPLE_RATE, 300u, false, 0u, 0.0f},
+        {"stereo64", 64u, 2u, DEVICE_SAMPLE_RATE, 300u, false, 0u, 0.0f},
+        {"mono128", 128u, 1u, DEVICE_SAMPLE_RATE, 150u, false, 0u, 0.0f},
+        {"stereo128", 128u, 2u, DEVICE_SAMPLE_RATE, 150u, false, 0u, 0.0f},
+        {"mono128_tail_trim", 128u, 1u, DEVICE_SAMPLE_RATE, 4000u, true, 1u, 0.0f},
+        {"mono16_step2", 16u, 1u, DEVICE_SAMPLE_RATE, 1000u, true, 0u, 2.0f},
+        {"stereo16_step2", 16u, 2u, DEVICE_SAMPLE_RATE, 1000u, true, 0u, 2.0f},
+        {"mono64_step4", 64u, 1u, DEVICE_SAMPLE_RATE, 300u, true, 0u, 4.0f},
+        {"stereo64_step4", 64u, 2u, DEVICE_SAMPLE_RATE, 300u, true, 0u, 4.0f},
+        {"mono128_step2", 128u, 1u, DEVICE_SAMPLE_RATE, 150u, true, 0u, 2.0f},
+        {"stereo128_step2", 128u, 2u, DEVICE_SAMPLE_RATE, 150u, true, 0u, 2.0f},
     };
 
     WriteText("laiue audio mixer benchmark\n");
