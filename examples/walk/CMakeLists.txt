@@ -63,7 +63,12 @@ endif()
 target_include_directories(laiue_walk PRIVATE
     "${PROJECT_SOURCE_DIR}/src")
 
-    laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)
+    if(WIN32 AND LAIUE_BUILD_GRAPHICS)
+        laiue_configure_standalone_executable(
+            laiue_walk WalkExampleEntryPoint WINDOWED)
+    else()
+        laiue_configure_standalone_executable(laiue_walk WalkExampleEntryPoint)
+    endif()
 endif()
 
 if(ANDROID AND LAIUE_BUILD_ANDROID_WALK)
