@@ -71,6 +71,7 @@ struct AndroidWalkState
     bool ragdollGrounded;
     double ragdollFacingYaw;
     double ragdollGaitPhase;
+    WalkHumanoidControllerState humanoidController;
     int64_t ragdollBlockOriginX;
     int64_t ragdollBlockOriginY;
     const LaiueCharacterServiceV1 *character;
@@ -446,6 +447,7 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
                                 (long long)delta[1]);
             return false;
         }
+    WalkHumanoidControllerRebase(&state->humanoidController, delta);
     state->ragdollBlockOriginX += shiftX;
     state->ragdollBlockOriginY += shiftY;
     return true;
@@ -1267,7 +1269,8 @@ static void AndroidStep(AndroidWalkState *state)
             state->jumpPending = false;
             WalkHumanoidStepFailure stepFailure = WALK_HUMANOID_STEP_OK;
             const bool humanoidStepped = WalkHumanoidStep(
-                    state->physics, &state->ragdoll, &state->ragdollCollision,
+                    state->physics, &state->ragdoll, &state->humanoidController,
+                    &state->ragdollCollision,
                     &state->ragdollRigidSettings, &state->ragdollSettings,
                     state->ragdollScratch, state->ragdollScratchBytes,
                     worldX, worldY, sprint, jump, fixedStep,
