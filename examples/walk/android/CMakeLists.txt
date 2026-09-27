@@ -24,6 +24,7 @@ target_compile_definitions(laiue_walk_android PRIVATE
     LAIUE_WALK_RUNTIME_ONLY=1)
 target_include_directories(laiue_walk_android PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/src/core"
     "${PROJECT_SOURCE_DIR}/src/assets"
     "${PROJECT_SOURCE_DIR}/src/jobs"
     "${PROJECT_SOURCE_DIR}/src/simulation"

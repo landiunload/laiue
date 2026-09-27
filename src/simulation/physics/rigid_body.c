@@ -1348,6 +1348,7 @@ typedef struct RigidStepScratch
     uint32_t *narrowVisits;
     uint32_t batchOffsets[RIGID_SOLVER_BATCH_COUNT + 1u];
     const VoxelRigidStepOptions *options;
+    uint32_t bodyCount;
     uint32_t bucketCount;
     uint32_t candidateCapacity;
     VoxelRigidBroadphase *broadphase;
@@ -1373,6 +1374,28 @@ typedef struct RigidStepScratch
     // обычных коробок для такого вызова отключаются.
     bool compoundScene;
 } RigidStepScratch;
+
+static const uint32_t *StepBodyPairExclusions(const VoxelRigidStepOptions *options,
+                                              uint32_t bodyCount)
+{
+    const size_t countEnd = offsetof(VoxelRigidStepOptions, bodyPairExclusionCount) +
+                            sizeof(options->bodyPairExclusionCount);
+    if (options == NULL || options->structSize < countEnd ||
+        options->bodyPairExclusionCount != bodyCount || bodyCount > 32u)
+        return NULL;
+    return options->bodyPairExclusions;
+}
+
+static bool BodyPairExcluded(const RigidStepScratch *scratch, uint32_t first,
+                             uint32_t second)
+{
+    const uint32_t *exclusions = StepBodyPairExclusions(scratch->options,
+                                                         scratch->bodyCount);
+    if (exclusions == NULL || first >= scratch->bodyCount || second >= 32u)
+        return false;
+    return ((exclusions[first] & (UINT32_C(1) << second)) != 0u) ||
+           ((exclusions[second] & (UINT32_C(1) << first)) != 0u);
+}
 
 static double ProfileNow(const RigidStepScratch *scratch)
 {
@@ -3423,6 +3446,8 @@ static bool WakeContactPair(VoxelRigidBody *bodies, RigidStepScratch *scratch,
                             const VoxelRigidStepSettings *settings, uint32_t first, uint32_t second,
                             uint32_t *queued)
 {
+    if (BodyPairExcluded(scratch, first, second))
+        return true;
     if (!bodies[second].sleeping)
         return true;
     RigidBodyCache *secondCache = &scratch->caches[second];
@@ -3703,6 +3728,8 @@ static void AppendCompoundPairContacts(VoxelRigidBody *bodies, uint32_t first, u
 static void AppendPairContacts(VoxelRigidBody *bodies, uint32_t first, uint32_t second,
                                RigidStepScratch *scratch)
 {
+    if (BodyPairExcluded(scratch, first, second))
+        return;
     if (scratch->stats->candidatePairCount != UINT32_MAX)
     {
         ++scratch->stats->candidatePairCount;
@@ -3840,7 +3867,8 @@ static void GridNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
                             const RigidGridEntry *entry = &scratch->grid[second];
                             if (entry->cell[0] != neighbour[0] || entry->cell[1] != neighbour[1] ||
                                 entry->cell[2] != neighbour[2] || entry->stableOrder <= ordered ||
-                                bodies[second].sleeping)
+                                bodies[second].sleeping ||
+                                BodyPairExcluded(scratch, first, second))
                                 continue;
                             const RigidBodyCache *secondCache = &scratch->caches[second];
                             // The grid only bounds centres, so a neighbouring cell
@@ -4063,6 +4091,8 @@ static void TreeNarrowphaseRange(void *context, uint32_t begin, uint32_t end)
                 {
                     continue;
                 }
+                if (BodyPairExcluded(scratch, first, second))
+                    continue;
                 ++pairs;
                 const RigidBodyCache *secondCache = &scratch->caches[second];
                 BoxManifold manifold;
@@ -6222,9 +6252,24 @@ static bool StepOptionsValid(const VoxelRigidStepOptions *options, const VoxelRi
 {
     if (options == NULL)
         return true;
-    if (options->structSize < sizeof(*options) ||
+    const size_t legacySize = offsetof(VoxelRigidStepOptions, bodyPairExclusions);
+    const size_t exclusionFieldsEnd =
+        offsetof(VoxelRigidStepOptions, bodyPairExclusionCount) +
+        sizeof(options->bodyPairExclusionCount);
+    if (options->structSize < legacySize ||
+        (options->structSize > legacySize && options->structSize < exclusionFieldsEnd) ||
         (options->solverOrder != VOXEL_RIGID_SOLVER_CANONICAL &&
          options->solverOrder != VOXEL_RIGID_SOLVER_COLORED))
+        return false;
+    const uint32_t *bodyPairExclusions = options->structSize >= exclusionFieldsEnd
+                                             ? options->bodyPairExclusions
+                                             : NULL;
+    const uint32_t bodyPairExclusionCount = options->structSize >= exclusionFieldsEnd
+                                                ? options->bodyPairExclusionCount
+                                                : 0u;
+    if ((bodyPairExclusions == NULL && bodyPairExclusionCount != 0u) ||
+        (bodyPairExclusions != NULL &&
+         (bodyPairExclusionCount != bodyCount || bodyCount > 32u)))
         return false;
     const LaiueTaskExecutor *executor = options->executor;
     VoxelRigidStepProfile *profile = options->profile;
@@ -6238,7 +6283,8 @@ static bool StepOptionsValid(const VoxelRigidStepOptions *options, const VoxelRi
     const void *reserved[] = {bodies,   scratch,
                               settings, collision,
                               cache,    cache != NULL ? cache->storage : NULL,
-                              index,    index != NULL ? index->storage : NULL};
+                              index,    index != NULL ? index->storage : NULL,
+                              bodyPairExclusions};
     uint64_t lengths[] = {(uint64_t)bodyCount * sizeof(*bodies),
                           scratchBytes,
                           sizeof(*settings),
@@ -6246,7 +6292,10 @@ static bool StepOptionsValid(const VoxelRigidStepOptions *options, const VoxelRi
                           cache != NULL ? sizeof(*cache) : 0u,
                           cache != NULL ? cache->storageBytes : 0u,
                           index != NULL ? sizeof(*index) : 0u,
-                          index != NULL ? index->storageBytes : 0u};
+                          index != NULL ? index->storageBytes : 0u,
+                          bodyPairExclusions != NULL
+                              ? (uint64_t)bodyPairExclusionCount * sizeof(*bodyPairExclusions)
+                              : 0u};
     const void *descriptors[] = {options, executor, profile};
     uint64_t sizes[] = {options->structSize, executor != NULL ? executor->structSize : 0u,
                         profile != NULL ? profile->structSize : 0u};
@@ -6441,6 +6490,7 @@ static bool RigidBodyStepInternal(VoxelRigidBody *bodies, uint32_t bodyCount,
     cursor += (size_t)bodyCount * sizeof(uint32_t);
     state.buckets = (uint32_t *)cursor;
     state.bucketCount = BucketCountFor(bodyCount);
+    state.bodyCount = bodyCount;
     state.compoundCaches = NULL;
     state.compoundOffsets = NULL;
     state.compoundNodes = NULL;

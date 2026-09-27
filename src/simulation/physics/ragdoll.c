@@ -3,6 +3,7 @@
 #include "physics/numeric_provider.h"
 
 #include <float.h>
+#include <stddef.h>
 #include <string.h>
 
 #define RAGDOLL_STEP_SECONDS (1.0 / 128.0)
@@ -321,16 +322,51 @@ bool VoxelRagdollStep(VoxelRagdoll *ragdoll, const VoxelCollisionSource *collisi
         !(settings->maximumCorrectionSpeed > 0.0) ||
         settings->maximumCorrectionSpeed > RAGDOLL_MAX_CORRECTION_SPEED)
         return false;
-    const bool stepped = options != NULL
-                             ? VoxelRigidBodyStepEx(ragdoll->bodies, ragdoll->bodyCount,
-                                                    collision, rigidSettings, scratch,
-                                                    scratchBytes, options)
-                             : VoxelRigidBodyStep(ragdoll->bodies, ragdoll->bodyCount,
-                                                  collision, rigidSettings, scratch,
-                                                  scratchBytes);
-    if (!stepped)
-        return false;
-    return SolveJoints(ragdoll, settings);
+    VoxelRigidStepOptions filteredOptions = {
+        .structSize = sizeof(filteredOptions),
+        .solverOrder = VOXEL_RIGID_SOLVER_CANONICAL,
+    };
+    const size_t legacyOptionsSize = offsetof(VoxelRigidStepOptions, bodyPairExclusions);
+    const size_t exclusionFieldsEnd =
+        offsetof(VoxelRigidStepOptions, bodyPairExclusionCount) +
+        sizeof(filteredOptions.bodyPairExclusionCount);
+    uint32_t excludedPairs[VOXEL_RAGDOLL_MAX_BODIES] = {0u};
+    if (options != NULL)
+    {
+        if (options->structSize < legacyOptionsSize ||
+            (options->structSize > legacyOptionsSize &&
+             options->structSize < exclusionFieldsEnd))
+            return false;
+        memcpy(&filteredOptions, options, legacyOptionsSize);
+        filteredOptions.structSize = sizeof(filteredOptions);
+        if (options->structSize >= exclusionFieldsEnd)
+        {
+            if ((options->bodyPairExclusions == NULL &&
+                 options->bodyPairExclusionCount != 0u) ||
+                (options->bodyPairExclusions != NULL &&
+                 options->bodyPairExclusionCount != ragdoll->bodyCount))
+                return false;
+            if (options->bodyPairExclusions != NULL)
+                for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+                    excludedPairs[body] = options->bodyPairExclusions[body];
+        }
+    }
+    for (uint32_t index = 0u; index < ragdoll->jointCount; ++index)
+    {
+        const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[index];
+        excludedPairs[joint->bodyA] |= UINT32_C(1) << joint->bodyB;
+        excludedPairs[joint->bodyB] |= UINT32_C(1) << joint->bodyA;
+    }
+    filteredOptions.bodyPairExclusions = excludedPairs;
+    filteredOptions.bodyPairExclusionCount = ragdoll->bodyCount;
+    // Joint impulses are applied before integration/contact resolution so the
+    // rigid solver can prevent connected limbs from crossing other parts in
+    // the same tick. Solving them after contacts lets the final joint impulse
+    // push a limb through an already-solved collision surface.
+    return SolveJoints(ragdoll, settings) &&
+           VoxelRigidBodyStepEx(ragdoll->bodies, ragdoll->bodyCount,
+                                collision, rigidSettings, scratch,
+                                scratchBytes, &filteredOptions);
 }
 
 bool VoxelRagdollDrive(VoxelRagdoll *ragdoll, double directionX, double directionY,

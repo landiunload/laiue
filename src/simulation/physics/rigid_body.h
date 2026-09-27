@@ -189,6 +189,12 @@ typedef struct VoxelRigidStepOptions
     VoxelRigidStepProfile *profile;
     double (*clockSeconds)(void *context);
     void *clockContext;
+    // Optional per-body bit masks. Bit j in entry i excludes the pair (i, j)
+    // from body-body contacts; bodyCount must be <= 32 when supplied. This is
+    // useful for articulated neighbours joined by a constraint. World contacts
+    // remain enabled. The array is borrowed only for this synchronous step.
+    const uint32_t *bodyPairExclusions;
+    uint32_t bodyPairExclusionCount;
 } VoxelRigidStepOptions;
 
 LAIUE_PHYSICS_API void VoxelRigidStepSettingsDefault(VoxelRigidStepSettings *outSettings);

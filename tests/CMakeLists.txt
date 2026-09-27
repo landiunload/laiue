@@ -111,7 +111,8 @@ laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPo
 add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
 
 add_executable(laiue_ragdoll_test ragdoll_test.c)
-target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric)
+target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric
+    laiue::math_support)
 laiue_configure_standalone_executable(laiue_ragdoll_test RagdollTestEntryPoint)
 add_test(NAME laiue.physics.ragdoll COMMAND laiue_ragdoll_test)
 set_tests_properties(laiue.physics.ragdoll PROPERTIES TIMEOUT 30)
