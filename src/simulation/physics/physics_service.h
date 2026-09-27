@@ -1,8 +1,10 @@
 #pragma once
 
 #include "physics/compound_shape.h"
+#include "physics/ragdoll.h"
 #include "physics/rigid_body.h"
 #include "physics/voxel_body.h"
+#include "mod/module_api.h"
 
 #include <stdint.h>
 
@@ -58,4 +60,18 @@ typedef struct LaiuePhysicsServiceV1
     bool (*contactCacheInitialize)(VoxelRigidContactCache *cache, void *storage,
                                    uint32_t bodyCapacity, uint32_t storageBytes);
     void (*contactCacheReset)(VoxelRigidContactCache *cache);
+    /* Optional ABI-v1 tail added after the original physics service fields. */
+    bool (*ragdollInitialize)(VoxelRagdoll *ragdoll,
+                              const VoxelRagdollDefinition *definition);
+    void (*ragdollRelease)(VoxelRagdoll *ragdoll);
+    void (*ragdollSettingsDefault)(VoxelRagdollSettings *outSettings);
+    bool (*ragdollStep)(VoxelRagdoll *ragdoll, const VoxelCollisionSource *collision,
+                        const VoxelRigidStepSettings *rigidSettings,
+                        const VoxelRagdollSettings *settings, void *scratch,
+                        uint32_t scratchBytes, const VoxelRigidStepOptions *options);
+    bool (*ragdollDrive)(VoxelRagdoll *ragdoll, double directionX, double directionY,
+                         double targetSpeed, double maximumAcceleration);
+    bool (*ragdollJump)(VoxelRagdoll *ragdoll, double upwardSpeed);
 } LaiuePhysicsServiceV1;
+
+const LaiueModuleApiV1 *LaiuePhysicsGetStaticModuleApiV1(void);

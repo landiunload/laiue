@@ -2,11 +2,12 @@
 
 This is the smallest public-SDK walk slice. It owns the game-specific base
 provider (grass at `z=0`, earth at `z=-1..-3`, stone below), loads the public
-`laiue.character`, `laiue.voxel`, `laiue.scene`, and `laiue.graphics` service
-tables through the bootstrap, keeps authoritative coordinates as integer cell
-plus local offsets, and advances a kinematic character at 128 Hz. Rendering is
-camera-relative; mouse-look, WASD, sprint, and jump are enabled when the
-corresponding optional platform providers are present.
+`laiue.character`, `laiue.physics`, `laiue.voxel`, `laiue.scene`, and
+`laiue.graphics` service tables through the bootstrap, and advances simulation
+at 128 Hz. Desktop keeps the kinematic character controller; Android runs an
+11-box humanoid ragdoll with pelvis, torso, head, upper/lower arms, thighs, and
+shins. Rendering is camera-relative; mouse-look, WASD, sprint, and jump are
+enabled when the corresponding optional platform providers are present.
 
 The character provider is optional. Without it the window and diagnostic
 surface remain available, but no character is advanced. If the voxel module
@@ -44,7 +45,13 @@ is cleared on pause, surface recreation, and resize. Vulkan 1.3 uses dynamic
 rendering; Vulkan 1.2 devices use the compatible render-pass
 path, so the same APK does not require a 1.3-only device. The sparse
 voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
-character on the example's deterministic infinite base plane.
+ragdoll on the example's deterministic infinite base plane. On Android, the
+lower-left stick drives the ragdoll pelvis relative to the camera, the orange
+button toggles its velocity target, and the purple button adds a jump impulse.
+Each body part is a colliding rigid box joined by a ball joint. The initial
+anchors coincide, and the rigid solver checks contacts between connected parts.
+Joint motors, anatomical angle limits, animation, and foot placement are not
+part of this first physics-driven prototype.
 
 Configure it with the API 35 emulator preset (put the build tree on the
 scratch disk as shown below):
@@ -52,13 +59,15 @@ scratch disk as shown below):
 ```powershell
 $env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk\29.0.14206865'
 cmake --preset android-x86_64-walk-api35 -B D:\build\laiue\android-x86_64-walk
-cmake --build D:\build\laiue\android-x86_64-walk --config Release --target laiue_walk_android
+cmake --build D:\build\laiue\android-x86_64-walk --config Release --target laiue_walk_android_apk
 ```
 
-The result is `android/Release/liblaiue_walk.so` plus the manifest staged by
-the `laiue_walk_android_manifest` target. APK signing/zipalign intentionally
-remain a packaging step. If `ANDROID_SDK_ROOT`/`ANDROID_HOME` points at an SDK
-with build-tools, CMake discovers `aapt2`, `zipalign`, `apksigner` and the
-highest installed `android.jar`; set `LAIUE_ANDROID_KEYSTORE` to enable the
-`laiue_walk_android_apk` target. A keystore is still supplied by the
-application owner, never generated or embedded by the engine.
+The native target produces `android/Release/liblaiue_walk.so` and stages the
+manifest. The `laiue_walk_android_apk` target also embeds the example textures,
+aligns the package, and signs the APK with the supplied keystore. If
+`ANDROID_SDK_ROOT`/`ANDROID_HOME` points at an SDK with build-tools, CMake
+discovers `aapt2`, `zipalign`, `apksigner` and the highest installed
+`android.jar`; set `LAIUE_ANDROID_KEYSTORE` to enable APK packaging. The Android
+build-tools signer needs a Java runtime on `PATH` (for example Android Studio's
+bundled JBR). The keystore remains application-owned and is never generated
+or embedded by the engine.

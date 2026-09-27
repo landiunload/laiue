@@ -25,6 +25,7 @@ target_compile_definitions(laiue_walk_android PRIVATE
 target_include_directories(laiue_walk_android PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/src/assets"
+    "${PROJECT_SOURCE_DIR}/src/jobs"
     "${PROJECT_SOURCE_DIR}/src/simulation"
     "${PROJECT_SOURCE_DIR}/src/graphics"
     "${PROJECT_SOURCE_DIR}/src/modding"
@@ -33,6 +34,8 @@ target_include_directories(laiue_walk_android PRIVATE
 target_link_libraries(laiue_walk_android PRIVATE
     laiue_bootstrap
     laiue_character
+    laiue_numeric
+    laiue_physics
     laiue_render
     laiue_scene_math
     laiue_scene
@@ -47,7 +50,6 @@ if(LAIUE_ANDROID_WALK_WITH_VOXEL)
     # image; relying on the voxel archive alone leaves the numeric/world
     # entrypoints unresolved under --no-undefined.
     target_link_libraries(laiue_walk_android PRIVATE
-        laiue_numeric
         laiue_world
         laiue_voxel)
     target_compile_definitions(laiue_walk_android PRIVATE LAIUE_ANDROID_WALK_WITH_VOXEL=1)
