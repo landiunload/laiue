@@ -160,7 +160,7 @@ typedef struct StressChunkEntry
     RendererMesh* mesh;
     uint64_t revision;
     uint32_t drawSlotPlusOne;
-    int state;
+    uint8_t state;
     bool requestQueued;
 } StressChunkEntry;
 
