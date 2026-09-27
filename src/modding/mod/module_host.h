@@ -102,7 +102,9 @@ LAIUE_MOD_API LaiueModuleHost *LaiueModuleHostCreate(const LaiueModuleHostConfig
                                                        LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleHostDestroy(LaiueModuleHost *host);
 
-/* Host-owned services (window, graphics, input) are registered before load. */
+/* Host-owned services (window, graphics, input) are registered before load.
+ * The service registry is frozen while any module is loaded; register and
+ * unregister return LAIUE_MODULE_BUSY until LaiueModuleHostUnloadAll finishes. */
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostRegisterService(
     LaiueModuleHost *host, const LaiueModuleServiceV1 *service,
     LaiueModuleDiagnostic *diagnostic);
@@ -139,6 +141,13 @@ LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadStatic(
     LaiueModuleHost *host, const LaiueModuleApiV1 *const *apis, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleHostUnloadAll(LaiueModuleHost *host);
+/* These snapshots return zero while a lifecycle operation is in progress. */
 LAIUE_MOD_API uint32_t LaiueModuleHostLoadedCount(const LaiueModuleHost *host);
 /* Fixed-width C ABI result: non-zero when the selected module is loaded. */
 LAIUE_MOD_API uint32_t LaiueModuleHostIsLoaded(const LaiueModuleHost *host, const char *id);
+
+/* Lifecycle calls (load, unload and destroy) must be serialized and must not
+ * be called reentrantly from module callbacks. Service queries are thread-safe,
+ * but return borrowed pointers rather than leases. Before UnloadAll/Destroy,
+ * the application must stop and join every callback, job, or thread that may
+ * still use module services. */
