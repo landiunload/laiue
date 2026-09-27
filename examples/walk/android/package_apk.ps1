@@ -26,7 +26,7 @@ $output = Join-Path $OutputDirectory 'laiue-walk.apk'
 Remove-Item -LiteralPath $unsigned, $aligned, $output -Force -ErrorAction SilentlyContinue
 
 & $Aapt2 link --manifest $Manifest -I $FrameworkJar --min-sdk-version 28 `
-    --target-sdk-version 35 --version-code 5 --version-name 0.9.2 `
+    --target-sdk-version 35 --version-code 6 --version-name 0.9.3 `
     --auto-add-overlay -o $unsigned
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed with exit code $LASTEXITCODE" }
 
