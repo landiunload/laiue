@@ -21,6 +21,8 @@ extern bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetu
 extern void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_D3D12(Renderer* renderer);
 extern void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats);
+extern void RendererGetGpuTiming_D3D12(const Renderer *renderer,
+                                       RendererGpuTimingV1 *outTiming);
 extern void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer);
 extern bool RendererUiSetFontAtlas_D3D12(Renderer* renderer, const uint8_t* alphaPixels, uint32_t width, uint32_t height);
@@ -80,6 +82,8 @@ extern bool RendererBeginFrame_Vulkan(Renderer* renderer, const RendererFrameSet
 extern void RendererBeginScenePass_Vulkan(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_Vulkan(Renderer* renderer);
 extern void RendererGetStats_Vulkan(const Renderer* renderer, RendererStats* outStats);
+extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
+                                        RendererGpuTimingV1 *outTiming);
 extern void RendererSetVerticalSync_Vulkan(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer* renderer);
 extern bool RendererUiSetFontAtlas_Vulkan(Renderer* renderer, const uint8_t* alphaPixels, uint32_t width, uint32_t height);
@@ -355,6 +359,29 @@ void RendererGetStats(const Renderer* renderer, RendererStats* outStats)
         return;
 #endif
     default: break;
+    }
+}
+
+void RendererGetGpuTimingV1(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
+{
+    if (outTiming == NULL) return;
+    memset(outTiming, 0, sizeof(*outTiming));
+    outTiming->structSize = sizeof(*outTiming);
+    if (renderer == NULL) return;
+    switch (RendererGetBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        RendererGetGpuTiming_D3D12(renderer, outTiming);
+        return;
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        RendererGetGpuTiming_Vulkan(renderer, outTiming);
+        return;
+#endif
+    default:
+        return;
     }
 }
 

@@ -432,6 +432,33 @@ if(TARGET laiue_voxel_render)
     add_test(NAME laiue.scene.panorama COMMAND laiue_panorama_test)
 endif()
 if(TARGET laiue_render)
+    # The rolling GPU profile service is backend-independent; exercise its
+    # statistics and input validation without requiring a physical GPU.
+    add_executable(laiue_graphics_profile_test
+        graphics_profile_test.c
+        "${PROJECT_SOURCE_DIR}/src/graphics/profile/profile.c")
+    target_include_directories(laiue_graphics_profile_test PRIVATE
+        "${PROJECT_SOURCE_DIR}/src")
+    target_compile_definitions(laiue_graphics_profile_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_graphics_profile_test GraphicsProfileTestEntryPoint)
+    add_test(NAME laiue.graphics.profile COMMAND laiue_graphics_profile_test)
+
+    if(TARGET laiue_graphics_profile AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_graphics_profile_module_test
+            graphics_profile_module_test.c)
+        target_link_libraries(laiue_graphics_profile_module_test PRIVATE
+            laiue_bootstrap)
+        target_compile_definitions(laiue_graphics_profile_module_test PRIVATE
+            LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_graphics_profile_module_test GraphicsProfileModuleTestEntryPoint)
+        add_dependencies(laiue_graphics_profile_module_test laiue_graphics_profile)
+        add_test(NAME laiue.graphics.profile_module
+            COMMAND laiue_graphics_profile_module_test)
+    endif()
+
     add_executable(laiue_render_pack_api_test render_pack_api_test.c)
     target_link_libraries(laiue_render_pack_api_test PRIVATE
         laiue_content

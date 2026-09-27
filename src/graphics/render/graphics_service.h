@@ -3,6 +3,7 @@
 #include "render/renderer.h"
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_GRAPHICS_SERVICE_NAME "laiue.graphics"
@@ -48,7 +49,21 @@ typedef struct LaiueGraphicsServiceV1
     RendererContentStatus (*getTexturePackLoadStatus)(const Renderer *renderer);
     void (*setWireframe)(Renderer *renderer, bool enabled);
     bool (*isWireframe)(const Renderer *renderer);
+    /* Optional tail extension. Timing is the most recent completed GPU
+     * frame; absence means unsupported, not zero milliseconds. */
+    void (*getGpuTimingV1)(const Renderer *renderer, RendererGpuTimingV1 *outTiming);
 } LaiueGraphicsServiceV1;
+
+// Minimum V1 prefix and safe feature test for consumers that can also run
+// against a renderer module built before the GPU-timing tail was appended.
+#define LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE \
+    ((uint32_t)offsetof(LaiueGraphicsServiceV1, getGpuTimingV1))
+#define LAIUE_GRAPHICS_SERVICE_HAS_GPU_TIMING_V1(service) \
+    ((service) != NULL && \
+     (service)->structSize >= \
+         offsetof(LaiueGraphicsServiceV1, getGpuTimingV1) + \
+             sizeof((service)->getGpuTimingV1) && \
+     (service)->getGpuTimingV1 != NULL)
 
 LAIUE_RENDER_API const LaiueGraphicsServiceV1 *LaiueGraphicsGetStaticServiceV1(void);
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);

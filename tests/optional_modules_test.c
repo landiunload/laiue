@@ -16,6 +16,7 @@
 #include "platform/window_service.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #if defined(_WIN32)
 #define AUDIO_MODULE_NAME L"laiue_audio.dll"
@@ -246,7 +247,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     const LaiueGraphicsServiceV1 *fallbackGraphics =
         (const LaiueGraphicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueGraphicsServiceV1), &version, &size);
+            LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE, &version, &size);
     Expect(fallbackGraphics != NULL && fallbackGraphics->createWithBackend != NULL,
            "graphics service survives missing content provider");
     const LaiueGraphicsDeviceServiceV1 *fallbackDevice =
@@ -403,7 +404,7 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     LaiueModuleHostDestroy(secondRenderHost);
     Expect(LaiueModuleHostQueryService(host, LAIUE_GRAPHICS_SERVICE_NAME,
                                        LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
-                                       sizeof(LaiueGraphicsServiceV1), NULL, NULL) != NULL,
+                                       LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE, NULL, NULL) != NULL,
            "first graphics host remains usable after second host failure");
     LaiueModuleHostUnloadAll(host);
 
@@ -472,7 +473,9 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     const LaiueGraphicsServiceV1 *graphicsService =
         (const LaiueGraphicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_GRAPHICS_SERVICE_NAME, LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueGraphicsServiceV1), &version, &size);
+            LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE, &version, &size);
+    Expect(LAIUE_GRAPHICS_SERVICE_HAS_GPU_TIMING_V1(graphicsService),
+           "the graphics service exposes optional GPU timing");
     const LaiueMesherServiceV1 *mesherService =
         (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
