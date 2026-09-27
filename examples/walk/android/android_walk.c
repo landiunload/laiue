@@ -13,6 +13,8 @@
 #include "walk_runtime.h"
 #include "touch_controls.h"
 #include "../humanoid_ragdoll.h"
+#include "../walk_visuals.h"
+#include "../walk_humanoid.h"
 #include "media/image.h"
 #include "math/scalar.h"
 
@@ -47,26 +49,8 @@
 #define ANDROID_WALK_TOUCH_JOYSTICK_RADIUS 0.16f
 #define ANDROID_WALK_TOUCH_BUTTON_RADIUS 0.095f
 #define ANDROID_WALK_TOUCH_MARGIN 0.06f
-#define ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT 3u
-#define ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT 24u
-#define ANDROID_WALK_TEXTURED_TERRAIN_MIN_X (-64.0f)
-#define ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y (-64.0f)
-#define ANDROID_WALK_TEXTURED_TERRAIN_MAX_X 128.0f
-#define ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y 128.0f
-#define ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS 4u
-#define ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS \
-    (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 3u)
-#define ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS \
-    (ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 2u)
-#define ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS 4u
-#define ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS 8u
-#define ANDROID_WALK_RAGDOLL_JOINT_VERTEX_COUNT \
-    (ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS * \
-     ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS * 6u)
 #define ANDROID_WALK_RAGDOLL_VERTEX_COUNT \
-    (WALK_RAGDOLL_BODY_COUNT * 6u * ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * \
-     ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS * 6u + \
-     WALK_RAGDOLL_JOINT_COUNT * ANDROID_WALK_RAGDOLL_JOINT_VERTEX_COUNT)
+    WALK_RAGDOLL_VISUAL_VERTEX_COUNT
 #define ANDROID_WALK_RAGDOLL_STABLE_ID UINT64_C(0x57414C4B52414744)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
@@ -86,6 +70,7 @@ struct AndroidWalkState
     void *ragdollScratch;
     uint32_t ragdollScratchBytes;
     LaiueGraphicsHandle ragdollBuffer;
+    WalkRagdollVisualScratch *ragdollVisualScratch;
     bool ragdollReady;
     bool ragdollGrounded;
     double ragdollFacingYaw;
@@ -103,8 +88,8 @@ struct AndroidWalkState
     LaiueGraphicsDeviceV2 *device;
     LaiueGraphicsHandle terrainBuffer;
     bool terrainReady;
-    LaiueGraphicsHandle texturedTerrainBuffers[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT];
-    LaiueGraphicsHandle terrainTextures[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT];
+    LaiueGraphicsHandle texturedTerrainBuffers[WALK_VISUAL_TEXTURE_COUNT];
+    LaiueGraphicsHandle terrainTextures[WALK_VISUAL_TEXTURE_COUNT];
     LaiueGraphicsHandle terrainSampler;
     bool texturedTerrainReady;
     const LaiueSceneServiceV1 *scene;
@@ -289,50 +274,24 @@ static void AndroidRagdollQueryBlock(void *context, int64_t x, int64_t y, int64_
 static bool AndroidInitializeRagdoll(AndroidWalkState *state)
 {
     if (state == NULL || state->physics == NULL ||
-        state->physics->configureThread == NULL ||
-        state->physics->stepScratchBytes == NULL ||
-        state->physics->ragdollInitialize == NULL ||
-        state->physics->ragdollSettingsDefault == NULL)
+        state->physics->ragdollInitialize == NULL)
         return false;
-    state->physics->configureThread();
-    const VoxelRagdollDefinition definition = {
-        .stableIdBase = ANDROID_WALK_RAGDOLL_STABLE_ID,
-        .origin = {0.0, 0.0, 0.7},
-        .bodies = walkRagdollBodies,
-        .bodyCount = WALK_RAGDOLL_BODY_COUNT,
-        .joints = walkRagdollJoints,
-        .jointCount = WALK_RAGDOLL_JOINT_COUNT,
-        .rootBody = WALK_RAGDOLL_PELVIS,
-    };
     state->ragdollCollision = (VoxelCollisionSource){
         .context = state,
         .queryBlockPhysics = AndroidRagdollQueryBlock,
     };
-    state->ragdollRigidSettings = (VoxelRigidStepSettings){
-        .gravity = {0.0, 0.0, -9.81},
-        .solverIterations = 16u,
-        .penetrationCorrection = 0.55,
-        .penetrationSlop = 0.005,
-        .sleepLinearSpeed = 0.02,
-        .sleepAngularSpeed = 0.05,
-        .sleepFrames = 30u,
-    };
-    state->physics->ragdollSettingsDefault(&state->ragdollSettings);
-    state->ragdollScratchBytes =
-        state->physics->stepScratchBytes(WALK_RAGDOLL_BODY_COUNT);
-    if (state->ragdollScratchBytes == 0u)
-        return false;
-    state->ragdollScratch = PlatformAllocate(state->ragdollScratchBytes, false);
-    if (state->ragdollScratch == NULL)
-        return false;
-    if (state->physics->ragdollInitialize(&state->ragdoll, &definition) == 0u)
+    const double origin[3] = {0.0, 0.0, 0.7};
+    if (!WalkHumanoidInitialize(
+            state->physics, &state->ragdoll, &state->ragdollCollision, origin,
+            ANDROID_WALK_RAGDOLL_STABLE_ID, &state->ragdollRigidSettings,
+            &state->ragdollSettings, &state->ragdollScratch,
+            &state->ragdollScratchBytes))
     {
-        PlatformFree(state->ragdollScratch);
-        state->ragdollScratch = NULL;
-        state->ragdollScratchBytes = 0u;
         return false;
     }
     state->ragdollReady = true;
+    state->ragdollGrounded = WalkHumanoidIsGrounded(
+        &state->ragdoll, &state->ragdollCollision);
     return true;
 }
 
@@ -354,612 +313,87 @@ static void AndroidDestroyTexturedTerrain(AndroidWalkState *state)
 {
     if (state == NULL)
         return;
-    for (uint32_t index = 0u; index < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT; ++index)
-    {
-        AndroidReleaseGraphicsHandle(state, &state->texturedTerrainBuffers[index]);
-        AndroidReleaseGraphicsHandle(state, &state->terrainTextures[index]);
-    }
-    AndroidReleaseGraphicsHandle(state, &state->terrainSampler);
+    WalkVisualsDestroyTerrain(state->device, state->texturedTerrainBuffers,
+                              state->terrainTextures, &state->terrainSampler);
     state->texturedTerrainReady = false;
 }
 
-static bool AndroidLoadTextureAsset(AndroidWalkState *state, const char *assetPath,
-                                    LaiueGraphicsHandle *outTexture)
+static bool AndroidReadAsset(void *context, const char *assetPath,
+                             uint8_t **outBytes, uint32_t *outSize)
 {
-    if (outTexture != NULL)
-        *outTexture = 0u;
+    AndroidWalkState *state = (AndroidWalkState *)context;
+    if (outBytes != NULL)
+        *outBytes = NULL;
+    if (outSize != NULL)
+        *outSize = 0u;
     if (state == NULL || state->app == NULL || state->app->activity == NULL ||
         state->app->activity->assetManager == NULL || assetPath == NULL ||
-        outTexture == NULL || state->device == NULL ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, createTexture),
-                             sizeof(state->device->createTexture)) ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, uploadTexture),
-                             sizeof(state->device->uploadTexture)) ||
-        state->device->createTexture == NULL || state->device->uploadTexture == NULL)
+        outBytes == NULL || outSize == NULL)
         return false;
-
     AAsset *asset = AAssetManager_open(state->app->activity->assetManager,
                                        assetPath, AASSET_MODE_BUFFER);
     if (asset == NULL)
         return false;
-    const off_t assetLength = AAsset_getLength(asset);
-    if (assetLength <= 0 || (uint64_t)assetLength > UINT32_MAX ||
-        (uint64_t)assetLength > INT32_MAX)
+    const off_t length = AAsset_getLength(asset);
+    if (length <= 0 || (uint64_t)length > UINT32_MAX)
     {
         AAsset_close(asset);
         return false;
     }
-
-    const uint32_t encodedBytes = (uint32_t)assetLength;
-    uint8_t *encoded = (uint8_t *)PlatformAllocate(encodedBytes, false);
-    uint8_t *pixels = NULL;
-    uint8_t *scratch = NULL;
-    uint8_t *generatedMip = NULL;
-    bool succeeded = false;
-    if (encoded == NULL)
-        goto cleanup;
-    uint32_t bytesRead = 0u;
-    while (bytesRead < encodedBytes)
+    const uint32_t size = (uint32_t)length;
+    uint8_t *bytes = (uint8_t *)PlatformAllocate(size, false);
+    uint32_t read = 0u;
+    while (bytes != NULL && read < size)
     {
-        const int32_t result = AAsset_read(asset, encoded + bytesRead,
-                                           encodedBytes - bytesRead);
+        const int32_t result = AAsset_read(asset, bytes + read, size - read);
         if (result <= 0)
-            goto cleanup;
-        bytesRead += (uint32_t)result;
+            break;
+        read += (uint32_t)result;
     }
     AAsset_close(asset);
-    asset = NULL;
-
-    ImageInfo info;
-    memset(&info, 0, sizeof(info));
-    if (ImageInspect(encoded, encodedBytes, &info) != IMAGE_OK ||
-        info.frameCount != 1u || info.frameBytes == 0u ||
-        info.pixelBytes != info.frameBytes || info.width > UINT32_MAX / 4u)
-        goto cleanup;
-    pixels = (uint8_t *)PlatformAllocate(info.pixelBytes, false);
-    if (info.scratchBytes != 0u)
-        scratch = (uint8_t *)PlatformAllocate(info.scratchBytes, false);
-    if (pixels == NULL || (info.scratchBytes != 0u && scratch == NULL) ||
-        ImageDecode(encoded, encodedBytes, &info, pixels, info.pixelBytes,
-                    scratch, info.scratchBytes) != IMAGE_OK)
-        goto cleanup;
-
-    uint32_t mipLevels = 1u;
-    for (uint32_t largestDimension = info.width > info.height ? info.width : info.height;
-         largestDimension > 1u; largestDimension >>= 1u)
-        ++mipLevels;
-    LaiueGraphicsTextureDescV1 description = {
-        .structSize = sizeof(description),
-        .format = LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB,
-        .extent = {info.width, info.height, 1u},
-        .mipLevels = mipLevels,
-        .usageFlags = 0u,
-    };
-    if (state->device->createTexture(state->device, &description, outTexture) == 0u)
-        goto cleanup;
-    const uint8_t *mipSource = pixels;
-    uint32_t mipWidth = info.width;
-    uint32_t mipHeight = info.height;
-    for (uint32_t mipLevel = 0u; mipLevel < mipLevels; ++mipLevel)
+    if (bytes == NULL || read != size)
     {
-        LaiueGraphicsTextureUploadV1 upload = {
-            .structSize = sizeof(upload),
-            .texture = *outTexture,
-            .data = mipSource,
-            .sizeBytes = (uint64_t)mipWidth * mipHeight * 4u,
-            .rowPitchBytes = mipWidth * 4u,
-            .mipLevel = mipLevel,
-        };
-        if (state->device->uploadTexture(state->device, &upload) == 0u)
-            goto cleanup;
-        if (mipLevel + 1u == mipLevels)
-            break;
-
-        const uint32_t nextWidth = mipWidth > 1u ? mipWidth >> 1u : 1u;
-        const uint32_t nextHeight = mipHeight > 1u ? mipHeight >> 1u : 1u;
-        const uint64_t nextBytes = (uint64_t)nextWidth * nextHeight * 4u;
-        if (nextBytes > UINT32_MAX)
-            goto cleanup;
-        uint8_t *nextMip = (uint8_t *)PlatformAllocate((uint32_t)nextBytes, false);
-        if (nextMip == NULL)
-            goto cleanup;
-        ImageResample(mipSource, mipWidth, mipHeight, nextMip, nextWidth, nextHeight);
-        PlatformFree(generatedMip);
-        generatedMip = nextMip;
-        mipSource = generatedMip;
-        mipWidth = nextWidth;
-        mipHeight = nextHeight;
+        PlatformFree(bytes);
+        return false;
     }
-    succeeded = true;
-
-cleanup:
-    if (asset != NULL)
-        AAsset_close(asset);
-    PlatformFree(scratch);
-    PlatformFree(generatedMip);
-    PlatformFree(pixels);
-    PlatformFree(encoded);
-    if (!succeeded)
-        AndroidReleaseGraphicsHandle(state, outTexture);
-    return succeeded;
-}
-
-static LaiueGraphicsVertexV2 AndroidTerrainVertex(float x, float y, float z,
-                                                  float u, float v)
-{
-    LaiueGraphicsVertexV2 vertex = {
-        .position = {x, y, z},
-        .uv = {u, v},
-        .colorRGBA = UINT32_MAX,
-    };
-    return vertex;
-}
-
-static void AndroidAppendTerrainQuad(LaiueGraphicsVertexV2 *vertices,
-                                    uint32_t *vertexCount,
-                                    const float positions[4][3],
-                                    const float uv[4][2])
-{
-    if (vertices == NULL || vertexCount == NULL || positions == NULL || uv == NULL)
-        return;
-    const LaiueGraphicsVertexV2 corners[4] = {
-        AndroidTerrainVertex(positions[0][0], positions[0][1], positions[0][2],
-                             uv[0][0], uv[0][1]),
-        AndroidTerrainVertex(positions[1][0], positions[1][1], positions[1][2],
-                             uv[1][0], uv[1][1]),
-        AndroidTerrainVertex(positions[2][0], positions[2][1], positions[2][2],
-                             uv[2][0], uv[2][1]),
-        AndroidTerrainVertex(positions[3][0], positions[3][1], positions[3][2],
-                             uv[3][0], uv[3][1]),
-    };
-    const uint32_t pattern[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-    for (uint32_t index = 0u; index < 6u; ++index)
-        vertices[(*vertexCount)++] = corners[pattern[index]];
-}
-
-static bool AndroidCreateGenericTerrainBuffer(AndroidWalkState *state,
-                                              const LaiueGraphicsVertexV2 *vertices,
-                                              uint32_t vertexCount,
-                                              LaiueGraphicsHandle *outBuffer)
-{
-    if (outBuffer != NULL)
-        *outBuffer = 0u;
-    if (state == NULL || state->device == NULL || vertices == NULL ||
-        vertexCount == 0u || outBuffer == NULL ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, createBuffer),
-                             sizeof(state->device->createBuffer)) ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                             sizeof(state->device->uploadBuffer)) ||
-        state->device->createBuffer == NULL || state->device->uploadBuffer == NULL)
-        return false;
-    LaiueGraphicsBufferDescV1 description = {
-        .structSize = sizeof(description),
-        .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
-        .sizeBytes = (uint64_t)vertexCount * sizeof(*vertices),
-    };
-    if (state->device->createBuffer(state->device, &description, outBuffer) == 0u)
-        return false;
-    LaiueGraphicsBufferUploadV1 upload = {
-        .structSize = sizeof(upload),
-        .buffer = *outBuffer,
-        .data = vertices,
-        .sizeBytes = description.sizeBytes,
-    };
-    if (state->device->uploadBuffer(state->device, &upload) != 0u)
-        return true;
-    AndroidReleaseGraphicsHandle(state, outBuffer);
-    return false;
+    *outBytes = bytes;
+    *outSize = size;
+    return true;
 }
 
 static bool AndroidCreateRagdollBuffer(AndroidWalkState *state)
 {
     if (state == NULL || !state->ragdollReady || state->ragdollBuffer != 0u)
         return false;
-    LaiueGraphicsVertexV2 vertices[ANDROID_WALK_RAGDOLL_VERTEX_COUNT] = {{0}};
-    if (!AndroidCreateGenericTerrainBuffer(state, vertices,
-                                           ANDROID_WALK_RAGDOLL_VERTEX_COUNT,
-                                           &state->ragdollBuffer))
-        return false;
-    return true;
-}
-
-static bool AndroidWriteRagdollVertex(LaiueGraphicsVertexV2 *output,
-                                      const AndroidWalkState *state,
-                                      const double center[3], const float rotation[9],
-                                      const double local[3], float u, float v,
-                                      uint32_t color)
-{
-    if (output == NULL || state == NULL || center == NULL || rotation == NULL ||
-        local == NULL)
-        return false;
-    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    state->ragdollVisualScratch =
+        (WalkRagdollVisualScratch *)PlatformAllocate(sizeof(*state->ragdollVisualScratch),
+                                                     false);
+    if (state->ragdollVisualScratch == NULL ||
+        !WalkVisualsCreateRagdollBuffer(state->device, &state->ragdollBuffer))
     {
-        const double world = center[axis] - state->renderOrigin[axis] +
-            (double)rotation[axis] * local[0] +
-            (double)rotation[3u + axis] * local[1] +
-            (double)rotation[6u + axis] * local[2];
-        if (!isfinite(world) || fabs(world) > 1000000.0)
-            return false;
-        output->position[axis] = (float)world;
+        PlatformFree(state->ragdollVisualScratch);
+        state->ragdollVisualScratch = NULL;
+        return false;
     }
-    output->uv[0] = u;
-    output->uv[1] = v;
-    output->colorRGBA = color;
     return true;
 }
 
 static bool AndroidUpdateRagdollBuffer(AndroidWalkState *state)
 {
-    static const uint8_t faceQuad[6][4] = {
-        {0u, 1u, 2u, 3u}, {4u, 7u, 6u, 5u}, {0u, 4u, 5u, 1u},
-        {3u, 2u, 6u, 7u}, {0u, 3u, 7u, 4u}, {1u, 5u, 6u, 2u},
-    };
-    static const uint32_t colors[WALK_RAGDOLL_BODY_COUNT] = {
-        UINT32_C(0xFF389AE3), UINT32_C(0xFFD67F52), UINT32_C(0xFFA4C9F0),
-        UINT32_C(0xFFD67F52), UINT32_C(0xFFD67F52), UINT32_C(0xFFB8683F),
-        UINT32_C(0xFFB8683F), UINT32_C(0xFF6BA64D), UINT32_C(0xFF6BA64D),
-        UINT32_C(0xFF508035), UINT32_C(0xFF508035), UINT32_C(0xFF313C45),
-        UINT32_C(0xFF313C45),
-    };
-    if (state == NULL || !state->ragdollReady ||
-        state->ragdoll.bodyCount != WALK_RAGDOLL_BODY_COUNT ||
-        state->ragdollBuffer == 0u || state->device == NULL ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                             sizeof(state->device->uploadBuffer)) ||
-        state->device->uploadBuffer == NULL)
-        return false;
-    LaiueGraphicsVertexV2 vertices[ANDROID_WALK_RAGDOLL_VERTEX_COUNT];
-    uint32_t vertexIndex = 0u;
-    for (uint32_t bodyIndex = 0u; bodyIndex < state->ragdoll.bodyCount; ++bodyIndex)
-    {
-        const VoxelRigidBody *body = &state->ragdoll.bodies[bodyIndex];
-        double center[3];
-        float rotation[9];
-        if (!VoxelRigidBodyLocalPosition(body, center))
-            return false;
-        VoxelRigidBodyOrientationMatrix(body, rotation);
-        if (bodyIndex == WALK_RAGDOLL_HEAD)
-        {
-            static const uint8_t triangleCorner[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-            const double pi = 3.14159265358979323846;
-            for (uint32_t latitude = 0u;
-                 latitude < ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS; ++latitude)
-                for (uint32_t longitude = 0u;
-                     longitude < ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
-                     ++longitude)
-                {
-                    const double latitude0 = -0.5 * pi + pi * (double)latitude /
-                        ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS;
-                    const double latitude1 = -0.5 * pi + pi * (double)(latitude + 1u) /
-                        ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS;
-                    const double longitude0 = 2.0 * pi * (double)longitude /
-                        ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
-                    const double longitude1 = 2.0 * pi * (double)(longitude + 1u) /
-                        ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS;
-                    const double latitudeSin[2] = {
-                        ScalarSin((float)latitude0), ScalarSin((float)latitude1),
-                    };
-                    const double latitudeCos[2] = {
-                        ScalarCos((float)latitude0), ScalarCos((float)latitude1),
-                    };
-                    const double longitudeSin[2] = {
-                        ScalarSin((float)longitude0), ScalarSin((float)longitude1),
-                    };
-                    const double longitudeCos[2] = {
-                        ScalarCos((float)longitude0), ScalarCos((float)longitude1),
-                    };
-                    const double points[4][3] = {
-                        {body->halfExtent[0] * latitudeCos[0] * longitudeCos[0],
-                         body->halfExtent[1] * latitudeCos[0] * longitudeSin[0],
-                         body->halfExtent[2] * latitudeSin[0]},
-                        {body->halfExtent[0] * latitudeCos[0] * longitudeCos[1],
-                         body->halfExtent[1] * latitudeCos[0] * longitudeSin[1],
-                         body->halfExtent[2] * latitudeSin[0]},
-                        {body->halfExtent[0] * latitudeCos[1] * longitudeCos[1],
-                         body->halfExtent[1] * latitudeCos[1] * longitudeSin[1],
-                         body->halfExtent[2] * latitudeSin[1]},
-                        {body->halfExtent[0] * latitudeCos[1] * longitudeCos[0],
-                         body->halfExtent[1] * latitudeCos[1] * longitudeSin[0],
-                         body->halfExtent[2] * latitudeSin[1]},
-                    };
-                    for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                    {
-                        const uint32_t corner = triangleCorner[vertex];
-                        LaiueGraphicsVertexV2 *output = &vertices[vertexIndex++];
-                        if (!AndroidWriteRagdollVertex(
-                                output, state, center, rotation, points[corner],
-                                (float)((longitude + (corner == 1u || corner == 2u)) /
-                                        (double)ANDROID_WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS),
-                                (float)((latitude + (corner >= 2u)) /
-                                        (double)ANDROID_WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS),
-                                colors[bodyIndex]))
-                            return false;
-                    }
-                }
-            continue;
-        }
-        double corners[8][3];
-        for (uint32_t corner = 0u; corner < 8u; ++corner)
-        {
-            corners[corner][0] =
-                (corner & 1u) != 0u ? body->halfExtent[0] : -body->halfExtent[0],
-            corners[corner][1] =
-                (corner & 2u) != 0u ? body->halfExtent[1] : -body->halfExtent[1];
-            corners[corner][2] =
-                (corner & 4u) != 0u ? body->halfExtent[2] : -body->halfExtent[2];
-        }
-        const double bevel = fmin(body->halfExtent[0],
-                                  fmin(body->halfExtent[1],
-                                       body->halfExtent[2])) * 0.82;
-        for (uint32_t face = 0u; face < 6u; ++face)
-            for (uint32_t cellY = 0u; cellY < ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                 ++cellY)
-                for (uint32_t cellX = 0u; cellX < ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                     ++cellX)
-            {
-                const double u0 = (double)cellX /
-                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                const double u1 = (double)(cellX + 1u) /
-                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                const double v0 = (double)cellY /
-                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                const double v1 = (double)(cellY + 1u) /
-                                  ANDROID_WALK_RAGDOLL_BEVEL_SEGMENTS;
-                const double uv[6][2] = {
-                    {u0, v0}, {u1, v0}, {u1, v1},
-                    {u0, v0}, {u1, v1}, {u0, v1},
-                };
-                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                {
-                    double local[3];
-                    for (uint32_t axis = 0u; axis < 3u; ++axis)
-                    {
-                        const double low = corners[faceQuad[face][0]][axis];
-                        const double high = corners[faceQuad[face][1]][axis];
-                        const double farHigh = corners[faceQuad[face][2]][axis];
-                        const double farLow = corners[faceQuad[face][3]][axis];
-                        const double near = low + (high - low) * uv[vertex][0];
-                        const double far = farLow + (farHigh - farLow) * uv[vertex][0];
-                        local[axis] = near + (far - near) * uv[vertex][1];
-                    }
-                    double inner[3];
-                    double roundedOffset[3];
-                    double offsetLengthSquared = 0.0;
-                    for (uint32_t axis = 0u; axis < 3u; ++axis)
-                    {
-                        const double limit = fmax(0.0, body->halfExtent[axis] - bevel);
-                        inner[axis] = fmax(-limit, fmin(limit, local[axis]));
-                        roundedOffset[axis] = local[axis] - inner[axis];
-                        offsetLengthSquared += roundedOffset[axis] * roundedOffset[axis];
-                    }
-                    const double offsetLength = sqrt(offsetLengthSquared);
-                    double rounded[3];
-                    for (uint32_t axis = 0u; axis < 3u; ++axis)
-                        rounded[axis] = offsetLength > 1.0e-9
-                            ? inner[axis] + roundedOffset[axis] * bevel / offsetLength
-                            : local[axis];
-                    LaiueGraphicsVertexV2 *output = &vertices[vertexIndex++];
-                    for (uint32_t axis = 0u; axis < 3u; ++axis)
-                    {
-                        const double world = center[axis] - state->renderOrigin[axis] +
-                            (double)rotation[axis] * rounded[0] +
-                            (double)rotation[3u + axis] * rounded[1] +
-                            (double)rotation[6u + axis] * rounded[2];
-                        if (!isfinite(world) || fabs(world) > 1000000.0)
-                            return false;
-                        output->position[axis] = (float)world;
-                    }
-                    output->uv[0] = (float)uv[vertex][0];
-                    output->uv[1] = (float)uv[vertex][1];
-                    const uint32_t shade = face == 1u ? 255u :
-                                           (face < 2u ? 238u : 205u);
-                    const uint32_t base = colors[bodyIndex];
-                    const uint32_t red = ((base >> 0u) & 0xFFu) * shade / 255u;
-                    const uint32_t green = ((base >> 8u) & 0xFFu) * shade / 255u;
-                    const uint32_t blue = ((base >> 16u) & 0xFFu) * shade / 255u;
-                    output->colorRGBA = (base & UINT32_C(0xFF000000)) |
-                                        (blue << 16u) | (green << 8u) | red;
-                }
-            }
-    }
-    /* The collision bodies stay separate boxes. Small render-only spheres
-     * at their ball joints hide the seams without changing deterministic
-     * contacts or making the physical limbs wider. */
-    static const uint8_t triangleCorner[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-    static const float identity[9] = {1.0f, 0.0f, 0.0f,
-                                      0.0f, 1.0f, 0.0f,
-                                      0.0f, 0.0f, 1.0f};
-    const double pi = 3.14159265358979323846;
-    double jointLatitudeSin[ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
-    double jointLatitudeCos[ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
-    double jointLongitudeSin[ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
-    double jointLongitudeCos[ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
-    for (uint32_t index = 0u;
-         index <= ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS; ++index)
-    {
-        const double angle = -0.5 * pi + pi * (double)index /
-            ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
-        jointLatitudeSin[index] = ScalarSin((float)angle);
-        jointLatitudeCos[index] = ScalarCos((float)angle);
-    }
-    for (uint32_t index = 0u;
-         index <= ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS; ++index)
-    {
-        const double angle = 2.0 * pi * (double)index /
-            ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS;
-        jointLongitudeSin[index] = ScalarSin((float)angle);
-        jointLongitudeCos[index] = ScalarCos((float)angle);
-    }
-    for (uint32_t jointIndex = 0u; jointIndex < state->ragdoll.jointCount;
-         ++jointIndex)
-    {
-        const VoxelRagdollBallJointDefinition *joint =
-            &state->ragdoll.joints[jointIndex];
-        const VoxelRigidBody *parent = &state->ragdoll.bodies[joint->bodyA];
-        const VoxelRigidBody *child = &state->ragdoll.bodies[joint->bodyB];
-        double center[3];
-        float rotation[9];
-        if (!VoxelRigidBodyLocalPosition(parent, center))
-            return false;
-        VoxelRigidBodyOrientationMatrix(parent, rotation);
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-            center[axis] += (double)rotation[axis] * joint->anchorA[0] +
-                            (double)rotation[3u + axis] * joint->anchorA[1] +
-                            (double)rotation[6u + axis] * joint->anchorA[2];
-        double smallestExtent = DBL_MAX;
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-        {
-            const double extent = fmin(parent->halfExtent[axis],
-                                       child->halfExtent[axis]);
-            if (extent < smallestExtent)
-                smallestExtent = extent;
-        }
-        const double radius = smallestExtent * 0.88;
-        for (uint32_t latitude = 0u;
-             latitude < ANDROID_WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
-             ++latitude)
-            for (uint32_t longitude = 0u;
-                 longitude < ANDROID_WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS;
-                 ++longitude)
-            {
-                const double latitudeSin[2] = {
-                    jointLatitudeSin[latitude], jointLatitudeSin[latitude + 1u],
-                };
-                const double latitudeCos[2] = {
-                    jointLatitudeCos[latitude], jointLatitudeCos[latitude + 1u],
-                };
-                const double longitudeSin[2] = {
-                    jointLongitudeSin[longitude], jointLongitudeSin[longitude + 1u],
-                };
-                const double longitudeCos[2] = {
-                    jointLongitudeCos[longitude], jointLongitudeCos[longitude + 1u],
-                };
-                const double points[4][3] = {
-                    {radius * latitudeCos[0] * longitudeCos[0],
-                     radius * latitudeCos[0] * longitudeSin[0],
-                     radius * latitudeSin[0]},
-                    {radius * latitudeCos[0] * longitudeCos[1],
-                     radius * latitudeCos[0] * longitudeSin[1],
-                     radius * latitudeSin[0]},
-                    {radius * latitudeCos[1] * longitudeCos[1],
-                     radius * latitudeCos[1] * longitudeSin[1],
-                     radius * latitudeSin[1]},
-                    {radius * latitudeCos[1] * longitudeCos[0],
-                     radius * latitudeCos[1] * longitudeSin[0],
-                     radius * latitudeSin[1]},
-                };
-                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                {
-                    const uint32_t corner = triangleCorner[vertex];
-                    if (!AndroidWriteRagdollVertex(
-                            &vertices[vertexIndex++], state, center, identity,
-                            points[corner], 0.0f, 0.0f,
-                            colors[joint->bodyA]))
-                        return false;
-                }
-            }
-    }
-    if (vertexIndex != ANDROID_WALK_RAGDOLL_VERTEX_COUNT)
-        return false;
-    LaiueGraphicsBufferUploadV1 upload = {
-        .structSize = sizeof(upload),
-        .buffer = state->ragdollBuffer,
-        .data = vertices,
-        .sizeBytes = sizeof(vertices),
-    };
-    return state->device->uploadBuffer(state->device, &upload) != 0u;
-}
-
-static void AndroidBuildTerrainSkirt(LaiueGraphicsVertexV2 *vertices,
-                                     float bottomZ, float topZ)
-{
-    const float minX = ANDROID_WALK_TEXTURED_TERRAIN_MIN_X;
-    const float minY = ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y;
-    const float maxX = ANDROID_WALK_TEXTURED_TERRAIN_MAX_X;
-    const float maxY = ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y;
-    const float padding = 0.01f;
-    const float uvSide[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
-                                {24.0f, (topZ - bottomZ) / 8.0f},
-                                {0.0f, (topZ - bottomZ) / 8.0f}};
-    const float faces[4][4][3] = {
-        {{minX, minY - padding, bottomZ}, {maxX, minY - padding, bottomZ},
-         {maxX, minY - padding, topZ}, {minX, minY - padding, topZ}},
-        {{maxX + padding, minY, bottomZ}, {maxX + padding, maxY, bottomZ},
-         {maxX + padding, maxY, topZ}, {maxX + padding, minY, topZ}},
-        {{maxX, maxY + padding, bottomZ}, {minX, maxY + padding, bottomZ},
-         {minX, maxY + padding, topZ}, {maxX, maxY + padding, topZ}},
-        {{minX - padding, maxY, bottomZ}, {minX - padding, minY, bottomZ},
-         {minX - padding, minY, topZ}, {minX - padding, maxY, topZ}},
-    };
-    uint32_t vertexCount = 0u;
-    for (uint32_t face = 0u; face < 4u; ++face)
-        AndroidAppendTerrainQuad(vertices, &vertexCount, faces[face], uvSide);
+    return state != NULL && state->ragdollReady &&
+           WalkVisualsUpdateRagdollBuffer(state->device, state->ragdollBuffer,
+                                          &state->ragdoll, state->renderOrigin,
+                                          state->ragdollVisualScratch);
 }
 
 static bool AndroidCreateTexturedTerrain(AndroidWalkState *state)
 {
-    static const char *const textureAssets[ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT] = {
-        "textures/grass.png", "textures/dirt.png", "textures/stone.png",
-    };
-    if (state == NULL || state->device == NULL ||
-        !AndroidFieldPresent(state->device->structSize, state->device->structSize,
-                             offsetof(LaiueGraphicsDeviceV2, createSampler),
-                             sizeof(state->device->createSampler)) ||
-        state->device->createSampler == NULL)
+    if (state == NULL)
         return false;
-    for (uint32_t index = 0u; index < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT; ++index)
-        if (!AndroidLoadTextureAsset(state, textureAssets[index],
-                                     &state->terrainTextures[index]))
-            goto failed;
-
-    LaiueGraphicsSamplerDescV1 sampler = {
-        .structSize = sizeof(sampler),
-        .minFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
-        .magFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
-        .addressModeU = LAIUE_GRAPHICS_ADDRESS_REPEAT,
-        .addressModeV = LAIUE_GRAPHICS_ADDRESS_REPEAT,
-        .addressModeW = LAIUE_GRAPHICS_ADDRESS_REPEAT,
-    };
-    if (state->device->createSampler(state->device, &sampler,
-                                     &state->terrainSampler) == 0u)
-        goto failed;
-
-    LaiueGraphicsVertexV2 top[6];
-    const float topPositions[4][3] = {
-        {ANDROID_WALK_TEXTURED_TERRAIN_MIN_X, ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y, 1.01f},
-        {ANDROID_WALK_TEXTURED_TERRAIN_MAX_X, ANDROID_WALK_TEXTURED_TERRAIN_MIN_Y, 1.01f},
-        {ANDROID_WALK_TEXTURED_TERRAIN_MAX_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
-        {ANDROID_WALK_TEXTURED_TERRAIN_MIN_X, ANDROID_WALK_TEXTURED_TERRAIN_MAX_Y, 1.01f},
-    };
-    const float topUv[4][2] = {{0.0f, 0.0f}, {24.0f, 0.0f},
-                               {24.0f, 24.0f}, {0.0f, 24.0f}};
-    uint32_t topCount = 0u;
-    AndroidAppendTerrainQuad(top, &topCount, topPositions, topUv);
-
-    LaiueGraphicsVertexV2 dirt[ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT];
-    LaiueGraphicsVertexV2 stone[ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT];
-    AndroidBuildTerrainSkirt(dirt, -3.0f, 1.0f);
-    AndroidBuildTerrainSkirt(stone, -7.0f, -3.0f);
-    if (!AndroidCreateGenericTerrainBuffer(state, top, topCount,
-                                           &state->texturedTerrainBuffers[0]) ||
-        !AndroidCreateGenericTerrainBuffer(state, dirt,
-                                           ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT,
-                                           &state->texturedTerrainBuffers[1]) ||
-        !AndroidCreateGenericTerrainBuffer(state, stone,
-                                           ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT,
-                                           &state->texturedTerrainBuffers[2]))
-        goto failed;
-    state->texturedTerrainReady = true;
-    return true;
-
-failed:
-    AndroidDestroyTexturedTerrain(state);
-    return false;
+    state->texturedTerrainReady = WalkVisualsCreateTerrain(
+        state->device, AndroidReadAsset, state, state->texturedTerrainBuffers,
+        state->terrainTextures, &state->terrainSampler);
+    return state->texturedTerrainReady;
 }
 
 static void AndroidDestroyDevice(AndroidWalkState *state)
@@ -967,6 +401,8 @@ static void AndroidDestroyDevice(AndroidWalkState *state)
     if (state == NULL)
         return;
     AndroidReleaseGraphicsHandle(state, &state->ragdollBuffer);
+    PlatformFree(state->ragdollVisualScratch);
+    state->ragdollVisualScratch = NULL;
     if (state->terrainReady && state->device != NULL &&
         AndroidFieldPresent(state->device->structSize, state->device->structSize,
                             offsetof(LaiueGraphicsDeviceV2, destroyHandle),
@@ -1532,38 +968,22 @@ static void AndroidStep(AndroidWalkState *state)
             strafe, forwardInput, forward[0], forward[1], &worldX, &worldY);
         if (ragdollCanStep)
         {
-            const double targetSpeed = state->keyDown[4] || state->sprintToggled ? 4.2 : 2.6;
-            const double inputMagnitude = sqrt((double)worldX * worldX +
-                                               (double)worldY * worldY);
-            const double gaitAmount = fmin(1.0, inputMagnitude);
-            if (gaitAmount > 1.0e-3)
-                state->ragdollFacingYaw = ScalarAtan2(-worldX, worldY);
-            state->ragdollGaitPhase += targetSpeed * gaitAmount * fixedStep * 4.8;
-            if (state->ragdollGaitPhase >= 6.2831853071795864769)
-                state->ragdollGaitPhase -= 6.2831853071795864769;
-            if (state->jumpPending)
-                (void)WalkRagdollJumpIfGrounded(&state->ragdoll,
-                                                &state->ragdollCollision, 5.0);
+            const bool sprint = state->keyDown[4] || state->sprintToggled;
+            const bool jump = state->jumpPending;
             state->jumpPending = false;
-            const double driveAcceleration = state->ragdollGrounded ? 8.0 : 2.5;
-            if (!WalkRagdollDrivePlanar(&state->ragdoll, worldX, worldY,
-                                        targetSpeed, driveAcceleration, fixedStep) ||
-                !WalkRagdollPoseDrive(&state->ragdoll, state->ragdollFacingYaw,
-                                      state->ragdollGaitPhase, gaitAmount, fixedStep) ||
-                !state->physics->ragdollStep(&state->ragdoll,
-                                             &state->ragdollCollision,
-                                             &state->ragdollRigidSettings,
-                                             &state->ragdollSettings,
-                                             state->ragdollScratch,
-                                             state->ragdollScratchBytes, NULL))
+            if (!WalkHumanoidStep(
+                    state->physics, &state->ragdoll, &state->ragdollCollision,
+                    &state->ragdollRigidSettings, &state->ragdollSettings,
+                    state->ragdollScratch, state->ragdollScratchBytes,
+                    worldX, worldY, sprint, jump, fixedStep,
+                    &state->ragdollGrounded, &state->ragdollFacingYaw,
+                    &state->ragdollGaitPhase))
             {
                 AndroidLog(state, ANDROID_LOG_ERROR,
                            "deterministic ragdoll step failed");
                 state->running = false;
                 break;
             }
-            state->ragdollGrounded = WalkRagdollGrounded(
-                &state->ragdoll, &state->ragdollCollision);
         }
         else
         {
@@ -1655,12 +1075,12 @@ static void AndroidStep(AndroidWalkState *state)
                         }
                 if (state->texturedTerrainReady)
                     for (uint32_t material = 0u;
-                         material < ANDROID_WALK_TEXTURED_TERRAIN_MATERIAL_COUNT;
+                         material < WALK_VISUAL_TEXTURE_COUNT;
                          ++material)
                     {
                         const uint32_t vertexCount = material == 0u
                                                          ? 6u
-                                                         : ANDROID_WALK_TEXTURED_TERRAIN_VERTEX_COUNT;
+                                                         : WALK_TERRAIN_SKIRT_VERTEX_COUNT;
                         draws[drawIndex] = (LaiueGraphicsDrawItemV2){
                             .structSize = sizeof(draws[drawIndex]),
                             .vertexBuffer = state->texturedTerrainBuffers[material],
@@ -1801,10 +1221,8 @@ void android_main(struct android_app *app)
     }
 
     AndroidDestroyDevice(&state);
-    if (state.ragdollReady && state.physics != NULL &&
-        state.physics->ragdollRelease != NULL)
-        state.physics->ragdollRelease(&state.ragdoll);
-    PlatformFree(state.ragdollScratch);
+    WalkHumanoidRelease(state.physics, &state.ragdoll, &state.ragdollScratch);
+    state.ragdollScratchBytes = 0u;
     if (state.controller != NULL && state.character != NULL &&
         AndroidFieldPresent(state.characterServiceSize, state.character->structSize,
                             offsetof(LaiueCharacterServiceV1, destroy),
