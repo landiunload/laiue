@@ -180,7 +180,7 @@ typedef struct StressChunkStreaming
     int64_t centerY;
     int64_t centerZ;
     StressChunkEntry* entries;
-    StressChunkEntry* rebuildScratch;
+    void* rebuildScratch;
     uint32_t capacity;
     StressDrawItem* drawItems;
     uint32_t drawItemCount;
@@ -816,6 +816,17 @@ static void RunOriginChangeScenario(int32_t radius, uint32_t iterations)
     StressSettle(handle);
     StressVerify(handle, shadow, false);
 
+    // A same-origin rebuild deterministically copies live meshes through the
+    // compact scratch records before the randomized origin-change coverage.
+    StressInjectInteriorMeshes(handle, 0, 0, 0);
+    StressVerify(handle, shadow, false);
+    EXPECT(ChunkStreamingResumeAfterOriginChange(handle, true,
+               0, 0, 0, 0, 0, 0),
+        "same-origin rebuild failed");
+    EXPECT(((StressChunkStreaming*)handle)->drawItemCount != 0u,
+        "origin rebuild discarded all injected meshes");
+    StressVerify(handle, shadow, false);
+
     int64_t centerX = 0;
     int64_t centerY = 0;
     int64_t centerZ = 0;
@@ -832,7 +843,7 @@ static void RunOriginChangeScenario(int32_t radius, uint32_t iterations)
         const int64_t nextY = centerY + StressSigned(&state, 4);
         const int64_t nextZ = centerZ + StressSigned(&state, 4);
 
-        // Мешей нет, поэтому смена origin собирает таблицу заново из куба.
+        // Смена origin собирает таблицу заново и переносит оставшиеся меши.
         StressSetClear(shadow);
         StressAddCube(shadow, nextX, nextY, nextZ, radius);
         (void)ChunkStreamingResumeAfterOriginChange(handle, originDeltaFits,
