@@ -391,6 +391,38 @@ static void TestFreeSpinPersists(void)
     VoxelRigidBodyRelease(&body);
 }
 
+static void TestLinearMotionPreservesQuaternionWithoutSpin(void)
+{
+    static RigidHarness harness;
+    HarnessInit(&harness, false);
+    harness.settings.gravity[0] = 0.0;
+    harness.settings.gravity[1] = 0.0;
+    harness.settings.gravity[2] = 0.0;
+
+    VoxelRigidBody body;
+    VoxelRigidBodyDescription description;
+    DescribeCube(&description, 0.0, 0.0, 20.0);
+    RigidExpect(VoxelRigidBodyInitialize(&body, 1u, &description), "тело создано");
+    body.orientation[2] = 0.3826834323650898;
+    body.orientation[3] = 0.9238795325112867;
+
+    const double linear[3] = {2.0, -1.0, 0.5};
+    RigidExpect(VoxelRigidBodyAddLinearVelocity(&body, linear), "поступательная скорость задана");
+    double initialOrientation[4];
+    memcpy(initialOrientation, body.orientation, sizeof(initialOrientation));
+
+    RigidExpect(Advance(&harness, &body, 1u, 128u), "шаги выполнены");
+    RigidExpect(memcmp(initialOrientation, body.orientation, sizeof(initialOrientation)) == 0,
+                "без угловой скорости ориентация побитово неизменна");
+
+    double position[3];
+    RigidExpect(VoxelRigidBodyLocalPosition(&body, position), "позиция читается");
+    RigidExpect(Near(position[0], 2.0, 1e-9) && Near(position[1], -1.0, 1e-9) &&
+                    Near(position[2], 20.5, 1e-9),
+                "нулевое вращение не мешает поступательному движению");
+    VoxelRigidBodyRelease(&body);
+}
+
 static void TestPointVelocityCarries(void)
 {
     VoxelRigidBody body;
@@ -1166,6 +1198,7 @@ LAIUE_TEST_ENTRY(RigidBodyTestEntryPoint)
     TestOverhangingBoxKeepsContact();
     TestTipsOverEdge();
     TestFreeSpinPersists();
+    TestLinearMotionPreservesQuaternionWithoutSpin();
     TestPointVelocityCarries();
     TestUnboundedSpeed();
     TestUnboundedSpinStaysSane();

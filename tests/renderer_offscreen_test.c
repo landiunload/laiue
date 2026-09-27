@@ -44,19 +44,29 @@ static void SetIdentity(float matrix[16])
     matrix[15] = 1.0f;
 }
 
+static bool PixelDifferentFrom(const uint8_t *pixels, uint32_t x, uint32_t y,
+                               uint8_t red, uint8_t green, uint8_t blue,
+                               uint32_t tolerance)
+{
+    const uint8_t *pixel = pixels + ((size_t)y * TEST_WIDTH + x) * 4u;
+    uint32_t deltaRed = pixel[0] > red ? (uint32_t)(pixel[0] - red) : (uint32_t)(red - pixel[0]);
+    uint32_t deltaGreen =
+        pixel[1] > green ? (uint32_t)(pixel[1] - green) : (uint32_t)(green - pixel[1]);
+    uint32_t deltaBlue =
+        pixel[2] > blue ? (uint32_t)(pixel[2] - blue) : (uint32_t)(blue - pixel[2]);
+    return deltaRed > tolerance || deltaGreen > tolerance || deltaBlue > tolerance;
+}
+
 static uint32_t CountPixelsDifferentFrom(const uint8_t *pixels, uint8_t red, uint8_t green,
                                          uint8_t blue, uint32_t tolerance)
 {
     uint32_t different = 0u;
-    for (uint32_t index = 0; index < TEST_WIDTH * TEST_HEIGHT; ++index)
+    for (uint32_t y = 0; y < TEST_HEIGHT; ++y)
     {
-        const uint8_t *pixel = pixels + (size_t)index * 4u;
-        uint32_t deltaRed = pixel[0] > red ? (uint32_t)(pixel[0] - red) : (uint32_t)(red - pixel[0]);
-        uint32_t deltaGreen =
-            pixel[1] > green ? (uint32_t)(pixel[1] - green) : (uint32_t)(green - pixel[1]);
-        uint32_t deltaBlue =
-            pixel[2] > blue ? (uint32_t)(pixel[2] - blue) : (uint32_t)(blue - pixel[2]);
-        if (deltaRed > tolerance || deltaGreen > tolerance || deltaBlue > tolerance) ++different;
+        for (uint32_t x = 0; x < TEST_WIDTH; ++x)
+        {
+            different += PixelDifferentFrom(pixels, x, y, red, green, blue, tolerance) ? 1u : 0u;
+        }
     }
     return different;
 }
@@ -332,6 +342,69 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     const uint8_t *corner = pixels;
     Expect(corner[0] > 250u && corner[1] < 5u && corner[2] < 5u,
            "the frame corner must stay the sky colour");
+
+    // === Пакет мелких загрузок ===
+    // Все 64 разных квада создаются до кадра: на Vulkan они используют одну
+    // upload-арену и один блок геометрии, поэтому запись копий может быть
+    // объединена в один vkCmdCopyBuffer с несколькими непересекающимися
+    // регионами. Квадры покрывают экран сеткой, чтобы проверялось содержимое
+    // всех загрузок, а не только успешный счётчик копирования.
+    enum { UPLOAD_BATCH_COUNT = 64u, UPLOAD_GRID_SIDE = 8u };
+    static RendererMesh *uploadMeshes[UPLOAD_BATCH_COUNT];
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+    {
+        uint32_t cellX = index % UPLOAD_GRID_SIDE;
+        uint32_t cellY = index / UPLOAD_GRID_SIDE;
+        ChunkQuad uploadQuad = PackChunkQuad(cellX * 8u, cellY * 8u, 0u, 4u,
+            1u + index, 8u, 8u, 0u);
+        uploadMeshes[index] = RendererCreateMesh(renderer, &uploadQuad, 1u);
+        Expect(uploadMeshes[index] != NULL,
+               "a small mesh in the upload batch could not be created");
+    }
+
+    RendererFrameSetup uploadSetup = setup;
+    SetIdentity(uploadSetup.passes[0].viewProjection);
+    uploadSetup.passes[0].viewProjection[0] = 1.0f / 32.0f;
+    uploadSetup.passes[0].viewProjection[5] = 1.0f / 32.0f;
+    uploadSetup.passes[0].viewProjection[12] = -1.0f;
+    uploadSetup.passes[0].viewProjection[13] = -1.0f;
+    const float uploadOrigin[3] = { 0.0f, 0.0f, 0.0f };
+    Expect(RendererBeginFrame(renderer, &uploadSetup),
+           "the many-mesh upload frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+        RendererDrawMesh(renderer, uploadMeshes[index], uploadOrigin);
+    Expect(RendererEndFrame(renderer), "the many-mesh upload frame could not end");
+
+    RendererStats uploadStats;
+    RendererGetStats(renderer, &uploadStats);
+    Expect(uploadStats.uploadedBytes == UPLOAD_BATCH_COUNT * sizeof(ChunkQuad),
+           "the batched upload must account for every small mesh exactly once");
+    Expect(uploadStats.drawCalls == UPLOAD_BATCH_COUNT &&
+               uploadStats.drawnQuads == UPLOAD_BATCH_COUNT,
+           "every mesh in the upload batch must be drawn once");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the many-mesh upload frame could not be captured");
+    bool allUploadCellsVisible = true;
+    for (uint32_t cellY = 0u; cellY < UPLOAD_GRID_SIDE; ++cellY)
+    {
+        for (uint32_t cellX = 0u; cellX < UPLOAD_GRID_SIDE; ++cellX)
+        {
+            uint32_t cellWidth = TEST_WIDTH / UPLOAD_GRID_SIDE;
+            uint32_t cellHeight = TEST_HEIGHT / UPLOAD_GRID_SIDE;
+            if (!PixelDifferentFrom(pixels, cellX * cellWidth + cellWidth / 2u,
+                                    cellY * cellHeight + cellHeight / 2u,
+                                    255u, 0u, 0u, 8u))
+                allUploadCellsVisible = false;
+        }
+    }
+    Expect(allUploadCellsVisible,
+           "each uploaded mesh must reach the center of its own screen cell");
+    Expect(CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u) >
+               (TEST_WIDTH * TEST_HEIGHT) / 2u,
+           "the uploaded mesh batch must render its full screen grid");
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+        RendererDestroyMesh(renderer, uploadMeshes[index]);
 
     // === Универсальный V2 mesh path ===
     // Это не ChunkQuad: обычный фиксированный vertex stream должен доходить
