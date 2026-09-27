@@ -224,6 +224,14 @@ typedef struct ChunkEntry
     bool requestQueued;     // есть ли в очереди заявка текущей ревизии
 } ChunkEntry;
 
+typedef struct ChunkRebuildEntry
+{
+    int64_t x;
+    int64_t y;
+    int64_t z;
+    RendererMesh* mesh;
+} ChunkRebuildEntry;
+
 typedef struct ChunkRequest
 {
     int64_t x;
@@ -268,7 +276,7 @@ struct ChunkStreaming
     // Живущих в гистерезисном кубе радиуса + 1 не больше (2R+3)^3 записей,
     // поэтому арена ровно этого размера — а не второй таблицы на всю
     // ёмкость, которая была чистой памятью впустую на весь сеанс игры.
-    ChunkEntry* rebuildScratch;
+    ChunkRebuildEntry* rebuildScratch;
     uint32_t capacity;
 
     // Плотный список записей с мешами. Он же хранит кешированный порядок
@@ -1273,7 +1281,7 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
     // вместе с их хешем, поэтому таблицу приходится строить заново. Приёмник
     // берём из компактной арены: живущих в радиусе + 1 не больше (2R+3)^3,
     // так что второй таблицы на всю ёмкость для этого не нужно.
-    ChunkEntry* scratch = streaming->rebuildScratch;
+    ChunkRebuildEntry* scratch = streaming->rebuildScratch;
     uint32_t scratchCount = 0u;
 
     for (uint32_t index = 0; index < streaming->capacity; ++index)
@@ -1293,14 +1301,11 @@ bool ChunkStreamingResumeAfterOriginChange(ChunkStreaming* streaming,
 
         if (keep)
         {
-            ChunkEntry* moved = &scratch[scratchCount++];
+            ChunkRebuildEntry* moved = &scratch[scratchCount++];
             moved->x = x;
             moved->y = y;
             moved->z = z;
             moved->mesh = previous->mesh;
-            moved->state = CHUNK_ENTRY_READY;
-            moved->requestQueued = false;
-            moved->drawSlotPlusOne = 0;
             previous->mesh = NULL;
             previous->drawSlotPlusOne = 0;
         }
@@ -1390,7 +1395,7 @@ ChunkStreaming* ChunkStreamingCreateWithServices(World* world, Renderer* rendere
     streaming->capacity = capacity;
     streaming->queueCapacity = queueCapacity;
     streaming->entries = PlatformAllocate((size_t)capacity * sizeof(ChunkEntry), true);
-    streaming->rebuildScratch = PlatformAllocate((size_t)volume * sizeof(ChunkEntry), false);
+    streaming->rebuildScratch = PlatformAllocate((size_t)volume * sizeof(ChunkRebuildEntry), false);
     streaming->drawItems = PlatformAllocate((size_t)volume * sizeof(DrawItem), false);
     streaming->requests = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkRequest), false);
     streaming->results = PlatformAllocate((size_t)queueCapacity * sizeof(ChunkMeshResult), false);
