@@ -32,6 +32,10 @@
 
 #include <vulkan/vulkan.h>
 
+bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *texture,
+                                     uint32_t mipLevel, const void *data,
+                                     uint64_t sizeBytes, uint32_t rowPitchBytes);
+
 #define LaiueContentCatalogDefault RendererContentDefaultCatalog
 
 #if defined(_WIN32)
@@ -179,6 +183,7 @@ typedef struct GpuImage
     uint32_t width;
     uint32_t height;
     uint32_t layerCount;
+    uint32_t mipLevels;
 } GpuImage;
 
 struct RendererTexture
@@ -609,10 +614,23 @@ static void ImageDestroy(Renderer *renderer, GpuImage *image)
     memset(image, 0, sizeof(*image));
 }
 
-static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height, uint32_t layerCount,
-                        VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                        VkImageViewType viewType, bool cubeCompatible, GpuImage *outImage)
+static bool ImageCreateWithMipLevels(Renderer *renderer, uint32_t width, uint32_t height,
+                                     uint32_t layerCount, uint32_t mipLevels,
+                                     VkFormat format, VkImageUsageFlags usage,
+                                     VkImageAspectFlags aspect, VkImageViewType viewType,
+                                     bool cubeCompatible, GpuImage *outImage)
 {
+    if (width == 0u || height == 0u || layerCount == 0u || mipLevels == 0u)
+        return false;
+    uint32_t largestDimension = width > height ? width : height;
+    uint32_t maximumMipLevels = 1u;
+    while (largestDimension > 1u)
+    {
+        largestDimension >>= 1u;
+        ++maximumMipLevels;
+    }
+    if (mipLevels > maximumMipLevels)
+        return false;
     memset(outImage, 0, sizeof(*outImage));
 
     VkImageCreateInfo imageInfo = {
@@ -621,7 +639,7 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height, uin
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
         .extent = { width, height, 1u },
-        .mipLevels = 1u,
+        .mipLevels = mipLevels,
         .arrayLayers = layerCount,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -658,7 +676,7 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height, uin
         .image = outImage->image,
         .viewType = viewType,
         .format = format,
-        .subresourceRange = { aspect, 0u, 1u, 0u, layerCount },
+        .subresourceRange = { aspect, 0u, mipLevels, 0u, layerCount },
     };
     if (vkCreateImageView(renderer->device, &viewInfo, NULL, &outImage->view) != VK_SUCCESS)
     {
@@ -670,7 +688,18 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height, uin
     outImage->width = width;
     outImage->height = height;
     outImage->layerCount = layerCount;
+    outImage->mipLevels = mipLevels;
     return true;
+}
+
+static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height,
+                        uint32_t layerCount, VkFormat format, VkImageUsageFlags usage,
+                        VkImageAspectFlags aspect, VkImageViewType viewType,
+                        bool cubeCompatible, GpuImage *outImage)
+{
+    return ImageCreateWithMipLevels(renderer, width, height, layerCount, 1u,
+                                    format, usage, aspect, viewType,
+                                    cubeCompatible, outImage);
 }
 
 /* Vulkan 1.3 dynamic rendering is the fast path, but Android devices still
@@ -817,7 +846,7 @@ static void ImageBarrier(VkCommandBuffer commandBuffer, GpuImage *image, VkImage
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = image->image,
-        .subresourceRange = { aspect, 0u, 1u, 0u, image->layerCount },
+        .subresourceRange = { aspect, 0u, image->mipLevels, 0u, image->layerCount },
     };
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
@@ -1860,10 +1889,17 @@ static bool EnsureBlockInstanceDescriptorSet(Renderer *renderer, uint32_t blockI
 
 // === Загрузка текстур ===
 
-static bool UploadImagePixels(Renderer *renderer, GpuImage *image, const uint8_t *pixels,
-                              uint32_t bytesPerPixel, uint32_t layerCount)
+static bool UploadImageMipPixels(Renderer *renderer, GpuImage *image,
+                                 const uint8_t *pixels, uint32_t bytesPerPixel,
+                                 uint32_t layerCount, uint32_t mipLevel)
 {
-    VkDeviceSize layerBytes = (VkDeviceSize)image->width * image->height * bytesPerPixel;
+    if (mipLevel >= image->mipLevels || layerCount != image->layerCount)
+        return false;
+    const uint32_t shiftedWidth = image->width >> mipLevel;
+    const uint32_t shiftedHeight = image->height >> mipLevel;
+    const uint32_t width = shiftedWidth == 0u ? 1u : shiftedWidth;
+    const uint32_t height = shiftedHeight == 0u ? 1u : shiftedHeight;
+    VkDeviceSize layerBytes = (VkDeviceSize)width * height * bytesPerPixel;
     VkDeviceSize totalBytes = layerBytes * layerCount;
     GpuBuffer staging;
     if (!BufferCreate(renderer, totalBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, &staging))
@@ -1880,8 +1916,8 @@ static bool UploadImagePixels(Renderer *renderer, GpuImage *image, const uint8_t
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy region = {
         .bufferOffset = 0u,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, layerCount },
-        .imageExtent = { image->width, image->height, 1u },
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevel, 0u, layerCount },
+        .imageExtent = { width, height, 1u },
     };
     vkCmdCopyBufferToImage(commandBuffer, staging.buffer, image->image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
@@ -1890,6 +1926,14 @@ static bool UploadImagePixels(Renderer *renderer, GpuImage *image, const uint8_t
     bool ok = EndImmediate(renderer, commandBuffer);
     BufferDestroy(renderer, &staging);
     return ok;
+}
+
+static bool UploadImagePixels(Renderer *renderer, GpuImage *image,
+                              const uint8_t *pixels, uint32_t bytesPerPixel,
+                              uint32_t layerCount)
+{
+    return UploadImageMipPixels(renderer, image, pixels, bytesPerPixel,
+                                layerCount, 0u);
 }
 
 // Слои пака лежат отдельными подресурсами; общий staging собирается из
@@ -3373,7 +3417,7 @@ RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width
                                                uint32_t format)
 {
     if (renderer == NULL || renderer->device == VK_NULL_HANDLE || width == 0u ||
-        height == 0u || mipLevels != 1u)
+        height == 0u || mipLevels == 0u)
         return NULL;
     VkFormat vkFormat = TextureFormat_Vulkan(format);
     if (vkFormat == VK_FORMAT_UNDEFINED)
@@ -3381,10 +3425,11 @@ RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width
     RendererTexture *texture = PlatformAllocate(sizeof(*texture), true);
     if (texture == NULL)
         return NULL;
-    if (!ImageCreate(renderer, width, height, 1u, vkFormat,
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
-                     &texture->image))
+    if (!ImageCreateWithMipLevels(renderer, width, height, 1u, mipLevels,
+                                  vkFormat,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                  VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                                  &texture->image))
     {
         PlatformFree(texture);
         return NULL;
@@ -3397,15 +3442,29 @@ bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                   const void *data, uint64_t sizeBytes,
                                   uint32_t rowPitchBytes)
 {
+    return RendererUploadTextureMip_Vulkan(renderer, texture, 0u, data,
+                                           sizeBytes, rowPitchBytes);
+}
+
+bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *texture,
+                                     uint32_t mipLevel, const void *data,
+                                     uint64_t sizeBytes, uint32_t rowPitchBytes)
+{
     if (renderer == NULL || texture == NULL || texture->owner != renderer || data == NULL ||
         renderer->frameRecording ||
         texture->image.image == VK_NULL_HANDLE || rowPitchBytes == 0u ||
-        texture->image.width > UINT32_MAX / 4u ||
-        rowPitchBytes != texture->image.width * 4u ||
-        texture->image.height > UINT64_MAX / rowPitchBytes ||
-        sizeBytes != (uint64_t)texture->image.height * rowPitchBytes)
+        mipLevel >= texture->image.mipLevels || mipLevel >= 32u)
         return false;
-    return UploadImagePixels(renderer, &texture->image, (const uint8_t *)data, 4u, 1u);
+    const uint32_t shiftedWidth = texture->image.width >> mipLevel;
+    const uint32_t shiftedHeight = texture->image.height >> mipLevel;
+    const uint32_t mipWidth = shiftedWidth == 0u ? 1u : shiftedWidth;
+    const uint32_t mipHeight = shiftedHeight == 0u ? 1u : shiftedHeight;
+    if (mipWidth > UINT32_MAX / 4u || rowPitchBytes != mipWidth * 4u ||
+        (uint64_t)mipHeight > UINT64_MAX / rowPitchBytes ||
+        sizeBytes != (uint64_t)mipHeight * rowPitchBytes)
+        return false;
+    return UploadImageMipPixels(renderer, &texture->image, (const uint8_t *)data,
+                                4u, 1u, mipLevel);
 }
 
 static VkFilter SamplerFilter_Vulkan(uint32_t filter)
@@ -3447,7 +3506,7 @@ RendererSampler *RendererCreateSampler_Vulkan(Renderer *renderer, uint32_t minFi
         .addressModeU = SamplerAddress_Vulkan(addressModeU),
         .addressModeV = SamplerAddress_Vulkan(addressModeV),
         .addressModeW = SamplerAddress_Vulkan(addressModeW),
-        .maxLod = 0.0f,
+        .maxLod = 16.0f,
     };
     if (vkCreateSampler(renderer->device, &description, NULL, &sampler->sampler) != VK_SUCCESS)
     {

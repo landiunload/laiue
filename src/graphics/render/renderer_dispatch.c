@@ -39,6 +39,9 @@ extern void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *te
 extern bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                         const void *data, uint64_t sizeBytes,
                                         uint32_t rowPitchBytes);
+extern bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture,
+                                           uint32_t mipLevel, const void *data,
+                                           uint64_t sizeBytes, uint32_t rowPitchBytes);
 extern RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer,
                                                      uint32_t minFilter, uint32_t magFilter,
                                                      uint32_t addressModeU, uint32_t addressModeV,
@@ -100,6 +103,9 @@ extern void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *t
 extern bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                          const void *data, uint64_t sizeBytes,
                                          uint32_t rowPitchBytes);
+extern bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *texture,
+                                            uint32_t mipLevel, const void *data,
+                                            uint64_t sizeBytes, uint32_t rowPitchBytes);
 extern RendererSampler *RendererCreateSampler_Vulkan(Renderer *renderer,
                                                       uint32_t minFilter, uint32_t magFilter,
                                                       uint32_t addressModeU, uint32_t addressModeV,
@@ -551,17 +557,25 @@ bool RendererUploadTexture(Renderer *renderer, RendererTexture *texture,
                            const void *data, uint64_t sizeBytes,
                            uint32_t rowPitchBytes)
 {
+    return RendererUploadTextureMip(renderer, texture, 0u, data, sizeBytes,
+                                    rowPitchBytes);
+}
+
+bool RendererUploadTextureMip(Renderer *renderer, RendererTexture *texture,
+                              uint32_t mipLevel, const void *data,
+                              uint64_t sizeBytes, uint32_t rowPitchBytes)
+{
     switch (LookupBackend(renderer))
     {
 #if defined(LAIUE_RENDER_HAS_D3D12)
     case RENDERER_BACKEND_D3D12:
-        return RendererUploadTexture_D3D12(renderer, texture, data, sizeBytes,
-                                           rowPitchBytes);
+        return RendererUploadTextureMip_D3D12(renderer, texture, mipLevel, data,
+                                              sizeBytes, rowPitchBytes);
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
-        return RendererUploadTexture_Vulkan(renderer, texture, data, sizeBytes,
-                                            rowPitchBytes);
+        return RendererUploadTextureMip_Vulkan(renderer, texture, mipLevel, data,
+                                               sizeBytes, rowPitchBytes);
 #endif
     default:
         return false;

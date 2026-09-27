@@ -241,6 +241,21 @@ static bool DeviceTextureExtentIsRepresentable(const LaiueGraphicsExtentV1 *exte
     return (uint64_t)extent->depth <= UINT64_MAX / area;
 }
 
+static bool DeviceTextureMipCountIsValid(const LaiueGraphicsExtentV1 *extent,
+                                         uint32_t mipLevels)
+{
+    if (extent == NULL || mipLevels == 0u)
+        return false;
+    uint32_t largest = extent->width > extent->height ? extent->width : extent->height;
+    uint32_t maximumLevels = 1u;
+    while (largest > 1u)
+    {
+        largest >>= 1u;
+        ++maximumLevels;
+    }
+    return mipLevels <= maximumLevels;
+}
+
 static bool DeviceTextureFormatIsSupported(const LaiueGraphicsTextureDescV1 *description)
 {
     return description != NULL && description->format <= LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB;
@@ -548,7 +563,8 @@ static uint32_t DeviceCreateTexture(LaiueGraphicsDeviceV1 *device,
         return 0u;
     *outTexture = 0u;
     if (state == NULL || description == NULL ||
-        description->structSize < sizeof(*description) || description->mipLevels != 1u ||
+        description->structSize < sizeof(*description) ||
+        !DeviceTextureMipCountIsValid(&description->extent, description->mipLevels) ||
         description->extent.depth != 1u || !DeviceTextureFormatIsSupported(description) ||
         !DeviceTextureExtentIsRepresentable(&description->extent))
         return 0u;
@@ -722,18 +738,24 @@ static uint32_t DeviceUploadTexture(LaiueGraphicsDeviceV1 *device,
 
     const uint32_t index = DeviceHandleSlot(upload->texture) - 1u;
     const LaiueGraphicsTextureDescV1 *description = &state->textures[index];
-    const uint64_t tightRowPitch = (uint64_t)description->extent.width * 4u;
+    if (upload->mipLevel >= description->mipLevels)
+        return 0u;
+    const uint32_t shiftedWidth = description->extent.width >> upload->mipLevel;
+    const uint32_t shiftedHeight = description->extent.height >> upload->mipLevel;
+    const uint32_t mipWidth = shiftedWidth == 0u ? 1u : shiftedWidth;
+    const uint32_t mipHeight = shiftedHeight == 0u ? 1u : shiftedHeight;
+    const uint64_t tightRowPitch = (uint64_t)mipWidth * 4u;
     const uint64_t rowPitch = upload->rowPitchBytes == 0u
                                   ? tightRowPitch
                                   : (uint64_t)upload->rowPitchBytes;
     if (rowPitch != tightRowPitch ||
-        (uint64_t)description->extent.height > UINT64_MAX / rowPitch ||
-        upload->sizeBytes != rowPitch * description->extent.height ||
+        (uint64_t)mipHeight > UINT64_MAX / rowPitch ||
+        upload->sizeBytes != rowPitch * mipHeight ||
         state->backendResources[index] == NULL)
         return 0u;
-    return RendererUploadTexture(
+    return RendererUploadTextureMip(
                state->renderer, (RendererTexture *)state->backendResources[index],
-               upload->data, upload->sizeBytes, (uint32_t)rowPitch)
+               upload->mipLevel, upload->data, upload->sizeBytes, (uint32_t)rowPitch)
                ? 1u
                : 0u;
 }

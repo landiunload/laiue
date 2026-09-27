@@ -32,6 +32,9 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
 bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes);
+bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture,
+                                    uint32_t mipLevel, const void *data,
+                                    uint64_t sizeBytes, uint32_t rowPitchBytes);
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 
 #define FRAME_COUNT 2
@@ -2470,7 +2473,16 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
                                               uint32_t format)
 {
     if (renderer == NULL || renderer->device == NULL || renderer->srvHeap == NULL ||
-        width == 0u || height == 0u || mipLevels != 1u)
+        width == 0u || height == 0u || mipLevels == 0u)
+        return NULL;
+    uint32_t largestDimension = width > height ? width : height;
+    uint32_t maximumMipLevels = 1u;
+    while (largestDimension > 1u)
+    {
+        largestDimension >>= 1u;
+        ++maximumMipLevels;
+    }
+    if (mipLevels > maximumMipLevels)
         return NULL;
     DXGI_FORMAT dxgiFormat = TextureFormat_D3D12(format);
     if (dxgiFormat == DXGI_FORMAT_UNKNOWN)
@@ -2525,6 +2537,14 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes)
 {
+    return RendererUploadTextureMip_D3D12(renderer, texture, 0u, data,
+                                          sizeBytes, rowPitchBytes);
+}
+
+bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture,
+                                    uint32_t mipLevel, const void *data,
+                                    uint64_t sizeBytes, uint32_t rowPitchBytes)
+{
     if (renderer == NULL || texture == NULL || texture->owner != renderer ||
         texture->resource == NULL || data == NULL ||
         renderer->frameRecording || rowPitchBytes == 0u)
@@ -2532,11 +2552,16 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
     D3D12_RESOURCE_DESC textureDescription;
     ID3D12Resource_GetDesc(texture->resource, &textureDescription);
     if (textureDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        textureDescription.DepthOrArraySize != 1u || textureDescription.MipLevels != 1u ||
-        textureDescription.Width > UINT64_MAX / 4u ||
-        rowPitchBytes != textureDescription.Width * 4u ||
-        textureDescription.Height > UINT64_MAX / rowPitchBytes ||
-        sizeBytes != textureDescription.Height * rowPitchBytes)
+        textureDescription.DepthOrArraySize != 1u ||
+        mipLevel >= textureDescription.MipLevels || mipLevel >= 32u)
+        return false;
+    const uint64_t shiftedWidth = textureDescription.Width >> mipLevel;
+    const uint32_t shiftedHeight = textureDescription.Height >> mipLevel;
+    const uint32_t mipWidth = shiftedWidth == 0u ? 1u : (uint32_t)shiftedWidth;
+    const uint32_t mipHeight = shiftedHeight == 0u ? 1u : shiftedHeight;
+    if (mipWidth > UINT32_MAX / 4u || rowPitchBytes != mipWidth * 4u ||
+        (uint64_t)mipHeight > UINT64_MAX / rowPitchBytes ||
+        sizeBytes != (uint64_t)mipHeight * rowPitchBytes)
         return false;
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
@@ -2544,9 +2569,9 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
     UINT64 rowSize = 0u;
     UINT64 uploadBytes = 0u;
     ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
-                                        0u, 1u, 0u, &layout, &rows, &rowSize,
+                                        mipLevel, 1u, 0u, &layout, &rows, &rowSize,
                                         &uploadBytes);
-    if (rows != textureDescription.Height || rowSize != rowPitchBytes || uploadBytes == 0u)
+    if (rows != mipHeight || rowSize != rowPitchBytes || uploadBytes == 0u)
         return false;
 
     D3D12_RESOURCE_DESC uploadDescription;
@@ -2600,6 +2625,7 @@ bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
     memset(&destination, 0, sizeof(destination));
     destination.pResource = texture->resource;
     destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = mipLevel;
     D3D12_TEXTURE_COPY_LOCATION sourceLocation;
     memset(&sourceLocation, 0, sizeof(sourceLocation));
     sourceLocation.pResource = upload;

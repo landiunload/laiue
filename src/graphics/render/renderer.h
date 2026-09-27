@@ -239,20 +239,26 @@ LAIUE_RENDER_API RendererMesh *RendererCreateGenericMesh(
     Renderer *renderer, const RendererGenericVertex *vertices,
     uint32_t vertexCount);
 
-/* Creates a backend-resident 2D RGBA8 sampled image.  The first revision
- * intentionally accepts one mip level; upload/update is a separate frame
- * safe operation.  Format 0 is RGBA8_UNORM and format 1 is RGBA8_SRGB. */
+/* Creates a backend-resident 2D RGBA8 sampled image.  Format 0 is
+ * RGBA8_UNORM and format 1 is RGBA8_SRGB. */
 LAIUE_RENDER_API RendererTexture *RendererCreateTexture(
     Renderer *renderer, uint32_t width, uint32_t height,
     uint32_t mipLevels, uint32_t format);
 LAIUE_RENDER_API void RendererDestroyTexture(Renderer *renderer,
                                              RendererTexture *texture);
-/* Uploads one tightly packed RGBA8 mip into a backend-owned texture. */
+/* Uploads mip zero of a backend-owned texture. */
 LAIUE_RENDER_API bool RendererUploadTexture(Renderer *renderer,
                                             RendererTexture *texture,
                                             const void *data,
                                             uint64_t sizeBytes,
                                             uint32_t rowPitchBytes);
+/* Uploads one tightly packed RGBA8 mip into a backend-owned texture. */
+LAIUE_RENDER_API bool RendererUploadTextureMip(Renderer *renderer,
+                                               RendererTexture *texture,
+                                               uint32_t mipLevel,
+                                               const void *data,
+                                               uint64_t sizeBytes,
+                                               uint32_t rowPitchBytes);
 LAIUE_RENDER_API RendererSampler *RendererCreateSampler(
     Renderer *renderer, uint32_t minFilter, uint32_t magFilter,
     uint32_t addressModeU, uint32_t addressModeV, uint32_t addressModeW);
