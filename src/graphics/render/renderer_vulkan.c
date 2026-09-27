@@ -4691,7 +4691,8 @@ _Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
 bool RendererUiSetFontAtlas_Vulkan(Renderer *renderer, const uint8_t *alphaPixels, uint32_t width,
                             uint32_t height)
 {
-    if (renderer == NULL || alphaPixels == NULL || width == 0u || height == 0u) return false;
+    if (renderer == NULL || renderer->frameRecording || alphaPixels == NULL ||
+        width == 0u || height == 0u) return false;
 
     GpuImage atlas;
     if (!ImageCreate(renderer, width, height, 1u, VK_FORMAT_R8_UNORM,

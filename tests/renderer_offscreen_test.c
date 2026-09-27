@@ -635,6 +635,8 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
 
     Expect(RendererBeginFrame(renderer, &setup), "ui frame could not begin");
     RendererBeginScenePass(renderer, 0u);
+    Expect(!RendererUiSetFontAtlas(renderer, atlas, 2u, 2u),
+           "font atlas replacement during an active frame must be rejected");
     RendererDrawMesh(renderer, mesh, origin);
     RendererUiQueue(renderer, &quad, 1u);
     Expect(RendererEndFrame(renderer), "ui frame could not end");

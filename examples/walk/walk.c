@@ -805,6 +805,55 @@ static void WalkWindowFrame(void *opaque)
     int32_t width = 0;
     int32_t height = 0;
     state->windowService->getClientSize(state->window, &width, &height);
+    bool uiFrameReady = false;
+    if (width > 0 && height > 0 && state->uiService != NULL &&
+        state->uiContext != NULL && state->uiService->begin != NULL &&
+        state->uiService->getFontAtlas != NULL)
+    {
+        int32_t mouseX = 0;
+        int32_t mouseY = 0;
+        state->windowService->getCursorClientPosition(state->window, &mouseX, &mouseY);
+        const uint32_t mouseDown =
+            state->inputService->isMouseButtonDown(state->input,
+                                                   INPUT_MOUSE_BUTTON_LEFT)
+                ? 1u
+                : 0u;
+        const uint32_t mousePressed =
+            state->inputService->wasMouseButtonPressed(state->input,
+                                                       INPUT_MOUSE_BUTTON_LEFT)
+                ? 1u
+                : 0u;
+        const float wheel = state->windowService->consumeMouseWheelSteps != NULL
+                                ? state->windowService->consumeMouseWheelSteps(
+                                      state->window)
+                                : 0.0f;
+        uiFrameReady = state->uiService->begin(state->uiContext, width, height,
+                                               (float)mouseX, (float)mouseY,
+                                               mouseDown, mousePressed, wheel,
+                                               (float)elapsed) != 0u;
+        if (uiFrameReady &&
+            WalkDeviceFieldPresent(state->device,
+                                   offsetof(LaiueGraphicsDeviceV2, setUiFontAtlas),
+                                   sizeof(state->device->setUiFontAtlas)) &&
+            state->device->setUiFontAtlas != NULL)
+        {
+            const uint8_t *pixels = NULL;
+            uint32_t atlasWidth = 0u;
+            uint32_t atlasHeight = 0u;
+            if (state->uiService->getFontAtlas(state->uiContext, &pixels,
+                                               &atlasWidth, &atlasHeight) != 0u &&
+                pixels != NULL && atlasWidth != 0u && atlasHeight != 0u &&
+                (pixels != state->fontPixels || atlasWidth != state->fontWidth ||
+                 atlasHeight != state->fontHeight) &&
+                state->device->setUiFontAtlas(state->device, pixels,
+                                              atlasWidth, atlasHeight) != 0u)
+            {
+                state->fontPixels = pixels;
+                state->fontWidth = atlasWidth;
+                state->fontHeight = atlasHeight;
+            }
+        }
+    }
     if (width > 0 && height > 0 &&
         WalkServiceFieldPresent(state->graphicsServiceSize,
                                 state->graphicsService->structSize,
@@ -812,83 +861,38 @@ static void WalkWindowFrame(void *opaque)
                                 sizeof(state->graphicsService->createDevice)) &&
         state->graphicsService->createDevice != NULL)
     {
-        if (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u)
+        if (state->device->beginFrame(state->device, (uint32_t)width,
+                                      (uint32_t)height) == 0u)
             state->failed = true;
         else
         {
-            if (state->uiService != NULL && state->uiContext != NULL &&
-                state->uiService->begin != NULL && state->uiService->rect != NULL &&
+            if (uiFrameReady && state->uiService != NULL &&
+                state->uiService->rect != NULL &&
                 state->uiService->textUtf8 != NULL &&
                 state->uiService->copyDrawList != NULL)
             {
-                int32_t mouseX = 0;
-                int32_t mouseY = 0;
-                state->windowService->getCursorClientPosition(state->window, &mouseX, &mouseY);
-                const uint32_t mouseDown =
-                    state->inputService->isMouseButtonDown(state->input,
-                                                           INPUT_MOUSE_BUTTON_LEFT)
-                        ? 1u
-                        : 0u;
-                const uint32_t mousePressed =
-                    state->inputService->wasMouseButtonPressed(state->input,
-                                                               INPUT_MOUSE_BUTTON_LEFT)
-                        ? 1u
-                        : 0u;
-                const float wheel = state->windowService->consumeMouseWheelSteps != NULL
-                                        ? state->windowService->consumeMouseWheelSteps(
-                                              state->window)
-                                        : 0.0f;
-                if (state->uiService->begin(state->uiContext, width, height,
-                                            (float)mouseX, (float)mouseY, mouseDown,
-                                            mousePressed, wheel, (float)elapsed) != 0u)
-                {
-                        if (WalkDeviceFieldPresent(state->device,
-                            offsetof(LaiueGraphicsDeviceV2, setUiFontAtlas),
-                            sizeof(state->device->setUiFontAtlas)) &&
-                        state->device->setUiFontAtlas != NULL &&
-                        state->uiService->getFontAtlas != NULL)
-                    {
-                        const uint8_t *pixels = NULL;
-                        uint32_t atlasWidth = 0u;
-                        uint32_t atlasHeight = 0u;
-                        if (state->uiService->getFontAtlas(state->uiContext, &pixels,
-                                                           &atlasWidth, &atlasHeight) != 0u &&
-                            pixels != NULL && atlasWidth != 0u && atlasHeight != 0u &&
-                            (pixels != state->fontPixels || atlasWidth != state->fontWidth ||
-                             atlasHeight != state->fontHeight))
-                        {
-                            if (state->device->setUiFontAtlas(state->device, pixels,
-                                                               atlasWidth, atlasHeight) != 0u)
-                            {
-                                state->fontPixels = pixels;
-                                state->fontWidth = atlasWidth;
-                                state->fontHeight = atlasHeight;
-                            }
-                        }
-                    }
-                    state->uiService->rect(state->uiContext, 16.0f, 16.0f, 330.0f, 126.0f,
-                                           8.0f, 0xF4221A16u);
-                    state->uiService->textUtf8(state->uiContext, 32.0f, 32.0f, 0xFFFFFFFFu,
-                                               "LAIUE Walk");
-                    state->uiService->textUtf8(state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
-                                               "WASD move   Shift sprint   Space jump");
-                    state->uiService->textUtf8(state->uiContext, 32.0f, 84.0f, 0xFFB8C8FFu,
-                                               state->controller != NULL
-                                                   ? "Character: online"
-                                                   : "Character: unavailable");
-                    state->uiService->textUtf8(state->uiContext, 32.0f, 106.0f, 0xFFB8C8FFu,
-                                               "Voxel: optional sparse edits");
-                    uint32_t quadCount = 0u;
-                    if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
-                                                       LAIUE_GRAPHICS_UI_MAX_QUADS,
-                                                       &quadCount) == 0u ||
-                        !WalkDeviceFieldPresent(state->device,
-                            offsetof(LaiueGraphicsDeviceV2, submitUi),
-                            sizeof(state->device->submitUi)) ||
-                        state->device->submitUi == NULL ||
-                        state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
-                        state->failed = true;
-                }
+                state->uiService->rect(state->uiContext, 16.0f, 16.0f, 330.0f, 126.0f,
+                                       8.0f, 0xF4221A16u);
+                state->uiService->textUtf8(state->uiContext, 32.0f, 32.0f, 0xFFFFFFFFu,
+                                           "LAIUE Walk");
+                state->uiService->textUtf8(state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
+                                           "WASD move   Shift sprint   Space jump");
+                state->uiService->textUtf8(state->uiContext, 32.0f, 84.0f, 0xFFB8C8FFu,
+                                           state->controller != NULL
+                                               ? "Character: online"
+                                               : "Character: unavailable");
+                state->uiService->textUtf8(state->uiContext, 32.0f, 106.0f, 0xFFB8C8FFu,
+                                           "Voxel: optional sparse edits");
+                uint32_t quadCount = 0u;
+                if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
+                                                   LAIUE_GRAPHICS_UI_MAX_QUADS,
+                                                   &quadCount) == 0u ||
+                    !WalkDeviceFieldPresent(state->device,
+                        offsetof(LaiueGraphicsDeviceV2, submitUi),
+                        sizeof(state->device->submitUi)) ||
+                    state->device->submitUi == NULL ||
+                    state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
+                    state->failed = true;
             }
             if (state->terrainReady &&
                 WalkDeviceFieldPresent(state->device,
@@ -925,7 +929,10 @@ static void WalkWindowFrame(void *opaque)
                     state->failed = true;
             }
             if (state->device->endFrame(state->device) == 0u)
+            {
                 state->failed = true;
+                state->windowService->requestClose(state->window);
+            }
         }
     }
     if (state->inputService->endFrame != NULL)
