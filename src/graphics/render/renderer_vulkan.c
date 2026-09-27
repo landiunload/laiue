@@ -3734,11 +3734,34 @@ static void SetViewportAndScissor(VkCommandBuffer commandBuffer, int32_t x, int3
     vkCmdSetScissor(commandBuffer, 0u, 1u, &scissor);
 }
 
+static void RecordPendingUploadBatch(Renderer *renderer, VkCommandBuffer commandBuffer,
+                                     VkBuffer staging, VkBuffer destination,
+                                     const VkBufferCopy *regions, uint32_t regionCount,
+                                     uint32_t firstUploadIndex)
+{
+    vkCmdCopyBuffer(commandBuffer, staging, destination, regionCount, regions);
+    for (uint32_t offset = 0; offset < regionCount; ++offset)
+    {
+        PendingUpload *upload = &renderer->pendingUploads[firstUploadIndex + offset];
+        renderer->currentStats.uploadedBytes += upload->sizeBytes;
+        if (upload->stagingMemory != VK_NULL_HANDLE)
+            DeferBufferRelease(renderer, upload->staging, upload->stagingMemory);
+    }
+}
+
 static void RecordPendingUploads(Renderer *renderer)
 {
     if (renderer->pendingUploadCount == 0u) return;
 
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    VkBufferCopy regions[MAX_PENDING_UPLOADS];
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkBuffer destination = VK_NULL_HANDLE;
+    uint32_t regionCount = 0u;
+    uint32_t firstUploadIndex = 0u;
+    // PoolAllocate retains unique destination ranges until uploads drain, and
+    // staging ring offsets advance monotonically. Equal buffer handles therefore
+    // identify disjoint regions without a quadratic overlap scan.
     for (uint32_t index = 0; index < renderer->pendingUploadCount; ++index)
     {
         PendingUpload *upload = &renderer->pendingUploads[index];
@@ -3747,11 +3770,28 @@ static void RecordPendingUploads(Renderer *renderer)
             .dstOffset = upload->destinationOffset,
             .size = upload->sizeBytes,
         };
-        vkCmdCopyBuffer(commandBuffer, upload->staging,
-                        renderer->poolBlocks[upload->blockIndex].buffer.buffer, 1u, &region);
-        renderer->currentStats.uploadedBytes += upload->sizeBytes;
-        if (upload->stagingMemory != VK_NULL_HANDLE)
-            DeferBufferRelease(renderer, upload->staging, upload->stagingMemory);
+        VkBuffer uploadDestination =
+            renderer->poolBlocks[upload->blockIndex].buffer.buffer;
+        bool sameBuffers = regionCount != 0u && upload->staging == staging &&
+            uploadDestination == destination;
+        if (regionCount != 0u && !sameBuffers)
+        {
+            RecordPendingUploadBatch(renderer, commandBuffer, staging, destination,
+                                     regions, regionCount, firstUploadIndex);
+            regionCount = 0u;
+        }
+        if (regionCount == 0u)
+        {
+            staging = upload->staging;
+            destination = uploadDestination;
+            firstUploadIndex = index;
+        }
+        regions[regionCount++] = region;
+    }
+    if (regionCount != 0u)
+    {
+        RecordPendingUploadBatch(renderer, commandBuffer, staging, destination,
+                                 regions, regionCount, firstUploadIndex);
     }
     renderer->pendingUploadCount = 0u;
 

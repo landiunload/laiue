@@ -6083,6 +6083,15 @@ static bool IntegrateBody(VoxelRigidBody *body, const RigidBodyCache *cache)
         }
     }
 
+    // Only the empty representation is unconditionally zero. A public
+    // InfiniteCoord with limbs and sign == 0 still follows the legacy path.
+    const InfiniteCoord *angularVelocity = body->angularVelocity;
+    if (angularVelocity[0].limbCount == 0u && angularVelocity[1].limbCount == 0u &&
+        angularVelocity[2].limbCount == 0u)
+    {
+        return true;
+    }
+
     double rotation[3];
     double angle = 0.0;
     for (int32_t axis = 0; axis < 3; ++axis)
