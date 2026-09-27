@@ -412,12 +412,9 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
     float left = slot->gains.left;
     float right = slot->gains.right;
 
-    // Для mono-клипа при точном целом шаге от двух кадров позиция остаётся
-    // целой, так что интерполяция всегда выбирает первый сэмпл. Пропускаем её
-    // и читаем выборки с постоянным шагом; очень короткие клипы оставляем
-    // общей ветви, где сохраняется поведение при нескольких оборотах за шаг.
-    if (clip->channelCount == 1u && step > 1.0 &&
-        step <= (double)clip->frameCount &&
+    // При точном целом шаге позиция целая, поэтому интерполяция всегда
+    // выбирает первый кадр. Очень короткие клипы остаются на общей ветви.
+    if (step > 1.0 && step <= (double)clip->frameCount &&
         step == (double)(uint32_t)step && position <= (double)UINT32_MAX &&
         position == (double)(uint32_t)position && GainsFoldExact(left, right))
     {
@@ -446,12 +443,26 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
             uint32_t run = 1u + (clipFrames - 1u - (uint32_t)frame) / stepFrames;
             uint32_t count = frameCount - index;
             if (run < count) count = run;
-            for (uint32_t sample = 0u; sample < count; ++sample)
+            if (clip->channelCount == 1u)
             {
-                float mono = (float)samples[(size_t)frame];
-                frames[(index + sample) * 2u] += mono * scaledLeft;
-                frames[(index + sample) * 2u + 1u] += mono * scaledRight;
-                frame += stepFrames;
+                for (uint32_t sample = 0u; sample < count; ++sample)
+                {
+                    float mono = (float)samples[(size_t)frame];
+                    frames[(index + sample) * 2u] += mono * scaledLeft;
+                    frames[(index + sample) * 2u + 1u] += mono * scaledRight;
+                    frame += stepFrames;
+                }
+            }
+            else
+            {
+                for (uint32_t sample = 0u; sample < count; ++sample)
+                {
+                    float channelLeft = (float)samples[(size_t)frame * 2u];
+                    float channelRight = (float)samples[(size_t)frame * 2u + 1u];
+                    frames[(index + sample) * 2u] += channelLeft * scaledLeft;
+                    frames[(index + sample) * 2u + 1u] += channelRight * scaledRight;
+                    frame += stepFrames;
+                }
             }
             index += count;
         }

@@ -277,12 +277,13 @@ static void CheckGeneralRuns(void)
     };
 
     // Дробные случаи проверяют общую ветвь; целые шаги 2 покрывают быстрый
-    // путь через границу клипа и естественное завершение незацикленного голоса.
-    const double steps[6] = {0.5, 2.5, 2.5, 2.0, 2.0, 2.0};
-    const bool looping[6] = {true, true, false, true, false, false};
-    const uint32_t channels[6] = {1u, 2u, 1u, 1u, 2u, 1u};
+    // путь в mono и stereo, повтор через границу и естественное завершение.
+    const double steps[8] = {0.5, 2.5, 2.5, 2.0, 2.0, 2.0, 2.0, 2.0};
+    const bool looping[8] = {true, true, false, true, false, false, true, false};
+    const uint32_t channels[8] = {1u, 2u, 1u, 1u, 2u, 1u, 2u, 2u};
+    const double pans[8] = {-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0};
 
-    for (uint32_t scenario = 0u; scenario < 6u; ++scenario)
+    for (uint32_t scenario = 0u; scenario < 8u; ++scenario)
     {
         AudioDevice *device = NULL;
         Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
@@ -294,7 +295,7 @@ static void CheckGeneralRuns(void)
                                               TEST_SAMPLE_RATE);
         AudioVoiceParameters parameters = {
             .volume = 1.0f,
-            .pan = -1.0f,   // только левый канал: усиление 1,0 и 0,0
+            .pan = (float)pans[scenario],
             .speed = (float)steps[scenario],
             .looping = looping[scenario],
         };
@@ -312,11 +313,16 @@ static void CheckGeneralRuns(void)
                 uint32_t output = buffer * GENERAL_BUFFER + index;
                 const int16_t *samples =
                     channels[scenario] == 2u ? stereoSamples : monoSamples;
-                float expectedLeft =
-                    GeneralReference(samples, channels[scenario], GENERAL_FRAMES, output, 0u,
-                                     steps[scenario], looping[scenario]);
+                bool rightOnly = pans[scenario] > 0.0;
+                float expectedLeft = rightOnly ? 0.0f
+                    : GeneralReference(samples, channels[scenario], GENERAL_FRAMES, output, 0u,
+                                       steps[scenario], looping[scenario]);
+                float expectedRight = rightOnly
+                    ? GeneralReference(samples, channels[scenario], GENERAL_FRAMES, output, 1u,
+                                       steps[scenario], looping[scenario])
+                    : 0.0f;
                 identical = identical && SameBits(frames[index * 2u], expectedLeft)
-                            && SameBits(frames[index * 2u + 1u], 0.0f);
+                            && SameBits(frames[index * 2u + 1u], expectedRight);
             }
         }
         Expect(identical, "integer and fractional steps must match the sample reference");
@@ -355,6 +361,32 @@ static void CheckGeneralRuns(void)
             }
         }
         Expect(identical, "a clip shorter than the step must stay silent after the first frame");
+
+        AudioClipDestroy(clip);
+        AudioDeviceDestroy(device);
+    }
+
+    {
+        static int16_t tinyStereoSamples[4] = {16384, 8192, -16384, -8192};
+        AudioDevice *device = NULL;
+        Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
+               "short stereo-clip device could not be created");
+        AudioClip *clip = MakeExactClip(device, tinyStereoSamples, 2u, 2u, TEST_SAMPLE_RATE);
+        AudioVoiceParameters parameters = {
+            .volume = 1.0f, .pan = 1.0f, .speed = 16.0f, .looping = true,
+        };
+        Expect(AudioVoicePlay(device, clip, &parameters) != AUDIO_VOICE_NONE,
+               "short stereo-clip voice could not be started");
+        Expect(AudioDeviceRenderFrames(device, frames, GENERAL_BUFFER),
+               "short stereo-clip render must succeed");
+        bool identical = true;
+        for (uint32_t index = 0u; index < GENERAL_BUFFER; ++index)
+        {
+            float expectedRight = index == 0u ? SampleToFloat(tinyStereoSamples[1]) : 0.0f;
+            identical = identical && SameBits(frames[index * 2u], 0.0f)
+                        && SameBits(frames[index * 2u + 1u], expectedRight);
+        }
+        Expect(identical, "a short stereo clip stays silent after its first frame");
 
         AudioClipDestroy(clip);
         AudioDeviceDestroy(device);
