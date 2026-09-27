@@ -243,6 +243,7 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_body.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/compound_shape.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/rigid_broadphase.h"
+        "${PROJECT_SOURCE_DIR}/src/simulation/physics/ragdoll.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/voxel_body.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/physics_service.h"
         "${PROJECT_SOURCE_DIR}/src/simulation/physics/numeric_provider.h"

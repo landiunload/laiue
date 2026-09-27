@@ -14,6 +14,8 @@ laiue_add_module(physics
         rigid_broadphase.h
         rigid_body.c
         rigid_body.h
+        ragdoll.c
+        ragdoll.h
         voxel_body.c
         voxel_body.h
         physics_service.h

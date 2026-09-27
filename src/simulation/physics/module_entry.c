@@ -44,6 +44,12 @@ static const LaiuePhysicsServiceV1 service = {
     .contactCacheBytes = VoxelRigidContactCacheBytes,
     .contactCacheInitialize = VoxelRigidContactCacheInitialize,
     .contactCacheReset = VoxelRigidContactCacheReset,
+    .ragdollInitialize = VoxelRagdollInitialize,
+    .ragdollRelease = VoxelRagdollRelease,
+    .ragdollSettingsDefault = VoxelRagdollSettingsDefault,
+    .ragdollStep = VoxelRagdollStep,
+    .ragdollDrive = VoxelRagdollDrive,
+    .ragdollJump = VoxelRagdollJump,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
