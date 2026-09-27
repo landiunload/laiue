@@ -2,6 +2,7 @@
 #include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
+#include "../examples/walk/android/touch_controls.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -128,6 +129,36 @@ LAIUE_TEST_ENTRY(CharacterModuleTestEntryPoint)
                character->step != NULL && character->destroy != NULL,
            "character service table is published");
 
+    float stickX = 0.8f;
+    float stickY = 0.8f;
+    AndroidWalkClampStick(&stickX, &stickY);
+    Expect(stickX > 0.706f && stickX < 0.708f &&
+               stickY > 0.706f && stickY < 0.708f,
+           "virtual stick clamps diagonally to the unit circle");
+    stickX = 0.3f;
+    stickY = 0.4f;
+    AndroidWalkClampStick(&stickX, &stickY);
+    Expect(stickX == 0.3f && stickY == 0.4f,
+           "virtual stick keeps partial deflection magnitude");
+    float worldX = 0.0f;
+    float worldY = 0.0f;
+    AndroidWalkCameraRelativeMovement(
+        0.8f, 0.8f, 0.0f, 1.0f, &worldX, &worldY);
+    Expect(worldX > 0.706f && worldX < 0.708f &&
+               worldY > 0.706f && worldY < 0.708f,
+           "diagonal stick keeps its angle and unit speed limit");
+    AndroidWalkCameraRelativeMovement(
+        0.25f, 0.5f, 1.0f, 0.0f, &worldX, &worldY);
+    Expect(worldX == 0.5f && worldY == -0.25f,
+           "movement axes rotate with the camera yaw");
+    AndroidWalkCameraRelativeMovement(
+        0.0f, 0.5f, 0.0f, 0.0f, &worldX, &worldY);
+    Expect(worldX == 0.0f && worldY == 0.5f,
+           "vertical camera fallback preserves horizontal movement");
+    Expect(AndroidWalkAxisToFixed(0.5f) ==
+               LAIUE_CHARACTER_INPUT_AXIS_SCALE / 2,
+           "virtual stick axis converts to normalized fixed point");
+
     LaiueCharacterCollisionV1 collision = {
         .structSize = sizeof(collision),
         .abiVersion = LAIUE_CHARACTER_ABI_VERSION_1,
@@ -165,6 +196,41 @@ LAIUE_TEST_ENTRY(CharacterModuleTestEntryPoint)
     Expect(character->getPosition(controller, &rebased) != 0u &&
                rebased.cellX == 1 && rebased.cellY == -1,
            "origin rebasing translates cells without resetting the state");
+
+    const LaiueCharacterPositionV1 analogStart = {
+        .cellX = 0,
+        .cellY = 0,
+        .localX = 0,
+        .localY = 0,
+        .localZ = 2500,
+    };
+    LaiueCharacterInputV1 analogInput = {
+        .moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE / 2,
+        .moveY = 0,
+        .flags = LAIUE_CHARACTER_INPUT_ANALOG,
+    };
+    Expect(character->setPosition(controller, &analogStart, 1u) != 0u,
+           "character resets before analog speed check");
+    for (uint32_t tick = 0u; tick < LAIUE_CHARACTER_TICK_HZ; ++tick)
+        Expect(character->step(controller, &analogInput) != 0u,
+               "character accepts bounded analog input");
+    LaiueCharacterPositionV1 halfSpeed;
+    Expect(character->getPosition(controller, &halfSpeed) != 0u &&
+               halfSpeed.localX == LAIUE_CHARACTER_WALK_SPEED / 2,
+           "half joystick deflection moves at half speed");
+    analogInput.moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE / 4;
+    Expect(character->setPosition(controller, &analogStart, 1u) != 0u,
+           "character resets before quarter-speed check");
+    for (uint32_t tick = 0u; tick < LAIUE_CHARACTER_TICK_HZ; ++tick)
+        Expect(character->step(controller, &analogInput) != 0u,
+               "character accepts lower analog input");
+    LaiueCharacterPositionV1 quarterSpeed;
+    Expect(character->getPosition(controller, &quarterSpeed) != 0u &&
+               quarterSpeed.localX == LAIUE_CHARACTER_WALK_SPEED / 4,
+           "quarter joystick deflection moves at quarter speed");
+    analogInput.moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE + 1;
+    Expect(character->step(controller, &analogInput) == 0u,
+           "character rejects analog input outside normalized range");
 
     bool collisionFails = true;
     LaiueCharacterCollisionV1 failingCollision = {

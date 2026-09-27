@@ -233,7 +233,9 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     add_test(NAME laiue.mod.content_module COMMAND laiue_content_module_test)
 
     add_executable(laiue_character_module_test character_module_test.c)
-    target_link_libraries(laiue_character_module_test PRIVATE laiue_bootstrap)
+    target_link_libraries(laiue_character_module_test PRIVATE
+        laiue_bootstrap
+        laiue::math_support)
     target_compile_definitions(laiue_character_module_test PRIVATE LAIUE_STATIC=1)
     laiue_configure_standalone_executable(
         laiue_character_module_test CharacterModuleTestEntryPoint)

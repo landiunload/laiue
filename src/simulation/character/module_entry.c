@@ -74,6 +74,22 @@ static bool DivideTickChecked(int64_t value, int64_t remainder,
     return true;
 }
 
+static bool DivideHorizontalChecked(int64_t value, int64_t remainder,
+                                    int64_t *outDelta, int64_t *outRemainder)
+{
+    const int64_t denominator = (int64_t)LAIUE_CHARACTER_TICK_HZ *
+                                LAIUE_CHARACTER_INPUT_AXIS_SCALE;
+    if (outDelta == NULL || outRemainder == NULL || remainder <= -denominator ||
+        remainder >= denominator ||
+        (value > 0 && remainder > INT64_MAX - value) ||
+        (value < 0 && remainder < INT64_MIN - value))
+        return false;
+    const int64_t total = value + remainder;
+    *outDelta = total / denominator;
+    *outRemainder = total % denominator;
+    return true;
+}
+
 /* Floor division keeps local coordinates in [0, cellSize), including for
  * negative positions. C's remainder is truncating, so normalize it here. */
 static bool NormalizeAxis(int64_t *cell, int64_t *local)
@@ -195,17 +211,29 @@ static uint32_t CharacterStep(
     const int64_t speed = (input->flags & LAIUE_CHARACTER_INPUT_SPRINT) != 0u
                               ? LAIUE_CHARACTER_SPRINT_SPEED
                               : LAIUE_CHARACTER_WALK_SPEED;
+    const bool analog = (input->flags & LAIUE_CHARACTER_INPUT_ANALOG) != 0u;
+    const int64_t axisLimit = LAIUE_CHARACTER_INPUT_AXIS_SCALE;
+    if (analog &&
+        (input->moveX < -axisLimit || input->moveX > axisLimit ||
+         input->moveY < -axisLimit || input->moveY > axisLimit))
+        return 0u;
+    int64_t axisX = input->moveX;
+    int64_t axisY = input->moveY;
+    if (!analog &&
+        (!MultiplyInt64Checked(axisX, axisLimit, &axisX) ||
+         !MultiplyInt64Checked(axisY, axisLimit, &axisY)))
+        return 0u;
     int64_t deltaX = 0;
     int64_t deltaY = 0;
-    if (!MultiplyInt64Checked(speed, (int64_t)input->moveX, &deltaX) ||
-        !MultiplyInt64Checked(speed, (int64_t)input->moveY, &deltaY))
+    if (!MultiplyInt64Checked(speed, axisX, &deltaX) ||
+        !MultiplyInt64Checked(speed, axisY, &deltaY))
         return 0u;
     int64_t remainderX = 0;
     int64_t remainderY = 0;
-    if (!DivideTickChecked(deltaX, controller->horizontalRemainderX,
-                           &deltaX, &remainderX) ||
-        !DivideTickChecked(deltaY, controller->horizontalRemainderY,
-                           &deltaY, &remainderY))
+    if (!DivideHorizontalChecked(deltaX, controller->horizontalRemainderX,
+                                 &deltaX, &remainderX) ||
+        !DivideHorizontalChecked(deltaY, controller->horizontalRemainderY,
+                                 &deltaY, &remainderY))
         return 0u;
 
     uint32_t candidateGrounded = controller->grounded;
