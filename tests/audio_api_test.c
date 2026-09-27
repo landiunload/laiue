@@ -276,12 +276,13 @@ static void CheckGeneralRuns(void)
         .masterVolume = 1.0f,
     };
 
-    // Шаг 0,5 в цикле и обрыв на шаге 2,5 — обе границы общей ветви.
-    const double steps[3] = {0.5, 2.5, 2.5};
-    const bool looping[3] = {true, true, false};
-    const uint32_t channels[3] = {1u, 2u, 1u};
+    // Дробные случаи проверяют общую ветвь; целые шаги 2 покрывают быстрый
+    // путь через границу клипа и естественное завершение незацикленного голоса.
+    const double steps[6] = {0.5, 2.5, 2.5, 2.0, 2.0, 2.0};
+    const bool looping[6] = {true, true, false, true, false, false};
+    const uint32_t channels[6] = {1u, 2u, 1u, 1u, 2u, 1u};
 
-    for (uint32_t scenario = 0u; scenario < 3u; ++scenario)
+    for (uint32_t scenario = 0u; scenario < 6u; ++scenario)
     {
         AudioDevice *device = NULL;
         Expect(AudioDeviceCreate(&configuration, &device) == AUDIO_RESULT_OK,
@@ -297,7 +298,8 @@ static void CheckGeneralRuns(void)
             .speed = (float)steps[scenario],
             .looping = looping[scenario],
         };
-        Expect(AudioVoicePlay(device, clip, &parameters) != AUDIO_VOICE_NONE,
+        AudioVoice voice = AudioVoicePlay(device, clip, &parameters);
+        Expect(voice != AUDIO_VOICE_NONE,
                "general-run voice could not be started");
 
         bool identical = true;
@@ -317,7 +319,9 @@ static void CheckGeneralRuns(void)
                             && SameBits(frames[index * 2u + 1u], 0.0f);
             }
         }
-        Expect(identical, "fractional-step runs must reproduce the interpolated reference");
+        Expect(identical, "integer and fractional steps must match the sample reference");
+        Expect(AudioVoiceIsActive(device, voice) == looping[scenario],
+               "integer-step voice lifetime must match looping mode");
 
         AudioClipDestroy(clip);
         AudioDeviceDestroy(device);
