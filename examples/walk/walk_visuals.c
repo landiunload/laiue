@@ -1,10 +1,10 @@
 #include "walk_visuals.h"
+#include "walk_math.h"
 
 #include "media/image.h"
 #include "math/scalar.h"
 #include "platform/system.h"
 
-#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stddef.h>
@@ -14,11 +14,9 @@ enum
 {
     WALK_VISUAL_RAGDOLL_BODY_COUNT = 13u,
     WALK_VISUAL_RAGDOLL_HEAD_INDEX = 2u,
-    WALK_RAGDOLL_BEVEL_SEGMENTS = 4u,
-    WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS = 12u,
-    WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS = 8u,
-    WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS = 4u,
-    WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS = 8u,
+    WALK_VISUAL_RAGDOLL_JOINT_COUNT = 12u,
+    WALK_RAGDOLL_RADIAL_SEGMENTS = 8u,
+    WALK_RAGDOLL_PROFILE_RINGS = 5u,
 };
 
 static bool DeviceFieldPresent(const LaiueGraphicsDeviceV2 *device,
@@ -680,7 +678,7 @@ static bool WriteRagdollVertex(LaiueGraphicsVertexV2 *output,
             (double)rotation[axis] * local[0] +
             (double)rotation[3u + axis] * local[1] +
             (double)rotation[6u + axis] * local[2];
-        if (!isfinite(value) || fabs(value) > 1000000.0)
+        if (!WalkMathFinite(value) || WalkMathAbs(value) > 1000000.0)
             return false;
         output->position[axis] = (float)value;
     }
@@ -689,56 +687,238 @@ static bool WriteRagdollVertex(LaiueGraphicsVertexV2 *output,
     return true;
 }
 
-static double CornerCoordinate(const VoxelRigidBody *body, uint32_t corner,
-                               uint32_t axis)
-{
-    return (corner & (1u << axis)) != 0u ? body->halfExtent[axis]
-                                          : -body->halfExtent[axis];
-}
+/* A single small mesh follows the solved physical poses. Limb centerlines use
+ * joint anchors, because the diagonal arm colliders are not anatomical bones.
+ * Fixed radial tables avoid rebuilding trigonometry for every rendered frame. */
+static const double radial8[8][2] = {
+    {1.0, 0.0}, {0.7071067811865475, 0.7071067811865475},
+    {0.0, 1.0}, {-0.7071067811865475, 0.7071067811865475},
+    {-1.0, 0.0}, {-0.7071067811865475, -0.7071067811865475},
+    {0.0, -1.0}, {0.7071067811865475, -0.7071067811865475},
+};
+static const double radial12[12][2] = {
+    {1.0, 0.0}, {0.8660254037844386, 0.5}, {0.5, 0.8660254037844386},
+    {0.0, 1.0}, {-0.5, 0.8660254037844386}, {-0.8660254037844386, 0.5},
+    {-1.0, 0.0}, {-0.8660254037844386, -0.5}, {-0.5, -0.8660254037844386},
+    {0.0, -1.0}, {0.5, -0.8660254037844386}, {0.8660254037844386, -0.5},
+};
+static const double latitude8[9][2] = {
+    {0.0, -1.0}, {0.3826834323650898, -0.9238795325112867},
+    {0.7071067811865475, -0.7071067811865475},
+    {0.9238795325112867, -0.3826834323650898}, {1.0, 0.0},
+    {0.9238795325112867, 0.3826834323650898},
+    {0.7071067811865475, 0.7071067811865475},
+    {0.3826834323650898, 0.9238795325112867}, {0.0, 1.0},
+};
+static const uint32_t skinColor = UINT32_C(0xFF9BBCE5);
+static const uint32_t hairColor = UINT32_C(0xFF29394B);
+static const uint32_t shirtColor = UINT32_C(0xFF4488D8);
+static const uint32_t trousersColor = UINT32_C(0xFF695342);
+static const uint32_t bootColor = UINT32_C(0xFF28313B);
 
-static bool WriteRoundedBodyVertex(LaiueGraphicsVertexV2 *output,
-                                   const VoxelRigidBody *body,
-                                   const double center[3], const float rotation[9],
-                                   const double renderOrigin[3],
-                                   const uint8_t faceCorners[4],
-                                   double u, double v, uint32_t color)
+typedef struct WalkRagdollMeshWriter
 {
-    double local[3];
-    const double bevel = Minimum(body->halfExtent[0],
-                                 Minimum(body->halfExtent[1], body->halfExtent[2])) * 0.82;
-    for (uint32_t axis = 0u; axis < 3u; ++axis)
-    {
-        const double low = CornerCoordinate(body, faceCorners[0], axis);
-        const double high = CornerCoordinate(body, faceCorners[1], axis);
-        const double farHigh = CornerCoordinate(body, faceCorners[2], axis);
-        const double farLow = CornerCoordinate(body, faceCorners[3], axis);
-        const double near = low + (high - low) * u;
-        const double far = farLow + (farHigh - farLow) * u;
-        local[axis] = near + (far - near) * v;
-    }
-    double inner[3];
-    double offset[3];
-    double offsetLengthSquared = 0.0;
-    for (uint32_t axis = 0u; axis < 3u; ++axis)
-    {
-        const double limit = Maximum(0.0, body->halfExtent[axis] - bevel);
-        inner[axis] = Maximum(-limit, Minimum(limit, local[axis]));
-        offset[axis] = local[axis] - inner[axis];
-        offsetLengthSquared += offset[axis] * offset[axis];
-    }
-    const double offsetLength = ScalarSqrtDouble(offsetLengthSquared);
-    if (offsetLength > 1.0e-9)
+    LaiueGraphicsVertexV2 *vertices;
+    uint32_t count;
+    const double *origin;
+    double center[3];
+    float rotation[9];
+} WalkRagdollMeshWriter;
+
+static uint32_t LitColor(uint32_t base, const double normal[3],
+                         const float rotation[9])
+{
+    const double length = ScalarSqrtDouble(normal[0] * normal[0] +
+        normal[1] * normal[1] + normal[2] * normal[2]);
+    double illumination = 0.0;
+    static const double light[3] = {-0.45, -0.30, 0.84};
+    if (WalkMathFinite(length) && length > 1.0e-9)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
-            local[axis] = inner[axis] + offset[axis] * bevel / offsetLength;
-    return WriteRagdollVertex(output, center, rotation, renderOrigin, local, color);
-}
-
-static uint32_t ShadeColor(uint32_t base, uint32_t shade)
-{
-    const uint32_t red = ((base >> 0u) & 0xFFu) * shade / 255u;
+            illumination += light[axis] * (rotation[axis] * normal[0] +
+                rotation[3u + axis] * normal[1] + rotation[6u + axis] * normal[2]) / length;
+    const uint32_t shade = (uint32_t)(170.0 + 85.0 *
+        Maximum(0.0, Minimum(1.0, illumination)));
+    const uint32_t red = (base & 0xFFu) * shade / 255u;
     const uint32_t green = ((base >> 8u) & 0xFFu) * shade / 255u;
     const uint32_t blue = ((base >> 16u) & 0xFFu) * shade / 255u;
     return (base & UINT32_C(0xFF000000)) | (blue << 16u) | (green << 8u) | red;
+}
+
+static bool MeshVertex(const WalkRagdollMeshWriter *writer,
+                       LaiueGraphicsVertexV2 *vertex, const double local[3],
+                       const double normal[3], uint32_t color)
+{
+    return WriteRagdollVertex(vertex, writer->center, writer->rotation,
+        writer->origin, local, LitColor(color, normal, writer->rotation));
+}
+
+static bool MeshTriangle(WalkRagdollMeshWriter *writer,
+                         const LaiueGraphicsVertexV2 *a,
+                         const LaiueGraphicsVertexV2 *b,
+                         const LaiueGraphicsVertexV2 *c)
+{
+    if (writer->count > WALK_RAGDOLL_VISUAL_VERTEX_COUNT - 3u)
+        return false;
+    writer->vertices[writer->count++] = *a;
+    writer->vertices[writer->count++] = *b;
+    writer->vertices[writer->count++] = *c;
+    return true;
+}
+
+static bool MeshEllipsoid(WalkRagdollMeshWriter *writer,
+                          const double offset[3], const double radius[3],
+                          uint32_t color, bool head)
+{
+    const uint32_t longitudeCount = head ? 12u : 8u;
+    const uint32_t latitudeCount = head ? 8u : 4u;
+    const double (*radial)[2] = head ? radial12 : radial8;
+    LaiueGraphicsVertexV2 points[86];
+    for (uint32_t latitude = 1u; latitude < latitudeCount; ++latitude)
+        for (uint32_t longitude = 0u; longitude < longitudeCount; ++longitude)
+        {
+            const double *ring = latitude8[latitude * 8u / latitudeCount];
+            const double unit[3] = {ring[0] * radial[longitude][0],
+                                     ring[0] * radial[longitude][1], ring[1]};
+            double local[3], normal[3];
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                local[axis] = offset[axis] + radius[axis] * unit[axis];
+                normal[axis] = unit[axis] / radius[axis];
+            }
+            const bool hair = head && (unit[2] >= 0.70 ||
+                                      (unit[1] < -0.35 && unit[2] > -0.05));
+            if (!MeshVertex(writer, &points[(latitude - 1u) * longitudeCount + longitude],
+                            local, normal, hair ? hairColor : color))
+                return false;
+        }
+    const uint32_t bottom = (latitudeCount - 1u) * longitudeCount;
+    const uint32_t top = bottom + 1u;
+    for (uint32_t cap = 0u; cap < 2u; ++cap)
+    {
+        const double normal[3] = {0.0, 0.0, cap == 0u ? -1.0 : 1.0};
+        const double local[3] = {offset[0], offset[1],
+                                  offset[2] + normal[2] * radius[2]};
+        if (!MeshVertex(writer, &points[bottom + cap], local, normal,
+                        head && cap != 0u ? hairColor : color))
+            return false;
+    }
+    for (uint32_t longitude = 0u; longitude < longitudeCount; ++longitude)
+    {
+        const uint32_t next = (longitude + 1u) % longitudeCount;
+        const uint32_t last = (latitudeCount - 2u) * longitudeCount;
+        if (!MeshTriangle(writer, &points[bottom], &points[next], &points[longitude]) ||
+            !MeshTriangle(writer, &points[top], &points[last + longitude], &points[last + next]))
+            return false;
+        for (uint32_t latitude = 0u; latitude + 2u < latitudeCount; ++latitude)
+        {
+            const uint32_t low = latitude * longitudeCount;
+            const uint32_t high = low + longitudeCount;
+            if (!MeshTriangle(writer, &points[low + longitude], &points[low + next],
+                              &points[high + next]) ||
+                !MeshTriangle(writer, &points[low + longitude], &points[high + next],
+                              &points[high + longitude]))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool MeshLoft(WalkRagdollMeshWriter *writer,
+                     const double bottom[3], const double top[3],
+                     double radiusX, double radiusY, const double profile[5],
+                     uint32_t color)
+{
+    static const double levels[5] = {0.0, 0.12, 0.5, 0.88, 1.0};
+    double direction[3], side[3];
+    double lengthSquared = 0.0;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        direction[axis] = top[axis] - bottom[axis];
+        lengthSquared += direction[axis] * direction[axis];
+    }
+    const double length = ScalarSqrtDouble(lengthSquared);
+    if (!(length > 1.0e-6))
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        direction[axis] /= length;
+    /* All humanoid limb anchors lie in the local XZ plane. Use a stable
+     * perpendicular basis even if an asset later supplies a Y component. */
+    const double reference[3] = {WalkMathAbs(direction[0]) < 0.9 ? 1.0 : 0.0,
+                                 WalkMathAbs(direction[0]) < 0.9 ? 0.0 : 1.0, 0.0};
+    const double dot = reference[0] * direction[0] + reference[1] * direction[1];
+    double sideLengthSquared = 0.0;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        side[axis] = reference[axis] - dot * direction[axis];
+        sideLengthSquared += side[axis] * side[axis];
+    }
+    const double sideLength = ScalarSqrtDouble(sideLengthSquared);
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        side[axis] /= sideLength;
+    const double front[3] = {
+        direction[1] * side[2] - direction[2] * side[1],
+        direction[2] * side[0] - direction[0] * side[2],
+        direction[0] * side[1] - direction[1] * side[0],
+    };
+    LaiueGraphicsVertexV2 points[42];
+    for (uint32_t ring = 0u; ring < WALK_RAGDOLL_PROFILE_RINGS; ++ring)
+        for (uint32_t radial = 0u; radial < WALK_RAGDOLL_RADIAL_SEGMENTS; ++radial)
+        {
+            double local[3], normal[3];
+            const double capSlope = ring == 0u ? -0.8 : (ring == 4u ? 0.8 : 0.0);
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                local[axis] = bottom[axis] + direction[axis] * length * levels[ring] +
+                    profile[ring] * (side[axis] * radial8[radial][0] * radiusX +
+                                     front[axis] * radial8[radial][1] * radiusY);
+                normal[axis] = side[axis] * radial8[radial][0] +
+                               front[axis] * radial8[radial][1] + capSlope * direction[axis];
+            }
+            if (!MeshVertex(writer, &points[ring * 8u + radial], local, normal, color))
+                return false;
+        }
+    double bottomNormal[3] = {-direction[0], -direction[1], -direction[2]};
+    if (!MeshVertex(writer, &points[40], bottom, bottomNormal, color) ||
+        !MeshVertex(writer, &points[41], top, direction, color))
+        return false;
+    for (uint32_t radial = 0u; radial < WALK_RAGDOLL_RADIAL_SEGMENTS; ++radial)
+    {
+        const uint32_t next = (radial + 1u) % WALK_RAGDOLL_RADIAL_SEGMENTS;
+        if (!MeshTriangle(writer, &points[40], &points[next], &points[radial]) ||
+            !MeshTriangle(writer, &points[41], &points[32u + radial], &points[32u + next]))
+            return false;
+        for (uint32_t ring = 0u; ring + 1u < WALK_RAGDOLL_PROFILE_RINGS; ++ring)
+        {
+            const uint32_t low = ring * 8u, high = low + 8u;
+            if (!MeshTriangle(writer, &points[low + radial], &points[low + next],
+                              &points[high + next]) ||
+                !MeshTriangle(writer, &points[low + radial], &points[high + next],
+                              &points[high + radial]))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool MeshEye(WalkRagdollMeshWriter *writer, double x, double y,
+                    double z, double width, double height, uint32_t color)
+{
+    const double normal[3] = {0.0, 1.0, 0.0};
+    const double center[3] = {x, y, z};
+    LaiueGraphicsVertexV2 points[9];
+    if (!MeshVertex(writer, &points[8], center, normal, color))
+        return false;
+    for (uint32_t i = 0u; i < 8u; ++i)
+    {
+        const double point[3] = {x + width * radial8[i][0], y,
+                                  z + height * radial8[i][1]};
+        if (!MeshVertex(writer, &points[i], point, normal, color))
+            return false;
+    }
+    for (uint32_t i = 0u; i < 8u; ++i)
+        if (!MeshTriangle(writer, &points[8], &points[(i + 1u) % 8u], &points[i]))
+            return false;
+    return true;
 }
 
 bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
@@ -747,192 +927,126 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
                                     const double renderOrigin[3],
                                     WalkRagdollVisualScratch *scratch)
 {
-    /* Keep the corner order cyclic and in lockstep with FACE_CORNERS in
-     * shaders/chunk.hlsl.  Corner bits are X=1, Y=2, Z=4; the old table
-     * crossed several diagonals, twisting rounded-body faces. */
-    static const uint8_t faceCorners[6][4] = {
-        {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u},
-        {7u, 6u, 2u, 3u}, {4u, 5u, 1u, 0u},
-        {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
-    };
-    static const uint8_t triangles[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-    static const uint32_t colors[WALK_VISUAL_RAGDOLL_BODY_COUNT] = {
-        UINT32_C(0xFF389AE3), UINT32_C(0xFFD67F52), UINT32_C(0xFFA4C9F0),
-        UINT32_C(0xFFD67F52), UINT32_C(0xFFD67F52), UINT32_C(0xFFB8683F),
-        UINT32_C(0xFFB8683F), UINT32_C(0xFF6BA64D), UINT32_C(0xFF6BA64D),
-        UINT32_C(0xFF508035), UINT32_C(0xFF508035), UINT32_C(0xFF313C45),
-        UINT32_C(0xFF313C45),
-    };
     if (device == NULL || buffer == 0u || ragdoll == NULL || !ragdoll->initialized ||
-        ragdoll->bodyCount != WALK_VISUAL_RAGDOLL_BODY_COUNT || renderOrigin == NULL ||
+        ragdoll->bodyCount != WALK_VISUAL_RAGDOLL_BODY_COUNT ||
+        ragdoll->jointCount != WALK_VISUAL_RAGDOLL_JOINT_COUNT || renderOrigin == NULL ||
         scratch == NULL ||
         !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                            sizeof(device->uploadBuffer)) ||
-        device->uploadBuffer == NULL)
+                            sizeof(device->uploadBuffer)) || device->uploadBuffer == NULL)
         return false;
-    LaiueGraphicsVertexV2 *vertices = scratch->vertices;
-    uint32_t count = 0u;
-    for (uint32_t bodyIndex = 0u; bodyIndex < ragdoll->bodyCount; ++bodyIndex)
-    {
-        const VoxelRigidBody *body = &ragdoll->bodies[bodyIndex];
-        double center[3];
-        float rotation[9];
-        if (!VoxelRigidBodyLocalPosition(body, center))
+    for (uint32_t joint = 0u; joint < ragdoll->jointCount; ++joint)
+        if (ragdoll->joints[joint].bodyA >= ragdoll->bodyCount ||
+            ragdoll->joints[joint].bodyB >= ragdoll->bodyCount)
             return false;
-        VoxelRigidBodyOrientationMatrix(body, rotation);
-        if (bodyIndex == WALK_VISUAL_RAGDOLL_HEAD_INDEX)
-        {
-            const double pi = 3.14159265358979323846;
-            for (uint32_t latitude = 0u; latitude < WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS;
-                 ++latitude)
-                for (uint32_t longitude = 0u;
-                     longitude < WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS; ++longitude)
-                {
-                    const double latitudeAngles[2] = {
-                        -0.5 * pi + pi * (double)latitude / WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS,
-                        -0.5 * pi + pi * (double)(latitude + 1u) /
-                                         WALK_RAGDOLL_HEAD_LATITUDE_SEGMENTS,
-                    };
-                    const double longitudeAngles[2] = {
-                        2.0 * pi * (double)longitude / WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS,
-                        2.0 * pi * (double)(longitude + 1u) /
-                                         WALK_RAGDOLL_HEAD_LONGITUDE_SEGMENTS,
-                    };
-                    const double latSin[2] = {ScalarSin((float)latitudeAngles[0]),
-                                               ScalarSin((float)latitudeAngles[1])};
-                    const double latCos[2] = {ScalarCos((float)latitudeAngles[0]),
-                                               ScalarCos((float)latitudeAngles[1])};
-                    const double lonSin[2] = {ScalarSin((float)longitudeAngles[0]),
-                                               ScalarSin((float)longitudeAngles[1])};
-                    const double lonCos[2] = {ScalarCos((float)longitudeAngles[0]),
-                                               ScalarCos((float)longitudeAngles[1])};
-                    const double points[4][3] = {
-                        {body->halfExtent[0] * latCos[0] * lonCos[0],
-                         body->halfExtent[1] * latCos[0] * lonSin[0],
-                         body->halfExtent[2] * latSin[0]},
-                        {body->halfExtent[0] * latCos[0] * lonCos[1],
-                         body->halfExtent[1] * latCos[0] * lonSin[1],
-                         body->halfExtent[2] * latSin[0]},
-                        {body->halfExtent[0] * latCos[1] * lonCos[1],
-                         body->halfExtent[1] * latCos[1] * lonSin[1],
-                         body->halfExtent[2] * latSin[1]},
-                        {body->halfExtent[0] * latCos[1] * lonCos[0],
-                         body->halfExtent[1] * latCos[1] * lonSin[0],
-                         body->halfExtent[2] * latSin[1]},
-                    };
-                    for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                    {
-                        const uint32_t corner = triangles[vertex];
-                        if (!WriteRagdollVertex(&vertices[count++], center, rotation,
-                                                renderOrigin, points[corner],
-                                                ShadeColor(colors[bodyIndex], 238u)))
-                            return false;
-                    }
-                }
-            continue;
-        }
-        for (uint32_t face = 0u; face < 6u; ++face)
-            for (uint32_t cellY = 0u; cellY < WALK_RAGDOLL_BEVEL_SEGMENTS; ++cellY)
-                for (uint32_t cellX = 0u; cellX < WALK_RAGDOLL_BEVEL_SEGMENTS; ++cellX)
-            {
-                const double uv[6][2] = {
-                    {(double)cellX / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)cellY / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                    {(double)(cellX + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)cellY / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                    {(double)(cellX + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)(cellY + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                    {(double)cellX / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)cellY / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                    {(double)(cellX + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)(cellY + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                    {(double)cellX / WALK_RAGDOLL_BEVEL_SEGMENTS,
-                     (double)(cellY + 1u) / WALK_RAGDOLL_BEVEL_SEGMENTS},
-                };
-                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                {
-                    const uint32_t shade = face == 1u ? 255u : (face == 0u ? 238u : 205u);
-                    if (!WriteRoundedBodyVertex(&vertices[count++], body, center, rotation,
-                            renderOrigin, faceCorners[face], uv[vertex][0], uv[vertex][1],
-                            ShadeColor(colors[bodyIndex], shade)))
-                        return false;
-                }
-            }
+    for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+    {
+        double normSquared = 0.0;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            if (!WalkMathFinite(ragdoll->bodies[body].halfExtent[axis]) ||
+                !(ragdoll->bodies[body].halfExtent[axis] > 0.0))
+                return false;
+        for (uint32_t axis = 0u; axis < 4u; ++axis)
+            normSquared += ragdoll->bodies[body].orientation[axis] *
+                           ragdoll->bodies[body].orientation[axis];
+        if (!WalkMathFinite(normSquared) || WalkMathAbs(normSquared - 1.0) > 1.0e-5)
+            return false;
     }
 
-    static const float identity[9] = {1.0f, 0.0f, 0.0f,
-                                      0.0f, 1.0f, 0.0f,
-                                      0.0f, 0.0f, 1.0f};
-    const double pi = 3.14159265358979323846;
-    double latSin[WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
-    double latCos[WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS + 1u];
-    double lonSin[WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
-    double lonCos[WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS + 1u];
-    for (uint32_t i = 0u; i <= WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS; ++i)
+    WalkRagdollMeshWriter writer = {.vertices = scratch->vertices, .origin = renderOrigin};
+    static const double zero[3] = {0.0, 0.0, 0.0};
+    static const double limbProfile[5] = {0.68, 0.94, 1.0, 0.94, 0.68};
+    static const double torsoProfile[5] = {0.76, 0.88, 1.0, 1.12, 0.93};
+    static const double pelvisProfile[5] = {0.78, 0.96, 1.0, 0.93, 0.77};
+    for (uint32_t index = 0u; index < ragdoll->bodyCount; ++index)
     {
-        const double angle = -0.5 * pi + pi * (double)i / WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
-        latSin[i] = ScalarSin((float)angle);
-        latCos[i] = ScalarCos((float)angle);
+        const VoxelRigidBody *body = &ragdoll->bodies[index];
+        if (!VoxelRigidBodyLocalPosition(body, writer.center))
+            return false;
+        VoxelRigidBodyOrientationMatrix(body, writer.rotation);
+        if (index == WALK_VISUAL_RAGDOLL_HEAD_INDEX)
+        {
+            if (!MeshEllipsoid(&writer, zero, body->halfExtent, skinColor, true))
+                return false;
+            /* +Y is the shared controller's forward direction. Features rotate
+             * with the physical head, making facing direction readable. */
+            for (uint32_t eye = 0u; eye < 2u; ++eye)
+            {
+                const double x = (eye == 0u ? -0.36 : 0.36) * body->halfExtent[0];
+                if (!MeshEye(&writer, x, body->halfExtent[1] * 1.005,
+                        body->halfExtent[2] * 0.12, body->halfExtent[0] * 0.21,
+                        body->halfExtent[2] * 0.24, UINT32_C(0xFFF3F3F3)) ||
+                    !MeshEye(&writer, x, body->halfExtent[1] * 1.02,
+                        body->halfExtent[2] * 0.10, body->halfExtent[0] * 0.095,
+                        body->halfExtent[2] * 0.14, UINT32_C(0xFF202B36)))
+                    return false;
+            }
+            const double nose[3] = {0.0, body->halfExtent[1] * 0.97, -body->halfExtent[2] * 0.12};
+            const double noseSize[3] = {body->halfExtent[0] * 0.14,
+                body->halfExtent[1] * 0.20, body->halfExtent[2] * 0.16};
+            if (!MeshEllipsoid(&writer, nose, noseSize, skinColor, false) ||
+                !MeshEye(&writer, 0.0, body->halfExtent[1] * 0.94,
+                    -body->halfExtent[2] * 0.42, body->halfExtent[0] * 0.22,
+                    body->halfExtent[2] * 0.038, UINT32_C(0xFF536998)))
+                return false;
+            continue;
+        }
+        double bottom[3] = {0.0, 0.0, -body->halfExtent[2]};
+        double top[3] = {0.0, 0.0, body->halfExtent[2]};
+        double width = body->halfExtent[0], depth = body->halfExtent[1];
+        uint32_t color = index == 1u || (index >= 3u && index <= 6u) ? shirtColor :
+                         (index < 11u ? trousersColor : bootColor);
+        const double *profile = index == 0u ? pelvisProfile :
+                                (index == 1u ? torsoProfile : limbProfile);
+        if (index >= 3u && index <= 10u)
+        {
+            for (uint32_t jointIndex = 0u; jointIndex < ragdoll->jointCount; ++jointIndex)
+            {
+                const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[jointIndex];
+                if (joint->bodyB == index)
+                    memcpy(top, joint->anchorB, sizeof(top));
+                if (joint->bodyA == index)
+                    memcpy(bottom, joint->anchorA, sizeof(bottom));
+            }
+            /* The upper-arm box spans a diagonal bone; its X extent measures
+             * that diagonal, not arm thickness. */
+            width = Minimum(width, depth) * 0.94;
+            depth *= 0.94;
+        }
+        if (index == 5u || index == 6u)
+        {
+            /* The forearm drives the palm as a rigid attachment. With the
+             * 1.8 m humanoid, the fingertips reach about 0.82 m at rest. */
+            const double hand[3] = {bottom[0], bottom[1], bottom[2]};
+            const double handSize[3] = {width * 0.95, depth * 0.74, depth * 1.55};
+            if (!MeshEllipsoid(&writer, hand, handSize, skinColor, false))
+                return false;
+            bottom[2] += depth * 0.8;
+        }
+        if (!MeshLoft(&writer, bottom, top, width, depth, profile, color))
+            return false;
     }
-    for (uint32_t i = 0u; i <= WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS; ++i)
+    for (uint32_t index = 0u; index < ragdoll->jointCount; ++index)
     {
-        const double angle = 2.0 * pi * (double)i / WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS;
-        lonSin[i] = ScalarSin((float)angle);
-        lonCos[i] = ScalarCos((float)angle);
-    }
-    for (uint32_t jointIndex = 0u; jointIndex < ragdoll->jointCount; ++jointIndex)
-    {
-        const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[jointIndex];
+        const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[index];
         const VoxelRigidBody *parent = &ragdoll->bodies[joint->bodyA];
         const VoxelRigidBody *child = &ragdoll->bodies[joint->bodyB];
-        double center[3];
-        float rotation[9];
-        if (!VoxelRigidBodyLocalPosition(parent, center))
+        if (!VoxelRigidBodyLocalPosition(parent, writer.center))
             return false;
-        VoxelRigidBodyOrientationMatrix(parent, rotation);
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-            center[axis] += (double)rotation[axis] * joint->anchorA[0] +
-                            (double)rotation[3u + axis] * joint->anchorA[1] +
-                            (double)rotation[6u + axis] * joint->anchorA[2];
-        double smallest = DBL_MAX;
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-        {
-            const double extent = Minimum(parent->halfExtent[axis], child->halfExtent[axis]);
-            if (extent < smallest)
-                smallest = extent;
-        }
-        const double radius = smallest * 0.88;
-        for (uint32_t latitude = 0u; latitude < WALK_RAGDOLL_JOINT_LATITUDE_SEGMENTS;
-             ++latitude)
-            for (uint32_t longitude = 0u;
-                 longitude < WALK_RAGDOLL_JOINT_LONGITUDE_SEGMENTS; ++longitude)
-            {
-                const double points[4][3] = {
-                    {radius * latCos[latitude] * lonCos[longitude],
-                     radius * latCos[latitude] * lonSin[longitude],
-                     radius * latSin[latitude]},
-                    {radius * latCos[latitude] * lonCos[longitude + 1u],
-                     radius * latCos[latitude] * lonSin[longitude + 1u],
-                     radius * latSin[latitude]},
-                    {radius * latCos[latitude + 1u] * lonCos[longitude + 1u],
-                     radius * latCos[latitude + 1u] * lonSin[longitude + 1u],
-                     radius * latSin[latitude + 1u]},
-                    {radius * latCos[latitude + 1u] * lonCos[longitude],
-                     radius * latCos[latitude + 1u] * lonSin[longitude],
-                     radius * latSin[latitude + 1u]},
-                };
-                for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                    if (!WriteRagdollVertex(&vertices[count++], center, identity,
-                                            renderOrigin, points[triangles[vertex]],
-                                            colors[joint->bodyA]))
-                        return false;
-            }
+        VoxelRigidBodyOrientationMatrix(parent, writer.rotation);
+        const double radius = Minimum(Minimum(parent->halfExtent[0], parent->halfExtent[1]),
+            Minimum(child->halfExtent[0], child->halfExtent[1])) *
+                (joint->bodyB == WALK_VISUAL_RAGDOLL_HEAD_INDEX ? 0.50 : 0.96);
+        const double size[3] = {radius, radius, radius};
+        const uint32_t color = joint->bodyB == 2u ? skinColor :
+                               (joint->bodyB < 7u ? shirtColor : trousersColor);
+        if (!MeshEllipsoid(&writer, joint->anchorA, size, color, false))
+            return false;
     }
-    if (count != WALK_RAGDOLL_VISUAL_VERTEX_COUNT)
+    if (writer.count != WALK_RAGDOLL_VISUAL_VERTEX_COUNT)
         return false;
     const LaiueGraphicsBufferUploadV1 upload = {
         .structSize = sizeof(upload), .buffer = buffer,
-        .data = vertices, .sizeBytes = sizeof(scratch->vertices),
+        .data = writer.vertices, .sizeBytes = sizeof(scratch->vertices),
     };
     return device->uploadBuffer(device, &upload) != 0u;
 }

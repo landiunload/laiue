@@ -1,4 +1,5 @@
 #include "walk_humanoid.h"
+#include "walk_math.h"
 
 #include "humanoid_ragdoll.h"
 #include "platform/system.h"
@@ -28,24 +29,18 @@ static bool FindFootTargetSurface(const VoxelCollisionSource *collision,
         !WalkRagdollCoordinateSafeForVoxelQuery(rootHeight))
         return false;
 
-    const int64_t blockX = (int64_t)floor(x);
-    const int64_t blockY = (int64_t)floor(y);
-    const int64_t highestSurface = (int64_t)floor(rootHeight - 1.0);
-    const int64_t lowestSurface = (int64_t)floor(rootHeight - 3.0);
-    static const int8_t sampleOffsets[5][2] = {
-        {0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1},
-    };
+    const int64_t blockX = (int64_t)WalkMathFloor(x);
+    const int64_t blockY = (int64_t)WalkMathFloor(y);
+    const int64_t highestSurface = (int64_t)WalkMathFloor(rootHeight - 0.30);
+    const int64_t lowestSurface = (int64_t)WalkMathFloor(rootHeight - 1.50);
     for (int64_t surface = highestSurface; surface >= lowestSurface; --surface)
-        for (uint32_t sample = 0u; sample < 5u; ++sample)
         {
             VoxelBlockPhysics below = {0};
             VoxelBlockPhysics above = {0};
             collision->queryBlockPhysics(
-                collision->context, blockX + sampleOffsets[sample][0],
-                blockY + sampleOffsets[sample][1], surface - 1, &below);
+                collision->context, blockX, blockY, surface - 1, &below);
             collision->queryBlockPhysics(
-                collision->context, blockX + sampleOffsets[sample][0],
-                blockY + sampleOffsets[sample][1], surface, &above);
+                collision->context, blockX, blockY, surface, &above);
             if ((below.flags & VOXEL_BLOCK_PHYSICS_SOLID) != 0u &&
                 (above.flags & VOXEL_BLOCK_PHYSICS_SOLID) == 0u)
             {
@@ -80,12 +75,14 @@ static bool DriveFootToward(VoxelRagdoll *ragdoll, uint32_t footIndex,
     if (!VoxelRigidBodyLocalPosition(foot, position) ||
         !VoxelRigidBodyLinearVelocity(foot, velocity))
         return false;
-    const double stiffness = planted ? 82.0 : 52.0;
-    const double damping = planted ? 18.0 : 14.0;
     double acceleration[3];
     for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        const double stiffness = planted ? 350.0 : 52.0;
+        const double damping = planted ? 37.0 : 14.0;
         acceleration[axis] = stiffness * (target[axis] - position[axis]) -
                              damping * (velocity[axis] - targetVelocity[axis]);
+    }
     (void)ClampMagnitude3(acceleration, planted ? 68.0 : 48.0);
     double deltaVelocity[3] = {
         acceleration[0] * deltaSeconds,
@@ -122,7 +119,8 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
             for (uint32_t axis = 0u; axis < 3u; ++axis)
                 controller->footAnchorRelativeToRoot[foot][axis] =
                     footPosition[foot][axis] - root[axis];
-            controller->footAnchorValid[foot] = grounded;
+            controller->footAnchorValid[foot] = grounded &&
+                WalkRagdollFootGrounded(ragdoll, collision, walkHumanoidFootBodies[foot]);
         }
         controller->initialized = true;
     }
@@ -142,17 +140,16 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
             controller->previousRootPosition[axis] = root[axis];
     }
 
-    const double tau = 6.2831853071795864769;
-    const double dutyCycle = 0.60;
+    const double dutyCycle = WALK_RAGDOLL_STANCE_FRACTION;
     const double cycleFrequency = sprint ? 1.85 : 1.30;
     const double targetSpeed = sprint ? 3.2 : 1.2;
     double strideLength = targetSpeed / cycleFrequency;
-    if (strideLength < 0.65)
-        strideLength = 0.65;
-    if (strideLength > 1.5)
-        strideLength = 1.5;
+    if (strideLength < 0.30)
+        strideLength = 0.30;
+    const double maximumStride = sprint ? 0.85 : 0.55;
+    if (strideLength > maximumStride)
+        strideLength = maximumStride;
     const double actualCycleFrequency = cycleFrequency * magnitude;
-    const double phaseCycle = gaitPhase / tau;
     const double forward[2] = {-ScalarSin((float)facingYaw),
                                 ScalarCos((float)facingYaw)};
     const double right[2] = {ScalarCos((float)facingYaw),
@@ -167,10 +164,11 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
     for (uint32_t foot = 0u; foot < 2u; ++foot)
     {
         const double side = foot == WALK_HUMANOID_LEFT_FOOT ? -1.0 : 1.0;
-        double phase = phaseCycle + (foot == WALK_HUMANOID_RIGHT_FOOT ? 0.5 : 0.0);
-        phase -= floor(phase);
+        const double phase = WalkRagdollFootPhase(gaitPhase, foot);
         const bool stance = magnitude < 0.05 || phase < dutyCycle;
-        if (stance && !controller->previousFootStance[foot] &&
+        /* Contact can arrive after the phase boundary, especially on landing.
+         * Capture it then, instead of dragging the foot until the next cycle. */
+        if (!activeJump && stance && !controller->footAnchorValid[foot] &&
             WalkRagdollFootGrounded(ragdoll, collision, walkHumanoidFootBodies[foot]))
         {
             for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -178,7 +176,8 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
                     footPosition[foot][axis] - root[axis];
             controller->footAnchorValid[foot] = true;
         }
-        if (!stance)
+        if (!stance || !WalkRagdollFootContact(
+                           ragdoll, collision, walkHumanoidFootBodies[foot], 0.75))
             controller->footAnchorValid[foot] = false;
         controller->previousFootStance[foot] = stance;
 
@@ -192,6 +191,20 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
             for (uint32_t axis = 0u; axis < 3u; ++axis)
                 target[axis] = root[axis] +
                     controller->footAnchorRelativeToRoot[foot][axis];
+            /* Plant the horizontal contact, not the body's center height.
+             * A sole can tilt around that contact as the articulated leg
+             * moves; holding its old center height drives its corners below
+             * the floor. */
+            const VoxelRigidBody *footBody =
+                &ragdoll->bodies[walkHumanoidFootBodies[foot]];
+            float rotation[9];
+            VoxelRigidBodyOrientationMatrix(footBody, rotation);
+            double surface;
+            if (FindFootTargetSurface(collision, target[0], target[1], root[2], &surface))
+                target[2] = surface + 0.005 +
+                    footBody->halfExtent[0] * WalkMathAbs((double)rotation[2]) +
+                    footBody->halfExtent[1] * WalkMathAbs((double)rotation[5]) +
+                    footBody->halfExtent[2] * WalkMathAbs((double)rotation[8]);
         }
         else
         {
@@ -205,8 +218,9 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
                 const double smoothDerivative = 6.0 * swingPhase *
                                                 (1.0 - swingPhase);
                 step = (smoothStep - 0.5) * strideLength;
-                lift = 0.22 * ScalarSin((float)(3.1415926535897932385 *
-                                                swingPhase));
+                const double liftSin = ScalarSin((float)(3.1415926535897932385 *
+                                                           swingPhase));
+                lift = 0.16 * liftSin * liftSin;
                 const double swingDuration =
                     (1.0 - dutyCycle) / actualCycleFrequency;
                 if (swingDuration > 1.0e-5)
@@ -215,7 +229,7 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
                                              swingDuration;
                     targetVelocity[0] = forward[0] * stepSpeed;
                     targetVelocity[1] = forward[1] * stepSpeed;
-                    targetVelocity[2] = 0.22 * 3.1415926535897932385 *
+                    targetVelocity[2] = 0.32 * 3.1415926535897932385 * liftSin *
                         ScalarCos((float)(3.1415926535897932385 * swingPhase)) /
                         swingDuration;
                 }
@@ -223,27 +237,56 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
             else
             {
                 const double desiredStep =
-                    (0.5 - phase / dutyCycle) * 0.18;
+                    (0.5 - phase / dutyCycle) * 0.08;
                 step = desiredStep;
             }
-            target[0] = root[0] + side * 0.48 * right[0] +
-                        (0.15 + step) * forward[0];
-            target[1] = root[1] + side * 0.48 * right[1] +
-                        (0.15 + step) * forward[1];
+            const double halfStance = 0.10 + 0.04 * magnitude;
+            target[0] = root[0] + side * halfStance * right[0] +
+                        (0.06 + step) * forward[0];
+            target[1] = root[1] + side * halfStance * right[1] +
+                        (0.06 + step) * forward[1];
+            if (!controller->footAnchorValid[foot])
+            {
+                /* Turn around the supporting foot, not through it. Project
+                 * both oriented soles onto the outward stepping direction. */
+                double separation = 0.025;
+                for (uint32_t sole = 0u; sole < 2u; ++sole)
+                {
+                    const VoxelRigidBody *body = &ragdoll->bodies[walkHumanoidFootBodies[sole]];
+                    float rotation[9];
+                    VoxelRigidBodyOrientationMatrix(body, rotation);
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                        separation += body->halfExtent[axis] *
+                            WalkMathAbs(rotation[3u * axis] * right[0] +
+                                 rotation[3u * axis + 1u] * right[1]);
+                }
+                const uint32_t other = 1u - foot;
+                const double projected = side *
+                    ((target[0] - footPosition[other][0]) * right[0] +
+                     (target[1] - footPosition[other][1]) * right[1]);
+                if (projected < separation)
+                {
+                    target[0] += side * (separation - projected) * right[0];
+                    target[1] += side * (separation - projected) * right[1];
+                }
+            }
             float footRotation[9];
             VoxelRigidBodyOrientationMatrix(
                 &ragdoll->bodies[walkHumanoidFootBodies[foot]], footRotation);
             const VoxelRigidBody *footBody =
                 &ragdoll->bodies[walkHumanoidFootBodies[foot]];
             const double footVerticalExtent =
-                footBody->halfExtent[0] * fabs((double)footRotation[2]) +
-                footBody->halfExtent[1] * fabs((double)footRotation[5]) +
-                footBody->halfExtent[2] * fabs((double)footRotation[8]);
+                footBody->halfExtent[0] * WalkMathAbs((double)footRotation[2]) +
+                footBody->halfExtent[1] * WalkMathAbs((double)footRotation[5]) +
+                footBody->halfExtent[2] * WalkMathAbs((double)footRotation[8]);
             double surfaceHeight;
             const bool surfaceFound = FindFootTargetSurface(
                 collision, target[0], target[1], root[2], &surfaceHeight);
-            target[2] = (surfaceFound ? surfaceHeight + footVerticalExtent + 0.02
-                                      : footPosition[foot][2]) + lift;
+            /* A neighboring voxel is not support under this target. Let the
+             * foot fall into empty space instead of holding it over a ledge. */
+            if (!surfaceFound)
+                continue;
+            target[2] = surfaceHeight + footVerticalExtent + 0.02 + lift;
         }
         if (!DriveFootToward(ragdoll, foot, target, targetVelocity,
                              stance && controller->footAnchorValid[foot],
@@ -255,23 +298,29 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
 
 static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
                                        const VoxelCollisionSource *collision,
+                                       const bool stance[2],
+                                       double gaitAmount, bool sprint,
                                        double deltaSeconds)
 {
     double supportHeight = 0.0;
-    double supportVelocity = 0.0;
     uint32_t supportCount = 0u;
+    bool supported[2] = {false, false};
     for (uint32_t foot = 0u; foot < 2u; ++foot)
     {
         const uint32_t bodyIndex = walkHumanoidFootBodies[foot];
-        if (!WalkRagdollFootGrounded(ragdoll, collision, bodyIndex))
+        if (!stance[foot] || !WalkRagdollFootContact(ragdoll, collision, bodyIndex, 0.75))
             continue;
         double position[3];
-        double velocity[3];
-        if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[bodyIndex], position) ||
-            !VoxelRigidBodyLinearVelocity(&ragdoll->bodies[bodyIndex], velocity))
+        if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[bodyIndex], position))
             return false;
-        supportHeight += position[2];
-        supportVelocity += velocity[2];
+        double surface;
+        if (!FindFootTargetSurface(collision, position[0], position[1],
+                                    position[2] + 0.94, &surface))
+            continue;
+        /* Voxels are stationary. Following the sole's bounce velocity fed it
+         * back into the pelvis spring and amplified each small contact bounce. */
+        supportHeight += surface + walkRagdollBodies[bodyIndex].halfExtent[2];
+        supported[foot] = true;
         ++supportCount;
     }
     double rootPosition[3];
@@ -284,8 +333,10 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
     double targetVelocity = 0.0;
     if (supportCount != 0u)
     {
-        targetHeight = supportHeight / supportCount + 1.55;
-        targetVelocity = supportVelocity / supportCount;
+        /* Bias the moving support height slightly lower. Leg IK and the
+         * compliant physical joints supply the rest of the knee flexion. */
+        targetHeight = supportHeight / supportCount + 0.94 -
+                       (sprint ? 0.06 : 0.02) * gaitAmount;
     }
     else
     {
@@ -298,56 +349,56 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
         float rotation[9];
         VoxelRigidBodyOrientationMatrix(pelvis, rotation);
         const double bottomExtent =
-            pelvis->halfExtent[0] * fabs((double)rotation[2]) +
-            pelvis->halfExtent[1] * fabs((double)rotation[5]) +
-            pelvis->halfExtent[2] * fabs((double)rotation[8]);
+            pelvis->halfExtent[0] * WalkMathAbs((double)rotation[2]) +
+            pelvis->halfExtent[1] * WalkMathAbs((double)rotation[5]) +
+            pelvis->halfExtent[2] * WalkMathAbs((double)rotation[8]);
         const double bottom = rootPosition[2] - bottomExtent;
         if (!WalkRagdollCoordinateSafeForVoxelQuery(bottom) ||
             !WalkRagdollCoordinateSafeForVoxelQuery(rootPosition[0]) ||
             !WalkRagdollCoordinateSafeForVoxelQuery(rootPosition[1]))
             return true;
-        const int64_t centerX = (int64_t)floor(rootPosition[0]);
-        const int64_t centerY = (int64_t)floor(rootPosition[1]);
-        const int64_t nearestSurface = (int64_t)floor(bottom + 0.5);
-        static const int8_t sampleOffsets[5][2] = {
-            {0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1},
-        };
+        const int64_t centerX = (int64_t)WalkMathFloor(rootPosition[0]);
+        const int64_t centerY = (int64_t)WalkMathFloor(rootPosition[1]);
+        const int64_t nearestSurface = (int64_t)WalkMathFloor(bottom + 0.5);
         bool bodyContact = false;
         int64_t contactSurface = 0;
         double nearestGap = INFINITY;
-        for (uint32_t sample = 0u; sample < 5u; ++sample)
-            for (int64_t offset = -1; offset <= 1; ++offset)
+        for (int64_t offset = -1; offset <= 1; ++offset)
             {
                 const int64_t surface = nearestSurface + offset;
                 const double gap = bottom - (double)surface;
-                if (gap < -0.08 || gap > 0.10 || fabs(gap) >= nearestGap)
+                if (gap < -0.08 || gap > 0.10 || WalkMathAbs(gap) >= nearestGap)
                     continue;
                 VoxelBlockPhysics below = {0};
                 VoxelBlockPhysics above = {0};
                 collision->queryBlockPhysics(
-                    collision->context, centerX + sampleOffsets[sample][0],
-                    centerY + sampleOffsets[sample][1], surface - 1, &below);
+                    collision->context, centerX, centerY, surface - 1, &below);
                 collision->queryBlockPhysics(
-                    collision->context, centerX + sampleOffsets[sample][0],
-                    centerY + sampleOffsets[sample][1], surface, &above);
+                    collision->context, centerX, centerY, surface, &above);
                 if ((below.flags & VOXEL_BLOCK_PHYSICS_SOLID) != 0u &&
                     (above.flags & VOXEL_BLOCK_PHYSICS_SOLID) == 0u)
                 {
                     bodyContact = true;
                     contactSurface = surface;
-                    nearestGap = fabs(gap);
+                    nearestGap = WalkMathAbs(gap);
                 }
             }
         if (!bodyContact)
             return true;
         targetHeight = (double)contactSurface + bottomExtent + 0.03;
     }
-    double deltaZ = 34.0 * (targetHeight - rootPosition[2]) -
-                    11.0 * (rootVelocity[2] - targetVelocity);
-    if (deltaZ > 16.0)
-        deltaZ = 16.0;
-    else if (deltaZ < -16.0)
-        deltaZ = -16.0;
+    /* The spring controls height error, while the feed-forward term carries
+     * weight. Without it the shorter human rig settles into a permanent squat
+     * (gravity/stiffness metres below its intended stance). */
+    double deltaZ = (supportCount != 0u ? 9.81 : 0.0) +
+                    80.0 * (targetHeight - rootPosition[2]) -
+                    16.0 * (rootVelocity[2] - targetVelocity);
+    if (deltaZ > 26.0)
+        deltaZ = 26.0;
+    else if (deltaZ < -26.0)
+        deltaZ = -26.0;
+    if (supportCount != 0u && deltaZ < 0.0)
+        deltaZ = 0.0;
     const double delta[3] = {0.0, 0.0, deltaZ * deltaSeconds};
     /* Apply a shared support impulse to the articulated island. The contacts
      * on planted feet absorb the downward part, so this restores leg extension
@@ -357,6 +408,27 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
         if (!VoxelRigidBodyAddLinearVelocity(&ragdoll->bodies[body], delta))
             return false;
         VoxelRigidBodyWake(&ragdoll->bodies[body]);
+    }
+    if (supportCount != 0u)
+    {
+        /* Keep the weight-bearing part on the supporting soles so grounding
+         * retains friction. The extra height correction remains an assisted
+         * balance motor, bounded separately from the character's weight. */
+        double totalMass = 0.0;
+        for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
+            totalMass += 1.0 / ragdoll->bodies[body].inverseMass;
+        for (uint32_t foot = 0u; foot < 2u; ++foot)
+            if (supported[foot])
+            {
+                VoxelRigidBody *sole = &ragdoll->bodies[walkHumanoidFootBodies[foot]];
+                double reaction[3] = {0.0, 0.0,
+                    -(deltaZ < 9.81 ? deltaZ : 9.81) * deltaSeconds *
+                    totalMass * sole->inverseMass * 0.5};
+                if (reaction[2] < -32.0 * deltaSeconds)
+                    reaction[2] = -32.0 * deltaSeconds;
+                if (!VoxelRigidBodyAddLinearVelocity(sole, reaction))
+                    return false;
+            }
     }
     return true;
 }
@@ -393,13 +465,15 @@ bool WalkHumanoidInitialize(const LaiuePhysicsServiceV1 *physics,
         .gravity = {0.0, 0.0, -9.81},
         .solverIterations = 16u,
         .penetrationCorrection = 0.55,
-        .penetrationSlop = 0.005,
+        .penetrationSlop = 0.002,
         .sleepLinearSpeed = 0.02,
         .sleepAngularSpeed = 0.05,
         .sleepFrames = 30u,
     };
     physics->configureThread();
     physics->ragdollSettingsDefault(outRagdollSettings);
+    outRagdollSettings->solverIterations = 16u;
+    outRagdollSettings->errorCorrection = 0.5;
     *outScratchBytes = physics->stepScratchBytes(WALK_RAGDOLL_BODY_COUNT);
     if (*outScratchBytes == 0u)
         return false;
@@ -433,21 +507,22 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
 {
     if (outFailure != NULL)
         *outFailure = WALK_HUMANOID_STEP_OK;
-    if (physics == NULL || physics->ragdollStep == NULL || ragdoll == NULL ||
-        controllerState == NULL ||
+    if (physics == NULL || physics->ragdollStep == NULL ||
+        !WalkRagdollHasHumanoidTopology(ragdoll) || controllerState == NULL ||
         collision == NULL || rigidSettings == NULL || ragdollSettings == NULL ||
         scratch == NULL || scratchBytes == 0u || inOutGrounded == NULL ||
-        inOutFacingYaw == NULL || inOutGaitPhase == NULL || !isfinite(moveX) ||
-        !isfinite(moveY) || !isfinite(deltaSeconds) || !(deltaSeconds > 0.0) ||
-        deltaSeconds > 1.0 / 30.0 || !isfinite(*inOutFacingYaw) ||
-        !isfinite(*inOutGaitPhase))
+        inOutFacingYaw == NULL || inOutGaitPhase == NULL || !WalkMathFinite(moveX) ||
+        !WalkMathFinite(moveY) || !WalkMathFinite(deltaSeconds) || !(deltaSeconds > 0.0) ||
+        deltaSeconds > 1.0 / 30.0 || !WalkMathFinite(*inOutFacingYaw) ||
+        !WalkMathFinite(*inOutGaitPhase) || !WalkMathFinite(controllerState->gaitAmount) ||
+        controllerState->gaitAmount < 0.0 || controllerState->gaitAmount > 1.0)
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
         return false;
     }
     const double magnitudeSquared = moveX * moveX + moveY * moveY;
-    if (!isfinite(magnitudeSquared))
+    if (!WalkMathFinite(magnitudeSquared))
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
@@ -466,22 +541,31 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
         const double tau = 6.2831853071795864769;
         const double desiredYaw = ScalarAtan2((float)-moveX, (float)moveY);
         double yawDelta = desiredYaw - *inOutFacingYaw;
-        yawDelta -= floor((yawDelta + 3.1415926535897932385) / tau) * tau;
-        const double maximumTurn = 3.5 * deltaSeconds;
+        yawDelta -= WalkMathFloor((yawDelta + 3.1415926535897932385) / tau) * tau;
+        const double maximumTurn = 2.0 * deltaSeconds;
         if (yawDelta > maximumTurn)
             yawDelta = maximumTurn;
         else if (yawDelta < -maximumTurn)
             yawDelta = -maximumTurn;
         *inOutFacingYaw += yawDelta;
     }
-    if (magnitude > 0.05)
+    *inOutGrounded = WalkRagdollGrounded(ragdoll, collision);
+    const double gaitTarget = *inOutGrounded ? magnitude : 0.0;
+    const double gaitDelta = gaitTarget - controllerState->gaitAmount;
+    const double maximumGaitDelta = 5.0 * deltaSeconds;
+    controllerState->gaitAmount += gaitDelta < -maximumGaitDelta ? -maximumGaitDelta :
+        (gaitDelta > maximumGaitDelta ? maximumGaitDelta : gaitDelta);
+    const double gaitAmount = controllerState->gaitAmount;
+    if (gaitAmount > 0.05)
         *inOutGaitPhase += 6.2831853071795864769 *
-                           (sprint ? 1.85 : 1.30) * magnitude * deltaSeconds;
+                           (sprint ? 1.85 : 1.30) * gaitAmount * deltaSeconds;
     if (*inOutGaitPhase >= 6.2831853071795864769)
-        *inOutGaitPhase -= floor(*inOutGaitPhase /
+        *inOutGaitPhase -= WalkMathFloor(*inOutGaitPhase /
                                  6.2831853071795864769) *
                            6.2831853071795864769;
-    const bool jumped = jump && WalkRagdollJumpIfGrounded(ragdoll, collision, 4.2);
+    const bool jumpPressed = jump && !controllerState->previousJumpInput;
+    controllerState->previousJumpInput = jump;
+    const bool jumped = jumpPressed && WalkRagdollJumpIfGrounded(ragdoll, collision, 4.2);
     if (jumped)
         *inOutGrounded = false;
     double rootPosition[3];
@@ -492,18 +576,23 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
             *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
         return false;
     }
-    if (!WalkRagdollDrivePlanar(ragdoll, moveX, moveY, targetSpeed,
+    /* Acceleration follows the same heading as the steps. Applying the new
+     * input direction instantly used to pull the hips sideways across planted
+     * legs during reversals, even though the torso was still turning. */
+    double driveX = -ScalarSin((float)*inOutFacingYaw);
+    double driveY = ScalarCos((float)*inOutFacingYaw);
+    const double headingLength = ScalarSqrtDouble(driveX * driveX + driveY * driveY);
+    driveX *= magnitude / headingLength;
+    driveY *= magnitude / headingLength;
+    if (!WalkRagdollDrivePlanar(ragdoll, driveX, driveY, targetSpeed,
                                 *inOutGrounded ? 3.5 : 0.25, deltaSeconds))
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_PLANAR_DRIVE;
         return false;
     }
-    const double footYaw = magnitude > 0.05
-        ? ScalarAtan2((float)-moveX, (float)moveY)
-        : *inOutFacingYaw;
     if (!DriveFootsteps(ragdoll, controllerState, collision, rootPosition,
-                        footYaw, magnitude,
+                        *inOutFacingYaw, gaitAmount,
                         *inOutGrounded, jumped, sprint, *inOutGaitPhase,
                         deltaSeconds))
     {
@@ -511,14 +600,16 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
             *outFailure = WALK_HUMANOID_STEP_PLANAR_DRIVE;
         return false;
     }
-    if (!jumped && !DriveSupportedPelvisHeight(ragdoll, collision, deltaSeconds))
+    if (!jumped && !DriveSupportedPelvisHeight(ragdoll, collision,
+                                               controllerState->previousFootStance,
+                                               gaitAmount, sprint, deltaSeconds))
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_PLANAR_DRIVE;
         return false;
     }
-    if (!WalkRagdollPoseDrive(ragdoll, *inOutFacingYaw, *inOutGaitPhase,
-                              magnitude, deltaSeconds))
+    if (!WalkRagdollPoseDriveWithSupport(ragdoll, *inOutFacingYaw, *inOutGaitPhase,
+                              gaitAmount, deltaSeconds, controllerState->footAnchorValid))
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_POSE_DRIVE;
@@ -561,4 +652,141 @@ void WalkHumanoidRelease(const LaiuePhysicsServiceV1 *physics,
         PlatformFree(*scratch);
         *scratch = NULL;
     }
+}
+
+static bool CameraSpaceClear(const VoxelCollisionSource *collision,
+                              const double point[3])
+{
+    int64_t lower[3], upper[3];
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        if (!WalkRagdollCoordinateSafeForVoxelQuery(point[axis]))
+            return false;
+        lower[axis] = (int64_t)WalkMathFloor(point[axis] - 0.15);
+        upper[axis] = (int64_t)WalkMathFloor(point[axis] + 0.15);
+    }
+    for (int64_t z = lower[2]; z <= upper[2]; ++z)
+        for (int64_t y = lower[1]; y <= upper[1]; ++y)
+            for (int64_t x = lower[0]; x <= upper[0]; ++x)
+            {
+                VoxelBlockPhysics block = {0};
+                collision->queryBlockPhysics(collision->context, x, y, z, &block);
+                if ((block.flags & VOXEL_BLOCK_PHYSICS_SOLID) != 0u)
+                    return false;
+            }
+    return true;
+}
+
+bool WalkHumanoidCameraEye(const VoxelRagdoll *ragdoll,
+                           const VoxelCollisionSource *collision,
+                           const float forward[3], bool firstPerson,
+                           double outEye[3])
+{
+    if (ragdoll == NULL || !ragdoll->initialized ||
+        ragdoll->bodyCount != WALK_RAGDOLL_BODY_COUNT || collision == NULL ||
+        collision->queryBlockPhysics == NULL || forward == NULL || outEye == NULL)
+        return false;
+    const double length = ScalarSqrtDouble((double)forward[0] * forward[0] +
+                                            (double)forward[1] * forward[1] +
+                                            (double)forward[2] * forward[2]);
+    if (!WalkMathFinite(length) || length < 1.0e-6)
+        return false;
+    double target[3];
+    if (!VoxelRigidBodyLocalPosition(
+            &ragdoll->bodies[firstPerson ? WALK_RAGDOLL_HEAD : WALK_RAGDOLL_PELVIS],
+            target))
+        return false;
+    target[2] += firstPerson ? 0.02 : 0.40;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        if (!WalkRagdollCoordinateSafeForVoxelQuery(target[axis]))
+            return false;
+    if (firstPerson)
+    {
+        memcpy(outEye, target, sizeof(target));
+        return true;
+    }
+    const double boom[3] = {-3.0 * forward[0] / length,
+                             -3.0 * forward[1] / length,
+                             -3.0 * forward[2] / length};
+    double clearFraction = 0.0;
+    bool foundClearPosition = false;
+    for (uint32_t sample = 1u; sample <= 64u; ++sample)
+    {
+        double blockedFraction = (double)sample / 64.0;
+        double eye[3];
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            eye[axis] = target[axis] + boom[axis] * blockedFraction;
+        if (CameraSpaceClear(collision, eye))
+        {
+            clearFraction = blockedFraction;
+            foundClearPosition = true;
+            continue;
+        }
+        /* A shoulder target can briefly be inside terrain while the ragdoll
+         * is being pushed free. Do not assume the initial point is clear when
+         * refining the sweep: start at the first clear sample and only bisect
+         * after the boom has entered a blocked region from clear space. */
+        if (!foundClearPosition)
+            continue;
+        /* Refine the first obstruction so slow camera motion is not quantized
+         * to the coarse sweep spacing. No allocation or unbounded world scan. */
+        for (uint32_t iteration = 0u; iteration < 5u; ++iteration)
+        {
+            const double middle = (clearFraction + blockedFraction) * 0.5;
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                eye[axis] = target[axis] + boom[axis] * middle;
+            if (CameraSpaceClear(collision, eye))
+                clearFraction = middle;
+            else
+                blockedFraction = middle;
+        }
+        break;
+    }
+    if (!foundClearPosition)
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        outEye[axis] = target[axis] + boom[axis] * clearFraction;
+    return true;
+}
+
+bool WalkHumanoidResolveCameraEye(
+    const VoxelRagdoll *ragdoll, const VoxelCollisionSource *collision,
+    const float forward[3], bool firstPerson, const double fallbackEye[3],
+    double lastSafeThirdPersonEye[3], bool *hasLastSafeThirdPersonEye,
+    double outEye[3])
+{
+    if (fallbackEye == NULL || lastSafeThirdPersonEye == NULL ||
+        hasLastSafeThirdPersonEye == NULL || outEye == NULL)
+        return false;
+    double eye[3];
+    if (WalkHumanoidCameraEye(ragdoll, collision, forward, firstPerson, eye))
+    {
+        if (!firstPerson)
+        {
+            memcpy(lastSafeThirdPersonEye, eye, sizeof(eye));
+            *hasLastSafeThirdPersonEye = true;
+        }
+        memcpy(outEye, eye, sizeof(eye));
+        return true;
+    }
+    if (!firstPerson && *hasLastSafeThirdPersonEye)
+    {
+        bool cacheValid = true;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            cacheValid = cacheValid && WalkMathFinite(lastSafeThirdPersonEye[axis]);
+        if (cacheValid)
+        {
+            memcpy(outEye, lastSafeThirdPersonEye, sizeof(eye));
+            return true;
+        }
+        *hasLastSafeThirdPersonEye = false;
+    }
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+    {
+        if (!WalkMathFinite(fallbackEye[axis]))
+            return false;
+        eye[axis] = fallbackEye[axis];
+    }
+    memcpy(outEye, eye, sizeof(eye));
+    return true;
 }

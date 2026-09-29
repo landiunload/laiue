@@ -11,6 +11,7 @@
 #include "scene/math_service.h"
 #include "../walk_world.h"
 #include "walk_runtime.h"
+#include "../walk_math.h"
 #include "touch_controls.h"
 #include "../humanoid_ragdoll.h"
 #include "../walk_visuals.h"
@@ -100,6 +101,8 @@ struct AndroidWalkState
     float cameraRelativeEye[3];
     float terrainOriginRelative[3];
     double cameraRenderOrigin[3];
+    double lastSafeCameraEye[3];
+    bool lastSafeCameraEyeValid;
     int64_t renderOriginBlock[3];
     float viewProjection[16];
     LaiueVoxelProviderV1 walkProvider;
@@ -349,9 +352,9 @@ static bool AndroidGetChunkCoordinates(AndroidWalkState *state,
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        const double localBlockDouble = floor(pelvis[axis]);
-        const double localChunkDouble = floor(pelvis[axis] / 64.0) * 64.0;
-        if (!isfinite(localBlockDouble) || !isfinite(localChunkDouble) ||
+        const double localBlockDouble = WalkMathFloor(pelvis[axis]);
+        const double localChunkDouble = WalkMathFloor(pelvis[axis] / 64.0) * 64.0;
+        if (!WalkMathFinite(localBlockDouble) || !WalkMathFinite(localChunkDouble) ||
             localBlockDouble < -9223372036854775808.0 ||
             localBlockDouble >= 9223372036854775808.0 ||
             localChunkDouble < -9223372036854775808.0 ||
@@ -404,14 +407,14 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
     double root[3];
     if (!VoxelRigidBodyLocalPosition(
             &state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
-        !isfinite(root[0]) || !isfinite(root[1]))
+        !WalkMathFinite(root[0]) || !WalkMathFinite(root[1]))
     {
         AndroidLog(state, ANDROID_LOG_ERROR, "ragdoll rebase could not read finite root");
         return false;
     }
-    const double shiftXD = floor(root[0] / 64.0) * 64.0;
-    const double shiftYD = floor(root[1] / 64.0) * 64.0;
-    if (fabs(shiftXD) < 1.0 && fabs(shiftYD) < 1.0)
+    const double shiftXD = WalkMathFloor(root[0] / 64.0) * 64.0;
+    const double shiftYD = WalkMathFloor(root[1] / 64.0) * 64.0;
+    if (WalkMathAbs(shiftXD) < 1.0 && WalkMathAbs(shiftYD) < 1.0)
         return true;
     if (shiftXD < -9223372036854775808.0 || shiftXD >= 9223372036854775808.0 ||
         shiftYD < -9223372036854775808.0 || shiftYD >= 9223372036854775808.0)
@@ -448,6 +451,11 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
             return false;
         }
     WalkHumanoidControllerRebase(&state->humanoidController, delta);
+    if (state->lastSafeCameraEyeValid)
+    {
+        state->lastSafeCameraEye[0] -= shiftXD;
+        state->lastSafeCameraEye[1] -= shiftYD;
+    }
     state->ragdollBlockOriginX += shiftX;
     state->ragdollBlockOriginY += shiftY;
     return true;
@@ -492,7 +500,7 @@ static bool AndroidInitializeRagdoll(AndroidWalkState *state)
         .context = state,
         .queryBlockPhysics = AndroidRagdollQueryBlock,
     };
-    const double origin[3] = {0.0, 0.0, 0.7};
+    const double origin[3] = {0.0, 0.0, 1.02};
     if (!WalkHumanoidInitialize(
             state->physics, &state->ragdoll, &state->ragdollCollision, origin,
             ANDROID_WALK_RAGDOLL_STABLE_ID, &state->ragdollRigidSettings,
@@ -1004,36 +1012,16 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene->cameraGetForwardVector != NULL)
             state->scene->cameraGetForwardVector(&state->camera, forward);
-        const double horizontalLength = sqrt((double)forward[0] * forward[0] +
-                                             (double)forward[1] * forward[1]);
-        if (horizontalLength > 0.0001)
-        {
-            forward[0] = (float)(forward[0] / horizontalLength);
-            forward[1] = (float)(forward[1] / horizontalLength);
-        }
-        else
-        {
-            forward[0] = 0.0f;
-            forward[1] = 1.0f;
-        }
-        if (state->firstPerson)
-        {
-            state->cameraRelativeEye[0] =
-                (float)(pelvis[0] - state->cameraRenderOrigin[0]);
-            state->cameraRelativeEye[1] =
-                (float)(pelvis[1] - state->cameraRenderOrigin[1]);
-            state->cameraRelativeEye[2] =
-                (float)(pelvis[2] - state->cameraRenderOrigin[2]) + 1.65f;
-        }
-        else
-        {
-            state->cameraRelativeEye[0] =
-                (float)(pelvis[0] - state->cameraRenderOrigin[0]) - forward[0] * 5.5f;
-            state->cameraRelativeEye[1] =
-                (float)(pelvis[1] - state->cameraRenderOrigin[1]) - forward[1] * 5.5f;
-            state->cameraRelativeEye[2] =
-                (float)(pelvis[2] - state->cameraRenderOrigin[2]) + 2.8f;
-        }
+        double eye[3];
+        const double fallbackEye[3] = {pelvis[0], pelvis[1], pelvis[2] + 1.8};
+        if (!WalkHumanoidResolveCameraEye(
+                &state->ragdoll, &state->ragdollCollision, forward,
+                state->firstPerson, fallbackEye, state->lastSafeCameraEye,
+                &state->lastSafeCameraEyeValid, eye))
+            return;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            state->cameraRelativeEye[axis] =
+                (float)(eye[axis] - state->cameraRenderOrigin[axis]);
     }
     else
     {

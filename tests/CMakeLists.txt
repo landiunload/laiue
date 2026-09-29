@@ -71,6 +71,19 @@ laiue_configure_standalone_executable(
     laiue_walk_world_test WalkWorldTestEntryPoint)
 add_test(NAME laiue.example.walk_world COMMAND laiue_walk_world_test)
 
+if(TARGET laiue_media_support)
+    add_executable(laiue_walk_visuals_test
+        walk_visuals_test.c
+        "${PROJECT_SOURCE_DIR}/examples/walk/walk_visuals.c")
+    target_include_directories(laiue_walk_visuals_test PRIVATE
+        "${PROJECT_SOURCE_DIR}/examples/walk")
+    target_link_libraries(laiue_walk_visuals_test PRIVATE
+        laiue::physics laiue::numeric laiue::math_support laiue::media_support)
+    laiue_configure_standalone_executable(
+        laiue_walk_visuals_test WalkVisualsTestEntryPoint)
+    add_test(NAME laiue.example.walk_visuals COMMAND laiue_walk_visuals_test)
+endif()
+
 add_executable(laiue_task_pool_test task_pool_test.c)
 target_link_libraries(laiue_task_pool_test PRIVATE laiue::task laiue::platform_support)
 laiue_configure_standalone_executable(laiue_task_pool_test TaskPoolTestEntryPoint)
