@@ -4,9 +4,9 @@ This is the smallest public-SDK walk slice. It owns the game-specific base
 provider (grass at `z=0`, earth at `z=-1..-3`, stone below), loads the public
 `laiue.character`, `laiue.physics`, `laiue.voxel`, `laiue.scene`, and
 `laiue.graphics` service tables through the bootstrap, and advances simulation
-at 128 Hz. Desktop keeps the kinematic character controller; Android runs a
-13-part active humanoid ragdoll with pelvis, torso, head, upper/lower arms,
-thighs, shins, and feet. Rendering is camera-relative; mouse-look, WASD, sprint, and jump are
+at 128 Hz. Desktop and Android run the same 13-part active humanoid ragdoll
+with pelvis, torso, head, upper/lower arms, thighs, shins, and feet. Rendering
+is camera-relative; mouse-look, WASD, sprint, and jump are
 enabled when the corresponding optional platform providers are present.
 
 The character provider is optional. Without it the window and diagnostic
@@ -19,7 +19,9 @@ the same fallback is then used without changing the application code.
 
 Build it with `-DLAIUE_BUILD_EXAMPLES=ON`. On Windows graphics builds the
 same executable starts a small windowed session by default: WASD moves,
-Shift sprints, Space jumps, and Escape closes it. `--headless` is retained for
+Shift sprints, Space jumps, mouse-look rotates the camera, `V` switches between
+first- and third-person views, left-click breaks a block, right-click places
+one, and `1`–`3` selects the material. Escape closes the game. `--headless` is retained for
 CI and validates the no-window/no-render bootstrap profile. Window, input and
 graphics are loaded as optional providers; if an artifact is absent or the
 device cannot be created, the example reports the reason and runs the same
@@ -43,7 +45,8 @@ and analog speed, the lower-right orange button toggles sprint, the purple
 button jumps, and dragging the rest of the right half looks around. Touch state
 is cleared on pause, surface recreation, and resize. Vulkan 1.3 uses dynamic
 rendering; Vulkan 1.2 devices use the compatible render-pass
-path, so the same APK does not require a 1.3-only device. The sparse
+path, so the same APK does not require a 1.3-only device. The Android manifest
+declares Vulkan 1.2 as the minimum supported API. The sparse
 voxel module is optional: disabling `LAIUE_ANDROID_WALK_WITH_VOXEL` keeps the
 ragdoll on the example's deterministic infinite base plane. On Android, the
 lower-left stick drives the active ragdoll relative to the camera, the orange

@@ -49,7 +49,7 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeExit(1);
 }
 
-int WalkWorldTestEntryPoint(void)
+LAIUE_TEST_ENTRY(WalkWorldTestEntryPoint)
 {
     TestWorld world = {0};
     const int64_t farX = (INT64_C(1) << 54) + 320;

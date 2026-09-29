@@ -20,6 +20,8 @@ typedef struct WalkHumanoidControllerState
     double footAnchorRelativeToRoot[2][3];
     bool footAnchorValid[2];
     bool previousFootStance[2];
+    bool previousJumpInput;
+    double gaitAmount;
     bool initialized;
 } WalkHumanoidControllerState;
 
@@ -30,6 +32,8 @@ bool WalkHumanoidInitialize(const LaiuePhysicsServiceV1 *physics,
                            VoxelRigidStepSettings *outRigidSettings,
                            VoxelRagdollSettings *outRagdollSettings,
                            void **outScratch, uint32_t *outScratchBytes);
+/* Jump accepts either a one-tick press or a held button. Release is required
+ * before another jump; holding it through a landing never repeats the jump. */
 bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
                       VoxelRagdoll *ragdoll,
                       WalkHumanoidControllerState *controllerState,
@@ -45,5 +49,21 @@ void WalkHumanoidControllerRebase(WalkHumanoidControllerState *controllerState,
                                   const int64_t blockShift[3]);
 bool WalkHumanoidIsGrounded(const VoxelRagdoll *ragdoll,
                             const VoxelCollisionSource *collision);
+/* Shared head/shoulder camera for every platform. Third-person boom is swept
+ * against voxel terrain with near-plane clearance, so walls cannot hide the
+ * character by passing through the camera. Returns false without changing
+ * outEye when inputs are invalid or the entire boom is blocked; callers can
+ * retain their last valid eye. outEye uses ragdoll coordinates. */
+bool WalkHumanoidCameraEye(const VoxelRagdoll *ragdoll,
+                           const VoxelCollisionSource *collision,
+                           const float forward[3], bool firstPerson,
+                           double outEye[3]);
+/* Resolve camera failures without reusing third-person positions in first
+ * person. A successful first-person query leaves the TPP cache untouched. */
+bool WalkHumanoidResolveCameraEye(
+    const VoxelRagdoll *ragdoll, const VoxelCollisionSource *collision,
+    const float forward[3], bool firstPerson, const double fallbackEye[3],
+    double lastSafeThirdPersonEye[3], bool *hasLastSafeThirdPersonEye,
+    double outEye[3]);
 void WalkHumanoidRelease(const LaiuePhysicsServiceV1 *physics,
                          VoxelRagdoll *ragdoll, void **scratch);

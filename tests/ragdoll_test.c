@@ -84,6 +84,49 @@ static void QueryRagdollNoFloor(void *context, int64_t x, int64_t y, int64_t z,
     outBlock->friction = 0.0f;
 }
 
+static void QueryRagdollFloorEdge(void *context, int64_t x, int64_t y, int64_t z,
+                                  VoxelBlockPhysics *outBlock)
+{
+    (void)context;
+    (void)y;
+    outBlock->flags = x < 0 && z < 1 ? VOXEL_BLOCK_PHYSICS_SOLID : 0u;
+    outBlock->friction = 0.75f;
+}
+
+static void QueryCameraWall(void *context, int64_t x, int64_t y, int64_t z,
+                             VoxelBlockPhysics *outBlock)
+{
+    (void)context;
+    (void)x;
+    (void)z;
+    /* One metre thick wall behind the character: -2 <= y < -1. */
+    outBlock->flags = y == -2 ? VOXEL_BLOCK_PHYSICS_SOLID : 0u;
+    outBlock->friction = 0.0f;
+}
+
+static void QueryCameraTargetWall(void *context, int64_t x, int64_t y, int64_t z,
+                                  VoxelBlockPhysics *outBlock)
+{
+    (void)context;
+    (void)x;
+    (void)z;
+    /* The shoulder anchor is inside this solid column while the boom points
+     * away from it. The camera must publish a clear sample, never the anchor. */
+    outBlock->flags = y == 0 ? VOXEL_BLOCK_PHYSICS_SOLID : 0u;
+    outBlock->friction = 0.0f;
+}
+
+static void QueryCameraFullyBlocked(void *context, int64_t x, int64_t y, int64_t z,
+                                    VoxelBlockPhysics *outBlock)
+{
+    (void)context;
+    (void)x;
+    (void)y;
+    (void)z;
+    outBlock->flags = VOXEL_BLOCK_PHYSICS_SOLID;
+    outBlock->friction = 0.0f;
+}
+
 static void HarnessInitialize(RagdollHarness *harness)
 {
     memset(harness, 0, sizeof(*harness));
@@ -94,7 +137,10 @@ static void HarnessInitialize(RagdollHarness *harness)
     harness->rigidSettings.gravity[2] = -9.81;
     harness->rigidSettings.solverIterations = 16u;
     harness->rigidSettings.penetrationCorrection = 0.55;
+    harness->rigidSettings.penetrationSlop = 0.002;
     VoxelRagdollSettingsDefault(&harness->ragdollSettings);
+    harness->ragdollSettings.solverIterations = 16u;
+    harness->ragdollSettings.errorCorrection = 0.5;
     harness->scratchBytes = VoxelRigidBodyStepScratchBytes(WALK_RAGDOLL_BODY_COUNT);
     harness->scratch = PlatformAllocate(harness->scratchBytes, false);
     RagdollExpect(harness->scratchBytes != 0u && harness->scratch != NULL,
@@ -111,7 +157,7 @@ static bool InitializeHumanoid(VoxelRagdoll *ragdoll, uint64_t stableIdBase)
 {
     const VoxelRagdollDefinition definition = {
         .stableIdBase = stableIdBase,
-        .origin = {0.0, 0.0, 0.7},
+        .origin = {0.0, 0.0, 1.0},
         .bodies = walkRagdollBodies,
         .bodyCount = WALK_RAGDOLL_BODY_COUNT,
         .joints = walkRagdollJoints,
@@ -119,6 +165,30 @@ static bool InitializeHumanoid(VoxelRagdoll *ragdoll, uint64_t stableIdBase)
         .rootBody = WALK_RAGDOLL_PELVIS,
     };
     return VoxelRagdollInitialize(ragdoll, &definition);
+}
+
+static void BodyVerticalBounds(const VoxelRigidBody *body, double *bottom, double *top)
+{
+    double position[3];
+    float rotation[9];
+    RagdollExpect(VoxelRigidBodyLocalPosition(body, position),
+                  "metric height check reads a finite body position");
+    VoxelRigidBodyOrientationMatrix(body, rotation);
+    const double extent = body->halfExtent[0] * RagdollAbs(rotation[2]) +
+                          body->halfExtent[1] * RagdollAbs(rotation[5]) +
+                          body->halfExtent[2] * RagdollAbs(rotation[8]);
+    *bottom = position[2] - extent;
+    *top = position[2] + extent;
+}
+
+static void HumanoidSoleAndCrown(const VoxelRagdoll *ragdoll,
+                                 double *sole, double *crown)
+{
+    double leftSole, rightSole, unused;
+    BodyVerticalBounds(&ragdoll->bodies[WALK_RAGDOLL_LEFT_FOOT], &leftSole, &unused);
+    BodyVerticalBounds(&ragdoll->bodies[WALK_RAGDOLL_RIGHT_FOOT], &rightSole, &unused);
+    BodyVerticalBounds(&ragdoll->bodies[WALK_RAGDOLL_HEAD], &unused, crown);
+    *sole = leftSole < rightSole ? leftSole : rightSole;
 }
 
 static double JointErrorSquared(const VoxelRagdoll *ragdoll)
@@ -251,7 +321,7 @@ static bool HasDeepSelfPenetration(const VoxelRagdoll *ragdoll)
                 }
             if (directlyJoined)
                 continue;
-            if (PairPenetratesBeyond(&ragdoll->bodies[left], &ragdoll->bodies[right], 0.06))
+            if (PairPenetratesBeyond(&ragdoll->bodies[left], &ragdoll->bodies[right], 0.025))
             {
                 ragdollPenetratingLeft = left;
                 ragdollPenetratingRight = right;
@@ -290,6 +360,240 @@ static uint64_t HashBodyState(const VoxelRagdoll *ragdoll)
     return hash;
 }
 
+static bool ControllerStatesEqual(const WalkHumanoidControllerState *first,
+                                  const WalkHumanoidControllerState *second)
+{
+    if (first->gaitAmount != second->gaitAmount ||
+        first->initialized != second->initialized ||
+        first->previousJumpInput != second->previousJumpInput)
+        return false;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        if (first->previousRootPosition[axis] != second->previousRootPosition[axis])
+            return false;
+    for (uint32_t foot = 0u; foot < 2u; ++foot)
+    {
+        if (first->footAnchorValid[foot] != second->footAnchorValid[foot] ||
+            first->previousFootStance[foot] != second->previousFootStance[foot])
+            return false;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            if (first->footAnchorRelativeToRoot[foot][axis] !=
+                second->footAnchorRelativeToRoot[foot][axis])
+                return false;
+    }
+    return true;
+}
+
+static void RunMetricStandingRegression(RagdollHarness *harness)
+{
+    VoxelRagdoll *ragdoll = PlatformAllocate(sizeof(*ragdoll), false);
+    RagdollExpect(ragdoll != NULL, "metric standing test allocates a humanoid");
+    memset(ragdoll, 0, sizeof(*ragdoll));
+    RagdollExpect(InitializeHumanoid(ragdoll, 15000u),
+                  "metric standing test initializes a humanoid on the one-metre floor");
+    double sole, crown;
+    HumanoidSoleAndCrown(ragdoll, &sole, &crown);
+    RagdollExpect(RagdollAbs(sole - 1.0) < 1.0e-8 &&
+                      RagdollAbs(crown - sole - 1.80) < 1.0e-8,
+                  "rest geometry is exactly 1.80 metres from sole to crown");
+    const LaiuePhysicsServiceV1 physics = {.ragdollStep = VoxelRagdollStep};
+    WalkHumanoidControllerState controller = {0};
+    bool grounded = true;
+    double facing = 0.0, phase = 0.0;
+    double maximumHeightError = 0.0, maximumFloorGap = 0.0;
+    for (uint32_t tick = 0u; tick < 512u; ++tick)
+    {
+        RagdollExpect(WalkHumanoidStep(
+                          &physics, ragdoll, &controller, &harness->collision,
+                          &harness->rigidSettings, &harness->ragdollSettings,
+                          harness->scratch, harness->scratchBytes,
+                          0.0, 0.0, false, false, 1.0 / 128.0,
+                          &grounded, &facing, &phase, NULL),
+                      "the metric humanoid settles through fixed physics steps");
+        if (tick < 384u)
+            continue;
+        HumanoidSoleAndCrown(ragdoll, &sole, &crown);
+        const double heightError = RagdollAbs(crown - sole - 1.80);
+        const double floorGap = RagdollAbs(sole - 1.0);
+        if (heightError > maximumHeightError)
+            maximumHeightError = heightError;
+        if (floorGap > maximumFloorGap)
+            maximumFloorGap = floorGap;
+    }
+    if (maximumHeightError > 0.03 || maximumFloorGap > 0.03)
+    {
+        LaiueTestRuntimeWrite("settled height/sole/max error cm ");
+        RagdollWriteSignedHundredths(crown - sole);
+        LaiueTestRuntimeWrite("/");
+        RagdollWriteSignedHundredths(sole - 1.0);
+        LaiueTestRuntimeWrite("/");
+        RagdollWriteSignedHundredths(maximumHeightError);
+        LaiueTestRuntimeWrite("\r\n");
+        const uint32_t measuredBodies[] = {
+            WALK_RAGDOLL_PELVIS, WALK_RAGDOLL_TORSO, WALK_RAGDOLL_HEAD,
+            WALK_RAGDOLL_LEFT_THIGH, WALK_RAGDOLL_LEFT_SHIN,
+            WALK_RAGDOLL_RIGHT_THIGH, WALK_RAGDOLL_RIGHT_SHIN,
+        };
+        for (uint32_t index = 0u; index < sizeof(measuredBodies) / sizeof(measuredBodies[0]);
+             ++index)
+        {
+            double position[3];
+            float rotation[9];
+            const uint32_t body = measuredBodies[index];
+            (void)VoxelRigidBodyLocalPosition(&ragdoll->bodies[body], position);
+            VoxelRigidBodyOrientationMatrix(&ragdoll->bodies[body], rotation);
+            LaiueTestRuntimeWrite("body/z cm/up percent ");
+            RagdollWriteUint32(body);
+            LaiueTestRuntimeWrite("/");
+            RagdollWriteSignedHundredths(position[2]);
+            LaiueTestRuntimeWrite("/");
+            RagdollWriteSignedHundredths(rotation[8]);
+            LaiueTestRuntimeWrite("\r\n");
+        }
+        LaiueTestRuntimeWrite("max joint gap cm ");
+        RagdollWriteSignedHundredths(ScalarSqrtDouble(JointErrorSquared(ragdoll)));
+        LaiueTestRuntimeWrite("\r\n");
+    }
+    RagdollExpect(grounded && maximumHeightError <= 0.03 && maximumFloorGap <= 0.03,
+                  "settled standing keeps a 1.80m height and floor contact within 3cm");
+    VoxelRagdollRelease(ragdoll);
+    PlatformFree(ragdoll);
+}
+
+static void RunCameraRegression(void)
+{
+    VoxelRagdoll *ragdoll = PlatformAllocate(sizeof(*ragdoll), false);
+    RagdollExpect(ragdoll != NULL, "camera test allocates a humanoid");
+    memset(ragdoll, 0, sizeof(*ragdoll));
+    RagdollExpect(InitializeHumanoid(ragdoll, 16000u),
+                  "camera test initializes a metric humanoid");
+    const VoxelCollisionSource clear = {.queryBlockPhysics = QueryRagdollNoFloor};
+    const VoxelCollisionSource wall = {.queryBlockPhysics = QueryCameraWall};
+    const VoxelCollisionSource embedded = {.queryBlockPhysics = QueryCameraTargetWall};
+    const VoxelCollisionSource fullyBlocked = {.queryBlockPhysics = QueryCameraFullyBlocked};
+    const float forward[3] = {0.0f, 1.0f, 0.0f};
+    double eye[3], head[3], pelvis[3];
+    RagdollExpect(VoxelRigidBodyLocalPosition(&ragdoll->bodies[WALK_RAGDOLL_HEAD], head) &&
+                      VoxelRigidBodyLocalPosition(&ragdoll->bodies[WALK_RAGDOLL_PELVIS], pelvis),
+                  "camera reads the physical head and pelvis");
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &clear, forward, true, eye) &&
+                      eye[0] == head[0] && eye[1] == head[1] &&
+                      RagdollAbs(eye[2] - head[2] - 0.02) < 1.0e-8 &&
+                      RagdollAbs(eye[2] - 1.0 - 1.70) < 1.0e-8,
+                  "first-person eyes follow the head at 1.70m above the floor");
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &clear, forward, false, eye) &&
+                      RagdollAbs(eye[0] - pelvis[0]) < 1.0e-8 &&
+                      RagdollAbs(eye[1] - pelvis[1] + 3.0) < 1.0e-8 &&
+                      RagdollAbs(eye[2] - pelvis[2] - 0.40) < 1.0e-8,
+                  "unobstructed third person keeps a three-metre shoulder boom");
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &wall, forward, false, eye) &&
+                      eye[1] > -0.86 && eye[1] < -0.84,
+                  "the camera boom stops 15cm before a wall instead of crossing it");
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &embedded, forward, false, eye) &&
+                      eye[1] < -1.15,
+                  "a camera target inside terrain advances to a clear point before publishing");
+    eye[0] = 11.0;
+    eye[1] = 12.0;
+    eye[2] = 13.0;
+    RagdollExpect(!WalkHumanoidCameraEye(ragdoll, &fullyBlocked, forward, false, eye) &&
+                      eye[0] == 11.0 && eye[1] == 12.0 && eye[2] == 13.0,
+                  "a fully obstructed camera preserves its last valid position for the caller");
+    const double fallbackEye[3] = {9.0, 8.0, 7.0};
+    double cachedThirdPersonEye[3] = {0.0, 0.0, 0.0};
+    double resolvedEye[3];
+    bool hasCachedThirdPersonEye = false;
+    RagdollExpect(WalkHumanoidResolveCameraEye(
+                      ragdoll, &clear, forward, false, fallbackEye,
+                      cachedThirdPersonEye, &hasCachedThirdPersonEye, resolvedEye) &&
+                      hasCachedThirdPersonEye &&
+                      RagdollAbs(resolvedEye[0] - pelvis[0]) < 1.0e-8 &&
+                      RagdollAbs(resolvedEye[1] - pelvis[1] + 3.0) < 1.0e-8,
+                  "camera resolution stores a successful third-person eye");
+    const double thirdPersonEyeBeforeFirstPerson[3] = {
+        cachedThirdPersonEye[0], cachedThirdPersonEye[1], cachedThirdPersonEye[2]};
+    RagdollExpect(WalkHumanoidResolveCameraEye(
+                      ragdoll, &clear, forward, true, fallbackEye,
+                      cachedThirdPersonEye, &hasCachedThirdPersonEye, resolvedEye) &&
+                      hasCachedThirdPersonEye &&
+                      RagdollAbs(resolvedEye[0] - head[0]) < 1.0e-8 &&
+                      RagdollAbs(resolvedEye[1] - head[1]) < 1.0e-8 &&
+                      RagdollAbs(resolvedEye[2] - head[2] - 0.02) < 1.0e-8 &&
+                      cachedThirdPersonEye[0] == thirdPersonEyeBeforeFirstPerson[0] &&
+                      cachedThirdPersonEye[1] == thirdPersonEyeBeforeFirstPerson[1] &&
+                      cachedThirdPersonEye[2] == thirdPersonEyeBeforeFirstPerson[2],
+                  "first-person camera uses the head without overwriting the TPP cache");
+    RagdollExpect(WalkHumanoidResolveCameraEye(
+                      ragdoll, &fullyBlocked, forward, false, fallbackEye,
+                      cachedThirdPersonEye, &hasCachedThirdPersonEye, resolvedEye) &&
+                      RagdollAbs(resolvedEye[0] - thirdPersonEyeBeforeFirstPerson[0]) < 1.0e-8 &&
+                      RagdollAbs(resolvedEye[1] - thirdPersonEyeBeforeFirstPerson[1]) < 1.0e-8 &&
+                      RagdollAbs(resolvedEye[2] - thirdPersonEyeBeforeFirstPerson[2]) < 1.0e-8,
+                  "blocked TPP after an FPS switch reuses its own prior clear eye");
+    const float pitched[3] = {0.0f, 0.8f, 0.6f};
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &clear, pitched, false, eye) &&
+                      RagdollAbs(eye[1] - pelvis[1] + 2.4) < 1.0e-6 &&
+                      RagdollAbs(eye[2] - pelvis[2] - 0.40 + 1.8) < 1.0e-6,
+                  "camera pitch moves around the shoulder through the complete 3D boom");
+    const float scaled[3] = {0.0f, 8.0f, 6.0f};
+    double scaledEye[3];
+    RagdollExpect(WalkHumanoidCameraEye(ragdoll, &clear, scaled, false, scaledEye) &&
+                      RagdollAbs(eye[1] - scaledEye[1]) < 1.0e-6 &&
+                      RagdollAbs(eye[2] - scaledEye[2]) < 1.0e-6,
+                  "camera distance is independent of forward-vector magnitude");
+    const float invalid[3] = {0.0f, NAN, 0.0f};
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const double previousEye[3] = {eye[0], eye[1], eye[2]};
+    RagdollExpect(!WalkHumanoidCameraEye(ragdoll, &clear, invalid, false, eye) &&
+                      !WalkHumanoidCameraEye(ragdoll, &clear, zero, true, eye) &&
+                      eye[0] == previousEye[0] && eye[1] == previousEye[1] &&
+                      eye[2] == previousEye[2],
+                  "invalid camera input fails without publishing a corrupt eye position");
+    /* TranslateBlocks is the floating-origin rebase API: it subtracts shift. */
+    const int64_t headShift[3] = {0, 0, -1};
+    RagdollExpect(VoxelRigidBodyTranslateBlocks(
+                      &ragdoll->bodies[WALK_RAGDOLL_HEAD], headShift) &&
+                      WalkHumanoidCameraEye(ragdoll, &clear, forward, true, eye) &&
+                      RagdollAbs(eye[2] - head[2] - 1.02) < 1.0e-8,
+                  "first person follows a moving physical head rather than a fixed pelvis offset");
+    VoxelRagdollRelease(ragdoll);
+    PlatformFree(ragdoll);
+}
+
+static void RunHumanoidTopologyRegression(RagdollHarness *harness)
+{
+    VoxelRagdoll *ragdoll = PlatformAllocate(sizeof(*ragdoll), false);
+    RagdollExpect(ragdoll != NULL, "topology test allocates a humanoid");
+    memset(ragdoll, 0, sizeof(*ragdoll));
+    RagdollExpect(InitializeHumanoid(ragdoll, 17000u),
+                  "topology test initializes the canonical humanoid");
+    const uint32_t leftBody = ragdoll->joints[6].bodyB;
+    ragdoll->joints[6].bodyB = ragdoll->joints[7].bodyB;
+    ragdoll->joints[7].bodyB = leftBody;
+    const uint64_t originalBodyHash = HashBodyState(ragdoll);
+    RagdollExpect(!WalkRagdollHasHumanoidTopology(ragdoll) &&
+                      !WalkRagdollPoseDrive(ragdoll, 0.0, 0.0, 0.0, 1.0 / 128.0),
+                  "pose motors reject a ragdoll with a mismatched leg-joint topology");
+    const LaiuePhysicsServiceV1 physics = {.ragdollStep = VoxelRagdollStep};
+    WalkHumanoidControllerState controller = {0};
+    const WalkHumanoidControllerState originalController = controller;
+    bool grounded = true;
+    double facing = 0.0;
+    double phase = 0.0;
+    WalkHumanoidStepFailure failure = WALK_HUMANOID_STEP_OK;
+    RagdollExpect(!WalkHumanoidStep(
+                      &physics, ragdoll, &controller, &harness->collision,
+                      &harness->rigidSettings, &harness->ragdollSettings,
+                      harness->scratch, harness->scratchBytes,
+                      0.0, 0.0, false, false, 1.0 / 128.0,
+                      &grounded, &facing, &phase, &failure) &&
+                      failure == WALK_HUMANOID_STEP_INVALID_STATE &&
+                      HashBodyState(ragdoll) == originalBodyHash &&
+                      ControllerStatesEqual(&controller, &originalController) &&
+                      grounded && facing == 0.0 && phase == 0.0,
+                  "the fixed-step controller rejects a mismatched topology before mutating it");
+    VoxelRagdollRelease(ragdoll);
+    PlatformFree(ragdoll);
+}
+
 static void RunHumanoidReplay(RagdollHarness *harness, VoxelRagdoll *first,
                               VoxelRagdoll *second)
 {
@@ -309,26 +613,45 @@ static void RunHumanoidReplay(RagdollHarness *harness, VoxelRagdoll *first,
     RagdollExpect(VoxelRigidBodyLocalPosition(
                       &first->bodies[WALK_RAGDOLL_PELVIS], startingPelvis),
                   "walking replay reads the initial pelvis position");
-    for (uint32_t tick = 0u; tick < 720u; ++tick)
+    double segmentStart[3];
+    memcpy(segmentStart, startingPelvis, sizeof(segmentStart));
+    double settledPelvis[3] = {0.0, 0.0, 0.0};
+    for (uint32_t tick = 0u; tick < 1024u; ++tick)
     {
-        const double directionX = tick < 240u ? 0.6 : (tick < 480u ? 0.0 : -0.4);
-        const double directionY = tick < 240u ? 0.8 : 0.0;
-        RagdollExpect(WalkHumanoidStep(
+        const double directionX = tick >= 256u && tick < 512u ? 1.0 : 0.0;
+        const double directionY = tick < 256u ? 1.0 : (tick >= 768u ? -1.0 : 0.0);
+        const double previousFacing = facingA;
+        WalkHumanoidStepFailure failure = WALK_HUMANOID_STEP_OK;
+        const bool advanced = WalkHumanoidStep(
                           &physics, first, &controllerA, &harness->collision,
                           &harness->rigidSettings, &harness->ragdollSettings,
                           harness->scratch, harness->scratchBytes,
                           directionX, directionY, false, false, deltaSeconds,
-                          &groundedA, &facingA, &phaseA, NULL) &&
+                          &groundedA, &facingA, &phaseA, &failure) &&
                           WalkHumanoidStep(
                               &physics, second, &controllerB, &harness->collision,
                               &harness->rigidSettings, &harness->ragdollSettings,
                               harness->scratch, harness->scratchBytes,
                               directionX, directionY, false, false, deltaSeconds,
-                              &groundedB, &facingB, &phaseB, NULL),
-                      "fixed-step stance, swing and rigid contacts advance");
+                              &groundedB, &facingB, &phaseB, &failure);
+        if (!advanced)
+        {
+            LaiueTestRuntimeWrite("advance failure tick/code ");
+            RagdollWriteUint32(tick);
+            LaiueTestRuntimeWrite("/");
+            RagdollWriteUint32((uint32_t)failure);
+            LaiueTestRuntimeWrite("\r\n");
+        }
+        RagdollExpect(advanced, "fixed-step stance, swing and rigid contacts advance");
         RagdollExpect(HashBodyState(first) == HashBodyState(second),
                       "identical inputs produce identical body state");
-        if (JointErrorSquared(first) >= 0.0225)
+        RagdollExpect(ControllerStatesEqual(&controllerA, &controllerB) &&
+                          groundedA == groundedB && facingA == facingB &&
+                          phaseA == phaseB,
+                      "turns, stops and restarts replay the complete controller state");
+        RagdollExpect(RagdollAbs(facingA - previousFacing) < 0.0873,
+                      "direction changes turn smoothly without snapping the body");
+        if (JointErrorSquared(first) >= 0.0025)
         {
             LaiueTestRuntimeWrite("joint anchor error at tick ");
             RagdollWriteUint32(tick);
@@ -370,14 +693,53 @@ static void RunHumanoidReplay(RagdollHarness *harness, VoxelRagdoll *first,
         double pelvisPosition[3];
         const bool pelvisPositionOkay = VoxelRigidBodyLocalPosition(
             &first->bodies[WALK_RAGDOLL_PELVIS], pelvisPosition);
-        RagdollExpect(pelvisPositionOkay && pelvisPosition[2] > 1.7 &&
-                          pelvisPosition[2] < 4.5,
+        if (pelvisPositionOkay && (pelvisPosition[2] <= startingPelvis[2] - 0.20 ||
+                                   pelvisPosition[2] >= startingPelvis[2] + 0.20))
+        {
+            LaiueTestRuntimeWrite("pelvis tick/start/current ");
+            RagdollWriteUint32(tick);
+            LaiueTestRuntimeWrite("/");
+            RagdollWriteSignedHundredths(startingPelvis[2]);
+            LaiueTestRuntimeWrite("/");
+            RagdollWriteSignedHundredths(pelvisPosition[2]);
+            LaiueTestRuntimeWrite("\r\n");
+        }
+        RagdollExpect(pelvisPositionOkay &&
+                          pelvisPosition[2] > startingPelvis[2] - 0.20 &&
+                          pelvisPosition[2] < startingPelvis[2] + 0.20,
                       "active gait keeps the pelvis above the planted feet");
         float pelvisRotation[9];
         VoxelRigidBodyOrientationMatrix(&first->bodies[WALK_RAGDOLL_PELVIS],
                                         pelvisRotation);
         RagdollExpect(pelvisRotation[8] > 0.7f,
                       "active gait keeps the pelvis upright beneath the torso");
+        if (tick == 255u || tick == 511u || tick == 1023u)
+        {
+            const double progress =
+                (pelvisPosition[0] - segmentStart[0]) * directionX +
+                (pelvisPosition[1] - segmentStart[1]) * directionY;
+            RagdollExpect(progress > 0.8,
+                          "starting, turning and restarting all move in the requested direction");
+            RagdollExpect(torsoRotation[3] * directionX +
+                              torsoRotation[4] * directionY > 0.8,
+                          "the torso faces the travel direction after completing a turn");
+        }
+        if (tick == 703u)
+            memcpy(settledPelvis, pelvisPosition, sizeof(settledPelvis));
+        if (tick == 767u)
+        {
+            double velocity[3];
+            RagdollExpect(VoxelRigidBodyLinearVelocity(
+                              &first->bodies[WALK_RAGDOLL_PELVIS], velocity),
+                          "stopped controller reports a finite pelvis velocity");
+            const double driftX = pelvisPosition[0] - settledPelvis[0];
+            const double driftY = pelvisPosition[1] - settledPelvis[1];
+            RagdollExpect(driftX * driftX + driftY * driftY < 0.01 &&
+                              velocity[0] * velocity[0] + velocity[1] * velocity[1] < 0.04,
+                          "released input stops the character without persistent skating");
+        }
+        if (tick == 255u || tick == 511u || tick == 767u)
+            memcpy(segmentStart, pelvisPosition, sizeof(segmentStart));
         for (uint32_t body = 0u; body < first->bodyCount; ++body)
         {
             double position[3];
@@ -432,6 +794,191 @@ static void RunGroundedJumpRegression(RagdollHarness *harness, VoxelRagdoll *rag
     VoxelRagdollRelease(ragdoll);
 }
 
+static void RunPlanarIsotropyRegression(void)
+{
+    VoxelRagdoll *cardinal = PlatformAllocate(sizeof(*cardinal), false);
+    VoxelRagdoll *diagonal = PlatformAllocate(sizeof(*diagonal), false);
+    RagdollExpect(cardinal != NULL && diagonal != NULL,
+                  "planar motor test allocates cardinal and diagonal ragdolls");
+    memset(cardinal, 0, sizeof(*cardinal));
+    memset(diagonal, 0, sizeof(*diagonal));
+    RagdollExpect(InitializeHumanoid(cardinal, 14000u) &&
+                      InitializeHumanoid(diagonal, 14000u),
+                  "planar motor test initializes matching ragdolls");
+    const double verticalVelocity[3] = {0.0, 0.0, 2.0};
+    RagdollExpect(VoxelRigidBodyAddLinearVelocity(
+                      &cardinal->bodies[WALK_RAGDOLL_PELVIS], verticalVelocity) &&
+                      VoxelRigidBodyAddLinearVelocity(
+                          &diagonal->bodies[WALK_RAGDOLL_PELVIS], verticalVelocity),
+                  "planar motor test begins with independent vertical motion");
+    const double diagonalComponent = ScalarSqrtDouble(0.5);
+    const double maximumDelta = 3.5 / 128.0;
+    double previousCardinal[3] = {0.0, 0.0, 2.0};
+    double previousDiagonal[3] = {0.0, 0.0, 2.0};
+    for (uint32_t tick = 0u; tick < 192u; ++tick)
+    {
+        const double direction = tick < 64u ? 1.0 : (tick < 128u ? 0.0 : -1.0);
+        RagdollExpect(WalkRagdollDrivePlanar(cardinal, direction, 0.0,
+                                             1.2, 3.5, 1.0 / 128.0) &&
+                          WalkRagdollDrivePlanar(
+                              diagonal, direction * diagonalComponent,
+                              direction * diagonalComponent, 1.2, 3.5, 1.0 / 128.0),
+                      "cardinal and diagonal motors accelerate, brake and reverse");
+        double cardinalVelocity[3], diagonalVelocity[3];
+        RagdollExpect(VoxelRigidBodyLinearVelocity(
+                          &cardinal->bodies[WALK_RAGDOLL_PELVIS], cardinalVelocity) &&
+                          VoxelRigidBodyLinearVelocity(
+                              &diagonal->bodies[WALK_RAGDOLL_PELVIS], diagonalVelocity),
+                      "planar motor velocities remain finite");
+        const double cardinalSpeed = RagdollAbs(cardinalVelocity[0]);
+        const double diagonalSpeed = ScalarSqrtDouble(
+            diagonalVelocity[0] * diagonalVelocity[0] +
+            diagonalVelocity[1] * diagonalVelocity[1]);
+        RagdollExpect(RagdollAbs(cardinalSpeed - diagonalSpeed) < 1.0e-6 &&
+                          RagdollAbs(diagonalVelocity[0] - diagonalVelocity[1]) < 1.0e-8,
+                      "diagonal input gains no acceleration or braking advantage");
+        const double deltaX = diagonalVelocity[0] - previousDiagonal[0];
+        const double deltaY = diagonalVelocity[1] - previousDiagonal[1];
+        RagdollExpect(RagdollAbs(cardinalVelocity[0] - previousCardinal[0]) <=
+                          maximumDelta + 1.0e-8 &&
+                          deltaX * deltaX + deltaY * deltaY <=
+                              maximumDelta * maximumDelta + 1.0e-8 &&
+                          cardinalVelocity[1] == 0.0 && cardinalVelocity[2] == 2.0 &&
+                          diagonalVelocity[2] == 2.0,
+                      "the acceleration budget is radial and never changes vertical motion");
+        if (tick == 63u || tick == 191u)
+            RagdollExpect(cardinalVelocity[0] * direction > 1.19,
+                          "both travel directions reach the requested speed");
+        if (tick == 127u)
+            RagdollExpect(cardinalSpeed < 1.0e-6 && diagonalSpeed < 1.0e-6,
+                          "released cardinal and diagonal input both brake to rest");
+        memcpy(previousCardinal, cardinalVelocity, sizeof(previousCardinal));
+        memcpy(previousDiagonal, diagonalVelocity, sizeof(previousDiagonal));
+    }
+    VoxelRagdollRelease(diagonal);
+    VoxelRagdollRelease(cardinal);
+    PlatformFree(diagonal);
+    PlatformFree(cardinal);
+}
+
+static void RunJumpInputRegression(RagdollHarness *harness)
+{
+    VoxelRagdoll *held = PlatformAllocate(sizeof(*held), false);
+    VoxelRagdoll *pressed = PlatformAllocate(sizeof(*pressed), false);
+    RagdollExpect(held != NULL && pressed != NULL,
+                  "jump input test allocates paired ragdolls");
+    memset(held, 0, sizeof(*held));
+    memset(pressed, 0, sizeof(*pressed));
+    RagdollExpect(InitializeHumanoid(held, 12000u) &&
+                      InitializeHumanoid(pressed, 12000u),
+                  "jump input test initializes identical ragdolls");
+    const LaiuePhysicsServiceV1 physics = {.ragdollStep = VoxelRagdollStep};
+    WalkHumanoidControllerState heldController = {0};
+    WalkHumanoidControllerState pressedController = {0};
+    bool heldGrounded = true;
+    bool pressedGrounded = true;
+    double heldFacing = 0.0, pressedFacing = 0.0;
+    double heldPhase = 0.0, pressedPhase = 0.0;
+    double startingPelvis[3];
+    RagdollExpect(VoxelRigidBodyLocalPosition(
+                      &held->bodies[WALK_RAGDOLL_PELVIS], startingPelvis),
+                  "jump input test reads the starting pelvis");
+    double peakHeight = startingPelvis[2];
+    uint32_t rejectedAirborneRequests = 0u;
+    bool becameAirborne = false;
+    bool landed = false;
+    for (uint32_t tick = 0u; tick < 416u; ++tick)
+    {
+        const bool airborneRequest = !pressedGrounded && tick >= 16u &&
+                                     tick < 80u && tick % 8u == 0u;
+        if (airborneRequest)
+            ++rejectedAirborneRequests;
+        const bool heldJump = tick < 320u || tick == 384u;
+        const bool pressedJump = tick == 0u || airborneRequest || tick == 384u;
+        RagdollExpect(WalkHumanoidStep(
+                          &physics, held, &heldController, &harness->collision,
+                          &harness->rigidSettings, &harness->ragdollSettings,
+                          harness->scratch, harness->scratchBytes,
+                          0.0, 0.0, false, heldJump, 1.0 / 128.0, &heldGrounded,
+                          &heldFacing, &heldPhase, NULL) &&
+                          WalkHumanoidStep(
+                              &physics, pressed, &pressedController, &harness->collision,
+                              &harness->rigidSettings, &harness->ragdollSettings,
+                              harness->scratch, harness->scratchBytes,
+                              0.0, 0.0, false, pressedJump, 1.0 / 128.0,
+                              &pressedGrounded, &pressedFacing, &pressedPhase, NULL),
+                      "held and repeated airborne jump inputs advance normally");
+        RagdollExpect(HashBodyState(held) == HashBodyState(pressed) &&
+                          heldGrounded == pressedGrounded,
+                      "holding jump and pressing it in the air add no extra impulse");
+        double pelvis[3];
+        RagdollExpect(VoxelRigidBodyLocalPosition(
+                          &held->bodies[WALK_RAGDOLL_PELVIS], pelvis),
+                      "jump input test keeps a finite pelvis");
+        if (tick < 320u && pelvis[2] > peakHeight)
+            peakHeight = pelvis[2];
+        becameAirborne = becameAirborne || (tick < 128u && !heldGrounded);
+        landed = landed || (tick > 64u && tick < 320u && heldGrounded);
+        if (tick == 383u)
+            RagdollExpect(heldGrounded,
+                          "one held press lands and remains ready for a new press");
+        if (tick == 384u)
+        {
+            double velocity[3];
+            RagdollExpect(VoxelRigidBodyLinearVelocity(
+                              &held->bodies[WALK_RAGDOLL_PELVIS], velocity) &&
+                              velocity[2] > 2.0 && !heldGrounded,
+                          "releasing and pressing after landing starts a second jump");
+        }
+    }
+    RagdollExpect(becameAirborne && landed && rejectedAirborneRequests >= 3u &&
+                      peakHeight > startingPelvis[2] + 0.30 &&
+                      peakHeight < startingPelvis[2] + 1.50,
+                  "a held jump follows one bounded arc and rejects midair requests");
+    VoxelRagdollRelease(pressed);
+    VoxelRagdollRelease(held);
+    PlatformFree(pressed);
+    PlatformFree(held);
+}
+
+static void RunFloorEdgeSupportRegression(RagdollHarness *harness)
+{
+    VoxelRagdoll *ragdoll = PlatformAllocate(sizeof(*ragdoll), false);
+    RagdollExpect(ragdoll != NULL, "ledge support test allocates a ragdoll");
+    memset(ragdoll, 0, sizeof(*ragdoll));
+    RagdollExpect(InitializeHumanoid(ragdoll, 13000u),
+                  "ledge support test initializes a straddling ragdoll");
+    const VoxelCollisionSource edge = {.queryBlockPhysics = QueryRagdollFloorEdge};
+    RagdollExpect(WalkRagdollFootGrounded(ragdoll, &edge, WALK_RAGDOLL_LEFT_FOOT) &&
+                      !WalkRagdollFootGrounded(ragdoll, &edge, WALK_RAGDOLL_RIGHT_FOOT),
+                  "only the foot overlapping a real floor can provide support");
+    const LaiuePhysicsServiceV1 physics = {.ragdollStep = VoxelRagdollStep};
+    WalkHumanoidControllerState controller = {0};
+    bool grounded = true;
+    double facing = 0.0, phase = 0.0;
+    RagdollExpect(WalkHumanoidStep(
+                      &physics, ragdoll, &controller, &edge,
+                      &harness->rigidSettings, &harness->ragdollSettings,
+                      harness->scratch, harness->scratchBytes,
+                      0.0, 0.0, false, false, 1.0 / 128.0,
+                      &grounded, &facing, &phase, NULL),
+                  "a one-foot ledge contact advances the shared controller");
+    RagdollExpect(controller.footAnchorValid[0] && !controller.footAnchorValid[1],
+                  "the unsupported foot does not inherit the other foot's planted anchor");
+    RagdollExpect(WalkRagdollFootGrounded(
+                      ragdoll, &harness->collision, WALK_RAGDOLL_RIGHT_FOOT) &&
+                      WalkHumanoidStep(
+                          &physics, ragdoll, &controller, &harness->collision,
+                          &harness->rigidSettings, &harness->ragdollSettings,
+                          harness->scratch, harness->scratchBytes,
+                          0.0, 0.0, false, false, 1.0 / 128.0,
+                          &grounded, &facing, &phase, NULL) &&
+                      controller.footAnchorValid[1],
+                  "a foot landing during stance acquires its new support immediately");
+    VoxelRagdollRelease(ragdoll);
+    PlatformFree(ragdoll);
+}
+
 static void RunGroundedWalkingRegression(RagdollHarness *harness)
 {
     VoxelRagdoll *first = PlatformAllocate(sizeof(*first), false);
@@ -461,7 +1008,11 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
     double startingFootHeight[2] = {0.0, 0.0};
     double peakFootHeight[2] = {-INFINITY, -INFINITY};
     double maximumPlantedFootError[2] = {0.0, 0.0};
-    double minimumFootCenterHeight[2] = {INFINITY, INFINITY};
+    uint32_t maximumSlipTick[2] = {0u, 0u};
+    double minimumSoleHeight[2] = {INFINITY, INFINITY};
+    uint32_t minimumSoleTick[2] = {0u, 0u};
+    double minimumSoleVelocity[2][3] = {{0.0}};
+    double minimumSoleAngular[2][3] = {{0.0}};
     uint32_t supportedFootTicks[2] = {0u, 0u};
     uint32_t stanceTransitions[2] = {0u, 0u};
     bool previousStance[2] = {false, false};
@@ -516,8 +1067,15 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
                           "walking controller keeps both feet finite");
             if (footPosition[2] > peakFootHeight[foot])
                 peakFootHeight[foot] = footPosition[2];
-            if (footPosition[2] < minimumFootCenterHeight[foot])
-                minimumFootCenterHeight[foot] = footPosition[2];
+            double soleHeight, unused;
+            BodyVerticalBounds(&first->bodies[bodyIndex], &soleHeight, &unused);
+            if (soleHeight < minimumSoleHeight[foot])
+            {
+                minimumSoleHeight[foot] = soleHeight;
+                minimumSoleTick[foot] = tick;
+                (void)VoxelRigidBodyLinearVelocity(&first->bodies[bodyIndex], minimumSoleVelocity[foot]);
+                (void)VoxelRigidBodyAngularVelocity(&first->bodies[bodyIndex], minimumSoleAngular[foot]);
+            }
             if (tick < 512u && WalkRagdollFootGrounded(
                                    first, &harness->collision, bodyIndex))
                 ++supportedFootTicks[foot];
@@ -528,12 +1086,17 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
                 WalkRagdollFootGrounded(first, &harness->collision, bodyIndex))
             {
                 const double errorX = footPosition[0] -
-                    (root[0] + controllerA.footAnchorRelativeToRoot[foot][0]);
+                    (controllerA.previousRootPosition[0] +
+                     controllerA.footAnchorRelativeToRoot[foot][0]);
                 const double errorY = footPosition[1] -
-                    (root[1] + controllerA.footAnchorRelativeToRoot[foot][1]);
+                    (controllerA.previousRootPosition[1] +
+                     controllerA.footAnchorRelativeToRoot[foot][1]);
                 const double error = ScalarSqrtDouble(errorX * errorX + errorY * errorY);
                 if (error > maximumPlantedFootError[foot])
+                {
                     maximumPlantedFootError[foot] = error;
+                    maximumSlipTick[foot] = tick;
+                }
             }
         }
         if (root[2] < minimumHeight)
@@ -590,7 +1153,8 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
                   "stance-driven steps translate the character forward");
     RagdollExpect(groundedTicks > 220u,
                   "walking remains supported by the floor for most moving ticks");
-    if (!(minimumHeight > 1.7 && maximumHeight < 4.0))
+    if (!(minimumHeight > startingRoot[2] - 0.20 &&
+          maximumHeight < startingRoot[2] + 0.20))
     {
         LaiueTestRuntimeWrite("walk height range ");
         RagdollWriteSignedHundredths(minimumHeight);
@@ -611,14 +1175,14 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
         RagdollWriteUint32(minimumFootGrounded[1] ? 1u : 0u);
         LaiueTestRuntimeWrite("\r\n");
     }
-    RagdollExpect(minimumHeight > startingRoot[2] - 0.55 &&
-                      maximumHeight < startingRoot[2] + 0.75,
+    RagdollExpect(minimumHeight > startingRoot[2] - 0.20 &&
+                      maximumHeight < startingRoot[2] + 0.20,
                   "walking controller does not collapse or launch the pelvis");
     for (uint32_t foot = 0u; foot < 2u; ++foot)
     {
-        if (peakFootHeight[foot] <= startingFootHeight[foot] + 0.08 ||
+        if (peakFootHeight[foot] <= startingFootHeight[foot] + 0.04 ||
             supportedFootTicks[foot] < 40u ||
-            maximumPlantedFootError[foot] > 0.30)
+            maximumPlantedFootError[foot] > 0.10)
         {
             LaiueTestRuntimeWrite("foot gait stats ");
             RagdollWriteUint32(foot);
@@ -630,17 +1194,34 @@ static void RunGroundedWalkingRegression(RagdollHarness *harness)
             RagdollWriteUint32(supportedFootTicks[foot]);
             LaiueTestRuntimeWrite("/");
             RagdollWriteSignedHundredths(maximumPlantedFootError[foot]);
+            LaiueTestRuntimeWrite(" tick ");
+            RagdollWriteUint32(maximumSlipTick[foot]);
             LaiueTestRuntimeWrite("\r\n");
         }
-        RagdollExpect(peakFootHeight[foot] > startingFootHeight[foot] + 0.08,
+        RagdollExpect(peakFootHeight[foot] > startingFootHeight[foot] + 0.04,
                       "each swing foot visibly lifts from its starting height");
         RagdollExpect(supportedFootTicks[foot] >= 40u,
                       "each foot makes repeated grounded stance contact");
         RagdollExpect(stanceTransitions[foot] >= 6u,
                       "each foot alternates through repeated stance and swing phases");
-        RagdollExpect(minimumFootCenterHeight[foot] >= 1.10,
-                      "swing targets keep both feet above the voxel floor");
-        RagdollExpect(maximumPlantedFootError[foot] <= 0.30,
+        if (minimumSoleHeight[foot] < 1.0 - 0.015)
+        {
+            LaiueTestRuntimeWrite("sole minimum millimetres ");
+            RagdollWriteUint32((uint32_t)(minimumSoleHeight[foot] * 1000.0));
+            LaiueTestRuntimeWrite(" tick/velocity/angular ");
+            RagdollWriteUint32(minimumSoleTick[foot]);
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                LaiueTestRuntimeWrite(" ");
+                RagdollWriteSignedHundredths(minimumSoleVelocity[foot][axis]);
+                LaiueTestRuntimeWrite("/");
+                RagdollWriteSignedHundredths(minimumSoleAngular[foot][axis]);
+            }
+            LaiueTestRuntimeWrite("\r\n");
+        }
+        RagdollExpect(minimumSoleHeight[foot] >= 1.0 - 0.015,
+                      "both oriented soles penetrate the voxel floor by at most 15mm");
+        RagdollExpect(maximumPlantedFootError[foot] <= 0.10,
                       "planted feet stay near their world-space support anchors");
     }
     VoxelRagdollRelease(second);
@@ -675,7 +1256,7 @@ static void RunAirborneLocomotionRegression(RagdollHarness *harness)
                           &physics, ragdoll, &controller, &noFloor,
                           &harness->rigidSettings, &harness->ragdollSettings,
                           harness->scratch, harness->scratchBytes,
-                          0.0, 1.0, false, false, 1.0 / 128.0, &grounded,
+                          0.0, 1.0, false, tick % 8u == 0u, 1.0 / 128.0, &grounded,
                           &facingYaw, &gaitPhase, NULL),
                       "airborne input advances with gravity and limited steering");
     double finalRoot[3];
@@ -687,7 +1268,7 @@ static void RunAirborneLocomotionRegression(RagdollHarness *harness)
         (finalRoot[1] - startingRoot[1]) * (finalRoot[1] - startingRoot[1]));
     RagdollExpect(horizontalTravel < 0.20 &&
                       finalRoot[2] < startingRoot[2] - 0.50,
-                  "airborne movement cannot fly and the body continues to fall");
+                  "airborne movement and repeated jump requests cannot prevent falling");
     VoxelRagdollRelease(ragdoll);
     PlatformFree(ragdoll);
 }
@@ -762,7 +1343,15 @@ static void RunUprightRecoveryRegression(RagdollHarness *harness,
     float torsoRotation[9];
     VoxelRigidBodyOrientationMatrix(&ragdoll->bodies[WALK_RAGDOLL_TORSO],
                                     torsoRotation);
-    RagdollExpect(torsoRotation[8] > 0.7f && JointErrorSquared(ragdoll) < 0.04,
+    if (!(torsoRotation[8] > 0.7f && JointErrorSquared(ragdoll) < 0.0025))
+    {
+        LaiueTestRuntimeWrite("recovery torsoUp/jointcm ");
+        RagdollWriteSignedHundredths(torsoRotation[8]);
+        LaiueTestRuntimeWrite("/");
+        RagdollWriteSignedHundredths(ScalarSqrtDouble(JointErrorSquared(ragdoll)));
+        LaiueTestRuntimeWrite("\r\n");
+    }
+    RagdollExpect(torsoRotation[8] > 0.7f && JointErrorSquared(ragdoll) < 0.0025,
                   "active ragdoll recovers upright with connected joints");
 }
 
@@ -842,10 +1431,16 @@ LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
                       JointErrorSquared(first) < 1.0e-18,
                   "13-part humanoid with feet begins at satisfied joint anchors");
     RunGroundedJumpRegression(&harness, invalid);
+    RunCameraRegression();
+    RunHumanoidTopologyRegression(&harness);
+    RunMetricStandingRegression(&harness);
+    RunPlanarIsotropyRegression();
+    RunJumpInputRegression(&harness);
+    RunFloorEdgeSupportRegression(&harness);
     RunFallBraceResponseRegression();
+    RunHumanoidReplay(&harness, first, second);
     RunGroundedWalkingRegression(&harness);
     RunAirborneLocomotionRegression(&harness);
-    RunHumanoidReplay(&harness, first, second);
     RunUprightRecoveryRegression(&harness, second);
     VoxelRagdollRelease(second);
     VoxelRagdollRelease(first);
@@ -871,7 +1466,7 @@ LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
     misalignedJoints[0].anchorB[2] += 0.01;
     VoxelRagdollDefinition misalignedDefinition = {
         .stableIdBase = 1u,
-        .origin = {0.0, 0.0, 0.7},
+        .origin = {0.0, 0.0, 1.0},
         .bodies = walkRagdollBodies,
         .bodyCount = WALK_RAGDOLL_BODY_COUNT,
         .joints = misalignedJoints,

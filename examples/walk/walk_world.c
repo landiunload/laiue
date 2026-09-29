@@ -1,4 +1,5 @@
 #include "walk_world.h"
+#include "walk_math.h"
 
 #include "math/scalar.h"
 
@@ -16,7 +17,7 @@ static bool AddCoordinate(int64_t left, int64_t right, int64_t *out)
 
 static bool FloorLocal(double value, int64_t *out)
 {
-    if (!isfinite(value) || value < -9223372036854775808.0 ||
+    if (!WalkMathFinite(value) || value < -9223372036854775808.0 ||
         value >= 9223372036854775808.0)
         return false;
     const int64_t truncated = (int64_t)value;
@@ -30,7 +31,7 @@ bool WalkWorldRaycast(WalkWorldGetBlockFn getBlock, void *context,
                       WalkWorldBlockHit *outHit)
 {
     if (getBlock == NULL || context == NULL || origin == NULL || offset == NULL ||
-        direction == NULL || outHit == NULL || !isfinite(maximumDistance) ||
+        direction == NULL || outHit == NULL || !WalkMathFinite(maximumDistance) ||
         maximumDistance <= 0.0f || maximumDistance > 1024.0f)
         return false;
 
@@ -39,16 +40,16 @@ bool WalkWorldRaycast(WalkWorldGetBlockFn getBlock, void *context,
     double lengthSquared = 0.0;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (!isfinite(direction[axis]) || direction[axis] < -1.0f ||
+        if (!WalkMathFinite(direction[axis]) || direction[axis] < -1.0f ||
             direction[axis] > 1.0f || !FloorLocal(origin[axis], &block[axis]) ||
             !AddCoordinate(block[axis], offset[axis], &block[axis]))
             return false;
-        localFloor[axis] = floor(origin[axis]);
+        localFloor[axis] = WalkMathFloor(origin[axis]);
         lengthSquared += (double)direction[axis] * direction[axis];
     }
     for (uint32_t axis = 0u; axis < 3u; ++axis)
         previous[axis] = block[axis];
-    if (!(lengthSquared > 1.0e-12) || !isfinite(lengthSquared))
+    if (!(lengthSquared > 1.0e-12) || !WalkMathFinite(lengthSquared))
         return false;
     const double inverseLength = 1.0 / ScalarSqrtDouble(lengthSquared);
     for (uint32_t axis = 0u; axis < 3u; ++axis)

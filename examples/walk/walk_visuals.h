@@ -9,7 +9,8 @@
 #include <stdint.h>
 
 #define WALK_VISUAL_TEXTURE_COUNT 3u
-#define WALK_RAGDOLL_VISUAL_VERTEX_COUNT 9792u
+/* 12 lofts, head, 12 joints, hands, nose and facial features. */
+#define WALK_RAGDOLL_VISUAL_VERTEX_COUNT 5664u
 #define WALK_VISUAL_CHUNK_RADIUS 1
 #define WALK_VISUAL_CHUNK_LEVELS 3u
 #define WALK_VISUAL_CHUNK_COUNT \

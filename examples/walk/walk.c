@@ -6,6 +6,7 @@
 #include "voxel/voxel_service.h"
 #include "world/world_service.h"
 #include "walk_runtime.h"
+#include "walk_math.h"
 #if defined(LAIUE_WALK_WINDOWED)
 #include "walk_world.h"
 #endif
@@ -560,6 +561,8 @@ typedef struct WalkWindowState
     uint32_t ragdollScratchBytes;
     bool ragdollReady;
     bool ragdollGrounded;
+    double lastSafeCameraEye[3];
+    bool lastSafeCameraEyeValid;
     WalkRagdollVisualScratch *ragdollVisualScratch;
     WalkHumanoidControllerState humanoidController;
     double ragdollFacingYaw;
@@ -660,8 +663,8 @@ static bool WalkGetRagdollRenderOrigin(const WalkWindowState *state,
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        const double origin = floor(root[axis] / 64.0) * 64.0;
-        if (!isfinite(origin) || origin < -9223372036854775808.0 ||
+        const double origin = WalkMathFloor(root[axis] / 64.0) * 64.0;
+        if (!WalkMathFinite(origin) || origin < -9223372036854775808.0 ||
             origin >= 9223372036854775808.0)
             return false;
         renderOrigin[axis] = origin;
@@ -701,21 +704,18 @@ static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
                sizeof(state->ragdollRenderOriginBlock));
         if (state->sceneService->cameraGetForwardVector != NULL)
             state->sceneService->cameraGetForwardVector(&state->camera, forward);
-        if (state->firstPerson)
-        {
-            state->cameraRelativeEye[0] = (float)(root[0] - renderOrigin[0]);
-            state->cameraRelativeEye[1] = (float)(root[1] - renderOrigin[1]);
-            state->cameraRelativeEye[2] = (float)(root[2] - renderOrigin[2] + 1.65);
-        }
-        else
-        {
-            state->cameraRelativeEye[0] =
-                (float)(root[0] - renderOrigin[0] - (double)forward[0] * 5.0);
-            state->cameraRelativeEye[1] =
-                (float)(root[1] - renderOrigin[1] - (double)forward[1] * 5.0);
-            state->cameraRelativeEye[2] =
-                (float)(root[2] - renderOrigin[2] + 2.4);
-        }
+        double eye[3];
+        /* A fully enclosed camera boom has no collision-free sample. Keep the
+         * last valid eye in that exceptional case instead of closing the game. */
+        const double fallbackEye[3] = {root[0], root[1], root[2] + 1.8};
+        if (!WalkHumanoidResolveCameraEye(
+                &state->ragdoll, &state->ragdollCollision, forward,
+                state->firstPerson, fallbackEye, state->lastSafeCameraEye,
+                &state->lastSafeCameraEyeValid, eye))
+            return false;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            state->cameraRelativeEye[axis] =
+                (float)(eye[axis] - renderOrigin[axis]);
     }
     float view[16];
     state->sceneService->cameraGetViewMatrix(&state->camera,
@@ -796,12 +796,12 @@ static bool WalkGetChunkCoordinates(WalkWindowState *state,
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        const double floored = floor(root[axis]);
-        if (!isfinite(floored) || floored < -9223372036854775808.0 ||
+        const double floored = WalkMathFloor(root[axis]);
+        if (!WalkMathFinite(floored) || floored < -9223372036854775808.0 ||
             floored >= 9223372036854775808.0)
             return false;
         const int64_t localBlock = (int64_t)floored;
-        const int64_t localChunk = (int64_t)floor(root[axis] / 64.0) * 64;
+        const int64_t localChunk = (int64_t)WalkMathFloor(root[axis] / 64.0) * 64;
         state->ragdollRenderOriginBlock[axis] = localChunk;
         if (axis < 2u)
         {
@@ -957,7 +957,7 @@ static bool WalkInitializeRagdoll(WalkWindowState *state,
     const double origin[3] = {
         (double)remainderX / WALK_VOXEL_SIZE,
         (double)remainderY / WALK_VOXEL_SIZE,
-        0.7,
+        1.02,
     };
     if (!WalkHumanoidInitialize(state->physicsService, &state->ragdoll,
             &state->ragdollCollision, origin, UINT64_C(0x57414C4B52414744),
@@ -976,12 +976,12 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
         return false;
     double root[3];
     if (!VoxelRigidBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
-        !isfinite(root[0]) || !isfinite(root[1]) ||
+        !WalkMathFinite(root[0]) || !WalkMathFinite(root[1]) ||
         root[0] >= (double)INT64_MAX / 2.0 || root[0] <= (double)INT64_MIN / 2.0 ||
         root[1] >= (double)INT64_MAX / 2.0 || root[1] <= (double)INT64_MIN / 2.0)
         return false;
-    const int64_t shiftX = (int64_t)floor(root[0] / 64.0) * 64;
-    const int64_t shiftY = (int64_t)floor(root[1] / 64.0) * 64;
+    const int64_t shiftX = (int64_t)WalkMathFloor(root[0] / 64.0) * 64;
+    const int64_t shiftY = (int64_t)WalkMathFloor(root[1] / 64.0) * 64;
     if (shiftX == 0 && shiftY == 0)
         return true;
     /* TranslateBlocks subtracts its argument from local body positions. */
@@ -995,6 +995,11 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
         if (!VoxelRigidBodyTranslateBlocks(&state->ragdoll.bodies[body], localShift))
             return false;
     WalkHumanoidControllerRebase(&state->humanoidController, localShift);
+    if (state->lastSafeCameraEyeValid)
+    {
+        state->lastSafeCameraEye[0] -= (double)shiftX;
+        state->lastSafeCameraEye[1] -= (double)shiftY;
+    }
     state->ragdollBlockOriginX = nextOriginX;
     state->ragdollBlockOriginY = nextOriginY;
     return true;
