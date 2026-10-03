@@ -978,6 +978,45 @@ static void RunPauseAfterResumeScenario(int32_t radius, uint32_t repeats)
     WorldDestroy(world);
 }
 
+// Рабочему потоку не хватило памяти на scratch мешера. Раньше такой поток
+// молча завершался, но оставался в счёте рабочих, и следующий Pause ждал
+// его отчёта вечно (ловится таймаутом CTest). Теперь scratch выделяется до
+// запуска потока: стриминг работает с оставшимися рабочими, а если не
+// запустился ни один, честно не создаётся.
+static uint32_t failingScratchCalls;
+
+static ChunkMesherScratch *FailFirstScratchCreate(void)
+{
+    if (failingScratchCalls++ == 0u)
+        return NULL;
+    return LaiueMesherGetStaticServiceV1()->scratchCreate();
+}
+
+static void RunWorkerScratchFailureScenario(int32_t radius)
+{
+    LaiueMesherServiceV1 failing = *LaiueMesherGetStaticServiceV1();
+    failing.scratchCreate = FailFirstScratchCreate;
+    failingScratchCalls = 0u;
+    ChunkStreamingSetMesherService(&failing);
+
+    World *world = WorldCreate(NULL);
+    EXPECT(world != NULL, "world was not created");
+    ChunkStreaming *handle =
+        ChunkStreamingCreate(world, (Renderer *)&stressRendererPlaceholder, radius);
+    EXPECT(failingScratchCalls >= 1u, "the failing scratch allocation was exercised");
+    if (handle != NULL)
+    {
+        EXPECT(ChunkStreamingPause(handle), "pause with a failed worker did not complete");
+        ChunkStreamingSetCenter(handle, 0, 0, 0);
+        EXPECT(ChunkStreamingPause(handle),
+               "pause after queueing work with a failed worker did not complete");
+        StressClearInjectedMeshes(handle);
+        ChunkStreamingDestroy(handle);
+    }
+    WorldDestroy(world);
+    ChunkStreamingSetMesherService(LaiueMesherGetStaticServiceV1());
+}
+
 // Быстрый путь ChunkStreamingSetCenter: повторная установка точно того же
 // центра обязана быть без побочных эффектов и не порождать повторных заявок
 // на чанки. Рабочие потоки ставятся на паузу до первой установки: тогда
@@ -1220,6 +1259,7 @@ LAIUE_TEST_ENTRY(ChunkStreamingStressTestEntryPoint)
     RunFarTeleportScenario(3);
     RunOriginChangeScenario(2, 16u);
     RunPauseAfterResumeScenario(2, 8u);
+    RunWorkerScratchFailureScenario(2);
     RunSameCenterNoOpScenario(2);
 #ifndef NDEBUG
     RunRevisionOverflowScenario(2);
