@@ -1,6 +1,7 @@
 #include "physics/ragdoll.h"
 
 #include "physics/numeric_provider.h"
+#include "physics/rigid_body_internal.h"
 
 #include <float.h>
 #include <stddef.h>
@@ -188,8 +189,13 @@ static void ApplyInverseInertia(const VoxelRigidBody *body, const float rotation
     TransformOffset(rotation, local, response);
 }
 
-static bool JointAnchor(const VoxelRigidBody *body, const double localAnchor[3],
-                        double outLever[3], double outPoint[3], float outRotation[9])
+// outPointLever — плечо точки сустава в том виде, в каком его получила бы
+// VoxelRigidBodyPointVelocity: (center + lever) - center, а не сам lever.
+// Позиции во время решения суставов не меняются, поэтому центр переводится
+// один раз на сустав, а скорость точки на каждой оси считается по готовому
+// плечу с тем же результатом бит в бит.
+static bool JointAnchor(const VoxelRigidBody *body, const double localAnchor[3], double outLever[3],
+                        double outPoint[3], double outPointLever[3], float outRotation[9])
 {
     double center[3];
     if (!VoxelRigidBodyLocalPosition(body, center))
@@ -201,6 +207,7 @@ static bool JointAnchor(const VoxelRigidBody *body, const double localAnchor[3],
         outPoint[axis] = center[axis] + outLever[axis];
         if (!Finite(outPoint[axis]))
             return false;
+        outPointLever[axis] = outPoint[axis] - center[axis];
     }
     return true;
 }
@@ -210,13 +217,11 @@ static double Clamp(double value, double minimum, double maximum)
     return value < minimum ? minimum : (value > maximum ? maximum : value);
 }
 
-static bool SolveJointAxis(VoxelRagdoll *ragdoll,
-                           const VoxelRagdollBallJointDefinition *joint,
-                           const double error[3], const double leverA[3],
-                           const double leverB[3], const float rotationA[9],
-                           const float rotationB[9], const double pointA[3],
-                           const double pointB[3], const VoxelRagdollSettings *settings,
-                           uint32_t axis)
+static bool SolveJointAxis(VoxelRagdoll *ragdoll, const VoxelRagdollBallJointDefinition *joint,
+                           const double error[3], const double leverA[3], const double leverB[3],
+                           const float rotationA[9], const float rotationB[9],
+                           const double pointLeverA[3], const double pointLeverB[3],
+                           const VoxelRagdollSettings *settings, uint32_t axis)
 {
     VoxelRigidBody *bodyA = &ragdoll->bodies[joint->bodyA];
     VoxelRigidBody *bodyB = &ragdoll->bodies[joint->bodyB];
@@ -237,9 +242,8 @@ static bool SolveJointAxis(VoxelRagdoll *ragdoll,
 
     double velocityA[3];
     double velocityB[3];
-    if (!VoxelRigidBodyPointVelocity(bodyA, pointA, velocityA) ||
-        !VoxelRigidBodyPointVelocity(bodyB, pointB, velocityB))
-        return false;
+    VoxelRigidBodyPointVelocityAtLever(bodyA, pointLeverA, velocityA);
+    VoxelRigidBodyPointVelocityAtLever(bodyB, pointLeverB, velocityB);
     const double relativeSpeed = velocityA[axis] - velocityB[axis];
     const double bias = Clamp(settings->errorCorrection * error[axis] / RAGDOLL_STEP_SECONDS,
                               -settings->maximumCorrectionSpeed,
@@ -286,20 +290,21 @@ static bool SolveJoints(VoxelRagdoll *ragdoll, const VoxelRagdollSettings *setti
             double leverB[3];
             double pointA[3];
             double pointB[3];
+            double pointLeverA[3];
+            double pointLeverB[3];
             float rotationA[9];
             float rotationB[9];
-            if (!JointAnchor(&ragdoll->bodies[joint->bodyA], joint->anchorA,
-                             leverA, pointA, rotationA) ||
-                !JointAnchor(&ragdoll->bodies[joint->bodyB], joint->anchorB,
-                             leverB, pointB, rotationB))
+            if (!JointAnchor(&ragdoll->bodies[joint->bodyA], joint->anchorA, leverA, pointA,
+                             pointLeverA, rotationA) ||
+                !JointAnchor(&ragdoll->bodies[joint->bodyB], joint->anchorB, leverB, pointB,
+                             pointLeverB, rotationB))
                 return false;
             double error[3];
             for (uint32_t axis = 0u; axis < 3u; ++axis)
                 error[axis] = pointA[axis] - pointB[axis];
             for (uint32_t axis = 0u; axis < 3u; ++axis)
-                if (!SolveJointAxis(ragdoll, joint, error, leverA, leverB,
-                                    rotationA, rotationB, pointA, pointB,
-                                    settings, axis))
+                if (!SolveJointAxis(ragdoll, joint, error, leverA, leverB, rotationA, rotationB,
+                                    pointLeverA, pointLeverB, settings, axis))
                     return false;
         }
     }

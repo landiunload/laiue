@@ -133,6 +133,12 @@ target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics laiue_numeric)
 laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPoint)
 add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
 
+add_executable(laiue_rigid_velocity_add_test rigid_velocity_add_test.c)
+target_link_libraries(laiue_rigid_velocity_add_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(
+    laiue_rigid_velocity_add_test RigidVelocityAddTestEntryPoint)
+add_test(NAME laiue.physics.velocity_add COMMAND laiue_rigid_velocity_add_test)
+
 add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c)
 target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric
     laiue::math_support)

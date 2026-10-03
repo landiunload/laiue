@@ -707,3 +707,14 @@ if(TARGET laiue_mod AND LAIUE_NATIVE_MODS_ENABLED)
     add_dependencies(laiue_r3_52_mod_host_benchmark
         laiue_r3_52_mod_host_query_extension)
 endif()
+
+# Шаг 13-тельной ragdoll из примера walk: решатель суставов, интеграция и
+# контакты с вокселями при 128 Гц. Печатает checksum конечного состояния.
+add_executable(laiue_ragdoll_benchmark EXCLUDE_FROM_ALL
+    ragdoll_benchmark.c ../examples/walk/walk_humanoid.c)
+target_link_libraries(laiue_ragdoll_benchmark PRIVATE laiue_physics laiue_numeric
+    laiue::math_support)
+target_include_directories(laiue_ragdoll_benchmark PRIVATE
+    "${PROJECT_SOURCE_DIR}/tests")
+laiue_configure_standalone_executable(
+    laiue_ragdoll_benchmark RagdollBenchmarkEntryPoint)
