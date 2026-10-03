@@ -71,7 +71,12 @@ static uint32_t RefResolveSlice(const TexturePackAnimationSet *set, uint32_t mat
     double milliseconds = animationSeconds * 1000.0;
     if (milliseconds >= cycle)
     {
-        milliseconds -= cycle * (double)(uint64_t)(milliseconds / cycle);
+        // Фаза за пределом точности double потеряна: начало цикла.
+        double quotient = milliseconds / cycle;
+        milliseconds = quotient < 18446744073709551616.0
+                           ? milliseconds - cycle * (double)(uint64_t)quotient
+                           : 0.0;
+        if (!(milliseconds >= 0.0 && milliseconds < cycle)) milliseconds = 0.0;
     }
     uint32_t elapsed = (uint32_t)milliseconds;
     uint32_t accumulated = 0u;
@@ -153,7 +158,8 @@ static uint32_t NextRandom(uint32_t *state)
 
 // === Таблица кадров и решение ===
 
-static double g_times[13];
+static volatile double g_zero = 0.0;
+static double g_times[15];
 
 static void FillTimes(void)
 {
@@ -170,6 +176,10 @@ static void FillTimes(void)
     g_times[10] = 86400.0;
     g_times[11] = 1e9;
     g_times[12] = 1e15;
+    // Часы приложения не ограничены: бесконечность и значение, частное
+    // которого не помещается в uint64, обязаны дать кадр материала.
+    g_times[13] = 1e300;
+    g_times[14] = 1.0 / g_zero;
 }
 
 // Детерминированное расписание: materialCount 0..67, у каждого материала
@@ -218,7 +228,7 @@ static EQ_NOINLINE void TestFillEquivalence(void)
     {
         TexturePackAnimationSet set;
         RandomSet(&set, &state);
-        double seconds = g_times[iteration % 13u];
+        double seconds = g_times[iteration % 15u];
         uint32_t real[16];
         uint32_t reference[16];
         TexturePackFillSliceTable(&set, seconds, real);

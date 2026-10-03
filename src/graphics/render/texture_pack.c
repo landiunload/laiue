@@ -205,10 +205,18 @@ static uint32_t ResolveSliceFromMilliseconds(const TexturePackAnimationSet *set,
     double cycle = (double)animation->cycleMilliseconds;
     // Свёртка по длине цикла до перевода в целое: за сутки анимации
     // миллисекунды ещё помещаются в double точно, а прямое приведение
-    // большого значения к uint32 не определено.
+    // большого значения к uint32 не определено. За пределом точности
+    // double (2^53 мс, сотни тысяч лет) округление произведения способно
+    // увести остаток чуть ниже нуля или до самого cycle, а частное от
+    // бесконечных часов не помещается в uint64 — фаза там всё равно
+    // потеряна, и выбирается начало цикла.
     if (milliseconds >= cycle)
     {
-        milliseconds -= cycle * (double)(uint64_t)(milliseconds / cycle);
+        double quotient = milliseconds / cycle;
+        milliseconds = quotient < 18446744073709551616.0
+                           ? milliseconds - cycle * (double)(uint64_t)quotient
+                           : 0.0;
+        if (!(milliseconds >= 0.0 && milliseconds < cycle)) milliseconds = 0.0;
     }
 
     uint32_t elapsed = (uint32_t)milliseconds;
