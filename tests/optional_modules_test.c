@@ -342,8 +342,12 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                    texture != 0u,
                "graphics device stores texture descriptor state");
         uint8_t texturePixels[4u * 4u * 4u] = {0};
-        LaiueGraphicsTextureUploadV1 textureUpload = {
-            sizeof(textureUpload), texture, texturePixels, sizeof(texturePixels), 0u, 0u};
+        LaiueGraphicsTextureUploadV1 textureUpload = {.structSize = sizeof(textureUpload),
+                                                      .texture = texture,
+                                                      .data = texturePixels,
+                                                      .sizeBytes = sizeof(texturePixels),
+                                                      .rowPitchBytes = 0u,
+                                                      .mipLevel = 0u};
         Expect(resourceDevice->uploadTexture != NULL &&
                    resourceDevice->uploadTexture(resourceDevice, &textureUpload) != 0u,
                "graphics device uploads texture pixels to the backend image");
