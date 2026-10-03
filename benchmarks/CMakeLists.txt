@@ -712,7 +712,8 @@ endif()
 # Шаг 13-тельной ragdoll из примера walk: решатель суставов, интеграция и
 # контакты с вокселями при 128 Гц. Печатает checksum конечного состояния.
 add_executable(laiue_ragdoll_benchmark EXCLUDE_FROM_ALL
-    ragdoll_benchmark.c ../examples/walk/walk_humanoid.c)
+    ragdoll_benchmark.c ../examples/walk/walk_humanoid.c
+    ../examples/walk/walk_physics.c)
 target_link_libraries(laiue_ragdoll_benchmark PRIVATE laiue_physics laiue_numeric
     laiue::math_support)
 target_include_directories(laiue_ragdoll_benchmark PRIVATE

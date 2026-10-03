@@ -3,6 +3,7 @@
 #include "physics/ragdoll.h"
 #include "math/scalar.h"
 #include "walk_math.h"
+#include "walk_physics.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -145,7 +146,7 @@ static inline bool WalkRagdollMotorBody(VoxelRigidBody *body,
     }
 
     double angularVelocity[3];
-    if (!VoxelRigidBodyAngularVelocity(body, angularVelocity))
+    if (!WalkBodyAngularVelocity(body, angularVelocity))
         return false;
     double delta[3];
     double accelerationSquared = 0.0;
@@ -160,7 +161,7 @@ static inline bool WalkRagdollMotorBody(VoxelRigidBody *body,
     if (deltaLength > maximumDelta)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
             delta[axis] *= maximumDelta / deltaLength;
-    return VoxelRigidBodyAddAngularVelocity(body, delta);
+    return WalkBodyAddAngularVelocity(body, delta);
 }
 
 /* One phase definition for the foot trajectory and the joint pose. The knee
@@ -199,7 +200,7 @@ static inline bool WalkRagdollLegTargets(const VoxelRagdoll *ragdoll, double yaw
     const double yawQuaternion[4] = {0.0, 0.0, ScalarSin((float)(yaw * 0.5)),
                                      ScalarCos((float)(yaw * 0.5))};
     double root[3];
-    if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[WALK_RAGDOLL_PELVIS], root))
+    if (!WalkBodyLocalPosition(&ragdoll->bodies[WALK_RAGDOLL_PELVIS], root))
         return false;
     for (uint32_t leg = 0u; leg < 2u; ++leg)
     {
@@ -210,7 +211,7 @@ static inline bool WalkRagdollLegTargets(const VoxelRagdoll *ragdoll, double yaw
         double hip[3], ankle[3], ankleOffset[3];
         WalkRagdollRotateVector(orientations[WALK_RAGDOLL_PELVIS], hipJoint->anchorA, hip);
         WalkRagdollRotateVector(foot->orientation, ankleJoint->anchorB, ankleOffset);
-        if (!VoxelRigidBodyLocalPosition(foot, ankle))
+        if (!WalkBodyLocalPosition(foot, ankle))
             return false;
         double axis[3], distanceSquared = 0.0;
         for (uint32_t coordinate = 0u; coordinate < 3u; ++coordinate)
@@ -318,12 +319,10 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
     const double yawSin = ScalarSin((float)(facingYaw * 0.5));
     const double yawCos = ScalarCos((float)(facingYaw * 0.5));
     double rootVelocity[3];
-    if (!VoxelRigidBodyLinearVelocity(&ragdoll->bodies[WALK_RAGDOLL_PELVIS],
-                                      rootVelocity))
+    if (!WalkBodyLinearVelocity(&ragdoll->bodies[WALK_RAGDOLL_PELVIS], rootVelocity))
         return false;
     double torsoAngularVelocity[3];
-    if (!VoxelRigidBodyAngularVelocity(&ragdoll->bodies[WALK_RAGDOLL_TORSO],
-                                       torsoAngularVelocity))
+    if (!WalkBodyAngularVelocity(&ragdoll->bodies[WALK_RAGDOLL_TORSO], torsoAngularVelocity))
         return false;
     const double torsoAngularSpeed = ScalarSqrtDouble(
         torsoAngularVelocity[0] * torsoAngularVelocity[0] +
@@ -362,7 +361,7 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
             /* Do not rotate a planted sole through the other foot. It adopts
              * the new heading on its next swing, just like a turning step. */
             float rotation[9];
-            VoxelRigidBodyOrientationMatrix(&ragdoll->bodies[body], rotation);
+            WalkBodyOrientationMatrix(&ragdoll->bodies[body], rotation);
             const double halfYaw = 0.5 * ScalarAtan2(rotation[1], rotation[0]);
             yawQuaternion[2] = ScalarSin((float)halfYaw);
             yawQuaternion[3] = ScalarCos((float)halfYaw);
@@ -380,8 +379,7 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
         !WalkRagdollLegTargets(ragdoll, facingYaw, targetOrientations))
         return false;
     float torsoRotation[9];
-    VoxelRigidBodyOrientationMatrix(&ragdoll->bodies[WALK_RAGDOLL_TORSO],
-                                    torsoRotation);
+    WalkBodyOrientationMatrix(&ragdoll->bodies[WALK_RAGDOLL_TORSO], torsoRotation);
     double recovery = (0.98 - (double)torsoRotation[8]) / 0.70;
     if (recovery < 0.0)
         recovery = 0.0;
@@ -411,8 +409,7 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
     }
 
     double rootPosition[3];
-    if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[ragdoll->rootBody],
-                                     rootPosition))
+    if (!WalkBodyLocalPosition(&ragdoll->bodies[ragdoll->rootBody], rootPosition))
         return false;
     double targetPositions[WALK_RAGDOLL_BODY_COUNT][3] = {{0.0}};
     bool positioned[WALK_RAGDOLL_BODY_COUNT] = {false};
@@ -472,8 +469,8 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
             continue;
         double position[3];
         double velocity[3];
-        if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[body], position) ||
-            !VoxelRigidBodyLinearVelocity(&ragdoll->bodies[body], velocity))
+        if (!WalkBodyLocalPosition(&ragdoll->bodies[body], position) ||
+            !WalkBodyLinearVelocity(&ragdoll->bodies[body], velocity))
             return false;
         double acceleration[3];
         double accelerationSquared = 0.0;
@@ -483,8 +480,8 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
         {
             const uint32_t leg = (body - WALK_RAGDOLL_LEFT_THIGH) & 1u;
             double footVelocity[3];
-            if (!VoxelRigidBodyLinearVelocity(
-                    &ragdoll->bodies[WALK_RAGDOLL_LEFT_FOOT + leg], footVelocity))
+            if (!WalkBodyLinearVelocity(&ragdoll->bodies[WALK_RAGDOLL_LEFT_FOOT + leg],
+                                        footVelocity))
                 return false;
             const double rootWeight = body <= WALK_RAGDOLL_RIGHT_THIGH ? 0.75 : 0.25;
             for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -506,7 +503,7 @@ static inline bool WalkRagdollPoseDriveWithSupport(VoxelRagdoll *ragdoll, double
             acceleration[1] * deltaSeconds,
             acceleration[2] * deltaSeconds,
         };
-        if (!VoxelRigidBodyAddLinearVelocity(&ragdoll->bodies[body], deltaVelocity))
+        if (!WalkBodyAddLinearVelocity(&ragdoll->bodies[body], deltaVelocity))
             return false;
     }
     return true;
@@ -535,8 +532,7 @@ static inline bool WalkRagdollDrivePlanar(VoxelRagdoll *ragdoll,
         !(deltaSeconds > 0.0) || deltaSeconds > 1.0 / 30.0)
         return false;
     double rootVelocity[3];
-    if (!VoxelRigidBodyLinearVelocity(&ragdoll->bodies[ragdoll->rootBody],
-                                      rootVelocity))
+    if (!WalkBodyLinearVelocity(&ragdoll->bodies[ragdoll->rootBody], rootVelocity))
         return false;
     const double maximumDelta = maximumAcceleration * deltaSeconds;
     const double targetDelta[2] = {
@@ -550,11 +546,10 @@ static inline bool WalkRagdollDrivePlanar(VoxelRagdoll *ragdoll,
     if (delta[0] == 0.0 && delta[1] == 0.0)
         return true;
     const double bodyDelta[3] = {delta[0], delta[1], 0.0};
-    if (!VoxelRigidBodyAddLinearVelocity(&ragdoll->bodies[ragdoll->rootBody],
-                                         bodyDelta))
+    if (!WalkBodyAddLinearVelocity(&ragdoll->bodies[ragdoll->rootBody], bodyDelta))
         return false;
     for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
-        VoxelRigidBodyWake(&ragdoll->bodies[body]);
+        WalkBodyWake(&ragdoll->bodies[body]);
     return true;
 }
 
@@ -573,11 +568,10 @@ static inline bool WalkRagdollFootContact(const VoxelRagdoll *ragdoll,
     double center[3];
     double linearVelocity[3];
     float rotation[9];
-    if (!VoxelRigidBodyLocalPosition(foot, center) ||
-        !VoxelRigidBodyLinearVelocity(foot, linearVelocity) ||
+    if (!WalkBodyLocalPosition(foot, center) || !WalkBodyLinearVelocity(foot, linearVelocity) ||
         linearVelocity[2] > maximumUpwardSpeed)
         return false;
-    VoxelRigidBodyOrientationMatrix(foot, rotation);
+    WalkBodyOrientationMatrix(foot, rotation);
     const double localZ = rotation[8] >= 0.0 ? -foot->halfExtent[2]
                                              : foot->halfExtent[2];
     for (int32_t xSign = -1; xSign <= 1; xSign += 2)
@@ -647,6 +641,5 @@ static inline bool WalkRagdollJumpIfGrounded(VoxelRagdoll *ragdoll,
                                              const VoxelCollisionSource *collision,
                                              double upwardSpeed)
 {
-    return WalkRagdollGrounded(ragdoll, collision) &&
-           VoxelRagdollJump(ragdoll, upwardSpeed);
+    return WalkRagdollGrounded(ragdoll, collision) && WalkRagdollJump(ragdoll, upwardSpeed);
 }

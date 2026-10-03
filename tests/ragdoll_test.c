@@ -4,6 +4,7 @@
 #include "test_runtime.h"
 #include "../examples/walk/humanoid_ragdoll.h"
 #include "../examples/walk/walk_humanoid.h"
+#include "walk_physics_binding.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -1404,6 +1405,7 @@ static void RunIdleDriveSleepRegression(RagdollHarness *harness, VoxelRagdoll *r
 LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
 {
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
+    RagdollExpect(BindLinkedWalkPhysics(), "walk binds the linked physics table");
     RagdollExpect(WalkRagdollCoordinateSafeForVoxelQuery(0.0) &&
                       WalkRagdollCoordinateSafeForVoxelQuery(1.0e9) &&
                       !WalkRagdollCoordinateSafeForVoxelQuery(0x1p62) &&

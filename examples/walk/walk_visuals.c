@@ -1,5 +1,6 @@
 #include "walk_visuals.h"
 #include "walk_math.h"
+#include "walk_physics.h"
 
 #include "media/image.h"
 #include "math/scalar.h"
@@ -960,9 +961,9 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
     for (uint32_t index = 0u; index < ragdoll->bodyCount; ++index)
     {
         const VoxelRigidBody *body = &ragdoll->bodies[index];
-        if (!VoxelRigidBodyLocalPosition(body, writer.center))
+        if (!WalkBodyLocalPosition(body, writer.center))
             return false;
-        VoxelRigidBodyOrientationMatrix(body, writer.rotation);
+        WalkBodyOrientationMatrix(body, writer.rotation);
         if (index == WALK_VISUAL_RAGDOLL_HEAD_INDEX)
         {
             if (!MeshEllipsoid(&writer, zero, body->halfExtent, skinColor, true))
@@ -1030,9 +1031,9 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
         const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[index];
         const VoxelRigidBody *parent = &ragdoll->bodies[joint->bodyA];
         const VoxelRigidBody *child = &ragdoll->bodies[joint->bodyB];
-        if (!VoxelRigidBodyLocalPosition(parent, writer.center))
+        if (!WalkBodyLocalPosition(parent, writer.center))
             return false;
-        VoxelRigidBodyOrientationMatrix(parent, writer.rotation);
+        WalkBodyOrientationMatrix(parent, writer.rotation);
         const double radius = Minimum(Minimum(parent->halfExtent[0], parent->halfExtent[1]),
             Minimum(child->halfExtent[0], child->halfExtent[1])) *
                 (joint->bodyB == WALK_VISUAL_RAGDOLL_HEAD_INDEX ? 0.50 : 0.96);

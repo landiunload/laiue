@@ -14,6 +14,7 @@
 #include "test_runtime.h"
 #include "../examples/walk/humanoid_ragdoll.h"
 #include "../examples/walk/walk_humanoid.h"
+#include "walk_physics_binding.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -190,6 +191,8 @@ static void ScenarioRun(Scenario *scenario, const LaiuePhysicsServiceV1 *physics
 LAIUE_TEST_ENTRY(RagdollBenchmarkEntryPoint)
 {
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
+    if (!BindLinkedWalkPhysics())
+        Fail("walk binds the linked physics table");
     const LaiuePhysicsServiceV1 physics = {
         .configureThread = VoxelPhysicsConfigureThread,
         .stepScratchBytes = VoxelRigidBodyStepScratchBytes,

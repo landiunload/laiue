@@ -74,6 +74,7 @@ add_test(NAME laiue.example.walk_world COMMAND laiue_walk_world_test)
 if(TARGET laiue_media_support)
     add_executable(laiue_walk_visuals_test
         walk_visuals_test.c
+        "${PROJECT_SOURCE_DIR}/examples/walk/walk_physics.c"
         "${PROJECT_SOURCE_DIR}/examples/walk/walk_visuals.c")
     target_include_directories(laiue_walk_visuals_test PRIVATE
         "${PROJECT_SOURCE_DIR}/examples/walk")
@@ -139,7 +140,8 @@ laiue_configure_standalone_executable(
     laiue_rigid_velocity_add_test RigidVelocityAddTestEntryPoint)
 add_test(NAME laiue.physics.velocity_add COMMAND laiue_rigid_velocity_add_test)
 
-add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c)
+add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c
+    ../examples/walk/walk_physics.c)
 target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric
     laiue::math_support)
 laiue_configure_standalone_executable(laiue_ragdoll_test RagdollTestEntryPoint)
