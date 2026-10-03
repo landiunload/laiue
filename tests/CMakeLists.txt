@@ -852,3 +852,20 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     add_dependencies(laiue_mod_host_order_test laiue_mod_test_extension)
     add_test(NAME laiue.mod.host_order COMMAND laiue_mod_host_order_test)
 endif()
+
+# ASan/UBSan замедляют вычислительные тесты в несколько раз. Пределы времени
+# выше рассчитаны на обычную сборку; в санитайзерной они пропорционально
+# растут, чтобы тайм-аут оставался признаком зависания, а не инструментации.
+if(LAIUE_ENABLE_SANITIZERS)
+    get_property(_laiue_sanitized_tests DIRECTORY PROPERTY TESTS)
+    foreach(_laiue_test IN LISTS _laiue_sanitized_tests)
+        get_test_property(${_laiue_test} TIMEOUT _laiue_timeout)
+        if(_laiue_timeout)
+            math(EXPR _laiue_timeout "${_laiue_timeout} * 4")
+            set_tests_properties(${_laiue_test} PROPERTIES TIMEOUT ${_laiue_timeout})
+        endif()
+    endforeach()
+    unset(_laiue_sanitized_tests)
+    unset(_laiue_test)
+    unset(_laiue_timeout)
+endif()

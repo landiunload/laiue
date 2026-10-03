@@ -1441,6 +1441,9 @@ LAIUE_TEST_ENTRY(RagdollTestEntryPoint)
     RunHumanoidReplay(&harness, first, second);
     RunGroundedWalkingRegression(&harness);
     RunAirborneLocomotionRegression(&harness);
+    // Повторная инициализация живой ragdoll теряла бы bigint-скорости её
+    // тел: сначала владелец освобождает прежнее состояние.
+    VoxelRagdollRelease(second);
     RunUprightRecoveryRegression(&harness, second);
     VoxelRagdollRelease(second);
     VoxelRagdollRelease(first);

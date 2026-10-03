@@ -185,8 +185,14 @@ static void RandomSet(TexturePackAnimationSet *set, uint32_t *state)
     {
         uint32_t frames = 1u + NextRandom(state) % 6u;
         uint32_t first = NextRandom(state) % 400u;
-        set->animation[material].firstSlice = (uint16_t)first;
-        set->animation[material].frameCount = (uint16_t)frames;
+        // materialCount сверх TEXTURE_PACK_MAX_LAYERS проверяет усечение в
+        // решателе, но сам массив анимаций длиннее не становится: записи
+        // за его концом портили бы sliceMilliseconds соседнего поля.
+        TexturePackAnimation unused;
+        TexturePackAnimation *animation =
+            material < TEXTURE_PACK_MAX_LAYERS ? &set->animation[material] : &unused;
+        animation->firstSlice = (uint16_t)first;
+        animation->frameCount = (uint16_t)frames;
         uint32_t cycle = 0u;
         for (uint32_t frame = 0; frame < frames; ++frame)
         {
@@ -197,7 +203,7 @@ static void RandomSet(TexturePackAnimationSet *set, uint32_t *state)
         }
         // Нулевой цикл тоже допустим: это ветка «кадр не решается».
         if ((NextRandom(state) & 7u) == 0u) cycle = 0u;
-        set->animation[material].cycleMilliseconds = cycle;
+        animation->cycleMilliseconds = cycle;
         (void)slice;
         sliceCount += frames;
     }
