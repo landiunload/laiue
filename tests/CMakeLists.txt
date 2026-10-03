@@ -19,7 +19,21 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND
                 "-DNM_TOOL=${CMAKE_NM}"
                 "-DLIBRARY_FILE=$<TARGET_FILE:${runtime_target}>"
                 -P "${PROJECT_SOURCE_DIR}/tools/check_elf_exports.cmake")
+        add_test(NAME "laiue.abi.${runtime_target}.imports"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DREADELF_TOOL=${CMAKE_READELF}"
+                "-DBINARY_FILE=$<TARGET_FILE:${runtime_target}>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_elf_imports.cmake")
     endforeach()
+    # The shared walk executable loads every technology as an optional module;
+    # a load-time import would make removing that artifact fatal.
+    if(TARGET laiue_walk)
+        add_test(NAME laiue.example.walk_imports
+            COMMAND "${CMAKE_COMMAND}"
+                "-DREADELF_TOOL=${CMAKE_READELF}"
+                "-DBINARY_FILE=$<TARGET_FILE:laiue_walk>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_elf_imports.cmake")
+    endif()
 elseif(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND APPLE)
     foreach(runtime_target IN LISTS LAIUE_RUNTIME_TARGETS)
         add_test(NAME "laiue.abi.${runtime_target}.exports"
@@ -361,6 +375,24 @@ if(LAIUE_NATIVE_MODS_ENABLED)
             laiue_scene laiue_world laiue_mesher laiue_render laiue_numeric
             laiue_content)
         add_test(NAME laiue.mod.optional_components COMMAND laiue_optional_modules_test)
+    endif()
+
+    # Every built module is removed, corrupted, and corrupted while pinned as a
+    # provider; only its required-dependency closure may stop with it.
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_module_removal_matrix_test module_removal_matrix_test.c)
+        target_link_libraries(laiue_module_removal_matrix_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_module_removal_matrix_test PRIVATE LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_module_removal_matrix_test ModuleRemovalMatrixTestEntryPoint)
+        get_property(_laiue_matrix_runtime_targets GLOBAL PROPERTY LAIUE_RUNTIME_TARGETS)
+        foreach(_laiue_matrix_target IN LISTS _laiue_matrix_runtime_targets
+                ITEMS laiue_graphics_d3d12 laiue_graphics_vulkan)
+            if(TARGET ${_laiue_matrix_target})
+                add_dependencies(laiue_module_removal_matrix_test ${_laiue_matrix_target})
+            endif()
+        endforeach()
+        add_test(NAME laiue.mod.removal_matrix COMMAND laiue_module_removal_matrix_test)
     endif()
 else()
     add_executable(laiue_mod_host_disabled_test mod_host_disabled_test.c)

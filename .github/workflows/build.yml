@@ -326,6 +326,12 @@ jobs:
         run: cmake --preset android-arm64-core
       - name: Compile and link Android targets
         run: cmake --build --preset android-arm64-core-release --parallel
+      # Пример NativeActivity делит с desktop-walk код ragdoll и выбор
+      # модулей; без этой сборки его поломка оставалась бы незамеченной.
+      - name: Compile and link Android walk example
+        run: |
+          cmake --preset android-arm64-walk
+          cmake --build --preset android-arm64-walk-release --parallel
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
