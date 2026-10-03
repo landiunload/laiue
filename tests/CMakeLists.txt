@@ -657,6 +657,19 @@ if(TARGET laiue_audio)
         set_tests_properties(laiue.audio.system_backend PROPERTIES
             SKIP_RETURN_CODE 125
             TIMEOUT 30)
+
+        # ALSA загружается в рантайме; повторное создание вывода не должно
+        # копить память libasound независимо от наличия звуковой карты.
+        if(LAIUE_PLATFORM_POSIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(laiue_audio_output_cycle_test audio_output_cycle_test.c)
+            target_link_libraries(laiue_audio_output_cycle_test PRIVATE laiue_bootstrap)
+            target_compile_definitions(laiue_audio_output_cycle_test PRIVATE LAIUE_STATIC=1)
+            laiue_configure_standalone_executable(
+                laiue_audio_output_cycle_test AudioOutputCycleTestEntryPoint)
+            add_dependencies(laiue_audio_output_cycle_test laiue_audio_output)
+            add_test(NAME laiue.audio.output_cycle COMMAND laiue_audio_output_cycle_test)
+            set_tests_properties(laiue.audio.output_cycle PROPERTIES TIMEOUT 60)
+        endif()
     endif()
 endif()
 
