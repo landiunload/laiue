@@ -1723,11 +1723,12 @@ static void CollectGpuTiming(Renderer *renderer, uint32_t frameIndex)
         vkGetFenceStatus(renderer->device, renderer->frameFences[frameIndex]) != VK_SUCCESS)
         return;
 
+    // stride — расстояние между соседними результатами, а не размер всего
+    // буфера: с шагом в 16 байт второй таймстемп лёг бы за конец массива.
     uint64_t timestamps[2] = { 0u, 0u };
-    VkResult result = vkGetQueryPoolResults(renderer->device,
-                                            renderer->gpuTimingQueries[frameIndex],
-                                            0u, 2u, sizeof(timestamps), timestamps,
-                                            sizeof(timestamps), VK_QUERY_RESULT_64_BIT);
+    VkResult result = vkGetQueryPoolResults(
+        renderer->device, renderer->gpuTimingQueries[frameIndex], 0u, 2u, sizeof(timestamps),
+        timestamps, sizeof(timestamps[0]), VK_QUERY_RESULT_64_BIT);
     renderer->gpuTimingPending[frameIndex] = false;
     if (result != VK_SUCCESS) return;
 
