@@ -284,6 +284,27 @@ LAIUE_TEST_ENTRY(SoundcTestEntryPoint)
                "float64 must round back to the original signal");
     }
 
+    // === float 32 из повреждённого файла: NaN — тишина, бесконечности и
+    // выход за [-1, 1] насыщаются. Приведение NaN к целому не определено
+    // стандартом; UBSan ловит его в санитайзерной сборке. ===
+    {
+        static const uint32_t specialBits[4] = {0x7FC00000u, 0x7F800000u, 0xFF800000u,
+                                                0x40000000u};
+        static const int16_t expected[4] = {0, 32767, -32767, 32767};
+        for (uint32_t index = 0; index < 4u; ++index)
+            PutU32(buffers->payload + index * 4u, specialBits[index]);
+        waveBytes = BuildWave(buffers->wave, 3u, 0u, 1u, TEST_SAMPLE_RATE, 32u,
+                              buffers->payload, 4u * 4u, 0u);
+        Expect(WaveInspect(buffers->wave, waveBytes, &info) == WAVE_OK,
+               "float32 with special values must be accepted");
+        Expect(WaveDecodeSamples(buffers->wave, waveBytes, &info, buffers->decoded, 4u) ==
+                   WAVE_OK,
+               "float32 with special values must decode");
+        for (uint32_t index = 0; index < 4u; ++index)
+            Expect(buffers->decoded[index] == expected[index],
+                   "NaN decodes to silence and infinities saturate");
+    }
+
     // === WAVE_FORMAT_EXTENSIBLE: настоящий формат лежит в GUID ===
     waveBytes = BuildWave(buffers->wave, 0xFFFEu, 1u, 2u, TEST_SAMPLE_RATE, 16u, buffers->payload,
                           TEST_FRAMES * 4u, 0u);

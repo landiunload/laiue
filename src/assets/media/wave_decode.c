@@ -51,6 +51,9 @@ static int16_t ScaleToI16(int64_t value, int64_t divisor)
 
 static int16_t FloatToI16(double value)
 {
+    // NaN из повреждённого файла — тишина: приведение NaN к целому не
+    // определено стандартом, и разные процессоры дали бы разный звук.
+    if (value != value) return 0;
     if (value > 1.0) value = 1.0;
     if (value < -1.0) value = -1.0;
     double scaled = value * 32767.0;
