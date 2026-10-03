@@ -243,10 +243,10 @@ static void CheckCollision(LaiueMeshWorldV1 *world, int64_t baseX, int64_t baseY
            "sideways box hits the wall face");
 
     // Угол повёрнутого куба на расстоянии √2 от центра.
-    const float small[3] = {0.25f, 0.25f, 0.25f};
+    const float smallHalf[3] = {0.25f, 0.25f, 0.25f};
     const float north[3] = {0.0f, 10.0f, 0.0f};
     start = Position(baseX, baseY, baseZ, 8.0f, 8.0f, 5.0f);
-    Expect(g_service->sweepBox(world, &start, small, north, &hit) != 0u && hit.instance == tilted &&
+    Expect(g_service->sweepBox(world, &start, smallHalf, north, &hit) != 0u && hit.instance == tilted &&
                Near(hit.time, (5.0f - 1.41421356f - 0.25f) / 10.0f, 1e-4f) &&
                Near(hit.normal[1], -1.0f, 1e-4f),
            "box hits the edge of the rotated box");
@@ -276,10 +276,10 @@ static void CheckCollision(LaiueMeshWorldV1 *world, int64_t baseX, int64_t baseY
     start = Position(baseX, baseY, baseZ, 10.4f, 8.0f, 5.0f);
     const float back[3] = {-1.0f, 0.0f, 0.0f};
     const float deeper[3] = {1.0f, 0.0f, 0.0f};
-    Expect(g_service->moveBox(world, &start, small, back, &move) != 0u && move.collided == 0u &&
+    Expect(g_service->moveBox(world, &start, smallHalf, back, &move) != 0u && move.collided == 0u &&
                Near(move.position.local[0], 9.4f, 1e-4f),
            "an overlapping box can leave");
-    Expect(g_service->sweepBox(world, &start, small, deeper, &hit) != 0u && hit.instance == wall &&
+    Expect(g_service->sweepBox(world, &start, smallHalf, deeper, &hit) != 0u && hit.instance == wall &&
                hit.time == 0.0f && Near(hit.normal[0], -1.0f, 1e-5f),
            "an overlapping box cannot go deeper");
 
@@ -360,7 +360,7 @@ static void CheckBlocksAndCells(LaiueMeshWorldV1 *world)
                cells[0].y == -2 && cells[1].y == 0,
            "a truncated answer is the sorted prefix");
     Expect(g_service->queryCells(world, &center, 4.0f, cells, 8u, &count) != 0u && count == 1u,
-           "a small radius sees only the local cell");
+           "a smallHalf radius sees only the local cell");
     // Масштабированный пол из ячейки 10 дотягивается до x = 10*16+8-32 = 136,
     // в 128 м от центра запроса.
     Expect(g_service->queryCells(world, &center, 120.0f, cells, 8u, &count) != 0u && count == 3u,
@@ -504,8 +504,8 @@ static void CheckProvider(LaiueMeshWorldV1 *world)
 
     // Идём по X на 100 ячеек: старые ячейки уходят, новые приходят, по
     // земле можно стоять.
-    const LaiueMeshPositionV1 far = Position(100, 0, 0, 8.0f, 8.0f, 1.0f);
-    Expect(g_service->stream(world, &far, 40.0f, 0u, &pending) != 0u && pending == 0u,
+    const LaiueMeshPositionV1 distant = Position(100, 0, 0, 8.0f, 8.0f, 1.0f);
+    Expect(g_service->stream(world, &distant, 40.0f, 0u, &pending) != 0u && pending == 0u,
            "stream follows the walker");
     Expect(g_service->instanceCount(world) == 1u + 90u, "the window keeps its size");
     LaiueMeshHitV1 hit;

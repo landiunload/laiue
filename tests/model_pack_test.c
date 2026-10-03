@@ -178,7 +178,7 @@ static void CheckWithoutCatalog(void)
     LaiueModelSetContentService(NULL);
     uint32_t status = 0u;
     LaiueModelV1 *placeholder = service->loadFrom(NULL, L"tree", &status);
-    LaiueModelViewV1 view;
+    LaiueModelViewV1 view = {0};
     Expect(placeholder != NULL && status == LAIUE_MODEL_LOAD_NO_CATALOG &&
                service->getView(placeholder, &view) != 0u &&
                (view.flags & LAIUE_MODEL_FLAG_PLACEHOLDER) != 0u && view.indexCount == 36u,
@@ -207,7 +207,7 @@ static void CheckPack(const LaiueModelServiceV1 *service, const LaiueContentServ
 
     uint32_t status = 0u;
     LaiueModelV1 *tree = service->loadFrom(catalog, L"tree", &status);
-    LaiueModelViewV1 view;
+    LaiueModelViewV1 view = {0};
     Expect(tree != NULL && status == LAIUE_MODEL_LOAD_OK && service->getView(tree, &view) != 0u,
            "OBJ model loads from the pack");
     Expect(view.vertexCount == 4u && view.indexCount == 6u && view.partCount == 1u &&

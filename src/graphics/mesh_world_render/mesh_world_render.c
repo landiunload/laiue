@@ -852,7 +852,7 @@ static uint32_t RendererDraws(LaiueMeshWorldRendererV1 *renderer,
     if (renderer == NULL || renderOrigin == NULL || outCount == NULL ||
         (capacity != 0u && outItems == NULL))
         return 0u;
-    float planes[6][4];
+    float planes[6][4] = {{0.0f}};
     if (viewProjection != NULL)
         FrustumPlanes(viewProjection, planes);
     uint32_t written = 0u;
