@@ -862,7 +862,7 @@ endif()
 # ASan/UBSan замедляют вычислительные тесты в несколько раз. Пределы времени
 # выше рассчитаны на обычную сборку; в санитайзерной они пропорционально
 # растут, чтобы тайм-аут оставался признаком зависания, а не инструментации.
-if(LAIUE_ENABLE_SANITIZERS)
+if(LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS)
     get_property(_laiue_sanitized_tests DIRECTORY PROPERTY TESTS)
     foreach(_laiue_test IN LISTS _laiue_sanitized_tests)
         get_test_property(${_laiue_test} TIMEOUT _laiue_timeout)

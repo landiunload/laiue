@@ -1,0 +1,16 @@
+LAIUE MOD 3
+id = example.weather
+name = Weather Extension
+version = 1.2.0-beta
+engine = 0.6
+
+[native]
+abi = 1
+entry_windows_x86_64 = weather.windows-x86_64.dll
+entry_windows_arm64 = weather.windows-arm64.dll
+entry_linux_x86_64_gnu = weather.linux-x86_64-gnu.so
+entry_linux_x86_64_musl = weather.linux-x86_64-musl.so
+entry_linux_arm64_gnu = weather.linux-arm64-gnu.so
+entry_linux_arm64_musl = weather.linux-arm64-musl.so
+entry_macos_x86_64 = weather.macos-x86_64.dylib
+entry_macos_arm64 = weather.macos-arm64.dylib

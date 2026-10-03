@@ -491,6 +491,10 @@ if(LAIUE_BUILD_BENCHMARKS)
 endif()
 
 include(CTest)
+# Фаззеры регистрируют в CTest короткие прогоны поверх семян.
+if(LAIUE_BUILD_FUZZERS)
+    add_subdirectory(tests/fuzz)
+endif()
 if(BUILD_TESTING)
     find_package(Git REQUIRED)
     add_subdirectory(tests)
@@ -523,7 +527,8 @@ if(BUILD_TESTING)
                 "-DENGINE_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
                 "-DENGINE_MULTI_CONFIG=${LAIUE_IS_MULTI_CONFIG}"
                 "-DHOST_WIN32=${WIN32}"
-                "-DENGINE_SANITIZERS=${LAIUE_ENABLE_SANITIZERS}"
+                "-DENGINE_SANITIZERS=$<OR:$<BOOL:${LAIUE_ENABLE_SANITIZERS}>,$<BOOL:${LAIUE_BUILD_FUZZERS}>>"
+                "-DENGINE_C_COMPILER=${CMAKE_C_COMPILER}"
                 -P "${PROJECT_SOURCE_DIR}/tests/run_installed_consumer_test.cmake")
         set_tests_properties(laiue.install.consumer PROPERTIES
             RUN_SERIAL TRUE

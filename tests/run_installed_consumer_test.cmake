@@ -32,6 +32,11 @@ set(configure_command
     -G "${ENGINE_GENERATOR}"
     "-DCMAKE_PREFIX_PATH=${prefix}")
 if(ENGINE_SANITIZERS AND NOT HOST_WIN32)
+    # Рантайм санитайзеров у GCC и Clang разный, а Clang не вносит его в
+    # разделяемые библиотеки: потребитель собирается тем же компилятором.
+    if(DEFINED ENGINE_C_COMPILER AND NOT "${ENGINE_C_COMPILER}" STREQUAL "")
+        list(APPEND configure_command "-DCMAKE_C_COMPILER=${ENGINE_C_COMPILER}")
+    endif()
     list(APPEND configure_command
         "-DCMAKE_C_FLAGS=-fno-omit-frame-pointer -fsanitize=address,undefined"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined")
