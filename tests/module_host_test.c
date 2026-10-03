@@ -131,6 +131,83 @@ static void LAIUE_MODULE_CALL CountStartFailureDestroy(void *context)
     ++startFailureDestroyCalls;
 }
 
+/* A consumer that is not ready in the first start pass forces the host to
+ * walk the module table again after an optional module failed and was
+ * removed. The provider sorts after the consumer by ID. */
+static const char regressionServiceName[] = "example.regression.provided";
+static const char *const regressionProvidedServices[] = {regressionServiceName};
+static const LaiueModuleRequirementV1 regressionRequirement[] = {{regressionServiceName, 1u}};
+static uint32_t regressionServiceTable;
+static uint32_t regressionConsumerStarts;
+
+static uint32_t LAIUE_MODULE_CALL RegressionConsumerCreate(const LaiueModuleHostV1 *host,
+                                                           void **outContext)
+{
+    if (host == NULL || outContext == NULL)
+        return false;
+    *outContext = &regressionConsumerStarts;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL RegressionConsumerStart(void *context)
+{
+    ++*(uint32_t *)context;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL RegressionProviderCreate(const LaiueModuleHostV1 *host,
+                                                           void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    LaiueModuleServiceV1 service = {
+        .name = regressionServiceName,
+        .version = 1u,
+        .table = &regressionServiceTable,
+        .tableSize = sizeof(regressionServiceTable),
+    };
+    *outContext = &regressionServiceTable;
+    return host->publishService(host->context, &service) == LAIUE_MODULE_OK;
+}
+
+static void LAIUE_MODULE_CALL RegressionDestroy(void *context)
+{
+    (void)context;
+}
+
+static const LaiueModuleApiV1 regressionConsumerApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.regression.a_consumer",
+            .version = "1.0.0",
+            .requiresServices = regressionRequirement,
+            .requiresCount = 1u,
+        },
+    .create = RegressionConsumerCreate,
+    .start = RegressionConsumerStart,
+    .destroy = RegressionDestroy,
+};
+
+static const LaiueModuleApiV1 regressionProviderApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.regression.z_provider",
+            .version = "1.0.0",
+            .providesServices = regressionProvidedServices,
+            .providesCount = 1u,
+        },
+    .create = RegressionProviderCreate,
+    .destroy = RegressionDestroy,
+};
+
 static const LaiueModuleApiV1 staticApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
@@ -921,6 +998,29 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
                                        NULL, NULL) == NULL,
            "start failure removes published service");
+    LaiueModuleHostUnloadAll(host);
+
+    /* An optional module that fails in create is removed from the table. A
+     * later start pass, needed here because the consumer waits for a provider
+     * that sorts after it, must skip the emptied slot instead of reading its
+     * descriptor through a cleared API pointer. */
+    publishingFailureCreateCalls = 0u;
+    regressionConsumerStarts = 0u;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 3u);
+    LaiueModuleBinaryV1 laterPassAfterFailure[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &regressionConsumerApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &publishingFailCreateApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &regressionProviderApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, laterPassAfterFailure,
+               (uint32_t)(sizeof(laterPassAfterFailure) / sizeof(laterPassAfterFailure[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport,
+               &diagnostic) == LAIUE_MODULE_PARTIAL,
+           "optional create failure before a later start pass stays partial");
+    Expect(LaiueModuleHostLoadedCount(host) == 2u && regressionConsumerStarts == 1u &&
+               publishingFailureCreateCalls == 1u,
+           "consumer and provider start after the failed optional module is removed");
     LaiueModuleHostUnloadAll(host);
 
     /* Two independent optional callbacks may fail in the same transaction.

@@ -1194,7 +1194,9 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
         {
             uint32_t index = indices[order];
             LoadedModule *module = &host->modules[index];
-            if (module->created || !RequiredServicesReady(host, module))
+            // A failed optional module is removed in place and its slot
+            // cleared; later passes must not read its API through it.
+            if (!module->used || module->created || !RequiredServicesReady(host, module))
                 continue;
             uint32_t blockedOptionalIndex = LAIUE_MODULE_HOST_MAX_SERVICES;
             if (!OptionalServicesReady(host, module, moduleCount,
