@@ -713,6 +713,15 @@ if(TARGET laiue_audio)
     endif()
 endif()
 
+# Мир на мешах проверяется через свою таблицу и статическую регистрацию
+# модуля: ему не нужны ни графика, ни модели, ни каталог содержимого.
+if(TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_test mesh_world_test.c)
+    target_link_libraries(laiue_mesh_world_test PRIVATE laiue_bootstrap laiue_mesh_world)
+    laiue_configure_standalone_executable(laiue_mesh_world_test MeshWorldTestEntryPoint)
+    add_test(NAME laiue.mesh_world.queries COMMAND laiue_mesh_world_test)
+endif()
+
 if(TARGET laiue_media_support)
     # Конвертер проверяется отдельно от provider-а: его формат и разбор WAV
     # не должны притягивать аудио DLL в минимальный профиль.

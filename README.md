@@ -49,6 +49,8 @@ runtime-сервисы с единым C ABI.
 | `scene_math` | общий поставщик матриц и frustum без renderer |
 | `voxel_render` | асинхронный chunk streaming и GPU-загрузка мешей |
 | `voxel_raycast` | переносимый raycast по World без renderer |
+| `model` | provider `laiue.model`: паки моделей `.lop`, OBJ и `.lo`, только геометрия — см. [docs/modelpacks.md](docs/modelpacks.md) |
+| `mesh_world` | provider `laiue.mesh_world`: бесконечный мир из моделей без вокселей и чанков, запросы, столкновения и поставщик ячеек — см. [docs/mesh_world.md](docs/mesh_world.md) |
 | `ui` | immediate-mode UI поверх renderer |
 
 Публичные header-only контракты `graphics/graphics_api.h`,

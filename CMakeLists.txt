@@ -46,6 +46,7 @@ option(LAIUE_BUILD_AUDIO_OUTPUT "Build the optional WASAPI/ALSA audio output pro
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 option(LAIUE_BUILD_MODEL "Build the model pack module (OBJ and .lo)" ON)
+option(LAIUE_BUILD_MESH_WORLD "Build the infinite mesh world module" ON)
 
 # Набор графического backend-а не выбирает оконный и вводный provider.
 # Windows-слой одинаково доступен для D3D12 и Vulkan; сам Vulkan при этом
@@ -110,6 +111,9 @@ if(LAIUE_BUILD_UI)
 endif()
 if(LAIUE_BUILD_MODEL)
     add_subdirectory(src/assets/model)
+endif()
+if(LAIUE_BUILD_MESH_WORLD)
+    add_subdirectory(src/simulation/mesh_world)
 endif()
 
 # Minimal application bootstrap. It contains only the standalone module
@@ -294,6 +298,11 @@ install(FILES
 if(TARGET laiue_model)
     install(FILES "${PROJECT_SOURCE_DIR}/src/assets/model/model_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/model"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_mesh_world)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/mesh_world/mesh_world_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh_world"
         COMPONENT Engine)
 endif()
 # Заголовки ставятся по собранным целям, а не по одному флагу графики:
