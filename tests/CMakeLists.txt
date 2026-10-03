@@ -716,6 +716,11 @@ endif()
 if(TARGET laiue_media_support)
     # Конвертер проверяется отдельно от provider-а: его формат и разбор WAV
     # не должны притягивать аудио DLL в минимальный профиль.
+    add_executable(laiue_model_codec_test model_codec_test.c)
+    target_link_libraries(laiue_model_codec_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_model_codec_test ModelCodecTestEntryPoint)
+    add_test(NAME laiue.media.model_codec COMMAND laiue_model_codec_test)
+
     add_executable(laiue_soundc_test soundc_test.c)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)

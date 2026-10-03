@@ -1,0 +1,16 @@
+# c-1 1
+v 1 -1 1
+v 9 1 1
+v -1 1 1
+vt 0 0
+vv 1 0
+vt 1 1
+vt 0 1
+vn 0 0 -1 -1 -1
+ -1
+vn 0 0 1
+u1w4
+o COL_box
+f 1 2 3
+g UCX_top
+f 5 6 7
