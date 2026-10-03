@@ -221,14 +221,16 @@ static uint32_t RunProfile(LaiueModuleHost *host, uint32_t removed, MatrixVarian
         .moduleId = removedModule != NULL ? removedModule->id : NULL,
     };
     const bool selected = variant == MATRIX_CORRUPT_SELECTED && selection.serviceName != NULL;
+    // Адреса локальных массивов присваиваются отдельно: MSVC в /W4 считает
+    // их в инициализаторе агрегата расширением языка (C4221).
     LaiueModuleProfileV1 profile = {
         .structSize = sizeof(profile),
         .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-        .binaries = binaries,
         .binaryCount = moduleCount,
-        .providerSelections = selected ? &selection : NULL,
         .providerSelectionCount = selected ? 1u : 0u,
     };
+    profile.binaries = binaries;
+    profile.providerSelections = selected ? &selection : NULL;
     LaiueModuleLoadReportV1 report;
     LaiueModuleLoadReportInitialize(&report, reportEntries, MATRIX_MAX_MODULES);
     LaiueModuleDiagnostic diagnostic;

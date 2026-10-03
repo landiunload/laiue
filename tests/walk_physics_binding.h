@@ -9,7 +9,10 @@
 
 static inline bool BindLinkedWalkPhysics(void)
 {
-    static const LaiuePhysicsServiceV1 table = {
+    // MSVC не принимает адрес dllimport-функции в статическом инициализаторе
+    // (C4232), поэтому таблица, переживающая вызов, заполняется здесь.
+    static LaiuePhysicsServiceV1 table;
+    table = (LaiuePhysicsServiceV1){
         .structSize = sizeof(LaiuePhysicsServiceV1),
         .abiVersion = LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
         .bodyWake = VoxelRigidBodyWake,

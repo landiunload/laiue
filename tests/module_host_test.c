@@ -967,11 +967,11 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     LaiueModuleProfileV1 unavailableProfile = {
         .structSize = sizeof(unavailableProfile),
         .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-        .binaries = unavailableBinaries,
         .binaryCount = 4u,
         .providerSelections = &unavailableSelection,
         .providerSelectionCount = 1u,
     };
+    unavailableProfile.binaries = unavailableBinaries;
     for (uint32_t variant = 0u; variant < 2u; ++variant)
     {
         if (variant == 1u)
