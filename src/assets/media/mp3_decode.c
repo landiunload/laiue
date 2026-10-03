@@ -1044,10 +1044,18 @@ static void Mp3SubbandSynthesis(Mp3State *state, uint32_t channel, const float *
         float sum = 0.0f;
         for (uint32_t group = 0; group < 16u; ++group) sum += windowed[index + 32u * group];
         float scaled = sum * 32768.0f;
-        int32_t value = (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
-        if (value > 32767) value = 32767;
-        if (value < -32768) value = -32768;
-        output[index * stride] = (int16_t)value;
+        // Насыщение до приведения к целому: повреждённый поток уводит синтез
+        // далеко за int32 и даже в NaN, а такое приведение не определено.
+        // Внутри диапазона округление прежнее, и корректный поток даёт те же
+        // сэмплы бит в бит.
+        int16_t sample = 0;
+        if (scaled >= 32767.0f)
+            sample = 32767;
+        else if (scaled <= -32768.0f)
+            sample = -32768;
+        else if (scaled == scaled)
+            sample = (int16_t)(int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+        output[index * stride] = sample;
     }
 }
 
