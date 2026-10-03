@@ -169,6 +169,15 @@ LAIUE_TEST_ENTRY(ContentCatalogTestEntryPoint)
     {
         PlatformDeleteFile(paths->built);
     }
+#if !defined(_WIN32)
+    // Каталог проверки коллизии регистра, оставленный прерванным прогоном,
+    // заставил бы каталог отвергнуть весь набор шейдерпаков.
+    if (DirectoryContainsExactName(paths->shaders, L"alpha.lsp"))
+    {
+        CatalogExpect(PlatformRemoveDirectory(paths->alphaLower),
+                      "stale case-collision test directory cleanup");
+    }
+#endif
 
     LaiueContentCatalog *catalog = LaiueContentCatalogCreate(paths->root);
     CatalogExpect(catalog != NULL, "explicit catalog creation");

@@ -19,13 +19,13 @@
 // нуль с точностью до страниц аллокатора.
 #define MAXIMUM_GROWTH_KIB 4096L
 
-// AddressSanitizer держит освобождённую память в карантине, и RSS там
-// растёт без всякой утечки. В такой сборке потерю ловит LeakSanitizer при
+// AddressSanitizer и ThreadSanitizer держат освобождённую память у себя, и
+// RSS там растёт без всякой утечки. В такой сборке потерю ловит LeakSanitizer при
 // выходе процесса, а сравнение RSS выполняется только в обычной.
-#if defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define CYCLE_TEST_RSS_CHECK 0
 #elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
 #define CYCLE_TEST_RSS_CHECK 0
 #endif
 #endif
