@@ -1459,14 +1459,23 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         }
         if (!selectedProviderFound || !serviceProviderFound)
         {
-            invalidProviderSelection = true;
+            /* A partial profile treats an absent or unloadable selected
+             * artifact like any other missing optional technology: the
+             * service has no provider, competing providers stay disabled
+             * instead of becoming a hidden fallback, and independent modules
+             * still start.  A strict profile keeps rejecting the mismatch. */
+            if (!allowPartial)
+                invalidProviderSelection = true;
             for (uint32_t candidateIndex = 0u; candidateIndex < count; ++candidateIndex)
             {
                 ProfileCandidate *candidate = &candidates[candidateIndex];
                 if (candidate->active &&
                     ProfileCandidateProvides(candidate, selection->serviceName))
-                    ProfileSetFailure(candidate, LAIUE_MODULE_INVALID_ARGUMENT,
-                                      "selected service provider is not present");
+                    ProfileSetFailure(candidate,
+                                      allowPartial ? LAIUE_MODULE_DUPLICATE_SERVICE
+                                                   : LAIUE_MODULE_INVALID_ARGUMENT,
+                                      allowPartial ? "selected service provider is unavailable"
+                                                   : "selected service provider is not present");
             }
         }
     }

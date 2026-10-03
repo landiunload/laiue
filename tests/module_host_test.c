@@ -657,6 +657,27 @@ static const LaiueModuleApiV1 selectedProviderZetaApi = {
     .destroy = StaticDestroy,
 };
 
+static const LaiueModuleRequirementV1 selectionRequirement[] = {
+    {"example.selection", 1u},
+};
+static const LaiueModuleApiV1 selectionConsumerApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.selection.consumer",
+            .version = "1.0.0",
+            .requiresServices = selectionRequirement,
+            .requiresCount = 1u,
+        },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
 static const LaiueModuleApiV1 badAbiApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = 99u,
@@ -923,6 +944,59 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                                         &diagnostic) == LAIUE_MODULE_INVALID_ARGUMENT &&
                LaiueModuleHostLoadedCount(host) == 0u,
            "invalid provider selection is rejected before callbacks");
+
+    /* The selected artifact may be present but unloadable (a Vulkan provider
+     * on a system without the Vulkan loader) or absent. A partial profile
+     * then treats the service as missing: the competing provider is not a
+     * hidden fallback, its consumer is disabled, and the independent module
+     * still starts instead of the whole graph being rejected. */
+    static LaiueModuleLoadReportEntryV1 unavailableEntries[4];
+    LaiueModuleLoadReportV1 unavailableReport;
+    LaiueModuleBinaryV1 unavailableBinaries[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &badAbiApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &selectedProviderAlphaApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &selectionConsumerApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    static const LaiueModuleProviderSelectionV1 unavailableSelection = {
+        .structSize = sizeof(LaiueModuleProviderSelectionV1),
+        .serviceName = "example.selection",
+        .moduleId = "example.provider.zeta",
+    };
+    LaiueModuleProfileV1 unavailableProfile = {
+        .structSize = sizeof(unavailableProfile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .binaries = unavailableBinaries,
+        .binaryCount = 4u,
+        .providerSelections = &unavailableSelection,
+        .providerSelectionCount = 1u,
+    };
+    for (uint32_t variant = 0u; variant < 2u; ++variant)
+    {
+        if (variant == 1u)
+            unavailableBinaries[0] =
+                (LaiueModuleBinaryV1){missingPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+        LaiueModuleLoadReportInitialize(&unavailableReport, unavailableEntries, 4u);
+        Expect(LaiueModuleHostLoadProfileV1(host, &unavailableProfile, &unavailableReport,
+                                            &diagnostic) == LAIUE_MODULE_PARTIAL,
+               "unavailable selected provider keeps a partial profile running");
+        Expect(LaiueModuleHostLoadedCount(host) == 1u &&
+                   LaiueModuleHostIsLoaded(host, "example.static") &&
+                   !LaiueModuleHostIsLoaded(host, "example.provider.alpha") &&
+                   !LaiueModuleHostIsLoaded(host, "example.selection.consumer") &&
+                   (unavailableEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+                   (unavailableEntries[2].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+                   (unavailableEntries[3].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+               "unavailable selected provider disables only its service branch");
+        LaiueModuleHostUnloadAll(host);
+    }
+    unavailableProfile.flags = 0u;
+    LaiueModuleLoadReportInitialize(&unavailableReport, unavailableEntries, 4u);
+    Expect(LaiueModuleHostLoadProfileV1(host, &unavailableProfile, &unavailableReport,
+                                        &diagnostic) == LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleHostLoadedCount(host) == 0u,
+           "strict profile still rejects an unavailable selected provider");
 
     /* A present optional provider may fail in create/start. The profile
      * disables it in the same transaction, while the independent static
