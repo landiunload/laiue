@@ -147,6 +147,14 @@
 8. **PR**: обновить описание draft-PR (mesh_world, render-адаптер,
    ёмкость устройства), следить за CI.
 
+## CI
+
+Windows-сборки (MSVC, clang-cl, x64 и ARM64) падали на ff25b11 и 43f00f8:
+переменная `far` в `tests/mesh_world_test.c` (это макрос Windows) и C4701 в
+`tests/model_pack_test.c`. Исправление — коммит 2304a23. Его результат в CI
+на момент записи ещё не пришёл: первым делом проверить CI PR на текущем
+HEAD.
+
 ## Как собирать и проверять
 
 ```sh
@@ -166,6 +174,12 @@ ctest --test-dir build/linux-vulkan-offscreen -C Release -j8   # нужен lava
   обнуляет** (на Windows обнуляет). Не полагаться на это.
 - `-Wpedantic` в C17 запрещает передавать `float[3][3]` в параметр
   `const float[3][3]`: параметры-матрицы объявлять без `const`.
+- В заголовках Windows `far`, `near`, `small`, `hyper`, `IN`, `OUT`
+  определены макросами: не называть так переменные. Быстрая проверка на
+  Linux: `gcc -fsyntax-only -Dfar= -Dnear= -Dsmall=char ...`. MSVC `/W4`
+  считает C4701 (возможно неинициализированная переменная) ошибкой: локальные
+  структуры, которые заполняются через указатель, лучше инициализировать
+  `= {0}`.
 - `LaiueModuleHostQueryService` принимает 6 аргументов (последние два —
   `outVersion`, `outSize`, можно `NULL`).
 - В модулях из списка `portable_modules`
