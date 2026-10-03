@@ -13,7 +13,7 @@
 | Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA, на устройстве не запускался | glibc, нужны окно, ввод и UI |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
-| Android ARM64 | NDK r29: core собирается в CI | Vulkan NativeActivity-пример собирается в CI; на устройстве в CI не запускается, системного звука нет | API 28+, static external core |
+| Android ARM64 | NDK r29: core собирается в CI | Vulkan NativeActivity-пример и вывод звука AAudio собираются в CI; на устройстве в CI не запускаются | API 28+, static external core |
 | Android x86_64 | API 35 Google APIs AVD + WHPX, NativeActivity/Vulkan `.so` build | — | NDK r29, static external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
@@ -54,11 +54,11 @@ Windows отвергается сразу.
 
 Микшер и сцена переносимы целиком: микшер не знает платформы, потоковый
 стриминг чанков работает через контракт потоков платформенного слоя.
-Системный вывод звука есть только на Windows (WASAPI) и Linux (ALSA,
-загружается в рантайме). На macOS, iOS и Android модуль `audio_output`
-собирается с заглушкой: запрос системного устройства завершается понятной
-ошибкой, а микшер и offscreen-вывод работают, поэтому игра остаётся
-исправной, но беззвучной. На POSIX headless-профиле окно
+Системный вывод звука: Windows — WASAPI, Linux — ALSA, Android — AAudio
+(обе загружаются в рантайме), macOS и iOS — выходной AudioUnit. Остальные
+внешние профили собирают `audio_output` с заглушкой: запрос системного
+устройства завершается понятной ошибкой, а микшер и offscreen-вывод
+работают. На POSIX headless-профиле окно
 и ввод можно подключить X11 provider-ом; `ui` остаётся доступным и использует
 portable font fallback, а на Windows растеризует
 шрифты через GDI.
