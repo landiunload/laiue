@@ -143,11 +143,6 @@ static void BufU16Be(BenchBuffer *buffer, uint32_t value)
     BufByte(buffer, (uint8_t)(value & 0xFFu));
 }
 
-static void BufBytes(BenchBuffer *buffer, const uint8_t *bytes, uint32_t count)
-{
-    for (uint32_t index = 0u; index < count; ++index) BufByte(buffer, bytes[index]);
-}
-
 // === Синтетический baseline JPEG ===
 //
 // Таблицы квантования — из единиц. DC кодируется ровно категорией (четыре

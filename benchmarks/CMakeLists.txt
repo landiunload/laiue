@@ -147,7 +147,8 @@ endif()
 
 if(TARGET laiue_scene AND TARGET laiue_world)
     add_executable(laiue_raycast_benchmark EXCLUDE_FROM_ALL raycast_benchmark.c)
-    target_link_libraries(laiue_raycast_benchmark PRIVATE laiue_scene laiue_world)
+    target_link_libraries(laiue_raycast_benchmark PRIVATE laiue_scene laiue_world
+        laiue_voxel_raycast laiue_numeric)
     target_include_directories(laiue_raycast_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(
