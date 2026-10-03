@@ -1,5 +1,5 @@
-# Форматы содержимого: чтение чужих (PNG, GIF, JPEG, WAV, MP3) и
-# запись своих (`.lt`, `.la`). Библиотека внутренняя и
+# Форматы содержимого: чтение чужих (PNG, GIF, JPEG, WAV, MP3, OBJ) и
+# запись своих (`.lt`, `.la`, `.lo`). Библиотека внутренняя и
 # статическая — её символы не становятся частью ABI модулей, ровно как у
 # platform_support и math_support.
 #
@@ -21,6 +21,8 @@ add_library(laiue_media_support STATIC
     mp3_decode.c
     mp3_decode.h
     mp3_tables.h
+    model.c
+    model.h
     png_decode.c
     png_decode.h
     sound.c

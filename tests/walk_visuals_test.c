@@ -2,6 +2,7 @@
 #include "walk_visuals.h"
 #include "humanoid_ragdoll.h"
 #include "physics/numeric_provider.h"
+#include "walk_physics_binding.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -201,6 +202,7 @@ static void CheckNeutralScale(void)
 LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
 {
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
+    Expect(BindLinkedWalkPhysics(), "walk binds the linked physics table");
     testDevice.api = (LaiueGraphicsDeviceV2){
         .structSize = sizeof(testDevice.api),
         .abiVersion = LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION,

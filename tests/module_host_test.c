@@ -131,6 +131,83 @@ static void LAIUE_MODULE_CALL CountStartFailureDestroy(void *context)
     ++startFailureDestroyCalls;
 }
 
+/* A consumer that is not ready in the first start pass forces the host to
+ * walk the module table again after an optional module failed and was
+ * removed. The provider sorts after the consumer by ID. */
+static const char regressionServiceName[] = "example.regression.provided";
+static const char *const regressionProvidedServices[] = {regressionServiceName};
+static const LaiueModuleRequirementV1 regressionRequirement[] = {{regressionServiceName, 1u}};
+static uint32_t regressionServiceTable;
+static uint32_t regressionConsumerStarts;
+
+static uint32_t LAIUE_MODULE_CALL RegressionConsumerCreate(const LaiueModuleHostV1 *host,
+                                                           void **outContext)
+{
+    if (host == NULL || outContext == NULL)
+        return false;
+    *outContext = &regressionConsumerStarts;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL RegressionConsumerStart(void *context)
+{
+    ++*(uint32_t *)context;
+    return true;
+}
+
+static uint32_t LAIUE_MODULE_CALL RegressionProviderCreate(const LaiueModuleHostV1 *host,
+                                                           void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL)
+        return false;
+    LaiueModuleServiceV1 service = {
+        .name = regressionServiceName,
+        .version = 1u,
+        .table = &regressionServiceTable,
+        .tableSize = sizeof(regressionServiceTable),
+    };
+    *outContext = &regressionServiceTable;
+    return host->publishService(host->context, &service) == LAIUE_MODULE_OK;
+}
+
+static void LAIUE_MODULE_CALL RegressionDestroy(void *context)
+{
+    (void)context;
+}
+
+static const LaiueModuleApiV1 regressionConsumerApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.regression.a_consumer",
+            .version = "1.0.0",
+            .requiresServices = regressionRequirement,
+            .requiresCount = 1u,
+        },
+    .create = RegressionConsumerCreate,
+    .start = RegressionConsumerStart,
+    .destroy = RegressionDestroy,
+};
+
+static const LaiueModuleApiV1 regressionProviderApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.regression.z_provider",
+            .version = "1.0.0",
+            .providesServices = regressionProvidedServices,
+            .providesCount = 1u,
+        },
+    .create = RegressionProviderCreate,
+    .destroy = RegressionDestroy,
+};
+
 static const LaiueModuleApiV1 staticApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
@@ -580,6 +657,27 @@ static const LaiueModuleApiV1 selectedProviderZetaApi = {
     .destroy = StaticDestroy,
 };
 
+static const LaiueModuleRequirementV1 selectionRequirement[] = {
+    {"example.selection", 1u},
+};
+static const LaiueModuleApiV1 selectionConsumerApi = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "example.selection.consumer",
+            .version = "1.0.0",
+            .requiresServices = selectionRequirement,
+            .requiresCount = 1u,
+        },
+    .create = StaticCreate,
+    .start = StaticStart,
+    .stop = StaticStop,
+    .destroy = StaticDestroy,
+};
+
 static const LaiueModuleApiV1 badAbiApi = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = 99u,
@@ -847,6 +945,59 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
                LaiueModuleHostLoadedCount(host) == 0u,
            "invalid provider selection is rejected before callbacks");
 
+    /* The selected artifact may be present but unloadable (a Vulkan provider
+     * on a system without the Vulkan loader) or absent. A partial profile
+     * then treats the service as missing: the competing provider is not a
+     * hidden fallback, its consumer is disabled, and the independent module
+     * still starts instead of the whole graph being rejected. */
+    static LaiueModuleLoadReportEntryV1 unavailableEntries[4];
+    LaiueModuleLoadReportV1 unavailableReport;
+    LaiueModuleBinaryV1 unavailableBinaries[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &badAbiApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL,
+         &selectedProviderAlphaApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &selectionConsumerApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &staticApi},
+    };
+    static const LaiueModuleProviderSelectionV1 unavailableSelection = {
+        .structSize = sizeof(LaiueModuleProviderSelectionV1),
+        .serviceName = "example.selection",
+        .moduleId = "example.provider.zeta",
+    };
+    LaiueModuleProfileV1 unavailableProfile = {
+        .structSize = sizeof(unavailableProfile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .binaryCount = 4u,
+        .providerSelections = &unavailableSelection,
+        .providerSelectionCount = 1u,
+    };
+    unavailableProfile.binaries = unavailableBinaries;
+    for (uint32_t variant = 0u; variant < 2u; ++variant)
+    {
+        if (variant == 1u)
+            unavailableBinaries[0] =
+                (LaiueModuleBinaryV1){missingPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+        LaiueModuleLoadReportInitialize(&unavailableReport, unavailableEntries, 4u);
+        Expect(LaiueModuleHostLoadProfileV1(host, &unavailableProfile, &unavailableReport,
+                                            &diagnostic) == LAIUE_MODULE_PARTIAL,
+               "unavailable selected provider keeps a partial profile running");
+        Expect(LaiueModuleHostLoadedCount(host) == 1u &&
+                   LaiueModuleHostIsLoaded(host, "example.static") &&
+                   !LaiueModuleHostIsLoaded(host, "example.provider.alpha") &&
+                   !LaiueModuleHostIsLoaded(host, "example.selection.consumer") &&
+                   (unavailableEntries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+                   (unavailableEntries[2].flags & LAIUE_MODULE_PROFILE_ENTRY_DISABLED) != 0u &&
+                   (unavailableEntries[3].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+               "unavailable selected provider disables only its service branch");
+        LaiueModuleHostUnloadAll(host);
+    }
+    unavailableProfile.flags = 0u;
+    LaiueModuleLoadReportInitialize(&unavailableReport, unavailableEntries, 4u);
+    Expect(LaiueModuleHostLoadProfileV1(host, &unavailableProfile, &unavailableReport,
+                                        &diagnostic) == LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleHostLoadedCount(host) == 0u,
+           "strict profile still rejects an unavailable selected provider");
+
     /* A present optional provider may fail in create/start. The profile
      * disables it in the same transaction, while the independent static
      * module still reaches a clean running graph without a second start. */
@@ -921,6 +1072,29 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     Expect(LaiueModuleHostQueryService(host, publishedFailureServices[0], 1u, 1u,
                                        NULL, NULL) == NULL,
            "start failure removes published service");
+    LaiueModuleHostUnloadAll(host);
+
+    /* An optional module that fails in create is removed from the table. A
+     * later start pass, needed here because the consumer waits for a provider
+     * that sorts after it, must skip the emptied slot instead of reading its
+     * descriptor through a cleared API pointer. */
+    publishingFailureCreateCalls = 0u;
+    regressionConsumerStarts = 0u;
+    LaiueModuleLoadReportInitialize(&profileReport, profileEntries, 3u);
+    LaiueModuleBinaryV1 laterPassAfterFailure[] = {
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &regressionConsumerApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC | LAIUE_MODULE_BINARY_OPTIONAL, &publishingFailCreateApi},
+        {NULL, LAIUE_MODULE_BINARY_STATIC, &regressionProviderApi},
+    };
+    Expect(LaiueModuleHostLoadProfile(
+               host, laterPassAfterFailure,
+               (uint32_t)(sizeof(laterPassAfterFailure) / sizeof(laterPassAfterFailure[0])),
+               LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, &profileReport,
+               &diagnostic) == LAIUE_MODULE_PARTIAL,
+           "optional create failure before a later start pass stays partial");
+    Expect(LaiueModuleHostLoadedCount(host) == 2u && regressionConsumerStarts == 1u &&
+               publishingFailureCreateCalls == 1u,
+           "consumer and provider start after the failed optional module is removed");
     LaiueModuleHostUnloadAll(host);
 
     /* Two independent optional callbacks may fail in the same transaction.

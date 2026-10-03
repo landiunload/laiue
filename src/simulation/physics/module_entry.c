@@ -50,6 +50,13 @@ static const LaiuePhysicsServiceV1 service = {
     .ragdollStep = VoxelRagdollStep,
     .ragdollDrive = VoxelRagdollDrive,
     .ragdollJump = VoxelRagdollJump,
+    .bodyLocalPosition = VoxelRigidBodyLocalPosition,
+    .bodyOrientationMatrix = VoxelRigidBodyOrientationMatrix,
+    .bodyLinearVelocity = VoxelRigidBodyLinearVelocity,
+    .bodyAngularVelocity = VoxelRigidBodyAngularVelocity,
+    .bodyAddLinearVelocity = VoxelRigidBodyAddLinearVelocity,
+    .bodyAddAngularVelocity = VoxelRigidBodyAddAngularVelocity,
+    .bodyTranslateBlocks = VoxelRigidBodyTranslateBlocks,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

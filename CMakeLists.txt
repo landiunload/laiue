@@ -45,6 +45,8 @@ option(LAIUE_BUILD_AUDIO "Build the audio mixer and deterministic offscreen outp
 option(LAIUE_BUILD_AUDIO_OUTPUT "Build the optional WASAPI/ALSA audio output provider" ON)
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
+option(LAIUE_BUILD_MODEL "Build the model pack module (OBJ and .lo)" ON)
+option(LAIUE_BUILD_MESH_WORLD "Build the infinite mesh world module" ON)
 
 # Набор графического backend-а не выбирает оконный и вводный provider.
 # Windows-слой одинаково доступен для D3D12 и Vulkan; сам Vulkan при этом
@@ -106,6 +108,13 @@ if(LAIUE_BUILD_AUDIO OR LAIUE_BUILD_AUDIO_OUTPUT OR LAIUE_BUILD_AUDIO_PACK)
 endif()
 if(LAIUE_BUILD_UI)
     add_subdirectory(src/ui)
+endif()
+if(LAIUE_BUILD_MODEL)
+    add_subdirectory(src/assets/model)
+endif()
+if(LAIUE_BUILD_MESH_WORLD)
+    add_subdirectory(src/simulation/mesh_world)
+    add_subdirectory(src/graphics/mesh_world_render)
 endif()
 
 # Minimal application bootstrap. It contains only the standalone module
@@ -287,6 +296,16 @@ install(FILES
         "${PROJECT_SOURCE_DIR}/src/simulation/character/character_service.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/character"
     COMPONENT Engine)
+if(TARGET laiue_model)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/assets/model/model_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/model"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_mesh_world)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/mesh_world/mesh_world_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh_world"
+        COMPONENT Engine)
+endif()
 # Заголовки ставятся по собранным целям, а не по одному флагу графики:
 # набор графических модулей зависит от бэкенда, и SDK не должен обещать
 # заголовок модуля, которого в сборке нет.
@@ -482,6 +501,7 @@ endif()
 
 if(LAIUE_BUILD_TOOLS)
     add_subdirectory(tools/soundc)
+    add_subdirectory(tools/modelc)
     add_subdirectory(tools/texc)
 endif()
 
@@ -491,6 +511,10 @@ if(LAIUE_BUILD_BENCHMARKS)
 endif()
 
 include(CTest)
+# Фаззеры регистрируют в CTest короткие прогоны поверх семян.
+if(LAIUE_BUILD_FUZZERS)
+    add_subdirectory(tests/fuzz)
+endif()
 if(BUILD_TESTING)
     find_package(Git REQUIRED)
     add_subdirectory(tests)
@@ -523,7 +547,8 @@ if(BUILD_TESTING)
                 "-DENGINE_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
                 "-DENGINE_MULTI_CONFIG=${LAIUE_IS_MULTI_CONFIG}"
                 "-DHOST_WIN32=${WIN32}"
-                "-DENGINE_SANITIZERS=${LAIUE_ENABLE_SANITIZERS}"
+                "-DENGINE_SANITIZERS=$<OR:$<BOOL:${LAIUE_ENABLE_SANITIZERS}>,$<BOOL:${LAIUE_BUILD_FUZZERS}>>"
+                "-DENGINE_C_COMPILER=${CMAKE_C_COMPILER}"
                 -P "${PROJECT_SOURCE_DIR}/tests/run_installed_consumer_test.cmake")
         set_tests_properties(laiue.install.consumer PROPERTIES
             RUN_SERIAL TRUE

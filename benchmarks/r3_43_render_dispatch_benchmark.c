@@ -39,13 +39,16 @@
 #define MESH_BATCH 64u
 #define SKIP_EXIT_CODE 125
 
-static volatile uint64_t benchmarkSink;
-static RendererFrameSetup sinkSetup;
-
 static void WriteText(const char *text)
 {
     LaiueTestRuntimeWrite(text);
 }
+
+// Сам замер требует Win32-окна и D3D12; на остальных платформах стенд
+// только сообщает о пропуске, и помощники ниже не компилируются.
+#if defined(_WIN32)
+static volatile uint64_t benchmarkSink;
+static RendererFrameSetup sinkSetup;
 
 static void WriteUnsigned(uint64_t value)
 {
@@ -289,6 +292,8 @@ static HWND CreateHiddenWindow(const wchar_t *className, const wchar_t *title)
     return CreateWindowExW(0, className, title, WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT, 320, 180, NULL, NULL, instance, NULL);
 }
+#endif
+
 #endif
 
 LAIUE_TEST_ENTRY(R3RenderDispatchBenchmarkEntryPoint)

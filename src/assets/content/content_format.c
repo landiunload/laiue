@@ -32,6 +32,25 @@ static const LaiueContentFormat g_formats[LAIUE_CONTENT_TYPE_COUNT] = {
         L"Звукопак", L"sounds", L".lap",
         LAIUE_CONTENT_STORAGE_DIRECTORY, true,
     },
+    [LAIUE_CONTENT_MODEL] = {
+        L"Модель", L"models", L".lo",
+        LAIUE_CONTENT_STORAGE_FILE, false,
+    },
+    // Пак моделей устроен как звукопак: имена моделей задаёт приложение,
+    // подпапки допустимы, и заменить одну модель — значит положить рядом
+    // файл с тем же именем.
+    [LAIUE_CONTENT_MODEL_PACK] = {
+        L"Пак моделей", L"models", L".lop",
+        LAIUE_CONTENT_STORAGE_DIRECTORY, true,
+    },
+    [LAIUE_CONTENT_ANIMATION] = {
+        L"Анимация", L"animations", L".lk",
+        LAIUE_CONTENT_STORAGE_FILE, false,
+    },
+    [LAIUE_CONTENT_ANIMATION_PACK] = {
+        L"Пак анимаций", L"animations", L".lkp",
+        LAIUE_CONTENT_STORAGE_DIRECTORY, true,
+    },
 };
 
 static wchar_t AsciiLower(wchar_t character)

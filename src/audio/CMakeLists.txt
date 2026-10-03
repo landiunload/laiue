@@ -10,8 +10,18 @@ if(LAIUE_PLATFORM_WINDOWS)
 elseif(LAIUE_PLATFORM_POSIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(audio_system_sources audio_alsa.c)
     set(audio_system_links)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    # AAudio тоже загружается в рантайме: приложению не нужен -laaudio.
+    set(audio_system_sources audio_aaudio.c)
+    set(audio_system_links)
+elseif(APPLE)
+    # Выходной AudioUnit — системная часть macOS и iOS, framework есть в
+    # каждом SDK; отдельной зависимости на машине пользователя не появляется.
+    find_library(LAIUE_AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
+    set(audio_system_sources audio_coreaudio.c)
+    set(audio_system_links "${LAIUE_AUDIOTOOLBOX_FRAMEWORK}")
 else()
-    # macOS и внешние профили своего вывода пока не имеют: запрос
+    # Остальные внешние профили своего вывода пока не имеют: запрос
     # системного бэкенда честно завершится ошибкой инициализации.
     set(audio_system_sources audio_system_unavailable.c)
     set(audio_system_links)

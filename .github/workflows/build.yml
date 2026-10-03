@@ -175,6 +175,33 @@ jobs:
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake
 
+  linux-fuzz-corpus:
+    name: Linux parser fuzz corpus (Clang)
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates clang cmake git \
+            libclang-rt-dev ninja-build
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure
+        run: cmake --preset linux-clang-fuzz
+      # Движок собран с ASan/UBSan и покрытием libFuzzer; каждый фаззер
+      # повторяет семена и входы, однажды ронявшие разборщик.
+      - name: Build fuzzers
+        run: >
+          cmake --build --preset linux-clang-fuzz-debug --parallel
+          --target laiue_fuzzers
+      - name: Replay seed and regression corpus
+        run: ctest --preset linux-clang-fuzz-debug -R '^laiue[.]fuzz[.]' --no-tests=error
+      - name: Verify build did not modify sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
   linux-vulkan-engine:
     name: Linux Vulkan offscreen renderer
     runs-on: ubuntu-24.04
@@ -183,8 +210,10 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y ca-certificates cmake gcc git ninja-build             glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools             vulkan-validationlayers
+          apt-get install -y ca-certificates cmake gcc git ninja-build             glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools             vulkan-validationlayers libx11-dev
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # С заголовками X11 профиль собирает и X11-окно с вводом: без них
+      # эти модули выпадали из сборки, и их поломка оставалась незамеченной.
       - name: Configure
         run: cmake --preset linux-vulkan-offscreen -DLAIUE_REQUIRE_VULKAN_TEST_DRIVER=ON
       - name: Build Debug
@@ -296,6 +325,12 @@ jobs:
         run: cmake --preset android-arm64-core
       - name: Compile and link Android targets
         run: cmake --build --preset android-arm64-core-release --parallel
+      # Пример NativeActivity делит с desktop-walk код ragdoll и выбор
+      # модулей; без этой сборки его поломка оставалась бы незамеченной.
+      - name: Compile and link Android walk example
+        run: |
+          cmake --preset android-arm64-walk
+          cmake --build --preset android-arm64-walk-release --parallel
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \

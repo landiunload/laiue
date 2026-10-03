@@ -257,6 +257,12 @@ typedef struct DrawItem
     uint32_t entryIndex;
 } DrawItem;
 
+typedef struct ChunkStreamingWorker
+{
+    ChunkStreaming *streaming;
+    ChunkMesherScratch *scratch;
+} ChunkStreamingWorker;
+
 struct ChunkStreaming
 {
     World* world;
@@ -314,6 +320,10 @@ struct ChunkStreaming
     PlatformMutex queueLock;
     PlatformConditionVariable workAvailable;
     PlatformThread workerThreads[MAX_WORKER_THREADS];
+    // Параметры запущенных рабочих. Scratch мешера выделяется до запуска
+    // потока: рабочий, которому не хватило бы памяти уже после старта,
+    // молча завершился бы, а Pause ждал бы его отчёта вечно.
+    ChunkStreamingWorker workers[MAX_WORKER_THREADS];
     uint32_t workerThreadCount;
     uint32_t desiredWorkerThreadCount;
     uint32_t pausedWorkerCount;
@@ -874,13 +884,10 @@ static void FlushEnqueueBatch(ChunkStreaming* streaming, ChunkEnqueueBatch* batc
 
 static uint32_t WorkerThreadProcedure(void* parameter)
 {
-    ChunkStreaming* streaming = parameter;
-
-    ChunkMesherScratch* scratch = VoxelRenderMesherScratchCreate(&streaming->services);
-    if (scratch == NULL)
-    {
-        return 1;
-    }
+    ChunkStreamingWorker *worker = parameter;
+    ChunkStreaming *streaming = worker->streaming;
+    // Scratch выделен до запуска потока и с этого момента принадлежит ему.
+    ChunkMesherScratch *scratch = worker->scratch;
 
     // Номер паузы, о которой этот поток уже отчитался. Ноль — ни о какой:
     // счёт пауз начинается с единицы.
@@ -956,10 +963,23 @@ static bool StartWorkerThreads(ChunkStreaming* streaming)
     for (uint32_t index = 0;
          index < streaming->desiredWorkerThreadCount; ++index)
     {
+        // Нехватка памяти или потоков уменьшает число рабочих, но не
+        // оставляет в счёте поток, который не сможет работать.
+        ChunkMesherScratch *scratch = VoxelRenderMesherScratchCreate(&streaming->services);
+        if (scratch == NULL)
+            continue;
+        ChunkStreamingWorker *worker = &streaming->workers[streaming->workerThreadCount];
+        worker->streaming = streaming;
+        worker->scratch = scratch;
         PlatformThread thread;
-        if (PlatformThreadStart(&thread, WorkerThreadProcedure, streaming))
+        if (PlatformThreadStart(&thread, WorkerThreadProcedure, worker))
         {
             streaming->workerThreads[streaming->workerThreadCount++] = thread;
+        }
+        else
+        {
+            VoxelRenderMesherScratchDestroy(&streaming->services, scratch);
+            worker->scratch = NULL;
         }
     }
     return streaming->workerThreadCount != 0;

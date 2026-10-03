@@ -138,6 +138,17 @@
       }
     },
     {
+      "name": "linux-clang-fuzz",
+      "displayName": "Linux glibc x64 + Clang + libFuzzer/ASan/UBSan",
+      "description": "Parser fuzzers over a sanitized engine core",
+      "inherits": "linux-clang",
+      "cacheVariables": {
+        "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
+        "LAIUE_ENABLE_LTO": "OFF",
+        "LAIUE_BUILD_FUZZERS": "ON"
+      }
+    },
+    {
       "name": "linux-musl",
       "displayName": "Linux musl x64 + GCC",
       "description": "Portable engine core libraries",
@@ -482,6 +493,11 @@
       "configurePreset": "linux-gcc-asan"
     },
     {
+      "name": "linux-clang-fuzz-debug",
+      "inherits": "linux-build-debug",
+      "configurePreset": "linux-clang-fuzz"
+    },
+    {
       "name": "linux-musl-debug",
       "inherits": "linux-build-debug",
       "configurePreset": "linux-musl"
@@ -769,6 +785,11 @@
       "name": "linux-gcc-asan-debug",
       "inherits": "linux-test-debug",
       "configurePreset": "linux-gcc-asan"
+    },
+    {
+      "name": "linux-clang-fuzz-debug",
+      "inherits": "linux-test-debug",
+      "configurePreset": "linux-clang-fuzz"
     },
     {
       "name": "linux-musl-debug",

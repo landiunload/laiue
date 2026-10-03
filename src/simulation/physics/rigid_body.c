@@ -4,6 +4,7 @@
 #include "physics/compound_bvh.h"
 #include "physics/fp_environment.h"
 #include "physics/numeric_provider.h"
+#include "physics/rigid_body_internal.h"
 
 #include <float.h>
 #include <string.h>
@@ -227,25 +228,78 @@ static bool TryFixedInt64(const InfiniteCoord *value, int64_t *outValue)
     return magnitude == 0u;
 }
 
-static bool TryDoubleToFixedInt64(double value, int64_t *outValue)
+// trunc(delta * 2^32), если оно помещается в int64. Ровно это целое
+// прибавляет и общий путь TryAddDoubleToFixed: умножение на степень двойки
+// в binary64 точное, целая часть trunc(delta) и дробная delta - trunc(delta)
+// вычитаются без округления, а усечение суммы целого и одноимённой по знаку
+// дроби равно сумме их усечений. Точной кратности 2^-32 здесь не требуется:
+// дельта от решателя её почти никогда не имеет, и проверка на точность
+// уводила каждую добавку скорости в четыре временных bigint.
+static bool TryScaledFixedDelta(double delta, int64_t *outValue)
 {
-    if (outValue == NULL || !IsFiniteDouble(value))
+    double scaled = delta * 4294967296.0;
+    if (!(scaled >= -9223372036854775808.0 && scaled < 9223372036854775808.0))
     {
         return false;
     }
-    double scaled = value * 4294967296.0;
-    if (!IsFiniteDouble(scaled) || scaled < -9223372036854775808.0 ||
-        scaled >= 9223372036854775808.0)
-    {
-        return false;
-    }
-    int64_t converted = (int64_t)scaled;
-    if ((double)converted != scaled)
-    {
-        return false;
-    }
-    *outValue = converted;
+    *outValue = (int64_t)scaled;
     return true;
+}
+
+// Прибавление int64 к однолимбовому значению, которое остаётся однолимбовым
+// и ненулевым: без переноса в новый лимб и без точного погашения. Такую
+// добавку physics выполняет сама, тем же действием, что и numeric, но без
+// трёх косвенных вызовов через таблицу сервиса и без возможности отказа:
+// память не выделяется и не освобождается. Канонический ноль, перенос и
+// погашение (лимб тогда освобождает его владелец) идут через numeric.
+static bool FixedAddStaysSingleLimb(const InfiniteCoord *value, int64_t delta)
+{
+    if (value->limbCount != 1u || value->limbs == NULL || value->sign == 0)
+    {
+        return false;
+    }
+    uint64_t current = value->limbs[0];
+    uint64_t magnitude = delta < 0 ? 0u - (uint64_t)delta : (uint64_t)delta;
+    if ((value->sign < 0) == (delta < 0))
+    {
+        return current + magnitude >= current;
+    }
+    return current != magnitude;
+}
+
+static void FixedAddSingleLimb(InfiniteCoord *value, int64_t delta)
+{
+    int32_t sign = delta < 0 ? -1 : 1;
+    uint64_t magnitude = delta < 0 ? 0u - (uint64_t)delta : (uint64_t)delta;
+    uint64_t current = value->limbs[0];
+    if (value->sign == sign)
+    {
+        value->limbs[0] = current + magnitude;
+    }
+    else if (current > magnitude)
+    {
+        value->limbs[0] = current - magnitude;
+    }
+    else
+    {
+        value->limbs[0] = magnitude - current;
+        value->sign = sign;
+    }
+}
+
+// Прибавляет fixed-point целое на месте. При неудаче value не меняется.
+static bool FixedAddInPlace(InfiniteCoord *value, int64_t delta)
+{
+    if (delta == 0)
+    {
+        return true;
+    }
+    if (FixedAddStaysSingleLimb(value, delta))
+    {
+        FixedAddSingleLimb(value, delta);
+        return true;
+    }
+    return InfiniteCoordTryAddInt64InPlace(value, delta);
 }
 
 static bool TryShiftRightInt64TowardZero(int64_t value, uint32_t shift, int64_t *outValue)
@@ -281,11 +335,11 @@ static bool TryAddDoubleToFixed(InfiniteCoord *outValue, const InfiniteCoord *va
     }
 
     int64_t fixedDelta = 0;
-    if (TryDoubleToFixedInt64(delta, &fixedDelta))
+    if (TryScaledFixedDelta(delta, &fixedDelta))
     {
         if (outValue == value)
         {
-            return InfiniteCoordTryAddInt64InPlace(outValue, fixedDelta);
+            return FixedAddInPlace(outValue, fixedDelta);
         }
         return InfiniteCoordTryCopyAddInt64(outValue, value, fixedDelta);
     }
@@ -355,10 +409,10 @@ static bool AddDoubleToFixed(InfiniteCoord *value, double delta)
     // линейно по целой части. Дельта скорости, пришедшая от решателя, почти
     // никогда не кратна 2^-32, и без этого пути на каждую ось и тело каждый
     // тик заводятся и уничтожаются несколько bigint-объектов.
-    double scaled = delta * 4294967296.0;
-    if (scaled >= -9223372036854775808.0 && scaled < 9223372036854775808.0)
+    int64_t fixedDelta = 0;
+    if (TryScaledFixedDelta(delta, &fixedDelta))
     {
-        return InfiniteCoordTryAddInt64InPlace(value, (int64_t)scaled);
+        return FixedAddInPlace(value, fixedDelta);
     }
     InfiniteCoord updated;
     InfiniteCoordInit(&updated);
@@ -532,62 +586,93 @@ void VoxelRigidBodyOrientationMatrix(const VoxelRigidBody *body, float outMatrix
     }
 }
 
-bool VoxelRigidBodyAddLinearVelocity(VoxelRigidBody *body, const double delta[3])
+// Общая часть AddLinearVelocity и AddAngularVelocity. Набор либо применяется
+// целиком, либо не меняет тело: при неконечной добавке или отказе выделения
+// все три компоненты остаются прежними.
+static bool AddVelocityDelta(VoxelRigidBody *body, InfiniteCoord velocity[3], const double delta[3])
 {
-    if (body == NULL || delta == NULL)
-    {
-        return false;
-    }
-
     VoxelPhysicsConfigureThread();
-    InfiniteCoord updated[3];
-    bool changed[3] = {false, false, false};
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        InfiniteCoordInit(&updated[axis]);
-    }
+    bool anyChanged = false;
+    bool inPlace = true;
+    int64_t fixedDelta[3] = {0, 0, 0};
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         if (!IsFiniteDouble(delta[axis]))
         {
-            for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
-            {
-                InfiniteCoordDestroy(&updated[cleanup]);
-            }
             return false;
         }
         if (delta[axis] == 0.0)
         {
             continue;
         }
-        changed[axis] = true;
-        if (!TryAddDoubleToFixed(&updated[axis], &body->linearVelocity[axis], delta[axis]))
+        anyChanged = true;
+        inPlace =
+            inPlace && TryScaledFixedDelta(delta[axis], &fixedDelta[axis]) &&
+            (fixedDelta[axis] == 0 || FixedAddStaysSingleLimb(&velocity[axis], fixedDelta[axis]));
+    }
+    if (!anyChanged)
+    {
+        return true;
+    }
+
+    // Обычный случай решателя суставов: компонента уже лежит в одном лимбе,
+    // и добавка меняет её на месте. Ни одна из трёх операций не может
+    // отказать, поэтому атомарность набора сохраняется без копий.
+    if (inPlace)
+    {
+        for (int32_t axis = 0; axis < 3; ++axis)
         {
-            for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
+            if (fixedDelta[axis] != 0)
             {
-                InfiniteCoordDestroy(&updated[cleanup]);
+                FixedAddSingleLimb(&velocity[axis], fixedDelta[axis]);
             }
-            return false;
         }
     }
-    for (int32_t axis = 0; axis < 3; ++axis)
+    else
     {
-        if (changed[axis])
+        InfiniteCoord updated[3];
+        bool changed[3] = {false, false, false};
+        for (int32_t axis = 0; axis < 3; ++axis)
         {
-            InfiniteCoordDestroy(&body->linearVelocity[axis]);
-            body->linearVelocity[axis] = updated[axis];
+            InfiniteCoordInit(&updated[axis]);
+        }
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            if (delta[axis] == 0.0)
+            {
+                continue;
+            }
+            changed[axis] = true;
+            if (!TryAddDoubleToFixed(&updated[axis], &velocity[axis], delta[axis]))
+            {
+                for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
+                {
+                    InfiniteCoordDestroy(&updated[cleanup]);
+                }
+                return false;
+            }
+        }
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            if (changed[axis])
+            {
+                InfiniteCoordDestroy(&velocity[axis]);
+                velocity[axis] = updated[axis];
+            }
         }
     }
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (changed[axis])
-        {
-            body->sleeping = false;
-            body->sleepCounter = 0u;
-            break;
-        }
-    }
+    body->sleeping = false;
+    body->sleepCounter = 0u;
     return true;
+}
+
+bool VoxelRigidBodyAddLinearVelocity(VoxelRigidBody *body, const double delta[3])
+{
+    if (body == NULL || delta == NULL)
+    {
+        return false;
+    }
+    return AddVelocityDelta(body, body->linearVelocity, delta);
 }
 
 bool VoxelRigidBodyAddAngularVelocity(VoxelRigidBody *body, const double delta[3])
@@ -596,56 +681,7 @@ bool VoxelRigidBodyAddAngularVelocity(VoxelRigidBody *body, const double delta[3
     {
         return false;
     }
-
-    VoxelPhysicsConfigureThread();
-    InfiniteCoord updated[3];
-    bool changed[3] = {false, false, false};
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        InfiniteCoordInit(&updated[axis]);
-    }
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (!IsFiniteDouble(delta[axis]))
-        {
-            for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
-            {
-                InfiniteCoordDestroy(&updated[cleanup]);
-            }
-            return false;
-        }
-        if (delta[axis] == 0.0)
-        {
-            continue;
-        }
-        changed[axis] = true;
-        if (!TryAddDoubleToFixed(&updated[axis], &body->angularVelocity[axis], delta[axis]))
-        {
-            for (int32_t cleanup = 0; cleanup < 3; ++cleanup)
-            {
-                InfiniteCoordDestroy(&updated[cleanup]);
-            }
-            return false;
-        }
-    }
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (changed[axis])
-        {
-            InfiniteCoordDestroy(&body->angularVelocity[axis]);
-            body->angularVelocity[axis] = updated[axis];
-        }
-    }
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        if (changed[axis])
-        {
-            body->sleeping = false;
-            body->sleepCounter = 0u;
-            break;
-        }
-    }
-    return true;
+    return AddVelocityDelta(body, body->angularVelocity, delta);
 }
 
 bool VoxelRigidBodyLinearVelocity(const VoxelRigidBody *body, double outVelocity[3])
@@ -881,6 +917,22 @@ failure:
     return false;
 }
 
+void VoxelRigidBodyPointVelocityAtLever(const VoxelRigidBody *body, const double lever[3],
+                                        double outVelocity[3])
+{
+    double angular[3];
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        angular[axis] = FixedToDouble(&body->angularVelocity[axis]);
+    }
+    double rotational[3];
+    Cross3(angular, lever, rotational);
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outVelocity[axis] = FixedToDouble(&body->linearVelocity[axis]) + rotational[axis];
+    }
+}
+
 bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body, const double point[3],
                                  double outVelocity[3])
 {
@@ -895,18 +947,11 @@ bool VoxelRigidBodyPointVelocity(const VoxelRigidBody *body, const double point[
     }
 
     double lever[3];
-    double angular[3];
     for (int32_t axis = 0; axis < 3; ++axis)
     {
         lever[axis] = point[axis] - centre[axis];
-        angular[axis] = FixedToDouble(&body->angularVelocity[axis]);
     }
-    double rotational[3];
-    Cross3(angular, lever, rotational);
-    for (int32_t axis = 0; axis < 3; ++axis)
-    {
-        outVelocity[axis] = FixedToDouble(&body->linearVelocity[axis]) + rotational[axis];
-    }
+    VoxelRigidBodyPointVelocityAtLever(body, lever, outVelocity);
     return true;
 }
 
@@ -6086,7 +6131,7 @@ static bool IntegrateBody(VoxelRigidBody *body, const RigidBodyCache *cache)
             // The in-place numeric operation preserves the public bigint
             // state and expands to the wide path only at the actual range
             // boundary.
-            if (!InfiniteCoordTryAddInt64InPlace(&body->position[axis], travel))
+            if (!FixedAddInPlace(&body->position[axis], travel))
             {
                 return false;
             }

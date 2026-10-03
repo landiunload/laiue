@@ -130,7 +130,11 @@ LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadProfile(
  * compatibility overload above remains the shorthand for a profile without
  * selections.  When selections are present, the selected provider is loaded
  * even in strict mode; an unselected competing provider is intentionally
- * reported as disabled rather than treated as a random load-order choice. */
+ * reported as disabled rather than treated as a random load-order choice.
+ * If the selected provider is absent or cannot be loaded, a strict profile is
+ * rejected; with ALLOW_PARTIAL the service simply has no provider: competing
+ * providers stay disabled, its consumers are reported as missing a
+ * dependency, and independent modules still start. */
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadProfileV1(
     LaiueModuleHost *host, const LaiueModuleProfileV1 *profile,
     LaiueModuleLoadReportV1 *report, LaiueModuleDiagnostic *diagnostic);

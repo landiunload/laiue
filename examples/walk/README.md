@@ -22,10 +22,22 @@ same executable starts a small windowed session by default: WASD moves,
 Shift sprints, Space jumps, mouse-look rotates the camera, `V` switches between
 first- and third-person views, left-click breaks a block, right-click places
 one, and `1`–`3` selects the material. Escape closes the game. `--headless` is retained for
-CI and validates the no-window/no-render bootstrap profile. Window, input and
-graphics are loaded as optional providers; if an artifact is absent or the
-device cannot be created, the example reports the reason and runs the same
-diagnostic headless check instead.
+CI and validates the no-window/no-render bootstrap profile. Every technology
+is an optional provider, and removing one only removes what it provides:
+
+| Removed or unloadable artifact | Windowed session |
+|---|---|
+| input | runs; controls are disabled, the window close button still exits |
+| physics (or numeric, which it requires) | runs; no ragdoll, the character controller moves the camera |
+| character | runs; ragdoll only |
+| voxel/world | runs on the game-owned infinite base strata; edits are disabled |
+| mesher | runs; near voxel chunks are not drawn, far terrain and body are |
+| UI | runs without the overlay |
+| scene/scene_math | runs without camera updates |
+| window or graphics backend | the diagnostic headless check runs instead |
+
+The executable reaches physics only through the `laiue.physics` table
+(`walk_physics.h`), so it has no load-time import of any engine library.
 
 For shared desktop builds the profile names one backend artifact explicitly:
 `laiue_graphics_d3d12.dll` for a D3D12 configure or

@@ -19,7 +19,21 @@ if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND
                 "-DNM_TOOL=${CMAKE_NM}"
                 "-DLIBRARY_FILE=$<TARGET_FILE:${runtime_target}>"
                 -P "${PROJECT_SOURCE_DIR}/tools/check_elf_exports.cmake")
+        add_test(NAME "laiue.abi.${runtime_target}.imports"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DREADELF_TOOL=${CMAKE_READELF}"
+                "-DBINARY_FILE=$<TARGET_FILE:${runtime_target}>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_elf_imports.cmake")
     endforeach()
+    # The shared walk executable loads every technology as an optional module;
+    # a load-time import would make removing that artifact fatal.
+    if(TARGET laiue_walk)
+        add_test(NAME laiue.example.walk_imports
+            COMMAND "${CMAKE_COMMAND}"
+                "-DREADELF_TOOL=${CMAKE_READELF}"
+                "-DBINARY_FILE=$<TARGET_FILE:laiue_walk>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_elf_imports.cmake")
+    endif()
 elseif(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND APPLE)
     foreach(runtime_target IN LISTS LAIUE_RUNTIME_TARGETS)
         add_test(NAME "laiue.abi.${runtime_target}.exports"
@@ -74,6 +88,7 @@ add_test(NAME laiue.example.walk_world COMMAND laiue_walk_world_test)
 if(TARGET laiue_media_support)
     add_executable(laiue_walk_visuals_test
         walk_visuals_test.c
+        "${PROJECT_SOURCE_DIR}/examples/walk/walk_physics.c"
         "${PROJECT_SOURCE_DIR}/examples/walk/walk_visuals.c")
     target_include_directories(laiue_walk_visuals_test PRIVATE
         "${PROJECT_SOURCE_DIR}/examples/walk")
@@ -133,7 +148,14 @@ target_link_libraries(laiue_rigid_body_test PRIVATE laiue_physics laiue_numeric)
 laiue_configure_standalone_executable(laiue_rigid_body_test RigidBodyTestEntryPoint)
 add_test(NAME laiue.physics.rigid_body COMMAND laiue_rigid_body_test)
 
-add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c)
+add_executable(laiue_rigid_velocity_add_test rigid_velocity_add_test.c)
+target_link_libraries(laiue_rigid_velocity_add_test PRIVATE laiue_physics laiue_numeric)
+laiue_configure_standalone_executable(
+    laiue_rigid_velocity_add_test RigidVelocityAddTestEntryPoint)
+add_test(NAME laiue.physics.velocity_add COMMAND laiue_rigid_velocity_add_test)
+
+add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c
+    ../examples/walk/walk_physics.c)
 target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric
     laiue::math_support)
 laiue_configure_standalone_executable(laiue_ragdoll_test RagdollTestEntryPoint)
@@ -353,6 +375,24 @@ if(LAIUE_NATIVE_MODS_ENABLED)
             laiue_scene laiue_world laiue_mesher laiue_render laiue_numeric
             laiue_content)
         add_test(NAME laiue.mod.optional_components COMMAND laiue_optional_modules_test)
+    endif()
+
+    # Every built module is removed, corrupted, and corrupted while pinned as a
+    # provider; only its required-dependency closure may stop with it.
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_module_removal_matrix_test module_removal_matrix_test.c)
+        target_link_libraries(laiue_module_removal_matrix_test PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_module_removal_matrix_test PRIVATE LAIUE_STATIC=1)
+        laiue_configure_standalone_executable(
+            laiue_module_removal_matrix_test ModuleRemovalMatrixTestEntryPoint)
+        get_property(_laiue_matrix_runtime_targets GLOBAL PROPERTY LAIUE_RUNTIME_TARGETS)
+        foreach(_laiue_matrix_target IN LISTS _laiue_matrix_runtime_targets
+                ITEMS laiue_graphics_d3d12 laiue_graphics_vulkan)
+            if(TARGET ${_laiue_matrix_target})
+                add_dependencies(laiue_module_removal_matrix_test ${_laiue_matrix_target})
+            endif()
+        endforeach()
+        add_test(NAME laiue.mod.removal_matrix COMMAND laiue_module_removal_matrix_test)
     endif()
 else()
     add_executable(laiue_mod_host_disabled_test mod_host_disabled_test.c)
@@ -657,12 +697,58 @@ if(TARGET laiue_audio)
         set_tests_properties(laiue.audio.system_backend PROPERTIES
             SKIP_RETURN_CODE 125
             TIMEOUT 30)
+
+        # ALSA загружается в рантайме; повторное создание вывода не должно
+        # копить память libasound независимо от наличия звуковой карты.
+        if(LAIUE_PLATFORM_POSIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(laiue_audio_output_cycle_test audio_output_cycle_test.c)
+            target_link_libraries(laiue_audio_output_cycle_test PRIVATE laiue_bootstrap)
+            target_compile_definitions(laiue_audio_output_cycle_test PRIVATE LAIUE_STATIC=1)
+            laiue_configure_standalone_executable(
+                laiue_audio_output_cycle_test AudioOutputCycleTestEntryPoint)
+            add_dependencies(laiue_audio_output_cycle_test laiue_audio_output)
+            add_test(NAME laiue.audio.output_cycle COMMAND laiue_audio_output_cycle_test)
+            set_tests_properties(laiue.audio.output_cycle PROPERTIES TIMEOUT 60)
+        endif()
     endif()
+endif()
+
+# Мир на мешах проверяется через свою таблицу и статическую регистрацию
+# модуля: ему не нужны ни графика, ни модели, ни каталог содержимого.
+if(TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_test mesh_world_test.c)
+    target_link_libraries(laiue_mesh_world_test PRIVATE laiue_bootstrap laiue_mesh_world)
+    laiue_configure_standalone_executable(laiue_mesh_world_test MeshWorldTestEntryPoint)
+    add_test(NAME laiue.mesh_world.queries COMMAND laiue_mesh_world_test)
 endif()
 
 if(TARGET laiue_media_support)
     # Конвертер проверяется отдельно от provider-а: его формат и разбор WAV
     # не должны притягивать аудио DLL в минимальный профиль.
+    add_executable(laiue_model_codec_test model_codec_test.c)
+    target_link_libraries(laiue_model_codec_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_model_codec_test ModelCodecTestEntryPoint)
+    add_test(NAME laiue.media.model_codec COMMAND laiue_model_codec_test)
+
+    if(TARGET laiue_model AND TARGET laiue_content AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_model_pack_test model_pack_test.c)
+        target_link_libraries(laiue_model_pack_test PRIVATE
+            laiue_bootstrap laiue_model laiue::media_support)
+        laiue_configure_standalone_executable(laiue_model_pack_test ModelPackTestEntryPoint)
+        add_dependencies(laiue_model_pack_test laiue_model laiue_content)
+        add_test(NAME laiue.model.packs COMMAND laiue_model_pack_test)
+    endif()
+
+    if(TARGET laiue_modelc)
+        add_test(NAME laiue.tools.modelc
+            COMMAND "${CMAKE_COMMAND}"
+                "-DMODELC=$<TARGET_FILE:laiue_modelc>"
+                "-DINPUT_OBJ=${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/model/cube.obj"
+                "-DWORK_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/modelc_test"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_modelc_test.cmake")
+    endif()
+
     add_executable(laiue_soundc_test soundc_test.c)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)
@@ -838,4 +924,21 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_configure_standalone_executable(laiue_mod_host_order_test ModHostOrderTestEntry)
     add_dependencies(laiue_mod_host_order_test laiue_mod_test_extension)
     add_test(NAME laiue.mod.host_order COMMAND laiue_mod_host_order_test)
+endif()
+
+# ASan/UBSan замедляют вычислительные тесты в несколько раз. Пределы времени
+# выше рассчитаны на обычную сборку; в санитайзерной они пропорционально
+# растут, чтобы тайм-аут оставался признаком зависания, а не инструментации.
+if(LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS)
+    get_property(_laiue_sanitized_tests DIRECTORY PROPERTY TESTS)
+    foreach(_laiue_test IN LISTS _laiue_sanitized_tests)
+        get_test_property(${_laiue_test} TIMEOUT _laiue_timeout)
+        if(_laiue_timeout)
+            math(EXPR _laiue_timeout "${_laiue_timeout} * 4")
+            set_tests_properties(${_laiue_test} PROPERTIES TIMEOUT ${_laiue_timeout})
+        endif()
+    endforeach()
+    unset(_laiue_sanitized_tests)
+    unset(_laiue_test)
+    unset(_laiue_timeout)
 endif()

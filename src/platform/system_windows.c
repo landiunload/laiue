@@ -714,9 +714,19 @@ bool PlatformConstantTimeEqual(
 
 PlatformDynamicLibrary PlatformDynamicLibraryOpen(const wchar_t* path)
 {
-    return (PlatformDynamicLibrary)LoadLibraryExW(
-        path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
-            | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    /* A damaged optional artifact must fail the load quietly: otherwise the
+     * loader may raise a modal "bad image" box and block startup until
+     * someone dismisses it. The thread's previous mode is restored. */
+    DWORD previousMode = 0;
+    const BOOL modeChanged =
+        SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &previousMode);
+    HMODULE library = LoadLibraryExW(
+        path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    const DWORD loadError = GetLastError();
+    if (modeChanged)
+        SetThreadErrorMode(previousMode, NULL);
+    SetLastError(loadError);
+    return (PlatformDynamicLibrary)library;
 }
 
 void* PlatformDynamicLibrarySymbol(

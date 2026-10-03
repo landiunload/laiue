@@ -30,6 +30,8 @@ if(NOT LAIUE_X86_64_TUNE MATCHES "^(generic|amd_zen4)$")
 endif()
 option(LAIUE_ENABLE_SANITIZERS
     "Включить AddressSanitizer и UndefinedBehaviorSanitizer" OFF)
+option(LAIUE_BUILD_FUZZERS
+    "Собрать libFuzzer-фаззеры разборщиков (Clang; включает санитайзеры)" OFF)
 
 if(LAIUE_PLATFORM_EXTERNAL)
     if(NOT CMAKE_C_COMPILER_ID MATCHES "^(MSVC|GNU|Clang|AppleClang)$")
@@ -306,11 +308,26 @@ else()
             $<$<CONFIG:Release>:-Wl,-dead_strip>)
     endif()
 
-    if(LAIUE_ENABLE_SANITIZERS)
+    if(LAIUE_BUILD_FUZZERS)
+        if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+            message(FATAL_ERROR "LAIUE_BUILD_FUZZERS требует Clang и libFuzzer")
+        endif()
+        # Покрытие для libFuzzer нужно всему коду движка, а не только
+        # драйверу: иначе мутации не видят ветвей разборщика.
+        target_compile_options(laiue_build_options INTERFACE -fsanitize=fuzzer-no-link)
+    endif()
+    if(LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS)
+        # Неопределённое поведение завершает процесс, а не печатает
+        # предупреждение: иначе тест с UB проходит, и CI его не замечает.
+        # GCC, в отличие от Clang, не включает float-cast-overflow в
+        # undefined, а приведение NaN или слишком большого double к целому —
+        # обычная ошибка разбора повреждённых файлов.
         target_compile_options(laiue_build_options INTERFACE
-            -fno-omit-frame-pointer -fsanitize=address,undefined)
+            -fno-omit-frame-pointer -fsanitize=address,undefined,float-cast-overflow
+            -fno-sanitize-recover=undefined,float-cast-overflow)
         target_link_options(laiue_build_options INTERFACE
-            -fsanitize=address,undefined)
+            -fsanitize=address,undefined,float-cast-overflow
+            -fno-sanitize-recover=undefined,float-cast-overflow)
     endif()
 endif()
 

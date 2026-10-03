@@ -41,6 +41,7 @@ typedef AlsaSFrames (*AlsaPcmWriteInterleaved)(AlsaPcm *pcm, const void *buffer,
 typedef int (*AlsaPcmRecover)(AlsaPcm *pcm, int error, int silent);
 typedef int (*AlsaPcmDrop)(AlsaPcm *pcm);
 typedef int (*AlsaPcmClose)(AlsaPcm *pcm);
+typedef int (*AlsaConfigFreeGlobal)(void);
 
 typedef struct AlsaApi
 {
@@ -52,6 +53,7 @@ typedef struct AlsaApi
     AlsaPcmRecover recover;
     AlsaPcmDrop drop;
     AlsaPcmClose close;
+    AlsaConfigFreeGlobal configFreeGlobal; // необязательна
 } AlsaApi;
 
 typedef struct AudioAlsaBackend
@@ -74,6 +76,16 @@ typedef struct AudioAlsaBackend
 
 static void AlsaApiUnload(AlsaApi *api)
 {
+    // snd_pcm_open читает и кэширует дерево конфигурации в глобальной
+    // переменной libasound. Когда dlclose выгружает библиотеку, указатель
+    // на это дерево пропадает вместе с ней, а повторная загрузка строит
+    // новое: без освобождения каждый цикл создания вывода терял около
+    // 100 КиБ даже при неудачном открытии. Начиная с alsa-lib 1.1.2
+    // открытые чужие PCM держат собственные ссылки на дерево, поэтому
+    // освобождение глобального кэша безопасно и при соседнем пользователе
+    // ALSA в процессе: следующий snd_pcm_open просто перечитает файлы.
+    if (api->configFreeGlobal != NULL)
+        api->configFreeGlobal();
     if (api->library != NULL) PlatformDynamicLibraryClose(api->library);
     memset(api, 0, sizeof(*api));
 }
@@ -109,6 +121,10 @@ static bool AlsaApiLoad(AlsaApi *api)
             return false;
         }
     }
+    // Необязательна: без неё вывод работает как прежде, только кэш
+    // конфигурации не возвращается при выгрузке.
+    *(void **)&api->configFreeGlobal =
+        PlatformDynamicLibrarySymbol(api->library, "snd_config_update_free_global");
     return true;
 }
 

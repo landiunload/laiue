@@ -16,6 +16,7 @@
 #include "../humanoid_ragdoll.h"
 #include "../walk_visuals.h"
 #include "../walk_humanoid.h"
+#include "../walk_physics.h"
 #include "media/image.h"
 #include "math/scalar.h"
 
@@ -266,6 +267,8 @@ static uint32_t AndroidLoadModules(AndroidWalkState *state)
         state->host, LAIUE_PHYSICS_SERVICE_NAME,
         LAIUE_PHYSICS_SERVICE_ABI_VERSION_1, sizeof(LaiuePhysicsServiceV1), NULL,
         &state->physicsServiceSize);
+    if (state->physics != NULL && !WalkPhysicsBind(state->physics, state->physicsServiceSize))
+        state->physics = NULL;
     state->mesher = (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
         state->host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
         sizeof(LaiueMesherServiceV1), NULL, NULL);
@@ -347,8 +350,7 @@ static bool AndroidGetChunkCoordinates(AndroidWalkState *state,
     if (state == NULL || !state->ragdollReady || centerBlock == NULL)
         return false;
     double pelvis[3];
-    if (!VoxelRigidBodyLocalPosition(
-            &state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
@@ -405,8 +407,7 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
     if (state == NULL || !state->ragdollReady)
         return false;
     double root[3];
-    if (!VoxelRigidBodyLocalPosition(
-            &state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
         !WalkMathFinite(root[0]) || !WalkMathFinite(root[1]))
     {
         AndroidLog(state, ANDROID_LOG_ERROR, "ragdoll rebase could not read finite root");
@@ -442,7 +443,7 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
     /* TranslateBlocks subtracts its argument from local body positions. */
     const int64_t delta[3] = {shiftX, shiftY, 0};
     for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
-        if (!VoxelRigidBodyTranslateBlocks(&state->ragdoll.bodies[body], delta))
+        if (!WalkBodyTranslateBlocks(&state->ragdoll.bodies[body], delta))
         {
             __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
                                 "ragdoll rebase translation failed body=%u root=(%.3f,%.3f) delta=(%lld,%lld)",
@@ -1002,8 +1003,7 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     if (state->ragdollReady)
     {
         double pelvis[3];
-        if (!VoxelRigidBodyLocalPosition(
-                &state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
+        if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
             return;
         int64_t centerBlock[3];
         if (!AndroidGetChunkCoordinates(state, centerBlock))
@@ -1521,6 +1521,7 @@ void android_main(struct android_app *app)
         state.voxel->destroy(state.world);
     if (state.host != NULL)
     {
+        WalkPhysicsUnbind();
         LaiueModuleHostUnloadAll(state.host);
         LaiueModuleHostDestroy(state.host);
     }

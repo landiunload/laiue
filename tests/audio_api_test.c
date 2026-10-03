@@ -599,6 +599,34 @@ static void CheckConcurrentMixer(void)
             }
         }
     }
+    // Под нагрузкой поток вывода может не получить ни одного кванта за всю
+    // серию, и выборка статистики тогда видит ноль без всякой ошибки
+    // протокола. Зацикленный голос не заканчивается сам, поэтому ожидание
+    // его перехода в ACTIVE от планировщика не зависит.
+    if (maximumActive == 0U)
+    {
+        AudioVoiceParameters looping = {
+            .volume = 1.0f,
+            .pan = 0.0f,
+            .speed = 1.0f,
+            .looping = true,
+        };
+        AudioVoice keeper = AUDIO_VOICE_NONE;
+        for (uint32_t spin = 0U; spin < 10000U && maximumActive == 0U; ++spin)
+        {
+            if (keeper == AUDIO_VOICE_NONE)
+            {
+                keeper = AudioVoicePlay(device, clip, &looping);
+            }
+            AudioDeviceStats sample;
+            if (AudioDeviceGetStats(device, &sample) && sample.activeVoices > 0U)
+            {
+                maximumActive = sample.activeVoices;
+                break;
+            }
+            PlatformSleepMilliseconds(1U);
+        }
+    }
     // Очередь и переход PENDING -> ACTIVE действительно работали: хотя бы в
     // одном буфере поток вывода увидел звучащий голос. Без публикации команд
     // или без перехода в ACTIVE здесь остаётся ноль.
