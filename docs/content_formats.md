@@ -5,8 +5,10 @@
 | шейдеры | `.ls` | `.lsp` | `shaders/` |
 | текстуры | `.lt` | `.ltp` | `textures/` |
 | звуки | `.la` | `.lap` | `sounds/` |
+| модели | `.lo` | `.lop` | `models/` |
+| анимации | `.lk` | `.lkp` | `animations/` |
 
-Все три пака — каталоги. `.ls` — один скомпилированный shader stage,
+Все паки — каталоги. `.ls` — один скомпилированный shader stage,
 `.lsp` — каталог стадий и манифеста. `.lt` — одна подготовленная
 текстура, `.ltp` — каталог текстур. `.la` — один готовый к
 воспроизведению звук, `.lap` — каталог звуков.
@@ -58,9 +60,17 @@ ui_vs.ls          ui_ps.ls
 WAV офлайн-конвертер `laiue_soundc`. Точная раскладка — в
 [soundpacks.md](soundpacks.md).
 
+## Модели
+
+Пак моделей — каталог `models/<name>.lop` с `.lo` и исходными `.obj`
+внутри. Имена моделей задаёт приложение, OBJ читается как есть и
+кэшируется рядом готовым `.obj.lo`, а офлайн-конвертер `laiue_modelc`
+собирает `.lo` заранее. Точная раскладка — в [modelpacks.md](modelpacks.md).
+
 ## Активный выбор
 
-`shaders/active.txt`, `textures/active.txt` и `sounds/active.txt` содержат UTF-8-имя одного
+`shaders/active.txt`, `textures/active.txt`, `sounds/active.txt`,
+`models/active.txt` и `animations/active.txt` содержат UTF-8-имя одного
 активного пака без пути. Пустой или отсутствующий файл означает встроенный
 fallback. Одиночные `.ls`, `.lt` и `.la` через `active.txt` не
 выбираются: они живут внутри паков.

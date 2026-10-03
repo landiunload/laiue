@@ -721,6 +721,25 @@ if(TARGET laiue_media_support)
     laiue_configure_standalone_executable(laiue_model_codec_test ModelCodecTestEntryPoint)
     add_test(NAME laiue.media.model_codec COMMAND laiue_model_codec_test)
 
+    if(TARGET laiue_model AND TARGET laiue_content AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_model_pack_test model_pack_test.c)
+        target_link_libraries(laiue_model_pack_test PRIVATE
+            laiue_bootstrap laiue_model laiue::media_support)
+        laiue_configure_standalone_executable(laiue_model_pack_test ModelPackTestEntryPoint)
+        add_dependencies(laiue_model_pack_test laiue_model laiue_content)
+        add_test(NAME laiue.model.packs COMMAND laiue_model_pack_test)
+    endif()
+
+    if(TARGET laiue_modelc)
+        add_test(NAME laiue.tools.modelc
+            COMMAND "${CMAKE_COMMAND}"
+                "-DMODELC=$<TARGET_FILE:laiue_modelc>"
+                "-DINPUT_OBJ=${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/model/cube.obj"
+                "-DWORK_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/modelc_test"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_modelc_test.cmake")
+    endif()
+
     add_executable(laiue_soundc_test soundc_test.c)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)

@@ -3,6 +3,7 @@ if(NOT DEFINED SOURCE_ROOT)
         "${CMAKE_CURRENT_LIST_DIR}/../src" ABSOLUTE)
 endif()
 
+set(allowed_animation animation content media mod platform)
 set(allowed_audio audio content math media mod platform)
 set(allowed_character character mod platform)
 set(allowed_content content mod platform)
@@ -11,6 +12,12 @@ set(allowed_input input mod platform)
 set(allowed_math math)
 set(allowed_media media)
 set(allowed_mesh mesh mod platform render world)
+# Мир на мешах — данные и запросы без графики; отрисовку делает отдельный
+# адаптер, которому видны только публичный графический контракт и таблица
+# мира, но не модели и не рендер.
+set(allowed_mesh_world math mesh_world mod platform)
+set(allowed_mesh_world_render graphics math mesh_world mesh_world_render mod platform)
+set(allowed_model content media mod model platform)
 set(allowed_mod mod platform)
 set(allowed_numeric mod numeric platform)
 # Физике доступны только числа: реализация мира ей по-прежнему не
@@ -37,7 +44,7 @@ set(allowed_world mod numeric platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules character content graphics math media mesh mod numeric physics profile runtime scene task voxel voxel_render world)
+set(portable_modules animation character content graphics math media mesh mesh_world mesh_world_render mod model numeric physics profile runtime scene task voxel voxel_render world)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h
@@ -74,6 +81,8 @@ set(canonical_prefix_numeric "numeric")
 set(canonical_prefix_math "core/math")
 set(canonical_prefix_runtime "core/runtime")
 set(canonical_prefix_media "assets/media")
+set(canonical_prefix_model "assets/model")
+set(canonical_prefix_animation "assets/animation")
 set(canonical_prefix_content "assets/content")
 set(canonical_prefix_input "graphics/input")
 set(canonical_prefix_mesh "graphics/mesh")
@@ -81,11 +90,13 @@ set(canonical_prefix_profile "graphics/profile")
 set(canonical_prefix_render "graphics/render")
 set(canonical_prefix_scene "graphics/scene")
 set(canonical_prefix_voxel_render "graphics/voxel_render")
+set(canonical_prefix_mesh_world_render "graphics/mesh_world_render")
 set(canonical_prefix_task "jobs/task")
 set(canonical_prefix_world "simulation/world")
 set(canonical_prefix_physics "simulation/physics")
 set(canonical_prefix_character "simulation/character")
 set(canonical_prefix_voxel "simulation/voxel")
+set(canonical_prefix_mesh_world "simulation/mesh_world")
 set(canonical_prefix_mod "modding/mod")
 
 file(GLOB_RECURSE source_files
