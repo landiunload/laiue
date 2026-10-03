@@ -24,6 +24,17 @@
 #define TASK_SPIN_PER_INDEX 128u
 #define TASK_SPIN_MAX 65536u
 
+// Spin loops poll fields that other threads write atomically. A plain read
+// of such a field is a data race under the C11 memory model (ThreadSanitizer
+// reports it), so GCC and Clang read it as a relaxed atomic. On x86-64 and
+// ARM64 this is the same single load the volatile read compiled to. MSVC,
+// built with /volatile:iso, keeps the aligned volatile word read.
+#if defined(__GNUC__) || defined(__clang__)
+#define TASK_LOAD_RELAXED(pointer) __atomic_load_n((pointer), __ATOMIC_RELAXED)
+#else
+#define TASK_LOAD_RELAXED(pointer) (*(pointer))
+#endif
+
 static uint64_t SpinBudget(uint32_t work)
 {
     uint64_t budget = (uint64_t)work * TASK_SPIN_PER_INDEX;
@@ -163,19 +174,19 @@ static uint32_t WorkerEntry(void *context)
         // one waits for the next publication without a kernel sleep.
         uint64_t spin = 0u;
         uint64_t budget = SpinBudget(work);
-        while (spin < budget && pool->generation == observedGeneration)
+        while (spin < budget && TASK_LOAD_RELAXED(&pool->generation) == observedGeneration)
         {
             PlatformCpuRelax();
             ++spin;
         }
-        // The spin is plain volatile: on its own it only decides that a
+        // The spin is a relaxed read: on its own it only decides that a
         // publication is worth taking. When a new generation is visible, the
         // acquire read pairs with the release store in Run and lets this
         // participant start without the mutex. A participant that saw nothing
         // takes the mutex exactly as before, so the parked path pays no extra
         // synchronisation on platforms where the acquire read is a locked
         // operation.
-        if (pool->generation != observedGeneration)
+        if (TASK_LOAD_RELAXED(&pool->generation) != observedGeneration)
         {
             uint32_t generation = PlatformAtomicLoadU32Acquire(&pool->generation);
             if (generation != observedGeneration)
@@ -259,7 +270,7 @@ static void Run(void *context, uint32_t count, uint32_t grain, LaiueTaskRangeFun
     // kernel transition on every short dispatch.
     uint64_t spin = 0u;
     uint64_t budget = SpinBudget(work);
-    while (spin < budget && pool->remainingWorkers != 0)
+    while (spin < budget && TASK_LOAD_RELAXED(&pool->remainingWorkers) != 0)
     {
         PlatformCpuRelax();
         ++spin;
