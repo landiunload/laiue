@@ -307,10 +307,17 @@ else()
     endif()
 
     if(LAIUE_ENABLE_SANITIZERS)
+        # Неопределённое поведение завершает процесс, а не печатает
+        # предупреждение: иначе тест с UB проходит, и CI его не замечает.
+        # GCC, в отличие от Clang, не включает float-cast-overflow в
+        # undefined, а приведение NaN или слишком большого double к целому —
+        # обычная ошибка разбора повреждённых файлов.
         target_compile_options(laiue_build_options INTERFACE
-            -fno-omit-frame-pointer -fsanitize=address,undefined)
+            -fno-omit-frame-pointer -fsanitize=address,undefined,float-cast-overflow
+            -fno-sanitize-recover=undefined,float-cast-overflow)
         target_link_options(laiue_build_options INTERFACE
-            -fsanitize=address,undefined)
+            -fsanitize=address,undefined,float-cast-overflow
+            -fno-sanitize-recover=undefined,float-cast-overflow)
     endif()
 endif()
 
