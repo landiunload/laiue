@@ -14,8 +14,14 @@
 
 set(LAIUE_FUZZ_RUNS 4000 CACHE STRING "Прогонов на фаззер в CTest")
 
+# Общая цель собирает все фаззеры: CI строит её, а не перечисляет их
+# поимённо, поэтому новый фаззер не останется без сборки и с тестом
+# «Not Run».
+add_custom_target(laiue_fuzzers)
+
 function(laiue_add_fuzzer name source)
     add_executable(laiue_fuzz_${name} ${source})
+    add_dependencies(laiue_fuzzers laiue_fuzz_${name})
     target_link_libraries(laiue_fuzz_${name} PRIVATE laiue_common ${ARGN})
     target_compile_options(laiue_fuzz_${name} PRIVATE -fsanitize=fuzzer)
     target_link_options(laiue_fuzz_${name} PRIVATE -fsanitize=fuzzer)

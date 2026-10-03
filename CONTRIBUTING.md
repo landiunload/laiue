@@ -50,14 +50,14 @@ ctest --preset macos-clang-x86_64-release --no-tests=error
 выполняется один раз на toolchain; Debug и Release выбираются build/test
 preset с соответствующим суффиксом.
 
-Разборщики внешних данных (картинки, звук, zlib, манифесты) проверяются
+Разборщики внешних данных (картинки, звук, модели, zlib, манифесты) проверяются
 фаззерами libFuzzer в preset `linux-clang-fuzz`. CTest повторяет на них
 семена из `tests/fuzz/corpus`, где лежат и входы, однажды ронявшие
 разборщик; долгий поиск запускается самим фаззером:
 
 ```sh
 cmake --preset linux-clang-fuzz
-cmake --build --preset linux-clang-fuzz-debug --parallel
+cmake --build --preset linux-clang-fuzz-debug --parallel --target laiue_fuzzers
 ctest --preset linux-clang-fuzz-debug
 build/linux-clang-fuzz/bin/Debug/laiue_fuzz_sound -max_total_time=600 \
     fuzz-corpus/sound tests/fuzz/corpus/sound

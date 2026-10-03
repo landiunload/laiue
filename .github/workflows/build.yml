@@ -193,8 +193,7 @@ jobs:
       - name: Build fuzzers
         run: >
           cmake --build --preset linux-clang-fuzz-debug --parallel
-          --target laiue_fuzz_image laiue_fuzz_sound laiue_fuzz_inflate
-          laiue_fuzz_mod_manifest laiue_fuzz_module_manifest
+          --target laiue_fuzzers
       - name: Replay seed and regression corpus
         run: ctest --preset linux-clang-fuzz-debug -R '^laiue[.]fuzz[.]' --no-tests=error
       - name: Verify build did not modify sources
