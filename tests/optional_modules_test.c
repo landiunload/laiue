@@ -391,6 +391,17 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                "graphics device validates texture and sampler bindings");
         Expect(resourceDevice->endFrame(resourceDevice) != 0u,
                "graphics device ends a resource-binding frame");
+        // Мир на мешах держит буфер на ячейку и текстуру: 256 слотов на все
+        // ресурсы устройства для этого мало.
+        static LaiueGraphicsHandle manyBuffers[1024];
+        uint32_t createdBuffers = 0u;
+        while (createdBuffers < 1024u &&
+               resourceDevice->createBuffer(resourceDevice, &boundVertexDescription,
+                                            &manyBuffers[createdBuffers]) != 0u)
+            ++createdBuffers;
+        Expect(createdBuffers == 1024u, "graphics device holds a thousand buffers");
+        for (uint32_t index = 0u; index < createdBuffers; ++index)
+            resourceDevice->destroyHandle(resourceDevice, manyBuffers[index]);
         resourceDevice->destroyHandle(resourceDevice, boundVertexBuffer);
         resourceDevice->destroyHandle(resourceDevice, texture);
         resourceDevice->destroyHandle(resourceDevice, sampler);

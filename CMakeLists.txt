@@ -114,6 +114,7 @@ if(LAIUE_BUILD_MODEL)
 endif()
 if(LAIUE_BUILD_MESH_WORLD)
     add_subdirectory(src/simulation/mesh_world)
+    add_subdirectory(src/graphics/mesh_world_render)
 endif()
 
 # Minimal application bootstrap. It contains only the standalone module
