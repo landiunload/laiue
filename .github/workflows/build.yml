@@ -402,6 +402,11 @@ jobs:
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install emulator runtime dependency
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpulse0
       - name: Build the shared image checker for the host
         timeout-minutes: 6
         run: |
