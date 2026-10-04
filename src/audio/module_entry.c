@@ -14,8 +14,7 @@ typedef struct AudioModuleState
     LaiueAudioServiceV1 service;
 } AudioModuleState;
 
-static uint32_t DeviceCreate(const AudioDeviceConfiguration *configuration,
-                             AudioDevice **outDevice)
+static uint32_t DeviceCreate(const AudioDeviceConfiguration *configuration, AudioDevice **outDevice)
 {
     return (uint32_t)AudioDeviceCreate(configuration, outDevice);
 }
@@ -28,7 +27,7 @@ static uint32_t DeviceCreateWithContext(void *moduleContext,
     if (state == NULL)
         return (uint32_t)AUDIO_RESULT_INVALID_STATE;
     return (uint32_t)AudioDeviceCreateWithOutputServiceEx(configuration, state->output,
-                                                           state->outputSize, outDevice);
+                                                          state->outputSize, outDevice);
 }
 
 static void DeviceDestroy(AudioDevice *device)
@@ -99,14 +98,52 @@ static uint32_t RenderFrames(AudioDevice *device, float *outFrames, uint32_t fra
     return AudioDeviceRenderFrames(device, outFrames, frameCount) ? 1u : 0u;
 }
 
+static uint32_t StreamCreate(AudioDevice *device, const AudioStreamDescription *description,
+                             AudioStream **outStream)
+{
+    return (uint32_t)AudioStreamCreate(device, description, outStream);
+}
+static uint32_t StreamOpenFile(AudioDevice *device, const char *path, AudioStream **outStream)
+{
+    return (uint32_t)AudioStreamOpenFile(device, path, outStream);
+}
+static uint32_t StreamGetStats(const AudioStream *stream, AudioStreamStats *stats)
+{
+    return AudioStreamGetStats(stream, stats) ? 1u : 0u;
+}
+static uint32_t VoicePlayStream(AudioDevice *device, AudioStream *stream,
+                                const AudioVoiceParameters *parameters)
+{
+    return AudioVoicePlayStream(device, stream, parameters);
+}
+static uint32_t VoicePause(AudioDevice *device, AudioVoice voice, uint32_t paused)
+{
+    return AudioVoicePause(device, voice, paused != 0u) ? 1u : 0u;
+}
+static uint32_t VoiceSeek(AudioDevice *device, AudioVoice voice, double seconds)
+{
+    return AudioVoiceSeek(device, voice, seconds) ? 1u : 0u;
+}
+static uint32_t VoiceGetPosition(const AudioDevice *device, AudioVoice voice, double *outSeconds)
+{
+    return AudioVoiceGetPosition(device, voice, outSeconds) ? 1u : 0u;
+}
+static void StreamDestroy(AudioStream *stream)
+{
+    AudioStreamDestroy(stream);
+}
+static double StreamDuration(const AudioStream *stream)
+{
+    return AudioStreamDurationSeconds(stream);
+}
+
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
 {
     if (host == NULL || outContext == NULL || host->publishService == NULL ||
-        host->unpublishService == NULL || host->queryService == NULL ||
-        host->allocate == NULL || host->free == NULL)
+        host->unpublishService == NULL || host->queryService == NULL || host->allocate == NULL ||
+        host->free == NULL)
         return 0u;
-    AudioModuleState *state =
-        (AudioModuleState *)host->allocate(host->context, sizeof(*state));
+    AudioModuleState *state = (AudioModuleState *)host->allocate(host->context, sizeof(*state));
     if (state == NULL)
         return 0u;
     memset(state, 0, sizeof(*state));
@@ -130,6 +167,15 @@ static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
         .renderFrames = RenderFrames,
         .deviceCreateWithContext = DeviceCreateWithContext,
         .context = state,
+        .streamCreate = StreamCreate,
+        .streamOpenFile = StreamOpenFile,
+        .streamDestroy = StreamDestroy,
+        .streamDuration = StreamDuration,
+        .streamGetStats = StreamGetStats,
+        .voicePlayStream = VoicePlayStream,
+        .voicePause = VoicePause,
+        .voiceSeek = VoiceSeek,
+        .voiceGetPosition = VoiceGetPosition,
     };
     *outContext = state;
     return 1u;
@@ -145,18 +191,16 @@ static uint32_t ModuleStart(void *context)
     uint32_t outputSize = 0u;
     state->output = (const LaiueAudioOutputServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_AUDIO_OUTPUT_SERVICE_NAME,
-        LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1,
-        LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE,
+        LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1, LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE,
         &outputVersion, &outputSize);
     state->outputSize = outputSize;
     if (state->output != NULL &&
         (outputVersion < LAIUE_AUDIO_OUTPUT_SERVICE_ABI_VERSION_1 ||
          outputSize < LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE ||
          state->output->structSize < LAIUE_AUDIO_OUTPUT_SERVICE_V1_LEGACY_SIZE ||
-         state->output->create == NULL ||
-         state->output->destroy == NULL || state->output->sampleRate == NULL ||
-         state->output->channelCount == NULL || state->output->bufferFrameCount == NULL ||
-         state->output->underrunCount == NULL))
+         state->output->create == NULL || state->output->destroy == NULL ||
+         state->output->sampleRate == NULL || state->output->channelCount == NULL ||
+         state->output->bufferFrameCount == NULL || state->output->underrunCount == NULL))
     {
         state->output = NULL;
         state->outputSize = 0u;
@@ -218,17 +262,18 @@ static const LaiueModuleRequirementV1 optionalServices[] = {
 static const LaiueModuleApiV1 api = {
     .structSize = sizeof(LaiueModuleApiV1),
     .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
-    .descriptor = {
-        .structSize = sizeof(LaiueModuleDescriptorV1),
-        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
-        .id = "laiue.audio",
-        .version = "1.0.0",
-        .providesServices = provides,
-        .providesCount = 1u,
-        .optionalServices = optionalServices,
-        .optionalCount = sizeof(optionalServices) / sizeof(optionalServices[0]),
-        .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
-    },
+    .descriptor =
+        {
+            .structSize = sizeof(LaiueModuleDescriptorV1),
+            .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+            .id = "laiue.audio",
+            .version = "1.0.0",
+            .providesServices = provides,
+            .providesCount = 1u,
+            .optionalServices = optionalServices,
+            .optionalCount = sizeof(optionalServices) / sizeof(optionalServices[0]),
+            .optionalMagic = LAIUE_MODULE_DESCRIPTOR_OPTIONAL_MAGIC,
+        },
     .create = ModuleCreate,
     .start = ModuleStart,
     .stop = ModuleStop,

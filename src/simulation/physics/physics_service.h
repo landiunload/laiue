@@ -72,6 +72,16 @@ typedef struct LaiuePhysicsServiceV1
     bool (*ragdollDrive)(VoxelRagdoll *ragdoll, double directionX, double directionY,
                          double targetSpeed, double maximumAcceleration);
     bool (*ragdollJump)(VoxelRagdoll *ragdoll, double upwardSpeed);
+    /* Optional ABI-v1 tail: per-body state accessors.  A game that drives
+     * bodies only through this table does not import the physics library,
+     * so removing the artifact disables physics instead of the process. */
+    bool (*bodyLocalPosition)(const VoxelRigidBody *body, double outPosition[3]);
+    void (*bodyOrientationMatrix)(const VoxelRigidBody *body, float outMatrix[9]);
+    bool (*bodyLinearVelocity)(const VoxelRigidBody *body, double outVelocity[3]);
+    bool (*bodyAngularVelocity)(const VoxelRigidBody *body, double outVelocity[3]);
+    bool (*bodyAddLinearVelocity)(VoxelRigidBody *body, const double delta[3]);
+    bool (*bodyAddAngularVelocity)(VoxelRigidBody *body, const double delta[3]);
+    bool (*bodyTranslateBlocks)(VoxelRigidBody *body, const int64_t blockShift[3]);
 } LaiuePhysicsServiceV1;
 
 const LaiueModuleApiV1 *LaiuePhysicsGetStaticModuleApiV1(void);

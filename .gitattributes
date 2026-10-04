@@ -5,10 +5,15 @@
 # изменённым, и шаг CI «Verify generated sources» падал с «Build changed
 # tracked sources» на ровном месте.
 #
-# Правило задаётся отдельно на бэкенд, потому что компиляторы разные:
-# fxc для D3D12 запускается на Windows и пишет CRLF, glslang для Vulkan —
-# на Linux и пишет LF. В репозитории оба хранятся с LF, а в рабочем дереве
-# получают ровно тот вид, который выдаёт их компилятор, поэтому проверка
-# checked-in fallback остаётся побайтовой.
-src/render/generated/d3d12/** text eol=crlf
-src/render/generated/vulkan/** text eol=lf
+# Правило задаётся отдельно на бэкенд, потому что сборки разные: D3D12-
+# заголовки генерируются на Windows и после cmake/NormalizeShaderHeader.cmake
+# выходят с CRLF, Vulkan-заголовки — на Linux с LF. В репозитории оба
+# хранятся с LF, а в рабочем дереве получают ровно тот вид, который даёт
+# генерация, поэтому проверка checked-in fallback (`laiue_verify_shaders`,
+# побайтовое `compare_files`) не зависит от core.autocrlf у разработчика.
+#
+# Каталог заголовков переехал в src/graphics/render/generated; пока правила
+# указывали на прежний src/render/generated, они не действовали, и проверка
+# на Windows проходила только при core.autocrlf=true.
+src/graphics/render/generated/d3d12/** text eol=crlf
+src/graphics/render/generated/vulkan/** text eol=lf

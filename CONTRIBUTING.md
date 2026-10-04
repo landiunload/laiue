@@ -45,9 +45,26 @@ cmake --build --preset macos-clang-x86_64-release --parallel
 ctest --preset macos-clang-x86_64-release --no-tests=error
 ```
 
-Диагностический preset `linux-gcc-asan` добавляет ASan/UBSan. Configure
+Диагностический preset `linux-gcc-asan` добавляет ASan/UBSan; неопределённое
+поведение, включая `float-cast-overflow`, завершает тест ошибкой. Configure
 выполняется один раз на toolchain; Debug и Release выбираются build/test
 preset с соответствующим суффиксом.
+
+Разборщики внешних данных (картинки, звук, модели, zlib, манифесты) проверяются
+фаззерами libFuzzer в preset `linux-clang-fuzz`. CTest повторяет на них
+семена из `tests/fuzz/corpus`, где лежат и входы, однажды ронявшие
+разборщик; долгий поиск запускается самим фаззером:
+
+```sh
+cmake --preset linux-clang-fuzz
+cmake --build --preset linux-clang-fuzz-debug --parallel --target laiue_fuzzers
+ctest --preset linux-clang-fuzz-debug
+build/linux-clang-fuzz/bin/Debug/laiue_fuzz_sound -max_total_time=600 \
+    fuzz-corpus/sound tests/fuzz/corpus/sound
+```
+
+Найденный фаззером вход, который ронял код, добавляется в
+`tests/fuzz/corpus/<цель>` вместе с исправлением.
 
 Публичная проверка внешней статической core-границы запускается отдельно:
 
@@ -257,6 +274,10 @@ World origin не заменяет render origin. До преобразован�
 - Новая внешняя зависимость требует закреплённой версии, проверки hash,
   лицензии, notices и сборки на каждой затронутой ABI.
 - Обычный configure не загружает файлы из интернета.
+- Коммиты содержат только описание изменения: без `Co-Authored-By`,
+  `Signed-off-by`, ссылок на сессии и других служебных подписей. Git-теги
+  не создаются. После интеграции проверяются сообщения всей истории `main`
+  и отсутствие локальных и удалённых тегов.
 
 ## Документация
 

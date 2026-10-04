@@ -259,6 +259,16 @@ static void PreparePackRoot(wchar_t *executableDirectory, wchar_t *packRoot)
                 NULL),
            "test pack root path overflowed");
     Expect(PlatformCreateDirectory(packRoot), "could not create test pack root");
+#if !defined(_WIN32)
+    // Прерванный прогон мог оставить пустой каталог проверки коллизии
+    // регистра; с ним корень отвергается целиком, и все следующие прогоны
+    // падали бы на обнаружении паков.
+    wchar_t staleCollision[LAIUE_PLATFORM_PATH_CAPACITY];
+    if (Join(staleCollision, LAIUE_PLATFORM_PATH_CAPACITY, packRoot, L"Alpha.lmp", NULL) &&
+        DirectoryContainsExactName(packRoot, L"Alpha.lmp"))
+        Expect(PlatformRemoveDirectory(staleCollision),
+               "could not remove a stale case-collision test pack");
+#endif
     Expect(WritePack(executableDirectory, packRoot, L"zeta.lmp", "test.zeta", true),
            "could not prepare zeta test pack");
     Expect(WritePack(executableDirectory, packRoot, L"alpha.lmp", "test.alpha", true),

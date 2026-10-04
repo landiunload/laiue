@@ -21,6 +21,7 @@ const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 #include "physics/physics_service.h"
 #include "mesh/mesher_service.h"
 #include "walk_humanoid.h"
+#include "walk_physics.h"
 #include "walk_visuals.h"
 #endif
 
@@ -605,8 +606,7 @@ static void WalkUpdateRenderOrigin(WalkWindowState *state)
     if (state != NULL && state->ragdollReady)
     {
         double root[3];
-        if (!VoxelRigidBodyLocalPosition(
-                &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+        if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
             return;
         state->cameraRelativeEye[0] = (float)root[0];
         state->cameraRelativeEye[1] = (float)root[1];
@@ -658,8 +658,7 @@ static bool WalkGetRagdollRenderOrigin(const WalkWindowState *state,
         !state->ragdollReady)
         return false;
     double root[3];
-    if (!VoxelRigidBodyLocalPosition(
-            &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
@@ -696,8 +695,7 @@ static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
         double renderOrigin[3];
         int64_t renderOriginBlock[3];
         float forward[3] = {0.0f, 1.0f, 0.0f};
-        if (!VoxelRigidBodyLocalPosition(
-                &state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
+        if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
             !WalkGetRagdollRenderOrigin(state, renderOrigin, renderOriginBlock))
             return false;
         memcpy(state->ragdollRenderOriginBlock, renderOriginBlock,
@@ -791,8 +789,7 @@ static bool WalkGetChunkCoordinates(WalkWindowState *state,
         return true;
     }
     double root[3];
-    if (!VoxelRigidBodyLocalPosition(
-            &state->ragdoll.bodies[state->ragdoll.rootBody], root))
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
         return false;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
@@ -975,7 +972,7 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
     if (state == NULL || !state->ragdollReady)
         return false;
     double root[3];
-    if (!VoxelRigidBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
         !WalkMathFinite(root[0]) || !WalkMathFinite(root[1]) ||
         root[0] >= (double)INT64_MAX / 2.0 || root[0] <= (double)INT64_MIN / 2.0 ||
         root[1] >= (double)INT64_MAX / 2.0 || root[1] <= (double)INT64_MIN / 2.0)
@@ -992,7 +989,7 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
         !AddChecked(state->ragdollBlockOriginY, shiftY, &nextOriginY))
         return false;
     for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
-        if (!VoxelRigidBodyTranslateBlocks(&state->ragdoll.bodies[body], localShift))
+        if (!WalkBodyTranslateBlocks(&state->ragdoll.bodies[body], localShift))
             return false;
     WalkHumanoidControllerRebase(&state->humanoidController, localShift);
     if (state->lastSafeCameraEyeValid)
@@ -1005,6 +1002,31 @@ static bool WalkRebaseRagdoll(WalkWindowState *state)
     return true;
 }
 
+/* Every control goes through these helpers: a profile without the input
+ * provider runs the same frame with all keys and buttons released. */
+static bool WalkKeyDown(const WalkWindowState *state, InputKey key)
+{
+    return state->input != NULL && state->inputService->isKeyDown(state->input, key);
+}
+
+static bool WalkTakeKeyPress(WalkWindowState *state, InputKey key)
+{
+    if (state->input == NULL || !state->inputService->wasKeyPressed(state->input, key))
+        return false;
+    (void)state->inputService->consumeKeyPress(state->input, key);
+    return true;
+}
+
+static bool WalkMouseButtonPressed(const WalkWindowState *state, InputMouseButton button)
+{
+    return state->input != NULL && state->inputService->wasMouseButtonPressed(state->input, button);
+}
+
+static bool WalkMouseButtonDown(const WalkWindowState *state, InputMouseButton button)
+{
+    return state->input != NULL && state->inputService->isMouseButtonDown(state->input, button);
+}
+
 static void WalkWindowFrame(void *opaque)
 {
     WalkWindowState *state = (WalkWindowState *)opaque;
@@ -1015,9 +1037,9 @@ static void WalkWindowFrame(void *opaque)
             state->windowService->requestClose(state->window);
         return;
     }
-    if (state == NULL || state->window == NULL || state->input == NULL ||
-        state->windowService == NULL || state->inputService == NULL ||
-        state->graphicsService == NULL || state->device == NULL ||
+    if (state == NULL || state->window == NULL || state->windowService == NULL ||
+        (state->input != NULL && state->inputService == NULL) || state->graphicsService == NULL ||
+        state->device == NULL ||
         !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, beginFrame),
                                 sizeof(state->device->beginFrame)) ||
         !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, endFrame),
@@ -1025,7 +1047,7 @@ static void WalkWindowFrame(void *opaque)
         state->device->beginFrame == NULL || state->device->endFrame == NULL)
         return;
     if (state->windowService->consumeFocusLoss != NULL &&
-        state->windowService->consumeFocusLoss(state->window) != 0 &&
+        state->windowService->consumeFocusLoss(state->window) != 0 && state->input != NULL &&
         state->inputService->resetState != NULL)
         state->inputService->resetState(state->input);
     if (state->windowService->consumeResize != NULL &&
@@ -1042,26 +1064,16 @@ static void WalkWindowFrame(void *opaque)
             state->graphicsService->resize != NULL)
             state->graphicsService->resize(state->device, width, height);
     }
-    if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_ESCAPE))
-    {
-        (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_ESCAPE);
+    if (WalkTakeKeyPress(state, INPUT_KEY_ESCAPE))
         state->windowService->requestClose(state->window);
-    }
-    if (state->inputService->wasKeyPressed(state->input, INPUT_KEY_V))
-    {
-        (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_V);
+    if (WalkTakeKeyPress(state, INPUT_KEY_V))
         state->firstPerson = !state->firstPerson;
-    }
     static const InputKey materialKeys[WALK_VISUAL_TEXTURE_COUNT] = {
         INPUT_KEY_1, INPUT_KEY_2, INPUT_KEY_3,
     };
     for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
-        if (state->inputService->wasKeyPressed(state->input, materialKeys[material]))
-        {
-            (void)state->inputService->consumeKeyPress(state->input,
-                                                       materialKeys[material]);
+        if (WalkTakeKeyPress(state, materialKeys[material]))
             state->selectedMaterial = (uint8_t)(material + 1u);
-        }
     const double now = PlatformMonotonicSeconds();
     double elapsed = state->lastTime == 0.0 ? 0.0 : now - state->lastTime;
     state->lastTime = now;
@@ -1076,12 +1088,10 @@ static void WalkWindowFrame(void *opaque)
             (state->controller != NULL && state->characterService != NULL)) &&
            state->accumulator >= fixedStep && ticks < 8u)
     {
-        const float strafe = (float)(
-            (state->inputService->isKeyDown(state->input, INPUT_KEY_D) ? 1 : 0) -
-            (state->inputService->isKeyDown(state->input, INPUT_KEY_A) ? 1 : 0));
-        const float forwardInput = (float)(
-            (state->inputService->isKeyDown(state->input, INPUT_KEY_W) ? 1 : 0) -
-            (state->inputService->isKeyDown(state->input, INPUT_KEY_S) ? 1 : 0));
+        const float strafe = (float)((WalkKeyDown(state, INPUT_KEY_D) ? 1 : 0) -
+                                     (WalkKeyDown(state, INPUT_KEY_A) ? 1 : 0));
+        const float forwardInput = (float)((WalkKeyDown(state, INPUT_KEY_W) ? 1 : 0) -
+                                           (WalkKeyDown(state, INPUT_KEY_S) ? 1 : 0));
         float cameraForward[3] = {0.0f, 1.0f, 0.0f};
         if (state->sceneService != NULL &&
             state->sceneService->cameraGetForwardVector != NULL)
@@ -1110,12 +1120,8 @@ static void WalkWindowFrame(void *opaque)
             worldX /= moveLength;
             worldY /= moveLength;
         }
-        const bool sprint =
-            state->inputService->isKeyDown(state->input, INPUT_KEY_SHIFT) != 0u;
-        const bool jump =
-            state->inputService->wasKeyPressed(state->input, INPUT_KEY_SPACE) != 0u;
-        if (jump)
-            (void)state->inputService->consumeKeyPress(state->input, INPUT_KEY_SPACE);
+        const bool sprint = WalkKeyDown(state, INPUT_KEY_SHIFT);
+        const bool jump = WalkTakeKeyPress(state, INPUT_KEY_SPACE);
         if (state->ragdollReady)
         {
             const bool stepped = WalkHumanoidStep(
@@ -1162,7 +1168,7 @@ static void WalkWindowFrame(void *opaque)
 
     int32_t mouseDeltaX = 0;
     int32_t mouseDeltaY = 0;
-    if (state->inputService->getMouseDelta != NULL)
+    if (state->input != NULL && state->inputService->getMouseDelta != NULL)
         state->inputService->getMouseDelta(state->input, &mouseDeltaX, &mouseDeltaY);
     WalkUpdateRenderOrigin(state);
     if (state->sceneService != NULL && state->sceneMath != NULL &&
@@ -1174,16 +1180,13 @@ static void WalkWindowFrame(void *opaque)
         state->failed = true;
         state->windowService->requestClose(state->window);
     }
-    if (!state->failed && state->inputService->wasMouseButtonPressed(
-            state->input, INPUT_MOUSE_BUTTON_LEFT))
+    if (!state->failed && WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_LEFT))
         WalkEditTarget(state, false);
-    if (!state->failed && state->inputService->wasMouseButtonPressed(
-            state->input, INPUT_MOUSE_BUTTON_RIGHT))
+    if (!state->failed && WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_RIGHT))
         WalkEditTarget(state, true);
-    if (!state->failed &&
-        !WalkVisualsUpdateChunkSet(state->device, state->mesherService,
-                                   &state->chunkSet, WalkReadVisualBlock,
-                                   (void *)state->voxelProvider, chunkCenter))
+    if (!state->failed && state->chunksReady &&
+        !WalkVisualsUpdateChunkSet(state->device, state->mesherService, &state->chunkSet,
+                                   WalkReadVisualBlock, (void *)state->voxelProvider, chunkCenter))
     {
         state->failed = true;
         state->windowService->requestClose(state->window);
@@ -1210,16 +1213,9 @@ static void WalkWindowFrame(void *opaque)
         int32_t mouseX = 0;
         int32_t mouseY = 0;
         state->windowService->getCursorClientPosition(state->window, &mouseX, &mouseY);
-        const uint32_t mouseDown =
-            state->inputService->isMouseButtonDown(state->input,
-                                                   INPUT_MOUSE_BUTTON_LEFT)
-                ? 1u
-                : 0u;
+        const uint32_t mouseDown = WalkMouseButtonDown(state, INPUT_MOUSE_BUTTON_LEFT) ? 1u : 0u;
         const uint32_t mousePressed =
-            state->inputService->wasMouseButtonPressed(state->input,
-                                                       INPUT_MOUSE_BUTTON_LEFT)
-                ? 1u
-                : 0u;
+            WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_LEFT) ? 1u : 0u;
         const float wheel = state->windowService->consumeMouseWheelSteps != NULL
                                 ? state->windowService->consumeMouseWheelSteps(
                                       state->window)
@@ -1295,9 +1291,7 @@ static void WalkWindowFrame(void *opaque)
                     state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
                     state->failed = true;
             }
-            if ((state->chunksReady || state->ragdollReady) &&
-                WalkDeviceFieldPresent(state->device,
-                                       offsetof(LaiueGraphicsDeviceV2, submit),
+            if (WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, submit),
                                        sizeof(state->device->submit)) &&
                 state->device->submit != NULL)
             {
@@ -1321,7 +1315,8 @@ static void WalkWindowFrame(void *opaque)
                     };
                     ++drawIndex;
                 }
-                if (state->device->submit(state->device, walkDraws, drawIndex) == 0u)
+                if (drawIndex != 0u &&
+                    state->device->submit(state->device, walkDraws, drawIndex) == 0u)
                     state->failed = true;
             }
             if (state->device->endFrame(state->device) == 0u)
@@ -1331,7 +1326,7 @@ static void WalkWindowFrame(void *opaque)
             }
         }
     }
-    if (state->inputService->endFrame != NULL)
+    if (state->input != NULL && state->inputService->endFrame != NULL)
         state->inputService->endFrame(state->input);
 }
 #endif
@@ -1494,22 +1489,22 @@ static LaiueModuleStatus LoadWalkModules(
                                     binaryCount);
 #if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
     /* The executable chooses exactly one standalone provider at configure
-     * time.  Pin that descriptor in the profile when its optional artifact is
-     * present; if it was removed, keep the partial graph usable and let walk
-     * fall back to its diagnostic/headless mode. */
+     * time and pins its descriptor.  If that artifact is removed or cannot
+     * be loaded (no Vulkan loader on the system), the partial profile only
+     * loses the graphics branch and walk falls back to its diagnostic
+     * headless mode. */
     LaiueModuleProviderSelectionV1 graphicsSelection = {
         .structSize = sizeof(graphicsSelection),
         .serviceName = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
         .moduleId = renderModuleId,
     };
-    const bool renderArtifactPresent = PlatformPathExists(renderPath);
     LaiueModuleProfileV1 profile = {
         .structSize = sizeof(profile),
         .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
         .binaries = binaries,
         .binaryCount = binaryCount,
-        .providerSelections = renderArtifactPresent ? &graphicsSelection : NULL,
-        .providerSelectionCount = renderArtifactPresent ? 1u : 0u,
+        .providerSelections = &graphicsSelection,
+        .providerSelectionCount = 1u,
     };
     return LaiueModuleHostLoadProfileV1(host, &profile, report, diagnostic);
 #else
@@ -1586,6 +1581,8 @@ static bool RunWalkExample(bool headless)
         (const LaiuePhysicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_PHYSICS_SERVICE_NAME, LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
             sizeof(LaiuePhysicsServiceV1), NULL, &physicsServiceSize);
+    if (physicsService != NULL && !WalkPhysicsBind(physicsService, physicsServiceSize))
+        physicsService = NULL;
     const LaiueMesherServiceV1 *mesherService =
         (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
@@ -1733,8 +1730,11 @@ static bool RunWalkExample(bool headless)
         walkUiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
                 LAIUE_UI_SERVICE_V1_LEGACY_SIZE, NULL, &walkUiServiceSize);
-        if (windowService != NULL && inputService != NULL && graphicsService != NULL &&
-            windowService->create != NULL && inputService->create != NULL &&
+        /* Input is optional: without it the window, renderer and simulation
+         * still run and only the controls are absent. */
+        if (inputService != NULL && (inputService->create == NULL || inputService->destroy == NULL))
+            inputService = NULL;
+        if (windowService != NULL && graphicsService != NULL && windowService->create != NULL &&
             WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
                                     offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
                                     sizeof(graphicsService->createDevice)) &&
@@ -1746,8 +1746,12 @@ static bool RunWalkExample(bool headless)
                 .height = 720,
             };
             Window *window = windowService->create(&windowConfiguration);
-            Input *input = window == NULL ? NULL :
-                inputService->create(windowService->getNativeHandle(window));
+            Input *input = window == NULL || inputService == NULL
+                               ? NULL
+                               : inputService->create(windowService->getNativeHandle(window));
+            if (window != NULL && input == NULL)
+                PlatformWriteConsoleUtf8(
+                    "laiue walk: input provider unavailable; controls disabled\n");
             LaiueGraphicsDeviceV2 *device = NULL;
             if (walkUiService != NULL &&
                 WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
@@ -1760,7 +1764,7 @@ static bool RunWalkExample(bool headless)
                 walkUiService->contextDestroy != NULL && walkUiService->context != NULL)
                 (void)walkUiService->contextCreateWithContext(walkUiService->context,
                                                           &walkUiContext);
-            if (window != NULL && input != NULL)
+            if (window != NULL)
             {
                 windowService->setRawInputCallback(window, WalkRawInput, NULL);
                 uint32_t created = 0u;
@@ -1785,7 +1789,7 @@ static bool RunWalkExample(bool headless)
                 /* The callback context is installed after the state is
                  * complete, so the window never observes a half-built input. */
             }
-            if (window != NULL && input != NULL && device != NULL)
+            if (window != NULL && device != NULL)
             {
                 static WalkWindowState state;
                 memset(&state, 0, sizeof(state));
@@ -1819,10 +1823,19 @@ static bool RunWalkExample(bool headless)
                 state.ragdollReady = WalkInitializeRagdoll(&state, &start);
                 if (!state.ragdollReady)
                     PlatformWriteConsoleUtf8(
-                        "laiue walk: deterministic ragdoll could not be initialized\n");
+                        state.physicsService == NULL
+                            ? "laiue walk: physics provider unavailable; ragdoll disabled\n"
+                            : "laiue walk: deterministic ragdoll could not be initialized\n");
                 WalkUpdateRenderOrigin(&state);
-                state.chunksReady = WalkVisualsCreateChunkSet(
-                    state.mesherService, &state.chunkSet);
+                /* Without the mesher only the near voxel chunks disappear; the
+                 * far terrain, the body and the camera keep working. A present
+                 * mesher that cannot build its chunks is still a failure. */
+                const bool chunksWanted = state.mesherService != NULL;
+                if (!chunksWanted)
+                    PlatformWriteConsoleUtf8(
+                        "laiue walk: mesher provider unavailable; near voxel chunks disabled\n");
+                state.chunksReady =
+                    chunksWanted && WalkVisualsCreateChunkSet(state.mesherService, &state.chunkSet);
                 int64_t chunkCenter[3] = {0, 0, 0};
                 if (state.chunksReady && WalkGetChunkCoordinates(&state, chunkCenter))
                     state.chunksReady = WalkVisualsUpdateChunkSet(
@@ -1845,11 +1858,13 @@ static bool RunWalkExample(bool headless)
                 const bool ragdollBufferReady = state.ragdollReady &&
                     state.ragdollVisualScratch != NULL &&
                     WalkVisualsCreateRagdollBuffer(device, &state.ragdollBuffer);
-                if (!state.chunksReady || !state.texturedTerrainReady || !farTerrainReady ||
-                    !ragdollBufferReady)
+                if ((chunksWanted && !state.chunksReady) || !state.texturedTerrainReady ||
+                    !farTerrainReady || (state.ragdollReady && !ragdollBufferReady))
                     state.failed = true;
                 windowService->setRawInputCallback(window, WalkRawInput, &state);
-                windowService->setMouseLook(window, true);
+                /* Mouse-look captures the cursor; without input nothing could
+                 * release it or read the motion, so it stays off. */
+                windowService->setMouseLook(window, input != NULL);
                 PlatformWriteConsoleUtf8(
                     "laiue walk: walk mode (WASD, Shift, Space, V view, mouse break/place, Esc)\n");
                 windowService->runLoop(window, WalkWindowFrame, &state);
@@ -1985,6 +2000,9 @@ static bool RunWalkExample(bool headless)
                                 sizeof(voxel->destroy)) &&
         voxel->destroy != NULL)
         voxel->destroy(world);
+#if defined(LAIUE_WALK_WINDOWED)
+    WalkPhysicsUnbind();
+#endif
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
     return success;

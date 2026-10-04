@@ -33,7 +33,6 @@
 #define WBR_REGION_CELLS ((size_t)WBR_REGION_SPAN * WBR_REGION_SPAN * WBR_REGION_SPAN)
 
 static volatile uint64_t wbrSink;
-static uint64_t wbrChecksum;
 /* Мир без привязанного numeric-сервиса молча теряет правки: кадр координат
  * не копируется, и вставка чанка не проходит. Все миры стенда создаются
  * через WorldCreateWithNumericService с этим сервисом. */

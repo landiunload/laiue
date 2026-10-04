@@ -72,8 +72,7 @@ static bool DriveFootToward(VoxelRagdoll *ragdoll, uint32_t footIndex,
     VoxelRigidBody *foot = &ragdoll->bodies[walkHumanoidFootBodies[footIndex]];
     double position[3];
     double velocity[3];
-    if (!VoxelRigidBodyLocalPosition(foot, position) ||
-        !VoxelRigidBodyLinearVelocity(foot, velocity))
+    if (!WalkBodyLocalPosition(foot, position) || !WalkBodyLinearVelocity(foot, velocity))
         return false;
     double acceleration[3];
     for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -90,9 +89,9 @@ static bool DriveFootToward(VoxelRagdoll *ragdoll, uint32_t footIndex,
         acceleration[2] * deltaSeconds,
     };
     (void)ClampMagnitude3(deltaVelocity, planted ? 0.42 : 0.32);
-    if (!VoxelRigidBodyAddLinearVelocity(foot, deltaVelocity))
+    if (!WalkBodyAddLinearVelocity(foot, deltaVelocity))
         return false;
-    VoxelRigidBodyWake(foot);
+    WalkBodyWake(foot);
     return true;
 }
 
@@ -106,8 +105,8 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
 {
     double footPosition[2][3];
     for (uint32_t foot = 0u; foot < 2u; ++foot)
-        if (!VoxelRigidBodyLocalPosition(
-                &ragdoll->bodies[walkHumanoidFootBodies[foot]], footPosition[foot]))
+        if (!WalkBodyLocalPosition(&ragdoll->bodies[walkHumanoidFootBodies[foot]],
+                                   footPosition[foot]))
             return false;
 
     if (!controller->initialized)
@@ -198,7 +197,7 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
             const VoxelRigidBody *footBody =
                 &ragdoll->bodies[walkHumanoidFootBodies[foot]];
             float rotation[9];
-            VoxelRigidBodyOrientationMatrix(footBody, rotation);
+            WalkBodyOrientationMatrix(footBody, rotation);
             double surface;
             if (FindFootTargetSurface(collision, target[0], target[1], root[2], &surface))
                 target[2] = surface + 0.005 +
@@ -254,7 +253,7 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
                 {
                     const VoxelRigidBody *body = &ragdoll->bodies[walkHumanoidFootBodies[sole]];
                     float rotation[9];
-                    VoxelRigidBodyOrientationMatrix(body, rotation);
+                    WalkBodyOrientationMatrix(body, rotation);
                     for (uint32_t axis = 0u; axis < 3u; ++axis)
                         separation += body->halfExtent[axis] *
                             WalkMathAbs(rotation[3u * axis] * right[0] +
@@ -271,8 +270,7 @@ static bool DriveFootsteps(VoxelRagdoll *ragdoll,
                 }
             }
             float footRotation[9];
-            VoxelRigidBodyOrientationMatrix(
-                &ragdoll->bodies[walkHumanoidFootBodies[foot]], footRotation);
+            WalkBodyOrientationMatrix(&ragdoll->bodies[walkHumanoidFootBodies[foot]], footRotation);
             const VoxelRigidBody *footBody =
                 &ragdoll->bodies[walkHumanoidFootBodies[foot]];
             const double footVerticalExtent =
@@ -311,7 +309,7 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
         if (!stance[foot] || !WalkRagdollFootContact(ragdoll, collision, bodyIndex, 0.75))
             continue;
         double position[3];
-        if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[bodyIndex], position))
+        if (!WalkBodyLocalPosition(&ragdoll->bodies[bodyIndex], position))
             return false;
         double surface;
         if (!FindFootTargetSurface(collision, position[0], position[1],
@@ -326,8 +324,8 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
     double rootPosition[3];
     double rootVelocity[3];
     VoxelRigidBody *pelvis = &ragdoll->bodies[WALK_RAGDOLL_PELVIS];
-    if (!VoxelRigidBodyLocalPosition(pelvis, rootPosition) ||
-        !VoxelRigidBodyLinearVelocity(pelvis, rootVelocity))
+    if (!WalkBodyLocalPosition(pelvis, rootPosition) ||
+        !WalkBodyLinearVelocity(pelvis, rootVelocity))
         return false;
     double targetHeight = 0.0;
     double targetVelocity = 0.0;
@@ -347,7 +345,7 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
         if (rootVelocity[2] > 0.5 || collision->queryBlockPhysics == NULL)
             return true;
         float rotation[9];
-        VoxelRigidBodyOrientationMatrix(pelvis, rotation);
+        WalkBodyOrientationMatrix(pelvis, rotation);
         const double bottomExtent =
             pelvis->halfExtent[0] * WalkMathAbs((double)rotation[2]) +
             pelvis->halfExtent[1] * WalkMathAbs((double)rotation[5]) +
@@ -405,9 +403,9 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
      * without injecting upward velocity while airborne. */
     for (uint32_t body = 0u; body < ragdoll->bodyCount; ++body)
     {
-        if (!VoxelRigidBodyAddLinearVelocity(&ragdoll->bodies[body], delta))
+        if (!WalkBodyAddLinearVelocity(&ragdoll->bodies[body], delta))
             return false;
-        VoxelRigidBodyWake(&ragdoll->bodies[body]);
+        WalkBodyWake(&ragdoll->bodies[body]);
     }
     if (supportCount != 0u)
     {
@@ -426,7 +424,7 @@ static bool DriveSupportedPelvisHeight(VoxelRagdoll *ragdoll,
                     totalMass * sole->inverseMass * 0.5};
                 if (reaction[2] < -32.0 * deltaSeconds)
                     reaction[2] = -32.0 * deltaSeconds;
-                if (!VoxelRigidBodyAddLinearVelocity(sole, reaction))
+                if (!WalkBodyAddLinearVelocity(sole, reaction))
                     return false;
             }
     }
@@ -569,8 +567,7 @@ bool WalkHumanoidStep(const LaiuePhysicsServiceV1 *physics,
     if (jumped)
         *inOutGrounded = false;
     double rootPosition[3];
-    if (!VoxelRigidBodyLocalPosition(&ragdoll->bodies[ragdoll->rootBody],
-                                     rootPosition))
+    if (!WalkBodyLocalPosition(&ragdoll->bodies[ragdoll->rootBody], rootPosition))
     {
         if (outFailure != NULL)
             *outFailure = WALK_HUMANOID_STEP_INVALID_STATE;
@@ -692,9 +689,8 @@ bool WalkHumanoidCameraEye(const VoxelRagdoll *ragdoll,
     if (!WalkMathFinite(length) || length < 1.0e-6)
         return false;
     double target[3];
-    if (!VoxelRigidBodyLocalPosition(
-            &ragdoll->bodies[firstPerson ? WALK_RAGDOLL_HEAD : WALK_RAGDOLL_PELVIS],
-            target))
+    if (!WalkBodyLocalPosition(
+            &ragdoll->bodies[firstPerson ? WALK_RAGDOLL_HEAD : WALK_RAGDOLL_PELVIS], target))
         return false;
     target[2] += firstPerson ? 0.02 : 0.40;
     for (uint32_t axis = 0u; axis < 3u; ++axis)

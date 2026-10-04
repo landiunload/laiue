@@ -23,6 +23,12 @@ typedef struct LaiueGraphicsModuleState
     LaiueGraphicsDeviceServiceV2 deviceServiceV2;
 } LaiueGraphicsModuleState;
 
+/* Every buffer, texture, sampler, pipeline and shader of one device takes a
+ * slot.  A world that keeps a buffer per cell and texture needs thousands;
+ * the slot field of a handle has 16 bits. */
+#define DEVICE_HANDLE_CAPACITY 4096u
+_Static_assert(DEVICE_HANDLE_CAPACITY <= 0xFFFFu, "device slots must fit the handle slot field");
+
 typedef struct LaiueGraphicsDeviceState
 {
     LaiueGraphicsDeviceV1 device;
@@ -30,24 +36,24 @@ typedef struct LaiueGraphicsDeviceState
     const LaiueModuleHostV1 *host;
     Renderer *renderer;
     uint32_t handleNamespace;
-    uint32_t generations[256];
-    uint64_t sizes[256];
-    uint32_t usageFlags[256];
-    LaiueGraphicsTextureDescV1 textures[256];
-    LaiueGraphicsSamplerDescV1 samplers[256];
-    LaiueGraphicsPipelineDescV1 pipelines[256];
-    uint32_t shaderRefCounts[256];
-    uint32_t shaderStages[256];
-    uint32_t vertexCounts[256];
-    LaiueGraphicsHandle meshIndexHandles[256];
-    uint32_t meshFirstIndices[256];
-    uint32_t meshIndexCounts[256];
-    int32_t meshVertexOffsets[256];
-    void *storage[256];
-    void *backendResources[256];
-    RendererMesh *meshes[256];
-    uint8_t kinds[256];
-    uint8_t live[256];
+    uint32_t generations[DEVICE_HANDLE_CAPACITY];
+    uint64_t sizes[DEVICE_HANDLE_CAPACITY];
+    uint32_t usageFlags[DEVICE_HANDLE_CAPACITY];
+    LaiueGraphicsTextureDescV1 textures[DEVICE_HANDLE_CAPACITY];
+    LaiueGraphicsSamplerDescV1 samplers[DEVICE_HANDLE_CAPACITY];
+    LaiueGraphicsPipelineDescV1 pipelines[DEVICE_HANDLE_CAPACITY];
+    uint32_t shaderRefCounts[DEVICE_HANDLE_CAPACITY];
+    uint32_t shaderStages[DEVICE_HANDLE_CAPACITY];
+    uint32_t vertexCounts[DEVICE_HANDLE_CAPACITY];
+    LaiueGraphicsHandle meshIndexHandles[DEVICE_HANDLE_CAPACITY];
+    uint32_t meshFirstIndices[DEVICE_HANDLE_CAPACITY];
+    uint32_t meshIndexCounts[DEVICE_HANDLE_CAPACITY];
+    int32_t meshVertexOffsets[DEVICE_HANDLE_CAPACITY];
+    void *storage[DEVICE_HANDLE_CAPACITY];
+    void *backendResources[DEVICE_HANDLE_CAPACITY];
+    RendererMesh *meshes[DEVICE_HANDLE_CAPACITY];
+    uint8_t kinds[DEVICE_HANDLE_CAPACITY];
+    uint8_t live[DEVICE_HANDLE_CAPACITY];
     uint32_t submittedItems;
     float viewProjection[16];
     bool cameraSet;
@@ -100,7 +106,7 @@ static uint32_t DeviceAllocateHandle(LaiueGraphicsDeviceState *state,
 {
     if (state == NULL || outHandle == NULL || kind == 0u)
         return 0u;
-    for (uint32_t index = 0u; index < 256u; ++index)
+    for (uint32_t index = 0u; index < DEVICE_HANDLE_CAPACITY; ++index)
         if (state->live[index] == 0u)
         {
             uint32_t generation = (state->generations[index] + 1u) & UINT32_C(0xffff);
@@ -123,8 +129,8 @@ static uint32_t DeviceHandleIsLive(const LaiueGraphicsDeviceState *state,
     const uint32_t index = DeviceHandleSlot(handle);
     const uint32_t generation = DeviceHandleGeneration(handle);
     return state != NULL && state->handleNamespace != 0u &&
-                   DeviceHandleNamespace(handle) == state->handleNamespace &&
-                   index != 0u && index <= 256u && generation != 0u &&
+                   DeviceHandleNamespace(handle) == state->handleNamespace && index != 0u &&
+                   index <= DEVICE_HANDLE_CAPACITY && generation != 0u &&
                    state->live[index - 1u] != 0u &&
                    (state->generations[index - 1u] & UINT32_C(0xffff)) == generation &&
                    (expectedKind == 0u || state->kinds[index - 1u] == expectedKind)
@@ -227,7 +233,7 @@ static void DeviceFree(const LaiueGraphicsDeviceState *state, void *memory)
 static bool DeviceBufferIsGeneric(const LaiueGraphicsDeviceState *state,
                                   uint32_t index)
 {
-    return state != NULL && index < 256u &&
+    return state != NULL && index < DEVICE_HANDLE_CAPACITY &&
            (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX) != 0u &&
            (state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX_PULLING) == 0u;
 }
@@ -313,7 +319,7 @@ static uint32_t DeviceBuildGenericMesh(LaiueGraphicsDeviceState *state,
                                        uint32_t firstIndex, uint32_t indexCount,
                                        int32_t vertexOffset)
 {
-    if (state == NULL || vertexIndex >= 256u ||
+    if (state == NULL || vertexIndex >= DEVICE_HANDLE_CAPACITY ||
         !DeviceBufferIsGeneric(state, vertexIndex) || state->storage[vertexIndex] == NULL ||
         state->sizes[vertexIndex] % sizeof(LaiueGraphicsVertexV2) != 0u)
         return 0u;
@@ -493,7 +499,7 @@ static void DeviceDestroy(LaiueGraphicsDeviceV1 *device)
         (LaiueGraphicsDeviceState *)device->context;
     if (state == NULL)
         return;
-    for (uint32_t index = 0u; index < 256u; ++index)
+    for (uint32_t index = 0u; index < DEVICE_HANDLE_CAPACITY; ++index)
     {
         if (state->meshes[index] != NULL)
             RendererDestroyMesh(state->renderer, state->meshes[index]);
@@ -691,7 +697,7 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
         state->meshIndexHandles[index] = 0u;
     }
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
-        for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
+        for (uint32_t vertex = 0u; vertex < DEVICE_HANDLE_CAPACITY; ++vertex)
             if (state->meshIndexHandles[vertex] == upload->buffer &&
                 state->meshes[vertex] != NULL)
             {
@@ -799,7 +805,7 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
         }
     }
     if ((state->usageFlags[index] & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
-        for (uint32_t vertex = 0u; vertex < 256u; ++vertex)
+        for (uint32_t vertex = 0u; vertex < DEVICE_HANDLE_CAPACITY; ++vertex)
             if (state->meshIndexHandles[vertex] == handle &&
                 state->meshes[vertex] != NULL)
             {

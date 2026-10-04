@@ -16,6 +16,10 @@ typedef enum LaiueContentType
     LAIUE_CONTENT_TEXTURE_PACK,       // .ltp
     LAIUE_CONTENT_SOUND,              // .la
     LAIUE_CONTENT_SOUND_PACK,         // .lap
+    LAIUE_CONTENT_MODEL,              // .lo
+    LAIUE_CONTENT_MODEL_PACK,         // .lop
+    LAIUE_CONTENT_ANIMATION,          // .lk
+    LAIUE_CONTENT_ANIMATION_PACK,     // .lkp
     LAIUE_CONTENT_TYPE_COUNT,
 } LaiueContentType;
 

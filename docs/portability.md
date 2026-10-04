@@ -5,7 +5,7 @@
 | Платформа | Core | Graphics | ABI |
 |---|---:|---:|---|
 | Windows x86_64 | Tier 1 | Tier 1: D3D12; при Vulkan SDK ещё и Vulkan (Win32 swapchain) | MSVC или clang-cl, no-CRT runtime |
-| Windows ARM64 | clang-cl собран локально | собирается, не запускался | MSVC или clang-cl, no-CRT runtime |
+| Windows ARM64 | native CI job, CTest Debug/Release | собирается и проходит CTest в CI на ARM64-раннере | MSVC или clang-cl, no-CRT runtime |
 | Debian x86_64 | Tier 1, Docker CI | Vulkan offscreen, CI на lavapipe | glibc, GCC или Clang |
 | Alpine x86_64 | проверено в Docker | — | musl, GCC |
 | Alpine ARM64 | проверено в Docker | — | musl, GCC |
@@ -13,7 +13,7 @@
 | Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA, на устройстве не запускался | glibc, нужны окно, ввод и UI |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
-| Android ARM64 | NDK r29: core и NativeActivity/Vulkan `.so` собираются локально | — | API 28+, static external core |
+| Android ARM64 | NDK r29: core собирается в CI | Vulkan NativeActivity-пример и вывод звука AAudio собираются в CI; на устройстве в CI не запускаются | API 28+, static external core |
 | Android x86_64 | API 35 Google APIs AVD + WHPX, NativeActivity/Vulkan `.so` build | — | NDK r29, static external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
@@ -52,9 +52,13 @@ adapter.
 отсутствующий backend завершается понятной ошибкой configure: `D3D12` вне
 Windows отвергается сразу.
 
-Звук и сцена переносимы целиком: микшер не знает платформы, а вывод у
-него свой на каждой (WASAPI и ALSA), потоковый стриминг чанков работает
-через контракт потоков платформенного слоя. На POSIX headless-профиле окно
+Микшер и сцена переносимы целиком: микшер не знает платформы, потоковый
+стриминг чанков работает через контракт потоков платформенного слоя.
+Системный вывод звука: Windows — WASAPI, Linux — ALSA, Android — AAudio
+(обе загружаются в рантайме), macOS и iOS — выходной AudioUnit. Остальные
+внешние профили собирают `audio_output` с заглушкой: запрос системного
+устройства завершается понятной ошибкой, а микшер и offscreen-вывод
+работают. На POSIX headless-профиле окно
 и ввод можно подключить X11 provider-ом; `ui` остаётся доступным и использует
 portable font fallback, а на Windows растеризует
 шрифты через GDI.

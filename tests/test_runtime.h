@@ -11,7 +11,7 @@
 
 // Общий минимальный harness: Windows-тесты сохраняют no-CRT entry point,
 // а POSIX-тесты используют обычный main и системный C runtime.
-static void LaiueTestRuntimeWrite(const char* text)
+static inline void LaiueTestRuntimeWrite(const char* text)
 {
 #if defined(_WIN32)
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -33,7 +33,7 @@ static void LaiueTestRuntimeWrite(const char* text)
 #endif
 }
 
-static void LaiueTestRuntimeExit(int code)
+static inline void LaiueTestRuntimeExit(int code)
 {
 #if defined(_WIN32)
     ExitProcess((UINT)code);

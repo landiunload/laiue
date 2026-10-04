@@ -15,7 +15,7 @@
 #include "platform/system.h"
 #include "scene/camera.h"
 #include "scene/math.h"
-#include "scene/voxel_raycast.h"
+#include "voxel/raycast.h"
 #include "world/world.h"
 
 // Харнесс без CRT общий с тестами: Windows собирает движок с

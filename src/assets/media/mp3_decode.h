@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "media/sound.h"
 
 // MPEG-1 Layer III (ISO/IEC 11172-3) в 16-битные сэмплы. Разбираются
 // частоты 44100, 48000 и 32000 Гц, все битрейты, постоянные и
@@ -54,6 +55,13 @@ typedef struct Mp3Info
 bool Mp3Matches(const void *bytes, uint32_t sizeBytes);
 
 Mp3Status Mp3Inspect(const void *bytes, uint32_t sizeBytes, Mp3Info *outInfo);
+Mp3Status Mp3InspectReader(const SoundReader *reader, Mp3Info *outInfo);
+uint32_t Mp3StreamScratchBytes(void);
+Mp3Status Mp3StreamInitialize(const SoundReader *reader, const Mp3Info *info, void *scratch,
+                              uint32_t scratchBytes);
+Mp3Status Mp3StreamRead(void *scratch, int16_t *samples, uint32_t frameCapacity,
+                        uint32_t *outFrames);
+Mp3Status Mp3StreamSeek(void *scratch, uint32_t frame);
 
 // Пишет frameCount * channelCount сэмплов, чередующихся по каналам.
 Mp3Status Mp3DecodeSamples(const void *bytes, uint32_t sizeBytes, const Mp3Info *info,

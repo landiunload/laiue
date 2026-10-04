@@ -147,7 +147,8 @@ endif()
 
 if(TARGET laiue_scene AND TARGET laiue_world)
     add_executable(laiue_raycast_benchmark EXCLUDE_FROM_ALL raycast_benchmark.c)
-    target_link_libraries(laiue_raycast_benchmark PRIVATE laiue_scene laiue_world)
+    target_link_libraries(laiue_raycast_benchmark PRIVATE laiue_scene laiue_world
+        laiue_voxel_raycast laiue_numeric)
     target_include_directories(laiue_raycast_benchmark PRIVATE
         "${PROJECT_SOURCE_DIR}/tests")
     laiue_configure_standalone_executable(
@@ -706,4 +707,40 @@ if(TARGET laiue_mod AND LAIUE_NATIVE_MODS_ENABLED)
         laiue_r3_52_mod_host_benchmark R3ModHostRegistryBenchmarkEntry)
     add_dependencies(laiue_r3_52_mod_host_benchmark
         laiue_r3_52_mod_host_query_extension)
+endif()
+
+# Шаг 13-тельной ragdoll из примера walk: решатель суставов, интеграция и
+# контакты с вокселями при 128 Гц. Печатает checksum конечного состояния.
+add_executable(laiue_ragdoll_benchmark EXCLUDE_FROM_ALL
+    ragdoll_benchmark.c ../examples/walk/walk_humanoid.c
+    ../examples/walk/walk_physics.c)
+target_link_libraries(laiue_ragdoll_benchmark PRIVATE laiue_physics laiue_numeric
+    laiue::math_support)
+target_include_directories(laiue_ragdoll_benchmark PRIVATE
+    "${PROJECT_SOURCE_DIR}/tests")
+laiue_configure_standalone_executable(
+    laiue_ragdoll_benchmark RagdollBenchmarkEntryPoint)
+
+# Manual collision query timings for one-box and 64-box model instances.
+if(TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_query_benchmark EXCLUDE_FROM_ALL
+        mesh_world_query_benchmark.c)
+    target_link_libraries(laiue_mesh_world_query_benchmark PRIVATE laiue_mesh_world)
+    target_include_directories(laiue_mesh_world_query_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests" "${PROJECT_SOURCE_DIR}/src/simulation"
+        "${PROJECT_SOURCE_DIR}/src/modding")
+    target_compile_definitions(laiue_mesh_world_query_benchmark PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(laiue_mesh_world_query_benchmark
+        MeshWorldQueryBenchmarkEntryPoint)
+endif()
+
+# Manual comparison of ready PCM and bounded WAV decode + offscreen mix.
+if(TARGET laiue_audio)
+    add_executable(laiue_audio_stream_benchmark EXCLUDE_FROM_ALL
+        audio_stream_benchmark.c)
+    target_link_libraries(laiue_audio_stream_benchmark PRIVATE laiue_audio)
+    target_include_directories(laiue_audio_stream_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    laiue_configure_standalone_executable(
+        laiue_audio_stream_benchmark AudioStreamBenchmarkEntryPoint)
 endif()

@@ -35,7 +35,7 @@ jobs:
               Out-File $env:GITHUB_ENV -Append
           }
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -99,7 +99,7 @@ jobs:
             throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
           }
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -140,14 +140,27 @@ jobs:
             ninja-build
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_GRAPHICS=OFF
+        run: >
+          cmake --preset ${{ matrix.preset }}
+          -DLAIUE_BUILD_GRAPHICS=OFF -DLAIUE_BUILD_EXAMPLES=ON
+          -DLAIUE_BUILD_BENCHMARKS=${{ matrix.preset == 'linux-gcc' && 'ON' || 'OFF' }}
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
+      - name: Compile mesh-world and audio-stream manual benchmarks (Debug)
+        if: matrix.preset == 'linux-gcc'
+        run: >
+          cmake --build --preset linux-gcc-debug --parallel
+          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark
       - name: Test Debug
         run: ctest --preset ${{ matrix.preset }}-debug --no-tests=error
       - name: Build Release
         if: matrix.preset != 'linux-gcc-asan'
         run: cmake --build --preset ${{ matrix.preset }}-release --parallel
+      - name: Compile mesh-world and audio-stream manual benchmarks (Release)
+        if: matrix.preset == 'linux-gcc'
+        run: >
+          cmake --build --preset linux-gcc-release --parallel
+          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark
       - name: Test Release
         if: matrix.preset != 'linux-gcc-asan'
         run: ctest --preset ${{ matrix.preset }}-release --no-tests=error
@@ -175,6 +188,33 @@ jobs:
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake
 
+  linux-fuzz-corpus:
+    name: Linux parser fuzz corpus (Clang)
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates clang cmake git \
+            libclang-rt-dev ninja-build
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure
+        run: cmake --preset linux-clang-fuzz
+      # Движок собран с ASan/UBSan и покрытием libFuzzer; каждый фаззер
+      # повторяет семена и входы, однажды ронявшие разборщик.
+      - name: Build fuzzers
+        run: >
+          cmake --build --preset linux-clang-fuzz-debug --parallel
+          --target laiue_fuzzers
+      - name: Replay seed and regression corpus
+        run: ctest --preset linux-clang-fuzz-debug -R '^laiue[.]fuzz[.]' --no-tests=error
+      - name: Verify build did not modify sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
   linux-vulkan-engine:
     name: Linux Vulkan offscreen renderer
     runs-on: ubuntu-24.04
@@ -183,10 +223,16 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y ca-certificates cmake gcc git ninja-build             glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools             vulkan-validationlayers
+          apt-get install -y ca-certificates cmake gcc git ninja-build \
+            glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools \
+            vulkan-validationlayers libx11-dev xvfb xauth
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # С заголовками X11 профиль собирает и X11-окно с вводом: без них
+      # эти модули выпадали из сборки, и их поломка оставалась незамеченной.
       - name: Configure
-        run: cmake --preset linux-vulkan-offscreen -DLAIUE_REQUIRE_VULKAN_TEST_DRIVER=ON
+        run: >
+          cmake --preset linux-vulkan-offscreen
+          -DLAIUE_REQUIRE_VULKAN_TEST_DRIVER=ON -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build Debug
         run: cmake --build --preset linux-vulkan-offscreen-debug --parallel
       # Кадр рисуется программным драйвером Mesa: GPU у раннера нет, но
@@ -198,6 +244,15 @@ jobs:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
           VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
         run: ctest --preset linux-vulkan-offscreen-debug --no-tests=error
+      # --frames требует настоящее окно, успешные Device V2 submissions и
+      # непустую геометрию. Отсутствие X11 не превращает smoke в успешный skip.
+      - name: Smoke mesh-world X11 presentation on lavapipe (Debug)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
+        run: >
+          timeout 60s xvfb-run -a -s '-screen 0 960x540x24'
+          build/linux-vulkan-offscreen/bin/Debug/laiue_mesh_world_demo --frames 12
       - name: Build Release
         run: cmake --build --preset linux-vulkan-offscreen-release --parallel
       - name: Test Release on lavapipe
@@ -205,6 +260,13 @@ jobs:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
           VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
         run: ctest --preset linux-vulkan-offscreen-release --no-tests=error
+      - name: Smoke mesh-world X11 presentation on lavapipe (Release)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
+        run: >
+          timeout 60s xvfb-run -a -s '-screen 0 960x540x24'
+          build/linux-vulkan-offscreen/bin/Release/laiue_mesh_world_demo --frames 12
       # Checked-in SPIR-V обязан совпадать с тем, что glslang выдаёт из
       # HLSL: иначе сборка без компилятора шейдеров получила бы другой
       # рендер, чем сборка с ним.
@@ -215,7 +277,8 @@ jobs:
       - name: Verify build did not modify sources
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE"             -P tools/verify_source_tree.cmake
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
 
   linux-arm64-engine:
     name: Linux ARM64 core (GCC)
@@ -230,7 +293,7 @@ jobs:
       - name: Configure headless core
         run: |
           test "$(uname -m)" = aarch64
-          cmake --preset linux-gcc-arm64
+          cmake --preset linux-gcc-arm64 -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build and test Debug
         run: |
           cmake --build --preset linux-gcc-arm64-debug --parallel
@@ -264,7 +327,9 @@ jobs:
           apk add --no-cache build-base cmake git ninja
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure
-        run: cmake --preset linux-musl -DLAIUE_BUILD_GRAPHICS=OFF
+        run: >
+          cmake --preset linux-musl
+          -DLAIUE_BUILD_GRAPHICS=OFF -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build and test Debug
         run: |
           cmake --build --preset linux-musl-debug --parallel
@@ -296,6 +361,12 @@ jobs:
         run: cmake --preset android-arm64-core
       - name: Compile and link Android targets
         run: cmake --build --preset android-arm64-core-release --parallel
+      # Пример NativeActivity делит с desktop-walk код ragdoll и выбор
+      # модулей; без этой сборки его поломка оставалась бы незамеченной.
+      - name: Compile and link Android walk example
+        run: |
+          cmake --preset android-arm64-walk
+          cmake --build --preset android-arm64-walk-release --parallel
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
@@ -317,11 +388,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install build dependencies
-        run: brew install ninja
+        run: |
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
       - name: Configure headless core
         run: |
           cmake --preset "${{ matrix.preset }}" \
-            -DLAIUE_BUILD_GRAPHICS=OFF
+            -DLAIUE_BUILD_GRAPHICS=OFF -DLAIUE_BUILD_EXAMPLES=ON
       - name: Build and test Debug
         run: |
           cmake --build --preset "${{ matrix.preset }}-debug" --parallel
@@ -341,6 +415,13 @@ jobs:
           cmake --preset ios-arm64-core
           cmake --build --preset ios-arm64-core-debug --parallel
           cmake --build --preset ios-arm64-core-release --parallel
+      - name: Verify complete iOS static-link closure without LTO
+        if: matrix.architecture == 'arm64'
+        run: |
+          cmake --preset ios-arm64-core -B build/ios-arm64-core-closure \
+            -DLAIUE_ENABLE_LTO=OFF
+          cmake --build build/ios-arm64-core-closure --config Debug --parallel \
+            --target laiue_static_core_link_smoke
       - name: Upload macOS core SDK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

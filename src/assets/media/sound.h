@@ -46,6 +46,30 @@ typedef struct SoundInfo
     uint32_t scratchBytes;
 } SoundInfo;
 
+/* Random-access source. Reads must fill the entire requested range or fail;
+ * the decoder never
+ * requests more than 16 KiB. Source ownership stays with
+ * the caller and callbacks are never
+ * invoked by the audio mixer. */
+typedef bool (*SoundReadAtFn)(void *context, uint64_t offset, void *bytes, uint32_t count);
+typedef struct SoundReader
+{
+    void *context;
+    SoundReadAtFn readAt;
+    uint64_t sizeBytes;
+} SoundReader;
+
+typedef struct SoundStream SoundStream;
+SoundStatus SoundStreamInspect(const SoundReader *reader, SoundInfo *outInfo);
+SoundStatus SoundStreamInitialize(const SoundReader *reader, void *scratch, uint32_t scratchBytes,
+                                  SoundStream **outStream);
+SoundStatus SoundStreamRead(SoundStream *stream, int16_t *samples, uint32_t frameCapacity,
+                            uint32_t *outFrames);
+/* Exact seek; MP3 restores its reservoir/filter history from the beginning.
+ * Time is linear in
+ * the target position, memory is independent of it. */
+SoundStatus SoundStreamSeek(SoundStream *stream, uint32_t frame);
+
 SoundFormat SoundProbe(const void *bytes, uint32_t sizeBytes);
 
 SoundStatus SoundInspect(const void *bytes, uint32_t sizeBytes, SoundInfo *outInfo);
