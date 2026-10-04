@@ -1,5 +1,6 @@
 #include "render/renderer.h"
 #include "render/renderer_internal.h"
+#include "render/renderer_offscreen.h"
 
 #include <string.h>
 
@@ -23,6 +24,9 @@ extern bool RendererEndFrame_D3D12(Renderer* renderer);
 extern void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats);
 extern void RendererGetGpuTiming_D3D12(const Renderer *renderer,
                                        RendererGpuTimingV1 *outTiming);
+extern bool RendererCaptureFrame_D3D12(Renderer *, void *, uint32_t, uint32_t *, uint32_t *);
+extern bool RendererCanCaptureFrame_D3D12(const Renderer *);
+extern bool RendererRequestFrameCapture_D3D12(Renderer *);
 extern void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer);
 extern bool RendererUiSetFontAtlas_D3D12(Renderer* renderer, const uint8_t* alphaPixels, uint32_t width, uint32_t height);
@@ -87,6 +91,9 @@ extern bool RendererEndFrame_Vulkan(Renderer* renderer);
 extern void RendererGetStats_Vulkan(const Renderer* renderer, RendererStats* outStats);
 extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
                                         RendererGpuTimingV1 *outTiming);
+extern bool RendererCaptureFrame_Vulkan(Renderer *, void *, uint32_t, uint32_t *, uint32_t *);
+extern bool RendererCanCaptureFrame_Vulkan(const Renderer *);
+extern bool RendererRequestFrameCapture_Vulkan(Renderer *);
 extern void RendererSetVerticalSync_Vulkan(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer* renderer);
 extern bool RendererUiSetFontAtlas_Vulkan(Renderer* renderer, const uint8_t* alphaPixels, uint32_t width, uint32_t height);
@@ -388,6 +395,62 @@ void RendererGetGpuTimingV1(const Renderer *renderer, RendererGpuTimingV1 *outTi
 #endif
     default:
         return;
+    }
+}
+
+bool RendererCanCaptureFrame(const Renderer *renderer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCanCaptureFrame_D3D12(renderer);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCanCaptureFrame_Vulkan(renderer);
+#endif
+    default:
+        return false;
+    }
+}
+
+bool RendererRequestFrameCapture(Renderer *renderer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererRequestFrameCapture_D3D12(renderer);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererRequestFrameCapture_Vulkan(renderer);
+#endif
+    default:
+        return false;
+    }
+}
+
+bool RendererCaptureFrame(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
+                          uint32_t *outWidth, uint32_t *outHeight)
+{
+    if (outWidth != NULL)
+        *outWidth = 0u;
+    if (outHeight != NULL)
+        *outHeight = 0u;
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCaptureFrame_D3D12(renderer, outPixels, capacityBytes, outWidth, outHeight);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCaptureFrame_Vulkan(renderer, outPixels, capacityBytes, outWidth, outHeight);
+#endif
+    default:
+        return false;
     }
 }
 

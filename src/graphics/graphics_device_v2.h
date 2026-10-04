@@ -84,6 +84,64 @@ typedef uint32_t (*LaiueGraphicsV2UploadTextureFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsTextureUploadV1 *upload);
 typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 
+// Diagnostics never wait for the GPU. FRAME_VALID describes the last successful endFrame;
+// resize or the next beginFrame clears it. GPU timing can describe an older completed frame.
+// Its backend index differs from the facade's one-based frameIndex. Unsupported timing has
+// absent flags; it never becomes a fabricated zero-time sample.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_FRAME_VALID (1u << 0)
+#define LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_SUPPORTED (1u << 1)
+#define LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_VALID (1u << 2)
+#define LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED (1u << 3)
+#define LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED (1u << 4)
+
+typedef struct LaiueGraphicsDiagnosticsV2
+{
+    uint32_t structSize;
+    uint32_t flags;
+    uint64_t frameIndex;
+    uint64_t gpuFrameIndex;
+    uint64_t gpuDurationNanoseconds;
+    uint64_t drawCalls;
+    uint64_t drawnQuads;
+    uint64_t uploadedBytes;
+    // Backend geometry pool, excluding textures, targets, driver and transient allocations.
+    // This is not total VRAM.
+    uint64_t geometryPoolUsedBytes;
+    uint64_t geometryPoolCapacityBytes;
+    // Requested bytes of live CPU buffer/shader copies in this facade only.
+    // Excludes allocator overhead, the device object and backend memory.
+    uint64_t cpuShadowBytes;
+    uint32_t resourceHandleCount;
+    uint32_t scenePasses;
+} LaiueGraphicsDiagnosticsV2;
+
+// Explicit synchronous diagnostic capture. Caller owns pixels and its capacity;
+// the provider retains neither. RGBA8 is tightly packed, top-down. flags/reserved must be zero.
+// expectedFrameIndex=0 selects the latest valid frame; a nonzero mismatch fails before
+// writing pixels. Success fills output fields. Failure sets writtenBytes/frameIndex to zero;
+// a short buffer can still report required width/height/rowPitch. Capture is unavailable
+// while recording, after resize or failed endFrame, and without READBACK_SUPPORTED.
+typedef struct LaiueGraphicsFrameReadbackV2
+{
+    uint32_t structSize;
+    uint32_t flags;
+    uint64_t expectedFrameIndex;
+    uint8_t *pixels;
+    uint64_t capacityBytes;
+    uint64_t frameIndex;
+    uint64_t writtenBytes;
+    uint32_t width;
+    uint32_t height;
+    uint32_t rowPitchBytes;
+    uint32_t reserved;
+} LaiueGraphicsFrameReadbackV2;
+
+typedef uint32_t (*LaiueGraphicsV2GetDiagnosticsFn)(LaiueGraphicsDeviceV2 *,
+                                                    LaiueGraphicsDiagnosticsV2 *outDiagnostics);
+typedef uint32_t (*LaiueGraphicsV2ReadbackFrameFn)(LaiueGraphicsDeviceV2 *,
+                                                   LaiueGraphicsFrameReadbackV2 *readback);
+typedef uint32_t (*LaiueGraphicsV2RequestFrameReadbackFn)(LaiueGraphicsDeviceV2 *);
+
 struct LaiueGraphicsDeviceV2
 {
     uint32_t structSize;
@@ -104,17 +162,35 @@ struct LaiueGraphicsDeviceV2
     /* Optional tail: 2D-only providers may omit camera control. */
     LaiueGraphicsV2SetCameraFn setCamera;
     LaiueGraphicsV2UploadTextureFn uploadTexture;
+    // Optional tail: check structSize and the individual callback before reading these fields.
+    // Older V2 providers remain valid.
+    LaiueGraphicsV2GetDiagnosticsFn getDiagnostics;
+    LaiueGraphicsV2ReadbackFrameFn readbackFrame;
+    // Request before beginFrame. Required for providers that discard their presented buffer;
+    // other capture providers may acknowledge the request without doing any work.
+    LaiueGraphicsV2RequestFrameReadbackFn requestFrameReadback;
 };
 
-typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(
-    void *nativeWindow, int32_t width, int32_t height, uint32_t backend,
-    LaiueGraphicsDeviceV2 **outDevice);
-typedef uint32_t (*LaiueGraphicsDeviceV2CreateWithContextFn)(
-    void *moduleContext, void *nativeWindow, int32_t width, int32_t height,
-    uint32_t backend, LaiueGraphicsDeviceV2 **outDevice);
+#define LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE                                                  \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, getDiagnostics) +                                  \
+                sizeof(LaiueGraphicsV2GetDiagnosticsFn)))
+#define LAIUE_GRAPHICS_DEVICE_V2_READBACK_SIZE                                                     \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, readbackFrame) +                                   \
+                sizeof(LaiueGraphicsV2ReadbackFrameFn)))
+
+#define LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE                                             \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, requestFrameReadback) +                            \
+                sizeof(LaiueGraphicsV2RequestFrameReadbackFn)))
+
+typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(void *nativeWindow, int32_t width, int32_t height,
+                                                  uint32_t backend,
+                                                  LaiueGraphicsDeviceV2 **outDevice);
+typedef uint32_t (*LaiueGraphicsDeviceV2CreateWithContextFn)(void *moduleContext,
+                                                             void *nativeWindow, int32_t width,
+                                                             int32_t height, uint32_t backend,
+                                                             LaiueGraphicsDeviceV2 **outDevice);
 typedef void (*LaiueGraphicsDeviceV2DestroyFn)(LaiueGraphicsDeviceV2 *device);
-typedef uint32_t (*LaiueGraphicsDeviceV2GetBackendFn)(
-    const LaiueGraphicsDeviceV2 *device);
+typedef uint32_t (*LaiueGraphicsDeviceV2GetBackendFn)(const LaiueGraphicsDeviceV2 *device);
 typedef void (*LaiueGraphicsDeviceV2ResizeFn)(
     LaiueGraphicsDeviceV2 *device, int32_t width, int32_t height);
 

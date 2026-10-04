@@ -1,4 +1,5 @@
 add_library(laiue_walk_common STATIC
+    walk_scenario.h
     walk_humanoid.c walk_humanoid.h
     walk_physics.c walk_physics.h
     walk_visuals.c walk_visuals.h
@@ -13,6 +14,7 @@ target_include_directories(laiue_walk_common PRIVATE
 target_link_libraries(laiue_walk_common PRIVATE
     laiue::build_options
     laiue::math_support
+    laiue_walk_scenario_support
     laiue_media_support)
 set_target_properties(laiue_walk_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(ANDROID OR LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")

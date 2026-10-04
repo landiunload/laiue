@@ -75,6 +75,36 @@ laiue_configure_standalone_executable(
     laiue_walk_runtime_test WalkRuntimeTestEntryPoint)
 add_test(NAME laiue.example.walk_runtime COMMAND laiue_walk_runtime_test)
 
+add_executable(laiue_walk_scenario_test walk_scenario_test.c)
+target_link_libraries(laiue_walk_scenario_test PRIVATE laiue_walk_scenario_support)
+target_include_directories(laiue_walk_scenario_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/examples/walk")
+laiue_configure_standalone_executable(laiue_walk_scenario_test WalkScenarioTestEntryPoint)
+add_test(NAME laiue.example.walk_scenario COMMAND laiue_walk_scenario_test)
+if(TARGET laiue_frame_check)
+    add_test(NAME laiue.tools.frame_check
+        COMMAND laiue_frame_check "${PROJECT_SOURCE_DIR}/examples/walk/android/assets/textures/grass.png")
+    add_test(NAME laiue.tools.frame_check.reject_text
+        COMMAND laiue_frame_check "${PROJECT_SOURCE_DIR}/README.md")
+    set_tests_properties(laiue.tools.frame_check.reject_text PROPERTIES WILL_FAIL TRUE)
+endif()
+
+if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    add_executable(laiue_graphics_diagnostics_test graphics_diagnostics_test.c)
+    target_link_libraries(laiue_graphics_diagnostics_test PRIVATE laiue_bootstrap)
+    target_compile_definitions(laiue_graphics_diagnostics_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(
+        laiue_graphics_diagnostics_test GraphicsDiagnosticsTestEntryPoint)
+    add_dependencies(laiue_graphics_diagnostics_test laiue_render)
+    add_test(NAME laiue.graphics.diagnostics COMMAND laiue_graphics_diagnostics_test)
+    set_tests_properties(laiue.graphics.diagnostics PROPERTIES
+        TIMEOUT 60 FAIL_REGULAR_EXPRESSION "Validation Error")
+    if(NOT LAIUE_REQUIRE_VULKAN_TEST_DRIVER)
+        set_tests_properties(laiue.graphics.diagnostics PROPERTIES SKIP_RETURN_CODE 125)
+    endif()
+endif()
+
 add_executable(laiue_walk_world_test
     walk_world_test.c
     "${PROJECT_SOURCE_DIR}/examples/walk/walk_world.c")

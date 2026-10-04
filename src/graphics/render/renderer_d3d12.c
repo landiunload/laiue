@@ -1,4 +1,5 @@
 #include "render/renderer_internal.h"
+#include "render/renderer_offscreen.h"
 
 #define COBJMACROS
 #include <windows.h>
@@ -278,6 +279,14 @@ struct Renderer
     bool                       wireframeEnabled;
     bool                       worldReady;
     bool                       frameRecording;
+    bool captureRequested;
+    bool captureValid;
+    ID3D12Resource *captureReadback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT captureFootprint;
+    UINT64 captureReadbackBytes;
+    UINT64 captureFenceValue;
+    uint32_t captureWidth;
+    uint32_t captureHeight;
 
     // Owned copies of application shader overrides, indexed by
     // LaiueShaderSlot.  NULL entries select checked-in embedded fallbacks.
@@ -483,24 +492,33 @@ static void WaitForGpu(Renderer* renderer)
     renderer->fenceValues[renderer->frameIndex]++;
 }
 
-static bool MoveToNextFrame(Renderer* renderer)
+static bool MoveToNextFrame(Renderer *renderer, bool *outWaitedForFence)
 {
-    bool waitedForFence = false;
+    *outWaitedForFence = false;
     UINT64 currentValue = renderer->fenceValues[renderer->frameIndex];
-    ID3D12CommandQueue_Signal(renderer->commandQueue, renderer->fence, currentValue);
+    if (currentValue == UINT64_MAX ||
+        FAILED(ID3D12CommandQueue_Signal(renderer->commandQueue, renderer->fence, currentValue)))
+        return false;
     renderer->lastSignaledFenceValue = currentValue;
 
     renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
 
-    if (ID3D12Fence_GetCompletedValue(renderer->fence) < renderer->fenceValues[renderer->frameIndex])
+    const UINT64 completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+    if (completed == UINT64_MAX)
+        return false;
+    if (completed < renderer->fenceValues[renderer->frameIndex])
     {
-        ID3D12Fence_SetEventOnCompletion(renderer->fence, renderer->fenceValues[renderer->frameIndex], renderer->fenceEvent);
-        WaitForSingleObject(renderer->fenceEvent, INFINITE);
-        waitedForFence = true;
+        if (FAILED(ID3D12Fence_SetEventOnCompletion(renderer->fence,
+                                                    renderer->fenceValues[renderer->frameIndex],
+                                                    renderer->fenceEvent)) ||
+            WaitForSingleObject(renderer->fenceEvent, INFINITE) != WAIT_OBJECT_0 ||
+            FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+            return false;
+        *outWaitedForFence = true;
     }
 
     renderer->fenceValues[renderer->frameIndex] = currentValue + 1;
-    return waitedForFence;
+    return true;
 }
 
 // === Пул геометрии ===
@@ -2193,6 +2211,12 @@ void RendererDestroy_D3D12(Renderer* renderer)
         DrainDeferredReleases(renderer, true);
     }
 
+    if (renderer->captureReadback != NULL)
+    {
+        ID3D12Resource_Release(renderer->captureReadback);
+        renderer->captureReadback = NULL;
+    }
+
     RendererReleaseWorld_D3D12(renderer);
 
     for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
@@ -3180,12 +3204,14 @@ static void RecordBackgroundUpload(Renderer* renderer)
 
 bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* frame)
 {
-    if (renderer == NULL || frame == NULL
-        || frame->passCount > RENDERER_MAX_SCENE_PASSES
-        || (frame->passCount != 0 && !renderer->worldReady))
+    if (renderer == NULL || frame == NULL || renderer->frameRecording ||
+        frame->passCount > RENDERER_MAX_SCENE_PASSES ||
+        (frame->passCount != 0 && !renderer->worldReady))
     {
         return false;
     }
+
+    renderer->captureValid = false;
 
     // Отложенный resize: применяется, когда GPU дошёл до этого кадра.
     // При неудаче кадр пропускается, попытка повторится в следующем.
@@ -3384,8 +3410,83 @@ void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex)
         ROOT_PARAMETER_CONSTANTS, 16, pass->viewProjection, 0);
 }
 
+static bool RecordRequestedFrameCapture(Renderer *renderer)
+{
+    ID3D12Resource *source = renderer->renderTargets[renderer->frameIndex];
+    if (source == NULL)
+        return false;
+    D3D12_RESOURCE_DESC sourceDescription;
+    ID3D12Resource_GetDesc(source, &sourceDescription);
+    if (sourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        sourceDescription.Format != DXGI_FORMAT_R8G8B8A8_UNORM || sourceDescription.Width == 0u ||
+        sourceDescription.Height == 0u || sourceDescription.Width > UINT32_MAX / 4u ||
+        sourceDescription.Width * 4u > UINT32_MAX / sourceDescription.Height ||
+        sourceDescription.SampleDesc.Count != 1u)
+        return false;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT rowCount = 0u;
+    UINT64 rowBytes = 0u;
+    UINT64 totalBytes = 0u;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &sourceDescription, 0u, 1u, 0u, &footprint,
+                                       &rowCount, &rowBytes, &totalBytes);
+    if (totalBytes == 0u || totalBytes > SIZE_MAX || rowCount != sourceDescription.Height ||
+        rowBytes != sourceDescription.Width * 4u || footprint.Footprint.RowPitch < rowBytes ||
+        footprint.Offset > totalBytes || rowCount == 0u ||
+        (uint64_t)(rowCount - 1u) >
+            (totalBytes - footprint.Offset) / footprint.Footprint.RowPitch ||
+        rowBytes > totalBytes - footprint.Offset -
+                       (uint64_t)(rowCount - 1u) * footprint.Footprint.RowPitch)
+        return false;
+    if (renderer->captureReadback == NULL || renderer->captureReadbackBytes != totalBytes)
+    {
+        D3D12_RESOURCE_DESC readbackDescription = {0};
+        readbackDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readbackDescription.Width = totalBytes;
+        readbackDescription.Height = 1u;
+        readbackDescription.DepthOrArraySize = 1u;
+        readbackDescription.MipLevels = 1u;
+        readbackDescription.SampleDesc.Count = 1u;
+        readbackDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_HEAP_PROPERTIES readbackHeap = {.Type = D3D12_HEAP_TYPE_READBACK};
+        ID3D12Resource *replacement = NULL;
+        if (FAILED(ID3D12Device_CreateCommittedResource(
+                renderer->device, &readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDescription,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&replacement)))
+            return false;
+        if (renderer->captureReadback != NULL)
+            DeferResourceRelease(renderer, renderer->captureReadback);
+        renderer->captureReadback = replacement;
+        renderer->captureReadbackBytes = totalBytes;
+    }
+    renderer->captureFootprint = footprint;
+    renderer->captureWidth = (uint32_t)sourceDescription.Width;
+    renderer->captureHeight = sourceDescription.Height;
+    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+        source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION destination = {
+        .pResource = renderer->captureReadback,
+        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        .PlacedFootprint = footprint,
+    };
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation = {
+        .pResource = source,
+        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        .SubresourceIndex = 0u,
+    };
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList, &destination, 0u, 0u, 0u,
+                                                &sourceLocation, NULL);
+    D3D12_RESOURCE_BARRIER restore = MakeTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &restore);
+    return true;
+}
+
 bool RendererEndFrame_D3D12(Renderer* renderer)
 {
+    if (renderer == NULL || !renderer->frameRecording)
+        return false;
+    renderer->captureValid = false;
     D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
         renderer->renderTargetViewHeap, &renderTargetViewHandle);
@@ -3468,6 +3569,13 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
             (UINT64)renderer->frameIndex * 2u * sizeof(UINT64));
     }
 
+    bool recordedCapture = false;
+    if (renderer->captureRequested)
+    {
+        renderer->captureRequested = false;
+        recordedCapture = RecordRequestedFrameCapture(renderer);
+    }
+
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
@@ -3525,8 +3633,15 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     }
 
     renderer->lastStats = renderer->currentStats;
+    renderer->captureFenceValue = renderer->fenceValues[submittedSlot];
 
-    bool waitedForFence = MoveToNextFrame(renderer);
+    bool waitedForFence = false;
+    if (!MoveToNextFrame(renderer, &waitedForFence))
+    {
+        renderer->frameRecording = false;
+        renderer->gpuTimingPending[submittedSlot] = false;
+        return false;
+    }
     renderer->meshUploadOffsets[renderer->frameIndex] = 0;
     renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
     // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
@@ -3540,6 +3655,7 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         SwitchToThread();
     }
     renderer->frameRecording = false;
+    renderer->captureValid = recordedCapture;
     return true;
 }
 
@@ -3550,6 +3666,71 @@ void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+}
+
+bool RendererCanCaptureFrame_D3D12(const Renderer *renderer)
+{
+    return renderer != NULL && renderer->device != NULL && renderer->commandQueue != NULL &&
+           renderer->swapChain != NULL && renderer->fence != NULL && renderer->fenceEvent != NULL;
+}
+
+bool RendererRequestFrameCapture_D3D12(Renderer *renderer)
+{
+    if (!RendererCanCaptureFrame_D3D12(renderer) || renderer->frameRecording)
+        return false;
+    renderer->captureValid = false;
+    renderer->captureRequested = true;
+    return true;
+}
+
+bool RendererCaptureFrame_D3D12(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
+                                uint32_t *outWidth, uint32_t *outHeight)
+{
+    if (!RendererCanCaptureFrame_D3D12(renderer) || outPixels == NULL || renderer->frameRecording ||
+        !renderer->captureValid || renderer->captureReadback == NULL)
+        return false;
+    const uint32_t width = renderer->captureWidth;
+    const uint32_t height = renderer->captureHeight;
+    if (outWidth != NULL)
+        *outWidth = width;
+    if (outHeight != NULL)
+        *outHeight = height;
+    if (width == 0u || height == 0u || width > UINT32_MAX / 4u ||
+        (uint64_t)width * 4u > UINT32_MAX / height)
+        return false;
+    const uint64_t required = (uint64_t)width * height * 4u;
+    if (required > capacityBytes || required > SIZE_MAX ||
+        required > UINTPTR_MAX - (uintptr_t)outPixels || renderer->captureFenceValue == 0u ||
+        renderer->captureFenceValue == UINT64_MAX)
+        return false;
+    UINT64 completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+    if (completed == UINT64_MAX || FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+        return false;
+    if (completed < renderer->captureFenceValue)
+    {
+        if (FAILED(ID3D12Fence_SetEventOnCompletion(renderer->fence, renderer->captureFenceValue,
+                                                    renderer->fenceEvent)) ||
+            WaitForSingleObject(renderer->fenceEvent, 5000u) != WAIT_OBJECT_0)
+            return false;
+        completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+        if (completed == UINT64_MAX || completed < renderer->captureFenceValue)
+            return false;
+    }
+    if (FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+        return false;
+    const D3D12_RANGE readRange = {.Begin = 0u, .End = (SIZE_T)renderer->captureReadbackBytes};
+    uint8_t *mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(renderer->captureReadback, 0u, &readRange, (void **)&mapped)))
+        return false;
+    const size_t rowBytes = (size_t)width * 4u;
+    for (uint32_t row = 0u; row < height; ++row)
+        memcpy((uint8_t *)outPixels + (size_t)row * rowBytes,
+               mapped + (size_t)renderer->captureFootprint.Offset +
+                   (size_t)row * renderer->captureFootprint.Footprint.RowPitch,
+               rowBytes);
+    const D3D12_RANGE writtenRange = {0u, 0u};
+    ID3D12Resource_Unmap(renderer->captureReadback, 0u, &writtenRange);
+    return true;
 }
 
 void RendererGetGpuTiming_D3D12(const Renderer *renderer,
@@ -3630,6 +3811,10 @@ bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer)
 
 void RendererResize_D3D12(Renderer* renderer, int32_t width, int32_t height)
 {
+    if (renderer == NULL)
+        return;
+    renderer->captureValid = false;
+    renderer->captureRequested = false;
     if (width <= 0 || height <= 0)
     {
         return;

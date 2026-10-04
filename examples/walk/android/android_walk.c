@@ -17,6 +17,7 @@
 #include "../walk_visuals.h"
 #include "../walk_humanoid.h"
 #include "../walk_physics.h"
+#include "../walk_scenario.h"
 #include "media/image.h"
 #include "math/scalar.h"
 
@@ -135,12 +136,145 @@ struct AndroidWalkState
     double accumulator;
     int32_t width;
     int32_t height;
+    /* Diagnostics are explicitly enabled by an intent extra. The ordinary
+     * game neither
+     * samples timings nor emits per-frame scenario output. */
+    bool scenarioEnabled;
+    bool scenarioFailed;
+    bool scenarioFinished;
+    bool scenarioCapturePending;
+    bool scenarioCaptureWaiting;
+    bool scenarioLifecyclePending;
+    uint32_t scenarioTick;
+    uint32_t scenarioFrames;
+    uint32_t scenarioBreaks;
+    uint32_t scenarioPlaces;
+    uint32_t scenarioGeneration;
+    uint32_t scenarioSkippedFrames;
+    uint32_t scenarioCaptureTick;
+    uint32_t scenarioCaptureCheckpoint;
+    uint32_t scenarioRunId;
+    uint32_t scenarioCheckpoints;
+    uint32_t scenarioAcks;
+    uint32_t scenarioRebases;
+    bool scenarioMoved;
+    bool scenarioAirborne;
+    bool scenarioJumpEligible;
+    double scenarioJumpStartZ;
+    bool scenarioPositionValid;
+    double scenarioStartPosition[3];
+    uint64_t scenarioGpuFrame;
+    uint64_t scenarioPeakCpuBytes;
+    uint64_t scenarioPeakGeometryBytes;
+    double scenarioCaptureDeadline;
+    WalkScenario scenario;
+    WalkScenarioMetrics *scenarioCpu;
+    WalkScenarioMetrics *scenarioGpu;
 };
 
 static void AndroidLog(AndroidWalkState *state, int priority, const char *message)
 {
     (void)state;
     __android_log_print(priority, ANDROID_WALK_LOG_TAG, "%s", message == NULL ? "" : message);
+}
+
+/* android_main runs on the glue thread, which is normally detached from
+ * ART. Keep local
+ * references bounded and never detach an already attached
+ * thread. A missing/false extra always
+ * leaves normal gameplay unchanged. */
+static bool AndroidScenarioIntentEnabled(struct android_app *app, uint32_t *outRunId)
+{
+    if (outRunId == NULL)
+        return false;
+    *outRunId = 0u;
+    if (app == NULL || app->activity == NULL || app->activity->vm == NULL ||
+        app->activity->clazz == NULL)
+        return false;
+    JavaVM *vm = app->activity->vm;
+    JNIEnv *env = NULL;
+    bool attached = false;
+    bool localFrame = false;
+    bool enabled = false;
+    const jint status = (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED)
+    {
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK)
+            return false;
+        attached = true;
+    }
+    else if (status != JNI_OK)
+        return false;
+    if ((*env)->PushLocalFrame(env, 8) < 0)
+        goto cleanup;
+    localFrame = true;
+    jclass activityClass = (*env)->GetObjectClass(env, app->activity->clazz);
+    if ((*env)->ExceptionCheck(env) || activityClass == NULL)
+        goto cleanup;
+    jmethodID getIntent =
+        (*env)->GetMethodID(env, activityClass, "getIntent", "()Landroid/content/Intent;");
+    if ((*env)->ExceptionCheck(env) || getIntent == NULL)
+        goto cleanup;
+    jobject intent = (*env)->CallObjectMethod(env, app->activity->clazz, getIntent);
+    if ((*env)->ExceptionCheck(env) || intent == NULL)
+        goto cleanup;
+    jclass intentClass = (*env)->GetObjectClass(env, intent);
+    if ((*env)->ExceptionCheck(env) || intentClass == NULL)
+        goto cleanup;
+    jmethodID getExtra =
+        (*env)->GetMethodID(env, intentClass, "getBooleanExtra", "(Ljava/lang/String;Z)Z");
+    if ((*env)->ExceptionCheck(env) || getExtra == NULL)
+        goto cleanup;
+    jstring name = (*env)->NewStringUTF(env, "laiueScenario");
+    if ((*env)->ExceptionCheck(env) || name == NULL)
+        goto cleanup;
+    enabled = (*env)->CallBooleanMethod(env, intent, getExtra, name, JNI_FALSE) == JNI_TRUE;
+    if ((*env)->ExceptionCheck(env))
+        goto cleanup;
+    if (enabled)
+    {
+        jmethodID getRun =
+            (*env)->GetMethodID(env, intentClass, "getIntExtra", "(Ljava/lang/String;I)I");
+        if ((*env)->ExceptionCheck(env) || getRun == NULL)
+            goto cleanup;
+        jstring runName = (*env)->NewStringUTF(env, "laiueScenarioRunId");
+        if ((*env)->ExceptionCheck(env) || runName == NULL)
+            goto cleanup;
+        const jint run = (*env)->CallIntMethod(env, intent, getRun, runName, 0);
+        if ((*env)->ExceptionCheck(env))
+            goto cleanup;
+        if (run <= 0)
+        {
+            enabled = false;
+            __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                                "LAIUE_SCENARIO event=failure run=0 stage=intent_run_id");
+        }
+        else
+            *outRunId = (uint32_t)run;
+    }
+cleanup:
+    if ((*env)->ExceptionCheck(env))
+    {
+        (*env)->ExceptionClear(env);
+        enabled = false;
+        __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                            "LAIUE_SCENARIO event=failure run=%u stage=intent_jni", *outRunId);
+    }
+    if (localFrame)
+        (*env)->PopLocalFrame(env, NULL);
+    if (attached)
+        (void)(*vm)->DetachCurrentThread(vm);
+    return enabled;
+}
+
+static void AndroidScenarioFail(AndroidWalkState *state, const char *stage)
+{
+    if (state == NULL || !state->scenarioEnabled || state->scenarioFailed)
+        return;
+    state->scenarioFailed = true;
+    __android_log_print(ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+                        "LAIUE_SCENARIO event=failure run=%u status=FAIL stage=%s tick=%u",
+                        state->scenarioRunId, stage, state->scenarioTick);
 }
 
 static bool AndroidFieldPresent(uint32_t actualSize, uint32_t declaredSize,
@@ -462,11 +596,186 @@ static bool AndroidRebaseRagdoll(AndroidWalkState *state)
     return true;
 }
 
-static void AndroidEditTarget(AndroidWalkState *state, bool place)
+static bool AndroidScenarioRebase(AndroidWalkState *state)
+{
+    double before[3];
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], before) ||
+        state->ragdollBlockOriginX < INT64_MIN + 9000)
+        return false;
+    before[0] += (double)state->ragdollBlockOriginX;
+    before[1] += (double)state->ragdollBlockOriginY;
+    const int64_t delta[3] = {-9000, 0, 0};
+    for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
+        if (!WalkBodyTranslateBlocks(&state->ragdoll.bodies[body], delta))
+            return false;
+    WalkHumanoidControllerRebase(&state->humanoidController, delta);
+    if (state->lastSafeCameraEyeValid)
+        state->lastSafeCameraEye[0] += 9000.0;
+    state->ragdollBlockOriginX -= 9000;
+    if (!AndroidRebaseRagdoll(state))
+        return false;
+    double after[3];
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], after) ||
+        WalkMathAbs(after[0]) > 64.0 || WalkMathAbs(after[1]) > 64.0)
+        return false;
+    after[0] += (double)state->ragdollBlockOriginX;
+    after[1] += (double)state->ragdollBlockOriginY;
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        if (!WalkMathFinite(after[axis]) || WalkMathAbs(after[axis] - before[axis]) > 0.001)
+            return false;
+    ++state->scenarioRebases;
+    return true;
+}
+
+static void AndroidScenarioObserve(AndroidWalkState *state, WalkScenarioPhase phase)
+{
+    double position[3];
+    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], position))
+    {
+        AndroidScenarioFail(state, "position");
+        return;
+    }
+    position[0] += (double)state->ragdollBlockOriginX;
+    position[1] += (double)state->ragdollBlockOriginY;
+    if (!state->scenarioPositionValid)
+    {
+        memcpy(state->scenarioStartPosition, position, sizeof(position));
+        state->scenarioPositionValid = true;
+    }
+    const double dx = position[0] - state->scenarioStartPosition[0];
+    const double dy = position[1] - state->scenarioStartPosition[1];
+    state->scenarioMoved |= dx * dx + dy * dy > 0.0025;
+    if (phase == WalkScenarioJump && state->scenarioJumpEligible && !state->ragdollGrounded &&
+        position[2] > state->scenarioJumpStartZ + 0.05)
+        state->scenarioAirborne = true;
+}
+
+static void AndroidScenarioSummary(AndroidWalkState *state)
+{
+    if (state->scenarioFinished || state->scenarioFailed)
+        return;
+    WalkScenarioSummary cpu = {0}, gpu = {0};
+    const bool hasCpu =
+        state->scenarioCpu != NULL && WalkScenarioMetricsGetSummary(state->scenarioCpu, &cpu) != 0u;
+    const bool hasGpu =
+        state->scenarioGpu != NULL && WalkScenarioMetricsGetSummary(state->scenarioGpu, &gpu) != 0u;
+    const bool success =
+        hasCpu && state->ragdollReady && state->chunksReady && state->texturedTerrainReady &&
+        state->terrainTextures[0] != 0u && state->terrainTextures[1] != 0u &&
+        state->terrainTextures[2] != 0u && state->scenarioFrames != 0u &&
+        state->scenarioCheckpoints == (uint32_t)WalkScenarioComplete &&
+        state->scenarioAcks == (uint32_t)WalkScenarioComplete && state->scenarioMoved &&
+        state->scenarioAirborne && state->scenarioBreaks != 0u && state->scenarioPlaces != 0u &&
+        state->scenarioRebases != 0u;
+    state->scenarioFinished = true;
+    __android_log_print(
+        success ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, ANDROID_WALK_LOG_TAG,
+        "LAIUE_SCENARIO event=summary run=%u status=%s ticks=%u frames=%u checkpoints=%u acks=%u "
+        "moved=%u "
+        "airborne=%u breaks=%u places=%u rebases=%u frame_wall_count=%u frame_wall_p95_ms=%.6f "
+        "frame_wall_p99_ms=%.6f gpu_available=%u gpu_count=%u gpu_p95_ms=%.6f gpu_p99_ms=%.6f "
+        "peak_cpu_shadow_bytes=%llu peak_geometry_bytes=%llu capture=external_adb",
+        state->scenarioRunId, success ? "PASS" : "FAIL", state->scenarioTick, state->scenarioFrames,
+        state->scenarioCheckpoints, state->scenarioAcks, state->scenarioMoved ? 1u : 0u,
+        state->scenarioAirborne ? 1u : 0u, state->scenarioBreaks, state->scenarioPlaces,
+        state->scenarioRebases, cpu.count, cpu.p95, cpu.p99, hasGpu ? 1u : 0u, gpu.count, gpu.p95,
+        gpu.p99, (unsigned long long)state->scenarioPeakCpuBytes,
+        (unsigned long long)state->scenarioPeakGeometryBytes);
+    if (!success)
+        state->scenarioFailed = true;
+}
+
+static void AndroidScenarioFrame(AndroidWalkState *state, double started, bool presented,
+                                 bool simulated)
+{
+    if (!state->scenarioEnabled || state->scenarioFailed)
+        return;
+    if (!presented)
+    {
+        if (++state->scenarioSkippedFrames >= 120u)
+            AndroidScenarioFail(state, "presentation_timeout");
+        return;
+    }
+    state->scenarioSkippedFrames = 0u;
+    ++state->scenarioFrames;
+    LaiueGraphicsDiagnosticsV2 diagnostics = {.structSize = sizeof(diagnostics)};
+    const bool hasDiagnostics =
+        state->device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE &&
+        state->device->getDiagnostics != NULL &&
+        state->device->getDiagnostics(state->device, &diagnostics) != 0u;
+    if (!hasDiagnostics || (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_FRAME_VALID) == 0u ||
+        diagnostics.drawCalls == 0u)
+    {
+        AndroidScenarioFail(state, "graphics_diagnostics");
+        return;
+    }
+    if (hasDiagnostics)
+    {
+        if (diagnostics.cpuShadowBytes > state->scenarioPeakCpuBytes)
+            state->scenarioPeakCpuBytes = diagnostics.cpuShadowBytes;
+        if (diagnostics.geometryPoolUsedBytes > state->scenarioPeakGeometryBytes)
+            state->scenarioPeakGeometryBytes = diagnostics.geometryPoolUsedBytes;
+        if (!state->scenarioFinished && simulated && state->scenarioGpu != NULL &&
+            (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_VALID) != 0u &&
+            diagnostics.gpuFrameIndex != state->scenarioGpuFrame)
+        {
+            state->scenarioGpuFrame = diagnostics.gpuFrameIndex;
+            (void)WalkScenarioMetricsAdd(state->scenarioGpu,
+                                         (double)diagnostics.gpuDurationNanoseconds / 1000000.0);
+        }
+    }
+    /* endFrame may include vsync/presentation, hence frame wall time rather
+     * than CPU time.
+     * Screenshot holds and ordinary idle frames are excluded. */
+    if (!state->scenarioFinished && simulated && state->scenarioCpu != NULL)
+        (void)WalkScenarioMetricsAdd(state->scenarioCpu,
+                                     (PlatformMonotonicSeconds() - started) * 1000.0);
+    if (state->scenarioLifecyclePending)
+    {
+        __android_log_print(
+            ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+            "LAIUE_SCENARIO event=presented run=%u generation=%u frame=%u width=%d height=%d",
+            state->scenarioRunId, state->scenarioGeneration, state->scenarioFrames, state->width,
+            state->height);
+        state->scenarioLifecyclePending = false;
+    }
+    if (state->scenarioCapturePending)
+    {
+        WalkScenarioInput input;
+        if (WalkScenarioInputAt(&state->scenario, state->scenarioCaptureTick, &input) == 0u)
+            AndroidScenarioFail(state, "checkpoint_input");
+        else
+        {
+            ++state->scenarioCheckpoints;
+            __android_log_print(
+                ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                "LAIUE_SCENARIO event=checkpoint run=%u phase=%s checkpoint=%u tick=%u frame=%u "
+                "width=%d "
+                "height=%d yaw=%.5f pitch=%.5f first_person=%u capture=external_adb "
+                "readback_supported=%u",
+                state->scenarioRunId, WalkScenarioPhaseName(input.phase), input.checkpoint,
+                state->scenarioCaptureTick, state->scenarioFrames, state->width, state->height,
+                state->camera.yaw, state->camera.pitch, state->firstPerson ? 1u : 0u,
+                hasDiagnostics &&
+                        (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED) != 0u
+                    ? 1u
+                    : 0u);
+            state->scenarioCaptureWaiting = true;
+            state->scenarioCaptureCheckpoint = input.checkpoint;
+            state->scenarioCaptureDeadline = PlatformMonotonicSeconds() + 30.0;
+        }
+        state->scenarioCapturePending = false;
+    }
+    if (!state->scenarioFinished && !state->scenarioCaptureWaiting &&
+        state->scenarioTick >= WALK_SCENARIO_TOTAL_TICKS)
+        AndroidScenarioSummary(state);
+}
+
+static bool AndroidEditTarget(AndroidWalkState *state, bool place)
 {
     if (state == NULL || state->scene == NULL ||
         state->scene->cameraGetForwardVector == NULL)
-        return;
+        return false;
     const double origin[3] = {state->cameraRelativeEye[0], state->cameraRelativeEye[1],
                               state->cameraRelativeEye[2]};
     const int64_t offset[3] = {state->renderOriginBlock[0],
@@ -479,17 +788,19 @@ static void AndroidEditTarget(AndroidWalkState *state, bool place)
                           direction, WALK_WORLD_INTERACTION_DISTANCE, &hit))
     {
         AndroidLog(state, ANDROID_LOG_INFO, "block edit ray found no block");
-        return;
+        return false;
     }
     if (!WalkWorldEditHit(AndroidSetWorldBlock, state, &hit, place,
                           state->selectedMaterial))
     {
         AndroidLog(state, ANDROID_LOG_WARN, "block edit provider rejected the change");
-        return;
+        return false;
     }
     const int64_t *edited = place ? hit.previousBlock : hit.block;
     WalkVisualsInvalidateBlock(&state->chunkSet, state->device,
                                edited[0], edited[1], edited[2]);
+    return AndroidReadVisualBlock(state, edited[0], edited[1], edited[2]) ==
+           (place ? state->selectedMaterial : 0u);
 }
 
 static bool AndroidInitializeRagdoll(AndroidWalkState *state)
@@ -693,7 +1004,12 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     state->height = height;
     state->lastTime = PlatformMonotonicSeconds();
     if (state->scene != NULL && state->scene->cameraInit != NULL)
-        state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0, 0.0f, -0.32f);
+    {
+        const bool preserveScenarioCamera = state->scenarioEnabled && state->scenarioTick != 0u;
+        state->scene->cameraInit(&state->camera, 0.0, 0.0, 0.0,
+                                 preserveScenarioCamera ? state->camera.yaw : 0.0f,
+                                 preserveScenarioCamera ? state->camera.pitch : -0.32f);
+    }
     if (!AndroidCreateTexturedTerrain(state))
         AndroidLog(state, ANDROID_LOG_WARN,
                    "Android walk terrain textures could not be loaded");
@@ -762,6 +1078,33 @@ static int32_t AndroidHandleInput(struct android_app *app, AInputEvent *event)
     AndroidWalkState *state = (AndroidWalkState *)app->userData;
     if (state == NULL || event == NULL)
         return 0;
+    if (state->scenarioEnabled)
+    {
+        if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY &&
+            AKeyEvent_getKeyCode(event) == AKEYCODE_F12 &&
+            AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN &&
+            AKeyEvent_getRepeatCount(event) == 0 && state->scenarioCaptureWaiting &&
+            !state->scenarioFailed)
+        {
+            const double acknowledged = PlatformMonotonicSeconds();
+            if (acknowledged >= state->scenarioCaptureDeadline)
+            {
+                AndroidScenarioFail(state, "capture_ack_timeout");
+                state->scenarioCaptureWaiting = false;
+                return 1;
+            }
+            state->scenarioCaptureWaiting = false;
+            state->scenarioCaptureDeadline = 0.0;
+            state->accumulator = 0.0;
+            state->lastTime = acknowledged;
+            ++state->scenarioAcks;
+            __android_log_print(ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                                "LAIUE_SCENARIO event=capture_ack run=%u checkpoint=%u tick=%u",
+                                state->scenarioRunId, state->scenarioCaptureCheckpoint,
+                                state->scenarioTick);
+        }
+        return 1;
+    }
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY)
     {
         const int32_t keyCode = AKeyEvent_getKeyCode(event);
@@ -931,6 +1274,44 @@ static void AndroidHandleCommand(struct android_app *app, int32_t command)
     AndroidWalkState *state = (AndroidWalkState *)app->userData;
     if (state == NULL)
         return;
+    if (state->scenarioEnabled)
+    {
+        const char *name = NULL;
+        switch (command)
+        {
+        case APP_CMD_INIT_WINDOW:
+            name = "init_window";
+            break;
+        case APP_CMD_TERM_WINDOW:
+            name = "term_window";
+            break;
+        case APP_CMD_GAINED_FOCUS:
+            name = "gained_focus";
+            break;
+        case APP_CMD_LOST_FOCUS:
+            name = "lost_focus";
+            break;
+        case APP_CMD_CONFIG_CHANGED:
+            name = "config_changed";
+            break;
+        case APP_CMD_WINDOW_RESIZED:
+            name = "window_resized";
+            break;
+        case APP_CMD_CONTENT_RECT_CHANGED:
+            name = "content_rect_changed";
+            break;
+        default:
+            break;
+        }
+        if (name != NULL)
+        {
+            ++state->scenarioGeneration;
+            state->scenarioLifecyclePending = true;
+            __android_log_print(ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                                "LAIUE_SCENARIO event=lifecycle run=%u command=%s generation=%u",
+                                state->scenarioRunId, name, state->scenarioGeneration);
+        }
+    }
     switch (command)
     {
         case APP_CMD_INIT_WINDOW:
@@ -992,7 +1373,10 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
                              offsetof(LaiueGraphicsDeviceV2, setCamera),
                              sizeof(state->device->setCamera)) ||
         state->device->setCamera == NULL)
+    {
+        AndroidScenarioFail(state, "required_camera");
         return;
+    }
     if (state->scene->cameraUpdate != NULL)
         state->scene->cameraUpdate(&state->camera, elapsed, false, false, false, false, false,
                                    state->lookDeltaX, state->lookDeltaY, 0.0f, 0.0025f);
@@ -1004,10 +1388,16 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
     {
         double pelvis[3];
         if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], pelvis))
+        {
+            AndroidScenarioFail(state, "camera_position");
             return;
+        }
         int64_t centerBlock[3];
         if (!AndroidGetChunkCoordinates(state, centerBlock))
+        {
+            AndroidScenarioFail(state, "camera_origin");
             return;
+        }
         state->cameraRenderOrigin[2] = (double)state->renderOriginBlock[2];
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene->cameraGetForwardVector != NULL)
@@ -1018,7 +1408,10 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
                 &state->ragdoll, &state->ragdollCollision, forward,
                 state->firstPerson, fallbackEye, state->lastSafeCameraEye,
                 &state->lastSafeCameraEyeValid, eye))
+        {
+            AndroidScenarioFail(state, "camera_eye");
             return;
+        }
         for (uint32_t axis = 0u; axis < 3u; ++axis)
             state->cameraRelativeEye[axis] =
                 (float)(eye[axis] - state->cameraRenderOrigin[axis]);
@@ -1083,7 +1476,8 @@ static void AndroidUpdateCamera(AndroidWalkState *state, int32_t width, int32_t 
         .flags = 0u,
     };
     memcpy(camera.viewProjection, state->viewProjection, sizeof(camera.viewProjection));
-    (void)state->device->setCamera(state->device, &camera);
+    if (state->device->setCamera(state->device, &camera) == 0u)
+        AndroidScenarioFail(state, "set_camera");
 }
 
 static LaiueGraphicsUiQuadV1 AndroidTouchQuad(float x0, float y0, float x1, float y1,
@@ -1219,6 +1613,9 @@ static void AndroidStep(AndroidWalkState *state)
     if (elapsed > 0.25)
         elapsed = 0.25;
     state->accumulator += elapsed;
+    if (state->scenarioEnabled &&
+        (state->scenarioCaptureWaiting || state->scenarioFinished || state->scenarioFailed))
+        state->accumulator = 0.0;
     const double fixedStep = 1.0 / (double)LAIUE_CHARACTER_TICK_HZ;
     uint32_t ticks = 0u;
     const bool characterCanStep =
@@ -1230,10 +1627,13 @@ static void AndroidStep(AndroidWalkState *state)
     const bool ragdollCanStep = state->ragdollReady && state->physics != NULL &&
                                 state->physics->ragdollStep != NULL &&
                                 state->physics->ragdollDrive != NULL;
-    while ((ragdollCanStep || characterCanStep) && state->accumulator >= fixedStep &&
-           ticks < 8u)
+    while ((ragdollCanStep || characterCanStep) && state->accumulator >= fixedStep && ticks < 8u &&
+           (!state->scenarioEnabled ||
+            (!state->scenarioCapturePending && !state->scenarioCaptureWaiting &&
+             !state->scenarioFinished && !state->scenarioFailed)))
     {
         LaiueCharacterInputV1 input = {0};
+        WalkScenarioInput scenarioInput = {0};
         float strafe = (float)((state->keyDown[3] ? 1 : 0) -
                                (state->keyDown[1] ? 1 : 0));
         float forwardInput = (float)((state->keyDown[0] ? 1 : 0) -
@@ -1242,6 +1642,40 @@ static void AndroidStep(AndroidWalkState *state)
         {
             strafe = state->joystickX;
             forwardInput = state->joystickY;
+        }
+        if (state->scenarioEnabled)
+        {
+            if (WalkScenarioInputAt(&state->scenario, state->scenarioTick, &scenarioInput) == 0u)
+                break;
+            if (!ragdollCanStep || state->scene == NULL || state->scene->cameraUpdate == NULL ||
+                state->scene->cameraInit == NULL || state->scene->cameraGetForwardVector == NULL)
+            {
+                AndroidScenarioFail(state, "required_gameplay");
+                break;
+            }
+            strafe = scenarioInput.moveX;
+            forwardInput = scenarioInput.moveY;
+            state->scene->cameraUpdate(
+                &state->camera, (float)fixedStep, false, false, false, false, false,
+                (int32_t)((scenarioInput.yaw - state->camera.yaw) / 0.0025f),
+                (int32_t)((state->camera.pitch - scenarioInput.pitch) / 0.0025f), 0.0f, 0.0025f);
+            state->firstPerson = scenarioInput.firstPerson != 0u;
+            state->sprintToggled = scenarioInput.sprint != 0u;
+            state->jumpPending |= scenarioInput.jump != 0u;
+            state->breakPending |= scenarioInput.breakBlock != 0u;
+            state->placePending |= scenarioInput.placeBlock != 0u;
+            if (scenarioInput.jump != 0u)
+            {
+                double root[3];
+                if (!state->ragdollGrounded ||
+                    !WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
+                    AndroidScenarioFail(state, "jump_not_grounded");
+                else
+                {
+                    state->scenarioJumpEligible = true;
+                    state->scenarioJumpStartZ = root[2];
+                }
+            }
         }
         float forward[3] = {0.0f, 1.0f, 0.0f};
         if (state->scene != NULL && state->scene->cameraGetForwardVector != NULL)
@@ -1270,6 +1704,7 @@ static void AndroidStep(AndroidWalkState *state)
                                     "deterministic ragdoll step failed at stage %u (rebase=%u)",
                                     (uint32_t)stepFailure, humanoidStepped ? 1u : 0u);
                 state->running = false;
+                AndroidScenarioFail(state, "ragdoll_step");
                 break;
             }
         }
@@ -1290,6 +1725,7 @@ static void AndroidStep(AndroidWalkState *state)
                 AndroidLog(state, ANDROID_LOG_ERROR,
                            "deterministic character step failed");
                 state->running = false;
+                AndroidScenarioFail(state, "character_step");
                 break;
             }
             if (WalkRebaseWorldAndCharacter(
@@ -1300,14 +1736,28 @@ static void AndroidStep(AndroidWalkState *state)
                 AndroidLog(state, ANDROID_LOG_ERROR,
                            "world/character rebase transaction failed");
                 state->running = false;
+                AndroidScenarioFail(state, "character_rebase");
                 break;
             }
+        }
+        if (state->scenarioEnabled)
+        {
+            AndroidScenarioObserve(state, scenarioInput.phase);
+            if (scenarioInput.rebaseCheck != 0u && !AndroidScenarioRebase(state))
+                AndroidScenarioFail(state, "rebase_check");
+            if (scenarioInput.capture != 0u)
+            {
+                state->scenarioCaptureTick = state->scenarioTick;
+                state->scenarioCapturePending = true;
+            }
+            ++state->scenarioTick;
         }
         state->accumulator -= fixedStep;
         ++ticks;
     }
     if (ticks == 8u && state->accumulator >= fixedStep)
         state->accumulator = 0.0;
+    bool scenarioPresented = false;
     if (state->device != NULL &&
         AndroidFieldPresent(state->device->structSize, state->device->structSize,
                             offsetof(LaiueGraphicsDeviceV2, beginFrame),
@@ -1333,9 +1783,25 @@ static void AndroidStep(AndroidWalkState *state)
         {
             AndroidUpdateCamera(state, width, height, (float)elapsed);
             if (state->breakPending)
-                AndroidEditTarget(state, false);
+            {
+                const bool edited = AndroidEditTarget(state, false);
+                if (state->scenarioEnabled)
+                {
+                    state->scenarioBreaks += edited ? 1u : 0u;
+                    if (!edited)
+                        AndroidScenarioFail(state, "break_readback");
+                }
+            }
             if (state->placePending)
-                AndroidEditTarget(state, true);
+            {
+                const bool edited = AndroidEditTarget(state, true);
+                if (state->scenarioEnabled)
+                {
+                    state->scenarioPlaces += edited ? 1u : 0u;
+                    if (!edited)
+                        AndroidScenarioFail(state, "place_readback");
+                }
+            }
             state->breakPending = false;
             state->placePending = false;
             int64_t chunkCenter[3] = {0, 0, 0};
@@ -1347,6 +1813,7 @@ static void AndroidStep(AndroidWalkState *state)
             {
                 AndroidLog(state, ANDROID_LOG_ERROR, "voxel chunk rebuild failed");
                 state->running = false;
+                AndroidScenarioFail(state, "chunk_rebuild");
             }
             const bool ragdollMeshReady = AndroidUpdateRagdollBuffer(state);
             const uint32_t began = state->device->beginFrame(
@@ -1387,6 +1854,8 @@ static void AndroidStep(AndroidWalkState *state)
                 AndroidSubmitTouchUi(state, width, height);
             const uint32_t ended = began != 0u
                 ? state->device->endFrame(state->device) : 0u;
+            scenarioPresented =
+                began != 0u && submitted != 0u && ended != 0u && sceneDrawCount != 0u;
             if (!state->renderTelemetryLogged)
             {
                 __android_log_print(ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
@@ -1402,6 +1871,7 @@ static void AndroidStep(AndroidWalkState *state)
                 AndroidLog(state, ANDROID_LOG_WARN, "frame skipped after surface change");
         }
     }
+    AndroidScenarioFrame(state, now, scenarioPresented, ticks != 0u);
 }
 
 void android_main(struct android_app *app)
@@ -1410,6 +1880,26 @@ void android_main(struct android_app *app)
     memset(&state, 0, sizeof(state));
     state.selectedMaterial = 1u;
     state.app = app;
+    state.scenarioEnabled = AndroidScenarioIntentEnabled(app, &state.scenarioRunId);
+    if (state.scenarioEnabled)
+    {
+        WalkScenarioInitialize(&state.scenario);
+        state.scenarioCpu =
+            (WalkScenarioMetrics *)PlatformAllocate(sizeof(*state.scenarioCpu), false);
+        state.scenarioGpu =
+            (WalkScenarioMetrics *)PlatformAllocate(sizeof(*state.scenarioGpu), false);
+        if (state.scenarioCpu == NULL || state.scenarioGpu == NULL)
+            AndroidScenarioFail(&state, "metrics_allocate");
+        else
+        {
+            WalkScenarioMetricsInitialize(state.scenarioCpu);
+            WalkScenarioMetricsInitialize(state.scenarioGpu);
+            __android_log_print(
+                ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
+                "LAIUE_SCENARIO event=start run=%u tick_hz=%u ticks=%u capture=external_adb",
+                state.scenarioRunId, WALK_SCENARIO_TICK_RATE, WALK_SCENARIO_TOTAL_TICKS);
+        }
+    }
     app->userData = &state;
     app->onAppCmd = AndroidHandleCommand;
     app->onInputEvent = AndroidHandleInput;
@@ -1487,16 +1977,33 @@ void android_main(struct android_app *app)
 
     while (app->destroyRequested == 0)
     {
+        if (state.scenarioCaptureWaiting &&
+            PlatformMonotonicSeconds() >= state.scenarioCaptureDeadline)
+        {
+            AndroidScenarioFail(&state, "capture_ack_timeout");
+            state.scenarioCaptureWaiting = false;
+        }
         int events = 0;
         struct android_poll_source *source = NULL;
-        int timeout = state.running && state.windowReady ? 0 : -1;
+        int timeout = state.running && state.windowReady ? 0
+                      : state.scenarioCaptureWaiting     ? 250
+                                                         : -1;
         while (ALooper_pollOnce(timeout, NULL, &events, (void **)&source) >= 0)
         {
             if (source != NULL && source->process != NULL)
                 source->process(app, source);
+            if (state.scenarioCaptureWaiting &&
+                PlatformMonotonicSeconds() >= state.scenarioCaptureDeadline)
+            {
+                AndroidScenarioFail(&state, "capture_ack_timeout");
+                state.scenarioCaptureWaiting = false;
+                break;
+            }
             if (app->destroyRequested != 0)
                 break;
-            timeout = state.running && state.windowReady ? 0 : -1;
+            timeout = state.running && state.windowReady ? 0
+                      : state.scenarioCaptureWaiting     ? 250
+                                                         : -1;
             if (timeout == 0)
                 break;
         }
@@ -1505,6 +2012,8 @@ void android_main(struct android_app *app)
     }
 
     AndroidDestroyDevice(&state);
+    PlatformFree(state.scenarioCpu);
+    PlatformFree(state.scenarioGpu);
     WalkHumanoidRelease(state.physics, &state.ragdoll, &state.ragdollScratch);
     state.ragdollScratchBytes = 0u;
     if (state.controller != NULL && state.character != NULL &&

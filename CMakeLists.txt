@@ -517,6 +517,12 @@ option(LAIUE_BUILD_TOOLS "Build the offline content tools"
     ${_laiue_tools_default})
 
 option(LAIUE_BUILD_EXAMPLES "Build the public SDK examples" OFF)
+
+# Internal scenario/measurement support is shared by the walk example, offline
+# frame validator and tests. It is not a module or part of the installed SDK.
+add_library(laiue_walk_scenario_support STATIC examples/walk/walk_scenario.c)
+target_link_libraries(laiue_walk_scenario_support PRIVATE laiue::build_options)
+set_target_properties(laiue_walk_scenario_support PROPERTIES POSITION_INDEPENDENT_CODE ON)
 option(LAIUE_BUILD_ANDROID_WALK
     "Build the NativeActivity/Vulkan Android walk client (requires Android NDK)"
     OFF)
@@ -526,6 +532,17 @@ if(LAIUE_BUILD_EXAMPLES)
 endif()
 
 if(LAIUE_BUILD_TOOLS)
+    add_executable(laiue_frame_check tools/frame_check.c)
+    target_include_directories(laiue_frame_check PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+        "${PROJECT_SOURCE_DIR}/src/assets"
+        "${PROJECT_SOURCE_DIR}/examples/walk")
+    target_link_libraries(laiue_frame_check PRIVATE
+        laiue::media_support laiue_walk_scenario_support)
+    laiue_configure_standalone_executable(laiue_frame_check FrameCheckEntryPoint)
+    if(WIN32)
+        target_link_libraries(laiue_frame_check PRIVATE shell32)
+    endif()
     add_subdirectory(tools/soundc)
     add_subdirectory(tools/modelc)
     add_subdirectory(tools/texc)

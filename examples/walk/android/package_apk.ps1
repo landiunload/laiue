@@ -66,8 +66,18 @@ try {
 
 & $Zipalign -f -p 4 $unsigned $aligned
 if ($LASTEXITCODE -ne 0) { throw "zipalign failed with exit code $LASTEXITCODE" }
-& $Apksigner sign --ks $Keystore --ks-pass "pass:$KeystorePassword" --out $output $aligned
-if ($LASTEXITCODE -ne 0) { throw "apksigner sign failed with exit code $LASTEXITCODE" }
-& $Apksigner verify --verbose $output
-if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed with exit code $LASTEXITCODE" }
+# apksigner loads its bundled Conscrypt library. Authorize that native access
+# explicitly on modern JDKs instead of hiding the restricted-access warning.
+# The Windows SDK's .bat parser splits --option=value, so use the JVM's own
+# option channel and restore it after these two child processes.
+$previousJavaOptions = [Environment]::GetEnvironmentVariable('JDK_JAVA_OPTIONS', 'Process')
+try {
+    $env:JDK_JAVA_OPTIONS = "$previousJavaOptions --enable-native-access=ALL-UNNAMED".Trim()
+    & $Apksigner sign --ks $Keystore --ks-pass "pass:$KeystorePassword" --out $output $aligned
+    if ($LASTEXITCODE -ne 0) { throw "apksigner sign failed with exit code $LASTEXITCODE" }
+    & $Apksigner verify --verbose $output
+    if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed with exit code $LASTEXITCODE" }
+} finally {
+    [Environment]::SetEnvironmentVariable('JDK_JAVA_OPTIONS', $previousJavaOptions, 'Process')
+}
 Write-Host "Created $output"

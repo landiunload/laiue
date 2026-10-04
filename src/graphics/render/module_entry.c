@@ -1,6 +1,7 @@
 #include "render/graphics_service.h"
 #include "render/content_provider.h"
 #include "render/chunk_geometry.h"
+#include "render/renderer_offscreen.h"
 #include "graphics/graphics_device_service.h"
 
 #include "content/content_service.h"
@@ -58,6 +59,9 @@ typedef struct LaiueGraphicsDeviceState
     float viewProjection[16];
     bool cameraSet;
     bool frameActive;
+    bool lastFrameValid;
+    bool readbackSupported;
+    uint64_t completedFrameIndex;
 } LaiueGraphicsDeviceState;
 
 enum
@@ -206,6 +210,9 @@ static uint32_t DeviceV2SubmitUi(LaiueGraphicsDeviceV2 *,
 static uint32_t DeviceV2SetUiFontAtlas(LaiueGraphicsDeviceV2 *, const uint8_t *,
                                        uint32_t, uint32_t);
 static uint32_t DeviceV2EndFrame(LaiueGraphicsDeviceV2 *);
+static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *, LaiueGraphicsDiagnosticsV2 *);
+static uint32_t DeviceV2ReadbackFrame(LaiueGraphicsDeviceV2 *, LaiueGraphicsFrameReadbackV2 *);
+static uint32_t DeviceV2RequestFrameReadback(LaiueGraphicsDeviceV2 *);
 
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
@@ -435,6 +442,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
         return 0u;
     }
     state->renderer = renderer;
+    state->readbackSupported = RendererCanCaptureFrame(renderer);
     state->device.structSize = sizeof(state->device);
     state->device.abiVersion = LAIUE_GRAPHICS_ABI_VERSION_1;
     state->device.context = state;
@@ -468,6 +476,9 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.submitUi = DeviceV2SubmitUi;
     state->deviceV2.setUiFontAtlas = DeviceV2SetUiFontAtlas;
     state->deviceV2.setCamera = DeviceV2SetCamera;
+    state->deviceV2.getDiagnostics = DeviceV2GetDiagnostics;
+    state->deviceV2.readbackFrame = DeviceV2ReadbackFrame;
+    state->deviceV2.requestFrameReadback = DeviceV2RequestFrameReadback;
     *outDevice = &state->device;
     return 1u;
 }
@@ -532,6 +543,7 @@ static void DeviceResize(LaiueGraphicsDeviceV1 *device, int32_t width, int32_t h
     LaiueGraphicsDeviceState *state = DeviceState(device);
     if (state == NULL)
         return;
+    state->lastFrameValid = false;
     RendererResize(state->renderer, width, height);
 }
 
@@ -849,6 +861,9 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
     LaiueGraphicsDeviceState *state = DeviceState(device);
     if (state == NULL || state->frameActive || width == 0u || height == 0u)
         return 0u;
+    if (state->completedFrameIndex == UINT64_MAX)
+        return 0u;
+    state->lastFrameValid = false;
     RendererFrameSetup frame;
     memset(&frame, 0, sizeof(frame));
     frame.passCount = 1u;
@@ -1010,9 +1025,12 @@ static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *device)
     if (!RendererEndFrame(state->renderer))
     {
         state->frameActive = false;
+        state->lastFrameValid = false;
         return 0u;
     }
     state->frameActive = false;
+    state->lastFrameValid = true;
+    ++state->completedFrameIndex;
     return 1u;
 }
 
@@ -1250,6 +1268,134 @@ static uint32_t DeviceV2EndFrame(LaiueGraphicsDeviceV2 *device)
 {
     LaiueGraphicsDeviceState *state = DeviceV2State(device);
     return state == NULL ? 0u : DeviceEndFrame(&state->device);
+}
+
+static LaiueGraphicsDeviceState *DeviceV2DiagnosticsState(LaiueGraphicsDeviceV2 *device)
+{
+    if (device == NULL ||
+        device->structSize < offsetof(LaiueGraphicsDeviceV2, context) + sizeof(device->context) ||
+        device->abiVersion != LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION || device->context == NULL)
+        return NULL;
+    LaiueGraphicsDeviceState *state = (LaiueGraphicsDeviceState *)device->context;
+    return device == &state->deviceV2 && state->renderer != NULL ? state : NULL;
+}
+
+static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
+                                       LaiueGraphicsDiagnosticsV2 *outDiagnostics)
+{
+    if (outDiagnostics == NULL || outDiagnostics->structSize < sizeof(*outDiagnostics))
+        return 0u;
+    LaiueGraphicsDiagnosticsV2 result = {.structSize = sizeof(result)};
+    LaiueGraphicsDeviceState *state = DeviceV2DiagnosticsState(device);
+    if (state == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE)
+    {
+        *outDiagnostics = result;
+        return 0u;
+    }
+    if (state->readbackSupported)
+    {
+        result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED;
+        if (RendererGetBackend(state->renderer) == RENDERER_BACKEND_D3D12)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED;
+    }
+    if (state->lastFrameValid)
+    {
+        RendererStats stats = {0};
+        RendererGetStats(state->renderer, &stats);
+        result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_FRAME_VALID;
+        result.frameIndex = state->completedFrameIndex;
+        result.drawCalls = stats.drawCalls;
+        result.drawnQuads = stats.drawnQuads;
+        result.uploadedBytes = stats.uploadedBytes;
+        result.geometryPoolUsedBytes = stats.geometryPoolUsedBytes;
+        result.geometryPoolCapacityBytes = stats.geometryPoolCapacityBytes;
+        result.scenePasses = stats.scenePasses;
+    }
+    RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};
+    RendererGetGpuTimingV1(state->renderer, &timing);
+    if ((timing.flags & RENDERER_GPU_TIMING_SUPPORTED) != 0u)
+    {
+        result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_SUPPORTED;
+        if ((timing.flags & RENDERER_GPU_TIMING_VALID) != 0u)
+        {
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_VALID;
+            result.gpuFrameIndex = timing.frameIndex;
+            result.gpuDurationNanoseconds = timing.durationNanoseconds;
+        }
+    }
+    for (uint32_t index = 0u; index < DEVICE_HANDLE_CAPACITY; ++index)
+        if (state->live[index] != 0u)
+        {
+            ++result.resourceHandleCount;
+            if (state->storage[index] != NULL)
+            {
+                if (state->sizes[index] > UINT64_MAX - result.cpuShadowBytes)
+                {
+                    *outDiagnostics =
+                        (LaiueGraphicsDiagnosticsV2){.structSize = sizeof(*outDiagnostics)};
+                    return 0u;
+                }
+                result.cpuShadowBytes += state->sizes[index];
+            }
+        }
+    *outDiagnostics = result;
+    return 1u;
+}
+
+static uint32_t DeviceV2ReadbackFrame(LaiueGraphicsDeviceV2 *device,
+                                      LaiueGraphicsFrameReadbackV2 *readback)
+{
+    if (readback == NULL || readback->structSize < sizeof(*readback))
+        return 0u;
+    readback->frameIndex = 0u;
+    readback->writtenBytes = 0u;
+    readback->width = 0u;
+    readback->height = 0u;
+    readback->rowPitchBytes = 0u;
+    LaiueGraphicsDeviceState *state = DeviceV2DiagnosticsState(device);
+    if (state == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_READBACK_SIZE ||
+        readback->flags != 0u || readback->reserved != 0u || readback->pixels == NULL ||
+        readback->capacityBytes == 0u || readback->capacityBytes > (uint64_t)SIZE_MAX ||
+        !state->readbackSupported || state->frameActive || !state->lastFrameValid ||
+        (readback->expectedFrameIndex != 0u &&
+         readback->expectedFrameIndex != state->completedFrameIndex))
+        return 0u;
+    const uintptr_t pixelBegin = (uintptr_t)readback->pixels;
+    const uintptr_t descriptionBegin = (uintptr_t)readback;
+    if (readback->capacityBytes > UINTPTR_MAX - pixelBegin ||
+        sizeof(*readback) > UINTPTR_MAX - descriptionBegin)
+        return 0u;
+    const uintptr_t pixelEnd = pixelBegin + (uintptr_t)readback->capacityBytes;
+    const uintptr_t descriptionEnd = descriptionBegin + sizeof(*readback);
+    if (pixelBegin < descriptionEnd && descriptionBegin < pixelEnd)
+        return 0u;
+    const uint32_t capacity =
+        readback->capacityBytes > UINT32_MAX ? UINT32_MAX : (uint32_t)readback->capacityBytes;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    const bool captured =
+        RendererCaptureFrame(state->renderer, readback->pixels, capacity, &width, &height);
+    if (width > UINT32_MAX / 4u || height == 0u || width == 0u ||
+        (uint64_t)width * 4u > UINT64_MAX / height)
+        return 0u;
+    readback->width = width;
+    readback->height = height;
+    readback->rowPitchBytes = width * 4u;
+    const uint64_t required = (uint64_t)readback->rowPitchBytes * height;
+    if (!captured || required > readback->capacityBytes)
+        return 0u;
+    readback->frameIndex = state->completedFrameIndex;
+    readback->writtenBytes = required;
+    return 1u;
+}
+
+static uint32_t DeviceV2RequestFrameReadback(LaiueGraphicsDeviceV2 *device)
+{
+    LaiueGraphicsDeviceState *state = DeviceV2DiagnosticsState(device);
+    if (state == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE ||
+        !state->readbackSupported || state->frameActive)
+        return 0u;
+    return RendererRequestFrameCapture(state->renderer) ? 1u : 0u;
 }
 
 static const LaiueGraphicsServiceV1 service = {

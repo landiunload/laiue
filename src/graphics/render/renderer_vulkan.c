@@ -3959,6 +3959,8 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         (frame->passCount != 0u && !renderer->worldReady))
         return false;
 
+    renderer->lastFrameValid = false;
+
     vkWaitForFences(renderer->device, 1u, &renderer->frameFences[renderer->frameIndex], VK_TRUE,
                     UINT64_MAX);
     CollectGpuTiming(renderer, renderer->frameIndex);
@@ -4442,6 +4444,7 @@ bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer *renderer)
 void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
 {
     if (renderer == NULL) return;
+    renderer->lastFrameValid = false;
     if (width <= 0 || height <= 0)
     {
         // Нулевой размер — свёрнутое окно: кадры пропускаются до
@@ -4747,10 +4750,22 @@ void RendererUiQueue_Vulkan(Renderer *renderer, const RendererUiQuad *quads, uin
 
 // === Диагностическое чтение кадра ===
 
-bool RendererCaptureFrame(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
-                          uint32_t *outWidth, uint32_t *outHeight)
+bool RendererCanCaptureFrame_Vulkan(const Renderer *renderer)
 {
-    if (renderer == NULL || outPixels == NULL || !renderer->lastFrameValid) return false;
+    return renderer != NULL && renderer->device != VK_NULL_HANDLE;
+}
+
+bool RendererRequestFrameCapture_Vulkan(Renderer *renderer)
+{
+    return RendererCanCaptureFrame_Vulkan(renderer) && !renderer->frameRecording;
+}
+
+bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
+                                 uint32_t *outWidth, uint32_t *outHeight)
+{
+    if (renderer == NULL || outPixels == NULL || renderer->frameRecording ||
+        !renderer->lastFrameValid || renderer->lastFrameIndex >= FRAME_COUNT)
+        return false;
 
     GpuImage *source = &renderer->colorTargets[renderer->lastFrameIndex];
     uint32_t width = source->width;
@@ -4758,10 +4773,16 @@ bool RendererCaptureFrame(Renderer *renderer, void *outPixels, uint32_t capacity
     if (outWidth != NULL) *outWidth = width;
     if (outHeight != NULL) *outHeight = height;
 
+    if (source->image == VK_NULL_HANDLE || width == 0u || height == 0u || width > UINT32_MAX / 4u ||
+        (uint64_t)width * 4u > UINT64_MAX / height)
+        return false;
     VkDeviceSize required = (VkDeviceSize)width * height * 4u;
-    if (capacityBytes < required) return false;
+    if (required > capacityBytes || required > SIZE_MAX ||
+        required > UINTPTR_MAX - (uintptr_t)outPixels)
+        return false;
 
-    vkDeviceWaitIdle(renderer->device);
+    if (vkDeviceWaitIdle(renderer->device) != VK_SUCCESS)
+        return false;
 
     GpuBuffer readback;
     if (!BufferCreate(renderer, required, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &readback))
@@ -4773,6 +4794,7 @@ bool RendererCaptureFrame(Renderer *renderer, void *outPixels, uint32_t capacity
         BufferDestroy(renderer, &readback);
         return false;
     }
+    const VkImageLayout originalLayout = source->layout;
     ImageBarrier(commandBuffer, source, VK_IMAGE_ASPECT_COLOR_BIT,
                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy region = {
@@ -4781,6 +4803,7 @@ bool RendererCaptureFrame(Renderer *renderer, void *outPixels, uint32_t capacity
     };
     vkCmdCopyImageToBuffer(commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback.buffer, 1u, &region);
+    ImageBarrier(commandBuffer, source, VK_IMAGE_ASPECT_COLOR_BIT, originalLayout);
     bool ok = EndImmediate(renderer, commandBuffer);
     if (ok) memcpy(outPixels, readback.mapped, (size_t)required);
     BufferDestroy(renderer, &readback);

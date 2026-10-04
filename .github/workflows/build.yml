@@ -48,6 +48,28 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}-release --parallel
       - name: Test Release
         run: ctest --preset ${{ matrix.preset }}-release --no-tests=error
+      - name: Verify native walk scenario and GPU captures
+        id: walk-scenario
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          foreach ($configuration in 'Debug', 'Release') {
+            ./tools/test_windows_walk.ps1 `
+              -GameExe "build/${{ matrix.preset }}/bin/$configuration/laiue_walk.exe" `
+              -FrameCheckExe "build/${{ matrix.preset }}/bin/$configuration/laiue_frame_check.exe" `
+              -OutputDir "build/${{ matrix.preset }}/walk-scenario/$configuration" `
+              -TimeoutSeconds 180
+          }
+      - name: Upload native walk captures and measurements
+        if: always() && steps.walk-scenario.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: laiue-walk-${{ matrix.preset }}
+          path: |
+            build/${{ matrix.preset }}/walk-scenario/**/*.png
+            build/${{ matrix.preset }}/walk-scenario/**/*.json
+            build/${{ matrix.preset }}/walk-scenario/**/*.log
+          if-no-files-found: error
       - name: Stage engine SDK
         if: matrix.preset == 'windows-msvc'
         run: >
@@ -368,6 +390,145 @@ jobs:
           cmake --preset android-arm64-walk
           cmake --build --preset android-arm64-walk-release --parallel
       - name: Verify build did not modify sources
+        run: |
+          cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
+            -P tools/verify_source_tree.cmake
+
+  android-emulator-runtime:
+    name: Android API 35 native Vulkan runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build the shared image checker for the host
+        timeout-minutes: 6
+        run: |
+          cmake --preset linux-gcc -B build/android-emulator-host \
+            -DLAIUE_BUILD_GRAPHICS=OFF -DLAIUE_BUILD_EXAMPLES=OFF \
+            -DLAIUE_BUILD_TOOLS=ON -DBUILD_TESTING=OFF \
+            -DLAIUE_ENABLE_SDK_INSTALL=OFF
+          cmake --build build/android-emulator-host --config Release \
+            --target laiue_frame_check --parallel
+      - name: Prepare pinned Android tools and the test image
+        id: prepare-runtime
+        timeout-minutes: 12
+        run: |
+          mkdir -p build/android-runtime-results "$RUNNER_TEMP/laiue-sdk-tools" \
+            "$RUNNER_TEMP/laiue-pinned-emulator" "$RUNNER_TEMP/laiue-avd"
+          printf 'ANDROID_AVD_HOME=%s/laiue-avd\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          curl --fail --location --connect-timeout 20 --max-time 180 --retry 2 \
+            https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip \
+            --output "$RUNNER_TEMP/laiue-sdk-tools.zip"
+          printf '4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  %s\n' \
+            "$RUNNER_TEMP/laiue-sdk-tools.zip" | sha256sum --check -
+          unzip -q "$RUNNER_TEMP/laiue-sdk-tools.zip" -d "$RUNNER_TEMP/laiue-sdk-tools"
+          tools="$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin"
+          test "$("$tools/sdkmanager" --version)" = '22.0'
+          for ((answer=0; answer<32; ++answer)); do printf 'y\n'; done \
+            > "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          "$tools/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses \
+            < "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          "$tools/sdkmanager" --sdk_root="$ANDROID_HOME" --install \
+            'platforms;android-35' 'build-tools;35.0.0' \
+            'system-images;android-35;google_apis;x86_64' \
+            < "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          curl --fail --location --connect-timeout 20 --max-time 180 --retry 2 \
+            https://dl.google.com/android/repository/emulator-linux_x64-15917651.zip \
+            --output "$RUNNER_TEMP/laiue-emulator.zip"
+          printf '95771e0ae431897b2a4bd2d97fa095f29a8b0624a7b216baf529f9306161c266  %s\n' \
+            "$RUNNER_TEMP/laiue-emulator.zip" | sha256sum --check -
+          unzip -q "$RUNNER_TEMP/laiue-emulator.zip" -d "$RUNNER_TEMP/laiue-pinned-emulator"
+          emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"
+          grep -Fx 'Pkg.Revision=37.1.11' "$emulator/source.properties"
+          grep -Fx 'Pkg.BuildId=15917651' "$emulator/source.properties"
+          "$emulator/emulator" -version > build/android-runtime-results/tool-versions.txt
+          printf '\nNDK: 29.0.14206865; command-line tools: 22.0; build-tools: 35.0.0\n' \
+            >> build/android-runtime-results/tool-versions.txt
+          cat "$ANDROID_HOME/system-images/android-35/google_apis/x86_64/source.properties" \
+            >> build/android-runtime-results/tool-versions.txt
+          keytool -genkeypair -keystore "$RUNNER_TEMP/laiue-ci-debug.p12" \
+            -storetype PKCS12 -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname 'CN=Android Debug,O=Android,C=US'
+      - name: Build and sign the native test APK
+        timeout-minutes: 8
+        run: |
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          cmake --preset android-x86_64-walk-api35 \
+            -DLAIUE_ANDROID_AAPT2="$tools/aapt2" \
+            -DLAIUE_ANDROID_ZIPALIGN="$tools/zipalign" \
+            -DLAIUE_ANDROID_APKSIGNER="$tools/apksigner" \
+            -DLAIUE_ANDROID_FRAMEWORK_JAR="$ANDROID_HOME/platforms/android-35/android.jar" \
+            -DLAIUE_ANDROID_KEYSTORE="$RUNNER_TEMP/laiue-ci-debug.p12"
+          cmake --build build/android-x86_64-walk-api35 --config Release \
+            --target laiue_walk_android_apk --parallel
+      - name: Boot the emulator with software Vulkan
+        id: emulator
+        timeout-minutes: 4
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator/emulator"
+          timeout 15s "$emulator" -accel-check
+          printf 'no\n' | "$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin/avdmanager" \
+            create avd --force --name laiue-ci-api35 --device nexus_6 \
+            --package 'system-images;android-35;google_apis;x86_64'
+          cat >> "$ANDROID_AVD_HOME/laiue-ci-api35.avd/config.ini" <<'CONFIG'
+          hw.lcd.width=1080
+          hw.lcd.height=1920
+          hw.lcd.density=420
+          CONFIG
+          setsid timeout --signal=TERM --kill-after=10s 600s "$emulator" \
+            -avd laiue-ci-api35 -no-snapshot -no-boot-anim -no-audio -no-window \
+            -gpu swiftshader -accel on -port 5554 -cores 2 -memory 2048 \
+            > build/android-runtime-results/emulator.log 2>&1 &
+          printf '%s\n' "$!" > "$RUNNER_TEMP/laiue-emulator.pid"
+          adb="$ANDROID_HOME/platform-tools/adb"
+          timeout 180s "$adb" -s emulator-5554 wait-for-device
+          boot_deadline=$((SECONDS + 150))
+          until [ "$(timeout 10s "$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1 ]; do
+            if [ "$SECONDS" -ge "$boot_deadline" ]; then
+              cat build/android-runtime-results/emulator.log
+              exit 1
+            fi
+            sleep 2
+          done
+          timeout 10s "$adb" -s emulator-5554 shell input keyevent KEYCODE_WAKEUP
+          timeout 10s "$adb" -s emulator-5554 shell wm dismiss-keyguard
+      - name: Verify native Android gameplay, rotation and resume
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          ./tools/test_android_walk.ps1 `
+            -AdbPath "$env:ANDROID_HOME/platform-tools/adb" `
+            -Serial emulator-5554 `
+            -Apk build/android-x86_64-walk-api35/android/Release/laiue-walk.apk `
+            -FrameCheckExe build/android-emulator-host/bin/Release/laiue_frame_check `
+            -OutputDir build/android-runtime-results/captures `
+            -TimeoutSeconds 240
+      - name: Stop the owned emulator process group
+        if: always()
+        timeout-minutes: 1
+        run: |
+          pid_file="$RUNNER_TEMP/laiue-emulator.pid"
+          if [ -f "$pid_file" ]; then
+            emulator_pid="$(cat "$pid_file")"
+            if [[ ! "$emulator_pid" =~ ^[0-9]+$ ]]; then exit 1; fi
+            if kill -0 -- "-$emulator_pid" 2>/dev/null; then
+              kill -TERM -- "-$emulator_pid"
+            fi
+          fi
+      - name: Upload Android runtime captures and diagnostics
+        if: always() && steps.prepare-runtime.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: laiue-walk-android-api35
+          path: build/android-runtime-results
+          if-no-files-found: error
+      - name: Verify runtime checks did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
             -P tools/verify_source_tree.cmake
