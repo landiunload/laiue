@@ -161,10 +161,11 @@ uint32_t WalkScenarioAnalyzeRGBA8(const uint8_t *rgba, size_t byteCount, uint32_
     if (outImage == NULL)
         return 0u;
     *outImage = (WalkScenarioImage){0};
-    if (rgba == NULL || width == 0u || height == 0u || (size_t)width > SIZE_MAX / 4u)
+    if (rgba == NULL || width == 0u || height == 0u)
         return 0u;
     const size_t rowBytes = (size_t)width * 4u;
-    if (rowStride < rowBytes || (size_t)(height - 1u) > (SIZE_MAX - rowBytes) / rowStride)
+    if (rowBytes / 4u != width || rowStride < rowBytes ||
+        (size_t)(height - 1u) > (SIZE_MAX - rowBytes) / rowStride)
         return 0u;
     const size_t required = (size_t)(height - 1u) * rowStride + rowBytes;
     if (byteCount < required)
