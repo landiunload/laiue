@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.28)
 
+if(POLICY CMP0156)
+    # Apple/Windows/LLD can resolve earlier archives without repeating them.
+    # Repetition on Apple's linker is a warning, fatal in the strict profile.
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
+
 if(POLICY CMP0184)
     cmake_policy(SET CMP0184 NEW)
     set(CMAKE_MSVC_RUNTIME_CHECKS "")
