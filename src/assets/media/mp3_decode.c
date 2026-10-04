@@ -196,25 +196,6 @@ static Mp3Status Mp3ParseHeader(const uint8_t *bytes, uint32_t available, Mp3Hea
 
 // === Теги ===
 
-static uint32_t Mp3SkipId3(const uint8_t *bytes, uint32_t sizeBytes)
-{
-    uint32_t offset = 0u;
-    while (offset + 10u <= sizeBytes && bytes[offset] == 'I' && bytes[offset + 1u] == 'D' &&
-           bytes[offset + 2u] == '3')
-    {
-        // Размер записан семью битами в байте, чтобы не столкнуться с
-        // синхрословом кадра.
-        uint32_t size = ((uint32_t)(bytes[offset + 6u] & 0x7Fu) << 21) |
-                        ((uint32_t)(bytes[offset + 7u] & 0x7Fu) << 14) |
-                        ((uint32_t)(bytes[offset + 8u] & 0x7Fu) << 7) |
-                        (uint32_t)(bytes[offset + 9u] & 0x7Fu);
-        uint32_t total = 10u + size + (((bytes[offset + 5u] & 0x10u) != 0u) ? 10u : 0u);
-        if (total > sizeBytes - offset) return sizeBytes;
-        offset += total;
-    }
-    return offset;
-}
-
 // Кадр Xing или Info не содержит звука: он несёт длину потока и, если
 // файл писал LAME, задержку кодировщика. Возвращает true, если кадр
 // служебный, и заполняет задержку с хвостом.
@@ -279,23 +260,59 @@ const char *Mp3StatusText(Mp3Status status)
     return "unknown error";
 }
 
+static bool Mp3MemoryRead(void *context, uint64_t offset, void *bytes, uint32_t count)
+{
+    const uint8_t *source = (const uint8_t *)context + (size_t)offset;
+    uint8_t *target = (uint8_t *)bytes;
+    for (uint32_t index = 0u; index < count; ++index)
+        target[index] = source[index];
+    return true;
+}
+
 Mp3Status Mp3Inspect(const void *bytes, uint32_t sizeBytes, Mp3Info *outInfo)
 {
-    if (bytes == NULL || outInfo == NULL) return MP3_INVALID_ARGUMENT;
-    const uint8_t *file = (const uint8_t *)bytes;
+    if (bytes == NULL)
+        return MP3_INVALID_ARGUMENT;
+    SoundReader reader = {(void *)bytes, Mp3MemoryRead, sizeBytes};
+    return Mp3InspectReader(&reader, outInfo);
+}
 
-    uint32_t offset = Mp3SkipId3(file, sizeBytes);
+Mp3Status Mp3InspectReader(const SoundReader *reader, Mp3Info *outInfo)
+{
+    if (reader == NULL || reader->readAt == NULL || outInfo == NULL)
+        return MP3_INVALID_ARGUMENT;
+    if (reader->sizeBytes > UINT32_MAX)
+        return MP3_TOO_LARGE;
+    uint32_t sizeBytes = (uint32_t)reader->sizeBytes;
+    uint8_t frame[1441];
+    uint32_t offset = 0u;
+    while (sizeBytes - offset >= 10u)
+    {
+        if (!reader->readAt(reader->context, offset, frame, 10u))
+            return MP3_TRUNCATED;
+        if (frame[0] != 'I' || frame[1] != 'D' || frame[2] != '3')
+            break;
+        uint32_t tagSize =
+            10u +
+            (((uint32_t)(frame[6] & 127u) << 21) | ((uint32_t)(frame[7] & 127u) << 14) |
+             ((uint32_t)(frame[8] & 127u) << 7) | (frame[9] & 127u)) +
+            ((frame[5] & 16u) != 0u ? 10u : 0u);
+        if (tagSize > sizeBytes - offset)
+            return MP3_TRUNCATED;
+        offset += tagSize;
+    }
     // Инициализация для анализатора: он не видит, что заполнение
     // и успешный возврат разбора связаны.
     Mp3Header header = {0};
     Mp3Status status = MP3_NOT_RECOGNISED;
     // Между тегом и первым кадром попадается мусор; ищем синхрослово,
     // но недалеко, чтобы не принять за MP3 чужой файл.
-    uint32_t searchLimit = offset + 4096u;
-    if (searchLimit > sizeBytes) searchLimit = sizeBytes;
-    while (offset + 4u <= searchLimit)
+    uint32_t searchLimit = sizeBytes - offset > 4096u ? offset + 4096u : sizeBytes;
+    while (offset <= searchLimit && searchLimit - offset >= 4u)
     {
-        status = Mp3ParseHeader(file + offset, sizeBytes - offset, &header);
+        if (!reader->readAt(reader->context, offset, frame, 4u))
+            return MP3_TRUNCATED;
+        status = Mp3ParseHeader(frame, 4u, &header);
         if (status == MP3_OK || status == MP3_UNSUPPORTED_FEATURE) break;
         offset += 1u;
         status = MP3_NOT_RECOGNISED;
@@ -309,10 +326,13 @@ Mp3Status Mp3Inspect(const void *bytes, uint32_t sizeBytes, Mp3Info *outInfo)
     uint32_t firstAudio = offset;
     bool first = true;
 
-    while (cursor + 4u <= sizeBytes)
+    while (cursor <= sizeBytes && sizeBytes - cursor >= 4u)
     {
         Mp3Header current = {0};
-        if (Mp3ParseHeader(file + cursor, sizeBytes - cursor, &current) != MP3_OK) break;
+        if (!reader->readAt(reader->context, cursor, frame, 4u))
+            return MP3_TRUNCATED;
+        if (Mp3ParseHeader(frame, 4u, &current) != MP3_OK)
+            break;
         if (current.sampleRate != header.sampleRate ||
             current.channelCount != header.channelCount)
         {
@@ -320,12 +340,15 @@ Mp3Status Mp3Inspect(const void *bytes, uint32_t sizeBytes, Mp3Info *outInfo)
             // такого не переживёт, и молча взять первую половину хуже.
             return MP3_UNSUPPORTED_FEATURE;
         }
-        if (cursor + current.frameBytes > sizeBytes) break;   // обрезанный последний кадр
+        if (current.frameBytes > sizeBytes - cursor)
+            break; // обрезанный последний кадр
 
         if (first)
         {
             first = false;
-            if (Mp3ParseXing(file + cursor, current.frameBytes, &current, &delay, &padding))
+            if (!reader->readAt(reader->context, cursor, frame, current.frameBytes))
+                return MP3_TRUNCATED;
+            if (Mp3ParseXing(frame, current.frameBytes, &current, &delay, &padding))
             {
                 cursor += current.frameBytes;
                 firstAudio = cursor;
@@ -1207,4 +1230,127 @@ Mp3Status Mp3DecodeSamples(const void *bytes, uint32_t sizeBytes, const Mp3Info 
 
     if (produced == 0u) return MP3_TRUNCATED;
     return MP3_OK;
+}
+
+/* Incremental state reuses the exact reservoir, overlap, synthesis and
+ * frameOutput used by Mp3DecodeSamples. No track-sized index or PCM. */
+typedef struct Mp3StreamState
+{
+    Mp3State decoder;
+    SoundReader reader;
+    Mp3Info info;
+    uint32_t cursor;
+    uint32_t decoded;
+    uint32_t position;
+    uint32_t bufferedOffset;
+    uint32_t bufferedFrames;
+    uint8_t packet[1441];
+} Mp3StreamState;
+
+uint32_t Mp3StreamScratchBytes(void)
+{
+    return (uint32_t)sizeof(Mp3StreamState);
+}
+
+Mp3Status Mp3StreamInitialize(const SoundReader *reader, const Mp3Info *info, void *scratch,
+                              uint32_t scratchBytes)
+{
+    if (reader == NULL || reader->readAt == NULL || info == NULL || scratch == NULL)
+        return MP3_INVALID_ARGUMENT;
+    if (scratchBytes < sizeof(Mp3StreamState))
+        return MP3_BUFFER_TOO_SMALL;
+    Mp3StreamState *stream = (Mp3StreamState *)scratch;
+    uint8_t *raw = (uint8_t *)scratch;
+    for (uint32_t index = 0u; index < sizeof(*stream); ++index)
+        raw[index] = 0u;
+    stream->reader = *reader;
+    stream->info = *info;
+    stream->cursor = info->firstFrameOffset;
+    stream->decoder.pow43Root = 1.0;
+    return MP3_OK;
+}
+
+Mp3Status Mp3StreamRead(void *scratch, int16_t *samples, uint32_t frameCapacity,
+                        uint32_t *outFrames)
+{
+    if (scratch == NULL || samples == NULL || outFrames == NULL)
+        return MP3_INVALID_ARGUMENT;
+    *outFrames = 0u;
+    Mp3StreamState *stream = (Mp3StreamState *)scratch;
+    while (*outFrames < frameCapacity && stream->position < stream->info.frameCount)
+    {
+        if (stream->bufferedFrames == 0u)
+        {
+            if (stream->decoded >= stream->info.decodedFrames)
+                return MP3_TRUNCATED;
+            if (stream->cursor > stream->reader.sizeBytes ||
+                stream->reader.sizeBytes - stream->cursor < 4u ||
+                !stream->reader.readAt(stream->reader.context, stream->cursor, stream->packet, 4u))
+                return MP3_TRUNCATED;
+            Mp3Header header = {0};
+            Mp3Status status = Mp3ParseHeader(stream->packet, 4u, &header);
+            if (status != MP3_OK)
+                return status;
+            if (header.channelCount != stream->info.channelCount ||
+                header.sampleRate != stream->info.sampleRate)
+                return MP3_CORRUPT;
+            if (header.frameBytes > stream->reader.sizeBytes - stream->cursor ||
+                !stream->reader.readAt(stream->reader.context, stream->cursor, stream->packet,
+                                       header.frameBytes))
+                return MP3_TRUNCATED;
+            status = Mp3DecodeFrame(&stream->decoder, stream->packet, &header,
+                                    stream->decoder.frameOutput);
+            if (status != MP3_OK)
+                return status;
+            stream->cursor += header.frameBytes;
+            uint32_t skip = stream->decoded < stream->info.skipFrames
+                                ? stream->info.skipFrames - stream->decoded
+                                : 0u;
+            if (skip > MP3_FRAME_SAMPLES)
+                skip = MP3_FRAME_SAMPLES;
+            stream->decoded += MP3_FRAME_SAMPLES;
+            stream->bufferedOffset = skip;
+            stream->bufferedFrames = MP3_FRAME_SAMPLES - skip;
+            if (stream->bufferedFrames == 0u)
+                continue;
+        }
+        uint32_t count = frameCapacity - *outFrames;
+        if (count > stream->bufferedFrames)
+            count = stream->bufferedFrames;
+        if (count > stream->info.frameCount - stream->position)
+            count = stream->info.frameCount - stream->position;
+        for (uint32_t index = 0u; index < count * stream->info.channelCount; ++index)
+            samples[*outFrames * stream->info.channelCount + index] =
+                stream->decoder
+                    .frameOutput[stream->bufferedOffset * stream->info.channelCount + index];
+        *outFrames += count;
+        stream->position += count;
+        stream->bufferedOffset += count;
+        stream->bufferedFrames -= count;
+    }
+    return MP3_OK;
+}
+
+Mp3Status Mp3StreamSeek(void *scratch, uint32_t frame)
+{
+    if (scratch == NULL)
+        return MP3_INVALID_ARGUMENT;
+    Mp3StreamState *stream = (Mp3StreamState *)scratch;
+    if (frame > stream->info.frameCount)
+        return MP3_INVALID_ARGUMENT;
+    SoundReader reader = stream->reader;
+    Mp3Info info = stream->info;
+    Mp3Status status = Mp3StreamInitialize(&reader, &info, scratch, sizeof(*stream));
+    int16_t discard[256u * 2u];
+    while (status == MP3_OK && stream->position < frame)
+    {
+        uint32_t count = frame - stream->position;
+        if (count > 256u)
+            count = 256u;
+        uint32_t read = 0u;
+        status = Mp3StreamRead(stream, discard, count, &read);
+        if (status == MP3_OK && read != count)
+            return MP3_TRUNCATED;
+    }
+    return status;
 }

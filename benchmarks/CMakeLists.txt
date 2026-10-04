@@ -720,3 +720,27 @@ target_include_directories(laiue_ragdoll_benchmark PRIVATE
     "${PROJECT_SOURCE_DIR}/tests")
 laiue_configure_standalone_executable(
     laiue_ragdoll_benchmark RagdollBenchmarkEntryPoint)
+
+# Manual collision query timings for one-box and 64-box model instances.
+if(TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_query_benchmark EXCLUDE_FROM_ALL
+        mesh_world_query_benchmark.c)
+    target_link_libraries(laiue_mesh_world_query_benchmark PRIVATE laiue_mesh_world)
+    target_include_directories(laiue_mesh_world_query_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests" "${PROJECT_SOURCE_DIR}/src/simulation"
+        "${PROJECT_SOURCE_DIR}/src/modding")
+    target_compile_definitions(laiue_mesh_world_query_benchmark PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(laiue_mesh_world_query_benchmark
+        MeshWorldQueryBenchmarkEntryPoint)
+endif()
+
+# Manual comparison of ready PCM and bounded WAV decode + offscreen mix.
+if(TARGET laiue_audio)
+    add_executable(laiue_audio_stream_benchmark EXCLUDE_FROM_ALL
+        audio_stream_benchmark.c)
+    target_link_libraries(laiue_audio_stream_benchmark PRIVATE laiue_audio)
+    target_include_directories(laiue_audio_stream_benchmark PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests")
+    laiue_configure_standalone_executable(
+        laiue_audio_stream_benchmark AudioStreamBenchmarkEntryPoint)
+endif()

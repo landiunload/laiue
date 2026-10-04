@@ -72,8 +72,11 @@ typedef struct LaiueMeshWorldRendererConfigV1
     const LaiueMeshWorldServiceV1 *worldService;
     LaiueMeshWorldV1 *world;
     LaiueGraphicsDeviceV2 *device;
-    /* Vertex buffers the renderer may hold at once; 0 selects 1024.  Cells
-     * beyond the budget are left undrawn, farthest first. */
+    /* Cached vertex buffers; 0 selects 1024. Cells beyond the budget are
+     * left undrawn,
+     * farthest first. A transactional rebuild briefly holds
+     * its replacement buffers as well,
+     * so a failed upload keeps the cache. */
     uint32_t maximumBuffers;
 } LaiueMeshWorldRendererConfigV1;
 
@@ -84,8 +87,8 @@ typedef struct LaiueMeshRenderStatsV1
     uint32_t buffers;    /* vertex buffers held */
     uint64_t vertices;   /* vertices held */
     uint32_t rebuilt;    /* cells rebuilt by the last update */
-    uint32_t pending;    /* cells waiting for a rebuild after the last update */
-    uint32_t overBudget; /* cells the buffer budget left undrawn */
+    uint32_t pending;    /* rebuild backlog (cell budget/failure), excluding overBudget */
+    uint32_t overBudget; /* cells evicted or refused a rebuild by the buffer budget */
     uint32_t drawn;      /* draw items written by the last draws call */
     uint32_t culled;     /* cells the frustum rejected in the last draws call */
 } LaiueMeshRenderStatsV1;
@@ -111,14 +114,20 @@ typedef struct LaiueMeshWorldRenderServiceV1
     /* Keeps the cells within radius of camera current: rebuilds changed
      * cells nearest first, at most cellBudget per call (0 means no limit),
      * and releases cells that left the radius.  outPending, when not NULL,
-     * receives the number of cells still waiting. */
+     * receives the rebuild backlog; cells excluded by maximumBuffers are
+     * counted separately
+     * in stats.overBudget. */
     uint32_t (*update)(LaiueMeshWorldRendererV1 *renderer, const LaiueMeshPositionV1 *camera,
                        float radius, uint32_t cellBudget, uint32_t *outPending);
     /* Draw items relative to renderOrigin, the point the camera's
      * view-projection is built around.  viewProjection, when not NULL, culls
      * cells outside the frustum (row-major, clip = position * matrix, depth
      * 0..1, the convention of the scene math module).  outCount receives the
-     * full number. */
+     * full number. Origins must have finite local offsets and cell coordinates
+     * within
+     * +-LAIUE_MESH_WORLD_MAX_CELL; every supplied matrix value must be
+     * finite. Invalid
+     * inputs fail with outCount zero. */
     uint32_t (*draws)(LaiueMeshWorldRendererV1 *renderer, const LaiueMeshPositionV1 *renderOrigin,
                       const float viewProjection[16], LaiueGraphicsDrawItemV2 *outItems,
                       uint32_t capacity, uint32_t *outCount);

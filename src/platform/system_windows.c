@@ -518,6 +518,80 @@ bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void
     return true;
 }
 
+bool PlatformFileOpenRead(const char *path, PlatformReadFile *outFile, uint64_t *outSize)
+{
+    if (outSize != NULL)
+        *outSize = 0u;
+    if (path == NULL || outFile == NULL || outSize == NULL || outFile->opaque[0] != 0u)
+        return false;
+    uint32_t length = 0u;
+    while (length < LAIUE_PLATFORM_PATH_CAPACITY * 4u && path[length] != '\0')
+        ++length;
+    if (length == LAIUE_PLATFORM_PATH_CAPACITY * 4u)
+        return false;
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    if (!PlatformUtf8ToWide(path, length, wide, LAIUE_PLATFORM_PATH_CAPACITY, NULL))
+        return false;
+    HANDLE native = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (native == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    LARGE_INTEGER size;
+    if (GetFileType(native) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(native, &information) ||
+        (information.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+        !GetFileSizeEx(native, &size) || size.QuadPart < 0)
+    {
+        CloseHandle(native);
+        return false;
+    }
+    outFile->opaque[0] = (uintptr_t)native;
+    outFile->opaque[1] = 0u;
+    *outSize = (uint64_t)size.QuadPart;
+    return true;
+}
+
+bool PlatformFileReadAt(PlatformReadFile *file, uint64_t offset, void *buffer, uint32_t count,
+                        uint32_t *outRead)
+{
+    if (outRead != NULL)
+        *outRead = 0u;
+    if (file == NULL || file->opaque[0] == 0u || outRead == NULL ||
+        (count != 0u && buffer == NULL) || offset > INT64_MAX || count > INT64_MAX - offset)
+        return false;
+    HANDLE native = (HANDLE)file->opaque[0];
+    LARGE_INTEGER position;
+    position.QuadPart = (int64_t)offset;
+    if (!SetFilePointerEx(native, position, NULL, FILE_BEGIN))
+        return false;
+    uint32_t completed = 0u;
+    while (completed < count)
+    {
+        DWORD part = count - completed;
+        if (part > 0x7ffff000u)
+            part = 0x7ffff000u;
+        DWORD read = 0u;
+        if (!ReadFile(native, (uint8_t *)buffer + completed, part, &read, NULL))
+            return false;
+        if (read == 0u)
+            break;
+        completed += read;
+    }
+    *outRead = completed;
+    return true;
+}
+
+void PlatformFileClose(PlatformReadFile *file)
+{
+    if (file == NULL)
+        return;
+    if (file->opaque[0] != 0u)
+        CloseHandle((HANDLE)file->opaque[0]);
+    memset(file, 0, sizeof(*file));
+}
+
 bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
                              uint64_t size)
 {

@@ -705,6 +705,81 @@ static bool WriteAll(int file, const void *bytes, uint64_t size)
     return true;
 }
 
+bool PlatformFileOpenRead(const char *path, PlatformReadFile *outFile, uint64_t *outSize)
+{
+    if (outSize != NULL)
+        *outSize = 0u;
+    if (path == NULL || outFile == NULL || outSize == NULL || outFile->opaque[0] != 0u)
+        return false;
+    int native;
+    do
+    {
+        native = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    } while (native < 0 && errno == EINTR);
+    if (native < 0)
+        return false;
+    struct stat status;
+    int result;
+    do
+    {
+        result = fstat(native, &status);
+    } while (result < 0 && errno == EINTR);
+    if (result != 0 || !S_ISREG(status.st_mode) || status.st_size < 0)
+    {
+        close(native);
+        return false;
+    }
+    outFile->opaque[0] = (uintptr_t)native + 1u;
+    outFile->opaque[1] = 0u;
+    *outSize = (uint64_t)status.st_size;
+    return true;
+}
+
+bool PlatformFileReadAt(PlatformReadFile *file, uint64_t offset, void *buffer, uint32_t count,
+                        uint32_t *outRead)
+{
+    if (outRead != NULL)
+        *outRead = 0u;
+    if (file == NULL || file->opaque[0] == 0u || outRead == NULL ||
+        (count != 0u && buffer == NULL) || offset > INT64_MAX || count > INT64_MAX - offset)
+        return false;
+    /* A port with a narrow off_t rejects unrepresentable offsets instead of
+     * truncating them.
+     * Native 64-bit/mobile targets all have 64-bit off_t. */
+    const uint64_t end = offset + count;
+    if ((off_t)offset < 0 || (uint64_t)(off_t)offset != offset || (off_t)end < 0 ||
+        (uint64_t)(off_t)end != end)
+        return false;
+    const int native = (int)(file->opaque[0] - 1u);
+    uint32_t completed = 0u;
+    while (completed < count)
+    {
+        uint32_t part = count - completed;
+        if (part > 0x7ffff000u)
+            part = 0x7ffff000u;
+        const ssize_t read =
+            pread(native, (uint8_t *)buffer + completed, part, (off_t)(offset + completed));
+        if (read < 0 && errno == EINTR)
+            continue;
+        if (read < 0)
+            return false;
+        if (read == 0)
+            break;
+        completed += (uint32_t)read;
+    }
+    *outRead = completed;
+    return true;
+}
+
+void PlatformFileClose(PlatformReadFile *file)
+{
+    if (file == NULL)
+        return;
+    if (file->opaque[0] != 0u)
+        close((int)(file->opaque[0] - 1u));
+    memset(file, 0, sizeof(*file));
+}
+
 bool PlatformWriteEntireFile(const wchar_t *path, const void *bytes, uint64_t size)
 {
     char nativePath[LAIUE_PLATFORM_PATH_CAPACITY * 4U];

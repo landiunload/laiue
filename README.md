@@ -40,8 +40,8 @@ runtime-сервисы с единым C ABI.
 | `world` | `InfiniteCoord`, rebasing, базовый provider и разреженные правки |
 | `physics` | переносимые AABB и столкновения с вокселями |
 | `mod` | discovery, ABI v1, versioned services и жизненный цикл нативных модов |
-| `window`, `input` | Windows-окно и Raw Input |
-| `audio` | PCM-микшер и offscreen provider; системный вывод вынесен в `audio_output`, звукопаки — в `audio_pack` |
+| `window`, `input` | Win32/Raw Input и Linux X11: окно, клавиатура, мышь |
+| `audio` | PCM-микшер, потоковые WAV/MP3, пауза и перемотка; системный вывод вынесен в `audio_output`, звукопаки — в `audio_pack` |
 | `mesh` | greedy meshing чанков `64³` |
 | `render` | Direct3D 12 или Vulkan, GPU-меши, текстуры и шейдеры |
 | `graphics_d3d12`, `graphics_vulkan` | самостоятельные альтернативные providers общего Graphics ABI; выбираются профилем |
@@ -51,6 +51,8 @@ runtime-сервисы с единым C ABI.
 | `voxel_raycast` | переносимый raycast по World без renderer |
 | `model` | provider `laiue.model`: паки моделей `.lop`, OBJ и `.lo`, только геометрия — см. [docs/modelpacks.md](docs/modelpacks.md) |
 | `mesh_world` | provider `laiue.mesh_world`: бесконечный мир из моделей без вокселей и чанков, запросы, столкновения и поставщик ячеек — см. [docs/mesh_world.md](docs/mesh_world.md) |
+| `mesh_world_render` | переносимый адаптер моделей к устройству графики V2: батчи по материалам, освещение, отсечение и ограниченный кэш — см. [docs/mesh_world_render.md](docs/mesh_world_render.md) |
+| `animation` | паки `.lk`/`.lkp`, каналы TRS, скалярные и покадровые анимации, скелетные позы и CPU skinning — см. [docs/animationpacks.md](docs/animationpacks.md) |
 | `ui` | immediate-mode UI поверх renderer |
 
 Публичные header-only контракты `graphics/graphics_api.h`,

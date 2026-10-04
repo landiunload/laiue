@@ -34,6 +34,9 @@ if(LAIUE_BUILD_AUDIO)
         RUNTIME_ROLE CORE
         SOURCES
             audio_mixer.c
+            audio_stream.c
+            audio_stream.h
+            audio_stream_internal.h
             audio_mixer_internal.h
             audio_offscreen.c
             audio_offscreen.h
@@ -45,6 +48,7 @@ if(LAIUE_BUILD_AUDIO)
             ../api.h
         LINK
             laiue::math_support
+            laiue::media_support
     )
 endif()
 

@@ -40,6 +40,16 @@ typedef struct PlatformThread
     uintptr_t storage[2];
 } PlatformThread;
 
+/* Zero-initialize before opening. The descriptor belongs to its caller and
+ * must not be copied or
+ * used concurrently. Reads never allocate file-sized
+ * storage. Close is also safe for a
+ * zeroed/already closed descriptor. */
+typedef struct PlatformReadFile
+{
+    uintptr_t opaque[2];
+} PlatformReadFile;
+
 /* Возвращаемое значение доходит только до PlatformThreadJoin; сообщать об
  * ошибке рабочему потоку следует через собственное состояние. */
 typedef uint32_t (*PlatformThreadEntry)(void *context);
@@ -144,6 +154,17 @@ bool PlatformMoveReplace(const wchar_t* source, const wchar_t* destination);
 bool PlatformValidatePrivateKeyFile(const wchar_t* path);
 bool PlatformReadEntireFile(const wchar_t* path, uint64_t maximumBytes,
                             uint8_t** outBytes, uint64_t* outSize);
+/* UTF-8 path; accepts only regular files, rejects final-component links.
+ * outSize is sampled at
+ * open, not a concurrent-write snapshot. ReadAt fills
+ * count bytes unless EOF intervenes; EOF is
+ * success with a short outRead.
+ * On error outRead is zero and buffer contents may be partially
+ * changed. */
+bool PlatformFileOpenRead(const char *path, PlatformReadFile *outFile, uint64_t *outSize);
+bool PlatformFileReadAt(PlatformReadFile *file, uint64_t offset, void *buffer, uint32_t count,
+                        uint32_t *outRead);
+void PlatformFileClose(PlatformReadFile *file);
 /* Reads min(fileSize, capacity) bytes into caller-owned storage without allocating
  * a file-sized buffer. Both output pointers are required; they are zeroed on
  * failure when non-NULL. A NULL buffer is allowed only for capacity == 0.

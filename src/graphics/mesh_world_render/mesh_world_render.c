@@ -50,8 +50,10 @@ typedef struct RenderCell
     uint64_t revision;
     uint32_t generation;
     uint32_t built;
+    uint32_t budgetExcluded;
     RenderBatch *batches;
     uint32_t batchCount;
+    double distanceSquared;
     float boundsMin[3];
     float boundsMax[3];
 } RenderCell;
@@ -117,6 +119,17 @@ static bool FiniteFloat(float value)
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
     return (bits & UINT32_C(0x7F800000)) != UINT32_C(0x7F800000);
+}
+
+static bool PositionValid(const LaiueMeshPositionV1 *position)
+{
+    return position != NULL && position->cell.x >= -LAIUE_MESH_WORLD_MAX_CELL &&
+           position->cell.x <= LAIUE_MESH_WORLD_MAX_CELL &&
+           position->cell.y >= -LAIUE_MESH_WORLD_MAX_CELL &&
+           position->cell.y <= LAIUE_MESH_WORLD_MAX_CELL &&
+           position->cell.z >= -LAIUE_MESH_WORLD_MAX_CELL &&
+           position->cell.z <= LAIUE_MESH_WORLD_MAX_CELL && FiniteFloat(position->local[0]) &&
+           FiniteFloat(position->local[1]) && FiniteFloat(position->local[2]);
 }
 
 static bool CellEqual(const LaiueMeshCellV1 *left, const LaiueMeshCellV1 *right)
@@ -232,8 +245,13 @@ static uint32_t RendererCreate(const LaiueMeshWorldRendererConfigV1 *config,
     if (config == NULL || config->structSize < sizeof(LaiueMeshWorldRendererConfigV1) ||
         config->worldService == NULL ||
         config->worldService->structSize < sizeof(LaiueMeshWorldServiceV1) ||
+        config->worldService->abiVersion != LAIUE_MESH_WORLD_SERVICE_ABI_VERSION_1 ||
+        config->worldService->cellSize == NULL || config->worldService->queryCells == NULL ||
+        config->worldService->cellInstances == NULL || config->worldService->cellRevision == NULL ||
         config->world == NULL || config->device == NULL ||
-        config->device->structSize < sizeof(LaiueGraphicsDeviceV2) ||
+        config->device->structSize < offsetof(LaiueGraphicsDeviceV2, destroyHandle) +
+                                         sizeof(config->device->destroyHandle) ||
+        config->device->abiVersion != LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION ||
         config->device->createBuffer == NULL || config->device->uploadBuffer == NULL ||
         config->device->destroyHandle == NULL ||
         config->maximumBuffers > RENDER_MAXIMUM_BUFFERS_LIMIT)
@@ -248,6 +266,12 @@ static uint32_t RendererCreate(const LaiueMeshWorldRendererConfigV1 *config,
     renderer->maximumBuffers =
         config->maximumBuffers == 0u ? RENDER_DEFAULT_MAXIMUM_BUFFERS : config->maximumBuffers;
     renderer->cellSize = config->worldService->cellSize(config->world);
+    if (!FiniteFloat(renderer->cellSize) || renderer->cellSize < 1.0f ||
+        renderer->cellSize > 4096.0f)
+    {
+        PlatformFree(renderer);
+        return 0u;
+    }
     renderer->generation = 1u;
     /* A sun high in the south-east and a soft sky: readable shapes before
      * the application chooses its own light. */
@@ -330,13 +354,20 @@ static uint32_t RendererRegisterModel(LaiueMeshWorldRendererV1 *renderer, uint32
     copy.indices = (uint32_t *)PlatformAllocate(sizeof(uint32_t) * copy.indexCount, false);
     copy.parts = (LaiueMeshRenderPartV1 *)PlatformAllocate(
         sizeof(LaiueMeshRenderPartV1) * copy.partCount, false);
+    if (copy.vertices == NULL || copy.indices == NULL || copy.parts == NULL)
+    {
+        PlatformFree(copy.vertices);
+        PlatformFree(copy.indices);
+        PlatformFree(copy.parts);
+        return 0u;
+    }
     bool found = false;
     const uint32_t index = FindModelIndex(renderer, model, &found);
     RenderModel *grown =
         found ? renderer->models
               : (RenderModel *)GrowArray(renderer->models, &renderer->modelCapacity,
                                          renderer->modelCount + 1u, sizeof(RenderModel));
-    if (copy.vertices == NULL || copy.indices == NULL || copy.parts == NULL || grown == NULL)
+    if (grown == NULL)
     {
         PlatformFree(copy.vertices);
         PlatformFree(copy.indices);
@@ -411,9 +442,11 @@ static uint32_t RendererSetLighting(LaiueMeshWorldRendererV1 *renderer,
             !FiniteFloat(lighting->ambientColor[axis]) || lighting->sunColor[axis] < 0.0f ||
             lighting->ambientColor[axis] < 0.0f)
             return 0u;
+        if (!FiniteFloat(lighting->sunColor[axis] + lighting->ambientColor[axis]))
+            return 0u;
         lengthSquared += lighting->toSun[axis] * lighting->toSun[axis];
     }
-    if (!(lengthSquared > 1.0e-12f))
+    if (!(lengthSquared > 1.0e-12f) || !FiniteFloat(lengthSquared))
         return 0u;
     const float inverse = 1.0f / ScalarSqrt(lengthSquared);
     for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -491,6 +524,8 @@ static bool AppendInstance(LaiueMeshWorldRendererV1 *renderer, const RenderModel
                                    rotation[r][1] * scaled[1] + rotation[r][2] * scaled[2];
                 normal[r] =
                     rotation[r][0] * bent[0] + rotation[r][1] * bent[1] + rotation[r][2] * bent[2];
+                if (!FiniteFloat(out->position[r]) || !FiniteFloat(normal[r]))
+                    return false;
                 if (*firstVertex || out->position[r] < boundsMin[r])
                     boundsMin[r] = out->position[r];
                 if (*firstVertex || out->position[r] > boundsMax[r])
@@ -499,6 +534,8 @@ static bool AppendInstance(LaiueMeshWorldRendererV1 *renderer, const RenderModel
             *firstVertex = false;
             const float lengthSquared =
                 normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+            if (!FiniteFloat(lengthSquared))
+                return false;
             float facing = 1.0f;
             if (lengthSquared > 1.0e-12f)
                 facing = (normal[0] * renderer->toSun[0] + normal[1] * renderer->toSun[1] +
@@ -506,6 +543,8 @@ static bool AppendInstance(LaiueMeshWorldRendererV1 *renderer, const RenderModel
                          ScalarSqrt(lengthSquared);
             if (facing < 0.0f)
                 facing = 0.0f;
+            if (facing > 1.0f)
+                facing = 1.0f;
             out->uv[0] = source->uv[0];
             out->uv[1] = source->uv[1];
             const uint32_t color = source->colorRGBA;
@@ -572,8 +611,25 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
     uint32_t needed = 0u;
     for (uint32_t i = 0u; i < renderer->accumulatorCount; ++i)
         needed += renderer->accumulators[i].count != 0u ? 1u : 0u;
-    if (renderer->bufferCount - cell->batchCount + needed > renderer->maximumBuffers)
+    /* Cached distant cells must not monopolize the budget when the camera
+     * approaches an
+     * unbuilt cell. Check availability without changing the
+     * cache: a failed GPU upload must
+     * leave the old buffers intact. */
+    uint32_t available = renderer->maximumBuffers - renderer->bufferCount + cell->batchCount;
+    for (uint32_t i = 0u; i < renderer->cellCount && available < needed; ++i)
+    {
+        const RenderCell *other = &renderer->cells[i];
+        if (other->distanceSquared > cell->distanceSquared ||
+            (other->distanceSquared == cell->distanceSquared &&
+             CompareCells(&other->coord, &cell->coord) > 0))
+            available += other->batchCount;
+    }
+    if (available < needed)
+    {
+        cell->budgetExcluded = 1u;
         return RENDER_BUILD_OVER_BUDGET;
+    }
 
     RenderBatch *batches = NULL;
     if (needed != 0u)
@@ -613,9 +669,27 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
         batches[created].buffer = buffer;
         ++created;
     }
+    while (renderer->bufferCount - cell->batchCount + created > renderer->maximumBuffers)
+    {
+        RenderCell *farthest = NULL;
+        for (uint32_t i = 0u; i < renderer->cellCount; ++i)
+        {
+            RenderCell *other = &renderer->cells[i];
+            if (other == cell || other->batchCount == 0u)
+                continue;
+            if (farthest == NULL || other->distanceSquared > farthest->distanceSquared ||
+                (other->distanceSquared == farthest->distanceSquared &&
+                 CompareCells(&other->coord, &farthest->coord) > 0))
+                farthest = other;
+        }
+        ReleaseBatches(renderer, farthest);
+        farthest->built = 0u;
+        farthest->budgetExcluded = 1u;
+    }
     ReleaseBatches(renderer, cell);
     cell->batches = batches;
     cell->batchCount = created;
+    cell->budgetExcluded = 0u;
     for (uint32_t i = 0u; i < created; ++i)
         renderer->vertexCount += batches[i].vertexCount;
     renderer->bufferCount += created;
@@ -694,13 +768,15 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
 {
     if (outPending != NULL)
         *outPending = 0u;
-    if (renderer == NULL || camera == NULL || !FiniteFloat(radius) || radius < 0.0f ||
+    if (renderer == NULL || !PositionValid(camera) || !FiniteFloat(radius) || radius < 0.0f ||
         radius > RENDER_MAX_QUERY_RADIUS)
         return 0u;
     const LaiueMeshWorldServiceV1 *world = renderer->worldService;
     uint32_t count = 0u;
     if (world->queryCells(renderer->world, camera, radius, renderer->query, renderer->queryCapacity,
                           &count) == 0u)
+        return 0u;
+    if (count == UINT32_MAX)
         return 0u;
     if (count > renderer->queryCapacity)
     {
@@ -711,16 +787,21 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
         renderer->query = grown;
         if (world->queryCells(renderer->world, camera, radius, renderer->query,
                               renderer->queryCapacity, &count) == 0u ||
-            count > renderer->queryCapacity)
+            count > renderer->queryCapacity || count == UINT32_MAX)
             return 0u;
     }
 
     /* Merge the sorted cache with the sorted answer: cells that left the
-     * radius release their buffers, new ones join unbuilt. */
+     * radius release
+     * their buffers, new ones join unbuilt. */
+    if ((uint64_t)count + 1u > SIZE_MAX / sizeof(RenderCell))
+        return 0u;
     RenderCell *next = (RenderCell *)PlatformAllocate(sizeof(RenderCell) * (count + 1u), false);
+    if (next == NULL)
+        return 0u;
     RenderCandidate *candidates = (RenderCandidate *)GrowArray(
         renderer->candidates, &renderer->candidateCapacity, count + 1u, sizeof(RenderCandidate));
-    if (next == NULL || candidates == NULL)
+    if (candidates == NULL)
     {
         PlatformFree(next);
         return 0u;
@@ -755,9 +836,7 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
     for (uint32_t i = 0u; i < count; ++i)
     {
         RenderCell *cell = &renderer->cells[i];
-        if (cell->built != 0u && cell->generation == renderer->generation &&
-            cell->revision == world->cellRevision(renderer->world, &cell->coord))
-            continue;
+        cell->budgetExcluded = 0u;
         double distanceSquared = 0.0;
         const int64_t offsets[3] = {cell->coord.x - center.cell.x, cell->coord.y - center.cell.y,
                                     cell->coord.z - center.cell.z};
@@ -767,6 +846,10 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
                                   (double)center.local[axis];
             distanceSquared += metres * metres;
         }
+        cell->distanceSquared = distanceSquared;
+        if (cell->built != 0u && cell->generation == renderer->generation &&
+            cell->revision == world->cellRevision(renderer->world, &cell->coord))
+            continue;
         candidates[candidateCount].cell = i;
         candidates[candidateCount].distanceSquared = distanceSquared;
         ++candidateCount;
@@ -774,26 +857,25 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
     SortCandidates(candidates, candidateCount);
 
     uint32_t rebuilt = 0u;
-    uint32_t overBudget = 0u;
     uint32_t pending = 0u;
     uint32_t result = 1u;
     for (uint32_t i = 0u; i < candidateCount; ++i)
     {
         if (cellBudget != 0u && rebuilt >= cellBudget)
         {
-            pending = candidateCount - i;
+            for (uint32_t k = i; k < candidateCount; ++k)
+                pending += renderer->cells[candidates[k].cell].budgetExcluded == 0u ? 1u : 0u;
             break;
         }
         const RenderBuildResult built = BuildCell(renderer, &renderer->cells[candidates[i].cell]);
         if (built == RENDER_BUILD_FAILED)
         {
-            pending = candidateCount - i;
+            for (uint32_t k = i; k < candidateCount; ++k)
+                pending += renderer->cells[candidates[k].cell].budgetExcluded == 0u ? 1u : 0u;
             result = 0u;
             break;
         }
-        if (built == RENDER_BUILD_OVER_BUDGET)
-            ++overBudget;
-        else
+        if (built == RENDER_BUILD_OK)
             ++rebuilt;
     }
     renderer->stats.cells = renderer->cellCount;
@@ -801,7 +883,9 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
     renderer->stats.vertices = renderer->vertexCount;
     renderer->stats.rebuilt = rebuilt;
     renderer->stats.pending = pending;
-    renderer->stats.overBudget = overBudget;
+    renderer->stats.overBudget = 0u;
+    for (uint32_t i = 0u; i < renderer->cellCount; ++i)
+        renderer->stats.overBudget += renderer->cells[i].budgetExcluded != 0u ? 1u : 0u;
     if (outPending != NULL)
         *outPending = pending;
     return result;
@@ -849,9 +933,13 @@ static uint32_t RendererDraws(LaiueMeshWorldRendererV1 *renderer,
 {
     if (outCount != NULL)
         *outCount = 0u;
-    if (renderer == NULL || renderOrigin == NULL || outCount == NULL ||
+    if (renderer == NULL || !PositionValid(renderOrigin) || outCount == NULL ||
         (capacity != 0u && outItems == NULL))
         return 0u;
+    if (viewProjection != NULL)
+        for (uint32_t i = 0u; i < 16u; ++i)
+            if (!FiniteFloat(viewProjection[i]))
+                return 0u;
     float planes[6][4] = {{0.0f}};
     if (viewProjection != NULL)
         FrustumPlanes(viewProjection, planes);

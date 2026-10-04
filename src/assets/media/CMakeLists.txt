@@ -6,6 +6,8 @@
 # Ей пользуются и движок, и офлайн-инструменты: одна реализация вместо
 # двух, и та, что проверена тестами, идёт в обе стороны.
 add_library(laiue_media_support STATIC
+    animation.c
+    animation.h
     gif_decode.c
     gif_decode.h
     image.c

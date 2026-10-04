@@ -331,6 +331,18 @@ else()
     endif()
 endif()
 
+if(LAIUE_WARNINGS_AS_ERRORS)
+    # Compile flags alone do not cover duplicate symbols, incompatible
+    # libraries and other linker warnings. Keep the same policy at link.
+    if(MSVC)
+        target_link_options(laiue_build_options INTERFACE /WX)
+    elseif(APPLE)
+        target_link_options(laiue_build_options INTERFACE -Wl,-fatal_warnings)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+        target_link_options(laiue_build_options INTERFACE -Wl,--fatal-warnings)
+    endif()
+endif()
+
 # Windows no-CRT является отдельным opt-in контрактом. Linux-цели никогда не
 # наследуют /NODEFAULTLIB или собственные memcpy/memset.
 add_library(laiue_windows_no_crt INTERFACE)

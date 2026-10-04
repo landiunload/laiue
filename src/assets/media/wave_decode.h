@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "media/sound.h"
 
 // Разбор WAV (RIFF/WAVE) в 16-битные сэмплы. Им пользуются и движок,
 // читающий звукопак, и офлайн-конвертер, готовящий `.la` заранее: одна
@@ -48,6 +49,7 @@ typedef struct WaveInfo
 
 // Читает заголовок и находит данные, ничего не декодируя.
 WaveStatus WaveInspect(const void *bytes, uint32_t sizeBytes, WaveInfo *outInfo);
+WaveStatus WaveInspectReader(const SoundReader *reader, WaveInfo *outInfo);
 
 // Пишет frameCount * channelCount сэмплов, чередующихся по каналам.
 // Требуемая ёмкость известна из WaveInfo и проверяется здесь же.

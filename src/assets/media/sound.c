@@ -157,3 +157,145 @@ const char *SoundFormatName(SoundFormat format)
     }
     return "unknown";
 }
+
+struct SoundStream
+{
+    SoundReader reader;
+    SoundInfo info;
+    SoundFormat format;
+    WaveInfo wave;
+    uint32_t position;
+    uint8_t waveBlock[16384];
+    /* The following payload is pointer-aligned, independently of WAV state. */
+    uintptr_t decoder[];
+};
+
+SoundStatus SoundStreamInspect(const SoundReader *reader, SoundInfo *outInfo)
+{
+    if (reader == NULL || reader->readAt == NULL || outInfo == NULL)
+        return SOUND_INVALID_ARGUMENT;
+    uint8_t prefix[12];
+    uint32_t prefixBytes =
+        reader->sizeBytes < sizeof(prefix) ? (uint32_t)reader->sizeBytes : sizeof(prefix);
+    if (!reader->readAt(reader->context, 0u, prefix, prefixBytes))
+        return SOUND_TRUNCATED;
+    SoundInfo info = {0};
+    switch (SoundProbe(prefix, prefixBytes))
+    {
+    case SOUND_FORMAT_WAVE:
+    {
+        WaveInfo wave = {0};
+        SoundStatus status = SoundFromWave(WaveInspectReader(reader, &wave));
+        if (status != SOUND_OK)
+            return status;
+        info.frameCount = wave.frameCount;
+        info.channelCount = wave.channelCount;
+        info.sampleRate = wave.sampleRate;
+        info.scratchBytes = sizeof(SoundStream);
+        break;
+    }
+    case SOUND_FORMAT_MP3:
+    {
+        Mp3Info mp3 = {0};
+        SoundStatus status = SoundFromMp3(Mp3InspectReader(reader, &mp3));
+        if (status != SOUND_OK)
+            return status;
+        info.frameCount = mp3.frameCount;
+        info.channelCount = mp3.channelCount;
+        info.sampleRate = mp3.sampleRate;
+        info.scratchBytes = sizeof(SoundStream) + Mp3StreamScratchBytes();
+        break;
+    }
+    default:
+        return SOUND_NOT_RECOGNISED;
+    }
+    info.sampleCount = info.frameCount * info.channelCount;
+    *outInfo = info;
+    return SOUND_OK;
+}
+
+SoundStatus SoundStreamInitialize(const SoundReader *reader, void *scratch, uint32_t scratchBytes,
+                                  SoundStream **outStream)
+{
+    if (outStream != NULL)
+        *outStream = NULL;
+    if (scratch == NULL || outStream == NULL)
+        return SOUND_INVALID_ARGUMENT;
+    SoundInfo info = {0};
+    SoundStatus status = SoundStreamInspect(reader, &info);
+    if (status != SOUND_OK)
+        return status;
+    if (scratchBytes < info.scratchBytes)
+        return SOUND_BUFFER_TOO_SMALL;
+    SoundStream *stream = (SoundStream *)scratch;
+    uint8_t prefix[12];
+    uint32_t count =
+        reader->sizeBytes < sizeof(prefix) ? (uint32_t)reader->sizeBytes : sizeof(prefix);
+    if (!reader->readAt(reader->context, 0u, prefix, count))
+        return SOUND_TRUNCATED;
+    stream->reader = *reader;
+    stream->info = info;
+    stream->format = SoundProbe(prefix, count);
+    stream->position = 0u;
+    if (stream->format == SOUND_FORMAT_WAVE)
+        status = SoundFromWave(WaveInspectReader(reader, &stream->wave));
+    else
+    {
+        Mp3Info mp3 = {0};
+        status = SoundFromMp3(Mp3InspectReader(reader, &mp3));
+        if (status == SOUND_OK)
+            status = SoundFromMp3(
+                Mp3StreamInitialize(reader, &mp3, stream->decoder, scratchBytes - sizeof(*stream)));
+    }
+    if (status == SOUND_OK)
+        *outStream = stream;
+    return status;
+}
+
+SoundStatus SoundStreamRead(SoundStream *stream, int16_t *samples, uint32_t frameCapacity,
+                            uint32_t *outFrames)
+{
+    if (outFrames != NULL)
+        *outFrames = 0u;
+    if (stream == NULL || samples == NULL || outFrames == NULL)
+        return SOUND_INVALID_ARGUMENT;
+    if (stream->format == SOUND_FORMAT_MP3)
+        return SoundFromMp3(Mp3StreamRead(stream->decoder, samples, frameCapacity, outFrames));
+    uint32_t count = stream->info.frameCount - stream->position;
+    if (count > frameCapacity)
+        count = frameCapacity;
+    uint32_t frameBytes = stream->wave.channelCount * (stream->wave.bitsPerSample / 8u);
+    uint8_t *block = stream->waveBlock;
+    while (*outFrames < count)
+    {
+        uint32_t frames = count - *outFrames;
+        if (frames > sizeof(stream->waveBlock) / frameBytes)
+            frames = sizeof(stream->waveBlock) / frameBytes;
+        uint32_t bytes = frames * frameBytes;
+        uint64_t offset = stream->wave.dataOffset + (uint64_t)stream->position * frameBytes;
+        if (!stream->reader.readAt(stream->reader.context, offset, block, bytes))
+            return SOUND_TRUNCATED;
+        WaveInfo wave = stream->wave;
+        wave.dataOffset = 0u;
+        wave.dataBytes = bytes;
+        wave.frameCount = frames;
+        SoundStatus status = SoundFromWave(
+            WaveDecodeSamples(block, bytes, &wave, samples + *outFrames * wave.channelCount,
+                              frames * wave.channelCount));
+        if (status != SOUND_OK)
+            return status;
+        stream->position += frames;
+        *outFrames += frames;
+    }
+    return SOUND_OK;
+}
+
+SoundStatus SoundStreamSeek(SoundStream *stream, uint32_t frame)
+{
+    if (stream == NULL || frame > stream->info.frameCount)
+        return SOUND_INVALID_ARGUMENT;
+    if (stream->format == SOUND_FORMAT_MP3)
+        return SoundFromMp3(Mp3StreamSeek(stream->decoder, frame));
+    stream->position = frame;
+    return SOUND_OK;
+}

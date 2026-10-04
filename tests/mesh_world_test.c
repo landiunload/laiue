@@ -34,6 +34,7 @@ enum
     MODEL_FLOOR = 2u,
     MODEL_TILTED = 3u,
     MODEL_EDGE = 4u,
+    MODEL_MAX_BOXES = 8u,
     MODEL_LATE = 9u,
 };
 
@@ -246,7 +247,8 @@ static void CheckCollision(LaiueMeshWorldV1 *world, int64_t baseX, int64_t baseY
     const float smallHalf[3] = {0.25f, 0.25f, 0.25f};
     const float north[3] = {0.0f, 10.0f, 0.0f};
     start = Position(baseX, baseY, baseZ, 8.0f, 8.0f, 5.0f);
-    Expect(g_service->sweepBox(world, &start, smallHalf, north, &hit) != 0u && hit.instance == tilted &&
+    Expect(g_service->sweepBox(world, &start, smallHalf, north, &hit) != 0u &&
+               hit.instance == tilted &&
                Near(hit.time, (5.0f - 1.41421356f - 0.25f) / 10.0f, 1e-4f) &&
                Near(hit.normal[1], -1.0f, 1e-4f),
            "box hits the edge of the rotated box");
@@ -279,8 +281,8 @@ static void CheckCollision(LaiueMeshWorldV1 *world, int64_t baseX, int64_t baseY
     Expect(g_service->moveBox(world, &start, smallHalf, back, &move) != 0u && move.collided == 0u &&
                Near(move.position.local[0], 9.4f, 1e-4f),
            "an overlapping box can leave");
-    Expect(g_service->sweepBox(world, &start, smallHalf, deeper, &hit) != 0u && hit.instance == wall &&
-               hit.time == 0.0f && Near(hit.normal[0], -1.0f, 1e-5f),
+    Expect(g_service->sweepBox(world, &start, smallHalf, deeper, &hit) != 0u &&
+               hit.instance == wall && hit.time == 0.0f && Near(hit.normal[0], -1.0f, 1e-5f),
            "an overlapping box cannot go deeper");
 
     // Луч сверху попадает в верх пола; луч изнутри коробки её не видит.
@@ -311,6 +313,77 @@ static void CheckCollision(LaiueMeshWorldV1 *world, int64_t baseX, int64_t baseY
     Expect(g_service->remove(world, floor) != 0u && g_service->remove(world, wall) != 0u &&
                g_service->remove(world, tilted) != 0u,
            "collision fixtures are removed");
+}
+
+static void CheckMaximumShapeBoxes(LaiueMeshWorldV1 *world)
+{
+    /* Exercise the last box, not just a successful early-out on box zero.
+     * Static fixture
+     * storage keeps the regression itself below a stack page. */
+    static LaiueMeshBoxV1 boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
+    static LaiueMeshColliderV1 colliders[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
+    for (uint32_t index = 0u; index < LAIUE_MESH_WORLD_MAX_SHAPE_BOXES; ++index)
+    {
+        boxes[index].center[1] = (float)index * 4.0f;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            boxes[index].halfExtent[axis] = 0.25f;
+        boxes[index].rotation[3] = 1.0f;
+    }
+    /* The second box covers the rotated-box arithmetic too. */
+    boxes[1].rotation[2] = 0.38268343f;
+    boxes[1].rotation[3] = 0.92387953f;
+    LaiueMeshShapeV1 shape = {
+        .structSize = sizeof(shape),
+        .boundsMin = {-0.5f, -0.5f, -0.5f},
+        .boundsMax = {0.5f, 253.0f, 0.5f},
+        .boxes = boxes,
+        .boxCount = LAIUE_MESH_WORLD_MAX_SHAPE_BOXES,
+    };
+    Expect(g_service->registerShape(world, MODEL_MAX_BOXES, &shape) != 0u, "64-box shape");
+    const LaiueMeshInstanceV1 instance =
+        Add(world, MODEL_MAX_BOXES, Position(0, 0, 0, 4.0f, 4.0f, 4.0f), 1.0f);
+    const float half[3] = {0.25f, 0.25f, 0.25f};
+    const float motion[3] = {6.0f, 0.0f, 0.0f};
+    const float east[3] = {1.0f, 0.0f, 0.0f};
+    const LaiueMeshPositionV1 start = Position(0, 16, 0, 1.0f, 0.0f, 4.0f);
+    LaiueMeshHitV1 hit = {0};
+    Expect(g_service->sweepBox(world, &start, half, motion, &hit) != 0u &&
+               hit.instance == instance && Near(hit.time, 2.5f / 6.0f, 1e-5f),
+           "sweep reaches the last of 64 boxes across cell boundaries");
+    Expect(g_service->raycast(world, &start, east, 6.0f, &hit) != 0u && hit.instance == instance &&
+               Near(hit.time, 2.75f / 6.0f, 1e-5f),
+           "ray reaches the last of 64 boxes");
+    Expect(g_service->blockSolid(world, 4, 256, 4, 1.0f) != 0u &&
+               g_service->blockSolid(world, 4, 254, 4, 1.0f) == 0u,
+           "solid visits the last box while the gap remains empty");
+    uint32_t count = 0u;
+    const float minimum[3] = {-1.0f, -1.0f, -1.0f};
+    const float maximum[3] = {1.0f, 253.0f, 1.0f};
+    const LaiueMeshPositionV1 reference = Position(0, 0, 0, 4.0f, 4.0f, 4.0f);
+    Expect(g_service->overlapBoxes(world, &reference, minimum, maximum, colliders,
+                                   LAIUE_MESH_WORLD_MAX_SHAPE_BOXES, &count) != 0u &&
+               count == LAIUE_MESH_WORLD_MAX_SHAPE_BOXES,
+           "overlap emits every box at the maximum shape capacity");
+    uint32_t seen = 0u;
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        Expect(colliders[index].instance == instance, "maximum-shape collider owner");
+        if (Near(colliders[index].minimum[1], 251.75f, 1e-5f))
+            ++seen;
+    }
+    Expect(seen == 1u, "the last collider occurs exactly once");
+    LaiueMeshInstanceInfoV1 info = {0};
+    Expect(g_service->get(world, instance, &info) != 0u, "64-box transform");
+    info.transform.scale[0] = 2.0f;
+    info.transform.scale[1] = 1.5f;
+    Expect(g_service->setTransform(world, instance, &info.transform) != 0u,
+           "nonuniform 64-box transform");
+    const float scaledMaximum[3] = {1.0f, 379.0f, 1.0f};
+    Expect(g_service->overlapBoxes(world, &reference, minimum, scaledMaximum, colliders,
+                                   LAIUE_MESH_WORLD_MAX_SHAPE_BOXES, &count) != 0u &&
+               count == LAIUE_MESH_WORLD_MAX_SHAPE_BOXES,
+           "nonuniform scaling keeps every identity and rotated box");
+    Expect(g_service->remove(world, instance) != 0u, "maximum-shape fixture cleanup");
 }
 
 static void CheckBlocksAndCells(LaiueMeshWorldV1 *world)
@@ -611,6 +684,7 @@ LAIUE_TEST_ENTRY(MeshWorldTestEntryPoint)
     // Тот же сценарий за 2^60 ячеек от начала: точность не зависит от
     // удалённости, потому что считаются только разности ячеек.
     CheckCollision(world, INT64_C(1) << 60, -(INT64_C(1) << 60), INT64_C(123456789012));
+    CheckMaximumShapeBoxes(world);
     CheckBlocksAndCells(world);
     CheckChurn(world);
     CheckProvider(world);

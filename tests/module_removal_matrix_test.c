@@ -300,12 +300,18 @@ LAIUE_TEST_ENTRY(ModuleRemovalMatrixTestEntryPoint)
            "corrupt artifact is written");
 
     static const wchar_t *const names[] = {
-        L"numeric",    L"task",         L"content",       L"character",
-        L"world",      L"voxel",        L"voxel_raycast", L"physics",
-        L"audio",      L"audio_output", L"audio_pack",    L"ui",
-        L"mesher",     L"scene_math",   L"scene",         L"graphics_profile",
-        L"window",     L"input",        L"voxel_render",  L"model",
-        L"mesh_world",
+        L"numeric",       L"task",
+        L"content",       L"character",
+        L"world",         L"voxel",
+        L"voxel_raycast", L"physics",
+        L"audio",         L"audio_output",
+        L"audio_pack",    L"ui",
+        L"mesher",        L"scene_math",
+        L"scene",         L"graphics_profile",
+        L"window",        L"input",
+        L"voxel_render",  L"model",
+        L"mesh_world",    L"mesh_world_render",
+        L"animation",
     };
     for (uint32_t index = 0u; index < sizeof(names) / sizeof(names[0]); ++index)
         (void)ProbeModule(names[index]);

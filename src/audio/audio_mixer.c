@@ -5,6 +5,7 @@
 // поток вывода не касается вовсе.
 
 #include "audio/audio.h"
+#include "audio/audio_stream_internal.h"
 #include "audio/audio_backend.h"
 #include "audio/audio_offscreen.h"
 #include "audio/audio_output_service.h"
@@ -132,6 +133,13 @@ typedef struct VoiceSlot
 
     // Ниже — собственность потока вывода после перехода в ACTIVE.
     const AudioClip *clip;
+    AudioStream *stream;
+    uint32_t streamEpoch;
+    double streamOffset;
+    bool paused;
+    volatile uint32_t positionSequence;
+    volatile uint32_t positionLow;
+    volatile uint32_t positionHigh;
     double position;      // позиция чтения в кадрах исходного клипа
     double step;          // на сколько кадров исходника сдвигаться за кадр вывода
     VoiceGains gains;
@@ -144,6 +152,8 @@ typedef enum CommandType
     COMMAND_UPDATE,
     COMMAND_STOP,
     COMMAND_STOP_ALL,
+    COMMAND_PAUSE,
+    COMMAND_SEEK,
 } CommandType;
 
 typedef struct AudioCommand
@@ -152,6 +162,10 @@ typedef struct AudioCommand
     uint32_t slot;
     uint32_t generation;
     const AudioClip *clip;
+    AudioStream *stream;
+    uint32_t streamEpoch;
+    double position;
+    bool paused;
     double step;
     VoiceGains gains;
     bool looping;
@@ -172,6 +186,8 @@ struct AudioDevice
     AudioCommand commands[AUDIO_COMMAND_CAPACITY];
     volatile uint32_t commandWrite;
     volatile uint32_t commandRead;
+    volatile int64_t commandIssued;
+    volatile int64_t commandApplied;
 
     // Разводит между собой потоки приложения. Поток вывода его не берёт.
     PlatformMutex producerLock;
@@ -182,6 +198,7 @@ struct AudioDevice
     // принадлежит потоку вывода, и читать его отсюда было бы гонкой.
     const AudioClip *slotClips[AUDIO_MAX_VOICES];
     AudioClip *retiredClips;
+    AudioStream *streams;
     uint32_t nextGeneration;
 
     // Верхняя граница обхода слотов. Слоты выдаются с младших индексов,
@@ -197,6 +214,31 @@ struct AudioDevice
 };
 
 static void ReleaseRetiredClips(AudioDevice *device, bool releaseEverything);
+static void ReleaseRetiredStreams(AudioDevice *device, bool releaseEverything);
+
+static void PublishPosition(VoiceSlot *slot)
+{
+    union
+    {
+        double value;
+        uint64_t bits;
+    } position;
+    position.value = slot->position;
+    PlatformAtomicIncrementU32(&slot->positionSequence);
+    PlatformAtomicStoreU32Release(&slot->positionLow, (uint32_t)position.bits);
+    PlatformAtomicStoreU32Release(&slot->positionHigh, (uint32_t)(position.bits >> 32));
+    PlatformAtomicIncrementU32(&slot->positionSequence);
+}
+
+static void DiscardOldStreamPackets(AudioStream *stream, uint32_t epoch)
+{
+    uint32_t read = stream->read;
+    uint32_t write = PlatformAtomicLoadU32Acquire(&stream->write);
+    while (read != write &&
+           (int32_t)(stream->packets[read % AUDIO_STREAM_PACKET_COUNT].epoch - epoch) < 0)
+        ++read;
+    PlatformAtomicStoreU32Release(&stream->read, read);
+}
 
 // Громкость живёт как биты float в атомарном слове: поток вывода читает
 // её каждый буфер, приложение меняет в любой момент.
@@ -231,6 +273,9 @@ static VoiceGains ComputeGains(float volume, float pan)
 
 static double ComputeStep(uint32_t clipSampleRate, uint32_t deviceSampleRate, float speed)
 {
+    /* NaN must not reach the sample-index conversions. */
+    if (!(speed >= AUDIO_MIN_SPEED))
+        speed = AUDIO_MIN_SPEED;
     float clampedSpeed = ClampFloat(speed, AUDIO_MIN_SPEED, AUDIO_MAX_SPEED);
     return ((double)clipSampleRate / (double)deviceSampleRate) * (double)clampedSpeed;
 }
@@ -261,6 +306,7 @@ static bool PushCommand(AudioDevice *device, const AudioCommand *command)
     }
     device->commands[write] = *command;
     // Запись видна потоку вывода только после публикации индекса.
+    PlatformAtomicIncrementI64(&device->commandIssued);
     PlatformAtomicStoreU32Release(&device->commandWrite, next);
     return true;
 }
@@ -274,6 +320,7 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
             VoiceSlot *slot = &device->voices[index];
             if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
             slot->clip = NULL;
+            slot->stream = NULL;
             PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_FINISHED);
         }
         return;
@@ -289,7 +336,14 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
     case COMMAND_START:
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_PENDING) return;
         slot->clip = command->clip;
+        slot->stream = command->stream;
+        slot->streamEpoch = command->streamEpoch;
+        slot->streamOffset = 0.0;
+        slot->paused = false;
+        if (slot->stream != NULL)
+            DiscardOldStreamPackets(slot->stream, slot->streamEpoch);
         slot->position = 0.0;
+        PublishPosition(slot);
         slot->step = command->step;
         slot->gains = command->gains;
         slot->looping = command->looping;
@@ -310,9 +364,24 @@ static void ApplyCommand(AudioDevice *device, const AudioCommand *command)
         uint32_t state = PlatformAtomicLoadU32Acquire(&slot->state);
         if (state != (uint32_t)VOICE_ACTIVE && state != (uint32_t)VOICE_PENDING) return;
         slot->clip = NULL;
+        slot->stream = NULL;
         PlatformAtomicStoreU32Release(&slot->state, (uint32_t)VOICE_FINISHED);
         break;
     }
+    case COMMAND_PAUSE:
+        if (PlatformAtomicLoadU32Acquire(&slot->state) == VOICE_ACTIVE)
+            slot->paused = command->paused;
+        break;
+    case COMMAND_SEEK:
+        if (PlatformAtomicLoadU32Acquire(&slot->state) != VOICE_ACTIVE)
+            break;
+        slot->position = command->position;
+        slot->streamOffset = 0.0;
+        slot->streamEpoch = command->streamEpoch;
+        if (slot->stream != NULL)
+            DiscardOldStreamPackets(slot->stream, slot->streamEpoch);
+        PublishPosition(slot);
+        break;
     default:
         break;
     }
@@ -325,12 +394,15 @@ static bool DrainCommands(AudioDevice *device)
     uint32_t read = device->commandRead;
     uint32_t write = PlatformAtomicLoadU32Acquire(&device->commandWrite);
     if (read == write) return false;
+    uint32_t applied = 0u;
     while (read != write)
     {
+        ++applied;
         ApplyCommand(device, &device->commands[read]);
         read = (read + 1u) % AUDIO_COMMAND_CAPACITY;
     }
     PlatformAtomicStoreU32Release(&device->commandRead, read);
+    PlatformAtomicAddI64(&device->commandApplied, applied);
     return true;
 }
 
@@ -690,6 +762,63 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
     slot->position = position;
 }
 
+static void MixStreamVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
+{
+    AudioStream *stream = slot->stream;
+    if (PlatformAtomicLoadU32Acquire(&stream->terminate) != 0u)
+    {
+        slot->stream = NULL;
+        PlatformAtomicStoreU32Release(&slot->state, VOICE_FINISHED);
+        return;
+    }
+    bool underrun = false;
+    bool finished = false;
+    for (uint32_t index = 0u; index < frameCount; ++index)
+    {
+        if (slot->position >= stream->info.frameCount)
+        {
+            if (!slot->looping)
+            {
+                slot->position = stream->info.frameCount;
+                finished = true;
+                break;
+            }
+            slot->position -= (double)(uint64_t)(slot->position / stream->info.frameCount) *
+                              stream->info.frameCount;
+        }
+        float left = 0.0f, right = 0.0f;
+        if (!AudioStreamSample(stream, slot->streamEpoch, &slot->streamOffset, slot->step, &left,
+                               &right))
+        {
+            if (PlatformAtomicLoadU32Acquire(&stream->result) != AUDIO_RESULT_OK)
+            {
+                finished = true;
+            }
+            underrun = true;
+            break;
+        }
+        frames[index * 2u] += left * slot->gains.left;
+        frames[index * 2u + 1u] += right * slot->gains.right;
+        slot->position += slot->step;
+    }
+    if (underrun)
+        PlatformAtomicIncrementI64(&stream->underruns);
+    if (!slot->looping && slot->position >= stream->info.frameCount)
+    {
+        slot->position = stream->info.frameCount;
+        finished = true;
+    }
+    if (slot->looping && slot->position >= stream->info.frameCount)
+        slot->position -=
+            (double)(uint64_t)(slot->position / stream->info.frameCount) * stream->info.frameCount;
+    if (finished)
+    {
+        /* FINISHED is the retirement ACK: no stream access may follow it. */
+        slot->stream = NULL;
+        PlatformAtomicStoreU32Release(&slot->state, VOICE_FINISHED);
+    }
+}
+
 static void RenderFrames(void *context, float *frames, uint32_t frameCount)
 {
     AudioDevice *device = (AudioDevice *)context;
@@ -709,8 +838,8 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     // нулевой после memset, поэтому тишина не платит за проход по слотам и
     // громкости. Голос становится ACTIVE только через COMMAND_START, значит
     // без команд его появление невозможно.
-    if (!commandsApplied && finiteMaster
-        && PlatformAtomicLoadU32Acquire(&device->activeVoices) == 0u)
+    if (!commandsApplied && finiteMaster &&
+        PlatformAtomicLoadU32Acquire(&device->activeVoices) == 0u && device->voiceScanLimit == 0u)
     {
         PlatformAtomicAddI64(&device->mixedFrames, (int64_t)frameCount);
         return;
@@ -726,8 +855,22 @@ static void RenderFrames(void *context, float *frames, uint32_t frameCount)
     {
         VoiceSlot *slot = &device->voices[index];
         if (PlatformAtomicLoadU32Acquire(&slot->state) != (uint32_t)VOICE_ACTIVE) continue;
-        if (slot->clip == NULL) continue;
-        MixVoice(slot, frames, frameCount);
+        if (slot->clip == NULL && slot->stream == NULL)
+            continue;
+        if (slot->stream != NULL && PlatformAtomicLoadU32Acquire(&slot->stream->terminate) != 0u)
+        {
+            slot->stream = NULL;
+            PlatformAtomicStoreU32Release(&slot->state, VOICE_FINISHED);
+            continue;
+        }
+        if (!slot->paused)
+        {
+            if (slot->stream != NULL)
+                MixStreamVoice(slot, frames, frameCount);
+            else
+                MixVoice(slot, frames, frameCount);
+            PublishPosition(slot);
+        }
         ++mixedVoices;
         if (PlatformAtomicLoadU32Acquire(&slot->state) == (uint32_t)VOICE_ACTIVE)
         {
@@ -894,6 +1037,7 @@ void AudioDeviceDestroy(AudioDevice *device)
     // Поток вывода остановлен, поэтому отложенные клипы можно освободить
     // безусловно: смотреть на них больше некому.
     ReleaseRetiredClips(device, true);
+    ReleaseRetiredStreams(device, true);
     if (device->producerLockReady) PlatformMutexDestroy(&device->producerLock);
     PlatformFree(device);
 }
@@ -1065,7 +1209,8 @@ _Static_assert(AUDIO_MAX_VOICES <= 256u, "the voice handle packs the slot into e
 AudioVoice AudioVoicePlay(AudioDevice *device, const AudioClip *clip,
                           const AudioVoiceParameters *parameters)
 {
-    if (device == NULL || clip == NULL) return AUDIO_VOICE_NONE;
+    if (device == NULL || clip == NULL || clip->device != device)
+        return AUDIO_VOICE_NONE;
 
     AudioVoiceParameters resolved;
     FillParameters(parameters, &resolved);
@@ -1137,6 +1282,12 @@ bool AudioVoiceSetParameters(AudioDevice *device, AudioVoice voice,
                 .looping = resolved.looping,
             };
             accepted = PushCommand(device, &command);
+            if (accepted)
+            {
+                for (AudioStream *stream = device->streams; stream != NULL; stream = stream->next)
+                    if (!stream->retired && stream->voice == voice)
+                        AudioStreamSetLooping(stream, resolved.looping);
+            }
         }
     }
     PlatformMutexUnlock(&device->producerLock);
@@ -1193,6 +1344,270 @@ bool AudioDeviceRenderFrames(AudioDevice *device, float *outFrames, uint32_t fra
     // вызов отсюда наложился бы на него и испортил и микс, и статистику.
     if (device->offscreenBackend == NULL || device->backendKind != AUDIO_BACKEND_OFFSCREEN)
         return false;
-    RenderFrames(device, outFrames, frameCount);
+    /* Offscreen is not a realtime callback: bounded chunks are prefetched on
+     * its caller, deterministically, without moving IO into RenderFrames. */
+    if (device->streams == NULL)
+    {
+        RenderFrames(device, outFrames, frameCount);
+        return true;
+    }
+    PlatformMutexLock(&device->producerLock);
+    DrainCommands(device);
+    uint32_t completed = 0u;
+    while (completed < frameCount)
+    {
+        for (AudioStream *stream = device->streams; stream != NULL; stream = stream->next)
+            if (!stream->retired)
+                AudioStreamPump(stream);
+        uint32_t count = frameCount - completed;
+        if (count > 256u)
+            count = 256u;
+        for (uint32_t index = 0u; index < device->voiceScanLimit; ++index)
+        {
+            VoiceSlot *slot = &device->voices[index];
+            if (slot->stream == NULL || slot->paused || slot->step <= 0.0)
+                continue;
+            double safe = 4096.0 / slot->step;
+            /* Compare against the already bounded output count before casting:
+             * tiny source/device ratios may exceed UINT32_MAX. */
+            if (safe < count)
+                count = safe >= 1.0 ? (uint32_t)safe : 1u;
+        }
+        RenderFrames(device, outFrames + (size_t)completed * 2u, count);
+        completed += count;
+    }
+    ReleaseRetiredStreams(device, false);
+    PlatformMutexUnlock(&device->producerLock);
     return true;
+}
+
+static void ReleaseRetiredStreams(AudioDevice *device, bool releaseEverything)
+{
+    uint64_t mixed = (uint64_t)PlatformAtomicLoadI64(&device->mixedFrames);
+    uint64_t applied = (uint64_t)PlatformAtomicLoadI64(&device->commandApplied);
+    AudioStream **link = &device->streams;
+    while (*link != NULL)
+    {
+        AudioStream *stream = *link;
+        uint32_t index = stream->voice & 255u;
+        uint32_t generation = stream->voice >> 8;
+        const VoiceSlot *slot = &device->voices[index];
+        uint32_t state = PlatformAtomicLoadU32Acquire(&slot->state);
+        bool voiceReleased = stream->voice == AUDIO_VOICE_NONE || slot->generation != generation ||
+                             state == VOICE_FREE || state == VOICE_FINISHED;
+        if (releaseEverything || (stream->retired && voiceReleased &&
+                                  stream->retireFrame <= mixed && stream->retireCommand <= applied))
+        {
+            *link = stream->next;
+            AudioStreamFree(stream);
+        }
+        else
+            link = &stream->next;
+    }
+}
+
+AudioResult AudioStreamCreate(AudioDevice *device, const AudioStreamDescription *description,
+                              AudioStream **outStream)
+{
+    AudioResult result = AudioStreamAllocate(
+        device, description, device != NULL && device->backendKind != AUDIO_BACKEND_OFFSCREEN,
+        outStream);
+    if (result != AUDIO_RESULT_OK)
+        return result;
+    PlatformMutexLock(&device->producerLock);
+    ReleaseRetiredStreams(device, false);
+    (*outStream)->next = device->streams;
+    device->streams = *outStream;
+    PlatformMutexUnlock(&device->producerLock);
+    return result;
+}
+
+AudioResult AudioStreamOpenFile(AudioDevice *device, const char *path, AudioStream **outStream)
+{
+    AudioResult result = AudioStreamAllocateFile(
+        device, path, device != NULL && device->backendKind != AUDIO_BACKEND_OFFSCREEN, outStream);
+    if (result != AUDIO_RESULT_OK)
+        return result;
+    PlatformMutexLock(&device->producerLock);
+    ReleaseRetiredStreams(device, false);
+    (*outStream)->next = device->streams;
+    device->streams = *outStream;
+    PlatformMutexUnlock(&device->producerLock);
+    return result;
+}
+
+void AudioStreamDestroy(AudioStream *stream)
+{
+    if (stream == NULL || stream->retired)
+        return;
+    AudioDevice *device = stream->device;
+    PlatformMutexLock(&device->producerLock);
+    uint32_t index = stream->voice & 255u;
+    uint32_t generation = stream->voice >> 8;
+    if (stream->voice != AUDIO_VOICE_NONE && device->voices[index].generation == generation)
+    {
+        AudioCommand command = {.type = COMMAND_STOP, .slot = index, .generation = generation};
+        PushCommand(device, &command);
+    }
+    stream->retired = true;
+    /* terminate is observed even by paused voices; retirement does not
+     * rely on a STOP fitting into the command ring. */
+    stream->retireFrame = (uint64_t)PlatformAtomicLoadI64(&device->mixedFrames) + 1u;
+    stream->retireCommand = (uint64_t)PlatformAtomicLoadI64(&device->commandIssued);
+    AudioStreamShutdown(stream);
+    ReleaseRetiredStreams(device, false);
+    PlatformMutexUnlock(&device->producerLock);
+}
+
+AudioVoice AudioVoicePlayStream(AudioDevice *device, AudioStream *stream,
+                                const AudioVoiceParameters *parameters)
+{
+    if (device == NULL || stream == NULL || stream->device != device || stream->retired)
+        return AUDIO_VOICE_NONE;
+    AudioVoiceParameters resolved;
+    FillParameters(parameters, &resolved);
+    PlatformMutexLock(&device->producerLock);
+    if (AudioVoiceIsActive(device, stream->voice))
+    {
+        PlatformMutexUnlock(&device->producerLock);
+        return AUDIO_VOICE_NONE;
+    }
+    AudioVoice handle = AUDIO_VOICE_NONE;
+    for (uint32_t index = 0u; index < AUDIO_MAX_VOICES; ++index)
+    {
+        VoiceSlot *slot = &device->voices[index];
+        uint32_t state = PlatformAtomicLoadU32Acquire(&slot->state);
+        if (state != VOICE_FREE && state != VOICE_FINISHED)
+            continue;
+        /* Reserve command capacity before changing the decoder's epoch. */
+        if ((device->commandWrite + 1u) % AUDIO_COMMAND_CAPACITY ==
+            PlatformAtomicLoadU32Acquire(&device->commandRead))
+            break;
+        uint32_t epoch = 0u;
+        if (!AudioStreamPrepare(stream, 0u, resolved.looping, &epoch))
+            break;
+        slot->clipSampleRate = stream->info.sampleRate;
+        device->slotClips[index] = NULL;
+        slot->generation = device->nextGeneration++;
+        if (device->nextGeneration == 0u)
+            device->nextGeneration = 1u;
+        AudioCommand command = {
+            .type = COMMAND_START,
+            .slot = index,
+            .generation = slot->generation,
+            .stream = stream,
+            .streamEpoch = epoch,
+            .step = ComputeStep(stream->info.sampleRate, device->sampleRate, resolved.speed),
+            .gains = ComputeGains(resolved.volume, resolved.pan),
+            .looping = resolved.looping,
+        };
+        PlatformAtomicStoreU32Release(&slot->state, VOICE_PENDING);
+        if (!PushCommand(device, &command))
+        {
+            PlatformAtomicStoreU32Release(&slot->state, VOICE_FREE);
+            break;
+        }
+        handle = MakeVoiceHandle(index, slot->generation);
+        stream->voice = handle;
+        break;
+    }
+    PlatformMutexUnlock(&device->producerLock);
+    return handle;
+}
+
+bool AudioVoicePause(AudioDevice *device, AudioVoice voice, bool paused)
+{
+    uint32_t index = 0u, generation = 0u;
+    if (device == NULL || !SplitVoiceHandle(voice, &index, &generation))
+        return false;
+    PlatformMutexLock(&device->producerLock);
+    AudioCommand command = {
+        .type = COMMAND_PAUSE, .slot = index, .generation = generation, .paused = paused};
+    bool ok = AudioVoiceIsActive(device, voice) && PushCommand(device, &command);
+    PlatformMutexUnlock(&device->producerLock);
+    return ok;
+}
+
+bool AudioVoiceSeek(AudioDevice *device, AudioVoice voice, double seconds)
+{
+    uint32_t index = 0u, generation = 0u;
+    if (device == NULL || !SplitVoiceHandle(voice, &index, &generation) || !(seconds >= 0.0) ||
+        seconds > DBL_MAX)
+        return false;
+    PlatformMutexLock(&device->producerLock);
+    bool ok = false;
+    if (AudioVoiceIsActive(device, voice))
+    {
+        AudioStream *stream = device->streams;
+        while (stream != NULL && (stream->retired || stream->voice != voice))
+            stream = stream->next;
+        const AudioClip *clip = device->slotClips[index];
+        uint32_t total =
+            stream != NULL ? stream->info.frameCount : (clip != NULL ? clip->frameCount : 0u);
+        uint32_t rate = device->voices[index].clipSampleRate;
+        double position = seconds * rate;
+        if (seconds <= (double)total / rate && position > total)
+            position = total;
+        if (position <= total && (device->commandWrite + 1u) % AUDIO_COMMAND_CAPACITY !=
+                                     PlatformAtomicLoadU32Acquire(&device->commandRead))
+        {
+            uint32_t epoch = 0u;
+            /* API producer owns loop preference; copy it through stream lock. */
+            bool looping = false;
+            if (stream != NULL)
+            {
+                PlatformMutexLock(&stream->decoderLock);
+                looping = stream->looping;
+                PlatformMutexUnlock(&stream->decoderLock);
+            }
+            ok = stream == NULL || AudioStreamPrepare(stream, (uint32_t)position, looping, &epoch);
+            if (ok)
+            {
+                AudioCommand command = {.type = COMMAND_SEEK,
+                                        .slot = index,
+                                        .generation = generation,
+                                        .position = (double)(uint32_t)position,
+                                        .streamEpoch = epoch};
+                ok = PushCommand(device, &command);
+            }
+        }
+    }
+    PlatformMutexUnlock(&device->producerLock);
+    return ok;
+}
+
+bool AudioVoiceGetPosition(const AudioDevice *device, AudioVoice voice, double *outSeconds)
+{
+    uint32_t index = 0u, generation = 0u;
+    if (device == NULL || outSeconds == NULL || !SplitVoiceHandle(voice, &index, &generation))
+        return false;
+    PlatformMutexLock((PlatformMutex *)&device->producerLock);
+    const VoiceSlot *slot = &device->voices[index];
+    bool valid =
+        slot->generation == generation && PlatformAtomicLoadU32Acquire(&slot->state) != VOICE_FREE;
+    if (valid)
+    {
+        if (PlatformAtomicLoadU32Acquire(&slot->state) == VOICE_PENDING)
+            *outSeconds = 0.0;
+        else
+        {
+            uint32_t before, after, low, high;
+            do
+            {
+                before = PlatformAtomicLoadU32Acquire(&slot->positionSequence);
+                low = PlatformAtomicLoadU32Acquire(&slot->positionLow);
+                high = PlatformAtomicLoadU32Acquire(&slot->positionHigh);
+                after = PlatformAtomicLoadU32Acquire(&slot->positionSequence);
+            } while ((before & 1u) != 0u || before != after);
+            union
+            {
+                double value;
+                uint64_t bits;
+            } position;
+            position.bits = ((uint64_t)high << 32) | low;
+            *outSeconds = position.value / slot->clipSampleRate;
+        }
+    }
+    PlatformMutexUnlock((PlatformMutex *)&device->producerLock);
+    return valid;
 }

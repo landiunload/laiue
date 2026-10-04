@@ -27,6 +27,7 @@
 #define MESH_MAX_STREAM_CELLS 64
 #define MESH_MAX_PROVIDER_CELL_OFFSET (INT64_C(1) << 40)
 #define MESH_KNOWN_INSTANCE_FLAGS (LAIUE_MESH_INSTANCE_VISIBLE | LAIUE_MESH_INSTANCE_COLLIDABLE)
+#define MESH_BOX_BATCH_SIZE 8u
 
 typedef struct MeshShape
 {
@@ -367,74 +368,110 @@ static const MeshShape *FindShape(const LaiueMeshWorldV1 *world, uint32_t model)
     return found ? &world->shapes[index] : NULL;
 }
 
-/* Collision boxes of an instance relative to its cell origin. */
-static uint32_t BuildInstanceBoxes(const MeshShape *shape, const LaiueMeshTransformV1 *transform,
-                                   MeshObb output[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES])
+/* One transform per instance, one OBB at a time. Keeping all 64 OBBs on the
+ * stack made inlined
+ * Release visitors exceed a page and require __chkstk in
+ * the no-CRT profile; early-out queries
+ * also transformed unused boxes. */
+typedef struct MeshBoxIterator
 {
-    if (shape == NULL)
-        return 0u;
+    const LaiueMeshTransformV1 *transform;
+    const LaiueMeshBoxV1 *boxes;
+    float instanceMatrix[3][3];
     LaiueMeshBoxV1 boundsBox;
-    const LaiueMeshBoxV1 *boxes = shape->boxes;
-    uint32_t count = shape->boxCount;
-    if (count == 0u)
+    uint32_t count;
+    bool uniform;
+} MeshBoxIterator;
+
+static void BeginInstanceBoxes(const MeshShape *shape, const LaiueMeshTransformV1 *transform,
+                               MeshBoxIterator *iterator)
+{
+    iterator->count = 0u;
+    if (shape == NULL)
+        return;
+    iterator->transform = transform;
+    iterator->boxes = shape->boxes;
+    iterator->count = shape->boxCount;
+    if (iterator->count == 0u)
     {
         if ((shape->flags & LAIUE_MESH_SHAPE_COLLIDE_BOUNDS) == 0u)
-            return 0u;
+            return;
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
-            boundsBox.center[axis] = 0.5f * (shape->boundsMin[axis] + shape->boundsMax[axis]);
-            boundsBox.halfExtent[axis] = 0.5f * (shape->boundsMax[axis] - shape->boundsMin[axis]);
+            iterator->boundsBox.center[axis] =
+                0.5f * (shape->boundsMin[axis] + shape->boundsMax[axis]);
+            iterator->boundsBox.halfExtent[axis] =
+                0.5f * (shape->boundsMax[axis] - shape->boundsMin[axis]);
         }
-        boundsBox.rotation[0] = 0.0f;
-        boundsBox.rotation[1] = 0.0f;
-        boundsBox.rotation[2] = 0.0f;
-        boundsBox.rotation[3] = 1.0f;
-        boxes = &boundsBox;
-        count = 1u;
+        iterator->boundsBox.rotation[0] = 0.0f;
+        iterator->boundsBox.rotation[1] = 0.0f;
+        iterator->boundsBox.rotation[2] = 0.0f;
+        iterator->boundsBox.rotation[3] = 1.0f;
+        iterator->boxes = &iterator->boundsBox;
+        iterator->count = 1u;
     }
-    float instanceMatrix[3][3];
-    QuaternionMatrix(transform->rotation, instanceMatrix);
+    QuaternionMatrix(transform->rotation, iterator->instanceMatrix);
     const float *scale = transform->scale;
-    const bool uniform = scale[0] == scale[1] && scale[1] == scale[2];
-    for (uint32_t i = 0u; i < count; ++i)
+    iterator->uniform = scale[0] == scale[1] && scale[1] == scale[2];
+}
+
+static inline void InstanceBox(MeshBoxIterator *iterator, uint32_t index, MeshObb *out)
+{
+    const LaiueMeshTransformV1 *transform = iterator->transform;
+    const LaiueMeshBoxV1 *box = &iterator->boxes[index];
+    const float *scale = transform->scale;
+    const float scaledCenter[3] = {box->center[0] * scale[0], box->center[1] * scale[1],
+                                   box->center[2] * scale[2]};
+    float rotatedCenter[3];
+    MatrixApply(iterator->instanceMatrix, scaledCenter, rotatedCenter);
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        out->center[axis] = transform->position.local[axis] + rotatedCenter[axis];
+    if (QuaternionIsIdentity(box->rotation))
     {
-        const LaiueMeshBoxV1 *box = &boxes[i];
-        MeshObb *out = &output[i];
-        const float scaledCenter[3] = {box->center[0] * scale[0], box->center[1] * scale[1],
-                                       box->center[2] * scale[2]};
-        float rotatedCenter[3];
-        MatrixApply(instanceMatrix, scaledCenter, rotatedCenter);
+        ObbFromMatrix(out, iterator->instanceMatrix);
         for (uint32_t axis = 0u; axis < 3u; ++axis)
-            out->center[axis] = transform->position.local[axis] + rotatedCenter[axis];
-        if (QuaternionIsIdentity(box->rotation))
-        {
-            ObbFromMatrix(out, instanceMatrix);
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
-                out->half[axis] = box->halfExtent[axis] * scale[axis];
-        }
-        else if (uniform)
-        {
-            float combined[4];
-            float matrix[3][3];
-            QuaternionMultiply(transform->rotation, box->rotation, combined);
-            QuaternionMatrix(combined, matrix);
-            ObbFromMatrix(out, matrix);
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
-                out->half[axis] = box->halfExtent[axis] * scale[0];
-        }
-        else
-        {
-            /* A rotated box under non-uniform scale is no longer a box; its
-             * bounds in model axes are a conservative stand-in. */
-            float boxMatrix[3][3];
-            QuaternionMatrix(box->rotation, boxMatrix);
-            ObbFromMatrix(out, instanceMatrix);
-            for (uint32_t r = 0u; r < 3u; ++r)
-                out->half[r] = scale[r] * (AbsFloat(boxMatrix[r][0]) * box->halfExtent[0] +
-                                           AbsFloat(boxMatrix[r][1]) * box->halfExtent[1] +
-                                           AbsFloat(boxMatrix[r][2]) * box->halfExtent[2]);
-        }
+            out->half[axis] = box->halfExtent[axis] * scale[axis];
     }
+    else if (iterator->uniform)
+    {
+        float combined[4];
+        float matrix[3][3];
+        QuaternionMultiply(transform->rotation, box->rotation, combined);
+        QuaternionMatrix(combined, matrix);
+        ObbFromMatrix(out, matrix);
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            out->half[axis] = box->halfExtent[axis] * scale[0];
+    }
+    else
+    {
+        /* A rotated box under non-uniform scale is no longer a box; its
+         * bounds in model
+         * axes are a conservative stand-in. */
+        float boxMatrix[3][3];
+        QuaternionMatrix(box->rotation, boxMatrix);
+        ObbFromMatrix(out, iterator->instanceMatrix);
+        for (uint32_t r = 0u; r < 3u; ++r)
+            out->half[r] = scale[r] * (AbsFloat(boxMatrix[r][0]) * box->halfExtent[0] +
+                                       AbsFloat(boxMatrix[r][1]) * box->halfExtent[1] +
+                                       AbsFloat(boxMatrix[r][2]) * box->halfExtent[2]);
+    }
+}
+
+/* Transform a small contiguous batch before running its narrow phase. This
+ * keeps the transform
+ * and offset loops cache-friendly without a page-sized
+ * scratch array; the source order and
+ * arithmetic match the full-array path. */
+static inline uint32_t InstanceBoxBatch(MeshBoxIterator *iterator, uint32_t first,
+                                        const float offset[3], MeshObb output[MESH_BOX_BATCH_SIZE])
+{
+    const uint32_t remaining = iterator->count - first;
+    const uint32_t count = remaining < MESH_BOX_BATCH_SIZE ? remaining : MESH_BOX_BATCH_SIZE;
+    for (uint32_t index = 0u; index < count; ++index)
+        InstanceBox(iterator, first + index, &output[index]);
+    for (uint32_t index = 0u; index < count; ++index)
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            output[index].center[axis] += offset[axis];
     return count;
 }
 
@@ -464,13 +501,15 @@ static void ComputeInstanceBounds(const MeshShape *shape, const LaiueMeshTransfo
     for (uint32_t axis = 0u; axis < 3u; ++axis)
         bounds.center[axis] += transform->position.local[axis];
     ObbAabb(&bounds, outMin, outMax);
-    MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
-    const uint32_t count = BuildInstanceBoxes(shape, transform, boxes);
-    for (uint32_t i = 0u; i < count; ++i)
+    MeshBoxIterator iterator;
+    BeginInstanceBoxes(shape, transform, &iterator);
+    for (uint32_t i = 0u; i < iterator.count; ++i)
     {
+        MeshObb box;
         float boxMin[3];
         float boxMax[3];
-        ObbAabb(&boxes[i], boxMin, boxMax);
+        InstanceBox(&iterator, i, &box);
+        ObbAabb(&box, boxMin, boxMax);
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
             outMin[axis] = MinFloat(outMin[axis], boxMin[axis]);
@@ -1596,18 +1635,6 @@ static void VisitCells(const LaiueMeshWorldV1 *world, const LaiueMeshCellV1 *ref
     }
 }
 
-/* Collision boxes of a slot in the query frame. */
-static uint32_t SlotBoxes(const LaiueMeshWorldV1 *world, const MeshSlot *slot,
-                          const float offset[3], MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES])
-{
-    const uint32_t count =
-        BuildInstanceBoxes(FindShape(world, slot->model), &slot->transform, boxes);
-    for (uint32_t i = 0u; i < count; ++i)
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-            boxes[i].center[axis] += offset[axis];
-    return count;
-}
-
 static bool SlotBoundsOverlap(const MeshSlot *slot, const float offset[3], const float queryMin[3],
                               const float queryMax[3])
 {
@@ -1861,14 +1888,20 @@ static bool SweepVisitor(void *context, const LaiueMeshWorldV1 *world, const Mes
         if ((slot->flags & LAIUE_MESH_INSTANCE_COLLIDABLE) == 0u ||
             !SlotBoundsOverlap(slot, offset, state->queryMin, state->queryMax))
             continue;
-        MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
-        const uint32_t count = SlotBoxes(world, slot, offset, boxes);
-        for (uint32_t b = 0u; b < count; ++b)
+        MeshBoxIterator iterator;
+        BeginInstanceBoxes(FindShape(world, slot->model), &slot->transform, &iterator);
+        for (uint32_t first = 0u; first < iterator.count; first += MESH_BOX_BATCH_SIZE)
         {
-            float time;
-            float normal[3];
-            if (SweepAgainstObb(state->start, state->half, state->delta, &boxes[b], &time, normal))
-                OfferHit(state, time, normal, MakeHandle(world, slotIndex));
+            MeshObb boxes[MESH_BOX_BATCH_SIZE];
+            const uint32_t count = InstanceBoxBatch(&iterator, first, offset, boxes);
+            for (uint32_t b = 0u; b < count; ++b)
+            {
+                float time;
+                float normal[3];
+                if (SweepAgainstObb(state->start, state->half, state->delta, &boxes[b], &time,
+                                    normal))
+                    OfferHit(state, time, normal, MakeHandle(world, slotIndex));
+            }
         }
     }
     return true;
@@ -1997,14 +2030,19 @@ static bool RayVisitor(void *context, const LaiueMeshWorldV1 *world, const MeshC
         if ((slot->flags & LAIUE_MESH_INSTANCE_COLLIDABLE) == 0u ||
             !SlotBoundsOverlap(slot, offset, state->queryMin, state->queryMax))
             continue;
-        MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
-        const uint32_t count = SlotBoxes(world, slot, offset, boxes);
-        for (uint32_t b = 0u; b < count; ++b)
+        MeshBoxIterator iterator;
+        BeginInstanceBoxes(FindShape(world, slot->model), &slot->transform, &iterator);
+        for (uint32_t first = 0u; first < iterator.count; first += MESH_BOX_BATCH_SIZE)
         {
-            float time;
-            float normal[3];
-            if (RayAgainstObb(state->origin, state->segment, &boxes[b], &time, normal))
-                OfferHit(&state->hits, time, normal, MakeHandle(world, slotIndex));
+            MeshObb boxes[MESH_BOX_BATCH_SIZE];
+            const uint32_t count = InstanceBoxBatch(&iterator, first, offset, boxes);
+            for (uint32_t b = 0u; b < count; ++b)
+            {
+                float time;
+                float normal[3];
+                if (RayAgainstObb(state->origin, state->segment, &boxes[b], &time, normal))
+                    OfferHit(&state->hits, time, normal, MakeHandle(world, slotIndex));
+            }
         }
     }
     return true;
@@ -2190,26 +2228,31 @@ static bool OverlapVisitor(void *context, const LaiueMeshWorldV1 *world, const M
         if ((slot->flags & LAIUE_MESH_INSTANCE_COLLIDABLE) == 0u ||
             !SlotBoundsOverlap(slot, offset, state->queryMin, state->queryMax))
             continue;
-        MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
-        const uint32_t count = SlotBoxes(world, slot, offset, boxes);
-        for (uint32_t b = 0u; b < count; ++b)
+        MeshBoxIterator iterator;
+        BeginInstanceBoxes(FindShape(world, slot->model), &slot->transform, &iterator);
+        for (uint32_t first = 0u; first < iterator.count; first += MESH_BOX_BATCH_SIZE)
         {
-            float boxMin[3];
-            float boxMax[3];
-            ObbAabb(&boxes[b], boxMin, boxMax);
-            if (!BoundsOverlap(boxMin, boxMax, state->queryMin, state->queryMax))
-                continue;
-            if (state->count < state->capacity)
+            MeshObb boxes[MESH_BOX_BATCH_SIZE];
+            const uint32_t count = InstanceBoxBatch(&iterator, first, offset, boxes);
+            for (uint32_t b = 0u; b < count; ++b)
             {
-                LaiueMeshColliderV1 *out = &state->output[state->count];
-                for (uint32_t axis = 0u; axis < 3u; ++axis)
+                float boxMin[3];
+                float boxMax[3];
+                ObbAabb(&boxes[b], boxMin, boxMax);
+                if (!BoundsOverlap(boxMin, boxMax, state->queryMin, state->queryMax))
+                    continue;
+                if (state->count < state->capacity)
                 {
-                    out->minimum[axis] = boxMin[axis] - state->reference[axis];
-                    out->maximum[axis] = boxMax[axis] - state->reference[axis];
+                    LaiueMeshColliderV1 *out = &state->output[state->count];
+                    for (uint32_t axis = 0u; axis < 3u; ++axis)
+                    {
+                        out->minimum[axis] = boxMin[axis] - state->reference[axis];
+                        out->maximum[axis] = boxMax[axis] - state->reference[axis];
+                    }
+                    out->instance = MakeHandle(world, slotIndex);
                 }
-                out->instance = MakeHandle(world, slotIndex);
+                ++state->count;
             }
-            ++state->count;
         }
     }
     return true;
@@ -2294,11 +2337,15 @@ static bool BlockVisitor(void *context, const LaiueMeshWorldV1 *world, const Mes
         if ((slot->flags & LAIUE_MESH_INSTANCE_COLLIDABLE) == 0u ||
             !SlotBoundsOverlap(slot, offset, state->queryMin, state->queryMax))
             continue;
-        MeshObb boxes[LAIUE_MESH_WORLD_MAX_SHAPE_BOXES];
-        const uint32_t count = SlotBoxes(world, slot, offset, boxes);
-        for (uint32_t b = 0u; b < count; ++b)
+        MeshBoxIterator iterator;
+        BeginInstanceBoxes(FindShape(world, slot->model), &slot->transform, &iterator);
+        for (uint32_t b = 0u; b < iterator.count; ++b)
         {
-            if (OverlapObb(state->center, state->half, &boxes[b]))
+            MeshObb box;
+            InstanceBox(&iterator, b, &box);
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                box.center[axis] += offset[axis];
+            if (OverlapObb(state->center, state->half, &box))
             {
                 state->solid = true;
                 return false;

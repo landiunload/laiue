@@ -46,6 +46,7 @@ option(LAIUE_BUILD_AUDIO_OUTPUT "Build the optional WASAPI/ALSA audio output pro
 option(LAIUE_BUILD_AUDIO_PACK "Build the optional audio pack/decoder module" ON)
 option(LAIUE_BUILD_UI "Build the backend-neutral UI module" ON)
 option(LAIUE_BUILD_MODEL "Build the model pack module (OBJ and .lo)" ON)
+option(LAIUE_BUILD_ANIMATION "Build the animation pack module (.lk)" ON)
 option(LAIUE_BUILD_MESH_WORLD "Build the infinite mesh world module" ON)
 
 # Набор графического backend-а не выбирает оконный и вводный provider.
@@ -111,6 +112,9 @@ if(LAIUE_BUILD_UI)
 endif()
 if(LAIUE_BUILD_MODEL)
     add_subdirectory(src/assets/model)
+endif()
+if(LAIUE_BUILD_ANIMATION)
+    add_subdirectory(src/assets/animation)
 endif()
 if(LAIUE_BUILD_MESH_WORLD)
     add_subdirectory(src/simulation/mesh_world)
@@ -189,9 +193,9 @@ set_target_properties(laiue_engine PROPERTIES EXPORT_NAME engine)
 # performs one final link with every engine-core object.
 if(LAIUE_PLATFORM_EXTERNAL AND
    LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
-    string(CONCAT _laiue_static_core_link
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,"
-        "laiue_numeric,laiue_world,laiue_physics,laiue_task,laiue_content,laiue_character,laiue_voxel,laiue_mod>")
+    get_property(_laiue_static_core_targets GLOBAL PROPERTY LAIUE_RUNTIME_CORE_TARGETS)
+    list(JOIN _laiue_static_core_targets "," _laiue_static_core_names)
+    set(_laiue_static_core_link "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_laiue_static_core_names}>")
     add_executable(laiue_static_core_link_smoke
         tests/static_core_link_smoke.c)
     target_link_libraries(laiue_static_core_link_smoke PRIVATE
@@ -301,9 +305,19 @@ if(TARGET laiue_model)
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/model"
         COMPONENT Engine)
 endif()
+if(TARGET laiue_animation)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/assets/animation/animation_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/animation"
+        COMPONENT Engine)
+endif()
 if(TARGET laiue_mesh_world)
     install(FILES "${PROJECT_SOURCE_DIR}/src/simulation/mesh_world/mesh_world_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh_world"
+        COMPONENT Engine)
+endif()
+if(TARGET laiue_mesh_world_render)
+    install(FILES "${PROJECT_SOURCE_DIR}/src/graphics/mesh_world_render/mesh_world_render_service.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/mesh_world_render"
         COMPONENT Engine)
 endif()
 # Заголовки ставятся по собранным целям, а не по одному флагу графики:
@@ -317,6 +331,7 @@ endif()
 if(TARGET laiue_audio)
     install(FILES
             "${PROJECT_SOURCE_DIR}/src/audio/audio.h"
+            "${PROJECT_SOURCE_DIR}/src/audio/audio_stream.h"
             "${PROJECT_SOURCE_DIR}/src/audio/audio_offscreen.h"
             "${PROJECT_SOURCE_DIR}/src/audio/audio_service.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue/audio"
@@ -497,6 +512,7 @@ option(LAIUE_BUILD_ANDROID_WALK
     OFF)
 if(LAIUE_BUILD_EXAMPLES)
     add_subdirectory(examples/walk)
+    add_subdirectory(examples/mesh_world)
 endif()
 
 if(LAIUE_BUILD_TOOLS)

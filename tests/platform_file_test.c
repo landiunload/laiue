@@ -131,6 +131,65 @@ static void TestPrefixes(FileTestState *state)
            "missing outputs accepted");
 }
 
+static void TestReadAt(FileTestState *state)
+{
+    PlatformReadFile file = {0};
+    uint64_t size = 0u;
+    uint32_t read = 0u;
+    Expect(PlatformWideToUtf8(state->file, state->nativePath, sizeof(state->nativePath), NULL),
+           "readAt UTF-8 path");
+    Expect(PlatformFileOpenRead(state->nativePath, &file, &size) && size == FILE_BYTES,
+           "readAt open regular file");
+    static const uint32_t offsets[] = {4097u, 3u, 8190u, 0u, FILE_BYTES, FILE_BYTES + 19u};
+    for (uint32_t i = 0u; i < sizeof(offsets) / sizeof(offsets[0]); ++i)
+    {
+        for (uint32_t j = 0u; j < sizeof(state->buffer); ++j)
+            state->buffer[j] = 0xc7u;
+        const uint32_t offset = offsets[i];
+        const uint32_t expected =
+            offset >= FILE_BYTES ? 0u : (FILE_BYTES - offset < 17u ? FILE_BYTES - offset : 17u);
+        Expect(PlatformFileReadAt(&file, offset, state->buffer + 1u, 17u, &read) &&
+                   read == expected,
+               "readAt random offset and EOF");
+        Expect(state->buffer[0] == 0xc7u && state->buffer[expected + 1u] == 0xc7u,
+               "readAt caller guards");
+        for (uint32_t j = 0u; j < expected; ++j)
+            Expect(state->buffer[j + 1u] == state->pattern[offset + j], "readAt contents");
+    }
+    Expect(PlatformFileReadAt(&file, 0u, NULL, 0u, &read) && read == 0u, "readAt zero count");
+    Expect(!PlatformFileReadAt(&file, UINT64_MAX, state->buffer, 1u, &read) && read == 0u,
+           "readAt overflowing offset");
+    Expect(!PlatformFileReadAt(&file, 0u, NULL, 1u, &read) && read == 0u,
+           "readAt rejects NULL destination");
+    Expect(!PlatformFileReadAt(&file, 0u, state->buffer, 1u, NULL), "readAt requires byte count");
+    PlatformFileClose(&file);
+    PlatformFileClose(&file);
+    Expect(file.opaque[0] == 0u && !PlatformFileReadAt(&file, 0u, state->buffer, 1u, &read),
+           "readAt closed descriptor rejected");
+    Expect(PlatformWideToUtf8(state->root, state->nativePath, sizeof(state->nativePath), NULL),
+           "readAt directory path");
+    Expect(!PlatformFileOpenRead(state->nativePath, &file, &size) && size == 0u,
+           "readAt directory rejected");
+    Expect(PlatformWideToUtf8(state->empty, state->nativePath, sizeof(state->nativePath), NULL),
+           "readAt empty path");
+    Expect(PlatformFileOpenRead(state->nativePath, &file, &size) && size == 0u &&
+               PlatformFileReadAt(&file, 0u, state->buffer, 1u, &read) && read == 0u,
+           "readAt empty file");
+    PlatformFileClose(&file);
+}
+
+static void ExpectReadAtRejected(FileTestState *state, const wchar_t *path)
+{
+    PlatformReadFile file = {0};
+    uint64_t size = UINT64_MAX;
+    Expect(PlatformWideToUtf8(path, state->nativePath, sizeof(state->nativePath), NULL),
+           "special reader native path");
+    Expect(!PlatformFileOpenRead(state->nativePath, &file, &size) && size == 0u &&
+               file.opaque[0] == 0u,
+           "random-access reader rejects special files without keeping a handle");
+    PlatformFileClose(&file);
+}
+
 static void TestSpecialFiles(FileTestState *state)
 {
 #if defined(_WIN32)
@@ -141,6 +200,7 @@ static void TestSpecialFiles(FileTestState *state)
     if (linked)
     {
         ExpectRejected(state->link, UINT64_MAX, NULL, 0U, "symbolic link accepted");
+        ExpectReadAtRejected(state, state->link);
         Expect(PlatformDeleteFile(state->link), "delete symbolic link");
     }
     else
@@ -149,17 +209,20 @@ static void TestSpecialFiles(FileTestState *state)
         LaiueTestRuntimeWrite("file symlink check skipped: Windows privilege unavailable\n");
     }
     ExpectRejected(L"NUL", UINT64_MAX, NULL, 0U, "character device accepted");
+    ExpectReadAtRejected(state, L"NUL");
 #else
     Expect(PlatformWideToUtf8(state->link, state->nativePath, sizeof(state->nativePath), NULL),
            "symbolic link native path");
     Expect(symlink("data.bin", state->nativePath) == 0, "create symbolic link");
     ExpectRejected(state->link, UINT64_MAX, NULL, 0U, "symbolic link accepted");
+    ExpectReadAtRejected(state, state->link);
     Expect(PlatformDeleteFile(state->link), "delete symbolic link");
     Expect(PlatformWideToUtf8(state->special, state->nativePath, sizeof(state->nativePath), NULL),
            "FIFO native path");
     Expect(mkfifo(state->nativePath, 0600) == 0, "create FIFO");
     /* No writer exists: omitting O_NONBLOCK in the reader would hang here. */
     ExpectRejected(state->special, UINT64_MAX, NULL, 0U, "FIFO accepted");
+    ExpectReadAtRejected(state, state->special);
     Expect(PlatformDeleteFile(state->special), "delete FIFO");
     ExpectRejected(L"/dev/null", UINT64_MAX, NULL, 0U, "character device accepted");
 #endif
@@ -201,6 +264,16 @@ static void TestLargeFile(FileTestState *state)
     for (uint32_t index = 0U; index < bytes; ++index)
         Expect(state->buffer[index] == 0U, "sparse prefix must contain zeros");
     ExpectRejected(state->large, largeSize - 1U, NULL, 0U, "large-file limit truncated");
+    Expect(PlatformWideToUtf8(state->large, state->nativePath, sizeof(state->nativePath), NULL),
+           "readAt large file path");
+    PlatformReadFile reader = {0};
+    Expect(PlatformFileOpenRead(state->nativePath, &reader, &size) && size == largeSize &&
+               PlatformFileReadAt(&reader, largeSize - 3u, state->buffer, 17u, &bytes) &&
+               bytes == 3u,
+           "readAt preserves offsets beyond 4 GiB");
+    Expect(state->buffer[0] == 0u && state->buffer[1] == 0u && state->buffer[2] == 0u,
+           "readAt sparse tail contents");
+    PlatformFileClose(&reader);
     Expect(PlatformDeleteFile(state->large), "delete sparse file");
 }
 
@@ -240,6 +313,7 @@ LAIUE_TEST_ENTRY(PlatformFileTestEntryPoint)
     Join(state->large, state->root, L"large.bin");
     Expect(PlatformCreateDirectory(state->root), "fixture directory");
     TestPrefixes(state);
+    TestReadAt(state);
     TestSpecialFiles(state);
     TestLargeFile(state);
     Expect(PlatformDeleteFile(state->file) && PlatformDeleteFile(state->empty), "delete fixtures");

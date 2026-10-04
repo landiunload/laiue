@@ -718,6 +718,7 @@ endif()
 if(TARGET laiue_mesh_world)
     add_executable(laiue_mesh_world_test mesh_world_test.c)
     target_link_libraries(laiue_mesh_world_test PRIVATE laiue_bootstrap laiue_mesh_world)
+    target_compile_definitions(laiue_mesh_world_test PRIVATE LAIUE_STATIC=1)
     laiue_configure_standalone_executable(laiue_mesh_world_test MeshWorldTestEntryPoint)
     add_test(NAME laiue.mesh_world.queries COMMAND laiue_mesh_world_test)
 endif()
@@ -735,6 +736,7 @@ if(TARGET laiue_media_support)
         add_executable(laiue_model_pack_test model_pack_test.c)
         target_link_libraries(laiue_model_pack_test PRIVATE
             laiue_bootstrap laiue_model laiue::media_support)
+        target_compile_definitions(laiue_model_pack_test PRIVATE LAIUE_STATIC=1)
         laiue_configure_standalone_executable(laiue_model_pack_test ModelPackTestEntryPoint)
         add_dependencies(laiue_model_pack_test laiue_model laiue_content)
         add_test(NAME laiue.model.packs COMMAND laiue_model_pack_test)
@@ -753,6 +755,89 @@ if(TARGET laiue_media_support)
     target_link_libraries(laiue_soundc_test PRIVATE laiue::media_support)
     laiue_configure_standalone_executable(laiue_soundc_test SoundcTestEntryPoint)
     add_test(NAME laiue.tools.soundc COMMAND laiue_soundc_test)
+endif()
+
+if(TARGET laiue_mesh_world_render AND TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_render_test mesh_world_render_test.c)
+    target_link_libraries(laiue_mesh_world_render_test PRIVATE laiue_mesh_world_render laiue_mesh_world)
+    laiue_configure_standalone_executable(laiue_mesh_world_render_test MeshWorldRenderTestEntryPoint)
+    add_test(NAME laiue.mesh_world.render COMMAND laiue_mesh_world_render_test)
+
+    # Compile the same implementation with test-only allocator substitution.
+    # Production modules keep the ordinary platform ABI and source ownership.
+    configure_file(
+        "${PROJECT_SOURCE_DIR}/src/graphics/mesh_world_render/mesh_world_render.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/mesh_world_render_failure_subject.c" COPYONLY)
+    add_library(laiue_mesh_world_render_failure_subject OBJECT
+        "${CMAKE_CURRENT_BINARY_DIR}/mesh_world_render_failure_subject.c")
+    target_link_libraries(laiue_mesh_world_render_failure_subject PRIVATE
+        laiue_common laiue::math_support)
+    target_compile_definitions(laiue_mesh_world_render_failure_subject PRIVATE
+        LAIUE_STATIC=1 PlatformAllocate=RendererTestAllocate
+        PlatformReallocate=RendererTestReallocate PlatformFree=RendererTestFree)
+    add_executable(laiue_mesh_world_render_failure_test
+        mesh_world_render_failure_test.c
+        $<TARGET_OBJECTS:laiue_mesh_world_render_failure_subject>)
+    target_link_libraries(laiue_mesh_world_render_failure_test PRIVATE
+        laiue_mesh_world laiue::math_support)
+    target_compile_definitions(laiue_mesh_world_render_failure_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(laiue_mesh_world_render_failure_test
+        MeshWorldRenderFailureTestEntryPoint)
+    add_test(NAME laiue.mesh_world.render_failure COMMAND laiue_mesh_world_render_failure_test)
+endif()
+
+if(TARGET laiue_mesh_world_demo AND TARGET laiue_model AND TARGET laiue_content
+   AND TARGET laiue_mesh_world AND TARGET laiue_mesh_world_render)
+    add_test(NAME laiue.mesh_world.demo_headless COMMAND laiue_mesh_world_demo --headless 12)
+    set_tests_properties(laiue.mesh_world.demo_headless PROPERTIES TIMEOUT 60)
+endif()
+
+if(TARGET laiue_mesh_world_demo_common AND TARGET laiue_mesh_world)
+    add_executable(laiue_mesh_world_demo_world_test mesh_world_demo_world_test.c)
+    target_link_libraries(laiue_mesh_world_demo_world_test PRIVATE laiue_bootstrap
+        laiue_mesh_world_demo_common laiue_mesh_world)
+    target_compile_definitions(laiue_mesh_world_demo_world_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(laiue_mesh_world_demo_world_test MeshWorldDemoWorldTestEntryPoint)
+    add_test(NAME laiue.mesh_world.demo_world COMMAND laiue_mesh_world_demo_world_test)
+endif()
+
+if(TARGET laiue_animation)
+    add_executable(laiue_animation_test animation_test.c)
+    target_link_libraries(laiue_animation_test PRIVATE laiue_animation laiue::media_support)
+    laiue_configure_standalone_executable(laiue_animation_test AnimationTestEntryPoint)
+    add_test(NAME laiue.animation.sampling COMMAND laiue_animation_test)
+endif()
+
+if(TARGET laiue_media_support)
+    add_executable(laiue_animation_codec_test animation_codec_test.c)
+    target_link_libraries(laiue_animation_codec_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_animation_codec_test AnimationCodecTestEntryPoint)
+    add_test(NAME laiue.media.animation_codec COMMAND laiue_animation_codec_test)
+endif()
+
+if(TARGET laiue_animation AND TARGET laiue_content AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    add_executable(laiue_animation_pack_test animation_pack_test.c)
+    target_link_libraries(laiue_animation_pack_test PRIVATE laiue_bootstrap laiue_animation laiue_content
+        laiue::media_support)
+    target_compile_definitions(laiue_animation_pack_test PRIVATE LAIUE_STATIC=1)
+    laiue_configure_standalone_executable(laiue_animation_pack_test AnimationPackTestEntryPoint)
+    add_dependencies(laiue_animation_pack_test laiue_content)
+    add_test(NAME laiue.animation.packs COMMAND laiue_animation_pack_test)
+endif()
+
+if(TARGET laiue_audio)
+    add_executable(laiue_audio_stream_test audio_stream_test.c)
+    target_link_libraries(laiue_audio_stream_test PRIVATE laiue_audio)
+    laiue_configure_standalone_executable(laiue_audio_stream_test AudioStreamTestEntryPoint)
+    add_test(NAME laiue.audio.streaming COMMAND laiue_audio_stream_test)
+    set_tests_properties(laiue.audio.streaming PROPERTIES TIMEOUT 60)
+endif()
+if(TARGET laiue_media_support)
+    add_executable(laiue_audio_stream_decoder_test audio_stream_decoder_test.c)
+    target_link_libraries(laiue_audio_stream_decoder_test PRIVATE laiue::media_support)
+    laiue_configure_standalone_executable(laiue_audio_stream_decoder_test AudioStreamDecoderTestEntryPoint)
+    add_test(NAME laiue.media.sound_stream COMMAND laiue_audio_stream_decoder_test)
 endif()
 
 if(TARGET laiue_media_support)

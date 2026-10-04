@@ -83,11 +83,34 @@ static double BitsToDouble(uint64_t bits)
     return cast.value;
 }
 
+static bool WaveMemoryRead(void *context, uint64_t offset, void *bytes, uint32_t count)
+{
+    const uint8_t *source = (const uint8_t *)context + (size_t)offset;
+    uint8_t *target = (uint8_t *)bytes;
+    for (uint32_t index = 0u; index < count; ++index)
+        target[index] = source[index];
+    return true;
+}
+
 WaveStatus WaveInspect(const void *bytes, uint32_t sizeBytes, WaveInfo *outInfo)
 {
-    if (bytes == NULL || outInfo == NULL) return WAVE_INVALID_ARGUMENT;
-    const uint8_t *file = (const uint8_t *)bytes;
+    if (bytes == NULL)
+        return WAVE_INVALID_ARGUMENT;
+    SoundReader reader = {(void *)bytes, WaveMemoryRead, sizeBytes};
+    return WaveInspectReader(&reader, outInfo);
+}
+
+WaveStatus WaveInspectReader(const SoundReader *reader, WaveInfo *outInfo)
+{
+    if (reader == NULL || reader->readAt == NULL || outInfo == NULL)
+        return WAVE_INVALID_ARGUMENT;
+    if (reader->sizeBytes > UINT32_MAX)
+        return WAVE_TOO_LARGE;
+    uint32_t sizeBytes = (uint32_t)reader->sizeBytes;
+    uint8_t file[12];
     if (sizeBytes < 12u) return WAVE_NOT_RIFF;
+    if (!reader->readAt(reader->context, 0u, file, sizeof(file)))
+        return WAVE_TRUNCATED;
     if (!TagEquals(file, "RIFF") || !TagEquals(file + 8, "WAVE")) return WAVE_NOT_RIFF;
 
     bool haveFormat = false;
@@ -100,9 +123,11 @@ WaveStatus WaveInspect(const void *bytes, uint32_t sizeBytes, WaveInfo *outInfo)
     uint32_t dataBytes = 0u;
 
     uint32_t cursor = 12u;
-    while (cursor + 8u <= sizeBytes)
+    while (cursor <= sizeBytes && sizeBytes - cursor >= 8u)
     {
-        const uint8_t *chunk = file + cursor;
+        uint8_t chunk[8];
+        if (!reader->readAt(reader->context, cursor, chunk, sizeof(chunk)))
+            return WAVE_TRUNCATED;
         uint32_t chunkBytes = ReadU32Le(chunk + 4);
         uint32_t payload = cursor + 8u;
         if (chunkBytes > sizeBytes - payload)
@@ -117,7 +142,10 @@ WaveStatus WaveInspect(const void *bytes, uint32_t sizeBytes, WaveInfo *outInfo)
         if (TagEquals(chunk, "fmt "))
         {
             if (chunkBytes < 16u) return WAVE_TRUNCATED;
-            const uint8_t *format = file + payload;
+            uint8_t format[40];
+            uint32_t formatBytes = chunkBytes < sizeof(format) ? chunkBytes : sizeof(format);
+            if (!reader->readAt(reader->context, payload, format, formatBytes))
+                return WAVE_TRUNCATED;
             formatTag = ReadU16Le(format);
             channelCount = ReadU16Le(format + 2);
             sampleRate = ReadU32Le(format + 4);
@@ -138,7 +166,10 @@ WaveStatus WaveInspect(const void *bytes, uint32_t sizeBytes, WaveInfo *outInfo)
         }
 
         // Чанки выровнены по чётной границе, а объявленный размер — нет.
-        cursor = payload + chunkBytes + (chunkBytes & 1u);
+        uint64_t next = (uint64_t)payload + chunkBytes + (chunkBytes & 1u);
+        if (next > sizeBytes)
+            break;
+        cursor = (uint32_t)next;
     }
 
     if (!haveFormat) return WAVE_MISSING_FORMAT;
