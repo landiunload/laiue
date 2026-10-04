@@ -273,8 +273,13 @@ static VoiceGains ComputeGains(float volume, float pan)
 
 static double ComputeStep(uint32_t clipSampleRate, uint32_t deviceSampleRate, float speed)
 {
-    /* NaN must not reach the sample-index conversions. */
-    if (!(speed >= AUDIO_MIN_SPEED))
+    /* Classify input bits before FP arithmetic: fast FP on Windows ARM64
+     * may assume ordered
+     * comparisons and let a NaN pass a range check. */
+    const uint32_t speedBits = FloatToBits(speed);
+    if ((speedBits & UINT32_C(0x7F800000)) == UINT32_C(0x7F800000))
+        speed = speedBits == UINT32_C(0x7F800000) ? AUDIO_MAX_SPEED : AUDIO_MIN_SPEED;
+    else if (speed < AUDIO_MIN_SPEED)
         speed = AUDIO_MIN_SPEED;
     float clampedSpeed = ClampFloat(speed, AUDIO_MIN_SPEED, AUDIO_MAX_SPEED);
     return ((double)clipSampleRate / (double)deviceSampleRate) * (double)clampedSpeed;

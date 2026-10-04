@@ -662,6 +662,11 @@ Clang-cl Release воспроизвёл ошибку проверки переп
 профиль PRECISE_FP, как для модельного мира и animation; проверки конечности
 и границы float не зависят от предположения компилятора об отсутствии Inf.
 
+MSVC ARM64 Release также выявил проход NaN speed через FP range check
+микшера. Классификация speed перенесена на IEEE-биты до вычисления шага;
+существующая регрессия экстремального sample rate сохранена. SIMD-микшер
+и его быстрый FP-профиль не меняются.
+
 CI собирает и тестирует MSVC/clang-cl x64/ARM64, Linux GCC/Clang,
 ASan/UBSan, musl, ARM64, фаззеры, Vulkan/X11 с Xvfb/lavapipe, macOS x64/ARM64;
 Android/iOS проверяются компиляцией и whole-archive линковкой всех CORE
