@@ -426,15 +426,16 @@ jobs:
             "$RUNNER_TEMP/laiue-sdk-tools.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-sdk-tools.zip" -d "$RUNNER_TEMP/laiue-sdk-tools"
           tools="$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin"
-          test "$("$tools/sdkmanager" --version)" = '22.0'
+          grep -Fx 'Pkg.Revision=22.0' "$tools/../source.properties"
+          "$tools/android" --no-metrics --sdk="$ANDROID_HOME" --version \
+            > build/android-runtime-results/tool-versions.txt
           for ((answer=0; answer<32; ++answer)); do printf 'y\n'; done \
             > "$RUNNER_TEMP/laiue-sdk-answers.txt"
-          "$tools/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses \
-            < "$RUNNER_TEMP/laiue-sdk-answers.txt"
-          "$tools/sdkmanager" --sdk_root="$ANDROID_HOME" --install \
-            'platforms;android-35' 'build-tools;35.0.0' \
-            'system-images;android-35;google_apis;x86_64' \
-            < "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          for package in platforms/android-35 build-tools/35.0.0 \
+            system-images/android-35/google_apis/x86_64; do
+            "$tools/android" --no-metrics --sdk="$ANDROID_HOME" sdk install "$package" \
+              < "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          done
           curl --fail --location --connect-timeout 20 --max-time 180 --retry 2 \
             https://dl.google.com/android/repository/emulator-linux_x64-15917651.zip \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
@@ -444,7 +445,7 @@ jobs:
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"
           grep -Fx 'Pkg.Revision=37.1.11' "$emulator/source.properties"
           grep -Fx 'Pkg.BuildId=15917651' "$emulator/source.properties"
-          "$emulator/emulator" -version > build/android-runtime-results/tool-versions.txt
+          "$emulator/emulator" -version >> build/android-runtime-results/tool-versions.txt
           printf '\nNDK: 29.0.14206865; command-line tools: 22.0; build-tools: 35.0.0\n' \
             >> build/android-runtime-results/tool-versions.txt
           cat "$ANDROID_HOME/system-images/android-35/google_apis/x86_64/source.properties" \
@@ -471,25 +472,52 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
+          test "$ANDROID_AVD_HOME" = "$RUNNER_TEMP/laiue-avd"
+          boot_deadline=$((SECONDS + 180))
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator/emulator"
           timeout 15s "$emulator" -accel-check
-          printf 'no\n' | "$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin/avdmanager" \
-            create avd --force --name laiue-ci-api35 --device nexus_6 \
-            --package 'system-images;android-35;google_apis;x86_64'
-          cat >> "$ANDROID_AVD_HOME/laiue-ci-api35.avd/config.ini" <<'CONFIG'
+          # Android CLI create selects its own image from a device profile.
+          # Write the AOSP AVD layout to preserve the pinned API 35 image.
+          avd_dir="$ANDROID_AVD_HOME/laiue-ci-api35.avd"
+          mkdir -p "$avd_dir"
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-35\n' \
+            "$avd_dir" > "$ANDROID_AVD_HOME/laiue-ci-api35.ini"
+          cat > "$avd_dir/config.ini" <<CONFIG
+          AvdId=laiue-ci-api35
+          avd.ini.displayname=laiue-ci-api35
+          avd.ini.encoding=UTF-8
+          abi.type=x86_64
+          hw.cpu.arch=x86_64
+          hw.cpu.ncore=2
+          hw.ramSize=2048
+          vm.heapSize=256
+          disk.dataPartition.size=2G
+          hw.keyboard=yes
+          hw.mainKeys=no
+          hw.accelerometer=yes
+          hw.sensors.orientation=yes
+          hw.initialOrientation=portrait
           hw.lcd.width=1080
           hw.lcd.height=1920
           hw.lcd.density=420
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader
+          hw.camera.back=none
+          hw.camera.front=none
+          fastboot.forceColdBoot=yes
+          image.sysdir.1=$ANDROID_HOME/system-images/android-35/google_apis/x86_64/
+          tag.id=google_apis
+          tag.display=Google APIs
           CONFIG
+          "$emulator" -list-avds | grep -Fx laiue-ci-api35
           setsid timeout --signal=TERM --kill-after=10s 600s "$emulator" \
             -avd laiue-ci-api35 -no-snapshot -no-boot-anim -no-audio -no-window \
             -gpu swiftshader -accel on -port 5554 -cores 2 -memory 2048 \
             > build/android-runtime-results/emulator.log 2>&1 &
           printf '%s\n' "$!" > "$RUNNER_TEMP/laiue-emulator.pid"
           adb="$ANDROID_HOME/platform-tools/adb"
-          timeout 180s "$adb" -s emulator-5554 wait-for-device
-          boot_deadline=$((SECONDS + 150))
-          until [ "$(timeout 10s "$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1 ]; do
+          timeout 90s "$adb" -s emulator-5554 wait-for-device
+          until [ "$(timeout 5s "$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1 ]; do
             if [ "$SECONDS" -ge "$boot_deadline" ]; then
               cat build/android-runtime-results/emulator.log
               exit 1
@@ -499,7 +527,7 @@ jobs:
           timeout 10s "$adb" -s emulator-5554 shell input keyevent KEYCODE_WAKEUP
           timeout 10s "$adb" -s emulator-5554 shell wm dismiss-keyguard
       - name: Verify native Android gameplay, rotation and resume
-        timeout-minutes: 5
+        timeout-minutes: 6
         shell: pwsh
         run: |
           ./tools/test_android_walk.ps1 `
@@ -518,11 +546,21 @@ jobs:
             emulator_pid="$(cat "$pid_file")"
             if [[ ! "$emulator_pid" =~ ^[0-9]+$ ]]; then exit 1; fi
             if kill -0 -- "-$emulator_pid" 2>/dev/null; then
-              kill -TERM -- "-$emulator_pid"
+              if ! kill -TERM -- "-$emulator_pid" 2>/dev/null \
+                && kill -0 -- "-$emulator_pid" 2>/dev/null; then exit 1; fi
+              stop_deadline=$((SECONDS + 15))
+              while kill -0 -- "-$emulator_pid" 2>/dev/null; do
+                if [ "$SECONDS" -ge "$stop_deadline" ]; then
+                  if ! kill -KILL -- "-$emulator_pid" 2>/dev/null \
+                    && kill -0 -- "-$emulator_pid" 2>/dev/null; then exit 1; fi
+                  break
+                fi
+                sleep 1
+              done
             fi
           fi
       - name: Upload Android runtime captures and diagnostics
-        if: always() && steps.prepare-runtime.outcome != 'skipped'
+        if: always() && hashFiles('build/android-runtime-results/**') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: laiue-walk-android-api35
