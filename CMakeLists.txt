@@ -215,6 +215,7 @@ if(LAIUE_PLATFORM_EXTERNAL AND
             MACOSX_BUNDLE TRUE
             MACOSX_BUNDLE_BUNDLE_NAME "LaiueCoreLinkSmoke"
             MACOSX_BUNDLE_GUI_IDENTIFIER "dev.laiue.core-link-smoke"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "dev.laiue.core-link-smoke"
             OUTPUT_NAME "LaiueCoreLinkSmoke"
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
     endif()
