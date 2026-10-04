@@ -3,6 +3,7 @@
 # передаёт приложение, поэтому модуль собирается и в headless-профилях и
 # тестируется подставным устройством.
 laiue_add_module(mesh_world_render
+    PRECISE_FP
     RUNTIME_ROLE CORE
     SOURCES
         mesh_world_render.c
