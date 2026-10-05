@@ -784,10 +784,40 @@ warnings, установила image revision 9 и проверила архив
 для `emulator -version`; в подготовку Ubuntu runner добавлен `libpulse0`.
 Это зависимость инструмента проверки, не Android-приложения или движка.
 
+Итоговый CI [`37230643264`](https://github.com/landiunload/laiue/actions/runs/37230643264)
+на `b457bfc` прошёл все 15 jobs: 2487 CTest passed, 21 штатный skip,
+0 failed. Все четыре Windows MSVC/Clang Debug/Release сценария — PASS.
+Android runtime artifact также PASS: 1280 тиков, девять последовательных
+ACK, 12 PNG с проверенными SHA-256 и повторным декодированием; подтверждены
+1080×1920 → 1920×1080, HOME/resume и восстановление настроек. Логи и
+artifacts сохранены в `D:/build/laiue/step1/ci-audit/37230643264`.
+Первый функциональный этап завершён.
+
+Аудит всех build/SDK/APK логов не выявил предупреждений компилятора,
+линкера, CMake или SDK CLI. Однако отдельный `emulator.log` содержит
+предупреждения самого emulator/SwiftShader и ошибку его завершения:
+24 WARNING, banner о выборе metrics и `stop: Not implemented`.
+16 строк относятся к запросам image-compression feature structs
+`1000338000`/`1000437000`, которых движок не использует. Эти сообщения
+сохранены, не отфильтрованы и не считаются доказательством чистоты всех
+внешних инструментов. Настройки запуска и завершения SDK проверяются
+отдельно; функциональный PASS не объявляется отсутствием этих diagnostics.
+
+По [Android 15 Vulkan loader](https://android.googlesource.com/platform/frameworks/native/+/refs/tags/android-15.0.0_r1/vulkan/libvulkan/driver.cpp#1202)
+эти feature structs добавляет системный loader при перечислении device
+extensions; удалять корректный Vulkan-запрос движка ради тишины нельзя.
+Для CI явно отключён необязательный сбор metrics эмулятора, установлены
+библиотеки с требуемыми X11 именами, подготовлен update-check ini, добавлен
+штатный `adb emu kill` с ограниченным ожиданием и TERM/KILL fallback.
+Нестабильный Quickboot не включается. Предупреждения bundled SwiftShader
+и emulator, не устраняемые настройкой, остаются явной границей SDK.
+
 Следующие шаги выполняются последовательно, с отдельным commit/push и
 проверкой CI после каждого: общий игровой runtime; индексные буферы и
 instancing; ограничения суставов ragdoll; анимации и skinned models;
 бюджеты мира/подготовка/LOD; оконные adapters; streaming audio; изоляция
 выбранных модов. На момент этой записи реализуется первый этап; завершение
 последующих не заявлено. Команды и контракты: `docs/walk_scenarios.md`
-и `docs/graphics_diagnostics.md`.
+и `docs/graphics_diagnostics.md`. После подтверждённого CI первого этапа
+начата реализация второго — общего `WalkGameplay` runtime; до её проверки
+он не считается завершённым.
