@@ -7,14 +7,22 @@
 #include "../examples/walk/walk_physics.h"
 #include "physics/physics_service.h"
 
+static WalkPhysicsContext linkedWalkPhysicsContext;
+static LaiuePhysicsServiceV1 linkedWalkPhysicsService;
+
 static inline bool BindLinkedWalkPhysics(void)
 {
     // MSVC не принимает адрес dllimport-функции в статическом инициализаторе
     // (C4232), поэтому таблица, переживающая вызов, заполняется здесь.
-    static LaiuePhysicsServiceV1 table;
-    table = (LaiuePhysicsServiceV1){
+    linkedWalkPhysicsService = (LaiuePhysicsServiceV1){
         .structSize = sizeof(LaiuePhysicsServiceV1),
         .abiVersion = LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
+        .configureThread = VoxelPhysicsConfigureThread,
+        .stepScratchBytes = VoxelRigidBodyStepScratchBytes,
+        .ragdollInitialize = VoxelRagdollInitialize,
+        .ragdollRelease = VoxelRagdollRelease,
+        .ragdollSettingsDefault = VoxelRagdollSettingsDefault,
+        .ragdollStep = VoxelRagdollStep,
         .bodyWake = VoxelRigidBodyWake,
         .ragdollJump = VoxelRagdollJump,
         .bodyLocalPosition = VoxelRigidBodyLocalPosition,
@@ -25,5 +33,6 @@ static inline bool BindLinkedWalkPhysics(void)
         .bodyAddAngularVelocity = VoxelRigidBodyAddAngularVelocity,
         .bodyTranslateBlocks = VoxelRigidBodyTranslateBlocks,
     };
-    return WalkPhysicsBind(&table, (uint32_t)sizeof(table));
+    return WalkPhysicsBind(&linkedWalkPhysicsContext, &linkedWalkPhysicsService,
+                           (uint32_t)sizeof(linkedWalkPhysicsService));
 }

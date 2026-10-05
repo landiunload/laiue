@@ -30,6 +30,14 @@ static VisualDevice testDevice;
 static VoxelRagdoll testRagdoll;
 static GuardedScratch guardedScratch;
 static LaiueGraphicsVertexV2 referenceVertices[WALK_RAGDOLL_VISUAL_VERTEX_COUNT];
+static uint64_t mesherScratchToken;
+static uint32_t mesherScratchReleases;
+
+static void DestroyMesherScratch(ChunkMesherScratch *scratch)
+{
+    if (scratch == (ChunkMesherScratch *)&mesherScratchToken)
+        ++mesherScratchReleases;
+}
 
 static void Expect(bool condition, const char *message)
 {
@@ -95,8 +103,9 @@ static void ExpectRejected(LaiueGraphicsDeviceV2 *device,
                             const double origin[3], const char *message)
 {
     const uint32_t uploads = testDevice.uploads;
-    Expect(!WalkVisualsUpdateRagdollBuffer(device, buffer, ragdoll, origin,
-                                          &guardedScratch.scratch), message);
+    Expect(!WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, device, buffer, ragdoll,
+                                           origin, &guardedScratch.scratch),
+           message);
     Expect(testDevice.uploads == uploads,
            "invalid visual input cannot submit a partially built mesh");
     CheckScratchGuards();
@@ -228,8 +237,8 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
     Expect(WalkVisualsCreateRagdollBuffer(&testDevice.api, &buffer) && buffer == 17u,
            "shared visuals create a buffer through a provider callback");
     const double origin[3] = {0.0, 0.0, 0.0};
-    Expect(WalkVisualsUpdateRagdollBuffer(&testDevice.api, buffer, &testRagdoll,
-                                         origin, &guardedScratch.scratch),
+    Expect(WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, &testDevice.api, buffer,
+                                          &testRagdoll, origin, &guardedScratch.scratch),
            "the complete shared humanoid mesh uploads successfully");
     CheckFiniteMesh();
     CheckTriangleGeometry();
@@ -237,8 +246,8 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
     memcpy(referenceVertices, testDevice.uploaded, sizeof(referenceVertices));
 
     const double shiftedOrigin[3] = {2.0, -3.0, 1.0};
-    Expect(WalkVisualsUpdateRagdollBuffer(&testDevice.api, buffer, &testRagdoll,
-                                         shiftedOrigin, &guardedScratch.scratch),
+    Expect(WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, &testDevice.api, buffer,
+                                          &testRagdoll, shiftedOrigin, &guardedScratch.scratch),
            "mesh generation accepts a camera-relative render origin");
     for (uint32_t vertex = 0u; vertex < WALK_RAGDOLL_VISUAL_VERTEX_COUNT; ++vertex)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -257,8 +266,8 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
                "all real physics body positions can be rebased");
     Expect(VoxelRigidBodyLocalPosition(&testRagdoll.bodies[0], movedCenter),
            "the translated physics body center is readable");
-    Expect(WalkVisualsUpdateRagdollBuffer(&testDevice.api, buffer, &testRagdoll,
-                                         origin, &guardedScratch.scratch),
+    Expect(WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, &testDevice.api, buffer,
+                                          &testRagdoll, origin, &guardedScratch.scratch),
            "visual geometry follows the translated physics pose");
     for (uint32_t vertex = 0u; vertex < WALK_RAGDOLL_VISUAL_VERTEX_COUNT; ++vertex)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
@@ -271,8 +280,8 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
     memcpy(referenceVertices, testDevice.uploaded, sizeof(referenceVertices));
     testRagdoll.bodies[WALK_RAGDOLL_PELVIS].orientation[2] = 0.7071067811865475;
     testRagdoll.bodies[WALK_RAGDOLL_PELVIS].orientation[3] = 0.7071067811865475;
-    Expect(WalkVisualsUpdateRagdollBuffer(&testDevice.api, buffer, &testRagdoll,
-                                         origin, &guardedScratch.scratch),
+    Expect(WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, &testDevice.api, buffer,
+                                          &testRagdoll, origin, &guardedScratch.scratch),
            "visual geometry accepts an independently rotated physics body");
     for (uint32_t vertex = 0u; vertex < 240u; ++vertex)
     {
@@ -337,8 +346,8 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
                    "missing upload callback fails cleanly");
     testDevice.api.uploadBuffer = UploadBuffer;
     testDevice.failUpload = true;
-    Expect(!WalkVisualsUpdateRagdollBuffer(&testDevice.api, buffer, &testRagdoll,
-                                          origin, &guardedScratch.scratch),
+    Expect(!WalkVisualsUpdateRagdollBuffer(&linkedWalkPhysicsContext, &testDevice.api, buffer,
+                                           &testRagdoll, origin, &guardedScratch.scratch),
            "a graphics-provider upload failure propagates to the caller");
     testDevice.failUpload = false;
     testDevice.failCreate = true;
@@ -351,6 +360,29 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
            "mesh cleanup releases its graphics allocation exactly once");
     WalkVisualsDestroyBuffer(&testDevice.api, &buffer);
     Expect(testDevice.destroys == 1u, "repeated mesh cleanup is harmless");
+    static WalkVisualChunkSet chunks;
+    chunks.scratch = (ChunkMesherScratch *)&mesherScratchToken;
+    chunks.centerValid = true;
+    chunks.chunks[0].buffers[0] = 17u;
+    chunks.chunks[0].ready = true;
+    chunks.chunks[WALK_VISUAL_CHUNK_COUNT - 1u].ready = true;
+    WalkVisualsInvalidateChunkSet(&testDevice.api, &chunks);
+    Expect(chunks.scratch == (ChunkMesherScratch *)&mesherScratchToken && !chunks.centerValid &&
+               !chunks.chunks[0].ready && !chunks.chunks[WALK_VISUAL_CHUNK_COUNT - 1u].ready &&
+               testDevice.destroys == 2u && mesherScratchReleases == 0u,
+           "provider-frame invalidation releases GPU geometry but retains mesher scratch");
+    WalkVisualsInvalidateChunkSet(&testDevice.api, &chunks);
+    Expect(testDevice.destroys == 2u && mesherScratchReleases == 0u,
+           "repeated invalidation does not release scratch or duplicate GPU destruction");
+    const LaiueMesherServiceV1 mesher = {
+        .structSize = sizeof(mesher),
+        .abiVersion = LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+        .scratchDestroy = DestroyMesherScratch,
+    };
+    WalkVisualsDestroyChunkSet(&testDevice.api, &mesher, &chunks);
+    WalkVisualsDestroyChunkSet(&testDevice.api, &mesher, &chunks);
+    Expect(chunks.scratch == NULL && mesherScratchReleases == 1u,
+           "final chunk cleanup releases retained scratch exactly once");
     CheckScratchGuards();
     VoxelRagdollRelease(&testRagdoll);
     LAIUE_TEST_SUCCESS();

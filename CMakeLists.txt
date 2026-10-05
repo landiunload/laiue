@@ -526,6 +526,26 @@ set_target_properties(laiue_walk_scenario_support PROPERTIES POSITION_INDEPENDEN
 option(LAIUE_BUILD_ANDROID_WALK
     "Build the NativeActivity/Vulkan Android walk client (requires Android NDK)"
     OFF)
+# Private game code is compiled once and reused by shells, tests and benchmarks.
+# Keep the archive out of the default build when none of those consumers is used.
+add_library(laiue_walk_common STATIC EXCLUDE_FROM_ALL
+    examples/walk/walk_runtime.c examples/walk/walk_runtime.h
+    examples/walk/walk_gameplay.c examples/walk/walk_gameplay.h
+    examples/walk/walk_humanoid.c examples/walk/walk_humanoid.h
+    examples/walk/walk_physics.c examples/walk/walk_physics.h
+    examples/walk/walk_visuals.c examples/walk/walk_visuals.h
+    examples/walk/walk_world.c examples/walk/walk_world.h)
+target_include_directories(laiue_walk_common PRIVATE
+    "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/src/assets"
+    "${PROJECT_SOURCE_DIR}/src/simulation")
+target_link_libraries(laiue_walk_common PRIVATE
+    laiue::build_options laiue::math_support
+    laiue_walk_scenario_support laiue_media_support)
+set_target_properties(laiue_walk_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(ANDROID OR LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
+    target_compile_definitions(laiue_walk_common PRIVATE LAIUE_STATIC=1)
+endif()
 if(LAIUE_BUILD_EXAMPLES)
     add_subdirectory(examples/walk)
     add_subdirectory(examples/mesh_world)

@@ -63,17 +63,23 @@ laiue_configure_standalone_executable(
 add_test(NAME laiue.platform.threading
     COMMAND laiue_platform_threading_test)
 
-add_executable(laiue_walk_runtime_test
-    walk_runtime_test.c
-    "${PROJECT_SOURCE_DIR}/examples/walk/walk.c")
-target_compile_definitions(laiue_walk_runtime_test PRIVATE
-    LAIUE_WALK_RUNTIME_ONLY=1)
+add_executable(laiue_walk_runtime_test walk_runtime_test.c)
+target_link_libraries(laiue_walk_runtime_test PRIVATE laiue_walk_common)
 target_include_directories(laiue_walk_runtime_test PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/examples/walk")
 laiue_configure_standalone_executable(
     laiue_walk_runtime_test WalkRuntimeTestEntryPoint)
 add_test(NAME laiue.example.walk_runtime COMMAND laiue_walk_runtime_test)
+
+add_executable(laiue_walk_gameplay_test walk_gameplay_test.c)
+target_include_directories(laiue_walk_gameplay_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/examples/walk")
+target_link_libraries(laiue_walk_gameplay_test PRIVATE
+    laiue_walk_common laiue::physics laiue::numeric)
+laiue_configure_standalone_executable(
+    laiue_walk_gameplay_test WalkGameplayTestEntryPoint)
+add_test(NAME laiue.example.walk_gameplay COMMAND laiue_walk_gameplay_test)
 
 add_executable(laiue_walk_scenario_test walk_scenario_test.c)
 target_link_libraries(laiue_walk_scenario_test PRIVATE laiue_walk_scenario_support)
@@ -105,9 +111,8 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET AND
     endif()
 endif()
 
-add_executable(laiue_walk_world_test
-    walk_world_test.c
-    "${PROJECT_SOURCE_DIR}/examples/walk/walk_world.c")
+add_executable(laiue_walk_world_test walk_world_test.c)
+target_link_libraries(laiue_walk_world_test PRIVATE laiue_walk_common)
 target_include_directories(laiue_walk_world_test PRIVATE
     "${PROJECT_SOURCE_DIR}/examples/walk")
 target_link_libraries(laiue_walk_world_test PRIVATE laiue::math_support)
@@ -116,14 +121,11 @@ laiue_configure_standalone_executable(
 add_test(NAME laiue.example.walk_world COMMAND laiue_walk_world_test)
 
 if(TARGET laiue_media_support)
-    add_executable(laiue_walk_visuals_test
-        walk_visuals_test.c
-        "${PROJECT_SOURCE_DIR}/examples/walk/walk_physics.c"
-        "${PROJECT_SOURCE_DIR}/examples/walk/walk_visuals.c")
+    add_executable(laiue_walk_visuals_test walk_visuals_test.c)
     target_include_directories(laiue_walk_visuals_test PRIVATE
         "${PROJECT_SOURCE_DIR}/examples/walk")
     target_link_libraries(laiue_walk_visuals_test PRIVATE
-        laiue::physics laiue::numeric laiue::math_support laiue::media_support)
+        laiue_walk_common laiue::physics laiue::numeric laiue::math_support laiue::media_support)
     laiue_configure_standalone_executable(
         laiue_walk_visuals_test WalkVisualsTestEntryPoint)
     add_test(NAME laiue.example.walk_visuals COMMAND laiue_walk_visuals_test)
@@ -184,9 +186,8 @@ laiue_configure_standalone_executable(
     laiue_rigid_velocity_add_test RigidVelocityAddTestEntryPoint)
 add_test(NAME laiue.physics.velocity_add COMMAND laiue_rigid_velocity_add_test)
 
-add_executable(laiue_ragdoll_test ragdoll_test.c ../examples/walk/walk_humanoid.c
-    ../examples/walk/walk_physics.c)
-target_link_libraries(laiue_ragdoll_test PRIVATE laiue::physics laiue::numeric
+add_executable(laiue_ragdoll_test ragdoll_test.c)
+target_link_libraries(laiue_ragdoll_test PRIVATE laiue_walk_common laiue::physics laiue::numeric
     laiue::math_support)
 laiue_configure_standalone_executable(laiue_ragdoll_test RagdollTestEntryPoint)
 add_test(NAME laiue.physics.ragdoll COMMAND laiue_ragdoll_test)

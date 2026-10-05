@@ -6,6 +6,7 @@
 #include "voxel/voxel_service.h"
 #include "world/world_service.h"
 #include "walk_runtime.h"
+#include "walk_gameplay.h"
 #include "walk_math.h"
 #if defined(LAIUE_WALK_WINDOWED)
 #include "walk_world.h"
@@ -37,497 +38,6 @@ const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 #include <wchar.h>
 #endif
 
-enum
-{
-    WALK_VOXEL_SIZE = 1000,
-    WALK_BLOCKS_PER_CELL = LAIUE_CHARACTER_LOCAL_CELL_SIZE / WALK_VOXEL_SIZE,
-    WALK_REBASE_RADIUS_BLOCKS = 8192,
-};
-
-static int64_t FloorDiv(int64_t value, int64_t divisor)
-{
-    int64_t quotient = value / divisor;
-    int64_t remainder = value % divisor;
-    if (remainder < 0)
-        --quotient;
-    return quotient;
-}
-
-static bool AddChecked(int64_t left, int64_t right, int64_t *out)
-{
-    if (out == NULL || (right > 0 && left > INT64_MAX - right) ||
-        (right < 0 && left < INT64_MIN - right))
-        return false;
-    *out = left + right;
-    return true;
-}
-
-static bool MulAddChecked(int64_t left, int64_t multiplier, int64_t addend, int64_t *out)
-{
-    if (out == NULL || multiplier < 0 ||
-        (left > 0 && left > INT64_MAX / multiplier) ||
-        (left < 0 && left < INT64_MIN / multiplier))
-        return false;
-    return AddChecked(left * multiplier, addend, out);
-}
-
-static bool PositionAxisToBlock(int64_t cell, int64_t local, int64_t *out)
-{
-    const int64_t localBlock = FloorDiv(local, WALK_VOXEL_SIZE);
-    return MulAddChecked(cell, WALK_BLOCKS_PER_CELL, localBlock, out);
-}
-
-#if defined(LAIUE_WALK_RUNTIME_ONLY)
-LAIUE_WALK_RUNTIME_API uint32_t WalkPositionAxisToBlock(
-    int64_t cell, int64_t local, int64_t *outBlock)
-{
-    return PositionAxisToBlock(cell, local, outBlock) ? 1u : 0u;
-}
-#endif
-
-static bool WalkIsSolid(const LaiueVoxelProviderV1 *provider, int64_t x, int64_t y, int32_t z);
-
-static bool NormalizeWalkAxis(int64_t *cell, int64_t *local)
-{
-    if (cell == NULL || local == NULL)
-        return false;
-    int64_t quotient = *local / LAIUE_CHARACTER_LOCAL_CELL_SIZE;
-    int64_t remainder = *local % LAIUE_CHARACTER_LOCAL_CELL_SIZE;
-    if (remainder < 0)
-    {
-        if (quotient == INT64_MIN)
-            return false;
-        --quotient;
-        remainder += LAIUE_CHARACTER_LOCAL_CELL_SIZE;
-    }
-    if (!AddChecked(*cell, quotient, cell))
-        return false;
-    *local = remainder;
-    return true;
-}
-
-static bool AddWalkAxis(LaiueCharacterPositionV1 *position, uint32_t axis, int64_t delta)
-{
-    if (position == NULL)
-        return false;
-    if (axis == 0u)
-    {
-        if (!AddChecked(position->localX, delta, &position->localX))
-            return false;
-        return NormalizeWalkAxis(&position->cellX, &position->localX);
-    }
-    if (axis == 1u)
-    {
-        if (!AddChecked(position->localY, delta, &position->localY))
-            return false;
-        return NormalizeWalkAxis(&position->cellY, &position->localY);
-    }
-    return AddChecked(position->localZ, delta, &position->localZ);
-}
-
-static bool WalkAxisBlockRange(const LaiueCharacterPositionV1 *position, uint32_t axis,
-                               int64_t halfExtent, int64_t *outMinimum, int64_t *outMaximum)
-{
-    if (position == NULL || outMinimum == NULL || outMaximum == NULL || halfExtent < 0)
-        return false;
-    int64_t cell = 0;
-    int64_t local = 0;
-    if (axis == 0u)
-    {
-        cell = position->cellX;
-        local = position->localX;
-    }
-    else if (axis == 1u)
-    {
-        cell = position->cellY;
-        local = position->localY;
-    }
-    else if (axis == 2u)
-    {
-        local = position->localZ;
-    }
-    else
-        return false;
-    int64_t centerBlock = 0;
-    if (axis == 2u)
-    {
-        centerBlock = FloorDiv(local, WALK_VOXEL_SIZE);
-    }
-    else if (!PositionAxisToBlock(cell, local, &centerBlock))
-        return false;
-    int64_t withinBlock = local % WALK_VOXEL_SIZE;
-    if (withinBlock < 0)
-        withinBlock += WALK_VOXEL_SIZE;
-    int64_t minimumLocal = 0;
-    int64_t maximumLocal = 0;
-    if (!AddChecked(withinBlock, -halfExtent, &minimumLocal) ||
-        !AddChecked(withinBlock, halfExtent, &maximumLocal))
-        return false;
-    if (halfExtent != 0 && !AddChecked(maximumLocal, -1, &maximumLocal))
-        return false;
-    const int64_t minimumOffset = FloorDiv(minimumLocal, WALK_VOXEL_SIZE);
-    const int64_t maximumOffset = FloorDiv(maximumLocal, WALK_VOXEL_SIZE);
-    return AddChecked(centerBlock, minimumOffset, outMinimum) &&
-           AddChecked(centerBlock, maximumOffset, outMaximum);
-}
-
-static bool WalkRangeCount(int64_t minimum, int64_t maximum, uint32_t *outCount)
-{
-    if (outCount == NULL || maximum < minimum)
-        return false;
-    /* A range spanning INT64_MIN cannot be represented by the checked
-     * subtraction below. It is also far outside the bounded swept-AABB
-     * neighbourhood, so reject it before evaluating -minimum. */
-    if (minimum == INT64_MIN)
-        return false;
-    int64_t distance = 0;
-    if (!AddChecked(maximum, -minimum, &distance) || distance > 64)
-        return false;
-    *outCount = (uint32_t)distance + 1u;
-    return true;
-}
-
-static bool WalkBlockFacePosition(LaiueCharacterPositionV1 *position, uint32_t axis,
-                                  int64_t block, int64_t offset)
-{
-    if (position == NULL)
-        return false;
-    if (axis == 2u)
-    {
-        return MulAddChecked(block, WALK_VOXEL_SIZE, offset, &position->localZ);
-    }
-    const int64_t blocksPerCell = WALK_BLOCKS_PER_CELL;
-    int64_t cell = block / blocksPerCell;
-    int64_t remainder = block % blocksPerCell;
-    if (remainder < 0)
-    {
-        --cell;
-        remainder += blocksPerCell;
-    }
-    int64_t local = remainder * WALK_VOXEL_SIZE;
-    if (!AddChecked(local, offset, &local))
-        return false;
-    if (axis == 0u)
-    {
-        position->cellX = cell;
-        position->localX = local;
-        return NormalizeWalkAxis(&position->cellX, &position->localX);
-    }
-    if (axis == 1u)
-    {
-        position->cellY = cell;
-        position->localY = local;
-        return NormalizeWalkAxis(&position->cellY, &position->localY);
-    }
-    return false;
-}
-
-static bool WalkAxisCenterBlock(const LaiueCharacterPositionV1 *position, uint32_t axis,
-                                int64_t *outBlock)
-{
-    int64_t minimum = 0;
-    int64_t maximum = 0;
-    return WalkAxisBlockRange(position, axis, 0, &minimum, &maximum) &&
-           minimum == maximum && (*outBlock = minimum, true);
-}
-
-static uint32_t WalkSweepAxis(const LaiueVoxelProviderV1 *provider,
-                              const LaiueCharacterPositionV1 *position,
-                              int64_t halfExtent, uint32_t axis, int64_t delta,
-                              LaiueCharacterPositionV1 *outPosition,
-                              uint32_t *outCollided)
-{
-    if (provider == NULL || position == NULL || outPosition == NULL || outCollided == NULL ||
-        halfExtent < 0)
-        return 0u;
-    /* The public caller intentionally reuses one position buffer for the
-     * three sequential axes.  Keep an immutable start snapshot so aliasing
-     * position/outPosition cannot erase the swept interval before it is
-     * inspected. */
-    const LaiueCharacterPositionV1 startPosition = *position;
-    *outPosition = startPosition;
-    *outCollided = 0u;
-    if (!AddWalkAxis(outPosition, axis, delta))
-        return 0u;
-    if (delta == 0)
-        return 1u;
-
-    int64_t startCenterBlock = 0;
-    if (!WalkAxisCenterBlock(&startPosition, axis, &startCenterBlock))
-        return 0u;
-    int64_t startRanges[3][2];
-    int64_t endRanges[3][2];
-    int64_t ranges[3][2];
-    for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
-        if (!WalkAxisBlockRange(&startPosition, currentAxis, halfExtent,
-                                &startRanges[currentAxis][0],
-                                &startRanges[currentAxis][1]) ||
-            !WalkAxisBlockRange(outPosition, currentAxis, halfExtent,
-                                &endRanges[currentAxis][0],
-                                &endRanges[currentAxis][1]))
-            return 0u;
-    for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
-    {
-        if (currentAxis != axis)
-        {
-            ranges[currentAxis][0] = endRanges[currentAxis][0];
-            ranges[currentAxis][1] = endRanges[currentAxis][1];
-            continue;
-        }
-        /* The old implementation inspected only the final AABB.  A fast
-         * fixed-step movement could therefore jump over a one-block wall.
-         * Sweep the complete integer interval between the start and end
-         * occupied ranges, then choose the nearest hit below. */
-        ranges[currentAxis][0] = startRanges[currentAxis][0] < endRanges[currentAxis][0]
-                                     ? startRanges[currentAxis][0]
-                                     : endRanges[currentAxis][0];
-        ranges[currentAxis][1] = startRanges[currentAxis][1] > endRanges[currentAxis][1]
-                                     ? startRanges[currentAxis][1]
-                                     : endRanges[currentAxis][1];
-    }
-    uint32_t counts[3];
-    for (uint32_t currentAxis = 0u; currentAxis < 3u; ++currentAxis)
-        if (!WalkRangeCount(ranges[currentAxis][0], ranges[currentAxis][1], &counts[currentAxis]))
-            return 0u;
-
-    bool haveCollision = false;
-    int64_t bestBlock = 0;
-    for (uint32_t ix = 0u; ix < counts[0]; ++ix)
-    {
-        int64_t blockX = 0;
-        if (!AddChecked(ranges[0][0], (int64_t)ix, &blockX))
-            return 0u;
-        for (uint32_t iy = 0u; iy < counts[1]; ++iy)
-        {
-            int64_t blockY = 0;
-            if (!AddChecked(ranges[1][0], (int64_t)iy, &blockY))
-                return 0u;
-            for (uint32_t iz = 0u; iz < counts[2]; ++iz)
-            {
-                int64_t blockZ = 0;
-                if (!AddChecked(ranges[2][0], (int64_t)iz, &blockZ))
-                    return 0u;
-                if (blockZ < INT32_MIN || blockZ > INT32_MAX ||
-                    (axis == 0u && delta > 0 && blockX < startCenterBlock) ||
-                    (axis == 1u && delta > 0 && blockY < startCenterBlock) ||
-                    (axis == 2u && delta > 0 && blockZ < startCenterBlock) ||
-                    (axis == 0u && delta < 0 && blockX > startCenterBlock) ||
-                    (axis == 1u && delta < 0 && blockY > startCenterBlock) ||
-                    (axis == 2u && delta < 0 && blockZ > startCenterBlock) ||
-                    !WalkIsSolid(provider, blockX, blockY, (int32_t)blockZ))
-                    continue;
-                const int64_t candidate = axis == 0u ? blockX : (axis == 1u ? blockY : blockZ);
-                if (!haveCollision || (delta > 0 ? candidate < bestBlock : candidate > bestBlock))
-                {
-                    haveCollision = true;
-                    bestBlock = candidate;
-                }
-            }
-        }
-    }
-    if (!haveCollision)
-        return 1u;
-    int64_t offset = 0;
-    if (delta > 0)
-        offset = -halfExtent;
-    else if (!AddChecked(halfExtent, WALK_VOXEL_SIZE, &offset))
-        return 0u;
-    if (!WalkBlockFacePosition(outPosition, axis, bestBlock, offset))
-        return 0u;
-    *outCollided = 1u;
-    return 1u;
-}
-
-static uint32_t BaseGetBlock(const LaiueVoxelCoordV1 *coordinate,
-                             LaiueVoxelBlockV1 *outBlock)
-{
-    if (coordinate == NULL || outBlock == NULL)
-        return 0u;
-    outBlock->flags = 0u;
-    if (coordinate->z > 0)
-        outBlock->material = 0u; /* air above the surface */
-    else if (coordinate->z == 0)
-        outBlock->material = 1u; /* grass */
-    else if (coordinate->z >= -3)
-        outBlock->material = 2u; /* earth */
-    else
-        outBlock->material = 3u; /* stone */
-    return 1u;
-}
-
-LAIUE_WALK_RUNTIME_API uint32_t WalkGetBlock(
-    const LaiueVoxelProviderV1 *provider,
-    const LaiueVoxelCoordV1 *coordinate,
-    LaiueVoxelBlockV1 *outBlock)
-{
-    if (provider == NULL || coordinate == NULL || outBlock == NULL)
-        return 0u;
-    const WalkVoxelContext *context = (const WalkVoxelContext *)provider->context;
-    LaiueVoxelBlockV1 overrideBlock = {0u, 0u};
-    uint32_t explicitEdit = 0u;
-    if (context != NULL && context->sparse.getBlockState != NULL)
-    {
-        if (context->sparse.getBlockState(&context->sparse, coordinate, &overrideBlock,
-                                          &explicitEdit) == 0u)
-            return 0u;
-    }
-    else if (context != NULL && context->sparse.getBlock != NULL)
-    {
-        if (context->sparse.getBlock(&context->sparse, coordinate, &overrideBlock) == 0u)
-            return 0u;
-        /* Compatibility providers predating getBlockState have no explicit
-         * air bit, so retain their non-air-only override behavior. */
-        explicitEdit = overrideBlock.material != 0u || overrideBlock.flags != 0u;
-    }
-    /* The sparse module is configured with air as its default. An explicit
-     * entry, including air, masks the game-owned infinite strata. */
-    if (explicitEdit != 0u)
-    {
-        *outBlock = overrideBlock;
-        return 1u;
-    }
-    return BaseGetBlock(coordinate, outBlock);
-}
-
-static bool WalkIsSolid(const LaiueVoxelProviderV1 *provider, int64_t x, int64_t y, int32_t z)
-{
-    LaiueVoxelCoordV1 coordinate = {x, y, z};
-    LaiueVoxelBlockV1 block = {0u, 0u};
-    if (provider == NULL || provider->getBlock == NULL)
-        return true;
-    /* A provider error is a collision failure, not air.  Conservatively
-     * treating it as solid prevents the character from tunnelling through a
-     * missing/failed voxel service. */
-    if (provider->getBlock(provider, &coordinate, &block) == 0u)
-        return true;
-    return block.material != 0u;
-}
-
-LAIUE_WALK_RUNTIME_API uint32_t WalkSweepAabb(
-    const LaiueCharacterCollisionV1 *collision,
-    const LaiueCharacterPositionV1 *position,
-    int64_t halfExtent,
-    int64_t deltaX,
-    int64_t deltaY,
-    int64_t deltaZ,
-    LaiueCharacterPositionV1 *outPosition,
-    uint32_t *outGrounded)
-{
-    if (collision == NULL || position == NULL || outPosition == NULL || outGrounded == NULL)
-        return 0u;
-    const LaiueVoxelProviderV1 *provider = (const LaiueVoxelProviderV1 *)collision->context;
-    *outGrounded = 0u;
-    if (provider == NULL || halfExtent < 0)
-        return 0u;
-    LaiueCharacterPositionV1 next = *position;
-    uint32_t collided = 0u;
-    if (!WalkSweepAxis(provider, &next, halfExtent, 0u, deltaX, &next, &collided) ||
-        !WalkSweepAxis(provider, &next, halfExtent, 1u, deltaY, &next, &collided) ||
-        !WalkSweepAxis(provider, &next, halfExtent, 2u, deltaZ, &next, &collided))
-        return 0u;
-    if (deltaZ <= 0)
-    {
-        int64_t bottom = 0;
-        int64_t sample = 0;
-        if (!AddChecked(next.localZ, -halfExtent, &bottom) ||
-            !AddChecked(bottom, -1, &sample))
-            return 0u;
-        const int64_t supportBlock = FloorDiv(sample, WALK_VOXEL_SIZE);
-        int64_t blockX = 0;
-        int64_t blockY = 0;
-        if (!PositionAxisToBlock(next.cellX, next.localX, &blockX) ||
-            !PositionAxisToBlock(next.cellY, next.localY, &blockY))
-            return 0u;
-        if (supportBlock >= INT32_MIN && supportBlock <= INT32_MAX &&
-            WalkIsSolid(provider, blockX, blockY, (int32_t)supportBlock))
-            *outGrounded = 1u;
-    }
-    *outPosition = next;
-    return 1u;
-}
-
-static bool WalkServiceFieldPresent(uint32_t actualSize, uint32_t declaredSize,
-                                    size_t offset, size_t size)
-{
-    return (size_t)actualSize >= offset && (size_t)actualSize - offset >= size &&
-           (size_t)declaredSize >= offset && (size_t)declaredSize - offset >= size;
-}
-
-static bool WalkBlockShiftToCharacterDelta(int64_t blockShift,
-                                           int64_t *outCellDelta,
-                                           int64_t *outLocalDelta)
-{
-    if (outCellDelta == NULL || outLocalDelta == NULL)
-        return false;
-    const int64_t cellShift = FloorDiv(blockShift, WALK_BLOCKS_PER_CELL);
-    const int64_t remainder = blockShift - cellShift * WALK_BLOCKS_PER_CELL;
-    if (remainder < 0 || remainder >= WALK_BLOCKS_PER_CELL ||
-        cellShift == INT64_MIN)
-        return false;
-    *outCellDelta = -cellShift;
-    *outLocalDelta = -remainder * WALK_VOXEL_SIZE;
-    return true;
-}
-
-LAIUE_WALK_RUNTIME_API uint32_t WalkRebaseWorldAndCharacter(
-    const LaiueVoxelServiceV1 *voxel, uint32_t voxelServiceSize,
-    LaiueVoxelWorldV1 *world, const LaiueCharacterServiceV1 *character,
-    uint32_t characterServiceSize, LaiueCharacterControllerV1 *controller)
-{
-    if (voxel == NULL || world == NULL || character == NULL || controller == NULL ||
-        !WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                 offsetof(LaiueCharacterServiceV1, getPosition),
-                                 sizeof(character->getPosition)) ||
-        character->getPosition == NULL ||
-        !WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                 LAIUE_VOXEL_SERVICE_V1_REBASE_OFFSET,
-                                 sizeof(voxel->rebase)) ||
-        voxel->rebase == NULL ||
-        !WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                 LAIUE_CHARACTER_SERVICE_V1_REBASE_ORIGIN_OFFSET,
-                                 sizeof(character->rebaseOrigin)) ||
-        character->rebaseOrigin == NULL)
-        return 1u;
-
-    LaiueCharacterPositionV1 position;
-    if (character->getPosition(controller, &position) == 0u)
-        return 0u;
-    int64_t blockX = 0;
-    int64_t blockY = 0;
-    if (!PositionAxisToBlock(position.cellX, position.localX, &blockX) ||
-        !PositionAxisToBlock(position.cellY, position.localY, &blockY))
-        return 0u;
-    const bool farX = blockX > WALK_REBASE_RADIUS_BLOCKS ||
-                      blockX < -WALK_REBASE_RADIUS_BLOCKS;
-    const bool farY = blockY > WALK_REBASE_RADIUS_BLOCKS ||
-                      blockY < -WALK_REBASE_RADIUS_BLOCKS;
-    if (!farX && !farY)
-        return 1u;
-
-    const int64_t shiftX = farX ? FloorDiv(blockX, 64) * 64 : 0;
-    const int64_t shiftY = farY ? FloorDiv(blockY, 64) * 64 : 0;
-    int64_t cellDeltaX = 0;
-    int64_t cellDeltaY = 0;
-    int64_t localDeltaX = 0;
-    int64_t localDeltaY = 0;
-    if (!WalkBlockShiftToCharacterDelta(shiftX, &cellDeltaX, &localDeltaX) ||
-        !WalkBlockShiftToCharacterDelta(shiftY, &cellDeltaY, &localDeltaY))
-        return 0u;
-
-    /* Move the consumer first, then the provider.  If the world rejects the
-     * shift, restore the character exactly; no fixed-point state is touched by
-     * the origin callback. */
-    if (character->rebaseOrigin(controller, cellDeltaX, cellDeltaY,
-                                localDeltaX, localDeltaY) == 0u)
-        return 0u;
-    if (voxel->rebase(world, shiftX, shiftY, 0) != 0u)
-        return 1u;
-    if (character->rebaseOrigin(controller, -cellDeltaX, -cellDeltaY,
-                                -localDeltaX, -localDeltaY) == 0u)
-        return 0u;
-    return 0u;
-}
-
 #if defined(LAIUE_WALK_WINDOWED)
 typedef struct WalkWindowState
 {
@@ -535,18 +45,11 @@ typedef struct WalkWindowState
     const LaiueInputServiceV1 *inputService;
     const LaiueGraphicsDeviceServiceV2 *graphicsService;
     uint32_t graphicsServiceSize;
-    const LaiueSceneServiceV1 *sceneService;
-    const LaiueSceneMathServiceV1 *sceneMath;
     const LaiueUiServiceV1 *uiService;
-    const LaiuePhysicsServiceV1 *physicsService;
     const LaiueMesherServiceV1 *mesherService;
-    uint32_t physicsServiceSize;
-    const LaiueVoxelProviderV1 *voxelProvider;
-    const LaiueCharacterServiceV1 *characterService;
-    const LaiueVoxelServiceV1 *voxelService;
-    uint32_t voxelServiceSize;
-    uint32_t characterServiceSize;
-    LaiueVoxelWorldV1 *world;
+    WalkGameplay *game;
+    WalkGameplaySpatialSnapshot spatial;
+    WalkGameplaySpatialSnapshot scenarioStartSpatial;
     Window *window;
     Input *input;
     LaiueGraphicsDeviceV2 *device;
@@ -554,23 +57,8 @@ typedef struct WalkWindowState
     const uint8_t *fontPixels;
     uint32_t fontWidth;
     uint32_t fontHeight;
-    LaiueCharacterControllerV1 *controller;
-    VoxelRagdoll ragdoll;
-    VoxelCollisionSource ragdollCollision;
-    VoxelRigidStepSettings ragdollRigidSettings;
-    VoxelRagdollSettings ragdollSettings;
-    void *ragdollScratch;
-    uint32_t ragdollScratchBytes;
-    bool ragdollReady;
-    bool ragdollGrounded;
-    double lastSafeCameraEye[3];
-    bool lastSafeCameraEyeValid;
+    bool cameraReady;
     WalkRagdollVisualScratch *ragdollVisualScratch;
-    WalkHumanoidControllerState humanoidController;
-    double ragdollFacingYaw;
-    double ragdollGaitPhase;
-    int64_t ragdollBlockOriginX;
-    int64_t ragdollBlockOriginY;
     WalkVisualChunkSet chunkSet;
     bool chunksReady;
     LaiueGraphicsHandle ragdollBuffer;
@@ -579,17 +67,11 @@ typedef struct WalkWindowState
     LaiueGraphicsHandle terrainSampler;
     LaiueGraphicsHandle farTerrainBuffer;
     bool texturedTerrainReady;
-    bool firstPerson;
-    uint8_t selectedMaterial;
-    int64_t ragdollRenderOriginBlock[3];
-    int64_t renderOriginBlock[3];
-    Camera camera;
-    LaiueCharacterPositionV1 lastPosition;
-    float cameraRelativeEye[3];
-    float viewProjection[16];
     double lastTime;
     double accumulator;
     bool failed;
+    bool smokeEnabled;
+    uint32_t smokeFrames;
     bool scenarioEnabled;
     WalkScenario scenario;
     WalkScenarioInput scenarioInput;
@@ -611,7 +93,6 @@ typedef struct WalkWindowState
     double scenarioJumpStartZ;
     uint32_t scenarioRebases;
     double scenarioHoldUntil;
-    double scenarioStartRoot[3];
     double scenarioMaximumDisplacement;
     uint64_t scenarioLastGpuFrame;
     uint64_t scenarioPeakShadowBytes;
@@ -621,262 +102,100 @@ typedef struct WalkWindowState
 static LaiueUiQuadV1 walkUiQuads[LAIUE_GRAPHICS_UI_MAX_QUADS];
 static LaiueGraphicsDrawItemV2 walkDraws[WALK_VISUAL_CHUNK_DRAW_COUNT + 2u];
 
-static bool WalkDeviceFieldPresent(const LaiueGraphicsDeviceV2 *device,
-                                   size_t offset, size_t size)
+static bool WalkDeviceFieldPresent(const LaiueGraphicsDeviceV2 *device, size_t offset, size_t size)
 {
     return device != NULL && (size_t)device->structSize >= offset &&
            (size_t)device->structSize - offset >= size;
 }
 
-static void WalkUpdateRenderOrigin(WalkWindowState *state)
-{
-    if (state != NULL && state->ragdollReady)
-    {
-        double root[3];
-        if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
-            return;
-        state->cameraRelativeEye[0] = (float)root[0];
-        state->cameraRelativeEye[1] = (float)root[1];
-        state->cameraRelativeEye[2] = (float)root[2] + 1.8f;
-        return;
-    }
-    if (state == NULL || state->controller == NULL || state->characterService == NULL ||
-        !WalkServiceFieldPresent(state->characterServiceSize,
-                                 state->characterService->structSize,
-                                 offsetof(LaiueCharacterServiceV1, getPosition),
-                                 sizeof(state->characterService->getPosition)) ||
-        state->characterService->getPosition == NULL)
-        return;
-    LaiueCharacterPositionV1 position;
-    if (state->characterService->getPosition(state->controller, &position) == 0u)
-        return;
-    state->lastPosition = position;
-    int64_t blockX = 0;
-    int64_t blockY = 0;
-    if (!PositionAxisToBlock(position.cellX, position.localX, &blockX) ||
-        !PositionAxisToBlock(position.cellY, position.localY, &blockY))
-        return;
-    /* Keep the active chunk around the camera. The world may be arbitrarily
-     * far from zero; only these bounded differences become floats. */
-    const int64_t originX = FloorDiv(blockX, 64) * 64;
-    const int64_t originY = FloorDiv(blockY, 64) * 64;
-    const int64_t originZFixed = FloorDiv(
-        position.localZ, INT64_C(64) * WALK_VOXEL_SIZE) *
-        (INT64_C(64) * WALK_VOXEL_SIZE);
-    const int64_t withinX = blockX - originX;
-    const int64_t withinY = blockY - originY;
-    int64_t fractionX = position.localX % WALK_VOXEL_SIZE;
-    int64_t fractionY = position.localY % WALK_VOXEL_SIZE;
-    if (fractionX < 0) fractionX += WALK_VOXEL_SIZE;
-    if (fractionY < 0) fractionY += WALK_VOXEL_SIZE;
-    state->cameraRelativeEye[0] = (float)withinX +
-                                  (float)fractionX / (float)WALK_VOXEL_SIZE;
-    state->cameraRelativeEye[1] = (float)withinY +
-                                  (float)fractionY / (float)WALK_VOXEL_SIZE;
-    state->cameraRelativeEye[2] = (float)(position.localZ - originZFixed) /
-                                  (float)WALK_VOXEL_SIZE + 1.6f;
-}
-
-static bool WalkGetRagdollRenderOrigin(const WalkWindowState *state,
-                                      double renderOrigin[3],
-                                      int64_t renderOriginBlock[3])
-{
-    if (state == NULL || renderOrigin == NULL || renderOriginBlock == NULL ||
-        !state->ragdollReady)
-        return false;
-    double root[3];
-    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
-        return false;
-    for (uint32_t axis = 0u; axis < 3u; ++axis)
-    {
-        const double origin = WalkMathFloor(root[axis] / 64.0) * 64.0;
-        if (!WalkMathFinite(origin) || origin < -9223372036854775808.0 ||
-            origin >= 9223372036854775808.0)
-            return false;
-        renderOrigin[axis] = origin;
-        renderOriginBlock[axis] = (int64_t)origin;
-    }
-    return true;
-}
-
-static bool WalkUpdateCamera(WalkWindowState *state, float elapsed,
-                             int32_t mouseDeltaX, int32_t mouseDeltaY)
-{
-    if (state == NULL || state->sceneService == NULL || state->sceneMath == NULL ||
-        state->windowService == NULL || state->window == NULL || state->device == NULL ||
-        state->sceneService->cameraGetViewMatrix == NULL ||
-        state->sceneService->cameraGetProjectionMatrix == NULL ||
-        state->sceneMath->matrix4Multiply == NULL ||
-        !WalkDeviceFieldPresent(state->device,
-            offsetof(LaiueGraphicsDeviceV2, setCamera),
-            sizeof(state->device->setCamera)) || state->device->setCamera == NULL)
-        return false;
-    if (state->sceneService->cameraUpdate != NULL)
-        state->sceneService->cameraUpdate(
-            &state->camera, elapsed,
-            false, false, false, false, false,
-            mouseDeltaX, mouseDeltaY, 0.0f, 0.0025f);
-    if (state->ragdollReady)
-    {
-        double root[3];
-        double renderOrigin[3];
-        int64_t renderOriginBlock[3];
-        float forward[3] = {0.0f, 1.0f, 0.0f};
-        if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
-            !WalkGetRagdollRenderOrigin(state, renderOrigin, renderOriginBlock))
-            return false;
-        memcpy(state->ragdollRenderOriginBlock, renderOriginBlock,
-               sizeof(state->ragdollRenderOriginBlock));
-        if (state->sceneService->cameraGetForwardVector != NULL)
-            state->sceneService->cameraGetForwardVector(&state->camera, forward);
-        double eye[3];
-        /* A fully enclosed camera boom has no collision-free sample. Keep the
-         * last valid eye in that exceptional case instead of closing the game. */
-        const double fallbackEye[3] = {root[0], root[1], root[2] + 1.8};
-        if (!WalkHumanoidResolveCameraEye(
-                &state->ragdoll, &state->ragdollCollision, forward,
-                state->firstPerson, fallbackEye, state->lastSafeCameraEye,
-                &state->lastSafeCameraEyeValid, eye))
-            return false;
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-            state->cameraRelativeEye[axis] =
-                (float)(eye[axis] - renderOrigin[axis]);
-    }
-    float view[16];
-    state->sceneService->cameraGetViewMatrix(&state->camera,
-                                             state->cameraRelativeEye, view);
-    float projection[16];
-    int32_t width = 1;
-    int32_t height = 1;
-    state->windowService->getClientSize(state->window, &width, &height);
-    const float aspect = height > 0 ? (float)width / (float)height : 1.0f;
-    state->sceneService->cameraGetProjectionMatrix(
-        aspect, 1.04719755f, 0.05f, 4096.0f, projection);
-    state->sceneMath->matrix4Multiply(view, projection, state->viewProjection);
-    LaiueGraphicsCameraV2 camera = {
-        .structSize = sizeof(camera),
-        .flags = 0u,
-    };
-    memcpy(camera.viewProjection, state->viewProjection,
-           sizeof(camera.viewProjection));
-    return state->device->setCamera(state->device, &camera) != 0u;
-}
-
 static uint8_t WalkReadVisualBlock(void *opaque, int64_t x, int64_t y, int64_t z)
 {
-    const LaiueVoxelProviderV1 *provider = (const LaiueVoxelProviderV1 *)opaque;
-    if (provider == NULL || provider->getBlock == NULL || z < INT32_MIN || z > INT32_MAX)
-        return 0u;
-    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
-    LaiueVoxelBlockV1 block = {0u, 0u};
-    return provider->getBlock(provider, &coordinate, &block) != 0u
-               ? (uint8_t)block.material : 0u;
+    return WalkGameplayReadBlock((const WalkGameplay *)opaque, x, y, z);
 }
 
-static bool WalkSetWorldBlock(void *opaque, int64_t x, int64_t y, int64_t z,
-                              uint8_t material)
+static bool WalkUpdateCamera(WalkWindowState *state)
 {
-    WalkWindowState *state = (WalkWindowState *)opaque;
-    if (state == NULL || state->world == NULL || state->voxelService == NULL ||
-        z < INT32_MIN || z > INT32_MAX ||
-        !WalkServiceFieldPresent(state->voxelServiceSize,
-                                 state->voxelService->structSize,
-                                 offsetof(LaiueVoxelServiceV1, setBlock),
-                                 sizeof(state->voxelService->setBlock)) ||
-        state->voxelService->setBlock == NULL)
+    state->cameraReady = false;
+    int32_t width = 0, height = 0;
+    state->windowService->getClientSize(state->window, &width, &height);
+    if (width <= 0 || height <= 0)
+        return WalkGameplaySnapshot(state->game, &state->spatial) == WALK_GAMEPLAY_OK;
+    const WalkGameplayStatus status =
+        WalkGameplayCamera(state->game, (uint32_t)width, (uint32_t)height, &state->spatial);
+    if (status == WALK_GAMEPLAY_UNSUPPORTED)
+        return !state->scenarioEnabled &&
+               WalkGameplaySnapshot(state->game, &state->spatial) == WALK_GAMEPLAY_OK;
+    if (status != WALK_GAMEPLAY_OK ||
+        (state->spatial.valid & WALK_GAMEPLAY_SPATIAL_CAMERA_VALID) == 0u)
         return false;
-    const LaiueVoxelCoordV1 coordinate = {x, y, (int32_t)z};
-    const LaiueVoxelBlockV1 block = {material, 0u};
-    return state->voxelService->setBlock(state->world, &coordinate, &block) != 0u;
+    if (!WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, setCamera),
+                                sizeof(state->device->setCamera)) ||
+        state->device->setCamera == NULL)
+        return !state->scenarioEnabled;
+    LaiueGraphicsCameraV2 graphicsCamera = {.structSize = sizeof(graphicsCamera)};
+    memcpy(graphicsCamera.viewProjection, state->spatial.viewProjection,
+           sizeof(graphicsCamera.viewProjection));
+    state->cameraReady = state->device->setCamera(state->device, &graphicsCamera) != 0u;
+    return state->cameraReady;
 }
 
-static bool WalkGetChunkCoordinates(WalkWindowState *state,
-                                    int64_t centerBlock[3])
+static bool WalkCheckGameplayHealth(WalkWindowState *state)
 {
-    if (state == NULL || centerBlock == NULL)
-        return false;
-    if (!state->ragdollReady)
-    {
-        if (state->controller == NULL || state->characterService == NULL ||
-            !WalkServiceFieldPresent(state->characterServiceSize,
-                state->characterService->structSize,
-                offsetof(LaiueCharacterServiceV1, getPosition),
-                sizeof(state->characterService->getPosition)) ||
-            state->characterService->getPosition == NULL)
-            return false;
-        LaiueCharacterPositionV1 position;
-        if (state->characterService->getPosition(state->controller, &position) == 0u ||
-            !PositionAxisToBlock(position.cellX, position.localX, &centerBlock[0]) ||
-            !PositionAxisToBlock(position.cellY, position.localY, &centerBlock[1]))
-            return false;
-        centerBlock[2] = FloorDiv(position.localZ, WALK_VOXEL_SIZE);
-        state->renderOriginBlock[0] = FloorDiv(centerBlock[0], 64) * 64;
-        state->renderOriginBlock[1] = FloorDiv(centerBlock[1], 64) * 64;
-        state->renderOriginBlock[2] = FloorDiv(centerBlock[2], 64) * 64;
+    if (WalkGameplayHealth(state->game) == WALK_GAMEPLAY_OK)
         return true;
-    }
-    double root[3];
-    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
-        return false;
-    for (uint32_t axis = 0u; axis < 3u; ++axis)
-    {
-        const double floored = WalkMathFloor(root[axis]);
-        if (!WalkMathFinite(floored) || floored < -9223372036854775808.0 ||
-            floored >= 9223372036854775808.0)
-            return false;
-        const int64_t localBlock = (int64_t)floored;
-        const int64_t localChunk = (int64_t)WalkMathFloor(root[axis] / 64.0) * 64;
-        state->ragdollRenderOriginBlock[axis] = localChunk;
-        if (axis < 2u)
-        {
-            const int64_t worldOrigin = axis == 0u
-                                            ? state->ragdollBlockOriginX
-                                            : state->ragdollBlockOriginY;
-            int64_t worldRenderOrigin = 0;
-            if (!AddChecked(worldOrigin, localBlock, &centerBlock[axis]) ||
-                !AddChecked(worldOrigin, localChunk, &worldRenderOrigin))
-                return false;
-            state->renderOriginBlock[axis] = worldRenderOrigin;
-        }
-        else
-        {
-            centerBlock[axis] = localBlock;
-            state->renderOriginBlock[axis] = localChunk;
-        }
-    }
-    return true;
+    PlatformWriteConsoleUtf8(state->scenarioEnabled
+                                 ? "LAIUE_SCENARIO event=failure reason=gameplay_health\n"
+                                 : "laiue walk: gameplay provider failed; stopping presentation\n");
+    return false;
 }
 
-static bool WalkEditTarget(WalkWindowState *state, bool place)
+static bool WalkApplyEdits(WalkWindowState *state)
 {
-    if (state == NULL || state->voxelProvider == NULL || state->sceneService == NULL)
+    /* A minimized camera-capable window defers edits. A profile without
+     * camera capability lets the common core consume unsupported actions. */
+    if ((state->spatial.valid & WALK_GAMEPLAY_SPATIAL_CAMERA_VALID) == 0u &&
+        (state->game->capabilities & WALK_GAMEPLAY_CAP_CAMERA) != 0u)
+        return !state->scenarioEnabled;
+    WalkGameplayEditResult result;
+    const WalkGameplayStatus status = WalkGameplayEdit(state->game, &state->spatial, &result);
+    if (status != WALK_GAMEPLAY_OK && status != WALK_GAMEPLAY_UNSUPPORTED)
         return false;
-    double origin[3] = {state->cameraRelativeEye[0], state->cameraRelativeEye[1],
-                        state->cameraRelativeEye[2]};
-    const int64_t offset[3] = {state->renderOriginBlock[0],
-                               state->renderOriginBlock[1],
-                               state->renderOriginBlock[2]};
-    float direction[3] = {0.0f, 1.0f, 0.0f};
-    if (state->sceneService->cameraGetForwardVector == NULL)
+    if (result.count > 2u)
         return false;
-    state->sceneService->cameraGetForwardVector(&state->camera, direction);
-    WalkWorldBlockHit hit;
-    if (!WalkWorldRaycast(WalkReadVisualBlock, (void *)state->voxelProvider,
-                          origin, offset, direction,
-                          WALK_WORLD_INTERACTION_DISTANCE, &hit))
+    bool changed = false;
+    bool sawBreak = false, sawPlace = false;
+    for (uint32_t index = 0u; index < result.count; ++index)
+    {
+        const WalkGameplayEditItem *item = &result.items[index];
+        if (item->place)
+            sawPlace = true;
+        else
+            sawBreak = true;
+        if (item->status != WALK_GAMEPLAY_OK && item->status != WALK_GAMEPLAY_UNSUPPORTED)
+            return false;
+        if (item->changed)
+        {
+            changed = true;
+            WalkVisualsInvalidateBlock(&state->chunkSet, state->device, item->coordinate.x,
+                                       item->coordinate.y, item->coordinate.z);
+            if (state->scenarioEnabled)
+            {
+                if (item->place)
+                    ++state->scenarioPlaces;
+                else
+                    ++state->scenarioBreaks;
+            }
+        }
+        else if (state->scenarioEnabled &&
+                 (item->place ? state->scenarioPlacePending : state->scenarioBreakPending))
+            return false;
+    }
+    if (state->scenarioEnabled &&
+        ((state->scenarioBreakPending && !sawBreak) || (state->scenarioPlacePending && !sawPlace)))
         return false;
-    if (!WalkWorldEditHit(WalkSetWorldBlock, state, &hit, place,
-                          state->selectedMaterial))
-        return false;
-    WalkVisualsInvalidateBlock(&state->chunkSet, state->device,
-                               place ? hit.previousBlock[0] : hit.block[0],
-                               place ? hit.previousBlock[1] : hit.block[1],
-                               place ? hit.previousBlock[2] : hit.block[2]);
-    return WalkReadVisualBlock((void *)state->voxelProvider,
-                               place ? hit.previousBlock[0] : hit.block[0],
-                               place ? hit.previousBlock[1] : hit.block[1],
-                               place ? hit.previousBlock[2] : hit.block[2]) ==
-           (place ? state->selectedMaterial : 0u);
+    state->scenarioBreakPending = false;
+    state->scenarioPlacePending = false;
+    return !changed || WalkUpdateCamera(state);
 }
 
 static void WalkRawInput(void *opaque, void *rawInput)
@@ -887,8 +206,8 @@ static void WalkRawInput(void *opaque, void *rawInput)
         state->inputService->handleRawInput(state->input, rawInput);
 }
 
-static bool WalkJoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY],
-                         const wchar_t *root, const wchar_t *name)
+static bool WalkJoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t *root,
+                         const wchar_t *name)
 {
     uint32_t index = 0u;
     while (root[index] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
@@ -906,8 +225,8 @@ static bool WalkJoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY],
     return true;
 }
 
-static bool WalkReadDesktopAsset(void *context, const char *relativePath,
-                                 uint8_t **outBytes, uint32_t *outSize)
+static bool WalkReadDesktopAsset(void *context, const char *relativePath, uint8_t **outBytes,
+                                 uint32_t *outSize)
 {
     (void)context;
     if (outBytes != NULL)
@@ -935,8 +254,7 @@ static bool WalkReadDesktopAsset(void *context, const char *relativePath,
         return false;
     (void)wideLength;
     uint64_t fileBytes = 0u;
-    if (!PlatformReadEntireFile(fullPath, UINT64_C(8) * 1024u * 1024u,
-                                outBytes, &fileBytes) ||
+    if (!PlatformReadEntireFile(fullPath, UINT64_C(8) * 1024u * 1024u, outBytes, &fileBytes) ||
         fileBytes == 0u || fileBytes > UINT32_MAX)
     {
         PlatformFree(*outBytes);
@@ -944,93 +262,6 @@ static bool WalkReadDesktopAsset(void *context, const char *relativePath,
         return false;
     }
     *outSize = (uint32_t)fileBytes;
-    return true;
-}
-
-static void WalkRagdollQueryBlock(void *context, int64_t x, int64_t y, int64_t z,
-                                  VoxelBlockPhysics *outBlock)
-{
-    if (outBlock == NULL)
-        return;
-    outBlock->flags = VOXEL_BLOCK_PHYSICS_SOLID;
-    outBlock->friction = 0.75f;
-    WalkWindowState *state = (WalkWindowState *)context;
-    int64_t worldX = 0;
-    int64_t worldY = 0;
-    if (state == NULL || state->voxelProvider == NULL || z < INT32_MIN ||
-        z > INT32_MAX || !AddChecked(state->ragdollBlockOriginX, x, &worldX) ||
-        !AddChecked(state->ragdollBlockOriginY, y, &worldY))
-        return;
-    const LaiueVoxelCoordV1 coordinate = {worldX, worldY, (int32_t)z};
-    LaiueVoxelBlockV1 block = {0u, 0u};
-    if (WalkGetBlock(state->voxelProvider, &coordinate, &block) != 0u &&
-        block.material == 0u)
-        outBlock->flags = 0u;
-}
-
-static bool WalkInitializeRagdoll(WalkWindowState *state,
-                                  const LaiueCharacterPositionV1 *start)
-{
-    if (state == NULL || start == NULL || state->physicsService == NULL ||
-        !PositionAxisToBlock(start->cellX, start->localX,
-                             &state->ragdollBlockOriginX) ||
-        !PositionAxisToBlock(start->cellY, start->localY,
-                             &state->ragdollBlockOriginY))
-        return false;
-
-    const int64_t remainderX = start->localX % WALK_VOXEL_SIZE;
-    const int64_t remainderY = start->localY % WALK_VOXEL_SIZE;
-    state->ragdollCollision = (VoxelCollisionSource){
-        .context = state, .queryBlockPhysics = WalkRagdollQueryBlock,
-    };
-    const double origin[3] = {
-        (double)remainderX / WALK_VOXEL_SIZE,
-        (double)remainderY / WALK_VOXEL_SIZE,
-        1.02,
-    };
-    if (!WalkHumanoidInitialize(state->physicsService, &state->ragdoll,
-            &state->ragdollCollision, origin, UINT64_C(0x57414C4B52414744),
-            &state->ragdollRigidSettings, &state->ragdollSettings,
-            &state->ragdollScratch, &state->ragdollScratchBytes))
-        return false;
-    state->ragdollReady = true;
-    state->ragdollGrounded = WalkHumanoidIsGrounded(&state->ragdoll,
-                                                     &state->ragdollCollision);
-    return true;
-}
-
-static bool WalkRebaseRagdoll(WalkWindowState *state)
-{
-    if (state == NULL || !state->ragdollReady)
-        return false;
-    double root[3];
-    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root) ||
-        !WalkMathFinite(root[0]) || !WalkMathFinite(root[1]) ||
-        root[0] >= (double)INT64_MAX / 2.0 || root[0] <= (double)INT64_MIN / 2.0 ||
-        root[1] >= (double)INT64_MAX / 2.0 || root[1] <= (double)INT64_MIN / 2.0)
-        return false;
-    const int64_t shiftX = (int64_t)WalkMathFloor(root[0] / 64.0) * 64;
-    const int64_t shiftY = (int64_t)WalkMathFloor(root[1] / 64.0) * 64;
-    if (shiftX == 0 && shiftY == 0)
-        return true;
-    /* TranslateBlocks subtracts its argument from local body positions. */
-    const int64_t localShift[3] = {shiftX, shiftY, 0};
-    int64_t nextOriginX = 0;
-    int64_t nextOriginY = 0;
-    if (!AddChecked(state->ragdollBlockOriginX, shiftX, &nextOriginX) ||
-        !AddChecked(state->ragdollBlockOriginY, shiftY, &nextOriginY))
-        return false;
-    for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
-        if (!WalkBodyTranslateBlocks(&state->ragdoll.bodies[body], localShift))
-            return false;
-    WalkHumanoidControllerRebase(&state->humanoidController, localShift);
-    if (state->lastSafeCameraEyeValid)
-    {
-        state->lastSafeCameraEye[0] -= (double)shiftX;
-        state->lastSafeCameraEye[1] -= (double)shiftY;
-    }
-    state->ragdollBlockOriginX = nextOriginX;
-    state->ragdollBlockOriginY = nextOriginY;
     return true;
 }
 
@@ -1147,27 +378,18 @@ static bool WalkScenarioCapture(WalkWindowState *state)
 
 static bool WalkScenarioRebaseCheck(WalkWindowState *state)
 {
-    double before[3], after[3];
-    if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], before))
-        return false;
-    const double worldX = before[0] + (double)state->ragdollBlockOriginX;
+    WalkGameplaySpatialSnapshot before, after;
+    WalkGameplayRebaseResult forced, automatic;
     const int64_t shift[3] = {-9000, 0, 0};
-    int64_t nextOrigin = 0;
-    if (!AddChecked(state->ragdollBlockOriginX, shift[0], &nextOrigin))
+    double delta[3];
+    if (WalkGameplaySnapshot(state->game, &before) != WALK_GAMEPLAY_OK ||
+        WalkGameplayRebase(state->game, shift, &forced) != WALK_GAMEPLAY_OK || !forced.changed ||
+        WalkGameplayRebase(state->game, NULL, &automatic) != WALK_GAMEPLAY_OK ||
+        !automatic.changed || WalkGameplaySnapshot(state->game, &after) != WALK_GAMEPLAY_OK ||
+        !WalkGameplaySpatialDelta(&before, &after, delta))
         return false;
-    for (uint32_t body = 0u; body < state->ragdoll.bodyCount; ++body)
-        if (!WalkBodyTranslateBlocks(&state->ragdoll.bodies[body], shift))
-            return false;
-    WalkHumanoidControllerRebase(&state->humanoidController, shift);
-    if (state->lastSafeCameraEyeValid)
-        state->lastSafeCameraEye[0] -= (double)shift[0];
-    state->ragdollBlockOriginX = nextOrigin;
-    if (!WalkRebaseRagdoll(state) ||
-        !WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], after))
-        return false;
-    return WalkMathAbs(after[0] + (double)state->ragdollBlockOriginX - worldX) < 1.0e-6 &&
-           WalkMathAbs(after[1] - before[1]) < 1.0e-6 &&
-           WalkMathAbs(after[2] - before[2]) < 1.0e-6 && WalkMathAbs(after[0]) < 64.0;
+    return WalkMathAbs(delta[0]) < 1.0e-6 && WalkMathAbs(delta[1]) < 1.0e-6 &&
+           WalkMathAbs(delta[2]) < 1.0e-6 && WalkMathAbs(after.rootLocal[0]) < 64.0;
 }
 
 static bool WalkScenarioReport(WalkWindowState *state)
@@ -1175,13 +397,13 @@ static bool WalkScenarioReport(WalkWindowState *state)
     WalkScenarioSummary summary;
     const bool hasSummary = WalkScenarioMetricsGetSummary(state->scenarioMetrics, &summary) != 0u;
     const bool passed =
-        !state->failed && state->scenarioTick == WALK_SCENARIO_TOTAL_TICKS &&
-        state->scenarioFrames != 0u && state->scenarioDrawFrames == state->scenarioFrames &&
-        state->scenarioCheckpoints == 9u && state->scenarioImages == 9u &&
-        state->scenarioBreaks != 0u && state->scenarioPlaces != 0u &&
+        !state->failed && WalkGameplayHealth(state->game) == WALK_GAMEPLAY_OK &&
+        state->scenarioTick == WALK_SCENARIO_TOTAL_TICKS && state->scenarioFrames != 0u &&
+        state->scenarioDrawFrames == state->scenarioFrames && state->scenarioCheckpoints == 9u &&
+        state->scenarioImages == 9u && state->scenarioBreaks != 0u && state->scenarioPlaces != 0u &&
         state->scenarioRebases == 1u && state->scenarioAirborne &&
-        state->scenarioMaximumDisplacement > 0.5 && state->ragdollReady && state->chunksReady &&
-        state->texturedTerrainReady && hasSummary && summary.rejected == 0u;
+        state->scenarioMaximumDisplacement > 0.5 && state->game->ragdollReady &&
+        state->chunksReady && state->texturedTerrainReady && hasSummary && summary.rejected == 0u;
     PlatformWriteConsoleUtf8(passed ? "LAIUE_SCENARIO event=summary status=PASS"
                                     : "LAIUE_SCENARIO event=summary status=FAIL");
     WalkScenarioWriteUnsigned(" ticks=", state->scenarioTick);
@@ -1229,12 +451,17 @@ static bool WalkScenarioReport(WalkWindowState *state)
  * provider runs the same frame with all keys and buttons released. */
 static bool WalkKeyDown(const WalkWindowState *state, InputKey key)
 {
-    return state->input != NULL && state->inputService->isKeyDown(state->input, key);
+    return state->input != NULL && state->inputService != NULL &&
+           state->inputService->isKeyDown != NULL &&
+           state->inputService->isKeyDown(state->input, key);
 }
 
 static bool WalkTakeKeyPress(WalkWindowState *state, InputKey key)
 {
-    if (state->input == NULL || !state->inputService->wasKeyPressed(state->input, key))
+    if (state->input == NULL || state->inputService == NULL ||
+        state->inputService->wasKeyPressed == NULL ||
+        state->inputService->consumeKeyPress == NULL ||
+        !state->inputService->wasKeyPressed(state->input, key))
         return false;
     (void)state->inputService->consumeKeyPress(state->input, key);
     return true;
@@ -1242,12 +469,16 @@ static bool WalkTakeKeyPress(WalkWindowState *state, InputKey key)
 
 static bool WalkMouseButtonPressed(const WalkWindowState *state, InputMouseButton button)
 {
-    return state->input != NULL && state->inputService->wasMouseButtonPressed(state->input, button);
+    return state->input != NULL && state->inputService != NULL &&
+           state->inputService->wasMouseButtonPressed != NULL &&
+           state->inputService->wasMouseButtonPressed(state->input, button);
 }
 
 static bool WalkMouseButtonDown(const WalkWindowState *state, InputMouseButton button)
 {
-    return state->input != NULL && state->inputService->isMouseButtonDown(state->input, button);
+    return state->input != NULL && state->inputService != NULL &&
+           state->inputService->isMouseButtonDown != NULL &&
+           state->inputService->isMouseButtonDown(state->input, button);
 }
 
 static void WalkWindowFrame(void *opaque)
@@ -1262,9 +493,9 @@ static void WalkWindowFrame(void *opaque)
             state->windowService->requestClose(state->window);
         return;
     }
-    if (state == NULL || state->window == NULL || state->windowService == NULL ||
-        (state->input != NULL && state->inputService == NULL) || state->graphicsService == NULL ||
-        state->device == NULL ||
+    if (state == NULL || state->game == NULL || state->window == NULL ||
+        state->windowService == NULL || (state->input != NULL && state->inputService == NULL) ||
+        state->graphicsService == NULL || state->device == NULL ||
         !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, beginFrame),
                                 sizeof(state->device->beginFrame)) ||
         !WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, endFrame),
@@ -1272,18 +503,21 @@ static void WalkWindowFrame(void *opaque)
         state->device->beginFrame == NULL || state->device->endFrame == NULL)
         return;
     if (state->windowService->consumeFocusLoss != NULL &&
-        state->windowService->consumeFocusLoss(state->window) != 0 && state->input != NULL &&
-        state->inputService->resetState != NULL)
-        state->inputService->resetState(state->input);
+        state->windowService->consumeFocusLoss(state->window) != 0)
+    {
+        WalkGameplayResetInput(state->game);
+        state->accumulator = 0.0;
+        state->lastTime = PlatformMonotonicSeconds();
+        if (state->input != NULL && state->inputService->resetState != NULL)
+            state->inputService->resetState(state->input);
+    }
     if (state->windowService->consumeResize != NULL &&
         state->windowService->consumeResize(state->window) != 0)
     {
-        int32_t width = 0;
-        int32_t height = 0;
+        int32_t width = 0, height = 0;
         state->windowService->getClientSize(state->window, &width, &height);
         if (width > 0 && height > 0 &&
-            WalkServiceFieldPresent(state->graphicsServiceSize,
-                                    state->graphicsService->structSize,
+            WalkServiceFieldPresent(state->graphicsServiceSize, state->graphicsService->structSize,
                                     offsetof(LaiueGraphicsDeviceServiceV2, resize),
                                     sizeof(state->graphicsService->resize)) &&
             state->graphicsService->resize != NULL)
@@ -1291,14 +525,6 @@ static void WalkWindowFrame(void *opaque)
     }
     if (WalkTakeKeyPress(state, INPUT_KEY_ESCAPE))
         state->windowService->requestClose(state->window);
-    if (!state->scenarioEnabled && WalkTakeKeyPress(state, INPUT_KEY_V))
-        state->firstPerson = !state->firstPerson;
-    static const InputKey materialKeys[WALK_VISUAL_TEXTURE_COUNT] = {
-        INPUT_KEY_1, INPUT_KEY_2, INPUT_KEY_3,
-    };
-    for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
-        if (!state->scenarioEnabled && WalkTakeKeyPress(state, materialKeys[material]))
-            state->selectedMaterial = (uint8_t)(material + 1u);
     const double now = PlatformMonotonicSeconds();
     double elapsed = state->lastTime == 0.0 ? 0.0 : now - state->lastTime;
     state->lastTime = now;
@@ -1308,11 +534,49 @@ static void WalkWindowFrame(void *opaque)
         elapsed = 0.25;
     if (state->scenarioEnabled && now < state->scenarioHoldUntil)
         elapsed = 0.0;
+    if (!state->scenarioEnabled)
+    {
+        bool firstPerson = state->game->firstPerson;
+        uint8_t material = state->game->selectedMaterial;
+        if (WalkTakeKeyPress(state, INPUT_KEY_V))
+            firstPerson = !firstPerson;
+        static const InputKey materialKeys[WALK_VISUAL_TEXTURE_COUNT] = {
+            INPUT_KEY_1,
+            INPUT_KEY_2,
+            INPUT_KEY_3,
+        };
+        for (uint32_t index = 0u; index < WALK_VISUAL_TEXTURE_COUNT; ++index)
+            if (WalkTakeKeyPress(state, materialKeys[index]))
+                material = (uint8_t)(index + 1u);
+        int32_t mouseX = 0, mouseY = 0;
+        if (state->input != NULL && state->inputService->getMouseDelta != NULL)
+            state->inputService->getMouseDelta(state->input, &mouseX, &mouseY);
+        if (WalkGameplaySetView(state->game, firstPerson, material) != WALK_GAMEPLAY_OK ||
+            WalkGameplayOrient(state->game, (float)mouseX * 0.0025f, -(float)mouseY * 0.0025f,
+                               WALK_GAMEPLAY_ORIENT_RELATIVE) != WALK_GAMEPLAY_OK)
+            state->failed = true;
+        WalkGameplayInput input = {
+            .strafe = (double)((WalkKeyDown(state, INPUT_KEY_D) ? 1 : 0) -
+                               (WalkKeyDown(state, INPUT_KEY_A) ? 1 : 0)),
+            .forward = (double)((WalkKeyDown(state, INPUT_KEY_W) ? 1 : 0) -
+                                (WalkKeyDown(state, INPUT_KEY_S) ? 1 : 0)),
+            .sprint = WalkKeyDown(state, INPUT_KEY_SHIFT),
+            .jumpHeld = WalkKeyDown(state, INPUT_KEY_SPACE),
+        };
+        if (WalkTakeKeyPress(state, INPUT_KEY_SPACE))
+            input.pulses |= WALK_GAMEPLAY_PULSE_JUMP;
+        if (WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_LEFT))
+            input.pulses |= WALK_GAMEPLAY_PULSE_BREAK;
+        if (WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_RIGHT))
+            input.pulses |= WALK_GAMEPLAY_PULSE_PLACE;
+        if (WalkGameplaySubmitInput(state->game, &input) != WALK_GAMEPLAY_OK)
+            state->failed = true;
+    }
     state->accumulator += elapsed;
-    const double fixedStep = 1.0 / 128.0;
+    const double fixedStep = 1.0 / (double)LAIUE_CHARACTER_TICK_HZ;
     uint32_t ticks = 0u;
-    while ((state->ragdollReady ||
-            (state->controller != NULL && state->characterService != NULL)) &&
+    bool providerFrameChanged = false;
+    while (!state->failed && state->game->actor != WALK_GAMEPLAY_ACTOR_STATIC &&
            state->accumulator >= fixedStep && ticks < 8u)
     {
         if (state->scenarioEnabled)
@@ -1320,125 +584,83 @@ static void WalkWindowFrame(void *opaque)
             if (WalkScenarioInputAt(&state->scenario, state->scenarioTick, &state->scenarioInput) ==
                 0u)
                 break;
-            state->camera.yaw = state->scenarioInput.yaw;
-            state->camera.pitch = state->scenarioInput.pitch;
-            state->firstPerson = state->scenarioInput.firstPerson != 0u;
-            state->scenarioBreakPending |= state->scenarioInput.breakBlock != 0u;
-            state->scenarioPlacePending |= state->scenarioInput.placeBlock != 0u;
+            if (WalkGameplayOrient(state->game, state->scenarioInput.yaw,
+                                   state->scenarioInput.pitch,
+                                   WALK_GAMEPLAY_ORIENT_ABSOLUTE) != WALK_GAMEPLAY_OK ||
+                WalkGameplaySetView(state->game, state->scenarioInput.firstPerson != 0u,
+                                    state->game->selectedMaterial) != WALK_GAMEPLAY_OK)
+            {
+                state->failed = true;
+                break;
+            }
+            WalkGameplayInput input = {
+                .strafe = state->scenarioInput.moveX,
+                .forward = state->scenarioInput.moveY,
+                .sprint = state->scenarioInput.sprint != 0u,
+            };
+            if (state->scenarioInput.jump != 0u)
+            {
+                WalkGameplaySpatialSnapshot beforeJump;
+                if (WalkGameplaySnapshot(state->game, &beforeJump) != WALK_GAMEPLAY_OK ||
+                    !beforeJump.grounded)
+                {
+                    state->failed = true;
+                    break;
+                }
+                state->scenarioJumpStartZ = beforeJump.rootLocal[2];
+                state->scenarioJumpStarted = true;
+                input.pulses |= WALK_GAMEPLAY_PULSE_JUMP;
+            }
+            if (state->scenarioInput.breakBlock != 0u)
+            {
+                input.pulses |= WALK_GAMEPLAY_PULSE_BREAK;
+                state->scenarioBreakPending = true;
+            }
+            if (state->scenarioInput.placeBlock != 0u)
+            {
+                input.pulses |= WALK_GAMEPLAY_PULSE_PLACE;
+                state->scenarioPlacePending = true;
+            }
+            if (WalkGameplaySubmitInput(state->game, &input) != WALK_GAMEPLAY_OK)
+            {
+                state->failed = true;
+                break;
+            }
             if (state->scenarioInput.rebaseCheck != 0u)
             {
                 if (!WalkScenarioRebaseCheck(state))
+                {
                     state->failed = true;
-                else
-                    ++state->scenarioRebases;
+                    break;
+                }
+                ++state->scenarioRebases;
             }
         }
-        const float strafe = state->scenarioEnabled
-                                 ? state->scenarioInput.moveX
-                                 : (float)((WalkKeyDown(state, INPUT_KEY_D) ? 1 : 0) -
-                                           (WalkKeyDown(state, INPUT_KEY_A) ? 1 : 0));
-        const float forwardInput = state->scenarioEnabled
-                                       ? state->scenarioInput.moveY
-                                       : (float)((WalkKeyDown(state, INPUT_KEY_W) ? 1 : 0) -
-                                                 (WalkKeyDown(state, INPUT_KEY_S) ? 1 : 0));
-        float cameraForward[3] = {0.0f, 1.0f, 0.0f};
-        if (state->sceneService != NULL &&
-            state->sceneService->cameraGetForwardVector != NULL)
-            state->sceneService->cameraGetForwardVector(&state->camera, cameraForward);
-        float horizontalLength = (float)ScalarSqrtDouble(
-            (double)cameraForward[0] * cameraForward[0] +
-            (double)cameraForward[1] * cameraForward[1]);
-        if (horizontalLength > 1.0e-6f)
+        WalkGameplayStepResult step;
+        if (WalkGameplayStep(state->game, &step) != WALK_GAMEPLAY_OK)
         {
-            cameraForward[0] /= horizontalLength;
-            cameraForward[1] /= horizontalLength;
+            state->failed = true;
+            break;
         }
-        else
-        {
-            cameraForward[0] = 0.0f;
-            cameraForward[1] = 1.0f;
-        }
-        const float rightX = cameraForward[1];
-        const float rightY = -cameraForward[0];
-        float worldX = forwardInput * cameraForward[0] + strafe * rightX;
-        float worldY = forwardInput * cameraForward[1] + strafe * rightY;
-        const float moveLength = (float)ScalarSqrtDouble(
-            (double)worldX * worldX + (double)worldY * worldY);
-        if (moveLength > 1.0f)
-        {
-            worldX /= moveLength;
-            worldY /= moveLength;
-        }
-        const bool sprint = state->scenarioEnabled ? state->scenarioInput.sprint != 0u
-                                                   : WalkKeyDown(state, INPUT_KEY_SHIFT);
-        const bool jump = state->scenarioEnabled ? state->scenarioInput.jump != 0u
-                                                 : WalkTakeKeyPress(state, INPUT_KEY_SPACE);
-        if (state->scenarioEnabled && jump && state->ragdollGrounded)
-        {
-            double root[3];
-            if (WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
-            {
-                state->scenarioJumpStartZ = root[2];
-                state->scenarioJumpStarted = true;
-            }
-        }
-        if (state->ragdollReady)
-        {
-            const bool stepped = WalkHumanoidStep(
-                state->physicsService, &state->ragdoll,
-                &state->humanoidController, &state->ragdollCollision,
-                &state->ragdollRigidSettings, &state->ragdollSettings,
-                state->ragdollScratch, state->ragdollScratchBytes,
-                worldX, worldY, sprint, jump, fixedStep, &state->ragdollGrounded,
-                &state->ragdollFacingYaw, &state->ragdollGaitPhase, NULL) &&
-                WalkRebaseRagdoll(state);
-            if (!stepped)
-            {
-                state->failed = true;
-                state->windowService->requestClose(state->window);
-                break;
-            }
-        }
-        else
-        {
-            LaiueCharacterInputV1 input = {
-                .moveX = worldX > 0.35f ? 1 : (worldX < -0.35f ? -1 : 0),
-                .moveY = worldY > 0.35f ? 1 : (worldY < -0.35f ? -1 : 0),
-            };
-            if (sprint)
-                input.flags |= LAIUE_CHARACTER_INPUT_SPRINT;
-            if (jump)
-                input.flags |= LAIUE_CHARACTER_INPUT_JUMP;
-            if (state->characterService->step(state->controller, &input) == 0u ||
-                WalkRebaseWorldAndCharacter(
-                    state->voxelService, state->voxelServiceSize, state->world,
-                    state->characterService, state->characterServiceSize,
-                    state->controller) == 0u)
-            {
-                state->failed = true;
-                state->windowService->requestClose(state->window);
-                break;
-            }
-        }
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            providerFrameChanged |= step.rebase.providerFrameShift[axis] != 0;
         state->accumulator -= fixedStep;
         ++ticks;
         if (state->scenarioEnabled)
         {
             ++state->scenarioTick;
-            double root[3];
-            if (!WalkBodyLocalPosition(&state->ragdoll.bodies[state->ragdoll.rootBody], root))
+            WalkGameplaySpatialSnapshot current;
+            double delta[3];
+            if (WalkGameplaySnapshot(state->game, &current) != WALK_GAMEPLAY_OK ||
+                !WalkGameplaySpatialDelta(&state->scenarioStartSpatial, &current, delta))
                 state->failed = true;
             else
             {
-                const double dx =
-                    root[0] + (double)state->ragdollBlockOriginX - state->scenarioStartRoot[0];
-                const double dy =
-                    root[1] + (double)state->ragdollBlockOriginY - state->scenarioStartRoot[1];
-                const double distance = ScalarSqrtDouble(dx * dx + dy * dy);
+                const double distance = ScalarSqrtDouble(delta[0] * delta[0] + delta[1] * delta[1]);
                 if (distance > state->scenarioMaximumDisplacement)
                     state->scenarioMaximumDisplacement = distance;
                 if (state->scenarioInput.phase == WalkScenarioJump && state->scenarioJumpStarted &&
-                    !state->ragdollGrounded && root[2] > state->scenarioJumpStartZ + 0.05)
+                    !current.grounded && current.rootLocal[2] > state->scenarioJumpStartZ + 0.05)
                     state->scenarioAirborne = true;
             }
             if (state->scenarioInput.capture != 0u)
@@ -1450,68 +672,38 @@ static void WalkWindowFrame(void *opaque)
             }
         }
     }
-    if (ticks == 8u && state->accumulator >= fixedStep)
+    if (ticks == 8u || state->game->actor == WALK_GAMEPLAY_ACTOR_STATIC)
         state->accumulator = 0.0;
-
-    int32_t mouseDeltaX = 0;
-    int32_t mouseDeltaY = 0;
-    if (state->input != NULL && state->inputService->getMouseDelta != NULL)
-        state->inputService->getMouseDelta(state->input, &mouseDeltaX, &mouseDeltaY);
-    if (state->scenarioEnabled)
-        mouseDeltaX = mouseDeltaY = 0;
-    WalkUpdateRenderOrigin(state);
-    if (state->sceneService != NULL && state->sceneMath != NULL &&
-        !WalkUpdateCamera(state, (float)elapsed, mouseDeltaX, mouseDeltaY))
+    /* Provider-frame changes invalidate GPU chunks after all fixed ticks.
+     * The shared mesher scratch stays owned for the whole presentation session. */
+    if (providerFrameChanged && state->chunksReady)
+        WalkVisualsInvalidateChunkSet(state->device, &state->chunkSet);
+    if (!state->failed && !WalkUpdateCamera(state))
         state->failed = true;
-    int64_t chunkCenter[3] = {0, 0, 0};
-    if (!state->failed && !WalkGetChunkCoordinates(state, chunkCenter))
-    {
+    if (!state->failed && !WalkApplyEdits(state))
         state->failed = true;
-        state->windowService->requestClose(state->window);
-    }
-    if (!state->failed &&
-        (state->scenarioBreakPending ||
-         (!state->scenarioEnabled && WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_LEFT))))
-    {
-        const bool edited = WalkEditTarget(state, false);
-        if (state->scenarioBreakPending && edited)
-            ++state->scenarioBreaks;
-        state->scenarioBreakPending = false;
-    }
-    if (!state->failed &&
-        (state->scenarioPlacePending ||
-         (!state->scenarioEnabled && WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_RIGHT))))
-    {
-        const bool edited = WalkEditTarget(state, true);
-        if (state->scenarioPlacePending && edited)
-            ++state->scenarioPlaces;
-        state->scenarioPlacePending = false;
-    }
     if (!state->failed && state->chunksReady &&
         !WalkVisualsUpdateChunkSet(state->device, state->mesherService, &state->chunkSet,
-                                   WalkReadVisualBlock, (void *)state->voxelProvider, chunkCenter))
-    {
+                                   WalkReadVisualBlock, state->game, state->spatial.centerBlock))
         state->failed = true;
-        state->windowService->requestClose(state->window);
-    }
-    if (state->ragdollReady && !WalkVisualsUpdateRagdollBuffer(
-            state->device, state->ragdollBuffer, &state->ragdoll,
-            (double[3]){(double)state->ragdollRenderOriginBlock[0],
-                        (double)state->ragdollRenderOriginBlock[1],
-                        (double)state->ragdollRenderOriginBlock[2]},
-            state->ragdollVisualScratch))
-    {
+    state->failed |= !WalkCheckGameplayHealth(state);
+    if (!state->failed && state->game->ragdollReady &&
+        !WalkVisualsUpdateRagdollBuffer(
+            &state->game->physicsContext, state->device, state->ragdollBuffer,
+            &state->game->ragdoll, state->spatial.ragdollRenderOrigin, state->ragdollVisualScratch))
         state->failed = true;
+    if (state->failed)
+    {
         state->windowService->requestClose(state->window);
+        return;
     }
 
     int32_t width = 0;
     int32_t height = 0;
     state->windowService->getClientSize(state->window, &width, &height);
     bool uiFrameReady = false;
-    if (width > 0 && height > 0 && state->uiService != NULL &&
-        state->uiContext != NULL && state->uiService->begin != NULL &&
-        state->uiService->getFontAtlas != NULL)
+    if (width > 0 && height > 0 && state->uiService != NULL && state->uiContext != NULL &&
+        state->uiService->begin != NULL && state->uiService->getFontAtlas != NULL)
     {
         int32_t mouseX = 0;
         int32_t mouseY = 0;
@@ -1520,29 +712,25 @@ static void WalkWindowFrame(void *opaque)
         const uint32_t mousePressed =
             WalkMouseButtonPressed(state, INPUT_MOUSE_BUTTON_LEFT) ? 1u : 0u;
         const float wheel = state->windowService->consumeMouseWheelSteps != NULL
-                                ? state->windowService->consumeMouseWheelSteps(
-                                      state->window)
+                                ? state->windowService->consumeMouseWheelSteps(state->window)
                                 : 0.0f;
-        uiFrameReady = state->uiService->begin(state->uiContext, width, height,
-                                               (float)mouseX, (float)mouseY,
-                                               mouseDown, mousePressed, wheel,
-                                               (float)elapsed) != 0u;
+        uiFrameReady =
+            state->uiService->begin(state->uiContext, width, height, (float)mouseX, (float)mouseY,
+                                    mouseDown, mousePressed, wheel, (float)elapsed) != 0u;
         if (uiFrameReady &&
-            WalkDeviceFieldPresent(state->device,
-                                   offsetof(LaiueGraphicsDeviceV2, setUiFontAtlas),
+            WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, setUiFontAtlas),
                                    sizeof(state->device->setUiFontAtlas)) &&
             state->device->setUiFontAtlas != NULL)
         {
             const uint8_t *pixels = NULL;
             uint32_t atlasWidth = 0u;
             uint32_t atlasHeight = 0u;
-            if (state->uiService->getFontAtlas(state->uiContext, &pixels,
-                                               &atlasWidth, &atlasHeight) != 0u &&
+            if (state->uiService->getFontAtlas(state->uiContext, &pixels, &atlasWidth,
+                                               &atlasHeight) != 0u &&
                 pixels != NULL && atlasWidth != 0u && atlasHeight != 0u &&
                 (pixels != state->fontPixels || atlasWidth != state->fontWidth ||
                  atlasHeight != state->fontHeight) &&
-                state->device->setUiFontAtlas(state->device, pixels,
-                                              atlasWidth, atlasHeight) != 0u)
+                state->device->setUiFontAtlas(state->device, pixels, atlasWidth, atlasHeight) != 0u)
             {
                 state->fontPixels = pixels;
                 state->fontWidth = atlasWidth;
@@ -1550,12 +738,7 @@ static void WalkWindowFrame(void *opaque)
             }
         }
     }
-    if (width > 0 && height > 0 &&
-        WalkServiceFieldPresent(state->graphicsServiceSize,
-                                state->graphicsService->structSize,
-                                offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
-                                sizeof(state->graphicsService->createDevice)) &&
-        state->graphicsService->createDevice != NULL)
+    if (width > 0 && height > 0)
     {
         if (state->scenarioCheckpointPending &&
             (!WalkDeviceFieldPresent(state->device,
@@ -1568,24 +751,22 @@ static void WalkWindowFrame(void *opaque)
             state->windowService->requestClose(state->window);
             return;
         }
-        if (state->device->beginFrame(state->device, (uint32_t)width,
-                                      (uint32_t)height) == 0u)
+        if (state->device->beginFrame(state->device, (uint32_t)width, (uint32_t)height) == 0u)
             state->failed = true;
         else
         {
-            if (uiFrameReady && state->uiService != NULL &&
-                state->uiService->rect != NULL &&
-                state->uiService->textUtf8 != NULL &&
-                state->uiService->copyDrawList != NULL)
+            if (uiFrameReady && state->uiService != NULL && state->uiService->rect != NULL &&
+                state->uiService->textUtf8 != NULL && state->uiService->copyDrawList != NULL)
             {
-                state->uiService->rect(state->uiContext, 16.0f, 16.0f, 370.0f, 150.0f,
-                                       8.0f, 0xF4221A16u);
+                state->uiService->rect(state->uiContext, 16.0f, 16.0f, 370.0f, 150.0f, 8.0f,
+                                       0xF4221A16u);
                 state->uiService->textUtf8(state->uiContext, 32.0f, 32.0f, 0xFFFFFFFFu,
                                            "LAIUE Walk");
-                state->uiService->textUtf8(state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
+                state->uiService->textUtf8(
+                    state->uiContext, 32.0f, 58.0f, 0xFFE8ECF4u,
                     "WASD move  Shift run  Space jump  V view  LMB break  RMB place");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 84.0f, 0xFFB8C8FFu,
-                                           state->ragdollReady
+                                           state->game->ragdollReady
                                                ? "Ragdoll: deterministic physics"
                                                : "Ragdoll: physics module unavailable");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 108.0f, 0xFFB8C8FFu,
@@ -1593,32 +774,32 @@ static void WalkWindowFrame(void *opaque)
                                                ? "Infinite voxel chunks: grass / dirt / stone"
                                                : "Terrain textures: unavailable");
                 state->uiService->textUtf8(state->uiContext, 32.0f, 132.0f, 0xFFE8ECF4u,
-                    state->firstPerson ? "View: first person" : "View: third person");
+                                           state->game->firstPerson ? "View: first person"
+                                                                    : "View: third person");
                 uint32_t quadCount = 0u;
                 if (state->uiService->copyDrawList(state->uiContext, walkUiQuads,
-                                                   LAIUE_GRAPHICS_UI_MAX_QUADS,
-                                                   &quadCount) == 0u ||
+                                                   LAIUE_GRAPHICS_UI_MAX_QUADS, &quadCount) == 0u ||
                     !WalkDeviceFieldPresent(state->device,
-                        offsetof(LaiueGraphicsDeviceV2, submitUi),
-                        sizeof(state->device->submitUi)) ||
+                                            offsetof(LaiueGraphicsDeviceV2, submitUi),
+                                            sizeof(state->device->submitUi)) ||
                     state->device->submitUi == NULL ||
                     state->device->submitUi(state->device, walkUiQuads, quadCount) == 0u)
                     state->failed = true;
             }
-            if (WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, submit),
+            if (state->cameraReady &&
+                WalkDeviceFieldPresent(state->device, offsetof(LaiueGraphicsDeviceV2, submit),
                                        sizeof(state->device->submit)) &&
                 state->device->submit != NULL)
             {
                 uint32_t drawIndex = 0u;
                 if (WalkVisualsBuildFarTerrainDraw(
-                        state->farTerrainBuffer, state->renderOriginBlock,
-                        state->terrainTextures, state->terrainSampler,
-                        &walkDraws[drawIndex]))
+                        state->farTerrainBuffer, state->spatial.renderOriginBlock,
+                        state->terrainTextures, state->terrainSampler, &walkDraws[drawIndex]))
                     ++drawIndex;
                 drawIndex += WalkVisualsBuildChunkDraws(
-                    &state->chunkSet, state->renderOriginBlock, state->terrainTextures,
+                    &state->chunkSet, state->spatial.renderOriginBlock, state->terrainTextures,
                     state->terrainSampler, &walkDraws[drawIndex]);
-                if (state->ragdollReady && !state->firstPerson)
+                if (state->game->ragdollReady && !state->game->firstPerson)
                 {
                     walkDraws[drawIndex] = (LaiueGraphicsDrawItemV2){
                         .structSize = sizeof(walkDraws[drawIndex]),
@@ -1640,6 +821,15 @@ static void WalkWindowFrame(void *opaque)
                 state->failed = true;
                 state->windowService->requestClose(state->window);
             }
+            else if (state->smokeEnabled)
+            {
+                if (!state->cameraReady || WalkGameplayHealth(state->game) != WALK_GAMEPLAY_OK)
+                    state->failed = true;
+                else
+                    ++state->smokeFrames;
+                if (state->failed || state->smokeFrames == 32u)
+                    state->windowService->requestClose(state->window);
+            }
             else if (state->scenarioEnabled && !state->failed)
             {
                 ++state->scenarioFrames;
@@ -1652,7 +842,11 @@ static void WalkWindowFrame(void *opaque)
                     state->device->getDiagnostics != NULL)
                 {
                     LaiueGraphicsDiagnosticsV2 diagnostics = {.structSize = sizeof(diagnostics)};
-                    if (state->device->getDiagnostics(state->device, &diagnostics) != 0u)
+                    if (state->device->getDiagnostics(state->device, &diagnostics) == 0u ||
+                        (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_FRAME_VALID) == 0u ||
+                        diagnostics.drawCalls == 0u || diagnostics.scenePasses == 0u)
+                        state->failed = true;
+                    else
                     {
                         if (diagnostics.cpuShadowBytes > state->scenarioPeakShadowBytes)
                             state->scenarioPeakShadowBytes = diagnostics.cpuShadowBytes;
@@ -1669,6 +863,13 @@ static void WalkWindowFrame(void *opaque)
                                 (double)diagnostics.gpuDurationNanoseconds / 1000000.0);
                         }
                     }
+                }
+                else
+                    state->failed = true;
+                if (state->failed)
+                {
+                    state->windowService->requestClose(state->window);
+                    return;
                 }
                 if (state->scenarioCheckpointPending)
                 {
@@ -1687,7 +888,7 @@ static void WalkWindowFrame(void *opaque)
                     WalkScenarioWriteUnsigned(" tick=", state->scenarioTick);
                     WalkScenarioWriteUnsigned(" frames=", state->scenarioFrames);
                     WalkScenarioWriteUnsigned(" textures=", state->texturedTerrainReady ? 1u : 0u);
-                    WalkScenarioWriteUnsigned(" ragdoll=", state->ragdollReady ? 1u : 0u);
+                    WalkScenarioWriteUnsigned(" ragdoll=", state->game->ragdollReady ? 1u : 0u);
                     PlatformWriteConsoleUtf8("\n");
                     state->scenarioCheckpointPending = false;
                     state->scenarioHoldUntil = PlatformMonotonicSeconds() + 2.0;
@@ -1726,11 +927,9 @@ static bool JoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t
 }
 #endif
 
-#if !defined(LAIUE_WALK_RUNTIME_ONLY)
-static LaiueModuleStatus LoadWalkModules(
-    LaiueModuleHost *host, LaiueModuleLoadReportV1 *report,
-    LaiueModuleLoadReportEntryV1 *reportEntries,
-    LaiueModuleDiagnostic *diagnostic)
+static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host, LaiueModuleLoadReportV1 *report,
+                                         LaiueModuleLoadReportEntryV1 *reportEntries,
+                                         LaiueModuleDiagnostic *diagnostic)
 {
 #if defined(LAIUE_WALK_DYNAMIC)
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -1819,48 +1018,37 @@ static LaiueModuleStatus LoadWalkModules(
     if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY) ||
         !JoinPath(characterPath, directory, characterName) ||
         !JoinPath(numericPath, directory, numericName) ||
-        !JoinPath(worldPath, directory, worldName) ||
-        !JoinPath(voxelPath, directory, voxelName))
+        !JoinPath(worldPath, directory, worldName) || !JoinPath(voxelPath, directory, voxelName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
     LaiueModuleBinaryV1 binaries[12];
     uint32_t binaryCount = 0u;
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){characterPath,
-                                                   LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){numericPath,
-                                                   LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){worldPath,
-                                                   LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+        (LaiueModuleBinaryV1){characterPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] =
+        (LaiueModuleBinaryV1){numericPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){worldPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
 #if defined(LAIUE_WALK_WINDOWED)
     if (!JoinPath(windowPath, directory, windowName) ||
         !JoinPath(inputPath, directory, inputName) ||
         !JoinPath(physicsPath, directory, physicsName) ||
         !JoinPath(mesherPath, directory, mesherName) ||
-        !JoinPath(renderPath, directory, renderName) ||
-        !JoinPath(uiPath, directory, uiName) ||
+        !JoinPath(renderPath, directory, renderName) || !JoinPath(uiPath, directory, uiName) ||
         !JoinPath(sceneMathPath, directory, sceneMathName) ||
         !JoinPath(scenePath, directory, sceneName))
         return LAIUE_MODULE_INVALID_ARGUMENT;
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){windowPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){windowPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){physicsPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){mesherPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){uiPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){mesherPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){uiPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
     binaries[binaryCount++] =
         (LaiueModuleBinaryV1){sceneMathPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){scenePath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
+    binaries[binaryCount++] = (LaiueModuleBinaryV1){scenePath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
 #endif
-    LaiueModuleLoadReportInitialize(report, reportEntries,
-                                    binaryCount);
+    LaiueModuleLoadReportInitialize(report, reportEntries, binaryCount);
 #if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
     /* The executable chooses exactly one standalone provider at configure
      * time and pins its descriptor.  If that artifact is removed or cannot
@@ -1882,9 +1070,8 @@ static LaiueModuleStatus LoadWalkModules(
     };
     return LaiueModuleHostLoadProfileV1(host, &profile, report, diagnostic);
 #else
-    return LaiueModuleHostLoadProfile(
-        host, binaries, binaryCount,
-        LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
+    return LaiueModuleHostLoadProfile(host, binaries, binaryCount,
+                                      LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
 #endif
 #else
     (void)report;
@@ -1909,31 +1096,26 @@ static LaiueModuleStatus LoadWalkModules(
     modules[moduleCount++] = LaiueSceneGetStaticModuleApiV1();
     modules[moduleCount++] = LaiueMesherGetStaticModuleApiV1();
 #endif
-    return LaiueModuleHostLoadStatic(host, modules,
-                                     moduleCount, diagnostic);
+    return LaiueModuleHostLoadStatic(host, modules, moduleCount, diagnostic);
 #endif
 }
-#endif /* !LAIUE_WALK_RUNTIME_ONLY */
 
-#if !defined(LAIUE_WALK_RUNTIME_ONLY)
-static bool RunWalkExample(bool headless, bool scenarioEnabled)
+static bool RunWalkExample(bool headless, bool scenarioEnabled, bool smokeEnabled)
 {
-#if !defined(LAIUE_WALK_WINDOWED)
-    (void)headless;
-#endif
-    LaiueModuleHostConfigV1 config;
-    LaiueModuleHostConfigInitialize(&config);
+    if (smokeEnabled && (headless || scenarioEnabled))
+        return false;
+    LaiueModuleHostConfigV1 hostConfig;
+    LaiueModuleHostConfigInitialize(&hostConfig);
     LaiueModuleDiagnostic diagnostic;
-    LaiueModuleHost *host = LaiueModuleHostCreate(&config, &diagnostic);
+    LaiueModuleHost *host = LaiueModuleHostCreate(&hostConfig, &diagnostic);
     if (host == NULL)
     {
         PlatformWriteConsoleUtf8("laiue walk: bootstrap creation failed\n");
         return false;
     }
-
     static LaiueModuleLoadReportEntryV1 reportEntries[12];
     LaiueModuleLoadReportV1 report;
-    LaiueModuleStatus moduleStatus =
+    const LaiueModuleStatus moduleStatus =
         LoadWalkModules(host, &report, reportEntries, &diagnostic);
     if (moduleStatus != LAIUE_MODULE_OK && moduleStatus != LAIUE_MODULE_PARTIAL)
     {
@@ -1944,226 +1126,198 @@ static bool RunWalkExample(bool headless, bool scenarioEnabled)
         return false;
     }
 
-    uint32_t characterServiceSize = 0u;
-    const LaiueCharacterServiceV1 *character =
-        (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
-            host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
-            LAIUE_CHARACTER_SERVICE_V1_LEGACY_SIZE, NULL, &characterServiceSize);
+    WalkGameplayServices services = {0};
+    services.character = (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
+        LAIUE_CHARACTER_SERVICE_V1_LEGACY_SIZE, NULL, &services.characterSize);
+    services.voxel = (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
+        LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &services.voxelSize);
 #if defined(LAIUE_WALK_WINDOWED)
-    uint32_t physicsServiceSize = 0u;
-    const LaiuePhysicsServiceV1 *physicsService =
-        (const LaiuePhysicsServiceV1 *)LaiueModuleHostQueryService(
+    if (!headless)
+        services.physics = (const LaiuePhysicsServiceV1 *)LaiueModuleHostQueryService(
             host, LAIUE_PHYSICS_SERVICE_NAME, LAIUE_PHYSICS_SERVICE_ABI_VERSION_1,
-            sizeof(LaiuePhysicsServiceV1), NULL, &physicsServiceSize);
-    if (physicsService != NULL && !WalkPhysicsBind(physicsService, physicsServiceSize))
-        physicsService = NULL;
-    const LaiueMesherServiceV1 *mesherService =
-        (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
-            host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
-            sizeof(LaiueMesherServiceV1), NULL, NULL);
+            sizeof(LaiuePhysicsServiceV1), NULL, &services.physicsSize);
+    services.scene = (const LaiueSceneServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_SCENE_SERVICE_NAME, LAIUE_SCENE_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueSceneServiceV1), NULL, &services.sceneSize);
+    services.sceneMath = (const LaiueSceneMathServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_SCENE_MATH_SERVICE_NAME, LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1,
+        sizeof(LaiueSceneMathServiceV1), NULL, &services.sceneMathSize);
+#else
+    (void)headless;
 #endif
-    uint32_t voxelServiceSize = 0u;
-    const LaiueVoxelServiceV1 *voxel =
-        (const LaiueVoxelServiceV1 *)LaiueModuleHostQueryService(
-            host, LAIUE_VOXEL_SERVICE_NAME, LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
-            LAIUE_VOXEL_SERVICE_V1_LEGACY_SIZE, NULL, &voxelServiceSize);
-    if (character == NULL || character->create == NULL)
-        PlatformWriteConsoleUtf8(
-            "laiue walk: character provider is unavailable; controls disabled\n");
-
-    const bool voxelHasContextCreate =
-        voxel != NULL &&
-        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                offsetof(LaiueVoxelServiceV1, createWithContext),
-                                sizeof(voxel->createWithContext)) &&
-        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                offsetof(LaiueVoxelServiceV1, context),
-                                sizeof(voxel->context)) &&
-        voxel->createWithContext != NULL && voxel->context != NULL;
-    const bool voxelHasCore =
-        voxel != NULL &&
-        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                offsetof(LaiueVoxelServiceV1, getProvider),
-                                sizeof(voxel->getProvider)) &&
-        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                offsetof(LaiueVoxelServiceV1, destroy),
-                                sizeof(voxel->destroy));
-    if (!voxelHasCore || voxel->getProvider == NULL ||
-        (!voxelHasContextCreate && voxel->create == NULL))
-        PlatformWriteConsoleUtf8(
-            "laiue walk: voxel provider unavailable; using base strata only\n");
-
-    LaiueVoxelWorldConfigV1 voxelConfig = {
-        .structSize = sizeof(voxelConfig),
-        .abiVersion = LAIUE_VOXEL_SERVICE_ABI_VERSION_1,
-        .defaultBlock = {0u, 0u},
-    };
-    LaiueVoxelWorldV1 *world = NULL;
-    LaiueVoxelProviderV1 sparse = {0};
-    LaiueCharacterControllerV1 *controller = NULL;
-    bool success = true;
-    if (voxelHasCore && voxel->getProvider != NULL &&
-        (voxelHasContextCreate || voxel->create != NULL))
-    {
-        const uint32_t created = voxelHasContextCreate
-                                     ? voxel->createWithContext(voxel->context, &voxelConfig,
-                                                                &world)
-                                     : voxel->create(&voxelConfig, &world);
-        success = created != 0u && world != NULL &&
-                  voxel->getProvider(world, &sparse) != 0u;
-        if (!success)
-        {
-            PlatformWriteConsoleUtf8(
-                "laiue walk: voxel world could not be created; using base strata only\n");
-            if (world != NULL && voxel->destroy != NULL)
-                voxel->destroy(world);
-            success = true;
-            world = NULL;
-            sparse = (LaiueVoxelProviderV1){0};
-        }
-    }
-    WalkVoxelContext walkContext = {.sparse = sparse};
-    LaiueVoxelProviderV1 walkProvider = {
-        .structSize = sizeof(walkProvider),
-        .abiVersion = LAIUE_VOXEL_ABI_VERSION_1,
-        .context = &walkContext,
-        .getBlock = WalkGetBlock,
-    };
-    LaiueCharacterCollisionV1 collision = {
-        .structSize = sizeof(collision),
-        .abiVersion = LAIUE_CHARACTER_ABI_VERSION_1,
-        .context = &walkProvider,
-        .sweepAabb = WalkSweepAabb,
-    };
-    LaiueCharacterPositionV1 start = {
-        .cellX = (int64_t)1 << 40,
-        .cellY = -((int64_t)1 << 39),
+    WalkGameplayConfig gameConfig;
+    WalkGameplayConfigDefault(&gameConfig);
+    gameConfig.initialPosition = (LaiueCharacterPositionV1){
+        .cellX = INT64_C(1) << 40,
+        .cellY = -(INT64_C(1) << 39),
         .localX = LAIUE_CHARACTER_LOCAL_CELL_SIZE - 100,
         .localY = 0,
         .localZ = 1400,
     };
-    bool characterReady = false;
-    const bool characterHasCore =
-        character != NULL &&
-        WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                offsetof(LaiueCharacterServiceV1, create),
-                                sizeof(character->create)) &&
-        WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                offsetof(LaiueCharacterServiceV1, setPosition),
-                                sizeof(character->setPosition));
-    if (characterHasCore && character->create != NULL && character->setPosition != NULL)
+    if (scenarioEnabled)
+        gameConfig.requiredCapabilities = WALK_GAMEPLAY_CAP_RAGDOLL |
+                                          WALK_GAMEPLAY_CAP_SPARSE_WORLD | WALK_GAMEPLAY_CAP_EDIT |
+                                          WALK_GAMEPLAY_CAP_CAMERA | WALK_GAMEPLAY_CAP_REBASE;
+    /* The game address is fixed before its providers install callbacks. */
+    static WalkGameplay game;
+    bool success = WalkGameplayInit(&game, &services, &gameConfig) == WALK_GAMEPLAY_OK;
+    if (!success)
     {
-        characterReady = character->create(&collision, 400, &controller) != 0u &&
-                         controller != NULL &&
-                         character->setPosition(controller, &start, 1u) != 0u;
-        if (!characterReady && controller != NULL &&
-            WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                    offsetof(LaiueCharacterServiceV1, destroy),
-                                    sizeof(character->destroy)) &&
-            character->destroy != NULL)
-        {
-            character->destroy(controller);
-            controller = NULL;
-        }
+        PlatformWriteConsoleUtf8(scenarioEnabled
+                                     ? "LAIUE_SCENARIO event=failure reason=gameplay_init\n"
+                                     : "laiue walk: gameplay initialization failed\n");
+        WalkGameplayRelease(&game);
+        LaiueModuleHostUnloadAll(host);
+        LaiueModuleHostDestroy(host);
+        return false;
     }
-    if (!characterReady)
+    if ((game.capabilities & WALK_GAMEPLAY_CAP_SPARSE_WORLD) == 0u)
         PlatformWriteConsoleUtf8(
-            "laiue walk: character module unavailable; continuing diagnostic shell\n");
-
+            "laiue walk: sparse voxel provider unavailable; using read-only base strata\n");
+    if (game.actor == WALK_GAMEPLAY_ACTOR_STATIC)
+        PlatformWriteConsoleUtf8(
+            "laiue walk: character/physics providers unavailable; controls disabled\n");
     bool ranWindow = false;
+
 #if defined(LAIUE_WALK_WINDOWED)
-    void *walkUiContext = NULL;
-    const LaiueUiServiceV1 *walkUiService = NULL;
-    uint32_t walkUiServiceSize = 0u;
     if (!headless)
     {
+        uint32_t windowServiceSize = 0u, inputServiceSize = 0u, mesherServiceSize = 0u;
         const LaiueWindowServiceV1 *windowService =
             (const LaiueWindowServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_WINDOW_SERVICE_NAME, LAIUE_WINDOW_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueWindowServiceV1), NULL, NULL);
+                sizeof(LaiueWindowServiceV1), NULL, &windowServiceSize);
         const LaiueInputServiceV1 *inputService =
             (const LaiueInputServiceV1 *)LaiueModuleHostQueryService(
                 host, LAIUE_INPUT_SERVICE_NAME, LAIUE_INPUT_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueInputServiceV1), NULL, NULL);
-        uint32_t graphicsServiceSize = 0u;
+                sizeof(LaiueInputServiceV1), NULL, &inputServiceSize);
+        const LaiueMesherServiceV1 *mesherService =
+            (const LaiueMesherServiceV1 *)LaiueModuleHostQueryService(
+                host, LAIUE_MESHER_SERVICE_NAME, LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+                sizeof(LaiueMesherServiceV1), NULL, &mesherServiceSize);
+        uint32_t graphicsServiceSize = 0u, uiServiceSize = 0u;
         const LaiueGraphicsDeviceServiceV2 *graphicsService =
             (const LaiueGraphicsDeviceServiceV2 *)LaiueModuleHostQueryService(
                 host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
                 LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2,
-                LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, NULL,
-                &graphicsServiceSize);
-        const LaiueSceneServiceV1 *sceneService =
-            (const LaiueSceneServiceV1 *)LaiueModuleHostQueryService(
-                host, LAIUE_SCENE_SERVICE_NAME, LAIUE_SCENE_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueSceneServiceV1), NULL, NULL);
-        const LaiueSceneMathServiceV1 *sceneMath =
-            (const LaiueSceneMathServiceV1 *)LaiueModuleHostQueryService(
-                host, LAIUE_SCENE_MATH_SERVICE_NAME,
-                LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1,
-                sizeof(LaiueSceneMathServiceV1), NULL, NULL);
-        walkUiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
-                host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
-                LAIUE_UI_SERVICE_V1_LEGACY_SIZE, NULL, &walkUiServiceSize);
-        /* Input is optional: without it the window, renderer and simulation
-         * still run and only the controls are absent. */
-        if (inputService != NULL && (inputService->create == NULL || inputService->destroy == NULL))
+                LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, NULL, &graphicsServiceSize);
+        const LaiueUiServiceV1 *uiService = (const LaiueUiServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_UI_SERVICE_NAME, LAIUE_UI_SERVICE_ABI_VERSION_1,
+            LAIUE_UI_SERVICE_V1_LEGACY_SIZE, NULL, &uiServiceSize);
+        if (windowService != NULL &&
+            (windowServiceSize < sizeof(*windowService) ||
+             windowService->structSize < sizeof(*windowService) ||
+             windowService->abiVersion != LAIUE_WINDOW_SERVICE_ABI_VERSION_1 ||
+             windowService->create == NULL || windowService->destroy == NULL ||
+             windowService->getNativeHandle == NULL || windowService->getClientSize == NULL ||
+             windowService->runLoop == NULL || windowService->requestClose == NULL ||
+             windowService->setRawInputCallback == NULL || windowService->setMouseLook == NULL ||
+             windowService->getCursorClientPosition == NULL))
+            windowService = NULL;
+        if (inputService != NULL &&
+            (inputServiceSize < sizeof(*inputService) ||
+             inputService->structSize < sizeof(*inputService) ||
+             inputService->abiVersion != LAIUE_INPUT_SERVICE_ABI_VERSION_1 ||
+             inputService->create == NULL || inputService->destroy == NULL))
             inputService = NULL;
-        if (windowService != NULL && graphicsService != NULL && windowService->create != NULL &&
+        if (mesherService != NULL &&
+            (mesherServiceSize < sizeof(*mesherService) ||
+             mesherService->structSize < sizeof(*mesherService) ||
+             mesherService->abiVersion != LAIUE_MESHER_SERVICE_ABI_VERSION_1))
+            mesherService = NULL;
+        if (graphicsService != NULL &&
+            (graphicsServiceSize < LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE ||
+             graphicsService->structSize < LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE ||
+             graphicsService->abiVersion != LAIUE_GRAPHICS_DEVICE_SERVICE_ABI_VERSION_2))
+            graphicsService = NULL;
+        if (uiService != NULL && (uiServiceSize < LAIUE_UI_SERVICE_V1_LEGACY_SIZE ||
+                                  uiService->structSize < LAIUE_UI_SERVICE_V1_LEGACY_SIZE ||
+                                  uiService->abiVersion != LAIUE_UI_SERVICE_ABI_VERSION_1))
+            uiService = NULL;
+        const bool canDestroyDevice =
+            graphicsService != NULL &&
+            WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
+                                    sizeof(graphicsService->destroyDevice)) &&
+            graphicsService->destroyDevice != NULL;
+        const bool canCreateWithContext =
+            graphicsService != NULL &&
+            WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, createDeviceWithContext),
+                                    sizeof(graphicsService->createDeviceWithContext)) &&
+            WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
+                                    offsetof(LaiueGraphicsDeviceServiceV2, context),
+                                    sizeof(graphicsService->context)) &&
+            graphicsService->createDeviceWithContext != NULL && graphicsService->context != NULL;
+        const bool canCreateDevice =
+            graphicsService != NULL &&
             WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
                                     offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
                                     sizeof(graphicsService->createDevice)) &&
-            graphicsService->createDevice != NULL)
+            graphicsService->createDevice != NULL;
+        if (windowService != NULL && canDestroyDevice && (canCreateWithContext || canCreateDevice))
         {
-            WindowConfiguration windowConfiguration = {
+            const WindowConfiguration configuration = {
                 .title = L"LAIUE Walk",
                 .width = 1280,
                 .height = 720,
             };
-            Window *window = windowService->create(&windowConfiguration);
+            Window *window = windowService->create(&configuration);
             Input *input = window == NULL || inputService == NULL
                                ? NULL
                                : inputService->create(windowService->getNativeHandle(window));
             if (window != NULL && input == NULL)
                 PlatformWriteConsoleUtf8(
                     "laiue walk: input provider unavailable; controls disabled\n");
-            LaiueGraphicsDeviceV2 *device = NULL;
-            if (walkUiService != NULL &&
-                WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
+            void *uiContext = NULL;
+            if (window != NULL && uiService != NULL &&
+                WalkServiceFieldPresent(uiServiceSize, uiService->structSize,
                                         offsetof(LaiueUiServiceV1, contextCreateWithContext),
-                                        sizeof(walkUiService->contextCreateWithContext)) &&
-                WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
+                                        sizeof(uiService->contextCreateWithContext)) &&
+                WalkServiceFieldPresent(uiServiceSize, uiService->structSize,
+                                        offsetof(LaiueUiServiceV1, context),
+                                        sizeof(uiService->context)) &&
+                WalkServiceFieldPresent(uiServiceSize, uiService->structSize,
                                         offsetof(LaiueUiServiceV1, contextDestroy),
-                                        sizeof(walkUiService->contextDestroy)) &&
-                walkUiService->contextCreateWithContext != NULL &&
-                walkUiService->contextDestroy != NULL && walkUiService->context != NULL)
-                (void)walkUiService->contextCreateWithContext(walkUiService->context,
-                                                          &walkUiContext);
+                                        sizeof(uiService->contextDestroy)) &&
+                uiService->contextCreateWithContext != NULL && uiService->contextDestroy != NULL &&
+                uiService->context != NULL)
+            {
+                const uint32_t created =
+                    uiService->contextCreateWithContext(uiService->context, &uiContext);
+                if (created == 0u && uiContext != NULL)
+                {
+                    uiService->contextDestroy(uiContext);
+                    uiContext = NULL;
+                }
+            }
+            LaiueGraphicsDeviceV2 *device = NULL;
+            bool deviceReady = false;
             if (window != NULL)
             {
-                windowService->setRawInputCallback(window, WalkRawInput, NULL);
-                uint32_t created = 0u;
-                if (WalkServiceFieldPresent(
-                        graphicsServiceSize, graphicsService->structSize,
-                        offsetof(LaiueGraphicsDeviceServiceV2, createDeviceWithContext),
-                        sizeof(graphicsService->createDeviceWithContext)) &&
-                    WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
-                                            offsetof(LaiueGraphicsDeviceServiceV2, context),
-                                            sizeof(graphicsService->context)) &&
-                    graphicsService->createDeviceWithContext != NULL &&
-                    graphicsService->context != NULL)
-                    created = graphicsService->createDeviceWithContext(
-                        graphicsService->context, windowService->getNativeHandle(window),
-                        1280, 720, LAIUE_GRAPHICS_BACKEND_AUTO, &device);
-                else if (graphicsService->createDevice != NULL)
-                    created = graphicsService->createDevice(
-                        windowService->getNativeHandle(window), 1280, 720,
-                        LAIUE_GRAPHICS_BACKEND_AUTO, &device);
-                if (created == 0u)
-                    device = NULL;
-                /* The callback context is installed after the state is
-                 * complete, so the window never observes a half-built input. */
+                const uint32_t created =
+                    canCreateWithContext
+                        ? graphicsService->createDeviceWithContext(
+                              graphicsService->context, windowService->getNativeHandle(window),
+                              1280, 720, LAIUE_GRAPHICS_BACKEND_AUTO, &device)
+                        : graphicsService->createDevice(windowService->getNativeHandle(window),
+                                                        1280, 720, LAIUE_GRAPHICS_BACKEND_AUTO,
+                                                        &device);
+                /* Preserve a partial output for its provider's destroy callback. */
+                deviceReady =
+                    created != 0u && device != NULL &&
+                    WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, abiVersion),
+                                           sizeof(device->abiVersion)) &&
+                    device->abiVersion == LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION &&
+                    WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, beginFrame),
+                                           sizeof(device->beginFrame)) &&
+                    WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, endFrame),
+                                           sizeof(device->endFrame)) &&
+                    device->beginFrame != NULL && device->endFrame != NULL;
             }
-            if (window != NULL && device != NULL)
+            if (window != NULL && deviceReady)
             {
                 static WalkWindowState state;
                 memset(&state, 0, sizeof(state));
@@ -2171,72 +1325,50 @@ static bool RunWalkExample(bool headless, bool scenarioEnabled)
                 state.inputService = inputService;
                 state.graphicsService = graphicsService;
                 state.graphicsServiceSize = graphicsServiceSize;
-                state.sceneService = sceneService;
-                state.sceneMath = sceneMath;
-                state.uiService = walkUiService;
-                state.physicsService = physicsService;
-                state.physicsServiceSize = physicsServiceSize;
+                state.uiService = uiService;
                 state.mesherService = mesherService;
-                state.voxelProvider = &walkProvider;
-                state.characterService = characterReady ? character : NULL;
-                state.characterServiceSize = characterServiceSize;
-                state.voxelService = voxel;
-                state.voxelServiceSize = voxelServiceSize;
-                state.world = world;
+                state.game = &game;
                 state.window = window;
                 state.input = input;
                 state.device = device;
-                state.uiContext = walkUiContext;
-                state.controller = controller;
-                state.selectedMaterial = 1u;
+                state.uiContext = uiContext;
                 state.lastTime = PlatformMonotonicSeconds();
                 state.scenarioEnabled = scenarioEnabled;
+                state.smokeEnabled = smokeEnabled;
                 WalkScenarioInitialize(&state.scenario);
-                if (sceneService != NULL && sceneMath != NULL &&
-                    sceneService->cameraInit != NULL)
-                    sceneService->cameraInit(&state.camera, 0.0, 0.0, 0.0,
-                                             0.0f, -0.14f);
-                state.ragdollReady = WalkInitializeRagdoll(&state, &start);
-                if (!state.ragdollReady)
-                    PlatformWriteConsoleUtf8(
-                        state.physicsService == NULL
-                            ? "laiue walk: physics provider unavailable; ragdoll disabled\n"
-                            : "laiue walk: deterministic ragdoll could not be initialized\n");
-                WalkUpdateRenderOrigin(&state);
-                /* Without the mesher only the near voxel chunks disappear; the
-                 * far terrain, the body and the camera keep working. A present
-                 * mesher that cannot build its chunks is still a failure. */
-                const bool chunksWanted = state.mesherService != NULL;
+                if (!game.ragdollReady)
+                    PlatformWriteConsoleUtf8("laiue walk: ragdoll provider unavailable; using "
+                                             "character/static fallback\n");
+                state.failed = !WalkUpdateCamera(&state);
+                const bool chunksWanted = mesherService != NULL;
                 if (!chunksWanted)
                     PlatformWriteConsoleUtf8(
                         "laiue walk: mesher provider unavailable; near voxel chunks disabled\n");
                 state.chunksReady =
-                    chunksWanted && WalkVisualsCreateChunkSet(state.mesherService, &state.chunkSet);
-                int64_t chunkCenter[3] = {0, 0, 0};
-                if (state.chunksReady && WalkGetChunkCoordinates(&state, chunkCenter))
+                    chunksWanted && WalkVisualsCreateChunkSet(mesherService, &state.chunkSet);
+                if (state.chunksReady)
                     state.chunksReady = WalkVisualsUpdateChunkSet(
-                        device, state.mesherService, &state.chunkSet,
-                        WalkReadVisualBlock, (void *)state.voxelProvider, chunkCenter);
-                else
-                    state.chunksReady = false;
+                        device, mesherService, &state.chunkSet, WalkReadVisualBlock, &game,
+                        state.spatial.centerBlock);
+                state.failed |= !WalkCheckGameplayHealth(&state);
                 state.texturedTerrainReady = WalkVisualsCreateTerrain(
                     device, WalkReadDesktopAsset, NULL, state.texturedTerrainBuffers,
                     state.terrainTextures, &state.terrainSampler);
                 if (!state.texturedTerrainReady)
                     PlatformWriteConsoleUtf8(
                         "laiue walk: bundled terrain textures could not be loaded\n");
-                const bool farTerrainReady = WalkVisualsCreateFarTerrainBuffer(
-                    device, &state.farTerrainBuffer);
-                if (state.ragdollReady)
-                    state.ragdollVisualScratch =
-                        (WalkRagdollVisualScratch *)PlatformAllocate(
-                            sizeof(*state.ragdollVisualScratch), false);
-                const bool ragdollBufferReady = state.ragdollReady &&
-                    state.ragdollVisualScratch != NULL &&
+                const bool farTerrainReady =
+                    WalkVisualsCreateFarTerrainBuffer(device, &state.farTerrainBuffer);
+                if (game.ragdollReady)
+                    state.ragdollVisualScratch = (WalkRagdollVisualScratch *)PlatformAllocate(
+                        sizeof(*state.ragdollVisualScratch), false);
+                const bool ragdollBufferReady =
+                    game.ragdollReady && state.ragdollVisualScratch != NULL &&
                     WalkVisualsCreateRagdollBuffer(device, &state.ragdollBuffer);
-                if ((chunksWanted && !state.chunksReady) || !state.texturedTerrainReady ||
-                    !farTerrainReady || (state.ragdollReady && !ragdollBufferReady))
-                    state.failed = true;
+                state.failed |= (chunksWanted && !state.chunksReady) ||
+                                !state.texturedTerrainReady || !farTerrainReady ||
+                                (game.ragdollReady && !ragdollBufferReady) ||
+                                WalkGameplayHealth(&game) != WALK_GAMEPLAY_OK;
                 if (scenarioEnabled)
                 {
                     state.scenarioMetrics = (WalkScenarioMetrics *)PlatformAllocate(
@@ -2247,76 +1379,52 @@ static bool RunWalkExample(bool headless, bool scenarioEnabled)
                         WalkScenarioMetricsInitialize(state.scenarioMetrics);
                     if (state.scenarioGpuMetrics != NULL)
                         WalkScenarioMetricsInitialize(state.scenarioGpuMetrics);
-                    if (!state.ragdollReady || !state.chunksReady ||
+                    state.failed |=
+                        !state.cameraReady || !game.ragdollReady || !state.chunksReady ||
                         state.scenarioMetrics == NULL || state.scenarioGpuMetrics == NULL ||
-                        sceneService == NULL || sceneMath == NULL ||
-                        sceneService->cameraGetForwardVector == NULL ||
-                        sceneService->cameraGetViewMatrix == NULL ||
-                        sceneService->cameraGetProjectionMatrix == NULL ||
-                        sceneMath->matrix4Multiply == NULL ||
-                        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, setCamera),
-                                                sizeof(device->setCamera)) ||
-                        device->setCamera == NULL || device->submit == NULL ||
-                        !WalkBodyLocalPosition(&state.ragdoll.bodies[state.ragdoll.rootBody],
-                                               state.scenarioStartRoot))
-                        state.failed = true;
-                    else
-                    {
-                        state.scenarioStartRoot[0] += (double)state.ragdollBlockOriginX;
-                        state.scenarioStartRoot[1] += (double)state.ragdollBlockOriginY;
-                    }
+                        !WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, submit),
+                                                sizeof(device->submit)) ||
+                        device->submit == NULL ||
+                        WalkGameplaySnapshot(&game, &state.scenarioStartSpatial) !=
+                            WALK_GAMEPLAY_OK;
                     PlatformWriteConsoleUtf8("LAIUE_SCENARIO event=start tick_rate=128\n");
                 }
                 windowService->setRawInputCallback(window, WalkRawInput, &state);
-                /* Mouse-look captures the cursor; without input nothing could
-                 * release it or read the motion, so it stays off. */
-                windowService->setMouseLook(window, input != NULL && !scenarioEnabled);
+                windowService->setMouseLook(window,
+                                            input != NULL && !scenarioEnabled && !smokeEnabled);
                 PlatformWriteConsoleUtf8(
                     "laiue walk: walk mode (WASD, Shift, Space, V view, mouse break/place, Esc)\n");
                 windowService->runLoop(window, WalkWindowFrame, &state);
                 success = success && !state.failed;
                 if (scenarioEnabled && state.scenarioTick != WALK_SCENARIO_TOTAL_TICKS)
                     success = false;
+                if (smokeEnabled && state.smokeFrames != 32u)
+                    success = false;
+                if (smokeEnabled && !state.failed && state.smokeFrames == 32u)
+                    PlatformWriteConsoleUtf8("laiue walk: windowed smoke32 passed\n");
                 ranWindow = true;
                 if (!state.failed)
                     PlatformWriteConsoleUtf8("laiue walk: windowed session ended cleanly\n");
-                WalkVisualsDestroyChunkSet(state.device, state.mesherService,
-                                           &state.chunkSet);
-                WalkVisualsDestroyTerrain(state.device, state.texturedTerrainBuffers,
+                WalkVisualsDestroyChunkSet(device, mesherService, &state.chunkSet);
+                WalkVisualsDestroyTerrain(device, state.texturedTerrainBuffers,
                                           state.terrainTextures, &state.terrainSampler);
-                WalkVisualsDestroyBuffer(state.device, &state.farTerrainBuffer);
+                WalkVisualsDestroyBuffer(device, &state.farTerrainBuffer);
                 if (state.ragdollBuffer != 0u &&
-                    WalkDeviceFieldPresent(state.device,
-                        offsetof(LaiueGraphicsDeviceV2, destroyHandle),
-                        sizeof(state.device->destroyHandle)) &&
-                    state.device->destroyHandle != NULL)
-                    state.device->destroyHandle(state.device, state.ragdollBuffer);
+                    WalkDeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                                           sizeof(device->destroyHandle)) &&
+                    device->destroyHandle != NULL)
+                    device->destroyHandle(device, state.ragdollBuffer);
                 PlatformFree(state.ragdollVisualScratch);
-                state.ragdollVisualScratch = NULL;
-                WalkHumanoidRelease(physicsService, &state.ragdoll,
-                                    &state.ragdollScratch);
                 PlatformFree(state.scenarioMetrics);
-                state.scenarioMetrics = NULL;
                 PlatformFree(state.scenarioGpuMetrics);
-                state.scenarioGpuMetrics = NULL;
-                state.ragdollScratchBytes = 0u;
-                if (WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
-                                            offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
-                                            sizeof(graphicsService->destroyDevice)) &&
-                    graphicsService->destroyDevice != NULL)
-                    graphicsService->destroyDevice(device);
             }
             else
-            {
                 PlatformWriteConsoleUtf8(
                     "laiue walk: graphics/window unavailable; using diagnostic headless mode\n");
-                if (device != NULL &&
-                    WalkServiceFieldPresent(graphicsServiceSize, graphicsService->structSize,
-                                            offsetof(LaiueGraphicsDeviceServiceV2, destroyDevice),
-                                            sizeof(graphicsService->destroyDevice)) &&
-                    graphicsService->destroyDevice != NULL)
-                    graphicsService->destroyDevice(device);
-            }
+            if (device != NULL)
+                graphicsService->destroyDevice(device);
+            if (uiContext != NULL)
+                uiService->contextDestroy(uiContext);
             if (input != NULL)
                 inputService->destroy(input);
             if (window != NULL)
@@ -2326,103 +1434,58 @@ static bool RunWalkExample(bool headless, bool scenarioEnabled)
             PlatformWriteConsoleUtf8(
                 "laiue walk: graphics/window modules missing; using diagnostic headless mode\n");
     }
-    if (walkUiContext != NULL && walkUiService != NULL &&
-        WalkServiceFieldPresent(walkUiServiceSize, walkUiService->structSize,
-                                offsetof(LaiueUiServiceV1, contextDestroy),
-                                sizeof(walkUiService->contextDestroy)) &&
-        walkUiService->contextDestroy != NULL)
-        walkUiService->contextDestroy(walkUiContext);
 #endif
+
     if (!ranWindow)
     {
-        LaiueVoxelBlockV1 grass = {0u, 0u};
-        LaiueVoxelCoordV1 grassCoordinate = {0, 0, 0};
-        success = success && walkProvider.getBlock(&walkProvider, &grassCoordinate, &grass) != 0u &&
-                  grass.material == 1u;
-        LaiueVoxelBlockV1 air = {0u, 0u};
-        LaiueVoxelCoordV1 airCoordinate = {0, 0, 1};
-        LaiueVoxelBlockV1 earth = {0u, 0u};
-        LaiueVoxelCoordV1 earthCoordinate = {0, 0, -1};
-        LaiueVoxelBlockV1 stone = {0u, 0u};
-        LaiueVoxelCoordV1 stoneCoordinate = {0, 0, -4};
-        success = success && walkProvider.getBlock(&walkProvider, &airCoordinate, &air) != 0u &&
-                  air.material == 0u &&
-                  walkProvider.getBlock(&walkProvider, &earthCoordinate, &earth) != 0u &&
-                  earth.material == 2u &&
-                  walkProvider.getBlock(&walkProvider, &stoneCoordinate, &stone) != 0u &&
-                  stone.material == 3u;
-        if (characterReady)
+        const LaiueVoxelProviderV1 *provider = &game.walkProvider;
+        const LaiueVoxelCoordV1 coordinates[4] = {{0, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 0, -4}};
+        const uint16_t materials[4] = {1u, 0u, 2u, 3u};
+        for (uint32_t index = 0u; success && index < 4u; ++index)
         {
-            /* One jump takes a little over one second with the fixed-point gravity
-             * constants. Run two fixed-step seconds so the smoke test observes both
-             * the airborne path and a deterministic landing on z=0. */
+            LaiueVoxelBlockV1 block = {0};
+            success = provider->getBlock(provider, &coordinates[index], &block) != 0u &&
+                      block.material == materials[index];
+        }
+        if (game.actor != WALK_GAMEPLAY_ACTOR_STATIC)
+        {
+            WalkGameplaySpatialSnapshot before, after;
+            success = success && WalkGameplaySnapshot(&game, &before) == WALK_GAMEPLAY_OK;
             for (uint32_t tick = 0u; success && tick < LAIUE_CHARACTER_TICK_HZ * 2u; ++tick)
             {
-                LaiueCharacterInputV1 input = {
-                    .moveX = 1,
-                    .moveY = 0,
-                    .flags = LAIUE_CHARACTER_INPUT_SPRINT |
-                             (tick == 0u ? LAIUE_CHARACTER_INPUT_JUMP : 0u),
+                WalkGameplayInput input = {
+                    .strafe = 1.0,
+                    .sprint = true,
+                    .pulses = tick == 0u ? WALK_GAMEPLAY_PULSE_JUMP : 0u,
                 };
-                success = WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                                  offsetof(LaiueCharacterServiceV1, step),
-                                                  sizeof(character->step)) &&
-                          character->step != NULL && character->step(controller, &input) != 0u;
-                if (success &&
-                    WalkRebaseWorldAndCharacter(voxel, voxelServiceSize, world, character,
-                                                characterServiceSize, controller) == 0u)
-                    success = false;
+                WalkGameplayStepResult step;
+                success = WalkGameplaySubmitInput(&game, &input) == WALK_GAMEPLAY_OK &&
+                          WalkGameplayStep(&game, &step) == WALK_GAMEPLAY_OK;
             }
-        LaiueCharacterPositionV1 end = {0};
-        success = success &&
-                  WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                           offsetof(LaiueCharacterServiceV1, getPosition),
-                                           sizeof(character->getPosition)) &&
-                  WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                           offsetof(LaiueCharacterServiceV1, isGrounded),
-                                           sizeof(character->isGrounded)) &&
-                  character->getPosition != NULL && character->isGrounded != NULL &&
-                  character->getPosition(controller, &end) != 0u &&
-                  character->isGrounded(controller) != 0u;
-        if (success)
-        {
-            PlatformWriteConsoleUtf8("laiue walk: SDK character/voxel graph passed\n");
-            PlatformWriteConsoleUtf8(end.cellX != start.cellX
-                                         ? "laiue walk: infinite-coordinate rebase passed\n"
-                                         : "laiue walk: infinite-coordinate rebase failed\n");
-            success = end.cellX != start.cellX;
+            double delta[3];
+            success = success && WalkGameplaySnapshot(&game, &after) == WALK_GAMEPLAY_OK &&
+                      after.grounded && WalkGameplaySpatialDelta(&before, &after, delta) &&
+                      delta[0] > 0.5;
+            if (success && game.actor == WALK_GAMEPLAY_ACTOR_CHARACTER)
+            {
+                const bool crossed = game.lastPosition.cellX != gameConfig.initialPosition.cellX;
+                PlatformWriteConsoleUtf8("laiue walk: SDK character/voxel graph passed\n");
+                PlatformWriteConsoleUtf8(crossed
+                                             ? "laiue walk: infinite-coordinate rebase passed\n"
+                                             : "laiue walk: infinite-coordinate rebase failed\n");
+                success = crossed;
+            }
+            else if (success)
+                PlatformWriteConsoleUtf8("laiue walk: shared ragdoll/terrain diagnostics passed\n");
         }
-        }
-        else
-        {
+        else if (success)
             PlatformWriteConsoleUtf8(
                 "laiue walk: terrain diagnostics passed; character controls disabled\n");
-        }
     }
-
-    if (scenarioEnabled)
-    {
-#if defined(LAIUE_WALK_WINDOWED)
+    if (scenarioEnabled || smokeEnabled)
         success = success && ranWindow;
-#else
-        success = false;
-#endif
-    }
-    if (controller != NULL && character != NULL &&
-        WalkServiceFieldPresent(characterServiceSize, character->structSize,
-                                offsetof(LaiueCharacterServiceV1, destroy),
-                                sizeof(character->destroy)) &&
-        character->destroy != NULL)
-        character->destroy(controller);
-    if (world != NULL && voxel != NULL &&
-        WalkServiceFieldPresent(voxelServiceSize, voxel->structSize,
-                                offsetof(LaiueVoxelServiceV1, destroy),
-                                sizeof(voxel->destroy)) &&
-        voxel->destroy != NULL)
-        voxel->destroy(world);
-#if defined(LAIUE_WALK_WINDOWED)
-    WalkPhysicsUnbind();
-#endif
+    /* No provider is stopped while the game still owns its bodies/world. */
+    WalkGameplayRelease(&game);
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
     return success;
@@ -2456,7 +1519,10 @@ static bool WalkArgument(const wchar_t *expected)
 
 void WalkExampleEntryPoint(void)
 {
-    ExitProcess(RunWalkExample(WalkArgument(L"--headless"), WalkArgument(L"--scenario")) ? 0u : 1u);
+    ExitProcess(RunWalkExample(WalkArgument(L"--headless"), WalkArgument(L"--scenario"),
+                               WalkArgument(L"--smoke"))
+                    ? 0u
+                    : 1u);
 }
 #else
 static bool WalkArgument(int argc, char **argv, const char *expected)
@@ -2467,8 +1533,7 @@ static bool WalkArgument(int argc, char **argv, const char *expected)
         uint32_t index = 0u;
         if (value == NULL)
             continue;
-        while (value[index] != '\0' && expected[index] != '\0' &&
-               value[index] == expected[index])
+        while (value[index] != '\0' && expected[index] != '\0' && value[index] == expected[index])
             ++index;
         if (value[index] == '\0' && expected[index] == '\0')
             return true;
@@ -2479,9 +1544,9 @@ static bool WalkArgument(int argc, char **argv, const char *expected)
 int main(int argc, char **argv)
 {
     return RunWalkExample(WalkArgument(argc, argv, "--headless"),
-                          WalkArgument(argc, argv, "--scenario"))
+                          WalkArgument(argc, argv, "--scenario"),
+                          WalkArgument(argc, argv, "--smoke"))
                ? 0
                : 1;
 }
 #endif
-#endif /* !LAIUE_WALK_RUNTIME_ONLY */

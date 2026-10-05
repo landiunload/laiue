@@ -20,8 +20,7 @@ enum
     WALK_RAGDOLL_PROFILE_RINGS = 5u,
 };
 
-static bool DeviceFieldPresent(const LaiueGraphicsDeviceV2 *device,
-                               size_t offset, size_t size)
+static bool DeviceFieldPresent(const LaiueGraphicsDeviceV2 *device, size_t offset, size_t size)
 {
     return device != NULL && (size_t)device->structSize >= offset &&
            (size_t)device->structSize - offset >= size;
@@ -37,8 +36,7 @@ static double Maximum(double left, double right)
     return left > right ? left : right;
 }
 
-static void ReleaseHandle(LaiueGraphicsDeviceV2 *device,
-                          LaiueGraphicsHandle *handle)
+static void ReleaseHandle(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle *handle)
 {
     if (handle == NULL || *handle == 0u)
         return;
@@ -49,10 +47,8 @@ static void ReleaseHandle(LaiueGraphicsDeviceV2 *device,
     *handle = 0u;
 }
 
-static bool UploadVertexBuffer(LaiueGraphicsDeviceV2 *device,
-                               const LaiueGraphicsVertexV2 *vertices,
-                               uint32_t vertexCount,
-                               LaiueGraphicsHandle *outBuffer)
+static bool UploadVertexBuffer(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsVertexV2 *vertices,
+                               uint32_t vertexCount, LaiueGraphicsHandle *outBuffer)
 {
     if (outBuffer != NULL)
         *outBuffer = 0u;
@@ -71,8 +67,10 @@ static bool UploadVertexBuffer(LaiueGraphicsDeviceV2 *device,
     if (device->createBuffer(device, &description, outBuffer) == 0u)
         return false;
     const LaiueGraphicsBufferUploadV1 upload = {
-        .structSize = sizeof(upload), .buffer = *outBuffer,
-        .data = vertices, .sizeBytes = description.sizeBytes,
+        .structSize = sizeof(upload),
+        .buffer = *outBuffer,
+        .data = vertices,
+        .sizeBytes = description.sizeBytes,
     };
     if (device->uploadBuffer(device, &upload) != 0u)
         return true;
@@ -116,27 +114,26 @@ static bool UploadTexture(LaiueGraphicsDeviceV2 *device, WalkReadAssetFn readAss
         !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadTexture),
                             sizeof(device->uploadTexture)) ||
         device->createTexture == NULL || device->uploadTexture == NULL ||
-        !readAsset(assetContext, relativePath, &encoded, &encodedBytes) ||
-        encoded == NULL || encodedBytes == 0u)
+        !readAsset(assetContext, relativePath, &encoded, &encodedBytes) || encoded == NULL ||
+        encodedBytes == 0u)
         goto cleanup;
 
     ImageInfo info;
     memset(&info, 0, sizeof(info));
-    if (ImageInspect(encoded, encodedBytes, &info) != IMAGE_OK ||
-        info.frameCount != 1u || info.frameBytes == 0u ||
-        info.pixelBytes != info.frameBytes || info.width > UINT32_MAX / 4u)
+    if (ImageInspect(encoded, encodedBytes, &info) != IMAGE_OK || info.frameCount != 1u ||
+        info.frameBytes == 0u || info.pixelBytes != info.frameBytes || info.width > UINT32_MAX / 4u)
         goto cleanup;
     pixels = (uint8_t *)PlatformAllocate(info.pixelBytes, false);
     if (info.scratchBytes != 0u)
         scratch = (uint8_t *)PlatformAllocate(info.scratchBytes, false);
     if (pixels == NULL || (info.scratchBytes != 0u && scratch == NULL) ||
-        ImageDecode(encoded, encodedBytes, &info, pixels, info.pixelBytes,
-                    scratch, info.scratchBytes) != IMAGE_OK)
+        ImageDecode(encoded, encodedBytes, &info, pixels, info.pixelBytes, scratch,
+                    info.scratchBytes) != IMAGE_OK)
         goto cleanup;
 
     uint32_t mipLevels = 1u;
-    for (uint32_t largest = info.width > info.height ? info.width : info.height;
-         largest > 1u; largest >>= 1u)
+    for (uint32_t largest = info.width > info.height ? info.width : info.height; largest > 1u;
+         largest >>= 1u)
         ++mipLevels;
     const LaiueGraphicsTextureDescV1 description = {
         .structSize = sizeof(description),
@@ -153,9 +150,12 @@ static bool UploadTexture(LaiueGraphicsDeviceV2 *device, WalkReadAssetFn readAss
     for (uint32_t level = 0u; level < mipLevels; ++level)
     {
         const LaiueGraphicsTextureUploadV1 upload = {
-            .structSize = sizeof(upload), .texture = *outTexture,
-            .data = source, .sizeBytes = (uint64_t)width * height * 4u,
-            .rowPitchBytes = width * 4u, .mipLevel = level,
+            .structSize = sizeof(upload),
+            .texture = *outTexture,
+            .data = source,
+            .sizeBytes = (uint64_t)width * height * 4u,
+            .rowPitchBytes = width * 4u,
+            .mipLevel = level,
         };
         if (device->uploadTexture(device, &upload) == 0u)
             goto cleanup;
@@ -188,14 +188,16 @@ cleanup:
     return succeeded;
 }
 
-bool WalkVisualsCreateTerrain(LaiueGraphicsDeviceV2 *device,
-                              WalkReadAssetFn readAsset, void *assetContext,
+bool WalkVisualsCreateTerrain(LaiueGraphicsDeviceV2 *device, WalkReadAssetFn readAsset,
+                              void *assetContext,
                               LaiueGraphicsHandle outBuffers[WALK_VISUAL_TEXTURE_COUNT],
                               LaiueGraphicsHandle outTextures[WALK_VISUAL_TEXTURE_COUNT],
                               LaiueGraphicsHandle *outSampler)
 {
     static const char *const paths[WALK_VISUAL_TEXTURE_COUNT] = {
-        "textures/grass.png", "textures/dirt.png", "textures/stone.png",
+        "textures/grass.png",
+        "textures/dirt.png",
+        "textures/stone.png",
     };
     if (outBuffers == NULL || outTextures == NULL || outSampler == NULL)
         return false;
@@ -211,7 +213,8 @@ bool WalkVisualsCreateTerrain(LaiueGraphicsDeviceV2 *device,
         if (!UploadTexture(device, readAsset, assetContext, paths[index], &outTextures[index]))
             goto failed;
     const LaiueGraphicsSamplerDescV1 sampler = {
-        .structSize = sizeof(sampler), .minFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
+        .structSize = sizeof(sampler),
+        .minFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
         .magFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
         .addressModeU = LAIUE_GRAPHICS_ADDRESS_REPEAT,
         .addressModeV = LAIUE_GRAPHICS_ADDRESS_REPEAT,
@@ -261,13 +264,13 @@ typedef struct WalkVisualBuildContext
     void *blockContext;
 } WalkVisualBuildContext;
 
-static WorldRegionContents WalkVisualFillRegion(void *opaque,
-    int64_t minX, int64_t minY, int64_t minZ,
-    int32_t sizeX, int32_t sizeY, int32_t sizeZ, BlockType *blocks)
+static WorldRegionContents WalkVisualFillRegion(void *opaque, int64_t minX, int64_t minY,
+                                                int64_t minZ, int32_t sizeX, int32_t sizeY,
+                                                int32_t sizeZ, BlockType *blocks)
 {
     WalkVisualBuildContext *context = (WalkVisualBuildContext *)opaque;
-    if (context == NULL || context->getBlock == NULL || blocks == NULL ||
-        sizeX <= 0 || sizeY <= 0 || sizeZ <= 0)
+    if (context == NULL || context->getBlock == NULL || blocks == NULL || sizeX <= 0 ||
+        sizeY <= 0 || sizeZ <= 0)
         return WORLD_REGION_ALL_AIR;
     for (int32_t y = 0; y < sizeY; ++y)
         for (int32_t x = 0; x < sizeX; ++x)
@@ -277,10 +280,9 @@ static WorldRegionContents WalkVisualFillRegion(void *opaque,
                 uint8_t material = 0u;
                 if (AddInt64(minX, x, &worldX) && AddInt64(minY, y, &worldY) &&
                     AddInt64(minZ, z, &worldZ))
-                    material = context->getBlock(context->blockContext,
-                                                  worldX, worldY, worldZ);
-                blocks[((size_t)y * (size_t)sizeX + (size_t)x) *
-                           (size_t)sizeZ + (size_t)z] = material;
+                    material = context->getBlock(context->blockContext, worldX, worldY, worldZ);
+                blocks[((size_t)y * (size_t)sizeX + (size_t)x) * (size_t)sizeZ + (size_t)z] =
+                    material;
             }
     return WORLD_REGION_MIXED;
 }
@@ -294,52 +296,56 @@ static void DestroyChunk(LaiueGraphicsDeviceV2 *device, WalkVisualChunk *chunk)
     memset(chunk, 0, sizeof(*chunk));
 }
 
-bool WalkVisualsCreateChunkSet(const LaiueMesherServiceV1 *mesher,
-                               WalkVisualChunkSet *outSet)
+bool WalkVisualsCreateChunkSet(const LaiueMesherServiceV1 *mesher, WalkVisualChunkSet *outSet)
 {
     if (outSet == NULL)
         return false;
     memset(outSet, 0, sizeof(*outSet));
-    if (mesher == NULL || mesher->structSize < sizeof(*mesher) ||
-        mesher->scratchCreate == NULL || mesher->scratchDestroy == NULL ||
-        mesher->buildChunkMesh == NULL)
+    if (mesher == NULL || mesher->structSize < sizeof(*mesher) || mesher->scratchCreate == NULL ||
+        mesher->scratchDestroy == NULL || mesher->buildChunkMesh == NULL)
         return false;
     outSet->scratch = mesher->scratchCreate();
     return outSet->scratch != NULL;
 }
 
-void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device,
-                                const LaiueMesherServiceV1 *mesher,
-                                WalkVisualChunkSet *set)
+void WalkVisualsInvalidateChunkSet(LaiueGraphicsDeviceV2 *device, WalkVisualChunkSet *set)
 {
     if (set == NULL)
         return;
     for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
         DestroyChunk(device, &set->chunks[i]);
+    set->centerValid = false;
+}
+
+void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
+                                WalkVisualChunkSet *set)
+{
+    if (set == NULL)
+        return;
+    WalkVisualsInvalidateChunkSet(device, set);
     if (set->scratch != NULL && mesher != NULL && mesher->scratchDestroy != NULL)
         mesher->scratchDestroy(set->scratch);
     memset(set, 0, sizeof(*set));
 }
 
-static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device,
-                             const LaiueMesherServiceV1 *mesher,
-                             ChunkMesherScratch *scratch,
-                             WalkVisualGetBlockFn getBlock, void *blockContext,
-                             const int64_t coordinate[3], WalkVisualChunk *outChunk)
+static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
+                             ChunkMesherScratch *scratch, WalkVisualGetBlockFn getBlock,
+                             void *blockContext, const int64_t coordinate[3],
+                             WalkVisualChunk *outChunk)
 {
     if (device == NULL || mesher == NULL || scratch == NULL || getBlock == NULL ||
-        coordinate == NULL || outChunk == NULL ||
-        coordinate[0] < INT64_MIN / 64 + 1 || coordinate[0] > INT64_MAX / 64 - 1 ||
-        coordinate[1] < INT64_MIN / 64 + 1 || coordinate[1] > INT64_MAX / 64 - 1 ||
-        coordinate[2] < INT64_MIN / 64 + 1 || coordinate[2] > INT64_MAX / 64 - 1)
+        coordinate == NULL || outChunk == NULL || coordinate[0] < INT64_MIN / 64 + 1 ||
+        coordinate[0] > INT64_MAX / 64 - 1 || coordinate[1] < INT64_MIN / 64 + 1 ||
+        coordinate[1] > INT64_MAX / 64 - 1 || coordinate[2] < INT64_MIN / 64 + 1 ||
+        coordinate[2] > INT64_MAX / 64 - 1)
         return false;
 
     WalkVisualBuildContext context = {getBlock, blockContext};
     const ChunkMesherWorldSource source = {&context, WalkVisualFillRegion};
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
-    if (!mesher->buildChunkMesh(&source, scratch, coordinate[0], coordinate[1],
-                                coordinate[2], &quads, &quadCount))
+    if (!mesher->buildChunkMesh(&source, scratch, coordinate[0], coordinate[1], coordinate[2],
+                                &quads, &quadCount))
         return false;
     uint32_t counts[WALK_VISUAL_TEXTURE_COUNT] = {0u, 0u, 0u};
     for (uint32_t i = 0u; i < quadCount; ++i)
@@ -353,9 +359,8 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device,
         built.coordinate[axis] = coordinate[axis];
     built.ready = true;
     static const uint8_t faceCorners[6][4] = {
-        {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u},
-        {7u, 6u, 2u, 3u}, {4u, 5u, 1u, 0u},
-        {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
+        {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u}, {7u, 6u, 2u, 3u},
+        {4u, 5u, 1u, 0u}, {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
     };
     static const uint8_t triangleCorners[6] = {0u, 1u, 2u, 0u, 2u, 3u};
     static const uint8_t shadeByFace[6] = {204u, 204u, 230u, 179u, 255u, 140u};
@@ -375,8 +380,10 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device,
         for (uint32_t q = 0u; q < quadCount; ++q)
         {
             const uint32_t blockMaterial = quads[q].positionAndFace >> 24u;
-            const uint32_t materialIndex = blockMaterial == 0u ? UINT32_MAX :
-                (blockMaterial <= WALK_VISUAL_TEXTURE_COUNT ? blockMaterial - 1u : 2u);
+            const uint32_t materialIndex =
+                blockMaterial == 0u
+                    ? UINT32_MAX
+                    : (blockMaterial <= WALK_VISUAL_TEXTURE_COUNT ? blockMaterial - 1u : 2u);
             if (materialIndex != material)
                 continue;
             const uint32_t face = (quads[q].positionAndFace >> 21u) & 7u;
@@ -402,20 +409,33 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device,
                 float u, v;
                 /* Voxel coordinates are in block units. Repeat each 16x16 tile
                  * once per block instead of stretching it over eight blocks. */
-                if (face < 2u) { u = y; v = -z; }
-                else if (face < 4u) { u = x; v = -z; }
-                else { u = x; v = y; }
+                if (face < 2u)
+                {
+                    u = y;
+                    v = -z;
+                }
+                else if (face < 4u)
+                {
+                    u = x;
+                    v = -z;
+                }
+                else
+                {
+                    u = x;
+                    v = y;
+                }
                 const uint32_t shade = shadeByFace[face];
                 corners[cornerIndex] = (LaiueGraphicsVertexV2){
-                    .position = {x, y, z}, .uv = {u, v},
-                    .colorRGBA = UINT32_C(0xFF000000) | (shade << 16u) |
-                                 (shade << 8u) | shade,
+                    .position = {x, y, z},
+                    .uv = {u, v},
+                    .colorRGBA = UINT32_C(0xFF000000) | (shade << 16u) | (shade << 8u) | shade,
                 };
             }
             for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
                 vertices[written[material]++] = corners[triangleCorners[vertex]];
         }
-        const bool uploaded = written[material] == vertexCount &&
+        const bool uploaded =
+            written[material] == vertexCount &&
             UploadVertexBuffer(device, vertices, vertexCount, &built.buffers[material]);
         PlatformFree(vertices);
         if (!uploaded)
@@ -432,11 +452,9 @@ failed:
     return false;
 }
 
-bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device,
-                               const LaiueMesherServiceV1 *mesher,
-                               WalkVisualChunkSet *set,
-                               WalkVisualGetBlockFn getBlock, void *blockContext,
-                               const int64_t centerBlock[3])
+bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
+                               WalkVisualChunkSet *set, WalkVisualGetBlockFn getBlock,
+                               void *blockContext, const int64_t centerBlock[3])
 {
     if (device == NULL || mesher == NULL || set == NULL || set->scratch == NULL ||
         getBlock == NULL || centerBlock == NULL)
@@ -466,8 +484,7 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device,
     {
         uint32_t slot = WALK_VISUAL_CHUNK_COUNT;
         for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
-            if (!used[i] && set->chunks[i].ready &&
-                set->chunks[i].coordinate[0] == desired[d][0] &&
+            if (!used[i] && set->chunks[i].ready && set->chunks[i].coordinate[0] == desired[d][0] &&
                 set->chunks[i].coordinate[1] == desired[d][1] &&
                 set->chunks[i].coordinate[2] == desired[d][2])
             {
@@ -479,12 +496,14 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device,
             used[slot] = true;
             continue;
         }
-        for (slot = 0u; slot < WALK_VISUAL_CHUNK_COUNT && used[slot]; ++slot) {}
+        for (slot = 0u; slot < WALK_VISUAL_CHUNK_COUNT && used[slot]; ++slot)
+        {
+        }
         if (slot == WALK_VISUAL_CHUNK_COUNT)
             return false;
         WalkVisualChunk replacement = {0};
-        if (!BuildChunkVisual(device, mesher, set->scratch, getBlock, blockContext,
-                              desired[d], &replacement))
+        if (!BuildChunkVisual(device, mesher, set->scratch, getBlock, blockContext, desired[d],
+                              &replacement))
             return false;
         DestroyChunk(device, &set->chunks[slot]);
         set->chunks[slot] = replacement;
@@ -498,8 +517,7 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device,
     return true;
 }
 
-void WalkVisualsInvalidateBlock(WalkVisualChunkSet *set,
-                                LaiueGraphicsDeviceV2 *device,
+void WalkVisualsInvalidateBlock(WalkVisualChunkSet *set, LaiueGraphicsDeviceV2 *device,
                                 int64_t blockX, int64_t blockY, int64_t blockZ)
 {
     if (set == NULL)
@@ -518,8 +536,10 @@ void WalkVisualsInvalidateBlock(WalkVisualChunkSet *set,
     uint32_t counts[3] = {1u, 1u, 1u};
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        if (edgeMask[axis] == 1u) offsets[axis][counts[axis]++] = -1;
-        else if (edgeMask[axis] == 2u) offsets[axis][counts[axis]++] = 1;
+        if (edgeMask[axis] == 1u)
+            offsets[axis][counts[axis]++] = -1;
+        else if (edgeMask[axis] == 2u)
+            offsets[axis][counts[axis]++] = 1;
     }
     for (uint32_t z = 0u; z < counts[2]; ++z)
         for (uint32_t y = 0u; y < counts[1]; ++y)
@@ -552,8 +572,8 @@ uint32_t WalkVisualsBuildChunkDraws(const WalkVisualChunkSet *set,
         {
             if (chunk->coordinate[axis] > INT64_MAX / 64 ||
                 chunk->coordinate[axis] < INT64_MIN / 64 ||
-                !SubtractInt64(chunk->coordinate[axis] * 64,
-                               renderOriginBlock[axis], &relativeOrigin[axis]))
+                !SubtractInt64(chunk->coordinate[axis] * 64, renderOriginBlock[axis],
+                               &relativeOrigin[axis]))
             {
                 relativeOriginValid = false;
                 break;
@@ -581,9 +601,8 @@ uint32_t WalkVisualsBuildChunkDraws(const WalkVisualChunkSet *set,
     return count;
 }
 
-static void AppendFarTerrainQuad(LaiueGraphicsVertexV2 vertices[6],
-                                 uint32_t *written, float x0, float y0,
-                                 float x1, float y1)
+static void AppendFarTerrainQuad(LaiueGraphicsVertexV2 vertices[6], uint32_t *written, float x0,
+                                 float y0, float x1, float y1)
 {
     const LaiueGraphicsVertexV2 corners[4] = {
         {.position = {x0, y0, 0.0f}, .uv = {x0, y0}, .colorRGBA = UINT32_MAX},
@@ -611,24 +630,21 @@ bool WalkVisualsCreateFarTerrainBuffer(LaiueGraphicsDeviceV2 *device,
     /* Leave the active 3x3 chunk window open so edits and holes remain visible. */
     AppendFarTerrainQuad(vertices, &written, -outer, innerMaximum, outer, outer);
     AppendFarTerrainQuad(vertices, &written, -outer, -outer, outer, innerMinimum);
-    AppendFarTerrainQuad(vertices, &written, -outer, innerMinimum,
-                         innerMinimum, innerMaximum);
-    AppendFarTerrainQuad(vertices, &written, innerMaximum, innerMinimum,
-                         outer, innerMaximum);
+    AppendFarTerrainQuad(vertices, &written, -outer, innerMinimum, innerMinimum, innerMaximum);
+    AppendFarTerrainQuad(vertices, &written, innerMaximum, innerMinimum, outer, innerMaximum);
     return written == WALK_VISUAL_FAR_TERRAIN_VERTEX_COUNT &&
-        UploadVertexBuffer(device, vertices, written, outBuffer);
+           UploadVertexBuffer(device, vertices, written, outBuffer);
 }
 
-bool WalkVisualsBuildFarTerrainDraw(
-    LaiueGraphicsHandle buffer, const int64_t renderOriginBlock[3],
-    const LaiueGraphicsHandle textures[WALK_VISUAL_TEXTURE_COUNT],
-    LaiueGraphicsHandle sampler, LaiueGraphicsDrawItemV2 *outDraw)
+bool WalkVisualsBuildFarTerrainDraw(LaiueGraphicsHandle buffer, const int64_t renderOriginBlock[3],
+                                    const LaiueGraphicsHandle textures[WALK_VISUAL_TEXTURE_COUNT],
+                                    LaiueGraphicsHandle sampler, LaiueGraphicsDrawItemV2 *outDraw)
 {
     if (outDraw == NULL)
         return false;
     memset(outDraw, 0, sizeof(*outDraw));
-    if (buffer == 0u || renderOriginBlock == NULL || textures == NULL ||
-        textures[0] == 0u || sampler == 0u)
+    if (buffer == 0u || renderOriginBlock == NULL || textures == NULL || textures[0] == 0u ||
+        sampler == 0u)
         return false;
     outDraw->structSize = sizeof(*outDraw);
     outDraw->vertexBuffer = buffer;
@@ -640,8 +656,7 @@ bool WalkVisualsBuildFarTerrainDraw(
     return true;
 }
 
-void WalkVisualsDestroyBuffer(LaiueGraphicsDeviceV2 *device,
-                              LaiueGraphicsHandle *buffer)
+void WalkVisualsDestroyBuffer(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle *buffer)
 {
     ReleaseHandle(device, buffer);
 }
@@ -660,25 +675,22 @@ void WalkVisualsDestroyTerrain(LaiueGraphicsDeviceV2 *device,
     ReleaseHandle(device, sampler);
 }
 
-bool WalkVisualsCreateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
-                                    LaiueGraphicsHandle *outBuffer)
+bool WalkVisualsCreateRagdollBuffer(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle *outBuffer)
 {
-    return CreateVertexBuffer(device,
-        (uint64_t)WALK_RAGDOLL_VISUAL_VERTEX_COUNT * sizeof(LaiueGraphicsVertexV2),
+    return CreateVertexBuffer(
+        device, (uint64_t)WALK_RAGDOLL_VISUAL_VERTEX_COUNT * sizeof(LaiueGraphicsVertexV2),
         outBuffer);
 }
 
-static bool WriteRagdollVertex(LaiueGraphicsVertexV2 *output,
-                               const double center[3], const float rotation[9],
-                               const double renderOrigin[3], const double local[3],
-                               uint32_t color)
+static bool WriteRagdollVertex(LaiueGraphicsVertexV2 *output, const double center[3],
+                               const float rotation[9], const double renderOrigin[3],
+                               const double local[3], uint32_t color)
 {
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
-        const double value = center[axis] - renderOrigin[axis] +
-            (double)rotation[axis] * local[0] +
-            (double)rotation[3u + axis] * local[1] +
-            (double)rotation[6u + axis] * local[2];
+        const double value = center[axis] - renderOrigin[axis] + (double)rotation[axis] * local[0] +
+                             (double)rotation[3u + axis] * local[1] +
+                             (double)rotation[6u + axis] * local[2];
         if (!WalkMathFinite(value) || WalkMathAbs(value) > 1000000.0)
             return false;
         output->position[axis] = (float)value;
@@ -692,24 +704,27 @@ static bool WriteRagdollVertex(LaiueGraphicsVertexV2 *output,
  * joint anchors, because the diagonal arm colliders are not anatomical bones.
  * Fixed radial tables avoid rebuilding trigonometry for every rendered frame. */
 static const double radial8[8][2] = {
-    {1.0, 0.0}, {0.7071067811865475, 0.7071067811865475},
-    {0.0, 1.0}, {-0.7071067811865475, 0.7071067811865475},
+    {1.0, 0.0},  {0.7071067811865475, 0.7071067811865475},
+    {0.0, 1.0},  {-0.7071067811865475, 0.7071067811865475},
     {-1.0, 0.0}, {-0.7071067811865475, -0.7071067811865475},
     {0.0, -1.0}, {0.7071067811865475, -0.7071067811865475},
 };
 static const double radial12[12][2] = {
-    {1.0, 0.0}, {0.8660254037844386, 0.5}, {0.5, 0.8660254037844386},
-    {0.0, 1.0}, {-0.5, 0.8660254037844386}, {-0.8660254037844386, 0.5},
+    {1.0, 0.0},  {0.8660254037844386, 0.5},   {0.5, 0.8660254037844386},
+    {0.0, 1.0},  {-0.5, 0.8660254037844386},  {-0.8660254037844386, 0.5},
     {-1.0, 0.0}, {-0.8660254037844386, -0.5}, {-0.5, -0.8660254037844386},
-    {0.0, -1.0}, {0.5, -0.8660254037844386}, {0.8660254037844386, -0.5},
+    {0.0, -1.0}, {0.5, -0.8660254037844386},  {0.8660254037844386, -0.5},
 };
 static const double latitude8[9][2] = {
-    {0.0, -1.0}, {0.3826834323650898, -0.9238795325112867},
+    {0.0, -1.0},
+    {0.3826834323650898, -0.9238795325112867},
     {0.7071067811865475, -0.7071067811865475},
-    {0.9238795325112867, -0.3826834323650898}, {1.0, 0.0},
+    {0.9238795325112867, -0.3826834323650898},
+    {1.0, 0.0},
     {0.9238795325112867, 0.3826834323650898},
     {0.7071067811865475, 0.7071067811865475},
-    {0.3826834323650898, 0.9238795325112867}, {0.0, 1.0},
+    {0.3826834323650898, 0.9238795325112867},
+    {0.0, 1.0},
 };
 static const uint32_t skinColor = UINT32_C(0xFF9BBCE5);
 static const uint32_t hairColor = UINT32_C(0xFF29394B);
@@ -726,37 +741,34 @@ typedef struct WalkRagdollMeshWriter
     float rotation[9];
 } WalkRagdollMeshWriter;
 
-static uint32_t LitColor(uint32_t base, const double normal[3],
-                         const float rotation[9])
+static uint32_t LitColor(uint32_t base, const double normal[3], const float rotation[9])
 {
-    const double length = ScalarSqrtDouble(normal[0] * normal[0] +
-        normal[1] * normal[1] + normal[2] * normal[2]);
+    const double length =
+        ScalarSqrtDouble(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
     double illumination = 0.0;
     static const double light[3] = {-0.45, -0.30, 0.84};
     if (WalkMathFinite(length) && length > 1.0e-9)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
-            illumination += light[axis] * (rotation[axis] * normal[0] +
-                rotation[3u + axis] * normal[1] + rotation[6u + axis] * normal[2]) / length;
-    const uint32_t shade = (uint32_t)(170.0 + 85.0 *
-        Maximum(0.0, Minimum(1.0, illumination)));
+            illumination += light[axis] *
+                            (rotation[axis] * normal[0] + rotation[3u + axis] * normal[1] +
+                             rotation[6u + axis] * normal[2]) /
+                            length;
+    const uint32_t shade = (uint32_t)(170.0 + 85.0 * Maximum(0.0, Minimum(1.0, illumination)));
     const uint32_t red = (base & 0xFFu) * shade / 255u;
     const uint32_t green = ((base >> 8u) & 0xFFu) * shade / 255u;
     const uint32_t blue = ((base >> 16u) & 0xFFu) * shade / 255u;
     return (base & UINT32_C(0xFF000000)) | (blue << 16u) | (green << 8u) | red;
 }
 
-static bool MeshVertex(const WalkRagdollMeshWriter *writer,
-                       LaiueGraphicsVertexV2 *vertex, const double local[3],
-                       const double normal[3], uint32_t color)
+static bool MeshVertex(const WalkRagdollMeshWriter *writer, LaiueGraphicsVertexV2 *vertex,
+                       const double local[3], const double normal[3], uint32_t color)
 {
-    return WriteRagdollVertex(vertex, writer->center, writer->rotation,
-        writer->origin, local, LitColor(color, normal, writer->rotation));
+    return WriteRagdollVertex(vertex, writer->center, writer->rotation, writer->origin, local,
+                              LitColor(color, normal, writer->rotation));
 }
 
-static bool MeshTriangle(WalkRagdollMeshWriter *writer,
-                         const LaiueGraphicsVertexV2 *a,
-                         const LaiueGraphicsVertexV2 *b,
-                         const LaiueGraphicsVertexV2 *c)
+static bool MeshTriangle(WalkRagdollMeshWriter *writer, const LaiueGraphicsVertexV2 *a,
+                         const LaiueGraphicsVertexV2 *b, const LaiueGraphicsVertexV2 *c)
 {
     if (writer->count > WALK_RAGDOLL_VISUAL_VERTEX_COUNT - 3u)
         return false;
@@ -766,9 +778,8 @@ static bool MeshTriangle(WalkRagdollMeshWriter *writer,
     return true;
 }
 
-static bool MeshEllipsoid(WalkRagdollMeshWriter *writer,
-                          const double offset[3], const double radius[3],
-                          uint32_t color, bool head)
+static bool MeshEllipsoid(WalkRagdollMeshWriter *writer, const double offset[3],
+                          const double radius[3], uint32_t color, bool head)
 {
     const uint32_t longitudeCount = head ? 12u : 8u;
     const uint32_t latitudeCount = head ? 8u : 4u;
@@ -778,18 +789,17 @@ static bool MeshEllipsoid(WalkRagdollMeshWriter *writer,
         for (uint32_t longitude = 0u; longitude < longitudeCount; ++longitude)
         {
             const double *ring = latitude8[latitude * 8u / latitudeCount];
-            const double unit[3] = {ring[0] * radial[longitude][0],
-                                     ring[0] * radial[longitude][1], ring[1]};
+            const double unit[3] = {ring[0] * radial[longitude][0], ring[0] * radial[longitude][1],
+                                    ring[1]};
             double local[3], normal[3];
             for (uint32_t axis = 0u; axis < 3u; ++axis)
             {
                 local[axis] = offset[axis] + radius[axis] * unit[axis];
                 normal[axis] = unit[axis] / radius[axis];
             }
-            const bool hair = head && (unit[2] >= 0.70 ||
-                                      (unit[1] < -0.35 && unit[2] > -0.05));
-            if (!MeshVertex(writer, &points[(latitude - 1u) * longitudeCount + longitude],
-                            local, normal, hair ? hairColor : color))
+            const bool hair = head && (unit[2] >= 0.70 || (unit[1] < -0.35 && unit[2] > -0.05));
+            if (!MeshVertex(writer, &points[(latitude - 1u) * longitudeCount + longitude], local,
+                            normal, hair ? hairColor : color))
                 return false;
         }
     const uint32_t bottom = (latitudeCount - 1u) * longitudeCount;
@@ -797,8 +807,7 @@ static bool MeshEllipsoid(WalkRagdollMeshWriter *writer,
     for (uint32_t cap = 0u; cap < 2u; ++cap)
     {
         const double normal[3] = {0.0, 0.0, cap == 0u ? -1.0 : 1.0};
-        const double local[3] = {offset[0], offset[1],
-                                  offset[2] + normal[2] * radius[2]};
+        const double local[3] = {offset[0], offset[1], offset[2] + normal[2] * radius[2]};
         if (!MeshVertex(writer, &points[bottom + cap], local, normal,
                         head && cap != 0u ? hairColor : color))
             return false;
@@ -824,10 +833,8 @@ static bool MeshEllipsoid(WalkRagdollMeshWriter *writer,
     return true;
 }
 
-static bool MeshLoft(WalkRagdollMeshWriter *writer,
-                     const double bottom[3], const double top[3],
-                     double radiusX, double radiusY, const double profile[5],
-                     uint32_t color)
+static bool MeshLoft(WalkRagdollMeshWriter *writer, const double bottom[3], const double top[3],
+                     double radiusX, double radiusY, const double profile[5], uint32_t color)
 {
     static const double levels[5] = {0.0, 0.12, 0.5, 0.88, 1.0};
     double direction[3], side[3];
@@ -870,10 +877,10 @@ static bool MeshLoft(WalkRagdollMeshWriter *writer,
             for (uint32_t axis = 0u; axis < 3u; ++axis)
             {
                 local[axis] = bottom[axis] + direction[axis] * length * levels[ring] +
-                    profile[ring] * (side[axis] * radial8[radial][0] * radiusX +
-                                     front[axis] * radial8[radial][1] * radiusY);
-                normal[axis] = side[axis] * radial8[radial][0] +
-                               front[axis] * radial8[radial][1] + capSlope * direction[axis];
+                              profile[ring] * (side[axis] * radial8[radial][0] * radiusX +
+                                               front[axis] * radial8[radial][1] * radiusY);
+                normal[axis] = side[axis] * radial8[radial][0] + front[axis] * radial8[radial][1] +
+                               capSlope * direction[axis];
             }
             if (!MeshVertex(writer, &points[ring * 8u + radial], local, normal, color))
                 return false;
@@ -901,8 +908,8 @@ static bool MeshLoft(WalkRagdollMeshWriter *writer,
     return true;
 }
 
-static bool MeshEye(WalkRagdollMeshWriter *writer, double x, double y,
-                    double z, double width, double height, uint32_t color)
+static bool MeshEye(WalkRagdollMeshWriter *writer, double x, double y, double z, double width,
+                    double height, uint32_t color)
 {
     const double normal[3] = {0.0, 1.0, 0.0};
     const double center[3] = {x, y, z};
@@ -911,8 +918,7 @@ static bool MeshEye(WalkRagdollMeshWriter *writer, double x, double y,
         return false;
     for (uint32_t i = 0u; i < 8u; ++i)
     {
-        const double point[3] = {x + width * radial8[i][0], y,
-                                  z + height * radial8[i][1]};
+        const double point[3] = {x + width * radial8[i][0], y, z + height * radial8[i][1]};
         if (!MeshVertex(writer, &points[i], point, normal, color))
             return false;
     }
@@ -922,10 +928,9 @@ static bool MeshEye(WalkRagdollMeshWriter *writer, double x, double y,
     return true;
 }
 
-bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
-                                    LaiueGraphicsHandle buffer,
-                                    const VoxelRagdoll *ragdoll,
-                                    const double renderOrigin[3],
+bool WalkVisualsUpdateRagdollBuffer(const WalkPhysicsContext *context,
+                                    LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle buffer,
+                                    const VoxelRagdoll *ragdoll, const double renderOrigin[3],
                                     WalkRagdollVisualScratch *scratch)
 {
     if (device == NULL || buffer == 0u || ragdoll == NULL || !ragdoll->initialized ||
@@ -933,7 +938,8 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
         ragdoll->jointCount != WALK_VISUAL_RAGDOLL_JOINT_COUNT || renderOrigin == NULL ||
         scratch == NULL ||
         !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
-                            sizeof(device->uploadBuffer)) || device->uploadBuffer == NULL)
+                            sizeof(device->uploadBuffer)) ||
+        device->uploadBuffer == NULL)
         return false;
     for (uint32_t joint = 0u; joint < ragdoll->jointCount; ++joint)
         if (ragdoll->joints[joint].bodyA >= ragdoll->bodyCount ||
@@ -947,8 +953,8 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
                 !(ragdoll->bodies[body].halfExtent[axis] > 0.0))
                 return false;
         for (uint32_t axis = 0u; axis < 4u; ++axis)
-            normSquared += ragdoll->bodies[body].orientation[axis] *
-                           ragdoll->bodies[body].orientation[axis];
+            normSquared +=
+                ragdoll->bodies[body].orientation[axis] * ragdoll->bodies[body].orientation[axis];
         if (!WalkMathFinite(normSquared) || WalkMathAbs(normSquared - 1.0) > 1.0e-5)
             return false;
     }
@@ -961,9 +967,9 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
     for (uint32_t index = 0u; index < ragdoll->bodyCount; ++index)
     {
         const VoxelRigidBody *body = &ragdoll->bodies[index];
-        if (!WalkBodyLocalPosition(body, writer.center))
+        if (!WalkBodyLocalPosition(context, body, writer.center))
             return false;
-        WalkBodyOrientationMatrix(body, writer.rotation);
+        WalkBodyOrientationMatrix(context, body, writer.rotation);
         if (index == WALK_VISUAL_RAGDOLL_HEAD_INDEX)
         {
             if (!MeshEllipsoid(&writer, zero, body->halfExtent, skinColor, true))
@@ -973,31 +979,32 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
             for (uint32_t eye = 0u; eye < 2u; ++eye)
             {
                 const double x = (eye == 0u ? -0.36 : 0.36) * body->halfExtent[0];
-                if (!MeshEye(&writer, x, body->halfExtent[1] * 1.005,
-                        body->halfExtent[2] * 0.12, body->halfExtent[0] * 0.21,
-                        body->halfExtent[2] * 0.24, UINT32_C(0xFFF3F3F3)) ||
-                    !MeshEye(&writer, x, body->halfExtent[1] * 1.02,
-                        body->halfExtent[2] * 0.10, body->halfExtent[0] * 0.095,
-                        body->halfExtent[2] * 0.14, UINT32_C(0xFF202B36)))
+                if (!MeshEye(&writer, x, body->halfExtent[1] * 1.005, body->halfExtent[2] * 0.12,
+                             body->halfExtent[0] * 0.21, body->halfExtent[2] * 0.24,
+                             UINT32_C(0xFFF3F3F3)) ||
+                    !MeshEye(&writer, x, body->halfExtent[1] * 1.02, body->halfExtent[2] * 0.10,
+                             body->halfExtent[0] * 0.095, body->halfExtent[2] * 0.14,
+                             UINT32_C(0xFF202B36)))
                     return false;
             }
             const double nose[3] = {0.0, body->halfExtent[1] * 0.97, -body->halfExtent[2] * 0.12};
-            const double noseSize[3] = {body->halfExtent[0] * 0.14,
-                body->halfExtent[1] * 0.20, body->halfExtent[2] * 0.16};
+            const double noseSize[3] = {body->halfExtent[0] * 0.14, body->halfExtent[1] * 0.20,
+                                        body->halfExtent[2] * 0.16};
             if (!MeshEllipsoid(&writer, nose, noseSize, skinColor, false) ||
-                !MeshEye(&writer, 0.0, body->halfExtent[1] * 0.94,
-                    -body->halfExtent[2] * 0.42, body->halfExtent[0] * 0.22,
-                    body->halfExtent[2] * 0.038, UINT32_C(0xFF536998)))
+                !MeshEye(&writer, 0.0, body->halfExtent[1] * 0.94, -body->halfExtent[2] * 0.42,
+                         body->halfExtent[0] * 0.22, body->halfExtent[2] * 0.038,
+                         UINT32_C(0xFF536998)))
                 return false;
             continue;
         }
         double bottom[3] = {0.0, 0.0, -body->halfExtent[2]};
         double top[3] = {0.0, 0.0, body->halfExtent[2]};
         double width = body->halfExtent[0], depth = body->halfExtent[1];
-        uint32_t color = index == 1u || (index >= 3u && index <= 6u) ? shirtColor :
-                         (index < 11u ? trousersColor : bootColor);
-        const double *profile = index == 0u ? pelvisProfile :
-                                (index == 1u ? torsoProfile : limbProfile);
+        uint32_t color = index == 1u || (index >= 3u && index <= 6u)
+                             ? shirtColor
+                             : (index < 11u ? trousersColor : bootColor);
+        const double *profile =
+            index == 0u ? pelvisProfile : (index == 1u ? torsoProfile : limbProfile);
         if (index >= 3u && index <= 10u)
         {
             for (uint32_t jointIndex = 0u; jointIndex < ragdoll->jointCount; ++jointIndex)
@@ -1031,23 +1038,25 @@ bool WalkVisualsUpdateRagdollBuffer(LaiueGraphicsDeviceV2 *device,
         const VoxelRagdollBallJointDefinition *joint = &ragdoll->joints[index];
         const VoxelRigidBody *parent = &ragdoll->bodies[joint->bodyA];
         const VoxelRigidBody *child = &ragdoll->bodies[joint->bodyB];
-        if (!WalkBodyLocalPosition(parent, writer.center))
+        if (!WalkBodyLocalPosition(context, parent, writer.center))
             return false;
-        WalkBodyOrientationMatrix(parent, writer.rotation);
+        WalkBodyOrientationMatrix(context, parent, writer.rotation);
         const double radius = Minimum(Minimum(parent->halfExtent[0], parent->halfExtent[1]),
-            Minimum(child->halfExtent[0], child->halfExtent[1])) *
-                (joint->bodyB == WALK_VISUAL_RAGDOLL_HEAD_INDEX ? 0.50 : 0.96);
+                                      Minimum(child->halfExtent[0], child->halfExtent[1])) *
+                              (joint->bodyB == WALK_VISUAL_RAGDOLL_HEAD_INDEX ? 0.50 : 0.96);
         const double size[3] = {radius, radius, radius};
-        const uint32_t color = joint->bodyB == 2u ? skinColor :
-                               (joint->bodyB < 7u ? shirtColor : trousersColor);
+        const uint32_t color =
+            joint->bodyB == 2u ? skinColor : (joint->bodyB < 7u ? shirtColor : trousersColor);
         if (!MeshEllipsoid(&writer, joint->anchorA, size, color, false))
             return false;
     }
     if (writer.count != WALK_RAGDOLL_VISUAL_VERTEX_COUNT)
         return false;
     const LaiueGraphicsBufferUploadV1 upload = {
-        .structSize = sizeof(upload), .buffer = buffer,
-        .data = writer.vertices, .sizeBytes = sizeof(scratch->vertices),
+        .structSize = sizeof(upload),
+        .buffer = buffer,
+        .data = writer.vertices,
+        .sizeBytes = sizeof(scratch->vertices),
     };
     return device->uploadBuffer(device, &upload) != 0u;
 }

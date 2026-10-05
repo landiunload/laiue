@@ -33,6 +33,8 @@ $testIssue = $null
 $summary = $null
 $rotationVerified = $false
 $homeResumeVerified = $false
+$gameplayStatePreserved = $false
+$gameplayState = $null
 $reportPath = Join-Path $OutputDir 'report.json'
 [pscustomobject]@{ status = 'RUNNING'; run = $runId } | ConvertTo-Json |
     Set-Content -LiteralPath $reportPath -Encoding utf8
@@ -163,6 +165,16 @@ function Latest-Presentation {
     return $items[$items.Count - 1]
 }
 
+function Gameplay-State {
+    param([string]$Log, [string]$Event)
+    $lines = [regex]::Matches($Log, "event=$Event run=$runId [^\r\n]*")
+    if ($lines.Count -eq 0) { throw "No $Event gameplay state was reported." }
+    $state = [regex]::Match($lines[$lines.Count - 1].Value,
+        'game_tick=\d+ game_revision=\d+ yaw=-?\d+[.]\d+ pitch=-?\d+[.]\d+ first_person=[01] material=[123] root_block_x=-?\d+ root_block_y=-?\d+ root_block_z=-?\d+ root_fraction_x=-?\d+[.]\d+ root_fraction_y=-?\d+[.]\d+ root_fraction_z=-?\d+[.]\d+ provider_frame_x=-?\d+ provider_frame_y=-?\d+ provider_frame_z=-?\d+')
+    if (-not $state.Success) { throw "Incomplete $Event gameplay state." }
+    return $state.Value
+}
+
 function Restore-Setting {
     param([string]$Name, [AllowNull()][object]$Original)
     if ($null -eq $Original) { return }
@@ -245,6 +257,7 @@ try {
         return $text -match "event=summary run=$runId status=PASS"
     }
     $summary = [regex]::Match($log, "LAIUE_SCENARIO event=summary run=$runId status=PASS[^\r\n]*").Value
+    $gameplayState = Gameplay-State -Log $log -Event 'summary'
 
     # Require real resize/presentation, not merely changed Android settings.
     $portraitFrame = Latest-Presentation -Log $log
@@ -264,6 +277,9 @@ try {
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
         -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
+    if ((Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
+        throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'
+    }
     $rotationVerified = $true
 
     $beforePause = Read-SmokeLog
@@ -291,6 +307,10 @@ try {
     $resumedFrame = Latest-Presentation -Log $resumedLog
     Save-Capture -Name 'resumed' -NativeWidth ([int]$resumedFrame.Groups[1].Value) `
         -NativeHeight ([int]$resumedFrame.Groups[2].Value) | Out-Null
+    if ((Gameplay-State -Log $resumedLog -Event 'presented') -ne $gameplayState) {
+        throw 'HOME/resume changed the held gameplay pose, world frame, camera or session revision.'
+    }
+    $gameplayStatePreserved = $true
     $homeResumeVerified = $true
     Read-SmokeLog | Out-Null
 } catch {
@@ -313,13 +333,15 @@ try {
 }
 
 $passed = $null -eq $testIssue -and $restoreErrors.Count -eq 0 -and
-          $rotationVerified -and $homeResumeVerified -and $captures.Count -eq 12
+          $rotationVerified -and $homeResumeVerified -and $gameplayStatePreserved -and
+          $captures.Count -eq 12
 $result = [pscustomobject]@{
     status = $(if ($passed) { 'PASS' } else { 'FAIL' })
     run = $runId; serial = $Serial; processId = $appProcessId; apk = $Apk
     elapsedSeconds = $clock.Elapsed.TotalSeconds; scenarioSummary = $summary
     captures = $captures.ToArray(); rotationVerified = $rotationVerified
     homeResumeVerified = $homeResumeVerified; settingsRestored = $restoreErrors.Count -eq 0
+    gameplayStatePreserved = $gameplayStatePreserved; gameplayState = $gameplayState
     originalIssue = $testIssue; restorationIssues = $restoreErrors.ToArray()
     limits = 'External adb captures inspect a held native checkpoint and the shared-decoder viewport. Visual correctness and frame-exact GPU readback are not certified. Frame wall time includes presentation/vsync and excludes ACK waits. Memory counters are scoped geometry/CPU-shadow bytes, not total VRAM or RSS.'
 }

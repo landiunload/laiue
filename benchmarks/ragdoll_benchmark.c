@@ -151,7 +151,7 @@ typedef struct Scenario
     double phase;
 } Scenario;
 
-static void ScenarioStart(Scenario *scenario, const LaiuePhysicsServiceV1 *physics)
+static void ScenarioStart(Scenario *scenario, const WalkPhysicsContext *physics)
 {
     memset(scenario, 0, sizeof(*scenario));
     scenario->collision.queryBlockPhysics = QueryFloor;
@@ -169,8 +169,8 @@ static void ScenarioStop(Scenario *scenario)
     scenario->scratch = NULL;
 }
 
-static void ScenarioRun(Scenario *scenario, const LaiuePhysicsServiceV1 *physics,
-                        uint32_t firstTick, uint32_t tickCount)
+static void ScenarioRun(Scenario *scenario, const WalkPhysicsContext *physics, uint32_t firstTick,
+                        uint32_t tickCount)
 {
     for (uint32_t tick = firstTick; tick < firstTick + tickCount; ++tick)
     {
@@ -193,25 +193,17 @@ LAIUE_TEST_ENTRY(RagdollBenchmarkEntryPoint)
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
     if (!BindLinkedWalkPhysics())
         Fail("walk binds the linked physics table");
-    const LaiuePhysicsServiceV1 physics = {
-        .configureThread = VoxelPhysicsConfigureThread,
-        .stepScratchBytes = VoxelRigidBodyStepScratchBytes,
-        .ragdollSettingsDefault = VoxelRagdollSettingsDefault,
-        .ragdollInitialize = VoxelRagdollInitialize,
-        .ragdollRelease = VoxelRagdollRelease,
-        .ragdollStep = VoxelRagdollStep,
-    };
 
     double samples[SAMPLE_COUNT];
     uint64_t checksum = 0u;
     for (uint32_t sample = 0u; sample < SAMPLE_COUNT; ++sample)
     {
         static Scenario scenario;
-        ScenarioStart(&scenario, &physics);
+        ScenarioStart(&scenario, &linkedWalkPhysicsContext);
         // Прогрев: тело встаёт на пол и набирает походку.
-        ScenarioRun(&scenario, &physics, 0u, 128u);
+        ScenarioRun(&scenario, &linkedWalkPhysicsContext, 0u, 128u);
         double start = PlatformMonotonicSeconds();
-        ScenarioRun(&scenario, &physics, 128u, TICKS_PER_SAMPLE);
+        ScenarioRun(&scenario, &linkedWalkPhysicsContext, 128u, TICKS_PER_SAMPLE);
         double elapsed = PlatformMonotonicSeconds() - start;
         samples[sample] = elapsed * 1.0e6 / (double)TICKS_PER_SAMPLE;
         uint64_t hash = HashRagdoll(&scenario.ragdoll);

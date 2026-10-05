@@ -138,6 +138,10 @@ check: нужен реальный link и запуск релевантных �
 - Android ARM64 проверяется NDK r29 build-only job; iOS ARM64 — Xcode 26
   unsigned link job с deployment target 15.0. Ни один из них не заменяет
   устройство, APK/IPA, Vulkan/Metal и lifecycle tests.
+- Android walk дополнительно запускается в API 35 x86_64 emulator с Vulkan:
+  поворот, HOME/resume, кадры и сохранение состояния игры. Эмулятор не заменяет
+  ARM64-телефон. Предупреждения внешнего emulator/SwiftShader сохраняются
+  в artifacts и перечисляются в общем отчёте.
 - Mobile application обязан передать явный app-container root каталогу
   содержимого; executable directory там намеренно недоступен как default.
 - Нативные моды на mobile отключены. Data-only packs проходят отдельную

@@ -15,13 +15,11 @@ endif()
 
 add_library(laiue_walk_android SHARED
     android_walk.c
-    ../walk.c
     ../walk_terrain.h
     "${_laiue_android_native_app_glue}")
 target_compile_definitions(laiue_walk_android PRIVATE
     LAIUE_STATIC=1
-    LAIUE_ANDROID_WALK=1
-    LAIUE_WALK_RUNTIME_ONLY=1)
+    LAIUE_ANDROID_WALK=1)
 target_include_directories(laiue_walk_android PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/src/core"

@@ -2,82 +2,98 @@
 
 #include <stddef.h>
 
-static const LaiuePhysicsServiceV1 *walkPhysics;
-
-bool WalkPhysicsBind(const LaiuePhysicsServiceV1 *service, uint32_t serviceSize)
+bool WalkPhysicsBind(WalkPhysicsContext *context, const LaiuePhysicsServiceV1 *service,
+                     uint32_t serviceSize)
 {
-    walkPhysics = NULL;
+
+    const size_t prefix = offsetof(LaiuePhysicsServiceV1, abiVersion) + sizeof(uint32_t);
     const size_t required =
         offsetof(LaiuePhysicsServiceV1, bodyTranslateBlocks) + sizeof(service->bodyTranslateBlocks);
-    if (service == NULL || serviceSize < required || service->structSize < required ||
-        service->bodyWake == NULL || service->ragdollJump == NULL ||
+    if (context == NULL || service == NULL || serviceSize < prefix ||
+        service->abiVersion != LAIUE_PHYSICS_SERVICE_ABI_VERSION_1 || serviceSize < required ||
+        service->structSize < required || service->configureThread == NULL ||
+        service->stepScratchBytes == NULL || service->ragdollInitialize == NULL ||
+        service->ragdollRelease == NULL || service->ragdollSettingsDefault == NULL ||
+        service->ragdollStep == NULL || service->bodyWake == NULL || service->ragdollJump == NULL ||
         service->bodyLocalPosition == NULL || service->bodyOrientationMatrix == NULL ||
         service->bodyLinearVelocity == NULL || service->bodyAngularVelocity == NULL ||
         service->bodyAddLinearVelocity == NULL || service->bodyAddAngularVelocity == NULL ||
         service->bodyTranslateBlocks == NULL)
         return false;
-    walkPhysics = service;
+    context->service = service;
+    context->serviceSize = serviceSize;
     return true;
 }
 
-void WalkPhysicsUnbind(void)
+void WalkPhysicsUnbind(WalkPhysicsContext *context)
 {
-    walkPhysics = NULL;
-}
-
-bool WalkPhysicsBound(void)
-{
-    return walkPhysics != NULL;
-}
-
-bool WalkBodyLocalPosition(const VoxelRigidBody *body, double outPosition[3])
-{
-    return walkPhysics != NULL && walkPhysics->bodyLocalPosition(body, outPosition);
-}
-
-void WalkBodyOrientationMatrix(const VoxelRigidBody *body, float outMatrix[9])
-{
-    if (walkPhysics != NULL)
+    if (context != NULL)
     {
-        walkPhysics->bodyOrientationMatrix(body, outMatrix);
+        context->service = NULL;
+        context->serviceSize = 0u;
+    }
+}
+
+bool WalkPhysicsBound(const WalkPhysicsContext *context)
+{
+    return context != NULL && context->service != NULL;
+}
+
+bool WalkBodyLocalPosition(const WalkPhysicsContext *context, const VoxelRigidBody *body,
+                           double outPosition[3])
+{
+    return WalkPhysicsBound(context) && context->service->bodyLocalPosition(body, outPosition);
+}
+
+void WalkBodyOrientationMatrix(const WalkPhysicsContext *context, const VoxelRigidBody *body,
+                               float outMatrix[9])
+{
+    if (WalkPhysicsBound(context))
+    {
+        context->service->bodyOrientationMatrix(body, outMatrix);
         return;
     }
     for (uint32_t index = 0u; index < 9u; ++index)
         outMatrix[index] = index % 4u == 0u ? 1.0f : 0.0f;
 }
 
-bool WalkBodyLinearVelocity(const VoxelRigidBody *body, double outVelocity[3])
+bool WalkBodyLinearVelocity(const WalkPhysicsContext *context, const VoxelRigidBody *body,
+                            double outVelocity[3])
 {
-    return walkPhysics != NULL && walkPhysics->bodyLinearVelocity(body, outVelocity);
+    return WalkPhysicsBound(context) && context->service->bodyLinearVelocity(body, outVelocity);
 }
 
-bool WalkBodyAngularVelocity(const VoxelRigidBody *body, double outVelocity[3])
+bool WalkBodyAngularVelocity(const WalkPhysicsContext *context, const VoxelRigidBody *body,
+                             double outVelocity[3])
 {
-    return walkPhysics != NULL && walkPhysics->bodyAngularVelocity(body, outVelocity);
+    return WalkPhysicsBound(context) && context->service->bodyAngularVelocity(body, outVelocity);
 }
 
-bool WalkBodyAddLinearVelocity(VoxelRigidBody *body, const double delta[3])
+bool WalkBodyAddLinearVelocity(const WalkPhysicsContext *context, VoxelRigidBody *body,
+                               const double delta[3])
 {
-    return walkPhysics != NULL && walkPhysics->bodyAddLinearVelocity(body, delta);
+    return WalkPhysicsBound(context) && context->service->bodyAddLinearVelocity(body, delta);
 }
 
-bool WalkBodyAddAngularVelocity(VoxelRigidBody *body, const double delta[3])
+bool WalkBodyAddAngularVelocity(const WalkPhysicsContext *context, VoxelRigidBody *body,
+                                const double delta[3])
 {
-    return walkPhysics != NULL && walkPhysics->bodyAddAngularVelocity(body, delta);
+    return WalkPhysicsBound(context) && context->service->bodyAddAngularVelocity(body, delta);
 }
 
-bool WalkBodyTranslateBlocks(VoxelRigidBody *body, const int64_t blockShift[3])
+bool WalkBodyTranslateBlocks(const WalkPhysicsContext *context, VoxelRigidBody *body,
+                             const int64_t blockShift[3])
 {
-    return walkPhysics != NULL && walkPhysics->bodyTranslateBlocks(body, blockShift);
+    return WalkPhysicsBound(context) && context->service->bodyTranslateBlocks(body, blockShift);
 }
 
-void WalkBodyWake(VoxelRigidBody *body)
+void WalkBodyWake(const WalkPhysicsContext *context, VoxelRigidBody *body)
 {
-    if (walkPhysics != NULL)
-        walkPhysics->bodyWake(body);
+    if (WalkPhysicsBound(context))
+        context->service->bodyWake(body);
 }
 
-bool WalkRagdollJump(VoxelRagdoll *ragdoll, double upwardSpeed)
+bool WalkRagdollJump(const WalkPhysicsContext *context, VoxelRagdoll *ragdoll, double upwardSpeed)
 {
-    return walkPhysics != NULL && walkPhysics->ragdollJump(ragdoll, upwardSpeed);
+    return WalkPhysicsBound(context) && context->service->ragdollJump(ragdoll, upwardSpeed);
 }

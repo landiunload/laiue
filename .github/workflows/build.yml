@@ -54,6 +54,9 @@ jobs:
         timeout-minutes: 8
         run: |
           foreach ($configuration in 'Debug', 'Release') {
+            ./tools/test_walk_fallback.ps1 `
+              -GameExe "build/${{ matrix.preset }}/bin/$configuration/laiue_walk.exe" `
+              -OutputDir "build/${{ matrix.preset }}/walk-scenario/fallback/$configuration"
             ./tools/test_windows_walk.ps1 `
               -GameExe "build/${{ matrix.preset }}/bin/$configuration/laiue_walk.exe" `
               -FrameCheckExe "build/${{ matrix.preset }}/bin/$configuration/laiue_frame_check.exe" `
