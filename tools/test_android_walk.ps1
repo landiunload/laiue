@@ -29,6 +29,11 @@ $oldFixedRotation = $null
 $logSince = $null
 $captures = [System.Collections.Generic.List[object]]::new()
 $restoreErrors = [System.Collections.Generic.List[string]]::new()
+$restoredSettings = @{}
+$originalSettings = $null
+$rotationSettingsModified = $false
+$baselineSamples = [System.Collections.Generic.List[object]]::new()
+$restoreAttempts = [System.Collections.Generic.List[object]]::new()
 $testIssue = $null
 $summary = $null
 $rotationVerified = $false
@@ -175,17 +180,114 @@ function Gameplay-State {
     return $state.Value
 }
 
+function Get-RotationSettings {
+    $auto = Invoke-Adb -Arguments @('shell', 'settings', 'get', 'system', 'accelerometer_rotation')
+    $rotation = Invoke-Adb -Arguments @('shell', 'settings', 'get', 'system', 'user_rotation')
+    $fixed = Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation')
+    $settings = [ordered]@{
+        user_rotation = $rotation; accelerometer_rotation = $auto
+        fixed_to_user_rotation = $fixed
+    }
+    Assert-RotationSettings -Settings $settings -Description 'observed'
+    return $settings
+}
+
+function Assert-RotationSettings {
+    param([AllowNull()][System.Collections.IDictionary]$Settings, [string]$Description = 'original')
+    if ($null -eq $Settings -or $Settings['accelerometer_rotation'] -notmatch '^(0|1|null)$' -or
+        $Settings['user_rotation'] -notmatch '^(0|1|2|3|null)$' -or
+        $Settings['fixed_to_user_rotation'] -notmatch '^(enabled|disabled|default|enabled_if_no_auto_rotation)$') {
+        $settingsText = [pscustomobject]$Settings | ConvertTo-Json -Compress
+        throw "No complete, valid $Description rotation settings are available: $settingsText"
+    }
+}
+
+function Test-RotationSettingsEqual {
+    param([System.Collections.IDictionary]$Left, [System.Collections.IDictionary]$Right)
+    foreach ($name in @('user_rotation', 'accelerometer_rotation', 'fixed_to_user_rotation')) {
+        if ([string]$Left[$name] -cne [string]$Right[$name]) { return $false }
+    }
+    return $true
+}
+
+function Wait-RotationSettings {
+    param([AllowNull()][System.Collections.IDictionary]$Expected = $null,
+          [System.Collections.Generic.List[object]]$Samples, [int]$WaitSeconds = 8)
+    $until = [Math]::Min($deadlineSeconds, $clock.Elapsed.TotalSeconds + $WaitSeconds)
+    $previous = $null
+    $observed = $null
+    $matching = 0
+    do {
+        $observed = Get-RotationSettings
+        foreach ($name in $observed.Keys) { $restoredSettings[$name] = $observed[$name] }
+        $Samples.Add([pscustomobject]@{
+            elapsedSeconds = $clock.Elapsed.TotalSeconds; settings = [pscustomobject]$observed
+        })
+        if ($null -ne $Expected) {
+            $matching = if (Test-RotationSettingsEqual -Left $Expected -Right $observed) { $matching + 1 } else { 0 }
+        } elseif ($null -ne $previous -and (Test-RotationSettingsEqual -Left $previous -Right $observed)) {
+            $matching++
+        } else {
+            $matching = 1
+        }
+        if ($matching -ge 3) { return [pscustomobject]@{ stable = $true; observed = $observed } }
+        $previous = $observed
+        if ($clock.Elapsed.TotalSeconds -ge $until) { break }
+        Start-Sleep -Milliseconds 200
+    } while ($clock.Elapsed.TotalSeconds -lt $until)
+    return [pscustomobject]@{ stable = $false; observed = $observed }
+}
+
 function Restore-Setting {
-    param([string]$Name, [AllowNull()][object]$Original)
-    if ($null -eq $Original) { return }
-    if ($Original -eq 'null' -or $Original -eq '') {
+    param([string]$Name, [string]$Original)
+    if ($Original -ceq 'null') {
         Invoke-Adb -Arguments @('shell', 'settings', 'delete', 'system', $Name) | Out-Null
     } else {
         Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', $Name, $Original) | Out-Null
     }
-    $restored = Invoke-Adb -Arguments @('shell', 'settings', 'get', 'system', $Name)
-    $expected = if ($Original -eq '') { 'null' } else { [string]$Original }
-    if ($restored -ne $expected) { throw "Restoring $Name did not recover its original value." }
+}
+
+function Restore-RotationSettings {
+    param([AllowNull()][System.Collections.IDictionary]$Original, [bool]$Modified)
+    # A failed/partial baseline never authorizes writes during cleanup.
+    if (-not $Modified) { return }
+    Assert-RotationSettings -Settings $Original
+    for ($number = 1; $number -le 3; $number++) {
+        $attempt = [pscustomobject]@{
+            number = $number; expected = [pscustomobject]$Original; status = 'RUNNING'
+            samples = [System.Collections.Generic.List[object]]::new()
+            errors = [System.Collections.Generic.List[string]]::new(); observed = $null
+        }
+        $restoreAttempts.Add($attempt)
+        # Fixed mode may trigger policy work: restore it before the final pair.
+        # Try every write even if an earlier command fails. Command failures
+        # remain fatal; only a readable, mismatched tuple permits a retry.
+        foreach ($write in @(
+            { Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation', $Original['fixed_to_user_rotation']) | Out-Null },
+            { Restore-Setting -Name 'user_rotation' -Original $Original['user_rotation'] },
+            { Restore-Setting -Name 'accelerometer_rotation' -Original $Original['accelerometer_rotation'] }
+        )) {
+            try { & $write } catch { $attempt.errors.Add($_.Exception.Message) }
+        }
+        try {
+            $verified = Wait-RotationSettings -Expected $Original -Samples $attempt.samples
+            $attempt.observed = [pscustomobject]$verified.observed
+        } catch {
+            $attempt.errors.Add($_.Exception.Message)
+        }
+        if ($attempt.errors.Count -ne 0) {
+            $attempt.status = 'ERROR'
+            throw "Rotation restoration command failed: $($attempt.errors -join '; ')."
+        }
+        if ($verified.stable) {
+            $attempt.status = 'PASS'
+            return
+        }
+        $attempt.status = 'MISMATCH'
+    }
+    $expectedText = [pscustomobject]$Original | ConvertTo-Json -Compress
+    $observedText = $attempt.observed | ConvertTo-Json -Compress
+    throw "Rotation restoration expected $expectedText, observed $observedText after 3 attempts."
 }
 
 try {
@@ -208,20 +310,18 @@ try {
     }
     $adbPrefix = @('-s', $Serial)
     if ((Invoke-Adb -Arguments @('get-state')) -ne 'device') { throw 'Android device is not ready.' }
-    $auto = Invoke-Adb -Arguments @('shell', 'settings', 'get', 'system', 'accelerometer_rotation')
-    if ($auto -notmatch '^(0|1|null)$') { throw 'Invalid original accelerometer rotation setting.' }
-    $oldAutoRotation = $auto
-    $rotation = Invoke-Adb -Arguments @('shell', 'settings', 'get', 'system', 'user_rotation')
-    if ($rotation -notmatch '^(0|1|2|3|null)$') { throw 'Invalid original user rotation setting.' }
-    $oldUserRotation = $rotation
-    $fixed = Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation')
-    if ($fixed -notmatch '^(enabled|disabled|default|enabled_if_no_auto_rotation)$') {
-        throw 'Device does not expose a restorable fixed-to-user-rotation mode.'
-    }
-    $oldFixedRotation = $fixed
     Invoke-Adb -Arguments @('install', '-r', $Apk) -CommandTimeoutSeconds 45 | Out-Null
     Invoke-Adb -Arguments @('shell', 'am', 'force-stop', $package) | Out-Null
+    # Installation and a fresh emulator's policy initialization can take time.
+    # Capture a stable complete tuple after both, before the first mutation.
+    $baseline = Wait-RotationSettings -Samples $baselineSamples
+    if (-not $baseline.stable) { throw 'Original rotation settings did not reach a stable baseline.' }
+    $originalSettings = $baseline.observed
+    $oldAutoRotation = $originalSettings['accelerometer_rotation']
+    $oldUserRotation = $originalSettings['user_rotation']
+    $oldFixedRotation = $originalSettings['fixed_to_user_rotation']
     $logSince = Invoke-Adb -Arguments @('shell', 'date', "'+%m-%d %H:%M:%S.000'")
+    $rotationSettingsModified = $true
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0') | Out-Null
     Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation', 'enabled') | Out-Null
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '0') | Out-Null
@@ -319,16 +419,10 @@ try {
     # Restore under a separate bounded deadline, attempting every setting.
     # PASS is written only after all these calls succeed.
     $deadlineSeconds = $clock.Elapsed.TotalSeconds + 60
-    foreach ($restore in @(
-        { Restore-Setting -Name 'user_rotation' -Original $oldUserRotation },
-        { Restore-Setting -Name 'accelerometer_rotation' -Original $oldAutoRotation },
-        { if ($null -ne $oldFixedRotation) {
-            Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation', $oldFixedRotation) | Out-Null
-            $restoredFixed = Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation')
-            if ($restoredFixed -ne $oldFixedRotation) { throw 'Fixed rotation restoration did not recover its original value.' }
-        } }
-    )) {
-        try { & $restore } catch { $restoreErrors.Add($_.Exception.Message) }
+    try {
+        Restore-RotationSettings -Original $originalSettings -Modified $rotationSettingsModified
+    } catch {
+        $restoreErrors.Add($_.Exception.Message)
     }
 }
 
@@ -342,6 +436,13 @@ $result = [pscustomobject]@{
     captures = $captures.ToArray(); rotationVerified = $rotationVerified
     homeResumeVerified = $homeResumeVerified; settingsRestored = $restoreErrors.Count -eq 0
     gameplayStatePreserved = $gameplayStatePreserved; gameplayState = $gameplayState
+    originalSettings = [pscustomobject]@{
+        user_rotation = $oldUserRotation; accelerometer_rotation = $oldAutoRotation
+        fixed_to_user_rotation = $oldFixedRotation
+    }
+    restoredSettings = $restoredSettings
+    settingsModified = $rotationSettingsModified; baselineSamples = $baselineSamples.ToArray()
+    restorationAttempts = $restoreAttempts.ToArray()
     originalIssue = $testIssue; restorationIssues = $restoreErrors.ToArray()
     limits = 'External adb captures inspect a held native checkpoint and the shared-decoder viewport. Visual correctness and frame-exact GPU readback are not certified. Frame wall time includes presentation/vsync and excludes ACK waits. Memory counters are scoped geometry/CPU-shadow bytes, not total VRAM or RSS.'
 }
