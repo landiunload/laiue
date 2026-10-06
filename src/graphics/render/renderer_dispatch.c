@@ -36,6 +36,9 @@ extern RendererMesh* RendererCreateMesh_D3D12(Renderer* renderer, const ChunkQua
 extern RendererMesh* RendererCreateGenericMesh_D3D12(Renderer *renderer,
                                                        const RendererGenericVertex *vertices,
                                                        uint32_t vertexCount);
+extern RendererIndexBuffer *RendererCreateIndexBuffer_D3D12(Renderer *, const uint32_t *, uint32_t);
+extern void RendererDestroyIndexBuffer_D3D12(Renderer *, RendererIndexBuffer *);
+extern bool RendererDrawGeometry_D3D12(Renderer *, const RendererGeometryDraw *);
 extern RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer,
                                                      uint32_t width, uint32_t height,
                                                      uint32_t mipLevels, uint32_t format);
@@ -100,9 +103,13 @@ extern bool RendererUiSetFontAtlas_Vulkan(Renderer* renderer, const uint8_t* alp
 extern bool RendererUiLoadBackground_Vulkan(Renderer* renderer, const wchar_t* path, uint32_t* outWidth, uint32_t* outHeight);
 extern void RendererUiQueue_Vulkan(Renderer* renderer, const RendererUiQuad* quads, uint32_t count);
 extern RendererMesh* RendererCreateMesh_Vulkan(Renderer* renderer, const ChunkQuad* quads, uint32_t quadCount);
-extern RendererMesh* RendererCreateGenericMesh_Vulkan(Renderer *renderer,
-                                                       const RendererGenericVertex *vertices,
-                                                       uint32_t vertexCount);
+extern RendererMesh *RendererCreateGenericMesh_Vulkan(Renderer *renderer,
+                                                      const RendererGenericVertex *vertices,
+                                                      uint32_t vertexCount);
+extern RendererIndexBuffer *RendererCreateIndexBuffer_Vulkan(Renderer *, const uint32_t *,
+                                                             uint32_t);
+extern void RendererDestroyIndexBuffer_Vulkan(Renderer *, RendererIndexBuffer *);
+extern bool RendererDrawGeometry_Vulkan(Renderer *, const RendererGeometryDraw *);
 extern RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer,
                                                       uint32_t width, uint32_t height,
                                                       uint32_t mipLevels, uint32_t format);
@@ -575,6 +582,64 @@ RendererMesh *RendererCreateGenericMesh(Renderer *renderer,
     default: break;
     }
     return NULL;
+}
+
+RendererIndexBuffer *RendererCreateIndexBuffer(Renderer *renderer, const uint32_t *indices,
+                                               uint32_t indexCount)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererCreateIndexBuffer_D3D12(renderer, indices, indexCount);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererCreateIndexBuffer_Vulkan(renderer, indices, indexCount);
+#endif
+    default:
+        break;
+    }
+    return NULL;
+}
+
+void RendererDestroyIndexBuffer(Renderer *renderer, RendererIndexBuffer *buffer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        RendererDestroyIndexBuffer_D3D12(renderer, buffer);
+        return;
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        RendererDestroyIndexBuffer_Vulkan(renderer, buffer);
+        return;
+#endif
+    default:
+        break;
+    }
+}
+
+bool RendererDrawGeometry(Renderer *renderer, const RendererGeometryDraw *draw)
+{
+    if (draw == NULL || draw->structSize < sizeof(*draw))
+        return false;
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererDrawGeometry_D3D12(renderer, draw);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererDrawGeometry_Vulkan(renderer, draw);
+#endif
+    default:
+        break;
+    }
+    return false;
 }
 
 RendererTexture *RendererCreateTexture(Renderer *renderer, uint32_t width,

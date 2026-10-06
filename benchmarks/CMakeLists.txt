@@ -227,6 +227,31 @@ if(TARGET laiue_bootstrap)
 endif()
 
 if(TARGET laiue_render)
+    if(TARGET laiue_bootstrap AND LAIUE_RENDER_HAS_VULKAN_TARGET AND
+       LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+        add_executable(laiue_graphics_geometry_benchmark EXCLUDE_FROM_ALL
+            graphics_geometry_benchmark.c)
+        target_link_libraries(laiue_graphics_geometry_benchmark PRIVATE laiue_bootstrap)
+        target_compile_definitions(laiue_graphics_geometry_benchmark PRIVATE LAIUE_STATIC=1)
+        target_include_directories(laiue_graphics_geometry_benchmark PRIVATE
+            "${PROJECT_SOURCE_DIR}/tests")
+        add_dependencies(laiue_graphics_geometry_benchmark laiue_render)
+        laiue_configure_standalone_executable(
+            laiue_graphics_geometry_benchmark GraphicsGeometryBenchmarkEntryPoint)
+        if(TARGET laiue_mesh_world AND TARGET laiue_mesh_world_render)
+            add_executable(laiue_mesh_world_render_benchmark EXCLUDE_FROM_ALL
+                mesh_world_render_benchmark.c)
+            target_link_libraries(laiue_mesh_world_render_benchmark PRIVATE laiue_bootstrap)
+            target_compile_definitions(laiue_mesh_world_render_benchmark PRIVATE LAIUE_STATIC=1)
+            target_include_directories(laiue_mesh_world_render_benchmark PRIVATE
+                "${PROJECT_SOURCE_DIR}/tests" "${PROJECT_SOURCE_DIR}/src/graphics"
+                "${PROJECT_SOURCE_DIR}/src/simulation" "${PROJECT_SOURCE_DIR}/src/modding")
+            add_dependencies(laiue_mesh_world_render_benchmark
+                laiue_render laiue_mesh_world laiue_mesh_world_render)
+            laiue_configure_standalone_executable(
+                laiue_mesh_world_render_benchmark MeshWorldRenderBenchmarkEntryPoint)
+        endif()
+    endif()
     # CPU-времена отправки кадра D3D12 (постановка мешей и инстансов,
     # пул геометрии). GPU-времена не измеряются: время берётся вокруг
     # записи командного списка, а Present/фенс остаются за замером.

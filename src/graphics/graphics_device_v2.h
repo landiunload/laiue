@@ -142,6 +142,22 @@ typedef uint32_t (*LaiueGraphicsV2ReadbackFrameFn)(LaiueGraphicsDeviceV2 *,
                                                    LaiueGraphicsFrameReadbackV2 *readback);
 typedef uint32_t (*LaiueGraphicsV2RequestFrameReadbackFn)(LaiueGraphicsDeviceV2 *);
 
+#define LAIUE_GRAPHICS_CAP_NATIVE_INDICES (1u << 0)
+#define LAIUE_GRAPHICS_CAP_GENERIC_INSTANCES (1u << 1)
+typedef uint32_t (*LaiueGraphicsV2GetCapabilitiesFn)(const LaiueGraphicsDeviceV2 *);
+/* One generic mesh, material and index range, with many placements. A zero
+ * count is a no-op.
+ * Records are copied before return, never retained. Zero
+ * item.scale selects one as in submit;
+ * instance.scale keeps its literal
+ * signed value. Unsupported features, invalid resources and
+ * exhausted
+ * frame budgets return zero. Check both the optional tail and capability. */
+typedef uint32_t (*LaiueGraphicsV2SubmitInstancesFn)(LaiueGraphicsDeviceV2 *,
+                                                     const LaiueGraphicsDrawItemV2 *,
+                                                     const LaiueGraphicsInstanceV2 *,
+                                                     uint32_t instanceCount);
+
 struct LaiueGraphicsDeviceV2
 {
     uint32_t structSize;
@@ -169,6 +185,8 @@ struct LaiueGraphicsDeviceV2
     // Request before beginFrame. Required for providers that discard their presented buffer;
     // other capture providers may acknowledge the request without doing any work.
     LaiueGraphicsV2RequestFrameReadbackFn requestFrameReadback;
+    LaiueGraphicsV2GetCapabilitiesFn getCapabilities;
+    LaiueGraphicsV2SubmitInstancesFn submitInstances;
 };
 
 #define LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE                                                  \
@@ -181,6 +199,13 @@ struct LaiueGraphicsDeviceV2
 #define LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE                                             \
     ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, requestFrameReadback) +                            \
                 sizeof(LaiueGraphicsV2RequestFrameReadbackFn)))
+
+#define LAIUE_GRAPHICS_DEVICE_V2_CAPABILITIES_SIZE                                                 \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, getCapabilities) +                                 \
+                sizeof(LaiueGraphicsV2GetCapabilitiesFn)))
+#define LAIUE_GRAPHICS_DEVICE_V2_INSTANCES_SIZE                                                    \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, submitInstances) +                                 \
+                sizeof(LaiueGraphicsV2SubmitInstancesFn)))
 
 typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(void *nativeWindow, int32_t width, int32_t height,
                                                   uint32_t backend,

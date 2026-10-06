@@ -1,5 +1,7 @@
 option(LAIUE_REQUIRE_VULKAN_TEST_DRIVER
     "Fail Vulkan offscreen tests instead of skipping when no driver is available" OFF)
+option(LAIUE_REQUIRE_D3D12_TEST_DRIVER
+    "Fail D3D12 geometry tests instead of skipping when no driver is available" OFF)
 # Прогон Vulkan-тестов под Khronos validation layer. Тесты уже считают
 # "Validation Error" провалом, поэтому слой превращает их в регрессию
 # spec-корректности (например, VUID-VkImageViewCreateInfo-image-04441 для
@@ -9,6 +11,10 @@ option(LAIUE_VULKAN_VALIDATION
 if(LAIUE_REQUIRE_VULKAN_TEST_DRIVER AND
    NOT (TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET))
     message(FATAL_ERROR "LAIUE_REQUIRE_VULKAN_TEST_DRIVER requires the Vulkan render target")
+endif()
+if(LAIUE_REQUIRE_D3D12_TEST_DRIVER AND
+   NOT (TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12 AND WIN32))
+    message(FATAL_ERROR "LAIUE_REQUIRE_D3D12_TEST_DRIVER requires the Windows D3D12 render target")
 endif()
 
 if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND
@@ -42,6 +48,60 @@ elseif(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND APPLE)
                 "-DLIBRARY_FILE=$<TARGET_FILE:${runtime_target}>"
                 -P "${PROJECT_SOURCE_DIR}/tools/check_macho_exports.cmake")
     endforeach()
+endif()
+
+if(TARGET laiue_render AND LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    # Public V2 calls must produce the selected geometry in the completed GPU
+    # image on the first frame. Separate targets keep D3D12's HWND requirement
+    # independent from the portable Vulkan offscreen test.
+    foreach(_laiue_geometry_backend IN ITEMS vulkan d3d12)
+        if((_laiue_geometry_backend STREQUAL "vulkan" AND LAIUE_RENDER_HAS_VULKAN_TARGET) OR
+           (_laiue_geometry_backend STREQUAL "d3d12" AND LAIUE_RENDER_HAS_D3D12 AND WIN32))
+            set(_laiue_geometry_target "laiue_graphics_geometry_${_laiue_geometry_backend}_test")
+            set(_laiue_geometry_name "laiue.graphics.geometry_${_laiue_geometry_backend}")
+            if(_laiue_geometry_backend STREQUAL "d3d12")
+                set(_laiue_geometry_d3d12 1)
+                set(_laiue_geometry_require_driver "${LAIUE_REQUIRE_D3D12_TEST_DRIVER}")
+            else()
+                set(_laiue_geometry_d3d12 0)
+                set(_laiue_geometry_require_driver "${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}")
+            endif()
+            add_executable(${_laiue_geometry_target} graphics_geometry_test.c)
+            target_link_libraries(${_laiue_geometry_target} PRIVATE laiue_bootstrap)
+            if(_laiue_geometry_d3d12)
+                target_link_libraries(${_laiue_geometry_target} PRIVATE user32)
+            endif()
+            target_compile_definitions(${_laiue_geometry_target} PRIVATE
+                LAIUE_STATIC=1
+                "LAIUE_GRAPHICS_TEST_D3D12=${_laiue_geometry_d3d12}"
+                "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${_laiue_geometry_require_driver}>")
+            laiue_configure_standalone_executable(
+                ${_laiue_geometry_target} GraphicsGeometryTestEntryPoint)
+            add_dependencies(${_laiue_geometry_target} laiue_render)
+            add_test(NAME ${_laiue_geometry_name} COMMAND ${_laiue_geometry_target})
+            set_tests_properties(${_laiue_geometry_name} PROPERTIES
+                TIMEOUT 90 FAIL_REGULAR_EXPRESSION "Validation Error")
+            if(NOT _laiue_geometry_require_driver)
+                set_tests_properties(${_laiue_geometry_name} PROPERTIES SKIP_RETURN_CODE 125)
+            endif()
+            if(_laiue_geometry_backend STREQUAL "vulkan" AND LAIUE_VULKAN_VALIDATION)
+                set(_laiue_geometry_validation_env
+                    "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation")
+                if(DEFINED ENV{VULKAN_SDK})
+                    list(APPEND _laiue_geometry_validation_env
+                        "VK_LAYER_PATH=$ENV{VULKAN_SDK}/Bin")
+                endif()
+                set_tests_properties(${_laiue_geometry_name} PROPERTIES
+                    ENVIRONMENT "${_laiue_geometry_validation_env}")
+                unset(_laiue_geometry_validation_env)
+            endif()
+        endif()
+    endforeach()
+    unset(_laiue_geometry_backend)
+    unset(_laiue_geometry_target)
+    unset(_laiue_geometry_name)
+    unset(_laiue_geometry_d3d12)
+    unset(_laiue_geometry_require_driver)
 endif()
 
 add_executable(laiue_platform_crypto_test platform_crypto_test.c)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api.h"
+#include "graphics/graphics_api.h"
 #include "render/chunk_geometry.h"
 #include "render/shader_pack.h"
 #include "render/ui_quad.h"
@@ -52,6 +53,7 @@ typedef enum RendererContentStatus
 // (суб-аллокация, без 64-КиБ ресурса на меш) и рисуются vertex pulling'ом
 // без вершинных и индексных буферов.
 typedef struct RendererMesh RendererMesh;
+typedef struct RendererIndexBuffer RendererIndexBuffer;
 /* Backend-owned sampled image.  The graphics device exposes this only as an
  * opaque handle; the renderer keeps the native resource behind this type. */
 typedef struct RendererTexture RendererTexture;
@@ -99,13 +101,39 @@ LAIUE_RENDER_API RendererBackendKind RendererGetBackend(const Renderer* renderer
 //
 // Нулевой кватернион означает отсутствие поворота: код, заполнявший только
 // origin и scale, остаётся верным после обнуления структуры.
-typedef struct RendererMeshInstance
+typedef LaiueGraphicsInstanceV2 RendererMeshInstance;
+
+/* One generic draw with a reported result. Index buffers contain uint32 elements; without
+ * one,
+ * firstElement/elementCount address vertices. UINT32_MAX selects the
+ * remaining elements. NULL
+ * instances with instanceCount zero is one ordinary
+ * draw; a nonempty instance array is copied
+ * before return. Origins add to
+ * each other, while scale affects geometry only. Zero quaternion
+ * is identity.
+ * Resources must be uploaded before BeginFrame and belong to this renderer.
+ * The
+ * caller validates selected index values plus vertexOffset against the
+ * vertex count. The
+ * graphics-device facade does this; the backend retains
+ * no duplicate CPU index copy and checks
+ * resource/range/frame budgets only. */
+typedef struct RendererGeometryDraw
 {
+    uint32_t structSize;
+    const RendererMesh *mesh;
+    const RendererIndexBuffer *indexBuffer;
+    uint32_t firstElement;
+    uint32_t elementCount;
+    int32_t vertexOffset;
     float originRelative[3];
     float scale;
-    // Кватернион (x, y, z, w).
-    float rotation[4];
-} RendererMeshInstance;
+    const RendererTexture *texture;
+    const RendererSampler *sampler;
+    const RendererMeshInstance *instances;
+    uint32_t instanceCount;
+} RendererGeometryDraw;
 
 // === Кадр и широкий угол ===
 //
@@ -238,6 +266,13 @@ LAIUE_RENDER_API RendererMesh* RendererCreateMesh(Renderer* renderer,
 LAIUE_RENDER_API RendererMesh *RendererCreateGenericMesh(
     Renderer *renderer, const RendererGenericVertex *vertices,
     uint32_t vertexCount);
+
+LAIUE_RENDER_API RendererIndexBuffer *RendererCreateIndexBuffer(Renderer *renderer,
+                                                                const uint32_t *indices,
+                                                                uint32_t indexCount);
+LAIUE_RENDER_API void RendererDestroyIndexBuffer(Renderer *renderer, RendererIndexBuffer *buffer);
+/* False includes invalid/unready resources and exhausted frame budgets. */
+LAIUE_RENDER_API bool RendererDrawGeometry(Renderer *renderer, const RendererGeometryDraw *draw);
 
 /* Creates a backend-resident 2D RGBA8 sampled image.  Format 0 is
  * RGBA8_UNORM and format 1 is RGBA8_SRGB. */

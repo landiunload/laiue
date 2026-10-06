@@ -7,6 +7,9 @@
 затем сам указатель callback.
 Старый поставщик без хвоста остаётся допустимым.
 
+Индексные буферы и optional GPU instancing описаны в
+[контракте геометрии](graphics_geometry.md).
+
 ## Счётчики и GPU-время
 
 `getDiagnostics` принимает caller-owned `LaiueGraphicsDiagnosticsV2`

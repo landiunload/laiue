@@ -47,35 +47,73 @@ static void ReleaseHandle(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle *ha
     *handle = 0u;
 }
 
-static bool UploadVertexBuffer(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsVertexV2 *vertices,
-                               uint32_t vertexCount, LaiueGraphicsHandle *outBuffer)
+static bool UploadBufferContents(LaiueGraphicsDeviceV2 *device, const void *bytes,
+                                 uint64_t sizeBytes, uint32_t usage, LaiueGraphicsHandle *outBuffer)
 {
     if (outBuffer != NULL)
         *outBuffer = 0u;
-    if (device == NULL || vertices == NULL || vertexCount == 0u || outBuffer == NULL ||
+    if (device == NULL || bytes == NULL || sizeBytes == 0u || outBuffer == NULL ||
         !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, createBuffer),
                             sizeof(device->createBuffer)) ||
         !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, uploadBuffer),
                             sizeof(device->uploadBuffer)) ||
-        device->createBuffer == NULL || device->uploadBuffer == NULL)
+        !DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, destroyHandle),
+                            sizeof(device->destroyHandle)) ||
+        device->createBuffer == NULL || device->uploadBuffer == NULL ||
+        device->destroyHandle == NULL)
         return false;
     const LaiueGraphicsBufferDescV1 description = {
         .structSize = sizeof(description),
-        .usageFlags = LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
-        .sizeBytes = (uint64_t)vertexCount * sizeof(*vertices),
+        .usageFlags = usage,
+        .sizeBytes = sizeBytes,
     };
     if (device->createBuffer(device, &description, outBuffer) == 0u)
         return false;
     const LaiueGraphicsBufferUploadV1 upload = {
         .structSize = sizeof(upload),
         .buffer = *outBuffer,
-        .data = vertices,
+        .data = bytes,
         .sizeBytes = description.sizeBytes,
     };
     if (device->uploadBuffer(device, &upload) != 0u)
         return true;
     ReleaseHandle(device, outBuffer);
     return false;
+}
+
+static bool UploadVertexBuffer(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsVertexV2 *vertices,
+                               uint32_t vertexCount, LaiueGraphicsHandle *outBuffer)
+{
+    return UploadBufferContents(device, vertices, (uint64_t)vertexCount * sizeof(*vertices),
+                                LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, outBuffer);
+}
+
+static bool DeviceHasNativeIndices(const LaiueGraphicsDeviceV2 *device)
+{
+    return DeviceFieldPresent(device, offsetof(LaiueGraphicsDeviceV2, getCapabilities),
+                              sizeof(device->getCapabilities)) &&
+           device->abiVersion == LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION &&
+           device->getCapabilities != NULL &&
+           (device->getCapabilities(device) & LAIUE_GRAPHICS_CAP_NATIVE_INDICES) != 0u;
+}
+
+static bool UploadQuadTopology(LaiueGraphicsDeviceV2 *device, uint32_t quadCount,
+                               LaiueGraphicsHandle *outBuffer)
+{
+    if (quadCount == 0u || quadCount > UINT32_MAX / (6u * (uint32_t)sizeof(uint32_t)))
+        return false;
+    const uint32_t sizeBytes = quadCount * 6u * (uint32_t)sizeof(uint32_t);
+    uint32_t *indices = (uint32_t *)PlatformAllocate(sizeBytes, false);
+    if (indices == NULL)
+        return false;
+    static const uint32_t corners[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    for (uint32_t q = 0u; q < quadCount; ++q)
+        for (uint32_t i = 0u; i < 6u; ++i)
+            indices[q * 6u + i] = q * 4u + corners[i];
+    const bool uploaded = UploadBufferContents(device, indices, sizeBytes,
+                                               LAIUE_GRAPHICS_BUFFER_USAGE_INDEX, outBuffer);
+    PlatformFree(indices);
+    return uploaded;
 }
 
 static bool CreateVertexBuffer(LaiueGraphicsDeviceV2 *device, uint64_t sizeBytes,
@@ -310,7 +348,7 @@ bool WalkVisualsCreateChunkSet(const LaiueMesherServiceV1 *mesher, WalkVisualChu
 
 void WalkVisualsInvalidateChunkSet(LaiueGraphicsDeviceV2 *device, WalkVisualChunkSet *set)
 {
-    if (set == NULL)
+    if (set == NULL || (set->ownerDevice != NULL && set->ownerDevice != device))
         return;
     for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
         DestroyChunk(device, &set->chunks[i]);
@@ -320,9 +358,10 @@ void WalkVisualsInvalidateChunkSet(LaiueGraphicsDeviceV2 *device, WalkVisualChun
 void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
                                 WalkVisualChunkSet *set)
 {
-    if (set == NULL)
+    if (set == NULL || (set->ownerDevice != NULL && set->ownerDevice != device))
         return;
     WalkVisualsInvalidateChunkSet(device, set);
+    ReleaseHandle(device, &set->indexBuffer);
     if (set->scratch != NULL && mesher != NULL && mesher->scratchDestroy != NULL)
         mesher->scratchDestroy(set->scratch);
     memset(set, 0, sizeof(*set));
@@ -330,7 +369,7 @@ void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesher
 
 static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
                              ChunkMesherScratch *scratch, WalkVisualGetBlockFn getBlock,
-                             void *blockContext, const int64_t coordinate[3],
+                             void *blockContext, const int64_t coordinate[3], bool indexed,
                              WalkVisualChunk *outChunk)
 {
     if (device == NULL || mesher == NULL || scratch == NULL || getBlock == NULL ||
@@ -345,7 +384,8 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherSer
     ChunkQuad *quads = NULL;
     uint32_t quadCount = 0u;
     if (!mesher->buildChunkMesh(&source, scratch, coordinate[0], coordinate[1], coordinate[2],
-                                &quads, &quadCount))
+                                &quads, &quadCount) ||
+        (quadCount != 0u && quads == NULL))
         return false;
     uint32_t counts[WALK_VISUAL_TEXTURE_COUNT] = {0u, 0u, 0u};
     for (uint32_t i = 0u; i < quadCount; ++i)
@@ -358,6 +398,7 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherSer
     for (uint32_t axis = 0u; axis < 3u; ++axis)
         built.coordinate[axis] = coordinate[axis];
     built.ready = true;
+    built.indexed = indexed;
     static const uint8_t faceCorners[6][4] = {
         {5u, 7u, 3u, 1u}, {6u, 4u, 0u, 2u}, {7u, 6u, 2u, 3u},
         {4u, 5u, 1u, 0u}, {6u, 7u, 5u, 4u}, {3u, 2u, 0u, 1u},
@@ -369,10 +410,12 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherSer
     {
         if (counts[material] == 0u)
             continue;
+        const uint32_t verticesPerQuad = indexed ? 4u : 6u;
         if (counts[material] > UINT32_MAX / 6u ||
-            (uint64_t)counts[material] * 6u * sizeof(LaiueGraphicsVertexV2) > UINT32_MAX)
+            (uint64_t)counts[material] * verticesPerQuad * sizeof(LaiueGraphicsVertexV2) >
+                UINT32_MAX)
             goto failed;
-        const uint32_t vertexCount = counts[material] * 6u;
+        const uint32_t vertexCount = counts[material] * verticesPerQuad;
         LaiueGraphicsVertexV2 *vertices = (LaiueGraphicsVertexV2 *)PlatformAllocate(
             (uint32_t)((uint64_t)vertexCount * sizeof(*vertices)), false);
         if (vertices == NULL)
@@ -431,8 +474,8 @@ static bool BuildChunkVisual(LaiueGraphicsDeviceV2 *device, const LaiueMesherSer
                     .colorRGBA = UINT32_C(0xFF000000) | (shade << 16u) | (shade << 8u) | shade,
                 };
             }
-            for (uint32_t vertex = 0u; vertex < 6u; ++vertex)
-                vertices[written[material]++] = corners[triangleCorners[vertex]];
+            for (uint32_t vertex = 0u; vertex < verticesPerQuad; ++vertex)
+                vertices[written[material]++] = corners[indexed ? vertex : triangleCorners[vertex]];
         }
         const bool uploaded =
             written[material] == vertexCount &&
@@ -456,8 +499,10 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherS
                                WalkVisualChunkSet *set, WalkVisualGetBlockFn getBlock,
                                void *blockContext, const int64_t centerBlock[3])
 {
-    if (device == NULL || mesher == NULL || set == NULL || set->scratch == NULL ||
-        getBlock == NULL || centerBlock == NULL)
+    if (device == NULL || mesher == NULL || mesher->structSize < sizeof(*mesher) ||
+        mesher->buildChunkMesh == NULL || set == NULL || set->scratch == NULL ||
+        (set->ownerDevice != NULL && set->ownerDevice != device) || getBlock == NULL ||
+        centerBlock == NULL)
         return false;
     int64_t desired[WALK_VISUAL_CHUNK_COUNT][3];
     const int64_t centerX = FloorDiv64(centerBlock[0]);
@@ -479,12 +524,20 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherS
                 desired[desiredCount][2] = cz;
                 ++desiredCount;
             }
+    const bool indexed = DeviceHasNativeIndices(device);
     bool used[WALK_VISUAL_CHUNK_COUNT] = {false};
+    uint32_t previousSlots[WALK_VISUAL_CHUNK_COUNT];
+    WalkVisualChunk prepared[WALK_VISUAL_CHUNK_COUNT] = {0};
+    LaiueGraphicsHandle preparedIndexBuffer = 0u;
+    uint32_t requiredQuads = 0u;
+    for (uint32_t d = 0u; d < WALK_VISUAL_CHUNK_COUNT; ++d)
+        previousSlots[d] = WALK_VISUAL_CHUNK_COUNT;
     for (uint32_t d = 0u; d < desiredCount; ++d)
     {
         uint32_t slot = WALK_VISUAL_CHUNK_COUNT;
         for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
-            if (!used[i] && set->chunks[i].ready && set->chunks[i].coordinate[0] == desired[d][0] &&
+            if (!used[i] && set->chunks[i].ready && set->chunks[i].indexed == indexed &&
+                set->chunks[i].coordinate[0] == desired[d][0] &&
                 set->chunks[i].coordinate[1] == desired[d][1] &&
                 set->chunks[i].coordinate[2] == desired[d][2])
             {
@@ -494,33 +547,57 @@ bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherS
         if (slot != WALK_VISUAL_CHUNK_COUNT)
         {
             used[slot] = true;
-            continue;
+            previousSlots[d] = slot;
+            prepared[d] = set->chunks[slot];
         }
-        for (slot = 0u; slot < WALK_VISUAL_CHUNK_COUNT && used[slot]; ++slot)
+        else if (!BuildChunkVisual(device, mesher, set->scratch, getBlock, blockContext, desired[d],
+                                   indexed, &prepared[d]))
+            goto failed;
+        if (indexed)
         {
+            for (uint32_t material = 0u; material < WALK_VISUAL_TEXTURE_COUNT; ++material)
+            {
+                const uint32_t quads = prepared[d].vertexCounts[material] / 4u;
+                if (quads > requiredQuads)
+                    requiredQuads = quads;
+            }
         }
-        if (slot == WALK_VISUAL_CHUNK_COUNT)
-            return false;
-        WalkVisualChunk replacement = {0};
-        if (!BuildChunkVisual(device, mesher, set->scratch, getBlock, blockContext, desired[d],
-                              &replacement))
-            return false;
-        DestroyChunk(device, &set->chunks[slot]);
-        set->chunks[slot] = replacement;
-        used[slot] = true;
     }
+    if (indexed && requiredQuads != 0u &&
+        (set->indexBuffer == 0u || requiredQuads > set->indexQuadCapacity) &&
+        !UploadQuadTopology(device, requiredQuads, &preparedIndexBuffer))
+        goto failed;
+
+    /* Publish only after every new VB and any larger shared IB has uploaded.
+     * Existing chunks
+     * and their topology remain usable on all failure paths. */
     for (uint32_t i = 0u; i < WALK_VISUAL_CHUNK_COUNT; ++i)
         if (!used[i])
             DestroyChunk(device, &set->chunks[i]);
+    memcpy(set->chunks, prepared, sizeof(set->chunks));
+    if (preparedIndexBuffer != 0u)
+    {
+        ReleaseHandle(device, &set->indexBuffer);
+        set->indexBuffer = preparedIndexBuffer;
+        set->indexQuadCapacity = requiredQuads;
+    }
+    set->ownerDevice = device;
     memcpy(set->center, (int64_t[3]){centerX, centerY, centerZ}, sizeof(set->center));
     set->centerValid = true;
     return true;
+
+failed:
+    ReleaseHandle(device, &preparedIndexBuffer);
+    for (uint32_t d = 0u; d < WALK_VISUAL_CHUNK_COUNT; ++d)
+        if (previousSlots[d] == WALK_VISUAL_CHUNK_COUNT)
+            DestroyChunk(device, &prepared[d]);
+    return false;
 }
 
 void WalkVisualsInvalidateBlock(WalkVisualChunkSet *set, LaiueGraphicsDeviceV2 *device,
                                 int64_t blockX, int64_t blockY, int64_t blockZ)
 {
-    if (set == NULL)
+    if (set == NULL || (set->ownerDevice != NULL && set->ownerDevice != device))
         return;
     const int64_t block[3] = {blockX, blockY, blockZ};
     int64_t base[3];
@@ -589,7 +666,9 @@ uint32_t WalkVisualsBuildChunkDraws(const WalkVisualChunkSet *set,
             memset(draw, 0, sizeof(*draw));
             draw->structSize = sizeof(*draw);
             draw->vertexBuffer = chunk->buffers[material];
-            draw->indexCount = chunk->vertexCounts[material];
+            draw->indexBuffer = chunk->indexed ? set->indexBuffer : 0u;
+            draw->indexCount = chunk->indexed ? chunk->vertexCounts[material] / 4u * 6u
+                                              : chunk->vertexCounts[material];
             draw->originRelative[0] = (float)relativeOrigin[0];
             draw->originRelative[1] = (float)relativeOrigin[1];
             draw->originRelative[2] = (float)relativeOrigin[2];

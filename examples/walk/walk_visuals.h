@@ -27,11 +27,18 @@ typedef struct WalkVisualChunk
     LaiueGraphicsHandle buffers[WALK_VISUAL_TEXTURE_COUNT];
     uint32_t vertexCounts[WALK_VISUAL_TEXTURE_COUNT];
     bool ready;
+    bool indexed;
 } WalkVisualChunk;
 
 typedef struct WalkVisualChunkSet
 {
     ChunkMesherScratch *scratch;
+    /* One topology resource serves every material/chunk VB. It and scratch
+     * survive
+     * coordinate invalidation; final teardown uses the owning device. */
+    LaiueGraphicsDeviceV2 *ownerDevice;
+    LaiueGraphicsHandle indexBuffer;
+    uint32_t indexQuadCapacity;
     WalkVisualChunk chunks[WALK_VISUAL_CHUNK_COUNT];
     int64_t center[3];
     bool centerValid;
@@ -58,10 +65,13 @@ void WalkVisualsDestroyTerrain(LaiueGraphicsDeviceV2 *device,
                                LaiueGraphicsHandle *sampler);
 
 bool WalkVisualsCreateChunkSet(const LaiueMesherServiceV1 *mesher, WalkVisualChunkSet *outSet);
-/* A provider-frame rebase invalidates coordinates, but retains mesher scratch. */
+/* A provider-frame rebase retains mesher scratch and the shared topology IB. */
 void WalkVisualsInvalidateChunkSet(LaiueGraphicsDeviceV2 *device, WalkVisualChunkSet *set);
 void WalkVisualsDestroyChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
                                 WalkVisualChunkSet *set);
+/* Call before beginFrame. Failed resource preparation preserves all previous
+ * geometry, the
+ * topology resource and the center. A set belongs to one device. */
 bool WalkVisualsUpdateChunkSet(LaiueGraphicsDeviceV2 *device, const LaiueMesherServiceV1 *mesher,
                                WalkVisualChunkSet *set, WalkVisualGetBlockFn getBlock,
                                void *blockContext, const int64_t centerBlock[3]);

@@ -554,12 +554,45 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
             vulkan, genericVertices, 3u);
         Expect(d3d12Generic != NULL && vulkanGeneric != NULL,
                "both backends must create generic meshes for resource bindings");
+        const uint32_t genericIndices[3] = {0u, 1u, 2u};
+        RendererIndexBuffer *d3d12Indices = RendererCreateIndexBuffer(d3d12, genericIndices, 3u);
+        RendererIndexBuffer *vulkanIndices = RendererCreateIndexBuffer(vulkan, genericIndices, 3u);
+        Expect(d3d12Indices != NULL && vulkanIndices != NULL,
+               "both backends must create native index buffers");
 
         // The first scene frame uses the user texture/sampler on both
         // providers.  This exercises the descriptor-table path, not just
         // resource creation and ownership checks.
         DrawBoundGenericFrame(d3d12, &setup, d3d12Generic, d3d12Texture, d3d12Sampler);
         DrawBoundGenericFrame(vulkan, &setup, vulkanGeneric, vulkanTexture, vulkanSampler);
+
+        Renderer *owners[2] = {d3d12, vulkan};
+        RendererMesh *genericMeshes[2] = {d3d12Generic, vulkanGeneric};
+        RendererIndexBuffer *indexBuffers[2] = {d3d12Indices, vulkanIndices};
+        for (uint32_t owner = 0u; owner < 2u; ++owner)
+        {
+            RendererGeometryDraw draw = {.structSize = sizeof(draw),
+                                         .mesh = genericMeshes[1u - owner],
+                                         .elementCount = 3u,
+                                         .scale = 1.0f};
+            Expect(RendererBeginFrame(owners[owner], &setup),
+                   "the foreign geometry rejection frame could not begin");
+            RendererBeginScenePass(owners[owner], 0u);
+            Expect(!RendererDrawGeometry(owners[owner], &draw),
+                   "generic geometry from another backend must be rejected");
+            draw.mesh = genericMeshes[owner];
+            draw.indexBuffer = indexBuffers[1u - owner];
+            Expect(!RendererDrawGeometry(owners[owner], &draw),
+                   "indices from another backend must be rejected");
+            draw.indexBuffer = indexBuffers[owner];
+            Expect(RendererDrawGeometry(owners[owner], &draw),
+                   "own geometry must remain usable after foreign handle rejection");
+            Expect(RendererEndFrame(owners[owner]),
+                   "the foreign geometry rejection frame could not end");
+            RendererStats rejected = {0};
+            RendererGetStats(owners[owner], &rejected);
+            Expect(rejected.drawCalls == 1u, "only the own geometry may record a GPU draw");
+        }
 
         for (uint32_t frame = 0u; frame < 4u; ++frame)
         {
@@ -573,6 +606,8 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
         RendererDestroyMesh(vulkan, vulkanMesh);
         RendererDestroyMesh(d3d12, d3d12Generic);
         RendererDestroyMesh(vulkan, vulkanGeneric);
+        RendererDestroyIndexBuffer(d3d12, d3d12Indices);
+        RendererDestroyIndexBuffer(vulkan, vulkanIndices);
         RendererDestroyTexture(d3d12, d3d12Texture);
         RendererDestroyTexture(vulkan, vulkanTexture);
         RendererDestroySampler(d3d12, d3d12Sampler);

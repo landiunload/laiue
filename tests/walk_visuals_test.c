@@ -3,6 +3,7 @@
 #include "humanoid_ragdoll.h"
 #include "physics/numeric_provider.h"
 #include "walk_physics_binding.h"
+#include "platform/system.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -208,6 +209,366 @@ static void CheckNeutralScale(void)
            "rendered soles and crown match the one-block-per-meter collision geometry");
 }
 
+#define CHUNK_TEST_RESOURCES 128u
+
+typedef struct ChunkTestBuffer
+{
+    uint32_t usage;
+    uint32_t sizeBytes;
+    bool live;
+    union
+    {
+        LaiueGraphicsVertexV2 vertices[48];
+        uint32_t indices[288];
+    } data;
+} ChunkTestBuffer;
+
+typedef struct ChunkTestDevice
+{
+    LaiueGraphicsDeviceV2 api;
+    ChunkTestBuffer buffers[CHUNK_TEST_RESOURCES];
+    uint32_t namespaceId;
+    uint32_t created;
+    uint32_t destroyed;
+    uint32_t uploaded;
+    uint32_t indexUploads;
+    uint32_t capabilityQueries;
+    uint32_t failCreateUsage;
+    uint32_t failUploadUsage;
+    bool nativeIndices;
+} ChunkTestDevice;
+
+static ChunkTestDevice chunkDevice, foreignChunkDevice;
+static WalkVisualChunkSet chunkSet, chunkSnapshot;
+static LaiueGraphicsDrawItemV2 chunkDraws[WALK_VISUAL_CHUNK_DRAW_COUNT];
+static LaiueGraphicsVertexV2 legacyChunkVertices[WALK_VISUAL_TEXTURE_COUNT][36];
+static uint32_t legacyChunkCounts[WALK_VISUAL_TEXTURE_COUNT];
+static uint32_t chunkExtraQuads, chunkBuildCalls;
+static bool failChunkMesh;
+static const LaiueGraphicsHandle chunkTextures[3] = {101u, 102u, 103u};
+
+static ChunkTestBuffer *ChunkBuffer(ChunkTestDevice *device, LaiueGraphicsHandle handle)
+{
+    Expect((uint32_t)(handle >> 32u) == device->namespaceId && (uint32_t)handle != 0u &&
+               (uint32_t)handle <= device->created,
+           "chunk graphics callbacks receive their own namespace and allocated slot");
+    ChunkTestBuffer *buffer = &device->buffers[(uint32_t)handle - 1u];
+    Expect(buffer->live, "chunk handles are live and never destroyed twice");
+    return buffer;
+}
+
+static uint32_t CreateChunkBuffer(LaiueGraphicsDeviceV2 *api,
+                                  const LaiueGraphicsBufferDescV1 *description,
+                                  LaiueGraphicsHandle *outBuffer)
+{
+    ChunkTestDevice *device = (ChunkTestDevice *)api->context;
+    Expect(description != NULL && description->structSize == sizeof(*description) &&
+               outBuffer != NULL && description->sizeBytes != 0u &&
+               description->sizeBytes <= sizeof(device->buffers[0].data) &&
+               (description->usageFlags == LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX ||
+                description->usageFlags == LAIUE_GRAPHICS_BUFFER_USAGE_INDEX),
+           "chunk buffers declare exact vertex or index ownership and bounded size");
+    if (description->usageFlags == device->failCreateUsage)
+        return 0u;
+    Expect(device->created < CHUNK_TEST_RESOURCES, "chunk mock resource capacity is sufficient");
+    ChunkTestBuffer *buffer = &device->buffers[device->created++];
+    buffer->usage = description->usageFlags;
+    buffer->sizeBytes = (uint32_t)description->sizeBytes;
+    buffer->live = true;
+    *outBuffer = ((uint64_t)device->namespaceId << 32u) | device->created;
+    return 1u;
+}
+
+static uint32_t UploadChunkBuffer(LaiueGraphicsDeviceV2 *api,
+                                  const LaiueGraphicsBufferUploadV1 *upload)
+{
+    ChunkTestDevice *device = (ChunkTestDevice *)api->context;
+    Expect(upload != NULL && upload->structSize == sizeof(*upload) && upload->data != NULL &&
+               upload->offsetBytes == 0u,
+           "chunk resource preparation uploads complete buffers before recording");
+    ChunkTestBuffer *buffer = ChunkBuffer(device, upload->buffer);
+    Expect(upload->sizeBytes == buffer->sizeBytes, "chunk uploads match their resource allocation");
+    ++device->uploaded;
+    if (buffer->usage == device->failUploadUsage)
+        return 0u;
+    memcpy(&buffer->data, upload->data, buffer->sizeBytes);
+    if (buffer->usage == LAIUE_GRAPHICS_BUFFER_USAGE_INDEX)
+        ++device->indexUploads;
+    return 1u;
+}
+
+static void DestroyChunkBuffer(LaiueGraphicsDeviceV2 *api, LaiueGraphicsHandle handle)
+{
+    ChunkTestDevice *device = (ChunkTestDevice *)api->context;
+    ChunkBuffer(device, handle)->live = false;
+    ++device->destroyed;
+}
+
+static uint32_t ChunkCapabilities(const LaiueGraphicsDeviceV2 *api)
+{
+    ChunkTestDevice *device = (ChunkTestDevice *)api->context;
+    Expect(api->structSize >= LAIUE_GRAPHICS_DEVICE_V2_CAPABILITIES_SIZE,
+           "a truncated capability tail is never called");
+    ++device->capabilityQueries;
+    return device->nativeIndices ? LAIUE_GRAPHICS_CAP_NATIVE_INDICES : 0u;
+}
+
+static void InitializeChunkDevice(ChunkTestDevice *device, uint32_t namespaceId, bool native)
+{
+    memset(device, 0, sizeof(*device));
+    device->namespaceId = namespaceId;
+    device->nativeIndices = native;
+    device->api = (LaiueGraphicsDeviceV2){
+        .structSize = sizeof(device->api),
+        .abiVersion = LAIUE_GRAPHICS_DEVICE_V2_ABI_VERSION,
+        .context = device,
+        .createBuffer = CreateChunkBuffer,
+        .uploadBuffer = UploadChunkBuffer,
+        .destroyHandle = DestroyChunkBuffer,
+        .getCapabilities = ChunkCapabilities,
+    };
+}
+
+static uint64_t ChunkLiveBytes(const ChunkTestDevice *device)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t i = 0u; i < device->created; ++i)
+        if (device->buffers[i].live)
+            bytes += device->buffers[i].sizeBytes;
+    return bytes;
+}
+
+static ChunkMesherScratch *CreateChunkScratch(void)
+{
+    return (ChunkMesherScratch *)&mesherScratchToken;
+}
+
+static uint8_t ChunkBlock(void *context, int64_t x, int64_t y, int64_t z)
+{
+    (void)context;
+    (void)x;
+    (void)y;
+    (void)z;
+    return 2u;
+}
+
+static bool BuildTestChunk(const ChunkMesherWorldSource *source, ChunkMesherScratch *scratch,
+                           int64_t x, int64_t y, int64_t z, ChunkQuad **outQuads,
+                           uint32_t *outQuadCount)
+{
+    Expect(source != NULL && source->context != NULL && source->fillRegion != NULL &&
+               scratch == (ChunkMesherScratch *)&mesherScratchToken,
+           "chunk preparation uses the supplied world adapter and retained mesher scratch");
+    ++chunkBuildCalls;
+    *outQuads = NULL;
+    *outQuadCount = 0u;
+    if (y != 0 || z != 0)
+        return true;
+    if (failChunkMesh)
+        return false;
+    BlockType block = 0u;
+    Expect(source->fillRegion(source->context, x * 64, 0, 0, 1, 1, 1, &block) ==
+                   WORLD_REGION_MIXED &&
+               block == 2u,
+           "the chunk adapter forwards block coordinates to its world provider");
+    const uint32_t count = 9u + chunkExtraQuads;
+    ChunkQuad *quads = (ChunkQuad *)PlatformAllocate(count * (uint32_t)sizeof(*quads), false);
+    Expect(quads != NULL, "small deterministic mesher fixtures allocate");
+    for (uint32_t q = 0u; q < 6u + chunkExtraQuads; ++q)
+        quads[q] = PackChunkQuad(2u + q, 3u, 4u, q % 6u, 1u, 2u, 3u, 4u);
+    quads[6u + chunkExtraQuads] = PackChunkQuad(2u, 3u, 4u, 0u, 2u, 2u, 3u, 4u);
+    quads[7u + chunkExtraQuads] = PackChunkQuad(2u, 3u, 4u, 5u, 2u, 2u, 3u, 4u);
+    quads[8u + chunkExtraQuads] = PackChunkQuad(2u, 3u, 4u, 3u, 3u, 2u, 3u, 4u);
+    *outQuads = quads;
+    *outQuadCount = count;
+    return true;
+}
+
+static const LaiueMesherServiceV1 chunkMesher = {
+    .structSize = sizeof(chunkMesher),
+    .abiVersion = LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+    .scratchCreate = CreateChunkScratch,
+    .scratchDestroy = DestroyMesherScratch,
+    .buildChunkMesh = BuildTestChunk,
+};
+
+static void CheckChunkFallback(uint32_t prefixBytes, bool callback, bool native, bool saveReference)
+{
+    const int64_t center[3] = {0, 0, 0};
+    InitializeChunkDevice(&chunkDevice, 43u, native);
+    chunkDevice.api.structSize = prefixBytes;
+    if (!callback)
+        chunkDevice.api.getCapabilities = NULL;
+    /* The compatibility fixture physically ends at its advertised prefix. */
+    LaiueGraphicsDeviceV2 *api = (LaiueGraphicsDeviceV2 *)PlatformAllocate(prefixBytes, false);
+    Expect(api != NULL, "an actual compatibility table prefix allocates");
+    memcpy(api, &chunkDevice.api, prefixBytes);
+    Expect(WalkVisualsCreateChunkSet(&chunkMesher, &chunkSet) &&
+               WalkVisualsUpdateChunkSet(api, &chunkMesher, &chunkSet, ChunkBlock, NULL, center),
+           "old or unavailable native-index capabilities retain complete chunk geometry");
+    Expect(chunkSet.indexBuffer == 0u && chunkDevice.indexUploads == 0u &&
+               ChunkLiveBytes(&chunkDevice) == 3u * 9u * 6u * sizeof(LaiueGraphicsVertexV2),
+           "fallback owns exactly six vertices per quad and no unused topology resource");
+    Expect(chunkDevice.capabilityQueries ==
+               (callback && prefixBytes >= LAIUE_GRAPHICS_DEVICE_V2_CAPABILITIES_SIZE ? 1u : 0u),
+           "capability probing respects both physical prefix length and missing callbacks");
+    const uint32_t count =
+        WalkVisualsBuildChunkDraws(&chunkSet, center, chunkTextures, 104u, chunkDraws);
+    Expect(count == 9u, "three populated chunks produce one draw per material");
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        const uint32_t material = (uint32_t)(chunkDraws[i].texture - chunkTextures[0]);
+        ChunkTestBuffer *buffer = ChunkBuffer(&chunkDevice, chunkDraws[i].vertexBuffer);
+        Expect(chunkDraws[i].indexBuffer == 0u && chunkDraws[i].sampler == 104u &&
+                   chunkDraws[i].indexCount * sizeof(LaiueGraphicsVertexV2) == buffer->sizeBytes,
+               "fallback draws retain exact triangle counts and material bindings");
+        if (saveReference)
+        {
+            legacyChunkCounts[material] = chunkDraws[i].indexCount;
+            memcpy(legacyChunkVertices[material], buffer->data.vertices, buffer->sizeBytes);
+        }
+    }
+    WalkVisualsDestroyChunkSet(api, &chunkMesher, &chunkSet);
+    Expect(ChunkLiveBytes(&chunkDevice) == 0u && chunkDevice.created == chunkDevice.destroyed,
+           "fallback teardown releases every prepared VB once");
+    PlatformFree(api);
+}
+
+static void CheckNativeChunkDraws(const int64_t center[3], bool compareLegacy)
+{
+    const uint32_t count =
+        WalkVisualsBuildChunkDraws(&chunkSet, center, chunkTextures, 104u, chunkDraws);
+    Expect(count == 9u, "native indexing preserves all material and chunk draws");
+    ChunkTestBuffer *indices = ChunkBuffer(&chunkDevice, chunkSet.indexBuffer);
+    Expect(indices->usage == LAIUE_GRAPHICS_BUFFER_USAGE_INDEX &&
+               indices->sizeBytes == chunkSet.indexQuadCapacity * 6u * sizeof(uint32_t),
+           "one shared topology resource is sized to the largest material chunk");
+    static const uint32_t corners[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    for (uint32_t i = 0u; i < chunkSet.indexQuadCapacity * 6u; ++i)
+        Expect(indices->data.indices[i] == i / 6u * 4u + corners[i % 6u],
+               "shared uint32 index bytes preserve both triangles and outward quad winding");
+    for (uint32_t d = 0u; d < count; ++d)
+    {
+        const LaiueGraphicsDrawItemV2 *draw = &chunkDraws[d];
+        ChunkTestBuffer *vertices = ChunkBuffer(&chunkDevice, draw->vertexBuffer);
+        const uint32_t material = (uint32_t)(draw->texture - chunkTextures[0]);
+        Expect(draw->indexBuffer == chunkSet.indexBuffer && draw->firstIndex == 0u &&
+                   draw->vertexOffset == 0 && draw->sampler == 104u &&
+                   vertices->sizeBytes ==
+                       draw->indexCount / 6u * 4u * sizeof(LaiueGraphicsVertexV2),
+               "all independent four-corner VBs reuse the same topology and material bindings");
+        if (compareLegacy)
+        {
+            Expect(draw->indexCount == legacyChunkCounts[material],
+                   "native and fallback paths report the same number of rendered triangles");
+            for (uint32_t i = 0u; i < draw->indexCount; ++i)
+                Expect(memcmp(&vertices->data.vertices[indices->data.indices[i]],
+                              &legacyChunkVertices[material][i],
+                              sizeof(LaiueGraphicsVertexV2)) == 0,
+                       "native corners reconstruct fallback positions, repeated UVs, colors and "
+                       "winding");
+        }
+    }
+}
+
+static void CheckChunkVisuals(void)
+{
+    chunkExtraQuads = 0u;
+    CheckChunkFallback(sizeof(LaiueGraphicsDeviceV2), true, false, true);
+    CheckChunkFallback(sizeof(LaiueGraphicsDeviceV2), false, true, false);
+    CheckChunkFallback((uint32_t)offsetof(LaiueGraphicsDeviceV2, getCapabilities), true, true,
+                       false);
+    CheckChunkFallback(LAIUE_GRAPHICS_DEVICE_V2_CAPABILITIES_SIZE - 1u, true, true, false);
+    const int64_t center[3] = {0, 0, 0};
+    const int64_t movedCenter[3] = {128, 0, 0};
+    InitializeChunkDevice(&chunkDevice, 44u, true);
+    InitializeChunkDevice(&foreignChunkDevice, 45u, true);
+    const uint32_t scratchReleases = mesherScratchReleases;
+    Expect(WalkVisualsCreateChunkSet(&chunkMesher, &chunkSet) &&
+               WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock,
+                                         NULL, center),
+           "native chunk geometry prepares before beginFrame");
+    Expect(chunkSet.indexQuadCapacity == 6u && chunkDevice.indexUploads == 1u &&
+               ChunkLiveBytes(&chunkDevice) ==
+                   3u * 9u * 4u * sizeof(LaiueGraphicsVertexV2) + 6u * 6u * sizeof(uint32_t),
+           "native storage is four vertices per quad plus one largest-material topology IB");
+    CheckNativeChunkDraws(center, true);
+    const uint32_t created = chunkDevice.created, uploaded = chunkDevice.uploaded;
+    const uint32_t builds = chunkBuildCalls;
+    Expect(WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock, NULL,
+                                     center) &&
+               chunkDevice.created == created && chunkDevice.uploaded == uploaded &&
+               chunkBuildCalls == builds,
+           "unchanged chunks reuse their VBs, topology and mesher result without uploads");
+    chunkSnapshot = chunkSet;
+    Expect(!WalkVisualsUpdateChunkSet(&foreignChunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock,
+                                      NULL, center),
+           "a foreign device cannot adopt another device's chunk handles");
+    WalkVisualsInvalidateBlock(&chunkSet, &foreignChunkDevice.api, 0, 0, 0);
+    WalkVisualsInvalidateChunkSet(&foreignChunkDevice.api, &chunkSet);
+    WalkVisualsDestroyChunkSet(&foreignChunkDevice.api, &chunkMesher, &chunkSet);
+    Expect(memcmp(&chunkSet, &chunkSnapshot, sizeof(chunkSet)) == 0 &&
+               foreignChunkDevice.created == 0u && foreignChunkDevice.destroyed == 0u &&
+               mesherScratchReleases == scratchReleases,
+           "foreign-device cleanup leaves the owner's geometry, topology and scratch intact");
+    chunkExtraQuads = 2u;
+    const uint64_t liveBytes = ChunkLiveBytes(&chunkDevice);
+    const uint32_t failures[3] = {LAIUE_GRAPHICS_BUFFER_USAGE_INDEX,
+                                  LAIUE_GRAPHICS_BUFFER_USAGE_INDEX,
+                                  LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX};
+    for (uint32_t attempt = 0u; attempt < 3u; ++attempt)
+    {
+        chunkDevice.failCreateUsage = attempt == 0u ? failures[attempt] : 0u;
+        chunkDevice.failUploadUsage = attempt != 0u ? failures[attempt] : 0u;
+        const uint32_t beforeCreates = chunkDevice.created, beforeDestroys = chunkDevice.destroyed;
+        Expect(!WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock,
+                                          NULL, movedCenter),
+               "failed VB or shared-IB growth propagates");
+        Expect(memcmp(&chunkSet, &chunkSnapshot, sizeof(chunkSet)) == 0 &&
+                   ChunkLiveBytes(&chunkDevice) == liveBytes &&
+                   chunkDevice.created - beforeCreates == chunkDevice.destroyed - beforeDestroys,
+               "failed preparation releases only candidates and preserves every prior draw and "
+               "center");
+        CheckNativeChunkDraws(center, true);
+    }
+    chunkDevice.failCreateUsage = chunkDevice.failUploadUsage = 0u;
+    failChunkMesh = true;
+    Expect(!WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock, NULL,
+                                      movedCenter) &&
+               memcmp(&chunkSet, &chunkSnapshot, sizeof(chunkSet)) == 0,
+           "mesher failure also leaves the complete previous chunk set published");
+    failChunkMesh = false;
+    const LaiueGraphicsHandle oldIndices = chunkSet.indexBuffer;
+    Expect(WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock, NULL,
+                                     movedCenter) &&
+               chunkSet.indexQuadCapacity == 8u && chunkSet.indexBuffer != oldIndices &&
+               chunkDevice.indexUploads == 2u &&
+               !chunkDevice.buffers[(uint32_t)oldIndices - 1u].live,
+           "successful growth publishes one larger topology and releases the previous IB once");
+    CheckNativeChunkDraws(movedCenter, false);
+    const LaiueGraphicsHandle retainedIndices = chunkSet.indexBuffer;
+    WalkVisualsInvalidateChunkSet(&chunkDevice.api, &chunkSet);
+    WalkVisualsInvalidateChunkSet(&chunkDevice.api, &chunkSet);
+    Expect(chunkSet.indexBuffer == retainedIndices && chunkSet.indexQuadCapacity == 8u &&
+               chunkSet.scratch == (ChunkMesherScratch *)&mesherScratchToken &&
+               ChunkLiveBytes(&chunkDevice) == 8u * 6u * sizeof(uint32_t) &&
+               mesherScratchReleases == scratchReleases,
+           "rebase invalidation releases VBs while retaining topology and mesher scratch exactly "
+           "once");
+    chunkExtraQuads = 0u;
+    Expect(WalkVisualsUpdateChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet, ChunkBlock, NULL,
+                                     center) &&
+               chunkSet.indexBuffer == retainedIndices && chunkDevice.indexUploads == 2u,
+           "post-rebase rebuild reuses its already sufficient topology allocation");
+    CheckNativeChunkDraws(center, true);
+    WalkVisualsDestroyChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet);
+    WalkVisualsDestroyChunkSet(&chunkDevice.api, &chunkMesher, &chunkSet);
+    Expect(ChunkLiveBytes(&chunkDevice) == 0u && chunkDevice.created == chunkDevice.destroyed &&
+               mesherScratchReleases == scratchReleases + 1u && chunkSet.indexBuffer == 0u &&
+               chunkSet.scratch == NULL,
+           "final teardown releases the retained index buffer, every VB and scratch exactly once");
+}
+
 LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
 {
     PhysicsSetNumericService(LaiueNumericGetStaticServiceV1());
@@ -385,5 +746,6 @@ LAIUE_TEST_ENTRY(WalkVisualsTestEntryPoint)
            "final chunk cleanup releases retained scratch exactly once");
     CheckScratchGuards();
     VoxelRagdollRelease(&testRagdoll);
+    CheckChunkVisuals();
     LAIUE_TEST_SUCCESS();
 }

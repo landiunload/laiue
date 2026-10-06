@@ -67,6 +67,21 @@ typedef struct LaiueGraphicsVertexV2
 _Static_assert(sizeof(LaiueGraphicsVertexV2) == 24u,
                "portable graphics vertex must match generic.hlsl");
 
+/* Generic GPU instances: translations add to the draw origin; the signed
+ * uniform scale affects
+ * geometry only. Rotation is a unit (x,y,z,w)
+ * quaternion; all zero means identity. Records are
+ * borrowed for one call. */
+typedef struct LaiueGraphicsInstanceV2
+{
+    float originRelative[3];
+    float scale;
+    float rotation[4];
+} LaiueGraphicsInstanceV2;
+
+_Static_assert(sizeof(LaiueGraphicsInstanceV2) == 32u,
+               "instance records must match the GPU ring layout");
+
 typedef struct LaiueGraphicsExtentV1
 {
     uint32_t width;

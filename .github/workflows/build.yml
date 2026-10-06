@@ -35,7 +35,9 @@ jobs:
               Out-File $env:GITHUB_ENV -Append
           }
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
+        run: >
+          cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
+          -DLAIUE_REQUIRE_D3D12_TEST_DRIVER=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug

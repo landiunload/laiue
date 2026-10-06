@@ -51,6 +51,7 @@ typedef struct Demo
     const LaiueModelServiceV1 *model;
     const LaiueMeshWorldServiceV1 *worldService;
     const LaiueMeshWorldRenderServiceV1 *renderService;
+    uint32_t renderServiceSize;
     const LaiueGraphicsDeviceServiceV2 *graphics;
     uint32_t graphicsSize;
     LaiueContentCatalog *catalog;
@@ -316,8 +317,9 @@ static void QueryServices(Demo *demo, const LaiueModuleHost *host)
     demo->content = DEMO_QUERY(LaiueContentServiceV1, LAIUE_CONTENT_SERVICE_NAME, 1u);
     demo->model = DEMO_QUERY(LaiueModelServiceV1, LAIUE_MODEL_SERVICE_NAME, 1u);
     demo->worldService = DEMO_QUERY(LaiueMeshWorldServiceV1, LAIUE_MESH_WORLD_SERVICE_NAME, 1u);
-    demo->renderService =
-        DEMO_QUERY(LaiueMeshWorldRenderServiceV1, LAIUE_MESH_WORLD_RENDER_SERVICE_NAME, 1u);
+    demo->renderService = (const LaiueMeshWorldRenderServiceV1 *)LaiueModuleHostQueryService(
+        host, LAIUE_MESH_WORLD_RENDER_SERVICE_NAME, 1u,
+        (uint32_t)offsetof(LaiueMeshWorldRenderServiceV1, submit), NULL, &demo->renderServiceSize);
     demo->graphics = (const LaiueGraphicsDeviceServiceV2 *)LaiueModuleHostQueryService(
         host, LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2, 2u,
         LAIUE_GRAPHICS_DEVICE_SERVICE_V2_LEGACY_SIZE, NULL, &demo->graphicsSize);
@@ -546,18 +548,26 @@ static uint32_t Draw(Demo *demo, uint32_t width, uint32_t height)
     camera.local[2] += 0.65f;
     LaiueGraphicsCameraV2 view = {.structSize = sizeof(view)};
     MeshDemoCamera(demo->yaw, demo->pitch, (float)width / (float)height, view.viewProjection);
+    const uint32_t direct = demo->renderer != NULL && demo->device != &demo->validation.device &&
+                            HasField(demo->renderServiceSize, demo->renderService->structSize,
+                                     offsetof(LaiueMeshWorldRenderServiceV1, submit),
+                                     sizeof(demo->renderService->submit)) &&
+                            demo->renderService->submit != NULL;
     uint32_t count = 0u;
     if (demo->renderer != NULL &&
         (!demo->renderService->update(demo->renderer, &camera, 48.0f, 16u, NULL) ||
-         !demo->renderService->draws(demo->renderer, &camera, view.viewProjection, demo->draws,
-                                     DEMO_DRAW_CAPACITY, &count) ||
-         count > DEMO_DRAW_CAPACITY))
+         !demo->renderService->draws(demo->renderer, &camera, view.viewProjection,
+                                     direct ? NULL : demo->draws, direct ? 0u : DEMO_DRAW_CAPACITY,
+                                     &count) ||
+         (direct == 0u && count > DEMO_DRAW_CAPACITY)))
         return 0u;
     if (demo->device == &demo->validation.device)
         demo->validation.submitted += count;
-    else if (!demo->device->beginFrame(demo->device, width, height) ||
-             !demo->device->setCamera(demo->device, &view) ||
-             (count != 0u && !demo->device->submit(demo->device, demo->draws, count)) ||
+    else if (!demo->device->setCamera(demo->device, &view) ||
+             !demo->device->beginFrame(demo->device, width, height) ||
+             (count != 0u &&
+              !(direct ? demo->renderService->submit(demo->renderer, &camera, view.viewProjection)
+                       : demo->device->submit(demo->device, demo->draws, count))) ||
              !demo->device->endFrame(demo->device))
         return 0u;
     if (count != 0u)

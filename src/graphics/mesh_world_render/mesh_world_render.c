@@ -26,6 +26,7 @@ typedef struct RenderModel
     uint32_t indexCount;
     LaiueMeshRenderPartV1 *parts;
     uint32_t partCount;
+    uint32_t exclusiveCells;
 } RenderModel;
 
 typedef struct RenderMaterial
@@ -42,6 +43,40 @@ typedef struct RenderBatch
     LaiueGraphicsHandle buffer;
 } RenderBatch;
 
+typedef struct RenderSharedPart
+{
+    uint32_t material;
+    uint32_t firstIndex;
+    uint32_t indexCount;
+} RenderSharedPart;
+
+typedef struct RenderSharedGeometry
+{
+    struct RenderSharedGeometry *next;
+    uint32_t model;
+    uint32_t generation;
+    uint32_t references;
+    uint32_t vertexCount;
+    uint32_t partCount;
+    uint32_t indexCount;
+    uint32_t scratchOffset;
+    uint32_t scratchCount;
+    LaiueGraphicsHandle vertexBuffer;
+    LaiueGraphicsHandle indexBuffer;
+    float boundsMin[3];
+    float boundsMax[3];
+    RenderSharedPart *parts;
+    LaiueGraphicsVertexV2 *pendingVertices;
+    uint32_t *pendingIndices;
+} RenderSharedGeometry;
+
+typedef struct RenderPlacement
+{
+    RenderSharedGeometry *geometry;
+    float origin[3];
+    float scale;
+} RenderPlacement;
+
 /* Cells are kept sorted by coordinate, the order queryCells answers in, so
  * one merge pass matches the cache against the cells in range. */
 typedef struct RenderCell
@@ -50,9 +85,18 @@ typedef struct RenderCell
     uint64_t revision;
     uint32_t generation;
     uint32_t built;
+    uint64_t censusRevision;
+    uint32_t censusGeneration;
+    uint32_t censusModel;
+    bool censusEligible;
+    bool sharedDesired;
+    bool builtShared;
     uint32_t budgetExcluded;
     RenderBatch *batches;
     uint32_t batchCount;
+    RenderPlacement *placements;
+    uint32_t placementCount;
+    bool budgetEvict;
     double distanceSquared;
     float boundsMin[3];
     float boundsMax[3];
@@ -98,6 +142,12 @@ struct LaiueMeshWorldRendererV1
     float ambientColor[3];
 
     uint32_t bufferCount;
+    uint32_t indexBufferCount;
+    uint32_t placementCount;
+    bool sharedGeometry;
+    RenderSharedGeometry *shared;
+    LaiueGraphicsInstanceV2 *submissionInstances;
+    uint32_t submissionInstanceCapacity;
     uint64_t vertexCount;
     LaiueMeshRenderStatsV1 stats;
 
@@ -210,6 +260,31 @@ static void ReleaseBatches(LaiueMeshWorldRendererV1 *renderer, RenderCell *cell)
     PlatformFree(cell->batches);
     cell->batches = NULL;
     cell->batchCount = 0u;
+    for (uint32_t i = 0u; i < cell->placementCount; ++i)
+    {
+        RenderSharedGeometry *geometry = cell->placements[i].geometry;
+        --renderer->placementCount;
+        if (--geometry->references != 0u)
+            continue;
+        RenderSharedGeometry **link = &renderer->shared;
+        while (*link != geometry)
+            link = &(*link)->next;
+        *link = geometry->next;
+        if (geometry->vertexBuffer != 0u)
+            renderer->device->destroyHandle(renderer->device, geometry->vertexBuffer);
+        if (geometry->indexBuffer != 0u)
+            renderer->device->destroyHandle(renderer->device, geometry->indexBuffer);
+        --renderer->bufferCount;
+        --renderer->indexBufferCount;
+        renderer->vertexCount -= geometry->vertexCount;
+        PlatformFree(geometry->parts);
+        PlatformFree(geometry->pendingVertices);
+        PlatformFree(geometry->pendingIndices);
+        PlatformFree(geometry);
+    }
+    PlatformFree(cell->placements);
+    cell->placements = NULL;
+    cell->placementCount = 0u;
 }
 
 static void QuaternionMatrix(const float q[4], float m[3][3])
@@ -265,6 +340,15 @@ static uint32_t RendererCreate(const LaiueMeshWorldRendererConfigV1 *config,
     renderer->device = config->device;
     renderer->maximumBuffers =
         config->maximumBuffers == 0u ? RENDER_DEFAULT_MAXIMUM_BUFFERS : config->maximumBuffers;
+    if (config->device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_INSTANCES_SIZE &&
+        config->device->getCapabilities != NULL && config->device->submitInstances != NULL)
+    {
+        const uint32_t capabilities = config->device->getCapabilities(config->device);
+        const uint32_t required =
+            LAIUE_GRAPHICS_CAP_NATIVE_INDICES | LAIUE_GRAPHICS_CAP_GENERIC_INSTANCES;
+        renderer->sharedGeometry =
+            (capabilities & required) == required && renderer->maximumBuffers >= 2u;
+    }
     renderer->cellSize = config->worldService->cellSize(config->world);
     if (!FiniteFloat(renderer->cellSize) || renderer->cellSize < 1.0f ||
         renderer->cellSize > 4096.0f)
@@ -306,6 +390,7 @@ static void RendererDestroy(LaiueMeshWorldRendererV1 *renderer)
     PlatformFree(renderer->query);
     PlatformFree(renderer->instances);
     PlatformFree(renderer->candidates);
+    PlatformFree(renderer->submissionInstances);
     PlatformFree(renderer);
 }
 
@@ -484,6 +569,289 @@ static RenderAccumulator *Accumulator(LaiueMeshWorldRendererV1 *renderer, uint32
     return accumulator;
 }
 
+static bool ShadeNormal(const LaiueMeshWorldRendererV1 *renderer, uint32_t color,
+                        const float normal[3], uint32_t *outColor);
+
+static bool SharedPlacementEligible(const LaiueMeshWorldRendererV1 *renderer,
+                                    const RenderModel *model, const LaiueMeshTransformV1 *transform)
+{
+    if (!(transform->scale[0] > 0.0f) || transform->scale[0] != transform->scale[1] ||
+        transform->scale[0] != transform->scale[2] || transform->rotation[0] != 0.0f ||
+        transform->rotation[1] != 0.0f || transform->rotation[2] != 0.0f ||
+        (transform->rotation[3] != 0.0f && transform->rotation[3] != 1.0f &&
+         transform->rotation[3] != -1.0f))
+        return false;
+    uint64_t used = 0u;
+    for (uint32_t p = 0u; p < model->partCount; ++p)
+        used += model->parts[p].indexCount;
+    /* Compare requested geometry bytes, without inferring a timing benefit.
+     * A sparse unique
+     * model need not trade its baked batch for two handles. */
+    if (used == 0u || used > RENDER_MAX_CELL_VERTICES ||
+        (uint64_t)model->vertexCount * sizeof(LaiueGraphicsVertexV2) + used * sizeof(uint32_t) >
+            used * sizeof(LaiueGraphicsVertexV2))
+        return false;
+    if (transform->scale[0] == 1.0f)
+        return true;
+    // The legacy normal threshold and colour rounding can depend on scale.
+    // Keep exact baked colours even for degenerate or unnormalised normals.
+    const float inverseScale = 1.0f / transform->scale[0];
+    for (uint32_t p = 0u; p < model->partCount; ++p)
+        for (uint32_t i = 0u; i < model->parts[p].indexCount; ++i)
+        {
+            const LaiueMeshRenderVertexV1 *source =
+                &model->vertices[model->indices[model->parts[p].firstIndex + i]];
+            const float normal[3] = {source->normal[0] * inverseScale,
+                                     source->normal[1] * inverseScale,
+                                     source->normal[2] * inverseScale};
+            uint32_t sharedColor;
+            uint32_t bakedColor;
+            if (!ShadeNormal(renderer, source->colorRGBA, source->normal, &sharedColor) ||
+                !ShadeNormal(renderer, source->colorRGBA, normal, &bakedColor) ||
+                sharedColor != bakedColor)
+                return false;
+        }
+    return true;
+}
+
+static bool ReadCellInstances(LaiueMeshWorldRendererV1 *renderer, const LaiueMeshCellV1 *coord,
+                              uint32_t *outCount)
+{
+    const LaiueMeshWorldServiceV1 *world = renderer->worldService;
+    uint32_t count = 0u;
+    if (world->cellInstances(renderer->world, coord, NULL, 0u, &count) == 0u || count == UINT32_MAX)
+        return false;
+    LaiueMeshInstanceInfoV1 *instances = (LaiueMeshInstanceInfoV1 *)GrowArray(
+        renderer->instances, &renderer->instanceCapacity, count, sizeof(*instances));
+    if (count != 0u && instances == NULL)
+        return false;
+    renderer->instances = instances;
+    uint32_t listed = 0u;
+    if (count != 0u &&
+        (world->cellInstances(renderer->world, coord, instances, count, &listed) == 0u ||
+         listed > count))
+        return false;
+    *outCount = listed;
+    return true;
+}
+
+/* One ordinary item per material already describes this cell. Sharing several
+ * placements would
+ * increase draws() output, even when submitInstances can group
+ * them. Mixed cells retain their
+ * single baked material batches for the same
+ * reason. Invisible and unregistered instances do not
+ * contribute geometry. */
+static bool SharedCellInstance(const LaiueMeshWorldRendererV1 *renderer, uint32_t count,
+                               uint32_t *outInstance, uint32_t *outModel)
+{
+    bool selected = false;
+    uint32_t instanceIndex = 0u;
+    uint32_t modelIndex = 0u;
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        if ((renderer->instances[i].flags & LAIUE_MESH_INSTANCE_VISIBLE) == 0u)
+            continue;
+        bool found = false;
+        const uint32_t model = FindModelIndex(renderer, renderer->instances[i].model, &found);
+        if (!found)
+            continue;
+        if (selected)
+            return false;
+        selected = true;
+        instanceIndex = i;
+        modelIndex = model;
+    }
+    if (!selected || !SharedPlacementEligible(renderer, &renderer->models[modelIndex],
+                                              &renderer->instances[instanceIndex].transform))
+        return false;
+    *outInstance = instanceIndex;
+    *outModel = modelIndex;
+    return true;
+}
+
+static bool ProbeCell(LaiueMeshWorldRendererV1 *renderer, RenderCell *cell, bool *outChanged)
+{
+    const LaiueMeshWorldServiceV1 *world = renderer->worldService;
+    const uint64_t revision = world->cellRevision(renderer->world, &cell->coord);
+    if (cell->censusGeneration == renderer->generation && cell->censusRevision == revision)
+        return true;
+    uint32_t count = 0u;
+    if (!ReadCellInstances(renderer, &cell->coord, &count))
+        return false;
+    uint32_t instance = 0u;
+    uint32_t model = 0u;
+    const bool eligible = SharedCellInstance(renderer, count, &instance, &model);
+    if (world->cellRevision(renderer->world, &cell->coord) != revision)
+        return false;
+    cell->censusRevision = revision;
+    cell->censusGeneration = renderer->generation;
+    cell->censusEligible = eligible;
+    cell->censusModel = eligible ? renderer->models[model].model : 0u;
+    *outChanged = true;
+    return true;
+}
+
+static bool ShadeNormal(const LaiueMeshWorldRendererV1 *renderer, uint32_t color,
+                        const float normal[3], uint32_t *outColor)
+{
+    const float lengthSquared =
+        normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+    if (!FiniteFloat(lengthSquared))
+        return false;
+    float facing = 1.0f;
+    if (lengthSquared > 1.0e-12f)
+        facing = (normal[0] * renderer->toSun[0] + normal[1] * renderer->toSun[1] +
+                  normal[2] * renderer->toSun[2]) /
+                 ScalarSqrt(lengthSquared);
+    if (facing < 0.0f)
+        facing = 0.0f;
+    if (facing > 1.0f)
+        facing = 1.0f;
+    *outColor =
+        ShadeChannel(color, 0u, renderer->ambientColor[0] + renderer->sunColor[0] * facing) |
+        ShadeChannel(color, 8u, renderer->ambientColor[1] + renderer->sunColor[1] * facing) |
+        ShadeChannel(color, 16u, renderer->ambientColor[2] + renderer->sunColor[2] * facing) |
+        (color & UINT32_C(0xFF000000));
+    return true;
+}
+
+static bool UploadOwnedBuffer(LaiueMeshWorldRendererV1 *renderer, uint32_t usage, const void *data,
+                              uint64_t bytes, LaiueGraphicsHandle *out)
+{
+    LaiueGraphicsBufferDescV1 desc = {sizeof(desc), usage, bytes};
+    *out = 0u;
+    if (renderer->device->createBuffer(renderer->device, &desc, out) == 0u || *out == 0u)
+        return false;
+    LaiueGraphicsBufferUploadV1 upload = {sizeof(upload), *out, 0u, data, bytes};
+    if (renderer->device->uploadBuffer(renderer->device, &upload) != 0u)
+        return true;
+    renderer->device->destroyHandle(renderer->device, *out);
+    *out = 0u;
+    return false;
+}
+
+static RenderSharedGeometry *SharedGeometry(LaiueMeshWorldRendererV1 *renderer,
+                                            const RenderModel *model)
+{
+    for (RenderSharedGeometry *geometry = renderer->shared; geometry != NULL;
+         geometry = geometry->next)
+        if (geometry->model == model->model && geometry->generation == renderer->generation)
+            return geometry;
+    uint32_t used = 0u;
+    for (uint32_t p = 0u; p < model->partCount; ++p)
+    {
+        if (model->parts[p].indexCount > RENDER_MAX_CELL_VERTICES - used)
+            return NULL;
+        used += model->parts[p].indexCount;
+    }
+    RenderSharedGeometry *geometry = PlatformAllocate(sizeof(*geometry), true);
+    LaiueGraphicsVertexV2 *vertices =
+        PlatformAllocate((size_t)model->vertexCount * sizeof(*vertices), false);
+    uint32_t *indices = PlatformAllocate((size_t)used * sizeof(*indices), false);
+    if (geometry != NULL)
+        geometry->parts =
+            PlatformAllocate((size_t)model->partCount * sizeof(*geometry->parts), true);
+    if (geometry == NULL || vertices == NULL || indices == NULL || geometry->parts == NULL)
+        goto fail;
+    for (uint32_t v = 0u; v < model->vertexCount; ++v)
+    {
+        memcpy(vertices[v].position, model->vertices[v].position, sizeof(vertices[v].position));
+        memcpy(vertices[v].uv, model->vertices[v].uv, sizeof(vertices[v].uv));
+        vertices[v].colorRGBA = model->vertices[v].colorRGBA;
+    }
+    bool first = true;
+    uint32_t written = 0u;
+    for (uint32_t p = 0u; p < model->partCount; ++p)
+    {
+        const LaiueMeshRenderPartV1 *part = &model->parts[p];
+        if (part->indexCount == 0u)
+            continue;
+        uint32_t material = 0u;
+        while (material < geometry->partCount &&
+               geometry->parts[material].material != part->material)
+            ++material;
+        if (material == geometry->partCount)
+        {
+            geometry->parts[material].material = part->material;
+            ++geometry->partCount;
+        }
+        geometry->parts[material].indexCount += part->indexCount;
+    }
+    for (uint32_t material = 0u; material < geometry->partCount; ++material)
+    {
+        geometry->parts[material].firstIndex = written;
+        for (uint32_t p = 0u; p < model->partCount; ++p)
+        {
+            const LaiueMeshRenderPartV1 *part = &model->parts[p];
+            if (part->material != geometry->parts[material].material)
+                continue;
+            for (uint32_t i = 0u; i < part->indexCount; ++i)
+            {
+                const uint32_t index = model->indices[part->firstIndex + i];
+                indices[written++] = index;
+                const LaiueMeshRenderVertexV1 *source = &model->vertices[index];
+                if (!ShadeNormal(renderer, source->colorRGBA, source->normal,
+                                 &vertices[index].colorRGBA))
+                    goto fail;
+                for (uint32_t axis = 0u; axis < 3u; ++axis)
+                {
+                    if (first || source->position[axis] < geometry->boundsMin[axis])
+                        geometry->boundsMin[axis] = source->position[axis];
+                    if (first || source->position[axis] > geometry->boundsMax[axis])
+                        geometry->boundsMax[axis] = source->position[axis];
+                }
+                first = false;
+            }
+        }
+    }
+    // Hold CPU preparation until the cell's complete buffer budget is known.
+    // Refused distant cells must not create/upload disposable GPU pairs.
+    geometry->pendingVertices = vertices;
+    geometry->pendingIndices = indices;
+    geometry->indexCount = used;
+    geometry->model = model->model;
+    geometry->generation = renderer->generation;
+    geometry->vertexCount = model->vertexCount;
+    geometry->next = renderer->shared;
+    renderer->shared = geometry;
+    ++renderer->bufferCount;
+    ++renderer->indexBufferCount;
+    renderer->vertexCount += model->vertexCount;
+    return geometry;
+fail:
+    PlatformFree(vertices);
+    PlatformFree(indices);
+    if (geometry != NULL)
+    {
+        if (geometry->vertexBuffer != 0u)
+            renderer->device->destroyHandle(renderer->device, geometry->vertexBuffer);
+        if (geometry->indexBuffer != 0u)
+            renderer->device->destroyHandle(renderer->device, geometry->indexBuffer);
+        PlatformFree(geometry->parts);
+        PlatformFree(geometry);
+    }
+    return NULL;
+}
+
+static bool UploadSharedGeometry(LaiueMeshWorldRendererV1 *renderer, RenderSharedGeometry *geometry)
+{
+    if (geometry->pendingVertices == NULL)
+        return true;
+    if (!UploadOwnedBuffer(renderer, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, geometry->pendingVertices,
+                           (uint64_t)geometry->vertexCount * sizeof(*geometry->pendingVertices),
+                           &geometry->vertexBuffer) ||
+        !UploadOwnedBuffer(renderer, LAIUE_GRAPHICS_BUFFER_USAGE_INDEX, geometry->pendingIndices,
+                           (uint64_t)geometry->indexCount * sizeof(*geometry->pendingIndices),
+                           &geometry->indexBuffer))
+        return false;
+    PlatformFree(geometry->pendingVertices);
+    PlatformFree(geometry->pendingIndices);
+    geometry->pendingVertices = NULL;
+    geometry->pendingIndices = NULL;
+    return true;
+}
+
 static bool AppendInstance(LaiueMeshWorldRendererV1 *renderer, const RenderModel *model,
                            const LaiueMeshTransformV1 *transform, float boundsMin[3],
                            float boundsMax[3], bool *firstVertex)
@@ -569,6 +937,60 @@ typedef enum RenderBuildResult
     RENDER_BUILD_FAILED,
 } RenderBuildResult;
 
+static uint64_t ReplacementBuffers(const LaiueMeshWorldRendererV1 *renderer, const RenderCell *cell,
+                                   uint32_t created)
+{
+    uint64_t held = (uint64_t)renderer->bufferCount + renderer->indexBufferCount + created;
+    for (uint32_t c = 0u; c < renderer->cellCount; ++c)
+        if (&renderer->cells[c] == cell || renderer->cells[c].budgetEvict)
+            held -= renderer->cells[c].batchCount;
+    for (const RenderSharedGeometry *geometry = renderer->shared; geometry != NULL;
+         geometry = geometry->next)
+    {
+        uint32_t removed = 0u;
+        for (uint32_t c = 0u; c < renderer->cellCount; ++c)
+        {
+            const RenderCell *other = &renderer->cells[c];
+            if (other != cell && !other->budgetEvict)
+                continue;
+            for (uint32_t p = 0u; p < other->placementCount; ++p)
+                removed += other->placements[p].geometry == geometry ? 1u : 0u;
+        }
+        if (removed == geometry->references)
+            held -= 2u;
+    }
+    return held;
+}
+
+static bool PlanCellBudget(LaiueMeshWorldRendererV1 *renderer, const RenderCell *cell,
+                           uint32_t needed)
+{
+    for (uint32_t c = 0u; c < renderer->cellCount; ++c)
+        renderer->cells[c].budgetEvict = false;
+    while (ReplacementBuffers(renderer, cell, needed) > renderer->maximumBuffers)
+    {
+        RenderCell *farthest = NULL;
+        for (uint32_t c = 0u; c < renderer->cellCount; ++c)
+        {
+            RenderCell *other = &renderer->cells[c];
+            if (other == cell || other->budgetEvict ||
+                (other->batchCount == 0u && other->placementCount == 0u) ||
+                other->distanceSquared < cell->distanceSquared ||
+                (other->distanceSquared == cell->distanceSquared &&
+                 CompareCells(&other->coord, &cell->coord) < 0))
+                continue;
+            if (farthest == NULL || other->distanceSquared > farthest->distanceSquared ||
+                (other->distanceSquared == farthest->distanceSquared &&
+                 CompareCells(&other->coord, &farthest->coord) > 0))
+                farthest = other;
+        }
+        if (farthest == NULL)
+            return false;
+        farthest->budgetEvict = true;
+    }
+    return true;
+}
+
 static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCell *cell)
 {
     const LaiueMeshWorldServiceV1 *world = renderer->worldService;
@@ -576,19 +998,35 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
      * rebuild, never a stale cell that claims to be current. */
     const uint64_t revision = world->cellRevision(renderer->world, &cell->coord);
     uint32_t count = 0u;
-    if (world->cellInstances(renderer->world, &cell->coord, NULL, 0u, &count) == 0u)
+    if (!ReadCellInstances(renderer, &cell->coord, &count))
         return RENDER_BUILD_FAILED;
-    LaiueMeshInstanceInfoV1 *instances = (LaiueMeshInstanceInfoV1 *)GrowArray(
-        renderer->instances, &renderer->instanceCapacity, count, sizeof(LaiueMeshInstanceInfoV1));
-    if (count != 0u && instances == NULL)
+    const LaiueMeshInstanceInfoV1 *instances = renderer->instances;
+
+    RenderCell temporary = {0};
+    uint32_t sharedInstance = 0u;
+    uint32_t sharedModel = 0u;
+    if (cell->sharedDesired &&
+        (cell->censusRevision != revision ||
+         !SharedCellInstance(renderer, count, &sharedInstance, &sharedModel) ||
+         renderer->models[sharedModel].model != cell->censusModel ||
+         world->cellRevision(renderer->world, &cell->coord) != revision))
         return RENDER_BUILD_FAILED;
-    renderer->instances = instances;
-    uint32_t listed = 0u;
-    if (count != 0u &&
-        (world->cellInstances(renderer->world, &cell->coord, instances, count, &listed) == 0u))
-        return RENDER_BUILD_FAILED;
-    if (listed < count)
-        count = listed;
+    const uint32_t sharedCount = cell->sharedDesired ? 1u : 0u;
+    if (sharedCount != 0u)
+    {
+        if (sharedCount > UINT32_MAX - renderer->placementCount)
+            return RENDER_BUILD_FAILED;
+        LaiueGraphicsInstanceV2 *scratch =
+            GrowArray(renderer->submissionInstances, &renderer->submissionInstanceCapacity,
+                      renderer->placementCount + sharedCount, sizeof(*scratch));
+        if (scratch == NULL)
+            return RENDER_BUILD_FAILED;
+        renderer->submissionInstances = scratch;
+        temporary.placements =
+            PlatformAllocate((size_t)sharedCount * sizeof(*temporary.placements), false);
+        if (temporary.placements == NULL)
+            return RENDER_BUILD_FAILED;
+    }
 
     renderer->accumulatorCount = 0u;
     float boundsMin[3] = {0.0f, 0.0f, 0.0f};
@@ -603,9 +1041,37 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
         const uint32_t modelIndex = FindModelIndex(renderer, instance->model, &found);
         if (!found)
             continue;
-        if (!AppendInstance(renderer, &renderer->models[modelIndex], &instance->transform,
-                            boundsMin, boundsMax, &firstVertex))
-            return RENDER_BUILD_FAILED;
+        const RenderModel *model = &renderer->models[modelIndex];
+        if (sharedCount != 0u && i == sharedInstance)
+        {
+            RenderSharedGeometry *geometry = SharedGeometry(renderer, model);
+            if (geometry == NULL)
+                goto failed;
+            RenderPlacement *placement = &temporary.placements[temporary.placementCount++];
+            placement->geometry = geometry;
+            ++geometry->references;
+            ++renderer->placementCount;
+            memcpy(placement->origin, instance->transform.position.local,
+                   sizeof(placement->origin));
+            placement->scale = instance->transform.scale[0];
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            {
+                const float minimum =
+                    placement->origin[axis] + geometry->boundsMin[axis] * placement->scale;
+                const float maximum =
+                    placement->origin[axis] + geometry->boundsMax[axis] * placement->scale;
+                if (!FiniteFloat(minimum) || !FiniteFloat(maximum))
+                    goto failed;
+                if (firstVertex || minimum < boundsMin[axis])
+                    boundsMin[axis] = minimum;
+                if (firstVertex || maximum > boundsMax[axis])
+                    boundsMax[axis] = maximum;
+            }
+            firstVertex = false;
+        }
+        else if (!AppendInstance(renderer, model, &instance->transform, boundsMin, boundsMax,
+                                 &firstVertex))
+            goto failed;
     }
 
     uint32_t needed = 0u;
@@ -616,27 +1082,22 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
      * unbuilt cell. Check availability without changing the
      * cache: a failed GPU upload must
      * leave the old buffers intact. */
-    uint32_t available = renderer->maximumBuffers - renderer->bufferCount + cell->batchCount;
-    for (uint32_t i = 0u; i < renderer->cellCount && available < needed; ++i)
+    if (!PlanCellBudget(renderer, cell, needed))
     {
-        const RenderCell *other = &renderer->cells[i];
-        if (other->distanceSquared > cell->distanceSquared ||
-            (other->distanceSquared == cell->distanceSquared &&
-             CompareCells(&other->coord, &cell->coord) > 0))
-            available += other->batchCount;
-    }
-    if (available < needed)
-    {
+        ReleaseBatches(renderer, &temporary);
         cell->budgetExcluded = 1u;
         return RENDER_BUILD_OVER_BUDGET;
     }
+    for (uint32_t p = 0u; p < temporary.placementCount; ++p)
+        if (!UploadSharedGeometry(renderer, temporary.placements[p].geometry))
+            goto failed;
 
     RenderBatch *batches = NULL;
     if (needed != 0u)
     {
         batches = (RenderBatch *)PlatformAllocate(sizeof(RenderBatch) * needed, false);
         if (batches == NULL)
-            return RENDER_BUILD_FAILED;
+            goto failed;
     }
     uint32_t created = 0u;
     for (uint32_t i = 0u; i < renderer->accumulatorCount; ++i)
@@ -662,33 +1123,28 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
             for (uint32_t k = 0u; k < created; ++k)
                 renderer->device->destroyHandle(renderer->device, batches[k].buffer);
             PlatformFree(batches);
-            return RENDER_BUILD_FAILED;
+            goto failed;
         }
         batches[created].material = accumulator->material;
         batches[created].vertexCount = accumulator->count;
         batches[created].buffer = buffer;
         ++created;
     }
-    while (renderer->bufferCount - cell->batchCount + created > renderer->maximumBuffers)
+    for (uint32_t i = 0u; i < renderer->cellCount; ++i)
     {
-        RenderCell *farthest = NULL;
-        for (uint32_t i = 0u; i < renderer->cellCount; ++i)
-        {
-            RenderCell *other = &renderer->cells[i];
-            if (other == cell || other->batchCount == 0u)
-                continue;
-            if (farthest == NULL || other->distanceSquared > farthest->distanceSquared ||
-                (other->distanceSquared == farthest->distanceSquared &&
-                 CompareCells(&other->coord, &farthest->coord) > 0))
-                farthest = other;
-        }
-        ReleaseBatches(renderer, farthest);
-        farthest->built = 0u;
-        farthest->budgetExcluded = 1u;
+        RenderCell *other = &renderer->cells[i];
+        if (!other->budgetEvict)
+            continue;
+        ReleaseBatches(renderer, other);
+        other->built = 0u;
+        other->budgetExcluded = 1u;
+        other->budgetEvict = false;
     }
     ReleaseBatches(renderer, cell);
     cell->batches = batches;
     cell->batchCount = created;
+    cell->placements = temporary.placements;
+    cell->placementCount = temporary.placementCount;
     cell->budgetExcluded = 0u;
     for (uint32_t i = 0u; i < created; ++i)
         renderer->vertexCount += batches[i].vertexCount;
@@ -696,12 +1152,16 @@ static RenderBuildResult BuildCell(LaiueMeshWorldRendererV1 *renderer, RenderCel
     cell->revision = revision;
     cell->generation = renderer->generation;
     cell->built = 1u;
+    cell->builtShared = cell->sharedDesired;
     for (uint32_t axis = 0u; axis < 3u; ++axis)
     {
         cell->boundsMin[axis] = boundsMin[axis];
         cell->boundsMax[axis] = boundsMax[axis];
     }
     return RENDER_BUILD_OK;
+failed:
+    ReleaseBatches(renderer, &temporary);
+    return RENDER_BUILD_FAILED;
 }
 
 static void SortCandidates(RenderCandidate *candidates, uint32_t count)
@@ -791,9 +1251,11 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
             return 0u;
     }
 
-    /* Merge the sorted cache with the sorted answer: cells that left the
-     * radius release
-     * their buffers, new ones join unbuilt. */
+    /* Prepare the next census before retiring any cached cell. A failed probe
+     * leaves both
+     * the old geometry and its policy snapshot available. Unchanged
+     * cells reuse their census
+     * without listing instances or shading normals. */
     if ((uint64_t)count + 1u > SIZE_MAX / sizeof(RenderCell))
         return 0u;
     RenderCell *next = (RenderCell *)PlatformAllocate(sizeof(RenderCell) * (count + 1u), false);
@@ -807,12 +1269,17 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
         return 0u;
     }
     renderer->candidates = candidates;
+    bool cellsChanged = count != renderer->cellCount;
+    bool replan = cellsChanged;
     uint32_t old = 0u;
     for (uint32_t i = 0u; i < count; ++i)
     {
         while (old < renderer->cellCount &&
                CompareCells(&renderer->cells[old].coord, &renderer->query[i]) < 0)
-            ReleaseBatches(renderer, &renderer->cells[old++]);
+        {
+            ++old;
+            cellsChanged = replan = true;
+        }
         if (old < renderer->cellCount &&
             CellEqual(&renderer->cells[old].coord, &renderer->query[i]))
         {
@@ -822,10 +1289,49 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
         {
             memset(&next[i], 0, sizeof(RenderCell));
             next[i].coord = renderer->query[i];
+            cellsChanged = replan = true;
+        }
+        if (renderer->sharedGeometry && !ProbeCell(renderer, &next[i], &replan))
+        {
+            PlatformFree(next);
+            return 0u;
         }
     }
-    while (old < renderer->cellCount)
-        ReleaseBatches(renderer, &renderer->cells[old++]);
+    if (renderer->sharedGeometry && replan)
+    {
+        for (uint32_t i = 0u; i < renderer->modelCount; ++i)
+            renderer->models[i].exclusiveCells = 0u;
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            if (!next[i].censusEligible)
+                continue;
+            bool found = false;
+            const uint32_t model = FindModelIndex(renderer, next[i].censusModel, &found);
+            if (found)
+                ++renderer->models[model].exclusiveCells;
+        }
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            next[i].sharedDesired = false;
+            if (!next[i].censusEligible)
+                continue;
+            bool found = false;
+            const uint32_t model = FindModelIndex(renderer, next[i].censusModel, &found);
+            next[i].sharedDesired = found && renderer->models[model].exclusiveCells >= 2u;
+        }
+    }
+    if (cellsChanged)
+    {
+        uint32_t retained = 0u;
+        for (uint32_t i = 0u; i < renderer->cellCount; ++i)
+        {
+            while (retained < count &&
+                   CompareCells(&next[retained].coord, &renderer->cells[i].coord) < 0)
+                ++retained;
+            if (retained == count || !CellEqual(&next[retained].coord, &renderer->cells[i].coord))
+                ReleaseBatches(renderer, &renderer->cells[i]);
+        }
+    }
     PlatformFree(renderer->cells);
     renderer->cells = next;
     renderer->cellCount = count;
@@ -848,7 +1354,10 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
         }
         cell->distanceSquared = distanceSquared;
         if (cell->built != 0u && cell->generation == renderer->generation &&
-            cell->revision == world->cellRevision(renderer->world, &cell->coord))
+            cell->builtShared == cell->sharedDesired &&
+            cell->revision == (renderer->sharedGeometry
+                                   ? cell->censusRevision
+                                   : world->cellRevision(renderer->world, &cell->coord)))
             continue;
         candidates[candidateCount].cell = i;
         candidates[candidateCount].distanceSquared = distanceSquared;
@@ -881,6 +1390,15 @@ static uint32_t RendererUpdate(LaiueMeshWorldRendererV1 *renderer,
     renderer->stats.cells = renderer->cellCount;
     renderer->stats.buffers = renderer->bufferCount;
     renderer->stats.vertices = renderer->vertexCount;
+    renderer->stats.indexBuffers = renderer->indexBufferCount;
+    renderer->stats.instances = renderer->placementCount;
+    uint32_t scratchOffset = 0u;
+    for (RenderSharedGeometry *geometry = renderer->shared; geometry != NULL;
+         geometry = geometry->next)
+    {
+        geometry->scratchOffset = scratchOffset;
+        scratchOffset += geometry->references;
+    }
     renderer->stats.rebuilt = rebuilt;
     renderer->stats.pending = pending;
     renderer->stats.overBudget = 0u;
@@ -926,6 +1444,61 @@ static bool BoxVisible(float planes[6][4], const float minimum[3], const float m
     return true;
 }
 
+static void FillDrawItem(const LaiueMeshWorldRendererV1 *renderer, LaiueGraphicsDrawItemV2 *item,
+                         LaiueGraphicsHandle vertices, LaiueGraphicsHandle indices,
+                         uint32_t firstIndex, uint32_t indexCount, uint32_t material,
+                         const float origin[3], float scale)
+{
+    memset(item, 0, sizeof(*item));
+    item->structSize = sizeof(*item);
+    item->vertexBuffer = vertices;
+    item->indexBuffer = indices;
+    item->firstIndex = firstIndex;
+    item->indexCount = indexCount;
+    memcpy(item->originRelative, origin, sizeof(item->originRelative));
+    item->scale = scale;
+    bool found = false;
+    const uint32_t binding = FindMaterialIndex(renderer, material, &found);
+    if (found)
+    {
+        item->texture = renderer->materials[binding].texture;
+        item->sampler = renderer->materials[binding].sampler;
+    }
+}
+
+static bool DrawInputs(const LaiueMeshWorldRendererV1 *renderer,
+                       const LaiueMeshPositionV1 *renderOrigin, const float viewProjection[16],
+                       float planes[6][4])
+{
+    if (renderer == NULL || !PositionValid(renderOrigin))
+        return false;
+    if (viewProjection != NULL)
+    {
+        for (uint32_t i = 0u; i < 16u; ++i)
+            if (!FiniteFloat(viewProjection[i]))
+                return false;
+        FrustumPlanes(viewProjection, planes);
+    }
+    return true;
+}
+
+static bool CellVisible(const LaiueMeshWorldRendererV1 *renderer, const RenderCell *cell,
+                        const LaiueMeshPositionV1 *renderOrigin, bool cull, float planes[6][4],
+                        float offset[3])
+{
+    const int64_t offsets[3] = {cell->coord.x - renderOrigin->cell.x,
+                                cell->coord.y - renderOrigin->cell.y,
+                                cell->coord.z - renderOrigin->cell.z};
+    for (uint32_t axis = 0u; axis < 3u; ++axis)
+        offset[axis] = (float)((double)offsets[axis] * (double)renderer->cellSize -
+                               (double)renderOrigin->local[axis]);
+    const float minimum[3] = {offset[0] + cell->boundsMin[0], offset[1] + cell->boundsMin[1],
+                              offset[2] + cell->boundsMin[2]};
+    const float maximum[3] = {offset[0] + cell->boundsMax[0], offset[1] + cell->boundsMax[1],
+                              offset[2] + cell->boundsMax[2]};
+    return !cull || BoxVisible(planes, minimum, maximum);
+}
+
 static uint32_t RendererDraws(LaiueMeshWorldRendererV1 *renderer,
                               const LaiueMeshPositionV1 *renderOrigin,
                               const float viewProjection[16], LaiueGraphicsDrawItemV2 *outItems,
@@ -933,67 +1506,51 @@ static uint32_t RendererDraws(LaiueMeshWorldRendererV1 *renderer,
 {
     if (outCount != NULL)
         *outCount = 0u;
-    if (renderer == NULL || !PositionValid(renderOrigin) || outCount == NULL ||
-        (capacity != 0u && outItems == NULL))
-        return 0u;
-    if (viewProjection != NULL)
-        for (uint32_t i = 0u; i < 16u; ++i)
-            if (!FiniteFloat(viewProjection[i]))
-                return 0u;
     float planes[6][4] = {{0.0f}};
-    if (viewProjection != NULL)
-        FrustumPlanes(viewProjection, planes);
+    if (outCount == NULL || (capacity != 0u && outItems == NULL) ||
+        !DrawInputs(renderer, renderOrigin, viewProjection, planes))
+        return 0u;
     uint32_t written = 0u;
     uint32_t culled = 0u;
     for (uint32_t i = 0u; i < renderer->cellCount; ++i)
     {
         const RenderCell *cell = &renderer->cells[i];
-        if (cell->batchCount == 0u)
+        if (cell->batchCount == 0u && cell->placementCount == 0u)
             continue;
         float offset[3];
-        const int64_t offsets[3] = {cell->coord.x - renderOrigin->cell.x,
-                                    cell->coord.y - renderOrigin->cell.y,
-                                    cell->coord.z - renderOrigin->cell.z};
-        for (uint32_t axis = 0u; axis < 3u; ++axis)
-            offset[axis] = (float)((double)offsets[axis] * (double)renderer->cellSize -
-                                   (double)renderOrigin->local[axis]);
-        if (viewProjection != NULL)
+        if (!CellVisible(renderer, cell, renderOrigin, viewProjection != NULL, planes, offset))
         {
-            const float minimum[3] = {offset[0] + cell->boundsMin[0],
-                                      offset[1] + cell->boundsMin[1],
-                                      offset[2] + cell->boundsMin[2]};
-            const float maximum[3] = {offset[0] + cell->boundsMax[0],
-                                      offset[1] + cell->boundsMax[1],
-                                      offset[2] + cell->boundsMax[2]};
-            if (!BoxVisible(planes, minimum, maximum))
-            {
-                ++culled;
-                continue;
-            }
+            ++culled;
+            continue;
         }
         for (uint32_t b = 0u; b < cell->batchCount; ++b)
         {
             if (written < capacity)
             {
                 const RenderBatch *batch = &cell->batches[b];
-                LaiueGraphicsDrawItemV2 *item = &outItems[written];
-                memset(item, 0, sizeof(*item));
-                item->structSize = sizeof(LaiueGraphicsDrawItemV2);
-                item->vertexBuffer = batch->buffer;
-                item->indexCount = batch->vertexCount;
-                item->originRelative[0] = offset[0];
-                item->originRelative[1] = offset[1];
-                item->originRelative[2] = offset[2];
-                item->scale = 1.0f;
-                bool found = false;
-                const uint32_t material = FindMaterialIndex(renderer, batch->material, &found);
-                if (found)
-                {
-                    item->texture = renderer->materials[material].texture;
-                    item->sampler = renderer->materials[material].sampler;
-                }
+                FillDrawItem(renderer, &outItems[written], batch->buffer, 0u, 0u,
+                             batch->vertexCount, batch->material, offset, 1.0f);
             }
             ++written;
+        }
+        for (uint32_t p = 0u; p < cell->placementCount; ++p)
+        {
+            const RenderPlacement *placement = &cell->placements[p];
+            const RenderSharedGeometry *geometry = placement->geometry;
+            const float origin[3] = {offset[0] + placement->origin[0],
+                                     offset[1] + placement->origin[1],
+                                     offset[2] + placement->origin[2]};
+            if (geometry->partCount > UINT32_MAX - written)
+                return 0u;
+            for (uint32_t part = 0u; part < geometry->partCount; ++part)
+            {
+                if (written < capacity)
+                    FillDrawItem(renderer, &outItems[written], geometry->vertexBuffer,
+                                 geometry->indexBuffer, geometry->parts[part].firstIndex,
+                                 geometry->parts[part].indexCount, geometry->parts[part].material,
+                                 origin, placement->scale);
+                ++written;
+            }
         }
     }
     renderer->stats.drawn = written < capacity ? written : capacity;
@@ -1002,13 +1559,94 @@ static uint32_t RendererDraws(LaiueMeshWorldRendererV1 *renderer,
     return 1u;
 }
 
+static uint32_t RendererSubmit(LaiueMeshWorldRendererV1 *renderer,
+                               const LaiueMeshPositionV1 *renderOrigin,
+                               const float viewProjection[16])
+{
+    float planes[6][4] = {{0.0f}};
+    if (!DrawInputs(renderer, renderOrigin, viewProjection, planes) ||
+        renderer->device->structSize <
+            offsetof(LaiueGraphicsDeviceV2, submit) + sizeof(renderer->device->submit) ||
+        renderer->device->submit == NULL)
+        return 0u;
+    renderer->stats.instanceDrawCalls = 0u;
+    for (RenderSharedGeometry *geometry = renderer->shared; geometry != NULL;
+         geometry = geometry->next)
+        geometry->scratchCount = 0u;
+    uint32_t culled = 0u;
+    for (uint32_t c = 0u; c < renderer->cellCount; ++c)
+    {
+        const RenderCell *cell = &renderer->cells[c];
+        if (cell->batchCount == 0u && cell->placementCount == 0u)
+            continue;
+        float offset[3];
+        if (!CellVisible(renderer, cell, renderOrigin, viewProjection != NULL, planes, offset))
+        {
+            ++culled;
+            continue;
+        }
+        for (uint32_t b = 0u; b < cell->batchCount; ++b)
+        {
+            const RenderBatch *batch = &cell->batches[b];
+            LaiueGraphicsDrawItemV2 item;
+            FillDrawItem(renderer, &item, batch->buffer, 0u, 0u, batch->vertexCount,
+                         batch->material, offset, 1.0f);
+            if (renderer->device->submit(renderer->device, &item, 1u) == 0u)
+                return 0u;
+        }
+        for (uint32_t p = 0u; p < cell->placementCount; ++p)
+        {
+            const RenderPlacement *placement = &cell->placements[p];
+            RenderSharedGeometry *geometry = placement->geometry;
+            const uint32_t slot = geometry->scratchOffset + geometry->scratchCount++;
+            if (slot >= renderer->submissionInstanceCapacity)
+                return 0u;
+            LaiueGraphicsInstanceV2 *instance = &renderer->submissionInstances[slot];
+            memset(instance, 0, sizeof(*instance));
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                instance->originRelative[axis] = offset[axis] + placement->origin[axis];
+            instance->scale = placement->scale;
+        }
+    }
+    for (RenderSharedGeometry *geometry = renderer->shared; geometry != NULL;
+         geometry = geometry->next)
+    {
+        if (geometry->scratchCount == 0u)
+            continue;
+        for (uint32_t p = 0u; p < geometry->partCount; ++p)
+        {
+            LaiueGraphicsDrawItemV2 item;
+            const float origin[3] = {0.0f, 0.0f, 0.0f};
+            const LaiueGraphicsInstanceV2 *instances =
+                renderer->submissionInstances + geometry->scratchOffset;
+            const bool single = geometry->scratchCount == 1u;
+            FillDrawItem(renderer, &item, geometry->vertexBuffer, geometry->indexBuffer,
+                         geometry->parts[p].firstIndex, geometry->parts[p].indexCount,
+                         geometry->parts[p].material, single ? instances->originRelative : origin,
+                         single ? instances->scale : 1.0f);
+            const uint32_t submitted =
+                single ? renderer->device->submit(renderer->device, &item, 1u)
+                       : renderer->device->submitInstances(renderer->device, &item, instances,
+                                                           geometry->scratchCount);
+            if (submitted == 0u)
+                return 0u;
+            renderer->stats.instanceDrawCalls += single ? 0u : 1u;
+        }
+    }
+    renderer->stats.culled = culled;
+    return 1u;
+}
+
 static uint32_t RendererStats(const LaiueMeshWorldRendererV1 *renderer,
                               LaiueMeshRenderStatsV1 *outStats)
 {
     if (renderer == NULL || outStats == NULL ||
-        outStats->structSize < sizeof(LaiueMeshRenderStatsV1))
+        outStats->structSize < LAIUE_MESH_RENDER_STATS_V1_LEGACY_SIZE)
         return 0u;
-    *outStats = renderer->stats;
+    const uint32_t bytes = outStats->structSize < sizeof(*outStats) ? outStats->structSize
+                                                                    : (uint32_t)sizeof(*outStats);
+    memcpy(outStats, &renderer->stats, bytes);
+    outStats->structSize = bytes;
     return 1u;
 }
 
@@ -1023,6 +1661,7 @@ static const LaiueMeshWorldRenderServiceV1 g_service = {
     .update = RendererUpdate,
     .draws = RendererDraws,
     .stats = RendererStats,
+    .submit = RendererSubmit,
 };
 
 const LaiueMeshWorldRenderServiceV1 *LaiueMeshWorldRenderGetStaticServiceV1(void)

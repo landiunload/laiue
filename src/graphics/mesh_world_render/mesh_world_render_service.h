@@ -1,17 +1,19 @@
 #pragma once
 
-/* Draws a laiue.mesh_world through the public graphics device.  Every cell
- * near the camera becomes a few vertex buffers, one per material, with the
- * instances' geometry transformed into the cell's frame and the sun and
- * ambient light baked into the vertex colours; the generic graphics
- * pipeline draws them unlit.  A cell is rebuilt only when its revision
- * changes, so a static world costs nothing after the first frames.
- *
+/* Draws a laiue.mesh_world through the public graphics device. Native index
+ * and instance
+ * providers share eligible models repeated across pure cells,
+ * with one visible registered
+ * instance per cell. Other placements are baked
+ * into cell/material vertex batches. Generic
+ * graphics draws both paths unlit.
+ * A cell is rebuilt only when its revision or geometry
+ * generation changes.
  * The adapter knows neither model files nor textures: the application
- * registers each model's geometry (a model pack view has the same vertex
- * layout) and binds each material id to a texture and sampler it created.
- * One renderer is used from one thread; update() must not run between the
- * device's beginFrame and endFrame. */
+ * registers each model's geometry
+ * (a model pack view has the same vertex layout) and binds each
+ * material id to a texture and sampler it created. One renderer is used from one thread; update()
+ * must not run between the device's beginFrame and endFrame. */
 
 #include "api.h"
 #include "graphics/graphics_device_v2.h"
@@ -72,11 +74,11 @@ typedef struct LaiueMeshWorldRendererConfigV1
     const LaiueMeshWorldServiceV1 *worldService;
     LaiueMeshWorldV1 *world;
     LaiueGraphicsDeviceV2 *device;
-    /* Cached vertex buffers; 0 selects 1024. Cells beyond the budget are
-     * left undrawn,
-     * farthest first. A transactional rebuild briefly holds
-     * its replacement buffers as well,
-     * so a failed upload keeps the cache. */
+    /* Cached vertex and index buffers together; 0 selects 1024. Cells beyond
+     * the budget are
+     * left undrawn, farthest first. A transactional rebuild
+     * briefly holds replacement
+     * buffers too, so failed uploads keep the cache. */
     uint32_t maximumBuffers;
 } LaiueMeshWorldRendererConfigV1;
 
@@ -91,7 +93,15 @@ typedef struct LaiueMeshRenderStatsV1
     uint32_t overBudget; /* cells evicted or refused a rebuild by the buffer budget */
     uint32_t drawn;      /* draw items written by the last draws call */
     uint32_t culled;     /* cells the frustum rejected in the last draws call */
+    uint32_t reservedLegacyPadding; /* preserves the original 48-byte prefix */
+    /* Optional tail. buffers keeps its original vertex-buffer meaning. */
+    uint32_t indexBuffers;
+    uint32_t instances;         /* placements using shared model geometry */
+    uint32_t instanceDrawCalls; /* successful native instance calls in the last submit */
 } LaiueMeshRenderStatsV1;
+
+#define LAIUE_MESH_RENDER_STATS_V1_LEGACY_SIZE                                                     \
+    ((uint32_t)offsetof(LaiueMeshRenderStatsV1, indexBuffers))
 
 typedef struct LaiueMeshWorldRenderServiceV1
 {
@@ -133,7 +143,24 @@ typedef struct LaiueMeshWorldRenderServiceV1
                       uint32_t capacity, uint32_t *outCount);
     uint32_t (*stats)(const LaiueMeshWorldRendererV1 *renderer, LaiueMeshRenderStatsV1 *outStats);
     uintptr_t reserved[8];
+    /* Set the device camera before beginFrame, then call this after beginFrame
+     * and after
+     * update prepared scratch and uploads. Visible shared placements
+     * are grouped per model
+     * generation and material; baked cells use ordinary
+     * device submit. This call allocates
+     * no adapter-owned CPU scratch; providers
+     * may allocate GPU resources on first use. A
+     * zero result may follow draws
+     * already recorded in this call, without rollback or
+     * whole-frame atomicity. */
+    uint32_t (*submit)(LaiueMeshWorldRendererV1 *renderer, const LaiueMeshPositionV1 *renderOrigin,
+                       const float viewProjection[16]);
 } LaiueMeshWorldRenderServiceV1;
+
+#define LAIUE_MESH_WORLD_RENDER_SERVICE_V1_SUBMIT_SIZE                                             \
+    ((uint32_t)(offsetof(LaiueMeshWorldRenderServiceV1, submit) +                                  \
+                sizeof(((LaiueMeshWorldRenderServiceV1 *)0)->submit)))
 
 LAIUE_MESH_WORLD_RENDER_API const LaiueModuleApiV1 *LaiueMeshWorldRenderGetStaticModuleApiV1(void);
 LAIUE_MESH_WORLD_RENDER_API const LaiueMeshWorldRenderServiceV1 *

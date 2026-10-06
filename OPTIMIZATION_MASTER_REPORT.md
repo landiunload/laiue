@@ -915,4 +915,168 @@ harness проверял поле сразу после записи и не с�
 ошибке восстановления. Два полных локальных Android-сценария — PASS:
 исходный набор `1/1/enabled` и отсутствующие настройки
 `null/null/default` восстановлены точно, с сохранением игрового состояния.
-Повтор всей CI-матрицы обязателен до следующего этапа.
+Повтор CI `37346982913` коммита `7bba3aa` завершился успешно: 15/15
+заданий. Android сохранил игровое состояние, прошёл 12 кадров, rotation и
+HOME/resume; исходные настройки `0/1/default` восстановлены точно за одну
+попытку. Сохранённые CI-логи не содержат compiler/linker warnings. Логи и
+отчёт: `D:/build/laiue/step2/ci-audit/37346982913`. Второй этап завершён;
+реализация третьего началась после этого результата.
+
+## Раунд 30: этап 3 — indexed geometry и GPU instancing, 2026-10-06
+
+D3D12 и Vulkan используют независимые GPU index buffers и native indexed
+commands. Один IB обслуживает несколько VB и диапазонов; signed base vertex
+проверяется без переполнения. Индексы не раскрываются в новые вершины внутри
+submit. Поддержаны транзакционные partial uploads, уничтожение после записи
+команд и переполнение очереди deferred ranges. Vulkan учитывает реальный
+uniform alignment, storage-buffer range и предел сырых uint32 indices.
+D3D12 shader учитывает отличие VertexID от base vertex; переключение
+generic/voxel восстанавливает scene constants.
+
+Optional V2 tail сообщает capabilities и принимает 32-байтовые placements.
+Размер DrawItemV2 сохранён. Старые таблицы и короткие prefix проверяются до
+доступа к context/callback. Контракт — `docs/graphics_geometry.md`.
+
+Walk хранит четыре вершины на quad и общий topology IB на набор чанков.
+Mock-сцена Q=27, M=6: requested geometry 3888 → 2736 B (−29,63%). Сбой
+создания/загрузки сохраняет полный прежний набор, scratch переживает rebase.
+Мир моделей разделяет VB/IB лишь для одинаковой модели в двух или более
+pure-ячейках с одним экземпляром. Unique/mixed/multiple-instance cells остаются
+запечёнными по материалу; поворот, nonuniform/negative scale или несовпадение
+запечённого света сохраняют старый путь. Восемь разных моделей в одной ячейке
+сохраняют один прежний batch.
+
+Adapter submit группирует placements по модели/материалу. После отсечения
+singleton идёт обычным indexed submit без instance ring. Adapter-owned CPU
+scratch выделяется в update; GPU provider может создавать свои ресурсы при
+первом использовании. Warm update читает одну revision на ячейку, без
+повторного census моделей/нормалей. Provider failure возвращает 0 и сохраняет
+cache для retry; уже записанные команды не откатываются.
+
+### CPU и ресурсы
+
+Baseline — `7bba3aa`, сохранённые Release DLL; оба варианта получают один и тот
+же benchmark EXE. MSVC Release x64, RTX 4060, driver 32.0.16.1714. Во время
+замеров нет эмулятора, сборок или других тестов движка; нагрузка ОС не изолирована.
+Samples проверяют число записанных draws и реальные пиксели. CPU submit не FPS.
+
+Generic benchmark: семь чередующихся пар, по девять samples; длинный режим
+усредняет восемь кадров записи, не более 8192 scalar commands в одном кадре.
+Begin/end, GPU execution, capture и fence waits вне таймера. Большинство
+placements аппаратно отсекается за границей кадра; измеряется CPU запись
+всех команд, а не GPU-throughput сцены. Медианы quad, ns на отправку:
+
+| Placements | Старый scalar | Native scalar | Native batch |
+| ---: | ---: | ---: | ---: |
+| 1 | 75 | 75 | 81 |
+| 32 | 2534 | 2499 | 250 |
+| 256 | 19640 | 19856 | 1156 |
+| 4096 | 310925 | 316418 | 18268 |
+
+Попарная медиана выигрыша batch на 32–4096 placements — **−90,08…−93,91%**.
+Scalar draws не гарантируют ускорения: quad при 1/32/256/4096 placements
+даёт +1,33/−6,69/+3,99/+3,87%, с широкими диапазонами пар
+(4096: −20,63…+14,91%). Triangle: +5,71/+6,43/+2,02/+5,77%.
+Это измеренная стоимость отдельных scalar indexed submissions, которую
+нельзя выдавать за улучшение. Batch из одного placement тоже медленнее;
+поэтому адаптер выбирает для singleton обычный submit.
+
+Quad: shadow остаётся 120 B, occupied geometry 144 → 128 B (−11,11%),
+requested payload 144 → 120 B (−16,67%). Triangle без повторных вершин:
+shadow 84 B в обеих версиях, occupied geometry 80 → 96 B (+20%).
+Native indices не обещают экономии каждому мешу. Capacity пула в обоих
+примерах остаётся 4 MiB.
+
+Реальный mesh_world_render caller: девять чередующихся пар. Warm выборка
+выполняет 8192 updates; submit — 128 повторов для 40 pure cells, 8192 для
+unique8. Camera/culling/budget/material совпадают, полные draws проверены;
+image hash обоих вариантов `11654447198448286501`.
+
+| Сцена | Warm update, ns | Submit, ns | Requested geometry | Draws |
+| --- | ---: | ---: | ---: | ---: |
+| Pure40, baseline | 3006 | 2283 | 5760 B | 40 |
+| Pure40, native | 3171 | 432 | 120 B | 1 |
+| Unique8, baseline | 86 | 74 | 1152 B | 1 |
+| Unique8, native | 88 | 72 | 1152 B | 1 |
+
+Pure40: warm update **+5,49%**, submit **−81,08%**. Попарная медиана изменения
+суммы двух измеренных CPU-компонентов **−32,81%**, все пары быстрее
+(−46,65…−29,49%). Requested geometry и shadow −97,92%; occupied geometry
+5760 → 128 B (−97,78%), handles 40 → 2. Дополнительно передаётся 1280 B
+instances на submit. Cold update этой серии 150400 → 166600 ns (+10,77%);
+короткие cold показатели меняют знак между сериями, обещания ускорения
+подготовки нет. Unique8 сохраняет полный прежний batch; попарная медиана
+суммы update/submit 0%, диапазон −24,06…+7,69% для очень короткого пути.
+
+Экономия payload не равна общей памяти. Точный MSVC sizeof относительно HEAD:
+DeviceState 647576 → 565672 B (−81904); Vulkan Renderer +17464 B;
+D3D12 Renderer +7392 B. Сумма двух fixed objects уменьшается на 64440 B для
+Vulkan или 74512 B для D3D12, без heap allocations. RenderCell 96 → 128 B
+(+32 на cell), adapter +48 B; placement 24 B, scratch 32 B × capacity
+(40 placements дают capacity64, 2048 B). SharedGeometry 104 B + 12 B на
+material range; IB metadata 32 B плюс wrapper 48 B Vulkan / 40 B D3D12.
+Vertex wrapper растёт на 28/24 B. Counters shadow/geometry исключают эти
+metadata, driver, textures и instance rings. Общая экономия RSS/VRAM
+на основании этих counters не заявляется.
+
+### Игровой сценарий
+
+Семь чередующихся пар Windows Release: текущий walk EXE со старыми или
+текущими DLL, одинаковые assets и 1280 deterministic ticks. Все 14 сценариев
+прошли девять checkpoints: ходьба/спринт/прыжок/поворот/first-person,
+break/place/rebase/settle, 4315 mm движения, без rejected/dropped frames.
+Попарные медианы: GPU mean interval **−11,19%** (все пары −20,60…−2,13%),
+GPU p95 **−25,36%**. Frame wall mean −1,69% (−5,47…+4,76%), p99 −1,60%:
+устойчивое улучшение всего кадра не установлено. Wall включает present/vsync,
+явные captures и screenshot holds исключены. На другой GPU эти проценты
+не подтверждены.
+
+Sampled peak occupied geometry 275040 → 138336 B (−49,70%), включая
+отложенные освобождения: выборочный пик сценария, не полная VRAM.
+Shadow 138960 → 138336 B (−0,45%). Process peak working set практически
+не меняется: попарная медиана −0,016%, RSS saving не заявляется.
+
+### Проверки и границы
+
+Чистые MSVC Debug/Release: по 99/99 CTest, shader fallback verification PASS.
+После расширения callback-failure regressions оба mesh renderer tests
+повторно прошли в обоих профилях. Vulkan geometry и window/lifecycle
+дополнительно прошли под Khronos validation. GPU regression проверяет первый
+indexed frame, обе половины quad, ranges/base vertex, текстуры,
+scalar/batch pixel equality, ring offsets, partial uploads, foreign/stale
+handles, короткие таблицы и deferred/upload budgets. Старый renderer
+проваливает новый first-frame test. Новый mesh demo работает с настоящей
+старой 136-byte service table; mock проверяет прежний 48-byte stats prefix.
+
+Оконные Debug/Release сценарии: по девять GPU captures, PASS. По три fallback
+профиля без voxel/physics/обоих actors, PASS. Windows walk imports только
+KERNEL32. Android x86_64 и ARM64 native builds без предупреждений, APK v3
+signature/zipalign/embedded SO hashes подтверждены. Runtime API35 emulator:
+12 PNG, девять ACK, rotation и HOME/resume, gameplay state сохранён; три
+настройки 1/1/enabled восстановлены точно. Portrait/landscape и desktop
+кадры просмотрены: текстуры и геометрия присутствуют. Это не сертификат
+анатомии/походки или запуска на физическом телефоне.
+
+Неудачные локальные попытки сохранены: stale frame_check пересобран после
+исправления локального Ninja/MSVC include-prefix cache; тот же PNG проходит
+после чистой сборки. Ранний Android install запущен до появления package
+service; окончательный сценарий начат после sys.boot_completed=1.
+Это не исправления игры и не PASS неудачных попыток.
+
+Архитектура (203 files), actionlint, changed-line format и diff check — PASS;
+финальные engine build/link logs без warnings/errors. Основная CI-матрица
+проверяется после push; четвёртый этап не начинается до её успеха.
+Локальный emulator SDK оставляет 19 WARNING: 16 SwiftShader feature-query
+сообщений и три startup/shutdown diagnostics. Они сохранены в
+`emulator-verified-stdout.log`/`emulator-verified-stderr.log`, не скрыты;
+чистота compiler/linker logs не означает отсутствие diagnostics внешнего SDK.
+Оставшиеся этапы: ragdoll limits, animation/skinning, world budgets/LOD,
+platform adapters, streaming audio, selected-mod isolation.
+
+Raw data: `D:/build/laiue/step3/geometry-paired-long-bounded-quad`,
+`geometry-paired-long-bounded-triangle`, `mesh-world-render-long`, `walk-paired`.
+Captures: `windows-capture-Debug`, `windows-capture-Release`,
+`android-captures-booted`. Layout probes: `D:/build/laiue/step3/private-layouts`;
+итоги замеров: `measurements-summary.json`. Build/test/shader logs в той же
+папке. Этап добавляет возможности и код; сокращение всего исходного кода
+не заявляется.
