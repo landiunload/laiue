@@ -38,8 +38,15 @@ D3D12/Vulkan, общий topology IB в walk, conservative shared geometry AUTO
 выигрыша wall time/RSS не установлено. Отдельные scalar submissions и
 подготовка shared cache имеют стоимость; проценты и границы — раунд 30
 общего отчёта. Старый 136-byte render service проверен настоящим старым DLL.
-Перед четвёртым этапом дождаться CI именно коммита этапа 3; зелёный CI
-предыдущего HEAD не заменяет эту проверку.
+Первый CI этапа 3 (`b9e9a41`, run `37495330448`) выявил headless helper,
+Clang fast-math finite checks и потерю ранней logcat history. Исправлены
+также owner-first guards старых draw entrypoints: guard-page regression
+падала до исправления, после него проходит. Полные Clang Debug/Release
+сборки и по 19 затронутых тестов Clang/MSVC в каждом профиле — PASS;
+свежий Android APK повторно прошёл 12 PNG, rotation и HOME/resume.
+Дополнительные замеры и границы — дополнение к раунду 30 общего отчёта.
+Перед четвёртым этапом дождаться повторного CI именно исправленного
+коммита этапа 3; зелёный CI предыдущего HEAD не заменяет эту проверку.
 
 Далее: суставы ragdoll;
 анимации/skinning; бюджеты мира/LOD; платформенные adapters; streaming audio;

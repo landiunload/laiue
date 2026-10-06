@@ -497,6 +497,39 @@ static void Reject(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsDrawItemV2 
     Expect(device->submitInstances(device, item, &valid, 1u) == 0u, reason);
 }
 
+static void RejectNonfiniteFields(LaiueGraphicsDeviceV2 *device,
+                                  const LaiueGraphicsDrawItemV2 *item)
+{
+    static const volatile uint32_t badBits[] = {
+        UINT32_C(0x7f800000), UINT32_C(0xff800000), UINT32_C(0x7fc00000), UINT32_C(0xffc00000),
+        UINT32_C(0x7f800001), UINT32_C(0xff800001), UINT32_C(0x7fffffff), UINT32_C(0xffffffff)};
+    for (uint32_t encoding = 0u; encoding < sizeof(badBits) / sizeof(badBits[0]); ++encoding)
+    {
+        const uint32_t bits = badBits[encoding];
+        for (uint32_t field = 0u; field < 8u; ++field)
+        {
+            LaiueGraphicsInstanceV2 instance = {.scale = 1.0f};
+            float *destination = field < 3u    ? &instance.originRelative[field]
+                                 : field == 3u ? &instance.scale
+                                               : &instance.rotation[field - 4u];
+            // Copy runtime bits into caller memory without forming a float argument.
+            memcpy(destination, &bits, sizeof(bits));
+            Expect(device->submitInstances(device, item, &instance, 1u) == 0u,
+                   "both signs of infinity and NaN are rejected in every instance field");
+        }
+        for (uint32_t field = 0u; field < 4u; ++field)
+        {
+            LaiueGraphicsDrawItemV2 invalid = *item;
+            LaiueGraphicsInstanceV2 instance = {.scale = 1.0f};
+            float *destination = field < 3u ? &invalid.originRelative[field] : &invalid.scale;
+            memcpy(destination, &bits, sizeof(bits));
+            Expect(device->submit(device, &invalid, 1u) == 0u &&
+                       device->submitInstances(device, &invalid, &instance, 1u) == 0u,
+                   "both ordinary and instance draws reject nonfinite base transforms");
+        }
+    }
+}
+
 static void InvalidGeometry(LaiueGraphicsDeviceV2 *device, LaiueGraphicsDeviceV2 *other,
                             LaiueGraphicsHandle vb, LaiueGraphicsHandle ib)
 {
@@ -563,6 +596,7 @@ static void InvalidGeometry(LaiueGraphicsDeviceV2 *device, LaiueGraphicsDeviceV2
     valid.scale = invalid.value;
     Expect(device->submitInstances(device, &item, &valid, 1u) == 0u,
            "nonfinite instance scale is rejected before recording");
+    RejectNonfiniteFields(device, &item);
     Capture(device, 0u);
     device->destroyHandle(device, replacement);
     other->destroyHandle(other, foreign);

@@ -330,10 +330,12 @@ static bool DeviceOptionalBindingsAreLive(const LaiueGraphicsDeviceState *state,
            (sampler == 0u || DeviceHandleIsLive(state, sampler, DEVICE_HANDLE_SAMPLER));
 }
 
-static bool DeviceFloatIsFinite(float value)
+static bool DeviceFloatIsFinite(const float *value)
 {
+    // Inspect caller bytes before a floating load: fast FP may assume a
+    // by-value float is finite and fold even a memcpy-based bit check.
     uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
+    memcpy(&bits, value, sizeof(bits));
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
@@ -991,7 +993,7 @@ static bool DeviceDrawMesh(const LaiueGraphicsDeviceState *state,
 
 static bool DeviceDrawGeometry(LaiueGraphicsDeviceState *state, LaiueGraphicsHandle vertexBuffer,
                                LaiueGraphicsHandle indexBuffer, uint32_t first, uint32_t count,
-                               int32_t vertexOffset, const float origin[3], float scale,
+                               int32_t vertexOffset, const float origin[3], const float *scale,
                                const RendererTexture *texture, const RendererSampler *sampler,
                                const LaiueGraphicsInstanceV2 *instances, uint32_t instanceCount)
 {
@@ -999,11 +1001,11 @@ static bool DeviceDrawGeometry(LaiueGraphicsDeviceState *state, LaiueGraphicsHan
         return false;
     const uint32_t vertexSlot = DeviceHandleSlot(vertexBuffer) - 1u;
     if (!DeviceBufferIsGeneric(state, vertexSlot) || state->meshes[vertexSlot] == NULL ||
-        !DeviceFloatIsFinite(scale))
+        (scale != NULL && !DeviceFloatIsFinite(scale)))
         return false;
     RendererGeometryDraw draw = {.structSize = sizeof(draw),
                                  .mesh = state->meshes[vertexSlot],
-                                 .scale = scale == 0.0f ? 1.0f : scale,
+                                 .scale = scale == NULL || *scale == 0.0f ? 1.0f : *scale,
                                  .texture = texture,
                                  .sampler = sampler,
                                  .instances = instances,
@@ -1011,7 +1013,7 @@ static bool DeviceDrawGeometry(LaiueGraphicsDeviceState *state, LaiueGraphicsHan
     if (origin != NULL)
         for (uint32_t axis = 0u; axis < 3u; ++axis)
         {
-            if (!DeviceFloatIsFinite(origin[axis]))
+            if (!DeviceFloatIsFinite(&origin[axis]))
                 return false;
             draw.originRelative[axis] = origin[axis];
         }
@@ -1066,7 +1068,7 @@ static uint32_t DeviceSubmit(LaiueGraphicsDeviceV1 *device,
         {
             if (!DeviceDrawGeometry(state, item->vertexBuffer, item->indexBuffer, item->firstIndex,
                                     item->indexBuffer != 0u ? item->indexCount : UINT32_MAX,
-                                    item->vertexOffset, NULL, 1.0f, NULL, NULL, NULL, 0u))
+                                    item->vertexOffset, NULL, NULL, NULL, NULL, NULL, 0u))
                 return 0u;
         }
         else if (item->indexBuffer != 0u ||
@@ -1317,7 +1319,7 @@ static uint32_t DeviceV2Submit(LaiueGraphicsDeviceV2 *device,
         {
             if (!DeviceDrawGeometry(state, item->vertexBuffer, item->indexBuffer, item->firstIndex,
                                     item->indexCount, item->vertexOffset, item->originRelative,
-                                    item->scale, textureResource, samplerResource, NULL, 0u))
+                                    &item->scale, textureResource, samplerResource, NULL, 0u))
                 return 0u;
         }
         else if (item->indexBuffer != 0u ||
@@ -1366,17 +1368,17 @@ static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *device,
     for (uint32_t index = 0u; index < instanceCount; ++index)
     {
         const LaiueGraphicsInstanceV2 *instance = &instances[index];
-        if (!DeviceFloatIsFinite(instance->scale))
+        if (!DeviceFloatIsFinite(&instance->scale))
             return 0u;
         for (uint32_t axis = 0u; axis < 3u; ++axis)
-            if (!DeviceFloatIsFinite(instance->originRelative[axis]))
+            if (!DeviceFloatIsFinite(&instance->originRelative[axis]))
                 return 0u;
         double lengthSquared = 0.0;
         for (uint32_t component = 0u; component < 4u; ++component)
         {
-            const float value = instance->rotation[component];
-            if (!DeviceFloatIsFinite(value))
+            if (!DeviceFloatIsFinite(&instance->rotation[component]))
                 return 0u;
+            const float value = instance->rotation[component];
             lengthSquared += (double)value * (double)value;
         }
         if (lengthSquared != 0.0 && (lengthSquared < 0.99999 || lengthSquared > 1.00001))
@@ -1392,8 +1394,9 @@ static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *device,
             : (const RendererSampler *)state->backendResources[DeviceHandleSlot(sampler) - 1u];
     if ((texture != 0u && textureResource == NULL) || (sampler != 0u && samplerResource == NULL) ||
         !DeviceDrawGeometry(state, item->vertexBuffer, item->indexBuffer, item->firstIndex,
-                            item->indexCount, item->vertexOffset, item->originRelative, item->scale,
-                            textureResource, samplerResource, instances, instanceCount))
+                            item->indexCount, item->vertexOffset, item->originRelative,
+                            &item->scale, textureResource, samplerResource, instances,
+                            instanceCount))
         return 0u;
     ++state->submittedItems;
     return 1u;

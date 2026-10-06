@@ -1080,3 +1080,71 @@ Captures: `windows-capture-Debug`, `windows-capture-Release`,
 итоги замеров: `measurements-summary.json`. Build/test/shader logs в той же
 папке. Этап добавляет возможности и код; сокращение всего исходного кода
 не заявляется.
+
+### Исправления после первого CI этапа 3
+
+CI `37495330448` для `b9e9a41` завершился с ошибкой: успешны 5/15 jobs.
+Следующий этап не начинался. Linux/macOS headless сборки вызывали `HasField`,
+скрытый условием backend; helper теперь доступен в этих сборках. Clang
+fast-math устранял finite check by-value float даже с memcpy: runtime
+воспроизведение принимает 8/8 неконечных кодировок до исправления. Теперь
+проверяются байты исходного поля до float load: отклонены 64/64 неконечных
+instance fields, сохранены конечные значения. GPU regression дополнительно
+проверяет 64 draw transform rejections через обычный и instanced submit.
+Compiler FP mode, ABI и прежние проверки не ослаблены.
+
+Android native scenario первого CI прошёл 1280 ticks/9 checkpoints/9 ACK,
+но harness потерял раннее `presented` после вытеснения строк из logcat ring.
+Он сохраняет наблюдавшиеся строки с ordinal full-line dedup, прежним PID/run
+filter и свежими lifecycle baselines. Offline regression использует настоящий
+усечённый CI log; проверяет overlap ACK, чужой run, ошибку процесса и порядок
+rotation/resume. События, потерянные до первого poll, не восстанавливаются.
+Rotation/HOME первого неудачного CI до ошибки не выполнялись.
+
+Ревью выявило чтение `mesh->generic` до owner check в старых voxel draw
+entrypoints. Backend layouts различаются: чужой меш мог вызвать чтение за
+границами объекта. Четыре entrypoints сначала сравнивают общий owner prefix;
+Vulkan также отвергает NULL origin. Guard-page test предоставляет только
+читаемый owner prefix: до исправления реальный CTest завершился SEGFAULT,
+после проходит. Проверены оба backend направления, generic wrapper,
+собственный draw после отказов и backend raw NaN/Inf. Guard не обещает
+безопасности dangling pointers; low-level instance records требуют валидного
+caller, полный внешний контроль полей выполняет facade.
+
+После исправлений: полные MSVC incremental и Clang clean Debug/Release
+builds без compiler/linker warnings; по 19/19 затронутых CTest в каждом из
+четырёх профилей, без skips. Это scoped повторная проверка, прежние 99/99 —
+отдельный результат. Android x86_64/API35 и ARM64/API28 native builds без
+предупреждений; свежий APK подписан v3. Эмулятор: 1280 ticks, 1355 frames,
+9 checkpoints/ACK, 12 проверенных PNG, rotation и HOME/resume с неизменным
+gameplay state. Настройки 1/1/enabled восстановлены точно с первой попытки.
+Portrait/landscape просмотрены: текстуры и модель присутствуют; качество
+анатомии не сертифицировано. Parse, architecture, actionlint и diff check —
+PASS; независимое ревью не обнаружило blockers.
+
+Повторный CPU A/B после остановки эмулятора/сборок: семь чередующихся пар
+generic, девять mesh renderer, прежний immutable baseline `7bba3aa`.
+Quad batch 32–4096 placements: попарная медиана −92,31…−95,33%; scalar при
+1/32/256/4096: 0/−3,04/−6,08/+1,26%, широкий разброс пар
+(singleton −8,75…+42,47%). Triangle scalar: −1,33/−4,81/−6,87/−1,85%;
+batch singleton +4,11%. Ускорение каждого scalar path не установлено.
+Pure40 warm update 3034 → 3160 ns, попарная медиана **+5,13%**;
+submit 2355 → 404 ns (**−82,86%**). Медиана изменения суммы измеренных
+компонентов **−32,59%**, все пары −56,45…−30,87%. Память/handles и image hash
+совпадают с прежней серией. Unique8 сохраняет старый batch; диапазон пар
+суммы −42,86…+79,14% при стоимости около 170 ns не подтверждает устойчивого
+ускорения. Это не FPS. Игровой семипарный A/B выше измерен до исправления
+и полностью заново не выполнялся; новая серия не заменяет предыдущую.
+
+Новые SDK diagnostics: локальный эмулятор 19 WARNING (16 SwiftShader,
+3 startup/shutdown), 0 ERROR. Первый CI artifact содержит 20 WARNING и
+1 teardown ERROR `stop: Not implemented` после запроса shutdown; cleanup
+прошёл. Полные Android x86_64/ARM64 job logs не содержат compiler или
+packaging warnings. Эти внешние diagnostics сохранены, не скрыты; полной
+чистоты emulator SDK не заявляется.
+
+Данные: `D:/build/laiue/step3/geometry-ci-fix-quad`,
+`geometry-ci-fix-triangle`, `mesh-world-render-ci-fix`,
+`ci-fix-measurements-summary.json`, `ci-fix-*-build.log`,
+`ci-fix-*-test.log`, `ci-fix-android-captures`, `ci-audit/37495330448`.
+Повторный CI проверяется после push исправления; этап 4 остаётся за барьером.

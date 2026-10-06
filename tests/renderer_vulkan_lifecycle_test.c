@@ -203,6 +203,40 @@ static void CaptureWithSize(Renderer *renderer, void *pixels, uint32_t expectedW
            "the captured frame must follow the requested size");
 }
 
+static void RejectGuardedForeignMesh(Renderer *renderer, Renderer *foreignOwner)
+{
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    const size_t pageSize = info.dwPageSize;
+    uint8_t *pages = VirtualAlloc(NULL, 2u * pageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Expect(pages != NULL, "the foreign mesh guard pages could not be allocated");
+    DWORD previous = 0u;
+    Expect(VirtualProtect(pages + pageSize, pageSize, PAGE_NOACCESS, &previous) != 0,
+           "the foreign mesh guard page could not be protected");
+    // Opaque backend layouts share an owner prefix, but their remaining fields
+    // differ. A foreign owner must be rejected before reading any such field.
+    Renderer **prefix = (Renderer **)(pages + pageSize - sizeof(*prefix));
+    *prefix = foreignOwner;
+    const RendererMesh *foreign = (const RendererMesh *)prefix;
+    const float origin[3] = {0.0f, 0.0f, 0.0f};
+    const RendererMeshInstance placement = {.scale = 1.0f};
+    RendererDrawMesh(renderer, foreign, origin);
+    RendererDrawMeshInstances(renderer, foreign, &placement, 1u);
+    RendererDrawGenericMeshRangeBound(renderer, foreign, origin, 1.0f, 0u, 3u, NULL, NULL);
+    const RendererGeometryDraw draw = {
+        .structSize = sizeof(draw), .mesh = foreign, .elementCount = 3u, .scale = 1.0f};
+    Expect(!RendererDrawGeometry(renderer, &draw), "the guarded foreign mesh must be rejected");
+    Expect(VirtualFree(pages, 0u, MEM_RELEASE) != 0, "the foreign guard pages must be released");
+}
+
+static void WriteFloatBits(float *destination, uint32_t bits)
+{
+    uint8_t *out = (uint8_t *)destination;
+    const uint8_t *in = (const uint8_t *)&bits;
+    for (size_t byte = 0u; byte < sizeof(bits); ++byte)
+        out[byte] = in[byte];
+}
+
 static RendererMesh *CreateUnitMesh(Renderer *renderer)
 {
     ChunkQuad quad = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
@@ -568,6 +602,7 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
 
         Renderer *owners[2] = {d3d12, vulkan};
         RendererMesh *genericMeshes[2] = {d3d12Generic, vulkanGeneric};
+        RendererMesh *voxelMeshes[2] = {d3d12Mesh, vulkanMesh};
         RendererIndexBuffer *indexBuffers[2] = {d3d12Indices, vulkanIndices};
         for (uint32_t owner = 0u; owner < 2u; ++owner)
         {
@@ -578,6 +613,12 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
             Expect(RendererBeginFrame(owners[owner], &setup),
                    "the foreign geometry rejection frame could not begin");
             RendererBeginScenePass(owners[owner], 0u);
+            RejectGuardedForeignMesh(owners[owner], owners[1u - owner]);
+            const float origin[3] = {0.0f, 0.0f, 0.0f};
+            const RendererMeshInstance placement = {.scale = 1.0f};
+            RendererDrawMesh(owners[owner], voxelMeshes[1u - owner], origin);
+            RendererDrawMeshInstances(owners[owner], voxelMeshes[1u - owner], &placement, 1u);
+            RendererDrawMesh(owners[owner], voxelMeshes[owner], NULL);
             Expect(!RendererDrawGeometry(owners[owner], &draw),
                    "generic geometry from another backend must be rejected");
             draw.mesh = genericMeshes[owner];
@@ -585,6 +626,14 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
             Expect(!RendererDrawGeometry(owners[owner], &draw),
                    "indices from another backend must be rejected");
             draw.indexBuffer = indexBuffers[owner];
+            WriteFloatBits(&draw.scale, UINT32_C(0x7fc00000));
+            Expect(!RendererDrawGeometry(owners[owner], &draw),
+                   "raw NaN scale must be rejected before any floating-point loads");
+            draw.scale = 1.0f;
+            WriteFloatBits(&draw.originRelative[0], UINT32_C(0x7f800000));
+            Expect(!RendererDrawGeometry(owners[owner], &draw),
+                   "raw infinite origin must be rejected before any floating-point loads");
+            draw.originRelative[0] = 0.0f;
             Expect(RendererDrawGeometry(owners[owner], &draw),
                    "own geometry must remain usable after foreign handle rejection");
             Expect(RendererEndFrame(owners[owner]),

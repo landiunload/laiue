@@ -3000,19 +3000,19 @@ static void BindGenericSceneState(Renderer *renderer)
     SetPipelineStateCached(renderer, renderer->genericPipelineState);
 }
 
-static bool GeometryFloatIsFinite(float value)
+static bool GeometryFloatIsFinite(const float *value)
 {
     uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
+    memcpy(&bits, value, sizeof(bits));
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
 void RendererDrawMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
                             const float chunkOriginRelative[3])
 {
-    if (renderer == NULL || mesh == NULL || mesh->generic || chunkOriginRelative == NULL ||
-        !renderer->frameRecording || !renderer->scenePassActive || renderer->commandList == NULL ||
-        renderer->pipelineState == NULL ||
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        chunkOriginRelative == NULL || !renderer->frameRecording || !renderer->scenePassActive ||
+        renderer->commandList == NULL || renderer->pipelineState == NULL ||
         !GeometryAllocationIsResident(renderer, &mesh->allocation))
         return;
     GeometryPoolBlock *block = &renderer->poolBlocks[mesh->allocation.blockIndex];
@@ -3045,9 +3045,9 @@ bool RendererDrawGeometry_D3D12(Renderer *renderer, const RendererGeometryDraw *
         (draw->instances != NULL && draw->instanceCount == 0u) ||
         draw->instanceCount >
             INSTANCE_MAX_BYTES_PER_DRAW / (uint32_t)sizeof(RendererMeshInstance) ||
-        !GeometryFloatIsFinite(draw->scale) || !GeometryFloatIsFinite(draw->originRelative[0]) ||
-        !GeometryFloatIsFinite(draw->originRelative[1]) ||
-        !GeometryFloatIsFinite(draw->originRelative[2]))
+        !GeometryFloatIsFinite(&draw->scale) || !GeometryFloatIsFinite(&draw->originRelative[0]) ||
+        !GeometryFloatIsFinite(&draw->originRelative[1]) ||
+        !GeometryFloatIsFinite(&draw->originRelative[2]))
         return false;
 
     const RendererMesh *mesh = draw->mesh;
@@ -3170,9 +3170,10 @@ void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
 void RendererDrawMeshInstances_D3D12(Renderer *renderer, const RendererMesh *mesh,
                                      const RendererMeshInstance *instances, uint32_t instanceCount)
 {
-    if (renderer == NULL || mesh == NULL || mesh->generic || instances == NULL ||
-        instanceCount == 0u || !renderer->frameRecording || !renderer->scenePassActive ||
-        renderer->commandList == NULL || renderer->pipelineState == NULL ||
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        instances == NULL || instanceCount == 0u || !renderer->frameRecording ||
+        !renderer->scenePassActive || renderer->commandList == NULL ||
+        renderer->pipelineState == NULL ||
         !GeometryAllocationIsResident(renderer, &mesh->allocation) ||
         instanceCount > INSTANCE_MAX_BYTES_PER_DRAW / (uint32_t)sizeof(RendererMeshInstance))
         return;

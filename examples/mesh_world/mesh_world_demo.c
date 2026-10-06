@@ -157,13 +157,11 @@ static uint32_t ParseToken(DemoOptions *options, const wchar_t *token, uint32_t 
     return 1u;
 }
 
-#if defined(LAIUE_MESH_DEMO_WINDOWED) || defined(LAIUE_MESH_DEMO_OFFSCREEN_VULKAN)
 static uint32_t HasField(uint32_t published, uint32_t table, size_t offset, size_t size)
 {
     return offset <= published && size <= published - offset && offset <= table &&
            size <= table - offset;
 }
-#endif
 
 static uint32_t ValidationCreateBuffer(LaiueGraphicsDeviceV2 *device,
                                        const LaiueGraphicsBufferDescV1 *desc,

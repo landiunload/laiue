@@ -27,6 +27,8 @@ $oldAutoRotation = $null
 $oldUserRotation = $null
 $oldFixedRotation = $null
 $logSince = $null
+$smokeLogLines = [System.Collections.Generic.List[string]]::new()
+$smokeLogSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 $captures = [System.Collections.Generic.List[object]]::new()
 $restoreErrors = [System.Collections.Generic.List[string]]::new()
 $restoredSettings = @{}
@@ -96,12 +98,18 @@ function Read-SmokeLog {
     if ($appProcessId) { $arguments += "--pid=$appProcessId" }
     $arguments += @('laiue.walk:I', 'AndroidRuntime:E', 'libc:F', '*:S')
     $raw = Invoke-Adb -Arguments $arguments
-    [System.IO.File]::WriteAllText((Join-Path $OutputDir 'logcat.txt'), $raw)
+    # Logcat is a bounded ring: retain each observed line once so later
+    # checkpoint polls cannot discard earlier presentation/lifecycle evidence.
+    foreach ($line in $raw -split '\r?\n') {
+        if ($line.Length -ne 0 -and $smokeLogSeen.Add($line)) { $smokeLogLines.Add($line) }
+    }
+    $history = $smokeLogLines -join "`n"
+    [System.IO.File]::WriteAllText((Join-Path $OutputDir 'logcat.txt'), $history)
     # App errors are scoped by PID; scenario messages additionally by run ID.
-    if ($appProcessId -and $raw -match 'FATAL EXCEPTION|Fatal signal|(?:^|\n)[^\n]*\sE\s+laiue[.]walk\s*:') {
+    if ($appProcessId -and $history -match 'FATAL EXCEPTION|Fatal signal|(?:^|\n)[^\n]*\sE\s+laiue[.]walk\s*:') {
         throw "Android walk process $appProcessId reported an error; inspect $(Join-Path $OutputDir 'logcat.txt')."
     }
-    $lines = @($raw -split '\r?\n' | Where-Object {
+    $lines = @($history -split '\r?\n' | Where-Object {
         $_ -match 'LAIUE_SCENARIO ' -and $_ -match "(?:^|\s)run=$runId(?:\s|$)"
     })
     $log = $lines -join "`n"

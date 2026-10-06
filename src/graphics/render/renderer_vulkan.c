@@ -3934,10 +3934,10 @@ static void DrawMeshInternal(Renderer *renderer, const RendererMesh *mesh, uint3
     renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
 }
 
-static bool GenericFloatIsFinite(float value)
+static bool GenericFloatIsFinite(const float *value)
 {
     uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
+    memcpy(&bits, value, sizeof(bits));
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
@@ -3947,10 +3947,10 @@ bool RendererDrawGeometry_Vulkan(Renderer *renderer, const RendererGeometryDraw 
         draw->mesh == NULL || draw->mesh->allocation.owner != renderer || !draw->mesh->generic ||
         !renderer->frameRecording || !renderer->renderingActive ||
         renderer->genericPipeline == VK_NULL_HANDLE ||
-        !GeometryIsReady(renderer, &draw->mesh->allocation) || !GenericFloatIsFinite(draw->scale) ||
-        !GenericFloatIsFinite(draw->originRelative[0]) ||
-        !GenericFloatIsFinite(draw->originRelative[1]) ||
-        !GenericFloatIsFinite(draw->originRelative[2]) ||
+        !GeometryIsReady(renderer, &draw->mesh->allocation) ||
+        !GenericFloatIsFinite(&draw->scale) || !GenericFloatIsFinite(&draw->originRelative[0]) ||
+        !GenericFloatIsFinite(&draw->originRelative[1]) ||
+        !GenericFloatIsFinite(&draw->originRelative[2]) ||
         (draw->instanceCount == 0u) != (draw->instances == NULL) ||
         draw->instanceCount > INSTANCE_MAX_BYTES_PER_FRAME / (uint32_t)sizeof(RendererMeshInstance))
         return false;
@@ -4065,7 +4065,8 @@ static void DrawGenericMeshInternal(Renderer *renderer, const RendererMesh *mesh
 void RendererDrawMesh_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                       const float chunkOriginRelative[3])
 {
-    if (renderer == NULL || mesh == NULL || mesh->generic || !renderer->renderingActive ||
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        chunkOriginRelative == NULL || !renderer->renderingActive ||
         !GeometryIsReady(renderer, &mesh->allocation))
         return;
 
@@ -4100,8 +4101,8 @@ void RendererDrawGenericMeshRangeBound_Vulkan(
 void RendererDrawMeshInstances_Vulkan(Renderer *renderer, const RendererMesh *mesh,
                                const RendererMeshInstance *instances, uint32_t instanceCount)
 {
-    if (renderer == NULL || mesh == NULL || mesh->generic || instances == NULL ||
-        instanceCount == 0u || !renderer->renderingActive ||
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        instances == NULL || instanceCount == 0u || !renderer->renderingActive ||
         !GeometryIsReady(renderer, &mesh->allocation) ||
         instanceCount > INSTANCE_MAX_BYTES_PER_FRAME / (uint32_t)sizeof(RendererMeshInstance))
         return;
