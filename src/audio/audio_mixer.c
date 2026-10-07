@@ -28,7 +28,8 @@
 #endif
 
 #define AUDIO_MIX_CHANNELS 2u
-#define AUDIO_COMMAND_CAPACITY 256u
+// Preserve 255 ordinary commands, plus one STOP_ALL slot and the ring sentinel.
+#define AUDIO_COMMAND_CAPACITY 257u
 #define AUDIO_DEFAULT_SAMPLE_RATE 48000u
 // Скорость ограничивается, чтобы шаг чтения не превращал короткий клип в
 // щелчок и не уводил интерполяцию за границы буфера.
@@ -300,12 +301,36 @@ static void FillParameters(const AudioVoiceParameters *source, AudioVoiceParamet
 
 // === Кольцо команд ===
 
+static uint32_t NextCommandIndex(uint32_t index)
+{
+    ++index;
+    return index == AUDIO_COMMAND_CAPACITY ? 0u : index;
+}
+
+static bool CommandQueueHasCapacity(const AudioDevice *device, uint32_t write,
+                                    bool allowReservedSlot)
+{
+    uint32_t next = NextCommandIndex(write);
+    uint32_t read = PlatformAtomicLoadU32Acquire(&device->commandRead);
+    return next != read && (allowReservedSlot || NextCommandIndex(next) != read);
+}
+
 static bool PushCommand(AudioDevice *device, const AudioCommand *command)
 {
     uint32_t write = device->commandWrite;
-    uint32_t next = (write + 1u) % AUDIO_COMMAND_CAPACITY;
-    if (next == PlatformAtomicLoadU32Acquire(&device->commandRead))
+    uint32_t next = NextCommandIndex(write);
+    bool stopAll = command->type == COMMAND_STOP_ALL;
+    if (!CommandQueueHasCapacity(device, write, stopAll))
     {
+        // Only STOP_ALL can consume the reserved slot. A full ring therefore
+        // ends with an immutable STOP_ALL, with no accepted START after it.
+        // Reuse that marker without overwriting anything the consumer reads.
+        if (stopAll)
+        {
+            uint32_t last = write == 0u ? AUDIO_COMMAND_CAPACITY - 1u : write - 1u;
+            if (device->commands[last].type == COMMAND_STOP_ALL)
+                return true;
+        }
         PlatformAtomicIncrementI64(&device->droppedCommands);
         return false;
     }
@@ -404,7 +429,7 @@ static bool DrainCommands(AudioDevice *device)
     {
         ++applied;
         ApplyCommand(device, &device->commands[read]);
-        read = (read + 1u) % AUDIO_COMMAND_CAPACITY;
+        read = NextCommandIndex(read);
     }
     PlatformAtomicStoreU32Release(&device->commandRead, read);
     PlatformAtomicAddI64(&device->commandApplied, applied);
@@ -1323,8 +1348,9 @@ void AudioDeviceStopAllVoices(AudioDevice *device)
     if (device == NULL) return;
     AudioCommand command = { .type = COMMAND_STOP_ALL };
     PlatformMutexLock(&device->producerLock);
-    PushCommand(device, &command);
-    for (uint32_t index = 0; index < AUDIO_MAX_VOICES; ++index) device->slotClips[index] = NULL;
+    if (PushCommand(device, &command))
+        for (uint32_t index = 0; index < AUDIO_MAX_VOICES; ++index)
+            device->slotClips[index] = NULL;
     PlatformMutexUnlock(&device->producerLock);
 }
 
@@ -1485,8 +1511,7 @@ AudioVoice AudioVoicePlayStream(AudioDevice *device, AudioStream *stream,
         if (state != VOICE_FREE && state != VOICE_FINISHED)
             continue;
         /* Reserve command capacity before changing the decoder's epoch. */
-        if ((device->commandWrite + 1u) % AUDIO_COMMAND_CAPACITY ==
-            PlatformAtomicLoadU32Acquire(&device->commandRead))
+        if (!CommandQueueHasCapacity(device, device->commandWrite, false))
             break;
         uint32_t epoch = 0u;
         if (!AudioStreamPrepare(stream, 0u, resolved.looping, &epoch))
@@ -1553,8 +1578,7 @@ bool AudioVoiceSeek(AudioDevice *device, AudioVoice voice, double seconds)
         double position = seconds * rate;
         if (seconds <= (double)total / rate && position > total)
             position = total;
-        if (position <= total && (device->commandWrite + 1u) % AUDIO_COMMAND_CAPACITY !=
-                                     PlatformAtomicLoadU32Acquire(&device->commandRead))
+        if (position <= total && CommandQueueHasCapacity(device, device->commandWrite, false))
         {
             uint32_t epoch = 0u;
             /* API producer owns loop preference; copy it through stream lock. */

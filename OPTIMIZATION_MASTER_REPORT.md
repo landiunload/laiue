@@ -1148,3 +1148,55 @@ packaging warnings. Эти внешние diagnostics сохранены, не �
 `ci-fix-measurements-summary.json`, `ci-fix-*-build.log`,
 `ci-fix-*-test.log`, `ci-fix-android-captures`, `ci-audit/37495330448`.
 Повторный CI проверяется после push исправления; этап 4 остаётся за барьером.
+
+### Аудио-барьер CI этапа 3, 2026-10-08
+
+CI `37499532961`, `266b93a`: 14/15 jobs. Единственная ошибка — macOS x86_64
+Debug `laiue.audio.mixer`; Release этой платформы не запускался. Остальные
+платформы собраны, настоящие D3D12 geometry tests прошли Clang x64/ARM64 в
+обоих профилях, Linux Vulkan geometry также прошёл. Win32 lifecycle test на
+Linux пропущен и не доказывает cross-backend ownership. Полные compiler/linker
+logs без предупреждений. Android: 1280 ticks/434 frames/9 ACK/12 PNG,
+rotation и HOME/resume с сохранением состояния. Настройки 0/1/default
+восстановлены со второй попытки: первый MISMATCH сохранён. В отдельном SDK
+artifact 36 WARNING (32 SwiftShader и 4 emulator), 1 teardown ERROR; эти
+сообщения не скрыты. Аудит: `ci-audit/37499532961/audit.json`.
+
+Падение имеет две причины. StopAll игнорировал отказ полной command queue,
+но очищал producer clip associations. Race test принимал старое
+`activeVoices == 0` за ACK, хотя in-flight render ещё мог применить START.
+Новый тест без concurrent consumer заполняет очередь и вызывает ровно одну
+остановку и один render: старый production действительно упал с
+`stop-all must silence a full queue in one render` (CTest exit 8).
+
+Очередь сохраняет 255 обычных команд и получает один reserved STOP_ALL slot.
+Только остановка может заполнить physical ring целиком; поэтому full tail
+обязательно STOP_ALL. Повторная остановка объединяется с этим неизменяемым
+маркером, без перезаписи consumer payload. Последующий принятый START остаётся
+в FIFO после остановки. Admission helper общий для публикации и stream
+START/SEEK preflight; decoder не меняется перед отказом. Clip associations
+очищаются только после принятой остановки. Ни allocation, ни mutex в callback
+не добавлены; modulo непоказательной степени двойки заменён increment/compare.
+Публичный ABI прежний. Clang layout probe: AudioCommand 80 B; fixed AudioDevice
+34032 → 34112 B, **+80 B (+0,235%)**, не полная память процесса/потока.
+
+Тесты: ACTIVE/PENDING, 96 циклов saturation/wrap, repeated stop coalescing,
+STOP/START FIFO, generation reuse и later voice survival. Race worker читает
+flush request до render и публикует ACK после его завершения; прежние проверки
+не удалены. MSVC и Clang: полные incremental Debug/Release builds без warnings,
+по 6/6 аудиотестов, по 30/30 повторов микшера в каждом из четырёх профилей
+(120 повторов). Независимое ревью и architecture/diff checks прошли.
+
+Семь чередующихся пар MSVC Release относительно immutable `266b93a`:
+17 mixing scenarios, 238 records, каждый вариант сохраняет sample hashes,
+общий hash `98cde06a350a0f28`. Для 16–128 voices попарные медианы времени
+−0,53…+0,09%; stereo128 +0,09% с диапазоном −0,76…+0,32% не устанавливает
+регрессию. Silence/одиночный integer-step voice −5,83…−6,34%; tail-trim
+−12,57%. Эти короткие paths зависят от placement/cache и не обещают общего
+ускорения аудио. Benchmark измеряет mixer render, не производительность
+producer control API и не задержку принятия STOP_ALL под нагрузкой.
+
+Данные: `D:/build/laiue/step3/audio-stop-before-{build,test}.log`,
+`audio-stop-{msvc,clang}-*`, `audio-size-probe`, `audio-stop-paired/raw.json`,
+`audio-stop-paired/summary.json`. Новый полный CI требуется после push;
+четвёртый этап не начинается до его завершения без ошибок.

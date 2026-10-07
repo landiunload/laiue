@@ -127,5 +127,8 @@ LAIUE_AUDIO_API AudioVoice AudioVoicePlay(AudioDevice *device, const AudioClip *
 LAIUE_AUDIO_API bool AudioVoiceSetParameters(AudioDevice *device, AudioVoice voice,
                                              const AudioVoiceParameters *parameters);
 LAIUE_AUDIO_API void AudioVoiceStop(AudioDevice *device, AudioVoice voice);
+// Остановка асинхронна и не теряется при заполненной очереди. Следующий
+// успешно поставленный Play остаётся после неё. Статистика микширования
+// не служит подтверждением выполнения команды.
 LAIUE_AUDIO_API void AudioDeviceStopAllVoices(AudioDevice *device);
 LAIUE_AUDIO_API bool AudioVoiceIsActive(const AudioDevice *device, AudioVoice voice);

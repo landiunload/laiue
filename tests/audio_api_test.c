@@ -499,6 +499,167 @@ static void CheckSingleVoiceMasterFastPath(void)
     PlatformFree(frames);
 }
 
+// The consumer stays stopped while the producer fills the ordinary command
+// budget. One stop and one render must suffice even at that boundary.
+static uint32_t FillCommandQueue(AudioDevice *device, AudioVoice voice,
+                                 const AudioVoiceParameters *parameters)
+{
+    for (uint32_t accepted = 0U; accepted < 1024U; ++accepted)
+    {
+        if (!AudioVoiceSetParameters(device, voice, parameters))
+            return accepted;
+    }
+    Expect(false, "ordinary commands must have a bounded queue");
+    return 0U;
+}
+
+static void CheckStopAllUnderPressure(void)
+{
+    static int16_t samples[8] = {16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384};
+    AudioDevice *device = CreateOffscreenDevice();
+    AudioClip *clip = MakeExactClip(device, samples, 8U, 1U, TEST_SAMPLE_RATE);
+    AudioVoiceParameters left = {
+        .volume = 1.0f,
+        .pan = -1.0f,
+        .speed = 1.0f,
+        .looping = true,
+    };
+    AudioVoiceParameters right = left;
+    right.pan = 1.0f;
+    float frame[2];
+
+    // The first two cases use exactly one STOP_ALL, covering ACTIVE and
+    // PENDING independently. Further cases wrap both ring indices many times
+    // and repeat adjacent stops to exercise critical-command coalescing.
+    for (uint32_t cycle = 0U; cycle < 96U; ++cycle)
+    {
+        bool pending = (cycle & 1U) != 0U;
+        AudioVoice voice = AudioVoicePlay(device, clip, &left);
+        Expect(voice != AUDIO_VOICE_NONE, "the queue-pressure voice must start");
+        if (!pending)
+        {
+            Expect(AudioDeviceRenderFrames(device, frame, 1U),
+                   "the queue-pressure voice must become active");
+            Expect(SameBits(frame[0], 0.5f) && SameBits(frame[1], 0.0f),
+                   "the active pressure fixture must really sound");
+        }
+        uint32_t accepted = FillCommandQueue(device, voice, &left);
+        Expect(accepted == (pending ? 254U : 255U),
+               "the ordinary queue must retain its 255-command capacity");
+        AudioDeviceStats full;
+        Expect(AudioDeviceGetStats(device, &full), "full-queue stats must be readable");
+
+        AudioDeviceStopAllVoices(device);
+        if (cycle >= 2U)
+        {
+            for (uint32_t repeat = 0U; repeat < 7U; ++repeat)
+                AudioDeviceStopAllVoices(device);
+        }
+        Expect(AudioDeviceRenderFrames(device, frame, 1U),
+               "one render must consume the full-queue stop");
+        Expect(SameBits(frame[0], 0.0f) && SameBits(frame[1], 0.0f),
+               "stop-all must silence a full queue in one render");
+        Expect(!AudioVoiceIsActive(device, voice),
+               "a full-queue stop must finish the original voice");
+        AudioDeviceStats stopped;
+        Expect(AudioDeviceGetStats(device, &stopped), "stopped-queue stats must be readable");
+        Expect(stopped.activeVoices == 0U, "the full-queue stop must clear active stats");
+        Expect(stopped.droppedCommands == full.droppedCommands,
+               "critical stop-all commands must not be dropped or consume ordinary capacity");
+
+        AudioVoice later = AudioVoicePlay(device, clip, &right);
+        Expect(later != AUDIO_VOICE_NONE && later != voice && (later & 255U) == (voice & 255U),
+               "a later start must safely reuse the stopped slot with a new generation");
+        for (uint32_t render = 0U; render < 2U; ++render)
+        {
+            Expect(AudioDeviceRenderFrames(device, frame, 1U),
+                   "a later start must render after the queue-pressure stop");
+            Expect(SameBits(frame[0], 0.0f) && SameBits(frame[1], 0.5f),
+                   "a previous stop must not silence the reused slot");
+            Expect(AudioVoiceIsActive(device, later) && !AudioVoiceIsActive(device, voice),
+                   "only the new generation may stay active after reuse");
+        }
+        AudioDeviceStopAllVoices(device);
+        Expect(AudioDeviceRenderFrames(device, frame, 1U),
+               "the later pressure-test voice must stop");
+        Expect(!AudioVoiceIsActive(device, later) && SameBits(frame[0], 0.0f) &&
+                   SameBits(frame[1], 0.0f),
+               "each wrap case must finish with silence");
+    }
+
+    AudioClipDestroy(clip);
+    AudioDeviceDestroy(device);
+}
+
+static void CheckStopAllCommandOrdering(void)
+{
+    static int16_t samples[8] = {16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384};
+    AudioVoiceParameters left = {
+        .volume = 1.0f,
+        .pan = -1.0f,
+        .speed = 1.0f,
+        .looping = true,
+    };
+    AudioVoiceParameters right = left;
+    right.pan = 1.0f;
+
+    for (uint32_t pending = 0U; pending < 2U; ++pending)
+    {
+        AudioDevice *device = CreateOffscreenDevice();
+        AudioClip *clip = MakeExactClip(device, samples, 8U, 1U, TEST_SAMPLE_RATE);
+        float frame[2];
+        AudioVoice first = AudioVoicePlay(device, clip, &left);
+        Expect(first != AUDIO_VOICE_NONE, "the FIFO fixture must start its first voice");
+        if (pending == 0U)
+            Expect(AudioDeviceRenderFrames(device, frame, 1U), "the first FIFO voice must render");
+        AudioDeviceStopAllVoices(device);
+        AudioVoice second = AudioVoicePlay(device, clip, &right);
+        Expect(second != AUDIO_VOICE_NONE, "a start after stop-all must be accepted");
+        Expect(AudioDeviceRenderFrames(device, frame, 1U), "ordered stop/start must render");
+        Expect(!AudioVoiceIsActive(device, first) && AudioVoiceIsActive(device, second),
+               "stop-all must stop earlier starts while preserving later starts");
+        Expect(SameBits(frame[0], 0.0f) && SameBits(frame[1], 0.5f),
+               "only the later right-panned FIFO voice may sound");
+
+        // Stops separated by a START have different boundaries and must not
+        // be collapsed into the first stop or applied after the last start.
+        AudioDeviceStopAllVoices(device);
+        AudioVoice third = AudioVoicePlay(device, clip, &left);
+        Expect(third != AUDIO_VOICE_NONE, "an intermediate FIFO voice must start");
+        AudioDeviceStopAllVoices(device);
+        AudioVoice fourth = AudioVoicePlay(device, clip, &right);
+        Expect(fourth != AUDIO_VOICE_NONE, "the final FIFO voice must start");
+        Expect(AudioDeviceRenderFrames(device, frame, 1U), "separated stop boundaries must render");
+        Expect(!AudioVoiceIsActive(device, second) && !AudioVoiceIsActive(device, third) &&
+                   AudioVoiceIsActive(device, fourth),
+               "separated stops must preserve their FIFO boundaries");
+        Expect(SameBits(frame[0], 0.0f) && SameBits(frame[1], 0.5f),
+               "only the last start may sound after separated stops");
+
+        // An earlier queued stop cannot acknowledge a later stop when the
+        // ordinary queue fills between them: the intermediate start must die.
+        AudioDeviceStopAllVoices(device);
+        AudioVoice intermediate = AudioVoicePlay(device, clip, &left);
+        Expect(intermediate != AUDIO_VOICE_NONE, "the full FIFO fixture must start");
+        Expect(FillCommandQueue(device, intermediate, &left) == 253U,
+               "queued stop/start must count toward the same ordinary capacity");
+        AudioDeviceStats full;
+        Expect(AudioDeviceGetStats(device, &full), "full FIFO stats must be readable");
+        AudioDeviceStopAllVoices(device);
+        AudioDeviceStopAllVoices(device);
+        Expect(AudioDeviceRenderFrames(device, frame, 1U), "the later full FIFO stop must render");
+        Expect(!AudioVoiceIsActive(device, fourth) && !AudioVoiceIsActive(device, intermediate) &&
+                   SameBits(frame[0], 0.0f) && SameBits(frame[1], 0.0f),
+               "a full-queue stop must retain its later FIFO boundary");
+        AudioDeviceStats stopped;
+        Expect(AudioDeviceGetStats(device, &stopped), "stopped FIFO stats must be readable");
+        Expect(stopped.activeVoices == 0U && stopped.droppedCommands == full.droppedCommands,
+               "repeated full FIFO stops must be applied without being dropped");
+        AudioClipDestroy(clip);
+        AudioDeviceDestroy(device);
+    }
+}
+
 // === Гонка производителя и потока вывода ===
 //
 // Поток вывода гонит RenderFrames, пока игровой поток заказывает, меняет и
@@ -513,6 +674,9 @@ typedef struct MixerRaceState
     AudioDevice *device;
     AudioClip *clip;
     volatile uint32_t stop;
+    volatile uint32_t flushRequest;
+    volatile uint32_t flushAck;
+    volatile uint32_t failure;
     volatile int64_t renderBuffers;
 } MixerRaceState;
 
@@ -523,16 +687,21 @@ static uint32_t MixerRenderWorker(void *rawContext)
         (size_t)EXACT_BUFFER_FRAMES * 2U * sizeof(float), false);
     if (frames == NULL)
     {
+        PlatformAtomicStoreU32Release(&state->failure, 1U);
         return 1U;
     }
     while (PlatformAtomicLoadU32Acquire(&state->stop) == 0U)
     {
+        uint32_t flush = PlatformAtomicLoadU32Acquire(&state->flushRequest);
         if (!AudioDeviceRenderFrames(state->device, frames, EXACT_BUFFER_FRAMES))
         {
+            PlatformAtomicStoreU32Release(&state->failure, 2U);
             PlatformFree(frames);
             return 2U;
         }
         PlatformAtomicIncrementI64(&state->renderBuffers);
+        if (flush != 0U)
+            PlatformAtomicStoreU32Release(&state->flushAck, flush);
     }
     PlatformFree(frames);
     return 0U;
@@ -633,23 +802,26 @@ static void CheckConcurrentMixer(void)
     Expect(maximumActive > 0U, "the output thread never saw an active voice");
     AudioDeviceStopAllVoices(device);
 
-    // Дать потоку вывода разобрать STOP_ALL: activeVoices обновляется только
-    // внутри RenderFrames, поэтому ждём его спада, а не гасим поток сразу.
+    // A zero census may precede pending STARTs or come from a buffer whose
+    // command snapshot predates STOP_ALL. The worker must observe this request
+    // before beginning a render, then acknowledge that complete render.
+    PlatformAtomicStoreU32Release(&state.flushRequest, 1U);
     AudioDeviceStats stats;
     for (uint32_t spin = 0U; spin < 4000U; ++spin)
     {
-        Expect(AudioDeviceGetStats(device, &stats),
-               "stats while draining the voice race must be readable");
-        if (stats.activeVoices == 0U)
-        {
+        if (PlatformAtomicLoadU32Acquire(&state.flushAck) == 1U ||
+            PlatformAtomicLoadU32Acquire(&state.failure) != 0U)
             break;
-        }
         PlatformSleepMilliseconds(1U);
     }
 
     PlatformAtomicStoreU32Release(&state.stop, 1U);
     PlatformThreadJoin(&renderThread);
 
+    Expect(PlatformAtomicLoadU32Acquire(&state.failure) == 0U,
+           "the concurrent render worker must complete without errors");
+    Expect(PlatformAtomicLoadU32Acquire(&state.flushAck) == 1U,
+           "the output worker must acknowledge a complete post-stop render");
     Expect(AudioDeviceGetStats(device, &stats), "stats after the mixer race must be readable");
     Expect(stats.activeVoices == 0U, "stop-all must leave no active voice after the race");
     Expect(stats.mixedFrames > 0U, "the output thread must have mixed frames");
@@ -838,6 +1010,9 @@ LAIUE_TEST_ENTRY(AudioApiTestEntryPoint)
 
     // === Быстрый путь мастера при одном голосе ===
     CheckSingleVoiceMasterFastPath();
+
+    CheckStopAllUnderPressure();
+    CheckStopAllCommandOrdering();
 
     // === Гонка производителя и потока вывода ===
     CheckConcurrentMixer();
