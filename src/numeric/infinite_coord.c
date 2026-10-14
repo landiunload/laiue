@@ -1,0 +1,1575 @@
+#include "numeric/infinite_coord.h"
+#include "platform/system.h"
+
+#include <float.h>
+#include <string.h>
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
+static uint64_t Int64Magnitude(int64_t value)
+{
+    return value < 0 ? 0u - (uint64_t)value : (uint64_t)value;
+}
+
+// Индекс старшего установленного бита. Для нуля и единицы возвращается 0 —
+// ровно как у прежнего побитового цикла, на котором это и держалось.
+// Цикл стоил до шестидесяти трёх итераций, а у обычной координаты физики
+// старший бит сорок четвёртый: перевод в double уходил почти целиком сюда.
+static uint32_t HighestSetBit(uint64_t value)
+{
+    if (value <= 1u)
+    {
+        return 0;
+    }
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long index = 0;
+    _BitScanReverse64(&index, value);
+    return (uint32_t)index;
+#elif defined(__GNUC__) || defined(__clang__)
+    return 63u - (uint32_t)__builtin_clzll(value);
+#else
+    uint32_t index = 0;
+    while (value > 1u)
+    {
+        value >>= 1;
+        ++index;
+    }
+    return index;
+#endif
+}
+
+static void InfiniteCoordNormalize(InfiniteCoord* value)
+{
+    while (value->limbCount > 0 && value->limbs[value->limbCount - 1] == 0)
+    {
+        value->limbCount--;
+    }
+
+    if (value->limbCount == 0)
+    {
+        if (value->limbs != NULL)
+        {
+            PlatformFree(value->limbs);
+            value->limbs = NULL;
+        }
+        value->sign = 0;
+    }
+}
+
+static int32_t InfiniteCoordCompareMagnitudeSmall(const InfiniteCoord* value, uint64_t magnitude)
+{
+    if (value->limbCount > 1)
+    {
+        return 1;
+    }
+    uint64_t current = value->limbCount == 0 ? 0 : value->limbs[0];
+    return current < magnitude ? -1 : (current > magnitude ? 1 : 0);
+}
+
+static int32_t InfiniteCoordCompareMagnitude(
+    const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (left->limbCount != right->limbCount)
+    {
+        return left->limbCount < right->limbCount ? -1 : 1;
+    }
+
+    for (uint32_t index = left->limbCount; index > 0; --index)
+    {
+        uint64_t leftLimb = left->limbs[index - 1];
+        uint64_t rightLimb = right->limbs[index - 1];
+        if (leftLimb != rightLimb)
+        {
+            return leftLimb < rightLimb ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static bool InfiniteCoordTryCopy(InfiniteCoord* out, const InfiniteCoord* source)
+{
+    InfiniteCoordInit(out);
+    if (source->limbCount == 0)
+    {
+        return true;
+    }
+
+    uint64_t* limbs = PlatformAllocate(
+        (size_t)source->limbCount * sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+
+    // Цикл, а не memcpy: в сборке без CRT это вызов собственной реализации
+    // движка, и на одном-четырёх лимбах он дороже развёрнутого копирования.
+    for (uint32_t i = 0; i < source->limbCount; ++i)
+    {
+        limbs[i] = source->limbs[i];
+    }
+
+    out->limbs = limbs;
+    out->limbCount = source->limbCount;
+    out->sign = source->sign;
+    return true;
+}
+
+// Однолимбовый результат одним выделением: физика и мир почти всегда
+// укладываются в лимб, и заводить под него «лишний» лимб незачем.
+static bool InfiniteCoordTryAssignSingleLimb(
+    InfiniteCoord* out, uint64_t magnitude, int32_t sign)
+{
+    uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    limbs[0] = magnitude;
+    out->limbs = limbs;
+    out->limbCount = 1u;
+    out->sign = sign;
+    return true;
+}
+
+static bool InfiniteCoordTryAddMagnitudeSmall(InfiniteCoord* value, uint64_t magnitude)
+{
+    if (magnitude == 0)
+    {
+        return true;
+    }
+
+    if (value->limbCount == 0)
+    {
+        value->limbs = PlatformAllocate(sizeof(uint64_t), false);
+        if (value->limbs == NULL)
+        {
+            return false;
+        }
+        value->limbs[0] = magnitude;
+        value->limbCount = 1;
+        return true;
+    }
+
+    uint64_t old = value->limbs[0];
+    value->limbs[0] = old + magnitude;
+    uint64_t carry = value->limbs[0] < old ? 1u : 0u;
+
+    for (uint32_t i = 1; i < value->limbCount && carry != 0; ++i)
+    {
+        old = value->limbs[i];
+        value->limbs[i] = old + 1u;
+        carry = value->limbs[i] == 0 ? 1u : 0u;
+    }
+
+    if (carry != 0)
+    {
+        uint32_t newCount = value->limbCount + 1;
+        uint64_t* expanded = PlatformReallocate(value->limbs,
+            (size_t)newCount * sizeof(uint64_t), false);
+        if (expanded == NULL)
+        {
+            // Откатываем перенос: исходное значение было ...FFFF + magnitude.
+            uint64_t borrow = magnitude;
+            for (uint32_t i = 0; i < value->limbCount && borrow != 0; ++i)
+            {
+                uint64_t current = value->limbs[i];
+                value->limbs[i] = current - borrow;
+                borrow = current < borrow ? 1u : 0u;
+            }
+            return false;
+        }
+        value->limbs = expanded;
+        value->limbs[value->limbCount] = 1u;
+        value->limbCount = newCount;
+    }
+
+    return true;
+}
+
+static void InfiniteCoordSubtractMagnitudeSmall(InfiniteCoord* value, uint64_t magnitude)
+{
+    uint64_t borrow = magnitude;
+    for (uint32_t i = 0; i < value->limbCount && borrow != 0; ++i)
+    {
+        uint64_t current = value->limbs[i];
+        value->limbs[i] = current - borrow;
+        borrow = current < borrow ? 1u : 0u;
+    }
+    InfiniteCoordNormalize(value);
+}
+
+bool InfiniteCoordTryAddInt64InPlace(InfiniteCoord* value, int64_t addend)
+{
+    if (value == NULL)
+    {
+        return false;
+    }
+    if (addend == 0)
+    {
+        return true;
+    }
+
+    int32_t addSign = addend < 0 ? -1 : 1;
+    uint64_t magnitude = addend < 0 ? 0u - (uint64_t)addend : (uint64_t)addend;
+
+    // Канонический ноль: физика заводит лимб первой же добавкой к покоящейся
+    // величине, и отдельный вызов ради одного выделения ни к чему.
+    if (value->limbCount == 0u)
+    {
+        uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+        if (limbs == NULL)
+        {
+            return false;
+        }
+        limbs[0] = magnitude;
+        value->limbs = limbs;
+        value->limbCount = 1u;
+        value->sign = addSign;
+        return true;
+    }
+
+    // Обычный случай физики: один лимб, знак либо сохраняется, либо меняется
+    // без переноса. Ровно здесь уходит почти вся стоимость вызова.
+    if (value->limbCount == 1u)
+    {
+        uint64_t current = value->limbs[0];
+        int32_t sign = value->sign;
+        if (sign == addSign)
+        {
+            uint64_t sum = current + magnitude;
+            if (sum >= current)
+            {
+                value->limbs[0] = sum;
+                return true;
+            }
+        }
+        else if (sign != 0)
+        {
+            if (current > magnitude)
+            {
+                value->limbs[0] = current - magnitude;
+                return true;
+            }
+            if (current < magnitude)
+            {
+                value->limbs[0] = magnitude - current;
+                value->sign = addSign;
+                return true;
+            }
+            InfiniteCoordDestroy(value);
+            return true;
+        }
+    }
+
+    if (value->sign == addSign)
+    {
+        return InfiniteCoordTryAddMagnitudeSmall(value, magnitude);
+    }
+
+    // Сюда попадает только каноническое значение с противоположным знаком,
+    // которое не разобрал однолимбовый путь. Канонический ноль лимбов не
+    // имеет и обработан раньше, значит у значения не меньше двух лимбов, а
+    // его модуль (2^64 и больше) заведомо перевешивает любую добавку int64
+    // (не больше 2^63). Точное погашение и смена знака возможны только в
+    // однолимбовом случае, который выше и разобран, поэтому сравнение
+    // модулей здесь не нужно: остаётся чистое вычитание меньшего из
+    // большего, а знак результата не меняется.
+    InfiniteCoordSubtractMagnitudeSmall(value, magnitude);
+    return true;
+}
+
+static void SignedDifference(int64_t left, int64_t right,
+    int32_t* outSign, uint64_t* outMagnitude)
+{
+    if ((left >= 0) == (right >= 0))
+    {
+        if (left == right)
+        {
+            *outSign = 0;
+            *outMagnitude = 0;
+        }
+        else if (left > right)
+        {
+            *outSign = 1;
+            *outMagnitude = (uint64_t)left - (uint64_t)right;
+        }
+        else
+        {
+            *outSign = -1;
+            *outMagnitude = (uint64_t)right - (uint64_t)left;
+        }
+        return;
+    }
+
+    if (left >= 0)
+    {
+        *outSign = 1;
+        *outMagnitude = (uint64_t)left + Int64Magnitude(right);
+    }
+    else
+    {
+        *outSign = -1;
+        *outMagnitude = Int64Magnitude(left) + (uint64_t)right;
+    }
+}
+
+static void CopyMagnitudeInfo(
+    const InfiniteCoord* value, uint64_t* outLow, bool* outWide)
+{
+    *outLow = value->limbCount == 0 ? 0 : value->limbs[0];
+    *outWide = false;
+    for (uint32_t index = 1; index < value->limbCount; ++index)
+    {
+        if (value->limbs[index] != 0)
+        {
+            *outWide = true;
+            break;
+        }
+    }
+}
+
+static void AddMagnitudeInfo(
+    const InfiniteCoord* left, const InfiniteCoord* right,
+    uint64_t* outLow, bool* outWide)
+{
+    uint64_t carry = 0;
+    uint32_t count = left->limbCount > right->limbCount
+        ? left->limbCount : right->limbCount;
+    *outLow = 0;
+    *outWide = false;
+
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        uint64_t a = index < left->limbCount ? left->limbs[index] : 0;
+        uint64_t b = index < right->limbCount ? right->limbs[index] : 0;
+        uint64_t sum = a + b;
+        uint64_t firstCarry = sum < a ? 1u : 0u;
+        uint64_t result = sum + carry;
+        uint64_t secondCarry = result < sum ? 1u : 0u;
+        carry = firstCarry | secondCarry;
+
+        if (index == 0) *outLow = result;
+        else if (result != 0) *outWide = true;
+    }
+    if (carry != 0) *outWide = true;
+}
+
+static void SubtractMagnitudeInfo(
+    const InfiniteCoord* larger, const InfiniteCoord* smaller,
+    uint64_t* outLow, bool* outWide)
+{
+    uint64_t borrow = 0;
+    *outLow = 0;
+    *outWide = false;
+
+    for (uint32_t index = 0; index < larger->limbCount; ++index)
+    {
+        uint64_t a = larger->limbs[index];
+        uint64_t b = index < smaller->limbCount ? smaller->limbs[index] : 0;
+        uint64_t difference = a - b;
+        uint64_t firstBorrow = a < b ? 1u : 0u;
+        uint64_t result = difference - borrow;
+        uint64_t secondBorrow = difference < borrow ? 1u : 0u;
+        borrow = firstBorrow | secondBorrow;
+
+        if (index == 0) *outLow = result;
+        else if (result != 0) *outWide = true;
+    }
+}
+
+static void InfiniteCoordDifferenceInfo(
+    const InfiniteCoord* left, const InfiniteCoord* right,
+    int32_t* outSign, uint64_t* outMagnitude, bool* outWide)
+{
+    if (left->sign == 0)
+    {
+        *outSign = -right->sign;
+        CopyMagnitudeInfo(right, outMagnitude, outWide);
+        return;
+    }
+    if (right->sign == 0)
+    {
+        *outSign = left->sign;
+        CopyMagnitudeInfo(left, outMagnitude, outWide);
+        return;
+    }
+    if (left->sign != right->sign)
+    {
+        *outSign = left->sign;
+        AddMagnitudeInfo(left, right, outMagnitude, outWide);
+        return;
+    }
+
+    int32_t comparison = InfiniteCoordCompareMagnitude(left, right);
+    if (comparison == 0)
+    {
+        *outSign = 0;
+        *outMagnitude = 0;
+        *outWide = false;
+        return;
+    }
+
+    if (comparison > 0)
+    {
+        *outSign = left->sign;
+        SubtractMagnitudeInfo(left, right, outMagnitude, outWide);
+    }
+    else
+    {
+        *outSign = -left->sign;
+        SubtractMagnitudeInfo(right, left, outMagnitude, outWide);
+    }
+}
+
+static int32_t InfiniteCoordSignAfterSmall(
+    const InfiniteCoord* value, int32_t addSign, uint64_t addMagnitude)
+{
+    if (addSign == 0 || addMagnitude == 0)
+    {
+        return value->sign;
+    }
+    if (value->sign == 0 || value->sign == addSign)
+    {
+        return addSign;
+    }
+
+    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(value, addMagnitude);
+    if (comparison == 0)
+    {
+        return 0;
+    }
+    return comparison > 0 ? value->sign : addSign;
+}
+
+static void InfiniteCoordTwosComplementLow128(
+    const InfiniteCoord* value, uint64_t* outLow, uint64_t* outHigh)
+{
+    uint64_t lowMagnitude = value->limbCount > 0 ? value->limbs[0] : 0;
+    uint64_t highMagnitude = value->limbCount > 1 ? value->limbs[1] : 0;
+
+    if (value->sign >= 0)
+    {
+        *outLow = lowMagnitude;
+        *outHigh = highMagnitude;
+        return;
+    }
+
+    uint64_t low = ~lowMagnitude + 1u;
+    uint64_t carry = low == 0 ? 1u : 0u;
+    *outLow = low;
+    *outHigh = ~highMagnitude + carry;
+}
+
+static uint64_t Mix64(uint64_t value)
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+void InfiniteCoordInit(InfiniteCoord* value)
+{
+    value->limbs = NULL;
+    value->limbCount = 0;
+    value->sign = 0;
+}
+
+void InfiniteCoordDestroy(InfiniteCoord* value)
+{
+    if (value->limbs != NULL)
+    {
+        PlatformFree(value->limbs);
+    }
+    InfiniteCoordInit(value);
+}
+
+bool InfiniteCoordTryCopyAddInt64(InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
+{
+    // Однолимбовый источник — это почти вся физика и мир. Раньше копия
+    // заводила лимб, а добавка при переносе перевыделяла его. Теперь сумму
+    // считаем прямо над limbs[0] и заводим результат (ноль, один или два
+    // лимба) ровно один раз, без промежуточной копии и без Normalize.
+    if (source->limbCount == 0u || (source->limbCount == 1u && source->sign != 0))
+    {
+        uint64_t current = source->limbCount == 0u ? 0u : source->limbs[0];
+        int32_t sign = source->limbCount == 0u ? 0 : source->sign;
+        // Источник прочитан: при неудаче выделения приёмник, как и прежде,
+        // остаётся каноническим нулём.
+        InfiniteCoordInit(out);
+        if (addend == 0)
+        {
+            return sign == 0
+                ? true
+                : InfiniteCoordTryAssignSingleLimb(out, current, sign);
+        }
+
+        int32_t addSign = addend < 0 ? -1 : 1;
+        uint64_t magnitude = Int64Magnitude(addend);
+        if (sign == 0)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, magnitude, addSign);
+        }
+        if (sign == addSign)
+        {
+            uint64_t sum = current + magnitude;
+            if (sum >= current)
+            {
+                return InfiniteCoordTryAssignSingleLimb(out, sum, sign);
+            }
+            // Перенос из старшего (и единственного) лимба: ровно два лимба.
+            uint64_t* limbs = PlatformAllocate(2u * sizeof(uint64_t), false);
+            if (limbs == NULL)
+            {
+                return false;
+            }
+            limbs[0] = sum;
+            limbs[1] = 1u;
+            out->limbs = limbs;
+            out->limbCount = 2u;
+            out->sign = sign;
+            return true;
+        }
+        if (current > magnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, current - magnitude, sign);
+        }
+        if (current < magnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(out, magnitude - current, addSign);
+        }
+        InfiniteCoordInit(out);
+        return true;
+    }
+
+    InfiniteCoord temporary;
+    if (!InfiniteCoordTryCopy(&temporary, source))
+    {
+        return false;
+    }
+    if (!InfiniteCoordTryAddInt64InPlace(&temporary, addend))
+    {
+        InfiniteCoordDestroy(&temporary);
+        return false;
+    }
+    *out = temporary;
+    return true;
+}
+
+static uint64_t Multiply64(uint64_t left, uint64_t right, uint64_t* outHigh)
+{
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+    return _umul128(left, right, outHigh);
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(_M_ARM64)
+    // _umul128 существует только на x64; на ARM64 верхнюю половину даёт umulh,
+    // а нижняя — обычное 64-битное произведение с переносом по модулю 2^64.
+    *outHigh = __umulh(left, right);
+    return left * right;
+#else
+    // Four 32x32 products avoid the non-standard __int128 extension and
+    // keep the exact same result on MSVC, GCC, Clang, glibc and musl.
+    uint64_t leftLow = (uint32_t)left;
+    uint64_t leftHigh = left >> 32U;
+    uint64_t rightLow = (uint32_t)right;
+    uint64_t rightHigh = right >> 32U;
+    uint64_t lowProduct = leftLow * rightLow;
+    uint64_t crossLeft = leftHigh * rightLow;
+    uint64_t crossRight = leftLow * rightHigh;
+    uint64_t middle =
+        (lowProduct >> 32U) +
+        (uint32_t)crossLeft +
+        (uint32_t)crossRight;
+    *outHigh =
+        leftHigh * rightHigh +
+        (crossLeft >> 32U) +
+        (crossRight >> 32U) +
+        (middle >> 32U);
+    return (middle << 32U) | (uint32_t)lowProduct;
+#endif
+}
+
+static uint64_t AddWithCarry64(
+    uint64_t left, uint64_t right, uint64_t carry, uint64_t* outValue)
+{
+    uint64_t sum = left + right;
+    uint64_t firstCarry = sum < left ? 1u : 0u;
+    uint64_t result = sum + carry;
+    uint64_t secondCarry = result < sum ? 1u : 0u;
+    *outValue = result;
+    return firstCarry | secondCarry;
+}
+
+static void AddWideProduct(uint64_t* limbs, uint32_t index,
+    uint64_t low, uint64_t high, uint64_t extra)
+{
+    uint64_t carry = AddWithCarry64(
+        limbs[index], low, 0, &limbs[index]);
+    ++index;
+    carry = AddWithCarry64(
+        limbs[index], high, carry, &limbs[index]);
+    ++index;
+    carry = AddWithCarry64(
+        limbs[index], extra, carry, &limbs[index]);
+    ++index;
+
+    while (carry != 0)
+    {
+        carry = AddWithCarry64(
+            limbs[index], 0, carry, &limbs[index]);
+        ++index;
+    }
+}
+
+bool InfiniteCoordTryCopySquareAddInt64(
+    InfiniteCoord* out, const InfiniteCoord* source, int64_t addend)
+{
+    InfiniteCoord value;
+    if (!InfiniteCoordTryCopyAddInt64(&value, source, addend))
+    {
+        return false;
+    }
+
+    if (value.limbCount == 0)
+    {
+        *out = value;
+        return true;
+    }
+
+    if (value.limbCount > (UINT32_MAX - 1u) / 2u)
+    {
+        InfiniteCoordDestroy(&value);
+        return false;
+    }
+
+    uint32_t capacity = value.limbCount * 2u + 1u;
+    uint64_t* limbs = PlatformAllocate(
+        (size_t)capacity * sizeof(uint64_t), true);
+    if (limbs == NULL)
+    {
+        InfiniteCoordDestroy(&value);
+        return false;
+    }
+
+    // Специализированное возведение в квадрат: диагональ считается один раз,
+    // попарные произведения — один раз и удваиваются. Почти вдвое меньше
+    // 64x64 умножений, чем у общего школьного умножения.
+    for (uint32_t leftIndex = 0;
+         leftIndex < value.limbCount; ++leftIndex)
+    {
+        uint64_t diagonalHigh;
+        uint64_t diagonalLow = Multiply64(
+            value.limbs[leftIndex], value.limbs[leftIndex], &diagonalHigh);
+        AddWideProduct(limbs, leftIndex * 2u,
+            diagonalLow, diagonalHigh, 0);
+
+        for (uint32_t rightIndex = leftIndex + 1;
+             rightIndex < value.limbCount; ++rightIndex)
+        {
+            uint64_t productHigh;
+            uint64_t productLow = Multiply64(
+                value.limbs[leftIndex], value.limbs[rightIndex], &productHigh);
+            uint64_t doubledLow = productLow << 1;
+            uint64_t doubledHigh = (productHigh << 1) | (productLow >> 63);
+            uint64_t extra = productHigh >> 63;
+            AddWideProduct(limbs, leftIndex + rightIndex,
+                doubledLow, doubledHigh, extra);
+        }
+    }
+
+    InfiniteCoordDestroy(&value);
+
+    out->limbs = limbs;
+    out->limbCount = capacity;
+    out->sign = 1;
+    InfiniteCoordNormalize(out);
+    return true;
+}
+
+bool InfiniteCoordTryCopyShiftRight(
+    InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount)
+{
+    if (bitCount == 0)
+    {
+        return InfiniteCoordTryCopy(out, source);
+    }
+    if (bitCount >= 64)
+    {
+        return false;
+    }
+
+    InfiniteCoordInit(out);
+    if (source->limbCount == 0)
+    {
+        return true;
+    }
+
+    out->limbs = PlatformAllocate(
+        (size_t)source->limbCount * sizeof(uint64_t), false);
+    if (out->limbs == NULL)
+    {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < source->limbCount; ++index)
+    {
+        uint64_t shifted = source->limbs[index] >> bitCount;
+        if (index + 1 < source->limbCount)
+        {
+            shifted |= source->limbs[index + 1] << (64u - bitCount);
+        }
+        out->limbs[index] = shifted;
+    }
+
+    out->limbCount = source->limbCount;
+    out->sign = source->sign;
+    InfiniteCoordNormalize(out);
+    return true;
+}
+
+bool InfiniteCoordTrySubtractToInt64(
+    const InfiniteCoord* left, const InfiniteCoord* right, int64_t* outDifference)
+{
+    if (outDifference == NULL) return false;
+
+    int32_t sign;
+    uint64_t magnitude;
+    bool wide;
+    InfiniteCoordDifferenceInfo(left, right, &sign, &magnitude, &wide);
+    if (wide) return false;
+
+    if (sign > 0)
+    {
+        if (magnitude > (uint64_t)INT64_MAX) return false;
+        *outDifference = (int64_t)magnitude;
+    }
+    else if (sign < 0)
+    {
+        if (magnitude > (1ull << 63)) return false;
+        *outDifference = magnitude == (1ull << 63)
+            ? INT64_MIN : -(int64_t)magnitude;
+    }
+    else
+    {
+        *outDifference = 0;
+    }
+    return true;
+}
+
+bool InfiniteCoordEqualsOffsets(const InfiniteCoord* left, int64_t leftOffset,
+    const InfiniteCoord* right, int64_t rightOffset)
+{
+    int32_t baseSign;
+    uint64_t baseMagnitude;
+    bool baseWide;
+    InfiniteCoordDifferenceInfo(
+        left, right, &baseSign, &baseMagnitude, &baseWide);
+    if (baseWide) return false;
+
+    int32_t offsetSign;
+    uint64_t offsetMagnitude;
+    SignedDifference(rightOffset, leftOffset, &offsetSign, &offsetMagnitude);
+    return baseSign == offsetSign && baseMagnitude == offsetMagnitude;
+}
+
+void InfiniteCoordSwap(InfiniteCoord* a, InfiniteCoord* b)
+{
+    InfiniteCoord temporary = *a;
+    *a = *b;
+    *b = temporary;
+}
+
+static uint64_t Divide128By64(uint64_t high, uint64_t low,
+    uint64_t divisor, uint64_t* outRemainder)
+{
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+    return _udiv128(high, low, divisor, outRemainder);
+#elif defined(__clang__) && defined(_M_X64)
+    // У clang-cl нет интринсика _udiv128, а деление unsigned __int128
+    // требует функций compiler-rt, которых нет в сборке с /NODEFAULTLIB.
+    // На каждом шаге high < divisor, поэтому частное помещается в uint64_t.
+    __asm__("divq %2"
+        : "+a"(low), "+d"(high)
+        : "r"(divisor)
+        : "cc");
+    *outRemainder = high;
+    return low;
+#else
+    // Переносимый резервный путь без деления расширенного целого.
+    uint64_t quotient = 0;
+    for (uint32_t bit = 64; bit > 0; --bit)
+    {
+        uint32_t shift = bit - 1;
+        uint64_t carry = high >> 63;
+        high = (high << 1) | ((low >> shift) & 1u);
+        if (carry != 0 || high >= divisor)
+        {
+            high -= divisor;
+            quotient |= 1ull << shift;
+        }
+    }
+    *outRemainder = high;
+    return quotient;
+#endif
+}
+
+uint64_t InfiniteCoordDivFloorSmallLow(
+    const InfiniteCoord* value, uint64_t divisor, uint64_t* outRemainder)
+{
+    uint64_t remainder = 0;
+    uint64_t quotientLow = 0;
+
+    for (uint32_t index = value->limbCount; index > 0; --index)
+    {
+        quotientLow = Divide128By64(
+            remainder, value->limbs[index - 1], divisor, &remainder);
+    }
+
+    if (value->sign >= 0)
+    {
+        *outRemainder = remainder;
+        return quotientLow;
+    }
+
+    if (remainder == 0)
+    {
+        *outRemainder = 0;
+        return 0u - quotientLow;
+    }
+
+    *outRemainder = divisor - remainder;
+    return 0u - quotientLow - 1u;
+}
+
+int32_t InfiniteCoordCompareAddInt64ToInt64(
+    const InfiniteCoord* value, int64_t addend, int64_t subtrahend)
+{
+    int32_t differenceSign;
+    uint64_t differenceMagnitude;
+    SignedDifference(addend, subtrahend, &differenceSign, &differenceMagnitude);
+    return InfiniteCoordSignAfterSmall(value, differenceSign, differenceMagnitude);
+}
+
+uint64_t InfiniteCoordHashOffset(const InfiniteCoord* base, int64_t offset)
+{
+    uint64_t low;
+    uint64_t high;
+    InfiniteCoordTwosComplementLow128(base, &low, &high);
+
+    uint64_t previous = low;
+    low += (uint64_t)offset;
+    uint64_t carry = low < previous ? 1u : 0u;
+    high += (offset < 0 ? UINT64_MAX : 0u) + carry;
+
+    return Mix64(low) ^ Mix64(high + 0x9e3779b97f4a7c15ULL);
+}
+
+bool InfiniteCoordEqualsOffset(const InfiniteCoord* value, const InfiniteCoord* base, int64_t offset)
+{
+    if (offset == 0)
+    {
+        if (value->sign != base->sign || value->limbCount != base->limbCount)
+        {
+            return false;
+        }
+        for (uint32_t i = 0; i < value->limbCount; ++i)
+        {
+            if (value->limbs[i] != base->limbs[i]) return false;
+        }
+        return true;
+    }
+
+    int32_t offsetSign = offset < 0 ? -1 : 1;
+    uint64_t magnitude = Int64Magnitude(offset);
+
+    if (base->sign == 0)
+    {
+        return value->sign == offsetSign && value->limbCount == 1
+            && value->limbs[0] == magnitude;
+    }
+
+    if (base->sign == offsetSign)
+    {
+        if (value->sign != base->sign)
+        {
+            return false;
+        }
+
+        uint64_t carry = magnitude;
+        uint32_t expectedCount = base->limbCount;
+        for (uint32_t i = 0; i < base->limbCount; ++i)
+        {
+            uint64_t limb = base->limbs[i] + carry;
+            carry = limb < base->limbs[i] ? 1u : 0u;
+            if (i >= value->limbCount || value->limbs[i] != limb)
+            {
+                return false;
+            }
+        }
+        if (carry != 0)
+        {
+            expectedCount++;
+            if (value->limbCount < expectedCount || value->limbs[expectedCount - 1] != 1u)
+            {
+                return false;
+            }
+        }
+        return value->limbCount == expectedCount;
+    }
+
+    int32_t comparison = InfiniteCoordCompareMagnitudeSmall(base, magnitude);
+    if (comparison == 0)
+    {
+        return value->sign == 0;
+    }
+    if (comparison < 0)
+    {
+        uint64_t baseMagnitude = base->limbCount == 0 ? 0 : base->limbs[0];
+        return value->sign == offsetSign && value->limbCount == 1
+            && value->limbs[0] == magnitude - baseMagnitude;
+    }
+
+    if (value->sign != base->sign)
+    {
+        return false;
+    }
+
+    uint64_t borrow = magnitude;
+    uint32_t expectedCount = base->limbCount;
+    for (uint32_t i = 0; i < base->limbCount; ++i)
+    {
+        uint64_t limb = base->limbs[i] - borrow;
+        borrow = base->limbs[i] < borrow ? 1u : 0u;
+        if (i < value->limbCount)
+        {
+            if (value->limbs[i] != limb) return false;
+        }
+        else if (limb != 0)
+        {
+            return false;
+        }
+        if (i == base->limbCount - 1 && limb == 0)
+        {
+            expectedCount--;
+        }
+    }
+    return value->limbCount == expectedCount;
+}
+
+int64_t InfiniteCoordSubtractFromInt64Clamped(int64_t scalar, const InfiniteCoord* value)
+{
+    if (value->sign == 0)
+    {
+        return scalar;
+    }
+    if (value->limbCount > 1)
+    {
+        return value->sign > 0 ? INT64_MIN : INT64_MAX;
+    }
+
+    uint64_t magnitude = value->limbs[0];
+    if (value->sign > 0)
+    {
+        if (scalar < 0)
+        {
+            uint64_t room = (uint64_t)(scalar - INT64_MIN);
+            return magnitude > room ? INT64_MIN : scalar - (int64_t)magnitude;
+        }
+        if (magnitude > (uint64_t)scalar + (uint64_t)INT64_MAX + 1u)
+        {
+            return INT64_MIN;
+        }
+        uint64_t resultMagnitude = magnitude - (uint64_t)scalar;
+        if (magnitude > (uint64_t)scalar)
+        {
+            return resultMagnitude == (1ULL << 63) ? INT64_MIN : -(int64_t)resultMagnitude;
+        }
+        return scalar - (int64_t)magnitude;
+    }
+
+    if (scalar >= 0)
+    {
+        return magnitude > (uint64_t)INT64_MAX - (uint64_t)scalar
+            ? INT64_MAX : scalar + (int64_t)magnitude;
+    }
+    uint64_t negativeMagnitude = Int64Magnitude(scalar);
+    if (magnitude >= negativeMagnitude)
+    {
+        uint64_t positive = magnitude - negativeMagnitude;
+        return positive > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)positive;
+    }
+    return -(int64_t)(negativeMagnitude - magnitude);
+}
+
+typedef struct ShortCoordinateWriter
+{
+    wchar_t* text;
+    uint32_t capacity;
+    uint32_t length;
+} ShortCoordinateWriter;
+
+static void ShortCoordinateWriteCharacter(ShortCoordinateWriter* writer, wchar_t character)
+{
+    if (writer->capacity == 0)
+    {
+        return;
+    }
+    if (writer->length + 1 < writer->capacity)
+    {
+        writer->text[writer->length++] = character;
+        writer->text[writer->length] = L'\0';
+    }
+}
+
+static void ShortCoordinateWriteUnsigned(ShortCoordinateWriter* writer, uint64_t value)
+{
+    wchar_t reversed[24];
+    uint32_t count = 0;
+    do
+    {
+        reversed[count++] = (wchar_t)(L'0' + value % 10u);
+        value /= 10u;
+    }
+    while (value != 0);
+
+    while (count > 0)
+    {
+        ShortCoordinateWriteCharacter(writer, reversed[--count]);
+    }
+}
+
+static uint32_t UnsignedDecimalDigits(uint64_t value)
+{
+    uint32_t digits = 1;
+    while (value >= 10u)
+    {
+        value /= 10u;
+        ++digits;
+    }
+    return digits;
+}
+
+void InfiniteCoordFormatShortOffsetW(const InfiniteCoord* base, int64_t offset,
+    wchar_t* outText, uint32_t capacity)
+{
+    if (capacity == 0)
+    {
+        return;
+    }
+    outText[0] = L'\0';
+
+    InfiniteCoord value;
+    if (!InfiniteCoordTryCopyAddInt64(&value, base, offset))
+    {
+        if (capacity > 1)
+        {
+            outText[0] = L'?';
+            outText[1] = L'\0';
+        }
+        return;
+    }
+
+    ShortCoordinateWriter writer = { outText, capacity, 0 };
+    if (value.sign < 0)
+    {
+        ShortCoordinateWriteCharacter(&writer, L'-');
+    }
+
+    if (value.limbCount == 0)
+    {
+        ShortCoordinateWriteCharacter(&writer, L'0');
+    }
+    else if (value.limbCount == 1)
+    {
+        uint64_t magnitude = value.limbs[0];
+        uint32_t digits = UnsignedDecimalDigits(magnitude);
+        if (digits <= 7)
+        {
+            ShortCoordinateWriteUnsigned(&writer, magnitude);
+        }
+        else
+        {
+            uint64_t divisor = 1;
+            for (uint32_t index = 3; index < digits; ++index)
+            {
+                divisor *= 10u;
+            }
+            uint64_t leading = magnitude / divisor;
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + leading / 100u));
+            ShortCoordinateWriteCharacter(&writer, L'.');
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + (leading / 10u) % 10u));
+            ShortCoordinateWriteCharacter(&writer, (wchar_t)(L'0' + leading % 10u));
+            ShortCoordinateWriteCharacter(&writer, L'e');
+            ShortCoordinateWriteUnsigned(&writer, digits - 1u);
+        }
+    }
+    else
+    {
+        uint64_t top = value.limbs[value.limbCount - 1];
+        uint64_t highestBit = (uint64_t)(value.limbCount - 1) * 64u
+            + HighestSetBit(top);
+        ShortCoordinateWriteCharacter(&writer, L'~');
+        ShortCoordinateWriteCharacter(&writer, L'2');
+        ShortCoordinateWriteCharacter(&writer, L'^');
+        ShortCoordinateWriteUnsigned(&writer, highestBit);
+    }
+
+    InfiniteCoordDestroy(&value);
+}
+
+// === Общая арифметика ===
+
+int32_t InfiniteCoordSign(const InfiniteCoord* value)
+{
+    return value == NULL ? 0 : value->sign;
+}
+
+int32_t InfiniteCoordCompare(const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (left->sign != right->sign)
+    {
+        return left->sign < right->sign ? -1 : 1;
+    }
+    if (left->sign == 0)
+    {
+        return 0;
+    }
+    int32_t magnitude = InfiniteCoordCompareMagnitude(left, right);
+    return left->sign > 0 ? magnitude : -magnitude;
+}
+
+static bool TryAllocateLimbs(InfiniteCoord* value, uint32_t limbCount)
+{
+    if (limbCount == 0)
+    {
+        InfiniteCoordInit(value);
+        return true;
+    }
+    // Без обнуления: каждый вызывающий записывает все лимбы до единого.
+    // Обнуление кучей стоило лишнего прохода по свежей памяти на каждом
+    // выделении, а пользы не приносило.
+    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    value->limbs = limbs;
+    value->limbCount = limbCount;
+    value->sign = 0;
+    return true;
+}
+
+// |left| + |right| в out. Знак вызывающий ставит сам.
+static bool TryAddMagnitudes(
+    InfiniteCoord* out, const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    uint32_t count = left->limbCount > right->limbCount
+        ? left->limbCount : right->limbCount;
+    if (count == UINT32_MAX)
+    {
+        return false;
+    }
+    InfiniteCoordInit(out);
+    if (!TryAllocateLimbs(out, count + 1u))
+    {
+        return false;
+    }
+
+    uint64_t carry = 0;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        uint64_t a = index < left->limbCount ? left->limbs[index] : 0;
+        uint64_t b = index < right->limbCount ? right->limbs[index] : 0;
+        uint64_t sum = a + b;
+        uint64_t firstCarry = sum < a ? 1u : 0u;
+        uint64_t result = sum + carry;
+        uint64_t secondCarry = result < sum ? 1u : 0u;
+        out->limbs[index] = result;
+        carry = firstCarry | secondCarry;
+    }
+    out->limbs[count] = carry;
+    return true;
+}
+
+// |larger| - |smaller| в out; вызывающий обязан гарантировать порядок.
+static bool TrySubtractMagnitudes(
+    InfiniteCoord* out, const InfiniteCoord* larger, const InfiniteCoord* smaller)
+{
+    InfiniteCoordInit(out);
+    if (!TryAllocateLimbs(out, larger->limbCount))
+    {
+        return false;
+    }
+
+    uint64_t borrow = 0;
+    for (uint32_t index = 0; index < larger->limbCount; ++index)
+    {
+        uint64_t a = larger->limbs[index];
+        uint64_t b = index < smaller->limbCount ? smaller->limbs[index] : 0;
+        uint64_t difference = a - b;
+        uint64_t firstBorrow = a < b ? 1u : 0u;
+        uint64_t result = difference - borrow;
+        uint64_t secondBorrow = difference < borrow ? 1u : 0u;
+        out->limbs[index] = result;
+        borrow = firstBorrow | secondBorrow;
+    }
+    return true;
+}
+
+bool InfiniteCoordTryAdd(
+    InfiniteCoord* out, const InfiniteCoord* left, const InfiniteCoord* right)
+{
+    if (out == NULL || left == NULL || right == NULL)
+    {
+        return false;
+    }
+    if (left->sign == 0)
+    {
+        return InfiniteCoordTryCopy(out, right);
+    }
+    if (right->sign == 0)
+    {
+        return InfiniteCoordTryCopy(out, left);
+    }
+
+    // Типовой малоразмерный случай: оба слагаемых — один лимб. Сумма
+    // считается прямо над их limbs[0], и заводится ровно нужное число лимбов:
+    // прежний общий путь всегда просил «max + 1» и вдобавок прогонял Normalize
+    // по готовому результату.
+    if (left->limbCount == 1u && right->limbCount == 1u)
+    {
+        uint64_t leftMagnitude = left->limbs[0];
+        uint64_t rightMagnitude = right->limbs[0];
+        InfiniteCoordInit(out);
+
+        if (left->sign == right->sign)
+        {
+            uint64_t sum = leftMagnitude + rightMagnitude;
+            if (sum >= leftMagnitude)
+            {
+                return InfiniteCoordTryAssignSingleLimb(out, sum, left->sign);
+            }
+            uint64_t* limbs = PlatformAllocate(2u * sizeof(uint64_t), false);
+            if (limbs == NULL)
+            {
+                return false;
+            }
+            limbs[0] = sum;
+            limbs[1] = 1u;
+            out->limbs = limbs;
+            out->limbCount = 2u;
+            out->sign = left->sign;
+            return true;
+        }
+
+        if (leftMagnitude == rightMagnitude)
+        {
+            return true;
+        }
+        if (leftMagnitude > rightMagnitude)
+        {
+            return InfiniteCoordTryAssignSingleLimb(
+                out, leftMagnitude - rightMagnitude, left->sign);
+        }
+        return InfiniteCoordTryAssignSingleLimb(
+            out, rightMagnitude - leftMagnitude, right->sign);
+    }
+
+    InfiniteCoord result;
+    if (left->sign == right->sign)
+    {
+        if (!TryAddMagnitudes(&result, left, right))
+        {
+            return false;
+        }
+        result.sign = left->sign;
+    }
+    else
+    {
+        int32_t order = InfiniteCoordCompareMagnitude(left, right);
+        if (order == 0)
+        {
+            InfiniteCoordInit(out);
+            return true;
+        }
+        const InfiniteCoord* larger = order > 0 ? left : right;
+        const InfiniteCoord* smaller = order > 0 ? right : left;
+        if (!TrySubtractMagnitudes(&result, larger, smaller))
+        {
+            return false;
+        }
+        result.sign = larger->sign;
+    }
+
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+bool InfiniteCoordTryCopyNegate(InfiniteCoord* out, const InfiniteCoord* source)
+{
+    if (!InfiniteCoordTryCopy(out, source))
+    {
+        return false;
+    }
+    out->sign = -out->sign;
+    return true;
+}
+
+bool InfiniteCoordTryCopyMultiplyInt64(
+    InfiniteCoord* out, const InfiniteCoord* source, int64_t factor)
+{
+    if (out == NULL || source == NULL)
+    {
+        return false;
+    }
+    if (source->sign == 0 || factor == 0)
+    {
+        InfiniteCoordInit(out);
+        return true;
+    }
+
+    uint64_t magnitude = Int64Magnitude(factor);
+    InfiniteCoord result;
+    InfiniteCoordInit(&result);
+    if (source->limbCount == UINT32_MAX || !TryAllocateLimbs(&result, source->limbCount + 1u))
+    {
+        return false;
+    }
+
+    uint64_t carry = 0;
+    for (uint32_t index = 0; index < source->limbCount; ++index)
+    {
+        uint64_t high = 0;
+        uint64_t low = Multiply64(source->limbs[index], magnitude, &high);
+        uint64_t sum = low + carry;
+        if (sum < low)
+        {
+            ++high;
+        }
+        result.limbs[index] = sum;
+        carry = high;
+    }
+    result.limbs[source->limbCount] = carry;
+    result.sign = factor < 0 ? -source->sign : source->sign;
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+bool InfiniteCoordTryCopyShiftLeft(
+    InfiniteCoord* out, const InfiniteCoord* source, uint32_t bitCount)
+{
+    if (out == NULL || source == NULL)
+    {
+        return false;
+    }
+    if (source->sign == 0)
+    {
+        InfiniteCoordInit(out);
+        return true;
+    }
+
+    uint32_t limbShift = bitCount / 64u;
+    uint32_t bitShift = bitCount % 64u;
+    uint64_t resultCount = (uint64_t)source->limbCount + limbShift + 1u;
+    if (resultCount > UINT32_MAX)
+    {
+        return false;
+    }
+
+    InfiniteCoord result;
+    InfiniteCoordInit(&result);
+    uint32_t resultLimbCount = (uint32_t)resultCount;
+    if (resultLimbCount == 0u || !TryAllocateLimbs(&result, resultLimbCount))
+    {
+        return false;
+    }
+
+    // Каждый лимб результата пишется ровно один раз, а не собирается двумя
+    // «или»: тогда выделенную память не нужно предварительно обнулять.
+    for (uint32_t index = 0; index < limbShift; ++index)
+    {
+        result.limbs[index] = 0u;
+    }
+    if (bitShift == 0u)
+    {
+        for (uint32_t index = 0; index < source->limbCount; ++index)
+        {
+            result.limbs[index + limbShift] = source->limbs[index];
+        }
+        result.limbs[source->limbCount + limbShift] = 0u;
+    }
+    else
+    {
+        uint64_t carry = 0u;
+        for (uint32_t index = 0; index < source->limbCount; ++index)
+        {
+            uint64_t limb = source->limbs[index];
+            result.limbs[index + limbShift] = (limb << bitShift) | carry;
+            carry = limb >> (64u - bitShift);
+        }
+        result.limbs[source->limbCount + limbShift] = carry;
+    }
+    result.sign = source->sign;
+    InfiniteCoordNormalize(&result);
+    *out = result;
+    return true;
+}
+
+// 2^exponent как double, без math.h: показатель кладётся прямо в поле
+// экспоненты IEEE 754. За верхней границей формата возвращается DBL_MAX.
+static double PowerOfTwo(uint32_t exponent)
+{
+    if (exponent > 1023u)
+    {
+        return DBL_MAX;
+    }
+    uint64_t bits = (uint64_t)(exponent + 1023u) << 52;
+    double result = 0.0;
+    // Exact-size IEEE 754 bit copy; the no-CRT runtime has no Annex K API.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+double InfiniteCoordToDoubleSaturating(const InfiniteCoord* value)
+{
+    if (value == NULL || value->sign == 0 || value->limbCount == 0)
+    {
+        return 0.0;
+    }
+
+    // Однолимбовое значение переводится прямо: битовый индекс тут не нужен,
+    // а его поиск был заметной долей стоимости этой функции.
+    if (value->limbCount == 1u)
+    {
+        double magnitude = (double)value->limbs[0];
+        return value->sign > 0 ? magnitude : -magnitude;
+    }
+
+    uint32_t topIndex = value->limbCount - 1u;
+    uint64_t top = value->limbs[topIndex];
+    uint64_t bitLength = (uint64_t)topIndex * 64u + HighestSetBit(top) + 1u;
+    if (bitLength > 1024u)
+    {
+        return value->sign > 0 ? DBL_MAX : -DBL_MAX;
+    }
+
+    // Достаточно 64 старших бит: остальные ниже точности double.
+    uint64_t mantissa = top;
+    uint32_t shift = 0;
+    if (bitLength > 64u)
+    {
+        shift = (uint32_t)(bitLength - 64u);
+        uint32_t bitShift = shift % 64u;
+        if (bitShift != 0 && topIndex > 0)
+        {
+            mantissa = (top << (64u - bitShift)) | (value->limbs[topIndex - 1u] >> bitShift);
+        }
+    }
+
+    double magnitude = (double)mantissa;
+    if (shift != 0)
+    {
+        double scale = PowerOfTwo(shift);
+        if (scale >= DBL_MAX / magnitude)
+        {
+            return value->sign > 0 ? DBL_MAX : -DBL_MAX;
+        }
+        magnitude *= scale;
+    }
+    return value->sign > 0 ? magnitude : -magnitude;
+}
+
+bool InfiniteCoordTrySetFromDouble(InfiniteCoord* out, double value)
+{
+    if (out == NULL)
+    {
+        return false;
+    }
+
+    // NaN и бесконечность распознаются непосредственно по IEEE 754 битам.
+    // Numeric, как и physics, собирается с точной FP-семантикой.
+    uint64_t valueBits = 0;
+    // Exact-size object representation copy; no Annex K in the no-CRT runtime.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    memcpy(&valueBits, &value, sizeof(valueBits));
+    if (((valueBits >> 52) & 0x7FFu) == 0x7FFu)
+    {
+        return false;
+    }
+
+    InfiniteCoordInit(out);
+    int32_t sign = value < 0.0 ? -1 : 1;
+    double magnitude = value < 0.0 ? -value : value;
+    if (magnitude < 1.0)
+    {
+        return true;
+    }
+
+    uint64_t bits = 0;
+    // Exact-size object representation copy; no Annex K in the no-CRT runtime.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    memcpy(&bits, &magnitude, sizeof(bits));
+    uint32_t exponent = (uint32_t)((bits >> 52) & 0x7FFu);
+    uint64_t fraction = bits & 0xFFFFFFFFFFFFFull;
+    // Нормальное число: 1.fraction * 2^(exponent-1023). Целая часть равна
+    // мантиссе, сдвинутой на exponent-1023-52 бит.
+    uint64_t mantissa = fraction | (1ull << 52);
+    int32_t shift = (int32_t)exponent - 1023 - 52;
+
+    // Мантисса укладывается в один лимб, поэтому результат собирается сразу
+    // в нужной раскладке. Прежний путь заводил промежуточное число под саму
+    // мантиссу и второе под сдвинутое значение: два выделения и одно
+    // освобождение там, где хватает одного выделения.
+    if (shift < 0)
+    {
+        // Отрицательный сдвиг — усечение к нулю: младшие биты отбрасываются.
+        uint32_t right = (uint32_t)(-shift);
+        uint64_t truncated = right >= 64u ? 0u : mantissa >> right;
+        if (truncated == 0u)
+        {
+            return true;
+        }
+        uint64_t* limbs = PlatformAllocate(sizeof(uint64_t), false);
+        if (limbs == NULL)
+        {
+            return false;
+        }
+        limbs[0] = truncated;
+        out->limbs = limbs;
+        out->limbCount = 1u;
+        out->sign = sign;
+        return true;
+    }
+
+    uint32_t limbShift = (uint32_t)shift / 64u;
+    uint32_t bitShift = (uint32_t)shift % 64u;
+    uint64_t high = bitShift == 0u ? 0u : mantissa >> (64u - bitShift);
+    uint32_t limbCount = limbShift + (high != 0u ? 2u : 1u);
+    if (limbCount < limbShift)
+    {
+        return false;
+    }
+    uint64_t* limbs = PlatformAllocate((size_t)limbCount * sizeof(uint64_t), false);
+    if (limbs == NULL)
+    {
+        return false;
+    }
+    for (uint32_t index = 0; index < limbShift; ++index)
+    {
+        limbs[index] = 0u;
+    }
+    limbs[limbShift] = bitShift == 0u ? mantissa : mantissa << bitShift;
+    if (high != 0u)
+    {
+        limbs[limbShift + 1u] = high;
+    }
+    out->limbs = limbs;
+    out->limbCount = limbCount;
+    out->sign = sign;
+    return true;
+}

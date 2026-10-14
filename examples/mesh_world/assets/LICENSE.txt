@@ -1,0 +1,4 @@
+These ground.obj and tree.obj assets were created for this example.
+They are dedicated to the public domain under CC0 1.0 Universal:
+https://creativecommons.org/publicdomain/zero/1.0/
+The demo does not use third-party art or model libraries.

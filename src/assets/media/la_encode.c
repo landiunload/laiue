@@ -1,0 +1,262 @@
+#include "media/la_encode.h"
+
+#include <stddef.h>
+#include <string.h>
+
+#define LA_MAGIC 0x3153414Cu   // L, A, S, 1 little-endian
+
+#define LA_MIN_SAMPLE_RATE 1000u
+#define LA_MAX_SAMPLE_RATE 384000u
+#define SOUND_LA_MAX_FILE_BYTES 0x20000000u
+
+// === IMA ADPCM ===
+//
+// Таблицы совпадают с декодерными в src/audio/audio_pack.c и с копией в
+// tests/audio_pack_test.c. Это стандартные таблицы IMA, и каждая из трёх
+// сторон держит свою намеренно: декодер проверяется независимым
+// кодировщиком теста, а этот кодировщик — уже проверенным декодером.
+// Общая таблица сделала бы обе проверки слепыми к ошибке в ней самой.
+
+static const int32_t ADPCM_INDEX_TABLE[16] = {
+    -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8,
+};
+
+static const int32_t ADPCM_STEP_TABLE[89] = {
+    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,
+    23,    25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,
+    73,    80,    88,    97,    107,   118,   130,   143,   157,   173,   190,   209,
+    230,   253,   279,   307,   337,   371,   408,   449,   494,   544,   598,   658,
+    724,   796,   876,   963,   1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,
+    2272,  2499,  2749,  3024,  3327,  3660,  4026,  4428,  4871,  5358,  5894,  6484,
+    7132,  7845,  8630,  9493,  10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350,
+    22385, 24623, 27086, 29794, 32767,
+};
+
+typedef struct AdpcmState
+{
+    int32_t predictor;
+    int32_t stepIndex;
+} AdpcmState;
+
+static void WriteU16Le(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)(value & 0xFFu);
+    bytes[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static void WriteU32Le(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)(value & 0xFFu);
+    bytes[1] = (uint8_t)((value >> 8) & 0xFFu);
+    bytes[2] = (uint8_t)((value >> 16) & 0xFFu);
+    bytes[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static uint32_t AdpcmChannelBytes(uint32_t frameCount)
+{
+    return (frameCount + 1u) / 2u;
+}
+
+static uint32_t EncodeNibble(AdpcmState *state, int32_t sample)
+{
+    int32_t step = ADPCM_STEP_TABLE[state->stepIndex];
+    int32_t difference = sample - state->predictor;
+
+    uint32_t nibble = 0u;
+    if (difference < 0)
+    {
+        nibble = 8u;
+        difference = -difference;
+    }
+
+    int32_t reconstructed = step >> 3;
+    if (difference >= step)
+    {
+        nibble |= 4u;
+        difference -= step;
+        reconstructed += step;
+    }
+    if (difference >= (step >> 1))
+    {
+        nibble |= 2u;
+        difference -= step >> 1;
+        reconstructed += step >> 1;
+    }
+    if (difference >= (step >> 2))
+    {
+        nibble |= 1u;
+        reconstructed += step >> 2;
+    }
+
+    // Предсказатель обновляется по восстановленному значению, а не по
+    // исходному: декодер другого не знает, и расхождение накапливалось бы.
+    int32_t predictor = state->predictor + ((nibble & 8u) != 0u ? -reconstructed : reconstructed);
+    if (predictor > 32767) predictor = 32767;
+    if (predictor < -32768) predictor = -32768;
+    state->predictor = predictor;
+
+    int32_t stepIndex = state->stepIndex + ADPCM_INDEX_TABLE[nibble];
+    if (stepIndex < 0) stepIndex = 0;
+    if (stepIndex > 88) stepIndex = 88;
+    state->stepIndex = stepIndex;
+    return nibble;
+}
+
+// Начальный шаг выбирается по первым перепадам. Он хранится в файле
+// именно затем, чтобы кодировщик мог это сделать: со шага 7 декодер
+// догонял бы быстрый сигнал десяток отсчётов, и весь разгон был бы
+// слышен как щелчок в начале звука.
+static int32_t ChooseInitialStepIndex(const int16_t *samples, uint32_t frameCount, uint32_t stride)
+{
+    int32_t largestDelta = 0;
+    uint32_t inspected = frameCount < 16u ? frameCount : 16u;
+    for (uint32_t index = 1; index < inspected; ++index)
+    {
+        int32_t delta = (int32_t)samples[(size_t)index * stride] -
+                        (int32_t)samples[(size_t)(index - 1u) * stride];
+        if (delta < 0) delta = -delta;
+        if (delta > largestDelta) largestDelta = delta;
+    }
+    for (int32_t index = 0; index < 88; ++index)
+    {
+        // Максимум, представимый одним полубайтом, — 1,875 шага.
+        if (ADPCM_STEP_TABLE[index] * 15 / 8 >= largestDelta) return index;
+    }
+    return 88;
+}
+
+// Каналы лежат последовательно, а не чередуются: клип распаковывается
+// целиком при загрузке, точки синхронизации не нужны, а декодировать так
+// проще. Исходные сэмплы при этом чередуются, поэтому канал читается с
+// шагом channelCount.
+static uint32_t EncodeAdpcmChannel(const int16_t *samples, uint32_t frameCount, uint32_t stride,
+                                   uint8_t *payload)
+{
+    AdpcmState state = {
+        .predictor = samples[0],
+        .stepIndex = ChooseInitialStepIndex(samples, frameCount, stride),
+    };
+    WriteU16Le(payload, (uint32_t)(uint16_t)(int16_t)state.predictor);
+    WriteU16Le(payload + 2, (uint32_t)state.stepIndex);
+
+    uint8_t *nibbles = payload + 4;
+    uint32_t byteCount = AdpcmChannelBytes(frameCount);
+    // Два ниббла складываются в регистре и записываются одним байтом:
+    // отдельный проход обнуления и read-modify-write на каждый кадр не
+    // нужны, а байты получаются те же (младший — чётный кадр, старший —
+    // нечётный). Нечётный последний кадр остаётся в младшем ниббле, как и
+    // прежде при обнулённом буфере.
+    uint32_t frame = 0u;
+    uint32_t fullBytes = frameCount / 2u;
+    for (uint32_t index = 0; index < fullBytes; ++index)
+    {
+        uint32_t low = EncodeNibble(&state, samples[(size_t)frame * stride]);
+        uint32_t high = EncodeNibble(&state, samples[(size_t)(frame + 1u) * stride]);
+        nibbles[index] = (uint8_t)(low | (high << 4));
+        frame += 2u;
+    }
+    if ((frameCount & 1u) != 0u)
+    {
+        nibbles[fullBytes] = (uint8_t)EncodeNibble(&state, samples[(size_t)frame * stride]);
+    }
+    return 4u + byteCount;
+}
+
+static SoundStatus PayloadBytes(SoundEncoding encoding, uint32_t frameCount, uint32_t channelCount,
+                             uint32_t *outBytes)
+{
+    if (frameCount == 0u || (channelCount != 1u && channelCount != 2u)) return SOUND_INVALID_ARGUMENT;
+    if (frameCount > SOUND_LA_MAX_FRAMES) return SOUND_TOO_LARGE;
+
+    uint64_t total = encoding == SOUND_ENCODING_PCM16
+                         ? (uint64_t)frameCount * channelCount * sizeof(int16_t)
+                         : (uint64_t)channelCount * (4u + (uint64_t)AdpcmChannelBytes(frameCount));
+    if (total + SOUND_LA_HEADER_BYTES > SOUND_LA_MAX_FILE_BYTES) return SOUND_TOO_LARGE;
+    *outBytes = (uint32_t)total;
+    return SOUND_OK;
+}
+
+SoundStatus SoundEncodedBytes(SoundEncoding encoding, uint32_t frameCount, uint32_t channelCount,
+                        uint32_t *outBytes)
+{
+    if (outBytes == NULL) return SOUND_INVALID_ARGUMENT;
+    if (encoding != SOUND_ENCODING_PCM16 && encoding != SOUND_ENCODING_ADPCM) return SOUND_INVALID_ARGUMENT;
+
+    uint32_t payload = 0u;
+    SoundStatus status = PayloadBytes(encoding, frameCount, channelCount, &payload);
+    if (status != SOUND_OK) return status;
+    *outBytes = SOUND_LA_HEADER_BYTES + payload;
+    return SOUND_OK;
+}
+
+SoundStatus SoundEncode(const SoundClip *clip, void *outBytes, uint32_t capacityBytes,
+                        uint32_t *outWritten)
+{
+    if (clip == NULL || clip->samples == NULL || outBytes == NULL) return SOUND_INVALID_ARGUMENT;
+    if (clip->encoding != SOUND_ENCODING_PCM16 && clip->encoding != SOUND_ENCODING_ADPCM)
+    {
+        return SOUND_INVALID_ARGUMENT;
+    }
+    if (clip->sampleRate < LA_MIN_SAMPLE_RATE || clip->sampleRate > LA_MAX_SAMPLE_RATE)
+    {
+        return SOUND_INVALID_ARGUMENT;
+    }
+
+    uint32_t payloadBytes = 0u;
+    SoundStatus status =
+        PayloadBytes(clip->encoding, clip->frameCount, clip->channelCount, &payloadBytes);
+    if (status != SOUND_OK) return status;
+
+    uint32_t required = SOUND_LA_HEADER_BYTES + payloadBytes;
+    if (capacityBytes < required) return SOUND_BUFFER_TOO_SMALL;
+
+    uint8_t *file = (uint8_t *)outBytes;
+    WriteU32Le(file, LA_MAGIC);
+    WriteU16Le(file + 4, SOUND_LA_VERSION);
+    WriteU16Le(file + 6, SOUND_LA_HEADER_BYTES);
+    WriteU16Le(file + 8, clip->channelCount);
+    WriteU16Le(file + 10, (uint32_t)clip->encoding);
+    WriteU32Le(file + 12, clip->sampleRate);
+    WriteU32Le(file + 16, clip->frameCount);
+    WriteU32Le(file + 20, payloadBytes);
+    // Отпечаток исходника: по нему движок узнаёт, не устарел ли файл, не
+    // читая сам исходник.
+    WriteU32Le(file + 24, (uint32_t)(clip->sourceModifiedTime & 0xFFFFFFFFu));
+    WriteU32Le(file + 28, (uint32_t)(clip->sourceModifiedTime >> 32));
+    WriteU32Le(file + 32, clip->sourceSizeBytes);
+    WriteU32Le(file + 36, 0u);
+
+    uint8_t *payload = file + SOUND_LA_HEADER_BYTES;
+    if (clip->encoding == SOUND_ENCODING_PCM16)
+    {
+        // Сэмплы пишутся побайтово, чтобы файл не зависел от порядка
+        // байтов машины, на которой собран пак. На little-endian хосте
+        // байты payload побитово равны байтам массива сэмплов, и целый
+        // блок копируется одним вызовом; на big-endian остаётся точный
+        // побайтовый путь.
+        uint32_t sampleCount = clip->frameCount * clip->channelCount;
+        uint16_t endianProbe = 1u;
+        if (*(const uint8_t *)&endianProbe == 1u)
+        {
+            memcpy(payload, clip->samples, (size_t)sampleCount * sizeof(int16_t));
+        }
+        else
+        {
+            for (uint32_t index = 0; index < sampleCount; ++index)
+            {
+                WriteU16Le(payload + (size_t)index * 2u, (uint32_t)(uint16_t)clip->samples[index]);
+            }
+        }
+    }
+    else
+    {
+        for (uint32_t channel = 0; channel < clip->channelCount; ++channel)
+        {
+            payload += EncodeAdpcmChannel(clip->samples + channel, clip->frameCount,
+                                          clip->channelCount, payload);
+        }
+    }
+
+    if (outWritten != NULL) *outWritten = required;
+    return SOUND_OK;
+}

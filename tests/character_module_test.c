@@ -1,0 +1,268 @@
+#include "character/character_service.h"
+#include "mod/module_host.h"
+#include "platform/system.h"
+#include "test_runtime.h"
+#include "../examples/walk/android/touch_controls.h"
+
+#include <stdbool.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#define CHARACTER_PROVIDER_NAME L"laiue_character.dll"
+#elif defined(__APPLE__)
+#define CHARACTER_PROVIDER_NAME L"liblaiue_character.dylib"
+#else
+#define CHARACTER_PROVIDER_NAME L"liblaiue_character.so"
+#endif
+
+static void Expect(bool condition, const char *message)
+{
+    if (!condition)
+    {
+        LaiueTestRuntimeWrite(message);
+        LaiueTestRuntimeWrite("\n");
+        LaiueTestRuntimeExit(1);
+    }
+}
+
+static bool Join(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY],
+                 const wchar_t *root, const wchar_t *name)
+{
+    uint32_t index = 0u;
+    while (root[index] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
+    {
+        output[index] = root[index];
+        ++index;
+    }
+    if (root[index] != L'\0')
+        return false;
+    if (index != 0u && output[index - 1u] != L'/' && output[index - 1u] != L'\\')
+        output[index++] = L'/';
+    uint32_t nameIndex = 0u;
+    while (name[nameIndex] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
+        output[index++] = name[nameIndex++];
+    if (name[nameIndex] != L'\0')
+        return false;
+    output[index] = L'\0';
+    return true;
+}
+
+static uint32_t SweepFlatFloor(const LaiueCharacterCollisionV1 *collision,
+                               const LaiueCharacterPositionV1 *position,
+                               int64_t halfExtent, int64_t deltaX, int64_t deltaY,
+                               int64_t deltaZ, LaiueCharacterPositionV1 *outPosition,
+                               uint32_t *outGrounded)
+{
+    const bool *fail = collision != NULL ? (const bool *)collision->context : NULL;
+    if (position == NULL || outPosition == NULL || outGrounded == NULL)
+        return 0u;
+    if (fail != NULL && *fail)
+    {
+        *outPosition = *position;
+        outPosition->localX += INT64_C(999999);
+        *outGrounded = 0u;
+        return 0u;
+    }
+    *outPosition = *position;
+    outPosition->localX += deltaX;
+    outPosition->localY += deltaY;
+    outPosition->localZ += deltaZ;
+    const int64_t floor = INT64_C(2000) + halfExtent;
+    if (outPosition->localZ <= floor)
+    {
+        outPosition->localZ = floor;
+        *outGrounded = 1u;
+    }
+    else
+        *outGrounded = 0u;
+    return 1u;
+}
+
+static void RunSequence(const LaiueCharacterServiceV1 *character,
+                        LaiueCharacterControllerV1 *controller,
+                        LaiueCharacterPositionV1 *outPosition)
+{
+    LaiueCharacterInputV1 input = {
+        .moveX = 1,
+        .moveY = -1,
+        .flags = LAIUE_CHARACTER_INPUT_SPRINT,
+    };
+    for (uint32_t tick = 0u; tick < 256u; ++tick)
+    {
+        if (tick == 1u)
+            input.flags |= LAIUE_CHARACTER_INPUT_JUMP;
+        else
+            input.flags &= ~LAIUE_CHARACTER_INPUT_JUMP;
+        Expect(character->step(controller, &input) != 0u,
+               "character step remains deterministic and in range");
+    }
+    Expect(character->getPosition(controller, outPosition) != 0u,
+           "character position is readable");
+}
+
+LAIUE_TEST_ENTRY(CharacterModuleTestEntryPoint)
+{
+    static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
+    static wchar_t providerPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    static LaiueModuleHostConfigV1 config;
+    static LaiueModuleDiagnostic diagnostic;
+
+    Expect(PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY),
+           "character test executable directory is available");
+    Expect(Join(providerPath, directory, CHARACTER_PROVIDER_NAME),
+           "character provider path fits");
+    LaiueModuleHostConfigInitialize(&config);
+    LaiueModuleHost *host = LaiueModuleHostCreate(&config, &diagnostic);
+    Expect(host != NULL, "character module host creates");
+    LaiueModuleBinaryV1 binary = {providerPath, 0u, NULL};
+    Expect(LaiueModuleHostLoad(host, &binary, 1u, &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+
+    uint32_t version = 0u;
+    uint32_t size = 0u;
+    const LaiueCharacterServiceV1 *character =
+        (const LaiueCharacterServiceV1 *)LaiueModuleHostQueryService(
+            host, LAIUE_CHARACTER_SERVICE_NAME, LAIUE_CHARACTER_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueCharacterServiceV1), &version, &size);
+    Expect(character != NULL && version == LAIUE_CHARACTER_SERVICE_ABI_VERSION_1 &&
+               size >= sizeof(*character) && character->create != NULL &&
+               character->step != NULL && character->destroy != NULL,
+           "character service table is published");
+
+    float stickX = 0.8f;
+    float stickY = 0.8f;
+    AndroidWalkClampStick(&stickX, &stickY);
+    Expect(stickX > 0.706f && stickX < 0.708f &&
+               stickY > 0.706f && stickY < 0.708f,
+           "virtual stick clamps diagonally to the unit circle");
+    stickX = 0.3f;
+    stickY = 0.4f;
+    AndroidWalkClampStick(&stickX, &stickY);
+    Expect(stickX == 0.3f && stickY == 0.4f,
+           "virtual stick keeps partial deflection magnitude");
+    float worldX = 0.0f;
+    float worldY = 0.0f;
+    AndroidWalkCameraRelativeMovement(
+        0.8f, 0.8f, 0.0f, 1.0f, &worldX, &worldY);
+    Expect(worldX > 0.706f && worldX < 0.708f &&
+               worldY > 0.706f && worldY < 0.708f,
+           "diagonal stick keeps its angle and unit speed limit");
+    AndroidWalkCameraRelativeMovement(
+        0.25f, 0.5f, 1.0f, 0.0f, &worldX, &worldY);
+    Expect(worldX == 0.5f && worldY == -0.25f,
+           "movement axes rotate with the camera yaw");
+    AndroidWalkCameraRelativeMovement(
+        0.0f, 0.5f, 0.0f, 0.0f, &worldX, &worldY);
+    Expect(worldX == 0.0f && worldY == 0.5f,
+           "vertical camera fallback preserves horizontal movement");
+    Expect(AndroidWalkAxisToFixed(0.5f) ==
+               LAIUE_CHARACTER_INPUT_AXIS_SCALE / 2,
+           "virtual stick axis converts to normalized fixed point");
+
+    LaiueCharacterCollisionV1 collision = {
+        .structSize = sizeof(collision),
+        .abiVersion = LAIUE_CHARACTER_ABI_VERSION_1,
+        .sweepAabb = SweepFlatFloor,
+    };
+    LaiueCharacterControllerV1 *controller = NULL;
+    Expect(character->create(&collision, 500, &controller) != 0u && controller != NULL,
+           "character controller creates");
+    const LaiueCharacterPositionV1 initial = {
+        .cellX = INT64_C(1) << 40,
+        .cellY = -(INT64_C(1) << 39),
+        .localX = LAIUE_CHARACTER_LOCAL_CELL_SIZE - 2,
+        .localY = 0,
+        .localZ = 2500,
+    };
+    Expect(character->setPosition(controller, &initial, 1u) != 0u,
+           "character accepts infinite starting coordinates");
+    LaiueCharacterPositionV1 first;
+    RunSequence(character, controller, &first);
+    Expect(character->setPosition(controller, &initial, 1u) != 0u,
+           "character can be reset for replay");
+    LaiueCharacterPositionV1 second;
+    RunSequence(character, controller, &second);
+    Expect(memcmp(&first, &second, sizeof(first)) == 0,
+           "same input sequence produces identical character state");
+    Expect(first.cellX == initial.cellX + 1,
+           "horizontal rebasing crosses the cell boundary exactly");
+    Expect(character->isGrounded(controller) != 0u,
+           "floor collision restores grounded state");
+    Expect(character->rebaseOrigin != NULL &&
+               character->rebaseOrigin(controller, -initial.cellX, -initial.cellY,
+                                       0, 0) != 0u,
+           "origin rebasing preserves a live controller");
+    LaiueCharacterPositionV1 rebased;
+    Expect(character->getPosition(controller, &rebased) != 0u &&
+               rebased.cellX == 1 && rebased.cellY == -1,
+           "origin rebasing translates cells without resetting the state");
+
+    const LaiueCharacterPositionV1 analogStart = {
+        .cellX = 0,
+        .cellY = 0,
+        .localX = 0,
+        .localY = 0,
+        .localZ = 2500,
+    };
+    LaiueCharacterInputV1 analogInput = {
+        .moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE / 2,
+        .moveY = 0,
+        .flags = LAIUE_CHARACTER_INPUT_ANALOG,
+    };
+    Expect(character->setPosition(controller, &analogStart, 1u) != 0u,
+           "character resets before analog speed check");
+    for (uint32_t tick = 0u; tick < LAIUE_CHARACTER_TICK_HZ; ++tick)
+        Expect(character->step(controller, &analogInput) != 0u,
+               "character accepts bounded analog input");
+    LaiueCharacterPositionV1 halfSpeed;
+    Expect(character->getPosition(controller, &halfSpeed) != 0u &&
+               halfSpeed.localX == LAIUE_CHARACTER_WALK_SPEED / 2,
+           "half joystick deflection moves at half speed");
+    analogInput.moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE / 4;
+    Expect(character->setPosition(controller, &analogStart, 1u) != 0u,
+           "character resets before quarter-speed check");
+    for (uint32_t tick = 0u; tick < LAIUE_CHARACTER_TICK_HZ; ++tick)
+        Expect(character->step(controller, &analogInput) != 0u,
+               "character accepts lower analog input");
+    LaiueCharacterPositionV1 quarterSpeed;
+    Expect(character->getPosition(controller, &quarterSpeed) != 0u &&
+               quarterSpeed.localX == LAIUE_CHARACTER_WALK_SPEED / 4,
+           "quarter joystick deflection moves at quarter speed");
+    analogInput.moveX = LAIUE_CHARACTER_INPUT_AXIS_SCALE + 1;
+    Expect(character->step(controller, &analogInput) == 0u,
+           "character rejects analog input outside normalized range");
+
+    bool collisionFails = true;
+    LaiueCharacterCollisionV1 failingCollision = {
+        .structSize = sizeof(failingCollision),
+        .abiVersion = LAIUE_CHARACTER_ABI_VERSION_1,
+        .context = &collisionFails,
+        .sweepAabb = SweepFlatFloor,
+    };
+    /* The controller owns a copy of its callback table.  Recreate it with a
+     * failing callback and verify that no position/state mutation leaks out
+     * when the provider rejects a step. */
+    character->destroy(controller);
+    controller = NULL;
+    Expect(character->create(&failingCollision, 500, &controller) != 0u &&
+               character->setPosition(controller, &initial, 1u) != 0u,
+           "character recreates for failure-atomicity check");
+    LaiueCharacterPositionV1 beforeFailure;
+    Expect(character->getPosition(controller, &beforeFailure) != 0u,
+           "position is readable before failed step");
+    LaiueCharacterInputV1 input = {.moveX = 1, .moveY = 0, .flags = 0u};
+    Expect(character->step(controller, &input) == 0u,
+           "collision failure is reported");
+    LaiueCharacterPositionV1 afterFailure;
+    Expect(character->getPosition(controller, &afterFailure) != 0u &&
+               memcmp(&beforeFailure, &afterFailure, sizeof(beforeFailure)) == 0,
+           "failed collision step leaves position unchanged");
+    character->destroy(controller);
+
+    LaiueModuleHostUnloadAll(host);
+    Expect(LaiueModuleHostQueryService(host, LAIUE_CHARACTER_SERVICE_NAME, 1u, 1u,
+                                       NULL, NULL) == NULL,
+           "character service disappears after unload");
+    LaiueModuleHostDestroy(host);
+    LAIUE_TEST_SUCCESS();
+}

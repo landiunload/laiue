@@ -1,0 +1,105 @@
+#include "mesh/mesher_service.h"
+
+#include "mod/module_api.h"
+#include "mod/module_service.h"
+#include "platform/system.h"
+
+typedef struct LaiueMesherModuleState
+{
+    const LaiueModuleHostV1 *host;
+} LaiueMesherModuleState;
+
+static const LaiueMesherServiceV1 service = {
+    .structSize = sizeof(LaiueMesherServiceV1),
+    .abiVersion = LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+    .scratchCreate = ChunkMesherScratchCreate,
+    .scratchDestroy = ChunkMesherScratchDestroy,
+    .buildChunkMesh = BuildChunkMesh,
+};
+
+static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
+{
+    if (host == NULL || outContext == NULL || host->publishService == NULL ||
+        host->unpublishService == NULL || host->allocate == NULL ||
+        host->free == NULL)
+        return 0u;
+    *outContext = NULL;
+    LaiueMesherModuleState *state =
+        (LaiueMesherModuleState *)host->allocate(host->context, sizeof(*state));
+    if (state == NULL)
+        return 0u;
+    state->host = host;
+    *outContext = state;
+    return 1u;
+}
+
+static uint32_t ModuleStart(void *context)
+{
+    LaiueMesherModuleState *state = (LaiueMesherModuleState *)context;
+    if (state == NULL || state->host == NULL)
+        return 0u;
+    LaiueModuleServiceV1 published = {
+        .name = LAIUE_MESHER_SERVICE_NAME,
+        .version = LAIUE_MESHER_SERVICE_ABI_VERSION_1,
+        .table = &service,
+        .tableSize = sizeof(service),
+    };
+    if (state->host->publishService(state->host->context, &published) != LAIUE_MODULE_OK)
+        return 0u;
+    return 1u;
+}
+
+static void ModuleStop(void *context)
+{
+    LaiueMesherModuleState *state = (LaiueMesherModuleState *)context;
+    if (state != NULL && state->host != NULL && state->host->unpublishService != NULL)
+        (void)state->host->unpublishService(state->host->context,
+                                             LAIUE_MESHER_SERVICE_NAME);
+}
+
+static void ModuleDestroy(void *context)
+{
+    LaiueMesherModuleState *state = (LaiueMesherModuleState *)context;
+    if (state != NULL)
+    {
+        const LaiueModuleHostV1 *host = state->host;
+        state->host = NULL;
+        if (host != NULL && host->free != NULL)
+            host->free(host->context, state);
+    }
+}
+
+static const char *const provides[] = {LAIUE_MESHER_SERVICE_NAME};
+static const LaiueModuleApiV1 api = {
+    .structSize = sizeof(LaiueModuleApiV1),
+    .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+    .descriptor = {
+        .structSize = sizeof(LaiueModuleDescriptorV1),
+        .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
+        .id = "laiue.mesher",
+        .version = "1.0.0",
+        .providesServices = provides,
+        .providesCount = 1u,
+    },
+    .create = ModuleCreate,
+    .start = ModuleStart,
+    .stop = ModuleStop,
+    .destroy = ModuleDestroy,
+};
+
+const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void)
+{
+    return &api;
+}
+
+const LaiueMesherServiceV1 *LaiueMesherGetStaticServiceV1(void)
+{
+    return &service;
+}
+
+#if !defined(LAIUE_STATIC)
+LAIUE_MODULE_EXPORT const LaiueModuleApiV1 *LAIUE_MODULE_CALL LaiueModuleGetApiV1(void)
+{
+    return &api;
+}
+#endif

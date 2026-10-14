@@ -1,0 +1,815 @@
+#include "platform/system.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#include <intrin.h>
+
+#include <string.h>
+
+
+typedef struct WindowsDirectoryIterator
+{
+    HANDLE handle;
+    WIN32_FIND_DATAW current;
+    bool hasCurrent;
+} WindowsDirectoryIterator;
+
+_Static_assert(sizeof(SRWLOCK) <= sizeof(PlatformMutex),
+    "PlatformMutex storage must cover SRWLOCK");
+_Static_assert(sizeof(CONDITION_VARIABLE) <= sizeof(PlatformConditionVariable),
+    "PlatformConditionVariable storage must cover CONDITION_VARIABLE");
+_Static_assert(sizeof(HANDLE) <= sizeof(PlatformThread),
+    "PlatformThread storage must cover a thread HANDLE");
+_Static_assert(sizeof(SRWLOCK) <= sizeof(PlatformRwLock),
+    "PlatformRwLock storage is too small");
+_Static_assert(sizeof(uint32_t) == sizeof(LONG), "platform atomics require 32-bit LONG");
+_Static_assert(sizeof(WindowsDirectoryIterator) <= sizeof(PlatformDirectoryIterator),
+    "PlatformDirectoryIterator storage is too small");
+
+static volatile LONG g_terminationRequested;
+
+static BOOL WINAPI PlatformConsoleHandler(DWORD controlType)
+{
+    if (controlType == CTRL_C_EVENT || controlType == CTRL_BREAK_EVENT
+        || controlType == CTRL_CLOSE_EVENT || controlType == CTRL_SHUTDOWN_EVENT)
+    {
+        InterlockedExchange(&g_terminationRequested, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void* PlatformAllocate(size_t size, bool zeroInitialize)
+{
+    if (size == 0) size = 1;
+    return HeapAlloc(GetProcessHeap(),
+        zeroInitialize ? HEAP_ZERO_MEMORY : 0, size);
+}
+
+void* PlatformReallocate(void* memory, size_t size, bool zeroNewMemory)
+{
+    if (memory == NULL) return PlatformAllocate(size, zeroNewMemory);
+    if (size == 0) size = 1;
+    return HeapReAlloc(GetProcessHeap(),
+        zeroNewMemory ? HEAP_ZERO_MEMORY : 0, memory, size);
+}
+
+void PlatformFree(void* memory)
+{
+    if (memory != NULL) HeapFree(GetProcessHeap(), 0, memory);
+}
+
+bool PlatformRwLockInitialize(PlatformRwLock* lock)
+{
+    if (lock == NULL) return false;
+    memset(lock, 0, sizeof(*lock));
+    InitializeSRWLock((PSRWLOCK)lock);
+    return true;
+}
+
+void PlatformRwLockDestroy(PlatformRwLock* lock)
+{
+    (void)lock;
+}
+
+void PlatformRwLockAcquireShared(PlatformRwLock* lock)
+{
+    AcquireSRWLockShared((PSRWLOCK)lock);
+}
+
+void PlatformRwLockReleaseShared(PlatformRwLock* lock)
+{
+    ReleaseSRWLockShared((PSRWLOCK)lock);
+}
+
+void PlatformRwLockAcquireExclusive(PlatformRwLock* lock)
+{
+    AcquireSRWLockExclusive((PSRWLOCK)lock);
+}
+
+void PlatformRwLockReleaseExclusive(PlatformRwLock* lock)
+{
+    ReleaseSRWLockExclusive((PSRWLOCK)lock);
+}
+
+bool PlatformMutexInitialize(PlatformMutex* mutex)
+{
+    if (mutex == NULL) return false;
+    memset(mutex, 0, sizeof(*mutex));
+    InitializeSRWLock((PSRWLOCK)mutex);
+    return true;
+}
+
+void PlatformMutexDestroy(PlatformMutex* mutex)
+{
+    /* SRWLOCK не владеет ресурсами ядра и не требует разрушения. */
+    (void)mutex;
+}
+
+void PlatformMutexLock(PlatformMutex* mutex)
+{
+    AcquireSRWLockExclusive((PSRWLOCK)mutex);
+}
+
+void PlatformMutexUnlock(PlatformMutex* mutex)
+{
+    ReleaseSRWLockExclusive((PSRWLOCK)mutex);
+}
+
+bool PlatformConditionVariableInitialize(PlatformConditionVariable* condition)
+{
+    if (condition == NULL) return false;
+    memset(condition, 0, sizeof(*condition));
+    InitializeConditionVariable((PCONDITION_VARIABLE)condition);
+    return true;
+}
+
+void PlatformConditionVariableDestroy(PlatformConditionVariable* condition)
+{
+    (void)condition;
+}
+
+void PlatformConditionVariableWait(PlatformConditionVariable* condition, PlatformMutex* mutex)
+{
+    SleepConditionVariableSRW((PCONDITION_VARIABLE)condition, (PSRWLOCK)mutex, INFINITE, 0);
+}
+
+void PlatformConditionVariableWakeOne(PlatformConditionVariable* condition)
+{
+    WakeConditionVariable((PCONDITION_VARIABLE)condition);
+}
+
+void PlatformConditionVariableWakeAll(PlatformConditionVariable* condition)
+{
+    WakeAllConditionVariable((PCONDITION_VARIABLE)condition);
+}
+
+typedef struct WindowsThreadStart
+{
+    PlatformThreadEntry entry;
+    void* context;
+} WindowsThreadStart;
+
+/* CreateThread ждёт stdcall-функцию с DWORD, поэтому контракт движка
+ * переносится через маленький переходник, а не через приведение типа
+ * указателя на функцию: такое приведение — неопределённое поведение. */
+static DWORD WINAPI WindowsThreadThunk(LPVOID parameter)
+{
+    WindowsThreadStart* start = (WindowsThreadStart*)parameter;
+    PlatformThreadEntry entry = start->entry;
+    void* context = start->context;
+    PlatformFree(start);
+    return (DWORD)entry(context);
+}
+
+bool PlatformThreadStart(PlatformThread* thread, PlatformThreadEntry entry, void* context)
+{
+    if (thread == NULL || entry == NULL) return false;
+    memset(thread, 0, sizeof(*thread));
+
+    WindowsThreadStart* start = PlatformAllocate(sizeof(*start), false);
+    if (start == NULL) return false;
+    start->entry = entry;
+    start->context = context;
+
+    HANDLE handle = CreateThread(NULL, 0, WindowsThreadThunk, start, 0, NULL);
+    if (handle == NULL)
+    {
+        PlatformFree(start);
+        return false;
+    }
+    memcpy(thread->storage, (const void *)&handle, sizeof(handle));
+    return true;
+}
+
+void PlatformThreadJoin(PlatformThread* thread)
+{
+    if (thread == NULL) return;
+    HANDLE handle = NULL;
+    memcpy((void *)&handle, thread->storage, sizeof(handle));
+    if (handle == NULL) return;
+    WaitForSingleObject(handle, INFINITE);
+    CloseHandle(handle);
+    memset(thread, 0, sizeof(*thread));
+}
+
+uint32_t PlatformLogicalProcessorCount(void)
+{
+    SYSTEM_INFO information;
+    GetSystemInfo(&information);
+    return information.dwNumberOfProcessors > 0 ? (uint32_t)information.dwNumberOfProcessors : 1u;
+}
+
+uint32_t PlatformAtomicIncrementU32(volatile uint32_t *value)
+{
+    return (uint32_t)InterlockedIncrement((volatile LONG *)value);
+}
+
+int64_t PlatformAtomicLoadI64(const volatile int64_t *value)
+{
+    return (int64_t)InterlockedCompareExchange64((volatile LONG64 *)value, 0, 0);
+}
+
+int64_t PlatformAtomicAddI64(volatile int64_t *value, int64_t addend)
+{
+    return (int64_t)InterlockedExchangeAdd64((volatile LONG64 *)value, (LONG64)addend) + addend;
+}
+
+int64_t PlatformAtomicIncrementI64(volatile int64_t *value)
+{
+    return (int64_t)InterlockedIncrement64((volatile LONG64 *)value);
+}
+
+uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)
+{
+#if defined(_M_IX86) || defined(_M_X64)
+    // На x86 выровненная загрузка сама по себе acquire (TSO): нужен только
+    // барьер компилятора. Блокирующий CAS здесь превращал каждого читателя
+    // в писателя той же кэш-линии, и параллельные читатели одного флага
+    // (рабочие мешера и поток физики у счётчика правок мира) толкались.
+    uint32_t result = (uint32_t)__iso_volatile_load32((const volatile __int32 *)value);
+    _ReadWriteBarrier();
+    return result;
+#else
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+#endif
+}
+
+bool PlatformAtomicCompareExchangeU32(volatile uint32_t *value, uint32_t *expected,
+                                      uint32_t desired)
+{
+    LONG previous =
+        InterlockedCompareExchange((volatile LONG *)value, (LONG)desired, (LONG)*expected);
+    if ((uint32_t)previous == *expected)
+    {
+        return true;
+    }
+    *expected = (uint32_t)previous;
+    return false;
+}
+
+void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired)
+{
+#if defined(_M_IX86) || defined(_M_X64)
+    // Симметрично загрузке: на x86 обычная запись — release, барьер только
+    // компилятору. Блокирующий обмен был полным барьером, которого контракт
+    // release не обещает и ни один вызывающий не требует.
+    _ReadWriteBarrier();
+    __iso_volatile_store32((volatile __int32 *)value, (__int32)desired);
+#else
+    InterlockedExchange((volatile LONG *)value, (LONG)desired);
+#endif
+}
+
+double PlatformMonotonicSeconds(void)
+{
+    static LONGLONG frequency;
+    if (frequency == 0)
+    {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        InterlockedCompareExchange64(&frequency, value.QuadPart, 0);
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency;
+}
+
+uint64_t PlatformMonotonicMilliseconds(void)
+{
+    return GetTickCount64();
+}
+
+void PlatformSleepMilliseconds(uint32_t milliseconds)
+{
+    Sleep(milliseconds);
+}
+
+void PlatformCpuRelax(void)
+{
+#if defined(_M_ARM64) || defined(_M_ARM)
+    __yield();
+#else
+    _mm_pause();
+#endif
+}
+
+bool PlatformInstallTerminationHandler(void)
+{
+    InterlockedExchange(&g_terminationRequested, 0);
+    return SetConsoleCtrlHandler(PlatformConsoleHandler, TRUE) != FALSE;
+}
+
+void PlatformRemoveTerminationHandler(void)
+{
+    SetConsoleCtrlHandler(PlatformConsoleHandler, FALSE);
+}
+
+bool PlatformTerminationRequested(void)
+{
+    return InterlockedCompareExchange(&g_terminationRequested, 0, 0) != 0;
+}
+
+void PlatformWriteConsoleUtf8(const char* message)
+{
+    if (message == NULL) return;
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == NULL || output == INVALID_HANDLE_VALUE) return;
+    DWORD length = 0;
+    while (message[length] != '\0') ++length;
+    DWORD written = 0;
+    WriteFile(output, message, length, &written, NULL);
+}
+
+uint32_t PlatformGetEnvironmentUtf8(
+    const char* name, char* output, uint32_t capacity)
+{
+    if (name == NULL || output == NULL || capacity == 0) return 0;
+    DWORD length = GetEnvironmentVariableA(name, output, capacity);
+    return length > 0 && length < capacity ? (uint32_t)length : 0;
+}
+
+bool PlatformExecutableDirectory(wchar_t* output, uint32_t capacity)
+{
+    if (output == NULL || capacity == 0) return false;
+    DWORD length = GetModuleFileNameW(NULL, output, capacity);
+    if (length == 0 || length >= capacity) return false;
+    while (length > 0 && output[length - 1U] != L'\\'
+        && output[length - 1U] != L'/')
+        --length;
+    if (length == 0) return false;
+    output[length - 1U] = L'\0';
+    return true;
+}
+
+bool PlatformWideToUtf8(const wchar_t* input, char* output,
+                        uint32_t capacity, uint32_t* outLength)
+{
+    if (input == NULL || output == NULL || capacity == 0) return false;
+    int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        input, -1, output, (int)capacity, NULL, NULL);
+    if (written <= 0) return false;
+    if (outLength != NULL) *outLength = (uint32_t)written - 1U;
+    return true;
+}
+
+bool PlatformUtf8ToWide(const char* input, uint32_t length, wchar_t* output,
+                        uint32_t capacity, uint32_t* outLength)
+{
+    if (input == NULL || output == NULL || capacity == 0
+        || length > INT32_MAX) return false;
+    int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        input, (int)length, output, (int)capacity - 1);
+    if (written <= 0 && length != 0) return false;
+    output[written] = L'\0';
+    if (outLength != NULL) *outLength = (uint32_t)written;
+    return true;
+}
+
+bool PlatformCreateDirectory(const wchar_t* path)
+{
+    if (CreateDirectoryW(path, NULL)) return true;
+    if (GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    // Каталог уже есть — это успех. Файл на том же месте успехом не
+    // является: вызывающая сторона просила каталог и получит отказ
+    // позже, в непонятном месте, если ответить здесь «да».
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool PlatformPathExists(const wchar_t* path)
+{
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool PlatformGetPathInformation(
+    const wchar_t* path, PlatformPathInformation* information)
+{
+    if (path == NULL || information == NULL) return false;
+    memset(information, 0, sizeof(*information));
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data))
+        return true;
+    information->exists = true;
+    information->isDirectory =
+        (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    information->isSymbolicLink =
+        (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    information->size = ((uint64_t)data.nFileSizeHigh << 32U)
+        | data.nFileSizeLow;
+    // FILETIME считает интервалы по сто наносекунд.
+    information->modifiedTime =
+        (((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32U)
+            | data.ftLastWriteTime.dwLowDateTime) * 100U;
+    return true;
+}
+
+bool PlatformDeleteFile(const wchar_t* path)
+{
+    return DeleteFileW(path) != FALSE;
+}
+
+bool PlatformRemoveDirectory(const wchar_t* path)
+{
+    return RemoveDirectoryW(path) != FALSE;
+}
+
+bool PlatformMoveReplace(const wchar_t* source, const wchar_t* destination)
+{
+    return MoveFileExW(source, destination,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+bool PlatformValidatePrivateKeyFile(const wchar_t* path)
+{
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && (attributes & (FILE_ATTRIBUTE_DIRECTORY
+            | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+bool PlatformReadEntireFile(const wchar_t* path, uint64_t maximumBytes,
+                            uint8_t** outBytes, uint64_t* outSize)
+{
+    if (outBytes == NULL || outSize == NULL) return false;
+    *outBytes = NULL;
+    *outSize = 0;
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    LARGE_INTEGER size = {0};
+    bool valid = GetFileInformationByHandle(file, &information)
+        && !(information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        && GetFileSizeEx(file, &size) && size.QuadPart >= 0
+        && (uint64_t)size.QuadPart <= maximumBytes;
+    uint8_t* bytes = valid
+        ? PlatformAllocate((size_t)(size.QuadPart == 0 ? 1 : size.QuadPart), false)
+        : NULL;
+    uint64_t completed = 0;
+    while (valid && completed < (uint64_t)size.QuadPart)
+    {
+        DWORD part = (uint64_t)size.QuadPart - completed > 0x7ffff000ULL
+            ? 0x7ffff000U : (DWORD)((uint64_t)size.QuadPart - completed);
+        DWORD read = 0;
+        if (!ReadFile(file, bytes + completed, part, &read, NULL) || read == 0)
+            valid = false;
+        else
+            completed += read;
+    }
+    CloseHandle(file);
+    if (!valid)
+    {
+        PlatformFree(bytes);
+        return false;
+    }
+    *outBytes = bytes;
+    *outSize = (uint64_t)size.QuadPart;
+    return true;
+}
+
+bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void *buffer,
+                            uint32_t capacity, uint32_t *outBytesRead, uint64_t *outFileSize)
+{
+    if (outBytesRead != NULL)
+        *outBytesRead = 0U;
+    if (outFileSize != NULL)
+        *outFileSize = 0U;
+    if (path == NULL || outBytesRead == NULL || outFileSize == NULL ||
+        (capacity != 0U && buffer == NULL))
+        return false;
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    LARGE_INTEGER size = {0};
+    bool valid = GetFileType(file) == FILE_TYPE_DISK &&
+                 GetFileInformationByHandle(file, &information) &&
+                 (information.dwFileAttributes &
+                  (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0U &&
+                 GetFileSizeEx(file, &size) && size.QuadPart >= 0 &&
+                 (uint64_t)size.QuadPart <= maximumFileBytes;
+    uint32_t wanted =
+        valid && (uint64_t)size.QuadPart < capacity ? (uint32_t)size.QuadPart : capacity;
+    uint32_t completed = 0U;
+    while (valid && completed < wanted)
+    {
+        DWORD part = wanted - completed;
+        if (part > 0x7ffff000U)
+            part = 0x7ffff000U;
+        DWORD read = 0U;
+        if (!ReadFile(file, (uint8_t *)buffer + completed, part, &read, NULL) || read == 0U)
+            valid = false;
+        else
+            completed += read;
+    }
+    CloseHandle(file);
+    if (!valid)
+        return false;
+    *outBytesRead = completed;
+    *outFileSize = (uint64_t)size.QuadPart;
+    return true;
+}
+
+bool PlatformFileOpenRead(const char *path, PlatformReadFile *outFile, uint64_t *outSize)
+{
+    if (outSize != NULL)
+        *outSize = 0u;
+    if (path == NULL || outFile == NULL || outSize == NULL || outFile->opaque[0] != 0u)
+        return false;
+    uint32_t length = 0u;
+    while (length < LAIUE_PLATFORM_PATH_CAPACITY * 4u && path[length] != '\0')
+        ++length;
+    if (length == LAIUE_PLATFORM_PATH_CAPACITY * 4u)
+        return false;
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    if (!PlatformUtf8ToWide(path, length, wide, LAIUE_PLATFORM_PATH_CAPACITY, NULL))
+        return false;
+    HANDLE native = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (native == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    LARGE_INTEGER size;
+    if (GetFileType(native) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(native, &information) ||
+        (information.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0u ||
+        !GetFileSizeEx(native, &size) || size.QuadPart < 0)
+    {
+        CloseHandle(native);
+        return false;
+    }
+    outFile->opaque[0] = (uintptr_t)native;
+    outFile->opaque[1] = 0u;
+    *outSize = (uint64_t)size.QuadPart;
+    return true;
+}
+
+bool PlatformFileReadAt(PlatformReadFile *file, uint64_t offset, void *buffer, uint32_t count,
+                        uint32_t *outRead)
+{
+    if (outRead != NULL)
+        *outRead = 0u;
+    if (file == NULL || file->opaque[0] == 0u || outRead == NULL ||
+        (count != 0u && buffer == NULL) || offset > INT64_MAX || count > INT64_MAX - offset)
+        return false;
+    HANDLE native = (HANDLE)file->opaque[0];
+    LARGE_INTEGER position;
+    position.QuadPart = (int64_t)offset;
+    if (!SetFilePointerEx(native, position, NULL, FILE_BEGIN))
+        return false;
+    uint32_t completed = 0u;
+    while (completed < count)
+    {
+        DWORD part = count - completed;
+        if (part > 0x7ffff000u)
+            part = 0x7ffff000u;
+        DWORD read = 0u;
+        if (!ReadFile(native, (uint8_t *)buffer + completed, part, &read, NULL))
+            return false;
+        if (read == 0u)
+            break;
+        completed += read;
+    }
+    *outRead = completed;
+    return true;
+}
+
+void PlatformFileClose(PlatformReadFile *file)
+{
+    if (file == NULL)
+        return;
+    if (file->opaque[0] != 0u)
+        CloseHandle((HANDLE)file->opaque[0]);
+    memset(file, 0, sizeof(*file));
+}
+
+bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
+                             uint64_t size)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const uint8_t* source = bytes;
+    uint64_t completed = 0;
+    bool succeeded = true;
+    while (completed < size)
+    {
+        DWORD part = size - completed > 0x7ffff000ULL
+            ? 0x7ffff000U : (DWORD)(size - completed);
+        DWORD written = 0;
+        if (!WriteFile(file, source + completed, part, &written, NULL)
+            || written == 0)
+        {
+            succeeded = false;
+            break;
+        }
+        completed += written;
+    }
+    succeeded = succeeded && FlushFileBuffers(file);
+    CloseHandle(file);
+    return succeeded;
+}
+
+static bool BuildTemporaryPath(
+    const wchar_t* path, wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY])
+{
+    uint32_t length = 0;
+    while (path[length] != L'\0'
+        && length + 5U < LAIUE_PLATFORM_PATH_CAPACITY)
+    {
+        output[length] = path[length];
+        ++length;
+    }
+    if (path[length] != L'\0') return false;
+    output[length++] = L'.';
+    output[length++] = L't';
+    output[length++] = L'm';
+    output[length++] = L'p';
+    output[length] = L'\0';
+    return true;
+}
+
+bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,
+                             uint64_t size)
+{
+    wchar_t* temporary = PlatformAllocate(
+        (size_t)LAIUE_PLATFORM_PATH_CAPACITY * sizeof(*temporary), false);
+    if (temporary == NULL) return false;
+    if (!BuildTemporaryPath(path, temporary))
+    {
+        PlatformFree(temporary);
+        return false;
+    }
+    if (!PlatformWriteEntireFile(temporary, bytes, size))
+    {
+        PlatformDeleteFile(temporary);
+        PlatformFree(temporary);
+        return false;
+    }
+    if (!PlatformMoveReplace(temporary, path))
+    {
+        PlatformDeleteFile(temporary);
+        PlatformFree(temporary);
+        return false;
+    }
+    PlatformFree(temporary);
+    return true;
+}
+
+bool PlatformAppendFile(const wchar_t* path, const void* bytes, uint64_t size)
+{
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool succeeded = size <= UINT32_MAX
+        && WriteFile(file, bytes, (DWORD)size, &written, NULL)
+        && written == (DWORD)size;
+    CloseHandle(file);
+    return succeeded;
+}
+
+bool PlatformDirectoryOpen(
+    PlatformDirectoryIterator* iterator, const wchar_t* path)
+{
+    if (iterator == NULL || path == NULL) return false;
+    memset(iterator, 0, sizeof(*iterator));
+    wchar_t search[LAIUE_PLATFORM_PATH_CAPACITY];
+    uint32_t length = 0;
+    while (path[length] != L'\0'
+        && length + 3U < LAIUE_PLATFORM_PATH_CAPACITY)
+    {
+        search[length] = path[length];
+        ++length;
+    }
+    if (path[length] != L'\0') return false;
+    if (length > 0 && search[length - 1U] != L'\\'
+        && search[length - 1U] != L'/')
+        search[length++] = L'\\';
+    search[length++] = L'*';
+    search[length] = L'\0';
+
+    WindowsDirectoryIterator* state = (WindowsDirectoryIterator*)iterator;
+    state->handle = FindFirstFileW(search, &state->current);
+    state->hasCurrent = state->handle != INVALID_HANDLE_VALUE;
+    return state->hasCurrent;
+}
+
+bool PlatformDirectoryNext(
+    PlatformDirectoryIterator* iterator, PlatformDirectoryEntry* entry)
+{
+    if (iterator == NULL || entry == NULL) return false;
+    WindowsDirectoryIterator* state = (WindowsDirectoryIterator*)iterator;
+    while (state->hasCurrent)
+    {
+        WIN32_FIND_DATAW data = state->current;
+        state->hasCurrent = FindNextFileW(state->handle, &state->current) != FALSE;
+        if ((data.cFileName[0] == L'.' && data.cFileName[1] == L'\0')
+            || (data.cFileName[0] == L'.' && data.cFileName[1] == L'.'
+                && data.cFileName[2] == L'\0'))
+            continue;
+        memset(entry, 0, sizeof(*entry));
+        uint32_t length = 0;
+        while (data.cFileName[length] != L'\0'
+            && length + 1U < LAIUE_PLATFORM_PATH_CAPACITY)
+        {
+            entry->name[length] = data.cFileName[length];
+            ++length;
+        }
+        if (data.cFileName[length] != L'\0') continue;
+        entry->name[length] = L'\0';
+        entry->size = ((uint64_t)data.nFileSizeHigh << 32U)
+            | data.nFileSizeLow;
+        entry->isDirectory =
+            (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        entry->isSymbolicLink =
+            (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        return true;
+    }
+    return false;
+}
+
+void PlatformDirectoryClose(PlatformDirectoryIterator* iterator)
+{
+    if (iterator == NULL) return;
+    WindowsDirectoryIterator* state = (WindowsDirectoryIterator*)iterator;
+    if (state->handle != NULL && state->handle != INVALID_HANDLE_VALUE)
+        FindClose(state->handle);
+    memset(iterator, 0, sizeof(*iterator));
+}
+
+bool PlatformSha256(const void* bytes, uint64_t size, uint8_t output[32])
+{
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    bool succeeded = BCryptOpenAlgorithmProvider(&algorithm,
+        BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0
+        && BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0) >= 0;
+    const uint8_t* input = bytes;
+    uint64_t offset = 0;
+    while (succeeded && offset < size)
+    {
+        ULONG part = size - offset > 0xffffffffULL
+            ? 0xffffffffU : (ULONG)(size - offset);
+        succeeded = BCryptHashData(hash, (PUCHAR)(input + offset), part, 0) >= 0;
+        offset += part;
+    }
+    if (succeeded)
+        succeeded = BCryptFinishHash(hash, output, 32U, 0) >= 0;
+    if (hash != NULL) BCryptDestroyHash(hash);
+    if (algorithm != NULL) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return succeeded;
+}
+
+bool PlatformRandomBytes(void* output, uint32_t size)
+{
+    return BCryptGenRandom(NULL, output, size,
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+}
+
+bool PlatformConstantTimeEqual(
+    const void* first, const void* second, size_t size)
+{
+    const uint8_t* a = first;
+    const uint8_t* b = second;
+    uint8_t difference = 0;
+    for (size_t i = 0; i < size; ++i) difference |= a[i] ^ b[i];
+    return difference == 0;
+}
+
+PlatformDynamicLibrary PlatformDynamicLibraryOpen(const wchar_t* path)
+{
+    /* A damaged optional artifact must fail the load quietly: otherwise the
+     * loader may raise a modal "bad image" box and block startup until
+     * someone dismisses it. The thread's previous mode is restored. */
+    DWORD previousMode = 0;
+    const BOOL modeChanged =
+        SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &previousMode);
+    HMODULE library = LoadLibraryExW(
+        path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    const DWORD loadError = GetLastError();
+    if (modeChanged)
+        SetThreadErrorMode(previousMode, NULL);
+    SetLastError(loadError);
+    return (PlatformDynamicLibrary)library;
+}
+
+void* PlatformDynamicLibrarySymbol(
+    PlatformDynamicLibrary library, const char* name)
+{
+    return (void*)GetProcAddress((HMODULE)library, name);
+}
+
+void PlatformDynamicLibraryClose(PlatformDynamicLibrary library)
+{
+    if (library != NULL) FreeLibrary((HMODULE)library);
+}

@@ -1,0 +1,2 @@
+These original demonstration model and animation assets are provided under
+the same license as the laiue repository. No third-party assets are included.

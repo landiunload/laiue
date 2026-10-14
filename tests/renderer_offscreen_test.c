@@ -1,0 +1,1189 @@
+// Кадр offscreen-бэкенда целиком: устройство, пул геометрии, загрузка
+// меша, проход сцены и чтение результата. Тест намеренно проверяет
+// пиксели, а не только коды возврата: рендер, который «успешно» рисует
+// пустой кадр, отличается от работающего только содержимым цели.
+
+#include "content/content_catalog.h"
+#include "render/chunk_geometry.h"
+#include "render/content_provider.h"
+#include "render/renderer.h"
+#include "render/renderer_offscreen.h"
+#include "render/texture_pack.h"
+#include "texc_fixtures.h"
+#include "platform/system.h"
+#include "test_runtime.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define TEST_WIDTH 64u
+#define TEST_HEIGHT 64u
+#define TEST_PIXEL_BYTES (TEST_WIDTH * TEST_HEIGHT * 4u)
+// Драйвера может не быть даже когда бэкенд слинкован (машина без Vulkan
+// ICD): тогда тест сообщает о пропуске, а не о ложном провале.
+#define SKIP_EXIT_CODE 125
+
+static void Expect(bool condition, const char *message)
+{
+    if (condition) return;
+    LaiueTestRuntimeWrite("Offscreen renderer check failed: ");
+    LaiueTestRuntimeWrite(message);
+    LaiueTestRuntimeWrite("\n");
+    LaiueTestRuntimeExit(1);
+}
+
+// Единичная матрица: мировые координаты попадают прямо в clip space,
+// поэтому ожидаемое положение квада считается на бумаге и не зависит
+// ни от камеры, ни от проекции.
+static void SetIdentity(float matrix[16])
+{
+    for (uint32_t index = 0; index < 16u; ++index) matrix[index] = 0.0f;
+    matrix[0] = 1.0f;
+    matrix[5] = 1.0f;
+    matrix[10] = 1.0f;
+    matrix[15] = 1.0f;
+}
+
+static bool PixelDifferentFrom(const uint8_t *pixels, uint32_t x, uint32_t y,
+                               uint8_t red, uint8_t green, uint8_t blue,
+                               uint32_t tolerance)
+{
+    const uint8_t *pixel = pixels + ((size_t)y * TEST_WIDTH + x) * 4u;
+    uint32_t deltaRed = pixel[0] > red ? (uint32_t)(pixel[0] - red) : (uint32_t)(red - pixel[0]);
+    uint32_t deltaGreen =
+        pixel[1] > green ? (uint32_t)(pixel[1] - green) : (uint32_t)(green - pixel[1]);
+    uint32_t deltaBlue =
+        pixel[2] > blue ? (uint32_t)(pixel[2] - blue) : (uint32_t)(blue - pixel[2]);
+    return deltaRed > tolerance || deltaGreen > tolerance || deltaBlue > tolerance;
+}
+
+static uint32_t CountPixelsDifferentFrom(const uint8_t *pixels, uint8_t red, uint8_t green,
+                                         uint8_t blue, uint32_t tolerance)
+{
+    uint32_t different = 0u;
+    for (uint32_t y = 0; y < TEST_HEIGHT; ++y)
+    {
+        for (uint32_t x = 0; x < TEST_WIDTH; ++x)
+        {
+            different += PixelDifferentFrom(pixels, x, y, red, green, blue, tolerance) ? 1u : 0u;
+        }
+    }
+    return different;
+}
+
+// Центр тяжести закрашенных пикселей. Поворот инстанса виден именно
+// смещением геометрии, а не изменением их числа.
+static bool CoveredCentroid(const uint8_t *pixels, uint8_t red, uint8_t green, uint8_t blue,
+                            uint32_t tolerance, double *outX, double *outY)
+{
+    double sumX = 0.0;
+    double sumY = 0.0;
+    uint32_t count = 0;
+    for (uint32_t y = 0; y < TEST_HEIGHT; ++y)
+    {
+        for (uint32_t x = 0; x < TEST_WIDTH; ++x)
+        {
+            const uint8_t *pixel = pixels + ((size_t)y * TEST_WIDTH + x) * 4u;
+            uint32_t deltaRed = pixel[0] > red ? (uint32_t)(pixel[0] - red) : (uint32_t)(red - pixel[0]);
+            uint32_t deltaGreen =
+                pixel[1] > green ? (uint32_t)(pixel[1] - green) : (uint32_t)(green - pixel[1]);
+            uint32_t deltaBlue =
+                pixel[2] > blue ? (uint32_t)(pixel[2] - blue) : (uint32_t)(blue - pixel[2]);
+            if (deltaRed <= tolerance && deltaGreen <= tolerance && deltaBlue <= tolerance)
+            {
+                continue;
+            }
+            sumX += (double)x;
+            sumY += (double)y;
+            ++count;
+        }
+    }
+    if (count == 0u)
+    {
+        return false;
+    }
+    *outX = sumX / (double)count;
+    *outY = sumY / (double)count;
+    return true;
+}
+
+static void PutU16(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)(value & 0xFFu);
+    bytes[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static void PutU32(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)(value & 0xFFu);
+    bytes[1] = (uint8_t)((value >> 8) & 0xFFu);
+    bytes[2] = (uint8_t)((value >> 16) & 0xFFu);
+    bytes[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static bool Join(wchar_t *destination, uint32_t capacity, const wchar_t *base,
+                 const wchar_t *part)
+{
+    uint32_t length = 0u;
+    while (base[length] != 0 && length + 1u < capacity)
+    {
+        destination[length] = base[length];
+        ++length;
+    }
+    if (length + 1u >= capacity) return false;
+    destination[length++] = L'/';
+
+    uint32_t index = 0u;
+    while (part[index] != 0 && length + 1u < capacity)
+    {
+        destination[length++] = part[index++];
+    }
+    if (part[index] != 0) return false;
+    destination[length] = 0;
+    return true;
+}
+
+typedef struct PackTestPaths
+{
+    wchar_t executable[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t root[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t textures[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t pack[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t blocks[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t main[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t special[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t stone[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t water[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t sand[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t glow[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t stoneCache[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t waterCache[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t sandCache[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t uneven[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t unevenCache[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t stoneAuthored[LAIUE_PLATFORM_PATH_CAPACITY];
+    wchar_t formats[LAIUE_PLATFORM_PATH_CAPACITY];
+} PackTestPaths;
+
+static int32_t AbsoluteDifference(int32_t left, int32_t right)
+{
+    int32_t difference = left - right;
+    return difference < 0 ? -difference : difference;
+}
+
+// Одна текстура своего формата: 4x4 одного цвета, один кадр, без карты
+// нормалей. Раскладка описана в docs/texturepacks.md.
+#define SINGLE_TEXTURE_BYTES (24u + 4u * 4u * 4u)
+
+static void BuildSingleTexture(uint8_t *file, uint8_t red, uint8_t green, uint8_t blue)
+{
+    PutU32(file, 0x3153544Cu);   // LTS1
+    PutU16(file + 4, 1u);        // версия
+    PutU16(file + 6, 24u);       // размер заголовка
+    PutU16(file + 8, 4u);        // ширина
+    PutU16(file + 10, 4u);       // высота
+    PutU16(file + 12, 1u);       // кадров
+    PutU16(file + 14, 0u);       // миллисекунд на кадр
+    PutU16(file + 16, 1u);       // только albedo
+    PutU16(file + 18, 0u);       // зарезервировано
+    PutU32(file + 20, 4u * 4u * 4u);
+
+    for (uint32_t texel = 0; texel < 16u; ++texel)
+    {
+        file[24u + texel * 4u + 0u] = red;
+        file[24u + texel * 4u + 1u] = green;
+        file[24u + texel * 4u + 2u] = blue;
+        file[24u + texel * 4u + 3u] = 255u;
+    }
+}
+
+// Рисует один квад материала и отдаёт цвет центра кадра. Проверок
+// приоритета форматов несколько, и каждая отличается только этим цветом.
+static void SampleMaterialCentre(Renderer *renderer, RendererFrameSetup *setup,
+                                 const float *origin, uint32_t blockType, double seconds,
+                                 uint8_t *pixels, uint8_t outColor[3])
+{
+    ChunkQuad quad[1];
+    quad[0] = PackChunkQuad(0u, 0u, 0u, 4u, blockType, 1u, 1u, 1u);
+    RendererMesh *mesh = RendererCreateMesh(renderer, quad, 1u);
+    Expect(mesh != NULL, "the sampled mesh could not be created");
+    setup->animationSeconds = seconds;
+    Expect(RendererBeginFrame(renderer, setup), "the sampled frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, mesh, origin);
+    Expect(RendererEndFrame(renderer), "the sampled frame could not end");
+
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the sampled frame could not be captured");
+    const uint8_t *centre =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    outColor[0] = centre[0];
+    outColor[1] = centre[1];
+    outColor[2] = centre[2];
+    RendererDestroyMesh(renderer, mesh);
+}
+
+static bool ColorMatches(const uint8_t color[3], uint8_t red, uint8_t green, uint8_t blue)
+{
+    return AbsoluteDifference(color[0], red) <= 6 && AbsoluteDifference(color[1], green) <= 6 &&
+           AbsoluteDifference(color[2], blue) <= 6;
+}
+
+LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
+{
+    RendererSetContentService(LaiueContentGetStaticServiceV1());
+    if (!RendererBackendIsAvailable(RENDERER_BACKEND_VULKAN))
+    {
+        LaiueTestRuntimeWrite("No Vulkan backend available; skipping\n");
+        LaiueTestRuntimeExit(SKIP_EXIT_CODE);
+    }
+    Renderer *renderer = RendererCreateWithBackend(NULL, (int32_t)TEST_WIDTH,
+                                                   (int32_t)TEST_HEIGHT,
+                                                   RENDERER_BACKEND_VULKAN);
+    if (renderer == NULL)
+    {
+        LaiueTestRuntimeWrite("No Vulkan driver available; skipping\n");
+        LaiueTestRuntimeExit(SKIP_EXIT_CODE);
+    }
+    Expect(RendererGetBackend(renderer) == RENDERER_BACKEND_VULKAN,
+           "the offscreen renderer must report the Vulkan backend");
+    Expect(!RendererIsWorldReady(renderer), "a fresh renderer must not report a ready world");
+
+    // Активного текстурпака нет: рендерер обязан подняться на встроенных
+    // заглушках, а не отказать.
+    Expect(RendererPrepareWorld(renderer), "world resources could not be prepared");
+    Expect(RendererIsWorldReady(renderer), "world must be ready after preparation");
+
+    uint8_t *pixels = PlatformAllocate(TEST_PIXEL_BYTES, true);
+    Expect(pixels != NULL, "readback buffer could not be allocated");
+
+    // === Кадр без проходов сцены: только очистка ===
+    RendererFrameSetup setup;
+    for (uint32_t index = 0; index < sizeof(setup); ++index) ((uint8_t *)&setup)[index] = 0u;
+    setup.gamma = 1.0f;
+    setup.skyColor[0] = 1.0f;
+    setup.skyColor[1] = 0.0f;
+    setup.skyColor[2] = 0.0f;
+    setup.passCount = 0u;
+
+    Expect(RendererBeginFrame(renderer, &setup), "empty frame could not begin");
+    Expect(RendererEndFrame(renderer), "empty frame could not end");
+
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "empty frame could not be captured");
+    Expect(width == TEST_WIDTH && height == TEST_HEIGHT, "captured frame has the wrong size");
+    Expect(CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 2u) == 0u,
+           "a frame without scene passes must be filled with the sky colour");
+
+    // === Кадр с геометрией ===
+    // Одна грань +Z единичного вокселя. С единичной матрицей и смещением
+    // -0.5 по X и Y квад накрывает ровно центральную половину экрана.
+    ChunkQuad quads[1];
+    quads[0] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+
+    RendererMesh *mesh = RendererCreateMesh(renderer, quads, 1u);
+    Expect(mesh != NULL, "mesh could not be created");
+
+    setup.passCount = 1u;
+    setup.skyColor[0] = 1.0f;
+    setup.skyColor[1] = 0.0f;
+    setup.skyColor[2] = 0.0f;
+    setup.sunDirection[0] = 0.0f;
+    setup.sunDirection[1] = 0.0f;
+    setup.sunDirection[2] = -1.0f;
+    setup.sunColor[0] = 1.0f;
+    setup.sunColor[1] = 1.0f;
+    setup.sunColor[2] = 1.0f;
+    setup.ambientColor[0] = 1.0f;
+    setup.ambientColor[1] = 1.0f;
+    setup.ambientColor[2] = 1.0f;
+    SetIdentity(setup.passes[0].viewProjection);
+    setup.passes[0].faceIndex = 0u;
+    setup.passes[0].rectMinX = 0u;
+    setup.passes[0].rectMinY = 0u;
+    setup.passes[0].rectMaxX = TEST_WIDTH;
+    setup.passes[0].rectMaxY = TEST_HEIGHT;
+
+    const float origin[3] = { -0.5f, -0.5f, -0.5f };
+    Expect(RendererBeginFrame(renderer, &setup), "scene frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, mesh, origin);
+    Expect(RendererEndFrame(renderer), "scene frame could not end");
+
+    RendererStats stats;
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 1u, "the scene pass must record exactly one draw call");
+    Expect(stats.drawnQuads == 1u, "the scene pass must record exactly one quad");
+    Expect(stats.scenePasses == 1u, "the frame must report one scene pass");
+    Expect(stats.uploadedBytes == sizeof(quads), "the mesh upload must be recorded once");
+    Expect(stats.geometryPoolCapacityBytes > 0u, "the geometry pool must report its capacity");
+    Expect(stats.geometryPoolUsedBytes >= sizeof(quads),
+           "the geometry pool must account for the mesh");
+
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "scene frame could not be captured");
+
+    // Квад занимает центральную половину кадра: четверть площади.
+    uint32_t covered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(covered > (TEST_WIDTH * TEST_HEIGHT) / 8u,
+           "the drawn quad covers far less of the frame than its geometry implies");
+    Expect(covered < (TEST_WIDTH * TEST_HEIGHT * 3u) / 8u,
+           "the drawn quad covers far more of the frame than its geometry implies");
+
+    // Центр кадра принадлежит квадру, а углы — небу. Это отличает
+    // настоящую отрисовку от случайной заливки.
+    const uint8_t *center = pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(!(center[0] > 250u && center[1] < 5u && center[2] < 5u),
+           "the centre of the frame must show the quad, not the sky");
+    const uint8_t *corner = pixels;
+    Expect(corner[0] > 250u && corner[1] < 5u && corner[2] < 5u,
+           "the frame corner must stay the sky colour");
+
+    // === Пакет мелких загрузок ===
+    // Все 64 разных квада создаются до кадра: на Vulkan они используют одну
+    // upload-арену и один блок геометрии, поэтому запись копий может быть
+    // объединена в один vkCmdCopyBuffer с несколькими непересекающимися
+    // регионами. Квадры покрывают экран сеткой, чтобы проверялось содержимое
+    // всех загрузок, а не только успешный счётчик копирования.
+    enum { UPLOAD_BATCH_COUNT = 64u, UPLOAD_GRID_SIDE = 8u };
+    static RendererMesh *uploadMeshes[UPLOAD_BATCH_COUNT];
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+    {
+        uint32_t cellX = index % UPLOAD_GRID_SIDE;
+        uint32_t cellY = index / UPLOAD_GRID_SIDE;
+        ChunkQuad uploadQuad = PackChunkQuad(cellX * 8u, cellY * 8u, 0u, 4u,
+            1u + index, 8u, 8u, 0u);
+        uploadMeshes[index] = RendererCreateMesh(renderer, &uploadQuad, 1u);
+        Expect(uploadMeshes[index] != NULL,
+               "a small mesh in the upload batch could not be created");
+    }
+
+    RendererFrameSetup uploadSetup = setup;
+    SetIdentity(uploadSetup.passes[0].viewProjection);
+    uploadSetup.passes[0].viewProjection[0] = 1.0f / 32.0f;
+    uploadSetup.passes[0].viewProjection[5] = 1.0f / 32.0f;
+    uploadSetup.passes[0].viewProjection[12] = -1.0f;
+    uploadSetup.passes[0].viewProjection[13] = -1.0f;
+    const float uploadOrigin[3] = { 0.0f, 0.0f, 0.0f };
+    Expect(RendererBeginFrame(renderer, &uploadSetup),
+           "the many-mesh upload frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+        RendererDrawMesh(renderer, uploadMeshes[index], uploadOrigin);
+    Expect(RendererEndFrame(renderer), "the many-mesh upload frame could not end");
+
+    RendererStats uploadStats;
+    RendererGetStats(renderer, &uploadStats);
+    Expect(uploadStats.uploadedBytes == UPLOAD_BATCH_COUNT * sizeof(ChunkQuad),
+           "the batched upload must account for every small mesh exactly once");
+    Expect(uploadStats.drawCalls == UPLOAD_BATCH_COUNT &&
+               uploadStats.drawnQuads == UPLOAD_BATCH_COUNT,
+           "every mesh in the upload batch must be drawn once");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the many-mesh upload frame could not be captured");
+    bool allUploadCellsVisible = true;
+    for (uint32_t cellY = 0u; cellY < UPLOAD_GRID_SIDE; ++cellY)
+    {
+        for (uint32_t cellX = 0u; cellX < UPLOAD_GRID_SIDE; ++cellX)
+        {
+            uint32_t cellWidth = TEST_WIDTH / UPLOAD_GRID_SIDE;
+            uint32_t cellHeight = TEST_HEIGHT / UPLOAD_GRID_SIDE;
+            if (!PixelDifferentFrom(pixels, cellX * cellWidth + cellWidth / 2u,
+                                    cellY * cellHeight + cellHeight / 2u,
+                                    255u, 0u, 0u, 8u))
+                allUploadCellsVisible = false;
+        }
+    }
+    Expect(allUploadCellsVisible,
+           "each uploaded mesh must reach the center of its own screen cell");
+    Expect(CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u) >
+               (TEST_WIDTH * TEST_HEIGHT) / 2u,
+           "the uploaded mesh batch must render its full screen grid");
+    for (uint32_t index = 0u; index < UPLOAD_BATCH_COUNT; ++index)
+        RendererDestroyMesh(renderer, uploadMeshes[index]);
+
+    // === Универсальный V2 mesh path ===
+    // Это не ChunkQuad: обычный фиксированный vertex stream должен доходить
+    // до того же GPU-прохода и менять пиксели, а не только увеличивать
+    // счётчик submit. Проверяем также range draw (первый и последний
+    // vertices передаются отдельно от cached mesh).
+    RendererGenericVertex genericVertices[3] = {
+        { { -0.75f, -0.75f, 0.0f }, { 0.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.75f, -0.75f, 0.0f }, { 1.0f, 0.0f }, 0xFFFFFFFFu },
+        { {  0.00f,  0.75f, 0.0f }, { 0.5f, 1.0f }, 0xFFFFFFFFu },
+    };
+    RendererMesh *genericMesh = RendererCreateGenericMesh(renderer,
+                                                           genericVertices, 3u);
+    Expect(genericMesh != NULL, "the generic mesh could not be created");
+    Expect(RendererBeginFrame(renderer, &setup), "generic mesh frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    for (uint32_t draw = 0u; draw < 300u; ++draw)
+        RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    Expect(RendererEndFrame(renderer), "generic mesh frame could not end");
+    RendererStats genericStats;
+    RendererGetStats(renderer, &genericStats);
+    Expect(genericStats.drawCalls == 300u,
+           "repeated generic draws must reuse descriptors past the cache capacity");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "generic mesh frame could not be captured");
+    uint32_t genericCovered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(genericCovered > (TEST_WIDTH * TEST_HEIGHT) / 32u,
+           "the generic mesh must change visible pixels");
+    const uint8_t *genericCentre =
+        pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(!(genericCentre[0] > 250u && genericCentre[1] < 5u && genericCentre[2] < 5u),
+           "the generic mesh centre must not remain the sky colour");
+
+    // Generic draws may override the default voxel texture and sampler.  A
+    // real 2D image is deliberately used here: binding it to the old
+    // Texture2DArray declaration would be invalid on both backends.
+    RendererTexture *genericTexture = RendererCreateTexture(
+        renderer, 1u, 1u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+    RendererSampler *genericSampler = RendererCreateSampler(
+        renderer, LAIUE_GRAPHICS_FILTER_NEAREST, LAIUE_GRAPHICS_FILTER_NEAREST,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_CLAMP,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP);
+    const uint8_t customPixel[4] = {0u, 255u, 0u, 255u};
+    Expect(genericTexture != NULL && genericSampler != NULL &&
+               RendererUploadTexture(renderer, genericTexture, customPixel,
+                                     sizeof(customPixel), sizeof(customPixel)),
+           "the generic resource texture and sampler must be uploadable");
+    Expect(RendererBeginFrame(renderer, &setup), "bound generic frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    const float defaultOrigin[3] = { -0.6f, 0.0f, 0.0f };
+    RendererDrawGenericMeshRange(renderer, genericMesh, defaultOrigin, 0.25f, 0u, 3u);
+    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 0.5f, 0u, 3u,
+                                      genericTexture, genericSampler);
+    RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 0.5f, 0u, 3u,
+                                      genericTexture, genericSampler);
+    Expect(RendererEndFrame(renderer), "bound generic frame could not end");
+    RendererStats boundGenericStats;
+    RendererGetStats(renderer, &boundGenericStats);
+    Expect(boundGenericStats.drawCalls == 3u,
+           "different and repeated generic descriptor keys must all draw");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "bound generic frame could not be captured");
+    const uint8_t *boundCentre =
+        pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(boundCentre[1] > boundCentre[0] + 32u &&
+               boundCentre[1] > boundCentre[2] + 32u,
+           "the bound generic texture must reach the pixel shader");
+    const uint8_t *defaultPixel = pixels +
+        ((TEST_HEIGHT / 2u) * TEST_WIDTH + 13u) * 4u;
+    Expect(defaultPixel[0] > 200u && defaultPixel[1] > 200u && defaultPixel[2] > 200u,
+           "generic draws with different textures must use distinct descriptor sets");
+    RendererDestroySampler(renderer, genericSampler);
+    RendererDestroyTexture(renderer, genericTexture);
+
+    Expect(RendererBeginFrame(renderer, &setup),
+           "a frame after generic texture destruction could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawGenericMeshRange(renderer, genericMesh, NULL, 1.0f, 0u, 3u);
+    Expect(RendererEndFrame(renderer),
+           "a frame after generic texture destruction could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the generic fallback frame could not be captured after resource destruction");
+    uint32_t fallbackCovered = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(fallbackCovered > 0u,
+           "generic fallback descriptors must be recreated after resource destruction");
+
+    RendererDestroyMesh(renderer, genericMesh);
+
+    // === Инстансный путь ===
+    // Тот же меш рисуется дважды со своими смещениями: в chunk.hlsl это
+    // отдельная ветка, которую обычная отрисовка не задевает.
+    RendererMeshInstance instances[2];
+    // Нулевой кватернион обязан означать отсутствие поворота: код, который
+    // заполняет только origin и scale, остаётся верным.
+    for (uint32_t index = 0; index < 2u; ++index)
+    {
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            instances[index].rotation[component] = 0.0f;
+        }
+    }
+    instances[0].originRelative[0] = -0.5f;
+    instances[0].originRelative[1] = -0.5f;
+    instances[0].originRelative[2] = -0.5f;
+    instances[0].scale = 0.5f;
+    instances[1].originRelative[0] = 0.0f;
+    instances[1].originRelative[1] = 0.0f;
+    instances[1].originRelative[2] = -0.5f;
+    instances[1].scale = 0.5f;
+
+    Expect(RendererBeginFrame(renderer, &setup), "instanced frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMeshInstances(renderer, mesh, instances, 2u);
+    Expect(RendererEndFrame(renderer), "instanced frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 1u, "instanced drawing must issue a single draw call");
+    Expect(stats.drawnQuads == 2u, "instanced drawing must count one quad per instance");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "instanced frame could not be captured");
+    uint32_t instanced = CountPixelsDifferentFrom(pixels, 255u, 0u, 0u, 8u);
+    Expect(instanced > 0u, "instanced drawing produced an empty frame");
+    Expect(instanced < covered, "half-scale instances must cover less than the full-size quad");
+
+    // === Поворот инстанса ===
+    // Один инстанс без поворота и он же, повёрнутый на 180 градусов вокруг
+    // Z. Меш растёт от локального нуля в плюс, поэтому такой поворот обязан
+    // перебросить геометрию на противоположную сторону точки привязки.
+    RendererMeshInstance placement = instances[0];
+    placement.originRelative[0] = 0.0f;
+    placement.originRelative[1] = 0.0f;
+    placement.originRelative[2] = -0.5f;
+    placement.scale = 0.75f;
+
+    Expect(RendererBeginFrame(renderer, &setup), "unrotated instance frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMeshInstances(renderer, mesh, &placement, 1u);
+    Expect(RendererEndFrame(renderer), "unrotated instance frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "unrotated instance frame could not be captured");
+    double straightX = 0.0;
+    double straightY = 0.0;
+    Expect(CoveredCentroid(pixels, 255u, 0u, 0u, 8u, &straightX, &straightY),
+           "unrotated instance produced an empty frame");
+
+    // Кватернион (0, 0, 1, 0) — поворот на 180 градусов вокруг Z.
+    placement.rotation[0] = 0.0f;
+    placement.rotation[1] = 0.0f;
+    placement.rotation[2] = 1.0f;
+    placement.rotation[3] = 0.0f;
+
+    Expect(RendererBeginFrame(renderer, &setup), "rotated instance frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMeshInstances(renderer, mesh, &placement, 1u);
+    Expect(RendererEndFrame(renderer), "rotated instance frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "rotated instance frame could not be captured");
+    double turnedX = 0.0;
+    double turnedY = 0.0;
+    Expect(CoveredCentroid(pixels, 255u, 0u, 0u, 8u, &turnedX, &turnedY),
+           "rotated instance produced an empty frame");
+
+    // Геометрия обязана оказаться по другую сторону точки привязки — то есть
+    // левее и ниже центра кадра там, где раньше была правее и выше.
+    double centreX = (double)TEST_WIDTH * 0.5;
+    double centreY = (double)TEST_HEIGHT * 0.5;
+    Expect((straightX - centreX) * (turnedX - centreX) < 0.0,
+           "a half turn must move the instance to the other side by X");
+    Expect((straightY - centreY) * (turnedY - centreY) < 0.0,
+           "a half turn must move the instance to the other side by Y");
+
+    // === Панорама ===
+    // Шесть граней кубмапы и полноэкранный резолв. Проход рисует только
+    // свой прямоугольник грани, поэтому очистка ограничена им же.
+    RendererFrameSetup panorama = setup;
+    panorama.panorama = true;
+    panorama.faceResolution = 32u;
+    panorama.resolveMapping = RENDERER_RESOLVE_FISHEYE;
+    panorama.fovHalfRadians = 1.5f;
+    panorama.resolveVerticalScale = 1.0f;
+    panorama.passCount = RENDERER_MAX_SCENE_PASSES;
+    for (uint32_t face = 0; face < RENDERER_MAX_SCENE_PASSES; ++face)
+    {
+        panorama.passes[face] = setup.passes[0];
+        panorama.passes[face].faceIndex = face;
+        panorama.passes[face].rectMaxX = panorama.faceResolution;
+        panorama.passes[face].rectMaxY = panorama.faceResolution;
+    }
+
+    Expect(RendererBeginFrame(renderer, &panorama), "panorama frame could not begin");
+    for (uint32_t face = 0; face < RENDERER_MAX_SCENE_PASSES; ++face)
+    {
+        RendererBeginScenePass(renderer, face);
+        RendererDrawMesh(renderer, mesh, origin);
+    }
+    Expect(RendererEndFrame(renderer), "panorama frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.scenePasses == RENDERER_MAX_SCENE_PASSES,
+           "the panorama frame must report six scene passes");
+    // Шесть проходов плюс полноэкранный резолв.
+    Expect(stats.drawCalls == RENDERER_MAX_SCENE_PASSES + 1u,
+           "the panorama frame must resolve the cube map exactly once");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "panorama frame could not be captured");
+    Expect(CountPixelsDifferentFrom(pixels, 0u, 0u, 0u, 4u) > 0u,
+           "the panorama resolve produced a black frame");
+
+    // === Слой интерфейса ===
+    // Без атласа шрифта слой не рисуется вовсе: это осознанное поведение
+    // контракта, а не молчаливая потеря квадов.
+    RendererUiQuad quad;
+    for (uint32_t index = 0; index < sizeof(quad); ++index) ((uint8_t *)&quad)[index] = 0u;
+    quad.rect[0] = 0.0f;
+    quad.rect[1] = 0.0f;
+    quad.rect[2] = (float)TEST_WIDTH;
+    quad.rect[3] = (float)TEST_HEIGHT;
+    quad.colorRGBA = 0xff00ff00u;   // непрозрачный зелёный
+
+    Expect(RendererBeginFrame(renderer, &setup), "ui frame without an atlas could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, mesh, origin);
+    RendererUiQueue(renderer, &quad, 1u);
+    Expect(RendererEndFrame(renderer), "ui frame without an atlas could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 1u, "without a font atlas the ui layer must not draw");
+
+    static const uint8_t atlas[4] = { 255u, 255u, 255u, 255u };
+    Expect(RendererUiSetFontAtlas(renderer, atlas, 2u, 2u), "font atlas could not be uploaded");
+
+    Expect(RendererBeginFrame(renderer, &setup), "ui frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    Expect(!RendererUiSetFontAtlas(renderer, atlas, 2u, 2u),
+           "font atlas replacement during an active frame must be rejected");
+    RendererDrawMesh(renderer, mesh, origin);
+    RendererUiQueue(renderer, &quad, 1u);
+    Expect(RendererEndFrame(renderer), "ui frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 2u, "the ui layer must add one draw call to the frame");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "ui frame could not be captured");
+    // Непрозрачный квад во весь экран закрывает и небо, и геометрию.
+    const uint8_t *uiCorner = pixels;
+    Expect(uiCorner[1] > uiCorner[0] && uiCorner[1] > uiCorner[2],
+           "the opaque ui quad must cover the frame with its own colour");
+
+    // === Изменение размера ===
+    RendererResize(renderer, (int32_t)TEST_WIDTH / 2, (int32_t)TEST_HEIGHT / 2);
+    setup.passCount = 0u;
+    Expect(RendererBeginFrame(renderer, &setup), "frame after resize could not begin");
+    Expect(RendererEndFrame(renderer), "frame after resize could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "frame after resize could not be captured");
+    Expect(width == TEST_WIDTH / 2u && height == TEST_HEIGHT / 2u,
+           "the captured frame must follow the requested size");
+
+    // === Формат байткода шейдеров ===
+    // Пак, собранный для D3D12, содержит DXBC. Бэкенд обязан отказать
+    // понятно, а не отдать драйверу чужой байткод.
+    static const uint8_t dxbcHeader[32] = { 'D', 'X', 'B', 'C' };
+    LaiueShaderSet shaderSet;
+    LaiueShaderSetInitialize(&shaderSet);
+    Expect(LaiueShaderSetSetOverride(&shaderSet, LAIUE_SHADER_UI_VERTEX, dxbcHeader,
+                                     (uint32_t)sizeof(dxbcHeader)),
+           "the override could not be recorded");
+    Expect(!RendererReloadShaderSet(renderer, &shaderSet),
+           "a Vulkan backend must reject D3D bytecode");
+    Expect(RendererReloadShaderSet(renderer, NULL),
+           "the embedded fallback set must stay loadable after a rejected override");
+
+    // === Текстурпак как папка ===
+    // Пак — каталог с обычными файлами: имя материала задаёт приложение,
+    // файл лежит по подпапкам, а расширение движок подбирает сам.
+    // Проверяется цвет пикселя: загрузка, которая «успешно» показывает
+    // не ту текстуру, отличается от работающей только им.
+    RendererResize(renderer, (int32_t)TEST_WIDTH, (int32_t)TEST_HEIGHT);
+
+    PackTestPaths *paths = PlatformAllocate(sizeof(*paths), true);
+    Expect(paths != NULL, "path scratch could not be allocated");
+    Expect(PlatformExecutableDirectory(paths->executable, LAIUE_PLATFORM_PATH_CAPACITY),
+           "executable directory");
+    Expect(Join(paths->root, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
+                L"renderer_texture_pack_test") &&
+               Join(paths->textures, LAIUE_PLATFORM_PATH_CAPACITY, paths->root, L"textures") &&
+               Join(paths->pack, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"Anim.ltp") &&
+               Join(paths->blocks, LAIUE_PLATFORM_PATH_CAPACITY, paths->pack, L"blocks") &&
+               Join(paths->main, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"main") &&
+               Join(paths->special, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"special") &&
+               Join(paths->stone, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.png") &&
+               Join(paths->water, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"water.gif") &&
+               Join(paths->sand, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg") &&
+               Join(paths->glow, LAIUE_PLATFORM_PATH_CAPACITY, paths->special, L"glow.lt") &&
+               Join(paths->stoneCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
+                    L"stone.png.lt") &&
+               Join(paths->waterCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
+                    L"water.gif.lt") &&
+               Join(paths->sandCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg.lt") &&
+               Join(paths->uneven, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"uneven.gif") &&
+               Join(paths->unevenCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
+                    L"uneven.gif.lt") &&
+               Join(paths->stoneAuthored, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.lt") &&
+               Join(paths->formats, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"formats.txt"),
+           "path construction");
+    Expect(PlatformCreateDirectory(paths->root) && PlatformCreateDirectory(paths->textures) &&
+               PlatformCreateDirectory(paths->pack) && PlatformCreateDirectory(paths->blocks) &&
+               PlatformCreateDirectory(paths->main) && PlatformCreateDirectory(paths->special),
+           "directory creation");
+
+    PlatformDeleteFile(paths->stoneCache);
+    PlatformDeleteFile(paths->waterCache);
+    PlatformDeleteFile(paths->sandCache);
+    PlatformDeleteFile(paths->unevenCache);
+    // Прерванный прогон мог оставить и запасной `.lt`, и порядок
+    // форматов: следующий начал бы с чужой настройкой.
+    PlatformDeleteFile(paths->stoneAuthored);
+    PlatformDeleteFile(paths->formats);
+    Expect(PlatformWriteEntireFile(paths->stone, PNG_SOLID_FILE, sizeof(PNG_SOLID_FILE)),
+           "the png layer could not be written");
+    Expect(PlatformWriteEntireFile(paths->water, GIF_ANIMATED_FILE, sizeof(GIF_ANIMATED_FILE)),
+           "the animated gif layer could not be written");
+    Expect(PlatformWriteEntireFile(paths->sand, JPEG_SOLID_FILE, sizeof(JPEG_SOLID_FILE)),
+           "the jpeg layer could not be written");
+    Expect(PlatformWriteEntireFile(paths->uneven, GIF_VARIABLE_FILE, sizeof(GIF_VARIABLE_FILE)),
+           "the unevenly timed gif could not be written");
+
+    uint8_t single[SINGLE_TEXTURE_BYTES];
+    BuildSingleTexture(single, 255u, 0u, 255u);
+    Expect(PlatformWriteEntireFile(paths->glow, single, sizeof(single)),
+           "the single texture could not be written");
+
+    LaiueContentCatalog *catalog = LaiueContentCatalogCreate(paths->root);
+    Expect(catalog != NULL, "content catalog could not be created");
+    Expect(TexturePackActivateIn(catalog, L"Anim.ltp"), "the pack could not be activated");
+
+    static const wchar_t *const materialNames[6] = {
+        L"blocks/main/stone",
+        L"blocks/main/water",
+        L"blocks/main/sand",
+        L"blocks/special/glow",
+        L"blocks/main/uneven",
+        L"blocks/missing",
+    };
+    Expect(RendererSetMaterialNames(renderer, materialNames, 6u),
+           "material names with subdirectories must be accepted");
+
+    // Выйти за пределы пака нельзя даже опечаткой в имени.
+    static const wchar_t *const escapingName[1] = {L"blocks/../../secret"};
+    Expect(!RendererSetMaterialNames(renderer, escapingName, 1u),
+           "a name that leaves the pack must be rejected");
+    Expect(RendererSetMaterialNames(renderer, materialNames, 6u),
+           "the material names must survive a rejected set");
+
+    Expect(RendererReloadTexturePackFrom(renderer, catalog), "the pack directory could not load");
+    Expect(RendererGetTexturePackLoadStatus(renderer) == RENDERER_CONTENT_INCOMPLETE,
+           "a pack missing one material must say so, not fail");
+
+    // Свет без ambient и с гаммой 1: цвет текстуры доходит до пикселя
+    // как есть, и ожидание считается на бумаге.
+    setup.ambientColor[0] = 0.0f;
+    setup.ambientColor[1] = 0.0f;
+    setup.ambientColor[2] = 0.0f;
+    setup.skyColor[0] = 1.0f;
+    setup.skyColor[1] = 1.0f;
+    setup.skyColor[2] = 0.0f;
+    setup.passCount = 1u;
+    setup.passes[0].rectMaxX = TEST_WIDTH;
+    setup.passes[0].rectMaxY = TEST_HEIGHT;
+
+    static const struct
+    {
+        uint32_t blockType;
+        double seconds;
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+        const char *reason;
+    } expectations[] = {
+        {1u, 0.0, 0u, 255u, 0u, "the png layer must reach the screen"},
+        {2u, 0.0, 255u, 0u, 0u, "the first gif frame must show at time zero"},
+        {2u, 0.07, 0u, 255u, 0u, "the second gif frame must show after one delay"},
+        {2u, 0.13, 0u, 0u, 255u, "the third gif frame must show after two delays"},
+        {3u, 0.0, 0u, 255u, 255u, "the jpeg layer must reach the screen"},
+        {4u, 0.0, 255u, 0u, 255u, "the prepared single texture must reach the screen"},
+        // Задержки 40, 120 и 60 мс: границы кадров лежат на 40 и 160 мс,
+        // цикл длится 220. Моменты выбраны так, чтобы отличить настоящее
+        // расписание от двух неверных. Средний интервал (73 мс) на 50 мс
+        // показал бы ещё первый кадр, а на 150 — уже третий. Прежнее
+        // поведение — задержка первого кадра на всех — на 100 мс дало бы
+        // третий кадр, а на 150 мс укоротило бы цикл до 120 и вернуло
+        // первый.
+        {5u, 0.02, 255u, 0u, 0u, "the first frame must hold for its own forty milliseconds"},
+        {5u, 0.05, 0u, 255u, 0u, "the second frame must start at 40 ms, not at the average"},
+        {5u, 0.10, 0u, 255u, 0u, "the long middle frame must still be showing at 100 ms"},
+        {5u, 0.15, 0u, 255u, 0u, "the middle frame must hold all of its 120 ms"},
+        {5u, 0.20, 0u, 0u, 255u, "the last frame must start only after 160 ms"},
+        {5u, 0.23, 255u, 0u, 0u, "the cycle must be the sum of the frame delays"},
+    };
+
+    for (uint32_t index = 0; index < sizeof(expectations) / sizeof(expectations[0]); ++index)
+    {
+        ChunkQuad materialQuad[1];
+        materialQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, expectations[index].blockType, 1u, 1u, 1u);
+        RendererMesh *materialMesh = RendererCreateMesh(renderer, materialQuad, 1u);
+        Expect(materialMesh != NULL, "the material mesh could not be created");
+
+        setup.animationSeconds = expectations[index].seconds;
+        Expect(RendererBeginFrame(renderer, &setup), "the material frame could not begin");
+        RendererBeginScenePass(renderer, 0u);
+        RendererDrawMesh(renderer, materialMesh, origin);
+        Expect(RendererEndFrame(renderer), "the material frame could not end");
+        Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+               "the material frame could not be captured");
+        Expect(width == TEST_WIDTH && height == TEST_HEIGHT,
+               "the material frame must be captured at full size");
+
+        const uint8_t *centre =
+            pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+        Expect(AbsoluteDifference(centre[0], expectations[index].red) <= 6 &&
+                   AbsoluteDifference(centre[1], expectations[index].green) <= 6 &&
+                   AbsoluteDifference(centre[2], expectations[index].blue) <= 6,
+               expectations[index].reason);
+
+        RendererDestroyMesh(renderer, materialMesh);
+    }
+
+    // Материал, которого в паке нет, показывает нейтральный серый.
+    // Точное значение не проверяется намеренно: цель кадра в sRGB, и
+    // байт на экране зависит от кривой переноса, а не от загрузчика.
+    // Остальные цвета выше — крайние точки этой кривой, поэтому у них
+    // сравнение точное.
+    ChunkQuad missingQuad[1];
+    missingQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, 6u, 1u, 1u, 1u);
+    RendererMesh *missingMesh = RendererCreateMesh(renderer, missingQuad, 1u);
+    Expect(missingMesh != NULL, "the mesh for the missing material could not be created");
+    setup.animationSeconds = 0.0;
+    Expect(RendererBeginFrame(renderer, &setup), "the missing material frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, missingMesh, origin);
+    Expect(RendererEndFrame(renderer), "the missing material frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the missing material frame could not be captured");
+    const uint8_t *neutral =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(AbsoluteDifference(neutral[0], neutral[1]) <= 2 &&
+               AbsoluteDifference(neutral[1], neutral[2]) <= 2,
+           "a material absent from the pack must show a neutral grey");
+    Expect(neutral[0] > 120u && neutral[0] < 240u,
+           "the neutral layer must be neither black, nor white, nor the sky");
+    RendererDestroyMesh(renderer, missingMesh);
+
+    // Цикл замыкается: пройдя все кадры, анимация возвращается к началу.
+    ChunkQuad waterQuad[1];
+    waterQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, 2u, 1u, 1u, 1u);
+    RendererMesh *waterMesh = RendererCreateMesh(renderer, waterQuad, 1u);
+    Expect(waterMesh != NULL, "the looping mesh could not be created");
+    setup.animationSeconds = 0.18;
+    Expect(RendererBeginFrame(renderer, &setup), "the looping frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, waterMesh, origin);
+    Expect(RendererEndFrame(renderer), "the looping frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the looping frame could not be captured");
+    const uint8_t *looped =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(looped[0] > 200u && looped[2] < 60u,
+           "the animation must return to its first frame after one cycle");
+    RendererDestroyMesh(renderer, waterMesh);
+
+    // === Кэш рядом с исходником ===
+    // Движок читает чужой формат один раз и кладёт рядом готовый `.lt`.
+    // Проверяется не только его появление: исходники удаляются, пак
+    // перезагружается, и те же материалы обязаны прийти из кэша.
+    Expect(PlatformPathExists(paths->stoneCache) && PlatformPathExists(paths->waterCache) &&
+               PlatformPathExists(paths->sandCache) && PlatformPathExists(paths->unevenCache),
+           "loading a foreign format must leave a prepared texture next to it");
+
+    // === Приоритет форматов ===
+    // Свой `.lt` — запасной путь, а не главный. Пока PNG лежит рядом и
+    // читается, показывается он: иначе `.lt`, собранный когда-то,
+    // навсегда заслонил бы обновлённую рядом картинку, и «положи новый
+    // файл» как способ поменять текстуру перестало бы работать.
+    uint8_t centreColor[3];
+    BuildSingleTexture(single, 255u, 0u, 0u);
+    Expect(PlatformWriteEntireFile(paths->stoneAuthored, single, sizeof(single)),
+           "the authored texture could not be written");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack could not be reloaded beside an authored texture");
+    SampleMaterialCentre(renderer, &setup, origin, 1u, 0.0, pixels, centreColor);
+    Expect(ColorMatches(centreColor, 0u, 255u, 0u),
+           "a live source must win over an authored .lt");
+
+    // `formats.txt` переставляет порядок. Свой формат первым — берётся
+    // он, и рядом ничего не появляется: выводить его не из чего.
+    Expect(PlatformDeleteFile(paths->stoneCache), "the cache could not be removed");
+    static const char formatsOwnFirst[] = "# priority\nlt\npng\n";
+    Expect(PlatformWriteEntireFile(paths->formats, formatsOwnFirst, sizeof(formatsOwnFirst) - 1u),
+           "formats.txt could not be written");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack could not be reloaded with the engine format first");
+    SampleMaterialCentre(renderer, &setup, origin, 1u, 0.0, pixels, centreColor);
+    Expect(ColorMatches(centreColor, 255u, 0u, 0u),
+           "formats.txt must be able to put the engine format first");
+    Expect(!PlatformPathExists(paths->stoneCache),
+           "nothing may be built next to a source the engine never read");
+
+    // Формат, которого в файле нет, не исчезает — он идёт следом.
+    // Иначе одна забытая строка прятала бы содержимое пака.
+    static const char formatsOnlyOwn[] = "lt\n";
+    Expect(PlatformWriteEntireFile(paths->formats, formatsOnlyOwn, sizeof(formatsOnlyOwn) - 1u),
+           "formats.txt could not be rewritten");
+    Expect(PlatformDeleteFile(paths->stoneAuthored), "the authored texture could not be removed");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack could not be reloaded without the authored texture");
+    SampleMaterialCentre(renderer, &setup, origin, 1u, 0.0, pixels, centreColor);
+    Expect(ColorMatches(centreColor, 0u, 255u, 0u),
+           "a format missing from formats.txt must still be reachable");
+    Expect(PlatformDeleteFile(paths->formats), "formats.txt could not be removed");
+
+    // Ради чего свой формат и стоит последним: исходник испортился —
+    // показывается заранее собранный `.lt`, а не нейтральный слой.
+    BuildSingleTexture(single, 255u, 0u, 0u);
+    Expect(PlatformWriteEntireFile(paths->stoneAuthored, single, sizeof(single)),
+           "the authored texture could not be restored");
+    Expect(PlatformDeleteFile(paths->stoneCache), "the rebuilt cache could not be removed");
+    static const uint8_t rubbish[64] = {0};
+    Expect(PlatformWriteEntireFile(paths->stone, rubbish, sizeof(rubbish)),
+           "the damaged png could not be written");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "a damaged source must not fail the pack");
+    SampleMaterialCentre(renderer, &setup, origin, 1u, 0.0, pixels, centreColor);
+    Expect(ColorMatches(centreColor, 255u, 0u, 0u),
+           "a damaged source must fall through to the authored .lt");
+    Expect(!PlatformPathExists(paths->stoneCache), "a damaged source must not leave a cache");
+
+    // Дальше тест проверяет жизнь кэша, и запасной путь ему помешал бы.
+    Expect(PlatformWriteEntireFile(paths->stone, PNG_SOLID_FILE, sizeof(PNG_SOLID_FILE)),
+           "the png layer could not be restored");
+    Expect(PlatformDeleteFile(paths->stoneAuthored), "the authored texture could not be removed");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack could not be reloaded from the restored png");
+    Expect(PlatformPathExists(paths->stoneCache), "the restored png must be cached again");
+
+    Expect(PlatformDeleteFile(paths->stone) && PlatformDeleteFile(paths->water) &&
+               PlatformDeleteFile(paths->sand) && PlatformDeleteFile(paths->uneven),
+           "the source images could not be removed");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack must load from the cache alone");
+
+    static const struct
+    {
+        uint32_t blockType;
+        double seconds;
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+        const char *reason;
+    } cached[] = {
+        {1u, 0.0, 0u, 255u, 0u, "the png material must survive its source"},
+        {2u, 0.07, 0u, 255u, 0u, "the animated material must survive its source"},
+        {3u, 0.0, 0u, 255u, 255u, "the jpeg material must survive its source"},
+        // Неровное расписание обязано пережить перекладку в `.lt`:
+        // на 100 мс всё ещё второй кадр, а не третий.
+        {5u, 0.05, 0u, 255u, 0u, "the uneven schedule must survive the cache"},
+        {5u, 0.15, 0u, 255u, 0u, "the long frame must still hold all of its 120 ms"},
+        {5u, 0.20, 0u, 0u, 255u, "the last frame must still start only after 160 ms"},
+    };
+    for (uint32_t index = 0; index < sizeof(cached) / sizeof(cached[0]); ++index)
+    {
+        ChunkQuad cachedQuad[1];
+        cachedQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, cached[index].blockType, 1u, 1u, 1u);
+        RendererMesh *cachedMesh = RendererCreateMesh(renderer, cachedQuad, 1u);
+        Expect(cachedMesh != NULL, "the cached mesh could not be created");
+        setup.animationSeconds = cached[index].seconds;
+        Expect(RendererBeginFrame(renderer, &setup), "the cached frame could not begin");
+        RendererBeginScenePass(renderer, 0u);
+        RendererDrawMesh(renderer, cachedMesh, origin);
+        Expect(RendererEndFrame(renderer), "the cached frame could not end");
+        Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+               "the cached frame could not be captured");
+        const uint8_t *centre =
+            pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+        Expect(AbsoluteDifference(centre[0], cached[index].red) <= 6 &&
+                   AbsoluteDifference(centre[1], cached[index].green) <= 6 &&
+                   AbsoluteDifference(centre[2], cached[index].blue) <= 6,
+               cached[index].reason);
+        RendererDestroyMesh(renderer, cachedMesh);
+    }
+
+    // Нет ни исходника, ни кэша — остаётся нейтральный слой. Это и есть
+    // «текстура по умолчанию для всего»: пак грузится, а не отказывает.
+    Expect(PlatformDeleteFile(paths->stoneCache) && PlatformDeleteFile(paths->waterCache) &&
+               PlatformDeleteFile(paths->sandCache) && PlatformDeleteFile(paths->unevenCache),
+           "the cached textures could not be removed");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "the pack must still load with nothing but the prepared texture");
+    Expect(RendererGetTexturePackLoadStatus(renderer) == RENDERER_CONTENT_INCOMPLETE,
+           "a pack that lost its sources must say so, not fail");
+
+    ChunkQuad goneQuad[1];
+    goneQuad[0] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+    RendererMesh *goneMesh = RendererCreateMesh(renderer, goneQuad, 1u);
+    Expect(goneMesh != NULL, "the mesh for the vanished material could not be created");
+    setup.animationSeconds = 0.0;
+    Expect(RendererBeginFrame(renderer, &setup), "the vanished material frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, goneMesh, origin);
+    Expect(RendererEndFrame(renderer), "the vanished material frame could not end");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the vanished material frame could not be captured");
+    const uint8_t *vanished =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(AbsoluteDifference(vanished[0], vanished[1]) <= 2 &&
+               AbsoluteDifference(vanished[1], vanished[2]) <= 2 && vanished[0] > 120u &&
+               vanished[0] < 240u,
+           "a material without a source and without a cache must show the neutral layer");
+    RendererDestroyMesh(renderer, goneMesh);
+
+    // Повреждённый файл теряет свой материал, но не весь пак: сосед по
+    // папке не должен пропадать из-за чужой опечатки.
+    BuildSingleTexture(single, 0u, 255u, 255u);
+    PutU16(single + 12, 0u);   // кадров ноль
+    Expect(PlatformWriteEntireFile(paths->glow, single, sizeof(single)),
+           "the damaged texture could not be written");
+    Expect(RendererReloadTexturePackFrom(renderer, catalog),
+           "one damaged file must not fail the whole pack");
+    Expect(RendererGetTexturePackLoadStatus(renderer) == RENDERER_CONTENT_INCOMPLETE,
+           "a damaged file must count as a missing material");
+
+    LaiueContentCatalogDestroy(catalog);
+    PlatformDeleteFile(paths->stone);
+    PlatformDeleteFile(paths->water);
+    PlatformDeleteFile(paths->glow);
+    PlatformFree(paths);
+
+    // === Пул геометрии: O(1)-счётчики и возврат опустевших блоков ===
+    // Меш сцены больше не нужен: без него сценарий начинается с полностью
+    // свободного пула, и проверки занятости однозначны.
+    RendererDestroyMesh(renderer, mesh);
+
+    setup.passCount = 0u;
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "a drain frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    uint64_t warmCapacity = stats.geometryPoolCapacityBytes;
+    Expect(warmCapacity > 0u, "the idle pool must keep one warm block");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "the idle pool must report zero used geometry");
+
+    // 256 мешей по 64 КиБ = 16 МиБ: четыре базовых блока по 4 МиБ.
+    const uint32_t meshQuads = 65536u / (uint32_t)sizeof(ChunkQuad);
+    const uint32_t meshBytes = meshQuads * (uint32_t)sizeof(ChunkQuad);
+    const uint32_t burstMeshes = 256u;
+    ChunkQuad *poolQuads = PlatformAllocate((size_t)meshBytes, false);
+    RendererMesh **poolMeshes =
+        PlatformAllocate((size_t)burstMeshes * sizeof(*poolMeshes), false);
+    Expect(poolQuads != NULL && poolMeshes != NULL,
+           "the pool stress scratch could not be allocated");
+    for (uint32_t quadIndex = 0u; quadIndex < meshQuads; ++quadIndex)
+        poolQuads[quadIndex] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+
+    // Лимит незакрытых загрузок — 64, поэтому партии идут через кадры.
+    for (uint32_t created = 0u; created < burstMeshes; created += 64u)
+    {
+        for (uint32_t index = 0u; index < 64u; ++index)
+        {
+            poolMeshes[created + index] = RendererCreateMesh(renderer, poolQuads, meshQuads);
+            Expect(poolMeshes[created + index] != NULL,
+                   "a pool stress mesh could not be created");
+        }
+        Expect(RendererBeginFrame(renderer, &setup), "a pool stress frame could not begin");
+        Expect(RendererEndFrame(renderer), "a pool stress frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    uint64_t burstCapacity = stats.geometryPoolCapacityBytes;
+    Expect(burstCapacity == warmCapacity * 4u,
+           "the geometry burst must add exactly three base blocks");
+    Expect(stats.geometryPoolUsedBytes == (uint64_t)meshBytes * burstMeshes,
+           "the O(1) counter must account for every allocated mesh byte");
+
+    // Спад: все меши исчезают, дренаж возвращает хвостовые блоки.
+    for (uint32_t index = 0u; index < burstMeshes; ++index)
+        RendererDestroyMesh(renderer, poolMeshes[index]);
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a shrink frame could not begin");
+        Expect(RendererEndFrame(renderer), "a shrink frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == warmCapacity,
+           "the pool must return to a single warm block after the burst");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "the pool must be idle after every mesh went away");
+
+    // Повторный всплеск: блоки берутся заново, геометрия снова рисуется.
+    for (uint32_t created = 0u; created < burstMeshes; created += 64u)
+    {
+        for (uint32_t index = 0u; index < 64u; ++index)
+        {
+            poolMeshes[created + index] = RendererCreateMesh(renderer, poolQuads, meshQuads);
+            Expect(poolMeshes[created + index] != NULL,
+                   "a recreated pool mesh could not be created");
+        }
+        Expect(RendererBeginFrame(renderer, &setup), "a regrow frame could not begin");
+        Expect(RendererEndFrame(renderer), "a regrow frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == burstCapacity,
+           "recreated geometry must fill the same number of blocks");
+
+    setup.passCount = 1u;
+    Expect(RendererBeginFrame(renderer, &setup), "a regrown scene frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, poolMeshes[0], origin);
+    Expect(RendererEndFrame(renderer), "a regrown scene frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 1u, "a mesh in a regrown pool must still draw");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "a regrown scene frame could not be captured");
+    const uint8_t *poolCentre =
+        pixels + ((size_t)(TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(!(poolCentre[0] > 250u && poolCentre[1] > 250u && poolCentre[2] < 5u),
+           "the regrown geometry must cover the frame centre, not the sky");
+
+    for (uint32_t index = 0u; index < burstMeshes; ++index)
+        RendererDestroyMesh(renderer, poolMeshes[index]);
+    setup.passCount = 0u;
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "a final drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "a final drain frame could not end");
+    }
+
+    // Крупный меш (> базового блока) получает отдельный блок, и после
+    // дренажа тот освобождается целиком, а не остаётся тёплым.
+    const uint32_t largeBytes = 5u * 1024u * 1024u;
+    const uint32_t largeQuads = largeBytes / (uint32_t)sizeof(ChunkQuad);
+    ChunkQuad *largeGeometry = PlatformAllocate((size_t)largeBytes, false);
+    Expect(largeGeometry != NULL, "the oversized geometry could not be allocated");
+    for (uint32_t quadIndex = 0u; quadIndex < largeQuads; ++quadIndex)
+        largeGeometry[quadIndex] = PackChunkQuad(0u, 0u, 0u, 4u, 1u, 1u, 1u, 1u);
+    RendererMesh *largeMesh = RendererCreateMesh(renderer, largeGeometry, largeQuads);
+    Expect(largeMesh != NULL, "the oversized mesh could not be created");
+    Expect(RendererBeginFrame(renderer, &setup), "an oversized mesh frame could not begin");
+    Expect(RendererEndFrame(renderer), "an oversized mesh frame could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes > warmCapacity,
+           "an oversized mesh must allocate its own block");
+    RendererDestroyMesh(renderer, largeMesh);
+    for (uint32_t frame = 0u; frame < 8u; ++frame)
+    {
+        Expect(RendererBeginFrame(renderer, &setup), "an oversized drain frame could not begin");
+        Expect(RendererEndFrame(renderer), "an oversized drain frame could not end");
+    }
+    RendererGetStats(renderer, &stats);
+    Expect(stats.geometryPoolCapacityBytes == warmCapacity,
+           "a block larger than the base size must be released, not kept warm");
+    Expect(stats.geometryPoolUsedBytes == 0u,
+           "an oversized mesh must leave no used bytes after draining");
+
+    // GPU timing is optional on unsupported queues/drivers. A supported
+    // backend publishes only completed-frame samples and never blocks here.
+    RendererGpuTimingV1 gpuTiming;
+    RendererGetGpuTimingV1(renderer, &gpuTiming);
+    Expect(gpuTiming.structSize == sizeof(gpuTiming),
+           "GPU timing must report its versioned structure size");
+    Expect((gpuTiming.flags & ~(RENDERER_GPU_TIMING_SUPPORTED |
+                                RENDERER_GPU_TIMING_VALID)) == 0u,
+           "GPU timing must not publish unknown status flags");
+    Expect((gpuTiming.flags & RENDERER_GPU_TIMING_VALID) == 0u ||
+               (gpuTiming.flags & RENDERER_GPU_TIMING_SUPPORTED) != 0u,
+           "a valid GPU sample must imply timestamp support");
+    PlatformFree(poolQuads);
+    PlatformFree(poolMeshes);
+    PlatformFree(largeGeometry);
+
+    PlatformFree(pixels);
+    RendererDestroy(renderer);
+
+    LaiueTestRuntimeWrite("Offscreen renderer frame checks passed\n");
+    LAIUE_TEST_SUCCESS();
+}

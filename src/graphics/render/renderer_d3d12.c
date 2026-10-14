@@ -1,0 +1,4808 @@
+#include "render/renderer_internal.h"
+#include "render/renderer_offscreen.h"
+
+#define COBJMACROS
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+
+#include "render/generated/d3d12/chunk_vs.h"
+#include "render/generated/d3d12/chunk_ps.h"
+#include "render/generated/d3d12/panorama_vs.h"
+#include "render/generated/d3d12/panorama_ps.h"
+#include "render/generated/d3d12/ui_vs.h"
+#include "render/generated/d3d12/ui_ps.h"
+#include "render/generated/d3d12/generic_vs.h"
+#include "render/generated/d3d12/generic_ps.h"
+#include "render/texture_pack_internal.h"
+#include "render/content_provider.h"
+#include "render/ui_image_wic.h"
+
+#include <float.h>
+#include <stddef.h>
+#include <string.h>
+
+#define LaiueContentCatalogDefault RendererContentDefaultCatalog
+
+// Публичное имя RendererDestroy теперь живёт в renderer_dispatch.c, а
+// путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
+// раньше её определения — объявляем её здесь.
+void RendererDestroy_D3D12(Renderer* renderer);
+RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
+                                              uint32_t height, uint32_t mipLevels,
+                                              uint32_t format);
+bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
+                                 const void *data, uint64_t sizeBytes,
+                                 uint32_t rowPitchBytes);
+bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture,
+                                    uint32_t mipLevel, const void *data,
+                                    uint64_t sizeBytes, uint32_t rowPitchBytes);
+void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
+
+#define FRAME_COUNT 2
+
+// Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
+// блоков соседствуют — таблица чанкового прохода накрывает оба (t1, t2).
+#define SRV_SLOT_BLOCK_TEXTURES 0
+#define SRV_SLOT_BLOCK_NORMALS  1
+#define SRV_SLOT_PANORAMA_CUBE  2
+#define SRV_SLOT_FONT_ATLAS     3
+#define SRV_SLOT_UI_BACKGROUND  4
+#define SRV_STATIC_SLOT_COUNT   5
+#define SRV_SLOT_COUNT          64
+#define SAMPLER_SLOT_COUNT      64
+#define SAMPLER_STATIC_SLOT_COUNT 1
+
+// Слой UI: размер квада держать в синхроне с shaders/ui.hlsl.
+// Число квадов является частью публичного контракта renderer.h.
+#define UI_QUAD_BYTES 48
+
+// Резолв панорамы: раскладка корневых констант.
+#define RESOLVE_ROOT_CONSTANT_COUNT 3
+
+// Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl,
+// float3 выравниваются по границам 16 байт):
+// dword 0..15 — view-projection, 16..18 — смещение чанка,
+// 20..22 — направление от солнца, 23 — число слоёв материалов,
+// 24..26 — цвет солнца, 28..30 — ambient.
+#define ROOT_CONSTANT_COUNT 48
+#define ROOT_CONSTANT_ORIGIN_OFFSET 16
+#define ROOT_CONSTANT_LIGHTING_OFFSET 20
+#define ROOT_CONSTANT_LIGHTING_COUNT 12
+// Таблица слоёв материалов: по байту на материал, шестнадцать слов.
+// Пишется раз на проход вместе со светом, а не на каждый чанк.
+#define ROOT_CONSTANT_SLICES_OFFSET 32
+#define ROOT_CONSTANT_SLICES_COUNT 16
+#define ROOT_PARAMETER_CONSTANTS 0
+#define ROOT_PARAMETER_QUAD_BUFFER 1
+#define ROOT_PARAMETER_BLOCK_TEXTURES 2
+#define ROOT_PARAMETER_INSTANCES 3
+
+#define GENERIC_ROOT_PARAMETER_CONSTANTS 0
+#define GENERIC_ROOT_PARAMETER_QUAD_BUFFER 1
+#define GENERIC_ROOT_PARAMETER_TEXTURE 2
+#define GENERIC_ROOT_PARAMETER_SAMPLER 3
+#define GENERIC_ROOT_PARAMETER_INSTANCES 4
+#define GENERIC_INSTANCE_MODE_OFFSET 27
+#define GENERIC_VERTEX_ID_OFFSET 28
+#define GEOMETRY_READ_STATE                                                                        \
+    (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER)
+
+#define MAX_TEXTURE_SUBRESOURCES TEXTURE_PACK_MAX_SUBRESOURCES
+
+// Пул геометрии: меши суб-аллоцируются из больших DEFAULT-буферов —
+// без 64-КиБ выравнивания на каждый меш и без чтения через PCIe.
+#define POOL_BLOCK_BYTES (4u * 1024u * 1024u)
+#define MAX_POOL_BLOCKS 64
+
+// Очереди отложенного освобождения: ресурс или диапазон пула
+// уничтожается, только когда GPU прошёл кадры, которые могли его читать.
+#define DEFERRED_RELEASE_CAPACITY 256
+#define DEFERRED_RESOURCE_CAPACITY 512
+#define MAX_PENDING_UPLOADS 128
+// Geometry staging, two block textures, font, background and old capture.
+#define MAX_RESOURCE_RELEASES_PER_FRAME (MAX_PENDING_UPLOADS + 5u)
+#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Крупные записи (один большой меш или всплеск чанков, который не влезает
+// в основное кольцо) идут в отдельную арену с тем же двойным
+// буферированием. Она создаётся лениво, при первом переполнении, и
+// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
+#define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Инстансное кольцо — чанковый upload-пул: кадровый слот начинает с одного
+// небольшого чанка и добавляет новый только тогда, когда очередной вызов
+// перестаёт влезать в уже существующие. Стартовая плата падает с 2 x 16 МиБ
+// до 2 x INSTANCE_CHUNK_BYTES, но ни один вызов не теряется: под него либо
+// находится место в существующем чанке, либо выделяется новый. Чанки не
+// уничтожаются, пока рендерер жив, поэтому GPU никогда не читает освобождённую
+// память, а фенс слота гарантирует, что кадр перезаписывает только тот чанк,
+// который GPU уже перестал читать.
+#define INSTANCE_CHUNK_BYTES (1u * 1024u * 1024u)
+// Бюджет на кадровый слот. Он выше прежних 16 МиБ: нагрузка сверх старого
+// лимита теперь не отбрасывается молча, но остаётся ограниченной.
+#define INSTANCE_MAX_BYTES_PER_FRAME (64u * 1024u * 1024u)
+#define INSTANCE_MAX_BYTES_PER_DRAW INSTANCE_MAX_BYTES_PER_FRAME
+// Каждый чанк не меньше INSTANCE_CHUNK_BYTES, поэтому бюджета хватает не
+// более чем на столько чанков на слот.
+#define INSTANCE_MAX_CHUNKS_PER_FRAME \
+    (INSTANCE_MAX_BYTES_PER_FRAME / INSTANCE_CHUNK_BYTES)
+
+typedef struct FreeRange
+{
+    uint32_t offset;
+    uint32_t size;
+} FreeRange;
+
+typedef struct GeometryPoolBlock
+{
+    ID3D12Resource* buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    uint32_t totalBytes;
+    FreeRange* freeRanges;      // отсортированы по offset, соседние слиты
+    uint32_t freeRangeCount;
+    uint32_t freeRangeCapacity;
+    D3D12_RESOURCE_STATES currentState;
+    bool touchedByUploads;
+} GeometryPoolBlock;
+
+typedef struct GeometryAllocation GeometryAllocation;
+struct GeometryAllocation
+{
+    union
+    {
+        Renderer *owner;
+        GeometryAllocation *nextDeferred;
+    };
+    union
+    {
+        uint64_t generation;
+        UINT64 safeFenceValue;
+    };
+    uint32_t blockIndex;
+    uint32_t offsetBytes;
+    uint32_t sizeBytes;
+    bool resident;
+};
+
+typedef struct PendingUpload
+{
+    GeometryAllocation *allocation;
+    ID3D12Resource* staging;
+    uint32_t sourceOffset;
+    uint32_t blockIndex;
+    uint32_t destinationOffset;
+    uint32_t sizeBytes;
+    bool ownsStaging;
+} PendingUpload;
+
+typedef struct DeferredResourceRelease
+{
+    ID3D12Resource* resource;
+    UINT64 safeFenceValue;
+} DeferredResourceRelease;
+
+typedef struct DeferredRangeRelease
+{
+    uint32_t blockIndex;
+    uint32_t offset;
+    uint32_t size;
+    UINT64 safeFenceValue;
+} DeferredRangeRelease;
+
+typedef struct InstanceChunk
+{
+    ID3D12Resource* buffer;
+    uint8_t* mapped;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    uint32_t capacityBytes;
+} InstanceChunk;
+
+struct RendererMesh
+{
+    GeometryAllocation allocation;
+    uint32_t quadCount;
+    uint32_t vertexCount;
+    bool generic;
+};
+
+struct RendererIndexBuffer
+{
+    GeometryAllocation allocation;
+    uint32_t indexCount;
+};
+
+_Static_assert(offsetof(struct RendererMesh, allocation) == 0,
+               "mesh allocation must be first for deferred release");
+_Static_assert(offsetof(struct RendererIndexBuffer, allocation) == 0,
+               "index allocation must be first for deferred release");
+_Static_assert(sizeof(RendererMeshInstance) == 32u,
+               "generic instances must match the shader layout");
+_Static_assert(MAX_RESOURCE_RELEASES_PER_FRAME < DEFERRED_RESOURCE_CAPACITY,
+               "one frame must fit the deferred resource queue");
+
+struct RendererTexture
+{
+    Renderer *owner;
+    ID3D12Resource *resource;
+    uint32_t srvSlot;
+};
+
+struct RendererSampler
+{
+    Renderer *owner;
+    uint32_t samplerSlot;
+};
+
+// Один экземпляр на устройство: поля сгруппированы по подсистемам, а не
+// упакованы, — несколько десятков байт выравнивания здесь ничего не стоят.
+struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
+{
+    RendererHeader header;
+    IDXGIFactory4*             factory;
+    ID3D12Device*              device;
+    ID3D12CommandQueue*        commandQueue;
+    IDXGISwapChain3*           swapChain;
+    ID3D12CommandAllocator*    commandAllocators[FRAME_COUNT];
+    ID3D12GraphicsCommandList* commandList;
+    ID3D12Resource*            renderTargets[FRAME_COUNT];
+    ID3D12DescriptorHeap*      renderTargetViewHeap;
+    UINT                       renderTargetViewSize;
+    ID3D12Resource*            depthBuffer;
+    ID3D12DescriptorHeap*      depthStencilViewHeap;
+    ID3D12Fence*               fence;
+    HANDLE                     fenceEvent;
+    UINT64                     fenceValues[FRAME_COUNT];
+    UINT64                     lastSignaledFenceValue;
+    ID3D12QueryHeap*            gpuTimingQueryHeap;
+    ID3D12Resource*             gpuTimingReadback;
+    uint8_t*                    gpuTimingMapped;
+    UINT64                      gpuTimingFrequency;
+    UINT64                      gpuTimingFenceValues[FRAME_COUNT];
+    uint64_t                    gpuTimingFrameIndices[FRAME_COUNT];
+    bool                        gpuTimingPending[FRAME_COUNT];
+    uint64_t                    gpuTimingNextFrameIndex;
+    bool                        gpuTimingSupported;
+    bool                        gpuTimingRecording;
+    UINT                       frameIndex;
+    ID3D12RootSignature*       rootSignature;
+    ID3D12RootSignature*       genericRootSignature;
+    ID3D12PipelineState*       pipelineState;
+    ID3D12PipelineState*       genericPipelineState;
+    ID3D12Resource*            blockTexture;
+    ID3D12Resource*            blockTextureUpload;
+    ID3D12Resource*            blockNormalTexture;
+    ID3D12Resource*            blockNormalUpload;
+    RendererTexture*            genericFallbackTexture;
+    ID3D12DescriptorHeap*      srvHeap;
+    UINT                       srvDescriptorSize;
+    uint32_t                   dynamicSrvNext;
+    uint32_t                   dynamicSrvFreeCount;
+    uint32_t                   dynamicSrvFree[SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT];
+    ID3D12DescriptorHeap*      samplerHeap;
+    UINT                       samplerDescriptorSize;
+    uint32_t                   dynamicSamplerNext;
+    uint32_t                   dynamicSamplerFreeCount;
+    uint32_t                   dynamicSamplerFree[SAMPLER_SLOT_COUNT - SAMPLER_STATIC_SLOT_COUNT];
+    bool                       blockTextureUploadPending;
+    TexturePackAnimationSet    blockAnimation;
+    TexturePackMaterialNames   materialNames;
+
+    // Панорама: кубмапа сцены (грани в пространстве вида) + резолв.
+    ID3D12Resource*            cubeColor;
+    ID3D12Resource*            cubeDepth;
+    ID3D12DescriptorHeap*      cubeRtvHeap;      // 6 RTV по слоям
+    ID3D12DescriptorHeap*      cubeDsvHeap;
+    uint32_t                   cubeResolution;   // 0 — ресурсы не созданы
+    ID3D12RootSignature*       resolveRootSignature;
+    ID3D12PipelineState*       resolvePipelineState;
+    RendererFrameSetup         frame;            // setup текущего кадра
+
+    // Слой UI: vertex pulling из upload-кольца, атлас шрифта.
+    ID3D12RootSignature*       uiRootSignature;
+    ID3D12PipelineState*       uiPipelineState;
+    ID3D12Resource*            uiQuadBuffers[FRAME_COUNT];
+    uint8_t*                   uiQuadMapped[FRAME_COUNT];
+    uint32_t                   uiQuadCount;
+    ID3D12Resource*            fontTexture;
+    ID3D12Resource*            fontTextureUpload;
+    bool                       fontUploadPending;
+    bool                       fontReady;
+    ID3D12Resource*            backgroundTexture;
+    ID3D12Resource*            backgroundTextureUpload;
+    bool                       backgroundUploadPending;
+    bool                       backgroundReady;
+    D3D12_VIEWPORT             viewport;
+    D3D12_RECT                 scissorRect;
+    int32_t                    windowWidth;
+    int32_t                    windowHeight;
+    int32_t                    resizeWidth;
+    int32_t                    resizeHeight;
+    bool                       resizeRequested;
+    bool                       verticalSyncEnabled;
+    bool                       tearingSupported;
+    bool                       tearingPresentEnabled;
+    bool                       wireframeEnabled;
+    bool                       worldReady;
+    bool                       frameRecording;
+    bool frameFailed;
+    bool captureRequested;
+    bool captureValid;
+    ID3D12Resource *captureReadback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT captureFootprint;
+    UINT64 captureReadbackBytes;
+    UINT64 captureFenceValue;
+    uint32_t captureWidth;
+    uint32_t captureHeight;
+
+    // Owned copies of application shader overrides, indexed by
+    // LaiueShaderSlot.  NULL entries select checked-in embedded fallbacks.
+    void *loadedShaders[LAIUE_SHADER_SLOT_COUNT];
+    uint32_t loadedShaderLengths[LAIUE_SHADER_SLOT_COUNT];
+
+    GeometryPoolBlock          poolBlocks[MAX_POOL_BLOCKS];
+    uint32_t                   poolBlockCount;
+    uint64_t geometryGeneration;
+    // Счётчики пула вместо обхода всех блоков и диапазонов в
+    // RendererGetStats_D3D12: capacity — сумма размеров блоков, used — сумма
+    // выданных мешам байт. Оба меняются только при создании блока,
+    // успешном PoolAllocate и записанном PoolFree.
+    uint64_t                   poolCapacityBytes;
+    uint64_t                   poolUsedBytes;
+
+    PendingUpload              pendingUploads[MAX_PENDING_UPLOADS];
+    uint32_t                   pendingUploadCount;
+    ID3D12Resource*            meshUploadBuffers[FRAME_COUNT];
+    uint8_t*                   meshUploadMapped[FRAME_COUNT];
+    uint32_t                   meshUploadOffsets[FRAME_COUNT];
+    ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
+    uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
+    uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
+    // Чанковый пул инстансов, по независимому набору на кадровый слот.
+    // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
+    // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
+    // всех выделенных чанков слота (чанки не уменьшаются).
+    InstanceChunk              instanceChunks[FRAME_COUNT]
+                                             [INSTANCE_MAX_CHUNKS_PER_FRAME];
+    uint32_t                   instanceChunkCount[FRAME_COUNT];
+    uint32_t                   instanceChunkIndex[FRAME_COUNT];
+    uint32_t                   instanceChunkOffset[FRAME_COUNT];
+    uint32_t                   instancePoolBytes[FRAME_COUNT];
+    // Известно ли CPU, что корневые константы смещения уже равны
+    // (0, 0, 0, -1) — значению, общему для всех инстансных вызовов кадра.
+    // Пока это так, повторная запись тех же констант не делается.
+    bool                       instanceOriginActive;
+    uint32_t sceneConstants[ROOT_CONSTANT_COUNT];
+    bool scenePassActive;
+    // Последние записанные в командный список PSO и корневая подпись.
+    // В потоке однотипных вызовов одного прохода оба значения постоянны,
+    // поэтому повторная запись пропускается. Сбрасываются Reset'ом
+    // командного списка и пересозданием PSO.
+    ID3D12PipelineState*       boundPipelineState;
+    ID3D12RootSignature*       boundRootSignature;
+    D3D12_GPU_VIRTUAL_ADDRESS boundIndexAddress;
+    uint32_t boundIndexBytes;
+
+    DeferredResourceRelease deferredResources[DEFERRED_RESOURCE_CAPACITY];
+    uint32_t                   deferredResourceHead;
+    uint32_t                   deferredResourceCount;
+
+    DeferredRangeRelease       deferredRanges[DEFERRED_RELEASE_CAPACITY];
+    uint32_t                   deferredRangeHead;
+    uint32_t                   deferredRangeCount;
+    GeometryAllocation *deferredAllocationHead;
+
+    RendererStats              currentStats;
+    RendererStats              lastStats;
+    RendererContentStatus     texturePackLoadStatus;
+};
+
+_Static_assert(offsetof(struct Renderer, header) == 0, "renderer header must be first");
+
+static bool RecreateChunkPipelineState(Renderer* renderer);
+static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
+                                               void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                               const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                               ID3D12PipelineState **outPipelineState);
+static bool CreateGenericPipelineState(Renderer *renderer,
+                                       ID3D12PipelineState **outPipelineState);
+static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
+                                                 void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                                 const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                                 ID3D12PipelineState **outPipelineState);
+static bool CreateUiPipelineStateForShaders(Renderer *renderer,
+                                            void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                            const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                            ID3D12PipelineState **outPipelineState);
+
+static D3D12_RESOURCE_BARRIER MakeTransitionBarrier(
+    ID3D12Resource* resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter)
+{
+    D3D12_RESOURCE_BARRIER barrier;
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.StateBefore = stateBefore;
+    barrier.Transition.StateAfter = stateAfter;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    return barrier;
+}
+
+// Profiling is optional: failure to allocate either resource leaves rendering
+// unchanged and the backend reports timing as unsupported.
+static void ReleaseGpuTimingResources(Renderer *renderer);
+
+static bool CreateGpuTimingResources(Renderer *renderer)
+{
+    UINT64 frequency = 0;
+    if (FAILED(ID3D12CommandQueue_GetTimestampFrequency(renderer->commandQueue,
+                                                        &frequency))
+        || frequency == 0)
+        return false;
+
+    D3D12_QUERY_HEAP_DESC queryHeapDescription = {
+        .Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+        .Count = FRAME_COUNT * 2u,
+    };
+    if (FAILED(ID3D12Device_CreateQueryHeap(renderer->device,
+            &queryHeapDescription, &IID_ID3D12QueryHeap,
+            (void **)&renderer->gpuTimingQueryHeap)))
+    {
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC readbackDescription;
+    memset(&readbackDescription, 0, sizeof(readbackDescription));
+    readbackDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackDescription.Width = (UINT64)(FRAME_COUNT * 2u) * sizeof(UINT64);
+    readbackDescription.Height = 1u;
+    readbackDescription.DepthOrArraySize = 1u;
+    readbackDescription.MipLevels = 1u;
+    readbackDescription.SampleDesc.Count = 1u;
+    readbackDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readbackHeap = { .Type = D3D12_HEAP_TYPE_READBACK };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDescription,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+            (void **)&renderer->gpuTimingReadback)))
+    {
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    D3D12_RANGE readRange = {
+        .Begin = 0,
+        .End = (SIZE_T)(FRAME_COUNT * 2u) * sizeof(UINT64),
+    };
+    if (FAILED(ID3D12Resource_Map(renderer->gpuTimingReadback, 0, &readRange,
+                                  (void **)&renderer->gpuTimingMapped)))
+    {
+        renderer->gpuTimingMapped = NULL;
+        ReleaseGpuTimingResources(renderer);
+        return false;
+    }
+
+    renderer->gpuTimingFrequency = frequency;
+    renderer->gpuTimingSupported = true;
+    return true;
+}
+
+static void ReleaseGpuTimingResources(Renderer *renderer)
+{
+    if (renderer->gpuTimingReadback != NULL)
+    {
+        if (renderer->gpuTimingMapped != NULL)
+        {
+            const D3D12_RANGE noCpuWrites = {0, 0};
+            ID3D12Resource_Unmap(renderer->gpuTimingReadback, 0,
+                                 &noCpuWrites);
+        }
+        ID3D12Resource_Release(renderer->gpuTimingReadback);
+    }
+    if (renderer->gpuTimingQueryHeap != NULL)
+        ID3D12QueryHeap_Release(renderer->gpuTimingQueryHeap);
+    renderer->gpuTimingReadback = NULL;
+    renderer->gpuTimingMapped = NULL;
+    renderer->gpuTimingQueryHeap = NULL;
+    renderer->gpuTimingFrequency = 0;
+    renderer->gpuTimingSupported = false;
+}
+
+// Смена состояния командного списка через кэш: повторная запись того же
+// PSO или корневой подписи — это запись, которую драйвер перечитывает на
+// каждом draw, даже если значение не изменилось. В потоке однотипных
+// вызовов одного прохода оба значения постоянны, поэтому последнее
+// записанное запоминается. Все места смены состояния обязаны идти через
+// эти помощники, иначе кэш разойдётся с фактическим состоянием списка.
+static void SetPipelineStateCached(Renderer *renderer, ID3D12PipelineState *pipelineState)
+{
+    if (renderer->boundPipelineState == pipelineState)
+    {
+        return;
+    }
+    ID3D12GraphicsCommandList_SetPipelineState(renderer->commandList, pipelineState);
+    renderer->boundPipelineState = pipelineState;
+}
+
+static void SetRootSignatureCached(Renderer *renderer, ID3D12RootSignature *rootSignature)
+{
+    if (renderer->boundRootSignature == rootSignature)
+    {
+        return;
+    }
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(renderer->commandList, rootSignature);
+    renderer->boundRootSignature = rootSignature;
+    renderer->instanceOriginActive = false;
+}
+
+static bool WaitForGpu(Renderer *renderer)
+{
+    UINT64 targetValue = renderer->fenceValues[renderer->frameIndex];
+    if (targetValue == UINT64_MAX ||
+        FAILED(ID3D12CommandQueue_Signal(renderer->commandQueue, renderer->fence, targetValue)))
+        return false;
+    renderer->lastSignaledFenceValue = targetValue;
+    UINT64 completedValue = ID3D12Fence_GetCompletedValue(renderer->fence);
+    if (completedValue == UINT64_MAX)
+        return false;
+    if (completedValue < targetValue &&
+        (FAILED(ID3D12Fence_SetEventOnCompletion(renderer->fence, targetValue,
+                                                 renderer->fenceEvent)) ||
+         WaitForSingleObject(renderer->fenceEvent, INFINITE) != WAIT_OBJECT_0))
+        return false;
+    if (FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+        return false;
+    renderer->fenceValues[renderer->frameIndex]++;
+    return true;
+}
+
+static bool MoveToNextFrame(Renderer *renderer, bool *outWaitedForFence)
+{
+    *outWaitedForFence = false;
+    UINT64 currentValue = renderer->fenceValues[renderer->frameIndex];
+    if (currentValue == UINT64_MAX ||
+        FAILED(ID3D12CommandQueue_Signal(renderer->commandQueue, renderer->fence, currentValue)))
+        return false;
+    renderer->lastSignaledFenceValue = currentValue;
+
+    renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
+
+    const UINT64 completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+    if (completed == UINT64_MAX)
+        return false;
+    if (completed < renderer->fenceValues[renderer->frameIndex])
+    {
+        if (FAILED(ID3D12Fence_SetEventOnCompletion(renderer->fence,
+                                                    renderer->fenceValues[renderer->frameIndex],
+                                                    renderer->fenceEvent)) ||
+            WaitForSingleObject(renderer->fenceEvent, INFINITE) != WAIT_OBJECT_0 ||
+            FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+            return false;
+        *outWaitedForFence = true;
+    }
+
+    renderer->fenceValues[renderer->frameIndex] = currentValue + 1;
+    return true;
+}
+
+// === Пул геометрии ===
+
+static bool PoolBlockCreate(Renderer* renderer, uint32_t minimumBytes, uint32_t* outBlockIndex)
+{
+    if (renderer->poolBlockCount == MAX_POOL_BLOCKS)
+    {
+        return false;
+    }
+
+    uint32_t totalBytes = minimumBytes > POOL_BLOCK_BYTES ? minimumBytes : POOL_BLOCK_BYTES;
+
+    GeometryPoolBlock* block = &renderer->poolBlocks[renderer->poolBlockCount];
+    memset(block, 0, sizeof(*block));
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = totalBytes;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE,
+        &description, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&block->buffer)))
+    {
+        return false;
+    }
+
+    block->freeRangeCapacity = 16;
+    block->freeRanges = HeapAlloc(GetProcessHeap(), 0, block->freeRangeCapacity * sizeof(FreeRange));
+    if (block->freeRanges == NULL)
+    {
+        ID3D12Resource_Release(block->buffer);
+        block->buffer = NULL;
+        return false;
+    }
+
+    block->address = ID3D12Resource_GetGPUVirtualAddress(block->buffer);
+    block->totalBytes = totalBytes;
+    block->freeRanges[0].offset = 0;
+    block->freeRanges[0].size = totalBytes;
+    block->freeRangeCount = 1;
+    block->currentState = D3D12_RESOURCE_STATE_COMMON;
+
+    renderer->poolCapacityBytes += totalBytes;
+    *outBlockIndex = renderer->poolBlockCount++;
+    return true;
+}
+
+static bool PoolAllocate(Renderer* renderer, uint32_t sizeBytes, uint32_t* outBlockIndex, uint32_t* outOffset)
+{
+    for (uint32_t blockIndex = 0; blockIndex < renderer->poolBlockCount; ++blockIndex)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[blockIndex];
+        for (uint32_t i = 0; i < block->freeRangeCount; ++i)
+        {
+            FreeRange* range = &block->freeRanges[i];
+            if (range->size < sizeBytes)
+            {
+                continue;
+            }
+
+            *outBlockIndex = blockIndex;
+            *outOffset = range->offset;
+            range->offset += sizeBytes;
+            range->size -= sizeBytes;
+            if (range->size == 0)
+            {
+                block->freeRanges[i] = block->freeRanges[--block->freeRangeCount];
+                // Список должен оставаться отсортированным для коалесценции —
+                // простая пересортировка вставкой (список короткий).
+                for (uint32_t j = 1; j < block->freeRangeCount; ++j)
+                {
+                    FreeRange moved = block->freeRanges[j];
+                    uint32_t position = j;
+                    while (position > 0 && block->freeRanges[position - 1].offset > moved.offset)
+                    {
+                        block->freeRanges[position] = block->freeRanges[position - 1];
+                        position--;
+                    }
+                    block->freeRanges[position] = moved;
+                }
+            }
+            renderer->poolUsedBytes += sizeBytes;
+            return true;
+        }
+    }
+
+    uint32_t newBlockIndex;
+    if (!PoolBlockCreate(renderer, sizeBytes, &newBlockIndex))
+    {
+        return false;
+    }
+
+    GeometryPoolBlock* block = &renderer->poolBlocks[newBlockIndex];
+    *outBlockIndex = newBlockIndex;
+    *outOffset = 0;
+    block->freeRanges[0].offset = sizeBytes;
+    block->freeRanges[0].size = block->totalBytes - sizeBytes;
+    block->freeRangeCount = block->freeRanges[0].size == 0 ? 0 : 1;
+    renderer->poolUsedBytes += sizeBytes;
+    return true;
+}
+
+// Возвращает диапазон в список свободных с коалесценцией соседей.
+// false — диапазон потерян из-за OOM при росте списка (счётчик used
+// тогда не уменьшается, как и раньше не уменьшался доступный объём).
+static bool PoolFree(GeometryPoolBlock* block, uint32_t offset, uint32_t size)
+{
+    uint32_t position = 0;
+    while (position < block->freeRangeCount && block->freeRanges[position].offset < offset)
+    {
+        position++;
+    }
+
+    bool mergesWithPrevious = position > 0 &&
+        block->freeRanges[position - 1].offset + block->freeRanges[position - 1].size == offset;
+    bool mergesWithNext = position < block->freeRangeCount &&
+        offset + size == block->freeRanges[position].offset;
+
+    if (mergesWithPrevious && mergesWithNext)
+    {
+        block->freeRanges[position - 1].size += size + block->freeRanges[position].size;
+        for (uint32_t i = position; i + 1 < block->freeRangeCount; ++i)
+        {
+            block->freeRanges[i] = block->freeRanges[i + 1];
+        }
+        block->freeRangeCount--;
+        return true;
+    }
+    if (mergesWithPrevious)
+    {
+        block->freeRanges[position - 1].size += size;
+        return true;
+    }
+    if (mergesWithNext)
+    {
+        block->freeRanges[position].offset = offset;
+        block->freeRanges[position].size += size;
+        return true;
+    }
+
+    if (block->freeRangeCount == block->freeRangeCapacity)
+    {
+        uint32_t newCapacity = block->freeRangeCapacity * 2;
+        FreeRange* newRanges = HeapReAlloc(GetProcessHeap(), 0, block->freeRanges, newCapacity * sizeof(FreeRange));
+        if (newRanges == NULL)
+        {
+            return false; // диапазон потерян до конца жизни пула — только при OOM
+        }
+        block->freeRanges = newRanges;
+        block->freeRangeCapacity = newCapacity;
+    }
+
+    for (uint32_t i = block->freeRangeCount; i > position; --i)
+    {
+        block->freeRanges[i] = block->freeRanges[i - 1];
+    }
+    block->freeRanges[position].offset = offset;
+    block->freeRanges[position].size = size;
+    block->freeRangeCount++;
+    return true;
+}
+
+// Полностью опустевший блок пула: все выданные из него области уже
+// вернулись, и в списке свободных лежит ровно весь блок.
+static bool PoolBlockIsEmpty(const GeometryPoolBlock* block)
+{
+    return block->freeRangeCount == 1u && block->freeRanges[0].offset == 0u &&
+           block->freeRanges[0].size == block->totalBytes;
+}
+
+// Блок ещё нужен незакрытым загрузкам или отложенным освобождениям: его
+// индекс обязан остаться валидным до конца дренажа.
+static bool PoolBlockIsReferenced(const Renderer* renderer, uint32_t blockIndex)
+{
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].blockIndex == blockIndex) return true;
+    }
+    for (uint32_t i = 0; i < renderer->deferredRangeCount; ++i)
+    {
+        uint32_t index = (renderer->deferredRangeHead + i) % DEFERRED_RELEASE_CAPACITY;
+        if (renderer->deferredRanges[index].blockIndex == blockIndex) return true;
+    }
+    for (const GeometryAllocation *allocation = renderer->deferredAllocationHead;
+         allocation != NULL; allocation = allocation->nextDeferred)
+    {
+        if (allocation->blockIndex == blockIndex)
+            return true;
+    }
+    return false;
+}
+
+// Отдаёт системе хвостовые блоки пула, в которых не осталось ни одной
+// выданной области. Иначе пул только растёт: после разового всплеска
+// геометрии память остаётся занятой до RendererReleaseWorld. Последний
+// блок базового размера сохраняется тёплым кэшем, чтобы одиночный меш не
+// создавал и не уничтожал ресурс каждый кадр; блок крупнее базового
+// (созданный под один большой меш) освобождается всегда.
+static void PoolReclaimEmptyTail(Renderer* renderer)
+{
+    while (renderer->poolBlockCount > 0)
+    {
+        uint32_t last = renderer->poolBlockCount - 1;
+        GeometryPoolBlock* block = &renderer->poolBlocks[last];
+        if (!PoolBlockIsEmpty(block)) break;
+        if (PoolBlockIsReferenced(renderer, last)) break;
+        if (renderer->poolBlockCount == 1u && block->totalBytes == POOL_BLOCK_BYTES) break;
+
+        ID3D12Resource_Release(block->buffer);
+        HeapFree(GetProcessHeap(), 0, block->freeRanges);
+        renderer->poolCapacityBytes -= block->totalBytes;
+        memset(block, 0, sizeof(*block));
+        renderer->poolBlockCount--;
+    }
+}
+
+// Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
+static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
+{
+    UINT64 completedValue = ID3D12Fence_GetCompletedValue(renderer->fence);
+
+    while (renderer->deferredResourceCount > 0)
+    {
+        DeferredResourceRelease* entry = &renderer->deferredResources[renderer->deferredResourceHead];
+        if (!releaseEverything && entry->safeFenceValue > completedValue)
+        {
+            break;
+        }
+        ID3D12Resource_Release(entry->resource);
+        renderer->deferredResourceHead =
+            (renderer->deferredResourceHead + 1) % DEFERRED_RESOURCE_CAPACITY;
+        renderer->deferredResourceCount--;
+    }
+
+    while (renderer->deferredRangeCount > 0)
+    {
+        DeferredRangeRelease* entry = &renderer->deferredRanges[renderer->deferredRangeHead];
+        if (!releaseEverything && entry->safeFenceValue > completedValue)
+        {
+            break;
+        }
+        if (PoolFree(&renderer->poolBlocks[entry->blockIndex], entry->offset, entry->size))
+            renderer->poolUsedBytes -= entry->size;
+        renderer->deferredRangeHead = (renderer->deferredRangeHead + 1) % DEFERRED_RELEASE_CAPACITY;
+        renderer->deferredRangeCount--;
+    }
+
+    GeometryAllocation **link = &renderer->deferredAllocationHead;
+    while (*link != NULL)
+    {
+        GeometryAllocation *allocation = *link;
+        if (!releaseEverything && allocation->safeFenceValue > completedValue)
+        {
+            link = &allocation->nextDeferred;
+            continue;
+        }
+        bool released = PoolFree(&renderer->poolBlocks[allocation->blockIndex],
+                                 allocation->offsetBytes, allocation->sizeBytes);
+        if (!released && !releaseEverything)
+        {
+            link = &allocation->nextDeferred;
+            continue;
+        }
+        if (released)
+            renderer->poolUsedBytes -= allocation->sizeBytes;
+        *link = allocation->nextDeferred;
+        HeapFree(GetProcessHeap(), 0, allocation);
+    }
+    PoolReclaimEmptyTail(renderer);
+}
+
+static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
+{
+    // BeginFrame reserves room for every bounded release in this command list.
+    // Signaling here would complete its fence before the list is submitted.
+    uint32_t slot = (renderer->deferredResourceHead + renderer->deferredResourceCount) %
+                    DEFERRED_RESOURCE_CAPACITY;
+    renderer->deferredResources[slot].resource = resource;
+    renderer->deferredResources[slot].safeFenceValue = renderer->fenceValues[renderer->frameIndex];
+    renderer->deferredResourceCount++;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->srvHeap, &handle);
+    handle.ptr += (SIZE_T)slot * renderer->srvDescriptorSize;
+    return handle;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(Renderer* renderer, uint32_t slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(renderer->srvHeap, &handle);
+    handle.ptr += (UINT64)slot * renderer->srvDescriptorSize;
+    return handle;
+}
+
+static D3D12_GPU_DESCRIPTOR_HANDLE SamplerGpuHandle(Renderer *renderer, uint32_t slot)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(renderer->samplerHeap, &handle);
+    handle.ptr += (UINT64)slot * renderer->samplerDescriptorSize;
+    return handle;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SamplerCpuHandle(Renderer *renderer,
+                                                    uint32_t slot);
+
+static bool CreateDefaultSamplerDescriptor(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->samplerHeap == NULL)
+        return false;
+    D3D12_SAMPLER_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    description.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.MaxLOD = D3D12_FLOAT32_MAX;
+    ID3D12Device_CreateSampler(renderer->device, &description,
+                               SamplerCpuHandle(renderer, 0u));
+    return true;
+}
+
+static uint32_t AllocateDynamicSrvSlot(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return UINT32_MAX;
+    if (renderer->dynamicSrvFreeCount != 0u)
+        return renderer->dynamicSrvFree[--renderer->dynamicSrvFreeCount];
+    if (renderer->dynamicSrvNext < SRV_STATIC_SLOT_COUNT)
+        renderer->dynamicSrvNext = SRV_STATIC_SLOT_COUNT;
+    if (renderer->dynamicSrvNext >= SRV_SLOT_COUNT)
+        return UINT32_MAX;
+    return renderer->dynamicSrvNext++;
+}
+
+static void FreeDynamicSrvSlot(Renderer *renderer, uint32_t slot)
+{
+    if (renderer == NULL || slot < SRV_STATIC_SLOT_COUNT || slot >= SRV_SLOT_COUNT ||
+        renderer->dynamicSrvFreeCount >= SRV_SLOT_COUNT - SRV_STATIC_SLOT_COUNT)
+        return;
+    renderer->dynamicSrvFree[renderer->dynamicSrvFreeCount++] = slot;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SamplerCpuHandle(Renderer *renderer, uint32_t slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->samplerHeap, &handle);
+    handle.ptr += (SIZE_T)slot * renderer->samplerDescriptorSize;
+    return handle;
+}
+
+static uint32_t AllocateDynamicSamplerSlot(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return UINT32_MAX;
+    if (renderer->dynamicSamplerFreeCount != 0u)
+        return renderer->dynamicSamplerFree[--renderer->dynamicSamplerFreeCount];
+    if (renderer->dynamicSamplerNext < SAMPLER_STATIC_SLOT_COUNT)
+        renderer->dynamicSamplerNext = SAMPLER_STATIC_SLOT_COUNT;
+    if (renderer->dynamicSamplerNext >= SAMPLER_SLOT_COUNT)
+        return UINT32_MAX;
+    return renderer->dynamicSamplerNext++;
+}
+
+static void FreeDynamicSamplerSlot(Renderer *renderer, uint32_t slot)
+{
+    if (renderer == NULL || slot < SAMPLER_STATIC_SLOT_COUNT ||
+        slot >= SAMPLER_SLOT_COUNT ||
+        renderer->dynamicSamplerFreeCount >= SAMPLER_SLOT_COUNT - SAMPLER_STATIC_SLOT_COUNT)
+        return;
+    renderer->dynamicSamplerFree[renderer->dynamicSamplerFreeCount++] = slot;
+}
+
+static bool CreateGenericRootSignature(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->device == NULL)
+        return false;
+
+    D3D12_ROOT_PARAMETER parameters[5];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].Constants.ShaderRegister = 0;
+    parameters[GENERIC_ROOT_PARAMETER_CONSTANTS].Constants.Num32BitValues =
+        ROOT_CONSTANT_COUNT;
+
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[GENERIC_ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
+
+    D3D12_DESCRIPTOR_RANGE textureRange;
+    memset(&textureRange, 0, sizeof(textureRange));
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 1;
+    textureRange.BaseShaderRegister = 1;
+    textureRange.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GENERIC_ROOT_PARAMETER_TEXTURE].DescriptorTable.pDescriptorRanges =
+        &textureRange;
+
+    D3D12_DESCRIPTOR_RANGE samplerRange;
+    memset(&samplerRange, 0, sizeof(samplerRange));
+    samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    samplerRange.NumDescriptors = 1;
+    samplerRange.BaseShaderRegister = 0;
+    samplerRange.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[GENERIC_ROOT_PARAMETER_SAMPLER].DescriptorTable.pDescriptorRanges =
+        &samplerRange;
+
+    parameters[GENERIC_ROOT_PARAMETER_INSTANCES].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[GENERIC_ROOT_PARAMETER_INSTANCES].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[GENERIC_ROOT_PARAMETER_INSTANCES].Descriptor.ShaderRegister = 3;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 5;
+    description.pParameters = parameters;
+    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ID3DBlob *signatureBlob = NULL;
+    ID3DBlob *errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+    HRESULT result = ID3D12Device_CreateRootSignature(
+        renderer->device, 0, ID3D10Blob_GetBufferPointer(signatureBlob),
+        ID3D10Blob_GetBufferSize(signatureBlob), &IID_ID3D12RootSignature,
+        (void **)&renderer->genericRootSignature);
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreateRootSignature(Renderer* renderer)
+{
+    D3D12_ROOT_PARAMETER parameters[4];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[ROOT_PARAMETER_CONSTANTS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[ROOT_PARAMETER_CONSTANTS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[ROOT_PARAMETER_CONSTANTS].Constants.ShaderRegister = 0;
+    parameters[ROOT_PARAMETER_CONSTANTS].Constants.Num32BitValues = ROOT_CONSTANT_COUNT;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[ROOT_PARAMETER_QUAD_BUFFER].Descriptor.ShaderRegister = 0;
+    parameters[ROOT_PARAMETER_INSTANCES].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[ROOT_PARAMETER_INSTANCES].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[ROOT_PARAMETER_INSTANCES].Descriptor.ShaderRegister = 3;
+
+    // t1 — albedo, t2 — нормали: соседние слоты одной таблицы.
+    D3D12_DESCRIPTOR_RANGE textureRange;
+    memset(&textureRange, 0, sizeof(textureRange));
+    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRange.NumDescriptors = 2;
+    textureRange.BaseShaderRegister = 1;
+    textureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[ROOT_PARAMETER_BLOCK_TEXTURES].DescriptorTable.pDescriptorRanges = &textureRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 4;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+
+    ID3DBlob* signatureBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+
+    HRESULT result = ID3D12Device_CreateRootSignature(renderer->device, 0,
+        ID3D10Blob_GetBufferPointer(signatureBlob), ID3D10Blob_GetBufferSize(signatureBlob),
+        &IID_ID3D12RootSignature, (void**)&renderer->rootSignature);
+
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreatePipelineState(Renderer* renderer)
+{
+    if (!CreateChunkPipelineStateForShaders(
+            renderer, renderer->loadedShaders, renderer->loadedShaderLengths,
+            &renderer->pipelineState))
+        return false;
+    return CreateGenericRootSignature(renderer) &&
+           CreateGenericPipelineState(renderer, &renderer->genericPipelineState);
+}
+
+// Общий путь создания texture array блоков (albedo или нормали):
+// DEFAULT-текстура + upload-буфер с подресурсами, SRV в заданный слот.
+typedef bool (*PackSubresourceGetter)(const TexturePackData* pack,
+    uint32_t layer, uint32_t mip, TexturePackSubresource* outSubresource);
+
+static bool CreateBlockArrayTexture(Renderer *renderer, const TexturePackData *pack,
+                                    PackSubresourceGetter getSubresource, DXGI_FORMAT format,
+                                    ID3D12Resource **outTexture, ID3D12Resource **outUpload)
+{
+    *outTexture = NULL;
+    *outUpload = NULL;
+    UINT subresourceCount = (UINT)pack->sliceCount * pack->mipCount;
+    if (subresourceCount == 0 || subresourceCount > MAX_TEXTURE_SUBRESOURCES)
+    {
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = pack->width;
+    textureDescription.Height = pack->height;
+    textureDescription.DepthOrArraySize = (UINT16)pack->sliceCount;
+    textureDescription.MipLevels = (UINT16)pack->mipCount;
+    textureDescription.Format = format;
+    textureDescription.SampleDesc.Count = 1;
+    textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &defaultHeap,
+        D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL, &IID_ID3D12Resource, (void**)outTexture)))
+    {
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts = HeapAlloc(
+        GetProcessHeap(), 0,
+        (SIZE_T)subresourceCount * sizeof(*layouts));
+    if (layouts == NULL)
+    {
+        ID3D12Resource_Release(*outTexture);
+        *outTexture = NULL;
+        return false;
+    }
+    UINT64 uploadBytes = 0;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+        0, subresourceCount, 0, layouts, NULL, NULL, &uploadBytes);
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1;
+    uploadDescription.DepthOrArraySize = 1;
+    uploadDescription.MipLevels = 1;
+    uploadDescription.SampleDesc.Count = 1;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &uploadHeap,
+        D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
+        NULL, &IID_ID3D12Resource, (void**)outUpload)))
+    {
+        HeapFree(GetProcessHeap(), 0, layouts);
+        ID3D12Resource_Release(*outTexture);
+        *outTexture = NULL;
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    unsigned char* mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(*outUpload, 0, &emptyRange, (void**)&mapped)))
+    {
+        HeapFree(GetProcessHeap(), 0, layouts);
+        ID3D12Resource_Release(*outUpload);
+        ID3D12Resource_Release(*outTexture);
+        *outUpload = NULL;
+        *outTexture = NULL;
+        return false;
+    }
+
+    for (uint32_t layer = 0; layer < pack->sliceCount; ++layer)
+    {
+        for (uint32_t mip = 0; mip < pack->mipCount; ++mip)
+        {
+            UINT index = layer * pack->mipCount + mip;
+            TexturePackSubresource subresource;
+            if (!getSubresource(pack, layer, mip, &subresource))
+            {
+                ID3D12Resource_Unmap(*outUpload, 0, NULL);
+                HeapFree(GetProcessHeap(), 0, layouts);
+                ID3D12Resource_Release(*outUpload);
+                ID3D12Resource_Release(*outTexture);
+                *outUpload = NULL;
+                *outTexture = NULL;
+                return false;
+            }
+            unsigned char* destination = mapped + layouts[index].Offset;
+            for (uint32_t row = 0; row < subresource.height; ++row)
+            {
+                memcpy(destination + (size_t)row * layouts[index].Footprint.RowPitch,
+                    subresource.pixels + (size_t)row * subresource.rowBytes,
+                    subresource.rowBytes);
+            }
+        }
+    }
+    ID3D12Resource_Unmap(*outUpload, 0, NULL);
+    HeapFree(GetProcessHeap(), 0, layouts);
+
+    return true;
+}
+
+typedef struct BlockTextureReplacement
+{
+    ID3D12Resource *albedo;
+    ID3D12Resource *albedoUpload;
+    ID3D12Resource *normal;
+    ID3D12Resource *normalUpload;
+    TexturePackAnimationSet animation;
+    uint32_t albedoMipCount;
+    uint32_t normalMipCount;
+    RendererContentStatus status;
+} BlockTextureReplacement;
+
+bool RendererSetMaterialNames_D3D12(Renderer *renderer, const wchar_t *const *names, uint32_t count)
+{
+    if (renderer == NULL) return false;
+    return TexturePackMaterialNamesSet(&renderer->materialNames, names, count);
+}
+
+static RendererContentStatus MapTexturePackLoadStatus(TexturePackLoadStatus status)
+{
+    switch (status)
+    {
+        case TEXTURE_PACK_LOAD_OK:
+            return RENDERER_CONTENT_OK;
+        case TEXTURE_PACK_LOAD_INCOMPLETE:
+            return RENDERER_CONTENT_INCOMPLETE;
+        case TEXTURE_PACK_LOAD_NO_ACTIVE_PACK:
+            return RENDERER_CONTENT_NO_ACTIVE;
+        case TEXTURE_PACK_LOAD_INVALID:
+            return RENDERER_CONTENT_INVALID;
+        default:
+            return RENDERER_CONTENT_IO_ERROR;
+        }
+}
+
+static void ReleaseBlockTextureReplacement(BlockTextureReplacement *replacement)
+{
+    if (replacement->albedoUpload != NULL)
+        ID3D12Resource_Release(replacement->albedoUpload);
+    if (replacement->albedo != NULL)
+        ID3D12Resource_Release(replacement->albedo);
+    if (replacement->normalUpload != NULL)
+        ID3D12Resource_Release(replacement->normalUpload);
+    if (replacement->normal != NULL)
+        ID3D12Resource_Release(replacement->normal);
+    memset(replacement, 0, sizeof(*replacement));
+}
+
+static bool CreateBlockTextureReplacement(Renderer *renderer, LaiueContentCatalog *catalog,
+                                          bool rejectInvalidActive,
+                                          BlockTextureReplacement *replacement)
+{
+    memset(replacement, 0, sizeof(*replacement));
+    TexturePackData pack;
+    TexturePackLoadStatus loadStatus = TexturePackLoadActiveFrom(catalog, renderer->materialNames.pointers,
+                                  renderer->materialNames.count, &pack);
+    replacement->status = MapTexturePackLoadStatus(loadStatus);
+    if (rejectInvalidActive && loadStatus != TEXTURE_PACK_LOAD_OK &&
+        loadStatus != TEXTURE_PACK_LOAD_INCOMPLETE &&
+        loadStatus != TEXTURE_PACK_LOAD_NO_ACTIVE_PACK)
+    {
+        TexturePackRelease(&pack);
+        return false;
+    }
+    if (pack.pixels == NULL)
+    {
+        return false;
+    }
+
+    // Albedo хранится в sRGB (декод при выборке), нормали — линейные.
+    bool succeeded = CreateBlockArrayTexture(renderer, &pack, TexturePackGetSubresource,
+                                             DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, &replacement->albedo,
+                                             &replacement->albedoUpload);
+
+    if (succeeded && pack.normalPixels != NULL)
+    {
+        succeeded = CreateBlockArrayTexture(renderer, &pack, TexturePackGetNormalSubresource,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, &replacement->normal,
+                                            &replacement->normalUpload);
+    }
+    else if (succeeded)
+    {
+        // Пак без нормалей (LTP1): плоская нормаль 1x1 на каждый слой,
+        // AO = 1 — освещение вырождается в чистый ламберт по граням.
+        uint8_t flatNormalPixels[TEXTURE_PACK_MAX_SLICES * 4u];
+        for (uint32_t layer = 0; layer < pack.sliceCount; ++layer)
+        {
+            flatNormalPixels[layer * 4u + 0u] = 128;
+            flatNormalPixels[layer * 4u + 1u] = 128;
+            flatNormalPixels[layer * 4u + 2u] = 255;
+            flatNormalPixels[layer * 4u + 3u] = 255;
+        }
+        TexturePackData flat = {
+            .width = 1,
+            .height = 1,
+            .sliceCount = pack.sliceCount,
+            .mipCount = 1,
+            .pixels = flatNormalPixels,
+            .pixelBytes = (uint32_t)pack.sliceCount * 4u,
+        };
+        succeeded = CreateBlockArrayTexture(renderer, &flat, TexturePackGetSubresource,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM, &replacement->normal,
+                                            &replacement->normalUpload);
+    }
+
+    if (succeeded) TexturePackCaptureAnimation(&replacement->animation, &pack);
+    replacement->albedoMipCount = succeeded ? pack.mipCount : 0U;
+    replacement->normalMipCount = succeeded ? (pack.normalPixels != NULL ? pack.mipCount : 1U) : 0U;
+    TexturePackRelease(&pack);
+    if (!succeeded)
+    {
+        replacement->status = RENDERER_CONTENT_GPU_ERROR;
+        ReleaseBlockTextureReplacement(replacement);
+        replacement->status = RENDERER_CONTENT_GPU_ERROR;
+    }
+    return succeeded;
+}
+
+static void CreateBlockTextureView(Renderer *renderer, ID3D12Resource *texture, uint32_t layerCount,
+                                   uint32_t mipCount, DXGI_FORMAT format, uint32_t srvSlot)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = format;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2DArray.MipLevels = mipCount;
+    viewDescription.Texture2DArray.ArraySize = layerCount;
+    ID3D12Device_CreateShaderResourceView(renderer->device, texture, &viewDescription,
+                                          SrvCpuHandle(renderer, srvSlot));
+}
+
+static void CommitBlockTexture(Renderer *renderer, BlockTextureReplacement *replacement)
+{
+    renderer->blockTexture = replacement->albedo;
+    renderer->blockTextureUpload = replacement->albedoUpload;
+    renderer->blockNormalTexture = replacement->normal;
+    renderer->blockNormalUpload = replacement->normalUpload;
+    renderer->blockAnimation = replacement->animation;
+    renderer->blockTextureUploadPending = true;
+    renderer->texturePackLoadStatus = replacement->status;
+    CreateBlockTextureView(renderer, renderer->blockTexture, renderer->blockAnimation.sliceCount,
+                           replacement->albedoMipCount, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                           SRV_SLOT_BLOCK_TEXTURES);
+    CreateBlockTextureView(renderer, renderer->blockNormalTexture,
+                           renderer->blockAnimation.sliceCount, replacement->normalMipCount,
+                           DXGI_FORMAT_R8G8B8A8_UNORM, SRV_SLOT_BLOCK_NORMALS);
+    memset(replacement, 0, sizeof(*replacement));
+}
+
+static bool CreateBlockTexture(Renderer *renderer, LaiueContentCatalog *catalog)
+{
+    BlockTextureReplacement replacement;
+    bool succeeded = CreateBlockTextureReplacement(renderer, catalog, false, &replacement);
+    renderer->texturePackLoadStatus = replacement.status;
+    if (!succeeded)
+    {
+        return false;
+    }
+    CommitBlockTexture(renderer, &replacement);
+    return true;
+}
+
+// === Панорама и UI: сигнатуры, конвейеры, ресурсы ===
+
+static bool CreateResolveRootSignature(Renderer* renderer)
+{
+    D3D12_ROOT_PARAMETER parameters[2];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = RESOLVE_ROOT_CONSTANT_COUNT;
+
+    D3D12_DESCRIPTOR_RANGE cubeRange;
+    memset(&cubeRange, 0, sizeof(cubeRange));
+    cubeRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    cubeRange.NumDescriptors = 1;
+    cubeRange.BaseShaderRegister = 0;
+    cubeRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &cubeRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+
+    ID3DBlob* signatureBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+
+    HRESULT result = ID3D12Device_CreateRootSignature(renderer->device, 0,
+        ID3D10Blob_GetBufferPointer(signatureBlob), ID3D10Blob_GetBufferSize(signatureBlob),
+        &IID_ID3D12RootSignature, (void**)&renderer->resolveRootSignature);
+
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreateResolvePipelineState(Renderer* renderer)
+{
+    return CreateResolvePipelineStateForShaders(renderer, renderer->loadedShaders,
+                                                renderer->loadedShaderLengths,
+                                                &renderer->resolvePipelineState);
+}
+
+static bool CreateUiRootSignature(Renderer* renderer)
+{
+    D3D12_ROOT_PARAMETER parameters[3];
+    memset(parameters, 0, sizeof(parameters));
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 2;
+
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[1].Descriptor.ShaderRegister = 0;
+
+    D3D12_DESCRIPTOR_RANGE fontRange;
+    memset(&fontRange, 0, sizeof(fontRange));
+    fontRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    fontRange.NumDescriptors = 2;
+    fontRange.BaseShaderRegister = 1;
+    fontRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &fontRange;
+
+    D3D12_STATIC_SAMPLER_DESC sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.NumParameters = 3;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+
+    ID3DBlob* signatureBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+        &signatureBlob, &errorBlob)))
+    {
+        if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+        return false;
+    }
+
+    HRESULT result = ID3D12Device_CreateRootSignature(renderer->device, 0,
+        ID3D10Blob_GetBufferPointer(signatureBlob), ID3D10Blob_GetBufferSize(signatureBlob),
+        &IID_ID3D12RootSignature, (void**)&renderer->uiRootSignature);
+
+    ID3D10Blob_Release(signatureBlob);
+    if (errorBlob != NULL) ID3D10Blob_Release(errorBlob);
+    return SUCCEEDED(result);
+}
+
+static bool CreateUiPipelineState(Renderer* renderer)
+{
+    return CreateUiPipelineStateForShaders(renderer, renderer->loadedShaders,
+                                           renderer->loadedShaderLengths,
+                                           &renderer->uiPipelineState);
+}
+
+static bool CreateUiQuadBuffers(Renderer* renderer)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = (UINT64)RENDERER_UI_MAX_QUADS * UI_QUAD_BYTES;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+            D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_GENERIC_READ,
+            NULL, &IID_ID3D12Resource, (void**)&renderer->uiQuadBuffers[i])))
+        {
+            return false;
+        }
+
+        D3D12_RANGE emptyRange = { 0, 0 };
+        if (FAILED(ID3D12Resource_Map(renderer->uiQuadBuffers[i], 0, &emptyRange,
+            (void**)&renderer->uiQuadMapped[i])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool CreateMeshUploadBuffers(Renderer* renderer)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = (UINT64)MESH_UPLOAD_BYTES_PER_FRAME;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+            &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&renderer->meshUploadBuffers[i])))
+        {
+            return false;
+        }
+        D3D12_RANGE emptyRange = { 0, 0 };
+        if (FAILED(ID3D12Resource_Map(renderer->meshUploadBuffers[i], 0,
+            &emptyRange, (void**)&renderer->meshUploadMapped[i])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Создаёт ещё один инстансный чанк в слоте и делает его mapped. Чанк для
+// одиночного вызова больше базового выделяется ровно под этот вызов.
+static bool CreateInstanceChunk(Renderer* renderer, uint32_t slot,
+    uint32_t index, uint32_t capacityBytes)
+{
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = capacityBytes;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    InstanceChunk* chunk = &renderer->instanceChunks[slot][index];
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource, (void**)&chunk->buffer)))
+    {
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(chunk->buffer, 0, &emptyRange,
+        (void**)&chunk->mapped)))
+    {
+        ID3D12Resource_Release(chunk->buffer);
+        chunk->buffer = NULL;
+        return false;
+    }
+
+    chunk->capacityBytes = capacityBytes;
+    chunk->address = ID3D12Resource_GetGPUVirtualAddress(chunk->buffer);
+    renderer->instanceChunkCount[slot] = index + 1;
+    return true;
+}
+
+// Лениво создаёт первый чанк слота: без него корневой SRV t3, который
+// проходы сцены выставляют до инстансных вызовов, указывал бы в никуда.
+static bool EnsureInstancePool(Renderer* renderer, uint32_t slot)
+{
+    if (renderer->instanceChunkCount[slot] != 0)
+    {
+        return true;
+    }
+    if (renderer->instancePoolBytes[slot]
+        > INSTANCE_MAX_BYTES_PER_FRAME - INSTANCE_CHUNK_BYTES)
+    {
+        return false;
+    }
+    if (!CreateInstanceChunk(renderer, slot, 0, INSTANCE_CHUNK_BYTES))
+    {
+        return false;
+    }
+    renderer->instancePoolBytes[slot] = INSTANCE_CHUNK_BYTES;
+    return true;
+}
+
+// Резервирует contiguous-диапазон под один вызов. Курсор внутри кадра
+// монотонен: назад он не идёт, иначе перезапись уже записанного в командный
+// список диапазона исказила бы ранние вызовы кадра.
+static bool ReserveInstanceSpace(Renderer* renderer, uint32_t slot,
+    uint32_t bytes, uint32_t* outChunkIndex, uint32_t* outOffset)
+{
+    uint32_t chunkIndex = renderer->instanceChunkIndex[slot];
+    uint32_t offset = (renderer->instanceChunkOffset[slot] + 15u) & ~15u;
+
+    while (chunkIndex < renderer->instanceChunkCount[slot])
+    {
+        InstanceChunk* chunk = &renderer->instanceChunks[slot][chunkIndex];
+        if (offset <= chunk->capacityBytes
+            && bytes <= chunk->capacityBytes - offset)
+        {
+            break;
+        }
+        chunkIndex++;
+        offset = 0u;
+    }
+
+    if (chunkIndex == renderer->instanceChunkCount[slot])
+    {
+        if (renderer->instanceChunkCount[slot]
+            == INSTANCE_MAX_CHUNKS_PER_FRAME)
+        {
+            return false;
+        }
+        uint32_t capacityBytes = bytes > INSTANCE_CHUNK_BYTES
+            ? bytes : INSTANCE_CHUNK_BYTES;
+        if (renderer->instancePoolBytes[slot]
+            > INSTANCE_MAX_BYTES_PER_FRAME - capacityBytes)
+        {
+            return false;
+        }
+        if (!CreateInstanceChunk(renderer, slot, chunkIndex, capacityBytes))
+        {
+            return false;
+        }
+        renderer->instancePoolBytes[slot] += capacityBytes;
+        offset = 0u;
+    }
+
+    renderer->instanceChunkIndex[slot] = chunkIndex;
+    renderer->instanceChunkOffset[slot] = offset + bytes;
+    *outChunkIndex = chunkIndex;
+    *outOffset = offset;
+    return true;
+}
+
+static void ReleaseInstancePool(Renderer* renderer)
+{
+    for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
+    {
+        for (uint32_t index = 0; index < renderer->instanceChunkCount[slot];
+            ++index)
+        {
+            InstanceChunk* chunk = &renderer->instanceChunks[slot][index];
+            if (chunk->buffer != NULL)
+            {
+                if (chunk->mapped != NULL)
+                    ID3D12Resource_Unmap(chunk->buffer, 0, NULL);
+                ID3D12Resource_Release(chunk->buffer);
+            }
+            memset(chunk, 0, sizeof(*chunk));
+        }
+        renderer->instanceChunkCount[slot] = 0;
+        renderer->instanceChunkIndex[slot] = 0;
+        renderer->instanceChunkOffset[slot] = 0;
+        renderer->instancePoolBytes[slot] = 0;
+    }
+}
+
+// Создаёт (или пересоздаёт под новое разрешение) кубмапу сцены и её
+// глубину. Пересоздание редкое — при смене разрешения грани от FOV,
+// поэтому честно дожидается GPU перед заменой дескрипторов.
+static bool EnsureCubeResources(Renderer* renderer, uint32_t resolution)
+{
+    if (renderer->cubeResolution == resolution && renderer->cubeColor != NULL)
+    {
+        return true;
+    }
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+
+    if (renderer->cubeColor != NULL)
+    {
+        ID3D12Resource_Release(renderer->cubeColor);
+        renderer->cubeColor = NULL;
+    }
+    if (renderer->cubeDepth != NULL)
+    {
+        ID3D12Resource_Release(renderer->cubeDepth);
+        renderer->cubeDepth = NULL;
+    }
+    renderer->cubeResolution = 0;
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+
+    D3D12_RESOURCE_DESC colorDescription;
+    memset(&colorDescription, 0, sizeof(colorDescription));
+    colorDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    colorDescription.Width = resolution;
+    colorDescription.Height = resolution;
+    colorDescription.DepthOrArraySize = 6;
+    colorDescription.MipLevels = 1;
+    colorDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    colorDescription.SampleDesc.Count = 1;
+    colorDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    colorDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE colorClear = {
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        .Color = { 0.4f, 0.6f, 0.9f, 1.0f },
+    };
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+        D3D12_HEAP_FLAG_NONE, &colorDescription, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        &colorClear, &IID_ID3D12Resource, (void**)&renderer->cubeColor)))
+    {
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC depthDescription;
+    memset(&depthDescription, 0, sizeof(depthDescription));
+    depthDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depthDescription.Width = resolution;
+    depthDescription.Height = resolution;
+    depthDescription.DepthOrArraySize = 1;
+    depthDescription.MipLevels = 1;
+    depthDescription.Format = DXGI_FORMAT_D32_FLOAT;
+    depthDescription.SampleDesc.Count = 1;
+    depthDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    depthDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE depthClear = {
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .DepthStencil = { .Depth = 1.0f, .Stencil = 0 },
+    };
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties,
+        D3D12_HEAP_FLAG_NONE, &depthDescription, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &depthClear, &IID_ID3D12Resource, (void**)&renderer->cubeDepth)))
+    {
+        ID3D12Resource_Release(renderer->cubeColor);
+        renderer->cubeColor = NULL;
+        return false;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->cubeRtvHeap, &rtvHandle);
+    for (UINT face = 0; face < 6; ++face)
+    {
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDescription;
+        memset(&rtvDescription, 0, sizeof(rtvDescription));
+        rtvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        rtvDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        rtvDescription.Texture2DArray.FirstArraySlice = face;
+        rtvDescription.Texture2DArray.ArraySize = 1;
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->cubeColor,
+            &rtvDescription, rtvHandle);
+        rtvHandle.ptr += renderer->renderTargetViewSize;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->cubeDsvHeap, &dsvHandle);
+    ID3D12Device_CreateDepthStencilView(renderer->device, renderer->cubeDepth, NULL, dsvHandle);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription;
+    memset(&srvDescription, 0, sizeof(srvDescription));
+    srvDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srvDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescription.TextureCube.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->cubeColor,
+        &srvDescription, SrvCpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
+
+    renderer->cubeResolution = resolution;
+    return true;
+}
+
+static bool CreateDepthBuffer(Renderer* renderer, int32_t width, int32_t height)
+{
+    if (renderer->depthStencilViewHeap != NULL)
+    {
+        ID3D12DescriptorHeap_Release(renderer->depthStencilViewHeap);
+        renderer->depthStencilViewHeap = NULL;
+    }
+    if (renderer->depthBuffer != NULL)
+    {
+        ID3D12Resource_Release(renderer->depthBuffer);
+        renderer->depthBuffer = NULL;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = (UINT64)width;
+    description.Height = (UINT)height;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Format = DXGI_FORMAT_D32_FLOAT;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clearValue = {
+        .Format = DXGI_FORMAT_D32_FLOAT,
+        .DepthStencil = { .Depth = 1.0f, .Stencil = 0 },
+    };
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE,
+        &description, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue,
+        &IID_ID3D12Resource, (void**)&renderer->depthBuffer)))
+    {
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &heapDescription,
+        &IID_ID3D12DescriptorHeap, (void**)&renderer->depthStencilViewHeap)))
+    {
+        return false;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE depthStencilViewHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->depthStencilViewHeap, &depthStencilViewHandle);
+    ID3D12Device_CreateDepthStencilView(renderer->device, renderer->depthBuffer, NULL, depthStencilViewHandle);
+    return true;
+}
+
+Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height)
+{
+    Renderer* renderer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*renderer));
+    if (renderer == NULL)
+    {
+        return NULL;
+    }
+
+    renderer->header.backend = RENDERER_BACKEND_D3D12;
+    renderer->windowWidth = width;
+    renderer->windowHeight = height;
+    renderer->verticalSyncEnabled = true;
+
+    if (FAILED(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void**)&renderer->factory)))
+    {
+        HeapFree(GetProcessHeap(), 0, renderer);
+        return NULL;
+    }
+
+    IDXGIFactory5* factory5 = NULL;
+    if (SUCCEEDED(IDXGIFactory4_QueryInterface(
+            renderer->factory, &IID_IDXGIFactory5, (void**)&factory5)))
+    {
+        BOOL allowTearing = FALSE;
+        if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(factory5,
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &allowTearing, (UINT)sizeof(allowTearing))))
+        {
+            renderer->tearingSupported = allowTearing != FALSE;
+            renderer->tearingPresentEnabled = renderer->tearingSupported;
+        }
+        IDXGIFactory5_Release(factory5);
+    }
+
+    // Аппаратный адаптер, при неудаче — программный WARP.
+    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&renderer->device)))
+    {
+        IDXGIAdapter* warpAdapter = NULL;
+        if (FAILED(IDXGIFactory4_EnumWarpAdapter(renderer->factory, &IID_IDXGIAdapter, (void**)&warpAdapter)))
+        {
+            RendererDestroy_D3D12(renderer);
+            return NULL;
+        }
+        HRESULT result = D3D12CreateDevice((IUnknown*)warpAdapter, D3D_FEATURE_LEVEL_11_0,
+            &IID_ID3D12Device, (void**)&renderer->device);
+        IDXGIAdapter_Release(warpAdapter);
+        if (FAILED(result))
+        {
+            RendererDestroy_D3D12(renderer);
+            return NULL;
+        }
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queueDescription = { .Type = D3D12_COMMAND_LIST_TYPE_DIRECT };
+    if (FAILED(ID3D12Device_CreateCommandQueue(renderer->device, &queueDescription,
+        &IID_ID3D12CommandQueue, (void**)&renderer->commandQueue)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+    // Timestamp support is optional and must never prevent renderer creation.
+    (void)CreateGpuTimingResources(renderer);
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDescription;
+    memset(&swapChainDescription, 0, sizeof(swapChainDescription));
+    swapChainDescription.BufferCount = FRAME_COUNT;
+    swapChainDescription.Width = (UINT)width;
+    swapChainDescription.Height = (UINT)height;
+    swapChainDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapChainDescription.SampleDesc.Count = 1;
+    swapChainDescription.Flags = renderer->tearingSupported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+    IDXGISwapChain1* swapChain1 = NULL;
+    if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
+        (HWND)windowHandle, &swapChainDescription, NULL, NULL, &swapChain1)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    HRESULT queryResult = IDXGISwapChain1_QueryInterface(swapChain1, &IID_IDXGISwapChain3, (void**)&renderer->swapChain);
+    IDXGISwapChain1_Release(swapChain1);
+    if (FAILED(queryResult))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
+
+    D3D12_DESCRIPTOR_HEAP_DESC renderTargetHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = FRAME_COUNT,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &renderTargetHeapDescription,
+        &IID_ID3D12DescriptorHeap, (void**)&renderer->renderTargetViewHeap)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    renderer->renderTargetViewSize = ID3D12Device_GetDescriptorHandleIncrementSize(renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    // Swapchain остаётся UNORM (требование flip-модели), но RTV — sRGB:
+    // шейдеры работают в линейном свете, кодирование выполняет вывод.
+    D3D12_RENDER_TARGET_VIEW_DESC backBufferViewDescription;
+    memset(&backBufferViewDescription, 0, sizeof(backBufferViewDescription));
+    backBufferViewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    backBufferViewDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(IDXGISwapChain3_GetBuffer(renderer->swapChain, i, &IID_ID3D12Resource, (void**)&renderer->renderTargets[i])))
+        {
+            RendererDestroy_D3D12(renderer);
+            return NULL;
+        }
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i],
+            &backBufferViewDescription, renderTargetViewHandle);
+        renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
+    }
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(ID3D12Device_CreateCommandAllocator(renderer->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void**)&renderer->commandAllocators[i])))
+        {
+            RendererDestroy_D3D12(renderer);
+            return NULL;
+        }
+    }
+
+    if (FAILED(ID3D12Device_CreateCommandList(renderer->device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        renderer->commandAllocators[0], NULL, &IID_ID3D12GraphicsCommandList, (void**)&renderer->commandList)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+    ID3D12GraphicsCommandList_Close(renderer->commandList);
+
+    if (FAILED(ID3D12Device_CreateFence(renderer->device, 0, D3D12_FENCE_FLAG_NONE,
+        &IID_ID3D12Fence, (void**)&renderer->fence)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    renderer->fenceEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (renderer->fenceEvent == NULL)
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    // Общая шейдерная куча SRV: блоки, кубмапа панорамы, атлас шрифта.
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        .NumDescriptors = SRV_SLOT_COUNT,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(renderer->device, &srvHeapDescription,
+        &IID_ID3D12DescriptorHeap, (void**)&renderer->srvHeap)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+    renderer->srvDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
+        renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC samplerHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        .NumDescriptors = SAMPLER_SLOT_COUNT,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(
+            renderer->device, &samplerHeapDescription, &IID_ID3D12DescriptorHeap,
+            (void **)&renderer->samplerHeap)))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+    renderer->samplerDescriptorSize = ID3D12Device_GetDescriptorHandleIncrementSize(
+        renderer->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (!CreateDefaultSamplerDescriptor(renderer))
+    {
+        RendererDestroy_D3D12(renderer);
+        return NULL;
+    }
+
+    if (!CreateUiRootSignature(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
+    if (!CreateUiPipelineState(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
+    if (!CreateUiQuadBuffers(renderer)) { RendererDestroy_D3D12(renderer); return NULL; }
+
+    renderer->viewport.TopLeftX = 0.0f;
+    renderer->viewport.TopLeftY = 0.0f;
+    renderer->viewport.Width = (float)width;
+    renderer->viewport.Height = (float)height;
+    renderer->viewport.MinDepth = 0.0f;
+    renderer->viewport.MaxDepth = 1.0f;
+    renderer->scissorRect.left = 0;
+    renderer->scissorRect.top = 0;
+    renderer->scissorRect.right = width;
+    renderer->scissorRect.bottom = height;
+
+    WaitForGpu(renderer);
+
+    return renderer;
+}
+
+void RendererReleaseWorld_D3D12(Renderer* renderer)
+{
+    if (renderer == NULL) return;
+    if (renderer->commandQueue != NULL && renderer->fence != NULL
+        && renderer->fenceEvent != NULL)
+    {
+        WaitForGpu(renderer);
+        DrainDeferredReleases(renderer, true);
+    }
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].ownsStaging
+            && renderer->pendingUploads[i].staging != NULL)
+            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
+    }
+    renderer->pendingUploadCount = 0;
+    if (renderer->geometryGeneration != UINT64_MAX)
+        renderer->geometryGeneration++;
+    renderer->scenePassActive = false;
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        if (renderer->poolBlocks[i].buffer != NULL)
+            ID3D12Resource_Release(renderer->poolBlocks[i].buffer);
+        if (renderer->poolBlocks[i].freeRanges != NULL)
+            HeapFree(GetProcessHeap(), 0,
+                renderer->poolBlocks[i].freeRanges);
+    }
+    memset(renderer->poolBlocks, 0, sizeof(renderer->poolBlocks));
+    renderer->poolBlockCount = 0;
+    renderer->poolCapacityBytes = 0;
+    renderer->poolUsedBytes = 0;
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->meshUploadBuffers[i] != NULL)
+        {
+            if (renderer->meshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
+        }
+        if (renderer->largeMeshUploadBuffers[i] != NULL)
+        {
+            if (renderer->largeMeshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->largeMeshUploadBuffers[i]);
+        }
+        renderer->meshUploadBuffers[i] = NULL;
+        renderer->meshUploadMapped[i] = NULL;
+        renderer->meshUploadOffsets[i] = 0;
+        renderer->largeMeshUploadBuffers[i] = NULL;
+        renderer->largeMeshUploadMapped[i] = NULL;
+        renderer->largeMeshUploadOffsets[i] = 0;
+    }
+    ReleaseInstancePool(renderer);
+
+    if (renderer->genericFallbackTexture != NULL)
+        RendererDestroyTexture_D3D12(renderer, renderer->genericFallbackTexture);
+    renderer->genericFallbackTexture = NULL;
+
+    if (renderer->blockTextureUpload != NULL)
+        ID3D12Resource_Release(renderer->blockTextureUpload);
+    if (renderer->blockTexture != NULL)
+        ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->blockNormalUpload != NULL)
+        ID3D12Resource_Release(renderer->blockNormalUpload);
+    if (renderer->blockNormalTexture != NULL)
+        ID3D12Resource_Release(renderer->blockNormalTexture);
+    renderer->blockTextureUpload = NULL;
+    renderer->blockTexture = NULL;
+    renderer->blockNormalUpload = NULL;
+    renderer->blockNormalTexture = NULL;
+    renderer->blockTextureUploadPending = false;
+    memset(&renderer->blockAnimation, 0, sizeof(renderer->blockAnimation));
+
+    if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
+    if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
+    if (renderer->cubeRtvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeRtvHeap);
+    if (renderer->cubeDsvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeDsvHeap);
+    renderer->cubeColor = NULL;
+    renderer->cubeDepth = NULL;
+    renderer->cubeRtvHeap = NULL;
+    renderer->cubeDsvHeap = NULL;
+    renderer->cubeResolution = 0;
+    if (renderer->resolvePipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->resolvePipelineState);
+    if (renderer->resolveRootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->resolveRootSignature);
+    renderer->resolvePipelineState = NULL;
+    renderer->resolveRootSignature = NULL;
+    if (renderer->pipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->pipelineState);
+    if (renderer->genericPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->genericPipelineState);
+    if (renderer->genericRootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->genericRootSignature);
+    if (renderer->rootSignature != NULL)
+        ID3D12RootSignature_Release(renderer->rootSignature);
+    renderer->pipelineState = NULL;
+    renderer->genericPipelineState = NULL;
+    renderer->genericRootSignature = NULL;
+    renderer->rootSignature = NULL;
+    renderer->boundPipelineState = NULL;
+    renderer->boundRootSignature = NULL;
+    renderer->boundIndexAddress = 0u;
+    renderer->boundIndexBytes = 0u;
+    if (renderer->depthBuffer != NULL)
+        ID3D12Resource_Release(renderer->depthBuffer);
+    if (renderer->depthStencilViewHeap != NULL)
+        ID3D12DescriptorHeap_Release(renderer->depthStencilViewHeap);
+    renderer->depthBuffer = NULL;
+    renderer->depthStencilViewHeap = NULL;
+    renderer->worldReady = false;
+    renderer->frameFailed = false;
+}
+
+static bool EnsureGenericFallbackTexture_D3D12(Renderer *renderer)
+{
+    if (renderer == NULL)
+        return false;
+    if (renderer->genericFallbackTexture != NULL)
+        return true;
+    static const uint8_t whitePixel[4] = {255u, 255u, 255u, 255u};
+    RendererTexture *texture = RendererCreateTexture_D3D12(
+        renderer, 1u, 1u, 1u, LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+    if (texture == NULL ||
+        !RendererUploadTexture_D3D12(renderer, texture, whitePixel,
+                                     sizeof(whitePixel), sizeof(whitePixel)))
+    {
+        if (texture != NULL)
+            RendererDestroyTexture_D3D12(renderer, texture);
+        return false;
+    }
+    renderer->genericFallbackTexture = texture;
+    return true;
+}
+
+bool RendererPrepareWorldFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
+{
+    if (renderer == NULL)
+        return false;
+    if (renderer->worldReady) return true;
+
+    D3D12_DESCRIPTOR_HEAP_DESC cubeRtvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = 6,
+    };
+    D3D12_DESCRIPTOR_HEAP_DESC cubeDsvHeapDescription = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
+    };
+    bool succeeded =
+        SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeRtvHeapDescription,
+                                                    &IID_ID3D12DescriptorHeap,
+                                                    (void **)&renderer->cubeRtvHeap)) &&
+        SUCCEEDED(ID3D12Device_CreateDescriptorHeap(renderer->device, &cubeDsvHeapDescription,
+                                                    &IID_ID3D12DescriptorHeap,
+                                                    (void **)&renderer->cubeDsvHeap)) &&
+        CreateRootSignature(renderer) && CreatePipelineState(renderer) &&
+        CreateResolveRootSignature(renderer) && CreateResolvePipelineState(renderer) &&
+        CreateMeshUploadBuffers(renderer) && CreateBlockTexture(renderer, catalog) &&
+        EnsureGenericFallbackTexture_D3D12(renderer) &&
+        CreateDepthBuffer(renderer, renderer->windowWidth, renderer->windowHeight);
+    if (succeeded && renderer->wireframeEnabled)
+        succeeded = RecreateChunkPipelineState(renderer);
+    if (!succeeded)
+    {
+        RendererReleaseWorld_D3D12(renderer);
+        return false;
+    }
+    renderer->worldReady = true;
+    return true;
+}
+
+bool RendererPrepareWorld_D3D12(Renderer *renderer)
+{
+    return RendererPrepareWorldFrom_D3D12(renderer, LaiueContentCatalogDefault());
+}
+
+bool RendererIsWorldReady_D3D12(const Renderer* renderer)
+{
+    return renderer != NULL && renderer->worldReady;
+}
+
+void RendererDestroy_D3D12(Renderer* renderer)
+{
+    if (renderer == NULL)
+    {
+        return;
+    }
+
+    if (renderer->swapChain != NULL)
+    {
+        IDXGISwapChain3_SetFullscreenState(renderer->swapChain, FALSE, NULL);
+    }
+
+    if (renderer->commandQueue != NULL && renderer->fence != NULL && renderer->fenceEvent != NULL)
+    {
+        WaitForGpu(renderer);
+    }
+
+    if (renderer->fence != NULL)
+    {
+        DrainDeferredReleases(renderer, true);
+    }
+
+    if (renderer->captureReadback != NULL)
+    {
+        ID3D12Resource_Release(renderer->captureReadback);
+        renderer->captureReadback = NULL;
+    }
+
+    RendererReleaseWorld_D3D12(renderer);
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        if (renderer->pendingUploads[i].ownsStaging)
+            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
+    }
+
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        if (renderer->poolBlocks[i].buffer != NULL) ID3D12Resource_Release(renderer->poolBlocks[i].buffer);
+        if (renderer->poolBlocks[i].freeRanges != NULL) HeapFree(GetProcessHeap(), 0, renderer->poolBlocks[i].freeRanges);
+    }
+
+    if (renderer->blockTextureUpload != NULL) ID3D12Resource_Release(renderer->blockTextureUpload);
+    if (renderer->blockTexture != NULL) ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->blockNormalUpload != NULL) ID3D12Resource_Release(renderer->blockNormalUpload);
+    if (renderer->blockNormalTexture != NULL) ID3D12Resource_Release(renderer->blockNormalTexture);
+    if (renderer->srvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->srvHeap);
+    if (renderer->samplerHeap != NULL) ID3D12DescriptorHeap_Release(renderer->samplerHeap);
+
+    if (renderer->cubeColor != NULL) ID3D12Resource_Release(renderer->cubeColor);
+    if (renderer->cubeDepth != NULL) ID3D12Resource_Release(renderer->cubeDepth);
+    if (renderer->cubeRtvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeRtvHeap);
+    if (renderer->cubeDsvHeap != NULL) ID3D12DescriptorHeap_Release(renderer->cubeDsvHeap);
+    if (renderer->resolvePipelineState != NULL) ID3D12PipelineState_Release(renderer->resolvePipelineState);
+    if (renderer->resolveRootSignature != NULL) ID3D12RootSignature_Release(renderer->resolveRootSignature);
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->uiQuadBuffers[i] != NULL)
+        {
+            ID3D12Resource_Release(renderer->uiQuadBuffers[i]);
+        }
+        if (renderer->meshUploadBuffers[i] != NULL)
+        {
+            if (renderer->meshUploadMapped[i] != NULL)
+                ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
+            ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
+        }
+    }
+    if (renderer->fontTextureUpload != NULL) ID3D12Resource_Release(renderer->fontTextureUpload);
+    if (renderer->fontTexture != NULL) ID3D12Resource_Release(renderer->fontTexture);
+    if (renderer->backgroundTextureUpload != NULL)
+        ID3D12Resource_Release(renderer->backgroundTextureUpload);
+    if (renderer->backgroundTexture != NULL)
+        ID3D12Resource_Release(renderer->backgroundTexture);
+    if (renderer->uiPipelineState != NULL) ID3D12PipelineState_Release(renderer->uiPipelineState);
+    if (renderer->uiRootSignature != NULL) ID3D12RootSignature_Release(renderer->uiRootSignature);
+
+    if (renderer->fenceEvent != NULL)
+    {
+        CloseHandle(renderer->fenceEvent);
+    }
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->renderTargets[i] != NULL) ID3D12Resource_Release(renderer->renderTargets[i]);
+        if (renderer->commandAllocators[i] != NULL) ID3D12CommandAllocator_Release(renderer->commandAllocators[i]);
+    }
+
+    if (renderer->pipelineState != NULL) ID3D12PipelineState_Release(renderer->pipelineState);
+    if (renderer->rootSignature != NULL) ID3D12RootSignature_Release(renderer->rootSignature);
+    if (renderer->depthBuffer != NULL) ID3D12Resource_Release(renderer->depthBuffer);
+    if (renderer->depthStencilViewHeap != NULL) ID3D12DescriptorHeap_Release(renderer->depthStencilViewHeap);
+    if (renderer->renderTargetViewHeap != NULL) ID3D12DescriptorHeap_Release(renderer->renderTargetViewHeap);
+    if (renderer->commandList != NULL) ID3D12GraphicsCommandList_Release(renderer->commandList);
+    ReleaseGpuTimingResources(renderer);
+    if (renderer->fence != NULL) ID3D12Fence_Release(renderer->fence);
+    if (renderer->swapChain != NULL) IDXGISwapChain3_Release(renderer->swapChain);
+    if (renderer->commandQueue != NULL) ID3D12CommandQueue_Release(renderer->commandQueue);
+    if (renderer->device != NULL) ID3D12Device_Release(renderer->device);
+    if (renderer->factory != NULL) IDXGIFactory4_Release(renderer->factory);
+
+    // Освобождаем загруженный байткод шейдеров (если не встроенный).
+    for (uint32_t shader = 0; shader < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++shader)
+        if (renderer->loadedShaders[shader] != NULL)
+            HeapFree(GetProcessHeap(), 0, renderer->loadedShaders[shader]);
+
+    HeapFree(GetProcessHeap(), 0, renderer);
+}
+
+// Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
+// Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
+// не платит за неё ни байтом.
+static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
+{
+    if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
+    {
+        return true;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = (UINT64)LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    description.SampleDesc.Count = 1;
+
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource,
+        (void**)&renderer->largeMeshUploadBuffers[frameIndex])))
+    {
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(renderer->largeMeshUploadBuffers[frameIndex],
+        0, &emptyRange,
+        (void**)&renderer->largeMeshUploadMapped[frameIndex])))
+    {
+        ID3D12Resource_Release(renderer->largeMeshUploadBuffers[frameIndex]);
+        renderer->largeMeshUploadBuffers[frameIndex] = NULL;
+        return false;
+    }
+    return true;
+}
+
+static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                                      GeometryAllocation *allocation)
+{
+    if (renderer == NULL || !renderer->worldReady || data == NULL || renderer->frameRecording ||
+        renderer->frameFailed || sizeBytes == 0u || allocation == NULL ||
+        sizeBytes > UINTPTR_MAX - (uintptr_t)data || renderer->geometryGeneration == UINT64_MAX ||
+        renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
+    {
+        return false;
+    }
+
+    uint32_t blockIndex;
+    uint32_t offsetBytes;
+    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes))
+    {
+        return false;
+    }
+
+    ID3D12Resource* staging = NULL;
+    uint32_t frameIndex = renderer->frameIndex;
+    uint32_t sourceOffset = (renderer->meshUploadOffsets[frameIndex] + 15u) & ~15u;
+    bool ownsStaging = false;
+    bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME
+        && sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
+    if (fitsSmallRing)
+    {
+        staging = renderer->meshUploadBuffers[frameIndex];
+        memcpy(renderer->meshUploadMapped[frameIndex] + sourceOffset,
+            data, sizeBytes);
+        renderer->meshUploadOffsets[frameIndex] = sourceOffset + sizeBytes;
+    }
+    else
+    {
+        // Крупная запись: сначала пробуем общую арену того же кадра, и
+        // только если запись не помещается и туда — отдельный ресурс.
+        uint32_t largeOffset =
+            (renderer->largeMeshUploadOffsets[frameIndex] + 15u) & ~15u;
+        bool fitsLargeRing =
+            largeOffset <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+            && sizeBytes <= LARGE_MESH_UPLOAD_BYTES_PER_FRAME - largeOffset;
+        if (fitsLargeRing && EnsureLargeMeshUploadBuffer(renderer, frameIndex))
+        {
+            staging = renderer->largeMeshUploadBuffers[frameIndex];
+            sourceOffset = largeOffset;
+            memcpy(renderer->largeMeshUploadMapped[frameIndex] + largeOffset,
+                data, sizeBytes);
+            renderer->largeMeshUploadOffsets[frameIndex] = largeOffset + sizeBytes;
+        }
+        else
+        {
+            D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+            D3D12_RESOURCE_DESC description;
+            memset(&description, 0, sizeof(description));
+            description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            description.Width = sizeBytes;
+            description.Height = 1;
+            description.DepthOrArraySize = 1;
+            description.MipLevels = 1;
+            description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            description.SampleDesc.Count = 1;
+            if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+                &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&staging)))
+            {
+                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+                    renderer->poolUsedBytes -= sizeBytes;
+                return false;
+            }
+            D3D12_RANGE emptyRange = { 0, 0 };
+            void* mapped = NULL;
+            if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
+            {
+                ID3D12Resource_Release(staging);
+                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+                    renderer->poolUsedBytes -= sizeBytes;
+                return false;
+            }
+            memcpy(mapped, data, sizeBytes);
+            ID3D12Resource_Unmap(staging, 0, NULL);
+            sourceOffset = 0;
+            ownsStaging = true;
+        }
+    }
+
+    allocation->owner = renderer;
+    allocation->generation = renderer->geometryGeneration;
+    allocation->blockIndex = blockIndex;
+    allocation->offsetBytes = offsetBytes;
+    allocation->sizeBytes = sizeBytes;
+    allocation->resident = false;
+
+    PendingUpload* upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
+    upload->allocation = allocation;
+    upload->staging = staging;
+    upload->sourceOffset = sourceOffset;
+    upload->blockIndex = blockIndex;
+    upload->destinationOffset = offsetBytes;
+    upload->sizeBytes = sizeBytes;
+    upload->ownsStaging = ownsStaging;
+
+    return true;
+}
+
+static RendererMesh *CreateMeshFromBytes_D3D12(Renderer *renderer, const void *data,
+                                               uint32_t sizeBytes, uint32_t elementCount,
+                                               bool generic)
+{
+    RendererMesh *mesh = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*mesh));
+    if (mesh == NULL)
+        return NULL;
+    if (!UploadGeometryBytes_D3D12(renderer, data, sizeBytes, &mesh->allocation))
+    {
+        HeapFree(GetProcessHeap(), 0, mesh);
+        return NULL;
+    }
+    mesh->quadCount = generic ? 0u : elementCount;
+    mesh->vertexCount = generic ? elementCount : 0u;
+    mesh->generic = generic;
+    return mesh;
+}
+
+RendererMesh *RendererCreateMesh_D3D12(Renderer *renderer, const ChunkQuad *quads,
+                                       uint32_t quadCount)
+{
+    if (quadCount == 0u || quadCount > UINT32_MAX / (uint32_t)sizeof(ChunkQuad))
+        return NULL;
+    return CreateMeshFromBytes_D3D12(renderer, quads,
+                                     quadCount * (uint32_t)sizeof(ChunkQuad),
+                                     quadCount, false);
+}
+
+RendererMesh *RendererCreateGenericMesh_D3D12(Renderer *renderer,
+                                              const RendererGenericVertex *vertices,
+                                              uint32_t vertexCount)
+{
+    if (vertexCount == 0u ||
+        vertexCount > UINT32_MAX / (uint32_t)sizeof(RendererGenericVertex))
+        return NULL;
+    return CreateMeshFromBytes_D3D12(renderer, vertices,
+                                     vertexCount * (uint32_t)sizeof(RendererGenericVertex),
+                                     vertexCount, true);
+}
+
+RendererIndexBuffer *RendererCreateIndexBuffer_D3D12(Renderer *renderer, const uint32_t *indices,
+                                                     uint32_t indexCount)
+{
+    if (indexCount == 0u || indexCount > UINT32_MAX / (uint32_t)sizeof(uint32_t))
+        return NULL;
+    RendererIndexBuffer *buffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*buffer));
+    if (buffer == NULL)
+        return NULL;
+    if (!UploadGeometryBytes_D3D12(renderer, indices, indexCount * (uint32_t)sizeof(uint32_t),
+                                   &buffer->allocation))
+    {
+        HeapFree(GetProcessHeap(), 0, buffer);
+        return NULL;
+    }
+    buffer->indexCount = indexCount;
+    return buffer;
+}
+
+static DXGI_FORMAT TextureFormat_D3D12(uint32_t format)
+{
+    switch (format)
+    {
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
+                                              uint32_t height, uint32_t mipLevels,
+                                              uint32_t format)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->srvHeap == NULL ||
+        width == 0u || height == 0u || mipLevels == 0u)
+        return NULL;
+    uint32_t largestDimension = width > height ? width : height;
+    uint32_t maximumMipLevels = 1u;
+    while (largestDimension > 1u)
+    {
+        largestDimension >>= 1u;
+        ++maximumMipLevels;
+    }
+    if (mipLevels > maximumMipLevels)
+        return NULL;
+    DXGI_FORMAT dxgiFormat = TextureFormat_D3D12(format);
+    if (dxgiFormat == DXGI_FORMAT_UNKNOWN)
+        return NULL;
+
+    uint32_t srvSlot = AllocateDynamicSrvSlot(renderer);
+    if (srvSlot == UINT32_MAX)
+        return NULL;
+    RendererTexture *texture = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(*texture));
+    if (texture == NULL)
+    {
+        FreeDynamicSrvSlot(renderer, srvSlot);
+        return NULL;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = width;
+    description.Height = height;
+    description.DepthOrArraySize = 1u;
+    description.MipLevels = (UINT16)mipLevels;
+    description.Format = dxgiFormat;
+    description.SampleDesc.Count = 1u;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+            &IID_ID3D12Resource, (void **)&texture->resource)))
+    {
+        HeapFree(GetProcessHeap(), 0, texture);
+        FreeDynamicSrvSlot(renderer, srvSlot);
+        return NULL;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC view;
+    memset(&view, 0, sizeof(view));
+    view.Format = dxgiFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = mipLevels;
+    ID3D12Device_CreateShaderResourceView(renderer->device, texture->resource, &view,
+                                          SrvCpuHandle(renderer, srvSlot));
+    texture->owner = renderer;
+    texture->srvSlot = srvSlot;
+    return texture;
+}
+
+bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
+                                 const void *data, uint64_t sizeBytes,
+                                 uint32_t rowPitchBytes)
+{
+    return RendererUploadTextureMip_D3D12(renderer, texture, 0u, data,
+                                          sizeBytes, rowPitchBytes);
+}
+
+bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture,
+                                    uint32_t mipLevel, const void *data,
+                                    uint64_t sizeBytes, uint32_t rowPitchBytes)
+{
+    if (renderer == NULL || texture == NULL || texture->owner != renderer ||
+        texture->resource == NULL || data == NULL ||
+        renderer->frameRecording || rowPitchBytes == 0u)
+        return false;
+    D3D12_RESOURCE_DESC textureDescription;
+    ID3D12Resource_GetDesc(texture->resource, &textureDescription);
+    if (textureDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        textureDescription.DepthOrArraySize != 1u ||
+        mipLevel >= textureDescription.MipLevels || mipLevel >= 32u)
+        return false;
+    const uint64_t shiftedWidth = textureDescription.Width >> mipLevel;
+    const uint32_t shiftedHeight = textureDescription.Height >> mipLevel;
+    const uint32_t mipWidth = shiftedWidth == 0u ? 1u : (uint32_t)shiftedWidth;
+    const uint32_t mipHeight = shiftedHeight == 0u ? 1u : shiftedHeight;
+    if (mipWidth > UINT32_MAX / 4u || rowPitchBytes != mipWidth * 4u ||
+        (uint64_t)mipHeight > UINT64_MAX / rowPitchBytes ||
+        sizeBytes != (uint64_t)mipHeight * rowPitchBytes)
+        return false;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    UINT rows = 0u;
+    UINT64 rowSize = 0u;
+    UINT64 uploadBytes = 0u;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+                                        mipLevel, 1u, 0u, &layout, &rows, &rowSize,
+                                        &uploadBytes);
+    if (rows != mipHeight || rowSize != rowPitchBytes || uploadBytes == 0u)
+        return false;
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1u;
+    uploadDescription.DepthOrArraySize = 1u;
+    uploadDescription.MipLevels = 1u;
+    uploadDescription.SampleDesc.Count = 1u;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    ID3D12Resource *upload = NULL;
+    if (FAILED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+            (void **)&upload)))
+        return false;
+
+    D3D12_RANGE emptyRange = {0, 0};
+    uint8_t *mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(upload, 0u, &emptyRange, (void **)&mapped)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    const uint8_t *source = (const uint8_t *)data;
+    for (UINT row = 0u; row < rows; ++row)
+        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
+               source + (size_t)row * rowPitchBytes, (size_t)rowPitchBytes);
+    ID3D12Resource_Unmap(upload, 0u, NULL);
+
+    WaitForGpu(renderer);
+    if (FAILED(ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex])) ||
+        FAILED(ID3D12GraphicsCommandList_Reset(renderer->commandList,
+                                                renderer->commandAllocators[renderer->frameIndex],
+                                                NULL)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    // Reset начинает новый command list с PSO=NULL; он не наследует
+    // привязки предыдущей записи.
+    renderer->boundPipelineState = NULL;
+    renderer->boundRootSignature = NULL;
+    renderer->boundIndexAddress = 0u;
+    renderer->boundIndexBytes = 0u;
+    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+        texture->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = texture->resource;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = mipLevel;
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
+    memset(&sourceLocation, 0, sizeof(sourceLocation));
+    sourceLocation.pResource = upload;
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sourceLocation.PlacedFootprint = layout;
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+                                                 &destination, 0u, 0u, 0u,
+                                                 &sourceLocation, NULL);
+    D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
+        texture->resource, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
+    if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
+    {
+        ID3D12Resource_Release(upload);
+        return false;
+    }
+    ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
+    ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
+    WaitForGpu(renderer);
+    ID3D12Resource_Release(upload);
+    return true;
+}
+
+static D3D12_FILTER SamplerFilter_D3D12(uint32_t minFilter, uint32_t magFilter)
+{
+    if (minFilter == LAIUE_GRAPHICS_FILTER_LINEAR &&
+        magFilter == LAIUE_GRAPHICS_FILTER_LINEAR)
+        return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    if (minFilter == LAIUE_GRAPHICS_FILTER_NEAREST &&
+        magFilter == LAIUE_GRAPHICS_FILTER_LINEAR)
+        return D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    if (minFilter == LAIUE_GRAPHICS_FILTER_LINEAR &&
+        magFilter == LAIUE_GRAPHICS_FILTER_NEAREST)
+        return D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+    return D3D12_FILTER_MIN_MAG_MIP_POINT;
+}
+
+static D3D12_TEXTURE_ADDRESS_MODE SamplerAddress_D3D12(uint32_t mode)
+{
+    switch (mode)
+    {
+    case LAIUE_GRAPHICS_ADDRESS_REPEAT: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    case LAIUE_GRAPHICS_ADDRESS_CLAMP: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    case LAIUE_GRAPHICS_ADDRESS_MIRROR: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case LAIUE_GRAPHICS_ADDRESS_BORDER: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    }
+}
+
+RendererSampler *RendererCreateSampler_D3D12(Renderer *renderer, uint32_t minFilter,
+                                              uint32_t magFilter, uint32_t addressModeU,
+                                              uint32_t addressModeV, uint32_t addressModeW)
+{
+    if (renderer == NULL || renderer->device == NULL || renderer->samplerHeap == NULL ||
+        minFilter > LAIUE_GRAPHICS_FILTER_LINEAR || magFilter > LAIUE_GRAPHICS_FILTER_LINEAR ||
+        addressModeU > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeV > LAIUE_GRAPHICS_ADDRESS_BORDER ||
+        addressModeW > LAIUE_GRAPHICS_ADDRESS_BORDER)
+        return NULL;
+    uint32_t samplerSlot = AllocateDynamicSamplerSlot(renderer);
+    if (samplerSlot == UINT32_MAX)
+        return NULL;
+    RendererSampler *sampler = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(*sampler));
+    if (sampler == NULL)
+    {
+        FreeDynamicSamplerSlot(renderer, samplerSlot);
+        return NULL;
+    }
+    D3D12_SAMPLER_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.Filter = SamplerFilter_D3D12(minFilter, magFilter);
+    description.AddressU = SamplerAddress_D3D12(addressModeU);
+    description.AddressV = SamplerAddress_D3D12(addressModeV);
+    description.AddressW = SamplerAddress_D3D12(addressModeW);
+    description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.MaxLOD = D3D12_FLOAT32_MAX;
+    ID3D12Device_CreateSampler(renderer->device, &description,
+                                SamplerCpuHandle(renderer, samplerSlot));
+    sampler->owner = renderer;
+    sampler->samplerSlot = samplerSlot;
+    return sampler;
+}
+
+void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
+{
+    if (sampler == NULL)
+        return;
+    if (renderer != NULL && sampler->owner != renderer)
+        return;
+    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
+        renderer->fenceEvent != NULL)
+        WaitForGpu(renderer);
+    if (renderer != NULL)
+        FreeDynamicSamplerSlot(renderer, sampler->samplerSlot);
+    HeapFree(GetProcessHeap(), 0, sampler);
+}
+
+void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture == NULL)
+        return;
+    if (renderer != NULL && texture->owner != renderer)
+        return;
+    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
+        renderer->fenceEvent != NULL)
+        WaitForGpu(renderer);
+    if (texture->resource != NULL)
+        ID3D12Resource_Release(texture->resource);
+    if (renderer != NULL)
+        FreeDynamicSrvSlot(renderer, texture->srvSlot);
+    HeapFree(GetProcessHeap(), 0, texture);
+}
+
+static bool GeometryAllocationIsResident(const Renderer *renderer,
+                                         const GeometryAllocation *allocation)
+{
+    if (allocation->owner != renderer || allocation->generation != renderer->geometryGeneration ||
+        !allocation->resident || allocation->blockIndex >= renderer->poolBlockCount)
+        return false;
+    const GeometryPoolBlock *block = &renderer->poolBlocks[allocation->blockIndex];
+    return block->buffer != NULL && allocation->offsetBytes <= block->totalBytes &&
+           allocation->sizeBytes <= block->totalBytes - allocation->offsetBytes &&
+           (block->currentState & GEOMETRY_READ_STATE) == GEOMETRY_READ_STATE;
+}
+
+static bool CancelGeometryUpload(Renderer *renderer, GeometryAllocation *allocation)
+{
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        PendingUpload *upload = &renderer->pendingUploads[i];
+        if (upload->allocation != allocation)
+            continue;
+        if (upload->ownsStaging)
+            ID3D12Resource_Release(upload->staging);
+        renderer->pendingUploadCount--;
+        memmove(upload, upload + 1, (renderer->pendingUploadCount - i) * sizeof(*upload));
+        return true;
+    }
+    return false;
+}
+
+/* The allocation is the first member of both resource records, so it can
+ * retain that already allocated record as an overflow node without a new
+ * allocation or prematurely freeing ranges referenced by the current list. */
+static void DestroyGeometryAllocation(Renderer *renderer, GeometryAllocation *allocation)
+{
+    if (renderer == NULL || allocation == NULL || allocation->owner != renderer)
+        return;
+    if (allocation->generation != renderer->geometryGeneration)
+    {
+        HeapFree(GetProcessHeap(), 0, allocation);
+        return;
+    }
+    if (CancelGeometryUpload(renderer, allocation))
+    {
+        if (PoolFree(&renderer->poolBlocks[allocation->blockIndex], allocation->offsetBytes,
+                     allocation->sizeBytes))
+            renderer->poolUsedBytes -= allocation->sizeBytes;
+        HeapFree(GetProcessHeap(), 0, allocation);
+        return;
+    }
+
+    if (renderer->deferredRangeCount == DEFERRED_RELEASE_CAPACITY)
+        DrainDeferredReleases(renderer, false);
+    const UINT64 safeFenceValue = renderer->frameRecording
+                                      ? renderer->fenceValues[renderer->frameIndex]
+                                      : renderer->lastSignaledFenceValue;
+    if (renderer->deferredRangeCount == DEFERRED_RELEASE_CAPACITY)
+    {
+        allocation->safeFenceValue = safeFenceValue;
+        allocation->nextDeferred = renderer->deferredAllocationHead;
+        renderer->deferredAllocationHead = allocation;
+        return;
+    }
+    uint32_t slot =
+        (renderer->deferredRangeHead + renderer->deferredRangeCount) % DEFERRED_RELEASE_CAPACITY;
+    renderer->deferredRanges[slot].blockIndex = allocation->blockIndex;
+    renderer->deferredRanges[slot].offset = allocation->offsetBytes;
+    renderer->deferredRanges[slot].size = allocation->sizeBytes;
+    renderer->deferredRanges[slot].safeFenceValue = safeFenceValue;
+    renderer->deferredRangeCount++;
+    HeapFree(GetProcessHeap(), 0, allocation);
+}
+
+void RendererDestroyMesh_D3D12(Renderer *renderer, RendererMesh *mesh)
+{
+    if (mesh != NULL)
+        DestroyGeometryAllocation(renderer, &mesh->allocation);
+}
+
+void RendererDestroyIndexBuffer_D3D12(Renderer *renderer, RendererIndexBuffer *buffer)
+{
+    if (buffer != NULL)
+        DestroyGeometryAllocation(renderer, &buffer->allocation);
+}
+
+static void BindChunkSceneState(Renderer *renderer)
+{
+    if (renderer->boundRootSignature != renderer->rootSignature)
+    {
+        SetRootSignatureCached(renderer, renderer->rootSignature);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+            renderer->commandList, ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_COUNT,
+            renderer->sceneConstants, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+            renderer->commandList, ROOT_PARAMETER_BLOCK_TEXTURES,
+            SrvGpuHandle(renderer, SRV_SLOT_BLOCK_TEXTURES));
+        ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+            renderer->commandList, ROOT_PARAMETER_INSTANCES,
+            renderer->instanceChunks[renderer->frameIndex][0].address);
+    }
+    SetPipelineStateCached(renderer, renderer->pipelineState);
+}
+
+static void BindGenericSceneState(Renderer *renderer)
+{
+    if (renderer->boundRootSignature != renderer->genericRootSignature)
+    {
+        SetRootSignatureCached(renderer, renderer->genericRootSignature);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+            renderer->commandList, GENERIC_ROOT_PARAMETER_CONSTANTS, ROOT_CONSTANT_COUNT,
+            renderer->sceneConstants, 0);
+    }
+    SetPipelineStateCached(renderer, renderer->genericPipelineState);
+}
+
+static bool GeometryFloatIsFinite(const float *value)
+{
+    uint32_t bits;
+    memcpy(&bits, value, sizeof(bits));
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+void RendererDrawMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                            const float chunkOriginRelative[3])
+{
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        chunkOriginRelative == NULL || !renderer->frameRecording || !renderer->scenePassActive ||
+        renderer->commandList == NULL || renderer->pipelineState == NULL ||
+        !GeometryAllocationIsResident(renderer, &mesh->allocation))
+        return;
+    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->allocation.blockIndex];
+    BindChunkSceneState(renderer);
+    float transform[4] = {chunkOriginRelative[0], chunkOriginRelative[1], chunkOriginRelative[2],
+                          1.0f};
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+        renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4, transform, ROOT_CONSTANT_ORIGIN_OFFSET);
+    renderer->instanceOriginActive = false;
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
+        block->address + mesh->allocation.offsetBytes);
+    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6u, 1u, 0u,
+                                            0u);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += mesh->quadCount;
+}
+
+bool RendererDrawGeometry_D3D12(Renderer *renderer, const RendererGeometryDraw *draw)
+{
+    if (renderer == NULL || draw == NULL || draw->structSize < sizeof(*draw) ||
+        draw->mesh == NULL || draw->mesh->allocation.owner != renderer || !draw->mesh->generic ||
+        !renderer->frameRecording || !renderer->scenePassActive || renderer->commandList == NULL ||
+        renderer->genericPipelineState == NULL || renderer->genericRootSignature == NULL ||
+        !GeometryAllocationIsResident(renderer, &draw->mesh->allocation) ||
+        (draw->texture != NULL &&
+         (draw->texture->owner != renderer || draw->texture->resource == NULL)) ||
+        (draw->sampler != NULL && draw->sampler->owner != renderer) ||
+        (draw->instances == NULL && draw->instanceCount != 0u) ||
+        (draw->instances != NULL && draw->instanceCount == 0u) ||
+        draw->instanceCount >
+            INSTANCE_MAX_BYTES_PER_DRAW / (uint32_t)sizeof(RendererMeshInstance) ||
+        !GeometryFloatIsFinite(&draw->scale) || !GeometryFloatIsFinite(&draw->originRelative[0]) ||
+        !GeometryFloatIsFinite(&draw->originRelative[1]) ||
+        !GeometryFloatIsFinite(&draw->originRelative[2]))
+        return false;
+
+    const RendererMesh *mesh = draw->mesh;
+    const RendererIndexBuffer *indices = draw->indexBuffer;
+    if (indices != NULL && !GeometryAllocationIsResident(renderer, &indices->allocation))
+        return false;
+    uint32_t available = indices != NULL ? indices->indexCount : mesh->vertexCount;
+    if (draw->firstElement > available ||
+        (draw->elementCount != UINT32_MAX && draw->elementCount > available - draw->firstElement) ||
+        (indices == NULL && draw->vertexOffset != 0))
+        return false;
+    uint32_t count =
+        draw->elementCount == UINT32_MAX ? available - draw->firstElement : draw->elementCount;
+    if (count == 0u)
+        return false;
+    if (draw->texture == NULL && renderer->genericFallbackTexture == NULL)
+        return false;
+
+    uint32_t instanceCount = draw->instanceCount == 0u ? 1u : draw->instanceCount;
+    D3D12_GPU_VIRTUAL_ADDRESS instanceAddress =
+        renderer->instanceChunks[renderer->frameIndex][0].address;
+    if (draw->instanceCount != 0u)
+    {
+        uint32_t bytes = draw->instanceCount * (uint32_t)sizeof(RendererMeshInstance);
+        if (bytes > UINTPTR_MAX - (uintptr_t)draw->instances)
+            return false;
+        uint32_t chunkIndex;
+        uint32_t offset;
+        if (!ReserveInstanceSpace(renderer, renderer->frameIndex, bytes, &chunkIndex, &offset))
+            return false;
+        InstanceChunk *chunk = &renderer->instanceChunks[renderer->frameIndex][chunkIndex];
+        memcpy(chunk->mapped + offset, draw->instances, bytes);
+        instanceAddress = chunk->address + offset;
+    }
+
+    BindGenericSceneState(renderer);
+    float transform[4] = {draw->originRelative[0], draw->originRelative[1], draw->originRelative[2],
+                          draw->scale};
+    float instanceMode = draw->instanceCount == 0u ? 0.0f : 1.0f;
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+                                                            GENERIC_ROOT_PARAMETER_CONSTANTS, 4u,
+                                                            transform, ROOT_CONSTANT_ORIGIN_OFFSET);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_CONSTANTS, 1u, &instanceMode,
+        GENERIC_INSTANCE_MODE_OFFSET);
+    const int32_t vertexIdOffset =
+        indices != NULL ? draw->vertexOffset : (int32_t)draw->firstElement;
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_CONSTANTS, 1u, &vertexIdOffset,
+        GENERIC_VERTEX_ID_OFFSET);
+    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->allocation.blockIndex];
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_QUAD_BUFFER,
+        block->address + mesh->allocation.offsetBytes);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_INSTANCES, instanceAddress);
+    uint32_t textureSlot =
+        draw->texture != NULL ? draw->texture->srvSlot : renderer->genericFallbackTexture->srvSlot;
+    uint32_t samplerSlot = draw->sampler != NULL ? draw->sampler->samplerSlot : 0u;
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_TEXTURE, SrvGpuHandle(renderer, textureSlot));
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+        renderer->commandList, GENERIC_ROOT_PARAMETER_SAMPLER,
+        SamplerGpuHandle(renderer, samplerSlot));
+    if (indices != NULL)
+    {
+        GeometryPoolBlock *indexBlock = &renderer->poolBlocks[indices->allocation.blockIndex];
+        D3D12_INDEX_BUFFER_VIEW view;
+        view.BufferLocation = indexBlock->address + indices->allocation.offsetBytes;
+        view.SizeInBytes = indices->allocation.sizeBytes;
+        view.Format = DXGI_FORMAT_R32_UINT;
+        if (renderer->boundIndexAddress != view.BufferLocation ||
+            renderer->boundIndexBytes != view.SizeInBytes)
+        {
+            ID3D12GraphicsCommandList_IASetIndexBuffer(renderer->commandList, &view);
+            renderer->boundIndexAddress = view.BufferLocation;
+            renderer->boundIndexBytes = view.SizeInBytes;
+        }
+        ID3D12GraphicsCommandList_DrawIndexedInstanced(renderer->commandList, count, instanceCount,
+                                                       draw->firstElement, 0, 0u);
+    }
+    else
+    {
+        ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, count, instanceCount, 0u,
+                                                0u);
+    }
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += (uint64_t)(count / 3u) * instanceCount;
+    return true;
+}
+
+void RendererDrawGenericMeshRangeBound_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                                             const float originRelative[3], float scale,
+                                             uint32_t firstVertex, uint32_t vertexCount,
+                                             const RendererTexture *texture,
+                                             const RendererSampler *sampler)
+{
+    RendererGeometryDraw draw;
+    memset(&draw, 0, sizeof(draw));
+    draw.structSize = sizeof(draw);
+    draw.mesh = mesh;
+    draw.firstElement = firstVertex;
+    draw.elementCount = vertexCount;
+    draw.scale = scale;
+    if (originRelative != NULL)
+        memcpy(draw.originRelative, originRelative, sizeof(draw.originRelative));
+    draw.texture = texture;
+    draw.sampler = sampler;
+    (void)RendererDrawGeometry_D3D12(renderer, &draw);
+}
+
+void RendererDrawGenericMesh_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                                   const float originRelative[3], float scale, uint32_t firstVertex,
+                                   uint32_t vertexCount)
+{
+    RendererDrawGenericMeshRangeBound_D3D12(renderer, mesh, originRelative, scale, firstVertex,
+                                            vertexCount, NULL, NULL);
+}
+
+void RendererDrawMeshInstances_D3D12(Renderer *renderer, const RendererMesh *mesh,
+                                     const RendererMeshInstance *instances, uint32_t instanceCount)
+{
+    if (renderer == NULL || mesh == NULL || mesh->allocation.owner != renderer || mesh->generic ||
+        instances == NULL || instanceCount == 0u || !renderer->frameRecording ||
+        !renderer->scenePassActive || renderer->commandList == NULL ||
+        renderer->pipelineState == NULL ||
+        !GeometryAllocationIsResident(renderer, &mesh->allocation) ||
+        instanceCount > INSTANCE_MAX_BYTES_PER_DRAW / (uint32_t)sizeof(RendererMeshInstance))
+        return;
+    uint32_t bytes = instanceCount * (uint32_t)sizeof(RendererMeshInstance);
+    uint32_t slot = renderer->frameIndex;
+    uint32_t chunkIndex;
+    uint32_t offset;
+    if (!ReserveInstanceSpace(renderer, slot, bytes, &chunkIndex, &offset))
+        return;
+    InstanceChunk *chunk = &renderer->instanceChunks[slot][chunkIndex];
+    memcpy(chunk->mapped + offset, instances, bytes);
+
+    BindChunkSceneState(renderer);
+    if (!renderer->instanceOriginActive)
+    {
+        static const float instanceTransform[4] = {0.0f, 0.0f, 0.0f, -1.0f};
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+            renderer->commandList, ROOT_PARAMETER_CONSTANTS, 4u, instanceTransform,
+            ROOT_CONSTANT_ORIGIN_OFFSET);
+        renderer->instanceOriginActive = true;
+    }
+    GeometryPoolBlock *block = &renderer->poolBlocks[mesh->allocation.blockIndex];
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_QUAD_BUFFER,
+        block->address + mesh->allocation.offsetBytes);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(
+        renderer->commandList, ROOT_PARAMETER_INSTANCES, chunk->address + offset);
+    ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, mesh->quadCount * 6u,
+                                            instanceCount, 0u, 0u);
+    renderer->currentStats.drawCalls++;
+    renderer->currentStats.drawnQuads += (uint64_t)mesh->quadCount * instanceCount;
+}
+
+static void RecordTextureArrayUpload(Renderer* renderer,
+    ID3D12Resource* texture, ID3D12Resource** upload,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts)
+{
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(texture, &description);
+    UINT subresourceCount = (UINT)description.DepthOrArraySize * description.MipLevels;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, subresourceCount, 0, layouts, NULL, NULL, NULL);
+
+    for (UINT index = 0; index < subresourceCount; ++index)
+    {
+        D3D12_TEXTURE_COPY_LOCATION destination;
+        memset(&destination, 0, sizeof(destination));
+        destination.pResource = texture;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = index;
+
+        D3D12_TEXTURE_COPY_LOCATION source;
+        memset(&source, 0, sizeof(source));
+        source.pResource = *upload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = layouts[index];
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+            &destination, 0, 0, 0, &source, NULL);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(texture,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    DeferResourceRelease(renderer, *upload);
+    *upload = NULL;
+}
+
+static void RecordBlockTextureUpload(Renderer* renderer)
+{
+    if (!renderer->blockTextureUploadPending)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC albedoDescription;
+    D3D12_RESOURCE_DESC normalDescription;
+    ID3D12Resource_GetDesc(renderer->blockTexture, &albedoDescription);
+    ID3D12Resource_GetDesc(renderer->blockNormalTexture, &normalDescription);
+    UINT albedoSubresources = (UINT)albedoDescription.DepthOrArraySize
+        * albedoDescription.MipLevels;
+    UINT normalSubresources = (UINT)normalDescription.DepthOrArraySize
+        * normalDescription.MipLevels;
+    UINT layoutCount = albedoSubresources > normalSubresources
+        ? albedoSubresources : normalSubresources;
+    if (layoutCount == 0 || layoutCount > MAX_TEXTURE_SUBRESOURCES)
+    {
+        return;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts = HeapAlloc(
+        GetProcessHeap(), 0, (SIZE_T)layoutCount * sizeof(*layouts));
+    if (layouts == NULL)
+    {
+        // Загрузка остаётся pending и будет повторена в
+        // следующем кадре, не оставляя текстуру наполовину записанной.
+        return;
+    }
+
+    RecordTextureArrayUpload(renderer,
+        renderer->blockTexture, &renderer->blockTextureUpload, layouts);
+    RecordTextureArrayUpload(renderer,
+        renderer->blockNormalTexture, &renderer->blockNormalUpload, layouts);
+    HeapFree(GetProcessHeap(), 0, layouts);
+    renderer->blockTextureUploadPending = false;
+}
+
+// Записывает отложенные загрузки мешей в командный список кадра.
+static void RecordPendingUploads(Renderer* renderer)
+{
+    if (renderer->pendingUploadCount == 0)
+    {
+        return;
+    }
+
+    // Блоки с загрузками — в состояние приёмника копирования.
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[renderer->pendingUploads[i].blockIndex];
+        if (!block->touchedByUploads)
+        {
+            block->touchedByUploads = true;
+            D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(block->buffer,
+                block->currentState, D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+            block->currentState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
+
+    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
+    {
+        PendingUpload* upload = &renderer->pendingUploads[i];
+        GeometryPoolBlock* block = &renderer->poolBlocks[upload->blockIndex];
+        ID3D12GraphicsCommandList_CopyBufferRegion(renderer->commandList,
+            block->buffer, upload->destinationOffset, upload->staging,
+            upload->sourceOffset, upload->sizeBytes);
+        if (upload->ownsStaging) DeferResourceRelease(renderer, upload->staging);
+        upload->allocation->resident = true;
+        renderer->currentStats.uploadedBytes += upload->sizeBytes;
+    }
+
+    // Обратно в состояние чтения вершинным шейдером.
+    for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
+    {
+        GeometryPoolBlock* block = &renderer->poolBlocks[i];
+        if (block->touchedByUploads)
+        {
+            block->touchedByUploads = false;
+            D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(
+                block->buffer, D3D12_RESOURCE_STATE_COPY_DEST, GEOMETRY_READ_STATE);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+            block->currentState = GEOMETRY_READ_STATE;
+        }
+    }
+
+    renderer->pendingUploadCount = 0;
+}
+
+static bool ApplyPendingResize(Renderer* renderer)
+{
+    int32_t width = renderer->resizeWidth;
+    int32_t height = renderer->resizeHeight;
+    if (width <= 0 || height <= 0)
+    {
+        renderer->resizeRequested = false;
+        return true;
+    }
+
+    WaitForGpu(renderer);
+
+    // После WaitForGpu GPU простаивает, поэтому курсоры чанков обоих слотов
+    // можно безопасно вернуть в начало: смена индекса back-буфера не должна
+    // оставлять слот с недосброшенным курсором и лишним чанком.
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        renderer->instanceChunkIndex[i] = 0;
+        renderer->instanceChunkOffset[i] = 0;
+    }
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (renderer->renderTargets[i] != NULL)
+        {
+            ID3D12Resource_Release(renderer->renderTargets[i]);
+            renderer->renderTargets[i] = NULL;
+        }
+    }
+
+    UINT swapChainFlags = renderer->tearingSupported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
+        DXGI_FORMAT_R8G8B8A8_UNORM, swapChainFlags)))
+    {
+        return false; // resizeRequested остаётся — повтор в следующем кадре
+    }
+
+    // ResizeBuffers сбрасывает индекс back-буфера: чтобы подписи фенса
+    // остались монотонными, все слоты выравниваются по текущему значению
+    // (иначе ~каждый второй ресайз зависал бы навсегда).
+    UINT64 currentFenceValue = renderer->fenceValues[renderer->frameIndex];
+    renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        renderer->fenceValues[i] = currentFenceValue;
+    }
+
+    D3D12_RENDER_TARGET_VIEW_DESC backBufferViewDescription;
+    memset(&backBufferViewDescription, 0, sizeof(backBufferViewDescription));
+    backBufferViewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    backBufferViewDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(renderer->renderTargetViewHeap, &renderTargetViewHandle);
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+    {
+        if (FAILED(IDXGISwapChain3_GetBuffer(renderer->swapChain, i, &IID_ID3D12Resource, (void**)&renderer->renderTargets[i])))
+        {
+            return false;
+        }
+        ID3D12Device_CreateRenderTargetView(renderer->device, renderer->renderTargets[i],
+            &backBufferViewDescription, renderTargetViewHandle);
+        renderTargetViewHandle.ptr += renderer->renderTargetViewSize;
+    }
+
+    if (renderer->worldReady
+        && !CreateDepthBuffer(renderer, width, height))
+    {
+        return false;
+    }
+
+    renderer->windowWidth = width;
+    renderer->windowHeight = height;
+    renderer->viewport.Width = (float)width;
+    renderer->viewport.Height = (float)height;
+    renderer->scissorRect.right = width;
+    renderer->scissorRect.bottom = height;
+    renderer->resizeRequested = false;
+    return true;
+}
+
+// Загрузка атласа шрифта: записана в командный список ближайшего кадра.
+static void RecordFontAtlasUpload(Renderer* renderer)
+{
+    if (!renderer->fontUploadPending)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(renderer->fontTexture, &description);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, 1, 0, &layout, NULL, NULL, NULL);
+
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = renderer->fontTexture;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_TEXTURE_COPY_LOCATION source;
+    memset(&source, 0, sizeof(source));
+    source.pResource = renderer->fontTextureUpload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = layout;
+
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+        &destination, 0, 0, 0, &source, NULL);
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->fontTexture,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    DeferResourceRelease(renderer, renderer->fontTextureUpload);
+    renderer->fontTextureUpload = NULL;
+    renderer->fontUploadPending = false;
+    renderer->fontReady = true;
+}
+
+static void RecordBackgroundUpload(Renderer* renderer)
+{
+    if (!renderer->backgroundUploadPending) return;
+
+    D3D12_RESOURCE_DESC description;
+    ID3D12Resource_GetDesc(renderer->backgroundTexture, &description);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &description,
+        0, 1, 0, &layout, NULL, NULL, NULL);
+
+    D3D12_TEXTURE_COPY_LOCATION destination;
+    memset(&destination, 0, sizeof(destination));
+    destination.pResource = renderer->backgroundTexture;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source;
+    memset(&source, 0, sizeof(source));
+    source.pResource = renderer->backgroundTextureUpload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = layout;
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
+        &destination, 0, 0, 0, &source, NULL);
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(
+        renderer->backgroundTexture, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1,
+        &barrier);
+    DeferResourceRelease(renderer, renderer->backgroundTextureUpload);
+    renderer->backgroundTextureUpload = NULL;
+    renderer->backgroundUploadPending = false;
+    renderer->backgroundReady = true;
+}
+
+bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* frame)
+{
+    if (renderer == NULL || frame == NULL || renderer->frameRecording || renderer->frameFailed ||
+        frame->passCount > RENDERER_MAX_SCENE_PASSES ||
+        (frame->passCount != 0 && !renderer->worldReady))
+    {
+        return false;
+    }
+
+    renderer->captureValid = false;
+
+    // Отложенный resize: применяется, когда GPU дошёл до этого кадра.
+    // При неудаче кадр пропускается, попытка повторится в следующем.
+    if (renderer->resizeRequested && !ApplyPendingResize(renderer))
+    {
+        return false;
+    }
+    if (renderer->renderTargets[renderer->frameIndex] == NULL
+        || (frame->passCount != 0 && renderer->depthBuffer == NULL))
+    {
+        return false;
+    }
+
+    renderer->frame = *frame;
+    renderer->uiQuadCount = 0;
+    memset(&renderer->currentStats, 0, sizeof(renderer->currentStats));
+    renderer->currentStats.scenePasses = frame->passCount;
+
+    // Первый чанк слота нужен проходам сцены как валидный t3 по умолчанию.
+    // Создаётся лениво, ровно один раз на слот, после чего переиспользуется.
+    if (frame->passCount != 0
+        && !EnsureInstancePool(renderer, renderer->frameIndex))
+    {
+        return false;
+    }
+
+    if (renderer->frame.panorama
+        && !EnsureCubeResources(renderer, renderer->frame.faceResolution))
+    {
+        return false;
+    }
+
+    DrainDeferredReleases(renderer, false);
+    if (renderer->deferredResourceCount >
+        DEFERRED_RESOURCE_CAPACITY - MAX_RESOURCE_RELEASES_PER_FRAME)
+    {
+        // The preceding submitted lists are safe to wait for before Reset.
+        if (!WaitForGpu(renderer))
+            return false;
+        DrainDeferredReleases(renderer, false);
+        if (renderer->deferredResourceCount >
+            DEFERRED_RESOURCE_CAPACITY - MAX_RESOURCE_RELEASES_PER_FRAME)
+            return false;
+    }
+
+    if (FAILED(ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex])) ||
+        FAILED(ID3D12GraphicsCommandList_Reset(
+            renderer->commandList, renderer->commandAllocators[renderer->frameIndex],
+            renderer->worldReady ? renderer->pipelineState : NULL)))
+        return false;
+    renderer->frameRecording = true;
+    renderer->gpuTimingRecording = renderer->gpuTimingSupported;
+    if (renderer->gpuTimingRecording)
+    {
+        UINT queryIndex = renderer->frameIndex * 2u;
+        ID3D12GraphicsCommandList_EndQuery(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex);
+    }
+    // После Reset кэш аннулируется независимо от результата вызова выше:
+    // первая отрисовка явно запишет обе привязки и не полагается на состояние
+    // командного списка до Reset.
+    renderer->boundRootSignature = NULL;
+    renderer->boundPipelineState = NULL;
+    renderer->boundIndexAddress = 0u;
+    renderer->boundIndexBytes = 0u;
+    // Reset возвращает корневые константы к нулю: общего инстансного
+    // смещения в новом командном списке ещё нет.
+    renderer->instanceOriginActive = false;
+    renderer->scenePassActive = false;
+
+    if (renderer->worldReady) RecordBlockTextureUpload(renderer);
+    RecordFontAtlasUpload(renderer);
+    RecordBackgroundUpload(renderer);
+    RecordPendingUploads(renderer);
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
+        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    // Общее состояние всех проходов сцены; цель, очистка и viewProjection
+    // назначаются в RendererBeginScenePass_D3D12.
+    ID3D12DescriptorHeap* descriptorHeaps[2] = { renderer->srvHeap, renderer->samplerHeap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(renderer->commandList, 2, descriptorHeaps);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(renderer->commandList, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    if (frame->passCount == 0)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->renderTargetViewHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex
+            * renderer->renderTargetViewSize;
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList,
+            1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList,
+            1, &renderer->scissorRect);
+        const float clearColor[4] = {
+            frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
+        };
+        ID3D12GraphicsCommandList_ClearRenderTargetView(
+            renderer->commandList, renderTargetViewHandle, clearColor, 0,
+            NULL);
+        return true;
+    }
+
+    float gammaInverse = frame->gamma > 0.01f ? 1.0f / frame->gamma : 1.0f;
+    float lighting[ROOT_CONSTANT_LIGHTING_COUNT] = {
+        frame->sunDirection[0],
+        frame->sunDirection[1],
+        frame->sunDirection[2],
+        (float)(renderer->blockAnimation.materialCount > 0u ? renderer->blockAnimation.materialCount
+                                                            : 1u),
+        frame->sunColor[0],
+        frame->sunColor[1],
+        frame->sunColor[2],
+        0.0f,
+        frame->ambientColor[0],
+        frame->ambientColor[1],
+        frame->ambientColor[2],
+        gammaInverse,
+    };
+    memset(renderer->sceneConstants, 0, sizeof(renderer->sceneConstants));
+    memcpy(renderer->sceneConstants + ROOT_CONSTANT_LIGHTING_OFFSET, lighting, sizeof(lighting));
+    TexturePackFillSliceTable(&renderer->blockAnimation, frame->animationSeconds,
+                              renderer->sceneConstants + ROOT_CONSTANT_SLICES_OFFSET);
+    BindChunkSceneState(renderer);
+
+    return true;
+}
+
+void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex)
+{
+    if (renderer == NULL || !renderer->worldReady || !renderer->frameRecording ||
+        passIndex >= renderer->frame.passCount)
+    {
+        return;
+    }
+    const RendererScenePass* pass = &renderer->frame.passes[passIndex];
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    D3D12_CPU_DESCRIPTOR_HANDLE depthStencilViewHandle;
+    D3D12_VIEWPORT viewport;
+    D3D12_RECT scissor;
+
+    if (renderer->frame.panorama)
+    {
+        // Грань кубмапы: рисуется и очищается только задействованный
+        // прямоугольник — остальные тексели резолв не читает.
+        uint32_t faceIndex = pass->faceIndex < 6 ? pass->faceIndex : 0;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->cubeRtvHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)faceIndex * renderer->renderTargetViewSize;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->cubeDsvHeap, &depthStencilViewHandle);
+
+        scissor.left = (LONG)pass->rectMinX;
+        scissor.top = (LONG)pass->rectMinY;
+        scissor.right = (LONG)pass->rectMaxX;
+        scissor.bottom = (LONG)pass->rectMaxY;
+        viewport.TopLeftX = (float)scissor.left;
+        viewport.TopLeftY = (float)scissor.top;
+        viewport.Width = (float)(scissor.right - scissor.left);
+        viewport.Height = (float)(scissor.bottom - scissor.top);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+    }
+    else
+    {
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->renderTargetViewHeap, &renderTargetViewHandle);
+        renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            renderer->depthStencilViewHeap, &depthStencilViewHandle);
+        viewport = renderer->viewport;
+        scissor = renderer->scissorRect;
+    }
+
+    ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+        1, &renderTargetViewHandle, FALSE, &depthStencilViewHandle);
+
+    const float clearColor[4] = {
+        renderer->frame.skyColor[0],
+        renderer->frame.skyColor[1],
+        renderer->frame.skyColor[2],
+        1.0f,
+    };
+    ID3D12GraphicsCommandList_ClearRenderTargetView(renderer->commandList,
+        renderTargetViewHandle, clearColor, 1, &scissor);
+    ID3D12GraphicsCommandList_ClearDepthStencilView(renderer->commandList,
+        depthStencilViewHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &scissor);
+
+    ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &scissor);
+
+    memcpy(renderer->sceneConstants, pass->viewProjection, sizeof(pass->viewProjection));
+    renderer->scenePassActive = true;
+    BindChunkSceneState(renderer);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+        ROOT_PARAMETER_CONSTANTS, 16, pass->viewProjection, 0);
+}
+
+static bool RecordRequestedFrameCapture(Renderer *renderer)
+{
+    ID3D12Resource *source = renderer->renderTargets[renderer->frameIndex];
+    if (source == NULL)
+        return false;
+    D3D12_RESOURCE_DESC sourceDescription;
+    ID3D12Resource_GetDesc(source, &sourceDescription);
+    if (sourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        sourceDescription.Format != DXGI_FORMAT_R8G8B8A8_UNORM || sourceDescription.Width == 0u ||
+        sourceDescription.Height == 0u || sourceDescription.Width > UINT32_MAX / 4u ||
+        sourceDescription.Width * 4u > UINT32_MAX / sourceDescription.Height ||
+        sourceDescription.SampleDesc.Count != 1u)
+        return false;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT rowCount = 0u;
+    UINT64 rowBytes = 0u;
+    UINT64 totalBytes = 0u;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &sourceDescription, 0u, 1u, 0u, &footprint,
+                                       &rowCount, &rowBytes, &totalBytes);
+    if (totalBytes == 0u || totalBytes > SIZE_MAX || rowCount != sourceDescription.Height ||
+        rowBytes != sourceDescription.Width * 4u || footprint.Footprint.RowPitch < rowBytes ||
+        footprint.Offset > totalBytes || rowCount == 0u ||
+        (uint64_t)(rowCount - 1u) >
+            (totalBytes - footprint.Offset) / footprint.Footprint.RowPitch ||
+        rowBytes > totalBytes - footprint.Offset -
+                       (uint64_t)(rowCount - 1u) * footprint.Footprint.RowPitch)
+        return false;
+    if (renderer->captureReadback == NULL || renderer->captureReadbackBytes != totalBytes)
+    {
+        D3D12_RESOURCE_DESC readbackDescription = {0};
+        readbackDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readbackDescription.Width = totalBytes;
+        readbackDescription.Height = 1u;
+        readbackDescription.DepthOrArraySize = 1u;
+        readbackDescription.MipLevels = 1u;
+        readbackDescription.SampleDesc.Count = 1u;
+        readbackDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_HEAP_PROPERTIES readbackHeap = {.Type = D3D12_HEAP_TYPE_READBACK};
+        ID3D12Resource *replacement = NULL;
+        if (FAILED(ID3D12Device_CreateCommittedResource(
+                renderer->device, &readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDescription,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&replacement)))
+            return false;
+        if (renderer->captureReadback != NULL)
+            DeferResourceRelease(renderer, renderer->captureReadback);
+        renderer->captureReadback = replacement;
+        renderer->captureReadbackBytes = totalBytes;
+    }
+    renderer->captureFootprint = footprint;
+    renderer->captureWidth = (uint32_t)sourceDescription.Width;
+    renderer->captureHeight = sourceDescription.Height;
+    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+        source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION destination = {
+        .pResource = renderer->captureReadback,
+        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        .PlacedFootprint = footprint,
+    };
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation = {
+        .pResource = source,
+        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        .SubresourceIndex = 0u,
+    };
+    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList, &destination, 0u, 0u, 0u,
+                                                &sourceLocation, NULL);
+    D3D12_RESOURCE_BARRIER restore = MakeTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &restore);
+    return true;
+}
+
+bool RendererEndFrame_D3D12(Renderer* renderer)
+{
+    if (renderer == NULL || !renderer->frameRecording)
+        return false;
+    renderer->captureValid = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+        renderer->renderTargetViewHeap, &renderTargetViewHandle);
+    renderTargetViewHandle.ptr += (SIZE_T)renderer->frameIndex * renderer->renderTargetViewSize;
+
+    if (renderer->frame.panorama)
+    {
+        // Резолв: кубмапа -> back-буфер выбранной проекцией.
+        D3D12_RESOURCE_BARRIER toShaderResource = MakeTransitionBarrier(renderer->cubeColor,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &toShaderResource);
+
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
+
+        SetPipelineStateCached(renderer, renderer->resolvePipelineState);
+        SetRootSignatureCached(renderer, renderer->resolveRootSignature);
+
+        float resolveConstants[2] = {
+            renderer->frame.fovHalfRadians,
+            renderer->frame.resolveVerticalScale,
+        };
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 2, resolveConstants, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(renderer->commandList,
+            0, (UINT)renderer->frame.resolveMapping, 2);
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+            1, SrvGpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
+
+        ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList, 3, 1, 0, 0);
+        renderer->currentStats.drawCalls++;
+
+        D3D12_RESOURCE_BARRIER toRenderTarget = MakeTransitionBarrier(renderer->cubeColor,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &toRenderTarget);
+    }
+
+    if (renderer->uiQuadCount > 0 && renderer->fontReady)
+    {
+        // Слой UI: альфа-смешивание поверх кадра, без глубины.
+        ID3D12GraphicsCommandList_OMSetRenderTargets(renderer->commandList,
+            1, &renderTargetViewHandle, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(renderer->commandList, 1, &renderer->viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(renderer->commandList, 1, &renderer->scissorRect);
+
+        SetPipelineStateCached(renderer, renderer->uiPipelineState);
+        SetRootSignatureCached(renderer, renderer->uiRootSignature);
+
+        float screenSize[2] = {
+            (float)renderer->windowWidth,
+            (float)renderer->windowHeight,
+        };
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 2, screenSize, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
+            1, ID3D12Resource_GetGPUVirtualAddress(
+                renderer->uiQuadBuffers[renderer->frameIndex]));
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
+            2, SrvGpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
+
+        ID3D12GraphicsCommandList_DrawInstanced(renderer->commandList,
+            renderer->uiQuadCount * 6, 1, 0, 0);
+        renderer->currentStats.drawCalls++;
+    }
+
+    // The end timestamp follows all scene, panorama, and UI work. Resolving
+    // happens afterward, so the readback copy is outside the measured interval.
+    bool hasGpuTimingSample = renderer->gpuTimingRecording;
+    if (hasGpuTimingSample)
+    {
+        UINT queryIndex = renderer->frameIndex * 2u;
+        ID3D12GraphicsCommandList_EndQuery(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex + 1u);
+        ID3D12GraphicsCommandList_ResolveQueryData(renderer->commandList,
+            renderer->gpuTimingQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+            queryIndex, 2u, renderer->gpuTimingReadback,
+            (UINT64)renderer->frameIndex * 2u * sizeof(UINT64));
+    }
+
+    bool recordedCapture = false;
+    if (renderer->captureRequested)
+    {
+        renderer->captureRequested = false;
+        recordedCapture = RecordRequestedFrameCapture(renderer);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1, &barrier);
+
+    HRESULT closeResult = ID3D12GraphicsCommandList_Close(
+        renderer->commandList);
+    if (FAILED(closeResult))
+    {
+        renderer->gpuTimingRecording = false;
+        renderer->frameRecording = false;
+        renderer->frameFailed = true;
+        return false;
+    }
+
+    UINT submittedSlot = renderer->frameIndex;
+    renderer->gpuTimingRecording = false;
+    if (hasGpuTimingSample)
+        renderer->gpuTimingPending[submittedSlot] = false;
+    ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
+    ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
+
+    UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
+    UINT presentFlags = 0;
+    if (!renderer->verticalSyncEnabled && renderer->tearingPresentEnabled)
+    {
+        BOOL fullscreen = TRUE;
+        if (SUCCEEDED(IDXGISwapChain3_GetFullscreenState(
+                renderer->swapChain, &fullscreen, NULL)) && !fullscreen)
+        {
+            presentFlags = DXGI_PRESENT_ALLOW_TEARING;
+        }
+    }
+
+    HRESULT presentResult = IDXGISwapChain3_Present(
+        renderer->swapChain, syncInterval, presentFlags);
+    if (presentResult == DXGI_ERROR_INVALID_CALL
+        && presentFlags == DXGI_PRESENT_ALLOW_TEARING)
+    {
+        renderer->tearingPresentEnabled = false;
+        presentResult = IDXGISwapChain3_Present(renderer->swapChain, 0, 0);
+    }
+    if (FAILED(presentResult))
+    {
+        // ExecuteCommandLists already submitted work. Complete its fence even
+        // when presentation fails, before any between-frame destruction.
+        WaitForGpu(renderer);
+        renderer->frameRecording = false;
+        renderer->frameFailed = true;
+        return false;
+    }
+
+    if (hasGpuTimingSample
+        && renderer->gpuTimingNextFrameIndex != UINT64_MAX)
+    {
+        renderer->gpuTimingFrameIndices[submittedSlot] =
+            ++renderer->gpuTimingNextFrameIndex;
+        renderer->gpuTimingFenceValues[submittedSlot] =
+            renderer->fenceValues[submittedSlot];
+        renderer->gpuTimingPending[submittedSlot] = true;
+    }
+
+    renderer->lastStats = renderer->currentStats;
+    renderer->captureFenceValue = renderer->fenceValues[submittedSlot];
+
+    bool waitedForFence = false;
+    if (!MoveToNextFrame(renderer, &waitedForFence))
+    {
+        renderer->frameRecording = false;
+        renderer->frameFailed = true;
+        renderer->gpuTimingPending[submittedSlot] = false;
+        return false;
+    }
+    renderer->meshUploadOffsets[renderer->frameIndex] = 0;
+    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
+    // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
+    // больше не читает: курсор можно вернуть в начало. Сами чанки остаются.
+    renderer->instanceChunkIndex[renderer->frameIndex] = 0;
+    renderer->instanceChunkOffset[renderer->frameIndex] = 0;
+    if (!renderer->verticalSyncEnabled && !waitedForFence)
+    {
+        // Без vsync Present не является точкой ожидания. Отдаём остаток
+        // кванта рабочим потокам, не вводя задержку или предел FPS.
+        SwitchToThread();
+    }
+    renderer->frameRecording = false;
+    renderer->captureValid = recordedCapture;
+    return true;
+}
+
+void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
+{
+    if (renderer == NULL || outStats == NULL) return;
+
+    *outStats = renderer->lastStats;
+    outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
+    outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+}
+
+bool RendererCanCaptureFrame_D3D12(const Renderer *renderer)
+{
+    return renderer != NULL && renderer->device != NULL && renderer->commandQueue != NULL &&
+           renderer->swapChain != NULL && renderer->fence != NULL && renderer->fenceEvent != NULL;
+}
+
+bool RendererRequestFrameCapture_D3D12(Renderer *renderer)
+{
+    if (!RendererCanCaptureFrame_D3D12(renderer) || renderer->frameRecording)
+        return false;
+    renderer->captureValid = false;
+    renderer->captureRequested = true;
+    return true;
+}
+
+bool RendererCaptureFrame_D3D12(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
+                                uint32_t *outWidth, uint32_t *outHeight)
+{
+    if (!RendererCanCaptureFrame_D3D12(renderer) || outPixels == NULL || renderer->frameRecording ||
+        !renderer->captureValid || renderer->captureReadback == NULL)
+        return false;
+    const uint32_t width = renderer->captureWidth;
+    const uint32_t height = renderer->captureHeight;
+    if (outWidth != NULL)
+        *outWidth = width;
+    if (outHeight != NULL)
+        *outHeight = height;
+    if (width == 0u || height == 0u || width > UINT32_MAX / 4u ||
+        (uint64_t)width * 4u > UINT32_MAX / height)
+        return false;
+    const uint64_t required = (uint64_t)width * height * 4u;
+    if (required > capacityBytes || required > SIZE_MAX ||
+        required > UINTPTR_MAX - (uintptr_t)outPixels || renderer->captureFenceValue == 0u ||
+        renderer->captureFenceValue == UINT64_MAX)
+        return false;
+    UINT64 completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+    if (completed == UINT64_MAX || FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+        return false;
+    if (completed < renderer->captureFenceValue)
+    {
+        if (FAILED(ID3D12Fence_SetEventOnCompletion(renderer->fence, renderer->captureFenceValue,
+                                                    renderer->fenceEvent)) ||
+            WaitForSingleObject(renderer->fenceEvent, 5000u) != WAIT_OBJECT_0)
+            return false;
+        completed = ID3D12Fence_GetCompletedValue(renderer->fence);
+        if (completed == UINT64_MAX || completed < renderer->captureFenceValue)
+            return false;
+    }
+    if (FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device)))
+        return false;
+    const D3D12_RANGE readRange = {.Begin = 0u, .End = (SIZE_T)renderer->captureReadbackBytes};
+    uint8_t *mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(renderer->captureReadback, 0u, &readRange, (void **)&mapped)))
+        return false;
+    const size_t rowBytes = (size_t)width * 4u;
+    for (uint32_t row = 0u; row < height; ++row)
+        memcpy((uint8_t *)outPixels + (size_t)row * rowBytes,
+               mapped + (size_t)renderer->captureFootprint.Offset +
+                   (size_t)row * renderer->captureFootprint.Footprint.RowPitch,
+               rowBytes);
+    const D3D12_RANGE writtenRange = {0u, 0u};
+    ID3D12Resource_Unmap(renderer->captureReadback, 0u, &writtenRange);
+    return true;
+}
+
+void RendererGetGpuTiming_D3D12(const Renderer *renderer,
+                                RendererGpuTimingV1 *outTiming)
+{
+    if (outTiming == NULL)
+        return;
+    memset(outTiming, 0, sizeof(*outTiming));
+    outTiming->structSize = sizeof(*outTiming);
+    if (renderer == NULL || !renderer->gpuTimingSupported
+        || renderer->gpuTimingMapped == NULL || renderer->fence == NULL)
+        return;
+
+    outTiming->flags = RENDERER_GPU_TIMING_SUPPORTED;
+    UINT64 completedValue = ID3D12Fence_GetCompletedValue(renderer->fence);
+    // UINT64_MAX means the device was removed; mapped query data is not trusted.
+    if (completedValue == UINT64_MAX)
+        return;
+
+    uint64_t bestFrameIndex = 0;
+    uint64_t bestDurationNanoseconds = 0;
+    for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
+    {
+        if (!renderer->gpuTimingPending[slot]
+            || renderer->gpuTimingFenceValues[slot] > completedValue
+            || renderer->gpuTimingFrameIndices[slot] <= bestFrameIndex)
+            continue;
+
+        UINT64 timestamps[2];
+        memcpy(timestamps,
+            renderer->gpuTimingMapped + (size_t)slot * 2u * sizeof(UINT64),
+            sizeof(timestamps));
+        if (timestamps[1] < timestamps[0])
+            continue;
+
+        UINT64 ticks = timestamps[1] - timestamps[0];
+        UINT64 wholeSeconds = ticks / renderer->gpuTimingFrequency;
+        UINT64 remainder = ticks % renderer->gpuTimingFrequency;
+        if (wholeSeconds > UINT64_MAX / 1000000000ull)
+            continue;
+
+        UINT64 duration = wholeSeconds * 1000000000ull;
+        UINT64 fractionalNanoseconds;
+        if (remainder <= UINT64_MAX / 1000000000ull)
+        {
+            fractionalNanoseconds = remainder * 1000000000ull
+                / renderer->gpuTimingFrequency;
+        }
+        else
+        {
+            fractionalNanoseconds = (UINT64)(((long double)remainder
+                / (long double)renderer->gpuTimingFrequency) * 1000000000.0L);
+        }
+        if (fractionalNanoseconds > UINT64_MAX - duration)
+            continue;
+
+        bestFrameIndex = renderer->gpuTimingFrameIndices[slot];
+        bestDurationNanoseconds = duration + fractionalNanoseconds;
+    }
+
+    if (bestFrameIndex != 0)
+    {
+        outTiming->flags |= RENDERER_GPU_TIMING_VALID;
+        outTiming->frameIndex = bestFrameIndex;
+        outTiming->durationNanoseconds = bestDurationNanoseconds;
+    }
+}
+
+void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled)
+{
+    renderer->verticalSyncEnabled = enabled;
+}
+
+bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer)
+{
+    return renderer->verticalSyncEnabled;
+}
+
+void RendererResize_D3D12(Renderer* renderer, int32_t width, int32_t height)
+{
+    if (renderer == NULL)
+        return;
+    renderer->captureValid = false;
+    renderer->captureRequested = false;
+    if (width <= 0 || height <= 0)
+    {
+        return;
+    }
+    renderer->resizeWidth = width;
+    renderer->resizeHeight = height;
+    renderer->resizeRequested = true;
+}
+
+static void ReleaseLoadedShader(void** loadedShader)
+{
+    if (*loadedShader != NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, *loadedShader);
+        *loadedShader = NULL;
+    }
+}
+
+static void* CopyShaderBytecode(const void* bytecode, uint32_t length)
+{
+    if (bytecode == NULL || length == 0)
+    {
+        return NULL;
+    }
+    void* copy = HeapAlloc(GetProcessHeap(), 0, length);
+    if (copy != NULL)
+    {
+        memcpy(copy, bytecode, length);
+    }
+    return copy;
+}
+
+static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
+                                               void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                               const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                               ID3D12PipelineState **outPipelineState)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->rootSignature;
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_CHUNK_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_CHUNK_VERTEX]
+                                         : (const void *)g_chunk_vs;
+    description.VS.BytecodeLength = shaders[LAIUE_SHADER_CHUNK_VERTEX] != NULL
+                                        ? lengths[LAIUE_SHADER_CHUNK_VERTEX]
+                                        : sizeof(g_chunk_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_CHUNK_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_CHUNK_PIXEL]
+                                         : (const void *)g_chunk_ps;
+    description.PS.BytecodeLength = shaders[LAIUE_SHADER_CHUNK_PIXEL] != NULL
+                                        ? lengths[LAIUE_SHADER_CHUNK_PIXEL]
+                                        : sizeof(g_chunk_ps);
+    description.RasterizerState.FillMode = renderer->wireframeEnabled
+        ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    description.RasterizerState.FrontCounterClockwise = FALSE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.DepthStencilState.DepthEnable = TRUE;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    description.DepthStencilState.StencilEnable = FALSE;
+    description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    description.SampleDesc.Count = 1;
+
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+}
+
+static bool CreateGenericPipelineState(Renderer *renderer,
+                                       ID3D12PipelineState **outPipelineState)
+{
+    if (renderer == NULL || outPipelineState == NULL)
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->genericRootSignature;
+    description.VS.pShaderBytecode = g_generic_vs;
+    description.VS.BytecodeLength = sizeof(g_generic_vs);
+    description.PS.pShaderBytecode = g_generic_ps;
+    description.PS.BytecodeLength = sizeof(g_generic_ps);
+    description.RasterizerState.FillMode = renderer->wireframeEnabled
+        ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.FrontCounterClockwise = FALSE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.DepthStencilState.DepthEnable = TRUE;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    description.SampleDesc.Count = 1;
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState,
+        (void **)outPipelineState));
+}
+
+static bool RecreateChunkPipelineState(Renderer *renderer)
+{
+    ID3D12PipelineState *replacement = NULL;
+    if (!CreateChunkPipelineStateForShaders(renderer, renderer->loadedShaders,
+                                            renderer->loadedShaderLengths, &replacement))
+        return false;
+    if (renderer->pipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->pipelineState);
+    renderer->pipelineState = replacement;
+    // Старый PSO освобождён: сохранённая привязка больше не описывает
+    // состояние командного списка.
+    renderer->boundPipelineState = NULL;
+    return true;
+}
+
+static bool RecreateGenericPipelineState(Renderer *renderer)
+{
+    ID3D12PipelineState *replacement = NULL;
+    if (!CreateGenericPipelineState(renderer, &replacement))
+        return false;
+    if (renderer->genericPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->genericPipelineState);
+    renderer->genericPipelineState = replacement;
+    renderer->boundPipelineState = NULL;
+    return true;
+}
+
+static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
+                                                 void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                                 const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                                 ID3D12PipelineState **outPipelineState)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->resolveRootSignature;
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_PANORAMA_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_PANORAMA_VERTEX]
+                                         : (const void *)g_panorama_vs;
+    description.VS.BytecodeLength = shaders[LAIUE_SHADER_PANORAMA_VERTEX] != NULL
+                                        ? lengths[LAIUE_SHADER_PANORAMA_VERTEX]
+                                        : sizeof(g_panorama_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_PANORAMA_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_PANORAMA_PIXEL]
+                                         : (const void *)g_panorama_ps;
+    description.PS.BytecodeLength = shaders[LAIUE_SHADER_PANORAMA_PIXEL] != NULL
+                                        ? lengths[LAIUE_SHADER_PANORAMA_PIXEL]
+                                        : sizeof(g_panorama_ps);
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    description.SampleDesc.Count = 1;
+
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+}
+
+static bool CreateUiPipelineStateForShaders(Renderer *renderer,
+                                            void *const shaders[LAIUE_SHADER_SLOT_COUNT],
+                                            const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT],
+                                            ID3D12PipelineState **outPipelineState)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description;
+    memset(&description, 0, sizeof(description));
+    description.pRootSignature = renderer->uiRootSignature;
+    description.VS.pShaderBytecode = shaders[LAIUE_SHADER_UI_VERTEX] != NULL
+                                         ? shaders[LAIUE_SHADER_UI_VERTEX]
+                                         : (const void *)g_ui_vs;
+    description.VS.BytecodeLength =
+        shaders[LAIUE_SHADER_UI_VERTEX] != NULL ? lengths[LAIUE_SHADER_UI_VERTEX] : sizeof(g_ui_vs);
+    description.PS.pShaderBytecode = shaders[LAIUE_SHADER_UI_PIXEL] != NULL
+                                         ? shaders[LAIUE_SHADER_UI_PIXEL]
+                                         : (const void *)g_ui_ps;
+    description.PS.BytecodeLength =
+        shaders[LAIUE_SHADER_UI_PIXEL] != NULL ? lengths[LAIUE_SHADER_UI_PIXEL] : sizeof(g_ui_ps);
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+
+    D3D12_RENDER_TARGET_BLEND_DESC* blend = &description.BlendState.RenderTarget[0];
+    blend->BlendEnable = TRUE;
+    blend->SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    blend->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    blend->BlendOp = D3D12_BLEND_OP_ADD;
+    blend->SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    blend->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    description.SampleMask = 0xFFFFFFFF;
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    description.SampleDesc.Count = 1;
+
+    *outPipelineState = NULL;
+    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
+        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+}
+
+bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)
+{
+    if (renderer == NULL)
+    {
+        return false;
+    }
+
+    if (!renderer->worldReady)
+    {
+        renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
+        return true;
+    }
+
+    BlockTextureReplacement replacement;
+    bool succeeded = CreateBlockTextureReplacement(renderer, catalog, true, &replacement);
+    renderer->texturePackLoadStatus = replacement.status;
+    if (!succeeded)
+    {
+        return false;
+    }
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+    if (renderer->blockTextureUpload != NULL)
+        ID3D12Resource_Release(renderer->blockTextureUpload);
+    if (renderer->blockTexture != NULL)
+        ID3D12Resource_Release(renderer->blockTexture);
+    if (renderer->blockNormalUpload != NULL)
+        ID3D12Resource_Release(renderer->blockNormalUpload);
+    if (renderer->blockNormalTexture != NULL)
+        ID3D12Resource_Release(renderer->blockNormalTexture);
+    CommitBlockTexture(renderer, &replacement);
+    return true;
+}
+
+bool RendererReloadTexturePack_D3D12(Renderer *renderer)
+{
+    return RendererReloadTexturePackFrom_D3D12(renderer, LaiueContentCatalogDefault());
+}
+
+RendererContentStatus RendererGetTexturePackLoadStatus_D3D12(
+    const Renderer* renderer)
+{
+    return renderer != NULL ? renderer->texturePackLoadStatus
+        : RENDERER_CONTENT_NOT_ATTEMPTED;
+}
+
+void RendererSetWireframe_D3D12(Renderer* renderer, bool enabled)
+{
+    if (renderer == NULL || renderer->wireframeEnabled == enabled)
+    {
+        return;
+    }
+    renderer->wireframeEnabled = enabled;
+
+    if (!renderer->worldReady) return;
+
+    WaitForGpu(renderer);
+    (void)RecreateChunkPipelineState(renderer);
+    (void)RecreateGenericPipelineState(renderer);
+}
+
+bool RendererIsWireframe_D3D12(const Renderer* renderer)
+{
+    return renderer != NULL && renderer->wireframeEnabled;
+}
+
+static void ReleaseShaderArray(void *shaders[LAIUE_SHADER_SLOT_COUNT])
+{
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+        ReleaseLoadedShader(&shaders[index]);
+}
+
+bool RendererReloadShaderSet_D3D12(Renderer *renderer, const LaiueShaderSet *shaderSet)
+{
+    if (renderer == NULL)
+    {
+        return false;
+    }
+
+    LaiueShaderSet fallbackSet;
+    if (shaderSet == NULL)
+    {
+        LaiueShaderSetInitialize(&fallbackSet);
+        shaderSet = &fallbackSet;
+    }
+    if (!LaiueShaderSetIsValid(shaderSet))
+    {
+        return false;
+    }
+
+    void *replacementShaders[LAIUE_SHADER_SLOT_COUNT] = {0};
+    uint32_t replacementLengths[LAIUE_SHADER_SLOT_COUNT] = {0};
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if ((shaderSet->overrideMask & (1U << index)) == 0U)
+            continue;
+        replacementShaders[index] = CopyShaderBytecode(shaderSet->bytecode[index].bytes,
+                                                       shaderSet->bytecode[index].sizeBytes);
+        if (replacementShaders[index] == NULL)
+        {
+            ReleaseShaderArray(replacementShaders);
+            return false;
+        }
+        replacementLengths[index] = shaderSet->bytecode[index].sizeBytes;
+    }
+
+    ID3D12PipelineState *replacementChunk = NULL;
+    ID3D12PipelineState *replacementResolve = NULL;
+    ID3D12PipelineState *replacementUi = NULL;
+    bool pipelinesCreated =
+        !renderer->worldReady ||
+        (CreateChunkPipelineStateForShaders(renderer, replacementShaders, replacementLengths,
+                                            &replacementChunk) &&
+         CreateResolvePipelineStateForShaders(renderer, replacementShaders, replacementLengths,
+                                              &replacementResolve));
+    pipelinesCreated =
+        pipelinesCreated && CreateUiPipelineStateForShaders(renderer, replacementShaders,
+                                                            replacementLengths, &replacementUi);
+    if (!pipelinesCreated)
+    {
+        if (replacementChunk != NULL)
+            ID3D12PipelineState_Release(replacementChunk);
+        if (replacementResolve != NULL)
+            ID3D12PipelineState_Release(replacementResolve);
+        if (replacementUi != NULL)
+            ID3D12PipelineState_Release(replacementUi);
+        ReleaseShaderArray(replacementShaders);
+        return false;
+    }
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+    if (renderer->worldReady)
+    {
+        if (renderer->pipelineState != NULL)
+            ID3D12PipelineState_Release(renderer->pipelineState);
+        if (renderer->resolvePipelineState != NULL)
+            ID3D12PipelineState_Release(renderer->resolvePipelineState);
+        renderer->pipelineState = replacementChunk;
+        renderer->resolvePipelineState = replacementResolve;
+    }
+    if (renderer->uiPipelineState != NULL)
+        ID3D12PipelineState_Release(renderer->uiPipelineState);
+    renderer->uiPipelineState = replacementUi;
+    // Все графические PSO могли быть освобождены и пересозданы: кэш
+    // привязки невалиден.
+    renderer->boundPipelineState = NULL;
+
+    ReleaseShaderArray(renderer->loadedShaders);
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        renderer->loadedShaders[index] = replacementShaders[index];
+        renderer->loadedShaderLengths[index] = replacementLengths[index];
+        replacementShaders[index] = NULL;
+    }
+    return true;
+}
+
+bool RendererReloadShaderPackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog,
+                                  ShaderPackLoadStatus *outStatus)
+{
+    if (outStatus != NULL)
+        *outStatus = SHADER_PACK_LOAD_IO_ERROR;
+    if (renderer == NULL || catalog == NULL)
+        return false;
+
+    ShaderPackLoadStatus status = SHADER_PACK_LOAD_NOT_ATTEMPTED;
+    ShaderPackLoadedSet *loadedSet = ShaderPackLoadActiveSet(catalog, &status);
+    if (loadedSet == NULL)
+    {
+        if (status != SHADER_PACK_LOAD_NO_ACTIVE_PACK)
+        {
+            if (outStatus != NULL)
+                *outStatus = status;
+            return false;
+        }
+        if (!RendererReloadShaderSet_D3D12(renderer, NULL))
+        {
+            if (outStatus != NULL)
+                *outStatus = SHADER_PACK_LOAD_PIPELINE_ERROR;
+            return false;
+        }
+        if (outStatus != NULL)
+            *outStatus = status;
+        return true;
+    }
+
+    bool reloaded = RendererReloadShaderSet_D3D12(renderer, ShaderPackLoadedSetGet(loadedSet));
+    ShaderPackLoadedSetRelease(loadedSet);
+    if (!reloaded)
+        status = SHADER_PACK_LOAD_PIPELINE_ERROR;
+    if (outStatus != NULL)
+        *outStatus = status;
+    return reloaded;
+}
+
+bool RendererReloadShaderPack_D3D12(Renderer *renderer, ShaderPackLoadStatus *outStatus)
+{
+    return RendererReloadShaderPackFrom_D3D12(renderer, LaiueContentCatalogDefault(), outStatus);
+}
+
+bool RendererReloadShaders_D3D12(Renderer *renderer, const void *chunkVS, uint32_t chunkVSLength,
+                           const void *chunkPS, uint32_t chunkPSLength, const void *panoramaVS,
+                           uint32_t panoramaVSLength, const void *panoramaPS,
+                           uint32_t panoramaPSLength, const void *uiVS, uint32_t uiVSLength,
+                           const void *uiPS, uint32_t uiPSLength)
+{
+    const void *bytecodes[LAIUE_SHADER_SLOT_COUNT] = {
+        chunkVS, chunkPS, panoramaVS, panoramaPS, uiVS, uiPS,
+    };
+    const uint32_t lengths[LAIUE_SHADER_SLOT_COUNT] = {
+        chunkVSLength, chunkPSLength, panoramaVSLength, panoramaPSLength, uiVSLength, uiPSLength,
+    };
+    LaiueShaderSet shaderSet;
+    LaiueShaderSetInitialize(&shaderSet);
+    for (uint32_t index = 0; index < (uint32_t)LAIUE_SHADER_SLOT_COUNT; ++index)
+    {
+        if (bytecodes[index] == NULL && lengths[index] == 0U)
+            continue;
+        if (!LaiueShaderSetSetOverride(&shaderSet, (LaiueShaderSlot)index, bytecodes[index],
+                                       lengths[index]))
+            return false;
+    }
+    return RendererReloadShaderSet_D3D12(renderer, &shaderSet);
+}
+
+// === Слой интерфейса ===
+
+_Static_assert(sizeof(RendererUiQuad) == UI_QUAD_BYTES,
+    "RendererUiQuad is part of the GPU format (shaders/ui.hlsl)");
+
+bool RendererUiSetFontAtlas_D3D12(Renderer* renderer,
+    const uint8_t* alphaPixels, uint32_t width, uint32_t height)
+{
+    if (renderer == NULL || renderer->frameRecording || alphaPixels == NULL ||
+        width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    // Замена атласа — редкое событие (смена масштаба интерфейса):
+    // честно дожидаемся GPU перед заменой текстуры и дескриптора.
+    // Вызывать вне пары BeginFrame/EndFrame.
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+
+    if (renderer->fontTextureUpload != NULL)
+    {
+        ID3D12Resource_Release(renderer->fontTextureUpload);
+        renderer->fontTextureUpload = NULL;
+    }
+    if (renderer->fontTexture != NULL)
+    {
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+    }
+    renderer->fontUploadPending = false;
+    renderer->fontReady = false;
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = width;
+    textureDescription.Height = height;
+    textureDescription.DepthOrArraySize = 1;
+    textureDescription.MipLevels = 1;
+    textureDescription.Format = DXGI_FORMAT_R8_UNORM;
+    textureDescription.SampleDesc.Count = 1;
+    textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &defaultHeap,
+        D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->fontTexture)))
+    {
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    memset(&layout, 0, sizeof(layout));
+    UINT64 uploadBytes = 0;
+    ID3D12Device_GetCopyableFootprints(renderer->device, &textureDescription,
+        0, 1, 0, &layout, NULL, NULL, &uploadBytes);
+
+    D3D12_RESOURCE_DESC uploadDescription;
+    memset(&uploadDescription, 0, sizeof(uploadDescription));
+    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDescription.Width = uploadBytes;
+    uploadDescription.Height = 1;
+    uploadDescription.DepthOrArraySize = 1;
+    uploadDescription.MipLevels = 1;
+    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    uploadDescription.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device, &uploadHeap,
+        D3D12_HEAP_FLAG_NONE, &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
+        NULL, &IID_ID3D12Resource, (void**)&renderer->fontTextureUpload)))
+    {
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+        return false;
+    }
+
+    D3D12_RANGE emptyRange = { 0, 0 };
+    unsigned char* mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(renderer->fontTextureUpload, 0,
+        &emptyRange, (void**)&mapped)))
+    {
+        ID3D12Resource_Release(renderer->fontTextureUpload);
+        renderer->fontTextureUpload = NULL;
+        ID3D12Resource_Release(renderer->fontTexture);
+        renderer->fontTexture = NULL;
+        return false;
+    }
+
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
+            alphaPixels + (size_t)row * width, width);
+    }
+    ID3D12Resource_Unmap(renderer->fontTextureUpload, 0, NULL);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = DXGI_FORMAT_R8_UNORM;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    viewDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2D.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device, renderer->fontTexture,
+        &viewDescription, SrvCpuHandle(renderer, SRV_SLOT_FONT_ATLAS));
+
+    renderer->fontUploadPending = true;
+    return true;
+}
+
+bool RendererUiLoadBackground_D3D12(Renderer* renderer, const wchar_t* path,
+    uint32_t* outWidth, uint32_t* outHeight)
+{
+    if (renderer == NULL || path == NULL) return false;
+
+    uint8_t* pixels = NULL;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!UiImageLoadRgba(path, &pixels, &width, &height)) return false;
+
+    WaitForGpu(renderer);
+    DrainDeferredReleases(renderer, true);
+    if (renderer->backgroundTextureUpload != NULL)
+    {
+        ID3D12Resource_Release(renderer->backgroundTextureUpload);
+        renderer->backgroundTextureUpload = NULL;
+    }
+    if (renderer->backgroundTexture != NULL)
+    {
+        ID3D12Resource_Release(renderer->backgroundTexture);
+        renderer->backgroundTexture = NULL;
+    }
+    renderer->backgroundUploadPending = false;
+    renderer->backgroundReady = false;
+
+    D3D12_RESOURCE_DESC textureDescription;
+    memset(&textureDescription, 0, sizeof(textureDescription));
+    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDescription.Width = width;
+    textureDescription.Height = height;
+    textureDescription.DepthOrArraySize = 1;
+    textureDescription.MipLevels = 1;
+    textureDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDescription.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES defaultHeap = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    bool succeeded = SUCCEEDED(ID3D12Device_CreateCommittedResource(
+        renderer->device, &defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &textureDescription, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+        &IID_ID3D12Resource, (void**)&renderer->backgroundTexture));
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    memset(&layout, 0, sizeof(layout));
+    UINT64 uploadBytes = 0;
+    if (succeeded)
+    {
+        ID3D12Device_GetCopyableFootprints(renderer->device,
+            &textureDescription, 0, 1, 0, &layout, NULL, NULL,
+            &uploadBytes);
+        D3D12_RESOURCE_DESC uploadDescription;
+        memset(&uploadDescription, 0, sizeof(uploadDescription));
+        uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDescription.Width = uploadBytes;
+        uploadDescription.Height = 1;
+        uploadDescription.DepthOrArraySize = 1;
+        uploadDescription.MipLevels = 1;
+        uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        uploadDescription.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES uploadHeap = {
+            .Type = D3D12_HEAP_TYPE_UPLOAD,
+        };
+        succeeded = SUCCEEDED(ID3D12Device_CreateCommittedResource(
+            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE,
+            &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource,
+            (void**)&renderer->backgroundTextureUpload));
+    }
+
+    if (succeeded)
+    {
+        D3D12_RANGE emptyRange = { 0, 0 };
+        uint8_t* mapped = NULL;
+        succeeded = SUCCEEDED(ID3D12Resource_Map(
+            renderer->backgroundTextureUpload, 0, &emptyRange,
+            (void**)&mapped));
+        if (succeeded)
+        {
+            uint32_t sourceStride = width * 4U;
+            for (uint32_t row = 0; row < height; ++row)
+            {
+                memcpy(mapped + layout.Offset
+                        + (size_t)row * layout.Footprint.RowPitch,
+                    pixels + (size_t)row * sourceStride, sourceStride);
+            }
+            ID3D12Resource_Unmap(renderer->backgroundTextureUpload, 0,
+                NULL);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, pixels);
+
+    if (!succeeded)
+    {
+        if (renderer->backgroundTextureUpload != NULL)
+        {
+            ID3D12Resource_Release(renderer->backgroundTextureUpload);
+            renderer->backgroundTextureUpload = NULL;
+        }
+        if (renderer->backgroundTexture != NULL)
+        {
+            ID3D12Resource_Release(renderer->backgroundTexture);
+            renderer->backgroundTexture = NULL;
+        }
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC viewDescription;
+    memset(&viewDescription, 0, sizeof(viewDescription));
+    viewDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    viewDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    viewDescription.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    viewDescription.Texture2D.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(renderer->device,
+        renderer->backgroundTexture, &viewDescription,
+        SrvCpuHandle(renderer, SRV_SLOT_UI_BACKGROUND));
+    renderer->backgroundUploadPending = true;
+    if (outWidth != NULL) *outWidth = width;
+    if (outHeight != NULL) *outHeight = height;
+    return true;
+}
+
+void RendererUiQueue_D3D12(Renderer* renderer, const RendererUiQuad* quads, uint32_t count)
+{
+    if (quads == NULL || count == 0)
+    {
+        return;
+    }
+
+    uint32_t space = RENDERER_UI_MAX_QUADS - renderer->uiQuadCount;
+    if (count > space)
+    {
+        count = space;
+    }
+    if (count == 0)
+    {
+        return;
+    }
+
+    memcpy(renderer->uiQuadMapped[renderer->frameIndex]
+            + (size_t)renderer->uiQuadCount * UI_QUAD_BYTES,
+        quads, (size_t)count * UI_QUAD_BYTES);
+    renderer->uiQuadCount += count;
+}

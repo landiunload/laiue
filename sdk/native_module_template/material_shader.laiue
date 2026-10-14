@@ -1,0 +1,9 @@
+LAIUE MODULE 1
+id = example.material.shader
+author = example.author
+version = 1.0.0
+platform = windows-x86_64
+binary = example_material_shader.dll
+provides = example.material.shader:1
+requires = laiue.graphics.device:1
+optional = false

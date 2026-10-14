@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest an improvement to the engine
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Game rules, networking and world generation belong to applications, not to the engine.
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposal
+      description: How should the engine help? API sketches are welcome.

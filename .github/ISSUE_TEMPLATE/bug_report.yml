@@ -1,0 +1,32 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code, commands or data.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Commit
+      placeholder: 1a2b3c4
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Platform
+      placeholder: Windows 11 x64, MSVC 19.51, D3D12
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Logs
+      render: text

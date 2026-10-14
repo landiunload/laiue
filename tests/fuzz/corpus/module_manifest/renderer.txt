@@ -1,0 +1,10 @@
+# comments are ignored
+LAIUE MODULE 1
+id = example.renderer
+author = example.author
+version = 1.0.0
+platform = windows-x86_64
+binary = example_renderer.dll
+provides = example.graphics:1
+requires = example.window:2
+optional = false

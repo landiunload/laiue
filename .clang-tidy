@@ -1,0 +1,26 @@
+# Disabled checks do not fit this C codebase:
+# - casting-through-void: the suggested C++ cast forms do not apply in C.
+# - no-int-to-ptr: Win32 passes pointers as LPARAM and LONG_PTR.
+# - DeprecatedOrUnsafeBufferHandling: wants Annex K memcpy_s, which glibc,
+#   musl and Apple libc do not provide.
+# - EnumCastOutOfRange: D3D12 and Vulkan flag enums combine their values.
+# - avoid-pragma-once: every supported compiler implements #pragma once.
+# Reserved names that the platform defines: feature-test macros and the
+# no-CRT _fltused symbol.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-casting-through-void,
+  -performance-no-int-to-ptr,
+  -portability-avoid-pragma-once,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-optin.core.EnumCastOutOfRange
+CheckOptions:
+  bugprone-reserved-identifier.AllowedIdentifiers: '_POSIX_C_SOURCE;_DARWIN_C_SOURCE;_fltused'
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src[/\\].*'
+FormatStyle: file
