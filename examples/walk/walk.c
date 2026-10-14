@@ -913,16 +913,21 @@ static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host, LaiueModuleLoadR
 #if defined(LAIUE_WALK_DYNAMIC)
     const char *names[12] = {"character", "numeric", "world", "voxel"};
     uint32_t nameCount = 4u;
-    const char *renderModuleId = NULL;
+    LaiueModuleNamedProfileV1 profile = {
+        .structSize = sizeof(profile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .names = names,
+    };
 #if defined(LAIUE_WALK_WINDOWED)
 #if defined(LAIUE_WALK_GRAPHICS_PROVIDER_D3D12)
     const char *renderName = "graphics_d3d12";
-    renderModuleId = "laiue.graphics.d3d12";
+    const char *renderModuleId = "laiue.graphics.d3d12";
 #elif defined(LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN)
     const char *renderName = "graphics_vulkan";
-    renderModuleId = "laiue.graphics.vulkan";
+    const char *renderModuleId = "laiue.graphics.vulkan";
 #else
     const char *renderName = "render";
+    const char *renderModuleId = NULL;
 #endif
     names[nameCount++] = "window";
     names[nameCount++] = "input";
@@ -932,8 +937,6 @@ static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host, LaiueModuleLoadR
     names[nameCount++] = "ui";
     names[nameCount++] = "scene_math";
     names[nameCount++] = "scene";
-#endif
-    LaiueModuleLoadReportInitialize(report, reportEntries, nameCount);
     /* The executable chooses exactly one standalone provider at configure
      * time and pins its descriptor.  If that artifact is removed or cannot
      * be loaded (no Vulkan loader on the system), the partial profile only
@@ -944,14 +947,14 @@ static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host, LaiueModuleLoadR
         .serviceName = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
         .moduleId = renderModuleId,
     };
-    const LaiueModuleNamedProfileV1 profile = {
-        .structSize = sizeof(profile),
-        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-        .names = names,
-        .nameCount = nameCount,
-        .providerSelections = renderModuleId != NULL ? &graphicsSelection : NULL,
-        .providerSelectionCount = renderModuleId != NULL ? 1u : 0u,
-    };
+    if (renderModuleId != NULL)
+    {
+        profile.providerSelections = &graphicsSelection;
+        profile.providerSelectionCount = 1u;
+    }
+#endif
+    profile.nameCount = nameCount;
+    LaiueModuleLoadReportInitialize(report, reportEntries, nameCount);
     return LaiueModuleHostLoadNamedProfileV1(host, &profile, report, diagnostic);
 #else
     (void)report;
