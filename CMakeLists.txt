@@ -135,12 +135,13 @@ add_library(laiue_bootstrap STATIC
 add_library(laiue::bootstrap ALIAS laiue_bootstrap)
 target_include_directories(laiue_bootstrap
     PUBLIC ${LAIUE_PUBLIC_INCLUDE_DIRECTORIES})
-# The engine's compile rules apply to the archive itself, but its no-CRT link
-# options must not reach the application that links it: that application
-# chooses its own C runtime, exactly as with the SDK package.
+# The engine's compile rules apply to the archive itself, but neither its
+# no-CRT link options nor its no-CRT memcpy/memset objects may reach the
+# application that links it: that application chooses its own C runtime.
+# Engine executables without a CRT get those objects from laiue_common.
 target_link_libraries(laiue_bootstrap
     PRIVATE
-        $<COMPILE_ONLY:laiue_common>
+        $<COMPILE_ONLY:laiue::build_options>
         laiue::platform_support)
 # Public, as in the SDK package: its consumers call these functions directly
 # from the static archive, not through a DLL import.
@@ -462,6 +463,14 @@ if(BUILD_TESTING)
     if(TARGET laiue_static_core_link_smoke)
         add_test(NAME laiue.build.static_core_link
             COMMAND laiue_static_core_link_smoke)
+    endif()
+    if(LAIUE_PLATFORM_WINDOWS)
+        add_test(NAME laiue.build.bootstrap_without_runtime
+            COMMAND "${CMAKE_COMMAND}"
+                "-DARCHIVER=${CMAKE_AR}"
+                "-DARCHIVE=$<TARGET_FILE:laiue_bootstrap>"
+                "-DFORBIDDEN=$<JOIN:$<TARGET_OBJECTS:laiue_runtime>,|>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_archive_members.cmake")
     endif()
     if(LAIUE_ENABLE_SDK_INSTALL_RESOLVED)
         add_test(NAME laiue.install.consumer

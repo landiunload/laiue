@@ -28,6 +28,8 @@ API and ABI may change between minor versions.
 - A source-tree build exposes the same include paths and the same
   `LAIUE_STATIC` definition of `laiue::bootstrap` as the SDK, so an
   application builds unchanged against either.
+- The bootstrap archive no longer carries the engine's no-CRT `memcpy` and
+  `memmove`; an application linked with its C runtime and LTCG got them twice.
 
 ## 0.1.0
 
