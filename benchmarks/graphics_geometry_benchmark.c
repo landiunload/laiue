@@ -224,7 +224,8 @@ LAIUE_TEST_ENTRY(GraphicsGeometryBenchmarkEntryPoint)
                     elapsedTotal += Record(device, &item, counts[workload], batch, repetitions);
                     Require(device->endFrame(device) != 0u, "timed frame");
                     stats = Stats(device);
-                    Require(stats.drawCalls == repetitions * (batch ? 1u : counts[workload]),
+                    Require(stats.drawCalls ==
+                                (uint64_t)repetitions * (batch ? 1u : counts[workload]),
                             "draw call count");
                     if (sample == 0u && frame == 0u)
                     {
