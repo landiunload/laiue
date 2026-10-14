@@ -147,9 +147,12 @@ target_link_libraries(laiue_bootstrap
 # from the static archive, not through a DLL import.
 target_compile_definitions(laiue_bootstrap PUBLIC LAIUE_STATIC=1)
 laiue_define_module_artifact_names(laiue_bootstrap)
+# An application links this archive with its own compiler, so it carries
+# ordinary machine code rather than LTO objects of the engine's compiler.
 set_target_properties(laiue_bootstrap PROPERTIES
     EXPORT_NAME bootstrap
-    POSITION_INDEPENDENT_CODE ON)
+    POSITION_INDEPENDENT_CODE ON
+    LAIUE_PORTABLE_ARCHIVE ON)
 
 # Public contracts for optional technology providers. These are intentionally
 # header-only interface targets: applications can compile a provider without

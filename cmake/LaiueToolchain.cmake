@@ -401,36 +401,42 @@ else()
     add_library(laiue_runtime INTERFACE)
 endif()
 
+# Archives handed to applications (bootstrap and its platform boundary) carry
+# ordinary machine code: an LTO object links only with the exact compiler
+# that produced it, and the application picks its own. Such targets set
+# LAIUE_PORTABLE_ARCHIVE; the LTO compile flags below skip them.
+set(_laiue_lto_compile
+    "$<AND:$<CONFIG:Release>,$<NOT:$<BOOL:$<TARGET_PROPERTY:LAIUE_PORTABLE_ARCHIVE>>>>")
 if(LAIUE_ENABLE_LTO)
     if(LAIUE_PLATFORM_WINDOWS OR MSVC)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/GL>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=${LAIUE_CLANG_LTO_MODE}>)
+            $<$<AND:$<C_COMPILER_ID:MSVC>,${_laiue_lto_compile}>:/GL>
+            $<$<AND:$<C_COMPILER_ID:Clang>,${_laiue_lto_compile}>:-flto=${LAIUE_CLANG_LTO_MODE}>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>
             $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/OPT:LLDLTO=3 /OPT:LLDLTOCGO=3>)
     elseif(LAIUE_PLATFORM_POSIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,${_laiue_lto_compile}>:-flto>
+            $<$<AND:$<C_COMPILER_ID:Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto;-flto-partition=one>
             $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_POSIX AND APPLE)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_EXTERNAL AND
            CMAKE_SYSTEM_NAME MATCHES "^(Android|iOS|tvOS|visionOS)$")
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_EXTERNAL)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto>
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,${_laiue_lto_compile}>:-flto>
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto;-flto-partition=one>
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)

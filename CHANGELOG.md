@@ -30,6 +30,9 @@ API and ABI may change between minor versions.
   application builds unchanged against either.
 - The bootstrap archive no longer carries the engine's no-CRT `memcpy` and
   `memmove`; an application linked with its C runtime and LTCG got them twice.
+- The bootstrap and platform archives are compiled without LTO, so an
+  application links them with its own compiler; the Linux SDK built with
+  Clang could not be linked by GCC.
 
 ## 0.1.0
 
