@@ -210,7 +210,8 @@ jobs:
         shell: pwsh
         run: |
           cmake --preset windows-msvc-arm64 -B build/windows-msvc-arm64-armv8.0 `
-            "-DLAIUE_WINDOWS_ARM64_BASELINE=armv8.0" -DLAIUE_BUILD_EXAMPLES=ON
+            "-DLAIUE_WINDOWS_ARM64_BASELINE=armv8.0" -DLAIUE_BUILD_EXAMPLES=ON `
+            "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
           if ($LASTEXITCODE -ne 0) { throw 'ARMv8.0 configure failed' }
           foreach ($configuration in 'Debug', 'Release') {
             cmake --build build/windows-msvc-arm64-armv8.0 --config $configuration --parallel
