@@ -18,6 +18,13 @@ permissions:
 env:
   LLVM_VERSION: '22'
   ANDROID_NDK_VERSION: 30.0.16248370
+  # DXC собирает встроенные шейдеры; checked-in байткод обязан совпадать
+  # с выводом именно этого релиза.
+  DXC_RELEASE: v1.9.2609
+  DXC_WINDOWS_ASSET: dxc_2026_09_29.zip
+  DXC_WINDOWS_SHA256: ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
+  DXC_LINUX_ASSET: linux_dxc_2026_09_28.x86_x64.tar.gz
+  DXC_LINUX_SHA256: 96faadc7f5c282d2ffda49804beb4c3ee38127bc252b723234e3c5cdf7aa39a1
 
 jobs:
   windows-engine:
@@ -50,10 +57,26 @@ jobs:
             "$name=$([Environment]::GetEnvironmentVariable($name))" |
               Out-File $env:GITHUB_ENV -Append
           }
+      - &install-windows-dxc
+        name: Install pinned DXC
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          curl.exe --fail --location --retry 3 --retry-all-errors --output $archive `
+            "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$env:DXC_RELEASE/$env:DXC_WINDOWS_ASSET"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $env:DXC_WINDOWS_SHA256) {
+            throw 'DXC archive checksum mismatch'
+          }
+          Expand-Archive $archive (Join-Path $env:RUNNER_TEMP 'dxc')
+          $architecture = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $dxc = Join-Path $env:RUNNER_TEMP "dxc\bin\$architecture\dxc.exe"
+          & $dxc --version
+          "LAIUE_DXC=$dxc" | Out-File $env:GITHUB_ENV -Append
       - name: Configure
         run: >
           cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
           -DLAIUE_REQUIRE_D3D12_TEST_DRIVER=ON
+          "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -153,12 +176,19 @@ jobs:
           if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
             throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
           }
+      - *install-windows-dxc
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
+        run: >
+          cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
+          "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
         run: ctest --preset ${{ matrix.preset }}-debug --parallel --no-tests=error
+      - name: Verify checked-in shaders
+        run: >
+          cmake --build --preset ${{ matrix.preset }}-debug
+          --target laiue_verify_shaders
       - name: Build Release
         run: cmake --build --preset ${{ matrix.preset }}-release --parallel
       - name: Test Release
@@ -293,8 +323,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            glslang-tools libvulkan-dev mesa-vulkan-drivers spirv-tools \
-            vulkan-validationlayers libx11-dev xvfb xauth
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers \
+            libx11-dev xvfb xauth
+      - name: Install pinned DXC
+        run: |
+          curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
+            "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_RELEASE/$DXC_LINUX_ASSET" \
+            --output "$RUNNER_TEMP/dxc.tar.gz"
+          printf '%s  %s\n' "$DXC_LINUX_SHA256" "$RUNNER_TEMP/dxc.tar.gz" | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/dxc"
+          tar -xzf "$RUNNER_TEMP/dxc.tar.gz" -C "$RUNNER_TEMP/dxc"
+          dxc="$(find "$RUNNER_TEMP/dxc" -type f -name dxc -perm -u+x | head -n 1)"
+          "$dxc" --version
+          echo "LAIUE_DXC=$dxc" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # С заголовками X11 профиль собирает и X11-окно с вводом: без них
       # эти модули выпадали из сборки, и их поломка оставалась незамеченной.
@@ -302,6 +343,7 @@ jobs:
         run: >
           cmake --preset linux-vulkan-offscreen
           -DLAIUE_REQUIRE_VULKAN_TEST_DRIVER=ON -DLAIUE_BUILD_EXAMPLES=ON
+          "-DLAIUE_DXC=$LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
       - name: Build Debug
         run: cmake --build --preset linux-vulkan-offscreen-debug --parallel
       # Кадр рисуется программным драйвером Mesa: GPU у раннера нет, но
@@ -358,9 +400,9 @@ jobs:
         run: >
           timeout 60s xvfb-run -a -s '-screen 0 960x540x24'
           build/linux-vulkan-offscreen/bin/Release/laiue_animation_demo
-      # Checked-in SPIR-V обязан совпадать с тем, что glslang выдаёт из
-      # HLSL: иначе сборка без компилятора шейдеров получила бы другой
-      # рендер, чем сборка с ним.
+      # Checked-in SPIR-V обязан совпадать с тем, что DXC выдаёт из HLSL:
+      # иначе сборка без компилятора шейдеров получила бы другой рендер,
+      # чем сборка с ним.
       - name: Verify checked-in SPIR-V matches the HLSL sources
         run: >
           cmake --build build/linux-vulkan-offscreen
@@ -675,7 +717,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "clang-$LLVM_VERSION" "clang-tidy-$LLVM_VERSION" \
-            glslang-tools libvulkan-dev libx11-dev
+            libvulkan-dev libx11-dev
       # Профиль Vulkan/X11 компилирует больше всего Linux-исходников; код
       # только для Windows проверяется тем же .clang-tidy в дереве clang-cl.
       - name: Configure with a compile database

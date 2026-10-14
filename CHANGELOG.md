@@ -3,6 +3,20 @@
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0 the
 API and ABI may change between minor versions.
 
+## Unreleased
+
+- Shaders compile with DXC for both backends: DXIL Shader Model 6.0 for
+  D3D12 and SPIR-V for Vulkan. fxc and glslang are no longer used.
+- Shader packs use contract 2: DXIL for D3D12, SPIR-V for Vulkan. Contract 1
+  packs with DXBC are rejected.
+- D3D12 requires a device with Shader Model 6.0 and falls back to WARP
+  without it.
+- Vulkan requests API 1.4. Generic draws use push descriptors on Vulkan 1.4
+  or with `VK_KHR_push_descriptor`, which removes the per-frame limit of 256
+  distinct descriptor sets.
+- Builds use the freshly compiled shaders; previously the checked-in copies
+  were always compiled in, and the build output was only verified.
+
 ## 0.1.0
 
 First public release.

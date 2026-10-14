@@ -7,7 +7,8 @@
 #include <stdint.h>
 
 #define SHADER_PACK_NAME_MAX LAIUE_CONTENT_NAME_CAPACITY
-#define LAIUE_SHADER_CONTRACT_VERSION 1u
+// Contract 2: DXIL Shader Model 6.0 for D3D12, SPIR-V for Vulkan.
+#define LAIUE_SHADER_CONTRACT_VERSION 2u
 #define LAIUE_SHADER_BYTECODE_MAX_BYTES 0x40000u
 
 // Every graphics pipeline owned by the renderer is represented explicitly.

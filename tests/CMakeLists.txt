@@ -396,6 +396,12 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12)
     laiue_add_harness(laiue_renderer_instance_ring_test RendererInstanceRingTestEntryPoint
         renderer_instance_ring_test.c LIBRARIES laiue_render laiue_content
         TEST laiue.render.instance_ring TIMEOUT 60 PROPERTIES SKIP_RETURN_CODE 125)
+    laiue_add_harness(laiue_renderer_d3d12_shader_contract_test
+        RendererD3D12ShaderContractTestEntryPoint renderer_d3d12_shader_contract_test.c
+        LIBRARIES laiue_render laiue_content
+        TEST laiue.render.d3d12_shader_contract TIMEOUT 60)
+    laiue_set_gpu_test_properties(${LAIUE_REQUIRE_D3D12_TEST_DRIVER}
+        laiue.render.d3d12_shader_contract)
 endif()
 if(TARGET laiue_ui)
     laiue_add_harness(laiue_ui_test UiTestEntryPoint ui_test.c LIBRARIES laiue_ui

@@ -249,7 +249,8 @@ target автоматически получает build-tools и `android.jar` 
 хранит ключ подписи. Renderer выбирает dynamic rendering на Vulkan 1.3 и
 совместимые render-pass/framebuffer на Vulkan 1.2; поэтому emulator с
 SwiftShader 1.2 также проходит NativeActivity smoke, не требуя 1.3-only
-расширений.
+расширений. Push descriptors Vulkan 1.4 (или `VK_KHR_push_descriptor`)
+используются, когда устройство их даёт, и не требуются.
 
 На Windows с динамическими модулями сборка также создаёт
 `laiue_graphics_d3d12.dll`. При найденном Vulkan SDK Linux/Windows собирают
@@ -267,7 +268,7 @@ GPU не обязателен: программный `lavapipe` из Mesa да�
 кадр проверяется в CI.
 
 ```sh
-sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers     spirv-tools vulkan-validationlayers
+sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 cmake --preset linux-vulkan-offscreen
 cmake --build --preset linux-vulkan-offscreen-release --parallel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json     ctest --preset linux-vulkan-offscreen-release --parallel --no-tests=error
@@ -285,22 +286,30 @@ VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation     ctest --preset linux-vul
 
 ### Шейдеры
 
-Исходник шейдера один и тот же HLSL в `shaders/`. Для D3D12 его собирает
-`fxc` в DXBC, для Vulkan — `glslang` в SPIR-V; результаты лежат в
-`src/graphics/render/generated/d3d12/` и `.../vulkan/` и хранятся в
-репозитории, поэтому сборка без компилятора шейдеров работает на любой
-платформе. Цель `laiue_verify_shaders` сверяет checked-in файлы с тем, что
-компилятор выдаёт из исходника, побайтово.
+Исходник шейдера один и тот же HLSL в `shaders/`, и один компилятор, DXC,
+собирает его под каждый бэкенд в сборке: DXIL Shader Model 6.0 для D3D12 и
+SPIR-V для Vulkan. Результаты лежат в `src/graphics/render/generated/d3d12/`
+и `.../vulkan/` массивами `uint32_t` и хранятся в репозитории, поэтому
+сборка без DXC работает на любой платформе.
 
-Раскладка дескрипторов задаётся сдвигами регистров, а не правкой HLSL:
-`fxc` не понимает `[[vk::binding]]`, а общий исходник важнее. Сдвиги
-переводят регистры в один descriptor set без коллизий — `b0` в binding 0,
-`t0`..`t3` в 1..4, `s0` в 5. `ByteAddressBuffer` относится к классу SSBO, а
-не текстур, поэтому ему нужен отдельный сдвиг с тем же значением: оба
-класса нумеруются в общем пространстве `t`-регистров.
+CMake ищет `dxc` в `PATH`, Vulkan SDK и Windows SDK; явный путь задаёт
+`-DLAIUE_DXC=<путь>`. Сборки DXC умеют разное: в DXC из Windows SDK нет
+SPIR-V, а DXC без валидатора не подписывает DXIL, который D3D12 тогда не
+примет. Поэтому для каждого бэкенда берётся первый кандидат, который
+собирает пробный шейдер; если подходящего нет, используется checked-in
+байткод, а `-DLAIUE_REQUIRE_SHADER_COMPILER=ON` делает это ошибкой
+конфигурации.
+Цель `laiue_verify_shaders` сверяет checked-in файлы с выводом компилятора
+побайтово. Совпадение гарантирует релиз DXC, закреплённый в CI
+(`DXC_RELEASE` в `.github/workflows/build.yml`).
 
-Правила упаковки констант HLSL glslang переносит в SPIR-V без изменений,
-поэтому структура констант кадра в C общая для обоих бэкендов. Ось Y
+Раскладка дескрипторов задаётся сдвигами регистров (`-fvk-*-shift`), а не
+атрибутами `[[vk::binding]]`: общий исходник остаётся без Vulkan-разметки.
+Сдвиги переводят регистры в один descriptor set без коллизий — `b0` в
+binding 0, `t0`..`t3` в 1..4, `s0` в 5.
+
+Смещения констант кадра, которые DXC даёт в SPIR-V, совпадают с упаковкой
+HLSL на D3D12, поэтому структура констант в C общая для обоих бэкендов. Ось Y
 возвращается к соглашению D3D отрицательной высотой viewport — иначе
 кадр оказался бы перевёрнут, а обход граней инвертирован.
 

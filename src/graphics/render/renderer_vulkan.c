@@ -3,7 +3,7 @@
 // переданном HWND/X11 handle/ANativeWindow создаёт соответствующую surface,
 // swapchain и present, не меняя публичный контракт.
 //
-// Шейдеры те же самые HLSL, скомпилированные glslang в SPIR-V. Регистры
+// Шейдеры те же самые HLSL, скомпилированные DXC в SPIR-V. Регистры
 // HLSL переводятся в один descriptor set сдвигами (cmake/LaiueShader.cmake):
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
@@ -126,8 +126,8 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define DEPTH_FORMAT VK_FORMAT_D32_SFLOAT
 
 // Константы кадра. Раскладка обязана совпадать с cbuffer в chunk.hlsl:
-// glslang переносит правила упаковки HLSL в SPIR-V без изменений, поэтому
-// смещения 0, 64, 76, 80, 92, 96, 112, 124 общие для обоих бэкендов.
+// смещения, которые DXC даёт в SPIR-V, совпадают с упаковкой HLSL на D3D12,
+// поэтому 0, 64, 76, 80, 92, 96, 112, 124 общие для обоих бэкендов.
 typedef struct ChunkConstants
 {
     float viewProjection[16];
@@ -334,6 +334,11 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     PFN_vkCmdBeginRendering cmdBeginRendering;
     PFN_vkCmdEndRendering cmdEndRendering;
     bool useDynamicRendering;
+    /* Vulkan 1.4 core or VK_KHR_push_descriptor.  When present, generic
+     * draws write their descriptors straight into the command buffer: no
+     * pool allocation, no per-frame set cache and no cap on distinct
+     * texture, sampler and mesh combinations in one frame. */
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet;
     VkRenderPass colorRenderPass;
     VkRenderPass depthRenderPass;
     VkFramebuffer colorFramebuffers[FRAME_COUNT];
@@ -369,7 +374,9 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     VkDescriptorSetLayout chunkSetLayout;
     VkDescriptorSetLayout resolveSetLayout;
     VkDescriptorSetLayout uiSetLayout;
+    VkDescriptorSetLayout genericPushSetLayout;
     VkPipelineLayout chunkPipelineLayout;
+    VkPipelineLayout genericPushPipelineLayout;
     VkPipelineLayout resolvePipelineLayout;
     VkPipelineLayout uiPipelineLayout;
     VkPipeline chunkPipeline;
@@ -1333,7 +1340,7 @@ static void DeferBufferRelease(Renderer *renderer, VkBuffer buffer, VkDeviceMemo
 static bool CreateShaderModule(Renderer *renderer, const void *bytes, uint32_t sizeBytes,
                                VkShaderModule *outModule)
 {
-    // Пак шейдеров, собранный под D3D12, содержит DXBC. Проверка сигнатуры
+    // Пак шейдеров, собранный под D3D12, содержит DXIL. Проверка сигнатуры
     // SPIR-V превращает это в понятный отказ вместо падения драйвера.
     if (bytes == NULL || sizeBytes < 20u || (sizeBytes % 4u) != 0u) return false;
     uint32_t magic = 0u;
@@ -1532,7 +1539,8 @@ static bool CreateGenericPipeline(Renderer *renderer, VkPipeline *outPipeline)
         .vertexFallbackBytes = (uint32_t)sizeof(g_generic_vs),
         .pixelFallback = g_generic_ps,
         .pixelFallbackBytes = (uint32_t)sizeof(g_generic_ps),
-        .layout = renderer->chunkPipelineLayout,
+        .layout = renderer->cmdPushDescriptorSet != NULL ? renderer->genericPushPipelineLayout
+                                                         : renderer->chunkPipelineLayout,
         .depthTest = true,
         .blend = false,
         // Generic geometry has no voxel-specific winding contract.  The
@@ -1655,7 +1663,38 @@ static bool CreateDescriptorLayouts(Renderer *renderer)
                                    pipelineLayouts[index]) != VK_SUCCESS)
             return false;
     }
-    return true;
+    if (renderer->cmdPushDescriptorSet == NULL) return true;
+
+    // Тот же generic.hlsl, но без dynamic-дескрипторов: push descriptors их
+    // не допускают, а смещения записываются в каждый дескриптор напрямую.
+    // Нормалей у generic-пути нет, поэтому binding 3 не объявлен.
+    VkDescriptorSetLayoutBinding genericBindings[] = {
+        { BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { BINDING_QUAD_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+          VK_SHADER_STAGE_VERTEX_BIT, NULL },
+        { BINDING_BLOCK_TEXTURES, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u,
+          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { BINDING_INSTANCES, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+          VK_SHADER_STAGE_VERTEX_BIT, NULL },
+        { BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo genericLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+        .bindingCount = (uint32_t)(sizeof(genericBindings) / sizeof(genericBindings[0])),
+        .pBindings = genericBindings,
+    };
+    if (vkCreateDescriptorSetLayout(renderer->device, &genericLayoutInfo, NULL,
+                                    &renderer->genericPushSetLayout) != VK_SUCCESS)
+        return false;
+    VkPipelineLayoutCreateInfo genericPipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1u,
+        .pSetLayouts = &renderer->genericPushSetLayout,
+    };
+    return vkCreatePipelineLayout(renderer->device, &genericPipelineLayoutInfo, NULL,
+                                  &renderer->genericPushPipelineLayout) == VK_SUCCESS;
 }
 
 static void WriteImageDescriptor(Renderer *renderer, VkDescriptorSet set, uint32_t binding,
@@ -2852,10 +2891,16 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     (void)windowHandle;
 #endif
 
+    // Наибольшая версия, возможности которой использует рендерер; устройства
+    // Vulkan 1.2 и 1.3 работают в пределах своей версии.
     VkApplicationInfo applicationInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "laiue",
+#if defined(VK_API_VERSION_1_4)
+        .apiVersion = VK_API_VERSION_1_4,
+#else
         .apiVersion = VK_API_VERSION_1_3,
+#endif
     };
     VkInstanceCreateInfo instanceInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -3012,10 +3057,48 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         renderer->useDynamicRendering = available13.dynamicRendering == VK_TRUE &&
                                         available13.synchronization2 == VK_TRUE;
     }
+    // Push descriptors — ядро Vulkan 1.4, на более старых устройствах —
+    // VK_KHR_push_descriptor. Без них generic-путь работает через кэш
+    // наборов дескрипторов, как раньше.
+    void *featureChain = NULL;
+    const char *pushDescriptorCommand = NULL;
+#if defined(VK_API_VERSION_1_4)
+    VkPhysicalDeviceVulkan14Features features14 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+        .pushDescriptor = VK_TRUE,
+    };
+    if (properties.apiVersion >= VK_API_VERSION_1_4)
+    {
+        VkPhysicalDeviceVulkan14Features available14 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+        };
+        VkPhysicalDeviceFeatures2 availableFeatures = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &available14,
+        };
+        vkGetPhysicalDeviceFeatures2(chosen, &availableFeatures);
+        if (available14.pushDescriptor == VK_TRUE)
+        {
+            featureChain = &features14;
+            pushDescriptorCommand = "vkCmdPushDescriptorSet";
+        }
+    }
+#endif
+    const char *deviceExtensions[2];
+    uint32_t deviceExtensionCount = 0u;
+    if (pushDescriptorCommand == NULL &&
+        DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
+    {
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+        pushDescriptorCommand = "vkCmdPushDescriptorSetKHR";
+    }
+    if (renderer->useDynamicRendering)
+    {
+        features13.pNext = featureChain;
+        featureChain = &features13;
+    }
     // VK_KHR_swapchain включается только при наличии поверхности: без неё
     // offscreen-путь не должен зависеть от оконного расширения.
-    const char *deviceExtensions[1];
-    uint32_t deviceExtensionCount = 0u;
     if (renderer->hasSurface)
     {
         if (!DeviceExtensionSupported(chosen, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return false;
@@ -3023,7 +3106,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = renderer->useDynamicRendering ? &features13 : NULL,
+        .pNext = featureChain,
         .queueCreateInfoCount = 1u,
         .pQueueCreateInfos = &queueInfo,
         .enabledExtensionCount = deviceExtensionCount,
@@ -3040,6 +3123,9 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         if (renderer->cmdBeginRendering == NULL || renderer->cmdEndRendering == NULL)
             return false;
     }
+    if (pushDescriptorCommand != NULL)
+        renderer->cmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(
+            renderer->device, pushDescriptorCommand);
     vkGetDeviceQueue(renderer->device, chosenFamily, 0u, &renderer->queue);
     CreateGpuTimingQueries(renderer);
 
@@ -3090,7 +3176,10 @@ static bool CreateDescriptorPool(Renderer *renderer)
 {
     const uint32_t chunkSetCount = MAX_POOL_BLOCKS * FRAME_COUNT *
                                    INSTANCE_MAX_CHUNKS_PER_FRAME;
-    const uint32_t genericSetCount = FRAME_COUNT * GENERIC_DESCRIPTOR_SET_CAPACITY;
+    // С push descriptors generic-наборы в пуле не нужны вовсе.
+    const uint32_t genericSetCount = renderer->cmdPushDescriptorSet != NULL
+                                         ? 0u
+                                         : FRAME_COUNT * GENERIC_DESCRIPTOR_SET_CAPACITY;
     VkDescriptorPoolSize sizes[] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, chunkSetCount + genericSetCount + 4u },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, chunkSetCount * 2u + genericSetCount * 2u + 4u },
@@ -3403,12 +3492,16 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             vkDestroyPipeline(renderer->device, renderer->uiPipeline, NULL);
         if (renderer->chunkPipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(renderer->device, renderer->chunkPipelineLayout, NULL);
+        if (renderer->genericPushPipelineLayout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(renderer->device, renderer->genericPushPipelineLayout, NULL);
         if (renderer->resolvePipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(renderer->device, renderer->resolvePipelineLayout, NULL);
         if (renderer->uiPipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(renderer->device, renderer->uiPipelineLayout, NULL);
         if (renderer->chunkSetLayout != VK_NULL_HANDLE)
             vkDestroyDescriptorSetLayout(renderer->device, renderer->chunkSetLayout, NULL);
+        if (renderer->genericPushSetLayout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(renderer->device, renderer->genericPushSetLayout, NULL);
         if (renderer->resolveSetLayout != VK_NULL_HANDLE)
             vkDestroyDescriptorSetLayout(renderer->device, renderer->resolveSetLayout, NULL);
         if (renderer->uiSetLayout != VK_NULL_HANDLE)
@@ -3947,6 +4040,59 @@ static bool GenericFloatIsFinite(const float *value)
     return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
+// Те же ресурсы, что пишет CreateGenericDescriptorSet, но прямо в командный
+// буфер: смещения константы и вершин стоят в самих дескрипторах, а не в
+// dynamic offsets.
+static void PushGenericDescriptors(Renderer *renderer, VkCommandBuffer commandBuffer,
+                                   const RendererMesh *mesh, const RendererTexture *texture,
+                                   const RendererSampler *sampler, uint32_t instanceChunkIndex,
+                                   uint32_t constantOffset)
+{
+    const uint32_t frameIndex = renderer->frameIndex;
+    const VkDescriptorBufferInfo constants = {
+        .buffer = renderer->constantBuffers[frameIndex].buffer,
+        .offset = constantOffset,
+        .range = sizeof(ChunkConstants),
+    };
+    const VkDescriptorBufferInfo vertices = {
+        .buffer = renderer->poolBlocks[mesh->allocation.blockIndex].buffer.buffer,
+        .offset = mesh->allocation.offsetBytes,
+        .range = mesh->allocation.sizeBytes,
+    };
+    const VkDescriptorBufferInfo instances = {
+        .buffer = renderer->instanceBuffers[frameIndex][instanceChunkIndex].buffer,
+        .offset = 0u,
+        .range = VK_WHOLE_SIZE,
+    };
+    const VkDescriptorImageInfo albedo = {
+        .imageView = texture != NULL ? texture->image.view : renderer->fallbackImage.view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkDescriptorImageInfo samplerInfo = {
+        .sampler = sampler != NULL ? sampler->sampler : renderer->sampler,
+    };
+    const VkWriteDescriptorSet writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = BINDING_CONSTANTS,
+          .descriptorCount = 1u, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .pBufferInfo = &constants },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = BINDING_QUAD_BUFFER,
+          .descriptorCount = 1u, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &vertices },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = BINDING_BLOCK_TEXTURES,
+          .descriptorCount = 1u, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+          .pImageInfo = &albedo },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = BINDING_INSTANCES,
+          .descriptorCount = 1u, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &instances },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = BINDING_SAMPLER,
+          .descriptorCount = 1u, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+          .pImageInfo = &samplerInfo },
+    };
+    renderer->cmdPushDescriptorSet(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                   renderer->genericPushPipelineLayout, 0u,
+                                   (uint32_t)(sizeof(writes) / sizeof(writes[0])), writes);
+}
+
 bool RendererDrawGeometry_Vulkan(Renderer *renderer, const RendererGeometryDraw *draw)
 {
     if (renderer == NULL || draw == NULL || draw->structSize < sizeof(*draw) ||
@@ -3989,13 +4135,17 @@ bool RendererDrawGeometry_Vulkan(Renderer *renderer, const RendererGeometryDraw 
     if (instanceBytes != 0u &&
         !ReserveVulkanInstanceSpace(renderer, instanceBytes, &chunkIndex, &instanceOffset))
         return false;
-    VkDescriptorSet set =
-        CreateGenericDescriptorSet(renderer, mesh, draw->texture, draw->sampler, chunkIndex);
-    if (set == VK_NULL_HANDLE)
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (renderer->cmdPushDescriptorSet == NULL)
     {
-        renderer->instanceChunkIndex[renderer->frameIndex] = previousChunk;
-        renderer->instanceChunkOffset[renderer->frameIndex] = previousOffset;
-        return false;
+        set = CreateGenericDescriptorSet(renderer, mesh, draw->texture, draw->sampler,
+                                         chunkIndex);
+        if (set == VK_NULL_HANDLE)
+        {
+            renderer->instanceChunkIndex[renderer->frameIndex] = previousChunk;
+            renderer->instanceChunkOffset[renderer->frameIndex] = previousOffset;
+            return false;
+        }
     }
 
     ChunkConstants constants = renderer->chunkConstants;
@@ -4020,12 +4170,20 @@ bool RendererDrawGeometry_Vulkan(Renderer *renderer, const RendererGeometryDraw 
     // dynamic storage offset and keep firstVertex relative to that mesh;
     // deriving it by dividing offsetBytes by the 24-byte record size would
     // silently round and read the preceding allocation.
-    uint32_t dynamicOffsets[3] = {constantOffset, mesh->allocation.offsetBytes, 0u};
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
     BindGraphicsPipeline(renderer, commandBuffer, renderer->genericPipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            renderer->chunkPipelineLayout, 0u, 1u, &set, 3u,
-                            dynamicOffsets);
+    if (renderer->cmdPushDescriptorSet != NULL)
+    {
+        PushGenericDescriptors(renderer, commandBuffer, mesh, draw->texture, draw->sampler,
+                               chunkIndex, constantOffset);
+    }
+    else
+    {
+        uint32_t dynamicOffsets[3] = {constantOffset, mesh->allocation.offsetBytes, 0u};
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                renderer->chunkPipelineLayout, 0u, 1u, &set, 3u,
+                                dynamicOffsets);
+    }
     uint32_t instanceCount = draw->instanceCount != 0u ? draw->instanceCount : 1u;
     uint32_t firstInstance = instanceOffset / (uint32_t)sizeof(RendererMeshInstance);
     if (indices != NULL)
@@ -5108,6 +5266,11 @@ void RendererUiQueue_Vulkan(Renderer *renderer, const RendererUiQuad *quads, uin
 bool RendererCanCaptureFrame_Vulkan(const Renderer *renderer)
 {
     return renderer != NULL && renderer->device != VK_NULL_HANDLE;
+}
+
+bool RendererUsesPushDescriptors_Vulkan(const Renderer *renderer)
+{
+    return renderer != NULL && renderer->cmdPushDescriptorSet != NULL;
 }
 
 bool RendererRequestFrameCapture_Vulkan(Renderer *renderer)

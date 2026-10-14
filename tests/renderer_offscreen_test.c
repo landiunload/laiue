@@ -19,6 +19,8 @@
 #define TEST_WIDTH 64u
 #define TEST_HEIGHT 64u
 #define TEST_PIXEL_BYTES (TEST_WIDTH * TEST_HEIGHT * 4u)
+// Больше, чем кэш generic-наборов дескрипторов держит за кадр.
+#define MANY_TEXTURE_COUNT 300u
 // Драйвера может не быть даже когда бэкенд слинкован (машина без Vulkan
 // ICD): тогда тест сообщает о пропуске, а не о ложном провале.
 #define SKIP_EXIT_CODE 125
@@ -491,6 +493,46 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(fallbackCovered > 0u,
            "generic fallback descriptors must be recreated after resource destruction");
 
+    // === Много различных ресурсов в одном кадре ===
+    // С push descriptors (Vulkan 1.4 или VK_KHR_push_descriptor) каждый
+    // generic-вызов несёт собственные дескрипторы, и число различных
+    // комбинаций ресурсов за кадр не ограничено. Без них кэш наборов на
+    // кадр конечен: вызовы сверх него отклоняются, а не рисуются с чужими
+    // ресурсами.
+    static RendererTexture *manyTextures[MANY_TEXTURE_COUNT];
+    const uint8_t manyPixel[4] = {0u, 0u, 255u, 255u};
+    for (uint32_t index = 0u; index < MANY_TEXTURE_COUNT; ++index)
+    {
+        manyTextures[index] = RendererCreateTexture(renderer, 1u, 1u, 1u,
+                                                    LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM);
+        Expect(manyTextures[index] != NULL &&
+                   RendererUploadTexture(renderer, manyTextures[index], manyPixel,
+                                         sizeof(manyPixel), sizeof(manyPixel)),
+               "a texture for the many-resource frame could not be created");
+    }
+    Expect(RendererBeginFrame(renderer, &setup), "the many-resource frame could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    for (uint32_t index = 0u; index < MANY_TEXTURE_COUNT; ++index)
+        RendererDrawGenericMeshRangeBound(renderer, genericMesh, NULL, 0.5f, 0u, 3u,
+                                          manyTextures[index], NULL);
+    Expect(RendererEndFrame(renderer), "the many-resource frame could not end");
+    RendererStats manyStats;
+    RendererGetStats(renderer, &manyStats);
+    if (RendererUsesPushDescriptors(renderer))
+        Expect(manyStats.drawCalls == MANY_TEXTURE_COUNT,
+               "with push descriptors every generic draw must reach the GPU");
+    else
+        Expect(manyStats.drawCalls > 0u && manyStats.drawCalls < MANY_TEXTURE_COUNT,
+               "without push descriptors the per-frame set cache must bound the frame");
+    Expect(RendererCaptureFrame(renderer, pixels, TEST_PIXEL_BYTES, &width, &height),
+           "the many-resource frame could not be captured");
+    const uint8_t *manyCentre =
+        pixels + ((TEST_HEIGHT / 2u) * TEST_WIDTH + TEST_WIDTH / 2u) * 4u;
+    Expect(manyCentre[2] > manyCentre[0] + 32u && manyCentre[2] > manyCentre[1] + 32u,
+           "the many-resource textures must reach the pixel shader");
+    for (uint32_t index = 0u; index < MANY_TEXTURE_COUNT; ++index)
+        RendererDestroyTexture(renderer, manyTextures[index]);
+
     RendererDestroyMesh(renderer, genericMesh);
 
     // === Инстансный путь ===
@@ -660,7 +702,7 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
            "the captured frame must follow the requested size");
 
     // === Формат байткода шейдеров ===
-    // Пак, собранный для D3D12, содержит DXBC. Бэкенд обязан отказать
+    // Пак, собранный для D3D12, лежит в контейнере DXBC. Бэкенд обязан отказать
     // понятно, а не отдать драйверу чужой байткод.
     static const uint8_t dxbcHeader[32] = { 'D', 'X', 'B', 'C' };
     LaiueShaderSet shaderSet;
