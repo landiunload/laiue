@@ -25,3 +25,8 @@ LAIUE_RENDER_API bool RendererCaptureFrame(Renderer *renderer, void *outPixels,
 // Vulkan reads its private color target and needs no request.
 LAIUE_RENDER_API bool RendererCanCaptureFrame(const Renderer *renderer);
 LAIUE_RENDER_API bool RendererRequestFrameCapture(Renderer *renderer);
+
+// Vulkan 1.4 or VK_KHR_push_descriptor: generic draws push their descriptors
+// and have no per-frame limit on distinct resource combinations. False for
+// D3D12 and for Vulkan devices without push descriptors.
+LAIUE_RENDER_API bool RendererUsesPushDescriptors(const Renderer *renderer);

@@ -96,6 +96,7 @@ extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
                                         RendererGpuTimingV1 *outTiming);
 extern bool RendererCaptureFrame_Vulkan(Renderer *, void *, uint32_t, uint32_t *, uint32_t *);
 extern bool RendererCanCaptureFrame_Vulkan(const Renderer *);
+extern bool RendererUsesPushDescriptors_Vulkan(const Renderer *);
 extern bool RendererRequestFrameCapture_Vulkan(Renderer *);
 extern void RendererSetVerticalSync_Vulkan(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer* renderer);
@@ -405,6 +406,16 @@ void RendererGetGpuTimingV1(const Renderer *renderer, RendererGpuTimingV1 *outTi
     default:
         return;
     }
+}
+
+bool RendererUsesPushDescriptors(const Renderer *renderer)
+{
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    if (LookupBackend(renderer) == RENDERER_BACKEND_VULKAN)
+        return RendererUsesPushDescriptors_Vulkan(renderer);
+#endif
+    (void)renderer;
+    return false;
 }
 
 bool RendererCanCaptureFrame(const Renderer *renderer)

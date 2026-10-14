@@ -1890,6 +1890,27 @@ static bool CreateDepthBuffer(Renderer* renderer, int32_t width, int32_t height)
     return true;
 }
 
+// Встроенные шейдеры и шейдерпаки — DXIL Shader Model 6.0. Устройство без
+// него отвергается сразу, чтобы рендерер переходил к WARP, а не падал
+// позже на создании первого конвейера.
+static bool CreateShaderModel6Device(IUnknown *adapter, ID3D12Device **outDevice)
+{
+    ID3D12Device *device = NULL;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
+                                 (void **)&device)))
+        return false;
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {.HighestShaderModel = D3D_SHADER_MODEL_6_0};
+    if (FAILED(ID3D12Device_CheckFeatureSupport(device, D3D12_FEATURE_SHADER_MODEL, &shaderModel,
+                                                (UINT)sizeof(shaderModel))) ||
+        shaderModel.HighestShaderModel < D3D_SHADER_MODEL_6_0)
+    {
+        ID3D12Device_Release(device);
+        return false;
+    }
+    *outDevice = device;
+    return true;
+}
+
 Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height)
 {
     Renderer* renderer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*renderer));
@@ -1925,7 +1946,7 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     }
 
     // Аппаратный адаптер, при неудаче — программный WARP.
-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&renderer->device)))
+    if (!CreateShaderModel6Device(NULL, &renderer->device))
     {
         IDXGIAdapter* warpAdapter = NULL;
         if (FAILED(IDXGIFactory4_EnumWarpAdapter(renderer->factory, &IID_IDXGIAdapter, (void**)&warpAdapter)))
@@ -1933,10 +1954,9 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
             RendererDestroy_D3D12(renderer);
             return NULL;
         }
-        HRESULT result = D3D12CreateDevice((IUnknown*)warpAdapter, D3D_FEATURE_LEVEL_11_0,
-            &IID_ID3D12Device, (void**)&renderer->device);
+        bool created = CreateShaderModel6Device((IUnknown*)warpAdapter, &renderer->device);
         IDXGIAdapter_Release(warpAdapter);
-        if (FAILED(result))
+        if (!created)
         {
             RendererDestroy_D3D12(renderer);
             return NULL;
@@ -4131,6 +4151,43 @@ static void ReleaseLoadedShader(void** loadedShader)
     }
 }
 
+// Контракт шейдерпаков 2 принимает только DXIL. D3D12 не собирает конвейер
+// из стадий DXBC и DXIL вместе, поэтому старый пак с DXBC при частичной
+// замене не заработал бы, а отказ драйвера был бы менее понятен. Контейнер
+// общий: 'DXBC', 16 байт хеша, версия, полный размер, число частей и их
+// смещения; программа DXIL лежит в части 'DXIL', DXBC — в 'SHEX'/'SHDR'.
+static bool ShaderBytecodeIsDxil(const void *bytecode, uint32_t length)
+{
+    const uint8_t *bytes = (const uint8_t *)bytecode;
+    if (bytecode == NULL || length < 32u || (length % 4u) != 0u)
+        return false;
+    uint32_t magic = 0u;
+    uint32_t containerBytes = 0u;
+    uint32_t partCount = 0u;
+    memcpy(&magic, bytes, sizeof(magic));
+    memcpy(&containerBytes, bytes + 24u, sizeof(containerBytes));
+    memcpy(&partCount, bytes + 28u, sizeof(partCount));
+    if (magic != 0x43425844u || containerBytes != length || partCount == 0u ||
+        partCount > (length - 32u) / 4u)
+        return false;
+    for (uint32_t part = 0u; part < partCount; ++part)
+    {
+        uint32_t offset = 0u;
+        uint32_t partMagic = 0u;
+        uint32_t partBytes = 0u;
+        memcpy(&offset, bytes + 32u + (size_t)part * 4u, sizeof(offset));
+        if (offset > length - 8u)
+            return false;
+        memcpy(&partMagic, bytes + offset, sizeof(partMagic));
+        memcpy(&partBytes, bytes + offset + 4u, sizeof(partBytes));
+        if (partBytes > length - offset - 8u)
+            return false;
+        if (partMagic == 0x4c495844u)
+            return true;
+    }
+    return false;
+}
+
 static void* CopyShaderBytecode(const void* bytecode, uint32_t length)
 {
     if (bytecode == NULL || length == 0)
@@ -4423,6 +4480,12 @@ bool RendererReloadShaderSet_D3D12(Renderer *renderer, const LaiueShaderSet *sha
     {
         if ((shaderSet->overrideMask & (1U << index)) == 0U)
             continue;
+        if (!ShaderBytecodeIsDxil(shaderSet->bytecode[index].bytes,
+                                  shaderSet->bytecode[index].sizeBytes))
+        {
+            ReleaseShaderArray(replacementShaders);
+            return false;
+        }
         replacementShaders[index] = CopyShaderBytecode(shaderSet->bytecode[index].bytes,
                                                        shaderSet->bytecode[index].sizeBytes);
         if (replacementShaders[index] == NULL)

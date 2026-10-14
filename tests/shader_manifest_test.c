@@ -166,14 +166,14 @@ LAIUE_TEST_ENTRY(ShaderManifestTestEntryPoint)
 
     // 1. Маленький корректный манифест.
     ResetManifest();
-    AppendManifest("LAIUE SHADER 1\nname = Case\ncontract = 1\n");
+    AppendManifest("LAIUE SHADER 1\nname = Case\ncontract = 2\n");
     WriteManifest(paths);
     ExpectOkWithOneSlot(catalog, "small valid manifest");
 
     // 2. BOM перед заголовком.
     ResetManifest();
     AppendBom();
-    AppendManifest("LAIUE SHADER 1\ncontract = 1\n");
+    AppendManifest("LAIUE SHADER 1\ncontract = 2\n");
     WriteManifest(paths);
     ExpectOkWithOneSlot(catalog, "bom valid manifest");
 
@@ -181,7 +181,7 @@ LAIUE_TEST_ENTRY(ShaderManifestTestEntryPoint)
     ResetManifest();
     AppendManifest("LAIUE SHADER 1\n");
     AppendPaddingPastPrefix();
-    AppendManifest("contract = 1\n");
+    AppendManifest("contract = 2\n");
     Expect(g_manifestLength > 2048U && g_manifestLength <= 4096U, "large valid size");
     WriteManifest(paths);
     ExpectOkWithOneSlot(catalog, "large valid manifest");
@@ -195,7 +195,7 @@ LAIUE_TEST_ENTRY(ShaderManifestTestEntryPoint)
 
     // 5. Файл больше максимума 4096 Б.
     ResetManifest();
-    AppendManifest("LAIUE SHADER 1\ncontract = 1\n");
+    AppendManifest("LAIUE SHADER 1\ncontract = 2\n");
     while (g_manifestLength <= 4096U)
     {
         AppendManifest("oversized-padding-oversized-padding\n");
@@ -205,7 +205,7 @@ LAIUE_TEST_ENTRY(ShaderManifestTestEntryPoint)
 
     // 6. Неверный заголовок.
     ResetManifest();
-    AppendManifest("LAIUE SHADER 2\ncontract = 1\n");
+    AppendManifest("LAIUE SHADER 2\ncontract = 2\n");
     WriteManifest(paths);
     ExpectStatus(catalog, SHADER_PACK_LOAD_INVALID_MANIFEST, "wrong header");
 
@@ -215,7 +215,13 @@ LAIUE_TEST_ENTRY(ShaderManifestTestEntryPoint)
     WriteManifest(paths);
     ExpectStatus(catalog, SHADER_PACK_LOAD_INVALID_MANIFEST, "missing contract");
 
-    // 8. Пустой файл.
+    // 8. Пак прежнего контракта: DXBC вместо DXIL, загружать его нельзя.
+    ResetManifest();
+    AppendManifest("LAIUE SHADER 1\nname = Case\ncontract = 1\n");
+    WriteManifest(paths);
+    ExpectStatus(catalog, SHADER_PACK_LOAD_INVALID_MANIFEST, "contract 1 manifest");
+
+    // 9. Пустой файл.
     ResetManifest();
     WriteManifest(paths);
     ExpectStatus(catalog, SHADER_PACK_LOAD_INVALID_MANIFEST, "empty manifest");

@@ -1,13 +1,3 @@
-set(render_shader_headers)
-foreach(shader IN ITEMS chunk panorama ui generic)
-    laiue_compile_shader(${shader}
-        SOURCE "${PROJECT_SOURCE_DIR}/shaders/${shader}.hlsl"
-        OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated"
-        FALLBACK_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/generated"
-        OUTPUT_VARIABLE shader_headers)
-    list(APPEND render_shader_headers ${shader_headers})
-endforeach()
-
 set(render_sources
     renderer_dispatch.c
     renderer.h
@@ -24,8 +14,7 @@ set(render_sources
     texture_pack.h
     texture_pack_internal.h
     chunk_geometry.h
-    ../../api.h
-    ${render_shader_headers})
+    ../../api.h)
 set(d3d12_sources renderer_d3d12.c ui_image_wic.c ui_image_wic.h)
 set(d3d12_links d3d12 dxgi dxguid ole32 windowscodecs)
 set(vulkan_sources renderer_vulkan.c renderer_offscreen.h)
@@ -79,6 +68,39 @@ if(NOT backend_definitions)
         "No render backend available: need Windows (D3D12) or a Vulkan SDK.")
 endif()
 
+# `laiue_render` may contain both backends so existing applications keep one
+# DLL. Each provider below compiles exactly one native backend and has no
+# link-time dependency on the other. Both publish `laiue.graphics` with
+# distinct descriptor IDs, so a profile selects one explicitly.
+option(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS
+    "Build standalone D3D12 and Vulkan graphics provider modules" ON)
+set(build_providers OFF)
+if(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS AND
+   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+    set(build_providers ON)
+endif()
+
+# Шейдеры собираются под каждый бэкенд, который попадёт в сборку: в
+# `laiue_render` или в отдельный provider.
+set(shader_backends)
+if(LAIUE_RENDER_HAS_D3D12 OR (build_providers AND WIN32))
+    list(APPEND shader_backends D3D12)
+endif()
+if(LAIUE_RENDER_HAS_VULKAN_TARGET OR (build_providers AND Vulkan_FOUND))
+    list(APPEND shader_backends VULKAN)
+endif()
+foreach(backend IN LISTS shader_backends)
+    foreach(shader IN ITEMS chunk panorama ui generic)
+        laiue_compile_shader(${shader}
+            BACKEND ${backend}
+            SOURCE "${PROJECT_SOURCE_DIR}/shaders/${shader}.hlsl"
+            OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            FALLBACK_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/generated"
+            OUTPUT_VARIABLE shader_headers)
+        list(APPEND render_sources ${shader_headers})
+    endforeach()
+endforeach()
+
 # RendererCreate()/RENDERER_BACKEND_AUTO выбирает бэкенд, разрешённый из
 # опции сборки: на Windows D3D12, иначе Vulkan.
 if(LAIUE_RENDER_BACKEND_RESOLVED STREQUAL "D3D12")
@@ -93,18 +115,12 @@ laiue_add_module(render
     LINK ${backend_links} laiue::media_support)
 target_compile_definitions(laiue_render PRIVATE ${backend_definitions})
 # Бэкенд включает render/generated/<backend>/*.h. Binary include идёт
-# первым, поэтому обычная сборка никогда не перезаписывает checked-in
-# fallback.
-target_include_directories(laiue_render BEFORE PRIVATE "${PROJECT_BINARY_DIR}/src")
+# первым, поэтому сборка берёт только что собранные шейдеры и никогда не
+# перезаписывает checked-in fallback.
+get_filename_component(generated_include_root "${CMAKE_CURRENT_BINARY_DIR}" DIRECTORY)
+target_include_directories(laiue_render BEFORE PRIVATE "${generated_include_root}")
 
-# `laiue_render` may contain both backends so existing applications keep one
-# DLL. Each provider below compiles exactly one native backend and has no
-# link-time dependency on the other. Both publish `laiue.graphics` with
-# distinct descriptor IDs, so a profile selects one explicitly.
-option(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS
-    "Build standalone D3D12 and Vulkan graphics provider modules" ON)
-if(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS AND
-   LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED")
+if(build_providers)
     set(providers)
     if(WIN32)
         list(APPEND providers d3d12)
@@ -129,7 +145,7 @@ if(LAIUE_BUILD_SEPARATE_GRAPHICS_PROVIDERS AND
             target_compile_definitions(${provider_target} PRIVATE LAIUE_RENDER_HAS_X11)
         endif()
         target_include_directories(${provider_target} BEFORE PRIVATE
-            "${PROJECT_BINARY_DIR}/src")
+            "${generated_include_root}")
     endforeach()
 endif()
 

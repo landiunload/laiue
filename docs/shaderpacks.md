@@ -5,17 +5,19 @@
 ```text
 LAIUE SHADER 1
 name = My Pack
-contract = 1
+contract = 2
 ```
 
-Contract 1 принимает скомпилированный DXBC, а не HLSL-текст. Допустим любой
+Contract 2 принимает скомпилированный байткод, а не HLSL-текст: DXIL Shader
+Model 6.0 для D3D12 и SPIR-V для Vulkan. Пак собирается под бэкенд, на
+котором его загружают; чужой байткод бэкенд отвергает. Допустим любой
 непустой набор стадий:
 
 | Файл | Entry/profile | Проход |
 |---|---|---|
-| `chunk_vs.ls`, `chunk_ps.ls` | `VSMain/PSMain`, `*_5_0` | чанки |
-| `panorama_vs.ls`, `panorama_ps.ls` | `VSMain/PSMain`, `*_5_0` | panorama |
-| `ui_vs.ls`, `ui_ps.ls` | `VSMain/PSMain`, `*_5_0` | UI |
+| `chunk_vs.ls`, `chunk_ps.ls` | `VSMain/PSMain`, `*_6_0` | чанки |
+| `panorama_vs.ls`, `panorama_ps.ls` | `VSMain/PSMain`, `*_6_0` | panorama |
+| `ui_vs.ls`, `ui_ps.ls` | `VSMain/PSMain`, `*_6_0` | UI |
 
 Отсутствующая стадия берётся из встроенного набора. Максимальный размер
 одного файла — 256 КиБ. Renderer сначала проверяет весь набор и создаёт
@@ -40,7 +42,7 @@ pipeline replacement; повреждённый или несовместимый
 возвращает immutable owned object; renderer копирует bytecode, после чего
 объект освобождается через `ShaderPackLoadedSetRelease`.
 
-## Contract 1
+## Contract 2
 
 Эталонные реализации находятся в `shaders/*.hlsl`.
 
@@ -82,13 +84,26 @@ flag 2 — фоновую текстуру. Точная раскладка за
 
 ## Компиляция
 
-Используйте `fxc.exe` с `/O3 /Qstrip_debug /Qstrip_reflect`:
+Подходит DXC с поддержкой Shader Model 6.0. D3D12 принимает только
+подписанный DXIL: DXC без встроенного валидатора подписывает его, лишь
+когда рядом лежит `dxil.dll`.
 
 ```bat
-fxc /nologo /T vs_5_0 /E VSMain /O3 /Qstrip_debug /Qstrip_reflect /Fo chunk_vs.ls chunk.hlsl
-fxc /nologo /T ps_5_0 /E PSMain /O3 /Qstrip_debug /Qstrip_reflect /Fo chunk_ps.ls chunk.hlsl
+dxc -HV 2021 -O3 -Qstrip_debug -Qstrip_reflect -T vs_6_0 -E VSMain -Fo chunk_vs.ls chunk.hlsl
+dxc -HV 2021 -O3 -Qstrip_debug -Qstrip_reflect -T ps_6_0 -E PSMain -Fo chunk_ps.ls chunk.hlsl
 ```
 
-CMake компилирует встроенные стадии теми же параметрами. Если `fxc` не
-найден, используются checked-in fallback headers. Их обновление выполняется
-явно и всегда проверяется через `git diff`.
+Для Vulkan сдвиги регистров дают раскладку дескрипторов рендерера:
+
+```sh
+dxc -spirv -fspv-target-env=vulkan1.1 -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-s-shift 5 0 \
+    -HV 2021 -O3 -T vs_6_0 -E VSMain -Fo chunk_vs.ls chunk.hlsl
+```
+
+CMake компилирует встроенные стадии теми же параметрами. Если DXC не
+найден, используются checked-in заголовки. Их обновление выполняется явно
+и всегда проверяется через `git diff`.
+
+Паки contract 1 с DXBC от `fxc` больше не загружаются: D3D12 не собирает
+конвейер из стадий DXBC и DXIL, а частичный пак смешал бы свои стадии со
+встроенными.
