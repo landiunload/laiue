@@ -435,7 +435,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Android NDK
         run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          # Загрузка с dl.google.com изредка обрывается (Premature EOF).
+          for attempt in 1 2 3; do
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null && break
+            echo "::warning::NDK download attempt $attempt failed"
+            sleep 20
+          done
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
           test -f "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
       - name: Verify complete Android static-link closure
@@ -489,7 +494,7 @@ jobs:
           mkdir -p "$HOME/.android"
           touch "$HOME/.android/emu-update-last-check.ini"
           printf 'ANDROID_AVD_HOME=%s/laiue-avd\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-          curl --fail --location --connect-timeout 20 --max-time 180 --retry 2 \
+          curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
             https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip \
             --output "$RUNNER_TEMP/laiue-sdk-tools.zip"
           printf '0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  %s\n' \
@@ -501,15 +506,23 @@ jobs:
             > build/android-runtime-results/tool-versions.txt
           for ((answer=0; answer<32; ++answer)); do printf 'y\n'; done \
             > "$RUNNER_TEMP/laiue-sdk-answers.txt"
+          # Загрузка с dl.google.com изредка обрывается (Premature EOF).
+          retry() {
+            for attempt in 1 2 3; do
+              "$@" < "$RUNNER_TEMP/laiue-sdk-answers.txt" && return
+              echo "::warning::Attempt $attempt failed: $*"
+              sleep 20
+            done
+            return 1
+          }
           for package in platforms/$LAIUE_ANDROID_IMAGE build-tools/$LAIUE_BUILD_TOOLS \
             system-images/$LAIUE_ANDROID_IMAGE/google_apis/x86_64 "ndk/$ANDROID_NDK_VERSION"; do
-            "$tools/android" --no-metrics --sdk="$ANDROID_HOME" sdk install "$package" \
-              < "$RUNNER_TEMP/laiue-sdk-answers.txt"
+            retry "$tools/android" --no-metrics --sdk="$ANDROID_HOME" sdk install "$package"
           done
           ndk="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
           test -f "$ndk/build/cmake/android.toolchain.cmake"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
-          curl --fail --location --connect-timeout 20 --max-time 180 --retry 2 \
+          curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
             https://dl.google.com/android/repository/emulator-linux_x64-16428233.zip \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
           printf 'b08fc43d8608d2955f607f1b287beb525041e730086bdca3af152accac3af9c1  %s\n' \
