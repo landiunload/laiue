@@ -3,8 +3,9 @@
 /* Backend-neutral UI service.  The draw list is copied out of the module so
  * a renderer may consume it without importing the UI implementation DLL. */
 
-#include "mod/module_api.h"
+#include "api.h"
 #include "graphics/graphics_api.h"
+#include "mod/module_api.h"
 
 #include <stddef.h>
 #include <stdint.h>

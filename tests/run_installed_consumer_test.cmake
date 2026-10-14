@@ -78,18 +78,20 @@ else()
     set(executable_directory "${consumer_binary}")
 endif()
 if(HOST_WIN32)
-    set(executable "${executable_directory}/laiue_consumer.exe")
+    set(executable_suffix ".exe")
     file(COPY "${prefix}/bin/" DESTINATION "${executable_directory}")
 else()
-    set(executable "${executable_directory}/laiue_consumer")
+    set(executable_suffix "")
 endif()
-execute_process(
-    COMMAND "${executable}"
-    RESULT_VARIABLE run_result
-    OUTPUT_VARIABLE run_output
-    ERROR_VARIABLE run_error)
-if(NOT run_result EQUAL 0)
-    message(FATAL_ERROR
-        "Installed consumer failed (${run_result}):\n"
-        "${run_output}${run_error}")
-endif()
+foreach(consumer IN ITEMS laiue_consumer laiue_bootstrap_consumer)
+    execute_process(
+        COMMAND "${executable_directory}/${consumer}${executable_suffix}"
+        RESULT_VARIABLE run_result
+        OUTPUT_VARIABLE run_output
+        ERROR_VARIABLE run_error)
+    if(NOT run_result EQUAL 0)
+        message(FATAL_ERROR
+            "Installed ${consumer} failed (${run_result}):\n"
+            "${run_output}${run_error}")
+    endif()
+endforeach()

@@ -88,57 +88,38 @@ static uint32_t LoadModules(LaiueModuleHost *host, uint32_t graphical, uint32_t 
 {
     LaiueModuleDiagnostic diagnostic = {0};
 #if defined(LAIUE_ANIMATION_DEMO_DYNAMIC)
-#if defined(_WIN32)
-#define BINARY(name) L"laiue_" name L".dll"
-#elif defined(__APPLE__)
-#define BINARY(name) L"liblaiue_" name L".dylib"
-#else
-#define BINARY(name) L"liblaiue_" name L".so"
-#endif
-    const wchar_t *names[MODULES] = {BINARY(L"content"), BINARY(L"model"), BINARY(L"animation")};
+    const char *names[MODULES] = {"content", "model", "animation"};
     uint32_t count = 3u;
     const char *provider = NULL;
 #if defined(LAIUE_ANIMATION_DEMO_GRAPHICS)
     if (graphical)
     {
 #if defined(LAIUE_ANIMATION_DEMO_D3D12)
-        names[count++] = offscreen ? BINARY(L"graphics_vulkan") : BINARY(L"graphics_d3d12");
+        names[count++] = offscreen ? "graphics_vulkan" : "graphics_d3d12";
         provider = offscreen ? "laiue.graphics.vulkan" : "laiue.graphics.d3d12";
 #else
-        names[count++] = BINARY(L"graphics_vulkan");
+        names[count++] = "graphics_vulkan";
         provider = "laiue.graphics.vulkan";
 #endif
     }
 #endif
 #if defined(LAIUE_ANIMATION_DEMO_WINDOW)
     if (graphical && !offscreen)
-        names[count++] = BINARY(L"window");
+        names[count++] = "window";
 #endif
-    static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t paths[MODULES][LAIUE_PLATFORM_PATH_CAPACITY];
-    LaiueModuleBinaryV1 binaries[MODULES] = {0};
-    if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY))
-        return 0u;
-    for (uint32_t i = 0u; i < count; ++i)
-    {
-        if (!Join(paths[i], directory, names[i]))
-            return 0u;
-        binaries[i].path = paths[i];
-        binaries[i].flags = LAIUE_MODULE_BINARY_OPTIONAL;
-    }
     const LaiueModuleProviderSelectionV1 selection = {.structSize = sizeof(selection),
                                                       .serviceName =
                                                           LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
                                                       .moduleId = provider};
-    const LaiueModuleProfileV1 profile = {.structSize = sizeof(profile),
-                                          .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-                                          .binaries = binaries,
-                                          .binaryCount = count,
-                                          .providerSelections =
-                                              provider != NULL ? &selection : NULL,
-                                          .providerSelectionCount = provider != NULL ? 1u : 0u};
+    const LaiueModuleNamedProfileV1 profile = {
+        .structSize = sizeof(profile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .names = names,
+        .nameCount = count,
+        .providerSelections = provider != NULL ? &selection : NULL,
+        .providerSelectionCount = provider != NULL ? 1u : 0u};
     const LaiueModuleStatus status =
-        LaiueModuleHostLoadProfileV1(host, &profile, NULL, &diagnostic);
+        LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic);
 #else
     const LaiueModuleApiV1 *apis[MODULES] = {0};
     uint32_t count = 0u;

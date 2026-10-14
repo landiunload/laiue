@@ -20,8 +20,8 @@
 | `physics` | переносимые AABB, sweep и столкновения с воксельной геометрией; numeric/jobs подключаются таблицами сервисов |
 | `content` | безопасные имена, каталог форматов и выбор активного пака |
 | `mod` | discovery паков, native ABI и registry versioned services |
-| `window` | Win32-окно и message loop |
-| `input` | Raw Input клавиатуры и мыши |
+| `window` | окно Win32 или X11 и цикл сообщений |
+| `input` | клавиатура и мышь: Raw Input на Windows, X11 на Linux |
 | `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
 | `mesh` | greedy meshing областей `World` |
 | `render` | backend-neutral graphics device плюс providers D3D12/Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
@@ -31,7 +31,8 @@
 
 Первые пять модулей образуют переносимое ядро. Полный графический набор
 доступен на Windows; Linux дополнительно собирает профиль Vulkan из
-`audio`, `mesh`, `render` и `scene`. Публичные API помечены export-макросами
+`audio`, `mesh`, `render`, `scene` и `ui`, а при найденном X11 — ещё окно и
+ввод. Публичные API помечены export-макросами
 из `src/api.h`; владеющие состоянием объекты остаются непрозрачными.
 
 ## Направление зависимостей
@@ -52,7 +53,7 @@ external application
               └── ui ─────────── graphics.device
 ```
 
-`window` и `input` находятся на Windows-границе и не нужны Linux core;
+`window` и `input` находятся на границе ОС и не нужны core-профилю;
 `audio_output` — отдельный optional provider, поэтому `audio` остаётся
 работоспособным с offscreen даже при удалённом системном выводе.
 Нижние модули не включают заголовки `scene` или `ui`.

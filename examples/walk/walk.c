@@ -906,173 +906,53 @@ static void WalkWindowFrame(void *opaque)
 }
 #endif
 
-#if defined(LAIUE_WALK_DYNAMIC)
-static bool JoinPath(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t *root,
-                     const wchar_t *name)
-{
-    uint32_t index = 0u;
-    while (root[index] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
-        output[index] = root[index], ++index;
-    if (root[index] != L'\0')
-        return false;
-    if (index != 0u && output[index - 1u] != L'/' && output[index - 1u] != L'\\')
-        output[index++] = L'/';
-    uint32_t nameIndex = 0u;
-    while (name[nameIndex] != L'\0' && index + 1u < LAIUE_PLATFORM_PATH_CAPACITY)
-        output[index++] = name[nameIndex++];
-    if (name[nameIndex] != L'\0')
-        return false;
-    output[index] = L'\0';
-    return true;
-}
-#endif
-
 static LaiueModuleStatus LoadWalkModules(LaiueModuleHost *host, LaiueModuleLoadReportV1 *report,
                                          LaiueModuleLoadReportEntryV1 *reportEntries,
                                          LaiueModuleDiagnostic *diagnostic)
 {
 #if defined(LAIUE_WALK_DYNAMIC)
-    static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t characterPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t numericPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t worldPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t voxelPath[LAIUE_PLATFORM_PATH_CAPACITY];
+    const char *names[12] = {"character", "numeric", "world", "voxel"};
+    uint32_t nameCount = 4u;
+    const char *renderModuleId = NULL;
 #if defined(LAIUE_WALK_WINDOWED)
-    static wchar_t windowPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t inputPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t physicsPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t mesherPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t renderPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t uiPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t sceneMathPath[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t scenePath[LAIUE_PLATFORM_PATH_CAPACITY];
-#endif
-#if defined(_WIN32)
-    const wchar_t *characterName = L"laiue_character.dll";
-    const wchar_t *numericName = L"laiue_numeric.dll";
-    const wchar_t *worldName = L"laiue_world.dll";
-    const wchar_t *voxelName = L"laiue_voxel.dll";
-#if defined(LAIUE_WALK_WINDOWED)
-    const wchar_t *mesherName = L"laiue_mesher.dll";
-    const wchar_t *windowName = L"laiue_window.dll";
-    const wchar_t *inputName = L"laiue_input.dll";
-    const wchar_t *physicsName = L"laiue_physics.dll";
 #if defined(LAIUE_WALK_GRAPHICS_PROVIDER_D3D12)
-    const wchar_t *renderName = L"laiue_graphics_d3d12.dll";
-#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
-    const char *renderModuleId = "laiue.graphics.d3d12";
-#endif
+    const char *renderName = "graphics_d3d12";
+    renderModuleId = "laiue.graphics.d3d12";
 #elif defined(LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN)
-    const wchar_t *renderName = L"laiue_graphics_vulkan.dll";
-#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
-    const char *renderModuleId = "laiue.graphics.vulkan";
-#endif
+    const char *renderName = "graphics_vulkan";
+    renderModuleId = "laiue.graphics.vulkan";
 #else
-    const wchar_t *renderName = L"laiue_render.dll";
+    const char *renderName = "render";
 #endif
-    const wchar_t *uiName = L"laiue_ui.dll";
-    const wchar_t *sceneMathName = L"laiue_scene_math.dll";
-    const wchar_t *sceneName = L"laiue_scene.dll";
+    names[nameCount++] = "window";
+    names[nameCount++] = "input";
+    names[nameCount++] = "physics";
+    names[nameCount++] = "mesher";
+    names[nameCount++] = renderName;
+    names[nameCount++] = "ui";
+    names[nameCount++] = "scene_math";
+    names[nameCount++] = "scene";
 #endif
-#elif defined(__APPLE__)
-    const wchar_t *characterName = L"liblaiue_character.dylib";
-    const wchar_t *numericName = L"liblaiue_numeric.dylib";
-    const wchar_t *worldName = L"liblaiue_world.dylib";
-    const wchar_t *voxelName = L"liblaiue_voxel.dylib";
-#if defined(LAIUE_WALK_WINDOWED)
-    const wchar_t *mesherName = L"liblaiue_mesher.dylib";
-    const wchar_t *windowName = L"liblaiue_window.dylib";
-    const wchar_t *inputName = L"liblaiue_input.dylib";
-    const wchar_t *physicsName = L"liblaiue_physics.dylib";
-#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
-    const wchar_t *renderName = L"liblaiue_graphics_vulkan.dylib";
-    const char *renderModuleId = "laiue.graphics.vulkan";
-#else
-    const wchar_t *renderName = L"liblaiue_render.dylib";
-#endif
-    const wchar_t *uiName = L"liblaiue_ui.dylib";
-    const wchar_t *sceneMathName = L"liblaiue_scene_math.dylib";
-    const wchar_t *sceneName = L"liblaiue_scene.dylib";
-#endif
-#else
-    const wchar_t *characterName = L"liblaiue_character.so";
-    const wchar_t *numericName = L"liblaiue_numeric.so";
-    const wchar_t *worldName = L"liblaiue_world.so";
-    const wchar_t *voxelName = L"liblaiue_voxel.so";
-#if defined(LAIUE_WALK_WINDOWED)
-    const wchar_t *mesherName = L"liblaiue_mesher.so";
-    const wchar_t *windowName = L"liblaiue_window.so";
-    const wchar_t *inputName = L"liblaiue_input.so";
-    const wchar_t *physicsName = L"liblaiue_physics.so";
-#if defined(LAIUE_WALK_GRAPHICS_PROVIDER_VULKAN)
-    const wchar_t *renderName = L"liblaiue_graphics_vulkan.so";
-    const char *renderModuleId = "laiue.graphics.vulkan";
-#else
-    const wchar_t *renderName = L"liblaiue_render.so";
-#endif
-    const wchar_t *uiName = L"liblaiue_ui.so";
-    const wchar_t *sceneMathName = L"liblaiue_scene_math.so";
-    const wchar_t *sceneName = L"liblaiue_scene.so";
-#endif
-#endif
-    if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY) ||
-        !JoinPath(characterPath, directory, characterName) ||
-        !JoinPath(numericPath, directory, numericName) ||
-        !JoinPath(worldPath, directory, worldName) || !JoinPath(voxelPath, directory, voxelName))
-        return LAIUE_MODULE_INVALID_ARGUMENT;
-    LaiueModuleBinaryV1 binaries[12];
-    uint32_t binaryCount = 0u;
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){characterPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){numericPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){worldPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){voxelPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-#if defined(LAIUE_WALK_WINDOWED)
-    if (!JoinPath(windowPath, directory, windowName) ||
-        !JoinPath(inputPath, directory, inputName) ||
-        !JoinPath(physicsPath, directory, physicsName) ||
-        !JoinPath(mesherPath, directory, mesherName) ||
-        !JoinPath(renderPath, directory, renderName) || !JoinPath(uiPath, directory, uiName) ||
-        !JoinPath(sceneMathPath, directory, sceneMathName) ||
-        !JoinPath(scenePath, directory, sceneName))
-        return LAIUE_MODULE_INVALID_ARGUMENT;
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){windowPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){inputPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){physicsPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){mesherPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){renderPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){uiPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] =
-        (LaiueModuleBinaryV1){sceneMathPath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-    binaries[binaryCount++] = (LaiueModuleBinaryV1){scenePath, LAIUE_MODULE_BINARY_OPTIONAL, NULL};
-#endif
-    LaiueModuleLoadReportInitialize(report, reportEntries, binaryCount);
-#if defined(LAIUE_WALK_EXPLICIT_GRAPHICS_PROVIDER)
+    LaiueModuleLoadReportInitialize(report, reportEntries, nameCount);
     /* The executable chooses exactly one standalone provider at configure
      * time and pins its descriptor.  If that artifact is removed or cannot
      * be loaded (no Vulkan loader on the system), the partial profile only
      * loses the graphics branch and walk falls back to its diagnostic
      * headless mode. */
-    LaiueModuleProviderSelectionV1 graphicsSelection = {
+    const LaiueModuleProviderSelectionV1 graphicsSelection = {
         .structSize = sizeof(graphicsSelection),
         .serviceName = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
         .moduleId = renderModuleId,
     };
-    LaiueModuleProfileV1 profile = {
+    const LaiueModuleNamedProfileV1 profile = {
         .structSize = sizeof(profile),
         .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-        .binaries = binaries,
-        .binaryCount = binaryCount,
-        .providerSelections = &graphicsSelection,
-        .providerSelectionCount = 1u,
+        .names = names,
+        .nameCount = nameCount,
+        .providerSelections = renderModuleId != NULL ? &graphicsSelection : NULL,
+        .providerSelectionCount = renderModuleId != NULL ? 1u : 0u,
     };
-    return LaiueModuleHostLoadProfileV1(host, &profile, report, diagnostic);
-#else
-    return LaiueModuleHostLoadProfile(host, binaries, binaryCount,
-                                      LAIUE_MODULE_PROFILE_ALLOW_PARTIAL, report, diagnostic);
-#endif
+    return LaiueModuleHostLoadNamedProfileV1(host, &profile, report, diagnostic);
 #else
     (void)report;
     (void)reportEntries;

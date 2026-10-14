@@ -24,6 +24,14 @@ function(laiue_collect_sources out_variable)
     set(${out_variable} "${result}" PARENT_SCOPE)
 endfunction()
 
+# The module-by-name helpers of mod name artifacts the way this toolchain
+# names shared libraries, so a lookup always matches what the build produced.
+function(laiue_define_module_artifact_names target_name)
+    target_compile_definitions(${target_name} PRIVATE
+        "LAIUE_MODULE_ARTIFACT_PREFIX=\"${CMAKE_SHARED_LIBRARY_PREFIX}\""
+        "LAIUE_MODULE_ARTIFACT_SUFFIX=\"${CMAKE_SHARED_LIBRARY_SUFFIX}\"")
+endfunction()
+
 function(laiue_register_runtime_target target_name runtime_role)
     if(NOT TARGET "${target_name}")
         message(FATAL_ERROR
@@ -111,9 +119,7 @@ function(laiue_add_module module_name)
         target_compile_options(${target_name} PRIVATE /fp:fast)
     endif()
     target_include_directories(${target_name}
-        PUBLIC
-            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
-            "$<INSTALL_INTERFACE:include/laiue>")
+        PUBLIC ${LAIUE_PUBLIC_INCLUDE_DIRECTORIES})
     target_link_libraries(${target_name}
         PRIVATE
             laiue_common

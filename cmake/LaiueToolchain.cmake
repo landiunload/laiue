@@ -206,15 +206,28 @@ endif()
 # композиции не меняет глобальные флаги CMake и не загрязняет потребителей.
 add_library(laiue_build_options INTERFACE)
 add_library(laiue::build_options ALIAS laiue_build_options)
+
+# Public headers are addressed the way the SDK installs them: "mod/module_host.h",
+# "world/world.h", "scene/camera.h". In the source tree they sit under category
+# directories, so these roots let an application that builds the engine from
+# source include exactly what an SDK consumer includes. src/core stays private:
+# its headers are not part of the SDK.
+set(LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES
+    "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/src/assets"
+    "${PROJECT_SOURCE_DIR}/src/graphics"
+    "${PROJECT_SOURCE_DIR}/src/jobs"
+    "${PROJECT_SOURCE_DIR}/src/simulation"
+    "${PROJECT_SOURCE_DIR}/src/modding")
+list(TRANSFORM LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES
+    PREPEND "$<BUILD_INTERFACE:" OUTPUT_VARIABLE LAIUE_PUBLIC_INCLUDE_DIRECTORIES)
+list(TRANSFORM LAIUE_PUBLIC_INCLUDE_DIRECTORIES APPEND ">")
+list(APPEND LAIUE_PUBLIC_INCLUDE_DIRECTORIES "$<INSTALL_INTERFACE:include/laiue>")
+
 target_include_directories(laiue_build_options
     INTERFACE
-        "${PROJECT_SOURCE_DIR}/src"
-        "${PROJECT_SOURCE_DIR}/src/core"
-        "${PROJECT_SOURCE_DIR}/src/assets"
-        "${PROJECT_SOURCE_DIR}/src/graphics"
-        "${PROJECT_SOURCE_DIR}/src/jobs"
-        "${PROJECT_SOURCE_DIR}/src/simulation"
-        "${PROJECT_SOURCE_DIR}/src/modding")
+        ${LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES}
+        "${PROJECT_SOURCE_DIR}/src/core")
 target_compile_definitions(laiue_build_options INTERFACE
     LAIUE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     LAIUE_VERSION_MINOR=${PROJECT_VERSION_MINOR}

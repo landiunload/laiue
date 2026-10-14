@@ -209,69 +209,46 @@ static uint32_t LoadModules(LaiueModuleHost *host, uint32_t offscreen)
 {
     LaiueModuleDiagnostic diagnostic = {0};
 #if defined(LAIUE_MESH_DEMO_DYNAMIC)
-#if defined(_WIN32)
-#define DEMO_BINARY(name) L"laiue_" name L".dll"
-#elif defined(__APPLE__)
-#define DEMO_BINARY(name) L"liblaiue_" name L".dylib"
-#else
-#define DEMO_BINARY(name) L"liblaiue_" name L".so"
-#endif
-    const wchar_t *names[DEMO_MODULE_CAPACITY] = {
-        DEMO_BINARY(L"content"),
-        DEMO_BINARY(L"model"),
-        DEMO_BINARY(L"mesh_world"),
-        DEMO_BINARY(L"mesh_world_render"),
-    };
+    const char *names[DEMO_MODULE_CAPACITY] = {"content", "model", "mesh_world",
+                                               "mesh_world_render"};
     uint32_t count = 4u;
     const char *graphicsId = NULL;
 #if defined(LAIUE_MESH_DEMO_GRAPHICS)
-    const wchar_t *graphicsName = DEMO_BINARY(L"render");
+    const char *graphicsName = "render";
 #if defined(LAIUE_MESH_DEMO_GRAPHICS_D3D12)
-    graphicsName = DEMO_BINARY(L"graphics_d3d12");
+    graphicsName = "graphics_d3d12";
     graphicsId = "laiue.graphics.d3d12";
 #elif defined(LAIUE_MESH_DEMO_GRAPHICS_VULKAN)
-    graphicsName = DEMO_BINARY(L"graphics_vulkan");
+    graphicsName = "graphics_vulkan";
     graphicsId = "laiue.graphics.vulkan";
 #endif
 #if defined(LAIUE_MESH_DEMO_OFFSCREEN_VULKAN)
     if (offscreen)
     {
-        graphicsName = DEMO_BINARY(L"graphics_vulkan");
+        graphicsName = "graphics_vulkan";
         graphicsId = "laiue.graphics.vulkan";
     }
 #endif
     names[count++] = graphicsName;
 #endif
 #if defined(LAIUE_MESH_DEMO_WINDOWED)
-    names[count++] = DEMO_BINARY(L"window");
-    names[count++] = DEMO_BINARY(L"input");
+    names[count++] = "window";
+    names[count++] = "input";
 #endif
-    static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
-    static wchar_t paths[DEMO_MODULE_CAPACITY][LAIUE_PLATFORM_PATH_CAPACITY];
-    LaiueModuleBinaryV1 binaries[DEMO_MODULE_CAPACITY] = {0};
-    if (!PlatformExecutableDirectory(directory, LAIUE_PLATFORM_PATH_CAPACITY))
-        return 0u;
-    for (uint32_t index = 0u; index < count; ++index)
-    {
-        if (!JoinPath(paths[index], directory, names[index]))
-            return 0u;
-        binaries[index].path = paths[index];
-        binaries[index].flags = LAIUE_MODULE_BINARY_OPTIONAL;
-    }
     LaiueModuleProviderSelectionV1 selection = {
         .structSize = sizeof(selection),
         .serviceName = LAIUE_GRAPHICS_DEVICE_SERVICE_NAME_V2,
         .moduleId = graphicsId,
     };
-    LaiueModuleProfileV1 profile = {
+    const LaiueModuleNamedProfileV1 profile = {
         .structSize = sizeof(profile),
         .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
-        .binaries = binaries,
-        .binaryCount = count,
+        .names = names,
+        .nameCount = count,
         .providerSelections = graphicsId == NULL ? NULL : &selection,
         .providerSelectionCount = graphicsId == NULL ? 0u : 1u,
     };
-    LaiueModuleStatus status = LaiueModuleHostLoadProfileV1(host, &profile, NULL, &diagnostic);
+    LaiueModuleStatus status = LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic);
 #else
     const LaiueModuleApiV1 *apis[DEMO_MODULE_CAPACITY] = {0};
     uint32_t count = 0u;
