@@ -145,3 +145,118 @@ bool Matrix4LookAt(const float eye[3], const float target[3], const float up[3],
     out[15] = 1.0f;
     return true;
 }
+
+static double AbsDouble(double value)
+{
+    return value < 0.0 ? -value : value;
+}
+
+bool Matrix4Invert(const float matrix[16], float out[16])
+{
+    // Гаусс-Жордан с выбором ведущего элемента: [M | I] -> [I | M^-1].
+    double work[4][8];
+    for (int32_t row = 0; row < 4; ++row)
+    {
+        for (int32_t column = 0; column < 4; ++column)
+        {
+            work[row][column] = matrix[row * 4 + column];
+            work[row][4 + column] = row == column ? 1.0 : 0.0;
+        }
+    }
+    for (int32_t column = 0; column < 4; ++column)
+    {
+        int32_t pivot = column;
+        for (int32_t row = column + 1; row < 4; ++row)
+        {
+            if (AbsDouble(work[row][column]) > AbsDouble(work[pivot][column]))
+            {
+                pivot = row;
+            }
+        }
+        if (!(AbsDouble(work[pivot][column]) > 1e-30))
+        {
+            Matrix4Identity(out);
+            return false;
+        }
+        for (int32_t element = 0; element < 8; ++element)
+        {
+            const double swap = work[column][element];
+            work[column][element] = work[pivot][element];
+            work[pivot][element] = swap;
+        }
+        const double scale = 1.0 / work[column][column];
+        for (int32_t element = 0; element < 8; ++element)
+        {
+            work[column][element] *= scale;
+        }
+        for (int32_t row = 0; row < 4; ++row)
+        {
+            const double factor = work[row][column];
+            if (row == column || factor == 0.0)
+            {
+                continue;
+            }
+            for (int32_t element = 0; element < 8; ++element)
+            {
+                work[row][element] -= factor * work[column][element];
+            }
+        }
+    }
+    for (int32_t row = 0; row < 4; ++row)
+    {
+        for (int32_t column = 0; column < 4; ++column)
+        {
+            out[row * 4 + column] = (float)work[row][4 + column];
+        }
+    }
+    return true;
+}
+
+// Точка экрана на глубине depth обратно в пространство мира.
+static bool Unproject(const float inverse[16], float ndcX, float ndcY, float depth, float out[3])
+{
+    float point[4];
+    for (int32_t column = 0; column < 4; ++column)
+    {
+        point[column] = ndcX * inverse[column] + ndcY * inverse[4 + column] +
+                        depth * inverse[8 + column] + inverse[12 + column];
+    }
+    if (!(point[3] > 1e-20f || point[3] < -1e-20f))
+    {
+        return false;
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        out[axis] = point[axis] / point[3];
+    }
+    return true;
+}
+
+bool ViewRayThroughScreenPoint(const float viewProjection[16], float ndcX, float ndcY,
+                               float outOrigin[3], float outDirection[3])
+{
+    float inverse[16];
+    float nearPoint[3];
+    float deeperPoint[3];
+    // Вторая точка берётся на глубине 0.5, а не на дальней плоскости: при
+    // дальней плоскости в десятки километров глубина около 1 теряет точность
+    // во float, а направлению хватает любой второй точки луча.
+    if (!Matrix4Invert(viewProjection, inverse) ||
+        !Unproject(inverse, ndcX, ndcY, 0.0f, nearPoint) ||
+        !Unproject(inverse, ndcX, ndcY, 0.5f, deeperPoint))
+    {
+        return false;
+    }
+    float direction[3] = {deeperPoint[0] - nearPoint[0], deeperPoint[1] - nearPoint[1],
+                          deeperPoint[2] - nearPoint[2]};
+    if (!Normalize3(direction))
+    {
+        return false;
+    }
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        outOrigin[axis] = nearPoint[axis];
+        outDirection[axis] = direction[axis];
+    }
+    return true;
+}

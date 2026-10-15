@@ -36,6 +36,10 @@ API and ABI may change between minor versions.
   a field join without gaps through owned edge ranges.
 - `laiue.scene_math` adds `Matrix4Perspective` and `Matrix4LookAt` in the
   renderer's conventions.
+- `laiue.scene_math` adds `Matrix4Invert` and `ViewRayThroughScreenPoint`,
+  the ray from the camera through a screen point for picking with a cursor.
+  Both are an optional service tail checked with
+  `LAIUE_SCENE_MATH_SERVICE_V1_PICKING_SIZE`.
 - The bootstrap and platform archives are compiled without LTO, so an
   application links them with its own compiler; the Linux SDK built with
   Clang could not be linked by GCC.

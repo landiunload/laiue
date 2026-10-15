@@ -84,9 +84,72 @@ static void TestLookAt(void)
     Expect(!Matrix4LookAt(eye, eye, up, view), "a zero-length view is rejected");
 }
 
+static void TestInvert(void)
+{
+    const float up[3] = {0.0f, 0.0f, 1.0f};
+    const float eye[3] = {3.0f, -10.0f, 5.0f};
+    const float target[3] = {3.0f, 0.0f, 0.0f};
+    float view[16];
+    float projection[16];
+    float viewProjection[16];
+    float inverse[16];
+    float product[16];
+    Expect(Matrix4LookAt(eye, target, up, view) &&
+               Matrix4Perspective(1.0f, 1.5f, 0.1f, 1000.0f, projection),
+           "a camera builds");
+    Matrix4Multiply(view, projection, viewProjection);
+    Expect(Matrix4Invert(viewProjection, inverse), "a camera inverts");
+    Matrix4Multiply(viewProjection, inverse, product);
+    for (int index = 0; index < 16; ++index)
+        Expect(Near(product[index], index % 5 == 0 ? 1.0f : 0.0f),
+               "a matrix times its inverse is the identity");
+
+    const float singular[16] = {1.0f, 2.0f, 3.0f, 4.0f, 2.0f, 4.0f, 6.0f, 8.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    Expect(!Matrix4Invert(singular, inverse) && IsIdentity(inverse),
+           "a singular matrix is rejected");
+}
+
+static void TestViewRay(void)
+{
+    const float up[3] = {0.0f, 0.0f, 1.0f};
+    const float eye[3] = {0.0f, -10.0f, 0.0f};
+    const float target[3] = {0.0f, 0.0f, 0.0f};
+    float view[16];
+    float projection[16];
+    float viewProjection[16];
+    Expect(Matrix4LookAt(eye, target, up, view) &&
+               Matrix4Perspective(1.5707963f, 2.0f, 0.5f, 80000.0f, projection),
+           "a camera builds");
+    Matrix4Multiply(view, projection, viewProjection);
+
+    float origin[3];
+    float direction[3];
+    Expect(ViewRayThroughScreenPoint(viewProjection, 0.0f, 0.0f, origin, direction),
+           "a ray through the centre");
+    Expect(Near(origin[0], 0.0f) && Near(origin[1], -9.5f) && Near(origin[2], 0.0f),
+           "the ray starts on the near plane");
+    Expect(Near(direction[0], 0.0f) && Near(direction[1], 1.0f) && Near(direction[2], 0.0f),
+           "the centre ray looks at the target");
+
+    /* A 90 degree vertical view at aspect 2: the top right corner lies at 45
+     * degrees up and atan(2) to the right. */
+    Expect(ViewRayThroughScreenPoint(viewProjection, 1.0f, 1.0f, origin, direction),
+           "a ray through a corner");
+    Expect(Near(direction[0], 2.0f / 2.4494897f) && Near(direction[1], 1.0f / 2.4494897f) &&
+               Near(direction[2], 1.0f / 2.4494897f),
+           "the corner ray follows the field of view and aspect ratio");
+
+    const float zero[16] = {0.0f};
+    Expect(!ViewRayThroughScreenPoint(zero, 0.0f, 0.0f, origin, direction),
+           "a degenerate camera gives no ray");
+}
+
 LAIUE_TEST_ENTRY(SceneMathTestEntryPoint)
 {
     TestPerspective();
     TestLookAt();
+    TestInvert();
+    TestViewRay();
     LAIUE_TEST_SUCCESS();
 }
