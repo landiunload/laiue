@@ -32,7 +32,8 @@ typedef struct LaiueSurfaceVertexV1
     float position[3];
     /* Unit length, pointing out of the matter. */
     float normal[3];
-    /* Material of the most solid corner of the vertex's cell; 0 without a
+    /* Material of the solid corner of the vertex's cell nearest the surface
+     * (the smallest positive value): what lies right beneath it. 0 without a
      * material array. */
     uint32_t material;
 } LaiueSurfaceVertexV1;

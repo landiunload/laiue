@@ -51,16 +51,21 @@ static uint32_t CellVertex(LaiueSurfaceMeshRequestV1 *request, const Grid *grid,
 
     float corners[8];
     uint32_t material = 0u;
-    float mostSolid = 0.0f;
+    bool haveSolid = false;
+    float nearestSolid = 0.0f;
     for (uint32_t corner = 0u; corner < 8u; ++corner)
     {
         const uint32_t point[3] = {cell[0] + (corner & 1u), cell[1] + ((corner >> 1) & 1u),
                                    cell[2] + ((corner >> 2) & 1u)};
         const size_t sample = SampleIndex(grid, point);
         corners[corner] = grid->values[sample];
-        if (grid->materials != NULL && corners[corner] > mostSolid)
+        /* The surface shows what lies right beneath it: the solid corner
+         * nearest the surface, not the deepest one. */
+        if (grid->materials != NULL && Inside(corners[corner]) &&
+            (!haveSolid || corners[corner] < nearestSolid))
         {
-            mostSolid = corners[corner];
+            haveSolid = true;
+            nearestSolid = corners[corner];
             material = grid->materials[sample];
         }
     }

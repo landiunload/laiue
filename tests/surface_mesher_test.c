@@ -155,6 +155,28 @@ static void TestEmitRanges(void)
            "halves split the surface without gaps or duplicates");
 }
 
+/* Ground below z = 10.3 with a thin top layer: the surface shows the layer
+ * right beneath it, however deep the rest of its cells reach. */
+static void TestSurfaceMaterial(void)
+{
+    for (uint32_t z = 0u; z < COUNT; ++z)
+        for (uint32_t y = 0u; y < COUNT; ++y)
+            for (uint32_t x = 0u; x < COUNT; ++x)
+            {
+                const size_t index = x + (size_t)y * COUNT + (size_t)z * COUNT * COUNT;
+                values[index] = 10.3f - (float)z;
+                materials[index] = (uint8_t)(values[index] < 1.0f ? 7u : 9u);
+            }
+    LaiueSurfaceMeshRequestV1 request = Request();
+    Expect(LaiueSurfaceMeshBuildV1(&request) == LAIUE_SURFACE_MESH_OK && request.vertexCount > 0u,
+           "a flat ground meshes");
+    for (uint32_t index = 0u; index < request.vertexCount; ++index)
+    {
+        Expect(vertices[index].material == 7u, "the surface shows its top layer");
+        Expect(vertices[index].normal[2] > 0.99f, "flat ground faces up");
+    }
+}
+
 static void TestLimits(void)
 {
     FillBall();
@@ -204,6 +226,7 @@ LAIUE_TEST_ENTRY(SurfaceMesherTestEntryPoint)
 {
     TestBall();
     TestEmitRanges();
+    TestSurfaceMaterial();
     TestLimits();
     LAIUE_TEST_SUCCESS();
 }
