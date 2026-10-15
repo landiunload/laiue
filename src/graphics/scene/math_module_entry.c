@@ -14,6 +14,8 @@ static const LaiueSceneMathServiceV1 service = {
     .matrix4Multiply = Matrix4Multiply,
     .matrix4ExtractFrustumPlanes = Matrix4ExtractFrustumPlanes,
     .frustumIntersectsBox = FrustumIntersectsBox,
+    .matrix4Perspective = Matrix4Perspective,
+    .matrix4LookAt = Matrix4LookAt,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

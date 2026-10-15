@@ -60,3 +60,88 @@ bool FrustumIntersectsBox(const float planes[6][4], const float minimum[3], cons
 
     return true;
 }
+
+static void Matrix4Identity(float out[16])
+{
+    for (int32_t index = 0; index < 16; ++index)
+    {
+        out[index] = (index % 5 == 0) ? 1.0f : 0.0f;
+    }
+}
+
+bool Matrix4Perspective(float verticalFovRadians, float aspectRatio, float nearPlane,
+                        float farPlane, float out[16])
+{
+    Matrix4Identity(out);
+    if (!(verticalFovRadians > 0.0f && verticalFovRadians < 3.14159f) || !(aspectRatio > 0.0f) ||
+        !(nearPlane > 0.0f) || !(farPlane > nearPlane))
+    {
+        return false;
+    }
+    const float yScale = 1.0f / ScalarTan(verticalFovRadians * 0.5f);
+    const float depth = farPlane / (farPlane - nearPlane);
+    out[0] = yScale / aspectRatio;
+    out[5] = yScale;
+    out[10] = depth;
+    out[11] = 1.0f;
+    out[14] = -nearPlane * depth;
+    out[15] = 0.0f;
+    return true;
+}
+
+static float Dot3(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void Cross3(const float a[3], const float b[3], float out[3])
+{
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static bool Normalize3(float vector[3])
+{
+    const float length = ScalarSqrt(Dot3(vector, vector));
+    if (!(length > 1e-20f))
+    {
+        return false;
+    }
+    vector[0] /= length;
+    vector[1] /= length;
+    vector[2] /= length;
+    return true;
+}
+
+bool Matrix4LookAt(const float eye[3], const float target[3], const float up[3], float out[16])
+{
+    Matrix4Identity(out);
+    float forward[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
+    float right[3];
+    float trueUp[3];
+    if (!Normalize3(forward))
+    {
+        return false;
+    }
+    // Тот же базис, что у CameraGetViewMatrix: right = forward x up,
+    // верх кадра = right x forward.
+    Cross3(forward, up, right);
+    if (!Normalize3(right))
+    {
+        return false;
+    }
+    Cross3(right, forward, trueUp);
+    for (int32_t axis = 0; axis < 3; ++axis)
+    {
+        out[axis * 4 + 0] = right[axis];
+        out[axis * 4 + 1] = trueUp[axis];
+        out[axis * 4 + 2] = forward[axis];
+        out[axis * 4 + 3] = 0.0f;
+    }
+    out[12] = -Dot3(right, eye);
+    out[13] = -Dot3(trueUp, eye);
+    out[14] = -Dot3(forward, eye);
+    out[15] = 1.0f;
+    return true;
+}

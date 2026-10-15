@@ -248,6 +248,8 @@ if(TARGET laiue_mesher)
     laiue_add_harness(laiue_chunk_mesher_test ChunkMesherTestEntryPoint chunk_mesher_test.c
         LIBRARIES laiue::mesher laiue::world laiue::numeric
         TEST laiue.mesh.chunk_mesher TIMEOUT 120)
+    laiue_add_harness(laiue_surface_mesher_test SurfaceMesherTestEntryPoint surface_mesher_test.c
+        LIBRARIES laiue::mesher TEST laiue.mesh.surface_mesher)
     if(laiue_shared_modules)
         laiue_add_harness(laiue_mesher_module_test MesherModuleTestEntryPoint
             mesher_module_test.c BOOTSTRAP DEPENDS laiue_mesher TEST laiue.mesh.module)
@@ -306,6 +308,8 @@ if(TARGET laiue_voxel_render)
     endif()
     laiue_add_harness(laiue_panorama_test PanoramaTestEntryPoint panorama_test.c
         LIBRARIES laiue_scene laiue_scene_math TEST laiue.scene.panorama)
+    laiue_add_harness(laiue_scene_math_test SceneMathTestEntryPoint scene_math_test.c
+        LIBRARIES laiue_scene_math TEST laiue.scene.math)
 endif()
 
 # Graphics. Driver-dependent tests skip without a GPU unless it is required.

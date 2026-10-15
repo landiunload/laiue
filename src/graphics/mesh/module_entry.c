@@ -15,6 +15,7 @@ static const LaiueMesherServiceV1 service = {
     .scratchCreate = ChunkMesherScratchCreate,
     .scratchDestroy = ChunkMesherScratchDestroy,
     .buildChunkMesh = BuildChunkMesh,
+    .buildSurfaceMesh = LaiueSurfaceMeshBuildV1,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

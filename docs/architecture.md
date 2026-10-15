@@ -23,7 +23,7 @@
 | `window` | окно Win32 или X11 и цикл сообщений |
 | `input` | клавиатура и мышь: Raw Input на Windows, X11 на Linux |
 | `audio` | PCM-микшер и offscreen путь; `audio_output` отдельно даёт WASAPI/ALSA |
-| `mesh` | greedy meshing областей `World` |
+| `mesh` | greedy meshing областей `World` и гладкая поверхность поля плотности |
 | `render` | backend-neutral graphics device плюс providers D3D12/Vulkan, GPU-меши, шейдеры и текстуры; content подключается таблицей сервиса |
 | `voxel_render` | композиционный adapter для world/mesh/render; не импортирует эти DLL напрямую |
 | `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |

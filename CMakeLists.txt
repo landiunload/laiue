@@ -279,7 +279,8 @@ laiue_install_headers(laiue_audio audio
     audio/audio.h audio/audio_stream.h audio/audio_offscreen.h audio/audio_service.h)
 laiue_install_headers(laiue_audio_output audio audio/audio_output_service.h)
 laiue_install_headers(laiue_audio_pack audio audio/audio_pack.h audio/audio_pack_service.h)
-laiue_install_headers(laiue_mesher mesh graphics/mesh/chunk_mesher.h graphics/mesh/mesher_service.h)
+laiue_install_headers(laiue_mesher mesh
+    graphics/mesh/chunk_mesher.h graphics/mesh/mesher_service.h graphics/mesh/surface_mesher.h)
 laiue_install_headers(laiue_render render
     graphics/render/chunk_geometry.h graphics/render/renderer.h
     graphics/render/graphics_service.h graphics/render/content_provider.h

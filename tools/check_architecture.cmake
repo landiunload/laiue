@@ -11,7 +11,7 @@ set(allowed_graphics graphics)
 set(allowed_input input mod platform)
 set(allowed_math math)
 set(allowed_media media)
-set(allowed_mesh mesh mod platform render world)
+set(allowed_mesh math mesh mod platform render world)
 # Мир на мешах — данные и запросы без графики; отрисовку делает отдельный
 # адаптер, которому видны только публичный графический контракт и таблица
 # мира, но не модели и не рендер.
