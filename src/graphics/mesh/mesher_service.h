@@ -2,6 +2,7 @@
 
 #include "mesh/chunk_mesher.h"
 #include "mesh/surface_mesher.h"
+#include "mod/module_api.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -29,3 +30,4 @@ typedef struct LaiueMesherServiceV1
 #define LAIUE_MESHER_SERVICE_V1_SURFACE_SIZE ((uint32_t)sizeof(LaiueMesherServiceV1))
 
 LAIUE_MESHER_API const LaiueMesherServiceV1 *LaiueMesherGetStaticServiceV1(void);
+const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
