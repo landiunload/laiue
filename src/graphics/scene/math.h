@@ -36,3 +36,16 @@ LAIUE_SCENE_MATH_API bool Matrix4Perspective(
 LAIUE_SCENE_MATH_API bool Matrix4LookAt(
     const float eye[3], const float target[3], const float up[3],
     float out[16]);
+
+// Обратная матрица 4x4, посчитанная в двойной точности. false и единичная
+// матрица, если матрица вырождена.
+LAIUE_SCENE_MATH_API bool Matrix4Invert(const float matrix[16], float out[16]);
+
+// Луч из камеры через точку экрана для выбора курсором. ndcX и ndcY — от -1
+// (левый и нижний край кадра) до 1 (правый и верхний); viewProjection — та же
+// матрица, что рисует кадр (вектор-строка, глубина D3D 0..1). Начало луча
+// лежит на ближней плоскости, направление единичное. false, если матрица
+// вырождена.
+LAIUE_SCENE_MATH_API bool ViewRayThroughScreenPoint(
+    const float viewProjection[16], float ndcX, float ndcY, float outOrigin[3],
+    float outDirection[3]);

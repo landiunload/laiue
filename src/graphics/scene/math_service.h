@@ -25,10 +25,18 @@ typedef struct LaiueSceneMathServiceV1
                                float nearPlane, float farPlane, float out[16]);
     bool (*matrix4LookAt)(const float eye[3], const float target[3],
                           const float up[3], float out[16]);
+    /* Optional tail: present when both the published size and structSize
+     * reach LAIUE_SCENE_MATH_SERVICE_V1_PICKING_SIZE. */
+    bool (*matrix4Invert)(const float matrix[16], float out[16]);
+    bool (*viewRayThroughScreenPoint)(const float viewProjection[16], float ndcX,
+                                      float ndcY, float outOrigin[3],
+                                      float outDirection[3]);
 } LaiueSceneMathServiceV1;
 
 #define LAIUE_SCENE_MATH_SERVICE_V1_LEGACY_SIZE \
     ((uint32_t)offsetof(LaiueSceneMathServiceV1, matrix4Perspective))
-#define LAIUE_SCENE_MATH_SERVICE_V1_CAMERA_SIZE ((uint32_t)sizeof(LaiueSceneMathServiceV1))
+#define LAIUE_SCENE_MATH_SERVICE_V1_CAMERA_SIZE \
+    ((uint32_t)offsetof(LaiueSceneMathServiceV1, matrix4Invert))
+#define LAIUE_SCENE_MATH_SERVICE_V1_PICKING_SIZE ((uint32_t)sizeof(LaiueSceneMathServiceV1))
 
 const LaiueModuleApiV1 *LaiueSceneMathGetStaticModuleApiV1(void);

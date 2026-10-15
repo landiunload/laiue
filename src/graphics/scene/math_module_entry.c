@@ -16,6 +16,8 @@ static const LaiueSceneMathServiceV1 service = {
     .frustumIntersectsBox = FrustumIntersectsBox,
     .matrix4Perspective = Matrix4Perspective,
     .matrix4LookAt = Matrix4LookAt,
+    .matrix4Invert = Matrix4Invert,
+    .viewRayThroughScreenPoint = ViewRayThroughScreenPoint,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
@@ -78,7 +80,7 @@ static const LaiueModuleApiV1 api = {
         .structSize = sizeof(LaiueModuleDescriptorV1),
         .abiVersion = LAIUE_MODULE_ABI_VERSION_1,
         .id = "laiue.scene_math",
-        .version = "1.0.0",
+        .version = "1.1.0",
         .providesServices = provides,
         .providesCount = 1u,
     },
