@@ -55,8 +55,10 @@ else()
         system.h)
     target_link_libraries(laiue_platform_support
         PRIVATE laiue::build_options)
+    # Installed with the SDK beside bootstrap, so it carries no LTO objects.
     set_target_properties(laiue_platform_support PROPERTIES
-        POSITION_INDEPENDENT_CODE ON)
+        POSITION_INDEPENDENT_CODE ON
+        LAIUE_PORTABLE_ARCHIVE ON)
     if(LAIUE_PLATFORM_POSIX)
         set_target_properties(laiue_platform_support PROPERTIES
             C_VISIBILITY_PRESET hidden

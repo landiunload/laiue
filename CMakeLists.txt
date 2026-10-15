@@ -42,8 +42,8 @@ option(LAIUE_BUILD_MESH_WORLD "Build the infinite mesh world module" ON)
 
 # Набор графического backend-а не выбирает оконный и вводный provider.
 # Windows-слой одинаково доступен для D3D12 и Vulkan; сам Vulkan при этом
-# также умеет headless/offscreen. На POSIX эти native providers пока
-# отсутствуют и внешний adapter может заменить их своей реализацией.
+# также умеет headless/offscreen. На Linux окно и ввод собираются поверх
+# X11, если он найден; на macOS и внешних платформах их даёт adapter.
 if(LAIUE_PLATFORM_WINDOWS)
     set(LAIUE_GRAPHICS_MODULE_DIRECTORIES input mesh profile render scene voxel_render)
 else()
@@ -119,7 +119,10 @@ endif()
 # module graph at runtime. The existing `laiue::mod` target remains the
 # compatibility aggregate for old native mods.
 add_library(laiue_bootstrap STATIC
+    src/modding/mod/application.c
+    src/modding/mod/application.h
     src/modding/mod/module_api.h
+    src/modding/mod/module_artifact.c
     src/modding/mod/module_manifest.c
     src/modding/mod/module_manifest.h
     src/modding/mod/module_profile.c
@@ -131,17 +134,25 @@ add_library(laiue_bootstrap STATIC
     src/modding/mod/mod_types.h)
 add_library(laiue::bootstrap ALIAS laiue_bootstrap)
 target_include_directories(laiue_bootstrap
-    PUBLIC
-        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
-        "$<INSTALL_INTERFACE:include/laiue>")
+    PUBLIC ${LAIUE_PUBLIC_INCLUDE_DIRECTORIES})
+# The engine's compile rules apply to the archive itself, but neither its
+# no-CRT link options nor its no-CRT memcpy/memset objects may reach the
+# application that links it: that application chooses its own C runtime.
+# Engine executables without a CRT get those objects from laiue_common.
 target_link_libraries(laiue_bootstrap
     PRIVATE
-        laiue_common
+        $<COMPILE_ONLY:laiue::build_options>
         laiue::platform_support)
-target_compile_definitions(laiue_bootstrap PRIVATE LAIUE_STATIC=1)
+# Public, as in the SDK package: its consumers call these functions directly
+# from the static archive, not through a DLL import.
+target_compile_definitions(laiue_bootstrap PUBLIC LAIUE_STATIC=1)
+laiue_define_module_artifact_names(laiue_bootstrap)
+# An application links this archive with its own compiler, so it carries
+# ordinary machine code rather than LTO objects of the engine's compiler.
 set_target_properties(laiue_bootstrap PROPERTIES
     EXPORT_NAME bootstrap
-    POSITION_INDEPENDENT_CODE ON)
+    POSITION_INDEPENDENT_CODE ON
+    LAIUE_PORTABLE_ARCHIVE ON)
 
 # Public contracts for optional technology providers. These are intentionally
 # header-only interface targets: applications can compile a provider without
@@ -149,9 +160,7 @@ set_target_properties(laiue_bootstrap PROPERTIES
 foreach(api IN ITEMS graphics voxel character)
     add_library(laiue_${api}_api INTERFACE)
     add_library(laiue::${api}_api ALIAS laiue_${api}_api)
-    target_include_directories(laiue_${api}_api INTERFACE
-        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
-        "$<INSTALL_INTERFACE:include/laiue>")
+    target_include_directories(laiue_${api}_api INTERFACE ${LAIUE_PUBLIC_INCLUDE_DIRECTORIES})
     set_target_properties(laiue_${api}_api PROPERTIES EXPORT_NAME ${api}_api)
 endforeach()
 
@@ -245,6 +254,7 @@ laiue_install_headers(laiue_content content
     assets/content/content_catalog.h assets/content/content_format.h
     assets/content/content_service.h)
 laiue_install_headers(laiue_mod mod
+    modding/mod/application.h
     modding/mod/mod.h modding/mod/mod_api.h modding/mod/mod_host.h
     modding/mod/mod_manifest.h modding/mod/mod_types.h modding/mod/module_api.h
     modding/mod/module_service.h modding/mod/module_manifest.h
@@ -261,7 +271,10 @@ laiue_install_headers(laiue_animation animation assets/animation/animation_servi
 laiue_install_headers(laiue_mesh_world mesh_world simulation/mesh_world/mesh_world_service.h)
 laiue_install_headers(laiue_mesh_world_render mesh_world_render
     graphics/mesh_world_render/mesh_world_render_service.h)
-laiue_install_headers(laiue_window platform platform/time.h)
+# The window headers keep their source directory: window_service.h includes
+# "platform/window.h".
+laiue_install_headers(laiue_window platform
+    platform/time.h platform/window.h platform/window_service.h)
 laiue_install_headers(laiue_audio audio
     audio/audio.h audio/audio_stream.h audio/audio_offscreen.h audio/audio_service.h)
 laiue_install_headers(laiue_audio_output audio audio/audio_output_service.h)
@@ -281,7 +294,6 @@ laiue_install_headers(laiue_voxel_render voxel_render
 laiue_install_headers(laiue_voxel_raycast voxel
     simulation/voxel/raycast.h simulation/voxel/raycast_service.h)
 laiue_install_headers(laiue_ui ui ui/ui.h ui/ui_service.h ui/ui_font.h ui/ui_format.h)
-laiue_install_headers(laiue_window window platform/window.h platform/window_service.h)
 if(LAIUE_BUILD_GRAPHICS)
     install(DIRECTORY "${PROJECT_SOURCE_DIR}/shaders/"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/laiue/shaders"
@@ -454,6 +466,14 @@ if(BUILD_TESTING)
     if(TARGET laiue_static_core_link_smoke)
         add_test(NAME laiue.build.static_core_link
             COMMAND laiue_static_core_link_smoke)
+    endif()
+    if(LAIUE_PLATFORM_WINDOWS)
+        add_test(NAME laiue.build.bootstrap_without_runtime
+            COMMAND "${CMAKE_COMMAND}"
+                "-DARCHIVER=${CMAKE_AR}"
+                "-DARCHIVE=$<TARGET_FILE:laiue_bootstrap>"
+                "-DFORBIDDEN=$<JOIN:$<TARGET_OBJECTS:laiue_runtime>,|>"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_archive_members.cmake")
     endif()
     if(LAIUE_ENABLE_SDK_INSTALL_RESOLVED)
         add_test(NAME laiue.install.consumer

@@ -1,5 +1,0 @@
-cmake_minimum_required(VERSION 4.2...4.4)
-project(laiue_bootstrap_consumer LANGUAGES C)
-find_package(laiue CONFIG REQUIRED)
-add_executable(laiue_bootstrap_consumer main.c)
-target_link_libraries(laiue_bootstrap_consumer PRIVATE laiue::bootstrap)

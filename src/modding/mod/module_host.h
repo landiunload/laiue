@@ -145,6 +145,47 @@ LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadStatic(
     LaiueModuleHost *host, const LaiueModuleApiV1 *const *apis, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleHostUnloadAll(LaiueModuleHost *host);
+
+/* === Modules by name ===
+ *
+ * An engine module is built as `<prefix>laiue_<name><suffix>`: laiue_window.dll
+ * on Windows, liblaiue_window.so on Linux and Android, liblaiue_window.dylib on
+ * Apple platforms. The prefix and suffix come from the toolchain that built the
+ * engine, so the name always matches the produced artifact and an application
+ * does not repeat the platform table. `name` is the module's build name
+ * ("window", "graphics_vulkan"): ASCII lowercase letters, digits and '_',
+ * starting with a letter or digit. */
+#define LAIUE_MODULE_ARTIFACT_NAME_CAPACITY 128u
+
+/* Writes the NUL-terminated file name. INVALID_ARGUMENT rejects a bad name or
+ * output, CAPACITY a short buffer; on failure output holds an empty string. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleArtifactFileNameV1(const char *name, wchar_t *output,
+                                                              uint32_t capacity);
+
+typedef struct LaiueModuleNamedProfileV1
+{
+    uint32_t structSize;
+    /* LAIUE_MODULE_PROFILE_ALLOW_PARTIAL makes every named artifact optional:
+     * a missing or broken module is reported, and independent modules still
+     * start. Without it the profile is the strict transactional load. */
+    uint32_t flags;
+    /* Directory that holds the artifacts. NULL selects the directory of the
+     * running executable, where builds and bundles place them. */
+    const wchar_t *directory;
+    const char *const *names;
+    uint32_t nameCount;
+    const LaiueModuleProviderSelectionV1 *providerSelections;
+    uint32_t providerSelectionCount;
+    uintptr_t reserved[4];
+} LaiueModuleNamedProfileV1;
+
+/* Resolves every name with LaiueModuleArtifactFileNameV1 inside the directory
+ * and loads the result exactly like LaiueModuleHostLoadProfileV1, including
+ * the report and provider selections. A name appears at most once. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadNamedProfileV1(
+    LaiueModuleHost *host, const LaiueModuleNamedProfileV1 *profile,
+    LaiueModuleLoadReportV1 *report, LaiueModuleDiagnostic *diagnostic);
+
 /* These snapshots return zero while a lifecycle operation is in progress. */
 LAIUE_MOD_API uint32_t LaiueModuleHostLoadedCount(const LaiueModuleHost *host);
 /* Fixed-width C ABI result: non-zero when the selected module is loaded. */

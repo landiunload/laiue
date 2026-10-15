@@ -16,6 +16,23 @@ API and ABI may change between minor versions.
   distinct descriptor sets.
 - Builds use the freshly compiled shaders; previously the checked-in copies
   were always compiled in, and the build output was only verified.
+- `laiue::bootstrap` loads modules by name: `LaiueModuleHostLoadNamedProfileV1`
+  resolves `window` to `laiue_window.dll`, `liblaiue_window.so` or
+  `liblaiue_window.dylib` in the executable directory, and
+  `LaiueModuleArtifactFileNameV1` returns that file name.
+- `mod/application.h` gives a bootstrap-only application its executable
+  directory, a monotonic clock, sleep and a termination request flag.
+- The SDK installs `window.h` and `window_service.h` under `platform/`;
+  `window_service.h` did not compile from the old `window/` location.
+  `ui/ui_service.h` now includes the export macros it uses.
+- A source-tree build exposes the same include paths and the same
+  `LAIUE_STATIC` definition of `laiue::bootstrap` as the SDK, so an
+  application builds unchanged against either.
+- The bootstrap archive no longer carries the engine's no-CRT `memcpy` and
+  `memmove`; an application linked with its C runtime and LTCG got them twice.
+- The bootstrap and platform archives are compiled without LTO, so an
+  application links them with its own compiler; the Linux SDK built with
+  Clang could not be linked by GCC.
 
 ## 0.1.0
 

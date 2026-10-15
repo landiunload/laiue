@@ -73,6 +73,41 @@ partial-профиль теряет только этот сервис: конк
 загрузочный импорт `liblaiue_*` у модулей и у shared-примера, поэтому
 удаление artifact отключает технологию, а не запуск процесса.
 
+## Приложение поверх bootstrap
+
+Приложению, которое линкует только `laiue::bootstrap`, не нужно знать, как
+называются файлы модулей на каждой платформе. `LaiueModuleHostLoadNamedProfileV1`
+принимает имена сборки (`window`, `input`, `graphics_vulkan`) и сама строит
+путь `<каталог>/<prefix>laiue_<имя><suffix>`. Префикс и суффикс берутся у
+toolchain-а, собравшего движок, поэтому имя всегда совпадает с собранным
+artifact. Каталог по умолчанию — каталог исполняемого файла, куда модули
+кладут сборка и бандлы. С `LAIUE_MODULE_PROFILE_ALLOW_PARTIAL` каждый модуль
+необязателен: отсутствующий попадает в report, остальные запускаются. Выбор
+provider и report работают так же, как в `LaiueModuleHostLoadProfileV1`.
+Имя файла отдельно возвращает `LaiueModuleArtifactFileNameV1`.
+
+```c
+static const char *const names[] = {"window", "input", "graphics_d3d12"};
+const LaiueModuleNamedProfileV1 profile = {
+    .structSize = sizeof(profile),
+    .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+    .names = names,
+    .nameCount = 3u,
+};
+LaiueModuleHostLoadNamedProfileV1(host, &profile, &report, &diagnostic);
+```
+
+`mod/application.h` открывает такому приложению ту же платформенную
+границу, которой пользуется движок: каталог исполняемого файла, монотонные
+часы, сон и флаг запроса завершения (Ctrl+C и закрытие консоли на Windows,
+SIGINT и SIGTERM на POSIX). Заголовки ОС приложению для этого не нужны.
+
+Сборка движка из исходников даёт те же пути заголовков, что и SDK:
+`mod/module_host.h`, `world/world.h`, `scene/camera.h`. Проверка
+установленного SDK компилирует каждый публичный заголовок отдельно и
+запускает потребителя, который линкует только bootstrap и загружает модуль
+по имени.
+
 ## Границы контрактов
 
 ### Срок жизни сервисов и очистка ошибок

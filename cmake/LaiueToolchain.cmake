@@ -206,15 +206,28 @@ endif()
 # композиции не меняет глобальные флаги CMake и не загрязняет потребителей.
 add_library(laiue_build_options INTERFACE)
 add_library(laiue::build_options ALIAS laiue_build_options)
+
+# Public headers are addressed the way the SDK installs them: "mod/module_host.h",
+# "world/world.h", "scene/camera.h". In the source tree they sit under category
+# directories, so these roots let an application that builds the engine from
+# source include exactly what an SDK consumer includes. src/core stays private:
+# its headers are not part of the SDK.
+set(LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES
+    "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/src/assets"
+    "${PROJECT_SOURCE_DIR}/src/graphics"
+    "${PROJECT_SOURCE_DIR}/src/jobs"
+    "${PROJECT_SOURCE_DIR}/src/simulation"
+    "${PROJECT_SOURCE_DIR}/src/modding")
+list(TRANSFORM LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES
+    PREPEND "$<BUILD_INTERFACE:" OUTPUT_VARIABLE LAIUE_PUBLIC_INCLUDE_DIRECTORIES)
+list(TRANSFORM LAIUE_PUBLIC_INCLUDE_DIRECTORIES APPEND ">")
+list(APPEND LAIUE_PUBLIC_INCLUDE_DIRECTORIES "$<INSTALL_INTERFACE:include/laiue>")
+
 target_include_directories(laiue_build_options
     INTERFACE
-        "${PROJECT_SOURCE_DIR}/src"
-        "${PROJECT_SOURCE_DIR}/src/core"
-        "${PROJECT_SOURCE_DIR}/src/assets"
-        "${PROJECT_SOURCE_DIR}/src/graphics"
-        "${PROJECT_SOURCE_DIR}/src/jobs"
-        "${PROJECT_SOURCE_DIR}/src/simulation"
-        "${PROJECT_SOURCE_DIR}/src/modding")
+        ${LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES}
+        "${PROJECT_SOURCE_DIR}/src/core")
 target_compile_definitions(laiue_build_options INTERFACE
     LAIUE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     LAIUE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
@@ -388,36 +401,42 @@ else()
     add_library(laiue_runtime INTERFACE)
 endif()
 
+# Archives handed to applications (bootstrap and its platform boundary) carry
+# ordinary machine code: an LTO object links only with the exact compiler
+# that produced it, and the application picks its own. Such targets set
+# LAIUE_PORTABLE_ARCHIVE; the LTO compile flags below skip them.
+set(_laiue_lto_compile
+    "$<AND:$<CONFIG:Release>,$<NOT:$<BOOL:$<TARGET_PROPERTY:LAIUE_PORTABLE_ARCHIVE>>>>")
 if(LAIUE_ENABLE_LTO)
     if(LAIUE_PLATFORM_WINDOWS OR MSVC)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/GL>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=${LAIUE_CLANG_LTO_MODE}>)
+            $<$<AND:$<C_COMPILER_ID:MSVC>,${_laiue_lto_compile}>:/GL>
+            $<$<AND:$<C_COMPILER_ID:Clang>,${_laiue_lto_compile}>:-flto=${LAIUE_CLANG_LTO_MODE}>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/LTCG>
             $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:/OPT:LLDLTO=3 /OPT:LLDLTOCGO=3>)
     elseif(LAIUE_PLATFORM_POSIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto>
-            $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,${_laiue_lto_compile}>:-flto>
+            $<$<AND:$<C_COMPILER_ID:Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto;-flto-partition=one>
             $<$<AND:$<C_COMPILER_ID:Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_POSIX AND APPLE)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_EXTERNAL AND
            CMAKE_SYSTEM_NAME MATCHES "^(Android|iOS|tvOS|visionOS)$")
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
     elseif(LAIUE_PLATFORM_EXTERNAL)
         target_compile_options(laiue_build_options INTERFACE
-            $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto>
-            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)
+            $<$<AND:$<C_COMPILER_ID:GNU>,${_laiue_lto_compile}>:-flto>
+            $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,${_laiue_lto_compile}>:-flto=full>)
         target_link_options(laiue_build_options INTERFACE
             $<$<AND:$<C_COMPILER_ID:GNU>,$<CONFIG:Release>>:-flto;-flto-partition=one>
             $<$<AND:$<C_COMPILER_ID:AppleClang,Clang>,$<CONFIG:Release>>:-flto=full>)

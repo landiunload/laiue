@@ -1,3 +1,4 @@
+#include "mod/application.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
 #include "test_runtime.h"
@@ -723,6 +724,154 @@ static bool Join(wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY], const wchar_t *ro
     return true;
 }
 
+static bool WideEquals(const wchar_t *first, const wchar_t *second)
+{
+    uint32_t index = 0u;
+    while (first[index] != L'\0' && first[index] == second[index])
+        ++index;
+    return first[index] == second[index];
+}
+
+static void ExpectArtifactNames(void)
+{
+    static wchar_t name[LAIUE_MODULE_ARTIFACT_NAME_CAPACITY];
+    Expect(LaiueModuleArtifactFileNameV1("module_provider", name,
+                                         LAIUE_MODULE_ARTIFACT_NAME_CAPACITY) == LAIUE_MODULE_OK &&
+               WideEquals(name, PROVIDER_NAME),
+           "artifact name matches the file the build produced");
+
+    /* A name fills at most LAIUE_MODULE_MAX_NAME - 1 characters. */
+    static char longest[LAIUE_MODULE_MAX_NAME + 1u];
+    for (uint32_t index = 0u; index < LAIUE_MODULE_MAX_NAME; ++index)
+        longest[index] = 'a';
+    longest[LAIUE_MODULE_MAX_NAME] = '\0';
+    static const char *const invalid[] = {
+        "", "Window", "_window", "graphics.vulkan", "../window", "win dow", "window\\x", longest,
+    };
+    for (uint32_t index = 0u; index < sizeof(invalid) / sizeof(invalid[0]); ++index)
+    {
+        name[0] = L'x';
+        Expect(LaiueModuleArtifactFileNameV1(invalid[index], name,
+                                             LAIUE_MODULE_ARTIFACT_NAME_CAPACITY) ==
+                       LAIUE_MODULE_INVALID_ARGUMENT &&
+                   name[0] == L'\0',
+               "invalid artifact name is rejected with an empty result");
+    }
+    longest[LAIUE_MODULE_MAX_NAME - 1u] = '\0';
+    Expect(LaiueModuleArtifactFileNameV1(longest, name, LAIUE_MODULE_ARTIFACT_NAME_CAPACITY) ==
+               LAIUE_MODULE_OK,
+           "the longest module name is accepted");
+    Expect(LaiueModuleArtifactFileNameV1(NULL, name, LAIUE_MODULE_ARTIFACT_NAME_CAPACITY) ==
+                   LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleArtifactFileNameV1("window", NULL, 8u) == LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleArtifactFileNameV1("window", name, 0u) == LAIUE_MODULE_INVALID_ARGUMENT,
+           "missing artifact name arguments are rejected");
+    name[0] = L'x';
+    Expect(LaiueModuleArtifactFileNameV1("module_provider", name, 8u) == LAIUE_MODULE_CAPACITY &&
+               name[0] == L'\0',
+           "short artifact name buffer fails with an empty result");
+}
+
+static void ExpectModulesByName(LaiueModuleHost *host, const wchar_t *directory)
+{
+    LaiueModuleDiagnostic diagnostic;
+    static const char *const names[] = {"module_consumer", "module_provider"};
+    LaiueModuleNamedProfileV1 profile = {
+        .structSize = sizeof(profile),
+        .names = names,
+        .nameCount = 2u,
+    };
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) == LAIUE_MODULE_OK,
+           diagnostic.message);
+    Expect(LaiueModuleHostLoadedCount(host) == 2u &&
+               LaiueModuleHostIsLoaded(host, "example.provider") &&
+               LaiueModuleHostIsLoaded(host, "example.consumer"),
+           "named profile loads modules from the executable directory");
+    LaiueModuleHostUnloadAll(host);
+
+    profile.directory = directory;
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+                   LAIUE_MODULE_OK &&
+               LaiueModuleHostLoadedCount(host) == 2u,
+           "named profile loads modules from an explicit directory");
+    LaiueModuleHostUnloadAll(host);
+
+    static const char *const withMissing[] = {"module_provider", "module_that_is_not_built",
+                                              "module_consumer"};
+    static LaiueModuleLoadReportEntryV1 entries[3];
+    LaiueModuleLoadReportV1 report;
+    LaiueModuleLoadReportInitialize(&report, entries, 3u);
+    profile = (LaiueModuleNamedProfileV1){
+        .structSize = sizeof(profile),
+        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
+        .names = withMissing,
+        .nameCount = 3u,
+    };
+    const LaiueModuleStatus partialStatus =
+        LaiueModuleHostLoadNamedProfileV1(host, &profile, &report, &diagnostic);
+    Expect((partialStatus == LAIUE_MODULE_OK || partialStatus == LAIUE_MODULE_PARTIAL) &&
+               LaiueModuleHostLoadedCount(host) == 2u &&
+               (entries[1].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u &&
+               (entries[0].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u &&
+               (entries[2].flags & LAIUE_MODULE_PROFILE_ENTRY_LOADED) != 0u,
+           "partial named profile skips a missing module and starts the rest");
+    LaiueModuleHostUnloadAll(host);
+
+    profile.flags = 0u;
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+                   LAIUE_MODULE_LOAD_FAILED &&
+               LaiueModuleHostLoadedCount(host) == 0u,
+           "strict named profile rejects a missing module without loading the rest");
+
+    static const char *const duplicated[] = {"module_provider", "module_provider"};
+    static const char *const badName[] = {"module_provider", "Module_consumer"};
+    profile.names = duplicated;
+    profile.nameCount = 2u;
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+               LAIUE_MODULE_INVALID_ARGUMENT,
+           "duplicated module name is rejected");
+    profile.names = badName;
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+               LAIUE_MODULE_INVALID_ARGUMENT,
+           "invalid module name is rejected");
+    profile.names = names;
+    profile.directory = L"";
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+               LAIUE_MODULE_INVALID_ARGUMENT,
+           "empty module directory is rejected");
+    profile.directory = NULL;
+    profile.nameCount = 0u;
+    Expect(LaiueModuleHostLoadNamedProfileV1(host, &profile, NULL, &diagnostic) ==
+                   LAIUE_MODULE_INVALID_ARGUMENT &&
+               LaiueModuleHostLoadNamedProfileV1(host, NULL, NULL, &diagnostic) ==
+                   LAIUE_MODULE_INVALID_ARGUMENT,
+           "empty named profile is rejected");
+    Expect(LaiueModuleHostLoadedCount(host) == 0u, "rejected named profiles load nothing");
+}
+
+static void ExpectApplicationServices(const wchar_t *directory)
+{
+    static wchar_t executableDirectory[LAIUE_APPLICATION_PATH_CAPACITY];
+    Expect(LaiueApplicationExecutableDirectory(executableDirectory,
+                                               LAIUE_APPLICATION_PATH_CAPACITY) != 0u &&
+               WideEquals(executableDirectory, directory),
+           "application sees its executable directory");
+    wchar_t tiny[2] = {L'x', L'x'};
+    Expect(LaiueApplicationExecutableDirectory(tiny, 2u) == 0u && tiny[0] == L'\0' &&
+               LaiueApplicationExecutableDirectory(NULL, 8u) == 0u,
+           "short executable directory buffer fails with an empty result");
+
+    const double before = LaiueApplicationMonotonicSeconds();
+    LaiueApplicationSleepMilliseconds(2u);
+    const double after = LaiueApplicationMonotonicSeconds();
+    Expect(before >= 0.0 && after > before, "monotonic clock advances across a sleep");
+
+    Expect(LaiueApplicationInstallTerminationHandler() != 0u &&
+               LaiueApplicationTerminationRequested() == 0u,
+           "termination handler installs without a pending request");
+    LaiueApplicationRemoveTerminationHandler();
+}
+
 LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
 {
     /* Keep the no-CRT test entry below the Windows stack-probe threshold. */
@@ -1172,6 +1321,10 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     Expect(LaiueModuleHostLoadedCount(host) == 0u, "unload clears all modules");
     Expect(LaiueModuleHostQueryService(host, "example.counter", 1u, 1u, NULL, NULL) == NULL,
            "unload removes module services");
+
+    ExpectArtifactNames();
+    ExpectModulesByName(host, directory);
+    ExpectApplicationServices(directory);
     LaiueModuleHostDestroy(host);
     LAIUE_TEST_SUCCESS();
 }
