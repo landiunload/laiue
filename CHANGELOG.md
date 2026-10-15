@@ -30,6 +30,12 @@ API and ABI may change between minor versions.
   application builds unchanged against either.
 - The bootstrap archive no longer carries the engine's no-CRT `memcpy` and
   `memmove`; an application linked with its C runtime and LTCG got them twice.
+- `laiue.mesher` builds smooth surfaces of density fields
+  (`LaiueSurfaceMeshBuildV1`, surface nets) for volumetric terrain and caves.
+  Caller-owned buffers make it allocation-free and thread-safe, and blocks of
+  a field join without gaps through owned edge ranges.
+- `laiue.scene_math` adds `Matrix4Perspective` and `Matrix4LookAt` in the
+  renderer's conventions.
 - The bootstrap and platform archives are compiled without LTO, so an
   application links them with its own compiler; the Linux SDK built with
   Clang could not be linked by GCC.

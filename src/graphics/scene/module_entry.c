@@ -60,7 +60,7 @@ static uint32_t ModuleStart(void *context)
         &graphicsVersion, &graphicsSize);
     state->sceneMath = (const LaiueSceneMathServiceV1 *)state->host->queryService(
         state->host->context, LAIUE_SCENE_MATH_SERVICE_NAME,
-        LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1, sizeof(LaiueSceneMathServiceV1),
+        LAIUE_SCENE_MATH_SERVICE_ABI_VERSION_1, LAIUE_SCENE_MATH_SERVICE_V1_LEGACY_SIZE,
         &sceneMathVersion, &sceneMathSize);
     if (state->graphics == NULL || graphicsVersion < LAIUE_GRAPHICS_SERVICE_ABI_VERSION_1 ||
         graphicsSize < LAIUE_GRAPHICS_SERVICE_V1_BASE_SIZE || state->sceneMath == NULL ||

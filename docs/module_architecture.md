@@ -211,7 +211,12 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
 * `laiue.mesher` публикует scratch и greedy chunk meshing поверх generic
   `ChunkMesherWorldSource` callback. Он не требует и не импортирует
   `laiue.world`: world, voxel provider или тестовый источник адаптируются
-  вызывающей стороной;
+  вызывающей стороной. Необязательный хвост таблицы `buildSurfaceMesh`
+  (`LaiueSurfaceMeshBuildV1`) строит гладкую поверхность поля плотности
+  методом surface nets: объёмный рельеф, пещеры, облака. Все буферы
+  принадлежат вызывающему, поэтому функция ничего не выделяет и работает в
+  любом числе потоков; соседние блоки поля сшиваются без щелей и двойных
+  граней через диапазон владения рёбрами (`emitMin`/`emitMax`);
 * `laiue.graphics` публикует legacy renderer table для существующих scene
   compatibility-потребителей, а `laiue.graphics.device` публикует общий
   device/resource contract для новых модулей. `laiue.scene`
@@ -227,7 +232,10 @@ LAIUE DLL; отсутствие мира поэтому диагностируе
   DLL. `laiue_render` остаётся объединённым compatibility-мостом для старых
   приложений;
 * `laiue.scene_math` и `laiue.voxel_raycast` являются самостоятельными
-  providers без renderer-зависимости; последний требует только `laiue.world`;
+  providers без renderer-зависимости; последний требует только `laiue.world`.
+  Хвост таблицы `scene_math` даёт перспективу и look-at в соглашениях
+  рендера (вид вдоль +Z, вектор-строка, глубина 0..1), так что приложению не
+  нужен legacy-модуль `scene` ради матриц камеры;
 * `laiue.window` и `laiue.input` отделены от renderer и публикуются только в
   профилях, где соответствующий OS backend собран.
 * `laiue.ui` публикует backend-neutral draw lists и требует
