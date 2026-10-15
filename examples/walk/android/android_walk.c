@@ -47,7 +47,6 @@
 #define ANDROID_WALK_RAGDOLL_STABLE_ID UINT64_C(0x57414C4B52414744)
 
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);
-const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 
 typedef struct AndroidWalkState AndroidWalkState;
 

@@ -12,7 +12,6 @@
 #include "walk_world.h"
 #endif
 #if defined(LAIUE_WALK_WINDOWED)
-const LaiueModuleApiV1 *LaiueMesherGetStaticModuleApiV1(void);
 #include "graphics/graphics_device_service.h"
 #include "render/graphics_service.h"
 #include "scene/scene_service.h"
