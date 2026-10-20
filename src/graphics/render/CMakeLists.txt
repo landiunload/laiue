@@ -2,6 +2,8 @@ set(render_sources
     renderer_dispatch.c
     renderer.h
     renderer_internal.h
+    pipeline_cache.c
+    pipeline_cache.h
     graphics_service.h
     module_entry.c
     content_provider.c

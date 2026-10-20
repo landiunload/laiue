@@ -28,6 +28,7 @@ extern bool RendererCaptureFrame_D3D12(Renderer *, void *, uint32_t, uint32_t *,
 extern bool RendererCanCaptureFrame_D3D12(const Renderer *);
 extern bool RendererRequestFrameCapture_D3D12(Renderer *);
 extern void RendererSetVerticalSync_D3D12(Renderer* renderer, bool enabled);
+extern bool RendererSavePipelineCache_D3D12(Renderer *);
 extern bool RendererIsVerticalSyncEnabled_D3D12(const Renderer* renderer);
 extern bool RendererUiSetFontAtlas_D3D12(Renderer* renderer, const uint8_t* alphaPixels, uint32_t width, uint32_t height);
 extern bool RendererUiLoadBackground_D3D12(Renderer* renderer, const wchar_t* path, uint32_t* outWidth, uint32_t* outHeight);
@@ -97,6 +98,7 @@ extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
 extern bool RendererCaptureFrame_Vulkan(Renderer *, void *, uint32_t, uint32_t *, uint32_t *);
 extern bool RendererCanCaptureFrame_Vulkan(const Renderer *);
 extern bool RendererUsesPushDescriptors_Vulkan(const Renderer *);
+extern bool RendererSavePipelineCache_Vulkan(Renderer *);
 extern bool RendererRequestFrameCapture_Vulkan(Renderer *);
 extern void RendererSetVerticalSync_Vulkan(Renderer* renderer, bool enabled);
 extern bool RendererIsVerticalSyncEnabled_Vulkan(const Renderer* renderer);
@@ -203,6 +205,39 @@ Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width, int32_t h
 RendererBackendKind RendererGetBackend(const Renderer* renderer)
 {
     return LookupBackend(renderer);
+}
+
+bool RendererSavePipelineCache(Renderer *renderer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererSavePipelineCache_D3D12(renderer);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererSavePipelineCache_Vulkan(renderer);
+#endif
+    default:
+        return false;
+    }
+}
+
+void RendererGetPipelineCacheStatusV1(const Renderer *renderer,
+                                      RendererPipelineCacheStatusV1 *outStatus)
+{
+    if (outStatus == NULL || outStatus->structSize < sizeof(*outStatus))
+        return;
+    const uint32_t structSize = outStatus->structSize;
+    if (LookupBackend(renderer) == RENDERER_BACKEND_AUTO)
+    {
+        memset(outStatus, 0, sizeof(*outStatus));
+        outStatus->structSize = structSize;
+        return;
+    }
+    *outStatus = ((const RendererHeader *)renderer)->pipelineCache;
+    outStatus->structSize = structSize;
 }
 
 // === Диспетчер: единственное определение каждой публичной функции ===

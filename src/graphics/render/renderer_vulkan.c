@@ -8,6 +8,7 @@
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
 #include "render/renderer_internal.h"
+#include "render/pipeline_cache.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
 #include "render/content_provider.h"
@@ -334,6 +335,11 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     PFN_vkCmdBeginRendering cmdBeginRendering;
     PFN_vkCmdEndRendering cmdEndRendering;
     bool useDynamicRendering;
+    // Кеш конвейеров драйвера; VK_NULL_HANDLE, если создать его не удалось.
+    VkPipelineCache pipelineCache;
+    RendererPipelineCacheIdentity pipelineCacheIdentity;
+    // VkPipelineCreationFeedback (ядро 1.3) сообщает о попаданиях в кеш.
+    bool pipelineCacheFeedback;
     /* Vulkan 1.4 core or VK_KHR_push_descriptor.  When present, generic
      * draws write their descriptors straight into the command buffer: no
      * pool allocation, no per-frame set cache and no cap on distinct
@@ -1505,10 +1511,28 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         pipelineInfo.subpass = 0u;
     }
 
-    VkResult result = vkCreateGraphicsPipelines(renderer->device, VK_NULL_HANDLE, 1u,
+    VkPipelineCreationFeedback feedback = {0};
+    VkPipelineCreationFeedbackCreateInfo feedbackInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+        .pNext = pipelineInfo.pNext,
+        .pPipelineCreationFeedback = &feedback,
+    };
+    if (renderer->pipelineCacheFeedback)
+        pipelineInfo.pNext = &feedbackInfo;
+
+    VkResult result = vkCreateGraphicsPipelines(renderer->device, renderer->pipelineCache, 1u,
                                                 &pipelineInfo, NULL, outPipeline);
     vkDestroyShaderModule(renderer->device, vertexModule, NULL);
     vkDestroyShaderModule(renderer->device, pixelModule, NULL);
+    if (result == VK_SUCCESS)
+    {
+        RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+        ++status->pipelinesCreated;
+        if (renderer->pipelineCacheFeedback &&
+            (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0u &&
+            (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0u)
+            ++status->pipelinesFromCache;
+    }
     return result == VK_SUCCESS;
 }
 
@@ -3013,6 +3037,13 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(chosen, &properties);
+    renderer->pipelineCacheIdentity.backend = RENDERER_BACKEND_VULKAN;
+    renderer->pipelineCacheIdentity.vendorId = properties.vendorID;
+    renderer->pipelineCacheIdentity.deviceId = properties.deviceID;
+    renderer->pipelineCacheIdentity.driverVersion = properties.driverVersion;
+    memcpy(renderer->pipelineCacheIdentity.uuid, properties.pipelineCacheUUID,
+           sizeof(renderer->pipelineCacheIdentity.uuid));
+    renderer->pipelineCacheFeedback = properties.apiVersion >= VK_API_VERSION_1_3;
     renderer->timestampPeriodNanoseconds = properties.limits.timestampPeriod;
     renderer->uniformAlignment = properties.limits.minUniformBufferOffsetAlignment;
     if (renderer->uniformAlignment < 16u)
@@ -3272,6 +3303,55 @@ static bool CreateSharedSets(Renderer *renderer)
     return true;
 }
 
+// Кеш драйвера с данными с диска. Без каталога или при отказе драйвера
+// принять данные создаётся пустой кеш; рендерер работает в любом случае.
+static bool CreatePipelineCacheObject(Renderer *renderer)
+{
+    RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+    status->structSize = sizeof(*status);
+    status->pipelinesFromCache = renderer->pipelineCacheFeedback ? 0u : UINT32_MAX;
+    uint8_t *payload = NULL;
+    uint64_t size = 0u;
+    (void)RendererPipelineCacheLoad(&renderer->pipelineCacheIdentity, &payload, &size, status);
+    VkPipelineCacheCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .initialDataSize = (size_t)size,
+        .pInitialData = payload,
+    };
+    VkResult result = vkCreatePipelineCache(renderer->device, &info, NULL, &renderer->pipelineCache);
+    if (result != VK_SUCCESS && payload != NULL)
+    {
+        status->state = RENDERER_PIPELINE_CACHE_REJECTED;
+        status->loadedBytes = 0u;
+        info.initialDataSize = 0u;
+        info.pInitialData = NULL;
+        result = vkCreatePipelineCache(renderer->device, &info, NULL, &renderer->pipelineCache);
+    }
+    PlatformFree(payload);
+    if (result != VK_SUCCESS)
+        renderer->pipelineCache = VK_NULL_HANDLE;
+    return true;
+}
+
+bool RendererSavePipelineCache_Vulkan(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->pipelineCache == VK_NULL_HANDLE ||
+        !RendererPipelineCacheEnabled())
+        return false;
+    size_t size = 0u;
+    if (vkGetPipelineCacheData(renderer->device, renderer->pipelineCache, &size, NULL) != VK_SUCCESS ||
+        size == 0u || size > RENDERER_PIPELINE_CACHE_MAXIMUM_BYTES)
+        return false;
+    void *data = PlatformAllocate(size, false);
+    if (data == NULL)
+        return false;
+    bool saved = vkGetPipelineCacheData(renderer->device, renderer->pipelineCache, &size, data) ==
+                     VK_SUCCESS &&
+                 RendererPipelineCacheStore(&renderer->pipelineCacheIdentity, data, size);
+    PlatformFree(data);
+    return saved;
+}
+
 Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
 {
     // Headless Vulkan остаётся допустимым на любой платформе. Если
@@ -3290,7 +3370,8 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
-    if (!CreateDeviceObjects(renderer, windowHandle) || !CreateRenderPasses(renderer) ||
+    if (!CreateDeviceObjects(renderer, windowHandle) || !CreatePipelineCacheObject(renderer) ||
+        !CreateRenderPasses(renderer) ||
         !CreateDescriptorLayouts(renderer) ||
         !CreateDescriptorPool(renderer) || !CreateFrameBuffers(renderer) ||
         !CreateFallbackImages(renderer) || !CreateSharedSets(renderer))
@@ -3513,6 +3594,17 @@ void RendererDestroy_Vulkan(Renderer *renderer)
         if (renderer->commandPool != VK_NULL_HANDLE)
             vkDestroyCommandPool(renderer->device, renderer->commandPool, NULL);
         DestroySwapchainResources(renderer);
+        if (renderer->pipelineCache != VK_NULL_HANDLE)
+        {
+            // Новые конвейеры, которых не было в кеше, сохраняются сами.
+            const RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+            const bool learned = status->state != RENDERER_PIPELINE_CACHE_LOADED ||
+                                 (status->pipelinesFromCache != UINT32_MAX &&
+                                  status->pipelinesCreated > status->pipelinesFromCache);
+            if (learned && status->pipelinesCreated != 0u)
+                (void)RendererSavePipelineCache_Vulkan(renderer);
+            vkDestroyPipelineCache(renderer->device, renderer->pipelineCache, NULL);
+        }
         if (renderer->depthRenderPass != VK_NULL_HANDLE)
             vkDestroyRenderPass(renderer->device, renderer->depthRenderPass, NULL);
         if (renderer->colorRenderPass != VK_NULL_HANDLE)

@@ -90,6 +90,42 @@ LAIUE_RENDER_API Renderer* RendererCreateWithBackend(void* windowHandle, int32_t
 // Каким бэкендом создан этот живой Renderer. NULL возвращает AUTO.
 LAIUE_RENDER_API RendererBackendKind RendererGetBackend(const Renderer* renderer);
 
+// === Кеш конвейеров ===
+//
+// Конвейеры (PSO в D3D12, VkPipeline в Vulkan) создаются при создании
+// рендерера и подготовке мира, не посреди кадра. Кеш на диске ускоряет
+// именно это: повторный запуск берёт скомпилированный драйвером код из
+// файла. Файл свой у каждого бэкенда и устройства; чужой GPU, другой
+// драйвер или порча файла дают пустой кеш, а не ошибку.
+typedef enum RendererPipelineCacheState
+{
+    RENDERER_PIPELINE_CACHE_DISABLED = 0, // каталог не задан
+    RENDERER_PIPELINE_CACHE_EMPTY = 1,    // файла нет: первый запуск
+    RENDERER_PIPELINE_CACHE_LOADED = 2,   // файл подошёл и передан драйверу
+    RENDERER_PIPELINE_CACHE_REJECTED = 3, // файл от другого GPU/драйвера или испорчен
+} RendererPipelineCacheState;
+
+typedef struct RendererPipelineCacheStatusV1
+{
+    uint32_t structSize;
+    RendererPipelineCacheState state;
+    uint64_t loadedBytes;
+    uint32_t pipelinesCreated;
+    // Сколько из созданных драйвер взял из кеша; UINT32_MAX — драйвер об
+    // этом не сообщает.
+    uint32_t pipelinesFromCache;
+} RendererPipelineCacheStatusV1;
+
+// UTF-16/UTF-32 путь каталога (каталог должен существовать). Действует на
+// рендереры, созданные после вызова; NULL выключает кеш. Вызывается до
+// создания рендереров, с одного потока.
+LAIUE_RENDER_API bool RendererSetPipelineCacheDirectory(const wchar_t *directory);
+// Записывает кеш сейчас, например в конце экрана загрузки. RendererDestroy
+// записывает его сам, если появились новые конвейеры.
+LAIUE_RENDER_API bool RendererSavePipelineCache(Renderer *renderer);
+LAIUE_RENDER_API void RendererGetPipelineCacheStatusV1(const Renderer *renderer,
+                                                       RendererPipelineCacheStatusV1 *outStatus);
+
 // Инстанс меша: где оказывается локальный ноль меша, во сколько раз он
 // растянут и как повёрнут.
 //
