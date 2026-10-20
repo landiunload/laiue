@@ -592,8 +592,10 @@ void LaiueNavQueryGetPath(LaiueNavQuery *query, LaiueNavEdge *edges, uint32_t ca
                   query->expansions, query->foundCost);
         return;
     }
+    /* Путь из count рёбер: позиция и обход кончаются одновременно, а пустой
+     * путь (start == goal) буфера не трогает. */
     uint32_t position = count;
-    for (uint32_t node = query->goalIndex; node != query->startIndex;)
+    for (uint32_t node = query->goalIndex; node != query->startIndex && position != 0u;)
     {
         const NavCsrEdge *edge = &graph->csr[query->nodes[node].parent];
         const NavEdgeRecord *record = &graph->edges[edge->edge];

@@ -5,7 +5,7 @@
 #define CHUNK_SHIFT 6u
 #define CHUNK_SIDE (1u << CHUNK_SHIFT)
 #define CHUNK_MASK (CHUNK_SIDE - 1u)
-#define CHUNK_CELLS (CHUNK_SIDE * CHUNK_SIDE)
+#define CHUNK_CELLS UINT32_C(4096) /* CHUNK_SIDE²: 64 × 64 */
 
 /* Чанк, целиком заполненный одной стоимостью, не хранит массив клеток:
  * бескрайний луг или море стоят одну запись. */
