@@ -111,7 +111,8 @@ static void WriteHeader(uint8_t header[CACHE_HEADER_SIZE],
                         const uint8_t digest[32])
 {
     memset(header, 0, CACHE_HEADER_SIZE);
-    memcpy(header, "LPSOCACH", 8u);
+    static const uint8_t magic[8] = {'L', 'P', 'S', 'O', 'C', 'A', 'C', 'H'};
+    memcpy(header, magic, sizeof(magic));
     Store32(header + 8u, CACHE_VERSION);
     Store32(header + 12u, identity->backend);
     Store32(header + 16u, identity->vendorId);

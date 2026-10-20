@@ -19,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RENDERER_PIPELINE_CACHE_MAXIMUM_BYTES (256u * 1024u * 1024u)
+#define RENDERER_PIPELINE_CACHE_MAXIMUM_BYTES UINT32_C(268435456) /* 256 МиБ */
 
 typedef struct RendererPipelineCacheIdentity
 {
