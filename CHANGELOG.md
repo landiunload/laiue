@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and`
+  `getVerticalSync` tail: presenting can stop waiting for the display's
+  refresh and start again at run time. Check`
+  `LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE` before calling it.
 - `LaiueGraphicsDeviceV2` gains the optional `setClearColor` tail: the colour
   every frame is cleared to, the sky behind all geometry. Check
   `LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE` before calling it; without it the
