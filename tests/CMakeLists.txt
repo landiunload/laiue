@@ -109,6 +109,11 @@ laiue_add_harness(laiue_sha256_test Sha256TestEntryPoint ${laiue_sha256_sources}
 laiue_add_harness(laiue_task_pool_test TaskPoolTestEntryPoint task_pool_test.c
     LIBRARIES laiue::task laiue::platform_support TEST laiue.task.pool TIMEOUT 20)
 
+# Persist.
+laiue_add_harness(laiue_persist_test PersistTestEntryPoint persist_test.c
+    LIBRARIES laiue::persist laiue::task laiue::platform_support
+    TEST laiue.persist.roundtrip TIMEOUT 120)
+
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c
     LIBRARIES laiue_numeric TEST laiue.numeric.infinite_coord)

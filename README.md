@@ -35,6 +35,8 @@ your code.
   immediate-mode UI.
 - **Animation and audio** — skinning, a mixer, WAV and MP3 streaming.
 - **Content** — model, texture, sound and shader packs with built-in decoders.
+- **Saves** — versioned sections, checksums, atomic replacement with
+  backups, background save and load.
 - **Mods** — native extensions through a versioned C ABI.
 - **Lean** — no CRT on Windows, portable core on x86_64 and ARM64.
 
@@ -107,6 +109,7 @@ Details are in [portability](docs/portability.md).
 
 [Architecture](docs/architecture.md) ·
 [Physics](docs/physics.md) ·
+[Saves](docs/persist.md) ·
 [Content formats](docs/content_formats.md) ·
 [Modding](docs/modding.md) ·
 [Development](docs/development.md)

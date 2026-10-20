@@ -50,6 +50,15 @@ typedef struct PlatformReadFile
     uintptr_t opaque[2];
 } PlatformReadFile;
 
+/* Потоковая запись: файл создаётся заново (существующий обрезается), запись
+ * идёт последовательно. Описатель обнуляется до открытия, принадлежит
+ * вызывающему и не используется параллельно. Close безопасен для нулевого и
+ * уже закрытого описателя. */
+typedef struct PlatformWriteFile
+{
+    uintptr_t opaque[2];
+} PlatformWriteFile;
+
 /* Возвращаемое значение доходит только до PlatformThreadJoin; сообщать об
  * ошибке рабочему потоку следует через собственное состояние. */
 typedef uint32_t (*PlatformThreadEntry)(void *context);
@@ -175,6 +184,21 @@ void PlatformFileClose(PlatformReadFile *file);
  * On failure buffer contents are unspecified and may have been partially changed. */
 bool PlatformReadFilePrefix(const wchar_t *path, uint64_t maximumFileBytes, void *buffer,
                             uint32_t capacity, uint32_t *outBytesRead, uint64_t *outFileSize);
+/* UTF-8 path. Конечный компонент-ссылка отвергается, а не переходится. */
+bool PlatformFileCreateWrite(const char *path, PlatformWriteFile *outFile);
+/* Пишет все count байт или возвращает false. */
+bool PlatformFileWrite(PlatformWriteFile *file, const void *bytes, uint32_t count);
+/* Дожидается, пока записанное дойдёт до носителя (fsync / FlushFileBuffers). */
+bool PlatformFileFlush(PlatformWriteFile *file);
+void PlatformFileCloseWrite(PlatformWriteFile *file);
+/* UTF-8 пути. Атомарно заменяет destination файлом source и дожидается,
+ * пока сама замена станет долговечной: на POSIX синхронизируется каталог,
+ * на Windows переименование идёт с MOVEFILE_WRITE_THROUGH. */
+bool PlatformFileReplaceDurable(const char *source, const char *destination);
+/* UTF-8 path; отсутствующий файл не считается ошибкой. */
+bool PlatformFileDeleteUtf8(const char *path);
+/* UTF-8 path; пишет сведения о пути, как PlatformGetPathInformation. */
+bool PlatformGetPathInformationUtf8(const char *path, PlatformPathInformation *information);
 bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,
                              uint64_t size);
 bool PlatformWriteFileAtomic(const wchar_t* path, const void* bytes,

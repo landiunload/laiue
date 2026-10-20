@@ -309,6 +309,7 @@ World origin не заменяет render origin. До преобразован�
 - [текстурпаки](texturepacks.md)
 - [моды](modding.md)
 - [физика](physics.md)
+- [сохранения](persist.md)
 - [аудио](audio.md)
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) ведёт к этому полному набору правил. Editor/agent-
