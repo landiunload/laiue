@@ -276,6 +276,14 @@ uint64_t PlatformMonotonicMilliseconds(void)
     return (uint64_t)value.tv_sec * 1000ULL + (uint64_t)value.tv_nsec / 1000000ULL;
 }
 
+uint64_t PlatformMonotonicNanoseconds(void)
+{
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+        return 0;
+    return (uint64_t)value.tv_sec * 1000000000ULL + (uint64_t)value.tv_nsec;
+}
+
 void PlatformSleepMilliseconds(uint32_t milliseconds)
 {
     struct timespec request = {
