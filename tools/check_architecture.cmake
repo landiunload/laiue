@@ -28,6 +28,9 @@ set(allowed_profile mod profile render)
 set(allowed_render content graphics media mod platform render)
 set(allowed_runtime runtime)
 set(allowed_task mod task platform)
+# Сохранения пишут файлы только через platform/system.h; параллельное
+# сжатие получает исполнителя задач таблицей, без импорта пула.
+set(allowed_persist mod persist platform task)
 set(allowed_scene math mesh mod platform render scene world)
 set(allowed_voxel_render math mesh mod platform render scene voxel_render world)
 set(allowed_ui graphics math mod platform render ui)
@@ -44,7 +47,7 @@ set(allowed_world mod numeric platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules animation character content graphics math media mesh mesh_world mesh_world_render mod model numeric physics profile runtime scene task voxel voxel_render world)
+set(portable_modules animation character content graphics math media mesh mesh_world mesh_world_render mod model numeric persist physics profile runtime scene task voxel voxel_render world)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h
@@ -78,6 +81,7 @@ set(canonical_prefix_audio "audio")
 set(canonical_prefix_ui "ui")
 set(canonical_prefix_platform "platform")
 set(canonical_prefix_numeric "numeric")
+set(canonical_prefix_persist "persist")
 set(canonical_prefix_math "core/math")
 set(canonical_prefix_runtime "core/runtime")
 set(canonical_prefix_media "assets/media")

@@ -780,6 +780,120 @@ void PlatformFileClose(PlatformReadFile *file)
     memset(file, 0, sizeof(*file));
 }
 
+bool PlatformFileCreateWrite(const char *path, PlatformWriteFile *outFile)
+{
+    if (path == NULL || path[0] == '\0' || outFile == NULL || outFile->opaque[0] != 0u)
+        return false;
+    int native;
+    do
+    {
+        native = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    } while (native < 0 && errno == EINTR);
+    if (native < 0)
+        return false;
+    struct stat status;
+    if (fstat(native, &status) != 0 || !S_ISREG(status.st_mode))
+    {
+        close(native);
+        return false;
+    }
+    outFile->opaque[0] = (uintptr_t)native + 1u;
+    outFile->opaque[1] = 0u;
+    return true;
+}
+
+bool PlatformFileWrite(PlatformWriteFile *file, const void *bytes, uint32_t count)
+{
+    if (file == NULL || file->opaque[0] == 0u || (count != 0u && bytes == NULL))
+        return false;
+    return WriteAll((int)(file->opaque[0] - 1u), bytes, count);
+}
+
+bool PlatformFileFlush(PlatformWriteFile *file)
+{
+    if (file == NULL || file->opaque[0] == 0u)
+        return false;
+    int result;
+    do
+    {
+        result = fsync((int)(file->opaque[0] - 1u));
+    } while (result != 0 && errno == EINTR);
+    return result == 0;
+}
+
+void PlatformFileCloseWrite(PlatformWriteFile *file)
+{
+    if (file == NULL)
+        return;
+    if (file->opaque[0] != 0u)
+        close((int)(file->opaque[0] - 1u));
+    memset(file, 0, sizeof(*file));
+}
+
+// После rename новая запись каталога долговечна только после fsync самого
+// каталога; без этого сбой питания может вернуть прежнее имя.
+static bool SyncParentDirectory(const char *path)
+{
+    char directory[LAIUE_PLATFORM_PATH_CAPACITY * 4U];
+    size_t length = strlen(path);
+    if (length >= sizeof(directory))
+        return false;
+    memcpy(directory, path, length + 1u);
+    char *slash = strrchr(directory, '/');
+    if (slash == NULL)
+    {
+        directory[0] = '.';
+        directory[1] = '\0';
+    }
+    else if (slash == directory)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+    int native;
+    do
+    {
+        native = open(directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    } while (native < 0 && errno == EINTR);
+    if (native < 0)
+        return false;
+    int result;
+    do
+    {
+        result = fsync(native);
+    } while (result != 0 && errno == EINTR);
+    // close вправе переписать errno, поэтому причина отказа fsync
+    // запоминается до него.
+    const int failure = result == 0 ? 0 : errno;
+    close(native);
+    // Часть файловых систем не умеет fsync каталога; сама замена уже
+    // произошла, поэтому EINVAL не превращается в отказ.
+    return failure == 0 || failure == EINVAL;
+}
+
+bool PlatformFileReplaceDurable(const char *source, const char *destination)
+{
+    return source != NULL && destination != NULL && source[0] != '\0' &&
+           destination[0] != '\0' && rename(source, destination) == 0 &&
+           SyncParentDirectory(destination);
+}
+
+bool PlatformFileDeleteUtf8(const char *path)
+{
+    if (path == NULL || path[0] == '\0')
+        return false;
+    return unlink(path) == 0 || errno == ENOENT;
+}
+
+bool PlatformGetPathInformationUtf8(const char *path, PlatformPathInformation *information)
+{
+    if (path == NULL || information == NULL || path[0] == '\0')
+        return false;
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    return PlatformUtf8ToWide(path, (uint32_t)strlen(path), wide, LAIUE_PLATFORM_PATH_CAPACITY,
+                              NULL) &&
+           PlatformGetPathInformation(wide, information);
+}
+
 bool PlatformWriteEntireFile(const wchar_t *path, const void *bytes, uint64_t size)
 {
     char nativePath[LAIUE_PLATFORM_PATH_CAPACITY * 4U];

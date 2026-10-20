@@ -89,6 +89,7 @@ add_subdirectory(src/numeric)
 add_subdirectory(src/assets/media)
 add_subdirectory(src/platform)
 add_subdirectory(src/jobs/task)
+add_subdirectory(src/persist)
 add_subdirectory(src/simulation/world)
 add_subdirectory(src/simulation/physics)
 add_subdirectory(src/assets/content)
@@ -250,6 +251,7 @@ laiue_install_headers(laiue_physics physics
     simulation/physics/voxel_body.h simulation/physics/physics_service.h
     simulation/physics/numeric_provider.h)
 laiue_install_headers(laiue_task task jobs/task/task_pool.h jobs/task/task_service.h)
+laiue_install_headers(laiue_persist persist persist/persist.h persist/persist_service.h)
 laiue_install_headers(laiue_content content
     assets/content/content_catalog.h assets/content/content_format.h
     assets/content/content_service.h)
