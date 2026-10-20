@@ -92,6 +92,7 @@ add_subdirectory(src/jobs/task)
 add_subdirectory(src/persist)
 add_subdirectory(src/simulation/world)
 add_subdirectory(src/simulation/physics)
+add_subdirectory(src/simulation/navigation)
 add_subdirectory(src/assets/content)
 add_subdirectory(src/simulation/character)
 add_subdirectory(src/simulation/voxel)
@@ -252,6 +253,8 @@ laiue_install_headers(laiue_physics physics
     simulation/physics/numeric_provider.h)
 laiue_install_headers(laiue_task task jobs/task/task_pool.h jobs/task/task_service.h)
 laiue_install_headers(laiue_persist persist persist/persist.h persist/persist_service.h)
+laiue_install_headers(laiue_navigation navigation
+    simulation/navigation/navigation.h simulation/navigation/navigation_service.h)
 laiue_install_headers(laiue_content content
     assets/content/content_catalog.h assets/content/content_format.h
     assets/content/content_service.h)

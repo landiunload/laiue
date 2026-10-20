@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `laiue.navigation` finds paths without game rules: a dynamic directed graph
+  with per-edge costs and travel-mode masks (cheap cost updates, generation
+  checked handles), A* with expansion and cost budgets, time-sliced and
+  parallel batch queries, a sparse infinite grid for free movement with
+  corner-safe 8-way A* and path smoothing, and flow fields for crowds. All
+  arithmetic is integer and results do not depend on the thread count.
 - `laiue.persist` saves and loads application state as named, versioned
   sections: CRC-32C on every byte, atomic replacement with rotating backups,
   fallback to the newest intact copy, block LZ compression in parallel,
