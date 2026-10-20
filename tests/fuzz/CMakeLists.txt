@@ -1,5 +1,5 @@
-# Фаззеры разборщиков внешних данных: картинок, звука, моделей, zlib и
-# манифестов.
+# Фаззеры разборщиков внешних данных: картинок, звука, моделей, zlib,
+# манифестов и сохранений.
 # Собираются только с LAIUE_BUILD_FUZZERS (Clang): тогда весь код движка
 # уже инструментирован -fsanitize=fuzzer-no-link и ASan/UBSan, а здесь
 # лишь компонуется драйвер libFuzzer. Production-исходники сюда не
@@ -43,6 +43,9 @@ laiue_add_fuzzer(model model_fuzz.c laiue::media_support)
 laiue_add_fuzzer(animation animation_fuzz.c laiue::media_support)
 if(TARGET laiue_mod)
     laiue_add_fuzzer(mod_manifest mod_manifest_fuzz.c laiue_mod)
+endif()
+if(TARGET laiue_persist)
+    laiue_add_fuzzer(persist persist_fuzz.c laiue_persist)
 endif()
 laiue_add_fuzzer(module_manifest module_manifest_fuzz.c laiue_bootstrap
     laiue::platform_support)
