@@ -114,6 +114,11 @@ laiue_add_harness(laiue_persist_test PersistTestEntryPoint persist_test.c
     LIBRARIES laiue::persist laiue::task laiue::platform_support
     TEST laiue.persist.roundtrip TIMEOUT 120)
 
+# Navigation.
+laiue_add_harness(laiue_navigation_test NavigationTestEntryPoint navigation_test.c
+    LIBRARIES laiue::navigation laiue::task laiue::platform_support
+    TEST laiue.navigation.paths TIMEOUT 120)
+
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c
     LIBRARIES laiue_numeric TEST laiue.numeric.infinite_coord)

@@ -311,6 +311,7 @@ World origin не заменяет render origin. До преобразован�
 - [моды](modding.md)
 - [физика](physics.md)
 - [сохранения](persist.md)
+- [навигация](navigation.md)
 - [аудио](audio.md)
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) ведёт к этому полному набору правил. Editor/agent-
