@@ -64,6 +64,8 @@ typedef struct LaiueGraphicsDeviceState
     uint8_t live[DEVICE_HANDLE_CAPACITY];
     uint32_t submittedItems;
     float viewProjection[16];
+    /* Linear RGB the next frame is cleared to: the sky. */
+    float clearColor[3];
     bool cameraSet;
     bool frameActive;
     bool lastFrameValid;
@@ -223,6 +225,7 @@ static uint32_t DeviceV2RequestFrameReadback(LaiueGraphicsDeviceV2 *);
 static uint32_t DeviceV2GetCapabilities(const LaiueGraphicsDeviceV2 *);
 static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *, const LaiueGraphicsDrawItemV2 *,
                                         const LaiueGraphicsInstanceV2 *, uint32_t);
+static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *, const float[3]);
 
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
@@ -394,6 +397,9 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
         return 0u;
     memset(state, 0, sizeof(*state));
     state->host = host;
+    state->clearColor[0] = 0.035f;
+    state->clearColor[1] = 0.055f;
+    state->clearColor[2] = 0.09f;
     state->handleNamespace = DeviceAllocateNamespace();
     if (state->handleNamespace == 0u)
     {
@@ -456,6 +462,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.requestFrameReadback = DeviceV2RequestFrameReadback;
     state->deviceV2.getCapabilities = DeviceV2GetCapabilities;
     state->deviceV2.submitInstances = DeviceV2SubmitInstances;
+    state->deviceV2.setClearColor = DeviceV2SetClearColor;
     *outDevice = &state->device;
     return 1u;
 }
@@ -909,9 +916,9 @@ static uint32_t DeviceBeginFrame(LaiueGraphicsDeviceV1 *device, uint32_t width,
         frame.passes[0].viewProjection[12] = -1.0f;
         frame.passes[0].viewProjection[13] = -1.0f;
     }
-    frame.skyColor[0] = 0.035f;
-    frame.skyColor[1] = 0.055f;
-    frame.skyColor[2] = 0.09f;
+    frame.skyColor[0] = state->clearColor[0];
+    frame.skyColor[1] = state->clearColor[1];
+    frame.skyColor[2] = state->clearColor[2];
     frame.ambientColor[0] = 0.18f;
     frame.ambientColor[1] = 0.18f;
     frame.ambientColor[2] = 0.18f;
@@ -1340,6 +1347,23 @@ static uint32_t DeviceV2GetCapabilities(const LaiueGraphicsDeviceV2 *device)
     return state != NULL && state->renderer != NULL
                ? LAIUE_GRAPHICS_CAP_NATIVE_INDICES | LAIUE_GRAPHICS_CAP_GENERIC_INSTANCES
                : 0u;
+}
+
+static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *device, const float rgb[3])
+{
+    if (device == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE ||
+        rgb == NULL)
+        return 0u;
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL)
+        return 0u;
+    for (uint32_t channel = 0u; channel < 3u; ++channel)
+        if (!DeviceFloatIsFinite(&rgb[channel]) || !(rgb[channel] >= 0.0f) ||
+            !(rgb[channel] <= 1.0f))
+            return 0u;
+    for (uint32_t channel = 0u; channel < 3u; ++channel)
+        state->clearColor[channel] = rgb[channel];
+    return 1u;
 }
 
 static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *device,

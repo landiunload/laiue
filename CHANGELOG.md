@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `LaiueGraphicsDeviceV2` gains the optional `setClearColor` tail: the colour
+  every frame is cleared to, the sky behind all geometry. Check
+  `LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE` before calling it; without it the
+  background keeps the previous dark default.
 - Release builds carry nothing debug-only. Modules with the new
   `DIAGNOSTICS` role are not built in Release or MinSizeRel, stay out of
   `laiue::engine` and install only for Debug and RelWithDebInfo; the

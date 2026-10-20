@@ -489,6 +489,33 @@ static void InstancePixels(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle vb
     device->destroyHandle(device, quarterTurn);
 }
 
+static void SkyColor(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("the clear colour shows behind the scene");
+    Expect(device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE &&
+               device->setClearColor != NULL,
+           "provider publishes the clear colour tail");
+    const float sky[3] = {0.0f, 1.0f, 1.0f};
+    const float tooBright[3] = {0.0f, 1.5f, 0.0f};
+    const float negative[3] = {-0.25f, 0.0f, 0.0f};
+    float notFinite[3] = {0.0f, 0.0f, 0.0f};
+    const uint32_t quietNan = UINT32_C(0x7fc00000);
+    memcpy(&notFinite[1], &quietNan, sizeof(quietNan));
+    Expect(device->setClearColor(device, sky) != 0u, "a colour in range is accepted");
+    Expect(device->setClearColor(device, tooBright) == 0u &&
+               device->setClearColor(device, negative) == 0u &&
+               device->setClearColor(device, notFinite) == 0u &&
+               device->setClearColor(device, NULL) == 0u,
+           "colours out of range are rejected");
+    Begin(device);
+    Capture(device, 0u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xffffff00), "an empty frame shows the last accepted colour");
+    ColorAt(-0.9f, 0.9f, UINT32_C(0xffffff00), "the colour covers the whole frame");
+    /* The other cases probe the default background. */
+    const float original[3] = {0.035f, 0.055f, 0.09f};
+    Expect(device->setClearColor(device, original) != 0u, "the default colour is restored");
+}
+
 static void Reject(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsDrawItemV2 *item,
                    const char *reason)
 {
@@ -644,9 +671,12 @@ static void LegacyTables(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle vb,
     const LaiueGraphicsInstanceV2 instance = {.scale = 1.0f};
     const LaiueGraphicsV2GetCapabilitiesFn capabilities = device->getCapabilities;
     const LaiueGraphicsV2SubmitInstancesFn submitInstances = device->submitInstances;
+    const LaiueGraphicsV2SetClearColorFn setClearColor = device->setClearColor;
+    const float sky[3] = {0.5f, 0.5f, 0.5f};
     Expect(capabilities(shortDevice) == 0u &&
                submitInstances(shortDevice, &item, &instance, 1u) == 0u &&
-               submitInstances(shortDevice, NULL, NULL, 0u) == 0u,
+               submitInstances(shortDevice, NULL, NULL, 0u) == 0u &&
+               setClearColor(shortDevice, sky) == 0u,
            "callbacks reject an actual eight-byte table without reading context");
 #if defined(_WIN32)
     Expect(VirtualFree(guarded, 0u, MEM_RELEASE) != 0, "ABI guard pages release");
@@ -660,7 +690,8 @@ static void LegacyTables(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle vb,
     old.context = (void *)(uintptr_t)1u;
     Expect(capabilities((const LaiueGraphicsDeviceV2 *)&old) == 0u &&
                submitInstances((LaiueGraphicsDeviceV2 *)&old, &item, &instance, 1u) == 0u &&
-               submitInstances((LaiueGraphicsDeviceV2 *)&old, NULL, NULL, 0u) == 0u,
+               submitInstances((LaiueGraphicsDeviceV2 *)&old, NULL, NULL, 0u) == 0u &&
+               setClearColor((LaiueGraphicsDeviceV2 *)&old, sky) == 0u,
            "missing tails return unsupported before touching the invalid context");
     old.context = device->context;
     Begin(device);
@@ -908,6 +939,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         PartialIndexUpload(device, vb, ib);
         TexturedIndices(device, ia);
         InstancePixels(device, vb, ia);
+        SkyColor(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         otherWindow = CreateTestWindow();
         Expect(otherWindow != NULL, "second device has its own HWND");
