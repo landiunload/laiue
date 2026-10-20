@@ -20,7 +20,9 @@
  * поэтому в исходник не переписываются. */
 static uint32_t crcTables[8][256];
 static volatile uint32_t crcState; /* 0 — не начато, 1 — строится, 2 — готово. */
+#if defined(LAIUE_PERSIST_CRC_X86)
 static bool crcHardware;
+#endif
 
 #if defined(LAIUE_PERSIST_CRC_X86)
 static bool CpuHasSse42(void)
