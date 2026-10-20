@@ -1581,6 +1581,9 @@ static const LaiueGraphicsServiceV1 service = {
     .setWireframe = RendererSetWireframe,
     .isWireframe = RendererIsWireframe,
     .getGpuTimingV1 = RendererGetGpuTimingV1,
+    .setPipelineCacheDirectory = RendererSetPipelineCacheDirectory,
+    .savePipelineCache = RendererSavePipelineCache,
+    .getPipelineCacheStatusV1 = RendererGetPipelineCacheStatusV1,
 };
 
 static const LaiueGraphicsDeviceServiceV1 deviceServiceTemplate = {

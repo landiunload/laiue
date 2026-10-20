@@ -52,6 +52,11 @@ typedef struct LaiueGraphicsServiceV1
     /* Optional tail extension. Timing is the most recent completed GPU
      * frame; absence means unsupported, not zero milliseconds. */
     void (*getGpuTimingV1)(const Renderer *renderer, RendererGpuTimingV1 *outTiming);
+    /* Optional tail extension: on-disk pipeline cache (see renderer.h). */
+    bool (*setPipelineCacheDirectory)(const wchar_t *directory);
+    bool (*savePipelineCache)(Renderer *renderer);
+    void (*getPipelineCacheStatusV1)(const Renderer *renderer,
+                                     RendererPipelineCacheStatusV1 *outStatus);
 } LaiueGraphicsServiceV1;
 
 // Minimum V1 prefix and safe feature test for consumers that can also run
@@ -64,6 +69,8 @@ typedef struct LaiueGraphicsServiceV1
          offsetof(LaiueGraphicsServiceV1, getGpuTimingV1) + \
              sizeof((service)->getGpuTimingV1) && \
      (service)->getGpuTimingV1 != NULL)
+
+#define LAIUE_GRAPHICS_SERVICE_HAS_PIPELINE_CACHE_V1(service)     ((service) != NULL &&      (service)->structSize >=          offsetof(LaiueGraphicsServiceV1, getPipelineCacheStatusV1) +              sizeof((service)->getPipelineCacheStatusV1) &&      (service)->setPipelineCacheDirectory != NULL)
 
 LAIUE_RENDER_API const LaiueGraphicsServiceV1 *LaiueGraphicsGetStaticServiceV1(void);
 const LaiueModuleApiV1 *LaiueGraphicsGetStaticModuleApiV1(void);

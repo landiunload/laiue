@@ -5,6 +5,14 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The renderer keeps an on-disk pipeline cache when
+  `RendererSetPipelineCacheDirectory` names a directory: `ID3D12PipelineLibrary`
+  on D3D12 and `VkPipelineCache` on Vulkan, behind an engine header that pins
+  the backend, vendor, device, driver version, Vulkan cache UUID and a SHA-256
+  of the payload. A foreign or damaged file is rejected instead of reaching the
+  driver. `RendererDestroy` saves new pipelines, `RendererSavePipelineCache`
+  saves on demand and `RendererGetPipelineCacheStatusV1` reports cache hits.
+  The graphics service gains the matching optional tail entries.
 - `laiue.navigation` finds paths without game rules: a dynamic directed graph
   with per-edge costs and travel-mode masks (cheap cost updates, generation
   checked handles), A* with expansion and cost budgets, time-sliced and

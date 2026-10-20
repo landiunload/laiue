@@ -8,4 +8,6 @@
 typedef struct RendererHeader
 {
     RendererBackendKind backend;
+    // Состояние кеша конвейеров; ведёт его бэкенд, читает общий код.
+    RendererPipelineCacheStatusV1 pipelineCache;
 } RendererHeader;
