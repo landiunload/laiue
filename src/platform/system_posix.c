@@ -861,10 +861,13 @@ static bool SyncParentDirectory(const char *path)
     {
         result = fsync(native);
     } while (result != 0 && errno == EINTR);
+    // close вправе переписать errno, поэтому причина отказа fsync
+    // запоминается до него.
+    const int failure = result == 0 ? 0 : errno;
     close(native);
     // Часть файловых систем не умеет fsync каталога; сама замена уже
     // произошла, поэтому EINVAL не превращается в отказ.
-    return result == 0 || errno == EINVAL;
+    return failure == 0 || failure == EINVAL;
 }
 
 bool PlatformFileReplaceDurable(const char *source, const char *destination)
