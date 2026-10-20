@@ -133,6 +133,9 @@ void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired);
 
 double PlatformMonotonicSeconds(void);
 uint64_t PlatformMonotonicMilliseconds(void);
+/* Целые наносекунды монотонных часов: для замеров кадров, где double в
+ * секундах за часы работы машины теряет точность. */
+uint64_t PlatformMonotonicNanoseconds(void);
 void PlatformSleepMilliseconds(uint32_t milliseconds);
 /* Короткая пауза процессора для ограниченного спина перед парковкой потока.
  * На x86 это PAUSE, на ARM — YIELD. На прочих платформах — пустая операция,

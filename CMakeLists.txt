@@ -90,6 +90,10 @@ add_subdirectory(src/assets/media)
 add_subdirectory(src/platform)
 add_subdirectory(src/jobs/task)
 add_subdirectory(src/persist)
+option(LAIUE_BUILD_DIAGNOSTICS "Build debug-only diagnostics such as the frame monitor" ON)
+if(LAIUE_BUILD_DIAGNOSTICS)
+    add_subdirectory(src/diagnostics/frame_monitor)
+endif()
 add_subdirectory(src/simulation/world)
 add_subdirectory(src/simulation/physics)
 add_subdirectory(src/simulation/navigation)
@@ -217,6 +221,17 @@ install(TARGETS ${LAIUE_RUNTIME_TARGETS} laiue_engine
     INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/laiue"
 )
 
+# Диагностические модули — только в отладочных конфигурациях SDK и вне
+# экспорта пакета: приложение загружает их по имени, а в релизе их нет.
+get_property(LAIUE_RUNTIME_DIAGNOSTICS_TARGETS GLOBAL PROPERTY LAIUE_RUNTIME_DIAGNOSTICS_TARGETS)
+if(LAIUE_RUNTIME_DIAGNOSTICS_TARGETS)
+    install(TARGETS ${LAIUE_RUNTIME_DIAGNOSTICS_TARGETS}
+        CONFIGURATIONS Debug RelWithDebInfo
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Diagnostics
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Diagnostics
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Diagnostics)
+endif()
+
 # The bootstrap archive intentionally keeps its private platform/no-CRT link
 # implementation out of the public aggregate export. It is still staged with
 # the SDK and can be linked directly by applications built in the same
@@ -253,6 +268,9 @@ laiue_install_headers(laiue_physics physics
     simulation/physics/numeric_provider.h)
 laiue_install_headers(laiue_task task jobs/task/task_pool.h jobs/task/task_service.h)
 laiue_install_headers(laiue_persist persist persist/persist.h persist/persist_service.h)
+# Заголовки диагностики ставятся всегда: без LAIUE_DIAGNOSTICS их макросы пусты.
+laiue_install_headers(laiue_frame_monitor frame_monitor
+    diagnostics/frame_monitor/frame_monitor.h diagnostics/frame_monitor/frame_monitor_service.h)
 laiue_install_headers(laiue_navigation navigation
     simulation/navigation/navigation.h simulation/navigation/navigation_service.h)
 laiue_install_headers(laiue_content content
@@ -482,6 +500,16 @@ if(BUILD_TESTING)
                 -P "${PROJECT_SOURCE_DIR}/tools/check_archive_members.cmake")
     endif()
     if(LAIUE_ENABLE_SDK_INSTALL_RESOLVED)
+        # Релизный SDK и релизные бинарники без тестов, бенчмарков,
+        # отладочной информации и диагностики.
+        add_test(NAME laiue.build.release_hygiene
+            CONFIGURATIONS Release
+            COMMAND "${CMAKE_COMMAND}"
+                "-DENGINE_BINARY_DIR=${PROJECT_BINARY_DIR}"
+                "-DRELEASE_RUNTIME_DIR=$<TARGET_FILE_DIR:laiue_persist>"
+                "-DTEST_ROOT=${PROJECT_BINARY_DIR}/release-hygiene"
+                -P "${PROJECT_SOURCE_DIR}/tools/check_release_hygiene.cmake")
+        set_tests_properties(laiue.build.release_hygiene PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME laiue.install.consumer
             COMMAND "${CMAKE_COMMAND}"
                 "-DENGINE_BINARY_DIR=${PROJECT_BINARY_DIR}"

@@ -215,6 +215,7 @@ add_library(laiue::build_options ALIAS laiue_build_options)
 set(LAIUE_PUBLIC_SOURCE_INCLUDE_DIRECTORIES
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/src/assets"
+    "${PROJECT_SOURCE_DIR}/src/diagnostics"
     "${PROJECT_SOURCE_DIR}/src/graphics"
     "${PROJECT_SOURCE_DIR}/src/jobs"
     "${PROJECT_SOURCE_DIR}/src/simulation"

@@ -42,6 +42,15 @@ function(laiue_add_vulkan_validation)
     endif()
 endfunction()
 
+# Тест диагностического модуля: как и сам модуль, не собирается и не
+# запускается в Release и MinSizeRel.
+function(laiue_add_diagnostics_test target_name windows_entry test_name)
+    laiue_add_harness(${target_name} ${windows_entry} ${ARGN})
+    set_target_properties(${target_name} PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    laiue_exclude_from_release(${target_name})
+    add_test(NAME ${test_name} COMMAND ${target_name} CONFIGURATIONS Debug RelWithDebInfo)
+endfunction()
+
 # Native fixtures load like mods: no CRT entry point and explicit exports only.
 function(laiue_add_test_module target_name)
     add_library(${target_name} SHARED ${ARGN})
@@ -113,6 +122,13 @@ laiue_add_harness(laiue_task_pool_test TaskPoolTestEntryPoint task_pool_test.c
 laiue_add_harness(laiue_persist_test PersistTestEntryPoint persist_test.c
     LIBRARIES laiue::persist laiue::task laiue::platform_support
     TEST laiue.persist.roundtrip TIMEOUT 120)
+
+# Frame monitor: debug-only diagnostics.
+if(TARGET laiue_frame_monitor)
+    laiue_add_diagnostics_test(laiue_frame_monitor_test FrameMonitorTestEntryPoint
+        laiue.diagnostics.frame_monitor frame_monitor_test.c
+        LIBRARIES laiue::frame_monitor laiue::platform_support)
+endif()
 
 # Navigation.
 laiue_add_harness(laiue_navigation_test NavigationTestEntryPoint navigation_test.c
@@ -347,9 +363,9 @@ if(TARGET laiue_render AND laiue_shared_modules)
             laiue.graphics.geometry_d3d12)
     endif()
     if(TARGET laiue_graphics_profile)
-        laiue_add_harness(laiue_graphics_profile_module_test GraphicsProfileModuleTestEntryPoint
-            graphics_profile_module_test.c BOOTSTRAP DEPENDS laiue_graphics_profile
-            TEST laiue.graphics.profile_module)
+        laiue_add_diagnostics_test(laiue_graphics_profile_module_test
+            GraphicsProfileModuleTestEntryPoint laiue.graphics.profile_module
+            graphics_profile_module_test.c BOOTSTRAP DEPENDS laiue_graphics_profile)
     endif()
 endif()
 if(TARGET laiue_render)

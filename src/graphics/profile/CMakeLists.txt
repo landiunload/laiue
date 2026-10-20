@@ -1,5 +1,5 @@
 laiue_add_module(graphics_profile
-    RUNTIME_ROLE GRAPHICS
+    RUNTIME_ROLE DIAGNOSTICS
     SOURCES
         profile.c
         profile_service.h

@@ -283,6 +283,24 @@ uint64_t PlatformMonotonicMilliseconds(void)
     return GetTickCount64();
 }
 
+uint64_t PlatformMonotonicNanoseconds(void)
+{
+    static LONGLONG frequency;
+    if (frequency == 0)
+    {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        InterlockedCompareExchange64(&frequency, value.QuadPart, 0);
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    // Целые секунды и остаток считаются раздельно: произведение счётчика
+    // на миллиард переполнило бы 64 бита через несколько суток.
+    const uint64_t ticks = (uint64_t)counter.QuadPart;
+    const uint64_t rate = (uint64_t)frequency;
+    return ticks / rate * 1000000000u + ticks % rate * 1000000000u / rate;
+}
+
 void PlatformSleepMilliseconds(uint32_t milliseconds)
 {
     Sleep(milliseconds);
