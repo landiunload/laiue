@@ -273,11 +273,21 @@ static LaiuePersistStatus WriteFileBody(SaveState *state)
     return status;
 }
 
-/* Сдвигает path → path.1 → … → path.N; самая старая копия удаляется. */
-static LaiuePersistStatus RotateBackups(const char *path, uint32_t backupCount)
+/* Пути сохранения живут в куче: без CRT нет __chkstk, а кадр больше
+ * страницы стека получается, как только компилятор встроит соседние
+ * функции друг в друга. */
+typedef struct SavePaths
 {
+    char temporary[PERSIST_PATH_CAPACITY];
     char from[PERSIST_PATH_CAPACITY];
     char to[PERSIST_PATH_CAPACITY];
+} SavePaths;
+
+/* Сдвигает path → path.1 → … → path.N; самая старая копия удаляется. */
+static LaiuePersistStatus RotateBackups(const char *path, uint32_t backupCount, SavePaths *paths)
+{
+    char *from = paths->from;
+    char *to = paths->to;
     char suffix[PERSIST_PATH_SUFFIX_CAPACITY];
     PersistBackupSuffix(backupCount, suffix);
     if (!PersistBuildPath(path, suffix, to) || !PlatformFileDeleteUtf8(to))
@@ -331,13 +341,20 @@ LaiuePersistStatus PersistSaveRun(LaiuePersistDocument *document, const LaiuePer
         return LAIUE_PERSIST_INVALID_ARGUMENT;
     if (desc->executor != NULL && desc->executor->structSize < sizeof(LaiueTaskExecutor))
         return LAIUE_PERSIST_INVALID_ARGUMENT;
-    char temporary[PERSIST_PATH_CAPACITY];
-    char check[PERSIST_PATH_CAPACITY];
+    SavePaths *paths = PlatformAllocate(sizeof(*paths), false);
+    if (paths == NULL)
+        return LAIUE_PERSIST_OUT_OF_MEMORY;
+    char *temporary = paths->temporary;
     char longestSuffix[PERSIST_PATH_SUFFIX_CAPACITY];
     PersistBackupSuffix(LAIUE_PERSIST_MAXIMUM_BACKUPS, longestSuffix);
+    /* Самая длинная резервная копия должна поместиться уже сейчас, а не
+     * отказать после записи всего файла. */
     if (!PersistBuildPath(desc->path, ".tmp", temporary) ||
-        !PersistBuildPath(desc->path, longestSuffix, check))
+        !PersistBuildPath(desc->path, longestSuffix, paths->from))
+    {
+        PlatformFree(paths);
         return LAIUE_PERSIST_INVALID_ARGUMENT;
+    }
 
     SaveState state;
     memset(&state, 0, sizeof(state));
@@ -356,7 +373,7 @@ LaiuePersistStatus PersistSaveRun(LaiuePersistDocument *document, const LaiuePer
 
     LaiuePersistStatus status = ProduceSections(&state);
     if (status != LAIUE_PERSIST_OK)
-        return status;
+        goto cleanup;
 
     const size_t orderBytes = (size_t)(count == 0u ? 1u : count) * sizeof(uint32_t);
     state.order = PlatformAllocate(orderBytes * 2u, false);
@@ -402,13 +419,14 @@ LaiuePersistStatus PersistSaveRun(LaiuePersistDocument *document, const LaiuePer
         status = LAIUE_PERSIST_CANCELLED;
     /* С этого места отмена уже не действует: замена идёт до конца. */
     if (status == LAIUE_PERSIST_OK && desc->backupCount != 0u)
-        status = RotateBackups(desc->path, desc->backupCount);
+        status = RotateBackups(desc->path, desc->backupCount, paths);
     if (status == LAIUE_PERSIST_OK && !PlatformFileReplaceDurable(temporary, desc->path))
         status = LAIUE_PERSIST_IO_ERROR;
     if (status != LAIUE_PERSIST_OK)
         (void)PlatformFileDeleteUtf8(temporary);
 
 cleanup:
+    PlatformFree(paths);
     PlatformFree(state.order);
     PlatformFree(state.entries);
     PlatformFree(state.copyBuffer);

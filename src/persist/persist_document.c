@@ -151,7 +151,7 @@ void PersistChunksRelease(PersistChunks *chunks)
         return;
     for (uint32_t index = 0u; index < chunks->count; ++index)
         PlatformFree(chunks->chunks[index]);
-    PlatformFree(chunks->chunks);
+    PlatformFree((void *)chunks->chunks);
     memset(chunks, 0, sizeof(*chunks));
 }
 
@@ -168,8 +168,8 @@ bool PersistChunksAppend(PersistChunks *chunks, const void *bytes, uint64_t size
                 if (chunks->capacity > UINT32_MAX / 2u)
                     return false;
                 const uint32_t capacity = chunks->capacity == 0u ? 8u : chunks->capacity * 2u;
-                uint8_t **grown =
-                    PlatformReallocate(chunks->chunks, (size_t)capacity * sizeof(*grown), false);
+                uint8_t **grown = (uint8_t **)PlatformReallocate(
+                    (void *)chunks->chunks, (size_t)capacity * sizeof(uint8_t *), false);
                 if (grown == NULL)
                     return false;
                 chunks->chunks = grown;

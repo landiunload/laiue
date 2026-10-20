@@ -57,7 +57,7 @@
 #define PERSIST_BLOCK_HEADER_SIZE 8u
 #define PERSIST_BLOCK_UNCOMPRESSED UINT32_C(0x80000000)
 
-#define PERSIST_IO_CHUNK (1024u * 1024u)
+#define PERSIST_IO_CHUNK UINT32_C(1048576) /* 1 МиБ */
 /* Самый длинный суффикс пути: ".tmp" либо ".16". */
 #define PERSIST_PATH_SUFFIX_CAPACITY 8u
 /* Путь сохранения в UTF-8 вместе с завершающим нулём и суффиксом. Больше
