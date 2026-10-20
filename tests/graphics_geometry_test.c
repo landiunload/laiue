@@ -516,6 +516,26 @@ static void SkyColor(LaiueGraphicsDeviceV2 *device)
     Expect(device->setClearColor(device, original) != 0u, "the default colour is restored");
 }
 
+static void VerticalSync(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("vertical sync can be switched off and on");
+    Expect(device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE &&
+               device->setVerticalSync != NULL && device->getVerticalSync != NULL,
+           "provider publishes the vertical sync tail");
+    Expect(device->getVerticalSync(device) == 1u, "vertical sync starts on");
+    Expect(device->setVerticalSync(device, 2u) == 0u && device->getVerticalSync(device) == 1u,
+           "a value other than 0 or 1 is rejected");
+    Expect(device->setVerticalSync(device, 0u) != 0u && device->getVerticalSync(device) == 0u,
+           "vertical sync turns off");
+    for (uint32_t frame = 0u; frame < 3u; ++frame)
+    {
+        Begin(device);
+        Expect(device->endFrame(device) != 0u, "frames present without vertical sync");
+    }
+    Expect(device->setVerticalSync(device, 1u) != 0u && device->getVerticalSync(device) == 1u,
+           "vertical sync turns back on");
+}
+
 static void Reject(LaiueGraphicsDeviceV2 *device, const LaiueGraphicsDrawItemV2 *item,
                    const char *reason)
 {
@@ -672,11 +692,14 @@ static void LegacyTables(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle vb,
     const LaiueGraphicsV2GetCapabilitiesFn capabilities = device->getCapabilities;
     const LaiueGraphicsV2SubmitInstancesFn submitInstances = device->submitInstances;
     const LaiueGraphicsV2SetClearColorFn setClearColor = device->setClearColor;
+    const LaiueGraphicsV2SetVerticalSyncFn setVerticalSync = device->setVerticalSync;
+    const LaiueGraphicsV2GetVerticalSyncFn getVerticalSync = device->getVerticalSync;
     const float sky[3] = {0.5f, 0.5f, 0.5f};
     Expect(capabilities(shortDevice) == 0u &&
                submitInstances(shortDevice, &item, &instance, 1u) == 0u &&
                submitInstances(shortDevice, NULL, NULL, 0u) == 0u &&
-               setClearColor(shortDevice, sky) == 0u,
+               setClearColor(shortDevice, sky) == 0u && setVerticalSync(shortDevice, 0u) == 0u &&
+               getVerticalSync(shortDevice) == 0u,
            "callbacks reject an actual eight-byte table without reading context");
 #if defined(_WIN32)
     Expect(VirtualFree(guarded, 0u, MEM_RELEASE) != 0, "ABI guard pages release");
@@ -691,7 +714,9 @@ static void LegacyTables(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle vb,
     Expect(capabilities((const LaiueGraphicsDeviceV2 *)&old) == 0u &&
                submitInstances((LaiueGraphicsDeviceV2 *)&old, &item, &instance, 1u) == 0u &&
                submitInstances((LaiueGraphicsDeviceV2 *)&old, NULL, NULL, 0u) == 0u &&
-               setClearColor((LaiueGraphicsDeviceV2 *)&old, sky) == 0u,
+               setClearColor((LaiueGraphicsDeviceV2 *)&old, sky) == 0u &&
+               setVerticalSync((LaiueGraphicsDeviceV2 *)&old, 0u) == 0u &&
+               getVerticalSync((const LaiueGraphicsDeviceV2 *)&old) == 0u,
            "missing tails return unsupported before touching the invalid context");
     old.context = device->context;
     Begin(device);
@@ -940,6 +965,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         TexturedIndices(device, ia);
         InstancePixels(device, vb, ia);
         SkyColor(device);
+    VerticalSync(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         otherWindow = CreateTestWindow();
         Expect(otherWindow != NULL, "second device has its own HWND");
