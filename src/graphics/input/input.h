@@ -34,6 +34,12 @@ typedef enum InputKey
     INPUT_KEY_F7,
     INPUT_KEY_SHIFT,
     INPUT_KEY_CONTROL,
+    INPUT_KEY_0,
+    INPUT_KEY_R,
+    INPUT_KEY_F,
+    INPUT_KEY_P,
+    INPUT_KEY_ENTER,
+    INPUT_KEY_BACKSPACE,
     INPUT_KEY_COUNT
 } InputKey;
 

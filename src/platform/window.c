@@ -4,6 +4,8 @@
 
 #define WINDOW_CLASS_NAME L"LaiueWindowClass"
 
+#define WINDOW_TEXT_CAPACITY 256u
+
 struct Window
 {
     HWND handle;
@@ -15,6 +17,12 @@ struct Window
     bool cursorHidden;
     bool focused;
     float wheelSteps;             // накопленные щелчки колеса до Consume
+    // Набранный текст до Consume: кольцо кодовых точек и старшая половина
+    // суррогатной пары, ждущая младшую.
+    uint32_t text[WINDOW_TEXT_CAPACITY];
+    uint32_t textHead;
+    uint32_t textCount;
+    uint32_t highSurrogate;
     bool fullscreen;
     WINDOWPLACEMENT windowedPlacement;   // положение окна до фуллскрина
     LONG windowedStyle;                  // стиль окна до фуллскрина
@@ -90,6 +98,36 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
                 if (window->cursorHidden)
                 {
                     ApplyCursorClip(window);
+                }
+            }
+            return 0;
+
+        case WM_CHAR:
+            if (window != NULL)
+            {
+                const uint32_t unit = (uint32_t)wParam;
+                uint32_t codepoint = unit;
+                if (unit >= 0xD800u && unit < 0xDC00u)
+                {
+                    window->highSurrogate = unit;
+                    return 0;
+                }
+                if (unit >= 0xDC00u && unit < 0xE000u)
+                {
+                    codepoint = window->highSurrogate != 0u
+                        ? 0x10000u + ((window->highSurrogate - 0xD800u) << 10u)
+                              + (unit - 0xDC00u)
+                        : 0u;
+                }
+                window->highSurrogate = 0u;
+                // Управляющие символы приходят клавишами, не текстом.
+                if (codepoint >= 0x20u && codepoint != 0x7Fu
+                    && window->textCount < WINDOW_TEXT_CAPACITY)
+                {
+                    const uint32_t slot =
+                        (window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY;
+                    window->text[slot] = codepoint;
+                    window->textCount++;
                 }
             }
             return 0;
@@ -337,6 +375,22 @@ float WindowConsumeMouseWheelSteps(Window* window)
     float steps = window->wheelSteps;
     window->wheelSteps = 0.0f;
     return steps;
+}
+
+uint32_t WindowConsumeText(Window* window, uint32_t* codepoints, uint32_t capacity)
+{
+    if (window == NULL || codepoints == NULL)
+    {
+        return 0u;
+    }
+    uint32_t written = 0u;
+    while (written < capacity && window->textCount != 0u)
+    {
+        codepoints[written++] = window->text[window->textHead];
+        window->textHead = (window->textHead + 1u) % WINDOW_TEXT_CAPACITY;
+        window->textCount--;
+    }
+    return written;
 }
 
 void WindowSetFullscreen(Window* window, bool enabled)

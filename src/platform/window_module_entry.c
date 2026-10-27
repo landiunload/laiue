@@ -26,6 +26,7 @@ static const LaiueWindowServiceV1 service = {
     .consumeMouseWheelSteps = WindowConsumeMouseWheelSteps,
     .setFullscreen = WindowSetFullscreen,
     .isFullscreen = WindowIsFullscreen,
+    .consumeText = WindowConsumeText,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

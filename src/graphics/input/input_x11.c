@@ -45,6 +45,12 @@ static InputKey MapKey(KeySym key)
         case XK_9: return INPUT_KEY_9;
         case XK_F3: return INPUT_KEY_F3;
         case XK_F7: return INPUT_KEY_F7;
+        case XK_0: return INPUT_KEY_0;
+        case XK_r: case XK_R: return INPUT_KEY_R;
+        case XK_f: case XK_F: return INPUT_KEY_F;
+        case XK_p: case XK_P: return INPUT_KEY_P;
+        case XK_Return: case XK_KP_Enter: return INPUT_KEY_ENTER;
+        case XK_BackSpace: return INPUT_KEY_BACKSPACE;
         case XK_Shift_L: case XK_Shift_R: return INPUT_KEY_SHIFT;
         case XK_Control_L: case XK_Control_R: return INPUT_KEY_CONTROL;
         default: return INPUT_KEY_COUNT;
