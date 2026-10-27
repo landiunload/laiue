@@ -163,7 +163,8 @@ typedef uint32_t (*LaiueGraphicsV2SubmitInstancesFn)(LaiueGraphicsDeviceV2 *,
  * returns zero and keeps the previous colour. */
 typedef uint32_t (*LaiueGraphicsV2SetClearColorFn)(LaiueGraphicsDeviceV2 *, const float rgb[3]);
 /* Whether presenting waits for the display's refresh. On by default; off
- * presents as soon as a frame is ready, tearing where the platform allows.
+ * renders without a cap and each refresh shows the newest whole frame, without
+ * tearing where the platform can (IMMEDIATE only where Vulkan has no MAILBOX).
  * The setter returns zero when the device cannot change it; the getter
  * returns 1 when it is on and 0 when it is off or unknown. */
 typedef uint32_t (*LaiueGraphicsV2SetVerticalSyncFn)(LaiueGraphicsDeviceV2 *, uint32_t enabled);

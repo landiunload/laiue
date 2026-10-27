@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Vertical sync off no longer tears. D3D12 keeps three swap-chain buffers and
+  presents without `ALLOW_TEARING`, Vulkan prefers `MAILBOX` to `IMMEDIATE`:
+  frames stay uncapped and each refresh shows the newest whole one, where at
+  thousands of frames a second tearing cut the picture into bands.
 - `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and`
   `getVerticalSync` tail: presenting can stop waiting for the display's
   refresh and start again at run time. Check`
