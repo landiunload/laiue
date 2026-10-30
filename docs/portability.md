@@ -79,7 +79,7 @@ portable font fallback, а на Windows растеризует
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
 | `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
 | `LAIUE_AGGRESSIVE_INLINING` | `ON` | MSVC `/Ob3`; отключаемый максимальный inline profile |
-| `LAIUE_X86_64_LEVEL` | x86_64: `avx2` | ISA Release x86_64: `sse2`, `avx2` либо экспериментальный `avx512`; к ARM64 не применяется |
+| `LAIUE_X86_64_LEVEL` | x86_64: `avx2`, Android: `sse2` | ISA Release x86_64: `sse2`, `avx2` либо экспериментальный `avx512`; на Android `sse2` — база ABI с SSE4.2 и POPCNT; к ARM64 не применяется |
 | `LAIUE_X86_64_TUNE` | x86_64: `generic` | планирование x86_64: `generic` либо opt-in `amd_zen4`; к ARM64 не применяется |
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
