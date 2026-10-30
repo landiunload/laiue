@@ -500,6 +500,12 @@ jobs:
         run: |
           cmake --preset android-arm64-walk
           cmake --build --preset android-arm64-walk-release --parallel
+      # Модули — отдельные .so, которые программа грузит по имени, как DLL
+      # на настольных системах.
+      - name: Compile and link Android programs on modules by name
+        run: |
+          cmake --preset android-arm64-shared
+          cmake --build --preset android-arm64-shared-release --parallel
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
@@ -508,7 +514,7 @@ jobs:
   android-emulator-runtime:
     name: Android native Vulkan runtime
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       LAIUE_ANDROID_IMAGE: android-37.0
       LAIUE_BUILD_TOOLS: 37.0.0
@@ -583,18 +589,25 @@ jobs:
             -storetype PKCS12 -storepass android -keypass android \
             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 3650 \
             -dname 'CN=Android Debug,O=Android,C=US'
-      - name: Build and sign the native test APK
-        timeout-minutes: 8
+      - name: Build and sign the native test APKs
+        timeout-minutes: 12
         run: |
           tools="$ANDROID_HOME/build-tools/$LAIUE_BUILD_TOOLS"
-          cmake --preset android-x86_64-walk \
-            -DLAIUE_ANDROID_AAPT2="$tools/aapt2" \
-            -DLAIUE_ANDROID_ZIPALIGN="$tools/zipalign" \
-            -DLAIUE_ANDROID_APKSIGNER="$tools/apksigner" \
-            -DLAIUE_ANDROID_FRAMEWORK_JAR="$ANDROID_HOME/platforms/$LAIUE_ANDROID_IMAGE/android.jar" \
+          sdk_options=(
+            -DLAIUE_ANDROID_AAPT2="$tools/aapt2"
+            -DLAIUE_ANDROID_ZIPALIGN="$tools/zipalign"
+            -DLAIUE_ANDROID_APKSIGNER="$tools/apksigner"
+            -DLAIUE_ANDROID_FRAMEWORK_JAR="$ANDROID_HOME/platforms/$LAIUE_ANDROID_IMAGE/android.jar"
             -DLAIUE_ANDROID_KEYSTORE="$RUNNER_TEMP/laiue-ci-debug.p12"
+          )
+          cmake --preset android-x86_64-walk "${sdk_options[@]}"
           cmake --build build/android-x86_64-walk --config Release \
             --target laiue_walk_android_apk --parallel
+          # Программа на модулях по имени: окно, ввод, интерфейс и Vulkan —
+          # отдельные .so в APK.
+          cmake --preset android-x86_64-shared "${sdk_options[@]}"
+          cmake --build build/android-x86_64-shared --config Release \
+            --target laiue_viewer_apk --parallel
       - name: Boot the emulator with software Vulkan
         id: emulator
         timeout-minutes: 4
@@ -662,10 +675,32 @@ jobs:
           ./tools/test_android_walk.ps1 `
             -AdbPath "$env:ANDROID_HOME/platform-tools/adb" `
             -Serial emulator-5554 `
-            -Apk build/android-x86_64-walk/android/Release/laiue-walk.apk `
+            -Apk build/android-x86_64-walk/android/laiue_walk_android_apk.apk `
             -FrameCheckExe build/android-emulator-host/bin/Release/laiue_frame_check `
             -OutputDir build/android-runtime-results/captures `
             -TimeoutSeconds 240
+      - name: Verify a program on modules by name draws on Android
+        timeout-minutes: 3
+        run: |
+          adb="$ANDROID_HOME/platform-tools/adb"
+          log=build/android-runtime-results/viewer.log
+          timeout 60s "$adb" -s emulator-5554 install -r \
+            build/android-x86_64-shared/android/laiue_viewer_apk.apk
+          timeout 10s "$adb" -s emulator-5554 logcat -c
+          # --smoke читает кадр с GPU и сравнивает центр с углом: картинка
+          # должна быть на экране, а не только в памяти.
+          timeout 30s "$adb" -s emulator-5554 shell am start -W \
+            -n dev.laiue.viewer/android.app.NativeActivity --es args --smoke
+          deadline=$((SECONDS + 90))
+          until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
+              && grep -Fq 'viewer: the picture is on screen' "$log"; do
+            if [ "$SECONDS" -ge "$deadline" ] || grep -Fq 'main returned' "$log"; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 2
+          done
+          cat "$log"
       - name: Stop the owned emulator process group
         if: always()
         timeout-minutes: 1

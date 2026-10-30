@@ -5,6 +5,28 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Android runs programs on modules by name, like the desktop: with
+  `LAIUE_MODULE_LIBRARY_TYPE=SHARED` every module is its own `.so` in the APK,
+  and a missing one turns off only its technology. The `window` module brings
+  NativeActivity and calls the program's ordinary `main`; `input` reads touch,
+  two-finger gestures and keys. Presets `android-arm64-shared` and
+  `android-x86_64-shared`; CI runs the viewer in the emulator.
+- On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
+  bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
+  shared modules: a program needs only the NDK toolchain file.
+- `laiue_add_program` builds one program for every platform, and
+  `laiue_add_android_apk` packages it: stripped libraries stored uncompressed
+  and aligned to 16 KiB pages. The walk APK uses it too and no longer claims
+  `minSdkVersion` 1.
+- `LaiueWindowServiceV1` gains the optional `setSurfaceCallback` tail and
+  `LaiueGraphicsDeviceV2` the `setNativeWindow` tail: the surface Android takes
+  away on pause is replaced without recreating the device.
+- `LaiueWindowServiceV1` gains the optional `getContentScale` tail: window
+  pixels per interface point, from the DPI on Windows, `Xft.dpi` on X11 and
+  the screen density on Android. Check `LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE`.
+- `examples/viewer`: a PNG, JPEG and GIF viewer in one C file for Windows, Linux
+  and Android.
+- Decoded pictures may be up to 16384 pixels a side; the LTP layer keeps 4096.
 - Input knows `INPUT_KEY_0`, `R`, `F`, `P`, `ENTER` and `BACKSPACE` on
   Windows and X11.
 - `LaiueWindowServiceV1` gains the optional `consumeText` tail: the text typed
@@ -16,9 +38,9 @@ API and ABI may change between minor versions.
   presents without `ALLOW_TEARING`, Vulkan prefers `MAILBOX` to `IMMEDIATE`:
   frames stay uncapped and each refresh shows the newest whole one, where at
   thousands of frames a second tearing cut the picture into bands.
-- `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and`
+- `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and
   `getVerticalSync` tail: presenting can stop waiting for the display's
-  refresh and start again at run time. Check`
+  refresh and start again at run time. Check
   `LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE` before calling it.
 - `LaiueGraphicsDeviceV2` gains the optional `setClearColor` tail: the colour
   every frame is cleared to, the sky behind all geometry. Check

@@ -106,9 +106,8 @@ LaiueModuleStatus LaiueModuleHostLoadNamedProfileV1(LaiueModuleHost *host,
     const wchar_t *directory = profile->directory;
     if (directory == NULL)
     {
-        if (!PlatformExecutableDirectory(executableDirectory, LAIUE_PLATFORM_PATH_CAPACITY))
-            return Fail(diagnostic, LAIUE_MODULE_LOAD_FAILED,
-                        "executable directory is unavailable");
+        if (!PlatformModuleDirectory(executableDirectory, LAIUE_PLATFORM_PATH_CAPACITY))
+            return Fail(diagnostic, LAIUE_MODULE_LOAD_FAILED, "module directory is unavailable");
         directory = executableDirectory;
     }
     else if (directory[0] == L'\0')

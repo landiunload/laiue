@@ -22,6 +22,8 @@ static const LaiueInputServiceV1 service = {
     .isMouseButtonDown = InputIsMouseButtonDown,
     .wasMouseButtonPressed = InputWasMouseButtonPressed,
     .getMouseDelta = InputGetMouseDelta,
+    .getTouches = InputGetTouches,
+    .getGesture = InputGetGesture,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

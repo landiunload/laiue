@@ -398,6 +398,39 @@ bool PlatformExecutableDirectory(wchar_t *output, uint32_t capacity)
 #endif
 }
 
+bool PlatformModuleDirectory(wchar_t *output, uint32_t capacity)
+{
+    if (output == NULL || capacity == 0)
+        return false;
+#if defined(__ANDROID__)
+    // Модули лежат рядом с библиотекой, в которую собран этот код: у
+    // приложения Android все нативные библиотеки в одном каталоге.
+    Dl_info information;
+    if (dladdr((const void *)PlatformModuleDirectory, &information) == 0 ||
+        information.dli_fname == NULL)
+    {
+        output[0] = L'\0';
+        return false;
+    }
+    const char *path = information.dli_fname;
+    size_t length = strlen(path);
+    while (length > 0 && path[length - 1] != '/')
+        --length;
+    if (length <= 1 || length - 1 > UINT32_MAX)
+    {
+        output[0] = L'\0';
+        return false;
+    }
+    return PlatformUtf8ToWide(path, (uint32_t)(length - 1), output, capacity, NULL);
+#elif defined(LAIUE_MOBILE_PLATFORM)
+    // Apple mobile: модули статические, каталога для них нет.
+    output[0] = L'\0';
+    return false;
+#else
+    return PlatformExecutableDirectory(output, capacity);
+#endif
+}
+
 static bool EncodeUtf8Scalar(uint32_t scalar, char *output, uint32_t capacity, uint32_t *offset)
 {
     uint32_t required = scalar <= 0x7fU ? 1U : scalar <= 0x7ffU ? 2U : scalar <= 0xffffU ? 3U : 4U;
@@ -538,11 +571,135 @@ bool PlatformCreateDirectory(const wchar_t *path)
     return stat(nativePath, &status) == 0 && S_ISDIR(status.st_mode);
 }
 
+#if defined(__ANDROID__)
+#define ZIP_END_SIGNATURE 0x06054b50U
+#define ZIP_END_SIZE 22U
+#define ZIP_END_SEARCH (ZIP_END_SIZE + 0xffffU)
+#define ZIP_ENTRY_SIGNATURE 0x02014b50U
+#define ZIP_ENTRY_SIZE 46U
+
+static uint32_t ZipRead16(const unsigned char *bytes)
+{
+    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8U;
+}
+
+static uint32_t ZipRead32(const unsigned char *bytes)
+{
+    return ZipRead16(bytes) | ZipRead16(bytes + 2) << 16U;
+}
+
+static bool ZipReadAt(int descriptor, unsigned char *buffer, size_t size, off_t offset)
+{
+    while (size > 0U)
+    {
+        const ssize_t count = pread(descriptor, buffer, size, offset);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return false;
+        buffer += count;
+        size -= (size_t)count;
+        offset += (off_t)count;
+    }
+    return true;
+}
+
+// Находит центральный каталог архива. Запись его конца ищется с хвоста:
+// за ней идёт только комментарий, длину которого она хранит. ZIP64 Android
+// не устанавливает, поэтому он не разбирается.
+static bool ZipFindDirectory(int descriptor, off_t archiveSize, off_t *offset, size_t *size)
+{
+    if (archiveSize < (off_t)ZIP_END_SIZE)
+        return false;
+    const size_t tailSize =
+        archiveSize < (off_t)ZIP_END_SEARCH ? (size_t)archiveSize : (size_t)ZIP_END_SEARCH;
+    const off_t tailOffset = archiveSize - (off_t)tailSize;
+    unsigned char *tail = (unsigned char *)malloc(tailSize);
+    bool found = false;
+    if (tail != NULL && ZipReadAt(descriptor, tail, tailSize, tailOffset))
+    {
+        size_t at = tailSize - ZIP_END_SIZE + 1U;
+        while (!found && at > 0U)
+        {
+            const unsigned char *end = tail + --at;
+            if (ZipRead32(end) != ZIP_END_SIGNATURE ||
+                ZipRead16(end + 20) != tailSize - ZIP_END_SIZE - at)
+                continue;
+            const off_t directoryOffset = (off_t)ZipRead32(end + 16);
+            const uint32_t directorySize = ZipRead32(end + 12);
+            found = ZipRead16(end + 4) == 0U && ZipRead16(end + 6) == 0U &&
+                    directoryOffset + (off_t)directorySize <= tailOffset + (off_t)at;
+            *offset = directoryOffset;
+            *size = directorySize;
+        }
+    }
+    free(tail);
+    return found;
+}
+
+static bool ZipHasEntry(int descriptor, off_t offset, size_t size, const char *name)
+{
+    const size_t nameLength = strlen(name);
+    unsigned char *directory = (unsigned char *)malloc(size == 0U ? 1U : size);
+    bool found = false;
+    if (directory != NULL && ZipReadAt(descriptor, directory, size, offset))
+    {
+        size_t at = 0U;
+        while (!found && size - at >= ZIP_ENTRY_SIZE &&
+               ZipRead32(directory + at) == ZIP_ENTRY_SIGNATURE)
+        {
+            const size_t length = ZipRead16(directory + at + 28);
+            const size_t record = ZIP_ENTRY_SIZE + length + ZipRead16(directory + at + 30) +
+                                  ZipRead16(directory + at + 32);
+            if (record > size - at)
+                break;
+            found = length == nameLength &&
+                    memcmp(directory + at + ZIP_ENTRY_SIZE, name, nameLength) == 0;
+            at += record;
+        }
+    }
+    free(directory);
+    return found;
+}
+
+// Загрузчик Android открывает несжатые библиотеки прямо из APK по пути
+// «архив!/запись», и такой же путь возвращает dladdr. Он существует, если в
+// центральном каталоге архива есть запись с этим именем: иначе отсутствующий
+// модуль нельзя было бы отличить от модуля, который не загрузился.
+static bool ArchiveEntryExists(char *path)
+{
+    char *separator = strstr(path, "!/");
+    if (separator == NULL || separator[2] == '\0')
+        return false;
+    *separator = '\0';
+    const int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    *separator = '!';
+    if (descriptor < 0)
+        return false;
+    struct stat status;
+    off_t offset = 0;
+    size_t size = 0U;
+    const bool found = fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
+                       ZipFindDirectory(descriptor, status.st_size, &offset, &size) &&
+                       ZipHasEntry(descriptor, offset, size, separator + 2);
+    close(descriptor);
+    return found;
+}
+#endif
+
 bool PlatformPathExists(const wchar_t *path)
 {
     char nativePath[LAIUE_PLATFORM_PATH_CAPACITY * 4U];
+    if (!WidePathToUtf8(path, nativePath))
+        return false;
     struct stat status;
-    return WidePathToUtf8(path, nativePath) && lstat(nativePath, &status) == 0;
+    if (lstat(nativePath, &status) == 0)
+        return true;
+#if defined(__ANDROID__)
+    return ArchiveEntryExists(nativePath);
+#else
+    return false;
+#endif
 }
 
 bool PlatformGetPathInformation(const wchar_t *path, PlatformPathInformation *information)

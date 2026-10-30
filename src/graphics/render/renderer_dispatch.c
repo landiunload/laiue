@@ -143,6 +143,8 @@ extern void RendererDrawGenericMeshRangeBound_Vulkan(Renderer *renderer,
                                                      const RendererSampler *sampler);
 extern void RendererDrawMeshInstances_Vulkan(Renderer* renderer, const RendererMesh* mesh, const RendererMeshInstance* instances, uint32_t instanceCount);
 extern void RendererResize_Vulkan(Renderer* renderer, int32_t width, int32_t height);
+extern bool RendererReplaceSurface_Vulkan(Renderer *renderer, void *windowHandle, int32_t width,
+                                          int32_t height);
 extern bool RendererReloadTexturePackFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog);
 extern bool RendererReloadTexturePack_Vulkan(Renderer* renderer);
 extern RendererContentStatus RendererGetTexturePackLoadStatus_Vulkan(const Renderer* renderer);
@@ -918,6 +920,21 @@ void RendererResize(Renderer* renderer, int32_t width, int32_t height)
 #endif
     default: break;
     }
+}
+
+bool RendererReplaceSurface(Renderer *renderer, void *windowHandle, int32_t width, int32_t height)
+{
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    if (LookupBackend(renderer) == RENDERER_BACKEND_VULKAN)
+        return RendererReplaceSurface_Vulkan(renderer, windowHandle, width, height);
+#else
+    (void)renderer;
+    (void)windowHandle;
+    (void)width;
+    (void)height;
+#endif
+    // Окно D3D12 живёт вместе со своим HWND: заменять нечего.
+    return false;
 }
 
 bool RendererReloadTexturePackFrom(Renderer *renderer, LaiueContentCatalog *catalog)
