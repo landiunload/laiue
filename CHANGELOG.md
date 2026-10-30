@@ -11,6 +11,9 @@ API and ABI may change between minor versions.
   NativeActivity and calls the program's ordinary `main`; `input` reads touch,
   two-finger gestures and keys. Presets `android-arm64-shared` and
   `android-x86_64-shared`; CI runs the viewer in the emulator.
+- On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
+  bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
+  shared modules: a program needs only the NDK toolchain file.
 - `laiue_add_program` builds one program for every platform, and
   `laiue_add_android_apk` packages it: stripped libraries stored uncompressed
   and aligned to 16 KiB pages. The walk APK uses it too and no longer claims

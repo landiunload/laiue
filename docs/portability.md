@@ -270,10 +270,12 @@ SwiftShader 1.2 также проходит NativeActivity smoke, не треб�
 Под Windows `main` получает аргументы в UTF-8 без CRT, `WINDOWED` убирает
 консоль. Пример — [просмотрщик картинок](../examples/viewer/README.md).
 
-Под Android с `LAIUE_MODULE_LIBRARY_TYPE=SHARED` (пресеты
-`android-arm64-shared` и `android-x86_64-shared`) программа — разделяемая
-библиотека, а цель `<имя>_apk` собирает APK функцией
-`laiue_add_android_apk`. Модули лежат в нём отдельными `.so` без сжатия,
+Под Android программе достаточно toolchain-файла NDK: на мобильных системах
+`LAIUE_PLATFORM_BACKEND=AUTO` берёт общий адаптер ядра, а
+`LAIUE_MODULE_LIBRARY_TYPE=AUTO` на Android даёт разделяемые модули (пресеты
+`android-arm64-shared` и `android-x86_64-shared`). Программа тогда —
+разделяемая библиотека, наружу из которой видна только `main`, а цель
+`<имя>_apk` собирает APK функцией `laiue_add_android_apk`. Модули лежат в нём отдельными `.so` без сжатия,
 выровненными по 16 КиБ и очищенными от отладочных сведений; полные копии
 остаются в каталоге сборки для отладчика. `PlatformModuleDirectory` даёт
 каталог модулей: рядом с исполняемым файлом на настольных системах,

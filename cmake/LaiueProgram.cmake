@@ -28,6 +28,9 @@ function(laiue_add_program name)
 
     if(ANDROID)
         add_library(${name} SHARED ${sources})
+        # Модуль окна ищет только main: статические библиотеки остаются
+        # внутри и не раздувают таблицу символов.
+        target_link_options(${name} PRIVATE "LINKER:--exclude-libs,ALL")
     else()
         add_executable(${name} ${sources})
     endif()
