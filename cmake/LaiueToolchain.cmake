@@ -12,7 +12,15 @@ if(NOT LAIUE_CLANG_LTO_MODE MATCHES "^(thin|full)$")
         "LAIUE_CLANG_LTO_MODE должен быть thin или full, получено: "
         "${LAIUE_CLANG_LTO_MODE}")
 endif()
-set(LAIUE_X86_64_LEVEL "avx2" CACHE STRING
+# ABI Android для x86_64 обещает SSE4.2 и POPCNT, но не AVX2: APK под
+# x86-64-v3 падал бы с SIGILL на устройствах без него. sse2 там не опускает
+# базу ниже ABI — её задаёт сам компилятор NDK.
+if(ANDROID)
+    set(_laiue_x86_64_level_default "sse2")
+else()
+    set(_laiue_x86_64_level_default "avx2")
+endif()
+set(LAIUE_X86_64_LEVEL "${_laiue_x86_64_level_default}" CACHE STRING
     "Release ISA profile: sse2, MSVC AVX2/GNU x86-64-v3, or avx512")
 set_property(CACHE LAIUE_X86_64_LEVEL PROPERTY STRINGS sse2 avx2 avx512)
 if(NOT LAIUE_X86_64_LEVEL MATCHES "^(sse2|avx2|avx512)$")

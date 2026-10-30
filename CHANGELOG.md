@@ -11,6 +11,9 @@ API and ABI may change between minor versions.
   NativeActivity and calls the program's ordinary `main`; `input` reads touch,
   two-finger gestures and keys. Presets `android-arm64-shared` and
   `android-x86_64-shared`; CI runs the viewer in the emulator.
+- On Android `LAIUE_X86_64_LEVEL` defaults to `sse2`, the ABI baseline with
+  SSE4.2 and POPCNT. x86_64 APKs were built for AVX2 and would stop with
+  `SIGILL` on devices without it.
 - On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
   bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
   shared modules: a program needs only the NDK toolchain file.
