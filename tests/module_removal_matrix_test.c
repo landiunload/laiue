@@ -312,6 +312,7 @@ LAIUE_TEST_ENTRY(ModuleRemovalMatrixTestEntryPoint)
         L"voxel_render",  L"model",
         L"mesh_world",    L"mesh_world_render",
         L"animation",     L"persist",
+        L"navigation",
     };
     for (uint32_t index = 0u; index < sizeof(names) / sizeof(names[0]); ++index)
         (void)ProbeModule(names[index]);

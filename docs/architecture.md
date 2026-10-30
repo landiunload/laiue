@@ -28,6 +28,7 @@
 | `voxel_render` | композиционный adapter для world/mesh/render; не импортирует эти DLL напрямую |
 | `scene` | камера, матрицы и panorama; streaming и raycast — отдельные providers |
 | `ui` | immediate-mode UI draw lists поверх `laiue.graphics.device` |
+| `navigation` | поиск путей: граф сетей с видами транспорта, сетка свободного движения, поля потока; см. [navigation.md](navigation.md) |
 | `persist` | сохранения: секции с версиями, контрольные суммы, атомарная замена файла, фоновые запись и загрузка; см. [persist.md](persist.md) |
 
 Первые пять модулей образуют переносимое ядро. Полный графический набор
