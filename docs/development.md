@@ -145,6 +145,9 @@ check: нужен реальный link и запуск релевантных �
   Потребитель не освобождает память allocator-ом из другой DLL/SO.
 - Fixed-step и другие горячие пути не содержат allocation, файлового I/O и
   покадрового logging.
+- Отладочные средства получают роль `DIAGNOSTICS` и не попадают в Release;
+  это проверяет `laiue.build.release_hygiene`
+  (см. [диагностика](diagnostics.md)).
 - Оптимизация требует повторяемого измерения до и после.
 
 ## Mobile
@@ -312,6 +315,7 @@ World origin не заменяет render origin. До преобразован�
 - [физика](physics.md)
 - [сохранения](persist.md)
 - [навигация](navigation.md)
+- [диагностика и чистота релиза](diagnostics.md)
 - [аудио](audio.md)
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) ведёт к этому полному набору правил. Editor/agent-

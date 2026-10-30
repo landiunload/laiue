@@ -38,14 +38,41 @@ function(laiue_register_runtime_target target_name runtime_role)
             "Нельзя зарегистрировать отсутствующую цель ${target_name}")
     endif()
     string(TOUPPER "${runtime_role}" normalized_role)
-    if(NOT normalized_role MATCHES "^(CORE|GRAPHICS)$")
+    if(NOT normalized_role MATCHES "^(CORE|GRAPHICS|DIAGNOSTICS)$")
         message(FATAL_ERROR
             "Цель ${target_name} имеет неизвестную runtime role: "
             "${runtime_role}")
     endif()
+    # Диагностика не входит ни в laiue::engine, ни в релизный SDK: она
+    # собирается и ставится только в отладочных конфигурациях.
+    if(normalized_role STREQUAL "DIAGNOSTICS")
+        set_property(GLOBAL APPEND PROPERTY LAIUE_RUNTIME_DIAGNOSTICS_TARGETS "${target_name}")
+        return()
+    endif()
     set_property(GLOBAL APPEND PROPERTY LAIUE_RUNTIME_TARGETS "${target_name}")
     set_property(GLOBAL APPEND PROPERTY
         "LAIUE_RUNTIME_${normalized_role}_TARGETS" "${target_name}")
+endfunction()
+
+# Цель не собирается в Release и MinSizeRel: в многоконфигурационной
+# сборке — через EXCLUDE_FROM_DEFAULT_BUILD_<CONFIG>, в одноконфигурационной
+# релизной — вовсе выпадает из ALL.
+function(laiue_exclude_from_release target_name)
+    get_property(multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(CMAKE_GENERATOR STREQUAL "Ninja Multi-Config")
+        # Только этот генератор понимает EXCLUDE_FROM_ALL, зависящий от
+        # конфигурации.
+        set_target_properties(${target_name} PROPERTIES
+            EXCLUDE_FROM_ALL "$<CONFIG:Release,MinSizeRel>")
+    elseif(multi_config)
+        # Visual Studio: цель остаётся в решении, но не входит в сборку
+        # релизных конфигураций.
+        set_target_properties(${target_name} PROPERTIES
+            EXCLUDE_FROM_DEFAULT_BUILD_RELEASE TRUE
+            EXCLUDE_FROM_DEFAULT_BUILD_MINSIZEREL TRUE)
+    elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+        set_target_properties(${target_name} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
 endfunction()
 
 function(laiue_add_module module_name)
@@ -151,6 +178,14 @@ function(laiue_add_module module_name)
 
     laiue_register_runtime_target(
         ${target_name} "${MODULE_RUNTIME_ROLE}")
+    string(TOUPPER "${MODULE_RUNTIME_ROLE}" module_role_upper)
+    if(module_role_upper STREQUAL "DIAGNOSTICS")
+        laiue_exclude_from_release(${target_name})
+        # Макросы инструментирования включаются у потребителя только там,
+        # где модуль существует.
+        target_compile_definitions(${target_name} INTERFACE
+            "$<$<NOT:$<CONFIG:Release,MinSizeRel>>:LAIUE_DIAGNOSTICS=1>")
+    endif()
     set_target_properties(${target_name} PROPERTIES
         EXPORT_NAME "${module_name}")
 endfunction()

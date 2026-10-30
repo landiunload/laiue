@@ -5,6 +5,18 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Release builds carry nothing debug-only. Modules with the new
+  `DIAGNOSTICS` role are not built in Release or MinSizeRel, stay out of
+  `laiue::engine` and install only for Debug and RelWithDebInfo; the
+  `laiue.build.release_hygiene` test installs the Release SDK and fails on
+  tests, benchmarks, fuzzers, debug information or diagnostics modules.
+  `laiue.graphics.profile` moves to this role.
+- `laiue.frame_monitor` (diagnostics only) records frame and zone times,
+  reports mean, p50, p90, p99, p99.9 and maximum, and logs spikes over a
+  budget or a median multiple with the three heaviest zones. Its
+  instrumentation macros compile to nothing without `LAIUE_DIAGNOSTICS`.
+- `PlatformMonotonicNanoseconds` returns integer nanoseconds of the
+  monotonic clock.
 - The renderer keeps an on-disk pipeline cache when
   `RendererSetPipelineCacheDirectory` names a directory: `ID3D12PipelineLibrary`
   on D3D12 and `VkPipelineCache` on Vulkan, behind an engine header that pins
