@@ -5,6 +5,21 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Input knows `INPUT_KEY_0`, `R`, `F`, `P`, `ENTER` and `BACKSPACE` on
+  Windows and X11.
+- `LaiueWindowServiceV1` gains the optional `consumeText` tail: the text typed
+  since the last call as Unicode code points (`WindowConsumeText`), control
+  characters left to the keys. Windows assembles surrogate pairs; X11 gives
+  Latin-1 for now. Check `LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE` before calling it;
+  `LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE` is the service without it.
+- Vertical sync off no longer tears. D3D12 keeps three swap-chain buffers and
+  presents without `ALLOW_TEARING`, Vulkan prefers `MAILBOX` to `IMMEDIATE`:
+  frames stay uncapped and each refresh shows the newest whole one, where at
+  thousands of frames a second tearing cut the picture into bands.
+- `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and`
+  `getVerticalSync` tail: presenting can stop waiting for the display's
+  refresh and start again at run time. Check`
+  `LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE` before calling it.
 - `LaiueGraphicsDeviceV2` gains the optional `setClearColor` tail: the colour
   every frame is cleared to, the sky behind all geometry. Check
   `LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE` before calling it; without it the

@@ -226,6 +226,8 @@ static uint32_t DeviceV2GetCapabilities(const LaiueGraphicsDeviceV2 *);
 static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *, const LaiueGraphicsDrawItemV2 *,
                                         const LaiueGraphicsInstanceV2 *, uint32_t);
 static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *, const float[3]);
+static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *, uint32_t);
+static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *);
 
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
@@ -463,6 +465,8 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.getCapabilities = DeviceV2GetCapabilities;
     state->deviceV2.submitInstances = DeviceV2SubmitInstances;
     state->deviceV2.setClearColor = DeviceV2SetClearColor;
+    state->deviceV2.setVerticalSync = DeviceV2SetVerticalSync;
+    state->deviceV2.getVerticalSync = DeviceV2GetVerticalSync;
     *outDevice = &state->device;
     return 1u;
 }
@@ -1364,6 +1368,29 @@ static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *device, const float
     for (uint32_t channel = 0u; channel < 3u; ++channel)
         state->clearColor[channel] = rgb[channel];
     return 1u;
+}
+
+static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *device, uint32_t enabled)
+{
+    if (device == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE ||
+        enabled > 1u)
+        return 0u;
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL || state->renderer == NULL)
+        return 0u;
+    RendererSetVerticalSync(state->renderer, enabled != 0u);
+    return RendererIsVerticalSyncEnabled(state->renderer) == (enabled != 0u) ? 1u : 0u;
+}
+
+static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *device)
+{
+    if (device == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_VERTICAL_SYNC_SIZE)
+        return 0u;
+    const LaiueGraphicsDeviceState *state = DeviceV2StateConst(device);
+    return state != NULL && state->renderer != NULL &&
+                   RendererIsVerticalSyncEnabled(state->renderer)
+               ? 1u
+               : 0u;
 }
 
 static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *device,

@@ -5,7 +5,10 @@
 #define Window X11Window
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 #undef Window
+
+#define WINDOW_TEXT_CAPACITY 256u
 
 struct Window
 {
@@ -22,6 +25,10 @@ struct Window
     bool fullscreen;
     bool closeRequested;
     float wheelSteps;
+    /* Typed text until consumed: a ring of code points. */
+    uint32_t text[WINDOW_TEXT_CAPACITY];
+    uint32_t textHead;
+    uint32_t textCount;
     RawInputCallback rawInputCallback;
     void *rawInputUserData;
 };
@@ -49,6 +56,26 @@ static void ProcessEvent(Window *window, XEvent *event)
             if ((Atom)event->xclient.data.l[0] == window->closeAtom)
                 window->closeRequested = true;
             break;
+        case KeyPress:
+        {
+            /* Latin-1 from the key; other scripts need an input method. */
+            char bytes[8];
+            KeySym symbol = 0;
+            const int count =
+                XLookupString(&event->xkey, bytes, (int)sizeof(bytes), &symbol, NULL);
+            for (int index = 0; index < count; ++index)
+            {
+                const uint32_t codepoint = (uint32_t)(unsigned char)bytes[index];
+                if (codepoint >= 0x20u && codepoint != 0x7Fu &&
+                    window->textCount < WINDOW_TEXT_CAPACITY)
+                {
+                    window->text[(window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY] =
+                        codepoint;
+                    window->textCount++;
+                }
+            }
+            break;
+        }
         case ButtonPress:
             if (event->xbutton.button == Button4)
                 window->wheelSteps += 1.0f;
@@ -227,6 +254,20 @@ float WindowConsumeMouseWheelSteps(Window *window)
     const float result = window->wheelSteps;
     window->wheelSteps = 0.0f;
     return result;
+}
+
+uint32_t WindowConsumeText(Window *window, uint32_t *codepoints, uint32_t capacity)
+{
+    if (window == NULL || codepoints == NULL)
+        return 0u;
+    uint32_t written = 0u;
+    while (written < capacity && window->textCount != 0u)
+    {
+        codepoints[written++] = window->text[window->textHead];
+        window->textHead = (window->textHead + 1u) % WINDOW_TEXT_CAPACITY;
+        window->textCount--;
+    }
+    return written;
 }
 
 void WindowSetFullscreen(Window *window, bool enabled)

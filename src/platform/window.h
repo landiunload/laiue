@@ -50,6 +50,12 @@ LAIUE_WINDOW_API void    WindowRequestClose(Window* window);
 // Накопленные с прошлого вызова щелчки колеса мыши (положительные — от себя).
 LAIUE_WINDOW_API float   WindowConsumeMouseWheelSteps(Window* window);
 
+// Набранный с прошлого вызова текст: до capacity кодовых точек Unicode в
+// порядке набора, управляющие символы (Enter, Backspace, Tab) не входят.
+// Возвращает число записанных; лишнее остаётся до следующего вызова.
+LAIUE_WINDOW_API uint32_t WindowConsumeText(Window* window, uint32_t* codepoints,
+    uint32_t capacity);
+
 // Полноэкранный режим без рамки на текущем мониторе. Обычный оконный
 // режим восстанавливает прежние стиль и положение окна.
 LAIUE_WINDOW_API void    WindowSetFullscreen(Window* window, bool enabled);

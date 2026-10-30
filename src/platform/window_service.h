@@ -3,6 +3,7 @@
 #include "platform/window.h"
 #include "mod/module_api.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LAIUE_WINDOW_SERVICE_NAME "laiue.window"
@@ -28,6 +29,14 @@ typedef struct LaiueWindowServiceV1
     float (*consumeMouseWheelSteps)(Window *window);
     void (*setFullscreen)(Window *window, bool enabled);
     bool (*isFullscreen)(const Window *window);
+    /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE. Text typed
+     * since the last call, as WindowConsumeText. */
+    uint32_t (*consumeText)(Window *window, uint32_t *codepoints, uint32_t capacity);
 } LaiueWindowServiceV1;
+
+/* The service before the text tail, and with it. */
+#define LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE                                                  \
+    ((uint32_t)offsetof(LaiueWindowServiceV1, consumeText))
+#define LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE ((uint32_t)sizeof(LaiueWindowServiceV1))
 
 const LaiueModuleApiV1 *LaiueWindowGetStaticModuleApiV1(void);

@@ -2542,8 +2542,8 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
     return formats[0];
 }
 
-// Present-mode: vsync — FIFO; без vsync — IMMEDIATE, иначе MAILBOX, иначе
-// FIFO (он обязан поддерживаться всегда).
+// Present-mode: vsync — FIFO; без vsync — MAILBOX (последний готовый кадр
+// без разрывов), иначе IMMEDIATE, иначе FIFO (он обязан поддерживаться всегда).
 static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync)
 {
     if (vsync)
@@ -2553,9 +2553,9 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
         return VK_PRESENT_MODE_FIFO_KHR;
     }
     for (uint32_t index = 0; index < count; ++index)
-        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    for (uint32_t index = 0; index < count; ++index)
         if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
+    for (uint32_t index = 0; index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 

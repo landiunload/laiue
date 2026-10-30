@@ -41,7 +41,9 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
                                     uint64_t sizeBytes, uint32_t rowPitchBytes);
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 
-#define FRAME_COUNT 2
+// Буферов swapchain и кадров в полёте: третий нужен, чтобы без vsync, пока
+// один кадр на экране и следующий ждёт обновления, GPU уже рисовал ещё один.
+#define FRAME_COUNT 3
 
 // Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
 // блоков соседствуют — таблица чанкового прохода накрывает оба (t1, t2).
@@ -333,8 +335,6 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     int32_t                    resizeHeight;
     bool                       resizeRequested;
     bool                       verticalSyncEnabled;
-    bool                       tearingSupported;
-    bool                       tearingPresentEnabled;
     bool                       wireframeEnabled;
     bool                       worldReady;
     bool                       frameRecording;
@@ -2149,21 +2149,6 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         return NULL;
     }
 
-    IDXGIFactory5* factory5 = NULL;
-    if (SUCCEEDED(IDXGIFactory4_QueryInterface(
-            renderer->factory, &IID_IDXGIFactory5, (void**)&factory5)))
-    {
-        BOOL allowTearing = FALSE;
-        if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(factory5,
-                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                &allowTearing, (UINT)sizeof(allowTearing))))
-        {
-            renderer->tearingSupported = allowTearing != FALSE;
-            renderer->tearingPresentEnabled = renderer->tearingSupported;
-        }
-        IDXGIFactory5_Release(factory5);
-    }
-
     // Аппаратный адаптер, при неудаче — программный WARP.
     if (!CreateShaderModel6Device(NULL, &renderer->device))
     {
@@ -2204,8 +2189,6 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDescription.SampleDesc.Count = 1;
-    swapChainDescription.Flags = renderer->tearingSupported
-        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     IDXGISwapChain1* swapChain1 = NULL;
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
@@ -3616,10 +3599,8 @@ static bool ApplyPendingResize(Renderer* renderer)
         }
     }
 
-    UINT swapChainFlags = renderer->tearingSupported
-        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, swapChainFlags)))
+        DXGI_FORMAT_R8G8B8A8_UNORM, 0)))
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
@@ -4140,26 +4121,11 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
+    // Без vsync окно с flip-моделью показывает на каждом обновлении экрана
+    // последний готовый кадр целиком: FPS не ограничен, а разрывов, которые
+    // при тысячах кадров в секунду режут картинку на полосы, нет.
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
-    UINT presentFlags = 0;
-    if (!renderer->verticalSyncEnabled && renderer->tearingPresentEnabled)
-    {
-        BOOL fullscreen = TRUE;
-        if (SUCCEEDED(IDXGISwapChain3_GetFullscreenState(
-                renderer->swapChain, &fullscreen, NULL)) && !fullscreen)
-        {
-            presentFlags = DXGI_PRESENT_ALLOW_TEARING;
-        }
-    }
-
-    HRESULT presentResult = IDXGISwapChain3_Present(
-        renderer->swapChain, syncInterval, presentFlags);
-    if (presentResult == DXGI_ERROR_INVALID_CALL
-        && presentFlags == DXGI_PRESENT_ALLOW_TEARING)
-    {
-        renderer->tearingPresentEnabled = false;
-        presentResult = IDXGISwapChain3_Present(renderer->swapChain, 0, 0);
-    }
+    HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval, 0);
     if (FAILED(presentResult))
     {
         // ExecuteCommandLists already submitted work. Complete its fence even
