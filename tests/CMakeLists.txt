@@ -445,6 +445,13 @@ if(TARGET laiue_ui)
         TEST laiue.ui.draw_list)
 endif()
 
+# Состояние ввода общее для всех платформ и не требует окна: оно
+# собирается в тест напрямую и проверяется везде, включая headless-сборки.
+laiue_add_harness(laiue_input_state_test InputStateTestEntryPoint
+    input_state_test.c "${laiue_src}/graphics/input/input_state.c"
+    STATIC INCLUDES "${laiue_src}" "${laiue_src}/graphics"
+    LIBRARIES laiue::math_support TEST laiue.input.state)
+
 # Audio. The offscreen backend needs no sound device.
 if(TARGET laiue_audio)
     laiue_add_harness(laiue_audio_api_test AudioApiTestEntryPoint audio_api_test.c

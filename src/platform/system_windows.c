@@ -363,6 +363,11 @@ bool PlatformExecutableDirectory(wchar_t* output, uint32_t capacity)
     return true;
 }
 
+bool PlatformModuleDirectory(wchar_t *output, uint32_t capacity)
+{
+    return PlatformExecutableDirectory(output, capacity);
+}
+
 bool PlatformWideToUtf8(const wchar_t* input, char* output,
                         uint32_t capacity, uint32_t* outLength)
 {

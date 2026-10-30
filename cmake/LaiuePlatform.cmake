@@ -89,7 +89,9 @@ if(NOT LAIUE_MODULE_LIBRARY_TYPE_RESOLVED MATCHES "^(SHARED|STATIC)$")
     message(FATAL_ERROR
         "LAIUE_MODULE_LIBRARY_TYPE must be AUTO, SHARED or STATIC")
 endif()
-if(LAIUE_PLATFORM_EXTERNAL AND
+# Android загружает модули из APK так же, как настольные системы — из
+# каталога программы; остальным внешним платформам нужны статические.
+if(LAIUE_PLATFORM_EXTERNAL AND NOT ANDROID AND
    NOT LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     message(FATAL_ERROR "The initial EXTERNAL core contract requires STATIC modules")
 endif()

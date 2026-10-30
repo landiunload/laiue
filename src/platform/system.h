@@ -150,6 +150,10 @@ void PlatformWriteConsoleUtf8(const char* message);
 uint32_t PlatformGetEnvironmentUtf8(
     const char* name, char* output, uint32_t capacity);
 bool PlatformExecutableDirectory(wchar_t* output, uint32_t capacity);
+/* Каталог, где лежат библиотеки модулей движка: рядом с исполняемым файлом
+ * на настольных системах, каталог нативных библиотек приложения на Android
+ * (внутри APK, если библиотеки не распакованы). Это не корень содержимого. */
+bool PlatformModuleDirectory(wchar_t *output, uint32_t capacity);
 
 bool PlatformWideToUtf8(const wchar_t* input, char* output,
                         uint32_t capacity, uint32_t* outLength);

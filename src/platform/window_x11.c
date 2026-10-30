@@ -281,6 +281,14 @@ bool WindowIsFullscreen(const Window *window)
     return window != NULL && window->fullscreen;
 }
 
+void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback, void *userData)
+{
+    // Поверхность окна X11 живёт вместе с окном и не меняется.
+    (void)window;
+    (void)callback;
+    (void)userData;
+}
+
 void WindowRequestClose(Window *window)
 {
     if (window != NULL)

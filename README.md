@@ -66,8 +66,10 @@ ctest --preset linux-gcc-release --parallel
 
 Add `-DLAIUE_BUILD_EXAMPLES=ON` to build the examples:
 [walk](examples/walk/README.md) on a voxel world,
-[mesh_world](examples/mesh_world/README.md) and
-[animation](examples/animation/README.md).
+[mesh_world](examples/mesh_world/README.md),
+[animation](examples/animation/README.md) and the
+[image viewer](examples/viewer/README.md), a program that runs unchanged on
+Windows, Linux and Android.
 
 ## Usage
 
@@ -101,7 +103,7 @@ int main(void)
 | Windows | x86_64, ARM64 | D3D12, Vulkan |
 | Linux | x86_64, ARM64 | Vulkan on x86_64 |
 | macOS | arm64, x86_64 | — |
-| Android | arm64, x86_64 | Vulkan example |
+| Android | arm64, x86_64 | Vulkan: window, touch input, UI |
 | iOS | arm64 | — |
 
 Every platform builds the core: world, physics, content and mods.

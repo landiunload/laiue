@@ -2878,6 +2878,43 @@ static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandB
 
 // === Создание и разрушение ===
 
+// Surface окна по его native handle: HWND, пара {Display, Window} X11 или
+// ANativeWindow. Пишет renderer->surface только при успехе.
+static bool CreateSurface(Renderer *renderer, void *windowHandle)
+{
+#if defined(_WIN32)
+    VkWin32SurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+        .hinstance = GetModuleHandleW(NULL),
+        .hwnd = (HWND)windowHandle,
+    };
+    return vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#elif defined(LAIUE_RENDER_HAS_X11)
+    const LaiueWindowNativeHandleV1 *nativeHandle = (const LaiueWindowNativeHandleV1 *)windowHandle;
+    if (nativeHandle->display == NULL || nativeHandle->window == 0u)
+        return false;
+    VkXlibSurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+        .dpy = (Display *)nativeHandle->display,
+        .window = (Window)nativeHandle->window,
+    };
+    return vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#elif defined(__ANDROID__)
+    VkAndroidSurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+        .window = (ANativeWindow *)windowHandle,
+    };
+    return vkCreateAndroidSurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#else
+    (void)renderer;
+    (void)windowHandle;
+    return false;
+#endif
+}
+
 static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 {
     // Оконная поверхность — единственное, ради чего включаются
@@ -2934,49 +2971,12 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     };
     if (vkCreateInstance(&instanceInfo, NULL, &renderer->instance) != VK_SUCCESS) return false;
 
-#if defined(_WIN32)
     if (windowHandle != NULL)
     {
-        VkWin32SurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-            .hinstance = GetModuleHandleW(NULL),
-            .hwnd = (HWND)windowHandle,
-        };
-        if (vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) !=
-            VK_SUCCESS)
+        if (!CreateSurface(renderer, windowHandle))
             return false;
         renderer->hasSurface = true;
     }
-#elif defined(LAIUE_RENDER_HAS_X11)
-    if (windowHandle != NULL)
-    {
-        const LaiueWindowNativeHandleV1 *nativeHandle =
-            (const LaiueWindowNativeHandleV1 *)windowHandle;
-        if (nativeHandle->display == NULL || nativeHandle->window == 0u)
-            return false;
-        VkXlibSurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
-            .dpy = (Display *)nativeHandle->display,
-            .window = (Window)nativeHandle->window,
-        };
-        if (vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
-                                   &renderer->surface) != VK_SUCCESS)
-            return false;
-        renderer->hasSurface = true;
-    }
-#elif defined(__ANDROID__)
-    if (windowHandle != NULL)
-    {
-        VkAndroidSurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
-            .window = (ANativeWindow *)windowHandle,
-        };
-        if (vkCreateAndroidSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
-                                      &renderer->surface) != VK_SUCCESS)
-            return false;
-        renderer->hasSurface = true;
-    }
-#endif
 
     uint32_t deviceCount = 0u;
     if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, NULL) != VK_SUCCESS ||
@@ -5060,6 +5060,43 @@ void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
     renderer->resizeWidth = width;
     renderer->resizeHeight = height;
     renderer->resizeRequested = true;
+}
+
+bool RendererReplaceSurface_Vulkan(Renderer *renderer, void *windowHandle, int32_t width,
+                                   int32_t height)
+{
+    // Offscreen-рендер поверхности не имеет и не получает: его цели кадра
+    // устроены иначе.
+    if (renderer == NULL || !renderer->hasSurface || renderer->device == VK_NULL_HANDLE)
+        return false;
+    WaitForGpu(renderer);
+    DestroySwapchainResources(renderer);
+    if (renderer->surface != VK_NULL_HANDLE)
+    {
+        vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
+        renderer->surface = VK_NULL_HANDLE;
+    }
+    // Без поверхности кадры пропускаются, как у свёрнутого окна, а
+    // swapchain собирается заново, когда поверхность вернётся.
+    renderer->swapchainOutOfDate = true;
+    RendererResize_Vulkan(renderer, 0, 0);
+    if (windowHandle == NULL)
+        return true;
+    VkBool32 supported = VK_FALSE;
+    if (!CreateSurface(renderer, windowHandle) ||
+        vkGetPhysicalDeviceSurfaceSupportKHR(renderer->physicalDevice, renderer->queueFamily,
+                                             renderer->surface, &supported) != VK_SUCCESS ||
+        supported != VK_TRUE)
+    {
+        if (renderer->surface != VK_NULL_HANDLE)
+        {
+            vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
+            renderer->surface = VK_NULL_HANDLE;
+        }
+        return false;
+    }
+    RendererResize_Vulkan(renderer, width, height);
+    return true;
 }
 
 // === Контент ===

@@ -228,6 +228,7 @@ static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *, const LaiueGrap
 static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *, const float[3]);
 static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *, uint32_t);
 static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *);
+static uint32_t DeviceV2SetNativeWindow(LaiueGraphicsDeviceV2 *, void *, int32_t, int32_t);
 
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
@@ -467,6 +468,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.setClearColor = DeviceV2SetClearColor;
     state->deviceV2.setVerticalSync = DeviceV2SetVerticalSync;
     state->deviceV2.getVerticalSync = DeviceV2GetVerticalSync;
+    state->deviceV2.setNativeWindow = DeviceV2SetNativeWindow;
     *outDevice = &state->device;
     return 1u;
 }
@@ -1380,6 +1382,18 @@ static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *device, uint32_t 
         return 0u;
     RendererSetVerticalSync(state->renderer, enabled != 0u);
     return RendererIsVerticalSyncEnabled(state->renderer) == (enabled != 0u) ? 1u : 0u;
+}
+
+static uint32_t DeviceV2SetNativeWindow(LaiueGraphicsDeviceV2 *device, void *nativeWindow,
+                                        int32_t width, int32_t height)
+{
+    if (device == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_NATIVE_WINDOW_SIZE)
+        return 0u;
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL || state->renderer == NULL)
+        return 0u;
+    state->lastFrameValid = false;
+    return RendererReplaceSurface(state->renderer, nativeWindow, width, height) ? 1u : 0u;
 }
 
 static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *device)

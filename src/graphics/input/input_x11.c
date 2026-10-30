@@ -1,4 +1,4 @@
-#include "input/input.h"
+#include "input/input_state.h"
 
 #define Window X11Window
 #include <X11/Xlib.h>
@@ -7,60 +7,93 @@
 
 #include "platform/system.h"
 
-struct Input
-{
-    bool keyDown[INPUT_KEY_COUNT];
-    uint8_t keyPressCount[INPUT_KEY_COUNT];
-    bool mouseButtonDown[INPUT_MOUSE_BUTTON_COUNT];
-    bool mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_COUNT];
-    int32_t mouseDeltaX;
-    int32_t mouseDeltaY;
-    int32_t lastPointerX;
-    int32_t lastPointerY;
-    bool hasLastPointer;
-};
-
 static InputKey MapKey(KeySym key)
 {
+    if (key >= XK_a && key <= XK_z)
+        return InputKeyLetter((uint32_t)(key - XK_a));
+    if (key >= XK_A && key <= XK_Z)
+        return InputKeyLetter((uint32_t)(key - XK_A));
+    if (key >= XK_0 && key <= XK_9)
+        return InputKeyDigit((uint32_t)(key - XK_0));
+    if (key >= XK_F1 && key <= XK_F12)
+        return InputKeyFunction((uint32_t)(key - XK_F1) + 1u);
     switch (key)
     {
-        case XK_Escape: return INPUT_KEY_ESCAPE;
-        case XK_space: return INPUT_KEY_SPACE;
-        case XK_w: case XK_W: return INPUT_KEY_W;
-        case XK_a: case XK_A: return INPUT_KEY_A;
-        case XK_s: case XK_S: return INPUT_KEY_S;
-        case XK_d: case XK_D: return INPUT_KEY_D;
-        case XK_t: case XK_T: return INPUT_KEY_T;
-        case XK_g: case XK_G: return INPUT_KEY_G;
-        case XK_v: case XK_V: return INPUT_KEY_V;
-        case XK_e: case XK_E: return INPUT_KEY_E;
-        case XK_1: return INPUT_KEY_1;
-        case XK_2: return INPUT_KEY_2;
-        case XK_3: return INPUT_KEY_3;
-        case XK_4: return INPUT_KEY_4;
-        case XK_5: return INPUT_KEY_5;
-        case XK_6: return INPUT_KEY_6;
-        case XK_7: return INPUT_KEY_7;
-        case XK_8: return INPUT_KEY_8;
-        case XK_9: return INPUT_KEY_9;
-        case XK_F3: return INPUT_KEY_F3;
-        case XK_F7: return INPUT_KEY_F7;
-        case XK_0: return INPUT_KEY_0;
-        case XK_r: case XK_R: return INPUT_KEY_R;
-        case XK_f: case XK_F: return INPUT_KEY_F;
-        case XK_p: case XK_P: return INPUT_KEY_P;
-        case XK_Return: case XK_KP_Enter: return INPUT_KEY_ENTER;
-        case XK_BackSpace: return INPUT_KEY_BACKSPACE;
-        case XK_Shift_L: case XK_Shift_R: return INPUT_KEY_SHIFT;
-        case XK_Control_L: case XK_Control_R: return INPUT_KEY_CONTROL;
-        default: return INPUT_KEY_COUNT;
+    case XK_Escape:
+        return INPUT_KEY_ESCAPE;
+    case XK_space:
+        return INPUT_KEY_SPACE;
+    case XK_Return:
+    case XK_KP_Enter:
+        return INPUT_KEY_ENTER;
+    case XK_BackSpace:
+        return INPUT_KEY_BACKSPACE;
+    case XK_Tab:
+        return INPUT_KEY_TAB;
+    case XK_Shift_L:
+    case XK_Shift_R:
+        return INPUT_KEY_SHIFT;
+    case XK_Control_L:
+    case XK_Control_R:
+        return INPUT_KEY_CONTROL;
+    case XK_Alt_L:
+    case XK_Alt_R:
+        return INPUT_KEY_ALT;
+    case XK_Left:
+        return INPUT_KEY_LEFT;
+    case XK_Right:
+        return INPUT_KEY_RIGHT;
+    case XK_Up:
+        return INPUT_KEY_UP;
+    case XK_Down:
+        return INPUT_KEY_DOWN;
+    case XK_Home:
+        return INPUT_KEY_HOME;
+    case XK_End:
+        return INPUT_KEY_END;
+    case XK_Prior:
+        return INPUT_KEY_PAGE_UP;
+    case XK_Next:
+        return INPUT_KEY_PAGE_DOWN;
+    case XK_Insert:
+        return INPUT_KEY_INSERT;
+    case XK_Delete:
+        return INPUT_KEY_DELETE;
+    case XK_minus:
+    case XK_KP_Subtract:
+        return INPUT_KEY_MINUS;
+    case XK_equal:
+    case XK_KP_Add:
+        return INPUT_KEY_EQUALS;
+    default:
+        return INPUT_KEY_COUNT;
+    }
+}
+
+static bool MapButton(unsigned int button, InputMouseButton *outButton)
+{
+    switch (button)
+    {
+    case Button1:
+        *outButton = INPUT_MOUSE_BUTTON_LEFT;
+        return true;
+    case Button2:
+        *outButton = INPUT_MOUSE_BUTTON_MIDDLE;
+        return true;
+    case Button3:
+        *outButton = INPUT_MOUSE_BUTTON_RIGHT;
+        return true;
+    default:
+        return false;
     }
 }
 
 Input *InputCreate(void *windowNativeHandle)
 {
     (void)windowNativeHandle;
-    return (Input *)PlatformAllocate(sizeof(Input), true);
+    Input *input = (Input *)PlatformAllocate(sizeof(Input), false);
+    InputStateInitialize(input, 0.0f);
+    return input;
 }
 
 void InputDestroy(Input *input)
@@ -75,121 +108,15 @@ void InputHandleRawInput(Input *input, void *rawInputHandle)
     const XEvent *event = (const XEvent *)rawInputHandle;
     if (event->type == KeyPress || event->type == KeyRelease)
     {
-        KeySym keySym = XLookupKeysym((XKeyEvent *)&event->xkey, 0);
-        const InputKey key = MapKey(keySym);
-        if (key == INPUT_KEY_COUNT)
-            return;
-        if (event->type == KeyRelease)
-            input->keyDown[key] = false;
-        else
-        {
-            if (!input->keyDown[key] && input->keyPressCount[key] < UINT8_MAX)
-                ++input->keyPressCount[key];
-            input->keyDown[key] = true;
-        }
+        const KeySym keySym = XLookupKeysym((XKeyEvent *)&event->xkey, 0);
+        InputStateKey(input, MapKey(keySym), event->type == KeyPress);
     }
     else if (event->type == ButtonPress || event->type == ButtonRelease)
     {
-        const unsigned int button = event->xbutton.button;
-        if (button == Button1)
-        {
-            if (event->type == ButtonPress)
-            {
-                input->mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_LEFT] =
-                    !input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT];
-                input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT] = true;
-            }
-            else
-                input->mouseButtonDown[INPUT_MOUSE_BUTTON_LEFT] = false;
-        }
-        else if (button == Button3)
-        {
-            if (event->type == ButtonPress)
-            {
-                input->mouseButtonPressedLatch[INPUT_MOUSE_BUTTON_RIGHT] =
-                    !input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT];
-                input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = true;
-            }
-            else
-                input->mouseButtonDown[INPUT_MOUSE_BUTTON_RIGHT] = false;
-        }
+        InputMouseButton button = INPUT_MOUSE_BUTTON_LEFT;
+        if (MapButton(event->xbutton.button, &button))
+            InputStateButton(input, button, event->type == ButtonPress);
     }
     else if (event->type == MotionNotify)
-    {
-        if (input->hasLastPointer)
-        {
-            input->mouseDeltaX += event->xmotion.x - input->lastPointerX;
-            input->mouseDeltaY += event->xmotion.y - input->lastPointerY;
-        }
-        input->lastPointerX = event->xmotion.x;
-        input->lastPointerY = event->xmotion.y;
-        input->hasLastPointer = true;
-    }
-}
-
-void InputEndFrame(Input *input)
-{
-    if (input == NULL)
-        return;
-    for (uint32_t button = 0u; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
-        input->mouseButtonPressedLatch[button] = false;
-    input->mouseDeltaX = 0;
-    input->mouseDeltaY = 0;
-}
-
-void InputResetState(Input *input)
-{
-    if (input == NULL)
-        return;
-    for (uint32_t key = 0u; key < INPUT_KEY_COUNT; ++key)
-    {
-        input->keyDown[key] = false;
-        input->keyPressCount[key] = 0u;
-    }
-    for (uint32_t button = 0u; button < INPUT_MOUSE_BUTTON_COUNT; ++button)
-    {
-        input->mouseButtonDown[button] = false;
-        input->mouseButtonPressedLatch[button] = false;
-    }
-    input->mouseDeltaX = 0;
-    input->mouseDeltaY = 0;
-    input->hasLastPointer = false;
-}
-
-bool InputIsKeyDown(const Input *input, InputKey key)
-{
-    return input != NULL && (uint32_t)key < INPUT_KEY_COUNT && input->keyDown[key];
-}
-
-bool InputWasKeyPressed(const Input *input, InputKey key)
-{
-    return input != NULL && (uint32_t)key < INPUT_KEY_COUNT && input->keyPressCount[key] != 0u;
-}
-
-bool InputConsumeKeyPress(Input *input, InputKey key)
-{
-    if (input == NULL || (uint32_t)key >= INPUT_KEY_COUNT || input->keyPressCount[key] == 0u)
-        return false;
-    --input->keyPressCount[key];
-    return true;
-}
-
-bool InputIsMouseButtonDown(const Input *input, InputMouseButton button)
-{
-    return input != NULL && (uint32_t)button < INPUT_MOUSE_BUTTON_COUNT &&
-           input->mouseButtonDown[button];
-}
-
-bool InputWasMouseButtonPressed(const Input *input, InputMouseButton button)
-{
-    return input != NULL && (uint32_t)button < INPUT_MOUSE_BUTTON_COUNT &&
-           input->mouseButtonPressedLatch[button];
-}
-
-void InputGetMouseDelta(const Input *input, int32_t *deltaX, int32_t *deltaY)
-{
-    if (deltaX != NULL)
-        *deltaX = input == NULL ? 0 : input->mouseDeltaX;
-    if (deltaY != NULL)
-        *deltaY = input == NULL ? 0 : input->mouseDeltaY;
+        InputStatePointer(input, event->xmotion.x, event->xmotion.y);
 }
