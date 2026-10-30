@@ -532,7 +532,8 @@ bool PlatformFileOpenRead(const char *path, PlatformReadFile *outFile, uint64_t 
     wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
     if (!PlatformUtf8ToWide(path, length, wide, LAIUE_PLATFORM_PATH_CAPACITY, NULL))
         return false;
-    HANDLE native = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+    HANDLE native = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (native == INVALID_HANDLE_VALUE)
         return false;
@@ -590,6 +591,110 @@ void PlatformFileClose(PlatformReadFile *file)
     if (file->opaque[0] != 0u)
         CloseHandle((HANDLE)file->opaque[0]);
     memset(file, 0, sizeof(*file));
+}
+
+static bool Utf8PathToWide(const char *path, wchar_t output[LAIUE_PLATFORM_PATH_CAPACITY])
+{
+    if (path == NULL)
+        return false;
+    uint32_t length = 0u;
+    while (length < LAIUE_PLATFORM_PATH_CAPACITY * 4u && path[length] != '\0')
+        ++length;
+    return length != 0u && length < LAIUE_PLATFORM_PATH_CAPACITY * 4u &&
+           PlatformUtf8ToWide(path, length, output, LAIUE_PLATFORM_PATH_CAPACITY, NULL);
+}
+
+bool PlatformFileCreateWrite(const char *path, PlatformWriteFile *outFile)
+{
+    if (outFile == NULL || outFile->opaque[0] != 0u)
+        return false;
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    if (!Utf8PathToWide(path, wide))
+        return false;
+    HANDLE native = CreateFileW(wide, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (native == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION information;
+    if (GetFileType(native) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(native, &information) ||
+        (information.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0u)
+    {
+        CloseHandle(native);
+        return false;
+    }
+    outFile->opaque[0] = (uintptr_t)native;
+    outFile->opaque[1] = 0u;
+    return true;
+}
+
+bool PlatformFileWrite(PlatformWriteFile *file, const void *bytes, uint32_t count)
+{
+    if (file == NULL || file->opaque[0] == 0u || (count != 0u && bytes == NULL))
+        return false;
+    HANDLE native = (HANDLE)file->opaque[0];
+    const uint8_t *source = bytes;
+    uint32_t completed = 0u;
+    while (completed < count)
+    {
+        DWORD part = count - completed;
+        if (part > 0x7ffff000u)
+            part = 0x7ffff000u;
+        DWORD written = 0u;
+        if (!WriteFile(native, source + completed, part, &written, NULL) || written == 0u)
+            return false;
+        completed += written;
+    }
+    return true;
+}
+
+bool PlatformFileFlush(PlatformWriteFile *file)
+{
+    return file != NULL && file->opaque[0] != 0u &&
+           FlushFileBuffers((HANDLE)file->opaque[0]) != FALSE;
+}
+
+void PlatformFileCloseWrite(PlatformWriteFile *file)
+{
+    if (file == NULL)
+        return;
+    if (file->opaque[0] != 0u)
+        CloseHandle((HANDLE)file->opaque[0]);
+    memset(file, 0, sizeof(*file));
+}
+
+bool PlatformFileReplaceDurable(const char *source, const char *destination)
+{
+    // Два пути на стеке превысили бы страницу, а без CRT нет __chkstk.
+    wchar_t *wide = PlatformAllocate(
+        (size_t)LAIUE_PLATFORM_PATH_CAPACITY * 2u * sizeof(*wide), false);
+    if (wide == NULL)
+        return false;
+    wchar_t *wideDestination = wide + LAIUE_PLATFORM_PATH_CAPACITY;
+    const bool replaced = Utf8PathToWide(source, wide) &&
+                          Utf8PathToWide(destination, wideDestination) &&
+                          PlatformMoveReplace(wide, wideDestination);
+    PlatformFree(wide);
+    return replaced;
+}
+
+bool PlatformFileDeleteUtf8(const char *path)
+{
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    if (!Utf8PathToWide(path, wide))
+        return false;
+    if (DeleteFileW(wide))
+        return true;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+bool PlatformGetPathInformationUtf8(const char *path, PlatformPathInformation *information)
+{
+    wchar_t wide[LAIUE_PLATFORM_PATH_CAPACITY];
+    return information != NULL && Utf8PathToWide(path, wide) &&
+           PlatformGetPathInformation(wide, information);
 }
 
 bool PlatformWriteEntireFile(const wchar_t* path, const void* bytes,

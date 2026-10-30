@@ -5,6 +5,17 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `laiue.persist` saves and loads application state as named, versioned
+  sections: CRC-32C on every byte, atomic replacement with rotating backups,
+  fallback to the newest intact copy, block LZ compression in parallel,
+  byte-for-byte copying of unchanged sections, schema migrations, and
+  background save and load jobs with progress and cancellation.
+- The platform boundary gains streaming file writes
+  (`PlatformFileCreateWrite`, `PlatformFileWrite`, `PlatformFileFlush`),
+  durable replacement (`PlatformFileReplaceDurable`, which also syncs the
+  directory on POSIX) and UTF-8 delete and stat helpers. External platform
+  adapters must implement them. Windows opens files for reading with
+  `FILE_SHARE_DELETE`, so an open file can be renamed or replaced.
 - Shaders compile with DXC for both backends: DXIL Shader Model 6.0 for
   D3D12 and SPIR-V for Vulkan. fxc and glslang are no longer used.
 - Shader packs use contract 2: DXIL for D3D12, SPIR-V for Vulkan. Contract 1
