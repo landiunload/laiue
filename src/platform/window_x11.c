@@ -8,6 +8,8 @@
 #include <X11/Xutil.h>
 #undef Window
 
+#include <string.h>
+
 #define WINDOW_TEXT_CAPACITY 256u
 
 struct Window
@@ -287,6 +289,43 @@ void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback, void *us
     (void)window;
     (void)callback;
     (void)userData;
+}
+
+float WindowGetContentScale(const Window *window)
+{
+    // Xft.dpi из ресурсов сервера — по нему масштабируют интерфейс GTK и Qt.
+    // Без него точка равна пикселю.
+    const char *resources =
+        window != NULL && window->display != NULL ? XResourceManagerString(window->display) : NULL;
+    static const char key[] = "Xft.dpi:";
+    for (const char *line = resources; line != NULL && *line != '\0';)
+    {
+        if (strncmp(line, key, sizeof(key) - 1u) == 0)
+        {
+            const char *cursor = line + sizeof(key) - 1u;
+            while (*cursor == ' ' || *cursor == '\t')
+                ++cursor;
+            // Целая часть и дробная: strtod зависит от локали процесса.
+            float dpi = 0.0f;
+            while (*cursor >= '0' && *cursor <= '9')
+                dpi = dpi * 10.0f + (float)(*cursor++ - '0');
+            if (*cursor == '.')
+            {
+                ++cursor;
+                float unit = 0.1f;
+                while (*cursor >= '0' && *cursor <= '9')
+                {
+                    dpi += unit * (float)(*cursor++ - '0');
+                    unit *= 0.1f;
+                }
+            }
+            return dpi >= 48.0f && dpi <= 960.0f ? dpi / 96.0f : 1.0f;
+        }
+        line = strchr(line, '\n');
+        if (line != NULL)
+            ++line;
+    }
+    return 1.0f;
 }
 
 void WindowRequestClose(Window *window)

@@ -72,3 +72,9 @@ LAIUE_WINDOW_API bool    WindowIsFullscreen(const Window* window);
 // NULL снимает callback.
 LAIUE_WINDOW_API void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback,
                                                void *userData);
+
+// Пикселей окна на точку интерфейса: размеры, заданные в точках (кнопка в
+// 44 точки), умножаются на это число. 1 — обычный экран в 96 точек на дюйм
+// (160 на Android); на плотном экране телефона — около 3. Меняется вместе с
+// экраном: читать каждый кадр.
+LAIUE_WINDOW_API float WindowGetContentScale(const Window *window);

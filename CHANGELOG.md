@@ -18,6 +18,9 @@ API and ABI may change between minor versions.
 - `LaiueWindowServiceV1` gains the optional `setSurfaceCallback` tail and
   `LaiueGraphicsDeviceV2` the `setNativeWindow` tail: the surface Android takes
   away on pause is replaced without recreating the device.
+- `LaiueWindowServiceV1` gains the optional `getContentScale` tail: window
+  pixels per interface point, from the DPI on Windows, `Xft.dpi` on X11 and
+  the screen density on Android. Check `LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE`.
 - `examples/viewer`: a PNG, JPEG and GIF viewer in one C file for Windows, Linux
   and Android.
 - Decoded pictures may be up to 16384 pixels a side; the LTP layer keeps 4096.

@@ -452,6 +452,14 @@ void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback, void *us
     (void)userData;
 }
 
+float WindowGetContentScale(const Window *window)
+{
+    // Процесс без объявленной осведомлённости о DPI получает 96, а окно
+    // целиком растягивает система: тогда пиксель окна и есть точка.
+    const UINT dpi = window != NULL ? GetDpiForWindow(window->handle) : 0u;
+    return dpi != 0u ? (float)dpi / (float)USER_DEFAULT_SCREEN_DPI : 1.0f;
+}
+
 void WindowRequestClose(Window* window)
 {
     PostMessageW(window->handle, WM_CLOSE, 0, 0);

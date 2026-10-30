@@ -490,6 +490,19 @@ bool WindowIsFullscreen(const Window *window)
     return window != NULL && window->fullscreen;
 }
 
+float WindowGetContentScale(const Window *window)
+{
+    // Плотность экрана в точках на дюйм: 160 — пиксель на точку. Glue
+    // обновляет конфигурацию, когда она меняется.
+    const int32_t density = window != NULL && window->app->config != NULL
+                                ? AConfiguration_getDensity(window->app->config)
+                                : 0;
+    if (density <= 0 || density == ACONFIGURATION_DENSITY_ANY ||
+        density == ACONFIGURATION_DENSITY_NONE)
+        return 1.0f;
+    return (float)density / (float)ACONFIGURATION_DENSITY_MEDIUM;
+}
+
 /* ---- Точка входа -------------------------------------------------------------------- */
 
 // Пакет из внутреннего каталога «/data/user/0/<пакет>/files»: им
