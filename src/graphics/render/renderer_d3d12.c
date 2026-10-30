@@ -1,4 +1,6 @@
 #include "render/renderer_internal.h"
+#include "render/pipeline_cache.h"
+#include "platform/system.h"
 #include "render/renderer_offscreen.h"
 
 #define COBJMACROS
@@ -239,6 +241,19 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     RendererHeader header;
     IDXGIFactory4*             factory;
     ID3D12Device*              device;
+    // Библиотека конвейеров из файла кеша; данные файла должны жить, пока
+    // жива библиотека.
+    ID3D12PipelineLibrary*     pipelineLibrary;
+    void*                      pipelineLibraryBlob;
+    RendererPipelineCacheIdentity pipelineCacheIdentity;
+    // Имя последнего созданного PSO по указателю: при записи кеша живые
+    // конвейеры сохраняются под своими именами.
+    struct
+    {
+        ID3D12PipelineState *pipeline;
+        wchar_t name[48];
+    } pipelineNames[16];
+    uint32_t                   pipelineNameNext;
     ID3D12CommandQueue*        commandQueue;
     IDXGISwapChain3*           swapChain;
     ID3D12CommandAllocator*    commandAllocators[FRAME_COUNT];
@@ -1890,6 +1905,210 @@ static bool CreateDepthBuffer(Renderer* renderer, int32_t width, int32_t height)
     return true;
 }
 
+// Меняется вместе с корневыми сигнатурами: описание PSO ссылается на них
+// указателем, и хеш описания их изменения не видит.
+#define RENDERER_D3D12_ROOT_LAYOUT_REVISION 1u
+
+static void ReadPipelineCacheIdentity(Renderer *renderer)
+{
+    RendererPipelineCacheIdentity *identity = &renderer->pipelineCacheIdentity;
+    identity->backend = RENDERER_BACKEND_D3D12;
+    LUID luid;
+    ID3D12Device_GetAdapterLuid(renderer->device, &luid);
+    IDXGIAdapter1 *adapter = NULL;
+    if (FAILED(IDXGIFactory4_EnumAdapterByLuid(renderer->factory, luid, &IID_IDXGIAdapter1,
+                                               (void **)&adapter)))
+        return;
+    DXGI_ADAPTER_DESC1 description;
+    if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &description)))
+    {
+        // LUID меняется при каждой загрузке системы, поэтому в кеш не входит.
+        identity->vendorId = description.VendorId;
+        identity->deviceId = description.DeviceId;
+    }
+    LARGE_INTEGER driverVersion;
+    if (SUCCEEDED(IDXGIAdapter1_CheckInterfaceSupport(adapter, &IID_IDXGIDevice, &driverVersion)))
+        identity->driverVersion = (uint64_t)driverVersion.QuadPart;
+    IDXGIAdapter1_Release(adapter);
+}
+
+// Библиотека конвейеров с диска. Отказ драйвера (другой драйвер, другое
+// устройство) даёт пустую библиотеку; без ID3D12Device1 кеша просто нет.
+static void CreatePipelineLibraryFromCache(Renderer *renderer)
+{
+    RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+    status->structSize = sizeof(*status);
+    if (!RendererPipelineCacheEnabled())
+        return;
+    ID3D12Device1 *device1 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(renderer->device, &IID_ID3D12Device1, (void **)&device1)))
+        return;
+    ReadPipelineCacheIdentity(renderer);
+    uint8_t *payload = NULL;
+    uint64_t size = 0u;
+    (void)RendererPipelineCacheLoad(&renderer->pipelineCacheIdentity, &payload, &size, status);
+    HRESULT result = E_FAIL;
+    if (payload != NULL)
+    {
+        result = ID3D12Device1_CreatePipelineLibrary(device1, payload, (SIZE_T)size,
+                                                     &IID_ID3D12PipelineLibrary,
+                                                     (void **)&renderer->pipelineLibrary);
+        if (SUCCEEDED(result))
+            renderer->pipelineLibraryBlob = payload;
+        else
+        {
+            PlatformFree(payload);
+            renderer->pipelineLibrary = NULL;
+            status->state = RENDERER_PIPELINE_CACHE_REJECTED;
+            status->loadedBytes = 0u;
+        }
+    }
+    if (FAILED(result) &&
+        FAILED(ID3D12Device1_CreatePipelineLibrary(device1, NULL, 0u, &IID_ID3D12PipelineLibrary,
+                                                   (void **)&renderer->pipelineLibrary)))
+        renderer->pipelineLibrary = NULL;
+    ID3D12Device1_Release(device1);
+}
+
+static uint64_t HashPipelineDescription(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *description)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC copy;
+    memcpy(&copy, description, sizeof(copy));
+    copy.pRootSignature = NULL;
+    copy.VS.pShaderBytecode = NULL;
+    copy.PS.pShaderBytecode = NULL;
+    copy.DS.pShaderBytecode = NULL;
+    copy.HS.pShaderBytecode = NULL;
+    copy.GS.pShaderBytecode = NULL;
+    copy.StreamOutput.pSODeclaration = NULL;
+    copy.StreamOutput.pBufferStrides = NULL;
+    copy.InputLayout.pInputElementDescs = NULL;
+    copy.CachedPSO.pCachedBlob = NULL;
+    const uint32_t revision = RENDERER_D3D12_ROOT_LAYOUT_REVISION;
+    uint64_t hash = RendererPipelineCacheHash(RENDERER_PIPELINE_CACHE_HASH_SEED, &revision,
+                                              sizeof(revision));
+    hash = RendererPipelineCacheHash(hash, &copy, sizeof(copy));
+    hash = RendererPipelineCacheHash(hash, description->VS.pShaderBytecode,
+                                     description->VS.BytecodeLength);
+    hash = RendererPipelineCacheHash(hash, description->PS.pShaderBytecode,
+                                     description->PS.BytecodeLength);
+    for (UINT index = 0u; index < description->InputLayout.NumElements; ++index)
+    {
+        D3D12_INPUT_ELEMENT_DESC element = description->InputLayout.pInputElementDescs[index];
+        const char *semantic = element.SemanticName;
+        element.SemanticName = NULL;
+        hash = RendererPipelineCacheHash(hash, &element, sizeof(element));
+        while (semantic != NULL && *semantic != '\0')
+            hash = RendererPipelineCacheHash(hash, semantic++, 1u);
+    }
+    return hash;
+}
+
+// Создаёт PSO, по возможности беря его из библиотеки конвейеров. Имя
+// включает хеш описания и байт-кода, поэтому изменённый шейдер получает
+// новое имя и никогда не загружается под старым.
+static bool CreatePipelineStateCached(Renderer *renderer, const wchar_t *slot,
+                                      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *description,
+                                      ID3D12PipelineState **outPipelineState)
+{
+    *outPipelineState = NULL;
+    wchar_t name[48];
+    uint32_t length = 0u;
+    static const wchar_t prefix[] = L"laiue-";
+    for (uint32_t index = 0u; prefix[index] != L'\0'; ++index)
+        name[length++] = prefix[index];
+    for (uint32_t index = 0u; slot[index] != L'\0' && length < 24u; ++index)
+        name[length++] = slot[index];
+    name[length++] = L'-';
+    const uint64_t hash = HashPipelineDescription(description);
+    static const wchar_t hex[] = L"0123456789abcdef";
+    for (uint32_t digit = 16u; digit != 0u; --digit)
+        name[length++] = hex[(hash >> ((digit - 1u) * 4u)) & 15u];
+    name[length] = L'\0';
+
+    RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+    bool fromCache = false;
+    if (renderer->pipelineLibrary != NULL &&
+        SUCCEEDED(ID3D12PipelineLibrary_LoadGraphicsPipeline(
+            renderer->pipelineLibrary, name, description, &IID_ID3D12PipelineState,
+            (void **)outPipelineState)))
+        fromCache = true;
+    else
+    {
+        *outPipelineState = NULL;
+        if (FAILED(ID3D12Device_CreateGraphicsPipelineState(renderer->device, description,
+                                                            &IID_ID3D12PipelineState,
+                                                            (void **)outPipelineState)))
+        {
+            *outPipelineState = NULL;
+            return false;
+        }
+        if (renderer->pipelineLibrary != NULL)
+            (void)ID3D12PipelineLibrary_StorePipeline(renderer->pipelineLibrary, name,
+                                                      *outPipelineState);
+    }
+    ++status->pipelinesCreated;
+    if (fromCache)
+        ++status->pipelinesFromCache;
+    uint32_t entry = renderer->pipelineNameNext;
+    bool reused = false;
+    for (uint32_t index = 0u; index < 16u && !reused; ++index)
+        if (renderer->pipelineNames[index].pipeline == *outPipelineState)
+        {
+            entry = index;
+            reused = true;
+        }
+    if (!reused)
+        renderer->pipelineNameNext = (renderer->pipelineNameNext + 1u) % 16u;
+    renderer->pipelineNames[entry].pipeline = *outPipelineState;
+    memcpy(renderer->pipelineNames[entry].name, name, sizeof(name));
+    return true;
+}
+
+static const wchar_t *PipelineName(const Renderer *renderer, const ID3D12PipelineState *pipeline)
+{
+    if (pipeline == NULL)
+        return NULL;
+    for (uint32_t index = 0u; index < 16u; ++index)
+        if (renderer->pipelineNames[index].pipeline == pipeline)
+            return renderer->pipelineNames[index].name;
+    return NULL;
+}
+
+// Записывает свежую библиотеку из живых конвейеров: устаревшие варианты
+// (прежние шейдеры, прежний режим заливки) в файл не попадают.
+bool RendererSavePipelineCache_D3D12(Renderer *renderer)
+{
+    if (renderer == NULL || renderer->device == NULL || !RendererPipelineCacheEnabled() ||
+        renderer->pipelineLibrary == NULL)
+        return false;
+    ID3D12Device1 *device1 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(renderer->device, &IID_ID3D12Device1, (void **)&device1)))
+        return false;
+    ID3D12PipelineLibrary *library = NULL;
+    const HRESULT created = ID3D12Device1_CreatePipelineLibrary(
+        device1, NULL, 0u, &IID_ID3D12PipelineLibrary, (void **)&library);
+    ID3D12Device1_Release(device1);
+    if (FAILED(created))
+        return false;
+    ID3D12PipelineState *const live[] = {renderer->pipelineState, renderer->genericPipelineState,
+                                         renderer->resolvePipelineState, renderer->uiPipelineState};
+    for (uint32_t index = 0u; index < sizeof(live) / sizeof(live[0]); ++index)
+    {
+        const wchar_t *name = PipelineName(renderer, live[index]);
+        if (name != NULL)
+            (void)ID3D12PipelineLibrary_StorePipeline(library, name, live[index]);
+    }
+    bool saved = false;
+    const SIZE_T size = ID3D12PipelineLibrary_GetSerializedSize(library);
+    void *data = size != 0u ? PlatformAllocate(size, false) : NULL;
+    if (data != NULL && SUCCEEDED(ID3D12PipelineLibrary_Serialize(library, data, size)))
+        saved = RendererPipelineCacheStore(&renderer->pipelineCacheIdentity, data, size);
+    PlatformFree(data);
+    ID3D12PipelineLibrary_Release(library);
+    return saved;
+}
+
 // Встроенные шейдеры и шейдерпаки — DXIL Shader Model 6.0. Устройство без
 // него отвергается сразу, чтобы рендерер переходил к WARP, а не падал
 // позже на создании первого конвейера.
@@ -1962,6 +2181,9 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
             return NULL;
         }
     }
+
+    // Кеш конвейеров нужен до первого PSO; без него рендерер тоже работает.
+    CreatePipelineLibraryFromCache(renderer);
 
     D3D12_COMMAND_QUEUE_DESC queueDescription = { .Type = D3D12_COMMAND_LIST_TYPE_DIRECT };
     if (FAILED(ID3D12Device_CreateCommandQueue(renderer->device, &queueDescription,
@@ -2325,6 +2547,13 @@ void RendererDestroy_D3D12(Renderer* renderer)
         WaitForGpu(renderer);
     }
 
+    // Пока конвейеры живы, новые из них сохраняются в кеш.
+    {
+        const RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
+        if (renderer->pipelineLibrary != NULL && status->pipelinesCreated > status->pipelinesFromCache)
+            (void)RendererSavePipelineCache_D3D12(renderer);
+    }
+
     if (renderer->fence != NULL)
     {
         DrainDeferredReleases(renderer, true);
@@ -2406,6 +2635,8 @@ void RendererDestroy_D3D12(Renderer* renderer)
     if (renderer->fence != NULL) ID3D12Fence_Release(renderer->fence);
     if (renderer->swapChain != NULL) IDXGISwapChain3_Release(renderer->swapChain);
     if (renderer->commandQueue != NULL) ID3D12CommandQueue_Release(renderer->commandQueue);
+    if (renderer->pipelineLibrary != NULL) ID3D12PipelineLibrary_Release(renderer->pipelineLibrary);
+    PlatformFree(renderer->pipelineLibraryBlob);
     if (renderer->device != NULL) ID3D12Device_Release(renderer->device);
     if (renderer->factory != NULL) IDXGIFactory4_Release(renderer->factory);
 
@@ -4239,9 +4470,7 @@ static bool CreateChunkPipelineStateForShaders(Renderer *renderer,
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    *outPipelineState = NULL;
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
-        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+    return CreatePipelineStateCached(renderer, L"chunk", &description, outPipelineState);
 }
 
 static bool CreateGenericPipelineState(Renderer *renderer,
@@ -4272,10 +4501,7 @@ static bool CreateGenericPipelineState(Renderer *renderer,
     description.NumRenderTargets = 1;
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
-    *outPipelineState = NULL;
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
-        renderer->device, &description, &IID_ID3D12PipelineState,
-        (void **)outPipelineState));
+    return CreatePipelineStateCached(renderer, L"generic", &description, outPipelineState);
 }
 
 static bool RecreateChunkPipelineState(Renderer *renderer)
@@ -4335,9 +4561,7 @@ static bool CreateResolvePipelineStateForShaders(Renderer *renderer,
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    *outPipelineState = NULL;
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
-        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+    return CreatePipelineStateCached(renderer, L"resolve", &description, outPipelineState);
 }
 
 static bool CreateUiPipelineStateForShaders(Renderer *renderer,
@@ -4378,9 +4602,7 @@ static bool CreateUiPipelineStateForShaders(Renderer *renderer,
     description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     description.SampleDesc.Count = 1;
 
-    *outPipelineState = NULL;
-    return SUCCEEDED(ID3D12Device_CreateGraphicsPipelineState(
-        renderer->device, &description, &IID_ID3D12PipelineState, (void **)outPipelineState));
+    return CreatePipelineStateCached(renderer, L"ui", &description, outPipelineState);
 }
 
 bool RendererReloadTexturePackFrom_D3D12(Renderer *renderer, LaiueContentCatalog *catalog)

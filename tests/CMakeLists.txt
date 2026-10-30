@@ -399,6 +399,13 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     laiue_add_vulkan_validation(laiue.render.offscreen_frame
         laiue.render.vulkan_instance_ring laiue.render.vulkan_lifecycle)
 endif()
+# Pipeline cache on every backend this build has; 125 means no GPU driver.
+if(TARGET laiue_render)
+    laiue_add_harness(laiue_pipeline_cache_test PipelineCacheTestEntryPoint
+        pipeline_cache_test.c LIBRARIES laiue_render laiue_content $<$<BOOL:${WIN32}>:user32>
+        TEST laiue.render.pipeline_cache TIMEOUT 120)
+    laiue_set_gpu_test_properties(OFF laiue.render.pipeline_cache)
+endif()
 if(TARGET laiue_render AND LAIUE_RENDER_HAS_D3D12)
     if(LAIUE_RENDER_HAS_VULKAN_TARGET)
         # Both backends alternate frames in one process.
