@@ -14,6 +14,9 @@ API and ABI may change between minor versions.
 - On Android `LAIUE_X86_64_LEVEL` defaults to `sse2`, the ABI baseline with
   SSE4.2 and POPCNT. x86_64 APKs were built for AVX2 and would stop with
   `SIGILL` on devices without it.
+- The APK's activity takes every configuration change itself, the resource
+  overlay Android applies right after installation included. Android used to
+  restart it then, and `main` was stopped and run again in the same process.
 - On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
   bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
   shared modules: a program needs only the NDK toolchain file.
