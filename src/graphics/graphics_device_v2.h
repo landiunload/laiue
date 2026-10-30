@@ -157,6 +157,11 @@ typedef uint32_t (*LaiueGraphicsV2SubmitInstancesFn)(LaiueGraphicsDeviceV2 *,
                                                      const LaiueGraphicsDrawItemV2 *,
                                                      const LaiueGraphicsInstanceV2 *,
                                                      uint32_t instanceCount);
+/* The colour every frame is cleared to before the scene: the sky behind all
+ * geometry. Linear RGB, each channel in [0, 1]. It takes effect from the next
+ * beginFrame and stays until changed. A value outside the range or not finite
+ * returns zero and keeps the previous colour. */
+typedef uint32_t (*LaiueGraphicsV2SetClearColorFn)(LaiueGraphicsDeviceV2 *, const float rgb[3]);
 
 struct LaiueGraphicsDeviceV2
 {
@@ -187,6 +192,7 @@ struct LaiueGraphicsDeviceV2
     LaiueGraphicsV2RequestFrameReadbackFn requestFrameReadback;
     LaiueGraphicsV2GetCapabilitiesFn getCapabilities;
     LaiueGraphicsV2SubmitInstancesFn submitInstances;
+    LaiueGraphicsV2SetClearColorFn setClearColor;
 };
 
 #define LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE                                                  \
@@ -206,6 +212,9 @@ struct LaiueGraphicsDeviceV2
 #define LAIUE_GRAPHICS_DEVICE_V2_INSTANCES_SIZE                                                    \
     ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, submitInstances) +                                 \
                 sizeof(LaiueGraphicsV2SubmitInstancesFn)))
+#define LAIUE_GRAPHICS_DEVICE_V2_CLEAR_COLOR_SIZE                                                  \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, setClearColor) +                                   \
+                sizeof(LaiueGraphicsV2SetClearColorFn)))
 
 typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(void *nativeWindow, int32_t width, int32_t height,
                                                   uint32_t backend,
