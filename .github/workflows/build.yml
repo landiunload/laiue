@@ -680,27 +680,64 @@ jobs:
             -OutputDir build/android-runtime-results/captures `
             -TimeoutSeconds 240
       - name: Verify a program on modules by name draws on Android
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           adb="$ANDROID_HOME/platform-tools/adb"
           log=build/android-runtime-results/viewer.log
+          viewer=dev.laiue.viewer/android.app.NativeActivity
+          fail() {
+            echo "$1"
+            cat "$log"
+            timeout 10s "$adb" -s emulator-5554 logcat -d -b crash || true
+            exit 1
+          }
+          # Ждёт, пока строк с текстом $1 в журнале viewer станет не меньше $2.
+          expect_lines() {
+            until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
+                && [ "$(grep -Fc "$1" "$log")" -ge "$2" ]; do
+              if grep -Fq 'main returned' "$log"; then
+                fail "a run of the viewer failed"
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                fail "expected $2 lines with: $1"
+              fi
+              sleep 0.5
+            done
+          }
+          viewer_process() {
+            timeout 10s "$adb" -s emulator-5554 shell pidof dev.laiue.viewer | tr -d '\r'
+          }
           timeout 60s "$adb" -s emulator-5554 install -r \
             build/android-x86_64-shared/android/laiue_viewer_apk.apk
           timeout 10s "$adb" -s emulator-5554 logcat -c
+          deadline=$((SECONDS + 200))
           # --smoke читает кадр с GPU и сравнивает центр с углом: картинка
           # должна быть на экране, а не только в памяти.
-          timeout 30s "$adb" -s emulator-5554 shell am start -W \
-            -n dev.laiue.viewer/android.app.NativeActivity --es args --smoke
-          deadline=$((SECONDS + 90))
-          until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
-              && grep -Fq 'viewer: the picture is on screen' "$log"; do
-            if [ "$SECONDS" -ge "$deadline" ] || grep -Fq 'main returned' "$log"; then
-              cat "$log"
-              exit 1
-            fi
-            sleep 2
-          done
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" --es args --smoke \
+            || fail "the viewer did not start"
+          expect_lines 'viewer: the picture is on screen' 1
+          expect_lines 'its activity is closing' 1
+          process="$(viewer_process)" || fail "the viewer process is gone"
+          # Android оставляет процесс, и следующие запуски идут в нём же.
+          # --activity-clear-task закрывает работающий viewer, но замену
+          # создаёт раньше, чем уничтожит его: второй main должен дождаться
+          # конца первого. Запуск сразу за выходом проверяет, что после этого
+          # процесс по-прежнему открывает программу и рисует.
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
+            || fail "the viewer did not start without arguments"
+          timeout 30s "$adb" -s emulator-5554 shell am start --activity-clear-task \
+            -n "$viewer" --es args --smoke || fail "the viewer did not start over itself"
+          expect_lines 'waiting for the previous run of the program to end' 1
+          expect_lines 'viewer: the picture is on screen' 2
+          expect_lines 'its activity is closing' 2
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" --es args --smoke \
+            || fail "the viewer did not start again"
+          expect_lines 'viewer: the picture is on screen' 3
           cat "$log"
+          now="$(viewer_process)" || fail "the viewer process is gone"
+          if [ "$process" != "$now" ]; then
+            fail "the runs did not share process $process (now $now)"
+          fi
       - name: Stop the owned emulator process group
         if: always()
         timeout-minutes: 1
