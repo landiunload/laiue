@@ -143,12 +143,16 @@ static void RunFrame(Window* window)
 static DWORD WINAPI FrameClockMain(void* parameter)
 {
     Window* window = (Window*)parameter;
+    // Миллисекундной паузе нужен таймер высокого разрешения: обычное
+    // ожидание округляется до системного тика, часто 15,6 мс.
+    HANDLE pause = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
     for (;;)
     {
         WaitForSingleObject(window->frameClockWake, INFINITE);
         if (InterlockedCompareExchange(&window->frameClockStop, 0, 0) != 0)
         {
-            return 0;
+            break;
         }
         if (InterlockedExchange(&window->frameTickPending, 1) == 0
             && !SendNotifyMessageW(window->frameClockTarget, WINDOW_FRAME_MESSAGE, 0, 0))
@@ -158,7 +162,21 @@ static DWORD WINAPI FrameClockMain(void* parameter)
         // Следующее сообщение — когда кадр закончится; если кадр не начался,
         // повтор через период обновления обычного экрана.
         WaitForSingleObject(window->frameDone, 16);
+        // Присланные сообщения Windows отдаёт потоку окна раньше ввода: без
+        // паузы следующий кадр всегда опережал бы мышь, и цикл кнопки
+        // заголовка не получал бы её, пока мышь движется.
+        const LARGE_INTEGER pauseTime = { .QuadPart = -10000 };   // 1 мс
+        if (pause == NULL || !SetWaitableTimer(pause, &pauseTime, 0, NULL, NULL, FALSE)
+            || WaitForSingleObject(pause, INFINITE) != WAIT_OBJECT_0)
+        {
+            Sleep(1);
+        }
     }
+    if (pause != NULL)
+    {
+        CloseHandle(pause);
+    }
+    return 0;
 }
 
 static bool StartFrameClock(Window* window, HWND handle)
@@ -423,14 +441,11 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
 
         case WINDOW_FRAME_MESSAGE:
             // Кадр от часов кадров. Опоздавшее после конца цикла сообщение
-            // кадра не запускает: кадры снова ведёт WindowRunLoop. Мышь в
-            // очереди важнее кадра: её ждёт цикл заголовка, чтобы начать
-            // перемещение или отпустить кнопку, а часы повторят позже.
+            // кадра не запускает: кадры снова ведёт WindowRunLoop.
             if (window != NULL)
             {
                 InterlockedExchange(&window->frameTickPending, 0);
-                if (window->modalDepth != 0u && !window->frameRunning
-                    && HIWORD(GetQueueStatus(QS_MOUSE)) == 0)
+                if (window->modalDepth != 0u && !window->frameRunning)
                 {
                     RunFrame(window);
                     SetEvent(window->frameDone);

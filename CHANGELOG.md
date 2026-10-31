@@ -14,8 +14,10 @@ API and ABI may change between minor versions.
   - A held caption button and a press on the caption before the first mouse
     move use a small frame clock thread instead. No timer gets through
     there: those waits take only mouse messages, or none. The thread wakes
-    the window procedure for each frame with `SendNotifyMessage`, and a
-    frame waits while mouse input is queued.
+    the window procedure for each frame with `SendNotifyMessage`. After
+    each frame it pauses for a millisecond: Windows hands the window
+    thread sent messages before input, and without the pause the loop
+    would not get the mouse while it moves.
   - Input is reset when the system takes the mouse, as on focus loss. Raw
     input reaches the program again only when the system gives the mouse
     back, so a press on the caption no longer becomes a click in the
