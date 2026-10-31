@@ -282,6 +282,19 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             {
                 return DefWindowProcW(handle, message, wParam, lParam);
             }
+            if (wParam == HTCAPTION)
+            {
+                // Нажатие на заголовок DefWindowProc отличает от
+                // перетаскивания: до первого движения мыши она около
+                // полсекунды ждёт и не разбирает сообщений, даже таймер.
+                // Движение в ту же точку сразу начинает перемещение, не
+                // сдвигая окна.
+                POINT cursor;
+                if (GetCursorPos(&cursor) && ScreenToClient(handle, &cursor))
+                {
+                    PostMessageW(handle, WM_MOUSEMOVE, 0, MAKELPARAM(cursor.x, cursor.y));
+                }
+            }
             EnterModalLoop(window, handle);
             const LRESULT result = DefWindowProcW(handle, message, wParam, lParam);
             LeaveModalLoop(window, handle);
