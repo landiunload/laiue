@@ -134,6 +134,23 @@ endif()
 laiue_add_harness(laiue_navigation_test NavigationTestEntryPoint navigation_test.c
     LIBRARIES laiue::navigation laiue::task laiue::platform_support
     TEST laiue.navigation.paths TIMEOUT 120)
+# Allocation faults are injected only into copies of the production bodies.
+set(laiue_navigation_failure_sources)
+foreach(source nav_graph nav_grid nav_query)
+    configure_file("${laiue_src}/simulation/navigation/${source}.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/navigation_failure_${source}.c" COPYONLY)
+    list(APPEND laiue_navigation_failure_sources
+        "${CMAKE_CURRENT_BINARY_DIR}/navigation_failure_${source}.c")
+endforeach()
+add_library(laiue_navigation_failure_subject OBJECT ${laiue_navigation_failure_sources})
+target_link_libraries(laiue_navigation_failure_subject PRIVATE laiue_common)
+target_compile_definitions(laiue_navigation_failure_subject PRIVATE
+    LAIUE_STATIC=1
+    PlatformAllocate=NavigationTestAllocate PlatformReallocate=NavigationTestReallocate
+    PlatformFree=NavigationTestFree)
+laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
+    navigation_failure_test.c $<TARGET_OBJECTS:laiue_navigation_failure_subject>
+    STATIC TEST laiue.navigation.allocation_failure TIMEOUT 60)
 
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c

@@ -259,6 +259,7 @@ LAIUE_NAVIGATION_API void LaiueNavGridDestroy(LaiueNavGrid *grid);
 LAIUE_NAVIGATION_API LaiueNavStatus LaiueNavGridSetCell(LaiueNavGrid *grid, int64_t x, int64_t y,
                                                         uint8_t cost);
 LAIUE_NAVIGATION_API uint8_t LaiueNavGridGetCell(const LaiueNavGrid *grid, int64_t x, int64_t y);
+/* При LAIUE_NAV_OUT_OF_MEMORY сетка и её ревизия остаются прежними. */
 LAIUE_NAVIGATION_API LaiueNavStatus LaiueNavGridFillRect(LaiueNavGrid *grid,
                                                          const LaiueNavRect *rect, uint8_t cost);
 LAIUE_NAVIGATION_API uint64_t LaiueNavGridRevision(const LaiueNavGrid *grid);
