@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Windows `PlatformAtomicLoadI64` reads with an ordinary load instead of a
+  locked compare-exchange, and on ARM64 the 32-bit acquire load and release
+  store use `LDAR` and `STLR` instead of locked instructions. Threads that
+  read a shared counter no longer take its cache line from each other and
+  from the thread that writes it.
 - Vulkan without vertical sync showed no more frames than the screen
   refreshes. On NVIDIA it also kept a CPU core busy waiting for a free
   swapchain image. Now it presents in `FIFO_LATEST_READY` mode where the
