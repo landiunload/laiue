@@ -198,37 +198,41 @@ LaiueNavStatus LaiueNavGridFillRect(LaiueNavGrid *grid, const LaiueNavRect *rect
         return LAIUE_NAV_INVALID_ARGUMENT;
     const int64_t endX = rect->x + (int64_t)rect->width;
     const int64_t endY = rect->y + (int64_t)rect->height;
-    for (int64_t chunkY = FloorChunk(rect->y); chunkY <= FloorChunk(endY - 1); ++chunkY)
-        for (int64_t chunkX = FloorChunk(rect->x); chunkX <= FloorChunk(endX - 1); ++chunkX)
-        {
-            const int64_t originX = chunkX * (int64_t)CHUNK_SIDE;
-            const int64_t originY = chunkY * (int64_t)CHUNK_SIDE;
-            const int64_t fromX = rect->x > originX ? rect->x : originX;
-            const int64_t fromY = rect->y > originY ? rect->y : originY;
-            const int64_t toX =
-                endX < originX + (int64_t)CHUNK_SIDE ? endX : originX + (int64_t)CHUNK_SIDE;
-            const int64_t toY =
-                endY < originY + (int64_t)CHUNK_SIDE ? endY : originY + (int64_t)CHUNK_SIDE;
-            const bool whole = fromX == originX && fromY == originY &&
-                               toX == originX + (int64_t)CHUNK_SIDE &&
-                               toY == originY + (int64_t)CHUNK_SIDE;
-            if (whole && cost == grid->defaultCost && FindChunk(grid, chunkX, chunkY) == NULL)
-                continue;
-            GridChunk *chunk = ObtainChunk(grid, chunkX, chunkY);
-            if (chunk == NULL)
-                return LAIUE_NAV_OUT_OF_MEMORY;
-            if (whole)
+    /* Первый проход только выделяет чанки и клетки, второй пишет: при
+     * нехватке памяти сетка остаётся прежней, а не залитой наполовину. */
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+        for (int64_t chunkY = FloorChunk(rect->y); chunkY <= FloorChunk(endY - 1); ++chunkY)
+            for (int64_t chunkX = FloorChunk(rect->x); chunkX <= FloorChunk(endX - 1); ++chunkX)
             {
-                PlatformFree(chunk->cells);
-                chunk->cells = NULL;
-                chunk->uniform = cost;
-                continue;
+                const int64_t originX = chunkX * (int64_t)CHUNK_SIDE;
+                const int64_t originY = chunkY * (int64_t)CHUNK_SIDE;
+                const int64_t fromX = rect->x > originX ? rect->x : originX;
+                const int64_t fromY = rect->y > originY ? rect->y : originY;
+                const int64_t toX =
+                    endX < originX + (int64_t)CHUNK_SIDE ? endX : originX + (int64_t)CHUNK_SIDE;
+                const int64_t toY =
+                    endY < originY + (int64_t)CHUNK_SIDE ? endY : originY + (int64_t)CHUNK_SIDE;
+                const bool whole = fromX == originX && fromY == originY &&
+                                   toX == originX + (int64_t)CHUNK_SIDE &&
+                                   toY == originY + (int64_t)CHUNK_SIDE;
+                if (whole && cost == grid->defaultCost && FindChunk(grid, chunkX, chunkY) == NULL)
+                    continue;
+                /* Во втором проходе чанк уже есть, а клетки уже выделены. */
+                GridChunk *chunk = ObtainChunk(grid, chunkX, chunkY);
+                if (chunk == NULL || (!whole && !Materialize(chunk)))
+                    return LAIUE_NAV_OUT_OF_MEMORY;
+                if (pass == 0u)
+                    continue;
+                if (whole)
+                {
+                    PlatformFree(chunk->cells);
+                    chunk->cells = NULL;
+                    chunk->uniform = cost;
+                    continue;
+                }
+                for (int64_t y = fromY; y < toY; ++y)
+                    memset(chunk->cells + LocalIndex(fromX, y), cost, (size_t)(toX - fromX));
             }
-            if (!Materialize(chunk))
-                return LAIUE_NAV_OUT_OF_MEMORY;
-            for (int64_t y = fromY; y < toY; ++y)
-                memset(chunk->cells + LocalIndex(fromX, y), cost, (size_t)(toX - fromX));
-        }
     ++grid->revision;
     return LAIUE_NAV_OK;
 }
