@@ -136,14 +136,21 @@ function Save-Capture {
     if ($Name -notmatch '^[a-zA-Z0-9_-]+$' -or $NativeWidth -le 0 -or $NativeHeight -le 0) {
         throw 'Invalid screenshot checkpoint metadata.'
     }
-    # Only this run's GUID-scoped device file is created and removed.
-    $remote = "/sdcard/laiue-walk-$remoteRun-$Name.png"
+    # Only this run's GUID-scoped device file is created and removed. It lives
+    # in the shell's /data/local/tmp: on /sdcard the FUSE layer of the media
+    # provider failed to unlink a capture that adb had just pulled.
+    $remote = "/data/local/tmp/laiue-walk-$remoteRun-$Name.png"
     $local = Join-Path $OutputDir "$Name.png"
     try {
         Invoke-Adb -Arguments @('shell', 'screencap', '-p', $remote) -CommandTimeoutSeconds 7 | Out-Null
         Invoke-Adb -Arguments @('pull', $remote, $local) -CommandTimeoutSeconds 7 | Out-Null
     } finally {
-        Invoke-Adb -Arguments @('shell', 'rm', '-f', $remote) -CommandTimeoutSeconds 3 | Out-Null
+        # A failed cleanup must not replace the error of the capture itself.
+        try {
+            Invoke-Adb -Arguments @('shell', 'rm', '-f', $remote) -CommandTimeoutSeconds 3 | Out-Null
+        } catch {
+            Write-Warning "Could not remove $remote from the device: $_"
+        }
     }
     # The engine PNG decoder is the sole parser; it inspects a viewport without UI.
     $imageText = Invoke-BoundedProcess -Executable $FrameCheckExe -Arguments @($local) `
