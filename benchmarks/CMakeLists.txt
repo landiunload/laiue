@@ -113,3 +113,9 @@ if(TARGET laiue_render)
         endif()
     endif()
 endif()
+
+# Every benchmark of this configuration behind one target, so CI compiles all
+# of them and none falls behind the engine.
+get_property(laiue_benchmark_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+add_custom_target(laiue_benchmarks)
+add_dependencies(laiue_benchmarks ${laiue_benchmark_targets})

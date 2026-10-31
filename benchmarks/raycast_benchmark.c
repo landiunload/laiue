@@ -16,6 +16,7 @@
 #include "scene/camera.h"
 #include "scene/math.h"
 #include "voxel/raycast.h"
+#include "world/numeric_provider.h"
 #include "world/world.h"
 
 // Харнесс без CRT общий с тестами: Windows собирает движок с
@@ -237,14 +238,11 @@ static uint8_t TerrainSolidBelowZero(void *context, int64_t x, int64_t y, int64_
     return y < 0 ? 1u : 0u;
 }
 
-static bool RunRayBenchmarks(void)
+static bool RunRayScenarios(World *empty, World *edited, World *terrain)
 {
     const float diagonal[3] = { 0.57735027f, 0.57735027f, 0.57735027f };
     const float positiveZ[3] = { 0.0f, 0.0f, 1.0f };
     const float positiveX[3] = { 1.0f, 0.0f, 0.0f };
-
-    World *empty = WorldCreate(NULL);
-    if (empty == NULL) return false;
 
     RayScenario scenario;
     scenario.world = empty;
@@ -265,8 +263,6 @@ static bool RunRayBenchmarks(void)
 
     // Мир с одной правкой в стороне: WorldGetBlock больше не может идти
     // быстрым путём и на каждом вокселе ищет запись в таблице под lock.
-    World *edited = WorldCreate(NULL);
-    if (edited == NULL) return false;
     if (!WorldTrySetBlock(edited, 1000, 0, 0, (BlockType)9U)) return false;
     scenario.world = edited;
     scenario.direction = positiveZ;
@@ -286,25 +282,31 @@ static bool RunRayBenchmarks(void)
     if (!RunRayScenario(&scenario)) return false;
 
     // Базовый слой: правок нет, но каждый воксель зовёт provider->getBlock.
-    WorldBaseProvider provider;
-    provider.context = NULL;
-    provider.getBlock = TerrainSolidBelowZero;
-    provider.fillRegion = NULL;
-    provider.rebase = NULL;
-    World *terrain = WorldCreate(&provider);
-    if (terrain == NULL) return false;
     scenario.world = terrain;
     scenario.name = "raycast.provider";
     scenario.direction = positiveX;
     scenario.originX = 0.5; scenario.originY = 50.5; scenario.originZ = 0.5;
     scenario.expectHit = false;
     scenario.operations = 1024u;
-    if (!RunRayScenario(&scenario)) return false;
+    return RunRayScenario(&scenario);
+}
 
+static bool RunRayBenchmarks(void)
+{
+    WorldBaseProvider provider;
+    provider.context = NULL;
+    provider.getBlock = TerrainSolidBelowZero;
+    provider.fillRegion = NULL;
+    provider.rebase = NULL;
+    World *empty = WorldCreate(NULL);
+    World *edited = WorldCreate(NULL);
+    World *terrain = WorldCreate(&provider);
+    const bool ran = empty != NULL && edited != NULL && terrain != NULL &&
+                     RunRayScenarios(empty, edited, terrain);
     WorldDestroy(terrain);
     WorldDestroy(edited);
     WorldDestroy(empty);
-    return true;
+    return ran;
 }
 
 // === Преобразования камеры ===
@@ -379,6 +381,10 @@ LAIUE_TEST_ENTRY(RaycastBenchmarkEntryPoint)
     WriteUnsigned(CAMERA_ACTIONS);
     WriteText("\n");
 
+    // Мир с бесконечными координатами не принимает правки без числового
+    // сервиса, и сценарии с правками не могли бы начаться. Тесты лучей
+    // ставят сервис так же.
+    WorldSetNumericService(LaiueNumericGetStaticServiceV1());
     if (!RunRayBenchmarks())
     {
         WriteText("raycast benchmark could not run\n");
