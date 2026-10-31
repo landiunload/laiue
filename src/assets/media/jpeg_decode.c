@@ -9,11 +9,12 @@
 #define JPEG_FAST_BITS 9u
 #define JPEG_FAST_SIZE (1u << JPEG_FAST_BITS)
 
-// Порядок обхода коэффициентов внутри блока. Коэффициенты хранятся
-// именно в нём, а не в естественном порядке: прогрессивный режим задаёт
-// спектральный диапазон номерами зигзага, и переводить их туда-сюда на
-// каждом блоке незачем. Естественный порядок нужен один раз, в обратном
-// ДКП.
+// Порядок обхода коэффициентов внутри блока: ZIGZAG[k] — естественное
+// место k-го коэффициента. Прогрессивные проходы хранят коэффициенты
+// зигзагом, потому что спектральный диапазон задан его номерами, и
+// переставляют блок один раз, перед обратным ДКП. Последовательный проход
+// сразу кладёт коэффициент на его место, а таблицы квантования хранятся
+// в естественном порядке, как их читает обратное ДКП.
 static const uint8_t ZIGZAG[64] = {
     0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
     12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
@@ -21,28 +22,27 @@ static const uint8_t ZIGZAG[64] = {
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 };
 
-// IDCT_BASIS[u][x] = C(u)/2 * cos((2x+1) u pi / 16), C(0) = 1/sqrt(2).
-// Обратное ДКП здесь разделимое и прямое: два прохода по восемь
-// умножений вместо быстрой бабочки. Текстура распаковывается один раз
-// при загрузке, и понятность формулы важнее пары миллисекунд.
-static const float IDCT_BASIS[8][8] = {
-    {0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f,
-     0.353553391f, 0.353553391f},
-    {0.490392640f, 0.415734806f, 0.277785117f, 0.097545161f, -0.097545161f, -0.277785117f,
-     -0.415734806f, -0.490392640f},
-    {0.461939766f, 0.191341716f, -0.191341716f, -0.461939766f, -0.461939766f, -0.191341716f,
-     0.191341716f, 0.461939766f},
-    {0.415734806f, -0.097545161f, -0.490392640f, -0.277785117f, 0.277785117f, 0.490392640f,
-     0.097545161f, -0.415734806f},
-    {0.353553391f, -0.353553391f, -0.353553391f, 0.353553391f, 0.353553391f, -0.353553391f,
-     -0.353553391f, 0.353553391f},
-    {0.277785117f, -0.490392640f, 0.097545161f, 0.415734806f, -0.415734806f, -0.097545161f,
-     0.490392640f, -0.277785117f},
-    {0.191341716f, -0.461939766f, 0.461939766f, -0.191341716f, -0.191341716f, 0.461939766f,
-     -0.461939766f, 0.191341716f},
-    {0.097545161f, -0.277785117f, 0.415734806f, -0.490392640f, 0.490392640f, -0.415734806f,
-     0.277785117f, -0.097545161f},
-};
+// Обратное ДКП — целочисленное islow из IJG libjpeg: бабочка Лёффлера,
+// Лигтенберга и Мошица, константы в 13 битах, после первого прохода два
+// бита запаса. Вместе с фильтром цветности и переводом цвета ниже оно
+// даёт те же байты, что libjpeg-turbo с настройками по умолчанию, на
+// любом процессоре: в целых числах нечему расходиться. Промежуточные
+// значения 64-битные: произведение коэффициента на 16-битный
+// квантователь занимает до 31 бита, и испорченный файл не переполнит их.
+#define IDCT_CONST_BITS 13
+#define IDCT_PASS1_BITS 2
+#define IDCT_FIX_0_298631336 2446
+#define IDCT_FIX_0_390180644 3196
+#define IDCT_FIX_0_541196100 4433
+#define IDCT_FIX_0_765366865 6270
+#define IDCT_FIX_0_899976223 7373
+#define IDCT_FIX_1_175875602 9633
+#define IDCT_FIX_1_501321110 12299
+#define IDCT_FIX_1_847759065 15137
+#define IDCT_FIX_1_961570560 16069
+#define IDCT_FIX_2_053119869 16819
+#define IDCT_FIX_2_562915447 20995
+#define IDCT_FIX_3_072711026 25172
 
 typedef struct JpegHuffman
 {
@@ -109,6 +109,7 @@ typedef struct JpegLayout
     uint32_t quant;
     uint32_t samples[JPEG_MAX_COMPONENTS];
     uint32_t coefficients[JPEG_MAX_COMPONENTS];
+    uint32_t rows;
     uint32_t total;
 } JpegLayout;
 
@@ -117,7 +118,7 @@ typedef struct JpegReader
     const uint8_t *bytes;
     uint32_t sizeBytes;
     uint32_t position;
-    uint32_t bitBuffer;
+    uint64_t bitBuffer;
     uint32_t bitCount;
     // Встретился маркер: энтропийные данные кончились, и дальше
     // выдаются нули. Так повреждённый файл не уходит за конец буфера.
@@ -183,14 +184,18 @@ static bool NextDataByte(JpegReader *reader, uint32_t *outByte)
     return true;
 }
 
-// Дозаправка буфера до count бит. Маркер не проглатывается: на нём
-// набор останавливается, и разбор получает нули, как и прежде.
+// Дозаправка: если в буфере меньше count бит, байты добавляются, пока
+// их не станет больше 56, — так буфер пополняется раз в несколько
+// символов, а не на каждом. Маркер не проглатывается: на нём и за концом
+// данных буфер добирается нулями, поэтому разбор испорченного или
+// обрезанного файла доходит до конца прохода, не выходя за его данные.
 static void EnsureBits(JpegReader *reader, uint32_t count)
 {
-    while (reader->bitCount < count)
+    if (reader->bitCount >= count) return;
+    while (reader->bitCount <= 56u)
     {
         uint32_t byte = 0u;
-        if (!NextDataByte(reader, &byte)) return;
+        (void)NextDataByte(reader, &byte);
         reader->bitBuffer = (reader->bitBuffer << 8) | byte;
         reader->bitCount += 8u;
     }
@@ -199,29 +204,17 @@ static void EnsureBits(JpegReader *reader, uint32_t count)
 static uint32_t ReadBit(JpegReader *reader)
 {
     EnsureBits(reader, 1u);
-    if (reader->bitCount == 0u) return 0u;
     reader->bitCount -= 1u;
-    return (reader->bitBuffer >> reader->bitCount) & 1u;
+    return (uint32_t)(reader->bitBuffer >> reader->bitCount) & 1u;
 }
 
+// count — не больше 16: длиннее значений в JPEG нет.
 static uint32_t ReadBits(JpegReader *reader, uint32_t count)
 {
     if (count == 0u) return 0u;
-    // Чтение сразу нужного числа бит вместо вызова ReadBit на каждый:
-    // байты при этом расходуются ровно так же, как в побитовом цикле,
-    // а после маркера недостающие биты так же считаются нулями.
     EnsureBits(reader, count);
-    if (reader->bitCount >= count)
-    {
-        reader->bitCount -= count;
-        return (reader->bitBuffer >> reader->bitCount) & ((1u << count) - 1u);
-    }
-    uint32_t available = reader->bitCount;
-    uint32_t value = available != 0u
-                         ? (reader->bitBuffer & ((1u << available) - 1u)) << (count - available)
-                         : 0u;
-    reader->bitCount = 0u;
-    return value;
+    reader->bitCount -= count;
+    return (uint32_t)(reader->bitBuffer >> reader->bitCount) & ((1u << count) - 1u);
 }
 
 static int32_t DecodeHuffman(JpegReader *reader, const JpegHuffman *table)
@@ -232,17 +225,14 @@ static int32_t DecodeHuffman(JpegReader *reader, const JpegHuffman *table)
     // кодов. Более длинные разбираются каноническим циклом, который
     // читает те же биты с начала: результат тождественен.
     EnsureBits(reader, JPEG_FAST_BITS);
-    if (reader->bitCount >= JPEG_FAST_BITS)
+    uint32_t lookup = (uint32_t)(reader->bitBuffer >> (reader->bitCount - JPEG_FAST_BITS)) &
+                      (JPEG_FAST_SIZE - 1u);
+    uint16_t entry = table->fast[lookup];
+    uint32_t fastLength = (uint32_t)entry >> 8;
+    if (fastLength != 0u)
     {
-        uint32_t index =
-            (reader->bitBuffer >> (reader->bitCount - JPEG_FAST_BITS)) & (JPEG_FAST_SIZE - 1u);
-        uint16_t entry = table->fast[index];
-        uint32_t length = (uint32_t)entry >> 8;
-        if (length != 0u)
-        {
-            reader->bitCount -= length;
-            return (int32_t)(entry & 0xFFu);
-        }
+        reader->bitCount -= fastLength;
+        return (int32_t)(entry & 0xFFu);
     }
 
     int32_t code = (int32_t)ReadBit(reader);
@@ -322,36 +312,118 @@ static ImageStatus BuildHuffman(JpegHuffman *table, const uint8_t *counts, const
     return IMAGE_OK;
 }
 
-// Обратное ДКП блока: коэффициенты лежат в порядке зигзага и уже
-// умножены на таблицу квантования.
-static void InverseTransform(const float *coefficients, uint8_t *destination, uint32_t stride)
+// Сдвиг вправо с округлением к ближайшему. У отрицательного сдвиг
+// арифметический, как и в переводе цвета.
+static int64_t IdctDescale(int64_t value, uint32_t bits)
 {
-    float natural[64];
-    for (uint32_t index = 0; index < 64u; ++index) natural[index] = 0.0f;
-    for (uint32_t index = 0; index < 64u; ++index) natural[ZIGZAG[index]] = coefficients[index];
+    return (value + ((int64_t)1 << (bits - 1u))) >> bits;
+}
 
-    float rows[64];
-    for (uint32_t v = 0; v < 8u; ++v)
+// Отсчёт после обратного ДКП: возврат уровня 128 и насыщение.
+static uint8_t IdctSample(int64_t value)
+{
+    value += 128;
+    if (value < 0) return 0u;
+    if (value > 255) return 255u;
+    return (uint8_t)value;
+}
+
+// Одномерное islow над восемью входами. Выходы — в масштабе
+// 2^IDCT_CONST_BITS: финальный сдвиг у каждого прохода свой.
+static void InverseTransform8(const int64_t *in, int64_t *out)
+{
+    // Чётная часть, поворот на sqrt(2) * c6.
+    int64_t z1 = (in[2] + in[6]) * IDCT_FIX_0_541196100;
+    const int64_t even2 = z1 - in[6] * IDCT_FIX_1_847759065;
+    const int64_t even3 = z1 + in[2] * IDCT_FIX_0_765366865;
+    const int64_t even0 = (in[0] + in[4]) * ((int64_t)1 << IDCT_CONST_BITS);
+    const int64_t even1 = (in[0] - in[4]) * ((int64_t)1 << IDCT_CONST_BITS);
+    const int64_t sum10 = even0 + even3;
+    const int64_t sum13 = even0 - even3;
+    const int64_t sum11 = even1 + even2;
+    const int64_t sum12 = even1 - even2;
+
+    // Нечётная часть: входы 7, 5, 3 и 1.
+    int64_t odd0 = in[7];
+    int64_t odd1 = in[5];
+    int64_t odd2 = in[3];
+    int64_t odd3 = in[1];
+    z1 = odd0 + odd3;
+    int64_t z2 = odd1 + odd2;
+    int64_t z3 = odd0 + odd2;
+    int64_t z4 = odd1 + odd3;
+    const int64_t z5 = (z3 + z4) * IDCT_FIX_1_175875602;
+    odd0 *= IDCT_FIX_0_298631336;
+    odd1 *= IDCT_FIX_2_053119869;
+    odd2 *= IDCT_FIX_3_072711026;
+    odd3 *= IDCT_FIX_1_501321110;
+    z1 *= -IDCT_FIX_0_899976223;
+    z2 *= -IDCT_FIX_2_562915447;
+    z3 = z3 * -IDCT_FIX_1_961570560 + z5;
+    z4 = z4 * -IDCT_FIX_0_390180644 + z5;
+    odd0 += z1 + z3;
+    odd1 += z2 + z4;
+    odd2 += z2 + z3;
+    odd3 += z1 + z4;
+
+    out[0] = sum10 + odd3;
+    out[7] = sum10 - odd3;
+    out[1] = sum11 + odd2;
+    out[6] = sum11 - odd2;
+    out[2] = sum12 + odd1;
+    out[5] = sum12 - odd1;
+    out[3] = sum13 + odd0;
+    out[4] = sum13 - odd0;
+}
+
+// Обратное ДКП блока. Коэффициенты и таблица квантования лежат в
+// естественном порядке, деквантование идёт по ходу первого прохода.
+static void InverseTransform(const int16_t *block, const uint16_t *quant, uint8_t *destination,
+                             uint32_t stride)
+{
+    // Столбцы. После квантования переменные части столбца обычно нули,
+    // и тогда весь столбец равен постоянной составляющей.
+    int64_t work[64];
+    int64_t column[8];
+    int64_t transformed[8];
+    for (uint32_t x = 0; x < 8u; ++x)
     {
-        for (uint32_t x = 0; x < 8u; ++x)
+        const int16_t *in = block + x;
+        if (in[8] == 0 && in[16] == 0 && in[24] == 0 && in[32] == 0 && in[40] == 0 &&
+            in[48] == 0 && in[56] == 0)
         {
-            float sum = 0.0f;
-            for (uint32_t u = 0; u < 8u; ++u) sum += natural[v * 8u + u] * IDCT_BASIS[u][x];
-            rows[v * 8u + x] = sum;
+            const int64_t level = (int64_t)in[0] * quant[x] * ((int64_t)1 << IDCT_PASS1_BITS);
+            for (size_t y = 0; y < 8u; ++y) work[y * 8u + x] = level;
+            continue;
+        }
+        for (size_t y = 0; y < 8u; ++y)
+        {
+            column[y] = (int64_t)in[y * 8u] * quant[y * 8u + x];
+        }
+        InverseTransform8(column, transformed);
+        for (size_t y = 0; y < 8u; ++y)
+        {
+            work[y * 8u + x] = IdctDescale(transformed[y], IDCT_CONST_BITS - IDCT_PASS1_BITS);
         }
     }
-    for (uint32_t y = 0; y < 8u; ++y)
+
+    // Строки: снимаются запас первого прохода и множитель 8 самого ДКП.
+    for (size_t y = 0; y < 8u; ++y)
     {
-        uint8_t *line = destination + (size_t)y * stride;
+        const int64_t *in = work + y * 8u;
+        uint8_t *line = destination + y * stride;
+        if (in[1] == 0 && in[2] == 0 && in[3] == 0 && in[4] == 0 && in[5] == 0 && in[6] == 0 &&
+            in[7] == 0)
+        {
+            const uint8_t level = IdctSample(IdctDescale(in[0], IDCT_PASS1_BITS + 3u));
+            for (uint32_t x = 0; x < 8u; ++x) line[x] = level;
+            continue;
+        }
+        InverseTransform8(in, transformed);
         for (uint32_t x = 0; x < 8u; ++x)
         {
-            float sum = 0.0f;
-            for (uint32_t v = 0; v < 8u; ++v) sum += rows[v * 8u + x] * IDCT_BASIS[v][y];
-            float level = sum + 128.5f;
-            int32_t sample = 0;
-            if (level >= 256.0f) sample = 255;
-            else if (level > 0.0f) sample = (int32_t)level;
-            line[x] = (uint8_t)sample;
+            line[x] = IdctSample(
+                IdctDescale(transformed[x], IDCT_CONST_BITS + IDCT_PASS1_BITS + 3u));
         }
     }
 }
@@ -474,6 +546,10 @@ static ImageStatus ComputeLayout(const JpegFrame *frame, JpegLayout *outLayout)
             outLayout->coefficients[index] = 0u;
         }
     }
+    offset = (offset + 7u) & ~(uint64_t)7u;
+    if (offset > 0xFFFFFFFFu) return IMAGE_TOO_LARGE;
+    outLayout->rows = (uint32_t)offset;
+    offset += (uint64_t)frame->width * frame->componentCount;
     if (offset > 0xFFFFFFFFu) return IMAGE_TOO_LARGE;
     outLayout->total = (uint32_t)offset;
     return IMAGE_OK;
@@ -590,10 +666,12 @@ static ImageStatus ParseQuantSegment(JpegDecoder *decoder, const uint8_t *segmen
         uint32_t needed = precision == 0u ? 64u : 128u;
         if (offset + needed > length) return IMAGE_CORRUPT;
 
+        // В файле таблица идёт зигзагом, а хранится в естественном
+        // порядке: так её читает обратное ДКП.
         uint16_t *values = decoder->quant + (size_t)table * 64u;
         for (uint32_t index = 0; index < 64u; ++index)
         {
-            values[index] = precision == 0u
+            values[ZIGZAG[index]] = precision == 0u
                                 ? (uint16_t)segment[offset + index]
                                 : (uint16_t)ReadU16Be(segment + offset + (size_t)(index * 2u));
         }
@@ -694,36 +772,21 @@ static void OutputBlock(const JpegDecoder *decoder, const JpegComponent *compone
     if (blockRow >= component->blocksPerColumn || blockColumn >= component->blocksPerLine) return;
 
     const uint16_t *quant = decoder->quant + (size_t)component->quantTable * 64u;
-    float values[64];
-    for (uint32_t index = 0; index < 64u; ++index)
-    {
-        values[index] = (float)block[index] * (float)quant[index];
-    }
     uint8_t *destination = component->samples +
                            (size_t)blockRow * 8u * component->sampleWidth + (size_t)blockColumn * 8u;
-    InverseTransform(values, destination, component->sampleWidth);
+    InverseTransform(block, quant, destination, component->sampleWidth);
 }
 
-// Блок только с DC: обратное ДКП даёт постоянный уровень. Значение
-// считается той же последовательностью float-операций, что и общий путь:
-// natural[0] = dc*quant[0], два умножения на IDCT_BASIS[0][0], затем
-// сложение с 128.5; остальные слагаемые — точные нули.
+// Блок только с DC: оба прохода islow сводятся к постоянной
+// составляющей, и уровень тот же, что дал бы общий путь.
 static void OutputFlatBlock(const JpegDecoder *decoder, const JpegComponent *component, int16_t dc,
                             uint32_t blockRow, uint32_t blockColumn)
 {
     if (blockRow >= component->blocksPerColumn || blockColumn >= component->blocksPerLine) return;
 
     const uint16_t *quant = decoder->quant + (size_t)component->quantTable * 64u;
-    float natural0 = (float)dc * (float)quant[0];
-    float row = 0.0f;
-    row += natural0 * IDCT_BASIS[0][0];
-    float level = 0.0f;
-    level += row * IDCT_BASIS[0][0];
-    level += 128.5f;
-    int32_t sample = 0;
-    if (level >= 256.0f) sample = 255;
-    else if (level > 0.0f) sample = (int32_t)level;
-    uint8_t value = (uint8_t)sample;
+    const int64_t level = (int64_t)dc * quant[0] * ((int64_t)1 << IDCT_PASS1_BITS);
+    const uint8_t value = IdctSample(IdctDescale(level, IDCT_PASS1_BITS + 3u));
 
     uint8_t *destination = component->samples +
                            (size_t)blockRow * 8u * component->sampleWidth + (size_t)blockColumn * 8u;
@@ -762,7 +825,7 @@ static ImageStatus DecodeSequentialBlock(JpegDecoder *decoder, JpegComponent *co
         }
         index += run;
         if (index >= 64u) return IMAGE_CORRUPT;
-        block[index] = (int16_t)Extend(ReadBits(&decoder->reader, size), size);
+        block[ZIGZAG[index]] = (int16_t)Extend(ReadBits(&decoder->reader, size), size);
         acPresent = true;
         index += 1u;
     }
@@ -1074,15 +1137,19 @@ static void FinishProgressive(const JpegDecoder *decoder)
                 const int16_t *block =
                     component->coefficients +
                     ((size_t)row * component->blocksPerLine + column) * 64u;
-                OutputBlock(decoder, component, block, row, column);
+                int16_t natural[64];
+                for (uint32_t zigzag = 0; zigzag < 64u; ++zigzag)
+                {
+                    natural[ZIGZAG[zigzag]] = block[zigzag];
+                }
+                OutputBlock(decoder, component, natural, row, column);
             }
         }
     }
 }
 
-// Целочисленное преобразование с теми же коэффициентами, что у
-// эталонных реализаций: расхождение с ними остаётся в пределах
-// округления обратного ДКП, а не накапливается на цвете.
+// Перевод цвета тот же, что у libjpeg: коэффициенты BT.601 с 16 битами
+// дробной части и одно округление на канал.
 #define JPEG_COLOR_HALF 32768
 static const int32_t JPEG_CR_TO_RED = 91881;      // 1.40200
 static const int32_t JPEG_CB_TO_BLUE = 116130;    // 1.77200
@@ -1096,120 +1163,162 @@ static uint8_t ClampByte(int32_t value)
     return (uint8_t)value;
 }
 
-// Отсчёт прореженного компонента лежит посередине своей пары, а не в
-// её начале, поэтому восстановление половинного разрешения — не
-// повторение соседа, а взвешивание три к одному. Повторение отличалось
-// бы от любого другого декодера на десятки единиц по краям цвета: это
-// измерено, а не предположено.
-//
-// Отношения, отличные от вдвое, встречаются редко (4:1:1 и подобное);
-// для них берётся ближайший отсчёт, потому что промежуточные веса там
-// уже неочевидны, а картинок таких почти нет.
-static void AxisTap(uint32_t coordinate, uint32_t sampling, uint32_t maximum, uint32_t extent,
-                    uint32_t *outNear, uint32_t *outFar, uint32_t *outNearWeight)
+// Ближняя строка компонента, прореженного вдвое по вертикали, и
+// следующая за ней: для чётной строки кадра — верхняя соседка, для
+// нечётной — нижняя. На краю строка повторяется.
+static void HalfHeightRows(const JpegComponent *component, uint32_t y, const uint8_t **outNear,
+                           const uint8_t **outFar)
 {
-    if (sampling == maximum)
+    const uint32_t centre = y >> 1;
+    uint32_t neighbour = centre;
+    if ((y & 1u) != 0u)
     {
-        *outNear = coordinate;
-        *outFar = coordinate;
-        *outNearWeight = 4u;
-        return;
+        if (centre + 1u < component->plainHeight) neighbour = centre + 1u;
     }
-    if (maximum == sampling * 2u)
+    else if (centre != 0u)
     {
-        uint32_t centre = coordinate >> 1;
-        uint32_t neighbour = centre;
-        if ((coordinate & 1u) != 0u) neighbour = centre + 1u;
-        else if (centre != 0u) neighbour = centre - 1u;
-        if (centre >= extent) centre = extent - 1u;
-        if (neighbour >= extent) neighbour = extent - 1u;
-        *outNear = centre;
-        *outFar = neighbour;
-        *outNearWeight = 3u;
-        return;
+        neighbour = centre - 1u;
     }
-    uint32_t nearest = coordinate * sampling / maximum;
-    if (nearest >= extent) nearest = extent - 1u;
-    *outNear = nearest;
-    *outFar = nearest;
-    *outNearWeight = 4u;
+    *outNear = component->samples + (size_t)centre * component->sampleWidth;
+    *outFar = component->samples + (size_t)neighbour * component->sampleWidth;
 }
 
-static uint8_t SampleAt(const JpegFrame *frame, const JpegComponent *component, uint32_t x,
-                        uint32_t y)
+// Строка y компонента в разрешении кадра; row — место под неё, если
+// компонент прорежен. Отсчёт прореженного компонента лежит посередине
+// своей пары, поэтому половинное разрешение восстанавливает фильтр
+// libjpeg (fancy upsampling): 3/4 ближнего отсчёта и 1/4 следующего по
+// каждой прореженной оси, с тем же чередованием округления. Повторение
+// соседа расходилось бы с любым другим декодером на десятки единиц по
+// краям цвета. Прочие кратности и прореженный компонент шириной в два
+// отсчёта и меньше libjpeg повторяет, и здесь так же.
+static const uint8_t *UpsampleRow(const JpegFrame *frame, const JpegComponent *component,
+                                  uint32_t y, uint8_t *row)
 {
-    if (component->horizontal == frame->maxHorizontal &&
-        component->vertical == frame->maxVertical)
+    const bool fullWidth = component->horizontal == frame->maxHorizontal;
+    const bool fullHeight = component->vertical == frame->maxVertical;
+    if (fullWidth && fullHeight) return component->samples + (size_t)y * component->sampleWidth;
+
+    const size_t width = component->plainWidth;
+    const bool halfWidth = frame->maxHorizontal == component->horizontal * 2u && width > 2u;
+    const bool halfHeight = frame->maxVertical == component->vertical * 2u;
+    const uint8_t *nearRow = NULL;
+    const uint8_t *farRow = NULL;
+    if (fullWidth && halfHeight)
     {
-        return component->samples[(size_t)y * component->sampleWidth + x];
+        HalfHeightRows(component, y, &nearRow, &farRow);
+        const uint32_t bias = (y & 1u) != 0u ? 2u : 1u;
+        for (size_t x = 0; x < frame->width; ++x)
+        {
+            row[x] = (uint8_t)((3u * nearRow[x] + farRow[x] + bias) >> 2);
+        }
+        return row;
+    }
+    if (halfWidth && fullHeight)
+    {
+        const uint8_t *in = component->samples + (size_t)y * component->sampleWidth;
+        row[0] = in[0];
+        row[1] = (uint8_t)((3u * in[0] + in[1] + 2u) >> 2);
+        size_t index = 1u;
+        for (; index + 1u < width; ++index)
+        {
+            const uint32_t centre = 3u * in[index];
+            row[2u * index] = (uint8_t)((centre + in[index - 1u] + 1u) >> 2);
+            row[2u * index + 1u] = (uint8_t)((centre + in[index + 1u] + 2u) >> 2);
+        }
+        row[2u * index] = (uint8_t)((3u * in[index] + in[index - 1u] + 1u) >> 2);
+        if (2u * index + 1u < frame->width) row[2u * index + 1u] = in[index];
+        return row;
+    }
+    if (halfWidth && halfHeight)
+    {
+        // Сначала по вертикали: сумма столбца — 3 * ближний + следующий.
+        HalfHeightRows(component, y, &nearRow, &farRow);
+        uint32_t current = 3u * nearRow[0] + farRow[0];
+        uint32_t next = 3u * nearRow[1] + farRow[1];
+        row[0] = (uint8_t)((4u * current + 8u) >> 4);
+        row[1] = (uint8_t)((3u * current + next + 7u) >> 4);
+        uint32_t previous = current;
+        current = next;
+        size_t index = 1u;
+        for (; index + 1u < width; ++index)
+        {
+            next = 3u * nearRow[index + 1u] + farRow[index + 1u];
+            row[2u * index] = (uint8_t)((3u * current + previous + 8u) >> 4);
+            row[2u * index + 1u] = (uint8_t)((3u * current + next + 7u) >> 4);
+            previous = current;
+            current = next;
+        }
+        row[2u * index] = (uint8_t)((3u * current + previous + 8u) >> 4);
+        if (2u * index + 1u < frame->width)
+        {
+            row[2u * index + 1u] = (uint8_t)((4u * current + 7u) >> 4);
+        }
+        return row;
     }
 
-    uint32_t nearX = 0u;
-    uint32_t farX = 0u;
-    uint32_t weightX = 4u;
-    AxisTap(x, component->horizontal, frame->maxHorizontal, component->plainWidth, &nearX, &farX,
-            &weightX);
-
-    uint32_t nearY = 0u;
-    uint32_t farY = 0u;
-    uint32_t weightY = 4u;
-    AxisTap(y, component->vertical, frame->maxVertical, component->plainHeight, &nearY, &farY,
-            &weightY);
-
-    const uint8_t *nearRow = component->samples + (size_t)nearY * component->sampleWidth;
-    const uint8_t *farRow = component->samples + (size_t)farY * component->sampleWidth;
-    uint32_t restX = 4u - weightX;
-    uint32_t restY = 4u - weightY;
-    uint32_t total = weightX * weightY * nearRow[nearX] + restX * weightY * nearRow[farX] +
-                     weightX * restY * farRow[nearX] + restX * restY * farRow[farX];
-    return (uint8_t)((total + 8u) >> 4);
+    // Повторение: отсчёт, в чью область попадает пиксель кадра.
+    const uint32_t sourceRow = y * component->vertical / frame->maxVertical;
+    const uint8_t *source = component->samples + (size_t)sourceRow * component->sampleWidth;
+    for (uint32_t x = 0; x < frame->width; ++x)
+    {
+        row[x] = source[x * component->horizontal / frame->maxHorizontal];
+    }
+    return row;
 }
 
-static void ConvertToRgba(const JpegFrame *frame, uint8_t *pixels)
+// rows — по строке ширины кадра на компонент: туда восстанавливаются
+// прореженные.
+static void ConvertToRgba(const JpegFrame *frame, uint8_t *pixels, uint8_t *rows)
 {
     // Adobe с transform 0 означает, что три компонента — уже RGB.
     bool convertColor = frame->componentCount == 3u && !(frame->adobe && frame->adobeTransform == 0u);
+    const size_t width = frame->width;
 
     for (uint32_t y = 0; y < frame->height; ++y)
     {
-        uint8_t *out = pixels + (size_t)y * frame->width * 4u;
-        for (uint32_t x = 0; x < frame->width; ++x)
+        uint8_t *out = pixels + (size_t)y * width * 4u;
+        if (frame->componentCount == 1u)
         {
-            if (frame->componentCount == 1u)
+            const uint8_t *gray = UpsampleRow(frame, &frame->components[0], y, rows);
+            for (size_t x = 0; x < width; ++x)
             {
-                uint8_t value = SampleAt(frame, &frame->components[0], x, y);
-                out[0] = value;
-                out[1] = value;
-                out[2] = value;
+                out[4u * x] = gray[x];
+                out[4u * x + 1u] = gray[x];
+                out[4u * x + 2u] = gray[x];
+                out[4u * x + 3u] = 255u;
             }
-            else
+            continue;
+        }
+
+        const uint8_t *first = UpsampleRow(frame, &frame->components[0], y, rows);
+        const uint8_t *second = UpsampleRow(frame, &frame->components[1], y, rows + width);
+        const uint8_t *third = UpsampleRow(frame, &frame->components[2], y, rows + 2u * width);
+        if (!convertColor)
+        {
+            for (size_t x = 0; x < width; ++x)
             {
-                int32_t first = (int32_t)SampleAt(frame, &frame->components[0], x, y);
-                int32_t second = (int32_t)SampleAt(frame, &frame->components[1], x, y);
-                int32_t third = (int32_t)SampleAt(frame, &frame->components[2], x, y);
-                if (convertColor)
-                {
-                    int32_t blueDifference = second - 128;
-                    int32_t redDifference = third - 128;
-                    // Сдвиг вправо у отрицательного здесь арифметический:
-                    // это и требуется, деление округляло бы к нулю.
-                    out[0] = ClampByte(
-                        first + ((JPEG_CR_TO_RED * redDifference + JPEG_COLOR_HALF) >> 16));
-                    out[1] = ClampByte(first + ((JPEG_CB_TO_GREEN * blueDifference +
-                                                 JPEG_CR_TO_GREEN * redDifference +
-                                                 JPEG_COLOR_HALF) >> 16));
-                    out[2] = ClampByte(
-                        first + ((JPEG_CB_TO_BLUE * blueDifference + JPEG_COLOR_HALF) >> 16));
-                }
-                else
-                {
-                    out[0] = (uint8_t)first;
-                    out[1] = (uint8_t)second;
-                    out[2] = (uint8_t)third;
-                }
+                out[4u * x] = first[x];
+                out[4u * x + 1u] = second[x];
+                out[4u * x + 2u] = third[x];
+                out[4u * x + 3u] = 255u;
             }
-            out[3] = 255u;
-            out += 4;
+            continue;
+        }
+        for (size_t x = 0; x < width; ++x)
+        {
+            const int32_t luma = first[x];
+            const int32_t blueDifference = (int32_t)second[x] - 128;
+            const int32_t redDifference = (int32_t)third[x] - 128;
+            // Сдвиг вправо у отрицательного здесь арифметический:
+            // это и требуется, деление округляло бы к нулю.
+            out[4u * x] =
+                ClampByte(luma + ((JPEG_CR_TO_RED * redDifference + JPEG_COLOR_HALF) >> 16));
+            out[4u * x + 1u] = ClampByte(luma + ((JPEG_CB_TO_GREEN * blueDifference +
+                                                  JPEG_CR_TO_GREEN * redDifference +
+                                                  JPEG_COLOR_HALF) >> 16));
+            out[4u * x + 2u] =
+                ClampByte(luma + ((JPEG_CB_TO_BLUE * blueDifference + JPEG_COLOR_HALF) >> 16));
+            out[4u * x + 3u] = 255u;
         }
     }
 }
@@ -1334,6 +1443,6 @@ ImageStatus JpegDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *i
 
     if (!decodedScan) return IMAGE_CORRUPT;
     if (decoder.frame.progressive) FinishProgressive(&decoder);
-    ConvertToRgba(&decoder.frame, (uint8_t *)pixels);
+    ConvertToRgba(&decoder.frame, (uint8_t *)pixels, base + layout.rows);
     return IMAGE_OK;
 }
