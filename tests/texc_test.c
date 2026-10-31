@@ -40,6 +40,20 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeExit(1);
 }
 
+static void CheckRejectedCount(uint32_t frameCount, LtTexture *texture, uint8_t *output,
+                               uint32_t capacityBytes)
+{
+    uint32_t written = UINT32_C(0x12345678);
+    texture->frameCount = frameCount;
+    Expect(LtEncode(texture, output, capacityBytes, &written) == LT_TOO_MANY_FRAMES,
+           "an invalid frame count is rejected before reading durations");
+    Expect(written == UINT32_C(0x12345678), "a failed encode preserves outWritten");
+    for (uint32_t index = 0u; index < capacityBytes; ++index)
+        Expect(output[index] == 0xa5u, "a failed encode preserves the output buffer");
+    Expect(*texture->frameMilliseconds == 40u,
+           "a failed encode preserves its borrowed duration table");
+}
+
 static void CheckEncodeFrameLimit(void)
 {
     size_t pageBytes;
@@ -82,18 +96,11 @@ static void CheckEncodeFrameLimit(void)
         .height = 1u,
         .frameMilliseconds = duration,
     };
-    const uint32_t rejectedCounts[] = {LT_MAX_FRAMES + 1u, UINT32_MAX, 0u};
-    uint32_t written = UINT32_C(0x12345678);
-    for (uint32_t count = 0u; count < 3u; ++count)
-    {
-        texture.frameCount = rejectedCounts[count];
-        Expect(LtEncode(&texture, output, sizeof(output), &written) == LT_TOO_MANY_FRAMES,
-               "an invalid frame count is rejected before reading durations");
-        Expect(written == UINT32_C(0x12345678), "a failed encode preserves outWritten");
-        for (uint32_t index = 0u; index < sizeof(output); ++index)
-            Expect(output[index] == 0xa5u, "a failed encode preserves the output buffer");
-        Expect(*duration == 40u, "a failed encode preserves its borrowed duration table");
-    }
+    /* Explicit cases let LTO discard unreachable writes before diagnosing
+     * the bounded output buffer. */
+    CheckRejectedCount(LT_MAX_FRAMES + 1u, &texture, output, sizeof(output));
+    CheckRejectedCount(UINT32_MAX, &texture, output, sizeof(output));
+    CheckRejectedCount(0u, &texture, output, sizeof(output));
 #if defined(_WIN32)
     Expect(VirtualFree(pages, 0u, MEM_RELEASE) != 0, "duration guard pages release");
 #else
