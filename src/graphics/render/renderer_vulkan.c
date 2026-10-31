@@ -470,6 +470,8 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     RendererStats lastStats;
     RendererContentStatus texturePackLoadStatus;
     bool verticalSyncEnabled;
+    // Устройство включило VK_PRESENT_MODE_FIFO_LATEST_READY_KHR.
+    bool presentLatestReady;
     bool wireframeEnabled;
     bool worldReady;
 
@@ -2487,6 +2489,29 @@ static bool DeviceExtensionSupported(VkPhysicalDevice device, const char *name)
     return found;
 }
 
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+// Расширение с VK_PRESENT_MODE_FIFO_LATEST_READY_KHR, которое устройство
+// поддерживает, или NULL.
+static const char *LatestReadyExtension(VkPhysicalDevice device)
+{
+    const char *extension = NULL;
+    if (DeviceExtensionSupported(device, VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+        extension = VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME;
+    else if (DeviceExtensionSupported(device, VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+        extension = VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME;
+    if (extension == NULL) return NULL;
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR available = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &available,
+    };
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return available.presentModeFifoLatestReady == VK_TRUE ? extension : NULL;
+}
+#endif
+
 // Формат swapchain. Приоритет: точное совпадение с форматом offscreen-цели
 // (тогда достаточно vkCmdCopyImage, без конверсии и перестановки каналов),
 // затем B8G8R8A8_UNORM из задачи (тогда — vkCmdBlitImage), затем любой
@@ -2513,16 +2538,21 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
     return formats[0];
 }
 
-// Present-mode: vsync — FIFO; без vsync — MAILBOX (последний готовый кадр
-// без разрывов), иначе IMMEDIATE, иначе FIFO (он обязан поддерживаться всегда).
-static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync)
+// Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
+// разрывов: FIFO_LATEST_READY, затем MAILBOX, иначе IMMEDIATE, иначе FIFO (он
+// обязан поддерживаться всегда).
+static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync,
+                                          bool latestReady)
 {
     if (vsync)
-    {
-        for (uint32_t index = 0; index < count; ++index)
-            if (modes[index] == VK_PRESENT_MODE_FIFO_KHR) return VK_PRESENT_MODE_FIFO_KHR;
         return VK_PRESENT_MODE_FIFO_KHR;
-    }
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+    for (uint32_t index = 0; latestReady && index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)
+            return VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
+#else
+    (void)latestReady;
+#endif
     for (uint32_t index = 0; index < count; ++index)
         if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
     for (uint32_t index = 0; index < count; ++index)
@@ -2621,11 +2651,17 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         if (modes == NULL) return false;
         if (vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physicalDevice, renderer->surface,
                                                       &modeCount, modes) == VK_SUCCESS)
-            presentMode = SelectPresentMode(modes, modeCount, renderer->verticalSyncEnabled);
+            presentMode = SelectPresentMode(modes, modeCount, renderer->verticalSyncEnabled,
+                                            renderer->presentLatestReady);
         PlatformFree(modes);
     }
 
+    // Без vsync показ держит до двух образов: показанный и ждущий следующего
+    // обновления экрана. Если образов только minImageCount, захват ждёт этого
+    // обновления, и кадров выходит не больше, чем обновлений экрана; ещё один
+    // образ даёт рисовать следующий кадр, пока те два заняты.
     uint32_t imageCount = capabilities.minImageCount;
+    if (presentMode != VK_PRESENT_MODE_FIFO_KHR) ++imageCount;
     if (imageCount < 2u) imageCount = 2u;
     if (capabilities.maxImageCount > 0u && imageCount > capabilities.maxImageCount)
         imageCount = capabilities.maxImageCount;
@@ -3103,7 +3139,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         }
     }
 #endif
-    const char *deviceExtensions[2];
+    const char *deviceExtensions[3];
     uint32_t deviceExtensionCount = 0u;
     if (pushDescriptorCommand == NULL &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
@@ -3123,6 +3159,24 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         if (!DeviceExtensionSupported(chosen, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return false;
         deviceExtensions[deviceExtensionCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     }
+    // Без vsync FIFO_LATEST_READY сдерживает кадры очередью показа, и поток
+    // ждёт GPU во сне. MAILBOX сдерживает их в захвате образа, а драйвер
+    // NVIDIA ждёт там активно и занимает целое ядро.
+    renderer->presentLatestReady = false;
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latestReady = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+        .presentModeFifoLatestReady = VK_TRUE,
+    };
+    const char *latestReadyExtension = renderer->hasSurface ? LatestReadyExtension(chosen) : NULL;
+    if (latestReadyExtension != NULL)
+    {
+        deviceExtensions[deviceExtensionCount++] = latestReadyExtension;
+        latestReady.pNext = featureChain;
+        featureChain = &latestReady;
+        renderer->presentLatestReady = true;
+    }
+#endif
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = featureChain,
