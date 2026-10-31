@@ -5,6 +5,35 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Windows a program in the background goes into efficiency mode, as with
+  the Task Manager switch: its process gets EcoQoS and low base priority, and
+  Task Manager shows the green leaf. The window module enters the mode when
+  another application becomes active and leaves it when the program is active
+  again or its window closes, restoring the previous priority class. Audio
+  output keeps high QoS, so playback in the background does not stutter.
+- On Windows `PlatformAtomicLoadI64` reads with an ordinary load instead of a
+  locked compare-exchange, and on ARM64 the 32-bit acquire load and release
+  store use `LDAR` and `STLR` instead of locked instructions. Threads that
+  read a shared counter no longer take its cache line from each other and
+  from the thread that writes it.
+- Vulkan without vertical sync showed no more frames than the screen
+  refreshes. On NVIDIA it also kept a CPU core busy waiting for a free
+  swapchain image. Now it presents in `FIFO_LATEST_READY` mode where the
+  device offers it, otherwise in `MAILBOX`, and with one more swapchain image.
+  As with D3D12, the screen shows the latest finished frame at each refresh,
+  up to two frames are rendered per refresh, and the CPU sleeps while it
+  waits.
+- The Vulkan renderer took the last suitable device, not the best. Without a
+  discrete GPU it could choose a CPU driver such as lavapipe over the
+  integrated GPU. It now ranks devices: discrete GPU first, then integrated,
+  virtual and other GPUs, and a CPU driver last. Among devices of one type it
+  takes the first one the loader lists. With more than eight devices it
+  chooses among the first eight instead of failing.
+- The graphics device kept a texture or a sampler destroyed between
+  `beginFrame` and `endFrame`, and a shader destroyed while a pipeline used
+  it, until the device itself was destroyed: `destroyHandle` dropped those
+  calls. Now the texture and the sampler are released when the frame ends,
+  and the shader with its last pipeline.
 - Android runs programs on modules by name, like the desktop: with
   `LAIUE_MODULE_LIBRARY_TYPE=SHARED` every module is its own `.so` in the APK,
   and a missing one turns off only its technology. The `window` module brings
@@ -14,6 +43,17 @@ API and ABI may change between minor versions.
 - On Android `LAIUE_X86_64_LEVEL` defaults to `sse2`, the ABI baseline with
   SSE4.2 and POPCNT. x86_64 APKs were built for AVX2 and would stop with
   `SIGILL` on devices without it.
+- The APK's activity takes every configuration change itself, the resource
+  overlay Android applies right after installation included. Android used to
+  restart it then, and `main` was stopped and run again in the same process.
+- On Android a program opened again before its previous activity is
+  destroyed, right after it exits or over a running one, waits for the
+  previous run of `main` to end. Both runs used to share the program's state
+  and output in one process, and destroying the old activity hung the app.
+- The D3D12 and Vulkan renderers accept any number of geometry uploads between
+  two frames; past 128 they used to refuse them until the next frame. Bytes
+  that miss both staging rings of a frame share overflow blocks freed once the
+  frame completes, instead of one staging buffer per upload.
 - On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
   bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
   shared modules: a program needs only the NDK toolchain file.

@@ -30,6 +30,7 @@
 #define ANDROID_ARGUMENT_CAPACITY 64u
 #define ANDROID_ARGUMENT_BYTES 4096u
 #define ANDROID_LOG_TAG_CAPACITY 64u
+#define ANDROID_RUN_WAIT_MILLISECONDS 50
 
 struct Window
 {
@@ -63,6 +64,8 @@ struct Window
 static struct android_app *androidApplication;
 static Window *androidWindow;
 static char androidLogTag[ANDROID_LOG_TAG_CAPACITY] = "laiue";
+// 1, пока android_main ведёт программу: от захвата до восстановления вывода.
+static volatile uint32_t androidRunActive;
 
 /* ---- stdout и stderr в logcat ------------------------------------------------------- */
 
@@ -110,7 +113,6 @@ static void *LogThread(void *context)
 
 static void LogRedirectStart(LogRedirect *redirect)
 {
-    redirect->running = false;
     redirect->pipeRead = -1;
     redirect->savedOutput = dup(STDOUT_FILENO);
     redirect->savedError = dup(STDERR_FILENO);
@@ -147,6 +149,7 @@ failed:
         close(redirect->savedError);
     redirect->savedOutput = -1;
     redirect->savedError = -1;
+    redirect->running = false;
 }
 
 static void LogRedirectStop(LogRedirect *redirect)
@@ -668,11 +671,34 @@ static int RunProgram(ANativeActivity *activity, int count, char **arguments)
 
 void android_main(struct android_app *app)
 {
-    androidApplication = app;
-    androidWindow = NULL;
     app->userData = NULL;
     app->onAppCmd = HandleCommand;
     app->onInputEvent = HandleInput;
+
+    // Активности одного процесса могут пересекаться: если программу открыли
+    // снова сразу после выхода или поверх работающей, Android создаёт новую
+    // раньше, чем уничтожит старую. Программа, её окно и перенаправление
+    // вывода — одни на процесс, поэтому новый android_main ждёт, пока старый
+    // закончит целиком. Иначе старый сбросил бы окно нового и вернул бы вывод
+    // на место поверх его перенаправления, а сам не дождался бы конца своего
+    // канала: копия дескриптора, снятая новым, держит канал открытым. Пока
+    // новый ждёт, команды его активности обрабатываются: поток интерфейса
+    // Android ждёт их и без этого не дошёл бы до onDestroy старой.
+    uint32_t idle = 0u;
+    bool waited = false;
+    while (!PlatformAtomicCompareExchangeU32(&androidRunActive, &idle, 1u))
+    {
+        if (!waited)
+            __android_log_write(ANDROID_LOG_INFO, androidLogTag,
+                                "waiting for the previous run of the program to end");
+        waited = true;
+        idle = 0u;
+        PumpEvents(app, ANDROID_RUN_WAIT_MILLISECONDS);
+        if (app->destroyRequested != 0)
+            return;
+    }
+    androidApplication = app;
+    androidWindow = NULL;
     SelectLogTag(app->activity);
 
     LogRedirect redirect;
@@ -714,11 +740,16 @@ void android_main(struct android_app *app)
     // Активность закрывается вместе с программой, и glue требует
     // дождаться её разрушения.
     if (app->destroyRequested == 0)
+    {
         ANativeActivity_finish(app->activity);
+        __android_log_write(ANDROID_LOG_INFO, androidLogTag,
+                            "the program has ended and its activity is closing");
+    }
     while (app->destroyRequested == 0)
         PumpEvents(app, -1);
     app->userData = NULL;
     androidWindow = NULL;
     androidApplication = NULL;
     LogRedirectStop(&redirect);
+    PlatformAtomicStoreU32Release(&androidRunActive, 0u);
 }

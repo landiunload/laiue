@@ -185,6 +185,10 @@ typedef uint32_t (*LaiueGraphicsCreateShaderFn)(LaiueGraphicsDeviceV1 *,
                                                 LaiueGraphicsHandle *outShader);
 typedef uint32_t (*LaiueGraphicsUploadBufferFn)(LaiueGraphicsDeviceV1 *,
                                                 const LaiueGraphicsBufferUploadV1 *upload);
+/* Releases a resource; a stale or foreign handle is ignored. A resource still
+ * in use stays live until it is free: a texture or a sampler destroyed
+ * between beginFrame and endFrame serves that frame to its end, and a shader
+ * goes with the last pipeline built from it. */
 typedef void (*LaiueGraphicsDestroyHandleFn)(LaiueGraphicsDeviceV1 *, LaiueGraphicsHandle);
 typedef uint32_t (*LaiueGraphicsBeginFrameFn)(LaiueGraphicsDeviceV1 *, uint32_t width,
                                               uint32_t height);

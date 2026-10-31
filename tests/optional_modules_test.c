@@ -310,9 +310,9 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                                               &firstPipeline) != 0u &&
                    firstPipeline != 0u,
                "graphics device records pipeline shader dependencies");
-        /* Destroying a referenced shader is intentionally a no-op in the void
-         * ABI.  Creating another pipeline proves that the original handle stayed
-         * live instead of becoming a dangling pointer. */
+        /* A destroyed shader that a pipeline references stays live until the
+         * last such pipeline goes. Creating another pipeline proves that the
+         * handle did not become a dangling pointer. */
         resourceDevice->destroyHandle(resourceDevice, shader);
         LaiueGraphicsHandle secondPipeline = 0u;
         Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
@@ -321,7 +321,9 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
                "referenced shader remains live until all pipelines are gone");
         resourceDevice->destroyHandle(resourceDevice, firstPipeline);
         resourceDevice->destroyHandle(resourceDevice, secondPipeline);
-        resourceDevice->destroyHandle(resourceDevice, shader);
+        Expect(resourceDevice->createPipeline(resourceDevice, &pipelineDescription,
+                                              &secondPipeline) == 0u,
+               "the destroyed shader is released with its last pipeline");
 
         LaiueGraphicsTextureDescV1 invalidTextureDescription = {
             sizeof(invalidTextureDescription), 0u, {4u, 4u, 1u}, 0u, 0u};

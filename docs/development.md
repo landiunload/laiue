@@ -77,6 +77,22 @@ cmake --build build/tidy --config Debug --parallel
 run-clang-tidy -p build/tidy -quiet "$PWD/src/.*[.]c$"
 ```
 
+Код под `__ANDROID__` и ветки ARM64 CI проверяет так же по базе
+`android-arm64-shared` (preset с `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` и NDK из
+`ANDROID_NDK_HOME`), а код только для Windows — по базе `windows-clang`. На
+Windows в Developer PowerShell с LLVM 22 в стандартном каталоге:
+
+```powershell
+cmake --preset windows-clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build --preset windows-clang-debug --parallel
+python "$env:ProgramFiles\LLVM\bin\run-clang-tidy" -p build/windows-clang -quiet `
+    -clang-tidy-binary "$env:ProgramFiles\LLVM\bin\clang-tidy.exe" `
+    "^$([regex]::Escape("$PWD\src\")).*[.]c$"
+```
+
+`run-clang-tidy` на Windows сравнивает фильтр с путями через обратную косую
+черту, поэтому путь к `src` экранирован.
+
 Находку исправляют, а не подавляют. Отключённые проверки и причины
 перечислены в `.clang-tidy`; точечный `NOLINT` допустим только с пояснением.
 

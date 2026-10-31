@@ -33,7 +33,10 @@
 #define INSTANCE_LIMIT (64u * 1024u * 1024u / 32u)
 #define RETIREMENT_MESH_COUNT 300u
 #define RETIREMENT_UPLOAD_BATCH 50u
-#define PENDING_UPLOAD_LIMIT 128u
+/* Six 3 MiB buffers fill the 4 MiB and 8 MiB staging rings of a frame and
+ * spill into two overflow blocks, the second one started by the last buffer. */
+#define SPILL_BUFFER_COUNT 6u
+#define SPILL_VERTEX_COUNT (3u * 1024u * 1024u / (uint32_t)sizeof(LaiueGraphicsVertexV2))
 
 typedef struct LegacyDeviceV2
 {
@@ -69,6 +72,7 @@ static uint8_t referencePixels[FRAME_BYTES];
 static LaiueGraphicsVertexV2 vertices[8];
 static LaiueGraphicsInstanceV2 instances[3];
 static LaiueGraphicsHandle retirementMeshes[RETIREMENT_MESH_COUNT];
+static LaiueGraphicsVertexV2 spillVertices[SPILL_VERTEX_COUNT];
 static const uint32_t indicesA[12] = {0u, 1u, 2u, 0u, 2u, 3u, 4u, 5u, 6u, 4u, 6u, 7u};
 static const uint32_t indicesB[12] = {4u, 5u, 6u, 4u, 6u, 7u, 0u, 1u, 2u, 0u, 2u, 3u};
 
@@ -809,79 +813,104 @@ static void OverflowRecordedRetirement(LaiueGraphicsDeviceV2 *device)
            "completed frame slots reclaim both the fixed queue and every overflow node");
 }
 
-static void PendingUploadExhaustion(LaiueGraphicsDeviceV2 *device)
+/* These resources retire after EndFrame, so Vulkan needs two later
+ * submissions before the third BeginFrame drains their ranges. */
+static void ExpectReclaimed(LaiueGraphicsDeviceV2 *device,
+                            const LaiueGraphicsDiagnosticsV2 *baseline, const char *reason)
 {
-    Stage("128 prepared uploads render immediately; rejected upload 129 preserves CPU indices");
-    const LaiueGraphicsDiagnosticsV2 baseline = Diagnostics(device);
-    const uint32_t meshBytes = 3u * sizeof(vertices[0]);
-    /* The unused range exceeds the VB so the selected triangle must use
-     * CPU subrange bounds rather than the whole-buffer bounds shortcut. */
-    static const uint32_t validIndices[6] = {0u, 1u, 2u, 0u, 1u, 3u};
-    const LaiueGraphicsHandle vb =
-        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices + 4u, meshBytes);
-    const LaiueGraphicsHandle ib =
-        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_INDEX, validIndices, sizeof(validIndices));
-    Begin(device);
-    Capture(device, 0u);
-    for (uint32_t i = 0u; i < PENDING_UPLOAD_LIMIT; ++i)
-        retirementMeshes[i] =
-            Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices + 4u, meshBytes);
-    const uint64_t used = Diagnostics(device).geometryPoolUsedBytes;
-    const uint32_t invalidIndex = UINT32_MAX;
-    LaiueGraphicsBufferUploadV1 replacement = {.structSize = sizeof(replacement),
-                                               .buffer = ib,
-                                               .data = &invalidIndex,
-                                               .sizeBytes = sizeof(invalidIndex)};
-    Expect(device->uploadBuffer(device, &replacement) == 0u &&
-               Diagnostics(device).geometryPoolUsedBytes == used,
-           "upload 129 rejects before publishing a replacement or consuming a GPU range");
-    LaiueGraphicsDrawItemV2 indexed = Item(vb, ib, 0u, 0, -0.125f, -0.125f, 1.0f);
-    indexed.indexCount = 3u;
-    const LaiueGraphicsDrawItemV2 last =
-        Item(retirementMeshes[PENDING_UPLOAD_LIMIT - 1u], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
-    Begin(device);
-    /* This first-ever subrange lookup reads the CPU index shadow rather
-     * than the cached whole-buffer bounds. Publishing the rejected poison
-     * index would reject this draw even if the original GPU IB survived. */
-    Submit(device, &indexed);
-    Submit(device, &last);
-    Capture(device, 2u);
-    Expect(Diagnostics(device).uploadedBytes == (uint64_t)PENDING_UPLOAD_LIMIT * meshBytes,
-           "exactly 128 prepared native meshes upload in their first frame");
-    ColorAt(0.0625f, -0.0625f, UINT32_C(0xff00ff00),
-            "a rejected replacement preserves both the CPU shadow and resident GPU indices");
-    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00),
-            "prepared mesh 128 renders without a second-frame retry");
-    const uint32_t validIndex = 0u;
-    replacement.data = &validIndex;
-    Expect(device->uploadBuffer(device, &replacement) != 0u,
-           "a new upload succeeds once the previous frame drains the pending queue");
-    Begin(device);
-    Submit(device, &indexed);
-    Capture(device, 1u);
-    Expect(Diagnostics(device).uploadedBytes == sizeof(validIndices),
-           "queue recovery stages only the successful replacement");
-    ColorAt(0.0625f, -0.0625f, UINT32_C(0xff00ff00),
-            "a recovered partial replacement preserves the remaining indices");
-    for (uint32_t i = 0u; i < PENDING_UPLOAD_LIMIT; ++i)
-    {
-        device->destroyHandle(device, retirementMeshes[i]);
-        retirementMeshes[i] = 0u;
-    }
-    device->destroyHandle(device, ib);
-    device->destroyHandle(device, vb);
-    /* These resources retire after EndFrame, so Vulkan needs two later
-     * submissions before the third BeginFrame drains their ranges. */
     for (uint32_t frame = 0u; frame < 3u; ++frame)
     {
         Begin(device);
         Capture(device, 0u);
     }
     const LaiueGraphicsDiagnosticsV2 reclaimed = Diagnostics(device);
-    Expect(reclaimed.geometryPoolUsedBytes == baseline.geometryPoolUsedBytes &&
-               reclaimed.cpuShadowBytes == baseline.cpuShadowBytes &&
-               reclaimed.resourceHandleCount == baseline.resourceHandleCount,
-           "upload exhaustion and recovery leave no resource or pool range behind");
+    Expect(reclaimed.geometryPoolUsedBytes == baseline->geometryPoolUsedBytes &&
+               reclaimed.cpuShadowBytes == baseline->cpuShadowBytes &&
+               reclaimed.resourceHandleCount == baseline->resourceHandleCount,
+           reason);
+}
+
+static void PendingUploadBurst(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("300 uploads prepared between frames, a partial index edit among them, render at once");
+    const LaiueGraphicsDiagnosticsV2 baseline = Diagnostics(device);
+    const uint32_t meshBytes = 3u * sizeof(vertices[0]);
+    /* The unused range exceeds the VB so the selected triangle must use
+     * CPU subrange bounds rather than the whole-buffer bounds shortcut. */
+    static const uint32_t validIndices[6] = {3u, 1u, 2u, 0u, 1u, 3u};
+    const LaiueGraphicsHandle vb =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices + 4u, meshBytes);
+    const LaiueGraphicsHandle ib =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_INDEX, validIndices, sizeof(validIndices));
+    Begin(device);
+    Capture(device, 0u);
+    for (uint32_t i = 0u; i < RETIREMENT_MESH_COUNT / 2u; ++i)
+        retirementMeshes[i] =
+            Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices + 4u, meshBytes);
+    /* Index 3 lies outside the three-vertex buffer; the edit queued in the
+     * middle of the burst must reach the GPU in the same first frame. */
+    const uint32_t firstIndex = 0u;
+    const LaiueGraphicsBufferUploadV1 edit = {.structSize = sizeof(edit),
+                                              .buffer = ib,
+                                              .data = &firstIndex,
+                                              .sizeBytes = sizeof(firstIndex)};
+    Expect(device->uploadBuffer(device, &edit) != 0u,
+           "a partial index edit queues behind more uploads than any fixed batch");
+    for (uint32_t i = RETIREMENT_MESH_COUNT / 2u; i < RETIREMENT_MESH_COUNT; ++i)
+        retirementMeshes[i] =
+            Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices + 4u, meshBytes);
+    LaiueGraphicsDrawItemV2 indexed = Item(vb, ib, 0u, 0, -0.125f, -0.125f, 1.0f);
+    indexed.indexCount = 3u;
+    const LaiueGraphicsDrawItemV2 last =
+        Item(retirementMeshes[RETIREMENT_MESH_COUNT - 1u], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &indexed);
+    Submit(device, &last);
+    Capture(device, 2u);
+    Expect(Diagnostics(device).uploadedBytes ==
+               (uint64_t)RETIREMENT_MESH_COUNT * meshBytes + sizeof(validIndices),
+           "all 300 meshes and the edited index buffer upload in their first frame");
+    ColorAt(0.0625f, -0.0625f, UINT32_C(0xff00ff00),
+            "the edited indices draw from the CPU shadow and the GPU copy alike");
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00),
+            "the last mesh of the burst renders without a second-frame retry");
+    for (uint32_t i = 0u; i < RETIREMENT_MESH_COUNT; ++i)
+    {
+        device->destroyHandle(device, retirementMeshes[i]);
+        retirementMeshes[i] = 0u;
+    }
+    device->destroyHandle(device, ib);
+    device->destroyHandle(device, vb);
+    ExpectReclaimed(device, &baseline, "the burst leaves no resource or pool range behind");
+}
+
+static void StagingSpill(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("18 MiB prepared between frames spills past both staging rings and renders at once");
+    for (uint32_t i = 0u; i < SPILL_VERTEX_COUNT; ++i)
+        spillVertices[i] = vertices[4u + i % 3u];
+    const LaiueGraphicsDiagnosticsV2 baseline = Diagnostics(device);
+    LaiueGraphicsHandle buffers[SPILL_BUFFER_COUNT];
+    for (uint32_t i = 0u; i < SPILL_BUFFER_COUNT; ++i)
+        buffers[i] = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, spillVertices,
+                            (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsDrawItemV2 spilled = Item(buffers[3], 0u, 0u, 0, -0.625f, -0.125f, 1.0f);
+    const LaiueGraphicsDrawItemV2 last =
+        Item(buffers[SPILL_BUFFER_COUNT - 1u], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &spilled);
+    Submit(device, &last);
+    Capture(device, 2u);
+    Expect(Diagnostics(device).uploadedBytes ==
+               (uint64_t)SPILL_BUFFER_COUNT * sizeof(spillVertices),
+           "every spilled byte uploads in its first frame");
+    ColorAt(-0.4375f, -0.0625f, UINT32_C(0xff00ff00),
+            "the first buffer past both staging rings renders");
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00),
+            "the buffer that opens a second overflow block renders");
+    for (uint32_t i = 0u; i < SPILL_BUFFER_COUNT; ++i)
+        device->destroyHandle(device, buffers[i]);
+    ExpectReclaimed(device, &baseline, "the spill leaves no resource or pool range behind");
 }
 
 LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
@@ -979,7 +1008,8 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         LegacyTables(device, vb, ia);
         DestroyRecordedResources(device);
         OverflowRecordedRetirement(device);
-        PendingUploadExhaustion(device);
+        PendingUploadBurst(device);
+        StagingSpill(device);
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);

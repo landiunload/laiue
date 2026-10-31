@@ -68,6 +68,7 @@ typedef uint32_t (*LaiueGraphicsV2CreateShaderFn)(
     LaiueGraphicsHandle *outShader);
 typedef uint32_t (*LaiueGraphicsV2UploadBufferFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsBufferUploadV1 *upload);
+/* Same contract as LaiueGraphicsDestroyHandleFn. */
 typedef void (*LaiueGraphicsV2DestroyHandleFn)(
     LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle handle);
 typedef uint32_t (*LaiueGraphicsV2BeginFrameFn)(
