@@ -62,7 +62,8 @@ LAIUE_WINDOW_API uint32_t WindowConsumeText(Window* window, uint32_t* codepoints
     uint32_t capacity);
 
 // Полноэкранный режим без рамки на текущем мониторе. Обычный оконный
-// режим восстанавливает прежние стиль и положение окна.
+// режим восстанавливает прежние стиль и положение окна. На Windows и X11
+// его переключает и Alt+Enter.
 LAIUE_WINDOW_API void    WindowSetFullscreen(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsFullscreen(const Window* window);
 

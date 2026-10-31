@@ -5,6 +5,18 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Alt+Enter switches borderless full screen in the window module, on
+  Windows and X11, with any graphics backend. Before, only D3D12 reacted,
+  through DXGI's own handler, and it entered exclusive full screen. There a
+  present that allows tearing fails, so without vertical sync the program
+  stopped drawing. D3D12 now leaves Alt+Enter to the window. On Vulkan
+  Alt+Enter did nothing.
+- On Windows Alt or F10 pressed alone no longer stops frames. They started
+  the system menu's modal loop until the next key; Alt+Space still opens
+  the menu.
+- On X11 `WindowSetFullscreen` asks the window manager for full screen
+  (EWMH); before it only stored the flag. A held key no longer counts as
+  repeated presses, because the window asks for detectable autorepeat.
 - `WindowSetPowerPolicy` chooses how the process spends power, also through
   the window service's optional `setPowerPolicy` tail. `WINDOW_POWER_AUTO`,
   the default, is the background efficiency mode described below.
