@@ -5,6 +5,13 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Vulkan without vertical sync showed no more frames than the screen
+  refreshes. On NVIDIA it also kept a CPU core busy waiting for a free
+  swapchain image. Now it presents in `FIFO_LATEST_READY` mode where the
+  device offers it, otherwise in `MAILBOX`, and with one more swapchain image.
+  As with D3D12, the screen shows the latest finished frame at each refresh,
+  up to two frames are rendered per refresh, and the CPU sleeps while it
+  waits.
 - The Vulkan renderer took the last suitable device, not the best. Without a
   discrete GPU it could choose a CPU driver such as lavapipe over the
   integrated GPU. It now ranks devices: discrete GPU first, then integrated,

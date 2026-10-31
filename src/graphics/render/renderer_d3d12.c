@@ -4193,8 +4193,9 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
     // Без vsync окно с flip-моделью показывает на каждом обновлении экрана
-    // последний готовый кадр целиком: FPS не ограничен, а разрывов, которые
-    // при тысячах кадров в секунду режут картинку на полосы, нет.
+    // последний готовый кадр целиком, без разрывов, которые режут картинку на
+    // полосы. Кадров выходит до двух на обновление: из трёх буферов один на
+    // экране, а два других ждут композиции.
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
     HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval, 0);
     if (FAILED(presentResult))
