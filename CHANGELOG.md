@@ -17,6 +17,10 @@ API and ABI may change between minor versions.
 - The APK's activity takes every configuration change itself, the resource
   overlay Android applies right after installation included. Android used to
   restart it then, and `main` was stopped and run again in the same process.
+- On Android a program opened again before its previous activity is
+  destroyed, right after it exits or over a running one, waits for the
+  previous run of `main` to end. Both runs used to share the program's state
+  and output in one process, and destroying the old activity hung the app.
 - The D3D12 and Vulkan renderers accept any number of geometry uploads between
   two frames; past 128 they used to refuse them until the next frame. Bytes
   that miss both staging rings of a frame share overflow blocks freed once the
