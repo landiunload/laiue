@@ -2945,6 +2945,13 @@ static uint32_t DeviceTypeRank(VkPhysicalDeviceType type)
 // Устройство Vulkan 1.2+ лучшего типа, семья которого рисует и, при
 // поверхности, показывает; из равных — первое в порядке загрузчика.
 // VK_NULL_HANDLE — подходящего нет.
+// Отдельный кадр стека: иначе LTO объединяет временные свойства и семьи
+// очередей с остальной инициализацией и превышает лимит no-CRT Windows.
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
 static VkPhysicalDevice ChoosePhysicalDevice(const Renderer *renderer, uint32_t *outFamily,
                                              uint32_t *outTimestampValidBits)
 {
