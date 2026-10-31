@@ -17,6 +17,10 @@ API and ABI may change between minor versions.
 - On X11 `WindowSetFullscreen` asks the window manager for full screen
   (EWMH); before it only stored the flag. A held key no longer counts as
   repeated presses, because the window asks for detectable autorepeat.
+- On X11 moving the window no longer reports a resize, only a new size does.
+  Losing focus with Enter held no longer swallows the next Alt+Enter, and
+  only a `WM_PROTOCOLS` message can close the window. The window asks the
+  server for all its atoms once, in one round trip.
 - `WindowSetPowerPolicy` chooses how the process spends power, also through
   the window service's optional `setPowerPolicy` tail. `WINDOW_POWER_AUTO`,
   the default, is the background efficiency mode described below.

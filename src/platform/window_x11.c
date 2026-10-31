@@ -18,7 +18,10 @@ struct Window
 {
     Display *display;
     X11Window handle;
+    Atom protocolsAtom;
     Atom closeAtom;
+    Atom stateAtom;
+    Atom fullscreenAtom;
     LaiueWindowNativeHandleV1 nativeHandle;
     int32_t clientWidth;
     int32_t clientHeight;
@@ -46,9 +49,15 @@ static void ProcessEvent(Window *window, XEvent *event)
     switch (event->type)
     {
         case ConfigureNotify:
-            window->clientWidth = event->xconfigure.width;
-            window->clientHeight = event->xconfigure.height;
-            window->resizePending = true;
+            /* A move reports the same size again: only a new size is a
+             * resize. */
+            if (event->xconfigure.width != window->clientWidth ||
+                event->xconfigure.height != window->clientHeight)
+            {
+                window->clientWidth = event->xconfigure.width;
+                window->clientHeight = event->xconfigure.height;
+                window->resizePending = true;
+            }
             break;
         case FocusIn:
             window->focused = true;
@@ -57,9 +66,13 @@ static void ProcessEvent(Window *window, XEvent *event)
             if (window->focused)
                 window->focusLossPending = true;
             window->focused = false;
+            /* The release of a held Enter goes to the next window and would
+             * leave the next Alt+Enter ignored. */
+            window->fullscreenKeyHeld = false;
             break;
         case ClientMessage:
-            if ((Atom)event->xclient.data.l[0] == window->closeAtom)
+            if (event->xclient.message_type == window->protocolsAtom &&
+                (Atom)event->xclient.data.l[0] == window->closeAtom)
                 window->closeRequested = true;
             break;
         case KeyPress:
@@ -140,7 +153,18 @@ Window *WindowCreate(const WindowConfiguration *configuration)
     /* A held key repeats KeyPress alone. By default every repeat also sends
      * a KeyRelease, and input would count each one as a new press. */
     (void)XkbSetDetectableAutoRepeat(display, True, NULL);
-    window->closeAtom = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    /* Every atom the window uses, in one round trip to the server. */
+    char protocolsName[] = "WM_PROTOCOLS";
+    char closeName[] = "WM_DELETE_WINDOW";
+    char stateName[] = "_NET_WM_STATE";
+    char fullscreenName[] = "_NET_WM_STATE_FULLSCREEN";
+    char *atomNames[] = {protocolsName, closeName, stateName, fullscreenName};
+    Atom atoms[sizeof(atomNames) / sizeof(atomNames[0])] = {0};
+    (void)XInternAtoms(display, atomNames, (int)(sizeof(atoms) / sizeof(atoms[0])), False, atoms);
+    window->protocolsAtom = atoms[0];
+    window->closeAtom = atoms[1];
+    window->stateAtom = atoms[2];
+    window->fullscreenAtom = atoms[3];
     XSetWMProtocols(display, window->handle, &window->closeAtom, 1);
     char title[LAIUE_PLATFORM_PATH_CAPACITY];
     if (configuration->title == NULL ||
@@ -300,11 +324,10 @@ void WindowSetFullscreen(Window *window, bool enabled)
     memset(&event, 0, sizeof(event));
     event.xclient.type = ClientMessage;
     event.xclient.window = window->handle;
-    event.xclient.message_type = XInternAtom(window->display, "_NET_WM_STATE", False);
+    event.xclient.message_type = window->stateAtom;
     event.xclient.format = 32;
     event.xclient.data.l[0] = enabled ? 1 : 0; /* _NET_WM_STATE_ADD or _REMOVE */
-    event.xclient.data.l[1] =
-        (long)XInternAtom(window->display, "_NET_WM_STATE_FULLSCREEN", False);
+    event.xclient.data.l[1] = (long)window->fullscreenAtom;
     event.xclient.data.l[3] = 1; /* asked by an application */
     XSendEvent(window->display, DefaultRootWindow(window->display), False,
                SubstructureRedirectMask | SubstructureNotifyMask, &event);
