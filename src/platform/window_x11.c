@@ -4,8 +4,10 @@
 
 #define Window X11Window
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 #undef Window
 
 #include <string.h>
@@ -25,6 +27,8 @@ struct Window
     bool mouseLookEnabled;
     bool focused;
     bool fullscreen;
+    /* Enter of Alt+Enter is down: the toggle waits for its release. */
+    bool fullscreenKeyHeld;
     bool closeRequested;
     float wheelSteps;
     /* Typed text until consumed: a ring of code points. */
@@ -76,8 +80,19 @@ static void ProcessEvent(Window *window, XEvent *event)
                     window->textCount++;
                 }
             }
+            /* Alt+Enter switches full screen, as on Windows. */
+            if (symbol == XK_Return && (event->xkey.state & Mod1Mask) != 0 &&
+                !window->fullscreenKeyHeld)
+            {
+                window->fullscreenKeyHeld = true;
+                WindowSetFullscreen(window, !window->fullscreen);
+            }
             break;
         }
+        case KeyRelease:
+            if (XLookupKeysym(&event->xkey, 0) == XK_Return)
+                window->fullscreenKeyHeld = false;
+            break;
         case ButtonPress:
             if (event->xbutton.button == Button4)
                 window->wheelSteps += 1.0f;
@@ -122,6 +137,9 @@ Window *WindowCreate(const WindowConfiguration *configuration)
     XSelectInput(display, window->handle,
                  StructureNotifyMask | FocusChangeMask | KeyPressMask | KeyReleaseMask |
                      ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+    /* A held key repeats KeyPress alone. By default every repeat also sends
+     * a KeyRelease, and input would count each one as a new press. */
+    (void)XkbSetDetectableAutoRepeat(display, True, NULL);
     window->closeAtom = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window->handle, &window->closeAtom, 1);
     char title[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -274,8 +292,24 @@ uint32_t WindowConsumeText(Window *window, uint32_t *codepoints, uint32_t capaci
 
 void WindowSetFullscreen(Window *window, bool enabled)
 {
-    if (window != NULL)
-        window->fullscreen = enabled;
+    if (window == NULL || window->display == NULL || window->fullscreen == enabled)
+        return;
+    /* The window manager stretches the window over its monitor without a
+     * frame and gives the old size back (EWMH _NET_WM_STATE). */
+    XEvent event;
+    memset(&event, 0, sizeof(event));
+    event.xclient.type = ClientMessage;
+    event.xclient.window = window->handle;
+    event.xclient.message_type = XInternAtom(window->display, "_NET_WM_STATE", False);
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = enabled ? 1 : 0; /* _NET_WM_STATE_ADD or _REMOVE */
+    event.xclient.data.l[1] =
+        (long)XInternAtom(window->display, "_NET_WM_STATE_FULLSCREEN", False);
+    event.xclient.data.l[3] = 1; /* asked by an application */
+    XSendEvent(window->display, DefaultRootWindow(window->display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XFlush(window->display);
+    window->fullscreen = enabled;
 }
 
 bool WindowIsFullscreen(const Window *window)
