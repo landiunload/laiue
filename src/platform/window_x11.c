@@ -328,6 +328,23 @@ float WindowGetContentScale(const Window *window)
     return 1.0f;
 }
 
+// Политика энергопотребления процесса, WINDOW_POWER_*. У Linux нет режима
+// эффективности, который процесс включал бы себе сам: политика только
+// хранится.
+static volatile uint32_t powerPolicy = WINDOW_POWER_AUTO;
+
+bool WindowSetPowerPolicy(uint32_t policy)
+{
+    if (policy <= WINDOW_POWER_PERFORMANCE)
+        PlatformAtomicStoreU32Release(&powerPolicy, policy);
+    return false;
+}
+
+uint32_t WindowGetPowerPolicy(void)
+{
+    return PlatformAtomicLoadU32Acquire(&powerPolicy);
+}
+
 void WindowRequestClose(Window *window)
 {
     if (window != NULL)

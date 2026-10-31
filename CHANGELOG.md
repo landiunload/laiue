@@ -5,6 +5,14 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `WindowSetPowerPolicy` chooses how the process spends power, also through
+  the window service's optional `setPowerPolicy` tail. `WINDOW_POWER_AUTO`,
+  the default, is the background efficiency mode described below.
+  `WINDOW_POWER_EFFICIENCY` keeps the process in efficiency mode even while
+  it is active. `WINDOW_POWER_PERFORMANCE` never enters it and asks Windows
+  for high QoS, so the program is not slowed even in the background. Only
+  Windows applies a policy; Linux and Android store it and return false.
+  Unloading the window module returns the process to the default mode.
 - On Windows a program in the background goes into efficiency mode, as with
   the Task Manager switch: its process gets EcoQoS and low base priority, and
   Task Manager shows the green leaf. The window module enters the mode when
