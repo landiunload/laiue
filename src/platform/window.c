@@ -211,6 +211,37 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
+        case WM_SYSKEYDOWN:
+            // Alt+Enter переключает полноэкранный режим, как принято в
+            // Windows, одинаково для любой графики; автоповтор удерживаемой
+            // клавиши его не повторяет.
+            if (window != NULL && wParam == VK_RETURN && (HIWORD(lParam) & KF_ALTDOWN) != 0
+                && (HIWORD(lParam) & KF_REPEAT) == 0)
+            {
+                WindowSetFullscreen(window, !window->fullscreen);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_SYSCHAR:
+            // Enter с Alt уже обработан: DefWindowProc искал бы его среди
+            // пунктов меню и подавал звуковой сигнал.
+            if (wParam == VK_RETURN)
+            {
+                return 0;
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_SYSCOMMAND:
+            // Alt или F10 без другой клавиши включают режим меню, и его
+            // модальный цикл внутри DefWindowProc останавливает кадры до
+            // следующего нажатия. Alt+Space по-прежнему открывает системное
+            // меню: у него lParam — код пробела.
+            if ((wParam & 0xFFF0u) == SC_KEYMENU && lParam == 0)
+            {
+                return 0;
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
         case WM_DESTROY:
             // WM_QUIT не постится: цикл каждого окна следит только
             // за своим окном, уничтожение одного не завершает остальные.

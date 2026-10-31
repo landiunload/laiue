@@ -2250,6 +2250,13 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         RendererDestroy_D3D12(renderer);
         return NULL;
     }
+    // Полноэкранный режим переключает окно (Alt+Enter в модуле окна), без
+    // рамки и одинаково для D3D12 и Vulkan. Свой Alt+Enter DXGI включал бы
+    // эксклюзивный режим, а в нём Present с DXGI_PRESENT_ALLOW_TEARING
+    // отказывает: без vsync программа переставала рисовать. Окно, с которым
+    // swapchain только что создан, вызов принимает всегда.
+    (void)IDXGIFactory4_MakeWindowAssociation(renderer->factory, (HWND)windowHandle,
+        DXGI_MWA_NO_ALT_ENTER);
 
     renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
 
