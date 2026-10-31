@@ -17,6 +17,10 @@ permissions:
 # Версии тулчейнов, общие для нескольких jobs.
 env:
   LLVM_VERSION: '22'
+  # LLVM на Windows-раннере старше LLVM_VERSION; clang-tidy того же мажора
+  # берётся из официального установщика.
+  LLVM_WINDOWS_RELEASE: 22.1.8
+  LLVM_WINDOWS_SHA256: 16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c
   ANDROID_NDK_VERSION: 30.0.16248370
   # DXC собирает встроенные шейдеры; checked-in байткод обязан совпадать
   # с выводом именно этого релиза.
@@ -77,6 +81,7 @@ jobs:
           cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
           -DLAIUE_REQUIRE_D3D12_TEST_DRIVER=ON
           "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -134,6 +139,31 @@ jobs:
           name: laiue-engine-windows-x86_64
           path: build/windows-msvc/bundles/engine/Release
           if-no-files-found: error
+      # Linux- и Android-анализ не видят код только для Windows (D3D12,
+      # WASAPI, Win32); база clang-cl этой сборки проверяет его тем же
+      # .clang-tidy. run-clang-tidy на Windows сравнивает фильтр с путями
+      # через обратную косую черту.
+      - name: Run clang-tidy on the Windows sources
+        if: matrix.preset == 'windows-clang'
+        shell: pwsh
+        run: |
+          if (-not $env:LLVM_WINDOWS_RELEASE.StartsWith("$env:LLVM_VERSION.")) {
+            throw 'LLVM_WINDOWS_RELEASE must belong to LLVM_VERSION'
+          }
+          $installer = Join-Path $env:RUNNER_TEMP 'llvm.exe'
+          curl.exe --fail --location --retry 3 --retry-all-errors --output $installer `
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_WINDOWS_RELEASE/LLVM-$env:LLVM_WINDOWS_RELEASE-win64.exe"
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $env:LLVM_WINDOWS_SHA256) {
+            throw 'LLVM installer checksum mismatch'
+          }
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm'
+          7z x $installer "-o$llvm" 'bin\clang-tidy.exe' 'bin\run-clang-tidy' `
+            "lib\clang\$env:LLVM_VERSION\include" -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed with exit code $LASTEXITCODE" }
+          $source = [regex]::Escape((Join-Path $env:GITHUB_WORKSPACE 'src\'))
+          python (Join-Path $llvm 'bin\run-clang-tidy') `
+            -clang-tidy-binary (Join-Path $llvm 'bin\clang-tidy.exe') `
+            -p build/windows-clang -quiet -j $env:NUMBER_OF_PROCESSORS "^$source.*[.]c$"
       - name: Verify build did not modify sources
         run: >
           cmake "-DSOURCE_ROOT=$env:GITHUB_WORKSPACE"
@@ -801,7 +831,7 @@ jobs:
             libvulkan-dev libx11-dev
       # Профиль Vulkan/X11 компилирует больше всего Linux-исходников. Код
       # Android и ветки ARM64 проверяет job Android ARM64, а код только для
-      # Windows — тот же .clang-tidy локально в дереве clang-cl.
+      # Windows — job windows-engine по базе clang-cl.
       - name: Configure with a compile database
         run: >
           cmake --preset linux-vulkan-offscreen -B build/tidy
