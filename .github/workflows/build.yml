@@ -504,8 +504,16 @@ jobs:
       # на настольных системах.
       - name: Compile and link Android programs on modules by name
         run: |
-          cmake --preset android-arm64-shared
+          cmake --preset android-arm64-shared -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           cmake --build --preset android-arm64-shared-release --parallel
+      # Linux-анализ не видит код под __ANDROID__ и ветки ARM64; база этой
+      # сборки проверяет их тем же .clang-tidy.
+      - name: Run clang-tidy on the Android sources
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "clang-tidy-$LLVM_VERSION"
+          run-clang-tidy-"$LLVM_VERSION" -p build/android-arm64-shared -quiet -j "$(nproc)" \
+            "$GITHUB_WORKSPACE/src/.*[.]c$"
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
@@ -791,8 +799,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "clang-$LLVM_VERSION" "clang-tidy-$LLVM_VERSION" \
             libvulkan-dev libx11-dev
-      # Профиль Vulkan/X11 компилирует больше всего Linux-исходников; код
-      # только для Windows проверяется тем же .clang-tidy в дереве clang-cl.
+      # Профиль Vulkan/X11 компилирует больше всего Linux-исходников. Код
+      # Android и ветки ARM64 проверяет job Android ARM64, а код только для
+      # Windows — тот же .clang-tidy локально в дереве clang-cl.
       - name: Configure with a compile database
         run: >
           cmake --preset linux-vulkan-offscreen -B build/tidy

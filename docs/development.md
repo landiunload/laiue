@@ -77,6 +77,11 @@ cmake --build build/tidy --config Debug --parallel
 run-clang-tidy -p build/tidy -quiet "$PWD/src/.*[.]c$"
 ```
 
+Код под `__ANDROID__` и ветки ARM64 CI проверяет так же по базе
+`android-arm64-shared` (preset с `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` и NDK из
+`ANDROID_NDK_HOME`). Код только для Windows проверяют локально по базе preset
+`windows-clang`.
+
 Находку исправляют, а не подавляют. Отключённые проверки и причины
 перечислены в `.clang-tidy`; точечный `NOLINT` допустим только с пояснением.
 
