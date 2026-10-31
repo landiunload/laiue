@@ -287,6 +287,75 @@ LAIUE_TEST_ENTRY(GraphicsDiagnosticsTestEntryPoint)
                capture.width == FRAME_WIDTH / 2u && capture.height == FRAME_HEIGHT / 2u &&
                capture.writtenBytes == FRAME_BYTES / 4u && capture.frameIndex == 3u,
            "capture after resize reports actual target dimensions");
+
+    // A destroyed resource that is still in use lives until it is free: a
+    // texture and a sampler destroyed during a frame until the frame ends, a
+    // shader until its last pipeline goes. Both destroys used to be dropped,
+    // keeping the resource until the device was destroyed.
+    const LaiueGraphicsTextureDescV1 textureDescription = {
+        .structSize = sizeof(textureDescription),
+        .extent = {4u, 4u, 1u},
+        .mipLevels = 1u,
+    };
+    const LaiueGraphicsSamplerDescV1 samplerDescription = {
+        .structSize = sizeof(samplerDescription),
+        .minFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
+        .magFilter = LAIUE_GRAPHICS_FILTER_LINEAR,
+        .addressModeU = LAIUE_GRAPHICS_ADDRESS_CLAMP,
+        .addressModeV = LAIUE_GRAPHICS_ADDRESS_CLAMP,
+        .addressModeW = LAIUE_GRAPHICS_ADDRESS_CLAMP,
+    };
+    static const uint8_t texels[4u * 4u * 4u] = {0};
+    LaiueGraphicsHandle texture = 0u;
+    LaiueGraphicsHandle sampler = 0u;
+    Expect(device->createTexture(device, &textureDescription, &texture) != 0u &&
+               device->createSampler(device, &samplerDescription, &sampler) != 0u,
+           "texture and sampler create");
+    const LaiueGraphicsTextureUploadV1 texelUpload = {
+        .structSize = sizeof(texelUpload),
+        .texture = texture,
+        .data = texels,
+        .sizeBytes = sizeof(texels),
+    };
+    Expect(device->uploadTexture(device, &texelUpload) != 0u &&
+               device->beginFrame(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u) != 0u,
+           "texture uploads and a frame begins");
+    device->destroyHandle(device, texture);
+    device->destroyHandle(device, sampler);
+    item.texture = texture;
+    item.sampler = sampler;
+    Expect(device->submit(device, &item, 1u) != 0u &&
+               device->getDiagnostics(device, &diagnostics) != 0u &&
+               diagnostics.resourceHandleCount == 3u,
+           "a texture and a sampler destroyed during a frame serve it to its end");
+    Expect(device->endFrame(device) != 0u && device->getDiagnostics(device, &diagnostics) != 0u &&
+               diagnostics.resourceHandleCount == 1u,
+           "the texture and the sampler are released when the frame ends");
+    item.texture = 0u;
+    item.sampler = 0u;
+
+    LaiueGraphicsHandle heldShader = 0u;
+    Expect(device->createShader(device, &shaderDescription, &heldShader) != 0u,
+           "a shader for a pipeline creates");
+    const LaiueGraphicsPipelineDescV1 pipelineDescription = {
+        .structSize = sizeof(pipelineDescription),
+        .topology = LAIUE_GRAPHICS_TOPOLOGY_TRIANGLES,
+        .vertexStride = sizeof(LaiueGraphicsVertexV2),
+        .vertexShader = heldShader,
+    };
+    LaiueGraphicsHandle pipeline = 0u;
+    Expect(device->createPipeline(device, &pipelineDescription, &pipeline) != 0u,
+           "a pipeline holds the shader");
+    device->destroyHandle(device, heldShader);
+    Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
+               diagnostics.resourceHandleCount == 3u,
+           "a destroyed shader stays while a pipeline uses it");
+    device->destroyHandle(device, pipeline);
+    Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
+               diagnostics.resourceHandleCount == 1u &&
+               diagnostics.cpuShadowBytes == sizeof(vertices),
+           "the shader is released with its last pipeline");
+
     device->destroyHandle(device, buffer);
     Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
                diagnostics.resourceHandleCount == 0u && diagnostics.cpuShadowBytes == 0u,
