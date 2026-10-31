@@ -29,7 +29,15 @@ struct Window
     LONG windowedStyle;                  // стиль окна до фуллскрина
     RawInputCallback rawInputCallback;
     void* rawInputUserData;
+    // Кадр программы, пока идёт WindowRunLoop: модальные циклы Windows
+    // вызывают его по таймеру.
+    FrameCallback frameCallback;
+    void* frameUserData;
+    bool frameRunning;
+    uint32_t modalDepth;                 // вложенность модальных циклов
 };
+
+#define WINDOW_MODAL_FRAME_TIMER 1u
 
 // Политика энергопотребления процесса (WINDOW_POWER_*) и окна модуля, ещё не
 // получившие WM_DESTROY: без окон программе нечему быть в фоне. Политику
@@ -101,6 +109,50 @@ static void UpdateMouseLookState(Window* window)
     {
         while (ShowCursor(TRUE) < 0) {}
         ClipCursor(NULL);
+    }
+}
+
+// Кадр программы; поверх незаконченного кадра новый не начинается.
+static void RunFrame(Window* window)
+{
+    if (window->frameCallback == NULL || window->frameRunning)
+    {
+        return;
+    }
+    window->frameRunning = true;
+    window->frameCallback(window->frameUserData);
+    window->frameRunning = false;
+}
+
+// Пока кнопка мыши держит заголовок, рамку или кнопку заголовка окна или
+// открыто меню окна, Windows крутит свой цикл сообщений внутри
+// DefWindowProc, и WindowRunLoop не получает управления. Кадры в это время
+// идут по таймеру. Мышь и клавиатура принадлежат системе: ввод программы
+// сбрасывается, как при потере фокуса, и raw input ей не передаётся, иначе
+// нажатие на заголовок стало бы щелчком в программе.
+static void EnterModalLoop(Window* window, HWND handle)
+{
+    window->modalDepth++;
+    if (window->modalDepth == 1u)
+    {
+        window->focusLossPending = true;
+        if (window->frameCallback != NULL)
+        {
+            SetTimer(handle, WINDOW_MODAL_FRAME_TIMER, USER_TIMER_MINIMUM, NULL);
+        }
+    }
+}
+
+static void LeaveModalLoop(Window* window, HWND handle)
+{
+    if (window->modalDepth == 0u)
+    {
+        return;
+    }
+    window->modalDepth--;
+    if (window->modalDepth == 0u)
+    {
+        KillTimer(handle, WINDOW_MODAL_FRAME_TIMER);
     }
 }
 
@@ -182,7 +234,7 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             return 0;
 
         case WM_INPUT:
-            if (window != NULL && window->rawInputCallback != NULL)
+            if (window != NULL && window->rawInputCallback != NULL && window->modalDepth == 0u)
             {
                 window->rawInputCallback(window->rawInputUserData, (void*)lParam);
             }
@@ -219,6 +271,45 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
                 && (HIWORD(lParam) & KF_REPEAT) == 0)
             {
                 WindowSetFullscreen(window, !window->fullscreen);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_NCLBUTTONDOWN:
+        {
+            // Заголовок, рамка и кнопки заголовка ведут мышь в своём цикле:
+            // DefWindowProc возвращается, когда кнопку отпустят.
+            if (window == NULL)
+            {
+                return DefWindowProcW(handle, message, wParam, lParam);
+            }
+            EnterModalLoop(window, handle);
+            const LRESULT result = DefWindowProcW(handle, message, wParam, lParam);
+            LeaveModalLoop(window, handle);
+            return result;
+        }
+
+        case WM_ENTERSIZEMOVE:
+        case WM_ENTERMENULOOP:
+            // Перемещение и размер с клавиатуры, меню окна.
+            if (window != NULL)
+            {
+                EnterModalLoop(window, handle);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_EXITSIZEMOVE:
+        case WM_EXITMENULOOP:
+            if (window != NULL)
+            {
+                LeaveModalLoop(window, handle);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_TIMER:
+            if (window != NULL && wParam == WINDOW_MODAL_FRAME_TIMER)
+            {
+                RunFrame(window);
+                return 0;
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
@@ -401,29 +492,27 @@ bool WindowConsumeFocusLoss(Window* window)
     return false;
 }
 
+// Разбирает очередь сообщений; false — окно уничтожено.
+static bool PumpMessages(Window* window)
+{
+    MSG message;
+    // WM_DESTROY этого окна мог прийти во время DispatchMessage.
+    while (window->handle != NULL && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    return window->handle != NULL;
+}
+
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 {
-    while (window->handle != NULL)
+    window->frameCallback = onFrame;
+    window->frameUserData = userData;
+    while (PumpMessages(window))
     {
-        MSG message;
-        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
-        {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-
-            // WM_DESTROY этого окна мог прийти во время DispatchMessage.
-            if (window->handle == NULL)
-            {
-                return;
-            }
-        }
-
         UpdateMouseLookState(window);
-
-        if (onFrame != NULL)
-        {
-            onFrame(userData);
-        }
+        RunFrame(window);
 
         // В фокусе ожидание кадра при необходимости происходит в Present:
         // дополнительный сон мешал бы vsync и ограничивал режим без него.
@@ -433,6 +522,8 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
             MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
         }
     }
+    window->frameCallback = NULL;
+    window->frameUserData = NULL;
 }
 
 void WindowSetMouseLook(Window* window, bool enabled)
