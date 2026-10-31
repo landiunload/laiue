@@ -5,6 +5,23 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Windows frames go on while the window is dragged or resized, while a
+  mouse button holds the caption or a caption button and while the window
+  menu is open. `DefWindowProc` runs its own message loop until the button
+  is released, and `WindowRunLoop` stood still.
+  - Moving, sizing and the menu now run frames from a timer. `WM_TIMER`
+    comes only when the queue is empty, so the loop keeps the mouse.
+  - A held caption button and a press on the caption before the first mouse
+    move use a small frame clock thread instead. No timer gets through
+    there: those waits take only mouse messages, or none. The thread wakes
+    the window procedure for each frame with `SendNotifyMessage`. After
+    each frame it pauses for a millisecond: Windows hands the window
+    thread sent messages before input, and without the pause the loop
+    would not get the mouse while it moves.
+  - Input is reset when the system takes the mouse, as on focus loss. Raw
+    input reaches the program again only when the system gives the mouse
+    back, so a press on the caption no longer becomes a click in the
+    program.
 - Alt+Enter switches borderless full screen in the window module, on
   Windows and X11, with any graphics backend. Before, only D3D12 reacted,
   through DXGI's own handler, and it entered exclusive full screen. There a

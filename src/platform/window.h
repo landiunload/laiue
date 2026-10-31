@@ -42,7 +42,14 @@ LAIUE_WINDOW_API void*   WindowGetNativeHandle(const Window* window);
 LAIUE_WINDOW_API void    WindowSetRawInputCallback(Window* window, RawInputCallback callback, void* userData);
 LAIUE_WINDOW_API void    WindowGetClientSize(const Window* window, int32_t* width, int32_t* height);
 LAIUE_WINDOW_API bool    WindowConsumeResize(Window* window);
+// true один раз после того, как окно лишилось ввода: ушло из фокуса или
+// отдало мышь и клавиатуру системе (на Windows — пока окно перетаскивают,
+// меняют его размер или открыто его меню). Отпускания клавиш за это время
+// не приходят, поэтому потребитель сбрасывает состояние ввода.
 LAIUE_WINDOW_API bool    WindowConsumeFocusLoss(Window* window);
+// Вызывает onFrame, пока окно не закроют. На Windows кадры идут и пока окно
+// перетаскивают или меняют его размер: тогда onFrame вызывается из оконной
+// процедуры по таймеру.
 LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
 LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
