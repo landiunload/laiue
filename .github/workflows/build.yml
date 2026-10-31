@@ -252,7 +252,7 @@ jobs:
         if: matrix.preset == 'linux-gcc'
         run: >
           cmake --build --preset linux-gcc-debug --parallel
-          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark laiue_animation_benchmark
+          --target laiue_benchmarks
       - name: Test Debug
         run: ctest --preset ${{ matrix.preset }}-debug --parallel --no-tests=error
       - name: Build Release
@@ -262,7 +262,7 @@ jobs:
         if: matrix.preset == 'linux-gcc'
         run: >
           cmake --build --preset linux-gcc-release --parallel
-          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark laiue_animation_benchmark
+          --target laiue_benchmarks
       - name: Test Release
         if: matrix.preset != 'linux-gcc-asan'
         run: ctest --preset ${{ matrix.preset }}-release --parallel --no-tests=error
