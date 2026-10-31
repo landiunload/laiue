@@ -464,6 +464,9 @@ endif()
 if(TARGET laiue_ui)
     laiue_add_harness(laiue_ui_test UiTestEntryPoint ui_test.c LIBRARIES laiue_ui
         TEST laiue.ui.draw_list)
+    laiue_add_harness(laiue_truetype_reader_test TrueTypeReaderTestEntryPoint
+        truetype_reader_test.c truetype_fixture.h LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_reader)
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно
