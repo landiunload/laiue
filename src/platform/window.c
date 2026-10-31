@@ -42,7 +42,7 @@ struct Window
     HANDLE frameDone;                    // кадр модального цикла закончен
     HWND frameClockTarget;
     volatile LONG frameClockStop;
-    volatile LONG frameTickPending;      // сообщение кадра ещё не разобрано
+    volatile LONG frameTickPending;      // кадр прислан и ещё не закончен
 };
 
 #define WINDOW_FRAME_MESSAGE (WM_APP + 1u)
@@ -441,13 +441,21 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
 
         case WINDOW_FRAME_MESSAGE:
             // Кадр от часов кадров. Опоздавшее после конца цикла сообщение
-            // кадра не запускает: кадры снова ведёт WindowRunLoop.
+            // кадра не запускает: кадры снова ведёт WindowRunLoop. Отметка
+            // снимается только после кадра: иначе часы, не дождавшись
+            // долгого кадра, прислали бы следующий во время него, Windows
+            // разбирала бы кадр за кадром, и цикл заголовка не получал бы
+            // мышь совсем.
             if (window != NULL)
             {
-                InterlockedExchange(&window->frameTickPending, 0);
-                if (window->modalDepth != 0u && !window->frameRunning)
+                const bool frame = window->modalDepth != 0u && !window->frameRunning;
+                if (frame)
                 {
                     RunFrame(window);
+                }
+                InterlockedExchange(&window->frameTickPending, 0);
+                if (frame)
+                {
                     SetEvent(window->frameDone);
                 }
             }
