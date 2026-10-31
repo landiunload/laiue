@@ -350,6 +350,8 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     int32_t                    resizeHeight;
     bool                       resizeRequested;
     bool                       verticalSyncEnabled;
+    // Swapchain создан с DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.
+    bool                       tearingSupported;
     bool                       wireframeEnabled;
     bool                       worldReady;
     bool                       frameRecording;
@@ -2221,6 +2223,17 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDescription.SampleDesc.Count = 1;
+    // Разрывы разрешаются, если система их поддерживает (Windows 10 1607 и
+    // новее): тогда без vsync Present не ждёт композиции.
+    IDXGIFactory5* factory5 = NULL;
+    if (SUCCEEDED(IDXGIFactory4_QueryInterface(renderer->factory, &IID_IDXGIFactory5, (void**)&factory5)))
+    {
+        BOOL allowTearing = FALSE;
+        renderer->tearingSupported = SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(factory5,
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))) && allowTearing;
+        IDXGIFactory5_Release(factory5);
+    }
+    swapChainDescription.Flags = renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     IDXGISwapChain1* swapChain1 = NULL;
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
@@ -2237,6 +2250,13 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         RendererDestroy_D3D12(renderer);
         return NULL;
     }
+    // Полноэкранный режим переключает окно (Alt+Enter в модуле окна), без
+    // рамки и одинаково для D3D12 и Vulkan. Свой Alt+Enter DXGI включал бы
+    // эксклюзивный режим, а в нём Present с DXGI_PRESENT_ALLOW_TEARING
+    // отказывает: без vsync программа переставала рисовать. Окно, с которым
+    // swapchain только что создан, вызов принимает всегда.
+    (void)IDXGIFactory4_MakeWindowAssociation(renderer->factory, (HWND)windowHandle,
+        DXGI_MWA_NO_ALT_ENTER);
 
     renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
 
@@ -3670,8 +3690,10 @@ static bool ApplyPendingResize(Renderer* renderer)
         }
     }
 
+    // Флаги swapchain при пересоздании буферов должны остаться прежними.
     if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, 0)))
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0)))
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
@@ -4192,12 +4214,15 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
-    // Без vsync окно с flip-моделью показывает на каждом обновлении экрана
-    // последний готовый кадр целиком, без разрывов, которые режут картинку на
-    // полосы. Кадров выходит до двух на обновление: из трёх буферов один на
-    // экране, а два других ждут композиции.
+    // Без vsync и с разрешёнными разрывами Present не ждёт ни обновления
+    // экрана, ни композиции: число кадров не ограничено, а окно во весь экран
+    // может показать разрыв. Без разрешения flip-модель показывает последний
+    // готовый кадр целиком, и кадров выходит до двух на обновление: из трёх
+    // буферов один на экране, а два других ждут композиции.
+    const bool tearing = !renderer->verticalSyncEnabled && renderer->tearingSupported;
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
-    HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval, 0);
+    HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval,
+        tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (FAILED(presentResult))
     {
         // ExecuteCommandLists already submitted work. Complete its fence even

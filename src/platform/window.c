@@ -31,6 +31,37 @@ struct Window
     void* rawInputUserData;
 };
 
+// Политика энергопотребления процесса (WINDOW_POWER_*) и окна модуля, ещё не
+// получившие WM_DESTROY: без окон программе нечему быть в фоне. Политику
+// применяют под замком, чтобы WM_ACTIVATEAPP и смена политики из другого
+// потока не оставили процесс в режиме прежней.
+static SRWLOCK g_powerLock = SRWLOCK_INIT;
+static uint32_t g_powerPolicy = WINDOW_POWER_AUTO;
+static uint32_t g_windowCount;
+
+static bool ProcessIsForeground(void)
+{
+    DWORD processId = 0;
+    const HWND foreground = GetForegroundWindow();
+    return foreground != NULL && GetWindowThreadProcessId(foreground, &processId) != 0
+        && processId == GetCurrentProcessId();
+}
+
+// Вызывается под g_powerLock.
+static bool ApplyPowerPolicyLocked(bool foreground)
+{
+    PlatformPowerMode mode = PLATFORM_POWER_DEFAULT;
+    if (g_powerPolicy == WINDOW_POWER_PERFORMANCE)
+    {
+        mode = PLATFORM_POWER_PERFORMANCE;
+    }
+    else if (g_powerPolicy == WINDOW_POWER_EFFICIENCY || (g_windowCount != 0u && !foreground))
+    {
+        mode = PLATFORM_POWER_EFFICIENCY;
+    }
+    return PlatformPowerModeSet(mode);
+}
+
 // Ограничивает курсор клиентской областью окна (в экранных координатах).
 static void ApplyCursorClip(const Window* window)
 {
@@ -158,10 +189,12 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_ACTIVATEAPP:
-            // Программа ушла в фон: процесс переходит в режим эффективности,
-            // как по переключателю диспетчера задач, и выходит из него
-            // вместе с возвращением фокуса.
-            PlatformEfficiencyModeSet(wParam == FALSE);
+            // Программа ушла в фон или вернулась: при WINDOW_POWER_AUTO
+            // процесс входит в режим эффективности, как по переключателю
+            // диспетчера задач, и выходит из него вместе с фокусом.
+            AcquireSRWLockExclusive(&g_powerLock);
+            ApplyPowerPolicyLocked(wParam != FALSE);
+            ReleaseSRWLockExclusive(&g_powerLock);
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_ACTIVATE:
@@ -178,16 +211,52 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
+        case WM_SYSKEYDOWN:
+            // Alt+Enter переключает полноэкранный режим, как принято в
+            // Windows, одинаково для любой графики; автоповтор удерживаемой
+            // клавиши его не повторяет.
+            if (window != NULL && wParam == VK_RETURN && (HIWORD(lParam) & KF_ALTDOWN) != 0
+                && (HIWORD(lParam) & KF_REPEAT) == 0)
+            {
+                WindowSetFullscreen(window, !window->fullscreen);
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_SYSCHAR:
+            // Enter с Alt уже обработан: DefWindowProc искал бы его среди
+            // пунктов меню и подавал звуковой сигнал.
+            if (wParam == VK_RETURN)
+            {
+                return 0;
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
+        case WM_SYSCOMMAND:
+            // Alt или F10 без другой клавиши включают режим меню, и его
+            // модальный цикл внутри DefWindowProc останавливает кадры до
+            // следующего нажатия. Alt+Space по-прежнему открывает системное
+            // меню: у него lParam — код пробела.
+            if ((wParam & 0xFFF0u) == SC_KEYMENU && lParam == 0)
+            {
+                return 0;
+            }
+            return DefWindowProcW(handle, message, wParam, lParam);
+
         case WM_DESTROY:
             // WM_QUIT не постится: цикл каждого окна следит только
             // за своим окном, уничтожение одного не завершает остальные.
-            if (window != NULL)
+            // handle == NULL: CreateWindowExW ещё не вернулся и окно не
+            // было посчитано.
+            if (window != NULL && window->handle != NULL)
             {
                 window->handle = NULL;
+                // Без окон процесс, который продолжит работу, получает
+                // обратно прежние QoS и приоритет.
+                AcquireSRWLockExclusive(&g_powerLock);
+                --g_windowCount;
+                ApplyPowerPolicyLocked(ProcessIsForeground());
+                ReleaseSRWLockExclusive(&g_powerLock);
             }
-            // Без окна нечему уходить в фон: процесс, который продолжит
-            // работу, получает обратно прежний приоритет.
-            PlatformEfficiencyModeSet(false);
             return 0;
 
         default:
@@ -256,8 +325,18 @@ Window* WindowCreate(const WindowConfiguration* configuration)
         return NULL;
     }
 
+    AcquireSRWLockExclusive(&g_powerLock);
+    ++g_windowCount;
+    ReleaseSRWLockExclusive(&g_powerLock);
+
     ShowWindow(window->handle, SW_SHOWDEFAULT);
     UpdateWindow(window->handle);
+
+    // Окно, показанное без фокуса, не получит WM_ACTIVATEAPP, пока его не
+    // выберут: политику применяет само создание.
+    AcquireSRWLockExclusive(&g_powerLock);
+    ApplyPowerPolicyLocked(ProcessIsForeground());
+    ReleaseSRWLockExclusive(&g_powerLock);
 
     return window;
 }
@@ -474,4 +553,26 @@ float WindowGetContentScale(const Window *window)
 void WindowRequestClose(Window* window)
 {
     PostMessageW(window->handle, WM_CLOSE, 0, 0);
+}
+
+bool WindowSetPowerPolicy(uint32_t policy)
+{
+    if (policy > WINDOW_POWER_PERFORMANCE)
+    {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&g_powerLock);
+    g_powerPolicy = policy;
+    const bool applied = ApplyPowerPolicyLocked(ProcessIsForeground());
+    ReleaseSRWLockExclusive(&g_powerLock);
+    return applied;
+}
+
+uint32_t WindowGetPowerPolicy(void)
+{
+    AcquireSRWLockShared(&g_powerLock);
+    const uint32_t policy = g_powerPolicy;
+    ReleaseSRWLockShared(&g_powerLock);
+    return policy;
 }

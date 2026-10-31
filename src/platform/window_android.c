@@ -506,6 +506,23 @@ float WindowGetContentScale(const Window *window)
     return (float)density / (float)ACONFIGURATION_DENSITY_MEDIUM;
 }
 
+// Политика энергопотребления процесса, WINDOW_POWER_*. Фоновую программу
+// Android ограничивает сам, а режима, который приложение включало бы себе,
+// нет: политика только хранится.
+static volatile uint32_t powerPolicy = WINDOW_POWER_AUTO;
+
+bool WindowSetPowerPolicy(uint32_t policy)
+{
+    if (policy <= WINDOW_POWER_PERFORMANCE)
+        PlatformAtomicStoreU32Release(&powerPolicy, policy);
+    return false;
+}
+
+uint32_t WindowGetPowerPolicy(void)
+{
+    return PlatformAtomicLoadU32Acquire(&powerPolicy);
+}
+
 /* ---- Точка входа -------------------------------------------------------------------- */
 
 // Пакет из внутреннего каталога «/data/user/0/<пакет>/files»: им

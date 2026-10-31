@@ -29,6 +29,8 @@ static const LaiueWindowServiceV1 service = {
     .consumeText = WindowConsumeText,
     .setSurfaceCallback = WindowSetSurfaceCallback,
     .getContentScale = WindowGetContentScale,
+    .setPowerPolicy = WindowSetPowerPolicy,
+    .getPowerPolicy = WindowGetPowerPolicy,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)
@@ -72,6 +74,9 @@ static void ModuleStop(void *context)
 
 static void ModuleDestroy(void *context)
 {
+    // Режим процесса не переживает модуль: новая его копия не знает, какой
+    // класс приоритета вернуть.
+    (void)WindowSetPowerPolicy(WINDOW_POWER_AUTO);
     LaiueWindowModuleState *state = (LaiueWindowModuleState *)context;
     if (state != NULL)
     {
