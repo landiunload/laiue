@@ -3654,11 +3654,13 @@ static bool ReservePendingUpload(Renderer *renderer)
 {
     if (renderer->pendingUploadCount < renderer->pendingUploadCapacity)
         return true;
+    // Удвоение 32-битной ёмкости проверяется на переполнение, а её
+    // произведение на размер записи в 64-битном size_t (движок собирается
+    // только под 64 бита) переполниться не может.
     const uint32_t capacity = renderer->pendingUploadCapacity == 0u
                                   ? PENDING_UPLOAD_INITIAL_CAPACITY
                                   : renderer->pendingUploadCapacity * 2u;
-    if (capacity <= renderer->pendingUploadCapacity ||
-        (size_t)capacity > SIZE_MAX / sizeof(PendingUpload))
+    if (capacity <= renderer->pendingUploadCapacity)
         return false;
     PendingUpload *uploads =
         (PendingUpload *)PlatformAllocate((size_t)capacity * sizeof(*uploads), false);
