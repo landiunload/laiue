@@ -700,7 +700,42 @@ jobs:
             fi
             sleep 2
           done
+          # Сразу после выхода программу открывают снова: Android оставляет
+          # процесс, и main работает в нём второй раз. Пока старая
+          # активность закрывается, новая создаётся рядом с ней, и движок
+          # должен дождаться конца первого запуска, а не смешать их.
+          deadline=$((SECONDS + 30))
+          until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
+              && grep -Fq 'its activity is closing' "$log"; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          first_process="$(timeout 10s "$adb" -s emulator-5554 shell pidof dev.laiue.viewer | tr -d '\r')"
+          timeout 30s "$adb" -s emulator-5554 shell am start -W \
+            -n dev.laiue.viewer/android.app.NativeActivity --es args --smoke
+          deadline=$((SECONDS + 90))
+          until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
+              && [ "$(grep -Fc 'viewer: the picture is on screen' "$log")" -ge 2 ]; do
+            if [ "$SECONDS" -ge "$deadline" ] || grep -Fq 'main returned' "$log"; then
+              cat "$log"
+              timeout 10s "$adb" -s emulator-5554 logcat -d -b crash || true
+              exit 1
+            fi
+            sleep 2
+          done
           cat "$log"
+          if grep -Fq 'waiting for the previous run' "$log"; then
+            echo "the second activity appeared before the first one closed and waited for it"
+          fi
+          second_process="$(timeout 10s "$adb" -s emulator-5554 shell pidof dev.laiue.viewer | tr -d '\r')"
+          if [ -z "$first_process" ] || [ "$first_process" != "$second_process" ]; then
+            echo "the second run did not reuse process '$first_process' (now '$second_process')"
+            timeout 10s "$adb" -s emulator-5554 logcat -d -b crash || true
+            exit 1
+          fi
       - name: Stop the owned emulator process group
         if: always()
         timeout-minutes: 1

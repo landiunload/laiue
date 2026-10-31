@@ -714,7 +714,11 @@ void android_main(struct android_app *app)
     // Активность закрывается вместе с программой, и glue требует
     // дождаться её разрушения.
     if (app->destroyRequested == 0)
+    {
         ANativeActivity_finish(app->activity);
+        __android_log_write(ANDROID_LOG_INFO, androidLogTag,
+                            "the program has ended and its activity is closing");
+    }
     while (app->destroyRequested == 0)
         PumpEvents(app, -1);
     app->userData = NULL;
