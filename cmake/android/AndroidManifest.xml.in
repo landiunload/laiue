@@ -6,10 +6,16 @@
     <application android:label="@LAIUE_APK_LABEL@" android:hasCode="false"
         android:extractNativeLibs="false"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <!-- Программа рисует всё сама и ресурсами Android не пользуется,
+             поэтому активность, а с ней и main, не должна перезапускаться ни
+             от поворота экрана, ни от клавиатуры или SIM-карты, ни от
+             оверлея, который Android ставит сразу после установки APK. Новым
+             системам это говорит resourcesUnused, старые смотрят на
+             остальные флаги. -->
         <activity android:name="android.app.NativeActivity"
             android:label="@LAIUE_APK_LABEL@"
             android:screenOrientation="@LAIUE_APK_ORIENTATION@"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode|grammaticalGender|fontWeightAdjustment|assetsPaths|resourcesUnused"
             android:resizeableActivity="true"
             android:exported="true">
             <meta-data android:name="android.app.lib_name"
