@@ -363,6 +363,14 @@ LAIUE_RENDER_API void RendererDrawGenericMeshRangeBound(Renderer *renderer,
     const RendererTexture *texture, const RendererSampler *sampler);
 
 LAIUE_RENDER_API void RendererResize(Renderer* renderer, int32_t width, int32_t height);
+// Новая поверхность окна вместо прежней без пересоздания устройства и
+// ресурсов: на Android активность отдаёт поверхность на паузе и получает
+// новую при возвращении. NULL отдаёт текущую; до новой кадры пропускаются.
+// false — бэкенд не меняет поверхностей (D3D12, offscreen; ничего не
+// тронуто) или новая поверхность не годится (прежней уже нет, ресурсы
+// целы, кадры пропускаются).
+LAIUE_RENDER_API bool RendererReplaceSurface(Renderer *renderer, void *windowHandle, int32_t width,
+                                             int32_t height);
 
 // Explicit-catalog variant keeps content location an application policy.
 // Both calls copy/upload the pack synchronously and do not retain catalog.

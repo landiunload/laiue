@@ -62,6 +62,11 @@ typedef struct LaiueGraphicsDeviceState
     RendererMesh *meshes[DEVICE_HANDLE_CAPACITY];
     uint8_t kinds[DEVICE_HANDLE_CAPACITY];
     uint8_t live[DEVICE_HANDLE_CAPACITY];
+    /* destroyHandle came while the resource was in use; see
+     * DeviceDestroyHandle. frameReleaseCount counts the textures and
+     * samplers among them, released when the frame ends. */
+    uint8_t releasePending[DEVICE_HANDLE_CAPACITY];
+    uint32_t frameReleaseCount;
     uint32_t submittedItems;
     float viewProjection[16];
     /* Linear RGB the next frame is cleared to: the sky. */
@@ -228,6 +233,7 @@ static uint32_t DeviceV2SubmitInstances(LaiueGraphicsDeviceV2 *, const LaiueGrap
 static uint32_t DeviceV2SetClearColor(LaiueGraphicsDeviceV2 *, const float[3]);
 static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *, uint32_t);
 static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *);
+static uint32_t DeviceV2SetNativeWindow(LaiueGraphicsDeviceV2 *, void *, int32_t, int32_t);
 
 static void *DeviceAllocate(const LaiueGraphicsDeviceState *state, size_t size,
                             bool clear)
@@ -467,6 +473,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     state->deviceV2.setClearColor = DeviceV2SetClearColor;
     state->deviceV2.setVerticalSync = DeviceV2SetVerticalSync;
     state->deviceV2.getVerticalSync = DeviceV2GetVerticalSync;
+    state->deviceV2.setNativeWindow = DeviceV2SetNativeWindow;
     *outDevice = &state->device;
     return 1u;
 }
@@ -823,6 +830,29 @@ static uint32_t DeviceUploadTexture(LaiueGraphicsDeviceV1 *device,
                : 0u;
 }
 
+static void DeviceReleaseSlot(LaiueGraphicsDeviceState *state, uint32_t index);
+
+/* Draws recorded in the current frame may reference these through their
+ * descriptors. */
+static bool DeviceKindIsFrameBound(uint8_t kind)
+{
+    return kind == DEVICE_HANDLE_TEXTURE || kind == DEVICE_HANDLE_SAMPLER;
+}
+
+/* Drops one pipeline's hold on a shader. A shader whose destroy waited for
+ * its last pipeline goes with it. */
+static void DeviceReleaseShaderReference(LaiueGraphicsDeviceState *state,
+                                         LaiueGraphicsHandle shader)
+{
+    if (shader == 0u || !DeviceHandleIsLive(state, shader, DEVICE_HANDLE_SHADER))
+        return;
+    const uint32_t index = DeviceHandleSlot(shader) - 1u;
+    if (state->shaderRefCounts[index] != 0u)
+        --state->shaderRefCounts[index];
+    if (state->shaderRefCounts[index] == 0u && state->releasePending[index] != 0u)
+        DeviceReleaseSlot(state, index);
+}
+
 static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
                                 LaiueGraphicsHandle handle)
 {
@@ -831,35 +861,43 @@ static void DeviceDestroyHandle(LaiueGraphicsDeviceV1 *device,
         return;
     const uint32_t index = DeviceHandleSlot(handle) - 1u;
     const uint8_t kind = state->kinds[index];
-    /* Draw commands may already reference backend descriptors in this frame.
-     * The void destroy ABI cannot report a deferred-release token, so keep
-     * texture/sampler handles live until EndFrame rather than invalidating a
-     * descriptor set or GPU heap entry mid-recording. */
-    if (state->frameActive &&
-        (kind == DEVICE_HANDLE_TEXTURE || kind == DEVICE_HANDLE_SAMPLER))
+    /* The void destroy ABI cannot report a deferral, so a resource still in
+     * use stays live and is released as soon as it is free. Draws of the
+     * current frame may reference a texture's or a sampler's descriptors:
+     * those wait for the end of the frame. A shader waits for the last
+     * pipeline built from it, so no pipeline is left with a dangling handle. */
+    const bool frameResource = state->frameActive && DeviceKindIsFrameBound(kind);
+    if (frameResource || (kind == DEVICE_HANDLE_SHADER && state->shaderRefCounts[index] != 0u))
+    {
+        if (frameResource && state->releasePending[index] == 0u)
+            ++state->frameReleaseCount;
+        state->releasePending[index] = 1u;
         return;
-    /* A shader remains owned by the device while any pipeline references it.
-     * The void destroy ABI cannot report an error, so a premature release is
-     * a safe no-op instead of turning a live pipeline into a dangling handle. */
-    if (kind == DEVICE_HANDLE_SHADER && state->shaderRefCounts[index] != 0u)
-        return;
+    }
+    DeviceReleaseSlot(state, index);
+}
+
+/* Releases the textures and samplers destroyed while the frame was recorded. */
+static void DeviceReleaseFrameResources(LaiueGraphicsDeviceState *state)
+{
+    for (uint32_t index = 0u; state->frameReleaseCount != 0u && index < DEVICE_HANDLE_CAPACITY;
+         ++index)
+        if (state->releasePending[index] != 0u && DeviceKindIsFrameBound(state->kinds[index]))
+            DeviceReleaseSlot(state, index);
+}
+
+static void DeviceReleaseSlot(LaiueGraphicsDeviceState *state, uint32_t index)
+{
+    const uint8_t kind = state->kinds[index];
+    if (state->releasePending[index] != 0u && DeviceKindIsFrameBound(kind))
+        --state->frameReleaseCount;
+    state->releasePending[index] = 0u;
     if (kind == DEVICE_HANDLE_PIPELINE)
     {
-        const LaiueGraphicsPipelineDescV1 *pipeline = &state->pipelines[index];
-        if (pipeline->vertexShader != 0u &&
-            DeviceHandleIsLive(state, pipeline->vertexShader, DEVICE_HANDLE_SHADER))
-        {
-            const uint32_t shaderIndex = DeviceHandleSlot(pipeline->vertexShader) - 1u;
-            if (state->shaderRefCounts[shaderIndex] != 0u)
-                --state->shaderRefCounts[shaderIndex];
-        }
-        if (pipeline->fragmentShader != 0u &&
-            DeviceHandleIsLive(state, pipeline->fragmentShader, DEVICE_HANDLE_SHADER))
-        {
-            const uint32_t shaderIndex = DeviceHandleSlot(pipeline->fragmentShader) - 1u;
-            if (state->shaderRefCounts[shaderIndex] != 0u)
-                --state->shaderRefCounts[shaderIndex];
-        }
+        const LaiueGraphicsHandle vertexShader = state->pipelines[index].vertexShader;
+        const LaiueGraphicsHandle fragmentShader = state->pipelines[index].fragmentShader;
+        DeviceReleaseShaderReference(state, vertexShader);
+        DeviceReleaseShaderReference(state, fragmentShader);
     }
     if (state->meshes[index] != NULL)
         RendererDestroyMesh(state->renderer, state->meshes[index]);
@@ -1125,10 +1163,12 @@ static uint32_t DeviceEndFrame(LaiueGraphicsDeviceV1 *device)
     {
         state->frameActive = false;
         state->lastFrameValid = false;
+        DeviceReleaseFrameResources(state);
         return 0u;
     }
     state->frameActive = false;
     state->lastFrameValid = true;
+    DeviceReleaseFrameResources(state);
     ++state->completedFrameIndex;
     return 1u;
 }
@@ -1380,6 +1420,18 @@ static uint32_t DeviceV2SetVerticalSync(LaiueGraphicsDeviceV2 *device, uint32_t 
         return 0u;
     RendererSetVerticalSync(state->renderer, enabled != 0u);
     return RendererIsVerticalSyncEnabled(state->renderer) == (enabled != 0u) ? 1u : 0u;
+}
+
+static uint32_t DeviceV2SetNativeWindow(LaiueGraphicsDeviceV2 *device, void *nativeWindow,
+                                        int32_t width, int32_t height)
+{
+    if (device == NULL || device->structSize < LAIUE_GRAPHICS_DEVICE_V2_NATIVE_WINDOW_SIZE)
+        return 0u;
+    LaiueGraphicsDeviceState *state = DeviceV2State(device);
+    if (state == NULL || state->renderer == NULL)
+        return 0u;
+    state->lastFrameValid = false;
+    return RendererReplaceSurface(state->renderer, nativeWindow, width, height) ? 1u : 0u;
 }
 
 static uint32_t DeviceV2GetVerticalSync(const LaiueGraphicsDeviceV2 *device)

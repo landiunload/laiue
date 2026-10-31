@@ -317,6 +317,32 @@
       }
     },
     {
+      "name": "android-arm64-shared",
+      "displayName": "Android ARM64 programs on modules by name",
+      "description": "Engine modules as separate .so files in the APK, loaded by name like desktop DLLs",
+      "inherits": "android-arm64-core",
+      "cacheVariables": {
+        "BUILD_TESTING": "OFF",
+        "LAIUE_BUILD_EXAMPLES": "ON",
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_BUILD_TOOLS": "OFF",
+        "LAIUE_MODULE_LIBRARY_TYPE": "SHARED"
+      }
+    },
+    {
+      "name": "android-x86_64-shared",
+      "displayName": "Android x86_64 programs on modules by name",
+      "description": "Engine modules as separate .so files in the APK, for the x86_64 emulator",
+      "inherits": "android-x86_64-core",
+      "cacheVariables": {
+        "BUILD_TESTING": "OFF",
+        "LAIUE_BUILD_EXAMPLES": "ON",
+        "LAIUE_BUILD_GRAPHICS": "ON",
+        "LAIUE_BUILD_TOOLS": "OFF",
+        "LAIUE_MODULE_LIBRARY_TYPE": "SHARED"
+      }
+    },
+    {
       "name": "ios-arm64-core",
       "displayName": "iOS ARM64 static core + AppleClang",
       "description": "Static core plus unsigned link smoke; not a product app or Metal client",
@@ -594,6 +620,24 @@
     {
       "name": "android-x86_64-walk-release",
       "configurePreset": "android-x86_64-walk",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-arm64-shared-release",
+      "configurePreset": "android-arm64-shared",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ANDROID_NDK_HOME}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "android-x86_64-shared-release",
+      "configurePreset": "android-x86_64-shared",
       "condition": {
         "type": "notEquals",
         "lhs": "$env{ANDROID_NDK_HOME}",

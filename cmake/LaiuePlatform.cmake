@@ -6,12 +6,18 @@ set_property(CACHE LAIUE_PLATFORM_BACKEND PROPERTY STRINGS
     AUTO WINDOWS POSIX EXTERNAL)
 string(TOUPPER "${LAIUE_PLATFORM_BACKEND}" _laiue_platform_backend)
 
+set(_laiue_platform_mobile OFF)
 if(_laiue_platform_backend STREQUAL "AUTO")
     if(WIN32)
         set(_laiue_platform_backend WINDOWS)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
            CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         set(_laiue_platform_backend POSIX)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Android|iOS|tvOS|visionOS)$")
+        # У мобильных систем нет своего бэкенда, но есть общий адаптер ядра:
+        # программе достаточно toolchain-файла.
+        set(_laiue_platform_backend EXTERNAL)
+        set(_laiue_platform_mobile ON)
     else()
         message(FATAL_ERROR
             "No built-in platform backend exists for ${CMAKE_SYSTEM_NAME}; "
@@ -45,6 +51,10 @@ endif()
 
 set(LAIUE_EXTERNAL_PLATFORM_FILE "" CACHE FILEPATH
     "CMake adapter file used by the EXTERNAL platform backend")
+if(_laiue_platform_mobile AND LAIUE_EXTERNAL_PLATFORM_FILE STREQUAL "")
+    set(LAIUE_EXTERNAL_PLATFORM_FILE
+        "${CMAKE_CURRENT_LIST_DIR}/platform/MobileCoreAdapter.cmake")
+endif()
 set(LAIUE_PLATFORM_ADAPTER_TARGET "" CACHE STRING
     "Target implementing src/platform/system.h for an external backend")
 set(LAIUE_PRECISE_FP_TARGET "" CACHE STRING
@@ -79,7 +89,9 @@ set_property(CACHE LAIUE_MODULE_LIBRARY_TYPE PROPERTY STRINGS
 string(TOUPPER "${LAIUE_MODULE_LIBRARY_TYPE}"
     LAIUE_MODULE_LIBRARY_TYPE_RESOLVED)
 if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "AUTO")
-    if(LAIUE_PLATFORM_EXTERNAL)
+    # Android, как настольные системы, грузит модули по имени, и удалённый из
+    # APK модуль отключает только свою технологию.
+    if(LAIUE_PLATFORM_EXTERNAL AND NOT ANDROID)
         set(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STATIC)
     else()
         set(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED SHARED)
@@ -89,7 +101,9 @@ if(NOT LAIUE_MODULE_LIBRARY_TYPE_RESOLVED MATCHES "^(SHARED|STATIC)$")
     message(FATAL_ERROR
         "LAIUE_MODULE_LIBRARY_TYPE must be AUTO, SHARED or STATIC")
 endif()
-if(LAIUE_PLATFORM_EXTERNAL AND
+# Android загружает модули из APK так же, как настольные системы — из
+# каталога программы; остальным внешним платформам нужны статические.
+if(LAIUE_PLATFORM_EXTERNAL AND NOT ANDROID AND
    NOT LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
     message(FATAL_ERROR "The initial EXTERNAL core contract requires STATIC modules")
 endif()

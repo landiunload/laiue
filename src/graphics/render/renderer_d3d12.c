@@ -103,14 +103,21 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // уничтожается, только когда GPU прошёл кадры, которые могли его читать.
 #define DEFERRED_RELEASE_CAPACITY 256
 #define DEFERRED_RESOURCE_CAPACITY 512
-#define MAX_PENDING_UPLOADS 128
-// Geometry staging, two block textures, font, background and old capture.
-#define MAX_RESOURCE_RELEASES_PER_FRAME (MAX_PENDING_UPLOADS + 5u)
+// Two block textures, font, background and old capture.
+#define MAX_RESOURCE_RELEASES_PER_FRAME 5u
+// Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
+// и сохраняет ёмкость: в установившемся режиме она не выделяет память.
+#define PENDING_UPLOAD_INITIAL_CAPACITY 128u
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
 // переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
+// Что не поместилось и туда, ложится в дополнительные блоки того же
+// кадрового слота размером не меньше арены. Блок делят все такие записи,
+// поэтому всплеск в тысячи мешей стоит нескольких ресурсов, а не тысяч
+// ресурсов с выравниванием по 64 КиБ; блоки освобождаются, когда пройден
+// fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
 // Инстансное кольцо — чанковый upload-пул: кадровый слот начинает с одного
 // небольшого чанка и добавляет новый только тогда, когда очередной вызов
@@ -175,8 +182,16 @@ typedef struct PendingUpload
     uint32_t blockIndex;
     uint32_t destinationOffset;
     uint32_t sizeBytes;
-    bool ownsStaging;
 } PendingUpload;
+
+typedef struct StagingOverflow
+{
+    struct StagingOverflow *next;
+    ID3D12Resource *resource;
+    uint8_t *mapped;
+    uint64_t sizeBytes;
+    uint64_t usedBytes;
+} StagingOverflow;
 
 typedef struct DeferredResourceRelease
 {
@@ -363,14 +378,16 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint64_t                   poolCapacityBytes;
     uint64_t                   poolUsedBytes;
 
-    PendingUpload              pendingUploads[MAX_PENDING_UPLOADS];
+    PendingUpload*             pendingUploads;
     uint32_t                   pendingUploadCount;
+    uint32_t                   pendingUploadCapacity;
     ID3D12Resource*            meshUploadBuffers[FRAME_COUNT];
     uint8_t*                   meshUploadMapped[FRAME_COUNT];
     uint32_t                   meshUploadOffsets[FRAME_COUNT];
     ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
+    StagingOverflow*           stagingOverflow[FRAME_COUNT];
     // Чанковый пул инстансов, по независимому набору на кадровый слот.
     // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
     // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
@@ -885,6 +902,21 @@ static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
     renderer->deferredResources[slot].resource = resource;
     renderer->deferredResources[slot].safeFenceValue = renderer->fenceValues[renderer->frameIndex];
     renderer->deferredResourceCount++;
+}
+
+// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
+    renderer->stagingOverflow[frameIndex] = NULL;
+    while (chunk != NULL)
+    {
+        StagingOverflow *next = chunk->next;
+        ID3D12Resource_Unmap(chunk->resource, 0, NULL);
+        ID3D12Resource_Release(chunk->resource);
+        HeapFree(GetProcessHeap(), 0, chunk);
+        chunk = next;
+    }
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
@@ -2339,13 +2371,9 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
         DrainDeferredReleases(renderer, true);
     }
 
-    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
-    {
-        if (renderer->pendingUploads[i].ownsStaging
-            && renderer->pendingUploads[i].staging != NULL)
-            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
-    }
     renderer->pendingUploadCount = 0;
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+        ReleaseStagingOverflow(renderer, i);
     if (renderer->geometryGeneration != UINT64_MAX)
         renderer->geometryGeneration++;
     renderer->scenePassActive = false;
@@ -2549,12 +2577,8 @@ void RendererDestroy_D3D12(Renderer* renderer)
     }
 
     RendererReleaseWorld_D3D12(renderer);
-
-    for (uint32_t i = 0; i < renderer->pendingUploadCount; ++i)
-    {
-        if (renderer->pendingUploads[i].ownsStaging)
-            ID3D12Resource_Release(renderer->pendingUploads[i].staging);
-    }
+    if (renderer->pendingUploads != NULL)
+        HeapFree(GetProcessHeap(), 0, renderer->pendingUploads);
 
     for (uint32_t i = 0; i < renderer->poolBlockCount; ++i)
     {
@@ -2673,13 +2697,94 @@ static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
     return true;
 }
 
+// Копирует запись в дополнительный блок текущего слота, начиная новый
+// блок, когда в последнем не хватает места.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          ID3D12Resource **outStaging, uint32_t *outOffset)
+{
+    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
+    StagingOverflow *chunk = *head;
+    uint64_t offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(uint64_t)15u;
+    if (chunk == NULL || offset > chunk->sizeBytes || sizeBytes > chunk->sizeBytes - offset)
+    {
+        chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*chunk));
+        if (chunk == NULL)
+            return false;
+        chunk->sizeBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+                               ? sizeBytes
+                               : LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC description;
+        memset(&description, 0, sizeof(description));
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = chunk->sizeBytes;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        description.SampleDesc.Count = 1;
+        D3D12_RANGE emptyRange = { 0, 0 };
+        if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
+                &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&chunk->resource)))
+        {
+            HeapFree(GetProcessHeap(), 0, chunk);
+            return false;
+        }
+        if (FAILED(ID3D12Resource_Map(chunk->resource, 0, &emptyRange, (void**)&chunk->mapped)))
+        {
+            ID3D12Resource_Release(chunk->resource);
+            HeapFree(GetProcessHeap(), 0, chunk);
+            return false;
+        }
+        chunk->next = *head;
+        *head = chunk;
+        offset = 0u;
+    }
+    memcpy(chunk->mapped + offset, data, sizeBytes);
+    chunk->usedBytes = offset + sizeBytes;
+    *outStaging = chunk->resource;
+    // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
+    *outOffset = (uint32_t)offset;
+    return true;
+}
+
+// Гарантирует место ещё под одну загрузку. Новый массив заполняется до
+// замены старого, поэтому отказ ничего не меняет.
+static bool ReservePendingUpload(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount < renderer->pendingUploadCapacity)
+        return true;
+    // Удвоение 32-битной ёмкости проверяется на переполнение, а её
+    // произведение на размер записи в 64-битном size_t (движок собирается
+    // только под 64 бита) переполниться не может.
+    const uint32_t capacity = renderer->pendingUploadCapacity == 0u
+                                  ? PENDING_UPLOAD_INITIAL_CAPACITY
+                                  : renderer->pendingUploadCapacity * 2u;
+    if (capacity <= renderer->pendingUploadCapacity)
+        return false;
+    PendingUpload *uploads =
+        HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof(*uploads));
+    if (uploads == NULL)
+        return false;
+    if (renderer->pendingUploadCount != 0u)
+        memcpy(uploads, renderer->pendingUploads,
+               (size_t)renderer->pendingUploadCount * sizeof(*uploads));
+    if (renderer->pendingUploads != NULL)
+        HeapFree(GetProcessHeap(), 0, renderer->pendingUploads);
+    renderer->pendingUploads = uploads;
+    renderer->pendingUploadCapacity = capacity;
+    return true;
+}
+
 static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint32_t sizeBytes,
                                       GeometryAllocation *allocation)
 {
     if (renderer == NULL || !renderer->worldReady || data == NULL || renderer->frameRecording ||
         renderer->frameFailed || sizeBytes == 0u || allocation == NULL ||
         sizeBytes > UINTPTR_MAX - (uintptr_t)data || renderer->geometryGeneration == UINT64_MAX ||
-        renderer->pendingUploadCount == MAX_PENDING_UPLOADS)
+        !ReservePendingUpload(renderer))
     {
         return false;
     }
@@ -2694,7 +2799,6 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
     ID3D12Resource* staging = NULL;
     uint32_t frameIndex = renderer->frameIndex;
     uint32_t sourceOffset = (renderer->meshUploadOffsets[frameIndex] + 15u) & ~15u;
-    bool ownsStaging = false;
     bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME
         && sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
     if (fitsSmallRing)
@@ -2707,7 +2811,7 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
     else
     {
         // Крупная запись: сначала пробуем общую арену того же кадра, и
-        // только если запись не помещается и туда — отдельный ресурс.
+        // только если запись не помещается и туда — дополнительный блок.
         uint32_t largeOffset =
             (renderer->largeMeshUploadOffsets[frameIndex] + 15u) & ~15u;
         bool fitsLargeRing =
@@ -2721,40 +2825,11 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
                 data, sizeBytes);
             renderer->largeMeshUploadOffsets[frameIndex] = largeOffset + sizeBytes;
         }
-        else
+        else if (!StageOverflow(renderer, data, sizeBytes, &staging, &sourceOffset))
         {
-            D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-            D3D12_RESOURCE_DESC description;
-            memset(&description, 0, sizeof(description));
-            description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            description.Width = sizeBytes;
-            description.Height = 1;
-            description.DepthOrArraySize = 1;
-            description.MipLevels = 1;
-            description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            description.SampleDesc.Count = 1;
-            if (FAILED(ID3D12Device_CreateCommittedResource(renderer->device,
-                &heapProperties, D3D12_HEAP_FLAG_NONE, &description,
-                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&staging)))
-            {
-                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
-                    renderer->poolUsedBytes -= sizeBytes;
-                return false;
-            }
-            D3D12_RANGE emptyRange = { 0, 0 };
-            void* mapped = NULL;
-            if (FAILED(ID3D12Resource_Map(staging, 0, &emptyRange, &mapped)))
-            {
-                ID3D12Resource_Release(staging);
-                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
-                    renderer->poolUsedBytes -= sizeBytes;
-                return false;
-            }
-            memcpy(mapped, data, sizeBytes);
-            ID3D12Resource_Unmap(staging, 0, NULL);
-            sourceOffset = 0;
-            ownsStaging = true;
+            if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, sizeBytes))
+                renderer->poolUsedBytes -= sizeBytes;
+            return false;
         }
     }
 
@@ -2772,7 +2847,6 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
     upload->blockIndex = blockIndex;
     upload->destinationOffset = offsetBytes;
     upload->sizeBytes = sizeBytes;
-    upload->ownsStaging = ownsStaging;
 
     return true;
 }
@@ -3142,8 +3216,6 @@ static bool CancelGeometryUpload(Renderer *renderer, GeometryAllocation *allocat
         PendingUpload *upload = &renderer->pendingUploads[i];
         if (upload->allocation != allocation)
             continue;
-        if (upload->ownsStaging)
-            ID3D12Resource_Release(upload->staging);
         renderer->pendingUploadCount--;
         memmove(upload, upload + 1, (renderer->pendingUploadCount - i) * sizeof(*upload));
         return true;
@@ -3547,7 +3619,6 @@ static void RecordPendingUploads(Renderer* renderer)
         ID3D12GraphicsCommandList_CopyBufferRegion(renderer->commandList,
             block->buffer, upload->destinationOffset, upload->staging,
             upload->sourceOffset, upload->sizeBytes);
-        if (upload->ownsStaging) DeferResourceRelease(renderer, upload->staging);
         upload->allocation->resident = true;
         renderer->currentStats.uploadedBytes += upload->sizeBytes;
     }
@@ -4122,8 +4193,9 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
     // Без vsync окно с flip-моделью показывает на каждом обновлении экрана
-    // последний готовый кадр целиком: FPS не ограничен, а разрывов, которые
-    // при тысячах кадров в секунду режут картинку на полосы, нет.
+    // последний готовый кадр целиком, без разрывов, которые режут картинку на
+    // полосы. Кадров выходит до двух на обновление: из трёх буферов один на
+    // экране, а два других ждут композиции.
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
     HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval, 0);
     if (FAILED(presentResult))
@@ -4160,7 +4232,9 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     renderer->meshUploadOffsets[renderer->frameIndex] = 0;
     renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
     // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
-    // больше не читает: курсор можно вернуть в начало. Сами чанки остаются.
+    // больше не читает: курсор можно вернуть в начало. Сами чанки остаются,
+    // а дополнительные staging-блоки, нужные только всплеску, отдаются.
+    ReleaseStagingOverflow(renderer, renderer->frameIndex);
     renderer->instanceChunkIndex[renderer->frameIndex] = 0;
     renderer->instanceChunkOffset[renderer->frameIndex] = 0;
     if (!renderer->verticalSyncEnabled && !waitedForFence)

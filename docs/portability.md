@@ -13,8 +13,8 @@
 | Steam Deck / SteamOS | Linux x86_64 core | Vulkan offscreen и ALSA, на устройстве не запускался | glibc, нужны окно, ввод и UI |
 | macOS arm64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
 | macOS x86_64 | macOS 11+, native CI job, не проверено локально | — | AppleClang, native slice |
-| Android ARM64 | NDK r30: core собирается в CI | Vulkan NativeActivity-пример и вывод звука AAudio собираются в CI; на устройстве в CI не запускаются | API 28+, static external core |
-| Android x86_64 | Android 17 Google APIs AVD в CI, NativeActivity/Vulkan APK | — | NDK r30, API 28+, static external core |
+| Android ARM64 | NDK r30: core собирается в CI | окно NativeActivity, касания, Vulkan, `ui` и вывод звука AAudio собираются в CI; на устройстве в CI не запускаются | API 28+, static или shared external core |
+| Android x86_64 | Android 17 Google APIs AVD в CI: walk и просмотрщик на модулях по имени | то же, что на ARM64 | NDK r30, API 28+, static или shared external core |
 | iOS/iPadOS ARM64 | Xcode 26 build/link CI настроен | — | iOS 15+, static external core |
 | tvOS/visionOS | adapter contract | — | без preset и native validation |
 | другие Linux x86_64 | source-compatible | — | совместимый glibc/musl toolchain |
@@ -29,6 +29,7 @@ Core включает `platform_support`, `world`, `physics`, `content` и `mod`
 | `D3D12` | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
 | `VULKAN` на Windows | `window`, `input`, `audio`, `mesh`, `render`, `scene`, `ui` | — |
 | `VULKAN` на POSIX | `audio`, `mesh`, `render`, `scene`, `ui`; X11 `window`/`input` when X11 is found | Wayland and evdev adapters |
+| `VULKAN` на Android | `window` (NativeActivity), `input` (касания, жест двумя пальцами, клавиши), `audio`, `mesh`, `render`, `scene`, `ui` | — |
 
 На Windows `LAIUE_RENDER_BACKEND=AUTO` (умолчание) связывает все физически
 доступные бэкенды: D3D12 и, если найден Vulkan SDK, Vulkan. `RendererCreate`
@@ -78,7 +79,7 @@ portable font fallback, а на Windows растеризует
 | `LAIUE_ENABLE_LTO` | `ON` | link-time optimization в Release |
 | `LAIUE_CLANG_LTO_MODE` | `full` | режим clang-cl: `thin` либо `full` |
 | `LAIUE_AGGRESSIVE_INLINING` | `ON` | MSVC `/Ob3`; отключаемый максимальный inline profile |
-| `LAIUE_X86_64_LEVEL` | x86_64: `avx2` | ISA Release x86_64: `sse2`, `avx2` либо экспериментальный `avx512`; к ARM64 не применяется |
+| `LAIUE_X86_64_LEVEL` | x86_64: `avx2`, Android: `sse2` | ISA Release x86_64: `sse2`, `avx2` либо экспериментальный `avx512`; на Android `sse2` — база ABI с SSE4.2 и POPCNT; к ARM64 не применяется |
 | `LAIUE_X86_64_TUNE` | x86_64: `generic` | планирование x86_64: `generic` либо opt-in `amd_zen4`; к ARM64 не применяется |
 | `LAIUE_ENABLE_SANITIZERS` | `OFF` | ASan и UBSan в поддерживаемом Linux toolchain |
 | `LAIUE_LINUX_LIBC` | `gnu` | `gnu` либо `musl` для ABI-меток |
@@ -260,6 +261,39 @@ SwiftShader 1.2 также проходит NativeActivity smoke, не треб�
 оставлен compatibility-мостом и может содержать оба backend-а для прежних
 клиентов.
 
+## Программы на модулях по имени
+
+`laiue_add_program(<имя> <исходники> MODULES <модули> [WINDOWED]
+[ANDROID_PACKAGE <пакет>] [ANDROID_LABEL <название>])` собирает обычный `main`
+на C под любую систему: программа линкует только `bootstrap` и грузит
+модули по имени, а модуль, которого нет, отключает лишь свою технологию.
+Под Windows `main` получает аргументы в UTF-8 без CRT, `WINDOWED` убирает
+консоль. Пример — [просмотрщик картинок](../examples/viewer/README.md).
+
+Под Android программе достаточно toolchain-файла NDK: на мобильных системах
+`LAIUE_PLATFORM_BACKEND=AUTO` берёт общий адаптер ядра, а
+`LAIUE_MODULE_LIBRARY_TYPE=AUTO` на Android даёт разделяемые модули (пресеты
+`android-arm64-shared` и `android-x86_64-shared`). Программа тогда —
+разделяемая библиотека, наружу из которой видна только `main`, а цель
+`<имя>_apk` собирает APK функцией `laiue_add_android_apk`. Модули лежат в нём отдельными `.so` без сжатия,
+выровненными по 16 КиБ и очищенными от отладочных сведений; полные копии
+остаются в каталоге сборки для отладчика. `PlatformModuleDirectory` даёт
+каталог модулей: рядом с исполняемым файлом на настольных системах,
+`base.apk!/lib/<abi>` на Android, и `PlatformPathExists` понимает такие
+пути.
+
+Модуль окна — библиотека активности. Его `android_main` перенаправляет
+stdout и stderr в logcat под именем пакета, дожидается поверхности, делает
+рабочим каталогом внутренний каталог приложения, кладёт оба каталога данных
+в `LAIUE_ANDROID_DATA` и `LAIUE_ANDROID_EXTERNAL_DATA` и вызывает `main`
+программы с аргументами из extra `args`:
+`adb shell am start -n <пакет>/android.app.NativeActivity --es args "--smoke"`.
+Поверхность Android уходит на паузе и возвращается: `setSurfaceCallback`
+окна сообщает об этом, а `setNativeWindow` графического устройства меняет её
+без пересоздания ресурсов. Размеры интерфейса задаются в точках и
+умножаются на `getContentScale` окна: DPI на Windows, `Xft.dpi` в X11,
+плотность экрана на Android.
+
 ## Vulkan offscreen на Linux
 
 Нужны CMake 4.2+, Ninja, GCC или Clang, заголовки Vulkan и любой драйвер.
@@ -408,7 +442,8 @@ host-процесса. Наличие core-сборки само по себе �
 
 Android и Apple mobile family используют публичный
 `cmake/platform/MobileCoreAdapter.cmake`, static core и
-`LAIUE_NATIVE_MOD_MODE=OFF`. Android core preset фиксирует NDK r30 и API 28,
+`LAIUE_NATIVE_MOD_MODE=OFF`; Android, кроме того, собирает модули
+разделяемыми библиотеками (см. «Программы на модулях по имени»). Android core preset фиксирует NDK r30 и API 28,
 а walk preset добавляет NativeActivity/Vulkan для ARM64 или x86_64;
 iOS preset фиксирует iOS 15, ARM64 и отключённую подпись build-only цели. CI
 компилирует Android targets и линкует game `.so`; Apple runner линкует

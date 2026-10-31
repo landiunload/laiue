@@ -53,6 +53,10 @@ else()
         if(X11_FOUND)
             list(APPEND LAIUE_GRAPHICS_MODULE_DIRECTORIES input)
         endif()
+    elseif(LAIUE_BUILD_GRAPHICS AND ANDROID)
+        # Android даёт окно и ввод сам: NativeActivity, ANativeWindow и
+        # AInputEvent.
+        list(APPEND LAIUE_GRAPHICS_MODULE_DIRECTORIES input)
     endif()
 endif()
 
@@ -61,6 +65,10 @@ include(LaiueModule)
 include(LaiueShader)
 include(LaiueArchitecture)
 include(LaiueStandaloneExecutable)
+if(ANDROID)
+    include(LaiueAndroid)
+endif()
+include(LaiueProgram)
 
 if(LAIUE_BUILD_GRAPHICS AND NOT (LAIUE_TARGET_X86_64 OR LAIUE_TARGET_ARM64))
     message(FATAL_ERROR
@@ -442,6 +450,11 @@ if(LAIUE_BUILD_EXAMPLES)
     add_subdirectory(examples/walk)
     add_subdirectory(examples/mesh_world)
     add_subdirectory(examples/animation)
+    # Программа на модулях по имени: окно, ввод и графика — в самой сборке.
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "SHARED" AND TARGET laiue_window AND
+       TARGET laiue_input)
+        add_subdirectory(examples/viewer)
+    endif()
 endif()
 
 if(LAIUE_BUILD_TOOLS)

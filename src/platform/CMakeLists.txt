@@ -36,7 +36,10 @@ if(LAIUE_PLATFORM_EXTERNAL)
     endif()
 else()
     if(LAIUE_PLATFORM_WINDOWS)
-        set(laiue_platform_system_sources system_windows.c)
+        set(laiue_platform_system_sources
+            system_windows.c
+            efficiency_windows.c
+            efficiency_windows.h)
     else()
         set(laiue_platform_system_sources
             system_posix.c
@@ -109,4 +112,44 @@ elseif(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND X11_FOUND)
             ../api.h
         POSIX_LINK
             X11::X11)
+elseif(LAIUE_BUILD_GRAPHICS AND ANDROID)
+    # NativeActivity: окно и точка входа android_main. native_app_glue —
+    # исходник NDK: её поток событий и есть цикл окна, поэтому она входит в
+    # модуль окна, но собирается правилами NDK, а не предупреждениями движка.
+    set(_laiue_android_ndk "${CMAKE_ANDROID_NDK}")
+    if(_laiue_android_ndk STREQUAL "")
+        set(_laiue_android_ndk "${ANDROID_NDK}")
+    endif()
+    set(_laiue_android_glue "${_laiue_android_ndk}/sources/android/native_app_glue")
+    if(NOT EXISTS "${_laiue_android_glue}/android_native_app_glue.c")
+        message(FATAL_ERROR
+            "Android NDK native_app_glue was not found: ${_laiue_android_glue}")
+    endif()
+    add_library(laiue_android_native_app_glue OBJECT
+        "${_laiue_android_glue}/android_native_app_glue.c")
+    # Наружу из glue видна только ANativeActivity_onCreate: она объявлена
+    # JNIEXPORT, а остальное — внутренности цикла окна.
+    set_target_properties(laiue_android_native_app_glue PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        C_VISIBILITY_PRESET hidden)
+    laiue_add_module(window
+        RUNTIME_ROLE GRAPHICS
+        SOURCES
+            window.h
+            window_service.h
+            window_module_entry.c
+            ../api.h
+        EXTERNAL_SOURCES
+            window_android.c
+        EXTERNAL_LINK
+            android
+            log)
+    target_sources(laiue_window PRIVATE $<TARGET_OBJECTS:laiue_android_native_app_glue>)
+    target_include_directories(laiue_window SYSTEM PRIVATE "${_laiue_android_glue}")
+    if(LAIUE_MODULE_LIBRARY_TYPE_RESOLVED STREQUAL "STATIC")
+        # Статическое окно входит в библиотеку программы. NativeActivity
+        # находит её по экспортированной ANativeActivity_onCreate; без явной
+        # ссылки компоновщик выбросил бы её из архива.
+        target_link_options(laiue_window INTERFACE "-uANativeActivity_onCreate")
+    endif()
 endif()

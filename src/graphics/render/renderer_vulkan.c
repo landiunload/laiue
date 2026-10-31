@@ -99,13 +99,19 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define MAX_POOL_BLOCKS 64
 
 #define DEFERRED_RELEASE_CAPACITY 256
-#define DEFERRED_BUFFER_RELEASE_CAPACITY 512
-#define MAX_PENDING_UPLOADS 128
+// Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
+// и сохраняет ёмкость: в установившемся режиме она не выделяет память.
+#define PENDING_UPLOAD_INITIAL_CAPACITY 128u
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
 // переиспользуется каждый кадр, поэтому на кадр не создаётся буфер.
+// Что не поместилось и туда, ложится в дополнительные блоки того же
+// кадрового слота размером не меньше арены. Блок делят все такие записи,
+// поэтому всплеск в тысячи мешей стоит нескольких выделений памяти, а не
+// тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
+// когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
 // Инстансы идут в независимых storage-буферах: descriptor set фиксирует
 // конкретный буфер до конца командного списка, поэтому растить один
@@ -224,7 +230,6 @@ typedef struct GeometryPoolBlock
 typedef struct PendingUpload
 {
     VkBuffer staging;
-    VkDeviceMemory stagingMemory;   // не NULL только у собственного буфера
     uint32_t sourceOffset;
     uint32_t blockIndex;
     uint32_t destinationOffset;
@@ -232,12 +237,12 @@ typedef struct PendingUpload
     bool *resident;
 } PendingUpload;
 
-typedef struct DeferredBufferRelease
+typedef struct StagingOverflow
 {
-    VkBuffer buffer;
-    VkDeviceMemory memory;
-    uint64_t safeFrameIndex;
-} DeferredBufferRelease;
+    struct StagingOverflow *next;
+    GpuBuffer buffer;
+    VkDeviceSize usedBytes;
+} StagingOverflow;
 
 typedef struct DeferredRangeRelease
 {
@@ -416,6 +421,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t meshUploadOffsets[FRAME_COUNT];
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
+    StagingOverflow *stagingOverflow[FRAME_COUNT];
     bool uploadSlotReady[FRAME_COUNT];
     GpuBuffer instanceBuffers[FRAME_COUNT][INSTANCE_MAX_CHUNKS_PER_FRAME];
     uint32_t instanceChunkCount[FRAME_COUNT];
@@ -443,15 +449,14 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint64_t poolCapacityBytes;
     uint64_t poolUsedBytes;
 
-    PendingUpload pendingUploads[MAX_PENDING_UPLOADS];
-    VkBufferCopy uploadRegionScratch[MAX_PENDING_UPLOADS];
+    // Три массива одной ёмкости: записанный кадр отмечает не больше
+    // резидентностей и областей копирования, чем было загрузок в очереди.
+    PendingUpload *pendingUploads;
+    VkBufferCopy *uploadRegionScratch;
+    bool **recordedUploadResidencies;
     uint32_t pendingUploadCount;
-    bool *recordedUploadResidencies[MAX_PENDING_UPLOADS];
+    uint32_t pendingUploadCapacity;
     uint32_t recordedUploadCount;
-
-    DeferredBufferRelease deferredBuffers[DEFERRED_BUFFER_RELEASE_CAPACITY];
-    uint32_t deferredBufferHead;
-    uint32_t deferredBufferCount;
 
     DeferredRangeRelease deferredRanges[DEFERRED_RELEASE_CAPACITY];
     uint32_t deferredRangeHead;
@@ -465,6 +470,8 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     RendererStats lastStats;
     RendererContentStatus texturePackLoadStatus;
     bool verticalSyncEnabled;
+    // Устройство включило VK_PRESENT_MODE_FIFO_LATEST_READY_KHR.
+    bool presentLatestReady;
     bool wireframeEnabled;
     bool worldReady;
 
@@ -526,8 +533,6 @@ _Static_assert((GENERIC_DESCRIPTOR_LOOKUP_CAPACITY &
     "generic descriptor lookup capacity must be a power of two");
 _Static_assert(GENERIC_DESCRIPTOR_SET_CAPACITY < UINT16_MAX,
                "generic descriptor indices must fit in the lookup table");
-_Static_assert(DEFERRED_BUFFER_RELEASE_CAPACITY >= MAX_PENDING_UPLOADS * (FRAME_COUNT + 1u),
-               "staging release capacity must cover every retained frame and recording batch");
 
 // === Мелкие помощники ===
 
@@ -574,27 +579,6 @@ static bool GeometryIsReady(const Renderer *renderer, const GeometryAllocation *
     const GeometryPoolBlock *block = &renderer->poolBlocks[allocation->blockIndex];
     return block->buffer.buffer != VK_NULL_HANDLE && allocation->offsetBytes <= block->totalBytes &&
            allocation->sizeBytes <= block->totalBytes - allocation->offsetBytes;
-}
-
-static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
-{
-    uint32_t frameIndex = renderer->frameIndex;
-    if (renderer->deviceFailed || frameIndex >= FRAME_COUNT)
-        return false;
-    if (renderer->uploadSlotReady[frameIndex])
-        return true;
-    // Mesh/index creation writes staging before BeginFrame. Wait before the
-    // first write, then retain its cursor until that slot has been submitted.
-    if (vkWaitForFences(renderer->device, 1u, &renderer->frameFences[frameIndex], VK_TRUE,
-                        UINT64_MAX) != VK_SUCCESS)
-    {
-        FailVulkanDevice(renderer);
-        return false;
-    }
-    renderer->meshUploadOffsets[frameIndex] = 0u;
-    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
-    renderer->uploadSlotReady[frameIndex] = true;
-    return true;
 }
 
 static uint32_t AlignUp(uint32_t value, uint32_t alignment)
@@ -693,6 +677,20 @@ static bool BufferCreate(Renderer *renderer, VkDeviceSize sizeBytes, VkBufferUsa
     }
     outBuffer->sizeBytes = sizeBytes;
     return true;
+}
+
+// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
+    renderer->stagingOverflow[frameIndex] = NULL;
+    while (chunk != NULL)
+    {
+        StagingOverflow *next = chunk->next;
+        BufferDestroy(renderer, &chunk->buffer);
+        PlatformFree(chunk);
+        chunk = next;
+    }
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -1280,18 +1278,6 @@ static void PoolReclaimEmptyTail(Renderer *renderer)
 
 static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
 {
-    while (renderer->deferredBufferCount > 0u)
-    {
-        DeferredBufferRelease *entry = &renderer->deferredBuffers[renderer->deferredBufferHead];
-        if (!releaseEverything && entry->safeFrameIndex > renderer->submittedFrames) break;
-        if (entry->buffer != VK_NULL_HANDLE)
-            vkDestroyBuffer(renderer->device, entry->buffer, NULL);
-        if (entry->memory != VK_NULL_HANDLE)
-            vkFreeMemory(renderer->device, entry->memory, NULL);
-        renderer->deferredBufferHead =
-            (renderer->deferredBufferHead + 1u) % DEFERRED_BUFFER_RELEASE_CAPACITY;
-        renderer->deferredBufferCount--;
-    }
     while (renderer->deferredRangeCount > 0u)
     {
         DeferredRangeRelease *entry = &renderer->deferredRanges[renderer->deferredRangeHead];
@@ -1326,19 +1312,6 @@ static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
     }
 
     PoolReclaimEmptyTail(renderer);
-}
-
-static void DeferBufferRelease(Renderer *renderer, VkBuffer buffer, VkDeviceMemory memory)
-{
-    // Only the bounded pending-upload batch calls this helper. BeginFrame
-    // drains the completed slot first, so the capacity assertion covers all
-    // retained batches without waiting or draining the current unsent frame.
-    uint32_t slot = (renderer->deferredBufferHead + renderer->deferredBufferCount) %
-                    DEFERRED_BUFFER_RELEASE_CAPACITY;
-    renderer->deferredBuffers[slot].buffer = buffer;
-    renderer->deferredBuffers[slot].memory = memory;
-    renderer->deferredBuffers[slot].safeFrameIndex = renderer->submittedFrames + FRAME_COUNT;
-    renderer->deferredBufferCount++;
 }
 
 // === Дескрипторы и конвейеры ===
@@ -2516,6 +2489,29 @@ static bool DeviceExtensionSupported(VkPhysicalDevice device, const char *name)
     return found;
 }
 
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+// Расширение с VK_PRESENT_MODE_FIFO_LATEST_READY_KHR, которое устройство
+// поддерживает, или NULL.
+static const char *LatestReadyExtension(VkPhysicalDevice device)
+{
+    const char *extension = NULL;
+    if (DeviceExtensionSupported(device, VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+        extension = VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME;
+    else if (DeviceExtensionSupported(device, VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+        extension = VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME;
+    if (extension == NULL) return NULL;
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR available = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &available,
+    };
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return available.presentModeFifoLatestReady == VK_TRUE ? extension : NULL;
+}
+#endif
+
 // Формат swapchain. Приоритет: точное совпадение с форматом offscreen-цели
 // (тогда достаточно vkCmdCopyImage, без конверсии и перестановки каналов),
 // затем B8G8R8A8_UNORM из задачи (тогда — vkCmdBlitImage), затем любой
@@ -2542,16 +2538,21 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
     return formats[0];
 }
 
-// Present-mode: vsync — FIFO; без vsync — MAILBOX (последний готовый кадр
-// без разрывов), иначе IMMEDIATE, иначе FIFO (он обязан поддерживаться всегда).
-static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync)
+// Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
+// разрывов: FIFO_LATEST_READY, затем MAILBOX, иначе IMMEDIATE, иначе FIFO (он
+// обязан поддерживаться всегда).
+static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync,
+                                          bool latestReady)
 {
     if (vsync)
-    {
-        for (uint32_t index = 0; index < count; ++index)
-            if (modes[index] == VK_PRESENT_MODE_FIFO_KHR) return VK_PRESENT_MODE_FIFO_KHR;
         return VK_PRESENT_MODE_FIFO_KHR;
-    }
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+    for (uint32_t index = 0; latestReady && index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)
+            return VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
+#else
+    (void)latestReady;
+#endif
     for (uint32_t index = 0; index < count; ++index)
         if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
     for (uint32_t index = 0; index < count; ++index)
@@ -2650,11 +2651,17 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         if (modes == NULL) return false;
         if (vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physicalDevice, renderer->surface,
                                                       &modeCount, modes) == VK_SUCCESS)
-            presentMode = SelectPresentMode(modes, modeCount, renderer->verticalSyncEnabled);
+            presentMode = SelectPresentMode(modes, modeCount, renderer->verticalSyncEnabled,
+                                            renderer->presentLatestReady);
         PlatformFree(modes);
     }
 
+    // Без vsync показ держит до двух образов: показанный и ждущий следующего
+    // обновления экрана. Если образов только minImageCount, захват ждёт этого
+    // обновления, и кадров выходит не больше, чем обновлений экрана; ещё один
+    // образ даёт рисовать следующий кадр, пока те два заняты.
     uint32_t imageCount = capabilities.minImageCount;
+    if (presentMode != VK_PRESENT_MODE_FIFO_KHR) ++imageCount;
     if (imageCount < 2u) imageCount = 2u;
     if (capabilities.maxImageCount > 0u && imageCount > capabilities.maxImageCount)
         imageCount = capabilities.maxImageCount;
@@ -2878,6 +2885,106 @@ static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandB
 
 // === Создание и разрушение ===
 
+// Surface окна по его native handle: HWND, пара {Display, Window} X11 или
+// ANativeWindow. Пишет renderer->surface только при успехе.
+static bool CreateSurface(Renderer *renderer, void *windowHandle)
+{
+#if defined(_WIN32)
+    VkWin32SurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+        .hinstance = GetModuleHandleW(NULL),
+        .hwnd = (HWND)windowHandle,
+    };
+    return vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#elif defined(LAIUE_RENDER_HAS_X11)
+    const LaiueWindowNativeHandleV1 *nativeHandle = (const LaiueWindowNativeHandleV1 *)windowHandle;
+    if (nativeHandle->display == NULL || nativeHandle->window == 0u)
+        return false;
+    VkXlibSurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+        .dpy = (Display *)nativeHandle->display,
+        .window = (Window)nativeHandle->window,
+    };
+    return vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#elif defined(__ANDROID__)
+    VkAndroidSurfaceCreateInfoKHR surfaceInfo = {
+        .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+        .window = (ANativeWindow *)windowHandle,
+    };
+    return vkCreateAndroidSurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) ==
+           VK_SUCCESS;
+#else
+    (void)renderer;
+    (void)windowHandle;
+    return false;
+#endif
+}
+
+// Чем больше, тем предпочтительнее тип устройства. CPU-драйвер — последний,
+// но тоже подходит: именно он позволяет проверять рендер там, где GPU нет
+// вовсе.
+static uint32_t DeviceTypeRank(VkPhysicalDeviceType type)
+{
+    switch (type)
+    {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return 5u;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 4u;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return 3u;
+    case VK_PHYSICAL_DEVICE_TYPE_OTHER: return 2u;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return 1u;
+    default: return 0u;
+    }
+}
+
+// Устройство Vulkan 1.2+ лучшего типа, семья которого рисует и, при
+// поверхности, показывает; из равных — первое в порядке загрузчика.
+// VK_NULL_HANDLE — подходящего нет.
+static VkPhysicalDevice ChoosePhysicalDevice(const Renderer *renderer, uint32_t *outFamily,
+                                             uint32_t *outTimestampValidBits)
+{
+    uint32_t deviceCount = 8u;
+    VkPhysicalDevice devices[8];
+    // VK_INCOMPLETE: устройств больше восьми, выбор идёт из первых.
+    const VkResult listed = vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, devices);
+    if (listed != VK_SUCCESS && listed != VK_INCOMPLETE) return VK_NULL_HANDLE;
+
+    VkPhysicalDevice chosen = VK_NULL_HANDLE;
+    uint32_t chosenRank = 0u;
+    for (uint32_t index = 0; index < deviceCount; ++index)
+    {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(devices[index], &properties);
+        const uint32_t rank = DeviceTypeRank(properties.deviceType) + 1u;
+        if (properties.apiVersion < VK_API_VERSION_1_2 || rank <= chosenRank) continue;
+
+        uint32_t familyCount = 16u;
+        VkQueueFamilyProperties families[16];
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, families);
+        for (uint32_t family = 0; family < familyCount; ++family)
+        {
+            if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) continue;
+            // Отдельную present-очередь не поддерживаем: годится только та
+            // же семья, что умеет показывать в surface.
+            if (renderer->hasSurface)
+            {
+                VkBool32 presentSupport = VK_FALSE;
+                if (vkGetPhysicalDeviceSurfaceSupportKHR(devices[index], family, renderer->surface,
+                                                         &presentSupport) != VK_SUCCESS ||
+                    presentSupport != VK_TRUE)
+                    continue;
+            }
+            chosen = devices[index];
+            chosenRank = rank;
+            *outFamily = family;
+            *outTimestampValidBits = families[family].timestampValidBits;
+            break;
+        }
+    }
+    return chosen;
+}
+
 static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 {
     // Оконная поверхность — единственное, ради чего включаются
@@ -2934,100 +3041,17 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
     };
     if (vkCreateInstance(&instanceInfo, NULL, &renderer->instance) != VK_SUCCESS) return false;
 
-#if defined(_WIN32)
     if (windowHandle != NULL)
     {
-        VkWin32SurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-            .hinstance = GetModuleHandleW(NULL),
-            .hwnd = (HWND)windowHandle,
-        };
-        if (vkCreateWin32SurfaceKHR(renderer->instance, &surfaceInfo, NULL, &renderer->surface) !=
-            VK_SUCCESS)
+        if (!CreateSurface(renderer, windowHandle))
             return false;
         renderer->hasSurface = true;
     }
-#elif defined(LAIUE_RENDER_HAS_X11)
-    if (windowHandle != NULL)
-    {
-        const LaiueWindowNativeHandleV1 *nativeHandle =
-            (const LaiueWindowNativeHandleV1 *)windowHandle;
-        if (nativeHandle->display == NULL || nativeHandle->window == 0u)
-            return false;
-        VkXlibSurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
-            .dpy = (Display *)nativeHandle->display,
-            .window = (Window)nativeHandle->window,
-        };
-        if (vkCreateXlibSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
-                                   &renderer->surface) != VK_SUCCESS)
-            return false;
-        renderer->hasSurface = true;
-    }
-#elif defined(__ANDROID__)
-    if (windowHandle != NULL)
-    {
-        VkAndroidSurfaceCreateInfoKHR surfaceInfo = {
-            .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
-            .window = (ANativeWindow *)windowHandle,
-        };
-        if (vkCreateAndroidSurfaceKHR(renderer->instance, &surfaceInfo, NULL,
-                                      &renderer->surface) != VK_SUCCESS)
-            return false;
-        renderer->hasSurface = true;
-    }
-#endif
 
-    uint32_t deviceCount = 0u;
-    if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, NULL) != VK_SUCCESS ||
-        deviceCount == 0u)
-        return false;
-    if (deviceCount > 8u) deviceCount = 8u;
-    VkPhysicalDevice devices[8];
-    if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, devices) != VK_SUCCESS)
-        return false;
-
-    // Дискретная карта предпочтительнее, но CPU-драйвер тоже подходит:
-    // именно он позволяет проверять рендер там, где GPU нет вовсе.
-    VkPhysicalDevice chosen = VK_NULL_HANDLE;
     uint32_t chosenFamily = 0u;
     uint32_t chosenTimestampValidBits = 0u;
-    for (uint32_t pass = 0; pass < 2u && chosen == VK_NULL_HANDLE; ++pass)
-    {
-        for (uint32_t index = 0; index < deviceCount; ++index)
-        {
-            VkPhysicalDeviceProperties properties;
-            vkGetPhysicalDeviceProperties(devices[index], &properties);
-            if (properties.apiVersion < VK_API_VERSION_1_2) continue;
-            if (pass == 0u && properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                continue;
-
-            uint32_t familyCount = 0u;
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, NULL);
-            if (familyCount > 16u) familyCount = 16u;
-            VkQueueFamilyProperties families[16];
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, families);
-            for (uint32_t family = 0; family < familyCount; ++family)
-            {
-                if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) continue;
-                // Отдельную present-очередь не поддерживаем: годится
-                // только та же семья, что умеет показывать в surface.
-                if (renderer->hasSurface)
-                {
-                    VkBool32 presentSupport = VK_FALSE;
-                    if (vkGetPhysicalDeviceSurfaceSupportKHR(devices[index], family,
-                                                             renderer->surface,
-                                                             &presentSupport) != VK_SUCCESS ||
-                        presentSupport != VK_TRUE)
-                        continue;
-                }
-                chosen = devices[index];
-                chosenFamily = family;
-                chosenTimestampValidBits = families[family].timestampValidBits;
-                break;
-            }
-        }
-    }
+    const VkPhysicalDevice chosen =
+        ChoosePhysicalDevice(renderer, &chosenFamily, &chosenTimestampValidBits);
     if (chosen == VK_NULL_HANDLE) return false;
 
     renderer->physicalDevice = chosen;
@@ -3115,7 +3139,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         }
     }
 #endif
-    const char *deviceExtensions[2];
+    const char *deviceExtensions[3];
     uint32_t deviceExtensionCount = 0u;
     if (pushDescriptorCommand == NULL &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
@@ -3135,6 +3159,24 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         if (!DeviceExtensionSupported(chosen, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return false;
         deviceExtensions[deviceExtensionCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     }
+    // Без vsync FIFO_LATEST_READY сдерживает кадры очередью показа, и поток
+    // ждёт GPU во сне. MAILBOX сдерживает их в захвате образа, а драйвер
+    // NVIDIA ждёт там активно и занимает целое ядро.
+    renderer->presentLatestReady = false;
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latestReady = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+        .presentModeFifoLatestReady = VK_TRUE,
+    };
+    const char *latestReadyExtension = renderer->hasSurface ? LatestReadyExtension(chosen) : NULL;
+    if (latestReadyExtension != NULL)
+    {
+        deviceExtensions[deviceExtensionCount++] = latestReadyExtension;
+        latestReady.pNext = featureChain;
+        featureChain = &latestReady;
+        renderer->presentLatestReady = true;
+    }
+#endif
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = featureChain,
@@ -3425,13 +3467,10 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
         PendingUpload *upload = &renderer->pendingUploads[i];
         if (upload->resident != NULL)
             *upload->resident = false;
-        if (upload->stagingMemory != VK_NULL_HANDLE)
-        {
-            vkDestroyBuffer(renderer->device, upload->staging, NULL);
-            vkFreeMemory(renderer->device, upload->stagingMemory, NULL);
-        }
     }
     renderer->pendingUploadCount = 0u;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+        ReleaseStagingOverflow(renderer, frame);
     FreeAllGenericDescriptorSets(renderer);
     DrainDeferredReleases(renderer, true);
 
@@ -3559,6 +3598,7 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             BufferDestroy(renderer, &renderer->constantBuffers[frame]);
             BufferDestroy(renderer, &renderer->meshUploadBuffers[frame]);
             BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frame]);
+            ReleaseStagingOverflow(renderer, frame);
             for (uint32_t chunk = 0u; chunk < renderer->instanceChunkCount[frame]; ++chunk)
                 BufferDestroy(renderer, &renderer->instanceBuffers[frame][chunk]);
             BufferDestroy(renderer, &renderer->uiQuadBuffers[frame]);
@@ -3614,10 +3654,112 @@ void RendererDestroy_Vulkan(Renderer *renderer)
     if (renderer->surface != VK_NULL_HANDLE && renderer->instance != VK_NULL_HANDLE)
         vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
     if (renderer->instance != VK_NULL_HANDLE) vkDestroyInstance(renderer->instance, NULL);
+    PlatformFree(renderer->pendingUploads);
+    PlatformFree(renderer->uploadRegionScratch);
+    PlatformFree((void *)renderer->recordedUploadResidencies);
     PlatformFree(renderer);
 }
 
 // === Меши ===
+
+static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
+{
+    uint32_t frameIndex = renderer->frameIndex;
+    if (renderer->deviceFailed || frameIndex >= FRAME_COUNT)
+        return false;
+    if (renderer->uploadSlotReady[frameIndex])
+        return true;
+    // Mesh/index creation writes staging before BeginFrame. Wait before the
+    // first write, then retain its cursor until that slot has been submitted.
+    if (vkWaitForFences(renderer->device, 1u, &renderer->frameFences[frameIndex], VK_TRUE,
+                        UINT64_MAX) != VK_SUCCESS)
+    {
+        FailVulkanDevice(renderer);
+        return false;
+    }
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
+    renderer->uploadSlotReady[frameIndex] = true;
+    return true;
+}
+
+// Копирует запись в дополнительный блок текущего слота, начиная новый
+// блок, когда в последнем не хватает места.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          VkBuffer *outStaging, uint32_t *outOffset)
+{
+    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
+    StagingOverflow *chunk = *head;
+    VkDeviceSize offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(VkDeviceSize)15u;
+    if (chunk == NULL || offset > chunk->buffer.sizeBytes ||
+        sizeBytes > chunk->buffer.sizeBytes - offset)
+    {
+        chunk = (StagingOverflow *)PlatformAllocate(sizeof(*chunk), true);
+        if (chunk == NULL)
+            return false;
+        const VkDeviceSize chunkBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+                                            ? (VkDeviceSize)sizeBytes
+                                            : (VkDeviceSize)LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        if (!BufferCreate(renderer, chunkBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                          &chunk->buffer))
+        {
+            PlatformFree(chunk);
+            return false;
+        }
+        chunk->next = *head;
+        *head = chunk;
+        offset = 0u;
+    }
+    memcpy(chunk->buffer.mapped + offset, data, sizeBytes);
+    chunk->usedBytes = offset + sizeBytes;
+    *outStaging = chunk->buffer.buffer;
+    // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
+    *outOffset = (uint32_t)offset;
+    return true;
+}
+
+// Гарантирует место ещё под одну загрузку. Новые массивы заполняются
+// до замены старых, поэтому отказ ничего не меняет.
+static bool ReservePendingUpload(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount < renderer->pendingUploadCapacity)
+        return true;
+    // Удвоение 32-битной ёмкости проверяется на переполнение, а её
+    // произведение на размер записи в 64-битном size_t (движок собирается
+    // только под 64 бита) переполниться не может.
+    const uint32_t capacity = renderer->pendingUploadCapacity == 0u
+                                  ? PENDING_UPLOAD_INITIAL_CAPACITY
+                                  : renderer->pendingUploadCapacity * 2u;
+    if (capacity <= renderer->pendingUploadCapacity)
+        return false;
+    PendingUpload *uploads =
+        (PendingUpload *)PlatformAllocate((size_t)capacity * sizeof(*uploads), false);
+    VkBufferCopy *regions =
+        (VkBufferCopy *)PlatformAllocate((size_t)capacity * sizeof(*regions), false);
+    bool **residencies = (bool **)PlatformAllocate((size_t)capacity * sizeof(*residencies), false);
+    if (uploads == NULL || regions == NULL || residencies == NULL)
+    {
+        PlatformFree(uploads);
+        PlatformFree(regions);
+        PlatformFree((void *)residencies);
+        return false;
+    }
+    if (renderer->pendingUploadCount != 0u)
+        memcpy(uploads, renderer->pendingUploads,
+               (size_t)renderer->pendingUploadCount * sizeof(*uploads));
+    if (renderer->recordedUploadCount != 0u)
+        memcpy((void *)residencies, (const void *)renderer->recordedUploadResidencies,
+               (size_t)renderer->recordedUploadCount * sizeof(*residencies));
+    PlatformFree(renderer->pendingUploads);
+    PlatformFree(renderer->uploadRegionScratch);
+    PlatformFree((void *)renderer->recordedUploadResidencies);
+    renderer->pendingUploads = uploads;
+    renderer->uploadRegionScratch = regions;
+    renderer->recordedUploadResidencies = residencies;
+    renderer->pendingUploadCapacity = capacity;
+    return true;
+}
 
 // Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
 // Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
@@ -3639,40 +3781,38 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
 {
     if (renderer == NULL || !renderer->worldReady || data == NULL || sizeBytes == 0u ||
         renderer->frameRecording || renderer->deviceFailed ||
-        renderer->pendingUploadCount == MAX_PENDING_UPLOADS ||
-        !EnsureVulkanUploadSlotReady(renderer))
+        !EnsureVulkanUploadSlotReady(renderer) || !ReservePendingUpload(renderer))
         return NULL;
 
+    // Сначала то, что откатывается без следа, затем диапазон пула и staging.
+    GeometryAllocation *allocation = PlatformAllocate(allocationBytes, true);
+    if (allocation == NULL)
+        return NULL;
     uint32_t allocatedBytes = PoolSpanBytes(renderer, sizeBytes);
     uint32_t blockIndex = 0u;
     uint32_t offsetBytes = 0u;
-    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes)) return NULL;
-    if (!EnsureBlockDescriptorSets(renderer, blockIndex))
+    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes))
     {
-        if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
-            renderer->poolUsedBytes -= allocatedBytes;
+        PlatformFree(allocation);
         return NULL;
     }
 
-    GpuBuffer ownedStaging;
-    memset(&ownedStaging, 0, sizeof(ownedStaging));
     VkBuffer staging = VK_NULL_HANDLE;
     uint32_t sourceOffset = AlignUp(renderer->meshUploadOffsets[renderer->frameIndex], 16u);
-    bool ownsStaging = false;
-    bool usedLargeRing = false;
     bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME &&
                          sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
-    if (fitsSmallRing)
+    bool staged = EnsureBlockDescriptorSets(renderer, blockIndex);
+    if (staged && fitsSmallRing)
     {
         staging = renderer->meshUploadBuffers[renderer->frameIndex].buffer;
         memcpy(renderer->meshUploadBuffers[renderer->frameIndex].mapped + sourceOffset, data,
                sizeBytes);
         renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset + sizeBytes;
     }
-    else
+    else if (staged)
     {
         // Крупная запись: сначала пробуем общую арену того же кадра, и
-        // только если запись не помещается и туда — отдельный буфер.
+        // только если запись не помещается и туда — дополнительный блок.
         uint32_t largeOffset =
             AlignUp(renderer->largeMeshUploadOffsets[renderer->frameIndex], 16u);
         bool fitsLargeRing =
@@ -3682,36 +3822,18 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
         {
             staging = renderer->largeMeshUploadBuffers[renderer->frameIndex].buffer;
             sourceOffset = largeOffset;
-            usedLargeRing = true;
             memcpy(renderer->largeMeshUploadBuffers[renderer->frameIndex].mapped + largeOffset,
                    data, sizeBytes);
             renderer->largeMeshUploadOffsets[renderer->frameIndex] = largeOffset + sizeBytes;
         }
         else
-        {
-            if (!BufferCreate(renderer, sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
-                              &ownedStaging))
-            {
-                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
-                    renderer->poolUsedBytes -= allocatedBytes;
-                return NULL;
-            }
-            memcpy(ownedStaging.mapped, data, sizeBytes);
-            staging = ownedStaging.buffer;
-            sourceOffset = 0u;
-            ownsStaging = true;
-        }
+            staged = StageOverflow(renderer, data, sizeBytes, &staging, &sourceOffset);
     }
-
-    GeometryAllocation *allocation = PlatformAllocate(allocationBytes, true);
-    if (allocation == NULL)
+    if (!staged)
     {
-        if (ownsStaging) BufferDestroy(renderer, &ownedStaging);
-        else if (usedLargeRing)
-            renderer->largeMeshUploadOffsets[renderer->frameIndex] = sourceOffset;
-        else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
         if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
             renderer->poolUsedBytes -= allocatedBytes;
+        PlatformFree(allocation);
         return NULL;
     }
 
@@ -3724,7 +3846,6 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
 
     PendingUpload *upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
     upload->staging = staging;
-    upload->stagingMemory = ownsStaging ? ownedStaging.memory : VK_NULL_HANDLE;
     upload->sourceOffset = sourceOffset;
     upload->blockIndex = blockIndex;
     upload->destinationOffset = offsetBytes;
@@ -3767,8 +3888,8 @@ RendererIndexBuffer *RendererCreateIndexBuffer_Vulkan(Renderer *renderer, const 
                                                       uint32_t indexCount)
 {
     if (renderer == NULL || indices == NULL || !renderer->worldReady || renderer->frameRecording ||
-        renderer->deviceFailed || renderer->pendingUploadCount == MAX_PENDING_UPLOADS ||
-        indexCount == 0u || indexCount > UINT32_MAX / (uint32_t)sizeof(uint32_t))
+        renderer->deviceFailed || indexCount == 0u ||
+        indexCount > UINT32_MAX / (uint32_t)sizeof(uint32_t))
         return NULL;
     uint32_t sizeBytes = indexCount * (uint32_t)sizeof(uint32_t);
     if (sizeBytes > UINTPTR_MAX - (uintptr_t)indices)
@@ -4473,8 +4594,6 @@ static void RecordPendingUploadBatch(Renderer *renderer, VkCommandBuffer command
         if (upload->resident != NULL)
             *upload->resident = true;
         renderer->recordedUploadResidencies[renderer->recordedUploadCount++] = upload->resident;
-        if (upload->stagingMemory != VK_NULL_HANDLE)
-            DeferBufferRelease(renderer, upload->staging, upload->stagingMemory);
     }
 }
 
@@ -5060,6 +5179,43 @@ void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
     renderer->resizeWidth = width;
     renderer->resizeHeight = height;
     renderer->resizeRequested = true;
+}
+
+bool RendererReplaceSurface_Vulkan(Renderer *renderer, void *windowHandle, int32_t width,
+                                   int32_t height)
+{
+    // Offscreen-рендер поверхности не имеет и не получает: его цели кадра
+    // устроены иначе.
+    if (renderer == NULL || !renderer->hasSurface || renderer->device == VK_NULL_HANDLE)
+        return false;
+    WaitForGpu(renderer);
+    DestroySwapchainResources(renderer);
+    if (renderer->surface != VK_NULL_HANDLE)
+    {
+        vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
+        renderer->surface = VK_NULL_HANDLE;
+    }
+    // Без поверхности кадры пропускаются, как у свёрнутого окна, а
+    // swapchain собирается заново, когда поверхность вернётся.
+    renderer->swapchainOutOfDate = true;
+    RendererResize_Vulkan(renderer, 0, 0);
+    if (windowHandle == NULL)
+        return true;
+    VkBool32 supported = VK_FALSE;
+    if (!CreateSurface(renderer, windowHandle) ||
+        vkGetPhysicalDeviceSurfaceSupportKHR(renderer->physicalDevice, renderer->queueFamily,
+                                             renderer->surface, &supported) != VK_SUCCESS ||
+        supported != VK_TRUE)
+    {
+        if (renderer->surface != VK_NULL_HANDLE)
+        {
+            vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
+            renderer->surface = VK_NULL_HANDLE;
+        }
+        return false;
+    }
+    RendererResize_Vulkan(renderer, width, height);
+    return true;
 }
 
 // === Контент ===

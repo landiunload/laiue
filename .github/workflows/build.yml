@@ -17,6 +17,10 @@ permissions:
 # Версии тулчейнов, общие для нескольких jobs.
 env:
   LLVM_VERSION: '22'
+  # LLVM на Windows-раннере старше LLVM_VERSION; clang-tidy того же мажора
+  # берётся из официального установщика.
+  LLVM_WINDOWS_RELEASE: 22.1.8
+  LLVM_WINDOWS_SHA256: 16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c
   ANDROID_NDK_VERSION: 30.0.16248370
   # DXC собирает встроенные шейдеры; checked-in байткод обязан совпадать
   # с выводом именно этого релиза.
@@ -77,6 +81,7 @@ jobs:
           cmake --preset ${{ matrix.preset }} -DLAIUE_BUILD_EXAMPLES=ON
           -DLAIUE_REQUIRE_D3D12_TEST_DRIVER=ON
           "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build Debug
         run: cmake --build --preset ${{ matrix.preset }}-debug --parallel
       - name: Test Debug
@@ -134,6 +139,31 @@ jobs:
           name: laiue-engine-windows-x86_64
           path: build/windows-msvc/bundles/engine/Release
           if-no-files-found: error
+      # Linux- и Android-анализ не видят код только для Windows (D3D12,
+      # WASAPI, Win32); база clang-cl этой сборки проверяет его тем же
+      # .clang-tidy. run-clang-tidy на Windows сравнивает фильтр с путями
+      # через обратную косую черту.
+      - name: Run clang-tidy on the Windows sources
+        if: matrix.preset == 'windows-clang'
+        shell: pwsh
+        run: |
+          if (-not $env:LLVM_WINDOWS_RELEASE.StartsWith("$env:LLVM_VERSION.")) {
+            throw 'LLVM_WINDOWS_RELEASE must belong to LLVM_VERSION'
+          }
+          $installer = Join-Path $env:RUNNER_TEMP 'llvm.exe'
+          curl.exe --fail --location --retry 3 --retry-all-errors --output $installer `
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_WINDOWS_RELEASE/LLVM-$env:LLVM_WINDOWS_RELEASE-win64.exe"
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $env:LLVM_WINDOWS_SHA256) {
+            throw 'LLVM installer checksum mismatch'
+          }
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm'
+          7z x $installer "-o$llvm" 'bin\clang-tidy.exe' 'bin\run-clang-tidy' `
+            "lib\clang\$env:LLVM_VERSION\include" -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed with exit code $LASTEXITCODE" }
+          $source = [regex]::Escape((Join-Path $env:GITHUB_WORKSPACE 'src\'))
+          python (Join-Path $llvm 'bin\run-clang-tidy') `
+            -clang-tidy-binary (Join-Path $llvm 'bin\clang-tidy.exe') `
+            -p build/windows-clang -quiet -j $env:NUMBER_OF_PROCESSORS "^$source.*[.]c$"
       - name: Verify build did not modify sources
         run: >
           cmake "-DSOURCE_ROOT=$env:GITHUB_WORKSPACE"
@@ -252,7 +282,7 @@ jobs:
         if: matrix.preset == 'linux-gcc'
         run: >
           cmake --build --preset linux-gcc-debug --parallel
-          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark laiue_animation_benchmark
+          --target laiue_benchmarks
       - name: Test Debug
         run: ctest --preset ${{ matrix.preset }}-debug --parallel --no-tests=error
       - name: Build Release
@@ -262,7 +292,7 @@ jobs:
         if: matrix.preset == 'linux-gcc'
         run: >
           cmake --build --preset linux-gcc-release --parallel
-          --target laiue_mesh_world_query_benchmark laiue_audio_stream_benchmark laiue_animation_benchmark
+          --target laiue_benchmarks
       - name: Test Release
         if: matrix.preset != 'linux-gcc-asan'
         run: ctest --preset ${{ matrix.preset }}-release --parallel --no-tests=error
@@ -500,6 +530,20 @@ jobs:
         run: |
           cmake --preset android-arm64-walk
           cmake --build --preset android-arm64-walk-release --parallel
+      # Модули — отдельные .so, которые программа грузит по имени, как DLL
+      # на настольных системах.
+      - name: Compile and link Android programs on modules by name
+        run: |
+          cmake --preset android-arm64-shared -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build --preset android-arm64-shared-release --parallel
+      # Linux-анализ не видит код под __ANDROID__ и ветки ARM64; база этой
+      # сборки проверяет их тем же .clang-tidy.
+      - name: Run clang-tidy on the Android sources
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "clang-tidy-$LLVM_VERSION"
+          run-clang-tidy-"$LLVM_VERSION" -p build/android-arm64-shared -quiet -j "$(nproc)" \
+            "$GITHUB_WORKSPACE/src/.*[.]c$"
       - name: Verify build did not modify sources
         run: |
           cmake -DSOURCE_ROOT="$GITHUB_WORKSPACE" \
@@ -508,7 +552,7 @@ jobs:
   android-emulator-runtime:
     name: Android native Vulkan runtime
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       LAIUE_ANDROID_IMAGE: android-37.0
       LAIUE_BUILD_TOOLS: 37.0.0
@@ -583,18 +627,25 @@ jobs:
             -storetype PKCS12 -storepass android -keypass android \
             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 3650 \
             -dname 'CN=Android Debug,O=Android,C=US'
-      - name: Build and sign the native test APK
-        timeout-minutes: 8
+      - name: Build and sign the native test APKs
+        timeout-minutes: 12
         run: |
           tools="$ANDROID_HOME/build-tools/$LAIUE_BUILD_TOOLS"
-          cmake --preset android-x86_64-walk \
-            -DLAIUE_ANDROID_AAPT2="$tools/aapt2" \
-            -DLAIUE_ANDROID_ZIPALIGN="$tools/zipalign" \
-            -DLAIUE_ANDROID_APKSIGNER="$tools/apksigner" \
-            -DLAIUE_ANDROID_FRAMEWORK_JAR="$ANDROID_HOME/platforms/$LAIUE_ANDROID_IMAGE/android.jar" \
+          sdk_options=(
+            -DLAIUE_ANDROID_AAPT2="$tools/aapt2"
+            -DLAIUE_ANDROID_ZIPALIGN="$tools/zipalign"
+            -DLAIUE_ANDROID_APKSIGNER="$tools/apksigner"
+            -DLAIUE_ANDROID_FRAMEWORK_JAR="$ANDROID_HOME/platforms/$LAIUE_ANDROID_IMAGE/android.jar"
             -DLAIUE_ANDROID_KEYSTORE="$RUNNER_TEMP/laiue-ci-debug.p12"
+          )
+          cmake --preset android-x86_64-walk "${sdk_options[@]}"
           cmake --build build/android-x86_64-walk --config Release \
             --target laiue_walk_android_apk --parallel
+          # Программа на модулях по имени: окно, ввод, интерфейс и Vulkan —
+          # отдельные .so в APK.
+          cmake --preset android-x86_64-shared "${sdk_options[@]}"
+          cmake --build build/android-x86_64-shared --config Release \
+            --target laiue_viewer_apk --parallel
       - name: Boot the emulator with software Vulkan
         id: emulator
         timeout-minutes: 4
@@ -662,10 +713,69 @@ jobs:
           ./tools/test_android_walk.ps1 `
             -AdbPath "$env:ANDROID_HOME/platform-tools/adb" `
             -Serial emulator-5554 `
-            -Apk build/android-x86_64-walk/android/Release/laiue-walk.apk `
+            -Apk build/android-x86_64-walk/android/laiue_walk_android_apk.apk `
             -FrameCheckExe build/android-emulator-host/bin/Release/laiue_frame_check `
             -OutputDir build/android-runtime-results/captures `
             -TimeoutSeconds 240
+      - name: Verify a program on modules by name draws on Android
+        timeout-minutes: 5
+        run: |
+          adb="$ANDROID_HOME/platform-tools/adb"
+          log=build/android-runtime-results/viewer.log
+          viewer=dev.laiue.viewer/android.app.NativeActivity
+          fail() {
+            echo "$1"
+            cat "$log"
+            timeout 10s "$adb" -s emulator-5554 logcat -d -b crash || true
+            exit 1
+          }
+          # Ждёт, пока строк с текстом $1 в журнале viewer станет не меньше $2.
+          expect_lines() {
+            until timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log" \
+                && [ "$(grep -Fc "$1" "$log")" -ge "$2" ]; do
+              if grep -Fq 'main returned' "$log"; then
+                fail "a run of the viewer failed"
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                fail "expected $2 lines with: $1"
+              fi
+              sleep 0.5
+            done
+          }
+          viewer_process() {
+            timeout 10s "$adb" -s emulator-5554 shell pidof dev.laiue.viewer | tr -d '\r'
+          }
+          timeout 60s "$adb" -s emulator-5554 install -r \
+            build/android-x86_64-shared/android/laiue_viewer_apk.apk
+          timeout 10s "$adb" -s emulator-5554 logcat -c
+          deadline=$((SECONDS + 200))
+          # --smoke читает кадр с GPU и сравнивает центр с углом: картинка
+          # должна быть на экране, а не только в памяти.
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" --es args --smoke \
+            || fail "the viewer did not start"
+          expect_lines 'viewer: the picture is on screen' 1
+          expect_lines 'its activity is closing' 1
+          process="$(viewer_process)" || fail "the viewer process is gone"
+          # Android оставляет процесс, и следующие запуски идут в нём же.
+          # --activity-clear-task закрывает работающий viewer, но замену
+          # создаёт раньше, чем уничтожит его: второй main должен дождаться
+          # конца первого. Запуск сразу за выходом проверяет, что после этого
+          # процесс по-прежнему открывает программу и рисует.
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
+            || fail "the viewer did not start without arguments"
+          timeout 30s "$adb" -s emulator-5554 shell am start --activity-clear-task \
+            -n "$viewer" --es args --smoke || fail "the viewer did not start over itself"
+          expect_lines 'waiting for the previous run of the program to end' 1
+          expect_lines 'viewer: the picture is on screen' 2
+          expect_lines 'its activity is closing' 2
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" --es args --smoke \
+            || fail "the viewer did not start again"
+          expect_lines 'viewer: the picture is on screen' 3
+          cat "$log"
+          now="$(viewer_process)" || fail "the viewer process is gone"
+          if [ "$process" != "$now" ]; then
+            fail "the runs did not share process $process (now $now)"
+          fi
       - name: Stop the owned emulator process group
         if: always()
         timeout-minutes: 1
@@ -719,8 +829,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "clang-$LLVM_VERSION" "clang-tidy-$LLVM_VERSION" \
             libvulkan-dev libx11-dev
-      # Профиль Vulkan/X11 компилирует больше всего Linux-исходников; код
-      # только для Windows проверяется тем же .clang-tidy в дереве clang-cl.
+      # Профиль Vulkan/X11 компилирует больше всего Linux-исходников. Код
+      # Android и ветки ARM64 проверяет job Android ARM64, а код только для
+      # Windows — job windows-engine по базе clang-cl.
       - name: Configure with a compile database
         run: >
           cmake --preset linux-vulkan-offscreen -B build/tidy

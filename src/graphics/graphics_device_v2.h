@@ -68,6 +68,7 @@ typedef uint32_t (*LaiueGraphicsV2CreateShaderFn)(
     LaiueGraphicsHandle *outShader);
 typedef uint32_t (*LaiueGraphicsV2UploadBufferFn)(
     LaiueGraphicsDeviceV2 *, const LaiueGraphicsBufferUploadV1 *upload);
+/* Same contract as LaiueGraphicsDestroyHandleFn. */
 typedef void (*LaiueGraphicsV2DestroyHandleFn)(
     LaiueGraphicsDeviceV2 *, LaiueGraphicsHandle handle);
 typedef uint32_t (*LaiueGraphicsV2BeginFrameFn)(
@@ -169,6 +170,13 @@ typedef uint32_t (*LaiueGraphicsV2SetClearColorFn)(LaiueGraphicsDeviceV2 *, cons
  * returns 1 when it is on and 0 when it is off or unknown. */
 typedef uint32_t (*LaiueGraphicsV2SetVerticalSyncFn)(LaiueGraphicsDeviceV2 *, uint32_t enabled);
 typedef uint32_t (*LaiueGraphicsV2GetVerticalSyncFn)(const LaiueGraphicsDeviceV2 *);
+/* Moves presentation to another native window without recreating the device:
+ * every buffer, texture, pipeline and handle stays valid. NULL releases the
+ * current surface (Android takes it away when the activity pauses); frames are
+ * skipped until a new one is set. Returns zero when the provider cannot change
+ * surfaces (D3D12, offscreen) or rejects the new one. */
+typedef uint32_t (*LaiueGraphicsV2SetNativeWindowFn)(LaiueGraphicsDeviceV2 *, void *nativeWindow,
+                                                     int32_t width, int32_t height);
 
 struct LaiueGraphicsDeviceV2
 {
@@ -202,6 +210,7 @@ struct LaiueGraphicsDeviceV2
     LaiueGraphicsV2SetClearColorFn setClearColor;
     LaiueGraphicsV2SetVerticalSyncFn setVerticalSync;
     LaiueGraphicsV2GetVerticalSyncFn getVerticalSync;
+    LaiueGraphicsV2SetNativeWindowFn setNativeWindow;
 };
 
 #define LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE                                                  \
@@ -228,6 +237,9 @@ struct LaiueGraphicsDeviceV2
     ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, getVerticalSync) +                                 \
                 sizeof(LaiueGraphicsV2GetVerticalSyncFn)))
 
+#define LAIUE_GRAPHICS_DEVICE_V2_NATIVE_WINDOW_SIZE                                                \
+    ((uint32_t)(offsetof(LaiueGraphicsDeviceV2, setNativeWindow) +                                 \
+                sizeof(LaiueGraphicsV2SetNativeWindowFn)))
 typedef uint32_t (*LaiueGraphicsDeviceV2CreateFn)(void *nativeWindow, int32_t width, int32_t height,
                                                   uint32_t backend,
                                                   LaiueGraphicsDeviceV2 **outDevice);

@@ -1,4 +1,5 @@
 #include "platform/window.h"
+#include "platform/efficiency_windows.h"
 
 #include <windows.h>
 
@@ -156,6 +157,13 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
+        case WM_ACTIVATEAPP:
+            // Программа ушла в фон: процесс переходит в режим эффективности,
+            // как по переключателю диспетчера задач, и выходит из него
+            // вместе с возвращением фокуса.
+            PlatformEfficiencyModeSet(wParam == FALSE);
+            return DefWindowProcW(handle, message, wParam, lParam);
+
         case WM_ACTIVATE:
             if (window != NULL)
             {
@@ -177,6 +185,9 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             {
                 window->handle = NULL;
             }
+            // Без окна нечему уходить в фон: процесс, который продолжит
+            // работу, получает обратно прежний приоритет.
+            PlatformEfficiencyModeSet(false);
             return 0;
 
         default:
@@ -442,6 +453,22 @@ void WindowSetFullscreen(Window* window, bool enabled)
 bool WindowIsFullscreen(const Window* window)
 {
     return window->fullscreen;
+}
+
+void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback, void *userData)
+{
+    // Поверхность окна Win32 живёт вместе с окном и не меняется.
+    (void)window;
+    (void)callback;
+    (void)userData;
+}
+
+float WindowGetContentScale(const Window *window)
+{
+    // Процесс без объявленной осведомлённости о DPI получает 96, а окно
+    // целиком растягивает система: тогда пиксель окна и есть точка.
+    const UINT dpi = window != NULL ? GetDpiForWindow(window->handle) : 0u;
+    return dpi != 0u ? (float)dpi / (float)USER_DEFAULT_SCREEN_DPI : 1.0f;
 }
 
 void WindowRequestClose(Window* window)

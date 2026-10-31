@@ -79,9 +79,11 @@ cmake --preset android-x86_64-walk -DLAIUE_ANDROID_KEYSTORE=<keystore>
 cmake --build --preset android-x86_64-walk-release --target laiue_walk_android_apk
 ```
 
-The native target produces `android/Release/liblaiue_walk.so` and stages the
-manifest. The `laiue_walk_android_apk` target also embeds the example textures,
-aligns the package, and signs the APK with the supplied keystore. If
+The native target produces `android/Release/liblaiue_walk.so`. The
+`laiue_walk_android_apk` target packages it with `laiue_add_android_apk`, like
+every laiue program, into `android/laiue_walk_android_apk.apk`: it writes the
+manifest, embeds the example textures, strips the library, aligns the package
+and signs it with the supplied keystore. If
 `ANDROID_SDK_ROOT`/`ANDROID_HOME` points at an SDK with build-tools, CMake
 discovers `aapt2`, `zipalign`, `apksigner` and the highest installed
 `android.jar`; set `LAIUE_ANDROID_KEYSTORE` to enable APK packaging. The Android

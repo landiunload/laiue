@@ -27,6 +27,8 @@ static const LaiueWindowServiceV1 service = {
     .setFullscreen = WindowSetFullscreen,
     .isFullscreen = WindowIsFullscreen,
     .consumeText = WindowConsumeText,
+    .setSurfaceCallback = WindowSetSurfaceCallback,
+    .getContentScale = WindowGetContentScale,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

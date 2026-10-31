@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@LAIUE_APK_PACKAGE@">
+    <uses-feature android:name="android.hardware.vulkan.version"
+        android:version="0x00402000" android:required="true" />
+    <application android:label="@LAIUE_APK_LABEL@" android:hasCode="false"
+        android:extractNativeLibs="false"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <!-- Программа рисует всё сама и ресурсами Android не пользуется,
+             поэтому активность, а с ней и main, не должна перезапускаться ни
+             от поворота экрана, ни от клавиатуры или SIM-карты, ни от
+             оверлея, который Android ставит сразу после установки APK. Новым
+             системам это говорит resourcesUnused, старые смотрят на
+             остальные флаги. -->
+        <activity android:name="android.app.NativeActivity"
+            android:label="@LAIUE_APK_LABEL@"
+            android:screenOrientation="@LAIUE_APK_ORIENTATION@"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode|grammaticalGender|fontWeightAdjustment|assetsPaths|resourcesUnused"
+            android:resizeableActivity="true"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name"
+                android:value="@LAIUE_APK_ACTIVITY_LIBRARY@" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

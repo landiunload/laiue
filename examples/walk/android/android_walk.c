@@ -1653,6 +1653,24 @@ static void AndroidStep(AndroidWalkState *state)
     AndroidScenarioFrame(state, now, scenarioPresented, ticks != 0u);
 }
 
+/* The scenario world stands still while an external capture holds a
+ * checkpoint and after the run ends, and the compositor keeps showing the
+ * frame already presented. Drawing it again only takes the CPU from
+ * screencap, which on a software-rendered emulator then misses its deadline;
+ * a lifecycle change still gets a new frame. */
+static bool AndroidSceneHeld(const AndroidWalkState *state)
+{
+    return state->scenarioEnabled && !state->scenarioLifecyclePending &&
+           (state->scenarioCaptureWaiting || state->scenarioFinished || state->scenarioFailed);
+}
+
+static int AndroidPollTimeout(const AndroidWalkState *state)
+{
+    if (state->running && state->windowReady && !AndroidSceneHeld(state))
+        return 0;
+    return state->scenarioCaptureWaiting ? 250 : -1;
+}
+
 void android_main(struct android_app *app)
 {
     AndroidWalkState state;
@@ -1732,9 +1750,7 @@ void android_main(struct android_app *app)
         }
         int events = 0;
         struct android_poll_source *source = NULL;
-        int timeout = state.running && state.windowReady ? 0
-                      : state.scenarioCaptureWaiting     ? 250
-                                                         : -1;
+        int timeout = AndroidPollTimeout(&state);
         while (ALooper_pollOnce(timeout, NULL, &events, (void **)&source) >= 0)
         {
             if (source != NULL && source->process != NULL)
@@ -1748,13 +1764,11 @@ void android_main(struct android_app *app)
             }
             if (app->destroyRequested != 0)
                 break;
-            timeout = state.running && state.windowReady ? 0
-                      : state.scenarioCaptureWaiting     ? 250
-                                                         : -1;
+            timeout = AndroidPollTimeout(&state);
             if (timeout == 0)
                 break;
         }
-        if (state.running && state.windowReady)
+        if (state.running && state.windowReady && !AndroidSceneHeld(&state))
             AndroidStep(&state);
     }
 

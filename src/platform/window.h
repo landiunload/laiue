@@ -29,6 +29,11 @@ typedef struct WindowConfiguration
 
 typedef void (*FrameCallback)(void* userData);
 typedef void (*RawInputCallback)(void* userData, void* rawInputHandle);
+// available == false: поверхность окна уходит, и всё созданное из
+// WindowGetNativeHandle (Vulkan surface, swapchain) нужно отдать до
+// возврата из callback-а. available == true: появилась новая поверхность,
+// WindowGetNativeHandle уже возвращает её.
+typedef void (*SurfaceCallback)(void *userData, bool available);
 
 LAIUE_WINDOW_API Window* WindowCreate(const WindowConfiguration* configuration);
 LAIUE_WINDOW_API void    WindowDestroy(Window* window);
@@ -60,3 +65,16 @@ LAIUE_WINDOW_API uint32_t WindowConsumeText(Window* window, uint32_t* codepoints
 // режим восстанавливает прежние стиль и положение окна.
 LAIUE_WINDOW_API void    WindowSetFullscreen(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsFullscreen(const Window* window);
+
+// Поверхность, которая приходит и уходит, пока программа работает: на
+// Android её отнимает пауза активности. Вызывается изнутри WindowRunLoop и
+// никогда — на настольных системах, где поверхность живёт вместе с окном.
+// NULL снимает callback.
+LAIUE_WINDOW_API void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback,
+                                               void *userData);
+
+// Пикселей окна на точку интерфейса: размеры, заданные в точках (кнопка в
+// 44 точки), умножаются на это число. 1 — обычный экран в 96 точек на дюйм
+// (160 на Android); на плотном экране телефона — около 3. Меняется вместе с
+// экраном: читать каждый кадр.
+LAIUE_WINDOW_API float WindowGetContentScale(const Window *window);

@@ -32,11 +32,22 @@ typedef struct LaiueWindowServiceV1
     /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE. Text typed
      * since the last call, as WindowConsumeText. */
     uint32_t (*consumeText)(Window *window, uint32_t *codepoints, uint32_t capacity);
+    /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_SURFACE_SIZE. Surface
+     * loss and return, as WindowSetSurfaceCallback. */
+    void (*setSurfaceCallback)(Window *window, SurfaceCallback callback, void *userData);
+    /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE. Window
+     * pixels per interface point, as WindowGetContentScale. */
+    float (*getContentScale)(const Window *window);
 } LaiueWindowServiceV1;
 
-/* The service before the text tail, and with it. */
+/* The service before the text tail, with it, with the surface tail and with
+ * the content scale. */
 #define LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE                                                  \
     ((uint32_t)offsetof(LaiueWindowServiceV1, consumeText))
-#define LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE ((uint32_t)sizeof(LaiueWindowServiceV1))
+#define LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE                                                          \
+    ((uint32_t)offsetof(LaiueWindowServiceV1, setSurfaceCallback))
+#define LAIUE_WINDOW_SERVICE_V1_SURFACE_SIZE                                                       \
+    ((uint32_t)offsetof(LaiueWindowServiceV1, getContentScale))
+#define LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE ((uint32_t)sizeof(LaiueWindowServiceV1))
 
 const LaiueModuleApiV1 *LaiueWindowGetStaticModuleApiV1(void);
