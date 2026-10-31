@@ -25,6 +25,10 @@ API and ABI may change between minor versions.
 - On X11 `WindowSetFullscreen` asks the window manager for full screen
   (EWMH); before it only stored the flag. A held key no longer counts as
   repeated presses, because the window asks for detectable autorepeat.
+- On X11 a key types the character of its keysym, so Cyrillic and every
+  character a layout names by a Unicode keysym are typed, not only Latin-1.
+  As on Windows, keys held with Ctrl or Alt type nothing. The conversion is
+  portable and tested on every platform.
 - On X11 moving the window no longer reports a resize, only a new size does.
   Losing focus with Enter held no longer swallows the next Alt+Enter, and
   only a `WM_PROTOCOLS` message can close the window. The window asks the

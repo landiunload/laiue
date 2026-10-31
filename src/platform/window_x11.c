@@ -1,5 +1,6 @@
 #include "platform/window.h"
 
+#include "platform/keysym.h"
 #include "platform/system.h"
 
 #define Window X11Window
@@ -77,21 +78,21 @@ static void ProcessEvent(Window *window, XEvent *event)
             break;
         case KeyPress:
         {
-            /* Latin-1 from the key; other scripts need an input method. */
+            /* XLookupString applies Shift, Caps Lock and the layout group to
+             * the keysym, but its text is Latin-1 in the C locale: the
+             * character comes from the keysym, in any script. Ctrl and Alt
+             * make shortcuts, not text, as on Windows. */
             char bytes[8];
-            KeySym symbol = 0;
-            const int count =
-                XLookupString(&event->xkey, bytes, (int)sizeof(bytes), &symbol, NULL);
-            for (int index = 0; index < count; ++index)
+            KeySym symbol = NoSymbol;
+            (void)XLookupString(&event->xkey, bytes, (int)sizeof(bytes), &symbol, NULL);
+            const uint32_t codepoint = (event->xkey.state & (ControlMask | Mod1Mask)) == 0u
+                                           ? LaiueKeysymToCodepoint((uint32_t)symbol)
+                                           : 0u;
+            if (codepoint != 0u && window->textCount < WINDOW_TEXT_CAPACITY)
             {
-                const uint32_t codepoint = (uint32_t)(unsigned char)bytes[index];
-                if (codepoint >= 0x20u && codepoint != 0x7Fu &&
-                    window->textCount < WINDOW_TEXT_CAPACITY)
-                {
-                    window->text[(window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY] =
-                        codepoint;
-                    window->textCount++;
-                }
+                window->text[(window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY] =
+                    codepoint;
+                window->textCount++;
             }
             /* Alt+Enter switches full screen, as on Windows. */
             if (symbol == XK_Return && (event->xkey.state & Mod1Mask) != 0 &&

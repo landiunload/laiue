@@ -119,6 +119,10 @@ if(LAIUE_PLATFORM_WINDOWS)
 endif()
 laiue_add_harness(laiue_sha256_test Sha256TestEntryPoint ${laiue_sha256_sources}
     INCLUDES "${laiue_src}" TEST laiue.platform.sha256 TIMEOUT 60)
+# The characters X11 keysyms type. The table is portable, so every platform
+# checks it, not only the ones with X11.
+laiue_add_harness(laiue_keysym_test KeysymTestEntryPoint keysym_test.c
+    "${laiue_src}/platform/keysym.c" INCLUDES "${laiue_src}" TEST laiue.platform.keysym)
 laiue_add_harness(laiue_task_pool_test TaskPoolTestEntryPoint task_pool_test.c
     LIBRARIES laiue::task laiue::platform_support TEST laiue.task.pool TIMEOUT 20)
 
