@@ -99,13 +99,19 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define MAX_POOL_BLOCKS 64
 
 #define DEFERRED_RELEASE_CAPACITY 256
-#define DEFERRED_BUFFER_RELEASE_CAPACITY 512
-#define MAX_PENDING_UPLOADS 128
+// Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
+// и сохраняет ёмкость: в установившемся режиме она не выделяет память.
+#define PENDING_UPLOAD_INITIAL_CAPACITY 128u
 #define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
 // переиспользуется каждый кадр, поэтому на кадр не создаётся буфер.
+// Что не поместилось и туда, ложится в дополнительные блоки того же
+// кадрового слота размером не меньше арены. Блок делят все такие записи,
+// поэтому всплеск в тысячи мешей стоит нескольких выделений памяти, а не
+// тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
+// когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
 // Инстансы идут в независимых storage-буферах: descriptor set фиксирует
 // конкретный буфер до конца командного списка, поэтому растить один
@@ -224,7 +230,6 @@ typedef struct GeometryPoolBlock
 typedef struct PendingUpload
 {
     VkBuffer staging;
-    VkDeviceMemory stagingMemory;   // не NULL только у собственного буфера
     uint32_t sourceOffset;
     uint32_t blockIndex;
     uint32_t destinationOffset;
@@ -232,12 +237,12 @@ typedef struct PendingUpload
     bool *resident;
 } PendingUpload;
 
-typedef struct DeferredBufferRelease
+typedef struct StagingOverflow
 {
-    VkBuffer buffer;
-    VkDeviceMemory memory;
-    uint64_t safeFrameIndex;
-} DeferredBufferRelease;
+    struct StagingOverflow *next;
+    GpuBuffer buffer;
+    VkDeviceSize usedBytes;
+} StagingOverflow;
 
 typedef struct DeferredRangeRelease
 {
@@ -416,6 +421,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t meshUploadOffsets[FRAME_COUNT];
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
+    StagingOverflow *stagingOverflow[FRAME_COUNT];
     bool uploadSlotReady[FRAME_COUNT];
     GpuBuffer instanceBuffers[FRAME_COUNT][INSTANCE_MAX_CHUNKS_PER_FRAME];
     uint32_t instanceChunkCount[FRAME_COUNT];
@@ -443,15 +449,14 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint64_t poolCapacityBytes;
     uint64_t poolUsedBytes;
 
-    PendingUpload pendingUploads[MAX_PENDING_UPLOADS];
-    VkBufferCopy uploadRegionScratch[MAX_PENDING_UPLOADS];
+    // Три массива одной ёмкости: записанный кадр отмечает не больше
+    // резидентностей и областей копирования, чем было загрузок в очереди.
+    PendingUpload *pendingUploads;
+    VkBufferCopy *uploadRegionScratch;
+    bool **recordedUploadResidencies;
     uint32_t pendingUploadCount;
-    bool *recordedUploadResidencies[MAX_PENDING_UPLOADS];
+    uint32_t pendingUploadCapacity;
     uint32_t recordedUploadCount;
-
-    DeferredBufferRelease deferredBuffers[DEFERRED_BUFFER_RELEASE_CAPACITY];
-    uint32_t deferredBufferHead;
-    uint32_t deferredBufferCount;
 
     DeferredRangeRelease deferredRanges[DEFERRED_RELEASE_CAPACITY];
     uint32_t deferredRangeHead;
@@ -526,8 +531,6 @@ _Static_assert((GENERIC_DESCRIPTOR_LOOKUP_CAPACITY &
     "generic descriptor lookup capacity must be a power of two");
 _Static_assert(GENERIC_DESCRIPTOR_SET_CAPACITY < UINT16_MAX,
                "generic descriptor indices must fit in the lookup table");
-_Static_assert(DEFERRED_BUFFER_RELEASE_CAPACITY >= MAX_PENDING_UPLOADS * (FRAME_COUNT + 1u),
-               "staging release capacity must cover every retained frame and recording batch");
 
 // === Мелкие помощники ===
 
@@ -574,27 +577,6 @@ static bool GeometryIsReady(const Renderer *renderer, const GeometryAllocation *
     const GeometryPoolBlock *block = &renderer->poolBlocks[allocation->blockIndex];
     return block->buffer.buffer != VK_NULL_HANDLE && allocation->offsetBytes <= block->totalBytes &&
            allocation->sizeBytes <= block->totalBytes - allocation->offsetBytes;
-}
-
-static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
-{
-    uint32_t frameIndex = renderer->frameIndex;
-    if (renderer->deviceFailed || frameIndex >= FRAME_COUNT)
-        return false;
-    if (renderer->uploadSlotReady[frameIndex])
-        return true;
-    // Mesh/index creation writes staging before BeginFrame. Wait before the
-    // first write, then retain its cursor until that slot has been submitted.
-    if (vkWaitForFences(renderer->device, 1u, &renderer->frameFences[frameIndex], VK_TRUE,
-                        UINT64_MAX) != VK_SUCCESS)
-    {
-        FailVulkanDevice(renderer);
-        return false;
-    }
-    renderer->meshUploadOffsets[frameIndex] = 0u;
-    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
-    renderer->uploadSlotReady[frameIndex] = true;
-    return true;
 }
 
 static uint32_t AlignUp(uint32_t value, uint32_t alignment)
@@ -693,6 +675,20 @@ static bool BufferCreate(Renderer *renderer, VkDeviceSize sizeBytes, VkBufferUsa
     }
     outBuffer->sizeBytes = sizeBytes;
     return true;
+}
+
+// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
+    renderer->stagingOverflow[frameIndex] = NULL;
+    while (chunk != NULL)
+    {
+        StagingOverflow *next = chunk->next;
+        BufferDestroy(renderer, &chunk->buffer);
+        PlatformFree(chunk);
+        chunk = next;
+    }
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -1280,18 +1276,6 @@ static void PoolReclaimEmptyTail(Renderer *renderer)
 
 static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
 {
-    while (renderer->deferredBufferCount > 0u)
-    {
-        DeferredBufferRelease *entry = &renderer->deferredBuffers[renderer->deferredBufferHead];
-        if (!releaseEverything && entry->safeFrameIndex > renderer->submittedFrames) break;
-        if (entry->buffer != VK_NULL_HANDLE)
-            vkDestroyBuffer(renderer->device, entry->buffer, NULL);
-        if (entry->memory != VK_NULL_HANDLE)
-            vkFreeMemory(renderer->device, entry->memory, NULL);
-        renderer->deferredBufferHead =
-            (renderer->deferredBufferHead + 1u) % DEFERRED_BUFFER_RELEASE_CAPACITY;
-        renderer->deferredBufferCount--;
-    }
     while (renderer->deferredRangeCount > 0u)
     {
         DeferredRangeRelease *entry = &renderer->deferredRanges[renderer->deferredRangeHead];
@@ -1326,19 +1310,6 @@ static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
     }
 
     PoolReclaimEmptyTail(renderer);
-}
-
-static void DeferBufferRelease(Renderer *renderer, VkBuffer buffer, VkDeviceMemory memory)
-{
-    // Only the bounded pending-upload batch calls this helper. BeginFrame
-    // drains the completed slot first, so the capacity assertion covers all
-    // retained batches without waiting or draining the current unsent frame.
-    uint32_t slot = (renderer->deferredBufferHead + renderer->deferredBufferCount) %
-                    DEFERRED_BUFFER_RELEASE_CAPACITY;
-    renderer->deferredBuffers[slot].buffer = buffer;
-    renderer->deferredBuffers[slot].memory = memory;
-    renderer->deferredBuffers[slot].safeFrameIndex = renderer->submittedFrames + FRAME_COUNT;
-    renderer->deferredBufferCount++;
 }
 
 // === Дескрипторы и конвейеры ===
@@ -3425,13 +3396,10 @@ void RendererReleaseWorld_Vulkan(Renderer *renderer)
         PendingUpload *upload = &renderer->pendingUploads[i];
         if (upload->resident != NULL)
             *upload->resident = false;
-        if (upload->stagingMemory != VK_NULL_HANDLE)
-        {
-            vkDestroyBuffer(renderer->device, upload->staging, NULL);
-            vkFreeMemory(renderer->device, upload->stagingMemory, NULL);
-        }
     }
     renderer->pendingUploadCount = 0u;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+        ReleaseStagingOverflow(renderer, frame);
     FreeAllGenericDescriptorSets(renderer);
     DrainDeferredReleases(renderer, true);
 
@@ -3559,6 +3527,7 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             BufferDestroy(renderer, &renderer->constantBuffers[frame]);
             BufferDestroy(renderer, &renderer->meshUploadBuffers[frame]);
             BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frame]);
+            ReleaseStagingOverflow(renderer, frame);
             for (uint32_t chunk = 0u; chunk < renderer->instanceChunkCount[frame]; ++chunk)
                 BufferDestroy(renderer, &renderer->instanceBuffers[frame][chunk]);
             BufferDestroy(renderer, &renderer->uiQuadBuffers[frame]);
@@ -3614,10 +3583,112 @@ void RendererDestroy_Vulkan(Renderer *renderer)
     if (renderer->surface != VK_NULL_HANDLE && renderer->instance != VK_NULL_HANDLE)
         vkDestroySurfaceKHR(renderer->instance, renderer->surface, NULL);
     if (renderer->instance != VK_NULL_HANDLE) vkDestroyInstance(renderer->instance, NULL);
+    PlatformFree(renderer->pendingUploads);
+    PlatformFree(renderer->uploadRegionScratch);
+    PlatformFree((void *)renderer->recordedUploadResidencies);
     PlatformFree(renderer);
 }
 
 // === Меши ===
+
+static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
+{
+    uint32_t frameIndex = renderer->frameIndex;
+    if (renderer->deviceFailed || frameIndex >= FRAME_COUNT)
+        return false;
+    if (renderer->uploadSlotReady[frameIndex])
+        return true;
+    // Mesh/index creation writes staging before BeginFrame. Wait before the
+    // first write, then retain its cursor until that slot has been submitted.
+    if (vkWaitForFences(renderer->device, 1u, &renderer->frameFences[frameIndex], VK_TRUE,
+                        UINT64_MAX) != VK_SUCCESS)
+    {
+        FailVulkanDevice(renderer);
+        return false;
+    }
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
+    renderer->uploadSlotReady[frameIndex] = true;
+    return true;
+}
+
+// Копирует запись в дополнительный блок текущего слота, начиная новый
+// блок, когда в последнем не хватает места.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          VkBuffer *outStaging, uint32_t *outOffset)
+{
+    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
+    StagingOverflow *chunk = *head;
+    VkDeviceSize offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(VkDeviceSize)15u;
+    if (chunk == NULL || offset > chunk->buffer.sizeBytes ||
+        sizeBytes > chunk->buffer.sizeBytes - offset)
+    {
+        chunk = (StagingOverflow *)PlatformAllocate(sizeof(*chunk), true);
+        if (chunk == NULL)
+            return false;
+        const VkDeviceSize chunkBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+                                            ? (VkDeviceSize)sizeBytes
+                                            : (VkDeviceSize)LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        if (!BufferCreate(renderer, chunkBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                          &chunk->buffer))
+        {
+            PlatformFree(chunk);
+            return false;
+        }
+        chunk->next = *head;
+        *head = chunk;
+        offset = 0u;
+    }
+    memcpy(chunk->buffer.mapped + offset, data, sizeBytes);
+    chunk->usedBytes = offset + sizeBytes;
+    *outStaging = chunk->buffer.buffer;
+    // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
+    *outOffset = (uint32_t)offset;
+    return true;
+}
+
+// Гарантирует место ещё под одну загрузку. Новые массивы заполняются
+// до замены старых, поэтому отказ ничего не меняет.
+static bool ReservePendingUpload(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount < renderer->pendingUploadCapacity)
+        return true;
+    // Удвоение 32-битной ёмкости проверяется на переполнение, а её
+    // произведение на размер записи в 64-битном size_t (движок собирается
+    // только под 64 бита) переполниться не может.
+    const uint32_t capacity = renderer->pendingUploadCapacity == 0u
+                                  ? PENDING_UPLOAD_INITIAL_CAPACITY
+                                  : renderer->pendingUploadCapacity * 2u;
+    if (capacity <= renderer->pendingUploadCapacity)
+        return false;
+    PendingUpload *uploads =
+        (PendingUpload *)PlatformAllocate((size_t)capacity * sizeof(*uploads), false);
+    VkBufferCopy *regions =
+        (VkBufferCopy *)PlatformAllocate((size_t)capacity * sizeof(*regions), false);
+    bool **residencies = (bool **)PlatformAllocate((size_t)capacity * sizeof(*residencies), false);
+    if (uploads == NULL || regions == NULL || residencies == NULL)
+    {
+        PlatformFree(uploads);
+        PlatformFree(regions);
+        PlatformFree((void *)residencies);
+        return false;
+    }
+    if (renderer->pendingUploadCount != 0u)
+        memcpy(uploads, renderer->pendingUploads,
+               (size_t)renderer->pendingUploadCount * sizeof(*uploads));
+    if (renderer->recordedUploadCount != 0u)
+        memcpy((void *)residencies, (const void *)renderer->recordedUploadResidencies,
+               (size_t)renderer->recordedUploadCount * sizeof(*residencies));
+    PlatformFree(renderer->pendingUploads);
+    PlatformFree(renderer->uploadRegionScratch);
+    PlatformFree((void *)renderer->recordedUploadResidencies);
+    renderer->pendingUploads = uploads;
+    renderer->uploadRegionScratch = regions;
+    renderer->recordedUploadResidencies = residencies;
+    renderer->pendingUploadCapacity = capacity;
+    return true;
+}
 
 // Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
 // Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
@@ -3639,40 +3710,38 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
 {
     if (renderer == NULL || !renderer->worldReady || data == NULL || sizeBytes == 0u ||
         renderer->frameRecording || renderer->deviceFailed ||
-        renderer->pendingUploadCount == MAX_PENDING_UPLOADS ||
-        !EnsureVulkanUploadSlotReady(renderer))
+        !EnsureVulkanUploadSlotReady(renderer) || !ReservePendingUpload(renderer))
         return NULL;
 
+    // Сначала то, что откатывается без следа, затем диапазон пула и staging.
+    GeometryAllocation *allocation = PlatformAllocate(allocationBytes, true);
+    if (allocation == NULL)
+        return NULL;
     uint32_t allocatedBytes = PoolSpanBytes(renderer, sizeBytes);
     uint32_t blockIndex = 0u;
     uint32_t offsetBytes = 0u;
-    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes)) return NULL;
-    if (!EnsureBlockDescriptorSets(renderer, blockIndex))
+    if (!PoolAllocate(renderer, sizeBytes, &blockIndex, &offsetBytes))
     {
-        if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
-            renderer->poolUsedBytes -= allocatedBytes;
+        PlatformFree(allocation);
         return NULL;
     }
 
-    GpuBuffer ownedStaging;
-    memset(&ownedStaging, 0, sizeof(ownedStaging));
     VkBuffer staging = VK_NULL_HANDLE;
     uint32_t sourceOffset = AlignUp(renderer->meshUploadOffsets[renderer->frameIndex], 16u);
-    bool ownsStaging = false;
-    bool usedLargeRing = false;
     bool fitsSmallRing = sourceOffset <= MESH_UPLOAD_BYTES_PER_FRAME &&
                          sizeBytes <= MESH_UPLOAD_BYTES_PER_FRAME - sourceOffset;
-    if (fitsSmallRing)
+    bool staged = EnsureBlockDescriptorSets(renderer, blockIndex);
+    if (staged && fitsSmallRing)
     {
         staging = renderer->meshUploadBuffers[renderer->frameIndex].buffer;
         memcpy(renderer->meshUploadBuffers[renderer->frameIndex].mapped + sourceOffset, data,
                sizeBytes);
         renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset + sizeBytes;
     }
-    else
+    else if (staged)
     {
         // Крупная запись: сначала пробуем общую арену того же кадра, и
-        // только если запись не помещается и туда — отдельный буфер.
+        // только если запись не помещается и туда — дополнительный блок.
         uint32_t largeOffset =
             AlignUp(renderer->largeMeshUploadOffsets[renderer->frameIndex], 16u);
         bool fitsLargeRing =
@@ -3682,36 +3751,18 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
         {
             staging = renderer->largeMeshUploadBuffers[renderer->frameIndex].buffer;
             sourceOffset = largeOffset;
-            usedLargeRing = true;
             memcpy(renderer->largeMeshUploadBuffers[renderer->frameIndex].mapped + largeOffset,
                    data, sizeBytes);
             renderer->largeMeshUploadOffsets[renderer->frameIndex] = largeOffset + sizeBytes;
         }
         else
-        {
-            if (!BufferCreate(renderer, sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
-                              &ownedStaging))
-            {
-                if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
-                    renderer->poolUsedBytes -= allocatedBytes;
-                return NULL;
-            }
-            memcpy(ownedStaging.mapped, data, sizeBytes);
-            staging = ownedStaging.buffer;
-            sourceOffset = 0u;
-            ownsStaging = true;
-        }
+            staged = StageOverflow(renderer, data, sizeBytes, &staging, &sourceOffset);
     }
-
-    GeometryAllocation *allocation = PlatformAllocate(allocationBytes, true);
-    if (allocation == NULL)
+    if (!staged)
     {
-        if (ownsStaging) BufferDestroy(renderer, &ownedStaging);
-        else if (usedLargeRing)
-            renderer->largeMeshUploadOffsets[renderer->frameIndex] = sourceOffset;
-        else renderer->meshUploadOffsets[renderer->frameIndex] = sourceOffset;
         if (PoolFree(&renderer->poolBlocks[blockIndex], offsetBytes, allocatedBytes))
             renderer->poolUsedBytes -= allocatedBytes;
+        PlatformFree(allocation);
         return NULL;
     }
 
@@ -3724,7 +3775,6 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
 
     PendingUpload *upload = &renderer->pendingUploads[renderer->pendingUploadCount++];
     upload->staging = staging;
-    upload->stagingMemory = ownsStaging ? ownedStaging.memory : VK_NULL_HANDLE;
     upload->sourceOffset = sourceOffset;
     upload->blockIndex = blockIndex;
     upload->destinationOffset = offsetBytes;
@@ -3767,8 +3817,8 @@ RendererIndexBuffer *RendererCreateIndexBuffer_Vulkan(Renderer *renderer, const 
                                                       uint32_t indexCount)
 {
     if (renderer == NULL || indices == NULL || !renderer->worldReady || renderer->frameRecording ||
-        renderer->deviceFailed || renderer->pendingUploadCount == MAX_PENDING_UPLOADS ||
-        indexCount == 0u || indexCount > UINT32_MAX / (uint32_t)sizeof(uint32_t))
+        renderer->deviceFailed || indexCount == 0u ||
+        indexCount > UINT32_MAX / (uint32_t)sizeof(uint32_t))
         return NULL;
     uint32_t sizeBytes = indexCount * (uint32_t)sizeof(uint32_t);
     if (sizeBytes > UINTPTR_MAX - (uintptr_t)indices)
@@ -4473,8 +4523,6 @@ static void RecordPendingUploadBatch(Renderer *renderer, VkCommandBuffer command
         if (upload->resident != NULL)
             *upload->resident = true;
         renderer->recordedUploadResidencies[renderer->recordedUploadCount++] = upload->resident;
-        if (upload->stagingMemory != VK_NULL_HANDLE)
-            DeferBufferRelease(renderer, upload->staging, upload->stagingMemory);
     }
 }
 
