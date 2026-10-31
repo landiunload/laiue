@@ -2886,6 +2886,69 @@ static bool CreateSurface(Renderer *renderer, void *windowHandle)
 #endif
 }
 
+// Чем больше, тем предпочтительнее тип устройства. CPU-драйвер — последний,
+// но тоже подходит: именно он позволяет проверять рендер там, где GPU нет
+// вовсе.
+static uint32_t DeviceTypeRank(VkPhysicalDeviceType type)
+{
+    switch (type)
+    {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return 5u;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 4u;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return 3u;
+    case VK_PHYSICAL_DEVICE_TYPE_OTHER: return 2u;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return 1u;
+    default: return 0u;
+    }
+}
+
+// Устройство Vulkan 1.2+ лучшего типа, семья которого рисует и, при
+// поверхности, показывает; из равных — первое в порядке загрузчика.
+// VK_NULL_HANDLE — подходящего нет.
+static VkPhysicalDevice ChoosePhysicalDevice(const Renderer *renderer, uint32_t *outFamily,
+                                             uint32_t *outTimestampValidBits)
+{
+    uint32_t deviceCount = 8u;
+    VkPhysicalDevice devices[8];
+    // VK_INCOMPLETE: устройств больше восьми, выбор идёт из первых.
+    const VkResult listed = vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, devices);
+    if (listed != VK_SUCCESS && listed != VK_INCOMPLETE) return VK_NULL_HANDLE;
+
+    VkPhysicalDevice chosen = VK_NULL_HANDLE;
+    uint32_t chosenRank = 0u;
+    for (uint32_t index = 0; index < deviceCount; ++index)
+    {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(devices[index], &properties);
+        const uint32_t rank = DeviceTypeRank(properties.deviceType) + 1u;
+        if (properties.apiVersion < VK_API_VERSION_1_2 || rank <= chosenRank) continue;
+
+        uint32_t familyCount = 16u;
+        VkQueueFamilyProperties families[16];
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, families);
+        for (uint32_t family = 0; family < familyCount; ++family)
+        {
+            if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) continue;
+            // Отдельную present-очередь не поддерживаем: годится только та
+            // же семья, что умеет показывать в surface.
+            if (renderer->hasSurface)
+            {
+                VkBool32 presentSupport = VK_FALSE;
+                if (vkGetPhysicalDeviceSurfaceSupportKHR(devices[index], family, renderer->surface,
+                                                         &presentSupport) != VK_SUCCESS ||
+                    presentSupport != VK_TRUE)
+                    continue;
+            }
+            chosen = devices[index];
+            chosenRank = rank;
+            *outFamily = family;
+            *outTimestampValidBits = families[family].timestampValidBits;
+            break;
+        }
+    }
+    return chosen;
+}
+
 static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 {
     // Оконная поверхность — единственное, ради чего включаются
@@ -2949,56 +3012,10 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         renderer->hasSurface = true;
     }
 
-    uint32_t deviceCount = 0u;
-    if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, NULL) != VK_SUCCESS ||
-        deviceCount == 0u)
-        return false;
-    if (deviceCount > 8u) deviceCount = 8u;
-    VkPhysicalDevice devices[8];
-    if (vkEnumeratePhysicalDevices(renderer->instance, &deviceCount, devices) != VK_SUCCESS)
-        return false;
-
-    // Дискретная карта предпочтительнее, но CPU-драйвер тоже подходит:
-    // именно он позволяет проверять рендер там, где GPU нет вовсе.
-    VkPhysicalDevice chosen = VK_NULL_HANDLE;
     uint32_t chosenFamily = 0u;
     uint32_t chosenTimestampValidBits = 0u;
-    for (uint32_t pass = 0; pass < 2u && chosen == VK_NULL_HANDLE; ++pass)
-    {
-        for (uint32_t index = 0; index < deviceCount; ++index)
-        {
-            VkPhysicalDeviceProperties properties;
-            vkGetPhysicalDeviceProperties(devices[index], &properties);
-            if (properties.apiVersion < VK_API_VERSION_1_2) continue;
-            if (pass == 0u && properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                continue;
-
-            uint32_t familyCount = 0u;
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, NULL);
-            if (familyCount > 16u) familyCount = 16u;
-            VkQueueFamilyProperties families[16];
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[index], &familyCount, families);
-            for (uint32_t family = 0; family < familyCount; ++family)
-            {
-                if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) continue;
-                // Отдельную present-очередь не поддерживаем: годится
-                // только та же семья, что умеет показывать в surface.
-                if (renderer->hasSurface)
-                {
-                    VkBool32 presentSupport = VK_FALSE;
-                    if (vkGetPhysicalDeviceSurfaceSupportKHR(devices[index], family,
-                                                             renderer->surface,
-                                                             &presentSupport) != VK_SUCCESS ||
-                        presentSupport != VK_TRUE)
-                        continue;
-                }
-                chosen = devices[index];
-                chosenFamily = family;
-                chosenTimestampValidBits = families[family].timestampValidBits;
-                break;
-            }
-        }
-    }
+    const VkPhysicalDevice chosen =
+        ChoosePhysicalDevice(renderer, &chosenFamily, &chosenTimestampValidBits);
     if (chosen == VK_NULL_HANDLE) return false;
 
     renderer->physicalDevice = chosen;
