@@ -210,7 +210,16 @@ uint32_t PlatformAtomicIncrementU32(volatile uint32_t *value)
 
 int64_t PlatformAtomicLoadI64(const volatile int64_t *value)
 {
-    return (int64_t)InterlockedCompareExchange64((volatile LONG64 *)value, 0, 0);
+#if defined(_M_X64)
+    // Как у 32-битной загрузки ниже: на x86-64 выровненная загрузка сама по
+    // себе атомарна и acquire. Блокирующий CAS превращал читателя в писателя
+    // строки кэша и к тому же писал в объект, переданный как const.
+    int64_t result = __iso_volatile_load64((const volatile __int64 *)value);
+    _ReadWriteBarrier();
+    return result;
+#else
+    return (int64_t)ReadAcquire64((const volatile LONG64 *)value);
+#endif
 }
 
 int64_t PlatformAtomicAddI64(volatile int64_t *value, int64_t addend)
@@ -234,7 +243,8 @@ uint32_t PlatformAtomicLoadU32Acquire(const volatile uint32_t *value)
     _ReadWriteBarrier();
     return result;
 #else
-    return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+    // На ARM64 загрузка с acquire — отдельная инструкция LDAR, без барьера.
+    return (uint32_t)ReadAcquire((const volatile LONG *)value);
 #endif
 }
 
@@ -260,22 +270,33 @@ void PlatformAtomicStoreU32Release(volatile uint32_t *value, uint32_t desired)
     _ReadWriteBarrier();
     __iso_volatile_store32((volatile __int32 *)value, (__int32)desired);
 #else
-    InterlockedExchange((volatile LONG *)value, (LONG)desired);
+    // На ARM64 запись с release — инструкция STLR.
+    WriteRelease((volatile LONG *)value, (LONG)desired);
 #endif
 }
 
-double PlatformMonotonicSeconds(void)
+// Частота счётчика задаётся при загрузке системы и больше не меняется.
+// Потоки, вошедшие сюда одновременно, запишут одно и то же значение, поэтому
+// хватает атомарных чтения и записи без упорядочивания.
+static uint64_t PerformanceFrequency(void)
 {
-    static LONGLONG frequency;
+    static volatile LONG64 cached;
+    LONG64 frequency = ReadNoFence64(&cached);
     if (frequency == 0)
     {
         LARGE_INTEGER value;
         QueryPerformanceFrequency(&value);
-        InterlockedCompareExchange64(&frequency, value.QuadPart, 0);
+        frequency = value.QuadPart;
+        WriteNoFence64(&cached, frequency);
     }
+    return (uint64_t)frequency;
+}
+
+double PlatformMonotonicSeconds(void)
+{
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart / (double)frequency;
+    return (double)counter.QuadPart / (double)PerformanceFrequency();
 }
 
 uint64_t PlatformMonotonicMilliseconds(void)
@@ -285,19 +306,12 @@ uint64_t PlatformMonotonicMilliseconds(void)
 
 uint64_t PlatformMonotonicNanoseconds(void)
 {
-    static LONGLONG frequency;
-    if (frequency == 0)
-    {
-        LARGE_INTEGER value;
-        QueryPerformanceFrequency(&value);
-        InterlockedCompareExchange64(&frequency, value.QuadPart, 0);
-    }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     // Целые секунды и остаток считаются раздельно: произведение счётчика
     // на миллиард переполнило бы 64 бита через несколько суток.
     const uint64_t ticks = (uint64_t)counter.QuadPart;
-    const uint64_t rate = (uint64_t)frequency;
+    const uint64_t rate = PerformanceFrequency();
     return ticks / rate * 1000000000u + ticks % rate * 1000000000u / rate;
 }
 
