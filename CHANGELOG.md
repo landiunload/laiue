@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The graphics device kept a texture or a sampler destroyed between
+  `beginFrame` and `endFrame`, and a shader destroyed while a pipeline used
+  it, until the device itself was destroyed: `destroyHandle` dropped those
+  calls. Now the texture and the sampler are released when the frame ends,
+  and the shader with its last pipeline.
 - Android runs programs on modules by name, like the desktop: with
   `LAIUE_MODULE_LIBRARY_TYPE=SHARED` every module is its own `.so` in the APK,
   and a missing one turns off only its technology. The `window` module brings
