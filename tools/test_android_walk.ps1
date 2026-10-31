@@ -141,32 +141,45 @@ function Save-Capture {
     # provider failed to unlink a capture that adb had just pulled.
     $remote = "/data/local/tmp/laiue-walk-$remoteRun-$Name.png"
     $local = Join-Path $OutputDir "$Name.png"
-    try {
-        Invoke-Adb -Arguments @('shell', 'screencap', '-p', $remote) -CommandTimeoutSeconds 7 | Out-Null
-        Invoke-Adb -Arguments @('pull', $remote, $local) -CommandTimeoutSeconds 7 | Out-Null
-    } finally {
-        # A failed cleanup must not replace the error of the capture itself.
+    # The program presents at the new surface size before the display finishes
+    # rotating, so a screenshot taken in between still shows the old
+    # orientation. Capture again until it agrees with the surface; a
+    # disagreement that outlasts the bound is a real failure.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
         try {
-            Invoke-Adb -Arguments @('shell', 'rm', '-f', $remote) -CommandTimeoutSeconds 3 | Out-Null
-        } catch {
-            Write-Warning "Could not remove $remote from the device: $_"
+            Invoke-Adb -Arguments @('shell', 'screencap', '-p', $remote) -CommandTimeoutSeconds 7 | Out-Null
+            Invoke-Adb -Arguments @('pull', $remote, $local) -CommandTimeoutSeconds 7 | Out-Null
+        } finally {
+            # A failed cleanup must not replace the error of the capture itself.
+            try {
+                Invoke-Adb -Arguments @('shell', 'rm', '-f', $remote) -CommandTimeoutSeconds 3 | Out-Null
+            } catch {
+                Write-Warning "Could not remove $remote from the device: $_"
+            }
         }
-    }
-    # The engine PNG decoder is the sole parser; it inspects a viewport without UI.
-    $imageText = Invoke-BoundedProcess -Executable $FrameCheckExe -Arguments @($local) `
-        -CommandTimeoutSeconds 10
-    $image = $imageText | ConvertFrom-Json
-    if ($image.status -ne 'PASS' -or -not $image.useful -or
-        $image.width -le 0 -or $image.height -le 0) {
-        throw "Shared frame checker rejected $Name."
-    }
-    # System bars can sit below portrait surfaces or beside landscape surfaces.
-    # Accept only a bounded inset on either axis and the same orientation.
-    if ($image.width -lt $NativeWidth -or $image.width -gt $NativeWidth * 1.25 -or
-        $image.height -lt $NativeHeight -or $image.height -gt $NativeHeight * 1.25 -or
-        (($image.width -gt $image.height) -ne ($NativeWidth -gt $NativeHeight))) {
-        throw "Native surface and screenshot dimensions disagree for $Name."
-    }
+        # The engine PNG decoder is the sole parser; it inspects a viewport without UI.
+        $imageText = Invoke-BoundedProcess -Executable $FrameCheckExe -Arguments @($local) `
+            -CommandTimeoutSeconds 10
+        $image = $imageText | ConvertFrom-Json
+        if ($image.status -ne 'PASS' -or -not $image.useful -or
+            $image.width -le 0 -or $image.height -le 0) {
+            $problem = "Shared frame checker rejected $Name."
+        } elseif ($image.width -lt $NativeWidth -or $image.width -gt $NativeWidth * 1.25 -or
+            $image.height -lt $NativeHeight -or $image.height -gt $NativeHeight * 1.25 -or
+            (($image.width -gt $image.height) -ne ($NativeWidth -gt $NativeHeight))) {
+            # System bars can sit below portrait surfaces or beside landscape
+            # surfaces. Accept only a bounded inset on either axis and the
+            # same orientation.
+            $problem = "Native surface ${NativeWidth}x$NativeHeight and screenshot " +
+                "$($image.width)x$($image.height) disagree for $Name."
+        } else {
+            $problem = $null
+        }
+        if ($null -eq $problem) { break }
+        if ($clock.Elapsed.TotalSeconds -ge 10) { throw $problem }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
     $capture = [pscustomobject]@{
         name = $Name; checkpoint = $Checkpoint; path = $local
         nativeWidth = $NativeWidth; nativeHeight = $NativeHeight
