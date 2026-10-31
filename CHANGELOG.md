@@ -17,6 +17,10 @@ API and ABI may change between minor versions.
 - The APK's activity takes every configuration change itself, the resource
   overlay Android applies right after installation included. Android used to
   restart it then, and `main` was stopped and run again in the same process.
+- The D3D12 and Vulkan renderers accept any number of geometry uploads between
+  two frames; past 128 they used to refuse them until the next frame. Bytes
+  that miss both staging rings of a frame share overflow blocks freed once the
+  frame completes, instead of one staging buffer per upload.
 - On Android, iOS, tvOS and visionOS `LAIUE_PLATFORM_BACKEND=AUTO` picks the
   bundled mobile adapter, and on Android `LAIUE_MODULE_LIBRARY_TYPE=AUTO` builds
   shared modules: a program needs only the NDK toolchain file.
