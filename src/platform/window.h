@@ -78,3 +78,18 @@ LAIUE_WINDOW_API void WindowSetSurfaceCallback(Window *window, SurfaceCallback c
 // (160 на Android); на плотном экране телефона — около 3. Меняется вместе с
 // экраном: читать каждый кадр.
 LAIUE_WINDOW_API float WindowGetContentScale(const Window *window);
+
+// Как программа расходует энергию, общее для процесса.
+// AUTO: пока программа в фоне, процесс в режиме эффективности Windows (как у
+// переключателя в диспетчере задач: EcoQoS и низкий приоритет), а на переднем
+// плане QoS выбирает система. EFFICIENCY: режим эффективности всегда.
+// PERFORMANCE: никогда, и система не замедляет процесс даже в фоне.
+#define WINDOW_POWER_AUTO 0u
+#define WINDOW_POWER_EFFICIENCY 1u
+#define WINDOW_POWER_PERFORMANCE 2u
+
+// true — система применяет политику. Такой механизм есть только у Windows;
+// на других системах политика запоминается, но ничего не меняет.
+// Неизвестное значение даёт false и оставляет прежнюю политику.
+LAIUE_WINDOW_API bool WindowSetPowerPolicy(uint32_t policy);
+LAIUE_WINDOW_API uint32_t WindowGetPowerPolicy(void);

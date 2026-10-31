@@ -228,6 +228,14 @@ LAIUE_TEST_ENTRY(OptionalModulesTestEntryPoint)
     Expect(inputService != NULL && inputService->create != NULL &&
                windowService != NULL && windowService->create != NULL,
            "platform providers load independently of the render backend");
+    Expect(size >= LAIUE_WINDOW_SERVICE_V1_POWER_SIZE &&
+               windowService->getPowerPolicy() == WINDOW_POWER_AUTO,
+           "the window service starts with the automatic power policy");
+    (void)windowService->setPowerPolicy(WINDOW_POWER_PERFORMANCE);
+    Expect(!windowService->setPowerPolicy(WINDOW_POWER_PERFORMANCE + 1u) &&
+               windowService->getPowerPolicy() == WINDOW_POWER_PERFORMANCE,
+           "an unknown power policy keeps the current one");
+    /* Выгрузка модуля возвращает процессу режим по умолчанию. */
     LaiueModuleHostUnloadAll(host);
 
     LaiueModuleBinaryV1 uiOnly = {uiPath, 0u, NULL};
