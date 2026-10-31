@@ -12,6 +12,7 @@
 #include <mmdeviceapi.h>
 
 #include "audio/audio_backend.h"
+#include "platform/efficiency_windows.h"
 #include "platform/system.h"
 
 #include <string.h>
@@ -193,6 +194,9 @@ static uint32_t RenderThreadEntry(void *parameter)
     // MMCSS поднимает приоритет потока вывода: без него планировщик
     // способен отобрать квант посреди подготовки буфера и дать провал.
     taskHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    // Программа в фоне уходит в режим эффективности; звук при этом не должен
+    // заикаться, поэтому поток вывода остаётся с высоким QoS.
+    PlatformEfficiencyExemptCurrentThread();
 
     SignalStartState(backend, AUDIO_START_SUCCEEDED);
 

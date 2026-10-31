@@ -108,6 +108,10 @@ if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
 endif()
 laiue_add_harness(laiue_platform_threading_test PlatformThreadingTestEntryPoint
     platform_threading_test.c TEST laiue.platform.threading)
+if(LAIUE_PLATFORM_WINDOWS)
+    laiue_add_harness(laiue_efficiency_windows_test EfficiencyWindowsTestEntryPoint
+        efficiency_windows_test.c TEST laiue.platform.efficiency_mode)
+endif()
 # Windows hashes through BCrypt, so the portable sha256.c is compiled in here.
 set(laiue_sha256_sources sha256_test.c)
 if(LAIUE_PLATFORM_WINDOWS)
