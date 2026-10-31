@@ -1,4 +1,5 @@
 #include "platform/window.h"
+#include "platform/efficiency_windows.h"
 
 #include <windows.h>
 
@@ -156,6 +157,13 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
+        case WM_ACTIVATEAPP:
+            // Программа ушла в фон: процесс переходит в режим эффективности,
+            // как по переключателю диспетчера задач, и выходит из него
+            // вместе с возвращением фокуса.
+            PlatformEfficiencyModeSet(wParam == FALSE);
+            return DefWindowProcW(handle, message, wParam, lParam);
+
         case WM_ACTIVATE:
             if (window != NULL)
             {
@@ -177,6 +185,9 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             {
                 window->handle = NULL;
             }
+            // Без окна нечему уходить в фон: процесс, который продолжит
+            // работу, получает обратно прежний приоритет.
+            PlatformEfficiencyModeSet(false);
             return 0;
 
         default:

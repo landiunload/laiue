@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Windows a program in the background goes into efficiency mode, as with
+  the Task Manager switch: its process gets EcoQoS and low base priority, and
+  Task Manager shows the green leaf. The window module enters the mode when
+  another application becomes active and leaves it when the program is active
+  again or its window closes, restoring the previous priority class. Audio
+  output keeps high QoS, so playback in the background does not stutter.
 - On Windows `PlatformAtomicLoadI64` reads with an ordinary load instead of a
   locked compare-exchange, and on ARM64 the 32-bit acquire load and release
   store use `LDAR` and `STLR` instead of locked instructions. Threads that

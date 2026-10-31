@@ -36,7 +36,10 @@ if(LAIUE_PLATFORM_EXTERNAL)
     endif()
 else()
     if(LAIUE_PLATFORM_WINDOWS)
-        set(laiue_platform_system_sources system_windows.c)
+        set(laiue_platform_system_sources
+            system_windows.c
+            efficiency_windows.c
+            efficiency_windows.h)
     else()
         set(laiue_platform_system_sources
             system_posix.c
