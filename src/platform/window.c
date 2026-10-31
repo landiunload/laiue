@@ -29,15 +29,23 @@ struct Window
     LONG windowedStyle;                  // стиль окна до фуллскрина
     RawInputCallback rawInputCallback;
     void* rawInputUserData;
-    // Кадр программы, пока идёт WindowRunLoop: модальные циклы Windows
-    // вызывают его по таймеру.
+    // Кадр программы, пока идёт WindowRunLoop: в модальных циклах Windows
+    // его вызывают часы кадров.
     FrameCallback frameCallback;
     void* frameUserData;
     bool frameRunning;
     uint32_t modalDepth;                 // вложенность модальных циклов
+    // Часы кадров: поток, который будит оконную процедуру, пока модальный
+    // цикл держит поток окна. Создаются при первом модальном цикле.
+    HANDLE frameClock;
+    HANDLE frameClockWake;               // взведено, пока идёт модальный цикл
+    HANDLE frameDone;                    // кадр модального цикла закончен
+    HWND frameClockTarget;
+    volatile LONG frameClockStop;
+    volatile LONG frameTickPending;      // сообщение кадра ещё не разобрано
 };
 
-#define WINDOW_MODAL_FRAME_TIMER 1u
+#define WINDOW_FRAME_MESSAGE (WM_APP + 1u)
 
 // Политика энергопотребления процесса (WINDOW_POWER_*) и окна модуля, ещё не
 // получившие WM_DESTROY: без окон программе нечему быть в фоне. Политику
@@ -124,35 +132,111 @@ static void RunFrame(Window* window)
     window->frameRunning = false;
 }
 
+// Часы кадров: пока идёт модальный цикл, будят оконную процедуру к
+// следующему кадру, как только закончился предыдущий. SendNotifyMessage не
+// ждёт получателя, а присланное сообщение доходит до оконной процедуры из
+// любого ожидания сообщений. Таймер так не может: цикл кнопок заголовка
+// берёт из очереди только сообщения мыши, а цикл перетаскивания заголовка
+// до первого движения мыши не разбирает ничего.
+static DWORD WINAPI FrameClockMain(void* parameter)
+{
+    Window* window = (Window*)parameter;
+    for (;;)
+    {
+        WaitForSingleObject(window->frameClockWake, INFINITE);
+        if (InterlockedCompareExchange(&window->frameClockStop, 0, 0) != 0)
+        {
+            return 0;
+        }
+        if (InterlockedExchange(&window->frameTickPending, 1) == 0
+            && !SendNotifyMessageW(window->frameClockTarget, WINDOW_FRAME_MESSAGE, 0, 0))
+        {
+            InterlockedExchange(&window->frameTickPending, 0);
+        }
+        // Следующее сообщение — когда кадр закончится; если кадр не начался,
+        // повтор через период обновления обычного экрана.
+        WaitForSingleObject(window->frameDone, 16);
+    }
+}
+
+static bool StartFrameClock(Window* window, HWND handle)
+{
+    if (window->frameClock != NULL)
+    {
+        return true;
+    }
+    window->frameClockTarget = handle;
+    window->frameClockWake = CreateEventW(NULL, TRUE, FALSE, NULL);
+    window->frameDone = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (window->frameClockWake != NULL && window->frameDone != NULL)
+    {
+        window->frameClock = CreateThread(NULL, (SIZE_T)64u * 1024u, FrameClockMain, window,
+            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    }
+    if (window->frameClock != NULL)
+    {
+        return true;
+    }
+    // Без часов кадры в модальных циклах просто стоят, как раньше.
+    if (window->frameClockWake != NULL)
+    {
+        CloseHandle(window->frameClockWake);
+        window->frameClockWake = NULL;
+    }
+    if (window->frameDone != NULL)
+    {
+        CloseHandle(window->frameDone);
+        window->frameDone = NULL;
+    }
+    return false;
+}
+
+static void StopFrameClock(Window* window)
+{
+    if (window->frameClock != NULL)
+    {
+        InterlockedExchange(&window->frameClockStop, 1);
+        SetEvent(window->frameClockWake);
+        SetEvent(window->frameDone);
+        WaitForSingleObject(window->frameClock, INFINITE);
+        CloseHandle(window->frameClock);
+        CloseHandle(window->frameClockWake);
+        CloseHandle(window->frameDone);
+        window->frameClock = NULL;
+        window->frameClockWake = NULL;
+        window->frameDone = NULL;
+    }
+}
+
 // Пока кнопка мыши держит заголовок, рамку или кнопку заголовка окна или
 // открыто меню окна, Windows крутит свой цикл сообщений внутри
 // DefWindowProc, и WindowRunLoop не получает управления. Кадры в это время
-// идут по таймеру. Мышь и клавиатура принадлежат системе: ввод программы
-// сбрасывается, как при потере фокуса, и raw input ей не передаётся, иначе
-// нажатие на заголовок стало бы щелчком в программе.
+// запускают часы кадров. Мышь и клавиатура принадлежат системе: ввод
+// программы сбрасывается, как при потере фокуса, и raw input ей не
+// передаётся, иначе нажатие на заголовок стало бы щелчком в программе.
 static void EnterModalLoop(Window* window, HWND handle)
 {
     window->modalDepth++;
     if (window->modalDepth == 1u)
     {
         window->focusLossPending = true;
-        if (window->frameCallback != NULL)
+        if (window->frameCallback != NULL && StartFrameClock(window, handle))
         {
-            SetTimer(handle, WINDOW_MODAL_FRAME_TIMER, USER_TIMER_MINIMUM, NULL);
+            SetEvent(window->frameClockWake);
         }
     }
 }
 
-static void LeaveModalLoop(Window* window, HWND handle)
+static void LeaveModalLoop(Window* window)
 {
     if (window->modalDepth == 0u)
     {
         return;
     }
     window->modalDepth--;
-    if (window->modalDepth == 0u)
+    if (window->modalDepth == 0u && window->frameClockWake != NULL)
     {
-        KillTimer(handle, WINDOW_MODAL_FRAME_TIMER);
+        ResetEvent(window->frameClockWake);
     }
 }
 
@@ -282,22 +366,9 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             {
                 return DefWindowProcW(handle, message, wParam, lParam);
             }
-            if (wParam == HTCAPTION)
-            {
-                // Нажатие на заголовок DefWindowProc отличает от
-                // перетаскивания: до первого движения мыши она около
-                // полсекунды ждёт и не разбирает сообщений, даже таймер.
-                // Движение в ту же точку сразу начинает перемещение, не
-                // сдвигая окна.
-                POINT cursor;
-                if (GetCursorPos(&cursor) && ScreenToClient(handle, &cursor))
-                {
-                    PostMessageW(handle, WM_MOUSEMOVE, 0, MAKELPARAM(cursor.x, cursor.y));
-                }
-            }
             EnterModalLoop(window, handle);
             const LRESULT result = DefWindowProcW(handle, message, wParam, lParam);
-            LeaveModalLoop(window, handle);
+            LeaveModalLoop(window);
             return result;
         }
 
@@ -314,17 +385,23 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
         case WM_EXITMENULOOP:
             if (window != NULL)
             {
-                LeaveModalLoop(window, handle);
+                LeaveModalLoop(window);
             }
             return DefWindowProcW(handle, message, wParam, lParam);
 
-        case WM_TIMER:
-            if (window != NULL && wParam == WINDOW_MODAL_FRAME_TIMER)
+        case WINDOW_FRAME_MESSAGE:
+            // Кадр модального цикла от часов кадров. Опоздавшее после конца
+            // цикла сообщение кадра не запускает: его ведёт WindowRunLoop.
+            if (window != NULL)
             {
-                RunFrame(window);
-                return 0;
+                InterlockedExchange(&window->frameTickPending, 0);
+                if (window->modalDepth != 0u && !window->frameRunning)
+                {
+                    RunFrame(window);
+                    SetEvent(window->frameDone);
+                }
             }
-            return DefWindowProcW(handle, message, wParam, lParam);
+            return 0;
 
         case WM_SYSCHAR:
             // Enter с Alt уже обработан: DefWindowProc искал бы его среди
@@ -354,6 +431,13 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             if (window != NULL && window->handle != NULL)
             {
                 window->handle = NULL;
+                // Окно закрыли изнутри модального цикла: часам больше
+                // некого будить.
+                window->modalDepth = 0u;
+                if (window->frameClockWake != NULL)
+                {
+                    ResetEvent(window->frameClockWake);
+                }
                 // Без окон процесс, который продолжит работу, получает
                 // обратно прежние QoS и приоритет.
                 AcquireSRWLockExclusive(&g_powerLock);
@@ -456,6 +540,7 @@ void WindowDestroy(Window* window)
     {
         DestroyWindow(window->handle);
     }
+    StopFrameClock(window);
 
     // Пока живы другие окна класса, вызов не пройдёт (ERROR_CLASS_HAS_WINDOWS)
     // и это нормально; последний уничтоживший — разрегистрирует.

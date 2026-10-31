@@ -8,8 +8,12 @@ API and ABI may change between minor versions.
 - On Windows frames go on while the window is dragged or resized, while a
   mouse button holds a caption button and while the window menu is open.
   `DefWindowProc` runs its own message loop until the button is released,
-  and `WindowRunLoop` stood still; now a timer runs the frames from the
-  window procedure. Input is reset when the system takes the mouse, as on
+  and `WindowRunLoop` stood still. Now a small thread wakes the window
+  procedure for each frame with `SendNotifyMessage`. Such a message gets
+  through any wait for messages. A timer does not: the caption buttons'
+  loop takes only mouse messages, and before the first mouse move a press
+  on the caption takes none at all. Input is reset when the system takes
+  the mouse, as on
   focus loss, and raw input reaches the program again only when the system
   gives the mouse back. A press on the caption no longer becomes a click in
   the program.
