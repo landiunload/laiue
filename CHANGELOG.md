@@ -16,13 +16,13 @@ API and ABI may change between minor versions.
   store use `LDAR` and `STLR` instead of locked instructions. Threads that
   read a shared counter no longer take its cache line from each other and
   from the thread that writes it.
-- Vulkan without vertical sync showed no more frames than the screen
-  refreshes. On NVIDIA it also kept a CPU core busy waiting for a free
-  swapchain image. Now it presents in `FIFO_LATEST_READY` mode where the
-  device offers it, otherwise in `MAILBOX`, and with one more swapchain image.
-  As with D3D12, the screen shows the latest finished frame at each refresh,
-  up to two frames are rendered per refresh, and the CPU sleeps while it
-  waits.
+- Without vertical sync the frame rate has no limit. D3D12 presents with
+  `ALLOW_TEARING` where the system supports it, and Vulkan prefers
+  `IMMEDIATE`, then `MAILBOX`, then `FIFO_LATEST_READY`. A window that covers
+  the screen may show a tear, while a composed window shows the newest frame.
+  Without tearing support D3D12 shows up to two frames per refresh. Vulkan
+  keeps one more swapchain image than the minimum, so on NVIDIA it no longer
+  keeps a CPU core busy waiting for a free image.
 - The Vulkan renderer took the last suitable device, not the best. Without a
   discrete GPU it could choose a CPU driver such as lavapipe over the
   integrated GPU. It now ranks devices: discrete GPU first, then integrated,
@@ -77,10 +77,6 @@ API and ABI may change between minor versions.
   characters left to the keys. Windows assembles surrogate pairs; X11 gives
   Latin-1 for now. Check `LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE` before calling it;
   `LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE` is the service without it.
-- Vertical sync off no longer tears. D3D12 keeps three swap-chain buffers and
-  presents without `ALLOW_TEARING`, Vulkan prefers `MAILBOX` to `IMMEDIATE`:
-  frames stay uncapped and each refresh shows the newest whole one, where at
-  thousands of frames a second tearing cut the picture into bands.
 - `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and
   `getVerticalSync` tail: presenting can stop waiting for the display's
   refresh and start again at run time. Check

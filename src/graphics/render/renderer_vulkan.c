@@ -2546,6 +2546,14 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
 {
     if (vsync)
         return VK_PRESENT_MODE_FIFO_KHR;
+    // Без vsync число кадров не ограничено: IMMEDIATE показывает кадр сразу,
+    // и картинка может разорваться. MAILBOX тоже не ограничивает кадры, но
+    // показывает их целиком; FIFO_LATEST_READY даёт до двух кадров на
+    // обновление экрана.
+    for (uint32_t index = 0; index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    for (uint32_t index = 0; index < count; ++index)
+        if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
     for (uint32_t index = 0; latestReady && index < count; ++index)
         if (modes[index] == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)
@@ -2553,10 +2561,6 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
 #else
     (void)latestReady;
 #endif
-    for (uint32_t index = 0; index < count; ++index)
-        if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) return VK_PRESENT_MODE_MAILBOX_KHR;
-    for (uint32_t index = 0; index < count; ++index)
-        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -2656,10 +2660,10 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         PlatformFree(modes);
     }
 
-    // Без vsync показ держит до двух образов: показанный и ждущий следующего
-    // обновления экрана. Если образов только minImageCount, захват ждёт этого
-    // обновления, и кадров выходит не больше, чем обновлений экрана; ещё один
-    // образ даёт рисовать следующий кадр, пока те два заняты.
+    // MAILBOX и FIFO_LATEST_READY держат до двух образов: показанный и ждущий
+    // следующего обновления экрана. Если образов только minImageCount, захват
+    // ждёт этого обновления, и кадров выходит не больше, чем обновлений
+    // экрана; ещё один образ даёт рисовать следующий кадр, пока те два заняты.
     uint32_t imageCount = capabilities.minImageCount;
     if (presentMode != VK_PRESENT_MODE_FIFO_KHR) ++imageCount;
     if (imageCount < 2u) imageCount = 2u;
