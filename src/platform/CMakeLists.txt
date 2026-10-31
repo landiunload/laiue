@@ -106,6 +106,8 @@ elseif(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND X11_FOUND)
         RUNTIME_ROLE GRAPHICS
         SOURCES
             window_x11.c
+            keysym.c
+            keysym.h
             window.h
             window_service.h
             window_module_entry.c
