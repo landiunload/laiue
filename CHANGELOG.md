@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The Vulkan renderer took the last suitable device, not the best. Without a
+  discrete GPU it could choose a CPU driver such as lavapipe over the
+  integrated GPU. It now ranks devices: discrete GPU first, then integrated,
+  virtual and other GPUs, and a CPU driver last. Among devices of one type it
+  takes the first one the loader lists. With more than eight devices it
+  chooses among the first eight instead of failing.
 - The graphics device kept a texture or a sampler destroyed between
   `beginFrame` and `endFrame`, and a shader destroyed while a pipeline used
   it, until the device itself was destroyed: `destroyHandle` dropped those
