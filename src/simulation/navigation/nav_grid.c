@@ -625,11 +625,11 @@ LaiueNavStatus LaiueNavFlowFieldBuild(LaiueNavFlowField *field, const LaiueNavGr
         {
             const int64_t fromX = x + directionX[direction];
             const int64_t fromY = y + directionY[direction];
-            if (!Inside(bounds, fromX, fromY) ||
-                ReadCell(&reader, fromX, fromY) == LAIUE_NAV_CELL_BLOCKED)
+            if (!Inside(bounds, fromX, fromY))
                 continue;
             const uint32_t from = AreaIndex(bounds, fromX, fromY);
-            if (NavQueryClosed(query, from))
+            if (NavQueryClosed(query, from) ||
+                ReadCell(&reader, fromX, fromY) == LAIUE_NAV_CELL_BLOCKED)
                 continue;
             /* Шаг из соседа обратно в текущую клетку — противоположное направление. */
             const uint64_t step =
