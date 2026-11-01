@@ -474,6 +474,9 @@ if(TARGET laiue_ui)
     laiue_add_harness(laiue_truetype_outline_test TrueTypeOutlineTestEntryPoint
         truetype_outline_test.c LIBRARIES laiue::ui_font_support
         TEST laiue.ui.truetype_outline)
+    laiue_add_harness(laiue_truetype_components_test TrueTypeComponentsTestEntryPoint
+        truetype_components_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_components)
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно
