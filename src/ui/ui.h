@@ -86,6 +86,8 @@ LAIUE_UI_API void UiRect(
 LAIUE_UI_API void UiImage(
     UiContext* ui, float x, float y, float width, float height,
     float u0, float v0, float u1, float v1, uint32_t color);
+// Начало каждого глифа округляется до ближайшего целого пикселя;
+// половина округляется к +бесконечности. Клип применяется после округления.
 LAIUE_UI_API void UiText(
     UiContext* ui, float x, float lineTopY, uint32_t color,
     const wchar_t* text);
