@@ -1,3 +1,18 @@
+# Внутреннее чтение шрифта: одна реализация для UI и тестов, без нового ABI.
+add_library(laiue_ui_font_support STATIC
+    truetype_reader.c
+    truetype_reader.h)
+target_link_libraries(laiue_ui_font_support PRIVATE laiue::build_options)
+target_include_directories(laiue_ui_font_support
+    PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>")
+set_target_properties(laiue_ui_font_support PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+    set_target_properties(laiue_ui_font_support PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES)
+endif()
+add_library(laiue::ui_font_support ALIAS laiue_ui_font_support)
+
 laiue_add_module(ui
     RUNTIME_ROLE CORE
     SOURCES
