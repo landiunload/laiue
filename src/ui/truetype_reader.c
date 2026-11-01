@@ -5,6 +5,9 @@
 // https://learn.microsoft.com/typography/opentype/spec/cmap
 // https://learn.microsoft.com/typography/opentype/spec/loca
 // https://learn.microsoft.com/typography/opentype/spec/hmtx
+// https://learn.microsoft.com/typography/opentype/spec/glyf
+// https://learn.microsoft.com/typography/opentype/spec/vhea
+// https://learn.microsoft.com/typography/opentype/spec/vmtx
 // Пределы ограничивают проход по directory и объём входных данных.
 #define TT_MAX_FONT_BYTES ((size_t)33554432u)
 #define TT_MAX_TABLES 4096u
@@ -33,7 +36,7 @@ static uint32_t TtU32(const uint8_t *bytes)
            bytes[3];
 }
 
-static bool TtFindTable(TrueTypeSpan file, uint32_t tag, TrueTypeSpan *out)
+static bool TtFindTable(TrueTypeSpan file, uint32_t tag, bool required, TrueTypeSpan *out)
 {
     uint32_t count = TtU16(file.bytes + 4u);
     bool found = false;
@@ -57,7 +60,38 @@ static bool TtFindTable(TrueTypeSpan file, uint32_t tag, TrueTypeSpan *out)
             found = true;
         }
     }
-    return found;
+    return found || !required;
+}
+
+static bool TtVerticalTables(TrueTypeSpan file, TrueTypeFont *font)
+{
+    TrueTypeSpan vhea = {0};
+    if (!TtFindTable(file, TT_TAG('v', 'h', 'e', 'a'), false, &vhea) ||
+        !TtFindTable(file, TT_TAG('v', 'm', 't', 'x'), false, &font->vmtx) ||
+        (vhea.bytes == NULL) != (font->vmtx.bytes == NULL))
+    {
+        return false;
+    }
+    if (vhea.bytes == NULL)
+    {
+        return true;
+    }
+    if (!TtHas(vhea, 0u, 36u))
+    {
+        return false;
+    }
+    uint32_t version = TtU32(vhea.bytes);
+    // В 1.0 lineGap зарезервирован, в 1.1 vertTypoLineGap имеет значение.
+    if ((version != 0x00010000u && version != 0x00011000u) ||
+        (version == 0x00010000u && TtU16(vhea.bytes + 8u) != 0u) || TtU32(vhea.bytes + 24u) != 0u ||
+        TtU32(vhea.bytes + 28u) != 0u || TtU16(vhea.bytes + 32u) != 0u)
+    {
+        return false;
+    }
+    font->numVMetrics = TtU16(vhea.bytes + 34u);
+    return font->numVMetrics != 0u && font->numVMetrics <= font->numGlyphs &&
+           font->vmtx.size >=
+               (size_t)font->numVMetrics * 4u + (size_t)(font->numGlyphs - font->numVMetrics) * 2u;
 }
 
 static bool TtValidateCmap4(TrueTypeSpan map)
@@ -206,13 +240,13 @@ static bool TtInitialize(const uint8_t *bytes, size_t size, TrueTypeFont *font)
     TrueTypeSpan hhea = {0};
     TrueTypeSpan maxp = {0};
     TrueTypeSpan cmap = {0};
-    if (!TtFindTable(file, TT_TAG('h', 'e', 'a', 'd'), &head) || head.size < 54u ||
-        !TtFindTable(file, TT_TAG('h', 'h', 'e', 'a'), &hhea) || hhea.size < 36u ||
-        !TtFindTable(file, TT_TAG('m', 'a', 'x', 'p'), &maxp) || maxp.size < 32u ||
-        !TtFindTable(file, TT_TAG('c', 'm', 'a', 'p'), &cmap) ||
-        !TtFindTable(file, TT_TAG('l', 'o', 'c', 'a'), &font->loca) ||
-        !TtFindTable(file, TT_TAG('g', 'l', 'y', 'f'), &font->glyf) ||
-        !TtFindTable(file, TT_TAG('h', 'm', 't', 'x'), &font->hmtx))
+    if (!TtFindTable(file, TT_TAG('h', 'e', 'a', 'd'), true, &head) || head.size < 54u ||
+        !TtFindTable(file, TT_TAG('h', 'h', 'e', 'a'), true, &hhea) || hhea.size < 36u ||
+        !TtFindTable(file, TT_TAG('m', 'a', 'x', 'p'), true, &maxp) || maxp.size < 32u ||
+        !TtFindTable(file, TT_TAG('c', 'm', 'a', 'p'), true, &cmap) ||
+        !TtFindTable(file, TT_TAG('l', 'o', 'c', 'a'), true, &font->loca) ||
+        !TtFindTable(file, TT_TAG('g', 'l', 'y', 'f'), true, &font->glyf) ||
+        !TtFindTable(file, TT_TAG('h', 'm', 't', 'x'), true, &font->hmtx))
     {
         return false;
     }
@@ -250,7 +284,7 @@ static bool TtInitialize(const uint8_t *bytes, size_t size, TrueTypeFont *font)
     font->ascent = (int16_t)TtI16(hhea.bytes + 4u);
     font->descent = (int16_t)TtI16(hhea.bytes + 6u);
     font->lineGap = (int16_t)TtI16(hhea.bytes + 8u);
-    return TtSelectCmap(cmap, font->numGlyphs, font);
+    return TtVerticalTables(file, font) && TtSelectCmap(cmap, font->numGlyphs, font);
 }
 
 bool TrueTypeReaderInitialize(const uint8_t *bytes, size_t size, TrueTypeFont *out)
@@ -376,5 +410,49 @@ bool TrueTypeReaderHorizontalMetric(const TrueTypeFont *font, uint16_t glyph,
                                                            ((size_t)glyph - font->numHMetrics) * 2u;
     out->advance = (uint16_t)TtU16(font->hmtx.bytes + (size_t)metric * 4u);
     out->bearing = (int16_t)TtI16(font->hmtx.bytes + bearingOffset);
+    return true;
+}
+
+bool TrueTypeReaderGlyphHeader(const TrueTypeFont *font, uint16_t glyph, TrueTypeGlyphHeader *out)
+{
+    TrueTypeSpan span = {0};
+    if (out == NULL || !TrueTypeReaderGlyphSpan(font, glyph, &span))
+    {
+        return false;
+    }
+    TrueTypeGlyphHeader header = {0};
+    if (span.size != 0u)
+    {
+        if (!TtHas(span, 0u, 10u))
+        {
+            return false;
+        }
+        header.contourCount = (int16_t)TtI16(span.bytes);
+        header.xMin = (int16_t)TtI16(span.bytes + 2u);
+        header.yMin = (int16_t)TtI16(span.bytes + 4u);
+        header.xMax = (int16_t)TtI16(span.bytes + 6u);
+        header.yMax = (int16_t)TtI16(span.bytes + 8u);
+        if (header.xMin > header.xMax || header.yMin > header.yMax)
+        {
+            return false;
+        }
+    }
+    *out = header;
+    return true;
+}
+
+bool TrueTypeReaderVerticalMetric(const TrueTypeFont *font, uint16_t glyph,
+                                  TrueTypeVerticalMetric *out)
+{
+    if (font == NULL || out == NULL || glyph >= font->numGlyphs || font->numVMetrics == 0u)
+    {
+        return false;
+    }
+    uint32_t metric = glyph < font->numVMetrics ? glyph : font->numVMetrics - 1u;
+    size_t bearingOffset = glyph < font->numVMetrics ? (size_t)glyph * 4u + 2u
+                                                     : (size_t)font->numVMetrics * 4u +
+                                                           ((size_t)glyph - font->numVMetrics) * 2u;
+    out->advance = (uint16_t)TtU16(font->vmtx.bytes + (size_t)metric * 4u);
+    out->bearing = (int16_t)TtI16(font->vmtx.bytes + bearingOffset);
     return true;
 }
