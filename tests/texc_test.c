@@ -122,14 +122,12 @@ static uint32_t ReadU32Le(const uint8_t *bytes)
 // Разбирает файл целиком и сверяет пиксели с ожидаемыми. Формат
 // определяет сама библиотека: так проверяется и её выбор декодера.
 //
-// tolerance — предельное расхождение канала. Для PNG и GIF оно нулевое:
-// там разбор точный. У JPEG обратное ДКП у каждой реализации своё, и
-// расхождение в единицу-другую неизбежно; неверный разбор при этом даёт
-// расхождение в десятки, и допуск его не прячет.
+// Пиксели обязаны совпасть до байта: PNG и GIF разбираются точно, а
+// JPEG декодируется той же целочисленной арифметикой, что у
+// libjpeg-turbo, которым Pillow снимал ожидания.
 static void CheckImage(const char *label, const uint8_t *file, uint32_t fileBytes,
                        const uint8_t *expected, uint32_t expectedBytes, uint32_t width,
-                       uint32_t height, uint32_t frameCount, uint32_t frameMilliseconds,
-                       uint32_t tolerance)
+                       uint32_t height, uint32_t frameCount, uint32_t frameMilliseconds)
 {
     ImageInfo info = {0};
     ImageStatus status = ImageInspect(file, fileBytes, &info);
@@ -149,10 +147,7 @@ static void CheckImage(const char *label, const uint8_t *file, uint32_t fileByte
 
     for (uint32_t index = 0; index < expectedBytes; ++index)
     {
-        uint32_t decoded = pixels[index];
-        uint32_t reference = expected[index];
-        uint32_t difference = decoded > reference ? decoded - reference : reference - decoded;
-        Expect(difference <= tolerance, label);
+        Expect(pixels[index] == expected[index], label);
     }
 
     PlatformFree(scratch);
@@ -205,22 +200,22 @@ LAIUE_TEST_ENTRY(TexcTestEntryPoint)
 {
     // === Разбор настоящих файлов ===
     CheckImage("rgba png must decode exactly", PNG_RGBA_FILE, (uint32_t)sizeof(PNG_RGBA_FILE),
-               PNG_RGBA_RGBA, (uint32_t)sizeof(PNG_RGBA_RGBA), 4u, 4u, 1u, 0u, 0u);
+               PNG_RGBA_RGBA, (uint32_t)sizeof(PNG_RGBA_RGBA), 4u, 4u, 1u, 0u);
     CheckImage("palette png with tRNS must decode exactly", PNG_PALETTE_FILE,
                (uint32_t)sizeof(PNG_PALETTE_FILE), PNG_PALETTE_RGBA,
-               (uint32_t)sizeof(PNG_PALETTE_RGBA), 4u, 4u, 1u, 0u, 0u);
+               (uint32_t)sizeof(PNG_PALETTE_RGBA), 4u, 4u, 1u, 0u);
     CheckImage("16 bit grayscale png must decode exactly", PNG_GRAY16_FILE,
                (uint32_t)sizeof(PNG_GRAY16_FILE), PNG_GRAY16_RGBA,
-               (uint32_t)sizeof(PNG_GRAY16_RGBA), 2u, 2u, 1u, 0u, 0u);
+               (uint32_t)sizeof(PNG_GRAY16_RGBA), 2u, 2u, 1u, 0u);
     CheckImage("interlaced png must decode exactly", PNG_INTERLACED_FILE,
                (uint32_t)sizeof(PNG_INTERLACED_FILE), PNG_INTERLACED_RGBA,
-               (uint32_t)sizeof(PNG_INTERLACED_RGBA), 8u, 8u, 1u, 0u, 0u);
+               (uint32_t)sizeof(PNG_INTERLACED_RGBA), 8u, 8u, 1u, 0u);
 
     // Все три кадра сразу: прозрачный угол второго обязан показать
     // пиксель первого, иначе анимация теряет частичные обновления.
     CheckImage("animated gif must composite its frames", GIF_ANIMATED_FILE,
                (uint32_t)sizeof(GIF_ANIMATED_FILE), GIF_ANIMATED_RGBA,
-               (uint32_t)sizeof(GIF_ANIMATED_RGBA), 4u, 4u, GIF_ANIMATED_FRAMES, 60u, 0u);
+               (uint32_t)sizeof(GIF_ANIMATED_RGBA), 4u, 4u, GIF_ANIMATED_FRAMES, 60u);
 
     // Задержки у кадров вправе различаться, и усреднять их нельзя:
     // анимация от этого меняется.
@@ -236,46 +231,43 @@ LAIUE_TEST_ENTRY(TexcTestEntryPoint)
     }
     CheckImage("a gif with uneven delays must decode", GIF_VARIABLE_FILE,
                (uint32_t)sizeof(GIF_VARIABLE_FILE), GIF_VARIABLE_RGBA,
-               (uint32_t)sizeof(GIF_VARIABLE_RGBA), 4u, 4u, GIF_VARIABLE_FRAMES, 40u, 0u);
+               (uint32_t)sizeof(GIF_VARIABLE_RGBA), 4u, 4u, GIF_VARIABLE_FRAMES, 40u);
 
     // === JPEG ===
-    // Допуск в две единицы покрывает разницу обратных ДКП. Ошибка в
-    // кодах Хаффмана, в порядке блоков или в переводе цвета сдвигает
-    // пиксели на десятки, и такой допуск её не пропускает: соседние
-    // проверки на JPEG_SUBSAMPLED это показывают прямо.
+    // Ожидания сняты libjpeg-turbo, и декодер обязан совпасть с ним до
+    // байта: обратное ДКП, фильтр цветности и перевод цвета у них одни.
     CheckImage("baseline jpeg must decode", JPEG_BASELINE_FILE,
                (uint32_t)sizeof(JPEG_BASELINE_FILE), JPEG_BASELINE_RGBA,
-               (uint32_t)sizeof(JPEG_BASELINE_RGBA), 16u, 16u, 1u, 0u, 2u);
+               (uint32_t)sizeof(JPEG_BASELINE_RGBA), 16u, 16u, 1u, 0u);
 
     // Тот же кадр, записанный проходами: коэффициенты не меняются, и
     // пиксели обязаны совпасть с последовательной записью.
     CheckImage("progressive jpeg must decode to the same picture", JPEG_PROGRESSIVE_FILE,
                (uint32_t)sizeof(JPEG_PROGRESSIVE_FILE), JPEG_BASELINE_RGBA,
-               (uint32_t)sizeof(JPEG_BASELINE_RGBA), 16u, 16u, 1u, 0u, 2u);
+               (uint32_t)sizeof(JPEG_BASELINE_RGBA), 16u, 16u, 1u, 0u);
 
     // Прореженная цветность на размере, не кратном MCU: лишние блоки
     // обязаны отброситься, а не сдвинуть картинку.
     CheckImage("subsampled jpeg must crop its trailing blocks", JPEG_SUBSAMPLED_FILE,
                (uint32_t)sizeof(JPEG_SUBSAMPLED_FILE), JPEG_SUBSAMPLED_RGBA,
-               (uint32_t)sizeof(JPEG_SUBSAMPLED_RGBA), 20u, 12u, 1u, 0u, 2u);
+               (uint32_t)sizeof(JPEG_SUBSAMPLED_RGBA), 20u, 12u, 1u, 0u);
 
     // Маркеры рестарта сбрасывают предсказание, но не коэффициенты:
     // результат обязан совпасть с тем же кадром без них.
     CheckImage("restart markers must not change the picture", JPEG_RESTART_FILE,
                (uint32_t)sizeof(JPEG_RESTART_FILE), JPEG_SUBSAMPLED_RGBA,
-               (uint32_t)sizeof(JPEG_SUBSAMPLED_RGBA), 20u, 12u, 1u, 0u, 2u);
+               (uint32_t)sizeof(JPEG_SUBSAMPLED_RGBA), 20u, 12u, 1u, 0u);
 
-    // Резкая цветность на шаге прореживания. Допуск здесь шире на
-    // единицу — округление треугольного фильтра у эталона чередуется, —
-    // но повторение ближайшего отсчёта вместо фильтра разошлось бы на
-    // 82 единицы, и такой допуск его не пропустит.
+    // Резкая цветность на шаге прореживания: треугольный фильтр с
+    // чередующимся, как у libjpeg, округлением. Повторение ближайшего
+    // отсчёта вместо фильтра разошлось бы на 82 единицы.
     CheckImage("subsampled chroma must be interpolated, not repeated", JPEG_CHROMA_FILE,
                (uint32_t)sizeof(JPEG_CHROMA_FILE), JPEG_CHROMA_RGBA,
-               (uint32_t)sizeof(JPEG_CHROMA_RGBA), 16u, 16u, 1u, 0u, 4u);
+               (uint32_t)sizeof(JPEG_CHROMA_RGBA), 16u, 16u, 1u, 0u);
 
     CheckImage("grayscale jpeg must decode without colour conversion", JPEG_GRAY_FILE,
                (uint32_t)sizeof(JPEG_GRAY_FILE), JPEG_GRAY_RGBA,
-               (uint32_t)sizeof(JPEG_GRAY_RGBA), 8u, 8u, 1u, 0u, 2u);
+               (uint32_t)sizeof(JPEG_GRAY_RGBA), 8u, 8u, 1u, 0u);
 
     // === Отказы ===
     Expect(ImageProbe(PNG_RGBA_FILE, 4u) == IMAGE_FORMAT_UNKNOWN,
