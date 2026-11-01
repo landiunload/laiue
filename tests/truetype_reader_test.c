@@ -24,6 +24,7 @@ static bool SameFont(const TrueTypeFont *left, const TrueTypeFont *right)
 {
     return SameSpan(left->cmap, right->cmap) && SameSpan(left->glyf, right->glyf) &&
            SameSpan(left->loca, right->loca) && SameSpan(left->hmtx, right->hmtx) &&
+           SameSpan(left->vmtx, right->vmtx) && left->numVMetrics == right->numVMetrics &&
            left->numGlyphs == right->numGlyphs && left->numHMetrics == right->numHMetrics &&
            left->locaWidth == right->locaWidth && left->cmapFormat == right->cmapFormat &&
            left->unitsPerEm == right->unitsPerEm && left->ascent == right->ascent &&
@@ -42,6 +43,8 @@ static void CheckMetricsAndSpans(const TrueTypeFont *font, const uint8_t *bytes)
     Expect(font->numGlyphs == 5u && font->numHMetrics == 2u && font->unitsPerEm == 1000u &&
                font->ascent == 800 && font->descent == -200 && font->lineGap == 100,
            "reader сохраняет целые метрики и число глифов");
+    Expect(font->numVMetrics == 0u && font->vmtx.bytes == NULL && font->vmtx.size == 0u,
+           "отсутствующая пара vertical tables явно представлена нулевым numVMetrics");
     Expect(font->glyf.bytes == bytes + fixture.glyfOffset && font->glyf.size == 36u &&
                font->hmtx.bytes == bytes + fixture.hmtxOffset && font->hmtx.size == 14u &&
                font->loca.bytes == bytes + fixture.locaOffset,
@@ -242,12 +245,227 @@ static void TestInvalidLookups(void)
            "повреждённый mapping отклоняется, сохраняя результат lookup");
 }
 
+static bool SameHeader(TrueTypeGlyphHeader left, TrueTypeGlyphHeader right)
+{
+    return left.contourCount == right.contourCount && left.xMin == right.xMin &&
+           left.yMin == right.yMin && left.xMax == right.xMax && left.yMax == right.yMax;
+}
+
+static void ExpectHeaderRejected(const TrueTypeFont *font, uint16_t glyph)
+{
+    TrueTypeGlyphHeader previous = {17, 18, 19, 20, 21};
+    TrueTypeGlyphHeader output = previous;
+    Expect(!TrueTypeReaderGlyphHeader(font, glyph, &output) && SameHeader(output, previous),
+           "отказ чтения заголовка сохраняет все поля результата");
+}
+
+static void TestGlyphHeaders(void)
+{
+    const TrueTypeGlyphHeader headers[] = {
+        {0, INT16_MIN, -200, INT16_MAX, 800},
+        {1, 7, -17, 7, -17},
+        {INT16_MIN, -500, INT16_MIN, 300, INT16_MAX},
+    };
+    const uint16_t glyphs[] = {1u, 2u, 4u};
+    for (uint32_t combination = 0u; combination < 4u; ++combination)
+    {
+        TrueTypeFixtureBuild(&fixture, (combination & 1u) != 0u, (combination & 2u) != 0u);
+        for (size_t index = 0u; index < 3u; ++index)
+        {
+            uint8_t *bytes = fixture.bytes + fixture.glyfOffset + index * 12u;
+            TrueTypeFixturePut16(bytes, (uint16_t)headers[index].contourCount);
+            TrueTypeFixturePut16(bytes + 2u, (uint16_t)headers[index].xMin);
+            TrueTypeFixturePut16(bytes + 4u, (uint16_t)headers[index].yMin);
+            TrueTypeFixturePut16(bytes + 6u, (uint16_t)headers[index].xMax);
+            TrueTypeFixturePut16(bytes + 8u, (uint16_t)headers[index].yMax);
+        }
+        TrueTypeFont font = {0};
+        if (!TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font))
+        {
+            Expect(false, "шрифт с signed glyph headers принимается");
+            continue;
+        }
+        for (size_t index = 0u; index < 3u; ++index)
+        {
+            TrueTypeGlyphHeader header = {0};
+            Expect(TrueTypeReaderGlyphHeader(&font, glyphs[index], &header) &&
+                       SameHeader(header, headers[index]),
+                   "glyph header сохраняет signed contourCount и bbox без чтения тела");
+        }
+        for (uint16_t glyph = 0u; glyph <= 3u; glyph += 3u)
+        {
+            TrueTypeGlyphHeader header = {17, 18, 19, 20, 21};
+            Expect(TrueTypeReaderGlyphHeader(&font, glyph, &header) &&
+                       SameHeader(header, (TrueTypeGlyphHeader){0}),
+                   "пустой loca span возвращает нулевой заголовок");
+        }
+        ExpectHeaderRejected(&font, 5u);
+        ExpectHeaderRejected(NULL, 0u);
+        Expect(!TrueTypeReaderGlyphHeader(&font, 1u, NULL), "NULL-заголовок отклоняется");
+    }
+
+    for (uint32_t longLoca = 0u; longLoca <= 1u; ++longLoca)
+    {
+        for (uint32_t truncated = 0u; truncated <= 1u; ++truncated)
+        {
+            TrueTypeFixtureBuild(&fixture, false, longLoca != 0u);
+            uint32_t size = truncated == 0u ? 10u : (longLoca != 0u ? 9u : 8u);
+            if (longLoca != 0u)
+                TrueTypeFixturePut32(fixture.bytes + fixture.locaOffset + 8u, size);
+            else
+                TrueTypeFixturePut16(fixture.bytes + fixture.locaOffset + 4u, size / 2u);
+            TrueTypeFont font = {0};
+            if (!TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font))
+            {
+                Expect(false, "loca допускает glyph span короче заголовка до его чтения");
+                continue;
+            }
+            if (truncated != 0u)
+                ExpectHeaderRejected(&font, 1u);
+            else
+            {
+                TrueTypeGlyphHeader header = {17, 18, 19, 20, 21};
+                Expect(TrueTypeReaderGlyphHeader(&font, 1u, &header) &&
+                           SameHeader(header, (TrueTypeGlyphHeader){0}),
+                       "ровно десяти байтов достаточно для заголовка");
+            }
+        }
+    }
+    for (size_t axis = 0u; axis < 2u; ++axis)
+    {
+        TrueTypeFixtureBuild(&fixture, false, false);
+        TrueTypeFixturePut16(fixture.bytes + fixture.glyfOffset + 2u + axis * 2u, 1u);
+        TrueTypeFont font = {0};
+        Expect(TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font),
+               "bbox проверяется при адресном чтении заголовка");
+        ExpectHeaderRejected(&font, 1u);
+    }
+}
+
+static void TestVerticalMetrics(void)
+{
+    const uint32_t counts[] = {1u, 2u, 5u};
+    const int16_t bearings[] = {INT16_MIN, -20, 30, -40, INT16_MAX};
+    for (uint32_t combination = 0u; combination < 4u; ++combination)
+    {
+        for (uint32_t version = 0u; version < 2u; ++version)
+        {
+            for (size_t index = 0u; index < 3u; ++index)
+            {
+                TrueTypeFixtureBuild(&fixture, (combination & 1u) != 0u, (combination & 2u) != 0u);
+                uint32_t count = counts[index];
+                TrueTypeFixtureAddVertical(&fixture, version == 0u ? 0x00010000u : 0x00011000u,
+                                           count);
+                if (version != 0u)
+                    TrueTypeFixturePut16(fixture.bytes + fixture.vheaOffset + 8u, 0xFF9Cu);
+                TrueTypeFont font = {0};
+                if (!TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font))
+                {
+                    Expect(false, "обе версии vhea и compressed vmtx принимаются");
+                    continue;
+                }
+                Expect(font.numVMetrics == count &&
+                           font.vmtx.bytes == fixture.bytes + fixture.vmtxOffset &&
+                           font.vmtx.size == (size_t)count * 4u + (size_t)(5u - count) * 2u,
+                       "vmtx span заимствован и число long metrics сохранено");
+                for (uint16_t glyph = 0u; glyph < 5u; ++glyph)
+                {
+                    TrueTypeVerticalMetric metric = {0};
+                    uint32_t expected = 1000u + (glyph < count ? glyph : count - 1u) * 100u;
+                    Expect(TrueTypeReaderVerticalMetric(&font, glyph, &metric) &&
+                               metric.advance == expected && metric.bearing == bearings[glyph],
+                           "vmtx читает signed bearings и повторяет последний advanceHeight");
+                }
+                TrueTypeVerticalMetric metric = {17u, -17};
+                Expect(!TrueTypeReaderVerticalMetric(&font, 5u, &metric) && metric.advance == 17u &&
+                           metric.bearing == -17 &&
+                           !TrueTypeReaderVerticalMetric(NULL, 0u, &metric) &&
+                           metric.advance == 17u && metric.bearing == -17 &&
+                           !TrueTypeReaderVerticalMetric(&font, 0u, NULL),
+                       "невалидный vertical lookup сохраняет результат");
+            }
+        }
+    }
+    for (size_t index = 0u; index < fixture.size; ++index)
+        unalignedBytes[index + 1u] = fixture.bytes[index];
+    TrueTypeFont font = {0};
+    TrueTypeVerticalMetric metric = {0};
+    Expect(TrueTypeReaderInitialize(unalignedBytes + 1u, fixture.size, &font) &&
+               TrueTypeReaderVerticalMetric(&font, 4u, &metric) && metric.advance == 1400u &&
+               metric.bearing == INT16_MAX,
+           "vertical tables читаются из невыровненного буфера");
+
+    TrueTypeFixturePut16(fixture.bytes + fixture.vmtxOffset, 0u);
+    TrueTypeFixturePut16(fixture.bytes + fixture.vmtxOffset + 16u, UINT16_MAX);
+    TrueTypeFixturePut16(fixture.bytes + fixture.vheaOffset + 10u, UINT16_MAX);
+    Expect(TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font) &&
+               TrueTypeReaderVerticalMetric(&font, 0u, &metric) && metric.advance == 0u &&
+               TrueTypeReaderVerticalMetric(&font, 4u, &metric) && metric.advance == UINT16_MAX,
+           "advanceHeight сохраняет весь диапазон unsigned16");
+
+    TrueTypeFixtureBuild(&fixture, false, false);
+    metric = (TrueTypeVerticalMetric){17u, -17};
+    Expect(TrueTypeReaderInitialize(fixture.bytes, fixture.size, &font) &&
+               !TrueTypeReaderVerticalMetric(&font, 0u, &metric) && metric.advance == 17u &&
+               metric.bearing == -17,
+           "отсутствие vertical tables не синтезирует метрики и сохраняет output");
+}
+
+static void TestInvalidVerticalTables(void)
+{
+    TrueTypeFixtureBuild(&fixture, true, true);
+    TrueTypeFixtureAddVertical(&fixture, 0x00011000u, 2u);
+    TrueTypeFont previous = {0};
+    if (!TrueTypeReaderInitialize(fixture.bytes, fixture.size, &previous))
+    {
+        Expect(false, "vertical fixture для отказов изначально корректен");
+        return;
+    }
+    for (size_t record = TRUE_TYPE_FIXTURE_VHEA_RECORD; record <= TRUE_TYPE_FIXTURE_VMTX_RECORD;
+         ++record)
+    {
+        TrueTypeFixtureBuild(&fixture, true, true);
+        TrueTypeFixtureAddVertical(&fixture, 0x00011000u, 2u);
+        fixture.bytes[12u + record * 16u] = (uint8_t)'x';
+        ExpectRejected(&previous);
+        TrueTypeFixtureBuild(&fixture, true, true);
+        TrueTypeFixtureAddVertical(&fixture, 0x00011000u, 2u);
+        TrueTypeFixturePut16(fixture.bytes + 4u, 10u);
+        TrueTypeFixturePut16(fixture.bytes + 10u, 32u);
+        for (uint32_t byte = 0u; byte < 16u; ++byte)
+            fixture.bytes[12u + 9u * 16u + byte] = fixture.bytes[12u + record * 16u + byte];
+        ExpectRejected(&previous);
+        TrueTypeFixtureBuild(&fixture, true, true);
+        TrueTypeFixtureAddVertical(&fixture, 0x00011000u, 2u);
+        TrueTypeFixturePut32(fixture.bytes + 12u + record * 16u + 12u, 0u);
+        ExpectRejected(&previous);
+        TrueTypeFixturePut32(fixture.bytes + 12u + record * 16u + 12u,
+                             record == TRUE_TYPE_FIXTURE_VHEA_RECORD ? 35u : 13u);
+        ExpectRejected(&previous);
+    }
+    const uint32_t offsets[] = {8u, 24u, 26u, 28u, 30u, 32u, 34u, 34u};
+    const uint32_t values[] = {1u, 1u, 1u, 1u, 1u, 1u, 0u, 6u};
+    for (size_t index = 0u; index < sizeof(offsets) / sizeof(offsets[0]); ++index)
+    {
+        TrueTypeFixtureBuild(&fixture, true, true);
+        TrueTypeFixtureAddVertical(&fixture, 0x00010000u, 2u);
+        TrueTypeFixturePut16(fixture.bytes + fixture.vheaOffset + offsets[index], values[index]);
+        ExpectRejected(&previous);
+    }
+    TrueTypeFixtureBuild(&fixture, true, true);
+    TrueTypeFixtureAddVertical(&fixture, 0x00010001u, 2u);
+    ExpectRejected(&previous);
+}
+
 LAIUE_TEST_ENTRY(TrueTypeReaderTestEntryPoint)
 {
     TestValidFonts();
     TestUnsupportedAndTruncated();
     TestInvalidTables();
     TestInvalidLookups();
+    TestGlyphHeaders();
+    TestVerticalMetrics();
+    TestInvalidVerticalTables();
     if (failureCount != 0u)
         LaiueTestRuntimeExit(1);
     LAIUE_TEST_SUCCESS();

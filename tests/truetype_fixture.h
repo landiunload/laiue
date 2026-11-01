@@ -9,14 +9,16 @@
 // Структура таблиц: https://learn.microsoft.com/typography/opentype/spec/otff
 enum
 {
-    TRUE_TYPE_FIXTURE_CAPACITY = 448,
-    TRUE_TYPE_FIXTURE_HEAD = 124,
-    TRUE_TYPE_FIXTURE_HHEA = 180,
-    TRUE_TYPE_FIXTURE_MAXP = 216,
-    TRUE_TYPE_FIXTURE_CMAP = 248,
+    TRUE_TYPE_FIXTURE_CAPACITY = 560,
+    TRUE_TYPE_FIXTURE_HEAD = 172,
+    TRUE_TYPE_FIXTURE_HHEA = 228,
+    TRUE_TYPE_FIXTURE_MAXP = 264,
+    TRUE_TYPE_FIXTURE_CMAP = 296,
     TRUE_TYPE_FIXTURE_CMAP_RECORD = 0,
     TRUE_TYPE_FIXTURE_HEAD_RECORD = 2,
     TRUE_TYPE_FIXTURE_HMTX_RECORD = 4,
+    TRUE_TYPE_FIXTURE_VHEA_RECORD = 7,
+    TRUE_TYPE_FIXTURE_VMTX_RECORD = 8,
 };
 
 typedef struct TrueTypeFixture
@@ -26,6 +28,8 @@ typedef struct TrueTypeFixture
     uint32_t locaOffset;
     uint32_t glyfOffset;
     uint32_t hmtxOffset;
+    uint32_t vheaOffset;
+    uint32_t vmtxOffset;
 } TrueTypeFixture;
 
 static void TrueTypeFixturePut16(uint8_t *bytes, uint32_t value)
@@ -91,6 +95,8 @@ static void TrueTypeFixtureBuild(TrueTypeFixture *fixture, bool fullUnicode, boo
     fixture->glyfOffset = fixture->locaOffset + locaBytes;
     fixture->hmtxOffset = fixture->glyfOffset + 36u;
     fixture->size = fixture->hmtxOffset + 14u;
+    fixture->vheaOffset = 0u;
+    fixture->vmtxOffset = 0u;
 
     TrueTypeFixturePut32(bytes, 0x00010000u);
     TrueTypeFixturePut16(bytes + 4u, 7u);
@@ -150,4 +156,36 @@ static void TrueTypeFixtureBuild(TrueTypeFixture *fixture, bool fullUnicode, boo
     TrueTypeFixturePut16(hmtx + 8u, 30u);
     TrueTypeFixturePut16(hmtx + 10u, 0xFFD8u);
     TrueTypeFixturePut16(hmtx + 12u, 50u);
+}
+
+static void TrueTypeFixtureAddVertical(TrueTypeFixture *fixture, uint32_t version,
+                                       uint32_t numMetrics)
+{
+    uint8_t *bytes = fixture->bytes;
+    fixture->vheaOffset = ((uint32_t)fixture->size + 3u) & ~3u;
+    fixture->vmtxOffset = fixture->vheaOffset + 36u;
+    uint32_t vmtxBytes = numMetrics * 4u + (5u - numMetrics) * 2u;
+    fixture->size = fixture->vmtxOffset + vmtxBytes;
+    TrueTypeFixturePut16(bytes + 4u, 9u);
+    TrueTypeFixturePut16(bytes + 6u, 128u);
+    TrueTypeFixturePut16(bytes + 8u, 3u);
+    TrueTypeFixturePut16(bytes + 10u, 16u);
+    TrueTypeFixtureTable(bytes, TRUE_TYPE_FIXTURE_VHEA_RECORD, "vhea", fixture->vheaOffset, 36u);
+    TrueTypeFixtureTable(bytes, TRUE_TYPE_FIXTURE_VMTX_RECORD, "vmtx", fixture->vmtxOffset,
+                         vmtxBytes);
+    TrueTypeFixturePut32(bytes + fixture->vheaOffset, version);
+    TrueTypeFixturePut16(bytes + fixture->vheaOffset + 10u, 1000u + (numMetrics - 1u) * 100u);
+    TrueTypeFixturePut16(bytes + fixture->vheaOffset + 34u, numMetrics);
+    const uint16_t bearings[] = {0x8000u, 0xFFECu, 30u, 0xFFD8u, 0x7FFFu};
+    uint32_t offset = fixture->vmtxOffset;
+    for (uint32_t glyph = 0u; glyph < 5u; ++glyph)
+    {
+        if (glyph < numMetrics)
+        {
+            TrueTypeFixturePut16(bytes + offset, 1000u + glyph * 100u);
+            offset += 2u;
+        }
+        TrueTypeFixturePut16(bytes + offset, bearings[glyph]);
+        offset += 2u;
+    }
 }
