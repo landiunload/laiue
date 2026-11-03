@@ -152,9 +152,10 @@ static void CheckCase(const DecodeCase *testCase)
 
 LAIUE_TEST_ENTRY(ImageDecodeTestEntryPoint)
 {
-    // PNG: разбор точный, статусы и байты обязаны совпасть. JPEG: обратное
-    // ДКП своё, но при неизменной арифметике выход не меняется вовсе, и
-    // эталоны сняты с того же кода.
+    // PNG: разбор точный, статусы и байты обязаны совпасть. JPEG декодер
+    // считает в целых числах, как libjpeg-turbo, и его выход не зависит ни
+    // от процессора, ни от компилятора; эталоны сняты с того же кода, а
+    // совпадение с libjpeg-turbo проверяет texc_test по пикселям Pillow.
     static const DecodeCase cases[] = {
         {"png-rgba", PNG_RGBA_FILE, (uint32_t)sizeof(PNG_RGBA_FILE), 0x0529eda670a0ad7full,
          0xb13fde1952d9b2aaull},
@@ -167,19 +168,19 @@ LAIUE_TEST_ENTRY(ImageDecodeTestEntryPoint)
         {"png-solid", PNG_SOLID_FILE, (uint32_t)sizeof(PNG_SOLID_FILE), 0x5b638429cd93565full,
          0x20613380c942052full},
         {"jpeg-baseline", JPEG_BASELINE_FILE, (uint32_t)sizeof(JPEG_BASELINE_FILE),
-         0x5c5a0439d209ee47ull, 0xbe8fd95dc2468784ull},
+         0x84c483f6ee55e103ull, 0xccec4b5a721fd075ull},
         {"jpeg-progressive", JPEG_PROGRESSIVE_FILE, (uint32_t)sizeof(JPEG_PROGRESSIVE_FILE),
-         0x5c5a0439d209ee47ull, 0xde5b9d197b9d5cc7ull},
+         0x84c483f6ee55e103ull, 0x3c6b38d532111c3cull},
         {"jpeg-subsampled", JPEG_SUBSAMPLED_FILE, (uint32_t)sizeof(JPEG_SUBSAMPLED_FILE),
-         0x4e5d41515746edb5ull, 0x03cae46207111cdaull},
+         0x563b3333dfedf3ebull, 0xd1f68898eccf016aull},
         {"jpeg-restart", JPEG_RESTART_FILE, (uint32_t)sizeof(JPEG_RESTART_FILE),
-         0x4e5d41515746edb5ull, 0x4de85a41cd1e4638ull},
+         0x563b3333dfedf3ebull, 0x8c69d51d34b7263full},
         {"jpeg-chroma", JPEG_CHROMA_FILE, (uint32_t)sizeof(JPEG_CHROMA_FILE),
-         0x6009a994666605bfull, 0x607ed3db27d06efaull},
+         0x1dc74cabe3010dc6ull, 0xa3063c129e94627full},
         {"jpeg-solid", JPEG_SOLID_FILE, (uint32_t)sizeof(JPEG_SOLID_FILE), 0x80422d07754a4ddfull,
-         0xd41bb96eca661d09ull},
-        {"jpeg-gray", JPEG_GRAY_FILE, (uint32_t)sizeof(JPEG_GRAY_FILE), 0x2d9ffcd83d82a660ull,
-         0x4834b9c795f53c87ull},
+         0xa9402a95a7721ca1ull},
+        {"jpeg-gray", JPEG_GRAY_FILE, (uint32_t)sizeof(JPEG_GRAY_FILE), 0x22c9d3ce4bc67375ull,
+         0x6d2ed936ed8e963bull},
     };
 
     for (uint32_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index)

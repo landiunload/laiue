@@ -5,6 +5,22 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- JPEG decodes 1.4 to 3.2 times faster, and byte for byte like
+  libjpeg-turbo with its default settings. A 24-megapixel 4:2:0 photo
+  takes 157 ms instead of 408 ms on one core, a progressive one 306 ms
+  instead of 560 ms.
+  - The inverse DCT is libjpeg's integer `islow` instead of a direct
+    float transform. Integer arithmetic also gives the same pixels on
+    every processor and compiler.
+  - Subsampled chroma is restored a row at a time with libjpeg's triangle
+    filter and its alternating rounding, instead of per pixel.
+  - The bit reader refills 64 bits at a time, and coefficients and
+    quantization tables are kept in natural order, as the transform reads
+    them.
+  - The texture converter test now requires the exact pixels Pillow
+    decodes, and 192 more files were checked against Pillow while making
+    the change: every subsampling, sizes from 1×1, progressive, restart
+    markers and qualities from 1 to 100.
 - On Windows frames go on while the window is dragged or resized, while a
   mouse button holds the caption or a caption button and while the window
   menu is open. `DefWindowProc` runs its own message loop until the button
