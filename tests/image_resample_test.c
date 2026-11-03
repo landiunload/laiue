@@ -244,6 +244,16 @@ LAIUE_TEST_ENTRY(ImageResampleTestEntryPoint)
                 CheckRandom(sourceWidth, sourceHeight, sourceWidth / 2u, sourceHeight / 2u,
                             "the halving path must match the general path");
                 ++cases;
+
+                // Непрозрачная строка идёт коротким путём, а одна неполная
+                // альфа возвращает её на взвешенный: ответ тот же.
+                for (size_t alpha = 3u; alpha < sourceBytes; alpha += 4u) g_source[alpha] = 255u;
+                CheckRandom(sourceWidth, sourceHeight, sourceWidth / 2u, sourceHeight / 2u,
+                            "an opaque picture must match the general path");
+                g_source[sourceBytes - 1u] = 254u;
+                CheckRandom(sourceWidth, sourceHeight, sourceWidth / 2u, sourceHeight / 2u,
+                            "a partial alpha in an opaque row must match the general path");
+                cases += 2u;
             }
         }
     }
