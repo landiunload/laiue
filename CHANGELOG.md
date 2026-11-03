@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Halving an opaque picture, the step of every mip chain, is four times
+  faster: 10 ms instead of 38 ms for all the levels of a 24-megapixel
+  photo. Equal weights turn the weighted average into a plain one, which
+  the compiler vectorizes.
 - JPEG decodes 1.4 to 3.2 times faster, and byte for byte like
   libjpeg-turbo with its default settings. A 24-megapixel 4:2:0 photo
   takes 157 ms instead of 408 ms on one core, a progressive one 306 ms
