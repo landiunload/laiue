@@ -1,5 +1,9 @@
 # Внутреннее чтение шрифта: одна реализация для UI и тестов, без нового ABI.
 add_library(laiue_ui_font_support STATIC
+    truetype_components.c
+    truetype_components.h
+    truetype_outline.c
+    truetype_outline.h
     truetype_reader.c
     truetype_reader.h)
 target_link_libraries(laiue_ui_font_support PRIVATE laiue::build_options)

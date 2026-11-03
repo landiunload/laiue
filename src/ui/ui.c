@@ -202,6 +202,28 @@ void UiPanel(UiContext* ui, float x, float y, float width, float height)
         UiScaled(ui, 14.0f), UI_COLOR_PANEL);
 }
 
+// Округление к ближайшему пикселю; середина идёт к +бесконечности.
+// За 2^23 float уже целый. Проверка также исключает преобразование NaN
+// и бесконечности в int32_t.
+static float TextPixel(float value)
+{
+    if (!(value > -8388608.0f && value < 8388608.0f))
+    {
+        return value;
+    }
+    int32_t pixel = (int32_t)value;
+    float fraction = value - (float)pixel;
+    if (fraction >= 0.5f)
+    {
+        ++pixel;
+    }
+    else if (fraction < -0.5f)
+    {
+        --pixel;
+    }
+    return (float)pixel;
+}
+
 void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
     const wchar_t* text)
 {
@@ -225,8 +247,8 @@ void UiText(UiContext* ui, float x, float lineTopY, uint32_t color,
             {
                 return;
             }
-            float glyphX = penX + (float)glyph->offsetX;
-            float glyphY = baseline - (float)glyph->offsetY;
+            float glyphX = TextPixel(penX + (float)glyph->offsetX);
+            float glyphY = TextPixel(baseline - (float)glyph->offsetY);
             quad->rect[0] = glyphX;
             quad->rect[1] = glyphY;
             quad->rect[2] = glyphX + (float)glyph->width;
