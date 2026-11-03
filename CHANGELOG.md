@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The viewer starts sooner on a large picture: from start to exit with
+  `--smoke`, a 24-megapixel JPEG takes 393 ms instead of 537 ms and a PNG of
+  that size 379 ms instead of 497 ms. The first picture is read on its own
+  thread while the window and the graphics device are created, which takes
+  longer than decoding a photo.
 - PNG decodes 2.3 to 2.5 times faster on one core: a 24-megapixel photo
   takes 119 ms instead of 276 ms, the same photo with Paeth on every row
   175 ms instead of 398 ms, and a noisy one that barely compresses 241 ms
