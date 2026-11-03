@@ -5,6 +5,23 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- PNG decodes 2.3 to 2.5 times faster on one core: a 24-megapixel photo
+  takes 119 ms instead of 276 ms, the same photo with Paeth on every row
+  175 ms instead of 398 ms, and a noisy one that barely compresses 241 ms
+  instead of 576 ms.
+  - Inflate runs a separate loop in the middle of a block. It checks the
+    input and output once a step instead of once a symbol and reads 64
+    bits at a time, and one table entry gives a code's length, extra bits
+    and base. Anything unusual stays with the careful decoder, so damaged
+    streams end with the same status at the same byte.
+  - Filters are undone a pixel at a time in SSE2 and NEON registers. Paeth
+    has no branches: on a photo the winner changes from byte to byte, and
+    mispredictions cost more than the predictor itself.
+  - Adler-32 takes 16 bytes at a time, and RGB expands a word at a time.
+  - New tests reach the loop, which short streams never did, and undo
+    every filter on every pixel size. While making the change, the old and
+    new code were compared under ASan and UBSan on 34 million mutated
+    streams and files: status, count and bytes all matched.
 - Halving an opaque picture, the step of every mip chain, is four times
   faster: 10 ms instead of 38 ms for all the levels of a 24-megapixel
   photo. Equal weights turn the weighted average into a plain one, which

@@ -531,6 +531,10 @@ if(TARGET laiue_media_support)
     laiue_add_harness(laiue_inflate_backref_test InflateBackrefTestEntryPoint
         inflate_backref_test.c inflate_backref_fixtures.h LIBRARIES ${laiue_media}
         TEST laiue.media.inflate_backref)
+    laiue_add_harness(laiue_inflate_fast_test InflateFastTestEntryPoint inflate_fast_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.inflate_fast)
+    laiue_add_harness(laiue_png_filter_test PngFilterTestEntryPoint png_filter_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.png_filter)
     laiue_add_harness(laiue_mp3_test Mp3TestEntryPoint mp3_test.c mp3_fixtures.h
         LIBRARIES ${laiue_media} TEST laiue.media.mp3)
     laiue_add_harness(laiue_audio_stream_decoder_test AudioStreamDecoderTestEntryPoint

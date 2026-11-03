@@ -5,8 +5,23 @@
 #include <stddef.h>
 #include <string.h>
 
+#if defined(_M_ARM64) || defined(__aarch64__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
+#include <arm_neon.h>
+#endif
+#else
+#include <emmintrin.h>
+#endif
+
 #define PNG_SIGNATURE_BYTES 8u
 #define PNG_MAX_IDAT_CHUNKS 65536u
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PNG_FORCE_INLINE __forceinline
+#else
+#define PNG_FORCE_INLINE inline __attribute__((always_inline))
+#endif
 
 // CRC проверяется у служебных чанков и не проверяется у IDAT: данные
 // пикселей и так покрыты Adler-32 в конце zlib-потока, а служебные
@@ -260,35 +275,165 @@ ImageStatus PngInspect(const void *bytes, uint32_t sizeBytes, ImageInfo *outInfo
 // на замере оказалось медленнее (0,63-0,69 от прежней
 // скорости на гладких градиентах), где предсказатель ветвей работает
 // почти идеально, а удлинившаяся цепочка зависимостей — нет.
-static uint8_t PaethPredictor(int32_t left, int32_t above, int32_t upperLeft)
-{
-    int32_t estimate = left + above - upperLeft;
-    int32_t distanceLeft = estimate > left ? estimate - left : left - estimate;
-    int32_t distanceAbove = estimate > above ? estimate - above : above - estimate;
-    int32_t distanceUpperLeft =
-        estimate > upperLeft ? estimate - upperLeft : upperLeft - estimate;
+// Фильтры разбирают строку по пикселю: левый сосед лежит в векторном
+// регистре, а не читается из только что записанной памяти, а каждый байт
+// пикселя занимает свою 16-битную дорожку, где суммы не переполняются.
+// Самый широкий пиксель, четыре канала по два байта, занимает все восемь.
+#if defined(_M_ARM64) || defined(__aarch64__)
 
-    if (distanceLeft <= distanceAbove && distanceLeft <= distanceUpperLeft) return (uint8_t)left;
-    if (distanceAbove <= distanceUpperLeft) return (uint8_t)above;
-    return (uint8_t)upperLeft;
+typedef int16x8_t PixelLanes;
+
+static PNG_FORCE_INLINE PixelLanes ZeroLanes(void)
+{
+    return vdupq_n_s16(0);
 }
 
-// Снимает фильтр со строки на месте. Предыдущая строка уже развёрнута,
-// поэтому обратные ссылки читают готовые байты. Проверка previous == NULL
-// и граница filterUnit инвариантны внутри строки, поэтому вынесены из
-// горячих циклов: результат побайтово тот же, что у общей формы ниже.
-static bool Unfilter(uint8_t *row, const uint8_t *previous, uint32_t rowBytes, uint32_t filterUnit,
-                     uint32_t filterType)
+static PNG_FORCE_INLINE PixelLanes LoadLanes(const uint8_t *bytes, uint32_t unit)
+{
+    uint64_t word = 0u;
+    memcpy(&word, bytes, unit);
+    return vreinterpretq_s16_u16(vmovl_u8(vcreate_u8(word)));
+}
+
+static PNG_FORCE_INLINE void StoreLanes(uint8_t *bytes, uint32_t unit, PixelLanes lanes)
+{
+    const uint8x8_t packed = vmovn_u16(vreinterpretq_u16_s16(lanes));
+    const uint64_t word = vget_lane_u64(vreinterpret_u64_u8(packed), 0);
+    memcpy(bytes, &word, unit);
+}
+
+static PNG_FORCE_INLINE PixelLanes AddLaneBytes(PixelLanes first, PixelLanes second)
+{
+    return vreinterpretq_s16_u8(
+        vaddq_u8(vreinterpretq_u8_s16(first), vreinterpretq_u8_s16(second)));
+}
+
+static PNG_FORCE_INLINE PixelLanes AverageLanes(PixelLanes first, PixelLanes second)
+{
+    return vshrq_n_s16(vaddq_s16(first, second), 1);
+}
+
+static PNG_FORCE_INLINE PixelLanes PaethLanes(PixelLanes left, PixelLanes above,
+                                              PixelLanes upperLeft)
+{
+    const PixelLanes fromAbove = vsubq_s16(above, upperLeft);
+    const PixelLanes fromLeft = vsubq_s16(left, upperLeft);
+    const PixelLanes distanceLeft = vabsq_s16(fromAbove);
+    const PixelLanes distanceAbove = vabsq_s16(fromLeft);
+    const PixelLanes distanceUpperLeft = vabsq_s16(vaddq_s16(fromAbove, fromLeft));
+    const PixelLanes smallest =
+        vminq_s16(vminq_s16(distanceLeft, distanceAbove), distanceUpperLeft);
+    const PixelLanes rest = vbslq_s16(vceqq_s16(smallest, distanceAbove), above, upperLeft);
+    return vbslq_s16(vceqq_s16(smallest, distanceLeft), left, rest);
+}
+
+#else
+
+typedef __m128i PixelLanes;
+
+static PNG_FORCE_INLINE PixelLanes ZeroLanes(void)
+{
+    return _mm_setzero_si128();
+}
+
+static PNG_FORCE_INLINE PixelLanes LoadLanes(const uint8_t *bytes, uint32_t unit)
+{
+    uint64_t word = 0u;
+    memcpy(&word, bytes, unit);
+    return _mm_unpacklo_epi8(_mm_cvtsi64_si128((int64_t)word), _mm_setzero_si128());
+}
+
+static PNG_FORCE_INLINE void StoreLanes(uint8_t *bytes, uint32_t unit, PixelLanes lanes)
+{
+    const uint64_t word = (uint64_t)_mm_cvtsi128_si64(_mm_packus_epi16(lanes, lanes));
+    memcpy(bytes, &word, unit);
+}
+
+static PNG_FORCE_INLINE PixelLanes AddLaneBytes(PixelLanes first, PixelLanes second)
+{
+    return _mm_add_epi8(first, second);
+}
+
+static PNG_FORCE_INLINE PixelLanes AverageLanes(PixelLanes first, PixelLanes second)
+{
+    return _mm_srli_epi16(_mm_add_epi16(first, second), 1);
+}
+
+static PNG_FORCE_INLINE PixelLanes AbsoluteLanes(PixelLanes lanes)
+{
+    return _mm_max_epi16(lanes, _mm_sub_epi16(_mm_setzero_si128(), lanes));
+}
+
+static PNG_FORCE_INLINE PixelLanes SelectLanes(PixelLanes mask, PixelLanes chosen, PixelLanes other)
+{
+    return _mm_or_si128(_mm_and_si128(mask, chosen), _mm_andnot_si128(mask, other));
+}
+
+static PNG_FORCE_INLINE PixelLanes PaethLanes(PixelLanes left, PixelLanes above,
+                                              PixelLanes upperLeft)
+{
+    const PixelLanes fromAbove = _mm_sub_epi16(above, upperLeft);
+    const PixelLanes fromLeft = _mm_sub_epi16(left, upperLeft);
+    const PixelLanes distanceLeft = AbsoluteLanes(fromAbove);
+    const PixelLanes distanceAbove = AbsoluteLanes(fromLeft);
+    const PixelLanes distanceUpperLeft = AbsoluteLanes(_mm_add_epi16(fromAbove, fromLeft));
+    const PixelLanes smallest =
+        _mm_min_epi16(_mm_min_epi16(distanceLeft, distanceAbove), distanceUpperLeft);
+    const PixelLanes rest =
+        SelectLanes(_mm_cmpeq_epi16(smallest, distanceAbove), above, upperLeft);
+    return SelectLanes(_mm_cmpeq_epi16(smallest, distanceLeft), left, rest);
+}
+
+#endif
+
+static PNG_FORCE_INLINE void UnfilterSub(uint8_t *row, uint32_t rowBytes, uint32_t unit)
+{
+    PixelLanes left = ZeroLanes();
+    for (uint32_t index = 0; index < rowBytes; index += unit)
+    {
+        left = AddLaneBytes(LoadLanes(row + index, unit), left);
+        StoreLanes(row + index, unit, left);
+    }
+}
+
+static PNG_FORCE_INLINE void UnfilterAverage(uint8_t *row, const uint8_t *previous,
+                                             uint32_t rowBytes, uint32_t unit)
+{
+    PixelLanes left = ZeroLanes();
+    for (uint32_t index = 0; index < rowBytes; index += unit)
+    {
+        const PixelLanes above = previous != NULL ? LoadLanes(previous + index, unit) : ZeroLanes();
+        left = AddLaneBytes(LoadLanes(row + index, unit), AverageLanes(left, above));
+        StoreLanes(row + index, unit, left);
+    }
+}
+
+// Ветвлений нет намеренно: на фотографии победитель меняется от байта к
+// байту, и условные переходы промахивались бы чаще, чем считается сам
+// предиктор. Порядок выбора при равенстве задан стандартом: левый,
+// верхний, верхний левый.
+static PNG_FORCE_INLINE void UnfilterPaeth(uint8_t *row, const uint8_t *previous, uint32_t rowBytes,
+                                           uint32_t unit)
+{
+    PixelLanes left = ZeroLanes();
+    PixelLanes upperLeft = ZeroLanes();
+    for (uint32_t index = 0; index < rowBytes; index += unit)
+    {
+        const PixelLanes above = LoadLanes(previous + index, unit);
+        left = AddLaneBytes(LoadLanes(row + index, unit), PaethLanes(left, above, upperLeft));
+        StoreLanes(row + index, unit, left);
+        upperLeft = above;
+    }
+}
+
+static PNG_FORCE_INLINE bool UnfilterWithUnit(uint8_t *row, const uint8_t *previous,
+                                              uint32_t rowBytes, uint32_t unit,
+                                              uint32_t filterType)
 {
     switch (filterType)
     {
     case 0u: return true;
-    case 1u:
-        for (uint32_t index = filterUnit; index < rowBytes; ++index)
-        {
-            row[index] = (uint8_t)(row[index] + row[index - filterUnit]);
-        }
-        return true;
+    case 1u: UnfilterSub(row, rowBytes, unit); return true;
     case 2u:
         if (previous == NULL) return true;
         for (uint32_t index = 0; index < rowBytes; ++index)
@@ -296,57 +441,49 @@ static bool Unfilter(uint8_t *row, const uint8_t *previous, uint32_t rowBytes, u
             row[index] = (uint8_t)(row[index] + previous[index]);
         }
         return true;
-    case 3u:
-    {
-        uint32_t index = 0u;
-        if (previous == NULL)
-        {
-            for (; index < rowBytes; ++index)
-            {
-                uint32_t left = index >= filterUnit ? row[index - filterUnit] : 0u;
-                row[index] = (uint8_t)(row[index] + left / 2u);
-            }
-            return true;
-        }
-        for (; index < filterUnit && index < rowBytes; ++index)
-        {
-            row[index] = (uint8_t)(row[index] + previous[index] / 2u);
-        }
-        for (; index < rowBytes; ++index)
-        {
-            row[index] =
-                (uint8_t)(row[index] + (row[index - filterUnit] + (uint32_t)previous[index]) / 2u);
-        }
-        return true;
-    }
+    case 3u: UnfilterAverage(row, previous, rowBytes, unit); return true;
     case 4u:
-    {
-        uint32_t index = 0u;
-        if (previous == NULL)
-        {
-            // Paeth(left, 0, 0) == left, то есть фильтр 4 вырождается в Sub.
-            for (index = filterUnit; index < rowBytes; ++index)
-            {
-                row[index] = (uint8_t)(row[index] + row[index - filterUnit]);
-            }
-            return true;
-        }
-        // Paeth(0, above, 0) == above: первые filterUnit байт строки не имеют
-        // левого и верхнего-левого соседа, и предиктор равен верхнему байту.
-        for (; index < filterUnit && index < rowBytes; ++index)
-        {
-            row[index] = (uint8_t)(row[index] + previous[index]);
-        }
-        for (; index < rowBytes; ++index)
-        {
-            int32_t left = row[index - filterUnit];
-            int32_t above = previous[index];
-            int32_t upperLeft = previous[index - filterUnit];
-            row[index] = (uint8_t)(row[index] + PaethPredictor(left, above, upperLeft));
-        }
+        // Paeth(left, 0, 0) == left, то есть без верхней строки фильтр 4
+        // вырождается в Sub.
+        if (previous == NULL) UnfilterSub(row, rowBytes, unit);
+        else UnfilterPaeth(row, previous, rowBytes, unit);
         return true;
-    }
     default: return false;
+    }
+}
+
+// Отдельные функции, а не ветви одного switch: вызовы с постоянным и с
+// переменным unit компилятор склеил бы обратно в общий.
+static bool UnfilterBytes(uint8_t *row, const uint8_t *previous, uint32_t rowBytes,
+                          uint32_t filterType)
+{
+    return UnfilterWithUnit(row, previous, rowBytes, 1u, filterType);
+}
+
+static bool UnfilterRgb(uint8_t *row, const uint8_t *previous, uint32_t rowBytes,
+                        uint32_t filterType)
+{
+    return UnfilterWithUnit(row, previous, rowBytes, 3u, filterType);
+}
+
+static bool UnfilterRgba(uint8_t *row, const uint8_t *previous, uint32_t rowBytes,
+                         uint32_t filterType)
+{
+    return UnfilterWithUnit(row, previous, rowBytes, 4u, filterType);
+}
+
+// Снимает фильтр со строки на месте. Предыдущая строка уже развёрнута,
+// поэтому обратные ссылки читают готовые байты. Пиксели в 1, 3 и 4 байта
+// встречаются почти всегда и получают свои копии циклов.
+static bool Unfilter(uint8_t *row, const uint8_t *previous, uint32_t rowBytes, uint32_t filterUnit,
+                     uint32_t filterType)
+{
+    switch (filterUnit)
+    {
+    case 1u: return UnfilterBytes(row, previous, rowBytes, filterType);
+    case 3u: return UnfilterRgb(row, previous, rowBytes, filterType);
+    case 4u: return UnfilterRgba(row, previous, rowBytes, filterType);
+    default: return UnfilterWithUnit(row, previous, rowBytes, filterUnit, filterType);
     }
 }
 
@@ -447,16 +584,25 @@ static void ExpandRow8Rgb(const DecodeContext *context, const uint8_t *row, uint
         }
         return;
     }
+    // Слово за раз: четвёртый байт принадлежит следующему пикселю, и его
+    // заменяет альфа. Поэтому последний пиксель строки идёт отдельно.
+    static const uint8_t OPAQUE_BYTES[4] = {0u, 0u, 0u, 255u};
+    uint32_t opaque;
+    memcpy(&opaque, OPAQUE_BYTES, sizeof(opaque));
     const uint8_t *source = row;
-    for (uint32_t pixel = 0; pixel < rowWidth; ++pixel)
+    for (uint32_t pixel = 1u; pixel < rowWidth; ++pixel)
     {
-        destination[0] = source[0];
-        destination[1] = source[1];
-        destination[2] = source[2];
-        destination[3] = 255u;
+        uint32_t word;
+        memcpy(&word, source, sizeof(word));
+        word |= opaque;
+        memcpy(destination, &word, sizeof(word));
         source += 3u;
         destination += destinationStride;
     }
+    destination[0] = source[0];
+    destination[1] = source[1];
+    destination[2] = source[2];
+    destination[3] = 255u;
 }
 
 static void ExpandRow8Palette(const DecodeContext *context, const uint8_t *row,
