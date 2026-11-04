@@ -72,6 +72,15 @@ in memory, and anything over 1 GiB decoded, or 256 MiB on Android, is read only
 when asked for. If reading ahead fails, the page turn reads the picture as
 usual, so errors look the same.
 
+## A lost graphics device
+
+A driver update or a GPU reset takes the device away, and every frame fails
+after that. The viewer asks `getDiagnostics` about a failed frame, and if the
+device is lost, creates a new one on the same window and reads the picture
+again, retrying for ten seconds while the driver comes back. A frame that fails
+for any other reason waits a quarter of a second, so a program with nothing to
+draw does not spin.
+
 ## Build
 
 Desktop builds need modules as shared libraries, the default:

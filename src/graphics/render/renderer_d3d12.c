@@ -4376,6 +4376,12 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     return true;
 }
 
+bool RendererIsDeviceLost_D3D12(const Renderer* renderer)
+{
+    return renderer->frameFailed ||
+           FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device));
+}
+
 void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
 {
     if (renderer == NULL || outStats == NULL) return;

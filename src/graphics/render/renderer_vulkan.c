@@ -5241,6 +5241,11 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     return true;
 }
 
+bool RendererIsDeviceLost_Vulkan(const Renderer *renderer)
+{
+    return renderer->deviceFailed;
+}
+
 void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
 {
     if (renderer == NULL || outStats == NULL) return;

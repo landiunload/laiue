@@ -44,6 +44,10 @@
 // Сколько кадров графике нужно, чтобы отдать удалённую текстуру и память,
 // через которую новая шла на видеокарту.
 #define RELEASE_FRAMES 4u
+// Устройство после сброса драйвера возвращается не сразу: просмотрщик пробует
+// создать его столько раз, с такой паузой.
+#define RESTART_TRIES 40u
+#define RESTART_PAUSE_SECONDS 0.25
 
 typedef struct Files
 {
@@ -123,6 +127,7 @@ struct Viewer
     uint32_t current;
     bool forward; // куда листают: туда же читается следующая картинка
     bool deferrable; // модуль окна умеет ждать событий
+    uint32_t restartTries; // столько раз новое устройство не создалось
     wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
     char caption[CAPTION_BYTES];
     // Вид: масштаб в пикселях экрана на пиксель картинки, точка повёрнутой
@@ -818,6 +823,55 @@ static double SecondsToNextFrame(const Picture *picture, double now)
     return seconds > 0.0 ? seconds : 0.0;
 }
 
+static bool OpenDevice(Viewer *viewer);
+static void CloseDevice(Viewer *viewer);
+
+// Новое устройство вместо потерянного. Текстуры пропали вместе с ним, и картинка
+// читается заново.
+static void RestartDevice(Viewer *viewer)
+{
+    if (!OpenDevice(viewer))
+    {
+        CloseDevice(viewer);
+        if (++viewer->restartTries == RESTART_TRIES)
+        {
+            viewer->failed = true;
+            viewer->windows->requestClose(viewer->window);
+        }
+        else if (viewer->deferrable)
+            viewer->windows->deferNextFrame(viewer->window, RESTART_PAUSE_SECONDS);
+        return;
+    }
+    viewer->restartTries = 0u;
+    PlatformWriteConsoleUtf8("viewer: graphics restarted\n");
+    if (viewer->files.count == 0u)
+        (void)ShowPattern(viewer);
+    else if (viewer->current < viewer->files.count)
+        (void)LoadPicture(viewer, viewer->current);
+}
+
+static bool DeviceLost(const Viewer *viewer)
+{
+    LaiueGraphicsDeviceV2 *device = viewer->device;
+    LaiueGraphicsDiagnosticsV2 diagnostics = {.structSize = sizeof(diagnostics)};
+    return device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE &&
+           device->getDiagnostics != NULL && device->getDiagnostics(device, &diagnostics) != 0u &&
+           (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST) != 0u;
+}
+
+// Кадры подряд здесь только грели бы процессор: окно ещё не готово, или устройство
+// потеряно, и следующий кадр начнётся с нового.
+static void PauseAfterFailedFrame(Viewer *viewer)
+{
+    if (DeviceLost(viewer))
+    {
+        PlatformWriteConsoleUtf8("viewer: the graphics device is lost\n");
+        CloseDevice(viewer);
+    }
+    if (viewer->deferrable)
+        viewer->windows->deferNextFrame(viewer->window, RESTART_PAUSE_SECONDS);
+}
+
 static void HandleKeys(Viewer *viewer)
 {
     const LaiueInputServiceV1 *keys = viewer->inputs;
@@ -1083,6 +1137,11 @@ static void Frame(void *context)
     const float seconds = (float)(now - viewer->lastTime);
     viewer->lastTime = now;
     const LaiueWindowServiceV1 *windows = viewer->windows;
+    if (viewer->device == NULL)
+    {
+        RestartDevice(viewer);
+        return;
+    }
     if (windows->consumeFocusLoss(viewer->window))
         viewer->inputs->resetState(viewer->input);
     const bool onDemand = viewer->deferrable && !viewer->smoke;
@@ -1149,10 +1208,18 @@ static void Frame(void *context)
     if (!UpdateShape(viewer) || !PrepareBar(viewer, seconds) ||
         !device->setCamera(device, &camera) ||
         !device->beginFrame(device, (uint32_t)width, (uint32_t)height))
+    {
+        PauseAfterFailedFrame(viewer);
         return;
+    }
     const bool drawn = DrawPicture(viewer) && DrawBar(viewer);
     if (!device->endFrame(device) || !drawn)
     {
+        if (DeviceLost(viewer))
+        {
+            PauseAfterFailedFrame(viewer);
+            return;
+        }
         viewer->failed = true;
         windows->requestClose(viewer->window);
         return;
@@ -1309,7 +1376,7 @@ static bool LoadModules(Viewer *viewer, const char *provider, const char *provid
     return viewer->windows != NULL && viewer->inputs != NULL && viewer->graphics != NULL;
 }
 
-static void Unload(Viewer *viewer)
+static void CloseDevice(Viewer *viewer)
 {
     ReleasePicture(viewer);
     if (viewer->device != NULL)
@@ -1319,6 +1386,17 @@ static void Unload(Viewer *viewer)
         viewer->device->destroyHandle(viewer->device, viewer->vertices);
         viewer->graphics->destroyDevice(viewer->device);
     }
+    viewer->device = NULL;
+    viewer->vertices = 0u;
+    viewer->indices = 0u;
+    viewer->sampler = 0u;
+    viewer->atlasWidth = 0;
+    viewer->atlasHeight = 0;
+}
+
+static void Unload(Viewer *viewer)
+{
+    CloseDevice(viewer);
     if (viewer->uiContext != NULL)
         viewer->ui->contextDestroy(viewer->uiContext);
     if (viewer->input != NULL)
@@ -1330,19 +1408,30 @@ static void Unload(Viewer *viewer)
     viewer->host = NULL;
     viewer->window = NULL;
     viewer->input = NULL;
-    viewer->device = NULL;
     viewer->uiContext = NULL;
-    viewer->vertices = 0u;
-    viewer->indices = 0u;
-    viewer->sampler = 0u;
-    viewer->atlasWidth = 0;
-    viewer->atlasHeight = 0;
 }
 
 static void InputFromWindow(void *context, void *raw)
 {
     Viewer *viewer = (Viewer *)context;
     viewer->inputs->handleRawInput(viewer->input, raw);
+}
+
+static bool OpenDevice(Viewer *viewer)
+{
+    void *native = viewer->windows->getNativeHandle(viewer->window);
+    viewer->windows->getClientSize(viewer->window, &viewer->width, &viewer->height);
+    const LaiueGraphicsDeviceServiceV2 *graphics = viewer->graphics;
+    const uint32_t created =
+        Has(viewer->graphicsBytes, graphics->structSize,
+            offsetof(LaiueGraphicsDeviceServiceV2, context), sizeof(graphics->context)) &&
+                graphics->createDeviceWithContext != NULL
+            ? graphics->createDeviceWithContext(graphics->context, native, viewer->width,
+                                                viewer->height, LAIUE_GRAPHICS_BACKEND_AUTO,
+                                                &viewer->device)
+            : graphics->createDevice(native, viewer->width, viewer->height,
+                                     LAIUE_GRAPHICS_BACKEND_AUTO, &viewer->device);
+    return created && viewer->device != NULL && CreateResources(viewer);
 }
 
 // Окно, ввод, графика и интерфейс поверх загруженных модулей. Без модуля
@@ -1366,18 +1455,7 @@ static bool Open(Viewer *viewer)
     viewer->deferrable =
         Has(viewer->windowBytes, viewer->windows->structSize,
             offsetof(LaiueWindowServiceV1, consumeRedraw), sizeof(viewer->windows->consumeRedraw));
-    viewer->windows->getClientSize(viewer->window, &viewer->width, &viewer->height);
-    const LaiueGraphicsDeviceServiceV2 *graphics = viewer->graphics;
-    const uint32_t created =
-        Has(viewer->graphicsBytes, graphics->structSize,
-            offsetof(LaiueGraphicsDeviceServiceV2, context), sizeof(graphics->context)) &&
-                graphics->createDeviceWithContext != NULL
-            ? graphics->createDeviceWithContext(graphics->context, native, viewer->width,
-                                                viewer->height, LAIUE_GRAPHICS_BACKEND_AUTO,
-                                                &viewer->device)
-            : graphics->createDevice(native, viewer->width, viewer->height,
-                                     LAIUE_GRAPHICS_BACKEND_AUTO, &viewer->device);
-    if (!created || viewer->device == NULL || !CreateResources(viewer))
+    if (!OpenDevice(viewer))
         return false;
     const LaiueUiServiceV1 *ui = viewer->ui;
     if (ui != NULL)

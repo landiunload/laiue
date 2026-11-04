@@ -89,6 +89,8 @@ LAIUE_RENDER_API Renderer* RendererCreateWithBackend(void* windowHandle, int32_t
                                                       int32_t height, RendererBackendKind backend);
 // Каким бэкендом создан этот живой Renderer. NULL возвращает AUTO.
 LAIUE_RENDER_API RendererBackendKind RendererGetBackend(const Renderer* renderer);
+// Устройство потеряно насовсем: кадры будут только отказывать.
+LAIUE_RENDER_API bool RendererIsDeviceLost(const Renderer* renderer);
 
 // === Кеш конвейеров ===
 //
