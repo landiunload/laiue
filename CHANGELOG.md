@@ -5,6 +5,18 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan a frame is drawn straight into the swap chain image, without two
+  extra colour targets and a copy of the whole screen in every frame. That copy
+  costs a phone GPU the most, but a phone has not been measured. Foxity on Windows
+  holds 232 MB instead of 241. A screen that offers only BGRA gets BGRA targets.
+  The copy stays for a surface that offers neither sRGB format and for a frame
+  whose size differs from the window. A chain asks for three images, since with
+  two a frame and its GPU work have to fit one refresh.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN` tells whether the last frame
+  went straight into the swap chain, and the Android scenario counts such frames.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED` covers every device with
+  a window: on Vulkan too `readbackFrame` now needs `requestFrameReadback` before
+  the frame. Without a window nothing changes.
 - Upload rings take a quarter of the memory, 1 MiB per frame instead of 4, and
   the 8 MiB arenas of a burst go back after 120 turns of their frame slot without
   use. A game loads its world in the first seconds and then uploads almost

@@ -379,7 +379,8 @@ endif()
 if(TARGET laiue_render AND laiue_shared_modules)
     if(LAIUE_RENDER_HAS_VULKAN_TARGET)
         laiue_add_harness(laiue_graphics_geometry_vulkan_test GraphicsGeometryTestEntryPoint
-            graphics_geometry_test.c BOOTSTRAP DEPENDS laiue_render
+            graphics_geometry_test.c BOOTSTRAP
+            LIBRARIES $<$<PLATFORM_ID:Windows>:user32> DEPENDS laiue_render
             DEFINITIONS LAIUE_GRAPHICS_TEST_D3D12=0
                 "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}>"
             TEST laiue.graphics.geometry_vulkan TIMEOUT 90)

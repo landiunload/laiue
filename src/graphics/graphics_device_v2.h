@@ -97,6 +97,9 @@ typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 // The device stopped for good, as after a driver reset, and every frame will
 // fail. Destroy it and create a new one, as soon as the system allows it.
 #define LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST (1u << 5)
+// The last frame went straight into a swap chain image. Without the flag a window
+// costs an extra colour target and a copy of the screen in every frame.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN (1u << 6)
 
 typedef struct LaiueGraphicsDiagnosticsV2
 {
