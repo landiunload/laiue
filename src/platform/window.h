@@ -102,16 +102,19 @@ LAIUE_WINDOW_API void WindowSetSurfaceCallback(Window *window, SurfaceCallback c
 LAIUE_WINDOW_API float WindowGetContentScale(const Window *window);
 
 // Как программа расходует энергию, общее для процесса.
-// AUTO: пока программа в фоне, процесс в режиме эффективности Windows (как у
-// переключателя в диспетчере задач: EcoQoS и низкий приоритет), а на переднем
-// плане QoS выбирает система. EFFICIENCY: режим эффективности всегда.
-// PERFORMANCE: никогда, и система не замедляет процесс даже в фоне.
+// AUTO: пока ни одно окно программы нельзя увидеть (они свёрнуты, скрыты или на
+// другом рабочем столе), процесс в режиме эффективности Windows (как у
+// переключателя в диспетчере задач: EcoQoS и низкий приоритет), а в остальное
+// время QoS выбирает система. EFFICIENCY: режим эффективности всегда, а окно вне
+// фокуса рисует около 20 кадров в секунду. PERFORMANCE: никогда, и система не
+// замедляет процесс даже в фоне. При AUTO и PERFORMANCE окно вне фокуса рисует как
+// обычно, пока его видно.
 #define WINDOW_POWER_AUTO 0u
 #define WINDOW_POWER_EFFICIENCY 1u
 #define WINDOW_POWER_PERFORMANCE 2u
 
-// true — система применяет политику. Такой механизм есть только у Windows;
-// на других системах политика запоминается, но ничего не меняет.
+// true — система применяет политику. Такой механизм есть только у Windows; на
+// других системах политика запоминается, а на X11 ещё ограничивает кадры вне фокуса.
 // Неизвестное значение даёт false и оставляет прежнюю политику.
 LAIUE_WINDOW_API bool WindowSetPowerPolicy(uint32_t policy);
 LAIUE_WINDOW_API uint32_t WindowGetPowerPolicy(void);

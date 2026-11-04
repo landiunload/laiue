@@ -264,7 +264,7 @@ if(LAIUE_NATIVE_MODS_ENABLED)
         set_tests_properties(laiue.platform.window_frames PROPERTIES SKIP_RETURN_CODE 125)
         if(WIN32)
             laiue_add_harness(laiue_window_dpi_test WindowDpiTestEntryPoint
-                window_dpi_test.c BOOTSTRAP LIBRARIES user32 DEPENDS laiue_window
+                window_dpi_test.c BOOTSTRAP LIBRARIES user32 dwmapi DEPENDS laiue_window
                 TEST laiue.platform.window_dpi TIMEOUT 30)
         endif()
     endif()

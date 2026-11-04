@@ -98,7 +98,8 @@ if(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_WINDOWS)
             ../api.h
         WINDOWS_LINK
             user32
-            gdi32)
+            gdi32
+            dwmapi)
 elseif(LAIUE_BUILD_GRAPHICS AND LAIUE_PLATFORM_POSIX AND X11_FOUND)
     # time.c — реализация на QueryPerformanceCounter и только для Win32;
     # X11-окну она не нужна, а монотонные часы POSIX есть в platform_support.

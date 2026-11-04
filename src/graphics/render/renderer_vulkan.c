@@ -78,6 +78,13 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // этого GPU — 2, максимум — 8; всё, что выше, движок не поддерживает.
 #define MAX_SWAPCHAIN_IMAGES 8u
 
+// С меньшим числом образов следующий образ захватывается в самом кадре, а не
+// после показа прошлого, см. RendererEndFrame_Vulkan.
+#define SWAPCHAIN_IMAGES_FOR_EARLY_ACQUIRE 3u
+
+// Предел ожидания показа: кадр не встаёт, что бы ни случилось с окном.
+#define PRESENT_WAIT_NANOSECONDS 100000000u
+
 // Раскладка дескрипторов повторяет сдвиги регистров HLSL.
 #define BINDING_CONSTANTS 0u
 #define BINDING_QUAD_BUFFER 1u
@@ -113,6 +120,11 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
 // когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
+// оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
+// предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
+// кадре до него GPU не ждёт.
+#define GEOMETRY_STAGING_LIMIT_BYTES (UINT64_C(32) << 20)
 // Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
 // загрузок много, накопленное копируется сразу: иначе подготовка большой
 // сцены держала бы все её пиксели в памяти дважды.
@@ -445,6 +457,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
     StagingOverflow *stagingOverflow[FRAME_COUNT];
+    uint64_t stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
     uint32_t pendingTextureCount;
     StagingOverflow *textureStaging;
@@ -508,6 +521,11 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     // пула геометрии было бесконфликтным.
     bool hasSurface;
     bool swapchainOutOfDate;
+    PFN_vkWaitForPresentKHR waitForPresent;  // NULL: устройство не умеет ждать показа
+    uint64_t presentId;                      // номер последнего показа
+    bool swapchainImageHeld;           // образ swapchainImageIndex захвачен и ждёт кадра
+    bool swapchainAcquiredSuboptimal;  // образ кадра захвачен с VK_SUBOPTIMAL_KHR
+    bool swapchainRefitTried;          // цепочку уже собирали заново из-за VK_SUBOPTIMAL_KHR
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkFormat swapchainFormat;
@@ -725,6 +743,7 @@ static void ReleaseStagingChain(Renderer *renderer, StagingOverflow **head)
 static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
 {
     ReleaseStagingChain(renderer, &renderer->stagingOverflow[frameIndex]);
+    renderer->stagingOverflowBytes[frameIndex] = 0u;
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -2583,6 +2602,27 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
 // Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
 // разрывов: FIFO_LATEST_READY, затем MAILBOX, иначе IMMEDIATE, иначе FIFO (он
 // обязан поддерживаться всегда).
+// Ожидание показа считает показы по их номерам, так что нужны оба расширения.
+static bool PresentWaitSupported(VkPhysicalDevice device)
+{
+    if (!DeviceExtensionSupported(device, VK_KHR_PRESENT_ID_EXTENSION_NAME) ||
+        !DeviceExtensionSupported(device, VK_KHR_PRESENT_WAIT_EXTENSION_NAME))
+        return false;
+    VkPhysicalDevicePresentWaitFeaturesKHR wait = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+    };
+    VkPhysicalDevicePresentIdFeaturesKHR id = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .pNext = &wait,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &id,
+    };
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return id.presentId == VK_TRUE && wait.presentWait == VK_TRUE;
+}
+
 static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync,
                                           bool latestReady)
 {
@@ -2634,6 +2674,7 @@ static void DestroySwapchainResources(Renderer *renderer)
     }
     renderer->swapchainImageCount = 0u;
     renderer->swapchainImageIndex = 0u;
+    renderer->swapchainImageHeld = false;
 }
 
 static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
@@ -2816,6 +2857,9 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainExtent = extent;
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
+    // Цепочка рисует без поворота, а экран повёрнут: Android отвечает на такой
+    // показ VK_SUBOPTIMAL_KHR всегда, и новая цепочка была бы такой же.
+    renderer->swapchainRefitTried = preTransform != capabilities.currentTransform;
     for (uint32_t index = 0; index < actualCount; ++index)
         renderer->swapchainImages[index] = images[index];
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
@@ -2843,27 +2887,50 @@ static bool SwapchainRecreate(Renderer *renderer)
     return true;
 }
 
-// Захват образа и запись копии colorTarget в команду кадра. Кадр уже
-// переведён вызывающим в TRANSFER_SRC_OPTIMAL.
-static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+// VK_SUBOPTIMAL_KHR — совет, а не сбой: образ показан. Новая цепочка может
+// подойти поверхности лучше, поэтому её собирают один раз. Если совет не
+// проходит, пересборка не помогает.
+static void NoteSwapchainFit(Renderer *renderer, bool suboptimal)
 {
-    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
-        return PRESENT_OUTCOME_NONE;
+    if (suboptimal && !renderer->swapchainRefitTried)
+        renderer->swapchainOutOfDate = true;
+    renderer->swapchainRefitTried = suboptimal;
+}
 
+// Образ для кадра слота frameIndex: семафор слота должен быть свободен, то есть
+// прошлый кадр этого слота закончен. false — образа нет.
+static bool AcquireSwapchainImage(Renderer *renderer)
+{
+    if (renderer->swapchainImageHeld)
+        return true;
     uint32_t imageIndex = 0u;
     VkResult acquire = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
                                              renderer->imageAvailable[renderer->frameIndex],
                                              VK_NULL_HANDLE, &imageIndex);
-    if (acquire != VK_SUCCESS)
+    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
     {
-        // OUT_OF_DATE/SUBOPTIMAL — не ошибка кадра: помечаем swapchain
+        // Образа нет, и OUT_OF_DATE — не ошибка кадра: помечаем swapchain
         // устаревшим, пересоберём в начале следующего кадра.
         renderer->swapchainOutOfDate = true;
-        return PRESENT_OUTCOME_SKIP;
+        return false;
     }
-
+    renderer->swapchainAcquiredSuboptimal = acquire == VK_SUBOPTIMAL_KHR;
     renderer->swapchainImageIndex = imageIndex;
-    VkImage destination = renderer->swapchainImages[imageIndex];
+    renderer->swapchainImageHeld = true;
+    return true;
+}
+
+// Запись копии colorTarget в образ кадра. Кадр уже переведён вызывающим в
+// TRANSFER_SRC_OPTIMAL.
+static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
+        return PRESENT_OUTCOME_NONE;
+    if (!AcquireSwapchainImage(renderer))
+        return PRESENT_OUTCOME_SKIP;
+
+    renderer->swapchainImageHeld = false;
+    VkImage destination = renderer->swapchainImages[renderer->swapchainImageIndex];
 
     VkImageMemoryBarrier toTransfer = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3192,7 +3259,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         }
     }
 #endif
-    const char *deviceExtensions[3];
+    const char *deviceExtensions[5];
     uint32_t deviceExtensionCount = 0u;
     if (pushDescriptorCommand == NULL &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
@@ -3230,6 +3297,23 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         renderer->presentLatestReady = true;
     }
 #endif
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .presentId = VK_TRUE,
+    };
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+        .presentWait = VK_TRUE,
+    };
+    const bool presentWait = renderer->hasSurface && PresentWaitSupported(chosen);
+    if (presentWait)
+    {
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        presentIdFeature.pNext = featureChain;
+        presentWaitFeature.pNext = &presentIdFeature;
+        featureChain = &presentWaitFeature;
+    }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = featureChain,
@@ -3240,6 +3324,9 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
+    if (presentWait)
+        renderer->waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(
+            renderer->device, "vkWaitForPresentKHR");
     if (renderer->useDynamicRendering)
     {
         renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
@@ -3782,6 +3869,7 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
                         &mapped))
         return false;
     memcpy(mapped, data, sizeBytes);
+    renderer->stagingOverflowBytes[renderer->frameIndex] += sizeBytes;
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -3843,6 +3931,8 @@ static bool EnsureVulkanLargeMeshBuffer(Renderer *renderer, uint32_t frameIndex)
                         &renderer->largeMeshUploadBuffers[frameIndex]);
 }
 
+static bool FlushUploads(Renderer *renderer);
+
 static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, const void *data,
                                                           uint32_t sizeBytes,
                                                           size_t allocationBytes)
@@ -3850,6 +3940,9 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
     if (renderer == NULL || !renderer->worldReady || data == NULL || sizeBytes == 0u ||
         renderer->frameRecording || renderer->deviceFailed ||
         !EnsureVulkanUploadSlotReady(renderer) || !ReservePendingUpload(renderer))
+        return NULL;
+    if (renderer->stagingOverflowBytes[renderer->frameIndex] >= GEOMETRY_STAGING_LIMIT_BYTES &&
+        !FlushUploads(renderer))
         return NULL;
 
     // Сначала то, что откатывается без следа, затем диапазон пула и staging.
@@ -4057,23 +4150,6 @@ static void RetireTextureStaging(Renderer *renderer)
     renderer->textureStagingBytes = 0u;
 }
 
-// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging-блоки.
-static bool FlushTextureUploads(Renderer *renderer)
-{
-    if (renderer->pendingTextureCount != 0u)
-    {
-        VkCommandBuffer commandBuffer = BeginImmediate(renderer);
-        if (commandBuffer == VK_NULL_HANDLE)
-            return false;
-        RecordTextureUploads(renderer, commandBuffer);
-        if (!EndImmediate(renderer, commandBuffer))
-            return false;
-    }
-    ReleaseStagingChain(renderer, &renderer->textureStaging);
-    renderer->textureStagingBytes = 0u;
-    return true;
-}
-
 bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                   const void *data, uint64_t sizeBytes,
                                   uint32_t rowPitchBytes)
@@ -4101,7 +4177,7 @@ bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *textur
         return false;
     if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
          renderer->textureStagingBytes + sizeBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
-        !FlushTextureUploads(renderer))
+        !FlushUploads(renderer))
         return false;
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceSize offset = 0u;
@@ -4760,11 +4836,10 @@ static void RecordPendingUploadBatch(Renderer *renderer, VkCommandBuffer command
     }
 }
 
-static void RecordPendingUploads(Renderer *renderer)
+static void RecordPendingUploads(Renderer *renderer, VkCommandBuffer commandBuffer)
 {
     if (renderer->pendingUploadCount == 0u) return;
 
-    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
     VkBufferCopy *regions = renderer->uploadRegionScratch;
     VkBuffer staging = VK_NULL_HANDLE;
     VkBuffer destination = VK_NULL_HANDLE;
@@ -4814,6 +4889,34 @@ static void RecordPendingUploads(Renderer *renderer)
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                          0, 1u, &barrier, 0, NULL, 0, NULL);
+}
+
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging. Запись,
+// заменённая до кадра, здесь не отменяется, и её диапазон пула ждёт отправок,
+// которых без кадров нет. После простоя очереди не нужен никто из них.
+static bool FlushUploads(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount != 0u || renderer->pendingTextureCount != 0u)
+    {
+        VkCommandBuffer commandBuffer = BeginImmediate(renderer);
+        if (commandBuffer == VK_NULL_HANDLE)
+            return false;
+        RecordPendingUploads(renderer, commandBuffer);
+        RecordTextureUploads(renderer, commandBuffer);
+        if (!EndImmediate(renderer, commandBuffer))
+        {
+            FailVulkanDevice(renderer);
+            return false;
+        }
+        renderer->recordedUploadCount = 0u;
+        renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
+        renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
+        ReleaseStagingOverflow(renderer, renderer->frameIndex);
+        DrainDeferredReleases(renderer, true);
+    }
+    ReleaseStagingChain(renderer, &renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    return true;
 }
 
 bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *frame)
@@ -4892,7 +4995,7 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     renderer->boundIndexBuffer = VK_NULL_HANDLE;
     renderer->boundIndexOffset = 0u;
 
-    RecordPendingUploads(renderer);
+    RecordPendingUploads(renderer, commandBuffer);
     RecordTextureUploads(renderer, commandBuffer);
     RetireTextureStaging(renderer);
 
@@ -5257,8 +5360,15 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     if (present == PRESENT_OUTCOME_PRESENT)
     {
         uint32_t imageIndex = renderer->swapchainImageIndex;
+        const uint64_t presentId = ++renderer->presentId;
+        VkPresentIdKHR presentIdInfo = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+            .swapchainCount = 1u,
+            .pPresentIds = &presentId,
+        };
         VkPresentInfoKHR presentInfo = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = renderer->waitForPresent != NULL ? &presentIdInfo : NULL,
             .waitSemaphoreCount = 1u,
             .pWaitSemaphores = &renderer->renderFinished[imageIndex],
             .swapchainCount = 1u,
@@ -5266,9 +5376,12 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
             .pImageIndices = &imageIndex,
         };
         VkResult presentResult = vkQueuePresentKHR(renderer->queue, &presentInfo);
-        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
             renderer->swapchainOutOfDate = true;
-        else if (presentResult != VK_SUCCESS)
+        else if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR)
+            NoteSwapchainFit(renderer, renderer->swapchainAcquiredSuboptimal ||
+                                           presentResult == VK_SUBOPTIMAL_KHR);
+        else
         {
             FailVulkanDevice(renderer);
             return false;
@@ -5280,6 +5393,22 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     renderer->lastFrameValid = true;
     renderer->submittedFrames++;
     renderer->frameIndex = (renderer->frameIndex + 1u) % FRAME_COUNT;
+
+    // Ожидания стоят в конце кадра: следующий кадр читает ввод уже после них, и
+    // готовая картинка не стоит в очереди. По умолчанию очередь держит столько
+    // кадров, что картинка выходит на экран через пять обновлений. Ждать показа
+    // этого кадра, а не прошлого, нельзя: в очереди остался бы один кадр, CPU и
+    // GPU работали бы строго по очереди, и им на двоих пришлось бы уложиться в
+    // одно обновление экрана, так что кадров под нагрузкой вышло бы вдвое
+    // меньше. По той же причине с двумя образами захват остаётся в кадре.
+    const bool shown = present == PRESENT_OUTCOME_PRESENT && !renderer->swapchainOutOfDate;
+    if (shown && renderer->waitForPresent != NULL && renderer->verticalSyncEnabled &&
+        renderer->presentId > 1u)
+        (void)renderer->waitForPresent(renderer->device, renderer->swapchain,
+                                       renderer->presentId - 1u, PRESENT_WAIT_NANOSECONDS);
+    if (EnsureVulkanUploadSlotReady(renderer) && shown &&
+        renderer->swapchainImageCount >= SWAPCHAIN_IMAGES_FOR_EARLY_ACQUIRE)
+        (void)AcquireSwapchainImage(renderer);
     return true;
 }
 
@@ -5295,6 +5424,7 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+    outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
