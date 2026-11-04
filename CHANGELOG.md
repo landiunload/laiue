@@ -12,6 +12,9 @@ API and ABI may change between minor versions.
   frames on the emulator, 0 now. A frame acquired as suboptimal is drawn instead
   of dropped. `swapchainRebuilds` in the graphics diagnostics counts them, which
   grows `LaiueGraphicsDiagnosticsV2`, so a program that reads it has to be rebuilt.
+- A vertex buffer keeps no CPU copy: its bytes stay only in the GPU, so vertices
+  take half the memory and each upload one copy less. Foxity uses 21 MB less. A
+  vertex buffer now takes whole uploads only; index buffers still take parts.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in

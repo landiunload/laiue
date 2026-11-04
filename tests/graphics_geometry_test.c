@@ -376,6 +376,30 @@ static void PartialIndexUpload(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandl
     ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00), "patched triangle one is immediately green");
 }
 
+static void WholeVertexUpload(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("a vertex buffer keeps no CPU copy and takes whole uploads only");
+    const LaiueGraphicsDiagnosticsV2 before = Diagnostics(device);
+    const LaiueGraphicsHandle buffer =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));
+    Expect(Diagnostics(device).cpuShadowBytes == before.cpuShadowBytes,
+           "the bytes of a vertex buffer stay only in the GPU");
+    const LaiueGraphicsBufferUploadV1 part = {
+        .structSize = sizeof(part),
+        .buffer = buffer,
+        .offsetBytes = sizeof(vertices[0]),
+        .data = vertices + 4u,
+        .sizeBytes = sizeof(vertices[0]),
+    };
+    Expect(device->uploadBuffer(device, &part) == 0u, "a part of a vertex buffer is refused");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the refused part changes nothing");
+    device->destroyHandle(device, buffer);
+}
+
 static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle ib)
 {
     Stage("indexed UV/color and texture bindings");
@@ -885,8 +909,7 @@ static void OverflowRecordedRetirement(LaiueGraphicsDeviceV2 *device)
     const LaiueGraphicsDiagnosticsV2 live = Diagnostics(device);
     Expect(live.geometryPoolUsedBytes >=
                    baseline.geometryPoolUsedBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
-               live.cpuShadowBytes ==
-                   baseline.cpuShadowBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
+               live.cpuShadowBytes == baseline.cpuShadowBytes &&
                live.resourceHandleCount == baseline.resourceHandleCount + RETIREMENT_MESH_COUNT,
            "all 300 independent meshes are resident before retirement");
     const LaiueGraphicsDrawItemV2 first =
@@ -1094,7 +1117,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         const uint64_t nativeBytes = sizeof(vertices) + sizeof(indicesA) + sizeof(indicesB);
         /* Vulkan allocates each resource at storage-buffer alignment (up to
          * 256 bytes); D3D12 accounts the requested bytes directly. */
-        Expect(firstStats.cpuShadowBytes == nativeBytes &&
+        Expect(firstStats.cpuShadowBytes == sizeof(indicesA) + sizeof(indicesB) &&
                    firstStats.uploadedBytes == nativeBytes &&
                    firstStats.resourceHandleCount == 3u &&
                    firstStats.geometryPoolUsedBytes >= nativeBytes &&
@@ -1103,6 +1126,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         AlternatingRanges(device, vb, ia, ib);
         LargeRawIndices(device, vb);
         PartialIndexUpload(device, vb, ib);
+        WholeVertexUpload(device);
         TexturedIndices(device, ia);
         QueuedTextureUploads(device, ia);
         InstancePixels(device, vb, ia);

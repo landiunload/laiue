@@ -172,9 +172,8 @@ LAIUE_TEST_ENTRY(GraphicsDiagnosticsTestEntryPoint)
     };
     Expect(device->uploadBuffer(device, &upload) != 0u, "triangle uploads");
     Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
-               diagnostics.resourceHandleCount == 1u &&
-               diagnostics.cpuShadowBytes == sizeof(vertices),
-           "resource counters report exact live CPU shadow bytes");
+               diagnostics.resourceHandleCount == 1u && diagnostics.cpuShadowBytes == 0u,
+           "a vertex buffer keeps no CPU copy");
     const uint32_t shaderCode = UINT32_C(0x07230203);
     const LaiueGraphicsShaderDescV1 shaderDescription = {
         .structSize = sizeof(shaderDescription),
@@ -187,7 +186,7 @@ LAIUE_TEST_ENTRY(GraphicsDiagnosticsTestEntryPoint)
            "shader shadow creates");
     Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
                diagnostics.resourceHandleCount == 2u &&
-               diagnostics.cpuShadowBytes == sizeof(vertices) + sizeof(shaderCode),
+               diagnostics.cpuShadowBytes == sizeof(shaderCode),
            "shader copy contributes its actual requested bytes");
     device->destroyHandle(device, shader);
 
@@ -353,8 +352,7 @@ LAIUE_TEST_ENTRY(GraphicsDiagnosticsTestEntryPoint)
            "a destroyed shader stays while a pipeline uses it");
     device->destroyHandle(device, pipeline);
     Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
-               diagnostics.resourceHandleCount == 1u &&
-               diagnostics.cpuShadowBytes == sizeof(vertices),
+               diagnostics.resourceHandleCount == 1u && diagnostics.cpuShadowBytes == 0u,
            "the shader is released with its last pipeline");
 
     device->destroyHandle(device, buffer);
