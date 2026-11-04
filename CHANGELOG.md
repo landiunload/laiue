@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The viewer plays a GIF frame by frame instead of unpacking it into memory first,
+  so a long GIF plays to its end. It used to stop at 256 frames without a word and
+  start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
+  `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in

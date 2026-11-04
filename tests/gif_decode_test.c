@@ -7,6 +7,7 @@
 // прозрачный с disposal 1/2/3, частые clear-коды и штатные фикстуры
 // texc_fixtures.h. Все входы малы, поэтому обходятся все длины усечения.
 
+#include "media/gif_decode.h"
 #include "media/image.h"
 
 #include "platform/system.h"
@@ -106,6 +107,129 @@ static uint64_t PrefixHash(const uint8_t *file, uint32_t sizeBytes, const ImageI
     return hash;
 }
 
+static bool SameBytes(const uint8_t *first, const uint8_t *second, uint32_t size)
+{
+    for (uint32_t index = 0u; index < size; ++index)
+    {
+        if (first[index] != second[index])
+            return false;
+    }
+    return true;
+}
+
+// Поток обязан выдать те же кадры и задержки, что и распаковка всего файла, а за
+// последним кадром снова первый.
+static void CheckStream(const uint8_t *file, uint32_t sizeBytes, const ImageInfo *info)
+{
+    uint8_t *pixels = (uint8_t *)PlatformAllocate(info->pixelBytes, true);
+    void *scratch = PlatformAllocate(info->scratchBytes, true);
+    const uint32_t streamBytes = GifStreamScratchBytes(info);
+    void *stream = PlatformAllocate(streamBytes, true);
+    uint8_t *canvas = (uint8_t *)PlatformAllocate(info->frameBytes, true);
+    Expect(pixels != NULL && scratch != NULL && stream != NULL && canvas != NULL,
+           "stream buffers could not be allocated");
+    Expect(ImageDecode(file, sizeBytes, info, pixels, info->pixelBytes, scratch,
+                       info->scratchBytes) == IMAGE_OK,
+           "a reference fixture must decode");
+    Expect(GifStreamOpen(file, sizeBytes, info, stream, streamBytes - 1u) == IMAGE_BUFFER_TOO_SMALL,
+           "the stream must refuse a short buffer");
+    Expect(GifStreamOpen(file, sizeBytes, info, stream, streamBytes) == IMAGE_OK,
+           "the stream must open a fixture");
+    for (uint32_t pass = 0u; pass < 3u; ++pass)
+    {
+        for (uint32_t frame = 0u; frame < info->frameCount; ++frame)
+        {
+            uint32_t delay = 0u;
+            Expect(GifStreamNext(stream, canvas, &delay) == IMAGE_OK,
+                   "the stream must give every frame");
+            Expect(SameBytes(canvas, pixels + (size_t)frame * info->frameBytes, info->frameBytes),
+                   "the stream must give the same frame as the whole decode");
+            Expect(info->frameCount == 1u || delay == info->frameMilliseconds[frame],
+                   "the stream must give the delay of the frame");
+        }
+    }
+    PlatformFree(canvas);
+    PlatformFree(stream);
+    PlatformFree(scratch);
+    PlatformFree(pixels);
+}
+
+// На любом усечении файла поток не выходит за буферы, а файл, который ещё читается,
+// не перестаёт показываться из-за испорченного хвоста.
+static void CheckStreamTruncation(const uint8_t *file, uint32_t sizeBytes)
+{
+    for (uint32_t cut = 0u; cut <= sizeBytes; ++cut)
+    {
+        ImageInfo info = {0};
+        if (ImageInspect(file, cut, &info) != IMAGE_OK)
+            continue;
+        const uint32_t streamBytes = GifStreamScratchBytes(&info);
+        void *stream = PlatformAllocate(streamBytes, true);
+        uint8_t *canvas = (uint8_t *)PlatformAllocate(info.frameBytes, true);
+        Expect(stream != NULL && canvas != NULL, "stream buffers could not be allocated");
+        if (GifStreamOpen(file, cut, &info, stream, streamBytes) == IMAGE_OK)
+        {
+            uint32_t delay = 0u;
+            ImageStatus status = GifStreamNext(stream, canvas, &delay);
+            for (uint32_t frame = 0u; status == IMAGE_OK && frame < 2u * info.frameCount; ++frame)
+            {
+                status = GifStreamNext(stream, canvas, &delay);
+            }
+            Expect(status == IMAGE_OK || delay == 0u,
+                   "only an unreadable first frame may stop the stream");
+        }
+        PlatformFree(canvas);
+        PlatformFree(stream);
+    }
+}
+
+// Длина показа не упирается в предел кадров ImageInfo.
+#define LONG_STREAM_FRAMES 300u
+static uint8_t s_longFile[65536];
+static uint64_t s_longHashes[LONG_STREAM_FRAMES];
+
+static void CheckLongStream(void)
+{
+    const GenGifParams params = {.width = 4u,
+                                 .height = 4u,
+                                 .frames = LONG_STREAM_FRAMES,
+                                 .pattern = GEN_GIF_NOISE,
+                                 .seed = 9u};
+    const uint32_t size = GenGifBuild(s_longFile, (uint32_t)sizeof(s_longFile), &params);
+    Expect(size != 0u, "a long fixture could not be built");
+    ImageInfo info = {0};
+    Expect(ImageInspect(s_longFile, size, &info) == IMAGE_OK && info.frameCount == IMAGE_MAX_FRAMES,
+           "the whole decode stops at its limit of frames");
+    const uint32_t streamBytes = GifStreamScratchBytes(&info);
+    void *stream = PlatformAllocate(streamBytes, true);
+    uint8_t *canvas = (uint8_t *)PlatformAllocate(info.frameBytes, true);
+    Expect(stream != NULL && canvas != NULL, "stream buffers could not be allocated");
+    Expect(GifStreamOpen(s_longFile, size, &info, stream, streamBytes) == IMAGE_OK,
+           "the stream must open a long fixture");
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        for (uint32_t frame = 0u; frame < LONG_STREAM_FRAMES; ++frame)
+        {
+            uint32_t delay = 0u;
+            Expect(GifStreamNext(stream, canvas, &delay) == IMAGE_OK,
+                   "the stream must go on past the limit of frames");
+            const uint64_t hash = HashBytes(FNV_SEED, canvas, info.frameBytes);
+            if (pass == 0u)
+            {
+                s_longHashes[frame] = hash;
+            }
+            else
+            {
+                Expect(hash == s_longHashes[frame], "the long fixture must repeat from its start");
+            }
+        }
+    }
+    Expect(s_longHashes[IMAGE_MAX_FRAMES] != s_longHashes[0],
+           "the frame past the limit is its own, not the first one again");
+    PlatformFree(canvas);
+    PlatformFree(stream);
+}
+
 typedef struct GenGifDecodeCase
 {
     const char *label;
@@ -128,6 +252,8 @@ static void CheckCase(const GenGifDecodeCase *testCase)
 
     uint64_t full = FullHash(testCase->file, testCase->sizeBytes, &info);
     uint64_t prefix = PrefixHash(testCase->file, testCase->sizeBytes, &info);
+    CheckStream(testCase->file, testCase->sizeBytes, &info);
+    CheckStreamTruncation(testCase->file, testCase->sizeBytes);
 
     LaiueTestRuntimeWrite("gif decode ");
     LaiueTestRuntimeWrite(testCase->label);
@@ -246,6 +372,7 @@ LAIUE_TEST_ENTRY(GifDecodeTestEntryPoint)
     {
         CheckCase(&cases[index]);
     }
+    CheckLongStream();
 
     LaiueTestRuntimeWrite("gif decode test passed\n");
     LAIUE_TEST_SUCCESS();
