@@ -747,12 +747,13 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 
         // В фокусе ожидание кадра при необходимости происходит в Present:
         // дополнительный сон мешал бы vsync и ограничивал режим без него.
-        // Вне фокуса — экономный режим: ~20 кадров в секунду.
+        // Вне фокуса — экономный режим: ~20 кадров в секунду. Окну без пикселей
+        // ждать в Present нечего, и оно спит так же, даже оставаясь активным.
         if (window->frameDeferred)
         {
             WaitForDeferredFrame(window);
         }
-        else if (!window->focused)
+        else if (!window->focused || window->clientWidth <= 0 || window->clientHeight <= 0)
         {
             MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
         }

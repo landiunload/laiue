@@ -12,6 +12,14 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#include <windows.h>
+
+#include <psapi.h>
+#elif defined(__linux__)
+#include <stdio.h>
+#endif
+
+#if defined(_WIN32)
 #define RENDER_MODULE_NAME L"laiue_render.dll"
 #elif defined(__APPLE__)
 #define RENDER_MODULE_NAME L"liblaiue_render.dylib"
@@ -37,6 +45,10 @@
  * spill into two overflow blocks, the second one started by the last buffer. */
 #define SPILL_BUFFER_COUNT 6u
 #define SPILL_VERTEX_COUNT (3u * 1024u * 1024u / (uint32_t)sizeof(LaiueGraphicsVertexV2))
+/* A program that stopped drawing goes on replacing a 3 MiB buffer. Without a
+ * limit all 360 MiB stay in staging, and on Vulkan in the geometry pool too. */
+#define UNDRAWN_UPLOAD_COUNT 120u
+#define UNDRAWN_GROWTH_LIMIT_BYTES (UINT64_C(200) << 20)
 
 typedef struct LegacyDeviceV2
 {
@@ -1005,6 +1017,56 @@ static void StagingSpill(LaiueGraphicsDeviceV2 *device)
     ExpectReclaimed(device, &baseline, "the spill leaves no resource or pool range behind");
 }
 
+/* Zero where the system does not say, and then the check passes. */
+static uint64_t ProcessMemoryBytes(void)
+{
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX counters = {.cb = sizeof(counters)};
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&counters,
+                                   sizeof(counters))
+               ? (uint64_t)counters.PrivateUsage
+               : 0u;
+#elif defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "r");
+    if (file == NULL)
+        return 0u;
+    unsigned long long size = 0u;
+    unsigned long long resident = 0u;
+    const int fields = fscanf(file, "%llu %llu", &size, &resident);
+    fclose(file);
+    return fields == 2 ? (uint64_t)resident * 4096u : 0u;
+#else
+    return 0u;
+#endif
+}
+
+static void UploadsWithoutFrames(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("360 MiB replaced without a frame stays within the limits and the last upload wins");
+    const LaiueGraphicsDiagnosticsV2 baseline = Diagnostics(device);
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsBufferUploadV1 upload = {.structSize = sizeof(upload),
+                                                .buffer = buffer,
+                                                .data = spillVertices,
+                                                .sizeBytes = sizeof(spillVertices)};
+    const uint64_t before = ProcessMemoryBytes();
+    for (uint32_t i = 0u; i < UNDRAWN_UPLOAD_COUNT; ++i)
+        Expect(device->uploadBuffer(device, &upload) != 0u, "uploads go on without frames");
+    Expect(ProcessMemoryBytes() <= before + UNDRAWN_GROWTH_LIMIT_BYTES,
+           "uploads replaced without a frame do not pile up");
+    for (uint32_t i = 0u; i < SPILL_VERTEX_COUNT; ++i)
+        spillVertices[i] = vertices[i % 3u];
+    Expect(device->uploadBuffer(device, &upload) != 0u, "the last upload is accepted");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the frame shows the last upload");
+    device->destroyHandle(device, buffer);
+    ExpectReclaimed(device, &baseline, "uploads without frames leave no pool range behind");
+}
+
 LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
 {
     static wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
@@ -1103,6 +1165,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         OverflowRecordedRetirement(device);
         PendingUploadBurst(device);
         StagingSpill(device);
+        UploadsWithoutFrames(device);
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);

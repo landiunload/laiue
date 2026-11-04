@@ -16,6 +16,17 @@
 #define WINDOW_HEIGHT 120
 // Монитор с масштабом 200 %, на который окно будто бы перешло.
 #define MOVED_DPI 192u
+// Без сна между кадрами цикл успел бы за это время сотни тысяч кадров.
+#define PACE_SECONDS 0.2
+#define PACE_MOST_FRAMES 40u
+
+typedef struct FramePace
+{
+    const LaiueWindowServiceV1 *windows;
+    Window *window;
+    double deadline;
+    uint32_t frames;
+} FramePace;
 
 static void Expect(bool condition, const char *message)
 {
@@ -25,6 +36,14 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeWrite(message);
     LaiueTestRuntimeWrite("\n");
     LaiueTestRuntimeExit(1);
+}
+
+static void CountFrame(void *context)
+{
+    FramePace *pace = (FramePace *)context;
+    ++pace->frames;
+    if (PlatformMonotonicSeconds() >= pace->deadline)
+        pace->windows->requestClose(pace->window);
 }
 
 static bool Join(wchar_t *output, const wchar_t *directory, const wchar_t *name)
@@ -110,6 +129,14 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     Expect(width == client.right && height == client.bottom,
            "a restored window has its size back");
     Expect(windows->consumeResize(window), "the program hears of the restored size");
+
+    // Активному окну без пикселей ждать в Present тоже нечего.
+    ShowWindow(handle, SW_SHOWMINNOACTIVE);
+    SendMessageW(handle, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, TRUE), 0);
+    FramePace pace = {windows, window, PlatformMonotonicSeconds() + PACE_SECONDS, 0u};
+    windows->runLoop(window, CountFrame, &pace);
+    Expect(pace.frames != 0u && pace.frames <= PACE_MOST_FRAMES,
+           "an active window without pixels sleeps between frames");
 
     windows->destroy(window);
     LaiueModuleHostDestroy(host);
