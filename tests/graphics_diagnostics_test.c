@@ -111,6 +111,7 @@ LAIUE_TEST_ENTRY(GraphicsDiagnosticsTestEntryPoint)
     LaiueGraphicsDiagnosticsV2 diagnostics = {.structSize = sizeof(diagnostics)};
     Expect(device->getDiagnostics(device, &diagnostics) != 0u &&
                (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_FRAME_VALID) == 0u &&
+               (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST) == 0u &&
                (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED) != 0u &&
                diagnostics.resourceHandleCount == 0u && diagnostics.cpuShadowBytes == 0u,
            "empty offscreen device reports readback capability and no valid frame");
