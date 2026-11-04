@@ -18,6 +18,9 @@ API and ABI may change between minor versions.
   frames a second now belong to `WINDOW_POWER_EFFICIENCY` and to windows nobody
   sees: hidden, or on another virtual desktop. On X11 a window the window manager
   took off the screen reports a size of 0 x 0, as on Windows.
+- `WINDOW_POWER_AUTO` enters efficiency mode only when no window of the program
+  can be seen. A window out of focus used to fall to idle priority, and any busy
+  program could stop it completely.
 - Geometry uploaded without frames no longer piles up. Past 32 MiB of spilled
   staging the renderers copy what waits and reuse the memory, as they already
   did for textures.

@@ -41,6 +41,7 @@ struct Window
     bool frameDeferred;
     double frameDeferSeconds;
     HANDLE frameDeferTimer;
+    bool unseen;                         // учтено в g_unseenWindowCount
     bool redrawPending;
     uint32_t modalDepth;                 // вложенность модальных циклов
     // Часы кадров: поток, который будит оконную процедуру, пока модальный
@@ -59,13 +60,15 @@ struct Window
 // и в миллисекунды, и в сотни наносекунд таймера.
 #define WINDOW_LONGEST_DEFER_SECONDS 86400.0
 
-// Политика энергопотребления процесса (WINDOW_POWER_*) и окна модуля, ещё не
-// получившие WM_DESTROY: без окон программе нечему быть в фоне. Политику
-// применяют под замком, чтобы WM_ACTIVATEAPP и смена политики из другого
-// потока не оставили процесс в режиме прежней.
+// Политика энергопотребления процесса (WINDOW_POWER_*), окна модуля, ещё не
+// получившие WM_DESTROY, и те из них, которых никто не видит: в фоне программа,
+// у которой есть окна и ни одно нельзя увидеть. Политику применяют под замком,
+// чтобы WM_ACTIVATEAPP и смена политики из другого потока не оставили процесс в
+// режиме прежней.
 static SRWLOCK g_powerLock = SRWLOCK_INIT;
 static uint32_t g_powerPolicy = WINDOW_POWER_AUTO;
 static uint32_t g_windowCount;
+static uint32_t g_unseenWindowCount;
 
 static bool ProcessIsForeground(void)
 {
@@ -83,7 +86,8 @@ static bool ApplyPowerPolicyLocked(bool foreground)
     {
         mode = PLATFORM_POWER_PERFORMANCE;
     }
-    else if (g_powerPolicy == WINDOW_POWER_EFFICIENCY || (g_windowCount != 0u && !foreground))
+    else if (g_powerPolicy == WINDOW_POWER_EFFICIENCY
+        || (g_windowCount != 0u && g_unseenWindowCount == g_windowCount && !foreground))
     {
         mode = PLATFORM_POWER_EFFICIENCY;
     }
@@ -306,16 +310,20 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
 
         case WM_SIZE:
             // Свёрнутому окну рисовать некуда, и программа узнаёт об этом по размеру
-            // 0x0. Цепочке кадров менять размер незачем: это не resize.
-            if (window != NULL && wParam == SIZE_MINIMIZED)
+            // 0x0. Цепочке кадров менять размер незачем: это не resize. Состояние
+            // спрашивается у системы: когда окно показывает другой поток, сообщение
+            // приходит с опозданием и описывает то, чего уже нет.
+            if (window != NULL && IsIconic(handle))
             {
                 window->clientWidth  = 0;
                 window->clientHeight = 0;
             }
             else if (window != NULL)
             {
-                window->clientWidth   = (int32_t)LOWORD(lParam);
-                window->clientHeight  = (int32_t)HIWORD(lParam);
+                RECT client = { 0, 0, LOWORD(lParam), HIWORD(lParam) };
+                GetClientRect(handle, &client);
+                window->clientWidth   = client.right;
+                window->clientHeight  = client.bottom;
                 window->resizePending = true;
 
                 if (window->cursorHidden)
@@ -380,9 +388,9 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             return DefWindowProcW(handle, message, wParam, lParam);
 
         case WM_ACTIVATEAPP:
-            // Программа ушла в фон или вернулась: при WINDOW_POWER_AUTO
-            // процесс входит в режим эффективности, как по переключателю
-            // диспетчера задач, и выходит из него вместе с фокусом.
+            // Фокус ушёл или вернулся: при WINDOW_POWER_AUTO процесс, окон
+            // которого не видно, входит в режим эффективности, как по
+            // переключателю диспетчера задач, и выходит из него вместе с фокусом.
             AcquireSRWLockExclusive(&g_powerLock);
             ApplyPowerPolicyLocked(wParam != FALSE);
             ReleaseSRWLockExclusive(&g_powerLock);
@@ -535,6 +543,7 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
                 // обратно прежние QoS и приоритет.
                 AcquireSRWLockExclusive(&g_powerLock);
                 --g_windowCount;
+                g_unseenWindowCount -= window->unseen ? 1u : 0u;
                 ApplyPowerPolicyLocked(ProcessIsForeground());
                 ReleaseSRWLockExclusive(&g_powerLock);
             }
@@ -621,7 +630,7 @@ Window* WindowCreate(const WindowConfiguration* configuration)
     UpdateWindow(window->handle);
 
     // Окно, показанное без фокуса, не получит WM_ACTIVATEAPP, пока его не
-    // выберут: политику применяет само создание.
+    // выберут, а окон стало больше: политику применяет само создание.
     AcquireSRWLockExclusive(&g_powerLock);
     ApplyPowerPolicyLocked(ProcessIsForeground());
     ReleaseSRWLockExclusive(&g_powerLock);
@@ -746,16 +755,40 @@ static bool WindowIsOnScreen(const Window* window)
             || cloaked == 0u);
 }
 
+static bool WindowHasPixels(const Window* window)
+{
+    return window->clientWidth > 0 && window->clientHeight > 0;
+}
+
+// Видимому окну нужен прежний приоритет и вне фокуса: с низким его остановит
+// любая занятая программа. Активное окно видно по определению, и система в этом
+// случае не спрашивается.
+static void UpdateWindowSight(Window* window)
+{
+    // Кадр мог закрыть окно: WM_DESTROY уже снял его со счёта.
+    if (window->handle == NULL)
+    {
+        return;
+    }
+    const bool unseen = !window->focused
+        && (!WindowHasPixels(window) || !WindowIsOnScreen(window));
+    if (unseen == window->unseen)
+    {
+        return;
+    }
+    window->unseen = unseen;
+    AcquireSRWLockExclusive(&g_powerLock);
+    g_unseenWindowCount = unseen ? g_unseenWindowCount + 1u : g_unseenWindowCount - 1u;
+    ApplyPowerPolicyLocked(ProcessIsForeground());
+    ReleaseSRWLockExclusive(&g_powerLock);
+}
+
 // ~20 кадров в секунду. Окну без пикселей ждать в Present нечего, даже активному;
 // окно вне фокуса рисует как обычно, пока его видно и не включён режим эффективности.
 static bool FrameShouldRest(const Window* window)
 {
-    if (window->clientWidth <= 0 || window->clientHeight <= 0)
-    {
-        return true;
-    }
-    return !window->focused
-        && (WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY || !WindowIsOnScreen(window));
+    return !WindowHasPixels(window) || window->unseen
+        || (!window->focused && WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY);
 }
 
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
@@ -767,6 +800,7 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
         UpdateMouseLookState(window);
         window->frameDeferred = false;
         RunFrame(window);
+        UpdateWindowSight(window);
 
         // Обычно ожидание кадра происходит в Present: дополнительный сон мешал
         // бы vsync и ограничивал режим без него.

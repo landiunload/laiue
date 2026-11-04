@@ -23,6 +23,10 @@
 // Без сна между кадрами цикл успел бы за это время сотни тысяч кадров.
 #define PACE_SECONDS 0.2
 #define PACE_MOST_FRAMES 40u
+// Цикл, который спит между кадрами, так часто кадры не выдаёт. Счёт идёт по таким
+// кадрам, а не по времени: на занятой машине за любой срок их может быть мало.
+#define QUICK_FRAME_SECONDS 0.025
+#define QUICK_PATIENCE_SECONDS 10.0
 // Пусковая программа тестов показывает окно не сразу.
 #define SHOW_PATIENCE_SECONDS 3.0
 
@@ -32,8 +36,8 @@ typedef enum PaceStage
 {
     PACE_WAIT_FOR_SHOW,
     PACE_WITHOUT_PIXELS,
-    PACE_OUT_OF_FOCUS,
     PACE_ON_ANOTHER_DESKTOP,
+    PACE_OUT_OF_FOCUS,
     PACE_EFFICIENCY,
     PACE_DONE,
 } PaceStage;
@@ -45,9 +49,16 @@ typedef struct FramePace
     HWND handle;
     PaceStage stage;
     double stageEnd;
+    double lastFrame;
     bool shown;
     bool cloaked;
+    bool foreground;
+    bool pixelsWhileMinimized;
+    bool resizedWhileMinimized;
+    bool resizedByRestore;
     uint32_t frames[PACE_DONE];
+    uint32_t quickFrames;
+    DWORD priorities[PACE_DONE];
 } FramePace;
 
 static void Expect(bool condition, const char *message)
@@ -66,38 +77,53 @@ static void Cloak(FramePace *pace, BOOL cloak)
         SUCCEEDED(DwmSetWindowAttribute(pace->handle, DWMWA_CLOAK, &cloak, sizeof(cloak)));
 }
 
-static void NextStage(FramePace *pace, double now)
+static void NextStage(FramePace *pace)
 {
+    pace->priorities[pace->stage] = GetPriorityClass(GetCurrentProcess());
+    pace->foreground = pace->foreground || GetForegroundWindow() == pace->handle;
     pace->stage = (PaceStage)(pace->stage + 1);
-    pace->stageEnd = now + PACE_SECONDS;
     switch (pace->stage)
     {
         case PACE_WITHOUT_PIXELS:
             // Только показанное окно: пусковая программа уже поставила его на место.
             pace->shown = IsWindowVisible(pace->handle) != FALSE;
             if (pace->shown)
+            {
+                (void)pace->windows->consumeResize(pace->window);
                 ShowWindow(pace->handle, SW_SHOWMINNOACTIVE);
-            break;
-        case PACE_OUT_OF_FOCUS:
-            if (pace->shown)
-                ShowWindow(pace->handle, SW_SHOWNOACTIVATE);
+                // Так опаздывает сообщение, когда окно показывал другой поток.
+                SendMessageW(pace->handle, WM_SIZE, SIZE_RESTORED,
+                             MAKELPARAM(WINDOW_WIDTH, WINDOW_HEIGHT));
+            }
             break;
         case PACE_ON_ANOTHER_DESKTOP:
             Cloak(pace, TRUE);
+            if (pace->shown)
+            {
+                pace->resizedWhileMinimized = pace->windows->consumeResize(pace->window);
+                ShowWindow(pace->handle, SW_SHOWNOACTIVATE);
+                pace->resizedByRestore = pace->windows->consumeResize(pace->window);
+            }
             break;
-        case PACE_EFFICIENCY:
+        case PACE_OUT_OF_FOCUS:
         {
             const bool cloaked = pace->cloaked;
             Cloak(pace, FALSE);
             pace->cloaked = cloaked;
-            (void)pace->windows->setPowerPolicy(WINDOW_POWER_EFFICIENCY);
             break;
         }
+        case PACE_EFFICIENCY:
+            (void)pace->windows->setPowerPolicy(WINDOW_POWER_EFFICIENCY);
+            break;
         default:
             (void)pace->windows->setPowerPolicy(WINDOW_POWER_AUTO);
             pace->windows->requestClose(pace->window);
             break;
     }
+    // Срок считается от конца перехода: показ окна сам может занять весь этап.
+    pace->stageEnd = PlatformMonotonicSeconds() +
+                     (pace->stage == PACE_OUT_OF_FOCUS && pace->shown ? QUICK_PATIENCE_SECONDS
+                                                                      : PACE_SECONDS);
 }
 
 static void CountFrame(void *context)
@@ -106,16 +132,27 @@ static void CountFrame(void *context)
     const double now = PlatformMonotonicSeconds();
     if (pace->stage != PACE_DONE &&
         (now >= pace->stageEnd ||
-         (pace->stage == PACE_WAIT_FOR_SHOW && IsWindowVisible(pace->handle))))
-        NextStage(pace, now);
+         (pace->stage == PACE_WAIT_FOR_SHOW && IsWindowVisible(pace->handle)) ||
+         (pace->stage == PACE_OUT_OF_FOCUS && pace->quickFrames > PACE_MOST_FRAMES)))
+        NextStage(pace);
     if (pace->stage == PACE_DONE)
         return;
     // Активным окно считается только свёрнутым: обычному DefWindowProc отдал бы
     // фокус, а тесты его не забирают.
     const bool active = pace->stage == PACE_WITHOUT_PIXELS && pace->shown;
+    if (active)
+    {
+        int32_t width = 0;
+        int32_t height = 0;
+        pace->windows->getClientSize(pace->window, &width, &height);
+        pace->pixelsWhileMinimized = pace->pixelsWhileMinimized || width != 0 || height != 0;
+    }
     SendMessageW(pace->handle, WM_ACTIVATE, MAKEWPARAM(active ? WA_ACTIVE : WA_INACTIVE, active),
                  0);
     ++pace->frames[pace->stage];
+    if (pace->stage == PACE_OUT_OF_FOCUS && now - pace->lastFrame < QUICK_FRAME_SECONDS)
+        ++pace->quickFrames;
+    pace->lastFrame = now;
 }
 
 static bool Join(wchar_t *output, const wchar_t *directory, const wchar_t *name)
@@ -158,6 +195,7 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     Expect(windows != NULL && windows->getContentScale != NULL && windows->setPowerPolicy != NULL,
            "the window service reports the content scale");
 
+    const DWORD priority = GetPriorityClass(GetCurrentProcess());
     const WindowConfiguration configuration = {
         .title = L"laiue window dpi test", .width = WINDOW_WIDTH, .height = WINDOW_HEIGHT};
     Window *window = windows->create(&configuration);
@@ -191,17 +229,14 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     Expect(width == client.right && height == client.bottom,
            "the new client size reaches the program");
 
-    (void)windows->consumeResize(window);
     SendMessageW(handle, WM_SIZE, SIZE_MINIMIZED, 0);
     windows->getClientSize(window, &width, &height);
-    Expect(width == 0 && height == 0, "a minimized window has nothing to draw on");
-    Expect(!windows->consumeResize(window), "minimizing is not a resize");
-    SendMessageW(handle, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right, client.bottom));
-    windows->getClientSize(window, &width, &height);
     Expect(width == client.right && height == client.bottom,
-           "a restored window has its size back");
-    Expect(windows->consumeResize(window), "the program hears of the restored size");
+           "a late size message does not take the pixels of a window");
 
+    // Этапы опускают приоритет процесса, и занятая машина держала бы тест десятки
+    // секунд: поток окна сохраняет свой.
+    (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     FramePace pace = {.windows = windows,
                       .window = window,
                       .handle = handle,
@@ -210,10 +245,18 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     Expect(pace.frames[PACE_WITHOUT_PIXELS] != 0u &&
                pace.frames[PACE_WITHOUT_PIXELS] <= PACE_MOST_FRAMES,
            "an active window without pixels sleeps between frames");
-    Expect(!pace.shown || pace.frames[PACE_OUT_OF_FOCUS] > PACE_MOST_FRAMES,
+    Expect(!pace.pixelsWhileMinimized, "a minimized window has nothing to draw on");
+    Expect(!pace.resizedWhileMinimized, "minimizing is not a resize");
+    Expect(!pace.shown || pace.resizedByRestore, "the program hears of the restored size");
+    Expect(!pace.shown || pace.quickFrames > PACE_MOST_FRAMES,
            "a visible window out of focus keeps its pace");
+    Expect(!pace.shown || pace.priorities[PACE_OUT_OF_FOCUS] == priority,
+           "a program that can be seen keeps its priority out of focus");
     Expect(!pace.cloaked || pace.frames[PACE_ON_ANOTHER_DESKTOP] <= PACE_MOST_FRAMES,
            "a window on another desktop sleeps between frames");
+    Expect(!pace.cloaked || pace.foreground ||
+               pace.priorities[PACE_ON_ANOTHER_DESKTOP] == IDLE_PRIORITY_CLASS,
+           "a program nobody can see goes into efficiency mode");
     Expect(pace.frames[PACE_EFFICIENCY] <= PACE_MOST_FRAMES,
            "efficiency mode spares frames out of focus");
 
