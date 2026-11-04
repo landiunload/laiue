@@ -1183,7 +1183,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         QueuedTextureUploads(device, ia);
         InstancePixels(device, vb, ia);
         SkyColor(device);
-    VerticalSync(device);
+        VerticalSync(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         otherWindow = CreateTestWindow();
         Expect(otherWindow != NULL, "second device has its own HWND");
