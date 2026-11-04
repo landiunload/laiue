@@ -134,7 +134,7 @@ static bool Join(wchar_t *out, const wchar_t *directory, const wchar_t *name)
     return *name == L'\0';
 }
 
-#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+#if defined(_WIN32)
 static HWND CreateTestWindow(void)
 {
     const wchar_t *name = L"LaiueGraphicsGeometryTestWindow";
@@ -146,12 +146,10 @@ static HWND CreateTestWindow(void)
     windowClass.lpszClassName = name;
     if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return NULL;
-    RECT rectangle = {0, 0, (LONG)FRAME_WIDTH, (LONG)FRAME_HEIGHT};
-    if (!AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE))
-        return NULL;
-    return CreateWindowExW(0u, name, L"laiue geometry pixels", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                           CW_USEDEFAULT, rectangle.right - rectangle.left,
-                           rectangle.bottom - rectangle.top, NULL, NULL, module, NULL);
+    /* A window with a frame cannot be this narrow, and a Vulkan swap chain takes
+     * the size of the client area. */
+    return CreateWindowExW(0u, name, L"laiue geometry pixels", WS_POPUP, 0, 0, (int)FRAME_WIDTH,
+                           (int)FRAME_HEIGHT, NULL, NULL, module, NULL);
 }
 #endif
 
@@ -162,9 +160,9 @@ static LaiueGraphicsDiagnosticsV2 Diagnostics(LaiueGraphicsDeviceV2 *device)
     return value;
 }
 
-#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
-// Only a device with a window has a swap chain, which is why Vulkan skips this
-// here. Android checks the same counter on a rotated screen.
+#if defined(_WIN32)
+// Only a device with a window has a swap chain. Android checks the same counter
+// on a rotated screen.
 static void SwapChainRebuilds(const LaiueGraphicsDeviceServiceV2 *service,
                               LaiueGraphicsDeviceV2 *device)
 {
@@ -1123,6 +1121,36 @@ static void IdleFrames(LaiueGraphicsDeviceV2 *device)
     }
 }
 
+#if defined(_WIN32) && !LAIUE_GRAPHICS_TEST_D3D12
+/* A frame of a window is drawn into the swap chain image, which cannot be read
+ * after it is shown, and such an image may be BGRA. Red tells the two apart.
+ * More frames than a chain has images and the renderer has slots. */
+static void WindowedFrames(const LaiueGraphicsDeviceServiceV2 *service)
+{
+    Stage("a frame drawn into the swap chain reads back as RGBA");
+    HWND window = CreateTestWindow();
+    Expect(window != NULL, "the swap chain has a hidden HWND");
+    LaiueGraphicsDeviceV2 *device = NULL;
+    Expect(service->createDeviceWithContext(service->context, window, FRAME_WIDTH, FRAME_HEIGHT,
+                                            LAIUE_GRAPHICS_BACKEND_VULKAN, &device) != 0u,
+           "a device draws to the window");
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    for (uint32_t frame = 0u; frame < 12u; ++frame)
+    {
+        Begin(device);
+        Submit(device, &item);
+        Capture(device, 1u);
+        ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the swap chain image holds the frame");
+    }
+    device->destroyHandle(device, buffer);
+    SwapChainRebuilds(service, device);
+    service->destroyDevice(device);
+    DestroyWindow(window);
+}
+#endif
+
 static void BurstMemoryReturns(LaiueGraphicsDeviceV2 *device)
 {
     Stage("the upload arena of a burst goes back when frames stop using it");
@@ -1247,6 +1275,8 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         BurstMemoryReturns(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         SwapChainRebuilds(service, device);
+#elif defined(_WIN32)
+        WindowedFrames(service);
 #endif
     }
     device->destroyHandle(device, ib);
