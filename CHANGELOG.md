@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
+  mip level and Vulkan once; the pixels now go to staging memory, and the copy
+  runs at the start of the next frame. In the viewer a page turn holds the
+  main thread for 17 to 24 ms instead of 33 to 50 ms.
 - The viewer turns a page in 35 to 45 ms instead of 200 to 300 ms on
   24-megapixel pictures. Reading and decoding took three quarters of that and
   need no graphics device, so the neighbour in the direction of browsing is

@@ -323,7 +323,9 @@ LAIUE_RENDER_API bool RendererUploadTexture(Renderer *renderer,
                                             const void *data,
                                             uint64_t sizeBytes,
                                             uint32_t rowPitchBytes);
-/* Uploads one tightly packed RGBA8 mip into a backend-owned texture. */
+/* Uploads one tightly packed RGBA8 mip into a backend-owned texture. The
+ * pixels are copied before the call returns and reach the GPU at the start of
+ * the next frame, without stopping it. Outside a frame only. */
 LAIUE_RENDER_API bool RendererUploadTextureMip(Renderer *renderer,
                                                RendererTexture *texture,
                                                uint32_t mipLevel,
