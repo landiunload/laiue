@@ -14,6 +14,7 @@
 
 #include "graphics/graphics_device_service.h"
 #include "input/input_service.h"
+#include "media/gif_decode.h"
 #include "media/image.h"
 #include "mod/module_host.h"
 #include "platform/system.h"
@@ -61,10 +62,13 @@ typedef struct Picture
     LaiueGraphicsHandle texture;
     uint32_t width, height;             // размер текстуры
     uint32_t sourceWidth, sourceHeight; // размер в файле
-    uint8_t *frames;                    // кадры анимации; у неподвижной картинки NULL
-    uint32_t frameCount, frame;
+    // Анимация: файл, её поток и холст с текущим кадром. Кадры распаковываются по мере
+    // показа, поэтому память не зависит от длины GIF. У неподвижной картинки их нет.
+    uint8_t *file;
+    void *stream;
+    uint8_t *canvas;
+    uint32_t frame, frameDelay;
     double frameStart;
-    uint16_t frameMilliseconds[IMAGE_MAX_FRAMES];
 } Picture;
 
 // Картинка в памяти: всё, что делается без видеокарты.
@@ -73,7 +77,10 @@ typedef struct LoadedPicture
     uint32_t index;
     ImageStatus status;
     ImageInfo info;
-    uint8_t *pixels;           // все кадры в размере файла
+    uint8_t *pixels;           // картинка в размере файла, у анимации первый кадр
+    uint8_t *file;             // файл анимации
+    void *stream;              // её поток
+    uint32_t frameDelay;       // сколько показывать первый кадр, мс
     uint8_t *reduced;          // первый кадр, уменьшенный до MAX_SIDE
     uint8_t *chain;            // mip-уровни от второго, один за другим
     bool outOfMemory;
@@ -446,7 +453,9 @@ static void ReleasePicture(Viewer *viewer)
         viewer->device->destroyHandle(viewer->device, viewer->picture.texture);
         viewer->framesLeft = RELEASE_FRAMES;
     }
-    PlatformFree(viewer->picture.frames);
+    PlatformFree(viewer->picture.file);
+    PlatformFree(viewer->picture.stream);
+    PlatformFree(viewer->picture.canvas);
     memset(&viewer->picture, 0, sizeof(viewer->picture));
 }
 
@@ -542,7 +551,21 @@ static void SetCaption(Viewer *viewer, const char *text, const char *detail)
 // Анимация идёт кадрами из памяти: уменьшенный GIF показывает первый.
 static bool Animated(const LoadedPicture *loaded)
 {
-    return loaded->info.frameCount > 1u && loaded->reduced == NULL;
+    return loaded->stream != NULL && loaded->reduced == NULL;
+}
+
+// Анимации сейчас нужен только первый кадр, а файл остаётся показу.
+static void ReadAnimation(LoadedPicture *loaded, uint8_t *bytes, uint32_t size)
+{
+    const ImageInfo *info = &loaded->info;
+    const uint32_t scratchBytes = GifStreamScratchBytes(info);
+    loaded->file = bytes;
+    loaded->stream = PlatformAllocate(scratchBytes, false);
+    loaded->status = loaded->stream == NULL
+                         ? IMAGE_TOO_LARGE
+                         : GifStreamOpen(bytes, size, info, loaded->stream, scratchBytes);
+    if (loaded->status == IMAGE_OK)
+        loaded->status = GifStreamNext(loaded->stream, loaded->pixels, &loaded->frameDelay);
 }
 
 // Читает и распаковывает картинку, уменьшает её до MAX_SIDE и строит
@@ -558,14 +581,26 @@ static void ReadPicture(const Viewer *viewer, uint32_t index, LoadedPicture *loa
     if (FilePath(viewer, index, loaded->path) &&
         PlatformReadEntireFile(loaded->path, MAX_FILE_BYTES, &bytes, &size))
         loaded->status = ImageInspect(bytes, (uint32_t)size, info);
-    if (loaded->status == IMAGE_OK && info->pixelBytes > mostPixelBytes)
+    const bool animation = loaded->status == IMAGE_OK && info->frameCount > 1u;
+    const uint32_t pixelBytes = animation ? info->frameBytes : info->pixelBytes;
+    if (loaded->status == IMAGE_OK && pixelBytes > mostPixelBytes)
         loaded->status = IMAGE_TOO_LARGE;
     if (loaded->status == IMAGE_OK)
     {
-        loaded->pixels = (uint8_t *)PlatformAllocate(info->pixelBytes, false);
+        loaded->pixels = (uint8_t *)PlatformAllocate(pixelBytes, false);
+        if (loaded->pixels == NULL)
+            loaded->status = IMAGE_TOO_LARGE;
+    }
+    if (loaded->status == IMAGE_OK && animation)
+    {
+        ReadAnimation(loaded, bytes, (uint32_t)size);
+        bytes = NULL;
+    }
+    else if (loaded->status == IMAGE_OK)
+    {
         void *scratch =
             info->scratchBytes != 0u ? PlatformAllocate(info->scratchBytes, false) : NULL;
-        loaded->status = loaded->pixels == NULL || (info->scratchBytes != 0u && scratch == NULL)
+        loaded->status = info->scratchBytes != 0u && scratch == NULL
                              ? IMAGE_TOO_LARGE
                              : ImageDecode(bytes, (uint32_t)size, info, loaded->pixels,
                                            info->pixelBytes, scratch, info->scratchBytes);
@@ -634,12 +669,19 @@ static void FinishReading(Reader *reader)
     reader->running = false;
 }
 
+static void FreeAnimation(LoadedPicture *loaded)
+{
+    PlatformFree(loaded->pixels);
+    PlatformFree(loaded->file);
+    PlatformFree(loaded->stream);
+}
+
 static void DropRead(Reader *reader)
 {
     FinishReading(reader);
     if (!reader->holding)
         return;
-    PlatformFree(reader->loaded.pixels);
+    FreeAnimation(&reader->loaded);
     PlatformFree(reader->loaded.reduced);
     PlatformFree(reader->loaded.chain);
     reader->holding = false;
@@ -656,7 +698,7 @@ static bool ShowLoaded(Viewer *viewer, LoadedPicture *loaded)
     viewer->shapeChanged = true;
     if (loaded->status != IMAGE_OK)
     {
-        PlatformFree(loaded->pixels);
+        FreeAnimation(loaded);
         SetCaption(viewer, FileName(viewer, index), " - ");
         Append(viewer->caption, sizeof(viewer->caption), ImageStatusText(loaded->status));
         return false;
@@ -672,15 +714,15 @@ static bool ShowLoaded(Viewer *viewer, LoadedPicture *loaded)
     PlatformFree(loaded->chain);
     if (uploaded && animated)
     {
-        viewer->picture.frames = loaded->pixels;
-        viewer->picture.frameCount = info->frameCount;
+        viewer->picture.file = loaded->file;
+        viewer->picture.stream = loaded->stream;
+        viewer->picture.canvas = loaded->pixels;
+        viewer->picture.frameDelay = loaded->frameDelay;
         viewer->picture.frameStart = PlatformMonotonicSeconds();
-        memcpy(viewer->picture.frameMilliseconds, info->frameMilliseconds,
-               sizeof(viewer->picture.frameMilliseconds));
     }
     else
     {
-        PlatformFree(loaded->pixels);
+        FreeAnimation(loaded);
     }
     if (!uploaded)
     {
@@ -786,8 +828,7 @@ static void ReadAhead(Viewer *viewer)
 // браузерах, через 100 мс.
 static double FrameSeconds(const Picture *picture)
 {
-    const uint32_t delay = picture->frameMilliseconds[picture->frame];
-    return (double)(delay < 20u ? 100u : delay) * 0.001;
+    return (double)(picture->frameDelay < 20u ? 100u : picture->frameDelay) * 0.001;
 }
 
 // Кадры GIF сменяются по своим задержкам. Срок считается от прошлого срока, а
@@ -796,21 +837,21 @@ static double FrameSeconds(const Picture *picture)
 static void Animate(Viewer *viewer, double now)
 {
     Picture *picture = &viewer->picture;
-    if (picture->frames == NULL)
+    if (picture->stream == NULL)
         return;
     const double seconds = FrameSeconds(picture);
     if (now - picture->frameStart < seconds)
         return;
-    picture->frame = (picture->frame + 1u) % picture->frameCount;
-    picture->frameStart = now - picture->frameStart < 2.0 * seconds
-                              ? picture->frameStart + seconds
-                              : now;
-    const size_t frameBytes = (size_t)picture->width * picture->height * 4u;
+    picture->frameStart =
+        now - picture->frameStart < 2.0 * seconds ? picture->frameStart + seconds : now;
+    if (GifStreamNext(picture->stream, picture->canvas, &picture->frameDelay) != IMAGE_OK)
+        return;
+    ++picture->frame;
     const LaiueGraphicsTextureUploadV1 upload = {
         .structSize = sizeof(upload),
         .texture = picture->texture,
-        .data = picture->frames + (size_t)picture->frame * frameBytes,
-        .sizeBytes = frameBytes,
+        .data = picture->canvas,
+        .sizeBytes = (size_t)picture->width * picture->height * 4u,
     };
     (void)viewer->device->uploadTexture(viewer->device, &upload);
 }
@@ -818,7 +859,7 @@ static void Animate(Viewer *viewer, double now)
 // Через сколько секунд сменится кадр анимации; у неподвижной картинки срока нет.
 static double SecondsToNextFrame(const Picture *picture, double now)
 {
-    if (picture->frames == NULL)
+    if (picture->stream == NULL)
         return -1.0;
     const double seconds = picture->frameStart + FrameSeconds(picture) - now;
     return seconds > 0.0 ? seconds : 0.0;

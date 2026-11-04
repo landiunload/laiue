@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The viewer plays a GIF frame by frame instead of unpacking it into memory first,
+  so a long GIF plays to its end. It used to stop at 256 frames without a word and
+  start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
+  `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
 - On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
   to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
   load too. The renderer used to wait for the GPU at the start of a frame, after
