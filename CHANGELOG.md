@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan depth is no longer written to memory after a pass, since nothing reads
+  it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
+  a full-screen depth write, and where the device offers lazily allocated memory
+  the depth target takes no RAM at all.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in
