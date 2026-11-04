@@ -1,6 +1,6 @@
-// Окно Windows рисуется настоящими пикселями. Экран с масштабом здесь не нужен:
-// осведомлённость о DPI видна у самого окна, а сообщение о смене монитора тест
-// присылает сам.
+// Окно Windows рисуется настоящими пикселями и только там, где их видно. Экран с
+// масштабом здесь не нужен: осведомлённость о DPI видна у самого окна, а сообщение
+// о смене монитора тест присылает сам. Свёрнутое окно сообщает размер 0x0.
 
 #include "mod/module_host.h"
 #include "platform/system.h"
@@ -99,6 +99,17 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     windows->getClientSize(window, &width, &height);
     Expect(width == client.right && height == client.bottom,
            "the new client size reaches the program");
+
+    (void)windows->consumeResize(window);
+    ShowWindow(handle, SW_SHOWMINNOACTIVE);
+    windows->getClientSize(window, &width, &height);
+    Expect(width == 0 && height == 0, "a minimized window has nothing to draw on");
+    Expect(!windows->consumeResize(window), "minimizing is not a resize");
+    ShowWindow(handle, SW_SHOWNOACTIVATE);
+    windows->getClientSize(window, &width, &height);
+    Expect(width == client.right && height == client.bottom,
+           "a restored window has its size back");
+    Expect(windows->consumeResize(window), "the program hears of the restored size");
 
     windows->destroy(window);
     LaiueModuleHostDestroy(host);

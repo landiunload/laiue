@@ -304,8 +304,14 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
         }
 
         case WM_SIZE:
-            // Сворачивание даёт клиентскую область 0x0 — это не resize.
-            if (window != NULL && wParam != SIZE_MINIMIZED)
+            // Свёрнутому окну рисовать некуда, и программа узнаёт об этом по размеру
+            // 0x0. Цепочке кадров менять размер незачем: это не resize.
+            if (window != NULL && wParam == SIZE_MINIMIZED)
+            {
+                window->clientWidth  = 0;
+                window->clientHeight = 0;
+            }
+            else if (window != NULL)
             {
                 window->clientWidth   = (int32_t)LOWORD(lParam);
                 window->clientHeight  = (int32_t)HIWORD(lParam);
