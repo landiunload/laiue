@@ -535,6 +535,8 @@ if(TARGET laiue_media_support)
         LIBRARIES ${laiue_media} TEST laiue.media.inflate_fast)
     laiue_add_harness(laiue_png_filter_test PngFilterTestEntryPoint png_filter_test.c
         LIBRARIES ${laiue_media} TEST laiue.media.png_filter)
+    laiue_add_harness(laiue_jpeg_reference_test JpegReferenceTestEntryPoint jpeg_reference_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.jpeg_reference)
     laiue_add_harness(laiue_mp3_test Mp3TestEntryPoint mp3_test.c mp3_fixtures.h
         LIBRARIES ${laiue_media} TEST laiue.media.mp3)
     laiue_add_harness(laiue_audio_stream_decoder_test AudioStreamDecoderTestEntryPoint

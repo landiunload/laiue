@@ -5,6 +5,17 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- JPEG decodes twice as fast on one core: a 24-megapixel 4:2:0 photo takes
+  75 ms instead of 157 ms, a 4:4:4 one 91 ms instead of 183 ms, and a
+  progressive one 216 ms instead of 298 ms. Valid files still match
+  libjpeg-turbo byte for byte.
+  - The inverse transform, chroma upsampling and color conversion run in
+    SSE2 and NEON registers. A new test compares them with a scalar
+    reference on every sampling and on widths around the vector steps.
+  - Bits stay in registers for a whole block, and one table entry gives
+    the length of a code together with the value behind it.
+  - Values too large for a 16-bit lane now saturate the same way on every
+    processor, which changes only the garbage from damaged files.
 - The viewer starts sooner on a large picture: from start to exit with
   `--smoke`, a 24-megapixel JPEG takes 393 ms instead of 537 ms and a PNG of
   that size 379 ms instead of 497 ms. The first picture is read on its own
