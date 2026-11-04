@@ -262,6 +262,11 @@ if(LAIUE_NATIVE_MODS_ENABLED)
             window_frames_test.c BOOTSTRAP DEPENDS laiue_window
             TEST laiue.platform.window_frames TIMEOUT 30)
         set_tests_properties(laiue.platform.window_frames PROPERTIES SKIP_RETURN_CODE 125)
+        if(WIN32)
+            laiue_add_harness(laiue_window_dpi_test WindowDpiTestEntryPoint
+                window_dpi_test.c BOOTSTRAP LIBRARIES user32 DEPENDS laiue_window
+                TEST laiue.platform.window_dpi TIMEOUT 30)
+        endif()
     endif()
 
     if(TARGET laiue_audio AND TARGET laiue_ui AND TARGET laiue_voxel_render AND
