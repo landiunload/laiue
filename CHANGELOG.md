@@ -13,6 +13,20 @@ API and ABI may change between minor versions.
 - Destroying a texture no longer stops the GPU either. A texture that frames in
   flight may read waits until the GPU has passed them; Vulkan used to wait for
   the device to go idle and rebuild its descriptor sets.
+- A minimized window on Windows reports a size of 0 x 0, as programs expected,
+  and they stop drawing to nowhere. The viewer sleeps until it is restored, and
+  a game goes on simulating. A window without pixels sleeps between frames even
+  when it stays active.
+- A window keeps its frame rate out of focus while it can be seen. About 20
+  frames a second now belong to `WINDOW_POWER_EFFICIENCY` and to windows nobody
+  sees: hidden, or on another virtual desktop. On X11 a window the window manager
+  took off the screen reports a size of 0 x 0, as on Windows.
+- `WINDOW_POWER_AUTO` enters efficiency mode only when no window of the program
+  can be seen. A window out of focus used to fall to idle priority, and any busy
+  program could stop it completely.
+- Geometry uploaded without frames no longer piles up. Past 32 MiB of spilled
+  staging the renderers copy what waits and reuse the memory, as they already
+  did for textures.
 - Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
   mip level and Vulkan once; the pixels now go to staging memory, and the copy
   runs at the start of the next frame. In the viewer a page turn holds the

@@ -122,6 +122,11 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // ресурсов с выравниванием по 64 КиБ; блоки освобождаются, когда пройден
 // fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
+// оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
+// предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
+// кадре до него GPU не ждёт.
+#define GEOMETRY_STAGING_LIMIT_BYTES (UINT64_C(32) << 20)
 // Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
 // загрузок много, накопленное копируется сразу: иначе подготовка большой
 // сцены держала бы все её пиксели в памяти дважды.
@@ -414,6 +419,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
     StagingOverflow*           stagingOverflow[FRAME_COUNT];
+    uint64_t                   stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload       pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
     uint32_t                   pendingTextureCount;
     StagingOverflow*           textureStaging;
@@ -969,6 +975,7 @@ static void ReleaseStagingChain(StagingOverflow **head)
 static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
 {
     ReleaseStagingChain(&renderer->stagingOverflow[frameIndex]);
+    renderer->stagingOverflowBytes[frameIndex] = 0u;
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
@@ -2846,6 +2853,7 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
                         (uint64_t)LARGE_MESH_UPLOAD_BYTES_PER_FRAME, outStaging, &offset, &mapped))
         return false;
     memcpy(mapped, data, sizeBytes);
+    renderer->stagingOverflowBytes[renderer->frameIndex] += sizeBytes;
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -2879,6 +2887,8 @@ static bool ReservePendingUpload(Renderer *renderer)
     return true;
 }
 
+static bool FlushUploads(Renderer *renderer);
+
 static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint32_t sizeBytes,
                                       GeometryAllocation *allocation)
 {
@@ -2886,6 +2896,11 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
         renderer->frameFailed || sizeBytes == 0u || allocation == NULL ||
         sizeBytes > UINTPTR_MAX - (uintptr_t)data || renderer->geometryGeneration == UINT64_MAX ||
         !ReservePendingUpload(renderer))
+    {
+        return false;
+    }
+    if (renderer->stagingOverflowBytes[renderer->frameIndex] >= GEOMETRY_STAGING_LIMIT_BYTES &&
+        !FlushUploads(renderer))
     {
         return false;
     }
@@ -3144,36 +3159,6 @@ static void RetireTextureStaging(Renderer *renderer)
     renderer->textureStagingBytes = 0u;
 }
 
-// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging-блоки.
-static bool FlushTextureUploads(Renderer *renderer)
-{
-    if (renderer->pendingTextureCount != 0u)
-    {
-        if (!WaitForGpu(renderer) ||
-            FAILED(ID3D12CommandAllocator_Reset(
-                renderer->commandAllocators[renderer->frameIndex])) ||
-            FAILED(ID3D12GraphicsCommandList_Reset(
-                renderer->commandList, renderer->commandAllocators[renderer->frameIndex], NULL)))
-            return false;
-        // Reset начинает новый command list с PSO=NULL; он не наследует
-        // привязки предыдущей записи.
-        renderer->boundPipelineState = NULL;
-        renderer->boundRootSignature = NULL;
-        renderer->boundIndexAddress = 0u;
-        renderer->boundIndexBytes = 0u;
-        RecordTextureUploads(renderer);
-        if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
-            return false;
-        ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
-        ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
-        if (!WaitForGpu(renderer))
-            return false;
-    }
-    ReleaseStagingChain(&renderer->textureStaging);
-    renderer->textureStagingBytes = 0u;
-    return true;
-}
-
 bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes)
@@ -3217,7 +3202,7 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
 
     if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
          renderer->textureStagingBytes + uploadBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
-        !FlushTextureUploads(renderer))
+        !FlushUploads(renderer))
         return false;
     ID3D12Resource *staging = NULL;
     uint64_t offset = 0u;
@@ -3794,6 +3779,42 @@ static void RecordPendingUploads(Renderer* renderer)
     }
 
     renderer->pendingUploadCount = 0;
+}
+
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging. Кольца слота
+// после этого свободны: их читали только эти копии.
+static bool FlushUploads(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount != 0u || renderer->pendingTextureCount != 0u)
+    {
+        if (!WaitForGpu(renderer) ||
+            FAILED(ID3D12CommandAllocator_Reset(
+                renderer->commandAllocators[renderer->frameIndex])) ||
+            FAILED(ID3D12GraphicsCommandList_Reset(
+                renderer->commandList, renderer->commandAllocators[renderer->frameIndex], NULL)))
+            return false;
+        // Reset начинает новый command list с PSO=NULL; он не наследует
+        // привязки предыдущей записи.
+        renderer->boundPipelineState = NULL;
+        renderer->boundRootSignature = NULL;
+        renderer->boundIndexAddress = 0u;
+        renderer->boundIndexBytes = 0u;
+        RecordPendingUploads(renderer);
+        RecordTextureUploads(renderer);
+        if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
+            return false;
+        ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
+        ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
+        if (!WaitForGpu(renderer))
+            return false;
+    }
+    ReleaseStagingChain(&renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
+    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, renderer->frameIndex);
+    DrainDeferredReleases(renderer, false);
+    return true;
 }
 
 static bool ApplyPendingResize(Renderer* renderer)
