@@ -117,6 +117,9 @@ typedef struct LaiueGraphicsDiagnosticsV2
     uint64_t cpuShadowBytes;
     uint32_t resourceHandleCount;
     uint32_t scenePasses;
+    // Swap chain rebuilds since the device was created. A window resize is one,
+    // so a number that grows with frames means presentation itself is broken.
+    uint32_t swapchainRebuilds;
     // Live upload rings and arenas of the backend. Blocks of a single burst are not counted.
     uint64_t uploadStagingBytes;
 } LaiueGraphicsDiagnosticsV2;

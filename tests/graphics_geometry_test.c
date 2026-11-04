@@ -162,6 +162,26 @@ static LaiueGraphicsDiagnosticsV2 Diagnostics(LaiueGraphicsDeviceV2 *device)
     return value;
 }
 
+#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+// Only a device with a window has a swap chain, which is why Vulkan skips this
+// here. Android checks the same counter on a rotated screen.
+static void SwapChainRebuilds(const LaiueGraphicsDeviceServiceV2 *service,
+                              LaiueGraphicsDeviceV2 *device)
+{
+    Expect(device->beginFrame(device, FRAME_WIDTH, FRAME_HEIGHT) != 0u &&
+               device->endFrame(device) != 0u,
+           "a frame draws before the resize");
+    const uint32_t before = Diagnostics(device).swapchainRebuilds;
+    service->resize(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u);
+    for (uint32_t frame = 0u; frame < 3u; ++frame)
+        Expect(device->beginFrame(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u) != 0u &&
+                   device->endFrame(device) != 0u,
+               "frames draw after the resize");
+    Expect(Diagnostics(device).swapchainRebuilds == before + 1u,
+           "a resize rebuilds the swap chain once, and frames after it do not");
+}
+#endif
+
 static void Begin(LaiueGraphicsDeviceV2 *device)
 {
     if (device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE &&
@@ -371,6 +391,30 @@ static void PartialIndexUpload(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandl
     Capture(device, 1u);
     ColorAt(0.4375f, 0.0625f, UINT32_C(0xff00ff00), "patched triangle two is immediately green");
     ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00), "patched triangle one is immediately green");
+}
+
+static void WholeVertexUpload(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("a vertex buffer keeps no CPU copy and takes whole uploads only");
+    const LaiueGraphicsDiagnosticsV2 before = Diagnostics(device);
+    const LaiueGraphicsHandle buffer =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));
+    Expect(Diagnostics(device).cpuShadowBytes == before.cpuShadowBytes,
+           "the bytes of a vertex buffer stay only in the GPU");
+    const LaiueGraphicsBufferUploadV1 part = {
+        .structSize = sizeof(part),
+        .buffer = buffer,
+        .offsetBytes = sizeof(vertices[0]),
+        .data = vertices + 4u,
+        .sizeBytes = sizeof(vertices[0]),
+    };
+    Expect(device->uploadBuffer(device, &part) == 0u, "a part of a vertex buffer is refused");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the refused part changes nothing");
+    device->destroyHandle(device, buffer);
 }
 
 static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle ib)
@@ -882,8 +926,7 @@ static void OverflowRecordedRetirement(LaiueGraphicsDeviceV2 *device)
     const LaiueGraphicsDiagnosticsV2 live = Diagnostics(device);
     Expect(live.geometryPoolUsedBytes >=
                    baseline.geometryPoolUsedBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
-               live.cpuShadowBytes ==
-                   baseline.cpuShadowBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
+               live.cpuShadowBytes == baseline.cpuShadowBytes &&
                live.resourceHandleCount == baseline.resourceHandleCount + RETIREMENT_MESH_COUNT,
            "all 300 independent meshes are resident before retirement");
     const LaiueGraphicsDrawItemV2 first =
@@ -1170,7 +1213,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         const uint64_t nativeBytes = sizeof(vertices) + sizeof(indicesA) + sizeof(indicesB);
         /* Vulkan allocates each resource at storage-buffer alignment (up to
          * 256 bytes); D3D12 accounts the requested bytes directly. */
-        Expect(firstStats.cpuShadowBytes == nativeBytes &&
+        Expect(firstStats.cpuShadowBytes == sizeof(indicesA) + sizeof(indicesB) &&
                    firstStats.uploadedBytes == nativeBytes &&
                    firstStats.resourceHandleCount == 3u &&
                    firstStats.geometryPoolUsedBytes >= nativeBytes &&
@@ -1179,6 +1222,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         AlternatingRanges(device, vb, ia, ib);
         LargeRawIndices(device, vb);
         PartialIndexUpload(device, vb, ib);
+        WholeVertexUpload(device);
         TexturedIndices(device, ia);
         QueuedTextureUploads(device, ia);
         InstancePixels(device, vb, ia);
@@ -1201,6 +1245,9 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         StagingSpill(device);
         UploadsWithoutFrames(device);
         BurstMemoryReturns(device);
+#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+        SwapChainRebuilds(service, device);
+#endif
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);
