@@ -374,6 +374,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     bool                       tearingSupported;
     // ResizeBuffers обязан передать те же флаги, что и создание.
     UINT                       swapChainFlags;
+    uint32_t                   swapChainRebuilds;
     // Сигналит, когда очередь показа готова принять следующий кадр.
     HANDLE                     frameLatencyWait;
     bool                       wireframeEnabled;
@@ -3832,6 +3833,7 @@ static bool ApplyPendingResize(Renderer* renderer)
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
+    renderer->swapChainRebuilds++;
 
     // ResizeBuffers сбрасывает индекс back-буфера: чтобы подписи фенса
     // остались монотонными, все слоты выравниваются по текущему значению
@@ -4430,6 +4432,7 @@ void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+    outStats->swapchainRebuilds = renderer->swapChainRebuilds;
 }
 
 bool RendererCanCaptureFrame_D3D12(const Renderer *renderer)

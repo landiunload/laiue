@@ -5,6 +5,13 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
+  Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
+  and the chain draws unrotated, and the renderer stopped the GPU and built a new
+  chain each time, in the landscape orientation games run in: 171 rebuilds in 171
+  frames on the emulator, 0 now. A frame acquired as suboptimal is drawn instead
+  of dropped. `swapchainRebuilds` in the graphics diagnostics counts them, which
+  grows `LaiueGraphicsDiagnosticsV2`, so a program that reads it has to be rebuilt.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in

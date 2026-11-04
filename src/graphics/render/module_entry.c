@@ -1568,6 +1568,7 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         result.geometryPoolUsedBytes = stats.geometryPoolUsedBytes;
         result.geometryPoolCapacityBytes = stats.geometryPoolCapacityBytes;
         result.scenePasses = stats.scenePasses;
+        result.swapchainRebuilds = stats.swapchainRebuilds;
     }
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};
     RendererGetGpuTimingV1(state->renderer, &timing);
