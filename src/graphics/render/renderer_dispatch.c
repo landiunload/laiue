@@ -22,6 +22,7 @@ extern bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetu
 extern void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_D3D12(Renderer* renderer);
 extern void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats);
+extern uint64_t RendererUploadStagingBytes_D3D12(const Renderer* renderer);
 extern bool RendererIsDeviceLost_D3D12(const Renderer* renderer);
 extern void RendererGetGpuTiming_D3D12(const Renderer *renderer,
                                        RendererGpuTimingV1 *outTiming);
@@ -94,6 +95,7 @@ extern bool RendererBeginFrame_Vulkan(Renderer* renderer, const RendererFrameSet
 extern void RendererBeginScenePass_Vulkan(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_Vulkan(Renderer* renderer);
 extern void RendererGetStats_Vulkan(const Renderer* renderer, RendererStats* outStats);
+extern uint64_t RendererUploadStagingBytes_Vulkan(const Renderer* renderer);
 extern bool RendererIsDeviceLost_Vulkan(const Renderer* renderer);
 extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
                                         RendererGpuTimingV1 *outTiming);
@@ -419,6 +421,22 @@ bool RendererIsDeviceLost(const Renderer* renderer)
         return RendererIsDeviceLost_Vulkan(renderer);
 #endif
     default: return false;
+    }
+}
+
+uint64_t RendererUploadStagingBytes(const Renderer* renderer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererUploadStagingBytes_D3D12(renderer);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererUploadStagingBytes_Vulkan(renderer);
+#endif
+    default: return 0u;
     }
 }
 

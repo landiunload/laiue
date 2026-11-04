@@ -269,6 +269,8 @@ LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 // с GPU и потому подходит для диагностики и внешнего профилировщика.
 LAIUE_RENDER_API void RendererGetStats(const Renderer* renderer,
     RendererStats* outStats);
+// Память колец и арен заливки геометрии, живых сейчас.
+LAIUE_RENDER_API uint64_t RendererUploadStagingBytes(const Renderer *renderer);
 LAIUE_RENDER_API void RendererGetGpuTimingV1(const Renderer *renderer,
                                              RendererGpuTimingV1 *outTiming);
 

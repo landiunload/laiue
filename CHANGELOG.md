@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Upload rings take a quarter of the memory, 1 MiB per frame instead of 4, and
+  the 8 MiB arenas of a burst go back after 120 turns of their frame slot without
+  use. A game loads its world in the first seconds and then uploads almost
+  nothing: Foxity peaked at 2.4 MiB a frame in 58 frames of 3600. Walk uses 11 MB
+  less. `LaiueGraphicsDiagnosticsV2` reports them as `uploadStagingBytes`, so a
+  program that reads diagnostics has to be rebuilt.
 - On Vulkan depth is no longer written to memory after a pass, since nothing reads
   it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
   a full-screen depth write, and where the device offers lazily allocated memory

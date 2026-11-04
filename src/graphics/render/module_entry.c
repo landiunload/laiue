@@ -1577,6 +1577,7 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         result.scenePasses = stats.scenePasses;
         result.swapchainRebuilds = stats.swapchainRebuilds;
     }
+    result.uploadStagingBytes = RendererUploadStagingBytes(state->renderer);
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};
     RendererGetGpuTimingV1(state->renderer, &timing);
     if ((timing.flags & RENDERER_GPU_TIMING_SUPPORTED) != 0u)
