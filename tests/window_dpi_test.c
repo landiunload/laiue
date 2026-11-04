@@ -84,46 +84,46 @@ static void NextStage(FramePace *pace)
     pace->stage = (PaceStage)(pace->stage + 1);
     switch (pace->stage)
     {
-        case PACE_WITHOUT_PIXELS:
-            // Только показанное окно: пусковая программа уже поставила его на место.
-            pace->shown = IsWindowVisible(pace->handle) != FALSE;
-            if (pace->shown)
-            {
-                (void)pace->windows->consumeResize(pace->window);
-                ShowWindow(pace->handle, SW_SHOWMINNOACTIVE);
-                // Так опаздывает сообщение, когда окно показывал другой поток.
-                SendMessageW(pace->handle, WM_SIZE, SIZE_RESTORED,
-                             MAKELPARAM(WINDOW_WIDTH, WINDOW_HEIGHT));
-            }
-            break;
-        case PACE_ON_ANOTHER_DESKTOP:
-            Cloak(pace, TRUE);
-            if (pace->shown)
-            {
-                pace->resizedWhileMinimized = pace->windows->consumeResize(pace->window);
-                ShowWindow(pace->handle, SW_SHOWNOACTIVATE);
-                pace->resizedByRestore = pace->windows->consumeResize(pace->window);
-            }
-            break;
-        case PACE_OUT_OF_FOCUS:
+    case PACE_WITHOUT_PIXELS:
+        // Только показанное окно: пусковая программа уже поставила его на место.
+        pace->shown = IsWindowVisible(pace->handle) != FALSE;
+        if (pace->shown)
         {
-            const bool cloaked = pace->cloaked;
-            Cloak(pace, FALSE);
-            pace->cloaked = cloaked;
-            break;
+            (void)pace->windows->consumeResize(pace->window);
+            ShowWindow(pace->handle, SW_SHOWMINNOACTIVE);
+            // Так опаздывает сообщение, когда окно показывал другой поток.
+            SendMessageW(pace->handle, WM_SIZE, SIZE_RESTORED,
+                         MAKELPARAM(WINDOW_WIDTH, WINDOW_HEIGHT));
         }
-        case PACE_EFFICIENCY:
-            (void)pace->windows->setPowerPolicy(WINDOW_POWER_EFFICIENCY);
-            break;
-        default:
-            (void)pace->windows->setPowerPolicy(WINDOW_POWER_AUTO);
-            pace->windows->requestClose(pace->window);
-            break;
+        break;
+    case PACE_ON_ANOTHER_DESKTOP:
+        Cloak(pace, TRUE);
+        if (pace->shown)
+        {
+            pace->resizedWhileMinimized = pace->windows->consumeResize(pace->window);
+            ShowWindow(pace->handle, SW_SHOWNOACTIVATE);
+            pace->resizedByRestore = pace->windows->consumeResize(pace->window);
+        }
+        break;
+    case PACE_OUT_OF_FOCUS:
+    {
+        const bool cloaked = pace->cloaked;
+        Cloak(pace, FALSE);
+        pace->cloaked = cloaked;
+        break;
+    }
+    case PACE_EFFICIENCY:
+        (void)pace->windows->setPowerPolicy(WINDOW_POWER_EFFICIENCY);
+        break;
+    default:
+        (void)pace->windows->setPowerPolicy(WINDOW_POWER_AUTO);
+        pace->windows->requestClose(pace->window);
+        break;
     }
     // Срок считается от конца перехода: показ окна сам может занять весь этап.
-    pace->stageEnd = PlatformMonotonicSeconds() +
-                     (pace->stage == PACE_OUT_OF_FOCUS && pace->shown ? QUICK_PATIENCE_SECONDS
-                                                                      : PACE_SECONDS);
+    pace->stageEnd =
+        PlatformMonotonicSeconds() +
+        (pace->stage == PACE_OUT_OF_FOCUS && pace->shown ? QUICK_PATIENCE_SECONDS : PACE_SECONDS);
 }
 
 static void CountFrame(void *context)
