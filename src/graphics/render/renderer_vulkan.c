@@ -149,6 +149,8 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define CONSTANT_BYTES_PER_FRAME (4u * 1024u * 1024u)
 
 #define COLOR_FORMAT VK_FORMAT_R8G8B8A8_SRGB
+#define DEPTH_TARGET_USAGE \
+    (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
 #define CAPTURE_FORMAT VK_FORMAT_R8G8B8A8_UNORM
 #define DEPTH_FORMAT VK_FORMAT_D32_SFLOAT
 
@@ -831,8 +833,13 @@ static bool ImageCreateWithMipLevels(Renderer *renderer, uint32_t width, uint32_
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(renderer->device, outImage->image, &requirements);
     uint32_t typeIndex = 0;
-    if (!FindMemoryType(renderer, requirements.memoryTypeBits,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+    // Мозаичному GPU глубина нужна только в памяти тайла: страницы под такой
+    // образ выделяются, лишь если он в неё не поместился.
+    const bool lazy = (usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0u &&
+                      FindMemoryType(renderer, requirements.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, &typeIndex);
+    if (!lazy && !FindMemoryType(renderer, requirements.memoryTypeBits,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
     {
         ImageDestroy(renderer, outImage);
         return false;
@@ -883,9 +890,10 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height,
 /* Vulkan 1.3 dynamic rendering is the fast path, but Android devices still
  * commonly expose only Vulkan 1.2.  Keep the same backend usable there with a
  * small render-pass compatibility path.  The render passes intentionally use
- * LOAD for color/depth; callers clear attachments explicitly when a pass
- * starts, so the same compatible pipeline can be reused by the resolve and UI
- * passes without creating duplicate pipeline layouts. */
+ * LOAD for color; callers clear attachments explicitly when a pass starts, so
+ * the same compatible pipeline can be reused by the resolve and UI passes
+ * without creating duplicate pipeline layouts.  Depth lives for one pass: it
+ * is cleared at the start and never read after the end. */
 static bool CreateRenderPasses(Renderer *renderer)
 {
     VkAttachmentDescription color = {
@@ -923,8 +931,8 @@ static bool CreateRenderPasses(Renderer *renderer)
         {
             .format = DEPTH_FORMAT,
             .samples = VK_SAMPLE_COUNT_1_BIT,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -2335,7 +2343,7 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
         return false;
     // Глубина общая для всех граней: каждый проход очищает свой прямоугольник.
     if (!ImageCreate(renderer, resolution, resolution, 1u, DEPTH_FORMAT,
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT,
                      VK_IMAGE_VIEW_TYPE_2D, false, &renderer->cubeDepth))
     {
         ReleaseCubeResources(renderer);
@@ -2409,8 +2417,8 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
         }
     }
     if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, DEPTH_FORMAT,
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     VK_IMAGE_VIEW_TYPE_2D, false, &renderer->depthTarget))
+                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                     &renderer->depthTarget))
     {
         ReleaseFrameTargets(renderer);
         return false;
@@ -5139,7 +5147,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         .imageView = depthView,
         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
     };
     depthAttachment.clearValue.depthStencil.depth = 1.0f;
 

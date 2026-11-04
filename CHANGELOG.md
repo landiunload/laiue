@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan depth is no longer written to memory after a pass, since nothing reads
+  it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
+  a full-screen depth write, and where the device offers lazily allocated memory
+  the depth target takes no RAM at all.
 - The viewer plays a GIF frame by frame instead of unpacking it into memory first,
   so a long GIF plays to its end. It used to stop at 256 frames without a word and
   start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
