@@ -36,6 +36,9 @@ struct Window
     bool focusLossPending;
     bool mouseLookEnabled;
     bool focused;
+    /* The window manager took the window off the screen: minimized, or on
+     * another workspace. It reports no size until the window is back. */
+    bool unmapped;
     bool fullscreen;
     /* Enter of Alt+Enter is down: the toggle waits for its release. */
     bool fullscreenKeyHeld;
@@ -72,6 +75,12 @@ static void ProcessEvent(Window *window, XEvent *event)
                 window->clientHeight = event->xconfigure.height;
                 window->resizePending = true;
             }
+            break;
+        case MapNotify:
+            window->unmapped = false;
+            break;
+        case UnmapNotify:
+            window->unmapped = true;
             break;
         case Expose:
             /* The last of a series: the frame redraws the whole window. */
@@ -255,9 +264,9 @@ void WindowSetRawInputCallback(Window *window, RawInputCallback callback, void *
 void WindowGetClientSize(const Window *window, int32_t *width, int32_t *height)
 {
     if (width != NULL)
-        *width = window == NULL ? 0 : window->clientWidth;
+        *width = window == NULL || window->unmapped ? 0 : window->clientWidth;
     if (height != NULL)
-        *height = window == NULL ? 0 : window->clientHeight;
+        *height = window == NULL || window->unmapped ? 0 : window->clientHeight;
 }
 
 bool WindowConsumeResize(Window *window)
@@ -314,9 +323,12 @@ void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
             onFrame(userData);
         if (window->closeRequested)
             break;
+        /* A frame usually waits in the present. A window off the screen has
+         * nothing to wait for, and efficiency mode spares frames out of focus. */
         if (window->frameDeferred)
             WaitForDeferredFrame(window);
-        else if (!window->focused)
+        else if (window->unmapped ||
+                 (!window->focused && WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY))
             PlatformSleepMilliseconds(50u);
     }
 }

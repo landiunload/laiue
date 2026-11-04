@@ -686,7 +686,8 @@ static void WalkWindowFrame(void *opaque)
                                    WalkReadVisualBlock, state->game, state->spatial.centerBlock))
         state->failed = true;
     state->failed |= !WalkCheckGameplayHealth(state);
-    if (!state->failed && state->game->ragdollReady &&
+    /* Without a camera nothing is drawn, so nothing is built for it. */
+    if (!state->failed && state->game->ragdollReady && state->cameraReady &&
         !WalkVisualsUpdateRagdollBuffer(
             &state->game->physicsContext, state->device, state->ragdollBuffer,
             &state->game->ragdoll, state->spatial.ragdollRenderOrigin, state->ragdollVisualScratch))
