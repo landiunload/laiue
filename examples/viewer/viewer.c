@@ -38,6 +38,8 @@
 #define CLICK_SLOP 12.0f
 #define NAME_BYTES (LAIUE_PLATFORM_PATH_CAPACITY * 3u)
 #define CAPTION_BYTES 768u
+// Сколько кадров графике нужно, чтобы отдать удалённую текстуру.
+#define RELEASE_FRAMES 4u
 
 typedef struct Files
 {
@@ -69,6 +71,14 @@ typedef struct LoadedPicture
     uint32_t width, height;    // размер текстуры
 } LoadedPicture;
 
+// Всё, от чего зависит изображение: кадр рисуется, только когда это изменилось.
+typedef struct View
+{
+    float scale, centerX, centerY;
+    int32_t width, height;
+    uint32_t turns, hideBar, current, frame;
+} View;
+
 typedef struct Viewer
 {
     LaiueModuleHost *host;
@@ -99,6 +109,8 @@ typedef struct Viewer
     double lastTime, clickTime;
     int32_t width, height, atlasWidth, atlasHeight;
     uint32_t frames;
+    View drawn;          // что на экране
+    uint32_t framesLeft; // столько кадров ещё нарисовать
     LaiueUiQuadV1 quads[LAIUE_GRAPHICS_UI_MAX_QUADS];
 } Viewer;
 
@@ -399,7 +411,10 @@ static void Turn(Viewer *viewer)
 static void ReleasePicture(Viewer *viewer)
 {
     if (viewer->picture.texture != 0u && viewer->device != NULL)
+    {
         viewer->device->destroyHandle(viewer->device, viewer->picture.texture);
+        viewer->framesLeft = RELEASE_FRAMES;
+    }
     PlatformFree(viewer->picture.frames);
     memset(&viewer->picture, 0, sizeof(viewer->picture));
 }
@@ -615,18 +630,29 @@ static void Show(Viewer *viewer, uint32_t index)
         (void)LoadPicture(viewer, index);
 }
 
-// Кадры GIF сменяются по своим задержкам; кадр без задержки идёт, как в
+// Сколько показывать текущий кадр GIF: кадр без задержки идёт, как в
 // браузерах, через 100 мс.
+static double FrameSeconds(const Picture *picture)
+{
+    const uint32_t delay = picture->frameMilliseconds[picture->frame];
+    return (double)(delay < 20u ? 100u : delay) * 0.001;
+}
+
+// Кадры GIF сменяются по своим задержкам. Срок считается от прошлого срока, а
+// не от момента смены: иначе опоздания копились бы и анимация отставала.
+// После долгой паузы она идёт дальше с места, а не догоняет.
 static void Animate(Viewer *viewer, double now)
 {
     Picture *picture = &viewer->picture;
     if (picture->frames == NULL)
         return;
-    const uint32_t delay = picture->frameMilliseconds[picture->frame];
-    if (now - picture->frameStart < (double)(delay < 20u ? 100u : delay) * 0.001)
+    const double seconds = FrameSeconds(picture);
+    if (now - picture->frameStart < seconds)
         return;
     picture->frame = (picture->frame + 1u) % picture->frameCount;
-    picture->frameStart = now;
+    picture->frameStart = now - picture->frameStart < 2.0 * seconds
+                              ? picture->frameStart + seconds
+                              : now;
     const size_t frameBytes = (size_t)picture->width * picture->height * 4u;
     const LaiueGraphicsTextureUploadV1 upload = {
         .structSize = sizeof(upload),
@@ -635,6 +661,15 @@ static void Animate(Viewer *viewer, double now)
         .sizeBytes = frameBytes,
     };
     (void)viewer->device->uploadTexture(viewer->device, &upload);
+}
+
+// Через сколько секунд сменится кадр анимации; у неподвижной картинки срока нет.
+static double SecondsToNextFrame(const Picture *picture, double now)
+{
+    if (picture->frames == NULL)
+        return -1.0;
+    const double seconds = picture->frameStart + FrameSeconds(picture) - now;
+    return seconds > 0.0 ? seconds : 0.0;
 }
 
 static void HandleKeys(Viewer *viewer)
@@ -904,13 +939,22 @@ static void Frame(void *context)
     const LaiueWindowServiceV1 *windows = viewer->windows;
     if (windows->consumeFocusLoss(viewer->window))
         viewer->inputs->resetState(viewer->input);
+    const bool deferrable =
+        Has(viewer->windowBytes, windows->structSize, offsetof(LaiueWindowServiceV1, consumeRedraw),
+            sizeof(windows->consumeRedraw));
+    const bool onDemand = deferrable && !viewer->smoke;
     int32_t width = 0;
     int32_t height = 0;
     windows->getClientSize(viewer->window, &width, &height);
     if (windows->consumeResize(viewer->window) && width > 0 && height > 0)
         viewer->graphics->resize(viewer->device, width, height);
     if (width <= 0 || height <= 0)
+    {
+        // Свёрнутому окну нечего показывать до следующего размера.
+        if (onDemand)
+            windows->deferNextFrame(viewer->window, -1.0);
         return;
+    }
     if (width != viewer->width || height != viewer->height)
     {
         viewer->width = width;
@@ -924,6 +968,27 @@ static void Frame(void *context)
     HandlePointer(viewer, now);
     viewer->inputs->endFrame(viewer->input);
     Animate(viewer, now);
+
+    // Без изменений на экране остаётся прежнее изображение: окно спит до
+    // события или до следующего кадра анимации.
+    const View view = {.scale = viewer->scale,
+                       .centerX = viewer->centerX,
+                       .centerY = viewer->centerY,
+                       .width = width,
+                       .height = height,
+                       .turns = viewer->turns,
+                       .hideBar = viewer->hideBar ? 1u : 0u,
+                       .current = viewer->current,
+                       .frame = viewer->picture.frame};
+    const bool redraw = onDemand && windows->consumeRedraw(viewer->window);
+    if ((redraw || memcmp(&view, &viewer->drawn, sizeof(view)) != 0) && viewer->framesLeft == 0u)
+        viewer->framesLeft = 1u;
+    viewer->drawn = view;
+    if (onDemand && viewer->framesLeft == 0u)
+    {
+        windows->deferNextFrame(viewer->window, SecondsToNextFrame(&viewer->picture, now));
+        return;
+    }
 
     LaiueGraphicsDeviceV2 *device = viewer->device;
     const bool check = viewer->smoke && viewer->frames == 2u;
@@ -949,11 +1014,21 @@ static void Frame(void *context)
         return;
     }
     ++viewer->frames;
+    if (viewer->framesLeft != 0u)
+        --viewer->framesLeft;
     if (check)
     {
         viewer->failed = !FrameShowsPicture(viewer);
         PlatformWriteConsoleUtf8(viewer->failed ? "viewer: the frame is empty\n"
                                                 : "viewer: the picture is on screen\n");
+        // Перед выходом окно проходит ожидание: так оно работает и в CI.
+        if (deferrable)
+            windows->deferNextFrame(viewer->window, 0.01);
+        else
+            windows->requestClose(viewer->window);
+    }
+    else if (viewer->smoke && viewer->frames > 3u)
+    {
         windows->requestClose(viewer->window);
     }
 }

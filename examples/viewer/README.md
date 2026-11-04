@@ -36,6 +36,28 @@ Without `laiue_graphics_d3d12.dll` Windows draws through Vulkan, and without
 the UI module the picture shows with no caption. With no graphics provider
 at all the program reports it and exits.
 
+## Frames on demand
+
+A picture does not change by itself, so the program draws only when it does.
+Each frame it compares what it would draw with what it drew last. If they
+match, it calls the window service's `deferNextFrame`, and the window sleeps
+until the next event or the next GIF frame:
+
+```c
+if (nothingChanged)
+{
+    windows->deferNextFrame(window, secondsToNextGifFrame); // negative: no deadline
+    return;
+}
+```
+
+A picture lying on the screen then costs no CPU or GPU time. Any event wakes
+the frame, even a mouse move, which is why the comparison decides and not the
+event. `consumeRedraw` reports when the system lost the window's picture. After
+a page turn the program draws a few frames more, because the graphics module
+releases a texture only once the GPU has finished with it. Another thread ends
+the wait with `wakeFrame`. A game simply never calls `deferNextFrame`.
+
 ## Build
 
 Desktop builds need modules as shared libraries, the default:

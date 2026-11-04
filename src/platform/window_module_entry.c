@@ -31,6 +31,9 @@ static const LaiueWindowServiceV1 service = {
     .getContentScale = WindowGetContentScale,
     .setPowerPolicy = WindowSetPowerPolicy,
     .getPowerPolicy = WindowGetPowerPolicy,
+    .deferNextFrame = WindowDeferNextFrame,
+    .wakeFrame = WindowWakeFrame,
+    .consumeRedraw = WindowConsumeRedraw,
 };
 
 static uint32_t ModuleCreate(const LaiueModuleHostV1 *host, void **outContext)

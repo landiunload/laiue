@@ -11,9 +11,15 @@
 #include <X11/keysym.h>
 #undef Window
 
+#include <fcntl.h>
+#include <poll.h>
 #include <string.h>
+#include <unistd.h>
 
 #define WINDOW_TEXT_CAPACITY 256u
+/* The furthest deadline: an early frame does no harm, and a day in
+ * milliseconds still fits an int. */
+#define WINDOW_LONGEST_DEFER_SECONDS 86400.0
 
 struct Window
 {
@@ -34,6 +40,13 @@ struct Window
     /* Enter of Alt+Enter is down: the toggle waits for its release. */
     bool fullscreenKeyHeld;
     bool closeRequested;
+    /* The frame asked to wait: the run loop sleeps until an event or the
+     * deadline. WindowWakeFrame writes to the pipe from any thread. */
+    bool frameDeferred;
+    bool redrawPending;
+    double frameDeferSeconds;
+    int wakeRead;
+    int wakeWrite;
     float wheelSteps;
     /* Typed text until consumed: a ring of code points. */
     uint32_t text[WINDOW_TEXT_CAPACITY];
@@ -59,6 +72,11 @@ static void ProcessEvent(Window *window, XEvent *event)
                 window->clientHeight = event->xconfigure.height;
                 window->resizePending = true;
             }
+            break;
+        case Expose:
+            /* The last of a series: the frame redraws the whole window. */
+            if (event->xexpose.count == 0)
+                window->redrawPending = true;
             break;
         case FocusIn:
             window->focused = true;
@@ -120,6 +138,23 @@ static void ProcessEvent(Window *window, XEvent *event)
         window->rawInputCallback(window->rawInputUserData, event);
 }
 
+/* Neither end blocks: a full pipe already holds a wake, and the run loop
+ * reads it empty. */
+static bool CreateWakePipe(Window *window)
+{
+    int ends[2];
+    if (pipe(ends) != 0)
+        return false;
+    for (int end = 0; end < 2; ++end)
+    {
+        (void)fcntl(ends[end], F_SETFL, O_NONBLOCK);
+        (void)fcntl(ends[end], F_SETFD, FD_CLOEXEC);
+    }
+    window->wakeRead = ends[0];
+    window->wakeWrite = ends[1];
+    return true;
+}
+
 Window *WindowCreate(const WindowConfiguration *configuration)
 {
     if (configuration == NULL || configuration->width <= 0 || configuration->height <= 0)
@@ -142,15 +177,17 @@ Window *WindowCreate(const WindowConfiguration *configuration)
                                          (unsigned int)configuration->height, 0,
                                          BlackPixel(display, screen),
                                          BlackPixel(display, screen));
-    if (window->handle == 0)
+    if (window->handle == 0 || !CreateWakePipe(window))
     {
+        if (window->handle != 0)
+            XDestroyWindow(display, window->handle);
         PlatformFree(window);
         XCloseDisplay(display);
         return NULL;
     }
     XSelectInput(display, window->handle,
-                 StructureNotifyMask | FocusChangeMask | KeyPressMask | KeyReleaseMask |
-                     ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+                 StructureNotifyMask | ExposureMask | FocusChangeMask | KeyPressMask |
+                     KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     /* A held key repeats KeyPress alone. By default every repeat also sends
      * a KeyRelease, and input would count each one as a new press. */
     (void)XkbSetDetectableAutoRepeat(display, True, NULL);
@@ -197,6 +234,8 @@ void WindowDestroy(Window *window)
             XDestroyWindow(window->display, window->handle);
         XCloseDisplay(window->display);
     }
+    close(window->wakeRead);
+    close(window->wakeWrite);
     PlatformFree(window);
 }
 
@@ -237,6 +276,27 @@ bool WindowConsumeFocusLoss(Window *window)
     return true;
 }
 
+/* Sleeps until an event, a wake or the WindowDeferNextFrame deadline. An event
+ * Xlib has already read waits in its queue, where poll cannot see it. */
+static void WaitForDeferredFrame(Window *window)
+{
+    if (XPending(window->display) != 0)
+        return;
+    struct pollfd sources[2] = {
+        {.fd = ConnectionNumber(window->display), .events = POLLIN},
+        {.fd = window->wakeRead, .events = POLLIN},
+    };
+    const int timeout =
+        window->frameDeferSeconds < 0.0 ? -1 : (int)(window->frameDeferSeconds * 1000.0) + 1;
+    (void)poll(sources, 2u, timeout);
+    if ((sources[1].revents & POLLIN) == 0)
+        return;
+    char bytes[16];
+    while (read(window->wakeRead, bytes, sizeof(bytes)) > 0)
+    {
+    }
+}
+
 void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
 {
     if (window == NULL)
@@ -249,11 +309,44 @@ void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
             XNextEvent(window->display, &event);
             ProcessEvent(window, &event);
         }
+        window->frameDeferred = false;
         if (onFrame != NULL)
             onFrame(userData);
-        if (!window->focused)
+        if (window->closeRequested)
+            break;
+        if (window->frameDeferred)
+            WaitForDeferredFrame(window);
+        else if (!window->focused)
             PlatformSleepMilliseconds(50u);
     }
+}
+
+void WindowDeferNextFrame(Window *window, double seconds)
+{
+    if (window == NULL)
+        return;
+    const double limited =
+        seconds > WINDOW_LONGEST_DEFER_SECONDS ? WINDOW_LONGEST_DEFER_SECONDS : seconds;
+    window->frameDeferred = true;
+    window->frameDeferSeconds = limited >= 0.0 ? limited : -1.0;
+}
+
+void WindowWakeFrame(Window *window)
+{
+    if (window == NULL)
+        return;
+    /* A full pipe already holds a wake, so a failed write loses nothing. */
+    const char byte = 0;
+    const ssize_t written = write(window->wakeWrite, &byte, 1u);
+    (void)written;
+}
+
+bool WindowConsumeRedraw(Window *window)
+{
+    if (window == NULL || !window->redrawPending)
+        return false;
+    window->redrawPending = false;
+    return true;
 }
 
 void WindowSetMouseLook(Window *window, bool enabled)
