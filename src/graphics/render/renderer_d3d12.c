@@ -1,4 +1,5 @@
 #include "render/renderer_internal.h"
+#include "render/frame_turn.h"
 #include "render/pipeline_cache.h"
 #include "platform/system.h"
 #include "render/renderer_offscreen.h"
@@ -64,8 +65,12 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Число квадов является частью публичного контракта renderer.h.
 #define UI_QUAD_BYTES 48
 
-// Резолв панорамы: раскладка корневых констант.
-#define RESOLVE_ROOT_CONSTANT_COUNT 3
+// Резолв панорамы: раскладка корневых констант. Dword 4..7 — оси окна.
+#define RESOLVE_ROOT_CONSTANT_COUNT 8
+#define RESOLVE_ROOT_CONSTANT_CLIP_AXES 4
+
+// Слой UI: размер окна и за ним оси окна. D3D12 рисует так, как лежит окно.
+#define UI_ROOT_CONSTANT_COUNT 6
 
 // Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl,
 // float3 выравниваются по границам 16 байт):
@@ -1527,7 +1532,7 @@ static bool CreateResolveRootSignature(Renderer* renderer)
     D3D12_ROOT_PARAMETER parameters[2];
     memset(parameters, 0, sizeof(parameters));
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     parameters[0].Constants.ShaderRegister = 0;
     parameters[0].Constants.Num32BitValues = RESOLVE_ROOT_CONSTANT_COUNT;
 
@@ -1592,7 +1597,7 @@ static bool CreateUiRootSignature(Renderer* renderer)
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     parameters[0].Constants.ShaderRegister = 0;
-    parameters[0].Constants.Num32BitValues = 2;
+    parameters[0].Constants.Num32BitValues = UI_ROOT_CONSTANT_COUNT;
 
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -4319,6 +4324,8 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
             0, 2, resolveConstants, 0);
         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(renderer->commandList,
             0, (UINT)renderer->frame.resolveMapping, 2);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 4, FRAME_TURN_CLIP_AXES[0], RESOLVE_ROOT_CONSTANT_CLIP_AXES);
         ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
             1, SrvGpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
 
@@ -4341,12 +4348,16 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         SetPipelineStateCached(renderer, renderer->uiPipelineState);
         SetRootSignatureCached(renderer, renderer->uiRootSignature);
 
-        float screenSize[2] = {
+        float uiConstants[UI_ROOT_CONSTANT_COUNT] = {
             (float)renderer->windowWidth,
             (float)renderer->windowHeight,
+            FRAME_TURN_CLIP_AXES[0][0],
+            FRAME_TURN_CLIP_AXES[0][1],
+            FRAME_TURN_CLIP_AXES[0][2],
+            FRAME_TURN_CLIP_AXES[0][3],
         };
         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-            0, 2, screenSize, 0);
+            0, UI_ROOT_CONSTANT_COUNT, uiConstants, 0);
         ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
             1, ID3D12Resource_GetGPUVirtualAddress(
                 renderer->uiQuadBuffers[renderer->frameIndex]));

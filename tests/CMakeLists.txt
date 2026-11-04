@@ -377,6 +377,8 @@ endif()
 
 # Graphics. Driver-dependent tests skip without a GPU unless it is required.
 if(TARGET laiue_render AND laiue_shared_modules)
+    laiue_add_harness(laiue_frame_turn_test FrameTurnTestEntryPoint frame_turn_test.c
+        TEST laiue.render.frame_turn)
     if(LAIUE_RENDER_HAS_VULKAN_TARGET)
         laiue_add_harness(laiue_graphics_geometry_vulkan_test GraphicsGeometryTestEntryPoint
             graphics_geometry_test.c BOOTSTRAP

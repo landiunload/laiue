@@ -9,6 +9,9 @@ cbuffer ResolveConstants : register(b0)
     float fovHalfRadians;   // половина горизонтального поля зрения
     float verticalScale;    // рыбий глаз: высота/ширина; цилиндр: tan половины вертикали
     uint mapping;           // 0 — равноудалённый рыбий глаз, 1 — цилиндр
+    // Куда в клип-пространстве цели ведут оси окна: цель может лежать повёрнутой.
+    float2 clipAxisX;
+    float2 clipAxisY;
 };
 
 TextureCube<float4> sceneCube : register(t0);
@@ -26,7 +29,7 @@ ResolveInput VSMain(uint vertexId : SV_VertexID)
     float2 corner = float2((vertexId << 1) & 2, vertexId & 2);
     ResolveInput output;
     output.ndc = corner * 2.0 - 1.0;
-    output.position = float4(output.ndc, 0.0, 1.0);
+    output.position = float4(output.ndc.x * clipAxisX + output.ndc.y * clipAxisY, 0.0, 1.0);
     return output;
 }
 
