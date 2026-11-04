@@ -5,6 +5,9 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Destroying a texture no longer stops the GPU either. A texture that frames in
+  flight may read waits until the GPU has passed them; Vulkan used to wait for
+  the device to go idle and rebuild its descriptor sets.
 - Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
   mip level and Vulkan once; the pixels now go to staging memory, and the copy
   runs at the start of the next frame. In the viewer a page turn holds the

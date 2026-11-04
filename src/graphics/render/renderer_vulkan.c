@@ -208,6 +208,9 @@ struct RendererTexture
 {
     Renderer *owner;
     GpuImage image;
+    // Удалённая текстура ждёт, пока GPU пройдёт кадры, которые её читают.
+    struct RendererTexture *nextRetired;
+    uint64_t safeFrameIndex;
 };
 
 struct RendererSampler
@@ -444,6 +447,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t pendingTextureCount;
     StagingOverflow *textureStaging;
     uint64_t textureStagingBytes;
+    RendererTexture *retiredTextures;
     bool uploadSlotReady[FRAME_COUNT];
     GpuBuffer instanceBuffers[FRAME_COUNT][INSTANCE_MAX_CHUNKS_PER_FRAME];
     uint32_t instanceChunkCount[FRAME_COUNT];
@@ -1306,6 +1310,20 @@ static void PoolReclaimEmptyTail(Renderer *renderer)
 
 static void DrainDeferredReleases(Renderer *renderer, bool releaseEverything)
 {
+    RendererTexture **retired = &renderer->retiredTextures;
+    while (*retired != NULL)
+    {
+        RendererTexture *texture = *retired;
+        if (!releaseEverything && texture->safeFrameIndex > renderer->submittedFrames)
+        {
+            retired = &texture->nextRetired;
+            continue;
+        }
+        *retired = texture->nextRetired;
+        ImageDestroy(renderer, &texture->image);
+        PlatformFree(texture);
+    }
+
     while (renderer->deferredRangeCount > 0u)
     {
         DeferredRangeRelease *entry = &renderer->deferredRanges[renderer->deferredRangeHead];
@@ -4162,17 +4180,22 @@ void RendererDestroySampler_Vulkan(Renderer *renderer, RendererSampler *sampler)
     PlatformFree(sampler);
 }
 
+// Ещё не закончен хотя бы один отправленный кадр.
+static bool FrameInFlight(const Renderer *renderer)
+{
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+        if (renderer->frameFences[frame] != VK_NULL_HANDLE &&
+            vkGetFenceStatus(renderer->device, renderer->frameFences[frame]) == VK_NOT_READY)
+            return true;
+    return false;
+}
+
 void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
         return;
     if (renderer != NULL && texture->owner != renderer)
         return;
-    if (renderer != NULL && renderer->device != VK_NULL_HANDLE)
-    {
-        vkDeviceWaitIdle(renderer->device);
-        FreeAllGenericDescriptorSets(renderer);
-    }
     if (renderer != NULL)
     {
         // Его пиксели остаются в staging-блоках до следующего кадра.
@@ -4181,6 +4204,17 @@ void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
             if (renderer->pendingTextures[index].texture != texture)
                 renderer->pendingTextures[kept++] = renderer->pendingTextures[index];
         renderer->pendingTextureCount = kept;
+        if (renderer->device != VK_NULL_HANDLE)
+        {
+            if (renderer->frameRecording || FrameInFlight(renderer))
+            {
+                texture->safeFrameIndex = renderer->submittedFrames + FRAME_COUNT;
+                texture->nextRetired = renderer->retiredTextures;
+                renderer->retiredTextures = texture;
+                return;
+            }
+            FreeAllGenericDescriptorSets(renderer);
+        }
         ImageDestroy(renderer, &texture->image);
     }
     PlatformFree(texture);
