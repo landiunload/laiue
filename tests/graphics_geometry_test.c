@@ -398,6 +398,8 @@ static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle i
     device->destroyHandle(device, vb);
 }
 
+#define BRIEF_TEXTURE_SIDE 2048u
+
 static void UploadTexel(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle texture,
                         const uint8_t texel[4])
 {
@@ -453,6 +455,35 @@ static void QueuedTextureUploads(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHan
     Submit(device, &item);
     Capture(device, 1u);
     ColorAt(0.0f, 0.0f, UINT32_C(0xffff0000), "a new upload reaches its first following frame");
+
+    /* Large enough that the GPU is often still copying it after endFrame, so
+     * the texture dies while the frame that reads it is in flight. */
+    static uint32_t briefTexels[BRIEF_TEXTURE_SIDE * BRIEF_TEXTURE_SIDE];
+    for (uint32_t i = 0u; i < BRIEF_TEXTURE_SIDE * BRIEF_TEXTURE_SIDE; ++i)
+        briefTexels[i] = UINT32_C(0xff00ff00);
+    LaiueGraphicsTextureDescV1 briefDesc = textureDesc;
+    briefDesc.extent.width = briefDesc.extent.height = BRIEF_TEXTURE_SIDE;
+    for (uint32_t i = 0u; i < 8u; ++i)
+    {
+        LaiueGraphicsHandle brief = 0u;
+        Expect(device->createTexture(device, &briefDesc, &brief) != 0u && brief != 0u,
+               "a short-lived texture creates");
+        const LaiueGraphicsTextureUploadV1 upload = {.structSize = sizeof(upload),
+                                                     .texture = brief,
+                                                     .data = briefTexels,
+                                                     .sizeBytes = sizeof(briefTexels)};
+        Expect(device->uploadTexture(device, &upload) != 0u, "a short-lived texture uploads");
+        LaiueGraphicsDrawItemV2 briefItem = item;
+        briefItem.texture = brief;
+        Begin(device);
+        Submit(device, &briefItem);
+        Expect(device->endFrame(device) != 0u, "a frame with a short-lived texture ends");
+        device->destroyHandle(device, brief);
+    }
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xffff0000), "frames go on after textures destroyed in flight");
 
     device->destroyHandle(device, sampler);
     device->destroyHandle(device, texture);
