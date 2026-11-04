@@ -152,6 +152,8 @@ static void ReadTestWindowClient(HWND window, int32_t *outWidth, int32_t *outHei
 static void DrawFrame(Renderer *renderer, const RendererFrameSetup *setup, const char *beginReason,
                       const char *endReason)
 {
+    // Кадр окна читается только по запросу, сделанному до него.
+    Expect(RendererRequestFrameCapture(renderer), "a frame capture could not be requested");
     Expect(RendererBeginFrame(renderer, setup), beginReason);
     if (setup->passCount != 0u)
         RendererBeginScenePass(renderer, 0u);
@@ -164,6 +166,7 @@ static void DrawMeshFrame(Renderer *renderer, RendererFrameSetup *setup, Rendere
 {
     static const float origin[3] = {-0.5f, -0.5f, -0.5f};
     setup->passCount = 1u;
+    Expect(RendererRequestFrameCapture(renderer), "a frame capture could not be requested");
     Expect(RendererBeginFrame(renderer, setup), "a mesh frame could not begin");
     RendererBeginScenePass(renderer, 0u);
     RendererDrawMesh(renderer, mesh, origin);

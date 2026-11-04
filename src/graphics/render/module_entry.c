@@ -75,7 +75,8 @@ typedef struct LaiueGraphicsDeviceState
     bool frameActive;
     bool lastFrameValid;
     bool readbackSupported;
-    bool readbackNeedsRequest;  // кадр окна читается только по запросу
+    // Кадр окна рисуется прямо в образ цепочки и читается только по запросу.
+    bool readbackNeedsRequest;
     uint64_t completedFrameIndex;
 } LaiueGraphicsDeviceState;
 

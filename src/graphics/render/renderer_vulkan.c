@@ -415,8 +415,6 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     int32_t windowHeight;
     int32_t resizeWidth;
     int32_t resizeHeight;
-    int32_t appliedWidth;  // запрос, под который собраны цели кадра
-    int32_t appliedHeight;
     bool resizeRequested;
     bool lastFrameValid;
     uint32_t lastFrameIndex;
@@ -2810,10 +2808,13 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     VkSurfaceFormatKHR surfaceFormat;
     if (!ReadSurfaceFormat(renderer, &surfaceFormat)) return false;
 
-    // TRANSFER_SRC нужен захвату кадра: без него образ цепочки не прочитать.
+    // Размер кадра выбирает программа: он может отличаться от окна, и тогда кадр
+    // рисуется отдельно и масштабируется при показе. TRANSFER_SRC нужен захвату
+    // кадра: без него образ цепочки не прочитать.
     const VkImageUsageFlags directUsage =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     const bool direct = surfaceFormat.format == renderer->colorFormat &&
+                        (int32_t)extent.width == width && (int32_t)extent.height == height &&
                         (capabilities.supportedUsageFlags & directUsage) == directUsage;
     if (!direct && (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u)
         return false;
@@ -2973,9 +2974,9 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     return true;
 }
 
-// Цепочка и цели кадра собираются вместе: размер кадра задаёт цепочка, а
-// framebuffer-ы держат её образы. Вызывать до записи кадра: старые объекты
-// уничтожаются только после полного простоя GPU.
+// Цепочка и цели кадра собираются вместе: от размера кадра зависит, рисует ли он
+// прямо в образы цепочки, а framebuffer-ы держат эти образы. Вызывать до записи
+// кадра: старые объекты уничтожаются только после полного простоя GPU.
 static bool RebuildFrameTargets(Renderer *renderer, int32_t width, int32_t height)
 {
     WaitForGpu(renderer);
@@ -2989,8 +2990,6 @@ static bool RebuildFrameTargets(Renderer *renderer, int32_t width, int32_t heigh
             return false;
         }
         renderer->swapchainRecreateCount++;
-        width = (int32_t)renderer->swapchainExtent.width;
-        height = (int32_t)renderer->swapchainExtent.height;
     }
     if (CreateFrameTargets(renderer, width, height))
         return true;
@@ -3016,10 +3015,8 @@ static bool ApplyPendingResize(Renderer *renderer)
         if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
         return true;
     }
-    // Сравнивается запрос, а не размер целей: цепочка вправе дать другой размер,
-    // и новая сборка его не изменит.
-    if (renderer->resizeWidth == renderer->appliedWidth &&
-        renderer->resizeHeight == renderer->appliedHeight && FrameTargetsReady(renderer))
+    if (renderer->resizeWidth == renderer->windowWidth &&
+        renderer->resizeHeight == renderer->windowHeight && FrameTargetsReady(renderer))
     {
         renderer->resizeRequested = false;
         return true;
@@ -3033,8 +3030,6 @@ static bool ApplyPendingResize(Renderer *renderer)
         renderer->resizeRequested = true;
         return false;
     }
-    renderer->appliedWidth = renderer->resizeWidth;
-    renderer->appliedHeight = renderer->resizeHeight;
     renderer->resizeRequested = false;
     return true;
 }
@@ -3734,22 +3729,29 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
         return NULL;
     }
 
-    // Размер кадра задаёт цепочка: на Win32 она равна клиентской области окна
-    // (minImageExtent == maxImageExtent).
-    int32_t initialWidth = width > 0 ? width : 1;
-    int32_t initialHeight = height > 0 ? height : 1;
+    // Размер целей кадра держим равным клиентской области surface, иначе
+    // на Win32 (minImageExtent == maxImageExtent) swapchain не создастся.
+    int32_t initialWidth = width;
+    int32_t initialHeight = height;
     if (renderer->hasSurface)
     {
-        if (!SwapchainCreate(renderer, initialWidth, initialHeight))
+        VkSurfaceCapabilitiesKHR capabilities;
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(renderer->physicalDevice, renderer->surface,
+                                                      &capabilities) == VK_SUCCESS &&
+            capabilities.currentExtent.width != UINT32_MAX &&
+            capabilities.currentExtent.height != UINT32_MAX &&
+            capabilities.currentExtent.width > 0u && capabilities.currentExtent.height > 0u)
         {
-            RendererDestroy_Vulkan(renderer);
-            return NULL;
+            initialWidth = (int32_t)capabilities.currentExtent.width;
+            initialHeight = (int32_t)capabilities.currentExtent.height;
         }
-        initialWidth = (int32_t)renderer->swapchainExtent.width;
-        initialHeight = (int32_t)renderer->swapchainExtent.height;
     }
+    if (initialWidth <= 0) initialWidth = width > 0 ? width : 1;
+    if (initialHeight <= 0) initialHeight = height > 0 ? height : 1;
 
-    if (!CreateFrameTargets(renderer, initialWidth, initialHeight) ||
+    // Цепочка первой: она решает, нужны ли цветовые цели.
+    if ((renderer->hasSurface && !SwapchainCreate(renderer, initialWidth, initialHeight)) ||
+        !CreateFrameTargets(renderer, initialWidth, initialHeight) ||
         !CreateResolvePipeline(renderer, &renderer->resolvePipeline) ||
         !CreateUiPipeline(renderer, &renderer->uiPipeline))
     {
@@ -3759,8 +3761,6 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
 
     renderer->resizeWidth = initialWidth;
     renderer->resizeHeight = initialHeight;
-    renderer->appliedWidth = initialWidth;
-    renderer->appliedHeight = initialHeight;
     return renderer;
 }
 
@@ -5460,7 +5460,6 @@ static void RecordUiLayer(Renderer *renderer)
 
 static void RecordFrameCapture(Renderer *renderer, VkCommandBuffer commandBuffer)
 {
-    renderer->captureRequested = false;
     GpuImage *target = FrameTarget(renderer);
     const VkDeviceSize bytes = (VkDeviceSize)target->width * target->height * 4u;
     if (renderer->captureBuffer.sizeBytes != bytes)
@@ -5504,6 +5503,7 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     else if (renderer->captureRequested)
         RecordFrameCapture(renderer, commandBuffer);
+    renderer->captureRequested = false;
 
     PresentOutcome present = RecordPresent(renderer, commandBuffer);
 
@@ -6042,7 +6042,7 @@ bool RendererRequestFrameCapture_Vulkan(Renderer *renderer)
 {
     if (!RendererCanCaptureFrame_Vulkan(renderer) || renderer->frameRecording) return false;
     renderer->captureValid = false;
-    renderer->captureRequested = renderer->swapchainDirect;
+    renderer->captureRequested = true;
     return true;
 }
 

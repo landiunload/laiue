@@ -92,9 +92,9 @@ Vulkan вправе отложить present при устаревшем swapcha
 диагностики не требуется. Основание: [DXGI_SWAP_EFFECT](https://learn.microsoft.com/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_effect).
 По той же причине Vulkan копирует образ swap chain до показа, а не читает
 уже переданный presentation engine, и цепочке нужен TRANSFER_SRC. Если
-поверхность его не предлагает или не берёт формат целей кадра, кадр рисуется
-в private color target и копируется в образ, а запрос ничего не меняет. Образ
-BGRA отдаётся приложению как RGBA.
+поверхность его не предлагает, не берёт формат целей кадра или размер кадра
+не равен размеру окна, кадр рисуется в private color target и копируется в
+образ, а запрос ничего не меняет. Образ BGRA отдаётся приложению как RGBA.
 
 `readbackFrame` принимает `LaiueGraphicsFrameReadbackV2`, у которого
 `structSize` задан, `flags` и `reserved` равны 0, `pixels` указывает на
