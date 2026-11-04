@@ -100,6 +100,9 @@ typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 // The last frame went straight into a swap chain image. Without the flag a window
 // costs an extra colour target and a copy of the screen in every frame.
 #define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN (1u << 6)
+// The last frame was drawn turned the way a rotated screen keeps its images, so
+// the system has nothing left to rotate when it shows the frame.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED (1u << 7)
 
 typedef struct LaiueGraphicsDiagnosticsV2
 {

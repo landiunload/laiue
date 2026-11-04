@@ -23,6 +23,9 @@ typedef struct RendererStats
     uint32_t scenePasses;
     uint32_t swapchainRebuilds;
     bool drawsIntoSwapchain;
+    // Vulkan: на сколько четвертей оборота цель кадра повёрнута от окна, см.
+    // render/frame_turn.h. Не ноль только на повёрнутом экране Android.
+    uint32_t frameTurn;
     // Vulkan: проходы кадра по его цели. Каждый лишний проход тайловый GPU оплачивает
     // записью всего кадра в память и чтением обратно.
     uint32_t targetPasses;

@@ -387,6 +387,10 @@ try {
         return $text -match "event=summary run=$runId status=PASS"
     }
     $summary = [regex]::Match($log, "LAIUE_SCENARIO event=summary run=$runId status=PASS[^\r\n]*").Value
+    # The screen is rotated here: a frame the system still has to turn costs a phone a pass.
+    if ($summary -notmatch ' swapchain_turned_frames=[1-9]') {
+        throw "No frame was drawn turned for the rotated screen: $summary"
+    }
     $gameplayState = Gameplay-State -Log $log -Event 'summary'
 
     # Require real resize/presentation, not merely changed Android settings.
@@ -403,8 +407,10 @@ try {
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
         -NativeHeight ([int]$portraitFrame.Groups[2].Value)
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
+    if (-not $portrait.imageCheck.skyAboveGround) { throw 'The portrait frame is upside down.' }
     $priorPresented = ([regex]::Matches($portraitLog, 'event=presented ')).Count
-    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
+    # The scenario ran in the other landscape: this one takes the opposite turn.
+    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '3') | Out-Null
     $landscapeLog = Wait-Log -Description 'landscape resize and presentation' -Condition {
         param($text)
         $presented = [regex]::Matches($text, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
@@ -416,6 +422,7 @@ try {
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
         -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
+    if (-not $landscape.imageCheck.skyAboveGround) { throw 'The landscape frame is upside down.' }
     if ((Gameplay-State -Log $portraitLog -Event 'presented') -ne $gameplayState -or
         (Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
         throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'

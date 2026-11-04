@@ -8,6 +8,7 @@
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
 #include "render/renderer_internal.h"
+#include "render/frame_turn.h"
 #include "render/pipeline_cache.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
@@ -196,11 +197,13 @@ typedef struct ResolveConstants
     float verticalScale;
     uint32_t mapping;
     uint32_t reserved;
+    float clipAxes[4];
 } ResolveConstants;
 
 typedef struct UiConstants
 {
     float screenSize[2];
+    float clipAxes[4];
     float reserved[2];
 } UiConstants;
 
@@ -545,6 +548,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t swapchainImageIndex;
     uint32_t swapchainRecreateCount;   // счётчик пересозданий (диагностика)
     bool swapchainDirect;              // кадр рисует прямо в образы цепочки
+    uint32_t frameTurn;                // поворот цели кадра, см. render/frame_turn.h
     // Память этих образов держит цепочка, здесь только представление и layout.
     // Если кадр в них не рисует, представлений нет: образ создан только с
     // VK_IMAGE_USAGE_TRANSFER_DST_BIT, а vkCreateImageView для такого образа
@@ -559,6 +563,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     GpuBuffer captureBuffer;
     uint32_t captureWidth;
     uint32_t captureHeight;
+    uint32_t captureTurn;
 
     // Vulkan пишет константы в кольцо на каждый draw. У инстансного пути все
     // вызовы одного прохода несут один и тот же блок (origin = 0, meshScale =
@@ -1765,11 +1770,11 @@ static bool CreateDescriptorLayouts(Renderer *renderer)
         { BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
     };
     VkDescriptorSetLayoutBinding resolveBindings[] = {
-        { BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { BINDING_PANORAMA_CUBE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        {BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {BINDING_PANORAMA_CUBE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u, VK_SHADER_STAGE_FRAGMENT_BIT,
+         NULL},
+        {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
     };
     VkDescriptorSetLayoutBinding uiBindings[] = {
         { BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
@@ -2511,7 +2516,9 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
             return false;
         }
     }
-    if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, DEPTH_FORMAT,
+    const bool sidesSwapped = (renderer->frameTurn & 1u) != 0u;
+    if (!ImageCreate(renderer, (uint32_t)(sidesSwapped ? height : width),
+                     (uint32_t)(sidesSwapped ? width : height), 1u, DEPTH_FORMAT,
                      DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
                      &renderer->depthTarget))
     {
@@ -2791,6 +2798,25 @@ static bool CreateSwapchainViews(Renderer *renderer)
     return true;
 }
 
+// На сколько четвертей оборота повернуть кадр, чтобы экрану осталось показать образ
+// как есть. extent — кадр в ориентации окна.
+static uint32_t ChooseFrameTurn(const VkSurfaceCapabilitiesKHR *capabilities, VkExtent2D extent)
+{
+    const VkSurfaceTransformFlagBitsKHR transform = capabilities->currentTransform;
+    if (transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)
+        return 2u;
+    if (transform != VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR &&
+        transform != VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)
+        return 0u;
+    // У образов цепочки стороны кадра меняются местами.
+    if (extent.height < capabilities->minImageExtent.width ||
+        extent.height > capabilities->maxImageExtent.width ||
+        extent.width < capabilities->minImageExtent.height ||
+        extent.width > capabilities->maxImageExtent.height)
+        return 0u;
+    return transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? 1u : 3u;
+}
+
 static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
 {
     if (!renderer->hasSurface || renderer->surface == VK_NULL_HANDLE ||
@@ -2838,6 +2864,10 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
                         (capabilities.supportedUsageFlags & directUsage) == directUsage;
     if (!direct && (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u)
         return false;
+    // Копию из отдельной цели не повернуть: кадр поворачивается только сам.
+    const uint32_t frameTurn = direct ? ChooseFrameTurn(&capabilities, extent) : 0u;
+    if ((frameTurn & 1u) != 0u)
+        extent = (VkExtent2D){extent.height, extent.width};
 
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     uint32_t modeCount = 0u;
@@ -2877,12 +2907,11 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
             compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     }
 
-    /* Render targets and camera/UI coordinates already use the window's
-     * current width and height.  Ask the presentation engine to keep those
-     * pixels in that orientation when it supports identity; otherwise retain
-     * its required transform. */
+    // Повёрнутый кадр показывается как есть. Кадр без поворота лежит как окно, и его
+    // поворачивает система, если умеет; иначе остаётся её обязательное преобразование.
     const VkSurfaceTransformFlagBitsKHR preTransform =
-        (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0u
+        frameTurn == 0u &&
+                (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0u
             ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
             : capabilities.currentTransform;
     VkSwapchainCreateInfoKHR swapchainInfo = {
@@ -2968,10 +2997,11 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainExtent = extent;
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
-    // Цепочка рисует без поворота, а экран повёрнут: Android отвечает на такой
+    // Кадр не повёрнут, а экран повёрнут: Android отвечает на такой
     // показ VK_SUBOPTIMAL_KHR всегда, и новая цепочка была бы такой же.
     renderer->swapchainRefitTried = preTransform != capabilities.currentTransform;
     renderer->swapchainDirect = direct;
+    renderer->frameTurn = frameTurn;
     for (uint32_t index = 0; index < actualCount; ++index)
     {
         GpuImage *target = &renderer->swapchainTargets[index];
@@ -5219,20 +5249,19 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         const float clearColor[4] = {
             frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
         };
+        const GpuImage *target = FrameTarget(renderer);
         renderer->currentStats.targetPasses++;
         if (!renderer->useDynamicRendering)
         {
             BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
-                                  false, 0, 0, (uint32_t)renderer->windowWidth,
-                                  (uint32_t)renderer->windowHeight, clearColor);
-            SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                                  (uint32_t)renderer->windowHeight);
+                                  false, 0, 0, target->width, target->height, clearColor);
+            SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
             EndRenderingIfActive(renderer);
             return true;
         }
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = FrameTarget(renderer)->view,
+            .imageView = target->view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -5243,19 +5272,28 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         colorAttachment.clearValue.color.float32[3] = 1.0f;
         VkRenderingInfo renderingInfo = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = { { 0, 0 },
-                            { (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight } },
+            .renderArea = {{0, 0}, {target->width, target->height}},
             .layerCount = 1u,
             .colorAttachmentCount = 1u,
             .pColorAttachments = &colorAttachment,
         };
         renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
+        SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
         renderer->cmdEndRendering(commandBuffer);
     }
     return true;
+}
+
+// Проход рисует в цель кадра, а она может лежать повёрнутой; грани панорамы не
+// повёрнуты, их поворачивает резолв.
+static void SetPassConstants(Renderer *renderer, const RendererScenePass *pass)
+{
+    memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
+    if (!renderer->frame.panorama)
+        FrameTurnMatrix(renderer->chunkConstants.viewProjection, renderer->frameTurn);
+    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 }
 
 void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
@@ -5286,12 +5324,13 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     }
     else
     {
-        colorView = FrameTarget(renderer)->view;
+        const GpuImage *target = FrameTarget(renderer);
+        colorView = target->view;
         depthView = renderer->depthTarget.view;
         x = 0;
         y = 0;
-        width = (uint32_t)renderer->windowWidth;
-        height = (uint32_t)renderer->windowHeight;
+        width = target->width;
+        height = target->height;
     }
     if (width == 0u || height == 0u || colorView == VK_NULL_HANDLE) return;
     if (!renderer->frame.panorama) renderer->currentStats.targetPasses++;
@@ -5310,8 +5349,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height, clearColor);
         SetViewportAndScissor(commandBuffer, x, y, width, height);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
-        memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection,
-               sizeof(float) * 16u);
+        SetPassConstants(renderer, pass);
         return;
     }
 
@@ -5349,10 +5387,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
 
     SetViewportAndScissor(commandBuffer, x, y, width, height);
     BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
-    memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
-    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
-    renderer->instancedConstantsValid = false;
-    renderer->chunkSetBound = false;
+    SetPassConstants(renderer, pass);
 }
 
 static void RecordPanoramaResolve(Renderer *renderer)
@@ -5366,17 +5401,18 @@ static void RecordPanoramaResolve(Renderer *renderer)
         .verticalScale = renderer->frame.resolveVerticalScale,
         .mapping = (uint32_t)renderer->frame.resolveMapping,
     };
+    memcpy(constants.clipAxes, FRAME_TURN_CLIP_AXES[renderer->frameTurn],
+           sizeof(constants.clipAxes));
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
     renderer->currentStats.targetPasses++;
+    const GpuImage *target = FrameTarget(renderer);
 
     if (!renderer->useDynamicRendering)
     {
         BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
-                              false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
+                              false, 0, 0, target->width, target->height, NULL);
+        SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 renderer->resolvePipelineLayout, 0u, 1u,
@@ -5392,22 +5428,20 @@ static void RecordPanoramaResolve(Renderer *renderer)
 
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = FrameTarget(renderer)->view,
+        .imageView = target->view,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
     VkRenderingInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = { { 0, 0 },
-                        { (uint32_t)renderer->windowWidth, (uint32_t)renderer->windowHeight } },
+        .renderArea = {{0, 0}, {target->width, target->height}},
         .layerCount = 1u,
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
     renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
-    SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                          (uint32_t)renderer->windowHeight);
+    SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
     BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->resolvePipelineLayout, 0u, 1u,
@@ -5423,25 +5457,24 @@ static void RecordPanoramaResolve(Renderer *renderer)
 // Проход для интерфейса в кадре, где прохода сцены нет.
 static void BeginUiPass(Renderer *renderer)
 {
+    const GpuImage *target = FrameTarget(renderer);
     renderer->currentStats.targetPasses++;
     if (!renderer->useDynamicRendering)
     {
         BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
-                              false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL);
+                              false, 0, 0, target->width, target->height, NULL);
         return;
     }
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = FrameTarget(renderer)->view,
+        .imageView = target->view,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
     VkRenderingInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = { { 0, 0 },
-                        { (uint32_t)renderer->windowWidth, (uint32_t)renderer->windowHeight } },
+        .renderArea = {{0, 0}, {target->width, target->height}},
         .layerCount = 1u,
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
@@ -5456,6 +5489,8 @@ static void RecordUiLayer(Renderer *renderer)
     UiConstants constants = {
         .screenSize = { (float)renderer->windowWidth, (float)renderer->windowHeight },
     };
+    memcpy(constants.clipAxes, FRAME_TURN_CLIP_AXES[renderer->frameTurn],
+           sizeof(constants.clipAxes));
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
 
@@ -5463,8 +5498,8 @@ static void RecordUiLayer(Renderer *renderer)
     // бы весь кадр в память и тут же прочитал его обратно.
     const bool inScenePass = renderer->renderingActive;
     if (!inScenePass) BeginUiPass(renderer);
-    SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                          (uint32_t)renderer->windowHeight);
+    const GpuImage *target = FrameTarget(renderer);
+    SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
     BindGraphicsPipeline(renderer, commandBuffer,
                          inScenePass ? renderer->uiScenePipeline : renderer->uiPipeline);
     uint32_t dynamicOffsets[2] = { constantOffset, 0u };
@@ -5496,8 +5531,10 @@ static void RecordFrameCapture(Renderer *renderer, VkCommandBuffer commandBuffer
     vkCmdCopyImageToBuffer(commandBuffer, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            renderer->captureBuffer.buffer, 1u, &region);
     HostReadBarrier(commandBuffer);
-    renderer->captureWidth = target->width;
-    renderer->captureHeight = target->height;
+    const bool sidesSwapped = (renderer->frameTurn & 1u) != 0u;
+    renderer->captureWidth = sidesSwapped ? target->height : target->width;
+    renderer->captureHeight = sidesSwapped ? target->width : target->height;
+    renderer->captureTurn = renderer->frameTurn;
     renderer->captureValid = true;
 }
 
@@ -5664,6 +5701,7 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
     outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
     outStats->drawsIntoSwapchain = renderer->swapchainDirect;
+    outStats->frameTurn = renderer->frameTurn;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
@@ -6077,15 +6115,26 @@ bool RendererRequestFrameCapture_Vulkan(Renderer *renderer)
 }
 
 // Кадр отдают как RGBA, цели на экране бывают и BGRA.
+// Кадр читается так, как лежит окно, в каком бы положении он ни был нарисован.
 static void CopyFramePixels(const Renderer *renderer, uint8_t *destination, const uint8_t *source,
-                            size_t bytes)
+                            uint32_t width, uint32_t height, uint32_t turn)
 {
-    memcpy(destination, source, bytes);
+    const size_t bytes = (size_t)width * height * 4u;
+    if (turn == 0u)
+        memcpy(destination, source, bytes);
+    for (uint32_t y = 0u; turn != 0u && y < height; ++y)
+    {
+        uint8_t *row = destination + (size_t)y * width * 4u;
+        for (uint32_t x = 0u; x < width; ++x)
+            memcpy(row + (size_t)x * 4u, source + FrameTurnPixel(turn, width, height, x, y) * 4u,
+                   4u);
+    }
     if (renderer->colorFormat != VK_FORMAT_B8G8R8A8_SRGB) return;
     for (size_t offset = 0u; offset + 4u <= bytes; offset += 4u)
     {
-        destination[offset] = source[offset + 2u];
-        destination[offset + 2u] = source[offset];
+        const uint8_t blue = destination[offset];
+        destination[offset] = destination[offset + 2u];
+        destination[offset + 2u] = blue;
     }
 }
 
@@ -6115,7 +6164,8 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
         return false;
     if (direct)
     {
-        CopyFramePixels(renderer, outPixels, renderer->captureBuffer.mapped, (size_t)required);
+        CopyFramePixels(renderer, outPixels, renderer->captureBuffer.mapped, width, height,
+                        renderer->captureTurn);
         return true;
     }
 
@@ -6141,7 +6191,8 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
     HostReadBarrier(commandBuffer);
     ImageBarrier(commandBuffer, source, VK_IMAGE_ASPECT_COLOR_BIT, originalLayout);
     bool ok = EndImmediate(renderer, commandBuffer);
-    if (ok) CopyFramePixels(renderer, outPixels, readback.mapped, (size_t)required);
+    if (ok)
+        CopyFramePixels(renderer, outPixels, readback.mapped, width, height, 0u);
     BufferDestroy(renderer, &readback);
     return ok;
 }

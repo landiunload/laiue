@@ -5,6 +5,16 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Android a frame is drawn already turned for a rotated screen, so the system
+  no longer rotates every frame of a game held in landscape, which often means
+  one more GPU pass over the screen. The camera, the interface, input and
+  `readbackFrame` still work in window coordinates. Nothing changes on other
+  platforms. The gain has not been measured on a phone.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED` tells whether the last frame was drawn
+  turned, and the Android scenario counts such frames.
+- Without dynamic rendering a change of scene pass drops the cached instanced
+  constants, so the faces of a panorama no longer draw instances with the matrix
+  of the previous face.
 - On Vulkan the interface is drawn in the pass of the scene instead of a pass of
   its own, which a tile GPU pays for by writing the whole frame to memory and
   reading it back. Without dynamic rendering the pass of the scene no longer
