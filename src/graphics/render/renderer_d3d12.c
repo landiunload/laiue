@@ -259,6 +259,9 @@ struct RendererTexture
     Renderer *owner;
     ID3D12Resource *resource;
     uint32_t srvSlot;
+    // Удалённая текстура ждёт, пока GPU пройдёт кадры, которые её читают.
+    struct RendererTexture *nextRetired;
+    UINT64 safeFenceValue;
 };
 
 struct RendererSampler
@@ -414,6 +417,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t                   pendingTextureCount;
     StagingOverflow*           textureStaging;
     uint64_t                   textureStagingBytes;
+    RendererTexture*           retiredTextures;
     // Чанковый пул инстансов, по независимому набору на кадровый слот.
     // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
     // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
@@ -864,6 +868,8 @@ static void PoolReclaimEmptyTail(Renderer* renderer)
     }
 }
 
+static void FreeTexture(Renderer *renderer, RendererTexture *texture);
+
 // Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
 static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
 {
@@ -880,6 +886,19 @@ static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
         renderer->deferredResourceHead =
             (renderer->deferredResourceHead + 1) % DEFERRED_RESOURCE_CAPACITY;
         renderer->deferredResourceCount--;
+    }
+
+    RendererTexture **retired = &renderer->retiredTextures;
+    while (*retired != NULL)
+    {
+        RendererTexture *texture = *retired;
+        if (!releaseEverything && texture->safeFenceValue > completedValue)
+        {
+            retired = &texture->nextRetired;
+            continue;
+        }
+        *retired = texture->nextRetired;
+        FreeTexture(renderer, texture);
     }
 
     while (renderer->deferredRangeCount > 0)
@@ -3023,6 +3042,13 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
         return NULL;
 
     uint32_t srvSlot = AllocateDynamicSrvSlot(renderer);
+    // Слоты могут держать удалённые текстуры, которые ещё читает GPU.
+    if (srvSlot == UINT32_MAX && renderer->retiredTextures != NULL &&
+        !renderer->frameRecording && WaitForGpu(renderer))
+    {
+        DrainDeferredReleases(renderer, false);
+        srvSlot = AllocateDynamicSrvSlot(renderer);
+    }
     if (srvSlot == UINT32_MAX)
         return NULL;
     RendererTexture *texture = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -3287,15 +3313,21 @@ void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
     HeapFree(GetProcessHeap(), 0, sampler);
 }
 
+static void FreeTexture(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture->resource != NULL)
+        ID3D12Resource_Release(texture->resource);
+    if (renderer != NULL)
+        FreeDynamicSrvSlot(renderer, texture->srvSlot);
+    HeapFree(GetProcessHeap(), 0, texture);
+}
+
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
         return;
     if (renderer != NULL && texture->owner != renderer)
         return;
-    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
-        renderer->fenceEvent != NULL)
-        WaitForGpu(renderer);
     if (renderer != NULL)
     {
         // Его пиксели остаются в staging-блоках до следующего кадра.
@@ -3304,12 +3336,19 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
             if (renderer->pendingTextures[i].texture != texture)
                 renderer->pendingTextures[kept++] = renderer->pendingTextures[i];
         renderer->pendingTextureCount = kept;
+        const UINT64 safeFenceValue = renderer->frameRecording
+                                          ? renderer->fenceValues[renderer->frameIndex]
+                                          : renderer->lastSignaledFenceValue;
+        if (renderer->fence != NULL &&
+            safeFenceValue > ID3D12Fence_GetCompletedValue(renderer->fence))
+        {
+            texture->safeFenceValue = safeFenceValue;
+            texture->nextRetired = renderer->retiredTextures;
+            renderer->retiredTextures = texture;
+            return;
+        }
     }
-    if (texture->resource != NULL)
-        ID3D12Resource_Release(texture->resource);
-    if (renderer != NULL)
-        FreeDynamicSrvSlot(renderer, texture->srvSlot);
-    HeapFree(GetProcessHeap(), 0, texture);
+    FreeTexture(renderer, texture);
 }
 
 static bool GeometryAllocationIsResident(const Renderer *renderer,
