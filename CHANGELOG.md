@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On D3D12 a frame reaches the screen 33 ms sooner at 60 Hz: 50 ms instead of
+  83 ms from the start of a frame in a window, 33 ms instead of 66 ms in
+  borderless full screen. The present queue holds two frames instead of three,
+  with the same frame rate under load, and without vertical sync a GPU-bound
+  program gains too: 27 ms instead of 32 ms at 218 frames per second.
 - A program can sleep while nothing changes, instead of drawing the same
   picture at the refresh rate. `WindowDeferNextFrame`, called from a frame,
   holds the next one until a window event, a deadline or `WindowWakeFrame`
