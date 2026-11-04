@@ -5,6 +5,14 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- A program can sleep while nothing changes, instead of drawing the same
+  picture at the refresh rate. `WindowDeferNextFrame`, called from a frame,
+  holds the next one until a window event, a deadline or `WindowWakeFrame`
+  from any thread, and `WindowConsumeRedraw` reports when the system lost the
+  window's picture. Without these calls frames run back to back, as before.
+  The viewer uses them: a picture lying on the screen costs no CPU or GPU
+  time at all, down from 3 % of a core and 9 % of the GPU, and an animated
+  GIF draws only when its frame changes.
 - JPEG decodes twice as fast on one core: a 24-megapixel 4:2:0 photo takes
   75 ms instead of 157 ms, a 4:4:4 one 91 ms instead of 183 ms, and a
   progressive one 216 ms instead of 298 ms. Valid files still match

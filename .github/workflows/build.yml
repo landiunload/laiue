@@ -386,6 +386,13 @@ jobs:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
           VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
         run: ctest --preset linux-vulkan-offscreen-debug --parallel --no-tests=error
+      # Общий прогон идёт без дисплея, и там этот тест пропускается.
+      - name: Test X11 frames on demand (Debug)
+        env:
+          LAIUE_WINDOW_TEST_REQUIRED: '1'
+        run: >
+          timeout 60s xvfb-run -a -s '-screen 0 960x540x24'
+          build/linux-vulkan-offscreen/bin/Debug/laiue_window_frames_test
       # --frames требует настоящее окно, успешные Device V2 submissions и
       # непустую геометрию. Отсутствие X11 не превращает smoke в успешный skip.
       - name: Smoke mesh-world X11 presentation on lavapipe (Debug)

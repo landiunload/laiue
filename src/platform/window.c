@@ -34,6 +34,13 @@ struct Window
     FrameCallback frameCallback;
     void* frameUserData;
     bool frameRunning;
+    // Кадр попросил подождать: WindowRunLoop спит до события или срока.
+    // Тайм-аут сообщения округляется до системного тика, часто 15,6 мс, и
+    // срок считает таймер высокого разрешения.
+    bool frameDeferred;
+    double frameDeferSeconds;
+    HANDLE frameDeferTimer;
+    bool redrawPending;
     uint32_t modalDepth;                 // вложенность модальных циклов
     // Часы кадров: поток, который будит оконную процедуру, пока модальный
     // цикл держит поток окна. Создаются при первом модальном цикле.
@@ -47,6 +54,9 @@ struct Window
 
 #define WINDOW_FRAME_MESSAGE (WM_APP + 1u)
 #define WINDOW_MODAL_FRAME_TIMER 1u
+// Дальний срок ожидания: кадр раньше времени безвреден, а сутки уже влезают
+// и в миллисекунды, и в сотни наносекунд таймера.
+#define WINDOW_LONGEST_DEFER_SECONDS 86400.0
 
 // Политика энергопотребления процесса (WINDOW_POWER_*) и окна модуля, ещё не
 // получившие WM_DESTROY: без окон программе нечему быть в фоне. Политику
@@ -461,6 +471,16 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             }
             return 0;
 
+        case WM_PAINT:
+            // Изображение приносит кадр, а непроверенная область окна
+            // присылала бы WM_PAINT снова и снова.
+            if (window != NULL)
+            {
+                window->redrawPending = true;
+            }
+            ValidateRect(handle, NULL);
+            return 0;
+
         case WM_SYSCHAR:
             // Enter с Alt уже обработан: DefWindowProc искал бы его среди
             // пунктов меню и подавал звуковой сигнал.
@@ -596,6 +616,10 @@ void WindowDestroy(Window* window)
         DestroyWindow(window->handle);
     }
     StopFrameClock(window);
+    if (window->frameDeferTimer != NULL)
+    {
+        CloseHandle(window->frameDeferTimer);
+    }
 
     // Пока живы другие окна класса, вызов не пройдёт (ERROR_CLASS_HAS_WINDOWS)
     // и это нормально; последний уничтоживший — разрегистрирует.
@@ -658,6 +682,35 @@ static bool PumpMessages(Window* window)
     return window->handle != NULL;
 }
 
+// Спит до сообщения окна или срока WindowDeferNextFrame. MWMO_INPUTAVAILABLE
+// будит и сообщением, которое пришло во время кадра.
+static void WaitForDeferredFrame(Window* window)
+{
+    const double seconds = window->frameDeferSeconds;
+    if (seconds < 0.0)
+    {
+        MsgWaitForMultipleObjectsEx(0, NULL, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        return;
+    }
+    if (window->frameDeferTimer == NULL)
+    {
+        window->frameDeferTimer = CreateWaitableTimerExW(NULL, NULL,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    const LARGE_INTEGER due = { .QuadPart = -(LONGLONG)(seconds * 1.0e7) };
+    if (window->frameDeferTimer != NULL
+        && SetWaitableTimer(window->frameDeferTimer, &due, 0, NULL, NULL, FALSE))
+    {
+        MsgWaitForMultipleObjectsEx(1, &window->frameDeferTimer, INFINITE, QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+    }
+    else
+    {
+        MsgWaitForMultipleObjectsEx(0, NULL, (DWORD)(seconds * 1000.0) + 1u, QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+    }
+}
+
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 {
     window->frameCallback = onFrame;
@@ -665,18 +718,43 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
     while (PumpMessages(window))
     {
         UpdateMouseLookState(window);
+        window->frameDeferred = false;
         RunFrame(window);
 
         // В фокусе ожидание кадра при необходимости происходит в Present:
         // дополнительный сон мешал бы vsync и ограничивал режим без него.
         // Вне фокуса — экономный режим: ~20 кадров в секунду.
-        if (!window->focused)
+        if (window->frameDeferred)
+        {
+            WaitForDeferredFrame(window);
+        }
+        else if (!window->focused)
         {
             MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
         }
     }
     window->frameCallback = NULL;
     window->frameUserData = NULL;
+}
+
+void WindowDeferNextFrame(Window* window, double seconds)
+{
+    const double limited = seconds > WINDOW_LONGEST_DEFER_SECONDS
+        ? WINDOW_LONGEST_DEFER_SECONDS : seconds;
+    window->frameDeferred = true;
+    window->frameDeferSeconds = limited >= 0.0 ? limited : -1.0;
+}
+
+void WindowWakeFrame(Window* window)
+{
+    PostMessageW(window->handle, WM_NULL, 0, 0);
+}
+
+bool WindowConsumeRedraw(Window* window)
+{
+    const bool pending = window->redrawPending;
+    window->redrawPending = false;
+    return pending;
 }
 
 void WindowSetMouseLook(Window* window, bool enabled)

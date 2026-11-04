@@ -51,6 +51,20 @@ LAIUE_WINDOW_API bool    WindowConsumeFocusLoss(Window* window);
 // перетаскивают или меняют его размер: тогда onFrame вызывается из оконной
 // процедуры по таймеру.
 LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
+// Программе нечего показывать: следующий onFrame придёт с первым событием
+// окна, после WindowWakeFrame или через seconds секунд, смотря что раньше.
+// Отрицательное значение — срока нет. Вызывается из onFrame и действует на
+// один кадр, без этого вызова кадры идут подряд. Событие — любое сообщение
+// системы, даже движение мыши, поэтому кадр сам решает, нужно ли рисовать.
+LAIUE_WINDOW_API void    WindowDeferNextFrame(Window* window, double seconds);
+// Заканчивает ожидание WindowDeferNextFrame из любого потока, пока окно живо:
+// так фоновая работа сообщает, что есть что показать. Вызов во время кадра
+// не теряется.
+LAIUE_WINDOW_API void    WindowWakeFrame(Window* window);
+// true один раз после того, как система потеряла изображение окна или
+// показала окно заново. Программе, которая рисует только изменения, нужен
+// кадр даже без них.
+LAIUE_WINDOW_API bool    WindowConsumeRedraw(Window* window);
 LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
 // Позиция курсора в клиентских координатах окна (для интерфейса);

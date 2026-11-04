@@ -257,6 +257,13 @@ if(LAIUE_NATIVE_MODS_ENABLED)
         BOOTSTRAP DEPENDS laiue_module_provider laiue_module_consumer
         TEST laiue.mod.module_host)
 
+    if(TARGET laiue_window AND laiue_shared_modules)
+        laiue_add_harness(laiue_window_frames_test WindowFramesTestEntryPoint
+            window_frames_test.c BOOTSTRAP DEPENDS laiue_window
+            TEST laiue.platform.window_frames TIMEOUT 30)
+        set_tests_properties(laiue.platform.window_frames PROPERTIES SKIP_RETURN_CODE 125)
+    endif()
+
     if(TARGET laiue_audio AND TARGET laiue_ui AND TARGET laiue_voxel_render AND
        TARGET laiue_window AND TARGET laiue_input AND laiue_shared_modules)
         set(laiue_optional_definitions)
