@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan the interface is drawn in the pass of the scene instead of a pass of
+  its own, which a tile GPU pays for by writing the whole frame to memory and
+  reading it back. Without dynamic rendering the pass of the scene no longer
+  loads the last contents of its targets just to clear them.
 - On Vulkan a frame is drawn straight into the swap chain image, without two
   extra colour targets and a copy of the whole screen in every frame. That copy
   costs a phone GPU the most, but a phone has not been measured. Foxity on Windows

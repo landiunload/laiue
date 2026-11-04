@@ -1153,6 +1153,29 @@ static void WindowedFrames(const LaiueGraphicsDeviceServiceV2 *service)
 }
 #endif
 
+static void InterfaceOverScene(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("the interface covers the scene of its frame, and only where it lies");
+    static const uint8_t atlas[1] = {255u};
+    Expect(device->setUiFontAtlas(device, atlas, 1u, 1u) != 0u, "the interface atlas is accepted");
+    for (uint32_t i = 0u; i < SPILL_VERTEX_COUNT; ++i)
+        spillVertices[i] = vertices[i % 3u];
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    const LaiueGraphicsUiQuadV1 quad = {
+        .rect = {0.0f, 0.0f, 72.0f, (float)FRAME_HEIGHT},
+        .colorRGBA = UINT32_C(0xffff0000),
+    };
+    Begin(device);
+    Submit(device, &item);
+    Expect(device->submitUi(device, &quad, 1u) != 0u, "the interface is submitted");
+    Capture(device, 2u);
+    ColorAt(0.4375f, -0.1042f, UINT32_C(0xffff0000), "the interface covers the triangle");
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the scene stays beside the interface");
+    device->destroyHandle(device, buffer);
+}
+
 static void BurstMemoryReturns(LaiueGraphicsDeviceV2 *device)
 {
     Stage("the upload arena of a burst goes back when frames stop using it");
@@ -1275,6 +1298,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         StagingSpill(device);
         UploadsWithoutFrames(device);
         BurstMemoryReturns(device);
+        InterfaceOverScene(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         SwapChainRebuilds(service, device);
 #elif defined(_WIN32)

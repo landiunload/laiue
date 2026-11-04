@@ -23,6 +23,9 @@ typedef struct RendererStats
     uint32_t scenePasses;
     uint32_t swapchainRebuilds;
     bool drawsIntoSwapchain;
+    // Vulkan: проходы кадра по его цели. Каждый лишний проход тайловый GPU оплачивает
+    // записью всего кадра в память и чтением обратно.
+    uint32_t targetPasses;
 } RendererStats;
 
 // Latest completed GPU frame interval. Results are delayed until the backend's
