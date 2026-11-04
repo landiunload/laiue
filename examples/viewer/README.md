@@ -58,6 +58,20 @@ a page turn the program draws a few frames more, because the graphics module
 releases a texture only once the GPU has finished with it. Another thread ends
 the wait with `wakeFrame`. A game simply never calls `deferNextFrame`.
 
+## Reading ahead
+
+Reading and decoding take three quarters of a page turn and need no graphics
+device, so the neighbour in the direction of browsing is read on its own
+thread, mip chain included. A page turn then only hands the picture to the GPU:
+about 40 ms for a 24-megapixel photo instead of 200 to 300 ms. If the wrong
+picture is being read, as after turning back, the thread wakes the window when
+it finishes, and the next frame starts the right one.
+
+The program holds at most one picture this way. It costs that picture's pixels
+in memory, and anything over 1 GiB decoded, or 256 MiB on Android, is read only
+when asked for. If reading ahead fails, the page turn reads the picture as
+usual, so errors look the same.
+
 ## Build
 
 Desktop builds need modules as shared libraries, the default:

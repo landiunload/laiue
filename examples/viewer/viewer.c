@@ -26,11 +26,14 @@
 #include <string.h>
 
 // Сторона текстуры: всё крупнее уменьшается при загрузке. На телефоне
-// предел ниже — там это ещё и экономия памяти.
+// предел ниже — там это ещё и экономия памяти. Картинка больше READ_AHEAD_BYTES
+// не читается заранее: памяти она займёт много, а открыть её могут и не захотеть.
 #if defined(__ANDROID__)
 #define MAX_SIDE 4096u
+#define READ_AHEAD_BYTES (UINT32_C(256) << 20)
 #else
 #define MAX_SIDE 8192u
+#define READ_AHEAD_BYTES (UINT32_C(1) << 30)
 #endif
 #define MAX_FILE_BYTES (UINT64_C(512) << 20)
 #define MAX_FILES 65536u
@@ -67,9 +70,27 @@ typedef struct LoadedPicture
     ImageInfo info;
     uint8_t *pixels;           // все кадры в размере файла
     uint8_t *reduced;          // первый кадр, уменьшенный до MAX_SIDE
-    bool reductionFailed;
+    uint8_t *chain;            // mip-уровни от второго, один за другим
+    bool outOfMemory;
     uint32_t width, height;    // размер текстуры
+    wchar_t path[LAIUE_PLATFORM_PATH_CAPACITY];
 } LoadedPicture;
+
+typedef struct Viewer Viewer;
+
+// Поток чтения: первую картинку он читает, пока драйвер создаёт устройство, а
+// дальше соседнюю, заранее. Чтение — три четверти времени перелистывания, и
+// видеокарта ему не нужна.
+typedef struct Reader
+{
+    Viewer *viewer;
+    PlatformThread thread;
+    LoadedPicture loaded;
+    bool running;  // поток запущен, и его ещё не дождались
+    bool holding;  // loaded занято: читается или ждёт, когда его заберут
+    bool ahead;    // читается заранее, а не по запросу
+    volatile uint32_t done;
+} Reader;
 
 // Всё, от чего зависит изображение: кадр рисуется, только когда это изменилось.
 typedef struct View
@@ -79,7 +100,7 @@ typedef struct View
     uint32_t turns, hideBar, current, frame;
 } View;
 
-typedef struct Viewer
+struct Viewer
 {
     LaiueModuleHost *host;
     const LaiueWindowServiceV1 *windows;
@@ -96,8 +117,11 @@ typedef struct Viewer
     void *uiContext;
     LaiueGraphicsHandle vertices, indices, sampler;
     Picture picture;
+    Reader reader;
     Files files;
     uint32_t current;
+    bool forward; // куда листают: туда же читается следующая картинка
+    bool deferrable; // модуль окна умеет ждать событий
     wchar_t directory[LAIUE_PLATFORM_PATH_CAPACITY];
     char caption[CAPTION_BYTES];
     // Вид: масштаб в пикселях экрана на пиксель картинки, точка повёрнутой
@@ -112,7 +136,7 @@ typedef struct Viewer
     View drawn;          // что на экране
     uint32_t framesLeft; // столько кадров ещё нарисовать
     LaiueUiQuadV1 quads[LAIUE_GRAPHICS_UI_MAX_QUADS];
-} Viewer;
+};
 
 static bool Has(uint32_t actual, uint32_t declared, size_t offset, size_t bytes)
 {
@@ -419,15 +443,52 @@ static void ReleasePicture(Viewer *viewer)
     memset(&viewer->picture, 0, sizeof(viewer->picture));
 }
 
-// Текстура с mip-цепочкой: уменьшенная картинка без неё рябит. Уровни
-// строятся по очереди в двух буферах: каждый следующий вчетверо меньше,
-// и тот, из которого читают, никогда не совпадает с тем, куда пишут.
-static bool Upload(Viewer *viewer, const uint8_t *pixels, uint32_t width, uint32_t height,
-                   bool mipmaps)
+static uint32_t MipLevels(uint32_t width, uint32_t height)
 {
     uint32_t levels = 1u;
-    while (mipmaps && ((width | height) >> levels) != 0u)
+    while (((width | height) >> levels) != 0u)
         ++levels;
+    return levels;
+}
+
+static size_t MipBytes(uint32_t width, uint32_t height, uint32_t mip)
+{
+    const uint32_t mipWidth = width >> mip;
+    const uint32_t mipHeight = height >> mip;
+    return (size_t)(mipWidth != 0u ? mipWidth : 1u) * (mipHeight != 0u ? mipHeight : 1u) * 4u;
+}
+
+// Уровни от второго один за другим в одном блоке: уменьшенная картинка без
+// них рябит. Каждый следующий считается из предыдущего.
+static uint8_t *BuildChain(const uint8_t *pixels, uint32_t width, uint32_t height)
+{
+    const uint32_t levels = MipLevels(width, height);
+    size_t bytes = 0u;
+    for (uint32_t mip = 1u; mip < levels; ++mip)
+        bytes += MipBytes(width, height, mip);
+    uint8_t *chain = bytes != 0u ? (uint8_t *)PlatformAllocate(bytes, false) : NULL;
+    if (chain == NULL)
+        return NULL;
+    const uint8_t *source = pixels;
+    uint8_t *target = chain;
+    uint32_t sourceWidth = width;
+    uint32_t sourceHeight = height;
+    for (uint32_t mip = 1u; mip < levels; ++mip)
+    {
+        const uint32_t targetWidth = sourceWidth > 1u ? sourceWidth / 2u : 1u;
+        const uint32_t targetHeight = sourceHeight > 1u ? sourceHeight / 2u : 1u;
+        ImageResample(source, sourceWidth, sourceHeight, target, targetWidth, targetHeight);
+        source = target;
+        target += MipBytes(width, height, mip);
+        sourceWidth = targetWidth;
+        sourceHeight = targetHeight;
+    }
+    return chain;
+}
+
+static bool Upload(Viewer *viewer, const uint8_t *pixels, const uint8_t *chain, uint32_t width,
+                   uint32_t height, uint32_t levels)
+{
     const LaiueGraphicsTextureDescV1 description = {
         .structSize = sizeof(description),
         .format = LAIUE_GRAPHICS_FORMAT_RGBA8_SRGB,
@@ -437,38 +498,21 @@ static bool Upload(Viewer *viewer, const uint8_t *pixels, uint32_t width, uint32
     LaiueGraphicsHandle texture = 0u;
     if (!viewer->device->createTexture(viewer->device, &description, &texture))
         return false;
-    const uint32_t width1 = width > 1u ? width / 2u : 1u;
-    const uint32_t height1 = height > 1u ? height / 2u : 1u;
-    const size_t bytes1 = (size_t)width1 * height1 * 4u;
-    const size_t bytes2 =
-        (size_t)(width1 > 1u ? width1 / 2u : 1u) * (height1 > 1u ? height1 / 2u : 1u) * 4u;
-    uint8_t *chain = levels > 1u ? (uint8_t *)PlatformAllocate(bytes1 + bytes2, false) : NULL;
-    bool uploaded = levels == 1u || chain != NULL;
+    bool uploaded = true;
     const uint8_t *level = pixels;
-    uint32_t levelWidth = width;
-    uint32_t levelHeight = height;
     for (uint32_t mip = 0u; uploaded && mip < levels; ++mip)
     {
-        if (mip != 0u)
-        {
-            const uint32_t nextWidth = levelWidth > 1u ? levelWidth / 2u : 1u;
-            const uint32_t nextHeight = levelHeight > 1u ? levelHeight / 2u : 1u;
-            uint8_t *next = level == chain ? chain + bytes1 : chain;
-            ImageResample(level, levelWidth, levelHeight, next, nextWidth, nextHeight);
-            level = next;
-            levelWidth = nextWidth;
-            levelHeight = nextHeight;
-        }
+        const size_t bytes = MipBytes(width, height, mip);
         const LaiueGraphicsTextureUploadV1 upload = {
             .structSize = sizeof(upload),
             .texture = texture,
             .data = level,
-            .sizeBytes = (uint64_t)levelWidth * levelHeight * 4u,
+            .sizeBytes = bytes,
             .mipLevel = mip,
         };
         uploaded = viewer->device->uploadTexture(viewer->device, &upload) != 0u;
+        level = mip == 0u ? chain : level + bytes;
     }
-    PlatformFree(chain);
     if (!uploaded)
     {
         viewer->device->destroyHandle(viewer->device, texture);
@@ -487,19 +531,27 @@ static void SetCaption(Viewer *viewer, const char *text, const char *detail)
     Append(viewer->caption, sizeof(viewer->caption), detail);
 }
 
-// Читает и распаковывает картинку, уменьшает её до MAX_SIDE. Видеокарта
-// здесь не нужна, поэтому первая картинка идёт в своём потоке.
-static void ReadPicture(const Viewer *viewer, uint32_t index, LoadedPicture *loaded)
+// Анимация идёт кадрами из памяти: уменьшенный GIF показывает первый.
+static bool Animated(const LoadedPicture *loaded)
 {
-    static wchar_t path[LAIUE_PLATFORM_PATH_CAPACITY];
+    return loaded->info.frameCount > 1u && loaded->reduced == NULL;
+}
+
+// Читает и распаковывает картинку, уменьшает её до MAX_SIDE и строит
+// mip-цепочку. Видеокарта здесь не нужна, поэтому всё это идёт и в своём потоке.
+static void ReadPicture(const Viewer *viewer, uint32_t index, LoadedPicture *loaded,
+                        uint32_t mostPixelBytes)
+{
     uint8_t *bytes = NULL;
     uint64_t size = 0u;
     ImageInfo *info = &loaded->info;
     loaded->index = index;
     loaded->status = IMAGE_TRUNCATED;
-    if (FilePath(viewer, index, path) &&
-        PlatformReadEntireFile(path, MAX_FILE_BYTES, &bytes, &size))
+    if (FilePath(viewer, index, loaded->path) &&
+        PlatformReadEntireFile(loaded->path, MAX_FILE_BYTES, &bytes, &size))
         loaded->status = ImageInspect(bytes, (uint32_t)size, info);
+    if (loaded->status == IMAGE_OK && info->pixelBytes > mostPixelBytes)
+        loaded->status = IMAGE_TOO_LARGE;
     if (loaded->status == IMAGE_OK)
     {
         loaded->pixels = (uint8_t *)PlatformAllocate(info->pixelBytes, false);
@@ -526,15 +578,67 @@ static void ReadPicture(const Viewer *viewer, uint32_t index, LoadedPicture *loa
         loaded->height = height == 0u ? 1u : height;
         loaded->reduced =
             (uint8_t *)PlatformAllocate((size_t)loaded->width * loaded->height * 4u, false);
-        loaded->reductionFailed = loaded->reduced == NULL;
-        if (loaded->reduced != NULL)
-            ImageResample(loaded->pixels, info->width, info->height, loaded->reduced,
-                          loaded->width, loaded->height);
+        loaded->outOfMemory = loaded->reduced == NULL;
+        if (loaded->outOfMemory)
+            return;
+        ImageResample(loaded->pixels, info->width, info->height, loaded->reduced, loaded->width,
+                      loaded->height);
+        PlatformFree(loaded->pixels);
+        loaded->pixels = NULL;
+    }
+    if (!Animated(loaded) && MipLevels(loaded->width, loaded->height) > 1u)
+    {
+        const uint8_t *first = loaded->reduced != NULL ? loaded->reduced : loaded->pixels;
+        loaded->chain = BuildChain(first, loaded->width, loaded->height);
+        loaded->outOfMemory = loaded->chain == NULL;
     }
 }
 
-// Отдаёт прочитанную картинку видеокарте и забирает её память. Mip-цепочка
-// строится здесь же; кадры GIF остаются в памяти для анимации.
+static uint32_t ReadInThread(void *context)
+{
+    Reader *reader = (Reader *)context;
+    ReadPicture(reader->viewer, reader->loaded.index, &reader->loaded,
+                reader->ahead ? READ_AHEAD_BYTES : UINT32_MAX);
+    PlatformAtomicStoreU32Release(&reader->done, 1u);
+    // Прочитанное зря ждёт кадра, который его отдаст и прочитает нужное.
+    if (reader->ahead && reader->viewer->deferrable)
+        reader->viewer->windows->wakeFrame(reader->viewer->window);
+    return 0u;
+}
+
+static bool StartReading(Viewer *viewer, uint32_t index, bool ahead)
+{
+    Reader *reader = &viewer->reader;
+    memset(&reader->loaded, 0, sizeof(reader->loaded));
+    reader->viewer = viewer;
+    reader->loaded.index = index;
+    reader->ahead = ahead;
+    PlatformAtomicStoreU32Release(&reader->done, 0u);
+    reader->running = PlatformThreadStart(&reader->thread, ReadInThread, reader);
+    reader->holding = reader->running;
+    return reader->running;
+}
+
+static void FinishReading(Reader *reader)
+{
+    if (reader->running)
+        PlatformThreadJoin(&reader->thread);
+    reader->running = false;
+}
+
+static void DropRead(Reader *reader)
+{
+    FinishReading(reader);
+    if (!reader->holding)
+        return;
+    PlatformFree(reader->loaded.pixels);
+    PlatformFree(reader->loaded.reduced);
+    PlatformFree(reader->loaded.chain);
+    reader->holding = false;
+}
+
+// Отдаёт прочитанную картинку видеокарте и забирает её память. Кадры GIF
+// остаются в памяти для анимации.
 static bool ShowLoaded(Viewer *viewer, LoadedPicture *loaded)
 {
     const uint32_t index = loaded->index;
@@ -550,12 +654,14 @@ static bool ShowLoaded(Viewer *viewer, LoadedPicture *loaded)
         return false;
     }
 
-    // Анимация идёт кадрами из памяти: уменьшенный GIF показывает первый.
-    const bool animated = info->frameCount > 1u && loaded->reduced == NULL;
+    const bool animated = Animated(loaded);
     const uint8_t *first = loaded->reduced != NULL ? loaded->reduced : loaded->pixels;
-    const bool uploaded = !loaded->reductionFailed &&
-                          Upload(viewer, first, loaded->width, loaded->height, !animated);
+    const bool uploaded =
+        !loaded->outOfMemory &&
+        Upload(viewer, first, loaded->chain, loaded->width, loaded->height,
+               animated ? 1u : MipLevels(loaded->width, loaded->height));
     PlatformFree(loaded->reduced);
+    PlatformFree(loaded->chain);
     if (uploaded && animated)
     {
         viewer->picture.frames = loaded->pixels;
@@ -586,7 +692,7 @@ static bool LoadPicture(Viewer *viewer, uint32_t index)
     ReleasePicture(viewer);
     static LoadedPicture loaded;
     memset(&loaded, 0, sizeof(loaded));
-    ReadPicture(viewer, index, &loaded);
+    ReadPicture(viewer, index, &loaded, UINT32_MAX);
     return ShowLoaded(viewer, &loaded);
 }
 
@@ -611,7 +717,10 @@ static bool ShowPattern(Viewer *viewer)
             pixel[3] = 255u;
         }
     ReleasePicture(viewer);
-    const bool uploaded = Upload(viewer, pixels, SIDE, SIDE, true);
+    uint8_t *chain = BuildChain(pixels, SIDE, SIDE);
+    const bool uploaded =
+        chain != NULL && Upload(viewer, pixels, chain, SIDE, SIDE, MipLevels(SIDE, SIDE));
+    PlatformFree(chain);
     PlatformFree(pixels);
     viewer->picture.sourceWidth = SIDE;
     viewer->picture.sourceHeight = SIDE;
@@ -624,10 +733,45 @@ static bool ShowPattern(Viewer *viewer)
     return uploaded;
 }
 
+// Картинка, которая уже читается, берётся из потока: дождаться его быстрее, чем
+// читать её заново. Если заранее прочитать не вышло, обычное чтение объяснит почему.
 static void Show(Viewer *viewer, uint32_t index)
 {
-    if (index < viewer->files.count && index != viewer->current)
-        (void)LoadPicture(viewer, index);
+    if (index >= viewer->files.count || index == viewer->current)
+        return;
+    viewer->forward = index > viewer->current;
+    Reader *reader = &viewer->reader;
+    if (reader->holding && reader->loaded.index == index)
+    {
+        FinishReading(reader);
+        if (reader->loaded.status == IMAGE_OK)
+        {
+            ReleasePicture(viewer);
+            (void)ShowLoaded(viewer, &reader->loaded);
+            reader->holding = false;
+            return;
+        }
+        DropRead(reader);
+    }
+    (void)LoadPicture(viewer, index);
+}
+
+// Читает заранее картинку, к которой перейдут дальше: следующую в сторону
+// листания, а у края списка — соседнюю с другой стороны.
+static void ReadAhead(Viewer *viewer)
+{
+    Reader *reader = &viewer->reader;
+    const uint32_t current = viewer->current;
+    if (viewer->smoke || viewer->files.count < 2u || current >= viewer->files.count ||
+        (reader->running && PlatformAtomicLoadU32Acquire(&reader->done) == 0u))
+        return;
+    uint32_t next = viewer->forward ? current + 1u : current - 1u;
+    if (next >= viewer->files.count)
+        next = viewer->forward ? current - 1u : current + 1u;
+    if (reader->holding && reader->loaded.index == next)
+        return;
+    DropRead(reader);
+    (void)StartReading(viewer, next, true);
 }
 
 // Сколько показывать текущий кадр GIF: кадр без задержки идёт, как в
@@ -939,10 +1083,7 @@ static void Frame(void *context)
     const LaiueWindowServiceV1 *windows = viewer->windows;
     if (windows->consumeFocusLoss(viewer->window))
         viewer->inputs->resetState(viewer->input);
-    const bool deferrable =
-        Has(viewer->windowBytes, windows->structSize, offsetof(LaiueWindowServiceV1, consumeRedraw),
-            sizeof(windows->consumeRedraw));
-    const bool onDemand = deferrable && !viewer->smoke;
+    const bool onDemand = viewer->deferrable && !viewer->smoke;
     int32_t width = 0;
     int32_t height = 0;
     windows->getClientSize(viewer->window, &width, &height);
@@ -968,6 +1109,7 @@ static void Frame(void *context)
     HandlePointer(viewer, now);
     viewer->inputs->endFrame(viewer->input);
     Animate(viewer, now);
+    ReadAhead(viewer);
 
     // Без изменений на экране остаётся прежнее изображение: окно спит до
     // события или до следующего кадра анимации.
@@ -1022,7 +1164,7 @@ static void Frame(void *context)
         PlatformWriteConsoleUtf8(viewer->failed ? "viewer: the frame is empty\n"
                                                 : "viewer: the picture is on screen\n");
         // Перед выходом окно проходит ожидание: так оно работает и в CI.
-        if (deferrable)
+        if (viewer->deferrable)
             windows->deferNextFrame(viewer->window, 0.01);
         else
             windows->requestClose(viewer->window);
@@ -1201,21 +1343,6 @@ static void InputFromWindow(void *context, void *raw)
     viewer->inputs->handleRawInput(viewer->input, raw);
 }
 
-// Первая картинка читается, пока драйвер создаёт устройство: на это уходит
-// больше времени, чем на распаковку снимка, а окну она до устройства не нужна.
-typedef struct FirstPicture
-{
-    const Viewer *viewer;
-    LoadedPicture loaded;
-} FirstPicture;
-
-static uint32_t ReadFirstPicture(void *context)
-{
-    FirstPicture *first = (FirstPicture *)context;
-    ReadPicture(first->viewer, first->loaded.index, &first->loaded);
-    return 0u;
-}
-
 // Окно, ввод, графика и интерфейс поверх загруженных модулей. Без модуля
 // интерфейса картинка показывается без подписи.
 static bool Open(Viewer *viewer)
@@ -1234,6 +1361,9 @@ static bool Open(Viewer *viewer)
             offsetof(LaiueWindowServiceV1, setSurfaceCallback),
             sizeof(viewer->windows->setSurfaceCallback)))
         viewer->windows->setSurfaceCallback(viewer->window, SurfaceChanged, viewer);
+    viewer->deferrable =
+        Has(viewer->windowBytes, viewer->windows->structSize,
+            offsetof(LaiueWindowServiceV1, consumeRedraw), sizeof(viewer->windows->consumeRedraw));
     viewer->windows->getClientSize(viewer->window, &viewer->width, &viewer->height);
     const LaiueGraphicsDeviceServiceV2 *graphics = viewer->graphics;
     const uint32_t created =
@@ -1284,12 +1414,10 @@ int main(int argumentCount, char **arguments)
         if (Equal(FileName(&viewer, index), selected))
             firstIndex = index;
 
-    static FirstPicture firstPicture;
-    firstPicture.viewer = &viewer;
-    firstPicture.loaded.index = firstIndex;
-    PlatformThread reader;
-    const bool reading = viewer.files.count != 0u &&
-                         PlatformThreadStart(&reader, ReadFirstPicture, &firstPicture);
+    // Первая картинка читается, пока драйвер создаёт устройство: на это уходит
+    // больше времени, чем на распаковку снимка.
+    viewer.forward = true;
+    const bool reading = viewer.files.count != 0u && StartReading(&viewer, firstIndex, false);
 
     // Под Windows сначала D3D12, затем Vulkan; остальные системы — Vulkan.
     static const char *const providers[][2] = {
@@ -1305,13 +1433,17 @@ int main(int argumentCount, char **arguments)
         if (!opened)
             Unload(&viewer);
     }
-    if (reading)
-        PlatformThreadJoin(&reader);
+    FinishReading(&viewer.reader);
     bool failed = !opened;
     if (opened)
     {
         viewer.current = UINT32_MAX;
-        bool shown = reading && ShowLoaded(&viewer, &firstPicture.loaded);
+        bool shown = false;
+        if (reading)
+        {
+            shown = ShowLoaded(&viewer, &viewer.reader.loaded);
+            viewer.reader.holding = false;
+        }
         for (uint32_t index = firstIndex + (reading ? 1u : 0u);
              !shown && index < viewer.files.count; ++index)
             shown = LoadPicture(&viewer, index);
@@ -1323,10 +1455,9 @@ int main(int argumentCount, char **arguments)
     }
     else
     {
-        PlatformFree(firstPicture.loaded.pixels);
-        PlatformFree(firstPicture.loaded.reduced);
         PlatformWriteConsoleUtf8("viewer: no window and graphics modules could start\n");
     }
+    DropRead(&viewer.reader);
     Unload(&viewer);
     PlatformFree(viewer.files.offsets);
     PlatformFree(viewer.files.text);
