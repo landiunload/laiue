@@ -113,6 +113,11 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
 // когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
+// оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
+// предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
+// кадре до него GPU не ждёт.
+#define GEOMETRY_STAGING_LIMIT_BYTES (UINT64_C(32) << 20)
 // Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
 // загрузок много, накопленное копируется сразу: иначе подготовка большой
 // сцены держала бы все её пиксели в памяти дважды.
@@ -443,6 +448,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
     StagingOverflow *stagingOverflow[FRAME_COUNT];
+    uint64_t stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
     uint32_t pendingTextureCount;
     StagingOverflow *textureStaging;
@@ -725,6 +731,7 @@ static void ReleaseStagingChain(Renderer *renderer, StagingOverflow **head)
 static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
 {
     ReleaseStagingChain(renderer, &renderer->stagingOverflow[frameIndex]);
+    renderer->stagingOverflowBytes[frameIndex] = 0u;
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -3790,6 +3797,7 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
                         &mapped))
         return false;
     memcpy(mapped, data, sizeBytes);
+    renderer->stagingOverflowBytes[renderer->frameIndex] += sizeBytes;
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -3851,6 +3859,8 @@ static bool EnsureVulkanLargeMeshBuffer(Renderer *renderer, uint32_t frameIndex)
                         &renderer->largeMeshUploadBuffers[frameIndex]);
 }
 
+static bool FlushUploads(Renderer *renderer);
+
 static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, const void *data,
                                                           uint32_t sizeBytes,
                                                           size_t allocationBytes)
@@ -3858,6 +3868,9 @@ static GeometryAllocation *CreateGeometryFromBytes_Vulkan(Renderer *renderer, co
     if (renderer == NULL || !renderer->worldReady || data == NULL || sizeBytes == 0u ||
         renderer->frameRecording || renderer->deviceFailed ||
         !EnsureVulkanUploadSlotReady(renderer) || !ReservePendingUpload(renderer))
+        return NULL;
+    if (renderer->stagingOverflowBytes[renderer->frameIndex] >= GEOMETRY_STAGING_LIMIT_BYTES &&
+        !FlushUploads(renderer))
         return NULL;
 
     // Сначала то, что откатывается без следа, затем диапазон пула и staging.
@@ -4065,23 +4078,6 @@ static void RetireTextureStaging(Renderer *renderer)
     renderer->textureStagingBytes = 0u;
 }
 
-// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging-блоки.
-static bool FlushTextureUploads(Renderer *renderer)
-{
-    if (renderer->pendingTextureCount != 0u)
-    {
-        VkCommandBuffer commandBuffer = BeginImmediate(renderer);
-        if (commandBuffer == VK_NULL_HANDLE)
-            return false;
-        RecordTextureUploads(renderer, commandBuffer);
-        if (!EndImmediate(renderer, commandBuffer))
-            return false;
-    }
-    ReleaseStagingChain(renderer, &renderer->textureStaging);
-    renderer->textureStagingBytes = 0u;
-    return true;
-}
-
 bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                   const void *data, uint64_t sizeBytes,
                                   uint32_t rowPitchBytes)
@@ -4109,7 +4105,7 @@ bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *textur
         return false;
     if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
          renderer->textureStagingBytes + sizeBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
-        !FlushTextureUploads(renderer))
+        !FlushUploads(renderer))
         return false;
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceSize offset = 0u;
@@ -4768,11 +4764,10 @@ static void RecordPendingUploadBatch(Renderer *renderer, VkCommandBuffer command
     }
 }
 
-static void RecordPendingUploads(Renderer *renderer)
+static void RecordPendingUploads(Renderer *renderer, VkCommandBuffer commandBuffer)
 {
     if (renderer->pendingUploadCount == 0u) return;
 
-    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
     VkBufferCopy *regions = renderer->uploadRegionScratch;
     VkBuffer staging = VK_NULL_HANDLE;
     VkBuffer destination = VK_NULL_HANDLE;
@@ -4822,6 +4817,34 @@ static void RecordPendingUploads(Renderer *renderer)
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                          0, 1u, &barrier, 0, NULL, 0, NULL);
+}
+
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging. Запись,
+// заменённая до кадра, здесь не отменяется, и её диапазон пула ждёт отправок,
+// которых без кадров нет. После простоя очереди не нужен никто из них.
+static bool FlushUploads(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount != 0u || renderer->pendingTextureCount != 0u)
+    {
+        VkCommandBuffer commandBuffer = BeginImmediate(renderer);
+        if (commandBuffer == VK_NULL_HANDLE)
+            return false;
+        RecordPendingUploads(renderer, commandBuffer);
+        RecordTextureUploads(renderer, commandBuffer);
+        if (!EndImmediate(renderer, commandBuffer))
+        {
+            FailVulkanDevice(renderer);
+            return false;
+        }
+        renderer->recordedUploadCount = 0u;
+        renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
+        renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
+        ReleaseStagingOverflow(renderer, renderer->frameIndex);
+        DrainDeferredReleases(renderer, true);
+    }
+    ReleaseStagingChain(renderer, &renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    return true;
 }
 
 bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *frame)
@@ -4900,7 +4923,7 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     renderer->boundIndexBuffer = VK_NULL_HANDLE;
     renderer->boundIndexOffset = 0u;
 
-    RecordPendingUploads(renderer);
+    RecordPendingUploads(renderer, commandBuffer);
     RecordTextureUploads(renderer, commandBuffer);
     RetireTextureStaging(renderer);
 
