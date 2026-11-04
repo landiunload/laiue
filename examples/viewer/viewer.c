@@ -137,7 +137,8 @@ struct Viewer
     bool fitted, shapeChanged, hideBar, pressed, smoke, failed;
     float pressX, pressY, travel, clickX, clickY;
     double lastTime, clickTime;
-    int32_t width, height, atlasWidth, atlasHeight;
+    int32_t width, height;
+    const uint8_t *atlas; // атлас шрифта, который уже у графики
     uint32_t frames;
     View drawn;          // что на экране
     uint32_t framesLeft; // столько кадров ещё нарисовать
@@ -1047,8 +1048,9 @@ static bool DrawPicture(Viewer *viewer)
     return viewer->device->submit(viewer->device, &draw, 1u) != 0u;
 }
 
-// Подпись строится до кадра: шрифт перепекается под размер окна, и его
-// атлас уходит в графику заново.
+// Подпись строится до кадра. Шрифт перепекается на шагах размера окна, и новый
+// атлас уходит в графику. Замена атласа ждёт видеокарту, поэтому при изменении
+// размера окна она случается только на этих шагах.
 static bool PrepareBar(Viewer *viewer, float seconds)
 {
     const LaiueUiServiceV1 *ui = viewer->ui;
@@ -1057,16 +1059,16 @@ static bool PrepareBar(Viewer *viewer, float seconds)
     if (!ui->begin(viewer->uiContext, viewer->width, viewer->height, 0.0f, 0.0f, 0u, 0u, 0.0f,
                    seconds))
         return false;
-    if (viewer->atlasWidth != viewer->width || viewer->atlasHeight != viewer->height)
+    const uint8_t *atlas = NULL;
+    uint32_t atlasWidth = 0u;
+    uint32_t atlasHeight = 0u;
+    if (!ui->getFontAtlas(viewer->uiContext, &atlas, &atlasWidth, &atlasHeight))
+        return false;
+    if (atlas != viewer->atlas)
     {
-        const uint8_t *atlas = NULL;
-        uint32_t atlasWidth = 0u;
-        uint32_t atlasHeight = 0u;
-        if (!ui->getFontAtlas(viewer->uiContext, &atlas, &atlasWidth, &atlasHeight) ||
-            !viewer->device->setUiFontAtlas(viewer->device, atlas, atlasWidth, atlasHeight))
+        if (!viewer->device->setUiFontAtlas(viewer->device, atlas, atlasWidth, atlasHeight))
             return false;
-        viewer->atlasWidth = viewer->width;
-        viewer->atlasHeight = viewer->height;
+        viewer->atlas = atlas;
     }
     static char line[CAPTION_BYTES + 64u];
     line[0] = '\0';
@@ -1390,8 +1392,7 @@ static void CloseDevice(Viewer *viewer)
     viewer->vertices = 0u;
     viewer->indices = 0u;
     viewer->sampler = 0u;
-    viewer->atlasWidth = 0;
-    viewer->atlasHeight = 0;
+    viewer->atlas = NULL;
 }
 
 static void Unload(Viewer *viewer)
