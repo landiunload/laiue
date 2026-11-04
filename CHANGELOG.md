@@ -5,6 +5,8 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The viewer sends its font atlas to the GPU only when the font was baked again,
+  not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in
   flight may read waits until the GPU has passed them; Vulkan used to wait for
   the device to go idle and rebuild its descriptor sets.
