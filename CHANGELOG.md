@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Windows draws engine windows pixel for pixel on a scaled display. The first
+  window declares the process aware of each monitor's DPI, the requested size
+  counts in points, and a window follows the scale of the monitor it moves to.
+  Before, the system stretched the whole window, and the viewer's 100 % was not
+  one image pixel per screen pixel.
 - Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
   mip level and Vulkan once; the pixels now go to staging memory, and the copy
   runs at the start of the next frame. In the viewer a page turn holds the

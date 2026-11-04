@@ -292,6 +292,17 @@ static LRESULT CALLBACK WindowProcedure(HWND handle, UINT message, WPARAM wParam
             return DefWindowProcW(handle, message, wParam, lParam);
         }
 
+        case WM_DPICHANGED:
+        {
+            // Окно перешло на монитор с другим масштабом: система предлагает
+            // прямоугольник, в котором оно выглядит так же.
+            const RECT* suggested = (const RECT*)lParam;
+            SetWindowPos(handle, NULL, suggested->left, suggested->top,
+                suggested->right - suggested->left, suggested->bottom - suggested->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+
         case WM_SIZE:
             // Сворачивание даёт клиентскую область 0x0 — это не resize.
             if (window != NULL && wParam != SIZE_MINIMIZED)
@@ -557,15 +568,22 @@ Window* WindowCreate(const WindowConfiguration* configuration)
         return NULL;
     }
 
-    window->clientWidth  = configuration->width;
-    window->clientHeight = configuration->height;
+    // Без этого система растягивает окно на экране с масштабом целиком, и пиксель
+    // окна перестаёт быть пикселем экрана. Программа, заранее объявившая процесс
+    // иначе, остаётся при своём: вызов откажет, и масштаб останется 96.
+    (void)SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Запрошенный размер задан в точках: на экране с масштабом окно выглядит таким же.
+    const UINT dpi = GetDpiForSystem();
+    window->clientWidth  = MulDiv(configuration->width, (int)dpi, USER_DEFAULT_SCREEN_DPI);
+    window->clientHeight = MulDiv(configuration->height, (int)dpi, USER_DEFAULT_SCREEN_DPI);
 
     // Размер окна подбирается так, чтобы клиентская область
-    // совпала с запрошенными width x height.
-    RECT windowRect = { 0, 0, configuration->width, configuration->height };
+    // совпала с запрошенным размером.
+    RECT windowRect = { 0, 0, window->clientWidth, window->clientHeight };
     const DWORD windowStyle         = WS_OVERLAPPEDWINDOW;
     const DWORD windowStyleExtended = WS_EX_APPWINDOW;
-    AdjustWindowRectEx(&windowRect, windowStyle, FALSE, windowStyleExtended);
+    AdjustWindowRectExForDpi(&windowRect, windowStyle, FALSE, windowStyleExtended, dpi);
 
     window->handle = CreateWindowExW(
         windowStyleExtended,
@@ -866,7 +884,7 @@ void WindowSetSurfaceCallback(Window *window, SurfaceCallback callback, void *us
 
 float WindowGetContentScale(const Window *window)
 {
-    // Процесс без объявленной осведомлённости о DPI получает 96, а окно
+    // Процесс, заранее объявленный неосведомлённым о DPI, получает 96, а окно
     // целиком растягивает система: тогда пиксель окна и есть точка.
     const UINT dpi = window != NULL ? GetDpiForWindow(window->handle) : 0u;
     return dpi != 0u ? (float)dpi / (float)USER_DEFAULT_SCREEN_DPI : 1.0f;
