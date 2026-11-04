@@ -393,6 +393,11 @@ if(TARGET laiue_render AND laiue_shared_modules)
             TEST laiue.graphics.geometry_d3d12 TIMEOUT 90)
         laiue_set_gpu_test_properties(${LAIUE_REQUIRE_D3D12_TEST_DRIVER}
             laiue.graphics.geometry_d3d12)
+        laiue_add_harness(laiue_graphics_device_lost_test GraphicsDeviceLostTestEntryPoint
+            graphics_device_lost_test.c BOOTSTRAP LIBRARIES user32 d3d12 dxgi dxguid
+            DEPENDS laiue_render TEST laiue.graphics.device_lost TIMEOUT 60)
+        laiue_set_gpu_test_properties(${LAIUE_REQUIRE_D3D12_TEST_DRIVER}
+            laiue.graphics.device_lost)
     endif()
     if(TARGET laiue_graphics_profile)
         laiue_add_diagnostics_test(laiue_graphics_profile_module_test
