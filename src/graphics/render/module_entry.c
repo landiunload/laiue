@@ -584,12 +584,16 @@ static uint32_t DeviceCreateBuffer(LaiueGraphicsDeviceV1 *device,
         return 0u;
     const uint32_t index = DeviceHandleSlot(*outBuffer) - 1u;
     state->usageFlags[index] = description->usageFlags;
-    state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true);
-    if ((description->usageFlags & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u)
+    /* Vertices are uploaded whole and stay only in the GPU. Indices keep a copy:
+     * a draw validates its range against them. */
+    const bool indices = (description->usageFlags & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u;
+    const bool copied = indices || geometryFlags == 0u;
+    if (copied)
+        state->storage[index] = DeviceAllocate(state, (size_t)description->sizeBytes, true);
+    if (indices)
         state->backendResources[index] = DeviceAllocate(state, sizeof(DeviceIndexState), true);
-    if (state->storage[index] == NULL ||
-        ((description->usageFlags & LAIUE_GRAPHICS_BUFFER_USAGE_INDEX) != 0u &&
-         state->backendResources[index] == NULL))
+    if ((copied && state->storage[index] == NULL) ||
+        (indices && state->backendResources[index] == NULL))
     {
         DeviceDestroyHandle(device, *outBuffer);
         *outBuffer = 0u;
@@ -746,6 +750,8 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
     const void *data = upload->data;
     if (upload->offsetBytes != 0u || upload->sizeBytes != state->sizes[index])
     {
+        if (state->storage[index] == NULL)
+            return 0u;
         temporary = DeviceAllocate(state, (size_t)state->sizes[index], false);
         if (temporary == NULL)
             return 0u;
@@ -792,7 +798,8 @@ static uint32_t DeviceUploadBuffer(LaiueGraphicsDeviceV1 *device,
         state->vertexCounts[index] = vertexCount;
         RendererDestroyMesh(state->renderer, previous);
     }
-    memcpy(state->storage[index], data, (size_t)state->sizes[index]);
+    if (state->storage[index] != NULL)
+        memcpy(state->storage[index], data, (size_t)state->sizes[index]);
     DeviceFree(state, temporary);
     return 1u;
 }
@@ -1568,6 +1575,7 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         result.geometryPoolUsedBytes = stats.geometryPoolUsedBytes;
         result.geometryPoolCapacityBytes = stats.geometryPoolCapacityBytes;
         result.scenePasses = stats.scenePasses;
+        result.swapchainRebuilds = stats.swapchainRebuilds;
     }
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};
     RendererGetGpuTimingV1(state->renderer, &timing);

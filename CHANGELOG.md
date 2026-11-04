@@ -9,11 +9,43 @@ API and ABI may change between minor versions.
   so a long GIF plays to its end. It used to stop at 256 frames without a word and
   start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
   `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
+- On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
+  to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
+  load too. The renderer used to wait for the GPU at the start of a frame, after
+  the program had read its input, and the present queue held four more frames.
+  It now waits at the end of a frame, and where the device has
+  `VK_KHR_present_wait` it waits until the previous frame is on the screen, which
+  keeps two frames queued, as on D3D12. Without the extension, on most Android
+  devices, the wait for a free image moves to the end of a frame as well.
+- On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
+  Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
+  and the chain draws unrotated, and the renderer stopped the GPU and built a new
+  chain each time, in the landscape orientation games run in: 171 rebuilds in 171
+  frames on the emulator, 0 now. A frame acquired as suboptimal is drawn instead
+  of dropped. `swapchainRebuilds` in the graphics diagnostics counts them, which
+  grows `LaiueGraphicsDiagnosticsV2`, so a program that reads it has to be rebuilt.
+- A vertex buffer keeps no CPU copy: its bytes stay only in the GPU, so vertices
+  take half the memory and each upload one copy less. Foxity uses 21 MB less. A
+  vertex buffer now takes whole uploads only; index buffers still take parts.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in
   flight may read waits until the GPU has passed them; Vulkan used to wait for
   the device to go idle and rebuild its descriptor sets.
+- A minimized window on Windows reports a size of 0 x 0, as programs expected,
+  and they stop drawing to nowhere. The viewer sleeps until it is restored, and
+  a game goes on simulating. A window without pixels sleeps between frames even
+  when it stays active.
+- A window keeps its frame rate out of focus while it can be seen. About 20
+  frames a second now belong to `WINDOW_POWER_EFFICIENCY` and to windows nobody
+  sees: hidden, or on another virtual desktop. On X11 a window the window manager
+  took off the screen reports a size of 0 x 0, as on Windows.
+- `WINDOW_POWER_AUTO` enters efficiency mode only when no window of the program
+  can be seen. A window out of focus used to fall to idle priority, and any busy
+  program could stop it completely.
+- Geometry uploaded without frames no longer piles up. Past 32 MiB of spilled
+  staging the renderers copy what waits and reuse the memory, as they already
+  did for textures.
 - Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
   mip level and Vulkan once; the pixels now go to staging memory, and the copy
   runs at the start of the next frame. In the viewer a page turn holds the

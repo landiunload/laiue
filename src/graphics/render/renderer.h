@@ -21,6 +21,7 @@ typedef struct RendererStats
     uint64_t geometryPoolUsedBytes;
     uint64_t geometryPoolCapacityBytes;
     uint32_t scenePasses;
+    uint32_t swapchainRebuilds;
 } RendererStats;
 
 // Latest completed GPU frame interval. Results are delayed until the backend's
