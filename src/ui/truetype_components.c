@@ -42,7 +42,8 @@ static bool TtcMeasure(TrueTypeSpan glyph, TrueTypeCompositeInfo *info)
                                       TRUE_TYPE_COMPONENT_MATRIX);
         uint32_t offsets =
             flags & (TRUE_TYPE_COMPONENT_SCALED_OFFSET | TRUE_TYPE_COMPONENT_UNSCALED_OFFSET);
-        if ((flags & 0xE010u) != 0u || (transform & (transform - 1u)) != 0u ||
+        // Legacy fonts may set obsolete bit4. Preserve it without applying an effect.
+        if ((flags & 0xE000u) != 0u || (transform & (transform - 1u)) != 0u ||
             offsets == (TRUE_TYPE_COMPONENT_SCALED_OFFSET | TRUE_TYPE_COMPONENT_UNSCALED_OFFSET) ||
             (info->componentCount == 0u && (flags & TRUE_TYPE_COMPONENT_XY_ARGUMENTS) == 0u) ||
             (info->componentCount != 0u && (flags & TRUE_TYPE_COMPONENT_OVERLAP) != 0u))

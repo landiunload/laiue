@@ -51,6 +51,8 @@ typedef struct TrueTypeCompositeInfo
 // Arguments: signed XY либо unsigned point numbers в int32, по flags.
 // Glyph IDs и point references проверяет resolver относительно font/outline.
 // Противоречивые transform или scaled/unscaled offset flags дают false.
+// Legacy bit4 сохраняется без эффекта для совместимости; новые fonts должны
+// оставлять его нулём. Остальные reserved bits 13..15 возвращают false.
 // До записи проверяется вся раскладка; false сохраняет storage и out.
 // glyph, storage и out не перекрываются, glyph неизменен во время вызова;
 // instructions заимствует память glyph и живёт не дольше исходного буфера.
