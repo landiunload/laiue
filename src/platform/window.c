@@ -2,6 +2,7 @@
 #include "platform/efficiency_windows.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 
 #define WINDOW_CLASS_NAME L"LaiueWindowClass"
 
@@ -735,6 +736,28 @@ static void WaitForDeferredFrame(Window* window)
     }
 }
 
+// Скрытое окно и окно на другом рабочем столе система не показывает, а о втором
+// не сообщает: его можно только спросить.
+static bool WindowIsOnScreen(const Window* window)
+{
+    DWORD cloaked = 0u;
+    return IsWindowVisible(window->handle)
+        && (FAILED(DwmGetWindowAttribute(window->handle, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))
+            || cloaked == 0u);
+}
+
+// ~20 кадров в секунду. Окну без пикселей ждать в Present нечего, даже активному;
+// окно вне фокуса рисует как обычно, пока его видно и не включён режим эффективности.
+static bool FrameShouldRest(const Window* window)
+{
+    if (window->clientWidth <= 0 || window->clientHeight <= 0)
+    {
+        return true;
+    }
+    return !window->focused
+        && (WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY || !WindowIsOnScreen(window));
+}
+
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 {
     window->frameCallback = onFrame;
@@ -745,15 +768,13 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
         window->frameDeferred = false;
         RunFrame(window);
 
-        // В фокусе ожидание кадра при необходимости происходит в Present:
-        // дополнительный сон мешал бы vsync и ограничивал режим без него.
-        // Вне фокуса — экономный режим: ~20 кадров в секунду. Окну без пикселей
-        // ждать в Present нечего, и оно спит так же, даже оставаясь активным.
+        // Обычно ожидание кадра происходит в Present: дополнительный сон мешал
+        // бы vsync и ограничивал режим без него.
         if (window->frameDeferred)
         {
             WaitForDeferredFrame(window);
         }
-        else if (!window->focused || window->clientWidth <= 0 || window->clientHeight <= 0)
+        else if (FrameShouldRest(window))
         {
             MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
         }

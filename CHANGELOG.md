@@ -12,6 +12,10 @@ API and ABI may change between minor versions.
   and they stop drawing to nowhere. The viewer sleeps until it is restored, and
   a game goes on simulating. A window without pixels sleeps between frames even
   when it stays active.
+- A window keeps its frame rate out of focus while it can be seen. About 20
+  frames a second now belong to `WINDOW_POWER_EFFICIENCY` and to windows nobody
+  sees: hidden, or on another virtual desktop. On X11 a window the window manager
+  took off the screen reports a size of 0 x 0, as on Windows.
 - Geometry uploaded without frames no longer piles up. Past 32 MiB of spilled
   staging the renderers copy what waits and reuse the memory, as they already
   did for textures.

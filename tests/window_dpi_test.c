@@ -11,6 +11,8 @@
 
 #include <windows.h>
 
+#include <dwmapi.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -21,14 +23,31 @@
 // Без сна между кадрами цикл успел бы за это время сотни тысяч кадров.
 #define PACE_SECONDS 0.2
 #define PACE_MOST_FRAMES 40u
+// Пусковая программа тестов показывает окно не сразу.
+#define SHOW_PATIENCE_SECONDS 3.0
+
+// Этапы идут в одном окне и одном цикле: скрытым пусковая программа запускает
+// только первое окно процесса, а второе система показала бы на основном мониторе.
+typedef enum PaceStage
+{
+    PACE_WAIT_FOR_SHOW,
+    PACE_WITHOUT_PIXELS,
+    PACE_OUT_OF_FOCUS,
+    PACE_ON_ANOTHER_DESKTOP,
+    PACE_EFFICIENCY,
+    PACE_DONE,
+} PaceStage;
 
 typedef struct FramePace
 {
     const LaiueWindowServiceV1 *windows;
     Window *window;
     HWND handle;
-    double deadline;
-    uint32_t frames;
+    PaceStage stage;
+    double stageEnd;
+    bool shown;
+    bool cloaked;
+    uint32_t frames[PACE_DONE];
 } FramePace;
 
 static void Expect(bool condition, const char *message)
@@ -41,20 +60,62 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeExit(1);
 }
 
-// Настоящий показ окна вернул бы ему пиксели, поэтому состояние повторяется.
-static void PretendMinimizedAndActive(HWND handle)
+static void Cloak(FramePace *pace, BOOL cloak)
 {
-    SendMessageW(handle, WM_SIZE, SIZE_MINIMIZED, 0);
-    SendMessageW(handle, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, TRUE), 0);
+    pace->cloaked =
+        SUCCEEDED(DwmSetWindowAttribute(pace->handle, DWMWA_CLOAK, &cloak, sizeof(cloak)));
+}
+
+static void NextStage(FramePace *pace, double now)
+{
+    pace->stage = (PaceStage)(pace->stage + 1);
+    pace->stageEnd = now + PACE_SECONDS;
+    switch (pace->stage)
+    {
+        case PACE_WITHOUT_PIXELS:
+            // Только показанное окно: пусковая программа уже поставила его на место.
+            pace->shown = IsWindowVisible(pace->handle) != FALSE;
+            if (pace->shown)
+                ShowWindow(pace->handle, SW_SHOWMINNOACTIVE);
+            break;
+        case PACE_OUT_OF_FOCUS:
+            if (pace->shown)
+                ShowWindow(pace->handle, SW_SHOWNOACTIVATE);
+            break;
+        case PACE_ON_ANOTHER_DESKTOP:
+            Cloak(pace, TRUE);
+            break;
+        case PACE_EFFICIENCY:
+        {
+            const bool cloaked = pace->cloaked;
+            Cloak(pace, FALSE);
+            pace->cloaked = cloaked;
+            (void)pace->windows->setPowerPolicy(WINDOW_POWER_EFFICIENCY);
+            break;
+        }
+        default:
+            (void)pace->windows->setPowerPolicy(WINDOW_POWER_AUTO);
+            pace->windows->requestClose(pace->window);
+            break;
+    }
 }
 
 static void CountFrame(void *context)
 {
     FramePace *pace = (FramePace *)context;
-    ++pace->frames;
-    PretendMinimizedAndActive(pace->handle);
-    if (PlatformMonotonicSeconds() >= pace->deadline)
-        pace->windows->requestClose(pace->window);
+    const double now = PlatformMonotonicSeconds();
+    if (pace->stage != PACE_DONE &&
+        (now >= pace->stageEnd ||
+         (pace->stage == PACE_WAIT_FOR_SHOW && IsWindowVisible(pace->handle))))
+        NextStage(pace, now);
+    if (pace->stage == PACE_DONE)
+        return;
+    // Активным окно считается только свёрнутым: обычному DefWindowProc отдал бы
+    // фокус, а тесты его не забирают.
+    const bool active = pace->stage == PACE_WITHOUT_PIXELS && pace->shown;
+    SendMessageW(pace->handle, WM_ACTIVATE, MAKEWPARAM(active ? WA_ACTIVE : WA_INACTIVE, active),
+                 0);
+    ++pace->frames[pace->stage];
 }
 
 static bool Join(wchar_t *output, const wchar_t *directory, const wchar_t *name)
@@ -93,8 +154,8 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
     uint32_t size = 0u;
     const LaiueWindowServiceV1 *windows = (const LaiueWindowServiceV1 *)LaiueModuleHostQueryService(
         host, LAIUE_WINDOW_SERVICE_NAME, LAIUE_WINDOW_SERVICE_ABI_VERSION_1,
-        LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE, &version, &size);
-    Expect(windows != NULL && windows->getContentScale != NULL,
+        LAIUE_WINDOW_SERVICE_V1_POWER_SIZE, &version, &size);
+    Expect(windows != NULL && windows->getContentScale != NULL && windows->setPowerPolicy != NULL,
            "the window service reports the content scale");
 
     const WindowConfiguration configuration = {
@@ -141,12 +202,20 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
            "a restored window has its size back");
     Expect(windows->consumeResize(window), "the program hears of the restored size");
 
-    // Активному окну без пикселей ждать в Present тоже нечего.
-    PretendMinimizedAndActive(handle);
-    FramePace pace = {windows, window, handle, PlatformMonotonicSeconds() + PACE_SECONDS, 0u};
+    FramePace pace = {.windows = windows,
+                      .window = window,
+                      .handle = handle,
+                      .stageEnd = PlatformMonotonicSeconds() + SHOW_PATIENCE_SECONDS};
     windows->runLoop(window, CountFrame, &pace);
-    Expect(pace.frames != 0u && pace.frames <= PACE_MOST_FRAMES,
+    Expect(pace.frames[PACE_WITHOUT_PIXELS] != 0u &&
+               pace.frames[PACE_WITHOUT_PIXELS] <= PACE_MOST_FRAMES,
            "an active window without pixels sleeps between frames");
+    Expect(!pace.shown || pace.frames[PACE_OUT_OF_FOCUS] > PACE_MOST_FRAMES,
+           "a visible window out of focus keeps its pace");
+    Expect(!pace.cloaked || pace.frames[PACE_ON_ANOTHER_DESKTOP] <= PACE_MOST_FRAMES,
+           "a window on another desktop sleeps between frames");
+    Expect(pace.frames[PACE_EFFICIENCY] <= PACE_MOST_FRAMES,
+           "efficiency mode spares frames out of focus");
 
     windows->destroy(window);
     LaiueModuleHostDestroy(host);
