@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Upload rings take a quarter of the memory, 1 MiB per frame instead of 4, and
+  the 8 MiB arenas of a burst go back after 120 turns of their frame slot without
+  use. A game loads its world in the first seconds and then uploads almost
+  nothing: Foxity peaked at 2.4 MiB a frame in 58 frames of 3600. Walk uses 11 MB
+  less. `LaiueGraphicsDiagnosticsV2` reports them as `uploadStagingBytes`, so a
+  program that reads diagnostics has to be rebuilt.
 - The viewer sends its font atlas to the GPU only when the font was baked again,
   not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in

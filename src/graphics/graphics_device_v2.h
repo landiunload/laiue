@@ -117,6 +117,8 @@ typedef struct LaiueGraphicsDiagnosticsV2
     uint64_t cpuShadowBytes;
     uint32_t resourceHandleCount;
     uint32_t scenePasses;
+    // Live upload rings and arenas of the backend. Blocks of a single burst are not counted.
+    uint64_t uploadStagingBytes;
 } LaiueGraphicsDiagnosticsV2;
 
 // Explicit synchronous diagnostic capture. Caller owns pixels and its capacity;

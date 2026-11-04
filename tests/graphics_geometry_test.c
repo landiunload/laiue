@@ -41,10 +41,15 @@
 #define INSTANCE_LIMIT (64u * 1024u * 1024u / 32u)
 #define RETIREMENT_MESH_COUNT 300u
 #define RETIREMENT_UPLOAD_BATCH 50u
-/* Six 3 MiB buffers fill the 4 MiB and 8 MiB staging rings of a frame and
+/* Six 3 MiB buffers fill the 1 MiB and 8 MiB staging rings of a frame and
  * spill into two overflow blocks, the second one started by the last buffer. */
 #define SPILL_BUFFER_COUNT 6u
 #define SPILL_VERTEX_COUNT (3u * 1024u * 1024u / (uint32_t)sizeof(LaiueGraphicsVertexV2))
+/* More turns of every frame slot than an idle upload arena lasts. */
+#define BURST_IDLE_FRAMES 400u
+#define UPLOAD_RING_BYTES (UINT64_C(1) << 20)
+#define UPLOAD_ARENA_BYTES (UINT64_C(8) << 20)
+#define MOST_FRAME_SLOTS 3u
 /* A program that stopped drawing goes on replacing a 3 MiB buffer. Without a
  * limit all 360 MiB stay in staging, and on Vulkan in the geometry pool too. */
 #define UNDRAWN_UPLOAD_COUNT 120u
@@ -998,9 +1003,8 @@ static void StagingSpill(LaiueGraphicsDeviceV2 *device)
     for (uint32_t i = 0u; i < SPILL_BUFFER_COUNT; ++i)
         buffers[i] = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, spillVertices,
                             (uint32_t)sizeof(spillVertices));
-    const LaiueGraphicsDrawItemV2 spilled = Item(buffers[3], 0u, 0u, 0, -0.625f, -0.125f, 1.0f);
-    const LaiueGraphicsDrawItemV2 last =
-        Item(buffers[SPILL_BUFFER_COUNT - 1u], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    const LaiueGraphicsDrawItemV2 spilled = Item(buffers[2], 0u, 0u, 0, -0.625f, -0.125f, 1.0f);
+    const LaiueGraphicsDrawItemV2 last = Item(buffers[4], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
     Begin(device);
     Submit(device, &spilled);
     Submit(device, &last);
@@ -1065,6 +1069,36 @@ static void UploadsWithoutFrames(LaiueGraphicsDeviceV2 *device)
     ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the frame shows the last upload");
     device->destroyHandle(device, buffer);
     ExpectReclaimed(device, &baseline, "uploads without frames leave no pool range behind");
+}
+
+static void IdleFrames(LaiueGraphicsDeviceV2 *device)
+{
+    for (uint32_t i = 0u; i < BURST_IDLE_FRAMES; ++i)
+    {
+        Begin(device);
+        Expect(device->endFrame(device) != 0u, "an idle frame ends");
+    }
+}
+
+static void BurstMemoryReturns(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("the upload arena of a burst goes back when frames stop using it");
+    IdleFrames(device);
+    const uint64_t rings = Diagnostics(device).uploadStagingBytes;
+    Expect(rings != 0u && rings <= MOST_FRAME_SLOTS * UPLOAD_RING_BYTES,
+           "an idle renderer holds its upload rings and nothing more");
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    Expect(Diagnostics(device).uploadStagingBytes == rings + UPLOAD_ARENA_BYTES,
+           "a burst past the ring gets an arena");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "a burst in a new arena renders");
+    device->destroyHandle(device, buffer);
+    IdleFrames(device);
+    Expect(Diagnostics(device).uploadStagingBytes == rings, "an idle arena goes back");
 }
 
 LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
@@ -1166,6 +1200,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         PendingUploadBurst(device);
         StagingSpill(device);
         UploadsWithoutFrames(device);
+        BurstMemoryReturns(device);
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);

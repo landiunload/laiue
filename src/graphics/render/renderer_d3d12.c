@@ -111,17 +111,22 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
 // и сохраняет ёмкость: в установившемся режиме она не выделяет память.
 #define PENDING_UPLOAD_INITIAL_CAPACITY 128u
-#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Кольцо живёт всё время работы и занимает память в каждом слоте, а заливать
+// между кадрами обычно нечего: игра грузит мир в первые секунды и дальше почти
+// не трогает геометрию. Большего размера хватает только на всплески, а им есть арена.
+#define MESH_UPLOAD_BYTES_PER_FRAME (1u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
-// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
+// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс, а
+// простояв LARGE_MESH_UPLOAD_IDLE_TURNS оборотов слота, отдаётся.
 // Что не поместилось и туда, ложится в дополнительные блоки того же
 // кадрового слота размером не меньше арены. Блок делят все такие записи,
 // поэтому всплеск в тысячи мешей стоит нескольких ресурсов, а не тысяч
 // ресурсов с выравниванием по 64 КиБ; блоки освобождаются, когда пройден
 // fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+#define LARGE_MESH_UPLOAD_IDLE_TURNS 120u
 // Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
 // оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
 // предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
@@ -418,6 +423,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
+    uint32_t                   largeMeshUploadIdleTurns[FRAME_COUNT];
     StagingOverflow*           stagingOverflow[FRAME_COUNT];
     uint64_t                   stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload       pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
@@ -976,6 +982,18 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
 {
     ReleaseStagingChain(&renderer->stagingOverflow[frameIndex]);
     renderer->stagingOverflowBytes[frameIndex] = 0u;
+}
+
+static void ReleaseLargeMeshUpload(Renderer* renderer, uint32_t frameIndex)
+{
+    if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
+    {
+        if (renderer->largeMeshUploadMapped[frameIndex] != NULL)
+            ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[frameIndex], 0, NULL);
+        ID3D12Resource_Release(renderer->largeMeshUploadBuffers[frameIndex]);
+    }
+    renderer->largeMeshUploadBuffers[frameIndex] = NULL;
+    renderer->largeMeshUploadMapped[frameIndex] = NULL;
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
@@ -2490,17 +2508,10 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
                 ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
         }
-        if (renderer->largeMeshUploadBuffers[i] != NULL)
-        {
-            if (renderer->largeMeshUploadMapped[i] != NULL)
-                ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[i], 0, NULL);
-            ID3D12Resource_Release(renderer->largeMeshUploadBuffers[i]);
-        }
+        ReleaseLargeMeshUpload(renderer, i);
         renderer->meshUploadBuffers[i] = NULL;
         renderer->meshUploadMapped[i] = NULL;
         renderer->meshUploadOffsets[i] = 0;
-        renderer->largeMeshUploadBuffers[i] = NULL;
-        renderer->largeMeshUploadMapped[i] = NULL;
         renderer->largeMeshUploadOffsets[i] = 0;
     }
     ReleaseInstancePool(renderer);
@@ -2753,6 +2764,24 @@ void RendererDestroy_D3D12(Renderer* renderer)
 // Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
 // Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
 // не платит за неё ни байтом.
+// Слот снова свободен: GPU прошёл всё, что читало из его колец.
+static void RewindUploadSlot(Renderer* renderer, uint32_t frameIndex)
+{
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    if (renderer->largeMeshUploadOffsets[frameIndex] != 0u)
+    {
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    else if (renderer->largeMeshUploadBuffers[frameIndex] != NULL
+        && ++renderer->largeMeshUploadIdleTurns[frameIndex] >= LARGE_MESH_UPLOAD_IDLE_TURNS)
+    {
+        ReleaseLargeMeshUpload(renderer, frameIndex);
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
+}
+
 static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
 {
     if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
@@ -3810,9 +3839,7 @@ static bool FlushUploads(Renderer *renderer)
     }
     ReleaseStagingChain(&renderer->textureStaging);
     renderer->textureStagingBytes = 0u;
-    renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
-    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
-    ReleaseStagingOverflow(renderer, renderer->frameIndex);
+    RewindUploadSlot(renderer, renderer->frameIndex);
     DrainDeferredReleases(renderer, false);
     return true;
 }
@@ -4412,12 +4439,10 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         renderer->gpuTimingPending[submittedSlot] = false;
         return false;
     }
-    renderer->meshUploadOffsets[renderer->frameIndex] = 0;
-    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
     // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
     // больше не читает: курсор можно вернуть в начало. Сами чанки остаются,
     // а дополнительные staging-блоки, нужные только всплеску, отдаются.
-    ReleaseStagingOverflow(renderer, renderer->frameIndex);
+    RewindUploadSlot(renderer, renderer->frameIndex);
     renderer->instanceChunkIndex[renderer->frameIndex] = 0;
     renderer->instanceChunkOffset[renderer->frameIndex] = 0;
     // Без vsync и без разрывов очередь сама заменяет ждущий кадр новым, а
@@ -4442,6 +4467,18 @@ bool RendererIsDeviceLost_D3D12(const Renderer* renderer)
 {
     return renderer->frameFailed ||
            FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device));
+}
+
+uint64_t RendererUploadStagingBytes_D3D12(const Renderer* renderer)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t i = 0u; i < FRAME_COUNT; ++i)
+    {
+        bytes += renderer->meshUploadBuffers[i] != NULL ? MESH_UPLOAD_BYTES_PER_FRAME : 0u;
+        bytes += renderer->largeMeshUploadBuffers[i] != NULL
+            ? LARGE_MESH_UPLOAD_BYTES_PER_FRAME : 0u;
+    }
+    return bytes;
 }
 
 void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)

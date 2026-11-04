@@ -102,7 +102,10 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
 // и сохраняет ёмкость: в установившемся режиме она не выделяет память.
 #define PENDING_UPLOAD_INITIAL_CAPACITY 128u
-#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Кольцо живёт всё время работы и занимает память в каждом слоте, а заливать
+// между кадрами обычно нечего: игра грузит мир в первые секунды и дальше почти
+// не трогает геометрию. Большего размера хватает только на всплески, а им есть арена.
+#define MESH_UPLOAD_BYTES_PER_FRAME (1u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
@@ -113,6 +116,8 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
 // когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Столько оборотов слота арена лежит без дела, прежде чем её отдают.
+#define LARGE_MESH_UPLOAD_IDLE_TURNS 120u
 // Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
 // оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
 // предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
@@ -447,6 +452,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t meshUploadOffsets[FRAME_COUNT];
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
+    uint32_t largeMeshUploadIdleTurns[FRAME_COUNT];
     StagingOverflow *stagingOverflow[FRAME_COUNT];
     uint64_t stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
@@ -730,6 +736,24 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
 {
     ReleaseStagingChain(renderer, &renderer->stagingOverflow[frameIndex]);
     renderer->stagingOverflowBytes[frameIndex] = 0u;
+}
+
+// Слот снова свободен: GPU прошёл всё, что читало из его колец.
+static void RewindUploadSlot(Renderer *renderer, uint32_t frameIndex)
+{
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    if (renderer->largeMeshUploadOffsets[frameIndex] != 0u)
+    {
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    else if (renderer->largeMeshUploadBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+             ++renderer->largeMeshUploadIdleTurns[frameIndex] >= LARGE_MESH_UPLOAD_IDLE_TURNS)
+    {
+        BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frameIndex]);
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -3730,9 +3754,7 @@ static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
         FailVulkanDevice(renderer);
         return false;
     }
-    renderer->meshUploadOffsets[frameIndex] = 0u;
-    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
-    ReleaseStagingOverflow(renderer, frameIndex);
+    RewindUploadSlot(renderer, frameIndex);
     renderer->uploadSlotReady[frameIndex] = true;
     return true;
 }
@@ -4821,9 +4843,7 @@ static bool FlushUploads(Renderer *renderer)
             return false;
         }
         renderer->recordedUploadCount = 0u;
-        renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
-        renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
-        ReleaseStagingOverflow(renderer, renderer->frameIndex);
+        RewindUploadSlot(renderer, renderer->frameIndex);
         DrainDeferredReleases(renderer, true);
     }
     ReleaseStagingChain(renderer, &renderer->textureStaging);
@@ -5301,6 +5321,21 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
 bool RendererIsDeviceLost_Vulkan(const Renderer *renderer)
 {
     return renderer->deviceFailed;
+}
+
+uint64_t RendererUploadStagingBytes_Vulkan(const Renderer *renderer)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    {
+        bytes += renderer->meshUploadBuffers[frame].buffer != VK_NULL_HANDLE
+                     ? MESH_UPLOAD_BYTES_PER_FRAME
+                     : 0u;
+        bytes += renderer->largeMeshUploadBuffers[frame].buffer != VK_NULL_HANDLE
+                     ? LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+                     : 0u;
+    }
+    return bytes;
 }
 
 void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
