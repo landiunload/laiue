@@ -475,6 +475,21 @@ static void RunFrameSlots(HINSTANCE instance, void *pixels)
     CaptureWithSize(renderer, pixels, (uint32_t)clientWidth, (uint32_t)clientHeight,
                     "the frame-slot frame could not be captured");
 
+    // Интерфейс остаётся в проходе сцены: свой проход стоил бы тайловому GPU
+    // записи всего кадра в память и чтения обратно.
+    static const uint8_t atlas[1] = {255u};
+    static const float origin[3] = {-0.5f, -0.5f, -0.5f};
+    const RendererUiQuad quad = {.rect = {0.0f, 0.0f, 8.0f, 8.0f}, .colorRGBA = UINT32_MAX};
+    Expect(RendererUiSetFontAtlas(renderer, atlas, 1u, 1u), "the interface atlas was refused");
+    Expect(RendererBeginFrame(renderer, &setup), "a frame with an interface could not begin");
+    RendererBeginScenePass(renderer, 0u);
+    RendererDrawMesh(renderer, mesh, origin);
+    RendererUiQueue(renderer, &quad, 1u);
+    Expect(RendererEndFrame(renderer), "a frame with an interface could not end");
+    RendererGetStats(renderer, &stats);
+    Expect(stats.drawCalls == 2u, "the interface must be drawn");
+    Expect(stats.targetPasses == 1u, "the interface must stay in the pass of the scene");
+
     RendererDestroyMesh(renderer, mesh);
     RendererDestroy(renderer);
     DestroyWindow(window);

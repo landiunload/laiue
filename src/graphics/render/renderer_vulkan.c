@@ -438,6 +438,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     VkPipeline genericPipeline;
     VkPipeline resolvePipeline;
     VkPipeline uiPipeline;
+    VkPipeline uiScenePipeline;  // тот же интерфейс для прохода сцены, где есть глубина
     VkDescriptorSet resolveSets[FRAME_COUNT];
     VkDescriptorSet uiSets[FRAME_COUNT];
     VkDescriptorSet genericSets[FRAME_COUNT][GENERIC_DESCRIPTOR_SET_CAPACITY];
@@ -960,12 +961,14 @@ static bool CreateRenderPasses(Renderer *renderer)
         VK_SUCCESS)
         return false;
 
+    // Проход сцены начинает кадр с чистого листа. С LOAD тайловый GPU читал бы из
+    // памяти прошлое содержимое целей только затем, чтобы его стереть.
     VkAttachmentDescription attachments[2] = {
         color,
         {
             .format = DEPTH_FORMAT,
             .samples = VK_SAMPLE_COUNT_1_BIT,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -973,6 +976,7 @@ static bool CreateRenderPasses(Renderer *renderer)
             .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         },
     };
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     VkAttachmentReference depthReference = {
         .attachment = 1u,
         .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -1513,6 +1517,7 @@ typedef struct PipelineRecipe
     uint32_t pixelFallbackBytes;
     VkPipelineLayout layout;
     bool depthTest;
+    bool inScenePass;  // проход с глубиной, даже если конвейер её не проверяет
     bool blend;
     VkCullModeFlags cullMode;
     bool wireframe;
@@ -1622,11 +1627,12 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         .layout = recipe->layout,
     };
     VkFormat colorFormat = renderer->colorFormat;
+    const bool depthAttachment = recipe->depthTest || recipe->inScenePass;
     VkPipelineRenderingCreateInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1u,
         .pColorAttachmentFormats = &colorFormat,
-        .depthAttachmentFormat = recipe->depthTest ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
+        .depthAttachmentFormat = depthAttachment ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
     };
     if (renderer->useDynamicRendering)
     {
@@ -1635,8 +1641,8 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
     }
     else
     {
-        pipelineInfo.renderPass = recipe->depthTest ? renderer->depthRenderPass
-                                                    : renderer->colorRenderPass;
+        pipelineInfo.renderPass = depthAttachment ? renderer->depthRenderPass
+                                                  : renderer->colorRenderPass;
         pipelineInfo.subpass = 0u;
     }
 
@@ -1724,7 +1730,7 @@ static bool CreateResolvePipeline(Renderer *renderer, VkPipeline *outPipeline)
     return CreateGraphicsPipeline(renderer, &recipe, outPipeline);
 }
 
-static bool CreateUiPipeline(Renderer *renderer, VkPipeline *outPipeline)
+static bool CreateUiPipeline(Renderer *renderer, bool inScenePass, VkPipeline *outPipeline)
 {
     PipelineRecipe recipe = {
         .vertexSlot = LAIUE_SHADER_UI_VERTEX,
@@ -1735,6 +1741,7 @@ static bool CreateUiPipeline(Renderer *renderer, VkPipeline *outPipeline)
         .pixelFallbackBytes = (uint32_t)sizeof(g_ui_ps),
         .layout = renderer->uiPipelineLayout,
         .depthTest = false,
+        .inScenePass = inScenePass,
         .blend = true,
         .cullMode = VK_CULL_MODE_NONE,
         .wireframe = false,
@@ -3766,7 +3773,8 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     if ((renderer->hasSurface && !SwapchainCreate(renderer, initialWidth, initialHeight)) ||
         !CreateFrameTargets(renderer, initialWidth, initialHeight) ||
         !CreateResolvePipeline(renderer, &renderer->resolvePipeline) ||
-        !CreateUiPipeline(renderer, &renderer->uiPipeline))
+        !CreateUiPipeline(renderer, false, &renderer->uiPipeline) ||
+        !CreateUiPipeline(renderer, true, &renderer->uiScenePipeline))
     {
         RendererDestroy_Vulkan(renderer);
         return NULL;
@@ -3934,6 +3942,8 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             vkDestroyPipeline(renderer->device, renderer->resolvePipeline, NULL);
         if (renderer->uiPipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(renderer->device, renderer->uiPipeline, NULL);
+        if (renderer->uiScenePipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, renderer->uiScenePipeline, NULL);
         if (renderer->chunkPipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(renderer->device, renderer->chunkPipelineLayout, NULL);
         if (renderer->genericPushPipelineLayout != VK_NULL_HANDLE)
@@ -4937,47 +4947,40 @@ static void EndRenderingIfActive(Renderer *renderer)
     renderer->renderingActive = false;
 }
 
+// Проход с глубиной очищает обе цели сам, поэтому clearColor обязателен; проходу
+// только с цветом очистка нужна не всегда.
 static void BeginLegacyRenderPass(Renderer *renderer, VkFramebuffer framebuffer,
                                   bool depth, int32_t x, int32_t y, uint32_t width,
-                                  uint32_t height, const float clearColor[4],
-                                  bool clearDepth)
+                                  uint32_t height, const float clearColor[4])
 {
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    VkClearValue clearValues[2] = { { .color = { { 0.0f } } },
+                                    { .depthStencil = { 1.0f, 0u } } };
+    if (clearColor != NULL)
+        memcpy(clearValues[0].color.float32, clearColor, sizeof(float) * 4u);
     VkRenderPassBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = depth ? renderer->depthRenderPass : renderer->colorRenderPass,
         .framebuffer = framebuffer,
         .renderArea = { { x, y }, { width, height } },
+        .clearValueCount = depth ? 2u : 0u,
+        .pClearValues = clearValues,
     };
     vkCmdBeginRenderPass(commandBuffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkClearAttachment clears[2];
-    uint32_t clearCount = 0u;
-    if (clearColor != NULL)
+    if (!depth && clearColor != NULL)
     {
-        clears[clearCount] = (VkClearAttachment){
+        VkClearAttachment clear = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .colorAttachment = 0u,
+            .clearValue = clearValues[0],
         };
-        memcpy(clears[clearCount].clearValue.color.float32, clearColor, sizeof(float) * 4u);
-        ++clearCount;
-    }
-    if (depth && clearDepth)
-    {
-        clears[clearCount] = (VkClearAttachment){
-            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .clearValue = { .depthStencil = { 1.0f, 0u } },
-        };
-        ++clearCount;
-    }
-    if (clearCount != 0u)
-    {
         VkClearRect rect = {
             .rect = { { x, y }, { width, height } },
             .baseArrayLayer = 0u,
             .layerCount = 1u,
         };
-        vkCmdClearAttachments(commandBuffer, clearCount, clears, 1u, &rect);
+        vkCmdClearAttachments(commandBuffer, 1u, &clear, 1u, &rect);
     }
     renderer->renderingActive = true;
 }
@@ -5216,11 +5219,12 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         const float clearColor[4] = {
             frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
         };
+        renderer->currentStats.targetPasses++;
         if (!renderer->useDynamicRendering)
         {
             BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
                                   false, 0, 0, (uint32_t)renderer->windowWidth,
-                                  (uint32_t)renderer->windowHeight, clearColor, false);
+                                  (uint32_t)renderer->windowHeight, clearColor);
             SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                                   (uint32_t)renderer->windowHeight);
             EndRenderingIfActive(renderer);
@@ -5290,6 +5294,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         height = (uint32_t)renderer->windowHeight;
     }
     if (width == 0u || height == 0u || colorView == VK_NULL_HANDLE) return;
+    if (!renderer->frame.panorama) renderer->currentStats.targetPasses++;
 
     if (!renderer->useDynamicRendering)
     {
@@ -5302,8 +5307,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
                                                                          ? pass->faceIndex
                                                                          : 0u]
                                         : renderer->depthFramebuffers[FrameTargetIndex(renderer)];
-        BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height,
-                              clearColor, true);
+        BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height, clearColor);
         SetViewportAndScissor(commandBuffer, x, y, width, height);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
         memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection,
@@ -5364,12 +5368,13 @@ static void RecordPanoramaResolve(Renderer *renderer)
     };
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+    renderer->currentStats.targetPasses++;
 
     if (!renderer->useDynamicRendering)
     {
         BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
                               false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL, false);
+                              (uint32_t)renderer->windowHeight, NULL);
         SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                               (uint32_t)renderer->windowHeight);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
@@ -5415,34 +5420,17 @@ static void RecordPanoramaResolve(Renderer *renderer)
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
-static void RecordUiLayer(Renderer *renderer)
+// Проход для интерфейса в кадре, где прохода сцены нет.
+static void BeginUiPass(Renderer *renderer)
 {
-    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    UiConstants constants = {
-        .screenSize = { (float)renderer->windowWidth, (float)renderer->windowHeight },
-    };
-    uint32_t constantOffset = 0u;
-    if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
-
+    renderer->currentStats.targetPasses++;
     if (!renderer->useDynamicRendering)
     {
         BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
                               false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL, false);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
-        BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
-        uint32_t dynamicOffsets[2] = { constantOffset, 0u };
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                renderer->uiPipelineLayout, 0u, 1u,
-                                &renderer->uiSets[renderer->frameIndex], 2u,
-                                dynamicOffsets);
-        vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
-        EndRenderingIfActive(renderer);
-        renderer->currentStats.drawCalls++;
+                              (uint32_t)renderer->windowHeight, NULL);
         return;
     }
-
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = FrameTarget(renderer)->view,
@@ -5458,16 +5446,32 @@ static void RecordUiLayer(Renderer *renderer)
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
-    renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
+    renderer->cmdBeginRendering(renderer->commandBuffers[renderer->frameIndex], &renderingInfo);
+    renderer->renderingActive = true;
+}
+
+static void RecordUiLayer(Renderer *renderer)
+{
+    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    UiConstants constants = {
+        .screenSize = { (float)renderer->windowWidth, (float)renderer->windowHeight },
+    };
+    uint32_t constantOffset = 0u;
+    if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+
+    // Открытый проход сцены продолжается: для своего прохода тайловый GPU записал
+    // бы весь кадр в память и тут же прочитал его обратно.
+    const bool inScenePass = renderer->renderingActive;
+    if (!inScenePass) BeginUiPass(renderer);
     SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
                           (uint32_t)renderer->windowHeight);
-    BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
+    BindGraphicsPipeline(renderer, commandBuffer,
+                         inScenePass ? renderer->uiScenePipeline : renderer->uiPipeline);
     uint32_t dynamicOffsets[2] = { constantOffset, 0u };
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->uiPipelineLayout, 0u, 1u,
                             &renderer->uiSets[renderer->frameIndex], 2u, dynamicOffsets);
     vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
-    renderer->cmdEndRendering(commandBuffer);
     renderer->currentStats.drawCalls++;
 }
 
@@ -5503,10 +5507,13 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
         return false;
 
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    EndRenderingIfActive(renderer);
-
-    if (renderer->frame.panorama && renderer->cubeResolution != 0u) RecordPanoramaResolve(renderer);
+    if (renderer->frame.panorama)
+    {
+        EndRenderingIfActive(renderer);
+        if (renderer->cubeResolution != 0u) RecordPanoramaResolve(renderer);
+    }
     if (renderer->uiQuadCount > 0u && renderer->fontReady) RecordUiLayer(renderer);
+    EndRenderingIfActive(renderer);
 
     // Без swapchain «показ» кадра — это перевод цели в состояние, из
     // которого её можно прочитать: именно так кадр проверяется в тестах.
@@ -5898,8 +5905,10 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
     VkPipeline chunkPipeline = VK_NULL_HANDLE;
     VkPipeline resolvePipeline = VK_NULL_HANDLE;
     VkPipeline uiPipeline = VK_NULL_HANDLE;
+    VkPipeline uiScenePipeline = VK_NULL_HANDLE;
     bool ok = CreateResolvePipeline(renderer, &resolvePipeline) &&
-              CreateUiPipeline(renderer, &uiPipeline) &&
+              CreateUiPipeline(renderer, false, &uiPipeline) &&
+              CreateUiPipeline(renderer, true, &uiScenePipeline) &&
               (!renderer->worldReady || CreateChunkPipeline(renderer, &chunkPipeline));
     if (!ok)
     {
@@ -5907,6 +5916,8 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
         if (resolvePipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(renderer->device, resolvePipeline, NULL);
         if (uiPipeline != VK_NULL_HANDLE) vkDestroyPipeline(renderer->device, uiPipeline, NULL);
+        if (uiScenePipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, uiScenePipeline, NULL);
         ReleaseShaderArray(replacements);
         memcpy((void *)renderer->loadedShaders, (const void *)previousShaders,
                sizeof(previousShaders));
@@ -5919,8 +5930,11 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
         vkDestroyPipeline(renderer->device, renderer->resolvePipeline, NULL);
     if (renderer->uiPipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(renderer->device, renderer->uiPipeline, NULL);
+    if (renderer->uiScenePipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(renderer->device, renderer->uiScenePipeline, NULL);
     renderer->resolvePipeline = resolvePipeline;
     renderer->uiPipeline = uiPipeline;
+    renderer->uiScenePipeline = uiScenePipeline;
     if (chunkPipeline != VK_NULL_HANDLE)
     {
         if (renderer->chunkPipeline != VK_NULL_HANDLE)
