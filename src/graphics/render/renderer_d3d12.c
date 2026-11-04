@@ -121,6 +121,12 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // ресурсов с выравниванием по 64 КиБ; блоки освобождаются, когда пройден
 // fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
+// загрузок много, накопленное копируется сразу: иначе подготовка большой
+// сцены держала бы все её пиксели в памяти дважды.
+#define MAX_PENDING_TEXTURE_UPLOADS 256u
+#define TEXTURE_STAGING_LIMIT_BYTES (UINT64_C(256) << 20)
+#define TEXTURE_STAGING_CHUNK_BYTES (UINT64_C(64) << 10)
 // Инстансное кольцо — чанковый upload-пул: кадровый слот начинает с одного
 // небольшого чанка и добавляет новый только тогда, когда очередной вызов
 // перестаёт влезать в уже существующие. Стартовая плата падает с 2 x 16 МиБ
@@ -194,6 +200,14 @@ typedef struct StagingOverflow
     uint64_t sizeBytes;
     uint64_t usedBytes;
 } StagingOverflow;
+
+typedef struct PendingTextureUpload
+{
+    RendererTexture *texture;
+    ID3D12Resource *staging;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    uint32_t mipLevel;
+} PendingTextureUpload;
 
 typedef struct DeferredResourceRelease
 {
@@ -396,6 +410,10 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
     StagingOverflow*           stagingOverflow[FRAME_COUNT];
+    PendingTextureUpload       pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
+    uint32_t                   pendingTextureCount;
+    StagingOverflow*           textureStaging;
+    uint64_t                   textureStagingBytes;
     // Чанковый пул инстансов, по независимому набору на кадровый слот.
     // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
     // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
@@ -912,11 +930,11 @@ static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
     renderer->deferredResourceCount++;
 }
 
-// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
-static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+// Вызывается, когда GPU эти staging-блоки уже не читает.
+static void ReleaseStagingChain(StagingOverflow **head)
 {
-    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
-    renderer->stagingOverflow[frameIndex] = NULL;
+    StagingOverflow *chunk = *head;
+    *head = NULL;
     while (chunk != NULL)
     {
         StagingOverflow *next = chunk->next;
@@ -925,6 +943,12 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
         HeapFree(GetProcessHeap(), 0, chunk);
         chunk = next;
     }
+}
+
+// Дополнительные staging-блоки слота.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    ReleaseStagingChain(&renderer->stagingOverflow[frameIndex]);
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
@@ -2618,6 +2642,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     }
 
     RendererReleaseWorld_D3D12(renderer);
+    ReleaseStagingChain(&renderer->textureStaging);
     if (renderer->pendingUploads != NULL)
         HeapFree(GetProcessHeap(), 0, renderer->pendingUploads);
 
@@ -2739,22 +2764,21 @@ static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
     return true;
 }
 
-// Копирует запись в дополнительный блок текущего слота, начиная новый
-// блок, когда в последнем не хватает места.
-static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
-                          ID3D12Resource **outStaging, uint32_t *outOffset)
+// Место под запись в цепочке staging-блоков: в последнем блоке, а если там
+// тесно, в новом, не меньше minimumBytes.
+static bool ReserveStaging(Renderer *renderer, StagingOverflow **head, uint64_t sizeBytes,
+                           uint64_t alignment, uint64_t minimumBytes,
+                           ID3D12Resource **outStaging, uint64_t *outOffset, uint8_t **outMapped)
 {
-    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
     StagingOverflow *chunk = *head;
-    uint64_t offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(uint64_t)15u;
+    uint64_t offset =
+        chunk == NULL ? 0u : (chunk->usedBytes + alignment - 1u) & ~(alignment - 1u);
     if (chunk == NULL || offset > chunk->sizeBytes || sizeBytes > chunk->sizeBytes - offset)
     {
         chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*chunk));
         if (chunk == NULL)
             return false;
-        chunk->sizeBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
-                               ? sizeBytes
-                               : LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        chunk->sizeBytes = sizeBytes > minimumBytes ? sizeBytes : minimumBytes;
         D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
         D3D12_RESOURCE_DESC description;
         memset(&description, 0, sizeof(description));
@@ -2784,9 +2808,23 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
         *head = chunk;
         offset = 0u;
     }
-    memcpy(chunk->mapped + offset, data, sizeBytes);
     chunk->usedBytes = offset + sizeBytes;
     *outStaging = chunk->resource;
+    *outOffset = offset;
+    *outMapped = chunk->mapped + offset;
+    return true;
+}
+
+// Копирует запись в дополнительный блок текущего слота.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          ID3D12Resource **outStaging, uint32_t *outOffset)
+{
+    uint64_t offset = 0u;
+    uint8_t *mapped = NULL;
+    if (!ReserveStaging(renderer, &renderer->stagingOverflow[renderer->frameIndex], sizeBytes, 16u,
+                        (uint64_t)LARGE_MESH_UPLOAD_BYTES_PER_FRAME, outStaging, &offset, &mapped))
+        return false;
+    memcpy(mapped, data, sizeBytes);
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -3029,6 +3067,85 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
     return texture;
 }
 
+// Уровни одной текстуры обычно идут подряд, и барьеры нужны вокруг всей серии.
+static void RecordTextureUploads(Renderer *renderer)
+{
+    const uint32_t count = renderer->pendingTextureCount;
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        const PendingTextureUpload *upload = &renderer->pendingTextures[i];
+        ID3D12Resource *resource = upload->texture->resource;
+        if (i == 0u || upload[-1].texture != upload->texture)
+        {
+            D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+                resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+        }
+        D3D12_TEXTURE_COPY_LOCATION destination;
+        memset(&destination, 0, sizeof(destination));
+        destination.pResource = resource;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = upload->mipLevel;
+        D3D12_TEXTURE_COPY_LOCATION source;
+        memset(&source, 0, sizeof(source));
+        source.pResource = upload->staging;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = upload->layout;
+        ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList, &destination, 0u, 0u,
+                                                    0u, &source, NULL);
+        if (i + 1u == count || upload[1].texture != upload->texture)
+        {
+            D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
+                resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
+        }
+    }
+    renderer->pendingTextureCount = 0u;
+}
+
+// Блоки читает записанный список, поэтому они уходят вместе с блоками его слота.
+static void RetireTextureStaging(Renderer *renderer)
+{
+    StagingOverflow **tail = &renderer->stagingOverflow[renderer->frameIndex];
+    while (*tail != NULL)
+        tail = &(*tail)->next;
+    *tail = renderer->textureStaging;
+    renderer->textureStaging = NULL;
+    renderer->textureStagingBytes = 0u;
+}
+
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging-блоки.
+static bool FlushTextureUploads(Renderer *renderer)
+{
+    if (renderer->pendingTextureCount != 0u)
+    {
+        if (!WaitForGpu(renderer) ||
+            FAILED(ID3D12CommandAllocator_Reset(
+                renderer->commandAllocators[renderer->frameIndex])) ||
+            FAILED(ID3D12GraphicsCommandList_Reset(
+                renderer->commandList, renderer->commandAllocators[renderer->frameIndex], NULL)))
+            return false;
+        // Reset начинает новый command list с PSO=NULL; он не наследует
+        // привязки предыдущей записи.
+        renderer->boundPipelineState = NULL;
+        renderer->boundRootSignature = NULL;
+        renderer->boundIndexAddress = 0u;
+        renderer->boundIndexBytes = 0u;
+        RecordTextureUploads(renderer);
+        if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
+            return false;
+        ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
+        ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
+        if (!WaitForGpu(renderer))
+            return false;
+    }
+    ReleaseStagingChain(&renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    return true;
+}
+
 bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes)
@@ -3043,7 +3160,7 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
 {
     if (renderer == NULL || texture == NULL || texture->owner != renderer ||
         texture->resource == NULL || data == NULL ||
-        renderer->frameRecording || rowPitchBytes == 0u)
+        renderer->frameRecording || renderer->frameFailed || rowPitchBytes == 0u)
         return false;
     D3D12_RESOURCE_DESC textureDescription;
     ID3D12Resource_GetDesc(texture->resource, &textureDescription);
@@ -3070,81 +3187,28 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
     if (rows != mipHeight || rowSize != rowPitchBytes || uploadBytes == 0u)
         return false;
 
-    D3D12_RESOURCE_DESC uploadDescription;
-    memset(&uploadDescription, 0, sizeof(uploadDescription));
-    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDescription.Width = uploadBytes;
-    uploadDescription.Height = 1u;
-    uploadDescription.DepthOrArraySize = 1u;
-    uploadDescription.MipLevels = 1u;
-    uploadDescription.SampleDesc.Count = 1u;
-    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-    ID3D12Resource *upload = NULL;
-    if (FAILED(ID3D12Device_CreateCommittedResource(
-            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
-            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
-            (void **)&upload)))
+    if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
+         renderer->textureStagingBytes + uploadBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
+        !FlushTextureUploads(renderer))
         return false;
-
-    D3D12_RANGE emptyRange = {0, 0};
+    ID3D12Resource *staging = NULL;
+    uint64_t offset = 0u;
     uint8_t *mapped = NULL;
-    if (FAILED(ID3D12Resource_Map(upload, 0u, &emptyRange, (void **)&mapped)))
-    {
-        ID3D12Resource_Release(upload);
+    if (!ReserveStaging(renderer, &renderer->textureStaging, uploadBytes,
+                        D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, TEXTURE_STAGING_CHUNK_BYTES,
+                        &staging, &offset, &mapped))
         return false;
-    }
     const uint8_t *source = (const uint8_t *)data;
     for (UINT row = 0u; row < rows; ++row)
-        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
+        memcpy(mapped + (size_t)row * layout.Footprint.RowPitch,
                source + (size_t)row * rowPitchBytes, (size_t)rowPitchBytes);
-    ID3D12Resource_Unmap(upload, 0u, NULL);
-
-    WaitForGpu(renderer);
-    if (FAILED(ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex])) ||
-        FAILED(ID3D12GraphicsCommandList_Reset(renderer->commandList,
-                                                renderer->commandAllocators[renderer->frameIndex],
-                                                NULL)))
-    {
-        ID3D12Resource_Release(upload);
-        return false;
-    }
-    // Reset начинает новый command list с PSO=NULL; он не наследует
-    // привязки предыдущей записи.
-    renderer->boundPipelineState = NULL;
-    renderer->boundRootSignature = NULL;
-    renderer->boundIndexAddress = 0u;
-    renderer->boundIndexBytes = 0u;
-    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
-        texture->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
-    D3D12_TEXTURE_COPY_LOCATION destination;
-    memset(&destination, 0, sizeof(destination));
-    destination.pResource = texture->resource;
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = mipLevel;
-    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
-    memset(&sourceLocation, 0, sizeof(sourceLocation));
-    sourceLocation.pResource = upload;
-    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    sourceLocation.PlacedFootprint = layout;
-    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
-                                                 &destination, 0u, 0u, 0u,
-                                                 &sourceLocation, NULL);
-    D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
-        texture->resource, D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
-    if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
-    {
-        ID3D12Resource_Release(upload);
-        return false;
-    }
-    ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
-    ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
-    WaitForGpu(renderer);
-    ID3D12Resource_Release(upload);
+    layout.Offset = offset;
+    PendingTextureUpload *upload = &renderer->pendingTextures[renderer->pendingTextureCount++];
+    upload->texture = texture;
+    upload->staging = staging;
+    upload->layout = layout;
+    upload->mipLevel = mipLevel;
+    renderer->textureStagingBytes += uploadBytes;
     return true;
 }
 
@@ -3232,6 +3296,15 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
     if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
         renderer->fenceEvent != NULL)
         WaitForGpu(renderer);
+    if (renderer != NULL)
+    {
+        // Его пиксели остаются в staging-блоках до следующего кадра.
+        uint32_t kept = 0u;
+        for (uint32_t i = 0u; i < renderer->pendingTextureCount; ++i)
+            if (renderer->pendingTextures[i].texture != texture)
+                renderer->pendingTextures[kept++] = renderer->pendingTextures[i];
+        renderer->pendingTextureCount = kept;
+    }
     if (texture->resource != NULL)
         ID3D12Resource_Release(texture->resource);
     if (renderer != NULL)
@@ -3919,6 +3992,8 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     RecordFontAtlasUpload(renderer);
     RecordBackgroundUpload(renderer);
     RecordPendingUploads(renderer);
+    RecordTextureUploads(renderer);
+    RetireTextureStaging(renderer);
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);

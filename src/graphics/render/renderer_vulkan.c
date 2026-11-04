@@ -113,6 +113,14 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
 // когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
+// загрузок много, накопленное копируется сразу: иначе подготовка большой
+// сцены держала бы все её пиксели в памяти дважды.
+#define MAX_PENDING_TEXTURE_UPLOADS 256u
+#define TEXTURE_STAGING_LIMIT_BYTES (UINT64_C(256) << 20)
+#define TEXTURE_STAGING_CHUNK_BYTES (UINT64_C(64) << 10)
+// Больше любого optimalBufferCopyOffsetAlignment у настоящих устройств.
+#define TEXTURE_STAGING_ALIGNMENT 256u
 // Инстансы идут в независимых storage-буферах: descriptor set фиксирует
 // конкретный буфер до конца командного списка, поэтому растить один
 // VkBuffer заменой нельзя без копирования уже записанных данных. Чанки
@@ -243,6 +251,16 @@ typedef struct StagingOverflow
     GpuBuffer buffer;
     VkDeviceSize usedBytes;
 } StagingOverflow;
+
+typedef struct PendingTextureUpload
+{
+    RendererTexture *texture;
+    VkBuffer staging;
+    VkDeviceSize sourceOffset;
+    uint32_t mipLevel;
+    uint32_t width;
+    uint32_t height;
+} PendingTextureUpload;
 
 typedef struct DeferredRangeRelease
 {
@@ -422,6 +440,10 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
     StagingOverflow *stagingOverflow[FRAME_COUNT];
+    PendingTextureUpload pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
+    uint32_t pendingTextureCount;
+    StagingOverflow *textureStaging;
+    uint64_t textureStagingBytes;
     bool uploadSlotReady[FRAME_COUNT];
     GpuBuffer instanceBuffers[FRAME_COUNT][INSTANCE_MAX_CHUNKS_PER_FRAME];
     uint32_t instanceChunkCount[FRAME_COUNT];
@@ -679,11 +701,11 @@ static bool BufferCreate(Renderer *renderer, VkDeviceSize sizeBytes, VkBufferUsa
     return true;
 }
 
-// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
-static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+// Вызывается, когда GPU эти staging-блоки уже не читает.
+static void ReleaseStagingChain(Renderer *renderer, StagingOverflow **head)
 {
-    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
-    renderer->stagingOverflow[frameIndex] = NULL;
+    StagingOverflow *chunk = *head;
+    *head = NULL;
     while (chunk != NULL)
     {
         StagingOverflow *next = chunk->next;
@@ -691,6 +713,12 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
         PlatformFree(chunk);
         chunk = next;
     }
+}
+
+// Дополнительные staging-блоки слота.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    ReleaseStagingChain(renderer, &renderer->stagingOverflow[frameIndex]);
 }
 
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
@@ -2074,17 +2102,13 @@ static bool EnsureBlockInstanceDescriptorSet(Renderer *renderer, uint32_t blockI
 
 // === Загрузка текстур ===
 
-static bool UploadImageMipPixels(Renderer *renderer, GpuImage *image,
-                                 const uint8_t *pixels, uint32_t bytesPerPixel,
-                                 uint32_t layerCount, uint32_t mipLevel)
+static bool UploadImagePixels(Renderer *renderer, GpuImage *image,
+                              const uint8_t *pixels, uint32_t bytesPerPixel,
+                              uint32_t layerCount)
 {
-    if (mipLevel >= image->mipLevels || layerCount != image->layerCount)
+    if (layerCount != image->layerCount)
         return false;
-    const uint32_t shiftedWidth = image->width >> mipLevel;
-    const uint32_t shiftedHeight = image->height >> mipLevel;
-    const uint32_t width = shiftedWidth == 0u ? 1u : shiftedWidth;
-    const uint32_t height = shiftedHeight == 0u ? 1u : shiftedHeight;
-    VkDeviceSize layerBytes = (VkDeviceSize)width * height * bytesPerPixel;
+    VkDeviceSize layerBytes = (VkDeviceSize)image->width * image->height * bytesPerPixel;
     VkDeviceSize totalBytes = layerBytes * layerCount;
     GpuBuffer staging;
     if (!BufferCreate(renderer, totalBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, &staging))
@@ -2101,8 +2125,8 @@ static bool UploadImageMipPixels(Renderer *renderer, GpuImage *image,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy region = {
         .bufferOffset = 0u,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevel, 0u, layerCount },
-        .imageExtent = { width, height, 1u },
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, layerCount },
+        .imageExtent = { image->width, image->height, 1u },
     };
     vkCmdCopyBufferToImage(commandBuffer, staging.buffer, image->image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
@@ -2111,14 +2135,6 @@ static bool UploadImageMipPixels(Renderer *renderer, GpuImage *image,
     bool ok = EndImmediate(renderer, commandBuffer);
     BufferDestroy(renderer, &staging);
     return ok;
-}
-
-static bool UploadImagePixels(Renderer *renderer, GpuImage *image,
-                              const uint8_t *pixels, uint32_t bytesPerPixel,
-                              uint32_t layerCount)
-{
-    return UploadImageMipPixels(renderer, image, pixels, bytesPerPixel,
-                                layerCount, 0u);
 }
 
 // Слои пака лежат отдельными подресурсами; общий staging собирается из
@@ -3591,6 +3607,7 @@ void RendererDestroy_Vulkan(Renderer *renderer)
     if (renderer->device != VK_NULL_HANDLE) WaitForGpu(renderer);
 
     RendererReleaseWorld_Vulkan(renderer);
+    ReleaseStagingChain(renderer, &renderer->textureStaging);
     if (renderer->device != VK_NULL_HANDLE)
     {
         DrainDeferredReleases(renderer, true);
@@ -3695,23 +3712,22 @@ static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
     return true;
 }
 
-// Копирует запись в дополнительный блок текущего слота, начиная новый
-// блок, когда в последнем не хватает места.
-static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
-                          VkBuffer *outStaging, uint32_t *outOffset)
+// Место под запись в цепочке staging-блоков: в последнем блоке, а если там
+// тесно, в новом, не меньше minimumBytes.
+static bool ReserveStaging(Renderer *renderer, StagingOverflow **head, VkDeviceSize sizeBytes,
+                           VkDeviceSize alignment, VkDeviceSize minimumBytes,
+                           VkBuffer *outStaging, VkDeviceSize *outOffset, uint8_t **outMapped)
 {
-    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
     StagingOverflow *chunk = *head;
-    VkDeviceSize offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(VkDeviceSize)15u;
+    VkDeviceSize offset =
+        chunk == NULL ? 0u : (chunk->usedBytes + alignment - 1u) & ~(alignment - 1u);
     if (chunk == NULL || offset > chunk->buffer.sizeBytes ||
         sizeBytes > chunk->buffer.sizeBytes - offset)
     {
         chunk = (StagingOverflow *)PlatformAllocate(sizeof(*chunk), true);
         if (chunk == NULL)
             return false;
-        const VkDeviceSize chunkBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
-                                            ? (VkDeviceSize)sizeBytes
-                                            : (VkDeviceSize)LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        const VkDeviceSize chunkBytes = sizeBytes > minimumBytes ? sizeBytes : minimumBytes;
         if (!BufferCreate(renderer, chunkBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
                           &chunk->buffer))
         {
@@ -3722,9 +3738,24 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
         *head = chunk;
         offset = 0u;
     }
-    memcpy(chunk->buffer.mapped + offset, data, sizeBytes);
     chunk->usedBytes = offset + sizeBytes;
     *outStaging = chunk->buffer.buffer;
+    *outOffset = offset;
+    *outMapped = chunk->buffer.mapped + offset;
+    return true;
+}
+
+// Копирует запись в дополнительный блок текущего слота.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          VkBuffer *outStaging, uint32_t *outOffset)
+{
+    VkDeviceSize offset = 0u;
+    uint8_t *mapped = NULL;
+    if (!ReserveStaging(renderer, &renderer->stagingOverflow[renderer->frameIndex], sizeBytes, 16u,
+                        (VkDeviceSize)LARGE_MESH_UPLOAD_BYTES_PER_FRAME, outStaging, &offset,
+                        &mapped))
+        return false;
+    memcpy(mapped, data, sizeBytes);
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -3965,6 +3996,58 @@ RendererTexture *RendererCreateTexture_Vulkan(Renderer *renderer, uint32_t width
     return texture;
 }
 
+// Уровни одной текстуры обычно идут подряд, и барьеры нужны вокруг всей серии.
+static void RecordTextureUploads(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    const uint32_t count = renderer->pendingTextureCount;
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        const PendingTextureUpload *upload = &renderer->pendingTextures[index];
+        GpuImage *image = &upload->texture->image;
+        ImageBarrier(commandBuffer, image, VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region = {
+            .bufferOffset = upload->sourceOffset,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, upload->mipLevel, 0u, 1u },
+            .imageExtent = { upload->width, upload->height, 1u },
+        };
+        vkCmdCopyBufferToImage(commandBuffer, upload->staging, image->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
+        if (index + 1u == count || upload[1].texture != upload->texture)
+            ImageBarrier(commandBuffer, image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    renderer->pendingTextureCount = 0u;
+}
+
+// Блоки читает записанный буфер, поэтому они уходят вместе с блоками его слота.
+static void RetireTextureStaging(Renderer *renderer)
+{
+    StagingOverflow **tail = &renderer->stagingOverflow[renderer->frameIndex];
+    while (*tail != NULL)
+        tail = &(*tail)->next;
+    *tail = renderer->textureStaging;
+    renderer->textureStaging = NULL;
+    renderer->textureStagingBytes = 0u;
+}
+
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging-блоки.
+static bool FlushTextureUploads(Renderer *renderer)
+{
+    if (renderer->pendingTextureCount != 0u)
+    {
+        VkCommandBuffer commandBuffer = BeginImmediate(renderer);
+        if (commandBuffer == VK_NULL_HANDLE)
+            return false;
+        RecordTextureUploads(renderer, commandBuffer);
+        if (!EndImmediate(renderer, commandBuffer))
+            return false;
+    }
+    ReleaseStagingChain(renderer, &renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    return true;
+}
+
 bool RendererUploadTexture_Vulkan(Renderer *renderer, RendererTexture *texture,
                                   const void *data, uint64_t sizeBytes,
                                   uint32_t rowPitchBytes)
@@ -3978,7 +4061,7 @@ bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *textur
                                      uint64_t sizeBytes, uint32_t rowPitchBytes)
 {
     if (renderer == NULL || texture == NULL || texture->owner != renderer || data == NULL ||
-        renderer->frameRecording ||
+        renderer->frameRecording || renderer->deviceFailed ||
         texture->image.image == VK_NULL_HANDLE || rowPitchBytes == 0u ||
         mipLevel >= texture->image.mipLevels || mipLevel >= 32u)
         return false;
@@ -3990,8 +4073,27 @@ bool RendererUploadTextureMip_Vulkan(Renderer *renderer, RendererTexture *textur
         (uint64_t)mipHeight > UINT64_MAX / rowPitchBytes ||
         sizeBytes != (uint64_t)mipHeight * rowPitchBytes)
         return false;
-    return UploadImageMipPixels(renderer, &texture->image, (const uint8_t *)data,
-                                4u, 1u, mipLevel);
+    if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
+         renderer->textureStagingBytes + sizeBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
+        !FlushTextureUploads(renderer))
+        return false;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0u;
+    uint8_t *mapped = NULL;
+    if (!ReserveStaging(renderer, &renderer->textureStaging, sizeBytes,
+                        TEXTURE_STAGING_ALIGNMENT, TEXTURE_STAGING_CHUNK_BYTES, &staging, &offset,
+                        &mapped))
+        return false;
+    memcpy(mapped, data, (size_t)sizeBytes);
+    PendingTextureUpload *upload = &renderer->pendingTextures[renderer->pendingTextureCount++];
+    upload->texture = texture;
+    upload->staging = staging;
+    upload->sourceOffset = offset;
+    upload->mipLevel = mipLevel;
+    upload->width = mipWidth;
+    upload->height = mipHeight;
+    renderer->textureStagingBytes += sizeBytes;
+    return true;
 }
 
 static VkFilter SamplerFilter_Vulkan(uint32_t filter)
@@ -4072,7 +4174,15 @@ void RendererDestroyTexture_Vulkan(Renderer *renderer, RendererTexture *texture)
         FreeAllGenericDescriptorSets(renderer);
     }
     if (renderer != NULL)
+    {
+        // Его пиксели остаются в staging-блоках до следующего кадра.
+        uint32_t kept = 0u;
+        for (uint32_t index = 0u; index < renderer->pendingTextureCount; ++index)
+            if (renderer->pendingTextures[index].texture != texture)
+                renderer->pendingTextures[kept++] = renderer->pendingTextures[index];
+        renderer->pendingTextureCount = kept;
         ImageDestroy(renderer, &texture->image);
+    }
     PlatformFree(texture);
 }
 
@@ -4741,6 +4851,8 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     renderer->boundIndexOffset = 0u;
 
     RecordPendingUploads(renderer);
+    RecordTextureUploads(renderer, commandBuffer);
+    RetireTextureStaging(renderer);
 
     ImageBarrier(commandBuffer, &renderer->colorTargets[renderer->frameIndex],
                  VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);

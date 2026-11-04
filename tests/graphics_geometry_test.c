@@ -398,6 +398,67 @@ static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle i
     device->destroyHandle(device, vb);
 }
 
+static void UploadTexel(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle texture,
+                        const uint8_t texel[4])
+{
+    const LaiueGraphicsTextureUploadV1 upload = {.structSize = sizeof(upload),
+                                                 .texture = texture,
+                                                 .data = texel,
+                                                 .sizeBytes = 4u,
+                                                 .rowPitchBytes = 4u};
+    Expect(device->uploadTexture(device, &upload) != 0u, "a texel uploads");
+}
+
+/* Uploads wait for the start of a frame. More of them than the queue holds
+ * reach the GPU on the spot, and the order must survive that split. */
+static void QueuedTextureUploads(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle ib)
+{
+    Stage("queued texture uploads keep their order and survive a destroyed texture");
+    LaiueGraphicsVertexV2 white[4];
+    memcpy(white, vertices, sizeof(white));
+    for (uint32_t i = 0u; i < 4u; ++i)
+        white[i].colorRGBA = UINT32_C(0xffffffff);
+    LaiueGraphicsHandle vb =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, white, sizeof(white));
+    LaiueGraphicsTextureDescV1 textureDesc = {
+        sizeof(textureDesc), LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM, {1u, 1u, 1u}, 1u, 0u};
+    LaiueGraphicsHandle texture = 0u, dropped = 0u, sampler = 0u;
+    Expect(device->createTexture(device, &textureDesc, &texture) != 0u && texture != 0u &&
+               device->createTexture(device, &textureDesc, &dropped) != 0u && dropped != 0u,
+           "single texel textures create");
+    LaiueGraphicsSamplerDescV1 samplerDesc = {
+        sizeof(samplerDesc),          LAIUE_GRAPHICS_FILTER_NEAREST, LAIUE_GRAPHICS_FILTER_NEAREST,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_CLAMP,  LAIUE_GRAPHICS_ADDRESS_CLAMP};
+    Expect(device->createSampler(device, &samplerDesc, &sampler) != 0u && sampler != 0u,
+           "explicit nearest sampler creates");
+    LaiueGraphicsDrawItemV2 item = Item(vb, ib, 0u, 0, -0.5f, -0.5f, 4.0f);
+    item.texture = texture;
+    item.sampler = sampler;
+
+    static const uint8_t red[4] = {255u, 0u, 0u, 255u};
+    static const uint8_t green[4] = {0u, 255u, 0u, 255u};
+    static const uint8_t blue[4] = {0u, 0u, 255u, 255u};
+    for (uint32_t i = 0u; i < 300u; ++i)
+        UploadTexel(device, texture, red);
+    UploadTexel(device, texture, green);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xff00ff00), "the last of more uploads than the queue holds wins");
+
+    UploadTexel(device, dropped, red);
+    UploadTexel(device, texture, blue);
+    device->destroyHandle(device, dropped);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xffff0000), "a new upload reaches its first following frame");
+
+    device->destroyHandle(device, sampler);
+    device->destroyHandle(device, texture);
+    device->destroyHandle(device, vb);
+}
+
 static void FillInstances(void)
 {
     memset(instances, 0, sizeof(instances));
@@ -992,6 +1053,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         LargeRawIndices(device, vb);
         PartialIndexUpload(device, vb, ib);
         TexturedIndices(device, ia);
+        QueuedTextureUploads(device, ia);
         InstancePixels(device, vb, ia);
         SkyColor(device);
     VerticalSync(device);

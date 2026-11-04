@@ -41,7 +41,8 @@
 #define CLICK_SLOP 12.0f
 #define NAME_BYTES (LAIUE_PLATFORM_PATH_CAPACITY * 3u)
 #define CAPTION_BYTES 768u
-// Сколько кадров графике нужно, чтобы отдать удалённую текстуру.
+// Сколько кадров графике нужно, чтобы отдать удалённую текстуру и память,
+// через которую новая шла на видеокарту.
 #define RELEASE_FRAMES 4u
 
 typedef struct Files
@@ -521,6 +522,7 @@ static bool Upload(Viewer *viewer, const uint8_t *pixels, const uint8_t *chain, 
     viewer->picture.texture = texture;
     viewer->picture.width = width;
     viewer->picture.height = height;
+    viewer->framesLeft = RELEASE_FRAMES;
     return true;
 }
 
