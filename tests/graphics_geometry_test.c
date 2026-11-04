@@ -1209,10 +1209,10 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         OverflowRecordedRetirement(device);
         PendingUploadBurst(device);
         StagingSpill(device);
+        UploadsWithoutFrames(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         SwapChainRebuilds(service, device);
 #endif
-        UploadsWithoutFrames(device);
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);
