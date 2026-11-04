@@ -5,6 +5,13 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
+  Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
+  and the chain draws unrotated, and the renderer stopped the GPU and built a new
+  chain each time, in the landscape orientation games run in: 171 rebuilds in 171
+  frames on the emulator, 0 now. A frame acquired as suboptimal is drawn instead
+  of dropped. `swapchainRebuilds` in the graphics diagnostics counts them, which
+  grows `LaiueGraphicsDiagnosticsV2`, so a program that reads it has to be rebuilt.
 - A vertex buffer keeps no CPU copy: its bytes stay only in the GPU, so vertices
   take half the memory and each upload one copy less. Foxity uses 21 MB less. A
   vertex buffer now takes whole uploads only; index buffers still take parts.

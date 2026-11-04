@@ -512,6 +512,8 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     // пула геометрии было бесконфликтным.
     bool hasSurface;
     bool swapchainOutOfDate;
+    bool swapchainAcquiredSuboptimal;  // образ кадра захвачен с VK_SUBOPTIMAL_KHR
+    bool swapchainRefitTried;          // цепочку уже собирали заново из-за VK_SUBOPTIMAL_KHR
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkFormat swapchainFormat;
@@ -2815,6 +2817,9 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainExtent = extent;
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
+    // Цепочка рисует без поворота, а экран повёрнут: Android отвечает на такой
+    // показ VK_SUBOPTIMAL_KHR всегда, и новая цепочка была бы такой же.
+    renderer->swapchainRefitTried = preTransform != capabilities.currentTransform;
     for (uint32_t index = 0; index < actualCount; ++index)
         renderer->swapchainImages[index] = images[index];
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
@@ -2842,6 +2847,16 @@ static bool SwapchainRecreate(Renderer *renderer)
     return true;
 }
 
+// VK_SUBOPTIMAL_KHR — совет, а не сбой: образ показан. Новая цепочка может
+// подойти поверхности лучше, поэтому её собирают один раз. Если совет не
+// проходит, пересборка не помогает.
+static void NoteSwapchainFit(Renderer *renderer, bool suboptimal)
+{
+    if (suboptimal && !renderer->swapchainRefitTried)
+        renderer->swapchainOutOfDate = true;
+    renderer->swapchainRefitTried = suboptimal;
+}
+
 // Захват образа и запись копии colorTarget в команду кадра. Кадр уже
 // переведён вызывающим в TRANSFER_SRC_OPTIMAL.
 static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
@@ -2853,14 +2868,15 @@ static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandB
     VkResult acquire = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
                                              renderer->imageAvailable[renderer->frameIndex],
                                              VK_NULL_HANDLE, &imageIndex);
-    if (acquire != VK_SUCCESS)
+    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
     {
-        // OUT_OF_DATE/SUBOPTIMAL — не ошибка кадра: помечаем swapchain
+        // Образа нет, и OUT_OF_DATE — не ошибка кадра: помечаем swapchain
         // устаревшим, пересоберём в начале следующего кадра.
         renderer->swapchainOutOfDate = true;
         return PRESENT_OUTCOME_SKIP;
     }
 
+    renderer->swapchainAcquiredSuboptimal = acquire == VK_SUBOPTIMAL_KHR;
     renderer->swapchainImageIndex = imageIndex;
     VkImage destination = renderer->swapchainImages[imageIndex];
 
@@ -5281,9 +5297,12 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
             .pImageIndices = &imageIndex,
         };
         VkResult presentResult = vkQueuePresentKHR(renderer->queue, &presentInfo);
-        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
             renderer->swapchainOutOfDate = true;
-        else if (presentResult != VK_SUCCESS)
+        else if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR)
+            NoteSwapchainFit(renderer, renderer->swapchainAcquiredSuboptimal ||
+                                           presentResult == VK_SUBOPTIMAL_KHR);
+        else
         {
             FailVulkanDevice(renderer);
             return false;
@@ -5310,6 +5329,7 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+    outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)

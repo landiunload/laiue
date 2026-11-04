@@ -352,7 +352,9 @@ try {
     $rotationSettingsModified = $true
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0') | Out-Null
     Invoke-Adb -Arguments @('shell', 'wm', 'fixed-to-user-rotation', 'enabled') | Out-Null
-    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '0') | Out-Null
+    # The scenario runs in landscape, as games do: a rotated screen is where
+    # presentation differs from the natural orientation.
+    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
     Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-n', $component,
         '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId") | Out-Null
     $appProcessId = Invoke-Adb -Arguments @('shell', 'pidof', $package)
@@ -388,11 +390,20 @@ try {
     $gameplayState = Gameplay-State -Log $log -Event 'summary'
 
     # Require real resize/presentation, not merely changed Android settings.
-    $portraitFrame = Latest-Presentation -Log $log
+    $priorPresented = ([regex]::Matches($log, 'event=presented ')).Count
+    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '0') | Out-Null
+    $portraitLog = Wait-Log -Description 'portrait resize and presentation' -Condition {
+        param($text)
+        $presented = [regex]::Matches($text, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
+        return $presented.Count -gt $priorPresented -and
+               [int]$presented[$presented.Count - 1].Groups[1].Value -lt
+               [int]$presented[$presented.Count - 1].Groups[2].Value
+    }
+    $portraitFrame = Latest-Presentation -Log $portraitLog
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
         -NativeHeight ([int]$portraitFrame.Groups[2].Value)
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
-    $priorPresented = ([regex]::Matches($log, 'event=presented ')).Count
+    $priorPresented = ([regex]::Matches($portraitLog, 'event=presented ')).Count
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
     $landscapeLog = Wait-Log -Description 'landscape resize and presentation' -Condition {
         param($text)
@@ -405,7 +416,8 @@ try {
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
         -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
-    if ((Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
+    if ((Gameplay-State -Log $portraitLog -Event 'presented') -ne $gameplayState -or
+        (Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
         throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'
     }
     $rotationVerified = $true
