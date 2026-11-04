@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The viewer turns a page in 35 to 45 ms instead of 200 to 300 ms on
+  24-megapixel pictures. Reading and decoding took three quarters of that and
+  need no graphics device, so the neighbour in the direction of browsing is
+  read on its own thread, mip chain included. This holds one more picture in
+  memory, 122 MiB at this size.
 - On D3D12 a frame reaches the screen 33 ms sooner at 60 Hz: 50 ms instead of
   83 ms from the start of a frame in a window, 33 ms instead of 66 ms in
   borderless full screen. The present queue holds two frames instead of three,
@@ -16,7 +21,7 @@ API and ABI may change between minor versions.
   from any thread, and `WindowConsumeRedraw` reports when the system lost the
   window's picture. Without these calls frames run back to back, as before.
   The viewer uses them: a picture lying on the screen costs no CPU or GPU
-  time at all, down from 3 % of a core and 9 % of the GPU, and an animated
+  time at all, down from 2.5 % of a core and 7.3 % of the GPU, and an animated
   GIF draws only when its frame changes.
 - JPEG decodes twice as fast on one core: a 24-megapixel 4:2:0 photo takes
   75 ms instead of 157 ms, a 4:4:4 one 91 ms instead of 183 ms, and a
