@@ -75,6 +75,7 @@ typedef struct LaiueGraphicsDeviceState
     bool frameActive;
     bool lastFrameValid;
     bool readbackSupported;
+    bool readbackNeedsRequest;  // кадр окна читается только по запросу
     uint64_t completedFrameIndex;
 } LaiueGraphicsDeviceState;
 
@@ -432,6 +433,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     }
     state->renderer = renderer;
     state->readbackSupported = RendererCanCaptureFrame(renderer);
+    state->readbackNeedsRequest = nativeWindow != NULL;
     state->device.structSize = sizeof(state->device);
     state->device.abiVersion = LAIUE_GRAPHICS_ABI_VERSION_1;
     state->device.context = state;
@@ -1560,7 +1562,7 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
     if (state->readbackSupported)
     {
         result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED;
-        if (RendererGetBackend(state->renderer) == RENDERER_BACKEND_D3D12)
+        if (state->readbackNeedsRequest)
             result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED;
     }
     if (state->lastFrameValid)

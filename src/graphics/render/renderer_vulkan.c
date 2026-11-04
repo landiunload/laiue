@@ -5684,6 +5684,7 @@ void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
 {
     if (renderer == NULL) return;
     renderer->lastFrameValid = false;
+    renderer->captureRequested = false;
     if (width <= 0 || height <= 0)
     {
         // Нулевой размер — свёрнутое окно: кадры пропускаются до
