@@ -44,6 +44,8 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Буферов swapchain и кадров в полёте: третий нужен, чтобы без vsync, пока
 // один кадр на экране и следующий ждёт обновления, GPU уже рисовал ещё один.
 #define FRAME_COUNT 3
+// Предел ожидания места в очереди показа: кадр не встаёт, что бы ни случилось с окном.
+#define FRAME_LATENCY_WAIT_MILLISECONDS 100u
 
 // Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
 // блоков соседствуют — таблица чанкового прохода накрывает оба (t1, t2).
@@ -352,6 +354,10 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     bool                       verticalSyncEnabled;
     // Swapchain создан с DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.
     bool                       tearingSupported;
+    // ResizeBuffers обязан передать те же флаги, что и создание.
+    UINT                       swapChainFlags;
+    // Сигналит, когда очередь показа готова принять следующий кадр.
+    HANDLE                     frameLatencyWait;
     bool                       wireframeEnabled;
     bool                       worldReady;
     bool                       frameRecording;
@@ -2233,7 +2239,9 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
             DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))) && allowTearing;
         IDXGIFactory5_Release(factory5);
     }
-    swapChainDescription.Flags = renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    renderer->swapChainFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+        | (renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swapChainDescription.Flags = renderer->swapChainFlags;
 
     IDXGISwapChain1* swapChain1 = NULL;
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
@@ -2249,6 +2257,19 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     {
         RendererDestroy_D3D12(renderer);
         return NULL;
+    }
+    // По умолчанию очередь показа держит три кадра, и картинка отстаёт от ввода
+    // на пять обновлений экрана. Ожидание идёт в конце кадра, поэтому программа
+    // читает ввод уже после него, и в очереди два кадра: отправленный и тот, что
+    // она рисует. Предел здесь 1, а не 2: счёт объекта копится до предела, пока
+    // кадров нет, и с пределом 2 после паузы в очереди стало бы на кадр больше.
+    // Один кадр в очереди не годится: CPU и GPU работали бы строго по очереди,
+    // и им на двоих пришлось бы уложиться в одно обновление экрана, иначе число
+    // кадров падает вдвое.
+    if (SUCCEEDED(IDXGISwapChain3_SetMaximumFrameLatency(renderer->swapChain, 1)))
+    {
+        renderer->frameLatencyWait =
+            IDXGISwapChain3_GetFrameLatencyWaitableObject(renderer->swapChain);
     }
     // Полноэкранный режим переключает окно (Alt+Enter в модуле окна), без
     // рамки и одинаково для D3D12 и Vulkan. Свой Alt+Enter DXGI включал бы
@@ -2660,6 +2681,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     if (renderer->commandList != NULL) ID3D12GraphicsCommandList_Release(renderer->commandList);
     ReleaseGpuTimingResources(renderer);
     if (renderer->fence != NULL) ID3D12Fence_Release(renderer->fence);
+    if (renderer->frameLatencyWait != NULL) CloseHandle(renderer->frameLatencyWait);
     if (renderer->swapChain != NULL) IDXGISwapChain3_Release(renderer->swapChain);
     if (renderer->commandQueue != NULL) ID3D12CommandQueue_Release(renderer->commandQueue);
     if (renderer->pipelineLibrary != NULL) ID3D12PipelineLibrary_Release(renderer->pipelineLibrary);
@@ -3692,8 +3714,7 @@ static bool ApplyPendingResize(Renderer* renderer)
 
     // Флаги swapchain при пересоздании буферов должны остаться прежними.
     if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0)))
+        DXGI_FORMAT_R8G8B8A8_UNORM, renderer->swapChainFlags)))
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
@@ -4262,6 +4283,13 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ReleaseStagingOverflow(renderer, renderer->frameIndex);
     renderer->instanceChunkIndex[renderer->frameIndex] = 0;
     renderer->instanceChunkOffset[renderer->frameIndex] = 0;
+    // Без vsync и без разрывов очередь сама заменяет ждущий кадр новым, а
+    // ожидание ограничило бы число кадров.
+    if (renderer->frameLatencyWait != NULL && (renderer->verticalSyncEnabled || tearing))
+    {
+        (void)WaitForSingleObjectEx(renderer->frameLatencyWait, FRAME_LATENCY_WAIT_MILLISECONDS,
+            FALSE);
+    }
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
         // Без vsync Present не является точкой ожидания. Отдаём остаток
