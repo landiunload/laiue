@@ -21,6 +21,7 @@
 
 #define FRAME_WIDTH 64u
 #define FRAME_HEIGHT 64u
+#define FRAME_BYTES (FRAME_WIDTH * FRAME_HEIGHT * 4u)
 // Снятие доходит до устройства не сразу: столько кадров ему даётся.
 #define FRAMES_TO_LOSS 8u
 // Драйвера может не быть: тогда тест сообщает о пропуске, а не о провале.
@@ -109,6 +110,22 @@ static bool DrawFrame(LaiueGraphicsDeviceV2 *device)
            device->endFrame(device) != 0u;
 }
 
+// Кадр дорисован целиком. WARP исполняет кадры на потоках этого процесса, а снятое
+// устройство сразу считает пройденными все ограждения: снятие посреди кадра дало
+// бы адаптеру писать в уже освобождённую память. Настоящая видеокарта при сбросе
+// останавливается сама, а обычные кадры ждать не нужно.
+static void FinishFrame(LaiueGraphicsDeviceV2 *device)
+{
+    static uint8_t pixels[FRAME_BYTES];
+    LaiueGraphicsFrameReadbackV2 capture = {
+        .structSize = sizeof(capture), .pixels = pixels, .capacityBytes = FRAME_BYTES};
+    if (device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE &&
+        device->requestFrameReadback != NULL)
+        Expect(device->requestFrameReadback(device) != 0u, "capture requested before recording");
+    Expect(DrawFrame(device) && device->readbackFrame(device, &capture) != 0u,
+           "the frame before the loss finishes");
+}
+
 static bool DrawsOn(LaiueGraphicsDeviceV2 *device)
 {
     for (uint32_t frame = 0u; frame < FRAMES_TO_LOSS; ++frame)
@@ -149,11 +166,12 @@ LAIUE_TEST_ENTRY(GraphicsDeviceLostTestEntryPoint)
         LaiueTestRuntimeWrite("No D3D12 adapter with Shader Model 6.0; skipping\n");
         LaiueTestRuntimeExit(SKIP_EXIT_CODE);
     }
-    Expect(device != NULL && device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_DIAGNOSTICS_SIZE &&
-               device->getDiagnostics != NULL,
-           "device publishes diagnostics");
+    Expect(device != NULL && device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_READBACK_SIZE &&
+               device->getDiagnostics != NULL && device->readbackFrame != NULL,
+           "device publishes diagnostics and readback");
     Expect(DrawFrame(device) && !Lost(device), "a new device draws and is not lost");
 
+    FinishFrame(device);
     ID3D12Device5 *native = ModuleDevice();
     if (native == NULL)
     {

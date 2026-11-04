@@ -30,6 +30,7 @@
 // путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
 // раньше её определения — объявляем её здесь.
 void RendererDestroy_D3D12(Renderer* renderer);
+bool RendererIsDeviceLost_D3D12(const Renderer* renderer);
 RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
                                               uint32_t height, uint32_t mipLevels,
                                               uint32_t format);
@@ -2626,7 +2627,8 @@ void RendererDestroy_D3D12(Renderer* renderer)
     // Пока конвейеры живы, новые из них сохраняются в кеш.
     {
         const RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
-        if (renderer->pipelineLibrary != NULL && status->pipelinesCreated > status->pipelinesFromCache)
+        if (renderer->pipelineLibrary != NULL && status->pipelinesCreated > status->pipelinesFromCache &&
+            !RendererIsDeviceLost_D3D12(renderer))
             (void)RendererSavePipelineCache_D3D12(renderer);
     }
 
