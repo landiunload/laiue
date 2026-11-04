@@ -33,6 +33,11 @@ API and ABI may change between minor versions.
   need no graphics device, so the neighbour in the direction of browsing is
   read on its own thread, mip chain included. This holds one more picture in
   memory, 122 MiB at this size.
+- A program can survive a driver reset. `getDiagnostics` reports
+  `LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST` when every frame is going to fail,
+  and a new device can be created on the same window. The viewer does this and
+  shows its picture again. It also no longer spins on a whole core while frames
+  fail.
 - On D3D12 a frame reaches the screen 33 ms sooner at 60 Hz: 50 ms instead of
   83 ms from the start of a frame in a window, 33 ms instead of 66 ms in
   borderless full screen. The present queue holds two frames instead of three,

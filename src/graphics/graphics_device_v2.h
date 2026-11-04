@@ -94,6 +94,9 @@ typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 #define LAIUE_GRAPHICS_DIAGNOSTICS_GPU_TIMING_VALID (1u << 2)
 #define LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED (1u << 3)
 #define LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED (1u << 4)
+// The device stopped for good, as after a driver reset, and every frame will
+// fail. Destroy it and create a new one, as soon as the system allows it.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST (1u << 5)
 
 typedef struct LaiueGraphicsDiagnosticsV2
 {

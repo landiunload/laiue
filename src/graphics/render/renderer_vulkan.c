@@ -3694,7 +3694,7 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             const bool learned = status->state != RENDERER_PIPELINE_CACHE_LOADED ||
                                  (status->pipelinesFromCache != UINT32_MAX &&
                                   status->pipelinesCreated > status->pipelinesFromCache);
-            if (learned && status->pipelinesCreated != 0u)
+            if (learned && status->pipelinesCreated != 0u && !renderer->deviceFailed)
                 (void)RendererSavePipelineCache_Vulkan(renderer);
             vkDestroyPipelineCache(renderer->device, renderer->pipelineCache, NULL);
         }
@@ -5296,6 +5296,11 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     renderer->submittedFrames++;
     renderer->frameIndex = (renderer->frameIndex + 1u) % FRAME_COUNT;
     return true;
+}
+
+bool RendererIsDeviceLost_Vulkan(const Renderer *renderer)
+{
+    return renderer->deviceFailed;
 }
 
 void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)

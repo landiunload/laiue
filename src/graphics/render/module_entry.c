@@ -1548,6 +1548,8 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         *outDiagnostics = result;
         return 0u;
     }
+    if (RendererIsDeviceLost(state->renderer))
+        result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST;
     if (state->readbackSupported)
     {
         result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED;
