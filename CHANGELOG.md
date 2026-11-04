@@ -5,6 +5,14 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
+  to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
+  load too. The renderer used to wait for the GPU at the start of a frame, after
+  the program had read its input, and the present queue held four more frames.
+  It now waits at the end of a frame, and where the device has
+  `VK_KHR_present_wait` it waits until the previous frame is on the screen, which
+  keeps two frames queued, as on D3D12. Without the extension, on most Android
+  devices, the wait for a free image moves to the end of a frame as well.
 - On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
   Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
   and the chain draws unrotated, and the renderer stopped the GPU and built a new

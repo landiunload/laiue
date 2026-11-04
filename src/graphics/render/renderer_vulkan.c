@@ -78,6 +78,13 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // этого GPU — 2, максимум — 8; всё, что выше, движок не поддерживает.
 #define MAX_SWAPCHAIN_IMAGES 8u
 
+// С меньшим числом образов следующий образ захватывается в самом кадре, а не
+// после показа прошлого, см. RendererEndFrame_Vulkan.
+#define SWAPCHAIN_IMAGES_FOR_EARLY_ACQUIRE 3u
+
+// Предел ожидания показа: кадр не встаёт, что бы ни случилось с окном.
+#define PRESENT_WAIT_NANOSECONDS 100000000u
+
 // Раскладка дескрипторов повторяет сдвиги регистров HLSL.
 #define BINDING_CONSTANTS 0u
 #define BINDING_QUAD_BUFFER 1u
@@ -506,6 +513,9 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     // пула геометрии было бесконфликтным.
     bool hasSurface;
     bool swapchainOutOfDate;
+    PFN_vkWaitForPresentKHR waitForPresent;  // NULL: устройство не умеет ждать показа
+    uint64_t presentId;                      // номер последнего показа
+    bool swapchainImageHeld;           // образ swapchainImageIndex захвачен и ждёт кадра
     bool swapchainAcquiredSuboptimal;  // образ кадра захвачен с VK_SUBOPTIMAL_KHR
     bool swapchainRefitTried;          // цепочку уже собирали заново из-за VK_SUBOPTIMAL_KHR
     VkSurfaceKHR surface;
@@ -2577,6 +2587,27 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
 // Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
 // разрывов: FIFO_LATEST_READY, затем MAILBOX, иначе IMMEDIATE, иначе FIFO (он
 // обязан поддерживаться всегда).
+// Ожидание показа считает показы по их номерам, так что нужны оба расширения.
+static bool PresentWaitSupported(VkPhysicalDevice device)
+{
+    if (!DeviceExtensionSupported(device, VK_KHR_PRESENT_ID_EXTENSION_NAME) ||
+        !DeviceExtensionSupported(device, VK_KHR_PRESENT_WAIT_EXTENSION_NAME))
+        return false;
+    VkPhysicalDevicePresentWaitFeaturesKHR wait = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+    };
+    VkPhysicalDevicePresentIdFeaturesKHR id = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .pNext = &wait,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &id,
+    };
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return id.presentId == VK_TRUE && wait.presentWait == VK_TRUE;
+}
+
 static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync,
                                           bool latestReady)
 {
@@ -2628,6 +2659,7 @@ static void DestroySwapchainResources(Renderer *renderer)
     }
     renderer->swapchainImageCount = 0u;
     renderer->swapchainImageIndex = 0u;
+    renderer->swapchainImageHeld = false;
 }
 
 static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
@@ -2850,13 +2882,12 @@ static void NoteSwapchainFit(Renderer *renderer, bool suboptimal)
     renderer->swapchainRefitTried = suboptimal;
 }
 
-// Захват образа и запись копии colorTarget в команду кадра. Кадр уже
-// переведён вызывающим в TRANSFER_SRC_OPTIMAL.
-static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+// Образ для кадра слота frameIndex: семафор слота должен быть свободен, то есть
+// прошлый кадр этого слота закончен. false — образа нет.
+static bool AcquireSwapchainImage(Renderer *renderer)
 {
-    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
-        return PRESENT_OUTCOME_NONE;
-
+    if (renderer->swapchainImageHeld)
+        return true;
     uint32_t imageIndex = 0u;
     VkResult acquire = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
                                              renderer->imageAvailable[renderer->frameIndex],
@@ -2866,12 +2897,25 @@ static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandB
         // Образа нет, и OUT_OF_DATE — не ошибка кадра: помечаем swapchain
         // устаревшим, пересоберём в начале следующего кадра.
         renderer->swapchainOutOfDate = true;
-        return PRESENT_OUTCOME_SKIP;
+        return false;
     }
-
     renderer->swapchainAcquiredSuboptimal = acquire == VK_SUBOPTIMAL_KHR;
     renderer->swapchainImageIndex = imageIndex;
-    VkImage destination = renderer->swapchainImages[imageIndex];
+    renderer->swapchainImageHeld = true;
+    return true;
+}
+
+// Запись копии colorTarget в образ кадра. Кадр уже переведён вызывающим в
+// TRANSFER_SRC_OPTIMAL.
+static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
+        return PRESENT_OUTCOME_NONE;
+    if (!AcquireSwapchainImage(renderer))
+        return PRESENT_OUTCOME_SKIP;
+
+    renderer->swapchainImageHeld = false;
+    VkImage destination = renderer->swapchainImages[renderer->swapchainImageIndex];
 
     VkImageMemoryBarrier toTransfer = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3200,7 +3244,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         }
     }
 #endif
-    const char *deviceExtensions[3];
+    const char *deviceExtensions[5];
     uint32_t deviceExtensionCount = 0u;
     if (pushDescriptorCommand == NULL &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
@@ -3238,6 +3282,23 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         renderer->presentLatestReady = true;
     }
 #endif
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .presentId = VK_TRUE,
+    };
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+        .presentWait = VK_TRUE,
+    };
+    const bool presentWait = renderer->hasSurface && PresentWaitSupported(chosen);
+    if (presentWait)
+    {
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        presentIdFeature.pNext = featureChain;
+        presentWaitFeature.pNext = &presentIdFeature;
+        featureChain = &presentWaitFeature;
+    }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = featureChain,
@@ -3248,6 +3309,9 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
+    if (presentWait)
+        renderer->waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(
+            renderer->device, "vkWaitForPresentKHR");
     if (renderer->useDynamicRendering)
     {
         renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
@@ -5265,8 +5329,15 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     if (present == PRESENT_OUTCOME_PRESENT)
     {
         uint32_t imageIndex = renderer->swapchainImageIndex;
+        const uint64_t presentId = ++renderer->presentId;
+        VkPresentIdKHR presentIdInfo = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+            .swapchainCount = 1u,
+            .pPresentIds = &presentId,
+        };
         VkPresentInfoKHR presentInfo = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = renderer->waitForPresent != NULL ? &presentIdInfo : NULL,
             .waitSemaphoreCount = 1u,
             .pWaitSemaphores = &renderer->renderFinished[imageIndex],
             .swapchainCount = 1u,
@@ -5291,6 +5362,22 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     renderer->lastFrameValid = true;
     renderer->submittedFrames++;
     renderer->frameIndex = (renderer->frameIndex + 1u) % FRAME_COUNT;
+
+    // Ожидания стоят в конце кадра: следующий кадр читает ввод уже после них, и
+    // готовая картинка не стоит в очереди. По умолчанию очередь держит столько
+    // кадров, что картинка выходит на экран через пять обновлений. Ждать показа
+    // этого кадра, а не прошлого, нельзя: в очереди остался бы один кадр, CPU и
+    // GPU работали бы строго по очереди, и им на двоих пришлось бы уложиться в
+    // одно обновление экрана, так что кадров под нагрузкой вышло бы вдвое
+    // меньше. По той же причине с двумя образами захват остаётся в кадре.
+    const bool shown = present == PRESENT_OUTCOME_PRESENT && !renderer->swapchainOutOfDate;
+    if (shown && renderer->waitForPresent != NULL && renderer->verticalSyncEnabled &&
+        renderer->presentId > 1u)
+        (void)renderer->waitForPresent(renderer->device, renderer->swapchain,
+                                       renderer->presentId - 1u, PRESENT_WAIT_NANOSECONDS);
+    if (EnsureVulkanUploadSlotReady(renderer) && shown &&
+        renderer->swapchainImageCount >= SWAPCHAIN_IMAGES_FOR_EARLY_ACQUIRE)
+        (void)AcquireSwapchainImage(renderer);
     return true;
 }
 
