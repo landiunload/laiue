@@ -157,6 +157,26 @@ static LaiueGraphicsDiagnosticsV2 Diagnostics(LaiueGraphicsDeviceV2 *device)
     return value;
 }
 
+#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+// Only a device with a window has a swap chain, which is why Vulkan skips this
+// here. Android checks the same counter on a rotated screen.
+static void SwapChainRebuilds(const LaiueGraphicsDeviceServiceV2 *service,
+                              LaiueGraphicsDeviceV2 *device)
+{
+    Expect(device->beginFrame(device, FRAME_WIDTH, FRAME_HEIGHT) != 0u &&
+               device->endFrame(device) != 0u,
+           "a frame draws before the resize");
+    const uint32_t before = Diagnostics(device).swapchainRebuilds;
+    service->resize(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u);
+    for (uint32_t frame = 0u; frame < 3u; ++frame)
+        Expect(device->beginFrame(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u) != 0u &&
+                   device->endFrame(device) != 0u,
+               "frames draw after the resize");
+    Expect(Diagnostics(device).swapchainRebuilds == before + 1u,
+           "a resize rebuilds the swap chain once, and frames after it do not");
+}
+#endif
+
 static void Begin(LaiueGraphicsDeviceV2 *device)
 {
     if (device->structSize >= LAIUE_GRAPHICS_DEVICE_V2_READBACK_REQUEST_SIZE &&
@@ -1190,6 +1210,9 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         PendingUploadBurst(device);
         StagingSpill(device);
         UploadsWithoutFrames(device);
+#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+        SwapChainRebuilds(service, device);
+#endif
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);
