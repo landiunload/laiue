@@ -448,6 +448,34 @@ static void ClearRect(uint8_t *canvas, uint32_t canvasWidth, const GifFrame *fra
     }
 }
 
+// Рисует кадр на холсте с предыдущим кадром. Способ убирания относится к тому кадру,
+// который уже показан: 2 очищает его прямоугольник, 3 возвращает то, что было под ним,
+// остальные оставляют картинку как есть. У первого кадра previous == NULL.
+static ImageStatus ComposeFrame(const uint8_t *file, uint32_t sizeBytes, const GifReader *reader,
+                                uint32_t frameBytes, const GifFrame *frame,
+                                const GifFrame *previous, GifDictionary *dictionary,
+                                uint8_t *saved, uint8_t *canvas)
+{
+    if (previous == NULL)
+    {
+        memset(canvas, 0, frameBytes);
+    }
+    else if (previous->disposal == 2u)
+    {
+        ClearRect(canvas, reader->canvasWidth, previous);
+    }
+    else if (previous->disposal == 3u)
+    {
+        memcpy(canvas, saved, frameBytes);
+    }
+
+    if (frame->disposal == 3u)
+    {
+        memcpy(saved, canvas, frameBytes);
+    }
+    return DrawFrame(file, sizeBytes, frame, reader->canvasWidth, dictionary, canvas);
+}
+
 ImageStatus GifDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *info, void *pixels,
                       uint32_t pixelBytes, void *scratch, uint32_t scratchBytes)
 {
@@ -467,10 +495,9 @@ ImageStatus GifDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *in
     uint8_t *saved = (uint8_t *)scratch + sizeof(GifDictionary);
     uint8_t *output = (uint8_t *)pixels;
 
-    // Обнуление ради компилятора: поле читается только при
-    // havePrevious, но доказать это анализатору нечем.
+    // Обнуление ради компилятора: поле читается только со второго кадра, но доказать
+    // это анализатору нечем.
     GifFrame previousFrame = {0};
-    bool havePrevious = false;
     for (uint32_t frameIndex = 0; frameIndex < info->frameCount; ++frameIndex)
     {
         GifFrame frame;
@@ -480,37 +507,85 @@ ImageStatus GifDecode(const void *bytes, uint32_t sizeBytes, const ImageInfo *in
         if (done) return IMAGE_CORRUPT;
 
         uint8_t *canvas = output + (size_t)frameIndex * info->frameBytes;
-        if (frameIndex == 0u)
-        {
-            memset(canvas, 0, info->frameBytes);
-        }
-        else
-        {
-            const uint8_t *earlier = canvas - info->frameBytes;
-            memcpy(canvas, earlier, info->frameBytes);
-            // Способ убирания относится к кадру, который уже показан:
-            // 2 очищает его прямоугольник, 3 возвращает то, что было
-            // под ним, остальные оставляют картинку как есть.
-            if (havePrevious && previousFrame.disposal == 2u)
-            {
-                ClearRect(canvas, reader.canvasWidth, &previousFrame);
-            }
-            else if (havePrevious && previousFrame.disposal == 3u)
-            {
-                memcpy(canvas, saved, info->frameBytes);
-            }
-        }
-
-        if (frame.disposal == 3u)
-        {
-            memcpy(saved, canvas, info->frameBytes);
-        }
-
-        status = DrawFrame(file, sizeBytes, &frame, reader.canvasWidth, dictionary, canvas);
+        if (frameIndex != 0u) memcpy(canvas, canvas - info->frameBytes, info->frameBytes);
+        status = ComposeFrame(file, sizeBytes, &reader, info->frameBytes, &frame,
+                              frameIndex != 0u ? &previousFrame : NULL, dictionary, saved, canvas);
         if (status != IMAGE_OK) return status;
 
         previousFrame = frame;
-        havePrevious = true;
     }
     return IMAGE_OK;
+}
+
+// Состояние показа лежит в начале рабочего буфера, за ним словарь и копия холста.
+typedef struct GifStream
+{
+    const uint8_t *file;
+    uint32_t sizeBytes;
+    uint32_t frameBytes;
+    GifReader reader;
+    GifReader start;
+    GifFrame previous;
+    bool havePrevious;
+} GifStream;
+
+uint32_t GifStreamScratchBytes(const ImageInfo *info)
+{
+    return (uint32_t)sizeof(GifStream) + info->scratchBytes;
+}
+
+ImageStatus GifStreamOpen(const void *bytes, uint32_t sizeBytes, const ImageInfo *info,
+                          void *scratch, uint32_t scratchBytes)
+{
+    if (bytes == NULL || info == NULL || scratch == NULL) return IMAGE_INVALID_ARGUMENT;
+    if (scratchBytes < GifStreamScratchBytes(info)) return IMAGE_BUFFER_TOO_SMALL;
+
+    GifReader reader;
+    const ImageStatus status = GifOpen((const uint8_t *)bytes, sizeBytes, &reader);
+    if (status != IMAGE_OK) return status;
+    if (reader.canvasWidth != info->width || reader.canvasHeight != info->height)
+        return IMAGE_INVALID_ARGUMENT;
+
+    GifStream *stream = (GifStream *)scratch;
+    memset(stream, 0, sizeof(*stream));
+    stream->file = (const uint8_t *)bytes;
+    stream->sizeBytes = sizeBytes;
+    stream->frameBytes = info->frameBytes;
+    stream->reader = reader;
+    stream->start = reader;
+    return IMAGE_OK;
+}
+
+ImageStatus GifStreamNext(void *scratch, void *canvas, uint32_t *outDelayMilliseconds)
+{
+    if (scratch == NULL || canvas == NULL || outDelayMilliseconds == NULL)
+        return IMAGE_INVALID_ARGUMENT;
+
+    GifStream *stream = (GifStream *)scratch;
+    GifDictionary *dictionary = (GifDictionary *)(stream + 1);
+    uint8_t *saved = (uint8_t *)(dictionary + 1);
+    for (;;)
+    {
+        GifFrame frame;
+        bool done = false;
+        ImageStatus status = GifNextFrame(&stream->reader, &frame, &done);
+        if (status == IMAGE_OK && !done)
+        {
+            status = ComposeFrame(stream->file, stream->sizeBytes, &stream->reader,
+                                  stream->frameBytes, &frame,
+                                  stream->havePrevious ? &stream->previous : NULL, dictionary,
+                                  saved, (uint8_t *)canvas);
+        }
+        if (status == IMAGE_OK && !done)
+        {
+            stream->previous = frame;
+            stream->havePrevious = true;
+            *outDelayMilliseconds =
+                frame.delayMilliseconds != 0u ? frame.delayMilliseconds : GIF_DEFAULT_DELAY_MS;
+            return IMAGE_OK;
+        }
+        if (!stream->havePrevious) return status != IMAGE_OK ? status : IMAGE_CORRUPT;
+        stream->reader = stream->start;
+        stream->havePrevious = false;
+    }
 }

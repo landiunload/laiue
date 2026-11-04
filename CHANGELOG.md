@@ -11,6 +11,14 @@ API and ABI may change between minor versions.
   nothing: Foxity peaked at 2.4 MiB a frame in 58 frames of 3600. Walk uses 11 MB
   less. `LaiueGraphicsDiagnosticsV2` reports them as `uploadStagingBytes`, so a
   program that reads diagnostics has to be rebuilt.
+- On Vulkan depth is no longer written to memory after a pass, since nothing reads
+  it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
+  a full-screen depth write, and where the device offers lazily allocated memory
+  the depth target takes no RAM at all.
+- The viewer plays a GIF frame by frame instead of unpacking it into memory first,
+  so a long GIF plays to its end. It used to stop at 256 frames without a word and
+  start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
+  `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
 - On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
   to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
   load too. The renderer used to wait for the GPU at the start of a frame, after
