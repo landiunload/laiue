@@ -8,6 +8,8 @@ API and ABI may change between minor versions.
 - A vertex buffer keeps no CPU copy: its bytes stay only in the GPU, so vertices
   take half the memory and each upload one copy less. Foxity uses 21 MB less. A
   vertex buffer now takes whole uploads only; index buffers still take parts.
+- The viewer sends its font atlas to the GPU only when the font was baked again,
+  not at every new window size. A window resize costs 13 % less CPU.
 - Destroying a texture no longer stops the GPU either. A texture that frames in
   flight may read waits until the GPU has passed them; Vulkan used to wait for
   the device to go idle and rebuild its descriptor sets.
