@@ -1,6 +1,8 @@
 // Окно Windows рисуется настоящими пикселями и только там, где их видно. Экран с
 // масштабом здесь не нужен: осведомлённость о DPI видна у самого окна, а сообщение
-// о смене монитора тест присылает сам. Свёрнутое окно сообщает размер 0x0.
+// о смене монитора тест присылает сам. Свёрнутое окно сообщает размер 0x0, и эти
+// сообщения тоже присылает тест: ShowWindow показал бы окно там, где оно создано,
+// а тесты не выводят окон на основной монитор.
 
 #include "mod/module_host.h"
 #include "platform/system.h"
@@ -24,6 +26,7 @@ typedef struct FramePace
 {
     const LaiueWindowServiceV1 *windows;
     Window *window;
+    HWND handle;
     double deadline;
     uint32_t frames;
 } FramePace;
@@ -38,10 +41,18 @@ static void Expect(bool condition, const char *message)
     LaiueTestRuntimeExit(1);
 }
 
+// Настоящий показ окна вернул бы ему пиксели, поэтому состояние повторяется.
+static void PretendMinimizedAndActive(HWND handle)
+{
+    SendMessageW(handle, WM_SIZE, SIZE_MINIMIZED, 0);
+    SendMessageW(handle, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, TRUE), 0);
+}
+
 static void CountFrame(void *context)
 {
     FramePace *pace = (FramePace *)context;
     ++pace->frames;
+    PretendMinimizedAndActive(pace->handle);
     if (PlatformMonotonicSeconds() >= pace->deadline)
         pace->windows->requestClose(pace->window);
 }
@@ -120,20 +131,19 @@ LAIUE_TEST_ENTRY(WindowDpiTestEntryPoint)
            "the new client size reaches the program");
 
     (void)windows->consumeResize(window);
-    ShowWindow(handle, SW_SHOWMINNOACTIVE);
+    SendMessageW(handle, WM_SIZE, SIZE_MINIMIZED, 0);
     windows->getClientSize(window, &width, &height);
     Expect(width == 0 && height == 0, "a minimized window has nothing to draw on");
     Expect(!windows->consumeResize(window), "minimizing is not a resize");
-    ShowWindow(handle, SW_SHOWNOACTIVATE);
+    SendMessageW(handle, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right, client.bottom));
     windows->getClientSize(window, &width, &height);
     Expect(width == client.right && height == client.bottom,
            "a restored window has its size back");
     Expect(windows->consumeResize(window), "the program hears of the restored size");
 
     // Активному окну без пикселей ждать в Present тоже нечего.
-    ShowWindow(handle, SW_SHOWMINNOACTIVE);
-    SendMessageW(handle, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, TRUE), 0);
-    FramePace pace = {windows, window, PlatformMonotonicSeconds() + PACE_SECONDS, 0u};
+    PretendMinimizedAndActive(handle);
+    FramePace pace = {windows, window, handle, PlatformMonotonicSeconds() + PACE_SECONDS, 0u};
     windows->runLoop(window, CountFrame, &pace);
     Expect(pace.frames != 0u && pace.frames <= PACE_MOST_FRAMES,
            "an active window without pixels sleeps between frames");
