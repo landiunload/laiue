@@ -187,6 +187,13 @@ static void DrawBoundGenericFrame(Renderer *renderer, RendererFrameSetup *setup,
 // Первый пиксель кадра только с очисткой обязан быть цветом неба (0,0,1).
 // Это отличает по-настоящему записанный кадр от цели, которую «успешно»
 // прочитали, но вовсе не рисовали.
+static bool DrawsIntoSwapchain(const Renderer *renderer)
+{
+    RendererStats stats;
+    RendererGetStats(renderer, &stats);
+    return stats.drawsIntoSwapchain;
+}
+
 static void ExpectSkyColour(const void *pixels, const char *reason)
 {
     const uint8_t *pixel = (const uint8_t *)pixels;
@@ -310,6 +317,13 @@ static void RunResizeMinimize(HINSTANCE instance, void *pixels)
     CaptureWithSize(renderer, pixels, (uint32_t)clientWidth, (uint32_t)clientHeight,
                     "the initial frame could not be captured");
     ExpectSkyColour(pixels, "the initial frame must show the sky clear colour");
+    Expect(DrawsIntoSwapchain(renderer), "a frame of the window size must skip the copy");
+
+    // Кадр без запроса не читается: копия в буфере относится к прошлому кадру.
+    Expect(RendererBeginFrame(renderer, &setup), "a frame without a request could not begin");
+    Expect(RendererEndFrame(renderer), "a frame without a request could not end");
+    Expect(!RendererCaptureFrame(renderer, pixels, MAX_CAPTURE_BYTES, NULL, NULL),
+           "a frame without a request must not return the previous frame");
 
     // Цель кадра меняется без изменения окна: swapchain остаётся прежним
     // размером, поэтому present проходит через путь blit.
@@ -317,6 +331,7 @@ static void RunResizeMinimize(HINSTANCE instance, void *pixels)
     DrawFrame(renderer, &setup, "the target-resize frame could not begin",
               "the target-resize frame could not end");
     CaptureWithSize(renderer, pixels, 200u, 120u, "the target-resize frame could not be captured");
+    Expect(!DrawsIntoSwapchain(renderer), "a frame of another size must go through the copy");
 
     // Шторм resize до кадра: применяется последний запрос, а промежуточные
     // схлопываются. Утечка цели на каждое промежуточное значение здесь была
@@ -337,6 +352,7 @@ static void RunResizeMinimize(HINSTANCE instance, void *pixels)
               "the window-resize frame could not end");
     CaptureWithSize(renderer, pixels, (uint32_t)clientWidth, (uint32_t)clientHeight,
                     "the window-resize frame could not be captured");
+    Expect(DrawsIntoSwapchain(renderer), "a frame of the window size must skip the copy again");
 
     // Свёрнутое окно: нулевой запрошенный размер. BeginFrame обязан
     // вернуть false, не блокируясь и не роняя рендер; EndFrame без

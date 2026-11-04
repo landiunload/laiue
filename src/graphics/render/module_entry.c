@@ -1579,6 +1579,8 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         result.geometryPoolCapacityBytes = stats.geometryPoolCapacityBytes;
         result.scenePasses = stats.scenePasses;
         result.swapchainRebuilds = stats.swapchainRebuilds;
+        if (stats.drawsIntoSwapchain)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN;
     }
     result.uploadStagingBytes = RendererUploadStagingBytes(state->renderer);
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};

@@ -169,6 +169,8 @@ static void SwapChainRebuilds(const LaiueGraphicsDeviceServiceV2 *service,
     Expect(device->beginFrame(device, FRAME_WIDTH, FRAME_HEIGHT) != 0u &&
                device->endFrame(device) != 0u,
            "a frame draws before the resize");
+    Expect((Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u,
+           "a window of the frame size takes the frame without a copy");
     const uint32_t before = Diagnostics(device).swapchainRebuilds;
     service->resize(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u);
     for (uint32_t frame = 0u; frame < 3u; ++frame)

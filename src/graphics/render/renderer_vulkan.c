@@ -1052,9 +1052,6 @@ static bool CreateCubeFramebuffers(Renderer *renderer)
     return true;
 }
 
-// Переход раскладки образа. Барьер намеренно широкий: кадр движка
-// содержит десятки переходов, а не тысячи, и точная маска стадий здесь
-// не окупает риск ошибки синхронизации.
 // Образ, в который рисует кадр, и номер его framebuffer-ов.
 static GpuImage *FrameTarget(Renderer *renderer)
 {
@@ -1067,6 +1064,9 @@ static uint32_t FrameTargetIndex(const Renderer *renderer)
     return renderer->swapchainDirect ? renderer->swapchainImageIndex : renderer->frameIndex;
 }
 
+// Переход раскладки образа. Барьер намеренно широкий: кадр движка
+// содержит десятки переходов, а не тысячи, и точная маска стадий здесь
+// не окупает риск ошибки синхронизации.
 static void ImageBarrier(VkCommandBuffer commandBuffer, GpuImage *image, VkImageAspectFlags aspect,
                          VkImageLayout newLayout)
 {
@@ -1109,6 +1109,19 @@ static void PrepareSwapchainTarget(VkCommandBuffer commandBuffer, GpuImage *targ
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
                          &barrier);
     target->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
+// Запись GPU становится видна процессору только после такого барьера: ожидания
+// забора для этого мало.
+static void HostReadBarrier(VkCommandBuffer commandBuffer)
+{
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
 // Одноразовый командный буфер для загрузок вне кадра.
@@ -5478,6 +5491,7 @@ static void RecordFrameCapture(Renderer *renderer, VkCommandBuffer commandBuffer
     };
     vkCmdCopyImageToBuffer(commandBuffer, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            renderer->captureBuffer.buffer, 1u, &region);
+    HostReadBarrier(commandBuffer);
     renderer->captureWidth = target->width;
     renderer->captureHeight = target->height;
     renderer->captureValid = true;
@@ -5497,7 +5511,8 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     // Без swapchain «показ» кадра — это перевод цели в состояние, из
     // которого её можно прочитать: именно так кадр проверяется в тестах.
     // С swapchain цель становится источником копии в образ показа, если кадр
-    // не нарисован прямо в него.
+    // не нарисован прямо в него. Копия захвата верна только для своего кадра.
+    renderer->captureValid = false;
     if (!renderer->swapchainDirect)
         ImageBarrier(commandBuffer, FrameTarget(renderer), VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -5534,9 +5549,9 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
                                          : VK_PIPELINE_STAGE_TRANSFER_BIT;
     if (present == PRESENT_OUTCOME_PRESENT)
     {
-        // Копия в swapchain ждёт готовности образа, последующий present —
-        // готовности копии. Семафоры возвращаются кадровым слотом и
-        // индексом образа, поэтому не переиспользуются под живой работой.
+        // Кадр ждёт готовности образа, последующий present — готовности
+        // кадра. Семафоры возвращаются кадровым слотом и индексом образа,
+        // поэтому не переиспользуются под живой работой.
         submitInfo.waitSemaphoreCount = 1u;
         submitInfo.pWaitSemaphores = &renderer->imageAvailable[renderer->frameIndex];
         submitInfo.pWaitDstStageMask = &waitStage;
@@ -5641,6 +5656,7 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
     outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
+    outStats->drawsIntoSwapchain = renderer->swapchainDirect;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
@@ -6108,6 +6124,7 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
     };
     vkCmdCopyImageToBuffer(commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback.buffer, 1u, &region);
+    HostReadBarrier(commandBuffer);
     ImageBarrier(commandBuffer, source, VK_IMAGE_ASPECT_COLOR_BIT, originalLayout);
     bool ok = EndImmediate(renderer, commandBuffer);
     if (ok) CopyFramePixels(renderer, outPixels, readback.mapped, (size_t)required);

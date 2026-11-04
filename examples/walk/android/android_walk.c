@@ -115,6 +115,7 @@ struct AndroidWalkState
     bool scenarioLifecyclePending;
     uint32_t scenarioTick;
     uint32_t scenarioFrames;
+    uint32_t scenarioDirectFrames;
     uint32_t scenarioSwapchainRebuilds;
     uint32_t scenarioBreaks;
     uint32_t scenarioPlaces;
@@ -515,6 +516,7 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         hasCpu && state->game.ragdollReady && state->chunksReady && state->texturedTerrainReady &&
         state->terrainTextures[0] != 0u && state->terrainTextures[1] != 0u &&
         state->terrainTextures[2] != 0u && state->scenarioFrames != 0u &&
+        state->scenarioDirectFrames != 0u &&
         state->scenarioSwapchainRebuilds <= ANDROID_WALK_SCENARIO_MOST_SWAPCHAIN_REBUILDS &&
         state->scenarioCheckpoints == (uint32_t)WalkScenarioComplete &&
         state->scenarioAcks == (uint32_t)WalkScenarioComplete && state->scenarioMoved &&
@@ -528,7 +530,7 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         "airborne=%u breaks=%u places=%u rebases=%u frame_wall_count=%u frame_wall_p95_ms=%.6f "
         "frame_wall_p99_ms=%.6f gpu_available=%u gpu_count=%u gpu_p95_ms=%.6f gpu_p99_ms=%.6f "
         "peak_cpu_shadow_bytes=%llu peak_geometry_bytes=%llu swapchain_rebuilds=%u "
-        "capture=external_adb "
+        "swapchain_direct_frames=%u capture=external_adb "
         "game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f first_person=%u material=%u "
         "root_block_x=%lld root_block_y=%lld root_block_z=%lld "
         "root_fraction_x=%.9f root_fraction_y=%.9f root_fraction_z=%.9f "
@@ -539,7 +541,8 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         state->scenarioRebases, cpu.count, cpu.p95, cpu.p99, hasGpu ? 1u : 0u, gpu.count, gpu.p95,
         gpu.p99, (unsigned long long)state->scenarioPeakCpuBytes,
         (unsigned long long)state->scenarioPeakGeometryBytes, state->scenarioSwapchainRebuilds,
-        (unsigned long long)state->game.tick, (unsigned long long)state->game.revision,
+        state->scenarioDirectFrames, (unsigned long long)state->game.tick,
+        (unsigned long long)state->game.revision,
         state->game.camera.yaw, state->game.camera.pitch, state->game.firstPerson ? 1u : 0u,
         (uint32_t)state->game.selectedMaterial, (long long)spatial.centerBlock[0],
         (long long)spatial.centerBlock[1], (long long)spatial.centerBlock[2],
@@ -577,6 +580,8 @@ static void AndroidScenarioFrame(AndroidWalkState *state, double started, bool p
     if (hasDiagnostics)
     {
         state->scenarioSwapchainRebuilds = diagnostics.swapchainRebuilds;
+        if ((diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u)
+            ++state->scenarioDirectFrames;
         if (diagnostics.cpuShadowBytes > state->scenarioPeakCpuBytes)
             state->scenarioPeakCpuBytes = diagnostics.cpuShadowBytes;
         if (diagnostics.geometryPoolUsedBytes > state->scenarioPeakGeometryBytes)

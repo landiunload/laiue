@@ -4491,6 +4491,7 @@ void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
     outStats->swapchainRebuilds = renderer->swapChainRebuilds;
+    outStats->drawsIntoSwapchain = renderer->swapChain != NULL;
 }
 
 bool RendererCanCaptureFrame_D3D12(const Renderer *renderer)
