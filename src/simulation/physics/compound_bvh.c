@@ -446,9 +446,25 @@ static void CompoundBvhSiftValues(uint32_t *values, uint32_t root, uint32_t size
 }
 
 // Исходные индексы листьев уникальны, поэтому обычный heapsort даёт строго
-// возрастающий порядок.
+// возрастающий порядок. Обход идёт от больших координат к меньшим, и когда
+// индексы следуют за положением (тела вдоль оси, блоки из обхода сетки),
+// попадания приходят строго по убыванию: остаётся развернуть их.
 static void CompoundBvhSortIndices(uint32_t *values, uint32_t size)
 {
+    uint32_t ordered = 1u;
+    while (ordered < size && values[ordered - 1u] > values[ordered])
+    {
+        ++ordered;
+    }
+    if (ordered == size)
+    {
+        for (uint32_t low = 0u, high = size - 1u; low < high; ++low, --high)
+        {
+            CompoundBvhSwap(&values[low], &values[high]);
+        }
+        return;
+    }
+
     for (uint32_t start = size / 2u; start > 0u; --start)
     {
         CompoundBvhSiftValues(values, start - 1u, size);
@@ -522,7 +538,10 @@ bool RigidCompoundBvhQuery(const RigidCompoundBvhNode *nodes, uint32_t root,
         index = stack[--stackSize];
     }
 
-    CompoundBvhSortIndices(outIndices, hits);
+    if (hits > 1u)
+    {
+        CompoundBvhSortIndices(outIndices, hits);
+    }
     *outCount = hits;
     return true;
 }

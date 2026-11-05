@@ -142,6 +142,9 @@ endif()
 laiue_add_harness(laiue_navigation_test NavigationTestEntryPoint navigation_test.c
     LIBRARIES laiue::navigation laiue::task laiue::platform_support
     TEST laiue.navigation.paths TIMEOUT 120)
+laiue_add_harness(laiue_navigation_sqrt_test NavigationSqrtTestEntryPoint
+    navigation_sqrt_test.c "${laiue_src}/simulation/navigation/nav_query.c"
+    STATIC INCLUDES "${laiue_src}/simulation" TEST laiue.navigation.integer_sqrt)
 # Allocation faults are injected only into copies of the production bodies.
 set(laiue_navigation_failure_sources)
 foreach(source nav_graph nav_grid nav_query)

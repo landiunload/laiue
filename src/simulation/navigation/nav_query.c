@@ -137,16 +137,16 @@ static uint64_t SqrtEstimate(uint64_t value)
 
 uint64_t NavIntegerSqrt(uint64_t value)
 {
-    /* Оценка и точная целая поправка: результат — ровно floor(sqrt(value))
-     * при любом режиме плавающей точки, поэтому детерминизм от компилятора
-     * не зависит. */
+    /* Округления оставляют оценку в пределах единицы от floor(sqrt(value)) при
+     * любом режиме плавающей точки, поэтому хватает одной целой поправки в каждую
+     * сторону, и детерминизм от плавающей точки не зависит. Циклов здесь нет
+     * намеренно: компилятор векторизует их, а шагов почти всегда ноль. */
     uint64_t root = SqrtEstimate(value);
     if (root > UINT64_C(0xFFFFFFFF))
         root = UINT64_C(0xFFFFFFFF);
-    while (root * root > value)
-        --root;
-    while (root < UINT64_C(0xFFFFFFFF) && (root + 1u) * (root + 1u) <= value)
-        ++root;
+    root -= (uint64_t)(root * root > value);
+    /* Это (root + 1)^2 <= value без переполнения при root = 2^32 - 1. */
+    root += (uint64_t)(root * (root + 2u) < value);
     return root;
 }
 

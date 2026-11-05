@@ -5,6 +5,23 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Everything built with Clang now uses LLVM 23. On Windows CI took the runner's
+  LLVM 20, so it did not check the compiler releases are built with.
+- The integer square root of the A* heuristic no longer loops. LLVM 23
+  vectorized the small correction loop, which almost never runs, and A* got
+  up to 30 % slower. Rounding keeps the estimate within one of the result, so
+  one correction each way is exact on the whole range, and a test proves it.
+- Stereo voices at a whole-number speed mix four frames at a time. LLVM 23
+  stopped vectorizing the loop over frames at an unknown stride and it became
+  30 % slower; the block form does not depend on that estimate and is a third
+  faster than it was with LLVM 22.
+- A region read out of a dense chunk copies eight edits at a time: edits are
+  sorted, so one check of the eighth proves the block has no gap. A solid chunk
+  is read 2.7 times faster, and a test compares runs of every length with
+  single reads.
+- A compound query no longer sorts hits that arrive in reverse order, which is
+  how boxes laid along an axis come out of the tree. Such a query is three times
+  faster; LLVM 23 had made it 30 % slower while making random ones much faster.
 - Vulkan now runs from version 1.1 instead of 1.2, the version most phones
   from Android 9 on have. Nothing in the renderer needed 1.2, and such a phone
   was simply turned away. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` holds a device
