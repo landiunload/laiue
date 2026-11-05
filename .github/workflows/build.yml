@@ -725,7 +725,7 @@ jobs:
             -OutputDir build/android-runtime-results/captures `
             -TimeoutSeconds 240
       - name: Verify a program on modules by name draws on Android
-        timeout-minutes: 5
+        timeout-minutes: 6
         run: |
           adb="$ANDROID_HOME/platform-tools/adb"
           log=build/android-runtime-results/viewer.log
@@ -782,6 +782,39 @@ jobs:
           now="$(viewer_process)" || fail "the viewer process is gone"
           if [ "$process" != "$now" ]; then
             fail "the runs did not share process $process (now $now)"
+          fi
+          # Телефон забирает окно у программы при каждом уходе в фон. Устройство
+          # меняет поверхность на месте, без пересоздания: на экран должна
+          # вернуться та же картинка, а не только новый кадр в цепочке.
+          shot() {
+            timeout 15s "$adb" -s emulator-5554 exec-out screencap -p > "$1"
+          }
+          before=build/android-runtime-results/viewer-before.png
+          settled=build/android-runtime-results/viewer-settled.png
+          home=build/android-runtime-results/viewer-home.png
+          after=build/android-runtime-results/viewer-after.png
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
+            || fail "the viewer did not start to stay"
+          until shot "$before" && sleep 1 && shot "$settled" && cmp -s "$before" "$settled"; do
+            if [ "$SECONDS" -ge "$deadline" ]; then fail "the viewer did not settle"; fi
+          done
+          timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log"
+          gone="$(grep -Fc 'viewer: the surface is gone' "$log" || true)"
+          back="$(grep -Fc 'viewer: the surface is back' "$log" || true)"
+          timeout 10s "$adb" -s emulator-5554 shell input keyevent KEYCODE_HOME
+          expect_lines 'viewer: the surface is gone' "$((gone + 1))"
+          shot "$home"
+          if cmp -s "$before" "$home"; then fail "the picture stayed on the screen after HOME"; fi
+          timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
+            || fail "the viewer did not come back"
+          expect_lines 'viewer: the surface is back' "$((back + 1))"
+          until shot "$after" && cmp -s "$before" "$after"; do
+            if [ "$SECONDS" -ge "$deadline" ]; then fail "the picture did not come back"; fi
+            sleep 1
+          done
+          now="$(viewer_process)" || fail "the viewer process is gone"
+          if [ "$process" != "$now" ]; then
+            fail "the return restarted process $process (now $now)"
           fi
       - name: Stop the owned emulator process group
         if: always()

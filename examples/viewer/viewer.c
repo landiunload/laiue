@@ -1301,6 +1301,8 @@ static void SurfaceChanged(void *context, bool available)
     viewer->windows->getClientSize(viewer->window, &width, &height);
     void *native = available ? viewer->windows->getNativeHandle(viewer->window) : NULL;
     (void)device->setNativeWindow(device, native, width, height);
+    PlatformWriteConsoleUtf8(available ? "viewer: the surface is back\n"
+                                       : "viewer: the surface is gone\n");
 }
 
 static bool CreateResources(Viewer *viewer)
