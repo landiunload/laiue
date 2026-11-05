@@ -248,10 +248,16 @@ target автоматически получает build-tools и `android.jar` 
 `ANDROID_SDK_ROOT`/`ANDROID_HOME`, если они установлены, и включается после
 явного задания `-DLAIUE_ANDROID_KEYSTORE=<keystore>`. Движок не создаёт и не
 хранит ключ подписи. Renderer выбирает dynamic rendering на Vulkan 1.3 и
-совместимые render-pass/framebuffer на Vulkan 1.2; поэтому emulator с
-SwiftShader 1.2 также проходит NativeActivity smoke, не требуя 1.3-only
-расширений. Push descriptors Vulkan 1.4 (или `VK_KHR_push_descriptor`)
-используются, когда устройство их даёт, и не требуются.
+совместимые render-pass/framebuffer на Vulkan 1.1, нижней границе: такой
+Vulkan есть на Android 9 и новее. Push descriptors Vulkan 1.4 (или
+`VK_KHR_push_descriptor`) используются, когда устройство их даёт, и не
+требуются. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` держит устройство в ядре 1.1
+без необязательных расширений: так путь старого телефона проверяется на любом
+устройстве, слоем валидации на компьютере и всем сценарием на эмуляторе.
+CI ещё гоняет тесты Vulkan на базовых профилях Android 2022 и 2025: слой
+Vulkan Profiles сужает драйвер до возможностей такого телефона, а валидация
+над ним ловит форматы, лимиты и расширения, которых там нет. Настоящий
+телефон с Vulkan 1.1 это не заменяет.
 
 На Windows с динамическими модулями сборка также создаёт
 `laiue_graphics_d3d12.dll`. При найденном Vulkan SDK Linux/Windows собирают

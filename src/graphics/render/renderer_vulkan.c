@@ -159,7 +159,6 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define DEPTH_TARGET_USAGE \
     (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
 #define CAPTURE_FORMAT VK_FORMAT_R8G8B8A8_UNORM
-#define DEPTH_FORMAT VK_FORMAT_D32_SFLOAT
 
 // Константы кадра. Раскладка обязана совпадать с cbuffer в chunk.hlsl:
 // смещения, которые DXC даёт в SPIR-V, совпадают с упаковкой HLSL на D3D12,
@@ -383,6 +382,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
      * desktop and mobile providers on the same ABI-safe path. */
     PFN_vkCmdBeginRendering cmdBeginRendering;
     PFN_vkCmdEndRendering cmdEndRendering;
+    bool coreOnly; // только ядро Vulkan 1.1, без необязательных расширений
     bool useDynamicRendering;
     // Кеш конвейеров драйвера; VK_NULL_HANDLE, если создать его не удалось.
     VkPipelineCache pipelineCache;
@@ -413,6 +413,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     // это последний отрисованный образ, который остаётся доступным для чтения.
     GpuImage colorTargets[FRAME_COUNT];
     GpuImage depthTarget;
+    VkFormat depthFormat;  // формат глубины, см. ChooseDepthFormat
     VkFormat colorFormat;  // формат цветовых целей и конвейеров, один на устройство
     int32_t windowWidth;
     int32_t windowHeight;
@@ -971,7 +972,7 @@ static bool CreateRenderPasses(Renderer *renderer)
     VkAttachmentDescription attachments[2] = {
         color,
         {
-            .format = DEPTH_FORMAT,
+            .format = renderer->depthFormat,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -1637,7 +1638,7 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1u,
         .pColorAttachmentFormats = &colorFormat,
-        .depthAttachmentFormat = depthAttachment ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
+        .depthAttachmentFormat = depthAttachment ? renderer->depthFormat : VK_FORMAT_UNDEFINED,
     };
     if (renderer->useDynamicRendering)
     {
@@ -2437,9 +2438,9 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
                      &renderer->cubeColor))
         return false;
     // Глубина общая для всех граней: каждый проход очищает свой прямоугольник.
-    if (!ImageCreate(renderer, resolution, resolution, 1u, DEPTH_FORMAT,
-                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     VK_IMAGE_VIEW_TYPE_2D, false, &renderer->cubeDepth))
+    if (!ImageCreate(renderer, resolution, resolution, 1u, renderer->depthFormat,
+                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                     &renderer->cubeDepth))
     {
         ReleaseCubeResources(renderer);
         return false;
@@ -2518,7 +2519,7 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
     }
     const bool sidesSwapped = (renderer->frameTurn & 1u) != 0u;
     if (!ImageCreate(renderer, (uint32_t)(sidesSwapped ? height : width),
-                     (uint32_t)(sidesSwapped ? width : height), 1u, DEPTH_FORMAT,
+                     (uint32_t)(sidesSwapped ? width : height), 1u, renderer->depthFormat,
                      DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
                      &renderer->depthTarget))
     {
@@ -2697,6 +2698,30 @@ static bool ChooseColorFormat(Renderer *renderer)
     if (!ReadSurfaceFormat(renderer, &surfaceFormat)) return false;
     if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB) renderer->colorFormat = surfaceFormat.format;
     return true;
+}
+
+// Лучше всего 32 бита с плавающей точкой, но Vulkan обещает как цель только D16:
+// базовый профиль Android не гарантирует ни D32, ни D24.
+static bool ChooseDepthFormat(Renderer *renderer)
+{
+    static const VkFormat candidates[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_X8_D24_UNORM_PACK32,
+        VK_FORMAT_D16_UNORM,
+    };
+    for (size_t index = 0u; index < sizeof(candidates) / sizeof(candidates[0]); ++index)
+    {
+        VkFormatProperties properties;
+        vkGetPhysicalDeviceFormatProperties(renderer->physicalDevice, candidates[index],
+                                            &properties);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
+            0u)
+        {
+            renderer->depthFormat = candidates[index];
+            return true;
+        }
+    }
+    return false;
 }
 
 // Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
@@ -3261,7 +3286,7 @@ static uint32_t DeviceTypeRank(VkPhysicalDeviceType type)
     }
 }
 
-// Устройство Vulkan 1.2+ лучшего типа, семья которого рисует и, при
+// Устройство Vulkan 1.1+ лучшего типа, семья которого рисует и, при
 // поверхности, показывает; из равных — первое в порядке загрузчика.
 // VK_NULL_HANDLE — подходящего нет.
 // Отдельный кадр стека: иначе LTO объединяет временные свойства и семьи
@@ -3287,7 +3312,8 @@ static VkPhysicalDevice ChoosePhysicalDevice(const Renderer *renderer, uint32_t 
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(devices[index], &properties);
         const uint32_t rank = DeviceTypeRank(properties.deviceType) + 1u;
-        if (properties.apiVersion < VK_API_VERSION_1_2 || rank <= chosenRank) continue;
+        if (properties.apiVersion < VK_API_VERSION_1_1 || rank <= chosenRank)
+            continue;
 
         uint32_t familyCount = 16u;
         VkQueueFamilyProperties families[16];
@@ -3353,15 +3379,17 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 #endif
 
     // Наибольшая версия, возможности которой использует рендерер; устройства
-    // Vulkan 1.2 и 1.3 работают в пределах своей версии.
+    // Vulkan 1.1, 1.2 и 1.3 работают в пределах своей версии.
+#if defined(VK_API_VERSION_1_4)
+    const uint32_t newestVersion = VK_API_VERSION_1_4;
+#else
+    const uint32_t newestVersion = VK_API_VERSION_1_3;
+#endif
+    const uint32_t versionLimit = renderer->coreOnly ? VK_API_VERSION_1_1 : newestVersion;
     VkApplicationInfo applicationInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "laiue",
-#if defined(VK_API_VERSION_1_4)
-        .apiVersion = VK_API_VERSION_1_4,
-#else
-        .apiVersion = VK_API_VERSION_1_3,
-#endif
+        .apiVersion = versionLimit,
     };
     VkInstanceCreateInfo instanceInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -3391,13 +3419,15 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(chosen, &properties);
+    const uint32_t deviceVersion =
+        properties.apiVersion < versionLimit ? properties.apiVersion : versionLimit;
     renderer->pipelineCacheIdentity.backend = RENDERER_BACKEND_VULKAN;
     renderer->pipelineCacheIdentity.vendorId = properties.vendorID;
     renderer->pipelineCacheIdentity.deviceId = properties.deviceID;
     renderer->pipelineCacheIdentity.driverVersion = properties.driverVersion;
     memcpy(renderer->pipelineCacheIdentity.uuid, properties.pipelineCacheUUID,
            sizeof(renderer->pipelineCacheIdentity.uuid));
-    renderer->pipelineCacheFeedback = properties.apiVersion >= VK_API_VERSION_1_3;
+    renderer->pipelineCacheFeedback = deviceVersion >= VK_API_VERSION_1_3;
     renderer->timestampPeriodNanoseconds = properties.limits.timestampPeriod;
     renderer->uniformAlignment = properties.limits.minUniformBufferOffsetAlignment;
     if (renderer->uniformAlignment < 16u)
@@ -3429,7 +3459,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .synchronization2 = VK_TRUE,
     };
     renderer->useDynamicRendering = false;
-    if (properties.apiVersion >= VK_API_VERSION_1_3)
+    if (deviceVersion >= VK_API_VERSION_1_3)
     {
         VkPhysicalDeviceVulkan13Features available13 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -3452,7 +3482,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
         .pushDescriptor = VK_TRUE,
     };
-    if (properties.apiVersion >= VK_API_VERSION_1_4)
+    if (deviceVersion >= VK_API_VERSION_1_4)
     {
         VkPhysicalDeviceVulkan14Features available14 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
@@ -3471,7 +3501,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 #endif
     const char *deviceExtensions[5];
     uint32_t deviceExtensionCount = 0u;
-    if (pushDescriptorCommand == NULL &&
+    if (pushDescriptorCommand == NULL && !renderer->coreOnly &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
     {
         deviceExtensions[deviceExtensionCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
@@ -3498,7 +3528,8 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
         .presentModeFifoLatestReady = VK_TRUE,
     };
-    const char *latestReadyExtension = renderer->hasSurface ? LatestReadyExtension(chosen) : NULL;
+    const char *latestReadyExtension =
+        renderer->hasSurface && !renderer->coreOnly ? LatestReadyExtension(chosen) : NULL;
     if (latestReadyExtension != NULL)
     {
         deviceExtensions[deviceExtensionCount++] = latestReadyExtension;
@@ -3515,7 +3546,8 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
         .presentWait = VK_TRUE,
     };
-    const bool presentWait = renderer->hasSurface && PresentWaitSupported(chosen);
+    const bool presentWait =
+        renderer->hasSurface && !renderer->coreOnly && PresentWaitSupported(chosen);
     if (presentWait)
     {
         deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
@@ -3744,7 +3776,7 @@ bool RendererSavePipelineCache_Vulkan(Renderer *renderer)
     return saved;
 }
 
-Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
+Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height, bool coreOnly)
 {
     // Headless Vulkan остаётся допустимым на любой платформе. Если
     // native handle передан, соответствующий surface provider должен быть
@@ -3759,12 +3791,13 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     if (renderer == NULL) return NULL;
 
     renderer->header.backend = RENDERER_BACKEND_VULKAN;
+    renderer->coreOnly = coreOnly;
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
     if (!CreateDeviceObjects(renderer, windowHandle) || !ChooseColorFormat(renderer) ||
-        !CreatePipelineCacheObject(renderer) || !CreateRenderPasses(renderer) ||
-        !CreateDescriptorLayouts(renderer) ||
+        !ChooseDepthFormat(renderer) || !CreatePipelineCacheObject(renderer) ||
+        !CreateRenderPasses(renderer) || !CreateDescriptorLayouts(renderer) ||
         !CreateDescriptorPool(renderer) || !CreateFrameBuffers(renderer) ||
         !CreateFallbackImages(renderer) || !CreateSharedSets(renderer))
     {
@@ -5695,6 +5728,7 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
     outStats->drawsIntoSwapchain = renderer->swapchainDirect;
     outStats->frameTurn = renderer->frameTurn;
+    outStats->dynamicRendering = renderer->useDynamicRendering;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)

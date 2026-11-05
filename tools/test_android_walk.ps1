@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Apk,
     [Parameter(Mandatory = $true)][string]$FrameCheckExe,
     [Parameter(Mandatory = $true)][string]$OutputDir,
-    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180
+    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180,
+    # The whole run on core Vulkan 1.1, the path of a phone below Vulkan 1.3.
+    [switch]$VulkanCore
 )
 
 # A real Activity/swapchain test: NDK build success cannot replace runtime.
@@ -359,8 +361,12 @@ try {
     # The scenario runs in landscape, as games do: a rotated screen is where
     # presentation differs from the natural orientation.
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
-    Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-n', $component,
-        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId") | Out-Null
+    # The system brings back an app that was on screen when install replaced it, and
+    # this intent would only reach that instance: -S starts from a clean process.
+    $started = Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-S', '-n', $component,
+        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId",
+        '--ez', 'laiueVulkanCore', $(if ($VulkanCore) { 'true' } else { 'false' }))
+    if ($started -match 'Activity not started') { throw "The scenario did not start: $started" }
     $appProcessId = Invoke-Adb -Arguments @('shell', 'pidof', $package)
     if ($appProcessId -notmatch '^\d+$') { throw 'NativeActivity did not retain a running application process.' }
 
@@ -394,6 +400,9 @@ try {
     # The screen is rotated here: a frame the system still has to turn costs a phone a pass.
     if ($summary -notmatch ' swapchain_turned_frames=[1-9]') {
         throw "No frame was drawn turned for the rotated screen: $summary"
+    }
+    if ($VulkanCore -and $summary -notmatch ' dynamic_rendering_frames=0 ') {
+        throw "The core Vulkan run used dynamic rendering: $summary"
     }
     $gameplayState = Gameplay-State -Log $log -Event 'summary'
 
@@ -509,6 +518,16 @@ $result = [pscustomobject]@{
 }
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
 if (-not $passed) {
+    # The log above is scoped to one process; the cause may lie outside it.
+    if ($logSince) {
+        try {
+            $fullLog = Invoke-Adb -Arguments @('logcat', '-d', '-b', 'all', '-v', 'threadtime', '-T', $logSince) `
+                -CommandTimeoutSeconds 30
+            [System.IO.File]::WriteAllText((Join-Path $OutputDir 'logcat-full.txt'), "$fullLog")
+        } catch {
+            Write-Warning "The full log could not be saved: $_"
+        }
+    }
     throw "Android walk runtime smoke FAIL: $testIssue $($restoreErrors -join '; '). Report: $reportPath"
 }
 Write-Host "Android walk runtime smoke PASS: $OutputDir"

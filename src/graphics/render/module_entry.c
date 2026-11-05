@@ -1583,6 +1583,8 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
             result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN;
         if (stats.frameTurn != 0u)
             result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED;
+        if (stats.dynamicRendering)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING;
     }
     result.uploadStagingBytes = RendererUploadStagingBytes(state->renderer);
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};

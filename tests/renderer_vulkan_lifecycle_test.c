@@ -22,6 +22,11 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
+// Эти же проверки идут и на пути телефона ниже Vulkan 1.3, на любом устройстве.
+#ifndef TEST_VULKAN_BACKEND
+#define TEST_VULKAN_BACKEND RENDERER_BACKEND_VULKAN
+#endif
 #endif
 
 #define SKIP_EXIT_CODE 125
@@ -269,7 +274,7 @@ static void RunCreateDestroyStress(HINSTANCE instance, void *pixels)
         ReadTestWindowClient(window, &clientWidth, &clientHeight);
 
         Renderer *renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH,
-                                                       TEST_CLIENT_HEIGHT, RENDERER_BACKEND_VULKAN);
+                                                       TEST_CLIENT_HEIGHT, TEST_VULKAN_BACKEND);
         Expect(renderer != NULL, "the windowed Vulkan renderer could not be created");
         Expect(RendererGetBackend(renderer) == RENDERER_BACKEND_VULKAN,
                "the renderer must report the Vulkan backend");
@@ -299,7 +304,7 @@ static void RunResizeMinimize(HINSTANCE instance, void *pixels)
     HWND window = CreateTestWindow(instance, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT);
     Expect(window != NULL, "the resize window could not be created");
     Renderer *renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+                                                   TEST_VULKAN_BACKEND);
     Expect(renderer != NULL, "the resize renderer could not be created");
     Expect(RendererPrepareWorld(renderer), "the resize world could not be prepared");
 
@@ -400,7 +405,7 @@ static void RunVerticalSyncToggle(HINSTANCE instance, void *pixels)
     int32_t clientHeight = 0;
     ReadTestWindowClient(window, &clientWidth, &clientHeight);
     Renderer *renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+                                                   TEST_VULKAN_BACKEND);
     Expect(renderer != NULL, "the vsync renderer could not be created");
     Expect(RendererPrepareWorld(renderer), "the vsync world could not be prepared");
 
@@ -445,7 +450,7 @@ static void RunFrameSlots(HINSTANCE instance, void *pixels)
     int32_t clientHeight = 0;
     ReadTestWindowClient(window, &clientWidth, &clientHeight);
     Renderer *renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+                                                   TEST_VULKAN_BACKEND);
     Expect(renderer != NULL, "the frame-slot renderer could not be created");
     Expect(RendererPrepareWorld(renderer), "the frame-slot world could not be prepared");
 
@@ -508,7 +513,7 @@ static void RunAbandonedFrameDestroy(HINSTANCE instance)
     HWND window = CreateTestWindow(instance, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT);
     Expect(window != NULL, "the abandoned-frame window could not be created");
     Renderer *renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+                                                   TEST_VULKAN_BACKEND);
     Expect(renderer != NULL, "the abandoned-frame renderer could not be created");
     Expect(RendererPrepareWorld(renderer), "the abandoned-frame world could not be prepared");
     static const float origin[3] = {-0.5f, -0.5f, -0.5f};
@@ -523,7 +528,7 @@ static void RunAbandonedFrameDestroy(HINSTANCE instance)
     window = CreateTestWindow(instance, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT);
     Expect(window != NULL, "the minimised-destroy window could not be created");
     renderer = RendererCreateWithBackend(window, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                         RENDERER_BACKEND_VULKAN);
+                                         TEST_VULKAN_BACKEND);
     Expect(renderer != NULL, "the minimised-destroy renderer could not be created");
     Expect(RendererPrepareWorld(renderer), "the minimised-destroy world could not be prepared");
     RendererResize(renderer, 0, 0);
@@ -567,7 +572,7 @@ static void RunBackendSwitch(HINSTANCE instance, void *pixels)
             return;
         }
         Renderer *vulkan = RendererCreateWithBackend(vulkanWindow, TEST_CLIENT_WIDTH,
-                                                     TEST_CLIENT_HEIGHT, RENDERER_BACKEND_VULKAN);
+                                                     TEST_CLIENT_HEIGHT, TEST_VULKAN_BACKEND);
         Expect(vulkan != NULL, "the Vulkan half of the switch could not be created");
         Expect(RendererGetBackend(d3d12) == RENDERER_BACKEND_D3D12,
                "the switch must keep the D3D12 backend identity");
@@ -739,7 +744,7 @@ LAIUE_TEST_ENTRY(RendererVulkanLifecycleTestEntryPoint)
     HWND probeWindow = CreateTestWindow(instance, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT);
     Expect(probeWindow != NULL, "the probe window could not be created");
     Renderer *probe = RendererCreateWithBackend(probeWindow, TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT,
-                                                RENDERER_BACKEND_VULKAN);
+                                                TEST_VULKAN_BACKEND);
     if (probe == NULL)
     {
         DestroyWindow(probeWindow);

@@ -5,6 +5,19 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Vulkan now runs from version 1.1 instead of 1.2, the version most phones
+  from Android 9 on have. Nothing in the renderer needed 1.2, and such a phone
+  was simply turned away. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` holds a device
+  to core 1.1 with no optional extension, so the path of an old phone runs on
+  any device: the Vulkan tests and the Android scenario now go through it too.
+  A real phone with Vulkan 1.1 has not been tried.
+- The Vulkan depth format is chosen from what the device can draw into:
+  32-bit float, then 24-bit, then 16-bit. It was always 32-bit float, which the
+  Android baseline does not promise, so such a phone could not draw at all.
+- CI runs the Vulkan tests on the Android baseline profiles of 2022 and 2025,
+  with the validation layer checking the calls against what a phone has.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING` tells whether a device draws
+  with dynamic rendering, and the Android scenario counts such frames.
 - Shader packs use contract 3. A frame drawn turned for an Android screen came
   with new constants for the interface and panorama vertex shaders, and a pack
   under contract 2 would have drawn them sideways on a rotated screen. Such a
