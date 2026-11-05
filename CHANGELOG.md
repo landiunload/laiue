@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- A weekly workflow compares every pinned tool, SDK, Android package and GitHub
+  action with the newest stable release, and only that workflow turns red when
+  one falls behind. `tools/check_versions.py` does the comparison.
+- The run on the Android baseline profiles now proves the profile layer really
+  loaded: the loader skips a layer it cannot load without a word.
 - Everything built with Clang now uses LLVM 23. On Windows CI took the runner's
   LLVM 20, so it did not check the compiler releases are built with.
 - The integer square root of the A* heuristic no longer loops. LLVM 23

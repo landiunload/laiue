@@ -1,0 +1,22 @@
+name: Versions
+
+# Сравнивает закреплённые версии с новейшими стабильными. Это отдельный
+# workflow: чужой новый выпуск не должен красить обычный CI.
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  newest-versions:
+    name: Pinned versions are the newest stable
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare with the newest stable releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I tools/check_versions.py

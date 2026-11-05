@@ -732,6 +732,12 @@ if(TARGET laiue_frame_check)
     set_tests_properties(laiue.tools.frame_check.reject_text PROPERTIES WILL_FAIL TRUE)
 endif()
 
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME laiue.tools.check_versions
+        COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/check_versions_test.py")
+endif()
+
 # ASan/UBSan slow compute-heavy tests several times over; scale the limits so
 # a timeout still means a hang rather than instrumentation overhead.
 if(LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS)

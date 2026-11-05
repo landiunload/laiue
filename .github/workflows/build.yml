@@ -461,6 +461,7 @@ jobs:
           VK_KHRONOS_PROFILES_SIMULATE_CAPABILITIES: SIMULATE_API_VERSION_BIT,SIMULATE_FEATURES_BIT,SIMULATE_PROPERTIES_BIT,SIMULATE_EXTENSIONS_BIT,SIMULATE_FORMATS_BIT
           # Иначе слой сам включает VK_KHR_portability_subset, которого нет на Android.
           VK_KHRONOS_PROFILES_EMULATE_PORTABILITY: 'false'
+          LAIUE_GRAPHICS_PHONE_PROFILE: '1'
         run: |
           profiles="$RUNNER_TEMP/vulkan-profiles/share/vulkan/config/VK_LAYER_KHRONOS_profiles"
           for profile in VP_ANDROID_vulkan_profile_2022 VP_ANDROID_vulkan_profile_2025; do
@@ -644,6 +645,8 @@ jobs:
     env:
       LAIUE_ANDROID_IMAGE: android-37.0
       LAIUE_BUILD_TOOLS: 37.0.0
+      LAIUE_CMDLINE_TOOLS: '23.0'
+      LAIUE_EMULATOR: 37.2.13
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install emulator runtime dependencies
@@ -676,7 +679,7 @@ jobs:
             "$RUNNER_TEMP/laiue-sdk-tools.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-sdk-tools.zip" -d "$RUNNER_TEMP/laiue-sdk-tools"
           tools="$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin"
-          grep -Fx 'Pkg.Revision=23.0' "$tools/../source.properties"
+          grep -Fx "Pkg.Revision=$LAIUE_CMDLINE_TOOLS" "$tools/../source.properties"
           for ((answer=0; answer<32; ++answer)); do printf 'y\n'; done \
             > "$RUNNER_TEMP/laiue-sdk-answers.txt"
           # Загрузка с dl.google.com изредка обрывается (Premature EOF), в том
@@ -699,13 +702,13 @@ jobs:
           test -f "$ndk/build/cmake/android.toolchain.cmake"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
           curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
-            https://dl.google.com/android/repository/emulator-linux_x64-16428233.zip \
+            https://dl.google.com/android/repository/emulator-linux_x64-16740729.zip \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
-          printf 'b08fc43d8608d2955f607f1b287beb525041e730086bdca3af152accac3af9c1  %s\n' \
+          printf 'cbc7c3cfb83220b8a0f9c513fdab557712e74d339ec19ddffa43f23350ae9bdd  %s\n' \
             "$RUNNER_TEMP/laiue-emulator.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-emulator.zip" -d "$RUNNER_TEMP/laiue-pinned-emulator"
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"
-          grep -Fx 'Pkg.Revision=37.2.12' "$emulator/source.properties"
+          grep -Fx "Pkg.Revision=$LAIUE_EMULATOR" "$emulator/source.properties"
           grep -Fx 'Pkg.BuildId=16428233' "$emulator/source.properties"
           "$emulator/emulator" -version >> build/android-runtime-results/tool-versions.txt
           printf '\nNDK: %s; build-tools: %s\n' "$ANDROID_NDK_VERSION" "$LAIUE_BUILD_TOOLS" \
