@@ -441,13 +441,15 @@ try {
     $rotationVerified = $true
 
     $beforePause = Read-SmokeLog
-    $lostCount = ([regex]::Matches($beforePause, 'event=lifecycle run=\d+ command=lost_focus ')).Count
+    $lostCount = ([regex]::Matches($beforePause, 'event=lifecycle run=\d+ command=term_window ')).Count
     Invoke-Adb -Arguments @('shell', 'input', 'keyevent', 'KEYCODE_HOME') | Out-Null
-    Wait-Log -Description 'HOME and lost focus' -Condition {
+    # The system takes the window away only once the activity has stopped. A return
+    # before that keeps the surface and proves nothing about losing it.
+    Wait-Log -Description 'HOME and lost window' -Condition {
         param($text)
-        return ([regex]::Matches($text, 'event=lifecycle run=\d+ command=lost_focus ')).Count -gt $lostCount
+        return ([regex]::Matches($text, 'event=lifecycle run=\d+ command=term_window ')).Count -gt $lostCount
     } | Out-Null
-    # Take baselines after confirmed loss of focus: a pre-HOME frame cannot
+    # Take baselines after the window is gone: a pre-HOME frame cannot
     # count as proof of successful resumed presentation.
     $pausedLog = Read-SmokeLog
     $presentedCount = ([regex]::Matches($pausedLog, 'event=presented ')).Count
