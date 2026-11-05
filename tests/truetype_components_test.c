@@ -147,6 +147,51 @@ static void ExpectRejected(TrueTypeSpan glyph, TrueTypeComponentStorage storage)
     CheckSentinels();
 }
 
+static void TestLegacyBit(void)
+{
+    uint8_t glyph[26] = {0xFF, 0xFF};
+    Put16(glyph + 10u, 0x0216u);
+    Put16(glyph + 12u, 17u);
+    glyph[14] = 0x80u;
+    glyph[15] = 0x7Fu;
+    TrueTypeCompositeInfo info = {0};
+    Expect(TrueTypeCompositeRead((TrueTypeSpan){glyph, 16u}, Storage(), &info) &&
+               ComponentEqual(components[0],
+                              (TrueTypeComponent){17, 0x0216, -128, 127, 16384, 0, 0, 16384}) &&
+               info.componentCount == 1u && info.instructions.bytes == NULL,
+           "Legacy bit4 is preserved in byte XY records without changing their fields");
+
+    Put16(glyph + 10u, 0x0153u);
+    Put16(glyph + 12u, 23u);
+    Put16(glyph + 14u, 0x8000u);
+    Put16(glyph + 16u, 0x7FFFu);
+    Put16(glyph + 18u, 8192u);
+    Put16(glyph + 20u, 24576u);
+    Put16(glyph + 22u, 2u);
+    glyph[24] = 0xAAu;
+    glyph[25] = 0x55u;
+    Expect(TrueTypeCompositeRead((TrueTypeSpan){glyph, sizeof(glyph)}, Storage(), &info) &&
+               ComponentEqual(components[0],
+                              (TrueTypeComponent){23, 0x0153, -32768, 32767, 8192, 0, 0, 24576}) &&
+               info.instructions.bytes == glyph + 24u && info.instructions.size == 2u &&
+               info.instructions.bytes[1] == 0x55u,
+           "Legacy bit4 preserves word arguments, scales and instructions");
+    ExpectRejected((TrueTypeSpan){glyph, 25u}, Storage());
+    Put16(glyph + 10u, 0x2153u);
+    ExpectRejected((TrueTypeSpan){glyph, sizeof(glyph)}, Storage());
+
+    Put16(glyph + 10u, TRUE_TYPE_COMPONENT_XY_ARGUMENTS | TRUE_TYPE_COMPONENT_MORE);
+    Put16(glyph + 16u, 0x0010u);
+    Put16(glyph + 18u, 29u);
+    glyph[20] = 0x80u;
+    glyph[21] = 0xFFu;
+    Expect(TrueTypeCompositeRead((TrueTypeSpan){glyph, 22u}, Storage(), &info) &&
+               ComponentEqual(components[1],
+                              (TrueTypeComponent){29, 0x0010, 128, 255, 16384, 0, 0, 16384}) &&
+               info.componentCount == 2u,
+           "Legacy bit4 is also preserved in a later point-number record");
+}
+
 static void TestRejected(void)
 {
     uint8_t glyph[32] = {0xFF, 0xFF};
@@ -171,7 +216,6 @@ static void TestRejected(void)
     ExpectRejected((TrueTypeSpan){glyph, 26u}, Storage());
     Put16(glyph + 10u, TRUE_TYPE_COMPONENT_XY_ARGUMENTS | TRUE_TYPE_COMPONENT_MORE);
     const uint32_t rejected[] = {
-        TRUE_TYPE_COMPONENT_XY_ARGUMENTS | 0x10u,
         TRUE_TYPE_COMPONENT_XY_ARGUMENTS | 0x2000u,
         TRUE_TYPE_COMPONENT_XY_ARGUMENTS | 0x4000u,
         TRUE_TYPE_COMPONENT_XY_ARGUMENTS | 0x8000u,
@@ -216,6 +260,7 @@ LAIUE_TEST_ENTRY(TrueTypeComponentsTestEntryPoint)
     TestRecords();
     TestTransforms();
     TestIgnoredPointFlags();
+    TestLegacyBit();
     TestRejected();
     TestMaximumComponents();
     if (failures != 0u)
