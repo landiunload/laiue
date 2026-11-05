@@ -887,8 +887,17 @@ jobs:
           # Телефон забирает окно у программы при каждом уходе в фон. Устройство
           # меняет поверхность на месте, без пересоздания: на экран должна
           # вернуться та же картинка, а не только новый кадр в цепочке.
+          # Снимок двумя файлами: PNG для человека, сырой для сравнения. Система
+          # подстраивает полоску жеста под фон, и та расходится на единицу яркости,
+          # поэтому сравниваются только строки выше неё, от заголовка в 16 байт.
           shot() {
-            timeout 15s "$adb" -s emulator-5554 exec-out screencap -p > "$1"
+            timeout 15s "$adb" -s emulator-5554 exec-out screencap > "$1.raw" \
+              && timeout 15s "$adb" -s emulator-5554 exec-out screencap -p > "$1"
+          }
+          same_picture() {
+            local width height
+            read -r width height < <(od -An -tu4 -N8 "$1.raw")
+            cmp -s -n "$((16 + width * 4 * (height - height / 16)))" "$1.raw" "$2.raw"
           }
           before=build/android-runtime-results/viewer-before.png
           settled=build/android-runtime-results/viewer-settled.png
@@ -896,7 +905,7 @@ jobs:
           after=build/android-runtime-results/viewer-after.png
           timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
             || fail "the viewer did not start to stay"
-          until shot "$before" && sleep 1 && shot "$settled" && cmp -s "$before" "$settled"; do
+          until shot "$before" && sleep 1 && shot "$settled" && same_picture "$before" "$settled"; do
             if [ "$SECONDS" -ge "$deadline" ]; then fail "the viewer did not settle"; fi
           done
           timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log"
@@ -905,11 +914,11 @@ jobs:
           timeout 10s "$adb" -s emulator-5554 shell input keyevent KEYCODE_HOME
           expect_lines 'viewer: the surface is gone' "$((gone + 1))"
           shot "$home"
-          if cmp -s "$before" "$home"; then fail "the picture stayed on the screen after HOME"; fi
+          if same_picture "$before" "$home"; then fail "the picture stayed on the screen after HOME"; fi
           timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
             || fail "the viewer did not come back"
           expect_lines 'viewer: the surface is back' "$((back + 1))"
-          until shot "$after" && cmp -s "$before" "$after"; do
+          until shot "$after" && same_picture "$before" "$after"; do
             if [ "$SECONDS" -ge "$deadline" ]; then fail "the picture did not come back"; fi
             sleep 1
           done
