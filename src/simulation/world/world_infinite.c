@@ -1708,6 +1708,18 @@ static uint32_t ChunkDeltaAdvance(const Chunk* chunk, uint32_t cursor, uint32_t 
     return left;
 }
 
+#define DELTA_BLOCK_ENTRIES 8U
+
+/* Длина известна заранее и проверять внутри нечего, поэтому компилятор сводит
+ * это к сжатию одного вектора. */
+static void CopyDeltaBlock(BlockType *restrict output, const DeltaEntry *restrict deltas)
+{
+    for (uint32_t index = 0U; index < DELTA_BLOCK_ENTRIES; ++index)
+    {
+        output[index] = DeltaBlock(deltas[index]);
+    }
+}
+
 WorldRegionContents WorldFillRegion(World* world,
     int64_t minBlockX, int64_t minBlockY, int64_t minBlockZ,
     int32_t sizeX, int32_t sizeY, int32_t sizeZ,
@@ -1836,7 +1848,11 @@ WorldRegionContents WorldFillRegion(World* world,
                      * внутри одной колонны ложатся в регион тоже подряд:
                      * место считается один раз на отрезок, а внутри него
                      * хватает наращивания. У заселённого чанка почти вся
-                     * работа приходится на такие отрезки. */
+                     * работа приходится на такие отрезки.
+                     *
+                     * Индексы строго растут, поэтому если запись на семь
+                     * вперёд стоит на своём месте, пропусков между ними
+                     * нет: одна проверка отвечает сразу за весь блок. */
                     const int64_t strideY = (int64_t)sizeX * (int64_t)sizeZ;
                     const int64_t strideX = (int64_t)sizeZ;
                     const int64_t regionBase =
@@ -1844,24 +1860,32 @@ WorldRegionContents WorldFillRegion(World* world,
                         (chunkBase[0] - minBlockX) * strideX + (chunkBase[2] - minBlockZ);
                     if (clip.whole)
                     {
+                        const DeltaEntry *deltas = chunk->deltas;
+                        const uint32_t deltaCount = chunk->deltaCount;
                         uint32_t delta = 0;
-                        while (delta < chunk->deltaCount)
+                        while (delta < deltaCount)
                         {
                             anyDeltaApplied = true;
-                            uint32_t localIndex = DeltaLocalIndex(chunk->deltas[delta]);
+                            uint32_t localIndex = DeltaLocalIndex(deltas[delta]);
                             uint32_t columnEnd = localIndex | (CHUNK_SIZE - 1U);
                             int64_t place = regionBase +
                                 (int64_t)(localIndex / (CHUNK_SIZE * CHUNK_SIZE)) * strideX +
                                 (int64_t)((localIndex / CHUNK_SIZE) % CHUNK_SIZE) * strideY +
                                 (int64_t)(localIndex % CHUNK_SIZE);
-                            outBlocks[place] = DeltaBlock(chunk->deltas[delta]);
-                            ++delta;
-                            ++place;
-                            ++localIndex;
-                            while (delta < chunk->deltaCount && localIndex <= columnEnd &&
-                                   DeltaLocalIndex(chunk->deltas[delta]) == localIndex)
+                            while (deltaCount - delta >= DELTA_BLOCK_ENTRIES &&
+                                   localIndex + DELTA_BLOCK_ENTRIES - 1U <= columnEnd &&
+                                   DeltaLocalIndex(deltas[delta + DELTA_BLOCK_ENTRIES - 1U]) ==
+                                       localIndex + DELTA_BLOCK_ENTRIES - 1U)
                             {
-                                outBlocks[place] = DeltaBlock(chunk->deltas[delta]);
+                                CopyDeltaBlock(outBlocks + place, deltas + delta);
+                                delta += DELTA_BLOCK_ENTRIES;
+                                place += DELTA_BLOCK_ENTRIES;
+                                localIndex += DELTA_BLOCK_ENTRIES;
+                            }
+                            while (delta < deltaCount && localIndex <= columnEnd &&
+                                   DeltaLocalIndex(deltas[delta]) == localIndex)
+                            {
+                                outBlocks[place] = DeltaBlock(deltas[delta]);
                                 ++delta;
                                 ++place;
                                 ++localIndex;

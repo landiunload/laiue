@@ -661,6 +661,44 @@ static void TestHaloRegionsWithPattern(void)
     WorldDestroy(world);
 }
 
+// Чанк целиком внутри региона пишется отрезками: подряд идущие индексы одной
+// колонны копируются блоками. Здесь отрезки всех длин и начал, разрывы внутри
+// колонны и сплошные колонны одна за другой: индексы соседних колонн тоже идут
+// подряд, и если блок перейдёт через конец колонны, материал окажется не там.
+static void TestWholeChunkRuns(void)
+{
+    static BlockType cells[(CHUNK_SIZE + 2) * (CHUNK_SIZE + 2) * (CHUNK_SIZE + 2)];
+    World *world = WorldCreate(NULL);
+    ProviderExpect(world != NULL, "мир для проверки отрезков создан");
+
+    for (int64_t x = 0; x < CHUNK_SIZE; ++x)
+    {
+        for (int64_t y = 0; y < CHUNK_SIZE; ++y)
+        {
+            int64_t start = (x + y * 3) % CHUNK_SIZE;
+            int64_t length = y < 2 ? CHUNK_SIZE : (x * 5 + y * 7) % (CHUNK_SIZE + 1);
+            if (y < 2)
+            {
+                start = 0;
+            }
+            for (int64_t z = 0; z < CHUNK_SIZE; ++z)
+            {
+                // Второй отрезок идёт через одну ячейку после первого.
+                bool first = z >= start && z < start + length;
+                bool second = z > start + length && z <= start + length + 9;
+                if (first || second)
+                {
+                    WorldSetBlock(world, x, y, z, (BlockType)(1 + (x * 3 + y * 5 + z * 7) % 251));
+                }
+            }
+        }
+    }
+
+    HaloCompare(world, 0, 0, 0, CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE, cells);
+    HaloCompare(world, -1, -1, -1, CHUNK_SIZE + 2, CHUNK_SIZE + 2, CHUNK_SIZE + 2, cells);
+    WorldDestroy(world);
+}
+
 static void TestRegionCoordinateLimits(void)
 {
     static BlockType cells[CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
@@ -1452,6 +1490,7 @@ LAIUE_TEST_ENTRY(WorldProviderTestEntryPoint)
     TestRebaseAndFormatting();
     TestRegionClassification();
     TestHaloRegions();
+    TestWholeChunkRuns();
     TestRegionCoordinateLimits();
     TestFastPathAfterEmpty();
     TestRegionEmptyOverrideFastPath();

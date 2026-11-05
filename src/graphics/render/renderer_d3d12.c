@@ -3246,10 +3246,15 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
                         D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, TEXTURE_STAGING_CHUNK_BYTES,
                         &staging, &offset, &mapped))
         return false;
+    // Шаг чтения считается от размера источника: rows совпадает с ним по проверке
+    // выше, а прочитать больше, чем передали, такой цикл не может в принципе.
     const uint8_t *source = (const uint8_t *)data;
-    for (UINT row = 0u; row < rows; ++row)
-        memcpy(mapped + (size_t)row * layout.Footprint.RowPitch,
-               source + (size_t)row * rowPitchBytes, (size_t)rowPitchBytes);
+    uint8_t *target = mapped;
+    for (uint64_t read = 0u; read < sizeBytes; read += rowPitchBytes)
+    {
+        memcpy(target, source + read, (size_t)rowPitchBytes);
+        target += layout.Footprint.RowPitch;
+    }
     layout.Offset = offset;
     PendingTextureUpload *upload = &renderer->pendingTextures[renderer->pendingTextureCount++];
     upload->texture = texture;
