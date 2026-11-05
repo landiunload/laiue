@@ -647,6 +647,7 @@ jobs:
       LAIUE_BUILD_TOOLS: 37.0.0
       LAIUE_CMDLINE_TOOLS: '23.0'
       LAIUE_EMULATOR: 37.2.13
+      LAIUE_EMULATOR_BUILD: 16740729
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install emulator runtime dependencies
@@ -702,14 +703,14 @@ jobs:
           test -f "$ndk/build/cmake/android.toolchain.cmake"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
           curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
-            https://dl.google.com/android/repository/emulator-linux_x64-16740729.zip \
+            "https://dl.google.com/android/repository/emulator-linux_x64-$LAIUE_EMULATOR_BUILD.zip" \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
           printf 'cbc7c3cfb83220b8a0f9c513fdab557712e74d339ec19ddffa43f23350ae9bdd  %s\n' \
             "$RUNNER_TEMP/laiue-emulator.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-emulator.zip" -d "$RUNNER_TEMP/laiue-pinned-emulator"
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"
           grep -Fx "Pkg.Revision=$LAIUE_EMULATOR" "$emulator/source.properties"
-          grep -Fx 'Pkg.BuildId=16428233' "$emulator/source.properties"
+          grep -Fx "Pkg.BuildId=$LAIUE_EMULATOR_BUILD" "$emulator/source.properties"
           "$emulator/emulator" -version >> build/android-runtime-results/tool-versions.txt
           printf '\nNDK: %s; build-tools: %s\n' "$ANDROID_NDK_VERSION" "$LAIUE_BUILD_TOOLS" \
             >> build/android-runtime-results/tool-versions.txt
