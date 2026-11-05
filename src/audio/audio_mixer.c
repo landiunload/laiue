@@ -564,10 +564,10 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
                 for (; sample + 4u <= count; sample += 4u)
                 {
                     int16_t block[8];
-                    for (uint32_t part = 0u; part < 4u; ++part)
+                    for (uint32_t part = 0u; part < 8u; part += 2u)
                     {
-                        memcpy(block + (size_t)part * 2u, samples + (size_t)frame * 2u,
-                               2u * sizeof(block[0]));
+                        block[part] = samples[(size_t)frame * 2u];
+                        block[part + 1u] = samples[(size_t)frame * 2u + 1u];
                         frame += stepFrames;
                     }
                     float *out = frames + (size_t)((index + sample) * 2u);
