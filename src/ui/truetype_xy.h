@@ -65,10 +65,15 @@ typedef struct TrueTypeXYGlyph
 } TrueTypeXYGlyph;
 
 // Private XY-only geometry: pixels/Y-up, исходные on/off-curve points и ends.
-// Нет implied points, hints, edges или raster. Point attachment и USE_MY_METRICS
-// возвращают false. Default offset unscaled; ROUND ties toward +infinity.
-// Root initial phantoms масштабируются из helper85, bounds относятся к points,
-// ещё не к tight quadratic/ink bounds. Empty glyph имеет нулевые bounds.
+// Нет implied points, hints, edges или raster. Point attachment возвращает false.
+// USE_MY_METRICS поддержан только при local identity matrix и zero XY arguments;
+// любой другой flagged component во всём plan возвращает false. На каждом уровне
+// последний flagged child выбирает источник всех phantoms/mask. Выбор повторяется
+// в выбранном child без C recursion. Без flags берутся initial metrics этого node.
+// Default offset unscaled; ROUND ties toward +infinity. Phantoms выбранного glyph
+// масштабируются из helper85; points не сдвигаются ради metric origin.
+// Bounds относятся к points, ещё не к tight quadratic/ink bounds.
+// Empty glyph имеет нулевые bounds.
 // 0 < pixelsPerUnit <= 64; abs basis, offsets, translations и output <= 2^20.
 // Это implementation limits, не гарантия всех fonts при maximum scale.
 // Требуется precise FP. Font успешно Initialize и immutable. Font/bytes,

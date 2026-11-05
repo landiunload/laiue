@@ -54,6 +54,28 @@ static bool XyChild(const TrueTypeXYFrame *parent, const TrueTypeComponent *comp
     return true;
 }
 
+// Каждая выбранная USE edge имеет local identity/zero placement после preflight.
+// Поэтому metric source остаётся в системе root, без per-node phantom scratch.
+static const TrueTypePlanNode *XyMetricNode(const TrueTypePlanWorkspace *plan)
+{
+    uint16_t index = 0u;
+    for (;;)
+    {
+        const TrueTypePlanNode *node = &plan->nodes[index];
+        uint16_t selected = TRUE_TYPE_PLAN_NO_INDEX;
+        for (uint32_t offset = 0u; offset < node->childCount; ++offset)
+        {
+            uint16_t child = (uint16_t)(node->firstChild + offset);
+            uint16_t flags = plan->components[plan->nodes[child].componentIndex].flags;
+            if ((flags & TRUE_TYPE_COMPONENT_USE_METRICS) != 0u)
+                selected = child;
+        }
+        if (selected == TRUE_TYPE_PLAN_NO_INDEX)
+            return node;
+        index = selected;
+    }
+}
+
 static bool XyPhantoms(const TrueTypeFont *font, uint16_t glyph, uint32_t contours, float scale,
                        TrueTypeXYGlyph *result)
 {
@@ -134,14 +156,18 @@ bool TrueTypeGlyphResolveXY(const TrueTypeFont *font, uint16_t glyph, float pixe
         return false;
     for (uint32_t index = 0u; index < summary.componentCount; ++index)
     {
-        uint16_t flags = workspace->plan.components[index].flags;
-        if ((flags & TRUE_TYPE_COMPONENT_XY_ARGUMENTS) == 0u ||
-            (flags & TRUE_TYPE_COMPONENT_USE_METRICS) != 0u)
+        const TrueTypeComponent *component = &workspace->plan.components[index];
+        if ((component->flags & TRUE_TYPE_COMPONENT_XY_ARGUMENTS) == 0u)
+            return false;
+        if ((component->flags & TRUE_TYPE_COMPONENT_USE_METRICS) != 0u &&
+            (component->argument1 != 0 || component->argument2 != 0 || component->xScale != 16384 ||
+             component->yScale != 16384 || component->scale01 != 0 || component->scale10 != 0))
             return false;
     }
     TrueTypeXYGlyph result = {.pointCount = summary.pointCount,
                               .contourCount = summary.contourCount};
-    if (!XyPhantoms(font, glyph, summary.contourCount, pixelsPerUnit, &result))
+    const TrueTypePlanNode *metric = XyMetricNode(&workspace->plan);
+    if (!XyPhantoms(font, metric->glyphIndex, metric->contourCount, pixelsPerUnit, &result))
         return false;
     workspace->frames[0] = (TrueTypeXYFrame){.m00 = pixelsPerUnit, .m11 = pixelsPerUnit};
     uint32_t frameCount = 1u;

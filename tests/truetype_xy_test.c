@@ -274,6 +274,16 @@ static bool PointEquals(uint32_t index, float x, float y, bool onCurve)
            outputPoints[index].onCurve == onCurve;
 }
 
+static bool PhantomsEqual(const TrueTypeXYGlyph *result, uint32_t mask, float left, float right,
+                          float top, float bottom)
+{
+    return result->phantomMask == mask && result->phantoms[0].x == left &&
+           result->phantoms[0].y == 0.0f && result->phantoms[1].x == right &&
+           result->phantoms[1].y == 0.0f && result->phantoms[2].x == 0.0f &&
+           result->phantoms[2].y == top && result->phantoms[3].x == 0.0f &&
+           result->phantoms[3].y == bottom;
+}
+
 static void TestSimpleAndEmpty(void)
 {
     Begin(1u, 1u, 1u);
@@ -430,6 +440,131 @@ static void TestRounding(void)
                "half ties go positive without double rounding a neighboring float");
 }
 
+static void TestMetricSources(void)
+{
+    Begin(2u, 2u, 2u);
+    TrueTypeComponent record = Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(&record, 1u, 20, 700, 20, 700);
+    Point(20, 700, true);
+    Metric(false, 0u, 900u, -30);
+    Metric(false, 1u, 512u, 10);
+    Metric(true, 0u, 1600u, -50);
+    Metric(true, 1u, 1024u, 100);
+    TrueTypeXYGlyph result = {0};
+    Expect(Resolve(1.0f / 32.0f, &result) &&
+               PhantomsEqual(&result, 15u, 0.3125f, 16.3125f, 25.0f, -7.0f) &&
+               PointEquals(0u, 0.625f, 21.875f, true) && result.xMin == 0.625f &&
+               result.xMax == 0.625f && result.yMin == 21.875f && result.yMax == 21.875f,
+           "identity USE selects all child phantoms without shifting geometry or bounds");
+
+    Begin(3u, 3u, 3u);
+    record = Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(&record, 1u, 4, 8, 4, 8);
+    record = Record(2u, 0, 0, TRUE_TYPE_COMPONENT_SCALE);
+    record.xScale = record.yScale = 8192;
+    Composite(&record, 1u, 4, 8, 4, 8);
+    Point(8, 16, true);
+    Metric(false, 0u, 900u, -30);
+    Metric(false, 1u, 700u, 1);
+    Metric(false, 2u, 512u, 10);
+    Metric(true, 0u, 1600u, -50);
+    Metric(true, 1u, 1000u, 20);
+    Metric(true, 2u, 1024u, 100);
+    Expect(Resolve(1.0f / 8.0f, &result) && result.pointCount == 1u && result.contourCount == 1u &&
+               PhantomsEqual(&result, 15u, 0.375f, 87.875f, 3.5f, -121.5f) &&
+               PointEquals(0u, 0.5f, 1.0f, true) && result.xMin == 0.5f && result.xMax == 0.5f &&
+               result.yMin == 1.0f && result.yMax == 1.0f,
+           "metric selection stops at a composite whose scaled child has no USE flag");
+
+    Begin(4u, 4u, 0u);
+    TrueTypeComponent records[3] = {
+        Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS | TRUE_TYPE_COMPONENT_MATRIX),
+        Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS | TRUE_TYPE_COMPONENT_XY_SCALE),
+        Record(3u, 0, 0, 0u)};
+    Composite(records, 3u, -10, 5, 20, 40);
+    Point(10, 30, true);
+    Point(20, 40, false);
+    Point(-10, 5, true);
+    Metric(false, 0u, 900u, -10);
+    Metric(false, 1u, 200u, 1);
+    Metric(false, 2u, 300u, 5);
+    Metric(false, 3u, 400u, -3);
+    Expect(Resolve(1.0f / 8.0f, &result) && result.pointCount == 3u && result.contourCount == 3u &&
+               PhantomsEqual(&result, 3u, 1.875f, 39.375f, 0.0f, 0.0f) &&
+               PointEquals(0u, 1.25f, 3.75f, true) && PointEquals(1u, 2.5f, 5.0f, false) &&
+               PointEquals(2u, -1.25f, 0.625f, true),
+           "last flagged child wins rather than last child, and absent V clears all V slots");
+
+    Begin(3u, 3u, 3u);
+    record = Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(&record, 1u, 20, 700, 20, 700);
+    record = Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(&record, 1u, 20, 700, 20, 700);
+    Point(20, 700, true);
+    Metric(false, 0u, 900u, -30);
+    Metric(false, 1u, 700u, -10);
+    Metric(false, 2u, 512u, 10);
+    Metric(true, 0u, 1600u, -50);
+    Metric(true, 1u, 1400u, 30);
+    Metric(true, 2u, 1024u, 100);
+    Expect(Resolve(1.0f / 32.0f, &result) &&
+               PhantomsEqual(&result, 15u, 0.3125f, 16.3125f, 25.0f, -7.0f),
+           "nested USE chain inherits the selected child's resolved metric source");
+
+    Begin(3u, 3u, 3u);
+    records[0] = Record(1u, 0, 0, 0u);
+    records[1] = Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(records, 2u, 20, 700, 20, 700);
+    Point(20, 700, true);
+    Empty();
+    Metric(false, 2u, 400u, 10);
+    Metric(true, 2u, 600u, 20);
+    Expect(Resolve(1.0f / 32.0f, &result) && result.pointCount == 1u && result.contourCount == 1u &&
+               PhantomsEqual(&result, 15u, -0.3125f, 12.1875f, 0.625f, -18.125f) &&
+               PointEquals(0u, 0.625f, 21.875f, true),
+           "selected empty glyph uses its own zero contour count while root remains nonempty");
+
+    Begin(3u, 3u, 0u);
+    record = Record(1u, 0, 0, 0u);
+    Composite(&record, 1u, 20, 700, 20, 700);
+    record = Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(&record, 1u, 20, 700, 20, 700);
+    Point(20, 700, true);
+    Metric(false, 0u, 900u, -30);
+    Metric(false, 2u, 512u, 10);
+    Expect(Resolve(1.0f / 32.0f, &result) &&
+               PhantomsEqual(&result, 3u, 1.5625f, 29.6875f, 0.0f, 0.0f),
+           "USE inside an unflagged subtree does not replace root initial metrics");
+
+    const uint16_t encodings[] = {TRUE_TYPE_COMPONENT_SCALE, TRUE_TYPE_COMPONENT_XY_SCALE,
+                                  TRUE_TYPE_COMPONENT_MATRIX};
+    for (uint32_t index = 0u; index < sizeof(encodings) / sizeof(encodings[0]); ++index)
+    {
+        Begin(2u, 2u, 0u);
+        record = Record(1u, 0, 0,
+                        encodings[index] | TRUE_TYPE_COMPONENT_USE_METRICS |
+                            TRUE_TYPE_COMPONENT_ROUND_XY | TRUE_TYPE_COMPONENT_SCALED_OFFSET);
+        Composite(&record, 1u, 8, 16, 8, 16);
+        Point(8, 16, true);
+        Metric(false, 1u, 256u, 4);
+        Expect(Resolve(1.0f / 8.0f, &result) &&
+                   PhantomsEqual(&result, 3u, 0.5f, 32.5f, 0.0f, 0.0f) &&
+                   PointEquals(0u, 1.0f, 2.0f, true),
+               "explicit identity encodings and zero ROUND/scaled placement support USE");
+    }
+
+    Begin(16u, 1u, 0u);
+    for (uint32_t glyph = 0u; glyph < 15u; ++glyph)
+    {
+        record = Record((uint16_t)(glyph + 1u), 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+        Composite(&record, 1u, 0, 0, 0, 0);
+    }
+    Point(0, 0, true);
+    Bearing(false, 15u, 10);
+    Expect(Resolve(0.5f, &result) && PhantomsEqual(&result, 3u, -5.0f, 245.0f, 0.0f, 0.0f),
+           "metric selection accepts the full sixteen-level chain without extra scratch");
+}
+
 static TrueTypeXYGlyph Sentinel(void)
 {
     return (TrueTypeXYGlyph){
@@ -492,7 +627,10 @@ static void TestLimitsAndUnsupportedModes(void)
     TrueTypeComponent records[2] = {Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS)};
     Composite(records, 1u, 8, 16, 8, 16);
     Point(8, 16, true);
-    Rejected(0.5f, Storage());
+    TrueTypeXYGlyph identity = {0};
+    Expect(Resolve(0.5f, &identity) && PointEquals(0u, 4.0f, 8.0f, true) &&
+               PhantomsEqual(&identity, 3u, 4.0f, 254.0f, 0.0f, 0.0f),
+           "the former identity USE rejection is now supported");
     Begin(2u, 1u, 0u);
     records[0] = Record(1u, 0, 0, 0u);
     records[1] = Record(1u, 0, 0, 0u);
@@ -539,6 +677,76 @@ static void TestLimitsAndUnsupportedModes(void)
     }
 }
 
+static void TestComplexMetricsRejected(void)
+{
+    for (uint32_t mode = 0u; mode < 7u; ++mode)
+    {
+        Begin(2u, 1u, 0u);
+        TrueTypeComponent record =
+            Record(1u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS | TRUE_TYPE_COMPONENT_MATRIX);
+        int16_t x = 8;
+        int16_t y = 16;
+        if (mode == 0u)
+        {
+            record.xScale = 8192;
+            x = 4;
+        }
+        if (mode == 1u)
+        {
+            record.yScale = 8192;
+            y = 8;
+        }
+        if (mode == 2u)
+        {
+            record.scale01 = 4096;
+            y = 18;
+        }
+        if (mode == 3u)
+        {
+            record.scale10 = 4096;
+            x = 12;
+        }
+        if (mode == 4u)
+        {
+            record.argument1 = 1;
+            x = 9;
+        }
+        if (mode == 5u)
+        {
+            record.argument2 = -1;
+            y = 15;
+        }
+        if (mode == 6u)
+        {
+            record.xScale = -16384;
+            x = -8;
+        }
+        Composite(&record, 1u, x, y, x, y);
+        Point(8, 16, true);
+        Rejected(0.5f, Storage());
+    }
+
+    Begin(3u, 1u, 0u);
+    TrueTypeComponent records[2] = {Record(1u, 1, 0, TRUE_TYPE_COMPONENT_USE_METRICS),
+                                    Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS)};
+    Composite(records, 2u, 9, 16, 12, 20);
+    Point(8, 16, true);
+    Point(12, 20, true);
+    Rejected(0.5f, Storage());
+
+    Begin(4u, 1u, 0u);
+    records[0] = Record(1u, 0, 0, 0u);
+    records[1] = Record(3u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS);
+    Composite(records, 2u, 4, 16, 12, 20);
+    TrueTypeComponent complex =
+        Record(2u, 0, 0, TRUE_TYPE_COMPONENT_USE_METRICS | TRUE_TYPE_COMPONENT_MATRIX);
+    complex.xScale = 8192;
+    Composite(&complex, 1u, 4, 16, 4, 16);
+    Point(8, 16, true);
+    Point(12, 20, true);
+    Rejected(0.5f, Storage());
+}
+
 static void WriteSize(size_t value)
 {
     char digits[32];
@@ -564,10 +772,12 @@ LAIUE_TEST_ENTRY(TrueTypeXYTestEntryPoint)
     TestMatricesAndOffsets();
     TestOrderAndRepeatedNodes();
     TestRounding();
+    TestMetricSources();
     TestLimitsAndUnsupportedModes();
+    TestComplexMetricsRejected();
     if (failures != 0u)
         LaiueTestRuntimeExit(1);
-    LaiueTestRuntimeWrite("TrueType XY OK; workspace=");
+    LaiueTestRuntimeWrite("TrueType XY metrics OK; workspace=");
     WriteSize(sizeof(TrueTypeXYWorkspace));
     LaiueTestRuntimeWrite(" frame=");
     WriteSize(sizeof(TrueTypeXYFrame));
