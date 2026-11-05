@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Shader packs use contract 3. A frame drawn turned for an Android screen came
+  with new constants for the interface and panorama vertex shaders, and a pack
+  under contract 2 would have drawn them sideways on a rotated screen. Such a
+  pack no longer loads: rebuild it with the two lines described in
+  `docs/shaderpacks.md`. A pack that only replaces chunk shaders needs a new
+  contract line and nothing more, since `viewProjection` already holds the turn.
 - On Android a swap chain built during a turn of the screen takes the size of
   the window. The surface still reports its old size at that moment, so since
   the frame went straight into the chain a turn to portrait left a chain of the
