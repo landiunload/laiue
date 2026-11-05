@@ -463,8 +463,9 @@ try {
                $presented[$presented.Count - 1].Index -gt $gained[$gained.Count - 1].Index
     }
     $resumedFrame = Latest-Presentation -Log $resumedLog
+    # A presented frame is not yet a frame on the screen: the launcher may still be there.
     Save-Capture -Name 'resumed' -NativeWidth ([int]$resumedFrame.Groups[1].Value) `
-        -NativeHeight ([int]$resumedFrame.Groups[2].Value) | Out-Null
+        -NativeHeight ([int]$resumedFrame.Groups[2].Value) -Upright | Out-Null
     if ((Gameplay-State -Log $resumedLog -Event 'presented') -ne $gameplayState) {
         throw 'HOME/resume changed the held gameplay pose, world frame, camera or session revision.'
     }
