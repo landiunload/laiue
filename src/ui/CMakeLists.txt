@@ -9,8 +9,11 @@ add_library(laiue_ui_font_support STATIC
     truetype_plan.c
     truetype_plan.h
     truetype_reader.c
-    truetype_reader.h)
+    truetype_reader.h
+    truetype_xy.c
+    truetype_xy.h)
 target_link_libraries(laiue_ui_font_support PRIVATE laiue::build_options)
+laiue_configure_precise_fp(laiue_ui_font_support)
 target_include_directories(laiue_ui_font_support
     PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>")
 set_target_properties(laiue_ui_font_support PROPERTIES POSITION_INDEPENDENT_CODE ON)
