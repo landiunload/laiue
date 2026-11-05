@@ -526,6 +526,9 @@ if(TARGET laiue_ui)
     laiue_add_harness(laiue_truetype_plan_test TrueTypePlanTestEntryPoint
         truetype_plan_test.c LIBRARIES laiue::ui_font_support
         TEST laiue.ui.truetype_plan)
+    laiue_add_harness(laiue_truetype_phantoms_test TrueTypePhantomsTestEntryPoint
+        truetype_phantoms_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_phantoms)
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно
