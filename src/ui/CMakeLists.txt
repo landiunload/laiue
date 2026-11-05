@@ -4,6 +4,8 @@ add_library(laiue_ui_font_support STATIC
     truetype_components.h
     truetype_outline.c
     truetype_outline.h
+    truetype_phantoms.c
+    truetype_phantoms.h
     truetype_plan.c
     truetype_plan.h
     truetype_reader.c
