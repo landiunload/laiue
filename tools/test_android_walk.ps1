@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Apk,
     [Parameter(Mandatory = $true)][string]$FrameCheckExe,
     [Parameter(Mandatory = $true)][string]$OutputDir,
-    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180
+    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180,
+    # The whole run on core Vulkan 1.1, the path of a phone below Vulkan 1.3.
+    [switch]$VulkanCore
 )
 
 # A real Activity/swapchain test: NDK build success cannot replace runtime.
@@ -132,7 +134,7 @@ function Wait-Log {
 }
 
 function Save-Capture {
-    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0)
+    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0, [switch]$Upright)
     if ($Name -notmatch '^[a-zA-Z0-9_-]+$' -or $NativeWidth -le 0 -or $NativeHeight -le 0) {
         throw 'Invalid screenshot checkpoint metadata.'
     }
@@ -173,6 +175,10 @@ function Save-Capture {
             # same orientation.
             $problem = "Native surface ${NativeWidth}x$NativeHeight and screenshot " +
                 "$($image.width)x$($image.height) disagree for $Name."
+        } elseif ($Upright -and -not $image.skyAboveGround) {
+            # After a turn the screen keeps the last frame of the old orientation,
+            # rotated, until it takes the new one.
+            $problem = "The sky is not above the ground in $Name."
         } else {
             $problem = $null
         }
@@ -193,7 +199,7 @@ function Save-Capture {
 
 function Latest-Presentation {
     param([string]$Log)
-    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
+    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+) direct=(\d)')
     if ($items.Count -eq 0) { throw 'No presented native frame was reported.' }
     return $items[$items.Count - 1]
 }
@@ -355,8 +361,12 @@ try {
     # The scenario runs in landscape, as games do: a rotated screen is where
     # presentation differs from the natural orientation.
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
-    Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-n', $component,
-        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId") | Out-Null
+    # The system brings back an app that was on screen when install replaced it, and
+    # this intent would only reach that instance: -S starts from a clean process.
+    $started = Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-S', '-n', $component,
+        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId",
+        '--ez', 'laiueVulkanCore', $(if ($VulkanCore) { 'true' } else { 'false' }))
+    if ($started -match 'Activity not started') { throw "The scenario did not start: $started" }
     $appProcessId = Invoke-Adb -Arguments @('shell', 'pidof', $package)
     if ($appProcessId -notmatch '^\d+$') { throw 'NativeActivity did not retain a running application process.' }
 
@@ -387,6 +397,13 @@ try {
         return $text -match "event=summary run=$runId status=PASS"
     }
     $summary = [regex]::Match($log, "LAIUE_SCENARIO event=summary run=$runId status=PASS[^\r\n]*").Value
+    # The screen is rotated here: a frame the system still has to turn costs a phone a pass.
+    if ($summary -notmatch ' swapchain_turned_frames=[1-9]') {
+        throw "No frame was drawn turned for the rotated screen: $summary"
+    }
+    if ($VulkanCore -and $summary -notmatch ' dynamic_rendering_frames=0 ') {
+        throw "The core Vulkan run used dynamic rendering: $summary"
+    }
     $gameplayState = Gameplay-State -Log $log -Event 'summary'
 
     # Require real resize/presentation, not merely changed Android settings.
@@ -400,11 +417,14 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $portraitFrame = Latest-Presentation -Log $portraitLog
+    # The surface reports its old size during a turn: the chain must still fit the window.
+    if ($portraitFrame.Groups[3].Value -ne '1') { throw 'The portrait frame did not go straight into the chain.' }
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
-        -NativeHeight ([int]$portraitFrame.Groups[2].Value)
+        -NativeHeight ([int]$portraitFrame.Groups[2].Value) -Upright
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
     $priorPresented = ([regex]::Matches($portraitLog, 'event=presented ')).Count
-    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
+    # The scenario ran in the other landscape: this one takes the opposite turn.
+    Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '3') | Out-Null
     $landscapeLog = Wait-Log -Description 'landscape resize and presentation' -Condition {
         param($text)
         $presented = [regex]::Matches($text, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
@@ -413,9 +433,16 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $landscapeFrame = Latest-Presentation -Log $landscapeLog
+    if ($landscapeFrame.Groups[3].Value -ne '1') { throw 'The landscape frame did not go straight into the chain.' }
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
-        -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
+        -NativeHeight ([int]$landscapeFrame.Groups[2].Value) -Upright
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
+    # The same world in both orientations: a turn must not change its colours.
+    foreach ($channel in @('skyRed', 'skyGreen', 'skyBlue')) {
+        if ([math]::Abs($portrait.imageCheck.$channel - $landscape.imageCheck.$channel) -gt 3) {
+            throw "Portrait and landscape disagree in ${channel}: $($portrait.imageCheck.$channel) against $($landscape.imageCheck.$channel)."
+        }
+    }
     if ((Gameplay-State -Log $portraitLog -Event 'presented') -ne $gameplayState -or
         (Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
         throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'
@@ -423,13 +450,15 @@ try {
     $rotationVerified = $true
 
     $beforePause = Read-SmokeLog
-    $lostCount = ([regex]::Matches($beforePause, 'event=lifecycle run=\d+ command=lost_focus ')).Count
+    $lostCount = ([regex]::Matches($beforePause, 'event=lifecycle run=\d+ command=term_window ')).Count
     Invoke-Adb -Arguments @('shell', 'input', 'keyevent', 'KEYCODE_HOME') | Out-Null
-    Wait-Log -Description 'HOME and lost focus' -Condition {
+    # The system takes the window away only once the activity has stopped. A return
+    # before that keeps the surface and proves nothing about losing it.
+    Wait-Log -Description 'HOME and lost window' -Condition {
         param($text)
-        return ([regex]::Matches($text, 'event=lifecycle run=\d+ command=lost_focus ')).Count -gt $lostCount
+        return ([regex]::Matches($text, 'event=lifecycle run=\d+ command=term_window ')).Count -gt $lostCount
     } | Out-Null
-    # Take baselines after confirmed loss of focus: a pre-HOME frame cannot
+    # Take baselines after the window is gone: a pre-HOME frame cannot
     # count as proof of successful resumed presentation.
     $pausedLog = Read-SmokeLog
     $presentedCount = ([regex]::Matches($pausedLog, 'event=presented ')).Count
@@ -445,8 +474,9 @@ try {
                $presented[$presented.Count - 1].Index -gt $gained[$gained.Count - 1].Index
     }
     $resumedFrame = Latest-Presentation -Log $resumedLog
+    # A presented frame is not yet a frame on the screen: the launcher may still be there.
     Save-Capture -Name 'resumed' -NativeWidth ([int]$resumedFrame.Groups[1].Value) `
-        -NativeHeight ([int]$resumedFrame.Groups[2].Value) | Out-Null
+        -NativeHeight ([int]$resumedFrame.Groups[2].Value) -Upright | Out-Null
     if ((Gameplay-State -Log $resumedLog -Event 'presented') -ne $gameplayState) {
         throw 'HOME/resume changed the held gameplay pose, world frame, camera or session revision.'
     }
@@ -488,6 +518,16 @@ $result = [pscustomobject]@{
 }
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
 if (-not $passed) {
+    # The log above is scoped to one process; the cause may lie outside it.
+    if ($logSince) {
+        try {
+            $fullLog = Invoke-Adb -Arguments @('logcat', '-d', '-b', 'all', '-v', 'threadtime', '-T', $logSince) `
+                -CommandTimeoutSeconds 30
+            [System.IO.File]::WriteAllText((Join-Path $OutputDir 'logcat-full.txt'), "$fullLog")
+        } catch {
+            Write-Warning "The full log could not be saved: $_"
+        }
+    }
     throw "Android walk runtime smoke FAIL: $testIssue $($restoreErrors -join '; '). Report: $reportPath"
 }
 Write-Host "Android walk runtime smoke PASS: $OutputDir"

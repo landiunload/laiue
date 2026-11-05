@@ -75,6 +75,8 @@ typedef struct LaiueGraphicsDeviceState
     bool frameActive;
     bool lastFrameValid;
     bool readbackSupported;
+    // Кадр окна рисуется прямо в образ цепочки и читается только по запросу.
+    bool readbackNeedsRequest;
     uint64_t completedFrameIndex;
 } LaiueGraphicsDeviceState;
 
@@ -432,6 +434,7 @@ static uint32_t DeviceCreateInternal(const LaiueModuleHostV1 *host,
     }
     state->renderer = renderer;
     state->readbackSupported = RendererCanCaptureFrame(renderer);
+    state->readbackNeedsRequest = nativeWindow != NULL;
     state->device.structSize = sizeof(state->device);
     state->device.abiVersion = LAIUE_GRAPHICS_ABI_VERSION_1;
     state->device.context = state;
@@ -1560,7 +1563,7 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
     if (state->readbackSupported)
     {
         result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED;
-        if (RendererGetBackend(state->renderer) == RENDERER_BACKEND_D3D12)
+        if (state->readbackNeedsRequest)
             result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED;
     }
     if (state->lastFrameValid)
@@ -1576,7 +1579,14 @@ static uint32_t DeviceV2GetDiagnostics(LaiueGraphicsDeviceV2 *device,
         result.geometryPoolCapacityBytes = stats.geometryPoolCapacityBytes;
         result.scenePasses = stats.scenePasses;
         result.swapchainRebuilds = stats.swapchainRebuilds;
+        if (stats.drawsIntoSwapchain)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN;
+        if (stats.frameTurn != 0u)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED;
+        if (stats.dynamicRendering)
+            result.flags |= LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING;
     }
+    result.uploadStagingBytes = RendererUploadStagingBytes(state->renderer);
     RendererGpuTimingV1 timing = {.structSize = sizeof(timing)};
     RendererGetGpuTimingV1(state->renderer, &timing);
     if ((timing.flags & RENDERER_GPU_TIMING_SUPPORTED) != 0u)

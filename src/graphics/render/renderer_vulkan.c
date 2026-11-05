@@ -8,6 +8,7 @@
 // b0 -> 0, t0..t3 -> 1..4, s0 -> 5.
 
 #include "render/renderer_internal.h"
+#include "render/frame_turn.h"
 #include "render/pipeline_cache.h"
 #include "render/renderer_offscreen.h"
 #include "render/texture_pack_internal.h"
@@ -78,6 +79,14 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // этого GPU — 2, максимум — 8; всё, что выше, движок не поддерживает.
 #define MAX_SWAPCHAIN_IMAGES 8u
 
+// Столько образов просим у цепочки, если она согласна. С двумя следующий образ
+// освобождается только с обновлением экрана, и кадр вместе с работой GPU обязан
+// уложиться в одно обновление: опоздал — кадров выходит вдвое меньше.
+#define SWAPCHAIN_MIN_IMAGES 3u
+
+// Предел ожидания показа: кадр не встаёт, что бы ни случилось с окном.
+#define PRESENT_WAIT_NANOSECONDS 100000000u
+
 // Раскладка дескрипторов повторяет сдвиги регистров HLSL.
 #define BINDING_CONSTANTS 0u
 #define BINDING_QUAD_BUFFER 1u
@@ -102,7 +111,10 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
 // и сохраняет ёмкость: в установившемся режиме она не выделяет память.
 #define PENDING_UPLOAD_INITIAL_CAPACITY 128u
-#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Кольцо живёт всё время работы и занимает память в каждом слоте, а заливать
+// между кадрами обычно нечего: игра грузит мир в первые секунды и дальше почти
+// не трогает геометрию. Большего размера хватает только на всплески, а им есть арена.
+#define MESH_UPLOAD_BYTES_PER_FRAME (1u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
@@ -113,6 +125,8 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 // тысяч, упирающихся в maxMemoryAllocationCount; блоки освобождаются,
 // когда пройден fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+// Столько оборотов слота арена лежит без дела, прежде чем её отдают.
+#define LARGE_MESH_UPLOAD_IDLE_TURNS 120u
 // Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
 // оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
 // предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
@@ -142,8 +156,9 @@ void RendererDestroy_Vulkan(Renderer *renderer);
 #define CONSTANT_BYTES_PER_FRAME (4u * 1024u * 1024u)
 
 #define COLOR_FORMAT VK_FORMAT_R8G8B8A8_SRGB
+#define DEPTH_TARGET_USAGE \
+    (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
 #define CAPTURE_FORMAT VK_FORMAT_R8G8B8A8_UNORM
-#define DEPTH_FORMAT VK_FORMAT_D32_SFLOAT
 
 // Константы кадра. Раскладка обязана совпадать с cbuffer в chunk.hlsl:
 // смещения, которые DXC даёт в SPIR-V, совпадают с упаковкой HLSL на D3D12,
@@ -181,11 +196,13 @@ typedef struct ResolveConstants
     float verticalScale;
     uint32_t mapping;
     uint32_t reserved;
+    float clipAxes[4];
 } ResolveConstants;
 
 typedef struct UiConstants
 {
     float screenSize[2];
+    float clipAxes[4];
     float reserved[2];
 } UiConstants;
 
@@ -365,6 +382,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
      * desktop and mobile providers on the same ABI-safe path. */
     PFN_vkCmdBeginRendering cmdBeginRendering;
     PFN_vkCmdEndRendering cmdEndRendering;
+    bool coreOnly; // только ядро Vulkan 1.1, без необязательных расширений
     bool useDynamicRendering;
     // Кеш конвейеров драйвера; VK_NULL_HANDLE, если создать его не удалось.
     VkPipelineCache pipelineCache;
@@ -378,8 +396,9 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet;
     VkRenderPass colorRenderPass;
     VkRenderPass depthRenderPass;
-    VkFramebuffer colorFramebuffers[FRAME_COUNT];
-    VkFramebuffer depthFramebuffers[FRAME_COUNT];
+    // По одному на образ, в который рисует кадр: образ цепочки или colorTargets.
+    VkFramebuffer colorFramebuffers[MAX_SWAPCHAIN_IMAGES];
+    VkFramebuffer depthFramebuffers[MAX_SWAPCHAIN_IMAGES];
     VkFramebuffer cubeFramebuffers[6];
     uint32_t queueFamily;
     VkQueue queue;
@@ -389,10 +408,13 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t frameIndex;
     uint64_t submittedFrames;   // растёт монотонно, задаёт срок отложенных освобождений
 
-    // Цели кадра. Без swapchain «показанный» кадр — это последний
-    // отрисованный образ, который остаётся доступным для чтения.
+    // Цели кадра. Глубина есть всегда, а цветовые образы только там, где кадр
+    // нельзя рисовать прямо в образ цепочки. Без swapchain «показанный» кадр —
+    // это последний отрисованный образ, который остаётся доступным для чтения.
     GpuImage colorTargets[FRAME_COUNT];
     GpuImage depthTarget;
+    VkFormat depthFormat;  // формат глубины, см. ChooseDepthFormat
+    VkFormat colorFormat;  // формат цветовых целей и конвейеров, один на устройство
     int32_t windowWidth;
     int32_t windowHeight;
     int32_t resizeWidth;
@@ -420,6 +442,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     VkPipeline genericPipeline;
     VkPipeline resolvePipeline;
     VkPipeline uiPipeline;
+    VkPipeline uiScenePipeline;  // тот же интерфейс для прохода сцены, где есть глубина
     VkDescriptorSet resolveSets[FRAME_COUNT];
     VkDescriptorSet uiSets[FRAME_COUNT];
     VkDescriptorSet genericSets[FRAME_COUNT][GENERIC_DESCRIPTOR_SET_CAPACITY];
@@ -447,6 +470,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t meshUploadOffsets[FRAME_COUNT];
     GpuBuffer largeMeshUploadBuffers[FRAME_COUNT];
     uint32_t largeMeshUploadOffsets[FRAME_COUNT];
+    uint32_t largeMeshUploadIdleTurns[FRAME_COUNT];
     StagingOverflow *stagingOverflow[FRAME_COUNT];
     uint64_t stagingOverflowBytes[FRAME_COUNT];
     PendingTextureUpload pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
@@ -512,6 +536,9 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     // пула геометрии было бесконфликтным.
     bool hasSurface;
     bool swapchainOutOfDate;
+    PFN_vkWaitForPresentKHR waitForPresent;  // NULL: устройство не умеет ждать показа
+    uint64_t presentId;                      // номер последнего показа
+    bool swapchainImageHeld;           // образ swapchainImageIndex захвачен и ждёт кадра
     bool swapchainAcquiredSuboptimal;  // образ кадра захвачен с VK_SUBOPTIMAL_KHR
     bool swapchainRefitTried;          // цепочку уже собирали заново из-за VK_SUBOPTIMAL_KHR
     VkSurfaceKHR surface;
@@ -521,15 +548,23 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     uint32_t swapchainImageCount;
     uint32_t swapchainImageIndex;
     uint32_t swapchainRecreateCount;   // счётчик пересозданий (диагностика)
-    VkImage swapchainImages[MAX_SWAPCHAIN_IMAGES];
-    // Представлений образов swapchain нет намеренно: кадр копируется/блитится
-    // в VkImage напрямую, представление не используется ни одной командой.
-    // Образ swapchain создаётся только с VK_IMAGE_USAGE_TRANSFER_DST_BIT, а
-    // vkCreateImageView для такого образа нарушает
-    // VUID-VkImageViewCreateInfo-image-04441; лишние представления были бы
-    // ещё и мёртвым ресурсом.
+    bool swapchainDirect;              // кадр рисует прямо в образы цепочки
+    uint32_t frameTurn;                // поворот цели кадра, см. render/frame_turn.h
+    // Память этих образов держит цепочка, здесь только представление и layout.
+    // Если кадр в них не рисует, представлений нет: образ создан только с
+    // VK_IMAGE_USAGE_TRANSFER_DST_BIT, а vkCreateImageView для такого образа
+    // нарушает VUID-VkImageViewCreateInfo-image-04441.
+    GpuImage swapchainTargets[MAX_SWAPCHAIN_IMAGES];
     VkSemaphore imageAvailable[FRAME_COUNT];
     VkSemaphore renderFinished[MAX_SWAPCHAIN_IMAGES];
+    // Образ цепочки после показа не прочитать, поэтому кадр с захватом заказывают
+    // заранее и копируют в буфер до показа.
+    bool captureRequested;
+    bool captureValid;
+    GpuBuffer captureBuffer;
+    uint32_t captureWidth;
+    uint32_t captureHeight;
+    uint32_t captureTurn;
 
     // Vulkan пишет константы в кольцо на каждый draw. У инстансного пути все
     // вызовы одного прохода несут один и тот же блок (origin = 0, meshScale =
@@ -734,6 +769,24 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
     renderer->stagingOverflowBytes[frameIndex] = 0u;
 }
 
+// Слот снова свободен: GPU прошёл всё, что читало из его колец.
+static void RewindUploadSlot(Renderer *renderer, uint32_t frameIndex)
+{
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    if (renderer->largeMeshUploadOffsets[frameIndex] != 0u)
+    {
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    else if (renderer->largeMeshUploadBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+             ++renderer->largeMeshUploadIdleTurns[frameIndex] >= LARGE_MESH_UPLOAD_IDLE_TURNS)
+    {
+        BufferDestroy(renderer, &renderer->largeMeshUploadBuffers[frameIndex]);
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
+}
+
 static uint32_t InstanceStorageAlignment(const Renderer *renderer)
 {
     // firstInstance must express the byte offset as a whole shader element.
@@ -821,8 +874,13 @@ static bool ImageCreateWithMipLevels(Renderer *renderer, uint32_t width, uint32_
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(renderer->device, outImage->image, &requirements);
     uint32_t typeIndex = 0;
-    if (!FindMemoryType(renderer, requirements.memoryTypeBits,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+    // Мозаичному GPU глубина нужна только в памяти тайла: страницы под такой
+    // образ выделяются, лишь если он в неё не поместился.
+    const bool lazy = (usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0u &&
+                      FindMemoryType(renderer, requirements.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, &typeIndex);
+    if (!lazy && !FindMemoryType(renderer, requirements.memoryTypeBits,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
     {
         ImageDestroy(renderer, outImage);
         return false;
@@ -873,13 +931,14 @@ static bool ImageCreate(Renderer *renderer, uint32_t width, uint32_t height,
 /* Vulkan 1.3 dynamic rendering is the fast path, but Android devices still
  * commonly expose only Vulkan 1.2.  Keep the same backend usable there with a
  * small render-pass compatibility path.  The render passes intentionally use
- * LOAD for color/depth; callers clear attachments explicitly when a pass
- * starts, so the same compatible pipeline can be reused by the resolve and UI
- * passes without creating duplicate pipeline layouts. */
+ * LOAD for color; callers clear attachments explicitly when a pass starts, so
+ * the same compatible pipeline can be reused by the resolve and UI passes
+ * without creating duplicate pipeline layouts.  Depth lives for one pass: it
+ * is cleared at the start and never read after the end. */
 static bool CreateRenderPasses(Renderer *renderer)
 {
     VkAttachmentDescription color = {
-        .format = COLOR_FORMAT,
+        .format = renderer->colorFormat,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -908,19 +967,22 @@ static bool CreateRenderPasses(Renderer *renderer)
         VK_SUCCESS)
         return false;
 
+    // Проход сцены начинает кадр с чистого листа. С LOAD тайловый GPU читал бы из
+    // памяти прошлое содержимое целей только затем, чтобы его стереть.
     VkAttachmentDescription attachments[2] = {
         color,
         {
-            .format = DEPTH_FORMAT,
+            .format = renderer->depthFormat,
             .samples = VK_SAMPLE_COUNT_1_BIT,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         },
     };
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     VkAttachmentReference depthReference = {
         .attachment = 1u,
         .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -947,25 +1009,26 @@ static bool CreateRenderPasses(Renderer *renderer)
 static bool CreateFrameTargetFramebuffers(Renderer *renderer)
 {
     if (renderer->useDynamicRendering) return true;
-    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    const uint32_t count = renderer->swapchainDirect ? renderer->swapchainImageCount : FRAME_COUNT;
+    for (uint32_t frame = 0u; frame < count; ++frame)
     {
-        VkImageView colorAttachments[1] = { renderer->colorTargets[frame].view };
+        const GpuImage *target = renderer->swapchainDirect ? &renderer->swapchainTargets[frame]
+                                                           : &renderer->colorTargets[frame];
+        VkImageView colorAttachments[1] = { target->view };
         VkFramebufferCreateInfo colorInfo = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .renderPass = renderer->colorRenderPass,
             .attachmentCount = 1u,
             .pAttachments = colorAttachments,
-            .width = renderer->colorTargets[frame].width,
-            .height = renderer->colorTargets[frame].height,
+            .width = target->width,
+            .height = target->height,
             .layers = 1u,
         };
         if (vkCreateFramebuffer(renderer->device, &colorInfo, NULL,
                                 &renderer->colorFramebuffers[frame]) != VK_SUCCESS)
             return false;
 
-        VkImageView depthAttachments[2] = {
-            renderer->colorTargets[frame].view, renderer->depthTarget.view,
-        };
+        VkImageView depthAttachments[2] = { target->view, renderer->depthTarget.view };
         VkFramebufferCreateInfo depthInfo = colorInfo;
         depthInfo.renderPass = renderer->depthRenderPass;
         depthInfo.attachmentCount = 2u;
@@ -999,6 +1062,18 @@ static bool CreateCubeFramebuffers(Renderer *renderer)
     return true;
 }
 
+// Образ, в который рисует кадр, и номер его framebuffer-ов.
+static GpuImage *FrameTarget(Renderer *renderer)
+{
+    return renderer->swapchainDirect ? &renderer->swapchainTargets[renderer->swapchainImageIndex]
+                                     : &renderer->colorTargets[renderer->frameIndex];
+}
+
+static uint32_t FrameTargetIndex(const Renderer *renderer)
+{
+    return renderer->swapchainDirect ? renderer->swapchainImageIndex : renderer->frameIndex;
+}
+
 // Переход раскладки образа. Барьер намеренно широкий: кадр движка
 // содержит десятки переходов, а не тысячи, и точная маска стадий здесь
 // не окупает риск ошибки синхронизации.
@@ -1021,6 +1096,42 @@ static void ImageBarrier(VkCommandBuffer commandBuffer, GpuImage *image, VkImage
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
     image->layout = newLayout;
+}
+
+// Прошлое содержимое образа не нужно: кадр нарисует его заново. Стадия та же, на
+// которой кадр ждёт семафор захвата, поэтому вершины могут работать, пока образ
+// ещё на экране.
+static void PrepareSwapchainTarget(VkCommandBuffer commandBuffer, GpuImage *target)
+{
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0u,
+        .dstAccessMask =
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = target->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+                         &barrier);
+    target->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
+// Запись GPU становится видна процессору только после такого барьера: ожидания
+// забора для этого мало.
+static void HostReadBarrier(VkCommandBuffer commandBuffer)
+{
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
 // Одноразовый командный буфер для загрузок вне кадра.
@@ -1412,6 +1523,7 @@ typedef struct PipelineRecipe
     uint32_t pixelFallbackBytes;
     VkPipelineLayout layout;
     bool depthTest;
+    bool inScenePass;  // проход с глубиной, даже если конвейер её не проверяет
     bool blend;
     VkCullModeFlags cullMode;
     bool wireframe;
@@ -1520,12 +1632,13 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
         .pDynamicState = &dynamicState,
         .layout = recipe->layout,
     };
-    VkFormat colorFormat = COLOR_FORMAT;
+    VkFormat colorFormat = renderer->colorFormat;
+    const bool depthAttachment = recipe->depthTest || recipe->inScenePass;
     VkPipelineRenderingCreateInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1u,
         .pColorAttachmentFormats = &colorFormat,
-        .depthAttachmentFormat = recipe->depthTest ? DEPTH_FORMAT : VK_FORMAT_UNDEFINED,
+        .depthAttachmentFormat = depthAttachment ? renderer->depthFormat : VK_FORMAT_UNDEFINED,
     };
     if (renderer->useDynamicRendering)
     {
@@ -1534,8 +1647,8 @@ static bool CreateGraphicsPipeline(Renderer *renderer, const PipelineRecipe *rec
     }
     else
     {
-        pipelineInfo.renderPass = recipe->depthTest ? renderer->depthRenderPass
-                                                    : renderer->colorRenderPass;
+        pipelineInfo.renderPass = depthAttachment ? renderer->depthRenderPass
+                                                  : renderer->colorRenderPass;
         pipelineInfo.subpass = 0u;
     }
 
@@ -1623,7 +1736,7 @@ static bool CreateResolvePipeline(Renderer *renderer, VkPipeline *outPipeline)
     return CreateGraphicsPipeline(renderer, &recipe, outPipeline);
 }
 
-static bool CreateUiPipeline(Renderer *renderer, VkPipeline *outPipeline)
+static bool CreateUiPipeline(Renderer *renderer, bool inScenePass, VkPipeline *outPipeline)
 {
     PipelineRecipe recipe = {
         .vertexSlot = LAIUE_SHADER_UI_VERTEX,
@@ -1634,6 +1747,7 @@ static bool CreateUiPipeline(Renderer *renderer, VkPipeline *outPipeline)
         .pixelFallbackBytes = (uint32_t)sizeof(g_ui_ps),
         .layout = renderer->uiPipelineLayout,
         .depthTest = false,
+        .inScenePass = inScenePass,
         .blend = true,
         .cullMode = VK_CULL_MODE_NONE,
         .wireframe = false,
@@ -1657,11 +1771,11 @@ static bool CreateDescriptorLayouts(Renderer *renderer)
         { BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
     };
     VkDescriptorSetLayoutBinding resolveBindings[] = {
-        { BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { BINDING_PANORAMA_CUBE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        {BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {BINDING_PANORAMA_CUBE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u, VK_SHADER_STAGE_FRAGMENT_BIT,
+         NULL},
+        {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
     };
     VkDescriptorSetLayoutBinding uiBindings[] = {
         { BINDING_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u,
@@ -2318,15 +2432,15 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
     WaitForGpu(renderer);
     ReleaseCubeResources(renderer);
 
-    if (!ImageCreate(renderer, resolution, resolution, 6u, COLOR_FORMAT,
+    if (!ImageCreate(renderer, resolution, resolution, 6u, renderer->colorFormat,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                      VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_CUBE, true,
                      &renderer->cubeColor))
         return false;
     // Глубина общая для всех граней: каждый проход очищает свой прямоугольник.
-    if (!ImageCreate(renderer, resolution, resolution, 1u, DEPTH_FORMAT,
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     VK_IMAGE_VIEW_TYPE_2D, false, &renderer->cubeDepth))
+    if (!ImageCreate(renderer, resolution, resolution, 1u, renderer->depthFormat,
+                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                     &renderer->cubeDepth))
     {
         ReleaseCubeResources(renderer);
         return false;
@@ -2338,7 +2452,7 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = renderer->cubeColor.image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = COLOR_FORMAT,
+            .format = renderer->colorFormat,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, face, 1u },
         };
         if (vkCreateImageView(renderer->device, &viewInfo, NULL, &renderer->cubeFaceViews[face]) !=
@@ -2366,9 +2480,9 @@ static bool EnsureCubeResources(Renderer *renderer, uint32_t resolution)
 
 // === Цели кадра ===
 
-static void ReleaseFrameTargets(Renderer *renderer)
+static void ReleaseFrameFramebuffers(Renderer *renderer)
 {
-    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    for (uint32_t frame = 0u; frame < MAX_SWAPCHAIN_IMAGES; ++frame)
     {
         if (renderer->colorFramebuffers[frame] != VK_NULL_HANDLE)
             vkDestroyFramebuffer(renderer->device, renderer->colorFramebuffers[frame], NULL);
@@ -2377,7 +2491,12 @@ static void ReleaseFrameTargets(Renderer *renderer)
         renderer->colorFramebuffers[frame] = VK_NULL_HANDLE;
         renderer->depthFramebuffers[frame] = VK_NULL_HANDLE;
     }
-    for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+}
+
+static void ReleaseFrameTargets(Renderer *renderer)
+{
+    ReleaseFrameFramebuffers(renderer);
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
         ImageDestroy(renderer, &renderer->colorTargets[frame]);
     ImageDestroy(renderer, &renderer->depthTarget);
     renderer->lastFrameValid = false;
@@ -2387,9 +2506,9 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
 {
     if (width <= 0 || height <= 0) return false;
 
-    for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+    for (uint32_t frame = 0u; frame < FRAME_COUNT && !renderer->swapchainDirect; ++frame)
     {
-        if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, COLOR_FORMAT,
+        if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, renderer->colorFormat,
                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
                          &renderer->colorTargets[frame]))
@@ -2398,9 +2517,11 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
             return false;
         }
     }
-    if (!ImageCreate(renderer, (uint32_t)width, (uint32_t)height, 1u, DEPTH_FORMAT,
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     VK_IMAGE_VIEW_TYPE_2D, false, &renderer->depthTarget))
+    const bool sidesSwapped = (renderer->frameTurn & 1u) != 0u;
+    if (!ImageCreate(renderer, (uint32_t)(sidesSwapped ? height : width),
+                     (uint32_t)(sidesSwapped ? width : height), 1u, renderer->depthFormat,
+                     DEPTH_TARGET_USAGE, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, false,
+                     &renderer->depthTarget))
     {
         ReleaseFrameTargets(renderer);
         return false;
@@ -2420,47 +2541,14 @@ static bool CreateFrameTargets(Renderer *renderer, int32_t width, int32_t height
 static bool FrameTargetsReady(const Renderer *renderer)
 {
     if (renderer->depthTarget.image == VK_NULL_HANDLE) return false;
-    for (uint32_t frame = 0; frame < FRAME_COUNT; ++frame)
+    for (uint32_t frame = 0; frame < FRAME_COUNT && !renderer->swapchainDirect; ++frame)
     {
         if (renderer->colorTargets[frame].image == VK_NULL_HANDLE) return false;
     }
     return true;
 }
 
-static bool ApplyPendingResize(Renderer *renderer)
-{
-    if (renderer->resizeWidth <= 0 || renderer->resizeHeight <= 0)
-    {
-        // Свёрнутое окно: цели кадра не трогаем, кадры пропускаются, но
-        // при восстановлении размера swapchain надо пересобрать.
-        renderer->resizeRequested = false;
-        if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
-        return true;
-    }
-    if (renderer->resizeWidth == renderer->windowWidth &&
-        renderer->resizeHeight == renderer->windowHeight && FrameTargetsReady(renderer))
-    {
-        renderer->resizeRequested = false;
-        return true;
-    }
-
-    WaitForGpu(renderer);
-    ReleaseFrameTargets(renderer);
-    if (!CreateFrameTargets(renderer, renderer->resizeWidth, renderer->resizeHeight))
-    {
-        // Keep the request pending so a transient allocation failure can be
-        // retried on the next frame, including when the requested size equals
-        // the last successfully created size.
-        renderer->resizeRequested = true;
-        return false;
-    }
-    renderer->resizeRequested = false;
-    // Размер изменился — swapchain придётся пересобрать целиком.
-    if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
-    return true;
-}
-
-// === Swapchain: вывод готового colorTarget в окно ===
+// === Swapchain: вывод кадра в окно ===
 
 // Сборка без CRT не имеет strcmp, а имена расширений — обычный ASCII.
 static bool NameEquals(const char *left, const char *right)
@@ -2555,23 +2643,22 @@ static const char *LatestReadyExtension(VkPhysicalDevice device)
 }
 #endif
 
-// Формат swapchain. Приоритет: точное совпадение с форматом offscreen-цели
-// (тогда достаточно vkCmdCopyImage, без конверсии и перестановки каналов),
-// затем B8G8R8A8_UNORM из задачи (тогда — vkCmdBlitImage), затем любой
-// с sRGB-цветовым пространством, затем первый предложенный.
-static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats, uint32_t count)
+// Формат swapchain. Приоритет: формат целей кадра (тогда кадр рисует прямо в
+// образы цепочки), затем B8G8R8A8_SRGB, который такие цели тоже могут взять,
+// затем B8G8R8A8_UNORM (тогда нужен vkCmdBlitImage), затем любой с sRGB-цветовым
+// пространством, затем первый предложенный.
+static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats, uint32_t count,
+                                              VkFormat preferred)
 {
-    for (uint32_t index = 0; index < count; ++index)
+    const VkFormat wanted[3] = { preferred, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+    for (uint32_t choice = 0; choice < 3u; ++choice)
     {
-        if (formats[index].format == COLOR_FORMAT &&
-            formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-            return formats[index];
-    }
-    for (uint32_t index = 0; index < count; ++index)
-    {
-        if (formats[index].format == VK_FORMAT_B8G8R8A8_UNORM &&
-            formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-            return formats[index];
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            if (formats[index].format == wanted[choice] &&
+                formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+                return formats[index];
+        }
     }
     for (uint32_t index = 0; index < count; ++index)
     {
@@ -2581,9 +2668,86 @@ static VkSurfaceFormatKHR SelectSurfaceFormat(const VkSurfaceFormatKHR *formats,
     return formats[0];
 }
 
+static bool ReadSurfaceFormat(Renderer *renderer, VkSurfaceFormatKHR *outFormat)
+{
+    uint32_t formatCount = 0u;
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
+                                             NULL) != VK_SUCCESS ||
+        formatCount == 0u)
+        return false;
+    VkSurfaceFormatKHR *formats = PlatformAllocate(formatCount * sizeof(*formats), false);
+    if (formats == NULL) return false;
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
+                                             formats) != VK_SUCCESS)
+    {
+        PlatformFree(formats);
+        return false;
+    }
+    *outFormat = SelectSurfaceFormat(formats, formatCount, renderer->colorFormat);
+    PlatformFree(formats);
+    return true;
+}
+
+// Конвейеры привязаны к формату цели, поэтому он выбирается один раз, до них. На
+// этом и живёт весь кадр: если экран предлагает только BGRA, цели будут BGRA.
+static bool ChooseColorFormat(Renderer *renderer)
+{
+    renderer->colorFormat = COLOR_FORMAT;
+    if (!renderer->hasSurface) return true;
+    VkSurfaceFormatKHR surfaceFormat;
+    if (!ReadSurfaceFormat(renderer, &surfaceFormat)) return false;
+    if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB) renderer->colorFormat = surfaceFormat.format;
+    return true;
+}
+
+// Лучше всего 32 бита с плавающей точкой, но Vulkan обещает как цель только D16:
+// базовый профиль Android не гарантирует ни D32, ни D24.
+static bool ChooseDepthFormat(Renderer *renderer)
+{
+    static const VkFormat candidates[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_X8_D24_UNORM_PACK32,
+        VK_FORMAT_D16_UNORM,
+    };
+    for (size_t index = 0u; index < sizeof(candidates) / sizeof(candidates[0]); ++index)
+    {
+        VkFormatProperties properties;
+        vkGetPhysicalDeviceFormatProperties(renderer->physicalDevice, candidates[index],
+                                            &properties);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
+            0u)
+        {
+            renderer->depthFormat = candidates[index];
+            return true;
+        }
+    }
+    return false;
+}
+
 // Present-mode: vsync — FIFO; без vsync — последний готовый кадр без
 // разрывов: FIFO_LATEST_READY, затем MAILBOX, иначе IMMEDIATE, иначе FIFO (он
 // обязан поддерживаться всегда).
+// Ожидание показа считает показы по их номерам, так что нужны оба расширения.
+static bool PresentWaitSupported(VkPhysicalDevice device)
+{
+    if (!DeviceExtensionSupported(device, VK_KHR_PRESENT_ID_EXTENSION_NAME) ||
+        !DeviceExtensionSupported(device, VK_KHR_PRESENT_WAIT_EXTENSION_NAME))
+        return false;
+    VkPhysicalDevicePresentWaitFeaturesKHR wait = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+    };
+    VkPhysicalDevicePresentIdFeaturesKHR id = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .pNext = &wait,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &id,
+    };
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return id.presentId == VK_TRUE && wait.presentWait == VK_TRUE;
+}
+
 static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_t count, bool vsync,
                                           bool latestReady)
 {
@@ -2611,6 +2775,7 @@ static VkPresentModeKHR SelectPresentMode(const VkPresentModeKHR *modes, uint32_
 // WaitForGpu; безопасно на частично построенном состоянии.
 static void DestroySwapchainResources(Renderer *renderer)
 {
+    ReleaseFrameFramebuffers(renderer);
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
     {
         if (renderer->imageAvailable[index] != VK_NULL_HANDLE)
@@ -2626,7 +2791,9 @@ static void DestroySwapchainResources(Renderer *renderer)
             vkDestroySemaphore(renderer->device, renderer->renderFinished[index], NULL);
             renderer->renderFinished[index] = VK_NULL_HANDLE;
         }
-        renderer->swapchainImages[index] = VK_NULL_HANDLE;
+        if (renderer->swapchainTargets[index].view != VK_NULL_HANDLE)
+            vkDestroyImageView(renderer->device, renderer->swapchainTargets[index].view, NULL);
+        memset(&renderer->swapchainTargets[index], 0, sizeof(renderer->swapchainTargets[index]));
     }
     if (renderer->swapchain != VK_NULL_HANDLE)
     {
@@ -2635,58 +2802,90 @@ static void DestroySwapchainResources(Renderer *renderer)
     }
     renderer->swapchainImageCount = 0u;
     renderer->swapchainImageIndex = 0u;
+    renderer->swapchainImageHeld = false;
+}
+
+static bool CreateSwapchainViews(Renderer *renderer)
+{
+    for (uint32_t index = 0; index < renderer->swapchainImageCount; ++index)
+    {
+        VkImageViewCreateInfo viewInfo = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = renderer->swapchainTargets[index].image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = renderer->swapchainFormat,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+        };
+        if (vkCreateImageView(renderer->device, &viewInfo, NULL,
+                              &renderer->swapchainTargets[index].view) != VK_SUCCESS)
+            return false;
+    }
+    return true;
+}
+
+// На сколько четвертей оборота повернуть кадр, чтобы экрану осталось показать образ
+// как есть. extent — кадр в ориентации окна.
+static uint32_t ChooseFrameTurn(const VkSurfaceCapabilitiesKHR *capabilities, VkExtent2D extent)
+{
+    const VkSurfaceTransformFlagBitsKHR transform = capabilities->currentTransform;
+    if (transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)
+        return 2u;
+    if (transform != VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR &&
+        transform != VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)
+        return 0u;
+    // У образов цепочки стороны кадра меняются местами.
+    if (extent.height < capabilities->minImageExtent.width ||
+        extent.height > capabilities->maxImageExtent.width ||
+        extent.width < capabilities->minImageExtent.height ||
+        extent.width > capabilities->maxImageExtent.height)
+        return 0u;
+    return transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? 1u : 3u;
 }
 
 static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
 {
-    if (!renderer->hasSurface || renderer->device == VK_NULL_HANDLE)
+    if (!renderer->hasSurface || renderer->surface == VK_NULL_HANDLE ||
+        renderer->device == VK_NULL_HANDLE)
         return false;
 
     VkSurfaceCapabilitiesKHR capabilities;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(renderer->physicalDevice, renderer->surface,
                                                   &capabilities) != VK_SUCCESS)
         return false;
-    if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u)
-        return false;
 
-    VkExtent2D extent;
-    if (capabilities.currentExtent.width != UINT32_MAX &&
-        capabilities.currentExtent.height != UINT32_MAX)
-    {
-        extent = capabilities.currentExtent;
-    }
-    else
-    {
-        uint32_t clampedWidth = width > 0 ? (uint32_t)width : 1u;
-        uint32_t clampedHeight = height > 0 ? (uint32_t)height : 1u;
-        if (clampedWidth < capabilities.minImageExtent.width)
-            clampedWidth = capabilities.minImageExtent.width;
-        if (clampedWidth > capabilities.maxImageExtent.width)
-            clampedWidth = capabilities.maxImageExtent.width;
-        if (clampedHeight < capabilities.minImageExtent.height)
-            clampedHeight = capabilities.minImageExtent.height;
-        if (clampedHeight > capabilities.maxImageExtent.height)
-            clampedHeight = capabilities.maxImageExtent.height;
-        extent.width = clampedWidth;
-        extent.height = clampedHeight;
-    }
+    // Размер цепочки — размер окна. Где поверхность не даёт его выбрать (Win32, X11),
+    // её минимум и максимум равны её размеру. currentExtent брать нельзя: при
+    // повороте Android ещё отдаёт старый, и цепочка вышла бы другой формы, чем окно.
+    uint32_t clampedWidth = width > 0 ? (uint32_t)width : 1u;
+    uint32_t clampedHeight = height > 0 ? (uint32_t)height : 1u;
+    if (clampedWidth < capabilities.minImageExtent.width)
+        clampedWidth = capabilities.minImageExtent.width;
+    if (clampedWidth > capabilities.maxImageExtent.width)
+        clampedWidth = capabilities.maxImageExtent.width;
+    if (clampedHeight < capabilities.minImageExtent.height)
+        clampedHeight = capabilities.minImageExtent.height;
+    if (clampedHeight > capabilities.maxImageExtent.height)
+        clampedHeight = capabilities.maxImageExtent.height;
+    VkExtent2D extent = {clampedWidth, clampedHeight};
     if (extent.width == 0u || extent.height == 0u) return false;
 
-    uint32_t formatCount = 0u;
-    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
-                                             NULL) != VK_SUCCESS ||
-        formatCount == 0u)
+    VkSurfaceFormatKHR surfaceFormat;
+    if (!ReadSurfaceFormat(renderer, &surfaceFormat)) return false;
+
+    // Размер кадра выбирает программа: он может отличаться от окна, и тогда кадр
+    // рисуется отдельно и масштабируется при показе. TRANSFER_SRC нужен захвату
+    // кадра: без него образ цепочки не прочитать.
+    const VkImageUsageFlags directUsage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const bool direct = surfaceFormat.format == renderer->colorFormat &&
+                        (int32_t)extent.width == width && (int32_t)extent.height == height &&
+                        (capabilities.supportedUsageFlags & directUsage) == directUsage;
+    if (!direct && (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u)
         return false;
-    VkSurfaceFormatKHR *formats = PlatformAllocate(formatCount * sizeof(*formats), false);
-    if (formats == NULL) return false;
-    if (vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physicalDevice, renderer->surface, &formatCount,
-                                             formats) != VK_SUCCESS)
-    {
-        PlatformFree(formats);
-        return false;
-    }
-    VkSurfaceFormatKHR surfaceFormat = SelectSurfaceFormat(formats, formatCount);
-    PlatformFree(formats);
+    // Копию из отдельной цели не повернуть: кадр поворачивается только сам.
+    const uint32_t frameTurn = direct ? ChooseFrameTurn(&capabilities, extent) : 0u;
+    if ((frameTurn & 1u) != 0u)
+        extent = (VkExtent2D){extent.height, extent.width};
 
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     uint32_t modeCount = 0u;
@@ -2709,7 +2908,7 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     // экрана; ещё один образ даёт рисовать следующий кадр, пока те два заняты.
     uint32_t imageCount = capabilities.minImageCount;
     if (presentMode != VK_PRESENT_MODE_FIFO_KHR) ++imageCount;
-    if (imageCount < 2u) imageCount = 2u;
+    if (imageCount < SWAPCHAIN_MIN_IMAGES) imageCount = SWAPCHAIN_MIN_IMAGES;
     if (capabilities.maxImageCount > 0u && imageCount > capabilities.maxImageCount)
         imageCount = capabilities.maxImageCount;
     if (imageCount > MAX_SWAPCHAIN_IMAGES) return false;
@@ -2726,12 +2925,11 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
             compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     }
 
-    /* Render targets and camera/UI coordinates already use the window's
-     * current width and height.  Ask the presentation engine to keep those
-     * pixels in that orientation when it supports identity; otherwise retain
-     * its required transform. */
+    // Повёрнутый кадр показывается как есть. Кадр без поворота лежит как окно, и его
+    // поворачивает система, если умеет; иначе остаётся её обязательное преобразование.
     const VkSurfaceTransformFlagBitsKHR preTransform =
-        (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0u
+        frameTurn == 0u &&
+                (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0u
             ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
             : capabilities.currentTransform;
     VkSwapchainCreateInfoKHR swapchainInfo = {
@@ -2742,7 +2940,7 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
         .imageColorSpace = surfaceFormat.colorSpace,
         .imageExtent = extent,
         .imageArrayLayers = 1u,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageUsage = direct ? directUsage : VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0u,
         .pQueueFamilyIndices = NULL,
@@ -2817,33 +3015,90 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
     renderer->swapchainExtent = extent;
     renderer->swapchainImageCount = actualCount;
     renderer->swapchainImageIndex = 0u;
-    // Цепочка рисует без поворота, а экран повёрнут: Android отвечает на такой
+    // Кадр не повёрнут, а экран повёрнут: Android отвечает на такой
     // показ VK_SUBOPTIMAL_KHR всегда, и новая цепочка была бы такой же.
     renderer->swapchainRefitTried = preTransform != capabilities.currentTransform;
+    renderer->swapchainDirect = direct;
+    renderer->frameTurn = frameTurn;
     for (uint32_t index = 0; index < actualCount; ++index)
-        renderer->swapchainImages[index] = images[index];
+    {
+        GpuImage *target = &renderer->swapchainTargets[index];
+        target->image = images[index];
+        target->width = extent.width;
+        target->height = extent.height;
+        target->layerCount = 1u;
+        target->mipLevels = 1u;
+    }
     for (uint32_t index = 0; index < FRAME_COUNT; ++index)
         renderer->imageAvailable[index] = imageAvailable[index];
     for (uint32_t index = 0; index < actualCount; ++index)
         renderer->renderFinished[index] = renderFinished[index];
+    if (direct && !CreateSwapchainViews(renderer))
+    {
+        DestroySwapchainResources(renderer);
+        return false;
+    }
     renderer->swapchainOutOfDate = false;
     return true;
 }
 
+// Цепочка и цели кадра собираются вместе: от размера кадра зависит, рисует ли он
+// прямо в образы цепочки, а framebuffer-ы держат эти образы. Вызывать до записи
+// кадра: старые объекты уничтожаются только после полного простоя GPU.
+static bool RebuildFrameTargets(Renderer *renderer, int32_t width, int32_t height)
+{
+    WaitForGpu(renderer);
+    ReleaseFrameTargets(renderer);
+    if (renderer->hasSurface)
+    {
+        DestroySwapchainResources(renderer);
+        if (!SwapchainCreate(renderer, width, height))
+        {
+            renderer->swapchainOutOfDate = true;
+            return false;
+        }
+        renderer->swapchainRecreateCount++;
+    }
+    if (CreateFrameTargets(renderer, width, height))
+        return true;
+    renderer->swapchainOutOfDate = renderer->hasSurface;
+    return false;
+}
+
 // Пересобрать swapchain под текущий размер окна и вертикальную
-// синхронизацию. Вызывать до записи кадра: старый swapchain уничтожается
-// только после полного простоя GPU.
+// синхронизацию.
 static bool SwapchainRecreate(Renderer *renderer)
 {
-    if (!renderer->hasSurface) return false;
-    WaitForGpu(renderer);
-    DestroySwapchainResources(renderer);
-    if (!SwapchainCreate(renderer, renderer->windowWidth, renderer->windowHeight))
+    return renderer->hasSurface &&
+           RebuildFrameTargets(renderer, renderer->windowWidth, renderer->windowHeight);
+}
+
+static bool ApplyPendingResize(Renderer *renderer)
+{
+    if (renderer->resizeWidth <= 0 || renderer->resizeHeight <= 0)
     {
-        renderer->swapchainOutOfDate = true;
+        // Свёрнутое окно: цели кадра не трогаем, кадры пропускаются, но
+        // при восстановлении размера swapchain надо пересобрать.
+        renderer->resizeRequested = false;
+        if (renderer->hasSurface) renderer->swapchainOutOfDate = true;
+        return true;
+    }
+    if (renderer->resizeWidth == renderer->windowWidth &&
+        renderer->resizeHeight == renderer->windowHeight && FrameTargetsReady(renderer))
+    {
+        renderer->resizeRequested = false;
+        return true;
+    }
+
+    if (!RebuildFrameTargets(renderer, renderer->resizeWidth, renderer->resizeHeight))
+    {
+        // Keep the request pending so a transient allocation failure can be
+        // retried on the next frame, including when the requested size equals
+        // the last successfully created size.
+        renderer->resizeRequested = true;
         return false;
     }
-    renderer->swapchainRecreateCount++;
+    renderer->resizeRequested = false;
     return true;
 }
 
@@ -2857,28 +3112,60 @@ static void NoteSwapchainFit(Renderer *renderer, bool suboptimal)
     renderer->swapchainRefitTried = suboptimal;
 }
 
-// Захват образа и запись копии colorTarget в команду кадра. Кадр уже
-// переведён вызывающим в TRANSFER_SRC_OPTIMAL.
-static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+// Образ для кадра слота frameIndex: семафор слота должен быть свободен, то есть
+// прошлый кадр этого слота закончен. false — образа нет.
+static bool AcquireSwapchainImage(Renderer *renderer)
 {
-    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
-        return PRESENT_OUTCOME_NONE;
-
+    if (renderer->swapchainImageHeld)
+        return true;
     uint32_t imageIndex = 0u;
     VkResult acquire = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
                                              renderer->imageAvailable[renderer->frameIndex],
                                              VK_NULL_HANDLE, &imageIndex);
+    if (acquire == VK_ERROR_DEVICE_LOST)
+    {
+        FailVulkanDevice(renderer);
+        return false;
+    }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
     {
         // Образа нет, и OUT_OF_DATE — не ошибка кадра: помечаем swapchain
         // устаревшим, пересоберём в начале следующего кадра.
         renderer->swapchainOutOfDate = true;
-        return PRESENT_OUTCOME_SKIP;
+        return false;
     }
-
     renderer->swapchainAcquiredSuboptimal = acquire == VK_SUBOPTIMAL_KHR;
     renderer->swapchainImageIndex = imageIndex;
-    VkImage destination = renderer->swapchainImages[imageIndex];
+    renderer->swapchainImageHeld = true;
+    return true;
+}
+
+// Кадр рисует прямо в образ цепочки, поэтому образ нужен до записи кадра.
+// Устаревшую цепочку пересобирают тут же, чтобы не терять кадр.
+static bool AcquireFrameImage(Renderer *renderer)
+{
+    if (AcquireSwapchainImage(renderer)) return true;
+    return !renderer->deviceFailed && SwapchainRecreate(renderer) &&
+           AcquireSwapchainImage(renderer);
+}
+
+// Вывод кадра. Кадр, нарисованный не в образ цепочки, уже переведён вызывающим в
+// TRANSFER_SRC_OPTIMAL и копируется в образ здесь.
+static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    if (!renderer->hasSurface || renderer->swapchain == VK_NULL_HANDLE)
+        return PRESENT_OUTCOME_NONE;
+    if (!AcquireSwapchainImage(renderer))
+        return PRESENT_OUTCOME_SKIP;
+
+    renderer->swapchainImageHeld = false;
+    if (renderer->swapchainDirect)
+    {
+        ImageBarrier(commandBuffer, FrameTarget(renderer), VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        return PRESENT_OUTCOME_PRESENT;
+    }
+    VkImage destination = renderer->swapchainTargets[renderer->swapchainImageIndex].image;
 
     VkImageMemoryBarrier toTransfer = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2895,7 +3182,7 @@ static PresentOutcome RecordPresent(Renderer *renderer, VkCommandBuffer commandB
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toTransfer);
 
     GpuImage *source = &renderer->colorTargets[renderer->frameIndex];
-    bool sameFormat = renderer->swapchainFormat == COLOR_FORMAT;
+    bool sameFormat = renderer->swapchainFormat == renderer->colorFormat;
     bool sameExtent = renderer->swapchainExtent.width == source->width &&
                       renderer->swapchainExtent.height == source->height;
     if (sameFormat && sameExtent)
@@ -2999,7 +3286,7 @@ static uint32_t DeviceTypeRank(VkPhysicalDeviceType type)
     }
 }
 
-// Устройство Vulkan 1.2+ лучшего типа, семья которого рисует и, при
+// Устройство Vulkan 1.1+ лучшего типа, семья которого рисует и, при
 // поверхности, показывает; из равных — первое в порядке загрузчика.
 // VK_NULL_HANDLE — подходящего нет.
 // Отдельный кадр стека: иначе LTO объединяет временные свойства и семьи
@@ -3025,7 +3312,8 @@ static VkPhysicalDevice ChoosePhysicalDevice(const Renderer *renderer, uint32_t 
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(devices[index], &properties);
         const uint32_t rank = DeviceTypeRank(properties.deviceType) + 1u;
-        if (properties.apiVersion < VK_API_VERSION_1_2 || rank <= chosenRank) continue;
+        if (properties.apiVersion < VK_API_VERSION_1_1 || rank <= chosenRank)
+            continue;
 
         uint32_t familyCount = 16u;
         VkQueueFamilyProperties families[16];
@@ -3091,15 +3379,17 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 #endif
 
     // Наибольшая версия, возможности которой использует рендерер; устройства
-    // Vulkan 1.2 и 1.3 работают в пределах своей версии.
+    // Vulkan 1.1, 1.2 и 1.3 работают в пределах своей версии.
+#if defined(VK_API_VERSION_1_4)
+    const uint32_t newestVersion = VK_API_VERSION_1_4;
+#else
+    const uint32_t newestVersion = VK_API_VERSION_1_3;
+#endif
+    const uint32_t versionLimit = renderer->coreOnly ? VK_API_VERSION_1_1 : newestVersion;
     VkApplicationInfo applicationInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "laiue",
-#if defined(VK_API_VERSION_1_4)
-        .apiVersion = VK_API_VERSION_1_4,
-#else
-        .apiVersion = VK_API_VERSION_1_3,
-#endif
+        .apiVersion = versionLimit,
     };
     VkInstanceCreateInfo instanceInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -3129,13 +3419,15 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
 
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(chosen, &properties);
+    const uint32_t deviceVersion =
+        properties.apiVersion < versionLimit ? properties.apiVersion : versionLimit;
     renderer->pipelineCacheIdentity.backend = RENDERER_BACKEND_VULKAN;
     renderer->pipelineCacheIdentity.vendorId = properties.vendorID;
     renderer->pipelineCacheIdentity.deviceId = properties.deviceID;
     renderer->pipelineCacheIdentity.driverVersion = properties.driverVersion;
     memcpy(renderer->pipelineCacheIdentity.uuid, properties.pipelineCacheUUID,
            sizeof(renderer->pipelineCacheIdentity.uuid));
-    renderer->pipelineCacheFeedback = properties.apiVersion >= VK_API_VERSION_1_3;
+    renderer->pipelineCacheFeedback = deviceVersion >= VK_API_VERSION_1_3;
     renderer->timestampPeriodNanoseconds = properties.limits.timestampPeriod;
     renderer->uniformAlignment = properties.limits.minUniformBufferOffsetAlignment;
     if (renderer->uniformAlignment < 16u)
@@ -3167,7 +3459,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .synchronization2 = VK_TRUE,
     };
     renderer->useDynamicRendering = false;
-    if (properties.apiVersion >= VK_API_VERSION_1_3)
+    if (deviceVersion >= VK_API_VERSION_1_3)
     {
         VkPhysicalDeviceVulkan13Features available13 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -3190,7 +3482,7 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
         .pushDescriptor = VK_TRUE,
     };
-    if (properties.apiVersion >= VK_API_VERSION_1_4)
+    if (deviceVersion >= VK_API_VERSION_1_4)
     {
         VkPhysicalDeviceVulkan14Features available14 = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
@@ -3207,9 +3499,9 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         }
     }
 #endif
-    const char *deviceExtensions[3];
+    const char *deviceExtensions[5];
     uint32_t deviceExtensionCount = 0u;
-    if (pushDescriptorCommand == NULL &&
+    if (pushDescriptorCommand == NULL && !renderer->coreOnly &&
         DeviceExtensionSupported(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
     {
         deviceExtensions[deviceExtensionCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
@@ -3236,7 +3528,8 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
         .presentModeFifoLatestReady = VK_TRUE,
     };
-    const char *latestReadyExtension = renderer->hasSurface ? LatestReadyExtension(chosen) : NULL;
+    const char *latestReadyExtension =
+        renderer->hasSurface && !renderer->coreOnly ? LatestReadyExtension(chosen) : NULL;
     if (latestReadyExtension != NULL)
     {
         deviceExtensions[deviceExtensionCount++] = latestReadyExtension;
@@ -3245,6 +3538,24 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         renderer->presentLatestReady = true;
     }
 #endif
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+        .presentId = VK_TRUE,
+    };
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+        .presentWait = VK_TRUE,
+    };
+    const bool presentWait =
+        renderer->hasSurface && !renderer->coreOnly && PresentWaitSupported(chosen);
+    if (presentWait)
+    {
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        deviceExtensions[deviceExtensionCount++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        presentIdFeature.pNext = featureChain;
+        presentWaitFeature.pNext = &presentIdFeature;
+        featureChain = &presentWaitFeature;
+    }
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = featureChain,
@@ -3255,6 +3566,9 @@ static bool CreateDeviceObjects(Renderer *renderer, void *windowHandle)
         .pEnabledFeatures = &enabled,
     };
     if (vkCreateDevice(chosen, &deviceInfo, NULL, &renderer->device) != VK_SUCCESS) return false;
+    if (presentWait)
+        renderer->waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(
+            renderer->device, "vkWaitForPresentKHR");
     if (renderer->useDynamicRendering)
     {
         renderer->cmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(
@@ -3462,7 +3776,7 @@ bool RendererSavePipelineCache_Vulkan(Renderer *renderer)
     return saved;
 }
 
-Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height)
+Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height, bool coreOnly)
 {
     // Headless Vulkan остаётся допустимым на любой платформе. Если
     // native handle передан, соответствующий surface provider должен быть
@@ -3477,12 +3791,13 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     if (renderer == NULL) return NULL;
 
     renderer->header.backend = RENDERER_BACKEND_VULKAN;
+    renderer->coreOnly = coreOnly;
     renderer->verticalSyncEnabled = true;
     renderer->texturePackLoadStatus = RENDERER_CONTENT_NOT_ATTEMPTED;
 
-    if (!CreateDeviceObjects(renderer, windowHandle) || !CreatePipelineCacheObject(renderer) ||
-        !CreateRenderPasses(renderer) ||
-        !CreateDescriptorLayouts(renderer) ||
+    if (!CreateDeviceObjects(renderer, windowHandle) || !ChooseColorFormat(renderer) ||
+        !ChooseDepthFormat(renderer) || !CreatePipelineCacheObject(renderer) ||
+        !CreateRenderPasses(renderer) || !CreateDescriptorLayouts(renderer) ||
         !CreateDescriptorPool(renderer) || !CreateFrameBuffers(renderer) ||
         !CreateFallbackImages(renderer) || !CreateSharedSets(renderer))
     {
@@ -3510,10 +3825,12 @@ Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t heigh
     if (initialWidth <= 0) initialWidth = width > 0 ? width : 1;
     if (initialHeight <= 0) initialHeight = height > 0 ? height : 1;
 
-    if (!CreateFrameTargets(renderer, initialWidth, initialHeight) ||
-        (renderer->hasSurface && !SwapchainCreate(renderer, initialWidth, initialHeight)) ||
+    // Цепочка первой: она решает, нужны ли цветовые цели.
+    if ((renderer->hasSurface && !SwapchainCreate(renderer, initialWidth, initialHeight)) ||
+        !CreateFrameTargets(renderer, initialWidth, initialHeight) ||
         !CreateResolvePipeline(renderer, &renderer->resolvePipeline) ||
-        !CreateUiPipeline(renderer, &renderer->uiPipeline))
+        !CreateUiPipeline(renderer, false, &renderer->uiPipeline) ||
+        !CreateUiPipeline(renderer, true, &renderer->uiScenePipeline))
     {
         RendererDestroy_Vulkan(renderer);
         return NULL;
@@ -3658,6 +3975,7 @@ void RendererDestroy_Vulkan(Renderer *renderer)
         }
         ReleaseCubeResources(renderer);
         ReleaseFrameTargets(renderer);
+        BufferDestroy(renderer, &renderer->captureBuffer);
         ImageDestroy(renderer, &renderer->fontTexture);
         ImageDestroy(renderer, &renderer->fallbackArray);
         ImageDestroy(renderer, &renderer->fallbackImage);
@@ -3680,6 +3998,8 @@ void RendererDestroy_Vulkan(Renderer *renderer)
             vkDestroyPipeline(renderer->device, renderer->resolvePipeline, NULL);
         if (renderer->uiPipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(renderer->device, renderer->uiPipeline, NULL);
+        if (renderer->uiScenePipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, renderer->uiScenePipeline, NULL);
         if (renderer->chunkPipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(renderer->device, renderer->chunkPipelineLayout, NULL);
         if (renderer->genericPushPipelineLayout != VK_NULL_HANDLE)
@@ -3746,9 +4066,7 @@ static bool EnsureVulkanUploadSlotReady(Renderer *renderer)
         FailVulkanDevice(renderer);
         return false;
     }
-    renderer->meshUploadOffsets[frameIndex] = 0u;
-    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
-    ReleaseStagingOverflow(renderer, frameIndex);
+    RewindUploadSlot(renderer, frameIndex);
     renderer->uploadSlotReady[frameIndex] = true;
     return true;
 }
@@ -4685,47 +5003,40 @@ static void EndRenderingIfActive(Renderer *renderer)
     renderer->renderingActive = false;
 }
 
+// Проход с глубиной очищает обе цели сам, поэтому clearColor обязателен; проходу
+// только с цветом очистка нужна не всегда.
 static void BeginLegacyRenderPass(Renderer *renderer, VkFramebuffer framebuffer,
                                   bool depth, int32_t x, int32_t y, uint32_t width,
-                                  uint32_t height, const float clearColor[4],
-                                  bool clearDepth)
+                                  uint32_t height, const float clearColor[4])
 {
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    VkClearValue clearValues[2] = { { .color = { { 0.0f } } },
+                                    { .depthStencil = { 1.0f, 0u } } };
+    if (clearColor != NULL)
+        memcpy(clearValues[0].color.float32, clearColor, sizeof(float) * 4u);
     VkRenderPassBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = depth ? renderer->depthRenderPass : renderer->colorRenderPass,
         .framebuffer = framebuffer,
         .renderArea = { { x, y }, { width, height } },
+        .clearValueCount = depth ? 2u : 0u,
+        .pClearValues = clearValues,
     };
     vkCmdBeginRenderPass(commandBuffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkClearAttachment clears[2];
-    uint32_t clearCount = 0u;
-    if (clearColor != NULL)
+    if (!depth && clearColor != NULL)
     {
-        clears[clearCount] = (VkClearAttachment){
+        VkClearAttachment clear = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .colorAttachment = 0u,
+            .clearValue = clearValues[0],
         };
-        memcpy(clears[clearCount].clearValue.color.float32, clearColor, sizeof(float) * 4u);
-        ++clearCount;
-    }
-    if (depth && clearDepth)
-    {
-        clears[clearCount] = (VkClearAttachment){
-            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .clearValue = { .depthStencil = { 1.0f, 0u } },
-        };
-        ++clearCount;
-    }
-    if (clearCount != 0u)
-    {
         VkClearRect rect = {
             .rect = { { x, y }, { width, height } },
             .baseArrayLayer = 0u,
             .layerCount = 1u,
         };
-        vkCmdClearAttachments(commandBuffer, clearCount, clears, 1u, &rect);
+        vkCmdClearAttachments(commandBuffer, 1u, &clear, 1u, &rect);
     }
     renderer->renderingActive = true;
 }
@@ -4837,9 +5148,7 @@ static bool FlushUploads(Renderer *renderer)
             return false;
         }
         renderer->recordedUploadCount = 0u;
-        renderer->meshUploadOffsets[renderer->frameIndex] = 0u;
-        renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0u;
-        ReleaseStagingOverflow(renderer, renderer->frameIndex);
+        RewindUploadSlot(renderer, renderer->frameIndex);
         DrainDeferredReleases(renderer, true);
     }
     ReleaseStagingChain(renderer, &renderer->textureStaging);
@@ -4877,8 +5186,8 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         !SwapchainRecreate(renderer))
         return false;
 
-    if (renderer->colorTargets[renderer->frameIndex].image == VK_NULL_HANDLE ||
-        (frame->passCount != 0u && renderer->depthTarget.image == VK_NULL_HANDLE))
+    if (!FrameTargetsReady(renderer) ||
+        (renderer->swapchainDirect && !AcquireFrameImage(renderer)))
         return false;
 
     renderer->frame = *frame;
@@ -4927,8 +5236,11 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
     RecordTextureUploads(renderer, commandBuffer);
     RetireTextureStaging(renderer);
 
-    ImageBarrier(commandBuffer, &renderer->colorTargets[renderer->frameIndex],
-                 VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (renderer->swapchainDirect)
+        PrepareSwapchainTarget(commandBuffer, FrameTarget(renderer));
+    else
+        ImageBarrier(commandBuffer, FrameTarget(renderer), VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ImageBarrier(commandBuffer, &renderer->depthTarget, VK_IMAGE_ASPECT_DEPTH_BIT,
                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     if (renderer->cubeColor.image != VK_NULL_HANDLE)
@@ -4963,19 +5275,19 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         const float clearColor[4] = {
             frame->skyColor[0], frame->skyColor[1], frame->skyColor[2], 1.0f,
         };
+        const GpuImage *target = FrameTarget(renderer);
+        renderer->currentStats.targetPasses++;
         if (!renderer->useDynamicRendering)
         {
-            BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
-                                  false, 0, 0, (uint32_t)renderer->windowWidth,
-                                  (uint32_t)renderer->windowHeight, clearColor, false);
-            SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                                  (uint32_t)renderer->windowHeight);
+            BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
+                                  false, 0, 0, target->width, target->height, clearColor);
+            SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
             EndRenderingIfActive(renderer);
             return true;
         }
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = renderer->colorTargets[renderer->frameIndex].view,
+            .imageView = target->view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -4986,19 +5298,28 @@ bool RendererBeginFrame_Vulkan(Renderer *renderer, const RendererFrameSetup *fra
         colorAttachment.clearValue.color.float32[3] = 1.0f;
         VkRenderingInfo renderingInfo = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = { { 0, 0 },
-                            { (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight } },
+            .renderArea = {{0, 0}, {target->width, target->height}},
             .layerCount = 1u,
             .colorAttachmentCount = 1u,
             .pColorAttachments = &colorAttachment,
         };
         renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
+        SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
         renderer->cmdEndRendering(commandBuffer);
     }
     return true;
+}
+
+// Проход рисует в цель кадра, а она может лежать повёрнутой; грани панорамы не
+// повёрнуты, их поворачивает резолв.
+static void SetPassConstants(Renderer *renderer, const RendererScenePass *pass)
+{
+    memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
+    if (!renderer->frame.panorama)
+        FrameTurnMatrix(renderer->chunkConstants.viewProjection, renderer->frameTurn);
+    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
+    renderer->instancedConstantsValid = false;
+    renderer->chunkSetBound = false;
 }
 
 void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
@@ -5029,14 +5350,16 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
     }
     else
     {
-        colorView = renderer->colorTargets[renderer->frameIndex].view;
+        const GpuImage *target = FrameTarget(renderer);
+        colorView = target->view;
         depthView = renderer->depthTarget.view;
         x = 0;
         y = 0;
-        width = (uint32_t)renderer->windowWidth;
-        height = (uint32_t)renderer->windowHeight;
+        width = target->width;
+        height = target->height;
     }
     if (width == 0u || height == 0u || colorView == VK_NULL_HANDLE) return;
+    if (!renderer->frame.panorama) renderer->currentStats.targetPasses++;
 
     if (!renderer->useDynamicRendering)
     {
@@ -5048,13 +5371,11 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
                                         ? renderer->cubeFramebuffers[pass->faceIndex < 6u
                                                                          ? pass->faceIndex
                                                                          : 0u]
-                                        : renderer->depthFramebuffers[renderer->frameIndex];
-        BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height,
-                              clearColor, true);
+                                        : renderer->depthFramebuffers[FrameTargetIndex(renderer)];
+        BeginLegacyRenderPass(renderer, framebuffer, true, x, y, width, height, clearColor);
         SetViewportAndScissor(commandBuffer, x, y, width, height);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
-        memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection,
-               sizeof(float) * 16u);
+        SetPassConstants(renderer, pass);
         return;
     }
 
@@ -5075,7 +5396,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
         .imageView = depthView,
         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
     };
     depthAttachment.clearValue.depthStencil.depth = 1.0f;
 
@@ -5092,10 +5413,7 @@ void RendererBeginScenePass_Vulkan(Renderer *renderer, uint32_t passIndex)
 
     SetViewportAndScissor(commandBuffer, x, y, width, height);
     BindGraphicsPipeline(renderer, commandBuffer, renderer->chunkPipeline);
-    memcpy(renderer->chunkConstants.viewProjection, pass->viewProjection, sizeof(float) * 16u);
-    // viewProjection сменился — кэш инстансных констант и привязки сброшен.
-    renderer->instancedConstantsValid = false;
-    renderer->chunkSetBound = false;
+    SetPassConstants(renderer, pass);
 }
 
 static void RecordPanoramaResolve(Renderer *renderer)
@@ -5109,16 +5427,18 @@ static void RecordPanoramaResolve(Renderer *renderer)
         .verticalScale = renderer->frame.resolveVerticalScale,
         .mapping = (uint32_t)renderer->frame.resolveMapping,
     };
+    memcpy(constants.clipAxes, FRAME_TURN_CLIP_AXES[renderer->frameTurn],
+           sizeof(constants.clipAxes));
     uint32_t constantOffset = 0u;
     if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+    renderer->currentStats.targetPasses++;
+    const GpuImage *target = FrameTarget(renderer);
 
     if (!renderer->useDynamicRendering)
     {
-        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
-                              false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL, false);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
+        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
+                              false, 0, 0, target->width, target->height, NULL);
+        SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
         BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 renderer->resolvePipelineLayout, 0u, 1u,
@@ -5134,22 +5454,20 @@ static void RecordPanoramaResolve(Renderer *renderer)
 
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = renderer->colorTargets[renderer->frameIndex].view,
+        .imageView = target->view,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
     VkRenderingInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = { { 0, 0 },
-                        { (uint32_t)renderer->windowWidth, (uint32_t)renderer->windowHeight } },
+        .renderArea = {{0, 0}, {target->width, target->height}},
         .layerCount = 1u,
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
     renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
-    SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                          (uint32_t)renderer->windowHeight);
+    SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
     BindGraphicsPipeline(renderer, commandBuffer, renderer->resolvePipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->resolvePipelineLayout, 0u, 1u,
@@ -5162,60 +5480,88 @@ static void RecordPanoramaResolve(Renderer *renderer)
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
-static void RecordUiLayer(Renderer *renderer)
+// Проход для интерфейса в кадре, где прохода сцены нет.
+static void BeginUiPass(Renderer *renderer)
 {
-    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    UiConstants constants = {
-        .screenSize = { (float)renderer->windowWidth, (float)renderer->windowHeight },
-    };
-    uint32_t constantOffset = 0u;
-    if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
-
+    const GpuImage *target = FrameTarget(renderer);
+    renderer->currentStats.targetPasses++;
     if (!renderer->useDynamicRendering)
     {
-        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[renderer->frameIndex],
-                              false, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight, NULL, false);
-        SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                              (uint32_t)renderer->windowHeight);
-        BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
-        uint32_t dynamicOffsets[2] = { constantOffset, 0u };
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                renderer->uiPipelineLayout, 0u, 1u,
-                                &renderer->uiSets[renderer->frameIndex], 2u,
-                                dynamicOffsets);
-        vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
-        EndRenderingIfActive(renderer);
-        renderer->currentStats.drawCalls++;
+        BeginLegacyRenderPass(renderer, renderer->colorFramebuffers[FrameTargetIndex(renderer)],
+                              false, 0, 0, target->width, target->height, NULL);
         return;
     }
-
     VkRenderingAttachmentInfo colorAttachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = renderer->colorTargets[renderer->frameIndex].view,
+        .imageView = target->view,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
     VkRenderingInfo renderingInfo = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = { { 0, 0 },
-                        { (uint32_t)renderer->windowWidth, (uint32_t)renderer->windowHeight } },
+        .renderArea = {{0, 0}, {target->width, target->height}},
         .layerCount = 1u,
         .colorAttachmentCount = 1u,
         .pColorAttachments = &colorAttachment,
     };
-    renderer->cmdBeginRendering(commandBuffer, &renderingInfo);
-    SetViewportAndScissor(commandBuffer, 0, 0, (uint32_t)renderer->windowWidth,
-                          (uint32_t)renderer->windowHeight);
-    BindGraphicsPipeline(renderer, commandBuffer, renderer->uiPipeline);
+    renderer->cmdBeginRendering(renderer->commandBuffers[renderer->frameIndex], &renderingInfo);
+    renderer->renderingActive = true;
+}
+
+static void RecordUiLayer(Renderer *renderer)
+{
+    VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
+    UiConstants constants = {
+        .screenSize = { (float)renderer->windowWidth, (float)renderer->windowHeight },
+    };
+    memcpy(constants.clipAxes, FRAME_TURN_CLIP_AXES[renderer->frameTurn],
+           sizeof(constants.clipAxes));
+    uint32_t constantOffset = 0u;
+    if (!PushConstants(renderer, &constants, sizeof(constants), &constantOffset)) return;
+
+    // Открытый проход сцены продолжается: для своего прохода тайловый GPU записал
+    // бы весь кадр в память и тут же прочитал его обратно.
+    const bool inScenePass = renderer->renderingActive;
+    if (!inScenePass) BeginUiPass(renderer);
+    const GpuImage *target = FrameTarget(renderer);
+    SetViewportAndScissor(commandBuffer, 0, 0, target->width, target->height);
+    BindGraphicsPipeline(renderer, commandBuffer,
+                         inScenePass ? renderer->uiScenePipeline : renderer->uiPipeline);
     uint32_t dynamicOffsets[2] = { constantOffset, 0u };
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             renderer->uiPipelineLayout, 0u, 1u,
                             &renderer->uiSets[renderer->frameIndex], 2u, dynamicOffsets);
     vkCmdDraw(commandBuffer, renderer->uiQuadCount * 6u, 1u, 0u, 0u);
-    renderer->cmdEndRendering(commandBuffer);
     renderer->currentStats.drawCalls++;
+}
+
+static void RecordFrameCapture(Renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    GpuImage *target = FrameTarget(renderer);
+    const VkDeviceSize bytes = (VkDeviceSize)target->width * target->height * 4u;
+    if (renderer->captureBuffer.sizeBytes != bytes)
+    {
+        WaitForGpu(renderer);
+        BufferDestroy(renderer, &renderer->captureBuffer);
+        if (!BufferCreate(renderer, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                          &renderer->captureBuffer))
+            return;
+    }
+    ImageBarrier(commandBuffer, target, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u },
+        .imageExtent = { target->width, target->height, 1u },
+    };
+    vkCmdCopyImageToBuffer(commandBuffer, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           renderer->captureBuffer.buffer, 1u, &region);
+    HostReadBarrier(commandBuffer);
+    const bool sidesSwapped = (renderer->frameTurn & 1u) != 0u;
+    renderer->captureWidth = sidesSwapped ? target->height : target->width;
+    renderer->captureHeight = sidesSwapped ? target->width : target->height;
+    renderer->captureTurn = renderer->frameTurn;
+    renderer->captureValid = true;
 }
 
 bool RendererEndFrame_Vulkan(Renderer *renderer)
@@ -5224,16 +5570,25 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
         return false;
 
     VkCommandBuffer commandBuffer = renderer->commandBuffers[renderer->frameIndex];
-    EndRenderingIfActive(renderer);
-
-    if (renderer->frame.panorama && renderer->cubeResolution != 0u) RecordPanoramaResolve(renderer);
+    if (renderer->frame.panorama)
+    {
+        EndRenderingIfActive(renderer);
+        if (renderer->cubeResolution != 0u) RecordPanoramaResolve(renderer);
+    }
     if (renderer->uiQuadCount > 0u && renderer->fontReady) RecordUiLayer(renderer);
+    EndRenderingIfActive(renderer);
 
     // Без swapchain «показ» кадра — это перевод цели в состояние, из
     // которого её можно прочитать: именно так кадр проверяется в тестах.
-    // С swapchain цель становится источником копии в образ показа.
-    ImageBarrier(commandBuffer, &renderer->colorTargets[renderer->frameIndex],
-                 VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // С swapchain цель становится источником копии в образ показа, если кадр
+    // не нарисован прямо в него. Копия захвата верна только для своего кадра.
+    renderer->captureValid = false;
+    if (!renderer->swapchainDirect)
+        ImageBarrier(commandBuffer, FrameTarget(renderer), VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    else if (renderer->captureRequested)
+        RecordFrameCapture(renderer, commandBuffer);
+    renderer->captureRequested = false;
 
     PresentOutcome present = RecordPresent(renderer, commandBuffer);
 
@@ -5259,12 +5614,14 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
         .commandBufferCount = 1u,
         .pCommandBuffers = &commandBuffer,
     };
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags waitStage = renderer->swapchainDirect
+                                         ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                         : VK_PIPELINE_STAGE_TRANSFER_BIT;
     if (present == PRESENT_OUTCOME_PRESENT)
     {
-        // Копия в swapchain ждёт готовности образа, последующий present —
-        // готовности копии. Семафоры возвращаются кадровым слотом и
-        // индексом образа, поэтому не переиспользуются под живой работой.
+        // Кадр ждёт готовности образа, последующий present — готовности
+        // кадра. Семафоры возвращаются кадровым слотом и индексом образа,
+        // поэтому не переиспользуются под живой работой.
         submitInfo.waitSemaphoreCount = 1u;
         submitInfo.pWaitSemaphores = &renderer->imageAvailable[renderer->frameIndex];
         submitInfo.pWaitDstStageMask = &waitStage;
@@ -5288,8 +5645,15 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     if (present == PRESENT_OUTCOME_PRESENT)
     {
         uint32_t imageIndex = renderer->swapchainImageIndex;
+        const uint64_t presentId = ++renderer->presentId;
+        VkPresentIdKHR presentIdInfo = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+            .swapchainCount = 1u,
+            .pPresentIds = &presentId,
+        };
         VkPresentInfoKHR presentInfo = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = renderer->waitForPresent != NULL ? &presentIdInfo : NULL,
             .waitSemaphoreCount = 1u,
             .pWaitSemaphores = &renderer->renderFinished[imageIndex],
             .swapchainCount = 1u,
@@ -5314,12 +5678,44 @@ bool RendererEndFrame_Vulkan(Renderer *renderer)
     renderer->lastFrameValid = true;
     renderer->submittedFrames++;
     renderer->frameIndex = (renderer->frameIndex + 1u) % FRAME_COUNT;
+
+    // Ожидания стоят в конце кадра: следующий кадр читает ввод уже после них, и
+    // готовая картинка не стоит в очереди. По умолчанию очередь держит столько
+    // кадров, что картинка выходит на экран через пять обновлений. Ждать показа
+    // этого кадра, а не прошлого, нельзя: в очереди остался бы один кадр, CPU и
+    // GPU работали бы строго по очереди, и им на двоих пришлось бы уложиться в
+    // одно обновление экрана, так что кадров под нагрузкой вышло бы вдвое
+    // меньше. По той же причине с двумя образами копия в цепочку захватывает
+    // образ в самом кадре; кадру, рисующему прямо в образ, он нужен до записи.
+    const bool shown = present == PRESENT_OUTCOME_PRESENT && !renderer->swapchainOutOfDate;
+    if (shown && renderer->waitForPresent != NULL && renderer->verticalSyncEnabled &&
+        renderer->presentId > 1u)
+        (void)renderer->waitForPresent(renderer->device, renderer->swapchain,
+                                       renderer->presentId - 1u, PRESENT_WAIT_NANOSECONDS);
+    if (EnsureVulkanUploadSlotReady(renderer) && shown &&
+        (renderer->swapchainDirect || renderer->swapchainImageCount >= SWAPCHAIN_MIN_IMAGES))
+        (void)AcquireSwapchainImage(renderer);
     return true;
 }
 
 bool RendererIsDeviceLost_Vulkan(const Renderer *renderer)
 {
     return renderer->deviceFailed;
+}
+
+uint64_t RendererUploadStagingBytes_Vulkan(const Renderer *renderer)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t frame = 0u; frame < FRAME_COUNT; ++frame)
+    {
+        bytes += renderer->meshUploadBuffers[frame].buffer != VK_NULL_HANDLE
+                     ? MESH_UPLOAD_BYTES_PER_FRAME
+                     : 0u;
+        bytes += renderer->largeMeshUploadBuffers[frame].buffer != VK_NULL_HANDLE
+                     ? LARGE_MESH_UPLOAD_BYTES_PER_FRAME
+                     : 0u;
+    }
+    return bytes;
 }
 
 void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
@@ -5330,6 +5726,9 @@ void RendererGetStats_Vulkan(const Renderer *renderer, RendererStats *outStats)
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
     outStats->swapchainRebuilds = renderer->swapchainRecreateCount;
+    outStats->drawsIntoSwapchain = renderer->swapchainDirect;
+    outStats->frameTurn = renderer->frameTurn;
+    outStats->dynamicRendering = renderer->useDynamicRendering;
 }
 
 void RendererGetGpuTiming_Vulkan(const Renderer *renderer, RendererGpuTimingV1 *outTiming)
@@ -5373,6 +5772,7 @@ void RendererResize_Vulkan(Renderer *renderer, int32_t width, int32_t height)
 {
     if (renderer == NULL) return;
     renderer->lastFrameValid = false;
+    renderer->captureRequested = false;
     if (width <= 0 || height <= 0)
     {
         // Нулевой размер — свёрнутое окно: кадры пропускаются до
@@ -5570,8 +5970,10 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
     VkPipeline chunkPipeline = VK_NULL_HANDLE;
     VkPipeline resolvePipeline = VK_NULL_HANDLE;
     VkPipeline uiPipeline = VK_NULL_HANDLE;
+    VkPipeline uiScenePipeline = VK_NULL_HANDLE;
     bool ok = CreateResolvePipeline(renderer, &resolvePipeline) &&
-              CreateUiPipeline(renderer, &uiPipeline) &&
+              CreateUiPipeline(renderer, false, &uiPipeline) &&
+              CreateUiPipeline(renderer, true, &uiScenePipeline) &&
               (!renderer->worldReady || CreateChunkPipeline(renderer, &chunkPipeline));
     if (!ok)
     {
@@ -5579,6 +5981,8 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
         if (resolvePipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(renderer->device, resolvePipeline, NULL);
         if (uiPipeline != VK_NULL_HANDLE) vkDestroyPipeline(renderer->device, uiPipeline, NULL);
+        if (uiScenePipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(renderer->device, uiScenePipeline, NULL);
         ReleaseShaderArray(replacements);
         memcpy((void *)renderer->loadedShaders, (const void *)previousShaders,
                sizeof(previousShaders));
@@ -5591,8 +5995,11 @@ bool RendererReloadShaderSet_Vulkan(Renderer *renderer, const LaiueShaderSet *sh
         vkDestroyPipeline(renderer->device, renderer->resolvePipeline, NULL);
     if (renderer->uiPipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(renderer->device, renderer->uiPipeline, NULL);
+    if (renderer->uiScenePipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(renderer->device, renderer->uiScenePipeline, NULL);
     renderer->resolvePipeline = resolvePipeline;
     renderer->uiPipeline = uiPipeline;
+    renderer->uiScenePipeline = uiScenePipeline;
     if (chunkPipeline != VK_NULL_HANDLE)
     {
         if (renderer->chunkPipeline != VK_NULL_HANDLE)
@@ -5728,7 +6135,34 @@ bool RendererUsesPushDescriptors_Vulkan(const Renderer *renderer)
 
 bool RendererRequestFrameCapture_Vulkan(Renderer *renderer)
 {
-    return RendererCanCaptureFrame_Vulkan(renderer) && !renderer->frameRecording;
+    if (!RendererCanCaptureFrame_Vulkan(renderer) || renderer->frameRecording) return false;
+    renderer->captureValid = false;
+    renderer->captureRequested = true;
+    return true;
+}
+
+// Кадр отдают как RGBA, цели на экране бывают и BGRA.
+// Кадр читается так, как лежит окно, в каком бы положении он ни был нарисован.
+static void CopyFramePixels(const Renderer *renderer, uint8_t *destination, const uint8_t *source,
+                            uint32_t width, uint32_t height, uint32_t turn)
+{
+    const size_t bytes = (size_t)width * height * 4u;
+    if (turn == 0u)
+        memcpy(destination, source, bytes);
+    for (uint32_t y = 0u; turn != 0u && y < height; ++y)
+    {
+        uint8_t *row = destination + (size_t)y * width * 4u;
+        for (uint32_t x = 0u; x < width; ++x)
+            memcpy(row + (size_t)x * 4u, source + FrameTurnPixel(turn, width, height, x, y) * 4u,
+                   4u);
+    }
+    if (renderer->colorFormat != VK_FORMAT_B8G8R8A8_SRGB) return;
+    for (size_t offset = 0u; offset + 4u <= bytes; offset += 4u)
+    {
+        const uint8_t blue = destination[offset];
+        destination[offset] = destination[offset + 2u];
+        destination[offset + 2u] = blue;
+    }
 }
 
 bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t capacityBytes,
@@ -5739,13 +6173,14 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
         return false;
 
     GpuImage *source = &renderer->colorTargets[renderer->lastFrameIndex];
-    uint32_t width = source->width;
-    uint32_t height = source->height;
+    const bool direct = renderer->swapchainDirect;
+    uint32_t width = direct ? renderer->captureWidth : source->width;
+    uint32_t height = direct ? renderer->captureHeight : source->height;
     if (outWidth != NULL) *outWidth = width;
     if (outHeight != NULL) *outHeight = height;
 
-    if (source->image == VK_NULL_HANDLE || width == 0u || height == 0u || width > UINT32_MAX / 4u ||
-        (uint64_t)width * 4u > UINT64_MAX / height)
+    if ((direct ? !renderer->captureValid : source->image == VK_NULL_HANDLE) || width == 0u ||
+        height == 0u || width > UINT32_MAX / 4u || (uint64_t)width * 4u > UINT64_MAX / height)
         return false;
     VkDeviceSize required = (VkDeviceSize)width * height * 4u;
     if (required > capacityBytes || required > SIZE_MAX ||
@@ -5754,6 +6189,12 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
 
     if (vkDeviceWaitIdle(renderer->device) != VK_SUCCESS)
         return false;
+    if (direct)
+    {
+        CopyFramePixels(renderer, outPixels, renderer->captureBuffer.mapped, width, height,
+                        renderer->captureTurn);
+        return true;
+    }
 
     GpuBuffer readback;
     if (!BufferCreate(renderer, required, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &readback))
@@ -5774,9 +6215,11 @@ bool RendererCaptureFrame_Vulkan(Renderer *renderer, void *outPixels, uint32_t c
     };
     vkCmdCopyImageToBuffer(commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback.buffer, 1u, &region);
+    HostReadBarrier(commandBuffer);
     ImageBarrier(commandBuffer, source, VK_IMAGE_ASPECT_COLOR_BIT, originalLayout);
     bool ok = EndImmediate(renderer, commandBuffer);
-    if (ok) memcpy(outPixels, readback.mapped, (size_t)required);
+    if (ok)
+        CopyFramePixels(renderer, outPixels, readback.mapped, width, height, 0u);
     BufferDestroy(renderer, &readback);
     return ok;
 }

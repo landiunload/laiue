@@ -377,18 +377,31 @@ endif()
 
 # Graphics. Driver-dependent tests skip without a GPU unless it is required.
 if(TARGET laiue_render AND laiue_shared_modules)
+    laiue_add_harness(laiue_frame_turn_test FrameTurnTestEntryPoint frame_turn_test.c
+        TEST laiue.render.frame_turn)
     if(LAIUE_RENDER_HAS_VULKAN_TARGET)
         laiue_add_harness(laiue_graphics_geometry_vulkan_test GraphicsGeometryTestEntryPoint
-            graphics_geometry_test.c BOOTSTRAP DEPENDS laiue_render
+            graphics_geometry_test.c BOOTSTRAP
+            LIBRARIES $<$<PLATFORM_ID:Windows>:user32> DEPENDS laiue_render
             DEFINITIONS LAIUE_GRAPHICS_TEST_D3D12=0
                 "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}>"
             TEST laiue.graphics.geometry_vulkan TIMEOUT 90)
+        # The path of a phone below Vulkan 1.3, on any device with Vulkan.
+        laiue_add_harness(laiue_graphics_geometry_vulkan_core_test
+            GraphicsGeometryTestEntryPoint graphics_geometry_test.c BOOTSTRAP
+            LIBRARIES $<$<PLATFORM_ID:Windows>:user32> DEPENDS laiue_render
+            DEFINITIONS LAIUE_GRAPHICS_TEST_D3D12=0
+                LAIUE_GRAPHICS_TEST_VULKAN_BACKEND=LAIUE_GRAPHICS_BACKEND_VULKAN_CORE
+                "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}>"
+            TEST laiue.graphics.geometry_vulkan_core TIMEOUT 90)
         laiue_add_harness(laiue_graphics_diagnostics_test GraphicsDiagnosticsTestEntryPoint
             graphics_diagnostics_test.c BOOTSTRAP DEPENDS laiue_render
             TEST laiue.graphics.diagnostics TIMEOUT 60)
         laiue_set_gpu_test_properties(${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}
-            laiue.graphics.geometry_vulkan laiue.graphics.diagnostics)
-        laiue_add_vulkan_validation(laiue.graphics.geometry_vulkan)
+            laiue.graphics.geometry_vulkan laiue.graphics.geometry_vulkan_core
+            laiue.graphics.diagnostics)
+        laiue_add_vulkan_validation(laiue.graphics.geometry_vulkan
+            laiue.graphics.geometry_vulkan_core)
     endif()
     if(LAIUE_RENDER_HAS_D3D12 AND WIN32)
         laiue_add_harness(laiue_graphics_geometry_d3d12_test GraphicsGeometryTestEntryPoint
@@ -444,18 +457,34 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     laiue_add_harness(laiue_renderer_offscreen_test RendererOffscreenTestEntryPoint
         renderer_offscreen_test.c texc_fixtures.h LIBRARIES laiue_content laiue_render
         TEST laiue.render.offscreen_frame)
+    laiue_add_harness(laiue_renderer_offscreen_core_test RendererOffscreenTestEntryPoint
+        renderer_offscreen_test.c texc_fixtures.h LIBRARIES laiue_content laiue_render
+        DEFINITIONS TEST_VULKAN_CORE=1 TEST laiue.render.offscreen_frame_core)
     laiue_add_harness(laiue_renderer_vulkan_instance_ring_test
         RendererVulkanInstanceRingTestEntryPoint renderer_vulkan_instance_ring_test.c
         LIBRARIES laiue_render laiue_content TEST laiue.render.vulkan_instance_ring TIMEOUT 180)
+    laiue_add_harness(laiue_renderer_vulkan_instance_ring_core_test
+        RendererVulkanInstanceRingTestEntryPoint renderer_vulkan_instance_ring_test.c
+        LIBRARIES laiue_render laiue_content
+        DEFINITIONS TEST_VULKAN_BACKEND=RENDERER_BACKEND_VULKAN_CORE
+        TEST laiue.render.vulkan_instance_ring_core TIMEOUT 180)
     laiue_set_gpu_test_properties(${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}
-        laiue.render.offscreen_frame laiue.render.vulkan_instance_ring)
+        laiue.render.offscreen_frame laiue.render.offscreen_frame_core
+        laiue.render.vulkan_instance_ring laiue.render.vulkan_instance_ring_core)
     # Hidden windows only; a missing driver or surface is always a skip.
     laiue_add_harness(laiue_renderer_vulkan_lifecycle_test RendererVulkanLifecycleTestEntryPoint
         renderer_vulkan_lifecycle_test.c LIBRARIES laiue_render laiue_content
         TEST laiue.render.vulkan_lifecycle TIMEOUT 180)
-    laiue_set_gpu_test_properties(OFF laiue.render.vulkan_lifecycle)
-    laiue_add_vulkan_validation(laiue.render.offscreen_frame
-        laiue.render.vulkan_instance_ring laiue.render.vulkan_lifecycle)
+    laiue_add_harness(laiue_renderer_vulkan_lifecycle_core_test
+        RendererVulkanLifecycleTestEntryPoint renderer_vulkan_lifecycle_test.c
+        LIBRARIES laiue_render laiue_content
+        DEFINITIONS TEST_VULKAN_BACKEND=RENDERER_BACKEND_VULKAN_CORE
+        TEST laiue.render.vulkan_lifecycle_core TIMEOUT 180)
+    laiue_set_gpu_test_properties(OFF laiue.render.vulkan_lifecycle
+        laiue.render.vulkan_lifecycle_core)
+    laiue_add_vulkan_validation(laiue.render.offscreen_frame laiue.render.offscreen_frame_core
+        laiue.render.vulkan_instance_ring laiue.render.vulkan_instance_ring_core
+        laiue.render.vulkan_lifecycle laiue.render.vulkan_lifecycle_core)
 endif()
 # Pipeline cache on every backend this build has; 125 means no GPU driver.
 if(TARGET laiue_render)

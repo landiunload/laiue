@@ -22,6 +22,7 @@ extern bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetu
 extern void RendererBeginScenePass_D3D12(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_D3D12(Renderer* renderer);
 extern void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats);
+extern uint64_t RendererUploadStagingBytes_D3D12(const Renderer* renderer);
 extern bool RendererIsDeviceLost_D3D12(const Renderer* renderer);
 extern void RendererGetGpuTiming_D3D12(const Renderer *renderer,
                                        RendererGpuTimingV1 *outTiming);
@@ -83,7 +84,8 @@ extern bool RendererReloadShaders_D3D12(Renderer* renderer, const void* chunkVS,
 #endif
 
 #if defined(LAIUE_RENDER_HAS_VULKAN)
-extern Renderer* RendererCreate_Vulkan(void* windowHandle, int32_t width, int32_t height);
+extern Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height,
+                                       bool coreOnly);
 extern void RendererDestroy_Vulkan(Renderer* renderer);
 extern bool RendererSetMaterialNames_Vulkan(Renderer *renderer, const wchar_t *const *names, uint32_t count);
 extern bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -94,6 +96,7 @@ extern bool RendererBeginFrame_Vulkan(Renderer* renderer, const RendererFrameSet
 extern void RendererBeginScenePass_Vulkan(Renderer* renderer, uint32_t passIndex);
 extern bool RendererEndFrame_Vulkan(Renderer* renderer);
 extern void RendererGetStats_Vulkan(const Renderer* renderer, RendererStats* outStats);
+extern uint64_t RendererUploadStagingBytes_Vulkan(const Renderer* renderer);
 extern bool RendererIsDeviceLost_Vulkan(const Renderer* renderer);
 extern void RendererGetGpuTiming_Vulkan(const Renderer *renderer,
                                         RendererGpuTimingV1 *outTiming);
@@ -168,7 +171,9 @@ bool RendererBackendIsAvailable(RendererBackendKind backend)
     case RENDERER_BACKEND_D3D12: return true;
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
-    case RENDERER_BACKEND_VULKAN: return true;
+    case RENDERER_BACKEND_VULKAN:
+    case RENDERER_BACKEND_VULKAN_CORE:
+        return true;
 #endif
     default: return false;
     }
@@ -197,7 +202,9 @@ Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width, int32_t h
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
-        renderer = RendererCreate_Vulkan(windowHandle, width, height);
+    case RENDERER_BACKEND_VULKAN_CORE:
+        renderer = RendererCreate_Vulkan(windowHandle, width, height,
+                                         backend == RENDERER_BACKEND_VULKAN_CORE);
         break;
 #endif
     default:
@@ -419,6 +426,22 @@ bool RendererIsDeviceLost(const Renderer* renderer)
         return RendererIsDeviceLost_Vulkan(renderer);
 #endif
     default: return false;
+    }
+}
+
+uint64_t RendererUploadStagingBytes(const Renderer* renderer)
+{
+    switch (LookupBackend(renderer))
+    {
+#if defined(LAIUE_RENDER_HAS_D3D12)
+    case RENDERER_BACKEND_D3D12:
+        return RendererUploadStagingBytes_D3D12(renderer);
+#endif
+#if defined(LAIUE_RENDER_HAS_VULKAN)
+    case RENDERER_BACKEND_VULKAN:
+        return RendererUploadStagingBytes_Vulkan(renderer);
+#endif
+    default: return 0u;
     }
 }
 

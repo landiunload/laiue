@@ -97,6 +97,15 @@ typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 // The device stopped for good, as after a driver reset, and every frame will
 // fail. Destroy it and create a new one, as soon as the system allows it.
 #define LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST (1u << 5)
+// The last frame went straight into a swap chain image. Without the flag a window
+// costs an extra colour target and a copy of the screen in every frame.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN (1u << 6)
+// The last frame was drawn turned the way a rotated screen keeps its images, so
+// the system has nothing left to rotate when it shows the frame.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED (1u << 7)
+// The device draws with dynamic rendering. Without the flag a Vulkan device uses
+// render passes, as every phone below Vulkan 1.3 does.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING (1u << 8)
 
 typedef struct LaiueGraphicsDiagnosticsV2
 {
@@ -120,6 +129,8 @@ typedef struct LaiueGraphicsDiagnosticsV2
     // Swap chain rebuilds since the device was created. A window resize is one,
     // so a number that grows with frames means presentation itself is broken.
     uint32_t swapchainRebuilds;
+    // Live upload rings and arenas of the backend. Blocks of a single burst are not counted.
+    uint64_t uploadStagingBytes;
 } LaiueGraphicsDiagnosticsV2;
 
 // Explicit synchronous diagnostic capture. Caller owns pixels and its capacity;

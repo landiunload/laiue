@@ -22,6 +22,15 @@ typedef struct RendererStats
     uint64_t geometryPoolCapacityBytes;
     uint32_t scenePasses;
     uint32_t swapchainRebuilds;
+    bool drawsIntoSwapchain;
+    // Vulkan: на сколько четвертей оборота цель кадра повёрнута от окна, см.
+    // render/frame_turn.h. Не ноль только на повёрнутом экране Android.
+    uint32_t frameTurn;
+    // Vulkan: проходы кадра по его цели. Каждый лишний проход тайловый GPU оплачивает
+    // записью всего кадра в память и чтением обратно.
+    uint32_t targetPasses;
+    // Vulkan: кадр рисуется через dynamic rendering, а не render pass.
+    bool dynamicRendering;
 } RendererStats;
 
 // Latest completed GPU frame interval. Results are delayed until the backend's
@@ -77,6 +86,9 @@ typedef enum RendererBackendKind
     RENDERER_BACKEND_AUTO = 0,
     RENDERER_BACKEND_D3D12 = 1,
     RENDERER_BACKEND_VULKAN = 2,
+    // Vulkan только с ядром 1.1 и без необязательных расширений, как на самом
+    // старом телефоне. RendererGetBackend отвечает RENDERER_BACKEND_VULKAN.
+    RENDERER_BACKEND_VULKAN_CORE = 3,
 } RendererBackendKind;
 
 // Есть ли этот бэкенд в данной сборке (слинкован ли он вообще).
@@ -269,6 +281,8 @@ LAIUE_RENDER_API bool RendererEndFrame(Renderer* renderer);
 // с GPU и потому подходит для диагностики и внешнего профилировщика.
 LAIUE_RENDER_API void RendererGetStats(const Renderer* renderer,
     RendererStats* outStats);
+// Память колец и арен заливки геометрии, живых сейчас.
+LAIUE_RENDER_API uint64_t RendererUploadStagingBytes(const Renderer *renderer);
 LAIUE_RENDER_API void RendererGetGpuTimingV1(const Renderer *renderer,
                                              RendererGpuTimingV1 *outTiming);
 

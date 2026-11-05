@@ -1,4 +1,4 @@
-// Контракт шейдерпаков 2 для D3D12: замена стадии принимается только как
+// Контракт шейдерпаков 3 для D3D12: замена стадии принимается только как
 // DXIL. Набор из встроенного DXIL обязан загрузиться целиком, а DXBC и
 // повреждённый контейнер — получить отказ, после которого прежний набор
 // остаётся рабочим. D3D12 нужен настоящий HWND, поэтому окно создаётся
@@ -94,7 +94,7 @@ LAIUE_TEST_ENTRY(RendererD3D12ShaderContractTestEntryPoint)
     // Мир готов: перезагрузка пересоздаёт и конвейер чанков.
     Expect(RendererPrepareWorld(renderer), "the D3D12 world could not be prepared");
 
-    // Пак contract 2 со всеми стадиями. Встроенный DXIL — заведомо
+    // Пак contract 3 со всеми стадиями. Встроенный DXIL — заведомо
     // корректный байткод того же контракта.
     LaiueShaderSet fullSet;
     LaiueShaderSetInitialize(&fullSet);
@@ -123,7 +123,7 @@ LAIUE_TEST_ENTRY(RendererD3D12ShaderContractTestEntryPoint)
         0x43425844u, 0u, 0u, 0u, 0u, 0x00000001u, 48u, 1u, 36u, 0x58454853u, 4u, 0u,
     };
     Expect(!ReloadSingle(renderer, LAIUE_SHADER_UI_VERTEX, dxbc, (uint32_t)sizeof(dxbc)),
-           "D3D12 must reject DXBC under contract 2");
+           "D3D12 must reject DXBC under contract 3");
 
     // Обрезанный DXIL: размер в заголовке контейнера больше переданного.
     Expect(!ReloadSingle(renderer, LAIUE_SHADER_UI_PIXEL, g_ui_ps,

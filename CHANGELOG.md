@@ -5,6 +5,78 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Vulkan now runs from version 1.1 instead of 1.2, the version most phones
+  from Android 9 on have. Nothing in the renderer needed 1.2, and such a phone
+  was simply turned away. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` holds a device
+  to core 1.1 with no optional extension, so the path of an old phone runs on
+  any device: the Vulkan tests and the Android scenario now go through it too.
+  A real phone with Vulkan 1.1 has not been tried.
+- The Vulkan depth format is chosen from what the device can draw into:
+  32-bit float, then 24-bit, then 16-bit. It was always 32-bit float, which the
+  Android baseline does not promise, so such a phone could not draw at all.
+- CI runs the Vulkan tests on the Android baseline profiles of 2022 and 2025,
+  with the validation layer checking the calls against what a phone has.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING` tells whether a device draws
+  with dynamic rendering, and the Android scenario counts such frames.
+- Shader packs use contract 3. A frame drawn turned for an Android screen came
+  with new constants for the interface and panorama vertex shaders, and a pack
+  under contract 2 would have drawn them sideways on a rotated screen. Such a
+  pack no longer loads: rebuild it with the two lines described in
+  `docs/shaderpacks.md`. A pack that only replaces chunk shaders needs a new
+  contract line and nothing more, since `viewProjection` already holds the turn.
+- On Android a swap chain built during a turn of the screen takes the size of
+  the window. The surface still reports its old size at that moment, so since
+  the frame went straight into the chain a turn to portrait left a chain of the
+  wrong shape: every frame was stretched into it with one more copy, and the
+  emulator showed it one gamma step too dark. It stayed so until the next resize.
+- On Android a frame is drawn already turned for a rotated screen, so the system
+  no longer rotates every frame of a game held in landscape, which often means
+  one more GPU pass over the screen. The camera, the interface, input and
+  `readbackFrame` still work in window coordinates. Nothing changes on other
+  platforms. The gain has not been measured on a phone.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED` tells whether the last frame was drawn
+  turned, and the Android scenario counts such frames.
+- Without dynamic rendering a change of scene pass drops the cached instanced
+  constants, so the faces of a panorama no longer draw instances with the matrix
+  of the previous face.
+- On Vulkan the interface is drawn in the pass of the scene instead of a pass of
+  its own, which a tile GPU pays for by writing the whole frame to memory and
+  reading it back. Without dynamic rendering the pass of the scene no longer
+  loads the last contents of its targets just to clear them.
+- On Vulkan a frame is drawn straight into the swap chain image, without two
+  extra colour targets and a copy of the whole screen in every frame. That copy
+  costs a phone GPU the most, but a phone has not been measured. Foxity on Windows
+  holds 232 MB instead of 241. A screen that offers only BGRA gets BGRA targets.
+  The copy stays for a surface that offers neither sRGB format and for a frame
+  whose size differs from the window. A chain asks for three images, since with
+  two a frame and its GPU work have to fit one refresh.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN` tells whether the last frame
+  went straight into the swap chain, and the Android scenario counts such frames.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED` covers every device with
+  a window: on Vulkan too `readbackFrame` now needs `requestFrameReadback` before
+  the frame. Without a window nothing changes.
+- Upload rings take a quarter of the memory, 1 MiB per frame instead of 4, and
+  the 8 MiB arenas of a burst go back after 120 turns of their frame slot without
+  use. A game loads its world in the first seconds and then uploads almost
+  nothing: Foxity peaked at 2.4 MiB a frame in 58 frames of 3600. Walk uses 11 MB
+  less. `LaiueGraphicsDiagnosticsV2` reports them as `uploadStagingBytes`, so a
+  program that reads diagnostics has to be rebuilt.
+- On Vulkan depth is no longer written to memory after a pass, since nothing reads
+  it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
+  a full-screen depth write, and where the device offers lazily allocated memory
+  the depth target takes no RAM at all.
+- The viewer plays a GIF frame by frame instead of unpacking it into memory first,
+  so a long GIF plays to its end. It used to stop at 256 frames without a word and
+  start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
+  `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
+- On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
+  to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
+  load too. The renderer used to wait for the GPU at the start of a frame, after
+  the program had read its input, and the present queue held four more frames.
+  It now waits at the end of a frame, and where the device has
+  `VK_KHR_present_wait` it waits until the previous frame is on the screen, which
+  keeps two frames queued, as on D3D12. Without the extension, on most Android
+  devices, the wait for a free image moves to the end of a frame as well.
 - On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
   Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
   and the chain draws unrotated, and the renderer stopped the GPU and built a new

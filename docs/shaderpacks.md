@@ -5,10 +5,10 @@
 ```text
 LAIUE SHADER 1
 name = My Pack
-contract = 2
+contract = 3
 ```
 
-Contract 2 принимает скомпилированный байткод, а не HLSL-текст: DXIL Shader
+Contract 3 принимает скомпилированный байткод, а не HLSL-текст: DXIL Shader
 Model 6.0 для D3D12 и SPIR-V для Vulkan. Пак собирается под бэкенд, на
 котором его загружают; чужой байткод бэкенд отвергает. Допустим любой
 непустой набор стадий:
@@ -42,7 +42,7 @@ pipeline replacement; повреждённый или несовместимый
 возвращает immutable owned object; renderer копирует bytecode, после чего
 объект освобождается через `ShaderPackLoadedSetRelease`.
 
-## Contract 2
+## Contract 3
 
 Эталонные реализации находятся в `shaders/*.hlsl`.
 
@@ -71,16 +71,33 @@ origin. Shader не получает абсолютные или `InfiniteCoord`
 
 ### Panorama
 
-`b0` содержит `fovHalfRadians`, `verticalScale`, `mapping`; `t0` —
-`TextureCube`, `s0` — sampler. `mapping`: 0 — equidistant fisheye, 1 —
-цилиндрическая проекция.
+`b0` содержит `fovHalfRadians`, `verticalScale`, `mapping`, затем с
+байта 16 `float2 clipAxisX` и `float2 clipAxisY`; `t0` — `TextureCube`,
+`s0` — sampler. `mapping`: 0 — equidistant fisheye, 1 — цилиндрическая
+проекция.
 
 ### UI
 
-`b0` содержит `float2 screenSize`; `t0` — квады по 48 байт, `t1` — атлас
+`b0` содержит `float2 screenSize`, `float2 clipAxisX` и
+`float2 clipAxisY`; `t0` — квады по 48 байт, `t1` — атлас
 шрифта, `t2` — фон, `s0` — sampler. У квада flag 1 выбирает альфу шрифта,
 flag 2 — фоновую текстуру. Точная раскладка записана в `shaders/ui.hlsl` и
 `RendererUiQuad`.
+
+### Поворот кадра
+
+Цепочка показа на Android может хранить кадр уже повёрнутым под экран. Тогда
+матрица `viewProjection` поворот уже содержит, а всё, что считает клип-координаты
+само, обязано довернуть их осями из `b0`, как `shaders/ui.hlsl` и
+`shaders/panorama.hlsl`:
+
+```hlsl
+output.position = float4(clip.x * clipAxisX + clip.y * clipAxisY, 0.0, 1.0);
+```
+
+Без поворота оси равны `(1, 0)` и `(0, 1)`. `SV_Position` в пиксельном шейдере
+считает пиксели повёрнутой цели, а не окна: положение на экране по нему
+определять нельзя.
 
 ## Компиляция
 
@@ -106,7 +123,8 @@ CMake компилирует встроенные стадии теми же п�
 
 Паки contract 1 с DXBC от `fxc` больше не загружаются: D3D12 не собирает
 конвейер из стадий DXBC и DXIL, а частичный пак смешал бы свои стадии со
-встроенными.
+встроенными. Паки contract 2 тоже: их интерфейс и панорама на повёрнутом
+экране легли бы боком.
 
 ## Кеш конвейеров
 
