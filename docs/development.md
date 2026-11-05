@@ -30,7 +30,7 @@ ctest --preset linux-gcc-release --parallel
 ```
 
 Официальный Linux CI выполняет те же команды на нативных Ubuntu 26.04
-runners x86_64 и ARM64 (GCC 15, Clang 22) и в контейнере Alpine 3.24 (musl).
+runners x86_64 и ARM64 (GCC 15, Clang 23) и в контейнере Alpine 3.24 (musl).
 macOS workflow назначает отдельные jobs Apple Silicon и Intel:
 
 ```sh
@@ -80,7 +80,7 @@ run-clang-tidy -p build/tidy -quiet "$PWD/src/.*[.]c$"
 Код под `__ANDROID__` и ветки ARM64 CI проверяет так же по базе
 `android-arm64-shared` (preset с `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` и NDK из
 `ANDROID_NDK_HOME`), а код только для Windows — по базе `windows-clang`. На
-Windows в Developer PowerShell с LLVM 22 в стандартном каталоге:
+Windows в Developer PowerShell с LLVM 23 в стандартном каталоге:
 
 ```powershell
 cmake --preset windows-clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

@@ -557,7 +557,27 @@ static void MixVoice(VoiceSlot *slot, float *frames, uint32_t frameCount)
             }
             else
             {
-                for (uint32_t sample = 0u; sample < count; ++sample)
+                // Кадры лежат с произвольным шагом, и цикл целиком векторизуется
+                // или нет по оценке компилятора. Сбор четырёх кадров в ряд
+                // оставляет дальше только обработку подряд идущих значений.
+                uint32_t sample = 0u;
+                for (; sample + 4u <= count; sample += 4u)
+                {
+                    int16_t block[8];
+                    for (uint32_t part = 0u; part < 8u; part += 2u)
+                    {
+                        block[part] = samples[(size_t)frame * 2u];
+                        block[part + 1u] = samples[(size_t)frame * 2u + 1u];
+                        frame += stepFrames;
+                    }
+                    float *out = frames + (size_t)((index + sample) * 2u);
+                    for (uint32_t part = 0u; part < 8u; part += 2u)
+                    {
+                        out[part] += (float)block[part] * scaledLeft;
+                        out[part + 1u] += (float)block[part + 1u] * scaledRight;
+                    }
+                }
+                for (; sample < count; ++sample)
                 {
                     float channelLeft = (float)samples[(size_t)frame * 2u];
                     float channelRight = (float)samples[(size_t)frame * 2u + 1u];

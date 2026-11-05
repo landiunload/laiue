@@ -5,6 +5,10 @@
 #   musl and Apple libc do not provide.
 # - EnumCastOutOfRange: D3D12 and Vulkan flag enums combine their values.
 # - avoid-pragma-once: every supported compiler implements #pragma once.
+# - signed-bitwise: C enumerators have type int, so every combination of
+#   Vulkan, D3D12 and Win32 flags fires. UBSan checks the shifts themselves.
+# - no-assembler: a rule for safety-critical code; clang-cl has no intrinsic
+#   for the two instructions written by hand in the no-CRT runtime.
 # Reserved names that the platform defines: feature-test macros and the
 # no-CRT _fltused symbol.
 Checks: >
@@ -15,8 +19,10 @@ Checks: >
   portability-*,
   -bugprone-easily-swappable-parameters,
   -bugprone-casting-through-void,
+  -bugprone-signed-bitwise,
   -performance-no-int-to-ptr,
   -portability-avoid-pragma-once,
+  -portability-no-assembler,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -clang-analyzer-optin.core.EnumCastOutOfRange
 CheckOptions:
