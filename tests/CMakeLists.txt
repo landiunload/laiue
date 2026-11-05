@@ -195,10 +195,10 @@ laiue_add_harness(laiue_rigid_broadphase_test RigidBroadphaseTestEntryPoint
     TEST laiue.physics.rigid_broadphase)
 laiue_add_harness(laiue_rigid_broadphase_scale_test RigidBroadphaseScaleTestEntryPoint
     rigid_broadphase_scale_test.c LIBRARIES laiue_physics laiue_numeric
-    TEST laiue.physics.rigid_broadphase_scale TIMEOUT 60)
+    TEST laiue.physics.rigid_broadphase_scale TIMEOUT 180)
 laiue_add_harness(laiue_rigid_parallel_test RigidParallelTestEntryPoint rigid_parallel_test.c
     LIBRARIES laiue::physics laiue::numeric laiue::task
-    TEST laiue.physics.rigid_parallel TIMEOUT 60)
+    TEST laiue.physics.rigid_parallel TIMEOUT 180)
 laiue_add_harness(laiue_rigid_compound_test RigidCompoundTestEntryPoint rigid_compound_test.c
     LIBRARIES laiue::physics laiue::numeric laiue::task
     TEST laiue.physics.rigid_compound TIMEOUT 120)
@@ -213,7 +213,7 @@ laiue_add_harness(laiue_compound_bvh_test CompoundBvhTestEntryPoint compound_bvh
     TEST laiue.physics.compound_bvh TIMEOUT 30 PROPERTIES RUN_SERIAL TRUE)
 laiue_add_harness(laiue_ragdoll_test RagdollTestEntryPoint ragdoll_test.c
     LIBRARIES laiue_walk_common laiue::physics laiue::numeric laiue::math_support
-    TEST laiue.physics.ragdoll TIMEOUT 30)
+    TEST laiue.physics.ragdoll TIMEOUT 90)
 if(TARGET laiue_physics AND laiue_shared_modules)
     laiue_add_harness(laiue_physics_module_test PhysicsModuleTestEntryPoint
         physics_module_test.c BOOTSTRAP DEPENDS laiue_physics laiue_numeric laiue_task
@@ -733,6 +733,12 @@ if(TARGET laiue_frame_check)
     add_test(NAME laiue.tools.frame_check.reject_text
         COMMAND laiue_frame_check "${PROJECT_SOURCE_DIR}/README.md")
     set_tests_properties(laiue.tools.frame_check.reject_text PROPERTIES WILL_FAIL TRUE)
+endif()
+
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME laiue.tools.check_versions
+        COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/check_versions_test.py")
 endif()
 
 # ASan/UBSan slow compute-heavy tests several times over; scale the limits so

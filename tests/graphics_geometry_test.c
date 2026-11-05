@@ -1256,9 +1256,16 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
                device->setCamera != NULL &&
                (Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED) != 0u,
            "test backend supports real explicit capture");
-    if (backend == LAIUE_GRAPHICS_BACKEND_VULKAN_CORE)
+    // Слой профиля телефона, который не загрузился, загрузчик пропускает молча, и
+    // тест шёл бы на полном драйвере: выдаёт это только путь рисования.
+    char phoneProfile[8] = {0};
+    const bool renderPassExpected = PlatformGetEnvironmentUtf8("LAIUE_GRAPHICS_PHONE_PROFILE",
+                                                               phoneProfile,
+                                                               sizeof(phoneProfile)) != 0u &&
+                                    phoneProfile[0] == '1';
+    if (backend == LAIUE_GRAPHICS_BACKEND_VULKAN_CORE || renderPassExpected)
         Expect((Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING) == 0u,
-               "core Vulkan draws through render passes");
+               "Vulkan 1.1 draws through render passes");
     InitializeVertices();
     const LaiueGraphicsHandle vb =
         Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));

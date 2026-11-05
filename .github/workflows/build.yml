@@ -461,6 +461,7 @@ jobs:
           VK_KHRONOS_PROFILES_SIMULATE_CAPABILITIES: SIMULATE_API_VERSION_BIT,SIMULATE_FEATURES_BIT,SIMULATE_PROPERTIES_BIT,SIMULATE_EXTENSIONS_BIT,SIMULATE_FORMATS_BIT
           # Иначе слой сам включает VK_KHR_portability_subset, которого нет на Android.
           VK_KHRONOS_PROFILES_EMULATE_PORTABILITY: 'false'
+          LAIUE_GRAPHICS_PHONE_PROFILE: '1'
         run: |
           profiles="$RUNNER_TEMP/vulkan-profiles/share/vulkan/config/VK_LAYER_KHRONOS_profiles"
           for profile in VP_ANDROID_vulkan_profile_2022 VP_ANDROID_vulkan_profile_2025; do
@@ -644,6 +645,9 @@ jobs:
     env:
       LAIUE_ANDROID_IMAGE: android-37.0
       LAIUE_BUILD_TOOLS: 37.0.0
+      LAIUE_CMDLINE_TOOLS: '23.0'
+      LAIUE_EMULATOR: 37.2.13
+      LAIUE_EMULATOR_BUILD: 16740729
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install emulator runtime dependencies
@@ -676,7 +680,7 @@ jobs:
             "$RUNNER_TEMP/laiue-sdk-tools.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-sdk-tools.zip" -d "$RUNNER_TEMP/laiue-sdk-tools"
           tools="$RUNNER_TEMP/laiue-sdk-tools/cmdline-tools/bin"
-          grep -Fx 'Pkg.Revision=23.0' "$tools/../source.properties"
+          grep -Fx "Pkg.Revision=$LAIUE_CMDLINE_TOOLS" "$tools/../source.properties"
           for ((answer=0; answer<32; ++answer)); do printf 'y\n'; done \
             > "$RUNNER_TEMP/laiue-sdk-answers.txt"
           # Загрузка с dl.google.com изредка обрывается (Premature EOF), в том
@@ -699,14 +703,14 @@ jobs:
           test -f "$ndk/build/cmake/android.toolchain.cmake"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
           curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
-            https://dl.google.com/android/repository/emulator-linux_x64-16428233.zip \
+            "https://dl.google.com/android/repository/emulator-linux_x64-$LAIUE_EMULATOR_BUILD.zip" \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
-          printf 'b08fc43d8608d2955f607f1b287beb525041e730086bdca3af152accac3af9c1  %s\n' \
+          printf 'cbc7c3cfb83220b8a0f9c513fdab557712e74d339ec19ddffa43f23350ae9bdd  %s\n' \
             "$RUNNER_TEMP/laiue-emulator.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-emulator.zip" -d "$RUNNER_TEMP/laiue-pinned-emulator"
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"
-          grep -Fx 'Pkg.Revision=37.2.12' "$emulator/source.properties"
-          grep -Fx 'Pkg.BuildId=16428233' "$emulator/source.properties"
+          grep -Fx "Pkg.Revision=$LAIUE_EMULATOR" "$emulator/source.properties"
+          grep -Fx "Pkg.BuildId=$LAIUE_EMULATOR_BUILD" "$emulator/source.properties"
           "$emulator/emulator" -version >> build/android-runtime-results/tool-versions.txt
           printf '\nNDK: %s; build-tools: %s\n' "$ANDROID_NDK_VERSION" "$LAIUE_BUILD_TOOLS" \
             >> build/android-runtime-results/tool-versions.txt
@@ -883,8 +887,17 @@ jobs:
           # Телефон забирает окно у программы при каждом уходе в фон. Устройство
           # меняет поверхность на месте, без пересоздания: на экран должна
           # вернуться та же картинка, а не только новый кадр в цепочке.
+          # Снимок двумя файлами: PNG для человека, сырой для сравнения. Система
+          # подстраивает полоску жеста под фон, и та расходится на единицу яркости,
+          # поэтому сравниваются только строки выше неё, от заголовка в 16 байт.
           shot() {
-            timeout 15s "$adb" -s emulator-5554 exec-out screencap -p > "$1"
+            timeout 15s "$adb" -s emulator-5554 exec-out screencap > "$1.raw" \
+              && timeout 15s "$adb" -s emulator-5554 exec-out screencap -p > "$1"
+          }
+          same_picture() {
+            local width height
+            read -r width height < <(od -An -tu4 -N8 "$1.raw")
+            cmp -s -n "$((16 + width * 4 * (height - height / 16)))" "$1.raw" "$2.raw"
           }
           before=build/android-runtime-results/viewer-before.png
           settled=build/android-runtime-results/viewer-settled.png
@@ -892,7 +905,7 @@ jobs:
           after=build/android-runtime-results/viewer-after.png
           timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
             || fail "the viewer did not start to stay"
-          until shot "$before" && sleep 1 && shot "$settled" && cmp -s "$before" "$settled"; do
+          until shot "$before" && sleep 1 && shot "$settled" && same_picture "$before" "$settled"; do
             if [ "$SECONDS" -ge "$deadline" ]; then fail "the viewer did not settle"; fi
           done
           timeout 10s "$adb" -s emulator-5554 logcat -d -s dev.laiue.viewer:V > "$log"
@@ -901,11 +914,11 @@ jobs:
           timeout 10s "$adb" -s emulator-5554 shell input keyevent KEYCODE_HOME
           expect_lines 'viewer: the surface is gone' "$((gone + 1))"
           shot "$home"
-          if cmp -s "$before" "$home"; then fail "the picture stayed on the screen after HOME"; fi
+          if same_picture "$before" "$home"; then fail "the picture stayed on the screen after HOME"; fi
           timeout 30s "$adb" -s emulator-5554 shell am start -W -n "$viewer" \
             || fail "the viewer did not come back"
           expect_lines 'viewer: the surface is back' "$((back + 1))"
-          until shot "$after" && cmp -s "$before" "$after"; do
+          until shot "$after" && same_picture "$before" "$after"; do
             if [ "$SECONDS" -ge "$deadline" ]; then fail "the picture did not come back"; fi
             sleep 1
           done
