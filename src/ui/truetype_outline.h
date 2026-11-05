@@ -29,6 +29,10 @@ typedef struct TrueTypeOutlineCounts
     uint32_t contourCount;
 } TrueTypeOutlineCounts;
 
+// Проверяет тот же packed layout, что Read, без записи точек и contour ends.
+// Пустой/simple glyph допустим; composite возвращает false; ошибка сохраняет out.
+bool TrueTypeSimpleOutlineMeasure(TrueTypeSpan glyph, TrueTypeOutlineCounts *out);
+
 // Внутренний decoder простого glyf: целые font design units, без hinting.
 // Пустой span и нулевые контуры допустимы; composite возвращает false.
 // Максимум 16384 точек и 4096 контуров. Буферы принадлежат вызывающему;
