@@ -193,7 +193,7 @@ function Save-Capture {
 
 function Latest-Presentation {
     param([string]$Log)
-    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
+    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+) direct=(\d)')
     if ($items.Count -eq 0) { throw 'No presented native frame was reported.' }
     return $items[$items.Count - 1]
 }
@@ -404,6 +404,8 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $portraitFrame = Latest-Presentation -Log $portraitLog
+    # The surface reports its old size during a turn: the chain must still fit the window.
+    if ($portraitFrame.Groups[3].Value -ne '1') { throw 'The portrait frame did not go straight into the chain.' }
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
         -NativeHeight ([int]$portraitFrame.Groups[2].Value)
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
@@ -419,10 +421,17 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $landscapeFrame = Latest-Presentation -Log $landscapeLog
+    if ($landscapeFrame.Groups[3].Value -ne '1') { throw 'The landscape frame did not go straight into the chain.' }
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
         -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
     if (-not $landscape.imageCheck.skyAboveGround) { throw 'The landscape frame is upside down.' }
+    # The same world in both orientations: a turn must not change its colours.
+    foreach ($channel in @('skyRed', 'skyGreen', 'skyBlue')) {
+        if ([math]::Abs($portrait.imageCheck.$channel - $landscape.imageCheck.$channel) -gt 3) {
+            throw "Portrait and landscape disagree in ${channel}: $($portrait.imageCheck.$channel) against $($landscape.imageCheck.$channel)."
+        }
+    }
     if ((Gameplay-State -Log $portraitLog -Event 'presented') -ne $gameplayState -or
         (Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
         throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'

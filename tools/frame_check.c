@@ -143,6 +143,9 @@ static int CheckFrame(const char *path)
     const bool skyAboveGround =
         BlueOverGreen(decoded, &info, info.height / 5u, info.height * 3u / 10u) > 0 &&
         BlueOverGreen(decoded, &info, info.height * 3u / 4u, info.height * 17u / 20u) < 0;
+    const uint8_t *sky =
+        decoded + (size_t)(info.height / 5u) * pitch + (size_t)(info.width / 2u) * 4u;
+    const uint32_t skyColor[3] = {sky[0], sky[1], sky[2]};
     PlatformFree(decoded);
     if (!inspected)
         return Failure("invalid_viewport");
@@ -173,6 +176,12 @@ static int CheckFrame(const char *path)
     Append(&message, ",\"viewportHeight\":");
     Number(&message, bottom - top);
     Append(&message, skyAboveGround ? ",\"skyAboveGround\":true" : ",\"skyAboveGround\":false");
+    Append(&message, ",\"skyRed\":");
+    Number(&message, skyColor[0]);
+    Append(&message, ",\"skyGreen\":");
+    Number(&message, skyColor[1]);
+    Append(&message, ",\"skyBlue\":");
+    Number(&message, skyColor[2]);
     Append(&message, "}\n");
     PlatformWriteConsoleUtf8(message.text);
     return useful ? 0 : 1;

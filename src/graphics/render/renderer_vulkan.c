@@ -2828,27 +2828,20 @@ static bool SwapchainCreate(Renderer *renderer, int32_t width, int32_t height)
                                                   &capabilities) != VK_SUCCESS)
         return false;
 
-    VkExtent2D extent;
-    if (capabilities.currentExtent.width != UINT32_MAX &&
-        capabilities.currentExtent.height != UINT32_MAX)
-    {
-        extent = capabilities.currentExtent;
-    }
-    else
-    {
-        uint32_t clampedWidth = width > 0 ? (uint32_t)width : 1u;
-        uint32_t clampedHeight = height > 0 ? (uint32_t)height : 1u;
-        if (clampedWidth < capabilities.minImageExtent.width)
-            clampedWidth = capabilities.minImageExtent.width;
-        if (clampedWidth > capabilities.maxImageExtent.width)
-            clampedWidth = capabilities.maxImageExtent.width;
-        if (clampedHeight < capabilities.minImageExtent.height)
-            clampedHeight = capabilities.minImageExtent.height;
-        if (clampedHeight > capabilities.maxImageExtent.height)
-            clampedHeight = capabilities.maxImageExtent.height;
-        extent.width = clampedWidth;
-        extent.height = clampedHeight;
-    }
+    // Размер цепочки — размер окна. Где поверхность не даёт его выбрать (Win32, X11),
+    // её минимум и максимум равны её размеру. currentExtent брать нельзя: при
+    // повороте Android ещё отдаёт старый, и цепочка вышла бы другой формы, чем окно.
+    uint32_t clampedWidth = width > 0 ? (uint32_t)width : 1u;
+    uint32_t clampedHeight = height > 0 ? (uint32_t)height : 1u;
+    if (clampedWidth < capabilities.minImageExtent.width)
+        clampedWidth = capabilities.minImageExtent.width;
+    if (clampedWidth > capabilities.maxImageExtent.width)
+        clampedWidth = capabilities.maxImageExtent.width;
+    if (clampedHeight < capabilities.minImageExtent.height)
+        clampedHeight = capabilities.minImageExtent.height;
+    if (clampedHeight > capabilities.maxImageExtent.height)
+        clampedHeight = capabilities.maxImageExtent.height;
+    VkExtent2D extent = {clampedWidth, clampedHeight};
     if (extent.width == 0u || extent.height == 0u) return false;
 
     VkSurfaceFormatKHR surfaceFormat;
