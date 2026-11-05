@@ -99,6 +99,15 @@ static int32_t TtoDelta(const uint8_t *bytes, size_t *position, uint8_t flags, u
     return value < 32768u ? (int32_t)value : (int32_t)value - 65536;
 }
 
+bool TrueTypeSimpleOutlineMeasure(TrueTypeSpan glyph, TrueTypeOutlineCounts *out)
+{
+    TrueTypeSimpleLayout layout = {0};
+    if (out == NULL || !TtoMeasure(glyph, &layout))
+        return false;
+    *out = layout.counts;
+    return true;
+}
+
 bool TrueTypeSimpleOutlineRead(TrueTypeSpan glyph, TrueTypeOutlineStorage storage,
                                TrueTypeOutlineCounts *out)
 {
