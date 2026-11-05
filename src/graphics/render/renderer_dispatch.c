@@ -84,7 +84,8 @@ extern bool RendererReloadShaders_D3D12(Renderer* renderer, const void* chunkVS,
 #endif
 
 #if defined(LAIUE_RENDER_HAS_VULKAN)
-extern Renderer* RendererCreate_Vulkan(void* windowHandle, int32_t width, int32_t height);
+extern Renderer *RendererCreate_Vulkan(void *windowHandle, int32_t width, int32_t height,
+                                       bool coreOnly);
 extern void RendererDestroy_Vulkan(Renderer* renderer);
 extern bool RendererSetMaterialNames_Vulkan(Renderer *renderer, const wchar_t *const *names, uint32_t count);
 extern bool RendererPrepareWorldFrom_Vulkan(Renderer *renderer, LaiueContentCatalog *catalog);
@@ -170,7 +171,9 @@ bool RendererBackendIsAvailable(RendererBackendKind backend)
     case RENDERER_BACKEND_D3D12: return true;
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
-    case RENDERER_BACKEND_VULKAN: return true;
+    case RENDERER_BACKEND_VULKAN:
+    case RENDERER_BACKEND_VULKAN_CORE:
+        return true;
 #endif
     default: return false;
     }
@@ -199,7 +202,9 @@ Renderer* RendererCreateWithBackend(void* windowHandle, int32_t width, int32_t h
 #endif
 #if defined(LAIUE_RENDER_HAS_VULKAN)
     case RENDERER_BACKEND_VULKAN:
-        renderer = RendererCreate_Vulkan(windowHandle, width, height);
+    case RENDERER_BACKEND_VULKAN_CORE:
+        renderer = RendererCreate_Vulkan(windowHandle, width, height,
+                                         backend == RENDERER_BACKEND_VULKAN_CORE);
         break;
 #endif
     default:

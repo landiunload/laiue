@@ -103,6 +103,9 @@ typedef uint32_t (*LaiueGraphicsV2EndFrameFn)(LaiueGraphicsDeviceV2 *);
 // The last frame was drawn turned the way a rotated screen keeps its images, so
 // the system has nothing left to rotate when it shows the frame.
 #define LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED (1u << 7)
+// The device draws with dynamic rendering. Without the flag a Vulkan device uses
+// render passes, as every phone below Vulkan 1.3 does.
+#define LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING (1u << 8)
 
 typedef struct LaiueGraphicsDiagnosticsV2
 {

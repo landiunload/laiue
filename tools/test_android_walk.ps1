@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Apk,
     [Parameter(Mandatory = $true)][string]$FrameCheckExe,
     [Parameter(Mandatory = $true)][string]$OutputDir,
-    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180
+    [ValidateRange(60, 1800)][int]$TimeoutSeconds = 180,
+    # The whole run on core Vulkan 1.1, the path of a phone below Vulkan 1.3.
+    [switch]$VulkanCore
 )
 
 # A real Activity/swapchain test: NDK build success cannot replace runtime.
@@ -360,7 +362,8 @@ try {
     # presentation differs from the natural orientation.
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '1') | Out-Null
     Invoke-Adb -Arguments @('shell', 'am', 'start', '-W', '-n', $component,
-        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId") | Out-Null
+        '--ez', 'laiueScenario', 'true', '--ei', 'laiueScenarioRunId', "$runId",
+        '--ez', 'laiueVulkanCore', $(if ($VulkanCore) { 'true' } else { 'false' })) | Out-Null
     $appProcessId = Invoke-Adb -Arguments @('shell', 'pidof', $package)
     if ($appProcessId -notmatch '^\d+$') { throw 'NativeActivity did not retain a running application process.' }
 
@@ -394,6 +397,9 @@ try {
     # The screen is rotated here: a frame the system still has to turn costs a phone a pass.
     if ($summary -notmatch ' swapchain_turned_frames=[1-9]') {
         throw "No frame was drawn turned for the rotated screen: $summary"
+    }
+    if ($VulkanCore -and $summary -notmatch ' dynamic_rendering_frames=0 ') {
+        throw "The core Vulkan run used dynamic rendering: $summary"
     }
     $gameplayState = Gameplay-State -Log $log -Event 'summary'
 

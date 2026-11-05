@@ -29,6 +29,8 @@ typedef struct RendererStats
     // Vulkan: проходы кадра по его цели. Каждый лишний проход тайловый GPU оплачивает
     // записью всего кадра в память и чтением обратно.
     uint32_t targetPasses;
+    // Vulkan: кадр рисуется через dynamic rendering, а не render pass.
+    bool dynamicRendering;
 } RendererStats;
 
 // Latest completed GPU frame interval. Results are delayed until the backend's
@@ -84,6 +86,9 @@ typedef enum RendererBackendKind
     RENDERER_BACKEND_AUTO = 0,
     RENDERER_BACKEND_D3D12 = 1,
     RENDERER_BACKEND_VULKAN = 2,
+    // Vulkan только с ядром 1.1 и без необязательных расширений, как на самом
+    // старом телефоне. RendererGetBackend отвечает RENDERER_BACKEND_VULKAN.
+    RENDERER_BACKEND_VULKAN_CORE = 3,
 } RendererBackendKind;
 
 // Есть ли этот бэкенд в данной сборке (слинкован ли он вообще).

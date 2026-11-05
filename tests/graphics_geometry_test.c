@@ -27,6 +27,9 @@
 #define RENDER_MODULE_NAME L"liblaiue_render.so"
 #endif
 
+#ifndef LAIUE_GRAPHICS_TEST_VULKAN_BACKEND
+#define LAIUE_GRAPHICS_TEST_VULKAN_BACKEND LAIUE_GRAPHICS_BACKEND_VULKAN
+#endif
 #ifndef LAIUE_GRAPHICS_TEST_D3D12
 #define LAIUE_GRAPHICS_TEST_D3D12 0
 #endif
@@ -805,13 +808,20 @@ static void InvalidGeometry(LaiueGraphicsDeviceV2 *device, LaiueGraphicsDeviceV2
     device->destroyHandle(device, replacement);
     other->destroyHandle(other, foreign);
 
-    const uint32_t invalidIndex = UINT32_MAX;
+    uint32_t invalidIndex = UINT32_MAX;
     LaiueGraphicsBufferUploadV1 patch = {.structSize = sizeof(patch),
                                          .buffer = ib,
                                          .data = &invalidIndex,
                                          .sizeBytes = sizeof(invalidIndex)};
-    Expect(device->uploadBuffer(device, &patch) != 0u,
-           "index bytes may upload before range validation");
+    if (device->uploadBuffer(device, &patch) == 0u)
+    {
+        // Спецификация обещает значения индексов только до 2^24 - 1: драйвер с таким
+        // пределом не примет большее уже при загрузке.
+        Expect(!LAIUE_GRAPHICS_TEST_D3D12, "only Vulkan may limit raw index values");
+        invalidIndex = UINT32_C(0x00ffffff);
+        Expect(device->uploadBuffer(device, &patch) != 0u,
+               "index bytes may upload before range validation");
+    }
     Begin(device);
     Reject(device, &item, "out-of-range uint32 element is rejected against the selected VB");
     Capture(device, 0u);
@@ -1134,7 +1144,7 @@ static void WindowedFrames(const LaiueGraphicsDeviceServiceV2 *service)
     Expect(window != NULL, "the swap chain has a hidden HWND");
     LaiueGraphicsDeviceV2 *device = NULL;
     Expect(service->createDeviceWithContext(service->context, window, FRAME_WIDTH, FRAME_HEIGHT,
-                                            LAIUE_GRAPHICS_BACKEND_VULKAN, &device) != 0u,
+                                            LAIUE_GRAPHICS_TEST_VULKAN_BACKEND, &device) != 0u,
            "a device draws to the window");
     const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
                                               spillVertices, (uint32_t)sizeof(spillVertices));
@@ -1226,8 +1236,8 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
     window = CreateTestWindow();
     Expect(window != NULL, "native D3D12 capture has a real hidden HWND");
 #endif
-    const uint32_t backend =
-        LAIUE_GRAPHICS_TEST_D3D12 ? LAIUE_GRAPHICS_BACKEND_D3D12 : LAIUE_GRAPHICS_BACKEND_VULKAN;
+    const uint32_t backend = LAIUE_GRAPHICS_TEST_D3D12 ? LAIUE_GRAPHICS_BACKEND_D3D12
+                                                       : LAIUE_GRAPHICS_TEST_VULKAN_BACKEND;
     LaiueGraphicsDeviceV2 *device = NULL;
     if (!service->createDeviceWithContext(service->context, window, FRAME_WIDTH, FRAME_HEIGHT,
                                           backend, &device))
@@ -1246,6 +1256,9 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
                device->setCamera != NULL &&
                (Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED) != 0u,
            "test backend supports real explicit capture");
+    if (backend == LAIUE_GRAPHICS_BACKEND_VULKAN_CORE)
+        Expect((Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING) == 0u,
+               "core Vulkan draws through render passes");
     InitializeVertices();
     const LaiueGraphicsHandle vb =
         Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));

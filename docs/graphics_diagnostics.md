@@ -42,6 +42,10 @@ render targets, драйверные allocations и временные ресу�
 `DRAWS_INTO_SWAPCHAIN`. Камере, интерфейсу, вводу и `readbackFrame` поворот не
 виден: они работают в координатах окна.
 
+`DYNAMIC_RENDERING` означает, что устройство рисует через dynamic rendering.
+Без него Vulkan идёт через render pass: так работает любой телефон ниже Vulkan
+1.3 и устройство, созданное с `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE`.
+
 `resourceHandleCount` — число живых handle этого устройства всех типов.
 `cpuShadowBytes` — сумма запрошенных размеров живых копий буферов и
 шейдеров в façade; вершинные буферы копий не имеют. Сам объект устройства,
