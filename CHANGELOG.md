@@ -5,6 +5,11 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- On Android a swap chain built during a turn of the screen takes the size of
+  the window. The surface still reports its old size at that moment, so since
+  the frame went straight into the chain a turn to portrait left a chain of the
+  wrong shape: every frame was stretched into it with one more copy, and the
+  emulator showed it one gamma step too dark. It stayed so until the next resize.
 - On Android a frame is drawn already turned for a rotated screen, so the system
   no longer rotates every frame of a game held in landscape, which often means
   one more GPU pass over the screen. The camera, the interface, input and

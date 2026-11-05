@@ -617,14 +617,17 @@ static void AndroidScenarioFrame(AndroidWalkState *state, double started, bool p
         __android_log_print(
             ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
             "LAIUE_SCENARIO event=presented run=%u generation=%u frame=%u width=%d height=%d "
-            "game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f first_person=%u material=%u "
+            "direct=%u turned=%u game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f "
+            "first_person=%u material=%u "
             "root_block_x=%lld root_block_y=%lld root_block_z=%lld "
             "root_fraction_x=%.9f root_fraction_y=%.9f root_fraction_z=%.9f "
             "provider_frame_x=%lld provider_frame_y=%lld provider_frame_z=%lld",
             state->scenarioRunId, state->scenarioGeneration, state->scenarioFrames, state->width,
-            state->height, (unsigned long long)state->game.tick,
-            (unsigned long long)state->game.revision, state->game.camera.yaw,
-            state->game.camera.pitch, state->game.firstPerson ? 1u : 0u,
+            state->height,
+            (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u ? 1u : 0u,
+            (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED) != 0u ? 1u : 0u,
+            (unsigned long long)state->game.tick, (unsigned long long)state->game.revision,
+            state->game.camera.yaw, state->game.camera.pitch, state->game.firstPerson ? 1u : 0u,
             (uint32_t)state->game.selectedMaterial, (long long)spatial.centerBlock[0],
             (long long)spatial.centerBlock[1], (long long)spatial.centerBlock[2],
             spatial.rootFraction[0], spatial.rootFraction[1], spatial.rootFraction[2],

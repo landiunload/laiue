@@ -132,7 +132,7 @@ function Wait-Log {
 }
 
 function Save-Capture {
-    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0)
+    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0, [switch]$Upright)
     if ($Name -notmatch '^[a-zA-Z0-9_-]+$' -or $NativeWidth -le 0 -or $NativeHeight -le 0) {
         throw 'Invalid screenshot checkpoint metadata.'
     }
@@ -173,6 +173,10 @@ function Save-Capture {
             # same orientation.
             $problem = "Native surface ${NativeWidth}x$NativeHeight and screenshot " +
                 "$($image.width)x$($image.height) disagree for $Name."
+        } elseif ($Upright -and -not $image.skyAboveGround) {
+            # After a turn the screen keeps the last frame of the old orientation,
+            # rotated, until it takes the new one.
+            $problem = "The sky is not above the ground in $Name."
         } else {
             $problem = $null
         }
@@ -193,7 +197,7 @@ function Save-Capture {
 
 function Latest-Presentation {
     param([string]$Log)
-    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+)')
+    $items = [regex]::Matches($Log, 'event=presented run=\d+ generation=\d+ frame=\d+ width=(\d+) height=(\d+) direct=(\d)')
     if ($items.Count -eq 0) { throw 'No presented native frame was reported.' }
     return $items[$items.Count - 1]
 }
@@ -404,10 +408,11 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $portraitFrame = Latest-Presentation -Log $portraitLog
+    # The surface reports its old size during a turn: the chain must still fit the window.
+    if ($portraitFrame.Groups[3].Value -ne '1') { throw 'The portrait frame did not go straight into the chain.' }
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
-        -NativeHeight ([int]$portraitFrame.Groups[2].Value)
+        -NativeHeight ([int]$portraitFrame.Groups[2].Value) -Upright
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
-    if (-not $portrait.imageCheck.skyAboveGround) { throw 'The portrait frame is upside down.' }
     $priorPresented = ([regex]::Matches($portraitLog, 'event=presented ')).Count
     # The scenario ran in the other landscape: this one takes the opposite turn.
     Invoke-Adb -Arguments @('shell', 'settings', 'put', 'system', 'user_rotation', '3') | Out-Null
@@ -419,10 +424,16 @@ try {
                [int]$presented[$presented.Count - 1].Groups[2].Value
     }
     $landscapeFrame = Latest-Presentation -Log $landscapeLog
+    if ($landscapeFrame.Groups[3].Value -ne '1') { throw 'The landscape frame did not go straight into the chain.' }
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
-        -NativeHeight ([int]$landscapeFrame.Groups[2].Value)
+        -NativeHeight ([int]$landscapeFrame.Groups[2].Value) -Upright
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
-    if (-not $landscape.imageCheck.skyAboveGround) { throw 'The landscape frame is upside down.' }
+    # The same world in both orientations: a turn must not change its colours.
+    foreach ($channel in @('skyRed', 'skyGreen', 'skyBlue')) {
+        if ([math]::Abs($portrait.imageCheck.$channel - $landscape.imageCheck.$channel) -gt 3) {
+            throw "Portrait and landscape disagree in ${channel}: $($portrait.imageCheck.$channel) against $($landscape.imageCheck.$channel)."
+        }
+    }
     if ((Gameplay-State -Log $portraitLog -Event 'presented') -ne $gameplayState -or
         (Gameplay-State -Log $landscapeLog -Event 'presented') -ne $gameplayState) {
         throw 'Rotation changed the held gameplay pose, world frame, camera or session revision.'
@@ -452,8 +463,9 @@ try {
                $presented[$presented.Count - 1].Index -gt $gained[$gained.Count - 1].Index
     }
     $resumedFrame = Latest-Presentation -Log $resumedLog
+    # A presented frame is not yet a frame on the screen: the launcher may still be there.
     Save-Capture -Name 'resumed' -NativeWidth ([int]$resumedFrame.Groups[1].Value) `
-        -NativeHeight ([int]$resumedFrame.Groups[2].Value) | Out-Null
+        -NativeHeight ([int]$resumedFrame.Groups[2].Value) -Upright | Out-Null
     if ((Gameplay-State -Log $resumedLog -Event 'presented') -ne $gameplayState) {
         throw 'HOME/resume changed the held gameplay pose, world frame, camera or session revision.'
     }
