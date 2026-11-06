@@ -535,6 +535,9 @@ if(TARGET laiue_ui)
     laiue_add_harness(laiue_truetype_xy_test TrueTypeXYTestEntryPoint
         truetype_xy_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
         TEST laiue.ui.truetype_xy)
+    laiue_add_harness(laiue_truetype_edges_test TrueTypeEdgesTestEntryPoint
+        truetype_edges_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_edges)
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно
