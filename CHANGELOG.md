@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The Android walk check no longer fails on its own timing. It compares a picture
+  after a turn only once the screen has come to rest, and it answers the system's
+  "not responding" dialog about another process, which took the focus the scenario
+  runs on. A dialog about the program itself still fails the run.
 - A weekly workflow compares every pinned tool, SDK, Android package and GitHub
   action with the newest stable release, and only that workflow turns red when
   one falls behind. `tools/check_versions.py` does the comparison.
