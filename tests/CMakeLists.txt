@@ -163,6 +163,37 @@ laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
     navigation_failure_test.c $<TARGET_OBJECTS:laiue_navigation_failure_subject>
     STATIC TEST laiue.navigation.allocation_failure TIMEOUT 60)
 
+# Net. The primitives are internal, so their test compiles the source itself.
+laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC TEST laiue.net.crypto TIMEOUT 120)
+laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
+    LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
+if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))
+    laiue_add_harness(laiue_net_udp_test NetUdpTestEntryPoint net_udp_test.c
+        LIBRARIES laiue::net laiue::platform_support TEST laiue.net.udp TIMEOUT 120)
+endif()
+# Allocation faults are injected only into copies of the endpoint sources; the
+# simulator keeps the real allocator, so the network itself never fails.
+set(laiue_net_failure_sources)
+foreach(source net_crypto net_wire net_address net_channel net_packet net_handshake net_endpoint)
+    configure_file("${laiue_src}/net/${source}.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c" COPYONLY)
+    list(APPEND laiue_net_failure_sources "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c")
+endforeach()
+add_library(laiue_net_failure_subject OBJECT ${laiue_net_failure_sources})
+target_link_libraries(laiue_net_failure_subject PRIVATE laiue_common)
+target_compile_definitions(laiue_net_failure_subject PRIVATE
+    LAIUE_STATIC=1
+    PlatformAllocate=NetTestAllocate PlatformReallocate=NetTestReallocate
+    PlatformFree=NetTestFree)
+laiue_add_harness(laiue_net_failure_test NetFailureTestEntryPoint net_failure_test.c
+    "${laiue_src}/net/net_simulator.c" $<TARGET_OBJECTS:laiue_net_failure_subject>
+    STATIC TEST laiue.net.allocation_failure TIMEOUT 300)
+# The socketless stub is checked everywhere, not only where the build picks it.
+laiue_add_harness(laiue_net_udp_none_test NetUdpNoneTestEntryPoint net_udp_none_test.c
+    "${laiue_src}/net/net_udp_none.c" "${laiue_src}/net/net_address.c"
+    STATIC INCLUDES "${laiue_src}" TEST laiue.net.udp_none)
+
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c
     LIBRARIES laiue_numeric TEST laiue.numeric.infinite_coord)

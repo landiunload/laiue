@@ -62,7 +62,7 @@ void NetX25519Public(const uint8_t privateKey[NET_KEY_SIZE], uint8_t publicKey[N
 #define NET_HMAC_MESSAGE_CAPACITY 256u
 bool NetHmacSha256(const uint8_t *key, size_t keySize, const uint8_t *message, size_t size,
                    uint8_t output[NET_HASH_SIZE]);
-/* HKDF-Extract и однoблочный HKDF-Expand: до 32 байт на метку. */
+/* HKDF-Extract и одноблочный HKDF-Expand: до 32 байт на метку. */
 bool NetHkdfExtract(const uint8_t *salt, size_t saltSize, const uint8_t *input, size_t inputSize,
                     uint8_t prk[NET_HASH_SIZE]);
 bool NetHkdfExpand(const uint8_t prk[NET_HASH_SIZE], const char *label,

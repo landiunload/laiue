@@ -60,6 +60,9 @@ set(LAIUE_PLATFORM_ADAPTER_TARGET "" CACHE STRING
 set(LAIUE_PRECISE_FP_TARGET "" CACHE STRING
     "External interface target providing deterministic strict-FP flags")
 set(LAIUE_ADAPTER_USE_ENGINE_BUILD_OPTIONS OFF)
+# An adapter that also implements src/platform/socket.h turns this on; without
+# it laiue.net keeps the transport and reports its UDP driver as unsupported.
+set(LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS OFF)
 
 if(LAIUE_PLATFORM_EXTERNAL)
     if(LAIUE_EXTERNAL_PLATFORM_FILE STREQUAL "" OR

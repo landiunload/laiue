@@ -486,6 +486,12 @@ platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указа�
 модули статические, динамический native-код модов выключен, а SDK export
 принадлежит родительскому superbuild.
 
+Сокеты в обязательный контракт не входят. Adapter, который реализует и
+`src/platform/socket.h`, включает `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`, и
+`laiue.net` собирает свой драйвер UDP. Без этого транспорт остаётся,
+`LaiueNetUdpOpen` отвечает `LAIUE_NET_UNSUPPORTED`, а сеть платформы
+подключается собственным `LaiueNetDriverV1`.
+
 Публичный `linux-external-port-smoke` проверяет именно эту границу, static
 link и core-тесты. Он использует тестовый Linux adapter и не является
 эмуляцией консоли. Реальный toolchain file, backend, SDK,

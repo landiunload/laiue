@@ -59,7 +59,7 @@ static void ChaChaSetup(uint32_t state[16], const uint8_t key[NET_KEY_SIZE], uin
     state[1] = UINT32_C(0x3320646e);
     state[2] = UINT32_C(0x79622d32);
     state[3] = UINT32_C(0x6b206574);
-    for (uint32_t index = 0u; index < 8u; ++index)
+    for (size_t index = 0u; index < 8u; ++index)
         state[4u + index] = Load32(key + index * 4u);
     state[12] = counter;
     state[13] = Load32(nonce);
@@ -82,7 +82,7 @@ static void ChaChaBlock(const uint32_t state[16], uint8_t output[64])
         QUARTER_ROUND(2, 7, 8, 13);
         QUARTER_ROUND(3, 4, 9, 14);
     }
-    for (uint32_t index = 0u; index < 16u; ++index)
+    for (size_t index = 0u; index < 16u; ++index)
         Store32(output + index * 4u, x[index] + state[index]);
 }
 
@@ -149,7 +149,7 @@ void NetPoly1305Begin(NetPoly1305 *state, const uint8_t key[NET_KEY_SIZE])
     state->r[4] = t3 >> 8u;
     for (uint32_t index = 0u; index < 5u; ++index)
         state->h[index] = 0u;
-    for (uint32_t index = 0u; index < 4u; ++index)
+    for (size_t index = 0u; index < 4u; ++index)
         state->pad[index] = Load32(key + 16u + index * 4u);
     state->buffered = 0u;
     NetWipe(r, sizeof(r));
@@ -414,7 +414,7 @@ static void FieldInvert(Field output, const Field value)
 
 static void FieldUnpack(Field output, const uint8_t bytes[NET_KEY_SIZE])
 {
-    for (uint32_t index = 0u; index < 16u; ++index)
+    for (size_t index = 0u; index < 16u; ++index)
         output[index] = (uint64_t)bytes[index * 2u] | ((uint64_t)bytes[index * 2u + 1u] << 8u);
     /* Старший бит u-координаты не используется. */
     output[15] &= 0x7FFFu;
@@ -444,7 +444,7 @@ static void FieldPack(uint8_t bytes[NET_KEY_SIZE], const Field value)
         for (uint32_t index = 0u; index < 16u; ++index)
             reduced[index] = (reduced[index] & ~take) | (lowered[index] & take);
     }
-    for (uint32_t index = 0u; index < 16u; ++index)
+    for (size_t index = 0u; index < 16u; ++index)
     {
         bytes[index * 2u] = (uint8_t)reduced[index];
         bytes[index * 2u + 1u] = (uint8_t)(reduced[index] >> 8u);

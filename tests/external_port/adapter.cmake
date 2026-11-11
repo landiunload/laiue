@@ -7,6 +7,8 @@ find_package(Threads REQUIRED)
 set(_laiue_external_mock_root "${CMAKE_CURRENT_LIST_DIR}/../..")
 add_library(laiue_external_mock_adapter STATIC
     "${_laiue_external_mock_root}/src/platform/system_posix.c"
+    "${_laiue_external_mock_root}/src/platform/socket_posix.c"
+    "${_laiue_external_mock_root}/src/platform/socket.h"
     "${_laiue_external_mock_root}/src/platform/sha256.c"
     "${_laiue_external_mock_root}/src/platform/sha256.h"
     "${_laiue_external_mock_root}/src/platform/system.h")
@@ -24,3 +26,4 @@ target_compile_options(laiue_external_mock_precise_fp INTERFACE
 set(LAIUE_PLATFORM_ADAPTER_TARGET laiue_external_mock_adapter)
 set(LAIUE_PRECISE_FP_TARGET laiue_external_mock_precise_fp)
 set(LAIUE_ADAPTER_USE_ENGINE_BUILD_OPTIONS ON)
+set(LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS ON)

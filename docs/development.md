@@ -337,6 +337,7 @@ World origin не заменяет render origin. До преобразован�
 - [физика](physics.md)
 - [сохранения](persist.md)
 - [навигация](navigation.md)
+- [сетевой транспорт](net.md)
 - [диагностика и чистота релиза](diagnostics.md)
 - [аудио](audio.md)
 

@@ -38,11 +38,13 @@ else()
     if(LAIUE_PLATFORM_WINDOWS)
         set(laiue_platform_system_sources
             system_windows.c
+            socket_windows.c
             efficiency_windows.c
             efficiency_windows.h)
     else()
         set(laiue_platform_system_sources
             system_posix.c
+            socket_posix.c
             sha256.c
             sha256.h)
         find_package(Threads REQUIRED)
@@ -55,6 +57,7 @@ else()
     # become part of the public module ABI.
     add_library(laiue_platform_support STATIC
         ${laiue_platform_system_sources}
+        socket.h
         system.h)
     target_link_libraries(laiue_platform_support
         PRIVATE laiue::build_options)
@@ -70,7 +73,7 @@ else()
 
     if(LAIUE_PLATFORM_WINDOWS)
         target_link_libraries(laiue_platform_support
-            PUBLIC kernel32 bcrypt)
+            PUBLIC kernel32 bcrypt ws2_32)
     elseif(APPLE)
         target_link_libraries(laiue_platform_support
             PUBLIC Threads::Threads ${LAIUE_SECURITY_FRAMEWORK} ${CMAKE_DL_LIBS})
