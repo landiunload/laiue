@@ -97,6 +97,13 @@ if(laiue_shared_modules AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
     endif()
 endif()
 
+# memset, memcpy, memmove and memcmp of the Windows no-CRT runtime; other
+# platforms take them from libc.
+if(LAIUE_PLATFORM_WINDOWS)
+    laiue_add_harness(laiue_runtime_memory_test RuntimeMemoryTestEntryPoint
+        runtime_memory_test.c TEST laiue.runtime.memory TIMEOUT 60)
+endif()
+
 # Platform.
 laiue_add_harness(laiue_platform_crypto_test PlatformCryptoTestEntry platform_crypto_test.c
     TEST laiue.platform.crypto)
