@@ -868,6 +868,70 @@ static CRYPTO_TEST_NOINLINE void TestChaCha20Groups(void)
     }
 }
 
+/* AEAD совпадает с построением RFC 8439 из уже сверенных частей на всех
+ * длинах вокруг групп блоков: ключ MAC и начало потока там считаются вместе. */
+static CRYPTO_TEST_NOINLINE void TestAeadAgainstParts(void)
+{
+    static uint8_t text[1300];
+    static uint8_t expected[1300];
+    static uint8_t actual[1300];
+    static uint8_t opened[1300];
+    static const uint8_t zeros[16] = {0u};
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t nonce[NET_NONCE_SIZE];
+    uint8_t aad[40];
+    uint8_t block[64];
+    uint8_t lengths[16];
+    uint8_t expectedTag[NET_TAG_SIZE];
+    uint8_t tag[NET_TAG_SIZE];
+    for (uint32_t size = 0u; size <= sizeof(text); size += size < 600u ? 1u : 7u)
+    {
+        FillRandom(key, sizeof(key));
+        FillRandom(nonce, sizeof(nonce));
+        const uint32_t aadSize = (uint32_t)(NextRandom() % (sizeof(aad) + 1u));
+        FillRandom(aad, aadSize);
+        FillRandom(text, size);
+        NetChaCha20Xor(key, 1u, nonce, text, expected, size);
+        NetChaCha20Block(key, 0u, nonce, block);
+        NetPoly1305 mac;
+        NetPoly1305Begin(&mac, block);
+        NetPoly1305Update(&mac, aad, aadSize);
+        NetPoly1305Update(&mac, zeros, (16u - aadSize % 16u) % 16u);
+        NetPoly1305Update(&mac, expected, size);
+        NetPoly1305Update(&mac, zeros, (16u - size % 16u) % 16u);
+        for (uint32_t index = 0u; index < 8u; ++index)
+        {
+            lengths[index] = (uint8_t)((uint64_t)aadSize >> (index * 8u));
+            lengths[8u + index] = (uint8_t)((uint64_t)size >> (index * 8u));
+        }
+        NetPoly1305Update(&mac, lengths, sizeof(lengths));
+        NetPoly1305Finish(&mac, expectedTag);
+
+        NetAeadSeal(key, nonce, aad, aadSize, text, size, actual, tag);
+        Expect(Same(actual, expected, size) && Same(tag, expectedTag, sizeof(tag)),
+               "AEAD matches its parts");
+        Expect(NetAeadOpen(key, nonce, aad, aadSize, actual, size, tag, opened) &&
+                   Same(opened, text, size),
+               "AEAD opens at every length");
+        memcpy(opened, text, size);
+        NetAeadSeal(key, nonce, aad, aadSize, opened, size, opened, tag);
+        Expect(Same(opened, expected, size) && Same(tag, expectedTag, sizeof(tag)),
+               "AEAD seals in place");
+
+        if (size != 0u)
+            actual[NextRandom() % size] ^= 0x10u;
+        else
+            tag[0] ^= 0x10u;
+        memset(opened, 0xA5, size);
+        Expect(!NetAeadOpen(key, nonce, aad, aadSize, actual, size, tag, opened),
+               "AEAD rejects a spoiled packet at every length");
+        bool untouched = true;
+        for (uint32_t index = 0u; index < size; ++index)
+            untouched = untouched && opened[index] == 0xA5u;
+        Expect(untouched, "a spoiled packet leaves the output untouched");
+    }
+}
+
 static void TestHmacAndHkdf(void)
 {
     uint8_t key[131];
@@ -910,6 +974,7 @@ static void TestWipe(void)
 {
     uint8_t secret[40];
     memset(secret, 0x5A, sizeof(secret));
+    NetWipe(secret, 0u);
     NetWipe(secret + 4u, 32u);
     for (uint32_t index = 0u; index < sizeof(secret); ++index)
         Expect(secret[index] == (index < 4u || index >= 36u ? 0x5Au : 0u), "wipe clears its range");
@@ -923,6 +988,7 @@ LAIUE_TEST_ENTRY(NetCryptoTestEntryPoint)
     TestX25519();
     TestX25519AgainstReference();
     TestChaCha20Groups();
+    TestAeadAgainstParts();
     TestPoly1305AgainstReference();
     TestHmacAndHkdf();
     TestWipe();

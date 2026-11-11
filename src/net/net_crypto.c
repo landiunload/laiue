@@ -53,11 +53,15 @@ static void Store64(uint8_t *bytes, uint64_t value)
     Store32(bytes + 4u, (uint32_t)(value >> 32u));
 }
 
+/* memset через volatile-указатель: компилятор не знает, какую функцию
+ * вызывает, и не может выбросить обнуление как мёртвую запись. Побайтовый
+ * volatile-цикл тоже не выбрасывается, но пишет по байту за такт. */
+static void *(*const volatile wipeMemset)(void *, int, size_t) = memset;
+
 void NetWipe(void *bytes, size_t size)
 {
-    volatile uint8_t *cursor = bytes;
-    while (size-- != 0u)
-        *cursor++ = 0u;
+    if (size != 0u)
+        (void)wipeMemset(bytes, 0, size);
 }
 
 static uint64_t Load64(const uint8_t *bytes)
@@ -190,8 +194,8 @@ static Wide WideMultiplyAdd(Wide sum, uint64_t left, uint64_t right)
  * Поток считается группами блоков, где есть векторы: AVX2 — по восемь, SSE2 и
  * NEON — по четыре. Каждое слово состояния лежит в своём векторе, по блоку в
  * дорожке, поэтому четверть раунда — те же сложения, исключающие ИЛИ и
- * повороты, только над векторами. Хвост до двух блоков и короткие сообщения
- * считает скалярный код. */
+ * повороты, только над векторами. Скалярный код считает одиночный последний
+ * блок и всё там, где векторов нет. */
 
 static uint32_t RotateLeft(uint32_t value, uint32_t count)
 {
@@ -297,10 +301,14 @@ static Lane LaneCounters(void)
     return _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
 }
 
+static __m128i Load16(const uint8_t *bytes)
+{
+    return _mm_loadu_si128((const __m128i *)(const void *)bytes);
+}
+
 static void XorStore(const uint8_t *input, uint8_t *output, __m128i stream)
 {
-    const __m128i text = _mm_loadu_si128((const __m128i *)(const void *)input);
-    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(text, stream));
+    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(Load16(input), stream));
 }
 
 /* Слова 4g..4g+3 всех восьми блоков: транспонирование четвёрки внутри
@@ -377,10 +385,14 @@ static Lane LaneCounters(void)
     return _mm_set_epi32(3, 2, 1, 0);
 }
 
+static Lane Load16(const uint8_t *bytes)
+{
+    return _mm_loadu_si128((const __m128i *)(const void *)bytes);
+}
+
 static void XorStore(const uint8_t *input, uint8_t *output, Lane stream)
 {
-    const Lane text = _mm_loadu_si128((const __m128i *)(const void *)input);
-    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(text, stream));
+    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(Load16(input), stream));
 }
 
 /* Слова 4g..4g+3 четырёх блоков: транспонирование четвёрки. */
@@ -442,6 +454,11 @@ static Lane LaneCounters(void)
 {
     static const uint32_t counters[4] = {0u, 1u, 2u, 3u};
     return vld1q_u32(counters);
+}
+
+static Lane Load16(const uint8_t *bytes)
+{
+    return vreinterpretq_u32_u8(vld1q_u8(bytes));
 }
 
 static void XorStore(const uint8_t *input, uint8_t *output, Lane stream)
@@ -508,7 +525,80 @@ static NET_NOINLINE void ChaChaXorLanes(uint32_t state[16], const uint8_t *input
     state[12] += NET_CHACHA_LANES;
 }
 
+/* Поток группы без исходного текста: исключающее ИЛИ с нулями. */
+static const uint8_t chachaZeros[(size_t)NET_CHACHA_LANES * 64u] = {0};
+
+#define CHACHA_GROUP_BYTES ((size_t)NET_CHACHA_LANES * 64u)
+#define CHACHA_FIRST_BYTES CHACHA_GROUP_BYTES
+
+#else
+
+#define CHACHA_FIRST_BYTES ((size_t)64u)
+
 #endif
+
+/* output = input ^ stream; output может совпадать с input. Цикл по байтам
+ * компилятор не всегда векторизует: буферы могут пересекаться. */
+static void XorBytes(uint8_t *output, const uint8_t *input, const uint8_t *stream, size_t size)
+{
+    size_t index = 0u;
+#if defined(NET_CHACHA_LANES)
+    for (; index + 16u <= size; index += 16u)
+        XorStore(input + index, output + index, Load16(stream + index));
+#endif
+    for (; index < size; ++index)
+        output[index] = (uint8_t)(input[index] ^ stream[index]);
+}
+
+/* Первые CHACHA_FIRST_BYTES потока с блока state[12]: группа векторов или
+ * один блок. Счётчик сдвигается. */
+static void ChaChaFirst(uint32_t state[16], uint8_t stream[CHACHA_FIRST_BYTES])
+{
+#if defined(NET_CHACHA_LANES)
+    ChaChaXorLanes(state, chachaZeros, stream);
+#else
+    ChaChaBlock(state, stream);
+    ++state[12];
+#endif
+}
+
+/* Поток с блока state[12]; счётчик сдвигается. Где есть векторы, неполную
+ * группу в конце тоже считают они, через поток целой группы: уже два блока
+ * так дешевле, чем по одному. Последний одиночный блок — скалярный. */
+static void ChaChaXorFrom(uint32_t state[16], const uint8_t *input, uint8_t *output, size_t size)
+{
+#if defined(NET_CHACHA_LANES)
+    while (size >= CHACHA_GROUP_BYTES)
+    {
+        ChaChaXorLanes(state, input, output);
+        input += CHACHA_GROUP_BYTES;
+        output += CHACHA_GROUP_BYTES;
+        size -= CHACHA_GROUP_BYTES;
+    }
+    if (size > 64u)
+    {
+        uint8_t stream[CHACHA_GROUP_BYTES];
+        ChaChaXorLanes(state, chachaZeros, stream);
+        XorBytes(output, input, stream, size);
+        NetWipe(stream, sizeof(stream));
+        return;
+    }
+#endif
+    if (size == 0u)
+        return;
+    uint8_t block[64];
+    while (size != 0u)
+    {
+        ChaChaBlock(state, block);
+        ++state[12];
+        const size_t part = size < sizeof(block) ? size : sizeof(block);
+        XorBytes(output, input, block, part);
+        input += part;
+        output += part;
+        size -= part;
+    }
+    NetWipe(block, sizeof(block));
+}
 
 void NetChaCha20Block(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
                       const uint8_t nonce[NET_NONCE_SIZE], uint8_t output[64])
@@ -524,44 +614,9 @@ void NetChaCha20Xor(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
                     size_t size)
 {
     uint32_t state[16];
-    uint8_t block[64];
     ChaChaSetup(state, key, counter, nonce);
-#if defined(NET_CHACHA_LANES)
-    const size_t group = (size_t)NET_CHACHA_LANES * 64u;
-    while (size >= group)
-    {
-        ChaChaXorLanes(state, input, output);
-        input += group;
-        output += group;
-        size -= group;
-    }
-    /* Неполную группу векторы считают быстрее скалярного кода с трёх блоков:
-     * остаток идёт через буфер группы. Два блока и меньше дешевле считать
-     * по одному — так считается большинство мелких пакетов. */
-    if (size > 128u)
-    {
-        uint8_t tail[(size_t)NET_CHACHA_LANES * 64u];
-        memset(tail, 0, sizeof(tail));
-        memcpy(tail, input, size);
-        ChaChaXorLanes(state, tail, tail);
-        memcpy(output, tail, size);
-        NetWipe(tail, sizeof(tail));
-        size = 0u;
-    }
-#endif
-    while (size != 0u)
-    {
-        ChaChaBlock(state, block);
-        ++state[12];
-        const size_t part = size < sizeof(block) ? size : sizeof(block);
-        for (size_t index = 0u; index < part; ++index)
-            output[index] = (uint8_t)(input[index] ^ block[index]);
-        input += part;
-        output += part;
-        size -= part;
-    }
+    ChaChaXorFrom(state, input, output, size);
     NetWipe(state, sizeof(state));
-    NetWipe(block, sizeof(block));
 }
 
 /* ---- Poly1305 (RFC 8439, раздел 2.5) ------------------------------------------
@@ -590,35 +645,45 @@ void NetPoly1305Begin(NetPoly1305 *state, const uint8_t key[NET_KEY_SIZE])
     state->buffered = 0u;
 }
 
-/* h = (h + блок) * r. highBit — бит 2^128 полного блока; у дополненного
- * последнего блока единица уже стоит внутри 16 байт. */
-static void PolyBlock(NetPoly1305 *state, const uint8_t block[16], uint64_t highBit)
+/* h = (h + блок) * r для count блоков подряд. highBit — бит 2^128 полного
+ * блока; у дополненного последнего блока единица уже стоит внутри 16 байт. */
+static void PolyBlocks(NetPoly1305 *state, const uint8_t *bytes, size_t count, uint64_t highBit)
 {
-    const uint64_t t0 = Load64(block);
-    const uint64_t t1 = Load64(block + 8u);
-    const uint64_t h0 = state->h[0] + (t0 & POLY_MASK44);
-    const uint64_t h1 = state->h[1] + (((t0 >> 44u) | (t1 << 20u)) & POLY_MASK44);
-    const uint64_t h2 = state->h[2] + ((t1 >> 24u) | (highBit << 40u));
     const uint64_t r0 = state->r[0];
     const uint64_t r1 = state->r[1];
     const uint64_t r2 = state->r[2];
     const uint64_t s1 = r1 * 20u;
     const uint64_t s2 = r2 * 20u;
-    Wide d0 = WideMultiply(h0, r0);
-    d0 = WideMultiplyAdd(d0, h1, s2);
-    d0 = WideMultiplyAdd(d0, h2, s1);
-    Wide d1 = WideMultiply(h0, r1);
-    d1 = WideMultiplyAdd(d1, h1, r0);
-    d1 = WideMultiplyAdd(d1, h2, s2);
-    Wide d2 = WideMultiply(h0, r2);
-    d2 = WideMultiplyAdd(d2, h1, r1);
-    d2 = WideMultiplyAdd(d2, h2, r0);
-    d1 = WideAddSmall(d1, WideShift(d0, 44u));
-    d2 = WideAddSmall(d2, WideShift(d1, 44u));
-    const uint64_t low = (WideLow(d0) & POLY_MASK44) + WideShift(d2, 42u) * 5u;
-    state->h[0] = low & POLY_MASK44;
-    state->h[1] = (WideLow(d1) & POLY_MASK44) + (low >> 44u);
-    state->h[2] = WideLow(d2) & POLY_MASK42;
+    uint64_t h0 = state->h[0];
+    uint64_t h1 = state->h[1];
+    uint64_t h2 = state->h[2];
+    for (; count != 0u; --count)
+    {
+        const uint64_t t0 = Load64(bytes);
+        const uint64_t t1 = Load64(bytes + 8u);
+        bytes += 16u;
+        h0 += t0 & POLY_MASK44;
+        h1 += ((t0 >> 44u) | (t1 << 20u)) & POLY_MASK44;
+        h2 += (t1 >> 24u) | (highBit << 40u);
+        Wide d0 = WideMultiply(h0, r0);
+        d0 = WideMultiplyAdd(d0, h1, s2);
+        d0 = WideMultiplyAdd(d0, h2, s1);
+        Wide d1 = WideMultiply(h0, r1);
+        d1 = WideMultiplyAdd(d1, h1, r0);
+        d1 = WideMultiplyAdd(d1, h2, s2);
+        Wide d2 = WideMultiply(h0, r2);
+        d2 = WideMultiplyAdd(d2, h1, r1);
+        d2 = WideMultiplyAdd(d2, h2, r0);
+        d1 = WideAddSmall(d1, WideShift(d0, 44u));
+        d2 = WideAddSmall(d2, WideShift(d1, 44u));
+        const uint64_t low = (WideLow(d0) & POLY_MASK44) + WideShift(d2, 42u) * 5u;
+        h0 = low & POLY_MASK44;
+        h1 = (WideLow(d1) & POLY_MASK44) + (low >> 44u);
+        h2 = WideLow(d2) & POLY_MASK42;
+    }
+    state->h[0] = h0;
+    state->h[1] = h1;
+    state->h[2] = h2;
 }
 
 void NetPoly1305Update(NetPoly1305 *state, const uint8_t *bytes, size_t size)
@@ -632,15 +697,12 @@ void NetPoly1305Update(NetPoly1305 *state, const uint8_t *bytes, size_t size)
         }
         if (state->buffered < 16u)
             return;
-        PolyBlock(state, state->buffer, 1u);
+        PolyBlocks(state, state->buffer, 1u, 1u);
         state->buffered = 0u;
     }
-    while (size >= 16u)
-    {
-        PolyBlock(state, bytes, 1u);
-        bytes += 16u;
-        size -= 16u;
-    }
+    PolyBlocks(state, bytes, size / 16u, 1u);
+    bytes += size & ~(size_t)15u;
+    size &= 15u;
     while (size != 0u)
     {
         state->buffer[state->buffered++] = *bytes++;
@@ -648,15 +710,9 @@ void NetPoly1305Update(NetPoly1305 *state, const uint8_t *bytes, size_t size)
     }
 }
 
-void NetPoly1305Finish(NetPoly1305 *state, uint8_t tag[NET_TAG_SIZE])
+/* Тег из аккумулятора всех блоков; состояние не обнуляется. */
+static void PolyFinal(const NetPoly1305 *state, uint8_t tag[NET_TAG_SIZE])
 {
-    if (state->buffered != 0u)
-    {
-        state->buffer[state->buffered++] = 1u;
-        while (state->buffered < 16u)
-            state->buffer[state->buffered++] = 0u;
-        PolyBlock(state, state->buffer, 0u);
-    }
     uint64_t h0 = state->h[0];
     uint64_t h1 = state->h[1];
     uint64_t h2 = state->h[2];
@@ -699,51 +755,103 @@ void NetPoly1305Finish(NetPoly1305 *state, uint8_t tag[NET_TAG_SIZE])
     h2 += (s1 >> 24u) + carry;
     Store64(tag, h0 | (h1 << 44u));
     Store64(tag + 8u, (h1 >> 20u) | (h2 << 24u));
+}
+
+void NetPoly1305Finish(NetPoly1305 *state, uint8_t tag[NET_TAG_SIZE])
+{
+    if (state->buffered != 0u)
+    {
+        state->buffer[state->buffered++] = 1u;
+        while (state->buffered < 16u)
+            state->buffer[state->buffered++] = 0u;
+        PolyBlocks(state, state->buffer, 1u, 0u);
+    }
+    PolyFinal(state, tag);
     NetWipe(state, sizeof(*state));
 }
 
-/* ---- AEAD (RFC 8439, раздел 2.8) ---------------------------------------------- */
+/* ---- AEAD (RFC 8439, раздел 2.8) ----------------------------------------------
+ *
+ * Одноразовый ключ Poly1305 — первые 32 байта блока 0, сообщение шифруется с
+ * блока 1. Где есть векторы, блок 0 считается одной группой с первыми
+ * блоками сообщения: мелкому пакету хватает одного прохода. MAC считает
+ * дополненные нулями до 16 байт данные, то есть только полные блоки, и
+ * буфер NetPoly1305 ему не нужен. */
 
-static void AeadTag(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_SIZE],
-                    const uint8_t *aad, size_t aadSize, const uint8_t *ciphertext, size_t size,
-                    uint8_t tag[NET_TAG_SIZE])
+typedef struct Aead
 {
-    static const uint8_t zeros[16] = {0};
-    uint8_t block[64];
-    uint8_t lengths[16];
+    uint32_t state[16];
+    /* Ключ Poly1305 и с 64-го байта — поток начала сообщения. */
+    uint8_t first[CHACHA_FIRST_BYTES];
     NetPoly1305 mac;
-    /* Одноразовый ключ Poly1305 — первые 32 байта блока со счётчиком 0. */
-    NetChaCha20Block(key, 0u, nonce, block);
-    NetPoly1305Begin(&mac, block);
-    NetPoly1305Update(&mac, aad, aadSize);
-    NetPoly1305Update(&mac, zeros, (16u - (aadSize & 15u)) & 15u);
-    NetPoly1305Update(&mac, ciphertext, size);
-    NetPoly1305Update(&mac, zeros, (16u - (size & 15u)) & 15u);
+} Aead;
+
+static void AeadBegin(Aead *aead, const uint8_t key[NET_KEY_SIZE],
+                      const uint8_t nonce[NET_NONCE_SIZE])
+{
+    ChaChaSetup(aead->state, key, 0u, nonce);
+    ChaChaFirst(aead->state, aead->first);
+}
+
+static void AeadXor(Aead *aead, const uint8_t *input, uint8_t *output, size_t size)
+{
+    const size_t ready = sizeof(aead->first) - 64u;
+    const size_t head = size < ready ? size : ready;
+    XorBytes(output, input, aead->first + 64u, head);
+    ChaChaXorFrom(aead->state, input + head, output + head, size - head);
+}
+
+static void PolyPadded(NetPoly1305 *mac, const uint8_t *bytes, size_t size)
+{
+    const size_t whole = size & ~(size_t)15u;
+    PolyBlocks(mac, bytes, whole / 16u, 1u);
+    if (whole != size)
+    {
+        uint8_t block[16] = {0};
+        for (size_t index = whole; index < size; ++index)
+            block[index - whole] = bytes[index];
+        PolyBlocks(mac, block, 1u, 1u);
+    }
+}
+
+static void AeadMac(Aead *aead, const uint8_t *aad, size_t aadSize, const uint8_t *ciphertext,
+                    size_t size, uint8_t tag[NET_TAG_SIZE])
+{
+    uint8_t lengths[16];
+    NetPoly1305Begin(&aead->mac, aead->first);
+    PolyPadded(&aead->mac, aad, aadSize);
+    PolyPadded(&aead->mac, ciphertext, size);
     Store64(lengths, (uint64_t)aadSize);
     Store64(lengths + 8u, (uint64_t)size);
-    NetPoly1305Update(&mac, lengths, sizeof(lengths));
-    NetPoly1305Finish(&mac, tag);
-    NetWipe(block, sizeof(block));
+    PolyBlocks(&aead->mac, lengths, 1u, 1u);
+    PolyFinal(&aead->mac, tag);
 }
 
 void NetAeadSeal(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_SIZE],
                  const uint8_t *aad, size_t aadSize, const uint8_t *plaintext, size_t size,
                  uint8_t *ciphertext, uint8_t tag[NET_TAG_SIZE])
 {
-    NetChaCha20Xor(key, 1u, nonce, plaintext, ciphertext, size);
-    AeadTag(key, nonce, aad, aadSize, ciphertext, size, tag);
+    Aead aead;
+    AeadBegin(&aead, key, nonce);
+    AeadXor(&aead, plaintext, ciphertext, size);
+    AeadMac(&aead, aad, aadSize, ciphertext, size, tag);
+    NetWipe(&aead, sizeof(aead));
 }
 
 bool NetAeadOpen(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_SIZE],
                  const uint8_t *aad, size_t aadSize, const uint8_t *ciphertext, size_t size,
                  const uint8_t tag[NET_TAG_SIZE], uint8_t *plaintext)
 {
+    Aead aead;
     uint8_t expected[NET_TAG_SIZE];
-    AeadTag(key, nonce, aad, aadSize, ciphertext, size, expected);
-    if (!PlatformConstantTimeEqual(expected, tag, NET_TAG_SIZE))
-        return false;
-    NetChaCha20Xor(key, 1u, nonce, ciphertext, plaintext, size);
-    return true;
+    AeadBegin(&aead, key, nonce);
+    AeadMac(&aead, aad, aadSize, ciphertext, size, expected);
+    /* Открытый текст появляется только после проверки тега. */
+    const bool valid = PlatformConstantTimeEqual(expected, tag, NET_TAG_SIZE);
+    if (valid)
+        AeadXor(&aead, ciphertext, plaintext, size);
+    NetWipe(&aead, sizeof(aead));
+    return valid;
 }
 
 /* ---- X25519 (RFC 7748) ----------------------------------------------------------
