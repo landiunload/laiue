@@ -800,15 +800,17 @@ static CRYPTO_TEST_NOINLINE void ReferencePoly1305(const uint8_t key[NET_KEY_SIZ
 }
 
 /* Poly1305 совпадает с эталоном на случайных ключах и длинах при любом
- * разбиении входа на части. Ключи с r из одних единиц и s из одних единиц
- * дают предельные переносы. */
+ * разбиении входа на части: мелкие куски идут по блоку, крупные и целое
+ * сообщение — векторами там, где они есть. Ключи с r из одних единиц и s из
+ * одних единиц дают предельные переносы, как и вход из одних единиц. */
 static CRYPTO_TEST_NOINLINE void TestPoly1305AgainstReference(void)
 {
-    static uint8_t message[300];
+    static uint8_t message[1300];
+    static const uint32_t largestPart[4] = {40u, 300u, 700u, 1300u};
     uint8_t key[NET_KEY_SIZE];
     uint8_t expected[NET_TAG_SIZE];
     uint8_t actual[NET_TAG_SIZE];
-    for (uint32_t round = 0u; round < 400u; ++round)
+    for (uint32_t round = 0u; round < 1200u; ++round)
     {
         FillRandom(key, sizeof(key));
         if (round % 4u == 1u)
@@ -820,10 +822,11 @@ static CRYPTO_TEST_NOINLINE void TestPoly1305AgainstReference(void)
         ReferencePoly1305(key, message, size, expected);
         NetPoly1305 mac;
         NetPoly1305Begin(&mac, key);
+        const uint32_t largest = largestPart[(round / 2u) % 4u];
         uint32_t done = 0u;
         while (done < size)
         {
-            uint32_t part = (uint32_t)(NextRandom() % 40u);
+            uint32_t part = (uint32_t)(NextRandom() % (largest + 1u));
             if (part > size - done)
                 part = size - done;
             NetPoly1305Update(&mac, message + done, part);
@@ -831,6 +834,61 @@ static CRYPTO_TEST_NOINLINE void TestPoly1305AgainstReference(void)
         }
         NetPoly1305Finish(&mac, actual);
         Expect(Same(actual, expected, sizeof(actual)), "Poly1305 matches the reference");
+    }
+}
+
+/* Аккумулятор — разряды по 44, 44 и 42 бита — между вызовами приведён не до
+ * конца: блоки по одному оставляют второй разряд до 2^44 + 2^10, векторы —
+ * третий до 2^42 + 2^17. Тег от такого значения совпадает с тегом от равного
+ * ему приведённого — сразу в Finish, после блоков по одному и после векторов.
+ * Случайный вход этих краёв почти не достигает, поэтому они задаются прямо. */
+static CRYPTO_TEST_NOINLINE void TestPoly1305LooseLimbs(void)
+{
+    static const uint32_t sizes[5] = {0u, 16u, 100u, 192u, 1200u};
+    static uint8_t message[1200];
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t expected[NET_TAG_SIZE];
+    uint8_t actual[NET_TAG_SIZE];
+    for (uint32_t round = 0u; round < 40u; ++round)
+    {
+        FillRandom(key, sizeof(key));
+        const uint32_t size = sizes[round % 5u];
+        FillRandom(message, size);
+        NetPoly1305 loose;
+        NetPoly1305 tight;
+        NetPoly1305Begin(&loose, key);
+        NetPoly1305Begin(&tight, key);
+        const uint64_t low = NextRandom() >> 21u;
+        const uint64_t high = NextRandom() >> 23u;
+        if (round % 2u == 0u)
+        {
+            /* Перенос из второго разряда в третий ещё не сделан. */
+            const uint64_t middle = NextRandom() >> 54u;
+            loose.h[0] = low;
+            loose.h[1] = (UINT64_C(1) << 44u) + middle;
+            loose.h[2] = high;
+            tight.h[0] = low;
+            tight.h[1] = middle;
+            tight.h[2] = high + 1u;
+        }
+        else
+        {
+            /* Третий разряд не меньше 2^42: 2^130 по модулю 2^130 - 5 — это 5. */
+            const uint64_t middle = NextRandom() >> 20u;
+            const uint64_t extra = NextRandom() >> 47u;
+            loose.h[0] = low;
+            loose.h[1] = middle;
+            loose.h[2] = (UINT64_C(1) << 42u) + extra;
+            tight.h[0] = low + 5u;
+            tight.h[1] = middle;
+            tight.h[2] = extra;
+        }
+        NetPoly1305Update(&loose, message, size);
+        NetPoly1305Update(&tight, message, size);
+        NetPoly1305Finish(&loose, actual);
+        NetPoly1305Finish(&tight, expected);
+        Expect(Same(actual, expected, sizeof(actual)),
+               "Poly1305 accepts an accumulator that is not fully carried");
     }
 }
 
@@ -990,6 +1048,7 @@ LAIUE_TEST_ENTRY(NetCryptoTestEntryPoint)
     TestChaCha20Groups();
     TestAeadAgainstParts();
     TestPoly1305AgainstReference();
+    TestPoly1305LooseLimbs();
     TestHmacAndHkdf();
     TestWipe();
     LaiueTestRuntimeWrite("net crypto: passed\n");
