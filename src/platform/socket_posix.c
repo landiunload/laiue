@@ -187,10 +187,14 @@ int32_t PlatformUdpSend(PlatformUdpSocket *socket, const PlatformSocketAddress *
     const socklen_t nativeLength = ToNative(to, socket->opaque[1], &native);
     if (nativeLength == 0 || size > UINT16_MAX)
         return 0;
+    /* Пустая датаграмма допустима и без буфера, но Bionic объявляет буфер
+     * sendto ненулевым. */
+    static const uint8_t empty = 0u;
+    const void *payload = bytes != NULL ? bytes : &empty;
     for (;;)
     {
-        if (sendto((int)socket->opaque[0], bytes, (size_t)size, 0, (const struct sockaddr *)&native,
-                   nativeLength) >= 0)
+        if (sendto((int)socket->opaque[0], payload, (size_t)size, 0,
+                   (const struct sockaddr *)&native, nativeLength) >= 0)
             return 1;
         if (errno != EINTR)
             break;
