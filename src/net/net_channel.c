@@ -425,10 +425,15 @@ void NetChannelOnAcked(NetPeer *peer, const NetSentRange *range)
         return;
     if (range->offset > channel->sendAcked)
     {
-        /* Переполненный набор забывает подтверждение: отрезок уйдёт ещё раз,
-         * что безвредно. */
-        (void)RangesAdd(channel->ackedRanges, &channel->ackedCount, NET_ACKED_RANGES, range->offset,
-                        end);
+        /* Подтверждение, которому нет места в наборе, не забывается молча:
+         * отрезок считается потерянным и уходит ещё раз, а получатель повтор
+         * просто отбросит. Иначе этот отрезок не подтвердил бы уже никто, и
+         * начало потока навсегда остановилось бы перед ним вместе с буфером
+         * отправки. */
+        if (!RangesAdd(channel->ackedRanges, &channel->ackedCount, NET_ACKED_RANGES, range->offset,
+                       end))
+            RangesAddCoarse(channel->lostRanges, &channel->lostCount, NET_LOST_RANGES,
+                            range->offset, end);
         return;
     }
     uint64_t acked = end;
