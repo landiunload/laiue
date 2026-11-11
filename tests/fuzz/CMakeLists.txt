@@ -1,5 +1,5 @@
 # Фаззеры разборщиков внешних данных: картинок, звука, моделей, zlib,
-# манифестов и сохранений.
+# манифестов, сохранений и пакетов сетевого транспорта.
 # Собираются только с LAIUE_BUILD_FUZZERS (Clang): тогда весь код движка
 # уже инструментирован -fsanitize=fuzzer-no-link и ASan/UBSan, а здесь
 # лишь компонуется драйвер libFuzzer. Production-исходники сюда не
@@ -49,3 +49,14 @@ if(TARGET laiue_persist)
 endif()
 laiue_add_fuzzer(module_manifest module_manifest_fuzz.c laiue_bootstrap
     laiue::platform_support)
+# Кадры соединения транспорт разбирает только после расшифровки, а ключи
+# участника, которыми фаззер шифрует свои пакеты, видны лишь изнутри модуля.
+# Поэтому исходники транспорта компилируются в сам фаззер.
+if(TARGET laiue_net)
+    laiue_add_fuzzer(net net_fuzz.c laiue::platform_support)
+    foreach(source net_crypto net_wire net_address net_channel net_packet net_handshake
+            net_endpoint)
+        target_sources(laiue_fuzz_net PRIVATE "${PROJECT_SOURCE_DIR}/src/net/${source}.c")
+    endforeach()
+    target_compile_definitions(laiue_fuzz_net PRIVATE LAIUE_STATIC=1)
+endif()

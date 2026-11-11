@@ -5,6 +5,16 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- `laiue.net` moves messages between endpoints over datagrams and leaves the
+  protocol, server and replication to the application. Connections use an
+  X25519 handshake behind a stateless return-path cookie, optional pinned
+  server keys and shared secrets, and ChaCha20-Poly1305 on every packet. Up to
+  64 channels carry reliable ordered, unreliable and sequenced messages, with
+  QUIC-style loss recovery, reordering thresholds that adapt to the path,
+  NewReno with pacing, address migration and hard memory limits. A UDP driver
+  covers IPv4 and IPv6, and a deterministic simulator drives network tests.
+  External platform adapters opt into sockets with
+  `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in `docs/net.md`.
 - The Android walk check no longer fails on its own timing. It compares a picture
   after a turn only once the screen has come to rest, and it answers the system's
   "not responding" dialog about another process, which took the focus the scenario

@@ -23,8 +23,8 @@
 
 laiue is a set of libraries your application links, not a framework that runs
 it. Each technology is a separate module behind a C ABI: remove one, and the
-rest keep working. Application logic, world generation and networking stay in
-your code.
+rest keep working. Application logic, world generation and the network
+protocol stay in your code.
 
 ## Features
 
@@ -39,6 +39,9 @@ your code.
   time-sliced and parallel queries, flow fields for crowds.
 - **Saves** — versioned sections, checksums, atomic replacement with
   backups, background save and load.
+- **Networking** — encrypted connections over UDP with reliable and
+  unreliable channels, congestion control and a deterministic network
+  simulator for tests.
 - **Mods** — native extensions through a versioned C ABI.
 - **Lean** — no CRT on Windows, portable core on x86_64 and ARM64.
 
@@ -115,6 +118,7 @@ Details are in [portability](docs/portability.md).
 [Physics](docs/physics.md) ·
 [Saves](docs/persist.md) ·
 [Navigation](docs/navigation.md) ·
+[Networking](docs/net.md) ·
 [Content formats](docs/content_formats.md) ·
 [Modding](docs/modding.md) ·
 [Development](docs/development.md)

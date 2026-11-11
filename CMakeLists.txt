@@ -98,6 +98,7 @@ add_subdirectory(src/assets/media)
 add_subdirectory(src/platform)
 add_subdirectory(src/jobs/task)
 add_subdirectory(src/persist)
+add_subdirectory(src/net)
 option(LAIUE_BUILD_DIAGNOSTICS "Build debug-only diagnostics such as the frame monitor" ON)
 if(LAIUE_BUILD_DIAGNOSTICS)
     add_subdirectory(src/diagnostics/frame_monitor)
@@ -276,6 +277,7 @@ laiue_install_headers(laiue_physics physics
     simulation/physics/numeric_provider.h)
 laiue_install_headers(laiue_task task jobs/task/task_pool.h jobs/task/task_service.h)
 laiue_install_headers(laiue_persist persist persist/persist.h persist/persist_service.h)
+laiue_install_headers(laiue_net net net/net.h net/net_service.h)
 # Заголовки диагностики ставятся всегда: без LAIUE_DIAGNOSTICS их макросы пусты.
 laiue_install_headers(laiue_frame_monitor frame_monitor
     diagnostics/frame_monitor/frame_monitor.h diagnostics/frame_monitor/frame_monitor_service.h)
