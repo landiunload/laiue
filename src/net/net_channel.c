@@ -582,19 +582,30 @@ uint32_t NetChannelReceiveStream(LaiueNetEndpoint *endpoint, NetPeer *peer, uint
         length -= known;
         offset = channel->receiveOffset;
     }
-    if (offset == channel->receiveOffset && channel->receivedCount == 0u)
-        return FeedStream(endpoint, peer, channelIndex, bytes, length);
-
-    if (channel->receiveData == NULL)
+    /* Начало потока разбирается сразу и места в наборе отрезков не занимает.
+     * Иначе после потерь вразбивку, когда отрезков с опережением больше, чем
+     * вмещает набор, повтор начала, короче дыры, откладывался бы раз за разом
+     * и передача вставала. */
+    if (offset == channel->receiveOffset)
     {
-        channel->receiveData = PlatformAllocate(window, false);
-        if (channel->receiveData == NULL)
-            return NET_FRAMES_DEFER;
+        const uint32_t status = FeedStream(endpoint, peer, channelIndex, bytes, length);
+        if (status != NET_FRAMES_OK || channel->receivedCount == 0u)
+            return status;
     }
-    if (!RangesAdd(channel->receivedRanges, &channel->receivedCount, NET_RECEIVED_RANGES, offset,
-                   end))
-        return NET_FRAMES_DEFER;
-    RingWrite(channel->receiveData, window, offset, bytes, length);
+    else
+    {
+        if (channel->receiveData == NULL)
+        {
+            channel->receiveData = PlatformAllocate(window, false);
+            if (channel->receiveData == NULL)
+                return NET_FRAMES_DEFER;
+        }
+        if (!RangesAdd(channel->receivedRanges, &channel->receivedCount, NET_RECEIVED_RANGES,
+                       offset, end))
+            return NET_FRAMES_DEFER;
+        RingWrite(channel->receiveData, window, offset, bytes, length);
+    }
+    /* Отрезки, до которых дошло начало, разбираются из кольца. */
     while (channel->receivedCount != 0u &&
            channel->receivedRanges[0].start <= channel->receiveOffset)
     {

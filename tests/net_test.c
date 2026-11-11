@@ -909,6 +909,69 @@ static void TestBottleneck(void)
     WorldEnd();
 }
 
+static bool scatterActive;
+static uint32_t scatterSeen;
+
+/* Из четырёхсот полных пакетов данных клиента теряются восемь из каждых
+ * десяти. */
+static bool ScatterFilter(void *context, const LaiueNetAddress *from, const LaiueNetAddress *to,
+                          uint8_t *bytes, uint32_t size)
+{
+    (void)context;
+    (void)to;
+    if (!scatterActive || from->port != 5000u || bytes[0] != 0x40u || size < 1000u)
+        return true;
+    const uint32_t index = scatterSeen;
+    ++scatterSeen;
+    return index >= 400u || index % 10u >= 8u;
+}
+
+/* Потери вразбивку, когда в пути сотни пакетов: у получателя сорок дыр по
+ * восемь пакетов, а отрезков с опережением он хранит меньше. Лишнее ждёт
+ * повтора, но повтор начала потока, короче дыры, принимается сразу, и
+ * передача идёт дальше. */
+static void TestScatteredLoss(void)
+{
+    const uint32_t total = 24u;
+    uint32_t next[CHANNELS] = {0u};
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 8u << 20u;
+    scatterActive = false;
+    scatterSeen = 0u;
+    WorldBegin(31u);
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    Expect(LaiueNetSimulatorSetFilter(world.simulator, ScatterFilter, NULL) == LAIUE_NET_OK,
+           "filter installs");
+    const LaiueNetPeer peer = Connect(client, server, SECOND);
+    Flow *serverFlow = ServerFlow(server, client->index);
+    serverFlow->sizes = bulkSizes;
+    serverFlow->sizeCount = COUNT_OF(bulkSizes);
+    SetConditions(5000u, 0u, 0u, 0u, 0u);
+    const uint64_t until = world.now + 20u * SECOND;
+    while (serverFlow->nextReliable[0] != total && world.now < until)
+    {
+        while (next[0] < total && SendScheduled(client, peer, 1u, client->index, bulkSizes,
+                                                COUNT_OF(bulkSizes), 0u, next[0]) == LAIUE_NET_OK)
+            ++next[0];
+        /* Потери начинаются, когда окно перегрузки уже разрослось. */
+        if (serverFlow->nextReliable[0] >= 4u)
+            scatterActive = true;
+        WorldStep();
+    }
+    scatterActive = false;
+    Expect(scatterSeen >= 400u, "the scattered losses happen");
+    ExpectEqual(serverFlow->nextReliable[0], total,
+                "a transfer survives more holes than the receiver keeps ranges for");
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK &&
+               info.packetsLost >= 320u,
+           "the sender detects the scattered losses");
+    WorldEnd();
+}
+
 /* ---- Очереди и пределы ---------------------------------------------------------------- */
 
 static void TestBackpressure(void)
@@ -1849,6 +1912,7 @@ LAIUE_TEST_ENTRY(NetTestEntryPoint)
     TestLossyNetwork();
     TestDeepPipe();
     TestBottleneck();
+    TestScatteredLoss();
     TestBackpressure();
     TestUnreliable();
     TestLiveness();
