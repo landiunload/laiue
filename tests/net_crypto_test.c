@@ -706,6 +706,168 @@ static CRYPTO_TEST_NOINLINE void TestX25519AgainstReference(void)
     }
 }
 
+/* ---- Эталон Poly1305 -------------------------------------------------------------
+ *
+ * Пять разрядов по 26 бит: произведения и их суммы помещаются в 64 бита. */
+
+static uint32_t ReadLe32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8u) | ((uint32_t)bytes[2] << 16u) |
+           ((uint32_t)bytes[3] << 24u);
+}
+
+static CRYPTO_TEST_NOINLINE void ReferencePoly1305(const uint8_t key[NET_KEY_SIZE],
+                                                   const uint8_t *message, size_t size,
+                                                   uint8_t tag[NET_TAG_SIZE])
+{
+    const uint32_t mask = UINT32_C(0x03FFFFFF);
+    const uint32_t k0 = ReadLe32(key) & UINT32_C(0x0FFFFFFF);
+    const uint32_t k1 = ReadLe32(key + 4u) & UINT32_C(0x0FFFFFFC);
+    const uint32_t k2 = ReadLe32(key + 8u) & UINT32_C(0x0FFFFFFC);
+    const uint32_t k3 = ReadLe32(key + 12u) & UINT32_C(0x0FFFFFFC);
+    const uint64_t r[5] = {k0 & mask, ((k0 >> 26u) | (k1 << 6u)) & mask,
+                           ((k1 >> 20u) | (k2 << 12u)) & mask, ((k2 >> 14u) | (k3 << 18u)) & mask,
+                           k3 >> 8u};
+    uint64_t h[5] = {0u};
+    while (size != 0u)
+    {
+        uint8_t block[17] = {0u};
+        const size_t part = size < 16u ? size : 16u;
+        memcpy(block, message, part);
+        block[part] = 1u;
+        message += part;
+        size -= part;
+        const uint32_t t0 = ReadLe32(block);
+        const uint32_t t1 = ReadLe32(block + 4u);
+        const uint32_t t2 = ReadLe32(block + 8u);
+        const uint32_t t3 = ReadLe32(block + 12u);
+        h[0] += t0 & mask;
+        h[1] += ((t0 >> 26u) | (t1 << 6u)) & mask;
+        h[2] += ((t1 >> 20u) | (t2 << 12u)) & mask;
+        h[3] += ((t2 >> 14u) | (t3 << 18u)) & mask;
+        h[4] += (t3 >> 8u) | ((uint32_t)block[16] << 24u);
+        uint64_t d[5];
+        for (uint32_t i = 0u; i < 5u; ++i)
+        {
+            d[i] = 0u;
+            for (uint32_t j = 0u; j < 5u; ++j)
+                d[i] += h[j] * (j <= i ? r[i - j] : 5u * r[5u + i - j]);
+        }
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            d[i + 1u] += d[i] >> 26u;
+            d[i] &= mask;
+        }
+        d[0] += (d[4] >> 26u) * 5u;
+        d[4] &= mask;
+        d[1] += d[0] >> 26u;
+        d[0] &= mask;
+        memcpy(h, d, sizeof(h));
+    }
+    /* Полный перенос и вычитание p, если h не меньше p. */
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            h[i + 1u] += h[i] >> 26u;
+            h[i] &= mask;
+        }
+        h[0] += (h[4] >> 26u) * 5u;
+        h[4] &= mask;
+    }
+    uint64_t g[5];
+    uint64_t carry = 5u;
+    for (uint32_t i = 0u; i < 5u; ++i)
+    {
+        g[i] = h[i] + carry;
+        carry = g[i] >> 26u;
+        g[i] &= mask;
+    }
+    if (carry != 0u)
+        memcpy(h, g, sizeof(h));
+    uint64_t sum = 0u;
+    const uint64_t words[4] = {
+        (h[0] | (h[1] << 26u)) & UINT32_MAX, ((h[1] >> 6u) | (h[2] << 20u)) & UINT32_MAX,
+        ((h[2] >> 12u) | (h[3] << 14u)) & UINT32_MAX, ((h[3] >> 18u) | (h[4] << 8u)) & UINT32_MAX};
+    for (size_t i = 0u; i < 4u; ++i)
+    {
+        sum = words[i] + ReadLe32(key + 16u + i * 4u) + (sum >> 32u);
+        tag[i * 4u] = (uint8_t)sum;
+        tag[i * 4u + 1u] = (uint8_t)(sum >> 8u);
+        tag[i * 4u + 2u] = (uint8_t)(sum >> 16u);
+        tag[i * 4u + 3u] = (uint8_t)(sum >> 24u);
+    }
+}
+
+/* Poly1305 совпадает с эталоном на случайных ключах и длинах при любом
+ * разбиении входа на части. Ключи с r из одних единиц и s из одних единиц
+ * дают предельные переносы. */
+static CRYPTO_TEST_NOINLINE void TestPoly1305AgainstReference(void)
+{
+    static uint8_t message[300];
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t expected[NET_TAG_SIZE];
+    uint8_t actual[NET_TAG_SIZE];
+    for (uint32_t round = 0u; round < 400u; ++round)
+    {
+        FillRandom(key, sizeof(key));
+        if (round % 4u == 1u)
+            memset(key, 0xFF, sizeof(key));
+        const uint32_t size = (uint32_t)(NextRandom() % (sizeof(message) + 1u));
+        FillRandom(message, size);
+        if (round % 8u == 2u)
+            memset(message, 0xFF, size);
+        ReferencePoly1305(key, message, size, expected);
+        NetPoly1305 mac;
+        NetPoly1305Begin(&mac, key);
+        uint32_t done = 0u;
+        while (done < size)
+        {
+            uint32_t part = (uint32_t)(NextRandom() % 40u);
+            if (part > size - done)
+                part = size - done;
+            NetPoly1305Update(&mac, message + done, part);
+            done += part;
+        }
+        NetPoly1305Finish(&mac, actual);
+        Expect(Same(actual, expected, sizeof(actual)), "Poly1305 matches the reference");
+    }
+}
+
+/* Поток группами блоков совпадает с поблочным на всех длинах вокруг групп по
+ * четыре и восемь блоков, со счётчиком у переполнения и на месте. */
+static CRYPTO_TEST_NOINLINE void TestChaCha20Groups(void)
+{
+    static uint8_t text[1300];
+    static uint8_t expected[1300];
+    static uint8_t actual[1300];
+    static const uint32_t counters[] = {0u, 1u, UINT32_C(0xFFFFFFFD)};
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t nonce[NET_NONCE_SIZE];
+    uint8_t block[64];
+    FillRandom(key, sizeof(key));
+    FillRandom(nonce, sizeof(nonce));
+    FillRandom(text, sizeof(text));
+    for (uint32_t which = 0u; which < 3u; ++which)
+    {
+        const uint32_t counter = counters[which];
+        for (uint32_t size = 0u; size <= sizeof(text); size += size < 600u ? 1u : 7u)
+        {
+            for (uint32_t offset = 0u; offset < size; offset += 64u)
+            {
+                NetChaCha20Block(key, counter + offset / 64u, nonce, block);
+                for (uint32_t index = offset; index < size && index < offset + 64u; ++index)
+                    expected[index] = (uint8_t)(text[index] ^ block[index - offset]);
+            }
+            NetChaCha20Xor(key, counter, nonce, text, actual, size);
+            Expect(Same(actual, expected, size), "ChaCha20 groups match single blocks");
+            memcpy(actual, text, size);
+            NetChaCha20Xor(key, counter, nonce, actual, actual, size);
+            Expect(Same(actual, expected, size), "ChaCha20 groups work in place");
+        }
+    }
+}
+
 static void TestHmacAndHkdf(void)
 {
     uint8_t key[131];
@@ -760,6 +922,8 @@ LAIUE_TEST_ENTRY(NetCryptoTestEntryPoint)
     TestAead();
     TestX25519();
     TestX25519AgainstReference();
+    TestChaCha20Groups();
+    TestPoly1305AgainstReference();
     TestHmacAndHkdf();
     TestWipe();
     LaiueTestRuntimeWrite("net crypto: passed\n");

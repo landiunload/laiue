@@ -4,8 +4,33 @@
 
 #include <string.h>
 
+/* Векторы ChaCha20. NET_CRYPTO_PORTABLE отключает их вместе с быстрым
+ * 128-битным умножением: так тест проверяет и переносимый код. */
+#if !defined(NET_CRYPTO_PORTABLE) && defined(__AVX2__)
+#define NET_CHACHA_AVX2 1
+#define NET_CHACHA_LANES 8u
+#include <immintrin.h>
+#elif !defined(NET_CRYPTO_PORTABLE) && (defined(__SSE2__) || defined(_M_X64))
+#define NET_CHACHA_SSE2 1
+#define NET_CHACHA_LANES 4u
+#include <emmintrin.h>
+#if defined(__SSSE3__) || defined(__AVX__)
+#include <tmmintrin.h>
+#endif
+#elif !defined(NET_CRYPTO_PORTABLE) && (defined(__ARM_NEON) || defined(_M_ARM64))
+#define NET_CHACHA_NEON 1
+#define NET_CHACHA_LANES 4u
+#include <arm_neon.h>
+#endif
+
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
+#endif
+
+#if defined(_MSC_VER)
+#define NET_NOINLINE __declspec(noinline)
+#else
+#define NET_NOINLINE __attribute__((noinline))
 #endif
 
 static uint32_t Load32(const uint8_t *bytes)
@@ -35,7 +60,138 @@ void NetWipe(void *bytes, size_t size)
         *cursor++ = 0u;
 }
 
-/* ---- ChaCha20 (RFC 8439, раздел 2.3) ----------------------------------------- */
+static uint64_t Load64(const uint8_t *bytes)
+{
+    return (uint64_t)Load32(bytes) | ((uint64_t)Load32(bytes + 4u) << 32u);
+}
+
+/* ---- 128-битные произведения ------------------------------------------------
+ *
+ * Poly1305 и X25519 копят суммы произведений 64 на 64 бита в Wide. Тест
+ * собирает переносимый путь и там, где компилятор умеет быстрый. */
+
+#if defined(__SIZEOF_INT128__) && !defined(NET_CRYPTO_PORTABLE)
+
+/* GCC и Clang, включая clang-cl, держат 128-битное целое на 64-битных целях:
+ * произведение становится одной инструкцией, сумма — парой. */
+#if defined(__GNUC__)
+__extension__ typedef unsigned __int128 Wide;
+#else
+typedef unsigned __int128 Wide;
+#endif
+
+static Wide WideMultiply(uint64_t left, uint64_t right)
+{
+    return (Wide)left * right;
+}
+
+static Wide WideAdd(Wide sum, Wide value)
+{
+    return sum + value;
+}
+
+static Wide WideAddSmall(Wide sum, uint64_t value)
+{
+    return sum + value;
+}
+
+static uint64_t WideLow(Wide value)
+{
+    return (uint64_t)value;
+}
+
+/* value >> count при 0 < count < 64; результат обязан помещаться в 64 бита. */
+static uint64_t WideShift(Wide value, uint32_t count)
+{
+    return (uint64_t)(value >> count);
+}
+
+#else
+
+typedef struct Wide
+{
+    uint64_t low;
+    uint64_t high;
+} Wide;
+
+#if defined(_MSC_VER) && !defined(__clang__) && !defined(NET_CRYPTO_PORTABLE) &&                   \
+    (defined(_M_X64) || defined(_M_ARM64))
+#define NET_MSVC_WIDE 1
+#endif
+
+static Wide WideMultiply(uint64_t left, uint64_t right)
+{
+    Wide product;
+#if defined(NET_MSVC_WIDE) && defined(_M_X64)
+    product.low = _umul128(left, right, &product.high);
+#elif defined(NET_MSVC_WIDE)
+    product.low = left * right;
+    product.high = __umulh(left, right);
+#else
+    /* Четыре произведения 32 на 32 бита. */
+    const uint64_t leftLow = (uint32_t)left;
+    const uint64_t leftHigh = left >> 32u;
+    const uint64_t rightLow = (uint32_t)right;
+    const uint64_t rightHigh = right >> 32u;
+    const uint64_t lowProduct = leftLow * rightLow;
+    const uint64_t crossLeft = leftHigh * rightLow;
+    const uint64_t crossRight = leftLow * rightHigh;
+    const uint64_t middle = (lowProduct >> 32u) + (uint32_t)crossLeft + (uint32_t)crossRight;
+    product.low = (middle << 32u) | (uint32_t)lowProduct;
+    product.high =
+        leftHigh * rightHigh + (crossLeft >> 32u) + (crossRight >> 32u) + (middle >> 32u);
+#endif
+    return product;
+}
+
+static Wide WideAdd(Wide sum, Wide value)
+{
+#if defined(NET_MSVC_WIDE) && defined(_M_X64)
+    const unsigned char carry = _addcarry_u64(0u, sum.low, value.low, &sum.low);
+    (void)_addcarry_u64(carry, sum.high, value.high, &sum.high);
+#else
+    /* Перенос — старший бит выражения, а не сравнение: время не зависит от
+     * значений и там, где компилятор не знает инструкции сложения с
+     * переносом. */
+    const uint64_t low = sum.low + value.low;
+    const uint64_t carry = ((sum.low & value.low) | ((sum.low | value.low) & ~low)) >> 63u;
+    sum.low = low;
+    sum.high += value.high + carry;
+#endif
+    return sum;
+}
+
+static Wide WideAddSmall(Wide sum, uint64_t value)
+{
+    const Wide wide = {value, 0u};
+    return WideAdd(sum, wide);
+}
+
+static uint64_t WideLow(Wide value)
+{
+    return value.low;
+}
+
+/* value >> count при 0 < count < 64; результат обязан помещаться в 64 бита. */
+static uint64_t WideShift(Wide value, uint32_t count)
+{
+    return (value.high << (64u - count)) | (value.low >> count);
+}
+
+#endif
+
+static Wide WideMultiplyAdd(Wide sum, uint64_t left, uint64_t right)
+{
+    return WideAdd(sum, WideMultiply(left, right));
+}
+
+/* ---- ChaCha20 (RFC 8439, раздел 2.3) -----------------------------------------
+ *
+ * Поток считается группами блоков, где есть векторы: AVX2 — по восемь, SSE2 и
+ * NEON — по четыре. Каждое слово состояния лежит в своём векторе, по блоку в
+ * дорожке, поэтому четверть раунда — те же сложения, исключающие ИЛИ и
+ * повороты, только над векторами. Хвост до двух блоков и короткие сообщения
+ * считает скалярный код. */
 
 static uint32_t RotateLeft(uint32_t value, uint32_t count)
 {
@@ -90,6 +246,270 @@ static void ChaChaBlock(const uint32_t state[16], uint8_t output[64])
         Store32(output + index * 4u, x[index] + state[index]);
 }
 
+#if defined(NET_CHACHA_LANES)
+
+#if defined(NET_CHACHA_AVX2)
+
+typedef __m256i Lane;
+
+static Lane LaneSet(uint32_t value)
+{
+    return _mm256_set1_epi32((int)value);
+}
+
+static Lane LaneAdd(Lane left, Lane right)
+{
+    return _mm256_add_epi32(left, right);
+}
+
+static Lane LaneXor(Lane left, Lane right)
+{
+    return _mm256_xor_si256(left, right);
+}
+
+/* Повороты на 16 и 8 бит — перестановки байтов внутри слова. */
+static Lane LaneRotate16(Lane value)
+{
+    return _mm256_shuffle_epi8(value, _mm256_set_epi8(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1,
+                                                      0, 3, 2, 13, 12, 15, 14, 9, 8, 11, 10, 5, 4,
+                                                      7, 6, 1, 0, 3, 2));
+}
+
+static Lane LaneRotate12(Lane value)
+{
+    return _mm256_or_si256(_mm256_slli_epi32(value, 12), _mm256_srli_epi32(value, 20));
+}
+
+static Lane LaneRotate8(Lane value)
+{
+    return _mm256_shuffle_epi8(value, _mm256_set_epi8(14, 13, 12, 15, 10, 9, 8, 11, 6, 5, 4, 7, 2,
+                                                      1, 0, 3, 14, 13, 12, 15, 10, 9, 8, 11, 6, 5,
+                                                      4, 7, 2, 1, 0, 3));
+}
+
+static Lane LaneRotate7(Lane value)
+{
+    return _mm256_or_si256(_mm256_slli_epi32(value, 7), _mm256_srli_epi32(value, 25));
+}
+
+static Lane LaneCounters(void)
+{
+    return _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+}
+
+static void XorStore(const uint8_t *input, uint8_t *output, __m128i stream)
+{
+    const __m128i text = _mm_loadu_si128((const __m128i *)(const void *)input);
+    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(text, stream));
+}
+
+/* Слова 4g..4g+3 всех восьми блоков: транспонирование четвёрки внутри
+ * каждой 128-битной половины. Нижняя половина — блоки 0..3, верхняя —
+ * 4..7. */
+static void LaneStoreGroup(const Lane x[4], size_t group, const uint8_t *input, uint8_t *output)
+{
+    const Lane ab01 = _mm256_unpacklo_epi32(x[0], x[1]);
+    const Lane cd01 = _mm256_unpacklo_epi32(x[2], x[3]);
+    const Lane ab23 = _mm256_unpackhi_epi32(x[0], x[1]);
+    const Lane cd23 = _mm256_unpackhi_epi32(x[2], x[3]);
+    const Lane blocks[4] = {_mm256_unpacklo_epi64(ab01, cd01), _mm256_unpackhi_epi64(ab01, cd01),
+                            _mm256_unpacklo_epi64(ab23, cd23), _mm256_unpackhi_epi64(ab23, cd23)};
+    for (size_t block = 0u; block < 4u; ++block)
+    {
+        const size_t low = block * 64u + group * 16u;
+        const size_t high = low + 256u;
+        XorStore(input + low, output + low, _mm256_castsi256_si128(blocks[block]));
+        XorStore(input + high, output + high, _mm256_extracti128_si256(blocks[block], 1));
+    }
+}
+
+#elif defined(NET_CHACHA_SSE2)
+
+typedef __m128i Lane;
+
+static Lane LaneSet(uint32_t value)
+{
+    return _mm_set1_epi32((int)value);
+}
+
+static Lane LaneAdd(Lane left, Lane right)
+{
+    return _mm_add_epi32(left, right);
+}
+
+static Lane LaneXor(Lane left, Lane right)
+{
+    return _mm_xor_si128(left, right);
+}
+
+static Lane LaneRotate16(Lane value)
+{
+#if defined(__SSSE3__) || defined(__AVX__)
+    return _mm_shuffle_epi8(value,
+                            _mm_set_epi8(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2));
+#else
+    return _mm_or_si128(_mm_slli_epi32(value, 16), _mm_srli_epi32(value, 16));
+#endif
+}
+
+static Lane LaneRotate12(Lane value)
+{
+    return _mm_or_si128(_mm_slli_epi32(value, 12), _mm_srli_epi32(value, 20));
+}
+
+static Lane LaneRotate8(Lane value)
+{
+#if defined(__SSSE3__) || defined(__AVX__)
+    return _mm_shuffle_epi8(value,
+                            _mm_set_epi8(14, 13, 12, 15, 10, 9, 8, 11, 6, 5, 4, 7, 2, 1, 0, 3));
+#else
+    return _mm_or_si128(_mm_slli_epi32(value, 8), _mm_srli_epi32(value, 24));
+#endif
+}
+
+static Lane LaneRotate7(Lane value)
+{
+    return _mm_or_si128(_mm_slli_epi32(value, 7), _mm_srli_epi32(value, 25));
+}
+
+static Lane LaneCounters(void)
+{
+    return _mm_set_epi32(3, 2, 1, 0);
+}
+
+static void XorStore(const uint8_t *input, uint8_t *output, Lane stream)
+{
+    const Lane text = _mm_loadu_si128((const __m128i *)(const void *)input);
+    _mm_storeu_si128((__m128i *)(void *)output, _mm_xor_si128(text, stream));
+}
+
+/* Слова 4g..4g+3 четырёх блоков: транспонирование четвёрки. */
+static void LaneStoreGroup(const Lane x[4], size_t group, const uint8_t *input, uint8_t *output)
+{
+    const Lane ab01 = _mm_unpacklo_epi32(x[0], x[1]);
+    const Lane cd01 = _mm_unpacklo_epi32(x[2], x[3]);
+    const Lane ab23 = _mm_unpackhi_epi32(x[0], x[1]);
+    const Lane cd23 = _mm_unpackhi_epi32(x[2], x[3]);
+    const Lane blocks[4] = {_mm_unpacklo_epi64(ab01, cd01), _mm_unpackhi_epi64(ab01, cd01),
+                            _mm_unpacklo_epi64(ab23, cd23), _mm_unpackhi_epi64(ab23, cd23)};
+    for (size_t block = 0u; block < 4u; ++block)
+    {
+        const size_t offset = block * 64u + group * 16u;
+        XorStore(input + offset, output + offset, blocks[block]);
+    }
+}
+
+#else
+
+typedef uint32x4_t Lane;
+
+static Lane LaneSet(uint32_t value)
+{
+    return vdupq_n_u32(value);
+}
+
+static Lane LaneAdd(Lane left, Lane right)
+{
+    return vaddq_u32(left, right);
+}
+
+static Lane LaneXor(Lane left, Lane right)
+{
+    return veorq_u32(left, right);
+}
+
+static Lane LaneRotate16(Lane value)
+{
+    return vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(value)));
+}
+
+static Lane LaneRotate12(Lane value)
+{
+    return vsriq_n_u32(vshlq_n_u32(value, 12), value, 20);
+}
+
+static Lane LaneRotate8(Lane value)
+{
+    return vsriq_n_u32(vshlq_n_u32(value, 8), value, 24);
+}
+
+static Lane LaneRotate7(Lane value)
+{
+    return vsriq_n_u32(vshlq_n_u32(value, 7), value, 25);
+}
+
+static Lane LaneCounters(void)
+{
+    static const uint32_t counters[4] = {0u, 1u, 2u, 3u};
+    return vld1q_u32(counters);
+}
+
+static void XorStore(const uint8_t *input, uint8_t *output, Lane stream)
+{
+    vst1q_u8(output, veorq_u8(vld1q_u8(input), vreinterpretq_u8_u32(stream)));
+}
+
+/* Слова 4g..4g+3 четырёх блоков: транспонирование четвёрки. */
+static void LaneStoreGroup(const Lane x[4], size_t group, const uint8_t *input, uint8_t *output)
+{
+    const uint32x4x2_t ab = vtrnq_u32(x[0], x[1]);
+    const uint32x4x2_t cd = vtrnq_u32(x[2], x[3]);
+    const Lane blocks[4] = {vcombine_u32(vget_low_u32(ab.val[0]), vget_low_u32(cd.val[0])),
+                            vcombine_u32(vget_low_u32(ab.val[1]), vget_low_u32(cd.val[1])),
+                            vcombine_u32(vget_high_u32(ab.val[0]), vget_high_u32(cd.val[0])),
+                            vcombine_u32(vget_high_u32(ab.val[1]), vget_high_u32(cd.val[1]))};
+    for (size_t block = 0u; block < 4u; ++block)
+    {
+        const size_t offset = block * 64u + group * 16u;
+        XorStore(input + offset, output + offset, blocks[block]);
+    }
+}
+
+#endif
+
+#define LANE_QUARTER_ROUND(a, b, c, d)                                                             \
+    do                                                                                             \
+    {                                                                                              \
+        x[a] = LaneAdd(x[a], x[b]);                                                                \
+        x[d] = LaneRotate16(LaneXor(x[d], x[a]));                                                  \
+        x[c] = LaneAdd(x[c], x[d]);                                                                \
+        x[b] = LaneRotate12(LaneXor(x[b], x[c]));                                                  \
+        x[a] = LaneAdd(x[a], x[b]);                                                                \
+        x[d] = LaneRotate8(LaneXor(x[d], x[a]));                                                   \
+        x[c] = LaneAdd(x[c], x[d]);                                                                \
+        x[b] = LaneRotate7(LaneXor(x[b], x[c]));                                                   \
+    } while (0)
+
+/* NET_CHACHA_LANES блоков подряд, начиная с state[12]; счётчик сдвигается. */
+static NET_NOINLINE void ChaChaXorLanes(uint32_t state[16], const uint8_t *input, uint8_t *output)
+{
+    Lane initial[16];
+    Lane x[16];
+    for (size_t index = 0u; index < 16u; ++index)
+        initial[index] = LaneSet(state[index]);
+    initial[12] = LaneAdd(initial[12], LaneCounters());
+    for (size_t index = 0u; index < 16u; ++index)
+        x[index] = initial[index];
+    for (uint32_t round = 0u; round < 10u; ++round)
+    {
+        LANE_QUARTER_ROUND(0, 4, 8, 12);
+        LANE_QUARTER_ROUND(1, 5, 9, 13);
+        LANE_QUARTER_ROUND(2, 6, 10, 14);
+        LANE_QUARTER_ROUND(3, 7, 11, 15);
+        LANE_QUARTER_ROUND(0, 5, 10, 15);
+        LANE_QUARTER_ROUND(1, 6, 11, 12);
+        LANE_QUARTER_ROUND(2, 7, 8, 13);
+        LANE_QUARTER_ROUND(3, 4, 9, 14);
+    }
+    for (size_t index = 0u; index < 16u; ++index)
+        x[index] = LaneAdd(x[index], initial[index]);
+    for (size_t group = 0u; group < 4u; ++group)
+        LaneStoreGroup(x + group * 4u, group, input, output);
+    state[12] += NET_CHACHA_LANES;
+}
+
+#endif
+
 void NetChaCha20Block(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
                       const uint8_t nonce[NET_NONCE_SIZE], uint8_t output[64])
 {
@@ -106,6 +526,29 @@ void NetChaCha20Xor(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
     uint32_t state[16];
     uint8_t block[64];
     ChaChaSetup(state, key, counter, nonce);
+#if defined(NET_CHACHA_LANES)
+    const size_t group = (size_t)NET_CHACHA_LANES * 64u;
+    while (size >= group)
+    {
+        ChaChaXorLanes(state, input, output);
+        input += group;
+        output += group;
+        size -= group;
+    }
+    /* Неполную группу векторы считают быстрее скалярного кода с трёх блоков:
+     * остаток идёт через буфер группы. Два блока и меньше дешевле считать
+     * по одному — так считается большинство мелких пакетов. */
+    if (size > 128u)
+    {
+        uint8_t tail[(size_t)NET_CHACHA_LANES * 64u];
+        memset(tail, 0, sizeof(tail));
+        memcpy(tail, input, size);
+        ChaChaXorLanes(state, tail, tail);
+        memcpy(output, tail, size);
+        NetWipe(tail, sizeof(tail));
+        size = 0u;
+    }
+#endif
     while (size != 0u)
     {
         ChaChaBlock(state, block);
@@ -123,80 +566,59 @@ void NetChaCha20Xor(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
 
 /* ---- Poly1305 (RFC 8439, раздел 2.5) ------------------------------------------
  *
- * Аккумулятор и r хранятся пятью разрядами по 26 бит, поэтому произведения
- * и их суммы помещаются в 64 бита без переноса. По модулю 2^130 - 5 старшая
- * часть возвращается вниз умножением на 5. */
+ * Аккумулятор и r хранятся разрядами по 44, 44 и 42 бита. Произведение
+ * разрядов меньше 2^92, и суммы трёх таких копятся в Wide. По модулю
+ * 2^130 - 5 перенос за 2^130 возвращается вниз умножением на 5, а
+ * произведения с весом 2^132 — умножением на 20. */
 
-#define POLY_MASK UINT32_C(0x03FFFFFF)
+#define POLY_MASK44 ((UINT64_C(1) << 44u) - 1u)
+#define POLY_MASK42 ((UINT64_C(1) << 42u) - 1u)
 
 void NetPoly1305Begin(NetPoly1305 *state, const uint8_t key[NET_KEY_SIZE])
 {
-    uint8_t r[16];
-    memcpy(r, key, sizeof(r));
     /* Обрезка r из стандарта: старшие 4 бита байтов 3, 7, 11, 15 и младшие
      * 2 бита байтов 4, 8, 12 равны нулю. */
-    r[3] &= 15u;
-    r[7] &= 15u;
-    r[11] &= 15u;
-    r[15] &= 15u;
-    r[4] &= 252u;
-    r[8] &= 252u;
-    r[12] &= 252u;
-    const uint32_t t0 = Load32(r);
-    const uint32_t t1 = Load32(r + 4u);
-    const uint32_t t2 = Load32(r + 8u);
-    const uint32_t t3 = Load32(r + 12u);
-    state->r[0] = t0 & POLY_MASK;
-    state->r[1] = ((t0 >> 26u) | (t1 << 6u)) & POLY_MASK;
-    state->r[2] = ((t1 >> 20u) | (t2 << 12u)) & POLY_MASK;
-    state->r[3] = ((t2 >> 14u) | (t3 << 18u)) & POLY_MASK;
-    state->r[4] = t3 >> 8u;
-    for (uint32_t index = 0u; index < 5u; ++index)
+    const uint64_t t0 = Load64(key) & UINT64_C(0x0FFFFFFC0FFFFFFF);
+    const uint64_t t1 = Load64(key + 8u) & UINT64_C(0x0FFFFFFC0FFFFFFC);
+    state->r[0] = t0 & POLY_MASK44;
+    state->r[1] = ((t0 >> 44u) | (t1 << 20u)) & POLY_MASK44;
+    state->r[2] = t1 >> 24u;
+    for (uint32_t index = 0u; index < 3u; ++index)
         state->h[index] = 0u;
-    for (size_t index = 0u; index < 4u; ++index)
-        state->pad[index] = Load32(key + 16u + index * 4u);
+    state->pad[0] = Load64(key + 16u);
+    state->pad[1] = Load64(key + 24u);
     state->buffered = 0u;
-    NetWipe(r, sizeof(r));
 }
 
 /* h = (h + блок) * r. highBit — бит 2^128 полного блока; у дополненного
  * последнего блока единица уже стоит внутри 16 байт. */
-static void PolyBlock(NetPoly1305 *state, const uint8_t block[16], uint32_t highBit)
+static void PolyBlock(NetPoly1305 *state, const uint8_t block[16], uint64_t highBit)
 {
-    const uint32_t t0 = Load32(block);
-    const uint32_t t1 = Load32(block + 4u);
-    const uint32_t t2 = Load32(block + 8u);
-    const uint32_t t3 = Load32(block + 12u);
-    const uint64_t h0 = (uint64_t)state->h[0] + (t0 & POLY_MASK);
-    const uint64_t h1 = (uint64_t)state->h[1] + (((t0 >> 26u) | (t1 << 6u)) & POLY_MASK);
-    const uint64_t h2 = (uint64_t)state->h[2] + (((t1 >> 20u) | (t2 << 12u)) & POLY_MASK);
-    const uint64_t h3 = (uint64_t)state->h[3] + (((t2 >> 14u) | (t3 << 18u)) & POLY_MASK);
-    const uint64_t h4 = (uint64_t)state->h[4] + ((t3 >> 8u) | (highBit << 24u));
+    const uint64_t t0 = Load64(block);
+    const uint64_t t1 = Load64(block + 8u);
+    const uint64_t h0 = state->h[0] + (t0 & POLY_MASK44);
+    const uint64_t h1 = state->h[1] + (((t0 >> 44u) | (t1 << 20u)) & POLY_MASK44);
+    const uint64_t h2 = state->h[2] + ((t1 >> 24u) | (highBit << 40u));
     const uint64_t r0 = state->r[0];
     const uint64_t r1 = state->r[1];
     const uint64_t r2 = state->r[2];
-    const uint64_t r3 = state->r[3];
-    const uint64_t r4 = state->r[4];
-    const uint64_t s1 = r1 * 5u;
-    const uint64_t s2 = r2 * 5u;
-    const uint64_t s3 = r3 * 5u;
-    const uint64_t s4 = r4 * 5u;
-    uint64_t d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
-    uint64_t d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
-    uint64_t d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
-    uint64_t d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
-    uint64_t d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
-    d1 += d0 >> 26u;
-    d2 += d1 >> 26u;
-    d3 += d2 >> 26u;
-    d4 += d3 >> 26u;
-    d0 = (d0 & POLY_MASK) + (d4 >> 26u) * 5u;
-    d1 = (d1 & POLY_MASK) + (d0 >> 26u);
-    state->h[0] = (uint32_t)d0 & POLY_MASK;
-    state->h[1] = (uint32_t)d1;
-    state->h[2] = (uint32_t)d2 & POLY_MASK;
-    state->h[3] = (uint32_t)d3 & POLY_MASK;
-    state->h[4] = (uint32_t)d4 & POLY_MASK;
+    const uint64_t s1 = r1 * 20u;
+    const uint64_t s2 = r2 * 20u;
+    Wide d0 = WideMultiply(h0, r0);
+    d0 = WideMultiplyAdd(d0, h1, s2);
+    d0 = WideMultiplyAdd(d0, h2, s1);
+    Wide d1 = WideMultiply(h0, r1);
+    d1 = WideMultiplyAdd(d1, h1, r0);
+    d1 = WideMultiplyAdd(d1, h2, s2);
+    Wide d2 = WideMultiply(h0, r2);
+    d2 = WideMultiplyAdd(d2, h1, r1);
+    d2 = WideMultiplyAdd(d2, h2, r0);
+    d1 = WideAddSmall(d1, WideShift(d0, 44u));
+    d2 = WideAddSmall(d2, WideShift(d1, 44u));
+    const uint64_t low = (WideLow(d0) & POLY_MASK44) + WideShift(d2, 42u) * 5u;
+    state->h[0] = low & POLY_MASK44;
+    state->h[1] = (WideLow(d1) & POLY_MASK44) + (low >> 44u);
+    state->h[2] = WideLow(d2) & POLY_MASK42;
 }
 
 void NetPoly1305Update(NetPoly1305 *state, const uint8_t *bytes, size_t size)
@@ -235,59 +657,48 @@ void NetPoly1305Finish(NetPoly1305 *state, uint8_t tag[NET_TAG_SIZE])
             state->buffer[state->buffered++] = 0u;
         PolyBlock(state, state->buffer, 0u);
     }
-    uint32_t h0 = state->h[0];
-    uint32_t h1 = state->h[1];
-    uint32_t h2 = state->h[2];
-    uint32_t h3 = state->h[3];
-    uint32_t h4 = state->h[4];
-    uint32_t carry = h1 >> 26u;
-    h1 &= POLY_MASK;
-    h2 += carry;
-    carry = h2 >> 26u;
-    h2 &= POLY_MASK;
-    h3 += carry;
-    carry = h3 >> 26u;
-    h3 &= POLY_MASK;
-    h4 += carry;
-    carry = h4 >> 26u;
-    h4 &= POLY_MASK;
-    h0 += carry * 5u;
-    carry = h0 >> 26u;
-    h0 &= POLY_MASK;
-    h1 += carry;
+    uint64_t h0 = state->h[0];
+    uint64_t h1 = state->h[1];
+    uint64_t h2 = state->h[2];
+    /* Два полных переноса: разряды точно в своих границах. */
+    uint64_t carry = 0u;
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        carry = h1 >> 44u;
+        h1 &= POLY_MASK44;
+        h2 += carry;
+        carry = h2 >> 42u;
+        h2 &= POLY_MASK42;
+        h0 += carry * 5u;
+        carry = h0 >> 44u;
+        h0 &= POLY_MASK44;
+        h1 += carry;
+    }
     /* g = h + 5 - 2^130: неотрицательно ровно тогда, когда h >= 2^130 - 5. */
-    uint32_t g0 = h0 + 5u;
-    carry = g0 >> 26u;
-    g0 &= POLY_MASK;
-    uint32_t g1 = h1 + carry;
-    carry = g1 >> 26u;
-    g1 &= POLY_MASK;
-    uint32_t g2 = h2 + carry;
-    carry = g2 >> 26u;
-    g2 &= POLY_MASK;
-    uint32_t g3 = h3 + carry;
-    carry = g3 >> 26u;
-    g3 &= POLY_MASK;
-    const uint32_t g4 = h4 + carry - (UINT32_C(1) << 26u);
+    uint64_t g0 = h0 + 5u;
+    carry = g0 >> 44u;
+    g0 &= POLY_MASK44;
+    uint64_t g1 = h1 + carry;
+    carry = g1 >> 44u;
+    g1 &= POLY_MASK44;
+    const uint64_t g2 = h2 + carry - (UINT64_C(1) << 42u);
     /* Все единицы, если заём не случился, то есть нужно взять g. */
-    const uint32_t takeG = (g4 >> 31u) - 1u;
+    const uint64_t takeG = (g2 >> 63u) - 1u;
     h0 = (h0 & ~takeG) | (g0 & takeG);
     h1 = (h1 & ~takeG) | (g1 & takeG);
     h2 = (h2 & ~takeG) | (g2 & takeG);
-    h3 = (h3 & ~takeG) | (g3 & takeG);
-    h4 = (h4 & ~takeG) | (g4 & takeG);
-    const uint32_t word0 = h0 | (h1 << 26u);
-    const uint32_t word1 = (h1 >> 6u) | (h2 << 20u);
-    const uint32_t word2 = (h2 >> 12u) | (h3 << 14u);
-    const uint32_t word3 = (h3 >> 18u) | (h4 << 8u);
-    uint64_t sum = (uint64_t)word0 + state->pad[0];
-    Store32(tag, (uint32_t)sum);
-    sum = (uint64_t)word1 + state->pad[1] + (sum >> 32u);
-    Store32(tag + 4u, (uint32_t)sum);
-    sum = (uint64_t)word2 + state->pad[2] + (sum >> 32u);
-    Store32(tag + 8u, (uint32_t)sum);
-    sum = (uint64_t)word3 + state->pad[3] + (sum >> 32u);
-    Store32(tag + 12u, (uint32_t)sum);
+    /* Тег — h + s по модулю 2^128. */
+    const uint64_t s0 = state->pad[0];
+    const uint64_t s1 = state->pad[1];
+    h0 += s0 & POLY_MASK44;
+    carry = h0 >> 44u;
+    h0 &= POLY_MASK44;
+    h1 += (((s0 >> 44u) | (s1 << 20u)) & POLY_MASK44) + carry;
+    carry = h1 >> 44u;
+    h1 &= POLY_MASK44;
+    h2 += (s1 >> 24u) + carry;
+    Store64(tag, h0 | (h1 << 44u));
+    Store64(tag + 8u, (h1 >> 20u) | (h2 << 24u));
     NetWipe(state, sizeof(*state));
 }
 
@@ -355,145 +766,23 @@ bool NetAeadOpen(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_
 
 typedef uint64_t Field[5];
 
-/* Тест собирает переносимое 128-битное умножение и там, где компилятор
- * умеет быстрое. */
-#if defined(__SIZEOF_INT128__) && !defined(NET_CRYPTO_PORTABLE)
-
-/* GCC и Clang, включая clang-cl, держат 128-битное целое на 64-битных целях:
- * произведение становится одной инструкцией, сумма — парой. */
-#if defined(__GNUC__)
-__extension__ typedef unsigned __int128 Wide;
-#else
-typedef unsigned __int128 Wide;
-#endif
-
-static Wide WideMultiply(uint64_t left, uint64_t right)
-{
-    return (Wide)left * right;
-}
-
-static Wide WideAdd(Wide sum, Wide value)
-{
-    return sum + value;
-}
-
-static Wide WideAddSmall(Wide sum, uint64_t value)
-{
-    return sum + value;
-}
-
-static uint64_t WideLow51(Wide value)
-{
-    return (uint64_t)value & FIELD_MASK;
-}
-
-/* value >> 51; value меньше 2^115. */
-static uint64_t WideHigh51(Wide value)
-{
-    return (uint64_t)(value >> 51u);
-}
-
-#else
-
-typedef struct Wide
-{
-    uint64_t low;
-    uint64_t high;
-} Wide;
-
-#if defined(_MSC_VER) && !defined(__clang__) && !defined(NET_CRYPTO_PORTABLE) &&                   \
-    (defined(_M_X64) || defined(_M_ARM64))
-#define NET_MSVC_WIDE 1
-#endif
-
-static Wide WideMultiply(uint64_t left, uint64_t right)
-{
-    Wide product;
-#if defined(NET_MSVC_WIDE) && defined(_M_X64)
-    product.low = _umul128(left, right, &product.high);
-#elif defined(NET_MSVC_WIDE)
-    product.low = left * right;
-    product.high = __umulh(left, right);
-#else
-    /* Четыре произведения 32 на 32 бита. */
-    const uint64_t leftLow = (uint32_t)left;
-    const uint64_t leftHigh = left >> 32u;
-    const uint64_t rightLow = (uint32_t)right;
-    const uint64_t rightHigh = right >> 32u;
-    const uint64_t lowProduct = leftLow * rightLow;
-    const uint64_t crossLeft = leftHigh * rightLow;
-    const uint64_t crossRight = leftLow * rightHigh;
-    const uint64_t middle = (lowProduct >> 32u) + (uint32_t)crossLeft + (uint32_t)crossRight;
-    product.low = (middle << 32u) | (uint32_t)lowProduct;
-    product.high =
-        leftHigh * rightHigh + (crossLeft >> 32u) + (crossRight >> 32u) + (middle >> 32u);
-#endif
-    return product;
-}
-
-static Wide WideAdd(Wide sum, Wide value)
-{
-#if defined(NET_MSVC_WIDE) && defined(_M_X64)
-    const unsigned char carry = _addcarry_u64(0u, sum.low, value.low, &sum.low);
-    (void)_addcarry_u64(carry, sum.high, value.high, &sum.high);
-#else
-    /* Перенос — старший бит выражения, а не сравнение: время не зависит от
-     * значений и там, где компилятор не знает инструкции сложения с
-     * переносом. */
-    const uint64_t low = sum.low + value.low;
-    const uint64_t carry = ((sum.low & value.low) | ((sum.low | value.low) & ~low)) >> 63u;
-    sum.low = low;
-    sum.high += value.high + carry;
-#endif
-    return sum;
-}
-
-static Wide WideAddSmall(Wide sum, uint64_t value)
-{
-    const Wide wide = {value, 0u};
-    return WideAdd(sum, wide);
-}
-
-static uint64_t WideLow51(Wide value)
-{
-    return value.low & FIELD_MASK;
-}
-
-/* value >> 51; value меньше 2^115. */
-static uint64_t WideHigh51(Wide value)
-{
-    return (value.high << 13u) | (value.low >> 51u);
-}
-
-#endif
-
-static Wide WideMultiplyAdd(Wide sum, uint64_t left, uint64_t right)
-{
-    return WideAdd(sum, WideMultiply(left, right));
-}
-
-static uint64_t Load64(const uint8_t *bytes)
-{
-    return (uint64_t)Load32(bytes) | ((uint64_t)Load32(bytes + 4u) << 32u);
-}
-
 /* Суммы произведений для пяти разрядов становятся почти приведённым
  * элементом. Каждая сумма меньше 2^115. */
 static void FieldReduce(Field output, Wide t0, Wide t1, Wide t2, Wide t3, Wide t4)
 {
-    t1 = WideAddSmall(t1, WideHigh51(t0));
-    t2 = WideAddSmall(t2, WideHigh51(t1));
-    t3 = WideAddSmall(t3, WideHigh51(t2));
-    t4 = WideAddSmall(t4, WideHigh51(t3));
+    t1 = WideAddSmall(t1, WideShift(t0, 51u));
+    t2 = WideAddSmall(t2, WideShift(t1, 51u));
+    t3 = WideAddSmall(t3, WideShift(t2, 51u));
+    t4 = WideAddSmall(t4, WideShift(t3, 51u));
     /* 2^255 = 19 по модулю p. Сумма старшего разряда — не больше пяти
      * произведений без множителя 19, перенос из неё меньше 5 * 2^57 + 2^13,
      * и младший разряд с ним остаётся меньше 2^64. */
-    const uint64_t low = WideLow51(t0) + 19u * WideHigh51(t4);
+    const uint64_t low = (WideLow(t0) & FIELD_MASK) + 19u * WideShift(t4, 51u);
     output[0] = low & FIELD_MASK;
-    output[1] = WideLow51(t1) + (low >> 51u);
-    output[2] = WideLow51(t2);
-    output[3] = WideLow51(t3);
-    output[4] = WideLow51(t4);
+    output[1] = (WideLow(t1) & FIELD_MASK) + (low >> 51u);
+    output[2] = WideLow(t2) & FIELD_MASK;
+    output[3] = WideLow(t3) & FIELD_MASK;
+    output[4] = WideLow(t4) & FIELD_MASK;
 }
 
 static void FieldAdd(Field output, const Field left, const Field right)

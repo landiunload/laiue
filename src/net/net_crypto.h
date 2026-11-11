@@ -30,9 +30,9 @@ void NetChaCha20Xor(const uint8_t key[NET_KEY_SIZE], uint32_t counter,
 
 typedef struct NetPoly1305
 {
-    uint32_t r[5];
-    uint32_t h[5];
-    uint32_t pad[4];
+    uint64_t r[3];
+    uint64_t h[3];
+    uint64_t pad[2];
     uint8_t buffer[16];
     uint32_t buffered;
 } NetPoly1305;

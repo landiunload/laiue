@@ -173,8 +173,8 @@ laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
 # Net. The primitives are internal, so their test compiles the source itself.
 laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.c
     "${laiue_src}/net/net_crypto.c" STATIC TEST laiue.net.crypto TIMEOUT 120)
-# The same checks over the portable 128-bit product, which compilers with
-# __int128 and MSVC replace with their own.
+# The same checks without vectors and over the portable 128-bit product, which
+# the build otherwise replaces with SIMD, __int128 or MSVC intrinsics.
 laiue_add_harness(laiue_net_crypto_portable_test NetCryptoTestEntryPoint net_crypto_test.c
     "${laiue_src}/net/net_crypto.c" STATIC DEFINITIONS NET_CRYPTO_PORTABLE=1
     TEST laiue.net.crypto_portable TIMEOUT 120)
