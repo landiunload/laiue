@@ -42,6 +42,11 @@ typedef struct SimPort
 struct LaiueNetSimulator
 {
     SimPort **ports;
+    /* Порты по адресу: открытая адресация, в ячейке номер порта плюс один,
+     * ноль — пусто. Ёмкость — степень двойки, вдвое больше числа портов:
+     * поиск получателя каждой датаграммы не зависит от числа портов. */
+    uint32_t *slots;
+    uint32_t slotMask;
     uint32_t portCount;
     uint32_t portCapacity;
     LaiueNetSimulatorConditions conditions;
@@ -128,14 +133,66 @@ static SimDatagram *HeapPop(SimPort *port)
     return top;
 }
 
+/* Хеш ровно тех полей, которые сравнивает LaiueNetAddressEqual: FNV-1a по
+ * байтам адреса и перемешивание из MurmurHash3, чтобы младшие биты, по
+ * которым выбирается ячейка, зависели и от порта. */
+static uint32_t AddressHash(const LaiueNetAddress *address)
+{
+    const bool ipv4 = address->family == LAIUE_NET_FAMILY_IPV4;
+    uint64_t hash = ((uint64_t)address->family << 48u) ^ ((uint64_t)address->port << 32u) ^
+                    (ipv4 ? 0u : address->scope);
+    const uint32_t length = ipv4 ? 4u : (uint32_t)sizeof(address->ip);
+    for (uint32_t index = 0u; index < length; ++index)
+        hash = (hash ^ address->ip[index]) * UINT64_C(0x100000001B3);
+    hash = (hash ^ (hash >> 33u)) * UINT64_C(0xFF51AFD7ED558CCD);
+    hash = (hash ^ (hash >> 33u)) * UINT64_C(0xC4CEB9FE1A85EC53);
+    return (uint32_t)(hash ^ (hash >> 33u));
+}
+
 static SimPort *FindPort(const LaiueNetSimulator *simulator, const LaiueNetAddress *address)
 {
-    for (uint32_t index = 0u; index < simulator->portCount; ++index)
+    if (simulator->slots == NULL)
+        return NULL;
+    uint32_t slot = AddressHash(address) & simulator->slotMask;
+    while (simulator->slots[slot] != 0u)
     {
-        if (LaiueNetAddressEqual(&simulator->ports[index]->address, address))
-            return simulator->ports[index];
+        SimPort *port = simulator->ports[simulator->slots[slot] - 1u];
+        if (LaiueNetAddressEqual(&port->address, address))
+            return port;
+        slot = (slot + 1u) & simulator->slotMask;
     }
     return NULL;
+}
+
+static void SlotInsert(LaiueNetSimulator *simulator, uint32_t portIndex)
+{
+    uint32_t slot = AddressHash(&simulator->ports[portIndex]->address) & simulator->slotMask;
+    while (simulator->slots[slot] != 0u)
+        slot = (slot + 1u) & simulator->slotMask;
+    simulator->slots[slot] = portIndex + 1u;
+}
+
+/* Таблица для count портов заполнена не больше чем наполовину; при нехватке
+ * строится вдвое большая. */
+static bool SlotsReserve(LaiueNetSimulator *simulator, uint32_t count)
+{
+    const uint32_t capacity = simulator->slots != NULL ? simulator->slotMask + 1u : 0u;
+    if ((uint64_t)count * 2u <= capacity)
+        return true;
+    if (count > (UINT32_C(1) << 30u))
+        return false;
+    uint32_t grown = capacity != 0u ? capacity * 2u : 16u;
+    while (count * 2u > grown)
+        grown *= 2u;
+    uint32_t *slots = PlatformAllocate((size_t)grown * sizeof(uint32_t), true);
+    if (slots == NULL)
+        return false;
+    PlatformFree(simulator->slots);
+    simulator->slots = slots;
+    simulator->slotMask = grown - 1u;
+    for (uint32_t index = 0u; index < simulator->portCount; ++index)
+        SlotInsert(simulator, index);
+    return true;
 }
 
 /* Ставит датаграмму в очередь получателя; при переполнении она теряется. */
@@ -277,6 +334,7 @@ void LaiueNetSimulatorDestroy(LaiueNetSimulator *simulator)
         PlatformFree(port);
     }
     PlatformFree((void *)simulator->ports);
+    PlatformFree(simulator->slots);
     PlatformFree(simulator);
 }
 
@@ -296,12 +354,15 @@ LaiueNetStatus LaiueNetSimulatorOpen(LaiueNetSimulator *simulator, const LaiueNe
         simulator->ports = ports;
         simulator->portCapacity = capacity;
     }
+    if (!SlotsReserve(simulator, simulator->portCount + 1u))
+        return LAIUE_NET_OUT_OF_MEMORY;
     SimPort *port = PlatformAllocate(sizeof(*port), true);
     if (port == NULL)
         return LAIUE_NET_OUT_OF_MEMORY;
     port->simulator = simulator;
     port->address = *address;
     simulator->ports[simulator->portCount] = port;
+    SlotInsert(simulator, simulator->portCount);
     ++simulator->portCount;
     outDriver->structSize = sizeof(*outDriver);
     outDriver->context = port;
