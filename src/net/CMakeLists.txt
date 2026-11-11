@@ -18,6 +18,7 @@ laiue_add_module(net
         net_wire.c
         net_address.c
         net_channel.c
+        net_congestion.c
         net_packet.c
         net_handshake.c
         net_endpoint.c
