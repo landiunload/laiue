@@ -173,6 +173,11 @@ laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
 # Net. The primitives are internal, so their test compiles the source itself.
 laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.c
     "${laiue_src}/net/net_crypto.c" STATIC TEST laiue.net.crypto TIMEOUT 120)
+# The same checks over the portable 128-bit product, which compilers with
+# __int128 and MSVC replace with their own.
+laiue_add_harness(laiue_net_crypto_portable_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC DEFINITIONS NET_CRYPTO_PORTABLE=1
+    TEST laiue.net.crypto_portable TIMEOUT 120)
 laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
     LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
 if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))

@@ -4,6 +4,10 @@
 
 #include <string.h>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 static uint32_t Load32(const uint8_t *bytes)
 {
     return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8u) | ((uint32_t)bytes[2] << 16u) |
@@ -333,64 +337,277 @@ bool NetAeadOpen(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_
 
 /* ---- X25519 (RFC 7748) ----------------------------------------------------------
  *
- * Элемент поля 2^255 - 19 — шестнадцать разрядов по 16 бит в uint64_t.
- * Разряды всегда неотрицательны: вычитание прибавляет 8p, поэтому знаковых
- * сдвигов нет. «Почти приведённый» элемент — выход умножения: все разряды
- * меньше 2^16, кроме младшего, который меньше 2^16 + 38. Сложение даёт
- * разряды меньше 2^18, вычитание — меньше 2^20, и умножение принимает
- * именно такие: шестнадцать произведений по 2^40 и свёртка старшей половины
- * множителем 38 остаются меньше 2^50. */
+ * Элемент поля 2^255 - 19 — пять разрядов по 51 биту в uint64_t: разряд i
+ * весит 2^(51i). Произведение двух разрядов занимает до 108 бит, и суммы
+ * таких произведений копятся в 128-битном Wide. Разряды всегда
+ * неотрицательны: вычитание прибавляет 2p, поэтому знаковых сдвигов нет.
+ *
+ * «Почти приведённый» элемент — выход умножения и возведения в квадрат: все
+ * разряды меньше 2^51, кроме второго, который меньше 2^51 + 2^13. Сумма двух
+ * таких элементов и разность почти приведённых дают разряды меньше 2^53, а
+ * умножение принимает разряды до 2^54: в сумме для разряда пять
+ * произведений, и у четырёх из них множитель 19, поэтому она меньше 2^115, а
+ * перенос из неё помещается в 64 бита. */
 
-typedef uint64_t Field[16];
+#define FIELD_MASK ((UINT64_C(1) << 51u) - 1u)
+/* (486662 - 2) / 4 */
+#define FIELD_A24 UINT64_C(121665)
 
-static void FieldCarry(Field value)
+typedef uint64_t Field[5];
+
+/* Тест собирает переносимое 128-битное умножение и там, где компилятор
+ * умеет быстрое. */
+#if defined(__SIZEOF_INT128__) && !defined(NET_CRYPTO_PORTABLE)
+
+/* GCC и Clang, включая clang-cl, держат 128-битное целое на 64-битных целях:
+ * произведение становится одной инструкцией, сумма — парой. */
+#if defined(__GNUC__)
+__extension__ typedef unsigned __int128 Wide;
+#else
+typedef unsigned __int128 Wide;
+#endif
+
+static Wide WideMultiply(uint64_t left, uint64_t right)
 {
-    for (uint32_t index = 0u; index < 15u; ++index)
-    {
-        value[index + 1u] += value[index] >> 16u;
-        value[index] &= 0xFFFFu;
-    }
-    /* 2^256 = 38 по модулю p. */
-    const uint64_t top = value[15] >> 16u;
-    value[15] &= 0xFFFFu;
-    value[0] += 38u * top;
+    return (Wide)left * right;
+}
+
+static Wide WideAdd(Wide sum, Wide value)
+{
+    return sum + value;
+}
+
+static Wide WideAddSmall(Wide sum, uint64_t value)
+{
+    return sum + value;
+}
+
+static uint64_t WideLow51(Wide value)
+{
+    return (uint64_t)value & FIELD_MASK;
+}
+
+/* value >> 51; value меньше 2^115. */
+static uint64_t WideHigh51(Wide value)
+{
+    return (uint64_t)(value >> 51u);
+}
+
+#else
+
+typedef struct Wide
+{
+    uint64_t low;
+    uint64_t high;
+} Wide;
+
+#if defined(_MSC_VER) && !defined(__clang__) && !defined(NET_CRYPTO_PORTABLE) &&                   \
+    (defined(_M_X64) || defined(_M_ARM64))
+#define NET_MSVC_WIDE 1
+#endif
+
+static Wide WideMultiply(uint64_t left, uint64_t right)
+{
+    Wide product;
+#if defined(NET_MSVC_WIDE) && defined(_M_X64)
+    product.low = _umul128(left, right, &product.high);
+#elif defined(NET_MSVC_WIDE)
+    product.low = left * right;
+    product.high = __umulh(left, right);
+#else
+    /* Четыре произведения 32 на 32 бита. */
+    const uint64_t leftLow = (uint32_t)left;
+    const uint64_t leftHigh = left >> 32u;
+    const uint64_t rightLow = (uint32_t)right;
+    const uint64_t rightHigh = right >> 32u;
+    const uint64_t lowProduct = leftLow * rightLow;
+    const uint64_t crossLeft = leftHigh * rightLow;
+    const uint64_t crossRight = leftLow * rightHigh;
+    const uint64_t middle = (lowProduct >> 32u) + (uint32_t)crossLeft + (uint32_t)crossRight;
+    product.low = (middle << 32u) | (uint32_t)lowProduct;
+    product.high =
+        leftHigh * rightHigh + (crossLeft >> 32u) + (crossRight >> 32u) + (middle >> 32u);
+#endif
+    return product;
+}
+
+static Wide WideAdd(Wide sum, Wide value)
+{
+#if defined(NET_MSVC_WIDE) && defined(_M_X64)
+    const unsigned char carry = _addcarry_u64(0u, sum.low, value.low, &sum.low);
+    (void)_addcarry_u64(carry, sum.high, value.high, &sum.high);
+#else
+    /* Перенос — старший бит выражения, а не сравнение: время не зависит от
+     * значений и там, где компилятор не знает инструкции сложения с
+     * переносом. */
+    const uint64_t low = sum.low + value.low;
+    const uint64_t carry = ((sum.low & value.low) | ((sum.low | value.low) & ~low)) >> 63u;
+    sum.low = low;
+    sum.high += value.high + carry;
+#endif
+    return sum;
+}
+
+static Wide WideAddSmall(Wide sum, uint64_t value)
+{
+    const Wide wide = {value, 0u};
+    return WideAdd(sum, wide);
+}
+
+static uint64_t WideLow51(Wide value)
+{
+    return value.low & FIELD_MASK;
+}
+
+/* value >> 51; value меньше 2^115. */
+static uint64_t WideHigh51(Wide value)
+{
+    return (value.high << 13u) | (value.low >> 51u);
+}
+
+#endif
+
+static Wide WideMultiplyAdd(Wide sum, uint64_t left, uint64_t right)
+{
+    return WideAdd(sum, WideMultiply(left, right));
+}
+
+static uint64_t Load64(const uint8_t *bytes)
+{
+    return (uint64_t)Load32(bytes) | ((uint64_t)Load32(bytes + 4u) << 32u);
+}
+
+/* Суммы произведений для пяти разрядов становятся почти приведённым
+ * элементом. Каждая сумма меньше 2^115. */
+static void FieldReduce(Field output, Wide t0, Wide t1, Wide t2, Wide t3, Wide t4)
+{
+    t1 = WideAddSmall(t1, WideHigh51(t0));
+    t2 = WideAddSmall(t2, WideHigh51(t1));
+    t3 = WideAddSmall(t3, WideHigh51(t2));
+    t4 = WideAddSmall(t4, WideHigh51(t3));
+    /* 2^255 = 19 по модулю p. Сумма старшего разряда — не больше пяти
+     * произведений без множителя 19, перенос из неё меньше 5 * 2^57 + 2^13,
+     * и младший разряд с ним остаётся меньше 2^64. */
+    const uint64_t low = WideLow51(t0) + 19u * WideHigh51(t4);
+    output[0] = low & FIELD_MASK;
+    output[1] = WideLow51(t1) + (low >> 51u);
+    output[2] = WideLow51(t2);
+    output[3] = WideLow51(t3);
+    output[4] = WideLow51(t4);
 }
 
 static void FieldAdd(Field output, const Field left, const Field right)
 {
-    for (uint32_t index = 0u; index < 16u; ++index)
+    for (uint32_t index = 0u; index < 5u; ++index)
         output[index] = left[index] + right[index];
 }
 
-/* right обязан быть почти приведённым. */
+/* left + 2p - right. right обязан быть почти приведённым: тогда каждый его
+ * разряд не больше разряда числа 2p. */
 static void FieldSubtract(Field output, const Field left, const Field right)
 {
-    /* Разряды числа 8p: вычитаемое их не превышает. */
-    output[0] = left[0] + UINT64_C(0x7FF68) - right[0];
-    for (uint32_t index = 1u; index < 15u; ++index)
-        output[index] = left[index] + UINT64_C(0x7FFF8) - right[index];
-    output[15] = left[15] + UINT64_C(0x3FFF8) - right[15];
+    output[0] = left[0] + ((UINT64_C(1) << 52u) - 38u) - right[0];
+    for (uint32_t index = 1u; index < 5u; ++index)
+        output[index] = left[index] + ((UINT64_C(1) << 52u) - 2u) - right[index];
 }
 
 static void FieldMultiply(Field output, const Field left, const Field right)
 {
-    uint64_t product[31] = {0};
-    for (uint32_t i = 0u; i < 16u; ++i)
-        for (uint32_t j = 0u; j < 16u; ++j)
-            product[i + j] += left[i] * right[j];
-    for (uint32_t index = 0u; index < 15u; ++index)
-        product[index] += 38u * product[index + 16u];
-    for (uint32_t index = 0u; index < 16u; ++index)
-        output[index] = product[index];
-    FieldCarry(output);
-    FieldCarry(output);
+    const uint64_t f0 = left[0];
+    const uint64_t f1 = left[1];
+    const uint64_t f2 = left[2];
+    const uint64_t f3 = left[3];
+    const uint64_t f4 = left[4];
+    const uint64_t g0 = right[0];
+    const uint64_t g1 = right[1];
+    const uint64_t g2 = right[2];
+    const uint64_t g3 = right[3];
+    const uint64_t g4 = right[4];
+    /* Произведения с весом 2^255 и выше сворачиваются множителем 19. */
+    const uint64_t g1x19 = 19u * g1;
+    const uint64_t g2x19 = 19u * g2;
+    const uint64_t g3x19 = 19u * g3;
+    const uint64_t g4x19 = 19u * g4;
+    Wide t0 = WideMultiply(f0, g0);
+    t0 = WideMultiplyAdd(t0, f1, g4x19);
+    t0 = WideMultiplyAdd(t0, f2, g3x19);
+    t0 = WideMultiplyAdd(t0, f3, g2x19);
+    t0 = WideMultiplyAdd(t0, f4, g1x19);
+    Wide t1 = WideMultiply(f0, g1);
+    t1 = WideMultiplyAdd(t1, f1, g0);
+    t1 = WideMultiplyAdd(t1, f2, g4x19);
+    t1 = WideMultiplyAdd(t1, f3, g3x19);
+    t1 = WideMultiplyAdd(t1, f4, g2x19);
+    Wide t2 = WideMultiply(f0, g2);
+    t2 = WideMultiplyAdd(t2, f1, g1);
+    t2 = WideMultiplyAdd(t2, f2, g0);
+    t2 = WideMultiplyAdd(t2, f3, g4x19);
+    t2 = WideMultiplyAdd(t2, f4, g3x19);
+    Wide t3 = WideMultiply(f0, g3);
+    t3 = WideMultiplyAdd(t3, f1, g2);
+    t3 = WideMultiplyAdd(t3, f2, g1);
+    t3 = WideMultiplyAdd(t3, f3, g0);
+    t3 = WideMultiplyAdd(t3, f4, g4x19);
+    Wide t4 = WideMultiply(f0, g4);
+    t4 = WideMultiplyAdd(t4, f1, g3);
+    t4 = WideMultiplyAdd(t4, f2, g2);
+    t4 = WideMultiplyAdd(t4, f3, g1);
+    t4 = WideMultiplyAdd(t4, f4, g0);
+    FieldReduce(output, t0, t1, t2, t3, t4);
+}
+
+/* Квадрат: пятнадцать произведений вместо двадцати пяти. */
+static void FieldSquare(Field output, const Field value)
+{
+    const uint64_t f0 = value[0];
+    const uint64_t f1 = value[1];
+    const uint64_t f2 = value[2];
+    const uint64_t f3 = value[3];
+    const uint64_t f4 = value[4];
+    const uint64_t f0x2 = 2u * f0;
+    const uint64_t f1x2 = 2u * f1;
+    const uint64_t f2x2 = 2u * f2;
+    const uint64_t f3x2 = 2u * f3;
+    const uint64_t f3x19 = 19u * f3;
+    const uint64_t f4x19 = 19u * f4;
+    Wide t0 = WideMultiply(f0, f0);
+    t0 = WideMultiplyAdd(t0, f1x2, f4x19);
+    t0 = WideMultiplyAdd(t0, f2x2, f3x19);
+    Wide t1 = WideMultiply(f0x2, f1);
+    t1 = WideMultiplyAdd(t1, f2x2, f4x19);
+    t1 = WideMultiplyAdd(t1, f3, f3x19);
+    Wide t2 = WideMultiply(f0x2, f2);
+    t2 = WideMultiplyAdd(t2, f1, f1);
+    t2 = WideMultiplyAdd(t2, f3x2, f4x19);
+    Wide t3 = WideMultiply(f0x2, f3);
+    t3 = WideMultiplyAdd(t3, f1x2, f2);
+    t3 = WideMultiplyAdd(t3, f4, f4x19);
+    Wide t4 = WideMultiply(f0x2, f4);
+    t4 = WideMultiplyAdd(t4, f1x2, f3);
+    t4 = WideMultiplyAdd(t4, f2, f2);
+    FieldReduce(output, t0, t1, t2, t3, t4);
+}
+
+/* value^(2^count), count не меньше единицы. */
+static void FieldSquareTimes(Field output, const Field value, uint32_t count)
+{
+    FieldSquare(output, value);
+    for (uint32_t index = 1u; index < count; ++index)
+        FieldSquare(output, output);
+}
+
+static void FieldMultiplyA24(Field output, const Field value)
+{
+    FieldReduce(output, WideMultiply(value[0], FIELD_A24), WideMultiply(value[1], FIELD_A24),
+                WideMultiply(value[2], FIELD_A24), WideMultiply(value[3], FIELD_A24),
+                WideMultiply(value[4], FIELD_A24));
 }
 
 /* Обмен без ветвления: swap равен 0 или 1. */
 static void FieldSwap(Field left, Field right, uint64_t swap)
 {
     const uint64_t mask = 0u - swap;
-    for (uint32_t index = 0u; index < 16u; ++index)
+    for (uint32_t index = 0u; index < 5u; ++index)
     {
         const uint64_t difference = mask & (left[index] ^ right[index]);
         left[index] ^= difference;
@@ -398,64 +615,100 @@ static void FieldSwap(Field left, Field right, uint64_t swap)
     }
 }
 
-/* value^(p - 2): показатель 2^255 - 21 состоит из единиц, кроме битов 2 и 4. */
+/* value^(p - 2) = value^(2^255 - 21): 254 возведения в квадрат и 11
+ * умножений. onesN — value^(2^N - 1), показатель из N единиц. */
 static void FieldInvert(Field output, const Field value)
 {
-    Field result;
-    memcpy(result, value, sizeof(Field));
-    for (int32_t bit = 253; bit >= 0; --bit)
-    {
-        FieldMultiply(result, result, result);
-        if (bit != 2 && bit != 4)
-            FieldMultiply(result, result, value);
-    }
-    memcpy(output, result, sizeof(Field));
+    Field square;
+    Field power9;
+    Field power11;
+    Field ones5;
+    Field ones10;
+    Field ones20;
+    Field ones50;
+    Field ones100;
+    Field power;
+    FieldSquare(square, value);
+    FieldSquareTimes(power, square, 2u);
+    FieldMultiply(power9, power, value);
+    FieldMultiply(power11, power9, square);
+    FieldSquare(power, power11);
+    FieldMultiply(ones5, power, power9);
+    FieldSquareTimes(power, ones5, 5u);
+    FieldMultiply(ones10, power, ones5);
+    FieldSquareTimes(power, ones10, 10u);
+    FieldMultiply(ones20, power, ones10);
+    FieldSquareTimes(power, ones20, 20u);
+    FieldMultiply(power, power, ones20);
+    FieldSquareTimes(power, power, 10u);
+    FieldMultiply(ones50, power, ones10);
+    FieldSquareTimes(power, ones50, 50u);
+    FieldMultiply(ones100, power, ones50);
+    FieldSquareTimes(power, ones100, 100u);
+    FieldMultiply(power, power, ones100);
+    FieldSquareTimes(power, power, 50u);
+    FieldMultiply(power, power, ones50);
+    /* 2^255 - 32, затем + 11. */
+    FieldSquareTimes(power, power, 5u);
+    FieldMultiply(output, power, power11);
+    NetWipe(square, sizeof(Field));
+    NetWipe(power9, sizeof(Field));
+    NetWipe(power11, sizeof(Field));
+    NetWipe(ones5, sizeof(Field));
+    NetWipe(ones10, sizeof(Field));
+    NetWipe(ones20, sizeof(Field));
+    NetWipe(ones50, sizeof(Field));
+    NetWipe(ones100, sizeof(Field));
+    NetWipe(power, sizeof(Field));
 }
 
 static void FieldUnpack(Field output, const uint8_t bytes[NET_KEY_SIZE])
 {
-    for (size_t index = 0u; index < 16u; ++index)
-        output[index] = (uint64_t)bytes[index * 2u] | ((uint64_t)bytes[index * 2u + 1u] << 8u);
-    /* Старший бит u-координаты не используется. */
-    output[15] &= 0x7FFFu;
+    /* Разряд i начинается с бита 51i. Старший бит u-координаты не
+     * используется: маска старшего разряда его отбрасывает. */
+    output[0] = Load64(bytes) & FIELD_MASK;
+    output[1] = (Load64(bytes + 6u) >> 3u) & FIELD_MASK;
+    output[2] = (Load64(bytes + 12u) >> 6u) & FIELD_MASK;
+    output[3] = (Load64(bytes + 19u) >> 1u) & FIELD_MASK;
+    output[4] = (Load64(bytes + 24u) >> 12u) & FIELD_MASK;
 }
 
-/* Канонический вид: значение строго меньше p. value почти приведён. */
+/* Канонический вид: значение строго меньше p. value почти приведён, то есть
+ * меньше 2^255 + 2^64 и тем более меньше 2p. */
 static void FieldPack(uint8_t bytes[NET_KEY_SIZE], const Field value)
 {
-    Field reduced;
-    memcpy(reduced, value, sizeof(Field));
-    FieldCarry(reduced);
-    FieldCarry(reduced);
-    /* Теперь значение меньше 2^256 = 2p + 38: p вычитается не больше двух раз. */
-    for (uint32_t pass = 0u; pass < 2u; ++pass)
-    {
-        Field lowered;
-        uint64_t borrow = 0u;
-        for (uint32_t index = 0u; index < 16u; ++index)
-        {
-            const uint64_t prime = index == 0u ? 0xFFEDu : index == 15u ? 0x7FFFu : 0xFFFFu;
-            const uint64_t difference = reduced[index] - prime - borrow;
-            borrow = difference >> 63u;
-            lowered[index] = difference & 0xFFFFu;
-        }
-        /* Все единицы, если заёма нет и значение было не меньше p. */
-        const uint64_t take = borrow - 1u;
-        for (uint32_t index = 0u; index < 16u; ++index)
-            reduced[index] = (reduced[index] & ~take) | (lowered[index] & take);
-    }
-    for (size_t index = 0u; index < 16u; ++index)
-    {
-        bytes[index * 2u] = (uint8_t)reduced[index];
-        bytes[index * 2u + 1u] = (uint8_t)(reduced[index] >> 8u);
-    }
+    uint64_t f0 = value[0];
+    uint64_t f1 = value[1];
+    uint64_t f2 = value[2];
+    uint64_t f3 = value[3];
+    uint64_t f4 = value[4];
+    /* Цепочка переносов числа value + 19 даёт его бит 2^255: единица ровно
+     * тогда, когда value не меньше p, и тогда p вычитается один раз —
+     * прибавлением 19 и отбрасыванием этого бита. */
+    uint64_t carry = (f0 + 19u) >> 51u;
+    carry = (f1 + carry) >> 51u;
+    carry = (f2 + carry) >> 51u;
+    carry = (f3 + carry) >> 51u;
+    carry = (f4 + carry) >> 51u;
+    f0 += 19u * carry;
+    f1 += f0 >> 51u;
+    f0 &= FIELD_MASK;
+    f2 += f1 >> 51u;
+    f1 &= FIELD_MASK;
+    f3 += f2 >> 51u;
+    f2 &= FIELD_MASK;
+    f4 += f3 >> 51u;
+    f3 &= FIELD_MASK;
+    f4 &= FIELD_MASK;
+    Store64(bytes, f0 | (f1 << 51u));
+    Store64(bytes + 8u, (f1 >> 13u) | (f2 << 38u));
+    Store64(bytes + 16u, (f2 >> 26u) | (f3 << 25u));
+    Store64(bytes + 24u, (f3 >> 39u) | (f4 << 12u));
 }
 
 bool NetX25519(const uint8_t scalar[NET_KEY_SIZE], const uint8_t point[NET_KEY_SIZE],
                uint8_t output[NET_KEY_SIZE])
 {
-    /* (486662 - 2) / 4 */
-    static const Field a24 = {0xDB41u, 1u};
     uint8_t clamped[NET_KEY_SIZE];
     memcpy(clamped, scalar, NET_KEY_SIZE);
     clamped[0] &= 248u;
@@ -488,18 +741,18 @@ bool NetX25519(const uint8_t scalar[NET_KEY_SIZE], const uint8_t point[NET_KEY_S
         FieldSubtract(b, x2, z2);
         FieldAdd(c, x3, z3);
         FieldSubtract(d, x3, z3);
-        FieldMultiply(aa, a, a);
-        FieldMultiply(bb, b, b);
+        FieldSquare(aa, a);
+        FieldSquare(bb, b);
         FieldSubtract(e, aa, bb);
         FieldMultiply(d, d, a);
         FieldMultiply(c, c, b);
         FieldAdd(x3, d, c);
-        FieldMultiply(x3, x3, x3);
+        FieldSquare(x3, x3);
         FieldSubtract(z3, d, c);
-        FieldMultiply(z3, z3, z3);
+        FieldSquare(z3, z3);
         FieldMultiply(z3, z3, x1);
         FieldMultiply(x2, aa, bb);
-        FieldMultiply(z2, a24, e);
+        FieldMultiplyA24(z2, e);
         FieldAdd(z2, z2, aa);
         FieldMultiply(z2, z2, e);
     }

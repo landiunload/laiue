@@ -12,6 +12,14 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Release LTO не должен сплющить эталон и сценарии в точку входа: кадр
+ * перерос бы страницу и потребовал __chkstk, которого в no-CRT сборке нет. */
+#if defined(_MSC_VER)
+#define CRYPTO_TEST_NOINLINE __declspec(noinline)
+#else
+#define CRYPTO_TEST_NOINLINE __attribute__((noinline))
+#endif
+
 typedef struct PolyCase
 {
     uint8_t key[32];
@@ -402,6 +410,302 @@ static void TestX25519(void)
            "a point above the prime is reduced");
 }
 
+/* ---- Эталон X25519 ------------------------------------------------------------
+ *
+ * Прямолинейная медленная лестница: шестнадцать разрядов по 16 бит, умножение
+ * в столбик, обращение возведением в степень p - 2 бит за битом. Быстрая
+ * реализация модуля обязана совпадать с ней на любых входах. */
+
+typedef uint64_t ReferenceField[16];
+
+static void ReferenceCarry(ReferenceField value)
+{
+    for (uint32_t index = 0u; index < 15u; ++index)
+    {
+        value[index + 1u] += value[index] >> 16u;
+        value[index] &= 0xFFFFu;
+    }
+    const uint64_t top = value[15] >> 16u;
+    value[15] &= 0xFFFFu;
+    value[0] += 38u * top;
+}
+
+static void ReferenceAdd(ReferenceField output, const ReferenceField left,
+                         const ReferenceField right)
+{
+    for (uint32_t index = 0u; index < 16u; ++index)
+        output[index] = left[index] + right[index];
+}
+
+/* left + 8p - right; right почти приведён. */
+static void ReferenceSubtract(ReferenceField output, const ReferenceField left,
+                              const ReferenceField right)
+{
+    output[0] = left[0] + UINT64_C(0x7FF68) - right[0];
+    for (uint32_t index = 1u; index < 15u; ++index)
+        output[index] = left[index] + UINT64_C(0x7FFF8) - right[index];
+    output[15] = left[15] + UINT64_C(0x3FFF8) - right[15];
+}
+
+static void ReferenceMultiply(ReferenceField output, const ReferenceField left,
+                              const ReferenceField right)
+{
+    uint64_t product[31] = {0};
+    for (uint32_t i = 0u; i < 16u; ++i)
+        for (uint32_t j = 0u; j < 16u; ++j)
+            product[i + j] += left[i] * right[j];
+    for (uint32_t index = 0u; index < 15u; ++index)
+        product[index] += 38u * product[index + 16u];
+    for (uint32_t index = 0u; index < 16u; ++index)
+        output[index] = product[index];
+    ReferenceCarry(output);
+    ReferenceCarry(output);
+}
+
+static void ReferenceSwap(ReferenceField left, ReferenceField right, uint64_t swap)
+{
+    const uint64_t mask = 0u - swap;
+    for (uint32_t index = 0u; index < 16u; ++index)
+    {
+        const uint64_t difference = mask & (left[index] ^ right[index]);
+        left[index] ^= difference;
+        right[index] ^= difference;
+    }
+}
+
+/* value^(2^255 - 21): единицы во всех битах показателя, кроме битов 2 и 4. */
+static void ReferenceInvert(ReferenceField output, const ReferenceField value)
+{
+    ReferenceField result;
+    memcpy(result, value, sizeof(ReferenceField));
+    for (int32_t bit = 253; bit >= 0; --bit)
+    {
+        ReferenceMultiply(result, result, result);
+        if (bit != 2 && bit != 4)
+            ReferenceMultiply(result, result, value);
+    }
+    memcpy(output, result, sizeof(ReferenceField));
+}
+
+static CRYPTO_TEST_NOINLINE void ReferenceX25519(const uint8_t scalar[NET_KEY_SIZE],
+                                                 const uint8_t point[NET_KEY_SIZE],
+                                                 uint8_t output[NET_KEY_SIZE])
+{
+    static const ReferenceField a24 = {0xDB41u, 1u};
+    uint8_t clamped[NET_KEY_SIZE];
+    memcpy(clamped, scalar, NET_KEY_SIZE);
+    clamped[0] &= 248u;
+    clamped[31] = (uint8_t)((clamped[31] & 127u) | 64u);
+    ReferenceField x1;
+    for (size_t index = 0u; index < 16u; ++index)
+        x1[index] = (uint64_t)point[index * 2u] | ((uint64_t)point[index * 2u + 1u] << 8u);
+    x1[15] &= 0x7FFFu;
+    ReferenceField x2 = {1u};
+    ReferenceField z2 = {0u};
+    ReferenceField x3;
+    ReferenceField z3 = {1u};
+    ReferenceField a;
+    ReferenceField b;
+    ReferenceField c;
+    ReferenceField d;
+    ReferenceField e;
+    ReferenceField aa;
+    ReferenceField bb;
+    memcpy(x3, x1, sizeof(ReferenceField));
+    uint64_t swap = 0u;
+    for (int32_t bit = 254; bit >= 0; --bit)
+    {
+        const uint64_t scalarBit = (uint64_t)(clamped[bit >> 3] >> (bit & 7)) & 1u;
+        swap ^= scalarBit;
+        ReferenceSwap(x2, x3, swap);
+        ReferenceSwap(z2, z3, swap);
+        swap = scalarBit;
+        ReferenceAdd(a, x2, z2);
+        ReferenceSubtract(b, x2, z2);
+        ReferenceAdd(c, x3, z3);
+        ReferenceSubtract(d, x3, z3);
+        ReferenceMultiply(aa, a, a);
+        ReferenceMultiply(bb, b, b);
+        ReferenceSubtract(e, aa, bb);
+        ReferenceMultiply(d, d, a);
+        ReferenceMultiply(c, c, b);
+        ReferenceAdd(x3, d, c);
+        ReferenceMultiply(x3, x3, x3);
+        ReferenceSubtract(z3, d, c);
+        ReferenceMultiply(z3, z3, z3);
+        ReferenceMultiply(z3, z3, x1);
+        ReferenceMultiply(x2, aa, bb);
+        ReferenceMultiply(z2, a24, e);
+        ReferenceAdd(z2, z2, aa);
+        ReferenceMultiply(z2, z2, e);
+    }
+    ReferenceSwap(x2, x3, swap);
+    ReferenceSwap(z2, z3, swap);
+    ReferenceInvert(z2, z2);
+    ReferenceMultiply(x2, x2, z2);
+    /* Канонический вид: после двух переносов значение меньше 2p + 38, и p
+     * вычитается не больше двух раз. */
+    ReferenceCarry(x2);
+    ReferenceCarry(x2);
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        ReferenceField lowered;
+        uint64_t borrow = 0u;
+        for (uint32_t index = 0u; index < 16u; ++index)
+        {
+            const uint64_t prime = index == 0u ? 0xFFEDu : index == 15u ? 0x7FFFu : 0xFFFFu;
+            const uint64_t difference = x2[index] - prime - borrow;
+            borrow = difference >> 63u;
+            lowered[index] = difference & 0xFFFFu;
+        }
+        if (borrow == 0u)
+            memcpy(x2, lowered, sizeof(ReferenceField));
+    }
+    for (size_t index = 0u; index < 16u; ++index)
+    {
+        output[index * 2u] = (uint8_t)x2[index];
+        output[index * 2u + 1u] = (uint8_t)(x2[index] >> 8u);
+    }
+}
+
+static uint64_t randomState = UINT64_C(0x243F6A8885A308D3);
+
+/* splitmix64: тест повторяется байт в байт. */
+static uint64_t NextRandom(void)
+{
+    randomState += UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t value = randomState;
+    value = (value ^ (value >> 30u)) * UINT64_C(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27u)) * UINT64_C(0x94D049BB133111EB);
+    return value ^ (value >> 31u);
+}
+
+static void FillRandom(uint8_t *bytes, uint32_t size)
+{
+    for (uint32_t index = 0u; index < size; ++index)
+        bytes[index] = (uint8_t)(NextRandom() >> 56u);
+}
+
+static bool AllZero(const uint8_t *bytes, uint32_t size)
+{
+    uint8_t any = 0u;
+    for (uint32_t index = 0u; index < size; ++index)
+        any |= bytes[index];
+    return any == 0u;
+}
+
+/* Сравнивает быструю лестницу с эталоном; ноль на выходе отвергается. */
+static void ExpectReference(const uint8_t scalar[NET_KEY_SIZE], const uint8_t point[NET_KEY_SIZE],
+                            const char *message)
+{
+    uint8_t fast[NET_KEY_SIZE];
+    uint8_t slow[NET_KEY_SIZE];
+    const bool accepted = NetX25519(scalar, point, fast);
+    ReferenceX25519(scalar, point, slow);
+    Expect(Same(fast, slow, NET_KEY_SIZE) && accepted == !AllZero(slow, NET_KEY_SIZE), message);
+}
+
+/* Значение 2^bits - 1 либо 2^bits, little-endian. */
+static void PowerOfTwo(uint8_t bytes[NET_KEY_SIZE], uint32_t bits, bool minusOne)
+{
+    memset(bytes, 0, NET_KEY_SIZE);
+    if (minusOne)
+    {
+        for (uint32_t bit = 0u; bit < bits; ++bit)
+            bytes[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+    }
+    else if (bits < 256u)
+    {
+        bytes[bits / 8u] = (uint8_t)(1u << (bits % 8u));
+    }
+}
+
+/* Точки, умножение на которые даёт ноль при любом скаляре: их порядок делит 8.
+ * Ноль, единица, две u-координаты точек порядка 8, p - 1, p и p + 1. */
+static const uint8_t smallOrder[7][NET_KEY_SIZE] = {
+    {0x00u},
+    {0x01u},
+    {0xe0u, 0xebu, 0x7au, 0x7cu, 0x3bu, 0x41u, 0xb8u, 0xaeu, 0x16u, 0x56u, 0xe3u,
+     0xfau, 0xf1u, 0x9fu, 0xc4u, 0x6au, 0xdau, 0x09u, 0x8du, 0xebu, 0x9cu, 0x32u,
+     0xb1u, 0xfdu, 0x86u, 0x62u, 0x05u, 0x16u, 0x5fu, 0x49u, 0xb8u, 0x00u},
+    {0x5fu, 0x9cu, 0x95u, 0xbcu, 0xa3u, 0x50u, 0x8cu, 0x24u, 0xb1u, 0xd0u, 0xb1u,
+     0x55u, 0x9cu, 0x83u, 0xefu, 0x5bu, 0x04u, 0x44u, 0x5cu, 0xc4u, 0x58u, 0x1cu,
+     0x8eu, 0x86u, 0xd8u, 0x22u, 0x4eu, 0xddu, 0xd0u, 0x9fu, 0x11u, 0x57u},
+    {0xecu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+    {0xedu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+    {0xeeu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+};
+
+/* Быстрая лестница совпадает с эталоном: случайные скаляры и точки, в том
+ * числе не меньше p и с поднятым старшим битом, границы 51-битных разрядов,
+ * значения рядом с p и точки малого порядка. */
+static CRYPTO_TEST_NOINLINE void TestX25519AgainstReference(void)
+{
+    uint8_t scalar[NET_KEY_SIZE];
+    uint8_t point[NET_KEY_SIZE];
+    for (uint32_t round = 0u; round < 256u; ++round)
+    {
+        FillRandom(scalar, NET_KEY_SIZE);
+        FillRandom(point, NET_KEY_SIZE);
+        ExpectReference(scalar, point, "X25519 matches the reference on random input");
+    }
+
+    static uint8_t points[40][NET_KEY_SIZE];
+    uint32_t count = 0u;
+    for (uint32_t limb = 1u; limb <= 5u; ++limb)
+    {
+        PowerOfTwo(points[count++], 51u * limb, true);
+        PowerOfTwo(points[count++], 51u * limb, false);
+        PowerOfTwo(points[count++], 51u * limb - 1u, false);
+    }
+    PowerOfTwo(points[count++], 256u, true);
+    /* p + 2 .. p + 18 и 2^255 - 1 = p + 18: неканоническая запись малых
+     * чисел. */
+    for (uint32_t above = 2u; above <= 18u; above += 4u)
+    {
+        memcpy(points[count], smallOrder[5], NET_KEY_SIZE);
+        points[count++][0] = (uint8_t)(0xEDu + above);
+    }
+    /* p - 2 .. p - 38: самые большие канонические. */
+    for (uint32_t below = 2u; below <= 38u; below += 9u)
+    {
+        memcpy(points[count], smallOrder[5], NET_KEY_SIZE);
+        points[count++][0] = (uint8_t)(0xEDu - below);
+    }
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        for (uint32_t round = 0u; round < 3u; ++round)
+        {
+            FillRandom(scalar, NET_KEY_SIZE);
+            ExpectReference(scalar, points[index], "X25519 matches the reference at the edges");
+        }
+        memset(scalar, 0xFF, sizeof(scalar));
+        ExpectReference(scalar, points[index], "X25519 matches the reference with the top scalar");
+    }
+
+    uint8_t output[NET_KEY_SIZE];
+    for (uint32_t index = 0u; index < 7u; ++index)
+    {
+        memcpy(point, smallOrder[index], NET_KEY_SIZE);
+        for (uint32_t high = 0u; high < 2u; ++high)
+        {
+            point[31] = (uint8_t)(smallOrder[index][31] | (high << 7u));
+            FillRandom(scalar, NET_KEY_SIZE);
+            uint8_t slow[NET_KEY_SIZE];
+            ReferenceX25519(scalar, point, slow);
+            Expect(AllZero(slow, NET_KEY_SIZE) && !NetX25519(scalar, point, output) &&
+                       AllZero(output, NET_KEY_SIZE),
+                   "a point of small order gives zero and is rejected");
+        }
+    }
+}
+
 static void TestHmacAndHkdf(void)
 {
     uint8_t key[131];
@@ -455,6 +759,7 @@ LAIUE_TEST_ENTRY(NetCryptoTestEntryPoint)
     TestPoly1305();
     TestAead();
     TestX25519();
+    TestX25519AgainstReference();
     TestHmacAndHkdf();
     TestWipe();
     LaiueTestRuntimeWrite("net crypto: passed\n");
