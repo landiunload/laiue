@@ -5,6 +5,13 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The Windows no-CRT `memcmp` and `memmove` no longer go byte by byte. Clang
+  can merge two compares of different lengths into one `memcmp` call with a
+  variable length, and such a call took a third of a network benchmark. Both
+  now work 16 bytes at a time: `memcmp` of 1200 bytes is 30 times faster, an
+  overlapping `memmove` 25 times. Copies and fills up to 512 bytes use the same
+  vectors instead of `rep movsb` and `rep stosb`, which cost more to start;
+  ARM64 uses NEON throughout. A test covers every length, alignment and overlap.
 - `laiue.net` moves messages between endpoints over datagrams and leaves the
   protocol, server and replication to the application. Connections use an
   X25519 handshake behind a stateless return-path cookie, optional pinned
