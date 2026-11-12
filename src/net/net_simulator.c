@@ -256,14 +256,14 @@ static int32_t SimulatorSend(void *context, const LaiueNetAddress *to, const voi
         return 0;
     /* Дальше отправитель потери не видит: для него датаграмма ушла. */
     SimPort *target = FindPort(simulator, to);
-    if (target == NULL ||
-        (conditions->maxDatagramBytes != 0u && size > conditions->maxDatagramBytes))
+    if (target == NULL)
         return 1;
     SimDatagram *datagram = CreateDatagram(&source->address, bytes, size);
     if (datagram == NULL)
         return 1;
     if ((simulator->filter != NULL && !simulator->filter(simulator->filterContext, &source->address,
                                                          to, DatagramBytes(datagram), size)) ||
+        (conditions->maxDatagramBytes != 0u && size > conditions->maxDatagramBytes) ||
         Chance(simulator, conditions->lossPerMillion))
     {
         PlatformFree(datagram);
