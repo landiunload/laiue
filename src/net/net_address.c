@@ -331,12 +331,23 @@ uint32_t LaiueNetAddressFormat(const LaiueNetAddress *address, char *output, uin
     return writer.length;
 }
 
+/* Не memcmp: clang сливал два его вызова разной длины в один с переменной
+ * длиной, и сравнение каждого пакета уходило в библиотечную функцию. Цикл
+ * без раннего выхода разворачивается в несколько инструкций. */
+static bool BytesEqual(const uint8_t *first, const uint8_t *second, uint32_t count)
+{
+    uint8_t difference = 0u;
+    for (uint32_t index = 0u; index < count; ++index)
+        difference |= (uint8_t)(first[index] ^ second[index]);
+    return difference == 0u;
+}
+
 bool LaiueNetAddressEqual(const LaiueNetAddress *first, const LaiueNetAddress *second)
 {
     if (first == NULL || second == NULL || first->family != second->family ||
         first->port != second->port)
         return false;
     if (first->family == LAIUE_NET_FAMILY_IPV4)
-        return memcmp(first->ip, second->ip, 4u) == 0;
-    return first->scope == second->scope && memcmp(first->ip, second->ip, sizeof(first->ip)) == 0;
+        return BytesEqual(first->ip, second->ip, 4u);
+    return first->scope == second->scope && BytesEqual(first->ip, second->ip, 16u);
 }

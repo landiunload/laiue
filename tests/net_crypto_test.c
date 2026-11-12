@@ -12,6 +12,14 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Release LTO не должен сплющить эталон и сценарии в точку входа: кадр
+ * перерос бы страницу и потребовал __chkstk, которого в no-CRT сборке нет. */
+#if defined(_MSC_VER)
+#define CRYPTO_TEST_NOINLINE __declspec(noinline)
+#else
+#define CRYPTO_TEST_NOINLINE __attribute__((noinline))
+#endif
+
 typedef struct PolyCase
 {
     uint8_t key[32];
@@ -402,6 +410,528 @@ static void TestX25519(void)
            "a point above the prime is reduced");
 }
 
+/* ---- Эталон X25519 ------------------------------------------------------------
+ *
+ * Прямолинейная медленная лестница: шестнадцать разрядов по 16 бит, умножение
+ * в столбик, обращение возведением в степень p - 2 бит за битом. Быстрая
+ * реализация модуля обязана совпадать с ней на любых входах. */
+
+typedef uint64_t ReferenceField[16];
+
+static void ReferenceCarry(ReferenceField value)
+{
+    for (uint32_t index = 0u; index < 15u; ++index)
+    {
+        value[index + 1u] += value[index] >> 16u;
+        value[index] &= 0xFFFFu;
+    }
+    const uint64_t top = value[15] >> 16u;
+    value[15] &= 0xFFFFu;
+    value[0] += 38u * top;
+}
+
+static void ReferenceAdd(ReferenceField output, const ReferenceField left,
+                         const ReferenceField right)
+{
+    for (uint32_t index = 0u; index < 16u; ++index)
+        output[index] = left[index] + right[index];
+}
+
+/* left + 8p - right; right почти приведён. */
+static void ReferenceSubtract(ReferenceField output, const ReferenceField left,
+                              const ReferenceField right)
+{
+    output[0] = left[0] + UINT64_C(0x7FF68) - right[0];
+    for (uint32_t index = 1u; index < 15u; ++index)
+        output[index] = left[index] + UINT64_C(0x7FFF8) - right[index];
+    output[15] = left[15] + UINT64_C(0x3FFF8) - right[15];
+}
+
+static void ReferenceMultiply(ReferenceField output, const ReferenceField left,
+                              const ReferenceField right)
+{
+    uint64_t product[31] = {0};
+    for (uint32_t i = 0u; i < 16u; ++i)
+        for (uint32_t j = 0u; j < 16u; ++j)
+            product[i + j] += left[i] * right[j];
+    for (uint32_t index = 0u; index < 15u; ++index)
+        product[index] += 38u * product[index + 16u];
+    for (uint32_t index = 0u; index < 16u; ++index)
+        output[index] = product[index];
+    ReferenceCarry(output);
+    ReferenceCarry(output);
+}
+
+static void ReferenceSwap(ReferenceField left, ReferenceField right, uint64_t swap)
+{
+    const uint64_t mask = 0u - swap;
+    for (uint32_t index = 0u; index < 16u; ++index)
+    {
+        const uint64_t difference = mask & (left[index] ^ right[index]);
+        left[index] ^= difference;
+        right[index] ^= difference;
+    }
+}
+
+/* value^(2^255 - 21): единицы во всех битах показателя, кроме битов 2 и 4. */
+static void ReferenceInvert(ReferenceField output, const ReferenceField value)
+{
+    ReferenceField result;
+    memcpy(result, value, sizeof(ReferenceField));
+    for (int32_t bit = 253; bit >= 0; --bit)
+    {
+        ReferenceMultiply(result, result, result);
+        if (bit != 2 && bit != 4)
+            ReferenceMultiply(result, result, value);
+    }
+    memcpy(output, result, sizeof(ReferenceField));
+}
+
+static CRYPTO_TEST_NOINLINE void ReferenceX25519(const uint8_t scalar[NET_KEY_SIZE],
+                                                 const uint8_t point[NET_KEY_SIZE],
+                                                 uint8_t output[NET_KEY_SIZE])
+{
+    static const ReferenceField a24 = {0xDB41u, 1u};
+    uint8_t clamped[NET_KEY_SIZE];
+    memcpy(clamped, scalar, NET_KEY_SIZE);
+    clamped[0] &= 248u;
+    clamped[31] = (uint8_t)((clamped[31] & 127u) | 64u);
+    ReferenceField x1;
+    for (size_t index = 0u; index < 16u; ++index)
+        x1[index] = (uint64_t)point[index * 2u] | ((uint64_t)point[index * 2u + 1u] << 8u);
+    x1[15] &= 0x7FFFu;
+    ReferenceField x2 = {1u};
+    ReferenceField z2 = {0u};
+    ReferenceField x3;
+    ReferenceField z3 = {1u};
+    ReferenceField a;
+    ReferenceField b;
+    ReferenceField c;
+    ReferenceField d;
+    ReferenceField e;
+    ReferenceField aa;
+    ReferenceField bb;
+    memcpy(x3, x1, sizeof(ReferenceField));
+    uint64_t swap = 0u;
+    for (int32_t bit = 254; bit >= 0; --bit)
+    {
+        const uint64_t scalarBit = (uint64_t)(clamped[bit >> 3] >> (bit & 7)) & 1u;
+        swap ^= scalarBit;
+        ReferenceSwap(x2, x3, swap);
+        ReferenceSwap(z2, z3, swap);
+        swap = scalarBit;
+        ReferenceAdd(a, x2, z2);
+        ReferenceSubtract(b, x2, z2);
+        ReferenceAdd(c, x3, z3);
+        ReferenceSubtract(d, x3, z3);
+        ReferenceMultiply(aa, a, a);
+        ReferenceMultiply(bb, b, b);
+        ReferenceSubtract(e, aa, bb);
+        ReferenceMultiply(d, d, a);
+        ReferenceMultiply(c, c, b);
+        ReferenceAdd(x3, d, c);
+        ReferenceMultiply(x3, x3, x3);
+        ReferenceSubtract(z3, d, c);
+        ReferenceMultiply(z3, z3, z3);
+        ReferenceMultiply(z3, z3, x1);
+        ReferenceMultiply(x2, aa, bb);
+        ReferenceMultiply(z2, a24, e);
+        ReferenceAdd(z2, z2, aa);
+        ReferenceMultiply(z2, z2, e);
+    }
+    ReferenceSwap(x2, x3, swap);
+    ReferenceSwap(z2, z3, swap);
+    ReferenceInvert(z2, z2);
+    ReferenceMultiply(x2, x2, z2);
+    /* Канонический вид: после двух переносов значение меньше 2p + 38, и p
+     * вычитается не больше двух раз. */
+    ReferenceCarry(x2);
+    ReferenceCarry(x2);
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        ReferenceField lowered;
+        uint64_t borrow = 0u;
+        for (uint32_t index = 0u; index < 16u; ++index)
+        {
+            const uint64_t prime = index == 0u ? 0xFFEDu : index == 15u ? 0x7FFFu : 0xFFFFu;
+            const uint64_t difference = x2[index] - prime - borrow;
+            borrow = difference >> 63u;
+            lowered[index] = difference & 0xFFFFu;
+        }
+        if (borrow == 0u)
+            memcpy(x2, lowered, sizeof(ReferenceField));
+    }
+    for (size_t index = 0u; index < 16u; ++index)
+    {
+        output[index * 2u] = (uint8_t)x2[index];
+        output[index * 2u + 1u] = (uint8_t)(x2[index] >> 8u);
+    }
+}
+
+static uint64_t randomState = UINT64_C(0x243F6A8885A308D3);
+
+/* splitmix64: тест повторяется байт в байт. */
+static uint64_t NextRandom(void)
+{
+    randomState += UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t value = randomState;
+    value = (value ^ (value >> 30u)) * UINT64_C(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27u)) * UINT64_C(0x94D049BB133111EB);
+    return value ^ (value >> 31u);
+}
+
+static void FillRandom(uint8_t *bytes, uint32_t size)
+{
+    for (uint32_t index = 0u; index < size; ++index)
+        bytes[index] = (uint8_t)(NextRandom() >> 56u);
+}
+
+static bool AllZero(const uint8_t *bytes, uint32_t size)
+{
+    uint8_t any = 0u;
+    for (uint32_t index = 0u; index < size; ++index)
+        any |= bytes[index];
+    return any == 0u;
+}
+
+/* Сравнивает быструю лестницу с эталоном; ноль на выходе отвергается. */
+static void ExpectReference(const uint8_t scalar[NET_KEY_SIZE], const uint8_t point[NET_KEY_SIZE],
+                            const char *message)
+{
+    uint8_t fast[NET_KEY_SIZE];
+    uint8_t slow[NET_KEY_SIZE];
+    const bool accepted = NetX25519(scalar, point, fast);
+    ReferenceX25519(scalar, point, slow);
+    Expect(Same(fast, slow, NET_KEY_SIZE) && accepted == !AllZero(slow, NET_KEY_SIZE), message);
+}
+
+/* Значение 2^bits - 1 либо 2^bits, little-endian. */
+static void PowerOfTwo(uint8_t bytes[NET_KEY_SIZE], uint32_t bits, bool minusOne)
+{
+    memset(bytes, 0, NET_KEY_SIZE);
+    if (minusOne)
+    {
+        for (uint32_t bit = 0u; bit < bits; ++bit)
+            bytes[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+    }
+    else if (bits < 256u)
+    {
+        bytes[bits / 8u] = (uint8_t)(1u << (bits % 8u));
+    }
+}
+
+/* Точки, умножение на которые даёт ноль при любом скаляре: их порядок делит 8.
+ * Ноль, единица, две u-координаты точек порядка 8, p - 1, p и p + 1. */
+static const uint8_t smallOrder[7][NET_KEY_SIZE] = {
+    {0x00u},
+    {0x01u},
+    {0xe0u, 0xebu, 0x7au, 0x7cu, 0x3bu, 0x41u, 0xb8u, 0xaeu, 0x16u, 0x56u, 0xe3u,
+     0xfau, 0xf1u, 0x9fu, 0xc4u, 0x6au, 0xdau, 0x09u, 0x8du, 0xebu, 0x9cu, 0x32u,
+     0xb1u, 0xfdu, 0x86u, 0x62u, 0x05u, 0x16u, 0x5fu, 0x49u, 0xb8u, 0x00u},
+    {0x5fu, 0x9cu, 0x95u, 0xbcu, 0xa3u, 0x50u, 0x8cu, 0x24u, 0xb1u, 0xd0u, 0xb1u,
+     0x55u, 0x9cu, 0x83u, 0xefu, 0x5bu, 0x04u, 0x44u, 0x5cu, 0xc4u, 0x58u, 0x1cu,
+     0x8eu, 0x86u, 0xd8u, 0x22u, 0x4eu, 0xddu, 0xd0u, 0x9fu, 0x11u, 0x57u},
+    {0xecu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+    {0xedu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+    {0xeeu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu,
+     0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0xffu, 0x7fu},
+};
+
+/* Быстрая лестница совпадает с эталоном: случайные скаляры и точки, в том
+ * числе не меньше p и с поднятым старшим битом, границы 51-битных разрядов,
+ * значения рядом с p и точки малого порядка. */
+static CRYPTO_TEST_NOINLINE void TestX25519AgainstReference(void)
+{
+    uint8_t scalar[NET_KEY_SIZE];
+    uint8_t point[NET_KEY_SIZE];
+    for (uint32_t round = 0u; round < 256u; ++round)
+    {
+        FillRandom(scalar, NET_KEY_SIZE);
+        FillRandom(point, NET_KEY_SIZE);
+        ExpectReference(scalar, point, "X25519 matches the reference on random input");
+    }
+
+    static uint8_t points[40][NET_KEY_SIZE];
+    uint32_t count = 0u;
+    for (uint32_t limb = 1u; limb <= 5u; ++limb)
+    {
+        PowerOfTwo(points[count++], 51u * limb, true);
+        PowerOfTwo(points[count++], 51u * limb, false);
+        PowerOfTwo(points[count++], 51u * limb - 1u, false);
+    }
+    PowerOfTwo(points[count++], 256u, true);
+    /* p + 2 .. p + 18 и 2^255 - 1 = p + 18: неканоническая запись малых
+     * чисел. */
+    for (uint32_t above = 2u; above <= 18u; above += 4u)
+    {
+        memcpy(points[count], smallOrder[5], NET_KEY_SIZE);
+        points[count++][0] = (uint8_t)(0xEDu + above);
+    }
+    /* p - 2 .. p - 38: самые большие канонические. */
+    for (uint32_t below = 2u; below <= 38u; below += 9u)
+    {
+        memcpy(points[count], smallOrder[5], NET_KEY_SIZE);
+        points[count++][0] = (uint8_t)(0xEDu - below);
+    }
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        for (uint32_t round = 0u; round < 3u; ++round)
+        {
+            FillRandom(scalar, NET_KEY_SIZE);
+            ExpectReference(scalar, points[index], "X25519 matches the reference at the edges");
+        }
+        memset(scalar, 0xFF, sizeof(scalar));
+        ExpectReference(scalar, points[index], "X25519 matches the reference with the top scalar");
+    }
+
+    uint8_t output[NET_KEY_SIZE];
+    for (uint32_t index = 0u; index < 7u; ++index)
+    {
+        memcpy(point, smallOrder[index], NET_KEY_SIZE);
+        for (uint32_t high = 0u; high < 2u; ++high)
+        {
+            point[31] = (uint8_t)(smallOrder[index][31] | (high << 7u));
+            FillRandom(scalar, NET_KEY_SIZE);
+            uint8_t slow[NET_KEY_SIZE];
+            ReferenceX25519(scalar, point, slow);
+            Expect(AllZero(slow, NET_KEY_SIZE) && !NetX25519(scalar, point, output) &&
+                       AllZero(output, NET_KEY_SIZE),
+                   "a point of small order gives zero and is rejected");
+        }
+    }
+}
+
+/* ---- Эталон Poly1305 -------------------------------------------------------------
+ *
+ * Пять разрядов по 26 бит: произведения и их суммы помещаются в 64 бита. */
+
+static uint32_t ReadLe32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8u) | ((uint32_t)bytes[2] << 16u) |
+           ((uint32_t)bytes[3] << 24u);
+}
+
+static CRYPTO_TEST_NOINLINE void ReferencePoly1305(const uint8_t key[NET_KEY_SIZE],
+                                                   const uint8_t *message, size_t size,
+                                                   uint8_t tag[NET_TAG_SIZE])
+{
+    const uint32_t mask = UINT32_C(0x03FFFFFF);
+    const uint32_t k0 = ReadLe32(key) & UINT32_C(0x0FFFFFFF);
+    const uint32_t k1 = ReadLe32(key + 4u) & UINT32_C(0x0FFFFFFC);
+    const uint32_t k2 = ReadLe32(key + 8u) & UINT32_C(0x0FFFFFFC);
+    const uint32_t k3 = ReadLe32(key + 12u) & UINT32_C(0x0FFFFFFC);
+    const uint64_t r[5] = {k0 & mask, ((k0 >> 26u) | (k1 << 6u)) & mask,
+                           ((k1 >> 20u) | (k2 << 12u)) & mask, ((k2 >> 14u) | (k3 << 18u)) & mask,
+                           k3 >> 8u};
+    uint64_t h[5] = {0u};
+    while (size != 0u)
+    {
+        uint8_t block[17] = {0u};
+        const size_t part = size < 16u ? size : 16u;
+        memcpy(block, message, part);
+        block[part] = 1u;
+        message += part;
+        size -= part;
+        const uint32_t t0 = ReadLe32(block);
+        const uint32_t t1 = ReadLe32(block + 4u);
+        const uint32_t t2 = ReadLe32(block + 8u);
+        const uint32_t t3 = ReadLe32(block + 12u);
+        h[0] += t0 & mask;
+        h[1] += ((t0 >> 26u) | (t1 << 6u)) & mask;
+        h[2] += ((t1 >> 20u) | (t2 << 12u)) & mask;
+        h[3] += ((t2 >> 14u) | (t3 << 18u)) & mask;
+        h[4] += (t3 >> 8u) | ((uint32_t)block[16] << 24u);
+        uint64_t d[5];
+        for (uint32_t i = 0u; i < 5u; ++i)
+        {
+            d[i] = 0u;
+            for (uint32_t j = 0u; j < 5u; ++j)
+                d[i] += h[j] * (j <= i ? r[i - j] : 5u * r[5u + i - j]);
+        }
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            d[i + 1u] += d[i] >> 26u;
+            d[i] &= mask;
+        }
+        d[0] += (d[4] >> 26u) * 5u;
+        d[4] &= mask;
+        d[1] += d[0] >> 26u;
+        d[0] &= mask;
+        memcpy(h, d, sizeof(h));
+    }
+    /* Полный перенос и вычитание p, если h не меньше p. */
+    for (uint32_t pass = 0u; pass < 2u; ++pass)
+    {
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            h[i + 1u] += h[i] >> 26u;
+            h[i] &= mask;
+        }
+        h[0] += (h[4] >> 26u) * 5u;
+        h[4] &= mask;
+    }
+    uint64_t g[5];
+    uint64_t carry = 5u;
+    for (uint32_t i = 0u; i < 5u; ++i)
+    {
+        g[i] = h[i] + carry;
+        carry = g[i] >> 26u;
+        g[i] &= mask;
+    }
+    if (carry != 0u)
+        memcpy(h, g, sizeof(h));
+    uint64_t sum = 0u;
+    const uint64_t words[4] = {
+        (h[0] | (h[1] << 26u)) & UINT32_MAX, ((h[1] >> 6u) | (h[2] << 20u)) & UINT32_MAX,
+        ((h[2] >> 12u) | (h[3] << 14u)) & UINT32_MAX, ((h[3] >> 18u) | (h[4] << 8u)) & UINT32_MAX};
+    for (size_t i = 0u; i < 4u; ++i)
+    {
+        sum = words[i] + ReadLe32(key + 16u + i * 4u) + (sum >> 32u);
+        tag[i * 4u] = (uint8_t)sum;
+        tag[i * 4u + 1u] = (uint8_t)(sum >> 8u);
+        tag[i * 4u + 2u] = (uint8_t)(sum >> 16u);
+        tag[i * 4u + 3u] = (uint8_t)(sum >> 24u);
+    }
+}
+
+/* Poly1305 совпадает с эталоном на случайных ключах и длинах при любом
+ * разбиении входа на части. Ключи с r из одних единиц и s из одних единиц
+ * дают предельные переносы. */
+static CRYPTO_TEST_NOINLINE void TestPoly1305AgainstReference(void)
+{
+    static uint8_t message[300];
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t expected[NET_TAG_SIZE];
+    uint8_t actual[NET_TAG_SIZE];
+    for (uint32_t round = 0u; round < 400u; ++round)
+    {
+        FillRandom(key, sizeof(key));
+        if (round % 4u == 1u)
+            memset(key, 0xFF, sizeof(key));
+        const uint32_t size = (uint32_t)(NextRandom() % (sizeof(message) + 1u));
+        FillRandom(message, size);
+        if (round % 8u == 2u)
+            memset(message, 0xFF, size);
+        ReferencePoly1305(key, message, size, expected);
+        NetPoly1305 mac;
+        NetPoly1305Begin(&mac, key);
+        uint32_t done = 0u;
+        while (done < size)
+        {
+            uint32_t part = (uint32_t)(NextRandom() % 40u);
+            if (part > size - done)
+                part = size - done;
+            NetPoly1305Update(&mac, message + done, part);
+            done += part;
+        }
+        NetPoly1305Finish(&mac, actual);
+        Expect(Same(actual, expected, sizeof(actual)), "Poly1305 matches the reference");
+    }
+}
+
+/* Поток группами блоков совпадает с поблочным на всех длинах вокруг групп по
+ * четыре и восемь блоков, со счётчиком у переполнения и на месте. */
+static CRYPTO_TEST_NOINLINE void TestChaCha20Groups(void)
+{
+    static uint8_t text[1300];
+    static uint8_t expected[1300];
+    static uint8_t actual[1300];
+    static const uint32_t counters[] = {0u, 1u, UINT32_C(0xFFFFFFFD)};
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t nonce[NET_NONCE_SIZE];
+    uint8_t block[64];
+    FillRandom(key, sizeof(key));
+    FillRandom(nonce, sizeof(nonce));
+    FillRandom(text, sizeof(text));
+    for (uint32_t which = 0u; which < 3u; ++which)
+    {
+        const uint32_t counter = counters[which];
+        for (uint32_t size = 0u; size <= sizeof(text); size += size < 600u ? 1u : 7u)
+        {
+            for (uint32_t offset = 0u; offset < size; offset += 64u)
+            {
+                NetChaCha20Block(key, counter + offset / 64u, nonce, block);
+                for (uint32_t index = offset; index < size && index < offset + 64u; ++index)
+                    expected[index] = (uint8_t)(text[index] ^ block[index - offset]);
+            }
+            NetChaCha20Xor(key, counter, nonce, text, actual, size);
+            Expect(Same(actual, expected, size), "ChaCha20 groups match single blocks");
+            memcpy(actual, text, size);
+            NetChaCha20Xor(key, counter, nonce, actual, actual, size);
+            Expect(Same(actual, expected, size), "ChaCha20 groups work in place");
+        }
+    }
+}
+
+/* AEAD совпадает с построением RFC 8439 из уже сверенных частей на всех
+ * длинах вокруг групп блоков: ключ MAC и начало потока там считаются вместе. */
+static CRYPTO_TEST_NOINLINE void TestAeadAgainstParts(void)
+{
+    static uint8_t text[1300];
+    static uint8_t expected[1300];
+    static uint8_t actual[1300];
+    static uint8_t opened[1300];
+    static const uint8_t zeros[16] = {0u};
+    uint8_t key[NET_KEY_SIZE];
+    uint8_t nonce[NET_NONCE_SIZE];
+    uint8_t aad[40];
+    uint8_t block[64];
+    uint8_t lengths[16];
+    uint8_t expectedTag[NET_TAG_SIZE];
+    uint8_t tag[NET_TAG_SIZE];
+    for (uint32_t size = 0u; size <= sizeof(text); size += size < 600u ? 1u : 7u)
+    {
+        FillRandom(key, sizeof(key));
+        FillRandom(nonce, sizeof(nonce));
+        const uint32_t aadSize = (uint32_t)(NextRandom() % (sizeof(aad) + 1u));
+        FillRandom(aad, aadSize);
+        FillRandom(text, size);
+        NetChaCha20Xor(key, 1u, nonce, text, expected, size);
+        NetChaCha20Block(key, 0u, nonce, block);
+        NetPoly1305 mac;
+        NetPoly1305Begin(&mac, block);
+        NetPoly1305Update(&mac, aad, aadSize);
+        NetPoly1305Update(&mac, zeros, (16u - aadSize % 16u) % 16u);
+        NetPoly1305Update(&mac, expected, size);
+        NetPoly1305Update(&mac, zeros, (16u - size % 16u) % 16u);
+        for (uint32_t index = 0u; index < 8u; ++index)
+        {
+            lengths[index] = (uint8_t)((uint64_t)aadSize >> (index * 8u));
+            lengths[8u + index] = (uint8_t)((uint64_t)size >> (index * 8u));
+        }
+        NetPoly1305Update(&mac, lengths, sizeof(lengths));
+        NetPoly1305Finish(&mac, expectedTag);
+
+        NetAeadSeal(key, nonce, aad, aadSize, text, size, actual, tag);
+        Expect(Same(actual, expected, size) && Same(tag, expectedTag, sizeof(tag)),
+               "AEAD matches its parts");
+        Expect(NetAeadOpen(key, nonce, aad, aadSize, actual, size, tag, opened) &&
+                   Same(opened, text, size),
+               "AEAD opens at every length");
+        memcpy(opened, text, size);
+        NetAeadSeal(key, nonce, aad, aadSize, opened, size, opened, tag);
+        Expect(Same(opened, expected, size) && Same(tag, expectedTag, sizeof(tag)),
+               "AEAD seals in place");
+
+        if (size != 0u)
+            actual[NextRandom() % size] ^= 0x10u;
+        else
+            tag[0] ^= 0x10u;
+        memset(opened, 0xA5, size);
+        Expect(!NetAeadOpen(key, nonce, aad, aadSize, actual, size, tag, opened),
+               "AEAD rejects a spoiled packet at every length");
+        bool untouched = true;
+        for (uint32_t index = 0u; index < size; ++index)
+            untouched = untouched && opened[index] == 0xA5u;
+        Expect(untouched, "a spoiled packet leaves the output untouched");
+    }
+}
+
 static void TestHmacAndHkdf(void)
 {
     uint8_t key[131];
@@ -444,6 +974,7 @@ static void TestWipe(void)
 {
     uint8_t secret[40];
     memset(secret, 0x5A, sizeof(secret));
+    NetWipe(secret, 0u);
     NetWipe(secret + 4u, 32u);
     for (uint32_t index = 0u; index < sizeof(secret); ++index)
         Expect(secret[index] == (index < 4u || index >= 36u ? 0x5Au : 0u), "wipe clears its range");
@@ -455,6 +986,10 @@ LAIUE_TEST_ENTRY(NetCryptoTestEntryPoint)
     TestPoly1305();
     TestAead();
     TestX25519();
+    TestX25519AgainstReference();
+    TestChaCha20Groups();
+    TestAeadAgainstParts();
+    TestPoly1305AgainstReference();
     TestHmacAndHkdf();
     TestWipe();
     LaiueTestRuntimeWrite("net crypto: passed\n");
