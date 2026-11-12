@@ -1031,12 +1031,14 @@ typedef struct PolyPowers
     PolyKey last;
 } PolyPowers;
 
-static void PolyKeyOf(PolyKey *key, const Poly26 power[NET_POLY_LANES + 1u],
+/* Степени берутся через указатель на неизменяемую структуру: массив
+ * массивов без const до C23 не передаётся туда, где ждут его с const. */
+static void PolyKeyOf(PolyKey *key, const PolyPowers *powers,
                       const uint32_t exponent[NET_POLY_LANES])
 {
     for (size_t limb = 0u; limb < 5u; ++limb)
     {
-        const PolyVector r = PolyLanesOf(power, exponent, limb);
+        const PolyVector r = PolyLanesOf(powers->power, exponent, limb);
         key->r[limb] = PolyNarrow(r);
         key->s[limb] = PolyNarrow(PolyTimes5(r));
     }
@@ -1054,8 +1056,8 @@ static NET_NOINLINE void PolyPowersOf(PolyPowers *powers, const NetPoly1305 *sta
     uint32_t step[NET_POLY_LANES];
     for (size_t lane = 0u; lane < NET_POLY_LANES; ++lane)
         step[lane] = NET_POLY_LANES;
-    PolyKeyOf(&powers->step, powers->power, step);
-    PolyKeyOf(&powers->last, powers->power, polyLastExponents);
+    PolyKeyOf(&powers->step, powers, step);
+    PolyKeyOf(&powers->last, powers, polyLastExponents);
 }
 
 /* Встраивается всегда: MSVC без /Ob3 оставлял вызов в цикле и проводил h и d
