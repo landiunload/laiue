@@ -212,6 +212,81 @@ typedef struct NetChannel
     bool haveHeader;
 } NetChannel;
 
+/* Кривая CUBIC одного эпизода предотвращения перегрузки (RFC 9438). */
+typedef struct NetCubic
+{
+    /* W_max: окно перед последним сокращением; быстрая сходимость делает
+     * его меньше. */
+    uint64_t maxWindow;
+    /* cwnd_prior: окно перед последним сокращением. */
+    uint64_t priorWindow;
+    /* W_est: окно, каким его вёл бы Reno. */
+    uint64_t renoWindow;
+    /* t, микросекунды: время предотвращения перегрузки, пока окно тесно. */
+    uint64_t elapsed;
+    /* K, миллисекунды: через столько от начала кривая возвращается к
+     * maxWindow. */
+    uint64_t plateau;
+    /* Кривую запускает первое подтверждение после восстановления. */
+    bool started;
+} NetCubic;
+
+/* Окно перегрузки соединения: CUBIC с медленным стартом HyStart++
+ * (RFC 9406). */
+typedef struct NetCongestion
+{
+    uint64_t window;
+    /* Порог медленного старта; UINT64_MAX — идёт первый медленный старт. */
+    uint64_t threshold;
+    /* Пакеты, отправленные до начала восстановления, окно не меняют. */
+    uint64_t recoveryStart;
+    uint64_t lastAckTime;
+    /* Дробные остатки приращений: окно растёт на доли байта за
+     * подтверждение. */
+    uint64_t windowRemainder;
+    uint64_t renoRemainder;
+    NetCubic cubic;
+    /* Кривая и порог до сокращения: мнимая потеря возвращает их. */
+    NetCubic priorCubic;
+    uint64_t priorThreshold;
+
+    /* HyStart++. Раунд — один полёт: он кончается, когда подтверждён пакет с
+     * номером не меньше roundEnd. */
+    uint64_t roundEnd;
+    uint64_t roundMinRtt;
+    uint64_t lastRoundMinRtt;
+    /* Наименьший оборот раунда, в котором рост стал осторожным. */
+    uint64_t baselineRtt;
+    uint32_t roundSamples;
+    uint32_t cautiousRounds;
+
+    uint32_t datagramBytes;
+    bool inRecovery;
+    /* Окно было тесно и при прошлом подтверждении: время между ними идёт в
+     * кривую. */
+    bool lastAckLimited;
+    /* Осторожный рост медленного старта (CSS). */
+    bool cautious;
+} NetCongestion;
+
+/* Подтверждение глазами окна перегрузки. */
+typedef struct NetCongestionAck
+{
+    uint64_t now;
+    /* Старший подтверждённый номер и номер следующего пакета: по ним
+     * считаются раунды. */
+    uint64_t largest;
+    uint64_t nextNumber;
+    /* Замер времени оборота этим подтверждением; 0 — замера нет. */
+    uint64_t rttSample;
+    uint64_t smoothedRtt;
+    /* Подтверждённые байты пакетов, которым окно было тесно и которые
+     * отправлены после начала восстановления, и время отправки последнего из
+     * них. */
+    uint64_t limitedBytes;
+    uint64_t limitedSentTime;
+} NetCongestionAck;
+
 #define NET_STATE_CONNECTING 1u
 #define NET_STATE_HALF_OPEN 2u
 #define NET_STATE_CONNECTED 3u
@@ -325,12 +400,8 @@ typedef struct NetPeer
     bool spuriousSeen;
 
     /* Управление перегрузкой. */
-    uint64_t congestionWindow;
-    uint64_t slowStartThreshold;
+    NetCongestion congestion;
     uint64_t bytesInFlight;
-    uint64_t recoveryStart;
-    uint64_t priorWindow;
-    uint64_t priorThreshold;
     int64_t paceBudget;
     uint64_t paceTime;
     /* Эпизод восстановления: сколько потерь в нём объявлено и сколько из них
@@ -338,7 +409,6 @@ typedef struct NetPeer
     uint32_t recoveryEpisode;
     uint32_t recoveryLosses;
     uint32_t recoverySpurious;
-    bool inRecovery;
     bool recoveryUndoable;
 
     /* Закрытие. */
@@ -565,6 +635,27 @@ uint32_t NetPeerMaxUnreliable(const NetPeer *peer);
 uint64_t NetPeerProbeTimeout(const NetPeer *peer);
 /* Первая оценка времени оборота: по рукопожатию, до первого пакета данных. */
 void NetPeerSeedRtt(NetPeer *peer, uint64_t sample, uint64_t now);
+
+/* net_congestion.c */
+/* Окно в начале соединения либо на новом пути: первый медленный старт. */
+void NetCongestionReset(NetCongestion *congestion, uint32_t datagramBytes, uint64_t window,
+                        uint64_t nextNumber);
+void NetCongestionOnAck(NetCongestion *congestion, const NetCongestionAck *ack);
+/* Потеря пакета, отправленного в sentTime. true — началось восстановление и
+ * окно сокращено; потери пакетов, отправленных раньше, окно не режут. */
+bool NetCongestionOnLoss(NetCongestion *congestion, uint64_t sentTime, uint64_t now);
+/* Затяжная перегрузка: окно сжимается до двух датаграмм. */
+void NetCongestionCollapse(NetCongestion *congestion, uint64_t now);
+/* Все потери последнего сокращения мнимы: окно, порог и кривая
+ * возвращаются к прежним. */
+void NetCongestionUndo(NetCongestion *congestion);
+/* Целый кубический корень с округлением вниз. */
+uint64_t NetCubeRoot(uint64_t value);
+
+static inline bool NetCongestionInRecovery(const NetCongestion *congestion, uint64_t sentTime)
+{
+    return congestion->inRecovery && sentTime <= congestion->recoveryStart;
+}
 
 /* Итог разбора кадров и приёма данных канала. */
 #define NET_FRAMES_OK 0u

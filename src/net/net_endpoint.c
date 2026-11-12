@@ -775,7 +775,7 @@ LaiueNetStatus LaiueNetPeerGetInfo(const LaiueNetEndpoint *endpoint, LaiueNetPee
         outInfo->roundTripMicroseconds = Saturate32(peer->smoothedRtt);
         outInfo->roundTripVarianceMicroseconds = Saturate32(peer->rttVariance);
     }
-    outInfo->congestionWindowBytes = Saturate32(peer->congestionWindow);
+    outInfo->congestionWindowBytes = Saturate32(peer->congestion.window);
     outInfo->bytesInFlight = Saturate32(peer->bytesInFlight);
     outInfo->queuedReliableBytes = Saturate32(peer->queuedReliable);
     outInfo->queuedUnreliableBytes = NetPeerQueuedUnreliable(peer);

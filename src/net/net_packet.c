@@ -14,8 +14,9 @@
  * Потерю выдаёт либо обгон на три пакета, либо возраст больше 9/8 времени
  * оборота. Когда подтверждений нет совсем, срабатывает пробный таймер: он
  * ничего не объявляет потерянным, а отправляет пробу, ответ на которую
- * запускает обычное обнаружение. Окно перегрузки растёт по NewReno, а
- * отправка размазана по времени оборота, а не выстреливает пачкой. */
+ * запускает обычное обнаружение. Окном перегрузки ведают CUBIC и HyStart++
+ * (net_congestion.c), а отправка размазана по времени оборота, а не
+ * выстреливает пачкой. */
 
 uint32_t NetPeerMaxUnreliable(const NetPeer *peer)
 {
@@ -68,8 +69,7 @@ bool NetPeerEstablish(LaiueNetEndpoint *endpoint, NetPeer *peer)
     const uint64_t ceiling = MinimumWindow(peer) > 14720u ? MinimumWindow(peer) : 14720u;
     if (window > ceiling)
         window = ceiling;
-    peer->congestionWindow = window;
-    peer->slowStartThreshold = UINT64_MAX;
+    NetCongestionReset(&peer->congestion, peer->datagramBytes, window, peer->nextNumber);
     peer->paceBudget = (int64_t)window;
     peer->paceTime = endpoint->now;
     peer->lastReceiveTime = endpoint->now;
@@ -309,26 +309,11 @@ static bool RecordsGrow(NetPeer *peer)
 
 /* ---- Перегрузка и оценка пути ------------------------------------------------------ */
 
-static void CongestionOnAck(NetPeer *peer, const NetSentPacket *record)
-{
-    /* Пакеты, отправленные до начала восстановления, окно не расширяют; не
-     * расширяет его и поток, которому окно не было тесно. */
-    if ((peer->inRecovery && record->sentTime <= peer->recoveryStart) || !record->windowLimited)
-        return;
-    if (peer->congestionWindow < peer->slowStartThreshold)
-        peer->congestionWindow += record->size;
-    else
-        peer->congestionWindow +=
-            (uint64_t)peer->datagramBytes * record->size / peer->congestionWindow;
-    if (peer->congestionWindow > NET_CONGESTION_WINDOW_LIMIT)
-        peer->congestionWindow = NET_CONGESTION_WINDOW_LIMIT;
-}
-
 static void CongestionOnLoss(NetPeer *peer, uint64_t sentTime, uint64_t now)
 {
-    /* Одно событие перегрузки на полёт: потери пакетов, отправленных до
-     * него, окно повторно не режут. */
-    if (peer->inRecovery && sentTime <= peer->recoveryStart)
+    /* Одно сокращение окна на полёт: потери пакетов, отправленных до него,
+     * нового эпизода не начинают. */
+    if (!NetCongestionOnLoss(&peer->congestion, sentTime, now))
         return;
     /* Эпизод без мнимых потерь с прошлого раза: пороги понемногу
      * возвращаются к исходным, и однажды случившаяся перестановка не
@@ -345,14 +330,6 @@ static void CongestionOnLoss(NetPeer *peer, uint64_t sentTime, uint64_t now)
     peer->recoveryLosses = 0u;
     peer->recoverySpurious = 0u;
     peer->recoveryUndoable = true;
-    peer->priorWindow = peer->congestionWindow;
-    peer->priorThreshold = peer->slowStartThreshold;
-    peer->inRecovery = true;
-    peer->recoveryStart = now;
-    peer->slowStartThreshold = peer->congestionWindow / 2u;
-    if (peer->slowStartThreshold < MinimumWindow(peer))
-        peer->slowStartThreshold = MinimumWindow(peer);
-    peer->congestionWindow = peer->slowStartThreshold;
 }
 
 static void UpdateRtt(NetPeer *peer, uint64_t sample, uint64_t ackDelay, uint64_t now)
@@ -396,6 +373,10 @@ typedef struct AckContext
     /* Позиция записи наибольшего подтверждённого номера. */
     uint32_t largestPosition;
     uint64_t largestSentTime;
+    /* Байты, которые расширяют окно: пакеты, которым оно было тесно, вне
+     * восстановления. */
+    uint64_t limitedBytes;
+    uint64_t limitedSentTime;
     bool largestNewlyAcked;
     uint32_t newlyAcked;
 } AckContext;
@@ -414,7 +395,12 @@ static void PacketAcked(NetPeer *peer, NetSentPacket *record, AckContext *contex
     record->state = NET_RECORD_ACKED;
     --peer->ackElicitingOutstanding;
     peer->bytesInFlight -= record->size;
-    CongestionOnAck(peer, record);
+    if (record->windowLimited && !NetCongestionInRecovery(&peer->congestion, record->sentTime))
+    {
+        context->limitedBytes += record->size;
+        if (record->sentTime > context->limitedSentTime)
+            context->limitedSentTime = record->sentTime;
+    }
     for (uint32_t index = 0u; index < record->rangeCount; ++index)
         NetChannelOnAcked(peer, &record->ranges[index]);
     if (record->number == context->largest)
@@ -462,10 +448,7 @@ static void SpuriousLoss(NetPeer *peer, NetSentPacket *record, uint32_t distance
         ++peer->recoverySpurious;
         if (peer->recoverySpurious == peer->recoveryLosses)
         {
-            if (peer->congestionWindow < peer->priorWindow)
-                peer->congestionWindow = peer->priorWindow;
-            peer->slowStartThreshold = peer->priorThreshold;
-            peer->inRecovery = false;
+            NetCongestionUndo(&peer->congestion);
             peer->recoveryUndoable = false;
         }
     }
@@ -540,9 +523,7 @@ static void DetectLost(NetPeer *peer, uint64_t now)
     if (collapsed)
     {
         /* Окно, сжатое затяжной перегрузкой, мнимые потери не возвращают. */
-        peer->congestionWindow = MinimumWindow(peer);
-        peer->inRecovery = true;
-        peer->recoveryStart = now;
+        NetCongestionCollapse(&peer->congestion, now);
         peer->recoveryUndoable = false;
     }
     RecordsTrim(peer, now);
@@ -592,6 +573,16 @@ static uint32_t ProcessAck(const LaiueNetEndpoint *endpoint, NetPeer *peer, cons
     if (context.largestNewlyAcked)
         UpdateRtt(peer, endpoint->now - context.largestSentTime, delay, endpoint->now);
     DetectLost(peer, endpoint->now);
+    const NetCongestionAck ack = {
+        .now = endpoint->now,
+        .largest = largest,
+        .nextNumber = peer->nextNumber,
+        .rttSample = context.largestNewlyAcked ? peer->latestRtt : 0u,
+        .smoothedRtt = peer->haveRtt ? peer->smoothedRtt : NET_INITIAL_RTT,
+        .limitedBytes = context.limitedBytes,
+        .limitedSentTime = context.limitedSentTime,
+    };
+    NetCongestionOnAck(&peer->congestion, &ack);
     peer->probeCount = 0u;
     return NET_FRAMES_OK;
 }
@@ -779,7 +770,7 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
         peer->pingPending || NetPeerQueuedUnreliable(peer) != 0u || NetPeerHasStreamData(peer);
     /* Пробы идут мимо окна и размеренной отправки: они и выясняют, жив ли
      * путь. */
-    const bool sendData = probe || (hasData && peer->bytesInFlight < peer->congestionWindow &&
+    const bool sendData = probe || (hasData && peer->bytesInFlight < peer->congestion.window &&
                                     peer->paceBudget > 0 && RecordsRoom(peer, now));
     /* Одинокий пакет ждёт подтверждения до следующего обновления: за это
      * время ответ может уехать вместе с данными. */
@@ -856,7 +847,7 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
         record->lossEpisode = 0u;
         record->state = NET_RECORD_SENT;
         record->rangeCount = (uint8_t)rangeCount;
-        record->windowLimited = (peer->bytesInFlight + total) * 2u >= peer->congestionWindow;
+        record->windowLimited = (peer->bytesInFlight + total) * 2u >= peer->congestion.window;
         memcpy(record->ranges, ranges, (size_t)rangeCount * sizeof(ranges[0]));
         peer->bytesInFlight += total;
         ++peer->ackElicitingOutstanding;
@@ -880,13 +871,13 @@ static void Migrate(NetPeer *peer, const LaiueNetAddress *from)
      * редких проб. */
     peer->address = *from;
     peer->haveRtt = false;
-    peer->inRecovery = false;
     peer->recoveryUndoable = false;
-    peer->slowStartThreshold = UINT64_MAX;
     peer->packetThreshold = NET_PACKET_THRESHOLD;
     peer->timeThreshold = NET_TIME_THRESHOLD;
+    /* До установки окна ещё нет: его заведёт первый пакет. */
     if (peer->datagramBytes != 0u)
-        peer->congestionWindow = MinimumWindow(peer);
+        NetCongestionReset(&peer->congestion, peer->datagramBytes, MinimumWindow(peer),
+                           peer->nextNumber);
 }
 
 void NetShortReceive(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from, uint8_t *bytes,
@@ -1020,7 +1011,7 @@ static void PaceRefill(NetPeer *peer, uint64_t now)
     if (!peer->haveRtt)
     {
         /* Пока путь не измерен, отправку сдерживает одно окно перегрузки. */
-        peer->paceBudget = (int64_t)peer->congestionWindow;
+        peer->paceBudget = (int64_t)peer->congestion.window;
         return;
     }
     if (elapsed > 10u * NET_SECOND)
@@ -1028,7 +1019,7 @@ static void PaceRefill(NetPeer *peer, uint64_t now)
     /* Темп — окно за время оборота с запасом в четверть. Накопить можно не
      * больше начальной пачки или того, что набежало за одно обновление. */
     const uint64_t rtt = peer->smoothedRtt > NET_MILLISECOND ? peer->smoothedRtt : NET_MILLISECOND;
-    const int64_t earned = (int64_t)(peer->congestionWindow * 5u / 4u * elapsed / rtt);
+    const int64_t earned = (int64_t)(peer->congestion.window * 5u / 4u * elapsed / rtt);
     const int64_t burst = 10 * (int64_t)peer->datagramBytes;
     const int64_t ceiling = earned > burst ? earned : burst;
     peer->paceBudget += earned;

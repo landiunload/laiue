@@ -909,6 +909,52 @@ static void TestBottleneck(void)
     WorldEnd();
 }
 
+/* Очередь на узком месте в десять времён оборота. Медленный старт замечает,
+ * что задержка растёт, и уходит из него раньше, чем очередь переполнится:
+ * удвоение окна до первой потери сбросило бы сотни пакетов, а пять
+ * осторожных раундов RFC 9406 — четверть тысячи. */
+static void TestSlowStartExit(void)
+{
+    const uint32_t total = 12u;
+    uint32_t next[CHANNELS] = {0u};
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    const LaiueNetSimulatorConditions conditions = {
+        .structSize = sizeof(conditions),
+        .latencyMicroseconds = 20000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 400000u,
+    };
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 4u << 20u;
+    WorldBegin(32u);
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    const LaiueNetPeer peer = Connect(client, server, SECOND);
+    Flow *serverFlow = ServerFlow(server, client->index);
+    serverFlow->sizes = bulkSizes;
+    serverFlow->sizeCount = COUNT_OF(bulkSizes);
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, &conditions) == LAIUE_NET_OK,
+           "bottleneck applies");
+    const uint64_t started = world.now;
+    const uint64_t until = world.now + 30u * SECOND;
+    while (serverFlow->nextReliable[0] != total && world.now < until)
+    {
+        while (next[0] < total && SendScheduled(client, peer, 1u, client->index, bulkSizes,
+                                                COUNT_OF(bulkSizes), 0u, next[0]) == LAIUE_NET_OK)
+            ++next[0];
+        WorldStep();
+    }
+    ExpectEqual(serverFlow->nextReliable[0], total, "bulk transfer completes");
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    ExpectEqual(info.packetsLost, 0u, "slow start ends before the queue overflows");
+    /* Три мебибайта на 1 МБ/с идут 3,15 секунды. */
+    Expect(world.now - started < 3600u * 1000u, "and the transfer still fills the bottleneck");
+    WorldEnd();
+}
+
 static bool scatterActive;
 static uint32_t scatterSeen;
 
@@ -1912,6 +1958,7 @@ LAIUE_TEST_ENTRY(NetTestEntryPoint)
     TestLossyNetwork();
     TestDeepPipe();
     TestBottleneck();
+    TestSlowStartExit();
     TestScatteredLoss();
     TestBackpressure();
     TestUnreliable();
