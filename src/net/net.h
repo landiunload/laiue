@@ -90,7 +90,9 @@ LAIUE_NET_API bool LaiueNetAddressEqual(const LaiueNetAddress *first,
 
 /* Сеть, какой её видит транспорт: ненадёжная доставка датаграмм по адресу.
  * Вызовы не блокируют. Таблица копируется при создании конечной точки;
- * context должен жить дольше неё. */
+ * context должен жить дольше неё. Датаграмму больше пути драйвер теряет, а
+ * не дробит: транспорт ищет размер пути пробами, и фрагменты скрыли бы от
+ * него настоящий. */
 typedef struct LaiueNetDriverV1
 {
     uint32_t structSize;
@@ -364,8 +366,8 @@ typedef struct LaiueNetUdpDesc
     uint32_t receiveBufferBytes;
 } LaiueNetUdpDesc;
 
-/* LAIUE_NET_UNSUPPORTED — у платформы нет сокетов; транспорт при этом
- * работает со своим драйвером. */
+/* Сокет запрещает системе дробить свои датаграммы. LAIUE_NET_UNSUPPORTED —
+ * у платформы нет сокетов; транспорт при этом работает со своим драйвером. */
 LAIUE_NET_API LaiueNetStatus LaiueNetUdpOpen(const LaiueNetUdpDesc *desc, LaiueNetUdp **outUdp);
 /* Закрывать после конечной точки, которая пользуется сокетом. */
 LAIUE_NET_API void LaiueNetUdpClose(LaiueNetUdp *udp);

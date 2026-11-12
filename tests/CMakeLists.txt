@@ -115,6 +115,13 @@ if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
 endif()
 laiue_add_harness(laiue_platform_threading_test PlatformThreadingTestEntryPoint
     platform_threading_test.c TEST laiue.platform.threading)
+# Reads the options of an open socket from the system, so it knows the built-in
+# backends only: an external adapter keeps its own socket behind the handle.
+if(NOT LAIUE_PLATFORM_EXTERNAL)
+    laiue_add_harness(laiue_platform_socket_test PlatformSocketTestEntryPoint
+        platform_socket_test.c LIBRARIES laiue::platform_support
+        TEST laiue.platform.socket TIMEOUT 60)
+endif()
 if(LAIUE_PLATFORM_WINDOWS)
     laiue_add_harness(laiue_efficiency_windows_test EfficiencyWindowsTestEntryPoint
         efficiency_windows_test.c TEST laiue.platform.efficiency_mode)

@@ -99,6 +99,12 @@ static int ClampBufferSize(uint32_t bytes)
     return bytes > (uint32_t)INT32_MAX ? INT32_MAX : (int)bytes;
 }
 
+/* Целая настройка сокета; false — система её не приняла. */
+static bool SetOption(SOCKET handle, int level, int name, DWORD value)
+{
+    return setsockopt(handle, level, name, (const char *)&value, (int)sizeof(value)) == 0;
+}
+
 bool PlatformUdpOpen(const PlatformSocketAddress *bindAddress, uint32_t sendBufferBytes,
                      uint32_t receiveBufferBytes, PlatformUdpSocket *outSocket)
 {
@@ -133,6 +139,19 @@ bool PlatformUdpOpen(const PlatformSocketAddress *bindAddress, uint32_t sendBuff
         succeeded = succeeded && setsockopt(handle, IPPROTO_IPV6, IPV6_V6ONLY,
                                             (const char *)&onlyIpv6, (int)sizeof(onlyIpv6)) == 0;
     }
+    /* Датаграмму больше пути система не дробит, а отвергает: размер пути
+     * транспорт ищет сам, и фрагменты скрыли бы от него настоящий. Режим
+     * пробы к тому же не сверяется с размером пути, который система
+     * запомнила по ICMP: подложное сообщение иначе запирало бы и пакеты
+     * базового размера. Сокету IPv6 нужны обе настройки: IPv4 идёт через
+     * него отображёнными адресами. Режим пробы ставится первым: после
+     * простого запрета Windows его уже не принимает. Системе без режима
+     * пробы остаётся простой запрет, а не знающая и его дробит как прежде. */
+    if (!SetOption(handle, IPPROTO_IP, IP_MTU_DISCOVER, (DWORD)IP_PMTUDISC_PROBE))
+        (void)SetOption(handle, IPPROTO_IP, IP_DONTFRAGMENT, 1u);
+    if (family == PLATFORM_SOCKET_IPV6 &&
+        !SetOption(handle, IPPROTO_IPV6, IPV6_MTU_DISCOVER, (DWORD)IP_PMTUDISC_PROBE))
+        (void)SetOption(handle, IPPROTO_IPV6, IPV6_DONTFRAG, 1u);
     if (sendBufferBytes != 0u)
     {
         const int size = ClampBufferSize(sendBufferBytes);

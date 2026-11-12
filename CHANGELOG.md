@@ -19,8 +19,9 @@ API and ABI may change between minor versions.
   64 channels carry reliable ordered, unreliable and sequenced messages, with
   QUIC-style loss recovery, reordering thresholds that adapt to the path,
   CUBIC with HyStart++ and pacing, datagram size discovery, address migration
-  and hard memory limits. A UDP driver covers IPv4 and IPv6, and a
-  deterministic simulator drives network tests. External platform adapters opt
+  and hard memory limits. A UDP driver covers IPv4 and IPv6 and keeps the
+  system from fragmenting its datagrams, and a deterministic simulator drives
+  network tests. External platform adapters opt
   into sockets with `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in
   `docs/net.md`.
 - The Android walk check no longer fails on its own timing. It compares a picture
