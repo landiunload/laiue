@@ -488,7 +488,8 @@ platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указа�
 
 Сокеты в обязательный контракт не входят. Adapter, который реализует и
 `src/platform/socket.h`, включает `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`, и
-`laiue.net` собирает свой драйвер UDP. Без этого транспорт остаётся,
+`laiue.net` собирает свой драйвер UDP. Датаграммы такого сокета система не
+дробит, если adapter умеет это запретить. Без сокетов транспорт остаётся,
 `LaiueNetUdpOpen` отвечает `LAIUE_NET_UNSUPPORTED`, а сеть платформы
 подключается собственным `LaiueNetDriverV1`.
 

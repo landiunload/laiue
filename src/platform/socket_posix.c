@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #if defined(__APPLE__)
-/* Под голым _POSIX_C_SOURCE Darwin прячет часть сетевых объявлений. */
+/* Под голым _POSIX_C_SOURCE Darwin прячет часть сетевых объявлений, а
+ * IPV6_DONTFRAG объявляет только с набором параметров RFC 3542. */
 #define _DARWIN_C_SOURCE 1
+#define __APPLE_USE_RFC_3542 1
 #endif
 
 #include "platform/socket.h"
@@ -120,6 +122,48 @@ static void SetBufferSize(int descriptor, int option, uint32_t bytes)
     }
 }
 
+/* Датаграмму больше пути система не дробит, а отвергает: размер пути
+ * транспорт ищет сам, и фрагменты скрыли бы от него настоящий. Система,
+ * которая запрета не знает, остаётся при дроблении. */
+static void ForbidFragmentation(int descriptor, uintptr_t family)
+{
+#if defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_PROBE)
+    /* Linux ставит DF и не сверяется с размером пути, который ядро запомнило
+     * по ICMP: подложное сообщение иначе запирало бы и пакеты базового
+     * размера. Сокету IPv6 нужны обе настройки: IPv4 идёт через него
+     * отображёнными адресами. */
+    const int probe = IP_PMTUDISC_PROBE;
+    (void)setsockopt(descriptor, IPPROTO_IP, IP_MTU_DISCOVER, &probe, (socklen_t)sizeof(probe));
+#if defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_PROBE)
+    if (family == PLATFORM_SOCKET_IPV6)
+    {
+        const int probeIpv6 = IPV6_PMTUDISC_PROBE;
+        (void)setsockopt(descriptor, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &probeIpv6,
+                         (socklen_t)sizeof(probeIpv6));
+    }
+#else
+    (void)family;
+#endif
+#else
+    /* Darwin запрещает дробление только своему семейству сокета: IPv4 через
+     * сокет IPv6 дробится по-прежнему. */
+    const int wholeDatagrams = 1;
+#if defined(IP_DONTFRAG)
+    if (family == PLATFORM_SOCKET_IPV4)
+        (void)setsockopt(descriptor, IPPROTO_IP, IP_DONTFRAG, &wholeDatagrams,
+                         (socklen_t)sizeof(wholeDatagrams));
+#endif
+#if defined(IPV6_DONTFRAG)
+    if (family == PLATFORM_SOCKET_IPV6)
+        (void)setsockopt(descriptor, IPPROTO_IPV6, IPV6_DONTFRAG, &wholeDatagrams,
+                         (socklen_t)sizeof(wholeDatagrams));
+#endif
+    (void)descriptor;
+    (void)family;
+    (void)wholeDatagrams;
+#endif
+}
+
 bool PlatformUdpOpen(const PlatformSocketAddress *bindAddress, uint32_t sendBufferBytes,
                      uint32_t receiveBufferBytes, PlatformUdpSocket *outSocket)
 {
@@ -142,6 +186,7 @@ bool PlatformUdpOpen(const PlatformSocketAddress *bindAddress, uint32_t sendBuff
         succeeded = succeeded && setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &onlyIpv6,
                                             (socklen_t)sizeof(onlyIpv6)) == 0;
     }
+    ForbidFragmentation(descriptor, family);
     SetBufferSize(descriptor, SO_SNDBUF, sendBufferBytes);
     SetBufferSize(descriptor, SO_RCVBUF, receiveBufferBytes);
     struct sockaddr_storage native;

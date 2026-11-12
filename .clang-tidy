@@ -9,8 +9,8 @@
 #   Vulkan, D3D12 and Win32 flags fires. UBSan checks the shifts themselves.
 # - no-assembler: a rule for safety-critical code; clang-cl has no intrinsic
 #   for the two instructions written by hand in the no-CRT runtime.
-# Reserved names that the platform defines: feature-test macros and the
-# no-CRT _fltused symbol.
+# Reserved names that the platform defines: feature-test macros, the switch
+# for Darwin's RFC 3542 socket options and the no-CRT _fltused symbol.
 Checks: >
   -*,
   bugprone-*,
@@ -26,7 +26,7 @@ Checks: >
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -clang-analyzer-optin.core.EnumCastOutOfRange
 CheckOptions:
-  bugprone-reserved-identifier.AllowedIdentifiers: '_POSIX_C_SOURCE;_DARWIN_C_SOURCE;_fltused'
+  bugprone-reserved-identifier.AllowedIdentifiers: '_POSIX_C_SOURCE;_DARWIN_C_SOURCE;__APPLE_USE_RFC_3542;_fltused'
 WarningsAsErrors: '*'
 HeaderFilterRegex: 'src[/\\].*'
 FormatStyle: file

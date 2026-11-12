@@ -115,6 +115,13 @@ if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
 endif()
 laiue_add_harness(laiue_platform_threading_test PlatformThreadingTestEntryPoint
     platform_threading_test.c TEST laiue.platform.threading)
+# Reads the options of an open socket from the system, so it knows the built-in
+# backends only: an external adapter keeps its own socket behind the handle.
+if(NOT LAIUE_PLATFORM_EXTERNAL)
+    laiue_add_harness(laiue_platform_socket_test PlatformSocketTestEntryPoint
+        platform_socket_test.c LIBRARIES laiue::platform_support
+        TEST laiue.platform.socket TIMEOUT 60)
+endif()
 if(LAIUE_PLATFORM_WINDOWS)
     laiue_add_harness(laiue_efficiency_windows_test EfficiencyWindowsTestEntryPoint
         efficiency_windows_test.c TEST laiue.platform.efficiency_mode)
@@ -183,6 +190,8 @@ laiue_add_harness(laiue_net_channel_test NetChannelTestEntryPoint net_channel_te
     LIBRARIES laiue::platform_support TEST laiue.net.channel TIMEOUT 120)
 laiue_add_harness(laiue_net_congestion_test NetCongestionTestEntryPoint net_congestion_test.c
     "${laiue_src}/net/net_congestion.c" STATIC TEST laiue.net.congestion TIMEOUT 120)
+laiue_add_harness(laiue_net_pmtu_test NetPmtuTestEntryPoint net_pmtu_test.c
+    "${laiue_src}/net/net_pmtu.c" STATIC TEST laiue.net.pmtu TIMEOUT 120)
 laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
     LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
 if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))
@@ -192,8 +201,8 @@ endif()
 # Allocation faults are injected only into copies of the endpoint sources; the
 # simulator keeps the real allocator, so the network itself never fails.
 set(laiue_net_failure_sources)
-foreach(source net_crypto net_wire net_address net_channel net_congestion net_packet net_handshake
-        net_endpoint)
+foreach(source net_crypto net_wire net_address net_channel net_congestion net_pmtu net_packet
+        net_handshake net_endpoint)
     configure_file("${laiue_src}/net/${source}.c"
         "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c" COPYONLY)
     list(APPEND laiue_net_failure_sources "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c")

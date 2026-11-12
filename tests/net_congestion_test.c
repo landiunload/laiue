@@ -180,6 +180,22 @@ static void TestReduction(void)
     Expect(congestion.window == 2u * DATAGRAM, "the window never drops below two datagrams");
 }
 
+/* Поиск размера пути меняет датаграмму посреди соединения: нижняя граница
+ * окна — две датаграммы нового размера, а само окно в байтах остаётся. */
+static void TestDatagramChange(void)
+{
+    Begin(2u * DATAGRAM);
+    NetCongestionSetDatagram(&congestion, 1452u);
+    Expect(congestion.window == 2u * 1452u, "a larger datagram raises the smallest window");
+    NetCongestionSetDatagram(&congestion, DATAGRAM);
+    Expect(congestion.window == 2u * 1452u, "a smaller one keeps the window");
+    Lose();
+    Expect(congestion.window == 2u * DATAGRAM, "and lowers the floor of a reduction");
+    Begin(100u * DATAGRAM);
+    NetCongestionSetDatagram(&congestion, 1452u);
+    Expect(congestion.window == 100u * DATAGRAM, "a window above the floor stays");
+}
+
 static void TestCubicCurve(void)
 {
     const uint64_t rtt = 100u * MS;
@@ -500,6 +516,7 @@ LAIUE_TEST_ENTRY(NetCongestionTestEntryPoint)
     TestCubeRoot();
     TestSlowStart();
     TestReduction();
+    TestDatagramChange();
     TestCubicCurve();
     TestRenoRegion();
     TestApplicationLimited();

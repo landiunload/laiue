@@ -195,16 +195,24 @@ static void WriteHelloFixed(const LaiueNetEndpoint *endpoint, const NetPeer *pee
     NetParametersWrite(&endpoint->local, output + HELLO_PARAMETERS);
 }
 
+/* Длина запроса: базовый размер датаграммы либо меньший предел клиента. */
+static uint32_t HelloBytes(const NetParameters *client)
+{
+    return client->datagramBytes < NET_DATAGRAM_BASE ? client->datagramBytes : NET_DATAGRAM_BASE;
+}
+
 static void SendHello(LaiueNetEndpoint *endpoint, const NetPeer *peer)
 {
-    /* Запрос дополнен до полной датаграммы: ответ сервера заведомо короче, а
-     * дошедший запрос показывает, что путь пропускает такой размер. */
+    /* Запрос дополнен до базового размера: ответ сервера заведомо короче, а
+     * дошедший запрос показывает, что путь пропускает такой размер. Больший
+     * найдёт поиск уже установленного соединения. */
     uint8_t *packet = endpoint->packetBuffer;
-    memset(packet, 0, endpoint->local.datagramBytes);
+    const uint32_t size = HelloBytes(&endpoint->local);
+    memset(packet, 0, size);
     WriteHelloFixed(endpoint, peer, packet);
     packet[HELLO_COOKIE_SIZE] = peer->cookieSize;
     memcpy(packet + HELLO_COOKIE, peer->cookie, peer->cookieSize);
-    NetTransmit(endpoint, &peer->address, packet, endpoint->local.datagramBytes);
+    NetTransmit(endpoint, &peer->address, packet, size);
 }
 
 bool NetHandshakeBegin(LaiueNetEndpoint *endpoint, NetPeer *peer, const uint8_t *serverPublicKey)
@@ -490,10 +498,10 @@ static void ReceiveHello(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from
         SendReject(endpoint, from, clientCid, reject);
         return;
     }
-    /* Клиент дополняет запрос до своей наибольшей датаграммы. Запрос короче
-     * заявленного размера не доказал, что путь такой размер пропускает. */
+    /* Клиент дополняет запрос до базового размера датаграммы. Запрос короче
+     * не доказал, что путь такой размер пропускает. */
     if ((flags & ~(NET_HELLO_PINNED | NET_HELLO_PRESHARED)) != 0u ||
-        !NetParametersRead(hello + HELLO_PARAMETERS, &remote) || size < remote.datagramBytes ||
+        !NetParametersRead(hello + HELLO_PARAMETERS, &remote) || size < HelloBytes(&remote) ||
         !ServerKeysReady(endpoint))
     {
         ++endpoint->stats.datagramsDropped;

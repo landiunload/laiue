@@ -33,7 +33,14 @@ typedef struct PlatformUdpSocket
 
 /* Открывает сокет семейства bindAddress и привязывает его. Нулевой адрес
  * означает все интерфейсы, нулевой порт — любой свободный. Размеры буферов
- * ОС — пожелание; ноль оставляет значения системы. */
+ * ОС — пожелание; ноль оставляет значения системы.
+ *
+ * Датаграммы сокета система не дробит, где умеет это запретить: слишком
+ * большая для пути теряется целиком, и транспорт находит размер пути
+ * пробами. Windows и Linux к тому же не сверяют датаграмму с размером пути,
+ * который запомнили по ICMP: проверить такое сообщение транспорту нечем.
+ * Darwin запрещает дробление только семейству самого сокета, и IPv4 через
+ * сокет IPv6 там дробится. */
 bool PlatformUdpOpen(const PlatformSocketAddress *bindAddress, uint32_t sendBufferBytes,
                      uint32_t receiveBufferBytes, PlatformUdpSocket *outSocket);
 void PlatformUdpClose(PlatformUdpSocket *socket);

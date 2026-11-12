@@ -90,7 +90,9 @@ LAIUE_NET_API bool LaiueNetAddressEqual(const LaiueNetAddress *first,
 
 /* Сеть, какой её видит транспорт: ненадёжная доставка датаграмм по адресу.
  * Вызовы не блокируют. Таблица копируется при создании конечной точки;
- * context должен жить дольше неё. */
+ * context должен жить дольше неё. Датаграмму больше пути драйвер теряет, а
+ * не дробит: транспорт ищет размер пути пробами, и фрагменты скрыли бы от
+ * него настоящий. */
 typedef struct LaiueNetDriverV1
 {
     uint32_t structSize;
@@ -130,8 +132,9 @@ typedef struct LaiueNetEndpointDesc
     /* Число каналов, от 1 до LAIUE_NET_MAX_CHANNELS; 0 — один. Соединение
      * пользуется меньшим из чисел двух сторон. */
     uint32_t channelCount;
-    /* Наибольшая датаграмма, от 576 до 1452 байт; 0 — 1200, что проходит
-     * почти по любому пути в интернете. Стороны берут меньшее. */
+    /* Наибольшая датаграмма, от 576 до 1452 байт; 0 — 1452. Стороны берут
+     * меньшее. Соединение начинает с 1200 байт, что проходит почти по любому
+     * пути в интернете, и поднимает размер, пока путь его пропускает. */
     uint32_t maxDatagramBytes;
     /* Наибольшее надёжное сообщение, которое примет эта сторона; 0 — 1 МиБ. */
     uint32_t maxMessageBytes;
@@ -264,6 +267,10 @@ typedef struct LaiueNetPeerInfo
     uint32_t channelCount;
     uint32_t maxMessageBytes;
     uint32_t maxUnreliableBytes;
+    /* Размер датаграмм сейчас — сколько пропускает путь: от 1200 байт до
+     * согласованного предела, а при пределе меньше 1200 — сам предел. До
+     * установления соединения — 0. */
+    uint32_t datagramBytes;
     /* Сглаженное время оборота и его отклонение; 0 — ещё не измерено. */
     uint32_t roundTripMicroseconds;
     uint32_t roundTripVarianceMicroseconds;
@@ -359,8 +366,8 @@ typedef struct LaiueNetUdpDesc
     uint32_t receiveBufferBytes;
 } LaiueNetUdpDesc;
 
-/* LAIUE_NET_UNSUPPORTED — у платформы нет сокетов; транспорт при этом
- * работает со своим драйвером. */
+/* Сокет запрещает системе дробить свои датаграммы. LAIUE_NET_UNSUPPORTED —
+ * у платформы нет сокетов; транспорт при этом работает со своим драйвером. */
 LAIUE_NET_API LaiueNetStatus LaiueNetUdpOpen(const LaiueNetUdpDesc *desc, LaiueNetUdp **outUdp);
 /* Закрывать после конечной точки, которая пользуется сокетом. */
 LAIUE_NET_API void LaiueNetUdpClose(LaiueNetUdp *udp);

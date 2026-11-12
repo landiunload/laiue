@@ -67,6 +67,15 @@ typedef struct World
 } World;
 
 static World world;
+/* Датаграмма, которую фильтр придержал, чтобы отправить позже. */
+static struct
+{
+    const LaiueNetDriverV1 *driver;
+    LaiueNetAddress to;
+    uint8_t bytes[1500];
+    uint32_t size;
+    uint64_t at;
+} held;
 /* Сдвиг всех зёрен: LAIUE_NET_TEST_SEED прогоняет те же сценарии на других сетях. */
 static uint64_t seedOffset;
 /* Когда отправлено ненадёжное сообщение с данным номером; 0 — не отмечено. */
@@ -339,6 +348,12 @@ static void WorldStep(void)
     world.now += TICK;
     Expect(LaiueNetSimulatorAdvance(world.simulator, world.now) == LAIUE_NET_OK,
            "simulator advances");
+    if (held.size != 0u && world.now >= held.at)
+    {
+        Expect(held.driver->send(held.driver->context, &held.to, held.bytes, held.size) == 1,
+               "a held datagram is sent");
+        held.size = 0u;
+    }
     for (uint32_t index = 0u; index < world.nodeCount; ++index)
     {
         Node *node = &world.nodes[index];
@@ -569,6 +584,8 @@ static void TestLifecycle(void)
                info.state == LAIUE_NET_PEER_CONNECTING && info.userData == &client->flows[0] &&
                LaiueNetAddressEqual(&info.address, &server->address),
            "a starting connection is visible");
+    Expect(info.maxUnreliableBytes == 0u && info.datagramBytes == 0u,
+           "and has no limits or datagram size yet");
     Expect(LaiueNetSend(client->endpoint, peer, 0u, LAIUE_NET_RELIABLE, "x", 1u) ==
                LAIUE_NET_NOT_CONNECTED,
            "nothing is sent before the connection exists");
@@ -1575,20 +1592,31 @@ static void TestMigration(void)
     Pump(server, serverFlow->peer, 2u, client->index, mixedSizes, COUNT_OF(mixedSizes), serverNext,
          6u);
     WorldRun(30u * TICK);
+    Expect(LaiueNetPeerGetInfo(server->endpoint, serverFlow->peer, &info) == LAIUE_NET_OK &&
+               info.datagramBytes == 1452u,
+           "the server has found the size of the first path");
     /* Клиент уходит в другую сеть посреди передачи. */
     roaming.current = 1u;
     Pump(client, peer, 1u, client->index, mixedSizes, COUNT_OF(mixedSizes), clientNext, 22u);
     Pump(server, serverFlow->peer, 2u, client->index, mixedSizes, COUNT_OF(mixedSizes), serverNext,
          22u);
     const uint64_t until = world.now + 30u * SECOND;
+    uint32_t smallest = UINT32_MAX;
     while ((!AllReceived(serverFlow, 22u) || !AllReceived(&client->flows[0], 22u)) &&
            world.now < until)
+    {
         WorldStep();
+        Expect(LaiueNetPeerGetInfo(server->endpoint, serverFlow->peer, &info) == LAIUE_NET_OK,
+               "peer information is available");
+        if (info.datagramBytes < smallest)
+            smallest = info.datagramBytes;
+    }
     Expect(AllReceived(serverFlow, 22u) && AllReceived(&client->flows[0], 22u),
            "the connection follows a client that changed its address");
-    Expect(LaiueNetPeerGetInfo(server->endpoint, serverFlow->peer, &info) == LAIUE_NET_OK &&
-               LaiueNetAddressEqual(&info.address, &elsewhere->address),
+    Expect(LaiueNetAddressEqual(&info.address, &elsewhere->address),
            "the server answers to the new address");
+    Expect(smallest == 1200u && info.datagramBytes == 1452u,
+           "and searches the size of the new path anew");
     Expect(client->disconnected == 0u && server->disconnected == 0u && server->connected == 1u,
            "a moved client is the same peer");
     WorldEnd();
@@ -1933,6 +1961,248 @@ static void TestNegotiation(void)
     WorldEnd();
 }
 
+/* ---- Размер датаграмм ------------------------------------------------------------------ */
+
+static uint32_t pathSizes[1];
+
+typedef struct PathCase
+{
+    /* Пределы датаграммы сторон; 0 — по умолчанию. */
+    uint32_t clientLimit;
+    uint32_t serverLimit;
+    /* Путь пропускает датаграммы не длиннее pathBytes, а со второй секунды
+     * передачи — не длиннее narrowedBytes; 0 — любые и не меняется. */
+    uint32_t pathBytes;
+    uint32_t narrowedBytes;
+    /* Узкое место; 0 — его нет. */
+    uint32_t bytesPerSecond;
+    uint32_t queueMicroseconds;
+    uint32_t jitterMicroseconds;
+    /* Сообщения клиента: сколько (0 — сто) и какого размера (0 — 64 КиБ). */
+    uint32_t messages;
+    uint32_t messageBytes;
+    /* Отдать всё сразу, а не по одному каждые 50 мс. */
+    bool bulk;
+    /* Ничего не отдавать: три секунды тишины после соединения. */
+    bool idle;
+    /* Первая проба в 1452 байта уходит на 60 мс позже. */
+    bool delayProbe;
+    /* Датаграмма клиента этого размера обрывает связь на две секунды.
+     * Приложение всё это время молчит: каждая его отправка отодвигала бы
+     * пробный таймер. */
+    uint32_t outageOnSize;
+} PathCase;
+
+typedef struct PathResult
+{
+    LaiueNetPeerInfo info;
+    /* Самая длинная датаграмма, которую клиент пытался отправить. */
+    uint32_t longest;
+    /* Сколько раз размер датаграмм клиента падал и до чего в последний раз. */
+    uint32_t falls;
+    uint32_t fallen;
+    /* Наименьшее окно перегрузки клиента при датаграммах в 1452 байта. */
+    uint32_t smallestWindow;
+} PathResult;
+
+typedef struct PathWire
+{
+    const LaiueNetDriverV1 *driver;
+    uint32_t *longest;
+    bool delayProbe;
+    uint32_t outageOnSize;
+    uint64_t outageUntil;
+} PathWire;
+
+static bool PathFilter(void *context, const LaiueNetAddress *from, const LaiueNetAddress *to,
+                       uint8_t *bytes, uint32_t size)
+{
+    PathWire *wire = context;
+    if (world.now < wire->outageUntil)
+        return false;
+    if (from->port != 5000u)
+        return true;
+    if (size > *wire->longest)
+        *wire->longest = size;
+    if (size == wire->outageOnSize)
+    {
+        wire->outageOnSize = 0u;
+        wire->outageUntil = world.now + 2u * SECOND;
+        return false;
+    }
+    if (wire->delayProbe && size == 1452u)
+    {
+        wire->delayProbe = false;
+        held.driver = wire->driver;
+        held.to = *to;
+        memcpy(held.bytes, bytes, size);
+        held.size = size;
+        held.at = world.now + 60u * TICK;
+        return false;
+    }
+    return true;
+}
+
+static PathResult PathTransfer(const PathCase *path)
+{
+    const uint32_t total = path->messages != 0u ? path->messages : 100u;
+    uint32_t next = 0u;
+    PathResult result = {.info = {.structSize = sizeof(LaiueNetPeerInfo)},
+                         .smallestWindow = UINT32_MAX};
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    LaiueNetSimulatorConditions conditions = {
+        .structSize = sizeof(conditions),
+        .latencyMicroseconds = 20000u,
+        .jitterMicroseconds = path->jitterMicroseconds,
+        .maxDatagramBytes = path->pathBytes,
+        .bytesPerSecond = path->bytesPerSecond,
+        .queueMicroseconds = path->queueMicroseconds,
+    };
+    pathSizes[0] = path->messageBytes != 0u ? path->messageBytes : 65536u;
+    held.size = 0u;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 8u << 20u;
+    desc.maxDatagramBytes = path->serverLimit;
+    WorldBegin(34u);
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    desc.maxDatagramBytes = path->clientLimit;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    PathWire wire = {
+        .driver = &client->driver,
+        .longest = &result.longest,
+        .delayProbe = path->delayProbe,
+        .outageOnSize = path->outageOnSize,
+    };
+    Expect(LaiueNetSimulatorSetFilter(world.simulator, PathFilter, &wire) == LAIUE_NET_OK,
+           "filter installs");
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, &conditions) == LAIUE_NET_OK,
+           "path applies");
+    const LaiueNetPeer peer = Connect(client, server, SECOND);
+    Flow *serverFlow = ServerFlow(server, client->index);
+    serverFlow->sizes = pathSizes;
+    serverFlow->sizeCount = COUNT_OF(pathSizes);
+    const uint64_t started = world.now;
+    const uint64_t until = world.now + 60u * SECOND;
+    uint32_t size = 0u;
+    while (path->idle ? world.now < started + 3u * SECOND
+                      : serverFlow->nextReliable[0] != total && world.now < until)
+    {
+        if (path->narrowedBytes != 0u && world.now == started + SECOND)
+        {
+            conditions.maxDatagramBytes = path->narrowedBytes;
+            Expect(LaiueNetSimulatorSetConditions(world.simulator, &conditions) == LAIUE_NET_OK,
+                   "path narrows");
+        }
+        if (!path->idle && next < total && world.now >= wire.outageUntil &&
+            (path->bulk || world.now >= started + next * 50u * TICK) &&
+            SendScheduled(client, peer, 1u, client->index, pathSizes, COUNT_OF(pathSizes), 0u,
+                          next) == LAIUE_NET_OK)
+            ++next;
+        WorldStep();
+        Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &result.info) == LAIUE_NET_OK,
+               "peer information is available");
+        if (result.info.datagramBytes < size)
+        {
+            ++result.falls;
+            result.fallen = result.info.datagramBytes;
+        }
+        size = result.info.datagramBytes;
+        if (size == 1452u && result.info.congestionWindowBytes < result.smallestWindow)
+            result.smallestWindow = result.info.congestionWindowBytes;
+    }
+    ExpectEqual(serverFlow->nextReliable[0], path->idle ? 0u : total, "the transfer completes");
+    Expect(client->disconnected == 0u && server->disconnected == 0u, "the connection survives");
+    WorldEnd();
+    return result;
+}
+
+/* Транспорт начинает с 1200 байт, которые проходят почти по любому пути, и
+ * пробами ищет, сколько пропускает именно этот (RFC 8899). Потерянная проба
+ * не теряет данных, не считается потерей пакета и не сжимает окно. */
+static void TestPathSize(void)
+{
+    /* Путь пропускает всё: первая же проба занимает общий предел сторон. */
+    const PathCase open = {0u};
+    PathResult result = PathTransfer(&open);
+    ExpectEqual(result.info.datagramBytes, 1452u, "an open path carries the largest datagram");
+    ExpectEqual(result.longest, 1452u, "and nothing longer is sent");
+    ExpectEqual(result.info.packetsLost, 0u, "probing an open path loses nothing");
+    ExpectEqual(result.info.maxUnreliableBytes, 1200u - 43u,
+                "an unreliable message still fits the base size");
+    /* Путь уже предела: поиск начинается сверху и подходит к пути снизу
+     * ближе чем на 16 байт. */
+    const PathCase narrow = {.pathBytes = 1350u};
+    result = PathTransfer(&narrow);
+    ExpectEqual(result.longest, 1452u, "the search starts from the top");
+    Expect(result.info.datagramBytes >= 1335u && result.info.datagramBytes <= 1350u,
+           "and finds a narrower path");
+    ExpectEqual(result.info.packetsLost, 0u, "lost probes are not lost packets");
+    /* Предел сервера меньше предела клиента. */
+    const PathCase server = {.serverLimit = 1300u};
+    result = PathTransfer(&server);
+    ExpectEqual(result.info.datagramBytes, 1300u, "the smaller limit of the two sides holds");
+    ExpectEqual(result.longest, 1300u, "and the client never exceeds it");
+    /* Предел в 1200 байт искать нечего. */
+    const PathCase base = {.clientLimit = 1200u};
+    result = PathTransfer(&base);
+    ExpectEqual(result.info.datagramBytes, 1200u, "a base-sized limit is never probed");
+    ExpectEqual(result.longest, 1200u, "and nothing longer is sent");
+    /* Путь сужается посреди передачи: большие пакеты пропадают, транспорт
+     * падает к 1200 байтам и через секунду ищет размер заново. */
+    const PathCase narrowed = {.narrowedBytes = 1300u};
+    result = PathTransfer(&narrowed);
+    Expect(result.info.packetsLost != 0u, "the narrowed path drops large packets");
+    Expect(result.falls == 1u && result.fallen == 1200u,
+           "the transport falls back to the base size once");
+    Expect(result.info.datagramBytes >= 1285u && result.info.datagramBytes <= 1300u,
+           "and finds the narrower path again");
+    /* Узкое место в 10 МБ/с с очередью в 10 мс теряет пакеты пачками в
+     * десятки, но пакеты полного размера за ними доходят: это перегрузка, а
+     * не сужение пути. */
+    const PathCase congested = {
+        .bytesPerSecond = 10000000u, .queueMicroseconds = 10000u, .bulk = true};
+    result = PathTransfer(&congested);
+    Expect(result.info.packetsLost >= 100u, "the bottleneck drops packets in bursts");
+    ExpectEqual(result.falls, 0u, "congestion is not a black hole");
+    ExpectEqual(result.info.datagramBytes, 1452u, "and the size stays");
+    /* Путь сужается под потоком из одних больших пакетов: не доходит
+     * ничего, и сужение выдают два пробных таймера подряд. */
+    const PathCase silent = {.narrowedBytes = 1300u, .bytesPerSecond = 2000000u, .bulk = true};
+    result = PathTransfer(&silent);
+    Expect(result.falls == 1u && result.fallen == 1200u,
+           "silence with large packets in flight is a black hole too");
+    Expect(result.info.datagramBytes <= 1300u, "and the size stays within the narrowed path");
+    /* Обрыв связи сразу после пробы: пробные таймеры срабатывают, но в пути,
+     * кроме пробы, одни малые пакеты, и о размере пути обрыв не говорит. */
+    const PathCase outage = {.pathBytes = 1350u, .messageBytes = 100u, .outageOnSize = 1389u};
+    result = PathTransfer(&outage);
+    ExpectEqual(result.falls, 0u,
+                "an outage with only small packets in flight is not a black hole");
+    ExpectEqual(result.info.datagramBytes, 1341u, "and the search goes on after it");
+    /* Перестановки: пробы, сочтённые потерянными, доходят позже и всё же
+     * доказывают свой размер, а мнимых потерь не остаётся. */
+    const PathCase reordered = {.pathBytes = 1350u, .jitterMicroseconds = 20000u};
+    result = PathTransfer(&reordered);
+    Expect(result.info.datagramBytes >= 1335u && result.info.datagramBytes <= 1350u,
+           "reordering does not mislead the search");
+    ExpectEqual(result.info.packetsLost, 0u, "every spurious loss is taken back");
+    const PathCase late = {.delayProbe = true};
+    result = PathTransfer(&late);
+    ExpectEqual(result.info.datagramBytes, 1452u, "a late probe still proves its size");
+    ExpectEqual(result.info.packetsLost, 0u, "and its loss was never counted");
+    /* На медленном пути с короткой очередью окно падает до двух датаграмм
+     * найденного размера, а не прежнего. */
+    const PathCase slow = {
+        .bytesPerSecond = 50000u, .queueMicroseconds = 20000u, .messages = 4u, .bulk = true};
+    result = PathTransfer(&slow);
+    ExpectEqual(result.smallestWindow, 2u * 1452u, "the smallest window counts found datagrams");
+    /* Соединению, которому нечего везти, больший размер не нужен. */
+    const PathCase idle = {.pathBytes = 1350u, .idle = true};
+    result = PathTransfer(&idle);
+    ExpectEqual(result.info.datagramBytes, 1200u, "an idle connection does not search");
+}
+
 static void ReadSeedOffset(void)
 {
     char text[24] = {0};
@@ -1973,6 +2243,7 @@ LAIUE_TEST_ENTRY(NetTestEntryPoint)
     TestDriverAndBacklog();
     TestEventBacklog();
     TestNegotiation();
+    TestPathSize();
     LaiueTestRuntimeWrite("net transport: passed\n");
     LAIUE_TEST_SUCCESS();
 }

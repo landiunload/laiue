@@ -37,7 +37,9 @@
 
 #define NET_DATAGRAM_MINIMUM 576u
 #define NET_DATAGRAM_MAXIMUM 1452u
-#define NET_DATAGRAM_DEFAULT 1200u
+/* Проходит почти по любому пути в интернете: с него соединение начинает, а
+ * больший размер находит поиском. */
+#define NET_DATAGRAM_BASE 1200u
 
 #define NET_PACKET_LONG 0x80u
 #define NET_PACKET_HELLO 0x81u
@@ -178,8 +180,44 @@ typedef struct NetSentPacket
     /* Окно перегрузки при отправке было занято хотя бы наполовину: только
      * такие пакеты расширяют его подтверждением. */
     bool windowLimited;
+    /* Проба размера датаграммы: её потеря о перегрузке не говорит. */
+    bool sizeProbe;
     NetSentRange ranges[NET_RECORD_RANGES];
 } NetSentPacket;
+
+/* Поиск размера датаграммы пути (net_pmtu.c). Размеры — датаграммы целиком,
+ * с заголовком и тегом. */
+typedef struct NetPmtu
+{
+    /* Когда слать следующую пробу; UINT64_MAX — искать больше нечего. */
+    uint64_t searchAt;
+    /* Начало нынешнего поиска: пробы, ушедшие раньше, ничего не решают. */
+    uint64_t epoch;
+    /* Последняя чёрная дыра (UINT64_MAX — не было) и пауза перед поиском
+     * после неё. */
+    uint64_t fallAt;
+    uint64_t holdOff;
+    /* Номер последнего дошедшего пакета полного размера: потери пакетов,
+     * ушедших раньше, объясняет перегрузка. */
+    uint64_t provenNumber;
+    /* Размер, доказанный рукопожатием, и наибольший, о котором договорились
+     * стороны. */
+    uint32_t base;
+    uint32_t limit;
+    /* Подтверждённый размер: им идут все пакеты. */
+    uint32_t current;
+    /* Поиск идёт в (current, ceiling]. */
+    uint32_t ceiling;
+    /* Размер следующей пробы и пробы в пути; 0 — её нет. */
+    uint32_t next;
+    uint32_t probing;
+    /* Потерянные подряд пробы размера next. */
+    uint32_t failures;
+    /* Подозрительные потери пакетов больше базового размера и наибольший из
+     * них; 0 — подозрений нет. */
+    uint32_t suspects;
+    uint32_t suspectSize;
+} NetPmtu;
 
 typedef struct NetChannel
 {
@@ -346,10 +384,12 @@ typedef struct NetPeer
      * установлено ли оно с той стороны. */
     bool confirmed;
 
-    /* Согласованные параметры. */
+    /* Согласованные параметры. Размер датаграммы — подтверждённый поиском
+     * размер пути. */
     uint64_t idleTimeout;
     NetChannel *channels;
     NetParameters remote;
+    NetPmtu pmtu;
     uint32_t datagramBytes;
     uint32_t channelCount;
 
@@ -649,6 +689,8 @@ void NetCongestionCollapse(NetCongestion *congestion, uint64_t now);
 /* Все потери последнего сокращения мнимы: окно, порог и кривая
  * возвращаются к прежним. */
 void NetCongestionUndo(NetCongestion *congestion);
+/* Размер датаграммы пути изменился; окно в байтах остаётся прежним. */
+void NetCongestionSetDatagram(NetCongestion *congestion, uint32_t datagramBytes);
 /* Целый кубический корень с округлением вниз. */
 uint64_t NetCubeRoot(uint64_t value);
 
@@ -689,3 +731,22 @@ uint32_t NetChannelReceiveStream(LaiueNetEndpoint *endpoint, NetPeer *peer, uint
 uint32_t NetChannelReceiveUnreliable(LaiueNetEndpoint *endpoint, NetPeer *peer,
                                      uint32_t channelIndex, bool sequenced, uint64_t sequence,
                                      const uint8_t *bytes, uint32_t length);
+
+/* net_pmtu.c */
+/* Новый путь: размер base, поиск до limit начинается сразу. */
+void NetPmtuReset(NetPmtu *pmtu, uint32_t base, uint32_t limit, uint64_t now);
+/* Размер пробы, которую пора отправить; 0 — не пора. */
+uint32_t NetPmtuProbeSize(const NetPmtu *pmtu, uint64_t now);
+void NetPmtuProbeSent(NetPmtu *pmtu, uint32_t size);
+/* Исход пробы с номером number, отправленной в sentTime. true —
+ * подтверждённый размер вырос. */
+bool NetPmtuProbeAcked(NetPmtu *pmtu, uint64_t number, uint32_t size, uint64_t sentTime,
+                       uint64_t now);
+void NetPmtuProbeLost(NetPmtu *pmtu, uint32_t size, uint64_t sentTime, uint64_t now);
+/* Обычные пакеты. true — большие датаграммы пропадают, и размер упал до
+ * базового. */
+void NetPmtuAcked(NetPmtu *pmtu, uint64_t number, uint32_t size);
+bool NetPmtuLost(NetPmtu *pmtu, uint64_t number, uint32_t size, uint64_t now);
+/* Пробный таймер сработал timeouts раз подряд, а самый большой пакет в пути,
+ * кроме проб, — largest байт. true — размер упал до базового. */
+bool NetPmtuTimeout(NetPmtu *pmtu, uint32_t timeouts, uint32_t largest, uint64_t now);

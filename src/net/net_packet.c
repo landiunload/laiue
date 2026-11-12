@@ -16,13 +16,15 @@
  * ничего не объявляет потерянным, а отправляет пробу, ответ на которую
  * запускает обычное обнаружение. Окном перегрузки ведают CUBIC и HyStart++
  * (net_congestion.c), а отправка размазана по времени оборота, а не
- * выстреливает пачкой. */
+ * выстреливает пачкой. Размер датаграмм ищут пробы (net_pmtu.c). */
 
 uint32_t NetPeerMaxUnreliable(const NetPeer *peer)
 {
     /* Заголовок пакета, тег и самый длинный заголовок кадра: вид, канал,
-     * номер до десяти байт и длина в два. */
-    return peer->datagramBytes - NET_SHORT_OVERHEAD - 14u;
+     * номер до десяти байт и длина в два. Предел считается от базового
+     * размера: найденный поиском может упасть, а принятое к отправке
+     * сообщение обязано поместиться в одну датаграмму. */
+    return peer->pmtu.base - NET_SHORT_OVERHEAD - 14u;
 }
 
 uint64_t NetPeerProbeTimeout(const NetPeer *peer)
@@ -43,8 +45,13 @@ bool NetPeerEstablish(LaiueNetEndpoint *endpoint, NetPeer *peer)
 {
     const NetParameters *local = &endpoint->local;
     const NetParameters *remote = &peer->remote;
-    peer->datagramBytes =
-        local->datagramBytes < remote->datagramBytes ? local->datagramBytes : remote->datagramBytes;
+    /* Рукопожатие доказало базовый размер; больший, до меньшего из двух
+     * пределов, найдёт поиск. */
+    NetPmtuReset(&peer->pmtu, NET_DATAGRAM_BASE,
+                 local->datagramBytes < remote->datagramBytes ? local->datagramBytes
+                                                              : remote->datagramBytes,
+                 endpoint->now);
+    peer->datagramBytes = peer->pmtu.current;
     peer->channelCount =
         local->channelCount < remote->channelCount ? local->channelCount : remote->channelCount;
     peer->idleTimeout =
@@ -309,6 +316,13 @@ static bool RecordsGrow(NetPeer *peer)
 
 /* ---- Перегрузка и оценка пути ------------------------------------------------------ */
 
+/* Поиск изменил размер датаграммы пути. */
+static void DatagramResize(NetPeer *peer)
+{
+    peer->datagramBytes = peer->pmtu.current;
+    NetCongestionSetDatagram(&peer->congestion, peer->datagramBytes);
+}
+
 static void CongestionOnLoss(NetPeer *peer, uint64_t sentTime, uint64_t now)
 {
     /* Одно сокращение окна на полёт: потери пакетов, отправленных до него,
@@ -395,6 +409,16 @@ static void PacketAcked(NetPeer *peer, NetSentPacket *record, AckContext *contex
     record->state = NET_RECORD_ACKED;
     --peer->ackElicitingOutstanding;
     peer->bytesInFlight -= record->size;
+    if (record->sizeProbe)
+    {
+        if (NetPmtuProbeAcked(&peer->pmtu, record->number, record->size, record->sentTime,
+                              context->now))
+            DatagramResize(peer);
+    }
+    else
+    {
+        NetPmtuAcked(&peer->pmtu, record->number, record->size);
+    }
     if (record->windowLimited && !NetCongestionInRecovery(&peer->congestion, record->sentTime))
     {
         context->limitedBytes += record->size;
@@ -416,12 +440,20 @@ static void PacketLost(NetPeer *peer, NetSentPacket *record, uint64_t now)
     record->state = NET_RECORD_LOST;
     --peer->ackElicitingOutstanding;
     peer->bytesInFlight -= record->size;
+    if (record->sizeProbe)
+    {
+        /* Проба теряется оттого, что велика для пути: перегрузки тут нет. */
+        NetPmtuProbeLost(&peer->pmtu, record->size, record->sentTime, now);
+        return;
+    }
     ++peer->packetsLost;
     CongestionOnLoss(peer, record->sentTime, now);
     record->lossEpisode = (uint16_t)peer->recoveryEpisode;
     ++peer->recoveryLosses;
     for (uint32_t index = 0u; index < record->rangeCount; ++index)
         NetChannelOnLost(peer, &record->ranges[index]);
+    if (NetPmtuLost(&peer->pmtu, record->number, record->size, now))
+        DatagramResize(peer);
 }
 
 /* Пакет, уже объявленный потерянным, всё-таки подтверждён: потеря мнимая,
@@ -432,6 +464,21 @@ static void SpuriousLoss(NetPeer *peer, NetSentPacket *record, uint32_t distance
                          AckContext *context)
 {
     record->state = NET_RECORD_ACKED;
+    if (record->sizeProbe)
+    {
+        /* Запоздавшая проба всё же доказывает свой размер. Окна и порогов
+         * её потеря не трогала, и откатывать нечего. */
+        if (NetPmtuProbeAcked(&peer->pmtu, record->number, record->size, record->sentTime,
+                              context->now))
+            DatagramResize(peer);
+        if (record->number == context->largest)
+        {
+            context->largestNewlyAcked = true;
+            context->largestSentTime = record->sentTime;
+        }
+        ++context->newlyAcked;
+        return;
+    }
     --peer->packetsLost;
     peer->spuriousSeen = true;
     for (uint32_t index = 0u; index < record->rangeCount; ++index)
@@ -505,6 +552,10 @@ static void DetectLost(NetPeer *peer, uint64_t now)
                 peer->lossTime = record->sentTime + lossDelay;
             }
         }
+        /* Потерянная проба размера о перегрузке не говорит: серию потерь она
+         * не продолжает и не прерывает. Дошедшая прерывает, как любой пакет. */
+        if (record->sizeProbe && record->state == NET_RECORD_LOST)
+            continue;
         if (record->state != NET_RECORD_LOST)
         {
             inRun = false;
@@ -759,6 +810,52 @@ static void RecordsMakeRoom(NetPeer *peer, uint64_t now)
     RecordsPop(peer);
 }
 
+/* Запись пакета, требующего подтверждения, перед его отправкой. */
+static NetSentPacket *RecordSent(NetPeer *peer, uint32_t total, uint64_t now)
+{
+    NetSentPacket *record = RecordAt(peer, peer->recordCount);
+    ++peer->recordCount;
+    record->number = peer->nextNumber;
+    record->sentTime = now;
+    record->size = (uint16_t)total;
+    record->lossEpisode = 0u;
+    record->state = NET_RECORD_SENT;
+    record->rangeCount = 0u;
+    /* Окно тесно, если пакет занимает его хотя бы наполовину. */
+    record->windowLimited = (peer->bytesInFlight + total) * 2u >= peer->congestion.window;
+    record->sizeProbe = false;
+    peer->bytesInFlight += total;
+    ++peer->ackElicitingOutstanding;
+    peer->lastAckElicitingSent = now;
+    peer->paceBudget -= (int64_t)total;
+    return record;
+}
+
+/* Проба размера датаграммы: PING и заполнитель до нужной длины. Уходит, когда
+ * есть что везти и окно позволяет: больший размер нужен потоку данных, а
+ * проба занимает окно наравне с ними. */
+static void SendSizeProbe(LaiueNetEndpoint *endpoint, NetPeer *peer)
+{
+    const uint64_t now = endpoint->now;
+    const uint32_t size = NetPmtuProbeSize(&peer->pmtu, now);
+    if (size == 0u || !peer->confirmed ||
+        (!NetPeerHasStreamData(peer) && NetPeerQueuedUnreliable(peer) == 0u) ||
+        peer->bytesInFlight >= peer->congestion.window || peer->paceBudget <= 0 ||
+        !RecordsRoom(peer, now))
+        return;
+    RecordsMakeRoom(peer, now);
+    uint8_t *payload = endpoint->packetBuffer + NET_SHORT_HEADER_SIZE;
+    const uint32_t payloadSize = size - NET_SHORT_OVERHEAD;
+    payload[0] = NET_FRAME_PING;
+    memset(payload + 1, NET_FRAME_PADDING, payloadSize - 1u);
+    NetSentPacket *record = RecordSent(peer, size, now);
+    /* Проба окно не расширяет: её подтверждение говорит о размере пути. */
+    record->windowLimited = false;
+    record->sizeProbe = true;
+    NetPmtuProbeSent(&peer->pmtu, size);
+    SealAndSend(endpoint, peer, payloadSize);
+}
+
 /* Собирает и отправляет один пакет. false — отправлять нечего или нельзя. */
 static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
 {
@@ -838,21 +935,9 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
 
     if (eliciting)
     {
-        const uint32_t total = NET_SHORT_OVERHEAD + used;
-        NetSentPacket *record = RecordAt(peer, peer->recordCount);
-        ++peer->recordCount;
-        record->number = peer->nextNumber;
-        record->sentTime = now;
-        record->size = (uint16_t)total;
-        record->lossEpisode = 0u;
-        record->state = NET_RECORD_SENT;
+        NetSentPacket *record = RecordSent(peer, NET_SHORT_OVERHEAD + used, now);
         record->rangeCount = (uint8_t)rangeCount;
-        record->windowLimited = (peer->bytesInFlight + total) * 2u >= peer->congestion.window;
         memcpy(record->ranges, ranges, (size_t)rangeCount * sizeof(ranges[0]));
-        peer->bytesInFlight += total;
-        ++peer->ackElicitingOutstanding;
-        peer->lastAckElicitingSent = now;
-        peer->paceBudget -= (int64_t)total;
         if (probe)
             --peer->probesPending;
     }
@@ -862,13 +947,13 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
 
 /* ---- Приём ---------------------------------------------------------------------------- */
 
-static void Migrate(NetPeer *peer, const LaiueNetAddress *from)
+static void Migrate(NetPeer *peer, const LaiueNetAddress *from, uint64_t now)
 {
     /* Собеседник сменил адрес: сеть, NAT. Пакет подлинный, поэтому ответы
-     * идут на новый адрес, но о новом пути ничего не известно — окно и
-     * оценки начинаются заново. Так подложный переезд не превращает
-     * соединение в усилитель: в чужой адрес уйдёт не больше двух пакетов и
-     * редких проб. */
+     * идут на новый адрес, но о новом пути ничего не известно — окно, размер
+     * датаграммы и оценки начинаются заново. Так подложный переезд не
+     * превращает соединение в усилитель: в чужой адрес уйдёт не больше двух
+     * пакетов и редких проб. */
     peer->address = *from;
     peer->haveRtt = false;
     peer->recoveryUndoable = false;
@@ -876,8 +961,12 @@ static void Migrate(NetPeer *peer, const LaiueNetAddress *from)
     peer->timeThreshold = NET_TIME_THRESHOLD;
     /* До установки окна ещё нет: его заведёт первый пакет. */
     if (peer->datagramBytes != 0u)
+    {
+        NetPmtuReset(&peer->pmtu, peer->pmtu.base, peer->pmtu.limit, now);
+        peer->datagramBytes = peer->pmtu.current;
         NetCongestionReset(&peer->congestion, peer->datagramBytes, MinimumWindow(peer),
                            peer->nextNumber);
+    }
 }
 
 void NetShortReceive(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from, uint8_t *bytes,
@@ -920,7 +1009,7 @@ void NetShortReceive(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from, ui
     peer->lastReceiveTime = endpoint->now;
     peer->confirmed = true;
     if (newest && !LaiueNetAddressEqual(&peer->address, from))
-        Migrate(peer, from);
+        Migrate(peer, from, endpoint->now);
 
     if (peer->state == NET_STATE_CLOSING)
     {
@@ -984,9 +1073,27 @@ void NetShortReceive(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from, ui
 
 /* ---- Таймеры -------------------------------------------------------------------------- */
 
-static void ProbeTimeout(NetPeer *peer)
+/* Самый большой пакет в пути, кроме проб размера. */
+static uint32_t LargestInFlight(const NetPeer *peer)
+{
+    uint32_t largest = 0u;
+    for (uint32_t position = 0u; position < peer->recordCount; ++position)
+    {
+        const NetSentPacket *record = RecordAt(peer, position);
+        if (record->state == NET_RECORD_SENT && !record->sizeProbe && record->size > largest)
+            largest = record->size;
+    }
+    return largest;
+}
+
+static void ProbeTimeout(NetPeer *peer, uint64_t now)
 {
     ++peer->probeCount;
+    /* Второй таймер подряд без единого подтверждения: путь мог перестать
+     * пропускать большие датаграммы, и пробы, несущие данные, пропадали бы
+     * вместе с ними. */
+    if (NetPmtuTimeout(&peer->pmtu, peer->probeCount, LargestInFlight(peer), now))
+        DatagramResize(peer);
     /* Проба несёт самые старые неподтверждённые данные: если потерялись
      * именно они, собеседник получит их без лишнего круга. */
     for (uint32_t position = 0u; position < peer->recordCount; ++position)
@@ -1070,7 +1177,7 @@ void NetPeerUpdate(LaiueNetEndpoint *endpoint, NetPeer *peer)
         if (timeout > limit)
             timeout = limit;
         if (now - peer->lastAckElicitingSent >= timeout)
-            ProbeTimeout(peer);
+            ProbeTimeout(peer, now);
     }
     else if (now - peer->lastAckElicitingSent >= peer->idleTimeout / 3u)
     {
@@ -1078,6 +1185,7 @@ void NetPeerUpdate(LaiueNetEndpoint *endpoint, NetPeer *peer)
         peer->pingPending = true;
     }
     PaceRefill(peer, now);
+    SendSizeProbe(endpoint, peer);
     for (uint32_t sent = 0u; sent < NET_FLUSH_PACKETS; ++sent)
     {
         if (!SendPacket(endpoint, peer))

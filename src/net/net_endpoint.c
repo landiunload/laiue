@@ -481,7 +481,7 @@ static bool ResolveLimits(const LaiueNetEndpointDesc *desc, LaiueNetEndpoint *en
     endpoint->maxPeers = desc->maxPeers != 0u ? desc->maxPeers : DEFAULT_PEERS;
     endpoint->local.channelCount = desc->channelCount != 0u ? desc->channelCount : 1u;
     endpoint->local.datagramBytes =
-        desc->maxDatagramBytes != 0u ? desc->maxDatagramBytes : NET_DATAGRAM_DEFAULT;
+        desc->maxDatagramBytes != 0u ? desc->maxDatagramBytes : NET_DATAGRAM_MAXIMUM;
     endpoint->local.maxMessageBytes =
         desc->maxMessageBytes != 0u ? desc->maxMessageBytes : DEFAULT_MESSAGE_BYTES;
     endpoint->local.idleMilliseconds = desc->idleTimeoutMilliseconds != 0u
@@ -770,6 +770,7 @@ LaiueNetStatus LaiueNetPeerGetInfo(const LaiueNetEndpoint *endpoint, LaiueNetPee
     outInfo->channelCount = peer->channelCount;
     outInfo->maxMessageBytes = peer->remote.maxMessageBytes;
     outInfo->maxUnreliableBytes = NetPeerMaxUnreliable(peer);
+    outInfo->datagramBytes = peer->datagramBytes;
     if (peer->haveRtt)
     {
         outInfo->roundTripMicroseconds = Saturate32(peer->smoothedRtt);

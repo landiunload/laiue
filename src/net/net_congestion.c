@@ -329,6 +329,13 @@ void NetCongestionCollapse(NetCongestion *congestion, uint64_t now)
     congestion->cubic.started = false;
 }
 
+void NetCongestionSetDatagram(NetCongestion *congestion, uint32_t datagramBytes)
+{
+    congestion->datagramBytes = datagramBytes;
+    if (congestion->window < MinimumWindow(congestion))
+        congestion->window = MinimumWindow(congestion);
+}
+
 void NetCongestionUndo(NetCongestion *congestion)
 {
     const uint64_t prior = congestion->cubic.priorWindow;
