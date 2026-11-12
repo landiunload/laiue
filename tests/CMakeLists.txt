@@ -178,6 +178,9 @@ laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.
 laiue_add_harness(laiue_net_crypto_portable_test NetCryptoTestEntryPoint net_crypto_test.c
     "${laiue_src}/net/net_crypto.c" STATIC DEFINITIONS NET_CRYPTO_PORTABLE=1
     TEST laiue.net.crypto_portable TIMEOUT 120)
+laiue_add_harness(laiue_net_channel_test NetChannelTestEntryPoint net_channel_test.c
+    "${laiue_src}/net/net_channel.c" "${laiue_src}/net/net_wire.c" STATIC
+    LIBRARIES laiue::platform_support TEST laiue.net.channel TIMEOUT 120)
 laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
     LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
 if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))
