@@ -4,8 +4,8 @@
 
 #include <string.h>
 
-/* Векторы ChaCha20. NET_CRYPTO_PORTABLE отключает их вместе с быстрым
- * 128-битным умножением: так тест проверяет и переносимый код. */
+/* Векторы ChaCha20 и Poly1305. NET_CRYPTO_PORTABLE отключает их вместе с
+ * быстрым 128-битным умножением: так тест проверяет и переносимый код. */
 #if !defined(NET_CRYPTO_PORTABLE) && defined(__AVX2__)
 #define NET_CHACHA_AVX2 1
 #define NET_CHACHA_LANES 8u
@@ -31,6 +31,18 @@
 #define NET_NOINLINE __declspec(noinline)
 #else
 #define NET_NOINLINE __attribute__((noinline))
+#endif
+
+/* Встраивание обязательно только с оптимизацией. Без неё clang всё равно
+ * встраивает, но каждой копии отводит свои слоты стека: кадр перерастает
+ * страницу и требует __chkstk, которого в сборке без CRT нет. MSVC без
+ * оптимизации не встраивает ничего. */
+#if (defined(__clang__) || defined(__GNUC__)) && defined(__OPTIMIZE__)
+#define NET_FORCE_INLINE inline __attribute__((always_inline))
+#elif defined(_MSC_VER) && !defined(__clang__)
+#define NET_FORCE_INLINE __forceinline
+#else
+#define NET_FORCE_INLINE inline
 #endif
 
 static uint32_t Load32(const uint8_t *bytes)
@@ -647,7 +659,8 @@ void NetPoly1305Begin(NetPoly1305 *state, const uint8_t key[NET_KEY_SIZE])
 
 /* h = (h + блок) * r для count блоков подряд. highBit — бит 2^128 полного
  * блока; у дополненного последнего блока единица уже стоит внутри 16 байт. */
-static void PolyBlocks(NetPoly1305 *state, const uint8_t *bytes, size_t count, uint64_t highBit)
+static void PolyBlocksScalar(NetPoly1305 *state, const uint8_t *bytes, size_t count,
+                             uint64_t highBit)
 {
     const uint64_t r0 = state->r[0];
     const uint64_t r1 = state->r[1];
@@ -684,6 +697,494 @@ static void PolyBlocks(NetPoly1305 *state, const uint8_t *bytes, size_t count, u
     state->h[0] = h0;
     state->h[1] = h1;
     state->h[2] = h2;
+}
+
+/* ---- Poly1305 векторами ------------------------------------------------------
+ *
+ * Длинный вход считают NET_POLY_LANES независимых аккумуляторов: дорожка
+ * берёт каждый NET_POLY_LANES-й блок и после него умножается на r^L, где L —
+ * число дорожек. Последнюю группу дорожки умножают на r^L, ..., r^1 — каждая
+ * на степень, которая оставалась бы её блокам до конца, — и сумма дорожек
+ * равна последовательному счёту. В дорожках числа — пять разрядов по 26 бит:
+ * векторное умножение 32 на 32 бита даёт 64, а сумма пяти произведений
+ * меньше 2^58. AVX2 ведёт четыре дорожки, SSE2 и NEON — две. */
+
+#if defined(NET_CHACHA_AVX2)
+#define NET_POLY_LANES 4u
+#elif defined(NET_CHACHA_LANES)
+#define NET_POLY_LANES 2u
+#endif
+
+#if defined(NET_POLY_LANES)
+
+#define POLY_MASK26 ((UINT64_C(1) << 26u) - 1u)
+
+typedef uint64_t Poly26[5];
+
+/* Почти приведённое значение: все разряды меньше 2^26, кроме второго — он
+ * меньше 2^26 + 2^11. Разряды входа меньше 2^60. */
+static void Poly26Carry(Poly26 value)
+{
+    uint64_t carry = value[0] >> 26u;
+    value[0] &= POLY_MASK26;
+    value[1] += carry;
+    carry = value[1] >> 26u;
+    value[1] &= POLY_MASK26;
+    value[2] += carry;
+    carry = value[2] >> 26u;
+    value[2] &= POLY_MASK26;
+    value[3] += carry;
+    carry = value[3] >> 26u;
+    value[3] &= POLY_MASK26;
+    value[4] += carry;
+    carry = value[4] >> 26u;
+    value[4] &= POLY_MASK26;
+    value[0] += carry * 5u;
+    carry = value[0] >> 26u;
+    value[0] &= POLY_MASK26;
+    value[1] += carry;
+}
+
+/* output = left * right по модулю 2^130 - 5; разряды обоих меньше 2^27. */
+static void Poly26Multiply(Poly26 output, const Poly26 left, const Poly26 right)
+{
+    const uint64_t s1 = right[1] * 5u;
+    const uint64_t s2 = right[2] * 5u;
+    const uint64_t s3 = right[3] * 5u;
+    const uint64_t s4 = right[4] * 5u;
+    Poly26 d;
+    d[0] = left[0] * right[0] + left[1] * s4 + left[2] * s3 + left[3] * s2 + left[4] * s1;
+    d[1] = left[0] * right[1] + left[1] * right[0] + left[2] * s4 + left[3] * s3 + left[4] * s2;
+    d[2] =
+        left[0] * right[2] + left[1] * right[1] + left[2] * right[0] + left[3] * s4 + left[4] * s3;
+    d[3] = left[0] * right[3] + left[1] * right[2] + left[2] * right[1] + left[3] * right[0] +
+           left[4] * s4;
+    d[4] = left[0] * right[4] + left[1] * right[3] + left[2] * right[2] + left[3] * right[1] +
+           left[4] * right[0];
+    Poly26Carry(d);
+    for (size_t limb = 0u; limb < 5u; ++limb)
+        output[limb] = d[limb];
+}
+
+/* Из разрядов по 44 бита: первые два меньше 2^44, третий меньше 2^43. */
+static void Poly26From44(Poly26 output, uint64_t low, uint64_t middle, uint64_t high)
+{
+    output[0] = low & POLY_MASK26;
+    output[1] = ((low >> 26u) | (middle << 18u)) & POLY_MASK26;
+    output[2] = (middle >> 8u) & POLY_MASK26;
+    output[3] = ((middle >> 34u) | (high << 10u)) & POLY_MASK26;
+    output[4] = high >> 16u;
+}
+
+/* Обратно в разряды по 44 бита после Poly26Carry; третий выходит меньше
+ * 2^42 + 2^17. */
+static void Poly26To44(const Poly26 value, uint64_t output[3])
+{
+    uint64_t t = value[0] + (value[1] << 26u);
+    output[0] = t & POLY_MASK44;
+    t = (t >> 44u) + (value[2] << 8u) + (value[3] << 34u);
+    output[1] = t & POLY_MASK44;
+    output[2] = (t >> 44u) + (value[4] << 16u);
+}
+
+#if defined(NET_CHACHA_AVX2)
+
+typedef __m256i PolyVector;
+/* Множитель: значение в младших 32 битах каждой 64-битной дорожки. */
+typedef __m256i PolyFactor;
+
+/* Распаковка берёт по слову из каждой 128-битной половины, поэтому в
+ * дорожках оказываются блоки 0, 2, 1 и 3: им в последней группе остаются
+ * степени r^4, r^2, r^3 и r^1. */
+static const uint32_t polyLastExponents[4] = {4u, 2u, 3u, 1u};
+
+static PolyVector PolyAdd(PolyVector left, PolyVector right)
+{
+    return _mm256_add_epi64(left, right);
+}
+
+static PolyVector PolyLow26(PolyVector value)
+{
+    return _mm256_and_si256(value, _mm256_set1_epi64x((long long)POLY_MASK26));
+}
+
+static PolyVector PolyHigh26(PolyVector value)
+{
+    return _mm256_srli_epi64(value, 26);
+}
+
+static PolyVector PolyTimes5(PolyVector value)
+{
+    return _mm256_add_epi64(value, _mm256_slli_epi64(value, 2));
+}
+
+static PolyFactor PolyNarrow(PolyVector value)
+{
+    return value;
+}
+
+static PolyVector PolyMultiply(PolyFactor left, PolyFactor right)
+{
+    return _mm256_mul_epu32(left, right);
+}
+
+static PolyVector PolyMultiplyAdd(PolyVector sum, PolyFactor left, PolyFactor right)
+{
+    return _mm256_add_epi64(sum, _mm256_mul_epu32(left, right));
+}
+
+/* Разряд limb степеней exponent[0..3] — по дорожкам. */
+static PolyVector PolyLanesOf(const Poly26 power[5], const uint32_t exponent[4], size_t limb)
+{
+    return _mm256_set_epi64x(
+        (long long)power[exponent[3]][limb], (long long)power[exponent[2]][limb],
+        (long long)power[exponent[1]][limb], (long long)power[exponent[0]][limb]);
+}
+
+static PolyVector PolyFirstLane(uint64_t value)
+{
+    return _mm256_set_epi64x(0, 0, 0, (long long)value);
+}
+
+static uint64_t PolySum(PolyVector value)
+{
+    uint64_t lanes[2];
+    _mm_storeu_si128((__m128i *)(void *)lanes, _mm_add_epi64(_mm256_castsi256_si128(value),
+                                                             _mm256_extracti128_si256(value, 1)));
+    return lanes[0] + lanes[1];
+}
+
+/* Разряды четырёх блоков с битом 2^128. */
+static void PolyLoad(const uint8_t *bytes, PolyVector m[5])
+{
+    const __m256i first = _mm256_loadu_si256((const __m256i *)(const void *)bytes);
+    const __m256i second = _mm256_loadu_si256((const __m256i *)(const void *)(bytes + 32u));
+    const __m256i low = _mm256_unpacklo_epi64(first, second);
+    const __m256i high = _mm256_unpackhi_epi64(first, second);
+    m[0] = PolyLow26(low);
+    m[1] = PolyLow26(_mm256_srli_epi64(low, 26));
+    m[2] = PolyLow26(_mm256_or_si256(_mm256_srli_epi64(low, 52), _mm256_slli_epi64(high, 12)));
+    m[3] = PolyLow26(_mm256_srli_epi64(high, 14));
+    m[4] = _mm256_or_si256(_mm256_srli_epi64(high, 40), _mm256_set1_epi64x(1 << 24));
+}
+
+#elif defined(NET_CHACHA_SSE2)
+
+typedef __m128i PolyVector;
+typedef __m128i PolyFactor;
+
+static const uint32_t polyLastExponents[2] = {2u, 1u};
+
+static PolyVector PolyAdd(PolyVector left, PolyVector right)
+{
+    return _mm_add_epi64(left, right);
+}
+
+static PolyVector PolyLow26(PolyVector value)
+{
+    return _mm_and_si128(value, _mm_set1_epi64x((long long)POLY_MASK26));
+}
+
+static PolyVector PolyHigh26(PolyVector value)
+{
+    return _mm_srli_epi64(value, 26);
+}
+
+static PolyVector PolyTimes5(PolyVector value)
+{
+    return _mm_add_epi64(value, _mm_slli_epi64(value, 2));
+}
+
+static PolyFactor PolyNarrow(PolyVector value)
+{
+    return value;
+}
+
+static PolyVector PolyMultiply(PolyFactor left, PolyFactor right)
+{
+    return _mm_mul_epu32(left, right);
+}
+
+static PolyVector PolyMultiplyAdd(PolyVector sum, PolyFactor left, PolyFactor right)
+{
+    return _mm_add_epi64(sum, _mm_mul_epu32(left, right));
+}
+
+static PolyVector PolyLanesOf(const Poly26 power[3], const uint32_t exponent[2], size_t limb)
+{
+    return _mm_set_epi64x((long long)power[exponent[1]][limb], (long long)power[exponent[0]][limb]);
+}
+
+static PolyVector PolyFirstLane(uint64_t value)
+{
+    return _mm_set_epi64x(0, (long long)value);
+}
+
+static uint64_t PolySum(PolyVector value)
+{
+    uint64_t lanes[2];
+    _mm_storeu_si128((__m128i *)(void *)lanes, value);
+    return lanes[0] + lanes[1];
+}
+
+static void PolyLoad(const uint8_t *bytes, PolyVector m[5])
+{
+    const __m128i first = Load16(bytes);
+    const __m128i second = Load16(bytes + 16u);
+    const __m128i low = _mm_unpacklo_epi64(first, second);
+    const __m128i high = _mm_unpackhi_epi64(first, second);
+    m[0] = PolyLow26(low);
+    m[1] = PolyLow26(_mm_srli_epi64(low, 26));
+    m[2] = PolyLow26(_mm_or_si128(_mm_srli_epi64(low, 52), _mm_slli_epi64(high, 12)));
+    m[3] = PolyLow26(_mm_srli_epi64(high, 14));
+    m[4] = _mm_or_si128(_mm_srli_epi64(high, 40), _mm_set1_epi64x(1 << 24));
+}
+
+#else
+
+typedef uint64x2_t PolyVector;
+/* У NEON произведение 32 на 32 бита берёт половинные векторы. */
+typedef uint32x2_t PolyFactor;
+
+static const uint32_t polyLastExponents[2] = {2u, 1u};
+
+static PolyVector PolyAdd(PolyVector left, PolyVector right)
+{
+    return vaddq_u64(left, right);
+}
+
+static PolyVector PolyLow26(PolyVector value)
+{
+    return vandq_u64(value, vdupq_n_u64(POLY_MASK26));
+}
+
+static PolyVector PolyHigh26(PolyVector value)
+{
+    return vshrq_n_u64(value, 26);
+}
+
+static PolyVector PolyTimes5(PolyVector value)
+{
+    return vaddq_u64(value, vshlq_n_u64(value, 2));
+}
+
+static PolyFactor PolyNarrow(PolyVector value)
+{
+    return vmovn_u64(value);
+}
+
+static PolyVector PolyMultiply(PolyFactor left, PolyFactor right)
+{
+    return vmull_u32(left, right);
+}
+
+static PolyVector PolyMultiplyAdd(PolyVector sum, PolyFactor left, PolyFactor right)
+{
+    return vmlal_u32(sum, left, right);
+}
+
+static PolyVector PolyLanesOf(const Poly26 power[3], const uint32_t exponent[2], size_t limb)
+{
+    return vcombine_u64(vcreate_u64(power[exponent[0]][limb]),
+                        vcreate_u64(power[exponent[1]][limb]));
+}
+
+static PolyVector PolyFirstLane(uint64_t value)
+{
+    return vcombine_u64(vcreate_u64(value), vcreate_u64(0u));
+}
+
+static uint64_t PolySum(PolyVector value)
+{
+    return vgetq_lane_u64(value, 0) + vgetq_lane_u64(value, 1);
+}
+
+static void PolyLoad(const uint8_t *bytes, PolyVector m[5])
+{
+    const uint64x2_t first = vreinterpretq_u64_u8(vld1q_u8(bytes));
+    const uint64x2_t second = vreinterpretq_u64_u8(vld1q_u8(bytes + 16u));
+    const uint64x2_t low = vcombine_u64(vget_low_u64(first), vget_low_u64(second));
+    const uint64x2_t high = vcombine_u64(vget_high_u64(first), vget_high_u64(second));
+    m[0] = PolyLow26(low);
+    m[1] = PolyLow26(vshrq_n_u64(low, 26));
+    m[2] = PolyLow26(vorrq_u64(vshrq_n_u64(low, 52), vshlq_n_u64(high, 12)));
+    m[3] = PolyLow26(vshrq_n_u64(high, 14));
+    m[4] = vorrq_u64(vshrq_n_u64(high, 40), vdupq_n_u64(UINT64_C(1) << 24u));
+}
+
+#endif
+
+/* Разряды степени r для каждой дорожки и они же, умноженные на 5: перенос
+ * за 2^130 возвращается вниз умножением на 5. */
+typedef struct PolyKey
+{
+    PolyFactor r[5];
+    PolyFactor s[5];
+} PolyKey;
+
+/* Степени r^1..r^L и ключи дорожек из них. Они секретны, как сам r, и
+ * обнуляются вместе, одним вызовом. */
+typedef struct PolyPowers
+{
+    Poly26 power[NET_POLY_LANES + 1u];
+    PolyKey step;
+    PolyKey last;
+} PolyPowers;
+
+/* Степени берутся через указатель на неизменяемую структуру: массив
+ * массивов без const до C23 не передаётся туда, где ждут его с const. */
+static void PolyKeyOf(PolyKey *key, const PolyPowers *powers,
+                      const uint32_t exponent[NET_POLY_LANES])
+{
+    for (size_t limb = 0u; limb < 5u; ++limb)
+    {
+        const PolyVector r = PolyLanesOf(powers->power, exponent, limb);
+        key->r[limb] = PolyNarrow(r);
+        key->s[limb] = PolyNarrow(PolyTimes5(r));
+    }
+}
+
+/* Не встраивается: цикл читает ключи из памяти. Встроив подготовку, clang
+ * держал ключи в регистрах и вытеснял из них аккумуляторы. */
+static NET_NOINLINE void PolyPowersOf(PolyPowers *powers, const NetPoly1305 *state)
+{
+    Poly26From44(powers->power[1], state->r[0], state->r[1], state->r[2]);
+    Poly26Multiply(powers->power[2], powers->power[1], powers->power[1]);
+    /* r^3 = r * r^2 и r^4 = r^2 * r^2 не ждут друг друга. */
+    for (uint32_t exponent = 3u; exponent <= NET_POLY_LANES; ++exponent)
+        Poly26Multiply(powers->power[exponent], powers->power[exponent - 2u], powers->power[2]);
+    uint32_t step[NET_POLY_LANES];
+    for (size_t lane = 0u; lane < NET_POLY_LANES; ++lane)
+        step[lane] = NET_POLY_LANES;
+    PolyKeyOf(&powers->step, powers, step);
+    PolyKeyOf(&powers->last, powers, polyLastExponents);
+}
+
+/* Встраивается всегда: MSVC без /Ob3 оставлял вызов в цикле и проводил h и d
+ * через память. */
+static NET_FORCE_INLINE void PolyMultiplyLanes(PolyVector d[5], const PolyVector h[5],
+                                               const PolyKey *key)
+{
+    const PolyFactor h0 = PolyNarrow(h[0]);
+    const PolyFactor h1 = PolyNarrow(h[1]);
+    const PolyFactor h2 = PolyNarrow(h[2]);
+    const PolyFactor h3 = PolyNarrow(h[3]);
+    const PolyFactor h4 = PolyNarrow(h[4]);
+    PolyVector d0 = PolyMultiply(h0, key->r[0]);
+    d0 = PolyMultiplyAdd(d0, h1, key->s[4]);
+    d0 = PolyMultiplyAdd(d0, h2, key->s[3]);
+    d0 = PolyMultiplyAdd(d0, h3, key->s[2]);
+    d0 = PolyMultiplyAdd(d0, h4, key->s[1]);
+    PolyVector d1 = PolyMultiply(h0, key->r[1]);
+    d1 = PolyMultiplyAdd(d1, h1, key->r[0]);
+    d1 = PolyMultiplyAdd(d1, h2, key->s[4]);
+    d1 = PolyMultiplyAdd(d1, h3, key->s[3]);
+    d1 = PolyMultiplyAdd(d1, h4, key->s[2]);
+    PolyVector d2 = PolyMultiply(h0, key->r[2]);
+    d2 = PolyMultiplyAdd(d2, h1, key->r[1]);
+    d2 = PolyMultiplyAdd(d2, h2, key->r[0]);
+    d2 = PolyMultiplyAdd(d2, h3, key->s[4]);
+    d2 = PolyMultiplyAdd(d2, h4, key->s[3]);
+    PolyVector d3 = PolyMultiply(h0, key->r[3]);
+    d3 = PolyMultiplyAdd(d3, h1, key->r[2]);
+    d3 = PolyMultiplyAdd(d3, h2, key->r[1]);
+    d3 = PolyMultiplyAdd(d3, h3, key->r[0]);
+    d3 = PolyMultiplyAdd(d3, h4, key->s[4]);
+    PolyVector d4 = PolyMultiply(h0, key->r[4]);
+    d4 = PolyMultiplyAdd(d4, h1, key->r[3]);
+    d4 = PolyMultiplyAdd(d4, h2, key->r[2]);
+    d4 = PolyMultiplyAdd(d4, h3, key->r[1]);
+    d4 = PolyMultiplyAdd(d4, h4, key->r[0]);
+    d[0] = d0;
+    d[1] = d1;
+    d[2] = d2;
+    d[3] = d3;
+    d[4] = d4;
+}
+
+/* Неполный перенос двумя цепочками сразу: разряды выходят меньше 2^26, второй
+ * и пятый — чуть больше, и с разрядом блока остаются меньше 2^28. */
+static NET_FORCE_INLINE void PolyCarryLanes(PolyVector h[5], PolyVector d[5])
+{
+    PolyVector carry = PolyHigh26(d[3]);
+    d[3] = PolyLow26(d[3]);
+    d[4] = PolyAdd(d[4], carry);
+    carry = PolyHigh26(d[0]);
+    d[0] = PolyLow26(d[0]);
+    d[1] = PolyAdd(d[1], carry);
+    carry = PolyHigh26(d[4]);
+    d[4] = PolyLow26(d[4]);
+    d[0] = PolyAdd(d[0], PolyTimes5(carry));
+    carry = PolyHigh26(d[1]);
+    d[1] = PolyLow26(d[1]);
+    d[2] = PolyAdd(d[2], carry);
+    carry = PolyHigh26(d[0]);
+    d[0] = PolyLow26(d[0]);
+    d[1] = PolyAdd(d[1], carry);
+    carry = PolyHigh26(d[2]);
+    d[2] = PolyLow26(d[2]);
+    d[3] = PolyAdd(d[3], carry);
+    carry = PolyHigh26(d[3]);
+    d[3] = PolyLow26(d[3]);
+    d[4] = PolyAdd(d[4], carry);
+    for (size_t limb = 0u; limb < 5u; ++limb)
+        h[limb] = d[limb];
+}
+
+/* groups групп по NET_POLY_LANES полных блоков, groups не меньше одной. */
+static NET_NOINLINE void PolyBlocksWide(NetPoly1305 *state, const uint8_t *bytes, size_t groups)
+{
+    PolyPowers powers;
+    PolyPowersOf(&powers, state);
+
+    /* Накопленное значение ложится в первую дорожку: оно стоит перед первым
+     * блоком. */
+    Poly26 start;
+    Poly26From44(start, state->h[0], state->h[1] & POLY_MASK44, state->h[2] + (state->h[1] >> 44u));
+    PolyVector h[5];
+    for (size_t limb = 0u; limb < 5u; ++limb)
+        h[limb] = PolyFirstLane(start[limb]);
+    PolyVector d[5];
+    for (;;)
+    {
+        PolyVector m[5];
+        PolyLoad(bytes, m);
+        bytes += (size_t)NET_POLY_LANES * 16u;
+        for (size_t limb = 0u; limb < 5u; ++limb)
+            h[limb] = PolyAdd(h[limb], m[limb]);
+        if (--groups == 0u)
+            break;
+        PolyMultiplyLanes(d, h, &powers.step);
+        PolyCarryLanes(h, d);
+    }
+    PolyMultiplyLanes(d, h, &powers.last);
+    Poly26 sum;
+    for (size_t limb = 0u; limb < 5u; ++limb)
+        sum[limb] = PolySum(d[limb]);
+    Poly26Carry(sum);
+    Poly26To44(sum, state->h);
+    NetWipe(&powers, sizeof(powers));
+}
+
+/* С 12 блоков (192 байт) векторы окупают степени r у MSVC и clang, с SSE2 и
+ * AVX2; на 128 байтах выигрыша ещё нет. */
+#define POLY_WIDE_BLOCKS 12u
+
+#endif
+
+/* Полные блоки — векторами, если вход длинный, остаток — по одному. */
+static void PolyBlocks(NetPoly1305 *state, const uint8_t *bytes, size_t count, uint64_t highBit)
+{
+#if defined(NET_POLY_LANES)
+    if (highBit != 0u && count >= POLY_WIDE_BLOCKS)
+    {
+        const size_t groups = count / NET_POLY_LANES;
+        PolyBlocksWide(state, bytes, groups);
+        bytes += groups * NET_POLY_LANES * 16u;
+        count -= groups * NET_POLY_LANES;
+    }
+#endif
+    PolyBlocksScalar(state, bytes, count, highBit);
 }
 
 void NetPoly1305Update(NetPoly1305 *state, const uint8_t *bytes, size_t size)
