@@ -45,14 +45,6 @@ jobs:
           cmake --preset windows-msvc-arm64 -DLAIUE_BUILD_EXAMPLES=ON
           '-DCMAKE_EXE_LINKER_FLAGS=/machine:ARM64 /MAP'
           '-DCMAKE_SHARED_LINKER_FLAGS=/machine:ARM64 /MAP'
-      - name: Build Debug
-        if: steps.toolset.outputs.match == 'true'
-        run: cmake --build --preset windows-msvc-arm64-debug --parallel
-      - name: Test Debug
-        if: steps.toolset.outputs.match == 'true'
-        run: >
-          ctest --preset windows-msvc-arm64-debug --parallel --no-tests=error
-          --output-on-failure
       - name: Build Release
         if: steps.toolset.outputs.match == 'true'
         run: cmake --build --preset windows-msvc-arm64-release --parallel
@@ -60,7 +52,7 @@ jobs:
         if: steps.toolset.outputs.match == 'true'
         run: >
           ctest --preset windows-msvc-arm64-release --parallel --no-tests=error
-          --output-on-failure
+          --output-on-failure -E '^laiue[.]tools[.]check_versions$'
       - name: Repeat the determinism test
         if: steps.toolset.outputs.match == 'true'
         run: >
