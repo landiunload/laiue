@@ -29,13 +29,16 @@ endfunction()
 # TEST registers the executable in CTest; without it the target stays out of
 # ALL and is built on request. BOOTSTRAP links the static module host, and
 # STATIC removes dllimport from engine sources compiled into the harness.
+# Every harness gets tests/test_runtime.c, which reports a crash with its code
+# and call stack before the process ends.
 function(laiue_add_harness target_name windows_entry)
     cmake_parse_arguments(PARSE_ARGV 2 arg "BOOTSTRAP;STATIC;PRECISE_FP"
         "TEST;TIMEOUT" "LIBRARIES;INCLUDES;DEFINITIONS;DEPENDS;PROPERTIES")
+    set(sources ${arg_UNPARSED_ARGUMENTS} "${PROJECT_SOURCE_DIR}/tests/test_runtime.c")
     if(arg_TEST)
-        add_executable(${target_name} ${arg_UNPARSED_ARGUMENTS})
+        add_executable(${target_name} ${sources})
     else()
-        add_executable(${target_name} EXCLUDE_FROM_ALL ${arg_UNPARSED_ARGUMENTS})
+        add_executable(${target_name} EXCLUDE_FROM_ALL ${sources})
     endif()
     if(arg_BOOTSTRAP)
         list(PREPEND arg_LIBRARIES laiue_bootstrap)

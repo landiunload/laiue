@@ -10,7 +10,9 @@
 #endif
 
 // Общий минимальный harness: Windows-тесты сохраняют no-CRT entry point,
-// а POSIX-тесты используют обычный main и системный C runtime.
+// а POSIX-тесты используют обычный main и системный C runtime. Вывод уходит
+// сразу, без буфера: при сбое теста в журнале остаётся всё, что он успел
+// написать.
 static inline void LaiueTestRuntimeWrite(const char* text)
 {
 #if defined(_WIN32)
@@ -30,6 +32,7 @@ static inline void LaiueTestRuntimeWrite(const char* text)
     WriteFile(output, text, length, &written, NULL);
 #else
     fputs(text, stdout);
+    fflush(stdout);
 #endif
 }
 
@@ -42,6 +45,13 @@ static inline void LaiueTestRuntimeExit(int code)
 #endif
 }
 
+// Отчёт о сбое (test_runtime.c): необработанное исключение Windows или
+// сигнал SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP печатает код,
+// адрес и цепочку вызовов, после чего процесс завершается так же, как без
+// отчёта. На Windows его первым делом ставит LAIUE_TEST_ENTRY, на POSIX —
+// конструктор ещё до main.
+void LaiueTestRuntimeReportCrashes(void);
+
 // Версия движка для тестовых манифестов берётся из project(VERSION):
 // "engine = " LAIUE_TEST_ENGINE_VERSION.
 #define LAIUE_TEST_STRINGIFY_(value) #value
@@ -50,7 +60,14 @@ static inline void LaiueTestRuntimeExit(int code)
     LAIUE_TEST_STRINGIFY(LAIUE_VERSION_MAJOR) "." LAIUE_TEST_STRINGIFY(LAIUE_VERSION_MINOR)
 
 #if defined(_WIN32)
-#define LAIUE_TEST_ENTRY(name) void name(void)
+#define LAIUE_TEST_ENTRY(name)                                                                     \
+    static void name##Body(void);                                                                  \
+    void name(void)                                                                                \
+    {                                                                                              \
+        LaiueTestRuntimeReportCrashes();                                                           \
+        name##Body();                                                                              \
+    }                                                                                              \
+    static void name##Body(void)
 #define LAIUE_TEST_SUCCESS() LaiueTestRuntimeExit(0)
 #else
 #define LAIUE_TEST_ENTRY(name) int main(void)

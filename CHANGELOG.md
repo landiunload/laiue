@@ -5,6 +5,13 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- A crashing test now says why instead of leaving a bare "SegFault" in the log.
+  Every test and benchmark prints the exception code or signal, the faulting
+  address and the call stack, then ends exactly as before, so CTest reports the
+  same result. On Windows frames read as `module+offset`, and a call through a
+  null function pointer still names its caller. A test crashes on purpose on
+  every platform to check the report, and test output on POSIX is no longer
+  held in a buffer that a crash would lose.
 - The Windows no-CRT `memcmp` and `memmove` no longer go byte by byte. Clang
   can merge two compares of different lengths into one `memcmp` call with a
   variable length, and such a call took a third of a network benchmark. Both
