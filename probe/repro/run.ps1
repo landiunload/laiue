@@ -43,7 +43,8 @@ foreach ($name in $variants.Keys) {
             $at = [Array]::FindIndex($symbols, [Predicate[object]]{ param($s) $s.Name -eq $function })
             if ($at -lt 0) { "  $function not in map"; continue }
             $from = $symbols[$at].Va
-            $to = if ($at + 1 -lt $symbols.Count) { $symbols[$at + 1].Va } else { $from + 0x200 }
+            $next = @($symbols | Where-Object { $_.Va -gt $from } | Select-Object -First 1)
+            $to = if ($next.Count -gt 0) { [Math]::Min($next[0].Va, $from + 0x400) } else { $from + 0x400 }
             "  --- $function"
             foreach ($line in $asm) {
                 if ($line -match '^\s+([0-9A-F]{16}):') {
