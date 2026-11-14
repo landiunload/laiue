@@ -104,6 +104,17 @@ if(LAIUE_PLATFORM_WINDOWS)
         runtime_memory_test.c TEST laiue.runtime.memory TIMEOUT 60)
 endif()
 
+# The crash report every harness installs. The harness crashes on purpose, so
+# a script runs it and checks the report; sanitizers print their own.
+if(NOT (LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS))
+    laiue_add_harness(laiue_crash_report_test CrashReportTestEntryPoint crash_report_test.c)
+    set_target_properties(laiue_crash_report_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME laiue.harness.crash_report
+        COMMAND "${CMAKE_COMMAND}" "-DHARNESS=$<TARGET_FILE:laiue_crash_report_test>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_crash_report_test.cmake")
+    set_tests_properties(laiue.harness.crash_report PROPERTIES TIMEOUT 120)
+endif()
+
 # Platform.
 laiue_add_harness(laiue_platform_crypto_test PlatformCryptoTestEntry platform_crypto_test.c
     TEST laiue.platform.crypto)
