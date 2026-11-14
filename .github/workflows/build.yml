@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  probe-msvc-arm64-report:
+  probe-msvc-arm64-forms:
     runs-on: windows-11-arm
     timeout-minutes: 20
     strategy:
@@ -16,9 +16,9 @@ jobs:
         slot: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run the report repro
+      - name: Compare initialization forms
         shell: pwsh
-        working-directory: probe/report
+        working-directory: probe/forms
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
             'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -31,20 +31,13 @@ jobs:
           Enter-VsDevShell -VsInstallPath $vsRoot `
             -SkipAutomaticLocation -DevCmdArguments '-arch=arm64 -host_arch=arm64'
           "image $env:ImageVersion, MSVC $env:VCToolsVersion"
-          cl 2>&1 | Select-Object -First 1
-          foreach ($flags in @('/O2 /GL'), @('/O2 /Ob3'), @('/O2 /Gw'), @('/O2 /GS-'), @('/O2')) {
+          $engine = '/O2 /Ot /Oi /GF /Gy /Gw /volatile:iso /Zc:inline /arch:armv8.2 /GS- /Ob3'
+          foreach ($flags in '/O2', "$engine", "$engine /GL") {
             $list = $flags -split ' '
-            cl /nologo /c /W4 @list repro.c | Out-Null
+            cl /nologo /c /W4 @list forms.c | Out-Null
             cl /nologo /c /W4 /O2 main.c | Out-Null
             $ltcg = if ($list -contains '/GL') { '/LTCG' } else { '/INCREMENTAL:NO' }
-            link /nologo $ltcg repro.obj main.obj /OUT:repro.exe | Out-Null
-            "[$flags] $(./repro.exe)"
+            link /nologo $ltcg forms.obj main.obj /OUT:forms.exe | Out-Null
+            "--- $flags"
+            ./forms.exe
           }
-          cl /nologo /c /W4 /O2 /GL repro.c | Out-Null
-          link /nologo /LTCG /MAP repro.obj main.obj /OUT:repro.exe | Out-Null
-          $start = (Select-String repro.map -Pattern '\s(\S+)\s+([0-9a-f]{16}) f\s+repro\.obj' |
-            Where-Object { $_.Matches[0].Groups[1].Value -eq 'Init' }).Matches[0].Groups[2].Value
-          "Init at $start"
-          $asm = dumpbin /nologo /disasm repro.exe
-          $at = [Array]::FindIndex($asm, [Predicate[string]]{ param($l) $l -match "^\s+$start`:" })
-          if ($at -ge 0) { $asm[$at..($at + 24)] }
