@@ -1,12 +1,13 @@
 param(
-    [Parameter(Mandatory)][ValidateSet('map', 'stress')][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet('map', 'stress', 'ctest')][string]$Mode,
     [string]$BuildDir = 'build/windows-msvc-arm64',
     [string]$Config = 'Release',
     [int]$Runs = 1000,
     [int]$Parallel = 4,
     [string]$Label = 'stress',
     [int]$ShowReports = 4,
-    [string[]]$Frames = @()
+    [string[]]$Frames = @(),
+    [string[]]$CtestArgs = @()
 )
 $ErrorActionPreference = 'Stop'
 $bin = Join-Path $BuildDir "bin/$Config"
@@ -102,6 +103,27 @@ if ($Mode -eq 'map') {
         $map = Get-Map $module
         foreach ($symbol in $map.Symbols) { '  0x{0:x} {1}' -f ($symbol.Va - $map.Base), $symbol.Name }
     }
+    exit 0
+}
+
+if ($Mode -eq 'ctest') {
+    $failures = 0
+    for ($iteration = 1; $iteration -le $Runs; ++$iteration) {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $output = & ctest --test-dir $BuildDir -C $Config --parallel --no-tests=error `
+            --output-on-failure @CtestArgs 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        $summary = ($output -split "`r?`n" | Where-Object { $_ -match 'tests passed' }) -join ' '
+        "=== $Label ctest $iteration exit $code in $($clock.Elapsed.TotalSeconds.ToString('0')) s: $summary"
+        if ($code -ne 0) {
+            ++$failures
+            if ($failures -le $ShowReports) { Add-Symbols $output }
+            else {
+                ($output -split "`r?`n" | Where-Object { $_ -match '\*\*\*|Failed|Unhandled exception' }) -join "`n"
+            }
+        }
+    }
+    "=== $Label ctest failures: $failures of $Runs"
     exit 0
 }
 

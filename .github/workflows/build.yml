@@ -6,13 +6,23 @@ on:
 permissions:
   contents: read
 
+env:
+  DXC_RELEASE: v1.9.2609
+  DXC_WINDOWS_ASSET: dxc_2026_09_29.zip
+  DXC_WINDOWS_SHA256: ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
+
 jobs:
   probe-physics-arm64:
     runs-on: windows-11-arm
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Activate ARM64 compiler environment
+        id: toolset
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
@@ -28,62 +38,64 @@ jobs:
             -SkipAutomaticLocation -DevCmdArguments '-arch=arm64 -host_arch=arm64'
           $env:PATH = ($env:PATH -split ';' |
             Where-Object { $_ -notlike '*\Microsoft\CMake\*' }) -join ';'
-          cmake --version
-          cl 2>&1 | Select-Object -First 1
+          "image $env:ImageVersion, MSVC $env:VCToolsVersion"
           foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'PATH') {
             "$name=$([Environment]::GetEnvironmentVariable($name))" |
               Out-File $env:GITHUB_ENV -Append
           }
-      - name: Build the main sources with link maps
+          $match = if ($env:VCToolsVersion -like '14.52.37025*') { 'true' } else { 'false' }
+          "match=$match" | Out-File $env:GITHUB_OUTPUT -Append
+      - name: Install pinned DXC
+        if: steps.toolset.outputs.match == 'true'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          curl.exe --fail --location --retry 3 --retry-all-errors --output $archive `
+            "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$env:DXC_RELEASE/$env:DXC_WINDOWS_ASSET"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $env:DXC_WINDOWS_SHA256) {
+            throw 'DXC archive checksum mismatch'
+          }
+          Expand-Archive $archive (Join-Path $env:RUNNER_TEMP 'dxc')
+          $dxc = Join-Path $env:RUNNER_TEMP 'dxc\bin\arm64\dxc.exe'
+          & $dxc --version
+          "LAIUE_DXC=$dxc" | Out-File $env:GITHUB_ENV -Append
+      - name: Build Release like CI with link maps
+        if: steps.toolset.outputs.match == 'true'
         shell: pwsh
         run: |
           cmake --preset windows-msvc-arm64 -DLAIUE_BUILD_EXAMPLES=ON `
+            "-DLAIUE_DXC=$env:LAIUE_DXC" -DLAIUE_REQUIRE_SHADER_COMPILER=ON `
             '-DCMAKE_EXE_LINKER_FLAGS=/machine:ARM64 /MAP' `
             '-DCMAKE_SHARED_LINKER_FLAGS=/machine:ARM64 /MAP'
           if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
-          foreach ($preset in 'windows-msvc-arm64-release', 'windows-msvc-arm64-debug') {
-            cmake --build --preset $preset --target laiue_physics_determinism_test
-            if ($LASTEXITCODE -ne 0) { throw "$preset build failed" }
-          }
+          cmake --build --preset windows-msvc-arm64-release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
       - name: Map the main crash frames
+        if: steps.toolset.outputs.match == 'true'
         shell: pwsh
         run: |
           ./probe/probe.ps1 -Mode map -Frames @(
             'laiue_physics_determinism_test.exe+0x1d20', 'laiue_world.dll+0x332c',
             'laiue_physics_determinism_test.exe+0x1f18', 'laiue_physics_determinism_test.exe+0x248c',
             'laiue_physics_determinism_test.exe+0x3a14')
-      - name: Stress the main Release build
+      - name: Repeat the Release tests like CI
+        if: steps.toolset.outputs.match == 'true'
         shell: pwsh
-        run: |
-          ./probe/probe.ps1 -Mode stress -Runs 1500 -Parallel 4 -Label release-p4
-          ./probe/probe.ps1 -Mode stress -Runs 800 -Parallel 12 -Label release-p12
-      - name: Build Release with register dumps
+        run: ./probe/probe.ps1 -Mode ctest -Runs 15 -Label main
+      - name: Stress the determinism test alone
+        if: steps.toolset.outputs.match == 'true'
+        shell: pwsh
+        run: ./probe/probe.ps1 -Mode stress -Runs 1500 -Parallel 6 -Label alone-p6
+      - name: Rebuild with register dumps
+        if: steps.toolset.outputs.match == 'true'
         shell: pwsh
         run: |
           Copy-Item probe/test_runtime_dump.c tests/test_runtime.c -Force
-          cmake --preset windows-msvc-arm64 -B build/probe-dump -DLAIUE_BUILD_EXAMPLES=ON `
-            '-DCMAKE_EXE_LINKER_FLAGS=/machine:ARM64 /MAP' `
-            '-DCMAKE_SHARED_LINKER_FLAGS=/machine:ARM64 /MAP'
-          if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
-          cmake --build build/probe-dump --config Release --target laiue_physics_determinism_test
+          cmake --build --preset windows-msvc-arm64-release --parallel
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-      - name: Stress the dump build
+      - name: Repeat the Release tests with register dumps
+        if: steps.toolset.outputs.match == 'true'
         shell: pwsh
         run: >
-          ./probe/probe.ps1 -Mode stress -BuildDir build/probe-dump -Runs 1500 -Parallel 6
-          -Label dump-p6 -ShowReports 3
-      - name: Stress the dump build under full page heap
-        shell: pwsh
-        run: |
-          $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\laiue_physics_determinism_test.exe'
-          New-Item -Force $ifeo | Out-Null
-          New-ItemProperty $ifeo -Name GlobalFlag -Value 0x02000000 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty $ifeo -Name PageHeapFlags -Value 0x3 -PropertyType DWord -Force | Out-Null
-          ./probe/probe.ps1 -Mode stress -BuildDir build/probe-dump -Runs 300 -Parallel 4 `
-            -Label dump-pageheap -ShowReports 3
-          Remove-Item $ifeo -Recurse -Force
-      - name: Stress the main Debug build
-        shell: pwsh
-        run: >
-          ./probe/probe.ps1 -Mode stress -Config Debug -Runs 300 -Parallel 4
-          -Label debug-p4
+          ./probe/probe.ps1 -Mode ctest -Runs 20 -Label dump -ShowReports 3
+          -CtestArgs @('-E', 'laiue[.]harness[.]crash_report')
