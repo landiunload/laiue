@@ -7,18 +7,18 @@ permissions:
   contents: read
 
 jobs:
-  probe-msvc-arm64-scope:
+  probe-msvc-arm64-report:
     runs-on: windows-11-arm
-    timeout-minutes: 90
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         slot: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Activate ARM64 compiler environment
-        id: toolset
+      - name: Run the report repro
         shell: pwsh
+        working-directory: probe/report
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
             'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -30,36 +30,21 @@ jobs:
             'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
           Enter-VsDevShell -VsInstallPath $vsRoot `
             -SkipAutomaticLocation -DevCmdArguments '-arch=arm64 -host_arch=arm64'
-          $env:PATH = ($env:PATH -split ';' |
-            Where-Object { $_ -notlike '*\Microsoft\CMake\*' }) -join ';'
           "image $env:ImageVersion, MSVC $env:VCToolsVersion"
-          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH', 'PATH') {
-            "$name=$([Environment]::GetEnvironmentVariable($name))" |
-              Out-File $env:GITHUB_ENV -Append
+          cl 2>&1 | Select-Object -First 1
+          foreach ($flags in @('/O2 /GL'), @('/O2 /Ob3'), @('/O2 /Gw'), @('/O2 /GS-'), @('/O2')) {
+            $list = $flags -split ' '
+            cl /nologo /c /W4 @list repro.c | Out-Null
+            cl /nologo /c /W4 /O2 main.c | Out-Null
+            $ltcg = if ($list -contains '/GL') { '/LTCG' } else { '/INCREMENTAL:NO' }
+            link /nologo $ltcg repro.obj main.obj /OUT:repro.exe | Out-Null
+            "[$flags] $(./repro.exe)"
           }
-          $match = if ($env:VCToolsVersion -like '14.52.*') { 'true' } else { 'false' }
-          "match=$match" | Out-File $env:GITHUB_OUTPUT -Append
-      - name: Build Release with link maps
-        if: steps.toolset.outputs.match == 'true'
-        shell: pwsh
-        run: |
-          cmake --preset windows-msvc-arm64 -DLAIUE_BUILD_EXAMPLES=ON `
-            '-DCMAKE_EXE_LINKER_FLAGS=/machine:ARM64 /MAP' `
-            '-DCMAKE_SHARED_LINKER_FLAGS=/machine:ARM64 /MAP'
-          if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
-          cmake --build --preset windows-msvc-arm64-release --parallel
-          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-      - name: Scan the determinism test as a positive control
-        if: steps.toolset.outputs.match == 'true'
-        shell: pwsh
-        run: >
-          ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release
-          -Include laiue_physics_determinism_test.exe
-      - name: Scan every engine DLL
-        if: steps.toolset.outputs.match == 'true'
-        shell: pwsh
-        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.dll' -Show 400
-      - name: Scan every executable
-        if: steps.toolset.outputs.match == 'true'
-        shell: pwsh
-        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.exe' -Show 400
+          cl /nologo /c /W4 /O2 /GL repro.c | Out-Null
+          link /nologo /LTCG /MAP repro.obj main.obj /OUT:repro.exe | Out-Null
+          $start = (Select-String repro.map -Pattern '\s(\S+)\s+([0-9a-f]{16}) f\s+repro\.obj' |
+            Where-Object { $_.Matches[0].Groups[1].Value -eq 'Init' }).Matches[0].Groups[2].Value
+          "Init at $start"
+          $asm = dumpbin /nologo /disasm repro.exe
+          $at = [Array]::FindIndex($asm, [Predicate[string]]{ param($l) $l -match "^\s+$start`:" })
+          if ($at -ge 0) { $asm[$at..($at + 24)] }
