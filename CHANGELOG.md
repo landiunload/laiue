@@ -5,6 +5,19 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- Modules load and unload while the application runs, without a restart. A
+  load adds to the running modules and may use their services; it is a
+  transaction over its own modules, so a failure unwinds only them, and nobody
+  outside the load sees their services until it succeeds. A module that
+  declares or obtains a service of another uses it, and
+  `LaiueModuleHostUnloadV1` refuses to unload a module in use with
+  `LAIUE_MODULE_IN_USE` or, with `LAIUE_MODULE_UNLOAD_DEPENDENTS`, unloads its
+  users first. `LaiueModuleHostListDependentsV1` lists them in advance. Host
+  services register and unregister while modules run; a service in use stays.
+  A strict profile now fails before any module code runs, and the profile
+  report counts only the modules that load started. A new test covers loads,
+  failed loads, unloads, host services, profiles and the module limit next to
+  running modules.
 - The physics determinism test no longer crashes when MSVC 19.52.37025 builds
   it for ARM64. The compiler stored part of the zero-fill from
   `*simulation = (Simulation){0}` after the member stores that followed it and

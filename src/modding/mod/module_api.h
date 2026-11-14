@@ -46,6 +46,8 @@ typedef uint32_t LaiueModuleStatus;
 #define LAIUE_MODULE_SERVICE_INVALID UINT32_C(15)
 #define LAIUE_MODULE_SERVICE_NOT_FOUND UINT32_C(16)
 #define LAIUE_MODULE_PARTIAL UINT32_C(17)
+#define LAIUE_MODULE_NOT_LOADED UINT32_C(18)
+#define LAIUE_MODULE_IN_USE UINT32_C(19)
 
 typedef uint32_t LaiueModuleLogLevel;
 #define LAIUE_MODULE_LOG_DEBUG UINT32_C(0)
@@ -86,17 +88,19 @@ typedef void *(LAIUE_MODULE_CALL *LaiueModuleAllocateFn)(void *context, uint64_t
 typedef void *(LAIUE_MODULE_CALL *LaiueModuleReallocateFn)(void *context, void *memory,
                                                             uint64_t size);
 typedef void(LAIUE_MODULE_CALL *LaiueModuleFreeFn)(void *context, void *memory);
-/* Query returns a borrowed service-table pointer. It remains valid until the
- * provider is stopped/unloaded; the application must quiesce all users and
- * worker jobs before host teardown begins. */
+/* Query returns a borrowed service-table pointer. A module that receives a
+ * table becomes a user of its provider: the host does not unload the provider
+ * while the user is loaded, so the pointer stays valid for the user's whole
+ * lifetime. The application must quiesce all users and worker jobs before
+ * host teardown begins. */
 typedef const void *(LAIUE_MODULE_CALL *LaiueModuleQueryServiceFn)(
     void *context, const char *name, uint32_t minimumVersion, uint32_t minimumSize,
     uint32_t *outVersion, uint32_t *outSize);
 typedef LaiueModuleStatus(LAIUE_MODULE_CALL *LaiueModulePublishServiceFn)(
     void *context, const LaiueModuleServiceV1 *service);
-/* Service tables are frozen after a profile has loaded successfully. Runtime
- * publish/unpublish attempts return BUSY; the host removes owned services as
- * it stops their provider. */
+/* A module publishes and unpublishes only from its own create and start.
+ * Later attempts, including from stop, return BUSY; the host removes owned
+ * services as it stops their provider. */
 typedef LaiueModuleStatus(LAIUE_MODULE_CALL *LaiueModuleUnpublishServiceFn)(
     void *context, const char *name);
 

@@ -303,6 +303,8 @@ laiue_add_harness(laiue_mod_manifest_scan_test ModManifestScanTestEntry
     mod_manifest_scan_test.c LIBRARIES laiue_mod TEST laiue.mod.manifest_scan)
 laiue_add_harness(laiue_module_manifest_test ModuleManifestTestEntryPoint
     module_manifest_test.c BOOTSTRAP TEST laiue.mod.module_manifest)
+laiue_add_harness(laiue_module_host_runtime_test ModuleHostRuntimeTestEntryPoint
+    module_host_runtime_test.c BOOTSTRAP TEST laiue.mod.module_host_runtime)
 if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_add_harness(laiue_numeric_module_test NumericModuleTestEntryPoint
         numeric_module_test.c BOOTSTRAP DEPENDS laiue_numeric TEST laiue.mod.numeric_module)
