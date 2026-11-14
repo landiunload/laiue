@@ -62,9 +62,11 @@ static const char *FormatHex(uint64_t value, char text[19])
 
 #if defined(LAIUE_TEST_RUNTIME_WINDOWS)
 
-// Кадры лежат вне стека: отчёт о его переполнении не должен расходовать
-// остаток. Пишет отчёт один поток, первым захвативший reportingThread.
+// Кадры и контекст раскрутки лежат вне стека: отчёт о его переполнении не
+// должен расходовать остаток. Пишет отчёт один поток, первым захвативший
+// reportingThread.
 static void *stackFrames[8192];
+static CONTEXT unwindContext;
 static volatile LONG reportingThread;
 static DWORD reportedCode;
 
@@ -148,23 +150,85 @@ static const char *ExceptionName(DWORD code)
     }
 }
 
-// Адрес возврата при переходе по негодному указателю на функцию: вызов уже
-// положил его на вершину стека (x64) или в регистр связи (ARM64).
-static void *ReturnAddress(const CONTEXT *context)
+#if defined(_M_X64) || defined(_M_ARM64)
+
+static DWORD64 ProgramCounter(const CONTEXT *context)
 {
 #if defined(_M_ARM64)
-    return (void *)(uintptr_t)context->Lr;
-#elif defined(_M_X64)
+    return context->Pc;
+#else
+    return context->Rip;
+#endif
+}
+
+static DWORD64 StackPointer(const CONTEXT *context)
+{
+#if defined(_M_ARM64)
+    return context->Sp;
+#else
+    return context->Rsp;
+#endif
+}
+
+#endif
+
+// Цепочка раскручивается от контекста сбоя, а не от самого отчёта: на ARM64
+// обход из фильтра обрывается на диспетчере исключений. Каждый шаг сверяется
+// с границами стека; сбой внутри раскрутки испорченного стека завершает
+// процесс кодом исходного сбоя (см. ReportException).
+static uint32_t CaptureFrames(const CONTEXT *fault)
+{
+    uint32_t count = 0u;
+#if defined(_M_X64) || defined(_M_ARM64)
     ULONG_PTR low = 0u;
     ULONG_PTR high = 0u;
     GetCurrentThreadStackLimits(&low, &high);
-    if (context->Rsp < low || context->Rsp > high - sizeof(void *))
-        return NULL;
-    return *(void *const *)(uintptr_t)context->Rsp;
-#else
-    (void)context;
-    return NULL;
+    CONTEXT *context = &unwindContext;
+    *context = *fault;
+    while (count < sizeof(stackFrames) / sizeof(stackFrames[0]))
+    {
+        const DWORD64 pc = ProgramCounter(context);
+        const DWORD64 sp = StackPointer(context);
+        stackFrames[count++] = (void *)(uintptr_t)pc;
+        if (sp < low || sp > high - sizeof(DWORD64))
+            break;
+        DWORD64 imageBase = 0u;
+        PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(pc, &imageBase, NULL);
+        if (function != NULL)
+        {
+#if defined(_M_ARM64)
+            // Кадр ARM64 восстанавливается через указатель кадра.
+            if (context->Fp < low || context->Fp > high - 2u * sizeof(DWORD64))
+                break;
 #endif
+            void *handlerData = NULL;
+            DWORD64 establisherFrame = 0u;
+            (void)RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, pc, function, context,
+                                   &handlerData, &establisherFrame, NULL);
+        }
+        else
+        {
+            // Без данных раскрутки — лист или переход по негодному адресу:
+            // адрес возврата ещё в регистре связи (ARM64) или на вершине
+            // стека (x64).
+#if defined(_M_ARM64)
+            context->Pc = context->Lr;
+#else
+            context->Rip = *(const DWORD64 *)(uintptr_t)sp;
+            context->Rsp = sp + sizeof(DWORD64);
+#endif
+        }
+        // Стек раскручивается только вверх; нулевой адрес возврата — конец
+        // цепочки.
+        const DWORD64 nextPc = ProgramCounter(context);
+        const DWORD64 nextSp = StackPointer(context);
+        if (nextPc == 0u || nextSp < sp || (nextSp == sp && nextPc == pc))
+            break;
+    }
+#else
+    (void)fault;
+#endif
+    return count;
 }
 
 // Подряд идущие повторы (рекурсия) сжимаются в одну строку; из длинной
@@ -200,10 +264,7 @@ static void WriteFrames(void *const *frames, uint32_t count)
     }
 }
 
-// Фильтр верхнего уровня вызывается при поиске обработчика, пока стек цел:
-// обход от фильтра проходит через диспетчер исключений в упавшую функцию и
-// дальше к её вызывающим. RtlCaptureStackBackTrace сверяет кадры с границами
-// стека и на испорченном стеке просто останавливается.
+// Фильтр верхнего уровня вызывается при поиске обработчика, пока стек цел.
 static LONG WINAPI ReportException(EXCEPTION_POINTERS *pointers)
 {
     const LONG thread = (LONG)GetCurrentThreadId();
@@ -238,24 +299,7 @@ static LONG WINAPI ReportException(EXCEPTION_POINTERS *pointers)
         }
     }
     LaiueTestRuntimeWrite("\nStack:\n");
-
-    if (ModuleOf(record->ExceptionAddress) == NULL)
-    {
-        // Переход по негодному указателю на функцию: от адреса вне модулей
-        // стек не раскрутить, но вызвавшего видно по адресу возврата.
-        void *const frames[2] = {record->ExceptionAddress, ReturnAddress(pointers->ContextRecord)};
-        WriteFrames(frames, frames[1] != NULL ? 2u : 1u);
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const uint32_t count = RtlCaptureStackBackTrace(
-        0u, (DWORD)(sizeof(stackFrames) / sizeof(stackFrames[0])), stackFrames, NULL);
-    // Первые кадры принадлежат самому отчёту и диспетчеру исключений.
-    uint32_t first = 0u;
-    while (first < count && stackFrames[first] != record->ExceptionAddress)
-        ++first;
-    if (first == count)
-        first = 0u;
-    WriteFrames(stackFrames + first, count - first);
+    WriteFrames(stackFrames, CaptureFrames(pointers->ContextRecord));
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -364,6 +408,12 @@ void LaiueTestRuntimeReportCrashes(void)
     static const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP};
     for (size_t index = 0u; index < sizeof(signals) / sizeof(signals[0]); ++index)
         (void)sigaction(signals[index], &action, NULL);
+}
+
+// Тело теста на POSIX — обычный main, поэтому отчёт ставится ещё до него.
+__attribute__((constructor)) static void ReportCrashesBeforeMain(void)
+{
+    LaiueTestRuntimeReportCrashes();
 }
 
 #else

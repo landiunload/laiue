@@ -48,7 +48,8 @@ static inline void LaiueTestRuntimeExit(int code)
 // Отчёт о сбое (test_runtime.c): необработанное исключение Windows или
 // сигнал SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP печатает код,
 // адрес и цепочку вызовов, после чего процесс завершается так же, как без
-// отчёта. LAIUE_TEST_ENTRY ставит его первым делом.
+// отчёта. На Windows его первым делом ставит LAIUE_TEST_ENTRY, на POSIX —
+// конструктор ещё до main.
 void LaiueTestRuntimeReportCrashes(void);
 
 // Версия движка для тестовых манифестов берётся из project(VERSION):
@@ -69,13 +70,6 @@ void LaiueTestRuntimeReportCrashes(void);
     static void name##Body(void)
 #define LAIUE_TEST_SUCCESS() LaiueTestRuntimeExit(0)
 #else
-#define LAIUE_TEST_ENTRY(name)                                                                     \
-    static int name##Body(void);                                                                   \
-    int main(void)                                                                                 \
-    {                                                                                              \
-        LaiueTestRuntimeReportCrashes();                                                           \
-        return name##Body();                                                                       \
-    }                                                                                              \
-    static int name##Body(void)
+#define LAIUE_TEST_ENTRY(name) int main(void)
 #define LAIUE_TEST_SUCCESS() return 0
 #endif
