@@ -6,9 +6,18 @@
 #include <stddef.h>
 #include <string.h>
 
+/* Module sets are 64-bit masks and every module keeps one bit per service. */
+_Static_assert(LAIUE_MODULE_HOST_MAX_MODULES <= 64u, "a module set must fit in 64 bits");
+_Static_assert(LAIUE_MODULE_HOST_MAX_SERVICES % 32u == 0u, "service bits fill whole words");
+#define SERVICE_WORDS (LAIUE_MODULE_HOST_MAX_SERVICES / 32u)
+
 typedef struct ModuleService
 {
     bool used;
+    /* Published by a module of the load in progress. Only modules of that
+     * load see it until the load commits, so nothing outside can keep a
+     * pointer into a module that the load may still roll back. */
+    bool pending;
     uint32_t owner;
     /* Precomputed from value.name at publish time. It is only a prefilter:
      * an equal hash still falls back to the exact name comparison, so a
@@ -24,6 +33,11 @@ typedef struct LoadedModule
     bool optional;
     bool created;
     bool started;
+    /* Part of the load in progress; cleared when that load commits. */
+    bool pending;
+    /* Chosen for unloading. Its services are hidden from every module that
+     * is not leaving with it, so no new user can appear before it stops. */
+    bool unloading;
     PlatformDynamicLibrary library;
     const LaiueModuleApiV1 *api;
     LaiueModuleHost *owner;
@@ -31,8 +45,12 @@ typedef struct LoadedModule
     void *context;
     char id[LAIUE_MODULE_MAX_NAME];
     char version[LAIUE_MODULE_MAX_NAME];
-    uint32_t createOrder;
-    uint32_t startOrder;
+    uint64_t createOrder;
+    uint64_t startOrder;
+    /* One bit per service slot: the module obtained that table or declared
+     * it as required. A provider never leaves while another loaded module
+     * still holds one of its tables. */
+    uint32_t usedServices[SERVICE_WORDS];
 } LoadedModule;
 
 struct LaiueModuleHost
@@ -44,7 +62,10 @@ struct LaiueModuleHost
     LaiueModuleHostLogCallback log;
     PlatformRwLock lock;
     bool lifecycleBusy;
-    bool servicesFrozen;
+    /* Lifecycle order across every load of this host, so modules added at
+     * run time unwind after the ones that started before them. */
+    uint64_t nextCreateOrder;
+    uint64_t nextStartOrder;
     LoadedModule modules[LAIUE_MODULE_HOST_MAX_MODULES];
     ModuleService services[LAIUE_MODULE_HOST_MAX_SERVICES];
     uint32_t loadedCount;
@@ -81,11 +102,26 @@ static LaiueModuleStatus Fail(LaiueModuleDiagnostic *diagnostic, LaiueModuleStat
 
 const char *LaiueModuleStatusString(LaiueModuleStatus status)
 {
-    static const char *const names[] = {
-        "ok", "invalid argument", "ABI mismatch", "invalid descriptor", "duplicate module id",
-        "duplicate service", "missing dependency", "dependency cycle", "library load failed",
-        "entry point missing", "out of memory", "module capacity", "create failed",
-        "start failed", "host busy", "invalid service", "service not found", "partial profile"};
+    static const char *const names[] = {"ok",
+                                        "invalid argument",
+                                        "ABI mismatch",
+                                        "invalid descriptor",
+                                        "duplicate module id",
+                                        "duplicate service",
+                                        "missing dependency",
+                                        "dependency cycle",
+                                        "library load failed",
+                                        "entry point missing",
+                                        "out of memory",
+                                        "module capacity",
+                                        "create failed",
+                                        "start failed",
+                                        "host busy",
+                                        "invalid service",
+                                        "service not found",
+                                        "partial profile",
+                                        "module not loaded",
+                                        "in use"};
     return (uint32_t)status < (uint32_t)(sizeof(names) / sizeof(names[0])) ? names[status]
                                                                             : "unknown";
 }
@@ -159,9 +195,120 @@ static bool Begin(LaiueModuleHost *host)
 static void End(LaiueModuleHost *host)
 {
     PlatformRwLockAcquireExclusive(&host->lock);
-    host->servicesFrozen = host->loadedCount != 0u;
     host->lifecycleBusy = false;
     PlatformRwLockReleaseExclusive(&host->lock);
+}
+
+/* Makes the modules and services of a successful load visible to everyone in
+ * one step. Only one lifecycle operation runs at a time, so every pending
+ * entry belongs to the load that commits. */
+static void Commit(LaiueModuleHost *host)
+{
+    PlatformRwLockAcquireExclusive(&host->lock);
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
+        host->modules[index].pending = false;
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
+        host->services[index].pending = false;
+    PlatformRwLockReleaseExclusive(&host->lock);
+}
+
+static uint64_t SlotBit(uint32_t slot)
+{
+    return UINT64_C(1) << slot;
+}
+
+static bool UsesService(const LoadedModule *module, uint32_t service)
+{
+    return (module->usedServices[service / 32u] & (UINT32_C(1) << (service % 32u))) != 0u;
+}
+
+/* The caller holds the lock exclusively. Clearing the bit in every module
+ * keeps a reused slot from inheriting the users of the service it held. */
+static void ForgetService(LaiueModuleHost *host, uint32_t service)
+{
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
+        host->modules[index].usedServices[service / 32u] &= ~(UINT32_C(1) << (service % 32u));
+    memset(&host->services[service], 0, sizeof(host->services[service]));
+}
+
+/* A load in progress and an unload in progress each see their own services;
+ * everyone else sees neither. The application has no module and sees only
+ * settled services. */
+static bool ServiceVisible(const LaiueModuleHost *host, const ModuleService *service,
+                           const LoadedModule *consumer)
+{
+    if (service->pending)
+        return consumer != NULL && consumer->pending;
+    if (service->owner < LAIUE_MODULE_HOST_MAX_MODULES && host->modules[service->owner].unloading)
+        return consumer != NULL && consumer->unloading;
+    return true;
+}
+
+static uint32_t FindService(const LaiueModuleHost *host, const char *name, uint32_t nameHash,
+                            uint32_t minimumVersion, uint32_t minimumSize,
+                            const LoadedModule *consumer)
+{
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
+    {
+        const ModuleService *service = &host->services[index];
+        if (service->used && service->nameHash == nameHash &&
+            service->value.version >= minimumVersion && service->value.tableSize >= minimumSize &&
+            ServiceVisible(host, service, consumer) &&
+            LaiueModAsciiEquals(service->value.name, name))
+            return index;
+    }
+    return LAIUE_MODULE_HOST_MAX_SERVICES;
+}
+
+/* Looks a service up for a module or, with consumer NULL, for the
+ * application. With record set, a module that receives a table is noted as
+ * its user, which keeps the provider loaded for as long as that module is. */
+static const void *QueryFor(LaiueModuleHost *host, LoadedModule *consumer, const char *name,
+                            uint32_t minimumVersion, uint32_t minimumSize, uint32_t *outVersion,
+                            uint32_t *outSize, bool record)
+{
+    if (outVersion != NULL)
+        *outVersion = 0u;
+    if (outSize != NULL)
+        *outSize = 0u;
+    if (host == NULL || !SafeName(name))
+        return NULL;
+    const uint32_t nameHash = NameHash(name);
+    const void *result = NULL;
+    uint32_t version = 0u;
+    uint32_t size = 0u;
+    bool noted = true;
+    PlatformRwLockAcquireShared(&host->lock);
+    uint32_t index = FindService(host, name, nameHash, minimumVersion, minimumSize, consumer);
+    if (index < LAIUE_MODULE_HOST_MAX_SERVICES)
+    {
+        result = host->services[index].value.table;
+        version = host->services[index].value.version;
+        size = host->services[index].value.tableSize;
+        noted = !record || consumer == NULL || UsesService(consumer, index);
+    }
+    PlatformRwLockReleaseShared(&host->lock);
+    if (!noted)
+    {
+        /* First use by this module. Look again under the exclusive lock, so
+         * the service cannot go away between the lookup and the note. */
+        result = NULL;
+        PlatformRwLockAcquireExclusive(&host->lock);
+        index = FindService(host, name, nameHash, minimumVersion, minimumSize, consumer);
+        if (index < LAIUE_MODULE_HOST_MAX_SERVICES)
+        {
+            result = host->services[index].value.table;
+            version = host->services[index].value.version;
+            size = host->services[index].value.tableSize;
+            consumer->usedServices[index / 32u] |= UINT32_C(1) << (index % 32u);
+        }
+        PlatformRwLockReleaseExclusive(&host->lock);
+    }
+    if (result != NULL && outVersion != NULL)
+        *outVersion = version;
+    if (result != NULL && outSize != NULL)
+        *outSize = size;
+    return result;
 }
 
 static void SetModuleStarted(LaiueModuleHost *host, LoadedModule *module, bool started)
@@ -213,51 +360,18 @@ static const void *LAIUE_MODULE_CALL ApiQuery(void *context, const char *name,
                                                uint32_t *outVersion, uint32_t *outSize)
 {
     LoadedModule *module = (LoadedModule *)context;
-    LaiueModuleHost *host = module == NULL ? NULL : module->owner;
-    if (outVersion != NULL)
-        *outVersion = 0u;
-    if (outSize != NULL)
-        *outSize = 0u;
-    if (host == NULL || !SafeName(name))
-        return NULL;
-    const void *result = LaiueModuleHostQueryService(host, name, minimumVersion, minimumSize,
-                                                     outVersion, outSize);
-    return result;
-/* Kept as a separate public read path so applications can inspect optional
- * capabilities without retaining the private module callback table. */
+    return QueryFor(module == NULL ? NULL : module->owner, module, name, minimumVersion,
+                    minimumSize, outVersion, outSize, true);
 }
 
+/* Kept as a separate public read path so applications can inspect optional
+ * capabilities without retaining the private module callback table. */
 const void *LaiueModuleHostQueryService(const LaiueModuleHost *host, const char *name,
                                         uint32_t minimumVersion, uint32_t minimumSize,
                                         uint32_t *outVersion, uint32_t *outSize)
 {
-    if (outVersion != NULL)
-        *outVersion = 0u;
-    if (outSize != NULL)
-        *outSize = 0u;
-    if (host == NULL || !SafeName(name))
-        return NULL;
-    const void *result = NULL;
-    LaiueModuleHost *mutableHost = (LaiueModuleHost *)host;
-    const uint32_t nameHash = NameHash(name);
-    PlatformRwLockAcquireShared(&mutableHost->lock);
-    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
-    {
-        const ModuleService *service = &host->services[index];
-        if (service->used && service->nameHash == nameHash &&
-            service->value.version >= minimumVersion &&
-            service->value.tableSize >= minimumSize && LaiueModAsciiEquals(service->value.name, name))
-        {
-            result = service->value.table;
-            if (outVersion != NULL)
-                *outVersion = service->value.version;
-            if (outSize != NULL)
-                *outSize = service->value.tableSize;
-            break;
-        }
-    }
-    PlatformRwLockReleaseShared(&mutableHost->lock);
-    return result;
+    return QueryFor((LaiueModuleHost *)host, NULL, name, minimumVersion, minimumSize, outVersion,
+                    outSize, false);
 }
 
 static bool DeclaresService(const LoadedModule *module, const char *name)
@@ -293,6 +407,8 @@ static LaiueModuleStatus PublishFor(LaiueModuleHost *host, uint32_t owner,
         if (!current->used)
         {
             current->used = true;
+            current->pending =
+                owner < LAIUE_MODULE_HOST_MAX_MODULES && host->modules[owner].pending;
             current->owner = owner;
             current->nameHash = serviceHash;
             current->value = *service;
@@ -311,10 +427,12 @@ static LaiueModuleStatus LAIUE_MODULE_CALL ApiPublish(void *context,
         return LAIUE_MODULE_INVALID_ARGUMENT;
     LaiueModuleDiagnostic diagnostic;
     PlatformRwLockAcquireExclusive(&host->lock);
-    LaiueModuleStatus status = host->servicesFrozen || module->started
-                                   ? LAIUE_MODULE_BUSY
-                                   : PublishFor(host, (uint32_t)(module - host->modules),
-                                                service, &diagnostic);
+    /* A module publishes only from its own create and start, while the load
+     * that adds it is still in progress. */
+    LaiueModuleStatus status =
+        !module->pending || module->started
+            ? LAIUE_MODULE_BUSY
+            : PublishFor(host, (uint32_t)(module - host->modules), service, &diagnostic);
     PlatformRwLockReleaseExclusive(&host->lock);
     return status;
 }
@@ -329,9 +447,8 @@ static LaiueModuleStatus LAIUE_MODULE_CALL ApiUnpublish(void *context, const cha
         return LAIUE_MODULE_SERVICE_INVALID;
     const uint32_t nameHash = NameHash(name);
     PlatformRwLockAcquireExclusive(&host->lock);
-    LaiueModuleStatus status = host->servicesFrozen || module->started
-                                   ? LAIUE_MODULE_BUSY
-                                   : LAIUE_MODULE_SERVICE_NOT_FOUND;
+    LaiueModuleStatus status =
+        !module->pending || module->started ? LAIUE_MODULE_BUSY : LAIUE_MODULE_SERVICE_NOT_FOUND;
     for (uint32_t index = 0u; status != LAIUE_MODULE_BUSY &&
                                 index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
     {
@@ -339,7 +456,7 @@ static LaiueModuleStatus LAIUE_MODULE_CALL ApiUnpublish(void *context, const cha
             host->services[index].nameHash == nameHash &&
             LaiueModAsciiEquals(host->services[index].value.name, name))
         {
-            memset(&host->services[index], 0, sizeof(host->services[index]));
+            ForgetService(host, index);
             status = LAIUE_MODULE_OK;
             break;
         }
@@ -368,20 +485,36 @@ static const LaiueModuleHostV1 *BuildApi(LaiueModuleHost *host, LoadedModule *mo
     return out;
 }
 
-static bool RequiredServicesReady(LaiueModuleHost *host, const LoadedModule *module)
+static bool ServiceAvailable(LaiueModuleHost *host, LoadedModule *module, const char *name,
+                             uint32_t minimumVersion)
 {
-    (void)host;
+    return QueryFor(host, module, name, minimumVersion, 1u, NULL, NULL, false) != NULL;
+}
+
+static bool RequiredServicesReady(LaiueModuleHost *host, LoadedModule *module)
+{
     const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
     for (uint32_t requirement = 0u; requirement < descriptor->requiresCount; ++requirement)
     {
-        uint32_t version = 0u;
         const LaiueModuleRequirementV1 *required = &descriptor->requiresServices[requirement];
         if (module->owner == NULL || required->name == NULL || required->minimumVersion == 0u ||
-            ApiQuery((void *)module, required->name, required->minimumVersion, 1u, &version,
-                     NULL) == NULL)
+            !ServiceAvailable(host, module, required->name, required->minimumVersion))
             return false;
     }
     return true;
+}
+
+/* A declared requirement binds the consumer to its provider even if the
+ * consumer never asks for the table itself. */
+static void NoteRequiredServices(LaiueModuleHost *host, LoadedModule *module)
+{
+    const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
+    for (uint32_t requirement = 0u; requirement < descriptor->requiresCount; ++requirement)
+    {
+        const LaiueModuleRequirementV1 *required = &descriptor->requiresServices[requirement];
+        (void)QueryFor(host, module, required->name, required->minimumVersion, 1u, NULL, NULL,
+                       true);
+    }
 }
 
 static bool DescriptorHasOptionalServices(const LaiueModuleDescriptorV1 *descriptor)
@@ -395,55 +528,134 @@ static void RemoveOwnedServices(LaiueModuleHost *host, uint32_t owner)
     PlatformRwLockAcquireExclusive(&host->lock);
     for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
         if (host->services[index].used && host->services[index].owner == owner)
-            memset(&host->services[index], 0, sizeof(host->services[index]));
+            ForgetService(host, index);
     PlatformRwLockReleaseExclusive(&host->lock);
 }
 
-static void Rollback(LaiueModuleHost *host, uint32_t count)
+static void ReleaseSlot(LaiueModuleHost *host, uint32_t slot)
 {
-    /* Callbacks are unwound by lifecycle order, never by descriptor/input
-     * order. A consumer can therefore always release its references before
-     * its provider is stopped. */
-    for (uint32_t reverse = count; reverse > 0u; --reverse)
-    {
-        uint32_t order = reverse - 1u;
-        for (uint32_t index = 0u; index < count; ++index)
-        {
-            LoadedModule *module = &host->modules[index];
-            if (!module->used || !module->started || module->startOrder != order)
-                continue;
-            if (module->api->stop != NULL)
-                module->api->stop(module->context);
-            SetModuleStarted(host, module, false);
-            RemoveOwnedServices(host, index);
-        }
-    }
-    for (uint32_t reverse = count; reverse > 0u; --reverse)
-    {
-        uint32_t order = reverse - 1u;
-        for (uint32_t index = 0u; index < count; ++index)
-        {
-            LoadedModule *module = &host->modules[index];
-            if (!module->used || !module->created || module->createOrder != order)
-                continue;
-            if (module->api->destroy != NULL)
-                module->api->destroy(module->context);
-            module->created = false;
-        }
-    }
-    for (uint32_t reverse = count; reverse > 0u; --reverse)
-    {
-        LoadedModule *module = &host->modules[reverse - 1u];
-        if (module->used)
-        {
-            RemoveOwnedServices(host, reverse - 1u);
-            PlatformDynamicLibraryClose(module->library);
-            memset(module, 0, sizeof(*module));
-        }
-    }
+    /* create() and start() are allowed to publish services before they report
+     * an error. Remove those entries before closing the library; otherwise the
+     * service registry can retain pointers into an unloaded module. */
+    RemoveOwnedServices(host, slot);
+    PlatformDynamicLibraryClose(host->modules[slot].library);
     PlatformRwLockAcquireExclusive(&host->lock);
-    host->loadedCount = 0u;
+    memset(&host->modules[slot], 0, sizeof(host->modules[slot]));
     PlatformRwLockReleaseExclusive(&host->lock);
+}
+
+/* Bit c of users[p] is set when module c holds a table that module p
+ * provides. The caller holds the lock. */
+static void CollectUsers(const LaiueModuleHost *host, uint64_t users[LAIUE_MODULE_HOST_MAX_MODULES])
+{
+    memset(users, 0, sizeof(uint64_t) * LAIUE_MODULE_HOST_MAX_MODULES);
+    for (uint32_t service = 0u; service < LAIUE_MODULE_HOST_MAX_SERVICES; ++service)
+    {
+        const ModuleService *entry = &host->services[service];
+        if (!entry->used || entry->owner >= LAIUE_MODULE_HOST_MAX_MODULES)
+            continue;
+        for (uint32_t consumer = 0u; consumer < LAIUE_MODULE_HOST_MAX_MODULES; ++consumer)
+            if (consumer != entry->owner && host->modules[consumer].used &&
+                UsesService(&host->modules[consumer], service))
+                users[entry->owner] |= SlotBit(consumer);
+    }
+}
+
+/* Adds every module that holds a table of a member, until nothing changes. */
+static uint64_t WithUsers(const uint64_t users[LAIUE_MODULE_HOST_MAX_MODULES], uint64_t members)
+{
+    uint64_t previous = 0u;
+    while (previous != members)
+    {
+        previous = members;
+        for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+            if ((members & SlotBit(slot)) != 0u)
+                members |= users[slot];
+    }
+    return members;
+}
+
+static uint64_t UnwindKey(const LoadedModule *module)
+{
+    /* Started modules leave newest first. A module that was created but did
+     * not start, or never got that far, was the last one its load touched. */
+    if (module->started)
+        return module->startOrder;
+    return module->created ? UINT64_MAX - 1u : UINT64_MAX;
+}
+
+/* Orders members so that every module leaves before the modules whose tables
+ * it holds, newest first among those that are free to go. A cycle of users,
+ * possible only through tables obtained after start, falls back to the
+ * newest member. The caller holds the lock. */
+static uint32_t UnwindOrder(const LaiueModuleHost *host, uint64_t members,
+                            uint32_t order[LAIUE_MODULE_HOST_MAX_MODULES])
+{
+    uint64_t users[LAIUE_MODULE_HOST_MAX_MODULES];
+    CollectUsers(host, users);
+    uint32_t count = 0u;
+    while (members != 0u)
+    {
+        uint32_t best = LAIUE_MODULE_HOST_MAX_MODULES;
+        uint32_t newest = LAIUE_MODULE_HOST_MAX_MODULES;
+        for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        {
+            if ((members & SlotBit(slot)) == 0u)
+                continue;
+            const uint64_t key = UnwindKey(&host->modules[slot]);
+            if (newest == LAIUE_MODULE_HOST_MAX_MODULES || key > UnwindKey(&host->modules[newest]))
+                newest = slot;
+            if ((users[slot] & members & ~SlotBit(slot)) == 0u &&
+                (best == LAIUE_MODULE_HOST_MAX_MODULES || key > UnwindKey(&host->modules[best])))
+                best = slot;
+        }
+        const uint32_t next = best != LAIUE_MODULE_HOST_MAX_MODULES ? best : newest;
+        order[count++] = next;
+        members &= ~SlotBit(next);
+    }
+    return count;
+}
+
+/* Stops, destroys and closes a set of modules. Callers make sure no module
+ * outside the set holds a table of a member; inside the set, users leave
+ * before their providers. */
+static void UnwindModules(LaiueModuleHost *host, uint64_t members)
+{
+    uint32_t order[LAIUE_MODULE_HOST_MAX_MODULES];
+    PlatformRwLockAcquireExclusive(&host->lock);
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if ((members & SlotBit(slot)) != 0u && !host->modules[slot].used)
+            members &= ~SlotBit(slot);
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if ((members & SlotBit(slot)) != 0u)
+            host->modules[slot].unloading = true;
+    const uint32_t count = UnwindOrder(host, members, order);
+    PlatformRwLockReleaseExclusive(&host->lock);
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        LoadedModule *module = &host->modules[order[index]];
+        if (!module->started)
+            continue;
+        if (module->api->stop != NULL)
+            module->api->stop(module->context);
+        PlatformRwLockAcquireExclusive(&host->lock);
+        module->started = false;
+        if (host->loadedCount != 0u)
+            --host->loadedCount;
+        PlatformRwLockReleaseExclusive(&host->lock);
+        RemoveOwnedServices(host, order[index]);
+    }
+    for (uint32_t index = 0u; index < count; ++index)
+    {
+        LoadedModule *module = &host->modules[order[index]];
+        if (!module->created)
+            continue;
+        if (module->api->destroy != NULL)
+            module->api->destroy(module->context);
+        module->created = false;
+    }
+    for (uint32_t index = 0u; index < count; ++index)
+        ReleaseSlot(host, order[index]);
 }
 
 static void RemoveUnstartedModule(LaiueModuleHost *host, uint32_t index)
@@ -453,12 +665,7 @@ static void RemoveUnstartedModule(LaiueModuleHost *host, uint32_t index)
     LoadedModule *module = &host->modules[index];
     if (!module->used || module->started || module->created)
         return;
-    /* create() is allowed to publish services before it reports an error.
-     * Remove those entries before closing the library; otherwise the service
-     * registry can retain pointers into an unloaded module. */
-    RemoveOwnedServices(host, index);
-    PlatformDynamicLibraryClose(module->library);
-    memset(module, 0, sizeof(*module));
+    ReleaseSlot(host, index);
 }
 
 static void RemoveStartedModule(LaiueModuleHost *host, uint32_t index)
@@ -489,8 +696,7 @@ static void RemoveStartedModule(LaiueModuleHost *host, uint32_t index)
             module->api->destroy(module->context);
         module->created = false;
     }
-    PlatformDynamicLibraryClose(module->library);
-    memset(module, 0, sizeof(*module));
+    ReleaseSlot(host, index);
 }
 
 void LaiueModuleHostConfigInitialize(LaiueModuleHostConfigV1 *config)
@@ -548,14 +754,35 @@ LaiueModuleStatus LaiueModuleHostRegisterService(LaiueModuleHost *host,
     if (!Begin(host))
         return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
     PlatformRwLockAcquireExclusive(&host->lock);
-    LaiueModuleStatus status = host->servicesFrozen
-                                   ? Fail(diagnostic, LAIUE_MODULE_BUSY,
-                                          "service registry is frozen while modules are loaded")
-                                   : PublishFor(host, LAIUE_MODULE_HOST_MAX_MODULES, service,
-                                                diagnostic);
+    LaiueModuleStatus status = PublishFor(host, LAIUE_MODULE_HOST_MAX_MODULES, service, diagnostic);
     PlatformRwLockReleaseExclusive(&host->lock);
     End(host);
     return status;
+}
+
+/* Writes "<prefix><name>" as the diagnostic message. */
+static LaiueModuleStatus FailNamed(LaiueModuleDiagnostic *diagnostic, LaiueModuleStatus status,
+                                   const char *prefix, const char *name)
+{
+    char message[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
+    uint32_t length = 0u;
+    for (const char *part = prefix; *part != '\0' && length + 1u < sizeof(message); ++part)
+        message[length++] = *part;
+    for (const char *part = name; *part != '\0' && length + 1u < sizeof(message); ++part)
+        message[length++] = *part;
+    message[length] = '\0';
+    return Fail(diagnostic, status, message);
+}
+
+/* Returns the first loaded module that holds the table in this slot, or
+ * LAIUE_MODULE_HOST_MAX_MODULES. The caller holds the lock. */
+static uint32_t ServiceUser(const LaiueModuleHost *host, uint32_t service)
+{
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if (host->modules[slot].used && slot != host->services[service].owner &&
+            UsesService(&host->modules[slot], service))
+            return slot;
+    return LAIUE_MODULE_HOST_MAX_MODULES;
 }
 
 LaiueModuleStatus LaiueModuleHostUnregisterService(LaiueModuleHost *host, const char *name,
@@ -567,19 +794,24 @@ LaiueModuleStatus LaiueModuleHostUnregisterService(LaiueModuleHost *host, const 
     if (!Begin(host))
         return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
     PlatformRwLockAcquireExclusive(&host->lock);
-    LaiueModuleStatus status = host->servicesFrozen
-                                   ? Fail(diagnostic, LAIUE_MODULE_BUSY,
-                                          "service registry is frozen while modules are loaded")
-                                   : LAIUE_MODULE_SERVICE_NOT_FOUND;
+    LaiueModuleStatus status = LAIUE_MODULE_SERVICE_NOT_FOUND;
     const uint32_t nameHash = NameHash(name);
-    for (uint32_t index = 0u; status != LAIUE_MODULE_BUSY &&
-                                index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_SERVICES; ++index)
         if (host->services[index].used && host->services[index].owner == LAIUE_MODULE_HOST_MAX_MODULES &&
             host->services[index].nameHash == nameHash &&
             LaiueModAsciiEquals(host->services[index].value.name, name))
         {
-            memset(&host->services[index], 0, sizeof(host->services[index]));
-            status = LAIUE_MODULE_OK;
+            /* Checked and removed under one lock: a module cannot obtain the
+             * table between the check and the removal. */
+            const uint32_t user = ServiceUser(host, index);
+            if (user < LAIUE_MODULE_HOST_MAX_MODULES)
+                status = FailNamed(diagnostic, LAIUE_MODULE_IN_USE, "service is in use by ",
+                                   host->modules[user].id);
+            else
+            {
+                ForgetService(host, index);
+                status = LAIUE_MODULE_OK;
+            }
             break;
         }
     PlatformRwLockReleaseExclusive(&host->lock);
@@ -615,13 +847,14 @@ static void StableSortIndices(LaiueModuleHost *host, uint32_t *indices, uint32_t
     }
 }
 
-static bool HasPendingProvider(const LaiueModuleHost *host, uint32_t moduleCount,
-                               const char *name)
+/* True while a module of the load in progress that has not started yet
+ * declares the service. */
+static bool HasPendingProvider(const LaiueModuleHost *host, const char *name)
 {
-    for (uint32_t index = 0u; index < moduleCount; ++index)
+    for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
     {
         const LoadedModule *module = &host->modules[index];
-        if (!module->used || module->started)
+        if (!module->used || !module->pending || module->started)
             continue;
         const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
         for (uint32_t provided = 0u; provided < descriptor->providesCount; ++provided)
@@ -631,8 +864,8 @@ static bool HasPendingProvider(const LaiueModuleHost *host, uint32_t moduleCount
     return false;
 }
 
-static bool OptionalServicesReady(LaiueModuleHost *host, const LoadedModule *module,
-                                  uint32_t moduleCount, const uint32_t *ignoredOptionalServices,
+static bool OptionalServicesReady(LaiueModuleHost *host, LoadedModule *module,
+                                  const uint32_t *ignoredOptionalServices,
                                   uint32_t *outBlockedIndex)
 {
     const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
@@ -645,14 +878,12 @@ static bool OptionalServicesReady(LaiueModuleHost *host, const LoadedModule *mod
             (ignoredOptionalServices[index / 32u] & (UINT32_C(1) << (index % 32u))) != 0u)
             continue;
         const LaiueModuleRequirementV1 *optional = &descriptor->optionalServices[index];
-        uint32_t version = 0u;
-        if (ApiQuery((void *)module, optional->name, optional->minimumVersion, 1u, &version,
-                     NULL) != NULL)
+        if (ServiceAvailable(host, module, optional->name, optional->minimumVersion))
             continue;
         /* Prefer a compatible module provider when it can still start. If the
          * graph stalls on optional edges, the caller retries without waiting:
          * optional capabilities must never turn fallback into a hard cycle. */
-        if (HasPendingProvider(host, moduleCount, optional->name))
+        if (HasPendingProvider(host, optional->name))
         {
             if (outBlockedIndex != NULL)
                 *outBlockedIndex = index;
@@ -662,13 +893,16 @@ static bool OptionalServicesReady(LaiueModuleHost *host, const LoadedModule *mod
     return true;
 }
 
-static bool HasProviderConflict(const LaiueModuleHost *host, uint32_t moduleCount)
+/* Resolves provider choice before invoking user code. A duplicate service
+ * must be a deterministic graph error, not a start-order accident. Returns
+ * why the new modules cannot provide their services, or NULL. The registry
+ * already holds the services of every module loaded before. */
+static const char *ProviderConflict(const LaiueModuleHost *host, const uint32_t *slots,
+                                    uint32_t moduleCount)
 {
-    /* Resolve provider choice before invoking user code. A duplicate service
-     * must be a deterministic graph error, not a start-order accident. */
     for (uint32_t index = 0u; index < moduleCount; ++index)
     {
-        const LoadedModule *module = &host->modules[index];
+        const LoadedModule *module = &host->modules[slots[index]];
         const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
         for (uint32_t provided = 0u; provided < descriptor->providesCount; ++provided)
         {
@@ -676,19 +910,108 @@ static bool HasProviderConflict(const LaiueModuleHost *host, uint32_t moduleCoun
             for (uint32_t service = 0u; service < LAIUE_MODULE_HOST_MAX_SERVICES; ++service)
                 if (host->services[service].used &&
                     LaiueModAsciiEquals(host->services[service].value.name, name))
-                    return true;
+                    return "service is already provided";
             for (uint32_t prior = 0u; prior < index; ++prior)
             {
                 const LaiueModuleDescriptorV1 *priorDescriptor =
-                    &host->modules[prior].api->descriptor;
+                    &host->modules[slots[prior]].api->descriptor;
                 for (uint32_t priorProvided = 0u;
                      priorProvided < priorDescriptor->providesCount; ++priorProvided)
                     if (LaiueModAsciiEquals(priorDescriptor->providesServices[priorProvided], name))
-                        return true;
+                        return "service provider selection is ambiguous";
             }
         }
     }
-    return false;
+    return NULL;
+}
+
+/* Returns why a descriptor's dependency and service lists are unusable, or
+ * NULL when they are valid. */
+static const char *DescriptorProblem(const LaiueModuleDescriptorV1 *descriptor)
+{
+    if ((descriptor->requiresCount != 0u && descriptor->requiresServices == NULL) ||
+        (descriptor->providesCount != 0u && descriptor->providesServices == NULL) ||
+        descriptor->requiresCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
+        descriptor->providesCount > LAIUE_MODULE_HOST_MAX_SERVICES)
+        return "module dependency arrays are invalid";
+    const bool hasOptional = DescriptorHasOptionalServices(descriptor);
+    const uint32_t optionalCount = hasOptional ? descriptor->optionalCount : 0u;
+    const LaiueModuleRequirementV1 *optionalServices =
+        hasOptional ? descriptor->optionalServices : NULL;
+    if ((optionalCount != 0u && optionalServices == NULL) ||
+        optionalCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
+        (hasOptional && descriptor->optionalReserved != 0u))
+        return "module optional dependency arrays are invalid";
+    for (uint32_t index = 0u; index < descriptor->requiresCount; ++index)
+        if (descriptor->requiresServices[index].minimumVersion == 0u ||
+            !SafeName(descriptor->requiresServices[index].name))
+            return "module service requirement is invalid";
+    for (uint32_t index = 0u; index < optionalCount; ++index)
+        if (optionalServices[index].minimumVersion == 0u || !SafeName(optionalServices[index].name))
+            return "module optional service requirement is invalid";
+    for (uint32_t index = 0u; index < descriptor->providesCount; ++index)
+    {
+        if (!SafeName(descriptor->providesServices[index]))
+            return "module service declaration is invalid";
+        for (uint32_t prior = 0u; prior < index; ++prior)
+            if (LaiueModAsciiEquals(descriptor->providesServices[prior],
+                                    descriptor->providesServices[index]))
+                return "module service declaration is duplicated";
+    }
+    return NULL;
+}
+
+/* Checks a module API before any of its code runs and copies its id and
+ * version. On failure *outProblem says what is wrong. */
+static LaiueModuleStatus ValidateApi(const LaiueModuleApiV1 *api, char id[LAIUE_MODULE_MAX_NAME],
+                                     char version[LAIUE_MODULE_MAX_NAME], const char **outProblem)
+{
+    *outProblem = "module descriptor is invalid";
+    if (api == NULL || api->structSize < offsetof(LaiueModuleApiV1, reserved))
+        return LAIUE_MODULE_DESCRIPTOR_INVALID;
+    if (api->abiVersion != LAIUE_MODULE_ABI_VERSION_1 ||
+        api->descriptor.abiVersion != LAIUE_MODULE_ABI_VERSION_1)
+    {
+        *outProblem = "module ABI version is unsupported";
+        return LAIUE_MODULE_ABI_MISMATCH;
+    }
+    if (api->descriptor.structSize < offsetof(LaiueModuleDescriptorV1, reserved))
+    {
+        *outProblem = "module descriptor is truncated";
+        return LAIUE_MODULE_DESCRIPTOR_INVALID;
+    }
+    if (api->create == NULL || api->destroy == NULL || !CopyName(id, api->descriptor.id) ||
+        !CopyName(version, api->descriptor.version))
+        return LAIUE_MODULE_DESCRIPTOR_INVALID;
+    *outProblem = DescriptorProblem(&api->descriptor);
+    return *outProblem == NULL ? LAIUE_MODULE_OK : LAIUE_MODULE_DESCRIPTOR_INVALID;
+}
+
+/* Returns the slot of the loaded module with this id, or
+ * LAIUE_MODULE_HOST_MAX_MODULES. */
+static uint32_t FindModule(const LaiueModuleHost *host, const char *id)
+{
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if (host->modules[slot].used && LaiueModAsciiEquals(host->modules[slot].id, id))
+            return slot;
+    return LAIUE_MODULE_HOST_MAX_MODULES;
+}
+
+static uint32_t SetSize(uint64_t set)
+{
+    uint32_t size = 0u;
+    for (; set != 0u; set &= set - 1u)
+        ++size;
+    return size;
+}
+
+/* Returns the lowest slot in a set, or LAIUE_MODULE_HOST_MAX_MODULES. */
+static uint32_t FirstSlot(uint64_t set)
+{
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if ((set & SlotBit(slot)) != 0u)
+            return slot;
+    return LAIUE_MODULE_HOST_MAX_MODULES;
 }
 
 typedef struct ProfileCandidate
@@ -742,48 +1065,11 @@ static void ProfileSetFailure(ProfileCandidate *candidate, LaiueModuleStatus sta
 static LaiueModuleStatus ProfileValidateApi(ProfileCandidate *candidate,
                                             const LaiueModuleApiV1 *api)
 {
-    if (api == NULL || api->structSize < offsetof(LaiueModuleApiV1, reserved))
-        return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    if (api->abiVersion != LAIUE_MODULE_ABI_VERSION_1 ||
-        api->descriptor.abiVersion != LAIUE_MODULE_ABI_VERSION_1)
-        return LAIUE_MODULE_ABI_MISMATCH;
-    if (api->descriptor.structSize < offsetof(LaiueModuleDescriptorV1, reserved) ||
-        api->create == NULL || api->destroy == NULL ||
-        !CopyName(candidate->id, api->descriptor.id) ||
-        !CopyName(candidate->message, api->descriptor.version))
-        return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    const LaiueModuleDescriptorV1 *descriptor = &api->descriptor;
-    if ((descriptor->requiresCount != 0u && descriptor->requiresServices == NULL) ||
-        (descriptor->providesCount != 0u && descriptor->providesServices == NULL) ||
-        descriptor->requiresCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
-        descriptor->providesCount > LAIUE_MODULE_HOST_MAX_SERVICES)
-        return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    const uint32_t optionalCount = DescriptorHasOptionalServices(descriptor)
-                                       ? descriptor->optionalCount
-                                       : 0u;
-    const LaiueModuleRequirementV1 *optional = DescriptorHasOptionalServices(descriptor)
-                                                    ? descriptor->optionalServices
-                                                    : NULL;
-    if ((optionalCount != 0u && optional == NULL) ||
-        optionalCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
-        (DescriptorHasOptionalServices(descriptor) && descriptor->optionalReserved != 0u))
-        return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    for (uint32_t index = 0u; index < descriptor->requiresCount; ++index)
-        if (descriptor->requiresServices[index].minimumVersion == 0u ||
-            !SafeName(descriptor->requiresServices[index].name))
-            return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    for (uint32_t index = 0u; index < optionalCount; ++index)
-        if (optional[index].minimumVersion == 0u || !SafeName(optional[index].name))
-            return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    for (uint32_t index = 0u; index < descriptor->providesCount; ++index)
-    {
-        if (!SafeName(descriptor->providesServices[index]))
-            return LAIUE_MODULE_DESCRIPTOR_INVALID;
-        for (uint32_t prior = 0u; prior < index; ++prior)
-            if (LaiueModAsciiEquals(descriptor->providesServices[prior],
-                                    descriptor->providesServices[index]))
-                return LAIUE_MODULE_DESCRIPTOR_INVALID;
-    }
+    char version[LAIUE_MODULE_MAX_NAME];
+    const char *problem = NULL;
+    const LaiueModuleStatus status = ValidateApi(api, candidate->id, version, &problem);
+    if (status != LAIUE_MODULE_OK)
+        return status;
     candidate->api = api;
     candidate->active = true;
     candidate->status = LAIUE_MODULE_OK;
@@ -967,222 +1253,138 @@ void LaiueModuleLoadReportInitialize(LaiueModuleLoadReportV1 *report,
         memset(entries, 0, sizeof(*entries) * capacity);
 }
 
-static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
-                                      const LaiueModuleBinaryV1 *binaries, uint32_t count,
-                                      LaiueModuleDiagnostic *diagnostic,
-                                      bool allowOptionalFailures,
-                                      uint8_t *failureKinds)
+/* Opens one entry of a load into a free slot and checks it. On success the
+ * slot belongs to the load in progress. A missing optional artifact returns
+ * OK with *outSkipped set; any other failure closes the library, leaves the
+ * slot free and fills the diagnostic. */
+static LaiueModuleStatus OpenEntry(LaiueModuleHost *host, const LaiueModuleBinaryV1 *binary,
+                                   uint32_t slot, bool *outSkipped,
+                                   LaiueModuleDiagnostic *diagnostic)
 {
-    DiagnosticClear(diagnostic);
-    if (host == NULL || binaries == NULL || count == 0u || count > LAIUE_MODULE_HOST_MAX_MODULES)
-        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "module paths and count are required");
+    *outSkipped = false;
+    const bool optional = (binary->flags & LAIUE_MODULE_BINARY_OPTIONAL) != 0u;
+    PlatformDynamicLibrary library = NULL;
+    const LaiueModuleApiV1 *api = binary->staticApi;
+    if ((binary->flags & LAIUE_MODULE_BINARY_STATIC) != 0u)
+    {
+        if (api == NULL)
+            return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "static module API is missing");
+    }
+    else
+    {
+        if (api != NULL)
+            return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                        "static API requires static module flag");
+        if (binary->path == NULL || binary->path[0] == L'\0')
+        {
+            *outSkipped = optional;
+            return optional
+                       ? LAIUE_MODULE_OK
+                       : Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "module path is empty");
+        }
+        library = PlatformDynamicLibraryOpen(binary->path);
+        if (library == NULL)
+        {
+            /* Optional means absent, not silently ignored corruption or a
+             * missing transitive dependency. Once the selected path exists,
+             * every load/entry/ABI error remains fatal. */
+            *outSkipped = optional && !PlatformPathExists(binary->path);
+            return *outSkipped ? LAIUE_MODULE_OK
+                               : Fail(diagnostic, LAIUE_MODULE_LOAD_FAILED,
+                                      "module library could not be loaded");
+        }
+        void *symbol = PlatformDynamicLibrarySymbol(library, LAIUE_MODULE_ENTRY_NAME_V1);
+        if (symbol == NULL)
+        {
+            PlatformDynamicLibraryClose(library);
+            return Fail(diagnostic, LAIUE_MODULE_ENTRY_MISSING, "module entry point is missing");
+        }
+        LaiueModuleGetApiFnV1 getApi = NULL;
+        memcpy((void *)&getApi, (const void *)&symbol, sizeof(getApi));
+        api = getApi();
+    }
+    LoadedModule *module = &host->modules[slot];
+    const char *problem = NULL;
+    LaiueModuleStatus status = ValidateApi(api, module->id, module->version, &problem);
+    for (uint32_t other = 0u; status == LAIUE_MODULE_OK && other < LAIUE_MODULE_HOST_MAX_MODULES;
+         ++other)
+        if (host->modules[other].used && LaiueModAsciiEquals(host->modules[other].id, module->id))
+        {
+            status = LAIUE_MODULE_DUPLICATE_ID;
+            problem = host->modules[other].pending ? "module id is duplicated"
+                                                   : "module is already loaded";
+        }
+    if (status != LAIUE_MODULE_OK)
+    {
+        PlatformDynamicLibraryClose(library);
+        return Fail(diagnostic, status, problem);
+    }
+    PlatformRwLockAcquireExclusive(&host->lock);
+    module->api = api;
+    module->owner = host;
+    module->library = library;
+    module->optional = optional;
+    module->pending = true;
+    module->used = true;
+    PlatformRwLockReleaseExclusive(&host->lock);
+    return LAIUE_MODULE_OK;
+}
+
+/* Starts the given modules next to the ones already running; the caller has
+ * begun a lifecycle operation. The load is a transaction over its own modules:
+ * on failure they are unwound and the running set stays as it was, and until
+ * it commits nothing outside the load sees their services. With
+ * allowOptionalFailures, an optional module whose callback fails, or that is
+ * left without a dependency, leaves alone; failureKinds then marks its entry
+ * with 1 or 2. outLoaded receives the slots that started. */
+static LaiueModuleStatus LoadModules(LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries,
+                                     uint32_t count, LaiueModuleDiagnostic *diagnostic,
+                                     bool allowOptionalFailures, uint8_t *failureKinds,
+                                     uint64_t *outLoaded)
+{
     if (failureKinds != NULL)
         memset(failureKinds, 0, count * sizeof(*failureKinds));
-    if (!Begin(host))
-        return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
-    if (host->loadedCount != 0u)
-    {
-        End(host);
-        return Fail(diagnostic, LAIUE_MODULE_BUSY, "modules are already loaded");
-    }
-    memset(host->modules, 0, sizeof(host->modules));
-    uint32_t indices[LAIUE_MODULE_HOST_MAX_MODULES];
+    if (outLoaded != NULL)
+        *outLoaded = 0u;
+    uint32_t slots[LAIUE_MODULE_HOST_MAX_MODULES] = {0u};
+    uint32_t inputs[LAIUE_MODULE_HOST_MAX_MODULES] = {0u};
+    uint64_t members = 0u;
     uint32_t moduleCount = 0u;
-    uint32_t activeCount = 0u;
     for (uint32_t input = 0u; input < count; ++input)
     {
-        bool optional = (binaries[input].flags & LAIUE_MODULE_BINARY_OPTIONAL) != 0u;
-        bool staticArtifact = (binaries[input].flags & LAIUE_MODULE_BINARY_STATIC) != 0u;
-        PlatformDynamicLibrary library = NULL;
-        const LaiueModuleApiV1 *api = binaries[input].staticApi;
-        if (staticArtifact)
+        uint32_t slot = 0u;
+        while (slot < LAIUE_MODULE_HOST_MAX_MODULES && host->modules[slot].used)
+            ++slot;
+        if (slot == LAIUE_MODULE_HOST_MAX_MODULES)
         {
-            if (api == NULL)
-            {
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                            "static module API is missing");
-            }
+            UnwindModules(host, members);
+            return Fail(diagnostic, LAIUE_MODULE_CAPACITY, "every module slot is in use");
         }
-        else
+        bool skipped = false;
+        const LaiueModuleStatus status =
+            OpenEntry(host, &binaries[input], slot, &skipped, diagnostic);
+        if (status != LAIUE_MODULE_OK)
         {
-            if (binaries[input].staticApi != NULL)
-            {
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                            "static API requires static module flag");
-            }
-            if (binaries[input].path == NULL || binaries[input].path[0] == L'\0')
-            {
-                if (optional)
-                    continue;
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "module path is empty");
-            }
-            library = PlatformDynamicLibraryOpen(binaries[input].path);
-            if (library == NULL)
-            {
-                /* Optional means absent, not silently ignored corruption or a
-                 * missing transitive dependency. Once the selected path
-                 * exists, every load/entry/ABI error remains fatal. */
-                if (optional && !PlatformPathExists(binaries[input].path))
-                    continue;
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_LOAD_FAILED,
-                            "module library could not be loaded");
-            }
-            void *symbol = PlatformDynamicLibrarySymbol(library, LAIUE_MODULE_ENTRY_NAME_V1);
-            if (symbol == NULL)
-            {
-                PlatformDynamicLibraryClose(library);
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_ENTRY_MISSING,
-                            "module entry point is missing");
-            }
-            LaiueModuleGetApiFnV1 getApi = NULL;
-            memcpy((void *)&getApi, (const void *)&symbol, sizeof(getApi));
-            api = getApi();
+            UnwindModules(host, members);
+            return status;
         }
-        if (api == NULL || api->structSize < offsetof(LaiueModuleApiV1, reserved))
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID, "module descriptor is invalid");
-        }
-        if (api->abiVersion != LAIUE_MODULE_ABI_VERSION_1 ||
-            api->descriptor.abiVersion != LAIUE_MODULE_ABI_VERSION_1)
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_ABI_MISMATCH, "module ABI version is unsupported");
-        }
-        if (api->descriptor.structSize < offsetof(LaiueModuleDescriptorV1, reserved))
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                        "module descriptor is truncated");
-        }
-        if (api->create == NULL || api->destroy == NULL ||
-            !CopyName(host->modules[moduleCount].id, api->descriptor.id) ||
-            !CopyName(host->modules[moduleCount].version, api->descriptor.version))
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                        "module descriptor is invalid");
-        }
-        for (uint32_t prior = 0u; prior < moduleCount; ++prior)
-            if (LaiueModAsciiEquals(host->modules[prior].id, host->modules[moduleCount].id))
-            {
-                PlatformDynamicLibraryClose(library);
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_DUPLICATE_ID, "module id is duplicated");
-            }
-        const LaiueModuleDescriptorV1 *descriptor = &api->descriptor;
-        if ((descriptor->requiresCount != 0u && descriptor->requiresServices == NULL) ||
-            (descriptor->providesCount != 0u && descriptor->providesServices == NULL) ||
-            descriptor->requiresCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
-            descriptor->providesCount > LAIUE_MODULE_HOST_MAX_SERVICES)
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID, "module dependency arrays are invalid");
-        }
-        uint32_t optionalCount = DescriptorHasOptionalServices(descriptor)
-                                     ? descriptor->optionalCount
-                                     : 0u;
-        const LaiueModuleRequirementV1 *optionalServices =
-            DescriptorHasOptionalServices(descriptor) ? descriptor->optionalServices : NULL;
-        if ((optionalCount != 0u && optionalServices == NULL) ||
-            optionalCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
-            (DescriptorHasOptionalServices(descriptor) && descriptor->optionalReserved != 0u))
-        {
-            PlatformDynamicLibraryClose(library);
-            Rollback(host, moduleCount);
-            End(host);
-            return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                        "module optional dependency arrays are invalid");
-        }
-        for (uint32_t requirement = 0u; requirement < descriptor->requiresCount; ++requirement)
-        {
-            const LaiueModuleRequirementV1 *required = &descriptor->requiresServices[requirement];
-            if (required->minimumVersion == 0u || !SafeName(required->name))
-            {
-                PlatformDynamicLibraryClose(library);
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                            "module service requirement is invalid");
-            }
-        }
-        for (uint32_t requirement = 0u; requirement < optionalCount; ++requirement)
-        {
-            const LaiueModuleRequirementV1 *optionalRequirement = &optionalServices[requirement];
-            if (optionalRequirement->minimumVersion == 0u ||
-                !SafeName(optionalRequirement->name))
-            {
-                PlatformDynamicLibraryClose(library);
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                            "module optional service requirement is invalid");
-            }
-        }
-        for (uint32_t provided = 0u; provided < descriptor->providesCount; ++provided)
-        {
-            if (!SafeName(descriptor->providesServices[provided]))
-            {
-                PlatformDynamicLibraryClose(library);
-                Rollback(host, moduleCount);
-                End(host);
-                return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                            "module service declaration is invalid");
-            }
-            for (uint32_t prior = 0u; prior < provided; ++prior)
-                if (LaiueModAsciiEquals(descriptor->providesServices[prior],
-                                        descriptor->providesServices[provided]))
-                {
-                    PlatformDynamicLibraryClose(library);
-                    Rollback(host, moduleCount);
-                    End(host);
-                    return Fail(diagnostic, LAIUE_MODULE_DESCRIPTOR_INVALID,
-                                "module service declaration is duplicated");
-                }
-        }
-        host->modules[moduleCount].api = api;
-        host->modules[moduleCount].owner = host;
-        host->modules[moduleCount].library = library;
-        host->modules[moduleCount].optional = optional;
-        host->modules[moduleCount].used = true;
-        indices[moduleCount] = moduleCount;
-        ++moduleCount;
-        ++activeCount;
+        if (skipped)
+            continue;
+        slots[moduleCount++] = slot;
+        inputs[slot] = input;
+        members |= SlotBit(slot);
     }
-    if (HasProviderConflict(host, moduleCount))
+    const char *conflict = ProviderConflict(host, slots, moduleCount);
+    if (conflict != NULL)
     {
-        Rollback(host, moduleCount);
-        End(host);
-        return Fail(diagnostic, LAIUE_MODULE_DUPLICATE_SERVICE,
-                    "service provider selection is ambiguous");
+        UnwindModules(host, members);
+        return Fail(diagnostic, LAIUE_MODULE_DUPLICATE_SERVICE, conflict);
     }
-    StableSortIndices(host, indices, moduleCount);
-    uint32_t created = 0u;
+    StableSortIndices(host, slots, moduleCount);
+    uint32_t activeCount = moduleCount;
     uint32_t started = 0u;
     bool partial = false;
-    uint32_t ignoredOptionalServices[LAIUE_MODULE_HOST_MAX_MODULES]
-                                    [LAIUE_MODULE_HOST_MAX_SERVICES / 32u] = {{0u}};
+    uint32_t ignoredOptionalServices[LAIUE_MODULE_HOST_MAX_MODULES][SERVICE_WORDS] = {{0u}};
     bool progress = true;
     while (started < activeCount && progress)
     {
@@ -1192,15 +1394,14 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
         uint32_t fallbackOptionalIndex = LAIUE_MODULE_HOST_MAX_SERVICES;
         for (uint32_t order = 0u; order < moduleCount; ++order)
         {
-            uint32_t index = indices[order];
+            const uint32_t index = slots[order];
             LoadedModule *module = &host->modules[index];
             // A failed optional module is removed in place and its slot
             // cleared; later passes must not read its API through it.
             if (!module->used || module->created || !RequiredServicesReady(host, module))
                 continue;
             uint32_t blockedOptionalIndex = LAIUE_MODULE_HOST_MAX_SERVICES;
-            if (!OptionalServicesReady(host, module, moduleCount,
-                                       ignoredOptionalServices[index],
+            if (!OptionalServicesReady(host, module, ignoredOptionalServices[index],
                                        &blockedOptionalIndex))
             {
                 deferredForOptional = true;
@@ -1211,47 +1412,48 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
                 }
                 continue;
             }
+            NoteRequiredServices(host, module);
             BuildApi(host, module);
             if (!module->api->create(&module->hostApi, &module->context))
             {
                 if (allowOptionalFailures && module->optional)
                 {
                     if (failureKinds != NULL)
-                        failureKinds[index] |= 1u;
+                        failureKinds[inputs[index]] |= 1u;
                     RemoveUnstartedModule(host, index);
+                    members &= ~SlotBit(index);
                     --activeCount;
                     partial = true;
                     progress = true;
                     continue;
                 }
-                Rollback(host, moduleCount);
-                End(host);
+                UnwindModules(host, members);
                 return Fail(diagnostic, LAIUE_MODULE_CREATE_FAILED, "module create callback failed");
             }
             module->created = true;
-            module->createOrder = created++;
+            module->createOrder = host->nextCreateOrder++;
             if (module->api->start != NULL && !module->api->start(module->context))
             {
                 if (allowOptionalFailures && module->optional)
                 {
                     if (failureKinds != NULL)
-                        failureKinds[index] |= 1u;
+                        failureKinds[inputs[index]] |= 1u;
                     RemoveStartedModule(host, index);
+                    members &= ~SlotBit(index);
                     --activeCount;
                     partial = true;
                     progress = true;
                     continue;
                 }
-                Rollback(host, moduleCount);
-                End(host);
+                UnwindModules(host, members);
                 return Fail(diagnostic, LAIUE_MODULE_START_FAILED, "module start callback failed");
             }
-            SetModuleStarted(host, module, true);
-            module->startOrder = started;
-            ++started;
             PlatformRwLockAcquireExclusive(&host->lock);
+            module->started = true;
+            module->startOrder = host->nextStartOrder++;
             ++host->loadedCount;
             PlatformRwLockReleaseExclusive(&host->lock);
+            ++started;
             progress = true;
         }
         if (!progress && deferredForOptional &&
@@ -1271,14 +1473,16 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
         while (removed)
         {
             removed = false;
-            for (uint32_t index = 0u; index < moduleCount; ++index)
+            for (uint32_t order = 0u; order < moduleCount; ++order)
             {
-                LoadedModule *module = &host->modules[index];
+                const uint32_t index = slots[order];
+                const LoadedModule *module = &host->modules[index];
                 if (!module->used || module->created || !module->optional)
                     continue;
                 if (failureKinds != NULL)
-                    failureKinds[index] |= 2u;
+                    failureKinds[inputs[index]] |= 2u;
                 RemoveUnstartedModule(host, index);
+                members &= ~SlotBit(index);
                 --activeCount;
                 partial = true;
                 removed = true;
@@ -1288,121 +1492,59 @@ static LaiueModuleStatus LoadInternal(LaiueModuleHost *host,
     if (started != activeCount)
     {
         bool missing = false;
-        for (uint32_t index = 0u; index < moduleCount && !missing; ++index)
+        for (uint32_t order = 0u; order < moduleCount && !missing; ++order)
         {
-            const LoadedModule *module = &host->modules[index];
+            const LoadedModule *module = &host->modules[slots[order]];
             if (!module->used || module->created)
                 continue;
             const LaiueModuleDescriptorV1 *descriptor = &module->api->descriptor;
             for (uint32_t requirement = 0u; requirement < descriptor->requiresCount;
                  ++requirement)
-                if (!HasPendingProvider(host, moduleCount,
-                                        descriptor->requiresServices[requirement].name))
+                if (!HasPendingProvider(host, descriptor->requiresServices[requirement].name))
                 {
                     missing = true;
                     break;
                 }
         }
-        Rollback(host, moduleCount);
-        End(host);
+        UnwindModules(host, members);
         return Fail(diagnostic, missing ? LAIUE_MODULE_DEPENDENCY_MISSING
                                         : LAIUE_MODULE_DEPENDENCY_CYCLE,
                     missing ? "a module dependency is missing"
                             : "module dependencies contain a cycle");
     }
-    End(host);
-    return partial ? Fail(diagnostic, LAIUE_MODULE_PARTIAL,
-                          "profile disabled an optional module")
+    Commit(host);
+    if (outLoaded != NULL)
+        *outLoaded = members;
+    return partial ? Fail(diagnostic, LAIUE_MODULE_PARTIAL, "profile disabled an optional module")
                    : LAIUE_MODULE_OK;
 }
 
-LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host,
-                                      const LaiueModuleBinaryV1 *binaries, uint32_t count,
-                                      LaiueModuleDiagnostic *diagnostic)
-{
-    return LoadInternal(host, binaries, count, diagnostic, false, NULL);
-}
-
-LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
-                                               const LaiueModuleProfileV1 *profile,
-                                               LaiueModuleLoadReportV1 *report,
-                                               LaiueModuleDiagnostic *diagnostic)
+LaiueModuleStatus LaiueModuleHostLoad(LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries,
+                                      uint32_t count, LaiueModuleDiagnostic *diagnostic)
 {
     DiagnosticClear(diagnostic);
-    if (host == NULL || profile == NULL ||
-        profile->structSize < offsetof(LaiueModuleProfileV1, reserved) ||
-        profile->binaries == NULL || profile->binaryCount == 0u ||
-        profile->binaryCount > LAIUE_MODULE_HOST_MAX_MODULES)
+    if (host == NULL || binaries == NULL || count == 0u || count > LAIUE_MODULE_HOST_MAX_MODULES)
         return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
                     "module paths and count are required");
+    if (!Begin(host))
+        return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
+    const LaiueModuleStatus status =
+        LoadModules(host, binaries, count, diagnostic, false, NULL, NULL);
+    End(host);
+    return status;
+}
+
+/* Plans and loads a profile next to the modules already running. The caller
+ * has begun a lifecycle operation and owns the scratch arrays. */
+static LaiueModuleStatus ProfileLoad(LaiueModuleHost *host, const LaiueModuleProfileV1 *profile,
+                                     LaiueModuleLoadReportV1 *report,
+                                     LaiueModuleDiagnostic *diagnostic,
+                                     ProfileCandidate *candidates, LaiueModuleBinaryV1 *selected,
+                                     bool *planned)
+{
     const LaiueModuleBinaryV1 *binaries = profile->binaries;
     const uint32_t count = profile->binaryCount;
-    const uint32_t profileFlags = profile->flags;
-    const bool allowPartial =
-        (profileFlags & LAIUE_MODULE_PROFILE_ALLOW_PARTIAL) != 0u;
-    if (profile->providerSelectionCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
-        (profile->providerSelectionCount != 0u && profile->providerSelections == NULL))
-        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                    "provider selection storage is invalid");
-    for (uint32_t index = 0u; index < profile->providerSelectionCount; ++index)
-    {
-        const LaiueModuleProviderSelectionV1 *selection =
-            &profile->providerSelections[index];
-        if (selection->structSize < offsetof(LaiueModuleProviderSelectionV1, reserved) ||
-            !SafeName(selection->serviceName) || !SafeName(selection->moduleId))
-            return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                        "provider selection is invalid");
-        for (uint32_t prior = 0u; prior < index; ++prior)
-            if (LaiueModAsciiEquals(profile->providerSelections[prior].serviceName,
-                                    selection->serviceName))
-                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                            "provider selection is duplicated");
-    }
-    if (report != NULL &&
-        (report->structSize < sizeof(*report) || report->capacity < count ||
-         report->entries == NULL))
-        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
-                    "profile report storage is invalid");
-    if (report != NULL)
-        report->flags = profileFlags;
-    PlatformRwLockAcquireShared(&host->lock);
-    const bool lifecycleBusy = host->lifecycleBusy;
-    const bool modulesAlreadyLoaded = host->loadedCount != 0u;
-    PlatformRwLockReleaseShared(&host->lock);
-    if (lifecycleBusy || modulesAlreadyLoaded)
-        return Fail(diagnostic, LAIUE_MODULE_BUSY,
-                    "module lifecycle is active or modules are already loaded");
-    if (!allowPartial && profile->providerSelectionCount == 0u)
-    {
-        const LaiueModuleStatus status = LaiueModuleHostLoad(host, binaries, count, diagnostic);
-        if (report != NULL)
-        {
-            report->flags = profileFlags;
-            report->count = 0u;
-            report->loadedCount = status == LAIUE_MODULE_OK
-                                      ? LaiueModuleHostLoadedCount(host)
-                                      : 0u;
-            report->skippedCount = 0u;
-        }
-        return status;
-    }
-
-    ProfileCandidate *candidates = (ProfileCandidate *)PlatformAllocate(
-        sizeof(*candidates) * LAIUE_MODULE_HOST_MAX_MODULES, true);
-    LaiueModuleBinaryV1 *selected = (LaiueModuleBinaryV1 *)PlatformAllocate(
-        sizeof(*selected) * LAIUE_MODULE_HOST_MAX_MODULES, true);
-    bool *planned = (bool *)PlatformAllocate(
-        sizeof(*planned) * LAIUE_MODULE_HOST_MAX_MODULES, true);
-    if (candidates == NULL || selected == NULL || planned == NULL)
-    {
-        PlatformFree(candidates);
-        PlatformFree(selected);
-        PlatformFree(planned);
-        return Fail(diagnostic, LAIUE_MODULE_OUT_OF_MEMORY,
-                    "profile scratch allocation failed");
-    }
-    memset(candidates, 0, sizeof(*candidates) * LAIUE_MODULE_HOST_MAX_MODULES);
-    memset(planned, 0, sizeof(*planned) * LAIUE_MODULE_HOST_MAX_MODULES);
+    const bool allowPartial = (profile->flags & LAIUE_MODULE_PROFILE_ALLOW_PARTIAL) != 0u;
     for (uint32_t index = 0u; index < count; ++index)
         (void)ProfileProbeBinary(&binaries[index], &candidates[index]);
 
@@ -1422,6 +1564,11 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         ProfileCandidate *candidate = &candidates[index];
         if (!candidate->active)
             continue;
+        if (FindModule(host, candidate->id) < LAIUE_MODULE_HOST_MAX_MODULES)
+        {
+            ProfileSetFailure(candidate, LAIUE_MODULE_DUPLICATE_ID, "module is already loaded");
+            continue;
+        }
         const LaiueModuleDescriptorV1 *descriptor = &candidate->api->descriptor;
         for (uint32_t provided = 0u; provided < descriptor->providesCount; ++provided)
         {
@@ -1429,7 +1576,7 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
             if (ProfileHostProvides(host, name))
             {
                 ProfileSetFailure(candidate, LAIUE_MODULE_DUPLICATE_SERVICE,
-                                  "service conflicts with host provider");
+                                  "service is already provided");
                 break;
             }
         }
@@ -1482,10 +1629,6 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
     if (invalidProviderSelection)
     {
         ProfileFillReport(report, candidates, count, 0u);
-        ProfileCloseProbes(candidates, count);
-        PlatformFree(candidates);
-        PlatformFree(selected);
-        PlatformFree(planned);
         return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
                     "provider selection does not match the profile");
     }
@@ -1594,6 +1737,19 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
                                              : "a module dependency is missing");
         }
 
+    /* A strict profile fails before any module code runs when an entry it
+     * needs cannot load. An absent optional artifact and a provider the
+     * profile disabled on purpose are not such entries. */
+    if (!allowPartial)
+        for (uint32_t index = 0u; index < count; ++index)
+            if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u &&
+                candidates[index].status != LAIUE_MODULE_OK &&
+                candidates[index].status != LAIUE_MODULE_DUPLICATE_SERVICE)
+            {
+                ProfileFillReport(report, candidates, count, 0u);
+                return Fail(diagnostic, candidates[index].status, candidates[index].message);
+            }
+
     uint32_t selectedCount = 0u;
     uint32_t selectedCandidates[LAIUE_MODULE_HOST_MAX_MODULES];
     for (uint32_t index = 0u; index < count; ++index)
@@ -1604,30 +1760,14 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
         }
     if (selectedCount == 0u)
     {
-        LaiueModuleStatus noStartStatus = LAIUE_MODULE_PARTIAL;
-        char noStartMessage[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
-        ProfileCopyMessage(noStartMessage, "profile has no startable modules");
-        if (!allowPartial)
-            for (uint32_t index = 0u; index < count; ++index)
-                if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u &&
-                    candidates[index].status != LAIUE_MODULE_OK &&
-                    candidates[index].status != LAIUE_MODULE_DUPLICATE_SERVICE)
-                {
-                    noStartStatus = candidates[index].status;
-                    ProfileCopyMessage(noStartMessage, candidates[index].message);
-                    break;
-                }
         ProfileFillReport(report, candidates, count, 0u);
-        ProfileCloseProbes(candidates, count);
-        PlatformFree(candidates);
-        PlatformFree(selected);
-        PlatformFree(planned);
-        return Fail(diagnostic, noStartStatus, noStartMessage);
+        return Fail(diagnostic, LAIUE_MODULE_PARTIAL, "profile has no startable modules");
     }
 
     uint8_t failureKinds[LAIUE_MODULE_HOST_MAX_MODULES];
-    LaiueModuleStatus status = LoadInternal(host, selected, selectedCount, diagnostic,
-                                             allowPartial, failureKinds);
+    uint64_t loaded = 0u;
+    const LaiueModuleStatus status =
+        LoadModules(host, selected, selectedCount, diagnostic, allowPartial, failureKinds, &loaded);
     if (status != LAIUE_MODULE_OK && status != LAIUE_MODULE_PARTIAL)
     {
         const char *message = diagnostic != NULL ? diagnostic->message
@@ -1636,22 +1776,18 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
             if (planned[index])
                 ProfileSetFailure(&candidates[index], status, message);
         ProfileFillReport(report, candidates, count, 0u);
-        ProfileCloseProbes(candidates, count);
-        PlatformFree(candidates);
-        PlatformFree(selected);
-        PlatformFree(planned);
         return status;
     }
     if (status == LAIUE_MODULE_PARTIAL)
     {
-        /* LoadInternal removes only the optional module that failed and any
+        /* LoadModules removes only the optional module that failed and any
          * optional modules left without a runnable dependency. The successful
          * branch is already running; do not replay create/start for it. */
         for (uint32_t selectedIndex = 0u; selectedIndex < selectedCount; ++selectedIndex)
         {
             const uint32_t candidateIndex = selectedCandidates[selectedIndex];
             ProfileCandidate *candidate = &candidates[candidateIndex];
-            if (LaiueModuleHostIsLoaded(host, candidate->id))
+            if (FindModule(host, candidate->id) < LAIUE_MODULE_HOST_MAX_MODULES)
             {
                 candidate->status = LAIUE_MODULE_OK;
                 candidate->flags = LAIUE_MODULE_PROFILE_ENTRY_LOADED;
@@ -1667,13 +1803,8 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
                 ProfileSetFailure(candidate, LAIUE_MODULE_DEPENDENCY_MISSING,
                                   "optional module was not started");
         }
-        ProfileFillReport(report, candidates, count, LaiueModuleHostLoadedCount(host));
-        ProfileCloseProbes(candidates, count);
-        PlatformFree(candidates);
-        PlatformFree(selected);
-        PlatformFree(planned);
-        return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
-                    "profile disabled an optional module");
+        ProfileFillReport(report, candidates, count, SetSize(loaded));
+        return Fail(diagnostic, LAIUE_MODULE_PARTIAL, "profile disabled an optional module");
     }
     for (uint32_t index = 0u; index < count; ++index)
         if (planned[index])
@@ -1682,33 +1813,88 @@ LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
             candidates[index].flags = LAIUE_MODULE_PROFILE_ENTRY_LOADED;
             candidates[index].message[0] = '\0';
         }
-    ProfileFillReport(report, candidates, count, LaiueModuleHostLoadedCount(host));
-    ProfileCloseProbes(candidates, count);
-    for (uint32_t index = 0u; index < count; ++index)
-        if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u)
-        {
-            if (!allowPartial &&
-                (candidates[index].status == LAIUE_MODULE_OK ||
-                 candidates[index].status == LAIUE_MODULE_DUPLICATE_SERVICE))
-                continue;
-            const LaiueModuleStatus disabledStatus = candidates[index].status;
-            const bool partialResult = allowPartial;
-            char disabledMessage[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
-            ProfileCopyMessage(disabledMessage, candidates[index].message);
-            if (!partialResult)
-                LaiueModuleHostUnloadAll(host);
-            PlatformFree(candidates);
-            PlatformFree(selected);
-            PlatformFree(planned);
-            return Fail(diagnostic, partialResult ? LAIUE_MODULE_PARTIAL
-                                                   : disabledStatus,
-                        partialResult ? "profile loaded with disabled modules"
-                                      : disabledMessage);
-        }
-    PlatformFree(candidates);
-    PlatformFree(selected);
-    PlatformFree(planned);
+    ProfileFillReport(report, candidates, count, SetSize(loaded));
+    if (allowPartial)
+        for (uint32_t index = 0u; index < count; ++index)
+            if ((candidates[index].flags & LAIUE_MODULE_PROFILE_ENTRY_SKIPPED) != 0u)
+                return Fail(diagnostic, LAIUE_MODULE_PARTIAL,
+                            "profile loaded with disabled modules");
     return LAIUE_MODULE_OK;
+}
+
+LaiueModuleStatus LaiueModuleHostLoadProfileV1(LaiueModuleHost *host,
+                                               const LaiueModuleProfileV1 *profile,
+                                               LaiueModuleLoadReportV1 *report,
+                                               LaiueModuleDiagnostic *diagnostic)
+{
+    DiagnosticClear(diagnostic);
+    if (host == NULL || profile == NULL ||
+        profile->structSize < offsetof(LaiueModuleProfileV1, reserved) ||
+        profile->binaries == NULL || profile->binaryCount == 0u ||
+        profile->binaryCount > LAIUE_MODULE_HOST_MAX_MODULES)
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                    "module paths and count are required");
+    const uint32_t count = profile->binaryCount;
+    if (profile->providerSelectionCount > LAIUE_MODULE_HOST_MAX_SERVICES ||
+        (profile->providerSelectionCount != 0u && profile->providerSelections == NULL))
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                    "provider selection storage is invalid");
+    for (uint32_t index = 0u; index < profile->providerSelectionCount; ++index)
+    {
+        const LaiueModuleProviderSelectionV1 *selection = &profile->providerSelections[index];
+        if (selection->structSize < offsetof(LaiueModuleProviderSelectionV1, reserved) ||
+            !SafeName(selection->serviceName) || !SafeName(selection->moduleId))
+            return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "provider selection is invalid");
+        for (uint32_t prior = 0u; prior < index; ++prior)
+            if (LaiueModAsciiEquals(profile->providerSelections[prior].serviceName,
+                                    selection->serviceName))
+                return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                            "provider selection is duplicated");
+    }
+    if (report != NULL && (report->structSize < sizeof(*report) || report->capacity < count ||
+                           report->entries == NULL))
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT, "profile report storage is invalid");
+    if (report != NULL)
+        report->flags = profile->flags;
+    if (!Begin(host))
+        return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
+    LaiueModuleStatus status = LAIUE_MODULE_OK;
+    if ((profile->flags & LAIUE_MODULE_PROFILE_ALLOW_PARTIAL) == 0u &&
+        profile->providerSelectionCount == 0u)
+    {
+        uint64_t loaded = 0u;
+        status = LoadModules(host, profile->binaries, count, diagnostic, false, NULL, &loaded);
+        if (report != NULL)
+        {
+            report->count = 0u;
+            report->loadedCount = SetSize(loaded);
+            report->skippedCount = 0u;
+        }
+    }
+    else
+    {
+        ProfileCandidate *candidates = (ProfileCandidate *)PlatformAllocate(
+            sizeof(*candidates) * LAIUE_MODULE_HOST_MAX_MODULES, true);
+        LaiueModuleBinaryV1 *selected = (LaiueModuleBinaryV1 *)PlatformAllocate(
+            sizeof(*selected) * LAIUE_MODULE_HOST_MAX_MODULES, true);
+        bool *planned =
+            (bool *)PlatformAllocate(sizeof(*planned) * LAIUE_MODULE_HOST_MAX_MODULES, true);
+        if (candidates == NULL || selected == NULL || planned == NULL)
+            status =
+                Fail(diagnostic, LAIUE_MODULE_OUT_OF_MEMORY, "profile scratch allocation failed");
+        else
+        {
+            memset(candidates, 0, sizeof(*candidates) * LAIUE_MODULE_HOST_MAX_MODULES);
+            memset(planned, 0, sizeof(*planned) * LAIUE_MODULE_HOST_MAX_MODULES);
+            status = ProfileLoad(host, profile, report, diagnostic, candidates, selected, planned);
+            ProfileCloseProbes(candidates, count);
+        }
+        PlatformFree(candidates);
+        PlatformFree(selected);
+        PlatformFree(planned);
+    }
+    End(host);
+    return status;
 }
 
 LaiueModuleStatus LaiueModuleHostLoadProfile(LaiueModuleHost *host,
@@ -1751,48 +1937,92 @@ void LaiueModuleHostUnloadAll(LaiueModuleHost *host)
 {
     if (host == NULL || !Begin(host))
         return;
-    for (uint32_t reverse = LAIUE_MODULE_HOST_MAX_MODULES; reverse > 0u; --reverse)
-    {
-        uint32_t order = reverse - 1u;
-        for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
-        {
-            LoadedModule *module = &host->modules[index];
-            if (!module->used || !module->started || module->startOrder != order)
-                continue;
-            if (module->api->stop != NULL)
-                module->api->stop(module->context);
-            SetModuleStarted(host, module, false);
-            RemoveOwnedServices(host, index);
-        }
-    }
-    for (uint32_t reverse = LAIUE_MODULE_HOST_MAX_MODULES; reverse > 0u; --reverse)
-    {
-        uint32_t order = reverse - 1u;
-        for (uint32_t index = 0u; index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
-        {
-            LoadedModule *module = &host->modules[index];
-            if (!module->used || !module->created || module->createOrder != order)
-                continue;
-            if (module->api->destroy != NULL)
-                module->api->destroy(module->context);
-            module->created = false;
-        }
-    }
-    for (uint32_t reverse = LAIUE_MODULE_HOST_MAX_MODULES; reverse > 0u; --reverse)
-    {
-        uint32_t index = reverse - 1u;
-        LoadedModule *module = &host->modules[index];
-        if (module->used)
-        {
-            RemoveOwnedServices(host, index);
-            PlatformDynamicLibraryClose(module->library);
-            memset(module, 0, sizeof(*module));
-        }
-    }
-    PlatformRwLockAcquireExclusive(&host->lock);
-    host->loadedCount = 0u;
-    PlatformRwLockReleaseExclusive(&host->lock);
+    uint64_t members = 0u;
+    for (uint32_t slot = 0u; slot < LAIUE_MODULE_HOST_MAX_MODULES; ++slot)
+        if (host->modules[slot].used)
+            members |= SlotBit(slot);
+    UnwindModules(host, members);
     End(host);
+}
+
+LaiueModuleStatus LaiueModuleHostUnloadV1(LaiueModuleHost *host, const char *id, uint32_t flags,
+                                          LaiueModuleDiagnostic *diagnostic)
+{
+    DiagnosticClear(diagnostic);
+    if (host == NULL || !SafeName(id) || (flags & ~LAIUE_MODULE_UNLOAD_DEPENDENTS) != 0u)
+        return Fail(diagnostic, LAIUE_MODULE_INVALID_ARGUMENT,
+                    "module id and known unload flags are required");
+    if (!Begin(host))
+        return Fail(diagnostic, LAIUE_MODULE_BUSY, "module lifecycle is active");
+    const uint32_t slot = FindModule(host, id);
+    if (slot == LAIUE_MODULE_HOST_MAX_MODULES)
+    {
+        End(host);
+        return Fail(diagnostic, LAIUE_MODULE_NOT_LOADED, "module is not loaded");
+    }
+    /* The set is taken and marked under one lock, so no module outside it
+     * can obtain a table of a member in between. */
+    uint64_t users[LAIUE_MODULE_HOST_MAX_MODULES];
+    PlatformRwLockAcquireExclusive(&host->lock);
+    CollectUsers(host, users);
+    const uint64_t members = WithUsers(users, SlotBit(slot));
+    const bool refused = members != SlotBit(slot) && (flags & LAIUE_MODULE_UNLOAD_DEPENDENTS) == 0u;
+    for (uint32_t member = 0u; !refused && member < LAIUE_MODULE_HOST_MAX_MODULES; ++member)
+        if ((members & SlotBit(member)) != 0u)
+            host->modules[member].unloading = true;
+    PlatformRwLockReleaseExclusive(&host->lock);
+    LaiueModuleStatus status = LAIUE_MODULE_OK;
+    if (refused)
+    {
+        const uint32_t user = FirstSlot(users[slot]);
+        status = FailNamed(diagnostic, LAIUE_MODULE_IN_USE, "module is in use by ",
+                           user < LAIUE_MODULE_HOST_MAX_MODULES ? host->modules[user].id
+                                                                : "another module");
+    }
+    else
+        UnwindModules(host, members);
+    End(host);
+    return status;
+}
+
+LaiueModuleStatus LaiueModuleHostListDependentsV1(const LaiueModuleHost *host, const char *id,
+                                                  LaiueModuleIdV1 *output, uint32_t capacity,
+                                                  uint32_t *outCount)
+{
+    if (outCount != NULL)
+        *outCount = 0u;
+    if (host == NULL || !SafeName(id) || outCount == NULL || (output == NULL && capacity != 0u))
+        return LAIUE_MODULE_INVALID_ARGUMENT;
+    LaiueModuleHost *mutableHost = (LaiueModuleHost *)host;
+    LaiueModuleStatus status = LAIUE_MODULE_OK;
+    uint32_t count = 0u;
+    PlatformRwLockAcquireShared(&mutableHost->lock);
+    const uint32_t slot =
+        host->lifecycleBusy ? LAIUE_MODULE_HOST_MAX_MODULES : FindModule(host, id);
+    if (host->lifecycleBusy)
+        status = LAIUE_MODULE_BUSY;
+    else if (slot == LAIUE_MODULE_HOST_MAX_MODULES)
+        status = LAIUE_MODULE_NOT_LOADED;
+    else
+    {
+        uint64_t users[LAIUE_MODULE_HOST_MAX_MODULES];
+        uint32_t order[LAIUE_MODULE_HOST_MAX_MODULES];
+        CollectUsers(host, users);
+        const uint32_t orderCount = UnwindOrder(host, WithUsers(users, SlotBit(slot)), order);
+        for (uint32_t index = 0u; index < orderCount; ++index)
+        {
+            if (order[index] == slot)
+                continue;
+            if (count < capacity)
+                memcpy(output[count].id, host->modules[order[index]].id, LAIUE_MODULE_MAX_NAME);
+            ++count;
+        }
+        if (count > capacity)
+            status = LAIUE_MODULE_CAPACITY;
+    }
+    PlatformRwLockReleaseShared(&mutableHost->lock);
+    *outCount = count;
+    return status;
 }
 
 uint32_t LaiueModuleHostLoadedCount(const LaiueModuleHost *host)
@@ -1812,14 +2042,8 @@ uint32_t LaiueModuleHostIsLoaded(const LaiueModuleHost *host, const char *id)
         return 0u;
     LaiueModuleHost *mutableHost = (LaiueModuleHost *)host;
     PlatformRwLockAcquireShared(&mutableHost->lock);
-    uint32_t result = 0u;
-    for (uint32_t index = 0u; !host->lifecycleBusy &&
-                                index < LAIUE_MODULE_HOST_MAX_MODULES; ++index)
-        if (host->modules[index].used && LaiueModAsciiEquals(host->modules[index].id, id))
-        {
-            result = 1u;
-            break;
-        }
+    const bool loaded =
+        !host->lifecycleBusy && FindModule(host, id) < LAIUE_MODULE_HOST_MAX_MODULES;
     PlatformRwLockReleaseShared(&mutableHost->lock);
-    return result;
+    return loaded ? 1u : 0u;
 }
