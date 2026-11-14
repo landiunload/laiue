@@ -18,11 +18,13 @@ API and ABI may change between minor versions.
   server keys and shared secrets, and ChaCha20-Poly1305 on every packet. Up to
   64 channels carry reliable ordered, unreliable and sequenced messages, with
   QUIC-style loss recovery, reordering thresholds that adapt to the path,
-  CUBIC with HyStart++ and pacing, datagram size discovery, address migration
-  and hard memory limits. A UDP driver covers IPv4 and IPv6 and keeps the
-  system from fragmenting its datagrams, and a deterministic simulator drives
-  network tests. External platform adapters opt
-  into sockets with `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in
+  paced congestion control by CUBIC with HyStart++ or by BBRv3, datagram size
+  discovery, address migration and hard memory limits. Acknowledgements to a
+  BBR sender carry the receiver's arrival clock, so BBR measures the path
+  rather than the update rate of either side. A UDP driver covers IPv4 and
+  IPv6 and keeps the system from fragmenting its datagrams, and a
+  deterministic simulator drives network tests. External platform adapters
+  opt into sockets with `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in
   `docs/net.md`.
 - The Android walk check no longer fails on its own timing. It compares a picture
   after a turn only once the screen has come to rest, and it answers the system's

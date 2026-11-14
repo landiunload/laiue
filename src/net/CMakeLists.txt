@@ -19,6 +19,8 @@ laiue_add_module(net
         net_address.c
         net_channel.c
         net_congestion.c
+        net_rate.c
+        net_bbr.c
         net_pmtu.c
         net_packet.c
         net_handshake.c

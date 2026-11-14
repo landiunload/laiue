@@ -54,8 +54,8 @@ laiue_add_fuzzer(module_manifest module_manifest_fuzz.c laiue_bootstrap
 # Поэтому исходники транспорта компилируются в сам фаззер.
 if(TARGET laiue_net)
     laiue_add_fuzzer(net net_fuzz.c laiue::platform_support)
-    foreach(source net_crypto net_wire net_address net_channel net_congestion net_pmtu
-            net_packet net_handshake net_endpoint)
+    foreach(source net_crypto net_wire net_address net_channel net_congestion net_rate net_bbr
+            net_pmtu net_packet net_handshake net_endpoint)
         target_sources(laiue_fuzz_net PRIVATE "${PROJECT_SOURCE_DIR}/src/net/${source}.c")
     endforeach()
     target_compile_definitions(laiue_fuzz_net PRIVATE LAIUE_STATIC=1)

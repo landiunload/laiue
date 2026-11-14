@@ -475,6 +475,8 @@ static void RunFrames(FuzzInput *input)
         desc.eventBacklogBytes = 4096u;
     }
     desc.maxDatagramBytes = (config & 0x10u) != 0u ? NET_DATAGRAM_MINIMUM : 0u;
+    /* Подтверждения и потери ведут модель пути BBR, а не окно CUBIC. */
+    desc.congestionControl = (config & 0x20u) != 0u ? LAIUE_NET_CONGESTION_BBR : 0u;
     if (!PortOpen(server, &desc))
         return;
     uint64_t now = FUZZ_START;

@@ -496,7 +496,10 @@ static bool ResolveLimits(const LaiueNetEndpointDesc *desc, LaiueNetEndpoint *en
     endpoint->eventBacklogBytes =
         desc->eventBacklogBytes != 0u ? desc->eventBacklogBytes : DEFAULT_EVENT_BACKLOG_BYTES;
     endpoint->handshakeTimeout = (uint64_t)handshake * NET_MILLISECOND;
-    if (endpoint->maxPeers > PEERS_LIMIT || endpoint->local.channelCount > LAIUE_NET_MAX_CHANNELS ||
+    endpoint->modelBased = desc->congestionControl == LAIUE_NET_CONGESTION_BBR;
+    endpoint->local.ackClock = endpoint->modelBased;
+    if (desc->congestionControl > LAIUE_NET_CONGESTION_BBR || endpoint->maxPeers > PEERS_LIMIT ||
+        endpoint->local.channelCount > LAIUE_NET_MAX_CHANNELS ||
         endpoint->local.datagramBytes < NET_DATAGRAM_MINIMUM ||
         endpoint->local.datagramBytes > NET_DATAGRAM_MAXIMUM ||
         endpoint->local.maxMessageBytes > NET_MESSAGE_LIMIT ||
@@ -684,6 +687,10 @@ static void ReceiveDatagrams(LaiueNetEndpoint *endpoint)
             endpoint->driver.context, &from, endpoint->receiveBuffer, RECEIVE_CAPACITY);
         if (received < 0)
             endpoint->driverBroken = true;
+        /* Сеть прочитана до конца: всё, что будет прочитано позже, пришло
+         * после этого, а пакеты этого чтения — после прошлого такого. */
+        if (received == 0)
+            endpoint->drainedTime = endpoint->now;
         if (received <= 0)
             return;
         const uint32_t size = (uint32_t)received;
@@ -776,7 +783,7 @@ LaiueNetStatus LaiueNetPeerGetInfo(const LaiueNetEndpoint *endpoint, LaiueNetPee
         outInfo->roundTripMicroseconds = Saturate32(peer->smoothedRtt);
         outInfo->roundTripVarianceMicroseconds = Saturate32(peer->rttVariance);
     }
-    outInfo->congestionWindowBytes = Saturate32(peer->congestion.window);
+    outInfo->congestionWindowBytes = Saturate32(NetPeerWindow(peer));
     outInfo->bytesInFlight = Saturate32(peer->bytesInFlight);
     outInfo->queuedReliableBytes = Saturate32(peer->queuedReliable);
     outInfo->queuedUnreliableBytes = NetPeerQueuedUnreliable(peer);
