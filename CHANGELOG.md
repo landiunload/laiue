@@ -5,6 +5,12 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The physics determinism test no longer crashes when MSVC 19.52.37025 builds
+  it for ARM64. The compiler stored part of the zero-fill from
+  `*simulation = (Simulation){0}` after the member stores that followed it and
+  erased the world's provider context. The test now builds its state in one
+  designated initializer; a disassembly scan of the whole ARM64 build found the
+  same mistake nowhere else.
 - A crashing test now says why instead of leaving a bare "SegFault" in the log.
   Every test and benchmark prints the exception code or signal, the faulting
   address and the call stack, then ends exactly as before, so CTest reports the
