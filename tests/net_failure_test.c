@@ -7,7 +7,8 @@
  * повторяется, и в каждом прогоне отказывает очередное выделение: одно
  * (отказ временный) или все начиная с него (память кончилась). Ни один
  * отказ не роняет процесс и не теряет память, а соединение либо доставляет
- * всё по порядку, либо закрывается с понятной причиной. */
+ * всё по порядку, либо закрывается с понятной причиной. Серия идёт и с
+ * CUBIC, и с BBR: соединению BBR память нужна и под модель пути. */
 
 #include "net/net.h"
 #include "platform/system.h"
@@ -194,8 +195,9 @@ static bool Delivered(const Side *receiver)
     return true;
 }
 
-/* Один прогон. true — отказ так и не наступил: сценарий выделяет меньше. */
-static bool RunScenario(uint32_t failAt, bool persistent)
+/* Один прогон с управлением перегрузкой control. true — отказ так и не
+ * наступил: сценарий выделяет меньше. */
+static bool RunScenario(uint32_t control, uint32_t failAt, bool persistent)
 {
     LaiueNetSimulator *simulator = NULL;
     const LaiueNetSimulatorDesc simulatorDesc = {.structSize = sizeof(simulatorDesc), .seed = 3u};
@@ -228,6 +230,7 @@ static bool RunScenario(uint32_t failAt, bool persistent)
             .receiveWindowBytes = 16384u,
             .random = TestRandom,
             .randomContext = &side->randomState,
+            .congestionControl = control,
         };
         side->randomState = UINT64_C(0x9E3779B97F4A7C15) * (index + 1u);
         Expect(LaiueNetAddressParse(index == 0u ? "10.0.0.1:4000" : "10.0.0.2:5000",
@@ -299,21 +302,25 @@ static bool RunScenario(uint32_t failAt, bool persistent)
 
 LAIUE_TEST_ENTRY(NetFailureTestEntryPoint)
 {
-    /* Без отказов сценарий доставляет всё и закрывается обычным порядком. */
-    Expect(RunScenario(0u, false), "the scenario runs without failures");
-    uint32_t transient = 0u;
-    bool completed = false;
-    for (uint32_t failAt = 1u; failAt <= FAILURE_LIMIT && !completed; ++failAt)
+    for (uint32_t control = LAIUE_NET_CONGESTION_CUBIC; control <= LAIUE_NET_CONGESTION_BBR;
+         ++control)
     {
-        completed = RunScenario(failAt, false);
-        if (!completed)
-            ++transient;
+        /* Без отказов сценарий доставляет всё и закрывается обычным порядком. */
+        Expect(RunScenario(control, 0u, false), "the scenario runs without failures");
+        uint32_t transient = 0u;
+        bool completed = false;
+        for (uint32_t failAt = 1u; failAt <= FAILURE_LIMIT && !completed; ++failAt)
+        {
+            completed = RunScenario(control, failAt, false);
+            if (!completed)
+                ++transient;
+        }
+        Expect(completed, "the scenario allocates a bounded number of times");
+        Expect(transient > 20u, "the scenario allocates, so failures were injected");
+        /* Память кончилась насовсем: конечные точки живут дальше и всё отдают. */
+        for (uint32_t failAt = 1u; failAt <= transient; failAt += 1u + failAt / 8u)
+            (void)RunScenario(control, failAt, true);
     }
-    Expect(completed, "the scenario allocates a bounded number of times");
-    Expect(transient > 20u, "the scenario allocates, so failures were injected");
-    /* Память кончилась насовсем: конечные точки живут дальше и всё отдают. */
-    for (uint32_t failAt = 1u; failAt <= transient; failAt += 1u + failAt / 8u)
-        (void)RunScenario(failAt, true);
     LaiueTestRuntimeWrite("net failure: passed\n");
     LAIUE_TEST_SUCCESS();
 }

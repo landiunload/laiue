@@ -52,7 +52,7 @@ void NetParametersWrite(const NetParameters *parameters, uint8_t output[NET_PARA
 {
     NetStore16(output, parameters->datagramBytes);
     output[2] = (uint8_t)parameters->channelCount;
-    output[3] = 0u;
+    output[3] = parameters->ackClock ? NET_PARAMETERS_ACK_CLOCK : 0u;
     NetStore32(output + 4, parameters->maxMessageBytes);
     NetStore32(output + 8, parameters->windowBytes);
     NetStore32(output + 12, parameters->idleMilliseconds);
@@ -62,6 +62,7 @@ bool NetParametersRead(const uint8_t input[NET_PARAMETERS_SIZE], NetParameters *
 {
     outParameters->datagramBytes = NetLoad16(input);
     outParameters->channelCount = input[2];
+    outParameters->ackClock = (input[3] & NET_PARAMETERS_ACK_CLOCK) != 0u;
     outParameters->maxMessageBytes = NetLoad32(input + 4);
     outParameters->windowBytes = NetLoad32(input + 8);
     outParameters->idleMilliseconds = NetLoad32(input + 12);

@@ -55,6 +55,9 @@
 #define NET_HELLO_PRESHARED 0x02u
 #define NET_HELLO_FIXED_SIZE 68u
 #define NET_PARAMETERS_SIZE 16u
+/* Флаг параметров: сторона просит часы получателя в кадрах ACK — ими мерит
+ * путь её BBR. Незнакомые флаги не мешают. */
+#define NET_PARAMETERS_ACK_CLOCK 0x01u
 #define NET_COOKIE_SIZE 17u
 #define NET_RETRY_SIZE 28u
 #define NET_ACCEPT_HEADER_SIZE 51u
@@ -70,7 +73,10 @@
  *   CLOSE      0x03 | u8 вид | код
  *   STREAM     0x04 | u8 канал | смещение | длина | байты
  *   DATAGRAM   0x05 | u8 канал | длина | байты
- *   SEQUENCED  0x06 | u8 канал | номер | длина | байты */
+ *   SEQUENCED  0x06 | u8 канал | номер | длина | байты
+ *   ACK_CLOCK  0x07 | наибольший | задержка, мкс | часы получателя |
+ *              их погрешность | число отрезков | первый | пары — ACK для
+ *              собеседника, попросившего часы получателя */
 #define NET_FRAME_PADDING 0x00u
 #define NET_FRAME_PING 0x01u
 #define NET_FRAME_ACK 0x02u
@@ -78,6 +84,7 @@
 #define NET_FRAME_STREAM 0x04u
 #define NET_FRAME_DATAGRAM 0x05u
 #define NET_FRAME_SEQUENCED 0x06u
+#define NET_FRAME_ACK_CLOCK 0x07u
 
 /* Вид закрытия в кадре CLOSE; NONE — собеседника не уведомлять. */
 #define NET_CLOSE_APPLICATION 0u
@@ -144,7 +151,15 @@
 #define NET_DEFERRED_HELLOS 1024u
 #define NET_RETRY_RESENDS 3u
 #define NET_ARENA_CHUNK (UINT32_C(64) * 1024u)
+/* Часы получателя в кадре ACK: младшие 30 бит микросекунд, не больше четырёх
+ * байт. Сколько они прошли с прошлого кадра, отправитель восстанавливает по
+ * ходу своих часов: ходы расходятся лишь на разницу задержек, а не на длину
+ * тишины. Погрешность этих часов в том же кадре больше не бывает. */
+#define NET_ACK_CLOCK_MASK ((UINT64_C(1) << 30u) - 1u)
 #define NET_CONGESTION_WINDOW_LIMIT (UINT64_C(1) << 30u)
+/* Предел темпа отправки в байтах в секунду: наибольшее окно за миллисекунду.
+ * Произведение темпа на десять секунд помещается в 64 бита. */
+#define NET_PACING_RATE_LIMIT (NET_CONGESTION_WINDOW_LIMIT * UINT64_C(1000))
 
 /* ---- Состояние ------------------------------------------------------------------ */
 
@@ -162,6 +177,90 @@ typedef struct NetSentRange
     uint16_t length;
     uint8_t channel;
 } NetSentRange;
+
+/* Замер скорости доставки (net_rate.c): счётчики соединения. */
+typedef struct NetRate
+{
+    /* Байты, подтверждённые за всё соединение, и когда получатель принял
+     * последний из подтверждённых пакетов: по его часам, приведённым к своим.
+     * Время, в которое подтверждение разобрано здесь, известно лишь с
+     * точностью до шага обновления, и отрезки между подтверждениями по нему
+     * шумели бы. */
+    uint64_t delivered;
+    uint64_t deliveredTime;
+    /* Погрешность deliveredTime: пакет пришёл не раньше чем за столько до
+     * него. Получатель тоже читает сеть раз в обновление. */
+    uint64_t deliveredAge;
+    /* Когда это подтверждение разобрано, по своим часам. */
+    uint64_t ackedTime;
+    /* Время отправки пакета, подтверждённого последним, а после тишины —
+     * первого отправленного: от него считается скорость отправки. */
+    uint64_t firstSentTime;
+    /* Байты, объявленные потерянными. */
+    uint64_t lost;
+    /* Отметка в счёте delivered: замеры по пакетам, отправленным до её
+     * подтверждения, ограничены приложением, а не путём. 0 — отметки нет. */
+    uint64_t appLimited;
+    /* Получатель отправил последнее подтверждение, не дочитав сеть: пакеты,
+     * которых в нём нет, могли прийти и раньше deliveredTime, но не раньше
+     * чем за deliveredAge до него. */
+    bool deliveredOpen;
+} NetRate;
+
+/* Снимок счётчиков в момент отправки пакета. */
+typedef struct NetRateStamp
+{
+    uint64_t delivered;
+    uint64_t deliveredTime;
+    uint64_t firstSentTime;
+    uint64_t lost;
+    /* Когда пакет ушёл бы при ровном темпе. Соединение шлёт пачками, раз в
+     * обновление; по настоящему времени вся пачка ушла бы мгновенно, и
+     * скорость отправки, а с ней и замер, вышли бы завышенными. */
+    uint64_t pacedTime;
+    /* Байты в пути сразу после отправки, вместе с самим пакетом. */
+    uint32_t inFlight;
+    /* Погрешность deliveredTime и недочитанная сеть, как в NetRate. */
+    uint32_t deliveredAge;
+    bool deliveredOpen;
+    bool appLimited;
+} NetRateStamp;
+
+/* Замер одним подтверждением: его даёт самый новый из подтверждённых
+ * пакетов. */
+typedef struct NetRateSample
+{
+    /* Часы кадра ACK, приведённые к своим, и их погрешность: когда
+     * получатель принял самый новый из названных пакетов и за сколько до
+     * этого тот мог прийти; ackOpen — сеть он при этом не дочитал. Задаёт
+     * тот, кто разбирает кадр. */
+    uint64_t ackTime;
+    uint64_t ackAge;
+    uint64_t number;
+    uint64_t sentTime;
+    NetRateStamp stamp;
+    /* Байты, подтверждённые этим ACK. */
+    uint64_t acked;
+    /* За interval микросекунд, пока пакет был в пути, доставлено delivered
+     * байт и потеряно lost. */
+    uint64_t delivered;
+    uint64_t lost;
+    uint64_t interval;
+    /* Байты в секунду; 0 — замера скорости нет. rate — скорость доставки, как
+     * её считает черновик; proven — скорость, которую путь заведомо выдал:
+     * она не выше rate. */
+    uint64_t rate;
+    uint64_t proven;
+    /* Наибольшее доставленное за полёт среди всех пакетов этого ACK. Один
+     * ACK подтверждает пачку, и самый новый её пакет ушёл, когда в пути было
+     * меньше всего: по нему одному объём пути вышел бы заниженным. */
+    uint64_t flight;
+    /* Самый большой из пакетов этого ACK: без него считается скорость,
+     * которую путь заведомо выдал. */
+    uint32_t largest;
+    bool ackOpen;
+    bool filled;
+} NetRateSample;
 
 #define NET_RECORD_SENT 1u
 #define NET_RECORD_ACKED 2u
@@ -325,6 +424,173 @@ typedef struct NetCongestionAck
     uint64_t limitedSentTime;
 } NetCongestionAck;
 
+/* Состояния BBR. */
+#define NET_BBR_STARTUP 0u
+#define NET_BBR_DRAIN 1u
+#define NET_BBR_PROBE_DOWN 2u
+#define NET_BBR_PROBE_CRUISE 3u
+#define NET_BBR_PROBE_REFILL 4u
+#define NET_BBR_PROBE_UP 5u
+#define NET_BBR_PROBE_RTT 6u
+
+/* Окно оценки лишних подтверждений: нынешний оборот и столько прошлых. */
+#define NET_BBR_EXTRA_ROUNDS 10u
+
+/* Модель пути и управление BBRv3 (net_bbr.c). Объёмы — байты, время —
+ * микросекунды, скорости — байты в секунду; UINT64_MAX у предела значит, что
+ * предела нет. */
+typedef struct NetBbr
+{
+    /* Итог: окно и темп отправки. Темп 0 — отправку сдерживает одно окно. */
+    uint64_t window;
+    uint64_t pacingRate;
+
+    /* Скорость. maxBw — наибольший замер нынешнего и прошлого циклов проб
+     * полосы, bwShort — предел после потерь нынешнего цикла, bw — меньшее. */
+    uint64_t maxBwSlots[2];
+    uint64_t maxBw;
+    uint64_t bwShort;
+    uint64_t bw;
+    /* Наибольшие скорость и объём доставки за оборот потерь. */
+    uint64_t bwLatest;
+    uint64_t inflightLatest;
+
+    /* Объём. minRtt — наименьший оборот за десять секунд; inflightLong —
+     * объём в пути, при котором проба полосы встретила потери выше порога;
+     * inflightShort — предел после потерь нынешнего цикла. */
+    uint64_t minRtt;
+    uint64_t minRttStamp;
+    uint64_t inflightLong;
+    uint64_t inflightShort;
+
+    /* Подтверждения пачками: сколько доставлено сверх ожидаемого по bw с
+     * начала отрезка и наибольший избыток по оборотам. */
+    uint64_t extraStart;
+    uint64_t extraDelivered;
+    uint64_t extraAcked;
+    uint64_t extraRing[NET_BBR_EXTRA_ROUNDS + 1u];
+
+    /* Обороты считаются пакетами: оборот кончается подтверждением пакета,
+     * отправленного после его начала. delivered повторяет счётчик замера
+     * скорости. */
+    uint64_t delivered;
+    uint64_t nextRoundDelivered;
+    uint64_t roundCount;
+    uint64_t lossRoundDelivered;
+    uint64_t drainStartRound;
+
+    /* Полная полоса: скорость, от которой ждут роста на четверть. */
+    uint64_t fullBw;
+
+    /* Цикл проб полосы: его начало, пауза до следующей пробы и рост
+     * inflightLong — на датаграмму за каждые upAckedPerStep подтверждённых
+     * байт. */
+    uint64_t cycleStamp;
+    uint64_t probeWait;
+    uint64_t upAcked;
+    uint64_t upAckedPerStep;
+
+    /* Замер оборота: когда его можно кончать (0 — объём ещё не упал) и окно
+     * на его время, запомненное по прежнему minRtt. */
+    uint64_t probeRttDone;
+    uint64_t probeRttWindow;
+
+    /* Восстановление после потерь и то, что вернёт отмена мнимых. */
+    uint64_t priorWindow;
+    uint64_t recoveryStart;
+    uint64_t undoBwShort;
+    uint64_t undoInflightShort;
+    uint64_t undoInflightLong;
+
+    uint64_t initialWindow;
+    /* С этого времени путь нынешний: пакеты, отправленные раньше, о нём
+     * ничего не говорят. */
+    uint64_t since;
+    uint64_t random;
+
+    uint32_t datagramBytes;
+    uint32_t pacingGain;
+    uint32_t windowGain;
+    uint32_t fullBwCount;
+    /* Серии потерь и замеры скорости за оборот потерь. */
+    uint32_t lossEvents;
+    uint32_t lossRoundSamples;
+    uint32_t upRounds;
+    uint32_t roundsSinceProbe;
+    /* Кольцо extraRing: нынешний оборот и сколько прошлых в нём годны. */
+    uint32_t extraIndex;
+    uint32_t extraSpan;
+
+    uint8_t state;
+    uint8_t undoState;
+    uint8_t cycle;
+    bool roundStart;
+    bool lossRoundStart;
+    bool lossInRound;
+    bool fullBwNow;
+    bool fullBwReached;
+    /* Потери ещё говорят о последней пробе полосы. */
+    bool checkProbeLoss;
+    /* Проба кончилась, но подтверждения её пакетов ещё идут. */
+    bool probeStopping;
+    /* Прошлая проба встретила потери выше порога; нынешняя из-за этого
+     * прервана у прежнего предела. */
+    bool probeTooHigh;
+    bool probePrecautionary;
+    bool minRttExpired;
+    bool probeRttRoundDone;
+    bool idleRestart;
+    bool inRecovery;
+    /* Окно было занято целиком в нынешнем и в прошлом обороте. */
+    bool windowFilled;
+    bool windowFilledPrior;
+    /* Начальный темп уже посчитан по измеренному обороту. */
+    bool paced;
+} NetBbr;
+
+/* Подтверждение глазами BBR. */
+typedef struct NetBbrAck
+{
+    uint64_t now;
+    /* Счётчик доставленного и байты в пути после этого подтверждения. */
+    uint64_t delivered;
+    uint64_t inFlight;
+    /* Замер скорости самым новым из подтверждённых пакетов: счётчик
+     * доставленного при его отправке, доставлено и потеряно за его полёт,
+     * скорость доставки и скорость, которую путь заведомо выдал (0 — замера
+     * нет), объём в пути сразу после его отправки. */
+    uint64_t priorDelivered;
+    uint64_t sampleDelivered;
+    uint64_t lost;
+    uint64_t rate;
+    uint64_t proven;
+    uint64_t txInFlight;
+    /* Байты, подтверждённые этим ACK. */
+    uint64_t acked;
+    /* Время отправки того же пакета: по нему кончается восстановление. */
+    uint64_t sentTime;
+    /* Замер оборота этим подтверждением и сглаженный оборот; 0 — нет. */
+    uint64_t rttSample;
+    uint64_t smoothedRtt;
+    /* Замер ограничен приложением, а не путём. */
+    bool appLimited;
+} NetBbrAck;
+
+/* Потеря пакета глазами BBR. */
+typedef struct NetBbrLoss
+{
+    uint64_t now;
+    uint64_t sentTime;
+    /* Объём в пути сразу после отправки пакета и потеряно с тех пор, вместе
+     * с ним самим. */
+    uint64_t txInFlight;
+    uint64_t lost;
+    uint32_t size;
+    bool appLimited;
+    /* Пакет, отправленный прямо перед этим, тоже потерян: серия одна. */
+    bool contiguous;
+} NetBbrLoss;
+
 #define NET_STATE_CONNECTING 1u
 #define NET_STATE_HALF_OPEN 2u
 #define NET_STATE_CONNECTED 3u
@@ -338,7 +604,40 @@ typedef struct NetParameters
     uint32_t maxMessageBytes;
     uint32_t windowBytes;
     uint32_t idleMilliseconds;
+    /* Сторона просит часы получателя в кадрах ACK. */
+    bool ackClock;
 } NetParameters;
+
+/* Всё, что нужно одному BBR: модель пути, замер скорости доставки со
+ * снимками для записей отправленных пакетов, часы собеседника из кадров ACK
+ * и ровный темп внутри обновления. Блок выделяется только соединению BBR:
+ * память соединения CUBIC и его записи не больше, чем были бы без BBR, а
+ * от их размера зависит, сколько соединений сервер обходит за такт. */
+typedef struct NetModel
+{
+    NetBbr bbr;
+    NetRate rate;
+    /* Снимок замера при отправке пакета — на том же месте, что его запись в
+     * очереди отправленных, и с той же ёмкостью. */
+    NetRateStamp *stamps;
+    /* Последний кадр ACK, продвинувший часы собеседника: их младшие биты,
+     * время по ним, приведённое к часам этой стороны, и когда кадр разобран
+     * по своим. */
+    uint64_t ackClock;
+    uint64_t ackClockTime;
+    uint64_t ackClockSeen;
+    /* Доля байта, заработанная темпом и ещё не выданная, в миллионных:
+     * частые обновления на медленном пути не теряют её округлением. */
+    uint64_t paceRemainder;
+    /* Ровный темп внутри обновления: за paceElapsed микросекунд заработано
+     * paceEarned байт, из них отправлено paceSpent. paceClock — время, когда
+     * при ровном темпе ушёл бы последний пакет. */
+    uint64_t paceEarned;
+    uint64_t paceSpent;
+    uint64_t paceElapsed;
+    uint64_t paceClock;
+    bool ackClockKnown;
+} NetModel;
 
 /* Поля сгруппированы по назначению, а внутри группы идут от широких к узким:
  * так структура почти не тратит места на выравнивание. */
@@ -399,6 +698,12 @@ typedef struct NetPeer
      * кадр ACK называет его и то, сколько ответ ждал отправки. */
     uint64_t largestEliciting;
     uint64_t largestElicitingTime;
+    /* Когда принят последний по времени пакет, требовавший подтверждения, и
+     * когда сеть до этого была прочитана до конца: между этими моментами он
+     * и пришёл. Ведутся, только если собеседник просил часы получателя:
+     * кадр ACK_CLOCK несёт оба, и по ним его BBR меряет скорость доставки. */
+    uint64_t arrivalTime;
+    uint64_t arrivalFloor;
     uint64_t seenBits[NET_WINDOW_WORDS];
     uint64_t ackBits[NET_WINDOW_WORDS];
     uint64_t ackPendingSince;
@@ -439,8 +744,10 @@ typedef struct NetPeer
     /* С начала прошлого эпизода восстановления была мнимая потеря. */
     bool spuriousSeen;
 
-    /* Управление перегрузкой. */
+    /* Управление перегрузкой: окно CUBIC либо, если конечная точка выбрала
+     * BBR, отдельный блок его модели пути. */
     NetCongestion congestion;
+    NetModel *model;
     uint64_t bytesInFlight;
     int64_t paceBudget;
     uint64_t paceTime;
@@ -519,6 +826,9 @@ struct LaiueNetEndpoint
     LaiueNetRandomFn random;
     void *randomContext;
     uint64_t now;
+    /* Когда сеть в последний раз была прочитана до конца: всё, что прочитано
+     * позже, пришло после этого. */
+    uint64_t drainedTime;
     NetParameters local;
     uint32_t flags;
     uint32_t maxPeers;
@@ -529,6 +839,8 @@ struct LaiueNetEndpoint
     bool hasIdentity;
     bool hasPreshared;
     bool driverBroken;
+    /* Соединения этой конечной точки ведёт BBR. */
+    bool modelBased;
 
     NetSlot *slots;
     uint32_t *active;
@@ -699,6 +1011,79 @@ static inline bool NetCongestionInRecovery(const NetCongestion *congestion, uint
     return congestion->inRecovery && sentTime <= congestion->recoveryStart;
 }
 
+/* value * factor / divisor. Произведение, которому не хватает 64 бит, делится
+ * раньше, чем умножается: теряет точность, а не разряды. */
+static inline uint64_t NetScale(uint64_t value, uint64_t factor, uint64_t divisor)
+{
+    if (factor == 0u)
+        return 0u;
+    if (value <= UINT64_MAX / factor)
+        return value * factor / divisor;
+    const uint64_t quotient = value / divisor;
+    return quotient <= UINT64_MAX / factor ? quotient * factor : UINT64_MAX;
+}
+
+/* net_rate.c */
+/* Пакет в size байт отправлен; inFlight — байты в пути вместе с ним,
+ * pacedTime — когда он ушёл бы при ровном темпе, не позже now. */
+void NetRateSent(NetRate *rate, NetRateStamp *stamp, uint64_t inFlight, uint32_t size,
+                 uint64_t pacedTime, uint64_t now);
+/* Пакет подтверждён: доставленное растёт, а замер берёт снимок самого нового
+ * из пакетов этого ACK. Часы кадра и их погрешность уже стоят в замере. */
+void NetRateAcked(NetRate *rate, NetRateSample *sample, const NetRateStamp *stamp, uint64_t number,
+                  uint64_t sentTime, uint32_t size, uint64_t now);
+/* Все пакеты ACK учтены, потери объявлены: считает замер. minRtt — наименьший
+ * оборот соединения (0 — не измерен); за отрезок короче него скорость не
+ * меряется. */
+void NetRateFinish(NetRate *rate, NetRateSample *sample, uint64_t minRtt);
+/* Слать нечего, хотя окно и темп позволяют: замеры ближайшего оборота
+ * говорят о приложении. inFlight — байты в пути. */
+void NetRateLimited(NetRate *rate, uint64_t inFlight);
+
+/* net_bbr.c */
+/* Начало соединения либо новый путь. seed — зерно случайных пауз между пробами
+ * полосы. */
+void NetBbrReset(NetBbr *bbr, uint32_t datagramBytes, uint64_t window, uint64_t seed, uint64_t now);
+/* Время оборота измерено: до первого замера скорости темп считается по нему. */
+void NetBbrSeed(NetBbr *bbr, uint64_t smoothedRtt);
+/* Перед отправкой пакета в size байт. inFlight — байты в пути до него,
+ * limited — замеры сейчас ограничены приложением. */
+void NetBbrOnSend(NetBbr *bbr, uint64_t inFlight, uint32_t size, bool limited, uint64_t now);
+void NetBbrOnAck(NetBbr *bbr, const NetBbrAck *ack);
+/* true — началось восстановление: потери пакетов, отправленных раньше, нового
+ * эпизода не начинают. */
+bool NetBbrOnLoss(NetBbr *bbr, const NetBbrLoss *loss);
+/* Затяжная перегрузка: окно сжимается до двух датаграмм и растёт заново;
+ * пакеты, ушедшие раньше, модель не учат. */
+void NetBbrCollapse(NetBbr *bbr, uint64_t now);
+/* Все потери последнего эпизода мнимы: окно, пределы модели и состояние
+ * возвращаются к прежним. */
+void NetBbrUndo(NetBbr *bbr);
+/* Размер датаграммы пути изменился. */
+void NetBbrSetDatagram(NetBbr *bbr, uint32_t datagramBytes);
+/* Столько может уйти разом, не дожидаясь темпа: миллисекунда отправки, но не
+ * меньше двух датаграмм и не больше 64 КиБ. */
+uint64_t NetBbrQuantum(const NetBbr *bbr);
+
+/* Окно при замере оборота нарочно мало, и скорость доставки говорит о нём,
+ * а не о пути. */
+static inline bool NetBbrProbesRtt(const NetBbr *bbr)
+{
+    return bbr->state == NET_BBR_PROBE_RTT;
+}
+
+/* Данным нет места в окне: оно занято целиком. */
+static inline void NetBbrWindowFilled(NetBbr *bbr)
+{
+    bbr->windowFilled = true;
+}
+
+/* Окно перегрузки соединения, какой бы алгоритм его ни вёл. */
+static inline uint64_t NetPeerWindow(const NetPeer *peer)
+{
+    return peer->model != NULL ? peer->model->bbr.window : peer->congestion.window;
+}
+
 /* Итог разбора кадров и приёма данных канала. */
 #define NET_FRAMES_OK 0u
 /* Данные не сохранены: пакет не подтверждать, отправитель повторит. */
@@ -724,6 +1109,9 @@ uint32_t NetPeerWriteUnreliable(NetPeer *peer, uint8_t *output, uint32_t space);
 uint32_t NetChannelWriteStream(NetPeer *peer, uint32_t channelIndex, uint8_t *output,
                                uint32_t space, NetSentRange *outRange);
 bool NetPeerHasStreamData(const NetPeer *peer);
+/* В потоках есть байты, ещё не уехавшие или ждущие повтора, пусть даже
+ * отправить их сейчас не даёт окно приёма собеседника. */
+bool NetPeerStreamPending(const NetPeer *peer);
 void NetChannelOnAcked(NetPeer *peer, const NetSentRange *range);
 void NetChannelOnLost(NetPeer *peer, const NetSentRange *range);
 uint32_t NetChannelReceiveStream(LaiueNetEndpoint *endpoint, NetPeer *peer, uint32_t channelIndex,

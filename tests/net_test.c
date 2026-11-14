@@ -62,12 +62,15 @@ typedef struct World
 {
     LaiueNetSimulator *simulator;
     uint64_t now;
+    /* Шаг обновления конечных точек; 0 — TICK. */
+    uint64_t tick;
     Node nodes[NODE_CAPACITY];
     uint32_t nodeCount;
 } World;
 
 static World world;
-/* Датаграмма, которую фильтр придержал, чтобы отправить позже. */
+#define HELD_CAPACITY 8u
+/* Датаграммы, которые фильтр придержал, чтобы отправить позже. */
 static struct
 {
     const LaiueNetDriverV1 *driver;
@@ -75,7 +78,7 @@ static struct
     uint8_t bytes[1500];
     uint32_t size;
     uint64_t at;
-} held;
+} held[HELD_CAPACITY];
 /* Сдвиг всех зёрен: LAIUE_NET_TEST_SEED прогоняет те же сценарии на других сетях. */
 static uint64_t seedOffset;
 /* Когда отправлено ненадёжное сообщение с данным номером; 0 — не отмечено. */
@@ -86,6 +89,7 @@ static const uint32_t smallSizes[] = {0u, 1u, 2u, 5u, 60u, 300u, 1100u, 1200u, 2
 static const uint32_t mixedSizes[] = {0u,    1u,    7u,     130u, 1150u,  1171u,
                                       1300u, 9000u, 40000u, 3u,   150000u};
 static const uint32_t bulkSizes[] = {262144u};
+static const uint32_t streamSizes[] = {65536u};
 
 #define COUNT_OF(array) ((uint32_t)(sizeof(array) / sizeof((array)[0])))
 
@@ -294,6 +298,7 @@ static void WorldBeginLimited(uint64_t seed, uint32_t maxQueuedDatagrams)
         .seed = seed + seedOffset * UINT64_C(0x100000001B3),
     };
     memset(&world, 0, sizeof(world));
+    memset(held, 0, sizeof(held));
     Expect(LaiueNetSimulatorCreate(&desc, &world.simulator) == LAIUE_NET_OK, "simulator creates");
 }
 
@@ -343,16 +348,21 @@ static void NodePoll(Node *node)
         NodeHandle(node, &event);
 }
 
-static void WorldStep(void)
+/* Шаг мира в step микросекунд: симулятор, затем каждая конечная точка. */
+static void WorldAdvance(uint64_t step)
 {
-    world.now += TICK;
+    world.now += step;
     Expect(LaiueNetSimulatorAdvance(world.simulator, world.now) == LAIUE_NET_OK,
            "simulator advances");
-    if (held.size != 0u && world.now >= held.at)
+    for (uint32_t index = 0u; index < HELD_CAPACITY; ++index)
     {
-        Expect(held.driver->send(held.driver->context, &held.to, held.bytes, held.size) == 1,
+        if (held[index].size == 0u || world.now < held[index].at)
+            continue;
+        const LaiueNetDriverV1 *driver = held[index].driver;
+        Expect(driver->send(driver->context, &held[index].to, held[index].bytes,
+                            held[index].size) == 1,
                "a held datagram is sent");
-        held.size = 0u;
+        held[index].size = 0u;
     }
     for (uint32_t index = 0u; index < world.nodeCount; ++index)
     {
@@ -363,6 +373,39 @@ static void WorldStep(void)
         if (!node->muted)
             NodePoll(node);
     }
+}
+
+/* Фильтр придерживает датаграмму, чтобы драйвер отправил её в момент at. */
+static void Hold(const LaiueNetDriverV1 *driver, const LaiueNetAddress *to, const uint8_t *bytes,
+                 uint32_t size, uint64_t at)
+{
+    for (uint32_t index = 0u; index < HELD_CAPACITY; ++index)
+    {
+        if (held[index].size != 0u)
+            continue;
+        held[index].driver = driver;
+        held[index].to = *to;
+        memcpy(held[index].bytes, bytes, size);
+        held[index].size = size;
+        held[index].at = at;
+        return;
+    }
+    Expect(false, "the held datagrams fit");
+}
+
+static bool HeldEmpty(void)
+{
+    for (uint32_t index = 0u; index < HELD_CAPACITY; ++index)
+    {
+        if (held[index].size != 0u)
+            return false;
+    }
+    return true;
+}
+
+static void WorldStep(void)
+{
+    WorldAdvance(world.tick != 0u ? world.tick : TICK);
 }
 
 static void WorldRun(uint64_t microseconds)
@@ -972,6 +1015,641 @@ static void TestSlowStartExit(void)
     WorldEnd();
 }
 
+/* ---- Управление перегрузкой по модели пути ------------------------------------------- */
+
+/* Итог передачи через узкое место: доставлено за время замера, средние
+ * сглаженный оборот и окно перегрузки за него же и потери за всё
+ * соединение. */
+typedef struct BulkResult
+{
+    uint64_t delivered;
+    uint64_t roundTrip;
+    uint64_t window;
+    uint64_t lost;
+} BulkResult;
+
+/* Клиент шлёт серверу поток сообщений по расписанию размеров получателя, пока
+ * их принимает буфер отправки; next — номер следующего. Первые warmup
+ * микросекунд не считаются, итог — за следующие measured. */
+static BulkResult Stream(Node *client, LaiueNetPeer peer, const Flow *serverFlow, uint32_t *next,
+                         uint64_t warmup, uint64_t measured)
+{
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    const uint64_t start = world.now + warmup;
+    uint64_t before = serverFlow->reliableBytes;
+    uint64_t roundTrips = 0u;
+    uint64_t windows = 0u;
+    uint64_t samples = 0u;
+    while (world.now < start + measured)
+    {
+        while (SendScheduled(client, peer, 1u, client->index, serverFlow->sizes,
+                             serverFlow->sizeCount, 0u, *next) == LAIUE_NET_OK)
+            ++*next;
+        WorldStep();
+        if (world.now <= start)
+        {
+            before = serverFlow->reliableBytes;
+            continue;
+        }
+        Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+               "peer information is available");
+        roundTrips += info.roundTripMicroseconds;
+        windows += info.congestionWindowBytes;
+        ++samples;
+    }
+    /* Нулевой замер не даёт ни одного отсчёта — средние тогда нулевые. */
+    const uint64_t divisor = samples > 0u ? samples : 1u;
+    const BulkResult result = {
+        .delivered = serverFlow->reliableBytes - before,
+        .roundTrip = roundTrips / divisor,
+        .window = windows / divisor,
+        .lost = info.packetsLost,
+    };
+    return result;
+}
+
+/* Клиент и сервер, соединённые по пути conditions. */
+typedef struct Pair
+{
+    Node *server;
+    Node *client;
+    LaiueNetPeer peer;
+    /* Поток клиента глазами сервера; расписание — streamSizes. */
+    Flow *flow;
+} Pair;
+
+/* Клиент с управлением перегрузкой control соединяется с сервером по пути
+ * conditions. Путь задан до соединения, и рукопожатие меряет уже его
+ * оборот. */
+static Pair StreamPair(uint32_t control, uint64_t seed,
+                       const LaiueNetSimulatorConditions *conditions)
+{
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    desc.congestionControl = control;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 4u << 20u;
+    WorldBegin(seed);
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, conditions) == LAIUE_NET_OK,
+           "the path applies");
+    Pair pair;
+    pair.server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    pair.client = WorldAdd("10.0.0.2:5000", &desc);
+    pair.peer = Connect(pair.client, pair.server, 30u * SECOND);
+    pair.flow = ServerFlow(pair.server, pair.client->index);
+    pair.flow->sizes = streamSizes;
+    pair.flow->sizeCount = COUNT_OF(streamSizes);
+    return pair;
+}
+
+/* Клиент с управлением перегрузкой control шлёт серверу поток по пути
+ * conditions. */
+static BulkResult Bulk(uint32_t control, uint64_t seed,
+                       const LaiueNetSimulatorConditions *conditions, uint64_t warmup,
+                       uint64_t measured)
+{
+    uint32_t next = 0u;
+    const Pair pair = StreamPair(control, seed, conditions);
+    const BulkResult result = Stream(pair.client, pair.peer, pair.flow, &next, warmup, measured);
+    WorldEnd();
+    return result;
+}
+
+/* Путь в 1 МБ/с с оборотом 40 мс и очередью в десять оборотов: BBR его
+ * очереди не наполняет. */
+static const LaiueNetSimulatorConditions deepPath = {
+    .structSize = sizeof(LaiueNetSimulatorConditions),
+    .latencyMicroseconds = 20000u,
+    .bytesPerSecond = 1000000u,
+    .queueMicroseconds = 400000u,
+};
+
+/* BBR рядом с CUBIC на тех же путях: где CUBIC теряет полосу или копит
+ * очередь, BBR держит и полосу, и оборот. */
+static void TestModelBased(void)
+{
+    /* Неизвестное управление перегрузкой отвергается при создании. */
+    LaiueNetEndpointDesc desc = DefaultDesc(0u);
+    WorldBegin(40u);
+    Node *node = WorldAdd("10.0.0.9:4000", NULL);
+    desc.driver = &node->driver;
+    desc.random = TestRandom;
+    desc.randomContext = &node->randomState;
+    desc.congestionControl = LAIUE_NET_CONGESTION_BBR + 1u;
+    Expect(LaiueNetEndpointCreate(&desc, &node->endpoint) == LAIUE_NET_INVALID_ARGUMENT &&
+               node->endpoint == NULL,
+           "an unknown congestion control is refused");
+    WorldEnd();
+
+    /* Процент случайных потерь на пути в 1 МБ/с с оборотом 100 мс. CUBIC
+     * принимает каждую потерю за перегрузку и занимает около четверти
+     * полосы; BBR отличает её от перегрузки по модели пути. */
+    const LaiueNetSimulatorConditions lossy = {
+        .structSize = sizeof(lossy),
+        .latencyMicroseconds = 50000u,
+        .lossPerMillion = 10000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 100000u,
+    };
+    const BulkResult backedOff =
+        Bulk(LAIUE_NET_CONGESTION_CUBIC, 41u, &lossy, 2u * SECOND, 8u * SECOND);
+    const BulkResult modelled =
+        Bulk(LAIUE_NET_CONGESTION_BBR, 41u, &lossy, 2u * SECOND, 8u * SECOND);
+    Expect(modelled.delivered > 6000000u, "BBR keeps most of a path with random loss");
+    Expect(modelled.delivered * 2u > backedOff.delivered * 5u,
+           "where CUBIC backs off from every loss");
+
+    /* Очередь узкого места в десять оборотов пустого пути, 40 мс. CUBIC
+     * растит окно до первой потери и наполняет её; BBR шлёт в темпе пути и
+     * держит оборот у пустого при той же полосе. */
+    const BulkResult filled =
+        Bulk(LAIUE_NET_CONGESTION_CUBIC, 42u, &deepPath, 2u * SECOND, 8u * SECOND);
+    const BulkResult kept =
+        Bulk(LAIUE_NET_CONGESTION_BBR, 42u, &deepPath, 2u * SECOND, 8u * SECOND);
+    Expect(kept.delivered > 7400000u, "BBR uses a deep-buffered path fully");
+    ExpectEqual(kept.lost, 0u, "without losing a packet");
+    Expect(kept.roundTrip < 60000u, "and with the round trip near the empty path's");
+    Expect(filled.roundTrip > 3u * kept.roundTrip, "while CUBIC fills the queue");
+}
+
+/* Часы получателя нужны только BBR: соединение шлёт их в кадре ACK лишь
+ * собеседнику, который просил о них при рукопожатии. Подтверждения
+ * отправителю CUBIC их не несут и не длиннее, чем были бы без BBR. */
+static void TestAckClock(void)
+{
+    const LaiueNetSimulatorConditions quiet = {
+        .structSize = sizeof(quiet),
+        .latencyMicroseconds = 10000u,
+    };
+    uint64_t acknowledgement[2] = {0u, 0u};
+    for (uint32_t control = LAIUE_NET_CONGESTION_CUBIC; control <= LAIUE_NET_CONGESTION_BBR;
+         ++control)
+    {
+        LaiueNetEndpointStats before = {.structSize = sizeof(before)};
+        LaiueNetEndpointStats after = {.structSize = sizeof(after)};
+        const Pair pair = StreamPair(control, 54u, &quiet);
+        Expect(LaiueNetEndpointGetStats(pair.server->endpoint, &before) == LAIUE_NET_OK,
+               "endpoint statistics are available");
+        /* Клиент шлёт, сервер лишь подтверждает. */
+        for (uint32_t index = 0u; index < 100u; ++index)
+        {
+            Expect(SendNumbered(pair.client, pair.peer, 1u, pair.client->index,
+                                LAIUE_NET_UNRELIABLE, 1u, index, 100u) == LAIUE_NET_OK,
+                   "a message is queued");
+            WorldRun(10u * TICK);
+        }
+        WorldRun(50u * TICK);
+        ExpectEqual(pair.flow->unreliableCount, 100u, "the messages arrive");
+        Expect(LaiueNetEndpointGetStats(pair.server->endpoint, &after) == LAIUE_NET_OK &&
+                   after.datagramsSent > before.datagramsSent,
+               "the server acknowledges them");
+        acknowledgement[control - LAIUE_NET_CONGESTION_CUBIC] =
+            (after.bytesSent - before.bytesSent) / (after.datagramsSent - before.datagramsSent);
+        WorldEnd();
+    }
+    /* Одни часы занимают в кадре четыре байта. */
+    Expect(acknowledgement[1] >= acknowledgement[0] + 4u,
+           "only a BBR sender gets the receiver's clock");
+}
+/* Два потока BBR на одном узком месте, 1 МБ/с при обороте 40 мс. Второй
+ * приходит через две секунды, когда первый уже занял всю полосу, и за
+ * несколько циклов проб получает свою половину. */
+static void TestSharedBottleneck(void)
+{
+    uint32_t next[2] = {0u, 0u};
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    const LaiueNetSimulatorConditions conditions = {
+        .structSize = sizeof(conditions),
+        .latencyMicroseconds = 20000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 100000u,
+    };
+    desc.congestionControl = LAIUE_NET_CONGESTION_BBR;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 4u << 20u;
+    WorldBegin(43u);
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, &conditions) == LAIUE_NET_OK,
+           "the bottleneck applies");
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *clients[2];
+    clients[0] = WorldAdd("10.0.0.2:5000", &desc);
+    clients[1] = WorldAdd("10.0.0.3:5000", &desc);
+    LaiueNetPeer peers[2];
+    Flow *flows[2];
+    for (uint32_t index = 0u; index < 2u; ++index)
+    {
+        peers[index] = Connect(clients[index], server, 10u * SECOND);
+        flows[index] = ServerFlow(server, clients[index]->index);
+        flows[index]->sizes = streamSizes;
+        flows[index]->sizeCount = COUNT_OF(streamSizes);
+    }
+    const uint64_t start = world.now;
+    uint64_t before[2] = {0u, 0u};
+    while (world.now < start + 26u * SECOND)
+    {
+        for (uint32_t index = 0u; index < 2u; ++index)
+        {
+            if (index == 1u && world.now < start + 2u * SECOND)
+                continue;
+            while (SendScheduled(clients[index], peers[index], 1u, clients[index]->index,
+                                 streamSizes, COUNT_OF(streamSizes), 0u,
+                                 next[index]) == LAIUE_NET_OK)
+                ++next[index];
+        }
+        WorldStep();
+        /* Замер — последние восемь секунд. */
+        if (world.now <= start + 18u * SECOND)
+        {
+            before[0] = flows[0]->reliableBytes;
+            before[1] = flows[1]->reliableBytes;
+        }
+    }
+    const uint64_t first = flows[0]->reliableBytes - before[0];
+    const uint64_t second = flows[1]->reliableBytes - before[1];
+    Expect(first + second > 7200000u, "two flows keep the bottleneck busy");
+    Expect(first * 100u > (first + second) * 35u && second * 100u > (first + second) * 35u,
+           "and share it");
+    WorldEnd();
+}
+
+/* Соединение BBR передаёт, молчит двенадцать минут и передаёт снова по пути
+ * с глубокой очередью. Часы получателя за тишину уходят дальше, чем
+ * помещается в младшие биты кадра ACK, но их ход восстанавливается по ходу
+ * своих: BBR по-прежнему меряет путь, а не темп своей отправки, и оборот
+ * остаётся у пустого. */
+static void TestLongSilence(void)
+{
+    uint32_t next = 0u;
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    desc.congestionControl = LAIUE_NET_CONGESTION_BBR;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 1u << 20u;
+    /* Проверка связи раз в двадцать минут тишину не прерывает. */
+    desc.idleTimeoutMilliseconds = 60u * 60u * 1000u;
+    WorldBegin(44u);
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, &deepPath) == LAIUE_NET_OK,
+           "the path applies");
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    const LaiueNetPeer peer = Connect(client, server, 10u * SECOND);
+    Flow *serverFlow = ServerFlow(server, client->index);
+    serverFlow->sizes = streamSizes;
+    serverFlow->sizeCount = COUNT_OF(streamSizes);
+    const BulkResult before = Stream(client, peer, serverFlow, &next, 2u * SECOND, 4u * SECOND);
+    Expect(before.roundTrip < 60000u, "BBR keeps the deep queue empty");
+
+    const uint64_t deadline = world.now + 10u * SECOND;
+    do
+    {
+        WorldStep();
+        Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+               "peer information is available");
+        Expect(world.now < deadline, "the queued stream is delivered");
+    } while (info.queuedReliableBytes != 0u || info.bytesInFlight != 0u);
+    const uint64_t sent = info.packetsSent;
+    const uint64_t quiet = world.now + 12u * 60u * SECOND;
+    while (world.now < quiet)
+        WorldAdvance(100u * TICK);
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    ExpectEqual(info.packetsSent, sent, "nothing breaks the silence");
+    /* Путь пуст, и BBR возвращается к нему в темпе пути: первое обновление
+     * выпускает пачку в миллисекунду отправки — две датаграммы. Тишина сама
+     * опустошила путь, и замер оборота после неё не нужен: поток сразу идёт в
+     * полную силу. */
+    Expect(SendScheduled(client, peer, 1u, client->index, streamSizes, COUNT_OF(streamSizes), 0u,
+                         next) == LAIUE_NET_OK,
+           "the stream resumes");
+    ++next;
+    WorldStep();
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    Expect(info.packetsSent - sent >= 1u && info.packetsSent - sent <= 2u,
+           "after the silence BBR sends at once, in a paced burst");
+    const uint64_t silent = info.bytesSent;
+    (void)Stream(client, peer, serverFlow, &next, 0u, 500u * TICK);
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    Expect(info.bytesSent - silent > 450000u, "and takes the whole path at once");
+
+    const BulkResult after = Stream(client, peer, serverFlow, &next, 2u * SECOND, 6u * SECOND);
+    Expect(after.delivered > 5400000u, "after the silence BBR uses the path again");
+    Expect(after.roundTrip < 60000u, "and measures the path rather than its own sending");
+    WorldEnd();
+}
+
+/* Поток идёт три секунды, затем десять секунд приложение шлёт редкие мелкие
+ * сообщения, затем снова поток. Пока оно шлёт мало, замеры скорости говорят
+ * о нём, а не о пути, и найденная полоса не забывается: поток сразу идёт в
+ * темпе пути, а не ждёт новых проб. */
+static void TestLimitedPause(void)
+{
+    uint32_t next = 0u;
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    const Pair pair = StreamPair(LAIUE_NET_CONGESTION_BBR, 45u, &deepPath);
+    (void)Stream(pair.client, pair.peer, pair.flow, &next, 0u, 3u * SECOND);
+    const uint64_t deadline = world.now + 10u * SECOND;
+    do
+    {
+        WorldStep();
+        Expect(LaiueNetPeerGetInfo(pair.client->endpoint, pair.peer, &info) == LAIUE_NET_OK,
+               "peer information is available");
+        Expect(world.now < deadline, "the queued stream is delivered");
+    } while (info.queuedReliableBytes != 0u || info.bytesInFlight != 0u);
+    /* Десять секунд по 500 байт раз в 20 мс: 25 кБ/с. */
+    for (uint32_t index = 0u; index < 500u; ++index)
+    {
+        Expect(SendNumbered(pair.client, pair.peer, 1u, pair.client->index, LAIUE_NET_UNRELIABLE,
+                            1u, index, 500u) == LAIUE_NET_OK,
+               "a small message is queued");
+        WorldRun(20u * TICK);
+    }
+    WorldRun(100u * TICK);
+    ExpectEqual(pair.flow->unreliableCount, 500u, "the small messages arrive");
+    Expect(LaiueNetPeerGetInfo(pair.client->endpoint, pair.peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    const uint64_t paused = info.bytesSent;
+    (void)Stream(pair.client, pair.peer, pair.flow, &next, 0u, 500u * TICK);
+    Expect(LaiueNetPeerGetInfo(pair.client->endpoint, pair.peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    Expect(info.bytesSent - paused > 400000u, "the stream resumes at the path's pace at once");
+    WorldEnd();
+}
+
+/* Соединению BBR есть что везти с первого мгновения: первый полёт уходит в
+ * темпе начального окна за оборот рукопожатия, а не разом во всё окно. */
+static void TestPacedStart(void)
+{
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    desc.congestionControl = LAIUE_NET_CONGESTION_BBR;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 4u << 20u;
+    WorldBegin(46u);
+    SetConditions(20000u, 0u, 0u, 0u, 0u);
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    const LaiueNetPeer peer = BeginConnect(client, server, NULL);
+    const uint64_t until = world.now + 5u * SECOND;
+    while (client->connected == 0u && world.now < until)
+        WorldStep();
+    Expect(client->connected == 1u, "the client connects");
+    SendIdentity(client, peer, client->index);
+    for (uint32_t index = 0u; index < 4u; ++index)
+        Expect(SendScheduled(client, peer, 1u, client->index, streamSizes, COUNT_OF(streamSizes),
+                             0u, index) == LAIUE_NET_OK,
+               "the stream is queued");
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    const uint64_t before = info.packetsSent;
+    WorldStep();
+    Expect(LaiueNetPeerGetInfo(client->endpoint, peer, &info) == LAIUE_NET_OK,
+           "peer information is available");
+    Expect(info.packetsSent - before >= 1u && info.packetsSent - before <= 2u,
+           "the first flight is paced, not sent at once");
+    Flow *serverFlow = NULL;
+    while ((serverFlow == NULL || serverFlow->nextReliable[0] != 4u) && world.now < until)
+    {
+        WorldStep();
+        if (serverFlow == NULL)
+        {
+            serverFlow = ServerFlow(server, client->index);
+            if (serverFlow != NULL)
+            {
+                serverFlow->sizes = streamSizes;
+                serverFlow->sizeCount = COUNT_OF(streamSizes);
+            }
+        }
+    }
+    Expect(serverFlow != NULL && serverFlow->nextReliable[0] == 4u, "and the stream arrives whole");
+    WorldEnd();
+}
+
+static const uint32_t slowSizes[] = {1000u};
+
+/* Путь в 7 кБ/с с оборотом в секунду: за миллисекунду между обновлениями
+ * темп зарабатывает считаные байты, и право на датаграмму копится около
+ * 170 обновлений. BBR занимает путь, не теряя пакетов, и очередь в нём не
+ * дольше оборота пустого пути. */
+static void TestSlowPath(void)
+{
+    uint32_t next = 0u;
+    const LaiueNetSimulatorConditions slow = {
+        .structSize = sizeof(slow),
+        .latencyMicroseconds = 500000u,
+        .bytesPerSecond = 7000u,
+        .queueMicroseconds = 4000000u,
+    };
+    const Pair pair = StreamPair(LAIUE_NET_CONGESTION_BBR, 47u, &slow);
+    pair.flow->sizes = slowSizes;
+    pair.flow->sizeCount = COUNT_OF(slowSizes);
+    const BulkResult result =
+        Stream(pair.client, pair.peer, pair.flow, &next, 20u * SECOND, 30u * SECOND);
+    Expect(result.delivered > 192000u, "BBR fills a path of a few bytes a millisecond");
+    ExpectEqual(result.lost, 0u, "without losing a packet");
+    /* Оборот пустого пути — около 1,2 с. */
+    Expect(result.roundTrip < 2400000u, "and queues no longer than the empty path's round trip");
+    WorldEnd();
+}
+
+static bool linkDown;
+
+/* Пока linkDown, теряется всё. */
+static bool LinkFilter(void *context, const LaiueNetAddress *from, const LaiueNetAddress *to,
+                       uint8_t *bytes, uint32_t size)
+{
+    (void)context;
+    (void)from;
+    (void)to;
+    (void)bytes;
+    (void)size;
+    return !linkDown;
+}
+
+/* Посреди передачи связь пропадает на три секунды. Подряд потеряно всё,
+ * отправленное дольше трёх пробных интервалов: о пути после обрыва прежнее
+ * окно ничего не говорит, и оно падает до двух датаграмм (RFC 9002, 7.6.2) —
+ * у CUBIC и у BBR, — а затем растёт заново. Подтверждения пакетов, принятых
+ * ещё до обрыва, приходят после него и окна не растят. */
+static void TestPersistentCongestion(void)
+{
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    const LaiueNetSimulatorConditions path = {
+        .structSize = sizeof(path),
+        .latencyMicroseconds = 20000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 100000u,
+    };
+    for (uint32_t control = LAIUE_NET_CONGESTION_CUBIC; control <= LAIUE_NET_CONGESTION_BBR;
+         ++control)
+    {
+        uint32_t next = 0u;
+        const Pair pair = StreamPair(control, 48u, &path);
+        linkDown = false;
+        Expect(LaiueNetSimulatorSetFilter(world.simulator, LinkFilter, NULL) == LAIUE_NET_OK,
+               "filter installs");
+        (void)Stream(pair.client, pair.peer, pair.flow, &next, 0u, 3u * SECOND);
+        Expect(LaiueNetPeerGetInfo(pair.client->endpoint, pair.peer, &info) == LAIUE_NET_OK,
+               "peer information is available");
+        const uint32_t before = info.congestionWindowBytes;
+        linkDown = true;
+        WorldRun(3u * SECOND);
+        linkDown = false;
+        uint32_t smallest = UINT32_MAX;
+        uint32_t datagram = 0u;
+        const uint64_t until = world.now + 2u * SECOND;
+        while (world.now < until)
+        {
+            WorldStep();
+            Expect(LaiueNetPeerGetInfo(pair.client->endpoint, pair.peer, &info) == LAIUE_NET_OK,
+                   "peer information is available");
+            if (info.congestionWindowBytes < smallest)
+            {
+                smallest = info.congestionWindowBytes;
+                datagram = info.datagramBytes;
+            }
+        }
+        const BulkResult after =
+            Stream(pair.client, pair.peer, pair.flow, &next, SECOND, 3u * SECOND);
+        Expect(before > 20u * datagram, "the window is wide before the outage");
+        ExpectEqual(smallest, 2u * datagram, "after it the window collapses to two datagrams");
+        Expect(after.delivered > 2500000u, "and grows again to take the path");
+        Expect(pair.client->disconnected == 0u, "the connection survives the outage");
+        WorldEnd();
+    }
+}
+
+/* Датаграммы данных клиента, которые путь задержит на 30 мс: сколько и как
+ * часто. */
+static struct
+{
+    const LaiueNetDriverV1 *driver;
+    uint64_t at;
+    uint64_t interval;
+    uint32_t remaining;
+} delayed;
+
+static bool DelayFilter(void *context, const LaiueNetAddress *from, const LaiueNetAddress *to,
+                        uint8_t *bytes, uint32_t size)
+{
+    (void)context;
+    if (delayed.remaining == 0u || world.now < delayed.at || from->port != 5000u || size < 1000u)
+        return true;
+    --delayed.remaining;
+    delayed.at = world.now + delayed.interval;
+    Hold(delayed.driver, to, bytes, size, world.now + 30u * TICK);
+    return false;
+}
+
+/* Путь задерживает на 30 мс по датаграмме каждые 250 мс: следующие за ней
+ * подтверждены раньше, и отправитель считает её потерянной, пока не придёт и
+ * её подтверждение. Потери мнимые, и всё, что они изменили, возвращается:
+ * окно CUBIC и BBR остаётся прежним. */
+static void TestSpuriousLoss(void)
+{
+    for (uint32_t control = LAIUE_NET_CONGESTION_CUBIC; control <= LAIUE_NET_CONGESTION_BBR;
+         ++control)
+    {
+        uint32_t next = 0u;
+        const Pair pair = StreamPair(control, 49u, &deepPath);
+        const BulkResult calm = Stream(pair.client, pair.peer, pair.flow, &next, SECOND, SECOND);
+        delayed.driver = &pair.client->driver;
+        delayed.at = world.now;
+        delayed.interval = 250u * TICK;
+        delayed.remaining = 8u;
+        Expect(LaiueNetSimulatorSetFilter(world.simulator, DelayFilter, NULL) == LAIUE_NET_OK,
+               "filter installs");
+        const BulkResult reordered =
+            Stream(pair.client, pair.peer, pair.flow, &next, 0u, 2u * SECOND);
+        Expect(delayed.remaining == 0u && HeldEmpty(), "datagrams are delayed and delivered");
+        ExpectEqual(reordered.lost, 0u, "the delayed datagrams are not counted as lost");
+        Expect(reordered.window * 20u > calm.window * 19u, "and the window stays as it was");
+        Expect(reordered.delivered > 1800000u, "and so does the stream");
+        WorldEnd();
+    }
+}
+
+/* BBR с обновлениями 60 раз в секунду на обеих сторонах. */
+static BulkResult FrameStream(const LaiueNetSimulatorConditions *conditions, uint64_t seed)
+{
+    uint32_t next = 0u;
+    LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
+    desc.congestionControl = LAIUE_NET_CONGESTION_BBR;
+    desc.receiveWindowBytes = 4u << 20u;
+    desc.sendBufferBytes = 4u << 20u;
+    WorldBegin(seed);
+    world.tick = 16667u;
+    Expect(LaiueNetSimulatorSetConditions(world.simulator, conditions) == LAIUE_NET_OK,
+           "the path applies");
+    Node *server = WorldAdd("10.0.0.1:4000", &desc);
+    desc.flags = 0u;
+    Node *client = WorldAdd("10.0.0.2:5000", &desc);
+    const LaiueNetPeer peer = Connect(client, server, 10u * SECOND);
+    Flow *serverFlow = ServerFlow(server, client->index);
+    serverFlow->sizes = streamSizes;
+    serverFlow->sizeCount = COUNT_OF(streamSizes);
+    const BulkResult result = Stream(client, peer, serverFlow, &next, 2u * SECOND, 8u * SECOND);
+    WorldEnd();
+    return result;
+}
+
+/* Игра обновляет сеть раз в кадр, 60 раз в секунду, и о подтверждениях
+ * отправитель узнаёт с опозданием до кадра, пачками. Часы получателя в
+ * кадре ACK говорят, когда пакеты пришли на самом деле: BBR меряет путь, а
+ * не ход кадров, занимает его целиком и не копит очереди — и на широком пути,
+ * и на узком, где за кадр приходит пара датаграмм. */
+static void TestFrameRate(void)
+{
+    const BulkResult wide = FrameStream(&deepPath, 50u);
+    const LaiueNetSimulatorConditions narrow = {
+        .structSize = sizeof(narrow),
+        .latencyMicroseconds = 50000u,
+        .bytesPerSecond = 200000u,
+        .queueMicroseconds = 1000000u,
+    };
+    const BulkResult thin = FrameStream(&narrow, 52u);
+    Expect(wide.delivered > 7400000u && thin.delivered > 1480000u,
+           "at 60 updates a second BBR fills the path");
+    ExpectEqual(wide.lost + thin.lost, 0u, "without losing a packet");
+    Expect(wide.roundTrip < 80000u && thin.roundTrip < 175000u, "and keeps the queue short");
+}
+
+/* Очередь узкого места вмещает пять миллисекунд — восьмую часть объёма пути
+ * в 1 МБ/с и тридцать вторую в 4 МБ/с. Поиск полосы переполняет её уже на
+ * третьем обороте, и BBR уходит из него, как только доля потерь за оборот
+ * превысила два процента, а не ждёт трёх оборотов плато. Пробы полосы на
+ * широком пути кончаются, как только их потери превысили два процента
+ * объёма в пути. */
+static void TestShallowQueue(void)
+{
+    uint32_t next = 0u;
+    LaiueNetSimulatorConditions shallow = {
+        .structSize = sizeof(shallow),
+        .latencyMicroseconds = 20000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 5000u,
+    };
+    Pair pair = StreamPair(LAIUE_NET_CONGESTION_BBR, 51u, &shallow);
+    const BulkResult start = Stream(pair.client, pair.peer, pair.flow, &next, 0u, 2u * SECOND);
+    const BulkResult steady = Stream(pair.client, pair.peer, pair.flow, &next, 0u, 8u * SECOND);
+    WorldEnd();
+    shallow.bytesPerSecond = 4000000u;
+    next = 0u;
+    pair = StreamPair(LAIUE_NET_CONGESTION_BBR, 53u, &shallow);
+    const BulkResult wideStart = Stream(pair.client, pair.peer, pair.flow, &next, 0u, 2u * SECOND);
+    const BulkResult wide = Stream(pair.client, pair.peer, pair.flow, &next, 0u, 8u * SECOND);
+    WorldEnd();
+    Expect(start.lost < 100u && wideStart.lost < 350u, "the start leaves on its loss");
+    Expect(steady.lost - start.lost < 50u && wide.lost - wideStart.lost < 100u,
+           "the probes then lose little");
+    Expect(steady.delivered > 6800000u && wide.delivered > 27200000u,
+           "while BBR keeps most of the path");
+}
+
 static bool scatterActive;
 static uint32_t scatterSeen;
 
@@ -1560,13 +2238,14 @@ static int32_t RoamingReceive(void *context, LaiueNetAddress *outFrom, void *buf
     return port->receive(port->context, outFrom, buffer, capacity);
 }
 
-static void TestMigration(void)
+static void RunMigration(uint32_t control)
 {
     static Roaming roaming;
     uint32_t clientNext[CHANNELS] = {0u};
     uint32_t serverNext[CHANNELS] = {0u};
     LaiueNetEndpointDesc desc = DefaultDesc(LAIUE_NET_ENDPOINT_ACCEPT);
     LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    desc.congestionControl = control;
     const LaiueNetDriverV1 driver = {
         .structSize = sizeof(driver),
         .context = &roaming,
@@ -1620,6 +2299,13 @@ static void TestMigration(void)
     Expect(client->disconnected == 0u && server->disconnected == 0u && server->connected == 1u,
            "a moved client is the same peer");
     WorldEnd();
+}
+
+/* Оценки пути начинаются заново при любом управлении перегрузкой. */
+static void TestMigration(void)
+{
+    RunMigration(LAIUE_NET_CONGESTION_CUBIC);
+    RunMigration(LAIUE_NET_CONGESTION_BBR);
 }
 
 /* ---- Давление незавершёнными рукопожатиями и проверка ответов ------------------------- */
@@ -2033,11 +2719,7 @@ static bool PathFilter(void *context, const LaiueNetAddress *from, const LaiueNe
     if (wire->delayProbe && size == 1452u)
     {
         wire->delayProbe = false;
-        held.driver = wire->driver;
-        held.to = *to;
-        memcpy(held.bytes, bytes, size);
-        held.size = size;
-        held.at = world.now + 60u * TICK;
+        Hold(wire->driver, to, bytes, size, world.now + 60u * TICK);
         return false;
     }
     return true;
@@ -2059,7 +2741,6 @@ static PathResult PathTransfer(const PathCase *path)
         .queueMicroseconds = path->queueMicroseconds,
     };
     pathSizes[0] = path->messageBytes != 0u ? path->messageBytes : 65536u;
-    held.size = 0u;
     desc.receiveWindowBytes = 4u << 20u;
     desc.sendBufferBytes = 8u << 20u;
     desc.maxDatagramBytes = path->serverLimit;
@@ -2229,6 +2910,17 @@ LAIUE_TEST_ENTRY(NetTestEntryPoint)
     TestDeepPipe();
     TestBottleneck();
     TestSlowStartExit();
+    TestModelBased();
+    TestAckClock();
+    TestSharedBottleneck();
+    TestLongSilence();
+    TestLimitedPause();
+    TestPacedStart();
+    TestSlowPath();
+    TestPersistentCongestion();
+    TestSpuriousLoss();
+    TestFrameRate();
+    TestShallowQueue();
     TestScatteredLoss();
     TestBackpressure();
     TestUnreliable();

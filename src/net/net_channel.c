@@ -378,6 +378,17 @@ bool NetPeerHasStreamData(const NetPeer *peer)
     return false;
 }
 
+bool NetPeerStreamPending(const NetPeer *peer)
+{
+    for (uint32_t index = 0u; index < peer->channelCount; ++index)
+    {
+        const NetChannel *channel = &peer->channels[index];
+        if (channel->lostCount != 0u || channel->sendNext < channel->sendEnd)
+            return true;
+    }
+    return false;
+}
+
 uint32_t NetChannelWriteStream(NetPeer *peer, uint32_t channelIndex, uint8_t *output,
                                uint32_t space, NetSentRange *outRange)
 {

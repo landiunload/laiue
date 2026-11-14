@@ -14,9 +14,11 @@
  * Потерю выдаёт либо обгон на три пакета, либо возраст больше 9/8 времени
  * оборота. Когда подтверждений нет совсем, срабатывает пробный таймер: он
  * ничего не объявляет потерянным, а отправляет пробу, ответ на которую
- * запускает обычное обнаружение. Окном перегрузки ведают CUBIC и HyStart++
- * (net_congestion.c), а отправка размазана по времени оборота, а не
- * выстреливает пачкой. Размер датаграмм ищут пробы (net_pmtu.c). */
+ * запускает обычное обнаружение. Окно и темп отправки ведёт один из двух
+ * алгоритмов, по выбору конечной точки: CUBIC с HyStart++ (net_congestion.c)
+ * либо BBR (net_bbr.c), которому каждый пакет везёт замер скорости доставки
+ * (net_rate.c). Отправка размазана по времени, а не выстреливает пачкой.
+ * Размер датаграмм ищут пробы (net_pmtu.c). */
 
 uint32_t NetPeerMaxUnreliable(const NetPeer *peer)
 {
@@ -41,6 +43,22 @@ static uint64_t MinimumWindow(const NetPeer *peer)
     return 2u * (uint64_t)peer->datagramBytes;
 }
 
+/* Окно в начале соединения либо на новом пути. */
+static void ControlReset(NetPeer *peer, uint64_t window, uint64_t now)
+{
+    if (peer->model == NULL)
+    {
+        NetCongestionReset(&peer->congestion, peer->datagramBytes, window, peer->nextNumber);
+        return;
+    }
+    /* Идентификаторы соединения случайны и известны только сторонам: у
+     * каждого соединения свои паузы между пробами полосы. */
+    NetBbrReset(&peer->model->bbr, peer->datagramBytes, window,
+                peer->localCid ^ (peer->remoteCid * UINT64_C(0x9E3779B97F4A7C15)), now);
+    if (peer->haveRtt)
+        NetBbrSeed(&peer->model->bbr, peer->smoothedRtt);
+}
+
 bool NetPeerEstablish(LaiueNetEndpoint *endpoint, NetPeer *peer)
 {
     const NetParameters *local = &endpoint->local;
@@ -60,7 +78,15 @@ bool NetPeerEstablish(LaiueNetEndpoint *endpoint, NetPeer *peer)
         NET_MILLISECOND;
     peer->channels = PlatformAllocate((size_t)peer->channelCount * sizeof(NetChannel), true);
     peer->records = PlatformAllocate((size_t)NET_RECORDS_INITIAL * sizeof(NetSentPacket), true);
-    if (peer->channels == NULL || peer->records == NULL)
+    if (endpoint->modelBased)
+    {
+        peer->model = PlatformAllocate(sizeof(NetModel), true);
+        if (peer->model != NULL)
+            peer->model->stamps =
+                PlatformAllocate((size_t)NET_RECORDS_INITIAL * sizeof(NetRateStamp), false);
+    }
+    if (peer->channels == NULL || peer->records == NULL ||
+        (endpoint->modelBased && (peer->model == NULL || peer->model->stamps == NULL)))
     {
         NetPeerFreeTransport(peer);
         return false;
@@ -76,7 +102,7 @@ bool NetPeerEstablish(LaiueNetEndpoint *endpoint, NetPeer *peer)
     const uint64_t ceiling = MinimumWindow(peer) > 14720u ? MinimumWindow(peer) : 14720u;
     if (window > ceiling)
         window = ceiling;
-    NetCongestionReset(&peer->congestion, peer->datagramBytes, window, peer->nextNumber);
+    ControlReset(peer, window, endpoint->now);
     peer->paceBudget = (int64_t)window;
     peer->paceTime = endpoint->now;
     peer->lastReceiveTime = endpoint->now;
@@ -89,6 +115,12 @@ void NetPeerFreeTransport(NetPeer *peer)
     NetChannelsFree(peer);
     PlatformFree(peer->records);
     peer->records = NULL;
+    if (peer->model != NULL)
+    {
+        PlatformFree(peer->model->stamps);
+        PlatformFree(peer->model);
+        peer->model = NULL;
+    }
     peer->recordCapacity = 0u;
     peer->recordHead = 0u;
     peer->recordCount = 0u;
@@ -174,9 +206,20 @@ static void NumberRecord(NetPeer *peer, uint64_t number)
  * Подтверждаются только пакеты, требовавшие подтверждения: у отправителя
  * запись есть именно для них, поэтому старший номер кадра всегда даёт ему
  * замер времени оборота, а задержка ответа отсчитана от приёма этого самого
- * пакета. */
+ * пакета.
+ *
+ * Собеседнику, который просил о них при рукопожатии, — а просит BBR, —
+ * кадр несёт и часы получателя: младшие биты времени, в которое принят
+ * самый новый из названных пакетов. Обе стороны читают сеть раз в
+ * обновление, и по своим часам отправитель знает приход подтверждения лишь с
+ * точностью до шага; часы получателя говорят, за какое время принято
+ * подтверждённое. Рядом их погрешность: за сколько до этих часов сеть была
+ * прочитана до конца — раньше пакет прийти не мог. Младший бит погрешности
+ * говорит, что с тех пор сеть до конца не прочитана и пакеты, которых в
+ * кадре нет, могли прийти и раньше этих часов. */
 
-static uint32_t WriteAck(const NetPeer *peer, uint8_t *output, uint32_t space, uint64_t now)
+static uint32_t WriteAck(const NetPeer *peer, uint8_t *output, uint32_t space, uint64_t now,
+                         uint64_t drainedTime)
 {
     /* Старший подтверждаемый пакет уже выехал из окна номеров: подтверждать
      * нечего, отправитель давно счёл его потерянным. */
@@ -213,10 +256,23 @@ static uint32_t WriteAck(const NetPeer *peer, uint8_t *output, uint32_t space, u
     }
 
     const uint64_t delay = now > peer->largestElicitingTime ? now - peer->largestElicitingTime : 0u;
+    const bool clocked = peer->remote.ackClock;
+    uint64_t clock = 0u;
+    uint64_t accuracy = 0u;
+    if (clocked)
+    {
+        clock = peer->arrivalTime & NET_ACK_CLOCK_MASK;
+        uint64_t age = peer->arrivalTime - peer->arrivalFloor;
+        if (age > NET_ACK_CLOCK_MASK)
+            age = NET_ACK_CLOCK_MASK;
+        accuracy = age << 1u | (peer->arrivalTime > drainedTime ? 1u : 0u);
+    }
     for (;;)
     {
         uint32_t size = 1u + NetVarintSize(largest) + NetVarintSize(delay) + NetVarintSize(count) +
                         NetVarintSize(first);
+        if (clocked)
+            size += NetVarintSize(clock) + NetVarintSize(accuracy);
         for (uint32_t index = 0u; index < count; ++index)
             size += NetVarintSize(gaps[index]) + NetVarintSize(lengths[index]);
         if (size <= space)
@@ -225,10 +281,15 @@ static uint32_t WriteAck(const NetPeer *peer, uint8_t *output, uint32_t space, u
             return 0u;
         --count;
     }
-    output[0] = NET_FRAME_ACK;
+    output[0] = clocked ? NET_FRAME_ACK_CLOCK : NET_FRAME_ACK;
     uint32_t used = 1u;
     used += NetVarintWrite(output + used, largest);
     used += NetVarintWrite(output + used, delay);
+    if (clocked)
+    {
+        used += NetVarintWrite(output + used, clock);
+        used += NetVarintWrite(output + used, accuracy);
+    }
     used += NetVarintWrite(output + used, count);
     used += NetVarintWrite(output + used, first);
     for (uint32_t index = 0u; index < count; ++index)
@@ -278,6 +339,12 @@ static uint32_t RecordFind(const NetPeer *peer, uint64_t number)
     return low;
 }
 
+/* Снимок замера скорости для записи: то же место в своей очереди. */
+static NetRateStamp *RecordStamp(const NetPeer *peer, const NetSentPacket *record)
+{
+    return &peer->model->stamps[record - peer->records];
+}
+
 static void RecordsPop(NetPeer *peer)
 {
     peer->recordHead = (peer->recordHead + 1u) & (peer->recordCapacity - 1u);
@@ -303,12 +370,28 @@ static bool RecordsGrow(NetPeer *peer)
 {
     const uint32_t capacity = peer->recordCapacity * 2u;
     NetSentPacket *grown = PlatformAllocate((size_t)capacity * sizeof(NetSentPacket), false);
-    if (grown == NULL)
+    NetRateStamp *stamps = NULL;
+    if (grown != NULL && peer->model != NULL)
+        stamps = PlatformAllocate((size_t)capacity * sizeof(NetRateStamp), false);
+    if (grown == NULL || (peer->model != NULL && stamps == NULL))
+    {
+        PlatformFree(grown);
         return false;
+    }
     for (uint32_t position = 0u; position < peer->recordCount; ++position)
-        grown[position] = *RecordAt(peer, position);
+    {
+        const uint32_t index = (peer->recordHead + position) & (peer->recordCapacity - 1u);
+        grown[position] = peer->records[index];
+        if (stamps != NULL)
+            stamps[position] = peer->model->stamps[index];
+    }
     PlatformFree(peer->records);
     peer->records = grown;
+    if (stamps != NULL)
+    {
+        PlatformFree(peer->model->stamps);
+        peer->model->stamps = stamps;
+    }
     peer->recordCapacity = capacity;
     peer->recordHead = 0u;
     return true;
@@ -320,14 +403,37 @@ static bool RecordsGrow(NetPeer *peer)
 static void DatagramResize(NetPeer *peer)
 {
     peer->datagramBytes = peer->pmtu.current;
-    NetCongestionSetDatagram(&peer->congestion, peer->datagramBytes);
+    if (peer->model != NULL)
+        NetBbrSetDatagram(&peer->model->bbr, peer->datagramBytes);
+    else
+        NetCongestionSetDatagram(&peer->congestion, peer->datagramBytes);
 }
 
-static void CongestionOnLoss(NetPeer *peer, uint64_t sentTime, uint64_t now)
+static void CongestionOnLoss(NetPeer *peer, const NetSentPacket *record, bool contiguous,
+                             uint64_t now)
 {
-    /* Одно сокращение окна на полёт: потери пакетов, отправленных до него,
-     * нового эпизода не начинают. */
-    if (!NetCongestionOnLoss(&peer->congestion, sentTime, now))
+    bool episode = false;
+    if (peer->model != NULL)
+    {
+        const NetRateStamp *stamp = RecordStamp(peer, record);
+        const NetBbrLoss loss = {
+            .now = now,
+            .sentTime = record->sentTime,
+            .txInFlight = stamp->inFlight,
+            .lost = peer->model->rate.lost - stamp->lost,
+            .size = record->size,
+            .appLimited = stamp->appLimited,
+            .contiguous = contiguous,
+        };
+        episode = NetBbrOnLoss(&peer->model->bbr, &loss);
+    }
+    else
+    {
+        episode = NetCongestionOnLoss(&peer->congestion, record->sentTime, now);
+    }
+    /* Один эпизод на полёт: потери пакетов, отправленных до его начала,
+     * нового не начинают. */
+    if (!episode)
         return;
     /* Эпизод без мнимых потерь с прошлого раза: пороги понемногу
      * возвращаются к исходным, и однажды случившаяся перестановка не
@@ -374,8 +480,11 @@ static void UpdateRtt(NetPeer *peer, uint64_t sample, uint64_t ackDelay, uint64_
 
 void NetPeerSeedRtt(NetPeer *peer, uint64_t sample, uint64_t now)
 {
-    if (!peer->haveRtt)
-        UpdateRtt(peer, sample, 0u, now);
+    if (peer->haveRtt)
+        return;
+    UpdateRtt(peer, sample, 0u, now);
+    if (peer->model != NULL)
+        NetBbrSeed(&peer->model->bbr, peer->smoothedRtt);
 }
 
 /* ---- Подтверждения и потери ---------------------------------------------------------- */
@@ -387,10 +496,12 @@ typedef struct AckContext
     /* Позиция записи наибольшего подтверждённого номера. */
     uint32_t largestPosition;
     uint64_t largestSentTime;
-    /* Байты, которые расширяют окно: пакеты, которым оно было тесно, вне
-     * восстановления. */
+    /* Байты, которые расширяют окно CUBIC: пакеты, которым оно было тесно,
+     * вне восстановления. */
     uint64_t limitedBytes;
     uint64_t limitedSentTime;
+    /* Замер скорости доставки этим подтверждением. */
+    NetRateSample rate;
     bool largestNewlyAcked;
     uint32_t newlyAcked;
 } AckContext;
@@ -409,6 +520,9 @@ static void PacketAcked(NetPeer *peer, NetSentPacket *record, AckContext *contex
     record->state = NET_RECORD_ACKED;
     --peer->ackElicitingOutstanding;
     peer->bytesInFlight -= record->size;
+    if (peer->model != NULL)
+        NetRateAcked(&peer->model->rate, &context->rate, RecordStamp(peer, record), record->number,
+                     record->sentTime, record->size, context->now);
     if (record->sizeProbe)
     {
         if (NetPmtuProbeAcked(&peer->pmtu, record->number, record->size, record->sentTime,
@@ -419,7 +533,8 @@ static void PacketAcked(NetPeer *peer, NetSentPacket *record, AckContext *contex
     {
         NetPmtuAcked(&peer->pmtu, record->number, record->size);
     }
-    if (record->windowLimited && !NetCongestionInRecovery(&peer->congestion, record->sentTime))
+    if (peer->model == NULL && record->windowLimited &&
+        !NetCongestionInRecovery(&peer->congestion, record->sentTime))
     {
         context->limitedBytes += record->size;
         if (record->sentTime > context->limitedSentTime)
@@ -435,7 +550,8 @@ static void PacketAcked(NetPeer *peer, NetSentPacket *record, AckContext *contex
     ++context->newlyAcked;
 }
 
-static void PacketLost(NetPeer *peer, NetSentPacket *record, uint64_t now)
+/* contiguous — пакет, отправленный прямо перед этим, тоже потерян. */
+static void PacketLost(NetPeer *peer, NetSentPacket *record, bool contiguous, uint64_t now)
 {
     record->state = NET_RECORD_LOST;
     --peer->ackElicitingOutstanding;
@@ -447,7 +563,9 @@ static void PacketLost(NetPeer *peer, NetSentPacket *record, uint64_t now)
         return;
     }
     ++peer->packetsLost;
-    CongestionOnLoss(peer, record->sentTime, now);
+    if (peer->model != NULL)
+        peer->model->rate.lost += record->size;
+    CongestionOnLoss(peer, record, contiguous, now);
     record->lossEpisode = (uint16_t)peer->recoveryEpisode;
     ++peer->recoveryLosses;
     for (uint32_t index = 0u; index < record->rangeCount; ++index)
@@ -464,6 +582,10 @@ static void SpuriousLoss(NetPeer *peer, NetSentPacket *record, uint32_t distance
                          AckContext *context)
 {
     record->state = NET_RECORD_ACKED;
+    /* Пакет всё же доставлен: в счёт доставленного он идёт, как любой. */
+    if (peer->model != NULL)
+        NetRateAcked(&peer->model->rate, &context->rate, RecordStamp(peer, record), record->number,
+                     record->sentTime, record->size, context->now);
     if (record->sizeProbe)
     {
         /* Запоздавшая проба всё же доказывает свой размер. Окна и порогов
@@ -495,7 +617,10 @@ static void SpuriousLoss(NetPeer *peer, NetSentPacket *record, uint32_t distance
         ++peer->recoverySpurious;
         if (peer->recoverySpurious == peer->recoveryLosses)
         {
-            NetCongestionUndo(&peer->congestion);
+            if (peer->model != NULL)
+                NetBbrUndo(&peer->model->bbr);
+            else
+                NetCongestionUndo(&peer->congestion);
             peer->recoveryUndoable = false;
         }
     }
@@ -545,7 +670,9 @@ static void DetectLost(NetPeer *peer, uint64_t now)
         {
             if (largest - position >= peer->packetThreshold || record->sentTime + lossDelay <= now)
             {
-                PacketLost(peer, record, now);
+                const bool contiguous =
+                    position != 0u && RecordAt(peer, position - 1u)->state == NET_RECORD_LOST;
+                PacketLost(peer, record, contiguous, now);
             }
             else if (peer->lossTime == 0u || record->sentTime + lossDelay < peer->lossTime)
             {
@@ -574,30 +701,138 @@ static void DetectLost(NetPeer *peer, uint64_t now)
     if (collapsed)
     {
         /* Окно, сжатое затяжной перегрузкой, мнимые потери не возвращают. */
-        NetCongestionCollapse(&peer->congestion, now);
+        if (peer->model != NULL)
+            NetBbrCollapse(&peer->model->bbr, now);
+        else
+            NetCongestionCollapse(&peer->congestion, now);
         peer->recoveryUndoable = false;
     }
     RecordsTrim(peer, now);
 }
 
-static uint32_t ProcessAck(const LaiueNetEndpoint *endpoint, NetPeer *peer, const uint8_t **cursor,
-                           const uint8_t *end)
+static void CongestionOnAck(NetPeer *peer, const AckContext *context)
+{
+    const uint64_t rttSample = context->largestNewlyAcked ? peer->latestRtt : 0u;
+    if (peer->model == NULL)
+    {
+        const NetCongestionAck ack = {
+            .now = context->now,
+            .largest = context->largest,
+            .nextNumber = peer->nextNumber,
+            .rttSample = rttSample,
+            .smoothedRtt = peer->haveRtt ? peer->smoothedRtt : NET_INITIAL_RTT,
+            .limitedBytes = context->limitedBytes,
+            .limitedSentTime = context->limitedSentTime,
+        };
+        NetCongestionOnAck(&peer->congestion, &ack);
+        return;
+    }
+    const NetRateSample *sample = &context->rate;
+    const NetBbrAck ack = {
+        .now = context->now,
+        .delivered = peer->model->rate.delivered,
+        .inFlight = peer->bytesInFlight,
+        .priorDelivered = sample->stamp.delivered,
+        .sampleDelivered = sample->flight,
+        .lost = sample->lost,
+        .rate = sample->rate,
+        .proven = sample->proven,
+        .txInFlight = sample->stamp.inFlight,
+        .acked = sample->acked,
+        .sentTime = sample->sentTime,
+        .rttSample = rttSample,
+        .smoothedRtt = peer->haveRtt ? peer->smoothedRtt : 0u,
+        .appLimited = sample->stamp.appLimited,
+    };
+    NetBbrOnAck(&peer->model->bbr, &ack);
+    /* Пока BBR держит окно малым ради замера оборота, скорость доставки
+     * говорит о нём самом, а не о пути. */
+    if (NetBbrProbesRtt(&peer->model->bbr))
+        NetRateLimited(&peer->model->rate, peer->bytesInFlight);
+}
+
+/* Расхождение хода часов сторон между кадрами ACK, которого не объяснить
+ * разницей задержек: часы одной из сторон стояли, пока шли другие. Меньше
+ * половины диапазона часов в кадре. */
+#define ACK_CLOCK_SLACK (60u * NET_SECOND)
+
+/* Часы получателя из кадра ACK, приведённые к часам этой стороны. Кадр несёт
+ * младшие биты, а сколько часы получателя прошли с прошлого кадра,
+ * восстанавливается по тому, сколько прошли свои: ходы расходятся лишь на
+ * разницу задержек, и тишина любой длины ничего не путает. Кадр, обогнанный
+ * более поздним, времени не двигает. Ходы, разошедшиеся больше
+ * ACK_CLOCK_SLACK, говорят о стоявших часах, и тогда верен ход своих. */
+static uint64_t AckClock(NetPeer *peer, uint64_t clock, uint64_t now)
+{
+    if (!peer->model->ackClockKnown)
+    {
+        /* Первое подтверждение привязывает часы получателя к своим. */
+        peer->model->ackClockKnown = true;
+        peer->model->ackClock = clock;
+        peer->model->ackClockTime = now;
+        peer->model->ackClockSeen = now;
+        return now;
+    }
+    const uint64_t elapsed = now - peer->model->ackClockSeen;
+    /* На сколько часы получателя ушли вперёд своих: ближайшее к нулю число с
+     * теми же младшими битами. */
+    const uint64_t ahead = (clock - peer->model->ackClock - elapsed) & NET_ACK_CLOCK_MASK;
+    const uint64_t behind = NET_ACK_CLOCK_MASK + 1u - ahead;
+    uint64_t advance = elapsed;
+    if (ahead <= ACK_CLOCK_SLACK)
+    {
+        advance = elapsed + ahead;
+    }
+    else if (behind <= ACK_CLOCK_SLACK)
+    {
+        if (behind >= elapsed)
+            return peer->model->ackClockTime;
+        advance = elapsed - behind;
+    }
+    peer->model->ackClock = clock;
+    peer->model->ackClockTime += advance;
+    peer->model->ackClockSeen = now;
+    return peer->model->ackClockTime;
+}
+
+/* clocked — кадр ACK_CLOCK, с часами получателя. */
+static uint32_t ProcessAck(const LaiueNetEndpoint *endpoint, NetPeer *peer, bool clocked,
+                           const uint8_t **cursor, const uint8_t *end)
 {
     uint64_t largest = 0u;
     uint64_t delay = 0u;
+    uint64_t clock = 0u;
+    uint64_t accuracy = 0u;
     uint64_t count = 0u;
     uint64_t first = 0u;
     if (!NetVarintRead(cursor, end, &largest) || !NetVarintRead(cursor, end, &delay) ||
+        (clocked &&
+         (!NetVarintRead(cursor, end, &clock) || !NetVarintRead(cursor, end, &accuracy))) ||
         !NetVarintRead(cursor, end, &count) || !NetVarintRead(cursor, end, &first))
         return NET_FRAMES_VIOLATION;
     /* Подтверждать можно только отправленное. */
-    if (largest >= peer->nextNumber || first > largest || count > 255u)
+    if (largest >= peer->nextNumber || first > largest || count > 255u ||
+        clock > NET_ACK_CLOCK_MASK || accuracy >> 1u > NET_ACK_CLOCK_MASK)
         return NET_FRAMES_VIOLATION;
-    AckContext context = {
-        .now = endpoint->now,
-        .largest = largest,
-        .largestPosition = RecordFind(peer, largest),
-    };
+    /* Замер скорости доставки ведётся только для BBR, и для CUBIC его поля не
+     * заполняются вовсе. */
+    AckContext context;
+    context.now = endpoint->now;
+    context.largest = largest;
+    context.largestPosition = RecordFind(peer, largest);
+    context.largestSentTime = 0u;
+    context.limitedBytes = 0u;
+    context.limitedSentTime = 0u;
+    context.largestNewlyAcked = false;
+    context.newlyAcked = 0u;
+    if (peer->model != NULL)
+    {
+        memset(&context.rate, 0, sizeof(context.rate));
+        /* Без часов получателя подтверждение датируется своими. */
+        context.rate.ackTime = clocked ? AckClock(peer, clock, endpoint->now) : endpoint->now;
+        context.rate.ackAge = accuracy >> 1u;
+        context.rate.ackOpen = (accuracy & 1u) != 0u;
+    }
     uint64_t low = largest - first;
     AckRange(peer, low, largest, &context);
     for (uint64_t index = 0u; index < count; ++index)
@@ -624,16 +859,11 @@ static uint32_t ProcessAck(const LaiueNetEndpoint *endpoint, NetPeer *peer, cons
     if (context.largestNewlyAcked)
         UpdateRtt(peer, endpoint->now - context.largestSentTime, delay, endpoint->now);
     DetectLost(peer, endpoint->now);
-    const NetCongestionAck ack = {
-        .now = endpoint->now,
-        .largest = largest,
-        .nextNumber = peer->nextNumber,
-        .rttSample = context.largestNewlyAcked ? peer->latestRtt : 0u,
-        .smoothedRtt = peer->haveRtt ? peer->smoothedRtt : NET_INITIAL_RTT,
-        .limitedBytes = context.limitedBytes,
-        .limitedSentTime = context.limitedSentTime,
-    };
-    NetCongestionOnAck(&peer->congestion, &ack);
+    /* Замер считается после потерь: в него входит и потерянное за полёт
+     * пакета. */
+    if (peer->model != NULL)
+        NetRateFinish(&peer->model->rate, &context.rate, peer->haveRtt ? peer->minRtt : 0u);
+    CongestionOnAck(peer, &context);
     peer->probeCount = 0u;
     return NET_FRAMES_OK;
 }
@@ -715,10 +945,12 @@ uint32_t NetPeerProcessFrames(LaiueNetEndpoint *endpoint, NetPeer *peer, const u
             *outAckEliciting = true;
             break;
         case NET_FRAME_ACK:
+        case NET_FRAME_ACK_CLOCK:
             /* Честному отправителю хватает одного кадра на пакет, а разбор
              * каждого обходит записи отправленного: вторым кадром собеседник
              * лишь заставлял бы делать эту работу повторно. */
-            status = acked ? NET_FRAMES_VIOLATION : ProcessAck(endpoint, peer, &cursor, end);
+            status = acked ? NET_FRAMES_VIOLATION
+                           : ProcessAck(endpoint, peer, type == NET_FRAME_ACK_CLOCK, &cursor, end);
             acked = true;
             break;
         case NET_FRAME_CLOSE:
@@ -776,8 +1008,9 @@ void NetPeerSendClose(LaiueNetEndpoint *endpoint, NetPeer *peer)
 
 static void SendAckOnly(LaiueNetEndpoint *endpoint, NetPeer *peer)
 {
-    const uint32_t used = WriteAck(peer, endpoint->packetBuffer + NET_SHORT_HEADER_SIZE,
-                                   peer->datagramBytes - NET_SHORT_OVERHEAD, endpoint->now);
+    const uint32_t used =
+        WriteAck(peer, endpoint->packetBuffer + NET_SHORT_HEADER_SIZE,
+                 peer->datagramBytes - NET_SHORT_OVERHEAD, endpoint->now, endpoint->drainedTime);
     AckSent(peer);
     if (used != 0u)
         SealAndSend(endpoint, peer, used);
@@ -806,8 +1039,25 @@ static void RecordsMakeRoom(NetPeer *peer, uint64_t now)
         return;
     NetSentPacket *front = RecordAt(peer, 0u);
     if (front->state == NET_RECORD_SENT)
-        PacketLost(peer, front, now);
+        PacketLost(peer, front, false, now);
     RecordsPop(peer);
+}
+
+/* Когда пакет ушёл бы при ровном темпе. Заработанное за время между
+ * обновлениями уходит разом в его конце, а ровный темп растянул бы пачку на
+ * всё это время. Отправленное сверх заработанного — из запаса, настоящей
+ * пачкой. */
+static uint64_t PacedTime(NetPeer *peer, uint32_t total, uint64_t now)
+{
+    uint64_t paced = now;
+    peer->model->paceSpent += total;
+    if (peer->model->paceSpent < peer->model->paceEarned)
+        paced = now - peer->model->paceElapsed +
+                NetScale(peer->model->paceSpent, peer->model->paceElapsed, peer->model->paceEarned);
+    if (paced < peer->model->paceClock)
+        paced = peer->model->paceClock;
+    peer->model->paceClock = paced;
+    return paced;
 }
 
 /* Запись пакета, требующего подтверждения, перед его отправкой. */
@@ -822,9 +1072,17 @@ static NetSentPacket *RecordSent(NetPeer *peer, uint32_t total, uint64_t now)
     record->state = NET_RECORD_SENT;
     record->rangeCount = 0u;
     /* Окно тесно, если пакет занимает его хотя бы наполовину. */
-    record->windowLimited = (peer->bytesInFlight + total) * 2u >= peer->congestion.window;
+    record->windowLimited = (peer->bytesInFlight + total) * 2u >= NetPeerWindow(peer);
     record->sizeProbe = false;
+    const uint64_t before = peer->bytesInFlight;
     peer->bytesInFlight += total;
+    /* Скорость доставки нужна только модели пути BBR. */
+    if (peer->model != NULL)
+    {
+        NetBbrOnSend(&peer->model->bbr, before, total, peer->model->rate.appLimited != 0u, now);
+        NetRateSent(&peer->model->rate, RecordStamp(peer, record), peer->bytesInFlight, total,
+                    PacedTime(peer, total, now), now);
+    }
     ++peer->ackElicitingOutstanding;
     peer->lastAckElicitingSent = now;
     peer->paceBudget -= (int64_t)total;
@@ -840,7 +1098,7 @@ static void SendSizeProbe(LaiueNetEndpoint *endpoint, NetPeer *peer)
     const uint32_t size = NetPmtuProbeSize(&peer->pmtu, now);
     if (size == 0u || !peer->confirmed ||
         (!NetPeerHasStreamData(peer) && NetPeerQueuedUnreliable(peer) == 0u) ||
-        peer->bytesInFlight >= peer->congestion.window || peer->paceBudget <= 0 ||
+        peer->bytesInFlight >= NetPeerWindow(peer) || peer->paceBudget <= 0 ||
         !RecordsRoom(peer, now))
         return;
     RecordsMakeRoom(peer, now);
@@ -867,7 +1125,7 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
         peer->pingPending || NetPeerQueuedUnreliable(peer) != 0u || NetPeerHasStreamData(peer);
     /* Пробы идут мимо окна и размеренной отправки: они и выясняют, жив ли
      * путь. */
-    const bool sendData = probe || (hasData && peer->bytesInFlight < peer->congestion.window &&
+    const bool sendData = probe || (hasData && peer->bytesInFlight < NetPeerWindow(peer) &&
                                     peer->paceBudget > 0 && RecordsRoom(peer, now));
     /* Одинокий пакет ждёт подтверждения до следующего обновления: за это
      * время ответ может уехать вместе с данными. */
@@ -880,7 +1138,7 @@ static bool SendPacket(LaiueNetEndpoint *endpoint, NetPeer *peer)
     uint32_t used = 0u;
     if (peer->ackPendingCount != 0u)
     {
-        used = WriteAck(peer, payload, space, now);
+        used = WriteAck(peer, payload, space, now, endpoint->drainedTime);
         AckSent(peer);
     }
     NetSentRange ranges[NET_RECORD_RANGES] = {0};
@@ -964,8 +1222,7 @@ static void Migrate(NetPeer *peer, const LaiueNetAddress *from, uint64_t now)
     {
         NetPmtuReset(&peer->pmtu, peer->pmtu.base, peer->pmtu.limit, now);
         peer->datagramBytes = peer->pmtu.current;
-        NetCongestionReset(&peer->congestion, peer->datagramBytes, MinimumWindow(peer),
-                           peer->nextNumber);
+        ControlReset(peer, MinimumWindow(peer), now);
     }
 }
 
@@ -1061,6 +1318,11 @@ void NetShortReceive(LaiueNetEndpoint *endpoint, const LaiueNetAddress *from, ui
         peer->largestEliciting = number;
         peer->largestElicitingTime = endpoint->now;
     }
+    if (peer->remote.ackClock)
+    {
+        peer->arrivalTime = endpoint->now;
+        peer->arrivalFloor = endpoint->drainedTime;
+    }
     if (peer->ackPendingCount == 0u)
         peer->ackPendingSince = endpoint->now;
     ++peer->ackPendingCount;
@@ -1115,23 +1377,71 @@ static void PaceRefill(NetPeer *peer, uint64_t now)
 {
     uint64_t elapsed = now - peer->paceTime;
     peer->paceTime = now;
-    if (!peer->haveRtt)
+    const uint64_t window = NetPeerWindow(peer);
+    if (peer->model != NULL)
+    {
+        /* Ровный темп этого обновления ещё ничего не заработал. */
+        peer->model->paceSpent = 0u;
+        peer->model->paceEarned = 0u;
+    }
+    if (!peer->haveRtt || (peer->model != NULL && peer->model->bbr.pacingRate == 0u))
     {
         /* Пока путь не измерен, отправку сдерживает одно окно перегрузки. */
-        peer->paceBudget = (int64_t)peer->congestion.window;
+        peer->paceBudget = (int64_t)window;
         return;
     }
     if (elapsed > 10u * NET_SECOND)
         elapsed = 10u * NET_SECOND;
-    /* Темп — окно за время оборота с запасом в четверть. Накопить можно не
-     * больше начальной пачки или того, что набежало за одно обновление. */
-    const uint64_t rtt = peer->smoothedRtt > NET_MILLISECOND ? peer->smoothedRtt : NET_MILLISECOND;
-    const int64_t earned = (int64_t)(peer->congestion.window * 5u / 4u * elapsed / rtt);
-    const int64_t burst = 10 * (int64_t)peer->datagramBytes;
-    const int64_t ceiling = earned > burst ? earned : burst;
-    peer->paceBudget += earned;
+    /* Темп BBR задаёт его модель пути. У CUBIC это окно за время оборота с
+     * запасом в четверть. */
+    uint64_t earned = 0u;
+    if (peer->model != NULL)
+    {
+        const uint64_t rate = peer->model->bbr.pacingRate < NET_PACING_RATE_LIMIT
+                                  ? peer->model->bbr.pacingRate
+                                  : NET_PACING_RATE_LIMIT;
+        const uint64_t total = rate * elapsed + peer->model->paceRemainder;
+        earned = total / NET_SECOND;
+        peer->model->paceRemainder = total % NET_SECOND;
+        if (earned > NET_CONGESTION_WINDOW_LIMIT)
+            earned = NET_CONGESTION_WINDOW_LIMIT;
+        peer->model->paceEarned = earned;
+        peer->model->paceElapsed = elapsed;
+    }
+    else
+    {
+        const uint64_t rtt =
+            peer->smoothedRtt > NET_MILLISECOND ? peer->smoothedRtt : NET_MILLISECOND;
+        earned = window * 5u / 4u * elapsed / rtt;
+    }
+    /* Накопить можно не больше пачки или того, что набежало за одно
+     * обновление. Пачка CUBIC — начальное окно; BBR после простоя
+     * возвращается ровно в темпе пути, и его пачка — миллисекунда отправки. */
+    const int64_t burst = peer->model != NULL ? (int64_t)NetBbrQuantum(&peer->model->bbr)
+                                              : 10 * (int64_t)peer->datagramBytes;
+    const int64_t ceiling = (int64_t)earned > burst ? (int64_t)earned : burst;
+    peer->paceBudget += (int64_t)earned;
     if (peer->paceBudget > ceiling)
         peer->paceBudget = ceiling;
+}
+
+/* Отправка этого обновления кончилась: почему — важно замеру скорости. Если
+ * слать больше нечего, хотя окно и темп ещё позволяли, пакеты ближайшего
+ * оборота мерят приложение, а не путь. Данные, которым не даёт уйти окно
+ * приёма собеседника, считаются неотправленными: узкое место тогда он. */
+static void SendFinished(NetPeer *peer)
+{
+    const bool pending = NetPeerQueuedUnreliable(peer) != 0u || NetPeerStreamPending(peer);
+    if (peer->bytesInFlight < NetPeerWindow(peer) && peer->paceBudget > 0)
+    {
+        if (!pending)
+            NetRateLimited(&peer->model->rate, peer->bytesInFlight);
+    }
+    else if (pending && peer->model != NULL &&
+             peer->bytesInFlight + peer->datagramBytes > NetPeerWindow(peer))
+    {
+        NetBbrWindowFilled(&peer->model->bbr);
+    }
 }
 
 void NetPeerUpdate(LaiueNetEndpoint *endpoint, NetPeer *peer)
@@ -1191,6 +1501,8 @@ void NetPeerUpdate(LaiueNetEndpoint *endpoint, NetPeer *peer)
         if (!SendPacket(endpoint, peer))
             break;
     }
+    if (peer->model != NULL)
+        SendFinished(peer);
     if (peer->state == NET_STATE_FLUSHING && peer->queuedReliable == 0u &&
         NetPeerQueuedUnreliable(peer) == 0u)
         NetPeerClose(endpoint, peer, LAIUE_NET_REASON_LOCAL, peer->closeCode,
