@@ -28,6 +28,13 @@ $lineRegex = [regex]'^\s+([0-9A-F]{16}):\s+[0-9A-F]{8}\s+(\S+)\s*(.*)$'
 $memoryRegex = [regex]'\[(\w+)(?:,#(-?0x[0-9A-F]+|-?\d+))?\](!?)(?:,#(-?0x[0-9A-F]+|-?\d+))?'
 $branchRegex = [regex]'^(b|bl|blr|br|ret|cbz|cbnz|tbz|tbnz|beq|bne|bcs|bhs|bcc|blo|bmi|bpl|bvs|bvc|bhi|bls|bge|blt|bgt|ble|bal|brk|svc|udf)$'
 $width = @{ x = 8; w = 4; q = 16; d = 8; s = 4; h = 2; b = 1 }
+$aliases = @{ xip0 = 'x16'; xip1 = 'x17'; wip0 = 'x16'; wip1 = 'x17'; fp = 'x29'; lr = 'x30' }
+function Get-Register([string]$name) {
+    $name = $name.Trim()
+    if ($aliases.ContainsKey($name)) { return $aliases[$name] }
+    if ($name -match '^[xw](\d+)$') { return "x$($Matches[1])" }
+    $name
+}
 $hits = [Collections.Generic.List[string]]::new()
 $scanned = 0
 $files = if ($DisasmFile) { @(Get-Item $DisasmFile) } else { Get-ChildItem $Bin -File -Filter $Include }
@@ -45,14 +52,16 @@ foreach ($file in $files) {
     $symbols = $null
     $zero = [Collections.Generic.HashSet[string]]::new()
     $stores = [Collections.Generic.List[object]]::new()
+    $recent = [Collections.Generic.List[string]]::new()
     foreach ($line in $lines) {
         $match = $lineRegex.Match($line)
         if (-not $match.Success) { continue }
         $va = [Convert]::ToUInt64($match.Groups[1].Value, 16)
         $op = $match.Groups[2].Value
         $operandText = $match.Groups[3].Value.Trim()
-        if ($targets.Contains($va)) { $zero.Clear(); $stores.Clear() }
-        if ($branchRegex.IsMatch($op)) { $zero.Clear(); $stores.Clear(); continue }
+        if ($targets.Contains($va)) { $zero.Clear(); $stores.Clear(); $recent.Clear() }
+        $recent.Add($line)
+        if ($branchRegex.IsMatch($op)) { $zero.Clear(); $stores.Clear(); $recent.Clear(); continue }
         $operands = @($operandText -split ',')
         if ($op -eq 'movi' -and $operandText -match '^v(\d+)\.\w+,#0$') { [void]$zero.Add($Matches[1]); continue }
         if ($op -eq 'fmov' -and $operandText -match '^[dsh](\d+),[xw]zr$') { [void]$zero.Add($Matches[1]); continue }
@@ -60,7 +69,7 @@ foreach ($file in $files) {
         $writeback = $memory.Success -and ($memory.Groups[3].Value -eq '!' -or $memory.Groups[4].Success)
         if ($op -match '^(stp|stnp|str|stur|strb|strh|sturb|sturh)$' -and $memory.Success) {
             $registers = @($operandText.Substring(0, $memory.Index).TrimEnd(',') -split ',')
-            $base = $memory.Groups[1].Value
+            $base = Get-Register $memory.Groups[1].Value
             $offset = if ($memory.Groups[2].Success) { [int64]$memory.Groups[2].Value } else { 0 }
             if ($memory.Groups[4].Success) { $offset = 0 }
             $size = if ($op -in 'strb', 'sturb') { 1 } elseif ($op -in 'strh', 'sturh') { 2 } else { $width[$registers[0].Substring(0, 1)] }
@@ -73,24 +82,26 @@ foreach ($file in $files) {
             }
             if ($isZero) {
                 foreach ($earlier in $stores) {
-                    if ($earlier.Base -eq $base -and -not $earlier.Zero -and
+                    if ($earlier.Base -eq $base -and -not $earlier.Zero -and $size -gt $earlier.Size -and
                         $offset -lt $earlier.Offset + $earlier.Size -and $earlier.Offset -lt $offset + $size) {
                         if ($null -eq $symbols) { $symbols = Get-Symbols $file.FullName }
                         $hits.Add(('{0}: {1} {2} @0x{3:x} [{4}] overwrites {5} {6} @0x{7:x}' -f
                             $file.Name, $op, $operandText, $va, (Get-Function $symbols $va),
                             $earlier.Op, $earlier.Args, $earlier.Va))
+                        $from = [Math]::Max(0, $earlier.Line - 3)
+                        $hits.Add(($recent.GetRange($from, $recent.Count - $from) -join "`n"))
                     }
                 }
             }
             if ($writeback) { $stores.Clear() }
             else {
-                $stores.Add([pscustomobject]@{ Base = $base; Offset = $offset; Size = $size; Zero = $isZero; Op = $op; Args = $operandText; Va = $va })
+                $stores.Add([pscustomobject]@{ Base = $base; Offset = $offset; Size = $size; Zero = $isZero; Op = $op; Args = $operandText; Va = $va; Line = $recent.Count - 1 })
             }
             continue
         }
         if ($memory.Success) {
             # A load through this base may read the earlier stores.
-            $base = $memory.Groups[1].Value
+            $base = Get-Register $memory.Groups[1].Value
             [void]$stores.RemoveAll([Predicate[object]]{ param($s) $s.Base -eq $base })
             if ($writeback) { $stores.Clear() }
         }
@@ -99,14 +110,9 @@ foreach ($file in $files) {
         if ($op -match '^ld[an]?p' -or $op -match '^ld\w*xp$') { $written += $operands[1] }
         foreach ($register in $written) {
             $register = $register.Trim()
-            if ($register -match '^[qdshbv](\d+)') { [void]$zero.Remove($Matches[1]) }
-            elseif ($register -match '^[xw](\d+)$') {
-                $name = "x$($Matches[1])"
-                [void]$stores.RemoveAll([Predicate[object]]{ param($s) $s.Base -eq $name })
-            }
-            elseif ($register -eq 'sp') {
-                [void]$stores.RemoveAll([Predicate[object]]{ param($s) $s.Base -eq 'sp' })
-            }
+            if ($register -match '^[qdshbv](\d+)') { [void]$zero.Remove($Matches[1]); continue }
+            $name = Get-Register $register
+            [void]$stores.RemoveAll([Predicate[object]]{ param($s) $s.Base -eq $name })
         }
     }
 }

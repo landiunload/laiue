@@ -39,10 +39,6 @@ jobs:
           }
           $match = if ($env:VCToolsVersion -like '14.52.*') { 'true' } else { 'false' }
           "match=$match" | Out-File $env:GITHUB_OUTPUT -Append
-      - name: Minimal repro
-        if: steps.toolset.outputs.match == 'true'
-        shell: pwsh
-        run: ./probe/repro/run.ps1 -Disassemble
       - name: Build Release with link maps
         if: steps.toolset.outputs.match == 'true'
         shell: pwsh
@@ -62,8 +58,8 @@ jobs:
       - name: Scan every engine DLL
         if: steps.toolset.outputs.match == 'true'
         shell: pwsh
-        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.dll' -Show 200
+        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.dll' -Show 400
       - name: Scan every executable
         if: steps.toolset.outputs.match == 'true'
         shell: pwsh
-        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.exe' -Show 200
+        run: ./probe/scan_stores.ps1 -Bin build/windows-msvc-arm64/bin/Release -Include '*.exe' -Show 400
