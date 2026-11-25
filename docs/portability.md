@@ -164,10 +164,10 @@ libraries.
 включая D3D12-клиент: Direct3D 12 доступен на ARM64, а архитектурно-зависимые
 места имеют собственные реализации. Маска колонны в `mesh` использует NEON
 вместо SSE2, `scene` берёт аппаратный `fsqrt`, а no-CRT runtime заменяет
-`rep stosb`/`rep movsb` явными циклами: у ARM64 нет строковых инструкций.
-Обе реализации маски проверены против скалярного эталона на своей
-архитектуре, а loop-based `memset`/`memcpy`/`memcmp`/`memmove` — запуском на
-реальном aarch64.
+`rep stosb`/`rep movsb` циклами 16-байтных векторов NEON: у ARM64 нет
+строковых инструкций. Обе реализации маски проверены против скалярного
+эталона на своей архитектуре, а `memset`/`memcpy`/`memcmp`/`memmove` —
+тестом `laiue.runtime.memory` на реальном aarch64.
 
 Запускайте из ARM64 VS Developer PowerShell:
 
@@ -485,6 +485,13 @@ platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указа�
 точными FP-флагами закрытого компилятора. В этом режиме graphics выключен,
 модули статические, динамический native-код модов выключен, а SDK export
 принадлежит родительскому superbuild.
+
+Сокеты в обязательный контракт не входят. Adapter, который реализует и
+`src/platform/socket.h`, включает `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`, и
+`laiue.net` собирает свой драйвер UDP. Датаграммы такого сокета система не
+дробит, если adapter умеет это запретить. Без сокетов транспорт остаётся,
+`LaiueNetUdpOpen` отвечает `LAIUE_NET_UNSUPPORTED`, а сеть платформы
+подключается собственным `LaiueNetDriverV1`.
 
 Публичный `linux-external-port-smoke` проверяет именно эту границу, static
 link и core-тесты. Он использует тестовый Linux adapter и не является

@@ -20,9 +20,10 @@ typedef struct LaiueModuleDiagnostic
     char message[LAIUE_MODULE_DIAGNOSTIC_CAPACITY];
 } LaiueModuleDiagnostic;
 
-/* Startup-only, caller-owned diagnostics for a profile load. The report is
- * deliberately a flat C table so a UI, logger, or platform adapter can use it
- * without retaining loader internals. */
+/* Caller-owned diagnostics for a profile load. The report is deliberately a
+ * flat C table so a UI, logger, or platform adapter can use it without
+ * retaining loader internals. loadedCount counts the modules this load
+ * started, not the ones that were already running. */
 typedef struct LaiueModuleLoadReportEntryV1
 {
     uint32_t structSize;
@@ -102,9 +103,10 @@ LAIUE_MOD_API LaiueModuleHost *LaiueModuleHostCreate(const LaiueModuleHostConfig
                                                        LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleHostDestroy(LaiueModuleHost *host);
 
-/* Host-owned services (window, graphics, input) are registered before load.
- * The service registry is frozen while any module is loaded; register and
- * unregister return LAIUE_MODULE_BUSY until LaiueModuleHostUnloadAll finishes. */
+/* Host-owned services (window, graphics, input). Register and unregister work
+ * at any time outside a lifecycle operation. Unregister returns
+ * LAIUE_MODULE_IN_USE while a loaded module uses the service, so no module is
+ * left holding a removed table. */
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostRegisterService(
     LaiueModuleHost *host, const LaiueModuleServiceV1 *service,
     LaiueModuleDiagnostic *diagnostic);
@@ -114,7 +116,13 @@ LAIUE_MOD_API const void *LaiueModuleHostQueryService(
     const LaiueModuleHost *host, const char *name, uint32_t minimumVersion,
     uint32_t minimumSize, uint32_t *outVersion, uint32_t *outSize);
 
-/* Loads explicit paths; no directory scan or automatic execution is performed. */
+/* Loads explicit paths; no directory scan or automatic execution is performed.
+ * Loading adds to the modules already running and needs no restart: new
+ * modules may use the services of running ones, and a module id or service
+ * that is already present is refused. The load is a transaction over its own
+ * modules: if any of them fails, every one of them is unwound, the running
+ * set is left as it was, and no module outside the load sees their services
+ * before it succeeds. */
 LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoad(
     LaiueModuleHost *host, const LaiueModuleBinaryV1 *binaries, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
@@ -145,6 +153,38 @@ LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostLoadStatic(
     LaiueModuleHost *host, const LaiueModuleApiV1 *const *apis, uint32_t count,
     LaiueModuleDiagnostic *diagnostic);
 LAIUE_MOD_API void LaiueModuleHostUnloadAll(LaiueModuleHost *host);
+
+/* With this flag LaiueModuleHostUnloadV1 also unloads every module that uses
+ * the given one, directly or through other modules. */
+#define LAIUE_MODULE_UNLOAD_DEPENDENTS (UINT32_C(1) << 0)
+
+/* Stops, destroys and closes one running module without a restart. A module
+ * uses another when it declared a requirement on one of its services or
+ * obtained one of its tables through queryService. Users leave before the
+ * modules they use; without LAIUE_MODULE_UNLOAD_DEPENDENTS a module in use is
+ * refused with LAIUE_MODULE_IN_USE, an unknown id with
+ * LAIUE_MODULE_NOT_LOADED. The application drops the tables it obtained from
+ * these modules before the call. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostUnloadV1(LaiueModuleHost *host, const char *id,
+                                                        uint32_t flags,
+                                                        LaiueModuleDiagnostic *diagnostic);
+
+typedef struct LaiueModuleIdV1
+{
+    char id[LAIUE_MODULE_MAX_NAME];
+} LaiueModuleIdV1;
+
+/* Lists the modules that LaiueModuleHostUnloadV1 with
+ * LAIUE_MODULE_UNLOAD_DEPENDENTS would unload together with `id`, in the
+ * order it would unload them; `id` itself is not listed. *outCount receives
+ * the full number. When it exceeds capacity, the first capacity entries are
+ * written and LAIUE_MODULE_CAPACITY is returned. LAIUE_MODULE_BUSY means a
+ * lifecycle operation is in progress. */
+LAIUE_MOD_API LaiueModuleStatus LaiueModuleHostListDependentsV1(const LaiueModuleHost *host,
+                                                                const char *id,
+                                                                LaiueModuleIdV1 *output,
+                                                                uint32_t capacity,
+                                                                uint32_t *outCount);
 
 /* === Modules by name ===
  *
@@ -191,8 +231,12 @@ LAIUE_MOD_API uint32_t LaiueModuleHostLoadedCount(const LaiueModuleHost *host);
 /* Fixed-width C ABI result: non-zero when the selected module is loaded. */
 LAIUE_MOD_API uint32_t LaiueModuleHostIsLoaded(const LaiueModuleHost *host, const char *id);
 
-/* Lifecycle calls (load, unload and destroy) must be serialized and must not
- * be called reentrantly from module callbacks. Service queries are thread-safe,
- * but return borrowed pointers rather than leases. Before UnloadAll/Destroy,
- * the application must stop and join every callback, job, or thread that may
- * still use module services. */
+/* Lifecycle calls (load, unload, service registration and destroy) may run
+ * while the application is running, at its own safe point, for example
+ * between ticks. One runs at a time, and a call made while another is in
+ * progress returns LAIUE_MODULE_BUSY; none may be called reentrantly from
+ * module callbacks. Service
+ * queries are thread-safe, but return borrowed pointers rather than leases.
+ * Before an unload, the application must stop and join every callback, job,
+ * or thread of its own that may still use the services of the modules it
+ * unloads. */

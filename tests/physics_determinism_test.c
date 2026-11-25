@@ -153,21 +153,23 @@ static VoxelBodyShape DeterminismShape(void)
 
 static void SimulationInitialize(Simulation *simulation)
 {
-    *simulation = (Simulation){0};
-    simulation->providerApi.context = &simulation->provider;
-    simulation->providerApi.getBlock = DeterminismGetBlock;
-    simulation->providerApi.rebase = DeterminismRebase;
+    *simulation = (Simulation){
+        .providerApi =
+            {
+                .context = &simulation->provider,
+                .getBlock = DeterminismGetBlock,
+                .rebase = DeterminismRebase,
+            },
+        .position = {0.5, 0.5, 2.751},
+        .velocity = {5.0 / 256.0, -3.0 / 256.0, 0.0},
+        .hash = 14695981039346656037ULL,
+    };
     simulation->world = WorldCreate(&simulation->providerApi);
     DeterminismExpect(simulation->world != NULL, "simulation world creation");
-    simulation->collision.context = simulation->world;
-    simulation->collision.queryBlockPhysics = QueryWorldPhysics;
-    simulation->position[0] = 0.5;
-    simulation->position[1] = 0.5;
-    simulation->position[2] = 2.751;
-    simulation->velocity[0] = 5.0 / 256.0;
-    simulation->velocity[1] = -3.0 / 256.0;
-    simulation->velocity[2] = 0.0;
-    simulation->hash = 14695981039346656037ULL;
+    simulation->collision = (VoxelCollisionSource){
+        .context = simulation->world,
+        .queryBlockPhysics = QueryWorldPhysics,
+    };
     for (uint32_t axis = 0U; axis < 3U; ++axis)
     {
         InfiniteCoordInit(&simulation->origin[axis]);

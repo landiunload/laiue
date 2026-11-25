@@ -97,6 +97,24 @@ if(laiue_shared_modules AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
     endif()
 endif()
 
+# memset, memcpy, memmove and memcmp of the Windows no-CRT runtime; other
+# platforms take them from libc.
+if(LAIUE_PLATFORM_WINDOWS)
+    laiue_add_harness(laiue_runtime_memory_test RuntimeMemoryTestEntryPoint
+        runtime_memory_test.c TEST laiue.runtime.memory TIMEOUT 60)
+endif()
+
+# The crash report every harness installs. The harness crashes on purpose, so
+# a script runs it and checks the report; sanitizers print their own.
+if(NOT (LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS))
+    laiue_add_harness(laiue_crash_report_test CrashReportTestEntryPoint crash_report_test.c)
+    set_target_properties(laiue_crash_report_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME laiue.harness.crash_report
+        COMMAND "${CMAKE_COMMAND}" "-DHARNESS=$<TARGET_FILE:laiue_crash_report_test>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_crash_report_test.cmake")
+    set_tests_properties(laiue.harness.crash_report PROPERTIES TIMEOUT 120)
+endif()
+
 # Platform.
 laiue_add_harness(laiue_platform_crypto_test PlatformCryptoTestEntry platform_crypto_test.c
     TEST laiue.platform.crypto)
@@ -108,6 +126,13 @@ if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
 endif()
 laiue_add_harness(laiue_platform_threading_test PlatformThreadingTestEntryPoint
     platform_threading_test.c TEST laiue.platform.threading)
+# Reads the options of an open socket from the system, so it knows the built-in
+# backends only: an external adapter keeps its own socket behind the handle.
+if(NOT LAIUE_PLATFORM_EXTERNAL)
+    laiue_add_harness(laiue_platform_socket_test PlatformSocketTestEntryPoint
+        platform_socket_test.c LIBRARIES laiue::platform_support
+        TEST laiue.platform.socket TIMEOUT 60)
+endif()
 if(LAIUE_PLATFORM_WINDOWS)
     laiue_add_harness(laiue_efficiency_windows_test EfficiencyWindowsTestEntryPoint
         efficiency_windows_test.c TEST laiue.platform.efficiency_mode)
@@ -162,6 +187,63 @@ target_compile_definitions(laiue_navigation_failure_subject PRIVATE
 laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
     navigation_failure_test.c $<TARGET_OBJECTS:laiue_navigation_failure_subject>
     STATIC TEST laiue.navigation.allocation_failure TIMEOUT 60)
+
+# Crypto. The native test links the library; the portable one compiles the
+# sources over the portable 128-bit product, which the build otherwise
+# replaces with __int128 or MSVC intrinsics.
+laiue_add_harness(laiue_crypto_test CryptoTestEntryPoint crypto_test.c
+    LIBRARIES laiue::crypto_support TEST laiue.crypto.signatures TIMEOUT 120)
+laiue_add_harness(laiue_crypto_portable_test CryptoTestEntryPoint crypto_test.c
+    "${laiue_src}/core/crypto/sha512.c" "${laiue_src}/core/crypto/scalar25519.c"
+    "${laiue_src}/core/crypto/ed25519.c" DEFINITIONS LAIUE_CRYPTO_PORTABLE=1
+    TEST laiue.crypto.signatures_portable TIMEOUT 120)
+
+# Net. The primitives are internal, so their test compiles the source itself.
+laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC TEST laiue.net.crypto TIMEOUT 120)
+# The same checks without vectors and over the portable 128-bit product, which
+# the build otherwise replaces with SIMD, __int128 or MSVC intrinsics.
+laiue_add_harness(laiue_net_crypto_portable_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC DEFINITIONS LAIUE_CRYPTO_PORTABLE=1
+    TEST laiue.net.crypto_portable TIMEOUT 120)
+laiue_add_harness(laiue_net_channel_test NetChannelTestEntryPoint net_channel_test.c
+    "${laiue_src}/net/net_channel.c" "${laiue_src}/net/net_wire.c" STATIC
+    LIBRARIES laiue::platform_support TEST laiue.net.channel TIMEOUT 120)
+laiue_add_harness(laiue_net_congestion_test NetCongestionTestEntryPoint net_congestion_test.c
+    "${laiue_src}/net/net_congestion.c" STATIC TEST laiue.net.congestion TIMEOUT 120)
+laiue_add_harness(laiue_net_bbr_test NetBbrTestEntryPoint net_bbr_test.c
+    "${laiue_src}/net/net_bbr.c" "${laiue_src}/net/net_rate.c" STATIC
+    TEST laiue.net.bbr TIMEOUT 120)
+laiue_add_harness(laiue_net_pmtu_test NetPmtuTestEntryPoint net_pmtu_test.c
+    "${laiue_src}/net/net_pmtu.c" STATIC TEST laiue.net.pmtu TIMEOUT 120)
+laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
+    LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
+if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))
+    laiue_add_harness(laiue_net_udp_test NetUdpTestEntryPoint net_udp_test.c
+        LIBRARIES laiue::net laiue::platform_support TEST laiue.net.udp TIMEOUT 120)
+endif()
+# Allocation faults are injected only into copies of the endpoint sources; the
+# simulator keeps the real allocator, so the network itself never fails.
+set(laiue_net_failure_sources)
+foreach(source net_crypto net_wire net_address net_channel net_congestion net_rate net_bbr
+        net_pmtu net_packet net_handshake net_endpoint)
+    configure_file("${laiue_src}/net/${source}.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c" COPYONLY)
+    list(APPEND laiue_net_failure_sources "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c")
+endforeach()
+add_library(laiue_net_failure_subject OBJECT ${laiue_net_failure_sources})
+target_link_libraries(laiue_net_failure_subject PRIVATE laiue_common)
+target_compile_definitions(laiue_net_failure_subject PRIVATE
+    LAIUE_STATIC=1
+    PlatformAllocate=NetTestAllocate PlatformReallocate=NetTestReallocate
+    PlatformFree=NetTestFree)
+laiue_add_harness(laiue_net_failure_test NetFailureTestEntryPoint net_failure_test.c
+    "${laiue_src}/net/net_simulator.c" $<TARGET_OBJECTS:laiue_net_failure_subject>
+    STATIC TEST laiue.net.allocation_failure TIMEOUT 300)
+# The socketless stub is checked everywhere, not only where the build picks it.
+laiue_add_harness(laiue_net_udp_none_test NetUdpNoneTestEntryPoint net_udp_none_test.c
+    "${laiue_src}/net/net_udp_none.c" "${laiue_src}/net/net_address.c"
+    STATIC INCLUDES "${laiue_src}" TEST laiue.net.udp_none)
 
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c
@@ -231,6 +313,8 @@ laiue_add_harness(laiue_mod_manifest_scan_test ModManifestScanTestEntry
     mod_manifest_scan_test.c LIBRARIES laiue_mod TEST laiue.mod.manifest_scan)
 laiue_add_harness(laiue_module_manifest_test ModuleManifestTestEntryPoint
     module_manifest_test.c BOOTSTRAP TEST laiue.mod.module_manifest)
+laiue_add_harness(laiue_module_host_runtime_test ModuleHostRuntimeTestEntryPoint
+    module_host_runtime_test.c BOOTSTRAP TEST laiue.mod.module_host_runtime)
 if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_add_harness(laiue_numeric_module_test NumericModuleTestEntryPoint
         numeric_module_test.c BOOTSTRAP DEPENDS laiue_numeric TEST laiue.mod.numeric_module)

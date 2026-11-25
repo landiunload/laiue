@@ -5,6 +5,61 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The engine has internal SHA-512 and Ed25519 signing and verification for
+  future mod packages. Ed25519 and the transport's X25519 share field
+  arithmetic. Tests cover standard vectors, malformed signatures and both
+  native and portable multiplication.
+- Modules load and unload while the application runs, without a restart. A
+  load adds to the running modules and may use their services; it is a
+  transaction over its own modules, so a failure unwinds only them, and nobody
+  outside the load sees their services until it succeeds. A module that
+  declares or obtains a service of another uses it, and
+  `LaiueModuleHostUnloadV1` refuses to unload a module in use with
+  `LAIUE_MODULE_IN_USE` or, with `LAIUE_MODULE_UNLOAD_DEPENDENTS`, unloads its
+  users first. `LaiueModuleHostListDependentsV1` lists them in advance. Host
+  services register and unregister while modules run; a service in use stays.
+  A strict profile now fails before any module code runs, and the profile
+  report counts only the modules that load started. A new test covers loads,
+  failed loads, unloads, host services, profiles and the module limit next to
+  running modules.
+- The physics determinism test no longer crashes when MSVC 19.52.37025 builds
+  it for ARM64. The compiler stored part of the zero-fill from
+  `*simulation = (Simulation){0}` after the member stores that followed it and
+  erased the world's provider context. The test now builds its state in one
+  designated initializer; a disassembly scan of the whole ARM64 build found the
+  same mistake nowhere else.
+- A crashing test now says why instead of leaving a bare "SegFault" in the log.
+  Every test and benchmark prints the exception code or signal, the faulting
+  address and the call stack, then ends exactly as before, so CTest reports the
+  same result. On Windows frames read as `module+offset`, and a call through a
+  null function pointer still names its caller. A test crashes on purpose on
+  every platform to check the report, and test output on POSIX is no longer
+  held in a buffer that a crash would lose.
+- The Windows no-CRT `memcmp` and `memmove` no longer go byte by byte. Clang
+  can merge two compares of different lengths into one `memcmp` call with a
+  variable length, and such a call took a third of a network benchmark. Both
+  now work 16 bytes at a time: `memcmp` of 1200 bytes is 30 times faster, an
+  overlapping `memmove` 25 times. Copies and fills up to 512 bytes use the same
+  vectors instead of `rep movsb` and `rep stosb`, which cost more to start;
+  ARM64 uses NEON throughout. A test covers every length, alignment and overlap.
+- `laiue.net` moves messages between endpoints over datagrams and leaves the
+  protocol, server and replication to the application. Connections use an
+  X25519 handshake behind a stateless return-path cookie, optional pinned
+  server keys and shared secrets, and ChaCha20-Poly1305 on every packet. Up to
+  64 channels carry reliable ordered, unreliable and sequenced messages, with
+  QUIC-style loss recovery, reordering thresholds that adapt to the path,
+  paced congestion control by CUBIC with HyStart++ or by BBRv3, datagram size
+  discovery, address migration and hard memory limits. Acknowledgements to a
+  BBR sender carry the receiver's arrival clock, so BBR measures the path
+  rather than the update rate of either side. A UDP driver covers IPv4 and
+  IPv6 and keeps the system from fragmenting its datagrams, and a
+  deterministic simulator drives network tests. External platform adapters
+  opt into sockets with `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in
+  `docs/net.md`.
+- The Android walk check no longer fails on its own timing. It compares a picture
+  after a turn only once the screen has come to rest, and it answers the system's
+  "not responding" dialog about another process, which took the focus the scenario
+  runs on. A dialog about the program itself still fails the run.
 - A weekly workflow compares every pinned tool, SDK, Android package and GitHub
   action with the newest stable release, and only that workflow turns red when
   one falls behind. `tools/check_versions.py` does the comparison.

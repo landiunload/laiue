@@ -7,6 +7,8 @@ set(allowed_animation animation content media mod platform)
 set(allowed_audio audio content math media mod platform)
 set(allowed_character character mod platform)
 set(allowed_content content mod platform)
+# Криптография — чистые вычисления: ни ОС, ни других модулей.
+set(allowed_crypto crypto)
 set(allowed_frame_monitor frame_monitor mod platform)
 set(allowed_graphics graphics)
 set(allowed_input input math mod platform)
@@ -22,6 +24,9 @@ set(allowed_model content media mod model platform)
 set(allowed_mod mod platform)
 # Навигация не знает ни мира, ни физики: граф и сетку строит приложение.
 set(allowed_navigation mod navigation platform task)
+# Транспорт видит ОС только через platform: сокеты, часы, случайные байты.
+# Арифметику поля X25519 он делит с подписями из crypto.
+set(allowed_net crypto mod net platform)
 set(allowed_numeric mod numeric platform)
 # Физике доступны только числа: реализация мира ей по-прежнему не
 # видна, свойства блоков приходят через callback.
@@ -50,7 +55,7 @@ set(allowed_world mod numeric platform world)
 # Модули, отсутствующие в списке, привязаны к платформе или бэкенду
 # осознанно: platform — сама граница ОС, а render, ui, audio и input пока
 # написаны на Win32/D3D12 либо Vulkan.
-set(portable_modules animation character content frame_monitor graphics math media mesh mesh_world mesh_world_render mod model navigation numeric persist physics profile runtime scene task voxel voxel_render world)
+set(portable_modules animation character content crypto frame_monitor graphics math media mesh mesh_world mesh_world_render mod model navigation net numeric persist physics profile runtime scene task voxel voxel_render world)
 set(portable_system_headers
     assert.h float.h inttypes.h iso646.h limits.h stdalign.h stdarg.h
     stdbool.h stddef.h stdint.h stdnoreturn.h string.h wchar.h
@@ -86,7 +91,9 @@ set(canonical_prefix_ui "ui")
 set(canonical_prefix_platform "platform")
 set(canonical_prefix_numeric "numeric")
 set(canonical_prefix_persist "persist")
+set(canonical_prefix_net "net")
 set(canonical_prefix_math "core/math")
+set(canonical_prefix_crypto "core/crypto")
 set(canonical_prefix_runtime "core/runtime")
 set(canonical_prefix_media "assets/media")
 set(canonical_prefix_model "assets/model")

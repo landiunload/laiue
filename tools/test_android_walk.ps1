@@ -33,6 +33,7 @@ $smokeLogLines = [System.Collections.Generic.List[string]]::new()
 $smokeLogSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 $captures = [System.Collections.Generic.List[object]]::new()
 $restoreErrors = [System.Collections.Generic.List[string]]::new()
+$closedDialogs = [System.Collections.Generic.List[string]]::new()
 $restoredSettings = @{}
 $originalSettings = $null
 $rotationSettingsModified = $false
@@ -122,19 +123,41 @@ function Read-SmokeLog {
     return $log
 }
 
+function Close-NotRespondingDialog {
+    # A part of the system that is late to start gets a dialog asking the user what
+    # to do, and the dialog takes the focus the scenario runs on. No user is here:
+    # closing system dialogs answers "Wait", which leaves everything running. A
+    # dialog about the program itself is a finding, not noise.
+    $focus = Invoke-Adb -Arguments @('shell', 'dumpsys window | grep -F mCurrentFocus || true')
+    $dialog = [regex]::Match($focus, 'Application Not Responding: ([^\s}]+)')
+    if (-not $dialog.Success) { return $false }
+    $process = $dialog.Groups[1].Value
+    if ($process -ceq $package) { throw "$package stopped responding." }
+    Invoke-Adb -Arguments @('shell', 'am', 'broadcast', '-a',
+        'android.intent.action.CLOSE_SYSTEM_DIALOGS') | Out-Null
+    $closedDialogs.Add($process)
+    return $true
+}
+
 function Wait-Log {
     param([scriptblock]$Condition, [string]$Description, [int]$WaitSeconds = 25)
     $until = $clock.Elapsed.TotalSeconds + $WaitSeconds
+    $lookAtFocus = $clock.Elapsed.TotalSeconds + 3
     do {
         $log = Read-SmokeLog
         if (& $Condition $log) { return $log }
         if ($clock.Elapsed.TotalSeconds -ge $until) { throw "Timed out waiting for $Description." }
+        if ($clock.Elapsed.TotalSeconds -ge $lookAtFocus) {
+            # The time a dialog held the focus does not count against the program.
+            if (Close-NotRespondingDialog) { $until = $clock.Elapsed.TotalSeconds + $WaitSeconds }
+            $lookAtFocus = $clock.Elapsed.TotalSeconds + 3
+        }
         Start-Sleep -Milliseconds 200
     } while ($true)
 }
 
 function Save-Capture {
-    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0, [switch]$Upright)
+    param([string]$Name, [int]$NativeWidth, [int]$NativeHeight, [int]$Checkpoint = 0, [switch]$Settled)
     if ($Name -notmatch '^[a-zA-Z0-9_-]+$' -or $NativeWidth -le 0 -or $NativeHeight -le 0) {
         throw 'Invalid screenshot checkpoint metadata.'
     }
@@ -147,8 +170,12 @@ function Save-Capture {
     # rotating, so a screenshot taken in between still shows the old
     # orientation. Capture again until it agrees with the surface; a
     # disagreement that outlasts the bound is a real failure.
-    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $captureClock = [Diagnostics.Stopwatch]::StartNew()
+    $hash = $null
+    $attempts = 0
     do {
+        $previousHash = $hash
+        $attempts++
         try {
             Invoke-Adb -Arguments @('shell', 'screencap', '-p', $remote) -CommandTimeoutSeconds 7 | Out-Null
             Invoke-Adb -Arguments @('pull', $remote, $local) -CommandTimeoutSeconds 7 | Out-Null
@@ -164,6 +191,7 @@ function Save-Capture {
         $imageText = Invoke-BoundedProcess -Executable $FrameCheckExe -Arguments @($local) `
             -CommandTimeoutSeconds 10
         $image = $imageText | ConvertFrom-Json
+        $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
         if ($image.status -ne 'PASS' -or -not $image.useful -or
             $image.width -le 0 -or $image.height -le 0) {
             $problem = "Shared frame checker rejected $Name."
@@ -175,22 +203,27 @@ function Save-Capture {
             # same orientation.
             $problem = "Native surface ${NativeWidth}x$NativeHeight and screenshot " +
                 "$($image.width)x$($image.height) disagree for $Name."
-        } elseif ($Upright -and -not $image.skyAboveGround) {
+        } elseif ($Settled -and -not $image.skyAboveGround) {
             # After a turn the screen keeps the last frame of the old orientation,
             # rotated, until it takes the new one.
             $problem = "The sky is not above the ground in $Name."
+        } elseif ($Settled -and $hash -cne $previousHash) {
+            # Then the system tilts the picture and fades it in, with the sky above
+            # the ground nearly all the way. The world is held here, so the same
+            # picture twice in a row means the screen has come to rest.
+            $problem = "The screen did not come to rest in $Name."
         } else {
             $problem = $null
         }
         if ($null -eq $problem) { break }
-        if ($clock.Elapsed.TotalSeconds -ge 10) { throw $problem }
+        if ($captureClock.Elapsed.TotalSeconds -ge 10) { throw $problem }
         Start-Sleep -Milliseconds 250
     } while ($true)
     $capture = [pscustomobject]@{
-        name = $Name; checkpoint = $Checkpoint; path = $local
+        name = $Name; checkpoint = $Checkpoint; path = $local; attempts = $attempts
         nativeWidth = $NativeWidth; nativeHeight = $NativeHeight
         width = $image.width; height = $image.height; imageCheck = $image
-        sha256 = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
+        sha256 = $hash
         source = 'external_adb_screencap'; run = $runId
     }
     $captures.Add($capture)
@@ -420,7 +453,7 @@ try {
     # The surface reports its old size during a turn: the chain must still fit the window.
     if ($portraitFrame.Groups[3].Value -ne '1') { throw 'The portrait frame did not go straight into the chain.' }
     $portrait = Save-Capture -Name 'portrait' -NativeWidth ([int]$portraitFrame.Groups[1].Value) `
-        -NativeHeight ([int]$portraitFrame.Groups[2].Value) -Upright
+        -NativeHeight ([int]$portraitFrame.Groups[2].Value) -Settled
     if ($portrait.width -ge $portrait.height) { throw 'Portrait display rotation did not occur.' }
     $priorPresented = ([regex]::Matches($portraitLog, 'event=presented ')).Count
     # The scenario ran in the other landscape: this one takes the opposite turn.
@@ -435,7 +468,7 @@ try {
     $landscapeFrame = Latest-Presentation -Log $landscapeLog
     if ($landscapeFrame.Groups[3].Value -ne '1') { throw 'The landscape frame did not go straight into the chain.' }
     $landscape = Save-Capture -Name 'landscape' -NativeWidth ([int]$landscapeFrame.Groups[1].Value) `
-        -NativeHeight ([int]$landscapeFrame.Groups[2].Value) -Upright
+        -NativeHeight ([int]$landscapeFrame.Groups[2].Value) -Settled
     if ($landscape.width -le $landscape.height) { throw 'Landscape display rotation did not occur.' }
     # The same world in both orientations: a turn must not change its colours.
     foreach ($channel in @('skyRed', 'skyGreen', 'skyBlue')) {
@@ -476,7 +509,7 @@ try {
     $resumedFrame = Latest-Presentation -Log $resumedLog
     # A presented frame is not yet a frame on the screen: the launcher may still be there.
     Save-Capture -Name 'resumed' -NativeWidth ([int]$resumedFrame.Groups[1].Value) `
-        -NativeHeight ([int]$resumedFrame.Groups[2].Value) -Upright | Out-Null
+        -NativeHeight ([int]$resumedFrame.Groups[2].Value) -Settled | Out-Null
     if ((Gameplay-State -Log $resumedLog -Event 'presented') -ne $gameplayState) {
         throw 'HOME/resume changed the held gameplay pose, world frame, camera or session revision.'
     }
@@ -514,7 +547,8 @@ $result = [pscustomobject]@{
     settingsModified = $rotationSettingsModified; baselineSamples = $baselineSamples.ToArray()
     restorationAttempts = $restoreAttempts.ToArray()
     originalIssue = $testIssue; restorationIssues = $restoreErrors.ToArray()
-    limits = 'External adb captures inspect a held native checkpoint and the shared-decoder viewport. Visual correctness and frame-exact GPU readback are not certified. Frame wall time includes presentation/vsync and excludes ACK waits. Memory counters are scoped geometry/CPU-shadow bytes, not total VRAM or RSS.'
+    closedDialogs = $closedDialogs.ToArray()
+    limits ='External adb captures inspect a held native checkpoint and the shared-decoder viewport. Visual correctness and frame-exact GPU readback are not certified. Frame wall time includes presentation/vsync and excludes ACK waits. Memory counters are scoped geometry/CPU-shadow bytes, not total VRAM or RSS.'
 }
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
 if (-not $passed) {
