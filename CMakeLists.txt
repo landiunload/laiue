@@ -93,6 +93,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/$<CONFIG>")
 
 add_subdirectory(src/core/math)
+add_subdirectory(src/core/crypto)
 add_subdirectory(src/numeric)
 add_subdirectory(src/assets/media)
 add_subdirectory(src/platform)
