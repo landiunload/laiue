@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The engine has internal SHA-512 and Ed25519 signing and verification for
+  future mod packages. Ed25519 and the transport's X25519 share field
+  arithmetic. Tests cover standard vectors, malformed signatures and both
+  native and portable multiplication.
 - Modules load and unload while the application runs, without a restart. A
   load adds to the running modules and may use their services; it is a
   transaction over its own modules, so a failure unwinds only them, and nobody

@@ -6,7 +6,7 @@ logical include names (`physics/...`, `render/...`, and so on).
 
 | Folder | Logical modules | Responsibility |
 |---|---|---|
-| `src/core/` | `math`, `runtime` | no-CRT runtime and scalar support |
+| `src/core/` | `crypto`, `math`, `runtime` | internal cryptography, scalar math and no-CRT runtime |
 | `src/assets/` | `content`, `media` | resource catalogs and format codecs |
 | `src/graphics/` | `graphics`, `input`, `mesh`, `render`, `scene_math`, `scene`, `voxel_render` | graphics contract, input, meshing, backends, shared scene math, presentation scene and voxel-to-render adapter |
 | `src/jobs/` | `task` | optional work scheduler |

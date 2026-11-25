@@ -1,30 +1,29 @@
 #include "net/net_crypto.h"
 
+#include "crypto/field25519.h"
+#include "crypto/wide.h"
+#include "crypto/wipe.h"
 #include "platform/system.h"
 
 #include <string.h>
 
-/* Векторы ChaCha20 и Poly1305. NET_CRYPTO_PORTABLE отключает их вместе с
+/* Векторы ChaCha20 и Poly1305. LAIUE_CRYPTO_PORTABLE отключает их вместе с
  * быстрым 128-битным умножением: так тест проверяет и переносимый код. */
-#if !defined(NET_CRYPTO_PORTABLE) && defined(__AVX2__)
+#if !defined(LAIUE_CRYPTO_PORTABLE) && defined(__AVX2__)
 #define NET_CHACHA_AVX2 1
 #define NET_CHACHA_LANES 8u
 #include <immintrin.h>
-#elif !defined(NET_CRYPTO_PORTABLE) && (defined(__SSE2__) || defined(_M_X64))
+#elif !defined(LAIUE_CRYPTO_PORTABLE) && (defined(__SSE2__) || defined(_M_X64))
 #define NET_CHACHA_SSE2 1
 #define NET_CHACHA_LANES 4u
 #include <emmintrin.h>
 #if defined(__SSSE3__) || defined(__AVX__)
 #include <tmmintrin.h>
 #endif
-#elif !defined(NET_CRYPTO_PORTABLE) && (defined(__ARM_NEON) || defined(_M_ARM64))
+#elif !defined(LAIUE_CRYPTO_PORTABLE) && (defined(__ARM_NEON) || defined(_M_ARM64))
 #define NET_CHACHA_NEON 1
 #define NET_CHACHA_LANES 4u
 #include <arm_neon.h>
-#endif
-
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
 #endif
 
 #if defined(_MSC_VER)
@@ -65,140 +64,14 @@ static void Store64(uint8_t *bytes, uint64_t value)
     Store32(bytes + 4u, (uint32_t)(value >> 32u));
 }
 
-/* memset через volatile-указатель: компилятор не знает, какую функцию
- * вызывает, и не может выбросить обнуление как мёртвую запись. Побайтовый
- * volatile-цикл тоже не выбрасывается, но пишет по байту за такт. */
-static void *(*const volatile wipeMemset)(void *, int, size_t) = memset;
-
 void NetWipe(void *bytes, size_t size)
 {
-    if (size != 0u)
-        (void)wipeMemset(bytes, 0, size);
+    CryptoWipe(bytes, size);
 }
 
 static uint64_t Load64(const uint8_t *bytes)
 {
     return (uint64_t)Load32(bytes) | ((uint64_t)Load32(bytes + 4u) << 32u);
-}
-
-/* ---- 128-битные произведения ------------------------------------------------
- *
- * Poly1305 и X25519 копят суммы произведений 64 на 64 бита в Wide. Тест
- * собирает переносимый путь и там, где компилятор умеет быстрый. */
-
-#if defined(__SIZEOF_INT128__) && !defined(NET_CRYPTO_PORTABLE)
-
-/* GCC и Clang, включая clang-cl, держат 128-битное целое на 64-битных целях:
- * произведение становится одной инструкцией, сумма — парой. */
-#if defined(__GNUC__)
-__extension__ typedef unsigned __int128 Wide;
-#else
-typedef unsigned __int128 Wide;
-#endif
-
-static Wide WideMultiply(uint64_t left, uint64_t right)
-{
-    return (Wide)left * right;
-}
-
-static Wide WideAdd(Wide sum, Wide value)
-{
-    return sum + value;
-}
-
-static Wide WideAddSmall(Wide sum, uint64_t value)
-{
-    return sum + value;
-}
-
-static uint64_t WideLow(Wide value)
-{
-    return (uint64_t)value;
-}
-
-/* value >> count при 0 < count < 64; результат обязан помещаться в 64 бита. */
-static uint64_t WideShift(Wide value, uint32_t count)
-{
-    return (uint64_t)(value >> count);
-}
-
-#else
-
-typedef struct Wide
-{
-    uint64_t low;
-    uint64_t high;
-} Wide;
-
-#if defined(_MSC_VER) && !defined(__clang__) && !defined(NET_CRYPTO_PORTABLE) &&                   \
-    (defined(_M_X64) || defined(_M_ARM64))
-#define NET_MSVC_WIDE 1
-#endif
-
-static Wide WideMultiply(uint64_t left, uint64_t right)
-{
-    Wide product;
-#if defined(NET_MSVC_WIDE) && defined(_M_X64)
-    product.low = _umul128(left, right, &product.high);
-#elif defined(NET_MSVC_WIDE)
-    product.low = left * right;
-    product.high = __umulh(left, right);
-#else
-    /* Четыре произведения 32 на 32 бита. */
-    const uint64_t leftLow = (uint32_t)left;
-    const uint64_t leftHigh = left >> 32u;
-    const uint64_t rightLow = (uint32_t)right;
-    const uint64_t rightHigh = right >> 32u;
-    const uint64_t lowProduct = leftLow * rightLow;
-    const uint64_t crossLeft = leftHigh * rightLow;
-    const uint64_t crossRight = leftLow * rightHigh;
-    const uint64_t middle = (lowProduct >> 32u) + (uint32_t)crossLeft + (uint32_t)crossRight;
-    product.low = (middle << 32u) | (uint32_t)lowProduct;
-    product.high =
-        leftHigh * rightHigh + (crossLeft >> 32u) + (crossRight >> 32u) + (middle >> 32u);
-#endif
-    return product;
-}
-
-static Wide WideAdd(Wide sum, Wide value)
-{
-#if defined(NET_MSVC_WIDE) && defined(_M_X64)
-    const unsigned char carry = _addcarry_u64(0u, sum.low, value.low, &sum.low);
-    (void)_addcarry_u64(carry, sum.high, value.high, &sum.high);
-#else
-    /* Перенос — старший бит выражения, а не сравнение: время не зависит от
-     * значений и там, где компилятор не знает инструкции сложения с
-     * переносом. */
-    const uint64_t low = sum.low + value.low;
-    const uint64_t carry = ((sum.low & value.low) | ((sum.low | value.low) & ~low)) >> 63u;
-    sum.low = low;
-    sum.high += value.high + carry;
-#endif
-    return sum;
-}
-
-static Wide WideAddSmall(Wide sum, uint64_t value)
-{
-    const Wide wide = {value, 0u};
-    return WideAdd(sum, wide);
-}
-
-static uint64_t WideLow(Wide value)
-{
-    return value.low;
-}
-
-/* value >> count при 0 < count < 64; результат обязан помещаться в 64 бита. */
-static uint64_t WideShift(Wide value, uint32_t count)
-{
-    return (value.high << (64u - count)) | (value.low >> count);
-}
-
-#endif
-
-static Wide WideMultiplyAdd(Wide sum, uint64_t left, uint64_t right)
-{
-    return WideAdd(sum, WideMultiply(left, right));
 }
 
 /* ---- ChaCha20 (RFC 8439, раздел 2.3) -----------------------------------------
@@ -1357,251 +1230,17 @@ bool NetAeadOpen(const uint8_t key[NET_KEY_SIZE], const uint8_t nonce[NET_NONCE_
 
 /* ---- X25519 (RFC 7748) ----------------------------------------------------------
  *
- * Элемент поля 2^255 - 19 — пять разрядов по 51 биту в uint64_t: разряд i
- * весит 2^(51i). Произведение двух разрядов занимает до 108 бит, и суммы
- * таких произведений копятся в 128-битном Wide. Разряды всегда
- * неотрицательны: вычитание прибавляет 2p, поэтому знаковых сдвигов нет.
- *
- * «Почти приведённый» элемент — выход умножения и возведения в квадрат: все
- * разряды меньше 2^51, кроме второго, который меньше 2^51 + 2^13. Сумма двух
- * таких элементов и разность почти приведённых дают разряды меньше 2^53, а
- * умножение принимает разряды до 2^54: в сумме для разряда пять
- * произведений, и у четырёх из них множитель 19, поэтому она меньше 2^115, а
- * перенос из неё помещается в 64 бита. */
+ * Арифметика поля 2^255 - 19 общая с подписями Ed25519 и лежит в
+ * crypto/field25519.h. */
 
-#define FIELD_MASK ((UINT64_C(1) << 51u) - 1u)
 /* (486662 - 2) / 4 */
 #define FIELD_A24 UINT64_C(121665)
-
-typedef uint64_t Field[5];
-
-/* Суммы произведений для пяти разрядов становятся почти приведённым
- * элементом. Каждая сумма меньше 2^115. */
-static void FieldReduce(Field output, Wide t0, Wide t1, Wide t2, Wide t3, Wide t4)
-{
-    t1 = WideAddSmall(t1, WideShift(t0, 51u));
-    t2 = WideAddSmall(t2, WideShift(t1, 51u));
-    t3 = WideAddSmall(t3, WideShift(t2, 51u));
-    t4 = WideAddSmall(t4, WideShift(t3, 51u));
-    /* 2^255 = 19 по модулю p. Сумма старшего разряда — не больше пяти
-     * произведений без множителя 19, перенос из неё меньше 5 * 2^57 + 2^13,
-     * и младший разряд с ним остаётся меньше 2^64. */
-    const uint64_t low = (WideLow(t0) & FIELD_MASK) + 19u * WideShift(t4, 51u);
-    output[0] = low & FIELD_MASK;
-    output[1] = (WideLow(t1) & FIELD_MASK) + (low >> 51u);
-    output[2] = WideLow(t2) & FIELD_MASK;
-    output[3] = WideLow(t3) & FIELD_MASK;
-    output[4] = WideLow(t4) & FIELD_MASK;
-}
-
-static void FieldAdd(Field output, const Field left, const Field right)
-{
-    for (uint32_t index = 0u; index < 5u; ++index)
-        output[index] = left[index] + right[index];
-}
-
-/* left + 2p - right. right обязан быть почти приведённым: тогда каждый его
- * разряд не больше разряда числа 2p. */
-static void FieldSubtract(Field output, const Field left, const Field right)
-{
-    output[0] = left[0] + ((UINT64_C(1) << 52u) - 38u) - right[0];
-    for (uint32_t index = 1u; index < 5u; ++index)
-        output[index] = left[index] + ((UINT64_C(1) << 52u) - 2u) - right[index];
-}
-
-static void FieldMultiply(Field output, const Field left, const Field right)
-{
-    const uint64_t f0 = left[0];
-    const uint64_t f1 = left[1];
-    const uint64_t f2 = left[2];
-    const uint64_t f3 = left[3];
-    const uint64_t f4 = left[4];
-    const uint64_t g0 = right[0];
-    const uint64_t g1 = right[1];
-    const uint64_t g2 = right[2];
-    const uint64_t g3 = right[3];
-    const uint64_t g4 = right[4];
-    /* Произведения с весом 2^255 и выше сворачиваются множителем 19. */
-    const uint64_t g1x19 = 19u * g1;
-    const uint64_t g2x19 = 19u * g2;
-    const uint64_t g3x19 = 19u * g3;
-    const uint64_t g4x19 = 19u * g4;
-    Wide t0 = WideMultiply(f0, g0);
-    t0 = WideMultiplyAdd(t0, f1, g4x19);
-    t0 = WideMultiplyAdd(t0, f2, g3x19);
-    t0 = WideMultiplyAdd(t0, f3, g2x19);
-    t0 = WideMultiplyAdd(t0, f4, g1x19);
-    Wide t1 = WideMultiply(f0, g1);
-    t1 = WideMultiplyAdd(t1, f1, g0);
-    t1 = WideMultiplyAdd(t1, f2, g4x19);
-    t1 = WideMultiplyAdd(t1, f3, g3x19);
-    t1 = WideMultiplyAdd(t1, f4, g2x19);
-    Wide t2 = WideMultiply(f0, g2);
-    t2 = WideMultiplyAdd(t2, f1, g1);
-    t2 = WideMultiplyAdd(t2, f2, g0);
-    t2 = WideMultiplyAdd(t2, f3, g4x19);
-    t2 = WideMultiplyAdd(t2, f4, g3x19);
-    Wide t3 = WideMultiply(f0, g3);
-    t3 = WideMultiplyAdd(t3, f1, g2);
-    t3 = WideMultiplyAdd(t3, f2, g1);
-    t3 = WideMultiplyAdd(t3, f3, g0);
-    t3 = WideMultiplyAdd(t3, f4, g4x19);
-    Wide t4 = WideMultiply(f0, g4);
-    t4 = WideMultiplyAdd(t4, f1, g3);
-    t4 = WideMultiplyAdd(t4, f2, g2);
-    t4 = WideMultiplyAdd(t4, f3, g1);
-    t4 = WideMultiplyAdd(t4, f4, g0);
-    FieldReduce(output, t0, t1, t2, t3, t4);
-}
-
-/* Квадрат: пятнадцать произведений вместо двадцати пяти. */
-static void FieldSquare(Field output, const Field value)
-{
-    const uint64_t f0 = value[0];
-    const uint64_t f1 = value[1];
-    const uint64_t f2 = value[2];
-    const uint64_t f3 = value[3];
-    const uint64_t f4 = value[4];
-    const uint64_t f0x2 = 2u * f0;
-    const uint64_t f1x2 = 2u * f1;
-    const uint64_t f2x2 = 2u * f2;
-    const uint64_t f3x2 = 2u * f3;
-    const uint64_t f3x19 = 19u * f3;
-    const uint64_t f4x19 = 19u * f4;
-    Wide t0 = WideMultiply(f0, f0);
-    t0 = WideMultiplyAdd(t0, f1x2, f4x19);
-    t0 = WideMultiplyAdd(t0, f2x2, f3x19);
-    Wide t1 = WideMultiply(f0x2, f1);
-    t1 = WideMultiplyAdd(t1, f2x2, f4x19);
-    t1 = WideMultiplyAdd(t1, f3, f3x19);
-    Wide t2 = WideMultiply(f0x2, f2);
-    t2 = WideMultiplyAdd(t2, f1, f1);
-    t2 = WideMultiplyAdd(t2, f3x2, f4x19);
-    Wide t3 = WideMultiply(f0x2, f3);
-    t3 = WideMultiplyAdd(t3, f1x2, f2);
-    t3 = WideMultiplyAdd(t3, f4, f4x19);
-    Wide t4 = WideMultiply(f0x2, f4);
-    t4 = WideMultiplyAdd(t4, f1x2, f3);
-    t4 = WideMultiplyAdd(t4, f2, f2);
-    FieldReduce(output, t0, t1, t2, t3, t4);
-}
-
-/* value^(2^count), count не меньше единицы. */
-static void FieldSquareTimes(Field output, const Field value, uint32_t count)
-{
-    FieldSquare(output, value);
-    for (uint32_t index = 1u; index < count; ++index)
-        FieldSquare(output, output);
-}
 
 static void FieldMultiplyA24(Field output, const Field value)
 {
     FieldReduce(output, WideMultiply(value[0], FIELD_A24), WideMultiply(value[1], FIELD_A24),
                 WideMultiply(value[2], FIELD_A24), WideMultiply(value[3], FIELD_A24),
                 WideMultiply(value[4], FIELD_A24));
-}
-
-/* Обмен без ветвления: swap равен 0 или 1. */
-static void FieldSwap(Field left, Field right, uint64_t swap)
-{
-    const uint64_t mask = 0u - swap;
-    for (uint32_t index = 0u; index < 5u; ++index)
-    {
-        const uint64_t difference = mask & (left[index] ^ right[index]);
-        left[index] ^= difference;
-        right[index] ^= difference;
-    }
-}
-
-/* value^(p - 2) = value^(2^255 - 21): 254 возведения в квадрат и 11
- * умножений. onesN — value^(2^N - 1), показатель из N единиц. */
-static void FieldInvert(Field output, const Field value)
-{
-    Field square;
-    Field power9;
-    Field power11;
-    Field ones5;
-    Field ones10;
-    Field ones20;
-    Field ones50;
-    Field ones100;
-    Field power;
-    FieldSquare(square, value);
-    FieldSquareTimes(power, square, 2u);
-    FieldMultiply(power9, power, value);
-    FieldMultiply(power11, power9, square);
-    FieldSquare(power, power11);
-    FieldMultiply(ones5, power, power9);
-    FieldSquareTimes(power, ones5, 5u);
-    FieldMultiply(ones10, power, ones5);
-    FieldSquareTimes(power, ones10, 10u);
-    FieldMultiply(ones20, power, ones10);
-    FieldSquareTimes(power, ones20, 20u);
-    FieldMultiply(power, power, ones20);
-    FieldSquareTimes(power, power, 10u);
-    FieldMultiply(ones50, power, ones10);
-    FieldSquareTimes(power, ones50, 50u);
-    FieldMultiply(ones100, power, ones50);
-    FieldSquareTimes(power, ones100, 100u);
-    FieldMultiply(power, power, ones100);
-    FieldSquareTimes(power, power, 50u);
-    FieldMultiply(power, power, ones50);
-    /* 2^255 - 32, затем + 11. */
-    FieldSquareTimes(power, power, 5u);
-    FieldMultiply(output, power, power11);
-    NetWipe(square, sizeof(Field));
-    NetWipe(power9, sizeof(Field));
-    NetWipe(power11, sizeof(Field));
-    NetWipe(ones5, sizeof(Field));
-    NetWipe(ones10, sizeof(Field));
-    NetWipe(ones20, sizeof(Field));
-    NetWipe(ones50, sizeof(Field));
-    NetWipe(ones100, sizeof(Field));
-    NetWipe(power, sizeof(Field));
-}
-
-static void FieldUnpack(Field output, const uint8_t bytes[NET_KEY_SIZE])
-{
-    /* Разряд i начинается с бита 51i. Старший бит u-координаты не
-     * используется: маска старшего разряда его отбрасывает. */
-    output[0] = Load64(bytes) & FIELD_MASK;
-    output[1] = (Load64(bytes + 6u) >> 3u) & FIELD_MASK;
-    output[2] = (Load64(bytes + 12u) >> 6u) & FIELD_MASK;
-    output[3] = (Load64(bytes + 19u) >> 1u) & FIELD_MASK;
-    output[4] = (Load64(bytes + 24u) >> 12u) & FIELD_MASK;
-}
-
-/* Канонический вид: значение строго меньше p. value почти приведён, то есть
- * меньше 2^255 + 2^64 и тем более меньше 2p. */
-static void FieldPack(uint8_t bytes[NET_KEY_SIZE], const Field value)
-{
-    uint64_t f0 = value[0];
-    uint64_t f1 = value[1];
-    uint64_t f2 = value[2];
-    uint64_t f3 = value[3];
-    uint64_t f4 = value[4];
-    /* Цепочка переносов числа value + 19 даёт его бит 2^255: единица ровно
-     * тогда, когда value не меньше p, и тогда p вычитается один раз —
-     * прибавлением 19 и отбрасыванием этого бита. */
-    uint64_t carry = (f0 + 19u) >> 51u;
-    carry = (f1 + carry) >> 51u;
-    carry = (f2 + carry) >> 51u;
-    carry = (f3 + carry) >> 51u;
-    carry = (f4 + carry) >> 51u;
-    f0 += 19u * carry;
-    f1 += f0 >> 51u;
-    f0 &= FIELD_MASK;
-    f2 += f1 >> 51u;
-    f1 &= FIELD_MASK;
-    f3 += f2 >> 51u;
-    f2 &= FIELD_MASK;
-    f4 += f3 >> 51u;
-    f3 &= FIELD_MASK;
-    f4 &= FIELD_MASK;
-    Store64(bytes, f0 | (f1 << 51u));
-    Store64(bytes + 8u, (f1 >> 13u) | (f2 << 38u));
-    Store64(bytes + 16u, (f2 >> 26u) | (f3 << 25u));
-    Store64(bytes + 24u, (f3 >> 39u) | (f4 << 12u));
 }
 
 bool NetX25519(const uint8_t scalar[NET_KEY_SIZE], const uint8_t point[NET_KEY_SIZE],
