@@ -42,8 +42,29 @@ LAIUE_WINDOW_API void*   WindowGetNativeHandle(const Window* window);
 LAIUE_WINDOW_API void    WindowSetRawInputCallback(Window* window, RawInputCallback callback, void* userData);
 LAIUE_WINDOW_API void    WindowGetClientSize(const Window* window, int32_t* width, int32_t* height);
 LAIUE_WINDOW_API bool    WindowConsumeResize(Window* window);
+// true один раз после того, как окно лишилось ввода: ушло из фокуса или
+// отдало мышь и клавиатуру системе (на Windows — пока окно перетаскивают,
+// меняют его размер или открыто его меню). Отпускания клавиш за это время
+// не приходят, поэтому потребитель сбрасывает состояние ввода.
 LAIUE_WINDOW_API bool    WindowConsumeFocusLoss(Window* window);
+// Вызывает onFrame, пока окно не закроют. На Windows кадры идут и пока окно
+// перетаскивают или меняют его размер: тогда onFrame вызывается из оконной
+// процедуры по таймеру.
 LAIUE_WINDOW_API void    WindowRunLoop(Window* window, FrameCallback onFrame, void* userData);
+// Программе нечего показывать: следующий onFrame придёт с первым событием
+// окна, после WindowWakeFrame или через seconds секунд, смотря что раньше.
+// Отрицательное значение — срока нет. Вызывается из onFrame и действует на
+// один кадр, без этого вызова кадры идут подряд. Событие — любое сообщение
+// системы, даже движение мыши, поэтому кадр сам решает, нужно ли рисовать.
+LAIUE_WINDOW_API void    WindowDeferNextFrame(Window* window, double seconds);
+// Заканчивает ожидание WindowDeferNextFrame из любого потока, пока окно живо:
+// так фоновая работа сообщает, что есть что показать. Вызов во время кадра
+// не теряется.
+LAIUE_WINDOW_API void    WindowWakeFrame(Window* window);
+// true один раз после того, как система потеряла изображение окна или
+// показала окно заново. Программе, которая рисует только изменения, нужен
+// кадр даже без них.
+LAIUE_WINDOW_API bool    WindowConsumeRedraw(Window* window);
 LAIUE_WINDOW_API void    WindowSetMouseLook(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsMouseLookEnabled(const Window* window);
 // Позиция курсора в клиентских координатах окна (для интерфейса);
@@ -62,7 +83,8 @@ LAIUE_WINDOW_API uint32_t WindowConsumeText(Window* window, uint32_t* codepoints
     uint32_t capacity);
 
 // Полноэкранный режим без рамки на текущем мониторе. Обычный оконный
-// режим восстанавливает прежние стиль и положение окна.
+// режим восстанавливает прежние стиль и положение окна. На Windows и X11
+// его переключает и Alt+Enter.
 LAIUE_WINDOW_API void    WindowSetFullscreen(Window* window, bool enabled);
 LAIUE_WINDOW_API bool    WindowIsFullscreen(const Window* window);
 
@@ -78,3 +100,21 @@ LAIUE_WINDOW_API void WindowSetSurfaceCallback(Window *window, SurfaceCallback c
 // (160 на Android); на плотном экране телефона — около 3. Меняется вместе с
 // экраном: читать каждый кадр.
 LAIUE_WINDOW_API float WindowGetContentScale(const Window *window);
+
+// Как программа расходует энергию, общее для процесса.
+// AUTO: пока ни одно окно программы нельзя увидеть (они свёрнуты, скрыты или на
+// другом рабочем столе), процесс в режиме эффективности Windows (как у
+// переключателя в диспетчере задач: EcoQoS и низкий приоритет), а в остальное
+// время QoS выбирает система. EFFICIENCY: режим эффективности всегда, а окно вне
+// фокуса рисует около 20 кадров в секунду. PERFORMANCE: никогда, и система не
+// замедляет процесс даже в фоне. При AUTO и PERFORMANCE окно вне фокуса рисует как
+// обычно, пока его видно.
+#define WINDOW_POWER_AUTO 0u
+#define WINDOW_POWER_EFFICIENCY 1u
+#define WINDOW_POWER_PERFORMANCE 2u
+
+// true — система применяет политику. Такой механизм есть только у Windows; на
+// других системах политика запоминается, а на X11 ещё ограничивает кадры вне фокуса.
+// Неизвестное значение даёт false и оставляет прежнюю политику.
+LAIUE_WINDOW_API bool WindowSetPowerPolicy(uint32_t policy);
+LAIUE_WINDOW_API uint32_t WindowGetPowerPolicy(void);

@@ -1,22 +1,34 @@
 #include "platform/window.h"
 
+#include "platform/keysym.h"
 #include "platform/system.h"
 
 #define Window X11Window
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 #undef Window
 
+#include <fcntl.h>
+#include <poll.h>
 #include <string.h>
+#include <unistd.h>
 
 #define WINDOW_TEXT_CAPACITY 256u
+/* The furthest deadline: an early frame does no harm, and a day in
+ * milliseconds still fits an int. */
+#define WINDOW_LONGEST_DEFER_SECONDS 86400.0
 
 struct Window
 {
     Display *display;
     X11Window handle;
+    Atom protocolsAtom;
     Atom closeAtom;
+    Atom stateAtom;
+    Atom fullscreenAtom;
     LaiueWindowNativeHandleV1 nativeHandle;
     int32_t clientWidth;
     int32_t clientHeight;
@@ -24,8 +36,20 @@ struct Window
     bool focusLossPending;
     bool mouseLookEnabled;
     bool focused;
+    /* The window manager took the window off the screen: minimized, or on
+     * another workspace. It reports no size until the window is back. */
+    bool unmapped;
     bool fullscreen;
+    /* Enter of Alt+Enter is down: the toggle waits for its release. */
+    bool fullscreenKeyHeld;
     bool closeRequested;
+    /* The frame asked to wait: the run loop sleeps until an event or the
+     * deadline. WindowWakeFrame writes to the pipe from any thread. */
+    bool frameDeferred;
+    bool redrawPending;
+    double frameDeferSeconds;
+    int wakeRead;
+    int wakeWrite;
     float wheelSteps;
     /* Typed text until consumed: a ring of code points. */
     uint32_t text[WINDOW_TEXT_CAPACITY];
@@ -42,9 +66,26 @@ static void ProcessEvent(Window *window, XEvent *event)
     switch (event->type)
     {
         case ConfigureNotify:
-            window->clientWidth = event->xconfigure.width;
-            window->clientHeight = event->xconfigure.height;
-            window->resizePending = true;
+            /* A move reports the same size again: only a new size is a
+             * resize. */
+            if (event->xconfigure.width != window->clientWidth ||
+                event->xconfigure.height != window->clientHeight)
+            {
+                window->clientWidth = event->xconfigure.width;
+                window->clientHeight = event->xconfigure.height;
+                window->resizePending = true;
+            }
+            break;
+        case MapNotify:
+            window->unmapped = false;
+            break;
+        case UnmapNotify:
+            window->unmapped = true;
+            break;
+        case Expose:
+            /* The last of a series: the frame redraws the whole window. */
+            if (event->xexpose.count == 0)
+                window->redrawPending = true;
             break;
         case FocusIn:
             window->focused = true;
@@ -53,31 +94,46 @@ static void ProcessEvent(Window *window, XEvent *event)
             if (window->focused)
                 window->focusLossPending = true;
             window->focused = false;
+            /* The release of a held Enter goes to the next window and would
+             * leave the next Alt+Enter ignored. */
+            window->fullscreenKeyHeld = false;
             break;
         case ClientMessage:
-            if ((Atom)event->xclient.data.l[0] == window->closeAtom)
+            if (event->xclient.message_type == window->protocolsAtom &&
+                (Atom)event->xclient.data.l[0] == window->closeAtom)
                 window->closeRequested = true;
             break;
         case KeyPress:
         {
-            /* Latin-1 from the key; other scripts need an input method. */
+            /* XLookupString applies Shift, Caps Lock and the layout group to
+             * the keysym, but its text is Latin-1 in the C locale: the
+             * character comes from the keysym, in any script. Ctrl and Alt
+             * make shortcuts, not text, as on Windows. */
             char bytes[8];
-            KeySym symbol = 0;
-            const int count =
-                XLookupString(&event->xkey, bytes, (int)sizeof(bytes), &symbol, NULL);
-            for (int index = 0; index < count; ++index)
+            KeySym symbol = NoSymbol;
+            (void)XLookupString(&event->xkey, bytes, (int)sizeof(bytes), &symbol, NULL);
+            const uint32_t codepoint = (event->xkey.state & (ControlMask | Mod1Mask)) == 0u
+                                           ? LaiueKeysymToCodepoint((uint32_t)symbol)
+                                           : 0u;
+            if (codepoint != 0u && window->textCount < WINDOW_TEXT_CAPACITY)
             {
-                const uint32_t codepoint = (uint32_t)(unsigned char)bytes[index];
-                if (codepoint >= 0x20u && codepoint != 0x7Fu &&
-                    window->textCount < WINDOW_TEXT_CAPACITY)
-                {
-                    window->text[(window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY] =
-                        codepoint;
-                    window->textCount++;
-                }
+                window->text[(window->textHead + window->textCount) % WINDOW_TEXT_CAPACITY] =
+                    codepoint;
+                window->textCount++;
+            }
+            /* Alt+Enter switches full screen, as on Windows. */
+            if (symbol == XK_Return && (event->xkey.state & Mod1Mask) != 0 &&
+                !window->fullscreenKeyHeld)
+            {
+                window->fullscreenKeyHeld = true;
+                WindowSetFullscreen(window, !window->fullscreen);
             }
             break;
         }
+        case KeyRelease:
+            if (XLookupKeysym(&event->xkey, 0) == XK_Return)
+                window->fullscreenKeyHeld = false;
+            break;
         case ButtonPress:
             if (event->xbutton.button == Button4)
                 window->wheelSteps += 1.0f;
@@ -89,6 +145,23 @@ static void ProcessEvent(Window *window, XEvent *event)
     }
     if (window->rawInputCallback != NULL)
         window->rawInputCallback(window->rawInputUserData, event);
+}
+
+/* Neither end blocks: a full pipe already holds a wake, and the run loop
+ * reads it empty. */
+static bool CreateWakePipe(Window *window)
+{
+    int ends[2];
+    if (pipe(ends) != 0)
+        return false;
+    for (int end = 0; end < 2; ++end)
+    {
+        (void)fcntl(ends[end], F_SETFL, O_NONBLOCK);
+        (void)fcntl(ends[end], F_SETFD, FD_CLOEXEC);
+    }
+    window->wakeRead = ends[0];
+    window->wakeWrite = ends[1];
+    return true;
 }
 
 Window *WindowCreate(const WindowConfiguration *configuration)
@@ -113,16 +186,32 @@ Window *WindowCreate(const WindowConfiguration *configuration)
                                          (unsigned int)configuration->height, 0,
                                          BlackPixel(display, screen),
                                          BlackPixel(display, screen));
-    if (window->handle == 0)
+    if (window->handle == 0 || !CreateWakePipe(window))
     {
+        if (window->handle != 0)
+            XDestroyWindow(display, window->handle);
         PlatformFree(window);
         XCloseDisplay(display);
         return NULL;
     }
     XSelectInput(display, window->handle,
-                 StructureNotifyMask | FocusChangeMask | KeyPressMask | KeyReleaseMask |
-                     ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
-    window->closeAtom = XInternAtom(display, "WM_DELETE_WINDOW", False);
+                 StructureNotifyMask | ExposureMask | FocusChangeMask | KeyPressMask |
+                     KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+    /* A held key repeats KeyPress alone. By default every repeat also sends
+     * a KeyRelease, and input would count each one as a new press. */
+    (void)XkbSetDetectableAutoRepeat(display, True, NULL);
+    /* Every atom the window uses, in one round trip to the server. */
+    char protocolsName[] = "WM_PROTOCOLS";
+    char closeName[] = "WM_DELETE_WINDOW";
+    char stateName[] = "_NET_WM_STATE";
+    char fullscreenName[] = "_NET_WM_STATE_FULLSCREEN";
+    char *atomNames[] = {protocolsName, closeName, stateName, fullscreenName};
+    Atom atoms[sizeof(atomNames) / sizeof(atomNames[0])] = {0};
+    (void)XInternAtoms(display, atomNames, (int)(sizeof(atoms) / sizeof(atoms[0])), False, atoms);
+    window->protocolsAtom = atoms[0];
+    window->closeAtom = atoms[1];
+    window->stateAtom = atoms[2];
+    window->fullscreenAtom = atoms[3];
     XSetWMProtocols(display, window->handle, &window->closeAtom, 1);
     char title[LAIUE_PLATFORM_PATH_CAPACITY];
     if (configuration->title == NULL ||
@@ -154,6 +243,8 @@ void WindowDestroy(Window *window)
             XDestroyWindow(window->display, window->handle);
         XCloseDisplay(window->display);
     }
+    close(window->wakeRead);
+    close(window->wakeWrite);
     PlatformFree(window);
 }
 
@@ -173,9 +264,9 @@ void WindowSetRawInputCallback(Window *window, RawInputCallback callback, void *
 void WindowGetClientSize(const Window *window, int32_t *width, int32_t *height)
 {
     if (width != NULL)
-        *width = window == NULL ? 0 : window->clientWidth;
+        *width = window == NULL || window->unmapped ? 0 : window->clientWidth;
     if (height != NULL)
-        *height = window == NULL ? 0 : window->clientHeight;
+        *height = window == NULL || window->unmapped ? 0 : window->clientHeight;
 }
 
 bool WindowConsumeResize(Window *window)
@@ -194,6 +285,27 @@ bool WindowConsumeFocusLoss(Window *window)
     return true;
 }
 
+/* Sleeps until an event, a wake or the WindowDeferNextFrame deadline. An event
+ * Xlib has already read waits in its queue, where poll cannot see it. */
+static void WaitForDeferredFrame(Window *window)
+{
+    if (XPending(window->display) != 0)
+        return;
+    struct pollfd sources[2] = {
+        {.fd = ConnectionNumber(window->display), .events = POLLIN},
+        {.fd = window->wakeRead, .events = POLLIN},
+    };
+    const int timeout =
+        window->frameDeferSeconds < 0.0 ? -1 : (int)(window->frameDeferSeconds * 1000.0) + 1;
+    (void)poll(sources, 2u, timeout);
+    if ((sources[1].revents & POLLIN) == 0)
+        return;
+    char bytes[16];
+    while (read(window->wakeRead, bytes, sizeof(bytes)) > 0)
+    {
+    }
+}
+
 void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
 {
     if (window == NULL)
@@ -206,11 +318,47 @@ void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
             XNextEvent(window->display, &event);
             ProcessEvent(window, &event);
         }
+        window->frameDeferred = false;
         if (onFrame != NULL)
             onFrame(userData);
-        if (!window->focused)
+        if (window->closeRequested)
+            break;
+        /* A frame usually waits in the present. A window off the screen has
+         * nothing to wait for, and efficiency mode spares frames out of focus. */
+        if (window->frameDeferred)
+            WaitForDeferredFrame(window);
+        else if (window->unmapped ||
+                 (!window->focused && WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY))
             PlatformSleepMilliseconds(50u);
     }
+}
+
+void WindowDeferNextFrame(Window *window, double seconds)
+{
+    if (window == NULL)
+        return;
+    const double limited =
+        seconds > WINDOW_LONGEST_DEFER_SECONDS ? WINDOW_LONGEST_DEFER_SECONDS : seconds;
+    window->frameDeferred = true;
+    window->frameDeferSeconds = limited >= 0.0 ? limited : -1.0;
+}
+
+void WindowWakeFrame(Window *window)
+{
+    if (window == NULL)
+        return;
+    /* A full pipe already holds a wake, so a failed write loses nothing. */
+    const char byte = 0;
+    const ssize_t written = write(window->wakeWrite, &byte, 1u);
+    (void)written;
+}
+
+bool WindowConsumeRedraw(Window *window)
+{
+    if (window == NULL || !window->redrawPending)
+        return false;
+    window->redrawPending = false;
+    return true;
 }
 
 void WindowSetMouseLook(Window *window, bool enabled)
@@ -274,8 +422,23 @@ uint32_t WindowConsumeText(Window *window, uint32_t *codepoints, uint32_t capaci
 
 void WindowSetFullscreen(Window *window, bool enabled)
 {
-    if (window != NULL)
-        window->fullscreen = enabled;
+    if (window == NULL || window->display == NULL || window->fullscreen == enabled)
+        return;
+    /* The window manager stretches the window over its monitor without a
+     * frame and gives the old size back (EWMH _NET_WM_STATE). */
+    XEvent event;
+    memset(&event, 0, sizeof(event));
+    event.xclient.type = ClientMessage;
+    event.xclient.window = window->handle;
+    event.xclient.message_type = window->stateAtom;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = enabled ? 1 : 0; /* _NET_WM_STATE_ADD or _REMOVE */
+    event.xclient.data.l[1] = (long)window->fullscreenAtom;
+    event.xclient.data.l[3] = 1; /* asked by an application */
+    XSendEvent(window->display, DefaultRootWindow(window->display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XFlush(window->display);
+    window->fullscreen = enabled;
 }
 
 bool WindowIsFullscreen(const Window *window)
@@ -326,6 +489,23 @@ float WindowGetContentScale(const Window *window)
             ++line;
     }
     return 1.0f;
+}
+
+// Политика энергопотребления процесса, WINDOW_POWER_*. У Linux нет режима
+// эффективности, который процесс включал бы себе сам: политика только
+// хранится.
+static volatile uint32_t powerPolicy = WINDOW_POWER_AUTO;
+
+bool WindowSetPowerPolicy(uint32_t policy)
+{
+    if (policy <= WINDOW_POWER_PERFORMANCE)
+        PlatformAtomicStoreU32Release(&powerPolicy, policy);
+    return false;
+}
+
+uint32_t WindowGetPowerPolicy(void)
+{
+    return PlatformAtomicLoadU32Acquire(&powerPolicy);
 }
 
 void WindowRequestClose(Window *window)

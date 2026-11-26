@@ -44,14 +44,14 @@ static bool BytesEqual(const uint8_t *left, const char *right, uint32_t count)
 }
 
 // Манифест читается как единый буфер: заголовок обязан быть первой строкой,
-// `contract = 2` — любой строкой. Раньше это были два отдельных прохода по
+// `contract = 3` — любой строкой. Раньше это были два отдельных прохода по
 // одному и тому же буферу; здесь оба условия проверяются за один проход.
-_Static_assert(LAIUE_SHADER_CONTRACT_VERSION == 2u,
+_Static_assert(LAIUE_SHADER_CONTRACT_VERSION == 3u,
                "the manifest contract line must name LAIUE_SHADER_CONTRACT_VERSION");
 static bool ManifestLinesAreCompatible(const uint8_t *data, uint32_t length)
 {
     static const char header[] = "LAIUE SHADER 1";
-    static const char contract[] = "contract = 2";
+    static const char contract[] = "contract = 3";
     const uint32_t headerLength = (uint32_t)sizeof(header) - 1U;
     const uint32_t contractLength = (uint32_t)sizeof(contract) - 1U;
     uint32_t start =

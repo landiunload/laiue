@@ -12,6 +12,14 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#include <windows.h>
+
+#include <psapi.h>
+#elif defined(__linux__)
+#include <stdio.h>
+#endif
+
+#if defined(_WIN32)
 #define RENDER_MODULE_NAME L"laiue_render.dll"
 #elif defined(__APPLE__)
 #define RENDER_MODULE_NAME L"liblaiue_render.dylib"
@@ -19,6 +27,9 @@
 #define RENDER_MODULE_NAME L"liblaiue_render.so"
 #endif
 
+#ifndef LAIUE_GRAPHICS_TEST_VULKAN_BACKEND
+#define LAIUE_GRAPHICS_TEST_VULKAN_BACKEND LAIUE_GRAPHICS_BACKEND_VULKAN
+#endif
 #ifndef LAIUE_GRAPHICS_TEST_D3D12
 #define LAIUE_GRAPHICS_TEST_D3D12 0
 #endif
@@ -33,10 +44,19 @@
 #define INSTANCE_LIMIT (64u * 1024u * 1024u / 32u)
 #define RETIREMENT_MESH_COUNT 300u
 #define RETIREMENT_UPLOAD_BATCH 50u
-/* Six 3 MiB buffers fill the 4 MiB and 8 MiB staging rings of a frame and
+/* Six 3 MiB buffers fill the 1 MiB and 8 MiB staging rings of a frame and
  * spill into two overflow blocks, the second one started by the last buffer. */
 #define SPILL_BUFFER_COUNT 6u
 #define SPILL_VERTEX_COUNT (3u * 1024u * 1024u / (uint32_t)sizeof(LaiueGraphicsVertexV2))
+/* More turns of every frame slot than an idle upload arena lasts. */
+#define BURST_IDLE_FRAMES 400u
+#define UPLOAD_RING_BYTES (UINT64_C(1) << 20)
+#define UPLOAD_ARENA_BYTES (UINT64_C(8) << 20)
+#define MOST_FRAME_SLOTS 3u
+/* A program that stopped drawing goes on replacing a 3 MiB buffer. Without a
+ * limit all 360 MiB stay in staging, and on Vulkan in the geometry pool too. */
+#define UNDRAWN_UPLOAD_COUNT 120u
+#define UNDRAWN_GROWTH_LIMIT_BYTES (UINT64_C(200) << 20)
 
 typedef struct LegacyDeviceV2
 {
@@ -117,7 +137,7 @@ static bool Join(wchar_t *out, const wchar_t *directory, const wchar_t *name)
     return *name == L'\0';
 }
 
-#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+#if defined(_WIN32)
 static HWND CreateTestWindow(void)
 {
     const wchar_t *name = L"LaiueGraphicsGeometryTestWindow";
@@ -129,12 +149,10 @@ static HWND CreateTestWindow(void)
     windowClass.lpszClassName = name;
     if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return NULL;
-    RECT rectangle = {0, 0, (LONG)FRAME_WIDTH, (LONG)FRAME_HEIGHT};
-    if (!AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE))
-        return NULL;
-    return CreateWindowExW(0u, name, L"laiue geometry pixels", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                           CW_USEDEFAULT, rectangle.right - rectangle.left,
-                           rectangle.bottom - rectangle.top, NULL, NULL, module, NULL);
+    /* A window with a frame cannot be this narrow, and a Vulkan swap chain takes
+     * the size of the client area. */
+    return CreateWindowExW(0u, name, L"laiue geometry pixels", WS_POPUP, 0, 0, (int)FRAME_WIDTH,
+                           (int)FRAME_HEIGHT, NULL, NULL, module, NULL);
 }
 #endif
 
@@ -144,6 +162,28 @@ static LaiueGraphicsDiagnosticsV2 Diagnostics(LaiueGraphicsDeviceV2 *device)
     Expect(device->getDiagnostics(device, &value) != 0u, "real device diagnostics are available");
     return value;
 }
+
+#if defined(_WIN32)
+// Only a device with a window has a swap chain. Android checks the same counter
+// on a rotated screen.
+static void SwapChainRebuilds(const LaiueGraphicsDeviceServiceV2 *service,
+                              LaiueGraphicsDeviceV2 *device)
+{
+    Expect(device->beginFrame(device, FRAME_WIDTH, FRAME_HEIGHT) != 0u &&
+               device->endFrame(device) != 0u,
+           "a frame draws before the resize");
+    Expect((Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u,
+           "a window of the frame size takes the frame without a copy");
+    const uint32_t before = Diagnostics(device).swapchainRebuilds;
+    service->resize(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u);
+    for (uint32_t frame = 0u; frame < 3u; ++frame)
+        Expect(device->beginFrame(device, FRAME_WIDTH / 2u, FRAME_HEIGHT / 2u) != 0u &&
+                   device->endFrame(device) != 0u,
+               "frames draw after the resize");
+    Expect(Diagnostics(device).swapchainRebuilds == before + 1u,
+           "a resize rebuilds the swap chain once, and frames after it do not");
+}
+#endif
 
 static void Begin(LaiueGraphicsDeviceV2 *device)
 {
@@ -356,6 +396,30 @@ static void PartialIndexUpload(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandl
     ColorAt(0.5625f, -0.0625f, UINT32_C(0xff00ff00), "patched triangle one is immediately green");
 }
 
+static void WholeVertexUpload(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("a vertex buffer keeps no CPU copy and takes whole uploads only");
+    const LaiueGraphicsDiagnosticsV2 before = Diagnostics(device);
+    const LaiueGraphicsHandle buffer =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));
+    Expect(Diagnostics(device).cpuShadowBytes == before.cpuShadowBytes,
+           "the bytes of a vertex buffer stay only in the GPU");
+    const LaiueGraphicsBufferUploadV1 part = {
+        .structSize = sizeof(part),
+        .buffer = buffer,
+        .offsetBytes = sizeof(vertices[0]),
+        .data = vertices + 4u,
+        .sizeBytes = sizeof(vertices[0]),
+    };
+    Expect(device->uploadBuffer(device, &part) == 0u, "a part of a vertex buffer is refused");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the refused part changes nothing");
+    device->destroyHandle(device, buffer);
+}
+
 static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle ib)
 {
     Stage("indexed UV/color and texture bindings");
@@ -393,6 +457,98 @@ static void TexturedIndices(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle i
     ColorAt(0.25f, -0.25f, UINT32_C(0xff00ff00), "indexed bottom right retains UV (1,0)");
     ColorAt(-0.25f, 0.25f, UINT32_C(0xffff0000), "indexed top left retains UV (0,1)");
     ColorAt(0.25f, 0.25f, UINT32_C(0xff00ffff), "indexed top right retains UV (1,1)");
+    device->destroyHandle(device, sampler);
+    device->destroyHandle(device, texture);
+    device->destroyHandle(device, vb);
+}
+
+#define BRIEF_TEXTURE_SIDE 2048u
+
+static void UploadTexel(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle texture,
+                        const uint8_t texel[4])
+{
+    const LaiueGraphicsTextureUploadV1 upload = {.structSize = sizeof(upload),
+                                                 .texture = texture,
+                                                 .data = texel,
+                                                 .sizeBytes = 4u,
+                                                 .rowPitchBytes = 4u};
+    Expect(device->uploadTexture(device, &upload) != 0u, "a texel uploads");
+}
+
+/* Uploads wait for the start of a frame. More of them than the queue holds
+ * reach the GPU on the spot, and the order must survive that split. */
+static void QueuedTextureUploads(LaiueGraphicsDeviceV2 *device, LaiueGraphicsHandle ib)
+{
+    Stage("queued texture uploads keep their order and survive a destroyed texture");
+    LaiueGraphicsVertexV2 white[4];
+    memcpy(white, vertices, sizeof(white));
+    for (uint32_t i = 0u; i < 4u; ++i)
+        white[i].colorRGBA = UINT32_C(0xffffffff);
+    LaiueGraphicsHandle vb =
+        Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, white, sizeof(white));
+    LaiueGraphicsTextureDescV1 textureDesc = {
+        sizeof(textureDesc), LAIUE_GRAPHICS_FORMAT_RGBA8_UNORM, {1u, 1u, 1u}, 1u, 0u};
+    LaiueGraphicsHandle texture = 0u, dropped = 0u, sampler = 0u;
+    Expect(device->createTexture(device, &textureDesc, &texture) != 0u && texture != 0u &&
+               device->createTexture(device, &textureDesc, &dropped) != 0u && dropped != 0u,
+           "single texel textures create");
+    LaiueGraphicsSamplerDescV1 samplerDesc = {
+        sizeof(samplerDesc),          LAIUE_GRAPHICS_FILTER_NEAREST, LAIUE_GRAPHICS_FILTER_NEAREST,
+        LAIUE_GRAPHICS_ADDRESS_CLAMP, LAIUE_GRAPHICS_ADDRESS_CLAMP,  LAIUE_GRAPHICS_ADDRESS_CLAMP};
+    Expect(device->createSampler(device, &samplerDesc, &sampler) != 0u && sampler != 0u,
+           "explicit nearest sampler creates");
+    LaiueGraphicsDrawItemV2 item = Item(vb, ib, 0u, 0, -0.5f, -0.5f, 4.0f);
+    item.texture = texture;
+    item.sampler = sampler;
+
+    static const uint8_t red[4] = {255u, 0u, 0u, 255u};
+    static const uint8_t green[4] = {0u, 255u, 0u, 255u};
+    static const uint8_t blue[4] = {0u, 0u, 255u, 255u};
+    for (uint32_t i = 0u; i < 300u; ++i)
+        UploadTexel(device, texture, red);
+    UploadTexel(device, texture, green);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xff00ff00), "the last of more uploads than the queue holds wins");
+
+    UploadTexel(device, dropped, red);
+    UploadTexel(device, texture, blue);
+    device->destroyHandle(device, dropped);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xffff0000), "a new upload reaches its first following frame");
+
+    /* Large enough that the GPU is often still copying it after endFrame, so
+     * the texture dies while the frame that reads it is in flight. */
+    static uint32_t briefTexels[BRIEF_TEXTURE_SIDE * BRIEF_TEXTURE_SIDE];
+    for (uint32_t i = 0u; i < BRIEF_TEXTURE_SIDE * BRIEF_TEXTURE_SIDE; ++i)
+        briefTexels[i] = UINT32_C(0xff00ff00);
+    LaiueGraphicsTextureDescV1 briefDesc = textureDesc;
+    briefDesc.extent.width = briefDesc.extent.height = BRIEF_TEXTURE_SIDE;
+    for (uint32_t i = 0u; i < 8u; ++i)
+    {
+        LaiueGraphicsHandle brief = 0u;
+        Expect(device->createTexture(device, &briefDesc, &brief) != 0u && brief != 0u,
+               "a short-lived texture creates");
+        const LaiueGraphicsTextureUploadV1 upload = {.structSize = sizeof(upload),
+                                                     .texture = brief,
+                                                     .data = briefTexels,
+                                                     .sizeBytes = sizeof(briefTexels)};
+        Expect(device->uploadTexture(device, &upload) != 0u, "a short-lived texture uploads");
+        LaiueGraphicsDrawItemV2 briefItem = item;
+        briefItem.texture = brief;
+        Begin(device);
+        Submit(device, &briefItem);
+        Expect(device->endFrame(device) != 0u, "a frame with a short-lived texture ends");
+        device->destroyHandle(device, brief);
+    }
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.0f, 0.0f, UINT32_C(0xffff0000), "frames go on after textures destroyed in flight");
+
     device->destroyHandle(device, sampler);
     device->destroyHandle(device, texture);
     device->destroyHandle(device, vb);
@@ -652,13 +808,20 @@ static void InvalidGeometry(LaiueGraphicsDeviceV2 *device, LaiueGraphicsDeviceV2
     device->destroyHandle(device, replacement);
     other->destroyHandle(other, foreign);
 
-    const uint32_t invalidIndex = UINT32_MAX;
+    uint32_t invalidIndex = UINT32_MAX;
     LaiueGraphicsBufferUploadV1 patch = {.structSize = sizeof(patch),
                                          .buffer = ib,
                                          .data = &invalidIndex,
                                          .sizeBytes = sizeof(invalidIndex)};
-    Expect(device->uploadBuffer(device, &patch) != 0u,
-           "index bytes may upload before range validation");
+    if (device->uploadBuffer(device, &patch) == 0u)
+    {
+        // Спецификация обещает значения индексов только до 2^24 - 1: драйвер с таким
+        // пределом не примет большее уже при загрузке.
+        Expect(!LAIUE_GRAPHICS_TEST_D3D12, "only Vulkan may limit raw index values");
+        invalidIndex = UINT32_C(0x00ffffff);
+        Expect(device->uploadBuffer(device, &patch) != 0u,
+               "index bytes may upload before range validation");
+    }
     Begin(device);
     Reject(device, &item, "out-of-range uint32 element is rejected against the selected VB");
     Capture(device, 0u);
@@ -773,8 +936,7 @@ static void OverflowRecordedRetirement(LaiueGraphicsDeviceV2 *device)
     const LaiueGraphicsDiagnosticsV2 live = Diagnostics(device);
     Expect(live.geometryPoolUsedBytes >=
                    baseline.geometryPoolUsedBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
-               live.cpuShadowBytes ==
-                   baseline.cpuShadowBytes + (uint64_t)RETIREMENT_MESH_COUNT * meshBytes &&
+               live.cpuShadowBytes == baseline.cpuShadowBytes &&
                live.resourceHandleCount == baseline.resourceHandleCount + RETIREMENT_MESH_COUNT,
            "all 300 independent meshes are resident before retirement");
     const LaiueGraphicsDrawItemV2 first =
@@ -894,9 +1056,8 @@ static void StagingSpill(LaiueGraphicsDeviceV2 *device)
     for (uint32_t i = 0u; i < SPILL_BUFFER_COUNT; ++i)
         buffers[i] = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, spillVertices,
                             (uint32_t)sizeof(spillVertices));
-    const LaiueGraphicsDrawItemV2 spilled = Item(buffers[3], 0u, 0u, 0, -0.625f, -0.125f, 1.0f);
-    const LaiueGraphicsDrawItemV2 last =
-        Item(buffers[SPILL_BUFFER_COUNT - 1u], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    const LaiueGraphicsDrawItemV2 spilled = Item(buffers[2], 0u, 0u, 0, -0.625f, -0.125f, 1.0f);
+    const LaiueGraphicsDrawItemV2 last = Item(buffers[4], 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
     Begin(device);
     Submit(device, &spilled);
     Submit(device, &last);
@@ -911,6 +1072,139 @@ static void StagingSpill(LaiueGraphicsDeviceV2 *device)
     for (uint32_t i = 0u; i < SPILL_BUFFER_COUNT; ++i)
         device->destroyHandle(device, buffers[i]);
     ExpectReclaimed(device, &baseline, "the spill leaves no resource or pool range behind");
+}
+
+/* Zero where the system does not say, and then the check passes. */
+static uint64_t ProcessMemoryBytes(void)
+{
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX counters = {.cb = sizeof(counters)};
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&counters,
+                                   sizeof(counters))
+               ? (uint64_t)counters.PrivateUsage
+               : 0u;
+#elif defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "r");
+    if (file == NULL)
+        return 0u;
+    unsigned long long size = 0u;
+    unsigned long long resident = 0u;
+    const int fields = fscanf(file, "%llu %llu", &size, &resident);
+    fclose(file);
+    return fields == 2 ? (uint64_t)resident * 4096u : 0u;
+#else
+    return 0u;
+#endif
+}
+
+static void UploadsWithoutFrames(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("360 MiB replaced without a frame stays within the limits and the last upload wins");
+    const LaiueGraphicsDiagnosticsV2 baseline = Diagnostics(device);
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsBufferUploadV1 upload = {.structSize = sizeof(upload),
+                                                .buffer = buffer,
+                                                .data = spillVertices,
+                                                .sizeBytes = sizeof(spillVertices)};
+    const uint64_t before = ProcessMemoryBytes();
+    for (uint32_t i = 0u; i < UNDRAWN_UPLOAD_COUNT; ++i)
+        Expect(device->uploadBuffer(device, &upload) != 0u, "uploads go on without frames");
+    Expect(ProcessMemoryBytes() <= before + UNDRAWN_GROWTH_LIMIT_BYTES,
+           "uploads replaced without a frame do not pile up");
+    for (uint32_t i = 0u; i < SPILL_VERTEX_COUNT; ++i)
+        spillVertices[i] = vertices[i % 3u];
+    Expect(device->uploadBuffer(device, &upload) != 0u, "the last upload is accepted");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the frame shows the last upload");
+    device->destroyHandle(device, buffer);
+    ExpectReclaimed(device, &baseline, "uploads without frames leave no pool range behind");
+}
+
+static void IdleFrames(LaiueGraphicsDeviceV2 *device)
+{
+    for (uint32_t i = 0u; i < BURST_IDLE_FRAMES; ++i)
+    {
+        Begin(device);
+        Expect(device->endFrame(device) != 0u, "an idle frame ends");
+    }
+}
+
+#if defined(_WIN32) && !LAIUE_GRAPHICS_TEST_D3D12
+/* A frame of a window is drawn into the swap chain image, which cannot be read
+ * after it is shown, and such an image may be BGRA. Red tells the two apart.
+ * More frames than a chain has images and the renderer has slots. */
+static void WindowedFrames(const LaiueGraphicsDeviceServiceV2 *service)
+{
+    Stage("a frame drawn into the swap chain reads back as RGBA");
+    HWND window = CreateTestWindow();
+    Expect(window != NULL, "the swap chain has a hidden HWND");
+    LaiueGraphicsDeviceV2 *device = NULL;
+    Expect(service->createDeviceWithContext(service->context, window, FRAME_WIDTH, FRAME_HEIGHT,
+                                            LAIUE_GRAPHICS_TEST_VULKAN_BACKEND, &device) != 0u,
+           "a device draws to the window");
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    for (uint32_t frame = 0u; frame < 12u; ++frame)
+    {
+        Begin(device);
+        Submit(device, &item);
+        Capture(device, 1u);
+        ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the swap chain image holds the frame");
+    }
+    device->destroyHandle(device, buffer);
+    SwapChainRebuilds(service, device);
+    service->destroyDevice(device);
+    DestroyWindow(window);
+}
+#endif
+
+static void InterfaceOverScene(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("the interface covers the scene of its frame, and only where it lies");
+    static const uint8_t atlas[1] = {255u};
+    Expect(device->setUiFontAtlas(device, atlas, 1u, 1u) != 0u, "the interface atlas is accepted");
+    for (uint32_t i = 0u; i < SPILL_VERTEX_COUNT; ++i)
+        spillVertices[i] = vertices[i % 3u];
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    const LaiueGraphicsUiQuadV1 quad = {
+        .rect = {0.0f, 0.0f, 72.0f, (float)FRAME_HEIGHT},
+        .colorRGBA = UINT32_C(0xffff0000),
+    };
+    Begin(device);
+    Submit(device, &item);
+    Expect(device->submitUi(device, &quad, 1u) != 0u, "the interface is submitted");
+    Capture(device, 2u);
+    ColorAt(0.4375f, -0.1042f, UINT32_C(0xffff0000), "the interface covers the triangle");
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "the scene stays beside the interface");
+    device->destroyHandle(device, buffer);
+}
+
+static void BurstMemoryReturns(LaiueGraphicsDeviceV2 *device)
+{
+    Stage("the upload arena of a burst goes back when frames stop using it");
+    IdleFrames(device);
+    const uint64_t rings = Diagnostics(device).uploadStagingBytes;
+    Expect(rings != 0u && rings <= MOST_FRAME_SLOTS * UPLOAD_RING_BYTES,
+           "an idle renderer holds its upload rings and nothing more");
+    const LaiueGraphicsHandle buffer = Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX,
+                                              spillVertices, (uint32_t)sizeof(spillVertices));
+    Expect(Diagnostics(device).uploadStagingBytes == rings + UPLOAD_ARENA_BYTES,
+           "a burst past the ring gets an arena");
+    const LaiueGraphicsDrawItemV2 item = Item(buffer, 0u, 0u, 0, 0.375f, -0.125f, 1.0f);
+    Begin(device);
+    Submit(device, &item);
+    Capture(device, 1u);
+    ColorAt(0.5625f, -0.0625f, UINT32_C(0xff0000ff), "a burst in a new arena renders");
+    device->destroyHandle(device, buffer);
+    IdleFrames(device);
+    Expect(Diagnostics(device).uploadStagingBytes == rings, "an idle arena goes back");
 }
 
 LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
@@ -942,8 +1236,8 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
     window = CreateTestWindow();
     Expect(window != NULL, "native D3D12 capture has a real hidden HWND");
 #endif
-    const uint32_t backend =
-        LAIUE_GRAPHICS_TEST_D3D12 ? LAIUE_GRAPHICS_BACKEND_D3D12 : LAIUE_GRAPHICS_BACKEND_VULKAN;
+    const uint32_t backend = LAIUE_GRAPHICS_TEST_D3D12 ? LAIUE_GRAPHICS_BACKEND_D3D12
+                                                       : LAIUE_GRAPHICS_TEST_VULKAN_BACKEND;
     LaiueGraphicsDeviceV2 *device = NULL;
     if (!service->createDeviceWithContext(service->context, window, FRAME_WIDTH, FRAME_HEIGHT,
                                           backend, &device))
@@ -962,6 +1256,16 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
                device->setCamera != NULL &&
                (Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_SUPPORTED) != 0u,
            "test backend supports real explicit capture");
+    // Слой профиля телефона, который не загрузился, загрузчик пропускает молча, и
+    // тест шёл бы на полном драйвере: выдаёт это только путь рисования.
+    char phoneProfile[8] = {0};
+    const bool renderPassExpected = PlatformGetEnvironmentUtf8("LAIUE_GRAPHICS_PHONE_PROFILE",
+                                                               phoneProfile,
+                                                               sizeof(phoneProfile)) != 0u &&
+                                    phoneProfile[0] == '1';
+    if (backend == LAIUE_GRAPHICS_BACKEND_VULKAN_CORE || renderPassExpected)
+        Expect((Diagnostics(device).flags & LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING) == 0u,
+               "Vulkan 1.1 draws through render passes");
     InitializeVertices();
     const LaiueGraphicsHandle vb =
         Buffer(device, LAIUE_GRAPHICS_BUFFER_USAGE_VERTEX, vertices, sizeof(vertices));
@@ -982,7 +1286,7 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         const uint64_t nativeBytes = sizeof(vertices) + sizeof(indicesA) + sizeof(indicesB);
         /* Vulkan allocates each resource at storage-buffer alignment (up to
          * 256 bytes); D3D12 accounts the requested bytes directly. */
-        Expect(firstStats.cpuShadowBytes == nativeBytes &&
+        Expect(firstStats.cpuShadowBytes == sizeof(indicesA) + sizeof(indicesB) &&
                    firstStats.uploadedBytes == nativeBytes &&
                    firstStats.resourceHandleCount == 3u &&
                    firstStats.geometryPoolUsedBytes >= nativeBytes &&
@@ -991,10 +1295,12 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         AlternatingRanges(device, vb, ia, ib);
         LargeRawIndices(device, vb);
         PartialIndexUpload(device, vb, ib);
+        WholeVertexUpload(device);
         TexturedIndices(device, ia);
+        QueuedTextureUploads(device, ia);
         InstancePixels(device, vb, ia);
         SkyColor(device);
-    VerticalSync(device);
+        VerticalSync(device);
 #if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
         otherWindow = CreateTestWindow();
         Expect(otherWindow != NULL, "second device has its own HWND");
@@ -1010,6 +1316,14 @@ LAIUE_TEST_ENTRY(GraphicsGeometryTestEntryPoint)
         OverflowRecordedRetirement(device);
         PendingUploadBurst(device);
         StagingSpill(device);
+        UploadsWithoutFrames(device);
+        BurstMemoryReturns(device);
+        InterfaceOverScene(device);
+#if defined(_WIN32) && LAIUE_GRAPHICS_TEST_D3D12
+        SwapChainRebuilds(service, device);
+#elif defined(_WIN32)
+        WindowedFrames(service);
+#endif
     }
     device->destroyHandle(device, ib);
     device->destroyHandle(device, ia);

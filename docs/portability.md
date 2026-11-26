@@ -164,10 +164,10 @@ libraries.
 включая D3D12-клиент: Direct3D 12 доступен на ARM64, а архитектурно-зависимые
 места имеют собственные реализации. Маска колонны в `mesh` использует NEON
 вместо SSE2, `scene` берёт аппаратный `fsqrt`, а no-CRT runtime заменяет
-`rep stosb`/`rep movsb` явными циклами: у ARM64 нет строковых инструкций.
-Обе реализации маски проверены против скалярного эталона на своей
-архитектуре, а loop-based `memset`/`memcpy`/`memcmp`/`memmove` — запуском на
-реальном aarch64.
+`rep stosb`/`rep movsb` циклами 16-байтных векторов NEON: у ARM64 нет
+строковых инструкций. Обе реализации маски проверены против скалярного
+эталона на своей архитектуре, а `memset`/`memcpy`/`memcmp`/`memmove` —
+тестом `laiue.runtime.memory` на реальном aarch64.
 
 Запускайте из ARM64 VS Developer PowerShell:
 
@@ -248,10 +248,16 @@ target автоматически получает build-tools и `android.jar` 
 `ANDROID_SDK_ROOT`/`ANDROID_HOME`, если они установлены, и включается после
 явного задания `-DLAIUE_ANDROID_KEYSTORE=<keystore>`. Движок не создаёт и не
 хранит ключ подписи. Renderer выбирает dynamic rendering на Vulkan 1.3 и
-совместимые render-pass/framebuffer на Vulkan 1.2; поэтому emulator с
-SwiftShader 1.2 также проходит NativeActivity smoke, не требуя 1.3-only
-расширений. Push descriptors Vulkan 1.4 (или `VK_KHR_push_descriptor`)
-используются, когда устройство их даёт, и не требуются.
+совместимые render-pass/framebuffer на Vulkan 1.1, нижней границе: такой
+Vulkan есть на Android 9 и новее. Push descriptors Vulkan 1.4 (или
+`VK_KHR_push_descriptor`) используются, когда устройство их даёт, и не
+требуются. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` держит устройство в ядре 1.1
+без необязательных расширений: так путь старого телефона проверяется на любом
+устройстве, слоем валидации на компьютере и всем сценарием на эмуляторе.
+CI ещё гоняет тесты Vulkan на базовых профилях Android 2022 и 2025: слой
+Vulkan Profiles сужает драйвер до возможностей такого телефона, а валидация
+над ним ловит форматы, лимиты и расширения, которых там нет. Настоящий
+телефон с Vulkan 1.1 это не заменяет.
 
 На Windows с динамическими модулями сборка также создаёт
 `laiue_graphics_d3d12.dll`. При найденном Vulkan SDK Linux/Windows собирают
@@ -293,6 +299,12 @@ stdout и stderr в logcat под именем пакета, дожидаетс�
 без пересоздания ресурсов. Размеры интерфейса задаются в точках и
 умножаются на `getContentScale` окна: DPI на Windows, `Xft.dpi` в X11,
 плотность экрана на Android.
+
+На Windows первое окно объявляет процесс осведомлённым о DPI каждого монитора,
+как это делают GLFW и SDL: пиксель окна равен пикселю экрана, а размер из
+`WindowConfiguration` считается в точках и окно на экране с масштабом больше в
+пикселях. Настоящий размер даёт `getClientSize`. Программа, которой нужно иное,
+объявляет процесс в манифесте до первого окна, и модуль это не трогает.
 
 ## Vulkan offscreen на Linux
 
@@ -476,6 +488,13 @@ platform-agnostic core через `LAIUE_PLATFORM_BACKEND=EXTERNAL`. Указа�
 точными FP-флагами закрытого компилятора. В этом режиме graphics выключен,
 модули статические, динамический native-код модов выключен, а SDK export
 принадлежит родительскому superbuild.
+
+Сокеты в обязательный контракт не входят. Adapter, который реализует и
+`src/platform/socket.h`, включает `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`, и
+`laiue.net` собирает свой драйвер UDP. Датаграммы такого сокета система не
+дробит, если adapter умеет это запретить. Без сокетов транспорт остаётся,
+`LaiueNetUdpOpen` отвечает `LAIUE_NET_UNSUPPORTED`, а сеть платформы
+подключается собственным `LaiueNetDriverV1`.
 
 Публичный `linux-external-port-smoke` проверяет именно эту границу, static
 link и core-тесты. Он использует тестовый Linux adapter и не является

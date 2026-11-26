@@ -1,3 +1,4 @@
+#include "media/gif_decode.h"
 #include "media/image.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,6 +16,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     uint8_t *pixels = malloc(info.pixelBytes ? info.pixelBytes : 1u);
     void *scratch = info.scratchBytes ? malloc(info.scratchBytes) : NULL;
     ImageDecode(data, (uint32_t)size, &info, pixels, info.pixelBytes, scratch, info.scratchBytes);
+    if (info.frameCount > 1u)
+    {
+        const uint32_t streamBytes = GifStreamScratchBytes(&info);
+        void *stream = malloc(streamBytes);
+        uint32_t delay = 0u;
+        if (GifStreamOpen(data, (uint32_t)size, &info, stream, streamBytes) == IMAGE_OK)
+            for (uint32_t frame = 0u; frame < 2u * info.frameCount; ++frame)
+                if (GifStreamNext(stream, pixels, &delay) != IMAGE_OK)
+                    break;
+        free(stream);
+    }
     free(scratch);
     free(pixels);
     return 0;

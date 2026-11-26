@@ -31,6 +31,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Эти же проверки идут и на пути телефона ниже Vulkan 1.3, на любом устройстве.
+#ifndef TEST_VULKAN_BACKEND
+#define TEST_VULKAN_BACKEND RENDERER_BACKEND_VULKAN
+#endif
+
 #define SKIP_EXIT_CODE 125
 #define TEST_WIDTH 64u
 #define TEST_HEIGHT 64u
@@ -433,7 +438,7 @@ LAIUE_TEST_ENTRY(RendererVulkanInstanceRingTestEntryPoint)
     }
 
     Renderer *renderer = RendererCreateWithBackend(NULL, (int32_t)TEST_WIDTH, (int32_t)TEST_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+                                                   TEST_VULKAN_BACKEND);
     if (renderer == NULL)
     {
         LaiueTestRuntimeWrite("No Vulkan driver available; skipping\n");

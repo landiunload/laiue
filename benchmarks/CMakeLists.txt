@@ -21,6 +21,8 @@ laiue_add_harness(laiue_navigation_benchmark NavigationBenchmarkEntryPoint navig
     LIBRARIES laiue::navigation laiue::task laiue::platform_support)
 laiue_add_harness(laiue_persist_benchmark PersistBenchmarkEntryPoint persist_benchmark.c
     LIBRARIES laiue::persist laiue::task laiue::platform_support)
+laiue_add_harness(laiue_net_benchmark NetBenchmarkEntryPoint net_benchmark.c
+    LIBRARIES laiue::net laiue::platform_support)
 # Private physics helpers are compiled into the benchmark instead of exported.
 laiue_add_harness(laiue_broadphase_benchmark BroadphaseBenchmarkEntryPoint broadphase_benchmark.c
     "${laiue_src}/simulation/physics/rigid_broadphase.c" STATIC INCLUDES "${laiue_src}")

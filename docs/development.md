@@ -30,7 +30,7 @@ ctest --preset linux-gcc-release --parallel
 ```
 
 Официальный Linux CI выполняет те же команды на нативных Ubuntu 26.04
-runners x86_64 и ARM64 (GCC 15, Clang 22) и в контейнере Alpine 3.24 (musl).
+runners x86_64 и ARM64 (GCC 15, Clang 23) и в контейнере Alpine 3.24 (musl).
 macOS workflow назначает отдельные jobs Apple Silicon и Intel:
 
 ```sh
@@ -80,7 +80,7 @@ run-clang-tidy -p build/tidy -quiet "$PWD/src/.*[.]c$"
 Код под `__ANDROID__` и ветки ARM64 CI проверяет так же по базе
 `android-arm64-shared` (preset с `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` и NDK из
 `ANDROID_NDK_HOME`), а код только для Windows — по базе `windows-clang`. На
-Windows в Developer PowerShell с LLVM 22 в стандартном каталоге:
+Windows в Developer PowerShell с LLVM 23 в стандартном каталоге:
 
 ```powershell
 cmake --preset windows-clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -109,8 +109,20 @@ ctest --preset linux-external-port-smoke-release --parallel --no-tests=error
 
 Тесты живут в `tests/` и регистрируются в CTest. Аудио-тест может вернуть
 125 и быть отмечен пропущенным, если в Windows отсутствует Media Foundation.
+Упавший тест или бенчмарк печатает код исключения или сигнала, адрес и
+цепочку вызовов (`tests/test_runtime.c`) и завершается так же, как без
+отчёта, поэтому CTest видит прежний итог. На Windows кадр записан как
+`модуль+смещение`; функцию по нему в Debug-сборке того же коммита находит
+`llvm-symbolizer --relative-address --obj=<модуль> <смещение>`. Под
+санитайзерами отчёт пишут они сами.
 Новый platform boundary нельзя считать подтверждённым только по syntax
 check: нужен реальный link и запуск релевантных тестов.
+
+Всё закреплённое в CI должно быть на новейшем стабильном выпуске. Еженедельный
+workflow `Versions` сравнивает компиляторы, SDK, пакеты Android и GitHub Actions
+с тем, что вышло, и краснеет только он сам: чужой новый выпуск не должен
+останавливать обычные PR. Вручную то же самое делает
+`python tools/check_versions.py`.
 
 ## Архитектурные правила
 
@@ -291,6 +303,10 @@ World origin не заменяет render origin. До преобразован�
   artifacts не смешиваются.
 - Любой внешний размер и offset проверяется до арифметики, allocation и
   обращения к памяти.
+- Структура, которую тут же заполняют, создаётся одним designated
+  initializer, а не обнулением `*p = (T){0}` с записью полей следом:
+  MSVC 19.52.37025 для ARM64 сохраняет часть такого обнуления после этих
+  записей и стирает их.
 - Исправление ошибки получает минимальный regression test, который падал до
   исправления.
 
@@ -331,6 +347,7 @@ World origin не заменяет render origin. До преобразован�
 - [физика](physics.md)
 - [сохранения](persist.md)
 - [навигация](navigation.md)
+- [сетевой транспорт](net.md)
 - [диагностика и чистота релиза](diagnostics.md)
 - [аудио](audio.md)
 

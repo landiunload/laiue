@@ -7,8 +7,9 @@
 #include <stdint.h>
 
 #define SHADER_PACK_NAME_MAX LAIUE_CONTENT_NAME_CAPACITY
-// Contract 2: DXIL Shader Model 6.0 for D3D12, SPIR-V for Vulkan.
-#define LAIUE_SHADER_CONTRACT_VERSION 2u
+// Contract 3: DXIL Shader Model 6.0 for D3D12, SPIR-V for Vulkan. A vertex shader that
+// writes its clip position past viewProjection turns it with clipAxisX and clipAxisY.
+#define LAIUE_SHADER_CONTRACT_VERSION 3u
 #define LAIUE_SHADER_BYTECODE_MAX_BYTES 0x40000u
 
 // Every graphics pipeline owned by the renderer is represented explicitly.

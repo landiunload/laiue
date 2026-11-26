@@ -38,16 +38,30 @@ typedef struct LaiueWindowServiceV1
     /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE. Window
      * pixels per interface point, as WindowGetContentScale. */
     float (*getContentScale)(const Window *window);
+    /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_POWER_SIZE. How the
+     * process spends power, WINDOW_POWER_*, as WindowSetPowerPolicy. */
+    bool (*setPowerPolicy)(uint32_t policy);
+    uint32_t (*getPowerPolicy)(void);
+    /* Optional tail: check LAIUE_WINDOW_SERVICE_V1_FRAMES_SIZE. Frames that
+     * run only when there is something to show, as WindowDeferNextFrame,
+     * WindowWakeFrame and WindowConsumeRedraw. */
+    void (*deferNextFrame)(Window *window, double seconds);
+    void (*wakeFrame)(Window *window);
+    bool (*consumeRedraw)(Window *window);
 } LaiueWindowServiceV1;
 
-/* The service before the text tail, with it, with the surface tail and with
- * the content scale. */
+/* The service before the text tail, with it, with the surface tail, with the
+ * content scale, with the power policy and with frames on demand. */
 #define LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE                                                  \
     ((uint32_t)offsetof(LaiueWindowServiceV1, consumeText))
 #define LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE                                                          \
     ((uint32_t)offsetof(LaiueWindowServiceV1, setSurfaceCallback))
 #define LAIUE_WINDOW_SERVICE_V1_SURFACE_SIZE                                                       \
     ((uint32_t)offsetof(LaiueWindowServiceV1, getContentScale))
-#define LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE ((uint32_t)sizeof(LaiueWindowServiceV1))
+#define LAIUE_WINDOW_SERVICE_V1_SCALE_SIZE                                                         \
+    ((uint32_t)offsetof(LaiueWindowServiceV1, setPowerPolicy))
+#define LAIUE_WINDOW_SERVICE_V1_POWER_SIZE                                                         \
+    ((uint32_t)offsetof(LaiueWindowServiceV1, deferNextFrame))
+#define LAIUE_WINDOW_SERVICE_V1_FRAMES_SIZE ((uint32_t)sizeof(LaiueWindowServiceV1))
 
 const LaiueModuleApiV1 *LaiueWindowGetStaticModuleApiV1(void);

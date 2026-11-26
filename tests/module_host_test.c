@@ -468,7 +468,10 @@ static const char *const moduleLifetimeServices[] = {moduleLifetimeServiceName};
 static uint32_t LAIUE_MODULE_CALL ServiceLifetimeCreate(const LaiueModuleHostV1 *host,
                                                         void **outContext)
 {
-    if (host == NULL || outContext == NULL || host->publishService == NULL)
+    if (host == NULL || outContext == NULL || host->publishService == NULL ||
+        host->queryService(host->context, "example.host.lifetime", 1u,
+                           sizeof(hostLifetimeServiceTable), NULL,
+                           NULL) != &hostLifetimeServiceTable)
         return false;
     serviceLifetimeState.host = host;
     serviceLifetimeState.value = 1u;
@@ -914,13 +917,15 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
     Expect(LaiueModuleHostLoadStatic(host, lifetimeApis, 1u, &diagnostic) == LAIUE_MODULE_OK,
            "service lifetime fixture loads");
     Expect(LaiueModuleHostUnregisterService(host, hostLifetimeName, &diagnostic) ==
-               LAIUE_MODULE_BUSY &&
-               LaiueModuleHostQueryService(host, hostLifetimeName, 1u, sizeof(hostLifetimeServiceTable),
-                                           NULL, NULL) == &hostLifetimeServiceTable,
-           "host service remains available while a module may retain its pointer");
-    Expect(LaiueModuleHostRegisterService(host, &lateHostService, &diagnostic) ==
-               LAIUE_MODULE_BUSY,
-           "host service registry cannot change while modules are loaded");
+                   LAIUE_MODULE_IN_USE &&
+               LaiueModuleHostQueryService(host, hostLifetimeName, 1u,
+                                           sizeof(hostLifetimeServiceTable), NULL,
+                                           NULL) == &hostLifetimeServiceTable,
+           "host service remains available while a module holds its pointer");
+    Expect(LaiueModuleHostRegisterService(host, &lateHostService, &diagnostic) == LAIUE_MODULE_OK &&
+               LaiueModuleHostUnregisterService(host, lateHostServiceName, &diagnostic) ==
+                   LAIUE_MODULE_OK,
+           "an unused host service comes and goes while modules are loaded");
     Expect(serviceLifetimeState.host->unpublishService(
                serviceLifetimeState.host->context, moduleLifetimeServiceName) ==
                LAIUE_MODULE_BUSY &&
@@ -930,16 +935,11 @@ LAIUE_TEST_ENTRY(ModuleHostTestEntryPoint)
            "a running provider cannot invalidate a cached service table");
     LaiueModuleHostUnloadAll(host);
     Expect(serviceLifetimeStopUnpublishStatus == LAIUE_MODULE_BUSY &&
-               LaiueModuleHostQueryService(host, moduleLifetimeServiceName, 1u, 1u,
-                                       NULL, NULL) == NULL,
-           "the registry stays frozen during stop and host removes services after unload");
-    Expect(LaiueModuleHostUnregisterService(host, hostLifetimeName, &diagnostic) ==
-               LAIUE_MODULE_OK &&
-               LaiueModuleHostRegisterService(host, &lateHostService, &diagnostic) ==
-                   LAIUE_MODULE_OK &&
-               LaiueModuleHostUnregisterService(host, lateHostServiceName, &diagnostic) ==
-                   LAIUE_MODULE_OK,
-           "host service registry becomes mutable again after unload");
+               LaiueModuleHostQueryService(host, moduleLifetimeServiceName, 1u, 1u, NULL, NULL) ==
+                   NULL,
+           "a stopping provider cannot unpublish and host removes services after unload");
+    Expect(LaiueModuleHostUnregisterService(host, hostLifetimeName, &diagnostic) == LAIUE_MODULE_OK,
+           "host service unregisters once no module holds it");
 
     LaiueModuleServiceV1 oldHostService = {
         .name = optionalVersionedServiceName,

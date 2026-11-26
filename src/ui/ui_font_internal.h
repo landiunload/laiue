@@ -17,10 +17,12 @@
 #define UI_GLYPH_ASCII_FIRST 0x0020u
 #define UI_GLYPH_ASCII_LAST 0x007Eu
 #define UI_GLYPH_DEGREE 0x00B0u
+#define UI_GLYPH_MULTIPLY 0x00D7u
 #define UI_GLYPH_YO_BIG 0x0401u
 #define UI_GLYPH_CYR_FIRST 0x0410u
 #define UI_GLYPH_CYR_LAST 0x044Fu
 #define UI_GLYPH_YO_SMALL 0x0451u
+#define UI_GLYPH_EM_DASH 0x2014u
 
 typedef struct UiGlyphRange
 {
@@ -31,9 +33,11 @@ typedef struct UiGlyphRange
 static const UiGlyphRange UI_GLYPH_RANGES[] = {
     {UI_GLYPH_ASCII_FIRST, UI_GLYPH_ASCII_LAST}, // ASCII
     {UI_GLYPH_DEGREE, UI_GLYPH_DEGREE},          // знак градуса
+    {UI_GLYPH_MULTIPLY, UI_GLYPH_MULTIPLY},      // ×
     {UI_GLYPH_YO_BIG, UI_GLYPH_YO_BIG},          // Ё
     {UI_GLYPH_CYR_FIRST, UI_GLYPH_CYR_LAST},     // А..я
     {UI_GLYPH_YO_SMALL, UI_GLYPH_YO_SMALL},      // ё
+    {UI_GLYPH_EM_DASH, UI_GLYPH_EM_DASH},        // —
 };
 #define UI_GLYPH_RANGE_COUNT (sizeof(UI_GLYPH_RANGES) / sizeof(UI_GLYPH_RANGES[0]))
 
@@ -43,9 +47,11 @@ static const UiGlyphRange UI_GLYPH_RANGES[] = {
 #define UI_GLYPH_ASCII_COUNT (UI_GLYPH_ASCII_LAST - UI_GLYPH_ASCII_FIRST + 1u)
 #define UI_GLYPH_CYR_COUNT (UI_GLYPH_CYR_LAST - UI_GLYPH_CYR_FIRST + 1u)
 #define UI_GLYPH_INDEX_DEGREE (UI_GLYPH_ASCII_COUNT)
-#define UI_GLYPH_INDEX_YO_BIG (UI_GLYPH_ASCII_COUNT + 1u)
-#define UI_GLYPH_INDEX_CYR_BASE (UI_GLYPH_ASCII_COUNT + 2u)
+#define UI_GLYPH_INDEX_MULTIPLY (UI_GLYPH_ASCII_COUNT + 1u)
+#define UI_GLYPH_INDEX_YO_BIG (UI_GLYPH_ASCII_COUNT + 2u)
+#define UI_GLYPH_INDEX_CYR_BASE (UI_GLYPH_ASCII_COUNT + 3u)
 #define UI_GLYPH_INDEX_YO_SMALL (UI_GLYPH_INDEX_CYR_BASE + UI_GLYPH_CYR_COUNT)
+#define UI_GLYPH_INDEX_EM_DASH (UI_GLYPH_INDEX_YO_SMALL + 1u)
 
 // Число глифов фиксированного набора; используется и при запекании, и для
 // проверки, что конкретный шрифт запечён именно по этой таблице.
@@ -77,6 +83,10 @@ static inline uint32_t UiGlyphLayoutIndex(uint16_t codepoint)
     {
         return UI_GLYPH_INDEX_DEGREE;
     }
+    if (codepoint == UI_GLYPH_MULTIPLY)
+    {
+        return UI_GLYPH_INDEX_MULTIPLY;
+    }
     if (codepoint == UI_GLYPH_YO_BIG)
     {
         return UI_GLYPH_INDEX_YO_BIG;
@@ -84,6 +94,10 @@ static inline uint32_t UiGlyphLayoutIndex(uint16_t codepoint)
     if (codepoint == UI_GLYPH_YO_SMALL)
     {
         return UI_GLYPH_INDEX_YO_SMALL;
+    }
+    if (codepoint == UI_GLYPH_EM_DASH)
+    {
+        return UI_GLYPH_INDEX_EM_DASH;
     }
     return UI_GLYPH_INDEX_NONE;
 }

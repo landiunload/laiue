@@ -317,6 +317,31 @@ const char *ImageFormatName(ImageFormat format)
     return "unknown";
 }
 
+// Строка уменьшения вдвое без учёта альфы; false — в её блоках есть
+// неполная альфа, и строку нужно считать с весами. У четырёх непрозрачных
+// пикселей веса равны, и взвешенное среднее с суммой каналов S и
+// alphaSum = 1020 сокращается до обычного:
+// (2 * 255 * S + 1020) / 2040 = (S + 2) / 4. Картинки чаще всего
+// непрозрачны целиком, а такой цикл компилятор разворачивает в векторный.
+static bool HalveOpaqueRow(const uint8_t *restrict firstLine, const uint8_t *restrict secondLine,
+                           uint8_t *restrict destination, uint32_t width)
+{
+    uint32_t alpha = 255u;
+    for (size_t column = 0; column < width; ++column)
+    {
+        const uint8_t *top = firstLine + column * 8u;
+        const uint8_t *bottom = secondLine + column * 8u;
+        uint8_t *out = destination + column * 4u;
+        for (size_t channel = 0; channel < 4u; ++channel)
+        {
+            out[channel] = (uint8_t)((top[channel] + top[channel + 4u] + bottom[channel] +
+                                      bottom[channel + 4u] + 2u) >> 2u);
+        }
+        alpha &= (uint32_t)top[3] & top[7] & bottom[3] & bottom[7];
+    }
+    return alpha == 255u;
+}
+
 void ImageResample(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceHeight,
                  uint8_t *destination, uint32_t destinationWidth, uint32_t destinationHeight)
 {
@@ -351,6 +376,7 @@ void ImageResample(const uint8_t *source, uint32_t sourceWidth, uint32_t sourceH
             const uint8_t *firstLine = source + (size_t)(row * 2u) * sourceWidth * 4u;
             const uint8_t *secondLine = firstLine + (size_t)sourceWidth * 4u;
             uint8_t *destinationLine = destination + (size_t)row * destinationWidth * 4u;
+            if (HalveOpaqueRow(firstLine, secondLine, destinationLine, destinationWidth)) continue;
 
             for (uint32_t column = 0; column < destinationWidth; ++column)
             {

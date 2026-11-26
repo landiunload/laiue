@@ -241,9 +241,16 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
         LaiueTestRuntimeWrite("No Vulkan backend available; skipping\n");
         LaiueTestRuntimeExit(SKIP_EXIT_CODE);
     }
-    Renderer *renderer = RendererCreateWithBackend(NULL, (int32_t)TEST_WIDTH,
-                                                   (int32_t)TEST_HEIGHT,
-                                                   RENDERER_BACKEND_VULKAN);
+    // Варианты теста идут параллельно, поэтому папка пака у каждого своя.
+#if defined(TEST_VULKAN_CORE)
+    const RendererBackendKind backend = RENDERER_BACKEND_VULKAN_CORE;
+    const wchar_t *const packFolder = L"renderer_texture_pack_core_test";
+#else
+    const RendererBackendKind backend = RENDERER_BACKEND_VULKAN;
+    const wchar_t *const packFolder = L"renderer_texture_pack_test";
+#endif
+    Renderer *renderer =
+        RendererCreateWithBackend(NULL, (int32_t)TEST_WIDTH, (int32_t)TEST_HEIGHT, backend);
     if (renderer == NULL)
     {
         LaiueTestRuntimeWrite("No Vulkan driver available; skipping\n");
@@ -726,28 +733,25 @@ LAIUE_TEST_ENTRY(RendererOffscreenTestEntryPoint)
     Expect(paths != NULL, "path scratch could not be allocated");
     Expect(PlatformExecutableDirectory(paths->executable, LAIUE_PLATFORM_PATH_CAPACITY),
            "executable directory");
-    Expect(Join(paths->root, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable,
-                L"renderer_texture_pack_test") &&
-               Join(paths->textures, LAIUE_PLATFORM_PATH_CAPACITY, paths->root, L"textures") &&
-               Join(paths->pack, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"Anim.ltp") &&
-               Join(paths->blocks, LAIUE_PLATFORM_PATH_CAPACITY, paths->pack, L"blocks") &&
-               Join(paths->main, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"main") &&
-               Join(paths->special, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"special") &&
-               Join(paths->stone, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.png") &&
-               Join(paths->water, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"water.gif") &&
-               Join(paths->sand, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg") &&
-               Join(paths->glow, LAIUE_PLATFORM_PATH_CAPACITY, paths->special, L"glow.lt") &&
-               Join(paths->stoneCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
-                    L"stone.png.lt") &&
-               Join(paths->waterCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
-                    L"water.gif.lt") &&
-               Join(paths->sandCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg.lt") &&
-               Join(paths->uneven, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"uneven.gif") &&
-               Join(paths->unevenCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main,
-                    L"uneven.gif.lt") &&
-               Join(paths->stoneAuthored, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.lt") &&
-               Join(paths->formats, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"formats.txt"),
-           "path construction");
+    Expect(
+        Join(paths->root, LAIUE_PLATFORM_PATH_CAPACITY, paths->executable, packFolder) &&
+            Join(paths->textures, LAIUE_PLATFORM_PATH_CAPACITY, paths->root, L"textures") &&
+            Join(paths->pack, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"Anim.ltp") &&
+            Join(paths->blocks, LAIUE_PLATFORM_PATH_CAPACITY, paths->pack, L"blocks") &&
+            Join(paths->main, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"main") &&
+            Join(paths->special, LAIUE_PLATFORM_PATH_CAPACITY, paths->blocks, L"special") &&
+            Join(paths->stone, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.png") &&
+            Join(paths->water, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"water.gif") &&
+            Join(paths->sand, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg") &&
+            Join(paths->glow, LAIUE_PLATFORM_PATH_CAPACITY, paths->special, L"glow.lt") &&
+            Join(paths->stoneCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.png.lt") &&
+            Join(paths->waterCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"water.gif.lt") &&
+            Join(paths->sandCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"sand.jpg.lt") &&
+            Join(paths->uneven, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"uneven.gif") &&
+            Join(paths->unevenCache, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"uneven.gif.lt") &&
+            Join(paths->stoneAuthored, LAIUE_PLATFORM_PATH_CAPACITY, paths->main, L"stone.lt") &&
+            Join(paths->formats, LAIUE_PLATFORM_PATH_CAPACITY, paths->textures, L"formats.txt"),
+        "path construction");
     Expect(PlatformCreateDirectory(paths->root) && PlatformCreateDirectory(paths->textures) &&
                PlatformCreateDirectory(paths->pack) && PlatformCreateDirectory(paths->blocks) &&
                PlatformCreateDirectory(paths->main) && PlatformCreateDirectory(paths->special),

@@ -1,4 +1,5 @@
 #include "render/renderer_internal.h"
+#include "render/frame_turn.h"
 #include "render/pipeline_cache.h"
 #include "platform/system.h"
 #include "render/renderer_offscreen.h"
@@ -30,6 +31,7 @@
 // путь отката внутри RendererCreate_D3D12 зовёт суффиксную реализацию
 // раньше её определения — объявляем её здесь.
 void RendererDestroy_D3D12(Renderer* renderer);
+bool RendererIsDeviceLost_D3D12(const Renderer* renderer);
 RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
                                               uint32_t height, uint32_t mipLevels,
                                               uint32_t format);
@@ -44,6 +46,8 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Буферов swapchain и кадров в полёте: третий нужен, чтобы без vsync, пока
 // один кадр на экране и следующий ждёт обновления, GPU уже рисовал ещё один.
 #define FRAME_COUNT 3
+// Предел ожидания места в очереди показа: кадр не встаёт, что бы ни случилось с окном.
+#define FRAME_LATENCY_WAIT_MILLISECONDS 100u
 
 // Общая шейдерная куча SRV: фиксированные слоты. Albedo и нормали
 // блоков соседствуют — таблица чанкового прохода накрывает оба (t1, t2).
@@ -61,8 +65,12 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Число квадов является частью публичного контракта renderer.h.
 #define UI_QUAD_BYTES 48
 
-// Резолв панорамы: раскладка корневых констант.
-#define RESOLVE_ROOT_CONSTANT_COUNT 3
+// Резолв панорамы: раскладка корневых констант. Dword 4..7 — оси окна.
+#define RESOLVE_ROOT_CONSTANT_COUNT 8
+#define RESOLVE_ROOT_CONSTANT_CLIP_AXES 4
+
+// Слой UI: размер окна и за ним оси окна. D3D12 рисует так, как лежит окно.
+#define UI_ROOT_CONSTANT_COUNT 6
 
 // Корневые константы (раскладка совпадает с cbuffer в chunk.hlsl,
 // float3 выравниваются по границам 16 байт):
@@ -108,17 +116,33 @@ void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture);
 // Очередь загрузок растёт вместе с числом мешей, созданных между кадрами,
 // и сохраняет ёмкость: в установившемся режиме она не выделяет память.
 #define PENDING_UPLOAD_INITIAL_CAPACITY 128u
-#define MESH_UPLOAD_BYTES_PER_FRAME (4u * 1024u * 1024u)
+// Кольцо живёт всё время работы и занимает память в каждом слоте, а заливать
+// между кадрами обычно нечего: игра грузит мир в первые секунды и дальше почти
+// не трогает геометрию. Большего размера хватает только на всплески, а им есть арена.
+#define MESH_UPLOAD_BYTES_PER_FRAME (1u * 1024u * 1024u)
 // Крупные записи (один большой меш или всплеск чанков, который не влезает
 // в основное кольцо) идут в отдельную арену с тем же двойным
 // буферированием. Она создаётся лениво, при первом переполнении, и
-// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс.
+// переиспользуется каждый кадр, поэтому на кадр не создаётся ресурс, а
+// простояв LARGE_MESH_UPLOAD_IDLE_TURNS оборотов слота, отдаётся.
 // Что не поместилось и туда, ложится в дополнительные блоки того же
 // кадрового слота размером не меньше арены. Блок делят все такие записи,
 // поэтому всплеск в тысячи мешей стоит нескольких ресурсов, а не тысяч
 // ресурсов с выравниванием по 64 КиБ; блоки освобождаются, когда пройден
 // fence слота.
 #define LARGE_MESH_UPLOAD_BYTES_PER_FRAME (8u * 1024u * 1024u)
+#define LARGE_MESH_UPLOAD_IDLE_TURNS 120u
+// Без кадров дополнительные блоки не отдаются, а буфер, заменённый до кадра,
+// оставляет в них мёртвые байты: у свёрнутой программы они копились бы без
+// предела. На этом пороге накопленное копируется сразу, а всплеск в обычном
+// кадре до него GPU не ждёт.
+#define GEOMETRY_STAGING_LIMIT_BYTES (UINT64_C(32) << 20)
+// Загрузка текстуры ждёт начала кадра в staging-блоках. Если кадров нет, а
+// загрузок много, накопленное копируется сразу: иначе подготовка большой
+// сцены держала бы все её пиксели в памяти дважды.
+#define MAX_PENDING_TEXTURE_UPLOADS 256u
+#define TEXTURE_STAGING_LIMIT_BYTES (UINT64_C(256) << 20)
+#define TEXTURE_STAGING_CHUNK_BYTES (UINT64_C(64) << 10)
 // Инстансное кольцо — чанковый upload-пул: кадровый слот начинает с одного
 // небольшого чанка и добавляет новый только тогда, когда очередной вызов
 // перестаёт влезать в уже существующие. Стартовая плата падает с 2 x 16 МиБ
@@ -193,6 +217,14 @@ typedef struct StagingOverflow
     uint64_t usedBytes;
 } StagingOverflow;
 
+typedef struct PendingTextureUpload
+{
+    RendererTexture *texture;
+    ID3D12Resource *staging;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    uint32_t mipLevel;
+} PendingTextureUpload;
+
 typedef struct DeferredResourceRelease
 {
     ID3D12Resource* resource;
@@ -243,6 +275,9 @@ struct RendererTexture
     Renderer *owner;
     ID3D12Resource *resource;
     uint32_t srvSlot;
+    // Удалённая текстура ждёт, пока GPU пройдёт кадры, которые её читают.
+    struct RendererTexture *nextRetired;
+    UINT64 safeFenceValue;
 };
 
 struct RendererSampler
@@ -350,6 +385,13 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     int32_t                    resizeHeight;
     bool                       resizeRequested;
     bool                       verticalSyncEnabled;
+    // Swapchain создан с DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.
+    bool                       tearingSupported;
+    // ResizeBuffers обязан передать те же флаги, что и создание.
+    UINT                       swapChainFlags;
+    uint32_t                   swapChainRebuilds;
+    // Сигналит, когда очередь показа готова принять следующий кадр.
+    HANDLE                     frameLatencyWait;
     bool                       wireframeEnabled;
     bool                       worldReady;
     bool                       frameRecording;
@@ -387,7 +429,14 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     ID3D12Resource*            largeMeshUploadBuffers[FRAME_COUNT];
     uint8_t*                   largeMeshUploadMapped[FRAME_COUNT];
     uint32_t                   largeMeshUploadOffsets[FRAME_COUNT];
+    uint32_t                   largeMeshUploadIdleTurns[FRAME_COUNT];
     StagingOverflow*           stagingOverflow[FRAME_COUNT];
+    uint64_t                   stagingOverflowBytes[FRAME_COUNT];
+    PendingTextureUpload       pendingTextures[MAX_PENDING_TEXTURE_UPLOADS];
+    uint32_t                   pendingTextureCount;
+    StagingOverflow*           textureStaging;
+    uint64_t                   textureStagingBytes;
+    RendererTexture*           retiredTextures;
     // Чанковый пул инстансов, по независимому набору на кадровый слот.
     // instanceChunkIndex/Offset — монотонный курсор записи внутри кадра,
     // сбрасываемый при переходе слота; instancePoolBytes — сумма ёмкостей
@@ -838,6 +887,8 @@ static void PoolReclaimEmptyTail(Renderer* renderer)
     }
 }
 
+static void FreeTexture(Renderer *renderer, RendererTexture *texture);
+
 // Освобождает ресурсы и диапазоны, кадры которых GPU уже прошёл.
 static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
 {
@@ -854,6 +905,19 @@ static void DrainDeferredReleases(Renderer* renderer, bool releaseEverything)
         renderer->deferredResourceHead =
             (renderer->deferredResourceHead + 1) % DEFERRED_RESOURCE_CAPACITY;
         renderer->deferredResourceCount--;
+    }
+
+    RendererTexture **retired = &renderer->retiredTextures;
+    while (*retired != NULL)
+    {
+        RendererTexture *texture = *retired;
+        if (!releaseEverything && texture->safeFenceValue > completedValue)
+        {
+            retired = &texture->nextRetired;
+            continue;
+        }
+        *retired = texture->nextRetired;
+        FreeTexture(renderer, texture);
     }
 
     while (renderer->deferredRangeCount > 0)
@@ -904,11 +968,11 @@ static void DeferResourceRelease(Renderer* renderer, ID3D12Resource* resource)
     renderer->deferredResourceCount++;
 }
 
-// Дополнительные staging-блоки слота: вызывается, когда GPU их уже не читает.
-static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+// Вызывается, когда GPU эти staging-блоки уже не читает.
+static void ReleaseStagingChain(StagingOverflow **head)
 {
-    StagingOverflow *chunk = renderer->stagingOverflow[frameIndex];
-    renderer->stagingOverflow[frameIndex] = NULL;
+    StagingOverflow *chunk = *head;
+    *head = NULL;
     while (chunk != NULL)
     {
         StagingOverflow *next = chunk->next;
@@ -917,6 +981,25 @@ static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
         HeapFree(GetProcessHeap(), 0, chunk);
         chunk = next;
     }
+}
+
+// Дополнительные staging-блоки слота.
+static void ReleaseStagingOverflow(Renderer *renderer, uint32_t frameIndex)
+{
+    ReleaseStagingChain(&renderer->stagingOverflow[frameIndex]);
+    renderer->stagingOverflowBytes[frameIndex] = 0u;
+}
+
+static void ReleaseLargeMeshUpload(Renderer* renderer, uint32_t frameIndex)
+{
+    if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
+    {
+        if (renderer->largeMeshUploadMapped[frameIndex] != NULL)
+            ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[frameIndex], 0, NULL);
+        ID3D12Resource_Release(renderer->largeMeshUploadBuffers[frameIndex]);
+    }
+    renderer->largeMeshUploadBuffers[frameIndex] = NULL;
+    renderer->largeMeshUploadMapped[frameIndex] = NULL;
 }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(Renderer* renderer, uint32_t slot)
@@ -1449,7 +1532,7 @@ static bool CreateResolveRootSignature(Renderer* renderer)
     D3D12_ROOT_PARAMETER parameters[2];
     memset(parameters, 0, sizeof(parameters));
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     parameters[0].Constants.ShaderRegister = 0;
     parameters[0].Constants.Num32BitValues = RESOLVE_ROOT_CONSTANT_COUNT;
 
@@ -1514,7 +1597,7 @@ static bool CreateUiRootSignature(Renderer* renderer)
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     parameters[0].Constants.ShaderRegister = 0;
-    parameters[0].Constants.Num32BitValues = 2;
+    parameters[0].Constants.Num32BitValues = UI_ROOT_CONSTANT_COUNT;
 
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -2221,6 +2304,19 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDescription.SampleDesc.Count = 1;
+    // Разрывы разрешаются, если система их поддерживает (Windows 10 1607 и
+    // новее): тогда без vsync Present не ждёт композиции.
+    IDXGIFactory5* factory5 = NULL;
+    if (SUCCEEDED(IDXGIFactory4_QueryInterface(renderer->factory, &IID_IDXGIFactory5, (void**)&factory5)))
+    {
+        BOOL allowTearing = FALSE;
+        renderer->tearingSupported = SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(factory5,
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))) && allowTearing;
+        IDXGIFactory5_Release(factory5);
+    }
+    renderer->swapChainFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+        | (renderer->tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swapChainDescription.Flags = renderer->swapChainFlags;
 
     IDXGISwapChain1* swapChain1 = NULL;
     if (FAILED(IDXGIFactory4_CreateSwapChainForHwnd(renderer->factory, (IUnknown*)renderer->commandQueue,
@@ -2237,6 +2333,26 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
         RendererDestroy_D3D12(renderer);
         return NULL;
     }
+    // По умолчанию очередь показа держит три кадра, и картинка отстаёт от ввода
+    // на пять обновлений экрана. Ожидание идёт в конце кадра, поэтому программа
+    // читает ввод уже после него, и в очереди два кадра: отправленный и тот, что
+    // она рисует. Предел здесь 1, а не 2: счёт объекта копится до предела, пока
+    // кадров нет, и с пределом 2 после паузы в очереди стало бы на кадр больше.
+    // Один кадр в очереди не годится: CPU и GPU работали бы строго по очереди,
+    // и им на двоих пришлось бы уложиться в одно обновление экрана, иначе число
+    // кадров падает вдвое.
+    if (SUCCEEDED(IDXGISwapChain3_SetMaximumFrameLatency(renderer->swapChain, 1)))
+    {
+        renderer->frameLatencyWait =
+            IDXGISwapChain3_GetFrameLatencyWaitableObject(renderer->swapChain);
+    }
+    // Полноэкранный режим переключает окно (Alt+Enter в модуле окна), без
+    // рамки и одинаково для D3D12 и Vulkan. Свой Alt+Enter DXGI включал бы
+    // эксклюзивный режим, а в нём Present с DXGI_PRESENT_ALLOW_TEARING
+    // отказывает: без vsync программа переставала рисовать. Окно, с которым
+    // swapchain только что создан, вызов принимает всегда.
+    (void)IDXGIFactory4_MakeWindowAssociation(renderer->factory, (HWND)windowHandle,
+        DXGI_MWA_NO_ALT_ENTER);
 
     renderer->frameIndex = IDXGISwapChain3_GetCurrentBackBufferIndex(renderer->swapChain);
 
@@ -2398,17 +2514,10 @@ void RendererReleaseWorld_D3D12(Renderer* renderer)
                 ID3D12Resource_Unmap(renderer->meshUploadBuffers[i], 0, NULL);
             ID3D12Resource_Release(renderer->meshUploadBuffers[i]);
         }
-        if (renderer->largeMeshUploadBuffers[i] != NULL)
-        {
-            if (renderer->largeMeshUploadMapped[i] != NULL)
-                ID3D12Resource_Unmap(renderer->largeMeshUploadBuffers[i], 0, NULL);
-            ID3D12Resource_Release(renderer->largeMeshUploadBuffers[i]);
-        }
+        ReleaseLargeMeshUpload(renderer, i);
         renderer->meshUploadBuffers[i] = NULL;
         renderer->meshUploadMapped[i] = NULL;
         renderer->meshUploadOffsets[i] = 0;
-        renderer->largeMeshUploadBuffers[i] = NULL;
-        renderer->largeMeshUploadMapped[i] = NULL;
         renderer->largeMeshUploadOffsets[i] = 0;
     }
     ReleaseInstancePool(renderer);
@@ -2561,7 +2670,8 @@ void RendererDestroy_D3D12(Renderer* renderer)
     // Пока конвейеры живы, новые из них сохраняются в кеш.
     {
         const RendererPipelineCacheStatusV1 *status = &renderer->header.pipelineCache;
-        if (renderer->pipelineLibrary != NULL && status->pipelinesCreated > status->pipelinesFromCache)
+        if (renderer->pipelineLibrary != NULL && status->pipelinesCreated > status->pipelinesFromCache &&
+            !RendererIsDeviceLost_D3D12(renderer))
             (void)RendererSavePipelineCache_D3D12(renderer);
     }
 
@@ -2577,6 +2687,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     }
 
     RendererReleaseWorld_D3D12(renderer);
+    ReleaseStagingChain(&renderer->textureStaging);
     if (renderer->pendingUploads != NULL)
         HeapFree(GetProcessHeap(), 0, renderer->pendingUploads);
 
@@ -2640,6 +2751,7 @@ void RendererDestroy_D3D12(Renderer* renderer)
     if (renderer->commandList != NULL) ID3D12GraphicsCommandList_Release(renderer->commandList);
     ReleaseGpuTimingResources(renderer);
     if (renderer->fence != NULL) ID3D12Fence_Release(renderer->fence);
+    if (renderer->frameLatencyWait != NULL) CloseHandle(renderer->frameLatencyWait);
     if (renderer->swapChain != NULL) IDXGISwapChain3_Release(renderer->swapChain);
     if (renderer->commandQueue != NULL) ID3D12CommandQueue_Release(renderer->commandQueue);
     if (renderer->pipelineLibrary != NULL) ID3D12PipelineLibrary_Release(renderer->pipelineLibrary);
@@ -2658,6 +2770,24 @@ void RendererDestroy_D3D12(Renderer* renderer)
 // Создаёт (один раз на кадровый слот) upload-арену под крупные записи.
 // Создание ленивое: приложение, чьи меши помещаются в основное кольцо,
 // не платит за неё ни байтом.
+// Слот снова свободен: GPU прошёл всё, что читало из его колец.
+static void RewindUploadSlot(Renderer* renderer, uint32_t frameIndex)
+{
+    renderer->meshUploadOffsets[frameIndex] = 0u;
+    if (renderer->largeMeshUploadOffsets[frameIndex] != 0u)
+    {
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    else if (renderer->largeMeshUploadBuffers[frameIndex] != NULL
+        && ++renderer->largeMeshUploadIdleTurns[frameIndex] >= LARGE_MESH_UPLOAD_IDLE_TURNS)
+    {
+        ReleaseLargeMeshUpload(renderer, frameIndex);
+        renderer->largeMeshUploadIdleTurns[frameIndex] = 0u;
+    }
+    renderer->largeMeshUploadOffsets[frameIndex] = 0u;
+    ReleaseStagingOverflow(renderer, frameIndex);
+}
+
 static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
 {
     if (renderer->largeMeshUploadBuffers[frameIndex] != NULL)
@@ -2697,22 +2827,21 @@ static bool EnsureLargeMeshUploadBuffer(Renderer* renderer, uint32_t frameIndex)
     return true;
 }
 
-// Копирует запись в дополнительный блок текущего слота, начиная новый
-// блок, когда в последнем не хватает места.
-static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
-                          ID3D12Resource **outStaging, uint32_t *outOffset)
+// Место под запись в цепочке staging-блоков: в последнем блоке, а если там
+// тесно, в новом, не меньше minimumBytes.
+static bool ReserveStaging(Renderer *renderer, StagingOverflow **head, uint64_t sizeBytes,
+                           uint64_t alignment, uint64_t minimumBytes,
+                           ID3D12Resource **outStaging, uint64_t *outOffset, uint8_t **outMapped)
 {
-    StagingOverflow **head = &renderer->stagingOverflow[renderer->frameIndex];
     StagingOverflow *chunk = *head;
-    uint64_t offset = chunk == NULL ? 0u : (chunk->usedBytes + 15u) & ~(uint64_t)15u;
+    uint64_t offset =
+        chunk == NULL ? 0u : (chunk->usedBytes + alignment - 1u) & ~(alignment - 1u);
     if (chunk == NULL || offset > chunk->sizeBytes || sizeBytes > chunk->sizeBytes - offset)
     {
         chunk = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*chunk));
         if (chunk == NULL)
             return false;
-        chunk->sizeBytes = sizeBytes > LARGE_MESH_UPLOAD_BYTES_PER_FRAME
-                               ? sizeBytes
-                               : LARGE_MESH_UPLOAD_BYTES_PER_FRAME;
+        chunk->sizeBytes = sizeBytes > minimumBytes ? sizeBytes : minimumBytes;
         D3D12_HEAP_PROPERTIES heapProperties = { .Type = D3D12_HEAP_TYPE_UPLOAD };
         D3D12_RESOURCE_DESC description;
         memset(&description, 0, sizeof(description));
@@ -2742,9 +2871,24 @@ static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeByt
         *head = chunk;
         offset = 0u;
     }
-    memcpy(chunk->mapped + offset, data, sizeBytes);
     chunk->usedBytes = offset + sizeBytes;
     *outStaging = chunk->resource;
+    *outOffset = offset;
+    *outMapped = chunk->mapped + offset;
+    return true;
+}
+
+// Копирует запись в дополнительный блок текущего слота.
+static bool StageOverflow(Renderer *renderer, const void *data, uint32_t sizeBytes,
+                          ID3D12Resource **outStaging, uint32_t *outOffset)
+{
+    uint64_t offset = 0u;
+    uint8_t *mapped = NULL;
+    if (!ReserveStaging(renderer, &renderer->stagingOverflow[renderer->frameIndex], sizeBytes, 16u,
+                        (uint64_t)LARGE_MESH_UPLOAD_BYTES_PER_FRAME, outStaging, &offset, &mapped))
+        return false;
+    memcpy(mapped, data, sizeBytes);
+    renderer->stagingOverflowBytes[renderer->frameIndex] += sizeBytes;
     // Смещение в блоке размером max(арена, запись) укладывается в 32 бита.
     *outOffset = (uint32_t)offset;
     return true;
@@ -2778,6 +2922,8 @@ static bool ReservePendingUpload(Renderer *renderer)
     return true;
 }
 
+static bool FlushUploads(Renderer *renderer);
+
 static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint32_t sizeBytes,
                                       GeometryAllocation *allocation)
 {
@@ -2785,6 +2931,11 @@ static bool UploadGeometryBytes_D3D12(Renderer *renderer, const void *data, uint
         renderer->frameFailed || sizeBytes == 0u || allocation == NULL ||
         sizeBytes > UINTPTR_MAX - (uintptr_t)data || renderer->geometryGeneration == UINT64_MAX ||
         !ReservePendingUpload(renderer))
+    {
+        return false;
+    }
+    if (renderer->stagingOverflowBytes[renderer->frameIndex] >= GEOMETRY_STAGING_LIMIT_BYTES &&
+        !FlushUploads(renderer))
     {
         return false;
     }
@@ -2943,6 +3094,13 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
         return NULL;
 
     uint32_t srvSlot = AllocateDynamicSrvSlot(renderer);
+    // Слоты могут держать удалённые текстуры, которые ещё читает GPU.
+    if (srvSlot == UINT32_MAX && renderer->retiredTextures != NULL &&
+        !renderer->frameRecording && WaitForGpu(renderer))
+    {
+        DrainDeferredReleases(renderer, false);
+        srvSlot = AllocateDynamicSrvSlot(renderer);
+    }
     if (srvSlot == UINT32_MAX)
         return NULL;
     RendererTexture *texture = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -2987,6 +3145,55 @@ RendererTexture *RendererCreateTexture_D3D12(Renderer *renderer, uint32_t width,
     return texture;
 }
 
+// Уровни одной текстуры обычно идут подряд, и барьеры нужны вокруг всей серии.
+static void RecordTextureUploads(Renderer *renderer)
+{
+    const uint32_t count = renderer->pendingTextureCount;
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        const PendingTextureUpload *upload = &renderer->pendingTextures[i];
+        ID3D12Resource *resource = upload->texture->resource;
+        if (i == 0u || upload[-1].texture != upload->texture)
+        {
+            D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+                resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
+        }
+        D3D12_TEXTURE_COPY_LOCATION destination;
+        memset(&destination, 0, sizeof(destination));
+        destination.pResource = resource;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = upload->mipLevel;
+        D3D12_TEXTURE_COPY_LOCATION source;
+        memset(&source, 0, sizeof(source));
+        source.pResource = upload->staging;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = upload->layout;
+        ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList, &destination, 0u, 0u,
+                                                    0u, &source, NULL);
+        if (i + 1u == count || upload[1].texture != upload->texture)
+        {
+            D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
+                resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
+        }
+    }
+    renderer->pendingTextureCount = 0u;
+}
+
+// Блоки читает записанный список, поэтому они уходят вместе с блоками его слота.
+static void RetireTextureStaging(Renderer *renderer)
+{
+    StagingOverflow **tail = &renderer->stagingOverflow[renderer->frameIndex];
+    while (*tail != NULL)
+        tail = &(*tail)->next;
+    *tail = renderer->textureStaging;
+    renderer->textureStaging = NULL;
+    renderer->textureStagingBytes = 0u;
+}
+
 bool RendererUploadTexture_D3D12(Renderer *renderer, RendererTexture *texture,
                                  const void *data, uint64_t sizeBytes,
                                  uint32_t rowPitchBytes)
@@ -3001,7 +3208,7 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
 {
     if (renderer == NULL || texture == NULL || texture->owner != renderer ||
         texture->resource == NULL || data == NULL ||
-        renderer->frameRecording || rowPitchBytes == 0u)
+        renderer->frameRecording || renderer->frameFailed || rowPitchBytes == 0u)
         return false;
     D3D12_RESOURCE_DESC textureDescription;
     ID3D12Resource_GetDesc(texture->resource, &textureDescription);
@@ -3028,81 +3235,33 @@ bool RendererUploadTextureMip_D3D12(Renderer *renderer, RendererTexture *texture
     if (rows != mipHeight || rowSize != rowPitchBytes || uploadBytes == 0u)
         return false;
 
-    D3D12_RESOURCE_DESC uploadDescription;
-    memset(&uploadDescription, 0, sizeof(uploadDescription));
-    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDescription.Width = uploadBytes;
-    uploadDescription.Height = 1u;
-    uploadDescription.DepthOrArraySize = 1u;
-    uploadDescription.MipLevels = 1u;
-    uploadDescription.SampleDesc.Count = 1u;
-    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES uploadHeap = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-    ID3D12Resource *upload = NULL;
-    if (FAILED(ID3D12Device_CreateCommittedResource(
-            renderer->device, &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
-            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
-            (void **)&upload)))
+    if ((renderer->pendingTextureCount == MAX_PENDING_TEXTURE_UPLOADS ||
+         renderer->textureStagingBytes + uploadBytes > TEXTURE_STAGING_LIMIT_BYTES) &&
+        !FlushUploads(renderer))
         return false;
-
-    D3D12_RANGE emptyRange = {0, 0};
+    ID3D12Resource *staging = NULL;
+    uint64_t offset = 0u;
     uint8_t *mapped = NULL;
-    if (FAILED(ID3D12Resource_Map(upload, 0u, &emptyRange, (void **)&mapped)))
-    {
-        ID3D12Resource_Release(upload);
+    if (!ReserveStaging(renderer, &renderer->textureStaging, uploadBytes,
+                        D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, TEXTURE_STAGING_CHUNK_BYTES,
+                        &staging, &offset, &mapped))
         return false;
-    }
+    // Шаг чтения считается от размера источника: rows совпадает с ним по проверке
+    // выше, а прочитать больше, чем передали, такой цикл не может в принципе.
     const uint8_t *source = (const uint8_t *)data;
-    for (UINT row = 0u; row < rows; ++row)
-        memcpy(mapped + layout.Offset + (size_t)row * layout.Footprint.RowPitch,
-               source + (size_t)row * rowPitchBytes, (size_t)rowPitchBytes);
-    ID3D12Resource_Unmap(upload, 0u, NULL);
-
-    WaitForGpu(renderer);
-    if (FAILED(ID3D12CommandAllocator_Reset(renderer->commandAllocators[renderer->frameIndex])) ||
-        FAILED(ID3D12GraphicsCommandList_Reset(renderer->commandList,
-                                                renderer->commandAllocators[renderer->frameIndex],
-                                                NULL)))
+    uint8_t *target = mapped;
+    for (uint64_t read = 0u; read < sizeBytes; read += rowPitchBytes)
     {
-        ID3D12Resource_Release(upload);
-        return false;
+        memcpy(target, source + read, (size_t)rowPitchBytes);
+        target += layout.Footprint.RowPitch;
     }
-    // Reset начинает новый command list с PSO=NULL; он не наследует
-    // привязки предыдущей записи.
-    renderer->boundPipelineState = NULL;
-    renderer->boundRootSignature = NULL;
-    renderer->boundIndexAddress = 0u;
-    renderer->boundIndexBytes = 0u;
-    D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
-        texture->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toCopy);
-    D3D12_TEXTURE_COPY_LOCATION destination;
-    memset(&destination, 0, sizeof(destination));
-    destination.pResource = texture->resource;
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = mipLevel;
-    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
-    memset(&sourceLocation, 0, sizeof(sourceLocation));
-    sourceLocation.pResource = upload;
-    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    sourceLocation.PlacedFootprint = layout;
-    ID3D12GraphicsCommandList_CopyTextureRegion(renderer->commandList,
-                                                 &destination, 0u, 0u, 0u,
-                                                 &sourceLocation, NULL);
-    D3D12_RESOURCE_BARRIER toShader = MakeTransitionBarrier(
-        texture->resource, D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ID3D12GraphicsCommandList_ResourceBarrier(renderer->commandList, 1u, &toShader);
-    if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
-    {
-        ID3D12Resource_Release(upload);
-        return false;
-    }
-    ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
-    ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
-    WaitForGpu(renderer);
-    ID3D12Resource_Release(upload);
+    layout.Offset = offset;
+    PendingTextureUpload *upload = &renderer->pendingTextures[renderer->pendingTextureCount++];
+    upload->texture = texture;
+    upload->staging = staging;
+    upload->layout = layout;
+    upload->mipLevel = mipLevel;
+    renderer->textureStagingBytes += uploadBytes;
     return true;
 }
 
@@ -3181,20 +3340,42 @@ void RendererDestroySampler_D3D12(Renderer *renderer, RendererSampler *sampler)
     HeapFree(GetProcessHeap(), 0, sampler);
 }
 
+static void FreeTexture(Renderer *renderer, RendererTexture *texture)
+{
+    if (texture->resource != NULL)
+        ID3D12Resource_Release(texture->resource);
+    if (renderer != NULL)
+        FreeDynamicSrvSlot(renderer, texture->srvSlot);
+    HeapFree(GetProcessHeap(), 0, texture);
+}
+
 void RendererDestroyTexture_D3D12(Renderer *renderer, RendererTexture *texture)
 {
     if (texture == NULL)
         return;
     if (renderer != NULL && texture->owner != renderer)
         return;
-    if (renderer != NULL && renderer->commandQueue != NULL && renderer->fence != NULL &&
-        renderer->fenceEvent != NULL)
-        WaitForGpu(renderer);
-    if (texture->resource != NULL)
-        ID3D12Resource_Release(texture->resource);
     if (renderer != NULL)
-        FreeDynamicSrvSlot(renderer, texture->srvSlot);
-    HeapFree(GetProcessHeap(), 0, texture);
+    {
+        // Его пиксели остаются в staging-блоках до следующего кадра.
+        uint32_t kept = 0u;
+        for (uint32_t i = 0u; i < renderer->pendingTextureCount; ++i)
+            if (renderer->pendingTextures[i].texture != texture)
+                renderer->pendingTextures[kept++] = renderer->pendingTextures[i];
+        renderer->pendingTextureCount = kept;
+        const UINT64 safeFenceValue = renderer->frameRecording
+                                          ? renderer->fenceValues[renderer->frameIndex]
+                                          : renderer->lastSignaledFenceValue;
+        if (renderer->fence != NULL &&
+            safeFenceValue > ID3D12Fence_GetCompletedValue(renderer->fence))
+        {
+            texture->safeFenceValue = safeFenceValue;
+            texture->nextRetired = renderer->retiredTextures;
+            renderer->retiredTextures = texture;
+            return;
+        }
+    }
+    FreeTexture(renderer, texture);
 }
 
 static bool GeometryAllocationIsResident(const Renderer *renderer,
@@ -3640,6 +3821,40 @@ static void RecordPendingUploads(Renderer* renderer)
     renderer->pendingUploadCount = 0;
 }
 
+// Копирует накопленное, не дожидаясь кадра, и отдаёт его staging. Кольца слота
+// после этого свободны: их читали только эти копии.
+static bool FlushUploads(Renderer *renderer)
+{
+    if (renderer->pendingUploadCount != 0u || renderer->pendingTextureCount != 0u)
+    {
+        if (!WaitForGpu(renderer) ||
+            FAILED(ID3D12CommandAllocator_Reset(
+                renderer->commandAllocators[renderer->frameIndex])) ||
+            FAILED(ID3D12GraphicsCommandList_Reset(
+                renderer->commandList, renderer->commandAllocators[renderer->frameIndex], NULL)))
+            return false;
+        // Reset начинает новый command list с PSO=NULL; он не наследует
+        // привязки предыдущей записи.
+        renderer->boundPipelineState = NULL;
+        renderer->boundRootSignature = NULL;
+        renderer->boundIndexAddress = 0u;
+        renderer->boundIndexBytes = 0u;
+        RecordPendingUploads(renderer);
+        RecordTextureUploads(renderer);
+        if (FAILED(ID3D12GraphicsCommandList_Close(renderer->commandList)))
+            return false;
+        ID3D12CommandList *commandLists[1] = {(ID3D12CommandList *)renderer->commandList};
+        ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1u, commandLists);
+        if (!WaitForGpu(renderer))
+            return false;
+    }
+    ReleaseStagingChain(&renderer->textureStaging);
+    renderer->textureStagingBytes = 0u;
+    RewindUploadSlot(renderer, renderer->frameIndex);
+    DrainDeferredReleases(renderer, false);
+    return true;
+}
+
 static bool ApplyPendingResize(Renderer* renderer)
 {
     int32_t width = renderer->resizeWidth;
@@ -3670,11 +3885,13 @@ static bool ApplyPendingResize(Renderer* renderer)
         }
     }
 
+    // Флаги swapchain при пересоздании буферов должны остаться прежними.
     if (FAILED(IDXGISwapChain3_ResizeBuffers(renderer->swapChain, FRAME_COUNT, (UINT)width, (UINT)height,
-        DXGI_FORMAT_R8G8B8A8_UNORM, 0)))
+        DXGI_FORMAT_R8G8B8A8_UNORM, renderer->swapChainFlags)))
     {
         return false; // resizeRequested остаётся — повтор в следующем кадре
     }
+    renderer->swapChainRebuilds++;
 
     // ResizeBuffers сбрасывает индекс back-буфера: чтобы подписи фенса
     // остались монотонными, все слоты выравниваются по текущему значению
@@ -3876,6 +4093,8 @@ bool RendererBeginFrame_D3D12(Renderer* renderer, const RendererFrameSetup* fram
     RecordFontAtlasUpload(renderer);
     RecordBackgroundUpload(renderer);
     RecordPendingUploads(renderer);
+    RecordTextureUploads(renderer);
+    RetireTextureStaging(renderer);
 
     D3D12_RESOURCE_BARRIER barrier = MakeTransitionBarrier(renderer->renderTargets[renderer->frameIndex],
         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4110,6 +4329,8 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
             0, 2, resolveConstants, 0);
         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(renderer->commandList,
             0, (UINT)renderer->frame.resolveMapping, 2);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
+            0, 4, FRAME_TURN_CLIP_AXES[0], RESOLVE_ROOT_CONSTANT_CLIP_AXES);
         ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(renderer->commandList,
             1, SrvGpuHandle(renderer, SRV_SLOT_PANORAMA_CUBE));
 
@@ -4132,12 +4353,16 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         SetPipelineStateCached(renderer, renderer->uiPipelineState);
         SetRootSignatureCached(renderer, renderer->uiRootSignature);
 
-        float screenSize[2] = {
+        float uiConstants[UI_ROOT_CONSTANT_COUNT] = {
             (float)renderer->windowWidth,
             (float)renderer->windowHeight,
+            FRAME_TURN_CLIP_AXES[0][0],
+            FRAME_TURN_CLIP_AXES[0][1],
+            FRAME_TURN_CLIP_AXES[0][2],
+            FRAME_TURN_CLIP_AXES[0][3],
         };
         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(renderer->commandList,
-            0, 2, screenSize, 0);
+            0, UI_ROOT_CONSTANT_COUNT, uiConstants, 0);
         ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(renderer->commandList,
             1, ID3D12Resource_GetGPUVirtualAddress(
                 renderer->uiQuadBuffers[renderer->frameIndex]));
@@ -4192,12 +4417,15 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     ID3D12CommandList* commandLists[1] = { (ID3D12CommandList*)renderer->commandList };
     ID3D12CommandQueue_ExecuteCommandLists(renderer->commandQueue, 1, commandLists);
 
-    // Без vsync окно с flip-моделью показывает на каждом обновлении экрана
-    // последний готовый кадр целиком, без разрывов, которые режут картинку на
-    // полосы. Кадров выходит до двух на обновление: из трёх буферов один на
-    // экране, а два других ждут композиции.
+    // Без vsync и с разрешёнными разрывами Present не ждёт ни обновления
+    // экрана, ни композиции: число кадров не ограничено, а окно во весь экран
+    // может показать разрыв. Без разрешения flip-модель показывает последний
+    // готовый кадр целиком, и кадров выходит до двух на обновление: из трёх
+    // буферов один на экране, а два других ждут композиции.
+    const bool tearing = !renderer->verticalSyncEnabled && renderer->tearingSupported;
     UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
-    HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval, 0);
+    HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval,
+        tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (FAILED(presentResult))
     {
         // ExecuteCommandLists already submitted work. Complete its fence even
@@ -4229,14 +4457,19 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
         renderer->gpuTimingPending[submittedSlot] = false;
         return false;
     }
-    renderer->meshUploadOffsets[renderer->frameIndex] = 0;
-    renderer->largeMeshUploadOffsets[renderer->frameIndex] = 0;
     // MoveToNextFrame уже дождался фенса этого слота, поэтому его чанки GPU
     // больше не читает: курсор можно вернуть в начало. Сами чанки остаются,
     // а дополнительные staging-блоки, нужные только всплеску, отдаются.
-    ReleaseStagingOverflow(renderer, renderer->frameIndex);
+    RewindUploadSlot(renderer, renderer->frameIndex);
     renderer->instanceChunkIndex[renderer->frameIndex] = 0;
     renderer->instanceChunkOffset[renderer->frameIndex] = 0;
+    // Без vsync и без разрывов очередь сама заменяет ждущий кадр новым, а
+    // ожидание ограничило бы число кадров.
+    if (renderer->frameLatencyWait != NULL && (renderer->verticalSyncEnabled || tearing))
+    {
+        (void)WaitForSingleObjectEx(renderer->frameLatencyWait, FRAME_LATENCY_WAIT_MILLISECONDS,
+            FALSE);
+    }
     if (!renderer->verticalSyncEnabled && !waitedForFence)
     {
         // Без vsync Present не является точкой ожидания. Отдаём остаток
@@ -4248,6 +4481,24 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     return true;
 }
 
+bool RendererIsDeviceLost_D3D12(const Renderer* renderer)
+{
+    return renderer->frameFailed ||
+           FAILED(ID3D12Device_GetDeviceRemovedReason(renderer->device));
+}
+
+uint64_t RendererUploadStagingBytes_D3D12(const Renderer* renderer)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t i = 0u; i < FRAME_COUNT; ++i)
+    {
+        bytes += renderer->meshUploadBuffers[i] != NULL ? MESH_UPLOAD_BYTES_PER_FRAME : 0u;
+        bytes += renderer->largeMeshUploadBuffers[i] != NULL
+            ? LARGE_MESH_UPLOAD_BYTES_PER_FRAME : 0u;
+    }
+    return bytes;
+}
+
 void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
 {
     if (renderer == NULL || outStats == NULL) return;
@@ -4255,6 +4506,8 @@ void RendererGetStats_D3D12(const Renderer* renderer, RendererStats* outStats)
     *outStats = renderer->lastStats;
     outStats->geometryPoolCapacityBytes = renderer->poolCapacityBytes;
     outStats->geometryPoolUsedBytes = renderer->poolUsedBytes;
+    outStats->swapchainRebuilds = renderer->swapChainRebuilds;
+    outStats->drawsIntoSwapchain = renderer->swapChain != NULL;
 }
 
 bool RendererCanCaptureFrame_D3D12(const Renderer *renderer)

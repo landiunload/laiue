@@ -5,15 +5,15 @@
 #endif
 #include <windows.h>
 
-// Класс приоритета до входа в режим; 0 — процесс не в режиме.
+// Класс приоритета до входа в режим эффективности; 0 — процесс не в нём.
 static volatile LONG g_priorityBeforeEfficiency;
 
-bool PlatformEfficiencyModeSet(bool enabled)
+bool PlatformPowerModeSet(PlatformPowerMode mode)
 {
     HANDLE process = GetCurrentProcess();
-    if (enabled)
+    const bool efficiency = mode == PLATFORM_POWER_EFFICIENCY;
+    if (efficiency)
     {
-        // Процесс, который уже работает с низким приоритетом, таким и остаётся.
         const DWORD current = GetPriorityClass(process);
         if (current != 0u && current != IDLE_PRIORITY_CLASS &&
             InterlockedCompareExchange(&g_priorityBeforeEfficiency, (LONG)current, 0) == 0)
@@ -25,11 +25,12 @@ bool PlatformEfficiencyModeSet(bool enabled)
         if (previous != 0u)
             SetPriorityClass(process, previous);
     }
-    // Без режима маска управления пуста: QoS снова выбирает система.
+    // Пустая маска управления отдаёт выбор QoS системе; маска без состояния
+    // просит высокий QoS.
     PROCESS_POWER_THROTTLING_STATE state = {
         .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        .ControlMask = enabled ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0u,
-        .StateMask = enabled ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0u,
+        .ControlMask = mode == PLATFORM_POWER_DEFAULT ? 0u : PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = efficiency ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0u,
     };
     return SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)) != FALSE;
 }

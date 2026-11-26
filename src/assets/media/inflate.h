@@ -19,12 +19,13 @@ typedef struct InflateSegment
     uint32_t size;
 } InflateSegment;
 
-// Таблицы прямого поиска по старшим битам кода. Девяти бит хватает
+// Таблицы прямого поиска по младшим битам буфера. Десяти бит хватает
 // почти всем кодам DEFLATE: более длинные разбираются каноническим
-// циклом. Таблица лежит в рабочей памяти вызывающего, а не на стеке:
+// циклом. Таблица шире не окупается: она дольше строится на каждый блок
+// и вытесняет из кеша окно копирования. Таблица лежит в рабочей памяти вызывающего, а не на стеке:
 // её размер не помещается в бюджет кадра без CRT.
 #define INFLATE_MAX_CODE_BITS 15u
-#define INFLATE_FAST_BITS 9u
+#define INFLATE_FAST_BITS 10u
 #define INFLATE_FAST_SIZE (1u << INFLATE_FAST_BITS)
 #define INFLATE_LITERAL_SYMBOLS 288u
 
@@ -34,9 +35,10 @@ typedef struct InflateHuffmanTable
     // возрастания кода. Этого достаточно для канонического разбора.
     int16_t count[INFLATE_MAX_CODE_BITS + 1u];
     int16_t symbol[INFLATE_LITERAL_SYMBOLS];
-    // fast[(length << 9) | symbol]; length == 0 означает, что код длиннее
-    // INFLATE_FAST_BITS и его следует читать по биту.
-    uint16_t fast[INFLATE_FAST_SIZE];
+    // Записи по младшим битам кода, их формат описан в inflate.c. Запись
+    // с нулевой длиной означает, что код длиннее INFLATE_FAST_BITS и его
+    // следует читать по биту.
+    uint32_t fast[INFLATE_FAST_SIZE];
 } InflateHuffmanTable;
 
 typedef struct InflateWork

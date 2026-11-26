@@ -16,6 +16,9 @@
 cbuffer UiConstants : register(b0)
 {
     float2 screenSize;
+    // Куда в клип-пространстве цели ведут оси окна: цель может лежать повёрнутой.
+    float2 clipAxisX;
+    float2 clipAxisY;
 };
 
 ByteAddressBuffer uiQuads : register(t0);
@@ -56,10 +59,11 @@ UiPixelInput VSMain(uint vertexId : SV_VertexID)
     float2 pixel = lerp(rect.xy, rect.zw, cornerWeight);
 
     UiPixelInput output;
-    output.position = float4(
+    float2 windowPosition = float2(
         pixel.x * 2.0 / screenSize.x - 1.0,
-        1.0 - pixel.y * 2.0 / screenSize.y,
-        0.0, 1.0);
+        1.0 - pixel.y * 2.0 / screenSize.y);
+    output.position = float4(
+        windowPosition.x * clipAxisX + windowPosition.y * clipAxisY, 0.0, 1.0);
     output.uv = lerp(uvRect.xy, uvRect.zw, cornerWeight);
     // Цвета интерфейса заданы в sRGB; цель кадра кодирует линейный свет,
     // поэтому декодируем здесь (приближение гаммой 2.2).

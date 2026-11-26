@@ -98,7 +98,7 @@ static void PreparePack(RenderPackTestPaths *paths)
     static const char manifest[] = "\xef\xbb\xbf"
                                    "LAIUE SHADER 1\n"
                                    "name = Complete\n"
-                                   "contract = 2\n";
+                                   "contract = 3\n";
     PackExpect(PlatformWriteEntireFile(paths->manifest, manifest, sizeof(manifest) - 1U),
                "shader manifest write");
 

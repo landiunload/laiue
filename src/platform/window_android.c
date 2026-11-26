@@ -31,6 +31,9 @@
 #define ANDROID_ARGUMENT_BYTES 4096u
 #define ANDROID_LOG_TAG_CAPACITY 64u
 #define ANDROID_RUN_WAIT_MILLISECONDS 50
+// Дальний срок ожидания: кадр раньше времени безвреден, а сутки в
+// миллисекундах ещё влезают в int.
+#define WINDOW_LONGEST_DEFER_SECONDS 86400.0
 
 struct Window
 {
@@ -49,6 +52,10 @@ struct Window
     bool mouseLookEnabled;
     bool fullscreen;
     bool closeRequested;
+    // Кадр попросил подождать: цикл спит до события или срока, -1 — без него.
+    bool frameDeferred;
+    bool redrawPending;
+    int frameDeferMilliseconds;
     float wheelSteps;
     uint32_t text[WINDOW_TEXT_CAPACITY];
     uint32_t textHead;
@@ -193,6 +200,7 @@ static void HandleCommand(struct android_app *app, int32_t command)
     {
     case APP_CMD_INIT_WINDOW:
         window->surfaceReady = true;
+        window->redrawPending = true;
         UpdateSize(window);
         if (window->surfaceLost)
         {
@@ -214,6 +222,9 @@ static void HandleCommand(struct android_app *app, int32_t command)
     case APP_CMD_CONTENT_RECT_CHANGED:
         UpdateSize(window);
         break;
+    case APP_CMD_WINDOW_REDRAW_NEEDED:
+        window->redrawPending = true;
+        break;
     case APP_CMD_GAINED_FOCUS:
         window->focused = true;
         break;
@@ -224,6 +235,7 @@ static void HandleCommand(struct android_app *app, int32_t command)
         break;
     case APP_CMD_RESUME:
         window->resumed = true;
+        window->redrawPending = true;
         break;
     case APP_CMD_PAUSE:
         window->resumed = false;
@@ -421,14 +433,41 @@ void WindowRunLoop(Window *window, FrameCallback onFrame, void *userData)
     while (!window->closeRequested && app->destroyRequested == 0)
     {
         // Кадры рисуются, пока активность на экране и у неё есть
-        // поверхность; иначе поток спит до следующего события.
+        // поверхность; иначе поток спит до следующего события. Срок
+        // WindowDeferNextFrame ждёт здесь же.
         const bool drawing = window->resumed && window->surfaceReady;
-        PumpEvents(app, drawing ? 0 : -1);
+        const int deferred = window->frameDeferred ? window->frameDeferMilliseconds : 0;
+        window->frameDeferred = false;
+        PumpEvents(app, drawing ? deferred : -1);
         if (window->closeRequested || app->destroyRequested != 0)
             break;
         if (window->resumed && window->surfaceReady && onFrame != NULL)
             onFrame(userData);
     }
+}
+
+void WindowDeferNextFrame(Window *window, double seconds)
+{
+    if (window == NULL)
+        return;
+    const double limited =
+        seconds > WINDOW_LONGEST_DEFER_SECONDS ? WINDOW_LONGEST_DEFER_SECONDS : seconds;
+    window->frameDeferred = true;
+    window->frameDeferMilliseconds = limited >= 0.0 ? (int)(limited * 1000.0) + 1 : -1;
+}
+
+void WindowWakeFrame(Window *window)
+{
+    if (window != NULL)
+        ALooper_wake(window->app->looper);
+}
+
+bool WindowConsumeRedraw(Window *window)
+{
+    if (window == NULL || !window->redrawPending)
+        return false;
+    window->redrawPending = false;
+    return true;
 }
 
 void WindowSetMouseLook(Window *window, bool enabled)
@@ -504,6 +543,23 @@ float WindowGetContentScale(const Window *window)
         density == ACONFIGURATION_DENSITY_NONE)
         return 1.0f;
     return (float)density / (float)ACONFIGURATION_DENSITY_MEDIUM;
+}
+
+// Политика энергопотребления процесса, WINDOW_POWER_*. Фоновую программу
+// Android ограничивает сам, а режима, который приложение включало бы себе,
+// нет: политика только хранится.
+static volatile uint32_t powerPolicy = WINDOW_POWER_AUTO;
+
+bool WindowSetPowerPolicy(uint32_t policy)
+{
+    if (policy <= WINDOW_POWER_PERFORMANCE)
+        PlatformAtomicStoreU32Release(&powerPolicy, policy);
+    return false;
+}
+
+uint32_t WindowGetPowerPolicy(void)
+{
+    return PlatformAtomicLoadU32Acquire(&powerPolicy);
 }
 
 /* ---- Точка входа -------------------------------------------------------------------- */

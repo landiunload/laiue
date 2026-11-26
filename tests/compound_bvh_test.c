@@ -641,6 +641,53 @@ static void TestOriginalIndexOrdering(void)
     }
 }
 
+// Индексы идут вдоль оси, и попадания приходят строго по убыванию: сортировка
+// сводится к развороту, но только если порядок верен на всей длине. Поэтому
+// единственное нарушение ставится и в начало обхода (коробки 6 и 7 поменяны
+// местами), и в самый его конец (коробки 0 и 1).
+static void TestOrderedHits(void)
+{
+    double bounds[6 * 8u];
+    for (uint32_t swapped = 0u; swapped < 3u; ++swapped)
+    {
+        for (uint32_t index = 0u; index < 8u; ++index)
+        {
+            uint32_t place = index;
+            if (swapped == 1u && index >= 6u)
+            {
+                place = 13u - index;
+            }
+            if (swapped == 2u && index < 2u)
+            {
+                place = 1u - index;
+            }
+            double minimum[3] = {(double)place * 2.0, 0.0, 0.0};
+            double maximum[3] = {minimum[0] + 1.0, 1.0, 1.0};
+            StoreBoundEntry(bounds + 6u * index, minimum, maximum);
+        }
+        uint32_t root = UINT32_MAX;
+        Expect(
+            RigidCompoundBvhBuild(bounds, 6u * sizeof(double), 8u, nodesA, 15u, workspaceA, &root),
+            "ordered fixture built");
+        double minimum[3] = {-1.0, -1.0, -1.0};
+        double maximum[3] = {100.0, 2.0, 2.0};
+        uint32_t count = 0u;
+        Expect(RigidCompoundBvhQuery(nodesA, root, minimum, maximum, queryOutput, 8u, &count),
+               "ordered query");
+        Expect(count == 8u, "ordered query returns every box");
+        for (uint32_t index = 0u; index < 8u; ++index)
+        {
+            Expect(queryOutput[index] == index, "ordered query returns indices in order");
+        }
+        minimum[0] = 3.0;
+        maximum[0] = 9.5;
+        Expect(RigidCompoundBvhQuery(nodesA, root, minimum, maximum, queryOutput, 8u, &count),
+               "partial ordered query");
+        Expect(count == 3u && queryOutput[0] == 2u && queryOutput[1] == 3u && queryOutput[2] == 4u,
+               "partial ordered query returns the run it covers");
+    }
+}
+
 // Дифференциальная регрессия для границ сравнения перекрытия: и коробки, и
 // запросы берут концы из одной решётки, поэтому грани совпадают точно.
 // Векторная ветка обязана вернуть тот же набор и порядок, что скалярный
@@ -712,6 +759,7 @@ LAIUE_TEST_ENTRY(CompoundBvhTestEntryPoint)
     TestRandomAgainstBruteForce();
     TestCapacityAndCanaries();
     TestOriginalIndexOrdering();
+    TestOrderedHits();
     TestBoundaryTieDifferential();
     LaiueTestRuntimeWrite("compound-bvh: ok\n");
     LAIUE_TEST_SUCCESS();

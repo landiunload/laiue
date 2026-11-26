@@ -18,6 +18,9 @@ enum
     LAIUE_GRAPHICS_BACKEND_AUTO = 0u,
     LAIUE_GRAPHICS_BACKEND_D3D12 = 1u,
     LAIUE_GRAPHICS_BACKEND_VULKAN = 2u,
+    /* Vulkan held to core 1.1 with no optional extension, as on the oldest
+     * supported phone. The device reports LAIUE_GRAPHICS_BACKEND_VULKAN. */
+    LAIUE_GRAPHICS_BACKEND_VULKAN_CORE = 3u,
 };
 
 typedef uint32_t (*LaiueGraphicsDeviceCreateFn)(

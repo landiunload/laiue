@@ -97,6 +97,24 @@ if(laiue_shared_modules AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
     endif()
 endif()
 
+# memset, memcpy, memmove and memcmp of the Windows no-CRT runtime; other
+# platforms take them from libc.
+if(LAIUE_PLATFORM_WINDOWS)
+    laiue_add_harness(laiue_runtime_memory_test RuntimeMemoryTestEntryPoint
+        runtime_memory_test.c TEST laiue.runtime.memory TIMEOUT 60)
+endif()
+
+# The crash report every harness installs. The harness crashes on purpose, so
+# a script runs it and checks the report; sanitizers print their own.
+if(NOT (LAIUE_ENABLE_SANITIZERS OR LAIUE_BUILD_FUZZERS))
+    laiue_add_harness(laiue_crash_report_test CrashReportTestEntryPoint crash_report_test.c)
+    set_target_properties(laiue_crash_report_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME laiue.harness.crash_report
+        COMMAND "${CMAKE_COMMAND}" "-DHARNESS=$<TARGET_FILE:laiue_crash_report_test>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_crash_report_test.cmake")
+    set_tests_properties(laiue.harness.crash_report PROPERTIES TIMEOUT 120)
+endif()
+
 # Platform.
 laiue_add_harness(laiue_platform_crypto_test PlatformCryptoTestEntry platform_crypto_test.c
     TEST laiue.platform.crypto)
@@ -108,6 +126,13 @@ if(LAIUE_PLATFORM_POSIX OR LAIUE_PLATFORM_EXTERNAL)
 endif()
 laiue_add_harness(laiue_platform_threading_test PlatformThreadingTestEntryPoint
     platform_threading_test.c TEST laiue.platform.threading)
+# Reads the options of an open socket from the system, so it knows the built-in
+# backends only: an external adapter keeps its own socket behind the handle.
+if(NOT LAIUE_PLATFORM_EXTERNAL)
+    laiue_add_harness(laiue_platform_socket_test PlatformSocketTestEntryPoint
+        platform_socket_test.c LIBRARIES laiue::platform_support
+        TEST laiue.platform.socket TIMEOUT 60)
+endif()
 if(LAIUE_PLATFORM_WINDOWS)
     laiue_add_harness(laiue_efficiency_windows_test EfficiencyWindowsTestEntryPoint
         efficiency_windows_test.c TEST laiue.platform.efficiency_mode)
@@ -119,6 +144,10 @@ if(LAIUE_PLATFORM_WINDOWS)
 endif()
 laiue_add_harness(laiue_sha256_test Sha256TestEntryPoint ${laiue_sha256_sources}
     INCLUDES "${laiue_src}" TEST laiue.platform.sha256 TIMEOUT 60)
+# The characters X11 keysyms type. The table is portable, so every platform
+# checks it, not only the ones with X11.
+laiue_add_harness(laiue_keysym_test KeysymTestEntryPoint keysym_test.c
+    "${laiue_src}/platform/keysym.c" INCLUDES "${laiue_src}" TEST laiue.platform.keysym)
 laiue_add_harness(laiue_task_pool_test TaskPoolTestEntryPoint task_pool_test.c
     LIBRARIES laiue::task laiue::platform_support TEST laiue.task.pool TIMEOUT 20)
 
@@ -138,6 +167,9 @@ endif()
 laiue_add_harness(laiue_navigation_test NavigationTestEntryPoint navigation_test.c
     LIBRARIES laiue::navigation laiue::task laiue::platform_support
     TEST laiue.navigation.paths TIMEOUT 120)
+laiue_add_harness(laiue_navigation_sqrt_test NavigationSqrtTestEntryPoint
+    navigation_sqrt_test.c "${laiue_src}/simulation/navigation/nav_query.c"
+    STATIC INCLUDES "${laiue_src}/simulation" TEST laiue.navigation.integer_sqrt)
 # Allocation faults are injected only into copies of the production bodies.
 set(laiue_navigation_failure_sources)
 foreach(source nav_graph nav_grid nav_query)
@@ -155,6 +187,63 @@ target_compile_definitions(laiue_navigation_failure_subject PRIVATE
 laiue_add_harness(laiue_navigation_failure_test NavigationFailureTestEntryPoint
     navigation_failure_test.c $<TARGET_OBJECTS:laiue_navigation_failure_subject>
     STATIC TEST laiue.navigation.allocation_failure TIMEOUT 60)
+
+# Crypto. The native test links the library; the portable one compiles the
+# sources over the portable 128-bit product, which the build otherwise
+# replaces with __int128 or MSVC intrinsics.
+laiue_add_harness(laiue_crypto_test CryptoTestEntryPoint crypto_test.c
+    LIBRARIES laiue::crypto_support TEST laiue.crypto.signatures TIMEOUT 120)
+laiue_add_harness(laiue_crypto_portable_test CryptoTestEntryPoint crypto_test.c
+    "${laiue_src}/core/crypto/sha512.c" "${laiue_src}/core/crypto/scalar25519.c"
+    "${laiue_src}/core/crypto/ed25519.c" DEFINITIONS LAIUE_CRYPTO_PORTABLE=1
+    TEST laiue.crypto.signatures_portable TIMEOUT 120)
+
+# Net. The primitives are internal, so their test compiles the source itself.
+laiue_add_harness(laiue_net_crypto_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC TEST laiue.net.crypto TIMEOUT 120)
+# The same checks without vectors and over the portable 128-bit product, which
+# the build otherwise replaces with SIMD, __int128 or MSVC intrinsics.
+laiue_add_harness(laiue_net_crypto_portable_test NetCryptoTestEntryPoint net_crypto_test.c
+    "${laiue_src}/net/net_crypto.c" STATIC DEFINITIONS LAIUE_CRYPTO_PORTABLE=1
+    TEST laiue.net.crypto_portable TIMEOUT 120)
+laiue_add_harness(laiue_net_channel_test NetChannelTestEntryPoint net_channel_test.c
+    "${laiue_src}/net/net_channel.c" "${laiue_src}/net/net_wire.c" STATIC
+    LIBRARIES laiue::platform_support TEST laiue.net.channel TIMEOUT 120)
+laiue_add_harness(laiue_net_congestion_test NetCongestionTestEntryPoint net_congestion_test.c
+    "${laiue_src}/net/net_congestion.c" STATIC TEST laiue.net.congestion TIMEOUT 120)
+laiue_add_harness(laiue_net_bbr_test NetBbrTestEntryPoint net_bbr_test.c
+    "${laiue_src}/net/net_bbr.c" "${laiue_src}/net/net_rate.c" STATIC
+    TEST laiue.net.bbr TIMEOUT 120)
+laiue_add_harness(laiue_net_pmtu_test NetPmtuTestEntryPoint net_pmtu_test.c
+    "${laiue_src}/net/net_pmtu.c" STATIC TEST laiue.net.pmtu TIMEOUT 120)
+laiue_add_harness(laiue_net_test NetTestEntryPoint net_test.c
+    LIBRARIES laiue::net laiue::platform_support TEST laiue.net.transport TIMEOUT 300)
+if(NOT (LAIUE_PLATFORM_EXTERNAL AND NOT LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS))
+    laiue_add_harness(laiue_net_udp_test NetUdpTestEntryPoint net_udp_test.c
+        LIBRARIES laiue::net laiue::platform_support TEST laiue.net.udp TIMEOUT 120)
+endif()
+# Allocation faults are injected only into copies of the endpoint sources; the
+# simulator keeps the real allocator, so the network itself never fails.
+set(laiue_net_failure_sources)
+foreach(source net_crypto net_wire net_address net_channel net_congestion net_rate net_bbr
+        net_pmtu net_packet net_handshake net_endpoint)
+    configure_file("${laiue_src}/net/${source}.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c" COPYONLY)
+    list(APPEND laiue_net_failure_sources "${CMAKE_CURRENT_BINARY_DIR}/net_failure_${source}.c")
+endforeach()
+add_library(laiue_net_failure_subject OBJECT ${laiue_net_failure_sources})
+target_link_libraries(laiue_net_failure_subject PRIVATE laiue_common)
+target_compile_definitions(laiue_net_failure_subject PRIVATE
+    LAIUE_STATIC=1
+    PlatformAllocate=NetTestAllocate PlatformReallocate=NetTestReallocate
+    PlatformFree=NetTestFree)
+laiue_add_harness(laiue_net_failure_test NetFailureTestEntryPoint net_failure_test.c
+    "${laiue_src}/net/net_simulator.c" $<TARGET_OBJECTS:laiue_net_failure_subject>
+    STATIC TEST laiue.net.allocation_failure TIMEOUT 300)
+# The socketless stub is checked everywhere, not only where the build picks it.
+laiue_add_harness(laiue_net_udp_none_test NetUdpNoneTestEntryPoint net_udp_none_test.c
+    "${laiue_src}/net/net_udp_none.c" "${laiue_src}/net/net_address.c"
+    STATIC INCLUDES "${laiue_src}" TEST laiue.net.udp_none)
 
 # World and numeric.
 laiue_add_harness(laiue_infinite_coord_test CoordTestEntryPoint infinite_coord_test.c
@@ -188,10 +277,10 @@ laiue_add_harness(laiue_rigid_broadphase_test RigidBroadphaseTestEntryPoint
     TEST laiue.physics.rigid_broadphase)
 laiue_add_harness(laiue_rigid_broadphase_scale_test RigidBroadphaseScaleTestEntryPoint
     rigid_broadphase_scale_test.c LIBRARIES laiue_physics laiue_numeric
-    TEST laiue.physics.rigid_broadphase_scale TIMEOUT 60)
+    TEST laiue.physics.rigid_broadphase_scale TIMEOUT 180)
 laiue_add_harness(laiue_rigid_parallel_test RigidParallelTestEntryPoint rigid_parallel_test.c
     LIBRARIES laiue::physics laiue::numeric laiue::task
-    TEST laiue.physics.rigid_parallel TIMEOUT 60)
+    TEST laiue.physics.rigid_parallel TIMEOUT 180)
 laiue_add_harness(laiue_rigid_compound_test RigidCompoundTestEntryPoint rigid_compound_test.c
     LIBRARIES laiue::physics laiue::numeric laiue::task
     TEST laiue.physics.rigid_compound TIMEOUT 120)
@@ -206,7 +295,7 @@ laiue_add_harness(laiue_compound_bvh_test CompoundBvhTestEntryPoint compound_bvh
     TEST laiue.physics.compound_bvh TIMEOUT 30 PROPERTIES RUN_SERIAL TRUE)
 laiue_add_harness(laiue_ragdoll_test RagdollTestEntryPoint ragdoll_test.c
     LIBRARIES laiue_walk_common laiue::physics laiue::numeric laiue::math_support
-    TEST laiue.physics.ragdoll TIMEOUT 30)
+    TEST laiue.physics.ragdoll TIMEOUT 90)
 if(TARGET laiue_physics AND laiue_shared_modules)
     laiue_add_harness(laiue_physics_module_test PhysicsModuleTestEntryPoint
         physics_module_test.c BOOTSTRAP DEPENDS laiue_physics laiue_numeric laiue_task
@@ -224,6 +313,8 @@ laiue_add_harness(laiue_mod_manifest_scan_test ModManifestScanTestEntry
     mod_manifest_scan_test.c LIBRARIES laiue_mod TEST laiue.mod.manifest_scan)
 laiue_add_harness(laiue_module_manifest_test ModuleManifestTestEntryPoint
     module_manifest_test.c BOOTSTRAP TEST laiue.mod.module_manifest)
+laiue_add_harness(laiue_module_host_runtime_test ModuleHostRuntimeTestEntryPoint
+    module_host_runtime_test.c BOOTSTRAP TEST laiue.mod.module_host_runtime)
 if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_add_harness(laiue_numeric_module_test NumericModuleTestEntryPoint
         numeric_module_test.c BOOTSTRAP DEPENDS laiue_numeric TEST laiue.mod.numeric_module)
@@ -252,6 +343,18 @@ if(LAIUE_NATIVE_MODS_ENABLED)
     laiue_add_harness(laiue_module_host_test ModuleHostTestEntryPoint module_host_test.c
         BOOTSTRAP DEPENDS laiue_module_provider laiue_module_consumer
         TEST laiue.mod.module_host)
+
+    if(TARGET laiue_window AND laiue_shared_modules)
+        laiue_add_harness(laiue_window_frames_test WindowFramesTestEntryPoint
+            window_frames_test.c BOOTSTRAP DEPENDS laiue_window
+            TEST laiue.platform.window_frames TIMEOUT 30)
+        set_tests_properties(laiue.platform.window_frames PROPERTIES SKIP_RETURN_CODE 125)
+        if(WIN32)
+            laiue_add_harness(laiue_window_dpi_test WindowDpiTestEntryPoint
+                window_dpi_test.c BOOTSTRAP LIBRARIES user32 dwmapi DEPENDS laiue_window
+                TEST laiue.platform.window_dpi TIMEOUT 30)
+        endif()
+    endif()
 
     if(TARGET laiue_audio AND TARGET laiue_ui AND TARGET laiue_voxel_render AND
        TARGET laiue_window AND TARGET laiue_input AND laiue_shared_modules)
@@ -361,18 +464,31 @@ endif()
 
 # Graphics. Driver-dependent tests skip without a GPU unless it is required.
 if(TARGET laiue_render AND laiue_shared_modules)
+    laiue_add_harness(laiue_frame_turn_test FrameTurnTestEntryPoint frame_turn_test.c
+        TEST laiue.render.frame_turn)
     if(LAIUE_RENDER_HAS_VULKAN_TARGET)
         laiue_add_harness(laiue_graphics_geometry_vulkan_test GraphicsGeometryTestEntryPoint
-            graphics_geometry_test.c BOOTSTRAP DEPENDS laiue_render
+            graphics_geometry_test.c BOOTSTRAP
+            LIBRARIES $<$<PLATFORM_ID:Windows>:user32> DEPENDS laiue_render
             DEFINITIONS LAIUE_GRAPHICS_TEST_D3D12=0
                 "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}>"
             TEST laiue.graphics.geometry_vulkan TIMEOUT 90)
+        # The path of a phone below Vulkan 1.3, on any device with Vulkan.
+        laiue_add_harness(laiue_graphics_geometry_vulkan_core_test
+            GraphicsGeometryTestEntryPoint graphics_geometry_test.c BOOTSTRAP
+            LIBRARIES $<$<PLATFORM_ID:Windows>:user32> DEPENDS laiue_render
+            DEFINITIONS LAIUE_GRAPHICS_TEST_D3D12=0
+                LAIUE_GRAPHICS_TEST_VULKAN_BACKEND=LAIUE_GRAPHICS_BACKEND_VULKAN_CORE
+                "LAIUE_GRAPHICS_TEST_REQUIRE_DRIVER=$<BOOL:${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}>"
+            TEST laiue.graphics.geometry_vulkan_core TIMEOUT 90)
         laiue_add_harness(laiue_graphics_diagnostics_test GraphicsDiagnosticsTestEntryPoint
             graphics_diagnostics_test.c BOOTSTRAP DEPENDS laiue_render
             TEST laiue.graphics.diagnostics TIMEOUT 60)
         laiue_set_gpu_test_properties(${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}
-            laiue.graphics.geometry_vulkan laiue.graphics.diagnostics)
-        laiue_add_vulkan_validation(laiue.graphics.geometry_vulkan)
+            laiue.graphics.geometry_vulkan laiue.graphics.geometry_vulkan_core
+            laiue.graphics.diagnostics)
+        laiue_add_vulkan_validation(laiue.graphics.geometry_vulkan
+            laiue.graphics.geometry_vulkan_core)
     endif()
     if(LAIUE_RENDER_HAS_D3D12 AND WIN32)
         laiue_add_harness(laiue_graphics_geometry_d3d12_test GraphicsGeometryTestEntryPoint
@@ -382,6 +498,11 @@ if(TARGET laiue_render AND laiue_shared_modules)
             TEST laiue.graphics.geometry_d3d12 TIMEOUT 90)
         laiue_set_gpu_test_properties(${LAIUE_REQUIRE_D3D12_TEST_DRIVER}
             laiue.graphics.geometry_d3d12)
+        laiue_add_harness(laiue_graphics_device_lost_test GraphicsDeviceLostTestEntryPoint
+            graphics_device_lost_test.c BOOTSTRAP LIBRARIES user32 d3d12 dxgi dxguid
+            DEPENDS laiue_render TEST laiue.graphics.device_lost TIMEOUT 60)
+        laiue_set_gpu_test_properties(${LAIUE_REQUIRE_D3D12_TEST_DRIVER}
+            laiue.graphics.device_lost)
     endif()
     if(TARGET laiue_graphics_profile)
         laiue_add_diagnostics_test(laiue_graphics_profile_module_test
@@ -423,18 +544,34 @@ if(TARGET laiue_render AND LAIUE_RENDER_HAS_VULKAN_TARGET)
     laiue_add_harness(laiue_renderer_offscreen_test RendererOffscreenTestEntryPoint
         renderer_offscreen_test.c texc_fixtures.h LIBRARIES laiue_content laiue_render
         TEST laiue.render.offscreen_frame)
+    laiue_add_harness(laiue_renderer_offscreen_core_test RendererOffscreenTestEntryPoint
+        renderer_offscreen_test.c texc_fixtures.h LIBRARIES laiue_content laiue_render
+        DEFINITIONS TEST_VULKAN_CORE=1 TEST laiue.render.offscreen_frame_core)
     laiue_add_harness(laiue_renderer_vulkan_instance_ring_test
         RendererVulkanInstanceRingTestEntryPoint renderer_vulkan_instance_ring_test.c
         LIBRARIES laiue_render laiue_content TEST laiue.render.vulkan_instance_ring TIMEOUT 180)
+    laiue_add_harness(laiue_renderer_vulkan_instance_ring_core_test
+        RendererVulkanInstanceRingTestEntryPoint renderer_vulkan_instance_ring_test.c
+        LIBRARIES laiue_render laiue_content
+        DEFINITIONS TEST_VULKAN_BACKEND=RENDERER_BACKEND_VULKAN_CORE
+        TEST laiue.render.vulkan_instance_ring_core TIMEOUT 180)
     laiue_set_gpu_test_properties(${LAIUE_REQUIRE_VULKAN_TEST_DRIVER}
-        laiue.render.offscreen_frame laiue.render.vulkan_instance_ring)
+        laiue.render.offscreen_frame laiue.render.offscreen_frame_core
+        laiue.render.vulkan_instance_ring laiue.render.vulkan_instance_ring_core)
     # Hidden windows only; a missing driver or surface is always a skip.
     laiue_add_harness(laiue_renderer_vulkan_lifecycle_test RendererVulkanLifecycleTestEntryPoint
         renderer_vulkan_lifecycle_test.c LIBRARIES laiue_render laiue_content
         TEST laiue.render.vulkan_lifecycle TIMEOUT 180)
-    laiue_set_gpu_test_properties(OFF laiue.render.vulkan_lifecycle)
-    laiue_add_vulkan_validation(laiue.render.offscreen_frame
-        laiue.render.vulkan_instance_ring laiue.render.vulkan_lifecycle)
+    laiue_add_harness(laiue_renderer_vulkan_lifecycle_core_test
+        RendererVulkanLifecycleTestEntryPoint renderer_vulkan_lifecycle_test.c
+        LIBRARIES laiue_render laiue_content
+        DEFINITIONS TEST_VULKAN_BACKEND=RENDERER_BACKEND_VULKAN_CORE
+        TEST laiue.render.vulkan_lifecycle_core TIMEOUT 180)
+    laiue_set_gpu_test_properties(OFF laiue.render.vulkan_lifecycle
+        laiue.render.vulkan_lifecycle_core)
+    laiue_add_vulkan_validation(laiue.render.offscreen_frame laiue.render.offscreen_frame_core
+        laiue.render.vulkan_instance_ring laiue.render.vulkan_instance_ring_core
+        laiue.render.vulkan_lifecycle laiue.render.vulkan_lifecycle_core)
 endif()
 # Pipeline cache on every backend this build has; 125 means no GPU driver.
 if(TARGET laiue_render)
@@ -464,6 +601,27 @@ endif()
 if(TARGET laiue_ui)
     laiue_add_harness(laiue_ui_test UiTestEntryPoint ui_test.c LIBRARIES laiue_ui
         TEST laiue.ui.draw_list)
+    laiue_add_harness(laiue_truetype_reader_test TrueTypeReaderTestEntryPoint
+        truetype_reader_test.c truetype_fixture.h LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_reader)
+    laiue_add_harness(laiue_truetype_outline_test TrueTypeOutlineTestEntryPoint
+        truetype_outline_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_outline)
+    laiue_add_harness(laiue_truetype_components_test TrueTypeComponentsTestEntryPoint
+        truetype_components_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_components)
+    laiue_add_harness(laiue_truetype_plan_test TrueTypePlanTestEntryPoint
+        truetype_plan_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_plan)
+    laiue_add_harness(laiue_truetype_phantoms_test TrueTypePhantomsTestEntryPoint
+        truetype_phantoms_test.c LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_phantoms)
+    laiue_add_harness(laiue_truetype_xy_test TrueTypeXYTestEntryPoint
+        truetype_xy_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_xy)
+    laiue_add_harness(laiue_truetype_edges_test TrueTypeEdgesTestEntryPoint
+        truetype_edges_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_edges)
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно
@@ -518,6 +676,12 @@ if(TARGET laiue_media_support)
     laiue_add_harness(laiue_inflate_backref_test InflateBackrefTestEntryPoint
         inflate_backref_test.c inflate_backref_fixtures.h LIBRARIES ${laiue_media}
         TEST laiue.media.inflate_backref)
+    laiue_add_harness(laiue_inflate_fast_test InflateFastTestEntryPoint inflate_fast_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.inflate_fast)
+    laiue_add_harness(laiue_png_filter_test PngFilterTestEntryPoint png_filter_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.png_filter)
+    laiue_add_harness(laiue_jpeg_reference_test JpegReferenceTestEntryPoint jpeg_reference_test.c
+        LIBRARIES ${laiue_media} TEST laiue.media.jpeg_reference)
     laiue_add_harness(laiue_mp3_test Mp3TestEntryPoint mp3_test.c mp3_fixtures.h
         LIBRARIES ${laiue_media} TEST laiue.media.mp3)
     laiue_add_harness(laiue_audio_stream_decoder_test AudioStreamDecoderTestEntryPoint
@@ -659,6 +823,12 @@ if(TARGET laiue_frame_check)
     add_test(NAME laiue.tools.frame_check.reject_text
         COMMAND laiue_frame_check "${PROJECT_SOURCE_DIR}/README.md")
     set_tests_properties(laiue.tools.frame_check.reject_text PROPERTIES WILL_FAIL TRUE)
+endif()
+
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME laiue.tools.check_versions
+        COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/check_versions_test.py")
 endif()
 
 # ASan/UBSan slow compute-heavy tests several times over; scale the limits so

@@ -32,6 +32,9 @@
 #include <string.h>
 
 #define ANDROID_WALK_LOG_TAG "laiue.walk"
+// The scenario resizes nothing. A surface may settle at the start, but a chain
+// rebuilt with every frame means presentation stalls on each of them.
+#define ANDROID_WALK_SCENARIO_MOST_SWAPCHAIN_REBUILDS 4u
 #define ANDROID_WALK_HALF_EXTENT INT64_C(400)
 /* Touch controls are deliberately owned by the walk example rather than by
  * the renderer or the Android window provider. The lower-left circle is a
@@ -112,6 +115,11 @@ struct AndroidWalkState
     bool scenarioLifecyclePending;
     uint32_t scenarioTick;
     uint32_t scenarioFrames;
+    uint32_t scenarioDirectFrames;
+    uint32_t scenarioTurnedFrames;
+    uint32_t scenarioDynamicRenderingFrames;
+    bool scenarioVulkanCore;
+    uint32_t scenarioSwapchainRebuilds;
     uint32_t scenarioBreaks;
     uint32_t scenarioPlaces;
     uint32_t scenarioGeneration;
@@ -148,11 +156,13 @@ static void AndroidLog(AndroidWalkState *state, int priority, const char *messag
  * references bounded and never detach an already attached
  * thread. A missing/false extra always
  * leaves normal gameplay unchanged. */
-static bool AndroidScenarioIntentEnabled(struct android_app *app, uint32_t *outRunId)
+static bool AndroidScenarioIntentEnabled(struct android_app *app, uint32_t *outRunId,
+                                         bool *outVulkanCore)
 {
-    if (outRunId == NULL)
+    if (outRunId == NULL || outVulkanCore == NULL)
         return false;
     *outRunId = 0u;
+    *outVulkanCore = false;
     if (app == NULL || app->activity == NULL || app->activity->vm == NULL ||
         app->activity->clazz == NULL)
         return false;
@@ -216,6 +226,13 @@ static bool AndroidScenarioIntentEnabled(struct android_app *app, uint32_t *outR
         }
         else
             *outRunId = (uint32_t)run;
+        jstring coreName = (*env)->NewStringUTF(env, "laiueVulkanCore");
+        if ((*env)->ExceptionCheck(env) || coreName == NULL)
+            goto cleanup;
+        *outVulkanCore =
+            (*env)->CallBooleanMethod(env, intent, getExtra, coreName, JNI_FALSE) == JNI_TRUE;
+        if ((*env)->ExceptionCheck(env))
+            goto cleanup;
     }
 cleanup:
     if ((*env)->ExceptionCheck(env))
@@ -511,6 +528,8 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         hasCpu && state->game.ragdollReady && state->chunksReady && state->texturedTerrainReady &&
         state->terrainTextures[0] != 0u && state->terrainTextures[1] != 0u &&
         state->terrainTextures[2] != 0u && state->scenarioFrames != 0u &&
+        state->scenarioDirectFrames != 0u &&
+        state->scenarioSwapchainRebuilds <= ANDROID_WALK_SCENARIO_MOST_SWAPCHAIN_REBUILDS &&
         state->scenarioCheckpoints == (uint32_t)WalkScenarioComplete &&
         state->scenarioAcks == (uint32_t)WalkScenarioComplete && state->scenarioMoved &&
         state->scenarioAirborne && state->scenarioBreaks != 0u && state->scenarioPlaces != 0u &&
@@ -522,7 +541,9 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         "moved=%u "
         "airborne=%u breaks=%u places=%u rebases=%u frame_wall_count=%u frame_wall_p95_ms=%.6f "
         "frame_wall_p99_ms=%.6f gpu_available=%u gpu_count=%u gpu_p95_ms=%.6f gpu_p99_ms=%.6f "
-        "peak_cpu_shadow_bytes=%llu peak_geometry_bytes=%llu capture=external_adb "
+        "peak_cpu_shadow_bytes=%llu peak_geometry_bytes=%llu swapchain_rebuilds=%u "
+        "swapchain_direct_frames=%u swapchain_turned_frames=%u "
+        "dynamic_rendering_frames=%u capture=external_adb "
         "game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f first_person=%u material=%u "
         "root_block_x=%lld root_block_y=%lld root_block_z=%lld "
         "root_fraction_x=%.9f root_fraction_y=%.9f root_fraction_z=%.9f "
@@ -532,7 +553,9 @@ static void AndroidScenarioSummary(AndroidWalkState *state)
         state->scenarioAirborne ? 1u : 0u, state->scenarioBreaks, state->scenarioPlaces,
         state->scenarioRebases, cpu.count, cpu.p95, cpu.p99, hasGpu ? 1u : 0u, gpu.count, gpu.p95,
         gpu.p99, (unsigned long long)state->scenarioPeakCpuBytes,
-        (unsigned long long)state->scenarioPeakGeometryBytes, (unsigned long long)state->game.tick,
+        (unsigned long long)state->scenarioPeakGeometryBytes, state->scenarioSwapchainRebuilds,
+        state->scenarioDirectFrames, state->scenarioTurnedFrames,
+        state->scenarioDynamicRenderingFrames, (unsigned long long)state->game.tick,
         (unsigned long long)state->game.revision, state->game.camera.yaw, state->game.camera.pitch,
         state->game.firstPerson ? 1u : 0u, (uint32_t)state->game.selectedMaterial,
         (long long)spatial.centerBlock[0], (long long)spatial.centerBlock[1],
@@ -569,6 +592,13 @@ static void AndroidScenarioFrame(AndroidWalkState *state, double started, bool p
     }
     if (hasDiagnostics)
     {
+        state->scenarioSwapchainRebuilds = diagnostics.swapchainRebuilds;
+        if ((diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u)
+            ++state->scenarioDirectFrames;
+        if ((diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED) != 0u)
+            ++state->scenarioTurnedFrames;
+        if ((diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING) != 0u)
+            ++state->scenarioDynamicRenderingFrames;
         if (diagnostics.cpuShadowBytes > state->scenarioPeakCpuBytes)
             state->scenarioPeakCpuBytes = diagnostics.cpuShadowBytes;
         if (diagnostics.geometryPoolUsedBytes > state->scenarioPeakGeometryBytes)
@@ -601,14 +631,17 @@ static void AndroidScenarioFrame(AndroidWalkState *state, double started, bool p
         __android_log_print(
             ANDROID_LOG_INFO, ANDROID_WALK_LOG_TAG,
             "LAIUE_SCENARIO event=presented run=%u generation=%u frame=%u width=%d height=%d "
-            "game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f first_person=%u material=%u "
+            "direct=%u turned=%u game_tick=%llu game_revision=%llu yaw=%.5f pitch=%.5f "
+            "first_person=%u material=%u "
             "root_block_x=%lld root_block_y=%lld root_block_z=%lld "
             "root_fraction_x=%.9f root_fraction_y=%.9f root_fraction_z=%.9f "
             "provider_frame_x=%lld provider_frame_y=%lld provider_frame_z=%lld",
             state->scenarioRunId, state->scenarioGeneration, state->scenarioFrames, state->width,
-            state->height, (unsigned long long)state->game.tick,
-            (unsigned long long)state->game.revision, state->game.camera.yaw,
-            state->game.camera.pitch, state->game.firstPerson ? 1u : 0u,
+            state->height,
+            (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN) != 0u ? 1u : 0u,
+            (diagnostics.flags & LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED) != 0u ? 1u : 0u,
+            (unsigned long long)state->game.tick, (unsigned long long)state->game.revision,
+            state->game.camera.yaw, state->game.camera.pitch, state->game.firstPerson ? 1u : 0u,
             (uint32_t)state->game.selectedMaterial, (long long)spatial.centerBlock[0],
             (long long)spatial.centerBlock[1], (long long)spatial.centerBlock[2],
             spatial.rootFraction[0], spatial.rootFraction[1], spatial.rootFraction[2],
@@ -809,6 +842,8 @@ static void AndroidCreateDevice(AndroidWalkState *state)
     AndroidDestroyDevice(state);
     const int32_t width = ANativeWindow_getWidth(state->app->window);
     const int32_t height = ANativeWindow_getHeight(state->app->window);
+    const uint32_t backend = state->scenarioVulkanCore ? LAIUE_GRAPHICS_BACKEND_VULKAN_CORE
+                                                       : LAIUE_GRAPHICS_BACKEND_VULKAN;
     uint32_t created = 0u;
     if (width > 0 && height > 0 &&
         AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
@@ -819,15 +854,14 @@ static void AndroidCreateDevice(AndroidWalkState *state)
                             sizeof(state->graphics->context)) &&
         state->graphics->createDeviceWithContext != NULL && state->graphics->context != NULL)
         created = state->graphics->createDeviceWithContext(
-            state->graphics->context, state->app->window, width, height,
-            LAIUE_GRAPHICS_BACKEND_VULKAN, &state->device);
+            state->graphics->context, state->app->window, width, height, backend, &state->device);
     else if (width > 0 && height > 0 &&
              AndroidFieldPresent(state->graphicsServiceSize, state->graphics->structSize,
                                  offsetof(LaiueGraphicsDeviceServiceV2, createDevice),
                                  sizeof(state->graphics->createDevice)) &&
              state->graphics->createDevice != NULL)
-        created = state->graphics->createDevice(state->app->window, width, height,
-                                                LAIUE_GRAPHICS_BACKEND_VULKAN, &state->device);
+        created = state->graphics->createDevice(state->app->window, width, height, backend,
+                                                &state->device);
     if (created == 0u || state->device == NULL)
     {
         AndroidDestroyDevice(state);
@@ -1676,7 +1710,8 @@ void android_main(struct android_app *app)
     AndroidWalkState state;
     memset(&state, 0, sizeof(state));
     state.app = app;
-    state.scenarioEnabled = AndroidScenarioIntentEnabled(app, &state.scenarioRunId);
+    state.scenarioEnabled =
+        AndroidScenarioIntentEnabled(app, &state.scenarioRunId, &state.scenarioVulkanCore);
     if (state.scenarioEnabled)
     {
         WalkScenarioInitialize(&state.scenario);

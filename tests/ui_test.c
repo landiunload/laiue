@@ -95,7 +95,7 @@ static bool FloatEqual(float left, float right)
 static void TestFontLookup(const UiContext* ui)
 {
     const UiFont* font = &ui->font;
-    CHECK(font->glyphCount == 162u, "glyph count is 162");
+    CHECK(font->glyphCount == 164u, "glyph count is 164");
     CHECK(font->glyphs != NULL, "glyph array allocated");
 
     // Строгий возрастающий порядок без дублей.
@@ -123,10 +123,9 @@ static void TestFontLookup(const UiContext* ui)
     CHECK(allFound, "every glyph found by codepoint");
 
     // Документированные диапазоны: выборка известных точек.
-    const uint16_t present[] = {
-        0x0020u, 0x0041u, 0x007Au, 0x00B0u, 0x0401u, 0x0410u, 0x044Fu, 0x0451u
-    };
-    for (uint32_t index = 0u; index < 8u; ++index)
+    const uint16_t present[] = {0x0020u, 0x0041u, 0x007Au, 0x00B0u, 0x00D7u,
+                                0x0401u, 0x0410u, 0x044Fu, 0x0451u, 0x2014u};
+    for (uint32_t index = 0u; index < sizeof(present) / sizeof(present[0]); ++index)
     {
         CHECK(UiFontFindGlyph(font, present[index]) != NULL,
             "documented codepoint present");
@@ -206,7 +205,7 @@ static void TestFontLookupLayout(const UiContext *ui)
 
 static void TestMeasure(const UiContext* ui)
 {
-    const wchar_t* text = L"ABC abc 0123 °Ёё";
+    const wchar_t *text = L"ABC abc 0123 °Ёё\x00D7\x2014";
     float expected = 0.0f;
     for (const wchar_t* character = text; *character != L'\0'; ++character)
     {
@@ -353,9 +352,94 @@ static void TestQuads(UiContext* ui)
             float width = UiFontMeasure(&ui->font, L"A");
             float penX = 300.0f - width * 0.5f;
             CHECK(FloatEqual(ui->quads[0].rect[0],
-                penX + (float)glyph->offsetX), "centered pen position");
+                             (float)(int32_t)(penX + 0.5f) + (float)glyph->offsetX),
+                  "centered pen snaps to nearest pixel");
         }
     }
+}
+
+static void TestTextPixelPlacement(UiContext *ui)
+{
+    // Дробные метрики заданы самим тестом: результат не зависит от GDI,
+    // системного шрифта и целочисленности его авансов или ascent.
+    UiFont savedFont = ui->font;
+    UiGlyph glyph = {0};
+    glyph.codepoint = (uint16_t)L'A';
+    glyph.offsetX = -2;
+    glyph.offsetY = 4;
+    glyph.width = 8u;
+    glyph.height = 8u;
+    glyph.advance = 5.25f;
+    glyph.u0 = 0.125f;
+    glyph.v0 = 0.25f;
+    glyph.u1 = 0.625f;
+    glyph.v1 = 0.75f;
+    ui->font.glyphs = &glyph;
+    ui->font.glyphCount = 1u;
+    ui->font.ascent = 4.25f;
+    const struct
+    {
+        float x, lineTopY, expectedX, expectedY;
+    } cases[] = {
+        {10.24f, 20.24f, 8.0f, 20.0f}, {10.5f, 20.25f, 9.0f, 21.0f},
+        {-0.5f, -0.75f, -2.0f, 0.0f},  {-0.51f, -0.76f, -3.0f, -1.0f},
+        {-1.5f, -1.75f, -3.0f, -1.0f}, {-1.51f, -1.76f, -4.0f, -2.0f},
+    };
+    for (uint32_t index = 0u; index < sizeof(cases) / sizeof(cases[0]); ++index)
+    {
+        ui->quadCount = 0u;
+        UiClearClip(ui);
+        UiText(ui, cases[index].x, cases[index].lineTopY, 0xFFFFFFFFu, L"A");
+        CHECK(ui->quadCount == 1u, "fractional text emits one quad");
+        if (ui->quadCount == 1u)
+        {
+            CHECK(ui->quads[0].rect[0] == cases[index].expectedX,
+                  "text x rounds to nearest pixel with ties toward positive infinity");
+            CHECK(ui->quads[0].rect[1] == cases[index].expectedY,
+                  "text baseline rounds to nearest pixel with negative origins");
+            CHECK(ui->quads[0].rect[2] == cases[index].expectedX + 8.0f &&
+                      ui->quads[0].rect[3] == cases[index].expectedY + 8.0f,
+                  "pixel placement preserves glyph dimensions");
+        }
+    }
+
+    // Авансы накапливаются без округления, привязывается каждый готовый глиф.
+    ui->quadCount = 0u;
+    UiText(ui, 0.25f, -0.75f, 0xFFFFFFFFu, L"AAA");
+    CHECK(ui->quadCount == 3u, "fractional advances emit three glyphs");
+    if (ui->quadCount == 3u)
+    {
+        CHECK(ui->quads[0].rect[0] == -2.0f && ui->quads[1].rect[0] == 4.0f &&
+                  ui->quads[2].rect[0] == 9.0f,
+              "fractional advances do not accumulate rounding drift");
+    }
+
+    ui->quadCount = 0u;
+    UiTextCentered(ui, 0.0f, -0.75f, 0xFFFFFFFFu, L"AAA");
+    CHECK(ui->quadCount == 3u, "centered fractional text emits three glyphs");
+    if (ui->quadCount == 3u)
+    {
+        CHECK(ui->quads[0].rect[0] == -10.0f && ui->quads[1].rect[0] == -5.0f &&
+                  ui->quads[2].rect[0] == 1.0f,
+              "centered text snaps each glyph across negative coordinates");
+    }
+
+    // Клип сохраняет дробные границы и интерполированные UV после привязки.
+    ui->quadCount = 0u;
+    UiSetClip(ui, 9.25f, 21.5f, 7.25f, 6.75f);
+    UiText(ui, 10.5f, 20.25f, 0xFFFFFFFFu, L"A");
+    CHECK(ui->quadCount == 1u, "fractional clip keeps the intersecting glyph");
+    if (ui->quadCount == 1u)
+    {
+        CHECK(ui->quads[0].rect[0] == 9.25f && ui->quads[0].rect[1] == 21.5f &&
+                  ui->quads[0].rect[2] == 16.5f && ui->quads[0].rect[3] == 28.25f,
+              "clipping preserves fractional boundaries");
+        CHECK(ui->quads[0].uv[0] == 0.140625f && ui->quads[0].uv[1] == 0.28125f &&
+                  ui->quads[0].uv[2] == 0.59375f && ui->quads[0].uv[3] == 0.703125f,
+              "clipped glyph UV follows the snapped rectangle");
+    }
+    UiClearClip(ui);
+    ui->font = savedFont;
 }
 
 LAIUE_TEST_ENTRY(UiTestEntryPoint)
@@ -378,6 +462,7 @@ LAIUE_TEST_ENTRY(UiTestEntryPoint)
     TestMeasure(ui);
     TestBuilderAndFormat();
     TestQuads(ui);
+    TestTextPixelPlacement(ui);
 
     WriteText("checks=");
     WriteUnsigned(gChecks);

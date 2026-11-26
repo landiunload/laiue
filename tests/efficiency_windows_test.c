@@ -30,17 +30,29 @@ LAIUE_TEST_ENTRY(EfficiencyWindowsTestEntryPoint)
     /* Программа сама выбрала класс приоритета: режим возвращает именно его. */
     Expect(SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS) != FALSE, "custom priority");
 
+    /* Первый круг уходит из эффективности в производительность, второй —
+     * сразу к выбору системы. */
     for (int round = 0; round < 2; ++round)
     {
-        Expect(PlatformEfficiencyModeSet(true), "EcoQoS is accepted");
-        Expect(PlatformEfficiencyModeSet(true), "entering twice");
+        Expect(PlatformPowerModeSet(PLATFORM_POWER_EFFICIENCY), "EcoQoS is accepted");
+        Expect(PlatformPowerModeSet(PLATFORM_POWER_EFFICIENCY), "entering twice");
         Expect(GetPriorityClass(process) == IDLE_PRIORITY_CLASS, "low base priority in the mode");
         if (QueryProcessThrottling(&state))
             Expect((state.ControlMask & speed) != 0u && (state.StateMask & speed) != 0u,
                    "EcoQoS in the mode");
 
-        Expect(PlatformEfficiencyModeSet(false), "leaving the mode");
-        Expect(PlatformEfficiencyModeSet(false), "leaving twice");
+        if (round == 0)
+        {
+            Expect(PlatformPowerModeSet(PLATFORM_POWER_PERFORMANCE), "HighQoS is accepted");
+            Expect(GetPriorityClass(process) == ABOVE_NORMAL_PRIORITY_CLASS,
+                   "performance returns the previous priority class");
+            if (QueryProcessThrottling(&state))
+                Expect((state.ControlMask & speed) != 0u && (state.StateMask & speed) == 0u,
+                       "HighQoS in the performance mode");
+        }
+
+        Expect(PlatformPowerModeSet(PLATFORM_POWER_DEFAULT), "leaving the mode");
+        Expect(PlatformPowerModeSet(PLATFORM_POWER_DEFAULT), "leaving twice");
         Expect(GetPriorityClass(process) == ABOVE_NORMAL_PRIORITY_CLASS,
                "the previous priority class returns");
         if (QueryProcessThrottling(&state))
@@ -49,7 +61,9 @@ LAIUE_TEST_ENTRY(EfficiencyWindowsTestEntryPoint)
 
     /* Процесс с низким приоритетом остаётся низким и после выхода. */
     Expect(SetPriorityClass(process, IDLE_PRIORITY_CLASS) != FALSE, "idle priority");
-    Expect(PlatformEfficiencyModeSet(true) && PlatformEfficiencyModeSet(false), "idle round");
+    Expect(PlatformPowerModeSet(PLATFORM_POWER_EFFICIENCY) &&
+               PlatformPowerModeSet(PLATFORM_POWER_DEFAULT),
+           "idle round");
     Expect(GetPriorityClass(process) == IDLE_PRIORITY_CLASS, "an idle process stays idle");
 
     Expect(PlatformEfficiencyExemptCurrentThread(), "the thread asks for high QoS");

@@ -106,8 +106,8 @@ static void ShiftWorldToggleChunk(uint32_t seed)
     }
 
     static BlockType region[CHUNK_SIZE * CHUNK_SIZE];
-    WorldRegionContents contents = WorldFillRegion(world, 0, 0, 0,
-        CHUNK_SIZE, CHUNK_SIZE, 1, region);
+    WorldRegionContents contents =
+        WorldFillRegion(world, 0, 0, 0, CHUNK_SIZE, CHUNK_SIZE, 1, region);
     ShiftWorldExpect(contents == WORLD_REGION_ALL_AIR, "emptied chunk region is all air");
 
     WorldDestroy(world);
@@ -140,12 +140,9 @@ static void ShiftWorldBoundaryCells(void)
     WorldDestroy(world);
 }
 
-static int64_t r2BaseCalls;
-
 static BlockType ShiftWorldBaseGetBlock(void *context, int64_t x, int64_t y, int64_t z)
 {
     (void)context;
-    ++r2BaseCalls;
     return (BlockType)((x + y + z) % 3 == 0 ? 5U : BLOCK_AIR);
 }
 
@@ -176,8 +173,7 @@ static void ShiftWorldProviderBaseEqual(void)
  * (хеш-ветка), и мелкий (линейная ветка) пакеты. */
 static void ShiftWorldBatchRoundTrip(uint32_t count)
 {
-    WorldBlockMutation *mutations = PlatformAllocate(
-        (size_t)count * sizeof(*mutations), false);
+    WorldBlockMutation *mutations = PlatformAllocate((size_t)count * sizeof(*mutations), false);
     ShiftWorldExpect(mutations != NULL, "batch mutations allocated");
     if (mutations == NULL)
     {

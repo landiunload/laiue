@@ -5,6 +5,314 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The engine has internal SHA-512 and Ed25519 signing and verification for
+  future mod packages. Ed25519 and the transport's X25519 share field
+  arithmetic. Tests cover standard vectors, malformed signatures and both
+  native and portable multiplication.
+- Modules load and unload while the application runs, without a restart. A
+  load adds to the running modules and may use their services; it is a
+  transaction over its own modules, so a failure unwinds only them, and nobody
+  outside the load sees their services until it succeeds. A module that
+  declares or obtains a service of another uses it, and
+  `LaiueModuleHostUnloadV1` refuses to unload a module in use with
+  `LAIUE_MODULE_IN_USE` or, with `LAIUE_MODULE_UNLOAD_DEPENDENTS`, unloads its
+  users first. `LaiueModuleHostListDependentsV1` lists them in advance. Host
+  services register and unregister while modules run; a service in use stays.
+  A strict profile now fails before any module code runs, and the profile
+  report counts only the modules that load started. A new test covers loads,
+  failed loads, unloads, host services, profiles and the module limit next to
+  running modules.
+- The physics determinism test no longer crashes when MSVC 19.52.37025 builds
+  it for ARM64. The compiler stored part of the zero-fill from
+  `*simulation = (Simulation){0}` after the member stores that followed it and
+  erased the world's provider context. The test now builds its state in one
+  designated initializer; a disassembly scan of the whole ARM64 build found the
+  same mistake nowhere else.
+- A crashing test now says why instead of leaving a bare "SegFault" in the log.
+  Every test and benchmark prints the exception code or signal, the faulting
+  address and the call stack, then ends exactly as before, so CTest reports the
+  same result. On Windows frames read as `module+offset`, and a call through a
+  null function pointer still names its caller. A test crashes on purpose on
+  every platform to check the report, and test output on POSIX is no longer
+  held in a buffer that a crash would lose.
+- The Windows no-CRT `memcmp` and `memmove` no longer go byte by byte. Clang
+  can merge two compares of different lengths into one `memcmp` call with a
+  variable length, and such a call took a third of a network benchmark. Both
+  now work 16 bytes at a time: `memcmp` of 1200 bytes is 30 times faster, an
+  overlapping `memmove` 25 times. Copies and fills up to 512 bytes use the same
+  vectors instead of `rep movsb` and `rep stosb`, which cost more to start;
+  ARM64 uses NEON throughout. A test covers every length, alignment and overlap.
+- `laiue.net` moves messages between endpoints over datagrams and leaves the
+  protocol, server and replication to the application. Connections use an
+  X25519 handshake behind a stateless return-path cookie, optional pinned
+  server keys and shared secrets, and ChaCha20-Poly1305 on every packet. Up to
+  64 channels carry reliable ordered, unreliable and sequenced messages, with
+  QUIC-style loss recovery, reordering thresholds that adapt to the path,
+  paced congestion control by CUBIC with HyStart++ or by BBRv3, datagram size
+  discovery, address migration and hard memory limits. Acknowledgements to a
+  BBR sender carry the receiver's arrival clock, so BBR measures the path
+  rather than the update rate of either side. A UDP driver covers IPv4 and
+  IPv6 and keeps the system from fragmenting its datagrams, and a
+  deterministic simulator drives network tests. External platform adapters
+  opt into sockets with `LAIUE_PLATFORM_ADAPTER_HAS_SOCKETS`. Details are in
+  `docs/net.md`.
+- The Android walk check no longer fails on its own timing. It compares a picture
+  after a turn only once the screen has come to rest, and it answers the system's
+  "not responding" dialog about another process, which took the focus the scenario
+  runs on. A dialog about the program itself still fails the run.
+- A weekly workflow compares every pinned tool, SDK, Android package and GitHub
+  action with the newest stable release, and only that workflow turns red when
+  one falls behind. `tools/check_versions.py` does the comparison.
+- The run on the Android baseline profiles now proves the profile layer really
+  loaded: the loader skips a layer it cannot load without a word.
+- Everything built with Clang now uses LLVM 23. On Windows CI took the runner's
+  LLVM 20, so it did not check the compiler releases are built with.
+- The integer square root of the A* heuristic no longer loops. LLVM 23
+  vectorized the small correction loop, which almost never runs, and A* got
+  up to 30 % slower. Rounding keeps the estimate within one of the result, so
+  one correction each way is exact on the whole range, and a test proves it.
+- Stereo voices at a whole-number speed mix four frames at a time. LLVM 23
+  stopped vectorizing the loop over frames at an unknown stride and it became
+  30 % slower; the block form does not depend on that estimate and is a third
+  faster than it was with LLVM 22.
+- A region read out of a dense chunk copies eight edits at a time: edits are
+  sorted, so one check of the eighth proves the block has no gap. A solid chunk
+  is read 2.7 times faster, and a test compares runs of every length with
+  single reads.
+- A compound query no longer sorts hits that arrive in reverse order, which is
+  how boxes laid along an axis come out of the tree. Such a query is three times
+  faster; LLVM 23 had made it 30 % slower while making random ones much faster.
+- Vulkan now runs from version 1.1 instead of 1.2, the version most phones
+  from Android 9 on have. Nothing in the renderer needed 1.2, and such a phone
+  was simply turned away. `LAIUE_GRAPHICS_BACKEND_VULKAN_CORE` holds a device
+  to core 1.1 with no optional extension, so the path of an old phone runs on
+  any device: the Vulkan tests and the Android scenario now go through it too.
+  A real phone with Vulkan 1.1 has not been tried.
+- The Vulkan depth format is chosen from what the device can draw into:
+  32-bit float, then 24-bit, then 16-bit. It was always 32-bit float, which the
+  Android baseline does not promise, so such a phone could not draw at all.
+- CI runs the Vulkan tests on the Android baseline profiles of 2022 and 2025,
+  with the validation layer checking the calls against what a phone has.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DYNAMIC_RENDERING` tells whether a device draws
+  with dynamic rendering, and the Android scenario counts such frames.
+- Shader packs use contract 3. A frame drawn turned for an Android screen came
+  with new constants for the interface and panorama vertex shaders, and a pack
+  under contract 2 would have drawn them sideways on a rotated screen. Such a
+  pack no longer loads: rebuild it with the two lines described in
+  `docs/shaderpacks.md`. A pack that only replaces chunk shaders needs a new
+  contract line and nothing more, since `viewProjection` already holds the turn.
+- On Android a swap chain built during a turn of the screen takes the size of
+  the window. The surface still reports its old size at that moment, so since
+  the frame went straight into the chain a turn to portrait left a chain of the
+  wrong shape: every frame was stretched into it with one more copy, and the
+  emulator showed it one gamma step too dark. It stayed so until the next resize.
+- On Android a frame is drawn already turned for a rotated screen, so the system
+  no longer rotates every frame of a game held in landscape, which often means
+  one more GPU pass over the screen. The camera, the interface, input and
+  `readbackFrame` still work in window coordinates. Nothing changes on other
+  platforms. The gain has not been measured on a phone.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_TURNED` tells whether the last frame was drawn
+  turned, and the Android scenario counts such frames.
+- Without dynamic rendering a change of scene pass drops the cached instanced
+  constants, so the faces of a panorama no longer draw instances with the matrix
+  of the previous face.
+- On Vulkan the interface is drawn in the pass of the scene instead of a pass of
+  its own, which a tile GPU pays for by writing the whole frame to memory and
+  reading it back. Without dynamic rendering the pass of the scene no longer
+  loads the last contents of its targets just to clear them.
+- On Vulkan a frame is drawn straight into the swap chain image, without two
+  extra colour targets and a copy of the whole screen in every frame. That copy
+  costs a phone GPU the most, but a phone has not been measured. Foxity on Windows
+  holds 232 MB instead of 241. A screen that offers only BGRA gets BGRA targets.
+  The copy stays for a surface that offers neither sRGB format and for a frame
+  whose size differs from the window. A chain asks for three images, since with
+  two a frame and its GPU work have to fit one refresh.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_DRAWS_INTO_SWAPCHAIN` tells whether the last frame
+  went straight into the swap chain, and the Android scenario counts such frames.
+- `LAIUE_GRAPHICS_DIAGNOSTICS_READBACK_REQUEST_REQUIRED` covers every device with
+  a window: on Vulkan too `readbackFrame` now needs `requestFrameReadback` before
+  the frame. Without a window nothing changes.
+- Upload rings take a quarter of the memory, 1 MiB per frame instead of 4, and
+  the 8 MiB arenas of a burst go back after 120 turns of their frame slot without
+  use. A game loads its world in the first seconds and then uploads almost
+  nothing: Foxity peaked at 2.4 MiB a frame in 58 frames of 3600. Walk uses 11 MB
+  less. `LaiueGraphicsDiagnosticsV2` reports them as `uploadStagingBytes`, so a
+  program that reads diagnostics has to be rebuilt.
+- On Vulkan depth is no longer written to memory after a pass, since nothing reads
+  it there. A phone GPU keeps depth in its tile memory, so a frame stops paying for
+  a full-screen depth write, and where the device offers lazily allocated memory
+  the depth target takes no RAM at all.
+- The viewer plays a GIF frame by frame instead of unpacking it into memory first,
+  so a long GIF plays to its end. It used to stop at 256 frames without a word and
+  start over. A 6 MB GIF of 120 frames at 1920 x 1080 no longer takes 1.1 GB.
+  `GifStreamOpen` and `GifStreamNext` are the new decoder calls.
+- On Vulkan with vertical sync a frame reaches the screen in 33 ms instead of 90
+  to 98 ms from its start, in a window at 60 Hz, at the same frame rate and under
+  load too. The renderer used to wait for the GPU at the start of a frame, after
+  the program had read its input, and the present queue held four more frames.
+  It now waits at the end of a frame, and where the device has
+  `VK_KHR_present_wait` it waits until the previous frame is on the screen, which
+  keeps two frames queued, as on D3D12. Without the extension, on most Android
+  devices, the wait for a free image moves to the end of a frame as well.
+- On Vulkan a swap chain is no longer rebuilt on every frame of a rotated screen.
+  Android answers each present with `VK_SUBOPTIMAL_KHR` while the screen is turned
+  and the chain draws unrotated, and the renderer stopped the GPU and built a new
+  chain each time, in the landscape orientation games run in: 171 rebuilds in 171
+  frames on the emulator, 0 now. A frame acquired as suboptimal is drawn instead
+  of dropped. `swapchainRebuilds` in the graphics diagnostics counts them, which
+  grows `LaiueGraphicsDiagnosticsV2`, so a program that reads it has to be rebuilt.
+- A vertex buffer keeps no CPU copy: its bytes stay only in the GPU, so vertices
+  take half the memory and each upload one copy less. Foxity uses 21 MB less. A
+  vertex buffer now takes whole uploads only; index buffers still take parts.
+- The viewer sends its font atlas to the GPU only when the font was baked again,
+  not at every new window size. A window resize costs 13 % less CPU.
+- Destroying a texture no longer stops the GPU either. A texture that frames in
+  flight may read waits until the GPU has passed them; Vulkan used to wait for
+  the device to go idle and rebuild its descriptor sets.
+- A minimized window on Windows reports a size of 0 x 0, as programs expected,
+  and they stop drawing to nowhere. The viewer sleeps until it is restored, and
+  a game goes on simulating. A window without pixels sleeps between frames even
+  when it stays active.
+- A window keeps its frame rate out of focus while it can be seen. About 20
+  frames a second now belong to `WINDOW_POWER_EFFICIENCY` and to windows nobody
+  sees: hidden, or on another virtual desktop. On X11 a window the window manager
+  took off the screen reports a size of 0 x 0, as on Windows.
+- `WINDOW_POWER_AUTO` enters efficiency mode only when no window of the program
+  can be seen. A window out of focus used to fall to idle priority, and any busy
+  program could stop it completely.
+- Geometry uploaded without frames no longer piles up. Past 32 MiB of spilled
+  staging the renderers copy what waits and reuse the memory, as they already
+  did for textures.
+- Uploading a texture no longer stops the GPU. D3D12 waited for it twice per
+  mip level and Vulkan once; the pixels now go to staging memory, and the copy
+  runs at the start of the next frame. In the viewer a page turn holds the
+  main thread for 17 to 24 ms instead of 33 to 50 ms.
+- Windows draws engine windows pixel for pixel on a scaled display. The first
+  window declares the process aware of each monitor's DPI, the requested size
+  counts in points, and a window follows the scale of the monitor it moves to.
+  Before, the system stretched the whole window, and the viewer's 100 % was not
+  one image pixel per screen pixel.
+- The viewer turns a page in 35 to 45 ms instead of 200 to 300 ms on
+  24-megapixel pictures. Reading and decoding took three quarters of that and
+  need no graphics device, so the neighbour in the direction of browsing is
+  read on its own thread, mip chain included. This holds one more picture in
+  memory, 122 MiB at this size.
+- A program can survive a driver reset. `getDiagnostics` reports
+  `LAIUE_GRAPHICS_DIAGNOSTICS_DEVICE_LOST` when every frame is going to fail,
+  and a new device can be created on the same window. The viewer does this and
+  shows its picture again. It also no longer spins on a whole core while frames
+  fail.
+- On D3D12 a frame reaches the screen 33 ms sooner at 60 Hz: 50 ms instead of
+  83 ms from the start of a frame in a window, 33 ms instead of 66 ms in
+  borderless full screen. The present queue holds two frames instead of three,
+  with the same frame rate under load, and without vertical sync a GPU-bound
+  program gains too: 27 ms instead of 32 ms at 218 frames per second.
+- A program can sleep while nothing changes, instead of drawing the same
+  picture at the refresh rate. `WindowDeferNextFrame`, called from a frame,
+  holds the next one until a window event, a deadline or `WindowWakeFrame`
+  from any thread, and `WindowConsumeRedraw` reports when the system lost the
+  window's picture. Without these calls frames run back to back, as before.
+  The viewer uses them: a picture lying on the screen costs no CPU or GPU
+  time at all, down from 2.5 % of a core and 7.3 % of the GPU, and an animated
+  GIF draws only when its frame changes.
+- JPEG decodes twice as fast on one core: a 24-megapixel 4:2:0 photo takes
+  75 ms instead of 157 ms, a 4:4:4 one 91 ms instead of 183 ms, and a
+  progressive one 216 ms instead of 298 ms. Valid files still match
+  libjpeg-turbo byte for byte.
+  - The inverse transform, chroma upsampling and color conversion run in
+    SSE2 and NEON registers. A new test compares them with a scalar
+    reference on every sampling and on widths around the vector steps.
+  - Bits stay in registers for a whole block, and one table entry gives
+    the length of a code together with the value behind it.
+  - Values too large for a 16-bit lane now saturate the same way on every
+    processor, which changes only the garbage from damaged files.
+- The viewer starts sooner on a large picture: from start to exit with
+  `--smoke`, a 24-megapixel JPEG takes 393 ms instead of 537 ms and a PNG of
+  that size 379 ms instead of 497 ms. The first picture is read on its own
+  thread while the window and the graphics device are created, which takes
+  longer than decoding a photo.
+- PNG decodes 2.3 to 2.5 times faster on one core: a 24-megapixel photo
+  takes 119 ms instead of 276 ms, the same photo with Paeth on every row
+  175 ms instead of 398 ms, and a noisy one that barely compresses 241 ms
+  instead of 576 ms.
+  - Inflate runs a separate loop in the middle of a block. It checks the
+    input and output once a step instead of once a symbol and reads 64
+    bits at a time, and one table entry gives a code's length, extra bits
+    and base. Anything unusual stays with the careful decoder, so damaged
+    streams end with the same status at the same byte.
+  - Filters are undone a pixel at a time in SSE2 and NEON registers. Paeth
+    has no branches: on a photo the winner changes from byte to byte, and
+    mispredictions cost more than the predictor itself.
+  - Adler-32 takes 16 bytes at a time, and RGB expands a word at a time.
+  - New tests reach the loop, which short streams never did, and undo
+    every filter on every pixel size. While making the change, the old and
+    new code were compared under ASan and UBSan on 34 million mutated
+    streams and files: status, count and bytes all matched.
+- Halving an opaque picture, the step of every mip chain, is four times
+  faster: 10 ms instead of 38 ms for all the levels of a 24-megapixel
+  photo. Equal weights turn the weighted average into a plain one, which
+  the compiler vectorizes.
+- JPEG decodes 1.4 to 3.2 times faster, and byte for byte like
+  libjpeg-turbo with its default settings. A 24-megapixel 4:2:0 photo
+  takes 157 ms instead of 408 ms on one core, a progressive one 306 ms
+  instead of 560 ms.
+  - The inverse DCT is libjpeg's integer `islow` instead of a direct
+    float transform. Integer arithmetic also gives the same pixels on
+    every processor and compiler.
+  - Subsampled chroma is restored a row at a time with libjpeg's triangle
+    filter and its alternating rounding, instead of per pixel.
+  - The bit reader refills 64 bits at a time, and coefficients and
+    quantization tables are kept in natural order, as the transform reads
+    them.
+  - The texture converter test now requires the exact pixels Pillow
+    decodes, and 192 more files were checked against Pillow while making
+    the change: every subsampling, sizes from 1×1, progressive, restart
+    markers and qualities from 1 to 100.
+- On Windows frames go on while the window is dragged or resized, while a
+  mouse button holds the caption or a caption button and while the window
+  menu is open. `DefWindowProc` runs its own message loop until the button
+  is released, and `WindowRunLoop` stood still.
+  - Moving, sizing and the menu now run frames from a timer. `WM_TIMER`
+    comes only when the queue is empty, so the loop keeps the mouse.
+  - A held caption button and a press on the caption before the first mouse
+    move use a small frame clock thread instead. No timer gets through
+    there: those waits take only mouse messages, or none. The thread wakes
+    the window procedure for each frame with `SendNotifyMessage`. After
+    each frame it pauses for a millisecond: Windows hands the window
+    thread sent messages before input, and without the pause the loop
+    would not get the mouse while it moves.
+  - Input is reset when the system takes the mouse, as on focus loss. Raw
+    input reaches the program again only when the system gives the mouse
+    back, so a press on the caption no longer becomes a click in the
+    program.
+- Alt+Enter switches borderless full screen in the window module, on
+  Windows and X11, with any graphics backend. Before, only D3D12 reacted,
+  through DXGI's own handler, and it entered exclusive full screen. There a
+  present that allows tearing fails, so without vertical sync the program
+  stopped drawing. D3D12 now leaves Alt+Enter to the window. On Vulkan
+  Alt+Enter did nothing.
+- On Windows Alt or F10 pressed alone no longer stops frames. They started
+  the system menu's modal loop until the next key; Alt+Space still opens
+  the menu.
+- On X11 `WindowSetFullscreen` asks the window manager for full screen
+  (EWMH); before it only stored the flag. A held key no longer counts as
+  repeated presses, because the window asks for detectable autorepeat.
+- On X11 a key types the character of its keysym, so Cyrillic and every
+  character a layout names by a Unicode keysym are typed, not only Latin-1.
+  As on Windows, keys held with Ctrl or Alt type nothing. The conversion is
+  portable and tested on every platform.
+- On X11 moving the window no longer reports a resize, only a new size does.
+  Losing focus with Enter held no longer swallows the next Alt+Enter, and
+  only a `WM_PROTOCOLS` message can close the window. The window asks the
+  server for all its atoms once, in one round trip.
+- `WindowSetPowerPolicy` chooses how the process spends power, also through
+  the window service's optional `setPowerPolicy` tail. `WINDOW_POWER_AUTO`,
+  the default, is the background efficiency mode described below.
+  `WINDOW_POWER_EFFICIENCY` keeps the process in efficiency mode even while
+  it is active. `WINDOW_POWER_PERFORMANCE` never enters it and asks Windows
+  for high QoS, so the program is not slowed even in the background. Only
+  Windows applies a policy; Linux and Android store it and return false.
+  Unloading the window module returns the process to the default mode.
 - On Windows a program in the background goes into efficiency mode, as with
   the Task Manager switch: its process gets EcoQoS and low base priority, and
   Task Manager shows the green leaf. The window module enters the mode when
@@ -16,13 +324,13 @@ API and ABI may change between minor versions.
   store use `LDAR` and `STLR` instead of locked instructions. Threads that
   read a shared counter no longer take its cache line from each other and
   from the thread that writes it.
-- Vulkan without vertical sync showed no more frames than the screen
-  refreshes. On NVIDIA it also kept a CPU core busy waiting for a free
-  swapchain image. Now it presents in `FIFO_LATEST_READY` mode where the
-  device offers it, otherwise in `MAILBOX`, and with one more swapchain image.
-  As with D3D12, the screen shows the latest finished frame at each refresh,
-  up to two frames are rendered per refresh, and the CPU sleeps while it
-  waits.
+- Without vertical sync the frame rate has no limit. D3D12 presents with
+  `ALLOW_TEARING` where the system supports it, and Vulkan prefers
+  `IMMEDIATE`, then `MAILBOX`, then `FIFO_LATEST_READY`. A window that covers
+  the screen may show a tear, while a composed window shows the newest frame.
+  Without tearing support D3D12 shows up to two frames per refresh. Vulkan
+  keeps one more swapchain image than the minimum, so on NVIDIA it no longer
+  keeps a CPU core busy waiting for a free image.
 - The Vulkan renderer took the last suitable device, not the best. Without a
   discrete GPU it could choose a CPU driver such as lavapipe over the
   integrated GPU. It now ranks devices: discrete GPU first, then integrated,
@@ -77,10 +385,6 @@ API and ABI may change between minor versions.
   characters left to the keys. Windows assembles surrogate pairs; X11 gives
   Latin-1 for now. Check `LAIUE_WINDOW_SERVICE_V1_TEXT_SIZE` before calling it;
   `LAIUE_WINDOW_SERVICE_V1_LEGACY_SIZE` is the service without it.
-- Vertical sync off no longer tears. D3D12 keeps three swap-chain buffers and
-  presents without `ALLOW_TEARING`, Vulkan prefers `MAILBOX` to `IMMEDIATE`:
-  frames stay uncapped and each refresh shows the newest whole one, where at
-  thousands of frames a second tearing cut the picture into bands.
 - `LaiueGraphicsDeviceV2` gains the optional `setVerticalSync` and
   `getVerticalSync` tail: presenting can stop waiting for the display's
   refresh and start again at run time. Check

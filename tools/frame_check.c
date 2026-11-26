@@ -50,6 +50,21 @@ static int Failure(const char *reason)
     return 1;
 }
 
+/* Blue over green in a band of rows: the sky of the walk scene is blue, its ground
+ * green. A frame turned the wrong way for the screen shows them swapped. */
+static int64_t BlueOverGreen(const uint8_t *pixels, const ImageInfo *info, uint32_t top,
+                             uint32_t bottom)
+{
+    int64_t balance = 0;
+    for (uint32_t y = top; y < bottom; ++y)
+    {
+        const uint8_t *pixel = pixels + (size_t)y * info->width * 4u;
+        for (uint32_t x = 0u; x < info->width; ++x, pixel += 4)
+            balance += (int64_t)pixel[2] - pixel[1];
+    }
+    return balance;
+}
+
 static int CheckFrame(const char *path)
 {
     PlatformReadFile file = {0};
@@ -124,6 +139,13 @@ static int CheckFrame(const char *path)
     const bool inspected =
         WalkScenarioAnalyzeRGBA8(decoded + offset, (size_t)info.pixelBytes - offset, right - left,
                                  bottom - top, pitch, &image) != 0u;
+    /* Clear of the buttons above and of the horizon in both orientations. */
+    const bool skyAboveGround =
+        BlueOverGreen(decoded, &info, info.height / 5u, info.height * 3u / 10u) > 0 &&
+        BlueOverGreen(decoded, &info, info.height * 3u / 4u, info.height * 17u / 20u) < 0;
+    const uint8_t *sky =
+        decoded + (size_t)(info.height / 5u) * pitch + (size_t)(info.width / 2u) * 4u;
+    const uint32_t skyColor[3] = {sky[0], sky[1], sky[2]};
     PlatformFree(decoded);
     if (!inspected)
         return Failure("invalid_viewport");
@@ -153,6 +175,13 @@ static int CheckFrame(const char *path)
     Number(&message, right - left);
     Append(&message, ",\"viewportHeight\":");
     Number(&message, bottom - top);
+    Append(&message, skyAboveGround ? ",\"skyAboveGround\":true" : ",\"skyAboveGround\":false");
+    Append(&message, ",\"skyRed\":");
+    Number(&message, skyColor[0]);
+    Append(&message, ",\"skyGreen\":");
+    Number(&message, skyColor[1]);
+    Append(&message, ",\"skyBlue\":");
+    Number(&message, skyColor[2]);
     Append(&message, "}\n");
     PlatformWriteConsoleUtf8(message.text);
     return useful ? 0 : 1;
