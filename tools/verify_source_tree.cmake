@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2...4.4)
+cmake_minimum_required(VERSION 4.2...4.5)
 
 if(NOT DEFINED SOURCE_ROOT OR SOURCE_ROOT STREQUAL "")
     message(FATAL_ERROR "SOURCE_ROOT is required")

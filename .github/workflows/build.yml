@@ -19,9 +19,9 @@ env:
   LLVM_VERSION: '23'
   # На раннерах LLVM старше, а выпуск собирается этим: CI проверяет тот же
   # компилятор. Linux берёт его с apt.llvm.org, Windows из архивов LLVM.
-  LLVM_WINDOWS_RELEASE: 23.1.5
-  LLVM_WINDOWS_SHA256: b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7
-  LLVM_WINDOWS_ARM64_SHA256: cb523582d9fe00862c5584ce5f7715f963037c11bba95181fa98425f48e06863
+  LLVM_WINDOWS_RELEASE: 23.1.6
+  LLVM_WINDOWS_SHA256: 7623f582089983c1cb51030cf1996514b19464e5669099571b399e8543770155
+  LLVM_WINDOWS_ARM64_SHA256: d3f65e879cd4b1524a0c85c871e0fc26164644b28e618fc341fac7850d48ea38
   ANDROID_NDK_VERSION: 30.0.16248370
   # DXC собирает встроенные шейдеры; checked-in байткод обязан совпадать
   # с выводом именно этого релиза.
@@ -646,8 +646,8 @@ jobs:
       LAIUE_ANDROID_IMAGE: android-37.0
       LAIUE_BUILD_TOOLS: 37.0.0
       LAIUE_CMDLINE_TOOLS: '23.0'
-      LAIUE_EMULATOR: 37.2.13
-      LAIUE_EMULATOR_BUILD: 16740729
+      LAIUE_EMULATOR: 37.3.10
+      LAIUE_EMULATOR_BUILD: 16970787
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install emulator runtime dependencies
@@ -705,7 +705,7 @@ jobs:
           curl --fail --location --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
             "https://dl.google.com/android/repository/emulator-linux_x64-$LAIUE_EMULATOR_BUILD.zip" \
             --output "$RUNNER_TEMP/laiue-emulator.zip"
-          printf 'cbc7c3cfb83220b8a0f9c513fdab557712e74d339ec19ddffa43f23350ae9bdd  %s\n' \
+          printf 'a4405349d8a9c52136ab7861e5331dc40e85574bd91cb8889a298a2ff4c52e26  %s\n' \
             "$RUNNER_TEMP/laiue-emulator.zip" | sha256sum --check -
           unzip -q "$RUNNER_TEMP/laiue-emulator.zip" -d "$RUNNER_TEMP/laiue-pinned-emulator"
           emulator="$RUNNER_TEMP/laiue-pinned-emulator/emulator"

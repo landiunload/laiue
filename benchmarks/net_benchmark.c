@@ -1,15 +1,17 @@
 // Ручной benchmark транспорта laiue.net: в ALL не входит, в CTest не
 // регистрируется.
 //
-// Сеть — симулятор без потерь, а время движет сам benchmark: число пакетов
-// и контрольная сумма от прогона к прогону не меняются, и часы меряют только
-// процессор — шифрование, сборку кадров, подтверждения, таймеры и события.
+// В первых четырёх сценариях симулятор не теряет пакеты. Измеряется время
+// работы транспорта и симулятора: шифрование, сборка кадров, подтверждения,
+// таймеры и события.
 //
 // поток       — 256 МиБ надёжных сообщений по 64 КиБ от клиента серверу;
 // мелочь      — миллион надёжных сообщений по 32 байта;
 // рукопожатия — тысяча клиентов разом соединяются с одним сервером;
 // толпа       — сервер и те же клиенты обмениваются ненадёжным сообщением
 //               в каждом такте 60 Гц; меряется такт сервера.
+// плохой путь — CUBIC и BBR передают один и тот же поток, измеряются
+//               виртуальное время доставки и реальное время работы.
 
 #include "net/net.h"
 #include "platform/system.h"
@@ -28,6 +30,11 @@
 #define CROWD_TICKS 600u
 #define CROWD_MESSAGE 64u
 #define TICK_60HZ UINT64_C(16667)
+#define PATH_MESSAGE (16u << 10u)
+#define PATH_MESSAGES 256u
+#define PATH_BUFFER_BYTES (1u << 20u)
+#define PATH_QUEUE_DATAGRAMS 4096u
+#define PATH_TIMEOUT (UINT64_C(90) * 1000000u)
 /* Симулированное время, за которое сценарий обязан закончиться. */
 #define SCENARIO_LIMIT (UINT64_C(600) * 1000000u)
 
@@ -44,6 +51,8 @@ typedef struct Network
 {
     LaiueNetSimulator *simulator;
     uint64_t now;
+    uint32_t congestionControl;
+    uint32_t streamBufferBytes;
 } Network;
 
 static uint64_t randomState = UINT64_C(0x9E3779B97F4A7C15);
@@ -108,21 +117,24 @@ static LaiueNetAddress Address(uint32_t host, uint16_t port)
     return address;
 }
 
-static void NetworkBegin(Network *network, uint32_t latencyMicroseconds)
+static void NetworkStart(Network *network, const LaiueNetSimulatorConditions *conditions,
+                         uint64_t seed, uint32_t queueDatagrams)
 {
     memset(network, 0, sizeof(*network));
-    LaiueNetSimulatorDesc desc;
-    memset(&desc, 0, sizeof(desc));
-    desc.structSize = sizeof(desc);
-    desc.maxQueuedDatagrams = 1u << 20u;
-    desc.seed = 1u;
+    const LaiueNetSimulatorDesc desc = {
+        .structSize = sizeof(desc), .maxQueuedDatagrams = queueDatagrams, .seed = seed};
     Check(LaiueNetSimulatorCreate(&desc, &network->simulator) == LAIUE_NET_OK, "simulator");
-    LaiueNetSimulatorConditions conditions;
-    memset(&conditions, 0, sizeof(conditions));
-    conditions.structSize = sizeof(conditions);
-    conditions.latencyMicroseconds = latencyMicroseconds;
-    Check(LaiueNetSimulatorSetConditions(network->simulator, &conditions) == LAIUE_NET_OK,
+    Check(LaiueNetSimulatorSetConditions(network->simulator, conditions) == LAIUE_NET_OK,
           "conditions");
+}
+
+static void NetworkBegin(Network *network, uint32_t latencyMicroseconds)
+{
+    const LaiueNetSimulatorConditions conditions = {.structSize = sizeof(conditions),
+                                                    .latencyMicroseconds = latencyMicroseconds};
+    NetworkStart(network, &conditions, 1u, 1u << 20u);
+    /* На быстром пути замер упирается в процессор, не в окно потока. */
+    network->streamBufferBytes = 16u << 20u;
 }
 
 static LaiueNetEndpoint *Open(Network *network, const LaiueNetAddress *address, uint32_t flags,
@@ -140,10 +152,9 @@ static LaiueNetEndpoint *Open(Network *network, const LaiueNetAddress *address, 
     desc.protocolId = PROTOCOL;
     desc.maxPeers = maxPeers;
     desc.channelCount = 2u;
-    /* Окна шире произведения скорости на задержку: упираться в них
-     * должен процессор, а не управление потоком. */
-    desc.receiveWindowBytes = 16u << 20u;
-    desc.sendBufferBytes = 16u << 20u;
+    desc.receiveWindowBytes = network->streamBufferBytes;
+    desc.sendBufferBytes = network->streamBufferBytes;
+    desc.congestionControl = network->congestionControl;
     desc.random = Random;
     LaiueNetEndpoint *endpoint = NULL;
     Check(LaiueNetEndpointCreate(&desc, &endpoint) == LAIUE_NET_OK, "endpoint");
@@ -342,6 +353,150 @@ static void Crowd(void)
     LaiueNetSimulatorDestroy(network.simulator);
 }
 
+static void PrintPathValue(const char *name, uint64_t value)
+{
+    LaiueTestRuntimeWrite(" ");
+    LaiueTestRuntimeWrite(name);
+    LaiueTestRuntimeWrite("=");
+    WriteUnsigned(value);
+}
+
+static void DrainPath(LaiueNetEndpoint *server, uint32_t *received)
+{
+    LaiueNetEvent event = {.structSize = sizeof(event)};
+    while (LaiueNetPollEvent(server, &event))
+    {
+        Check(event.type == LAIUE_NET_EVENT_MESSAGE && event.delivery == LAIUE_NET_RELIABLE &&
+                  event.channel == 0u && event.size == PATH_MESSAGE && event.data != NULL &&
+                  *received < PATH_MESSAGES,
+              "one complete reliable path message (channel 0)");
+        const uint8_t *data = event.data;
+        for (uint32_t byte = 0u; byte < sizeof(*received); ++byte)
+            Check(data[byte] == (uint8_t)(*received >> (8u * byte)), "path message order");
+        Check(memcmp(data + sizeof(*received), streamMessage + sizeof(*received),
+                     PATH_MESSAGE - sizeof(*received)) == 0,
+              "path message bytes");
+        ++*received;
+    }
+}
+
+/* Доставить поток целиком и дождаться подтверждений. Пропускная
+ * способность включает разгон, но отсчёт начинается после рукопожатия. */
+static void PathTransfer(const LaiueNetSimulatorConditions *conditions, const char *label,
+                         uint32_t control, uint64_t seed)
+{
+    randomState = UINT64_C(0x9E3779B97F4A7C15) ^ seed;
+    Network network;
+    NetworkStart(&network, conditions, seed, PATH_QUEUE_DATAGRAMS);
+    network.streamBufferBytes = PATH_BUFFER_BYTES;
+    network.congestionControl = control;
+    const LaiueNetAddress serverAddress = Address(1u, 4000u);
+    const LaiueNetAddress clientAddress = Address(2u, 5000u);
+    LaiueNetEndpoint *server = Open(&network, &serverAddress, LAIUE_NET_ENDPOINT_ACCEPT, 1u);
+    LaiueNetEndpoint *client = Open(&network, &clientAddress, 0u, 1u);
+    const LaiueNetPeer peer = Connect(client, &serverAddress);
+    Totals serverTotals = {0};
+    Totals clientTotals = {0};
+    while (serverTotals.connected == 0u || clientTotals.connected == 0u)
+    {
+        Check(network.now < PATH_TIMEOUT, "path handshake deadline");
+        Step(&network, MILLISECOND);
+        Check(LaiueNetUpdate(client, network.now) == LAIUE_NET_OK &&
+                  LaiueNetUpdate(server, network.now) == LAIUE_NET_OK,
+              "path handshake update");
+        Drain(client, &clientTotals, NULL, 0u);
+        Drain(server, &serverTotals, NULL, 0u);
+        Check(clientTotals.disconnected == 0u && serverTotals.disconnected == 0u, "path connects");
+    }
+
+    uint32_t queued = 0u;
+    uint32_t received = 0u;
+    uint64_t deliveryUs = 0u;
+    uint64_t rttSum = 0u;
+    uint64_t rttSamples = 0u;
+    LaiueNetPeerInfo info = {.structSize = sizeof(info)};
+    const uint64_t startUs = network.now;
+    const double wallStart = PlatformMonotonicSeconds();
+    do
+    {
+        Check(network.now - startUs < PATH_TIMEOUT, "path transfer deadline");
+        while (queued < PATH_MESSAGES)
+        {
+            for (uint32_t byte = 0u; byte < sizeof(queued); ++byte)
+                streamMessage[byte] = (uint8_t)(queued >> (8u * byte));
+            const LaiueNetStatus status =
+                LaiueNetSend(client, peer, 0u, LAIUE_NET_RELIABLE, streamMessage, PATH_MESSAGE);
+            if (status == LAIUE_NET_WOULD_BLOCK)
+                break;
+            Check(status == LAIUE_NET_OK, "queue path message");
+            ++queued;
+        }
+        Step(&network, MILLISECOND);
+        Check(LaiueNetUpdate(client, network.now) == LAIUE_NET_OK &&
+                  LaiueNetUpdate(server, network.now) == LAIUE_NET_OK,
+              "path update");
+        Drain(client, &clientTotals, NULL, 0u);
+        DrainPath(server, &received);
+        Check(clientTotals.disconnected == 0u && clientTotals.messages == 0u &&
+                  LaiueNetPeerGetInfo(client, peer, &info) == LAIUE_NET_OK,
+              "path stays connected");
+        if (deliveryUs == 0u)
+        {
+            if (info.roundTripMicroseconds != 0u)
+            {
+                rttSum += info.roundTripMicroseconds;
+                ++rttSamples;
+            }
+            if (received == PATH_MESSAGES)
+                deliveryUs = network.now - startUs;
+        }
+    } while (deliveryUs == 0u || info.queuedReliableBytes != 0u || info.bytesInFlight != 0u);
+    Check(rttSamples != 0u, "path samples a round trip");
+    const uint64_t wallUs = (uint64_t)((PlatformMonotonicSeconds() - wallStart) * 1000000.0);
+    const uint64_t bytes = (uint64_t)PATH_MESSAGE * PATH_MESSAGES;
+    LaiueTestRuntimeWrite(label);
+    PrintPathValue("seed", seed);
+    PrintPathValue("delivered_bytes", bytes);
+    PrintPathValue("payload_bps", bytes * 8000000u / deliveryUs);
+    PrintPathValue("delivery_us", deliveryUs);
+    PrintPathValue("confirmed_us", network.now - startUs);
+    PrintPathValue("mean_srtt_us", rttSum / rttSamples);
+    PrintPathValue("packets_sent", info.packetsSent);
+    PrintPathValue("packets_lost", info.packetsLost);
+    PrintPathValue("wall_us", wallUs);
+    LaiueTestRuntimeWrite("\n");
+    LaiueNetEndpointDestroy(client);
+    LaiueNetEndpointDestroy(server);
+    LaiueNetSimulatorDestroy(network.simulator);
+}
+
+static void ImpairedPath(void)
+{
+    const LaiueNetSimulatorConditions conditions = {
+        .structSize = sizeof(conditions),
+        .latencyMicroseconds = 50000u,
+        .lossPerMillion = 10000u,
+        .bytesPerSecond = 1000000u,
+        .queueMicroseconds = 100000u,
+    };
+    LaiueTestRuntimeWrite("\nImpaired path: one-thread simulator, fixed transfer after handshake");
+    PrintPathValue("tick_us", MILLISECOND);
+    PrintPathValue("one_way_us", conditions.latencyMicroseconds);
+    PrintPathValue("link_bytes_per_s", conditions.bytesPerSecond);
+    PrintPathValue("link_queue_us", conditions.queueMicroseconds);
+    PrintPathValue("random_loss_ppm", conditions.lossPerMillion);
+    PrintPathValue("simulator_queue_datagrams", PATH_QUEUE_DATAGRAMS);
+    PrintPathValue("stream_buffer_bytes", PATH_BUFFER_BYTES);
+    PrintPathValue("message_bytes", PATH_MESSAGE);
+    PrintPathValue("messages", PATH_MESSAGES);
+    LaiueTestRuntimeWrite("\n");
+    for (uint64_t seed = 41u; seed <= 45u; ++seed)
+    {
+        PathTransfer(&conditions, "CUBIC", LAIUE_NET_CONGESTION_CUBIC, seed);
+        PathTransfer(&conditions, "BBR", LAIUE_NET_CONGESTION_BBR, seed);
+    }
+}
+
 LAIUE_TEST_ENTRY(NetBenchmarkEntryPoint)
 {
     for (uint32_t index = 0u; index < STREAM_MESSAGE; ++index)
@@ -352,5 +507,6 @@ LAIUE_TEST_ENTRY(NetBenchmarkEntryPoint)
     LaiueTestRuntimeWrite("checksum: ");
     WriteUnsigned(checksum);
     LaiueTestRuntimeWrite("\n");
+    ImpairedPath();
     LAIUE_TEST_SUCCESS();
 }

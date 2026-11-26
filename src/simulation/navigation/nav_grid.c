@@ -208,13 +208,16 @@ LaiueNavStatus LaiueNavGridFillRect(LaiueNavGrid *grid, const LaiueNavRect *rect
                 const int64_t originY = chunkY * (int64_t)CHUNK_SIDE;
                 const int64_t fromX = rect->x > originX ? rect->x : originX;
                 const int64_t fromY = rect->y > originY ? rect->y : originY;
-                const int64_t toX =
-                    endX < originX + (int64_t)CHUNK_SIDE ? endX : originX + (int64_t)CHUNK_SIDE;
-                const int64_t toY =
-                    endY < originY + (int64_t)CHUNK_SIDE ? endY : originY + (int64_t)CHUNK_SIDE;
-                const bool whole = fromX == originX && fromY == originY &&
-                                   toX == originX + (int64_t)CHUNK_SIDE &&
-                                   toY == originY + (int64_t)CHUNK_SIDE;
+                /* Последний чанк может продолжаться за INT64_MAX. Сначала
+                 * ограничиваем его локальный размер концом прямоугольника. */
+                const int64_t remainingX = endX - originX;
+                const int64_t remainingY = endY - originY;
+                const int64_t width = remainingX < CHUNK_SIDE ? remainingX : CHUNK_SIDE;
+                const int64_t height = remainingY < CHUNK_SIDE ? remainingY : CHUNK_SIDE;
+                const int64_t toX = originX + width;
+                const int64_t toY = originY + height;
+                const bool whole = fromX == originX && fromY == originY && width == CHUNK_SIDE &&
+                                   height == CHUNK_SIDE;
                 if (whole && cost == grid->defaultCost && FindChunk(grid, chunkX, chunkY) == NULL)
                     continue;
                 /* Во втором проходе чанк уже есть, а клетки уже выделены. */
@@ -274,8 +277,8 @@ static uint8_t ReadCell(CellReader *reader, int64_t x, int64_t y)
 
 static bool Inside(const LaiueNavRect *rect, int64_t x, int64_t y)
 {
-    return x >= rect->x && y >= rect->y && (uint64_t)(x - rect->x) < rect->width &&
-           (uint64_t)(y - rect->y) < rect->height;
+    return x >= rect->x && y >= rect->y && (uint64_t)x - (uint64_t)rect->x < rect->width &&
+           (uint64_t)y - (uint64_t)rect->y < rect->height;
 }
 
 static uint32_t AreaIndex(const LaiueNavRect *rect, int64_t x, int64_t y)
@@ -283,14 +286,12 @@ static uint32_t AreaIndex(const LaiueNavRect *rect, int64_t x, int64_t y)
     return (uint32_t)(y - rect->y) * rect->width + (uint32_t)(x - rect->x);
 }
 
-/* Шаг из (x, y) в направлении direction разрешён: клетка проходима, а у
- * диагонали проходимы оба прямых соседа. Возвращает стоимость шага или 0. */
-static uint64_t StepCost(CellReader *reader, const LaiueNavRect *bounds, int64_t x, int64_t y,
+/* Обе клетки в bounds, поэтому прямые соседи диагонали тоже внутри.
+ * Возвращает стоимость шага или 0, если вход или угол закрыт. */
+static uint64_t StepCost(CellReader *reader, int64_t x, int64_t y, int64_t nextX, int64_t nextY,
                          uint32_t direction, uint8_t enteringCost)
 {
-    const int64_t nextX = x + directionX[direction];
-    const int64_t nextY = y + directionY[direction];
-    if (!Inside(bounds, nextX, nextY) || enteringCost == LAIUE_NAV_CELL_BLOCKED)
+    if (enteringCost == LAIUE_NAV_CELL_BLOCKED)
         return 0u;
     if ((direction & 1u) != 0u)
     {
@@ -302,10 +303,15 @@ static uint64_t StepCost(CellReader *reader, const LaiueNavRect *bounds, int64_t
     return (uint64_t)LAIUE_NAV_GRID_STRAIGHT_STEP * enteringCost;
 }
 
+static uint64_t Distance(int64_t from, int64_t to)
+{
+    return from >= to ? (uint64_t)from - (uint64_t)to : (uint64_t)to - (uint64_t)from;
+}
+
 static uint64_t Octile(int64_t fromX, int64_t fromY, int64_t toX, int64_t toY)
 {
-    const uint64_t dx = fromX >= toX ? (uint64_t)(fromX - toX) : (uint64_t)(toX - fromX);
-    const uint64_t dy = fromY >= toY ? (uint64_t)(fromY - toY) : (uint64_t)(toY - fromY);
+    const uint64_t dx = Distance(fromX, toX);
+    const uint64_t dy = Distance(fromY, toY);
     const uint64_t larger = dx > dy ? dx : dy;
     const uint64_t smaller = dx > dy ? dy : dx;
     return LAIUE_NAV_GRID_STRAIGHT_STEP * larger +
@@ -344,14 +350,15 @@ static bool ResolveBounds(const LaiueNavGridPathRequest *request, LaiueNavRect *
         if (minimumX < INT64_MIN + margin || minimumY < INT64_MIN + margin ||
             maximumX > INT64_MAX - margin - 1 || maximumY > INT64_MAX - margin - 1)
             return false;
-        const uint64_t width = (uint64_t)(maximumX - minimumX) + 1u + 2u * (uint64_t)margin;
-        const uint64_t height = (uint64_t)(maximumY - minimumY) + 1u + 2u * (uint64_t)margin;
-        if (width > UINT32_MAX || height > UINT32_MAX)
+        const uint64_t spanX = (uint64_t)maximumX - (uint64_t)minimumX;
+        const uint64_t spanY = (uint64_t)maximumY - (uint64_t)minimumY;
+        const uint64_t padding = 1u + 2u * (uint64_t)margin;
+        if (padding > UINT32_MAX || spanX > UINT32_MAX - padding || spanY > UINT32_MAX - padding)
             return false;
         bounds->x = minimumX - margin;
         bounds->y = minimumY - margin;
-        bounds->width = (uint32_t)width;
-        bounds->height = (uint32_t)height;
+        bounds->width = (uint32_t)(spanX + padding);
+        bounds->height = (uint32_t)(spanY + padding);
     }
     return (uint64_t)bounds->width * bounds->height <= LAIUE_NAV_GRID_MAXIMUM_AREA &&
            bounds->x <= INT64_MAX - (int64_t)bounds->width &&
@@ -418,19 +425,25 @@ void LaiueNavGridFindPath(const LaiueNavGrid *grid, LaiueNavQuery *query,
             query->foundCost = top.g;
             break;
         }
-        const int64_t x = bounds.x + (int64_t)(top.node % bounds.width);
-        const int64_t y = bounds.y + (int64_t)(top.node / bounds.width);
+        const uint32_t localX = top.node % bounds.width;
+        const uint32_t localY = top.node / bounds.width;
+        const int64_t x = bounds.x + (int64_t)localX;
+        const int64_t y = bounds.y + (int64_t)localY;
         for (uint32_t direction = 0u; direction < 8u; ++direction)
         {
-            const int64_t nextX = x + directionX[direction];
-            const int64_t nextY = y + directionY[direction];
-            if (!Inside(&bounds, nextX, nextY))
+            /* Сначала проверяем соседа в локальных координатах. Шаг влево
+             * от нуля даёт UINT32_MAX и потому оказывается вне окна. */
+            const uint32_t nextLocalX = localX + (uint32_t)directionX[direction];
+            const uint32_t nextLocalY = localY + (uint32_t)directionY[direction];
+            if (nextLocalX >= bounds.width || nextLocalY >= bounds.height)
                 continue;
-            const uint32_t next = AreaIndex(&bounds, nextX, nextY);
+            const uint32_t next = nextLocalY * bounds.width + nextLocalX;
             if (NavQueryClosed(query, next))
                 continue;
+            const int64_t nextX = bounds.x + (int64_t)nextLocalX;
+            const int64_t nextY = bounds.y + (int64_t)nextLocalY;
             const uint64_t step =
-                StepCost(&reader, &bounds, x, y, direction, ReadCell(&reader, nextX, nextY));
+                StepCost(&reader, x, y, nextX, nextY, direction, ReadCell(&reader, nextX, nextY));
             if (step == 0u)
                 continue;
             const uint64_t g = top.g + step;
@@ -479,8 +492,8 @@ static bool LineOfSight(CellReader *reader, LaiueNavCell from, LaiueNavCell to, 
 {
     const int64_t stepX = to.x >= from.x ? 1 : -1;
     const int64_t stepY = to.y >= from.y ? 1 : -1;
-    const uint64_t spanX = to.x >= from.x ? (uint64_t)(to.x - from.x) : (uint64_t)(from.x - to.x);
-    const uint64_t spanY = to.y >= from.y ? (uint64_t)(to.y - from.y) : (uint64_t)(from.y - to.y);
+    const uint64_t spanX = Distance(from.x, to.x);
+    const uint64_t spanY = Distance(from.y, to.y);
     if (spanX > (UINT64_C(1) << 30) || spanY > (UINT64_C(1) << 30))
         return false;
     int64_t x = from.x;
@@ -618,22 +631,26 @@ LaiueNavStatus LaiueNavFlowFieldBuild(LaiueNavFlowField *field, const LaiueNavGr
         if (NavQueryClosed(query, top.node) || top.g != query->nodes[top.node].g)
             continue;
         query->nodes[top.node].closed = query->currentStamp;
-        const int64_t x = bounds->x + (int64_t)(top.node % bounds->width);
-        const int64_t y = bounds->y + (int64_t)(top.node / bounds->width);
+        const uint32_t localX = top.node % bounds->width;
+        const uint32_t localY = top.node / bounds->width;
+        const int64_t x = bounds->x + (int64_t)localX;
+        const int64_t y = bounds->y + (int64_t)localY;
         const uint8_t enteringCost = ReadCell(&reader, x, y);
         for (uint32_t direction = 0u; direction < 8u; ++direction)
         {
-            const int64_t fromX = x + directionX[direction];
-            const int64_t fromY = y + directionY[direction];
-            if (!Inside(bounds, fromX, fromY))
+            const uint32_t fromLocalX = localX + (uint32_t)directionX[direction];
+            const uint32_t fromLocalY = localY + (uint32_t)directionY[direction];
+            if (fromLocalX >= bounds->width || fromLocalY >= bounds->height)
                 continue;
-            const uint32_t from = AreaIndex(bounds, fromX, fromY);
-            if (NavQueryClosed(query, from) ||
-                ReadCell(&reader, fromX, fromY) == LAIUE_NAV_CELL_BLOCKED)
+            const uint32_t from = fromLocalY * bounds->width + fromLocalX;
+            if (NavQueryClosed(query, from))
+                continue;
+            const int64_t fromX = bounds->x + (int64_t)fromLocalX;
+            const int64_t fromY = bounds->y + (int64_t)fromLocalY;
+            if (ReadCell(&reader, fromX, fromY) == LAIUE_NAV_CELL_BLOCKED)
                 continue;
             /* Шаг из соседа обратно в текущую клетку — противоположное направление. */
-            const uint64_t step =
-                StepCost(&reader, bounds, fromX, fromY, (direction + 4u) & 7u, enteringCost);
+            const uint64_t step = StepCost(&reader, fromX, fromY, x, y, direction, enteringCost);
             if (step == 0u)
                 continue;
             const uint64_t g = top.g + step;

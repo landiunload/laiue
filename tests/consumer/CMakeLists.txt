@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2...4.4)
+cmake_minimum_required(VERSION 4.2...4.5)
 project(laiue_consumer LANGUAGES C)
 
 # The installed-consumer test passes the engine's own version; a standalone
@@ -18,6 +18,13 @@ endif()
 add_executable(laiue_bootstrap_consumer bootstrap_consumer.c)
 target_compile_features(laiue_bootstrap_consumer PRIVATE c_std_17)
 target_link_libraries(laiue_bootstrap_consumer PRIVATE laiue::bootstrap)
+# The loader looks beside the executable, while the SDK may install shared
+# modules under bin or lib. Stage the imported artifact without linking it.
+add_custom_command(TARGET laiue_bootstrap_consumer POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:laiue::numeric>"
+        "$<TARGET_FILE_DIR:laiue_bootstrap_consumer>/$<TARGET_FILE_NAME:laiue::numeric>"
+    VERBATIM)
 
 # Every installed header must compile on its own with the SDK include root, as
 # an application includes it. One generated source per header keeps a missing

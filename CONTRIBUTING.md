@@ -25,8 +25,8 @@ changing code.
 
 Every change reaches `main` through a pull request that passes CI and is
 squash-merged, so each change becomes one commit titled after the pull
-request. A commit message describes the change and nothing else: no
-co-authors, sign-offs, generated-by lines or session links.
+request. Keep commit messages free of sign-offs, generated-by lines and
+session links. `Co-authored-by` is allowed for `rossia7612-arch` and `landiunload`.
 
 ## Releases
 

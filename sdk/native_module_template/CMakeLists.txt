@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2...4.4)
+cmake_minimum_required(VERSION 4.2...4.5)
 project(laiue_example_service LANGUAGES C)
 
 set(LAIUE_SDK_INCLUDE_DIR "" CACHE PATH "Installed LAIUE include directory")
