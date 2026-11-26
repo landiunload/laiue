@@ -149,6 +149,10 @@ static void CountFrame(void *context)
     }
     SendMessageW(pace->handle, WM_ACTIVATE, MAKEWPARAM(active ? WA_ACTIVE : WA_INACTIVE, active),
                  0);
+    // Сообщение должно разбудить обработку событий, а не ускорить фоновый кадр.
+    if (pace->stage == PACE_ON_ANOTHER_DESKTOP || pace->stage == PACE_EFFICIENCY)
+        Expect(PostMessageW(pace->handle, WM_NULL, 0, 0) != FALSE,
+               "the background window can receive a message");
     ++pace->frames[pace->stage];
     if (pace->stage == PACE_OUT_OF_FOCUS && now - pace->lastFrame < QUICK_FRAME_SECONDS)
         ++pace->quickFrames;

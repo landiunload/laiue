@@ -56,6 +56,7 @@ struct Window
 
 #define WINDOW_FRAME_MESSAGE (WM_APP + 1u)
 #define WINDOW_MODAL_FRAME_TIMER 1u
+#define WINDOW_BACKGROUND_FRAME_MILLISECONDS 50u
 // Дальний срок ожидания: кадр раньше времени безвреден, а сутки уже влезают
 // и в миллисекунды, и в сотни наносекунд таймера.
 #define WINDOW_LONGEST_DEFER_SECONDS 86400.0
@@ -791,6 +792,22 @@ static bool FrameShouldRest(const Window* window)
         || (!window->focused && WindowGetPowerPolicy() == WINDOW_POWER_EFFICIENCY);
 }
 
+static void WaitForBackgroundFrame(Window* window)
+{
+    // Разбираем сообщения сразу, но частые сообщения не ускоряют фоновые кадры.
+    const ULONGLONG start = GetTickCount64();
+    DWORD remaining = WINDOW_BACKGROUND_FRAME_MILLISECONDS;
+    while (MsgWaitForMultipleObjectsEx(0, NULL, remaining, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+           == WAIT_OBJECT_0 && PumpMessages(window))
+    {
+        UpdateWindowSight(window);
+        const ULONGLONG elapsed = GetTickCount64() - start;
+        if (!FrameShouldRest(window) || elapsed >= WINDOW_BACKGROUND_FRAME_MILLISECONDS)
+            return;
+        remaining = WINDOW_BACKGROUND_FRAME_MILLISECONDS - (DWORD)elapsed;
+    }
+}
+
 void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
 {
     window->frameCallback = onFrame;
@@ -808,9 +825,9 @@ void WindowRunLoop(Window* window, FrameCallback onFrame, void* userData)
         {
             WaitForDeferredFrame(window);
         }
-        else if (FrameShouldRest(window))
+        else if (window->handle != NULL && FrameShouldRest(window))
         {
-            MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
+            WaitForBackgroundFrame(window);
         }
     }
     window->frameCallback = NULL;
