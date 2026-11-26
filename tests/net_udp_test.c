@@ -215,6 +215,93 @@ static void CloseSide(Side *side)
     LaiueNetUdpClose(side->udp);
 }
 
+static void QueueReliableMessages(Side *side, uint8_t *scratch)
+{
+    for (uint32_t index = 0u; index < MESSAGE_COUNT; ++index)
+    {
+        for (uint32_t position = 0u; position < messageSizes[index]; ++position)
+            scratch[position] = Pattern(index, position);
+        Expect(LaiueNetSend(side->endpoint, side->peer, 0u, LAIUE_NET_RELIABLE, scratch,
+                            messageSizes[index]) == LAIUE_NET_OK,
+               "a reliable message is queued");
+    }
+}
+
+typedef struct ThreadedExchange
+{
+    uint64_t deadline;
+    volatile uint32_t serverPort;
+    volatile uint32_t serverClosed;
+} ThreadedExchange;
+
+static void WaitConnected(Side *side, uint64_t deadline)
+{
+    while (side->connected == 0u && side->disconnected == 0u &&
+           LaiueNetClockMicroseconds() < deadline)
+        Pump(side, 1u);
+    Expect(side->connected == 1u && side->disconnected == 0u, "the owner observes its connection");
+}
+
+static uint32_t RunServer(void *context)
+{
+    ThreadedExchange *exchange = context;
+    static uint8_t scratch[LARGE_MESSAGE_BYTES];
+    Side server;
+    OpenSide(&server, "127.0.0.1", LAIUE_NET_ENDPOINT_ACCEPT);
+    PlatformAtomicStoreU32Release(&exchange->serverPort, server.address.port);
+    WaitConnected(&server, exchange->deadline);
+    QueueReliableMessages(&server, scratch);
+    while (server.disconnected == 0u && LaiueNetClockMicroseconds() < exchange->deadline)
+        Pump(&server, 1u);
+    Expect(server.reliable == MESSAGE_COUNT && server.disconnected == 1u &&
+               server.reason == LAIUE_NET_REASON_REMOTE && server.code == 42u,
+           "the server owner receives every message and the close code");
+    CloseSide(&server);
+    PlatformAtomicStoreU32Release(&exchange->serverClosed, 1u);
+    return 0u;
+}
+
+static void TestSeparateOwners(void)
+{
+    /* Каждый поток создаёт, обслуживает и закрывает свои endpoint и сокет.
+     * Между владельцами публикуются только порт и завершение. */
+    ThreadedExchange exchange = {.deadline = LaiueNetClockMicroseconds() + DEADLINE_MICROSECONDS};
+    PlatformThread worker;
+    Expect(PlatformThreadStart(&worker, RunServer, &exchange), "server owner starts");
+    uint32_t port;
+    while ((port = PlatformAtomicLoadU32Acquire(&exchange.serverPort)) == 0u)
+    {
+        Expect(LaiueNetClockMicroseconds() < exchange.deadline, "the server publishes its port");
+        PlatformSleepMilliseconds(1u);
+    }
+
+    Side client;
+    OpenSide(&client, "127.0.0.1", 0u);
+    LaiueNetConnectDesc connect = {.structSize = sizeof(connect), .address = Address("127.0.0.1")};
+    connect.address.port = (uint16_t)port;
+    Expect(LaiueNetConnect(client.endpoint, &connect, &client.peer) == LAIUE_NET_OK,
+           "the client owner connects");
+    WaitConnected(&client, exchange.deadline);
+    QueueReliableMessages(&client, message);
+    while (client.reliable != MESSAGE_COUNT && client.disconnected == 0u &&
+           LaiueNetClockMicroseconds() < exchange.deadline)
+        Pump(&client, 1u);
+    Expect(client.reliable == MESSAGE_COUNT && client.disconnected == 0u,
+           "the client owner receives every message");
+    Expect(LaiueNetDisconnect(client.endpoint, client.peer, 42u, LAIUE_NET_DISCONNECT_FLUSH) ==
+               LAIUE_NET_OK,
+           "close after flushing the client queue");
+    while (client.disconnected == 0u || PlatformAtomicLoadU32Acquire(&exchange.serverClosed) == 0u)
+    {
+        Expect(LaiueNetClockMicroseconds() < exchange.deadline, "both owners finish closing");
+        Pump(&client, 1u);
+    }
+    Expect(client.disconnected == 1u && client.reason == LAIUE_NET_REASON_LOCAL,
+           "the client owner observes local close");
+    CloseSide(&client);
+    PlatformThreadJoin(&worker);
+}
+
 /* Полный обмен: рукопожатие, надёжные сообщения до 200 КБ, ненадёжное,
  * закрытие с кодом. target — адрес сервера, каким его видит клиент. */
 static void Exchange(const char *serverBind, const char *clientBind, const char *target,
@@ -240,14 +327,7 @@ static void Exchange(const char *serverBind, const char *clientBind, const char 
     Expect(server->remote.family == expectedFamily && server->remote.port == client->address.port,
            "the server sees the client's own address");
 
-    for (uint32_t index = 0u; index < MESSAGE_COUNT; ++index)
-    {
-        for (uint32_t position = 0u; position < messageSizes[index]; ++position)
-            message[position] = Pattern(index, position);
-        Expect(LaiueNetSend(client->endpoint, client->peer, 0u, LAIUE_NET_RELIABLE, message,
-                            messageSizes[index]) == LAIUE_NET_OK,
-               "a reliable message is queued");
-    }
+    QueueReliableMessages(client, message);
     until = LaiueNetClockMicroseconds() + DEADLINE_MICROSECONDS;
     while (server->reliable != MESSAGE_COUNT && LaiueNetClockMicroseconds() < until)
         Pump(sides, 2u);
@@ -333,6 +413,7 @@ LAIUE_TEST_ENTRY(NetUdpTestEntryPoint)
     TestDriver();
     TestResolve();
     Exchange("127.0.0.1", "127.0.0.1", "127.0.0.1", LAIUE_NET_FAMILY_IPV4);
+    TestSeparateOwners();
     if (HasIpv6())
     {
         Exchange("::1", "::1", "::1", LAIUE_NET_FAMILY_IPV6);

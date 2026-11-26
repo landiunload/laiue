@@ -526,6 +526,58 @@ static void TestGrid(LaiueNavQuery *query)
     LaiueNavGridDestroy(grid);
 }
 
+static void TestGridCoordinateLimits(LaiueNavQuery *query)
+{
+    const LaiueNavGridDesc desc = {sizeof(desc), 1u};
+    LaiueNavGrid *grid = NULL;
+    LaiueNavFlowField *flow = NULL;
+    Expect(LaiueNavGridCreate(&desc, &grid) == LAIUE_NAV_OK, "limit grid create");
+    Expect(LaiueNavFlowFieldCreate(&flow) == LAIUE_NAV_OK, "limit flow create");
+
+    static const int64_t origins[] = {INT64_MIN, INT64_MAX - 3};
+    for (size_t index = 0u; index < sizeof(origins) / sizeof(origins[0]); ++index)
+    {
+        const int64_t origin = origins[index];
+        const LaiueNavRect bounds = {origin, origin, 3u, 3u};
+        Expect(LaiueNavGridFillRect(grid, &bounds, 2u) == LAIUE_NAV_OK &&
+                   LaiueNavGridGetCell(grid, origin + 2, origin + 2) == 2u &&
+                   LaiueNavGridGetCell(grid, origin + 3, origin + 2) == desc.defaultCost,
+               "fill stays in bounds at the coordinate limit");
+
+        LaiueNavGridPathRequest request = GridRequest(origin, origin, origin + 2, origin + 2, 0u);
+        request.bounds = bounds;
+        const uint32_t expected = 4u * LAIUE_NAV_GRID_DIAGONAL_STEP;
+        LaiueNavPathResult result = {.structSize = sizeof(result)};
+        LaiueNavGridFindPath(grid, query, &request, cells, 4096u, &result);
+        Expect(result.pathStatus == LAIUE_NAV_PATH_FOUND && result.count == 3u &&
+                   result.cost == expected,
+               "A* follows the diagonal at the coordinate limit");
+        CheckCellPath(grid, cells, result.count, request, result.cost);
+        Expect(LaiueNavGridSmoothPath(grid, cells, result.count) == 2u,
+               "short segment at the coordinate limit can be smoothed");
+
+        const LaiueNavCell goals[] = {request.goal, {INT64_MAX, INT64_MAX}};
+        Expect(LaiueNavFlowFieldBuild(flow, grid, &bounds, goals, 2u) == LAIUE_NAV_OK &&
+                   LaiueNavFlowFieldCost(flow, origin, origin) == expected &&
+                   LaiueNavFlowFieldDirection(flow, origin, origin) == 1u &&
+                   LaiueNavFlowFieldCost(flow, INT64_MAX, INT64_MAX) == LAIUE_NAV_FLOW_UNREACHABLE,
+               "flow stays in bounds and uses the same diagonal cost");
+    }
+
+    LaiueNavPathResult result = {.structSize = sizeof(result)};
+    const LaiueNavGridPathRequest tooWide = GridRequest(INT64_MIN, 0, INT64_MAX - 1, 0, 0u);
+    LaiueNavGridFindPath(grid, query, &tooWide, cells, 4096u, &result);
+    Expect(result.pathStatus == LAIUE_NAV_PATH_ERROR && result.status == LAIUE_NAV_INVALID_ARGUMENT,
+           "implicit bounds cannot span the full coordinate range");
+
+    LaiueNavCell sparse[] = {{INT64_MIN, 0}, {INT64_MIN + 1, 0}, {INT64_MAX, 0}};
+    Expect(LaiueNavGridSmoothPath(grid, sparse, 3u) == 3u,
+           "smoothing leaves a segment too long to scan alone");
+
+    LaiueNavFlowFieldDestroy(flow);
+    LaiueNavGridDestroy(grid);
+}
+
 LAIUE_TEST_ENTRY(NavigationTestEntryPoint)
 {
     BuildCity();
@@ -544,6 +596,7 @@ LAIUE_TEST_ENTRY(NavigationTestEntryPoint)
     TestBatch(queries, &executor);
     TestEdits(queries[0]);
     TestGrid(queries[1]);
+    TestGridCoordinateLimits(queries[1]);
 
     LaiueTaskPoolDestroy(pool);
     for (uint32_t index = 0u; index < 4u; ++index)

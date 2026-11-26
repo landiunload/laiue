@@ -4,10 +4,7 @@
 
 #include <stdint.h>
 
-/* Loads the numeric module by name the way an application would. Whether the
- * artifact sits next to this executable depends on the platform layout of the
- * installed SDK, so both a loaded and a skipped module are valid outcomes; a
- * loaded one must publish its service. */
+/* Exercises the installed SDK from an ordinary console application. */
 int main(void)
 {
     wchar_t directory[LAIUE_APPLICATION_PATH_CAPACITY];
@@ -31,21 +28,37 @@ int main(void)
     LaiueModuleLoadReportInitialize(&report, entries, 1u);
     const LaiueModuleNamedProfileV1 profile = {
         .structSize = sizeof(profile),
-        .flags = LAIUE_MODULE_PROFILE_ALLOW_PARTIAL,
         .names = names,
         .nameCount = 1u,
     };
     const LaiueModuleStatus status =
         LaiueModuleHostLoadNamedProfileV1(host, &profile, &report, &diagnostic);
     int result = 0;
-    if (status != LAIUE_MODULE_OK && status != LAIUE_MODULE_PARTIAL)
+    if (status != LAIUE_MODULE_OK || report.loadedCount != 1u ||
+        LaiueModuleHostIsLoaded(host, "laiue.numeric") == 0u)
         result = 3;
-    else if (LaiueModuleHostIsLoaded(host, "laiue.numeric") != 0u &&
-             LaiueModuleHostQueryService(host, LAIUE_NUMERIC_SERVICE_NAME, 1u, 1u, NULL, NULL) ==
-                 NULL)
-        result = 4;
-    else if (LaiueApplicationMonotonicSeconds() < started)
-        result = 5;
+    else
+    {
+        const LaiueNumericServiceV1 *numeric = LaiueModuleHostQueryService(
+            host, LAIUE_NUMERIC_SERVICE_NAME, LAIUE_NUMERIC_SERVICE_ABI_VERSION_1,
+            sizeof(LaiueNumericServiceV1), NULL, NULL);
+        if (numeric == NULL || numeric->structSize < sizeof(*numeric) ||
+            numeric->abiVersion != LAIUE_NUMERIC_SERVICE_ABI_VERSION_1 || numeric->init == NULL ||
+            numeric->destroy == NULL || numeric->tryAddInt64InPlace == NULL ||
+            numeric->compareAddInt64ToInt64 == NULL)
+            result = 4;
+        else
+        {
+            InfiniteCoord value;
+            numeric->init(&value);
+            if (numeric->tryAddInt64InPlace(&value, -17) == 0u ||
+                numeric->compareAddInt64ToInt64(&value, 0, -17) != 0)
+                result = 5;
+            numeric->destroy(&value);
+        }
+    }
+    if (result == 0 && LaiueApplicationMonotonicSeconds() < started)
+        result = 6;
     LaiueModuleHostUnloadAll(host);
     LaiueModuleHostDestroy(host);
     return result;
