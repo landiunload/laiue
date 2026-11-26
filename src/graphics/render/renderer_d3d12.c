@@ -379,6 +379,7 @@ struct Renderer // NOLINT(clang-analyzer-optin.performance.Padding)
     bool                       backgroundReady;
     D3D12_VIEWPORT             viewport;
     D3D12_RECT                 scissorRect;
+    HWND                       window;
     int32_t                    windowWidth;
     int32_t                    windowHeight;
     int32_t                    resizeWidth;
@@ -2254,6 +2255,7 @@ Renderer* RendererCreate_D3D12(void* windowHandle, int32_t width, int32_t height
     }
 
     renderer->header.backend = RENDERER_BACKEND_D3D12;
+    renderer->window = (HWND)windowHandle;
     renderer->windowWidth = width;
     renderer->windowHeight = height;
     renderer->verticalSyncEnabled = true;
@@ -4422,8 +4424,10 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     // может показать разрыв. Без разрешения flip-модель показывает последний
     // готовый кадр целиком, и кадров выходит до двух на обновление: из трёх
     // буферов один на экране, а два других ждут композиции.
+    // Скрытому окну не нужна синхронизация показа с обновлением экрана.
+    const bool visible = IsWindowVisible(renderer->window) != 0;
     const bool tearing = !renderer->verticalSyncEnabled && renderer->tearingSupported;
-    UINT syncInterval = renderer->verticalSyncEnabled ? 1 : 0;
+    UINT syncInterval = renderer->verticalSyncEnabled && visible ? 1u : 0u;
     HRESULT presentResult = IDXGISwapChain3_Present(renderer->swapChain, syncInterval,
         tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (FAILED(presentResult))
@@ -4463,9 +4467,9 @@ bool RendererEndFrame_D3D12(Renderer* renderer)
     RewindUploadSlot(renderer, renderer->frameIndex);
     renderer->instanceChunkIndex[renderer->frameIndex] = 0;
     renderer->instanceChunkOffset[renderer->frameIndex] = 0;
-    // Без vsync и без разрывов очередь сама заменяет ждущий кадр новым, а
-    // ожидание ограничило бы число кадров.
-    if (renderer->frameLatencyWait != NULL && (renderer->verticalSyncEnabled || tearing))
+    // Для скрытого окна достаточно синхронизации GPU фенсом слота.
+    // Без vsync и разрывов очередь сама заменяет ждущий кадр новым.
+    if (visible && renderer->frameLatencyWait != NULL && (renderer->verticalSyncEnabled || tearing))
     {
         (void)WaitForSingleObjectEx(renderer->frameLatencyWait, FRAME_LATENCY_WAIT_MILLISECONDS,
             FALSE);

@@ -18,7 +18,7 @@ set(render_sources
     chunk_geometry.h
     ../../api.h)
 set(d3d12_sources renderer_d3d12.c ui_image_wic.c ui_image_wic.h)
-set(d3d12_links d3d12 dxgi dxguid ole32 windowscodecs)
+set(d3d12_links d3d12 dxgi dxguid ole32 user32 windowscodecs)
 set(vulkan_sources renderer_vulkan.c renderer_offscreen.h)
 set(vulkan_links Vulkan::Vulkan)
 
