@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2...4.4)
+cmake_minimum_required(VERSION 4.2...4.5)
 project(laiue_consumer LANGUAGES C)
 
 # The installed-consumer test passes the engine's own version; a standalone

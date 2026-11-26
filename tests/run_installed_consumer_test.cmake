@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2...4.4)
+cmake_minimum_required(VERSION 4.2...4.5)
 
 foreach(required IN ITEMS
         ENGINE_BINARY_DIR CONSUMER_SOURCE_DIR TEST_ROOT CONFIGURATION
