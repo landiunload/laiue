@@ -622,6 +622,17 @@ if(TARGET laiue_ui)
     laiue_add_harness(laiue_truetype_edges_test TrueTypeEdgesTestEntryPoint
         truetype_edges_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
         TEST laiue.ui.truetype_edges)
+    laiue_add_harness(laiue_truetype_coverage_test TrueTypeCoverageTestEntryPoint
+        truetype_coverage_test.c PRECISE_FP LIBRARIES laiue::ui_font_support
+        TEST laiue.ui.truetype_coverage)
+    laiue_add_harness(laiue_truetype_atlas_test TrueTypeAtlasTestEntryPoint
+        truetype_atlas_test.c LIBRARIES laiue::ui_font_support TEST laiue.ui.truetype_atlas)
+    laiue_add_harness(laiue_truetype_bake_test TrueTypeBakeTestEntryPoint
+        truetype_bake_test.c "${laiue_src}/ui/ui_font.c" "${laiue_src}/ui/truetype_font.c"
+        STATIC PRECISE_FP LIBRARIES laiue::ui_font_support TEST laiue.ui.truetype_bake)
+    if(WIN32)
+        target_link_libraries(laiue_truetype_bake_test PRIVATE gdi32)
+    endif()
 endif()
 
 # Состояние ввода общее для всех платформ и не требует окна: оно

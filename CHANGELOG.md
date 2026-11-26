@@ -5,6 +5,10 @@ API and ABI may change between minor versions.
 
 ## Unreleased
 
+- The UI can bake a TrueType alpha atlas for ASCII, Cyrillic and punctuation.
+  Set `LAIUE_UI_FONT` to choose a TTF file. Linux, Android and macOS try system
+  fonts by default. A failed explicit replacement leaves the existing atlas
+  available.
 - The engine has internal SHA-512 and Ed25519 signing and verification for
   future mod packages. Ed25519 and the transport's X25519 share field
   arithmetic. Tests cover standard vectors, malformed signatures and both

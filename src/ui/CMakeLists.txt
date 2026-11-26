@@ -1,7 +1,13 @@
 # Внутреннее чтение шрифта: одна реализация для UI и тестов, без нового ABI.
 add_library(laiue_ui_font_support STATIC
+    truetype_atlas.c
+    truetype_atlas.h
+    truetype_bake.c
+    truetype_bake.h
     truetype_components.c
     truetype_components.h
+    truetype_coverage.c
+    truetype_coverage.h
     truetype_edges.c
     truetype_edges.h
     truetype_outline.c
@@ -34,6 +40,7 @@ laiue_add_module(ui
         ui_service.h
         module_entry.c
         ui_font.c
+        truetype_font.c
         ui_font.h
         ui_font_internal.h
         ui_format.c
@@ -41,6 +48,7 @@ laiue_add_module(ui
         ../api.h
     LINK
         laiue::math_support
+        laiue::ui_font_support
     WINDOWS_LINK
         gdi32
 )

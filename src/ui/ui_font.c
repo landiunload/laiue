@@ -1,5 +1,7 @@
 #include "ui/ui_font.h"
 #include "ui/ui_font_internal.h"
+#include "ui/truetype_bake.h"
+#include "platform/system.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -30,13 +32,8 @@ void UiFontRelease(UiFont* font)
     font->pixelSize = 0;
 }
 
-bool UiFontBake(UiFont* font, int32_t pixelSize)
+static bool BakeFallback(UiFont* font, int32_t pixelSize)
 {
-    if (pixelSize < 6)
-    {
-        pixelSize = 6;
-    }
-
     HFONT gdiFont = CreateFontW(
         -pixelSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -225,9 +222,8 @@ bool UiFontBake(UiFont* font, int32_t pixelSize)
 /*
  * Mobile and POSIX builds do not have GDI.  Keep the UI useful without
  * pulling a font engine into the core: this deterministic monochrome atlas
- * is a safe fallback, while a platform font provider can replace it later.
+ * is a safe fallback when no usable TrueType file is available.
  */
-#include "platform/system.h"
 
 void UiFontRelease(UiFont *font)
 {
@@ -238,12 +234,10 @@ void UiFontRelease(UiFont *font)
     memset(font, 0, sizeof(*font));
 }
 
-bool UiFontBake(UiFont *font, int32_t pixelSize)
+static bool BakeFallback(UiFont *font, int32_t pixelSize)
 {
-    if (font == NULL)
+    if (pixelSize > INT16_MAX)
         return false;
-    if (pixelSize < 6)
-        pixelSize = 6;
 
     uint32_t glyphCount = UiGlyphCount();
     uint32_t cellWidth = (uint32_t)pixelSize / 2u + 3u;
@@ -314,6 +308,57 @@ bool UiFontBake(UiFont *font, int32_t pixelSize)
 }
 
 #endif
+
+static bool BakeFontFile(UiFont *font, int32_t pixelSize, const wchar_t *path)
+{
+    uint8_t *bytes = NULL;
+    uint64_t size = 0u;
+    if (!PlatformReadEntireFile(path, 16u << 20u, &bytes, &size))
+        return false;
+    const TrueTypeAtlasLimits limits = {pixelSize <= 28 ? 512u : 1024u, UINT16_MAX, 16u << 20u};
+    const bool baked = UiFontBakeFromSfnt(font, pixelSize, bytes, (size_t)size, limits,
+                                         UINT64_C(4) << 20u);
+    PlatformFree(bytes);
+    return baked;
+}
+
+bool UiFontBake(UiFont *font, int32_t pixelSize)
+{
+    if (font == NULL)
+        return false;
+    if (pixelSize < 6)
+        pixelSize = 6;
+
+    char override[768];
+    const uint32_t length = PlatformGetEnvironmentUtf8("LAIUE_UI_FONT", override, sizeof(override));
+    if (length != 0u)
+    {
+        wchar_t path[768];
+        return PlatformUtf8ToWide(override, length, path, sizeof(path) / sizeof(path[0]), NULL) &&
+               BakeFontFile(font, pixelSize, path);
+    }
+
+#if !defined(_WIN32)
+    static const wchar_t *const systemFonts[] = {
+#if defined(__ANDROID__)
+        L"/system/fonts/Roboto-Regular.ttf",
+        L"/system/fonts/RobotoStatic-Regular.ttf",
+        L"/system/fonts/NotoSans-Regular.ttf",
+#elif defined(__APPLE__)
+        L"/System/Library/Fonts/Supplemental/Arial.ttf",
+#else
+        L"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        L"/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        L"/usr/share/fonts/TTF/DejaVuSans.ttf",
+        L"/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+#endif
+    };
+    for (size_t index = 0u; index < sizeof(systemFonts) / sizeof(systemFonts[0]); ++index)
+        if (BakeFontFile(font, pixelSize, systemFonts[index]))
+            return true;
+#endif
+    return BakeFallback(font, pixelSize);
+}
 
 const UiGlyph* UiFontFindGlyph(const UiFont* font, uint16_t codepoint)
 {

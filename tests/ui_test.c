@@ -295,7 +295,7 @@ static void TestQuads(UiContext* ui)
         const RendererUiQuad* quad = &ui->quads[0];
         float glyphX = 100.0f + (float)glyph->offsetX;
         float baseline = 50.0f + ui->font.ascent;
-        float glyphY = baseline - (float)glyph->offsetY;
+        float glyphY = (float)(int32_t)(baseline - (float)glyph->offsetY + 0.5f);
         CHECK(FloatEqual(quad->rect[0], glyphX), "glyph rect x0");
         CHECK(FloatEqual(quad->rect[1], glyphY), "glyph rect y0");
         CHECK(FloatEqual(quad->rect[2], glyphX + (float)glyph->width),
